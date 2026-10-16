@@ -5,7 +5,9 @@
 //! directly) changes a partitioned root's rows without a write any capture
 //! trigger sees. The reconcile pass records each such change as a durable
 //! correction request ([`crate::capture::partitions`], P3). This module
-//! consumes the requests of an **aggregate** that reads the source.
+//! consumes the requests of an **aggregate** that reads the source, and
+//! (the `to_many` module, P4b) of a definition that reads it through a **to-many
+//! relationship**.
 //!
 //! # What a correction does
 //!
@@ -83,7 +85,8 @@
 //!
 //! # Scheduling
 //!
-//! A correction runs for each aggregate that reads the source as a
+//! A correction runs for each definition that reads the source (an aggregate
+//! over it, or one reading it through a to-many relationship) as a
 //! `backfill_chunks` row of kind `correction` (V92), one per correction and
 //! definition, which the staging worker's pass enqueues ([`schedule`]) right
 //! after the capture pass that queued the correction. The row gives it what a
@@ -115,10 +118,15 @@
 //! the correction, as the record `Trellis::status` reports until that resume.
 //! Each row is its own claim, so a failing correction holds up no other
 //! correction, definition or source. A correction leaves the queue once every
-//! aggregate that applies has re-derived it ([`schedule`], and the runner
-//! that finishes the last).
+//! definition that reads its source and applies has corrected it
+//! ([`schedule`], and the runner that finishes the last).
 //!
-//! A to-many relationship's recompute is P4b.
+//! A to-many reader's correction stages recomputes into the ring rather than
+//! writing its target, and its target has no group deltas for
+//! [`super::build::try_complete`] to wait on. So its row is done only once
+//! the ring has drained through the segment that was active when its last
+//! page committed (the `drain` phase): the definition reads `backfilling`
+//! until every recompute the correction staged is applied.
 
 use std::fmt;
 use std::time::Duration;
@@ -135,6 +143,8 @@ use crate::pool::{Pool, quote_ident};
 use super::apply::ApplyError;
 use super::build::{self, BuildPlan, CHUNK_APPLICATION_NAME};
 use super::ledger::LedgerTargetPlan;
+
+mod to_many;
 
 /// Keys per page by default, the size of a build chunk
 /// ([`build::DEFAULT_CHUNK_ROWS`]): one page is one transaction and one entry
@@ -159,6 +169,7 @@ pub enum CorrectionError {
     Apply(ApplyError),
     Capture(crate::capture::CaptureError),
     Catalog(catalog::CatalogError),
+    Staging(super::StagingError),
     /// The node's group cannot be presented to its constraint text.
     Unroutable(String),
     /// The Re-derive build does not serve the definition's shape, so its keys
@@ -176,6 +187,7 @@ impl CorrectionError {
             CorrectionError::Pool(err) => err.code(),
             CorrectionError::Apply(err) => err.code(),
             CorrectionError::Catalog(err) => err.code(),
+            CorrectionError::Staging(err) => err.code(),
             CorrectionError::Capture(err) => {
                 let mut link: Option<&(dyn std::error::Error + 'static)> = Some(err);
                 while let Some(err) = link {
@@ -201,6 +213,7 @@ impl fmt::Display for CorrectionError {
             CorrectionError::Apply(err) => write!(f, "partition correction: {err}"),
             CorrectionError::Capture(err) => write!(f, "partition correction: {err}"),
             CorrectionError::Catalog(err) => write!(f, "partition correction: {err}"),
+            CorrectionError::Staging(err) => write!(f, "partition correction: {err}"),
             CorrectionError::Unroutable(why) => write!(f, "partition correction: {why}"),
             CorrectionError::Unserved { target } => write!(
                 f,
@@ -219,6 +232,7 @@ impl std::error::Error for CorrectionError {
             CorrectionError::Apply(err) => Some(err),
             CorrectionError::Capture(err) => Some(err),
             CorrectionError::Catalog(err) => Some(err),
+            CorrectionError::Staging(err) => Some(err),
             CorrectionError::Unroutable(_) | CorrectionError::Unserved { .. } => None,
         }
     }
@@ -251,6 +265,12 @@ impl From<ApplyError> for CorrectionError {
 impl From<crate::capture::CaptureError> for CorrectionError {
     fn from(err: crate::capture::CaptureError) -> Self {
         CorrectionError::Capture(err)
+    }
+}
+
+impl From<super::StagingError> for CorrectionError {
+    fn from(err: super::StagingError) -> Self {
+        CorrectionError::Staging(err)
     }
 }
 
@@ -420,7 +440,12 @@ fn route_columns_named(
 enum Phase {
     Fence,
     Ledger,
+    /// A to-many reader's walk of the routed from-side rows (`to_many`).
+    Parents,
     Node,
+    /// A to-many reader's recomputes are staged; it waits for the ring to
+    /// drain through `drain_seg` (`to_many`).
+    Drain,
     Done,
 }
 
@@ -429,7 +454,9 @@ impl Phase {
         match self {
             Phase::Fence => "fence",
             Phase::Ledger => "ledger",
+            Phase::Parents => "parents",
             Phase::Node => "node",
+            Phase::Drain => "drain",
             Phase::Done => "done",
         }
     }
@@ -438,7 +465,9 @@ impl Phase {
         match text {
             "fence" => Phase::Fence,
             "ledger" => Phase::Ledger,
+            "parents" => Phase::Parents,
             "node" => Phase::Node,
+            "drain" => Phase::Drain,
             _ => Phase::Done,
         }
     }
@@ -459,12 +488,17 @@ pub struct Progress {
 }
 
 impl Progress {
-    /// The phase: `fence`, `ledger`, `node` or `done`.
+    /// The phase: `fence`, `ledger`, `parents`, `node`, `drain` or `done`.
     pub fn phase(&self) -> &str {
         self.phase
     }
 
     /// Keys still to re-derive by the estimate.
+    ///
+    /// A to-many reader counts a parent done once its recompute is staged,
+    /// so 0 here does not yet mean its target is right: the recomputes apply
+    /// as the ring drains, which the `drain` phase waits for before the
+    /// definition can read `live`.
     #[cfg_attr(
         not(any(test, feature = "internals")),
         allow(dead_code, reason = "read by tests and embedders through `internals`")
@@ -508,8 +542,9 @@ pub struct Scheduled {
 }
 
 /// The staging worker pass's step for the queued corrections (see the module
-/// doc's "Scheduling"): for each correction and each aggregate that reads its
-/// source and applies (`live`, `catching_up`, or `backfilling` under a
+/// doc's "Scheduling"): for each correction and each definition that reads
+/// its source (an aggregate over it, or one reading it through a to-many
+/// relationship) and applies (`live`, `catching_up`, or `backfilling` under a
 /// Re-derive build: `defs::model::APPLYING_SQL`) and has not re-derived it,
 /// enqueues the correction's row unless one is there, moving a `live`
 /// definition to `backfilling`. A `catching_up` one gets its row once it is
@@ -537,13 +572,14 @@ pub async fn schedule(pool: &Pool) -> Result<Scheduled, CorrectionError> {
             .collect()
     };
     for table in tables {
-        let (corrections, (readers, held)) = {
+        let corrections = {
             let client = pool.get().await?;
-            (
-                partitions::pending_corrections(&**client, &table).await?,
-                readers(&**client, &table).await?,
-            )
+            partitions::pending_corrections(&**client, &table).await?
         };
+        if corrections.is_empty() {
+            continue;
+        }
+        let (readers, held) = all_readers(pool, &table).await?;
         for correction in &corrections {
             let mut drained = !held && !kept_by_frozen(pool, correction.id).await?;
             for &id in &readers {
@@ -670,18 +706,15 @@ async fn enqueue(
     Ok(true)
 }
 
-/// Takes `correction` off the queue if every aggregate reading its source
-/// that applies has re-derived it, no old-path build holds it and no frozen
+/// Takes `correction` off the queue if every definition reading its source
+/// that applies has corrected it, no old-path build holds it and no frozen
 /// definition keeps it ([`kept_by_frozen`]): [`schedule`]'s test. Returns
 /// whether it did.
 async fn complete_if_drained(
     pool: &Pool,
     correction: &PendingCorrection,
 ) -> Result<bool, CorrectionError> {
-    let (ids, held) = {
-        let client = pool.get().await?;
-        readers(&**client, &correction.table).await?
-    };
+    let (ids, held) = all_readers(pool, &correction.table).await?;
     if held || kept_by_frozen(pool, correction.id).await? {
         return Ok(false);
     }
@@ -746,10 +779,22 @@ pub(crate) async fn run_chunk(
         })?;
     let correction = {
         let client = pool.get().await?;
-        partitions::pending_corrections(&**client, &definition.source_table)
+        // The correction's source: a to-many reader's own source is the
+        // relationship's from-side, not the partitioned root.
+        let table: Option<String> = client
+            .query_opt(
+                "select table_name from partition_corrections where id = $1",
+                &[&correction_id],
+            )
             .await?
-            .into_iter()
-            .find(|c| c.id == correction_id)
+            .map(|row| row.get(0));
+        match table {
+            Some(table) => partitions::pending_corrections(&**client, &table)
+                .await?
+                .into_iter()
+                .find(|c| c.id == correction_id),
+            None => None,
+        }
     };
     let Some(correction) = correction else {
         // The correction left the queue, and its rows with it.
@@ -762,7 +807,17 @@ pub(crate) async fn run_chunk(
         heartbeat_interval,
     );
     let fence = ClaimFence::new(chunk.id, claimed_by, reclaim_ttl);
-    match correct(pool, &definition, &correction, options, outcome, &fence).await? {
+    let step = if definition.source_table == correction.table {
+        correct(pool, &definition, &correction, options, outcome, &fence).await?
+    } else if let Some(reader) = to_many::reader(pool, &definition, &correction.table).await? {
+        to_many::correct(pool, &reader, &correction, options, outcome, &fence).await?
+    } else if mark_done(pool, &fence, &correction, &definition).await? {
+        // It no longer reads the source: nothing of it to correct.
+        Step::Done
+    } else {
+        Step::Superseded
+    };
+    match step {
         Step::Done => {
             if !finish_row(pool, &fence, chunk.id).await? {
                 return chunk_queue::discard_if_superseded(pool, chunk, claimed_by).await;
@@ -888,6 +943,22 @@ async fn readers(
     Ok((row.get(0), row.get(1)))
 }
 
+/// The ids of every definition reading `source_table` that applies (the
+/// aggregates over it and the definitions reading it through a to-many
+/// relationship), and whether one of them is under an old-path build, which
+/// holds the corrections in the queue.
+async fn all_readers(pool: &Pool, source_table: &str) -> Result<(Vec<i64>, bool), CorrectionError> {
+    let (mut ids, held) = {
+        let client = pool.get().await?;
+        readers(&**client, source_table).await?
+    };
+    let (to_many, to_many_held) = to_many::reader_ids(pool, source_table).await?;
+    ids.extend(to_many);
+    ids.sort_unstable();
+    ids.dedup();
+    Ok((ids, held || to_many_held))
+}
+
 /// What one call of [`correct`] left.
 enum Step {
     /// The definition re-derived the correction's key set.
@@ -921,28 +992,12 @@ async fn correct(
         });
     };
     let ledger = plan.ledger();
-    if correction.kind == partitions::Kind::GoneNode.as_str()
-        && let Some(parent) = correction.parent_oid
-    {
-        // A `HASH` text embeds the parent's oid and cannot be evaluated once
-        // the parent is dropped. The parent's own correction, queued by the
-        // pass that saw it go, routes every group of its bound, the leaf's
-        // among them.
-        let client = pool.get().await?;
-        let alive: bool = client
-            .query_one(
-                "select exists (select 1 from pg_catalog.pg_class where oid = $1::bigint::oid)",
-                &[&i64::from(parent)],
-            )
-            .await?
-            .get(0);
-        if !alive {
-            return Ok(if mark_done(pool, fence, correction, definition).await? {
-                Step::Done
-            } else {
-                Step::Superseded
-            });
-        }
+    if covered_by_parent(pool, correction).await? {
+        return Ok(if mark_done(pool, fence, correction, definition).await? {
+            Step::Done
+        } else {
+            Step::Superseded
+        });
     }
     if correction.kind == partitions::Kind::Complement.as_str()
         && let Some(text) = &correction.constraint
@@ -999,6 +1054,12 @@ async fn correct(
         };
         let page = match Phase::parse(current.phase) {
             Phase::Done => return Ok(Step::Done),
+            Phase::Parents | Phase::Drain => {
+                return Err(CorrectionError::Unroutable(format!(
+                    "an aggregate's correction {} is in a to-many phase",
+                    correction.id
+                )));
+            }
             Phase::Fence => {
                 if !settle_fence(pool, definition, correction).await? {
                     return Ok(Step::Waiting);
@@ -1039,6 +1100,57 @@ async fn correct(
         outcome.pages += 1;
         outcome.keys += keys;
     }
+}
+
+/// Whether `correction` is a gone node whose parent has been dropped since
+/// it left the tree. A `HASH` text embeds the parent's oid and cannot be
+/// evaluated once the parent is dropped. The parent's own correction, queued
+/// by the pass that saw it go, routes every group of its bound, the node's
+/// among them, so the node's is complete without work.
+async fn covered_by_parent(
+    pool: &Pool,
+    correction: &PendingCorrection,
+) -> Result<bool, CorrectionError> {
+    let Some(parent) = correction.parent_oid else {
+        return Ok(false);
+    };
+    if correction.kind != partitions::Kind::GoneNode.as_str() {
+        return Ok(false);
+    }
+    let client = pool.get().await?;
+    let alive: bool = client
+        .query_one(
+            "select exists (select 1 from pg_catalog.pg_class where oid = $1::bigint::oid)",
+            &[&i64::from(parent)],
+        )
+        .await?
+        .get(0);
+    Ok(!alive)
+}
+
+/// Whether `correction` is a gone node whose detach is still pending.
+///
+/// The node's `pg_inherits` row is there, `inhdetachpending`, until the
+/// detach is final. A writer with an older snapshot can still write through
+/// the parent into a detach-pending leaf, and `DETACH ... FINALIZE` waits for
+/// those writers, so only a node that has left the tree has all its changes
+/// in the ring. A node attached again since has a row that is not pending:
+/// its correction runs, and every key it corrects reads the source as it is.
+async fn detach_pending(
+    client: &impl GenericClient,
+    correction: &PendingCorrection,
+) -> Result<bool, CorrectionError> {
+    if correction.kind != partitions::Kind::GoneNode.as_str() {
+        return Ok(false);
+    }
+    Ok(client
+        .query_one(
+            "select exists (select 1 from pg_catalog.pg_inherits \
+                            where inhrelid = $1::bigint::oid and inhdetachpending)",
+            &[&u32_param(correction.node_oid)],
+        )
+        .await?
+        .get(0))
 }
 
 /// Records `correction` done for `definition` with no work (its parent's
@@ -1095,25 +1207,8 @@ async fn start(
     fence: &ClaimFence<'_>,
 ) -> Result<Started, CorrectionError> {
     let mut client = pool.get().await?;
-    if correction.kind == partitions::Kind::GoneNode.as_str() {
-        // The node's `pg_inherits` row is there, `inhdetachpending`, until
-        // the detach is final. A writer with an older snapshot can still
-        // write through the parent into a detach-pending leaf, and `DETACH
-        // ... FINALIZE` waits for those writers, so only a node that has left
-        // the tree has all its changes in the ring. A node attached again
-        // since has a row that is not pending: its correction runs, and every
-        // key it re-derives reads the source as it is.
-        let pending: bool = client
-            .query_one(
-                "select exists (select 1 from pg_catalog.pg_inherits \
-                                where inhrelid = $1::bigint::oid and inhdetachpending)",
-                &[&u32_param(correction.node_oid)],
-            )
-            .await?
-            .get(0);
-        if pending {
-            return Ok(Started::Pending);
-        }
+    if detach_pending(&**client, correction).await? {
+        return Ok(Started::Pending);
     }
     let txn = client.transaction().await?;
     fence.arm(&*txn).await?;
