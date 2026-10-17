@@ -716,9 +716,15 @@ it adds its region's partials to the groups as increments.
 - **Must:** a source truncate's page resets every chunk whose snapshot saw
   the truncate to not-run ([Truncate](#truncate-ddl-drop)).
 - **Must:** over a source keyed by nullable columns (another aggregate's
-  target), the build counts the rows whose key has a `NULL` part, which no
-  key range holds. [OPEN: how, for example a recompute of their groups
-  after the walk. Decided with the recompute producers in #1102.]
+  target, or a source with `UNIQUE NULLS NOT DISTINCT`), the rows whose key
+  has a `NULL` part, which no key range holds, get a build chunk of their
+  own, whose region is "any key part is `NULL`". It is a chunk like any
+  other: it takes its snapshot, runs its `GROUP BY` and adds its partials
+  under the group locks; the chunk gate judges a side whose key has a
+  `NULL` part by it (not run skips, done refuses what its snapshot saw,
+  retired applies); a recompute during the build counts those rows only
+  once it is done or retired; and a source truncate resets it like any
+  chunk whose snapshot saw the truncate.
 - **Must:** a rebuild over a target that already has groups
   (`request_backfill`, a capture re-install) does not pause the definition,
   and is an absolute write under R1, R5, R6 and R8 that covers the target's
@@ -817,11 +823,32 @@ exact with pages applying throughout.]
   plan and sweep jobs, so the status already reads `backfilling` when the
   call returns). The only repair that is not a rebuild is a quarantine
   release (`release_key`): on a 1-1 target a per-key Re-derive (a staged
-  `Recompute`) of the one key. [OPEN: a release on an aggregate, either
-  restaging the key's exact images or recomputing its groups. Decided with
-  quarantine under the group basis in #1102.] A
-  repair a caller waits on is therefore visible in the status, never parked
-  where only the repair knows it hasn't run.
+  `Recompute`) of the one key, and on an aggregate a recompute of the key's
+  groups (below). A repair a caller waits on is therefore visible in the
+  status, never parked where only the repair knows it hasn't run.
+- **Must (a release on an aggregate):** while a key is held its changes are
+  skipped for the aggregate, so the groups it feeds drift until the release;
+  `await_converged` and `self_check` hold back on a held key with parked
+  changes. A release, and the automatic retry of a held key, recompute every
+  group the key could owe (R8): every group named by the old and new images
+  of the changes skipped while it was held, including the change that
+  evicted it, plus the group of the key's current row. A resume's rebuild
+  covers these groups with the rest. The recompute is the ordinary group
+  recompute, an absolute write under R1, R5, R6 and R8 with its lock
+  statement first; the key's changes still in the ring after the release
+  apply as deltas, filtered by each group's basis like any page's.
+- **Must:** the parked changes are discarded, not replayed, so a held key's
+  parked row stays one folded row per key and carries no transition images.
+  The recompute is absolute, so it is exact whatever other absolute writes
+  (another key's release, the recompute of a group an image-less change
+  names, a rebuild) reached those groups during the hold.
+- **Must:** on a JOIN side, the release recomputes the side's `P`/`M` cells
+  for those groups and carries the change to `T` under the `J` lock (JR1–JR3
+  in [ADR-0019](0019-join-transforms.md)).
+- A release's recompute holds its groups' locks for its whole `GROUP BY`
+  ([the cost above](#absolute-group-writes-lock-first-and-cover-every-group-they-could-owe));
+  without an index leading with the group key it scans the source, and pages
+  touching those groups wait for it.
 
 ### A change Trellis never saw stays wrong until it is detected and repaired
 
