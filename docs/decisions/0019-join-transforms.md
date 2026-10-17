@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: draft
 date: 2026-10-17
 deciders: Michael Ries
 ---
@@ -38,18 +38,31 @@ out of scope.
 
 ### A JOIN transform is two tables, an equi-join and a `GROUP BY`
 
-The two sides are two different tables, each a captured table, a partitioned
-root, or another transform's target. The join is `INNER` or `LEFT`, and `a` is
-the side `LEFT` keeps. `ON` is one or more equalities, each between a column of
-`a` and a column of `b`, joined by `AND`; the pair's types must match and a text
-pair's collation must be the same deterministic collation on both sides, so that
-grouping by the key and joining on it agree on equality. `GROUP BY` takes columns
-from either side, and every column reference is qualified by its side's table
-name.
+The two sides are two different tables, each a captured table with a primary
+key, a partitioned root, or another transform's target (which needs no primary
+key). The join is `INNER` or `LEFT`, and `a` is the side `LEFT` keeps. `ON` is
+one or more equalities between a column of `a` and a column of `b`, joined by
+`AND`. The join-key collations must match and be deterministic, so that grouping
+by the key and joining on it agree on equality. The join may be many-to-many:
+`b`'s join key needn't be unique, and the results match SQL's fan-out. A `NULL`
+join key never matches, so a `LEFT` row with no match lands in the group with a
+`NULL` `gb`. `GROUP BY` is required, with at least one key, and takes columns
+from either side. A JOIN transform has no relationship paths. `WHERE` stays
+`TRUE`-only, as on every transform; a future `WHERE` applies after the join, as
+in SQL.
 
-What's admitted is the shape the design below is proven exact for. An
-expression or one-side predicate in `ON`, a self-join, `RIGHT`, `FULL`, `CROSS`,
-a third table and a join with no `GROUP BY` are refused at define;
+[OPEN: the syntax surface: how a column reference names its side (the table
+name, an alias, or a bare name unique to one side), whether a bare `JOIN` means
+`INNER`, which `ON` shapes beyond column equalities are admitted (expression
+keys and one-side predicates decompose by key too), what two `GROUP BY` keys
+with the same column name (`a.id`, `b.id`) are called in the target, and the
+join-key type rule. Decided in #1106. Recommendation: references qualified by
+the side's table name with bare names refused, a bare `JOIN` as `INNER`,
+column equalities only, same-named keys refused, and matching key types.]
+
+What's admitted is the shape the design below is proven exact for. A self-join,
+`RIGHT`, `FULL`, `CROSS`, a third table, a join with no `GROUP BY` and a non-equi
+`ON` are refused at define;
 [Supported sources and targets](../transforms.md#supported-sources-and-targets)
 lists each refusal and its remedy. A join with no `GROUP BY` produces one row per
 matching pair, which is per-row state by definition, and a non-equi join (a
@@ -60,7 +73,12 @@ validity-date range, say) doesn't decompose by key at all.
 A JOIN transform admits exactly the aggregates a plain aggregate admits under
 ADR-0002's group basis: `COUNT(*)`, `COUNT(col)`, and `SUM(col)` and `AVG(col)`
 where `col` is `int2`, `int4`, `int8` or `numeric(p,s)` with a declared scale.
-Each argument is a single column of either side. Result types match Postgres:
+An argument may be a column or an expression over one side's columns, as long
+as its result type is admitted: it becomes a partial on that side, kept by
+`f(new) − f(old)` per change exactly like a column. An argument that mixes both
+sides (`SUM(a.x + b.y)`) is refused at define. A field may compose admitted
+aggregates (`COALESCE(SUM(a.x), 0)`), computed from the target group's
+partials whenever its row is written. Result types match Postgres:
 `count` is `bigint`, `sum` over `int2`/`int4` is `bigint`, `sum` over
 `int8`/`numeric` is `numeric`, and `avg` is `numeric`. Every other aggregate is
 refused at define, as on a plain aggregate.
@@ -73,7 +91,7 @@ in the group: a running sum would keep `1.500` after its most precise row left,
 where Postgres shows `1.5`. A `numeric(p,s)` column stores every value at scale
 `s`, so a running sum and every product below carry exactly the scale Postgres
 shows. A product across the sides (`SUM(a.qty * b.price)`) decomposes the same
-way but isn't admitted, because aggregate arguments are single columns.
+way but isn't admitted, because an argument mixing the sides is refused.
 
 ### Each side is aggregated before the join, and the target is their combination
 
@@ -88,6 +106,12 @@ of the last:
   `matches = Σ M.n` over the key.
 - **`T(ga, gb)`**: the target's groups, holding the joined partials
   `Σ_k P[ga,k] ⊗ M[k,gb]`.
+
+`P`, `M`, `J` and `T`'s partials belong to one definition, never shared with
+another, and live in hidden tables in the instance's catalog schema, named by
+definition id, as ADR-0002 places a plain aggregate's partials. The target is a
+plain table holding only the declared columns, and each page writes a group's
+hidden partials, then its visible row.
 
 The product `⊗` multiplies each side's partials by the other side's row count,
 because each `a` row in a cell joins every `b` row in the matching cell:
@@ -122,9 +146,10 @@ values, I measured 51 MB in all, against 15 GB for one materialized row per fact
 
 - **JR1, lock order.** Every writer of `P` or `M` (a page, a build step, a cell
   recompute, a leaf correction) locks `J[k]` `FOR UPDATE` for every non-null
-  key it touches; a `NULL` key joins nothing and takes no lock. Every writer takes its locks in one order: build-chunk rows, the
-  pair's truncate lock row, `J` rows sorted by key, `P` and `M` cells sorted,
-  then `T` groups sorted, each class in one sorted statement.
+  key it touches; a `NULL` key joins nothing and takes no lock. Every writer
+  takes its locks in one order: build-chunk rows, the pair's truncate lock
+  row, `J` rows sorted by key, `P` and `M` cells sorted, then `T` groups
+  sorted, each class in one sorted statement.
 - **JR2, read after the lock.** A writer reads the other side's partials and
   `J.matches` only in statements after its `J` lock statement. Pages and builds
   run under `READ COMMITTED`, so each of those statements sees every writer the
@@ -143,7 +168,10 @@ I modelled this against real PostgreSQL 15 and 18, maintaining six targets at
 once over shared `P`/`M`/`J` (`LEFT` and `INNER`, grouped by both sides, by `b`
 only and by `a` only). 815 deterministic interleavings, each confirmed to reach
 its interleaving by `pg_blocking_pids`, were exact on both versions against the
-`JOIN … GROUP BY` oracle, and so was a randomized soak of about 535k writes. Each
+`JOIN … GROUP BY` oracle, and so was a randomized soak of about 535k writes.
+The model's `a` side locked `J` `FOR SHARE`; `FOR UPDATE` only excludes more,
+and every build and page of my cost runs, which used it on both sides,
+matched the oracle. Each
 rule is necessary: skipping the `a`-side lock, reading `M` before the lock,
 reading the live `b` table, writing `T` in a second transaction, and taking the
 locks unsorted each produced wrong answers or deadlocks. The `a`-side lock
@@ -230,7 +258,7 @@ refuses, naming the column. The join key counts toward the rule, so a fact table
 partitioned on the column it joins by needs nothing more in its `GROUP BY`; one
 partitioned on its own id is refused.
 
-### A build fills `P` and `M` from each source and `T` from them, applying pages from the start
+### A build fills `P` and `M` from each source and `T` from them
 
 A build fills `P` and `M` with ADR-0002's group-basis build, each a chunk at a
 time, and each chunk carries its cells' contribution into `T` under the same
@@ -245,8 +273,9 @@ per structure was 2–12x cheaper than chunks (84 s against 412–509 s on a 100
 fact table grouped by day and dimension attribute). Which locks make filling `P`
 and `M` by one `GROUP BY` each, and `T` from `P ⋈ M` in one statement, exact
 while both sides take writes, and whether pages can apply during that fill,
-awaits a correctness model. Recommendation: build that way if the model shows it
-exact, and keep chunks otherwise.]
+awaits the build-path correctness model in #1097, and the build itself is
+decided in #1109. Recommendation: build that way if the model shows it exact,
+and keep chunks otherwise.]
 
 ### Define warns when `P` approaches the fact table's size
 
@@ -282,7 +311,8 @@ a second table with different correctness rules.
 ## Example
 
 `orders(id, customer_id, amount numeric(12,2))` has 100M rows, and
-`customers(id, region)` has 50k.
+`customers(id, region)` has 50k. The definition is written in the recommended
+syntax, which is still open (above).
 
 ```text
 TRANSFORM revenue_by_region
@@ -323,12 +353,17 @@ query shows them.
   creates a multixact whenever two overlap.
 - Zero `P` and `M` cells are collected once the drained prefix passes them, as
   ADR-0002's zero groups are; on a hot key, uncollected zero cells made
-  fact-side pages 16x slower. `J` rows are never collected.
+  fact-side pages 16x slower. [OPEN: whether `J` rows, one per distinct key
+  ever seen, are collected once no `P` or `M` cell holds their key, and under
+  which lock a writer that is about to create the row is kept safe. Decided
+  with the apply path in #1108. Recommendation: never collect them, as the
+  model did; their count is bounded by the distinct keys.]
 - Before `await_converged`, readers can see impossible combinations in a JOIN
   target; after it, values are exact.
 - The admitted aggregate set is `COUNT`, `SUM` and `AVG` over integers and
-  scaled `numeric`. Each other aggregate, an expression argument, a product
-  across sides, and the out-of-scope join shapes are refused until designed.
+  scaled `numeric`, with arguments over one side. Each other aggregate, an
+  argument mixing the sides (so a product across them), and the out-of-scope
+  join shapes are refused until designed.
 - Relationships, their reverse propagation and their dedicated tests leave
   Trellis, and a transform that copied a dimension attribute onto every fact row
   has no replacement inside Trellis.

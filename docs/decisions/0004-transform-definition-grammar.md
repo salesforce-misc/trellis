@@ -33,8 +33,8 @@ context:
 * **Key-space** — the granularity definition, which decides the target's
   primary key: a `GROUP BY` list for aggregates, a join clause plus a
   `GROUP BY` list for JOIN transforms, nothing for 1-1. Tiny and closed.
-  Enforces that aggregate columns are wrapped in an aggregate function and a
-  JOIN transform's columns are side-qualified.
+  Enforces that aggregate columns are wrapped in an aggregate function and
+  that each of a JOIN transform's column references resolves to one side.
 * **Calculated-field expressions** — the scalar-expression language, reused for
   every calculated field.
 * **Partial-data predicate** — the same expression grammar with a `-> bool`
@@ -158,25 +158,22 @@ shape:
 
   ```text
   TRANSFORM <target>
-  FROM <a> [INNER | LEFT] JOIN <b> ON <a>.<col> = <b>.<col> [AND ...]
-  GROUP BY <side>.<col>[, <side>.<col>...]
-  SELECT <side>.<col> AS <field>, <aggregate>(<side>.<col>) AS <field> [, ...]
+  FROM <a> [INNER | LEFT] JOIN <b> ON <equalities between a and b>
+  GROUP BY <columns of a and/or b>
+  SELECT <group columns>, <aggregates over a and/or b>
   ```
 
-  The join kind is SQL's prefix, and a bare `JOIN` is `INNER`. `<cond>` is one or
-  more `=` comparisons, each between a column of `a` and a column of `b`, joined
-  by `AND`. Every column reference in `ON`, `GROUP BY` and `SELECT` is qualified
-  by its side's table name, which is how a reference says which side it reads;
-  a bare name is refused. Each `GROUP BY` key becomes a target column named
-  after its bare column, as on a plain aggregate, so two keys with the same
-  column name (`a.id`, `b.id`) are refused. Aggregates take one side-qualified
-  column (or `*` for `COUNT`), from the set ADR-0019 admits.
-  `RIGHT`, `FULL`, `CROSS`, a second `JOIN`, a table joined to itself (there
-  are no table aliases), a `JOIN` with no `GROUP BY`, and an
-  `ON` that isn't a conjunction of cross-side column equalities are recognized
-  and refused by name. Relationship reference syntax is defined with the
-  relationship feature ([0006-relationships](0006-relationships.md)), which
-  JOIN transforms replace.
+  `<cond>` is one or more equalities between a column of `a` and a column of
+  `b`, joined by `AND`. An aggregate argument reads one side; one mixing both
+  sides is refused, and the admitted aggregates are ADR-0019's. A JOIN
+  transform has no relationship paths. `WHERE` stays `TRUE`-only; a future
+  `WHERE` applies after the join, as in SQL, so adding it changes nothing a
+  JOIN transform already means. `RIGHT`, `FULL`, `CROSS`, a second `JOIN`, a
+  table joined to itself and a `JOIN` with no `GROUP BY` are recognized and
+  refused by name. How a column reference names its side, and the rest of the
+  reference syntax, is settled in ADR-0019. Relationship reference syntax is
+  defined with the relationship feature
+  ([0006-relationships](0006-relationships.md)), which JOIN transforms replace.
 
 ## Growth policy
 
