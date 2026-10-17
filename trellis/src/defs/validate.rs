@@ -1607,7 +1607,6 @@ fn validate_target_names(def: &TransformDef) -> Result<(), ValidationError> {
 /// (`catalog::JoinColumn`), plus the [`ValueType`] and whether the type is a
 /// live enum.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // the install path consumes it when JOIN targets are built
 pub struct JoinColumnInfo {
     pub value_type: ValueType,
     /// `format_type(atttypid, atttypmod)`, e.g. `numeric(10,2)`.
@@ -1624,7 +1623,6 @@ pub struct JoinColumnInfo {
 
 /// Which table of a `JOIN` a column belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // the install path consumes it when JOIN targets are built
 enum JoinSide {
     Left,
     Right,
@@ -1656,7 +1654,6 @@ pub(crate) fn is_deferred_aggregate_name(name: &str) -> bool {
 
 /// The one column argument of an aggregate call, as
 /// [`check_aggregate_admitted`] needs it.
-#[allow(dead_code)] // the install path consumes it when JOIN targets are built
 pub(crate) struct AggregateArg<'a> {
     pub column: &'a str,
     pub value_type: ValueType,
@@ -1674,7 +1671,6 @@ pub(crate) struct AggregateArg<'a> {
 ///
 /// Shared so every key-space refuses the same way. A `JOIN` uses it today;
 /// the plain aggregate adopts it when #1105 removes the ledger.
-#[allow(dead_code)] // the install path consumes it when JOIN targets are built
 pub(crate) fn check_aggregate_admitted(
     function: &str,
     arg: Option<&AggregateArg<'_>>,
@@ -1722,7 +1718,6 @@ pub(crate) fn check_aggregate_admitted(
     }
 }
 
-#[allow(dead_code)] // the install path consumes it when JOIN targets are built
 fn written(column: &QualifiedColumn) -> String {
     match &column.schema {
         Some(schema) => format!("{schema}.{}.{}", column.table, column.column),
@@ -1740,7 +1735,6 @@ fn written(column: &QualifiedColumn) -> String {
 /// and each field is a key passthrough or `COUNT(*)`, `COUNT(col)`,
 /// `SUM(col)` or `AVG(col)` over one column of either table, per
 /// [`check_aggregate_admitted`].
-#[allow(dead_code)] // the install path consumes it when JOIN targets are built
 pub fn validate_join(
     def: &TransformDef,
     left: &HashMap<String, JoinColumnInfo>,
@@ -1753,6 +1747,13 @@ pub fn validate_join(
     if join.right == def.source {
         return Err(ValidationError::JoinSelf {
             table: def.source.clone(),
+        });
+    }
+    // The joined table is a source too: writing the target into it would
+    // feed Trellis's own writes back into capture.
+    if def.target == join.right {
+        return Err(ValidationError::TargetEqualsSource {
+            table: def.target.clone(),
         });
     }
 
@@ -1907,6 +1908,13 @@ pub fn validate_join(
                     ));
                 }
             }
+            // A dotted name whose head is neither table: a JOIN transform
+            // has no relationship paths.
+            Expr::RelationshipPath { rel, column } => {
+                return Err(ValidationError::JoinUnknownTable {
+                    reference: format!("{rel}.{column}"),
+                });
+            }
             Expr::FunctionCall { name, args } => {
                 if is_deferred_aggregate_name(name) {
                     check_aggregate_admitted(name, None)?;
@@ -1951,6 +1959,11 @@ pub fn validate_join(
                         return Err(ValidationError::JoinUnqualifiedColumn {
                             field: field.name.clone(),
                             column: column.clone(),
+                        });
+                    }
+                    [Expr::RelationshipPath { rel, column }] => {
+                        return Err(ValidationError::JoinUnknownTable {
+                            reference: format!("{rel}.{column}"),
                         });
                     }
                     _ => {
@@ -5969,6 +5982,39 @@ mod tests {
             validate_join(&def, &left, &right),
             Err(ValidationError::JoinSelf { .. })
         ));
+    }
+
+    #[test]
+    fn join_refuses_a_target_named_after_the_joined_table() {
+        assert_eq!(
+            check_text(
+                "TRANSFORM items FROM orders JOIN items ON orders.id = items.order_id \
+                 GROUP BY orders.region SELECT COUNT(*) AS n",
+            ),
+            Err(ValidationError::TargetEqualsSource {
+                table: "items".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn join_reads_a_dotted_name_of_neither_table_as_an_unknown_table() {
+        for select in [
+            "orders.region AS region, author.name AS name",
+            "orders.region AS region, SUM(author.age) AS s",
+        ] {
+            assert_eq!(
+                check(select),
+                Err(ValidationError::JoinUnknownTable {
+                    reference: if select.contains("SUM") {
+                        "author.age".to_string()
+                    } else {
+                        "author.name".to_string()
+                    }
+                }),
+                "{select}"
+            );
+        }
     }
 
     #[test]

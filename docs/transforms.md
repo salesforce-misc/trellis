@@ -43,7 +43,7 @@ a key, index or policy itself.
 | A bare name that could mean a source column or a field: the name of a source column and of a field whose expression is not just that column, read by another field (`(grp + 1) AS val, SUM(val) AS total`). An aggregate field's name inside another aggregate's argument is not ambiguous: it is the source column ([Calculated Fields](#calculated-fields)). | Yes (`AmbiguousColumnReference`), naming both meanings. `val AS val` passes the column through, so reading `val` elsewhere is not ambiguous. | A source column added later under the name of a field: nothing is detected, and the transform keeps reading the field. An `ALTER TRANSFORM` that adds a field of that name is refused, as define would. `RESUME` re-validates and refuses what define would: in an aggregate target, a field another field reads by that name, and in a 1-1 target, any field of that name. | At define, write `src.val` or `public.src.val` to read the source column, or rename the field and read it by its new name. After a later column, rename or drop that column and `RESUME`, or drop the transform and define it again. |
 | A relationship named after its from-table (`RELATIONSHIP posts FROM posts.author_id TO users.id`) | Yes, when it's declared. A transform over `posts` reads `posts.<column>` as its own source column, so the relationship's paths could never be read. | n/a | Give the relationship another name. |
 | A `JOIN` transform (`FROM a [LEFT\|INNER] JOIN b ON … GROUP BY … SELECT …`) | Yes (`JoinNotInstallable`). The definition parses and passes the checks in the rows below, then define refuses it: nothing builds a `JOIN` target yet (epic [#1091](https://github.com/salesforce-misc/trellis/issues/1091)). | n/a | Use a [relationship](#relationships) with an aggregate over its to-many path. |
-| A `JOIN` that is `RIGHT`, `FULL`, `CROSS` or `NATURAL`; joins a table to itself; has no `GROUP BY`; has an `ON` that is anything but equalities between a column of each table joined by `AND` (`OR`, `<`, a literal, an expression, two columns of one table); or reads a column without its table (`SUM(qty)`, `GROUP BY region`) | Yes (parse error, or `JoinSelf`, `JoinOnSameSide`, `JoinUnqualifiedColumn`, `JoinUnknownTable`, `JoinUnresolvedColumn`). Only `INNER` and `LEFT` equi-joins of two different tables are admitted, with every column written `<table>.<column>`. A field is a `GROUP BY` key from either table, or `COUNT(*)`, or `COUNT`/`SUM`/`AVG` of one column from either table. | n/a | Rewrite the definition in the admitted shape. |
+| A `JOIN` that is `RIGHT`, `FULL`, `CROSS` or `NATURAL`; joins a table to itself; joins a third table; has no `GROUP BY`; has an `ON` that is anything but equalities between a column of each table joined by `AND` (`OR`, `<`, a literal, an expression, two columns of one table); reads a column without its table (`SUM(qty)`, `GROUP BY region`) or through a table that is neither side (a relationship path); or has a field that is anything but a `GROUP BY` key or an aggregate of one column (`SUM(items.qty + 1)`) | Yes (parse error, or `JoinSelf`, `JoinOnSameSide`, `JoinUnqualifiedColumn`, `JoinUnknownTable`, `JoinUnresolvedColumn`, `JoinFieldShape`). Only `INNER` and `LEFT` equi-joins of two different tables are admitted, with every column written `<table>.<column>`. A field is a `GROUP BY` key from either table, or `COUNT(*)`, or `COUNT`/`SUM`/`AVG` of one column from either table. | n/a | Rewrite the definition in the admitted shape. |
 | A `JOIN` whose `ON` columns differ in type, type modifier or collation, are off the join-key allowlist, or have a nondeterministic collation; or a `GROUP BY` key of a type that can't be one | Yes (`JoinKeyTypeMismatch`, `JoinUnsupportedKeyType`, `JoinNondeterministicCollation`, `UnsupportedGroupByKeyType`). The same rules as a relationship's join columns and a `GROUP BY` key. | n/a | Alter one column to match the other. |
 | `MIN`/`MAX`, `bool_and`/`bool_or`/`bit_and`/`bit_or`, float or `interval` `SUM`/`AVG`, or `array_agg`/`string_agg`/`jsonb_agg` in a `JOIN` transform. Plain aggregates keep these until [#1105](https://github.com/salesforce-misc/trellis/issues/1105) removes the per-row ledger. | Yes (`DeferredAggregate`), named by family. Only the aggregates kept exact by signed deltas are admitted. | n/a | Not supported yet: [#1117](https://github.com/salesforce-misc/trellis/issues/1117) (`MIN`/`MAX`), [#1118](https://github.com/salesforce-misc/trellis/issues/1118) (`bool_*`/`bit_*`), [#1119](https://github.com/salesforce-misc/trellis/issues/1119) (float and `interval`), [#1040](https://github.com/salesforce-misc/trellis/issues/1040) (`array_agg`/`string_agg`/`jsonb_agg`). |
 | `SUM` or `AVG` over an unconstrained `numeric` column, or over any type but `smallint`, `integer`, `bigint` and `numeric(p,s)`, in a `JOIN` transform | Yes (`UnconstrainedNumericAggregate`, `UnsupportedAggregateArgument`). Postgres shows a sum with as many decimal places as the most precise value in the group, which a running sum can't track; a declared scale removes the mismatch. | n/a | Declare a scale (`ALTER TABLE … ALTER COLUMN … TYPE numeric(p,s)`), or wait for [#1120](https://github.com/salesforce-misc/trellis/issues/1120). |
@@ -144,28 +144,11 @@ it first (`benchmark group-contention --groups <n>`).
 
 ### Join aggregate
 
-An aggregate over the join of two tables, written with `JOIN` between `FROM`
-and `GROUP BY`:
-
-```sql
-TRANSFORM sales_by_region
-FROM orders
-LEFT JOIN items ON orders.id = items.order_id
-GROUP BY orders.region, items.sku
-SELECT orders.region AS region, items.sku AS sku,
-       COUNT(*) AS lines, SUM(items.qty) AS units
-```
-
-The target's primary key is the `GROUP BY` columns, as for any aggregate;
-each key may come from either table. The join is `INNER` (the default) or
-`LEFT [OUTER]`: with `LEFT`, an `orders` row with no `items` still counts,
-its `items` columns null. The `ON` clause is one or more equalities, joined by
-`AND`, each between a column of each table, and the two columns must have the
-same type, type modifier and collation (the [relationship](#relationships)
-join-column rules). Every column is written `<table>.<column>`. A field is a
-`GROUP BY` key, `COUNT(*)`, or `COUNT`, `SUM` or `AVG` of one column from
-either table. [Supported sources and targets](#supported-sources-and-targets)
-lists what is refused, and which aggregates are admitted.
+An aggregate over the join of two tables (`FROM a [LEFT|INNER] JOIN b ON …
+GROUP BY …`). Define checks it and then refuses it: nothing builds its target
+yet. [Supported sources and targets](#supported-sources-and-targets) lists the
+checks; epic [#1091](https://github.com/salesforce-misc/trellis/issues/1091)
+builds the rest.
 
 ## Relationships
 

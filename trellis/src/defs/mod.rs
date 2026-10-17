@@ -438,6 +438,16 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_second_join() {
+        let (construct, detail) = refusal(
+            "TRANSFORM t FROM a JOIN b ON a.k = b.k LEFT JOIN c ON b.j = c.j \
+             GROUP BY a.g SELECT COUNT(*) AS n",
+        );
+        assert_eq!(construct, "JOIN");
+        assert!(detail.contains("exactly two tables"), "{detail}");
+    }
+
+    #[test]
     fn join_group_by_keys_must_be_qualified() {
         let (construct, _) =
             refusal("TRANSFORM t FROM a JOIN b ON a.k = b.k GROUP BY g SELECT COUNT(*) AS n");

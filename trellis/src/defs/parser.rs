@@ -816,6 +816,15 @@ impl Parser {
                 "ON admits only equalities joined by AND, not OR",
             ));
         }
+        if ["JOIN", "LEFT", "INNER", "RIGHT", "FULL", "CROSS", "NATURAL"]
+            .iter()
+            .any(|kw| self.peek_is_keyword(kw))
+        {
+            return Err(unsupported(
+                "JOIN",
+                "a JOIN transform joins exactly two tables; a second JOIN is not supported",
+            ));
+        }
 
         if !self.peek_is_keyword("GROUP") {
             return Err(unsupported(
