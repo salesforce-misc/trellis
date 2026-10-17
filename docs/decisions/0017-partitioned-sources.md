@@ -415,9 +415,10 @@ grouped `BY product_id` is refused at define, naming `order_id`.
 - After a dump and restore into another cluster the pass detects the new oids
   and pauses every definition on a partitioned source, holding stale values
   until an operator runs `RESUME`, which rebuilds.
-- Four cases are left as [known correctness gaps](../known-correctness-gaps.md)
+- Five cases are left as [known correctness gaps](../known-correctness-gaps.md)
   rather than designed around, because no capture shape or fingerprint sees
   them: "A `MERGE` that moves a row to another partition", "A `DEFAULT`
   partition beside a leaf created and dropped within one pass", "A
   partitioned source attached under another table and detached within one
-  pass" and "A partitioned source renamed away and back within one pass".
+  pass", "A partitioned source renamed away and back within one pass" and "A
+  leaf detached and attached again around a `pg_upgrade`".

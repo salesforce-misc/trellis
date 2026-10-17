@@ -1496,6 +1496,30 @@ mod tests {
     }
 
     #[test]
+    fn a_pg_upgrade_still_finds_a_new_or_moved_leaf() {
+        let mut live = base();
+        for n in &mut live.nodes {
+            n.inherits_xmin = n.inherits_xmin.as_ref().map(|_| "1".to_string());
+        }
+        // Leaf 3 moved under a new middle 4 with the same bound text, and a
+        // new leaf 5.
+        let mut middle = node(4, Some(1), "FOR VALUES IN (2, 3)", "1");
+        middle.partitioned = true;
+        live.nodes[2].parent = Some(4);
+        live.nodes.push(middle);
+        live.nodes.push(node(5, Some(1), "FOR VALUES IN (4)", "1"));
+        assert_eq!(
+            classify_cluster(Some("a"), "b", &base(), &live),
+            ClusterChange::PgUpgrade
+        );
+        let plan = plan(Some(&rebaseline(&base(), &live)), &live, false);
+        let mut found: Vec<(u32, Cause)> =
+            plan.corrections.iter().map(|c| (c.node, c.cause)).collect();
+        found.sort_by_key(|(n, _)| *n);
+        assert_eq!(found, [(3, Cause::Reattached), (5, Cause::Created)]);
+    }
+
+    #[test]
     fn a_changed_identifier_with_a_missing_oid_or_another_bound_is_a_restore() {
         let mut gone = base();
         gone.nodes.pop();

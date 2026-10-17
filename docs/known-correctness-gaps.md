@@ -116,6 +116,7 @@ These are the tools the entries refer to:
 | 25 | A `MERGE` moving a row to another partition, once partitioned sources are supported (#897) | yes | `self_check` (1-1 targets only) | none; reported to Postgres (#942) |
 | 26 | A partitioned source renamed away and back within one pass, once partitioned sources are supported (#897) | yes | no | none filed |
 | 27 | A `DEFAULT` partition beside a leaf created and dropped within one pass, once partitioned sources are supported (#897) | yes | no | none filed |
+| 28 | A leaf detached, written and attached again under the same bound around a `pg_upgrade`, with no pass between, once partitioned sources are supported (#897) | yes | no | none filed |
 
 ## 1. A rewriting `ALTER COLUMN TYPE … USING`
 
@@ -802,6 +803,34 @@ siblings don't, so no group routes to no partition.
 
 **Workaround:** delete a short-lived leaf's rows through the parent before
 dropping or detaching it, or keep the leaf until a reconcile pass has run.
+
+**Repair:** `PAUSE`/`RESUME` the transforms that read the table, or
+`request_backfill` it.
+
+## 28. A leaf detached and attached again around a `pg_upgrade`
+
+**Trigger:** on a partitioned source, a leaf detached, written while
+detached, and attached again under the same parent and bound, with no
+reconcile pass completing a deep check between that and a `pg_upgrade`:
+after the last pass on the old cluster, or after the upgrade and before the
+first pass on the new one completes. It applies once partitioned sources are
+supported (epic #897). Outside an upgrade, the pass sees such a leaf by its
+new `pg_inherits.xmin` and corrects it.
+
+**Effect:** silent. A detached leaf's capture functions stage nothing, and
+`pg_upgrade` resets every `xmin`. The pass recognizes the upgrade by a
+changed `system_identifier` with every recorded oid present under its
+recorded bound, and records the new `xmin`s instead of comparing them, so the
+leaf reads as unchanged. The groups the missed writes touched stay as they
+were.
+
+**Detected?** No.
+
+**Planned work:** none.
+
+**Workaround:** let a reconcile pass run after partition maintenance before
+shutting the cluster down for the upgrade, and after the upgrade don't detach
+or attach a source's partitions until a pass has run.
 
 **Repair:** `PAUSE`/`RESUME` the transforms that read the table, or
 `request_backfill` it.
