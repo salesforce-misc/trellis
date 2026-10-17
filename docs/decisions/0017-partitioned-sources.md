@@ -180,8 +180,9 @@ that commits its keys' entries and its progress together, so a restart resumes
 after the last committed page: the ledger walk in `(group, key)` order, then the
 node's rows in primary-key order.
 
-A correction runs for each aggregate as a row of the build-chunk queue, which
-the pass that queues the correction enqueues. The drain workers claim it as
+A correction runs for each definition that reads the source, an aggregate over
+it or a definition reading it through a to-many relationship, as a row of the
+build-chunk queue, which the pass that queues the correction enqueues. The drain workers claim it as
 they claim a build chunk, behind the ring's backlog, and give it back after
 about a second of pages. The claim makes one runner per correction and
 definition at a time, the stale-claim sweep frees the row of a runner that
@@ -204,7 +205,29 @@ write a key the walk has no entry for. Waiting for the ring to fold through a
 position would never finish on a busy ring, whose active segment is never empty.
 
 For a to-many target, the correction is "recompute the routed parents" through
-the normal Recompute path: no target row is ever deleted.
+the normal Recompute path: no target row is ever deleted. A parent routes to
+the node when the node's recorded text holds over its join value, presented as
+the to-side's join column and cast to its recorded type and collation. Every
+row of a node holds the text, so the routed parents are every parent of a row
+the node holds or held, and a node in the tree needs no read of its own rows.
+The correction walks the from-side in primary-key order, in pages that each
+stage a recompute of their parents (the one a child's change stages) and
+commit the progress with it. The drain reads each parent's children live, so
+a parent whose last child went away reads 0, and a child's change staged
+before the DDL and drained after recomputes from the live rows too: the
+correction stamps no `build_seg` and waits on no fence. A gone node without a
+usable text has its detached table's rows read instead, and their parents
+recomputed. Staging a recompute does not write the target, and a to-many target
+has no group deltas for the build's completion to wait on, so the last page
+records the segment active at its commit, read under the share lock that keeps
+the seal from moving it, and the correction's row is done only once every
+segment through that one has drained. Until then the definition reports
+`backfilling`, and a `keys_remaining` of 0 means every recompute is staged, not
+yet applied. The wait is for a fixed segment, which seals and drains as the ring
+rotates, not for an empty ring. When that segment is still the active one and
+holds nothing, with no straggler of the one before it, the last page staged
+nothing after the earlier pages' segment sealed, and only the segments before
+it are waited for: an idle ring never seals an empty segment.
 
 My cleanup measurements deleted a leaf's routed rows from a model target, a
 virtual sum with no ledger and no real Apply, then re-aggregated the leaf. That
