@@ -1319,6 +1319,17 @@ async fn a_worker_that_dies_before_the_last_page_commits_is_resumed_from_its_pro
         .execute("select pg_advisory_unlock($1)", &[&KEY])
         .await
         .expect("release");
+    // `pg_terminate_backend` only signals: the dying backend still holds the
+    // page's row locks until it has rolled back, and the reclaim sweep skips
+    // locked rows (#1124). A blocking lock on the chunk returns exactly when
+    // that rollback has released it.
+    fx.d.ctl
+        .execute(
+            "select 1 from backfill_chunks where kind = 'correction' for update",
+            &[],
+        )
+        .await
+        .expect("wait out the dead worker's rollback");
 
     let saved = partition_correction::progress(&fx.d.ctl, correction.id, definition)
         .await
