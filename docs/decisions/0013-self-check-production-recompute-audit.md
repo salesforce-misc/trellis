@@ -1,20 +1,21 @@
 ---
-status: accepted
-date: 2026-09-19
+status: draft
+date: 2026-10-17
 deciders: Michael Ries
 ---
 
 # `self_check`: A Production Recompute Audit
 
 Trellis's one hard correctness promise is convergence to a from-scratch recompute
-at any caught-up LSN — **byte-identical** for almost every value, and **up to the
-type's own `=`** for the narrow class of aggregate results where byte-identity
-would be stricter than correctness (see [Comparison semantics](#comparison-semantics-byte-identical-except-non-injective-aggregate-folds)
+at any caught-up LSN, **byte-identical** (see [Comparison semantics](#comparison-semantics-byte-identical)
 below). The failure mode that promise guards
 against is a *silently stale target*: a wrong answer with no error raised and no
 metric out of range, invisible without an independent recompute. `self_check` makes
 that recompute a shipped, operator-callable capability instead of something only the
-test suite can perform.
+test suite can perform. It is also the only way an aggregate or JOIN target's drift
+is found: those targets don't repair a change Trellis never saw
+([ADR-0002](0002-async-data-flow.md#a-change-trellis-never-saw-stays-wrong-until-it-is-detected-and-repaired)),
+so `self_check` detects it and the operator repairs it.
 
 ## Decisions
 
@@ -49,8 +50,7 @@ open on the instance, read when it is polled.
   marks its jobs `cancelled`; a job whose worker vanished is taken over by
   another worker after a TTL and resumes at its saved cursor; dropping the
   transform deletes the job's row, which ends the walk.
-* **Refused at the start**: an unknown target, an aggregate or relationship
-  target (see [Scope](#scope-1-1-targets)).
+* **Refused at the start**: an unknown target.
 
 Fleet-wide sweeps are a caller-side loop over `definitions()`, not a behaviour
 of the primitive. There is no cursor-paged variant of the call: paging is how a
@@ -65,8 +65,8 @@ is invisible to the convergence wait: convergence is a predicate over ring
 rows, and a capture that has stopped writes none. So before it awaits or
 compares anything, `self_check` reads from the catalog (`pg_trigger`,
 `pg_proc`, `pg_class`, `pg_inherits` and the `has_*_privilege` functions) that every table
-the target is computed from (its source and the to-side of each relationship
-it reads through, less any this instance's seam feeds) is still captured as
+the target is computed from (its source, or both sides of a JOIN, less any
+this instance's seam feeds) is still captured as
 the staging worker installed it:
 
 - all five capture triggers exist, are `ENABLE ALWAYS` (`tgenabled = 'A'`),
@@ -124,30 +124,18 @@ the answer from source rows independently. This also matches the failure class t
 audit exists to catch: a stale target diverges as persisted-vs-recompute, where an
 independent query is exactly the detector and the evaluator adds nothing.
 
-### Comparison semantics: byte-identical, except non-injective aggregate folds
+### Comparison semantics: byte-identical
 
-`self_check` compares a persisted cell against its recompute **byte-for-byte** by
-default. Byte-identity is the strongest, simplest yardstick — "diff the text" — and
-it is exactly what the join/`GROUP BY`/primary-key roles rely on, so keys are
-**always** compared byte-for-byte, no exception.
-
-There is one narrow class where byte-identity is *stricter than correctness*:
-`MIN`/`MAX` folded over a type whose `=` admits several textually-distinct
-representatives of the same value. `real`/`double precision` (`-0` `=` `0`,
-rendered `-0` and `0`) and `interval` (`'1 day'` `=` `'24 hours'`) are the known
-cases. Postgres's `min`/`max` is a fold that returns *whichever tied representative
-the scan saw last* (`float8larger(a,b)` is `a > b ? a : b`), so the persisted text
-and a recompute's text can differ while both are genuinely-correct answers. A
-byte-exact check reports that as a divergence no recomputation can ever settle — a
-false positive in the audit, not a caught bug.
-
-So for **aggregate result cells produced by such a fold**, the promise holds up to the
-type's own `=` (`persisted = recompute`), not the text: a truly wrong `MAX` still fails
-(`3 = 5` is false), but a `-0`/`0` tie does not. The carve-out is tight: it covers only
-`MIN`/`MAX` result cells of these types, never keys, passthrough, or invertible
-aggregates (`SUM`/`AVG`/`COUNT`), which stay byte-identical. `self_check` audits 1-1
-targets only (see [Scope](#scope-1-1-targets)), so every cell it compares is compared
-byte-for-byte.
+`self_check` compares a persisted cell against its recompute **byte-for-byte**.
+Byte-identity is the strongest, simplest yardstick ("diff the text"), and it is
+exactly what the join, `GROUP BY` and primary-key roles rely on. Every admitted
+aggregate meets it: `COUNT` is an integer, and `SUM` and `AVG` take only integer
+or `numeric(p,s)` arguments, so a sum or average kept from partials carries exactly
+the scale Postgres's own `sum()` and `avg()` show
+([ADR-0002](0002-async-data-flow.md#numeric-arguments-declare-their-scale)). An
+aggregate whose `=` admits several textually distinct representatives of one value
+(`MIN`/`MAX` over `real` or `interval`) would need a looser comparison; such
+aggregates are refused at define.
 
 ### The audit query is rendered independently of the write path
 
@@ -177,12 +165,43 @@ re-check after a fresh await** — a genuine divergence is stable; a convergence
 resolves. A strict mode, sound only when writes to the audited tables are stopped, is
 the documented strong guarantee for callers that can quiesce.
 
-### Scope: 1-1 targets
+### Scope: every target; aggregate and JOIN targets detect, never repair
 
-`self_check` audits 1-1 targets; asked for an aggregate or a relationship-enriched
-target it refuses to start a job and returns an error naming the limit
-([known correctness gaps](../known-correctness-gaps.md)). The audit query projects the
-target's key so a divergence is reported per key.
+`self_check` audits 1-1, aggregate and JOIN targets. Every comparison projects the
+target's key (a 1-1 target's primary key, an aggregate's or JOIN's `GROUP BY`
+columns), so a divergence is reported per key.
+
+- **A 1-1 target** is compared row by row against its source.
+- **An aggregate target** is compared a page of groups at a time: each group's
+  hidden partials (its row count, non-null counts and `numeric` sums) against a
+  `GROUP BY` of the source over the same groups, and its visible row against the
+  partials (a row exactly while the row count is above 0, with each field the
+  function of the partials the definition names). A group the source has and the
+  target lacks, or the reverse, is a missing or extra row.
+- **A JOIN target** is compared a page of groups at a time against the `JOIN …
+  GROUP BY` query, and its internal structures are audited against their
+  definitions: each side's per-(group, join key) partials against a `GROUP BY` of
+  that side, each join key's match count against the sum of the other side's row
+  counts for it, and the target's partials against the sum, over join keys, of the
+  products of the two sides' partials
+  ([ADR-0019](0019-join-transforms.md)). A divergence names the structure and the
+  key, so an operator can tell a wrong side from a wrong combination.
+
+For aggregate and JOIN targets `self_check` **detects and reports; it never
+repairs.** A target found wrong is repaired by the operator, with the tools any
+definition has: `request_backfill` of the source table, which rebuilds each reading
+definition without pausing it, or `PAUSE` and `RESUME`. There is no background
+repair sweep. A sweep would put a continuous source `GROUP BY` load on the
+database, hold group locks that compete with pages, and silently mask Trellis's own
+bugs, which an audit exists to surface. A repair of only the groups an audit
+names is additive and can come later.
+
+An aggregate or JOIN page compares the partials under the same convergence rules
+as every page (see [Quiescence](#quiescence-distinguish-diverged-from-not-yet-caught-up)).
+Pages apply out of order, so between them a group's partials can be inconsistent;
+the comparison is meaningful only once the page's convergence wait has returned,
+and a divergence must survive the re-check after a fresh await before it is
+reported.
 
 ### Respect column-level quarantine
 
@@ -206,6 +225,9 @@ standing cost.
   lock, and its caller never waits on it.
 - It needs a drain worker somewhere in the fleet, as a build does; with none, a
   job stays `queued`.
+- Aggregate and JOIN targets depend on it: a change Trellis never saw leaves them
+  wrong until an audit finds it and an operator repairs it, and that repair
+  rebuilds the whole definition.
 - Trellis gains a shipped, public answer to "is this target correct right now,"
   usable by operators, by a thin CLI wrapper, and as a shared end-of-test
   assertion that turns integration tests into correctness tests.

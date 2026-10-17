@@ -18,6 +18,8 @@ number. A deleted ADR's number is never reused: 0007 and 0016 are retired. The
 frontmatter carries `status`, `date` (the day the decision was made or last
 changed) and `deciders`. The status is `draft` while any point is undecided, and
 `accepted` once none is; the code then follows the ADR or is being changed to.
+An ADR whose design is being replaced is `superseded` until the code it
+describes is gone.
 
 - **Record the decision, not the journey.** Describe the design as it is, in the
   present tense, and edit the ADR in place when the design changes. Earlier
@@ -46,7 +48,8 @@ changed) and `deciders`. The status is `draft` while any point is undecided, and
   status becomes `accepted`. A question the ADR leaves open past that becomes
   an issue, not an ADR section.
 - **When an ADR extends another, both say so in one line with a link.** A
-  superseded ADR is deleted, not kept as a stub, and whatever of it survives
+  superseded ADR names its successor in its first line and is deleted, not
+  kept as a stub, once the code it describes is gone; whatever of it survives
   is restated where it now lives.
 - **Keep caveats and refusals in their reference docs.** Correctness gaps live
   only in [known correctness gaps](../known-correctness-gaps.md), cited by
