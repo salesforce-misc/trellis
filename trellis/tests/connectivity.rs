@@ -144,7 +144,7 @@ async fn migrate_up_is_idempotent() {
         // #894 V82 (`resume_requests.timeout_cancels`), and #877 V83
         // (`trellis_instance.target_schema`), #1023 V84 (`self_check_jobs`), #864 V85 (`grammar_version`), #273 V86 (the work-wake triggers), #1047 V87 (they also announce a definition entering `waiting_to_backfill` or `live`), #1061 V88 (`partition_sources`, `partition_corrections`), #861 V89 (`retry_attempts` on `poison` and `key_deaths`), #1075 V90 (a queued `self_check` job announces itself), #1062 V91 (`partition_correction_progress`, `partition_corrections.node_default` and `parent_oid`), #1062 V92 (`backfill_chunks.correction_id`, the `correction` chunk kind), #1063 V93 (the progress's `parents` phase), #1064 V94 (the `truncated` correction kind), #1066 V95 (the `complement` correction kind), #1067 V96 (`partition_sources.system_identifier`), and #1107 V98 (`transform_definitions.join_table` and `join_columns`).
         // V73 is unused.
-        "expected exactly V1 through V7, V9 through V24, V26 through V40, V42 through V51, V53 through V60, V63 through V65, V67 through V72, V74 through V96 to be applied"
+        "expected exactly V1 through V7, V9 through V24, V26 through V40, V42 through V51, V53 through V60, V63 through V65, V67 through V72, V74 through V96, V98 to be applied"
     );
 
     // Running again should be a no-op: same ledger, no error.
