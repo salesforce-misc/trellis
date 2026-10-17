@@ -654,6 +654,7 @@ fn render_rel_select(def: &TransformDef, pk_column: &str, rels: &RelIndex<'_>) -
     let joins = render_joins(def, rels);
 
     match &def.key_space {
+        KeySpace::Join(_) => unreachable!("the generator never produces a JOIN definition"),
         KeySpace::OneToOne => {
             let mut select_list = vec![format!("{source}.{}::text", quote_ident(pk_column))];
             for field in &def.fields {
@@ -724,6 +725,7 @@ fn render_select(def: &TransformDef, pk_column: &str, rels: &RelIndex<'_>) -> St
     }
 
     match &def.key_space {
+        KeySpace::Join(_) => unreachable!("the generator never produces a JOIN definition"),
         KeySpace::OneToOne => {
             let mut select_list = vec![format!("{}::text", quote_ident(pk_column))];
             for field in &def.fields {
@@ -789,6 +791,7 @@ pub async fn sql_oracle(
     let db_rows = client.query(sql.as_str(), &[]).await?;
 
     match &def.key_space {
+        KeySpace::Join(_) => unreachable!("the generator never produces a JOIN definition"),
         KeySpace::OneToOne => {
             let mut rows: Rows = BTreeMap::new();
             for db_row in db_rows {
@@ -867,6 +870,7 @@ pub async fn evaluator_oracle(
     source_columns: &HashMap<String, ValueType>,
 ) -> Result<Rows, OracleError> {
     match &def.key_space {
+        KeySpace::Join(_) => unreachable!("the generator never produces a JOIN definition"),
         KeySpace::OneToOne => {
             let recomputed = recompute(pool, def, pk_column, source_columns).await?;
             let mut rows: Rows = BTreeMap::new();

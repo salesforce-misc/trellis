@@ -1148,6 +1148,9 @@ pub async fn install_definition(
     // `create_definition_inner`'s transaction (issue #440), so the table
     // commits or rolls back together with the catalog row.
     let target_ddl = match &def.key_space {
+        KeySpace::Join(_) => {
+            unreachable!("a JOIN definition is refused by validation, so none reaches here")
+        }
         KeySpace::OneToOne => {
             // Issue #121: the 1-1 target table's own primary key mirrors the
             // source's in full — at whatever arity the source declares it —
@@ -6699,6 +6702,9 @@ async fn reject_unkeyed_source(
             });
         }
         let refusal = match &def.key_space {
+            KeySpace::Join(_) => {
+                unreachable!("a JOIN definition is refused by validation, so none reaches here")
+            }
             KeySpace::OneToOne => Some(super::partition_tree::PartitionRefusal::OneToOneFrom {
                 table: qualified_source.to_string(),
             }),

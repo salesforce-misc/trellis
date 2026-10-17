@@ -369,8 +369,8 @@ pub enum AlterClause {
 ///
 /// [`KeySpace::Aggregate`] (issue #11's groundwork) is a `GROUP BY <cols>`
 /// definition, whose target's primary key is the grouping columns rather
-/// than an inherited source column. Cross-join key-spaces are still rejected
-/// at parse time with a specific error rather than represented here.
+/// than an inherited source column. [`KeySpace::Join`] is the same over the
+/// join of two tables.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeySpace {
     OneToOne,
@@ -382,6 +382,55 @@ pub enum KeySpace {
     Aggregate {
         group_by: Vec<GroupByKey>,
     },
+    /// `FROM a [LEFT|INNER] JOIN b ON <equi-join> GROUP BY <keys>` (ADR-0019,
+    /// epic #1091): an aggregate over the join of two tables.
+    Join(JoinSpec),
+}
+
+/// Which rows of the `FROM` table a [`JoinSpec`] keeps when no `JOIN` table
+/// row matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKind {
+    /// `INNER JOIN` (or bare `JOIN`): a row with no match contributes nothing.
+    Inner,
+    /// `LEFT [OUTER] JOIN`: a row with no match still contributes, with the
+    /// joined side's columns `NULL`.
+    Left,
+}
+
+/// A column reference as written in a `JOIN` definition: always qualified
+/// with its table, optionally with the schema too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QualifiedColumn {
+    pub schema: Option<String>,
+    pub table: String,
+    pub column: String,
+}
+
+/// One `<table>.<column> = <table>.<column>` term of a `JOIN ... ON` clause,
+/// in the order written. Which side each column belongs to is the
+/// validator's to resolve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinOn {
+    pub lhs: QualifiedColumn,
+    pub rhs: QualifiedColumn,
+}
+
+/// The `JOIN` half of a [`KeySpace::Join`] definition. The `FROM` table is
+/// [`TransformDef::source`]; this is the other table, how it joins, and the
+/// `GROUP BY` keys, each of which may come from either table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinSpec {
+    pub kind: JoinKind,
+    /// The joined table's bare name.
+    pub right: String,
+    /// `Some(schema)` when the joined table was written `<schema>.<table>`;
+    /// the twin of [`TransformDef::explicit_source_schema`].
+    pub explicit_right_schema: Option<String>,
+    /// The `ON` terms, joined by `AND`. At least one.
+    pub on: Vec<JoinOn>,
+    /// The `GROUP BY` keys in the order written; at least one.
+    pub group_by: Vec<QualifiedColumn>,
 }
 
 /// One `GROUP BY` key (issue #137): either a plain source column, or a

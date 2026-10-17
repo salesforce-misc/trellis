@@ -1186,6 +1186,7 @@ impl super::Backend for ManualBackend {
             // see `install_definition` above and that field's doc comment.
             let qualified = qualified_target_table(&self.target_schema, def);
             let rows = match &def.key_space {
+                KeySpace::Join(_) => unreachable!("the generator never produces a JOIN definition"),
                 KeySpace::OneToOne => {
                     // `source_primary_key` accepts an arbitrary-arity source
                     // primary key (issue #126), and — since issue #121 — the
