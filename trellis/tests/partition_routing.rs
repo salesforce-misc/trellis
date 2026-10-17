@@ -165,17 +165,21 @@ async fn clauses(client: &Client, ty: &Ty, kind: &str) -> Vec<String> {
     }
 }
 
-/// The key column's type and its level's `partcollation`, read from the
-/// catalog. `capture::partitions` records two collations per key (the type's
-/// own `typcollation`, and the level's); this helper sets both fields to the
-/// level's, which is enough for the keys these tests use because each presents
-/// its values under the collation the level compares by.
+/// The key column's recorded type, type collation (`typcollation`) and level
+/// collation (`partcollation`), as `capture::partitions::read_keys` records
+/// them.
 async fn recorded_key(client: &mut Client, table: &str, column: &str) -> Key {
     let txn = client.transaction().await.expect("begin");
     txn.batch_execute(&pinned_settings()).await.expect("pin");
     let row = txn
         .query_one(
             "select p.partrelid::bigint, pg_catalog.format_type(a.atttypid, a.atttypmod), \
+                    coalesce( \
+                        (select n.nspname::text || '.' || co.collname::text \
+                         from pg_catalog.pg_type ty \
+                         join pg_catalog.pg_collation co on co.oid = ty.typcollation \
+                         join pg_catalog.pg_namespace n on n.oid = co.collnamespace \
+                         where ty.oid = a.atttypid), ''), \
                     case when k.collid = 0 then '' else ( \
                         select n.nspname::text || '.' || co.collname::text \
                         from pg_catalog.pg_collation co \
@@ -197,7 +201,7 @@ async fn recorded_key(client: &mut Client, table: &str, column: &str) -> Key {
         column: Some(column.to_string()),
         pg_type: row.get(1),
         collation: row.get(2),
-        level_collation: row.get(2),
+        level_collation: row.get(3),
     }
 }
 
@@ -636,7 +640,8 @@ async fn an_enum_key_and_a_collation_in_public_route_exactly() {
         .await
         .expect("collation tree");
     let key = recorded_key(&mut client, "c", "k").await;
-    assert_eq!(key.collation, "public.C");
+    assert_eq!(key.collation, "pg_catalog.default");
+    assert_eq!(key.level_collation, "public.C");
     for (leaf, oid) in leaves(&client, "c").await {
         let text = constraint_text(&mut client, oid).await;
         let route = text.map_or(Route::Every, Route::Text);

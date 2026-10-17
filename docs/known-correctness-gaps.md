@@ -93,23 +93,23 @@ These are the tools the entries refer to:
 
 | # | Trigger | Silent? | Detected? | Planned work |
 |---|---|---|---|---|
-| 1 | `ALTER COLUMN … TYPE … USING` that rewrites values | yes | `self_check` (1-1 targets only) | #703, study pending; #1104 bounds it for aggregates |
-| 2 | A column dropped and re-added under the same name | yes | `self_check` (1-1 targets only) | #703, study pending; #1104 bounds it for aggregates |
+| 1 | `ALTER COLUMN … TYPE … USING` that rewrites values | yes | `self_check` (1-1 targets only) | #703, study pending |
+| 2 | A column dropped and re-added under the same name | yes | `self_check` (1-1 targets only) | #703, study pending |
 | 3 | A source key re-collated while a `self_check` job runs | the job can skip or repeat keys | no | none filed |
-| 5 | Capture switched off and back on, or the table attached to a hierarchy and detached, between two reconcile passes | yes | no | #707, study pending; #1104 bounds it for aggregates |
-| 6 | A capture function body replaced by hand | yes | not by the audit | #707, study pending; #1104 bounds it for aggregates |
+| 5 | Capture switched off and back on, or the table attached to a hierarchy and detached, between two reconcile passes | yes | `self_check` (1-1 targets only) | #707, study pending |
+| 6 | A capture function body replaced by hand | yes | `self_check` (1-1 targets only) | #707, study pending |
 | 8 | Hand edits to a target table | yes | `self_check` (1-1 targets only) | none; documented |
-| 9 | An application trigger re-keying a parent's join column within the statement | yes | no | removed by #1115 |
+| 9 | An application trigger re-keying a parent's join column within the statement | yes | no | #1115 removes relationships |
 | 10 | `REGEXP_COUNT` on `"C"`-collated data or with Postgres-only regex syntax | yes | `self_check` (1-1 targets only) | #643, with #575 |
 | 11 | Row-level security applying to a role Trellis runs as | only capture, for the ring owner, until the next reconcile pass; elsewhere reads and writes fail | drain, discharge, catch-up and build merge: pause what they reach; one the catalog can't pin shows on `drain_failure` (drain) or `backfill_failure` (discharge, catch-up), or, for a build merge, pauses on its fifth charge with the error on `capture_failure`; build chunk: `backfill_failure` | none |
-| 12 | A crash empties an unlogged source table | yes | no | none filed |
-| 13 | Partial restore, or a schema-only load (`db:schema:load`, `ecto.load`) | partial restore silent; schema load loud | schema load of a plain dump: on define | none |
-| 15 | A from-side change pending across a to-side `TRUNCATE` | yes | no | removed by #1115 |
-| 16 | `self_check` audits 1-1 targets only | yes | n/a | #1104 (aggregates), #1112 (JOIN targets) |
+| 12 | A crash empties an unlogged source table | yes | `self_check` (1-1 targets only) | none filed |
+| 13 | Partial restore, or a schema-only load (`db:schema:load`, `ecto.load`) | partial restore silent; schema load loud | schema load of a plain dump: on define; partial restore: `self_check` (1-1 targets only) | none |
+| 15 | A from-side change pending across a to-side `TRUNCATE` | yes | no | #1115 removes relationships |
+| 16 | `self_check` audits 1-1 targets only | yes | n/a | #1104 (aggregates); #1115 removes relationships, and #1112 audits the JOIN targets that replace them |
 | 17 | `DROP TYPE` of an enum a live definition references | no (later introspection fails) | at failure only | none filed |
 | 18 | `jsonb_agg`, `array_agg` and `string_agg` element order differs between recomputes | yes | no | none filed |
 | 19 | A paused column doesn't pause the aggregates that read it | yes | on the upstream only | none filed |
-| 21 | A to-one relationship field keeps a superseded parent value under concurrent writes (rare) | yes | no | removed by #1115 |
+| 21 | A to-one relationship field keeps a superseded parent value under concurrent writes (rare) | yes | no | #1115 removes relationships |
 | 22 | A column read only as a field moved to another type family (`integer` → `double precision`, `numeric` ↔ `double precision`) | a value rounded into the old type is silent; other writes fail | at failure; `self_check` (1-1 targets only) | none filed |
 | 23 | A value padded with spaces past a widened `varchar`'s old length, drained before Trellis re-types its copy | yes | `self_check` (1-1 targets only) | none filed |
 | 24 | A trigger or constraint refusing a change only when two separate pairs of definitions apply it | no (the drain fails) | `drain_failure` and `self_check` | none |
@@ -223,8 +223,9 @@ COMMIT;
 Targets stay wrong until each affected row is written again, with nothing
 on status.
 
-**Detected?** No. The pass and the `self_check` audit both see only the
-current trigger state, and it looks healthy again.
+**Detected?** Not automatically. The pass and `self_check`'s capture audit
+both see only the current trigger state, and it looks healthy again.
+`self_check`'s comparison reports the stale rows on 1-1 targets.
 
 If the pass *does* see the broken trigger, it isn't a gap. Trellis reinstalls
 it and re-reads the table for its readers, so it repairs itself. Examples are a
@@ -251,7 +252,9 @@ functions, with a body that drops or alters what it stages.
 is stale and rewrites it. That repair is a "widen", which doesn't re-read the
 table, so the writes made in between stay lost.
 
-**Detected?** The function is restored, but the lost writes aren't detected.
+**Detected?** The function is restored, but the lost writes aren't detected
+automatically. `self_check`'s comparison reports the stale rows on 1-1
+targets.
 
 **Planned work:** #707 (case 2). One option there is to have this repair
 re-read the table the way a reinstall does.
@@ -511,8 +514,9 @@ target is compared with a recompute, so a stale value in one is silent.
 **Detected?** Not applicable. Each entry's "Detected?" line says `self_check`
 only for plain 1-1 targets.
 
-**Planned work:** #1104 adds `self_check` for aggregate targets and #1112 for
-JOIN targets. #1115 removes relationships.
+**Planned work:** #1104 adds `self_check` for aggregate targets. #1115
+removes relationships, and with them relationship-enriched 1-1 targets;
+#1112 adds `self_check` for the JOIN targets that replace them.
 
 **Repair:** compare the target with your own query of the source, or
 `PAUSE`/`RESUME` it when you suspect a divergence.
