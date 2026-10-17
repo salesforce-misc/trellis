@@ -726,16 +726,40 @@ pub(crate) fn render_definition_text(def: &TransformDef) -> String {
     out.push_str(" FROM ");
     render_table_ref(&mut out, &def.source, def.explicit_source_schema.as_deref());
 
-    if let KeySpace::Aggregate { group_by } = &def.key_space {
-        out.push_str(" GROUP BY ");
-        let keys: Vec<String> = group_by
-            .iter()
-            .map(|key| match key {
-                GroupByKey::Column(column) => column.clone(),
-                GroupByKey::RelationshipPath { rel, column } => format!("{rel}.{column}"),
-            })
-            .collect();
-        out.push_str(&keys.join(", "));
+    match &def.key_space {
+        KeySpace::OneToOne => {}
+        KeySpace::Aggregate { group_by } => {
+            out.push_str(" GROUP BY ");
+            let keys: Vec<String> = group_by
+                .iter()
+                .map(|key| match key {
+                    GroupByKey::Column(column) => column.clone(),
+                    GroupByKey::RelationshipPath { rel, column } => format!("{rel}.{column}"),
+                })
+                .collect();
+            out.push_str(&keys.join(", "));
+        }
+        KeySpace::Join(join) => {
+            let qualified = |column: &QualifiedColumn| match &column.schema {
+                Some(schema) => format!("{schema}.{}.{}", column.table, column.column),
+                None => format!("{}.{}", column.table, column.column),
+            };
+            out.push_str(match join.kind {
+                JoinKind::Inner => " INNER JOIN ",
+                JoinKind::Left => " LEFT JOIN ",
+            });
+            render_table_ref(&mut out, &join.right, join.explicit_right_schema.as_deref());
+            out.push_str(" ON ");
+            let terms: Vec<String> = join
+                .on
+                .iter()
+                .map(|term| format!("{} = {}", qualified(&term.lhs), qualified(&term.rhs)))
+                .collect();
+            out.push_str(&terms.join(" AND "));
+            out.push_str(" GROUP BY ");
+            let keys: Vec<String> = join.group_by.iter().map(qualified).collect();
+            out.push_str(&keys.join(", "));
+        }
     }
 
     out.push_str(" SELECT ");

@@ -145,6 +145,9 @@ pub enum ValidationError {
     /// An `ON` term compares two columns of the same table, or a column with
     /// itself. An equi-join term has one column from each side.
     JoinOnSameSide { term: String },
+    /// An `ON` term pairs the same two columns as an earlier one (in either
+    /// order).
+    JoinOnRepeatedPair { term: String },
     /// The two columns of an `ON` term differ in type, type modifier or
     /// collation. Trellis never casts a join key.
     JoinKeyTypeMismatch {
@@ -887,6 +890,10 @@ impl fmt::Display for ValidationError {
                 f,
                 "ON term '{term}' must compare a column of the FROM table with a column of \
                  the joined table"
+            ),
+            ValidationError::JoinOnRepeatedPair { term } => write!(
+                f,
+                "ON term '{term}' repeats a column pair an earlier term already joins"
             ),
             ValidationError::JoinKeyTypeMismatch {
                 lhs,
@@ -1807,11 +1814,21 @@ pub fn validate_join(
         Ok(())
     };
 
+    let mut pairs: HashSet<(&str, &str)> = HashSet::with_capacity(join.on.len());
     for term in &join.on {
         let (lhs_side, lhs) = resolve(&term.lhs)?;
         let (rhs_side, rhs) = resolve(&term.rhs)?;
         if lhs_side == rhs_side {
             return Err(ValidationError::JoinOnSameSide {
+                term: format!("{} = {}", written(&term.lhs), written(&term.rhs)),
+            });
+        }
+        let pair = match lhs_side {
+            JoinSide::Left => (term.lhs.column.as_str(), term.rhs.column.as_str()),
+            JoinSide::Right => (term.rhs.column.as_str(), term.lhs.column.as_str()),
+        };
+        if !pairs.insert(pair) {
+            return Err(ValidationError::JoinOnRepeatedPair {
                 term: format!("{} = {}", written(&term.lhs), written(&term.rhs)),
             });
         }
@@ -5982,6 +5999,24 @@ mod tests {
             validate_join(&def, &left, &right),
             Err(ValidationError::JoinSelf { .. })
         ));
+    }
+
+    #[test]
+    fn join_admits_a_composite_key_in_either_conjunct_order_but_not_a_repeated_pair() {
+        let on = |on: &str| {
+            check_text(&format!(
+                "TRANSFORM t FROM orders JOIN items ON {on} GROUP BY orders.region \
+                 SELECT COUNT(*) AS n"
+            ))
+        };
+        on("orders.id = items.order_id AND orders.region = items.sku").unwrap();
+        on("items.sku = orders.region AND items.order_id = orders.id").unwrap();
+        assert_eq!(
+            on("orders.id = items.order_id AND items.order_id = orders.id"),
+            Err(ValidationError::JoinOnRepeatedPair {
+                term: "items.order_id = orders.id".to_string()
+            })
+        );
     }
 
     #[test]

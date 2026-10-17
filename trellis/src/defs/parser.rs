@@ -748,6 +748,12 @@ impl Parser {
         {
             return self.parse_join_clause().map(KeySpace::Join);
         }
+        if self.peek_is_symbol(',') {
+            return Err(ParseError::UnsupportedKeySpace {
+                construct: "comma join".to_string(),
+                detail: "write the join as `FROM a [LEFT|INNER] JOIN b ON a.x = b.y`".to_string(),
+            });
+        }
         if self.peek_is_keyword("GROUP") {
             self.advance();
             self.expect_keyword("BY")?;
@@ -786,11 +792,13 @@ impl Parser {
             .into_iter()
             .find(|kw| self.peek_is_keyword(kw))
         {
-            return Err(unsupported(
-                &format!("{kw} JOIN"),
+            let detail = if kw == "RIGHT" {
+                "only INNER and LEFT joins are supported: swap the two tables and use LEFT JOIN"
+            } else {
                 "only INNER and LEFT joins are supported (docs/transforms.md, \"Supported \
-                 sources and targets\")",
-            ));
+                 sources and targets\")"
+            };
+            return Err(unsupported(&format!("{kw} JOIN"), detail));
         } else {
             JoinKind::Inner
         };
@@ -799,7 +807,17 @@ impl Parser {
         if self.source.as_deref() == Some(right.as_str()) {
             return Err(unsupported(
                 "JOIN",
-                "a table can't be joined to itself: this grammar has no table aliases",
+                &format!(
+                    "both tables are named '{right}': a table can't be joined to itself, and \
+                     two tables sharing a bare name can't be told apart, since every column \
+                     is written `<table>.<column>` and this grammar has no table aliases"
+                ),
+            ));
+        }
+        if self.peek_is_keyword("USING") {
+            return Err(unsupported(
+                "JOIN USING",
+                "write the join columns out with ON: `ON a.x = b.x`",
             ));
         }
         self.joined = Some(right.clone());

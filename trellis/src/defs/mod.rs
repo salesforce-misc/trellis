@@ -438,6 +438,25 @@ mod tests {
     }
 
     #[test]
+    fn rejects_comma_joins_using_and_tables_sharing_a_bare_name() {
+        let (construct, _) = refusal("TRANSFORM t FROM a, b GROUP BY a.g SELECT COUNT(*) AS n");
+        assert_eq!(construct, "comma join");
+        let (construct, _) =
+            refusal("TRANSFORM t FROM a JOIN b USING (k) GROUP BY a.g SELECT COUNT(*) AS n");
+        assert_eq!(construct, "JOIN USING");
+        let (construct, detail) = refusal(
+            "TRANSFORM t FROM shop.orders JOIN archive.orders ON orders.id = orders.id \
+             GROUP BY orders.g SELECT COUNT(*) AS n",
+        );
+        assert_eq!(construct, "JOIN");
+        assert!(detail.contains("bare name"), "{detail}");
+        let (_, detail) = refusal(
+            "TRANSFORM t FROM a RIGHT JOIN b ON a.k = b.k GROUP BY a.g SELECT COUNT(*) AS n",
+        );
+        assert!(detail.contains("swap the two tables"), "{detail}");
+    }
+
+    #[test]
     fn rejects_a_second_join() {
         let (construct, detail) = refusal(
             "TRANSFORM t FROM a JOIN b ON a.k = b.k LEFT JOIN c ON b.j = c.j \
@@ -1180,6 +1199,11 @@ mod tests {
             "TRANSFORM t FROM orders GROUP BY region SELECT region AS region, \
              (region + 1) AS price, SUM(orders.price) AS total",
             "TRANSFORM t FROM app.orders SELECT app.orders.price AS p",
+            "TRANSFORM t FROM orders JOIN items ON orders.id = items.order_id \
+             GROUP BY orders.region SELECT orders.region AS region, SUM(items.qty) AS q",
+            "TRANSFORM t FROM app.orders LEFT OUTER JOIN app.items ON items.order_id = orders.id \
+             AND orders.k = items.k GROUP BY items.sku, app.orders.region \
+             SELECT MIN(items.qty) AS m",
         ] {
             let def = parse(text).unwrap();
             assert_eq!(
