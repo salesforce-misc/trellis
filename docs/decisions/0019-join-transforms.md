@@ -90,8 +90,9 @@ because Postgres displays a `numeric` sum at the scale of the most precise value
 in the group: a running sum would keep `1.500` after its most precise row left,
 where Postgres shows `1.5`. A `numeric(p,s)` column stores every value at scale
 `s`, so a running sum and every product below carry exactly the scale Postgres
-shows. A product across the sides (`SUM(a.qty * b.price)`) decomposes the same
-way but isn't admitted, because an argument mixing the sides is refused.
+shows. A product across the sides (revenue as quantity times a dimension's
+price) decomposes the same way but isn't admitted: the grammar has no `*` or
+`/`, and an argument mixing the sides is refused.
 
 ### Each side is aggregated before the join, and the target is their combination
 
@@ -362,7 +363,7 @@ query shows them.
   target; after it, values are exact.
 - The admitted aggregate set is `COUNT`, `SUM` and `AVG` over integers and
   scaled `numeric`, with arguments over one side. Each other aggregate, an
-  argument mixing the sides (so a product across them), and the out-of-scope
+  argument mixing the sides, and the out-of-scope
   join shapes are refused until designed.
 - Relationships, their reverse propagation and their dedicated tests leave
   Trellis, and a transform that copied a dimension attribute onto every fact row
