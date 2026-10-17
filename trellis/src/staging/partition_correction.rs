@@ -527,7 +527,8 @@ pub struct CorrectingNode {
     pub since: SystemTime,
     /// The keys still to re-derive for this definition, from its persisted
     /// progress. `None` until the correction's first page has counted them.
-    /// An estimate while it walks the node's own rows.
+    /// An estimate while it walks the node's own rows. A to-many count's
+    /// entry stays at 0 until the recomputes it staged are applied.
     pub keys_remaining: Option<u64>,
 }
 

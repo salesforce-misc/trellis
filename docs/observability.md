@@ -261,7 +261,8 @@ pause are arcs of one lifecycle:
   queued the correction; and `keys_remaining`, the keys still to re-derive from
   the correction's persisted progress (`None` until its first page has counted
   them, and an estimate while it reads the partition's own rows). An entry
-  leaves once its keys are re-derived. A paused or quarantined transform lists
+  leaves once its keys are re-derived. A to-many count's entry stays at
+  `keys_remaining` 0 until the recomputes it staged are applied. A paused or quarantined transform lists
   none; a correction that keeps failing is reported in `backfill_failure`. The
   CLI's `trellis status` prints one `correcting` line per entry under the
   transform.
