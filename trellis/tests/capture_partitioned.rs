@@ -346,6 +346,38 @@ async fn a_tree_of_one_hundred_tables_held_at_a_leaf_installs_nothing() {
     writer.batch_execute("rollback").await.expect("release");
 }
 
+/// One table more than [`SINGLE_TRANSACTION_TABLES`] is the smallest tree
+/// that installs node by node: with a leaf held by a writer, the root and
+/// the leaves ahead of it land.
+#[tokio::test]
+async fn a_tree_of_one_hundred_and_one_tables_held_at_a_leaf_lands_the_root() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect(db.dsn()).await;
+    client
+        .batch_execute(&flat(SINGLE_TRANSACTION_TABLES))
+        .await
+        .expect("100 leaves");
+    let writer = connect(db.dsn()).await;
+    writer
+        .batch_execute("begin; lock table public.r_50 in row exclusive mode")
+        .await
+        .expect("hold the leaf");
+    let progress = install::install(
+        &mut client,
+        DEFAULT_SCHEMA,
+        &spec("public.r"),
+        Some(Instant::now() + Duration::from_millis(300)),
+    )
+    .await
+    .expect("install");
+    assert!(matches!(progress, Progress::Waiting(_)), "{progress:?}");
+    let map = trigger_map(&client).await;
+    assert!(map.iter().any(|(t, n, _)| t == "r" && *n == 5), "{map:?}");
+    assert!(!map.iter().any(|(t, _, _)| t == "r_50"), "{map:?}");
+    writer.batch_execute("rollback").await.expect("release");
+}
+
 #[tokio::test]
 async fn a_tree_of_one_hundred_and_one_leaves_installs_root_first_then_node_by_node() {
     let cluster = TestCluster::start();
