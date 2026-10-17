@@ -279,7 +279,8 @@ async fn exp2_2b_one_to_one() {
 
 /// Exp 2 scenario 3 (#321): C moves key 1 from group 1 to group 2 and
 /// commits; a Re-derive of keys 1 and 2 (both groups) drains before C's own
-/// batch, which drains after. C must not be counted twice.
+/// batch, which drains after. C must not be counted twice. A counting shape:
+/// no 1-1 flavour, where C writes the image the Re-derive already wrote.
 async fn exp2_3(flavour: Flavour) {
     let mut d = start(flavour, &[(1, 1, 10), (2, 1, 5), (3, 2, 7)]).await;
     write(&d, "update public.src set g = 2, v = 20 where id = 1").await;
@@ -304,11 +305,6 @@ async fn exp2_3_aggregate_avg() {
 #[tokio::test]
 async fn exp2_3_aggregate_min_max() {
     exp2_3(Flavour::AggregateMinMax).await;
-}
-
-#[tokio::test]
-async fn exp2_3_one_to_one() {
-    exp2_3(Flavour::OneToOne).await;
 }
 
 // ------------------------------------------------------------------ exp 2, 4
@@ -940,9 +936,6 @@ async fn issue_392_one_to_one() {
 /// reads, then z → b (C2) after it, and C1 and C2 fold into one
 /// batch. The Re-derive (through z's member 5, sealed before C1 and drained
 /// after it) commits with key 1 counted in z. z must end without key 1.
-///
-/// Before the ledger (#623 D3): z kept key 1, `(2,60,2)` against the
-/// oracle's `(2,50,1)`.
 async fn issue_494(flavour: Flavour) {
     let mut d = start(flavour, A_Z_B).await;
     d.stage_recomputes(SRC, &["5"]).await;
@@ -955,6 +948,8 @@ async fn issue_494(flavour: Flavour) {
     assert_oracle(&mut d, flavour).await;
 }
 
+/// Before the ledger (#623 D3): z kept key 1, `(2,60,2)` against the
+/// oracle's `(2,50,1)`.
 #[tokio::test]
 async fn issue_494_aggregate() {
     issue_494(Flavour::Aggregate).await;
