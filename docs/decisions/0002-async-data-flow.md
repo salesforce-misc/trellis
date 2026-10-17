@@ -829,14 +829,19 @@ exact with pages applying throughout.]
 - **Must (a release on an aggregate):** while a key is held its changes are
   skipped for the aggregate, so the groups it feeds drift until the release;
   `await_converged` and `self_check` hold back on a held key with parked
-  changes. A release, and the automatic retry of a held key, recompute every
-  group the key could owe (R8): every group named by the old and new images
-  of the changes skipped while it was held, including the change that
-  evicted it, plus the group of the key's current row. A resume's rebuild
-  covers these groups with the rest. The recompute is the ordinary group
-  recompute, an absolute write under R1, R5, R6 and R8 with its lock
-  statement first; the key's changes still in the ring after the release
-  apply as deltas, filtered by each group's basis like any page's.
+  changes. A release, and the
+  [automatic retry](0003-quarantine-storage-and-api.md#retry-policy) of a
+  held key, recompute every group the key could owe (R8): every group named
+  by the old and new images of the changes skipped while it was held,
+  including the change that evicted it, plus the group of the key's current
+  row. A resume releases
+  every held key and rebuilds
+  ([ADR-0003](0003-quarantine-storage-and-api.md#resume-releases-the-transforms-held-keys)),
+  and its rebuild covers these groups among the target's own and the
+  source's (R8). The recompute is the ordinary group recompute, an absolute
+  write under R1 (its lock statement first), R5, R6 and R8; the key's
+  changes still in the ring after the release apply as deltas, filtered by
+  each group's basis like any page's.
 - **Must:** the parked changes are discarded, not replayed, so a held key's
   parked row stays one folded row per key and carries no transition images.
   The recompute is absolute, so it is exact whatever other absolute writes
