@@ -194,6 +194,7 @@ async fn recorded_key(client: &mut Client, table: &str, column: &str) -> Key {
         column: Some(column.to_string()),
         pg_type: row.get(1),
         collation: row.get(2),
+        level_collation: row.get(2),
     }
 }
 

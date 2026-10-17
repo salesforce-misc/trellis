@@ -1679,6 +1679,7 @@ mod tests {
                 column: Some(name.to_string()),
                 pg_type: ty.to_string(),
                 collation: collation.to_string(),
+                level_collation: collation.to_string(),
             }),
         }
     }

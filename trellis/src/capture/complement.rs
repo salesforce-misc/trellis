@@ -200,6 +200,8 @@ pub struct KeyColumn {
     pub name: String,
     /// `format_type(atttypid, atttypmod)`.
     pub pg_type: String,
+    /// The level's key collation (`partcollation`): the one Postgres
+    /// compares the column under against this level's children's bounds.
     /// Schema-qualified, empty for a type without one.
     pub collation: String,
 }
@@ -980,7 +982,7 @@ fn key_column(name: &str, key: &Key) -> KeyColumn {
     KeyColumn {
         name: name.to_string(),
         pg_type: key.pg_type.clone(),
-        collation: key.collation.clone(),
+        collation: key.level_collation.clone(),
     }
 }
 

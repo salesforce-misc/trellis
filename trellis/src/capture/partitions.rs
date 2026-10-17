@@ -148,6 +148,13 @@ pub struct Key {
     /// bound (`COLLATE`) only when it differs from this one, so a column
     /// presented under it compares under each level's own (#1084).
     pub collation: String,
+    /// The level's own key collation (`partcollation`), schema-qualified,
+    /// empty when the type has none: what Postgres compares this column
+    /// under against the node's children's `relpartbound`s, which name no
+    /// collation. Differs from `collation` when the level partitions under
+    /// an explicit `COLLATE`.
+    #[serde(default)]
+    pub level_collation: String,
 }
 
 /// The state recorded for one source: the tree as the pass last saw it.
@@ -954,7 +961,7 @@ async fn read_live(
 }
 
 /// The partition-key columns of each of the partitioned nodes `partitioned`,
-/// with their types and collations, in key order.
+/// with their types, type collations and level collations, in key order.
 pub(crate) async fn read_keys(
     client: &impl GenericClient,
     partitioned: &[i64],
@@ -968,10 +975,15 @@ pub(crate) async fn read_keys(
                          from pg_catalog.pg_type ty \
                          join pg_catalog.pg_collation co on co.oid = ty.typcollation \
                          join pg_catalog.pg_namespace n on n.oid = co.collnamespace \
-                         where ty.oid = a.atttypid), '') \
+                         where ty.oid = a.atttypid), ''), \
+                    coalesce( \
+                        (select n.nspname::text || '.' || co.collname::text \
+                         from pg_catalog.pg_collation co \
+                         join pg_catalog.pg_namespace n on n.oid = co.collnamespace \
+                         where co.oid = k.collid), '') \
              from pg_catalog.pg_partitioned_table p \
-             cross join lateral unnest(p.partattrs::int2[]) \
-                 with ordinality as k(attnum, ord) \
+             cross join lateral unnest(p.partattrs::int2[], p.partcollation::oid[]) \
+                 with ordinality as k(attnum, collid, ord) \
              left join pg_catalog.pg_attribute a \
                  on a.attrelid = p.partrelid and a.attnum = k.attnum and k.attnum > 0 \
              where p.partrelid = any($1::bigint[]::oid[]) \
@@ -986,6 +998,7 @@ pub(crate) async fn read_keys(
             column: r.get(1),
             pg_type: r.get(2),
             collation: r.get(3),
+            level_collation: r.get(4),
         })
         .collect())
 }
