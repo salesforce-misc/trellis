@@ -101,8 +101,8 @@ const NEW_ROWS: &str = "trellis_new";
 /// `row_txid`, `change_id`, `appended_at`, `route`, `retry_count`,
 /// `relationship_id`) comes from the ring tables' own defaults, exactly as
 /// for `staging::append::append`.
-const RING_COLUMNS: &str =
-    "src_table, key, op, lsn, old_image, new_image, origin_lsn, src_changed, group_key";
+const RING_COLUMNS: &str = "src_table, key, op, lsn, old_image, new_image, origin_lsn, src_changed, \
+     group_key, transition_images";
 
 /// Postgres truncates a longer identifier, so every generated name stays
 /// within this many bytes.
@@ -680,11 +680,15 @@ pub(crate) fn function_source(schema: &str, spec: &CaptureSpec, event: CaptureEv
 /// fired yet: one capture call for both. A row both updates changed (a
 /// self-referencing key that cascades, or two cascading keys on one row) is
 /// then in the transition tables twice, and the join can pair an old version
-/// with an intermediate new one and emit that pair last. Such a pairing
-/// needs a key that occurs twice among the old rows, since the intermediate
-/// version is an old row too, so the update function also re-reads whenever
-/// a key does (`capture_ssi.rs` pins it). An `ON DELETE CASCADE` merges the
-/// same way, harmlessly: a row is deleted once, and no action inserts.
+/// with an intermediate new one and emit that pair last. A key's first
+/// update can also move it onto a key the second then updates (a
+/// self-referencing `ON UPDATE CASCADE` of a row that references itself), so
+/// a key can occur twice among the new rows only, and pairing by key would
+/// image one old row twice (#1099). So the update function also re-reads
+/// whenever a key occurs twice on either side (`capture_ssi.rs` pins it), and
+/// the re-read pairs one to one (see "Every transition row counts once" on
+/// [`ring_select`]). An `ON DELETE CASCADE` merges the same way, harmlessly: a
+/// row is deleted once, and no action inserts.
 ///
 /// The schema-changed branch ([`schema_changed_branch`]) always re-reads:
 /// it is rare, and its `EXECUTE` builds one statement shape.
@@ -764,13 +768,16 @@ fn function_body(schema: &str, spec: &CaptureSpec, event: CaptureEvent) -> Strin
     if event == CaptureEvent::Update {
         // After the schema-changed branch, which handles a renamed key.
         body.push_str(&format!(
-            "    -- #623 D8a: an FK action's update shares these transition tables, and\n    \
-             -- a row updated twice leaves two old versions of one key.\n    \
+            "    -- #623 D8a, #1099: an FK action's update shares these transition tables,\n    \
+             -- and a row updated twice leaves two versions of one key on a side.\n    \
              if not reread then\n        \
              reread := exists (select 1 from {OLD_ROWS} o\n            \
-             group by {} collate \"C\" having count(*) > 1);\n    \
+             group by {} having count(*) > 1)\n            \
+             or exists (select 1 from {NEW_ROWS} n\n            \
+             group by {} having count(*) > 1);\n    \
              end if;\n",
-            key_expr(spec, "o")
+            typed_key(spec, "o"),
+            typed_key(spec, "n")
         ));
     }
     body.push_str("    case slot\n");
@@ -946,7 +953,7 @@ fn schema_changed_branch(schema: &str, spec: &CaptureSpec, event: CaptureEvent) 
     );
     let marker_sql = format!(
         "insert into %s ({RING_COLUMNS}) \
-         values ($1, $2, '{SCHEMA_CHANGED_OP}', $3, null, $4, $3, $5, null)"
+         values ($1, $2, '{SCHEMA_CHANGED_OP}', $3, null, $4, $3, $5, null, null)"
     );
 
     // The static select, with the column-dependent parts as `format()`
@@ -959,7 +966,7 @@ fn schema_changed_branch(schema: &str, spec: &CaptureSpec, event: CaptureEvent) 
     )
     .replace('\n', " ")
     .replace('%', "%%");
-    let template = (1..=7).fold(template, |t, n| {
+    let template = (1..=9).fold(template, |t, n| {
         t.replace(&placeholder(n), &format!("%{n}$s"))
     });
 
@@ -1003,6 +1010,13 @@ fn schema_changed_branch(schema: &str, spec: &CaptureSpec, event: CaptureEvent) 
             fragments(alias, value_text, &spec.group_key, ", ")
         )
     };
+    // Only the update's pairing reads the select lists.
+    let columns_arg = |alias: &str| {
+        if event != CaptureEvent::Update {
+            return "null".to_string();
+        }
+        fragments(alias, column_ref, &spec.columns, ", ")
+    };
     format!(
         "    if present <> {count} then\n        \
          -- #622 C6: an imaged column was renamed or dropped.\n        \
@@ -1012,7 +1026,8 @@ fn schema_changed_branch(schema: &str, spec: &CaptureSpec, event: CaptureEvent) 
          if not ({key_present}) then\n            return null;\n        end if;\n        \
          execute pg_catalog.format({template},\n                {ring},\n                \
          {img_o},\n                {img_n},\n                {img_t},\n                \
-         {gk_o},\n                {gk_n},\n                {gk_t})\n            \
+         {gk_o},\n                {gk_n},\n                {gk_t},\n                \
+         {cols_o},\n                {cols_n})\n            \
          using l, ts;\n        \
          return null;\n    end if;\n",
         count = spec.columns.len(),
@@ -1027,6 +1042,8 @@ fn schema_changed_branch(schema: &str, spec: &CaptureSpec, event: CaptureEvent) 
         gk_o = group_arg("o"),
         gk_n = group_arg("n"),
         gk_t = group_arg("t"),
+        cols_o = columns_arg("o"),
+        cols_n = columns_arg("n"),
     )
 }
 
@@ -1035,6 +1052,21 @@ fn schema_changed_branch(schema: &str, spec: &CaptureSpec, event: CaptureEvent) 
 /// generated SQL, so it can't collide.
 fn placeholder(n: usize) -> String {
     format!("\u{0}{n}\u{0}")
+}
+
+/// `alias`'s `column`, qualified.
+fn column_ref(alias: &str, column: &str) -> String {
+    format!("{alias}.{}", quote_ident(column))
+}
+
+/// The name of the update re-read's pair number: `trellis_pair`, with
+/// underscores added until no imaged column has it.
+fn pair_column(spec: &CaptureSpec) -> String {
+    let mut name = "trellis_pair".to_string();
+    while spec.columns.contains(&name) {
+        name.push('_');
+    }
+    quote_ident(&name)
 }
 
 /// `alias`'s `column` as a one-pair image: [`image_expr`]'s pair, alone.
@@ -1054,8 +1086,9 @@ enum Render {
     /// function's variables.
     Static,
     /// [`schema_changed_branch`]'s template: [`placeholder`]s for the images
-    /// of `o`, `n` and `t` (2, 3, 4) and their group-key arrays (5, 6, 7),
-    /// and `$1`/`$2` for `l` and `ts`. It has no skip-no-op filter, so an
+    /// of `o`, `n` and `t` (2, 3, 4), their group-key arrays (5, 6, 7) and
+    /// the select lists of `o` and `n` (8, 9; the update's pairing), and
+    /// `$1`/`$2` for `l` and `ts`. It has no skip-no-op filter, so an
     /// update in the branch stages every row it changed.
     Dynamic,
 }
@@ -1093,6 +1126,20 @@ impl Render {
         }
     }
 
+    /// `alias`'s imaged columns as a select list (see the update's pairing
+    /// in [`ring_select`]).
+    fn projection(self, spec: &CaptureSpec, alias: &str) -> String {
+        match self {
+            Render::Static => spec
+                .columns
+                .iter()
+                .map(|c| column_ref(alias, c))
+                .collect::<Vec<_>>()
+                .join(", "),
+            Render::Dynamic => placeholder(8 + alias_index(alias)),
+        }
+    }
+
     fn group_array(self, spec: &CaptureSpec, alias: &str) -> String {
         match self {
             Render::Static => group_key_array(spec, alias),
@@ -1120,6 +1167,41 @@ impl Render {
 /// `old_image`. A delete's key is re-read too: a nested write that put the
 /// key back stages it as an update to the live row.
 ///
+/// # Every transition row counts once (#1099)
+///
+/// A reader that sums each ring row's `f(new) − f(old)` (the group basis,
+/// #1043 R3) needs the images to chain: summed over a transaction, they must
+/// telescope to the final row minus the first. The live `new_image` breaks
+/// that. An `AFTER ROW` trigger that rewrites `a → b` to `c` stages `(b, c)`
+/// from the nested capture and then `(a, c)` from the outer one, which sums
+/// to `2c − a − b`. The live re-read stays, since a 1-1 target needs the
+/// final row at the highest `lsn`, so a re-read row also records the
+/// statement's own transition rows where its images aren't them:
+///
+/// - `transition_images` is `{"old": …, "new": …}`, each side the transition
+///   row's image or JSON `null` where the ring row has none. It is set where
+///   the live row is gone (an insert or update whose key a nested write
+///   removed, staged as a `delete` whose `old_image` is the transition new
+///   row if it had no old one), where it differs from the transition new
+///   row, and where a row with no transition new row finds one (a delete
+///   whose key a nested write put back, staged as an `update`). Otherwise
+///   it is `NULL`, and `old_image`/`new_image` are the transition rows; a
+///   capture that doesn't re-read never sets it.
+/// - Each transition row is in exactly one ring row. An update's re-read
+///   pairs its old and new rows one to one, so a key with two versions on a
+///   side (an FK action's rows merged into the update) pairs each once, and
+///   a leftover becomes an unpaired row of its own.
+///
+/// A reader summing `f(new) − f(old)` takes each row's sides from
+/// `transition_images` when it is set and from `old_image`/`new_image`
+/// otherwise. A statement's ring rows then sum to `Σ f(NEW TABLE) −
+/// Σ f(OLD TABLE)`, less the dropped no-op pairs, which cancel; every row
+/// version a transaction writes is in one statement's new rows and, unless
+/// it is the final one, one later statement's old rows, so the sums
+/// telescope. 1-1 readers ignore the column.
+/// `tests/capture_transition_images.rs` checks the sum for each nested-write
+/// shape.
+///
 /// The re-read never sees another transaction's change. Each row it joins
 /// was written (or deleted) by this statement, so this transaction holds its
 /// row lock, or for a new key its unique-index entry, until it commits, and
@@ -1143,9 +1225,8 @@ impl Render {
 ///
 /// `tests/capture_reread.rs` checks this at every isolation level.
 ///
-/// The old image and the `group_key` are unchanged (old ∪ new, plus the live
-/// row's): the relationship readers still need the old join keys until E
-/// (#624).
+/// The `group_key` is the union of the old, new and live rows' values, so a
+/// relationship reader learns every join key the row had.
 ///
 /// # An update that changed nothing read stages nothing
 ///
@@ -1193,43 +1274,60 @@ fn ring_select(spec: &CaptureSpec, event: CaptureEvent, render: Render, live: bo
             "{indent}select {src}, case when {live} then {} else {} end,\n{indent}    \
              case when {live} then 'insert' else 'delete' end,\n{indent}    \
              {l}, case when not ({live}) then {} end, case when {live} then {} end, \
-             {l}, {ts}, {}\n{indent}from {NEW_ROWS} n\n{}",
+             {l}, {ts}, {},\n{indent}    {}\n{indent}from {NEW_ROWS} n\n{}",
             key_expr(spec, "t"),
             key_expr(spec, "n"),
             render.image(spec, "n"),
             render.image(spec, "t"),
             group_key_expr(spec, &["n", "t"], render),
+            transition_images(spec, render, None, Some("true"), &live),
             live_join(&|c| format!("n.{c}"), &key_expr(spec, "n")),
         ),
         CaptureEvent::Delete => format!(
             "{indent}select {src}, case when {live} then {} else {} end,\n{indent}    \
              case when {live} then 'update' else 'delete' end,\n{indent}    \
-             {l}, {}, case when {live} then {} end, {l}, {ts}, {}\n{indent}from {OLD_ROWS} o\n{}",
+             {l}, {}, case when {live} then {} end, {l}, {ts}, {},\n{indent}    {}\n\
+             {indent}from {OLD_ROWS} o\n{}",
             key_expr(spec, "t"),
             key_expr(spec, "o"),
             render.image(spec, "o"),
             render.image(spec, "t"),
             group_key_expr(spec, &["o", "t"], render),
+            transition_images(spec, render, Some("true"), None, &live),
             live_join(&|c| format!("o.{c}"), &key_expr(spec, "o")),
         ),
         // A statement trigger sees the update's old and new rows as two sets
-        // with no pairing, so they are paired on the key text. A row whose
-        // key changed has no partner: it becomes a delete of its old key and
-        // an insert of its new one. Pairing on the rendered key rather than
-        // the key columns' `=` keeps the pairing on the same identity the
-        // ring keys by, and `collate "C"` makes that a byte comparison.
+        // with no pairing, so they are paired on the key text, one to one
+        // (see "Every transition row counts once" above): the `p`th old row
+        // of a key with its `p`th new row. A row whose key changed has no
+        // partner: it becomes a delete of its old key and an insert of its
+        // new one. Pairing on the rendered key rather than the key columns'
+        // `=` keeps the pairing on the same identity the ring keys by, and
+        // `collate "C"` makes that a byte comparison. Each side projects only
+        // the imaged columns beside its pair number, so the number's name
+        // ([`pair_column`]) can't collide with a column the select reads.
         CaptureEvent::Update => {
             let old = format!("o.{first_key} is not null");
             let new = format!("n.{first_key} is not null");
             let changed = update_changed_filter(spec, render);
+            let pair = pair_column(spec);
+            let numbered = |rows: &str, alias: &str| {
+                format!(
+                    "(select {}, row_number() over (partition by {} collate \"C\") as {pair} \
+                     from {rows} {alias}) {alias}",
+                    render.projection(spec, alias),
+                    key_expr(spec, alias)
+                )
+            };
             format!(
                 "{indent}select {src},\n{indent}    \
                  case when {live} then {} when {new} then {} else {} end,\n{indent}    \
                  case when not ({live}) then 'delete' when not ({old}) then 'insert' \
                  else 'update' end,\n{indent}    \
                  {l}, case when {old} then {} when not ({live}) then {} end,\n{indent}    \
-                 case when {live} then {} end, {l}, {ts}, {}\n{indent}from {OLD_ROWS} o\n\
-                 {indent}full join {NEW_ROWS} n on {} = {} collate \"C\"\n{}{changed}",
+                 case when {live} then {} end, {l}, {ts}, {},\n{indent}    {}\n\
+                 {indent}from {}\n\
+                 {indent}full join {}\n{indent}    on {} = {} collate \"C\" and o.{pair} = n.{pair}\n{}{changed}",
                 key_expr(spec, "t"),
                 key_expr(spec, "n"),
                 key_expr(spec, "o"),
@@ -1237,6 +1335,9 @@ fn ring_select(spec: &CaptureSpec, event: CaptureEvent, render: Render, live: bo
                 render.image(spec, "n"),
                 render.image(spec, "t"),
                 group_key_expr(spec, &["o", "n", "t"], render),
+                transition_images(spec, render, Some(&old), Some(&new), &live),
+                numbered(OLD_ROWS, "o"),
+                numbered(NEW_ROWS, "n"),
                 key_expr(spec, "o"),
                 key_expr(spec, "n"),
                 live_join(
@@ -1265,13 +1366,13 @@ fn transition_select(spec: &CaptureSpec, event: CaptureEvent, render: Render) ->
     let first_key = quote_ident(&spec.key[0]);
     match event {
         CaptureEvent::Insert => format!(
-            "{indent}select {src}, {}, 'insert', {l}, null, {}, {l}, {ts}, {}\n{indent}from {NEW_ROWS} n",
+            "{indent}select {src}, {}, 'insert', {l}, null, {}, {l}, {ts}, {}, null\n{indent}from {NEW_ROWS} n",
             key_expr(spec, "n"),
             render.image(spec, "n"),
             group_key_expr(spec, &["n"], render),
         ),
         CaptureEvent::Delete => format!(
-            "{indent}select {src}, {}, 'delete', {l}, {}, null, {l}, {ts}, {}\n{indent}from {OLD_ROWS} o",
+            "{indent}select {src}, {}, 'delete', {l}, {}, null, {l}, {ts}, {}, null\n{indent}from {OLD_ROWS} o",
             key_expr(spec, "o"),
             render.image(spec, "o"),
             group_key_expr(spec, &["o"], render),
@@ -1283,7 +1384,7 @@ fn transition_select(spec: &CaptureSpec, event: CaptureEvent, render: Render) ->
                 "{indent}select {src}, case when {new} then {} else {} end,\n{indent}    \
                  case when not ({new}) then 'delete' when not ({old}) then 'insert' \
                  else 'update' end,\n{indent}    \
-                 {l}, case when {old} then {} end, case when {new} then {} end, {l}, {ts}, {}\n\
+                 {l}, case when {old} then {} end, case when {new} then {} end, {l}, {ts}, {}, null\n\
                  {indent}from {OLD_ROWS} o\n\
                  {indent}full join {NEW_ROWS} n on {} = {} collate \"C\"{}",
                 key_expr(spec, "n"),
@@ -1302,12 +1403,12 @@ fn transition_select(spec: &CaptureSpec, event: CaptureEvent, render: Render) ->
              {indent}    case when node then pg_catalog.jsonb_build_object('node',\n\
              {indent}        tg_table_schema || '.' || tg_table_name,\n\
              {indent}        'oid', tg_relid::pg_catalog.oid::bigint) end,\n\
-             {indent}    {l}, {ts}, null)",
+             {indent}    {l}, {ts}, null, null)",
             text_expr(NODE_TRUNCATE_SENTINEL_KEY),
             text_expr(TRUNCATE_SENTINEL_KEY),
         ),
         CaptureEvent::Truncate => format!(
-            "{indent}values ({src}, {}, 'truncate', {l}, null, null, {l}, {ts}, null)",
+            "{indent}values ({src}, {}, 'truncate', {l}, null, null, {l}, {ts}, null, null)",
             text_expr(TRUNCATE_SENTINEL_KEY)
         ),
         CaptureEvent::Begin => unreachable!("the begin function writes no ring row"),
@@ -1321,24 +1422,76 @@ fn update_changed_filter(spec: &CaptureSpec, render: Render) -> String {
     let indent = "        ";
     let first_key = quote_ident(&spec.key[0]);
     match render {
-        Render::Static => {
-            let row = |alias: &str| {
-                let cols: Vec<String> = spec
-                    .columns
-                    .iter()
-                    .map(|c| format!("{alias}.{}", quote_ident(c)))
-                    .collect();
-                format!("row({})", cols.join(", "))
-            };
-            format!(
-                "\n{indent}where not (o.{first_key} is not null) or not (n.{first_key} is not null)\n{indent}    \
-                 or pg_catalog.record_image_ne({}, {})",
-                row("o"),
-                row("n")
-            )
-        }
+        Render::Static => format!(
+            "\n{indent}where not (o.{first_key} is not null) or not (n.{first_key} is not null)\n{indent}    \
+             or {}",
+            images_differ(spec, "o", "n")
+        ),
         Render::Dynamic => String::new(),
     }
+}
+
+/// Whether `a`'s and `b`'s imaged columns differ, by `record_image_ne` over
+/// the typed values (see "An update that changed nothing read stages
+/// nothing" on [`ring_select`]).
+fn images_differ(spec: &CaptureSpec, a: &str, b: &str) -> String {
+    let row = |alias: &str| {
+        let cols: Vec<String> = spec.columns.iter().map(|c| column_ref(alias, c)).collect();
+        format!("row({})", cols.join(", "))
+    };
+    format!("pg_catalog.record_image_ne({}, {})", row(a), row(b))
+}
+
+/// A re-read row's `transition_images` (see "Every transition row counts
+/// once" on [`ring_select`]): `{"old": …, "new": …}`, the statement's own
+/// transition rows for the ring row (JSON `null` for a side it has none of:
+/// `has_old`/`has_new` say which it has, and `None` means never), written
+/// where `old_image`/`new_image` aren't those rows: where the live row `t`
+/// is gone, differs from the transition new row, or exists for a row with
+/// no transition new row. Otherwise `NULL`. [`Render::Dynamic`] writes it
+/// for every row with a transition new row, which means the same.
+fn transition_images(
+    spec: &CaptureSpec,
+    render: Render,
+    has_old: Option<&str>,
+    has_new: Option<&str>,
+    live: &str,
+) -> String {
+    let side = |has: Option<&str>, alias: &str| match has {
+        None => "null::jsonb".to_string(),
+        Some("true") => render.image(spec, alias),
+        Some(has) => format!("case when {has} then {} end", render.image(spec, alias)),
+    };
+    let images = format!(
+        "jsonb_build_object('old', {}, 'new', {})",
+        side(has_old, "o"),
+        side(has_new, "n")
+    );
+    let set = match has_new {
+        None => live.to_string(),
+        Some(has_new) => {
+            let differs = match render {
+                Render::Static => format!("not ({live}) or {}", images_differ(spec, "n", "t")),
+                Render::Dynamic => "true".to_string(),
+            };
+            format!("case when {has_new} then {differs} else {live} end")
+        }
+    };
+    format!("case when {set} then {images} end")
+}
+
+/// `alias`'s primary-key columns, typed, for the update's repeated-key
+/// check ([`function_body`]). Grouping by the typed values rather than the
+/// rendered key ([`key_expr`]) costs no output function per row, and never
+/// misses a repeat: two rows whose keys render the same have equal keys, so a
+/// type's `=` that is looser than the text (`numeric` `1.0 = 1.00`) only
+/// makes the check re-read more often.
+fn typed_key(spec: &CaptureSpec, alias: &str) -> String {
+    spec.key
+        .iter()
+        .map(|c| column_ref(alias, c))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// `alias`'s ring key. A single-column key is the column's text verbatim; a
@@ -1862,16 +2015,25 @@ mod tests {
         assert!(!begin.contains("insert into"), "{begin}");
         assert!(!ddl(&spec(), CaptureEvent::Truncate).contains("reread"));
 
-        // An update also re-reads when a key repeats among its old rows (an
-        // FK action's merged update), checked after the schema-changed branch.
+        // An update also re-reads when a key repeats among its old rows or
+        // its new rows (an FK action's merged update, #1099), checked after
+        // the schema-changed branch.
         let update = ddl(&spec(), CaptureEvent::Update);
         let repeated = update
             .find("reread := exists (select 1 from trellis_old o")
             .expect("the repeated-key check");
         assert!(update.find("-- #622 C6: an imaged column").expect("branch") < repeated);
-        assert!(repeated < update.find("    case slot\n").expect("case"));
+        let case = update.find("    case slot\n").expect("case");
+        assert!(repeated < case);
         assert!(
-            update[repeated..].contains("having count(*) > 1"),
+            update[repeated..case].contains("or exists (select 1 from trellis_new n"),
+            "{update}"
+        );
+        assert_eq!(
+            update[repeated..case]
+                .matches("having count(*) > 1")
+                .count(),
+            2,
             "{update}"
         );
         for event in [CaptureEvent::Insert, CaptureEvent::Delete] {
@@ -2067,7 +2229,8 @@ mod tests {
             "{insert}"
         );
         let plain = ddl(&composite(), CaptureEvent::Update);
-        assert!(plain.contains(", l, ts, null::text[]\n"), "{plain}");
+        assert!(plain.contains(", l, ts, null::text[],\n"), "{plain}");
+        assert!(plain.contains(", l, ts, null::text[], null\n"), "{plain}");
     }
 
     #[test]
@@ -2076,7 +2239,7 @@ mod tests {
         assert!(
             sql.contains(
                 "values ('public.orders', (chr(31) || 'trellis-truncate-sentinel'), 'truncate', \
-                 l, null, null, l, ts, null)"
+                 l, null, null, l, ts, null, null)"
             ),
             "{sql}"
         );

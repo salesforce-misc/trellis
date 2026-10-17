@@ -4,7 +4,7 @@
 //! Every cell starts a fresh cluster (on `$TMPDIR`, so `bench --disk` moves
 //! it onto the disk), creates `public.wt_src (id bigint primary key, val
 //! numeric)`, registers one transform on it so every variant has the same
-//! catalog, then sets up one [`Variant`] and runs one [`Shape`] of inserts
+//! catalog, then sets up one [`Variant`] and runs one [`Shape`] of writes
 //! against it. Nothing drains the ring in any variant.
 //!
 //! Variants:
@@ -43,6 +43,19 @@
 //!   overflowing the backend's subtransaction cache past 64 captured
 //!   statements per transaction (#622 plan finding 8). That variant is gone,
 //!   and the shape now checks the chosen `trigger` stays clear of it.
+//! - `upd<r>x<w>`: `w` writers, each committing one
+//!   `UPDATE … SET val = val + 1` of `r` rows per transaction, cycling
+//!   through [`UPDATE_BAND_ROWS`] rows preloaded per writer before capture
+//!   is installed. The update capture's common path, which checks for
+//!   repeated keys on both sides (#1099).
+//! - `ups<r>x<w>`: one `INSERT … ON CONFLICT DO UPDATE` of `r` rows per
+//!   transaction, half of them the writer's previous statement's keys
+//!   (updated) and half new (inserted). Its two events capture in one
+//!   statement, so the second capture re-reads (the gated path).
+//! - `nest<r>x<w>`: `<r>x<w>` on a table with an application `AFTER INSERT`
+//!   row trigger that rewrites the row it fired for, in every variant. The
+//!   nested write makes capture re-read and stage transition images (the
+//!   gated path, #1099).
 //! - `copy`: one `COPY … FROM STDIN` of `--copy-rows` rows, one transaction.
 //! - A `+hold` suffix holds a transaction with an xid open on another
 //!   connection for the whole window: the long-running transaction under
@@ -172,11 +185,47 @@ impl Variant {
     }
 }
 
+/// What one batch statement does to its `rows_per_commit` rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Write {
+    /// `INSERT … SELECT` of new keys.
+    Insert,
+    /// `UPDATE … SET val = val + 1` of preloaded keys ([`UPDATE_BAND_ROWS`]
+    /// per writer, cycled through).
+    Update,
+    /// `INSERT … ON CONFLICT DO UPDATE`: half the keys the writer's previous
+    /// statement wrote (updated), half new (inserted). Both events capture
+    /// in one statement, so the second capture re-reads (the gated path).
+    Upsert,
+    /// `INSERT … SELECT` into a table with an application `AFTER INSERT` row
+    /// trigger that rewrites the row it fired for (in every variant). The
+    /// nested write makes capture re-read (the gated path).
+    Nested,
+}
+
+impl Write {
+    const PREFIXES: [(&'static str, Write); 3] = [
+        ("upd", Write::Update),
+        ("ups", Write::Upsert),
+        ("nest", Write::Nested),
+    ];
+
+    fn prefix(self) -> &'static str {
+        Write::PREFIXES
+            .iter()
+            .find(|(_, w)| *w == self)
+            .map_or("", |(p, _)| p)
+    }
+}
+
 /// How a shape's writers write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
-    /// One multi-row `INSERT … SELECT` per transaction.
-    Batch { rows_per_commit: usize },
+    /// One multi-row statement per transaction.
+    Batch {
+        rows_per_commit: usize,
+        write: Write,
+    },
     /// `statements` single-row `INSERT`s per transaction.
     Orm { statements: usize },
     /// One `COPY` of the cell's `--copy-rows`.
@@ -193,8 +242,9 @@ pub struct Shape {
 }
 
 impl Shape {
-    /// Parses `<r>x<w>`, `orm<s>x<w>` or `copy`, each optionally suffixed
-    /// `+hold` (see the module doc).
+    /// Parses `<r>x<w>`, `upd<r>x<w>`, `ups<r>x<w>`, `nest<r>x<w>`,
+    /// `orm<s>x<w>` or `copy`, each optionally suffixed `+hold` (see the
+    /// module doc).
     pub fn parse(raw: &str) -> Shape {
         let raw = raw.trim();
         let (body, hold_xmin) = match raw.strip_suffix("+hold") {
@@ -212,8 +262,15 @@ impl Shape {
             Some(rest) => (true, rest),
             None => (false, body),
         };
+        let (write, body) = Write::PREFIXES
+            .iter()
+            .find_map(|(p, w)| body.strip_prefix(p).map(|rest| (*w, rest)))
+            .unwrap_or((Write::Insert, body));
         let (per_txn, writers) = body.split_once('x').unwrap_or_else(|| {
-            panic!("shape {raw:?} must be <rows>x<writers>, orm<statements>x<writers> or copy")
+            panic!(
+                "shape {raw:?} must be <rows>x<writers> (optionally upd, ups or nest \
+                 before it), orm<statements>x<writers> or copy"
+            )
         });
         let number = |s: &str, what: &str| -> usize {
             let n: usize = s
@@ -232,6 +289,7 @@ impl Shape {
             } else {
                 Kind::Batch {
                     rows_per_commit: per_txn,
+                    write,
                 }
             },
             writers,
@@ -241,7 +299,10 @@ impl Shape {
 
     pub fn batch(rows_per_commit: usize, writers: usize) -> Shape {
         Shape {
-            kind: Kind::Batch { rows_per_commit },
+            kind: Kind::Batch {
+                rows_per_commit,
+                write: Write::Insert,
+            },
             writers,
             hold_xmin: false,
         }
@@ -249,7 +310,10 @@ impl Shape {
 
     pub fn label(&self) -> String {
         let body = match self.kind {
-            Kind::Batch { rows_per_commit } => format!("{rows_per_commit}x{}", self.writers),
+            Kind::Batch {
+                rows_per_commit,
+                write,
+            } => format!("{}{rows_per_commit}x{}", write.prefix(), self.writers),
             Kind::Orm { statements } => format!("orm{statements}x{}", self.writers),
             Kind::Copy => "copy".to_string(),
         };
@@ -263,7 +327,9 @@ impl Shape {
     /// Rows one transaction writes.
     pub fn rows_per_txn(&self, copy_rows: u64) -> u64 {
         match self.kind {
-            Kind::Batch { rows_per_commit } => rows_per_commit as u64,
+            Kind::Batch {
+                rows_per_commit, ..
+            } => rows_per_commit as u64,
             Kind::Orm { statements } => statements as u64,
             Kind::Copy => copy_rows,
         }
@@ -284,8 +350,13 @@ impl Shape {
     pub fn default_rows(&self, copy_rows: u64) -> u64 {
         let scale = self.writers.min(4) as u64;
         match self.kind {
-            Kind::Batch { rows_per_commit: 1 } | Kind::Orm { .. } => 400_000 * scale,
-            Kind::Batch { rows_per_commit } if rows_per_commit < 1000 => 2_000_000,
+            Kind::Batch {
+                rows_per_commit: 1, ..
+            }
+            | Kind::Orm { .. } => 400_000 * scale,
+            Kind::Batch {
+                rows_per_commit, ..
+            } if rows_per_commit < 1000 => 2_000_000,
             Kind::Batch { .. } => 4_000_000,
             Kind::Copy => copy_rows,
         }
@@ -293,7 +364,10 @@ impl Shape {
 }
 
 /// E1's shapes plus the ORM shape (#622 plan, C4), and the ORM shape again at
-/// 16 writers and under a held `xmin`, for the subtransaction effect.
+/// 16 writers and under a held `xmin`, for the subtransaction effect; then
+/// #1099's updates (single-row and bulk, the update capture's common path),
+/// a mixed upsert and an application trigger rewriting its row (both the
+/// gated path, where capture re-reads).
 pub const DEFAULT_SHAPES: &[&str] = &[
     "1x1",
     "1x16",
@@ -304,7 +378,16 @@ pub const DEFAULT_SHAPES: &[&str] = &[
     "orm100x16",
     "orm100x16+hold",
     "copy",
+    "upd1x1",
+    "upd1000x1",
+    "upd1000x16",
+    "ups1000x1",
+    "nest100x1",
 ];
+
+/// Rows preloaded into each writer's band for an update shape, which its
+/// statements cycle through.
+pub const UPDATE_BAND_ROWS: i64 = 100_000;
 
 /// When the snapshot probe runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -711,9 +794,27 @@ async fn connect_writers(dsn: &str, shape: Shape) -> Vec<Writer> {
     for w in 0..shape.writers {
         let raw = connect_raw(dsn).await;
         let sql = match shape.kind {
-            Kind::Batch { .. } => format!(
+            Kind::Batch {
+                write: Write::Insert | Write::Nested,
+                ..
+            } => format!(
                 "insert into public.{SOURCE_TABLE} (id, val) \
                  select g, g from generate_series($1::bigint, $2::bigint) g"
+            ),
+            Kind::Batch {
+                write: Write::Update,
+                ..
+            } => format!(
+                "update public.{SOURCE_TABLE} set val = val + 1 \
+                 where id between $1::bigint and $2::bigint"
+            ),
+            Kind::Batch {
+                write: Write::Upsert,
+                ..
+            } => format!(
+                "insert into public.{SOURCE_TABLE} (id, val) \
+                 select g, g from generate_series($1::bigint, $2::bigint) g \
+                 on conflict (id) do update set val = excluded.val + 1"
             ),
             Kind::Orm { .. } => format!(
                 "insert into public.{SOURCE_TABLE} (id, val) values ($1::bigint, $1::bigint)"
@@ -738,6 +839,15 @@ async fn run_writers(
     max_window: Duration,
 ) -> Writes {
     let rows_per_txn = shape.rows_per_txn(0);
+    // How far a writer's keys move per transaction. An upsert's next
+    // statement updates the second half of this one's keys.
+    let step = match shape.kind {
+        Kind::Batch {
+            write: Write::Upsert,
+            ..
+        } => (rows_per_txn as i64 / 2).max(1),
+        _ => rows_per_txn as i64,
+    };
     let claimed = Arc::new(AtomicU64::new(0));
     let start = Instant::now();
     let deadline = start + max_window;
@@ -746,17 +856,27 @@ async fn run_writers(
         .map(|(w, mut raw, statement)| {
             let claimed = Arc::clone(&claimed);
             tokio::spawn(async move {
-                let mut next_id = (w as i64 + 1) * WRITER_BAND;
+                let band = (w as i64 + 1) * WRITER_BAND;
+                let mut next_id = band;
                 let mut done = 0u64;
                 let mut latency = LatencyHistogram::default();
                 while Instant::now() < deadline && claimed.fetch_add(1, Ordering::Relaxed) < txns {
                     let t = Instant::now();
                     match shape.kind {
-                        Kind::Batch { .. } => {
-                            let hi = next_id + rows_per_txn as i64 - 1;
-                            raw.execute(&statement, &[&next_id, &hi])
+                        Kind::Batch { write, .. } => {
+                            let lo = match write {
+                                // Cycle through the preloaded band.
+                                Write::Update => {
+                                    let span = (UPDATE_BAND_ROWS / rows_per_txn as i64).max(1)
+                                        * rows_per_txn as i64;
+                                    band + (next_id - band) % span
+                                }
+                                Write::Insert | Write::Upsert | Write::Nested => next_id,
+                            };
+                            let hi = lo + rows_per_txn as i64 - 1;
+                            raw.execute(&statement, &[&lo, &hi])
                                 .await
-                                .expect("batch insert");
+                                .expect("batch statement");
                         }
                         Kind::Orm { statements } => {
                             let txn = raw.transaction().await.expect("begin");
@@ -770,7 +890,7 @@ async fn run_writers(
                         Kind::Copy => unreachable!(),
                     }
                     latency.record(t.elapsed());
-                    next_id += rows_per_txn as i64;
+                    next_id += step;
                     done += 1;
                 }
                 (done, latency)
@@ -866,7 +986,8 @@ pub struct CellResult {
     /// row commits with the source row), `None` without capture.
     pub capture_rows_per_sec: Option<f64>,
     pub ring_rows: i64,
-    /// The ring holds exactly the rows written (no capture: none).
+    /// The ring holds exactly the rows written, twice over for a nested
+    /// shape (no capture: none).
     pub ring_ok: bool,
 }
 
@@ -1057,6 +1178,49 @@ pub async fn run_cell(
         .await
         .expect("declare the relationship onto the source table");
     }
+    match shape.kind {
+        Kind::Batch {
+            write: Write::Update,
+            rows_per_commit,
+        } => {
+            assert!(
+                rows_per_commit as i64 <= UPDATE_BAND_ROWS,
+                "an update shape writes at most {UPDATE_BAND_ROWS} rows per statement"
+            );
+            for w in 0..shape.writers as i64 {
+                let band = (w + 1) * WRITER_BAND;
+                raw.batch_execute(&format!(
+                    "insert into public.{SOURCE_TABLE} (id, val) \
+                     select g, g from generate_series({band}, {}) g",
+                    band + UPDATE_BAND_ROWS - 1
+                ))
+                .await
+                .expect("preload the writer's band");
+            }
+            raw.batch_execute(&format!("vacuum analyze public.{SOURCE_TABLE}"))
+                .await
+                .expect("vacuum the preloaded table");
+        }
+        Kind::Batch {
+            write: Write::Nested,
+            ..
+        } => {
+            raw.batch_execute(&format!(
+                "create function public.wt_rewrite() returns trigger language plpgsql as $$ \
+                 begin \
+                     if pg_trigger_depth() = 1 then \
+                         update public.{SOURCE_TABLE} set val = new.val + 1 where id = new.id; \
+                     end if; \
+                     return null; \
+                 end $$; \
+                 create trigger wt_rewrite after insert on public.{SOURCE_TABLE} \
+                     for each row execute function public.wt_rewrite()"
+            ))
+            .await
+            .expect("create the application trigger");
+        }
+        _ => {}
+    }
     set_up_variant(variant, SOURCE_TABLE, &mut raw).await;
 
     let rows_target = opts
@@ -1179,7 +1343,16 @@ pub async fn run_cell(
         };
     let capture_rows_per_sec = variant.captures().then_some(rows_per_sec);
     let expected_ring = if variant.captures() {
-        writes.rows as i64
+        // A nested shape's trigger rewrites every row it inserts, which
+        // stages a second ring row per row.
+        let per_row = match shape.kind {
+            Kind::Batch {
+                write: Write::Nested,
+                ..
+            } => 2,
+            _ => 1,
+        };
+        writes.rows as i64 * per_row
     } else {
         0
     };
@@ -1335,6 +1508,27 @@ mod tests {
         );
         assert_eq!(Shape::parse("1000x16"), Shape::batch(1000, 16));
         assert_eq!(Shape::parse("copy").kind, Kind::Copy);
+        assert_eq!(
+            Shape::parse("upd1000x16").kind,
+            Kind::Batch {
+                rows_per_commit: 1000,
+                write: Write::Update
+            }
+        );
+        assert_eq!(
+            Shape::parse("ups100x1").kind,
+            Kind::Batch {
+                rows_per_commit: 100,
+                write: Write::Upsert
+            }
+        );
+        assert_eq!(
+            Shape::parse("nest1x4").kind,
+            Kind::Batch {
+                rows_per_commit: 1,
+                write: Write::Nested
+            }
+        );
     }
 
     #[test]

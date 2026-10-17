@@ -102,7 +102,7 @@ All four append into the active segment:
 
 | Producer | What it appends | Carries images? |
 |---|---|---|
-| Capture triggers | the source change, in the writer's transaction | yes — `old_image` and/or `new_image` |
+| Capture triggers | the source change, in the writer's transaction | yes — `old_image` and/or `new_image`, and `transition_images` where a re-read's images aren't the statement's own ([01](01-capture-by-triggers.md#every-transition-row-counts-once)) |
 | Reverse propagation (a worker staging its dependents) | a bare recompute trigger | **no** |
 | Definition re-derive (a formula changed) | a bare recompute trigger | **no** |
 | Backfill / snapshot enumeration | a bare recompute trigger, server-side | **no** |

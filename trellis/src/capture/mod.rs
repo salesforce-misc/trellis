@@ -40,15 +40,17 @@
 //! - **`src_changed`** is `clock_timestamp()` when the statement's trigger
 //!   runs, which is change time, not commit time (#622 plan Q8).
 //!
-//! # Known limitation until D (#623)
+//! # Nested writes to the same key
 //!
-//! A nested write to the same key reorders its images. Suppose an
-//! application `AFTER ROW` trigger, or a self-referencing cascade, rewrites a
-//! row its own statement wrote. The nested statement's capture runs first,
-//! so the ring holds the newer image at the lower `lsn`. A GROUP BY target
-//! then subtracts and adds the wrong images. A 1-1 target is unaffected.
-//! Under OLD+NEW images no image shape fixes this; D's NEW-only apply with a
-//! re-read image does.
+//! Suppose an application `AFTER ROW` trigger, or a self-referencing cascade,
+//! rewrites a row its own statement wrote. The nested statement's capture
+//! runs first, so the outer statement's ring row has the higher `lsn`. That
+//! row re-reads the live row, so its `new_image` carries the final values a
+//! 1-1 target needs (#623 D8a, #680). Where the live row isn't the statement's
+//! own transition row, the row also records the transition images in
+//! `transition_images`, which a reader summing `f(new) − f(old)` uses so
+//! every transition row counts once (#1099; [`sql`]'s "Every transition row
+//! counts once").
 
 // A few items (the parity helpers, the spec accessors) only the tests reach,
 // and a build without `internals` would flag them as dead.

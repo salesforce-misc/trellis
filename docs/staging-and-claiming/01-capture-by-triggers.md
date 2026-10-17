@@ -416,6 +416,33 @@ target keeps the final values (`tests/capture_join.rs`,
 the fold keeps the earliest old image anyway. A nested write that re-keys a
 row is covered by the [known correctness gaps](../known-correctness-gaps.md).
 
+### Every transition row counts once
+
+A reader that sums each ring row's `f(new) − f(old)`, as a group basis does,
+needs a transaction's rows to telescope to the final row minus the first. The
+live `new_image` breaks that: when a trigger rewrites `a → b` to `c`, the
+nested capture stages `(b, c)` and the outer one `(a, c)`, which sums to
+`2c − a − b`. A 1-1 target still needs the live row at the highest `lsn`, so
+the re-read stays, and a re-read row also records the statement's own
+transition rows wherever its images aren't them:
+
+- `transition_images` is `{"old": …, "new": …}`, each side the transition
+  row's image or JSON `null`. It is set where the live row is gone (staged as
+  a delete, whose `old_image` is the transition NEW row if the statement
+  inserted it), where the live row differs from the transition NEW row, and
+  where a delete finds its key put back (staged as an update). Otherwise it is
+  `NULL` and `old_image`/`new_image` are the transition rows. A capture that
+  doesn't re-read never sets it, so the common path writes nothing new.
+- Each transition row is in exactly one ring row. An update's re-read pairs
+  OLD and NEW rows one to one per key, so a key with two versions on a side
+  pairs each once.
+
+A summing reader takes a row's sides from `transition_images` when it is set.
+A statement's rows then sum to `Σ f(NEW) − Σ f(OLD)` (a dropped no-op pair
+cancels), and a transaction's telescope. 1-1 readers ignore the column.
+`tests/capture_transition_images.rs` checks the sum, and each key's final
+state, for every nested-write shape.
+
 ## When capture re-reads
 
 `new_image` is the live row: the one the transaction holds once the
@@ -471,8 +498,11 @@ once one has fired, and its rows join the transition tables of the table's
 update already queued there: one capture call covers both. A row both
 updated (a self-referencing key that cascades, or two cascading keys on one
 row) is in the transition tables twice, and pairing by key can image the
-intermediate version last. So an update capture also re-reads when a key
-occurs twice among its old rows.
+intermediate version last. A row that references itself through a
+self-referencing `ON UPDATE CASCADE` can repeat a key among the new rows
+only, where pairing by key counts one old row twice. So an update capture
+also re-reads when a key occurs twice on either side, and the re-read pairs
+one to one.
 `tests/capture_ssi.rs` pins the gate, and `capture::sql`'s `function_body`
 has the argument.
 
@@ -483,11 +513,13 @@ it: about 16 µs per single-row statement on tmpfs, and 1.3–1.7× one
 expression index's CPU per row for batched writes, with about 300 bytes of
 WAL per row (`benchmark` scenario `write-tax`). The begin
 trigger and the span bookkeeping add about 4.4 µs per statement,
-and nothing per row. An update's repeated-key check adds about 2.7 µs per
-statement and 0.3 µs per row (a rough in-transaction measurement, not
-`write-tax`, which only inserts). When a statement does re-read, the probe
-adds about 0.65–1.0 µs per row in batched writes and 3–10 µs per single-row
-statement.
+and nothing per row. An update's repeated-key checks, which group its old and
+new rows by key, cost about 2% of a captured update's throughput, single-row
+or bulk (`write-tax` shapes `upd1x1`, `upd1000x1`). When a statement does
+re-read, the probe adds about 0.65–1.0 µs per row in batched writes and
+3–10 µs per single-row statement. An application trigger that rewrites every
+row it inserted makes every statement re-read and stage transition images:
+captured, `nest100x1` keeps 8.5% of its uncaptured rate.
 
 ## Trellis migrations and the write path
 
