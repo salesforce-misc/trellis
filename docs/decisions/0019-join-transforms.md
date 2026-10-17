@@ -38,31 +38,49 @@ out of scope.
 
 ### A JOIN transform is two tables, an equi-join and a `GROUP BY`
 
-The two sides are two different tables, each a captured table with a primary
-key, a partitioned root, or another transform's target (which needs no primary
-key). The join is `INNER` or `LEFT`, and `a` is the side `LEFT` keeps. `ON` is
-one or more equalities between a column of `a` and a column of `b`, joined by
-`AND`. The join-key collations must match and be deterministic, so that grouping
-by the key and joining on it agree on equality. The join may be many-to-many:
-`b`'s join key needn't be unique, and the results match SQL's fan-out. A `NULL`
-join key never matches, so a `LEFT` row with no match lands in the group with a
-`NULL` `gb`. `GROUP BY` is required, with at least one key, and takes columns
-from either side. A JOIN transform has no relationship paths. `WHERE` stays
-`TRUE`-only, as on every transform; a future `WHERE` applies after the join, as
-in SQL.
+The rules are strict where loosening one later is additive and tightening one
+would break a stored definition, which is stored as text and re-parsed.
 
-[OPEN: the syntax surface: how a column reference names its side (the table
-name, an alias, or a bare name unique to one side), whether a bare `JOIN` means
-`INNER`, which `ON` shapes beyond column equalities are admitted (expression
-keys and one-side predicates decompose by key too), what two `GROUP BY` keys
-with the same column name (`a.id`, `b.id`) are called in the target, and the
-join-key type rule. Decided in #1106. Recommendation: references qualified by
-the side's table name with bare names refused, a bare `JOIN` as `INNER`,
-column equalities only, same-named keys refused, and matching key types.]
+- **Sides.** The two sides are two tables with different bare names, each a
+  captured table with a primary key, a partitioned root, or another transform's
+  target (which needs no primary key). A side is named by its bare table name;
+  there are no table aliases, so two sides sharing a bare name (a self-join, or
+  `shop.orders JOIN archive.orders`) are refused.
+- **Side qualification.** Every source column is written `<side>.<col>`, in
+  `ON`, `GROUP BY` and fields alike; a bare name means a field. Resolving a
+  bare name to whichever side has it would let a column later added to the
+  other side change or break a stored definition. A dotted name whose head
+  isn't a side is an unknown table qualifier: a JOIN transform has no
+  relationship paths.
+- **Join kind.** `JOIN` and `INNER JOIN` are `INNER`; `LEFT JOIN` and
+  `LEFT OUTER JOIN` are `LEFT`, and `a` is the side `LEFT` keeps. A definition
+  stores and renders them as `INNER JOIN` and `LEFT JOIN`. Exactly one join.
+- **`ON`.** One or more equalities joined by `AND`, each `a.col = b.col` (in
+  either order) with one column from each side, and no column pair repeated, so
+  composite keys such as `(tenant_id, id)` are admitted. `P`, `M` and `J` key on
+  the tuple of join columns, in `ON` order. A row with a `NULL` in any join-key
+  column never matches, so a `LEFT` row with no match lands in the group with a
+  `NULL` `gb`.
+- **Join-key types.** Each column pair has the same type, type modifier and
+  deterministic collation, with no casting or widening, from the same set of
+  text-stable types any join key admits, so that grouping by the key and
+  joining on it agree on equality. A retype of one side pauses the transform
+  until the other side matches.
+- **Cardinality.** The join may be many-to-many: `b`'s join key needn't be
+  unique, and `M` counts multiplicity, so the results match SQL's fan-out.
+- **`GROUP BY`.** Required, with at least one key, from either side. Each key
+  becomes a target column named after its bare column name, so two keys with
+  the same bare name (`orders.region`, `customers.region`) are refused; a 1-1
+  transform that renames the column on one side is the remedy.
+- **`WHERE`.** `TRUE`-only, as on every transform; a future `WHERE` applies
+  after the join, as in SQL.
 
-What's admitted is the shape the design below is proven exact for. A self-join,
-`RIGHT`, `FULL`, `CROSS`, a third table, a join with no `GROUP BY` and a non-equi
-`ON` are refused at define;
+What's admitted is the shape the design below is proven exact for. Refused at
+define, by name: two sides sharing a bare table name; `RIGHT` (swap the sides
+and use `LEFT`), `FULL`, `CROSS`, a comma join and a second `JOIN`; an
+expression key, a non-equality condition, `OR`, a one-side predicate, an
+equality between two columns of one side, `USING` and `NATURAL`; and a join
+with no `GROUP BY`.
 [Supported sources and targets](../transforms.md#supported-sources-and-targets)
 lists each refusal and its remedy. A join with no `GROUP BY` produces one row per
 matching pair, which is per-row state by definition, and a non-equi join (a
@@ -312,8 +330,7 @@ a second table with different correctness rules.
 ## Example
 
 `orders(id, customer_id, amount numeric(12,2))` has 100M rows, and
-`customers(id, region)` has 50k. The definition is written in the recommended
-syntax, which is still open (above).
+`customers(id, region)` has 50k.
 
 ```text
 TRANSFORM revenue_by_region
