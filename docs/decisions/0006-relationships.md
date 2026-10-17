@@ -1,10 +1,14 @@
 ---
-status: accepted
-date: 2026-09-02
+status: superseded
+date: 2026-10-17
 deciders: Michael Ries
 ---
 
 # Named Relationships
+
+Superseded by [ADR-0019](0019-join-transforms.md): JOIN transforms replace
+relationships, which are removed. This ADR describes the relationship code
+until it is deleted, and is deleted with it.
 
 This ADR settles how a named relationship is declared and referenced, how
 cardinality constrains that reference, and how a change to a *related* row
@@ -168,7 +172,7 @@ directions:
 * **Reverse (a *related* row changes).** From the dependency graph, Trellis
   finds which relationships target the changed table and updates the
   referencing rows' targets through the parent's applied value, which each
-  target owns ([ADR-0002](0002-async-data-flow.md#relationships-the-parent-is-read-under-the-childs-entry-lock)):
+  target owns ([ADR-0002](0002-async-data-flow.md)):
   a to-side change touches the parent row and its groups, never the children,
   for fields linear in the to-side value; other fields re-derive each child
   through the target's join-key index. No replica identity is required on
