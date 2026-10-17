@@ -672,3 +672,162 @@ async fn a_statement_without_a_nested_write_sets_no_transition_images() {
         );
     }
 }
+
+/// A partitioned source: the root's statement trigger sees every leaf's
+/// rows, and a nested write the application trigger makes through the root
+/// (including onto a row an update moved to another partition) or straight
+/// to a leaf counts once.
+#[tokio::test]
+async fn a_partitioned_source_sums_once() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect(db.dsn()).await;
+    client
+        .batch_execute(
+            "create table public.src (id int primary key, g int, v int) partition by range (id); \
+             create table public.src_a partition of public.src for values from (0) to (100); \
+             create table public.src_b partition of public.src for values from (100) to (1000); \
+             insert into public.src values (1, 1, 2), (2, 1, 4), (150, 1, 6)",
+        )
+        .await
+        .expect("create public.src");
+    capture(&mut client, "public.src", SRC).await;
+    app_trigger(
+        &client,
+        "insert or update",
+        "if new.v % 2 = 1 then update public.src set v = new.v + 1 where id = new.id; end if;",
+    )
+    .await;
+
+    for sql in [
+        "update public.src set v = v + 1",
+        "update public.src set id = id + 100, v = v + 1 where id < 100",
+        "update public.src_b set v = v + 1",
+        "insert into public.src values (5, 1, 1), (500, 1, 3)",
+    ] {
+        assert_chains(&client, "public.src", SRC, sql).await;
+    }
+}
+
+/// An insert's new rows can hold one key twice: a `BEFORE ROW` trigger
+/// deletes the row the statement inserted a moment earlier, and the
+/// statement inserts the key again.
+#[tokio::test]
+async fn an_insert_that_writes_a_key_twice_sums_once() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = src_table(db.dsn()).await;
+    client
+        .batch_execute(
+            "create function public.replace() returns trigger language plpgsql as $$ \
+             begin delete from public.src where id = new.id; return new; end $$; \
+             create trigger replace before insert on public.src \
+                 for each row execute function public.replace()",
+        )
+        .await
+        .expect("create the trigger");
+
+    let rows = assert_chains(
+        &client,
+        "public.src",
+        SRC,
+        "insert into public.src values (9, 1, 1), (9, 1, 2), (1, 5, 5)",
+    )
+    .await;
+    assert!(
+        rows.iter().any(|r| r.transition.is_some()),
+        "the first version of key 9 isn't the live row: {rows:#?}"
+    );
+}
+
+/// A key swap under a deferrable primary key, with and without a nested
+/// write: each key is on both sides once, and pairs with the row that now
+/// holds it.
+#[tokio::test]
+async fn a_key_swap_sums_once() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect(db.dsn()).await;
+    client
+        .batch_execute(
+            "create table public.src (id int primary key deferrable initially immediate, \
+                 g int, v int); \
+             insert into public.src values (1, 1, 2), (2, 1, 4), (3, 1, 6)",
+        )
+        .await
+        .expect("create public.src");
+    capture(&mut client, "public.src", SRC).await;
+
+    assert_chains(
+        &client,
+        "public.src",
+        SRC,
+        "update public.src set id = 3 - id where id in (1, 2)",
+    )
+    .await;
+    app_trigger(
+        &client,
+        "update",
+        "update public.src set v = new.v + 1000 where id = new.id;",
+    )
+    .await;
+    assert_chains(
+        &client,
+        "public.src",
+        SRC,
+        "update public.src set id = case id when 1 then 2 when 2 then 3 else 1 end",
+    )
+    .await;
+}
+
+/// `H1.fk-cascade-self` with a composite key: the new-key check and the
+/// one-to-one pairing work on the joined key.
+#[tokio::test]
+async fn a_composite_key_cascade_sums_once() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect(db.dsn()).await;
+    client
+        .batch_execute(
+            "create table public.ck (a int, id int, pa int, pid int, v int, \
+                 primary key (a, id), \
+                 foreign key (pa, pid) references public.ck (a, id) on update cascade); \
+             insert into public.ck values (1, 1, 1, 1, 10), (1, 2, 1, 1, 20), (2, 1, 2, 1, 30)",
+        )
+        .await
+        .expect("create public.ck");
+    let spec = CaptureSpec::new(
+        "public.ck",
+        vec!["a".to_string(), "id".to_string()],
+        ["pa", "pid", "v"].iter().map(|c| c.to_string()),
+        Vec::new(),
+    )
+    .expect("valid spec");
+    match install::install(&mut client, DEFAULT_SCHEMA, &spec, None)
+        .await
+        .expect("install")
+    {
+        Progress::Done(_) => {}
+        Progress::Waiting(wait) => panic!("an install without a deadline landed: {wait}"),
+    }
+
+    // `table_images` adds `id`; `a` is the key's other column.
+    let columns = &["a", "pa", "pid", "v"];
+    let before = table_images(&client, "public.ck", columns).await;
+    client
+        .batch_execute("begin; update public.ck set id = id + 100 where a = 1 and id = 1")
+        .await
+        .expect("update");
+    let txid: String = client
+        .query_one("select pg_current_xact_id()::text", &[])
+        .await
+        .expect("txid")
+        .get(0);
+    client.batch_execute("commit").await.expect("commit");
+    let mut expected = table_images(&client, "public.ck", columns).await;
+    for (image, n) in before {
+        add(&mut expected, image, -n);
+    }
+    let rows = ring(&client, "public.ck", &txid).await;
+    assert_eq!(chain_sum(&rows), expected, "ring rows: {rows:#?}");
+}

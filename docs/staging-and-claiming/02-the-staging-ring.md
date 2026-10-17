@@ -74,7 +74,7 @@ VALUES (...), (...), ...;
 ```
 
 No `ON CONFLICT`, no merge, one row per raw change. Three columns are supplied by
-the *table definition* rather than the producer, which makes them free that makes them free:
+the *table definition* rather than the producer, which makes them free:
 
 | Column | How it is populated | Why not client-side |
 |---|---|---|

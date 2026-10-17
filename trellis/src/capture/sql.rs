@@ -1483,9 +1483,12 @@ fn transition_images(
 /// `alias`'s primary-key columns, typed, for the update's repeated-key
 /// check ([`function_body`]). Grouping by the typed values rather than the
 /// rendered key ([`key_expr`]) costs no output function per row, and never
-/// misses a repeat: two rows whose keys render the same have equal keys, so a
-/// type's `=` that is looser than the text (`numeric` `1.0 = 1.00`) only
-/// makes the check re-read more often.
+/// misses a repeat: under the function's pinned output settings, two keys
+/// that render the same are equal by their type's `=` (a primary key's type
+/// always has a btree `=`, and `extra_float_digits` keeps every `float`
+/// distinct in text). A type's `=` that is looser than the text (`numeric`
+/// `1.0 = 1.00`, `float8` `-0 = 0`, a nondeterministic collation) only makes
+/// the check re-read more often.
 fn typed_key(spec: &CaptureSpec, alias: &str) -> String {
     spec.key
         .iter()

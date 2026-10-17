@@ -513,9 +513,9 @@ it: about 16 µs per single-row statement on tmpfs, and 1.3–1.7× one
 expression index's CPU per row for batched writes, with about 300 bytes of
 WAL per row (`benchmark` scenario `write-tax`). The begin
 trigger and the span bookkeeping add about 4.4 µs per statement,
-and nothing per row. An update's repeated-key checks, which group its old and
-new rows by key, cost about 2% of a captured update's throughput, single-row
-or bulk (`write-tax` shapes `upd1x1`, `upd1000x1`). When a statement does
+and nothing per row. An update's two repeated-key checks, which group its old
+and new rows by the typed key, add about 2.5 µs per statement each and well
+under 1 µs per row (`write-tax` shapes `upd1x1`, `upd1000x1`). When a statement does
 re-read, the probe adds about 0.65–1.0 µs per row in batched writes and
 3–10 µs per single-row statement. An application trigger that rewrites every
 row it inserted makes every statement re-read and stage transition images:
