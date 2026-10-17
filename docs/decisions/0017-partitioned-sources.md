@@ -1,6 +1,6 @@
 ---
 status: draft
-date: 2026-10-14
+date: 2026-10-17
 deciders: Michael Ries
 ---
 
@@ -20,8 +20,10 @@ detects the change and corrects it by itself, with no operator step, and every
 supported operation has a documented path that avoids the window altogether.
 
 This ADR extends [ADR-0002](0002-async-data-flow.md)'s capture and truncate
-decisions to partitioned sources. It settles which partition trees an aggregate
-or a to-many relationship can read, how capture covers them, and how the
+decisions to partitioned sources. It settles which partition trees an
+aggregate, a side of a JOIN transform
+([ADR-0019](0019-join-transforms.md)) or a to-many relationship can read, how
+capture covers them, and how the
 reconcile pass detects and corrects partition maintenance. Partitioned targets,
 inheritance hierarchies, a partition named as a source, and trees of more than
 1,000 leaves are out of scope.
@@ -31,17 +33,35 @@ inheritance hierarchies, a partition named as a source, and trees of more than
 ### A partitioned root is a source when its group key holds every partition-key column
 
 A declaratively partitioned root (`RANGE`, `LIST` or `HASH`, any depth, with or
-without a `DEFAULT`) may be an aggregate's `FROM` or a to-many relationship's
-to-side, on PostgreSQL 15+, when its `GROUP BY` (or the relationship's to-side
-join key) contains every partition-key column at every level. Targets stay plain
-tables.
+without a `DEFAULT`) may be an aggregate's `FROM`, either side of a JOIN
+transform, or a to-many relationship's to-side, on PostgreSQL 15+, when its
+group key contains every partition-key column at every level. The group key is
+an aggregate's `GROUP BY`; for a JOIN side, it is that side's partial key, the
+side's own group columns plus the join key; for a relationship, its to-side join
+key. Targets stay plain tables.
 
 With every partition-key column in the group key, each group lives in exactly
 one leaf, so a lifecycle change touches only the groups routing to one node and
-the catalog says which those are. Without it, a `DROP` needs a full source
-rescan (hours at multi-TB per retention drop) or per-leaf group bookkeeping. The
-motivating shape, `HASH` on the parent id with 32 leaves, satisfies it, so the
-restriction costs little and has no fallback.
+the catalog says which those are. Under [ADR-0002](0002-async-data-flow.md)'s
+group-level basis, a node's correction recomputes exactly those groups from the
+source; on a JOIN side, those groups are the side's partial cells, recomputed
+under the join-key locks so the change carries into the target. Because the
+join key counts, a fact table partitioned on the column it joins by needs
+nothing more in its `GROUP BY`, while one partitioned on its own id is refused.
+Without the rule, a `DROP` needs a full source rescan (hours at multi-TB per
+retention drop) or per-leaf group bookkeeping. The motivating shape, `HASH` on
+the parent id with 32 leaves, satisfies it, so the restriction costs little and
+has no fallback.
+
+Why not lift the rule by keying the partials by a hidden leaf column, so a leaf
+event deletes that leaf's cells and propagates the change? It costs up to
+leaves × cells in state and touches every group-basis structure, and stamping
+each captured image with its leaf is unmeasured. Why not recompute every group
+from the source on any leaf event? That is a full source `GROUP BY` per leaf
+event, one a day under daily retention drops, and it is untested. Either would
+lift a define-time refusal later without changing what is admitted now.
+Time-range-partitioned tables grouped coarser than their partition key (by day
+over `created_at` partitions) are refused until then.
 
 I tested every decision here against real clusters with Trellis's generated
 capture and an oracle diff after each step: the trigger and lifecycle behaviour
@@ -341,8 +361,8 @@ full rebuild away from the operator.
 
 ### Define refuses a shape routing can't serve, and the pass pauses one that appears later
 
-Define refuses, naming the column: a group key or to-many join key missing a
-partition-key column at some level; a key level that resolves to no columns (an
+Define refuses, naming the column: a group key, a JOIN side's partial key or a
+to-many join key missing a partition-key column at some level; a key level that resolves to no columns (an
 expression or whole-row key); a partition-key column whose type is not
 `smallint`, `integer`, `bigint`, `numeric`, `text`, `varchar`, `uuid`, `date`,
 `timestamp`, `timestamptz` or `boolean`, that uses a non-default partition
