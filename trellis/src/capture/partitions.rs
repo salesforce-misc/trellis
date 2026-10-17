@@ -514,10 +514,19 @@ fn refusal_for(
     tree: &PartitionTree,
     server_version_num: i32,
 ) -> Option<PartitionRefusal> {
-    if reader.source == table {
+    if reader.source == table || reader.join.as_deref() == Some(table) {
         let refusal = match &reader.def.key_space {
+            // ADR-0019: a side's partials are keyed by its `GROUP BY`
+            // columns and join key, the key ADR-0017's group-key rule
+            // applies to (define makes the same check).
             KeySpace::Join(_) => {
-                unreachable!("a JOIN definition is refused by validation, so none reaches here")
+                crate::defs::join::side_of_table(&reader.def, table).and_then(|side| {
+                    tree.refusal(
+                        server_version_num,
+                        KeyRole::GroupBy,
+                        &crate::defs::join::side_key_columns(&reader.def, side),
+                    )
+                })
             }
             KeySpace::OneToOne => Some(PartitionRefusal::OneToOneFrom {
                 table: table.to_string(),

@@ -128,9 +128,10 @@ pub enum ValidationError {
     /// source would feed our own writes back into capture (see
     /// `docs/data-flow.md`).
     TargetEqualsSource { table: String },
-    /// A `JOIN` definition passed validation, but nothing builds it yet, so
-    /// define refuses it rather than install a transform that never fills.
-    JoinNotInstallable,
+    /// [`validate`] was handed a `JOIN` definition. A `JOIN` is checked
+    /// against both tables' columns, by [`validate_join`]; this entry point
+    /// has only the `FROM` table's.
+    JoinNeedsBothTables,
     /// The joined table is the `FROM` table. A self-join needs aliases, which
     /// the grammar doesn't have.
     JoinSelf { table: String },
@@ -866,10 +867,10 @@ impl fmt::Display for ValidationError {
                 "target table '{table}' is the same as the source table; calculated \
                  columns must live on a separate neighbor table"
             ),
-            ValidationError::JoinNotInstallable => write!(
+            ValidationError::JoinNeedsBothTables => write!(
                 f,
-                "JOIN definitions parse and validate, but are not installable yet: nothing \
-                 builds their target (epic #1091)"
+                "a JOIN definition is validated against both tables' columns, not the FROM \
+                 table's alone"
             ),
             ValidationError::JoinSelf { table } => write!(
                 f,
@@ -1352,10 +1353,9 @@ pub fn validate(
     validate_target_names(def)?;
 
     // A JOIN is validated by [`validate_join`], which needs both tables'
-    // columns; this entry point has only the source's. Nothing builds a JOIN
-    // target yet, so define stops here rather than install one.
+    // columns; this entry point has only the source's.
     if let KeySpace::Join(_) = def.key_space {
-        return Err(ValidationError::JoinNotInstallable);
+        return Err(ValidationError::JoinNeedsBothTables);
     }
 
     validate_qualified_columns(def, source_columns, def.explicit_source_schema.as_deref())?;
@@ -1365,7 +1365,7 @@ pub fn validate(
     // `Aggregate` has real runtime checks (below), since — unlike the other
     // arm here — the AST can encode an invalid one.
     match &def.key_space {
-        KeySpace::Join(_) => return Err(ValidationError::JoinNotInstallable),
+        KeySpace::Join(_) => return Err(ValidationError::JoinNeedsBothTables),
         KeySpace::OneToOne => {
             for field in &def.fields {
                 // A calculated field aliased to a real source column's name
@@ -1955,24 +1955,7 @@ pub fn validate_join(
         }
         // The composed field's type, over both tables' columns: each column
         // is renamed apart by side, since the two tables may share names.
-        let mut renamed = field.expr.clone();
-        let mut types = HashMap::new();
-        rename_join_columns(&mut renamed, &def.source, left, right, &mut types);
-        let types_by_field = infer_field_types(
-            &TransformDef {
-                fields: vec![super::ast::FieldDef {
-                    name: field.name.clone(),
-                    expr: renamed,
-                }],
-                key_space: KeySpace::Aggregate {
-                    group_by: Vec::new(),
-                },
-                ..def.clone()
-            },
-            &types,
-            &HashMap::new(),
-        )?;
-        debug_assert!(types_by_field.contains_key(&field.name));
+        join_field_value_type(def, field, left, right)?;
     }
     Ok(())
 }
@@ -2163,6 +2146,39 @@ fn rename_join_columns(
         }
         _ => {}
     }
+}
+
+/// The type of a `JOIN` definition's field that isn't a `GROUP BY` key, as
+/// [`validate_join`] infers it: each column typed by its own side, the
+/// single-table inference over the rest. Only meaningful for a definition
+/// [`validate_join`] accepts.
+pub(crate) fn join_field_value_type(
+    def: &TransformDef,
+    field: &super::ast::FieldDef,
+    left: &HashMap<String, JoinColumnInfo>,
+    right: &HashMap<String, JoinColumnInfo>,
+) -> Result<ValueType, ValidationError> {
+    let mut renamed = field.expr.clone();
+    let mut types = HashMap::new();
+    rename_join_columns(&mut renamed, &def.source, left, right, &mut types);
+    let types_by_field = infer_field_types(
+        &TransformDef {
+            fields: vec![super::ast::FieldDef {
+                name: field.name.clone(),
+                expr: renamed,
+            }],
+            key_space: KeySpace::Aggregate {
+                group_by: Vec::new(),
+            },
+            ..def.clone()
+        },
+        &types,
+        &HashMap::new(),
+    )?;
+    Ok(types_by_field
+        .get(&field.name)
+        .copied()
+        .unwrap_or(ValueType::Numeric))
 }
 
 /// Checks every qualified [`Expr::SourceColumn`] in `def` (issue #830): it
@@ -6287,7 +6303,7 @@ mod tests {
     }
 
     #[test]
-    fn the_single_table_validator_refuses_a_join_as_not_installable() {
+    fn the_single_table_validator_leaves_a_join_to_validate_join() {
         let def = parse_text(
             "TRANSFORM t FROM orders JOIN items ON orders.id = items.order_id \
              GROUP BY orders.region SELECT COUNT(*) AS n",
@@ -6295,7 +6311,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             validate(&def, &HashMap::new(), &HashMap::new()),
-            Err(ValidationError::JoinNotInstallable)
+            Err(ValidationError::JoinNeedsBothTables)
         );
     }
 }

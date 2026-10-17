@@ -76,6 +76,8 @@ pub(crate) enum KeyUse {
     JoinColumn { rel: String },
     /// Part of relationship `rel`'s to-side's row-identity key.
     EndpointKey { rel: String },
+    /// A column of a `JOIN` transform's `ON` clause (#1107).
+    JoinOn,
 }
 
 impl fmt::Display for KeyUse {
@@ -87,6 +89,7 @@ impl fmt::Display for KeyUse {
             KeyUse::EndpointKey { rel } => {
                 write!(f, "part of the key of relationship '{rel}''s to-side")
             }
+            KeyUse::JoinOn => write!(f, "a join column of its JOIN"),
         }
     }
 }
@@ -112,6 +115,25 @@ pub(crate) fn key_uses(
     table: &str,
     table_key: &[String],
 ) -> Vec<(String, KeyUse)> {
+    // #1107: each table of a JOIN is keyed by its own row-identity key, and
+    // matched by its join and `GROUP BY` columns. It reads no relationship.
+    if let Some(side) = super::join::side_of_table(def, table) {
+        let mut uses: Vec<(String, KeyUse)> = table_key
+            .iter()
+            .map(|c| (c.clone(), KeyUse::SourceKey))
+            .collect();
+        uses.extend(
+            super::join::group_columns(def, side)
+                .into_iter()
+                .map(|c| (c, KeyUse::GroupBy)),
+        );
+        uses.extend(
+            super::join::join_key(def, side)
+                .into_iter()
+                .map(|c| (c, KeyUse::JoinOn)),
+        );
+        return uses;
+    }
     let read: BTreeSet<String> = super::eval::relationship_references(def)
         .into_iter()
         .map(|(rel, _)| rel)
@@ -609,8 +631,9 @@ async fn upsert(
 
 /// Records the live type of every key column definition `id` uses
 /// ([`key_uses`]): on its qualified `source`, keyed by the source's
-/// row-identity key, and on the to-side of each relationship in `rels`,
-/// keyed by that table's. Define calls it with nothing recorded yet; a
+/// row-identity key, on a JOIN's qualified `joined` table, keyed by its own,
+/// and on the to-side of each relationship in `rels`, keyed by that table's.
+/// Define calls it with nothing recorded yet; a
 /// resume with `replace`, which deletes what was recorded first, so the
 /// types the capture pass compares against are the ones the rebuild builds
 /// from.
@@ -619,10 +642,12 @@ pub(crate) async fn record_definition(
     id: i64,
     def: &TransformDef,
     source: &str,
+    joined: Option<&str>,
     rels: &[RelRef<'_>],
     replace: bool,
 ) -> Result<(), tokio_postgres::Error> {
     let mut tables: Vec<&str> = vec![source];
+    tables.extend(joined);
     for rel in rels {
         if !tables.contains(&rel.to_table) {
             tables.push(rel.to_table);
@@ -669,6 +694,31 @@ mod tests {
     /// `varchar(n)`'s `atttypmod` is `n + 4`.
     fn varchar(n: i32) -> ColumnType {
         ty("varchar", n + 4)
+    }
+
+    #[test]
+    fn a_join_uses_each_sides_key_group_and_join_columns() {
+        let def = crate::defs::parse(
+            "TRANSFORM t FROM orders JOIN items ON orders.id = items.order_id \
+             GROUP BY orders.region SELECT COUNT(*) AS n",
+        )
+        .unwrap();
+        let key = ["id".to_string()];
+        assert_eq!(
+            key_uses(&def, "public.orders", &[], "public.orders", &key),
+            [
+                ("id".to_string(), KeyUse::SourceKey),
+                ("region".to_string(), KeyUse::GroupBy),
+                ("id".to_string(), KeyUse::JoinOn),
+            ]
+        );
+        assert_eq!(
+            key_uses(&def, "public.orders", &[], "public.items", &key),
+            [
+                ("id".to_string(), KeyUse::SourceKey),
+                ("order_id".to_string(), KeyUse::JoinOn),
+            ]
+        );
     }
 
     #[test]

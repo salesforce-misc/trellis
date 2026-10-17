@@ -248,7 +248,7 @@ pub(crate) async fn backfill_definition_fenced(
 ) -> Result<(), BackfillError> {
     match &def.key_space {
         KeySpace::Join(_) => {
-            unreachable!("a JOIN definition is refused by validation, so none reaches here")
+            unreachable!("nothing dispatches a JOIN definition's build yet (J4, #1109)")
         }
         KeySpace::OneToOne => {
             // Issue #121: the 1-1 direct build's PK-range chunking
@@ -1479,7 +1479,7 @@ pub(crate) async fn check_direct_build(
     }
     match &def.key_space {
         KeySpace::Join(_) => {
-            unreachable!("a JOIN definition is refused by validation, so none reaches here")
+            unreachable!("nothing dispatches a JOIN definition's build yet (J4, #1109)")
         }
         KeySpace::Aggregate { .. } => {
             substituted_field_exprs(def)?;

@@ -642,6 +642,45 @@ pub(crate) async fn pause_readers_of_retyped(
             }
         }
 
+        // #1107: a JOIN's `ON` pairs, which define holds to one type,
+        // modifier and collation each, after a retype of this table's side
+        // (the side whose join column moved from its recorded type, so the
+        // failure names the table that changed). The whole definition
+        // pauses, and a resume revalidates both sides.
+        let join_key: Vec<String> = crate::defs::join::side_of_table(&reader.def, table)
+            .map(|side| crate::defs::join::join_key(&reader.def, side))
+            .unwrap_or_default();
+        let join_key_moved = join_key.iter().any(|column| {
+            matches!(
+                (recorded.get(&(reader.id, column.clone())), live.get(column)),
+                (Some((old, _)), Some(now)) if old != &now.ty
+            )
+        });
+        if let Some(joined) = &reader.join
+            && join_key_moved
+        {
+            let sides = crate::defs::catalog::JoinSides::read(
+                &*client,
+                reader.source.clone(),
+                joined.clone(),
+            )
+            .await?;
+            if let Err(err @ ValidationError::JoinKeyTypeMismatch { .. }) =
+                crate::defs::validate::validate_join(
+                    &reader.def,
+                    &sides.from_columns,
+                    &sides.joined_columns,
+                )
+            {
+                refused = true;
+                for column in &join_key {
+                    if !columns.contains(column) {
+                        flag(column, err.to_string(), &mut columns);
+                    }
+                }
+            }
+        }
+
         // #767, #824: the columns Trellis created for it typed from columns
         // of this table, each with the type define would give it now.
         //

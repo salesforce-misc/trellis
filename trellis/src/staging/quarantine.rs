@@ -4071,17 +4071,33 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
 /// transaction's first lock (issue #744): it waits for the pages holding the
 /// fence, and holding the definition row meanwhile could close a cycle
 /// through one queued on a transaction that wants it.
+///
+/// A `JOIN` reads two tables, and a page of either may judge it (#1107), so
+/// its joined table's fence is bumped too, the two in table-name order.
 async fn lock_frozen(
     txn: &Transaction<'_>,
     column: &str,
     value: &(dyn tokio_postgres::types::ToSql + Sync),
     fenced_source: &str,
 ) -> Result<Option<(i64, TransformStatus)>, ApplyError> {
-    super::build::bump_version_fence(txn, fenced_source).await?;
+    let fenced_join: Option<String> = txn
+        .query_opt(
+            &format!("select join_table from transform_definitions where {column} = $1"),
+            &[value],
+        )
+        .await?
+        .and_then(|row| row.get(0));
+    let mut fenced: Vec<&str> = std::iter::once(fenced_source)
+        .chain(fenced_join.as_deref())
+        .collect();
+    fenced.sort_unstable();
+    for table in fenced {
+        super::build::bump_version_fence(txn, table).await?;
+    }
     let row = txn
         .query_opt(
             &format!(
-                "select id, source_table, status from transform_definitions \
+                "select id, source_table, status, join_table from transform_definitions \
                  where {column} = $1 for update"
             ),
             &[value],
@@ -4091,8 +4107,8 @@ async fn lock_frozen(
         return Ok(None);
     };
     let source_table: String = row.get(1);
-    if source_table != fenced_source {
-        // Dropped and defined again on another source between the two
+    if source_table != fenced_source || row.get::<_, Option<String>>(3) != fenced_join {
+        // Dropped and defined again on other sources between the two
         // reads: not the definition the caller resumed.
         return Ok(None);
     }
@@ -4208,7 +4224,16 @@ async fn resume_locked(
         }
         return Ok(ResumeStep::Retyping(labels));
     }
-    complete_resume(txn, id, source_table, status, &definition, &revalidated).await?;
+    complete_resume(
+        txn,
+        schema,
+        id,
+        source_table,
+        status,
+        &definition,
+        &revalidated,
+    )
+    .await?;
     Ok(ResumeStep::Resumed)
 }
 
@@ -4305,6 +4330,7 @@ async fn set_capture_failure(
 /// compares later changes against them, and deletes any resume request.
 async fn complete_resume(
     txn: &Transaction<'_>,
+    schema: &str,
     id: i64,
     source_table: &str,
     status: TransformStatus,
@@ -4334,15 +4360,24 @@ async fn complete_resume(
     // and the capture pass compares the key columns against what it builds
     // from.
     catalog::record_source_columns(txn, id, &revalidated.source_columns).await?;
+    let joined = revalidated.join.as_ref().map(|sides| sides.joined.as_str());
     crate::defs::key_types::record_definition(
         txn,
         id,
         &definition.def,
         source_table,
+        joined,
         &catalog::rel_refs(&revalidated.relationships),
         true,
     )
     .await?;
+    // #1107, #1096 decision 7: a JOIN's hidden tables are fully derived, so
+    // the resume drops and recreates them, at the shape define would give
+    // them now, rather than check them.
+    if let Some(sides) = &revalidated.join {
+        catalog::record_join_columns(txn, id, &sides.joined_value_types()).await?;
+        catalog::recreate_hidden_tables(txn, schema, id, &definition.def, sides).await?;
+    }
 
     // Discard the definition's leftover unclaimed backfill chunks (issue
     // #332). The pause only withheld them from `claim_chunks`; unfrozen, they
@@ -4387,7 +4422,9 @@ async fn complete_resume(
     // `"schema.table"` form (issue #72) — re-resolving it via
     // `resolve_source_schema_in_txn` (bare names only) or re-`qualify`-ing it
     // would reject it outright (`DottedIdentifierComponent`).
-    if !super::build::qualifies(txn, definition).await? {
+    // A JOIN gets none either: nothing builds one yet, so it waits
+    // (`super::build::start_ready_builds`).
+    if revalidated.join.is_none() && !super::build::qualifies(txn, definition).await? {
         crate::intake::markers::park_marker(txn, source_table).await?;
     }
     // Issue #768: the drain skips a to-side whose key can't be used while

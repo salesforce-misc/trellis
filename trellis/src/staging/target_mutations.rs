@@ -435,7 +435,7 @@ impl TargetMutations {
                 .query_one(
                     &format!(
                         "select exists (select 1 from transform_definitions \
-                         where source_table = $1 and {})",
+                         where (source_table = $1 or join_table = $1) and {})",
                         crate::defs::model::APPLYING_SQL
                     ),
                     &[&target],

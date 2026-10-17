@@ -473,7 +473,8 @@ pub async fn reconcile(
 struct Snapshot {
     catalog: CaptureCatalog,
     /// Every `waiting_to_backfill` definition: id, qualified source, and the
-    /// to-sides of the relationships it reads a column through.
+    /// to-sides of the relationships it reads a column through (a `JOIN`'s
+    /// joined table among them).
     waiting: Vec<(i64, String, BTreeSet<String>)>,
     /// Every definition's target: the tables the target-mutation seam feeds.
     targets: HashSet<String>,
@@ -489,7 +490,7 @@ async fn read_snapshot(client: &mut Client, schema: &str) -> Result<Snapshot, Ca
     let catalog = load_catalog(&txn, schema).await?;
     let rows = txn
         .query(
-            "select id, source_table, definition_text, grammar_version \
+            "select id, source_table, definition_text, grammar_version, join_table \
              from transform_definitions where status = $1 order by id",
             &[&TransformStatus::WaitingToBackfill.as_str()],
         )
@@ -506,7 +507,9 @@ async fn read_snapshot(client: &mut Client, schema: &str) -> Result<Snapshot, Ca
         let source: String = row.get(1);
         let def = crate::defs::grammar::load(row.get::<_, &str>(2), row.get(3))
             .map_err(|e| CaptureError::Catalog(e.into()))?;
-        let to_sides = to_sides_read(&catalog, &source, &def);
+        let mut to_sides = to_sides_read(&catalog, &source, &def);
+        // #1107: a JOIN's joined table is read like its source.
+        to_sides.extend(row.get::<_, Option<String>>(4));
         waiting.push((row.get(0), source, to_sides));
     }
     Ok(Snapshot {

@@ -8837,7 +8837,7 @@ pub(super) async fn compute_page(
             })?;
             match &def.def.key_space {
                 KeySpace::Join(_) => {
-                    unreachable!("a JOIN definition is refused by validation, so none reaches here")
+                    unreachable!("a JOIN definition never applies yet (J3, #1108)")
                 }
                 KeySpace::Aggregate { .. } => {
                     if let Some(existing) = aggregate_clears.get_mut(&def.def.target) {

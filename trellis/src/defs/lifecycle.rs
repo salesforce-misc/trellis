@@ -396,8 +396,8 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
         .await?;
 
     // Edges *into* the target node are the ones this definition owns: its
-    // `source` edge from its own source table, plus any `join` edges its
-    // relationship-enriched fields added. Edges *out of* the target node
+    // `source` edge from its own source table, plus a `JOIN`'s `join` edge
+    // from its joined table (#1107). Edges *out of* the target node
     // belong to whatever chains off it and are left alone — as is a
     // `relationship` edge, which a `RELATIONSHIP` declaration owns and
     // `drop_relationship` reaps.
@@ -439,6 +439,10 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
         quote_qualified(&super::ledger::deltas_table_name(&qualified)),
     ))
     .await?;
+    // #1107, #1096 decision 7: the hidden tables Trellis keeps in its catalog
+    // schema for a definition are named by its id, and go with it.
+    txn.batch_execute(&super::join::drop_hidden_tables_sql(pool.schema(), id))
+        .await?;
     // The target's ledger (#623 D2) and group deltas (#625 F1) went with it
     // just above. Its truncate floor (#623 D3) is keyed by the target's
     // name, so without this a later target of the same name would inherit
@@ -642,9 +646,9 @@ async fn dependency_blockers(
     //    because the damage is edge-scoped and that check is reader-scoped.
     //
     // 2. **Every transform reading `<name>.<column>`**, which is a reader of
-    //    this target's rows by a path that leaves no `source` edge behind
-    //    ([`EdgeKind::Join`] has no writer yet), so `source_edge_dependents`
-    //    above cannot see it. Named in addition to the relationship rather
+    //    this target's rows by a path that leaves no `source` or `join` edge
+    //    behind, so `source_edge_dependents` above cannot see it. Named in
+    //    addition to the relationship rather
     //    than instead of it, so the refusal shows the operator the whole
     //    subgraph still standing on this target rather than one layer of it
     //    at a time.
@@ -711,9 +715,9 @@ async fn dependency_blockers(
     Ok((blockers, column_detail))
 }
 
-/// The bare target names of every definition reached by a `source` edge out
-/// of `qualified_target`'s schema node — i.e. everything defined
-/// `FROM <target>`.
+/// The bare target names of every definition reached by a `source` or
+/// `join` edge out of `qualified_target`'s schema node — i.e. everything
+/// defined `FROM <target>` or `JOIN <target>` (#1107).
 ///
 /// The same graph walk [`super::catalog::dependents_of`] does, deliberately
 /// *without* its applying-status filter (issue #231): that filter is
@@ -732,14 +736,14 @@ async fn source_edge_dependents(
         .query(
             "select split_part(t.target_table, '.', 2) \
              from schema_nodes from_node \
-             join schema_edges se on se.from_node_id = from_node.id and se.kind = $2 \
+             join schema_edges se on se.from_node_id = from_node.id and se.kind = any($2) \
              join schema_nodes to_node on to_node.id = se.to_node_id \
              join transform_definitions t on t.target_table = to_node.table_name \
              where from_node.table_name = $1 and t.id <> $3 \
              order by t.id",
             &[
                 &qualified_target,
-                &EdgeKind::Source.as_str(),
+                &[EdgeKind::Source.as_str(), EdgeKind::Join.as_str()].as_slice(),
                 &definition_id,
             ],
         )

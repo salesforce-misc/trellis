@@ -331,7 +331,9 @@ async fn refusals(
             .iter()
             .filter(|r| unfrozen.contains(&r.id))
     };
-    let mut read: BTreeSet<String> = live().map(|r| r.source.clone()).collect();
+    let mut read: BTreeSet<String> = live()
+        .flat_map(|r| std::iter::once(r.source.clone()).chain(r.join.clone()))
+        .collect();
     for rel in &catalog.relationships {
         read.insert(rel.qualified_to_table());
     }
@@ -491,6 +493,7 @@ mod tests {
                     def: parse(text).unwrap_or_else(|e| panic!("{text}: {e:?}")),
                     capture_failed: false,
                     target: target.to_string(),
+                    join: None,
                 })
                 .collect(),
             relationships: vec![RelationshipDefinition {

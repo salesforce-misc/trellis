@@ -8,7 +8,9 @@
 //!
 //! 1. **`T`'s primary key.**
 //! 2. **Columns `T`'s own definitions read.** For every definition whose
-//!    source is `T`, in any status:
+//!    source is `T`, in any status (a `JOIN` reads both of its tables, and
+//!    from each its join key, its `GROUP BY` columns and every column its
+//!    fields read there, #1107):
 //!    - every source column its fields reference
 //!      ([`crate::defs::oracle::referenced_source_columns`]: a self-named
 //!      passthrough reads its own column, a reference to another calculated
@@ -84,6 +86,24 @@ pub struct CaptureReader {
     pub capture_failed: bool,
     /// The qualified `target_table` it writes (#765).
     pub target: String,
+    /// A `JOIN`'s qualified joined table, its second source (#1107).
+    pub join: Option<String>,
+}
+
+impl CaptureReader {
+    /// The columns of `table` this definition reads directly, as its source
+    /// or as either table of a `JOIN`; `None` if it reads `table` only
+    /// through a relationship, or not at all.
+    fn reads_directly(&self, table: &str) -> Option<BTreeSet<String>> {
+        if self.join.is_some() {
+            if self.source != table && self.join.as_deref() != Some(table) {
+                return None;
+            }
+            return crate::defs::join::side_of_table(&self.def, table)
+                .map(|side| crate::defs::join::side_columns(&self.def, side));
+        }
+        (self.source == table).then(|| own_columns(&self.def))
+    }
 }
 
 /// The columns [`read_columns`] finds a table's readers need, before the
@@ -104,8 +124,8 @@ pub fn read_columns(catalog: &CaptureCatalog, table: &str) -> ReadColumns {
     let mut read = ReadColumns::default();
 
     for reader in catalog.definitions.iter().filter(|r| !r.capture_failed) {
-        if reader.source == table {
-            read.columns.extend(own_columns(&reader.def));
+        if let Some(columns) = reader.reads_directly(table) {
+            read.columns.extend(columns);
         }
     }
 
@@ -154,9 +174,9 @@ pub fn readers_of(
         .filter(|reader| {
             let mut reads_table = false;
             let mut reads: BTreeSet<String> = BTreeSet::new();
-            if reader.source == table {
+            if let Some(columns) = reader.reads_directly(table) {
                 reads_table = true;
-                reads.extend(own_columns(&reader.def));
+                reads.extend(columns);
             }
             for rel in &catalog.relationships {
                 if rel.qualified_from_table() != reader.source || !reads_through(&reader.def, rel) {
@@ -240,12 +260,13 @@ pub async fn load_catalog(
     let (definitions, relationships) = crate::defs::catalog::capture_readers(client).await?;
     let definitions = definitions
         .into_iter()
-        .map(|(id, source, def, capture_failed, target)| CaptureReader {
-            id,
-            source,
-            def,
-            capture_failed,
-            target,
+        .map(|row| CaptureReader {
+            id: row.id,
+            source: row.source,
+            def: row.def,
+            capture_failed: row.capture_failed,
+            target: row.target,
+            join: row.join,
         })
         .collect();
     let bookkeeping = [
@@ -444,6 +465,7 @@ mod tests {
                     def: def(text),
                     capture_failed: false,
                     target: format!("public.target_{}", i + 1),
+                    join: None,
                 })
                 .collect(),
             relationships,
@@ -467,6 +489,47 @@ mod tests {
             read_columns(&catalog, "public.other"),
             ReadColumns::default()
         );
+    }
+
+    #[test]
+    fn a_join_reads_each_side_and_is_a_reader_of_both() {
+        let mut catalog = catalog(
+            &[(
+                "public.orders",
+                "TRANSFORM by_sku FROM orders LEFT JOIN items ON orders.id = items.order_id \
+                 GROUP BY items.sku SELECT items.sku AS sku, SUM(orders.total) AS total, \
+                 COUNT(items.qty) AS n",
+            )],
+            vec![],
+        );
+        catalog.definitions[0].join = Some("public.items".to_string());
+        assert_eq!(
+            read_columns(&catalog, "public.orders").columns,
+            set(&["id", "total"])
+        );
+        assert_eq!(
+            read_columns(&catalog, "public.items").columns,
+            set(&["order_id", "qty", "sku"])
+        );
+        // A table that merely shares a side's bare name isn't read.
+        assert_eq!(
+            read_columns(&catalog, "archive.items"),
+            ReadColumns::default()
+        );
+        // A missing column, or a missing key, on either side pauses it.
+        assert_eq!(
+            readers_of(&catalog, "public.items", &set(&["sku"]), false),
+            [1]
+        );
+        assert_eq!(
+            readers_of(&catalog, "public.orders", &set(&["total"]), false),
+            [1]
+        );
+        assert_eq!(
+            readers_of(&catalog, "public.items", &BTreeSet::new(), true),
+            [1]
+        );
+        assert!(readers_of(&catalog, "public.items", &set(&["price"]), false).is_empty());
     }
 
     #[test]

@@ -1227,6 +1227,12 @@ pub async fn qualifies(
     client: &impl GenericClient,
     definition: &Definition,
 ) -> Result<bool, catalog::CatalogError> {
+    if matches!(
+        definition.def.key_space,
+        crate::defs::ast::KeySpace::Join(_)
+    ) {
+        return Ok(false);
+    }
     if buildable_shape(definition).is_none() && !one_to_one::buildable(definition) {
         return Ok(false);
     }
@@ -1276,9 +1282,19 @@ pub async fn start_ready_builds(
         let Some(definition) = catalog::definition_by_id(pool, id).await? else {
             continue;
         };
-        if definition.status != TransformStatus::WaitingToBackfill
-            || !qualifies(&*client, &definition).await?
-        {
+        if definition.status != TransformStatus::WaitingToBackfill {
+            continue;
+        }
+        // #1107: nothing builds a JOIN yet (J4, #1109), and no other build
+        // may take one: it stays `waiting_to_backfill`, with no marker.
+        if matches!(
+            definition.def.key_space,
+            crate::defs::ast::KeySpace::Join(_)
+        ) {
+            taken.push(id);
+            continue;
+        }
+        if !qualifies(&*client, &definition).await? {
             continue;
         }
         if capture_gate_holds(&*client, &definition.source_table).await? {

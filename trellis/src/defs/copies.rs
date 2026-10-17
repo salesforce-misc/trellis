@@ -169,9 +169,10 @@ pub(crate) async fn typed_copies(
             inferred: None,
         };
     match &def.key_space {
-        KeySpace::Join(_) => {
-            unreachable!("a JOIN definition is refused by validation, so none reaches here")
-        }
+        // #1107: a JOIN's hidden tables are rebuilt from scratch on resume,
+        // so they need no re-typing. Its visible target's re-typing on either
+        // side is #1110's (J5); until then it records no copies.
+        KeySpace::Join(_) => return Ok(Vec::new()),
         KeySpace::OneToOne => {
             let source_columns: HashSet<String> = client
                 .query(
@@ -428,9 +429,8 @@ async fn inferred_copies(
         }
     };
     match &def.key_space {
-        KeySpace::Join(_) => {
-            unreachable!("a JOIN definition is refused by validation, so none reaches here")
-        }
+        // Never reached: `typed_copies` returns before it for a JOIN.
+        KeySpace::Join(_) => {}
         KeySpace::OneToOne => {
             for field in &def.fields {
                 // A bare passthrough is a copy of its column, as

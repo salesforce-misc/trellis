@@ -38,6 +38,7 @@ pub mod eval;
 pub mod grammar;
 pub mod hierarchy;
 pub mod invertibility;
+pub(crate) mod join;
 pub(crate) mod key_types;
 pub mod ledger;
 mod lexer;

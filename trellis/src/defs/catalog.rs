@@ -1149,7 +1149,22 @@ pub async fn install_definition(
     // commits or rolls back together with the catalog row.
     let target_ddl = match &def.key_space {
         KeySpace::Join(_) => {
-            unreachable!("a JOIN definition is refused by validation, so none reaches here")
+            // #1107: each side is held to the source rules (a primary key,
+            // another definition's target, or a partitioned root whose
+            // partial key holds its partition key). The target holds only
+            // the declared columns; its hidden tables are created with the
+            // definition row, named by its id.
+            let sides = JoinSides::resolve(pool, &def).await?;
+            reject_non_live_upstream(&**pool.get().await?, &sides.joined).await?;
+            for side in [&sides.from, &sides.joined] {
+                reject_unkeyed_source(&**pool.get().await?, side, &def).await?;
+            }
+            super::join::target_ddl(
+                &def,
+                &ddl::qualified_target_table(target_schema, &def),
+                &sides.from_columns,
+                &sides.joined_columns,
+            )?
         }
         KeySpace::OneToOne => {
             // Issue #121: the 1-1 target table's own primary key mirrors the
@@ -1367,14 +1382,14 @@ pub(crate) async fn definition_tables_read(
 ) -> Result<Vec<String>, CatalogError> {
     let row = txn
         .query_one(
-            "select source_table, definition_text, grammar_version \
+            "select source_table, definition_text, grammar_version, join_table \
              from transform_definitions where id = $1",
             &[&definition_id],
         )
         .await?;
     let qualified: String = row.get(0);
     let def = grammar::load(row.get::<_, &str>(1), row.get(2))?;
-    tables_read_by(txn, &def, &qualified).await
+    tables_read_by(txn, &def, &qualified, row.get(3)).await
 }
 
 /// Every `catching_up` definition that reads `table`, locked `for update`,
@@ -1415,8 +1430,8 @@ pub(crate) async fn catching_up_readers_unlocked(
 ) -> Result<Vec<(i64, Vec<String>)>, CatalogError> {
     let rows = txn
         .query(
-            "select id, source_table, definition_text, grammar_version from transform_definitions \
-             where status = $1 order by id",
+            "select id, source_table, definition_text, grammar_version, join_table \
+             from transform_definitions where status = $1 order by id",
             &[&TransformStatus::CatchingUp.as_str()],
         )
         .await?;
@@ -1424,7 +1439,7 @@ pub(crate) async fn catching_up_readers_unlocked(
     for row in rows {
         let qualified: String = row.get(1);
         let def = grammar::load(row.get::<_, &str>(2), row.get(3))?;
-        let tables = tables_read_by(txn, &def, &qualified).await?;
+        let tables = tables_read_by(txn, &def, &qualified, row.get(4)).await?;
         if tables.iter().any(|t| t == table) {
             readers.push((row.get::<_, i64>(0), tables));
         }
@@ -1446,8 +1461,8 @@ pub(crate) async fn applying_readers(
 ) -> Result<Vec<i64>, CatalogError> {
     let rows = client
         .query(
-            "select id, source_table, definition_text, grammar_version from transform_definitions \
-             where status = any($1) order by id",
+            "select id, source_table, definition_text, grammar_version, join_table \
+             from transform_definitions where status = any($1) order by id",
             &[&TransformStatus::applying()],
         )
         .await?;
@@ -1455,7 +1470,7 @@ pub(crate) async fn applying_readers(
     for row in rows {
         let qualified: String = row.get(1);
         let def = grammar::load(row.get::<_, &str>(2), row.get(3))?;
-        if tables_read_by(client, &def, &qualified)
+        if tables_read_by(client, &def, &qualified, row.get(4))
             .await?
             .iter()
             .any(|t| t == table)
@@ -1487,8 +1502,8 @@ pub(crate) async fn has_unfrozen_reader(
 ) -> Result<bool, CatalogError> {
     let rows = client
         .query(
-            "select source_table, definition_text, grammar_version from transform_definitions \
-             where status = any($1) order by id",
+            "select source_table, definition_text, grammar_version, join_table \
+             from transform_definitions where status = any($1) order by id",
             &[&TransformStatus::dispatchable()],
         )
         .await?;
@@ -1498,7 +1513,7 @@ pub(crate) async fn has_unfrozen_reader(
             return Ok(true);
         }
         let def = grammar::load(row.get::<_, &str>(1), row.get(2))?;
-        if tables_read_by(client, &def, &qualified)
+        if tables_read_by(client, &def, &qualified, row.get(3))
             .await?
             .iter()
             .any(|t| t == table)
@@ -1511,16 +1526,19 @@ pub(crate) async fn has_unfrozen_reader(
 
 /// Every table `def`'s direct build reads, fully qualified, sorted and
 /// deduplicated: its source (`qualified_source`, the persisted
-/// `transform_definitions.source_table`) and the to-side table of every
-/// relationship its fields reference, as recorded at declaration time
+/// `transform_definitions.source_table`), a `JOIN`'s joined table
+/// (`joined`, the persisted `join_table`, #1107) and the to-side table of
+/// every relationship its fields reference, as recorded at declaration time
 /// ([`RelationshipDefinition::qualified_to_table`], issue #372). A referenced
 /// relationship the source no longer declares contributes nothing.
 async fn tables_read_by(
     txn: &impl GenericClient,
     def: &TransformDef,
     qualified_source: &str,
+    joined: Option<String>,
 ) -> Result<Vec<String>, CatalogError> {
     let mut tables = vec![qualified_source.to_string()];
+    tables.extend(joined);
     if let Some((schema, table)) = qualified_source.split_once('.') {
         for rel in referenced_relationships(def) {
             if let Some(reldef) = relationship_by_name_in(txn, schema, table, &rel).await? {
@@ -1581,7 +1599,8 @@ pub(crate) async fn reported_statuses(
         .collect();
     let rows = client
         .query(
-            "select id, target_table, source_table, status, definition_text, grammar_version \
+            "select id, target_table, source_table, status, definition_text, grammar_version, \
+                    join_table \
              from transform_definitions order by id",
             &[],
         )
@@ -1598,6 +1617,7 @@ pub(crate) async fn reported_statuses(
         let mut reads = Vec::new();
         if status == TransformStatus::Live {
             reads.push(source.clone());
+            reads.extend(row.get::<_, Option<String>>(6));
             if let Some((schema, table)) = source.split_once('.') {
                 let def = grammar::load(row.get::<_, &str>(4), row.get(5))?;
                 for rel in referenced_relationships(&def) {
@@ -3285,9 +3305,37 @@ async fn create_definition_inner(
     // Issue #315: the authoritative check (`install_definition` repeats it
     // earlier, before any DDL, as a fail-fast).
     reject_non_live_upstream(&*txn, &qualified_source).await?;
-    // Issue #830: a three-part qualified column names the source's schema,
-    // which a bare `FROM` only now resolved.
-    validate_qualified_columns(&def, source_columns, schema_of(&qualified_source))?;
+    // #1107: a JOIN's joined table resolves the way its `FROM` does, and is
+    // held to the same checks. Its columns are read here, in this
+    // transaction, for the catalog row and the hidden tables.
+    let join_sides = match super::join::spec(&def) {
+        Some(join) => {
+            let joined = match &join.explicit_right_schema {
+                Some(schema) => {
+                    confirm_qualified_source(&*txn, schema, &join.right).await?;
+                    crate::intake::markers::qualify(schema, &join.right)?
+                }
+                None => match resolve_graph_identity_in_txn(&txn, &join.right).await {
+                    Err(err @ CatalogError::SourceTableNotFound(_)) => {
+                        reject_inaccessible_table(&*txn, None, &join.right).await?;
+                        return Err(err);
+                    }
+                    result => result?,
+                },
+            };
+            reject_non_live_upstream(&*txn, &joined).await?;
+            let sides = JoinSides::read(&*txn, qualified_source.clone(), joined).await?;
+            super::validate::validate_join(&def, &sides.from_columns, &sides.joined_columns)?;
+            Some(sides)
+        }
+        None => {
+            // Issue #830: a three-part qualified column names the source's
+            // schema, which a bare `FROM` only now resolved. A JOIN's
+            // qualified columns are `validate_join`'s.
+            validate_qualified_columns(&def, source_columns, schema_of(&qualified_source))?;
+            None
+        }
+    };
 
     // The source's version fence, bumped as this transaction's first lock
     // (issues #744 and #770). The bump waits for every page holding the
@@ -3296,17 +3344,31 @@ async fn create_definition_inner(
     // a bump made while holding a projection the widen below locked (a new
     // column is an `alter table`) would close a cycle with it. Everything
     // above only reads. A failure below rolls the bump back.
-    let version: i64 = txn
-        .query_one(
-            "insert into source_table_versions (source_table, version)
-             values ($1, 1)
-             on conflict (source_table)
-             do update set version = source_table_versions.version + 1
-             returning version",
-            &[&qualified_source],
-        )
-        .await?
-        .get(0);
+    //
+    // A JOIN bumps both tables' fences (#1107), in table-name order, the
+    // order every taker of two fences takes them in; it records the `FROM`
+    // table's version.
+    let fenced: Vec<&str> = match &join_sides {
+        Some(sides) => sides.tables_in_order().to_vec(),
+        None => vec![qualified_source.as_str()],
+    };
+    let mut version: i64 = 0;
+    for table in fenced {
+        let bumped: i64 = txn
+            .query_one(
+                "insert into source_table_versions (source_table, version)
+                 values ($1, 1)
+                 on conflict (source_table)
+                 do update set version = source_table_versions.version + 1
+                 returning version",
+                &[&table],
+            )
+            .await?
+            .get(0);
+        if table == qualified_source {
+            version = bumped;
+        }
+    }
     // The column-pause lock, shared (#922), right after the fence and before
     // the definition row or any DDL: the pause state a field reading a
     // paused column is born under (below) is read under it, so a pause
@@ -3393,7 +3455,10 @@ async fn create_definition_inner(
     // the table, the role and the fix. It reads only the catalog, so a
     // source that's another definition's not-yet-built target passes here
     // (`to_regclass` finds no table) and is reported by the checks below.
-    let read_tables = read_tables_of(&*txn, &qualified_source, &relationships).await?;
+    let mut read_tables = read_tables_of(&*txn, &qualified_source, &relationships).await?;
+    if let Some(sides) = &join_sides {
+        read_tables.push(side_read_table(&*txn, &sides.joined).await?);
+    }
     reject_row_security(&*txn, pool.schema(), &read_tables).await?;
 
     // Issue #129, epic #127: before this definition is persisted, widen the
@@ -3464,6 +3529,15 @@ async fn create_definition_inner(
     // resolutions above so `dependents_of` can walk the graph instead of
     // matching on `transform_definitions.source_table` string equality.
     persist_edge_in_txn(&txn, source_node.id, target_node.id, EdgeKind::Source).await?;
+
+    // #1107: a JOIN's joined table is a `Join` edge into the target, checked
+    // for a cycle on its own. Self-joins are refused, so it never collides
+    // with the `Source` edge.
+    if let Some(sides) = &join_sides {
+        let joined_node = resolve_node_in_txn(&txn, &sides.joined, NodeKind::Source).await?;
+        reject_if_table_cycle(&txn, &sides.joined, &qualified_target).await?;
+        persist_edge_in_txn(&txn, joined_node.id, target_node.id, EdgeKind::Join).await?;
+    }
 
     // Reviewer follow-up to issue #73 / ADR-0011: reject this definition if
     // `qualified_target` shares a bare table-name suffix with a *different*
@@ -3565,7 +3639,13 @@ async fn create_definition_inner(
     // a `numeric`-grouped aggregate (whose identity is its `GROUP BY` key),
     // used to be accepted here and then halt on its first live change.
     // The same checks every resume runs again ([`validate_live_schema`]).
-    validate_live_schema(&txn, pool.schema(), &def, &qualified_source, &relationships).await?;
+    match &join_sides {
+        Some(sides) => validate_live_join_schema(&txn, pool.schema(), &def, sides).await?,
+        None => {
+            validate_live_schema(&txn, pool.schema(), &def, &qualified_source, &relationships)
+                .await?;
+        }
+    }
 
     // Issue #440: registration creates the target here, in the transaction
     // that records the definition, so a failure anywhere after this rolls the
@@ -3634,12 +3714,21 @@ async fn create_definition_inner(
     // `Some`): the insert failure has already aborted this transaction, so
     // there's no further query available in it to look up what was won
     // against.
+    // #1107: a JOIN's joined table and its column types beside the source's.
+    let joined_types = join_sides.as_ref().map(JoinSides::joined_value_types);
+    let (join_keys, join_vals) = joined_types
+        .as_ref()
+        .map(encode_type_map)
+        .unwrap_or_default();
+    let join_table = join_sides.as_ref().map(|sides| sides.joined.as_str());
     let id: i64 = match txn
         .query_one(
             "insert into transform_definitions
                 (target_table, source_table, source_version, definition_text, source_columns, status,
-                 grammar_version)
-             values ($1, $2, $3, $4, jsonb_object($5::text[], $6::text[]), $7, $8)
+                 grammar_version, join_table, join_columns)
+             values ($1, $2, $3, $4, jsonb_object($5::text[], $6::text[]), $7, $8, $9,
+                     case when $9::text is null then null
+                          else jsonb_object($10::text[], $11::text[]) end)
              returning id",
             &[
                 &qualified_target,
@@ -3650,6 +3739,9 @@ async fn create_definition_inner(
                 &type_vals,
                 &status_text,
                 &CURRENT_GRAMMAR_VERSION,
+                &join_table,
+                &join_keys,
+                &join_vals,
             ],
         )
         .await
@@ -3672,10 +3764,23 @@ async fn create_definition_inner(
         id,
         &def,
         &qualified_source,
+        join_table,
         &rel_refs(&relationships),
         false,
     )
     .await?;
+    // #1107, #1096 decision 7: a JOIN's hidden tables, in the catalog schema,
+    // named by this definition's id, created empty with its row.
+    if let Some(sides) = &join_sides {
+        txn.batch_execute(&super::join::hidden_tables_ddl(
+            pool.schema(),
+            id,
+            &def,
+            &sides.from_columns,
+            &sides.joined_columns,
+        ))
+        .await?;
+    }
 
     // Issue #914: a field reading a column paused now is paused at birth, so
     // the build this registration starts leaves it out rather than writing
@@ -4457,9 +4562,22 @@ pub(crate) async fn relationships_from_table_in(
     rows.iter().map(relationship_from_row).collect()
 }
 
-/// Issue #622 (C2): every registered definition, as its id, qualified
-/// `source_table`, parsed text and whether a `schema_changed` marker paused
-/// it (C6, `capture_failures`) and its qualified `target_table` (#765),
+/// One registered definition, as [`capture_readers`] reads it.
+#[derive(Debug)]
+pub(crate) struct CaptureReaderRow {
+    pub id: i64,
+    /// The qualified `source_table`.
+    pub source: String,
+    pub def: TransformDef,
+    /// A `schema_changed` marker paused it (C6, `capture_failures`).
+    pub capture_failed: bool,
+    /// The qualified `target_table` (#765).
+    pub target: String,
+    /// A `JOIN`'s qualified joined table (#1107).
+    pub join: Option<String>,
+}
+
+/// Issue #622 (C2): every registered definition ([`CaptureReaderRow`]),
 /// plus every relationship. This is the whole input `crate::capture::columns`
 /// needs to decide which columns a table's capture trigger images.
 ///
@@ -4470,28 +4588,28 @@ pub(crate) async fn relationships_from_table_in(
 /// attaching paused it, it never resumes, and its fix is a drop and a fresh
 /// define, so it reads nothing and is left out. A definition newer than the
 /// window fails the read, since its columns can't be known.
-#[allow(clippy::type_complexity)]
 pub(crate) async fn capture_readers(
     client: &impl GenericClient,
-) -> Result<
-    (
-        Vec<(i64, String, TransformDef, bool, String)>,
-        Vec<RelationshipDefinition>,
-    ),
-    CatalogError,
-> {
+) -> Result<(Vec<CaptureReaderRow>, Vec<RelationshipDefinition>), CatalogError> {
     let definitions = client
         .query_typed(
             "select d.id, d.source_table, d.definition_text, \
                     exists (select 1 from capture_failures f where f.transform_id = d.id), \
-                    d.target_table, d.grammar_version \
+                    d.target_table, d.grammar_version, d.join_table \
              from transform_definitions d order by d.id",
             &[],
         )
         .await?
         .into_iter()
         .filter_map(|row| match grammar::load(row.get(2), row.get(5)) {
-            Ok(def) => Some(Ok((row.get(0), row.get(1), def, row.get(3), row.get(4)))),
+            Ok(def) => Some(Ok(CaptureReaderRow {
+                id: row.get(0),
+                source: row.get(1),
+                def,
+                capture_failed: row.get(3),
+                target: row.get(4),
+                join: row.get(6),
+            })),
             Err(ParseError::GrammarVersionTooOld { .. }) => None,
             Err(e) => Some(Err(e.into())),
         })
@@ -5087,17 +5205,21 @@ fn validate_with_source(
 /// ambiguous-name refusal (issue #830); a definition that fails some other
 /// way, or passes, never resolves it here.
 ///
-/// A `JOIN` definition is checked against both tables' live columns
-/// ([`validate_join_for_define`]) and then refused as
-/// [`ValidationError::JoinNotInstallable`]: nothing builds its target yet.
+/// A `JOIN` definition is checked against both tables' live columns instead
+/// ([`JoinSides::resolve`], [`super::validate::validate_join`]).
 async fn validate_for_define(
     pool: &Pool,
     def: &TransformDef,
     source_columns: &HashMap<String, ValueType>,
     relationships: &HashMap<String, ResolvedRelationship>,
 ) -> Result<(), CatalogError> {
-    if let KeySpace::Join(join) = &def.key_space {
-        validate_join_for_define(pool, def, join).await?;
+    if let KeySpace::Join(_) = &def.key_space {
+        let sides = JoinSides::resolve(pool, def).await?;
+        return Ok(super::validate::validate_join(
+            def,
+            &sides.from_columns,
+            &sides.joined_columns,
+        )?);
     }
     match validate(def, source_columns, relationships) {
         Err(err @ ValidationError::AmbiguousColumnReference(_)) => {
@@ -5114,26 +5236,71 @@ async fn validate_for_define(
     }
 }
 
-/// [`super::validate::validate_join`] for a `JOIN` definition being defined:
-/// resolves both tables the way a `FROM` resolves (an explicit schema is
-/// confirmed, a bare name walks `search_path`) and reads their columns.
-async fn validate_join_for_define(
-    pool: &Pool,
-    def: &TransformDef,
-    join: &super::ast::JoinSpec,
-) -> Result<(), CatalogError> {
-    let left = resolve_source_for_install(pool, def).await?;
-    let right = match &join.explicit_right_schema {
-        Some(schema) => {
-            confirm_qualified_source(&**pool.get().await?, schema, &join.right).await?;
-            crate::intake::markers::qualify(schema, &join.right)?
-        }
-        None => resolve_graph_identity(pool, &join.right).await?,
-    };
-    let client = pool.get().await?;
-    let left = join_columns_of(&**client, &left).await?;
-    let right = join_columns_of(&**client, &right).await?;
-    Ok(super::validate::validate_join(def, &left, &right)?)
+/// The two tables of a `JOIN` definition (#1106, #1107), resolved to their
+/// qualified identities, with their live columns as
+/// [`super::validate::validate_join`] reads them.
+#[derive(Debug, Clone)]
+pub(crate) struct JoinSides {
+    /// The `FROM` table.
+    pub from: String,
+    /// The joined table.
+    pub joined: String,
+    pub from_columns: HashMap<String, super::validate::JoinColumnInfo>,
+    pub joined_columns: HashMap<String, super::validate::JoinColumnInfo>,
+}
+
+impl JoinSides {
+    /// Resolves both tables of `def` the way a `FROM` resolves (an explicit
+    /// schema is confirmed, a bare name walks `search_path`) and reads their
+    /// columns.
+    async fn resolve(pool: &Pool, def: &TransformDef) -> Result<JoinSides, CatalogError> {
+        let Some(join) = super::join::spec(def) else {
+            panic!("JoinSides::resolve called on a definition that isn't a JOIN");
+        };
+        let from = resolve_source_for_install(pool, def).await?;
+        let joined = match &join.explicit_right_schema {
+            Some(schema) => {
+                confirm_qualified_source(&**pool.get().await?, schema, &join.right).await?;
+                crate::intake::markers::qualify(schema, &join.right)?
+            }
+            None => resolve_graph_identity(pool, &join.right).await?,
+        };
+        let client = pool.get().await?;
+        JoinSides::read(&**client, from, joined).await
+    }
+
+    /// Reads the live columns of the already-qualified `from` and `joined`.
+    pub(crate) async fn read(
+        client: &impl GenericClient,
+        from: String,
+        joined: String,
+    ) -> Result<JoinSides, CatalogError> {
+        let from_columns = join_columns_of(client, &from).await?;
+        let joined_columns = join_columns_of(client, &joined).await?;
+        Ok(JoinSides {
+            from,
+            joined,
+            from_columns,
+            joined_columns,
+        })
+    }
+
+    /// The two tables in table-name order: the order define and a resume
+    /// bump their version fences in.
+    fn tables_in_order(&self) -> [&str; 2] {
+        let mut tables = [self.from.as_str(), self.joined.as_str()];
+        tables.sort_unstable();
+        tables
+    }
+
+    /// The joined side's column types, as `transform_definitions.join_columns`
+    /// records them.
+    pub(crate) fn joined_value_types(&self) -> HashMap<String, ValueType> {
+        self.joined_columns
+            .iter()
+            .map(|(name, info)| (name.clone(), info.value_type))
+            .collect()
+    }
 }
 
 /// Every column of `qualified` as [`super::validate::validate_join`] reads
@@ -5593,6 +5760,48 @@ pub(crate) async fn validate_live_schema(
     Ok(source_key)
 }
 
+/// [`validate_live_schema`] for a `JOIN` definition (#1107): each side is
+/// held to the rules a definition's source is (a usable row-identity key of
+/// deterministic collation, a primary key or another definition's target),
+/// and neither may be under row-level security that applies to its readers
+/// or replicated into by a subscription. The join and `GROUP BY` columns'
+/// types and collations are [`super::validate::validate_join`]'s.
+pub(crate) async fn validate_live_join_schema(
+    txn: &tokio_postgres::Transaction<'_>,
+    schema: &str,
+    def: &TransformDef,
+    sides: &JoinSides,
+) -> Result<(), CatalogError> {
+    for side in [&sides.from, &sides.joined] {
+        let key = ddl::source_primary_key_in_txn(txn, side)
+            .await
+            .map_err(CatalogError::Ddl)?;
+        assert_deterministic_definition_keys(txn, def, side, &key).await?;
+        reject_unkeyed_source(txn, side, def).await?;
+    }
+    let read_tables = vec![
+        side_read_table(txn, &sides.from).await?,
+        side_read_table(txn, &sides.joined).await?,
+    ];
+    reject_row_security(txn, schema, &read_tables).await?;
+    reject_subscribed(txn, &[sides.from.as_str(), sides.joined.as_str()]).await
+}
+
+/// One side of a `JOIN` as [`read_tables_of`] lists a source: read by the
+/// ring's owner, or by the session's role alone when it is another
+/// definition's target.
+async fn side_read_table(
+    client: &impl GenericClient,
+    table: &str,
+) -> Result<(String, super::row_security::Readers), CatalogError> {
+    let readers = if is_definition_target(client, table).await? {
+        super::row_security::Readers::Session
+    } else {
+        super::row_security::Readers::Ring
+    };
+    Ok((table.to_string(), readers))
+}
+
 /// The tables definition reads, `qualified_source` and the to-side of each of
 /// `relationships`, each with the roles that read it as row-level security
 /// sees them (#745): the ring's owner for a captured table, the session's
@@ -5678,6 +5887,8 @@ pub(crate) struct Revalidated {
     pub source_columns: HashMap<String, ValueType>,
     /// The relationships the definition reads through.
     pub relationships: HashMap<String, ResolvedRelationship>,
+    /// A `JOIN` definition's two tables and their live columns (#1107).
+    pub join: Option<JoinSides>,
 }
 
 /// Re-runs define-time validation for `definition` against the live schema
@@ -5700,6 +5911,9 @@ pub(crate) async fn revalidate(
 ) -> Result<Revalidated, CatalogError> {
     let source = definition.source_table.as_str();
     reject_target_in_catalog_schema(txn, schema, &definition.target_table).await?;
+    if let Some(joined) = join_table_of(txn, definition.id).await? {
+        return revalidate_join(txn, schema, definition, joined).await;
+    }
     let source_columns = live_source_columns(txn, source).await?;
     if source_columns.is_empty() {
         return Err(CatalogError::SourceTableNotFound(source.to_string()));
@@ -5735,7 +5949,100 @@ pub(crate) async fn revalidate(
     Ok(Revalidated {
         source_columns,
         relationships,
+        join: None,
     })
+}
+
+/// [`revalidate`] for a `JOIN` definition (#1107): both tables, and every
+/// check define makes on each, so a failure on either side refuses the
+/// resume, naming that side's table.
+async fn revalidate_join(
+    txn: &tokio_postgres::Transaction<'_>,
+    schema: &str,
+    definition: &Definition,
+    joined: String,
+) -> Result<Revalidated, CatalogError> {
+    let sides = JoinSides::read(txn, definition.source_table.clone(), joined).await?;
+    for (table, columns) in [
+        (&sides.from, &sides.from_columns),
+        (&sides.joined, &sides.joined_columns),
+    ] {
+        if columns.is_empty() {
+            return Err(CatalogError::SourceTableNotFound(table.clone()));
+        }
+    }
+    super::validate::validate_join(&definition.def, &sides.from_columns, &sides.joined_columns)?;
+    validate_live_join_schema(txn, schema, &definition.def, &sides).await?;
+    reject_row_security(
+        txn,
+        schema,
+        &[(
+            definition.target_table.clone(),
+            super::row_security::Readers::Target,
+        )],
+    )
+    .await?;
+    Ok(Revalidated {
+        source_columns: sides
+            .from_columns
+            .iter()
+            .map(|(name, info)| (name.clone(), info.value_type))
+            .collect(),
+        relationships: HashMap::new(),
+        join: Some(sides),
+    })
+}
+
+/// Drops `JOIN` definition `id`'s hidden tables from `schema`, the catalog
+/// schema, and creates them again, empty, at the shape `sides` gives them
+/// (#1107): a resume's, since they're fully derived.
+pub(crate) async fn recreate_hidden_tables(
+    txn: &tokio_postgres::Transaction<'_>,
+    schema: &str,
+    id: i64,
+    def: &TransformDef,
+    sides: &JoinSides,
+) -> Result<(), CatalogError> {
+    txn.batch_execute(&format!(
+        "{};\n{}",
+        super::join::drop_hidden_tables_sql(schema, id),
+        super::join::hidden_tables_ddl(schema, id, def, &sides.from_columns, &sides.joined_columns)
+    ))
+    .await?;
+    Ok(())
+}
+
+/// The qualified joined table of definition `id`, a `JOIN` (#1107); `None`
+/// for any other definition, or an id with no row.
+pub(crate) async fn join_table_of(
+    client: &impl GenericClient,
+    id: i64,
+) -> Result<Option<String>, CatalogError> {
+    Ok(client
+        .query_opt(
+            "select join_table from transform_definitions where id = $1",
+            &[&id],
+        )
+        .await?
+        .and_then(|row| row.get(0)))
+}
+
+/// Persists `columns` as `JOIN` definition `id`'s joined-table column types
+/// (#1107), as a resume reads them, beside [`record_source_columns`].
+pub(crate) async fn record_join_columns(
+    client: &impl GenericClient,
+    id: i64,
+    columns: &HashMap<String, ValueType>,
+) -> Result<(), CatalogError> {
+    let (keys, vals) = encode_type_map(columns);
+    client
+        .execute(
+            "update transform_definitions \
+             set join_columns = jsonb_object($2::text[], $3::text[]) where id = $1",
+            &[&id, &keys, &vals],
+        )
+        .await?;
+    Ok(())
 }
 
 /// Refuses a whole-transform resume of a definition, 1-1 or aggregate, whose
@@ -5786,6 +6093,11 @@ pub(crate) async fn check_owned_tables(
     definition: &Definition,
     revalidated: &Revalidated,
 ) -> Result<(), CatalogError> {
+    // A JOIN keeps no ledger, and its hidden tables are fully derived: the
+    // resume drops and recreates them (#1107), so there's nothing to check.
+    if revalidated.join.is_some() {
+        return Ok(());
+    }
     check_ledger_table(txn, definition).await?;
     check_deltas_shape(txn, definition, revalidated).await
 }
@@ -6785,9 +7097,17 @@ async fn reject_unkeyed_source(
             });
         }
         let refusal = match &def.key_space {
-            KeySpace::Join(_) => {
-                unreachable!("a JOIN definition is refused by validation, so none reaches here")
-            }
+            // ADR-0019: a side's partials are a single-table aggregate keyed
+            // by its `GROUP BY` columns and join key, so ADR-0017's group-key
+            // rule applies to that key.
+            KeySpace::Join(_) => match super::join::side_of_table(def, qualified_source) {
+                Some(side) => tree.refusal(
+                    super::partition_tree::server_version_num(client).await?,
+                    super::partition_tree::KeyRole::GroupBy,
+                    &super::join::side_key_columns(def, side),
+                ),
+                None => None,
+            },
             KeySpace::OneToOne => Some(super::partition_tree::PartitionRefusal::OneToOneFrom {
                 table: qualified_source.to_string(),
             }),
@@ -8112,11 +8432,22 @@ struct PendingDefinition {
 /// longer necessary now both sides hold the exact same qualified string
 /// (both ultimately derived from the same `qualified_target`, in the same
 /// transaction, by `create_definition_inner`).
+#[cfg(any(test, feature = "internals"))]
 pub async fn dependents_of(
     pool: &Pool,
     node_table: &str,
     kind: EdgeKind,
 ) -> Result<Vec<Definition>, CatalogError> {
+    dependents_via(pool, node_table, &[kind]).await
+}
+
+/// [`dependents_of`] over an edge of any of `kinds`.
+async fn dependents_via(
+    pool: &Pool,
+    node_table: &str,
+    kinds: &[EdgeKind],
+) -> Result<Vec<Definition>, CatalogError> {
+    let kinds: Vec<&str> = kinds.iter().map(|kind| kind.as_str()).collect();
     let client = pool.get().await?;
     let rows = client
         .query(
@@ -8124,7 +8455,7 @@ pub async fn dependents_of(
                 "select t.id, t.source_version, t.definition_text, t.status, t.source_table, \
                         t.target_table, e.key, e.value, t.grammar_version
                  from schema_nodes from_node
-                 join schema_edges se on se.from_node_id = from_node.id and se.kind = $2
+                 join schema_edges se on se.from_node_id = from_node.id and se.kind = any($2)
                  join schema_nodes to_node on to_node.id = se.to_node_id
                  join transform_definitions t on t.target_table = to_node.table_name
                  left join lateral jsonb_each_text(t.source_columns) e on true
@@ -8132,7 +8463,7 @@ pub async fn dependents_of(
                  order by t.id",
                 super::model::applying_sql("t")
             ),
-            &[&node_table, &kind.as_str()],
+            &[&node_table, &kinds],
         )
         .await?;
 
@@ -8191,15 +8522,18 @@ pub async fn dependents_of(
     Ok(result)
 }
 
-/// The transform definitions currently subscribed to `source_table`. A thin
-/// wrapper over [`dependents_of`] filtered to [`EdgeKind::Source`], the only
-/// edge kind persisted today. `source_table` must already be fully-qualified
-/// (issue #74, ADR-0011) — see [`dependents_of`]'s doc comment.
+/// The transform definitions currently subscribed to `source_table`: a thin
+/// wrapper over [`dependents_of`] following the edges a definition reads a
+/// table by, its `FROM` ([`EdgeKind::Source`]) and a `JOIN`'s joined table
+/// ([`EdgeKind::Join`], #1107). A self-join is refused at define, so a
+/// definition is reached through at most one of them. `source_table` must
+/// already be fully-qualified (issue #74, ADR-0011) — see [`dependents_of`]'s
+/// doc comment.
 pub async fn transforms_for_source(
     pool: &Pool,
     source_table: &str,
 ) -> Result<Vec<Definition>, CatalogError> {
-    dependents_of(pool, source_table, EdgeKind::Source).await
+    dependents_via(pool, source_table, &[EdgeKind::Source, EdgeKind::Join]).await
 }
 
 /// Every table that needs CDC capture for at least one registered transform
@@ -8281,6 +8615,9 @@ fn reachable_tables_cte(anchor_filter: &str) -> String {
     format!(
         "with recursive reachable(table_name) as (
             select distinct source_table from transform_definitions where {anchor_filter}
+            union
+            select distinct join_table from transform_definitions
+            where join_table is not null and {anchor_filter}
             union
             select from_node.table_name
             from schema_edges se
@@ -8379,7 +8716,7 @@ async fn readers_exist(
                 "{} select exists (select 1 from reachable where table_name = $1)",
                 reachable_tables_cte(
                     "build is null and status = any($2) \
-                     and not (source_table = $1 \
+                     and not ((source_table = $1 or coalesce(join_table = $1, false)) \
                               and coalesce(build_marker_generation = $3::bigint, false))"
                 )
             ),
@@ -10210,7 +10547,7 @@ mod grammar_window_tests {
         seed(&**client, old, CURRENT_GRAMMAR_VERSION).await;
 
         let (definitions, _) = capture_readers(&**client).await.expect("capture readers");
-        let targets: Vec<&str> = definitions.iter().map(|d| d.4.as_str()).collect();
+        let targets: Vec<&str> = definitions.iter().map(|d| d.target.as_str()).collect();
         assert_eq!(targets, ["public.t", "public.other"]);
 
         client
