@@ -440,6 +440,54 @@ async fn a_leaf_detached_and_attached_again_under_the_same_bound_is_found() {
     it.trellis.shutdown().await.expect("shutdown");
 }
 
+/// A `pg_upgrade` keeps oids and bounds and resets every `xmin`, under a new
+/// `system_identifier`: the pass records them again and corrects nothing.
+#[tokio::test]
+async fn a_pg_upgrade_rebaselines_the_recorded_xmins_and_corrects_nothing() {
+    let cluster = TestCluster::start();
+    let mut it = instance(&cluster, TREE).await;
+    let live_id: String = it
+        .raw
+        .query_one(
+            "select system_identifier from partition_sources where table_name = $1",
+            &[&SOURCE],
+        )
+        .await
+        .expect("the identifier is recorded")
+        .get(0);
+    assert!(!live_id.is_empty());
+    // Fake the upgrade: another identifier and every recorded xmin reset.
+    it.raw
+        .execute(
+            "update partition_sources set system_identifier = '1', nodes = jsonb_set(nodes, \
+                 '{nodes}', (select jsonb_agg(case when n ? 'inherits_xmin' \
+                     and n->'inherits_xmin' <> 'null'::jsonb \
+                     then jsonb_set(n, '{inherits_xmin}', '\"1\"') else n end) \
+                 from jsonb_array_elements(nodes->'nodes') n)) \
+             where table_name = $1",
+            &[&SOURCE],
+        )
+        .await
+        .expect("fake a pg_upgrade");
+    let outcome = clean_pass(&mut it).await;
+    assert_eq!(outcome.partition_deep_checks, [SOURCE]);
+    assert!(queued(&it.raw).await.is_empty());
+    let row = it
+        .raw
+        .query_one(
+            "select system_identifier, nodes::text from partition_sources where table_name = $1",
+            &[&SOURCE],
+        )
+        .await
+        .expect("recorded");
+    assert_eq!(row.get::<_, String>(0), live_id);
+    assert!(!row.get::<_, String>(1).contains("\"inherits_xmin\": \"1\""));
+    // And the next pass has nothing to check.
+    let outcome = clean_pass(&mut it).await;
+    assert!(outcome.partition_deep_checks.is_empty());
+    it.trellis.shutdown().await.expect("shutdown");
+}
+
 /// A `DEFAULT` whose siblings changed is treated as new, and its text is
 /// fetched again.
 #[tokio::test]

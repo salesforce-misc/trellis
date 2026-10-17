@@ -369,6 +369,64 @@ pub fn plan(prev: Option<&Recorded>, live: &Recorded, renamed: bool) -> Plan {
     Plan { corrections, fetch }
 }
 
+/// What a changed `system_identifier` says happened to the cluster
+/// (ADR-0017 P8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClusterChange {
+    /// The identifier is the one recorded, or none was recorded.
+    Unchanged,
+    /// Every recorded oid is present with the bound it had: `pg_upgrade`,
+    /// which keeps oids and bounds and resets every `xmin`.
+    PgUpgrade,
+    /// Some recorded oid is gone or has another bound: the tree was dumped
+    /// and restored.
+    Restored,
+}
+
+/// Classifies the live cluster against the recorded one. `stored` is the
+/// `system_identifier` recorded with the tree, `None` when none was.
+///
+/// Pure: the decision over two snapshots, tested without a database.
+pub fn classify_cluster(
+    stored: Option<&str>,
+    live_id: &str,
+    prev: &Recorded,
+    live: &Recorded,
+) -> ClusterChange {
+    match stored {
+        Some(id) if id != live_id => {}
+        _ => return ClusterChange::Unchanged,
+    }
+    let live_by: HashMap<u32, &Node> = live.nodes.iter().map(|n| (n.oid, n)).collect();
+    let survives = prev
+        .nodes
+        .iter()
+        .all(|old| live_by.get(&old.oid).is_some_and(|n| n.bound == old.bound));
+    if survives {
+        ClusterChange::PgUpgrade
+    } else {
+        ClusterChange::Restored
+    }
+}
+
+/// The recorded tree with each node's `pg_inherits.xmin` taken from the live
+/// one: `pg_upgrade` resets them all, which without this reads as every leaf
+/// detached and attached again.
+fn rebaseline(prev: &Recorded, live: &Recorded) -> Recorded {
+    let xmins: HashMap<u32, &Option<String>> = live
+        .nodes
+        .iter()
+        .map(|n| (n.oid, &n.inherits_xmin))
+        .collect();
+    let mut out = prev.clone();
+    for node in &mut out.nodes {
+        if let Some(xmin) = xmins.get(&node.oid) {
+            node.inherits_xmin = (*xmin).clone();
+        }
+    }
+    out
+}
+
 /// Carries the recorded constraint text onto each live node the plan doesn't
 /// fetch.
 fn carry_constraints(prev: Option<&Recorded>, live: &mut Recorded, fetch: &[u32]) {
@@ -509,6 +567,8 @@ pub struct Fingerprints {
     pub servable: bool,
     pub lifecycle: String,
     pub compliance: String,
+    /// The cluster's `system_identifier` (`pg_control_system()`).
+    pub system_identifier: String,
 }
 
 /// Reads both fingerprints of `table` (an unquoted `schema.table`) in one
@@ -548,7 +608,8 @@ pub async fn read_fingerprints(
                                            h.xmin::text), \
                                        ',' order by h.inhrelid, h.inhparent) \
                                    from pg_catalog.pg_inherits h \
-                                   where h.inhrelid = r.oid or h.inhparent = r.oid), ''))) \
+                                   where h.inhrelid = r.oid or h.inhparent = r.oid), ''))), \
+                    (select system_identifier::text from pg_catalog.pg_control_system()) \
              from root r",
             &[&regclass_arg(table)],
         )
@@ -558,6 +619,7 @@ pub async fn read_fingerprints(
         servable: row.get(1),
         lifecycle: row.get(2),
         compliance: row.get(3),
+        system_identifier: row.get(4),
     }))
 }
 
@@ -567,6 +629,7 @@ struct Stored {
     root_oid: u32,
     lifecycle: String,
     compliance: String,
+    system_identifier: Option<String>,
     recorded: Recorded,
     stale: bool,
     noncompliant: bool,
@@ -578,7 +641,8 @@ async fn load_state(
 ) -> Result<Option<Stored>, CaptureError> {
     let Some(row) = client
         .query_opt(
-            "select root_oid, lifecycle_fp, compliance_fp, nodes::text, stale, noncompliant \
+            "select root_oid, lifecycle_fp, compliance_fp, nodes::text, stale, noncompliant, \
+                    system_identifier \
              from partition_sources where table_name = $1",
             &[&table],
         )
@@ -596,6 +660,7 @@ async fn load_state(
         root_oid: row.get::<_, i64>(0) as u32,
         lifecycle: row.get(1),
         compliance: row.get(2),
+        system_identifier: row.get(6),
         recorded,
         stale: row.get(4),
         noncompliant: row.get(5),
@@ -687,6 +752,7 @@ pub(crate) async fn begin(
         s.lifecycle == fingerprints.lifecycle
             && s.compliance == fingerprints.compliance
             && s.root_oid == fingerprints.root_oid
+            && s.system_identifier.as_deref() == Some(fingerprints.system_identifier.as_str())
             && !s.stale
             && !s.noncompliant
     }) && was_checked(instance, table);
@@ -731,7 +797,20 @@ pub(crate) async fn begin(
     let refused: HashSet<i64> = refusals.iter().map(|(id, _)| *id).collect();
     let remaining = unpaused.iter().filter(|id| !refused.contains(id)).count();
 
-    let prev = stored.as_ref().map(|s| &s.recorded);
+    // `pg_upgrade` resets every `xmin`; the plan then compares against the
+    // recorded tree with the live ones, and the tree is recorded again below.
+    let rebaselined = stored.as_ref().and_then(|s| {
+        (classify_cluster(
+            s.system_identifier.as_deref(),
+            &fingerprints.system_identifier,
+            &s.recorded,
+            &live,
+        ) == ClusterChange::PgUpgrade)
+            .then(|| rebaseline(&s.recorded, &live))
+    });
+    let prev = rebaselined
+        .as_ref()
+        .or(stored.as_ref().map(|s| &s.recorded));
     let renamed = stored.as_ref().is_some_and(|s| s.stale);
     let mut plan = plan(prev, &live, renamed);
     let mut live = live;
@@ -796,12 +875,14 @@ async fn write_state(
     let txn = client.transaction().await?;
     txn.execute(
         "insert into partition_sources as s \
-             (table_name, root_oid, lifecycle_fp, compliance_fp, nodes, stale, noncompliant) \
-         values ($1, $2, $3, $4, $5::text::jsonb, false, $6) \
+             (table_name, root_oid, lifecycle_fp, compliance_fp, nodes, stale, noncompliant, \
+              system_identifier) \
+         values ($1, $2, $3, $4, $5::text::jsonb, false, $6, $7) \
          on conflict (table_name) do update set \
              root_oid = excluded.root_oid, lifecycle_fp = excluded.lifecycle_fp, \
              compliance_fp = excluded.compliance_fp, nodes = excluded.nodes, \
-             stale = false, noncompliant = excluded.noncompliant",
+             stale = false, noncompliant = excluded.noncompliant, \
+             system_identifier = excluded.system_identifier",
         &[
             &table,
             &i64::from(record.fingerprints.root_oid),
@@ -809,6 +890,7 @@ async fn write_state(
             &record.fingerprints.compliance,
             &nodes,
             &noncompliant,
+            &record.fingerprints.system_identifier,
         ],
     )
     .await?;
@@ -1394,5 +1476,50 @@ mod tests {
         let live = live_from(&tree, &inherits, Vec::new());
         // The pending middle, and the leaf under it, are no longer in the tree.
         assert_eq!(live.nodes.iter().map(|n| n.oid).collect::<Vec<_>>(), [1]);
+    }
+
+    #[test]
+    fn a_changed_identifier_with_every_oid_and_bound_is_pg_upgrade() {
+        let mut live = base();
+        for n in &mut live.nodes {
+            n.inherits_xmin = n.inherits_xmin.as_ref().map(|_| "1".to_string());
+        }
+        assert_eq!(
+            classify_cluster(Some("a"), "b", &base(), &live),
+            ClusterChange::PgUpgrade
+        );
+        // Re-baselined, the plan sees nothing to correct.
+        assert_eq!(
+            plan(Some(&rebaseline(&base(), &live)), &live, false),
+            Plan::default()
+        );
+    }
+
+    #[test]
+    fn a_changed_identifier_with_a_missing_oid_or_another_bound_is_a_restore() {
+        let mut gone = base();
+        gone.nodes.pop();
+        assert_eq!(
+            classify_cluster(Some("a"), "b", &base(), &gone),
+            ClusterChange::Restored
+        );
+        let mut rebound = base();
+        rebound.nodes[1].bound = Some("FOR VALUES IN (9)".to_string());
+        assert_eq!(
+            classify_cluster(Some("a"), "b", &base(), &rebound),
+            ClusterChange::Restored
+        );
+    }
+
+    #[test]
+    fn the_same_or_an_unrecorded_identifier_is_no_cluster_change() {
+        assert_eq!(
+            classify_cluster(Some("a"), "a", &base(), &base()),
+            ClusterChange::Unchanged
+        );
+        assert_eq!(
+            classify_cluster(None, "a", &base(), &base()),
+            ClusterChange::Unchanged
+        );
     }
 }
