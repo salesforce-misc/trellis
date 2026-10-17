@@ -740,6 +740,25 @@ async fn install_tree(
     Ok(Progress::Done(()))
 }
 
+/// Installs `spec`'s capture on its whole tree in one transaction, whatever
+/// the tree's size: the shape [`install`] gives a tree of fewer than
+/// [`SINGLE_TRANSACTION_TABLES`] tables. For measuring what that shape would
+/// stall writers for on a larger tree (ADR-0017 P10).
+#[cfg(any(test, feature = "internals"))]
+pub async fn install_in_one_transaction(
+    client: &mut Client,
+    schema: &str,
+    spec: &CaptureSpec,
+    deadline: Option<Instant>,
+) -> Result<Progress<()>, CaptureError> {
+    let op = Op::Install {
+        spec,
+        scope: Scope::All,
+        last: true,
+    };
+    run(client, schema, op, deadline).await
+}
+
 fn function_names(table: &str) -> Result<Vec<String>, CaptureError> {
     CaptureEvent::ALL
         .into_iter()

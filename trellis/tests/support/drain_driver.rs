@@ -57,6 +57,10 @@ pub struct Driver {
     /// else, so it can never be part of a deadlock cycle.
     gate: Client,
     next_lock: AtomicI64,
+    /// How long each phase of [`Self::start`] took: the source DDL, the
+    /// definitions' install (define, build and backfill), the capture
+    /// install, and the settle to quiescence. For measurements.
+    pub phases: Vec<(&'static str, Duration)>,
     pub db: TestDatabase,
     pub cluster: TestCluster,
 }
@@ -128,7 +132,10 @@ impl Driver {
                 trellis::config::Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
             db.pool = trellis::Pool::new(&config).expect("a fresh pool");
         }
+        let mut phases = Vec::new();
+        let started = Instant::now();
         ctl.batch_execute(source_ddl).await.expect("source DDL");
+        phases.push(("source_ddl", started.elapsed()));
         for relationship in relationships {
             create_relationship(&db.pool, relationship)
                 .await
@@ -138,11 +145,14 @@ impl Driver {
             .iter()
             .map(|(name, ty)| (name.to_string(), *ty))
             .collect();
+        let started = Instant::now();
         for definition in definitions {
             install_definition(&db.pool, definition, &columns, "public")
                 .await
                 .expect("install definition");
         }
+        phases.push(("define", started.elapsed()));
+        let started = Instant::now();
         let catalog = load_catalog(&ctl, DEFAULT_SCHEMA)
             .await
             .expect("load the catalog");
@@ -158,6 +168,8 @@ impl Driver {
                 Progress::Waiting(wait) => panic!("an unbounded install waited: {wait}"),
             }
         }
+        phases.push(("capture_install", started.elapsed()));
+        let started = Instant::now();
         markers::settle_registrations(&db.pool).await;
         let mut driver = Driver {
             cluster,
@@ -165,8 +177,11 @@ impl Driver {
             ctl,
             gate,
             next_lock: AtomicI64::new(623_000),
+            phases,
         };
         driver.settle().await;
+        let settled = started.elapsed();
+        driver.phases.push(("settle", settled));
         let not_live: i64 = driver
             .ctl
             .query_one(

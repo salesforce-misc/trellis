@@ -316,6 +316,36 @@ async fn trigger_oids(client: &Client) -> Vec<(String, String)> {
         .collect()
 }
 
+/// A tree of exactly [`SINGLE_TRANSACTION_TABLES`] tables is the largest
+/// that installs in one transaction: with a leaf held by a writer, the
+/// install lands nothing, not even the root.
+#[tokio::test]
+async fn a_tree_of_one_hundred_tables_held_at_a_leaf_installs_nothing() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect(db.dsn()).await;
+    client
+        .batch_execute(&flat(SINGLE_TRANSACTION_TABLES - 1))
+        .await
+        .expect("99 leaves");
+    let writer = connect(db.dsn()).await;
+    writer
+        .batch_execute("begin; lock table public.r_50 in row exclusive mode")
+        .await
+        .expect("hold the leaf");
+    let progress = install::install(
+        &mut client,
+        DEFAULT_SCHEMA,
+        &spec("public.r"),
+        Some(Instant::now() + Duration::from_millis(300)),
+    )
+    .await
+    .expect("install");
+    assert!(matches!(progress, Progress::Waiting(_)), "{progress:?}");
+    assert_eq!(trigger_map(&client).await, Vec::new());
+    writer.batch_execute("rollback").await.expect("release");
+}
+
 #[tokio::test]
 async fn a_tree_of_one_hundred_and_one_leaves_installs_root_first_then_node_by_node() {
     let cluster = TestCluster::start();
