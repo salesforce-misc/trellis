@@ -74,6 +74,7 @@ pub(super) fn render_definition(def: &TransformDef) -> String {
         .collect();
     debug_assert_eq!(def.predicate, Predicate::True);
     let key_space_clause = match &def.key_space {
+        KeySpace::Join(_) => unreachable!("the generator never produces a JOIN definition"),
         KeySpace::OneToOne => String::new(),
         KeySpace::Aggregate { group_by } => format!(
             " GROUP BY {}",

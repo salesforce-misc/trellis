@@ -369,8 +369,8 @@ pub enum AlterClause {
 ///
 /// [`KeySpace::Aggregate`] (issue #11's groundwork) is a `GROUP BY <cols>`
 /// definition, whose target's primary key is the grouping columns rather
-/// than an inherited source column. Cross-join key-spaces are still rejected
-/// at parse time with a specific error rather than represented here.
+/// than an inherited source column. [`KeySpace::Join`] is the same over the
+/// join of two tables.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeySpace {
     OneToOne,
@@ -382,6 +382,55 @@ pub enum KeySpace {
     Aggregate {
         group_by: Vec<GroupByKey>,
     },
+    /// `FROM a [LEFT|INNER] JOIN b ON <equi-join> GROUP BY <keys>` (ADR-0019,
+    /// epic #1091): an aggregate over the join of two tables.
+    Join(JoinSpec),
+}
+
+/// Which rows of the `FROM` table a [`JoinSpec`] keeps when no `JOIN` table
+/// row matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKind {
+    /// `INNER JOIN` (or bare `JOIN`): a row with no match contributes nothing.
+    Inner,
+    /// `LEFT [OUTER] JOIN`: a row with no match still contributes, with the
+    /// joined side's columns `NULL`.
+    Left,
+}
+
+/// A column reference as written in a `JOIN` definition: always qualified
+/// with its table, optionally with the schema too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QualifiedColumn {
+    pub schema: Option<String>,
+    pub table: String,
+    pub column: String,
+}
+
+/// One `<table>.<column> = <table>.<column>` term of a `JOIN ... ON` clause,
+/// in the order written. Which side each column belongs to is the
+/// validator's to resolve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinOn {
+    pub lhs: QualifiedColumn,
+    pub rhs: QualifiedColumn,
+}
+
+/// The `JOIN` half of a [`KeySpace::Join`] definition. The `FROM` table is
+/// [`TransformDef::source`]; this is the other table, how it joins, and the
+/// `GROUP BY` keys, each of which may come from either table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinSpec {
+    pub kind: JoinKind,
+    /// The joined table's bare name.
+    pub right: String,
+    /// `Some(schema)` when the joined table was written `<schema>.<table>`;
+    /// the twin of [`TransformDef::explicit_source_schema`].
+    pub explicit_right_schema: Option<String>,
+    /// The `ON` terms, joined by `AND`. At least one.
+    pub on: Vec<JoinOn>,
+    /// The `GROUP BY` keys in the order written; at least one.
+    pub group_by: Vec<QualifiedColumn>,
 }
 
 /// One `GROUP BY` key (issue #137): either a plain source column, or a
@@ -677,16 +726,40 @@ pub(crate) fn render_definition_text(def: &TransformDef) -> String {
     out.push_str(" FROM ");
     render_table_ref(&mut out, &def.source, def.explicit_source_schema.as_deref());
 
-    if let KeySpace::Aggregate { group_by } = &def.key_space {
-        out.push_str(" GROUP BY ");
-        let keys: Vec<String> = group_by
-            .iter()
-            .map(|key| match key {
-                GroupByKey::Column(column) => column.clone(),
-                GroupByKey::RelationshipPath { rel, column } => format!("{rel}.{column}"),
-            })
-            .collect();
-        out.push_str(&keys.join(", "));
+    match &def.key_space {
+        KeySpace::OneToOne => {}
+        KeySpace::Aggregate { group_by } => {
+            out.push_str(" GROUP BY ");
+            let keys: Vec<String> = group_by
+                .iter()
+                .map(|key| match key {
+                    GroupByKey::Column(column) => column.clone(),
+                    GroupByKey::RelationshipPath { rel, column } => format!("{rel}.{column}"),
+                })
+                .collect();
+            out.push_str(&keys.join(", "));
+        }
+        KeySpace::Join(join) => {
+            let qualified = |column: &QualifiedColumn| match &column.schema {
+                Some(schema) => format!("{schema}.{}.{}", column.table, column.column),
+                None => format!("{}.{}", column.table, column.column),
+            };
+            out.push_str(match join.kind {
+                JoinKind::Inner => " INNER JOIN ",
+                JoinKind::Left => " LEFT JOIN ",
+            });
+            render_table_ref(&mut out, &join.right, join.explicit_right_schema.as_deref());
+            out.push_str(" ON ");
+            let terms: Vec<String> = join
+                .on
+                .iter()
+                .map(|term| format!("{} = {}", qualified(&term.lhs), qualified(&term.rhs)))
+                .collect();
+            out.push_str(&terms.join(" AND "));
+            out.push_str(" GROUP BY ");
+            let keys: Vec<String> = join.group_by.iter().map(qualified).collect();
+            out.push_str(&keys.join(", "));
+        }
     }
 
     out.push_str(" SELECT ");

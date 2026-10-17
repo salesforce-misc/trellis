@@ -1022,6 +1022,7 @@ fn op_outcome_name(outcome: &OpOutcome) -> &'static str {
 
 fn key_space_name(key_space: &KeySpace) -> &'static str {
     match key_space {
+        KeySpace::Join(_) => unreachable!("the generator never produces a JOIN definition"),
         KeySpace::OneToOne => "OneToOne",
         KeySpace::Aggregate { .. } => "Aggregate",
     }

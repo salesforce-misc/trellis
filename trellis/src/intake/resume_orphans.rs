@@ -555,6 +555,9 @@ impl Sweep {
                 None => None,
             };
             let mut matching = match &def.key_space {
+                KeySpace::Join(_) => {
+                    unreachable!("a JOIN definition is refused by validation, so none reaches here")
+                }
                 KeySpace::OneToOne => one_to_one_match(&key_cols),
                 KeySpace::Aggregate { group_by } => {
                     aggregate_match(txn, &source_table, &target, group_by, &key_cols).await?

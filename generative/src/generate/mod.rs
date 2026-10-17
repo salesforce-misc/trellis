@@ -2944,6 +2944,7 @@ pub fn target_key_for(def: &TransformDef, table: &Table, op: &Op) -> Option<Stri
         return None;
     }
     match &def.key_space {
+        KeySpace::Join(_) => unreachable!("the generator never produces a JOIN definition"),
         KeySpace::OneToOne => op_pk_value(op, table),
         KeySpace::Aggregate { group_by } => match op {
             Op::Insert { row, .. } => {

@@ -76,6 +76,8 @@ pub use pg_type::PgType;
 // reach it here.
 #[cfg(any(test, feature = "internals"))]
 pub use validate::validate;
+#[cfg(any(test, feature = "internals"))]
+pub use validate::{JoinColumnInfo, validate_join};
 
 // Reached from `crate::dev` (ADR-0012's sanctioned exception) by `generative`
 // and `benchmark`.
@@ -99,7 +101,8 @@ pub use oracle::{
 // feature (ADR-0012; see `Cargo.toml`). Not part of `dev`.
 #[cfg(any(test, feature = "internals"))]
 pub use ast::{
-    Expr, FieldDef, GroupByKey, KeySpace, Operator, Predicate, RelationshipDef, TransformDef,
+    Expr, FieldDef, GroupByKey, JoinKind, JoinOn, JoinSpec, KeySpace, Operator, Predicate,
+    QualifiedColumn, RelationshipDef, TransformDef,
 };
 #[cfg(any(test, feature = "internals"))]
 pub use backfill::BackfillError;
@@ -323,15 +326,171 @@ mod tests {
         }
     }
 
-    #[test]
-    fn rejects_join() {
-        let err =
-            parse("TRANSFORM t FROM s JOIN other ON s.id = other.id SELECT a AS x").unwrap_err();
-        match err {
-            ParseError::UnsupportedKeySpace { construct, .. } => {
-                assert_eq!(construct, "JOIN");
-            }
+    const JOIN_HEAD: &str = "TRANSFORM t FROM orders JOIN items ON orders.id = items.order_id";
+
+    fn join_spec(text: &str) -> ast::JoinSpec {
+        match parse(text).unwrap().key_space {
+            KeySpace::Join(spec) => spec,
+            other => panic!("expected a join, got {other:?}"),
+        }
+    }
+
+    fn refusal(text: &str) -> (String, String) {
+        match parse(text).unwrap_err() {
+            ParseError::UnsupportedKeySpace { construct, detail } => (construct, detail),
             other => panic!("expected UnsupportedKeySpace, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_an_inner_join_aggregate() {
+        let def = parse(&format!(
+            "{JOIN_HEAD} GROUP BY orders.region, items.sku \
+             SELECT orders.region AS region, items.sku AS sku, \
+             COUNT(*) AS n, SUM(items.qty) AS qty, AVG(orders.total) AS avg_total"
+        ))
+        .unwrap();
+        let KeySpace::Join(spec) = &def.key_space else {
+            panic!("expected a join");
+        };
+        assert_eq!(spec.kind, ast::JoinKind::Inner);
+        assert_eq!(spec.right, "items");
+        assert_eq!(spec.on.len(), 1);
+        assert_eq!(spec.on[0].lhs.table, "orders");
+        assert_eq!(spec.on[0].rhs.column, "order_id");
+        assert_eq!(spec.group_by.len(), 2);
+        assert_eq!(spec.group_by[1].table, "items");
+        assert_eq!(
+            def.fields[3].expr,
+            Expr::FunctionCall {
+                name: "SUM".to_string(),
+                args: vec![Expr::SourceColumn {
+                    schema: None,
+                    table: "items".to_string(),
+                    column: "qty".to_string(),
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn join_kind_spellings() {
+        let kind = |head: &str| {
+            join_spec(&format!(
+                "TRANSFORM t FROM a {head} b ON a.k = b.k GROUP BY a.g SELECT COUNT(*) AS n"
+            ))
+            .kind
+        };
+        assert_eq!(kind("JOIN"), ast::JoinKind::Inner);
+        assert_eq!(kind("INNER JOIN"), ast::JoinKind::Inner);
+        assert_eq!(kind("left join"), ast::JoinKind::Left);
+        assert_eq!(kind("LEFT OUTER JOIN"), ast::JoinKind::Left);
+    }
+
+    #[test]
+    fn join_on_admits_and_of_equalities_in_either_order() {
+        let spec = join_spec(
+            "TRANSFORM t FROM a JOIN s.b ON b.k2 = a.k2 AND a.k = b.k \
+             GROUP BY a.g SELECT COUNT(*) AS n",
+        );
+        assert_eq!(spec.explicit_right_schema.as_deref(), Some("s"));
+        assert_eq!(spec.on.len(), 2);
+        assert_eq!(spec.on[0].lhs.table, "b");
+    }
+
+    #[test]
+    fn rejects_join_kinds_other_than_inner_and_left() {
+        for kind in ["RIGHT", "FULL", "CROSS", "NATURAL"] {
+            let (construct, _) = refusal(&format!(
+                "TRANSFORM t FROM a {kind} JOIN b ON a.k = b.k GROUP BY a.g SELECT COUNT(*) AS n"
+            ));
+            assert_eq!(construct, format!("{kind} JOIN"));
+        }
+    }
+
+    #[test]
+    fn rejects_join_on_shapes_beyond_a_conjunction_of_equalities() {
+        for on in [
+            "a.k > b.k",
+            "a.k = b.k OR a.j = b.j",
+            "a.k = 5",
+            "a.k = b.k AND b.x > 3",
+            "k = b.k",
+            "a.k + 1 = b.k",
+        ] {
+            let (construct, _) = refusal(&format!(
+                "TRANSFORM t FROM a JOIN b ON {on} GROUP BY a.g SELECT COUNT(*) AS n"
+            ));
+            assert_eq!(construct, "JOIN ON", "{on}");
+        }
+    }
+
+    #[test]
+    fn rejects_a_self_join_and_a_join_without_group_by() {
+        let (construct, detail) =
+            refusal("TRANSFORM t FROM a JOIN a ON a.k = a.j GROUP BY a.g SELECT COUNT(*) AS n");
+        assert_eq!(construct, "JOIN");
+        assert!(detail.contains("itself"), "{detail}");
+        let (construct, detail) =
+            refusal("TRANSFORM t FROM s JOIN other ON s.id = other.id SELECT a AS x");
+        assert_eq!(construct, "JOIN");
+        assert!(detail.contains("GROUP BY"), "{detail}");
+    }
+
+    #[test]
+    fn rejects_comma_joins_using_and_tables_sharing_a_bare_name() {
+        let (construct, _) = refusal("TRANSFORM t FROM a, b GROUP BY a.g SELECT COUNT(*) AS n");
+        assert_eq!(construct, "comma join");
+        let (construct, _) =
+            refusal("TRANSFORM t FROM a JOIN b USING (k) GROUP BY a.g SELECT COUNT(*) AS n");
+        assert_eq!(construct, "JOIN USING");
+        let (construct, detail) = refusal(
+            "TRANSFORM t FROM shop.orders JOIN archive.orders ON orders.id = orders.id \
+             GROUP BY orders.g SELECT COUNT(*) AS n",
+        );
+        assert_eq!(construct, "JOIN");
+        assert!(detail.contains("bare name"), "{detail}");
+        let (_, detail) = refusal(
+            "TRANSFORM t FROM a RIGHT JOIN b ON a.k = b.k GROUP BY a.g SELECT COUNT(*) AS n",
+        );
+        assert!(detail.contains("swap the two tables"), "{detail}");
+    }
+
+    #[test]
+    fn rejects_a_second_join() {
+        let (construct, detail) = refusal(
+            "TRANSFORM t FROM a JOIN b ON a.k = b.k LEFT JOIN c ON b.j = c.j \
+             GROUP BY a.g SELECT COUNT(*) AS n",
+        );
+        assert_eq!(construct, "JOIN");
+        assert!(detail.contains("exactly two tables"), "{detail}");
+    }
+
+    #[test]
+    fn join_group_by_keys_must_be_qualified() {
+        let (construct, _) =
+            refusal("TRANSFORM t FROM a JOIN b ON a.k = b.k GROUP BY g SELECT COUNT(*) AS n");
+        assert_eq!(construct, "JOIN GROUP BY");
+    }
+
+    #[test]
+    fn deferred_aggregate_families_parse_inside_a_join() {
+        for call in [
+            "MIN(a.x)",
+            "BOOL_AND(a.x)",
+            "bit_or(b.x)",
+            "ARRAY_AGG(a.x)",
+            "STRING_AGG(a.x, ',')",
+            "JSONB_AGG(a.x)",
+        ] {
+            let def = parse(&format!(
+                "TRANSFORM t FROM a JOIN b ON a.k = b.k GROUP BY a.g SELECT {call} AS v"
+            ))
+            .unwrap();
+            assert!(
+                matches!(def.fields[0].expr, Expr::FunctionCall { .. }),
+                "{call}"
+            );
         }
     }
 
@@ -1040,6 +1199,11 @@ mod tests {
             "TRANSFORM t FROM orders GROUP BY region SELECT region AS region, \
              (region + 1) AS price, SUM(orders.price) AS total",
             "TRANSFORM t FROM app.orders SELECT app.orders.price AS p",
+            "TRANSFORM t FROM orders JOIN items ON orders.id = items.order_id \
+             GROUP BY orders.region SELECT orders.region AS region, SUM(items.qty) AS q",
+            "TRANSFORM t FROM app.orders LEFT OUTER JOIN app.items ON items.order_id = orders.id \
+             AND orders.k = items.k GROUP BY items.sku, app.orders.region \
+             SELECT MIN(items.qty) AS m",
         ] {
             let def = parse(text).unwrap();
             assert_eq!(

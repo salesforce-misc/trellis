@@ -516,6 +516,9 @@ fn refusal_for(
 ) -> Option<PartitionRefusal> {
     if reader.source == table {
         let refusal = match &reader.def.key_space {
+            KeySpace::Join(_) => {
+                unreachable!("a JOIN definition is refused by validation, so none reaches here")
+            }
             KeySpace::OneToOne => Some(PartitionRefusal::OneToOneFrom {
                 table: table.to_string(),
             }),

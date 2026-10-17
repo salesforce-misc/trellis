@@ -18,7 +18,8 @@ use std::fmt;
 use regex::Regex;
 
 use super::ast::{
-    Expr, FieldDef, GroupByKey, KeySpace, Predicate, TransformDef, ValueType, render_field_expr,
+    Expr, FieldDef, GroupByKey, KeySpace, Predicate, QualifiedColumn, TransformDef, ValueType,
+    render_field_expr,
 };
 use super::model::{RelationshipCardinality, RelationshipSide};
 use super::pg_type::PgType;
@@ -127,6 +128,68 @@ pub enum ValidationError {
     /// source would feed our own writes back into capture (see
     /// `docs/data-flow.md`).
     TargetEqualsSource { table: String },
+    /// A `JOIN` definition passed validation, but nothing builds it yet, so
+    /// define refuses it rather than install a transform that never fills.
+    JoinNotInstallable,
+    /// The joined table is the `FROM` table. A self-join needs aliases, which
+    /// the grammar doesn't have.
+    JoinSelf { table: String },
+    /// A `JOIN` definition's column reference names a table that is neither
+    /// the `FROM` table nor the joined one.
+    JoinUnknownTable { reference: String },
+    /// A column in a `JOIN` definition's field list isn't qualified with its
+    /// table; with two tables in play every column must say which it is.
+    JoinUnqualifiedColumn { field: String, column: String },
+    /// A qualified column in a `JOIN` definition names no column of its table.
+    JoinUnresolvedColumn { reference: String },
+    /// An `ON` term compares two columns of the same table, or a column with
+    /// itself. An equi-join term has one column from each side.
+    JoinOnSameSide { term: String },
+    /// An aggregate's argument reads columns of both tables
+    /// (`SUM(a.x + b.y)`). Each argument becomes a partial on one side.
+    JoinMixedSideArgument { field: String, argument: String },
+    /// An `ON` term pairs the same two columns as an earlier one (in either
+    /// order).
+    JoinOnRepeatedPair { term: String },
+    /// The two columns of an `ON` term differ in type, type modifier or
+    /// collation. Trellis never casts a join key.
+    JoinKeyTypeMismatch {
+        lhs: String,
+        lhs_type: String,
+        rhs: String,
+        rhs_type: String,
+    },
+    /// A join column has a type that isn't text-stable (the relationship
+    /// join-key rule, [`super::catalog::TEXT_STABLE_JOIN_KEY_TYPES`]).
+    JoinUnsupportedKeyType { reference: String, pg_type: String },
+    /// A join column has a nondeterministic collation, whose `=` Trellis
+    /// can't reproduce (the relationship join-key rule).
+    JoinNondeterministicCollation {
+        reference: String,
+        collation: String,
+    },
+    /// A `JOIN` definition's field is neither a `GROUP BY` key passthrough
+    /// nor an admitted aggregate over a single column.
+    JoinFieldShape { field: String, detail: String },
+    /// An aggregate in a deferred family (`MIN`/`MAX`, `bool_*`/`bit_*`,
+    /// float or `interval` `SUM`/`AVG`, `array_agg`/`string_agg`/`jsonb_agg`).
+    /// Only the aggregates the group basis keeps exact from signed deltas are
+    /// admitted (#1096 decision 1).
+    DeferredAggregate {
+        function: String,
+        family: &'static str,
+        issue: u32,
+    },
+    /// `SUM`/`AVG` over an unconstrained `numeric` column, whose display
+    /// scale a running sum can't track (#1096 decision 2).
+    UnconstrainedNumericAggregate { function: String, column: String },
+    /// `SUM`/`AVG` over a column whose type is not an integer or a
+    /// `numeric(p,s)`.
+    UnsupportedAggregateArgument {
+        function: String,
+        column: String,
+        pg_type: String,
+    },
     /// The target's name ends with `suffix`, one of
     /// [`super::ledger::RESERVED_TARGET_SUFFIXES`], which name the tables
     /// Trellis keeps beside a target (its ledger, #623 D2, and its group
@@ -803,6 +866,102 @@ impl fmt::Display for ValidationError {
                 "target table '{table}' is the same as the source table; calculated \
                  columns must live on a separate neighbor table"
             ),
+            ValidationError::JoinNotInstallable => write!(
+                f,
+                "JOIN definitions parse and validate, but are not installable yet: nothing \
+                 builds their target (epic #1091)"
+            ),
+            ValidationError::JoinSelf { table } => write!(
+                f,
+                "'{table}' is joined to itself; a self-join needs table aliases, which this \
+                 grammar doesn't have"
+            ),
+            ValidationError::JoinUnknownTable { reference } => write!(
+                f,
+                "'{reference}' names a table that is neither the FROM table nor the joined \
+                 table"
+            ),
+            ValidationError::JoinUnqualifiedColumn { field, column } => write!(
+                f,
+                "field '{field}' reads column '{column}' without a table; in a JOIN every \
+                 column is written `<table>.<column>`"
+            ),
+            ValidationError::JoinUnresolvedColumn { reference } => {
+                write!(f, "'{reference}' is not a column of its table")
+            }
+            ValidationError::JoinOnSameSide { term } => write!(
+                f,
+                "ON term '{term}' must compare a column of the FROM table with a column of \
+                 the joined table"
+            ),
+            ValidationError::JoinMixedSideArgument { field, argument } => write!(
+                f,
+                "field '{field}': {argument} reads columns of both tables; an aggregate's \
+                 argument reads one table's columns only, so aggregate each table \
+                 separately and compose the results"
+            ),
+            ValidationError::JoinOnRepeatedPair { term } => write!(
+                f,
+                "ON term '{term}' repeats a column pair an earlier term already joins"
+            ),
+            ValidationError::JoinKeyTypeMismatch {
+                lhs,
+                lhs_type,
+                rhs,
+                rhs_type,
+            } => write!(
+                f,
+                "ON joins {lhs} ({lhs_type}) to {rhs} ({rhs_type}), which don't match: join \
+                 columns must have the same type, type modifier and collation, because \
+                 Trellis never casts a join key. Alter one column to match the other"
+            ),
+            ValidationError::JoinUnsupportedKeyType { reference, pg_type } => write!(
+                f,
+                "ON joins on {reference} ({pg_type}), a type whose equality isn't text-stable, \
+                 so the engine (which compares join keys as text) would silently diverge from \
+                 Postgres's typed join; supported join key types: {}",
+                super::catalog::supported_join_key_types()
+            ),
+            ValidationError::JoinNondeterministicCollation {
+                reference,
+                collation,
+            } => write!(
+                f,
+                "ON joins on {reference}, whose collation \"{collation}\" is nondeterministic: \
+                 Postgres treats distinct strings as equal under it (e.g. by case), but \
+                 Trellis matches join keys by their exact text, so join on a column with a \
+                 deterministic collation"
+            ),
+            ValidationError::JoinFieldShape { field, detail } => {
+                write!(f, "field '{field}' of a JOIN definition: {detail}")
+            }
+            ValidationError::DeferredAggregate {
+                function,
+                family,
+                issue,
+            } => write!(
+                f,
+                "{function} is not supported yet: {family} is deferred past 0.1.0 (tracked in \
+                 #{issue}); the supported aggregates are COUNT(*), COUNT(col), and SUM/AVG over \
+                 smallint, integer, bigint or numeric(p,s)"
+            ),
+            ValidationError::UnconstrainedNumericAggregate { function, column } => write!(
+                f,
+                "{function}({column}) is over a numeric with no declared scale, which is not \
+                 supported yet (tracked in #1120): Postgres shows a sum with as many decimal \
+                 places as the most precise value in the group, which a running sum can't \
+                 track. Sum a numeric(p,s) column directly (ALTER TABLE ... ALTER COLUMN ... \
+                 TYPE numeric(p,s)); an expression over numeric has no declared scale"
+            ),
+            ValidationError::UnsupportedAggregateArgument {
+                function,
+                column,
+                pg_type,
+            } => write!(
+                f,
+                "{function}({column}) is over {pg_type}; SUM and AVG are supported over \
+                 smallint, integer, bigint and numeric(p,s) only"
+            ),
             ValidationError::ReservedTargetSuffix { target, suffix } => write!(
                 f,
                 "target name '{target}' ends with '{suffix}', which Trellis reserves for \
@@ -1190,41 +1349,13 @@ pub fn validate(
     source_columns: &HashMap<String, ValueType>,
     relationships: &HashMap<String, ResolvedRelationship>,
 ) -> Result<(), ValidationError> {
-    if def.target == def.source {
-        return Err(ValidationError::TargetEqualsSource {
-            table: def.target.clone(),
-        });
-    }
+    validate_target_names(def)?;
 
-    // #623 D2, #625 F1: a target has a ledger named `<target>__ledger` beside
-    // it, and a ledger-routed aggregate also `<target>__deltas`.
-    if let Some(suffix) = super::ledger::RESERVED_TARGET_SUFFIXES
-        .into_iter()
-        .find(|suffix| def.target.ends_with(suffix))
-    {
-        return Err(ValidationError::ReservedTargetSuffix {
-            target: def.target.clone(),
-            suffix,
-        });
-    }
-    if def.target.len() > super::ledger::MAX_TARGET_NAME_LEN {
-        return Err(ValidationError::TargetNameTooLong {
-            target: def.target.clone(),
-            max: super::ledger::MAX_TARGET_NAME_LEN,
-        });
-    }
-
-    // Issue #566: checked ahead of every per-key-space rule, so a reserved
-    // name is reported as such rather than as whatever shape error its
-    // expression also happens to have.
-    if let Some(field) = def
-        .fields
-        .iter()
-        .find(|f| f.name.starts_with(RESERVED_COLUMN_PREFIX))
-    {
-        return Err(ValidationError::ReservedFieldName {
-            field: field.name.clone(),
-        });
+    // A JOIN is validated by [`validate_join`], which needs both tables'
+    // columns; this entry point has only the source's. Nothing builds a JOIN
+    // target yet, so define stops here rather than install one.
+    if let KeySpace::Join(_) = def.key_space {
+        return Err(ValidationError::JoinNotInstallable);
     }
 
     validate_qualified_columns(def, source_columns, def.explicit_source_schema.as_deref())?;
@@ -1234,6 +1365,7 @@ pub fn validate(
     // `Aggregate` has real runtime checks (below), since — unlike the other
     // arm here — the AST can encode an invalid one.
     match &def.key_space {
+        KeySpace::Join(_) => return Err(ValidationError::JoinNotInstallable),
         KeySpace::OneToOne => {
             for field in &def.fields {
                 // A calculated field aliased to a real source column's name
@@ -1442,6 +1574,595 @@ pub fn validate(
     infer_field_types(def, source_columns, relationships)?;
 
     Ok(())
+}
+
+/// The target-name and field-name rules every key-space shares.
+fn validate_target_names(def: &TransformDef) -> Result<(), ValidationError> {
+    if def.target == def.source {
+        return Err(ValidationError::TargetEqualsSource {
+            table: def.target.clone(),
+        });
+    }
+
+    // #623 D2, #625 F1: a target has a ledger named `<target>__ledger` beside
+    // it, and a ledger-routed aggregate also `<target>__deltas`.
+    if let Some(suffix) = super::ledger::RESERVED_TARGET_SUFFIXES
+        .into_iter()
+        .find(|suffix| def.target.ends_with(suffix))
+    {
+        return Err(ValidationError::ReservedTargetSuffix {
+            target: def.target.clone(),
+            suffix,
+        });
+    }
+    if def.target.len() > super::ledger::MAX_TARGET_NAME_LEN {
+        return Err(ValidationError::TargetNameTooLong {
+            target: def.target.clone(),
+            max: super::ledger::MAX_TARGET_NAME_LEN,
+        });
+    }
+
+    // Issue #566: checked ahead of every per-key-space rule, so a reserved
+    // name is reported as such rather than as whatever shape error its
+    // expression also happens to have.
+    if let Some(field) = def
+        .fields
+        .iter()
+        .find(|f| f.name.starts_with(RESERVED_COLUMN_PREFIX))
+    {
+        return Err(ValidationError::ReservedFieldName {
+            field: field.name.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// One column of a `JOIN` definition's two tables, as the catalog reads it:
+/// everything [`validate_join`] needs without touching the database. The
+/// fields mirror what the relationship join-key checks compare
+/// (`catalog::JoinColumn`), plus the [`ValueType`] and whether the type is a
+/// live enum.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinColumnInfo {
+    pub value_type: ValueType,
+    /// `format_type(atttypid, atttypmod)`, e.g. `numeric(10,2)`.
+    pub pg_type: String,
+    pub type_oid: u32,
+    /// `atttypmod`: `-1` for no modifier.
+    pub typmod: i32,
+    pub collation_oid: u32,
+    pub collation: Option<String>,
+    pub collation_deterministic: bool,
+    /// The type is a live enum, which is a text-stable join key too.
+    pub is_enum: bool,
+}
+
+/// Which table of a `JOIN` a column belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JoinSide {
+    Left,
+    Right,
+}
+
+/// The aggregate families a `JOIN` (and, once #1105 lands, a plain
+/// aggregate) refuses, by name: `(functions, family, follow-up issue)`.
+const DEFERRED_AGGREGATES: &[(&[&str], &str, u32)] = &[
+    (&["MIN", "MAX"], "MIN/MAX", 1117),
+    (
+        &["BOOL_AND", "BOOL_OR", "BIT_AND", "BIT_OR"],
+        "bool_and/bool_or/bit_and/bit_or",
+        1118,
+    ),
+    (
+        &["ARRAY_AGG", "STRING_AGG", "JSONB_AGG"],
+        "array_agg/string_agg/jsonb_agg",
+        1040,
+    ),
+];
+
+/// Whether `name` is an aggregate the grammar parses only so the validator
+/// can refuse it by family: a deferred name from [`DEFERRED_AGGREGATES`].
+pub(crate) fn is_deferred_aggregate_name(name: &str) -> bool {
+    DEFERRED_AGGREGATES
+        .iter()
+        .any(|(names, _, _)| names.contains(&name.to_ascii_uppercase().as_str()))
+}
+
+/// The one column argument of an aggregate call, as
+/// [`check_aggregate_admitted`] needs it.
+pub(crate) struct AggregateArg<'a> {
+    pub column: &'a str,
+    pub value_type: ValueType,
+    /// `format_type` rendering, for the message.
+    pub pg_type: &'a str,
+    /// `atttypmod`; `-1` means no modifier, i.e. an unconstrained `numeric`.
+    pub typmod: i32,
+}
+
+/// The per-family refusal of #1096 decision 1: whether `function` (an
+/// uppercased aggregate name) over `arg` is in the admitted set, `COUNT(*)`,
+/// `COUNT(col)`, and `SUM`/`AVG` over `smallint`/`integer`/`bigint`/
+/// `numeric(p,s)`, or else a named refusal. `arg` is `None` for `COUNT(*)`
+/// and for a call whose argument isn't a resolved column.
+///
+/// Shared so every key-space refuses the same way. A `JOIN` uses it today;
+/// the plain aggregate adopts it when #1105 removes the ledger.
+pub(crate) fn check_aggregate_admitted(
+    function: &str,
+    arg: Option<&AggregateArg<'_>>,
+) -> Result<(), ValidationError> {
+    let function = function.to_ascii_uppercase();
+    if let Some((_, family, issue)) = DEFERRED_AGGREGATES
+        .iter()
+        .find(|(names, _, _)| names.contains(&function.as_str()))
+    {
+        return Err(ValidationError::DeferredAggregate {
+            function,
+            family,
+            issue: *issue,
+        });
+    }
+    match function.as_str() {
+        "COUNT" => Ok(()),
+        "SUM" | "AVG" => {
+            let Some(arg) = arg else { return Ok(()) };
+            match arg.value_type {
+                ValueType::Integer(_) => Ok(()),
+                ValueType::Numeric if arg.typmod != -1 => Ok(()),
+                ValueType::Numeric => Err(ValidationError::UnconstrainedNumericAggregate {
+                    function,
+                    column: arg.column.to_string(),
+                }),
+                ValueType::Float(_) | ValueType::Other(PgType::Interval) => {
+                    Err(ValidationError::DeferredAggregate {
+                        function,
+                        family: "float and interval SUM/AVG",
+                        issue: 1119,
+                    })
+                }
+                _ => Err(ValidationError::UnsupportedAggregateArgument {
+                    function,
+                    column: arg.column.to_string(),
+                    pg_type: arg.pg_type.to_string(),
+                }),
+            }
+        }
+        _ => Err(ValidationError::JoinFieldShape {
+            field: function.clone(),
+            detail: format!("{function} is not an aggregate this grammar knows"),
+        }),
+    }
+}
+
+fn written(column: &QualifiedColumn) -> String {
+    match &column.schema {
+        Some(schema) => format!("{schema}.{}.{}", column.table, column.column),
+        None => format!("{}.{}", column.table, column.column),
+    }
+}
+
+/// Validates a [`KeySpace::Join`] definition against the live columns of its
+/// two tables (`left` is the `FROM` table, `right` the joined one).
+///
+/// The join is admitted when: the tables differ; every column is qualified
+/// and exists; each `ON` term is an equality between one column of each
+/// table, of one type, modifier and collation (the relationship join-key
+/// rules); every `GROUP BY` key, from either table, is an admitted key type;
+/// and each field is a key passthrough or composes admitted aggregates
+/// (`COUNT(*)`, and `COUNT`/`SUM`/`AVG` of a column or an expression over
+/// one table's columns, per [`check_aggregate_admitted`]) with literals,
+/// operators and scalar functions (#1096 decision 1). An argument reading
+/// both tables is refused as [`ValidationError::JoinMixedSideArgument`].
+pub fn validate_join(
+    def: &TransformDef,
+    left: &HashMap<String, JoinColumnInfo>,
+    right: &HashMap<String, JoinColumnInfo>,
+) -> Result<(), ValidationError> {
+    let KeySpace::Join(join) = &def.key_space else {
+        return Ok(());
+    };
+    validate_target_names(def)?;
+    if join.right == def.source {
+        return Err(ValidationError::JoinSelf {
+            table: def.source.clone(),
+        });
+    }
+    // The joined table is a source too: writing the target into it would
+    // feed Trellis's own writes back into capture.
+    if def.target == join.right {
+        return Err(ValidationError::TargetEqualsSource {
+            table: def.target.clone(),
+        });
+    }
+
+    let resolve =
+        |column: &QualifiedColumn| -> Result<(JoinSide, &JoinColumnInfo), ValidationError> {
+            let side = if column.table == def.source {
+                JoinSide::Left
+            } else if column.table == join.right {
+                JoinSide::Right
+            } else {
+                return Err(ValidationError::JoinUnknownTable {
+                    reference: written(column),
+                });
+            };
+            let schema_written = match side {
+                JoinSide::Left => def.explicit_source_schema.as_deref(),
+                JoinSide::Right => join.explicit_right_schema.as_deref(),
+            };
+            if let (Some(used), Some(declared)) = (column.schema.as_deref(), schema_written)
+                && used != declared
+            {
+                return Err(ValidationError::JoinUnknownTable {
+                    reference: written(column),
+                });
+            }
+            let columns = match side {
+                JoinSide::Left => left,
+                JoinSide::Right => right,
+            };
+            columns
+                .get(&column.column)
+                .map(|info| (side, info))
+                .ok_or_else(|| ValidationError::JoinUnresolvedColumn {
+                    reference: written(column),
+                })
+        };
+
+    let check_key_type = |column: &QualifiedColumn, info: &JoinColumnInfo| {
+        if !super::catalog::is_text_stable_join_key_type(&info.pg_type) && !info.is_enum {
+            return Err(ValidationError::JoinUnsupportedKeyType {
+                reference: written(column),
+                pg_type: info.pg_type.clone(),
+            });
+        }
+        if !info.collation_deterministic {
+            return Err(ValidationError::JoinNondeterministicCollation {
+                reference: written(column),
+                collation: info.collation.clone().unwrap_or_default(),
+            });
+        }
+        Ok(())
+    };
+
+    let mut pairs: HashSet<(&str, &str)> = HashSet::with_capacity(join.on.len());
+    for term in &join.on {
+        let (lhs_side, lhs) = resolve(&term.lhs)?;
+        let (rhs_side, rhs) = resolve(&term.rhs)?;
+        if lhs_side == rhs_side {
+            return Err(ValidationError::JoinOnSameSide {
+                term: format!("{} = {}", written(&term.lhs), written(&term.rhs)),
+            });
+        }
+        let pair = match lhs_side {
+            JoinSide::Left => (term.lhs.column.as_str(), term.rhs.column.as_str()),
+            JoinSide::Right => (term.rhs.column.as_str(), term.lhs.column.as_str()),
+        };
+        if !pairs.insert(pair) {
+            return Err(ValidationError::JoinOnRepeatedPair {
+                term: format!("{} = {}", written(&term.lhs), written(&term.rhs)),
+            });
+        }
+        check_key_type(&term.lhs, lhs)?;
+        check_key_type(&term.rhs, rhs)?;
+        if (lhs.type_oid, lhs.typmod, lhs.collation_oid)
+            != (rhs.type_oid, rhs.typmod, rhs.collation_oid)
+        {
+            let with_collation = lhs.collation_oid != rhs.collation_oid;
+            let describe = |info: &JoinColumnInfo| match (&info.collation, with_collation) {
+                (Some(collation), true) => format!("{} COLLATE \"{collation}\"", info.pg_type),
+                _ => info.pg_type.clone(),
+            };
+            return Err(ValidationError::JoinKeyTypeMismatch {
+                lhs: written(&term.lhs),
+                lhs_type: describe(lhs),
+                rhs: written(&term.rhs),
+                rhs_type: describe(rhs),
+            });
+        }
+    }
+
+    let mut key_columns: HashMap<&str, &QualifiedColumn> =
+        HashMap::with_capacity(join.group_by.len());
+    for key in &join.group_by {
+        let (_, info) = resolve(key)?;
+        reject_unsupported_group_by_key_type(&key.column, info.value_type)?;
+        if !info.collation_deterministic {
+            return Err(ValidationError::NondeterministicKeyCollation(Box::new(
+                NondeterministicKeyCollation {
+                    key: KeyColumnRole::GroupBy,
+                    table: key.table.clone(),
+                    column: key.column.clone(),
+                    collation: info.collation.clone().unwrap_or_default(),
+                },
+            )));
+        }
+        if let Some(earlier) = key_columns.insert(key.column.as_str(), key) {
+            return Err(ValidationError::GroupByKeysShareTargetColumn {
+                first: written(earlier),
+                second: written(key),
+                column: key.column.clone(),
+            });
+        }
+        if key.column.starts_with(RESERVED_COLUMN_PREFIX) {
+            return Err(ValidationError::ReservedGroupByColumnName {
+                key: written(key),
+                column: key.column.clone(),
+            });
+        }
+    }
+
+    let mut field_names = HashSet::with_capacity(def.fields.len());
+    for field in &def.fields {
+        if !field_names.insert(field.name.as_str()) {
+            return Err(ValidationError::DuplicateFieldName {
+                name: field.name.clone(),
+            });
+        }
+        let shape = |detail: &str| ValidationError::JoinFieldShape {
+            field: field.name.clone(),
+            detail: detail.to_string(),
+        };
+        // A GROUP BY key selected on its own, under its column name.
+        if let Expr::SourceColumn {
+            schema,
+            table,
+            column,
+        } = &field.expr
+        {
+            let reference = QualifiedColumn {
+                schema: schema.clone(),
+                table: table.clone(),
+                column: column.clone(),
+            };
+            let (side, _) = resolve(&reference)?;
+            let is_key = join
+                .group_by
+                .iter()
+                .any(|key| key.column == *column && resolve(key).ok().map(|k| k.0) == Some(side));
+            if !is_key {
+                return Err(shape(
+                    "a column outside an aggregate must be one of the GROUP BY keys; \
+                     aggregate anything else",
+                ));
+            }
+            if field.name != *column {
+                return Err(shape(
+                    "a GROUP BY key is selected under its own column name",
+                ));
+            }
+            continue;
+        }
+        if key_columns.contains_key(field.name.as_str()) {
+            return Err(shape(
+                "only the GROUP BY key itself can take the name of a GROUP BY key's column",
+            ));
+        }
+        let mut aggregates = 0;
+        check_join_field_expr(
+            &field.expr,
+            &field.name,
+            &resolve,
+            None,
+            left,
+            right,
+            &mut aggregates,
+        )?;
+        if aggregates == 0 {
+            return Err(shape(
+                "a field is a GROUP BY key or composes at least one aggregate",
+            ));
+        }
+        // The composed field's type, over both tables' columns: each column
+        // is renamed apart by side, since the two tables may share names.
+        let mut renamed = field.expr.clone();
+        let mut types = HashMap::new();
+        rename_join_columns(&mut renamed, &def.source, left, right, &mut types);
+        let types_by_field = infer_field_types(
+            &TransformDef {
+                fields: vec![super::ast::FieldDef {
+                    name: field.name.clone(),
+                    expr: renamed,
+                }],
+                key_space: KeySpace::Aggregate {
+                    group_by: Vec::new(),
+                },
+                ..def.clone()
+            },
+            &types,
+            &HashMap::new(),
+        )?;
+        debug_assert!(types_by_field.contains_key(&field.name));
+    }
+    Ok(())
+}
+
+/// One column-read side of an aggregate argument, for the mixed-side check.
+type ResolveJoinColumn<'a> =
+    dyn Fn(&QualifiedColumn) -> Result<(JoinSide, &'a JoinColumnInfo), ValidationError> + 'a;
+
+/// Walks one `JOIN` field's expression. Outside an aggregate (`in_aggregate`
+/// is `None`) it admits literals, operators and scalar functions over
+/// aggregates; a column there must be a lone `GROUP BY` key (checked by the
+/// caller), so any other is refused. Inside an aggregate's argument it
+/// collects which sides the argument reads, so the caller can refuse a
+/// mixed-side argument by name. Every aggregate is checked against
+/// [`check_aggregate_admitted`] and counted in `aggregates`.
+fn check_join_field_expr<'a>(
+    expr: &Expr,
+    field: &str,
+    resolve: &ResolveJoinColumn<'a>,
+    mut in_aggregate: Option<&mut Vec<JoinSide>>,
+    left: &HashMap<String, JoinColumnInfo>,
+    right: &HashMap<String, JoinColumnInfo>,
+    aggregates: &mut usize,
+) -> Result<(), ValidationError> {
+    let shape = |detail: &str| ValidationError::JoinFieldShape {
+        field: field.to_string(),
+        detail: detail.to_string(),
+    };
+    match expr {
+        Expr::Column(column) => Err(ValidationError::JoinUnqualifiedColumn {
+            field: field.to_string(),
+            column: column.clone(),
+        }),
+        // A dotted name whose head is neither table: a JOIN transform has no
+        // relationship paths.
+        Expr::RelationshipPath { rel, column } => Err(ValidationError::JoinUnknownTable {
+            reference: format!("{rel}.{column}"),
+        }),
+        Expr::SourceColumn {
+            schema,
+            table,
+            column,
+        } => {
+            let (side, _) = resolve(&QualifiedColumn {
+                schema: schema.clone(),
+                table: table.clone(),
+                column: column.clone(),
+            })?;
+            match in_aggregate {
+                Some(sides) => {
+                    sides.push(side);
+                    Ok(())
+                }
+                None => Err(shape(
+                    "a column outside an aggregate must be a GROUP BY key selected on its own; \
+                     aggregate anything else",
+                )),
+            }
+        }
+        Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::TypedLiteral { .. } => Ok(()),
+        Expr::BinaryOp { lhs, rhs, .. } => {
+            check_join_field_expr(
+                lhs,
+                field,
+                resolve,
+                in_aggregate.as_deref_mut(),
+                left,
+                right,
+                aggregates,
+            )?;
+            check_join_field_expr(rhs, field, resolve, in_aggregate, left, right, aggregates)
+        }
+        Expr::FunctionCall { name, args } => {
+            let upper = name.to_ascii_uppercase();
+            let is_aggregate = is_deferred_aggregate_name(&upper)
+                || super::registry::AGGREGATE_FUNCTIONS.contains(&upper.as_str());
+            if !is_aggregate {
+                for arg in args {
+                    check_join_field_expr(
+                        arg,
+                        field,
+                        resolve,
+                        in_aggregate.as_deref_mut(),
+                        left,
+                        right,
+                        aggregates,
+                    )?;
+                }
+                return Ok(());
+            }
+            if in_aggregate.is_some() {
+                return Err(shape("an aggregate can't be nested in another aggregate"));
+            }
+            check_aggregate_admitted(&upper, None)?;
+            *aggregates += 1;
+            let arg = match args.as_slice() {
+                [] if upper == "COUNT" => return Ok(()),
+                [arg] => arg,
+                _ => return Err(shape("an aggregate takes one argument (or * for COUNT)")),
+            };
+            let mut sides = Vec::new();
+            check_join_field_expr(
+                arg,
+                field,
+                resolve,
+                Some(&mut sides),
+                left,
+                right,
+                aggregates,
+            )?;
+            let side = match sides.first() {
+                None => {
+                    return Err(shape(
+                        "an aggregate's argument reads a column of one of the two tables",
+                    ));
+                }
+                Some(side) if sides.iter().any(|other| other != side) => {
+                    return Err(ValidationError::JoinMixedSideArgument {
+                        field: field.to_string(),
+                        argument: format!("{upper}({})", render_field_expr(arg)),
+                    });
+                }
+                Some(side) => *side,
+            };
+            let columns = match side {
+                JoinSide::Left => left,
+                JoinSide::Right => right,
+            };
+            // The argument's type over its one side, and for a lone column
+            // its declared modifier (an expression's `numeric` result has no
+            // declared scale).
+            let value_types: HashMap<String, ValueType> = columns
+                .iter()
+                .map(|(name, info)| (name.clone(), info.value_type))
+                .collect();
+            let value_type = infer_expr_type(arg, &value_types, &HashMap::new())?;
+            let (pg_type, typmod) = match arg {
+                Expr::SourceColumn { column, .. } => columns
+                    .get(column)
+                    .map(|info| (info.pg_type.clone(), info.typmod))
+                    .unwrap_or_default(),
+                _ => (super::ddl::pg_type_name(value_type).into_owned(), -1),
+            };
+            check_aggregate_admitted(
+                &upper,
+                Some(&AggregateArg {
+                    column: &render_field_expr(arg),
+                    value_type,
+                    pg_type: &pg_type,
+                    typmod,
+                }),
+            )
+        }
+    }
+}
+
+/// Rewrites every side-qualified column in `expr` to a bare name unique to
+/// its side, recording its type in `types`, so a composed field can be typed
+/// by the single-table inference.
+fn rename_join_columns(
+    expr: &mut Expr,
+    source: &str,
+    left: &HashMap<String, JoinColumnInfo>,
+    right: &HashMap<String, JoinColumnInfo>,
+    types: &mut HashMap<String, ValueType>,
+) {
+    match expr {
+        Expr::SourceColumn { table, column, .. } => {
+            let (prefix, columns) = if table == source {
+                ("l", left)
+            } else {
+                ("r", right)
+            };
+            let renamed = format!("{prefix}\u{1}{column}");
+            if let Some(info) = columns.get(column.as_str()) {
+                types.insert(renamed.clone(), info.value_type);
+            }
+            *expr = Expr::Column(renamed);
+        }
+        Expr::BinaryOp { lhs, rhs, .. } => {
+            rename_join_columns(lhs, source, left, right, types);
+            rename_join_columns(rhs, source, left, right, types);
+        }
+        Expr::FunctionCall { args, .. } => {
+            for arg in args {
+                rename_join_columns(arg, source, left, right, types);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Checks every qualified [`Expr::SourceColumn`] in `def` (issue #830): it
@@ -5101,5 +5822,480 @@ mod tests {
         );
         let d = parsed("TRANSFORM t FROM s SELECT s.val + 2 AS other");
         assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
+    }
+
+    // ---- JOIN validation (#1106) ----
+
+    use crate::defs::parser::parse as parse_text;
+
+    fn jcol(value_type: ValueType, pg_type: &str, type_oid: u32, typmod: i32) -> JoinColumnInfo {
+        JoinColumnInfo {
+            value_type,
+            pg_type: pg_type.to_string(),
+            type_oid,
+            typmod,
+            collation_oid: 0,
+            collation: None,
+            collation_deterministic: true,
+            is_enum: false,
+        }
+    }
+
+    fn int4() -> JoinColumnInfo {
+        jcol(ValueType::Integer(IntWidth::Int4), "integer", 23, -1)
+    }
+
+    fn side(cols: &[(&str, JoinColumnInfo)]) -> HashMap<String, JoinColumnInfo> {
+        cols.iter()
+            .map(|(name, info)| (name.to_string(), info.clone()))
+            .collect()
+    }
+
+    /// orders(id, region text, total numeric(10,2)) and
+    /// items(order_id, sku text, qty int4, price numeric, weight float8, note text).
+    fn tables() -> (
+        HashMap<String, JoinColumnInfo>,
+        HashMap<String, JoinColumnInfo>,
+    ) {
+        let text = || jcol(ValueType::Text, "text", 25, -1);
+        (
+            side(&[
+                ("id", int4()),
+                ("region", text()),
+                (
+                    "total",
+                    jcol(ValueType::Numeric, "numeric(10,2)", 1700, 655366),
+                ),
+            ]),
+            side(&[
+                ("order_id", int4()),
+                ("sku", text()),
+                ("qty", int4()),
+                ("price", jcol(ValueType::Numeric, "numeric", 1700, -1)),
+                (
+                    "weight",
+                    jcol(
+                        ValueType::Float(FloatWidth::Float8),
+                        "double precision",
+                        701,
+                        -1,
+                    ),
+                ),
+                ("note", text()),
+            ]),
+        )
+    }
+
+    fn check(select: &str) -> Result<(), ValidationError> {
+        check_text(&format!(
+            "TRANSFORM t FROM orders JOIN items ON orders.id = items.order_id \
+             GROUP BY orders.region SELECT {select}"
+        ))
+    }
+
+    fn check_text(text: &str) -> Result<(), ValidationError> {
+        let (left, right) = tables();
+        validate_join(&parse_text(text).unwrap(), &left, &right)
+    }
+
+    #[test]
+    fn join_admits_every_aggregate_shape_from_either_side() {
+        check("orders.region AS region, COUNT(*) AS n").unwrap();
+        check("orders.region AS region, COUNT(items.note) AS n").unwrap();
+        check("orders.region AS region, COUNT(items.price) AS n").unwrap();
+        check("orders.region AS region, SUM(items.qty) AS s, AVG(items.qty) AS a").unwrap();
+        check("orders.region AS region, SUM(orders.total) AS s, AVG(orders.total) AS a").unwrap();
+        // Keys from either side, and a left join.
+        check_text(
+            "TRANSFORM t FROM orders LEFT JOIN items ON orders.id = items.order_id \
+             GROUP BY orders.region, items.sku \
+             SELECT orders.region AS region, items.sku AS sku, COUNT(*) AS n",
+        )
+        .unwrap();
+        // Both ON orders and a conjunction.
+        check_text(
+            "TRANSFORM t FROM orders JOIN items ON items.order_id = orders.id AND \
+             items.qty = orders.id GROUP BY orders.region SELECT COUNT(*) AS n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn join_refuses_each_deferred_aggregate_family_by_name() {
+        for (call, family, issue) in [
+            ("MIN(items.qty)", "MIN/MAX", 1117),
+            ("MAX(orders.total)", "MIN/MAX", 1117),
+            (
+                "BOOL_AND(items.qty)",
+                "bool_and/bool_or/bit_and/bit_or",
+                1118,
+            ),
+            (
+                "BOOL_OR(items.qty)",
+                "bool_and/bool_or/bit_and/bit_or",
+                1118,
+            ),
+            (
+                "BIT_AND(items.qty)",
+                "bool_and/bool_or/bit_and/bit_or",
+                1118,
+            ),
+            ("BIT_OR(items.qty)", "bool_and/bool_or/bit_and/bit_or", 1118),
+            ("SUM(items.weight)", "float and interval SUM/AVG", 1119),
+            ("AVG(items.weight)", "float and interval SUM/AVG", 1119),
+            (
+                "ARRAY_AGG(items.sku)",
+                "array_agg/string_agg/jsonb_agg",
+                1040,
+            ),
+            (
+                "STRING_AGG(items.sku, ',')",
+                "array_agg/string_agg/jsonb_agg",
+                1040,
+            ),
+            (
+                "JSONB_AGG(items.sku)",
+                "array_agg/string_agg/jsonb_agg",
+                1040,
+            ),
+        ] {
+            let err = check(&format!("orders.region AS region, {call} AS v")).unwrap_err();
+            match &err {
+                ValidationError::DeferredAggregate {
+                    family: got_family,
+                    issue: got_issue,
+                    ..
+                } => {
+                    assert_eq!((*got_family, *got_issue), (family, issue), "{call}");
+                }
+                other => panic!("{call}: expected DeferredAggregate, got {other:?}"),
+            }
+            assert!(err.to_string().contains(&format!("#{issue}")), "{call}");
+        }
+    }
+
+    #[test]
+    fn join_refuses_sum_and_avg_over_unconstrained_numeric_on_either_side() {
+        for call in ["SUM(items.price)", "AVG(items.price)"] {
+            assert!(
+                matches!(
+                    check(&format!("orders.region AS region, {call} AS v")),
+                    Err(ValidationError::UnconstrainedNumericAggregate { .. })
+                ),
+                "{call}"
+            );
+        }
+        // The same on the FROM side.
+        let (mut left, right) = tables();
+        left.insert(
+            "loose".into(),
+            jcol(ValueType::Numeric, "numeric", 1700, -1),
+        );
+        let def = parse_text(
+            "TRANSFORM t FROM orders JOIN items ON orders.id = items.order_id \
+             GROUP BY orders.region SELECT SUM(orders.loose) AS v",
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_join(&def, &left, &right),
+            Err(ValidationError::UnconstrainedNumericAggregate { .. })
+        ));
+    }
+
+    #[test]
+    fn join_accepts_numeric_with_a_declared_scale_including_zero() {
+        let (mut left, right) = tables();
+        // numeric(10): scale 0, typmod (10 << 16) + 4.
+        left.insert(
+            "whole".into(),
+            jcol(ValueType::Numeric, "numeric(10,0)", 1700, 655364),
+        );
+        let def = parse_text(
+            "TRANSFORM t FROM orders JOIN items ON orders.id = items.order_id \
+             GROUP BY orders.region SELECT SUM(orders.whole) AS v, AVG(orders.total) AS w",
+        )
+        .unwrap();
+        validate_join(&def, &left, &right).unwrap();
+    }
+
+    #[test]
+    fn join_refuses_sum_over_other_types_and_expression_shapes() {
+        assert!(matches!(
+            check("orders.region AS region, SUM(items.sku) AS v"),
+            Err(ValidationError::UnsupportedAggregateArgument { .. })
+        ));
+        assert!(matches!(
+            check("orders.region AS region, SUM(qty) AS v"),
+            Err(ValidationError::JoinUnqualifiedColumn { .. })
+        ));
+        assert!(matches!(
+            check("orders.region AS region, items.qty + 1 AS v"),
+            Err(ValidationError::JoinFieldShape { .. })
+        ));
+        assert!(matches!(
+            check("orders.region AS region, items.sku AS sku"),
+            Err(ValidationError::JoinFieldShape { .. })
+        ));
+        assert!(matches!(
+            check("orders.region AS other"),
+            Err(ValidationError::JoinFieldShape { .. })
+        ));
+    }
+
+    #[test]
+    fn join_on_terms_are_checked_against_both_tables() {
+        let on = |on: &str| {
+            check_text(&format!(
+                "TRANSFORM t FROM orders JOIN items ON {on} GROUP BY orders.region \
+                 SELECT COUNT(*) AS n"
+            ))
+        };
+        assert!(matches!(
+            on("orders.id = orders.id"),
+            Err(ValidationError::JoinOnSameSide { .. })
+        ));
+        assert!(matches!(
+            on("orders.id = other.order_id"),
+            Err(ValidationError::JoinUnknownTable { .. })
+        ));
+        assert!(matches!(
+            on("orders.id = items.nope"),
+            Err(ValidationError::JoinUnresolvedColumn { .. })
+        ));
+        // integer against text: a type mismatch, never a cast.
+        assert!(matches!(
+            on("orders.id = items.sku"),
+            Err(ValidationError::JoinKeyTypeMismatch { .. })
+        ));
+        // numeric isn't a text-stable join key.
+        assert!(matches!(
+            on("orders.total = items.price"),
+            Err(ValidationError::JoinUnsupportedKeyType { .. })
+        ));
+    }
+
+    #[test]
+    fn join_key_modifiers_and_collations_must_match() {
+        let (mut left, mut right) = tables();
+        left.insert(
+            "v50".into(),
+            jcol(ValueType::Text, "character varying(50)", 1043, 54),
+        );
+        right.insert(
+            "v255".into(),
+            jcol(ValueType::Text, "character varying(255)", 1043, 259),
+        );
+        let def = parse_text(
+            "TRANSFORM t FROM orders JOIN items ON orders.v50 = items.v255 \
+             GROUP BY orders.region SELECT COUNT(*) AS n",
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_join(&def, &left, &right),
+            Err(ValidationError::JoinKeyTypeMismatch { .. })
+        ));
+
+        let (mut left, mut right) = tables();
+        for (table, name) in [(&mut left, "c"), (&mut right, "c")] {
+            let mut info = jcol(ValueType::Text, "text", 25, -1);
+            info.collation_oid = 99;
+            info.collation = Some("ci".into());
+            info.collation_deterministic = false;
+            table.insert(name.into(), info);
+        }
+        let def = parse_text(
+            "TRANSFORM t FROM orders JOIN items ON orders.c = items.c \
+             GROUP BY orders.region SELECT COUNT(*) AS n",
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_join(&def, &left, &right),
+            Err(ValidationError::JoinNondeterministicCollation { .. })
+        ));
+    }
+
+    #[test]
+    fn join_group_by_keys_are_checked_from_either_side() {
+        let group = |keys: &str| {
+            check_text(&format!(
+                "TRANSFORM t FROM orders JOIN items ON orders.id = items.order_id \
+                 GROUP BY {keys} SELECT COUNT(*) AS n"
+            ))
+        };
+        group("orders.region, items.sku").unwrap();
+        assert!(matches!(
+            group("items.nope"),
+            Err(ValidationError::JoinUnresolvedColumn { .. })
+        ));
+        assert!(matches!(
+            group("items.weight"),
+            Err(ValidationError::UnsupportedGroupByKeyType { .. })
+        ));
+        // Two keys, one target column name.
+        let (mut left, right) = tables();
+        left.insert("sku".into(), jcol(ValueType::Text, "text", 25, -1));
+        let def = parse_text(
+            "TRANSFORM t FROM orders JOIN items ON orders.id = items.order_id \
+             GROUP BY orders.sku, items.sku SELECT COUNT(*) AS n",
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_join(&def, &left, &right),
+            Err(ValidationError::GroupByKeysShareTargetColumn { .. })
+        ));
+    }
+
+    #[test]
+    fn join_refuses_a_self_join_built_by_hand() {
+        let (left, right) = tables();
+        let mut def = parse_text(
+            "TRANSFORM t FROM orders JOIN items ON orders.id = items.order_id \
+             GROUP BY orders.region SELECT COUNT(*) AS n",
+        )
+        .unwrap();
+        if let KeySpace::Join(spec) = &mut def.key_space {
+            spec.right = "orders".to_string();
+        }
+        assert!(matches!(
+            validate_join(&def, &left, &right),
+            Err(ValidationError::JoinSelf { .. })
+        ));
+    }
+
+    #[test]
+    fn join_admits_a_composite_key_in_either_conjunct_order_but_not_a_repeated_pair() {
+        let on = |on: &str| {
+            check_text(&format!(
+                "TRANSFORM t FROM orders JOIN items ON {on} GROUP BY orders.region \
+                 SELECT COUNT(*) AS n"
+            ))
+        };
+        on("orders.id = items.order_id AND orders.region = items.sku").unwrap();
+        on("items.sku = orders.region AND items.order_id = orders.id").unwrap();
+        assert_eq!(
+            on("orders.id = items.order_id AND items.order_id = orders.id"),
+            Err(ValidationError::JoinOnRepeatedPair {
+                term: "items.order_id = orders.id".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn join_admits_one_side_expression_arguments_and_composed_fields() {
+        for select in [
+            "SUM(items.qty + 1) AS v",
+            "SUM(COALESCE(items.qty, 0)) AS v",
+            "COUNT(items.qty > 3) AS v",
+            "AVG(orders.id + orders.id) AS v",
+            "SUM(items.qty) + COUNT(orders.id) AS v",
+            "COALESCE(SUM(items.qty), 0) AS v",
+            "SUM(orders.total) + 1 AS v",
+            "(COUNT(*) + SUM(items.qty)) > 10 AS v",
+        ] {
+            check(&format!("orders.region AS region, {select}"))
+                .unwrap_or_else(|err| panic!("{select}: {err:?}"));
+        }
+    }
+
+    #[test]
+    fn join_refuses_a_mixed_side_argument_by_name() {
+        assert_eq!(
+            check("orders.region AS region, SUM(orders.id + items.qty) AS v"),
+            Err(ValidationError::JoinMixedSideArgument {
+                field: "v".to_string(),
+                argument: "SUM((orders.id + items.qty))".to_string(),
+            })
+        );
+        // Inside a composition, and through a scalar function.
+        assert!(matches!(
+            check("COALESCE(COUNT(COALESCE(orders.id, items.qty)), 0) AS v"),
+            Err(ValidationError::JoinMixedSideArgument { .. })
+        ));
+    }
+
+    #[test]
+    fn join_refuses_bad_expression_arguments_and_compositions() {
+        let refused = |select: &str| check(&format!("orders.region AS region, {select}"));
+        // An expression over numeric has no declared scale.
+        assert!(matches!(
+            refused("SUM(orders.total + 1) AS v"),
+            Err(ValidationError::UnconstrainedNumericAggregate { .. })
+        ));
+        // A deferred aggregate is refused inside a composition too.
+        assert!(matches!(
+            refused("COALESCE(MIN(items.qty), 0) AS v"),
+            Err(ValidationError::DeferredAggregate { issue: 1117, .. })
+        ));
+        assert!(matches!(
+            refused("SUM(items.sku) + 1 AS v"),
+            Err(ValidationError::UnsupportedAggregateArgument { .. })
+        ));
+        assert!(matches!(
+            refused("SUM(items.qty) + 'a' AS v"),
+            Err(ValidationError::TypeMismatch { .. })
+        ));
+        for select in [
+            "SUM(COUNT(items.qty)) AS v",
+            "1 AS v",
+            "COUNT(1) AS v",
+            "SUM(items.qty) + items.qty AS v",
+            "orders.region + 1 AS v",
+        ] {
+            assert!(
+                matches!(refused(select), Err(ValidationError::JoinFieldShape { .. })),
+                "{select}: {:?}",
+                refused(select)
+            );
+        }
+        assert!(matches!(
+            refused("SUM(qty + 1) AS v"),
+            Err(ValidationError::JoinUnqualifiedColumn { .. })
+        ));
+    }
+
+    #[test]
+    fn join_refuses_a_target_named_after_the_joined_table() {
+        assert_eq!(
+            check_text(
+                "TRANSFORM items FROM orders JOIN items ON orders.id = items.order_id \
+                 GROUP BY orders.region SELECT COUNT(*) AS n",
+            ),
+            Err(ValidationError::TargetEqualsSource {
+                table: "items".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn join_reads_a_dotted_name_of_neither_table_as_an_unknown_table() {
+        for select in [
+            "orders.region AS region, author.name AS name",
+            "orders.region AS region, SUM(author.age) AS s",
+        ] {
+            assert_eq!(
+                check(select),
+                Err(ValidationError::JoinUnknownTable {
+                    reference: if select.contains("SUM") {
+                        "author.age".to_string()
+                    } else {
+                        "author.name".to_string()
+                    }
+                }),
+                "{select}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_single_table_validator_refuses_a_join_as_not_installable() {
+        let def = parse_text(
+            "TRANSFORM t FROM orders JOIN items ON orders.id = items.order_id \
+             GROUP BY orders.region SELECT COUNT(*) AS n",
+        )
+        .unwrap();
+        assert_eq!(
+            validate(&def, &HashMap::new(), &HashMap::new()),
+            Err(ValidationError::JoinNotInstallable)
+        );
     }
 }

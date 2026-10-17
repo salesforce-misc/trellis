@@ -8836,6 +8836,9 @@ pub(super) async fn compute_page(
                 src_table: change.src_table.clone(),
             })?;
             match &def.def.key_space {
+                KeySpace::Join(_) => {
+                    unreachable!("a JOIN definition is refused by validation, so none reaches here")
+                }
                 KeySpace::Aggregate { .. } => {
                     if let Some(existing) = aggregate_clears.get_mut(&def.def.target) {
                         existing.hop_gen = existing.hop_gen.max(change.hop_gen);

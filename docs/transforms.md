@@ -42,7 +42,11 @@ a key, index or policy itself.
 | `ARRAY_AGG` or `STRING_AGG` over an argument that isn't `text`, `varchar` or `char(n)`, `STRING_AGG` with a separator that isn't a string literal, or either over a to-many relationship path (#293) | Yes (`FunctionArgTypeMismatch`, `StringAggSeparatorNotLiteral`, `ListAggregateOverToManyRelationshipUnsupported`). `text[]` is the only array result type Trellis models, and the to-many relationship fold has no form of either aggregate. | n/a | Write the separator as a literal. For another argument type, or a to-many path, none: the grammar has no cast to `text`. |
 | A bare name that could mean a source column or a field: the name of a source column and of a field whose expression is not just that column, read by another field (`(grp + 1) AS val, SUM(val) AS total`). An aggregate field's name inside another aggregate's argument is not ambiguous: it is the source column ([Calculated Fields](#calculated-fields)). | Yes (`AmbiguousColumnReference`), naming both meanings. `val AS val` passes the column through, so reading `val` elsewhere is not ambiguous. | A source column added later under the name of a field: nothing is detected, and the transform keeps reading the field. An `ALTER TRANSFORM` that adds a field of that name is refused, as define would. `RESUME` re-validates and refuses what define would: in an aggregate target, a field another field reads by that name, and in a 1-1 target, any field of that name. | At define, write `src.val` or `public.src.val` to read the source column, or rename the field and read it by its new name. After a later column, rename or drop that column and `RESUME`, or drop the transform and define it again. |
 | A relationship named after its from-table (`RELATIONSHIP posts FROM posts.author_id TO users.id`) | Yes, when it's declared. A transform over `posts` reads `posts.<column>` as its own source column, so the relationship's paths could never be read. | n/a | Give the relationship another name. |
-| `JOIN` | Yes (parse error). Cross-join is not supported. | n/a | Use a [relationship](#relationships). |
+| A `JOIN` transform (`FROM a [LEFT\|INNER] JOIN b ON … GROUP BY … SELECT …`) | Yes (`JoinNotInstallable`). The definition parses and passes the checks in the rows below, then define refuses it: nothing builds a `JOIN` target yet (epic [#1091](https://github.com/salesforce-misc/trellis/issues/1091)). | n/a | Use a [relationship](#relationships) with an aggregate over its to-many path. |
+| A `JOIN` that is `RIGHT`, `FULL`, `CROSS`, `NATURAL`, `USING` or a comma join; joins a table to itself, or two tables with the same bare name (`shop.orders JOIN archive.orders`); joins a third table; has no `GROUP BY`; has an `ON` that is anything but equalities between a column of each table joined by `AND` (`OR`, `<`, a literal, an expression, two columns of one table, a column pair repeated); reads a column without its table (`SUM(qty)`, `GROUP BY region`) or through a table that is neither side (a relationship path); has an aggregate whose argument reads both tables (`SUM(orders.x + items.y)`); or has a field that is neither a `GROUP BY` key selected on its own nor a composition of aggregates (a column outside an aggregate, a nested aggregate, no aggregate at all) | Yes (parse error, or `JoinSelf`, `JoinOnSameSide`, `JoinOnRepeatedPair`, `JoinUnqualifiedColumn`, `JoinUnknownTable`, `JoinUnresolvedColumn`, `JoinMixedSideArgument`, `JoinFieldShape`). Only `INNER` and `LEFT` equi-joins of two different tables are admitted, with every column written `<table>.<column>`. A field is a `GROUP BY` key from either table, or composes aggregates with literals, operators and functions (`COALESCE(SUM(items.qty), 0)`); each aggregate is `COUNT(*)`, or `COUNT`/`SUM`/`AVG` of a column or an expression over one table's columns (`SUM(items.qty + 1)`). Each argument is kept as a running total on its own table, so one reading both tables has no such total. | n/a | Rewrite the definition in the admitted shape. For `RIGHT JOIN`, swap the two tables and use `LEFT JOIN`. |
+| A `JOIN` whose `ON` columns differ in type, type modifier or collation, are off the join-key allowlist, or have a nondeterministic collation; or a `GROUP BY` key of a type that can't be one | Yes (`JoinKeyTypeMismatch`, `JoinUnsupportedKeyType`, `JoinNondeterministicCollation`, `UnsupportedGroupByKeyType`). The same rules as a relationship's join columns and a `GROUP BY` key. | n/a | Alter one column to match the other. |
+| `MIN`/`MAX`, `bool_and`/`bool_or`/`bit_and`/`bit_or`, float or `interval` `SUM`/`AVG`, or `array_agg`/`string_agg`/`jsonb_agg` in a `JOIN` transform. Plain aggregates keep these until [#1105](https://github.com/salesforce-misc/trellis/issues/1105) removes the per-row ledger. | Yes (`DeferredAggregate`), named by family. Only the aggregates kept exact by signed deltas are admitted. | n/a | Not supported yet: [#1117](https://github.com/salesforce-misc/trellis/issues/1117) (`MIN`/`MAX`), [#1118](https://github.com/salesforce-misc/trellis/issues/1118) (`bool_*`/`bit_*`), [#1119](https://github.com/salesforce-misc/trellis/issues/1119) (float and `interval`), [#1040](https://github.com/salesforce-misc/trellis/issues/1040) (`array_agg`/`string_agg`/`jsonb_agg`). |
+| `SUM` or `AVG` over an unconstrained `numeric` column or an expression whose result is `numeric`, or over any type but `smallint`, `integer`, `bigint` and `numeric(p,s)`, in a `JOIN` transform | Yes (`UnconstrainedNumericAggregate`, `UnsupportedAggregateArgument`). Postgres shows a sum with as many decimal places as the most precise value in the group, which a running sum can't track; a declared scale removes the mismatch, and an expression's `numeric` result has none. | n/a | Sum the `numeric(p,s)` column itself, declare a scale (`ALTER TABLE … ALTER COLUMN … TYPE numeric(p,s)`), or wait for [#1120](https://github.com/salesforce-misc/trellis/issues/1120). |
 | A `WHERE` other than `TRUE` | Yes (parse error). Partial data is not supported ([#804](https://github.com/salesforce-misc/trellis/issues/804)). | n/a | None. |
 | Chaining off a transform that is not `live` (`TransformNotLive`) | Yes. | n/a | Wait for the upstream to go `live`, then define. |
 | A target whose name is taken: a relation of any kind already exists in the target schema under the target's name or the name of a table Trellis keeps beside it (`<target>__ledger`, `<target>__deltas`). That includes another definition's target, in this instance or in another instance sharing the target schema. | Yes (`TargetTableExists`, a `conflict` error). Trellis writes only to target tables it creates, and `DROP TRANSFORM` drops the target, so it never takes over an existing relation. | n/a | Choose another target name, give the instance its own target schema ([instance-identity](instance-identity.md)), or drop or rename the existing relation. |
@@ -78,15 +82,15 @@ by scan rather than by index.
 ## Granularity
 
 Granularity determines the target's primary-key space — what a single target row
-represents relative to its source row(s). The design has three: 1-1 and
-aggregate are supported; cross-join is not.
+represents relative to its source row(s). The grammar has three: 1-1, aggregate and join aggregate. A join aggregate
+can't be installed yet (see [Supported sources and targets](#supported-sources-and-targets)).
 
 ### 1-1
 
 Exactly one target row per source row, inheriting the source's primary key.
 Insertion/deletion maps 1-1. Always a single source table: deriving a target
-from a key-to-key join of two tables is a cross-join, not 1-1, even when the
-join is one-to-one in practice.
+from a join of two tables is a [join aggregate](#join-aggregate), not 1-1, even
+when the join is one-to-one in practice.
 
 The target always carries the source's primary key columns, so a field can't
 reuse a key column's name (see [Supported sources and targets](#supported-sources-and-targets)).
@@ -138,25 +142,17 @@ batches share groups queue behind each other for those rows. If you're planning
 an aggregate with tens of thousands of groups written concurrently, benchmark
 it first (`benchmark group-contention --groups <n>`).
 
-### Cross-join
+### Join aggregate
 
-**Not supported:** a `JOIN` clause is refused with a parse error. This
-section describes the intended design.
-
-The primary-key space is the join of two source tables, mirroring the rows a
-`JOIN` returns. Each unique pairing of source primary keys that satisfies the
-join condition produces one target row, keyed by the pair `{a.pk, b.pk}` — both
-kept because one row on either side may match many on the other. Source columns
-are referenced through the side they come from (`a.column`, `b.column`). The
-join type is chosen per transform:
-
-* `INNER` — only matching pairs produce a row.
-* `LEFT` / `RIGHT` — every row on the retained side produces a row even with no
-  match; the unmatched side's columns (and its half of the key) read null.
+An aggregate over the join of two tables (`FROM a [LEFT|INNER] JOIN b ON …
+GROUP BY …`). Define checks it and then refuses it: nothing builds its target
+yet. [Supported sources and targets](#supported-sources-and-targets) lists the
+checks; epic [#1091](https://github.com/salesforce-misc/trellis/issues/1091)
+builds the rest.
 
 ## Relationships
 
-Cross-join changes a table's granularity. Often you instead want to keep a
+A join aggregate changes a table's granularity. Often you instead want to keep a
 table's own granularity and merely *enrich* it with columns looked up from a
 related table — order lines decorated with `product.category_name`.
 
@@ -246,7 +242,7 @@ unchanged inputs always yields the same result.
 Calculated columns may reference each other, letting users build derivations out
 of small named steps (a `margin` column defined in terms of `revenue` and `cost`).
 Transforms also chain: a target table may itself be a source for another —
-aggregated, cross-joined, or referenced through a relationship. Trellis builds a
+aggregated, joined, or referenced through a relationship. Trellis builds a
 dependency graph spanning columns within a table and tables across chained
 transforms, and evaluates in dependency order.
 

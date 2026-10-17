@@ -1148,6 +1148,9 @@ pub async fn install_definition(
     // `create_definition_inner`'s transaction (issue #440), so the table
     // commits or rolls back together with the catalog row.
     let target_ddl = match &def.key_space {
+        KeySpace::Join(_) => {
+            unreachable!("a JOIN definition is refused by validation, so none reaches here")
+        }
         KeySpace::OneToOne => {
             // Issue #121: the 1-1 target table's own primary key mirrors the
             // source's in full — at whatever arity the source declares it —
@@ -4615,7 +4618,11 @@ pub(crate) async fn resolve_relationships_for_new_definition(
     pool: &Pool,
     def: &TransformDef,
 ) -> Result<HashMap<String, ResolvedRelationship>, CatalogError> {
-    if super::eval::relationship_references(def).is_empty() {
+    // A JOIN transform has no relationship paths: a dotted name whose head
+    // is neither table is refused by the JOIN validator as an unknown table.
+    if matches!(def.key_space, KeySpace::Join(_))
+        || super::eval::relationship_references(def).is_empty()
+    {
         return Ok(HashMap::new());
     }
     match resolve_source_for_install(pool, def).await {
@@ -5079,12 +5086,19 @@ fn validate_with_source(
 /// resolved. Resolves the source only to spell its schema in an
 /// ambiguous-name refusal (issue #830); a definition that fails some other
 /// way, or passes, never resolves it here.
+///
+/// A `JOIN` definition is checked against both tables' live columns
+/// ([`validate_join_for_define`]) and then refused as
+/// [`ValidationError::JoinNotInstallable`]: nothing builds its target yet.
 async fn validate_for_define(
     pool: &Pool,
     def: &TransformDef,
     source_columns: &HashMap<String, ValueType>,
     relationships: &HashMap<String, ResolvedRelationship>,
 ) -> Result<(), CatalogError> {
+    if let KeySpace::Join(join) = &def.key_space {
+        validate_join_for_define(pool, def, join).await?;
+    }
     match validate(def, source_columns, relationships) {
         Err(err @ ValidationError::AmbiguousColumnReference(_)) => {
             let err = match resolve_source_for_install(pool, def).await {
@@ -5098,6 +5112,78 @@ async fn validate_for_define(
         }
         result => Ok(result?),
     }
+}
+
+/// [`super::validate::validate_join`] for a `JOIN` definition being defined:
+/// resolves both tables the way a `FROM` resolves (an explicit schema is
+/// confirmed, a bare name walks `search_path`) and reads their columns.
+async fn validate_join_for_define(
+    pool: &Pool,
+    def: &TransformDef,
+    join: &super::ast::JoinSpec,
+) -> Result<(), CatalogError> {
+    let left = resolve_source_for_install(pool, def).await?;
+    let right = match &join.explicit_right_schema {
+        Some(schema) => {
+            confirm_qualified_source(&**pool.get().await?, schema, &join.right).await?;
+            crate::intake::markers::qualify(schema, &join.right)?
+        }
+        None => resolve_graph_identity(pool, &join.right).await?,
+    };
+    let client = pool.get().await?;
+    let left = join_columns_of(&**client, &left).await?;
+    let right = join_columns_of(&**client, &right).await?;
+    Ok(super::validate::validate_join(def, &left, &right)?)
+}
+
+/// Every column of `qualified` as [`super::validate::validate_join`] reads
+/// it. Like [`live_source_columns`], a column whose type the registry can't
+/// place is left out, so a reference to it is an unresolved column.
+async fn join_columns_of(
+    client: &impl GenericClient,
+    qualified: &str,
+) -> Result<HashMap<String, super::validate::JoinColumnInfo>, CatalogError> {
+    let rows = client
+        .query(
+            "select a.attname::text,
+                    pg_catalog.format_type(a.atttypid, a.atttypmod),
+                    a.atttypid,
+                    a.atttypmod,
+                    a.attcollation,
+                    co.collname::text,
+                    coalesce(co.collisdeterministic, true),
+                    t.typtype = 'e'
+             from pg_attribute a
+             join pg_catalog.pg_type t on t.oid = a.atttypid
+             left join pg_catalog.pg_collation co on co.oid = a.attcollation
+             where a.attrelid = pg_catalog.to_regclass($1)
+               and a.attnum > 0
+               and not a.attisdropped",
+            &[&ddl::regclass_arg(qualified)],
+        )
+        .await?;
+    let mut columns = HashMap::with_capacity(rows.len());
+    for row in rows {
+        let type_oid: u32 = row.get(2);
+        let value_type = super::pg_type::value_type_for_oid(client, type_oid).await?;
+        if value_type == ValueType::Other(PgType::Unrecognized) {
+            continue;
+        }
+        columns.insert(
+            row.get::<_, String>(0),
+            super::validate::JoinColumnInfo {
+                value_type,
+                pg_type: row.get(1),
+                type_oid,
+                typmod: row.get(3),
+                collation_oid: row.get(4),
+                collation: row.get(5),
+                collation_deterministic: row.get(6),
+                is_enum: row.get(7),
+            },
+        );
+    }
+    Ok(columns)
 }
 
 /// The fully-qualified source [`install_definition`]'s own DDL steps read
@@ -6699,6 +6785,9 @@ async fn reject_unkeyed_source(
             });
         }
         let refusal = match &def.key_space {
+            KeySpace::Join(_) => {
+                unreachable!("a JOIN definition is refused by validation, so none reaches here")
+            }
             KeySpace::OneToOne => Some(super::partition_tree::PartitionRefusal::OneToOneFrom {
                 table: qualified_source.to_string(),
             }),

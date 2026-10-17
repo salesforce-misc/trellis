@@ -17,10 +17,9 @@
 //! `<rel>.<column>` relationship-path syntax elsewhere in this grammar despite
 //! reusing the same `ident '.' ident` token shape.
 //!
-//! `FROM <source>` is where a future aggregate (`GROUP BY <cols>`) or
-//! cross-join (`JOIN <other> ON <cond>`) key-space clause will slot in;
-//! this slice only accepts the 1-1 case (clause absent) and rejects both
-//! keywords by name if present. `<expr>` supports column references,
+//! `FROM <source>` is where the key-space clause slots in: absent for 1-1,
+//! `GROUP BY <cols>` for an aggregate, `[LEFT|INNER] JOIN <other> ON <cond>
+//! GROUP BY <cols>` for a join aggregate (ADR-0019). `<expr>` supports column references,
 //! numeric and string literals, `+`, `>` (issue #65), parenthesized
 //! grouping (`(<expr>)`, issue #67 — needed once a caller composes `+` and
 //! `>` and must override the precedence table's own grouping), `name(args)`
@@ -50,8 +49,9 @@
 //! storage are all separate, later issues.
 
 use super::ast::{
-    AlterClause, AlterTransform, DefinitionRef, Expr, FieldDef, GroupByKey, KeySpace, Predicate,
-    RelationshipDef, Statement, StatementKind, TransformDef, TransformRef,
+    AlterClause, AlterTransform, DefinitionRef, Expr, FieldDef, GroupByKey, JoinKind, JoinOn,
+    JoinSpec, KeySpace, Predicate, QualifiedColumn, RelationshipDef, Statement, StatementKind,
+    TransformDef, TransformRef,
 };
 use super::error::ParseError;
 use super::lexer::{Token, lex};
@@ -60,6 +60,7 @@ use super::registry::{
     lookup_operator, operator_spec,
 };
 use super::typed_literal::lookup_typed_literal;
+use super::validate::is_deferred_aggregate_name;
 
 const OPERATOR_CHARS: &[char] = &['+', '-', '*', '/', '%', '>', '<', '='];
 
@@ -88,6 +89,7 @@ pub fn parse(input: &str) -> Result<TransformDef, ParseError> {
         pos: 0,
         is_aggregate: false,
         source: None,
+        joined: None,
     }
     .parse_transform_def()
 }
@@ -105,6 +107,7 @@ pub fn parse_relationship(input: &str) -> Result<RelationshipDef, ParseError> {
         pos: 0,
         is_aggregate: false,
         source: None,
+        joined: None,
     }
     .parse_relationship_def()
 }
@@ -124,6 +127,8 @@ pub fn parse_relationship(input: &str) -> Result<RelationshipDef, ParseError> {
 ///
 /// ```text
 /// TRANSFORM <target> FROM <source> [GROUP BY <keys>] SELECT <fields> [WHERE <predicate>]
+/// TRANSFORM <target> FROM <source> [LEFT|INNER] JOIN <other> ON <equi-join>
+///   GROUP BY <keys> SELECT <fields> [WHERE <predicate>]
 /// RELATIONSHIP <name> FROM <from_table>.<fk_col> TO <to_table>.<pk_col>
 ///
 /// PAUSE  TRANSFORM <target>[.<column>]
@@ -166,6 +171,7 @@ pub fn parse_statement(input: &str) -> Result<Statement, ParseError> {
         pos: 0,
         is_aggregate: false,
         source: None,
+        joined: None,
     }
     .parse_statement()
 }
@@ -224,6 +230,11 @@ struct Parser {
     /// two-part names against the stored definition's instead
     /// ([`super::ast::Expr::qualify_source_columns`]).
     source: Option<String>,
+    /// The `JOIN` table's bare name, once [`Self::parse_join_clause`] has
+    /// parsed it: a two-part `<head>.<column>` whose head is this table is a
+    /// qualified column of the joined side, as `source` does for the `FROM`
+    /// side.
+    joined: Option<String>,
 }
 
 impl Parser {
@@ -727,16 +738,20 @@ impl Parser {
 
     /// Parses the key-space clause in its ADR-0004-reserved slot, between
     /// `FROM <source>` and `SELECT`: absent -> [`KeySpace::OneToOne`],
-    /// `GROUP BY <key>[, <key>...]` -> [`KeySpace::Aggregate`]. `JOIN` is
-    /// rejected outright — cross-join key-spaces aren't supported by any
-    /// part of this grammar yet.
+    /// `GROUP BY <key>[, <key>...]` -> [`KeySpace::Aggregate`], and
+    /// `[LEFT|INNER] JOIN <other> ON <equi-join> GROUP BY <key>[, ...]` ->
+    /// [`KeySpace::Join`] (ADR-0019).
     fn parse_key_space_clause(&mut self) -> Result<KeySpace, ParseError> {
-        if self.peek_is_keyword("JOIN") {
+        if ["JOIN", "LEFT", "INNER", "RIGHT", "FULL", "CROSS", "NATURAL"]
+            .iter()
+            .any(|kw| self.peek_is_keyword(kw))
+        {
+            return self.parse_join_clause().map(KeySpace::Join);
+        }
+        if self.peek_is_symbol(',') {
             return Err(ParseError::UnsupportedKeySpace {
-                construct: "JOIN".to_string(),
-                detail: "cross-join key-spaces are not supported by this grammar slice \
-                    (see issue #22 and docs/transforms.md#granularity)"
-                    .to_string(),
+                construct: "comma join".to_string(),
+                detail: "write the join as `FROM a [LEFT|INNER] JOIN b ON a.x = b.y`".to_string(),
             });
         }
         if self.peek_is_keyword("GROUP") {
@@ -751,6 +766,157 @@ impl Parser {
             return Ok(KeySpace::Aggregate { group_by });
         }
         Ok(KeySpace::OneToOne)
+    }
+
+    /// Parses `[LEFT [OUTER]|INNER] JOIN <other> ON <term> [AND <term>...]
+    /// GROUP BY <column>[, <column>...]`, every column written
+    /// `<table>.<column>`. Only inner and left equi-joins are admitted, and a
+    /// `JOIN` always aggregates, so `GROUP BY` is required. The shape of the
+    /// result (`ON` terms across the two tables, column types, aggregates) is
+    /// the validator's to check.
+    fn parse_join_clause(&mut self) -> Result<JoinSpec, ParseError> {
+        let unsupported = |construct: &str, detail: &str| ParseError::UnsupportedKeySpace {
+            construct: construct.to_string(),
+            detail: detail.to_string(),
+        };
+        let kind = if self.peek_is_keyword("LEFT") {
+            self.advance();
+            if self.peek_is_keyword("OUTER") {
+                self.advance();
+            }
+            JoinKind::Left
+        } else if self.peek_is_keyword("INNER") {
+            self.advance();
+            JoinKind::Inner
+        } else if let Some(kw) = ["RIGHT", "FULL", "CROSS", "NATURAL"]
+            .into_iter()
+            .find(|kw| self.peek_is_keyword(kw))
+        {
+            let detail = if kw == "RIGHT" {
+                "only INNER and LEFT joins are supported: swap the two tables and use LEFT JOIN"
+            } else {
+                "only INNER and LEFT joins are supported (docs/transforms.md, \"Supported \
+                 sources and targets\")"
+            };
+            return Err(unsupported(&format!("{kw} JOIN"), detail));
+        } else {
+            JoinKind::Inner
+        };
+        self.expect_keyword("JOIN")?;
+        let (right, explicit_right_schema) = self.parse_table_ref()?;
+        if self.source.as_deref() == Some(right.as_str()) {
+            return Err(unsupported(
+                "JOIN",
+                &format!(
+                    "both tables are named '{right}': a table can't be joined to itself, and \
+                     two tables sharing a bare name can't be told apart, since every column \
+                     is written `<table>.<column>` and this grammar has no table aliases"
+                ),
+            ));
+        }
+        if self.peek_is_keyword("USING") {
+            return Err(unsupported(
+                "JOIN USING",
+                "write the join columns out with ON: `ON a.x = b.x`",
+            ));
+        }
+        self.joined = Some(right.clone());
+
+        self.expect_keyword("ON")?;
+        let mut on = vec![self.parse_join_on_term()?];
+        while self.peek_is_keyword("AND") {
+            self.advance();
+            on.push(self.parse_join_on_term()?);
+        }
+        if self.peek_is_keyword("OR") {
+            return Err(unsupported(
+                "JOIN ON",
+                "ON admits only equalities joined by AND, not OR",
+            ));
+        }
+        if ["JOIN", "LEFT", "INNER", "RIGHT", "FULL", "CROSS", "NATURAL"]
+            .iter()
+            .any(|kw| self.peek_is_keyword(kw))
+        {
+            return Err(unsupported(
+                "JOIN",
+                "a JOIN transform joins exactly two tables; a second JOIN is not supported",
+            ));
+        }
+
+        if !self.peek_is_keyword("GROUP") {
+            return Err(unsupported(
+                "JOIN",
+                "a JOIN aggregates, so it needs a GROUP BY after the ON clause",
+            ));
+        }
+        self.advance();
+        self.expect_keyword("BY")?;
+        let mut group_by = vec![self.parse_join_column("JOIN GROUP BY")?];
+        while self.peek_is_symbol(',') {
+            self.advance();
+            group_by.push(self.parse_join_column("JOIN GROUP BY")?);
+        }
+        self.is_aggregate = true;
+        Ok(JoinSpec {
+            kind,
+            right,
+            explicit_right_schema,
+            on,
+            group_by,
+        })
+    }
+
+    /// One `<table>.<column> = <table>.<column>` term of a `JOIN ... ON`.
+    fn parse_join_on_term(&mut self) -> Result<JoinOn, ParseError> {
+        let lhs = self.parse_join_column("JOIN ON")?;
+        if !self.peek_is_symbol('=') {
+            return Err(ParseError::UnsupportedKeySpace {
+                construct: "JOIN ON".to_string(),
+                detail: "ON admits only equalities between columns: \
+                    `<table>.<column> = <table>.<column>`"
+                    .to_string(),
+            });
+        }
+        self.advance();
+        let rhs = self.parse_join_column("JOIN ON")?;
+        Ok(JoinOn { lhs, rhs })
+    }
+
+    /// A `<table>.<column>` or `<schema>.<table>.<column>` reference in a
+    /// `JOIN`'s `ON` or `GROUP BY`; anything else (a bare column, a literal,
+    /// an expression) is refused under `construct`.
+    fn parse_join_column(&mut self, construct: &str) -> Result<QualifiedColumn, ParseError> {
+        let refuse = |found: String| ParseError::UnsupportedKeySpace {
+            construct: construct.to_string(),
+            detail: format!(
+                "expected a column written `<table>.<column>`, found {found}; a JOIN admits \
+                 only side-qualified columns here"
+            ),
+        };
+        let first = match self.advance() {
+            Token::Ident(first) => first,
+            other => return Err(refuse(other.describe())),
+        };
+        if !self.peek_is_symbol('.') {
+            return Err(refuse(format!("the bare name '{first}'")));
+        }
+        self.advance();
+        let second = self.expect_ident()?;
+        if !self.peek_is_symbol('.') {
+            return Ok(QualifiedColumn {
+                schema: None,
+                table: first,
+                column: second,
+            });
+        }
+        self.advance();
+        let third = self.expect_ident()?;
+        Ok(QualifiedColumn {
+            schema: Some(first),
+            table: second,
+            column: third,
+        })
     }
 
     /// Parses one `GROUP BY` key (issue #137): a plain `<column>`, or a
@@ -789,8 +955,8 @@ impl Parser {
         if self.peek_is_keyword("JOIN") {
             return Err(ParseError::UnsupportedKeySpace {
                 construct: "JOIN".to_string(),
-                detail: "cross-join key-spaces are not supported by this grammar slice \
-                    (see issue #22 and docs/transforms.md#granularity)"
+                detail: "JOIN must appear directly after FROM <source> and before \
+                    GROUP BY and SELECT (ADR-0004's reserved slot), not after SELECT/WHERE"
                     .to_string(),
             });
         }
@@ -960,6 +1126,15 @@ impl Parser {
                         return self.parse_cast_body();
                     }
 
+                    // In a `JOIN` the deferred aggregate families parse (to
+                    // any argument list) so the validator can refuse each by
+                    // name rather than the parser calling it an unknown
+                    // function.
+                    if self.joined.is_some() && is_deferred_aggregate_name(&upper) {
+                        let args = self.parse_call_args()?;
+                        return Ok(Expr::FunctionCall { name: upper, args });
+                    }
+
                     if AGGREGATE_FUNCTIONS.contains(&upper.as_str()) {
                         if !self.is_aggregate {
                             // A to-many relationship enrichment (ADR-0006, #29):
@@ -1108,6 +1283,13 @@ impl Parser {
         let second = self.expect_ident()?;
         if !self.peek_is_symbol('.') {
             if self.source.as_deref() == Some(first.as_str()) {
+                return Ok(Expr::SourceColumn {
+                    schema: None,
+                    table: first,
+                    column: second,
+                });
+            }
+            if self.joined.as_deref() == Some(first.as_str()) {
                 return Ok(Expr::SourceColumn {
                     schema: None,
                     table: first,

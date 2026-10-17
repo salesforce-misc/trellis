@@ -169,6 +169,9 @@ pub(crate) async fn typed_copies(
             inferred: None,
         };
     match &def.key_space {
+        KeySpace::Join(_) => {
+            unreachable!("a JOIN definition is refused by validation, so none reaches here")
+        }
         KeySpace::OneToOne => {
             let source_columns: HashSet<String> = client
                 .query(
@@ -425,6 +428,9 @@ async fn inferred_copies(
         }
     };
     match &def.key_space {
+        KeySpace::Join(_) => {
+            unreachable!("a JOIN definition is refused by validation, so none reaches here")
+        }
         KeySpace::OneToOne => {
             for field in &def.fields {
                 // A bare passthrough is a copy of its column, as
