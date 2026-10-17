@@ -208,9 +208,10 @@ What it does there is one append.
   CASCADE` merges two updates of one row into one statement, and pairing by
   key uses one old image twice. So a group-basis reader counts every
   transition row exactly once, `Σf(NEW TABLE) − Σf(OLD TABLE)` per statement
-  with no pairing (dropping a no-op pair is still exact, as a cancellation),
-  and a ring row the re-read wrote also carries the statement's transition
-  new image for it. The re-read also fires when an update's new rows hold a
+  (dropping a no-op pair is still exact, as a cancellation), and a ring row
+  the re-read wrote carries the statement's transition images for it
+  (`transition_images`, old and new); duplicate keys pair one to one, and
+  the sum is identical. The re-read also fires when an update's new rows hold a
   key twice. *Evidence:* in my group-basis model the live images left
   groups wrong in every soak run with application triggers that rewrite rows
   (about 1,200 wrong groups per version); unpaired transition images were
