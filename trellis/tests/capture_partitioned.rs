@@ -584,6 +584,49 @@ async fn the_nodes_of_a_root_attached_under_another_table_are_not_installed_tabl
     );
 }
 
+/// A root whose schema and name need quoting still covers its nodes: the
+/// installed tables are the root alone, not each node carrying triggers.
+#[tokio::test]
+async fn the_nodes_of_a_root_with_quoted_names_are_not_installed_tables() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect(db.dsn()).await;
+    client
+        .batch_execute(
+            "create schema \"Odd Schema\"; \
+             create table \"Odd Schema\".\"Root R\" (id int primary key, v text) \
+                 partition by hash (id); \
+             create table \"Odd Schema\".\"Leaf 0\" partition of \"Odd Schema\".\"Root R\" \
+                 for values with (modulus 2, remainder 0) ; \
+             create table \"Odd Schema\".\"Leaf 1\" partition of \"Odd Schema\".\"Root R\" \
+                 for values with (modulus 2, remainder 1)",
+        )
+        .await
+        .expect("tree");
+    landed(
+        install::install(
+            &mut client,
+            DEFAULT_SCHEMA,
+            &spec("Odd Schema.Root R"),
+            None,
+        )
+        .await
+        .expect("install"),
+    );
+    assert_eq!(
+        trigger_map(&client).await.len(),
+        3,
+        "every node carries triggers"
+    );
+    let tables = trellis::capture::reconcile::installed_tables(&client, DEFAULT_SCHEMA)
+        .await
+        .expect("installed tables");
+    assert_eq!(
+        tables.into_iter().collect::<Vec<_>>(),
+        vec!["Odd Schema.Root R".to_string()]
+    );
+}
+
 /// A leaf detached from the tree keeps its capture triggers, which call the
 /// root's functions. Uninstalling the root drops them too, rather than
 /// failing on the functions' dependents, and the reconcile pass lists the

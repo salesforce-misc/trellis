@@ -588,7 +588,9 @@ async fn gated_marker_tables(client: &impl GenericClient) -> Result<HashSet<Stri
 /// root's. Neither is a table (or one under a table) whose `DETACH
 /// CONCURRENTLY` is still pending: a writer with an older snapshot can still
 /// write through the parent into it, so its triggers come off only once the
-/// detach has completed (ADR-0017).
+/// detach has completed (ADR-0017). Both exclusions are each one subtree
+/// walk per recorded table or pending detach, not an ancestor walk per
+/// trigger, so a steady pass over a large tree stays cheap.
 pub async fn installed_tables(
     client: &impl GenericClient,
     schema: &str,
@@ -610,24 +612,29 @@ pub async fn installed_tables(
                      where p.pronamespace = ( \
                          select oid from pg_catalog.pg_namespace where nspname = $1) \
                        and d.description like '{\"trellis_capture\":1,%') c \
-                 where c.j ->> 'table' is not null) \
+                 where c.j ->> 'table' is not null), \
+             covered as ( \
+                 select d.relid from (select distinct name from recorded) x \
+                 join pg_catalog.pg_namespace kn \
+                   on kn.nspname = pg_catalog.split_part(x.name, '.', 1)::name \
+                 join pg_catalog.pg_class k \
+                   on k.relnamespace = kn.oid \
+                  and k.relname = pg_catalog.split_part(x.name, '.', 2)::name \
+                 cross join pg_catalog.pg_partition_tree(k.oid) d), \
+             pending as ( \
+                 select d.relid from pg_catalog.pg_inherits i \
+                 cross join pg_catalog.pg_partition_tree(i.inhrelid) d \
+                 where i.inhdetachpending) \
              select name from recorded \
              union \
              select n.nspname::text || '.' || r.relname::text \
-             from pg_catalog.pg_trigger t \
-             join pg_catalog.pg_class r on r.oid = t.tgrelid \
+             from pg_catalog.pg_class r \
              join pg_catalog.pg_namespace n on n.oid = r.relnamespace \
-             where t.tgname = any($2) and not t.tgisinternal \
-               and not exists ( \
-                   select 1 from pg_catalog.pg_partition_ancestors(r.oid) a \
-                   join pg_catalog.pg_inherits i on i.inhrelid = a.relid \
-                   where i.inhdetachpending) \
-               and not (r.relispartition and exists ( \
-                   select 1 from recorded x \
-                   join pg_catalog.pg_partition_ancestors(r.oid) a on true \
-                   join pg_catalog.pg_class k on k.oid = a.relid \
-                   join pg_catalog.pg_namespace kn on kn.oid = k.relnamespace \
-                   where x.name = kn.nspname::text || '.' || k.relname::text))",
+             where r.oid in ( \
+                   select t.tgrelid from pg_catalog.pg_trigger t \
+                   where t.tgname = any($2) and not t.tgisinternal) \
+               and r.oid not in (select relid from pending) \
+               and not (r.relispartition and r.oid in (select relid from covered))",
             &[(&schema, Type::TEXT), (&triggers, Type::TEXT_ARRAY)],
         )
         .await?
