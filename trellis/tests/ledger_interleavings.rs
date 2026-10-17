@@ -280,9 +280,7 @@ async fn exp2_2b_one_to_one() {
 /// Exp 2 scenario 3 (#321): C moves key 1 from group 1 to group 2 and
 /// commits; a Re-derive of keys 1 and 2 (both groups) drains before C's own
 /// batch, which drains after. C must not be counted twice.
-#[tokio::test]
-async fn exp2_3_aggregate() {
-    let flavour = Flavour::Aggregate;
+async fn exp2_3(flavour: Flavour) {
     let mut d = start(flavour, &[(1, 1, 10), (2, 1, 5), (3, 2, 7)]).await;
     write(&d, "update public.src set g = 2, v = 20 where id = 1").await;
     let c_batch = d.seal().await;
@@ -291,6 +289,26 @@ async fn exp2_3_aggregate() {
     d.drain(r_batch, "a").await;
     d.drain(c_batch, "b").await;
     assert_oracle(&mut d, flavour).await;
+}
+
+#[tokio::test]
+async fn exp2_3_aggregate() {
+    exp2_3(Flavour::Aggregate).await;
+}
+
+#[tokio::test]
+async fn exp2_3_aggregate_avg() {
+    exp2_3(Flavour::AggregateAvg).await;
+}
+
+#[tokio::test]
+async fn exp2_3_aggregate_min_max() {
+    exp2_3(Flavour::AggregateMinMax).await;
+}
+
+#[tokio::test]
+async fn exp2_3_one_to_one() {
+    exp2_3(Flavour::OneToOne).await;
 }
 
 // ------------------------------------------------------------------ exp 2, 4
@@ -354,9 +372,7 @@ async fn concurrent_group_writes(
 /// parallel: one drain's bulk group `update` against another's new-group
 /// `insert ... on conflict`, each waiting on the other's transaction. The
 /// ledger path locks entries, then groups, each in one sorted statement.
-#[tokio::test]
-async fn exp2_4_aggregate() {
-    let flavour = Flavour::Aggregate;
+async fn exp2_4(flavour: Flavour) {
     let mut d = start(flavour, &[]).await;
     let deadlocks = concurrent_group_writes(&mut d, 30, |_, r| (r % 20) as i32 + 1).await;
     assert_oracle(&mut d, flavour).await;
@@ -365,6 +381,21 @@ async fn exp2_4_aggregate() {
         "deadlocks detected while draining:\n{}",
         deadlocks.join("\n--\n")
     );
+}
+
+#[tokio::test]
+async fn exp2_4_aggregate() {
+    exp2_4(Flavour::Aggregate).await;
+}
+
+#[tokio::test]
+async fn exp2_4_aggregate_avg() {
+    exp2_4(Flavour::AggregateAvg).await;
+}
+
+#[tokio::test]
+async fn exp2_4_aggregate_min_max() {
+    exp2_4(Flavour::AggregateMinMax).await;
 }
 
 // ------------------------------------------------------------------ exp 2, 5
@@ -828,9 +859,7 @@ async fn exp2_10_one_to_one() {
 /// #389: two batches each create the same new group 7.
 /// The first worker is frozen after its group upsert, with group 7's row
 /// inserted and uncommitted; the second queues behind it. Both rows count.
-#[tokio::test]
-async fn issue_389_aggregate() {
-    let flavour = Flavour::Aggregate;
+async fn issue_389(flavour: Flavour) {
     let mut d = start(flavour, &[(1, 1, 10)]).await;
     write(&d, "insert into public.src values (10, 7, 1)").await;
     let first = d.seal().await;
@@ -850,6 +879,21 @@ async fn issue_389_aggregate() {
     a.finish().await;
     b.finish().await;
     assert_oracle(&mut d, flavour).await;
+}
+
+#[tokio::test]
+async fn issue_389_aggregate() {
+    issue_389(Flavour::Aggregate).await;
+}
+
+#[tokio::test]
+async fn issue_389_aggregate_avg() {
+    issue_389(Flavour::AggregateAvg).await;
+}
+
+#[tokio::test]
+async fn issue_389_aggregate_min_max() {
+    issue_389(Flavour::AggregateMinMax).await;
 }
 
 /// The CDC text-format image of `public.src`'s row `id`, as the go-live
@@ -899,9 +943,7 @@ async fn issue_392_one_to_one() {
 ///
 /// Before the ledger (#623 D3): z kept key 1, `(2,60,2)` against the
 /// oracle's `(2,50,1)`.
-#[tokio::test]
-async fn issue_494_aggregate() {
-    let flavour = Flavour::Aggregate;
+async fn issue_494(flavour: Flavour) {
     let mut d = start(flavour, A_Z_B).await;
     d.stage_recomputes(SRC, &["5"]).await;
     let r_batch = d.seal().await;
@@ -913,6 +955,21 @@ async fn issue_494_aggregate() {
     assert_oracle(&mut d, flavour).await;
 }
 
+#[tokio::test]
+async fn issue_494_aggregate() {
+    issue_494(Flavour::Aggregate).await;
+}
+
+#[tokio::test]
+async fn issue_494_aggregate_avg() {
+    issue_494(Flavour::AggregateAvg).await;
+}
+
+#[tokio::test]
+async fn issue_494_aggregate_min_max() {
+    issue_494(Flavour::AggregateMinMax).await;
+}
+
 /// #539: a burst of new groups, 8 workers at once: every one of 4 batches
 /// of 320 rows creates 20 groups no batch before it touched. No worker
 /// deadlocks.
@@ -921,9 +978,7 @@ async fn issue_494_aggregate() {
 /// parallel: one drain's bulk group `update` against another's new-group
 /// `insert ... on conflict`, each waiting on the other's transaction. The
 /// ledger path locks entries, then groups, each in one sorted statement.
-#[tokio::test]
-async fn issue_539_aggregate() {
-    let flavour = Flavour::Aggregate;
+async fn issue_539(flavour: Flavour) {
     let mut d = start(flavour, &[]).await;
     let deadlocks =
         concurrent_group_writes(&mut d, 4, |round, r| round * 20 + (r % 20) as i32 + 1).await;
@@ -933,6 +988,21 @@ async fn issue_539_aggregate() {
         "deadlocks detected while draining:\n{}",
         deadlocks.join("\n--\n")
     );
+}
+
+#[tokio::test]
+async fn issue_539_aggregate() {
+    issue_539(Flavour::Aggregate).await;
+}
+
+#[tokio::test]
+async fn issue_539_aggregate_avg() {
+    issue_539(Flavour::AggregateAvg).await;
+}
+
+#[tokio::test]
+async fn issue_539_aggregate_min_max() {
+    issue_539(Flavour::AggregateMinMax).await;
 }
 
 /// #550: key 1 is quarantined. It moves a → z (C1); a Re-derive of z counts
