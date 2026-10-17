@@ -6576,15 +6576,15 @@ async fn to_col_cardinality_in_txn(
 /// [`super::partition_tree::PartitionTree::refusal`] (ADR-0017). Capture is
 /// installed on every node of the tree and stages each write once under the
 /// root's identity, and nothing for a table that has left the tree. That is
-/// not enough to serve a definition: `ATTACH`, `DETACH` and `DROP` of a
-/// partition change the root's rows without a write the triggers see, and a
-/// leaf or middle `TRUNCATE` stages the root's truncate sentinel, which
+/// not enough to serve a definition on its own: `ATTACH`, `DETACH` and `DROP`
+/// of a partition change the root's rows without a write the triggers see, and
+/// a leaf or middle `TRUNCATE` stages the root's truncate sentinel, which
 /// empties the whole target. The reconcile pass detects the lifecycle changes
 /// and queues a correction request for each ([`crate::capture::partitions`],
-/// P3), but nothing consumes the queue yet (the correction engine, P4, and the
-/// node-named `TRUNCATE`), so the definition would count wrongly until a
-/// rebuild. Until then the pass still treats a partitioned root as a table in
-/// a hierarchy and pauses its readers.
+/// P3), the seal queues one for a node-named `TRUNCATE` (P5), and the
+/// correction engine consumes the queue (P4). The gate stays closed until the
+/// remaining phases land; until then the pass still treats a partitioned root
+/// as a table in a hierarchy and pauses its readers.
 /// While this is `false`, [`accept_partitioned`] refuses every servable tree
 /// with [`CatalogError::PartitionedSourceNotCaptured`], after every shape
 /// check, so a refusal for the shape still names its column.

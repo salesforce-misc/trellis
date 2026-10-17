@@ -165,8 +165,11 @@ async fn clauses(client: &Client, ty: &Ty, kind: &str) -> Vec<String> {
     }
 }
 
-/// The key column's recorded type and collation, as `capture::partitions`
-/// records them.
+/// The key column's type and its level's `partcollation`, read from the
+/// catalog. `capture::partitions` records two collations per key (the type's
+/// own `typcollation`, and the level's); this helper sets both fields to the
+/// level's, which is enough for the keys these tests use because each presents
+/// its values under the collation the level compares by.
 async fn recorded_key(client: &mut Client, table: &str, column: &str) -> Key {
     let txn = client.transaction().await.expect("begin");
     txn.batch_execute(&pinned_settings()).await.expect("pin");

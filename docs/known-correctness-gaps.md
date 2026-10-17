@@ -93,23 +93,23 @@ These are the tools the entries refer to:
 
 | # | Trigger | Silent? | Detected? | Planned work |
 |---|---|---|---|---|
-| 1 | `ALTER COLUMN … TYPE … USING` that rewrites values | yes | `self_check` (1-1 targets only) | #703, study pending |
-| 2 | A column dropped and re-added under the same name | yes | `self_check` (1-1 targets only) | #703, study pending |
+| 1 | `ALTER COLUMN … TYPE … USING` that rewrites values | yes | `self_check` (1-1 targets only) | #703, study pending; #1104 bounds it for aggregates |
+| 2 | A column dropped and re-added under the same name | yes | `self_check` (1-1 targets only) | #703, study pending; #1104 bounds it for aggregates |
 | 3 | A source key re-collated while a `self_check` job runs | the job can skip or repeat keys | no | none filed |
-| 5 | Capture switched off and back on, or the table attached to a hierarchy and detached, between two reconcile passes | yes | no | #707, study pending |
-| 6 | A capture function body replaced by hand | yes | not by the audit | #707, study pending |
+| 5 | Capture switched off and back on, or the table attached to a hierarchy and detached, between two reconcile passes | yes | no | #707, study pending; #1104 bounds it for aggregates |
+| 6 | A capture function body replaced by hand | yes | not by the audit | #707, study pending; #1104 bounds it for aggregates |
 | 8 | Hand edits to a target table | yes | `self_check` (1-1 targets only) | none; documented |
-| 9 | An application trigger re-keying a parent's join column within the statement | yes | no | #788, decision pending |
+| 9 | An application trigger re-keying a parent's join column within the statement | yes | no | removed by #1115 |
 | 10 | `REGEXP_COUNT` on `"C"`-collated data or with Postgres-only regex syntax | yes | `self_check` (1-1 targets only) | #643, with #575 |
 | 11 | Row-level security applying to a role Trellis runs as | only capture, for the ring owner, until the next reconcile pass; elsewhere reads and writes fail | drain, discharge, catch-up and build merge: pause what they reach; one the catalog can't pin shows on `drain_failure` (drain) or `backfill_failure` (discharge, catch-up), or, for a build merge, pauses on its fifth charge with the error on `capture_failure`; build chunk: `backfill_failure` | none |
 | 12 | A crash empties an unlogged source table | yes | no | none filed |
 | 13 | Partial restore, or a schema-only load (`db:schema:load`, `ecto.load`) | partial restore silent; schema load loud | schema load of a plain dump: on define | none |
-| 15 | A from-side change pending across a to-side `TRUNCATE` | yes | no | #624, test ignored |
-| 16 | `self_check` audits 1-1 targets only | yes | n/a | none filed |
+| 15 | A from-side change pending across a to-side `TRUNCATE` | yes | no | removed by #1115 |
+| 16 | `self_check` audits 1-1 targets only | yes | n/a | #1104 (aggregates), #1112 (JOIN targets) |
 | 17 | `DROP TYPE` of an enum a live definition references | no (later introspection fails) | at failure only | none filed |
 | 18 | `jsonb_agg`, `array_agg` and `string_agg` element order differs between recomputes | yes | no | none filed |
 | 19 | A paused column doesn't pause the aggregates that read it | yes | on the upstream only | none filed |
-| 21 | A to-one relationship field keeps a superseded parent value under concurrent writes (rare) | yes | no | #892 |
+| 21 | A to-one relationship field keeps a superseded parent value under concurrent writes (rare) | yes | no | removed by #1115 |
 | 22 | A column read only as a field moved to another type family (`integer` → `double precision`, `numeric` ↔ `double precision`) | a value rounded into the old type is silent; other writes fail | at failure; `self_check` (1-1 targets only) | none filed |
 | 23 | A value padded with spaces past a widened `varchar`'s old length, drained before Trellis re-types its copy | yes | `self_check` (1-1 targets only) | none filed |
 | 24 | A trigger or constraint refusing a change only when two separate pairs of definitions apply it | no (the drain fails) | `drain_failure` and `self_check` | none |
@@ -309,12 +309,7 @@ behaviour:
 (aggregate) and
 `a_nested_rekey_of_a_non_key_to_col_clears_the_committed_projection` (1-1).
 
-**Planned work:** #788 needs a design decision. The options are:
-
-* have the fold pick its old image from the outer write;
-* have capture record the outer pre-image;
-* leave it to milestone E (#624);
-* document it as unsupported.
+**Planned work:** #1115 removes relationships, which removes this gap.
 
 **Repair:** `PAUSE`/`RESUME` the definitions that read through the
 relationship, or `request_backfill` the child table. Avoid triggers that re-key
@@ -499,8 +494,7 @@ value. This is silent.
 `a_from_side_change_pending_across_a_to_side_truncate_leaves_no_stale_group`
 (`trellis/tests/apply_relationships.rs`).
 
-**Planned work:** milestone E (#624), whose interleaving tests include this
-shape (#528).
+**Planned work:** #1115 removes relationships, which removes this gap.
 
 **Repair:** `PAUSE`/`RESUME` the aggregate.
 
@@ -517,8 +511,8 @@ target is compared with a recompute, so a stale value in one is silent.
 **Detected?** Not applicable. Each entry's "Detected?" line says `self_check`
 only for plain 1-1 targets.
 
-**Planned work:** none filed. ADR-0013 names aggregates and relationships as
-the next scope.
+**Planned work:** #1104 adds `self_check` for aggregate targets and #1112 for
+JOIN targets. #1115 removes relationships.
 
 **Repair:** compare the target with your own query of the source, or
 `PAUSE`/`RESUME` it when you suspect a divergence.
@@ -599,15 +593,7 @@ the child corrects it.
 **Detected?** No. `self_check` doesn't compare a 1-1 target with a field read
 through a relationship (entry 16).
 
-**Planned work:** #892. The page finds the parent's children to re-derive
-before it commits (for a `TRUNCATE`, in its own transaction just after it
-clears the projection). A child that joins the parent after that read is not
-among them, and its own write reads the projection without waiting for the
-page, so it reads the value from before the change. The fix needs a design
-call: the page would lock the parents its rows join before it evaluates
-them, or check the parent's row there and stage the child again when it
-moved. Milestone E (#624) replaces the relationship projection a 1-1
-target reads its to-one values from.
+**Planned work:** #1115 removes relationships, which removes this gap.
 
 **Repair:** any later write to the child. `request_backfill` of the parent
 table also repairs it: its catch-up refreshes the relationship projection
