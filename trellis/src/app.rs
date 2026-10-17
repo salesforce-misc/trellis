@@ -822,7 +822,7 @@ impl Trellis {
                 if !capture_failed
                     && (stored == TransformStatus::WaitingToBackfill || row.get("awaiting_capture"))
                 {
-                    holdup = self.capture_holdup(&*txn, row.get(2)).await?;
+                    holdup = self.capture_holdup(&*txn, row.get(1), row.get(2)).await?;
                 }
                 // #817: a page the drain keeps failing on, charged to no one,
                 // holds back every definition still applying what it reads.
@@ -872,11 +872,13 @@ impl Trellis {
     /// What holds up the capture a definition sourced from `source_table`
     /// waits on (issue #622 C5, #687): the lock wait, then the other
     /// failure, that the staging worker's latest pass recorded in
-    /// `capture_holdups` for the source, or for the to-side of a relationship
-    /// declared on it. The staging worker may run in any process.
+    /// `capture_holdups` for the source, for a `JOIN`'s joined table (#1107),
+    /// or for the to-side of a relationship declared on the source. The
+    /// staging worker may run in any process.
     async fn capture_holdup(
         &self,
         client: &impl tokio_postgres::GenericClient,
+        definition_id: i64,
         source_table: &str,
     ) -> Result<(Option<CaptureWait>, Option<CaptureFailure>), TrellisError> {
         let rows = client
@@ -886,11 +888,14 @@ impl Trellis {
                  from capture_holdups h \
                  join (select $1::text as t, 0::bigint as ord \
                        union all \
+                       select join_table, 0 from transform_definitions \
+                       where id = $2 and join_table is not null \
+                       union all \
                        select to_schema || '.' || to_table, id from relationship_definitions \
                        where from_schema || '.' || from_table = $1) read \
                    on read.t = h.table_name \
-                 order by read.ord",
-                &[&source_table],
+                 order by read.ord, read.t",
+                &[&source_table, &definition_id],
             )
             .await?;
         let wait = rows.iter().find_map(|row| {

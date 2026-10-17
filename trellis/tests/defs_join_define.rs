@@ -325,6 +325,29 @@ async fn a_join_registers_both_tables_and_waits_to_be_built() {
     assert_eq!(summaries.len(), 1);
     assert_eq!(summaries[0].status, TransformStatus::WaitingToBackfill);
 
+    // A lock wait on the joined table's capture, as a pass records one, is
+    // what the waiting JOIN reports it waits on, as for its FROM table.
+    raw.batch_execute(
+        "insert into capture_holdups \
+             (table_name, since, operation, lock_mode, observed_at, blockers) \
+         values ('public.items', now(), 'install', 'ShareRowExclusiveLock', now(), '{}')",
+    )
+    .await
+    .expect("record a lock wait");
+    let reported = trellis
+        .status("by_region")
+        .await
+        .expect("status")
+        .expect("defined");
+    assert_eq!(
+        reported.capture_wait.map(|wait| wait.table).as_deref(),
+        Some("public.items"),
+        "the joined table's capture holds the JOIN up"
+    );
+    raw.batch_execute("delete from capture_holdups")
+        .await
+        .expect("clear the lock wait");
+
     // The catalog row names both tables, with each side's column types.
     let row = raw
         .query_one(
@@ -419,6 +442,10 @@ async fn a_join_registers_both_tables_and_waits_to_be_built() {
     // A staging-worker pass captures both tables, each imaged with the
     // columns the definition reads from it, and builds nothing: the JOIN
     // stays waiting, with no backfill marker parked for it.
+    // The first pass installs both captures, and the joined table's install
+    // gate holds the JOIN back; the second finds it ready, so it is the one
+    // that would start or dispatch a build if anything took a JOIN.
+    pass(&mut raw, &db.pool).await;
     pass(&mut raw, &db.pool).await;
     for (table, columns) in [
         ("public.orders", vec!["id", "region", "total"]),
@@ -669,4 +696,54 @@ async fn a_column_lost_or_retyped_on_either_table_pauses_the_whole_join() {
             "{break_it}"
         );
     }
+}
+
+/// A JOIN may read another definition's target as either table. That
+/// target's drop is refused while the JOIN stands, as it is for a
+/// definition reading it as its `FROM`: the `join` edge counts.
+#[tokio::test]
+async fn a_target_a_join_reads_cannot_be_dropped_under_it() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    raw.batch_execute(ORDERS_ITEMS).await.expect("seed");
+    let trellis = define_only(db.dsn()).await;
+    trellis
+        .apply(
+            "TRANSFORM line_totals FROM items GROUP BY order_id \
+             SELECT order_id AS order_id, SUM(qty) AS qty",
+        )
+        .await
+        .expect("define the upstream aggregate");
+    trellis::intake::markers::settle_registrations(&db.pool).await;
+    assert_eq!(
+        status(&trellis, "line_totals").await,
+        Some(TransformStatus::Live)
+    );
+    trellis
+        .apply(
+            "TRANSFORM by_region FROM orders JOIN line_totals \
+             ON orders.id = line_totals.order_id GROUP BY orders.region \
+             SELECT orders.region AS region, SUM(line_totals.qty) AS qty",
+        )
+        .await
+        .expect("define a JOIN over the upstream's target");
+
+    trellis
+        .apply("PAUSE TRANSFORM line_totals")
+        .await
+        .expect("pause the upstream");
+    let err = trellis
+        .apply("DROP TRANSFORM line_totals")
+        .await
+        .expect_err("a JOIN still reads the target");
+    assert!(err.to_string().contains("by_region"), "{err}");
+    assert_eq!(
+        count(
+            &raw,
+            "select count(*) from pg_catalog.pg_class where relname = 'line_totals'"
+        )
+        .await,
+        1
+    );
 }

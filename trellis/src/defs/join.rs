@@ -111,6 +111,19 @@ pub(crate) fn side_columns(def: &TransformDef, side: Side) -> BTreeSet<String> {
     columns
 }
 
+/// Whether `expr`, one of `def`'s field expressions, reads `side`'s
+/// `column`.
+pub(crate) fn expr_reads(def: &TransformDef, expr: &Expr, side: Side, column: &str) -> bool {
+    let Some(join) = spec(def) else {
+        return false;
+    };
+    let mut reads = false;
+    walk_columns(expr, &mut |c| {
+        reads |= c.column == column && side_of_written(def, join, &c.table) == Some(side);
+    });
+    reads
+}
+
 fn walk_columns(expr: &Expr, visit: &mut impl FnMut(&QualifiedColumn)) {
     match expr {
         Expr::SourceColumn {

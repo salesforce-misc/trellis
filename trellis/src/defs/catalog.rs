@@ -952,6 +952,7 @@ pub async fn create_definition(
     source_text: &str,
     source_columns: &HashMap<String, ValueType>,
 ) -> Result<Definition, CatalogError> {
+    refuse_join_fixture(source_text);
     let mut definition = create_definition_inner(
         pool,
         source_text,
@@ -1000,6 +1001,7 @@ pub async fn create_definition_without_backfill(
     source_text: &str,
     source_columns: &HashMap<String, ValueType>,
 ) -> Result<Definition, CatalogError> {
+    refuse_join_fixture(source_text);
     // `pool.target_schema()` — see [`create_definition`]'s own doc comment
     // for why this entry point reads it off `pool` rather than taking its own
     // `target_schema` parameter.
@@ -1012,6 +1014,20 @@ pub async fn create_definition_without_backfill(
         None,
     )
     .await
+}
+
+/// The test fixtures above flip what they register `live` without a build,
+/// and nothing builds or maintains a `JOIN` target yet (J3 #1108, J4 #1109):
+/// a `JOIN` reaches `live` through no path until then (#1107), so they refuse
+/// one. Text that doesn't parse is left to the fixture's own error.
+#[cfg(any(test, feature = "test-util"))]
+fn refuse_join_fixture(source_text: &str) {
+    if let Ok(def) = parse(source_text) {
+        assert!(
+            !matches!(def.key_space, KeySpace::Join(_)),
+            "a JOIN definition can't be registered `live`: nothing builds one yet"
+        );
+    }
 }
 
 /// The front door real callers use to stand up a new definition (issue #63
@@ -9162,7 +9178,7 @@ async fn column_dependents_via(
             // the same transform depending on whether a row was reached
             // directly or via cascade.
             "select split_part(target_table, '.', 2), definition_text, source_table, \
-                    target_table, grammar_version \
+                    target_table, grammar_version, join_table \
              from transform_definitions",
             &[],
         )
@@ -9208,6 +9224,8 @@ async fn column_dependents_via(
         // The definition's qualified source: what it reads directly, and what
         // its relationship paths resolve against (issue #288).
         let qualified_source: String = row.get(2);
+        // A `JOIN`'s joined table, which it reads directly too (#1107).
+        let joined: Option<String> = row.get(5);
         // A definition already persisted here is expected to always re-parse
         // (the same assumption every other read path in this module makes);
         // skip rather than fail this best-effort lineage scan on the
@@ -9226,6 +9244,7 @@ async fn column_dependents_via(
             Err(e @ ParseError::GrammarVersionTooNew { .. })
                 if !only_one_to_one
                     && (qualified_source == qualified_upstream
+                        || joined.as_deref() == Some(qualified_upstream.as_str())
                         || rel_to_table.iter().any(|((from, _), to)| {
                             *from == qualified_source && *to == qualified_upstream
                         })) =>
@@ -9235,6 +9254,31 @@ async fn column_dependents_via(
             Err(_) => continue,
         };
         if only_one_to_one && !matches!(def.key_space, KeySpace::OneToOne) {
+            continue;
+        }
+        // #1107: a `JOIN` names every column by its table, and reads no
+        // relationship. It reads the upstream column through whichever side
+        // is the upstream table: in a field, or in its `ON` or `GROUP BY`
+        // (named by that column, which a `GROUP BY` key's target column is).
+        if super::join::spec(&def).is_some() {
+            for (side, table) in [
+                (super::join::Side::From, Some(&qualified_source)),
+                (super::join::Side::Joined, joined.as_ref()),
+            ] {
+                if table != Some(&qualified_upstream) {
+                    continue;
+                }
+                let mut named = false;
+                for field in &def.fields {
+                    if super::join::expr_reads(&def, &field.expr, side, upstream_column) {
+                        deps.push((target.clone(), field.name.clone()));
+                        named = true;
+                    }
+                }
+                if !named && super::join::side_columns(&def, side).contains(upstream_column) {
+                    deps.push((target.clone(), upstream_column.to_string()));
+                }
+            }
             continue;
         }
         for field in &def.fields {
@@ -9327,6 +9371,18 @@ fn expr_references_column(
 #[cfg(test)]
 mod go_live_tests {
     use super::*;
+
+    /// #1107: the fixtures that flip a definition `live` without a build
+    /// refuse a `JOIN`, which nothing builds yet; any other shape passes.
+    #[test]
+    #[should_panic(expected = "a JOIN definition can't be registered `live`")]
+    fn the_live_fixtures_refuse_a_join() {
+        refuse_join_fixture("TRANSFORM t FROM orders SELECT id AS id");
+        refuse_join_fixture(
+            "TRANSFORM t FROM orders JOIN items ON orders.id = items.order_id \
+             GROUP BY orders.region SELECT COUNT(*) AS n",
+        );
+    }
 
     #[tokio::test]
     async fn only_a_still_backfilling_definition_starts_catching_up() {
@@ -9497,6 +9553,55 @@ mod column_dependents_tests {
                 ("via_rel".to_string(), "a_t".to_string()),
             ]
         );
+    }
+
+    /// #1107: a `JOIN` reads an upstream target's column through whichever
+    /// of its tables the target is, in a field or in its `ON` or `GROUP BY`,
+    /// so dropping that field is refused. A column of the other table that
+    /// only shares the name isn't a read of the target's.
+    #[tokio::test]
+    async fn a_join_reads_a_target_column_through_either_of_its_tables() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let client = db.pool.get().await.expect("acquire connection");
+        client
+            .batch_execute(
+                "insert into source_table_versions (source_table, version) \
+                 values ('public.s', 1), ('public.t', 1), ('public.orders', 1), \
+                        ('public.items', 1); \
+                 insert into transform_definitions \
+                 (target_table, source_table, source_version, definition_text, status, \
+                  join_table, join_columns) \
+                 values \
+                 ('public.t', 'public.s', 1, \
+                  'TRANSFORM t FROM s SELECT a AS a, b AS b, k AS k', 'live', null, null), \
+                 ('public.j_joined', 'public.orders', 1, \
+                  'TRANSFORM j_joined FROM orders JOIN t ON orders.id = t.k \
+                   GROUP BY t.b SELECT t.b AS b, SUM(t.a) AS total', \
+                  'waiting_to_backfill', 'public.t', '{}'), \
+                 ('public.j_from', 'public.t', 1, \
+                  'TRANSFORM j_from FROM t JOIN items ON t.k = items.id \
+                   GROUP BY items.sku SELECT items.sku AS sku, SUM(items.a) AS a_sum', \
+                  'waiting_to_backfill', 'public.items', '{}')",
+            )
+            .await
+            .expect("seed definitions");
+
+        for (column, expected) in [
+            ("a", vec![("j_joined", "total")]),
+            ("b", vec![("j_joined", "b")]),
+            ("k", vec![("j_from", "k"), ("j_joined", "k")]),
+        ] {
+            let mut deps = column_dependents_any_keyspace(&**client, "t", column)
+                .await
+                .expect("column dependents");
+            deps.sort();
+            let expected: Vec<(String, String)> = expected
+                .into_iter()
+                .map(|(t, f)| (t.to_string(), f.to_string()))
+                .collect();
+            assert_eq!(deps, expected, "t.{column}");
+        }
     }
 
     /// Issue #955: the cascade's per-pair re-check, [`reads_column`], says
