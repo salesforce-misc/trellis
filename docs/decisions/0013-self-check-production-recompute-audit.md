@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: draft
 date: 2026-10-17
 deciders: Michael Ries
 ---

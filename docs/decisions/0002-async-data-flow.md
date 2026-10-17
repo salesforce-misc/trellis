@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: draft
 date: 2026-10-17
 deciders: Michael Ries
 ---
@@ -392,12 +392,20 @@ R4 restates I4, R7 is I5, and R9 is the truncate barrier.
 ### The admitted aggregates are the ones partials keep exact
 
 - **Must:** a plain aggregate, or a JOIN transform
-  ([ADR-0019](0019-join-transforms.md)), admits exactly these aggregates,
-  each over a single column (no expression arguments), from the source or
-  from either side of a JOIN:
-  - `COUNT(*)` and `COUNT(col)`, of any column type;
+  ([ADR-0019](0019-join-transforms.md)), admits exactly these aggregates:
+  - `COUNT(*)` and `COUNT(col)`;
   - `SUM(col)` and `AVG(col)`, where `col` is `int2`, `int4`, `int8`, or
     `numeric(p,s)` with a declared scale (next section).
+- **Must:** an argument is a column or an expression over one row's
+  columns in the transform grammar (`SUM(a + b)`, `COUNT(<expr>)`), as long
+  as its result type is admitted. The group basis evaluates it on each
+  change's old and new images, so its delta is `f(new) − f(old)`, exactly
+  as for a column. On a JOIN an argument may use only one side's columns; an
+  argument mixing both sides is refused at define.
+- **Must:** a field may compose admitted aggregates (`SUM(a) + COUNT(b)`,
+  `COALESCE(SUM(a), 0)`). It is computed from the group's partials whenever
+  the group's row is written. Neither expression arguments nor composed
+  fields change lock order or apply order.
 - **Must:** result types match Postgres: `count` is `bigint`,
   `sum(int2|int4)` is `bigint`, `sum(int8|numeric)` is `numeric`, and `avg`
   is `numeric`.
@@ -470,7 +478,7 @@ is additive, so it can come later without changing this rule.
 ### Absolute group writes lock first and cover every group they could owe
 
 The producers of absolute group writes are a build or rebuild, a
-quarantine release, a partition correction
+quarantine release that recomputes its groups, a partition correction
 ([ADR-0017](0017-partitioned-sources.md)) and the recompute of a group an
 image-less change names.
 
@@ -511,6 +519,17 @@ exact.
   in the target only while its row count is above 0, and is written in the
   same transaction as the partials. Nothing else filters, orders or checks
   what readers see.
+- **Must:** the target is a plain table in the schema the user named,
+  holding exactly the declared columns and the `UNIQUE NULLS NOT DISTINCT`
+  group identity, with no partial columns, so users can query, join and
+  index it, and a chained reader finds its key through the constraint. The
+  partials, basis and stamp of every group, zero groups and transiently
+  negative ones included, live in a hidden table in the instance's catalog
+  schema, named by definition id. Readers get no grant on it, and its shape
+  is internal. A page writes the hidden row, then the visible row, for each
+  group it touches, and skips the visible write when no visible value
+  changed. A drop removes the hidden table by definition id; a resume drops
+  and recreates it.
 - **The contract:** before `await_converged`, aggregate values may be
   inconsistent, including combinations no source state could produce;
   after it they are exact. In my model, draining every batch up to a cut
@@ -697,12 +716,15 @@ it adds its region's partials to the groups as increments.
 - **Must:** a source truncate's page resets every chunk whose snapshot saw
   the truncate to not-run ([Truncate](#truncate-ddl-drop)).
 - **Must:** over a source keyed by nullable columns (another aggregate's
-  target), the plan covers the rows whose key has a `NULL` part, which no
-  key range holds.
+  target), the build counts the rows whose key has a `NULL` part, which no
+  key range holds. [OPEN: how, for example a recompute of their groups
+  after the walk. Decided with the recompute producers in #1102.]
 - **Must:** a rebuild over a target that already has groups
-  (`request_backfill`, a capture re-install) recomputes the groups in sorted
-  batches, each an absolute write under R1, R5, R6 and R8, and covers the
-  target's own groups; the target stays readable and applying throughout.
+  (`request_backfill`, a capture re-install) does not pause the definition,
+  and is an absolute write under R1, R5, R6 and R8 that covers the target's
+  own groups. [OPEN: how it replaces the existing groups while pages keep
+  applying, and what readers see meanwhile. Decided with the build plan in
+  #1101.]
 
 *Evidence:* in my model, chunk builds with recomputes, garbage collection
 and retirement, by one runner and by eight, were exact in every soak run.
@@ -795,8 +817,9 @@ exact with pages applying throughout.]
   plan and sweep jobs, so the status already reads `backfilling` when the
   call returns). The only repair that is not a rebuild is a quarantine
   release (`release_key`): on a 1-1 target a per-key Re-derive (a staged
-  `Recompute`) of the one key; on an aggregate, a replay of the key's parked
-  images or a recompute of the groups they and the key's live row name. A
+  `Recompute`) of the one key. [OPEN: a release on an aggregate, either
+  restaging the key's exact images or recomputing its groups. Decided with
+  quarantine under the group basis in #1102.] A
   repair a caller waits on is therefore visible in the status, never parked
   where only the repair knows it hasn't run.
 
@@ -907,10 +930,9 @@ A group-basis or JOIN reader needs exact images, as capture gives a source.
   the write token. The old image comes from the writer's own read under its
   lock (a delete's from its `RETURNING`), the new image from a re-read by
   key, and the `row_txid` is the writer's transaction, which orders the
-  change against the reader's bases. Every write to the target stages them:
-  an Apply, a recompute, a build chunk, a truncate's wipe and a GC delete.
-  An upstream group whose row count is not above 0 has no row, so it
-  appears in the images as absent, and the reader's sums telescope.
+  change against the reader's bases. An upstream group whose row count is
+  not above 0 has no visible row, so it appears in the images as absent,
+  and the reader's sums telescope.
 - **Must (one feed per target):** if any reader needs images, the target
   stages images, and its 1-1 readers consume the same rows. A target whose
   readers are all 1-1 may stage key-only `Recompute` rows. A target with no
@@ -928,9 +950,10 @@ A group-basis or JOIN reader needs exact images, as capture gives a source.
   deterministic test freezes such a writer between its check and its
   commit.
 - **The chains this serves:** 1-1 over a 1-1 or aggregate target; an
-  aggregate over a 1-1 target (the computed-measure pattern: aggregate
-  arguments are single columns, so a computed value is aggregated through a
-  1-1 transform that computes it); an aggregate over an aggregate target (a
+  aggregate over a 1-1 target (the computed-measure pattern: a 1-1
+  transform computes what an aggregate argument can't express, since the
+  grammar has no `*` or `/`, and an aggregate then sums it); an aggregate
+  over an aggregate target (a
   rollup); and a JOIN side that is a target.
 - **Cost to state.** A target with an aggregate or JOIN reader pays a
   re-read by key per changed key and wider staged rows. A terminal target
