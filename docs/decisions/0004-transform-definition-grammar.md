@@ -1,6 +1,6 @@
 ---
 status: accepted
-date: 2026-08-20
+date: 2026-10-17
 deciders: Michael Ries
 ---
 
@@ -31,9 +31,10 @@ are enforced by *which* grammar applies rather than one validator branching on
 context:
 
 * **Key-space** — the granularity definition, which decides the target's
-  primary key: a `GROUP BY` list for aggregates, a join condition and type for
-  cross-joins, nothing for 1-1. Tiny and closed. Enforces that aggregate columns
-  are wrapped in an aggregate function and cross-join columns are side-qualified.
+  primary key: a `GROUP BY` list for aggregates, a join clause plus a
+  `GROUP BY` list for JOIN transforms, nothing for 1-1. Tiny and closed.
+  Enforces that aggregate columns are wrapped in an aggregate function and a
+  JOIN transform's columns are side-qualified.
 * **Calculated-field expressions** — the scalar-expression language, reused for
   every calculated field.
 * **Partial-data predicate** — the same expression grammar with a `-> bool`
@@ -151,10 +152,31 @@ shape:
   separate aggregate-function registry. `COUNT(*)` and
   `COUNT(<expr>)` (counts non-null occurrences of `<expr>`, a
   different Postgres semantic from `COUNT(*)`) are both supported.
-* `JOIN <other> ON <cond> [INNER|LEFT|RIGHT]` for cross-join is recognized and
-  rejected by name; cross-join, and the notation for qualifying columns by join side, remain out of scope. Relationship reference
-  syntax is defined with the relationship feature — see
-  [0006-relationships](0006-relationships.md).
+* `[INNER | LEFT] JOIN <other> ON <cond>` between `FROM <source>` and a
+  required `GROUP BY` makes a JOIN transform
+  ([0019-join-transforms](0019-join-transforms.md)):
+
+  ```text
+  TRANSFORM <target>
+  FROM <a> [INNER | LEFT] JOIN <b> ON <a>.<col> = <b>.<col> [AND ...]
+  GROUP BY <side>.<col>[, <side>.<col>...]
+  SELECT <side>.<col> AS <field>, <aggregate>(<side>.<col>) AS <field> [, ...]
+  ```
+
+  The join kind is SQL's prefix, and a bare `JOIN` is `INNER`. `<cond>` is one or
+  more `=` comparisons, each between a column of `a` and a column of `b`, joined
+  by `AND`. Every column reference in `ON`, `GROUP BY` and `SELECT` is qualified
+  by its side's table name, which is how a reference says which side it reads;
+  a bare name is refused. Each `GROUP BY` key becomes a target column named
+  after its bare column, as on a plain aggregate, so two keys with the same
+  column name (`a.id`, `b.id`) are refused. Aggregates take one side-qualified
+  column (or `*` for `COUNT`), from the set ADR-0019 admits.
+  `RIGHT`, `FULL`, `CROSS`, a second `JOIN`, a table joined to itself (there
+  are no table aliases), a `JOIN` with no `GROUP BY`, and an
+  `ON` that isn't a conjunction of cross-side column equalities are recognized
+  and refused by name. Relationship reference syntax is defined with the
+  relationship feature ([0006-relationships](0006-relationships.md)), which
+  JOIN transforms replace.
 
 ## Growth policy
 

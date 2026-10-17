@@ -1,6 +1,6 @@
 ---
 status: draft
-date: 2026-10-14
+date: 2026-10-17
 deciders: Michael Ries
 ---
 
@@ -20,8 +20,10 @@ detects the change and corrects it by itself, with no operator step, and every
 supported operation has a documented path that avoids the window altogether.
 
 This ADR extends [ADR-0002](0002-async-data-flow.md)'s capture and truncate
-decisions to partitioned sources. It settles which partition trees an aggregate
-or a to-many relationship can read, how capture covers them, and how the
+decisions to partitioned sources. It settles which partition trees an
+aggregate, a side of a JOIN transform
+([ADR-0019](0019-join-transforms.md)) or a to-many relationship can read, how
+capture covers them, and how the
 reconcile pass detects and corrects partition maintenance. Partitioned targets,
 inheritance hierarchies, a partition named as a source, and trees of more than
 1,000 leaves are out of scope.
@@ -31,17 +33,35 @@ inheritance hierarchies, a partition named as a source, and trees of more than
 ### A partitioned root is a source when its group key holds every partition-key column
 
 A declaratively partitioned root (`RANGE`, `LIST` or `HASH`, any depth, with or
-without a `DEFAULT`) may be an aggregate's `FROM` or a to-many relationship's
-to-side, on PostgreSQL 15+, when its `GROUP BY` (or the relationship's to-side
-join key) contains every partition-key column at every level. Targets stay plain
-tables.
+without a `DEFAULT`) may be an aggregate's `FROM`, either side of a JOIN
+transform, or a to-many relationship's to-side, on PostgreSQL 15+, when its
+group key contains every partition-key column at every level. The group key is
+an aggregate's `GROUP BY`; for a JOIN side, it is that side's partial key, the
+side's own group columns plus the join key; for a relationship, its to-side join
+key. Targets stay plain tables.
 
 With every partition-key column in the group key, each group lives in exactly
 one leaf, so a lifecycle change touches only the groups routing to one node and
-the catalog says which those are. Without it, a `DROP` needs a full source
-rescan (hours at multi-TB per retention drop) or per-leaf group bookkeeping. The
-motivating shape, `HASH` on the parent id with 32 leaves, satisfies it, so the
-restriction costs little and has no fallback.
+the catalog says which those are. Under [ADR-0002](0002-async-data-flow.md)'s
+group-level basis, a node's correction recomputes exactly those groups from the
+source; on a JOIN side, those groups are the side's partial cells, recomputed
+under the join-key locks so the change carries into the target. Because the
+join key counts, a fact table partitioned on the column it joins by needs
+nothing more in its `GROUP BY`, while one partitioned on its own id is refused.
+Without the rule, a `DROP` needs a full source rescan (hours at multi-TB per
+retention drop) or per-leaf group bookkeeping. The motivating shape, `HASH` on
+the parent id with 32 leaves, satisfies it, so the restriction costs little and
+has no fallback.
+
+Why not lift the rule by keying the partials by a hidden leaf column, so a leaf
+event deletes that leaf's cells and propagates the change? It costs up to
+leaves × cells in state and touches every group-basis structure, and stamping
+each captured image with its leaf is unmeasured. Why not recompute every group
+from the source on any leaf event? That is a full source `GROUP BY` per leaf
+event, one a day under daily retention drops, and it is untested. Either would
+lift a define-time refusal later without changing what is admitted now.
+Time-range-partitioned tables grouped coarser than their partition key (by day
+over `created_at` partitions) are refused until then.
 
 I tested every decision here against real clusters with Trellis's generated
 capture and an oracle diff after each step: the trigger and lifecycle behaviour
@@ -287,10 +307,7 @@ backfill it is.
 For `HASH` the sweep finds target groups over the missing remainders; for
 `RANGE` and `LIST`, over the gaps between the current bounds, read from
 `pg_get_expr(relpartbound)` and ordered by the key column's collation. A
-`DEFAULT` under the root means no statement. The full routing form runs, limited
-to the groups the fold changed since the last successful check, only on a pass
-where a recorded node is gone and its text is unusable. On an aggregate, the
-keys of the live ledger entries in the groups it finds are corrected through the
+`DEFAULT` under the root means no statement. On an aggregate, the keys of the live ledger entries in the groups it finds are corrected through the
 normal page path, as a node's are; on a to-many target, those parents are
 recomputed. The sweep runs in its own `READ COMMITTED` transaction: the pass
 reads the lifecycle catalog before the constraint texts, re-reads it in a new
@@ -298,13 +315,26 @@ statement after queuing the hits' correction, and rolls back and retries if the
 leaf set changed.
 
 The sweep catches a leaf created and dropped between two passes, which no
-fingerprint sees. Its full routing form cost 4.1–7.3 s per pass at 1,000 leaves
-and about 1M target rows, nearly the whole interval. The complement forms cost
-0 ms for `HASH` with nothing missing and 38 ms with two remainders missing,
-under 1 ms for `RANGE`, and 4–8 ms for `LIST`; reading the gaps took 1.9 ms. The
-changed-group fallback brought a never-recorded leaf's groups to zero diff, but
-only when the changed set survives a skipped check and the pass clears only the
-ids it read. Against the model target, without the re-read a leaf created
+fingerprint sees. Routing every target row through every bound instead cost
+4.1–7.3 s per pass at 1,000 leaves and about 1M target rows, nearly the whole
+interval. The complement forms cost 0 ms for `HASH` with nothing missing and
+38 ms with two remainders missing, under 1 ms for `RANGE`, and 4–8 ms for
+`LIST`; reading the gaps took 1.9 ms.
+
+A recorded node that is gone with an unusable text needs no routing form of its
+own. Its region is either uncovered, which the complement finds; taken by a
+`DEFAULT` sibling, whose changed sibling set queues the `DEFAULT`'s correction;
+or taken by a new or re-attached leaf, whose own correction routes by its text.
+I drove each of the three to zero diff, and six more interleavings around such a
+node (a `HASH` modulus change, a middle with some children gone, two operations
+in one interval beside a `DEFAULT`, a `DEFAULT` created as a short-lived leaf
+is dropped, a `DEFAULT` created, written and dropped, and a leaf attached,
+written and dropped) converged without one. Why not run the full routing form over the groups the
+fold changed since the last check anyway? Keeping that changed-group set durable
+would add a write to every fold of every partitioned aggregate, for a case the
+corrections above already cover.
+
+Against the model target, without the re-read a leaf created
 between the catalog read and the cleanup lost its rows for a pass; under about
 20 DDL statements a second I counted 264–308 wrongful deletes a minute without
 it and none in about 2,000 passes with it. Reading the constraint texts before
@@ -341,8 +371,8 @@ full rebuild away from the operator.
 
 ### Define refuses a shape routing can't serve, and the pass pauses one that appears later
 
-Define refuses, naming the column: a group key or to-many join key missing a
-partition-key column at some level; a key level that resolves to no columns (an
+Define refuses, naming the column: a group key, a JOIN side's partial key or a
+to-many join key missing a partition-key column at some level; a key level that resolves to no columns (an
 expression or whole-row key); a partition-key column whose type is not
 `smallint`, `integer`, `bigint`, `numeric`, `text`, `varchar`, `uuid`, `date`,
 `timestamp`, `timestamptz` or `boolean`, that uses a non-default partition
