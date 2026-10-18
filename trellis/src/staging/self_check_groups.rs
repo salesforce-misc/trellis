@@ -304,7 +304,8 @@ fn diff_groups(
     let zeros: Vec<Option<String>> = partials.iter().map(|_| Some("0".to_string())).collect();
 
     // The hidden partials against the source's. A group on one side only is
-    // all zeros on the other: the hidden table keeps a zero group's row.
+    // all zeros on the other: the hidden table keeps a zero group's row until
+    // the zero-group GC (`retire::collect_zero_groups`) deletes it.
     let keys: BTreeSet<&String> = src.keys().chain(hid.keys()).collect();
     for key in keys {
         let expected = src.get(key).unwrap_or(&zeros);
