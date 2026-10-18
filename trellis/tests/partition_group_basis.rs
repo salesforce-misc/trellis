@@ -832,6 +832,34 @@ async fn a_hash_resplit_converges() {
     assert!(fx.queue().await.is_empty());
 }
 
+/// A new `HASH` leaf's correction routes by the leaf's text, which embeds its
+/// middle's oid. A middle dropped before the correction runs makes that text
+/// raise `XX000`; the correction is complete without work instead (#1148),
+/// and the middle's own `gone_node`, queued by the next pass, recomputes the
+/// region.
+#[tokio::test]
+async fn a_new_hash_leaf_whose_middle_was_dropped_completes_without_error() {
+    let mut fx = Fx::start(&two_level(), SEED).await;
+    fx.exec("drop table public.items_m1").await;
+    fx.pass().await;
+    fx.exec(
+        "create table public.items_m1 partition of public.items_m \
+         for values with (modulus 4, remainder 1)",
+    )
+    .await;
+    fx.pass().await;
+    fx.d.settle().await;
+    assert_eq!(fx.kinds().await, ["gone_node", "new_leaf"]);
+    fx.exec("drop table public.items_m").await;
+    let outcome = fx.run().await;
+    assert_eq!(outcome.completed, 2);
+    assert!(fx.queue().await.is_empty());
+    fx.correct().await;
+    fx.assert_right("middle dropped under a queued new leaf")
+        .await;
+    assert!(fx.queue().await.is_empty());
+}
+
 // --- The complement sweep (tests/partition_sweep.rs on the group basis) ---
 
 /// `items` partitioned `kind` on `g` with leaves for the groups 0-11 only,
