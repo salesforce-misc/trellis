@@ -688,19 +688,69 @@ async fn r4_the_gc_skips_a_group_a_page_holds() {
     assert_oracle(&mut d).await;
 }
 
+/// R4, the other order: the GC has claimed and deleted zero group 1 but not
+/// committed when a page refilling it starts. The page's lock statement
+/// queues on the GC's delete, and once the GC commits it inserts the group
+/// afresh, with no basis, and applies its change to it.
+#[tokio::test]
+async fn r4_a_page_meeting_a_group_the_gc_is_deleting_inserts_it_afresh() {
+    let mut d = start().await;
+    step(&mut d, "insert into public.src values (1, 1, 10)").await;
+    step(&mut d, "delete from public.src where id = 1").await;
+    assert_eq!(partials(&d, 1).await, ["(0,0,0,f)"]);
+    let hidden = hidden(&d).await;
+    let gc = d.user().await;
+    let gc_pid: i32 = gc
+        .query_one("select pg_backend_pid()", &[])
+        .await
+        .expect("pid")
+        .get(0);
+    gc.batch_execute("begin").await.expect("begin");
+    let deleted = gc
+        .execute(
+            &format!(
+                "delete from {hidden} where ctid = any(array( \
+                     select ctid from {hidden} where __zero and __basis is null \
+                     order by g for update skip locked))"
+            ),
+            &[],
+        )
+        .await
+        .expect("the GC's delete");
+    assert_eq!(deleted, 1);
+    write(&d, "insert into public.src values (2, 1, 5)").await;
+    let refill = d.seal().await;
+    let page = d.drain_frozen(refill, "a", &[]).await;
+    d.wait_blocked_behind(gc_pid).await;
+    gc.batch_execute("commit").await.expect("commit");
+    page.finish().await;
+    assert_eq!(partials(&d, 1).await, ["(1,1,5,f)"]);
+    assert_oracle(&mut d).await;
+}
+
 // ------------------------------------------------------------- plan control
 
 /// The page's apply statement fetches the hidden rows it updates by TID and
 /// probes both tables' group identity indexes, `NULL` groups included:
 /// nothing in it scans either table whole while the page holds its groups'
-/// locks (#1100 G2b).
+/// locks (#1100 G2b). The hidden rows' TID scan is over the array of the
+/// page's `ctid`s, not a probe per row from a nested loop: on this test's
+/// tiny tables `enable_seqscan = off` alone makes the planner pick that
+/// probe (a disabled nested loop), but on a large hidden table with real
+/// statistics nothing stops it hashing the whole table instead.
 #[tokio::test]
 async fn the_apply_statement_reads_no_table_whole() {
     let d = start().await;
     let plan = trellis::dev::staging::explain_group_apply(d.pool(), "agg")
         .await
         .expect("explain");
-    assert!(plan.contains("Tid Scan on agg_"), "{plan}");
+    let lines: Vec<&str> = plan.lines().collect();
+    assert!(
+        lines
+            .windows(2)
+            .any(|w| w[0].contains("Tid Scan on agg_") && w[1].contains("TID Cond: (ctid = ANY")),
+        "{plan}"
+    );
     assert!(!plan.contains("Seq Scan on agg"), "{plan}");
 }
 
