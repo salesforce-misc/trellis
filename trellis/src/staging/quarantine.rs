@@ -527,8 +527,8 @@ impl HeldKey {
 
 /// The `on conflict` clause every park into `poison_held` ends with: merges
 /// the parked change (`excluded`) into the key's held row (`h`), as
-/// [`HeldKey::merge`] does, plus the two fields it leaves out: the union of
-/// `join_values` and the greatest `lsn`. Every right-hand side reads `h` as it was before the
+/// [`HeldKey::merge`] does, plus the three fields it leaves out: the unions
+/// of `join_values` and `agg_groups`, and the greatest `lsn`. Every right-hand side reads `h` as it was before the
 /// update, so `old_image` compares the old `seg_seq`.
 const MERGE_HELD_ROW: &str = "on conflict (transform_id, src_table, key) do update set \
          seg_seq = least(h.seg_seq, excluded.seg_seq), \
@@ -545,6 +545,11 @@ const MERGE_HELD_ROW: &str = "on conflict (transform_id, src_table, key) do upda
                                      order by 1) end, \
          join_values = array(select distinct j \
                              from unnest(h.join_values || excluded.join_values) j), \
+         agg_groups = case when h.agg_groups is null and excluded.agg_groups is null then null \
+                           else array(select distinct g \
+                                      from unnest(coalesce(h.agg_groups, '{}') \
+                                                  || coalesce(excluded.agg_groups, '{}')) g) \
+                      end, \
          lsn = greatest(h.lsn, excluded.lsn)";
 
 /// Parks `changes` — a batch's own folded contribution for keys already
@@ -604,7 +609,7 @@ pub(super) async fn park_batch_contribution(
     let statement = format!(
         "insert into poison_held as h \
              (transform_id, src_table, key, seg_seq, old_image, origin_lsn, src_changed, \
-              hop_gen, group_key, join_values, lsn) \
+              hop_gen, group_key, join_values, lsn, agg_groups) \
          select $1::bigint, $2::text, $3::text, $4::bigint, $5::text::jsonb, $6::pg_lsn, \
                 $7::timestamptz, $8::integer, $9::text[], \
                 array(select distinct j from ( \
@@ -615,11 +620,31 @@ pub(super) async fn park_batch_contribution(
                           from relationship_definitions r \
                           where r.to_schema || '.' || r.to_table = $2 \
                             and $5::text::jsonb ->> r.to_col is not null) named), \
-                $12::pg_lsn \
+                $12::pg_lsn, \
+                case when $14::text[] is not null then array( \
+                    select distinct (select jsonb_object_agg(c, i -> c) \
+                                     from unnest($14::text[]) c)::text \
+                    from unnest($13::text[]) as r(x) \
+                    cross join lateral (values (x::jsonb -> 'o'), (x::jsonb -> 'n'), \
+                                               (x::jsonb -> 'x' -> 'old'), \
+                                               (x::jsonb -> 'x' -> 'new')) as v(i) \
+                    where jsonb_typeof(i) = 'object') end \
          where exists (select 1 from poison p \
                        where p.transform_id = $1 and p.src_table = $2 and p.key = $3) \
          {MERGE_HELD_ROW}"
     );
+    // #1102: a group-basis definition keeps the groups of every image the
+    // parked change's ring rows hold (`FoldedChange::group_sides`), as
+    // objects of its `GROUP BY` columns, for the release's recompute.
+    let mut group_columns: HashMap<i64, Option<Vec<String>>> = HashMap::new();
+    for id in &ids {
+        let columns = match catalog::definition_by_id_in(txn, *id).await? {
+            Some(def) => super::group_basis::route(&def.def, &def.source_columns)
+                .map(|shape| shape.group_columns().to_vec()),
+            None => None,
+        };
+        group_columns.insert(*id, columns);
+    }
     for (transform_id, change) in ordered {
         // Issue #315: a recompute's prior-image hint rides in `old_image`,
         // exactly as it does in the ring, so `release_key` hands it on.
@@ -654,6 +679,8 @@ pub(super) async fn park_batch_contribution(
                 &columns,
                 &values,
                 &change.lsn,
+                &change.group_sides,
+                &group_columns[transform_id],
             ],
         )
         .await?;
@@ -5375,7 +5402,7 @@ async fn release_key_as(
             "delete from poison_held \
              where transform_id = $3 and src_table = any($1::text[]) and key = $2 \
              returning src_table, seg_seq, old_image::text, origin_lsn, src_changed, hop_gen, \
-                       group_key, join_values::text[], lsn",
+                       group_key, join_values::text[], lsn, agg_groups",
             &[&names, &key, &transform_id],
         )
         .await?;
@@ -5422,6 +5449,20 @@ async fn release_key_as(
         }],
     };
     append::append(&txn, &staged).await?;
+
+    // #1102: on a group-basis aggregate the release recomputes every group
+    // the key could owe: those its parked changes named, and its current
+    // row's. The parked changes are discarded. The version fence above keeps
+    // every page of the source out until this commits, and the groups are
+    // locked after it, the order a page takes them in.
+    let definition = catalog::definition_by_id_in(&*txn, transform_id).await?;
+    if let Some(definition) = &definition {
+        let groups: Vec<String> = held
+            .iter()
+            .flat_map(|row| row.get::<_, Option<Vec<String>>>(9).unwrap_or_default())
+            .collect();
+        super::group_basis::release(&txn, pool.schema(), definition, &groups, key).await?;
+    }
 
     txn.execute(
         "delete from key_deaths \

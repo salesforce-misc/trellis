@@ -177,6 +177,28 @@ batch, with no restart or redefine. It changes speed only, never results.
 with the index to create
 ([observability](observability.md#transform-status-lifecycle)).
 
+## Index an aggregate's group key when groups are large
+
+Some writes recompute an aggregate's groups from the source instead of
+adding a change to them: releasing a held key, its automatic retry, and a
+change that carries no row images. A recompute locks its groups, then runs
+a `GROUP BY` of their source rows, and holds the locks until it commits, so
+batches that touch those groups wait for it
+([ADR-0002](decisions/0002-async-data-flow.md#absolute-group-writes-lock-first-and-cover-every-group-they-could-owe)).
+
+When groups hold many rows, create an index whose leading columns are the
+definition's `GROUP BY` columns:
+
+```sql
+-- TRANSFORM sales_by_region FROM orders GROUP BY region SELECT SUM(amount) AS total
+CREATE INDEX ON orders (region);
+```
+
+With one, a recompute reads only its groups' rows: about 1.3 ms for a
+10,000-row group, 9 ms at 100,000 rows and 80 ms at 890,000. Without one,
+each recompute scans the source. Small groups don't need it. An index you
+create or drop changes speed only, never results.
+
 ## Roles and permissions
 
 ### One Trellis role

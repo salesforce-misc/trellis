@@ -3,9 +3,8 @@
 //!
 //! # The knob
 //!
-//! The group basis is built in steps (#1091), and its build (#1101) and its
-//! `TRUNCATE`, recompute and quarantine paths (#1102) don't exist yet. Until
-//! they do, the ledger (`super::ledger`) keeps every aggregate by default,
+//! The group basis is built in steps (#1091), and its build (#1101) doesn't
+//! exist yet. Until it does, the ledger (`super::ledger`) keeps every aggregate by default,
 //! and this path runs only behind a dev/bench knob: [`enabled`], read from
 //! [`KNOB_ENV`] or set with [`set_enabled`] (`trellis::dev::set_group_basis`).
 //! [`route`] is the one routing decision: with the knob on, it takes every
@@ -21,8 +20,8 @@
 //!   `live`: its build only checks that the source is empty
 //!   (`super::build`'s plan job fails otherwise), since the group-basis build
 //!   is #1101's;
-//! - halts on a source `TRUNCATE`, on an image-less change (a Re-derive or a
-//!   released key), and on a resume or rebuild, which are #1101's and #1102's;
+//! - halts on a resume or rebuild with a non-empty source, which are
+//!   #1101's;
 //! - is refused at define over a partitioned source (#1103), and for
 //!   `SUM`/`AVG` over a `numeric` column with no declared scale (#1096
 //!   decision 2).
@@ -90,6 +89,28 @@
 //!    falls to 0. It returns, per group, the change it applied. It runs with
 //!    nested loops off: its joins are between the page's own rows, whose
 //!    sizes the planner can't see.
+//!
+//! # Image-less changes, releases and truncates (#1102)
+//!
+//! An image-less change (a `Recompute`: a 1-1 reader's release of a key, a
+//! relationship's reverse re-derive of the source's rows) has no sides. The
+//! page recomputes the groups it names instead: its key's current row's
+//! group and its prior-image hint's. The page's lock statement locks those
+//! groups with its sides' groups, and after the page's sides apply,
+//! [`recompute_locked_groups`] rewrites each of them from a `GROUP BY` of its
+//! source rows, the statement's snapshot as its basis (R1, R5, R6).
+//!
+//! A held key's changes are skipped and parked: its held row keeps the
+//! groups of every parked image (`poison_held.agg_groups`, the evicting
+//! change's among them), not the images. A release or the automatic retry
+//! recomputes those groups and the key's current row's ([`release`]), so
+//! every group the key could owe is rewritten (R8) whatever absolute writes
+//! reached them during the hold.
+//!
+//! A source `TRUNCATE` empties the hidden table and raises the target's
+//! truncate floor on the truncate's own page ([`truncate_groups`]); the
+//! drain barrier orders that page after every page of earlier segments and
+//! before every page of later ones (R9).
 //!
 //! Sides are never folded per key (#1043 F2): the fold's first old and last
 //! new image are wrong when a group's basis falls between two of a key's
@@ -192,6 +213,14 @@ pub(crate) struct GroupShape {
     /// The `numeric` source columns a `SUM` or `AVG` reads, whose declared
     /// scale define checks ([`check_define`]).
     numeric_args: Vec<String>,
+}
+
+impl GroupShape {
+    /// The `GROUP BY` columns: the source's, the target's and the hidden
+    /// table's column of that name.
+    pub(crate) fn group_columns(&self) -> &[String] {
+        &self.group_cols
+    }
 }
 
 /// The column an aggregate call is read from inside a field's expression.
@@ -363,7 +392,7 @@ pub(crate) fn hidden_table_name_sql(id: &str) -> String {
 
 /// The hidden table of definition `id`, quoted and qualified by the catalog
 /// schema `schema`.
-pub(super) fn hidden_table_ident(schema: &str, id: i64) -> String {
+pub(crate) fn hidden_table_ident(schema: &str, id: i64) -> String {
     format!(
         "{}.{}",
         quote_ident(schema),
@@ -474,13 +503,21 @@ pub(crate) struct GroupTargetPlan {
     /// The session's temporary table the page's sides are summed into
     /// before any group is locked ([`stage_sides`]), quoted.
     staged: String,
+    /// The session's temporary table of the groups a page or a release
+    /// recomputes ([`recompute_locked_groups`]), quoted.
+    recomputed: String,
     /// The source, quoted and qualified: the row type images populate.
     source_row: String,
+    /// The source's row identity, which an image-less change's key names.
+    source_pk: Vec<PrimaryKeyColumn>,
     /// The target's identity, its `GROUP BY` columns.
     identity: Vec<PrimaryKeyColumn>,
     shape: GroupShape,
     /// Every ring row of every change the page has for this target.
     sides: Vec<String>,
+    /// The keys of the page's image-less changes, whose current rows'
+    /// groups the page recomputes.
+    recompute_keys: Vec<String>,
     hop_gen: i32,
     src_changed: Option<SystemTime>,
     origin_lsn: Option<PgLsn>,
@@ -493,6 +530,7 @@ impl GroupTargetPlan {
         definition_id: i64,
         target: &str,
         source: &str,
+        source_pk: Vec<PrimaryKeyColumn>,
         identity: Vec<PrimaryKeyColumn>,
         shape: GroupShape,
     ) -> Self {
@@ -504,10 +542,16 @@ impl GroupTargetPlan {
                 "pg_temp.{}",
                 quote_ident(&format!("trellis_group_sides_{definition_id}"))
             ),
+            recomputed: format!(
+                "pg_temp.{}",
+                quote_ident(&format!("trellis_group_recompute_{definition_id}"))
+            ),
             source_row: ddl::qualified_source_table(source),
+            source_pk,
             identity,
             shape,
             sides: Vec::new(),
+            recompute_keys: Vec::new(),
             hop_gen: 0,
             src_changed: None,
             origin_lsn: None,
@@ -516,13 +560,11 @@ impl GroupTargetPlan {
     }
 
     /// Adds one folded change's ring rows. An image-less change (a
-    /// Re-derive) can't be applied as deltas: see the module doc.
+    /// `Recompute`) has no sides: the page recomputes the groups it names
+    /// instead (see the module doc).
     pub(crate) fn push(&mut self, change: &FoldedChange) -> Result<(), ApplyError> {
         if change.has_recompute {
-            return Err(self.unsupported(
-                "an image-less change (a Re-derive, a released key, or a catch-up); \
-                 the group basis applies captured images only until #1101/#1102",
-            ));
+            self.recompute_keys.push(change.key.clone());
         }
         if change.group_sides.is_empty() {
             return Err(self.unsupported(
@@ -554,19 +596,20 @@ impl GroupTargetPlan {
 
     /// The CTEs every statement starts with: `raw`, one parsed ring row per
     /// element of `$1`, and `sides`, its old and new sides with their
-    /// transaction, `lsn` and sign.
+    /// transaction, `lsn` and sign. A `Recompute` has no sides: its `o` is
+    /// a prior-image hint, not a change's old image.
     fn sides_sql() -> &'static str {
         "raw as (select x::jsonb as r from unnest($1::text[]) as u(x)), \
          sides as ( \
              select (r ->> 't')::xid8 as __txid, (r ->> 'l')::pg_lsn as __lsn, -1 as __sgn, \
                     case when jsonb_typeof(r -> 'x') = 'object' then r -> 'x' -> 'old' \
                          else r -> 'o' end as __i \
-             from raw \
+             from raw where r ->> 'op' <> 'recompute' \
              union all \
              select (r ->> 't')::xid8, (r ->> 'l')::pg_lsn, 1, \
                     case when jsonb_typeof(r -> 'x') = 'object' then r -> 'x' -> 'new' \
                          else r -> 'n' end \
-             from raw \
+             from raw where r ->> 'op' <> 'recompute' \
          )"
     }
 
@@ -639,11 +682,66 @@ impl GroupTargetPlan {
         )
     }
 
+    /// The `create` of [`Self::recomputed`], one row per group to recompute
+    /// (repeats allowed). Created once a session; its rows go with each
+    /// transaction.
+    fn recomputed_ddl(&self) -> String {
+        let columns: Vec<String> = self
+            .shape
+            .group_cols
+            .iter()
+            .zip(&self.shape.group_types)
+            .map(|(c, t)| format!("{} {t}", quote_ident(c)))
+            .collect();
+        format!(
+            "create temp table if not exists {} ({}) on commit delete rows",
+            self.recomputed.trim_start_matches("pg_temp."),
+            columns.join(", ")
+        )
+    }
+
+    /// The statement adding groups to [`Self::recomputed`] ([`name_groups`]):
+    /// the group of each image of `$1` (a `text[]` of source-row images,
+    /// populated as the source's row type, so an image holding only the
+    /// group columns names its group), and the group of the current source
+    /// row of each key, read by its typed key parts: `$2..`, one `text[]`
+    /// per source key column. Each key reads its row by its own index
+    /// probe.
+    fn name_groups_sql(&self) -> String {
+        let cols = quoted(&self.shape.group_cols).join(", ");
+        let mut on = Vec::with_capacity(self.source_pk.len());
+        let mut arrays = Vec::with_capacity(self.source_pk.len());
+        let mut parts = Vec::with_capacity(self.source_pk.len());
+        for (i, column) in self.source_pk.iter().enumerate() {
+            let p = format!("__p{i}");
+            on.push(format!("s.{} = u.{p}", quote_ident(&column.name)));
+            arrays.push(format!("${}::text[]::{}[]", i + 2, column.data_type));
+            parts.push(p);
+        }
+        format!(
+            "insert into {rc} ({cols}) \
+             select {values} from ( \
+                 select s.* from unnest($1::text[]) as i(x) \
+                 cross join lateral jsonb_populate_record(null::{src}, x::jsonb) as s \
+                 union all \
+                 select s.* from unnest({arrays}) as u({parts}) \
+                 cross join lateral (select * from {src} s where {on}) as s \
+             ) as s",
+            rc = self.recomputed,
+            values = self.group_values().join(", "),
+            src = self.source_row,
+            arrays = arrays.join(", "),
+            parts = parts.join(", "),
+            on = on.join(" and "),
+        )
+    }
+
     /// Step 0's statement ([`stage_sides`]): parses `$1`'s ring rows, splits
     /// them into sides, evaluates the group and each argument on each, and
     /// sums them per (group, transaction, statement) into [`Self::staged`].
-    /// Returns the number of ring rows it can't apply as deltas; when there
-    /// are any it stages nothing.
+    /// A `Recompute`'s prior-image hint names a group to recompute
+    /// ([`Self::recomputed`]). Returns the number of ring rows it can't
+    /// apply as deltas; when there are any it stages nothing.
     fn stage_sql(&self) -> String {
         let cols = quoted(&self.shape.group_cols).join(", ");
         let mut values = self.group_values();
@@ -663,12 +761,19 @@ impl GroupTargetPlan {
             "with {sides}, \
              bad as ( \
                  select count(*) as __bad from raw \
-                 where r ->> 'op' = 'recompute' \
-                    or (jsonb_typeof(r -> 'x') is distinct from 'object' \
-                        and ((r ->> 'op' in ('update', 'delete') \
-                              and jsonb_typeof(r -> 'o') is distinct from 'object') \
-                          or (r ->> 'op' in ('insert', 'update') \
-                              and jsonb_typeof(r -> 'n') is distinct from 'object'))) \
+                 where r ->> 'op' <> 'recompute' \
+                   and jsonb_typeof(r -> 'x') is distinct from 'object' \
+                   and ((r ->> 'op' in ('update', 'delete') \
+                         and jsonb_typeof(r -> 'o') is distinct from 'object') \
+                     or (r ->> 'op' in ('insert', 'update') \
+                         and jsonb_typeof(r -> 'n') is distinct from 'object')) \
+             ), \
+             hinted as ( \
+                 insert into {recomputed} ({cols}) \
+                 select {group_values} from raw \
+                 cross join lateral jsonb_populate_record(null::{src}, r -> 'o') as s \
+                 where r ->> 'op' = 'recompute' and jsonb_typeof(r -> 'o') = 'object' \
+                   and (select __bad from bad) = 0 \
              ), \
              ev as ( \
                  select {values} \
@@ -687,20 +792,26 @@ impl GroupTargetPlan {
             src = self.source_row,
             staged = self.staged,
             sums = sums.join(", "),
+            recomputed = self.recomputed,
+            group_values = self.group_values().join(", "),
         )
     }
 
     /// Step 1's statement ([`lock_groups`]): inserts every group the staged
-    /// sides name that has no hidden row, and locks the rest, sorted.
+    /// sides or [`Self::recomputed`] name that has no hidden row, and locks
+    /// the rest, sorted, in one statement (R1, R7).
     fn lock_sql(&self) -> String {
         let cols = quoted(&self.shape.group_cols).join(", ");
         format!(
             "insert into {hidden} ({cols}) \
-             select distinct {cols} from {staged} \
+             select distinct {cols} from ( \
+                 select {cols} from {staged} union all select {cols} from {recomputed} \
+             ) as g \
              order by {cols} \
              on conflict ({cols}) do update set __n = excluded.__n where false",
             hidden = self.hidden_ident,
             staged = self.staged,
+            recomputed = self.recomputed,
         )
     }
 
@@ -803,6 +914,151 @@ impl GroupTargetPlan {
             .iter()
             .map(|c| format!("array[sg.{c}] = array[b.{c}]"))
             .collect();
+        format!(
+            "with sg as ( \
+                 select {col_list}, __txid, {sums} from {staged} \
+                 where __lsn > coalesce( \
+                     (select floor from ledger_truncate_floor where target_table = $1), \
+                     '0/0'::pg_lsn) \
+                 group by {col_list}, __txid \
+             ), \
+             pg as (select distinct {col_list} from sg), \
+             b as ( \
+                 select pg.*, h.__hc, h.__basis from pg \
+                 cross join lateral {lookup_hidden} as h(__hc, __basis) \
+             ), \
+             f as ( \
+                 select sg.*, b.__hc from sg join b on {matched} \
+                 where b.__basis is null or not pg_visible_in_snapshot(sg.__txid, b.__basis) \
+             ), \
+             t as (select __hc, {totals} from f group by __hc), \
+             up as ( \
+                 update {hidden} u set {sets} from t \
+                 where u.ctid = t.__hc and ({nonzero}) \
+                 returning {up_groups}, {returning} \
+             ), \
+             {tail}",
+            staged = self.staged,
+            sums = sums.join(", "),
+            lookup_hidden = self.group_lookup(&self.hidden_ident, "pg", "x.ctid, x.__basis"),
+            matched = matched.join(" and "),
+            totals = totals.join(", "),
+            hidden = self.hidden_ident,
+            sets = sets.join(", "),
+            nonzero = nonzero.join(" or "),
+            up_groups = up_groups.join(", "),
+            returning = returning.join(", "),
+            tail = self.visible_tail_sql(image_columns),
+        )
+    }
+
+    /// The recompute's statement ([`recompute_locked_groups`], R1, R5): over
+    /// the groups of [`Self::recomputed`], already locked, takes the
+    /// snapshot and reads the newest segment's `seg_seq` in this one
+    /// statement, `GROUP BY`s each group's source rows into its partials,
+    /// and writes them with the snapshot as the group's basis and the
+    /// segment as its stamp. A group with no source row keeps its hidden
+    /// row at zero with the basis (R4). `image_columns` as
+    /// [`Self::apply_sql`]'s.
+    fn recompute_sql(&self, image_columns: Option<&[String]>) -> String {
+        let cols = quoted(&self.shape.group_cols);
+        let col_list = cols.join(", ");
+        let args = &self.shape.args;
+        let mut old = vec!["x.__n".to_string()];
+        let mut old_names = vec!["__on".to_string()];
+        let mut fresh = vec!["count(*)::bigint as __rn".to_string()];
+        let mut sets = vec!["__n = r.__rn".to_string()];
+        let mut returning = vec![
+            "u.__n - r.__on as __dn".to_string(),
+            "u.__n as __nn".to_string(),
+        ];
+        for (i, arg) in args.iter().enumerate() {
+            let i = i + 1;
+            old.push(format!("x.__count_{i}"));
+            old_names.push(format!("__oc{i}"));
+            fresh.push(format!(
+                "(count(*) filter (where ({}) is not null))::bigint as __rc{i}",
+                arg.sql
+            ));
+            sets.push(format!("__count_{i} = r.__rc{i}"));
+            returning.push(format!(
+                "u.__count_{i} - r.__oc{i} as __dc{i}, u.__count_{i} as __nc{i}"
+            ));
+            if arg.summed {
+                old.push(format!("x.__sum_{i}"));
+                old_names.push(format!("__os{i}"));
+                fresh.push(format!(
+                    "coalesce(sum(({})::numeric), 0) as __rs{i}",
+                    arg.sql
+                ));
+                sets.push(format!("__sum_{i} = r.__rs{i}"));
+                returning.push(format!(
+                    "u.__sum_{i} - r.__os{i} as __ds{i}, u.__sum_{i} as __ns{i}"
+                ));
+            }
+        }
+        let up_groups: Vec<String> = cols.iter().map(|c| format!("u.{c}")).collect();
+        let equal: Vec<String> = cols.iter().map(|c| format!("s.{c} = rg.{c}")).collect();
+        let has_null: Vec<String> = cols.iter().map(|c| format!("rg.{c} is null")).collect();
+        let same: Vec<String> = cols
+            .iter()
+            .map(|c| format!("s.{c} is not distinct from rg.{c}"))
+            .collect();
+        format!(
+            "with snap as materialized ( \
+                 select pg_catalog.pg_current_snapshot() as __snap, \
+                        coalesce((select max(seg_seq) from segments), 0) as __seg \
+             ), \
+             rg as (select distinct {col_list} from {recomputed}), \
+             r as ( \
+                 select h.*, a.* from rg \
+                 cross join lateral {lookup_hidden} as h(__hc, {old_names}) \
+                 cross join lateral ( \
+                     select {fresh} from ( \
+                         select s.* from {src} s where {equal} \
+                         union all \
+                         select s.* from {src} s where ({has_null}) and {same} \
+                     ) as s \
+                 ) as a \
+             ), \
+             up as ( \
+                 update {hidden} u set {sets}, __basis = snap.__snap, __stamp = snap.__seg \
+                 from r, snap where u.ctid = r.__hc \
+                 returning {up_groups}, {returning} \
+             ), \
+             {tail}",
+            recomputed = self.recomputed,
+            lookup_hidden = self.group_lookup(
+                &self.hidden_ident,
+                "rg",
+                &format!("x.ctid, {}", old.join(", "))
+            ),
+            old_names = old_names.join(", "),
+            fresh = fresh.join(", "),
+            src = self.source_row,
+            equal = equal.join(" and "),
+            has_null = has_null.join(" or "),
+            same = same.join(" and "),
+            hidden = self.hidden_ident,
+            sets = sets.join(", "),
+            up_groups = up_groups.join(", "),
+            returning = returning.join(", "),
+            tail = self.visible_tail_sql(image_columns),
+        )
+    }
+
+    /// The end of [`Self::apply_sql`] and [`Self::recompute_sql`], after
+    /// their `up` CTE, which returns each written group's columns, and per
+    /// partial its change (`__dn`, `__dc<i>`, `__ds<i>`) and its new value
+    /// (`__nn`, `__nc<i>`, `__ns<i>`): writes the visible row when a visible
+    /// value changed (an upsert while `__n > 0`, a delete when it falls to
+    /// 0), and returns per group its key, whether its visible row changed,
+    /// whether it is visible now and was before, its prior visible image,
+    /// and its change per partial.
+    fn visible_tail_sql(&self, image_columns: Option<&[String]>) -> String {
+        let cols = quoted(&self.shape.group_cols);
+        let col_list = cols.join(", ");
+        let args = &self.shape.args;
         let new_fields = self.fields_lateral("__nf", "up.__nn", &|i| format!("up.__nc{i}"), &|i| {
             format!("up.__ns{i}")
         });
@@ -832,7 +1088,7 @@ impl GroupTargetPlan {
             format!("do update set {}", field_updates.join(", "))
         };
         // The prior visible row's image, for the seam, from the partials
-        // before this page's change.
+        // before this statement's change.
         let prior_image = match image_columns {
             Some(columns) => {
                 let pairs: Vec<String> = columns
@@ -865,29 +1121,7 @@ impl GroupTargetPlan {
             }
         }
         format!(
-            "with sg as ( \
-                 select {col_list}, __txid, {sums} from {staged} \
-                 where __lsn > coalesce( \
-                     (select floor from ledger_truncate_floor where target_table = $1), \
-                     '0/0'::pg_lsn) \
-                 group by {col_list}, __txid \
-             ), \
-             pg as (select distinct {col_list} from sg), \
-             b as ( \
-                 select pg.*, h.__hc, h.__basis from pg \
-                 cross join lateral {lookup_hidden} as h(__hc, __basis) \
-             ), \
-             f as ( \
-                 select sg.*, b.__hc from sg join b on {matched} \
-                 where b.__basis is null or not pg_visible_in_snapshot(sg.__txid, b.__basis) \
-             ), \
-             t as (select __hc, {totals} from f group by __hc), \
-             up as ( \
-                 update {hidden} u set {sets} from t \
-                 where u.ctid = t.__hc and ({nonzero}) \
-                 returning {up_groups}, {returning} \
-             ), \
-             vis as ( \
+            "vis as ( \
                  select up.*, {nf_pf}, \
                         (up.__nn > 0, {nf_cols}) is distinct from \
                             (up.__nn - up.__dn > 0, {pf_cols}) as __changed \
@@ -907,16 +1141,6 @@ impl GroupTargetPlan {
              select {key}, vis.__changed, vis.__nn > 0, vis.__nn - vis.__dn > 0, {prior_image}, \
                     {applied} \
              from vis",
-            staged = self.staged,
-            sums = sums.join(", "),
-            lookup_hidden = self.group_lookup(&self.hidden_ident, "pg", "x.ctid, x.__basis"),
-            matched = matched.join(" and "),
-            totals = totals.join(", "),
-            hidden = self.hidden_ident,
-            sets = sets.join(", "),
-            nonzero = nonzero.join(" or "),
-            up_groups = up_groups.join(", "),
-            returning = returning.join(", "),
             nf_pf = if field_count == 0 {
                 "true as __trellis_none".to_string()
             } else {
@@ -964,13 +1188,15 @@ pub(crate) struct AppliedGroup {
 }
 
 /// Step 1 of a page on a group-basis target (see the module doc): locks, in
-/// one sorted statement, every group a side of the page names, creating the
-/// hidden rows of those that have none.
+/// one sorted statement, every group a side of the page names and every
+/// group its image-less changes name, creating the hidden rows of those
+/// that have none.
 pub(crate) async fn lock_groups(
     txn: &Transaction<'_>,
     plan: &GroupTargetPlan,
 ) -> Result<(), ApplyError> {
     stage_sides(txn, plan).await?;
+    name_groups(txn, plan, &[], &plan.recompute_keys).await?;
     txn.execute(&plan.lock_sql(), &[]).await?;
     Ok(())
 }
@@ -981,17 +1207,49 @@ pub(crate) async fn lock_groups(
 /// page's work, and none of it reads a basis, so it stays out of the time
 /// the page holds its groups.
 async fn stage_sides(txn: &Transaction<'_>, plan: &GroupTargetPlan) -> Result<(), ApplyError> {
-    txn.batch_execute(&plan.staged_ddl()).await?;
+    txn.batch_execute(&format!("{}; {}", plan.staged_ddl(), plan.recomputed_ddl()))
+        .await?;
     let bad: i64 = txn
         .query_one(&plan.stage_sql(), &[&plan.sides])
         .await?
         .get(0);
     if bad > 0 {
         return Err(plan.unsupported(
-            "a ring row without the images its change needs (an image-less delete, or a \
-             Re-derive); the group basis applies captured images only",
+            "a ring row without the images its change needs (an image-less delete or \
+             update); the group basis applies captured images only",
         ));
     }
+    Ok(())
+}
+
+/// Adds to the groups `plan` recomputes ([`GroupTargetPlan::recomputed`])
+/// the group of each of `images` (source-row images, or objects of the
+/// group columns alone) and the group of the current source row of each of
+/// `keys`. Reads the source before any group is locked: which groups to
+/// recompute is decided here, and each is counted only by the recompute's
+/// own statement, after its lock.
+async fn name_groups(
+    txn: &Transaction<'_>,
+    plan: &GroupTargetPlan,
+    images: &[String],
+    keys: &[String],
+) -> Result<(), ApplyError> {
+    if images.is_empty() && keys.is_empty() {
+        return Ok(());
+    }
+    let mut parts: Vec<Vec<Option<String>>> =
+        vec![Vec::with_capacity(keys.len()); plan.source_pk.len()];
+    for key in keys {
+        let split = ddl::split_pk_key(&plan.source_pk, &plan.source_row, key)?;
+        for (column, part) in parts.iter_mut().zip(split) {
+            column.push(part.map(|p| p.into_owned()));
+        }
+    }
+    let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&images];
+    for column in &parts {
+        params.push(column);
+    }
+    txn.execute(&plan.name_groups_sql(), &params).await?;
     Ok(())
 }
 
@@ -1016,6 +1274,102 @@ pub(crate) async fn apply_locked_groups(
     txn.batch_execute(PLAN_SETTINGS).await?;
     let rows = txn.query(&sql, &[&plan.target]).await?;
     txn.batch_execute(PLAN_RESET).await?;
+    Ok(written_groups(plan, rows, mutations))
+}
+
+/// The recompute of the groups in [`GroupTargetPlan::recomputed`], which
+/// the caller has locked (R1: [`lock_groups`] for a page, [`recompute_groups`]
+/// for a release): an absolute write of each group's partials from a
+/// `GROUP BY` of its source rows, with the statement's snapshot as its
+/// basis (see [`GroupTargetPlan::recompute_sql`]). Each changed visible row
+/// is recorded into `mutations`. Returns how many visible rows it wrote and
+/// deleted. A page's own sides, applied before it in the same transaction,
+/// are counted again here and overwritten: their transactions are committed,
+/// so the recompute's snapshot sees them, and its basis refuses them from
+/// then on.
+///
+/// A group-basis definition has no build chunks yet (#1101), so the
+/// recompute counts every source row of its groups: a recompute during a
+/// chunked build will lock the chunk rows `FOR SHARE` first and count only
+/// rows of done or retired chunks (ADR-0002, F6).
+pub(crate) async fn recompute_locked_groups(
+    txn: &Transaction<'_>,
+    plan: &GroupTargetPlan,
+    mutations: &mut TargetMutations,
+) -> Result<(usize, usize), ApplyError> {
+    let image_columns = mutations.image_columns(txn, &plan.target).await?;
+    let rows = txn
+        .query(&plan.recompute_sql(image_columns.as_deref()), &[])
+        .await?;
+    let (_, written, deleted) = written_groups(plan, rows, mutations);
+    Ok((written, deleted))
+}
+
+/// A release's recompute on a group-basis target (#1102 decision 1): every
+/// group the held key could owe (R8), each named by an object of its group
+/// columns in `groups` (the held row's `agg_groups`: the groups of the old
+/// and new images of every change skipped while the key was held, the
+/// evicting change's among them), plus the group of the key's current row.
+/// Locks them in one sorted statement (R1, R6), then recomputes them in
+/// the next. The caller holds the version fence of the key's source, so no
+/// page of it runs meanwhile. Returns how many visible rows it wrote and
+/// deleted.
+pub(crate) async fn recompute_groups(
+    txn: &Transaction<'_>,
+    plan: &GroupTargetPlan,
+    groups: &[String],
+    key: &str,
+    mutations: &mut TargetMutations,
+) -> Result<(usize, usize), ApplyError> {
+    txn.batch_execute(&format!("{}; {}", plan.staged_ddl(), plan.recomputed_ddl()))
+        .await?;
+    name_groups(txn, plan, groups, &[key.to_string()]).await?;
+    txn.execute(&plan.lock_sql(), &[]).await?;
+    recompute_locked_groups(txn, plan, mutations).await
+}
+
+/// A release's work on `definition` ([`super::quarantine::release_key`]),
+/// when the group basis takes it: [`recompute_groups`] over the held row's
+/// `agg_groups` and `key`'s current row, then the seam's rows for every
+/// visible row that changed. Returns whether the definition is on the group
+/// basis; when it isn't, does nothing.
+pub(crate) async fn release(
+    txn: &Transaction<'_>,
+    catalog_schema: &str,
+    definition: &crate::defs::model::Definition,
+    groups: &[String],
+    key: &str,
+) -> Result<bool, ApplyError> {
+    let Some(shape) = route(&definition.def, &definition.source_columns) else {
+        return Ok(false);
+    };
+    let source_pk = ddl::source_primary_key_in_txn(txn, &definition.source_table).await?;
+    let identity = ddl::identity_key_columns(txn, &definition.target_table).await?;
+    let plan = GroupTargetPlan::new(
+        catalog_schema,
+        definition.id,
+        &definition.target_table,
+        &definition.source_table,
+        source_pk,
+        identity,
+        shape,
+    );
+    let mut mutations = TargetMutations::new();
+    recompute_groups(txn, &plan, groups, key, &mut mutations).await?;
+    let propagation = mutations.into_staged(txn).await?;
+    super::append::append(txn, &propagation.changes).await?;
+    Ok(true)
+}
+
+/// What one statement wrote per group, read from the rows
+/// [`GroupTargetPlan::visible_tail_sql`] returns, with each changed visible
+/// row recorded into `mutations`; and how many visible rows it wrote and
+/// deleted.
+fn written_groups(
+    plan: &GroupTargetPlan,
+    rows: Vec<tokio_postgres::Row>,
+    mutations: &mut TargetMutations,
+) -> (Vec<AppliedGroup>, usize, usize) {
     let mut applied = Vec::with_capacity(rows.len());
     let (mut written, mut deleted) = (0, 0);
     for row in rows {
@@ -1059,12 +1413,13 @@ pub(crate) async fn apply_locked_groups(
             sums,
         });
     }
-    Ok((applied, written, deleted))
+    (applied, written, deleted)
 }
 
 /// One page's work on one group-basis target: [`lock_groups`], the
-/// interleaving tests' pause point, then [`apply_locked_groups`]. Returns the
-/// visible rows written and deleted.
+/// interleaving tests' pause point, [`apply_locked_groups`], then
+/// [`recompute_locked_groups`] when an image-less change named groups.
+/// Returns the visible rows written and deleted.
 #[tracing::instrument(
     name = "staging.apply_group_target",
     skip_all,
@@ -1085,7 +1440,14 @@ pub(crate) async fn apply_group_target(
         &plan.target,
     )
     .await?;
-    let (_, written, deleted) = apply_locked_groups(txn, plan, mutations).await?;
+    let (_, mut written, mut deleted) = apply_locked_groups(txn, plan, mutations).await?;
+    // Only an image-less change names a group to recompute: its key, and
+    // its prior-image hint, which rides on the same ring row.
+    if !plan.recompute_keys.is_empty() {
+        let (w, d) = recompute_locked_groups(txn, plan, mutations).await?;
+        written += w;
+        deleted += d;
+    }
     #[cfg(any(test, feature = "test-util"))]
     super::interleave::pause_at(
         txn,
@@ -1094,6 +1456,34 @@ pub(crate) async fn apply_group_target(
     )
     .await?;
     Ok((written, deleted))
+}
+
+/// A source `TRUNCATE`'s clear of a group-basis target's hidden table
+/// `hidden` ([`hidden_table_ident`]; ADR-0002 "Truncate, DDL, drop"):
+/// empties every group's partials, basis
+/// and stamp, zero groups included, and raises the target's truncate floor
+/// to `lsn`, so a change from before the truncate that still reaches a page
+/// is refused. The caller clears the visible target. It runs on the
+/// truncate's own page, which the drain barrier orders after every page
+/// of earlier segments and before every page of later ones
+/// (`super::apply::next_claimable_segments`), so no page of the source
+/// holds a group meanwhile, and which passes the same claim check as any
+/// page.
+pub(crate) async fn truncate_groups(
+    txn: &Transaction<'_>,
+    hidden: &str,
+    target: &str,
+    lsn: PgLsn,
+) -> Result<(), ApplyError> {
+    txn.batch_execute(&format!("truncate {hidden}")).await?;
+    txn.execute(
+        "insert into ledger_truncate_floor (target_table, floor) values ($1, $2) \
+         on conflict (target_table) do update \
+         set floor = greatest(ledger_truncate_floor.floor, excluded.floor)",
+        &[&target, &lsn],
+    )
+    .await?;
+    Ok(())
 }
 
 #[cfg(test)]

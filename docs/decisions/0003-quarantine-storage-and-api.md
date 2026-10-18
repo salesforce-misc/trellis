@@ -82,7 +82,10 @@ transforms/columns at once, and a failure in one of them is that one's to hold.
   read-your-writes token), the earliest source-change time, the deepest hop,
   the union of the group keys, the join values the changes' images held for
   a relationship's `to_col` (each change's raw new images and its pre-image),
-  and the greatest WAL position. A held key
+  the greatest WAL position, and, for a group-basis aggregate
+  ([ADR-0002](0002-async-data-flow.md#aggregates-a-basis-per-group-kept-by-deltas)),
+  the groups the changes' old and new images named (`agg_groups`), the
+  evicting change's among them, but none of the images. A held key
   costs one row, not one per batch.
 * **`column_failures`** — keyed on `(transform_table, column_name, src_table,
   key)`, one row per `(transform, column)` pair that failed while propagating a
@@ -327,7 +330,24 @@ until one of these releases it:
   the table: one that doesn't hold the key re-derives it, which is idempotent,
   and one that does parks it. If the cause is still there, the `Recompute`
   fails as the changes before it did, and the key is poisoned again once its
-  fresh death count reaches the threshold. An unknown transform is
+  fresh death count reaches the threshold.
+
+  On a group-basis aggregate, a held key's changes are skipped, so the
+  groups they feed drift until the release. The release and the
+  [automatic retry](#retry-policy) each recompute every group the key could
+  owe, in the release's own transaction: each group the held row's `agg_groups` names,
+  and its current row's. The recompute locks the groups in one sorted
+  statement, after the fence, then rewrites each from a `GROUP BY` of its
+  source rows, with that statement's snapshot as the group's basis
+  ([ADR-0002](0002-async-data-flow.md#absolute-group-writes-lock-first-and-cover-every-group-they-could-owe)).
+  The key's changes still in the ring apply afterwards as deltas, filtered
+  by that basis. The recompute holds its groups' locks for its whole
+  `GROUP BY`: about 1.3 ms for a 10k-row group, 9 ms at 100k and 80 ms at
+  890k with an index whose leading column is the group key
+  ([recommendations](../recommendations.md)). Without one, it scans the
+  source, and pages touching those groups wait for it.
+
+  An unknown transform is
   `TransformNotFound`, and a key the transform doesn't hold (a table it doesn't
   read, a key it never held or one already released) is `KeyNotHeld`; both are
   `not_found`, and neither changes anything.

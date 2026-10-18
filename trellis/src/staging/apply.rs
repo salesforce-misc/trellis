@@ -175,10 +175,12 @@ pub enum ApplyError {
     /// can't apply at all, not a bad row: every key of the target would
     /// reproduce it, so it halts rather than charging each key a death.
     AggregateOffLedger { target: String },
-    /// A group-basis aggregate target (`super::group_basis`, #1100) met a
-    /// change its dev knob doesn't support yet (a source `TRUNCATE`, an
-    /// image-less change). Like [`ApplyError::AggregateOffLedger`], every
-    /// page of the target would reproduce it, so it halts the target.
+    /// A group-basis aggregate target (`super::group_basis`, #1100) met
+    /// what its dev knob doesn't support yet: a ring row missing the images
+    /// its change needs, a page folded with the knob off, or a build over a
+    /// source with rows or a rebuild's sweep (#1101). Like
+    /// [`ApplyError::AggregateOffLedger`], every page of the target would
+    /// reproduce it, so it halts the target.
     GroupBasisUnsupported { target: String, what: &'static str },
     /// A folded record names a source table Postgres no longer has
     /// (`42P01` from a live query against it) — issue #16's "one sanctioned
@@ -4213,11 +4215,23 @@ struct AggregateClearPlan {
     pk: Vec<PrimaryKeyColumn>,
     src_changed: Option<std::time::SystemTime>,
     origin_lsn: Option<PgLsn>,
-    /// #623 D3: whether the target is on the ledger, whose clear also
-    /// empties the ledger and raises the truncate floor to `truncate_lsn`.
-    on_ledger: bool,
+    /// Where the target keeps its ordering state, whose clear also empties
+    /// it and raises the truncate floor to `truncate_lsn`.
+    state: AggregateState,
     /// The latest truncating commit's ring `lsn` this batch carries.
     truncate_lsn: PgLsn,
+}
+
+/// Where an aggregate target keeps its ordering state ([`AggregateClearPlan`]).
+#[derive(Debug, Clone)]
+enum AggregateState {
+    /// #623 D3: the per-row ledger.
+    Ledger,
+    /// #1102: the group basis's hidden table (`super::group_basis`), quoted
+    /// and qualified.
+    GroupBasis { hidden: String },
+    /// Neither: nothing to empty.
+    Neither,
 }
 
 /// The fan-in tie-break for [`StagedChange::Recompute::src_changed`]
@@ -8518,6 +8532,7 @@ pub(super) async fn compute_page(
                             def.id,
                             &def.target_table,
                             qualified_source,
+                            pk.clone(),
                             identity,
                             shape,
                         ))
@@ -8931,13 +8946,21 @@ pub(super) async fn compute_page(
                             }
                             .into());
                         }
-                        // #1100: a group-basis target's truncate is #1102's.
-                        if super::group_basis::route(&def.def, &def.source_columns).is_some() {
-                            return Err(ApplyError::GroupBasisUnsupported {
-                                target: def.def.target.clone(),
-                                what: "a source TRUNCATE (the group-basis truncate is #1102)",
-                            });
-                        }
+                        // #1102: a group-basis target empties its hidden
+                        // table, as a ledger target empties its ledger.
+                        let state =
+                            if super::group_basis::route(&def.def, &def.source_columns).is_some() {
+                                AggregateState::GroupBasis {
+                                    hidden: super::group_basis::hidden_table_ident(
+                                        pool.schema(),
+                                        def.id,
+                                    ),
+                                }
+                            } else if super::ledger::route_definition(pool, def).await?.is_some() {
+                                AggregateState::Ledger
+                            } else {
+                                AggregateState::Neither
+                            };
                         aggregate_clears.insert(
                             def.def.target.clone(),
                             AggregateClearPlan {
@@ -8946,9 +8969,7 @@ pub(super) async fn compute_page(
                                 pk,
                                 src_changed: change.src_changed,
                                 origin_lsn: change.origin_lsn,
-                                on_ledger: super::ledger::route_definition(pool, def)
-                                    .await?
-                                    .is_some(),
+                                state,
                                 truncate_lsn,
                             },
                         );
@@ -10655,9 +10676,22 @@ pub(crate) async fn apply_page(
     for clear in plan.aggregate_clears.values() {
         // #623 D3: a ledger target's truncate empties its ledger and raises
         // its truncate floor (the D split's Q6), then clears its groups.
-        if clear.on_ledger {
-            super::ledger::truncate_ledger(txn, &clear.qualified_target, clear.truncate_lsn)
+        // #1102: a group-basis target empties its hidden table the same way.
+        match &clear.state {
+            AggregateState::Ledger => {
+                super::ledger::truncate_ledger(txn, &clear.qualified_target, clear.truncate_lsn)
+                    .await?;
+            }
+            AggregateState::GroupBasis { hidden } => {
+                super::group_basis::truncate_groups(
+                    txn,
+                    hidden,
+                    &clear.qualified_target,
+                    clear.truncate_lsn,
+                )
                 .await?;
+            }
+            AggregateState::Neither => {}
         }
         keys_deleted += clear_target(
             txn,
@@ -12675,6 +12709,12 @@ struct HaltRetry {
 /// returns the *lowest* eligible `seg_seq`, `B` itself is only ever handed
 /// out once every segment below it has drained — one clause gives both
 /// directions of the barrier.
+///
+/// Sealed segments are fenced strictly in order (R9 in ADR-0002: the
+/// barrier needs them planned in order): the seal gate
+/// (`seal::seal_phase1`) refuses to seal a segment while its predecessor's
+/// fence is unpublished, so no segment past one whose `has_truncate` is
+/// still undecided is ever fenced, and none is returned here.
 #[cfg(any(test, feature = "internals"))]
 pub async fn next_claimable_segment(
     client: &impl GenericClient,

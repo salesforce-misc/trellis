@@ -583,22 +583,359 @@ async fn r7_concurrent_pages_over_shared_groups_never_deadlock() {
     assert_oracle(&mut d).await;
 }
 
-// ------------------------------------------------------------------ refusals
+// ------------------------------------------------------------ truncate (F5)
 
-/// What the knob doesn't support yet halts the definition rather than
-/// writing a wrong value: a source `TRUNCATE` (#1102).
+/// The ids of the segments a free worker could claim now, in order: the
+/// drain barrier's view (`next_claimable_segments`).
+async fn claimable(d: &Driver) -> Vec<i64> {
+    trellis::staging::apply::next_claimable_segments(&d.ctl, 1_000_000)
+        .await
+        .expect("next claimable segments")
+}
+
+/// A source `TRUNCATE` empties the hidden table and the target, and raises
+/// the floor; an insert later in the truncating transaction applies, as
+/// does one after it.
 #[tokio::test]
-async fn a_truncate_halts_the_definition() {
+async fn a_truncate_clears_the_groups_and_raises_the_floor() {
+    let mut d = start().await;
+    step(
+        &mut d,
+        "insert into public.src values (1, 1, 10), (2, 2, 20), (3, 3, 30)",
+    )
+    .await;
+    step(&mut d, "delete from public.src where id = 3").await;
+    step(
+        &mut d,
+        "begin; insert into public.src values (4, 1, 1); truncate public.src; \
+         insert into public.src values (5, 2, 5); commit",
+    )
+    .await;
+    assert_eq!(
+        d.rows(&format!(
+            "select g, __n, __basis is null from {} order by g",
+            hidden(&d).await
+        ))
+        .await,
+        ["(2,1,t)"],
+        "the wipe took every group, the zero group 3 among them"
+    );
+    let floor = d
+        .rows("select floor::text from ledger_truncate_floor where target_table = 'public.agg'")
+        .await;
+    assert_eq!(floor.len(), 1, "the floor is raised");
+    step(&mut d, "insert into public.src values (6, 1, 6)").await;
+    assert_oracle(&mut d).await;
+}
+
+/// T.floor: a change from before the truncate that reaches a page after the
+/// truncate's page is refused by the floor alone. The driver drains the two
+/// segments out of order, which the barrier never does.
+#[tokio::test]
+async fn a_change_from_before_a_truncate_is_refused_after_it() {
+    let mut d = start().await;
+    step(&mut d, "insert into public.src values (1, 1, 10)").await;
+    write(&d, "insert into public.src values (2, 1, 5), (3, 2, 7)").await;
+    let before = d.seal().await;
+    write(
+        &d,
+        "truncate public.src; insert into public.src values (4, 2, 1)",
+    )
+    .await;
+    let truncate = d.seal().await;
+    d.drain(truncate, "a").await;
+    d.drain(before, "b").await;
+    assert_eq!(partials(&d, 1).await, ["(0,0,0,f)"]);
+    assert_oracle(&mut d).await;
+}
+
+/// T.concurrent-earlier, and the barrier's other side: a page of an earlier
+/// segment still open (it has locked its groups and is frozen there) holds
+/// the truncate's segment back, and a later segment waits for the
+/// truncate's. A wipe that ran under the earlier page would leave the
+/// group row that page creates.
+#[tokio::test]
+async fn the_truncate_page_waits_for_earlier_pages_and_later_ones_for_it() {
+    let mut d = start().await;
+    write(&d, "insert into public.src values (1, 9, 10)").await;
+    let earlier = d.seal().await;
+    write(&d, "truncate public.src").await;
+    let truncate = d.seal().await;
+    write(&d, "insert into public.src values (2, 9, 5)").await;
+
+    let mut page = d
+        .drain_frozen(earlier, "a", &[(PausePoint::AfterEntryLock, "public.agg")])
+        .await;
+    page.reached(PausePoint::AfterEntryLock).await;
+    assert_eq!(
+        claimable(&d).await,
+        [earlier],
+        "the truncate isn't claimable while an earlier page is open"
+    );
+    d.release(&mut page, PausePoint::AfterEntryLock).await;
+    page.finish().await;
+    let later = d.seal().await;
+
+    assert_eq!(
+        claimable(&d).await,
+        [truncate],
+        "the truncate's segment drains alone"
+    );
+    d.drain(truncate, "b").await;
+    assert_eq!(claimable(&d).await, [later]);
+    d.drain(later, "c").await;
+    assert_eq!(partials(&d, 9).await, ["(1,1,5,f)"]);
+    assert_oracle(&mut d).await;
+}
+
+/// R9: segments are planned in order around a truncate. A seal that stopped
+/// between its phases leaves the truncate's segment unfenced, its
+/// `has_truncate` undecided. The seal gate seals no later segment until its
+/// fence is published, so none can be claimed past it: drained first, a
+/// later segment's post-truncate insert would be wiped by the truncate.
+#[tokio::test]
+async fn no_segment_is_sealed_past_an_unfenced_one() {
     let mut d = start().await;
     step(&mut d, "insert into public.src values (1, 1, 10)").await;
     write(&d, "truncate public.src").await;
+    d.retire().await;
+    let stuck = trellis::staging::seal::seal_phase1(&mut d.ctl)
+        .await
+        .expect("seal phase 1")
+        .sealed_seg_seq;
+    write(&d, "insert into public.src values (2, 1, 5)").await;
+    assert_eq!(
+        d.try_seal().await,
+        None,
+        "the seal gate holds the next seal"
+    );
+    assert!(claimable(&d).await.is_empty());
+    trellis::staging::seal::seal_phase2(&d.ctl, stuck, drain_driver::WAKE)
+        .await
+        .expect("seal phase 2");
+    let later = d.seal().await;
+    assert_eq!(claimable(&d).await, [stuck]);
+    d.drain(stuck, "a").await;
+    assert_eq!(claimable(&d).await, [later]);
+    d.drain(later, "b").await;
+    assert_oracle(&mut d).await;
+}
+
+// --------------------------------------------------- image-less changes (R8)
+
+/// An image-less change (a `Recompute`) has no sides: its page recomputes the
+/// group of the key's current row, and of its prior-image hint, under the
+/// page's own group locks. The recompute is absolute, so it also repairs a
+/// group whose hidden partials had drifted.
+#[tokio::test]
+async fn an_image_less_change_recomputes_the_groups_it_names() {
+    let mut d = start().await;
+    step(
+        &mut d,
+        "insert into public.src values (1, 1, 10), (2, 1, 5), (3, 2, 7)",
+    )
+    .await;
+    // Drift both groups behind the pipeline's back.
+    d.ctl
+        .batch_execute(&format!(
+            "update {h} set __n = __n + 5, __sum_1 = __sum_1 + 100; \
+             update public.agg set total = total + 100, n = n + 5",
+            h = hidden(&d).await
+        ))
+        .await
+        .expect("drift");
+    d.stage_recomputes_with_prior(
+        SRC,
+        &[("1", Some(r#"{"id": 1, "g": 2, "v": 10}"#.to_string()))],
+    )
+    .await;
+    write(&d, "insert into public.src values (4, 1, 1)").await;
     let batch = d.seal().await;
     d.drain(batch, "a").await;
-    assert_eq!(
-        d.rows("select status from transform_definitions").await,
-        ["(paused)"]
-    );
+    assert_eq!(partials(&d, 1).await, ["(3,3,16,t)"]);
+    assert_eq!(partials(&d, 2).await, ["(1,1,7,t)"]);
+    assert_oracle(&mut d).await;
 }
+
+// ------------------------------------------------- quarantine release (R8)
+
+/// Holds `key` for the one definition, as an eviction would: from now on
+/// every page parks its changes.
+async fn hold(d: &Driver, key: &str) {
+    d.ctl
+        .execute(
+            "insert into poison (transform_id, src_table, key, last_error) \
+             select id, $1, $2, 'test' from transform_definitions \
+             where target_table = 'public.agg'",
+            &[&SRC, &key],
+        )
+        .await
+        .expect("hold the key");
+}
+
+/// The `g` of each group the held row of `key` names, sorted.
+async fn held_groups(d: &Driver, key: &str) -> Vec<String> {
+    d.rows(&format!(
+        "select coalesce(g::jsonb ->> 'g', 'null') from poison_held, unnest(agg_groups) g \
+         where key = '{key}' order by 1"
+    ))
+    .await
+}
+
+async fn release(d: &Driver, key: &str) {
+    trellis::staging::release_key(d.pool(), "agg", SRC, key)
+        .await
+        .expect("release the key");
+}
+
+/// A held key moves 1 → 2 → 3, each change parked. Meanwhile an absolute
+/// write to group 2 (a recompute) counts the key there. The release
+/// recomputes every group the parked changes named, so group 2 loses the
+/// key again; recomputing only the current row's group would leave it.
+#[tokio::test]
+async fn a_release_recomputes_every_group_the_held_key_moved_through() {
+    let mut d = start().await;
+    step(
+        &mut d,
+        "insert into public.src values (1, 1, 10), (2, 2, 20)",
+    )
+    .await;
+    hold(&d, "1").await;
+    step(&mut d, "update public.src set g = 2 where id = 1").await;
+    recompute(&d, &[2]).await.commit().await;
+    step(&mut d, "update public.src set g = 3, v = 11 where id = 1").await;
+    assert_eq!(held_groups(&d, "1").await, ["(1)", "(2)", "(3)"]);
+    assert_eq!(
+        partials(&d, 1).await,
+        ["(1,1,10,f)"],
+        "group 1 drifts while held"
+    );
+    release(&d, "1").await;
+    assert_eq!(partials(&d, 1).await, ["(0,0,0,t)"]);
+    assert_eq!(partials(&d, 2).await, ["(1,1,20,t)"]);
+    assert_eq!(partials(&d, 3).await, ["(1,1,11,t)"]);
+    assert_eq!(d.rows(ACTUAL).await, d.rows(EXPECTED).await);
+    assert_oracle(&mut d).await;
+}
+
+/// Another key's release is the absolute write during the hold: keys 1 and
+/// 2 are both held in group 1 and both move to group 2. Key 2's release
+/// recomputes group 2 counting key 1 there; key 1's release still covers
+/// groups 1 and 2, whatever key 2's did.
+#[tokio::test]
+async fn a_release_after_another_keys_release_to_the_same_group() {
+    let mut d = start().await;
+    step(
+        &mut d,
+        "insert into public.src values (1, 1, 10), (2, 1, 20), (3, 2, 1)",
+    )
+    .await;
+    hold(&d, "1").await;
+    hold(&d, "2").await;
+    step(&mut d, "update public.src set g = 2 where id in (1, 2)").await;
+    release(&d, "2").await;
+    step(&mut d, "update public.src set v = 12 where id = 1").await;
+    release(&d, "1").await;
+    assert_eq!(d.rows(ACTUAL).await, d.rows(EXPECTED).await);
+    assert_oracle(&mut d).await;
+}
+
+/// A change to the key still in the ring at the release applies as a delta
+/// afterwards, filtered by the recomputed groups' basis: its move into group
+/// 3 is already counted there, and its old side leaves group 2, which the
+/// release recomputed from the current row too.
+#[tokio::test]
+async fn a_change_undrained_at_the_release_is_filtered_by_the_basis() {
+    let mut d = start().await;
+    step(&mut d, "insert into public.src values (1, 1, 10)").await;
+    hold(&d, "1").await;
+    step(&mut d, "update public.src set g = 2 where id = 1").await;
+    write(&d, "update public.src set g = 3 where id = 1").await;
+    let pending = d.seal().await;
+    write(&d, "insert into public.src values (2, 4, 1)").await;
+    release(&d, "1").await;
+    assert_eq!(partials(&d, 3).await, ["(1,1,10,t)"]);
+    d.drain(pending, "a").await;
+    assert_eq!(partials(&d, 2).await, ["(0,0,0,t)"]);
+    assert_eq!(partials(&d, 3).await, ["(1,1,10,t)"]);
+    assert_oracle(&mut d).await;
+}
+
+/// The automatic retry of a held key releases it the same way.
+#[tokio::test]
+async fn the_automatic_retry_recomputes_the_held_keys_groups() {
+    let mut d = start().await;
+    step(
+        &mut d,
+        "insert into public.src values (1, 1, 10), (2, 2, 20)",
+    )
+    .await;
+    hold(&d, "1").await;
+    step(&mut d, "update public.src set g = 2, v = 3 where id = 1").await;
+    let poisoned_at: std::time::SystemTime = d
+        .ctl
+        .query_one("select poisoned_at from poison where key = '1'", &[])
+        .await
+        .expect("poisoned_at")
+        .get(0);
+    trellis::staging::quarantine::retry_held_key(d.pool(), "agg", SRC, "1", poisoned_at)
+        .await
+        .expect("retry the key");
+    assert_eq!(d.rows(ACTUAL).await, d.rows(EXPECTED).await);
+    assert_oracle(&mut d).await;
+}
+
+/// The evicting change is parked with its groups: a constraint on the
+/// target refuses the change of key 1 that moves it into group 2, and the
+/// isolation evicts the key at a threshold of one. Its held row names both
+/// groups, and once the constraint is gone the release fixes both.
+#[tokio::test]
+async fn the_evicting_changes_groups_are_held_and_released() {
+    use trellis::staging::quarantine::{IsolationOutcome, isolate_and_evict};
+    use trellis::staging::{BucketFilter, claim, fold};
+
+    let mut d = start().await;
+    step(
+        &mut d,
+        "insert into public.src values (1, 1, 10), (2, 2, 20)",
+    )
+    .await;
+    d.ctl
+        .batch_execute("alter table public.agg add constraint small check (total < 25)")
+        .await
+        .expect("constrain the target");
+    write(&d, "update public.src set g = 2 where id = 1").await;
+    let seg = d.seal().await;
+    let folded = {
+        let mut conn = d.pool().get().await.expect("pool");
+        let txn = conn.transaction().await.expect("txn");
+        claim::claim(&txn, seg, "w", 1).await.expect("claim");
+        let folded = fold::fold(&txn, seg, BucketFilter::all())
+            .await
+            .expect("fold");
+        txn.commit().await.expect("commit the claim");
+        folded
+    };
+    let outcome = isolate_and_evict(d.pool(), seg, "w", drain_driver::WAKE, &folded, 1, false)
+        .await
+        .expect("isolation");
+    assert!(
+        matches!(outcome, IsolationOutcome::Evicted { evicted: 1, .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(held_groups(&d, "1").await, ["(1)", "(2)"]);
+    d.drain(seg, "w").await;
+    d.ctl
+        .batch_execute("alter table public.agg drop constraint small")
+        .await
+        .expect("lift the constraint");
+    assert_eq!(partials(&d, 1).await, ["(1,1,10,f)"], "the move is skipped");
+    release(&d, "1").await;
+    assert_eq!(d.rows(ACTUAL).await, d.rows(EXPECTED).await);
+    assert_oracle(&mut d).await;
+}
+
+// ------------------------------------------------------------------ refusals
 
 /// Define refuses `SUM` over a `numeric` with no declared scale on the group
 /// basis (#1096 decision 2).

@@ -486,12 +486,22 @@ position on. The floor is the second line of defence: the drain barrier
 already orders the truncate's batch after every earlier one and before every
 later one (no segment above an undrained truncate's is claimable,
 `next_claimable_segments`; see [truncate-propagation-spec.md](truncate-propagation-spec.md)),
-and the fold voids its own batch's rows from before it.
+and the fold voids its own batch's rows from before it. Segments are fenced
+in order (the seal gate seals none past an unfenced predecessor), so no
+segment past a truncate's is claimable before the truncate's `has_truncate`
+is decided. A group-basis aggregate (`staging::group_basis`, behind its dev
+knob) empties its hidden table of partials, bases and zero groups the same
+way, and raises the same floor.
 
 **Release and the orphan sweep.** Releasing a quarantined key
 (`staging::release_key`) stages one `Recompute` of it and discards the parked
 rows. A replayed row would carry the releaser's `row_txid`, not the source
-transaction's. A catch-up discharge's orphan sweep finds live entries the
+transaction's. On a group-basis aggregate the release also recomputes, in
+its own transaction, every group the held row's `agg_groups` names (the
+groups of every parked change's images) and the key's current row's, locked
+in one sorted statement and rewritten from a `GROUP BY` of the source with
+that statement's snapshot as each group's basis; a page with a `Recompute`
+recomputes the groups it names the same way, under the page's group locks. A catch-up discharge's orphan sweep finds live entries the
 source no longer backs and Re-derives them in its own transaction (each comes
 back a tombstone and leaves its group), stamping them with the newest segment.
 It locks every such entry, and then every group they are in, before its first
