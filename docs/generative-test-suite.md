@@ -213,11 +213,13 @@ unblocks it.
   table, or by the `FROM` table's alone, with `COUNT`/`SUM`/`AVG` on either side,
   an expression argument and composed fields), and inserts, updates and deletes
   on both tables with `NULL` keys, groups and values now and then. The join keys
-  spread over a dozen values, land mostly on one hot key, or fan out over three
-  keys that both tables keep writing. The ops are issued as the concurrent tier
-  issues them (bursts split over lanes, several drain workers, a short seal
-  cadence), so both sides' writes race into the same batches and onto the same
-  keys; every burst is checked once it settles, and every definition must still
+  spread over a dozen values, land mostly on one hot key, fan out over three
+  keys that both tables keep writing, or spread so wide (64 keys) that two
+  workers' pages of one batch change a key from opposite sides without sharing
+  a partial cell, so only the per-key join lock orders them. The ops are issued
+  as the concurrent tier issues them (bursts split over lanes, several drain
+  workers, a short seal cadence), so both sides' writes race into the same
+  batches and onto the same keys; every burst is checked once it settles, and every definition must still
   be `live` at the end. Every definition is installed over the two empty tables,
   and the run waits for it before its first write: a join aggregate builds only
   over empty tables until its build exists (#1109). A `TRUNCATE` of either table

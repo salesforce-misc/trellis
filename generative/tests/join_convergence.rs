@@ -18,7 +18,12 @@
 //! - `hot_key`: four in five writes on key 0, so pages on both sides queue
 //!   on one key's `J` row and cells;
 //! - `fan_out`: three keys, both tables written alike, so each key has many
-//!   rows on each side and one change fans out over many cells.
+//!   rows on each side and one change fans out over many cells;
+//! - `wide`: 64 keys, both tables written alike, so two workers' pages of
+//!   one batch often change a key from opposite sides without sharing a
+//!   `P` or `M` cell: only the `J` lock orders them (with the denser
+//!   shapes every page locks the same cells, which hides a missing `J`
+//!   lock).
 //!
 //! The ops are issued as the concurrent tier issues them
 //! (`generative::run::run_convergence_concurrent`): bursts of 40 to 600 ops,

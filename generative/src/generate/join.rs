@@ -21,8 +21,12 @@
 //! The op stream ([`build_join_program`]) inserts, updates and deletes rows
 //! of both tables, one statement per op, with values `NULL` now and then
 //! (a `NULL` join key joins nothing). Its [`KeyShape`] decides how the join
-//! keys spread: over a dozen keys, mostly onto one hot key, or over three
-//! keys that both tables keep writing (fan-out on both sides). Updates move
+//! keys spread: over a dozen keys, mostly onto one hot key, over three keys
+//! that both tables keep writing (fan-out on both sides), or over enough
+//! keys that one worker's page often names a key on one side only while
+//! another worker's names it on the other (the race only the `J` lock
+//! orders: with denser keys every page locks the same `P` and `M` cells,
+//! which order the pages anyway). Updates move
 //! rows between keys and groups. The concurrent runner issues the stream in
 //! bursts over several lanes, so both sides' writes race each other into
 //! the same sealed batches and onto the same keys.
@@ -196,11 +200,17 @@ pub enum KeyShape {
     /// up with many rows on each side, so one change fans out over many
     /// cells of the other side.
     FanOut,
+    /// Over [`WIDE_KEYS`] keys, both tables written alike: a key has few
+    /// rows in any one page, so two workers' pages of one batch often
+    /// change one key from opposite sides without sharing a `P` or `M`
+    /// cell, and only the `J` lock orders them.
+    Wide,
 }
 
 pub const SPREAD_KEYS: u8 = 12;
 pub const HOT_OTHER_KEYS: u8 = 6;
 pub const FAN_OUT_KEYS: u8 = 3;
+pub const WIDE_KEYS: u8 = 64;
 
 impl KeyShape {
     pub fn name(self) -> &'static str {
@@ -208,6 +218,7 @@ impl KeyShape {
             KeyShape::Spread => "spread",
             KeyShape::HotKey => "hot_key",
             KeyShape::FanOut => "fan_out",
+            KeyShape::Wide => "wide",
         }
     }
 
@@ -222,6 +233,7 @@ impl KeyShape {
             KeyShape::HotKey if raw < 200 => 0,
             KeyShape::HotKey => 1 + raw % HOT_OTHER_KEYS,
             KeyShape::FanOut => raw % FAN_OUT_KEYS,
+            KeyShape::Wide => raw % WIDE_KEYS,
         })
     }
 }
@@ -456,23 +468,35 @@ mod strategy {
     }
 
     /// A JOIN-tier case: one to three definitions, a [`KeyShape`], 120 to
-    /// [`MAX_OPS`] ops (half on each side for fan-out, about a third on the
-    /// joined side otherwise), bursts of 40 to 600 ops over 2 to 4 lanes,
-    /// against 2 to 6 drain workers sealing every 20 to 200 ms. A burst
-    /// past the engine's split threshold (256 rows) can seal into one batch
-    /// that several workers claim parts of.
+    /// [`MAX_OPS`] ops (half on each side for fan-out and wide, about a
+    /// third on the joined side otherwise), bursts of 40 to 600 ops over 2
+    /// to 4 lanes, against 2 to 6 drain workers sealing every 20 to 200 ms.
+    /// A burst past the engine's split threshold (256 rows) can seal into
+    /// one batch that several workers claim parts of. A `wide` case draws
+    /// its burst size past that threshold, as its race needs two workers on
+    /// one batch.
     pub fn join_case_strategy() -> impl Strategy<Value = JoinCase> {
         prop_oneof![
             Just(KeyShape::Spread),
             Just(KeyShape::HotKey),
-            Just(KeyShape::FanOut)
+            Just(KeyShape::FanOut),
+            Just(KeyShape::Wide)
         ]
         .prop_flat_map(|shape| {
-            let joined_weight = if shape == KeyShape::FanOut { 5 } else { 3 };
+            let joined_weight = if matches!(shape, KeyShape::FanOut | KeyShape::Wide) {
+                5
+            } else {
+                3
+            };
+            let burst_size = if shape == KeyShape::Wide {
+                260usize..=600
+            } else {
+                40usize..=600
+            };
             (
                 proptest::collection::vec(spec(), 1..=3),
                 proptest::collection::vec(draw(joined_weight), 120..=MAX_OPS),
-                40usize..=600,
+                burst_size,
                 2usize..=4,
                 2usize..=6,
                 20u64..=200,
@@ -591,10 +615,19 @@ mod tests {
             .filter(|&raw| KeyShape::HotKey.key(raw) == Some(0))
             .count();
         assert!(hot > 190, "{hot}");
-        for shape in [KeyShape::Spread, KeyShape::HotKey, KeyShape::FanOut] {
+        for shape in [
+            KeyShape::Spread,
+            KeyShape::HotKey,
+            KeyShape::FanOut,
+            KeyShape::Wide,
+        ] {
             assert_eq!(shape.key(255), None);
             assert!((0..250u8).all(|raw| shape.key(raw).is_some()));
         }
         assert!((0..250u8).all(|raw| KeyShape::FanOut.key(raw).unwrap() < FAN_OUT_KEYS));
+        let wide: std::collections::BTreeSet<u8> = (0..250u8)
+            .filter_map(|raw| KeyShape::Wide.key(raw))
+            .collect();
+        assert_eq!(wide.len(), usize::from(WIDE_KEYS));
     }
 }
