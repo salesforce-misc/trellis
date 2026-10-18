@@ -333,17 +333,17 @@ fingerprint sees. Its full routing form cost 4.1–7.3 s per pass at 1,000 leave
 and about 1M target rows, nearly the whole interval. The complement forms cost
 0 ms for `HASH` with nothing missing and 38 ms with two remainders missing,
 under 1 ms for `RANGE`, and 4–8 ms for `LIST`; reading the gaps took 1.9 ms.
-Against Postgres 16, 17 and 18, a leaf detached or dropped between the tree read
-and the text fetch, by a plain or a concurrent detach, reached zero diff one
-pass after the pass that recorded it, in each of the three states, beside mixed
-`HASH` moduli, a partitioned `DEFAULT`, a `DEFAULT` under a middle, a middle
-created again under its name, and several operations in one interval. Against
-the model target, without the re-read a leaf created between the catalog read
-and the cleanup lost its rows for a pass; under about 20 DDL statements a second
-I counted 264–308 wrongful deletes a minute without it and none in about 2,000
-passes with it. Reading the constraint texts before
-the lifecycle catalog lost rows even with the re-read, so the order is part of
-the decision.
+Against Postgres 15 to 18, a node detached between the tree read and the text
+fetch, by a plain or a concurrent detach, and then dropped reached zero diff one
+pass after the pass that recorded it, in each of the three states, also beside
+mixed `HASH` moduli, a partitioned `DEFAULT`, a `DEFAULT` under a middle, a
+middle created again under its name, and several operations in one interval.
+Against the model target, without the re-read a leaf created between the
+catalog read and the cleanup lost its rows for a pass; under about 20 DDL
+statements a second I counted 264–308 wrongful deletes a minute without it and
+none in about 2,000 passes with it. Reading the constraint texts before the
+lifecycle catalog lost rows even with the re-read, so the order is part of the
+decision.
 
 ### A leaf or middle `TRUNCATE` queues that node's correction
 

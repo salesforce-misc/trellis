@@ -1613,16 +1613,18 @@ async fn a_detach_committed_during_the_text_fetch_converges() {
         holder.batch_execute("commit").await.expect("commit");
         // The fetch takes the node's lock once the DDL commits and finds it
         // no longer a partition: the pass fails for the source (`XX000`) and
-        // records nothing; or, past the fetch's lock timeout, it retries and
-        // reads no text. Either way the next pass reads the tree afresh.
+        // records nothing. Past the fetch's lock timeout it retries and reads
+        // no text; past its last retry it defers the check and records
+        // nothing (a slow runner can commit that late). Each way the next
+        // pass reads the tree afresh.
         let outcome = pass.finish().await;
         let recorded = fx.recorded_text("public.items_x").await;
+        let failed = outcome
+            .failed
+            .iter()
+            .any(|(_, e)| e.to_string().contains("could not"));
         assert!(
-            outcome
-                .failed
-                .iter()
-                .any(|(_, e)| e.to_string().contains("could not"))
-                || recorded == Some(None),
+            failed || (outcome.failed.is_empty() && matches!(recorded, Some(None) | None)),
             "{ddl}: {:?} {recorded:?}",
             outcome.failed
         );
@@ -1631,4 +1633,126 @@ async fn a_detach_committed_during_the_text_fetch_converges() {
         }
         converge(&mut fx, ddl, 4).await;
     }
+}
+
+/// A range tree with a `HASH` middle for the groups 4-19 that has no leaf
+/// for remainder 3, ten rows a group outside that remainder.
+const HASH_MIDDLE_TREE: &str = "create table public.items (id integer not null, g integer not null, \
+         v integer not null, primary key (g, id)) partition by range (g); \
+     create table public.items_lo partition of public.items for values from (0) to (4); \
+     create table public.items_m partition of public.items for values from (4) to (20) \
+         partition by hash (g); \
+     create table public.items_m0 partition of public.items_m \
+         for values with (modulus 4, remainder 0); \
+     create table public.items_m1 partition of public.items_m \
+         for values with (modulus 4, remainder 1); \
+     create table public.items_m2 partition of public.items_m \
+         for values with (modulus 4, remainder 2); \
+     insert into public.items select i, i % 20, i from generate_series(1, 200) i \
+         where i % 20 < 4 \
+            or not satisfies_hash_partition('public.items_m'::regclass, 4, 3, i % 20);";
+
+/// The middle's remainder-3 leaf, with rows through the parent.
+const HASH_MIDDLE_M3: &str = "create table public.items_m3 partition of public.items_m \
+         for values with (modulus 4, remainder 3); \
+     insert into public.items select 5000 + i, i % 20, 7 from generate_series(1, 200) i \
+         where i % 20 >= 4 \
+           and satisfies_hash_partition('public.items_m'::regclass, 4, 3, i % 20);";
+
+/// Rows through the parent for the groups 4-19, into whatever owns them.
+const INTO_THE_MIDDLES_REGION: &str =
+    "insert into public.items select 8000 + i, 4 + i % 16, 5 from generate_series(1, 64) i;";
+
+/// A `HASH` leaf read and detached in the window (no usable text) and
+/// dropped; then, in one interval, its middle is dropped and a root
+/// `DEFAULT` takes the middle's whole bound. The engine runs before the next
+/// pass.
+#[tokio::test]
+async fn a_hash_middle_dropped_and_a_default_created_around_a_node_without_a_usable_text_converge()
+{
+    let mut fx = Fx::start(HASH_MIDDLE_TREE, ValueType::Numeric).await;
+    fx.exec(HASH_MIDDLE_M3).await;
+    fx.d.settle().await;
+    fx.pass_around_the_fetch(
+        "alter table public.items_m detach partition public.items_m3; \
+         drop table public.items_m3",
+    )
+    .await;
+    assert_eq!(fx.recorded_text("public.items_m3").await, Some(None));
+    fx.exec(&format!(
+        "drop table public.items_m; \
+         create table public.items_d partition of public.items default; \
+         {INTO_THE_MIDDLES_REGION}"
+    ))
+    .await;
+    fx.d.settle().await;
+    assert!(!fx.wrong_groups().await.is_empty(), "rows to correct");
+    fx.correct().await;
+    let (_, queued) = converge(&mut fx, "middle dropped, default created", 4).await;
+    assert!(
+        queued
+            .iter()
+            .any(|q| q == "new_leaf public.items_d created")
+            && queued
+                .iter()
+                .any(|q| q.starts_with("gone_node public.items_m ")),
+        "{queued:?}"
+    );
+}
+
+/// A `HASH` middle detached, not dropped, while a new leaf's `new_leaf`
+/// (whose text names the middle) is queued: the engine runs before the next
+/// pass and can still evaluate the text. The detached middle is dropped
+/// later.
+#[tokio::test]
+async fn a_hash_middle_detached_under_a_queued_new_leaf_converges() {
+    let mut fx = Fx::start(HASH_MIDDLE_TREE, ValueType::Numeric).await;
+    fx.exec(HASH_MIDDLE_M3).await;
+    fx.d.settle().await;
+    fx.pass().await;
+    assert_eq!(kinds(&fx.queue().await), ["new_leaf"]);
+    fx.exec("alter table public.items detach partition public.items_m")
+        .await;
+    fx.d.settle().await;
+    fx.correct().await;
+    let (_, queued) = converge(&mut fx, "middle detached", 4).await;
+    assert_eq!(queued, ["gone_node public.items_m gone"]);
+    fx.exec("drop table public.items_m").await;
+    converge(&mut fx, "detached middle dropped", 4).await;
+}
+
+/// A new `HASH` leaf read by a pass whose window detaches its middle and
+/// attaches a middle of another modulus under the same bound; the old
+/// middle is dropped before the next pass, with rows for the new one.
+#[tokio::test]
+async fn a_hash_middle_replaced_by_another_modulus_around_the_fetch_converges() {
+    let mut fx = Fx::start(HASH_MIDDLE_TREE, ValueType::Numeric).await;
+    fx.exec(HASH_MIDDLE_M3).await;
+    fx.d.settle().await;
+    fx.pass_around_the_fetch(
+        "alter table public.items detach partition public.items_m; \
+         create table public.items_n partition of public.items for values from (4) to (20) \
+             partition by hash (g); \
+         create table public.items_n0 partition of public.items_n \
+             for values with (modulus 2, remainder 0); \
+         create table public.items_n1 partition of public.items_n \
+             for values with (modulus 2, remainder 1);",
+    )
+    .await;
+    fx.exec(&format!(
+        "drop table public.items_m; {INTO_THE_MIDDLES_REGION}"
+    ))
+    .await;
+    fx.d.settle().await;
+    assert!(!fx.wrong_groups().await.is_empty(), "rows to correct");
+    let (_, queued) = converge(&mut fx, "middle replaced", 4).await;
+    assert!(
+        queued
+            .iter()
+            .any(|q| q == "new_leaf public.items_n0 created")
+            && queued
+                .iter()
+                .any(|q| q.starts_with("gone_node public.items_m ")),
+        "{queued:?}"
+    );
 }
