@@ -1746,6 +1746,29 @@ pub(crate) async fn rebuildable(
     Ok(taken)
 }
 
+/// The definitions among `ids` that [`rebuildable`] takes and that are on the
+/// group basis ([`takes_group_basis`]): the readers of a target an upstream
+/// build rewrote outside the seam that are rebuilt rather than caught up
+/// (`intake::markers::park_target_catchup_if_read`, #1100). The caller holds
+/// their rows `for update`.
+pub(crate) async fn rebuildable_on_group_basis(
+    client: &impl GenericClient,
+    ids: &[i64],
+) -> Result<Vec<i64>, crate::intake::IntakeError> {
+    let mut taken = Vec::new();
+    if ids.is_empty() || !super::group_basis::enabled() {
+        return Ok(taken);
+    }
+    for id in rebuildable(client, ids).await? {
+        if let Some(definition) = catalog::definition_by_id_in(client, id).await?
+            && takes_group_basis(&definition)
+        {
+            taken.push(id);
+        }
+    }
+    Ok(taken)
+}
+
 /// Rebuilds the definitions `ids` ([`rebuildable`]) in `txn`, the caller's
 /// transaction (#625 F7): moves a `live` one to `backfilling` with `build =
 /// 'rederive'` (one already building stays as it is), and enqueues a plan

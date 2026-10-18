@@ -23,10 +23,26 @@
 //!   is #1101's;
 //! - halts on a source `TRUNCATE`, on an image-less change (a Re-derive or a
 //!   released key), and on a resume or rebuild, which are #1101's and #1102's;
-//! - is refused at define over another definition's target (the generic
-//!   target feed, #1100's chained-source part), over a partitioned source
-//!   (#1103), and for `SUM`/`AVG` over a `numeric` column with no declared
-//!   scale (#1096 decision 2).
+//! - is refused at define over a partitioned source (#1103), and for
+//!   `SUM`/`AVG` over a `numeric` column with no declared scale (#1096
+//!   decision 2).
+//!
+//! # A source that is another definition's target
+//!
+//! A target is never captured. Its writers stage its changes through the
+//! target-mutation seam, and a target with a group-basis reader is on the
+//! seam's image feed (`super::target_mutations`, "The image feed"): each
+//! changed key arrives as a CDC-shaped ring row with its exact old and new
+//! images, ordered by the writer's write token, with the writer's
+//! transaction as its `row_txid`. A page consumes those rows exactly as it
+//! consumes captured ones. An upstream group with no visible row is absent
+//! from the images, so a rollup's sums telescope as the group empties and
+//! refills.
+//!
+//! An upstream build or rebuild that writes the target outside the seam
+//! parks a catch-up for its readers, and a group-basis reader is rebuilt
+//! instead (`crate::intake::markers::park_target_catchup_if_read`): an
+//! image-less catch-up names keys, not the deltas a group needs.
 //!
 //! # Which definitions
 //!
@@ -333,6 +349,14 @@ pub(crate) fn hidden_table_name(id: i64) -> String {
     format!("agg_{id}")
 }
 
+/// [`hidden_table_name`] as SQL, over the definition id expression `id`:
+/// for a statement that asks which definitions are on the group basis by
+/// whether their hidden table exists (`super::target_mutations`' image
+/// feed).
+pub(crate) fn hidden_table_name_sql(id: &str) -> String {
+    format!("('agg_' || {id})")
+}
+
 /// The hidden table of definition `id`, quoted and qualified by the catalog
 /// schema `schema`.
 fn hidden_table_ident(schema: &str, id: i64) -> String {
@@ -408,12 +432,6 @@ pub(crate) async fn check_define(
 ) -> Result<(), crate::defs::catalog::CatalogError> {
     let refuse =
         |reason: String| Err(crate::defs::catalog::CatalogError::GroupBasisUnsupported { reason });
-    if crate::defs::catalog::is_definition_target(txn, qualified_source).await? {
-        return refuse(format!(
-            "its source {qualified_source} is another definition's target, which needs the \
-             generic target feed (#1100)"
-        ));
-    }
     if crate::defs::partition_tree::is_partitioned_root(txn, qualified_source).await? {
         return refuse(format!(
             "its source {qualified_source} is partitioned (#1103)"

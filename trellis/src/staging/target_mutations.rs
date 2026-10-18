@@ -8,7 +8,8 @@
 //! definition's target (a chained hop) learns about that target's changes
 //! only from the rows the writer stages here, inside the same transaction as
 //! the write itself: image-less `Recompute` rows, or CDC-shaped rows for a
-//! relationship endpoint (see the last section). That gives properties
+//! target whose readers need exact images (see "The image feed"). That gives
+//! properties
 //! capture would not:
 //!
 //! - **The key is correct by construction.** Each staged key is the target's
@@ -53,7 +54,10 @@
 //! settled projection that catch-up's discharge also refreshes (#507,
 //! `intake::markers::park_target_catchup_if_read`). That catch-up re-reads
 //! the target's current keys, so it can't tell a reader about a row the
-//! rebuild deleted: such a delete goes through the seam (#815).
+//! rebuild deleted: such a delete goes through the seam (#815). A reader on
+//! the group basis (`super::group_basis`) can't apply an image-less
+//! catch-up as deltas, so the same park starts a rebuild of it instead
+//! (`staging::build::start_rebuilds`).
 //! A chunk a worker held across a resume can't write once the rebuild has
 //! made the target applying again: its claim fences every write it makes
 //! (`defs::chunk_queue::ClaimFence`, #434).
@@ -81,9 +85,9 @@
 //! # What gets staged
 //!
 //! One `StagedChange::Recompute` per changed key, for every target at least
-//! one applying definition reads (a relationship-endpoint target the seam
-//! feeds gets a CDC-shaped row instead; see the last section). The row is
-//! image-less, so a downstream
+//! one applying definition reads (a target on the image feed gets a
+//! CDC-shaped row instead; see "The image feed"). The row is image-less, so a
+//! downstream
 //! aggregate re-derives the affected group from live state and a downstream
 //! 1-1 re-reads the row: both idempotent, whatever batch the signal lands in.
 //!
@@ -113,9 +117,9 @@
 //! token**, `pg_current_wal_insert_lsn()`, into [`Propagation::write_token`]
 //! (issue #401, step 1 of #375's direction 1). It orders one key's writes in
 //! the same WAL space as a capture trigger's `lsn`, which is what lets the seam
-//! stand in as a CDC-shaped feed for a target (steps 2 and 3, #402/#403): an
-//! endpoint target's CDC-shaped seam rows carry it as their `lsn` (see the last
-//! section).
+//! stand in as a CDC-shaped feed for a target (steps 2 and 3, #402/#403): a
+//! target's CDC-shaped seam rows carry it as their `lsn` (see "The image
+//! feed").
 //!
 //! Where it is read is the whole point. Two writers of one key serialize on
 //! that key's row lock: the second acquires it only after the first commits,
@@ -137,8 +141,8 @@
 //! conservative "unknown" `await_converged` already gates on (see
 //! `staging::converge::converged_through`).
 //! It is read only when this transaction stages something (some key of a
-//! target an applying definition reads, or that the seam feeds as an
-//! endpoint), so a terminal target pays no extra round trip.
+//! target an applying definition reads, or that is on the image feed), so
+//! a terminal target pays no extra round trip.
 //!
 //! # Spilling a large write (issue #924)
 //!
@@ -150,7 +154,7 @@
 //! not capped: either can delete tens of millions of rows in one
 //! transaction, and holding each key with its
 //! prior image until the flush would hold them all in memory, and re-reading
-//! an endpoint target's new images would bind them all in one statement,
+//! an image-fed target's new images would bind them all in one statement,
 //! past PostgreSQL's 1 GB message limit.
 //!
 //! So a writer that changes keys in batches calls
@@ -175,17 +179,26 @@
 //! it refuses one (`ApplyError::SpilledMutationsNotFlushed`) rather than drop
 //! the keys in the table.
 //!
-//! # Standing in for a relationship endpoint's CDC (issues #402, #403)
+//! # The image feed (issues #402, #403, #1100)
 //!
-//! A relationship's settled parent projection, its reverse deltas and a
-//! from-side's `group_key` (issues #129-#136) are driven by image-bearing,
-//! LSN-ordered changes. A plain source endpoint gets those from CDC. A
-//! target that is a relationship endpoint gets them from the seam alone
-//! (#375's direction 1): endpoint targets are uncaptured like every other
-//! target. For such a target ([`TargetInfo::endpoint_feed`], any relationship
-//! naming it on either side, whether or not an applying definition reads through
-//! it yet), each changed key is staged as a [`StagedChange::Cdc`] row rather
-//! than a `Recompute`:
+//! Some readers of a target need exact, ordered images of its changes, as
+//! capture gives a source:
+//!
+//! - a relationship naming the target on either side: its settled parent
+//!   projection, its reverse deltas and a from-side's `group_key` (issues
+//!   #129-#136), whether or not an applying definition reads through it yet;
+//! - an applying aggregate on the group basis (`super::group_basis`), which
+//!   applies `f(new) - f(old)` per change: an image-less `Recompute` names a
+//!   row's new group but not the one it left (ADR-0002, "Multi-hop");
+//! - an applying `JOIN` transform with the target on either side.
+//!
+//! The last two count only while the group-basis dev knob is on
+//! (`super::group_basis`'s "The knob"): until it is the default, no
+//! aggregate is on the group basis, and the `JOIN` apply (#1108) builds on
+//! it.
+//!
+//! A target with any of them ([`TargetInfo::image_feed`]) stages each
+//! changed key as a [`StagedChange::Cdc`] row rather than a `Recompute`:
 //!
 //! - **`old_image`** is the key's prior image (above), and **`new_image`**
 //!   is the row as this transaction left it, re-read by key in
@@ -194,38 +207,50 @@
 //!   wrong or missing new image: every recorded key is either still
 //!   row-locked by this transaction or gone. The op follows from which
 //!   images exist; a key created and deleted in the same transaction
-//!   changed nothing any consumer saw and stages nothing.
-//! - **`lsn`** is the write token, so the fold's first/last image rules
-//!   order one key's seam rows by the order their writers committed.
+//!   changed nothing any consumer saw and stages nothing. An aggregate
+//!   group that has no visible row is absent from both, so a reader's sums
+//!   telescope across its writes.
+//! - **`lsn`** is the write token, so one key's seam rows order by the order
+//!   their writers committed, and its images chain: each row's old image is
+//!   the previous row's new image.
+//! - **`row_txid`** is the writer's transaction, as for any ring row, which
+//!   orders the change against a group-basis reader's bases.
 //! - **`group_key`** is the union of the target's outbound relationships'
 //!   `from_col` values across both images, the same rule a capture trigger
 //!   applies to a changed row (`capture::sql`).
 //! - **`origin_lsn`** stays `None`, as for a `Recompute` (see "The write
 //!   token").
 //!
-//! Every consumer of the target then sees the same rows it would from CDC,
-//! a direct transform reader included: it applies a delta from the images
-//! instead of re-reading. Only endpoint targets get these rows; every other
-//! target keeps the image-less `Recompute`. An aggregate target qualifies
-//! too: its NULL-able grouping key is re-read NULL-safely.
+//! Every target without such a reader keeps the image-less `Recompute`, and
+//! a terminal target stages nothing. An aggregate target qualifies like any
+//! other: its NULL-able grouping key is re-read NULL-safely.
 //!
-//! **One feed per target.** A seam row and a CDC row for the same write
-//! would be two deltas, applied twice when they land in different batches,
-//! which is why the seam only took this over once endpoint targets were no
-//! longer captured (#403). Targets are not trigger-captured (#807).
+//! **One feed per target.** Every reader of an image-fed target consumes the
+//! same rows: a 1-1 or ledger reader applies a delta from the images instead
+//! of re-reading. A seam row and a CDC row for the same write would be two
+//! deltas, applied twice when they land in different batches, which is why
+//! the seam only took this over once endpoint targets were no longer
+//! captured (#403). Targets are not trigger-captured (#807).
 //!
-//! **A target becoming an endpoint.** [`TargetInfo`] is resolved once per
-//! transaction, so a writer that resolved it before a `create_relationship`
-//! naming the target committed stages its `Recompute` (or nothing, with no
-//! reader), not a CDC-shaped row. That write is invisible to the
-//! relationship's own projection seed as well, so its projection misses
-//! it. The miss is bounded: no definition can read through a relationship
-//! before the relationship commits, and the first one to do so re-seeds the
-//! projection's missing rows, and every column it reads, from the live table
-//! (`catalog::ensure_relationship_projection_in_txn`). What that catch-up
-//! can't undo (it only adds rows) is a projection row for a to-side row the
-//! writer deleted or re-keyed. That is the drift a plain source to-side's
-//! projection already accumulates before its capture is installed.
+//! **A target gaining a reader that needs images.** [`TargetInfo`] is
+//! resolved once per transaction, so a writer that resolved it before the
+//! reader existed stages its `Recompute` (or nothing, with no reader), not a
+//! CDC-shaped row.
+//!
+//! - A group-basis reader is built by the Re-derive build, whose plan waits
+//!   on its fence (`staging::build`'s "Seam-fed sources") until every such
+//!   writer has ended, so it reads their writes. Until the group basis has a
+//!   build of its own (#1101), that plan only accepts an empty source, so a
+//!   write that raced the build fails it rather than being missed.
+//! - A relationship's own projection seed doesn't see such a write either, so
+//!   its projection misses it. The miss is bounded: no definition can read
+//!   through a relationship before the relationship commits, and the first
+//!   one to do so re-seeds the projection's missing rows, and every column it
+//!   reads, from the live table
+//!   (`catalog::ensure_relationship_projection_in_txn`). What that catch-up
+//!   can't undo (it only adds rows) is a projection row for a to-side row the
+//!   writer deleted or re-keyed. That is the drift a plain source to-side's
+//!   projection already accumulates before its capture is installed.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::SystemTime;
@@ -259,40 +284,68 @@ struct KeyMutation {
 #[derive(Debug, Clone)]
 struct TargetInfo {
     /// Whether anything consumes this target's changes: an applying definition
-    /// reads it as its source, or the seam feeds it as a relationship
-    /// endpoint (`endpoint_feed`).
+    /// reads it as its source, or the seam feeds it images as a relationship
+    /// endpoint (`image_feed`).
     has_readers: bool,
     /// The target's live column list, only resolved when `has_readers`.
     image_columns: Vec<String>,
-    /// `Some` when the seam is this target's change feed as a relationship
-    /// endpoint, so its rows are staged CDC-shaped (see the module doc).
-    endpoint_feed: Option<EndpointFeed>,
+    /// `Some` when the target's feed carries exact images, so its rows are
+    /// staged CDC-shaped (see the module doc's "The image feed").
+    image_feed: Option<ImageFeed>,
 }
 
-/// What staging CDC-shaped rows for an endpoint target needs beyond its
-/// images.
+/// What staging CDC-shaped rows for a target needs beyond its images.
 #[derive(Debug, Clone)]
-struct EndpointFeed {
+struct ImageFeed {
     /// The target's row identity, in declared order: what every writer's
     /// recorded key encodes (`ddl::pk_key_sql_expr`), used to re-read each
     /// key's new image.
     key_columns: Vec<PrimaryKeyColumn>,
     /// The `from_col` of every relationship whose from-side is this target,
-    /// sorted and deduplicated; empty when it is only ever a to-side.
+    /// sorted and deduplicated; empty when it is no relationship's from-side.
     group_key_columns: Vec<String>,
 }
 
-/// Resolves the seam's [`EndpointFeed`] for `target`, or `None` when it is no
-/// relationship's endpoint.
+/// Whether an applying definition that needs exact images reads `$1` (see
+/// the module doc's "The image feed"): a `JOIN` transform with the table on
+/// either side, or an aggregate on the group basis, which is the one kind of
+/// definition with a hidden table named by its id in the catalog's schema
+/// (`super::group_basis::hidden_table_name`).
+///
+/// A constant `false` while the group-basis dev knob is off
+/// (`super::group_basis::enabled`): no aggregate is on the group basis then,
+/// and a `JOIN` transform's apply, which consumes the images, is #1108's and
+/// builds on the group basis. So with the knob off the check costs nothing.
+fn image_readers_sql() -> String {
+    if !super::group_basis::enabled() {
+        return "false".to_string();
+    }
+    format!(
+        "select exists (select 1 from transform_definitions d \
+             where (d.source_table = $1 or d.join_table = $1) and {} \
+               and (d.join_table is not null or exists ( \
+                   select 1 from pg_catalog.pg_class c \
+                   where c.relname = {} \
+                     and c.relnamespace = (select relnamespace from pg_catalog.pg_class \
+                                           where oid = 'transform_definitions'::regclass))))",
+        crate::defs::model::applying_sql("d"),
+        super::group_basis::hidden_table_name_sql("d.id"),
+    )
+}
+
+/// Resolves the seam's [`ImageFeed`] for `target`, or `None` when its feed
+/// stays image-less: it is no relationship's endpoint, and no applying
+/// definition that needs images reads it (`image_readers`).
 ///
 /// An aggregate target qualifies like any other: its row identity is its
 /// `UNIQUE NULLS NOT DISTINCT` grouping columns, which [`read_new_images`]
 /// matches NULL-safely.
-async fn resolve_endpoint_feed(
+async fn resolve_image_feed(
     txn: &Transaction<'_>,
     target: &str,
-) -> Result<Option<EndpointFeed>, ApplyError> {
-    if !catalog::is_relationship_endpoint(txn, target).await? {
+    image_readers: bool,
+) -> Result<Option<ImageFeed>, ApplyError> {
+    if !image_readers && !catalog::is_relationship_endpoint(txn, target).await? {
         return Ok(None);
     }
     let key_columns = ddl::identity_key_columns(txn, target).await?;
@@ -313,7 +366,7 @@ async fn resolve_endpoint_feed(
     };
     group_key_columns.sort();
     group_key_columns.dedup();
-    Ok(Some(EndpointFeed {
+    Ok(Some(ImageFeed {
         key_columns,
         group_key_columns,
     }))
@@ -418,7 +471,7 @@ impl TargetMutations {
                 .or_insert(TargetInfo {
                     has_readers,
                     image_columns: Vec::new(),
-                    endpoint_feed: None,
+                    image_feed: None,
                 });
         }
         if !self.targets.contains_key(target) {
@@ -431,23 +484,24 @@ impl TargetMutations {
             // Mirrors `catalog::dependents_of`'s own status filter: a reader
             // apply doesn't maintain yet is excluded from applies anyway, and
             // catches up from its own backfill or catch-up marker.
-            let direct_readers: bool = txn
+            let readers = txn
                 .query_one(
                     &format!(
                         "select exists (select 1 from transform_definitions \
-                         where (source_table = $1 or join_table = $1) and {})",
-                        crate::defs::model::APPLYING_SQL
+                         where (source_table = $1 or join_table = $1) and {}), ({})",
+                        crate::defs::model::APPLYING_SQL,
+                        image_readers_sql(),
                     ),
                     &[&target],
                 )
-                .await?
-                .get(0);
+                .await?;
+            let (direct_readers, image_readers): (bool, bool) = (readers.get(0), readers.get(1));
             // Any relationship, not only one a live definition reads: a
             // to-one relationship's settled parent projection is maintained
             // from the moment the relationship exists, so a reader that goes
             // live later finds it current.
-            let endpoint_feed = resolve_endpoint_feed(txn, target).await?;
-            let has_readers = direct_readers || endpoint_feed.is_some();
+            let image_feed = resolve_image_feed(txn, target, image_readers).await?;
+            let has_readers = direct_readers || image_feed.is_some();
             let image_columns = if has_readers {
                 live_row_columns(txn, target).await?
             } else {
@@ -458,7 +512,7 @@ impl TargetMutations {
                 TargetInfo {
                     has_readers,
                     image_columns,
-                    endpoint_feed,
+                    image_feed,
                 },
             );
         }
@@ -531,8 +585,8 @@ impl TargetMutations {
     }
 
     /// Turns every recorded key of a target with an applying reader into its
-    /// downstream `Recompute` row at `hop_gen + 1`, or, for a target the seam
-    /// feeds as a relationship endpoint, its CDC-shaped row (re-reading each
+    /// downstream `Recompute` row at `hop_gen + 1`, or, for a target on the
+    /// image feed, its CDC-shaped row (re-reading each
     /// key's new image; see the module doc). A key whose next hop
     /// would pass [`MAX_HOP_GEN`] is not staged; its target is reported in
     /// [`Propagation::hop_bound_tables`] instead, for the caller to fail the
@@ -831,7 +885,7 @@ async fn upsert_spilled(
 
 /// Stages one target's `keys` into `propagation`, as
 /// [`TargetMutations::into_staged`] describes: a `Recompute` per key, or for
-/// an endpoint target a CDC-shaped row from the key's prior image and its
+/// a target on the image feed a CDC-shaped row from the key's prior image and its
 /// re-read new image, carrying `token`. A key past [`MAX_HOP_GEN`] is
 /// reported instead.
 async fn stage_target(
@@ -843,7 +897,7 @@ async fn stage_target(
     propagation: &mut Propagation,
     stats: &mut SeamStats,
 ) -> Result<(), ApplyError> {
-    let mut new_images = match &info.endpoint_feed {
+    let mut new_images = match &info.image_feed {
         Some(feed) => {
             stats.bound(keys.len());
             read_new_images(txn, target, &info.image_columns, feed, &keys).await?
@@ -896,7 +950,7 @@ async fn stage_target(
 struct NewImage {
     /// The row as this transaction left it, `None` if it deleted the row.
     image: Option<String>,
-    /// The union of `EndpointFeed::group_key_columns`' values across the
+    /// The union of `ImageFeed::group_key_columns`' values across the
     /// key's prior and new images, `None` when there are none.
     group_key: Option<Vec<String>>,
 }
@@ -919,7 +973,7 @@ async fn read_new_images(
     txn: &Transaction<'_>,
     target: &str,
     image_columns: &[String],
-    feed: &EndpointFeed,
+    feed: &ImageFeed,
     keys: &BTreeMap<String, KeyMutation>,
 ) -> Result<HashMap<String, NewImage>, ApplyError> {
     if keys.is_empty() {
@@ -1003,7 +1057,7 @@ impl NewImagesQuery<'_> {
 fn new_images_query<'a>(
     target: &str,
     image_columns: &[String],
-    feed: &EndpointFeed,
+    feed: &ImageFeed,
     keys: &'a BTreeMap<String, KeyMutation>,
 ) -> Result<NewImagesQuery<'a>, ApplyError> {
     let pk = &feed.key_columns;
@@ -1562,7 +1616,7 @@ mod tests {
                 },
             );
         }
-        let feed = EndpointFeed {
+        let feed = ImageFeed {
             key_columns,
             group_key_columns: vec!["Grp".to_string()],
         };
@@ -1648,7 +1702,7 @@ mod tests {
                 )
             })
             .collect();
-        let feed = EndpointFeed {
+        let feed = ImageFeed {
             key_columns,
             group_key_columns: Vec::new(),
         };
@@ -1734,7 +1788,7 @@ mod tests {
                     )
                 })
                 .collect();
-            let feed = EndpointFeed {
+            let feed = ImageFeed {
                 key_columns,
                 group_key_columns: Vec::new(),
             };
@@ -1868,7 +1922,7 @@ mod tests {
                 })
                 .collect();
             assert_eq!(keys.len(), 5000);
-            let feed = EndpointFeed {
+            let feed = ImageFeed {
                 key_columns,
                 group_key_columns: Vec::new(),
             };

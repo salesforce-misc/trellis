@@ -178,10 +178,18 @@ pub(crate) async fn park_widen_marker(
 /// for by [`request_projection_refresh`]), which a later consumer would
 /// otherwise read stale. A no-op for a target that is neither read nor a
 /// to-side.
+///
+/// A reader on the group basis (`staging::group_basis`) is rebuilt instead
+/// (ADR-0002, "Multi-hop"): the catch-up's image-less re-read names keys,
+/// not the deltas its groups need. It is taken as
+/// [`park_table_catch_ups`] takes a rebuildable reader, and the ids are
+/// returned for the caller to pass to
+/// [`crate::staging::build::stamp_rebuild_seg`] as the last statement before
+/// it commits.
 pub(crate) async fn park_target_catchup_if_read(
     client: &impl GenericClient,
     definition_id: i64,
-) -> Result<(), IntakeError> {
+) -> Result<Vec<i64>, IntakeError> {
     let target: String = client
         .query_one(
             "select target_table from transform_definitions where id = $1",
@@ -189,9 +197,25 @@ pub(crate) async fn park_target_catchup_if_read(
         )
         .await?
         .get(0);
-    let (readers, tables) = target_catchups(client, std::slice::from_ref(&target)).await?;
+    let (mut readers, tables) = target_catchups(client, std::slice::from_ref(&target)).await?;
+    if !readers.is_empty() {
+        // `park_catch_up`'s lock order: every definition this touches
+        // first, in id order (`readers` is sorted).
+        client
+            .execute(
+                "select 1 from transform_definitions where id = any($1) order by id for update",
+                &[&readers],
+            )
+            .await?;
+    }
+    let rebuilt = crate::staging::build::rebuildable_on_group_basis(client, &readers).await?;
+    readers.retain(|id| !rebuilt.contains(id));
     park_catch_up(client, &readers, &tables).await?;
-    request_projection_refresh(client, &tables).await
+    // After the marker, so the generation each rebuild records is the one
+    // just parked, which then has nothing to enumerate for it.
+    crate::staging::build::start_rebuilds(client, &rebuilt).await?;
+    request_projection_refresh(client, &tables).await?;
+    Ok(rebuilt)
 }
 
 /// Parks a marker on each of `tables` that re-reads it for definitions

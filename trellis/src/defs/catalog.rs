@@ -1383,16 +1383,21 @@ pub(crate) async fn complete_direct_backfill(
     // match anything and this would fail every time with
     // [`CatalogError::SourceTableNotFound`].
     let status = catch_up_if_backfilling(txn, definition_id).await?.status();
+    let mut rebuilt = Vec::new();
     if status == TransformStatus::CatchingUp {
         // Issue #315: the chunks wrote this target outside the seam; a
-        // reader already attached to it (a resumed upstream's) re-derives.
-        crate::intake::markers::park_target_catchup_if_read(txn, definition_id).await?;
+        // reader already attached to it (a resumed upstream's) re-derives,
+        // or, on the group basis, is rebuilt (#1100).
+        rebuilt = crate::intake::markers::park_target_catchup_if_read(txn, definition_id).await?;
     }
     if status.is_frozen() {
         return Ok(status);
     }
     let tables = definition_tables_read(txn, definition_id).await?;
     crate::intake::markers::park_catch_up(txn, &[definition_id], &tables).await?;
+    // Last here, so the active segment's share lock is held only for the
+    // rest of the caller's transaction.
+    crate::staging::build::stamp_rebuild_seg(txn, &rebuilt).await?;
     // The park moves a `live` definition (one a leftover chunk wrote under)
     // to `catching_up` too.
     Ok(if status.is_applying() {
