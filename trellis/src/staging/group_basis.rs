@@ -487,6 +487,41 @@ pub(crate) struct GroupTargetPlan {
     pushed: bool,
 }
 
+/// The columns of a plan's staging table, as DDL.
+fn staged_columns(shape: &GroupShape) -> Vec<String> {
+    let mut columns: Vec<String> = shape
+        .group_cols
+        .iter()
+        .zip(&shape.group_types)
+        .map(|(c, t)| format!("{} {t}", quote_ident(c)))
+        .collect();
+    columns.push("__txid xid8".to_string());
+    columns.push("__lsn pg_lsn".to_string());
+    columns.push("__n bigint".to_string());
+    for (i, arg) in shape.args.iter().enumerate() {
+        columns.push(format!("__c{} bigint", i + 1));
+        if arg.summed {
+            columns.push(format!("__s{} numeric", i + 1));
+        }
+    }
+    columns
+}
+
+/// A short stable hash of the staging table's columns. The table is a
+/// session temp table, and the pool keeps its connections, so a connection
+/// keeps the table it first created under a name. Putting the shape in the
+/// name means a definition whose group column was re-typed (a resume re-reads
+/// the types under the same id) gets a new table; the old one is never
+/// touched again and goes with its session.
+fn staged_shape_hash(shape: &GroupShape) -> u32 {
+    // FNV-1a: fixed by definition, unlike `DefaultHasher`.
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in staged_columns(shape).join(",").bytes() {
+        hash = (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
 impl GroupTargetPlan {
     pub(crate) fn new(
         catalog_schema: &str,
@@ -502,7 +537,10 @@ impl GroupTargetPlan {
             hidden_ident: hidden_table_ident(catalog_schema, definition_id),
             staged: format!(
                 "pg_temp.{}",
-                quote_ident(&format!("trellis_group_sides_{definition_id}"))
+                quote_ident(&format!(
+                    "trellis_group_sides_{definition_id}_{:08x}",
+                    staged_shape_hash(&shape)
+                ))
             ),
             source_row: ddl::qualified_source_table(source),
             identity,
@@ -616,26 +654,10 @@ impl GroupTargetPlan {
     /// statement) of the page with each partial's signed sum. Created once a
     /// session; its rows go with each page's transaction.
     fn staged_ddl(&self) -> String {
-        let mut columns: Vec<String> = self
-            .shape
-            .group_cols
-            .iter()
-            .zip(&self.shape.group_types)
-            .map(|(c, t)| format!("{} {t}", quote_ident(c)))
-            .collect();
-        columns.push("__txid xid8".to_string());
-        columns.push("__lsn pg_lsn".to_string());
-        columns.push("__n bigint".to_string());
-        for (i, arg) in self.shape.args.iter().enumerate() {
-            columns.push(format!("__c{} bigint", i + 1));
-            if arg.summed {
-                columns.push(format!("__s{} numeric", i + 1));
-            }
-        }
         format!(
             "create temp table if not exists {} ({}) on commit delete rows",
             self.staged.trim_start_matches("pg_temp."),
-            columns.join(", ")
+            staged_columns(&self.shape).join(", ")
         )
     }
 
@@ -1146,6 +1168,25 @@ mod tests {
         ] {
             assert!(shape(text).is_none(), "{text}");
         }
+    }
+
+    /// A session keeps the temp table it created under a name, and a resume
+    /// keeps the definition id while re-reading the column types: the name
+    /// must change with the shape, or a connection reuses the old table.
+    #[test]
+    fn the_staging_table_name_follows_its_shape() {
+        let text = "TRANSFORM t FROM s GROUP BY g SELECT SUM(a) AS s";
+        let name = |cols: &HashMap<String, ValueType>| {
+            let def = crate::defs::parse(text).expect("parses");
+            let shape = shape_of(&def, cols).expect("admitted");
+            GroupTargetPlan::new("trellis", 7, "public.t", "public.s", Vec::new(), shape).staged
+        };
+        let int4 = columns();
+        let mut int8 = columns();
+        int8.insert("g".to_string(), ValueType::Integer(IntWidth::Int8));
+        assert_eq!(name(&int4), name(&columns()));
+        assert_ne!(name(&int4), name(&int8));
+        assert!(name(&int4).starts_with("pg_temp.\"trellis_group_sides_7_"));
     }
 
     #[test]
