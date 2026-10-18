@@ -629,21 +629,26 @@ fn staged_columns(shape: &GroupShape) -> Vec<String> {
     columns
 }
 
-/// A short stable hash of the staging table's columns. The table is a
-/// session temp table, and the pool keeps its connections, so a connection
+/// The columns of the recompute's session table: the group columns, typed
+/// as the hidden table types them.
+fn recompute_columns(shape: &GroupShape) -> Vec<String> {
+    shape
+        .group_cols
+        .iter()
+        .zip(&shape.group_types)
+        .map(|(c, t)| format!("{} {t}", quote_ident(c)))
+        .collect()
+}
+
+/// A short stable hash of a session temp table's columns. The tables are
+/// session temp tables, and the pool keeps its connections, so a connection
 /// keeps the table it first created under a name. Putting the shape in the
 /// name means a definition whose group column was re-typed (a resume re-reads
 /// the types under the same id) gets a new table; the old one is never
 /// touched again and goes with its session. 64 bits keep two shapes of one
 /// definition from sharing a name, and the name within Postgres's 63 bytes
-/// for any `i64` id.
-fn staged_shape_hash(shape: &GroupShape) -> u64 {
-    shape_hash(&staged_columns(shape).join(","))
-}
-
-/// A stable 64-bit hash of a working table's column list `columns`, for its
-/// name (see [`staged_shape_hash`]; a `JOIN`'s working tables use it too,
-/// `super::join`). FNV-1a: fixed by definition, unlike `DefaultHasher`.
+/// for any `i64` id. A `JOIN`'s working tables use it too (`super::join`).
+/// FNV-1a: fixed by definition, unlike `DefaultHasher`.
 pub(super) fn shape_hash(columns: &str) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in columns.bytes() {
@@ -670,12 +675,15 @@ impl GroupTargetPlan {
                 "pg_temp.{}",
                 quote_ident(&format!(
                     "trellis_group_sides_{definition_id}_{:016x}",
-                    staged_shape_hash(&shape)
+                    shape_hash(&staged_columns(&shape).join(","))
                 ))
             ),
             recomputed: format!(
                 "pg_temp.{}",
-                quote_ident(&format!("trellis_group_recompute_{definition_id}"))
+                quote_ident(&format!(
+                    "trellis_group_recompute_{definition_id}_{:016x}",
+                    shape_hash(&recompute_columns(&shape).join(","))
+                ))
             ),
             source_row: ddl::qualified_source_table(source),
             source_pk,
@@ -958,17 +966,10 @@ impl GroupTargetPlan {
     /// transaction. A plain aggregate's only: a `JOIN`'s writers recompute
     /// nothing ([`Self::push`]).
     fn recomputed_ddl(&self) -> String {
-        let columns: Vec<String> = self
-            .shape
-            .group_cols
-            .iter()
-            .zip(&self.shape.group_types)
-            .map(|(c, t)| format!("{} {t}", quote_ident(c)))
-            .collect();
         format!(
             "create temp table if not exists {} ({}) on commit delete rows",
             self.recomputed.trim_start_matches("pg_temp."),
-            columns.join(", ")
+            recompute_columns(&self.shape).join(", ")
         )
     }
 
@@ -2102,6 +2103,38 @@ mod tests {
         assert!(bare.len() <= 63, "{bare} fits a Postgres identifier");
     }
 
+    /// The recompute table is a session table too: its name follows its
+    /// group columns' types, and fits an identifier for any id.
+    #[test]
+    fn the_recompute_table_name_follows_its_shape() {
+        let text = "TRANSFORM t FROM s GROUP BY g SELECT SUM(a) AS s";
+        let name = |id: i64, cols: &HashMap<String, ValueType>| {
+            let def = crate::defs::parse(text).expect("parses");
+            let shape = shape_of(&def, cols).expect("admitted");
+            GroupTargetPlan::new(
+                "trellis",
+                id,
+                "public.t",
+                "public.s",
+                Vec::new(),
+                Vec::new(),
+                shape,
+            )
+            .recomputed
+        };
+        let int4 = columns();
+        let mut int8 = columns();
+        int8.insert("g".to_string(), ValueType::Integer(IntWidth::Int8));
+        assert_eq!(name(7, &int4), name(7, &columns()));
+        assert_ne!(name(7, &int4), name(7, &int8));
+        assert!(name(7, &int4).starts_with("pg_temp.\"trellis_group_recompute_7_"));
+        let longest = name(i64::MIN, &int4);
+        let bare = longest
+            .trim_start_matches("pg_temp.\"")
+            .trim_end_matches('"');
+        assert!(bare.len() <= 63, "{bare} fits a Postgres identifier");
+    }
+
     /// One page staged and locked on `client` for definition 7 over the
     /// source columns `cols`, after recreating its hidden table for that
     /// shape: one insert of group `g`. Returns the hidden table's groups.
@@ -2178,6 +2211,67 @@ mod tests {
             stage_one_page(&mut client, &int8, 5_000_000_000).await,
             [5_000_000_000]
         );
+    }
+
+    /// Names group `g` into the recompute table on `client`, as a recompute
+    /// does, for definition 7 over the source columns `cols`.
+    async fn name_one_group(
+        client: &mut tokio_postgres::Client,
+        cols: &HashMap<String, ValueType>,
+        g: i64,
+    ) {
+        let def =
+            crate::defs::parse("TRANSFORM t FROM s GROUP BY g SELECT SUM(a) AS s").expect("parses");
+        let shape = shape_of(&def, cols).expect("admitted");
+        let plan = GroupTargetPlan::new(
+            crate::config::DEFAULT_SCHEMA,
+            7,
+            "public.t",
+            "public.s",
+            vec![PrimaryKeyColumn {
+                name: "id".to_string(),
+                data_type: "integer".to_string(),
+                nullable: false,
+                collation: None,
+            }],
+            Vec::new(),
+            shape,
+        );
+        let txn = client.transaction().await.expect("begin");
+        txn.batch_execute(&format!("{}; {}", plan.staged_ddl(), plan.recomputed_ddl()))
+            .await
+            .expect("session tables");
+        if let Err(error) = name_groups(&txn, &plan, &[format!(r#"{{"g":{g}}}"#)], &[]).await {
+            panic!("naming group {g}: {error:?}");
+        }
+        txn.commit().await.expect("commit");
+    }
+
+    /// The recompute's table follows a re-typed group column the same way:
+    /// the second recompute, of a group out of the first shape's range,
+    /// names it into a table of its own type.
+    #[tokio::test]
+    async fn a_session_recomputes_a_retyped_group_into_a_table_of_its_shape() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (mut client, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute("create table public.s (id integer primary key, g integer, a integer)")
+            .await
+            .expect("source");
+        name_one_group(&mut client, &columns(), 1).await;
+        client
+            .batch_execute("alter table public.s alter column g type bigint")
+            .await
+            .expect("re-type the group column");
+        let mut int8 = columns();
+        int8.insert("g".to_string(), ValueType::Integer(IntWidth::Int8));
+        name_one_group(&mut client, &int8, 5_000_000_000).await;
     }
 
     #[test]
