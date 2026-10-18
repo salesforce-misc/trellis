@@ -64,7 +64,36 @@
 //! `defs::ledger::contributions`' order) its non-null count `__count_<i>` and,
 //! when a `SUM` or `AVG` reads it, its sum `__sum_<i>` as `numeric`. A group
 //! row is visible in the target only while `__n > 0`; a zero group stays in
-//! the hidden table.
+//! the hidden table until the GC collects it (below).
+//!
+//! # Zero groups
+//!
+//! A group whose partials are all zero (`__zero`, a stored generated
+//! column) has no visible row, but its hidden row can still matter (ADR-0002
+//! R4): an absolute write (a build's or a recompute's, #1101/#1102) sets
+//! its basis, and a change that basis saw but a page hasn't drained yet must
+//! still be refused. A fresh row has no basis and would apply it twice. So
+//! the absolute write also sets the stamp, the newest segment holding a
+//! change its snapshot saw (R5), and a zero group with a basis stays until
+//! the contiguous drained prefix reaches its stamp: then every change the
+//! basis saw has been applied or refused. A zero group with no basis
+//! protects nothing, and a group with any non-zero partial is never
+//! collected, whatever its `__n`. A basis with no stamp keeps its group.
+//!
+//! The maintenance loop's tombstone pass collects them
+//! (`super::retire::collect_tombstones`), in batches that claim rows `for
+//! update skip locked` in key order through the partial `where __zero`
+//! index ([`collect_zero_groups_sql`]). It never waits on a page: a page
+//! holds the locks of every group it applies to from its lock statement to
+//! its commit. A page whose lock statement meets a group the GC is deleting
+//! waits for the GC's commit and inserts the group afresh. Pages only make
+//! `__zero` change when a group empties or refills, so an update that keeps
+//! a group non-zero changes no indexed column and stays HOT.
+//!
+//! Zero groups left in place aren't free: #1043's JOIN model ran 16x slower
+//! with thousands of them on a few hot keys, and a definition whose groups
+//! churn (a `GROUP BY` over a session id, say) would grow its hidden table
+//! without bound.
 //!
 //! # One page, one target ([`apply_group_target`])
 //!
@@ -87,8 +116,12 @@
 //!    what is kept to the hidden row, and writes the visible row when a
 //!    visible value changed: an upsert while `__n > 0`, a delete when it
 //!    falls to 0. It returns, per group, the change it applied. It runs with
-//!    nested loops off: its joins are between the page's own rows, whose
-//!    sizes the planner can't see.
+//!    nested loops off, since its joins are between the page's own rows,
+//!    whose sizes the planner can't see, and sequential scans off: it reaches
+//!    the hidden table and the target only through their group identity
+//!    index, one probe per group, and the hidden rows it updates by `ctid`,
+//!    so its cost under the groups' locks is the page's groups, not the
+//!    definition's.
 //!
 //! # Image-less changes, releases and truncates (#1102)
 //!
@@ -400,9 +433,10 @@ pub(crate) fn hidden_table_ident(schema: &str, id: i64) -> String {
     )
 }
 
-/// The `create table` statement of definition `id`'s hidden table in the
-/// catalog schema `schema` (see the module doc). Created empty with the
-/// definition's row, and dropped with it ([`drop_hidden_table_sql`]).
+/// The statements creating definition `id`'s hidden table in the catalog
+/// schema `schema` (see the module doc) and its zero-group index (see "Zero
+/// groups" there). Created empty with the definition's row, and dropped with
+/// it ([`drop_hidden_table_sql`]).
 pub(crate) fn hidden_table_ddl(schema: &str, id: i64, shape: &GroupShape) -> String {
     let mut columns: Vec<String> = shape
         .group_cols
@@ -411,22 +445,42 @@ pub(crate) fn hidden_table_ddl(schema: &str, id: i64, shape: &GroupShape) -> Str
         .map(|(c, t)| format!("{} {t}", quote_ident(c)))
         .collect();
     columns.push("__n bigint not null default 0".to_string());
+    let mut zero = vec!["__n = 0".to_string()];
     for (i, arg) in shape.args.iter().enumerate() {
         columns.push(format!("__count_{} bigint not null default 0", i + 1));
+        zero.push(format!("__count_{} = 0", i + 1));
         if arg.summed {
             columns.push(format!("__sum_{} numeric not null default 0", i + 1));
+            zero.push(format!("__sum_{} = 0", i + 1));
         }
     }
     columns.push("__basis pg_snapshot".to_string());
-    columns.push("__stamp bigint not null default 0".to_string());
+    columns.push("__stamp bigint".to_string());
     columns.push(format!(
-        "unique nulls not distinct ({})",
-        quoted(&shape.group_cols).join(", ")
+        "__zero boolean not null generated always as ({}) stored",
+        zero.join(" and ")
     ));
+    let group_cols = quoted(&shape.group_cols).join(", ");
+    columns.push(format!("unique nulls not distinct ({group_cols})"));
+    let table = hidden_table_ident(schema, id);
     format!(
-        "create table {} ({})",
-        hidden_table_ident(schema, id),
+        "create table {table} ({}); create index on {table} ({group_cols}) where __zero",
         columns.join(", ")
+    )
+}
+
+/// One zero-group GC batch's statement on the hidden table `hidden`
+/// (schema-qualified and quoted), whose zero-group index keys on
+/// `group_cols` (quoted, joined): deletes up to `$2` zero groups that have no
+/// basis or whose stamp is at or below `$1`, the contiguous drained prefix,
+/// claimed `for update skip locked` in key order. See "Zero groups" in the
+/// module doc; `super::retire::collect_tombstones` runs it.
+pub(crate) fn collect_zero_groups_sql(hidden: &str, group_cols: &str) -> String {
+    format!(
+        "delete from {hidden} where ctid = any(array( \
+             select ctid from {hidden} \
+             where __zero and (__basis is null or __stamp <= $1) \
+             order by {group_cols} limit $2 for update skip locked))"
     )
 }
 
@@ -667,32 +721,68 @@ impl GroupTargetPlan {
     }
 
     /// The lookup of the row of `table` (quoted) whose group is `alias`'s,
-    /// `NULL` matching `NULL`, returning `columns` (over `x`): plain equality,
-    /// which the group identity's index serves, and the null-matching form
-    /// behind a one-time test that the group has a `NULL`.
+    /// `NULL` matching `NULL`, returning `columns` (over `x`), as one index
+    /// probe on the group identity's index: plain equality, and, for each
+    /// pattern of `NULL` columns, the same equality with `x.<col> is null`
+    /// for those columns, behind a one-time test that `alias`'s group has
+    /// exactly those `NULL`s. `is not distinct from` would match too, but no
+    /// index serves it: each page naming a group with a `NULL` would scan
+    /// the whole table. Past [`MAX_NULL_PATTERN_COLUMNS`] group columns the
+    /// patterns get too many, and a group with a `NULL` takes that scan.
     fn group_lookup(&self, table: &str, alias: &str, columns: &str) -> String {
         let cols = quoted(&self.shape.group_cols);
         let equal: Vec<String> = cols
             .iter()
             .map(|c| format!("x.{c} = {alias}.{c}"))
             .collect();
-        let has_null: Vec<String> = cols
-            .iter()
-            .map(|c| format!("{alias}.{c} is null"))
-            .collect();
-        let same: Vec<String> = cols
-            .iter()
-            .map(|c| format!("x.{c} is not distinct from {alias}.{c}"))
-            .collect();
-        format!(
-            "(select {columns} from {table} x where {} \
-              union all \
-              select {columns} from {table} x where ({}) and {} \
-              limit 1)",
-            equal.join(" and "),
-            has_null.join(" or "),
-            same.join(" and ")
-        )
+        let mut branches = vec![format!(
+            "select {columns} from {table} x where {}",
+            equal.join(" and ")
+        )];
+        if cols.len() <= MAX_NULL_PATTERN_COLUMNS {
+            for pattern in 1..(1_u32 << cols.len()) {
+                let is_null = |i: usize| pattern & (1 << i) != 0;
+                let guard: Vec<String> = cols
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| {
+                        let not = if is_null(i) { "" } else { "not " };
+                        format!("{alias}.{c} is {not}null")
+                    })
+                    .collect();
+                let probe: Vec<String> = cols
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| {
+                        if is_null(i) {
+                            format!("x.{c} is null")
+                        } else {
+                            format!("x.{c} = {alias}.{c}")
+                        }
+                    })
+                    .collect();
+                branches.push(format!(
+                    "select {columns} from {table} x where ({}) and {}",
+                    guard.join(" and "),
+                    probe.join(" and ")
+                ));
+            }
+        } else {
+            let has_null: Vec<String> = cols
+                .iter()
+                .map(|c| format!("{alias}.{c} is null"))
+                .collect();
+            let same: Vec<String> = cols
+                .iter()
+                .map(|c| format!("x.{c} is not distinct from {alias}.{c}"))
+                .collect();
+            branches.push(format!(
+                "select {columns} from {table} x where ({}) and {}",
+                has_null.join(" or "),
+                same.join(" and ")
+            ));
+        }
+        format!("({} limit 1)", branches.join(" union all "))
     }
 
     /// The `create` of [`Self::staged`], one row per (group, transaction,
@@ -964,7 +1054,8 @@ impl GroupTargetPlan {
              t as (select __hc, {totals} from f group by __hc), \
              up as ( \
                  update {hidden} u set {sets} from t \
-                 where u.ctid = t.__hc and ({nonzero}) \
+                 where u.ctid = any(array(select t.__hc from t where {nonzero})) \
+                   and u.ctid = t.__hc \
                  returning {up_groups}, {returning} \
              ), \
              {tail}",
@@ -1053,7 +1144,8 @@ impl GroupTargetPlan {
              ), \
              up as ( \
                  update {hidden} u set {sets}, __basis = snap.__snap, __stamp = snap.__seg \
-                 from r, snap where u.ctid = r.__hc \
+                 from r, snap \
+                 where u.ctid = any(array(select r.__hc from r)) and u.ctid = r.__hc \
                  returning {up_groups}, {returning} \
              ), \
              {tail}",
@@ -1202,8 +1294,13 @@ impl GroupTargetPlan {
 /// The settings [`apply_locked_groups`]'s statement runs under, and their
 /// reset for the rest of the page's transaction. An error leaves them on,
 /// but it also aborts the transaction, where a `set local` ends.
-const PLAN_SETTINGS: &str = "set local enable_nestloop = off";
-const PLAN_RESET: &str = "set local enable_nestloop to default";
+const PLAN_SETTINGS: &str = "set local enable_nestloop = off; set local enable_seqscan = off";
+const PLAN_RESET: &str =
+    "set local enable_nestloop to default; set local enable_seqscan to default";
+
+/// The most `GROUP BY` columns a group lookup writes one index probe per
+/// pattern of `NULL`s for (`GroupTargetPlan::group_lookup`): 15 probes at 4.
+const MAX_NULL_PATTERN_COLUMNS: usize = 4;
 
 /// What one page applied to one group ([`apply_locked_groups`]): the
 /// group's identity key text (`ddl::pk_key_sql_expr`), and the deltas it
@@ -1300,7 +1397,17 @@ pub(crate) async fn apply_locked_groups(
     // Every other join is between the page's own CTEs, whose sizes the
     // planner can't see (`unnest` of a parameter): as a nested loop it is
     // quadratic in the page, so it's planned without one. A lateral lookup
-    // is a nested loop whatever the setting.
+    // is a nested loop whatever the setting. Without one, the hidden rows'
+    // update can't probe each row by its `ctid` from the join, so it fetches
+    // them by a TID scan over the array of the page's `ctid`s instead: as a
+    // join on `ctid` alone it hashed a sequential scan of the whole hidden
+    // table, every group the definition has, while the page held its groups'
+    // locks (twice the statement's time at 1M groups and 4,000 a page).
+    // Sequential scans are off too: the statement reads the hidden table and
+    // the target only by `ctid` or by their group identity index, and a
+    // table whose statistics say it is small (a new definition's, before
+    // `analyze` reaches it) would otherwise be scanned whole as it grows.
+    // The staging table has no index, so its scans stay sequential.
     txn.batch_execute(PLAN_SETTINGS).await?;
     let rows = txn.query(&sql, &[&plan.target]).await?;
     txn.batch_execute(PLAN_RESET).await?;
@@ -1514,6 +1621,51 @@ pub(crate) async fn truncate_groups(
     )
     .await?;
     Ok(())
+}
+
+/// The plan of [`apply_locked_groups`]' statement on the group-basis target
+/// `target` (its bare name), as `explain`'s text, under the settings a page
+/// runs it with and over an empty staging table. For tests of the plan's
+/// shape. It locks and writes nothing.
+#[cfg(any(test, feature = "internals"))]
+pub async fn explain_apply(pool: &crate::pool::Pool, target: &str) -> Result<String, ApplyError> {
+    let Some(definition) = crate::defs::catalog::definition_by_target(pool, target).await? else {
+        return Err(ApplyError::TransformNotFound {
+            transform: target.to_string(),
+        });
+    };
+    let Some(shape) = route(&definition.def, &definition.source_columns) else {
+        return Err(ApplyError::GroupBasisUnsupported {
+            target: definition.target_table,
+            what: "a definition the group basis doesn't take",
+        });
+    };
+    let mut client = pool.get().await?;
+    let identity = ddl::identity_key_columns(&**client, &definition.target_table).await?;
+    let plan = GroupTargetPlan::new(
+        pool.schema(),
+        definition.id,
+        &definition.target_table,
+        &definition.source_table,
+        ddl::source_primary_key_in_txn(&**client, &definition.source_table).await?,
+        identity,
+        shape,
+    );
+    let txn = client.transaction().await?;
+    txn.batch_execute(&plan.staged_ddl()).await?;
+    txn.batch_execute(PLAN_SETTINGS).await?;
+    let rows = txn
+        .query(
+            &format!("explain {}", plan.apply_sql(None)),
+            &[&plan.target],
+        )
+        .await?;
+    txn.rollback().await?;
+    Ok(rows
+        .iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect::<Vec<_>>()
+        .join("\n"))
 }
 
 #[cfg(test)]
@@ -1734,8 +1886,11 @@ mod tests {
             hidden_table_ddl("trellis", 7, &shape),
             "create table \"trellis\".\"agg_7\" (\"g\" integer, __n bigint not null default 0, \
              __count_1 bigint not null default 0, __sum_1 numeric not null default 0, \
-             __count_2 bigint not null default 0, __basis pg_snapshot, \
-             __stamp bigint not null default 0, unique nulls not distinct (\"g\"))"
+             __count_2 bigint not null default 0, __basis pg_snapshot, __stamp bigint, \
+             __zero boolean not null generated always as \
+             (__n = 0 and __count_1 = 0 and __sum_1 = 0 and __count_2 = 0) stored, \
+             unique nulls not distinct (\"g\")); \
+             create index on \"trellis\".\"agg_7\" (\"g\") where __zero"
         );
         assert_eq!(
             target_table_ddl("\"public\".\"t\"", &shape),

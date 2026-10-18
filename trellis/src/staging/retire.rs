@@ -21,7 +21,9 @@
 //!
 //! [`collect_tombstones`] is the ledgers' half of the same cleanup (#623
 //! D7): a tombstone is only needed while an older change to its key can
-//! still arrive, and the drained prefix says when none can.
+//! still arrive, and the drained prefix says when none can. It collects the
+//! group basis's zero groups by the same prefix ([`collect_zero_groups`],
+//! ADR-0002 R4).
 
 use tokio_postgres::Client;
 use tokio_postgres::types::Type;
@@ -198,8 +200,9 @@ pub(crate) fn may_leave_backlog(collected: u64) -> bool {
 
 /// Deletes the tombstones no change can still need (#623 D7): in every
 /// ledger, each `__tombstone` entry whose `__applied_seg` is at or below the
-/// contiguous drained prefix `P` ([`DRAINED_PREFIX_SQL`]). Returns how many
-/// went.
+/// contiguous drained prefix `P` ([`DRAINED_PREFIX_SQL`]), and then the
+/// group-basis aggregates' zero groups through `P` ([`collect_zero_groups`]).
+/// Returns how many of both went.
 ///
 /// **Why it's sound.** A tombstone exists so that an older change to its key,
 /// arriving after the delete, is skipped (ADR-0002 I2 and I4); once one is
@@ -313,7 +316,118 @@ pub async fn collect_tombstones(client: &mut Client) -> Result<u64, StagingError
             }
         }
     }
+    collected += collect_zero_groups(client, through).await?;
     Ok(collected)
+}
+
+/// Every group-basis aggregate's hidden table, schema-qualified and quoted
+/// (`super::group_basis::hidden_table_name`), with the quoted key columns of
+/// its zero-group index, or `NULL` while it has none valid.
+fn hidden_tables_sql() -> String {
+    format!(
+        "select format('%I.%I', n.nspname, c.relname), \
+                (select string_agg(format('%I', a.attname), ', ' order by k.ord) \
+                 from pg_catalog.pg_index i \
+                 cross join unnest(i.indkey::int2[]) with ordinality as k(attnum, ord) \
+                 join pg_catalog.pg_attribute a \
+                   on a.attrelid = i.indrelid and a.attnum = k.attnum \
+                 where i.indrelid = c.oid and i.indisvalid and i.indpred is not null) \
+         from transform_definitions d \
+         join pg_catalog.pg_class c on c.relname = {name} \
+          and c.relnamespace = (select relnamespace from pg_catalog.pg_class \
+                                where oid = 'transform_definitions'::regclass) \
+         join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
+         order by d.id",
+        name = super::group_basis::hidden_table_name_sql("d.id"),
+    )
+}
+
+/// Deletes the zero groups of every group-basis aggregate that no change
+/// can still need (ADR-0002 R4): each hidden row whose partials are all
+/// zero (`__zero`) and that has no basis, or whose stamp is at or below the
+/// contiguous drained prefix `through`. Returns how many went. See "Zero
+/// groups" in `super::group_basis`'s module doc for why that is sound.
+///
+/// Batched as [`collect_tombstones`]' ledgers are, and for the same
+/// reasons: each batch is a short transaction that takes the hidden table's
+/// `ROW EXCLUSIVE` lock `NOWAIT` (a drop of the definition makes it skip the
+/// table), claims its rows `for update skip locked` in key order, so it
+/// never waits on a page or a recompute, and runs under
+/// [`GC_PLAN_SETTINGS`], so it walks the partial `where __zero` index and
+/// its cost is the zero groups it walks, not the groups there are. Unlike a
+/// ledger's tombstones, it doesn't skip a definition under a build: a build
+/// or recompute locks its groups before its snapshot (R1), so one that
+/// loses a group to the GC inserts it afresh and writes its own basis.
+async fn collect_zero_groups(client: &mut Client, through: i64) -> Result<u64, StagingError> {
+    let tables: Vec<(String, Option<String>)> = client
+        .query(&hidden_tables_sql(), &[])
+        .await?
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    let mut collected = 0;
+    for (hidden, group_cols) in &tables {
+        let Some(group_cols) = group_cols else {
+            continue;
+        };
+        let sql = super::group_basis::collect_zero_groups_sql(hidden, group_cols);
+        for _ in 0..TOMBSTONE_BATCHES_PER_PASS {
+            let txn = client.transaction().await?;
+            if let Err(err) = txn
+                .batch_execute(&format!(
+                    "lock table {hidden} in row exclusive mode nowait; {GC_PLAN_SETTINGS}"
+                ))
+                .await
+            {
+                if is_lock_not_available(&err) || is_undefined_table(&err) {
+                    break;
+                }
+                return Err(err.into());
+            }
+            let deleted = txn.execute(&sql, &[&through, &TOMBSTONE_BATCH]).await?;
+            txn.commit().await?;
+            collected += deleted;
+            if deleted < TOMBSTONE_BATCH as u64 {
+                break;
+            }
+        }
+    }
+    Ok(collected)
+}
+
+/// The plan of one zero-group GC batch's statement on the hidden table
+/// `hidden` (schema-qualified and quoted) through `through`, as `explain`'s
+/// text, under the settings a batch runs it with. For tests of the plan's
+/// shape. It deletes nothing.
+#[cfg(any(test, feature = "internals"))]
+pub async fn explain_collect_zero_groups(
+    client: &mut Client,
+    hidden: &str,
+    through: i64,
+) -> Result<String, StagingError> {
+    let tables = client.query(&hidden_tables_sql(), &[]).await?;
+    let group_cols: String = tables
+        .iter()
+        .find(|row| row.get::<_, String>(0) == hidden)
+        .and_then(|row| row.get::<_, Option<String>>(1))
+        .unwrap_or_default();
+    let txn = client.transaction().await?;
+    txn.batch_execute(GC_PLAN_SETTINGS).await?;
+    let rows = txn
+        .query(
+            &format!(
+                "explain {}",
+                super::group_basis::collect_zero_groups_sql(hidden, &group_cols)
+            ),
+            &[&through, &TOMBSTONE_BATCH],
+        )
+        .await?;
+    txn.rollback().await?;
+    Ok(rows
+        .iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect::<Vec<_>>()
+        .join("\n"))
 }
 
 /// Locks definition `$1`'s row `for key share`, without waiting, and

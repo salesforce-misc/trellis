@@ -89,6 +89,10 @@ pub mod staging {
     /// `await_converged`, for a harness that must re-check the ring once
     /// without starting another wait.
     pub use crate::staging::converge::converged_through;
+    /// The plan of a group-basis page's apply statement, for plan-shape
+    /// tests.
+    #[cfg(any(test, feature = "internals"))]
+    pub use crate::staging::group_basis::explain_apply as explain_group_apply;
     /// The group-basis dev knob (#1100): tests and `benchmark` turn the group
     /// basis on for admitted aggregates, once, before a client starts. See
     /// `staging::group_basis`'s module doc for what it supports until the

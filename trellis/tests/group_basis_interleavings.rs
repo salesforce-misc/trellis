@@ -124,8 +124,9 @@ async fn partials(d: &Driver, g: i32) -> Vec<String> {
 
 /// A locked group recompute of `groups`, the absolute write #1102 will
 /// make: lock the groups in one sorted statement, then one statement takes
-/// the snapshot, `GROUP BY`s the source and writes the partials, the basis
-/// and the visible rows. Runs on its own connection and is left open; the
+/// the snapshot, `GROUP BY`s the source and writes the partials, the basis,
+/// the stamp (the newest segment there is, read with the snapshot: R5) and
+/// the visible rows. Runs on its own connection and is left open; the
 /// caller commits it with [`Recompute::commit`].
 struct Recompute {
     client: tokio_postgres::Client,
@@ -162,7 +163,8 @@ async fn recompute(d: &Driver, groups: &[i32]) -> Recompute {
                  left join public.src s on s.g = x.g group by x.g), \
              h as ( \
                  update {hidden} h set __n = a.n, __count_1 = a.c, __sum_1 = a.s, \
-                     __basis = pg_current_snapshot() \
+                     __basis = pg_current_snapshot(), \
+                     __stamp = (select max(seg_seq) from {DEFAULT_SCHEMA}.segments) \
                  from a where h.g = a.g returning h.g) \
              delete from public.agg where g in (select g from h); \
              insert into public.agg (g, total, n) \
@@ -340,6 +342,35 @@ async fn group_columns_named_like_the_applys_working_columns() {
             "after {sql}"
         );
     }
+}
+
+/// Two `GROUP BY` columns and every pattern of `NULL`s in them: each pattern
+/// is its own index probe (the group lookup), and each finds its own group,
+/// in the hidden table and in the target, as groups fill, move and empty.
+#[tokio::test]
+async fn every_pattern_of_null_group_columns_finds_its_group() {
+    let mut d = start_with(
+        "TRANSFORM agg FROM public.src GROUP BY g, h SELECT SUM(v) AS total, COUNT(*) AS n",
+        "create table public.src (id integer primary key, g integer, h integer, v integer)",
+        &[("id", int4()), ("g", int4()), ("h", int4()), ("v", int4())],
+        "",
+    )
+    .await;
+    let actual = "select g, h, total, n from public.agg order by g, h";
+    let expected = "select g, h, sum(v), count(*) from public.src group by g, h order by g, h";
+    for sql in [
+        "insert into public.src values (1, 1, 1, 1), (2, 1, null, 2), (3, null, 1, 3), \
+                                       (4, null, null, 4), (5, 1, null, 5), (6, null, 1, 6)",
+        "update public.src set v = v * 10",
+        "update public.src set g = null where id = 1; update public.src set h = 1 where id = 2",
+        "update public.src set h = null where id in (3, 6)",
+        "delete from public.src where id in (4, 5)",
+        "delete from public.src",
+    ] {
+        step(&mut d, sql).await;
+        assert_eq!(d.rows(actual).await, d.rows(expected).await, "after {sql}");
+    }
+    assert_oracle(&mut d).await;
 }
 
 // ------------------------------------------------------------------- R1, R2
@@ -529,6 +560,165 @@ async fn a_group_is_visible_only_while_its_count_is_above_zero() {
     d.drain(insert, "b").await;
     assert_eq!(partials(&d, 1).await, ["(0,0,0,f)"]);
     assert_oracle(&mut d).await;
+}
+
+// ----------------------------------------------------------------------- R4
+
+/// How many hidden rows the one definition has, zero groups included.
+async fn hidden_rows(d: &Driver) -> i64 {
+    scalar(d, &format!("select count(*) from {}", hidden(d).await))
+        .await
+        .parse()
+        .expect("a count")
+}
+
+/// R4: groups that churn (each filled and emptied again, the shape that made
+/// #1043's JOIN model 16x slower with the zero rows left in place) leave
+/// zero groups with no basis, and the GC collects every one, so the hidden
+/// table holds only the groups with rows however many have come and gone.
+#[tokio::test]
+async fn r4_the_gc_bounds_a_hidden_table_whose_groups_churn() {
+    let mut d = start().await;
+    step(&mut d, "insert into public.src values (0, 0, 1)").await;
+    for round in 0..5 {
+        let first = 1 + round * 1_000;
+        step(
+            &mut d,
+            &format!(
+                "insert into public.src select i, i, i from generate_series({first}, {}) i",
+                first + 999
+            ),
+        )
+        .await;
+        step(&mut d, "delete from public.src where id > 0").await;
+        assert_eq!(hidden_rows(&d).await, 1_001, "round {round}: before the GC");
+        assert_eq!(d.collect_tombstones().await, 1_000, "round {round}");
+        assert_eq!(hidden_rows(&d).await, 1, "round {round}: after the GC");
+    }
+    assert_eq!(partials(&d, 0).await, ["(1,1,1,f)"]);
+    assert_oracle(&mut d).await;
+}
+
+/// R4, #1043's `RV.gc-n0`: pages applied out of order leave group 1 at
+/// `n = 0` with its sum still owed (`-2`). A GC that tests `n = 0` alone
+/// would delete it, and the late page would then leave `sum = 2` behind.
+/// Only a group whose every partial is zero is collected.
+#[tokio::test]
+async fn r4_a_group_with_a_nonzero_partial_stays() {
+    let mut d = start().await;
+    step(&mut d, "insert into public.src values (1, 1, 1)").await;
+    write(&d, "update public.src set v = 3 where id = 1").await;
+    let update = d.seal().await;
+    write(&d, "delete from public.src where id = 1").await;
+    let delete = d.seal().await;
+    d.drain(delete, "a").await;
+    assert_eq!(partials(&d, 1).await, ["(0,0,-2,f)"]);
+    assert_eq!(d.collect_tombstones().await, 0);
+    d.drain(update, "b").await;
+    assert_eq!(partials(&d, 1).await, ["(0,0,0,f)"]);
+    assert_eq!(d.collect_tombstones().await, 1);
+    assert_eq!(hidden_rows(&d).await, 0);
+    assert_oracle(&mut d).await;
+}
+
+/// R4 with a basis (#1043's `R.recreate-gc-race`): a recompute empties
+/// group 5 after the delete C1 is sealed but before it drains, so the zero
+/// group's basis already counts C1. The GC keeps it while C1's segment is
+/// undrained, though a later segment has drained, and C1's page is then
+/// refused by the basis. A GC by the highest drained segment, or by
+/// `n = 0` alone, would let C1 apply to a fresh group: `n = -1`. Once the
+/// contiguous drained prefix passes the stamp, the group goes.
+#[tokio::test]
+async fn r4_a_zero_group_with_a_basis_stays_until_the_prefix_passes_its_stamp() {
+    let mut d = start().await;
+    step(&mut d, "insert into public.src values (1, 5, 4), (2, 6, 1)").await;
+    write(&d, "delete from public.src where id = 1").await;
+    let c1 = d.seal().await;
+    recompute(&d, &[5]).await.commit().await;
+    assert_eq!(partials(&d, 5).await, ["(0,0,0,t)"]);
+    write(&d, "update public.src set v = 2 where id = 2").await;
+    let later = d.seal().await;
+    d.drain(later, "a").await;
+    assert_eq!(d.collect_tombstones().await, 0);
+    assert_eq!(partials(&d, 5).await, ["(0,0,0,t)"]);
+    d.drain(c1, "b").await;
+    assert_eq!(partials(&d, 5).await, ["(0,0,0,t)"], "C1 refused");
+    // The recompute stamped the segment that was active when it ran, which
+    // drains only once sealed: the settle seals and drains it.
+    assert_oracle(&mut d).await;
+    assert_eq!(partials(&d, 5).await, Vec::<String>::new());
+}
+
+/// R4: a basis with no stamp protects its group for good, since nothing
+/// says when the changes it saw have drained.
+#[tokio::test]
+async fn r4_a_basis_without_a_stamp_keeps_its_group() {
+    let mut d = start().await;
+    step(&mut d, "insert into public.src values (1, 1, 1)").await;
+    recompute(&d, &[2]).await.commit().await;
+    write(
+        &d,
+        &format!("update {} set __stamp = null where g = 2", hidden(&d).await),
+    )
+    .await;
+    d.settle().await;
+    assert_eq!(partials(&d, 2).await, ["(0,0,0,t)"]);
+}
+
+/// R4: the GC never waits on a page. A page frozen holding the lock of zero
+/// group 1 keeps it from the GC, which skips it and returns; the page then
+/// refills the group.
+#[tokio::test]
+async fn r4_the_gc_skips_a_group_a_page_holds() {
+    let mut d = start().await;
+    step(&mut d, "insert into public.src values (1, 1, 10)").await;
+    step(&mut d, "delete from public.src where id = 1").await;
+    assert_eq!(partials(&d, 1).await, ["(0,0,0,f)"]);
+    write(&d, "insert into public.src values (2, 1, 5)").await;
+    let refill = d.seal().await;
+    let mut page = d
+        .drain_frozen(refill, "a", &[(PausePoint::AfterEntryLock, "public.agg")])
+        .await;
+    page.reached(PausePoint::AfterEntryLock).await;
+    assert_eq!(d.collect_tombstones().await, 0);
+    assert_eq!(partials(&d, 1).await, ["(0,0,0,f)"]);
+    d.release(&mut page, PausePoint::AfterEntryLock).await;
+    page.finish().await;
+    assert_eq!(partials(&d, 1).await, ["(1,1,5,f)"]);
+    assert_oracle(&mut d).await;
+}
+
+// ------------------------------------------------------------- plan control
+
+/// The page's apply statement fetches the hidden rows it updates by TID and
+/// probes both tables' group identity indexes, `NULL` groups included:
+/// nothing in it scans either table whole while the page holds its groups'
+/// locks (#1100 G2b).
+#[tokio::test]
+async fn the_apply_statement_reads_no_table_whole() {
+    let d = start().await;
+    let plan = trellis::dev::staging::explain_group_apply(d.pool(), "agg")
+        .await
+        .expect("explain");
+    assert!(plan.contains("Tid Scan on agg_"), "{plan}");
+    assert!(!plan.contains("Seq Scan on agg"), "{plan}");
+}
+
+/// A zero-group GC batch walks the partial `where __zero` index in key
+/// order: its cost is the zero groups, not the groups.
+#[tokio::test]
+async fn the_zero_group_gc_walks_its_index() {
+    let mut d = start().await;
+    let hidden = hidden(&d).await;
+    let (_, table) = hidden.split_once('.').expect("qualified");
+    let plan = trellis::staging::retire::explain_collect_zero_groups(&mut d.ctl, &hidden, 0)
+        .await
+        .expect("explain");
+    assert!(
+        plan.contains(&format!("Index Scan using {table}_g_idx")),
+        "{plan}"
+    );
+    assert!(!plan.contains("Seq Scan"), "{plan}");
 }
 
 // ----------------------------------------------------------------------- R7
