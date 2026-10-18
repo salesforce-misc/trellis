@@ -126,9 +126,10 @@ of the last:
 - **`T(ga, gb)`**: the target's groups, holding the joined partials
   `Σ_k P[ga,k] ⊗ M[k,gb]`.
 
-`P`, `M`, `J` and `T`'s partials belong to one definition, never shared with
-another, and live in hidden tables in the instance's catalog schema, named by
-definition id, as ADR-0002 places a plain aggregate's partials. The target is a
+`P`, `M`, `J`, `T`'s partials and the pair's truncate lock row belong to one
+definition, never shared with another, and live in hidden tables in the
+instance's catalog schema, named by definition id, as ADR-0002 places a plain
+aggregate's partials. The target is a
 plain table holding only the declared columns, and each page writes a group's
 hidden partials, then its visible row.
 
@@ -165,10 +166,13 @@ values, I measured 51 MB in all, against 15 GB for one materialized row per fact
 
 - **JR1, lock order.** Every writer of `P` or `M` (a page, a build step, a cell
   recompute, a leaf correction) locks `J[k]` `FOR UPDATE` for every non-null
-  key it touches; a `NULL` key joins nothing and takes no lock. Every writer
-  takes its locks in one order: build-chunk rows, the pair's truncate lock
-  row, `J` rows sorted by key, `P` and `M` cells sorted, then `T` groups
-  sorted, each class in one sorted statement.
+  key it touches; a key with a `NULL` in any column joins nothing and takes
+  no `J` row and no lock. A writer creates the `J` rows its keys lack with
+  one sorted `insert … on conflict do nothing`, then locks all of them with
+  one sorted `select … for update`. Every writer takes its locks in one
+  order: build-chunk rows, the pair's truncate lock row, `J` rows sorted by
+  key (by the tuple of join columns), `P` and `M` cells sorted, then `T`
+  groups sorted, each class in one sorted statement.
 - **JR2, read after the lock.** A writer reads the other side's partials and
   `J.matches` only in statements after its `J` lock statement. Pages and builds
   run under `READ COMMITTED`, so each of those statements sees every writer the
@@ -371,11 +375,15 @@ query shows them.
   creates a multixact whenever two overlap.
 - Zero `P` and `M` cells are collected once the drained prefix passes them, as
   ADR-0002's zero groups are; on a hot key, uncollected zero cells made
-  fact-side pages 16x slower. [OPEN: whether `J` rows, one per distinct key
-  ever seen, are collected once no `P` or `M` cell holds their key, and under
-  which lock a writer that is about to create the row is kept safe. Decided
-  with the apply path in #1108. Recommendation: never collect them, as the
-  model did; their count is bounded by the distinct keys.]
+  fact-side pages 16x slower.
+- `J` rows are never collected while the transform runs. JR1's insert-then-lock
+  pair of statements is exact only because no `J` row is ever deleted: a
+  writer queued behind a delete would carry on holding no lock. So `J` keeps
+  a row, about 40–50 bytes, for every distinct non-null key either table has
+  ever held. That is small for a dimension joined on its key, and unbounded
+  where the join key churns, as under retention on the joined table. `RESUME`
+  rebuilds the hidden tables, which reclaims it, and so does dropping the
+  transform.
 - Before `await_converged`, readers can see impossible combinations in a JOIN
   target; after it, values are exact.
 - The admitted aggregate set is `COUNT`, `SUM` and `AVG` over integers and

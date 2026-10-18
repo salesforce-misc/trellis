@@ -434,8 +434,10 @@ async fn a_join_registers_both_tables_and_waits_to_be_built() {
         hidden_tables(&raw, id).await,
         [
             format!("join_{id}_j"),
+            format!("join_{id}_l"),
             format!("join_{id}_m"),
-            format!("join_{id}_p")
+            format!("join_{id}_p"),
+            format!("join_{id}_t")
         ]
     );
 
@@ -529,7 +531,7 @@ async fn a_join_pauses_resumes_and_drops_with_its_hidden_tables() {
         .await,
         0
     );
-    assert_eq!(hidden_tables(&raw, id).await.len(), 3);
+    assert_eq!(hidden_tables(&raw, id).await.len(), 5);
     assert_eq!(
         count(&raw, "select count(*) from pending_backfill").await,
         0,

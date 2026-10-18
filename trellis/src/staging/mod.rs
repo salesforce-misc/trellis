@@ -72,6 +72,7 @@ pub(crate) mod halt;
 pub(crate) mod holdup;
 #[cfg(any(test, feature = "test-util"))]
 pub mod interleave;
+pub(crate) mod join;
 pub(crate) mod ledger;
 pub mod liveness;
 pub(crate) mod one_to_one_ledger;

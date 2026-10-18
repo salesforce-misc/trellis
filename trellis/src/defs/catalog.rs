@@ -6072,6 +6072,44 @@ pub(crate) async fn join_table_of(
         .and_then(|row| row.get(0)))
 }
 
+/// The qualified joined table of `JOIN` definition `id` and its column
+/// types as define or the last resume recorded them (#1107); `None` for any
+/// other definition, or an id with no row.
+pub(crate) async fn join_side_of(
+    client: &impl GenericClient,
+    id: i64,
+) -> Result<Option<(String, HashMap<String, ValueType>)>, CatalogError> {
+    let rows = client
+        .query(
+            "select d.join_table, e.key, e.value from transform_definitions d \
+             left join lateral jsonb_each_text(d.join_columns) e on true \
+             where d.id = $1 and d.join_table is not null",
+            &[&id],
+        )
+        .await?;
+    let Some(first) = rows.first() else {
+        return Ok(None);
+    };
+    let table: String = first.get(0);
+    let mut columns = HashMap::with_capacity(rows.len());
+    for row in &rows {
+        let (Some(key), Some(value)) = (
+            row.get::<_, Option<String>>(1),
+            row.get::<_, Option<String>>(2),
+        ) else {
+            continue;
+        };
+        let Some(value_type) = decode_value_type(&value) else {
+            return Err(CatalogError::UnknownValueType {
+                column: key,
+                text: value,
+            });
+        };
+        columns.insert(key, value_type);
+    }
+    Ok(Some((table, columns)))
+}
+
 /// Persists `columns` as `JOIN` definition `id`'s joined-table column types
 /// (#1107), as a resume reads them, beside [`record_source_columns`].
 pub(crate) async fn record_join_columns(

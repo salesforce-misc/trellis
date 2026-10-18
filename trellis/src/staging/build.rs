@@ -1164,10 +1164,13 @@ fn buildable_shape(definition: &Definition) -> Option<ledger::LedgerShape> {
 }
 
 /// Whether `definition` is on the group basis (`super::group_basis`, behind
-/// its dev knob, #1100). Its build is #1101's: until then the plan job only
-/// checks that the source is empty ([`run_plan`]), and enqueues no chunk.
+/// its dev knob, #1100), a `JOIN` behind the same knob (`super::join`,
+/// #1108) included. Their builds are #1101's and #1109's: until then the
+/// plan job only checks that the source (each side of a `JOIN`) is empty
+/// ([`run_plan`]), and enqueues no chunk.
 fn takes_group_basis(definition: &Definition) -> bool {
     super::group_basis::route(&definition.def, &definition.source_columns).is_some()
+        || super::join::applies(&definition.def)
 }
 
 /// [`buildable_shape`] of a definition's parts.
@@ -1237,7 +1240,8 @@ pub async fn qualifies(
     if matches!(
         definition.def.key_space,
         crate::defs::ast::KeySpace::Join(_)
-    ) {
+    ) && !super::join::applies(&definition.def)
+    {
         return Ok(false);
     }
     if buildable_shape(definition).is_none()
@@ -1296,18 +1300,27 @@ pub async fn start_ready_builds(
             continue;
         }
         // #1107: nothing builds a JOIN yet (J4, #1109), and no other build
-        // may take one: it stays `waiting_to_backfill`, with no marker.
-        if matches!(
-            definition.def.key_space,
-            crate::defs::ast::KeySpace::Join(_)
-        ) {
-            taken.push(id);
-            continue;
-        }
+        // may take one: it stays `waiting_to_backfill`, with no marker. Behind
+        // the group-basis knob, one over two empty tables starts as a knob-on
+        // aggregate does (#1108, `super::join`).
+        let join = match &definition.def.key_space {
+            crate::defs::ast::KeySpace::Join(_) => {
+                if !super::join::applies(&definition.def) {
+                    taken.push(id);
+                    continue;
+                }
+                catalog::join_table_of(&*client, id).await?
+            }
+            _ => None,
+        };
         if !qualifies(&*client, &definition).await? {
             continue;
         }
-        if capture_gate_holds(&*client, &definition.source_table).await? {
+        let mut gated = capture_gate_holds(&*client, &definition.source_table).await?;
+        if let Some(joined) = &join {
+            gated = gated || capture_gate_holds(&*client, joined).await?;
+        }
+        if gated {
             crate::instance_log::debug!(
                 definition_id = id,
                 table = %definition.source_table,
@@ -3073,22 +3086,45 @@ async fn run_plan(
     // #1100: the group basis has no build yet (#1101), so its dev knob
     // takes only a source that is empty when the build plans, which needs
     // none: the walk below enqueues no chunk.
+    // #1108: a `JOIN` behind the same knob takes two empty tables, each
+    // captured (the target feed is #1100's) and unpartitioned (#1111).
     if cursor.is_none() && chunk.fields.is_none() && takes_group_basis(&definition) {
-        let has_rows: bool = client
-            .query_one(
-                &format!(
-                    "select exists (select 1 from {})",
-                    ddl::qualified_source_table(&definition.source_table)
-                ),
-                &[],
-            )
-            .await?
-            .get(0);
-        if has_rows {
-            return Err(build_error(ApplyError::GroupBasisUnsupported {
-                target: definition.target_table.clone(),
-                what: "a build over a source that has rows (the group-basis build is #1101)",
-            }));
+        let mut tables = vec![definition.source_table.clone()];
+        if super::join::applies(&definition.def) {
+            tables.extend(catalog::join_table_of(&**client, definition.id).await?);
+            for table in &tables {
+                let what = if catalog::is_definition_target(&**client, table).await? {
+                    "a JOIN side that is another definition's target (the target feed is #1100's)"
+                } else if crate::defs::partition_tree::is_partitioned_root(&**client, table).await?
+                {
+                    "a partitioned JOIN side (#1111)"
+                } else {
+                    continue;
+                };
+                return Err(build_error(ApplyError::GroupBasisUnsupported {
+                    target: definition.target_table.clone(),
+                    what,
+                }));
+            }
+        }
+        for table in &tables {
+            let has_rows: bool = client
+                .query_one(
+                    &format!(
+                        "select exists (select 1 from {})",
+                        ddl::qualified_source_table(table)
+                    ),
+                    &[],
+                )
+                .await?
+                .get(0);
+            if has_rows {
+                return Err(build_error(ApplyError::GroupBasisUnsupported {
+                    target: definition.target_table.clone(),
+                    what: "a build over a source that has rows (the group-basis build is #1101, \
+                           the JOIN build #1109)",
+                }));
+            }
         }
     }
     loop {

@@ -52,6 +52,13 @@
 //! the statement that reads the groups' bases, `AfterGroupUpsert` after
 //! that statement, and `BeforeCommit`.
 //!
+//! A `JOIN` target (`super::join`, behind the same knob) fires, in order:
+//! `BeforeJoinLock` after the pair's lock row, `AfterJoinKeyInsert` after
+//! its `J` insert, `AfterJoinLock` after its sorted `J` lock,
+//! `AfterEntryLock` after its `P` and `M` cell locks, `AfterJoinTargetLock`
+//! after its `T` group lock, `AfterGroupUpsert` after its `T` write, and
+//! `BeforeCommit`.
+//!
 //! A build chunk (`super::build::run_chunk`, #625 F1) fires the ledger
 //! column's first three points for its target too: `AfterPlaceholders` and
 //! `AfterEntryLock` around the entry lock of the keys that had an entry
@@ -168,8 +175,20 @@ pub enum PausePoint {
     /// (#623 D7): where a tombstone the insert found can be collected.
     AfterPlaceholders,
     /// After the page has locked the entries (off the ledger, the group
-    /// rows) it will write.
+    /// rows; on a `JOIN`, its `P` and `M` cells) it will write.
     AfterEntryLock,
+    /// On a `JOIN` target (`super::join`), after the page took the pair's
+    /// lock row, before it creates and locks its `J` rows.
+    BeforeJoinLock,
+    /// On a `JOIN` target, after the page's insert of the `J` rows it
+    /// names, before its sorted lock of them.
+    AfterJoinKeyInsert,
+    /// On a `JOIN` target, after the page locked its `J` rows, before it
+    /// locks its `P` and `M` cells.
+    AfterJoinLock,
+    /// On a `JOIN` target, after the page applied its `P` and `M` changes and
+    /// locked the `T` groups their product changes, before it writes them.
+    AfterJoinTargetLock,
     /// After a Re-derive's live read of the source (off the ledger, a
     /// forced group recompute).
     AfterRederiveRead,

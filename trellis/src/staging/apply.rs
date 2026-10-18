@@ -178,7 +178,9 @@ pub enum ApplyError {
     /// A group-basis aggregate target (`super::group_basis`, #1100) met
     /// what its dev knob doesn't support yet: a ring row missing the images
     /// its change needs, a page folded with the knob off, or a build over a
-    /// source with rows or a rebuild's sweep (#1101). Like
+    /// source with rows or a rebuild's sweep (#1101); or, on a `JOIN`
+    /// (`super::join`, #1108), a side's `TRUNCATE` or an image-less change
+    /// (#1110). Like
     /// [`ApplyError::AggregateOffLedger`], every page of the target would
     /// reproduce it, so it halts the target.
     GroupBasisUnsupported { target: String, what: &'static str },
@@ -7162,6 +7164,10 @@ pub struct ApplyPlan {
     /// behind its dev knob, #1100), each with this page's ring rows for it,
     /// keyed by the definition's bare target name, in target order.
     group_targets: BTreeMap<String, super::group_basis::GroupTargetPlan>,
+    /// The `JOIN` targets (`super::join`, behind the group-basis knob,
+    /// #1108), each with this page's ring rows of either table, keyed by the
+    /// definition's bare target name, in target order.
+    join_targets: BTreeMap<String, super::join::JoinTargetPlan>,
     /// Targets to clear in full at Phase 3, keyed by target table name —
     /// issue #60's truncate propagation. See [`ClearPlan`].
     clears: HashMap<String, ClearPlan>,
@@ -7939,6 +7945,8 @@ pub(super) async fn compute_page(
     let mut ledger_targets: BTreeMap<String, super::ledger::LedgerTargetPlan> = BTreeMap::new();
     // #1100: aggregate targets on the group basis, in target order too.
     let mut group_targets: BTreeMap<String, super::group_basis::GroupTargetPlan> = BTreeMap::new();
+    // #1108: `JOIN` targets, in target order too.
+    let mut join_targets: BTreeMap<String, super::join::JoinTargetPlan> = BTreeMap::new();
     // Issue #52: every `Some(src_changed)` origin timestamp
     // `buffer_transform_apply_metrics` sees below, buffered per consuming
     // target — filtered into `ApplyPlan::end_to_end_origins` only for
@@ -8206,15 +8214,24 @@ pub(super) async fn compute_page(
         // it decodes and re-reads nothing here either.
         let mut group_shapes: Vec<Option<super::group_basis::GroupShape>> =
             Vec::with_capacity(defs.len());
+        // #1108: so does a `JOIN` (`super::join`).
+        let mut joins: Vec<bool> = Vec::with_capacity(defs.len());
         for def in &defs {
-            ledger_shapes.push(super::ledger::route_definition(pool, def).await?);
+            let join = matches!(def.def.key_space, KeySpace::Join(_));
+            joins.push(join);
+            ledger_shapes.push(if join {
+                None
+            } else {
+                super::ledger::route_definition(pool, def).await?
+            });
             group_shapes.push(super::group_basis::route(&def.def, &def.source_columns));
         }
         let ledger_only = inbound_rels.is_empty()
             && ledger_shapes
                 .iter()
                 .zip(&group_shapes)
-                .all(|(ledger, group)| ledger.is_some() || group.is_some());
+                .zip(&joins)
+                .all(|((ledger, group), join)| ledger.is_some() || group.is_some() || *join);
         // #623 D6: so does a relationship-free 1-1 definition's Re-derive,
         // so a source read only by those re-reads nothing here either.
         let rederives_in_phase3 = inbound_rels.is_empty()
@@ -8224,6 +8241,7 @@ pub(super) async fn compute_page(
                 .all(|(def, (shape, group))| {
                     shape.is_some()
                         || group.is_some()
+                        || matches!(def.def.key_space, KeySpace::Join(_))
                         || (def.def.key_space == KeySpace::OneToOne
                             && eval::relationship_references(&def.def).is_empty())
                 });
@@ -8514,6 +8532,50 @@ pub(super) async fn compute_page(
             let (changes, rows, old_rows) =
                 definition_share(def.id, &changes, &rows, &old_rows, &exclusions);
             if changes.is_empty() {
+                continue;
+            }
+            // #1108: a `JOIN` takes each change's ring rows as they are,
+            // routed to the side this source is; Phase 3 applies both sides'
+            // (`super::join`).
+            if matches!(def.def.key_space, KeySpace::Join(_)) {
+                let side = if canonical_of(qualified_source) == canonical_of(&def.source_table) {
+                    crate::defs::join::Side::From
+                } else {
+                    crate::defs::join::Side::Joined
+                };
+                let target_plan = match join_targets.entry(def.def.target.clone()) {
+                    std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        let client = pool.get().await?;
+                        let identity =
+                            ddl::identity_key_columns(&**client, &def.target_table).await?;
+                        let joined =
+                            catalog::join_side_of(&**client, def.id)
+                                .await?
+                                .ok_or_else(|| ApplyError::GroupBasisUnsupported {
+                                    target: def.target_table.clone(),
+                                    what: "a JOIN definition with no joined table recorded",
+                                })?;
+                        let field_types =
+                            super::join::target_column_types(&**client, &def.target_table).await?;
+                        entry.insert(super::join::JoinTargetPlan::new(
+                            pool.schema(),
+                            def,
+                            &joined,
+                            &field_types,
+                            identity,
+                        )?)
+                    }
+                };
+                for change in changes.iter() {
+                    target_plan.push(side, change)?;
+                    buffer_transform_apply_metrics(
+                        &def.def.target,
+                        change,
+                        &mut end_to_end_origins,
+                        &mut transform_observations,
+                    );
+                }
                 continue;
             }
             // #1100: an aggregate on the group basis takes each change's
@@ -8914,8 +8976,12 @@ pub(super) async fn compute_page(
                 src_table: change.src_table.clone(),
             })?;
             match &def.def.key_space {
+                // #1108: a `JOIN` side's truncate is J5's (#1110).
                 KeySpace::Join(_) => {
-                    unreachable!("a JOIN definition never applies yet (J3, #1108)")
+                    return Err(ApplyError::GroupBasisUnsupported {
+                        target: def.def.target.clone(),
+                        what: "a TRUNCATE of a JOIN side (the JOIN truncate is #1110)",
+                    });
                 }
                 KeySpace::Aggregate { .. } => {
                     if let Some(existing) = aggregate_clears.get_mut(&def.def.target) {
@@ -9140,6 +9206,7 @@ pub(super) async fn compute_page(
     all_targets.extend(clears.keys());
     all_targets.extend(ledger_targets.keys());
     all_targets.extend(group_targets.keys());
+    all_targets.extend(join_targets.keys());
     all_targets.extend(aggregate_clears.keys());
     // Epic #49 cross-cutting review fix (issues #51/#52): only the
     // terminal-filtered subset of `end_to_end_origins` survives into
@@ -9213,6 +9280,7 @@ pub(super) async fn compute_page(
         targets,
         ledger_targets,
         group_targets,
+        join_targets,
         clears,
         aggregate_clears,
         poisoned_park,
@@ -10750,6 +10818,14 @@ pub(crate) async fn apply_page(
         keys_deleted += deleted;
     }
 
+    // 3b''. `JOIN` targets (#1108, behind the same knob), in target order.
+    for join_plan in plan.join_targets.values() {
+        let (written, deleted) =
+            super::join::apply_join_target(txn, join_plan, &mut mutations).await?;
+        keys_written += written;
+        keys_deleted += deleted;
+    }
+
     // Before 2c and 3c, issue #531: the refresh stamp of every relationship
     // this batch carries a reverse record or a projection clear for, locked
     // `for share` before this transaction touches any projection row (2c,
@@ -11258,6 +11334,7 @@ pub(crate) async fn apply_page(
         .map(|t| &t.qualified_target)
         .chain(plan.ledger_targets.values().map(|t| &t.target))
         .chain(plan.group_targets.values().map(|t| &t.target))
+        .chain(plan.join_targets.values().map(|t| &t.target))
     {
         super::interleave::pause_at(txn, super::interleave::PausePoint::BeforeCommit, target)
             .await?;

@@ -7,20 +7,28 @@
 //! the two have different bare names, and a qualified table's side is found
 //! by its bare name alone ([`side_of_table`]).
 //!
-//! **Hidden tables.** Each `JOIN` definition owns three tables in the
+//! **Hidden tables.** Each `JOIN` definition owns five tables in the
 //! instance's catalog schema, named by its definition id, never by its
 //! target ([#1096 decision 7](https://github.com/salesforce-misc/trellis/issues/1096)):
 //!
 //! - `P` ([`HiddenTable::FromPartials`]): the `FROM` side grouped by its
 //!   `GROUP BY` columns and its join key, with the row count and, per
-//!   aggregate argument on that side, a non-null count and a `numeric` sum;
+//!   aggregate argument on that side, a non-null count and a `numeric` sum,
+//!   and the cell's basis and stamp (ADR-0002's group basis);
 //! - `M` ([`HiddenTable::JoinedPartials`]): the same for the joined side;
 //! - `J` ([`HiddenTable::Matches`]): one row per join key, the key's lock,
-//!   holding the joined side's row count under it.
+//!   holding the joined side's row count under it;
+//! - `T` ([`HiddenTable::TargetPartials`]): the target's groups with their
+//!   joined partials: the row count, then a non-null count and a sum per
+//!   argument, the `FROM` side's arguments first;
+//! - the lock row ([`HiddenTable::TruncateLock`]): one row every writer of
+//!   the pair takes `FOR SHARE` before any `J` row (ADR-0019's lock order),
+//!   and a truncate of either side would take `FOR UPDATE`.
 //!
 //! They're fully derived: define creates them empty, `DROP TRANSFORM` drops
 //! them, and a resume drops and recreates them, so nothing checks their
 //! shape. The visible target holds only the declared columns.
+//! `crate::staging::join` writes them.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -160,7 +168,7 @@ fn is_aggregate(name: &str) -> bool {
 /// The distinct aggregate arguments `def` reads on `side`, in the order its
 /// fields first use them: the expressions `side`'s partials keep a non-null
 /// count and a sum of.
-fn side_arguments(def: &TransformDef, side: Side) -> Vec<Expr> {
+pub(crate) fn side_arguments(def: &TransformDef, side: Side) -> Vec<Expr> {
     let Some(join) = spec(def) else {
         return Vec::new();
     };
@@ -206,13 +214,19 @@ pub(crate) enum HiddenTable {
     JoinedPartials,
     /// `J`: one row per join key.
     Matches,
+    /// `T`: the target groups' joined partials.
+    TargetPartials,
+    /// The pair's one lock row.
+    TruncateLock,
 }
 
 impl HiddenTable {
-    pub(crate) const ALL: [HiddenTable; 3] = [
+    pub(crate) const ALL: [HiddenTable; 5] = [
         HiddenTable::FromPartials,
         HiddenTable::JoinedPartials,
         HiddenTable::Matches,
+        HiddenTable::TargetPartials,
+        HiddenTable::TruncateLock,
     ];
 
     /// The table's bare name in the catalog schema, for definition `id`.
@@ -221,6 +235,8 @@ impl HiddenTable {
             HiddenTable::FromPartials => "p",
             HiddenTable::JoinedPartials => "m",
             HiddenTable::Matches => "j",
+            HiddenTable::TargetPartials => "t",
+            HiddenTable::TruncateLock => "l",
         };
         format!("join_{id}_{part}")
     }
@@ -238,13 +254,13 @@ fn column_type(info: &JoinColumnInfo) -> String {
     }
 }
 
-/// The partial columns of one side's hidden table: the row count, then a
-/// non-null count and a `numeric` sum per aggregate argument.
+/// The partial columns of a hidden table: the row count, then a non-null
+/// count and a `numeric` sum per aggregate argument.
 fn partial_columns(arguments: usize) -> Vec<String> {
     let mut columns = vec!["__n bigint not null default 0".to_string()];
     for i in 1..=arguments {
         columns.push(format!("__count_{i} bigint not null default 0"));
-        columns.push(format!("__sum_{i} numeric"));
+        columns.push(format!("__sum_{i} numeric not null default 0"));
     }
     columns
 }
@@ -286,8 +302,22 @@ pub(crate) fn hidden_tables_ddl(
         let keys = side_key_columns(def, side);
         let mut body: Vec<String> = keys.iter().map(|c| typed(columns, c)).collect();
         body.extend(partial_columns(side_arguments(def, side).len()));
-        let quoted: Vec<String> = keys.iter().map(|c| quote_ident(c)).collect();
-        body.push(format!("unique nulls not distinct ({})", quoted.join(", ")));
+        body.push("__basis pg_snapshot".to_string());
+        body.push("__stamp bigint not null default 0".to_string());
+        // The join key leads the cell identity, so its index also serves
+        // the other side's lookup of a key's cells.
+        let mut identity: Vec<String> =
+            join_key(def, side).iter().map(|c| quote_ident(c)).collect();
+        for key in &keys {
+            let key = quote_ident(key);
+            if !identity.contains(&key) {
+                identity.push(key);
+            }
+        }
+        body.push(format!(
+            "unique nulls not distinct ({})",
+            identity.join(", ")
+        ));
         sql.push_str(&format!(
             "create table {schema}.{} ({});\n",
             quote_ident(&table.name(id)),
@@ -305,6 +335,39 @@ pub(crate) fn hidden_tables_ddl(
         "create table {schema}.{} ({});\n",
         quote_ident(&HiddenTable::Matches.name(id)),
         body.join(", ")
+    ));
+    // `T`: the target's group columns, each typed as its side's column.
+    if let Some(join) = spec(def) {
+        let mut body: Vec<String> = join
+            .group_by
+            .iter()
+            .map(|key| match side_of_written(def, join, &key.table) {
+                Some(Side::Joined) => typed(joined, &key.column),
+                _ => typed(from, &key.column),
+            })
+            .collect();
+        body.extend(partial_columns(
+            side_arguments(def, Side::From).len() + side_arguments(def, Side::Joined).len(),
+        ));
+        let groups: Vec<String> = join
+            .group_by
+            .iter()
+            .map(|k| quote_ident(&k.column))
+            .collect();
+        body.push(format!("unique nulls not distinct ({})", groups.join(", ")));
+        sql.push_str(&format!(
+            "create table {schema}.{} ({});\n",
+            quote_ident(&HiddenTable::TargetPartials.name(id)),
+            body.join(", ")
+        ));
+    }
+    let lock = format!(
+        "{schema}.{}",
+        quote_ident(&HiddenTable::TruncateLock.name(id))
+    );
+    sql.push_str(&format!(
+        "create table {lock} (id boolean primary key default true check (id));\n\
+         insert into {lock} default values;\n"
     ));
     sql
 }
@@ -395,9 +458,11 @@ pub(crate) fn target_ddl(
             Some(Side::Joined) => joined,
             _ => from,
         };
+        // With its collation, as the hidden tables carry it, so the two
+        // compare a group's values alike.
         let pg_type = side_columns
             .get(&key.column)
-            .map_or_else(|| "text".to_string(), |info| info.pg_type.clone());
+            .map_or_else(|| "text".to_string(), column_type);
         columns.push(format!("{} {pg_type}", quote_ident(&key.column)));
         keys.push(quote_ident(&key.column));
     }
@@ -509,10 +574,31 @@ mod tests {
             "{ddl}"
         );
         assert!(ddl.contains("\"join_7_j\" (\"id\" integer, \"tenant\" integer, __matches bigint not null default 0, primary key (\"id\", \"tenant\"))"), "{ddl}");
+        // The join key leads each side's cell identity.
+        assert!(
+            ddl.contains("__stamp bigint not null default 0, unique nulls not distinct (\"id\", \"tenant\", \"region\"))"),
+            "{ddl}"
+        );
+        // `T`: the group columns, then the `FROM` side's one argument and the
+        // joined side's two.
+        assert!(
+            ddl.contains(
+                "\"join_7_t\" (\"region\" text, \"sku\" text, __n bigint not null default 0, \
+                 __count_1 bigint not null default 0, __sum_1 numeric not null default 0, \
+                 __count_2 bigint not null default 0, __sum_2 numeric not null default 0, \
+                 __count_3 bigint not null default 0, __sum_3 numeric not null default 0, \
+                 unique nulls not distinct (\"region\", \"sku\"))"
+            ),
+            "{ddl}"
+        );
+        assert!(
+            ddl.contains("\"join_7_l\" (id boolean primary key default true check (id))"),
+            "{ddl}"
+        );
         assert_eq!(
             drop_hidden_tables_sql("trellis", 7),
             "drop table if exists \"trellis\".\"join_7_p\", \"trellis\".\"join_7_m\", \
-             \"trellis\".\"join_7_j\""
+             \"trellis\".\"join_7_j\", \"trellis\".\"join_7_t\", \"trellis\".\"join_7_l\""
         );
 
         let target = target_ddl(&def, "\"public\".\"by_region\"", &from, &joined).unwrap();

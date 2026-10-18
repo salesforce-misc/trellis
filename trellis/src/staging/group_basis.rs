@@ -59,7 +59,7 @@
 //! and the `UNIQUE NULLS NOT DISTINCT` group identity (#1096 decision 7). The
 //! group's partials, its basis and its stamp live in a hidden table in the
 //! instance's catalog schema, named by definition id ([`hidden_table_name`],
-//! `agg_<id>`, beside a `JOIN`'s `join_<id>_p`/`_m`/`_j`): the row count
+//! `agg_<id>`, beside a `JOIN`'s `join_<id>_*` tables): the row count
 //! `__n`, and per distinct aggregate argument `i` (1-based, in
 //! `defs::ledger::contributions`' order) its non-null count `__count_<i>` and,
 //! when a `SUM` or `AVG` reads it, its sum `__sum_<i>` as `numeric`. A group
@@ -78,7 +78,8 @@
 //!    the staged sides name, sorted, and locks the ones that exist
 //!    (`on conflict … do update … where false` locks without writing).
 //! 3. A caller may do its own work here, holding the groups' locks: a
-//!    `JOIN` target's derived structures (#1108) call the steps itself.
+//!    `JOIN` (`super::join`) calls the steps itself, on its `P`, `M` and
+//!    `T` ([`Writer`]), with its `J` locks between them.
 //! 4. **Apply** ([`apply_locked_groups`], R2, F2): one later statement, so
 //!    under `READ COMMITTED` its snapshot sees every committed basis. It
 //!    sums the staged sides per (group, `row_txid`), keeps a sum only when
@@ -188,7 +189,7 @@ pub(super) enum Agg {
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct Arg {
     /// The argument over the image populated as the source's row type `s`.
-    sql: String,
+    pub(super) sql: String,
     /// The argument, for the audit to render on its own
     /// (`super::self_check_groups`).
     pub(super) expr: Expr,
@@ -202,7 +203,9 @@ pub(crate) struct GroupShape {
     /// The `GROUP BY` columns: the source's, the target's and the hidden
     /// table's column of that name.
     pub(super) group_cols: Vec<String>,
-    /// Each `GROUP BY` column's type in the target and hidden table.
+    /// Each `GROUP BY` column's type in the target and hidden table. Unread
+    /// by a `JOIN`'s writers, whose working tables copy the hidden table's
+    /// columns ([`Writer`]).
     pub(super) group_types: Vec<String>,
     pub(super) args: Vec<Arg>,
     pub(super) aggs: Vec<Agg>,
@@ -212,7 +215,7 @@ pub(crate) struct GroupShape {
     pub(super) fields: Vec<(String, String, Expr)>,
     /// The `numeric` source columns a `SUM` or `AVG` reads, whose declared
     /// scale define checks ([`check_define`]).
-    numeric_args: Vec<String>,
+    pub(super) numeric_args: Vec<String>,
 }
 
 impl GroupShape {
@@ -284,12 +287,10 @@ fn shape_of(def: &TransformDef, source_columns: &HashMap<String, ValueType>) -> 
         if group_by_contains(group_by, &field.name) {
             continue;
         }
-        let expr = rewrite(
-            &substituted[&field.name],
-            source_columns,
-            &arg_of,
-            &mut shape,
-        )?;
+        let type_of = |arg: &Expr| {
+            crate::defs::validate::infer_expr_type(arg, source_columns, &HashMap::new()).ok()
+        };
+        let expr = rewrite(&substituted[&field.name], &type_of, &arg_of, &mut shape)?;
         let pg_type = ddl::pg_type_name(*field_types.get(&field.name)?).into_owned();
         shape.fields.push((field.name.clone(), pg_type, expr));
     }
@@ -298,9 +299,11 @@ fn shape_of(def: &TransformDef, source_columns: &HashMap<String, ValueType>) -> 
 
 /// `expr` with each aggregate call replaced by its placeholder column, the
 /// call added to `shape.aggs`; `None` when some call isn't admitted.
-fn rewrite(
+/// `type_of` types an aggregate's argument, and `arg_of` finds its index in
+/// `shape.args`.
+pub(super) fn rewrite(
     expr: &Expr,
-    source_columns: &HashMap<String, ValueType>,
+    type_of: &dyn Fn(&Expr) -> Option<ValueType>,
     arg_of: &dyn Fn(&Expr) -> Option<usize>,
     shape: &mut GroupShape,
 ) -> Option<Expr> {
@@ -311,12 +314,7 @@ fn rewrite(
                 ("COUNT", [arg]) => Agg::Count(arg_of(arg)?),
                 (function @ ("SUM" | "AVG"), [arg]) => {
                     let i = arg_of(arg)?;
-                    let value_type = crate::defs::validate::infer_expr_type(
-                        arg,
-                        source_columns,
-                        &HashMap::new(),
-                    )
-                    .ok()?;
+                    let value_type = type_of(arg)?;
                     let cast = match value_type {
                         ValueType::Integer(IntWidth::Int2 | IntWidth::Int4) => "bigint",
                         ValueType::Integer(IntWidth::Int8) => "numeric",
@@ -356,13 +354,13 @@ fn rewrite(
             name: name.clone(),
             args: args
                 .iter()
-                .map(|a| rewrite(a, source_columns, arg_of, shape))
+                .map(|a| rewrite(a, type_of, arg_of, shape))
                 .collect::<Option<Vec<_>>>()?,
         }),
         Expr::BinaryOp { op, lhs, rhs } => Some(Expr::BinaryOp {
             op: *op,
-            lhs: Box::new(rewrite(lhs, source_columns, arg_of, shape)?),
-            rhs: Box::new(rewrite(rhs, source_columns, arg_of, shape)?),
+            lhs: Box::new(rewrite(lhs, type_of, arg_of, shape)?),
+            rhs: Box::new(rewrite(rhs, type_of, arg_of, shape)?),
         }),
         Expr::RelationshipPath { .. } => None,
         other => Some(other.clone()),
@@ -493,7 +491,28 @@ fn quoted(columns: &[String]) -> Vec<String> {
     columns.iter().map(|c| quote_ident(c)).collect()
 }
 
-/// One page's work on one group-basis target ([`apply_group_target`]).
+/// What a [`GroupTargetPlan`]'s statements write.
+#[derive(Debug, Clone)]
+pub(super) enum Writer {
+    /// A plain aggregate's target: the hidden table `agg_<id>` and the
+    /// visible target (see the module doc).
+    Aggregate,
+    /// One side's partials of a `JOIN` (`P` or `M`, `super::join`): the
+    /// hidden table only, with no visible row. The apply adds the change it
+    /// applied to each cell to `deltas`, a session temporary table, for the
+    /// `JOIN`'s product step.
+    JoinPartials {
+        /// Quoted, `pg_temp.`-qualified.
+        deltas: String,
+    },
+    /// A `JOIN`'s target groups (`T`, `super::join`): its hidden partials
+    /// and the visible target. Its staged rows are the page's product
+    /// deltas, already exact, so no basis or truncate floor filters them.
+    JoinTarget,
+}
+
+/// One page's work on one group-basis target ([`apply_group_target`]), or
+/// on one of a `JOIN`'s structures ([`Writer`]).
 #[derive(Debug, Clone)]
 pub(crate) struct GroupTargetPlan {
     /// The target, qualified and unquoted (`transform_definitions.target_table`).
@@ -512,16 +531,23 @@ pub(crate) struct GroupTargetPlan {
     source_pk: Vec<PrimaryKeyColumn>,
     /// The target's identity, its `GROUP BY` columns.
     identity: Vec<PrimaryKeyColumn>,
-    shape: GroupShape,
+    pub(super) shape: GroupShape,
     /// Every ring row of every change the page has for this target.
-    sides: Vec<String>,
+    pub(super) sides: Vec<String>,
     /// The keys of the page's image-less changes, whose current rows'
     /// groups the page recomputes.
     recompute_keys: Vec<String>,
-    hop_gen: i32,
-    src_changed: Option<SystemTime>,
-    origin_lsn: Option<PgLsn>,
+    pub(super) hop_gen: i32,
+    pub(super) src_changed: Option<SystemTime>,
+    pub(super) origin_lsn: Option<PgLsn>,
     pushed: bool,
+    writer: Writer,
+    /// The `ledger_truncate_floor` row the staged sides' `lsn` must be
+    /// above, or `None` for none ([`Writer::JoinTarget`]).
+    floor_key: Option<String>,
+    /// More conditions, over the populated image `s`, a side must meet to
+    /// be staged: `and …`, or empty.
+    stage_filter: String,
 }
 
 /// The columns of a plan's staging table, as DDL.
@@ -596,14 +622,66 @@ impl GroupTargetPlan {
             src_changed: None,
             origin_lsn: None,
             pushed: false,
+            writer: Writer::Aggregate,
+            floor_key: Some(target.to_string()),
+            stage_filter: String::new(),
+        }
+    }
+
+    /// The plan of one `JOIN` structure (`super::join`): `hidden` is its
+    /// hidden table (quoted, qualified), `staged` its session staging table
+    /// (a bare name, made `pg_temp.`), and `target` the `JOIN`'s target,
+    /// which errors and the seam name. `source` is the side's table, for a
+    /// [`Writer::JoinPartials`]; a [`Writer::JoinTarget`] stages nothing
+    /// from images. `floor_key` names the side's truncate floor.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn for_join(
+        target: &str,
+        hidden: String,
+        staged: &str,
+        source: Option<&str>,
+        identity: Vec<PrimaryKeyColumn>,
+        shape: GroupShape,
+        writer: Writer,
+        floor_key: Option<String>,
+        stage_filter: String,
+    ) -> Self {
+        Self {
+            target: target.to_string(),
+            target_ident: ddl::qualified_target_table_ident(target),
+            hidden_ident: hidden,
+            staged: format!("pg_temp.{}", quote_ident(staged)),
+            // A `JOIN` recomputes nothing (`push` refuses an image-less
+            // change), so its writers never create or read this table.
+            recomputed: String::new(),
+            source_row: source.map(ddl::qualified_source_table).unwrap_or_default(),
+            source_pk: Vec::new(),
+            identity,
+            shape,
+            sides: Vec::new(),
+            recompute_keys: Vec::new(),
+            hop_gen: 0,
+            src_changed: None,
+            origin_lsn: None,
+            pushed: false,
+            writer,
+            floor_key,
+            stage_filter,
         }
     }
 
     /// Adds one folded change's ring rows. An image-less change (a
     /// `Recompute`) has no sides: the page recomputes the groups it names
-    /// instead (see the module doc).
+    /// instead (see the module doc). A `JOIN`'s writers can't recompute yet
+    /// (J5, #1110), so they halt on one.
     pub(crate) fn push(&mut self, change: &FoldedChange) -> Result<(), ApplyError> {
         if change.has_recompute {
+            if !matches!(self.writer, Writer::Aggregate) {
+                return Err(self.unsupported(
+                    "an image-less change (a Re-derive, a released key, or a catch-up) on a \
+                     JOIN; the JOIN apply applies captured images only until J5 (#1110)",
+                ));
+            }
             self.recompute_keys.push(change.key.clone());
         }
         if change.group_sides.is_empty() {
@@ -613,6 +691,13 @@ impl GroupTargetPlan {
             ));
         }
         self.sides.extend(change.group_sides.iter().cloned());
+        self.note(change);
+        Ok(())
+    }
+
+    /// Merges `change`'s provenance into what the seam records for this
+    /// plan's rows.
+    pub(super) fn note(&mut self, change: &FoldedChange) {
         if self.pushed {
             self.hop_gen = self.hop_gen.max(change.hop_gen);
             self.src_changed =
@@ -624,10 +709,9 @@ impl GroupTargetPlan {
             self.origin_lsn = change.origin_lsn;
             self.pushed = true;
         }
-        Ok(())
     }
 
-    fn unsupported(&self, what: &'static str) -> ApplyError {
+    pub(super) fn unsupported(&self, what: &'static str) -> ApplyError {
         ApplyError::GroupBasisUnsupported {
             target: self.target.clone(),
             what,
@@ -654,6 +738,8 @@ impl GroupTargetPlan {
     }
 
     /// `s.<group col>::<type> as <group col>`, for each `GROUP BY` column.
+    /// A `JOIN` side's key columns are the image's own columns, at the
+    /// hidden table's types, so they need no cast.
     fn group_values(&self) -> Vec<String> {
         self.shape
             .group_cols
@@ -661,9 +747,61 @@ impl GroupTargetPlan {
             .zip(&self.shape.group_types)
             .map(|(c, t)| {
                 let c = quote_ident(c);
-                format!("s.{c}::{t} as {c}")
+                match self.writer {
+                    Writer::Aggregate => format!("s.{c}::{t} as {c}"),
+                    Writer::JoinPartials { .. } | Writer::JoinTarget => format!("s.{c} as {c}"),
+                }
             })
             .collect()
+    }
+
+    /// The working columns a staged row or an applied delta carries after
+    /// the group's: `<prefix>n`, then per argument `<prefix>c<i>` and, when
+    /// summed, `<prefix>s<i>`, each `null::<type> as <name>`.
+    fn working_columns(&self, n: &str, count: &str, sum: &str) -> Vec<String> {
+        let mut columns = vec![format!("null::bigint as {n}")];
+        for (i, arg) in self.shape.args.iter().enumerate() {
+            columns.push(format!("null::bigint as {count}{}", i + 1));
+            if arg.summed {
+                columns.push(format!("null::numeric as {sum}{}", i + 1));
+            }
+        }
+        columns
+    }
+
+    /// The `create` of a `JOIN` working table `table` (quoted,
+    /// `pg_temp.`-qualified): the hidden table's group columns, at their
+    /// exact types and collations, then `extra`. Once a session; its rows go
+    /// with each page's transaction.
+    fn join_working_ddl(&self, table: &str, extra: &[String]) -> String {
+        format!(
+            "create temp table if not exists {} on commit delete rows as \
+             select {}, {} from {} with no data",
+            table.trim_start_matches("pg_temp."),
+            quoted(&self.shape.group_cols).join(", "),
+            extra.join(", "),
+            self.hidden_ident
+        )
+    }
+
+    /// The `create` of [`Writer::JoinPartials`]' delta table.
+    pub(super) fn deltas_ddl(&self) -> Option<String> {
+        match &self.writer {
+            Writer::JoinPartials { deltas } => {
+                Some(self.join_working_ddl(deltas, &self.working_columns("__dn", "__dc", "__ds")))
+            }
+            _ => None,
+        }
+    }
+
+    /// The hidden table, quoted and qualified.
+    pub(super) fn hidden(&self) -> &str {
+        &self.hidden_ident
+    }
+
+    /// The staging table, quoted and `pg_temp.`-qualified.
+    pub(super) fn staged(&self) -> &str {
+        &self.staged
     }
 
     /// The lookup of the row of `table` (quoted) whose group is `alias`'s,
@@ -698,7 +836,15 @@ impl GroupTargetPlan {
     /// The `create` of [`Self::staged`], one row per (group, transaction,
     /// statement) of the page with each partial's signed sum. Created once a
     /// session; its rows go with each page's transaction.
-    fn staged_ddl(&self) -> String {
+    pub(super) fn staged_ddl(&self) -> String {
+        if !matches!(self.writer, Writer::Aggregate) {
+            let mut extra = vec![
+                "null::xid8 as __txid".to_string(),
+                "null::pg_lsn as __lsn".to_string(),
+            ];
+            extra.extend(self.working_columns("__n", "__c", "__s"));
+            return self.join_working_ddl(&self.staged, &extra);
+        }
         format!(
             "create temp table if not exists {} ({}) on commit delete rows",
             self.staged.trim_start_matches("pg_temp."),
@@ -708,7 +854,8 @@ impl GroupTargetPlan {
 
     /// The `create` of [`Self::recomputed`], one row per group to recompute
     /// (repeats allowed). Created once a session; its rows go with each
-    /// transaction.
+    /// transaction. A plain aggregate's only: a `JOIN`'s writers recompute
+    /// nothing ([`Self::push`]).
     fn recomputed_ddl(&self) -> String {
         let columns: Vec<String> = self
             .shape
@@ -722,6 +869,15 @@ impl GroupTargetPlan {
             self.recomputed.trim_start_matches("pg_temp."),
             columns.join(", ")
         )
+    }
+
+    /// The `create`s of every session table this plan's page stages into:
+    /// [`Self::staged`], and for a plain aggregate [`Self::recomputed`].
+    fn working_ddl(&self) -> String {
+        match self.writer {
+            Writer::Aggregate => format!("{}; {}", self.staged_ddl(), self.recomputed_ddl()),
+            Writer::JoinPartials { .. } | Writer::JoinTarget => self.staged_ddl(),
+        }
     }
 
     /// The statement adding groups to [`Self::recomputed`] ([`name_groups`]):
@@ -787,6 +943,24 @@ impl GroupTargetPlan {
                 sums.push(format!("sum(__sgn * coalesce(__a{i}, 0)::numeric)"));
             }
         }
+        // A `JOIN`'s writers have no `Recompute` rows ([`Self::push`]) and no
+        // recompute table.
+        let hinted = if matches!(self.writer, Writer::Aggregate) {
+            format!(
+                "hinted as ( \
+                     insert into {recomputed} ({cols}) \
+                     select {group_values} from raw \
+                     cross join lateral jsonb_populate_record(null::{src}, r -> 'o') as s \
+                     where r ->> 'op' = 'recompute' and jsonb_typeof(r -> 'o') = 'object' \
+                       and (select __bad from bad) = 0 \
+                 ),",
+                recomputed = self.recomputed,
+                group_values = self.group_values().join(", "),
+                src = self.source_row,
+            )
+        } else {
+            String::new()
+        };
         format!(
             "with {sides}, \
              bad as ( \
@@ -798,17 +972,11 @@ impl GroupTargetPlan {
                      or (r ->> 'op' in ('insert', 'update') \
                          and jsonb_typeof(r -> 'n') is distinct from 'object')) \
              ), \
-             hinted as ( \
-                 insert into {recomputed} ({cols}) \
-                 select {group_values} from raw \
-                 cross join lateral jsonb_populate_record(null::{src}, r -> 'o') as s \
-                 where r ->> 'op' = 'recompute' and jsonb_typeof(r -> 'o') = 'object' \
-                   and (select __bad from bad) = 0 \
-             ), \
+             {hinted} \
              ev as ( \
                  select {values} \
                  from sides sd cross join lateral jsonb_populate_record(null::{src}, sd.__i) as s \
-                 where jsonb_typeof(sd.__i) = 'object' \
+                 where jsonb_typeof(sd.__i) = 'object' {filter} \
              ), \
              staged as ( \
                  insert into {staged} \
@@ -822,26 +990,31 @@ impl GroupTargetPlan {
             src = self.source_row,
             staged = self.staged,
             sums = sums.join(", "),
-            recomputed = self.recomputed,
-            group_values = self.group_values().join(", "),
+            hinted = hinted,
+            filter = self.stage_filter,
         )
     }
 
     /// Step 1's statement ([`lock_groups`]): inserts every group the staged
     /// sides or [`Self::recomputed`] name that has no hidden row, and locks
-    /// the rest, sorted, in one statement (R1, R7).
-    fn lock_sql(&self) -> String {
+    /// the rest, sorted, in one statement (R1, R7). A `JOIN`'s writers have
+    /// only their staged sides.
+    pub(super) fn lock_sql(&self) -> String {
         let cols = quoted(&self.shape.group_cols).join(", ");
+        let recomputed = if matches!(self.writer, Writer::Aggregate) {
+            format!(" union all select {cols} from {}", self.recomputed)
+        } else {
+            String::new()
+        };
         format!(
             "insert into {hidden} ({cols}) \
              select distinct {cols} from ( \
-                 select {cols} from {staged} union all select {cols} from {recomputed} \
+                 select {cols} from {staged}{recomputed} \
              ) as g \
              order by {cols} \
              on conflict ({cols}) do update set __n = excluded.__n where false",
             hidden = self.hidden_ident,
             staged = self.staged,
-            recomputed = self.recomputed,
         )
     }
 
@@ -947,9 +1120,7 @@ impl GroupTargetPlan {
         format!(
             "with sg as ( \
                  select {col_list}, __txid, {sums} from {staged} \
-                 where __lsn > coalesce( \
-                     (select floor from ledger_truncate_floor where target_table = $1), \
-                     '0/0'::pg_lsn) \
+                 {floor} \
                  group by {col_list}, __txid \
              ), \
              pg as (select distinct {col_list} from sg), \
@@ -970,7 +1141,22 @@ impl GroupTargetPlan {
              {tail}",
             staged = self.staged,
             sums = sums.join(", "),
-            lookup_hidden = self.group_lookup(&self.hidden_ident, "pg", "x.ctid, x.__basis"),
+            floor = if self.floor_key.is_some() {
+                "where __lsn > coalesce( \
+                     (select floor from ledger_truncate_floor where target_table = $1), \
+                     '0/0'::pg_lsn)"
+            } else {
+                ""
+            },
+            lookup_hidden = self.group_lookup(
+                &self.hidden_ident,
+                "pg",
+                if matches!(self.writer, Writer::JoinTarget) {
+                    "x.ctid, null::pg_snapshot"
+                } else {
+                    "x.ctid, x.__basis"
+                }
+            ),
             matched = matched.join(" and "),
             totals = totals.join(", "),
             hidden = self.hidden_ident,
@@ -978,7 +1164,29 @@ impl GroupTargetPlan {
             nonzero = nonzero.join(" or "),
             up_groups = up_groups.join(", "),
             returning = returning.join(", "),
-            tail = self.visible_tail_sql(image_columns),
+            tail = match &self.writer {
+                Writer::JoinPartials { deltas } => self.deltas_tail_sql(deltas),
+                Writer::Aggregate | Writer::JoinTarget => self.visible_tail_sql(image_columns),
+            },
+        )
+    }
+
+    /// The end of [`Self::apply_sql`] for [`Writer::JoinPartials`], after its
+    /// `up` CTE: adds each written cell's change to `deltas` and returns how
+    /// many cells it wrote.
+    fn deltas_tail_sql(&self, deltas: &str) -> String {
+        let mut columns = quoted(&self.shape.group_cols);
+        columns.push("__dn".to_string());
+        for (i, arg) in self.shape.args.iter().enumerate() {
+            columns.push(format!("__dc{}", i + 1));
+            if arg.summed {
+                columns.push(format!("__ds{}", i + 1));
+            }
+        }
+        let columns = columns.join(", ");
+        format!(
+            "d as (insert into {deltas} ({columns}) select {columns} from up) \
+             select count(*) from up"
         )
     }
 
@@ -1236,9 +1444,11 @@ pub(crate) async fn lock_groups(
 /// any group is locked. Parsing and evaluating the images is most of a
 /// page's work, and none of it reads a basis, so it stays out of the time
 /// the page holds its groups.
-async fn stage_sides(txn: &Transaction<'_>, plan: &GroupTargetPlan) -> Result<(), ApplyError> {
-    txn.batch_execute(&format!("{}; {}", plan.staged_ddl(), plan.recomputed_ddl()))
-        .await?;
+pub(super) async fn stage_sides(
+    txn: &Transaction<'_>,
+    plan: &GroupTargetPlan,
+) -> Result<(), ApplyError> {
+    txn.batch_execute(&plan.working_ddl()).await?;
     let bad: i64 = txn
         .query_one(&plan.stage_sql(), &[&plan.sides])
         .await?
@@ -1293,6 +1503,16 @@ pub(crate) async fn apply_locked_groups(
     plan: &GroupTargetPlan,
     mutations: &mut TargetMutations,
 ) -> Result<(Vec<AppliedGroup>, usize, usize), ApplyError> {
+    if let Writer::JoinPartials { .. } = plan.writer {
+        let sql = plan.apply_sql(None);
+        txn.batch_execute(PLAN_SETTINGS).await?;
+        match &plan.floor_key {
+            Some(key) => txn.query_one(&sql, &[key]).await?,
+            None => txn.query_one(&sql, &[]).await?,
+        };
+        txn.batch_execute(PLAN_RESET).await?;
+        return Ok((Vec::new(), 0, 0));
+    }
     let image_columns = mutations.image_columns(txn, &plan.target).await?;
     let sql = plan.apply_sql(image_columns.as_deref());
     // One index lookup per group (`b`), not per (group, transaction): a
@@ -1302,7 +1522,10 @@ pub(crate) async fn apply_locked_groups(
     // quadratic in the page, so it's planned without one. A lateral lookup
     // is a nested loop whatever the setting.
     txn.batch_execute(PLAN_SETTINGS).await?;
-    let rows = txn.query(&sql, &[&plan.target]).await?;
+    let rows = match &plan.floor_key {
+        Some(key) => txn.query(&sql, &[key]).await?,
+        None => txn.query(&sql, &[]).await?,
+    };
     txn.batch_execute(PLAN_RESET).await?;
     Ok(written_groups(plan, rows, mutations))
 }
@@ -1351,8 +1574,7 @@ pub(crate) async fn recompute_groups(
     key: &str,
     mutations: &mut TargetMutations,
 ) -> Result<(usize, usize), ApplyError> {
-    txn.batch_execute(&format!("{}; {}", plan.staged_ddl(), plan.recomputed_ddl()))
-        .await?;
+    txn.batch_execute(&plan.working_ddl()).await?;
     name_groups(txn, plan, groups, &[key.to_string()]).await?;
     txn.execute(&plan.lock_sql(), &[]).await?;
     recompute_locked_groups(txn, plan, mutations).await
@@ -1577,7 +1799,16 @@ mod tests {
         let name = |cols: &HashMap<String, ValueType>| {
             let def = crate::defs::parse(text).expect("parses");
             let shape = shape_of(&def, cols).expect("admitted");
-            GroupTargetPlan::new("trellis", 7, "public.t", "public.s", Vec::new(), shape).staged
+            GroupTargetPlan::new(
+                "trellis",
+                7,
+                "public.t",
+                "public.s",
+                Vec::new(),
+                Vec::new(),
+                shape,
+            )
+            .staged
         };
         let int4 = columns();
         let mut int8 = columns();
@@ -1592,6 +1823,7 @@ mod tests {
             i64::MIN,
             "public.t",
             "public.s",
+            Vec::new(),
             Vec::new(),
             shape,
         )
@@ -1614,8 +1846,15 @@ mod tests {
         let def =
             crate::defs::parse("TRANSFORM t FROM s GROUP BY g SELECT SUM(a) AS s").expect("parses");
         let shape = shape_of(&def, cols).expect("admitted");
-        let mut plan =
-            GroupTargetPlan::new(schema, 7, "public.t", "public.s", Vec::new(), shape.clone());
+        let mut plan = GroupTargetPlan::new(
+            schema,
+            7,
+            "public.t",
+            "public.s",
+            Vec::new(),
+            Vec::new(),
+            shape.clone(),
+        );
         plan.sides = vec![format!(
             r#"{{"op":"insert","t":"100","l":"0/10","n":{{"id":1,"g":{g},"a":5}}}}"#
         )];
