@@ -261,7 +261,9 @@ pub(crate) async fn park_target_catchup_if_read(
 /// root on the group basis (`staging::group_basis`) is then neither rebuilt
 /// nor caught up: the reconcile pass queues each new node's correction,
 /// which recomputes the groups that route to it, the node's own rows' among
-/// them (#1103).
+/// them (#1103). The table's marker is still parked, and its discharge
+/// still enumerates the table for them, as for any applying reader
+/// ([`crate::defs::catalog::table_has_reader`]).
 pub(crate) async fn park_table_catch_ups(
     client: &impl GenericClient,
     tables: &[String],

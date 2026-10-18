@@ -33,8 +33,8 @@
 //! one sorted statement and rewrites each group from a `GROUP BY` of its
 //! rows, with that statement's snapshot as the group's basis, in one
 //! transaction with the correction's progress. The rows are read through the
-//! root, one index probe per group, or, for a node in the tree that is still
-//! there as recorded, by one `GROUP BY` of the node ([`node_to_read`]).
+//! root, one index probe per group, or, for a node in a tree that is still
+//! exactly as recorded, by one `GROUP BY` of the node ([`node_to_read`]).
 //! Every change the operation removed was committed before the pass queued
 //! the correction (the operation's lock on the node waits for its writers; a
 //! detach that is still pending is waited for), so the basis sees its
@@ -272,12 +272,18 @@ async fn routed_groups(
 /// `ACCESS SHARE` for the rest of `txn`; `None` to read them through the
 /// root. Every group in the set routes to the node, and the group key holds
 /// every partition-key column, so the node holds every row of every one of
-/// them while it is in the tree as recorded: under the same parent, by the
-/// same `pg_inherits` row, not detach-pending, and under the source's root.
-/// The lock keeps it there (a `DROP`, `DETACH` or `TRUNCATE` waits for
-/// `txn`), and the check runs after it, so it reads the catalog as the lock
-/// left it. A node that changed since the record is read through the root:
-/// the pass queues its own correction for the change.
+/// them while the whole tree is as recorded: every node under the same
+/// parent, by the same `pg_inherits` row, none detach-pending and none
+/// added. The node's own row is not enough: a sibling attached beside a
+/// `DEFAULT`, or an ancestor re-attached under another bound, moves groups
+/// the set routed to the node into another node, whose rows a read of this
+/// node alone would zero. The check runs after the lock, so it reads the
+/// catalog as the lock left it, and the lock keeps the node's region from
+/// narrowing after it: a `DROP`, `DETACH` or `TRUNCATE` of the node, an
+/// attach beside it or beside an ancestor `DEFAULT`, and an ancestor's
+/// re-attach all lock it `ACCESS EXCLUSIVE`. A tree that changed since the
+/// record is read through the root: the pass queues the change's own
+/// corrections.
 async fn node_to_read(
     txn: &tokio_postgres::Transaction<'_>,
     correction: &PendingCorrection,
@@ -291,19 +297,18 @@ async fn node_to_read(
     let Some(recorded) = recorded else {
         return Ok(None);
     };
-    let Some(node) = recorded.nodes.iter().find(|n| n.oid == correction.node_oid) else {
+    if !recorded.nodes[1..]
+        .iter()
+        .any(|n| n.oid == correction.node_oid)
+    {
         return Ok(None);
-    };
-    let (Some(parent), Some(xmin)) = (node.parent, node.inherits_xmin.as_ref()) else {
-        return Ok(None);
-    };
-    let oid = i64::from(node.oid);
+    }
     let name: Option<String> = txn
         .query_opt(
             "select pg_catalog.format('%I.%I', n.nspname, c.relname) \
              from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
              where c.oid = $1::bigint::oid and c.relkind in ('r', 'p')",
-            &[&oid],
+            &[&i64::from(correction.node_oid)],
         )
         .await?
         .map(|row| row.get(0));
@@ -312,21 +317,32 @@ async fn node_to_read(
     };
     txn.batch_execute(&format!("lock table {name} in access share mode"))
         .await?;
-    let in_tree: bool = txn
+    let mut oids = Vec::new();
+    let mut parents = Vec::new();
+    let mut xmins = Vec::new();
+    for node in &recorded.nodes[1..] {
+        let (Some(parent), Some(xmin)) = (node.parent, node.inherits_xmin.as_ref()) else {
+            return Ok(None);
+        };
+        oids.push(i64::from(node.oid));
+        parents.push(i64::from(parent));
+        xmins.push(xmin.clone());
+    }
+    let as_recorded: bool = txn
         .query_one(
-            "select exists ( \
-                 select 1 from pg_catalog.pg_inherits i \
-                 where i.inhrelid = $1::bigint::oid and i.inhparent = $2::bigint::oid \
-                   and not i.inhdetachpending and i.xmin::text = $3 \
-                   and pg_catalog.pg_partition_root(i.inhrelid) = $4::bigint::oid)",
-            &[
-                &oid,
-                &i64::from(parent),
-                xmin,
-                &i64::from(recorded.nodes[0].oid),
-            ],
+            "with recursive t as ( \
+                 select i.inhrelid, i.inhparent, i.xmin::text as x, i.inhdetachpending as p \
+                 from pg_catalog.pg_inherits i where i.inhparent = $1::bigint::oid \
+                 union all \
+                 select i.inhrelid, i.inhparent, i.xmin::text, i.inhdetachpending \
+                 from pg_catalog.pg_inherits i join t on i.inhparent = t.inhrelid), \
+             now as (select inhrelid::bigint, inhparent::bigint, x from t where not p), \
+             was as (select * from unnest($2::bigint[], $3::bigint[], $4::text[])) \
+             select not exists (select * from now except select * from was) \
+                and not exists (select * from was except select * from now)",
+            &[&i64::from(recorded.nodes[0].oid), &oids, &parents, &xmins],
         )
         .await?
         .get(0);
-    Ok(in_tree.then_some(name))
+    Ok(as_recorded.then_some(name))
 }

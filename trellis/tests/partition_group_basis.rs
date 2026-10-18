@@ -1326,3 +1326,61 @@ async fn a_leaf_detached_before_its_correction_runs_is_read_through_the_root() {
     fx.assert_right("after the detach's own correction").await;
     assert!(fx.queue().await.is_empty());
 }
+
+/// A node is read directly only while the whole tree is as recorded, not
+/// just its own `pg_inherits` row: a `DEFAULT`'s truncate correction
+/// enumerates its groups under its old text, a sibling is attached with rows
+/// for two of them, and the sibling's correction commits first. Read alone,
+/// the `DEFAULT` would zero those two groups after the sibling's correction
+/// counted them, with nothing queued to repair it.
+#[tokio::test]
+async fn a_default_narrowed_before_its_recompute_is_read_through_the_root() {
+    let mut fx = Fx::start(
+        &format!(
+            "{} create table public.items_a partition of public.items for values from (0) to (8); \
+             create table public.items_d partition of public.items default;",
+            head("range")
+        ),
+        SEED,
+    )
+    .await;
+    fx.exec("truncate public.items_d").await;
+    let batch = fx.d.seal().await;
+    assert_eq!(fx.kinds().await, ["truncated"]);
+    fx.drain(batch).await;
+    let mut run =
+        fx.d.run_frozen(
+            &[(PausePoint::BeforeCorrectionRecompute, "public.agg")],
+            |pool| async move {
+                Ok(
+                    partition_correction::run_pending(&pool, &Options::default())
+                        .await
+                        .expect("run the corrections"),
+                )
+            },
+        )
+        .await;
+    run.reached(PausePoint::BeforeCorrectionRecompute).await;
+    fx.exec(
+        "create table public.items_s (like public.items including all); \
+         insert into public.items_s values (9100, 8, 5), (9101, 9, 6); \
+         alter table public.items attach partition public.items_s for values from (8) to (10);",
+    )
+    .await;
+    fx.pass().await;
+    assert_eq!(fx.kinds().await, ["truncated", "new_leaf", "new_leaf"]);
+    // The sibling's and the narrowed `DEFAULT`'s corrections; the frozen
+    // one's row is claimed.
+    let others = partition_correction::run_pending(fx.d.pool(), &Options::default())
+        .await
+        .expect("the sibling's correction");
+    assert_eq!((others.completed, others.remaining), (2, 1));
+    fx.d.settle().await;
+    fx.d.release(&mut run, PausePoint::BeforeCorrectionRecompute)
+        .await;
+    assert_eq!(run.finish().await.completed, 1);
+    fx.d.settle().await;
+    fx.assert_right("a DEFAULT narrowed before its recompute")
+        .await;
+    assert!(fx.queue().await.is_empty());
+}

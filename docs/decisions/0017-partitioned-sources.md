@@ -217,17 +217,22 @@ set in one sorted statement and rewrites each group's partials from a
 in one transaction with its progress. Every change the DDL removed was
 committed before the pass queued the correction, so the basis sees it and its
 page refuses it: no `build_seg` and no fence. The rows are read through the
-root, or, for a node still in the tree as recorded (same parent, same
-`pg_inherits` row, not detach-pending), by one `GROUP BY` of the node under an
-`ACCESS SHARE` lock that holds it there; every row of a group that routes to
-the node is in it. The capture install that adds a new node to the tree
-rebuilds none of these aggregates: the node's own correction covers its rows,
-including those written into it directly before its capture existed. Measured on
-the engine (a debug build, one runner), a `DROP`, `DETACH` or `TRUNCATE` of a
-leaf of 1M or of 10M rows over 1,560 groups takes 27–34 ms and about 0.6 MB of
-WAL, whatever the leaf's rows; an `ATTACH` of such a leaf reads it twice, once
-for its groups and once for their partials, 0.5–0.6 s at 1M rows and 3.9–4.7 s
-at 10M.
+root, or, while the whole tree is as recorded (every node under the same
+parent by the same `pg_inherits` row, none detach-pending, none added), by one
+`GROUP BY` of the node under an `ACCESS SHARE` lock; every row of a group that
+routes to the node is then in it. The node's own row isn't enough: a sibling
+attached beside a `DEFAULT` takes some of its groups, whose rows a read of the
+`DEFAULT` alone would zero. Every operation that narrows the node's region
+after the check locks the node, so it waits for the correction. The capture
+install that adds a new node to the tree rebuilds none of these aggregates:
+the node's own correction covers its rows, including those written into it
+directly before its capture existed. The marker that install parks on the root
+still has them as readers, so its discharge stages a recompute of every key of
+the source. Measured on the engine (a debug build, one runner), the correction
+of a `DROP`, `DETACH` or `TRUNCATE` of a leaf of 1M or of 10M rows over 1,560
+groups takes 27–34 ms and about 0.6 MB of WAL, whatever the leaf's rows; the
+correction of an `ATTACH` of such a leaf reads it twice, once for its groups and
+once for their partials, 0.5–0.6 s at 1M rows and 3.9–4.7 s at 10M.
 
 A correction runs for each definition that reads the source, an aggregate over
 it or a definition reading it through a to-many relationship, as a row of the
