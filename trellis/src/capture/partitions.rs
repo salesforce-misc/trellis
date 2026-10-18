@@ -1128,6 +1128,10 @@ async fn fetch_constraints(
                 // fail with XX000 (internal error). The tree has changed
                 // under the check, so leave it to the next pass.
                 Err(err) if err.code() == Some(&SqlState::INTERNAL_ERROR) => {
+                    crate::instance_log::debug!(
+                        error = %err,
+                        "a partition constraint fetch raced DDL; leaving it for the next pass"
+                    );
                     return Ok(None);
                 }
                 Err(err) => return Err(err.into()),
@@ -1585,6 +1589,9 @@ mod tests {
         let db = cluster.create_empty_database().await;
         let mut fetcher = connect(db.dsn()).await;
         let ddl = connect(db.dsn()).await;
+        // Its own session: `pg_stat_activity` read inside the drop's open
+        // transaction would be the snapshot of the first read.
+        let watcher = connect(db.dsn()).await;
         ddl.batch_execute(
             "create table public.items (a int) partition by range (a); \
              create table public.i1 partition of public.items for values from (0) to (10)",
@@ -1609,8 +1616,13 @@ mod tests {
         let fetched = fetch_constraints(&mut fetcher, &oids);
         let commit = async {
             // Waits until the fetch is blocked on the lock, then commits.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             loop {
-                let waiting: bool = ddl
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the fetch never waited on the dropped leaf's lock"
+                );
+                let waiting: bool = watcher
                     .query_one(
                         "select exists (select 1 from pg_stat_activity \
                          where pid = $1 and wait_event_type = 'Lock')",

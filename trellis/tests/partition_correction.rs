@@ -1122,6 +1122,113 @@ async fn a_new_hash_leaf_whose_middle_was_dropped_completes_without_error() {
     assert_eq!(wrong, 0);
 }
 
+/// A new `HASH` leaf moved out from under its middle, and the middle dropped,
+/// before the leaf's correction ran: the leaf's rows are still in the source,
+/// under a parent the recorded tree does not know yet. The correction waits
+/// for the next pass to record the leaf where it is now rather than
+/// completing without work: that pass's `new_leaf` of the leaf is the same
+/// queue entry while another reader (here a paused one) keeps it queued, so
+/// nothing else would count the leaf's rows for this aggregate.
+#[tokio::test]
+async fn a_new_hash_leaf_moved_from_under_its_dropped_middle_is_still_counted() {
+    for reattach in [true, false] {
+        a_new_hash_leaf_moved_from_under_its_dropped_middle(reattach).await;
+    }
+}
+
+/// [`a_new_hash_leaf_moved_from_under_its_dropped_middle_is_still_counted`]:
+/// the leaf is attached to the root again, or left out of the tree.
+async fn a_new_hash_leaf_moved_from_under_its_dropped_middle(reattach: bool) {
+    const GROUPED: &str = "TRANSFORM agg FROM public.items GROUP BY g, h \
+         SELECT SUM(v) AS total, COUNT(*) AS n";
+    const SECOND: &str = "TRANSFORM agg2 FROM public.items GROUP BY g, h \
+         SELECT MAX(v) AS top, COUNT(*) AS n";
+    let mut fx = Fx::start_with(
+        "create table public.items (id integer not null, g integer not null, \
+             h smallint not null, v integer not null, primary key (g, h, id)) \
+             partition by range (g); \
+         create table public.items_m0 partition of public.items for values from (0) to (8) \
+             partition by hash (h); \
+         create table public.items_m0a partition of public.items_m0 \
+             for values with (modulus 2, remainder 0); \
+         create table public.items_m0b partition of public.items_m0 \
+             for values with (modulus 2, remainder 1); \
+         create table public.items_m1 partition of public.items for values from (8) to (16); \
+         insert into public.items select i, i % 16, (i % 7)::smallint, i \
+             from generate_series(1, 320) i;",
+        &[GROUPED, SECOND],
+    )
+    .await;
+    fx.exec("drop table public.items_m0b").await;
+    fx.correct().await;
+    // A table with rows in groups no other leaf holds is attached in the
+    // dropped leaf's place.
+    fx.exec(
+        "create table public.items_x (id integer not null, g integer not null, \
+             h smallint not null, v integer not null, primary key (g, h, id)); \
+         insert into public.items_x select i, i % 8, (100 + i % 10)::smallint, i \
+             from generate_series(1000, 1099) i \
+             where satisfies_hash_partition('public.items_m0'::regclass, 2, 1, \
+                                            (100 + i % 10)::smallint); \
+         alter table public.items_m0 attach partition public.items_x \
+             for values with (modulus 2, remainder 1)",
+    )
+    .await;
+    fx.pass().await;
+    fx.d.settle().await;
+    assert_eq!(
+        queued(&fx.queue().await),
+        [entry("new_leaf", "public.items_x")]
+    );
+    // Both readers get their row; the second is paused, so its row keeps
+    // the correction queued.
+    partition_correction::schedule(fx.d.pool())
+        .await
+        .expect("schedule");
+    fx.exec("update transform_definitions set status = 'paused' where target_table like '%.agg2'")
+        .await;
+    // The leaf moves out, to the root or out of the tree, and its middle
+    // goes, before the next pass.
+    fx.exec(
+        "alter table public.items_m0 detach partition public.items_x; \
+         drop table public.items_m0",
+    )
+    .await;
+    if reattach {
+        fx.exec(
+            "alter table public.items attach partition public.items_x \
+             for values from (0) to (8)",
+        )
+        .await;
+    }
+    // The leaf's correction waits for the next pass's record of the tree.
+    let outcome = fx.run(&Options::default()).await;
+    assert_eq!((outcome.completed, outcome.remaining), (0, 1), "{reattach}");
+    fx.correct().await;
+    assert_eq!(
+        queued(&fx.queue().await),
+        [entry("new_leaf", "public.items_x")],
+        "{reattach}: only the paused reader's row keeps it"
+    );
+    let wrong: Vec<String> =
+        fx.d.ctl
+            .query(
+                "select coalesce(w.g, a.g)::text || '/' || coalesce(w.h, a.h)::text \
+                 from (select g, h, sum(v) as total, count(*) as n \
+                       from public.items group by g, h) w \
+                 full join public.agg a on a.g = w.g and a.h = w.h \
+                 where w.total is distinct from a.total or w.n is distinct from a.n \
+                 order by 1",
+                &[],
+            )
+            .await
+            .expect("oracle")
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+    assert_eq!(wrong, Vec::<String>::new(), "{reattach}");
+}
+
 /// A `catching_up` definition applies, so the correction waits for it: it
 /// gets its row once its catch-up has moved it `live` (the merger folds only
 /// a `backfilling` definition's deltas), and the correction stays queued

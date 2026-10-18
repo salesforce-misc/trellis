@@ -552,6 +552,49 @@ async fn a_dropped_middle_is_corrected_through_its_own_text() {
     assert_eq!(fx.wrong_parents().await, Vec::<String>::new());
 }
 
+/// A new `HASH` leaf's correction routes by the leaf's text, which embeds
+/// its middle's oid. A middle dropped, and the leaf with it, before the
+/// correction has run makes that text raise `XX000`; the correction is
+/// complete without work instead (#1148), and the middle's own `gone_node`,
+/// queued by the next pass, recomputes its orders.
+#[tokio::test]
+async fn a_new_hash_leaf_whose_middle_was_dropped_completes_without_error() {
+    let mut fx = Fx::start(&with_leaves(
+        "partition by range (order_id)",
+        "create table public.items_m0 partition of public.items for values from (0) to (8) \
+             partition by hash (order_id); \
+         create table public.items_m0a partition of public.items_m0 \
+             for values with (modulus 2, remainder 0); \
+         create table public.items_m0b partition of public.items_m0 \
+             for values with (modulus 2, remainder 1); \
+         create table public.items_m1 partition of public.items for values from (8) to (16);",
+    ))
+    .await;
+    fx.exec("drop table public.items_m0b").await;
+    fx.correct().await;
+    fx.exec(
+        "create table public.items_m0b partition of public.items_m0 \
+         for values with (modulus 2, remainder 1)",
+    )
+    .await;
+    fx.pass().await;
+    fx.d.settle().await;
+    assert_eq!(
+        queued(&fx.queue().await),
+        [entry("new_leaf", "public.items_m0b")]
+    );
+    // The capture install on the new leaf parks a catch-up; the definition
+    // gets its correction row once it is `live`.
+    fx.catch_up().await;
+    // Before the leaf's correction runs, its middle goes too.
+    fx.exec("drop table public.items_m0").await;
+    let outcome = fx.run_through(&Options::default()).await;
+    assert_eq!(outcome.completed, 1);
+    assert!(fx.queue().await.is_empty());
+    fx.correct().await;
+    assert_eq!(fx.wrong_parents().await, Vec::<String>::new());
+}
+
 /// Item changes staged before the drop and drained after the correction
 /// recompute their orders from the live rows: they bring no item back.
 #[tokio::test]

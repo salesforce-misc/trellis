@@ -75,9 +75,9 @@ use crate::pool::{Pool, quote_ident};
 use crate::staging::append::{self, StagedChange};
 
 use super::{
-    CHUNK_APPLICATION_NAME, CorrectionError, Options, Outcome, Phase, Progress, Route, RouteColumn,
-    Step, budget_spent, covered_by_parent, detach_pending, mark_done, progress, route_of,
-    route_predicate, u32_param,
+    Ancestry, CHUNK_APPLICATION_NAME, CorrectionError, Options, Outcome, Phase, Progress, Route,
+    RouteColumn, Step, ancestry, budget_spent, covered_by_parent, detach_pending, mark_done,
+    progress, route_of, route_predicate, u32_param,
 };
 use crate::staging::apply::ApplyError;
 
@@ -212,6 +212,17 @@ pub(super) async fn correct(
         let client = pool.get().await?;
         partitions::recorded(&**client, &correction.table).await?
     };
+    match ancestry(pool, correction, recorded.as_ref()).await? {
+        Ancestry::Intact => {}
+        Ancestry::Moved => return Ok(Step::Waiting),
+        Ancestry::Gone => {
+            return Ok(if mark_done(pool, fence, correction, definition).await? {
+                Step::Done
+            } else {
+                Step::Superseded
+            });
+        }
+    }
     let route = route_of(correction, recorded.as_ref());
     if matches!(route, Route::Text(_)) && !join_types_match(pool, reader, recorded.as_ref()).await?
     {

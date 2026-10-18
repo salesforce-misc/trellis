@@ -1094,12 +1094,16 @@ async fn correct(
         let client = pool.get().await?;
         partitions::recorded(&**client, &correction.table).await?
     };
-    if ancestor_gone(pool, correction, recorded.as_ref()).await? {
-        return Ok(if mark_done(pool, fence, correction, definition).await? {
-            Step::Done
-        } else {
-            Step::Superseded
-        });
+    match ancestry(pool, correction, recorded.as_ref()).await? {
+        Ancestry::Intact => {}
+        Ancestry::Moved => return Ok(Step::Waiting),
+        Ancestry::Gone => {
+            return Ok(if mark_done(pool, fence, correction, definition).await? {
+                Step::Done
+            } else {
+                Step::Superseded
+            });
+        }
     }
     let route = route_of(correction, recorded.as_ref());
     let columns = route_columns(ledger, recorded.as_ref(), "l");
@@ -1196,24 +1200,41 @@ async fn covered_by_parent(
     Ok(!alive)
 }
 
-/// Whether `correction` is a new or truncated leaf with an ancestor, in the
-/// recorded tree, that has been dropped since the pass queued it (#1148). The
-/// leaf's text embeds its `HASH` ancestors' oids and cannot be evaluated once
-/// one is dropped. The ancestor's own `gone_node`, queued by the pass that
-/// sees it go, routes every group of its bound, the leaf's among them, so the
-/// leaf's is complete without work.
-async fn ancestor_gone(
+/// What became of a new or truncated leaf's recorded ancestors (#1148).
+#[derive(Debug, PartialEq, Eq)]
+enum Ancestry {
+    /// Every recorded ancestor is there, or the correction is of another
+    /// kind, or the node is not in the recorded tree.
+    Intact,
+    /// An ancestor has been dropped but the node is still there: it was
+    /// moved out from under it. The next pass records it where it is now,
+    /// and the correction routes by that record.
+    Moved,
+    /// An ancestor has been dropped, and the node with it.
+    Gone,
+}
+
+/// What became of `correction`'s recorded ancestors, for a new or truncated
+/// leaf. The leaf's text embeds its `HASH` ancestors' oids and cannot be
+/// evaluated once one is dropped. If the leaf went with it, the topmost
+/// dropped ancestor's own `gone_node`, queued by the pass that sees it go,
+/// routes every group of its bound, the leaf's among them, so the leaf's
+/// correction is complete without work. If the leaf is still there, its rows
+/// still count: the pass that sees it moved queues a `new_leaf` of it, but
+/// that is this same queue entry while any reader keeps it queued, so this
+/// correction waits for the pass's record rather than completing.
+async fn ancestry(
     pool: &Pool,
     correction: &PendingCorrection,
     recorded: Option<&Recorded>,
-) -> Result<bool, CorrectionError> {
+) -> Result<Ancestry, CorrectionError> {
     if correction.kind != partitions::Kind::NewLeaf.as_str()
         && correction.kind != partitions::Kind::Truncated.as_str()
     {
-        return Ok(false);
+        return Ok(Ancestry::Intact);
     }
     let Some(recorded) = recorded else {
-        return Ok(false);
+        return Ok(Ancestry::Intact);
     };
     let mut ancestors: Vec<i64> = Vec::new();
     let mut at = correction.node_oid;
@@ -1230,17 +1251,26 @@ async fn ancestor_gone(
         at = parent;
     }
     if ancestors.is_empty() {
-        return Ok(false);
+        return Ok(Ancestry::Intact);
     }
     let client = pool.get().await?;
-    let alive: i64 = client
+    let row = client
         .query_one(
-            "select count(*) from pg_catalog.pg_class where oid = any($1::bigint[]::oid[])",
-            &[&ancestors],
+            "select (select count(*) from pg_catalog.pg_class \
+                     where oid = any($1::bigint[]::oid[])), \
+                    exists (select 1 from pg_catalog.pg_class where oid = $2::bigint::oid)",
+            &[&ancestors, &i64::from(correction.node_oid)],
         )
-        .await?
-        .get(0);
-    Ok(usize::try_from(alive).unwrap_or(0) < ancestors.len())
+        .await?;
+    let alive: i64 = row.get(0);
+    let node_alive: bool = row.get(1);
+    Ok(if usize::try_from(alive).unwrap_or(0) == ancestors.len() {
+        Ancestry::Intact
+    } else if node_alive {
+        Ancestry::Moved
+    } else {
+        Ancestry::Gone
+    })
 }
 
 /// Whether `correction` is a gone node whose detach is still pending.
