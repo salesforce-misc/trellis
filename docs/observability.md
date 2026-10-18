@@ -290,11 +290,13 @@ pause are arcs of one lifecycle:
   * an `ALTER TRANSFORM` that added columns;
   * a resumed column;
   * a rebuild of a transform whose target it reads;
-  * a re-read of a table it reads (`Trellis::request_backfill`, or the table's
-    capture triggers put back after someone dropped them), unless the
-    Re-derive build serves it: that definition goes `backfilling` instead,
-    in the call's own transaction, and returns to `live` when the rebuild
-    is done.
+  * a re-read of a table it reads (`Trellis::request_backfill`, the table's
+    capture triggers put back after someone dropped them, or an automatic
+    rebuild counted in `capture_auto_rebuilds_total`), unless the Re-derive
+    build serves it: that definition goes `backfilling` instead, in the
+    call's own transaction (or the capture pass that starts the automatic
+    rebuild), and returns to `live` when the rebuild is done. Its target
+    keeps its rows meanwhile: the rebuild rewrites them in place.
 
   A `live` transform that reads an upstream which isn't `live` reports
   `catching_up` too.

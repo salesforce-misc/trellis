@@ -177,11 +177,12 @@ pub enum ApplyError {
     AggregateOffLedger { target: String },
     /// A group-basis aggregate target (`super::group_basis`, #1100) met
     /// what its dev knob doesn't support yet: a ring row missing the images
-    /// its change needs, a page folded with the knob off, or a build over a
-    /// source with rows or a rebuild's sweep (#1101); or, on a `JOIN`
-    /// (`super::join`, #1108), a side's `TRUNCATE` or an image-less change
-    /// (#1110), or a build over a side that is partitioned (#1111) or
-    /// another definition's target. Like
+    /// its change needs, a page folded with the knob off, or a fresh build
+    /// or resume over a source with rows or a rebuild over a partitioned
+    /// source (#1101); or, on a `JOIN` (`super::join`, #1108), a side's
+    /// `TRUNCATE` or an image-less change (#1110), a build over a side that
+    /// is partitioned (#1111) or another definition's target, or a rebuild
+    /// (#1109). Like
     /// [`ApplyError::AggregateOffLedger`], every page of the target would
     /// reproduce it, so it halts the target.
     GroupBasisUnsupported { target: String, what: &'static str },

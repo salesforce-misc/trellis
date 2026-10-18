@@ -1,7 +1,8 @@
 //! `self_check` of an aggregate target on the group basis (#1104, ADR-0013
 //! "Scope"). It detects and never repairs: a planted divergence is reported,
-//! and gone once the planted damage is undone (the repair for real damage,
-//! `request_backfill` of the source, is the group-basis build's, #1101).
+//! and gone once the planted damage is undone (the repair for real damage
+//! is `request_backfill` of the source, which rebuilds the groups in place:
+//! `group_basis_rebuild.rs`).
 //!
 //! Every test turns the group-basis dev knob on before its driver starts,
 //! drives the pipeline by hand through `support/drain_driver.rs` and never

@@ -130,6 +130,13 @@
 //! classifies the tree, before it fetches the constraint texts (#1129). A
 //! test runs the reconcile pass inside [`with_scope`].
 //!
+//! A group-basis rebuild (`super::group_basis::rebuild`, run by a rebuild's
+//! sweep job in `super::build`) fires [`PausePoint::AfterRebuildLock`] for
+//! the definition's target once it has locked its groups, before the
+//! statement that takes its snapshot, and [`PausePoint::BeforeRebuildCommit`]
+//! after its last write, before it commits (#1101). A test runs the job
+//! inside [`with_scope`].
+//!
 //! A later part that replaces a step moves its hook with it.
 //!
 //! # Stalls
@@ -292,6 +299,17 @@ pub enum PausePoint {
     /// (`capture::partitions`, #1129). The pass holds no transaction, so a
     /// node it read can be detached or dropped here.
     BeforeConstraintFetch,
+    /// After a group-basis rebuild has locked every group it covers, before
+    /// the statement that takes its snapshot and replaces them, for the
+    /// definition's target (`super::group_basis::rebuild`, #1101). Pages of
+    /// those groups queue on their locks here; a group a page creates now
+    /// isn't locked.
+    AfterRebuildLock,
+    /// After a group-basis rebuild has replaced every group and marked its
+    /// job done, just before it commits, for the definition's target
+    /// (`super::build`'s rebuild job, #1101). Readers still see the old
+    /// values here.
+    BeforeRebuildCommit,
 }
 
 /// What a frozen worker reports when it reaches its armed point.

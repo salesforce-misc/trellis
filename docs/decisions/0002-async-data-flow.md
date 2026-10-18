@@ -726,12 +726,39 @@ it adds its region's partials to the groups as increments.
   retired applies); a recompute during the build counts those rows only
   once it is done or retired; and a source truncate resets it like any
   chunk whose snapshot saw the truncate.
-- **Must:** a rebuild over a target that already has groups
-  (`request_backfill`, a capture re-install) does not pause the definition,
-  and is an absolute write under R1, R5, R6 and R8 that covers the target's
-  own groups. [OPEN: how it replaces the existing groups while pages keep
-  applying, and what readers see meanwhile. Decided with the build plan in
-  #1101.]
+- **Must:** a rebuild over a target that already has groups recomputes
+  every group in place, without pausing the definition. That is
+  `request_backfill`, a capture re-install, and the automatic rebuilds
+  (`capture_auto_rebuilds_total`), but not `RESUME`, which truncates and
+  builds fresh. It is one absolute write per structure (one per source, or
+  one per partition on a partitioned source, each group routing to one
+  partition under
+  [ADR-0017](0017-partitioned-sources.md)'s group-key rule), each the
+  ordinary group recompute applied to all of the structure's groups in one
+  transaction: it locks the groups in key order in a statement of their
+  own (R6), runs the `GROUP BY` of the structure's source rows from one
+  snapshot, and **replaces**, not adds to, each group's hidden partials and
+  visible row, with that snapshot as the group's basis and its stamp per
+  R5.
+- **Must:** the groups a rebuild covers are the enumeration union (R8): the
+  source's groups, the groups named by old images of undrained ring
+  changes, and the target's own groups. A group with no source rows goes to
+  zero and is collected under R4; its visible row is removed in the same
+  transaction. A group a page creates after the lock statement is not
+  locked, and the rebuild leaves it to its pages.
+- **Must:** pages keep applying during a rebuild. A change the snapshot saw
+  is refused by its group's basis, a later one applies as a delta, and a
+  page touching a locked group waits for the statement to commit. Readers
+  see the old values until a structure's statement commits, then the new
+  ones: the target never empties and no group shows a partial build. The
+  status reads `backfilling` from the call, or from the pass that starts an
+  automatic rebuild, until every structure has committed, then `live`.
+  *Cost:* pages of a structure's groups, in practice its source's drain,
+  wait while its statement runs: 1.4–1.9 s at 100M source rows, about
+  15–20 s at 1B (extrapolated), one partition's worth at a time on a
+  partitioned source. Clearing the target and building fresh would show
+  readers an empty, then filling target, and a shadow build and swap would
+  make pages write to both states; both are rejected.
 
 *Evidence:* in my model, chunk builds with recomputes, garbage collection
 and retirement, by one runner and by eight, were exact in every soak run.

@@ -42,6 +42,14 @@
 //!   runs enqueues another plan and sweep; the definition is `live` when
 //!   every one is done. Every other reader gets the marker's go-live
 //!   catch-up.
+//!
+//!   A group-basis aggregate (`super::group_basis`) has no entries to
+//!   re-derive, so its rebuild is its sweep job alone, which recomputes
+//!   every group in place in one transaction
+//!   (`super::group_basis::rebuild`, #1101): its readers see the old values
+//!   until that commits, then the new ones, never an empty or partial
+//!   target. A fresh group-basis build never has a sweep, so a sweep row
+//!   is always this rebuild.
 //! - **Plan** ([`run_plan`]). A drain worker walks the source's primary key
 //!   and enqueues `rederive` chunks of `ClientOptions::build_chunk_rows`
 //!   rows, [`PLAN_BATCH`] per transaction (Q13). The walk and every chunk
@@ -1165,8 +1173,10 @@ fn buildable_shape(definition: &Definition) -> Option<ledger::LedgerShape> {
 
 /// Whether `definition` is on the group basis (`super::group_basis`, behind
 /// its dev knob, #1100), a `JOIN` behind the same knob (`super::join`,
-/// #1108) included. Their builds are #1101's and #1109's: until then the
-/// plan job only checks that the source (each side of a `JOIN`) is empty
+/// #1108) included. A rebuild of a plain aggregate's is its sweep job alone
+/// ([`start_rebuilds`], [`run_group_rebuild`]). Their fresh builds are
+/// #1101's open part and #1109's: until then the plan job only checks that
+/// the source (each side of a `JOIN`) is empty
 /// ([`run_plan`]), and enqueues no chunk.
 fn takes_group_basis(definition: &Definition) -> bool {
     super::group_basis::route(&definition.def, &definition.source_columns).is_some()
@@ -1789,6 +1799,9 @@ pub(crate) async fn rebuildable_on_group_basis(
 /// [`start`] does for a resumed definition: a rebuild re-derives the rows
 /// the table has and sweeps the entries it no longer backs. That is one row
 /// of each per definition, so the call stays fast whatever the table's size.
+/// A group-basis definition (one with a hidden group table,
+/// `super::group_basis`) gets the sweep job alone, which recomputes its
+/// groups in place ([`run_group_rebuild`]).
 ///
 /// The definition applies throughout (B1), as it did before the call, so
 /// nothing is parked for it: the caller leaves it out of its catch-up. Its
@@ -1823,9 +1836,19 @@ pub(crate) async fn start_rebuilds(
         .collect();
     for kind in [chunk_queue::KIND_PLAN, chunk_queue::KIND_SWEEP] {
         txn.execute(
-            "insert into backfill_chunks (definition_id, kind, fuse_rearmed_at, start_xid) \
-             select id, $2, fuse_rearmed_at, pg_current_xact_id() \
-             from transform_definitions where id = any($1) order by id",
+            &format!(
+                "insert into backfill_chunks (definition_id, kind, fuse_rearmed_at, start_xid) \
+                 select id, $2, fuse_rearmed_at, pg_current_xact_id() \
+                 from transform_definitions d where id = any($1) \
+                   and ($2 = '{sweep}' or not exists ( \
+                       select 1 from pg_catalog.pg_class c \
+                       where c.relname = {hidden} \
+                         and c.relnamespace = (select relnamespace from pg_catalog.pg_class \
+                                               where oid = 'transform_definitions'::regclass))) \
+                 order by id",
+                sweep = chunk_queue::KIND_SWEEP,
+                hidden = super::group_basis::hidden_table_name_sql("d.id"),
+            ),
             &[&ids, &kind],
         )
         .await?;
@@ -3083,9 +3106,10 @@ async fn run_plan(
         }
     }
     let mut client = pool.get().await?;
-    // #1100: the group basis has no build yet (#1101), so its dev knob
-    // takes only a source that is empty when the build plans, which needs
-    // none: the walk below enqueues no chunk.
+    // #1100: the group basis has no fresh build yet (#1101's open part), so
+    // its dev knob takes only a source that is empty when a fresh build or a
+    // resume plans, which needs none: the walk below enqueues no chunk. A
+    // rebuild of a live plain aggregate has no plan job ([`start_rebuilds`]).
     // #1108: a `JOIN` behind the same knob takes two empty tables, each
     // captured (the target feed is #1100's) and unpartitioned (#1111).
     if cursor.is_none() && chunk.fields.is_none() && takes_group_basis(&definition) {
@@ -3121,8 +3145,8 @@ async fn run_plan(
             if has_rows {
                 return Err(build_error(ApplyError::GroupBasisUnsupported {
                     target: definition.target_table.clone(),
-                    what: "a build over a source that has rows (the group-basis build is #1101, \
-                           the JOIN build #1109)",
+                    what: "a fresh build or resume over a source that has rows (the group-basis \
+                           fresh build is #1101, the JOIN build #1109)",
                 }));
             }
         }
@@ -3228,6 +3252,83 @@ async fn run_plan(
     Ok(())
 }
 
+/// Runs a group-basis definition's claimed sweep job, which is its whole
+/// rebuild (#1101's decision; see the module doc's "Rebuild of an applying
+/// definition"): [`super::group_basis::rebuild_definition`] and the job's
+/// done mark in one `read committed` transaction, fenced by the claim
+/// ([`ClaimFence`]), so a job that dies before its commit runs again whole
+/// and one that committed never does. The rebuild is idempotent: run again,
+/// it writes each group from a newer snapshot. Then [`try_complete`].
+///
+/// On an unpartitioned source that one transaction is the whole rebuild. A
+/// partitioned source's rebuild (one statement per partition) is #1101's
+/// open part, so it halts here.
+async fn run_group_rebuild(
+    pool: &Pool,
+    chunk: &ClaimedChunk,
+    claimed_by: &str,
+    definition: &Definition,
+    options: &WorkerOptions,
+) -> Result<(), ChunkQueueError> {
+    let _heartbeat = chunk_queue::ChunkHeartbeat::spawn(
+        pool.clone(),
+        chunk.id,
+        claimed_by.to_string(),
+        options.heartbeat_interval,
+    );
+    let fence = ClaimFence::new(chunk.id, claimed_by, options.reclaim_ttl);
+    let mut client = pool.get().await?;
+    if crate::defs::partition_tree::is_partitioned_root(&**client, &definition.source_table).await?
+    {
+        return Err(build_error(ApplyError::GroupBasisUnsupported {
+            target: definition.target_table.clone(),
+            what: "a rebuild over a partitioned source (one statement per partition is #1101's)",
+        }));
+    }
+    let started = Instant::now();
+    let txn = client
+        .build_transaction()
+        .isolation_level(IsolationLevel::ReadCommitted)
+        .start()
+        .await?;
+    txn.batch_execute(&format!(
+        "set local application_name = '{CHUNK_APPLICATION_NAME}'"
+    ))
+    .await?;
+    if !fence.hold(&*txn).await? {
+        txn.rollback().await?;
+        return chunk_queue::discard_if_superseded(pool, chunk, claimed_by).await;
+    }
+    let (written, deleted) =
+        super::group_basis::rebuild_definition(&txn, pool.schema(), definition)
+            .await
+            .map_err(build_error)?
+            .unwrap_or((0, 0));
+    txn.execute(
+        "update backfill_chunks set done = true, claimed_by = null, claimed_at = null \
+         where id = $1",
+        &[&chunk.id],
+    )
+    .await?;
+    #[cfg(any(test, feature = "test-util"))]
+    super::interleave::pause_at(
+        &*txn,
+        super::interleave::PausePoint::BeforeRebuildCommit,
+        &definition.target_table,
+    )
+    .await?;
+    txn.commit().await?;
+    metrics::record_build_chunk(started.elapsed(), (written + deleted) as u64, 0);
+    crate::instance_log::debug!(
+        definition_id = chunk.definition_id,
+        written,
+        deleted,
+        "group-basis rebuild replaced every group"
+    );
+    try_complete(pool, chunk.definition_id).await?;
+    Ok(())
+}
+
 /// Runs a claimed sweep job (#625 F3; see the module doc): [`sweep_batch`]es
 /// of [`WorkerOptions::chunk_rows`] entries from the job's cursor, each in
 /// its own `read committed` transaction with the cursor's advance, fenced by
@@ -3248,11 +3349,14 @@ async fn run_sweep(
         .ok_or(ChunkQueueError::DefinitionNotFound {
             definition_id: chunk.definition_id,
         })?;
-    if takes_group_basis(&definition) {
+    if super::join::applies(&definition.def) {
         return Err(build_error(ApplyError::GroupBasisUnsupported {
             target: definition.target_table.clone(),
-            what: "a rebuild's sweep (the group-basis rebuild is #1101)",
+            what: "a JOIN rebuild's sweep (the JOIN build is #1109)",
         }));
+    }
+    if takes_group_basis(&definition) {
+        return run_group_rebuild(pool, chunk, claimed_by, &definition, options).await;
     }
     let plan = AnyPlan::for_definition(pool, &definition).await?;
     let _heartbeat = chunk_queue::ChunkHeartbeat::spawn(

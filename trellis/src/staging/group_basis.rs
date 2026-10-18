@@ -3,8 +3,8 @@
 //!
 //! # The knob
 //!
-//! The group basis is built in steps (#1091), and its build (#1101) doesn't
-//! exist yet. Until it does, the ledger (`super::ledger`) keeps every aggregate by default,
+//! The group basis is built in steps (#1091), and its fresh build (#1101)
+//! doesn't exist yet. Until it does, the ledger (`super::ledger`) keeps every aggregate by default,
 //! and this path runs only behind a dev/bench knob: [`enabled`], read from
 //! [`KNOB_ENV`] or set with [`set_enabled`] (`trellis::dev::set_group_basis`).
 //! [`route`] is the one routing decision: with the knob on, it takes every
@@ -18,10 +18,13 @@
 //!
 //! - must be defined over a source that is empty and unwritten until it is
 //!   `live`: its build only checks that the source is empty
-//!   (`super::build`'s plan job fails otherwise), since the group-basis build
-//!   is #1101's;
-//! - halts on a resume or rebuild with a non-empty source, which are
-//!   #1101's;
+//!   (`super::build`'s plan job fails otherwise), since the group-basis
+//!   fresh build is #1101's;
+//! - halts on a resume with a non-empty source, which truncates and builds
+//!   fresh;
+//! - is rebuilt in place once `live` ([`rebuild`]: `request_backfill`, a
+//!   capture re-install, an automatic rebuild, or an upstream's rebuild),
+//!   except over a partitioned source, whose rebuild halts (#1101);
 //! - is refused at define for `SUM`/`AVG` over a `numeric` column with no
 //!   declared scale (#1096 decision 2).
 //!
@@ -149,6 +152,18 @@
 //! truncate floor on the truncate's own page ([`truncate_groups`]); the
 //! drain barrier orders that page after every page of earlier segments and
 //! before every page of later ones (R9).
+//!
+//! # A rebuild of a live definition ([`rebuild`], #1101)
+//!
+//! A rebuild over a target that already has groups recomputes every group
+//! in place, as one absolute write per source: lock the groups of the
+//! enumeration union (the target's, the source's, and those the ring's old
+//! images name; R8) in key order, then one statement runs the source's
+//! `GROUP BY` from its snapshot and replaces each group's partials, basis,
+//! stamp and visible row. Pages keep applying, against the new bases once it
+//! commits; readers see the old values until then. It runs as the rebuild's
+//! one job (`super::build`'s sweep job, which a group-basis definition's
+//! rebuild is alone).
 //!
 //! Sides are never folded per key (#1043 F2): the fold's first old and last
 //! new image are wrong when a group's basis falls between two of a key's
@@ -586,6 +601,11 @@ pub(crate) struct GroupTargetPlan {
     recomputed: String,
     /// The source, quoted and qualified: the row type images populate.
     source_row: String,
+    /// The source as the ring names it (`src_table`), unquoted.
+    source: String,
+    /// The ring's segment tables, quoted and qualified, whose old images a
+    /// rebuild's enumeration reads ([`rebuild`]).
+    ring: Vec<String>,
     /// The source's row identity, which an image-less change's key names.
     source_pk: Vec<PrimaryKeyColumn>,
     /// The target's identity, its `GROUP BY` columns.
@@ -686,6 +706,10 @@ impl GroupTargetPlan {
                 ))
             ),
             source_row: ddl::qualified_source_table(source),
+            source: source.to_string(),
+            ring: (0..super::append::RING_SIZE)
+                .map(|slot| format!("{}.seg_{slot}", quote_ident(catalog_schema)))
+                .collect(),
             source_pk,
             identity,
             shape,
@@ -728,6 +752,9 @@ impl GroupTargetPlan {
             // change), so its writers never create or read this table.
             recomputed: String::new(),
             source_row: source.map(ddl::qualified_source_table).unwrap_or_default(),
+            // A `JOIN` isn't rebuilt in place (#1109), so nothing reads these.
+            source: source.unwrap_or_default().to_string(),
+            ring: Vec::new(),
             source_pk: Vec::new(),
             identity,
             shape,
@@ -1425,6 +1452,234 @@ impl GroupTargetPlan {
         )
     }
 
+    /// A rebuild's enumeration ([`rebuild`], R8): adds to
+    /// [`Self::recomputed`] every group of the target's own (its hidden
+    /// rows, zero groups included, and its visible rows), every group of the
+    /// source, and the group of every old image in the ring for the source
+    /// (`$1`): an old image or a statement's transition `old` row. The ring
+    /// read covers every undrained change, and may name the groups of
+    /// drained changes whose segment is not yet retired, which costs only
+    /// their recompute.
+    fn rebuild_groups_sql(&self) -> String {
+        let cols = quoted(&self.shape.group_cols).join(", ");
+        let images: Vec<String> = self
+            .ring
+            .iter()
+            .flat_map(|seg| {
+                [
+                    format!(
+                        "select old_image as __i from {seg} \
+                         where src_table = $1 and jsonb_typeof(old_image) = 'object'"
+                    ),
+                    format!(
+                        "select transition_images -> 'old' from {seg} \
+                         where src_table = $1 \
+                           and jsonb_typeof(transition_images -> 'old') = 'object'"
+                    ),
+                ]
+            })
+            .collect();
+        format!(
+            "insert into {rc} ({cols}) \
+             select {cols} from {hidden} \
+             union all select {cols} from {target} \
+             union all select distinct {values} from {src} s \
+             union all select {values} from ({images}) as r \
+                 cross join lateral jsonb_populate_record(null::{src}, r.__i) as s",
+            rc = self.recomputed,
+            hidden = self.hidden_ident,
+            target = self.target_ident,
+            values = self.group_values().join(", "),
+            src = self.source_row,
+            images = images.join(" union all "),
+        )
+    }
+
+    /// A rebuild's write ([`rebuild`], R1, R5): over the groups of
+    /// [`Self::recomputed`], already locked, takes the snapshot and reads
+    /// the newest segment's `seg_seq` in this one statement, runs the
+    /// `GROUP BY` of the whole source, and replaces each group's partials
+    /// with its own (zero for a group the `GROUP BY` doesn't have, R4), with
+    /// the snapshot as its basis and the segment as its stamp. A group the
+    /// snapshot sees in the source but that wasn't locked (one a page created
+    /// after the lock) is left to its pages.
+    ///
+    /// The visible row is replaced too: compared with the row the target
+    /// holds, not with what the old partials say, so a rebuild repairs a
+    /// visible row that disagrees with them. It is upserted where its new
+    /// values differ, deleted where the group's count is 0, and each prior
+    /// image is the row the target held. Returns rows in
+    /// [`Self::visible_tail_sql`]'s layout, with each partial's new value in
+    /// place of its change.
+    fn rebuild_sql(&self, image_columns: Option<&[String]>) -> String {
+        let cols = quoted(&self.shape.group_cols);
+        let col_list = cols.join(", ");
+        let args = &self.shape.args;
+        let mut fresh = vec!["count(*)::bigint as __rn".to_string()];
+        let mut kept = vec!["coalesce(a.__rn, 0) as __rn".to_string()];
+        let mut sets = vec!["__n = r.__rn".to_string()];
+        let mut returning = vec!["u.__n as __nn".to_string()];
+        let mut applied = vec!["cur.__nn".to_string()];
+        for (i, arg) in args.iter().enumerate() {
+            let i = i + 1;
+            fresh.push(format!(
+                "(count(*) filter (where ({}) is not null))::bigint as __rc{i}",
+                arg.sql
+            ));
+            kept.push(format!("coalesce(a.__rc{i}, 0) as __rc{i}"));
+            sets.push(format!("__count_{i} = r.__rc{i}"));
+            returning.push(format!("u.__count_{i} as __nc{i}"));
+            applied.push(format!("cur.__nc{i}"));
+            if arg.summed {
+                fresh.push(format!(
+                    "coalesce(sum(({})::numeric), 0) as __rs{i}",
+                    arg.sql
+                ));
+                kept.push(format!("coalesce(a.__rs{i}, 0) as __rs{i}"));
+                sets.push(format!("__sum_{i} = r.__rs{i}"));
+                returning.push(format!("u.__sum_{i} as __ns{i}"));
+                applied.push(format!("cur.__ns{i}::text"));
+            }
+        }
+        let positions: Vec<String> = (1..=cols.len()).map(|p| p.to_string()).collect();
+        let matched: Vec<String> = cols
+            .iter()
+            .map(|c| format!("array[a.{c}] = array[rg.{c}]"))
+            .collect();
+        let up_groups: Vec<String> = cols.iter().map(|c| format!("u.{c}")).collect();
+        let field_count = self.shape.fields.len();
+        let field_names: Vec<String> = self
+            .shape
+            .fields
+            .iter()
+            .map(|(name, _, _)| quote_ident(name))
+            .collect();
+        let new_fields = self.fields_lateral("__nf", "up.__nn", &|i| format!("up.__nc{i}"), &|i| {
+            format!("up.__ns{i}")
+        });
+        let nf: Vec<String> = (0..field_count).map(|j| format!("nv.__nf{j}")).collect();
+        let held: Vec<String> = (0..field_count).map(|j| format!("t.__vf{j}")).collect();
+        let held_names: Vec<String> = (0..field_count).map(|j| format!("__vf{j}")).collect();
+        let mut lookup_columns = vec!["x.ctid".to_string()];
+        lookup_columns.extend(field_names.iter().map(|f| format!("x.{f}")));
+        let mut lookup_names = vec!["__tc".to_string()];
+        lookup_names.extend(held_names.iter().cloned());
+        let same_values = if field_count == 0 {
+            "true".to_string()
+        } else {
+            format!(
+                "({}) is not distinct from ({})",
+                nf.join(", "),
+                held.join(", ")
+            )
+        };
+        let field_updates: Vec<String> = field_names
+            .iter()
+            .map(|f| format!("{f} = excluded.{f}"))
+            .collect();
+        let upsert_action = if field_updates.is_empty() {
+            "do nothing".to_string()
+        } else {
+            format!("do update set {}", field_updates.join(", "))
+        };
+        let prior_image = match image_columns {
+            Some(columns) => {
+                let pairs: Vec<String> = columns
+                    .iter()
+                    .map(|column| {
+                        let value = if self.shape.group_cols.contains(column) {
+                            format!("cur.{}", quote_ident(column))
+                        } else if let Some(j) =
+                            self.shape.fields.iter().position(|(n, _, _)| n == column)
+                        {
+                            format!("cur.__vf{j}")
+                        } else {
+                            "null".to_string()
+                        };
+                        format!("{}, ({value})::text", quote_literal(column))
+                    })
+                    .collect();
+                format!(
+                    "case when cur.__tc is not null then jsonb_build_object({})::text end",
+                    pairs.join(", ")
+                )
+            }
+            None => "null::text".to_string(),
+        };
+        format!(
+            "with snap as materialized ( \
+                 select pg_catalog.pg_current_snapshot() as __snap, \
+                        coalesce((select max(seg_seq) from segments), 0) as __seg \
+             ), \
+             rg as (select distinct {col_list} from {recomputed}), \
+             a as ( \
+                 select {values}, {fresh} from {src} s group by {positions} \
+             ), \
+             r as ( \
+                 select h.__hc, {kept} from rg \
+                 cross join lateral {lookup_hidden} as h(__hc) \
+                 left join a on {matched} \
+             ), \
+             up as ( \
+                 update {hidden} u set {sets}, __basis = snap.__snap, __stamp = snap.__seg \
+                 from r, snap where u.ctid = r.__hc \
+                 returning {up_groups}, {returning} \
+             ), \
+             nv as (select up.*, {nf_all} from up cross join {new_fields}), \
+             cur as ( \
+                 select nv.*, t.* , \
+                        (nv.__nn > 0) is distinct from (t.__tc is not null) \
+                            or (nv.__nn > 0 and not ({same_values})) as __changed \
+                 from nv left join lateral {lookup_target} as t({lookup_names}) on true \
+             ), \
+             written as ( \
+                 insert into {target} ({col_list}{field_list}) \
+                 select {col_list}{nf_list} from cur where __changed and __nn > 0 \
+                 order by {col_list} \
+                 on conflict ({col_list}) {upsert_action} \
+             ), \
+             deleted as ( \
+                 delete from {target} where ctid = any(array( \
+                     select __tc from cur where __changed and __nn <= 0 and __tc is not null)) \
+             ) \
+             select {key}, cur.__changed, cur.__nn > 0, cur.__tc is not null, {prior_image}, \
+                    {applied} \
+             from cur",
+            recomputed = self.recomputed,
+            values = self.group_values().join(", "),
+            fresh = fresh.join(", "),
+            src = self.source_row,
+            positions = positions.join(", "),
+            kept = kept.join(", "),
+            lookup_hidden = self.group_lookup(&self.hidden_ident, "rg", "x.ctid"),
+            matched = matched.join(" and "),
+            hidden = self.hidden_ident,
+            sets = sets.join(", "),
+            up_groups = up_groups.join(", "),
+            returning = returning.join(", "),
+            nf_all = if field_count == 0 {
+                "true as __trellis_none".to_string()
+            } else {
+                (0..field_count)
+                    .map(|j| format!("__nf.__nf{j}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            },
+            lookup_target = self.group_lookup(&self.target_ident, "nv", &lookup_columns.join(", ")),
+            lookup_names = lookup_names.join(", "),
+            target = self.target_ident,
+            field_list = field_names
+                .iter()
+                .map(|f| format!(", {f}"))
+                .collect::<String>(),
+            nf_list = (0..field_count)
+                .map(|j| format!(", __nf{j}"))
+                .collect::<String>(),
+            key = ddl::pk_key_sql_expr(&self.identity, Some("cur")),
+            applied = applied.join(", "),
+        )
+    }
+
     /// The end of [`Self::apply_sql`] and [`Self::recompute_sql`], after
     /// their `up` CTE, which returns each written group's columns, and per
     /// partial its change (`__dn`, `__dc<i>`, `__ds<i>`) and its new value
@@ -1835,6 +2090,87 @@ pub(crate) async fn release(
     let propagation = mutations.into_staged(txn).await?;
     super::append::append(txn, &propagation.changes).await?;
     Ok(true)
+}
+
+/// A rebuild of a group-basis target that already has groups (ADR-0002,
+/// "An aggregate's build adds each chunk's partials under its group locks";
+/// #1101's decision), in the caller's `READ COMMITTED` transaction, which
+/// commits it: one absolute write of every group, in three statements.
+///
+/// 1. **Enumerate** ([`GroupTargetPlan::rebuild_groups_sql`], R8): the
+///    target's own groups, the source's, and those named by the old images
+///    of the ring's changes to the source.
+/// 2. **Lock** them in key order, in a statement of their own (R6), creating
+///    the hidden rows of those that have none.
+/// 3. **Replace** ([`GroupTargetPlan::rebuild_sql`]): one statement takes the
+///    snapshot, runs the source's `GROUP BY`, and replaces each locked
+///    group's partials and visible row, with the snapshot as its basis and
+///    the newest segment as its stamp (R5). A group with no source row goes
+///    to zero, and its visible row is removed (R4).
+///
+/// Pages keep applying. One that touches a locked group waits for the
+/// commit, then reads the new basis, which refuses each change the snapshot
+/// saw and lets a later one apply as a delta. A group a page creates after
+/// the lock statement isn't locked, so the replace leaves it to its pages.
+/// Readers see each group's old values until the commit, then the new ones.
+///
+/// Each changed visible row is recorded into `mutations`. Returns how many
+/// visible rows it wrote and deleted.
+pub(crate) async fn rebuild(
+    txn: &Transaction<'_>,
+    plan: &GroupTargetPlan,
+    mutations: &mut TargetMutations,
+) -> Result<(usize, usize), ApplyError> {
+    txn.batch_execute(&format!("{}; {}", plan.staged_ddl(), plan.recomputed_ddl()))
+        .await?;
+    txn.execute(&plan.rebuild_groups_sql(), &[&plan.source])
+        .await?;
+    txn.execute(&plan.lock_sql(), &[]).await?;
+    // Test-only pause point: the groups are locked, and the replace's
+    // snapshot is not yet taken. See `super::interleave`.
+    #[cfg(any(test, feature = "test-util"))]
+    super::interleave::pause_at(
+        txn,
+        super::interleave::PausePoint::AfterRebuildLock,
+        &plan.target,
+    )
+    .await?;
+    let image_columns = mutations.image_columns(txn, &plan.target).await?;
+    let rows = txn
+        .query(&plan.rebuild_sql(image_columns.as_deref()), &[])
+        .await?;
+    let (_, written, deleted) = written_groups(plan, rows, mutations);
+    Ok((written, deleted))
+}
+
+/// [`rebuild`] of `definition`'s target in `txn`, then the seam's rows for
+/// every visible row that changed. Returns `None` when the group basis
+/// doesn't take `definition`, and does nothing then; otherwise the visible
+/// rows written and deleted.
+pub(crate) async fn rebuild_definition(
+    txn: &Transaction<'_>,
+    catalog_schema: &str,
+    definition: &crate::defs::model::Definition,
+) -> Result<Option<(usize, usize)>, ApplyError> {
+    let Some(shape) = route(&definition.def, &definition.source_columns) else {
+        return Ok(None);
+    };
+    let source_pk = ddl::source_primary_key_in_txn(txn, &definition.source_table).await?;
+    let identity = ddl::identity_key_columns(txn, &definition.target_table).await?;
+    let plan = GroupTargetPlan::new(
+        catalog_schema,
+        definition.id,
+        &definition.target_table,
+        &definition.source_table,
+        source_pk,
+        identity,
+        shape,
+    );
+    let mut mutations = TargetMutations::new();
+    let counts = rebuild(txn, &plan, &mut mutations).await?;
+    let propagation = mutations.into_staged(txn).await?;
+    super::append::append(txn, &propagation.changes).await?;
+    Ok(Some(counts))
 }
 
 /// What one statement wrote per group, read from the rows

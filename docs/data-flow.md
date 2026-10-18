@@ -313,6 +313,14 @@ Derived tables are eventually consistent. Two ways to reason about staleness:
 The predicate behind `await` — the one that must never falsely report
 "converged" — is [stage 07](staging-and-claiming/07-convergence-and-await.md).
 
+A rebuild of a `live` transform (`Trellis::request_backfill`, a capture
+re-install, or an automatic rebuild) never empties its target: it rewrites
+the target's rows in place while changes keep applying, so a reader sees
+each row's previous value until the rebuild rewrites it. The transform reads
+`backfilling` until the rebuild is done (`catching_up`, if the Re-derive build
+doesn't serve it)
+([observability](observability.md#transform-status-lifecycle)).
+
 ## Correctness
 
 The correctness bar for the [generative suite](../README.md#structure): once

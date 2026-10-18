@@ -484,8 +484,26 @@ async fn an_upstream_rebuild_outside_the_seam_rebuilds_the_reader() {
              order by bc.kind"
         )
         .await,
-        ["(plan)", "(sweep)"]
+        ["(sweep)"],
+        "a group-basis rebuild is its sweep job alone (#1101)"
     );
+
+    // The rebuild replaces the reader's groups from the upstream's target
+    // as the upstream's build left it, and the reader stays exact as the
+    // upstream catches up and is written again.
+    trellis::staging::build::settle_builds(d.pool()).await;
+    assert_eq!(d.rows(&status("public.roll")).await, ["(live,)"]);
+    trellis::intake::markers::settle_registrations(d.pool()).await;
+    let roll = "select n, groups from public.roll order by n";
+    let oracle = "select n, count(*) from (select count(*) as n from public.src group by g) s \
+                  group by n order by n";
+    assert_equal(&mut d, roll, oracle).await;
+    step(
+        &mut d,
+        "insert into public.src values (4, 2, null, 1), (5, 3, null, 1)",
+    )
+    .await;
+    assert_equal(&mut d, roll, oracle).await;
 }
 
 /// A relationship-fed upstream (its totals follow a parent's value, which
