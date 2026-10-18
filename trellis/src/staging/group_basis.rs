@@ -546,7 +546,7 @@ pub(crate) struct GroupTargetPlan {
     /// above, or `None` for none ([`Writer::JoinTarget`]).
     floor_key: Option<String>,
     /// More conditions, over the populated image `s`, a side must meet to
-    /// be staged: `and …`, or empty.
+    /// be staged: ` and …` (with its leading space), or empty.
     stage_filter: String,
 }
 
@@ -982,7 +982,7 @@ impl GroupTargetPlan {
              ev as ( \
                  select {values} \
                  from sides sd cross join lateral jsonb_populate_record(null::{src}, sd.__i) as s \
-                 where jsonb_typeof(sd.__i) = 'object' {filter} \
+                 where jsonb_typeof(sd.__i) = 'object'{filter} \
              ), \
              staged as ( \
                  insert into {staged} \

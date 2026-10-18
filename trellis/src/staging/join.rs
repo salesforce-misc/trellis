@@ -6,8 +6,9 @@
 //! nothing builds a `JOIN` yet (J4, #1109), and with the knob off one stays
 //! `waiting_to_backfill` and never applies. With the knob on, a `JOIN`
 //! definition ([`applies`]) is built like a knob-on aggregate: its plan job
-//! only checks that both tables are empty (`super::build`), so it goes `live`
-//! with empty hidden tables and applies every captured change from then on.
+//! only checks that both tables are empty, unpartitioned and no other
+//! definition's target (`super::build`), so it goes `live` with empty hidden
+//! tables and applies every captured change from then on.
 //! A `TRUNCATE` of either side, an image-less change (a Re-derive, a
 //! released key, a catch-up) and a rebuild halt it: they are J5's (#1110)
 //! and J4's. A knob-on aggregate takes the first two (#1102), but a `JOIN`'s
