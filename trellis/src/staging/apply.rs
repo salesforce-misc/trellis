@@ -179,10 +179,9 @@ pub enum ApplyError {
     /// what its dev knob doesn't support yet: a ring row missing the images
     /// its change needs, a page folded with the knob off, or a fresh build
     /// or resume over a source with rows or a rebuild over a partitioned
-    /// source (#1101); or, on a `JOIN` (`super::join`, #1108), a side's
-    /// `TRUNCATE` or an image-less change (#1110), a build over a side that
-    /// is partitioned (#1111) or another definition's target, or a rebuild
-    /// (#1109). Like
+    /// source (#1101); or, on a `JOIN` (`super::join`, #1108), a build over
+    /// a side that is partitioned (#1111) or another definition's target,
+    /// or a rebuild (#1109). Like
     /// [`ApplyError::AggregateOffLedger`], every page of the target would
     /// reproduce it, so it halts the target.
     GroupBasisUnsupported { target: String, what: &'static str },
@@ -8549,28 +8548,7 @@ pub(super) async fn compute_page(
                     std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
                     std::collections::btree_map::Entry::Vacant(entry) => {
                         let client = pool.get().await?;
-                        let identity =
-                            ddl::identity_key_columns(&**client, &def.target_table).await?;
-                        let joined =
-                            catalog::join_side_of(&**client, def.id)
-                                .await?
-                                .ok_or_else(|| ApplyError::GroupBasisUnsupported {
-                                    target: def.target_table.clone(),
-                                    what: "a JOIN definition with no joined table recorded",
-                                })?;
-                        let field_types =
-                            super::join::target_column_types(&**client, &def.target_table).await?;
-                        let hidden_columns =
-                            super::join::hidden_table_columns(&**client, pool.schema(), def.id)
-                                .await?;
-                        entry.insert(super::join::JoinTargetPlan::new(
-                            pool.schema(),
-                            def,
-                            &joined,
-                            &field_types,
-                            &hidden_columns,
-                            identity,
-                        )?)
+                        entry.insert(super::join::plan_for(&**client, pool.schema(), def).await?)
                     }
                 };
                 for change in changes.iter() {
@@ -8982,12 +8960,24 @@ pub(super) async fn compute_page(
                 src_table: change.src_table.clone(),
             })?;
             match &def.def.key_space {
-                // #1108: a `JOIN` side's truncate is J5's (#1110).
+                // #1110: a `JOIN` page clears what the truncate of its side
+                // empties, under its lock row (`super::join`).
                 KeySpace::Join(_) => {
-                    return Err(ApplyError::GroupBasisUnsupported {
-                        target: def.def.target.clone(),
-                        what: "a TRUNCATE of a JOIN side (the JOIN truncate is #1110)",
-                    });
+                    let side = crate::defs::join::side_of_table(&def.def, &change.src_table)
+                        .filter(|_| super::join::applies(&def.def))
+                        .ok_or_else(|| ApplyError::GroupBasisUnsupported {
+                            target: def.def.target.clone(),
+                            what: "a TRUNCATE of a JOIN side the JOIN apply doesn't take",
+                        })?;
+                    let target_plan = match join_targets.entry(def.def.target.clone()) {
+                        std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            let client = pool.get().await?;
+                            entry
+                                .insert(super::join::plan_for(&**client, pool.schema(), def).await?)
+                        }
+                    };
+                    target_plan.truncate(side, truncate_lsn, change);
                 }
                 KeySpace::Aggregate { .. } => {
                     if let Some(existing) = aggregate_clears.get_mut(&def.def.target) {
@@ -10461,7 +10451,7 @@ async fn apply_target(
 /// columns) and, when something reads
 /// the target, its image reported to `mutations` as the key's prior image
 /// (issue #315). Returns how many rows it deleted.
-async fn clear_target(
+pub(super) async fn clear_target(
     txn: &Transaction<'_>,
     qualified_target: &str,
     pk: &[PrimaryKeyColumn],

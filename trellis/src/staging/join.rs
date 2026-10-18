@@ -8,11 +8,8 @@
 //! definition ([`applies`]) is built like a knob-on aggregate: its plan job
 //! only checks that both tables are empty, unpartitioned and no other
 //! definition's target (`super::build`), so it goes `live` with empty hidden
-//! tables and applies every captured change from then on.
-//! A `TRUNCATE` of either side, an image-less change (a Re-derive, a
-//! released key, a catch-up) and a rebuild halt it: they are J5's (#1110)
-//! and J4's. A knob-on aggregate takes the first two (#1102), but a `JOIN`'s
-//! own truncate and recompute need its `J` and pair locks.
+//! tables and applies every captured change from then on. A rebuild halts
+//! it (J4's, #1109).
 //!
 //! # One page ([`apply_join_target`])
 //!
@@ -25,18 +22,25 @@
 //!    by #1100's writer (`super::group_basis`): `P`'s cells are the `FROM`
 //!    side's `GROUP BY` columns and join key, `M`'s the joined side's. A
 //!    joined row with a `NULL` in any join-key column joins nothing and is
-//!    never staged.
-//! 2. **Lock (JR1).** The pair's lock row `FOR SHARE`. Then `J`: one sorted
-//!    `insert … on conflict do nothing` of every non-null key the page
-//!    names, then one sorted `select … for update` of the same keys. `J`
-//!    rows are never deleted (ADR-0019), which is what makes that pair of
-//!    statements exact. A key with a `NULL` part takes no `J` row and no
-//!    lock. Then the `P` cells and the `M` cells, each in one sorted
+//!    never staged. An image-less change (a `Recompute`: a released key, a
+//!    Re-derive, a catch-up) has no sides: it names the cells to recompute,
+//!    its key's current row's and its prior-image hint's, read before any
+//!    lock as a plain aggregate's do (`super::group_basis`).
+//! 2. **Lock (JR1).** The pair's lock row: `FOR SHARE`, or `FOR UPDATE` on
+//!    a page that carries a `TRUNCATE` of either side (below). Then `J`:
+//!    one sorted `insert … on conflict do nothing` of every non-null key
+//!    the page names, then one sorted `select … for update` of the same
+//!    keys. `J` rows are never deleted (ADR-0019), which is what makes that
+//!    pair of statements exact. A key with a `NULL` part takes no `J` row
+//!    and no lock. Then the `P` cells and the `M` cells, each in one sorted
 //!    statement. `FOR UPDATE` on both sides makes every key's lock mode the
 //!    page's one mode, so a mixed page never upgrades.
 //! 3. **Apply the sides.** #1100's writer applies the staged sides to `P`
 //!    and `M` (each cell's basis and its side's truncate floor filter them),
-//!    and records the change it applied per cell.
+//!    and records the change it applied per cell. Then each cell to
+//!    recompute is rewritten from a `GROUP BY` of its source rows, with the
+//!    statement's snapshot as its basis (ADR-0002's R1, R5, R6), and its
+//!    change recorded the same way.
 //! 4. **The product (JR3).** One statement computes the change to `T` from
 //!    the cells' changes and the partials the page holds locked:
 //!    `ΔP ⊗ M_new + P_old ⊗ ΔM`, and for `LEFT` the unmatched terms: a `P`
@@ -52,20 +56,46 @@
 //! The lock order is ADR-0019's: lock row, `J` sorted, `P` then `M` cells
 //! sorted, `T` groups sorted. A page applies its `JOIN` targets in target
 //! order, after its other aggregate targets.
+//!
+//! # `TRUNCATE` ([`JoinTargetPlan::truncate`])
+//!
+//! A source `TRUNCATE` drains on a page of its own segment, which the drain
+//! barrier orders after every page of earlier segments and before every
+//! page of later ones, of either table (`super::apply::next_claimable_segments`).
+//! That is ADR-0019's two-sided barrier, mixed pages included. Holding the
+//! lock row `FOR UPDATE`, before its `J` locks, the page clears what the
+//! truncate empties: for the `FROM` side, `P` and `T`; for the joined side,
+//! `M`, every `J.matches` (to 0) and `T`, then refills `T` from `P` (each
+//! cell's unmatched term for `LEFT`, nothing for `INNER`). Each side raises
+//! its own truncate floor, so a change from before the truncate that still
+//! reaches a page is refused. The visible target is cleared through the
+//! seam. Then the page applies its other changes as any page does. The
+//! hidden tables are emptied by `DELETE`, not `TRUNCATE`: another writer
+//! (a release) may hold a hidden table's `ACCESS SHARE` from its working
+//! tables' `create … as select` while it queues on the lock row.
+//!
+//! # Release ([`release`])
+//!
+//! A quarantine release, and the automatic retry, of a key held for a
+//! `JOIN` recomputes every cell of the key's side it could owe (ADR-0002's
+//! R8): those its parked changes named (`poison_held.agg_groups`) and its
+//! current row's, through steps 2 to 5 above, in the release's own
+//! transaction.
 
 use std::collections::HashMap;
 
 use tokio_postgres::Transaction;
+use tokio_postgres::types::PgLsn;
 
 use crate::defs::ast::{Expr, KeySpace, TransformDef, ValueType};
-use crate::defs::ddl::PrimaryKeyColumn;
+use crate::defs::ddl::{self, PrimaryKeyColumn};
 use crate::defs::join::{self as spec, HiddenTable, Side};
 use crate::defs::model::Definition;
 use crate::defs::oracle::render_to_one_rel_expr_sql;
 use crate::pool::quote_ident;
 
 use super::apply::ApplyError;
-use super::fold::FoldedChange;
+use super::fold::{FoldedChange, earliest_origin};
 use super::group_basis::{self, Arg, GroupShape, GroupTargetPlan, Writer};
 use super::target_mutations::TargetMutations;
 
@@ -84,6 +114,27 @@ struct SidePlan {
     join_cols: Vec<String>,
     /// The deltas table its apply fills, quoted and `pg_temp.`-qualified.
     deltas: String,
+    /// Whether the page (or the release) recomputes cells of this side.
+    recompute: bool,
+}
+
+impl SidePlan {
+    /// Whether this side writes its cells: it has sides to apply or cells
+    /// to recompute.
+    fn writes(&self) -> bool {
+        !self.plan.sides.is_empty() || self.recompute
+    }
+}
+
+/// A page's `TRUNCATE` of one side or both ([`JoinTargetPlan::truncate`]).
+#[derive(Debug, Clone, Default)]
+struct Truncate {
+    /// Each side's truncate's `lsn`: the floor it raises.
+    from: Option<PgLsn>,
+    joined: Option<PgLsn>,
+    hop_gen: i32,
+    src_changed: Option<std::time::SystemTime>,
+    origin_lsn: Option<PgLsn>,
 }
 
 /// One page's work on one `JOIN` target ([`apply_join_target`]).
@@ -91,6 +142,9 @@ struct SidePlan {
 pub(crate) struct JoinTargetPlan {
     /// The target, qualified and unquoted.
     pub(crate) target: String,
+    /// The target's group identity, for a truncate's clear.
+    identity: Vec<PrimaryKeyColumn>,
+    truncate: Option<Truncate>,
     left: bool,
     lock_ident: String,
     j_ident: String,
@@ -164,8 +218,9 @@ impl JoinTargetPlan {
     /// The plan of `definition`, a `JOIN`. `joined` is its joined table
     /// (qualified) and that table's column types, `field_types` the visible
     /// target's column types (`format_type`), `hidden_columns` its hidden
-    /// tables' column lists ([`hidden_table_columns`]), and `identity` the
-    /// target's group identity.
+    /// tables' column lists ([`hidden_table_columns`]), `identity` the
+    /// target's group identity, and `source_pks` each side's row identity
+    /// (`FROM`, joined), which an image-less change's key names.
     pub(crate) fn new(
         catalog_schema: &str,
         definition: &Definition,
@@ -173,7 +228,9 @@ impl JoinTargetPlan {
         field_types: &HashMap<String, String>,
         hidden_columns: &HashMap<String, String>,
         identity: Vec<PrimaryKeyColumn>,
+        source_pks: [Vec<PrimaryKeyColumn>; 2],
     ) -> Result<Self, ApplyError> {
+        let [from_pk, joined_pk] = source_pks;
         let def = &definition.def;
         let id = definition.id;
         let working = |prefix: &str, table: HiddenTable| {
@@ -263,65 +320,74 @@ impl JoinTargetPlan {
                 .ok_or_else(|| unsupported("a field its target has no column for"))?;
             t_shape.fields.push((field.name.clone(), pg_type, expr));
         }
-        let side_plan = |side: Side, table: HiddenTable, source: &str, tag: &str| {
-            let args: Vec<Arg> = match side {
-                Side::From => t_shape.args[..from_args.len()].to_vec(),
-                Side::Joined => t_shape.args[from_args.len()..].to_vec(),
+        let side_plan =
+            |side: Side, table: HiddenTable, source: &str, pk: Vec<PrimaryKeyColumn>, tag: &str| {
+                let args: Vec<Arg> = match side {
+                    Side::From => t_shape.args[..from_args.len()].to_vec(),
+                    Side::Joined => t_shape.args[from_args.len()..].to_vec(),
+                };
+                let key_cols = spec::side_key_columns(def, side);
+                let join_cols = spec::join_key(def, side);
+                // A joined row with a `NULL` key part joins nothing: no `M` cell.
+                let stage_filter = match side {
+                    Side::From => String::new(),
+                    Side::Joined => join_cols
+                        .iter()
+                        .map(|c| format!(" and s.{} is not null", quote_ident(c)))
+                        .collect(),
+                };
+                let hidden = hidden_ident(catalog_schema, id, table);
+                let deltas = format!(
+                    "pg_temp.{}",
+                    quote_ident(&working(&format!("d{tag}"), table))
+                );
+                SidePlan {
+                    plan: GroupTargetPlan::for_join(
+                        target,
+                        hidden.clone(),
+                        &working(tag, table),
+                        Some((source, &working(&format!("r{tag}"), table), pk)),
+                        Vec::new(),
+                        GroupShape {
+                            group_types: vec![String::new(); key_cols.len()],
+                            group_cols: key_cols,
+                            args,
+                            aggs: Vec::new(),
+                            fields: Vec::new(),
+                            numeric_args: Vec::new(),
+                        },
+                        Writer::JoinPartials {
+                            deltas: deltas.clone(),
+                        },
+                        // Each side's own truncate floor (ADR-0019).
+                        Some(hidden),
+                        stage_filter,
+                    ),
+                    join_cols,
+                    deltas,
+                    recompute: false,
+                }
             };
-            let key_cols = spec::side_key_columns(def, side);
-            let join_cols = spec::join_key(def, side);
-            // A joined row with a `NULL` key part joins nothing: no `M` cell.
-            let stage_filter = match side {
-                Side::From => String::new(),
-                Side::Joined => join_cols
-                    .iter()
-                    .map(|c| format!(" and s.{} is not null", quote_ident(c)))
-                    .collect(),
-            };
-            let hidden = hidden_ident(catalog_schema, id, table);
-            let deltas = format!(
-                "pg_temp.{}",
-                quote_ident(&working(&format!("d{tag}"), table))
-            );
-            SidePlan {
-                plan: GroupTargetPlan::for_join(
-                    target,
-                    hidden.clone(),
-                    &working(tag, table),
-                    Some(source),
-                    Vec::new(),
-                    GroupShape {
-                        group_types: vec![String::new(); key_cols.len()],
-                        group_cols: key_cols,
-                        args,
-                        aggs: Vec::new(),
-                        fields: Vec::new(),
-                        numeric_args: Vec::new(),
-                    },
-                    Writer::JoinPartials {
-                        deltas: deltas.clone(),
-                    },
-                    // Each side's own truncate floor (ADR-0019).
-                    Some(hidden),
-                    stage_filter,
-                ),
-                join_cols,
-                deltas,
-            }
-        };
         let from = side_plan(
             Side::From,
             HiddenTable::FromPartials,
             &definition.source_table,
+            from_pk,
             "p",
         );
-        let joined_plan = side_plan(Side::Joined, HiddenTable::JoinedPartials, &joined.0, "m");
+        let joined_plan = side_plan(
+            Side::Joined,
+            HiddenTable::JoinedPartials,
+            &joined.0,
+            joined_pk,
+            "m",
+        );
         let t = GroupTargetPlan::for_join(
             target,
             hidden_ident(catalog_schema, id, HiddenTable::TargetPartials),
             &working("t", HiddenTable::TargetPartials),
             None,
-            identity,
+            identity.clone(),
             t_shape,
             Writer::JoinTarget,
             None,
@@ -329,6 +395,8 @@ impl JoinTargetPlan {
         );
         Ok(Self {
             target: target.to_string(),
+            identity,
+            truncate: None,
             left,
             lock_ident: hidden_ident(catalog_schema, id, HiddenTable::TruncateLock),
             j_ident: hidden_ident(catalog_schema, id, HiddenTable::Matches),
@@ -340,19 +408,48 @@ impl JoinTargetPlan {
         })
     }
 
-    /// Adds one folded change of `side`'s table. An image-less change can't
-    /// be applied as deltas (see the module doc).
-    pub(crate) fn push(&mut self, side: Side, change: &FoldedChange) -> Result<(), ApplyError> {
+    fn side_mut(&mut self, side: Side) -> &mut SidePlan {
         match side {
-            Side::From => self.from.plan.push(change)?,
-            Side::Joined => self.joined.plan.push(change)?,
+            Side::From => &mut self.from,
+            Side::Joined => &mut self.joined,
         }
+    }
+
+    /// Adds one folded change of `side`'s table. An image-less change names
+    /// cells to recompute (see the module doc).
+    pub(crate) fn push(&mut self, side: Side, change: &FoldedChange) -> Result<(), ApplyError> {
+        let plan = self.side_mut(side);
+        plan.plan.push(change)?;
+        plan.recompute |= change.has_recompute;
         self.t.note(change);
         Ok(())
     }
 
-    /// The keys the page's staged cells name, as `J`'s columns, with no
-    /// `NULL` part: `select …` over both staging tables.
+    /// Adds a `TRUNCATE` of `side`'s table, `change`, whose `lsn` is `lsn`:
+    /// the page clears what it empties before its other changes (see the
+    /// module doc).
+    pub(crate) fn truncate(&mut self, side: Side, lsn: PgLsn, change: &FoldedChange) {
+        let truncate = self.truncate.get_or_insert_with(|| Truncate {
+            hop_gen: change.hop_gen,
+            src_changed: change.src_changed,
+            origin_lsn: change.origin_lsn,
+            ..Truncate::default()
+        });
+        truncate.hop_gen = truncate.hop_gen.max(change.hop_gen);
+        truncate.src_changed =
+            super::apply::earliest_src_changed(truncate.src_changed, change.src_changed);
+        truncate.origin_lsn = earliest_origin(truncate.origin_lsn, change.origin_lsn);
+        let floor = match side {
+            Side::From => &mut truncate.from,
+            Side::Joined => &mut truncate.joined,
+        };
+        *floor = Some(floor.map_or(lsn, |f| f.max(lsn)));
+        self.t.note(change);
+    }
+
+    /// The keys the page's cells name, staged or to recompute, as `J`'s
+    /// columns, with no `NULL` part: `select …` over both sides' working
+    /// tables.
     fn staged_keys_sql(&self) -> String {
         let as_j = |cols: &[String]| -> String {
             cols.iter()
@@ -365,13 +462,91 @@ impl JoinTargetPlan {
             .iter()
             .map(|c| format!("{c} is not null"))
             .collect();
+        let selects: Vec<String> = [&self.from, &self.joined]
+            .into_iter()
+            .flat_map(|side| {
+                let columns = as_j(&side.join_cols);
+                [side.plan.staged(), side.plan.recomputed()]
+                    .map(|table| format!("select {columns} from {table}"))
+            })
+            .collect();
         format!(
-            "select * from (select {} from {} union select {} from {}) k where {}",
-            as_j(&self.from.join_cols),
-            self.from.plan.staged(),
-            as_j(&self.joined.join_cols),
-            self.joined.plan.staged(),
+            "select * from ({}) k where {}",
+            selects.join(" union "),
             not_null.join(" and ")
+        )
+    }
+
+    /// A `TRUNCATE` of the joined side's refill of `T` (see the module doc):
+    /// stages, into `T`'s staging table, each `P` cell's unmatched term `P ⊗
+    /// U` per `T` group. Run after `T` is emptied and before the page's own
+    /// sides apply, so it reads `P` as it was before them.
+    fn refill_sql(&self) -> String {
+        let p_args = &self.from.plan.shape.args;
+        let m_args = &self.joined.plan.shape.args;
+        // The `FROM` side's `T` group columns, which `P` holds; the joined
+        // side's are `NULL` in every unmatched term.
+        let from_groups: Vec<String> = self
+            .t_groups
+            .iter()
+            .filter(|(side, _)| *side == Side::From)
+            .map(|(_, c)| quote_ident(c))
+            .collect();
+        let mut select: Vec<String> = self
+            .t_groups
+            .iter()
+            .map(|(side, c)| match side {
+                Side::From => format!("q.{}", quote_ident(c)),
+                Side::Joined => "null".to_string(),
+            })
+            .collect();
+        let mut insert_cols = quoted(&self.t.shape.group_cols);
+        insert_cols.extend(["__txid", "__lsn", "__n"].map(String::from));
+        select.extend([
+            "pg_current_xact_id()".to_string(),
+            "'0/0'::pg_lsn".to_string(),
+            "q.__n".to_string(),
+        ]);
+        let mut sums = from_groups.clone();
+        sums.push("sum(__n)::bigint as __n".to_string());
+        let mut nonzero = vec!["sum(__n) <> 0".to_string()];
+        for (i, arg) in p_args.iter().chain(m_args).enumerate() {
+            let from = i < p_args.len();
+            let i = i + 1;
+            insert_cols.push(format!("__c{i}"));
+            if from {
+                sums.push(format!("sum(__count_{i})::bigint as __c{i}"));
+                nonzero.push(format!("sum(__count_{i}) <> 0"));
+                select.push(format!("q.__c{i}"));
+            } else {
+                select.push("0".to_string());
+            }
+            if arg.summed {
+                insert_cols.push(format!("__s{i}"));
+                if from {
+                    sums.push(format!("sum(__sum_{i}) as __s{i}"));
+                    nonzero.push(format!("sum(__sum_{i}) <> 0"));
+                    select.push(format!("q.__s{i}"));
+                } else {
+                    select.push("0".to_string());
+                }
+            }
+        }
+        let group_by = if from_groups.is_empty() {
+            String::new()
+        } else {
+            format!(" group by {}", from_groups.join(", "))
+        };
+        format!(
+            "insert into {staged} ({cols}) select {select} from ( \
+                 select {sums} from {p}{group_by} having {nonzero} \
+             ) q",
+            staged = self.t.staged(),
+            cols = insert_cols.join(", "),
+            select = select.join(", "),
+            sums = sums.join(", "),
+            p = self.from.plan.hidden(),
+            nonzero = nonzero.join(" or "),
         )
     }
 
@@ -406,7 +581,26 @@ impl JoinTargetPlan {
     fn product_sql(&self) -> String {
         let p = self.from.plan.hidden();
         let m = self.joined.plan.hidden();
-        let (dp, dm) = (&self.from.deltas, &self.joined.deltas);
+        // Each side's change per cell: its apply's and its recompute's, for
+        // a cell both wrote, summed.
+        let (dp, dm) = ("__dp", "__dm");
+        let summed = |name: &str, side: &SidePlan| {
+            let keys = quoted(&side.plan.shape.group_cols).join(", ");
+            let mut columns = vec![keys.clone(), "sum(__dn)::bigint as __dn".to_string()];
+            for (i, arg) in side.plan.shape.args.iter().enumerate() {
+                let i = i + 1;
+                columns.push(format!("sum(__dc{i})::bigint as __dc{i}"));
+                if arg.summed {
+                    columns.push(format!("sum(__ds{i}) as __ds{i}"));
+                }
+            }
+            format!(
+                "{name} as materialized (select {} from {} group by {keys})",
+                columns.join(", "),
+                side.deltas
+            )
+        };
+        let delta_ctes = vec![summed(dp, &self.from), summed(dm, &self.joined)];
         let p_args = self.from.plan.shape.args.clone();
         let m_args = self.joined.plan.shape.args.clone();
         let fa = p_args.len();
@@ -509,7 +703,7 @@ impl JoinTargetPlan {
                 key_eq("p", &pj, "e", &mj),
             ));
         }
-        let mut ctes = Vec::new();
+        let mut ctes = delta_ctes;
         if self.left {
             let zero_b = |counts: &mut Vec<String>, sums: &mut Vec<String>| {
                 for _ in 0..m_args.len() {
@@ -656,6 +850,7 @@ macro_rules! pause {
         target = %plan.target,
         from_sides = plan.from.plan.sides.len(),
         joined_sides = plan.joined.plan.sides.len(),
+        truncate = plan.truncate.is_some(),
     )
 )]
 pub(crate) async fn apply_join_target(
@@ -663,38 +858,78 @@ pub(crate) async fn apply_join_target(
     plan: &JoinTargetPlan,
     mutations: &mut TargetMutations,
 ) -> Result<(usize, usize), ApplyError> {
-    let sides = [&plan.from, &plan.joined];
-    // 1. The working tables (once a session), then each side's staging.
+    // 1. The working tables (once a session), then each side's staging and
+    // the cells its image-less changes name.
+    create_working_tables(txn, plan).await?;
+    for side in [&plan.from, &plan.joined] {
+        if !side.plan.sides.is_empty() {
+            group_basis::stage_sides(txn, &side.plan).await?;
+        }
+        if !side.plan.recompute_keys().is_empty() {
+            group_basis::name_groups(txn, &side.plan, &[], side.plan.recompute_keys()).await?;
+        }
+    }
+    write_locked(txn, plan, mutations).await
+}
+
+/// Creates every working table of `plan`'s writers, once a session.
+async fn create_working_tables(
+    txn: &Transaction<'_>,
+    plan: &JoinTargetPlan,
+) -> Result<(), ApplyError> {
     let mut ddl = Vec::with_capacity(5);
-    for side in sides {
-        ddl.push(side.plan.staged_ddl());
+    for side in [&plan.from, &plan.joined] {
+        ddl.push(side.plan.working_ddl());
         ddl.extend(side.plan.deltas_ddl());
     }
     ddl.push(plan.t.staged_ddl());
     txn.batch_execute(&ddl.join(";\n")).await?;
-    for side in sides {
-        if !side.plan.sides.is_empty() {
-            group_basis::stage_sides(txn, &side.plan).await?;
-        }
+    Ok(())
+}
+
+/// Steps 2 to 5 of a page (see the module doc), over the sides already
+/// staged and the cells already named: the lock row and a truncate's clear,
+/// `J`, the cells, the cells' changes, the product and `T`.
+async fn write_locked(
+    txn: &Transaction<'_>,
+    plan: &JoinTargetPlan,
+    mutations: &mut TargetMutations,
+) -> Result<(usize, usize), ApplyError> {
+    let sides = [&plan.from, &plan.joined];
+    // 2. The pair's lock row, a truncate's clear, `J`, then the cells.
+    let mode = if plan.truncate.is_some() {
+        "update"
+    } else {
+        "share"
+    };
+    txn.execute(
+        &format!("select 1 from {} for {mode}", plan.lock_ident),
+        &[],
+    )
+    .await?;
+    let mut deleted = 0;
+    if let Some(truncate) = &plan.truncate {
+        deleted += clear(txn, plan, truncate, mutations).await?;
     }
-    // 2. The pair's lock row, `J`, then the cells.
-    txn.execute(&format!("select 1 from {} for share", plan.lock_ident), &[])
-        .await?;
     pause!(txn, BeforeJoinLock, &plan.target);
     txn.execute(&plan.j_insert_sql(), &[]).await?;
     pause!(txn, AfterJoinKeyInsert, &plan.target);
     txn.execute(&plan.j_lock_sql(), &[]).await?;
     pause!(txn, AfterJoinLock, &plan.target);
     for side in sides {
-        if !side.plan.sides.is_empty() {
+        if side.writes() {
             txn.execute(&side.plan.lock_sql(), &[]).await?;
         }
     }
     pause!(txn, AfterEntryLock, &plan.target);
-    // 3. Each side's cells, recording the change applied per cell.
+    // 3. Each side's cells, recording the change applied per cell, then
+    // the cells it recomputes.
     for side in sides {
         if !side.plan.sides.is_empty() {
             group_basis::apply_locked_groups(txn, &side.plan, mutations).await?;
+        }
+        if side.recompute {
+            group_basis::recompute_locked_groups(txn, &side.plan, mutations).await?;
         }
     }
     // 4. The product into `T`'s staging, and `J.matches`. With nested
@@ -704,9 +939,121 @@ pub(crate) async fn apply_join_target(
     // 5. `T`: lock the changed groups, sorted, then write them.
     txn.execute(&plan.t.lock_sql(), &[]).await?;
     pause!(txn, AfterJoinTargetLock, &plan.target);
-    let (_, written, deleted) = group_basis::apply_locked_groups(txn, &plan.t, mutations).await?;
+    let (_, written, removed) = group_basis::apply_locked_groups(txn, &plan.t, mutations).await?;
     pause!(txn, AfterGroupUpsert, &plan.target);
-    Ok((written, deleted))
+    Ok((written, deleted + removed))
+}
+
+/// A page's `TRUNCATE` clear (see the module doc), under the lock row held
+/// `FOR UPDATE`: empties the truncated sides' cells and raises their
+/// floors, zeroes every `J.matches` for the joined side, empties `T` and
+/// the visible target (through the seam), and for the joined side refills
+/// `T`'s staging from `P`. Returns how many visible rows it deleted.
+async fn clear(
+    txn: &Transaction<'_>,
+    plan: &JoinTargetPlan,
+    truncate: &Truncate,
+    mutations: &mut TargetMutations,
+) -> Result<usize, ApplyError> {
+    for (side, lsn) in [(&plan.from, truncate.from), (&plan.joined, truncate.joined)] {
+        if let Some(lsn) = lsn {
+            let hidden = side.plan.hidden();
+            txn.batch_execute(&format!("delete from {hidden}")).await?;
+            group_basis::raise_truncate_floor(txn, hidden, lsn).await?;
+        }
+    }
+    if truncate.joined.is_some() {
+        txn.batch_execute(&format!(
+            "update {} set __matches = 0 where __matches <> 0",
+            plan.j_ident
+        ))
+        .await?;
+    }
+    txn.batch_execute(&format!("delete from {}", plan.t.hidden()))
+        .await?;
+    let deleted = super::apply::clear_target(
+        txn,
+        &plan.target,
+        &plan.identity,
+        truncate.hop_gen,
+        truncate.src_changed,
+        truncate.origin_lsn,
+        mutations,
+    )
+    .await?;
+    if truncate.joined.is_some() && plan.left {
+        txn.execute(&plan.refill_sql(), &[]).await?;
+    }
+    Ok(deleted)
+}
+
+/// A `JOIN`'s plan for definition `definition`, with every catalog read it
+/// needs ([`JoinTargetPlan::new`]).
+pub(crate) async fn plan_for(
+    client: &impl tokio_postgres::GenericClient,
+    catalog_schema: &str,
+    definition: &Definition,
+) -> Result<JoinTargetPlan, ApplyError> {
+    let identity = ddl::identity_key_columns(client, &definition.target_table).await?;
+    let joined = crate::defs::catalog::join_side_of(client, definition.id)
+        .await?
+        .ok_or_else(|| ApplyError::GroupBasisUnsupported {
+            target: definition.target_table.clone(),
+            what: "a JOIN definition with no joined table recorded",
+        })?;
+    let field_types = target_column_types(client, &definition.target_table).await?;
+    let hidden_columns = hidden_table_columns(client, catalog_schema, definition.id).await?;
+    let source_pks = [
+        ddl::identity_key_columns(client, &definition.source_table).await?,
+        ddl::identity_key_columns(client, &joined.0).await?,
+    ];
+    JoinTargetPlan::new(
+        catalog_schema,
+        definition,
+        &joined,
+        &field_types,
+        &hidden_columns,
+        identity,
+        source_pks,
+    )
+}
+
+/// A quarantine release's (or the automatic retry's) work on `definition`, a
+/// `JOIN` that applies, for `key` of `src_table` (see the module doc):
+/// recomputes every cell of the key's side named by `cells` (the held row's
+/// `agg_groups`: objects of the side's cell columns) and the cell of the
+/// key's current row, carries the change to `T` under the `J` locks, and
+/// stages the seam's rows for every visible row that changed. The caller
+/// holds the version fence of `src_table`, so no page of it runs meanwhile.
+/// Returns whether `definition` is such a `JOIN`; when it isn't, does
+/// nothing.
+pub(crate) async fn release(
+    txn: &Transaction<'_>,
+    catalog_schema: &str,
+    definition: &Definition,
+    src_table: &str,
+    cells: &[String],
+    key: &str,
+) -> Result<bool, ApplyError> {
+    if !applies(&definition.def) {
+        return Ok(false);
+    }
+    let Some(side) = spec::side_of_table(&definition.def, src_table) else {
+        return Ok(false);
+    };
+    let mut plan = plan_for(txn, catalog_schema, definition).await?;
+    plan.side_mut(side).recompute = true;
+    create_working_tables(txn, &plan).await?;
+    let side_plan = match side {
+        Side::From => &plan.from,
+        Side::Joined => &plan.joined,
+    };
+    group_basis::name_groups(txn, &side_plan.plan, cells, &[key.to_string()]).await?;
+    let mut mutations = TargetMutations::new();
+    write_locked(txn, &plan, &mut mutations).await?;
+    let propagation = mutations.into_staged(txn).await?;
+    super::append::append(txn, &propagation.changes).await?;
+    Ok(true)
 }
 
 /// The column list of each of definition `id`'s hidden tables in

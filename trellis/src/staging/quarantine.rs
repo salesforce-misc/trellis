@@ -635,17 +635,24 @@ pub(super) async fn park_batch_contribution(
     );
     // #1102: a group-basis definition keeps the groups of every image the
     // parked change's ring rows hold (`FoldedChange::group_sides`), as
-    // objects of its `GROUP BY` columns, for the release's recompute.
-    let mut group_columns: HashMap<i64, Option<Vec<String>>> = HashMap::new();
+    // objects of its `GROUP BY` columns, for the release's recompute. #1110:
+    // a `JOIN` keeps the cells of the change's side, as objects of the
+    // side's cell columns.
+    let mut definitions: HashMap<i64, Option<crate::defs::model::Definition>> = HashMap::new();
     for id in &ids {
-        let columns = match catalog::definition_by_id_in(txn, *id).await? {
-            Some(def) => super::group_basis::route(&def.def, &def.source_columns)
-                .map(|shape| shape.group_columns().to_vec()),
-            None => None,
-        };
-        group_columns.insert(*id, columns);
+        definitions.insert(*id, catalog::definition_by_id_in(txn, *id).await?);
     }
+    let cell_columns = |id: i64, src_table: &str| -> Option<Vec<String>> {
+        let def = definitions.get(&id)?.as_ref()?;
+        if super::join::applies(&def.def) {
+            let side = crate::defs::join::side_of_table(&def.def, src_table)?;
+            return Some(crate::defs::join::side_key_columns(&def.def, side));
+        }
+        super::group_basis::route(&def.def, &def.source_columns)
+            .map(|shape| shape.group_columns().to_vec())
+    };
     for (transform_id, change) in ordered {
+        let group_columns = cell_columns(*transform_id, &change.src_table);
         // Issue #315: a recompute's prior-image hint rides in `old_image`,
         // exactly as it does in the ring, so `release_key` hands it on.
         let old_image = if change.old_image.is_none() && change.new_image.is_none() {
@@ -680,7 +687,7 @@ pub(super) async fn park_batch_contribution(
                 &values,
                 &change.lsn,
                 &change.group_sides,
-                &group_columns[transform_id],
+                &group_columns,
             ],
         )
         .await?;
@@ -5461,7 +5468,11 @@ async fn release_key_as(
             .iter()
             .flat_map(|row| row.get::<_, Option<Vec<String>>>(9).unwrap_or_default())
             .collect();
-        super::group_basis::release(&txn, pool.schema(), definition, &groups, key).await?;
+        // #1110: on a `JOIN`, the cells of the key's side, carried into `T`
+        // under the `J` locks.
+        if !super::group_basis::release(&txn, pool.schema(), definition, &groups, key).await? {
+            super::join::release(&txn, pool.schema(), definition, &names[0], &groups, key).await?;
+        }
     }
 
     txn.execute(

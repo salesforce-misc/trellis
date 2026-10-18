@@ -1393,29 +1393,496 @@ async fn composed_fields_expression_arguments_and_numeric_scale() {
     }
 }
 
-/// Until #1110, a `TRUNCATE` of either side halts the definition.
+// ------------------------------------------------------------ family 10
+
+/// J1 family 10's seed on scenario `n`'s key: two facts and a dimension row
+/// matching them, and the decoys.
+const SEED: &str = "insert into public.a values ({id} + 1, {g1}, {k}, 10), \
+                                         ({id} + 2, {g2}, {k}, null); \
+                    insert into public.b values ({id} + 1, {k}, {g1}, 100); \
+                    insert into public.a values ({id} + 90, {g1}, {dk}, 1); \
+                    insert into public.b values ({id} + 90, {dk}, {g4}, 1000)";
+
+/// Every schedule of a race between a `TRUNCATE` page and another page of
+/// the pair: both sequential orders, and each page frozen at every point.
+/// Every page holds the pair's lock row from its first point on, `FOR
+/// SHARE`, and the truncate's page `FOR UPDATE`, so the other always queues.
+fn truncate_schedules() -> Vec<(usize, Option<PausePoint>, Option<bool>)> {
+    let mut out = vec![(0, None, None), (1, None, None)];
+    for paused in [0, 1] {
+        for point in POINTS {
+            out.push((paused, Some(point), Some(true)));
+        }
+    }
+    out
+}
+
+/// Runs `races` (name, x, y) under every [`truncate_schedules`], each on a
+/// key of its own seeded with [`SEED`].
+async fn run_truncate_races(lab: &mut Lab, races: &[(&str, &str, &str)]) {
+    let mut n = 0;
+    for (name, x, y) in races {
+        for (paused, point, queues) in truncate_schedules() {
+            n += 1;
+            lab.step(&fill(SEED, n, lab.key)).await;
+            lab.race(
+                &format!(
+                    "{:?}/{}: {name}, page {paused} frozen at {point:?}",
+                    lab.key, lab.kinds[0].name
+                ),
+                &fill(x, n, lab.key),
+                &fill(y, n, lab.key),
+                paused,
+                point,
+                queues,
+            )
+            .await;
+        }
+    }
+}
+
+/// J1 family 10: a `TRUNCATE` of either side against a page of the other
+/// side, of its own side, and a truncate and an insert in one transaction,
+/// in both batch orders and both page orders, each page frozen at every
+/// point. A page of the truncated side from an earlier batch that applies
+/// after the truncate's page is refused by the side's floor.
+async fn truncate_races(key: Key, kind: Kind) {
+    let mut lab = lab(key, &[kind]).await;
+    run_truncate_races(
+        &mut lab,
+        &[
+            (
+                "truncate a vs b",
+                "truncate public.a",
+                "update public.b set gb = {g3} where id = {id} + 1",
+            ),
+            (
+                "truncate b vs a",
+                "truncate public.b",
+                "insert into public.a values ({id} + 3, {g1}, {k}, 5)",
+            ),
+            (
+                "a vs truncate a",
+                "update public.a set x = 99 where id = {id} + 1; \
+                 insert into public.a values ({id} + 3, {g3}, {k}, 5)",
+                "truncate public.a",
+            ),
+            (
+                "b vs truncate b",
+                "insert into public.b values ({id} + 3, {k}, {g2}, 5)",
+                "truncate public.b",
+            ),
+            (
+                "truncate a and insert vs b",
+                "begin; truncate public.a; \
+                 insert into public.a values ({id} + 3, {g1}, {k}, 5), \
+                                             ({id} + 4, {g2}, null, null, 6); commit",
+                "update public.b set gb = {g3} where id = {id} + 1",
+            ),
+            (
+                "truncate b and insert vs a",
+                "begin; truncate public.b; \
+                 insert into public.b values ({id} + 3, {k}, {g4}, 5), \
+                                             ({id} + 4, null, null, {g2}, 6); commit",
+                "insert into public.a values ({id} + 3, {g2}, {k}, 1)",
+            ),
+        ],
+    )
+    .await;
+}
+
 #[tokio::test]
-async fn a_truncate_of_either_side_halts_the_join() {
-    for table in ["public.a", "public.b"] {
-        let mut lab = lab(Key::Single, &[L]).await;
-        lab.step(
-            "insert into public.a values (1, 1, 0, 1, 10); \
-             insert into public.b values (1, 0, 1, 1, 100)",
+async fn family10_truncate_races_left() {
+    truncate_races(Key::Single, L).await;
+}
+
+#[tokio::test]
+async fn family10_truncate_races_inner() {
+    truncate_races(Key::Single, I).await;
+}
+
+#[tokio::test]
+async fn family10_truncate_races_pair_key() {
+    truncate_races(Key::Pair, L).await;
+}
+
+/// J1 family 10, sequential, on all six kinds: both sides truncated in either
+/// order and then refilled, and a `TRUNCATE b` with every key matched, after
+/// which `LEFT` targets hold each fact under a `NULL` `gb`, `INNER` ones
+/// nothing, and every `J.matches` is 0 while the `J` rows stay.
+#[tokio::test]
+async fn family10_truncates_on_all_six_kinds() {
+    let mut lab = lab(Key::Single, &SIX).await;
+    let mut n = 0;
+    for order in [
+        "truncate public.a; truncate public.b",
+        "truncate public.b; truncate public.a",
+    ] {
+        n += 1;
+        lab.step(&fill(SEED, n, lab.key)).await;
+        lab.step(&format!(
+            "{order}; {}",
+            fill(
+                "insert into public.a values ({id} + 9, {g1}, {k}, 5); \
+                 insert into public.b values ({id} + 9, {k}, {g4}, 5)",
+                n,
+                lab.key
+            )
+        ))
+        .await;
+        lab.check(order).await;
+    }
+    n += 1;
+    lab.step(&fill(SEED, n, lab.key)).await;
+    let j_rows = lab
+        .d
+        .rows(&format!(
+            "select count(*) from {}",
+            lab.hidden(L, "j").await
+        ))
+        .await;
+    lab.step("truncate public.b").await;
+    lab.check("truncate b with every key matched").await;
+    for kind in SIX {
+        let j = lab.hidden(kind, "j").await;
+        assert_eq!(
+            lab.d
+                .rows(&format!("select coalesce(sum(__matches), 0) from {j}"))
+                .await,
+            ["(0)"],
+            "{}: every J.matches is 0",
+            kind.name
+        );
+    }
+    assert_eq!(
+        lab.d
+            .rows(&format!(
+                "select count(*) from {}",
+                lab.hidden(L, "j").await
+            ))
+            .await,
+        j_rows,
+        "J rows are never collected"
+    );
+    for kind in [I, IB, IA] {
+        assert_eq!(
+            lab.d
+                .rows(&format!("select count(*) from {}", kind.target()))
+                .await,
+            ["(0)"],
+            "{} is empty",
+            kind.name
+        );
+    }
+    assert_eq!(
+        lab.d
+            .rows("select count(*) from public.l where gb is not null")
+            .await,
+        ["(0)"],
+        "every LEFT group is unmatched"
+    );
+}
+
+/// J1 family 10: a page of the truncated side from before the truncate,
+/// applied after the truncate's page (the drain barrier never lets it; the
+/// driver claims it out of order on purpose), is refused by the side's
+/// floor, and a page of the other side applies.
+#[tokio::test]
+async fn family10_a_stale_page_after_the_truncate_is_refused() {
+    let mut lab = lab(Key::Single, &[L, I]).await;
+    for (n, (table, stale)) in [
+        (
+            "public.a",
+            "insert into public.a values ({id} + 9, {g1}, {k}, 5); \
+             update public.a set x = 99 where id = {id} + 1",
+        ),
+        (
+            "public.b",
+            "insert into public.b values ({id} + 9, {k}, {g4}, 5); \
+             update public.b set y = 99 where id = {id} + 1",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let n = n as i32 + 1;
+        lab.step(&fill(SEED, n, lab.key)).await;
+        let earlier = lab.sealed(&fill(stale, n, lab.key)).await;
+        let truncate = lab.sealed(&format!("truncate {table}")).await;
+        lab.d.drain(truncate, "x").await;
+        lab.check_applied(table).await;
+        lab.d.drain(earlier, "y").await;
+        lab.check(table).await;
+    }
+}
+
+/// The mixed-page barrier (J1's `S10.mixed-page-barrier`): a `TRUNCATE a`,
+/// then an insert into `a` and a change of `b` in one later batch, whose
+/// page is a mixed one. Nothing past the truncate's batch is claimable
+/// until it drains, so the mixed page can't apply its insert first and have
+/// the truncate wipe it.
+#[tokio::test]
+async fn family10_a_mixed_page_waits_for_an_earlier_truncate() {
+    let mut lab = lab(Key::Single, &[L, I]).await;
+    lab.step(&fill(SEED, 1, lab.key)).await;
+    let truncate = lab.sealed("truncate public.a").await;
+    let mixed = lab
+        .sealed(&fill(
+            "insert into public.a values ({id} + 9, {g1}, {k}, 5); \
+             update public.b set gb = {g3} where id = {id} + 1",
+            1,
+            lab.key,
+        ))
+        .await;
+    let claimable = || async {
+        trellis::staging::apply::next_claimable_segments(&lab.d.ctl, 1_000_000)
+            .await
+            .expect("next claimable segments")
+    };
+    assert_eq!(claimable().await, [truncate], "the mixed page waits");
+    lab.d.drain(truncate, "x").await;
+    assert_eq!(claimable().await, [mixed]);
+    lab.d.drain(mixed, "x").await;
+    lab.check("the mixed page after the truncate").await;
+    assert_eq!(
+        lab.d.rows("select count(*) from public.a").await,
+        ["(1)"],
+        "the insert survived"
+    );
+}
+
+// ------------------------------------------- image-less changes and release
+
+/// Writes `sql` to `table` with its capture triggers off: a change Trellis
+/// never sees, which only a recompute repairs.
+async fn uncaptured(lab: &Lab, table: &str, sql: &str) {
+    lab.write(&format!(
+        "alter table {table} disable trigger all; {sql}; alter table {table} enable trigger all"
+    ))
+    .await;
+}
+
+/// An image-less change (a `Recompute`) on either side recomputes the cells
+/// it names: its key's current row's and its prior-image hint's, from the
+/// side's source, and carries the change into `T` under the `J` locks. Here
+/// it repairs changes capture never saw: a fact moved to another `ga` and
+/// one deleted, and the key's only dimension row deleted, which flips the
+/// key unmatched.
+#[tokio::test]
+async fn an_image_less_change_recomputes_the_cells_it_names() {
+    for kind in [L, I] {
+        let mut lab = lab(Key::Single, &[kind]).await;
+        lab.step(&fill(SEED, 1, lab.key)).await;
+        uncaptured(
+            &lab,
+            "public.a",
+            "update public.a set ga = 13, x = 7 where id = 101; delete from public.a where id = 102",
         )
         .await;
-        lab.write(&format!("truncate {table}")).await;
-        let batch = lab.d.seal().await;
-        let _ = lab
-            .d
-            .drain_frozen(batch, "x", &[])
-            .await
-            .finish_result()
+        lab.d
+            .stage_recomputes_with_prior(
+                "public.a",
+                &[
+                    (
+                        "101",
+                        Some(r#"{"id": 101, "ga": 11, "t": 1, "k": 1, "x": 10}"#.to_string()),
+                    ),
+                    (
+                        "102",
+                        Some(r#"{"id": 102, "ga": 12, "t": 1, "k": 1, "x": null}"#.to_string()),
+                    ),
+                ],
+            )
             .await;
+        let batch = lab.d.seal().await;
+        lab.d.drain(batch, "x").await;
+        lab.check(&format!("{}: the a side's recompute", kind.name))
+            .await;
+        uncaptured(&lab, "public.b", "delete from public.b where id = 101").await;
+        lab.d
+            .stage_recomputes_with_prior(
+                "public.b",
+                &[(
+                    "101",
+                    Some(r#"{"id": 101, "t": 1, "k": 1, "gb": 11, "y": 100}"#.to_string()),
+                )],
+            )
+            .await;
+        let batch = lab.d.seal().await;
+        lab.d.drain(batch, "x").await;
+        lab.check(&format!("{}: the b side's recompute", kind.name))
+            .await;
+    }
+}
+
+impl Lab {
+    /// Holds `key` of `table` for every target, as an eviction would: from
+    /// now on every page parks its changes for them.
+    async fn hold(&self, table: &str, key: &str) {
+        self.d
+            .ctl
+            .execute(
+                "insert into poison (transform_id, src_table, key, last_error) \
+                 select id, $1, $2, 'test' from transform_definitions",
+                &[&table, &key],
+            )
+            .await
+            .expect("hold the key");
+    }
+
+    /// The cells `L`'s held row of `key` names, as `ga/k`, sorted.
+    async fn held_cells(&self, key: &str) -> Vec<String> {
+        self.d
+            .rows(&format!(
+                "select (g::jsonb ->> 'ga') || '/' || (g::jsonb ->> 'k') \
+                 from poison_held h join transform_definitions d on d.id = h.transform_id, \
+                      unnest(h.agg_groups) g \
+                 where h.key = '{key}' and d.target_table = 'public.l' order by 1"
+            ))
+            .await
+    }
+
+    /// Releases `key` of `table` for every target, then checks each one
+    /// against its `JOIN` before anything drains: the release's recompute,
+    /// not the `Recompute` it stages, is what repairs it.
+    async fn release(&mut self, table: &str, key: &str, context: &str) {
+        for kind in self.kinds.clone() {
+            trellis::staging::release_key(self.d.pool(), kind.name, table, key)
+                .await
+                .expect("release the key");
+        }
+        self.check_applied(context).await;
+        for kind in &self.kinds {
+            assert_eq!(
+                self.d.rows(&kind.actual()).await,
+                self.d.rows(&kind.expected(self.key)).await,
+                "{context}: target {} (left) differs from its JOIN (right) after the release",
+                kind.name
+            );
+        }
+        self.check(context).await;
+    }
+}
+
+/// A key held for a `JOIN` parks its changes, keeping the cells of their
+/// images (`agg_groups`); its release recomputes every one of them and the
+/// key's current row's, on either side, and carries the change into `T`.
+/// The `a` key moves through three `ga`s and to another join key while
+/// held; the `b` key's moves flip its old key unmatched and its new one
+/// matched.
+#[tokio::test]
+async fn a_release_recomputes_every_cell_the_held_key_could_owe() {
+    let mut lab = lab(Key::Single, &SIX).await;
+    lab.step(&fill(SEED, 1, lab.key)).await;
+    lab.step(&fill(
+        "insert into public.b values ({id} + 2, {k2}, {g2}, 7)",
+        1,
+        lab.key,
+    ))
+    .await;
+    lab.hold("public.a", "101").await;
+    lab.step("update public.a set ga = 13 where id = 101").await;
+    lab.step("update public.a set ga = 14, x = 3 where id = 101")
+        .await;
+    lab.step("update public.a set k = 5001 where id = 101")
+        .await;
+    assert_eq!(
+        lab.held_cells("101").await,
+        ["(11/1)", "(13/1)", "(14/1)", "(14/5001)"],
+        "the held row names every cell the parked changes touched"
+    );
+    lab.release("public.a", "101", "the a key's release").await;
+    lab.hold("public.b", "101").await;
+    lab.step("update public.b set k = 5001 where id = 101")
+        .await;
+    lab.step("update public.b set gb = 13 where id = 101").await;
+    lab.release("public.b", "101", "the b key's release").await;
+}
+
+/// The automatic retry of a held key releases it the same way.
+#[tokio::test]
+async fn the_automatic_retry_recomputes_the_held_keys_cells() {
+    let mut lab = lab(Key::Pair, &[L, I]).await;
+    lab.step(&fill(SEED, 1, lab.key)).await;
+    lab.hold("public.b", "101").await;
+    lab.step(
+        "update public.b set gb = 13, y = 3 where id = 101; delete from public.a where id = 101",
+    )
+    .await;
+    for kind in [L, I] {
+        let poisoned_at: std::time::SystemTime = lab
+            .d
+            .ctl
+            .query_one(
+                "select p.poisoned_at from poison p \
+                 join transform_definitions d on d.id = p.transform_id \
+                 where p.key = '101' and d.target_table = $1",
+                &[&kind.target()],
+            )
+            .await
+            .expect("poisoned_at")
+            .get(0);
+        trellis::staging::quarantine::retry_held_key(
+            lab.d.pool(),
+            kind.name,
+            "public.b",
+            "101",
+            poisoned_at,
+        )
+        .await
+        .expect("retry the key");
+    }
+    lab.check_applied("after the retry").await;
+    lab.check("after the retry").await;
+}
+
+/// A release is a `J`-locked writer: frozen at each point of its write, a
+/// page of the other side on the same key queues behind it once it holds
+/// the key's `J` row, and runs through before that; either way both apply
+/// exactly (JR1, JR2).
+#[tokio::test]
+async fn a_release_takes_the_j_lock_against_the_other_sides_pages() {
+    let mut lab = lab(Key::Single, &[L]).await;
+    let mut n = 0;
+    for point in &POINTS[..6] {
+        n += 1;
+        lab.step(&fill(SEED, n, lab.key)).await;
+        let key = (100 * n + 1).to_string();
+        lab.hold("public.a", &key).await;
+        lab.step(&fill(
+            "update public.a set ga = {g3}, x = 4 where id = {id} + 1",
+            n,
+            lab.key,
+        ))
+        .await;
+        let other = lab
+            .sealed(&fill(
+                "update public.b set gb = {g2} where id = {id} + 1; \
+                 insert into public.b values ({id} + 3, {k}, {g4}, 1)",
+                n,
+                lab.key,
+            ))
+            .await;
+        let context = format!("release frozen at {point:?}");
+        let release_key = key.clone();
+        let mut frozen = lab
+            .d
+            .run_frozen(&[(*point, "public.l")], move |pool| async move {
+                trellis::staging::release_key(&pool, "l", "public.a", &release_key).await
+            })
+            .await;
+        let reached = frozen.reached(*point).await;
+        let page = lab.d.drain_frozen(other, "y", &[]).await;
+        let queued = lab.queued_or_done(&page, reached.backend_pid).await;
         assert_eq!(
-            lab.scalar("select status from transform_definitions").await,
-            "paused",
-            "a truncate of {table} halts the JOIN"
+            queued,
+            holds_j(*point, false),
+            "{context}: did the page queue?"
         );
+        lab.d.release(&mut frozen, *point).await;
+        frozen.finish().await;
+        page.finish().await;
+        lab.check(&context).await;
     }
 }
 

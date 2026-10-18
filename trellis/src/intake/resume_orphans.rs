@@ -557,7 +557,7 @@ impl Sweep {
             let mut matching = match &def.key_space {
                 KeySpace::Join(_) => {
                     unreachable!(
-                        "a JOIN definition never applies yet (J3, #1108), so no orphan sweep reaches it"
+                        "a JOIN goes live with no marker discharge until its build (J4, #1109), so no orphan sweep reaches it"
                     )
                 }
                 KeySpace::OneToOne => one_to_one_match(&key_cols),
