@@ -198,9 +198,11 @@ pub(crate) async fn park_target_catchup_if_read(
         .await?
         .get(0);
     let (mut readers, tables) = target_catchups(client, std::slice::from_ref(&target)).await?;
-    if !readers.is_empty() {
+    if !readers.is_empty() && crate::staging::group_basis::enabled() {
         // `park_catch_up`'s lock order: every definition this touches
-        // first, in id order (`readers` is sorted).
+        // first, in id order (`readers` is sorted), before
+        // `rebuildable_on_group_basis` reads their status. With the knob
+        // off nothing is rebuilt, and `park_catch_up` takes the same locks.
         client
             .execute(
                 "select 1 from transform_definitions where id = any($1) order by id for update",

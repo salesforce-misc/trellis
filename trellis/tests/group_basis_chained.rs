@@ -17,7 +17,9 @@
 //! basis. The rest are decision 5's: a row that moves group upstream (#1043
 //! F8), a rollup whose upstream group is emptied and refilled in one page, a
 //! reader defined while an upstream writer is in flight, and an upstream
-//! rebuild that rebuilds the reader.
+//! rebuild that rebuilds the reader. The last covers a ledger upstream fed
+//! through a relationship, whose writes reach the reader through the seam
+//! like any other writer's.
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
@@ -468,6 +470,15 @@ async fn an_upstream_rebuild_outside_the_seam_rebuilds_the_reader() {
     );
     assert_eq!(
         d.rows(
+            "select build_seg is not null from transform_definitions \
+             where target_table = 'public.roll'"
+        )
+        .await,
+        ["(t)"],
+        "the rebuild records the segment active at its commit"
+    );
+    assert_eq!(
+        d.rows(
             "select bc.kind from backfill_chunks bc join transform_definitions d \
              on d.id = bc.definition_id where d.target_table = 'public.roll' and not bc.done \
              order by bc.kind"
@@ -475,4 +486,48 @@ async fn an_upstream_rebuild_outside_the_seam_rebuilds_the_reader() {
         .await,
         ["(plan)", "(sweep)"]
     );
+}
+
+/// A relationship-fed upstream (its totals follow a parent's value, which
+/// reaches it through the relationship rather than its own source's capture)
+/// still writes its target through the seam, so a group-basis rollup grouped
+/// by those totals moves each upstream group between its groups.
+#[tokio::test]
+async fn a_rollup_over_a_relationship_fed_upstream_follows_parent_changes() {
+    trellis::dev::staging::set_group_basis(true);
+    let mut columns = src_columns();
+    columns.push(("x", int4()));
+    let mut d = Driver::start_with_relationships(
+        "create table public.par (id integer primary key, x integer); \
+         create table public.src (id integer primary key, g integer, h integer, v integer)",
+        &columns,
+        &["RELATIONSHIP parent FROM src.h TO par.id"],
+        &["TRANSFORM up FROM public.src GROUP BY g SELECT SUM(parent.x) AS total, COUNT(*) AS n"],
+        &["public.par", SRC],
+    )
+    .await;
+    install(
+        &d,
+        "TRANSFORM roll FROM public.up GROUP BY total SELECT SUM(n) AS rows, COUNT(*) AS groups",
+        &[("g", int4()), ("total", int8()), ("n", int8())],
+    )
+    .await;
+    trellis::intake::markers::settle_registrations(d.pool()).await;
+    d.settle().await;
+    const ROLL: &str = "select total, rows, groups from public.roll order by total";
+    const ORACLE: &str = "select total, sum(n), count(*) from \
+                          (select s.g, sum(p.x) as total, count(*) as n from public.src s \
+                           left join public.par p on p.id = s.h group by s.g) t \
+                          group by total order by total";
+    step(
+        &mut d,
+        "insert into public.par values (1, 100), (2, 10); \
+         insert into public.src values (1, 1, 1, 0), (2, 2, 2, 0), (3, 3, 2, 0)",
+    )
+    .await;
+    assert_equal(&mut d, ROLL, ORACLE).await;
+    step(&mut d, "update public.par set x = 50 where id = 2").await;
+    assert_equal(&mut d, ROLL, ORACLE).await;
+    step(&mut d, "update public.par set x = 100 where id = 2").await;
+    assert_equal(&mut d, ROLL, ORACLE).await;
 }
