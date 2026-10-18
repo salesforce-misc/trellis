@@ -234,7 +234,13 @@ impl Coverage {
             .map(|r| (r.name.as_str(), r))
             .collect();
         let mut reads = Vec::new();
-        for def in &program.defs {
+        // A `JOIN`'s joined-table columns parse as `<table>.<column>`
+        // paths, which are not relationship reads.
+        for def in program
+            .defs
+            .iter()
+            .filter(|d| !matches!(d.key_space, KeySpace::Join(_)))
+        {
             for field in &def.fields {
                 collect_relationship_reads(&field.expr, def, &by_name, false, &mut reads);
             }
@@ -1022,7 +1028,7 @@ fn op_outcome_name(outcome: &OpOutcome) -> &'static str {
 
 fn key_space_name(key_space: &KeySpace) -> &'static str {
     match key_space {
-        KeySpace::Join(_) => unreachable!("the generator never produces a JOIN definition"),
+        KeySpace::Join(_) => "Join",
         KeySpace::OneToOne => "OneToOne",
         KeySpace::Aggregate { .. } => "Aggregate",
     }

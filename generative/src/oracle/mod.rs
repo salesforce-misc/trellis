@@ -259,9 +259,9 @@ pub struct ThreeWayReport {
     /// "immutable subset of Postgres's" semantics, tested directly).
     pub evaluator_vs_sql: Vec<Divergence>,
     /// Whether the evaluator leg ran at all (issue #34). `false` for a
-    /// relationship-reading definition, where the engine's evaluator-driven
-    /// recompute has no relationship support to compare against — see
-    /// [`check`] for the full reasoning. An empty `evaluator_vs_sql` means
+    /// relationship-reading definition and for a `JOIN` (#1113), where the
+    /// engine's evaluator-driven recompute has nothing to compare against —
+    /// see [`check`] for the full reasoning. An empty `evaluator_vs_sql` means
     /// "agreed" when this is `true` and "never asked" when it is `false`,
     /// and the two must never be confused for each other.
     pub evaluator_checked: bool,
@@ -283,7 +283,8 @@ impl fmt::Display for ThreeWayReport {
             } else {
                 write!(
                     f,
-                    "no divergence (evaluator leg not run: relationship-reading definition)"
+                    "no divergence (evaluator leg not run: relationship-reading or JOIN \
+                     definition)"
                 )
             };
         }
@@ -308,8 +309,9 @@ impl fmt::Display for ThreeWayReport {
         if !self.evaluator_checked {
             writeln!(
                 f,
-                "(evaluator leg not run: this definition reads a relationship, which the \
-                 engine's evaluator-driven recompute does not support — see oracle::check)"
+                "(evaluator leg not run: this definition reads a relationship or is a JOIN, \
+                 which the engine's evaluator-driven recompute does not support — see \
+                 oracle::check)"
             )?;
         }
         write!(f, "program:\n{}", self.program)
@@ -1168,6 +1170,125 @@ pub fn field_types(
         .collect()
 }
 
+/// The SQL oracle of a `JOIN` definition (#1113): the definition's own
+/// `select … from a [left] join b on … group by …`, each column as text,
+/// group columns first in `GROUP BY` order, then every other field.
+///
+/// # Panics
+///
+/// If `def` isn't a `JOIN`.
+pub fn render_join_select(def: &TransformDef) -> String {
+    let KeySpace::Join(join) = &def.key_space else {
+        panic!("render_join_select: {:?} is not a JOIN", def.target);
+    };
+    let column =
+        |table: &str, column: &str| format!("{}.{}", quote_ident(table), quote_ident(column));
+    let mut select: Vec<String> = join
+        .group_by
+        .iter()
+        .map(|key| format!("{}::text", column(&key.table, &key.column)))
+        .collect();
+    for field in &def.fields {
+        if join.group_by.iter().any(|key| key.column == field.name) {
+            continue;
+        }
+        select.push(format!(
+            "({})::text as {}",
+            render_join_expr(&field.expr),
+            quote_ident(&field.name)
+        ));
+    }
+    let on: Vec<String> = join
+        .on
+        .iter()
+        .map(|on| {
+            format!(
+                "{} = {}",
+                column(&on.lhs.table, &on.lhs.column),
+                column(&on.rhs.table, &on.rhs.column)
+            )
+        })
+        .collect();
+    let group_by: Vec<String> = join
+        .group_by
+        .iter()
+        .map(|key| column(&key.table, &key.column))
+        .collect();
+    format!(
+        "select {} from {} {} {} on {} group by {}",
+        select.join(", "),
+        quote_ident(&def.source),
+        match join.kind {
+            trellis::dev::defs::ast::JoinKind::Inner => "join",
+            trellis::dev::defs::ast::JoinKind::Left => "left join",
+        },
+        quote_ident(&join.right),
+        on.join(" and "),
+        group_by.join(", ")
+    )
+}
+
+/// One `JOIN` field expression as SQL: every column is read through the
+/// table it names (`a.x`, or a joined `b.y`, which parses as a path).
+fn render_join_expr(expr: &Expr) -> String {
+    match expr {
+        Expr::SourceColumn { table, column, .. }
+        | Expr::RelationshipPath { rel: table, column } => {
+            format!("{}.{}", quote_ident(table), quote_ident(column))
+        }
+        Expr::BinaryOp { op, lhs, rhs } => format!(
+            "({} {} {})",
+            render_join_expr(lhs),
+            match op {
+                Operator::Add => "+",
+                Operator::GreaterThan => ">",
+            },
+            render_join_expr(rhs)
+        ),
+        Expr::FunctionCall { name, args } if name == "COUNT" && args.is_empty() => {
+            "count(*)".to_string()
+        }
+        Expr::FunctionCall { name, args } => format!(
+            "{}({})",
+            name.to_lowercase(),
+            args.iter()
+                .map(render_join_expr)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        other => trellis::dev::defs::oracle::render_expr_sql(other),
+    }
+}
+
+/// Runs [`render_join_select`] and keys its rows the way
+/// [`crate::backend::Backend::snapshot`] keys a `JOIN` target's: by the
+/// group columns' [`group_key`].
+async fn join_sql_oracle(pool: &Pool, def: &TransformDef) -> Result<Rows, OracleError> {
+    let KeySpace::Join(join) = &def.key_space else {
+        unreachable!("join_sql_oracle is only called on a JOIN");
+    };
+    let client = pool.get().await?;
+    let db_rows = client.query(render_join_select(def).as_str(), &[]).await?;
+    let fields: Vec<&str> = def
+        .fields
+        .iter()
+        .map(|f| f.name.as_str())
+        .filter(|name| !join.group_by.iter().any(|key| key.column == *name))
+        .collect();
+    let groups = join.group_by.len();
+    let mut rows: Rows = BTreeMap::new();
+    for db_row in db_rows {
+        let values: Vec<Option<String>> = (0..groups).map(|i| db_row.get(i)).collect();
+        let by_column = fields
+            .iter()
+            .enumerate()
+            .map(|(i, name)| ((*name).to_string(), db_row.get(groups + i)))
+            .collect();
+        rows.insert(group_key(&values), by_column);
+    }
+    Ok(rows)
+}
+
 /// Runs the full three-way comparison for a 1-1 `def`: reads the SQL oracle
 /// and the evaluator recompute from `pool`, strips the pk column from the
 /// caller-supplied persisted `target` rows (as read back by
@@ -1182,6 +1303,17 @@ pub async fn check(
     source_columns: &HashMap<String, ValueType>,
     target: &Rows,
 ) -> Result<ThreeWayReport, OracleError> {
+    // #1113: a `JOIN`'s oracle is its own `JOIN … GROUP BY` query over the
+    // two tables, compared byte for byte; there is no evaluator leg.
+    if matches!(def.key_space, KeySpace::Join(_)) {
+        let sql = join_sql_oracle(pool, def).await?;
+        return Ok(ThreeWayReport {
+            target_vs_sql: diff(&def.target, &sql, target, &|_| Comparison::Exact),
+            evaluator_vs_sql: Vec::new(),
+            evaluator_checked: false,
+            program: format!("{program:#?}"),
+        });
+    }
     let sql = sql_oracle(pool, program, def, pk_column).await?;
     let target = target_fields(target, pk_column);
 
@@ -1755,6 +1887,27 @@ mod tests {
         assert_eq!(
             field_value_type(&text_path, &source_columns, &rels),
             ValueType::Text
+        );
+    }
+
+    /// #1113: a `JOIN`'s oracle is its own query: group columns first, read
+    /// through their tables, then each other field, a joined-side column
+    /// read through the joined table.
+    #[test]
+    fn render_join_select_is_the_definitions_own_query() {
+        use crate::generate::join::{JoinDefSpec, JoinField, JoinGroups, JoinKey, join_definition};
+        let def = join_definition(
+            "j",
+            &JoinDefSpec {
+                left: true,
+                key: JoinKey::Pair,
+                groups: JoinGroups::Both,
+                fields: vec![JoinField::SumY, JoinField::CoalesceSumY],
+            },
+        );
+        assert_eq!(
+            render_join_select(&def),
+            r#"select "ja"."ga"::text, "jb"."gb"::text, (count(*))::text as "n", (sum("jb"."y"))::text as "sy", (coalesce(sum("jb"."y"), 0::numeric))::text as "sy0" from "ja" left join "jb" on "ja"."t" = "jb"."t" and "ja"."k" = "jb"."k" group by "ja"."ga", "jb"."gb""#
         );
     }
 

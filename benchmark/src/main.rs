@@ -43,6 +43,10 @@
 //! # #1100: any streaming scenario on the group basis instead of the ledger (the dev knob);
 //! # the same command without the flag is its same-session ledger control
 //! cargo run -p benchmark --features engine-access --release -- group-contention --groups 10,400 --group-basis
+//! # #1113: #1091 J2's JOIN scenario (D1/D2 x S1/S2, a-side and b-side pages, hot keys)
+//! # against its same-session per-fact control (B0); turns the group-basis knob on itself
+//! cargo run -p benchmark --features engine-access --release -- join
+//! cargo run -p benchmark --features engine-access --release -- join --datasets d1 --facts 1000000 --hot-pages 0
 //! # the write-path tax and the capture ceiling (#622 C4; #565 E1/E2), and V-IDLE
 //! cargo run -p benchmark --features engine-access --release -- write-tax --shapes 1x1,1000x16,orm100x1 --reps 3
 //! cargo run -p benchmark --features engine-access --release -- write-tax --variants none,trigger,trigger+exception --shapes orm100x16+hold

@@ -12,7 +12,7 @@ use crate::streaming::tuning::EngineTuning;
 use crate::streaming::write_tax::{self, CellOptions, ProbeMode, Shape, Variant};
 use crate::streaming::{
     build_under_load, capture_ceiling, disk_tier, fold_in, generator_reach, hop_latency, idle_cost,
-    load, ssi_tax, throughput,
+    join, load, ssi_tax, throughput,
 };
 
 /// Every scenario name this module handles, for `main.rs`'s usage message.
@@ -29,6 +29,7 @@ pub const SCENARIOS: &[&str] = &[
     "idle-cost",
     "generator-reach",
     "build-under-load",
+    "join",
 ];
 
 /// The latency ladder's defaults. #266: "low offered rate (e.g. 10
@@ -246,6 +247,49 @@ fn tuning(args: &[String], default: EngineTuning) -> EngineTuning {
             })
             .unwrap_or(default.build_chunk_rows),
     }
+}
+
+/// `join`'s knobs (see [`join`]'s module doc): `--datasets d1,d2`,
+/// `--variants s1,s2,b0`, `--facts` (2,000,000), `--a-page` (20,000),
+/// `--a-pages` (5), `--b-page` (2% of D1's keys), `--b-pages` (3),
+/// `--hot-pages` (160; 0 skips the hot-key runs), `--hot-writers` (8),
+/// `--hot-keys` (10), `--load-chunk` (100,000), `--seed`, `--timeout-secs`.
+fn join_config(args: &[String]) -> join::JoinBench {
+    let default = join::JoinBench::default();
+    let count = |name: &str, default: usize| number(args, name).map_or(default, |v| v as usize);
+    join::JoinBench {
+        datasets: flag(args, "--datasets").map_or(default.datasets.clone(), |raw| {
+            raw.split(',').map(join::Dataset::parse).collect()
+        }),
+        variants: flag(args, "--variants").map_or(default.variants.clone(), |raw| {
+            raw.split(',').map(join::Variant::parse).collect()
+        }),
+        facts: number(args, "--facts").map_or(default.facts, |v| v as i64),
+        a_page: count("--a-page", default.a_page),
+        a_pages: count("--a-pages", default.a_pages),
+        b_page: number(args, "--b-page").map(|v| v as usize),
+        b_pages: count("--b-pages", default.b_pages),
+        hot_pages: count("--hot-pages", default.hot_pages),
+        hot_writers: count("--hot-writers", default.hot_writers),
+        hot_keys: count("--hot-keys", default.hot_keys),
+        load_chunk: number(args, "--load-chunk").map_or(default.load_chunk, |v| v as i64),
+        seed: number(args, "--seed").map_or(default.seed, |v| v as u64),
+        timeout: secs(args, "--timeout-secs").unwrap_or(default.timeout),
+    }
+}
+
+/// `join`'s engine: 8 drain workers, as the throughput scenarios, and a
+/// 10 ms seal cadence, so a page's apply time isn't mostly waiting for the
+/// next seal.
+fn join_tuning(args: &[String]) -> EngineTuning {
+    tuning(
+        args,
+        EngineTuning {
+            application_threads: throughput::THROUGHPUT_APPLICATION_THREADS,
+            maintenance_interval: Duration::from_millis(10),
+            ..Default::default()
+        },
+    )
 }
 
 fn throughput_tuning(args: &[String]) -> EngineTuning {
@@ -505,6 +549,23 @@ pub fn run(name: &str, args: &[String]) -> Option<bool> {
                 eprintln!("APPLY AUDIT FAILURE: {audit_failed} audited statement(s) failed");
             }
             Some(result.oracle_ok && result.writes.errors == 0 && audit_failed == 0)
+        }
+
+        // #1113 J8: #1091 J2's JOIN scenario, with its per-fact control.
+        "join" => {
+            // A `JOIN` applies only behind the group-basis knob (#1108).
+            trellis::dev::staging::set_group_basis(true);
+            let cfg = join_config(args);
+            let tuning = join_tuning(args);
+            let outcome = runtime().block_on(join::run(&cfg, &tuning));
+            for failure in &outcome.failures {
+                eprintln!("CORRECTNESS FAILURE: {failure}");
+            }
+            let ordering = outcome.d1_ordering();
+            if ordering.values().any(|kept| *kept == Some(false)) {
+                eprintln!("D1 did not keep J2's ordering (S1 < S2 < B0) for: {ordering:?}");
+            }
+            Some(outcome.failures.is_empty())
         }
 
         "write-tax" => {

@@ -117,6 +117,9 @@ source, run it in the same cluster, and assert the persisted target equals it.
 
 - **1-1:** `SELECT pk, (price + tax) AS total FROM orders` → compare row-by-row.
 - **Aggregate:** `SELECT grain, sum(measure) FROM src GROUP BY grain` → compare.
+- **Join aggregate:** the definition's own `SELECT keys, aggregates FROM a [LEFT]
+  JOIN b ON … GROUP BY keys` over the two tables → compare byte for byte. The
+  evaluator recompute has no join, so this one has no second leg.
 
 This oracle shares **no evaluation code** with the engine — only the parser AST
 and a small AST→`SELECT` printer. It catches every class of bug, including one in
@@ -204,6 +207,22 @@ unblocks it.
   reading another's target), so it never exercised issue #110's sibling
   downstream-propagation gap either way; #110's own front-door coverage lives in
   `trellis/tests/defs_aggregate_chained_single_column_group_key.rs`.
+- **Join convergence** *(`JOIN` apply, #1108; the JOIN tier, #1113)*. Two
+  tables, one to three `LEFT` or `INNER` join aggregates over them (joined on one
+  column or on two, grouped by the joined table's column, by a column of each
+  table, or by the `FROM` table's alone, with `COUNT`/`SUM`/`AVG` on either side,
+  an expression argument and composed fields), and inserts, updates and deletes
+  on both tables with `NULL` keys, groups and values now and then. The join keys
+  spread over a dozen values, land mostly on one hot key, or fan out over three
+  keys that both tables keep writing. The ops are issued as the concurrent tier
+  issues them (bursts split over lanes, several drain workers, a short seal
+  cadence), so both sides' writes race into the same batches and onto the same
+  keys; every burst is checked once it settles, and every definition must still
+  be `live` at the end. Every definition is installed over the two empty tables,
+  and the run waits for it before its first write: a join aggregate builds only
+  over empty tables until its build exists (#1109). A `TRUNCATE` of either table
+  isn't drawn: it halts a join aggregate until #1110. Run it with `cargo test -p
+  generative --test join_convergence -- --ignored`.
 - **A second, structural oracle** *(needs an engine consistency auditor, if one
   exists)*. Run the engine's internal consistency check at end of run, require zero
   findings, prove the wiring with a negative test.

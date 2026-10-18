@@ -58,6 +58,8 @@
 //!   with nothing draining (#565 E2, #622 C4). It replaced `intake-ceiling`.
 //! - [`ssi_tax`]: the `40001` rate capture adds to concurrent
 //!   `SERIALIZABLE` writers, against the same table with no capture (#623 D8a).
+//! - [`join`]: #1091 J2's `JOIN … GROUP BY` scenario (D1/D2 x S1/S2,
+//!   a-side and b-side pages, hot keys) against a per-fact control (#1113).
 //! - [`idle_cost`]: a zero-traffic install's transactions/sec, WAL bytes/sec
 //!   and seals/sec (V-IDLE).
 //! - [`build_under_load`]: a large aggregate build under a paced mixed write
@@ -82,6 +84,7 @@ pub mod fold_in;
 pub mod generator_reach;
 pub mod hop_latency;
 pub mod idle_cost;
+pub mod join;
 pub mod load;
 pub mod process_memory;
 pub mod rate;

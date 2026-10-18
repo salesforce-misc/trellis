@@ -43,7 +43,9 @@ pub struct ConcurrentRun {
 /// shrink-trust convention before treating a shrunk case as minimal.
 ///
 /// The drain audit ([`ConcurrentBackend::start_drain_audit`]) is on for the
-/// whole run, and its counts come back with the outcome.
+/// whole run, and its counts come back with the outcome. With
+/// [`ConcurrentPlan::settle_after_install`], the first burst waits for every
+/// definition installed up front to settle.
 ///
 /// With a [`ConcurrentPlan::steady_load`], the engine's pages and build
 /// chunks stall at their entry-lock step for the whole run, and once an
@@ -119,6 +121,12 @@ pub async fn run_convergence_concurrent<B: ConcurrentBackend>(
         .start_drain_audit()
         .await
         .map_err(|e| RunError::Install(format!("drain audit: {e:?}")))?;
+    if plan.settle_after_install {
+        backend
+            .quiesce()
+            .await
+            .map_err(|e| RunError::Quiesce(format!("after install: {e:?}")))?;
+    }
 
     // The plan's steady load's stall, if any, holds for the whole run, and
     // is cleared when the run ends, however it ends.

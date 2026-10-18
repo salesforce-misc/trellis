@@ -22,7 +22,8 @@ use std::time::{Duration, Instant};
 
 use trellis::dev::defs::TransformStatus;
 use trellis::dev::defs::ast::{
-    Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType,
+    Expr, FieldDef, JoinKind, KeySpace, Operator, Predicate, QualifiedColumn, TransformDef,
+    ValueType,
 };
 use trellis::dev::staging::{StagingError, await_converged, converged_through, watermark_token};
 
@@ -74,7 +75,28 @@ pub(super) fn render_definition(def: &TransformDef) -> String {
         .collect();
     debug_assert_eq!(def.predicate, Predicate::True);
     let key_space_clause = match &def.key_space {
-        KeySpace::Join(_) => unreachable!("the generator never produces a JOIN definition"),
+        // The JOIN tier (#1113): `FROM a [LEFT|INNER] JOIN b ON … GROUP BY …`.
+        KeySpace::Join(join) => {
+            let qualified = |c: &QualifiedColumn| format!("{}.{}", c.table, c.column);
+            format!(
+                " {} {} ON {} GROUP BY {}",
+                match join.kind {
+                    JoinKind::Inner => "INNER JOIN",
+                    JoinKind::Left => "LEFT JOIN",
+                },
+                join.right,
+                join.on
+                    .iter()
+                    .map(|on| format!("{} = {}", qualified(&on.lhs), qualified(&on.rhs)))
+                    .collect::<Vec<_>>()
+                    .join(" AND "),
+                join.group_by
+                    .iter()
+                    .map(qualified)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
         KeySpace::OneToOne => String::new(),
         KeySpace::Aggregate { group_by } => format!(
             " GROUP BY {}",
@@ -771,6 +793,31 @@ mod tests {
             let text = format!("TRANSFORM t FROM s GROUP BY g SELECT g AS g, {rendered} AS total");
             let def = parse(&text).unwrap_or_else(|e| panic!("{text}: {e:?}"));
             assert_eq!(def.fields[1].expr, expr);
+        }
+    }
+
+    /// #1113: every `JOIN` shape the JOIN tier draws renders back to text
+    /// that parses to the same definition.
+    #[test]
+    fn render_definition_round_trips_a_join() {
+        use crate::generate::join::{JoinDefSpec, JoinField, JoinGroups, JoinKey, join_definition};
+        for left in [true, false] {
+            for key in [JoinKey::Single, JoinKey::Pair] {
+                for groups in [JoinGroups::Joined, JoinGroups::Both, JoinGroups::From] {
+                    let def = join_definition(
+                        "j",
+                        &JoinDefSpec {
+                            left,
+                            key,
+                            groups,
+                            fields: JoinField::ALL.to_vec(),
+                        },
+                    );
+                    let text = render_definition(&def);
+                    let reparsed = parse(&text).unwrap_or_else(|e| panic!("{text}: {e:?}"));
+                    assert_eq!(reparsed, def, "{text}");
+                }
+            }
         }
     }
 

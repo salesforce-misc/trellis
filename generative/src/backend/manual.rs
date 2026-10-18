@@ -1186,7 +1186,14 @@ impl super::Backend for ManualBackend {
             // see `install_definition` above and that field's doc comment.
             let qualified = qualified_target_table(&self.target_schema, def);
             let rows = match &def.key_space {
-                KeySpace::Join(_) => unreachable!("the generator never produces a JOIN definition"),
+                // The JOIN tier (#1113): a `JOIN` target's group columns
+                // are named after the columns its `GROUP BY` keys name.
+                KeySpace::Join(join) => {
+                    let group_by_names: Vec<String> =
+                        join.group_by.iter().map(|k| k.column.clone()).collect();
+                    sql::read_aggregate_table(&self.raw, &qualified, &group_by_names, &def.fields)
+                        .await?
+                }
                 KeySpace::OneToOne => {
                     // `source_primary_key` accepts an arbitrary-arity source
                     // primary key (issue #126), and — since issue #121 — the

@@ -231,6 +231,8 @@
 //!
 //! [`Strategy`]: proptest::strategy::Strategy
 
+pub mod join;
+
 use std::collections::HashMap;
 
 use trellis::dev::defs::ast::{
@@ -2449,6 +2451,7 @@ pub fn concurrent_plan(program: &Program, burst_size: usize, lanes: usize) -> Co
     let mut plan = ConcurrentPlan {
         bursts,
         steady_load: None,
+        settle_after_install: false,
     };
     for (def, &at) in program.def_install_after_op.iter().enumerate() {
         if at == 0 {
