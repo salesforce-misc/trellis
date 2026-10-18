@@ -570,6 +570,22 @@ const NODES_MISSING_CAPTURE: &str = concat!(
      order by d.level, 1"
 );
 
+/// [`NODES_MISSING_CAPTURE`]'s nodes by oid (`bigint`), unordered.
+const NODE_OIDS_MISSING_CAPTURE: &str = concat!(
+    "select d.relid::bigint from ",
+    partition_nodes!("pg_catalog.to_regclass($3)"),
+    " d where exists ( \
+         select 1 from unnest($2::text[], $4::text[]) as e(function, trigger) \
+         where not exists ( \
+             select 1 from pg_catalog.pg_trigger t \
+             join pg_catalog.pg_proc p on p.oid = t.tgfoid \
+             where t.tgrelid = d.relid and t.tgname = e.trigger \
+               and not t.tgisinternal and t.tgenabled = 'A' \
+               and p.proname = e.function \
+               and p.pronamespace = ( \
+                   select oid from pg_catalog.pg_namespace where nspname = $1)))"
+);
+
 /// The tables under the partitioned root `table` that lack any of the five
 /// capture triggers: missing, not `ENABLE ALWAYS`, or not calling the root's
 /// function for the event. `functions` and `triggers` are the root's names,
@@ -595,6 +611,51 @@ async fn nodes_missing_capture(
         .into_iter()
         .map(|row| row.get(0))
         .collect())
+}
+
+/// Whether installing `table`'s capture only adds nodes new to its recorded
+/// tree to a root already captured: `table` is a partitioned root whose own
+/// five triggers are in place, calling its functions, and every node that
+/// lacks any of its triggers is absent, by oid, from the tree the reconcile
+/// pass recorded (`super::partitions::recorded`). A new or attached leaf is
+/// such a node, and the pass queues its correction
+/// (`crate::staging::partition_correction`), which an aggregate on the group
+/// basis takes instead of a rebuild (`crate::intake::markers::park_table_catch_ups`).
+/// A recorded node whose triggers were dropped by hand is not.
+async fn adds_only_new_nodes(
+    client: &impl GenericClient,
+    schema: &str,
+    table: &str,
+) -> Result<bool, CaptureError> {
+    let Some(recorded) = super::partitions::recorded(client, table).await? else {
+        return Ok(false);
+    };
+    let functions = function_names(table)?;
+    let triggers = trigger_names(schema);
+    let root = crate::defs::ddl::regclass_arg(table);
+    let row = client
+        .query_one(
+            &format!(
+                "select not exists ( \
+                     select 1 from unnest($2::text[], $4::text[]) as e(function, trigger) \
+                     where not exists ( \
+                         select 1 from pg_catalog.pg_trigger t \
+                         join pg_catalog.pg_proc p on p.oid = t.tgfoid \
+                         where t.tgrelid = pg_catalog.to_regclass($3) and t.tgname = e.trigger \
+                           and not t.tgisinternal and t.tgenabled = 'A' \
+                           and p.proname = e.function \
+                           and p.pronamespace = ( \
+                               select oid from pg_catalog.pg_namespace where nspname = $1))), \
+                        array({NODE_OIDS_MISSING_CAPTURE})"
+            ),
+            &[&schema, &functions, &root, &triggers],
+        )
+        .await?;
+    let root_captured: bool = row.get(0);
+    let bare: Vec<i64> = row.get(1);
+    let known: std::collections::HashSet<i64> =
+        recorded.nodes.iter().map(|n| i64::from(n.oid)).collect();
+    Ok(root_captured && !bare.is_empty() && bare.iter().all(|oid| !known.contains(oid)))
 }
 
 /// The spec a function's comment records, if it records one for `table`'s
@@ -706,11 +767,13 @@ async fn install_tree(
     deadline: Option<Instant>,
 ) -> Result<Progress<()>, CaptureError> {
     let nodes = descendants(&*client, spec.table()).await?;
+    let new_nodes = adds_only_new_nodes(&*client, schema, spec.table()).await?;
     if nodes.len() < SINGLE_TRANSACTION_TABLES {
         let op = Op::Install {
             spec,
             scope: Scope::All,
             last: true,
+            new_nodes,
         };
         return run(client, schema, op, deadline).await;
     }
@@ -723,6 +786,7 @@ async fn install_tree(
         spec,
         scope: Scope::Root,
         last: missing.is_empty(),
+        new_nodes,
     };
     if let waiting @ Progress::Waiting(_) = run(client, schema, root, deadline).await? {
         return Ok(waiting);
@@ -732,6 +796,7 @@ async fn install_tree(
             spec,
             scope: Scope::Node(node),
             last: i + 1 == missing.len(),
+            new_nodes,
         };
         if let waiting @ Progress::Waiting(_) = run(client, schema, op, deadline).await? {
             return Ok(waiting);
@@ -755,6 +820,7 @@ pub async fn install_in_one_transaction(
         spec,
         scope: Scope::All,
         last: true,
+        new_nodes: false,
     };
     run(client, schema, op, deadline).await
 }
@@ -878,11 +944,14 @@ enum Scope<'a> {
 #[derive(Clone, Copy)]
 enum Op<'a> {
     /// `last` is whether this attempt completes the install, and so parks
-    /// the join marker (see "Partitioned tables").
+    /// the join marker (see "Partitioned tables"). `new_nodes` is whether
+    /// the install only adds nodes new to the recorded tree to a captured
+    /// root ([`adds_only_new_nodes`]).
     Install {
         spec: &'a CaptureSpec,
         scope: Scope<'a>,
         last: bool,
+        new_nodes: bool,
     },
     Widen(&'a CaptureSpec),
     Uninstall {
@@ -1032,9 +1101,14 @@ async fn attempt(
     let mut rebuilt = Vec::new();
     let parks_marker = matches!(op, Op::Install { last: true, .. } | Op::Widen(_));
     match op {
-        Op::Install { last: true, .. } => {
+        Op::Install {
+            last: true,
+            new_nodes,
+            ..
+        } => {
             rebuilt =
-                crate::intake::markers::park_table_catch_ups(&txn, &[table.to_string()]).await?
+                crate::intake::markers::park_table_catch_ups(&txn, &[table.to_string()], new_nodes)
+                    .await?
         }
         Op::Widen(_) => crate::intake::markers::park_widen_marker(&txn, table).await?,
         Op::Install { .. } | Op::Uninstall { .. } => {}

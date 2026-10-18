@@ -108,7 +108,10 @@
 //! Each page of a partition correction (`super::partition_correction`) fires
 //! [`PausePoint::BeforeCorrectionCommit`] for the definition's target after
 //! it has re-derived its keys and recorded its progress, before it commits.
-//! A test runs the correction inside [`with_scope`].
+//! A test runs the correction inside [`with_scope`]. A correction on the
+//! group basis (#1103) fires it after its recompute, and fires
+//! [`PausePoint::BeforeCorrectionRecompute`] before it, once it has
+//! enumerated the groups to recompute.
 //!
 //! A partitioned source's every-pass sweep (`crate::capture::complement`)
 //! fires [`PausePoint::AfterSweepCatalogRead`] for the source after its
@@ -251,6 +254,12 @@ pub enum PausePoint {
     /// target (`super::partition_correction`, ADR-0017 P4a). The page holds
     /// its keys' entry locks and its row's claim fence.
     BeforeCorrectionCommit,
+    /// After a group-basis partition correction has enumerated the groups
+    /// that route to its node, in its own committed statement, and before
+    /// it locks and recomputes them, for the definition's target
+    /// (`super::partition_correction`, #1103). Its transaction holds only
+    /// its row's claim fence, so the source can be written and drained here.
+    BeforeCorrectionRecompute,
     /// After the every-pass sweep of a partitioned source has read the
     /// lifecycle fingerprint, the bounds and the queued corrections, before
     /// it searches the targets, for the source's unquoted `schema.table`

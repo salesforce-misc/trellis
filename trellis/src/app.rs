@@ -1019,6 +1019,7 @@ impl Trellis {
             let rebuilt = crate::intake::markers::park_table_catch_ups(
                 &*txn,
                 std::slice::from_ref(&qualified),
+                false,
             )
             .await
             .map_err(|err| match err {

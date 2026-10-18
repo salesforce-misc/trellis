@@ -584,7 +584,7 @@ pub(crate) async fn check(
             .map(|r| r.target.clone())
             .collect();
         let rebuilt =
-            crate::intake::markers::park_table_catch_ups(&txn, &[table.to_string()]).await?;
+            crate::intake::markers::park_table_catch_ups(&txn, &[table.to_string()], false).await?;
         crate::staging::build::stamp_rebuild_seg(&txn, &rebuilt).await?;
     }
     write(&txn, table, &found.rewrite).await?;

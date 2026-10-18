@@ -200,6 +200,35 @@ that commits its keys' entries and its progress together, so a restart resumes
 after the last committed page: the ledger walk in `(group, key)` order, then the
 node's rows in primary-key order.
 
+On an aggregate kept on [ADR-0002](0002-async-data-flow.md)'s group basis, a
+node's correction recomputes the groups that route to the node, never zeroes
+them: a `TRUNCATE` and an `INSERT` into the leaf in one transaction leave a row
+that a zero would erase and whose change the zero's basis would then refuse.
+The set is read in one statement: the target's groups that route to the node by
+its recorded text, the groups of the images of the source's changes still in
+the ring that route to it, and, for a node in the tree, the groups of its
+current rows. The ring's groups are there because a change committed before
+the DDL and not yet applied may name a group the target doesn't have, and its
+page would otherwise create that group with a row the DDL removed. One
+statement, because a page that applies such a change and has its ring rows
+retired between two reads would be in neither. The correction then locks the
+set in one sorted statement and rewrites each group's partials from a
+`GROUP BY` of its rows, with that statement's snapshot as the group's basis,
+in one transaction with its progress. Every change the DDL removed was
+committed before the pass queued the correction, so the basis sees it and its
+page refuses it: no `build_seg` and no fence. The rows are read through the
+root, or, for a node still in the tree as recorded (same parent, same
+`pg_inherits` row, not detach-pending), by one `GROUP BY` of the node under an
+`ACCESS SHARE` lock that holds it there; every row of a group that routes to
+the node is in it. The capture install that adds a new node to the tree
+rebuilds none of these aggregates: the node's own correction covers its rows,
+including those written into it directly before its capture existed. Measured on
+the engine (a debug build, one runner), a `DROP`, `DETACH` or `TRUNCATE` of a
+leaf of 1M or of 10M rows over 1,560 groups takes 27–34 ms and about 0.6 MB of
+WAL, whatever the leaf's rows; an `ATTACH` of such a leaf reads it twice, once
+for its groups and once for their partials, 0.5–0.6 s at 1M rows and 3.9–4.7 s
+at 10M.
+
 A correction runs for each definition that reads the source, an aggregate over
 it or a definition reading it through a to-many relationship, as a row of the
 build-chunk queue, which the pass that queues the correction enqueues. The drain workers claim it as

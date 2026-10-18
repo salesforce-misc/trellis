@@ -254,9 +254,18 @@ pub(crate) async fn park_target_catchup_if_read(
 ///
 /// Locks follow [`park_catch_up`]'s order: every definition this touches
 /// first (in id order), then the markers.
+///
+/// `new_nodes` says the install that parks the marker only added nodes new
+/// to a captured partitioned root's recorded tree
+/// (`capture::install::adds_only_new_nodes`). A definition reading the
+/// root on the group basis (`staging::group_basis`) is then neither rebuilt
+/// nor caught up: the reconcile pass queues each new node's correction,
+/// which recomputes the groups that route to it, the node's own rows' among
+/// them (#1103).
 pub(crate) async fn park_table_catch_ups(
     client: &impl GenericClient,
     tables: &[String],
+    new_nodes: bool,
 ) -> Result<Vec<i64>, IntakeError> {
     let mut readers = Vec::new();
     let mut to_sides = Vec::new();
@@ -266,7 +275,21 @@ pub(crate) async fn park_table_catch_ups(
             to_sides.push(table.clone());
         }
     }
-    let candidates = crate::staging::build::rebuild_candidates(client, tables).await?;
+    let mut candidates = crate::staging::build::rebuild_candidates(client, tables).await?;
+    if new_nodes {
+        let mut corrected = Vec::new();
+        for &id in readers.iter().chain(&candidates) {
+            if let Some(definition) = crate::defs::catalog::definition_by_id_in(client, id).await?
+                && tables.contains(&definition.source_table)
+                && crate::staging::group_basis::route(&definition.def, &definition.source_columns)
+                    .is_some()
+            {
+                corrected.push(id);
+            }
+        }
+        readers.retain(|id| !corrected.contains(id));
+        candidates.retain(|id| !corrected.contains(id));
+    }
     let mut locked: Vec<i64> = readers.iter().chain(&candidates).copied().collect();
     locked.sort_unstable();
     locked.dedup();

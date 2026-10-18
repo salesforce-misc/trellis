@@ -36,6 +36,19 @@
 //!    (a detached table is then read the same way): every row of a gone node
 //!    routed by its text has its live entry found by the ledger phase.
 //!
+//! # On the group basis
+//!
+//! An aggregate kept on the group basis (`super::group_basis`, behind its
+//! dev knob) has no ledger: its correction (the `group` module, #1103)
+//! recomputes, in one transaction, the groups that route to the node (the
+//! target's, those of the ring's undrained images, and the node's current
+//! rows'), with the recompute's snapshot as each group's basis. It routes
+//! as below, and is scheduled, reported and failed as below, but stamps no
+//! `build_seg` and has no fence, ledger or node phase. A capture install
+//! that only adds new nodes to the tree rebuilds no such aggregate
+//! (`crate::intake::markers::park_table_catch_ups`): the nodes' corrections
+//! cover them.
+//!
 //! # Routing
 //!
 //! A group routes to a node when the node's recorded
@@ -144,6 +157,7 @@ use super::apply::ApplyError;
 use super::build::{self, BuildPlan, CHUNK_APPLICATION_NAME};
 use super::ledger::LedgerTargetPlan;
 
+mod group;
 mod to_many;
 
 /// Keys per page by default, the size of a build chunk
@@ -868,7 +882,21 @@ pub(crate) async fn run_chunk(
         heartbeat_interval,
     );
     let fence = ClaimFence::new(chunk.id, claimed_by, reclaim_ttl);
-    let step = if definition.source_table == correction.table {
+    let group_shape = super::group_basis::route(&definition.def, &definition.source_columns);
+    let step = if definition.source_table == correction.table
+        && let Some(shape) = &group_shape
+    {
+        group::correct(
+            pool,
+            &definition,
+            shape,
+            &correction,
+            options,
+            outcome,
+            &fence,
+        )
+        .await?
+    } else if definition.source_table == correction.table {
         correct(pool, &definition, &correction, options, outcome, &fence).await?
     } else if let Some(reader) = to_many::reader(pool, &definition, &correction.table).await? {
         to_many::correct(pool, &reader, &correction, options, outcome, &fence).await?
@@ -1053,42 +1081,14 @@ async fn correct(
         });
     };
     let ledger = plan.ledger();
-    if covered_by_parent(pool, correction).await? {
+    if covered_by_parent(pool, correction).await?
+        || complement_unevaluable(pool, correction).await?
+    {
         return Ok(if mark_done(pool, fence, correction, definition).await? {
             Step::Done
         } else {
             Step::Superseded
         });
-    }
-    if correction.kind == partitions::Kind::Complement.as_str()
-        && let Some(text) = &correction.constraint
-    {
-        // A complement names each `HASH` node it reads remainders of, and
-        // can't be evaluated once one is dropped. The dropped node's own
-        // correction covers its groups, and the next pass's sweep finds any
-        // others again under the tree as it is then.
-        let mut oids: Vec<i64> = crate::capture::complement::hash_parents(text)
-            .into_iter()
-            .map(i64::from)
-            .collect();
-        oids.sort_unstable();
-        oids.dedup();
-        let client = pool.get().await?;
-        let alive: i64 = client
-            .query_one(
-                "select count(*) from pg_catalog.pg_class \
-                 where oid = any($1::bigint[]::oid[])",
-                &[&oids],
-            )
-            .await?
-            .get(0);
-        if usize::try_from(alive).unwrap_or(0) < oids.len() {
-            return Ok(if mark_done(pool, fence, correction, definition).await? {
-                Step::Done
-            } else {
-                Step::Superseded
-            });
-        }
     }
     let recorded = {
         let client = pool.get().await?;
@@ -1172,6 +1172,39 @@ async fn correct(
         outcome.pages += 1;
         outcome.keys += keys;
     }
+}
+
+/// Whether `correction` is a complement that names a `HASH` node no longer
+/// there. A complement names each `HASH` node it reads remainders of, and
+/// can't be evaluated once one is dropped. The dropped node's own
+/// correction covers its groups, and the next pass's sweep finds any others
+/// again under the tree as it is then.
+async fn complement_unevaluable(
+    pool: &Pool,
+    correction: &PendingCorrection,
+) -> Result<bool, CorrectionError> {
+    if correction.kind != partitions::Kind::Complement.as_str() {
+        return Ok(false);
+    }
+    let Some(text) = &correction.constraint else {
+        return Ok(false);
+    };
+    let mut oids: Vec<i64> = crate::capture::complement::hash_parents(text)
+        .into_iter()
+        .map(i64::from)
+        .collect();
+    oids.sort_unstable();
+    oids.dedup();
+    let client = pool.get().await?;
+    let alive: i64 = client
+        .query_one(
+            "select count(*) from pg_catalog.pg_class \
+             where oid = any($1::bigint[]::oid[])",
+            &[&oids],
+        )
+        .await?
+        .get(0);
+    Ok(usize::try_from(alive).unwrap_or(0) < oids.len())
 }
 
 /// Whether `correction` is a gone node whose parent has been dropped since

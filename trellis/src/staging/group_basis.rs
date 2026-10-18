@@ -22,9 +22,13 @@
 //!   is #1101's;
 //! - halts on a resume or rebuild with a non-empty source, which are
 //!   #1101's;
-//! - is refused at define over a partitioned source (#1103), and for
-//!   `SUM`/`AVG` over a `numeric` column with no declared scale (#1096
-//!   decision 2).
+//! - is refused at define for `SUM`/`AVG` over a `numeric` column with no
+//!   declared scale (#1096 decision 2).
+//!
+//! Over a partitioned source, its partition maintenance is corrected by
+//! recomputing the groups that route to the node (#1103,
+//! [`recompute_routed`], `super::partition_correction`'s "On the group
+//! basis").
 //!
 //! # A source that is another definition's target
 //!
@@ -220,6 +224,12 @@ impl GroupShape {
     /// table's column of that name.
     pub(crate) fn group_columns(&self) -> &[String] {
         &self.group_cols
+    }
+
+    /// Each `GROUP BY` column's type in the target and hidden table, in
+    /// [`Self::group_columns`]' order.
+    pub(crate) fn group_types(&self) -> &[String] {
+        &self.group_types
     }
 }
 
@@ -465,11 +475,6 @@ pub(crate) async fn check_define(
 ) -> Result<(), crate::defs::catalog::CatalogError> {
     let refuse =
         |reason: String| Err(crate::defs::catalog::CatalogError::GroupBasisUnsupported { reason });
-    if crate::defs::partition_tree::is_partitioned_root(txn, qualified_source).await? {
-        return refuse(format!(
-            "its source {qualified_source} is partitioned (#1103)"
-        ));
-    }
     for column in &shape.numeric_args {
         let typmod: Option<i32> = txn
             .query_opt(
@@ -990,13 +995,22 @@ impl GroupTargetPlan {
     /// segment as its stamp. A group with no source row keeps its hidden
     /// row at zero with the basis (R4). `image_columns` as
     /// [`Self::apply_sql`]'s.
-    fn recompute_sql(&self, image_columns: Option<&[String]>) -> String {
+    ///
+    /// `node` (quoted and qualified) reads the groups' rows from one
+    /// partition of the source instead of through the root, in one
+    /// `GROUP BY` of the whole node rather than an index probe per group: a
+    /// partition correction's ([`recompute_routed`]), whose caller has
+    /// established that the node holds every row of every group in the set
+    /// and no row of a group outside it.
+    fn recompute_sql(&self, image_columns: Option<&[String]>, node: Option<&str>) -> String {
         let cols = quoted(&self.shape.group_cols);
         let col_list = cols.join(", ");
         let args = &self.shape.args;
         let mut old = vec!["x.__n".to_string()];
         let mut old_names = vec!["__on".to_string()];
         let mut fresh = vec!["count(*)::bigint as __rn".to_string()];
+        // The scan form's partials, `NULL` for a group the node has no row of.
+        let mut zeroed = vec!["coalesce(n.__rn, 0) as __rn".to_string()];
         let mut sets = vec!["__n = r.__rn".to_string()];
         let mut returning = vec![
             "u.__n - r.__on as __dn".to_string(),
@@ -1011,6 +1025,7 @@ impl GroupTargetPlan {
                 arg.sql
             ));
             sets.push(format!("__count_{i} = r.__rc{i}"));
+            zeroed.push(format!("coalesce(n.__rc{i}, 0) as __rc{i}"));
             returning.push(format!(
                 "u.__count_{i} - r.__oc{i} as __dc{i}, u.__count_{i} as __nc{i}"
             ));
@@ -1022,6 +1037,7 @@ impl GroupTargetPlan {
                     arg.sql
                 ));
                 sets.push(format!("__sum_{i} = r.__rs{i}"));
+                zeroed.push(format!("coalesce(n.__rs{i}, 0) as __rs{i}"));
                 returning.push(format!(
                     "u.__sum_{i} - r.__os{i} as __ds{i}, u.__sum_{i} as __ns{i}"
                 ));
@@ -1034,23 +1050,59 @@ impl GroupTargetPlan {
             .iter()
             .map(|c| format!("s.{c} is not distinct from rg.{c}"))
             .collect();
+        let lookup_hidden = self.group_lookup(
+            &self.hidden_ident,
+            "rg",
+            &format!("x.ctid, {}", old.join(", ")),
+        );
+        let r = match node {
+            None => format!(
+                "r as ( \
+                     select h.*, a.* from rg \
+                     cross join lateral {lookup_hidden} as h(__hc, {old_names}) \
+                     cross join lateral ( \
+                         select {fresh} from ( \
+                             select s.* from {src} s where {equal} \
+                             union all \
+                             select s.* from {src} s where ({has_null}) and {same} \
+                         ) as s \
+                     ) as a \
+                 )",
+                old_names = old_names.join(", "),
+                fresh = fresh.join(", "),
+                src = self.source_row,
+                equal = equal.join(" and "),
+                has_null = has_null.join(" or "),
+                same = same.join(" and "),
+            ),
+            Some(node) => {
+                let matched: Vec<String> = cols
+                    .iter()
+                    .map(|c| format!("n.{c} is not distinct from rg.{c}"))
+                    .collect();
+                format!(
+                    "n as materialized ( \
+                         select {col_list}, {fresh} from {node} s group by {col_list} \
+                     ), \
+                     r as ( \
+                         select h.*, {zeroed} from rg \
+                         cross join lateral {lookup_hidden} as h(__hc, {old_names}) \
+                         left join n on {matched} \
+                     )",
+                    fresh = fresh.join(", "),
+                    zeroed = zeroed.join(", "),
+                    old_names = old_names.join(", "),
+                    matched = matched.join(" and "),
+                )
+            }
+        };
         format!(
             "with snap as materialized ( \
                  select pg_catalog.pg_current_snapshot() as __snap, \
                         coalesce((select max(seg_seq) from segments), 0) as __seg \
              ), \
              rg as (select distinct {col_list} from {recomputed}), \
-             r as ( \
-                 select h.*, a.* from rg \
-                 cross join lateral {lookup_hidden} as h(__hc, {old_names}) \
-                 cross join lateral ( \
-                     select {fresh} from ( \
-                         select s.* from {src} s where {equal} \
-                         union all \
-                         select s.* from {src} s where ({has_null}) and {same} \
-                     ) as s \
-                 ) as a \
-             ), \
+             {r}, \
              up as ( \
                  update {hidden} u set {sets}, __basis = snap.__snap, __stamp = snap.__seg \
                  from r, snap where u.ctid = r.__hc \
@@ -1058,17 +1110,6 @@ impl GroupTargetPlan {
              ), \
              {tail}",
             recomputed = self.recomputed,
-            lookup_hidden = self.group_lookup(
-                &self.hidden_ident,
-                "rg",
-                &format!("x.ctid, {}", old.join(", "))
-            ),
-            old_names = old_names.join(", "),
-            fresh = fresh.join(", "),
-            src = self.source_row,
-            equal = equal.join(" and "),
-            has_null = has_null.join(" or "),
-            same = same.join(" and "),
             hidden = self.hidden_ident,
             sets = sets.join(", "),
             up_groups = up_groups.join(", "),
@@ -1327,9 +1368,20 @@ pub(crate) async fn recompute_locked_groups(
     plan: &GroupTargetPlan,
     mutations: &mut TargetMutations,
 ) -> Result<(usize, usize), ApplyError> {
+    recompute_locked_groups_from(txn, plan, None, mutations).await
+}
+
+/// [`recompute_locked_groups`], reading the groups' rows from `node` when
+/// it is given ([`GroupTargetPlan::recompute_sql`]).
+async fn recompute_locked_groups_from(
+    txn: &Transaction<'_>,
+    plan: &GroupTargetPlan,
+    node: Option<&str>,
+    mutations: &mut TargetMutations,
+) -> Result<(usize, usize), ApplyError> {
     let image_columns = mutations.image_columns(txn, &plan.target).await?;
     let rows = txn
-        .query(&plan.recompute_sql(image_columns.as_deref()), &[])
+        .query(&plan.recompute_sql(image_columns.as_deref(), node), &[])
         .await?;
     let (_, written, deleted) = written_groups(plan, rows, mutations);
     Ok((written, deleted))
@@ -1358,6 +1410,75 @@ pub(crate) async fn recompute_groups(
     recompute_locked_groups(txn, plan, mutations).await
 }
 
+/// [`recompute_groups`] over `groups` alone, reading their rows from `node`
+/// when it is given.
+async fn recompute_named_groups(
+    txn: &Transaction<'_>,
+    plan: &GroupTargetPlan,
+    groups: &[String],
+    node: Option<&str>,
+    mutations: &mut TargetMutations,
+) -> Result<(usize, usize), ApplyError> {
+    txn.batch_execute(&format!("{}; {}", plan.staged_ddl(), plan.recomputed_ddl()))
+        .await?;
+    name_groups(txn, plan, groups, &[]).await?;
+    txn.execute(&plan.lock_sql(), &[]).await?;
+    recompute_locked_groups_from(txn, plan, node, mutations).await
+}
+
+/// The plan of `definition`'s group-basis target, read in `txn`, if the
+/// group basis takes it.
+async fn plan_of(
+    txn: &Transaction<'_>,
+    catalog_schema: &str,
+    definition: &crate::defs::model::Definition,
+) -> Result<Option<GroupTargetPlan>, ApplyError> {
+    let Some(shape) = route(&definition.def, &definition.source_columns) else {
+        return Ok(None);
+    };
+    let source_pk = ddl::source_primary_key_in_txn(txn, &definition.source_table).await?;
+    let identity = ddl::identity_key_columns(txn, &definition.target_table).await?;
+    Ok(Some(GroupTargetPlan::new(
+        catalog_schema,
+        definition.id,
+        &definition.target_table,
+        &definition.source_table,
+        source_pk,
+        identity,
+        shape,
+    )))
+}
+
+/// A partition correction's recompute on a group-basis target (#1103,
+/// `super::partition_correction`): every group of `groups` (objects of the
+/// group columns: the groups that route to the node, `super::partition_correction`
+/// enumerates them) locked in one sorted statement and recomputed in the
+/// next from a `GROUP BY` of its source rows, with the statement's snapshot
+/// as its basis, then the seam's rows for every visible row that changed. A
+/// change the node's operation removed that is still in the ring has a
+/// transaction the basis sees, so it is refused when its page applies.
+/// The rows are read through the root, one index probe per group, or, when
+/// `node` (quoted and qualified) is given, by one `GROUP BY` of that
+/// partition ([`GroupTargetPlan::recompute_sql`]'s condition is the
+/// caller's). Returns whether the definition is on the group basis and,
+/// when it is, the visible rows written and deleted.
+pub(crate) async fn recompute_routed(
+    txn: &Transaction<'_>,
+    catalog_schema: &str,
+    definition: &crate::defs::model::Definition,
+    groups: &[String],
+    node: Option<&str>,
+) -> Result<Option<(usize, usize)>, ApplyError> {
+    let Some(plan) = plan_of(txn, catalog_schema, definition).await? else {
+        return Ok(None);
+    };
+    let mut mutations = TargetMutations::new();
+    let counts = recompute_named_groups(txn, &plan, groups, node, &mut mutations).await?;
+    let propagation = mutations.into_staged(txn).await?;
+    super::append::append(txn, &propagation.changes).await?;
+    Ok(Some(counts))
+}
+
 /// A release's work on `definition` ([`super::quarantine::release_key`]),
 /// when the group basis takes it: [`recompute_groups`] over the held row's
 /// `agg_groups` and `key`'s current row, then the seam's rows for every
@@ -1370,20 +1491,9 @@ pub(crate) async fn release(
     groups: &[String],
     key: &str,
 ) -> Result<bool, ApplyError> {
-    let Some(shape) = route(&definition.def, &definition.source_columns) else {
+    let Some(plan) = plan_of(txn, catalog_schema, definition).await? else {
         return Ok(false);
     };
-    let source_pk = ddl::source_primary_key_in_txn(txn, &definition.source_table).await?;
-    let identity = ddl::identity_key_columns(txn, &definition.target_table).await?;
-    let plan = GroupTargetPlan::new(
-        catalog_schema,
-        definition.id,
-        &definition.target_table,
-        &definition.source_table,
-        source_pk,
-        identity,
-        shape,
-    );
     let mut mutations = TargetMutations::new();
     recompute_groups(txn, &plan, groups, key, &mut mutations).await?;
     let propagation = mutations.into_staged(txn).await?;
