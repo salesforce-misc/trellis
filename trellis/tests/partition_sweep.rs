@@ -1514,17 +1514,14 @@ async fn a_hash_middle_dropped_under_a_queued_correction_converges() {
             fx.exec("drop table public.items_m3").await;
         }
         fx.d.settle().await;
-        let ran = partition_correction::run_pending(fx.d.pool(), &Options::default()).await;
-        if case == "new_leaf" {
-            // The leaf's recorded text embeds the dropped middle's oid: the
-            // engine can't evaluate it until the next pass records the tree
-            // without it.
-            assert!(ran.is_err(), "{case}");
-        } else {
-            ran.expect("run the pending corrections");
-            let plan = fx.d.build_plan("agg").await;
-            fx.d.merge_all(&plan).await;
-        }
+        // A new leaf's text embeds the dropped middle's oid; the leaf went
+        // with its middle, so its correction is complete without work
+        // (#1148), and the middle's `gone_node` corrects the region.
+        partition_correction::run_pending(fx.d.pool(), &Options::default())
+            .await
+            .expect("run the pending corrections");
+        let plan = fx.d.build_plan("agg").await;
+        fx.d.merge_all(&plan).await;
         let (_, queued) = converge(&mut fx, case, 4).await;
         assert!(
             queued
@@ -1612,19 +1609,15 @@ async fn a_detach_committed_during_the_text_fetch_converges() {
         fx.d.wait_blocked_behind(holder_pid).await;
         holder.batch_execute("commit").await.expect("commit");
         // The fetch takes the node's lock once the DDL commits and finds it
-        // no longer a partition: the pass fails for the source (`XX000`) and
-        // records nothing. Past the fetch's lock timeout it retries and reads
-        // no text; past its last retry it defers the check and records
-        // nothing (a slow runner can commit that late). Each way the next
+        // no longer a partition (`XX000`): it defers the check and records
+        // nothing (#1149). Past the fetch's lock timeout it retries and reads
+        // no text; past its last retry it defers too (a slow runner can
+        // commit that late). Each way the pass fails nothing, and the next
         // pass reads the tree afresh.
         let outcome = pass.finish().await;
         let recorded = fx.recorded_text("public.items_x").await;
-        let failed = outcome
-            .failed
-            .iter()
-            .any(|(_, e)| e.to_string().contains("could not"));
         assert!(
-            failed || (outcome.failed.is_empty() && matches!(recorded, Some(None) | None)),
+            outcome.failed.is_empty() && matches!(recorded, Some(None) | None),
             "{ddl}: {:?} {recorded:?}",
             outcome.failed
         );
