@@ -179,9 +179,15 @@ with the index to create
 
 ## Index an aggregate's group key when groups are large
 
-Some writes recompute an aggregate's groups from the source instead of
-adding a change to them: releasing a held key, its automatic retry, and a
-change that carries no row images. A recompute locks its groups, then runs
+This applies to an aggregate kept on the group basis
+([ADR-0002](decisions/0002-async-data-flow.md#aggregates-a-basis-per-group-kept-by-deltas)),
+which today runs only behind a development switch; by default an aggregate
+is kept on its per-row ledger, which never reads a group's rows from the
+source.
+
+On the group basis, some writes recompute an aggregate's groups from the
+source instead of adding a change to them: releasing a held key, its
+automatic retry, and a change that carries no row images. A recompute locks its groups, then runs
 a `GROUP BY` of their source rows, and holds the locks until it commits, so
 batches that touch those groups wait for it
 ([ADR-0002](decisions/0002-async-data-flow.md#absolute-group-writes-lock-first-and-cover-every-group-they-could-owe)).

@@ -885,6 +885,67 @@ async fn the_automatic_retry_recomputes_the_held_keys_groups() {
     assert_oracle(&mut d).await;
 }
 
+/// The release's recompute is an absolute write between other keys'
+/// changes to its group: one committed before it but still in the ring is
+/// counted by the recompute and refused by its basis when its page runs
+/// (before the page of the release's own `Recompute`, which would recompute
+/// the group again), and one still open during it is not counted and
+/// applies afterwards.
+#[tokio::test]
+async fn a_release_counts_each_concurrent_change_to_its_group_once() {
+    let mut d = start().await;
+    step(
+        &mut d,
+        "insert into public.src values (1, 1, 10), (2, 1, 20)",
+    )
+    .await;
+    hold(&d, "1").await;
+    step(&mut d, "update public.src set v = 11 where id = 1").await;
+    write(&d, "insert into public.src values (3, 1, 5)").await;
+    let pending = d.seal().await;
+    let open = d.user().await;
+    open.batch_execute("begin; update public.src set v = 25 where id = 2")
+        .await
+        .expect("an open change");
+    release(&d, "1").await;
+    assert_eq!(partials(&d, 1).await, ["(3,3,36,t)"]);
+    d.drain(pending, "a").await;
+    assert_eq!(
+        partials(&d, 1).await,
+        ["(3,3,36,t)"],
+        "the recompute counted the insert; its delta is refused"
+    );
+    open.batch_execute("commit").await.expect("commit");
+    assert_oracle(&mut d).await;
+}
+
+/// A held key leaves the `NULL` group: its held row names that group by a
+/// `NULL` part, and the release recomputes it by `IS NOT DISTINCT FROM`,
+/// keeping the group's other row.
+#[tokio::test]
+async fn a_release_recomputes_a_null_group() {
+    let mut d = start().await;
+    step(
+        &mut d,
+        "insert into public.src values (1, null, 10), (2, null, 20), (3, 2, 1)",
+    )
+    .await;
+    hold(&d, "1").await;
+    step(&mut d, "update public.src set g = 2 where id = 1").await;
+    assert_eq!(held_groups(&d, "1").await, ["(2)", "(null)"]);
+    release(&d, "1").await;
+    assert_eq!(
+        d.rows(&format!(
+            "select __n, __sum_1 from {} where g is null",
+            hidden(&d).await
+        ))
+        .await,
+        ["(1,20)"]
+    );
+    assert_eq!(d.rows(ACTUAL).await, d.rows(EXPECTED).await);
+    assert_oracle(&mut d).await;
+}
+
 /// The evicting change is parked with its groups: a constraint on the
 /// target refuses the change of key 1 that moves it into group 2, and the
 /// isolation evicts the key at a threshold of one. Its held row names both
