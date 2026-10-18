@@ -86,7 +86,7 @@ fn partial_columns(shape: &GroupShape) -> Vec<String> {
 
 /// A partial as the text both sides compare: counts as they are, a sum
 /// without trailing zeros.
-fn partial_text(column: &str, expr: &str) -> String {
+pub(super) fn partial_text(column: &str, expr: &str) -> String {
     if column.starts_with("__sum_") {
         format!("pg_catalog.trim_scale(({expr}))::text")
     } else {
@@ -234,7 +234,7 @@ fn page_sql(
     ))
 }
 
-type Side = BTreeMap<String, Vec<Option<String>>>;
+pub(super) type Side = BTreeMap<String, Vec<Option<String>>>;
 
 /// One page of the comparison of a group-basis target: [`page_sql`]'s rows,
 /// diffed.

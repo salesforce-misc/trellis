@@ -85,6 +85,7 @@ pub mod seal;
 pub mod self_check;
 mod self_check_groups;
 pub mod self_check_job;
+mod self_check_joins;
 pub mod session;
 pub mod state;
 pub(crate) mod target_mutations;

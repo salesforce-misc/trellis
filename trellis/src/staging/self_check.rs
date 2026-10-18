@@ -84,13 +84,16 @@
 //! a repair's own transaction moves the definition out of it, so a caller
 //! that polls for `live` and then checks is checking after the repair.
 //!
-//! # Scope: 1-1 targets and group-basis aggregates
+//! # Scope: 1-1 targets, group-basis aggregates and JOIN targets
 //!
 //! A 1-1 target is compared row by row against its source. An aggregate on
 //! the group basis ([`super::group_basis`], behind its dev knob) is
 //! compared a page of groups at a time by [`super::self_check_groups`]: each
 //! group's hidden partials against a `GROUP BY` of the source, and its
-//! visible row against the partials. It detects and never repairs
+//! visible row against the partials. A `JOIN` target (behind the same knob,
+//! [`super::join`]) is compared by [`super::self_check_joins`]: its visible
+//! rows and `T`'s partials against the definition's `JOIN … GROUP BY`, and
+//! `P`, `M` and `J` against their tables. Both detect and never repair
 //! (ADR-0013). Any other aggregate (a ledger one) and a relationship-enriched
 //! target are refused ([`SelfCheckError::UnsupportedKeySpace`] /
 //! [`SelfCheckError::UnsupportedExpr`]).
@@ -345,8 +348,10 @@ pub enum Divergence {
 pub enum SelfCheckError {
     /// No transform is registered under this target table name.
     TargetNotFound(String),
-    /// `self_check` only audits a [`KeySpace::OneToOne`] target this issue
-    /// — see the module doc comment's "Scope" section.
+    /// The target is neither 1-1, an aggregate on the group basis nor a
+    /// `JOIN` that applies (a ledger aggregate, or a `JOIN` with the
+    /// group-basis knob off) — see the module doc comment's "Scope"
+    /// section.
     UnsupportedKeySpace {
         target: String,
     },
@@ -407,8 +412,8 @@ impl fmt::Display for SelfCheckError {
             }
             SelfCheckError::UnsupportedKeySpace { target } => write!(
                 f,
-                "self_check audits a 1-1 target or an aggregate on the group basis; \
-                 \"{target}\" is an aggregate target of another kind"
+                "self_check audits a 1-1 target, an aggregate on the group basis or a JOIN \
+                 on it; \"{target}\" is a target of another kind"
             ),
             SelfCheckError::UnsupportedExpr { target, detail } => {
                 write!(f, "self_check can't audit \"{target}\": {detail}")
@@ -567,8 +572,8 @@ impl CheckPageExt for crate::Trellis {
 }
 
 /// The definition registered under `target_table`, if it is one `self_check`
-/// can compare: a 1-1 target, whose fields render ([`render_leaf`]). Refused
-/// with what is wrong otherwise.
+/// can compare: a 1-1 target, an aggregate on the group basis or a `JOIN`
+/// that applies. Refused with what is wrong otherwise.
 pub(crate) async fn comparable_definition(
     pool: &Pool,
     target_table: &str,
@@ -577,7 +582,10 @@ pub(crate) async fn comparable_definition(
         .await?
         .ok_or_else(|| SelfCheckError::TargetNotFound(target_table.to_string()))?;
 
-    if !matches!(def.def.key_space, KeySpace::OneToOne) && group_shape(&def).is_none() {
+    if !matches!(def.def.key_space, KeySpace::OneToOne)
+        && group_shape(&def).is_none()
+        && !joined(&def)
+    {
         return Err(SelfCheckError::UnsupportedKeySpace {
             target: target_table.to_string(),
         });
@@ -592,12 +600,21 @@ fn group_shape(def: &Definition) -> Option<super::group_basis::GroupShape> {
     super::group_basis::route(&def.def, &def.source_columns)
 }
 
+/// Whether `def` is a `JOIN` that applies (behind the group-basis knob,
+/// [`super::join::applies`]): audited by [`super::self_check_joins`].
+fn joined(def: &Definition) -> bool {
+    super::join::applies(&def.def)
+}
+
 /// Refuses a definition with a field [`render_leaf`] can't render (a
 /// relationship path), which the comparison would otherwise refuse only once
 /// it got that far.
 pub(crate) fn check_renders(def: &Definition) -> Result<(), SelfCheckError> {
     if let Some(shape) = group_shape(def) {
         return super::self_check_groups::check_renders(def, &shape);
+    }
+    if joined(def) {
+        return super::self_check_joins::check_renders(def);
     }
     for field in &def.def.fields {
         render_leaf(&field.expr).map_err(|detail| SelfCheckError::UnsupportedExpr {
@@ -691,10 +708,11 @@ pub(crate) async fn audit(
     // Issue #121: this audit now keys on the source's full (possibly
     // composite) primary key, through the shared key-contract text
     // (`ddl::pk_key_sql_expr`) rather than a single named column.
-    // An aggregate on the group basis is keyed by its `GROUP BY` columns
-    // (its target's identity), and compared by `super::self_check_groups`.
+    // An aggregate on the group basis or a `JOIN` is keyed by its `GROUP BY`
+    // columns (its target's identity), and compared by
+    // `super::self_check_groups` or `super::self_check_joins`.
     let group = group_shape(def);
-    let pk = if group.is_some() {
+    let pk = if group.is_some() || joined(def) {
         let client = pool.get().await?;
         ddl::identity_key_columns(&**client, &def.target_table).await?
     } else {
@@ -934,6 +952,10 @@ async fn compare_once(
             checked_through,
         )
         .await;
+    }
+    if joined(def) {
+        return super::self_check_joins::compare(pool, def, pk, scope, paused, checked_through)
+            .await;
     }
     // The recompute `SELECT` below carries no `WHERE` for the definition's
     // own partial-data predicate, which is sound only because `Predicate`
