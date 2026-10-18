@@ -1687,7 +1687,16 @@ mod tests {
         let name = |cols: &HashMap<String, ValueType>| {
             let def = crate::defs::parse(text).expect("parses");
             let shape = shape_of(&def, cols).expect("admitted");
-            GroupTargetPlan::new("trellis", 7, "public.t", "public.s", Vec::new(), shape).staged
+            GroupTargetPlan::new(
+                "trellis",
+                7,
+                "public.t",
+                "public.s",
+                Vec::new(),
+                Vec::new(),
+                shape,
+            )
+            .staged
         };
         let int4 = columns();
         let mut int8 = columns();
@@ -1702,6 +1711,7 @@ mod tests {
             i64::MIN,
             "public.t",
             "public.s",
+            Vec::new(),
             Vec::new(),
             shape,
         )
@@ -1724,8 +1734,15 @@ mod tests {
         let def =
             crate::defs::parse("TRANSFORM t FROM s GROUP BY g SELECT SUM(a) AS s").expect("parses");
         let shape = shape_of(&def, cols).expect("admitted");
-        let mut plan =
-            GroupTargetPlan::new(schema, 7, "public.t", "public.s", Vec::new(), shape.clone());
+        let mut plan = GroupTargetPlan::new(
+            schema,
+            7,
+            "public.t",
+            "public.s",
+            Vec::new(),
+            Vec::new(),
+            shape.clone(),
+        );
         plan.sides = vec![format!(
             r#"{{"op":"insert","t":"100","l":"0/10","n":{{"id":1,"g":{g},"a":5}}}}"#
         )];
