@@ -841,6 +841,15 @@ pub(crate) async fn begin(
         mark_checked(instance, table);
         return Ok(Begin::Held { deep: true });
     }
+    // Test-only pause point (#1129): after the tree read, before the text
+    // fetch. See `staging::interleave`.
+    #[cfg(any(test, feature = "test-util"))]
+    crate::staging::interleave::pause_between_transactions(
+        &*client,
+        crate::staging::interleave::PausePoint::BeforeConstraintFetch,
+        table,
+    )
+    .await?;
     let Some(fetched) = fetch_constraints(client, &plan.fetch).await? else {
         return Ok(deferred());
     };

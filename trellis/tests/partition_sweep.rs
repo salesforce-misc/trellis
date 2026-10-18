@@ -838,3 +838,797 @@ async fn a_complement_whose_hash_middle_is_dropped_completes_and_converges() {
     assert_eq!(fx.wrong_groups().await, Vec::<String>::new());
     assert!(fx.queue().await.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// #1129: real ways to reach a recorded node that is gone with an unusable
+// text, and the shapes that could let an unchanged leaf absorb its region.
+// Each drives real DDL against the real pass, freezing it between the tree
+// read and the text fetch where the window needs widening.
+// ---------------------------------------------------------------------------
+
+impl Fx {
+    /// A pass run in its own task, frozen at `point` for the source.
+    async fn frozen_pass(&self, point: PausePoint) -> drain_driver::Running<PassOutcome> {
+        let dsn = self.d.db.dsn().to_string();
+        self.d
+            .run_frozen(&[(point, SOURCE)], move |pool| async move {
+                let mut client = drain_driver::connect(&dsn).await;
+                let desired = trellis::defs::tables_to_capture(&pool)
+                    .await
+                    .expect("tables to capture");
+                Ok(trellis::capture::reconcile::reconcile(
+                    &mut client,
+                    DEFAULT_SCHEMA,
+                    &desired,
+                    Instant::now() + Duration::from_secs(5),
+                )
+                .await
+                .expect("pass"))
+            })
+            .await
+    }
+
+    /// The recorded node `name`: `None` when it isn't recorded, else its
+    /// recorded text.
+    async fn recorded_text(&self, name: &str) -> Option<Option<String>> {
+        partitions::recorded(&self.d.ctl, SOURCE)
+            .await
+            .expect("recorded")
+            .and_then(|r| r.nodes.into_iter().find(|n| n.name == name))
+            .map(|n| n.constraint)
+    }
+
+    /// Runs `ddl` while a pass is frozen between its tree read and its text
+    /// fetch, then lets the pass finish.
+    async fn pass_around_the_fetch(&mut self, ddl: &str) -> PassOutcome {
+        let mut pass = self.frozen_pass(PausePoint::BeforeConstraintFetch).await;
+        pass.reached(PausePoint::BeforeConstraintFetch).await;
+        self.exec(ddl).await;
+        self.d
+            .release(&mut pass, PausePoint::BeforeConstraintFetch)
+            .await;
+        let outcome = pass.finish().await;
+        assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+        outcome
+    }
+}
+
+/// Passes, each followed by the engine, until the target matches the oracle
+/// and nothing is queued, with no full routing form. Returns how many passes
+/// it took and every correction queued meanwhile (`kind node cause`), which
+/// says which of the three states the region ended in.
+async fn converge(fx: &mut Fx, what: &str, max: usize) -> (usize, Vec<String>) {
+    let mut queued: Vec<String> = Vec::new();
+    for n in 1..=max {
+        fx.pass().await;
+        for c in fx.queue().await {
+            let line = format!("{} {} {}", c.kind, c.node_name, c.cause);
+            if !queued.contains(&line) {
+                queued.push(line);
+            }
+        }
+        fx.correct().await;
+        if fx.wrong_groups().await.is_empty() && fx.queue().await.is_empty() {
+            eprintln!("CONVERGED {what}: passes={n} queued={queued:?}");
+            return (n, queued);
+        }
+    }
+    panic!(
+        "{what}: not converged after {max} passes: {:?}, queued {queued:?}",
+        fx.wrong_groups().await
+    );
+}
+
+/// Rows through the parent for the groups 12-15, which the leaf for them
+/// takes.
+const WRITE_THROUGH_X: &str = "insert into public.items select 7000 + i, 12 + i % 4, 2 \
+     from generate_series(1, 8) i";
+
+/// The region of a leaf for the groups 12-15 after it is gone, by what took
+/// it: nothing, the `DEFAULT`, a new leaf of the same bound, or two new
+/// leaves that split it.
+const REPLACEMENTS: [(&str, &str); 4] = [
+    ("uncovered", ""),
+    (
+        "default",
+        "create table public.items_d partition of public.items default;",
+    ),
+    (
+        "new leaf",
+        "create table public.items_again partition of public.items for values from (12) to (16);",
+    ),
+    (
+        "split",
+        "create table public.items_s1 partition of public.items for values from (12) to (14); \
+         create table public.items_s2 partition of public.items for values from (14) to (16);",
+    ),
+];
+
+/// A leaf attached with rows of its own and written through the parent, read
+/// by a pass, detached before the pass fetches its text, then dropped: a
+/// recorded node gone with no usable text. The drop and what takes the
+/// region come either in the same window, so the pass's own sweep sees the
+/// region taken, or before the next pass, with or without the engine
+/// running between.
+#[tokio::test]
+async fn a_leaf_detached_between_the_tree_read_and_the_text_fetch_converges() {
+    for timing in ["in the window", "before the next pass", "engine between"] {
+        for (state, replacement) in REPLACEMENTS {
+            let what = format!("{state}, {timing}");
+            let (ddl, missing) = tree("range");
+            let mut fx = Fx::start(&ddl, ValueType::Numeric).await;
+            fx.exec(&format!(
+                "create table public.items_x (like public.items including all); \
+                 insert into public.items_x select 9000 + i, 12 + i % 4, 1 \
+                     from generate_series(1, 8) i; \
+                 alter table public.items attach partition public.items_x {missing};"
+            ))
+            .await;
+            fx.exec(WRITE_THROUGH_X).await;
+            fx.d.settle().await;
+            let gone = format!("drop table public.items_x; {replacement}");
+            let window = if timing == "in the window" {
+                format!("alter table public.items detach partition public.items_x; {gone}")
+            } else {
+                "alter table public.items detach partition public.items_x".to_string()
+            };
+            fx.pass_around_the_fetch(&window).await;
+            assert_eq!(
+                fx.recorded_text("public.items_x").await,
+                Some(None),
+                "{what}: recorded without a usable text"
+            );
+            if timing == "engine between" {
+                fx.correct().await;
+            }
+            if timing != "in the window" {
+                fx.exec(&gone).await;
+            }
+            if state != "uncovered" {
+                // Rows the new owner of the region takes, applied normally.
+                fx.exec(
+                    "insert into public.items select 8000 + i, 12 + i % 4, 5 \
+                     from generate_series(1, 8) i",
+                )
+                .await;
+                fx.d.settle().await;
+            }
+            if timing != "engine between" {
+                assert!(
+                    !fx.wrong_groups().await.is_empty(),
+                    "{what}: rows to correct"
+                );
+            }
+            let (_, queued) = converge(&mut fx, &what, 4).await;
+            assert!(
+                queued
+                    .iter()
+                    .any(|q| q.starts_with("gone_node public.items_x")),
+                "{what}: {queued:?}"
+            );
+        }
+    }
+}
+
+/// Attaches `public.items_x` for the groups 12-15 with rows of its own and
+/// writes the region through the parent, applied, so the next pass reads the
+/// leaf as created and fetches its text.
+async fn attach_x(fx: &mut Fx, missing: &str) {
+    fx.exec(&format!(
+        "create table public.items_x (like public.items including all); \
+         insert into public.items_x select 9000 + i, 12 + i % 4, 1 \
+             from generate_series(1, 8) i; \
+         alter table public.items attach partition public.items_x {missing};"
+    ))
+    .await;
+    fx.exec(WRITE_THROUGH_X).await;
+    fx.d.settle().await;
+}
+
+/// A `DETACH ... CONCURRENTLY` of `public.items_x` held in its second
+/// transaction by an open reader of the parent. `cancel` cancels it there,
+/// which leaves the detach pending (`inhdetachpending`); otherwise
+/// [`Self::finish`] lets it complete.
+struct ConcurrentDetach {
+    holder: tokio_postgres::Client,
+    task: tokio::task::JoinHandle<Result<(), tokio_postgres::Error>>,
+    pid: i32,
+}
+
+impl ConcurrentDetach {
+    async fn start(fx: &Fx) -> ConcurrentDetach {
+        let dsn = fx.d.db.dsn().to_string();
+        let holder = drain_driver::connect(&dsn).await;
+        holder
+            .batch_execute("begin; select count(*) from public.items")
+            .await
+            .expect("hold the parent");
+        let holder_pid: i32 = holder
+            .query_one("select pg_backend_pid()", &[])
+            .await
+            .expect("pid")
+            .get(0);
+        let detacher = drain_driver::connect(&dsn).await;
+        let pid: i32 = detacher
+            .query_one("select pg_backend_pid()", &[])
+            .await
+            .expect("pid")
+            .get(0);
+        let task = tokio::spawn(async move {
+            detacher
+                .batch_execute(
+                    "alter table public.items detach partition public.items_x concurrently",
+                )
+                .await
+        });
+        fx.d.wait_blocked_behind(holder_pid).await;
+        assert!(fx.detach_pending().await, "the first transaction committed");
+        ConcurrentDetach { holder, task, pid }
+    }
+
+    /// Cancels the detach in its wait, leaving it pending.
+    async fn cancel(self, fx: &Fx) {
+        fx.exec(&format!("select pg_cancel_backend({})", self.pid))
+            .await;
+        let result = self.task.await.expect("task");
+        assert!(result.is_err(), "the detach was cancelled");
+        self.holder
+            .batch_execute("rollback")
+            .await
+            .expect("rollback");
+        assert!(fx.detach_pending().await, "left pending");
+    }
+
+    /// Lets the detach complete.
+    async fn finish(self) {
+        self.holder
+            .batch_execute("rollback")
+            .await
+            .expect("rollback");
+        self.task
+            .await
+            .expect("task")
+            .expect("the detach completes");
+    }
+}
+
+impl Fx {
+    async fn detach_pending(&self) -> bool {
+        self.d
+            .ctl
+            .query_one(
+                "select coalesce((select inhdetachpending from pg_inherits \
+                                  where inhrelid = 'public.items_x'::regclass), false)",
+                &[],
+            )
+            .await
+            .expect("inhdetachpending")
+            .get(0)
+    }
+}
+
+/// `DETACH ... CONCURRENTLY` around the text fetch: started (its first
+/// transaction committed) between the tree read and the fetch and then left
+/// pending; left pending and finalized in that window; or completing after
+/// the fetch. A pending node's text is still fetched; a finalized one reads
+/// none. Each converges once the detach is final, which a `gone_node`
+/// correction waits for.
+#[tokio::test]
+async fn a_concurrent_detach_around_the_text_fetch_converges() {
+    for case in [
+        "left pending",
+        "finalized in the window",
+        "completes after the fetch",
+    ] {
+        let (ddl, missing) = tree("range");
+        let mut fx = Fx::start(&ddl, ValueType::Numeric).await;
+        attach_x(&mut fx, missing).await;
+        let mut pass = fx.frozen_pass(PausePoint::BeforeConstraintFetch).await;
+        pass.reached(PausePoint::BeforeConstraintFetch).await;
+        let detach = ConcurrentDetach::start(&fx).await;
+        let running = match case {
+            "left pending" => {
+                detach.cancel(&fx).await;
+                None
+            }
+            "finalized in the window" => {
+                detach.cancel(&fx).await;
+                fx.exec("alter table public.items detach partition public.items_x finalize")
+                    .await;
+                None
+            }
+            _ => Some(detach),
+        };
+        fx.d.release(&mut pass, PausePoint::BeforeConstraintFetch)
+            .await;
+        let outcome = pass.finish().await;
+        assert!(outcome.failed.is_empty(), "{case}: {:?}", outcome.failed);
+        // A detach-pending leaf still has its text; a finalized one has none.
+        let text = fx.recorded_text("public.items_x").await;
+        assert_eq!(
+            text.as_ref().map(Option::is_some),
+            Some(case != "finalized in the window"),
+            "{case}: {text:?}"
+        );
+        if let Some(detach) = running {
+            detach.finish().await;
+        }
+        if case == "left pending" {
+            // The next pass reads the pending detach as gone; its correction
+            // waits for the detach to be final.
+            fx.pass().await;
+            assert!(
+                fx.queue()
+                    .await
+                    .iter()
+                    .any(|c| c.kind == "gone_node" && c.node_name == "public.items_x"),
+                "{case}"
+            );
+            fx.correct().await;
+            assert!(!fx.queue().await.is_empty(), "{case}: waits while pending");
+            // A read of the parent still sees the detach-pending leaf's rows,
+            // so nothing is wrong while the correction waits.
+            assert_eq!(fx.wrong_groups().await, Vec::<String>::new(), "{case}");
+            fx.exec("alter table public.items detach partition public.items_x finalize")
+                .await;
+        }
+        fx.exec("drop table public.items_x").await;
+        let (_, queued) = converge(&mut fx, case, 4).await;
+        assert!(
+            queued
+                .iter()
+                .any(|q| q.starts_with("gone_node public.items_x")),
+            "{case}: {queued:?}"
+        );
+    }
+}
+
+/// One window case: `tree` with an aggregate kept live; `attach` (a node the
+/// next pass reads as new, with rows `write` puts through the parent,
+/// applied); a pass that runs `window` between its tree read and its text
+/// fetch, after which `node` is recorded without a usable text; `after`
+/// before the next pass, then rows `owner_write` puts through the parent
+/// into whatever owns the region now, applied. Returns the passes to
+/// converge and the corrections queued.
+struct Window<'a> {
+    what: &'a str,
+    tree: &'a str,
+    attach: &'a str,
+    write: &'a str,
+    node: &'a str,
+    window: &'a str,
+    after: &'a str,
+    owner_write: &'a str,
+}
+
+impl Window<'_> {
+    async fn run(&self) -> (usize, Vec<String>) {
+        let mut fx = Fx::start(self.tree, ValueType::Numeric).await;
+        fx.exec(self.attach).await;
+        fx.exec(self.write).await;
+        fx.d.settle().await;
+        fx.pass_around_the_fetch(self.window).await;
+        assert_eq!(
+            fx.recorded_text(self.node).await,
+            Some(None),
+            "{}: recorded without a usable text",
+            self.what
+        );
+        fx.exec(self.after).await;
+        fx.exec(self.owner_write).await;
+        fx.d.settle().await;
+        assert!(
+            !fx.wrong_groups().await.is_empty(),
+            "{}: rows to correct",
+            self.what
+        );
+        let (passes, queued) = converge(&mut fx, self.what, 4).await;
+        assert!(
+            queued
+                .iter()
+                .any(|q| q.starts_with(&format!("gone_node {}", self.node))),
+            "{}: {queued:?}",
+            self.what
+        );
+        (passes, queued)
+    }
+}
+
+/// Mixed `HASH` moduli: a `(4, 3)` leaf beside `(2, 0)` and `(4, 1)`, read
+/// and detached in the window and dropped; its remainder is left uncovered,
+/// taken by a new `(4, 3)`, or split into `(8, 3)` and `(8, 7)`. Postgres
+/// refuses a bound that overlaps, so neither unchanged leaf can take it.
+#[tokio::test]
+async fn mixed_hash_moduli_around_a_node_without_a_usable_text_converge() {
+    let tree = "create table public.items (id integer not null, g integer not null, \
+             v integer not null, primary key (g, id)) partition by hash (g); \
+         create table public.items_a partition of public.items \
+             for values with (modulus 2, remainder 0); \
+         create table public.items_b partition of public.items \
+             for values with (modulus 4, remainder 1); \
+         insert into public.items select i, i % 32, i from generate_series(1, 320) i \
+             where not satisfies_hash_partition('public.items'::regclass, 4, 3, i % 32);";
+    let into_x = "insert into public.items select 7000 + i, i % 32, 2 from generate_series(1, 320) i \
+             where satisfies_hash_partition('public.items'::regclass, 4, 3, i % 32)";
+    let into_owner = "insert into public.items select 8000 + i, i % 32, 5 from generate_series(1, 320) i \
+             where satisfies_hash_partition('public.items'::regclass, 4, 3, i % 32)";
+    for (state, after, owner_write) in [
+        ("uncovered", "", ""),
+        (
+            "new leaf",
+            "create table public.items_again partition of public.items \
+                 for values with (modulus 4, remainder 3);",
+            into_owner,
+        ),
+        (
+            "split",
+            "create table public.items_s1 partition of public.items \
+                 for values with (modulus 8, remainder 3); \
+             create table public.items_s2 partition of public.items \
+                 for values with (modulus 8, remainder 7);",
+            into_owner,
+        ),
+    ] {
+        Window {
+            what: &format!("hash {state}"),
+            tree,
+            attach: "create table public.items_x partition of public.items \
+                         for values with (modulus 4, remainder 3);",
+            write: into_x,
+            node: "public.items_x",
+            window: "alter table public.items detach partition public.items_x; \
+                     drop table public.items_x;",
+            after,
+            owner_write,
+        }
+        .run()
+        .await;
+    }
+}
+
+/// A `DEFAULT` that is itself partitioned takes the region of a leaf read
+/// and detached in the window: its children cover all of it, or only part,
+/// leaving the rest in the `DEFAULT`'s own gap.
+#[tokio::test]
+async fn a_partitioned_default_taking_a_node_without_a_usable_text_converges() {
+    let (base, missing) = tree("range");
+    for (state, children) in [
+        (
+            "partitioned default",
+            "create table public.items_d1 partition of public.items_d for values in (12, 13); \
+             create table public.items_d2 partition of public.items_d for values in (14, 15, 16);",
+        ),
+        (
+            "partitioned default, part in its gap",
+            "create table public.items_d1 partition of public.items_d for values in (12, 13);",
+        ),
+    ] {
+        Window {
+            what: state,
+            tree: &format!(
+                "{base} create table public.items_d partition of public.items default \
+                     partition by list (g); {children}"
+            ),
+            attach: &format!("create table public.items_x partition of public.items {missing};"),
+            write: WRITE_THROUGH_X,
+            node: "public.items_x",
+            window: "alter table public.items detach partition public.items_x; \
+                     drop table public.items_x;",
+            after: "",
+            owner_write: "insert into public.items select 8000 + i, 12 + i % 2, 5 \
+                          from generate_series(1, 8) i",
+        }
+        .run()
+        .await;
+    }
+}
+
+/// A two-level tree with a `DEFAULT` under the middle, or under the root
+/// beside a middle without one: a leaf under the middle, read and detached
+/// in the window, dropped. Its region goes to the middle's `DEFAULT`, or is
+/// left in the middle's own gap, which the root's `DEFAULT` doesn't take.
+#[tokio::test]
+async fn a_default_on_a_two_level_tree_around_a_node_without_a_usable_text_converges() {
+    let head = "create table public.items (id integer not null, g integer not null, \
+             v integer not null, primary key (g, id)) partition by range (g); \
+         create table public.items_lo partition of public.items for values from (0) to (4); \
+         create table public.items_m partition of public.items for values from (4) to (16) \
+             partition by list (g); \
+         create table public.items_m1 partition of public.items_m for values in (4, 5, 6, 7); \
+         insert into public.items select i, i % 8, i from generate_series(1, 80) i;";
+    for (state, extra, owner_write) in [
+        (
+            "default middle",
+            "create table public.items_md partition of public.items_m default;",
+            "insert into public.items select 8000 + i, 12 + i % 4, 5 from generate_series(1, 8) i",
+        ),
+        (
+            "root default, middle gap",
+            "create table public.items_d partition of public.items default;",
+            "insert into public.items select 8000 + i, 20 + i % 4, 5 from generate_series(1, 8) i",
+        ),
+    ] {
+        Window {
+            what: state,
+            tree: &format!("{head} {extra}"),
+            attach: "create table public.items_x partition of public.items_m \
+                         for values in (12, 13, 14, 15);",
+            write: WRITE_THROUGH_X,
+            node: "public.items_x",
+            window: "alter table public.items_m detach partition public.items_x; \
+                     drop table public.items_x;",
+            after: "",
+            owner_write,
+        }
+        .run()
+        .await;
+    }
+}
+
+/// A leaf read and detached in the window, then, before the next pass,
+/// changed while detached and attached again under the same bound in one
+/// transaction; or attached again under the same bound in the window itself.
+#[tokio::test]
+async fn a_node_without_a_usable_text_attached_again_under_its_bound_converges() {
+    let (base, missing) = tree("range");
+    let reattach = format!(
+        "begin; \
+         delete from public.items_x where id % 2 = 0; \
+         insert into public.items_x select 9500 + i, 12 + i % 4, 3 from generate_series(1, 8) i; \
+         alter table public.items attach partition public.items_x {missing}; \
+         commit;"
+    );
+    for (state, window, after) in [
+        (
+            "re-attached before the next pass",
+            "alter table public.items detach partition public.items_x".to_string(),
+            reattach.clone(),
+        ),
+        (
+            "re-attached in the window",
+            format!("alter table public.items detach partition public.items_x; {reattach}"),
+            String::new(),
+        ),
+    ] {
+        let mut fx = Fx::start(&base, ValueType::Numeric).await;
+        attach_x(&mut fx, missing).await;
+        fx.pass_around_the_fetch(&window).await;
+        // Attached again before the fetch, the leaf has its text again.
+        let text = fx.recorded_text("public.items_x").await;
+        assert_eq!(
+            text.as_ref().map(Option::is_some),
+            Some(state == "re-attached in the window"),
+            "{state}: {text:?}"
+        );
+        fx.exec(&after).await;
+        let (_, queued) = converge(&mut fx, state, 4).await;
+        assert!(
+            queued
+                .iter()
+                .any(|q| q.starts_with("new_leaf public.items_x")),
+            "{state}: {queued:?}"
+        );
+    }
+}
+
+/// A recorded leaf detached, changed and attached again under the same bound
+/// in one transaction between two passes: its `pg_inherits.xmin` moved, so
+/// it reads as re-attached.
+#[tokio::test]
+async fn a_leaf_detached_and_attached_again_in_one_transaction_converges() {
+    let (ddl, _) = tree("list");
+    let mut fx = Fx::start(&ddl, ValueType::Numeric).await;
+    fx.exec(
+        "begin; \
+         alter table public.items detach partition public.items_p1; \
+         delete from public.items_p1 where id % 3 = 0; \
+         insert into public.items_p1 select 9000 + i, 4 + i % 4, 1 from generate_series(1, 8) i; \
+         alter table public.items attach partition public.items_p1 for values in (4, 5, 6, 7); \
+         commit;",
+    )
+    .await;
+    let (_, queued) = converge(&mut fx, "detach and attach in one transaction", 4).await;
+    assert_eq!(queued, ["new_leaf public.items_p1 reattached"]);
+}
+
+/// Several operations in one pass interval around a node without a usable
+/// text: in the window, the new leaf is detached and dropped, a recorded
+/// leaf is dropped, a leaf is created over half of the first one's range
+/// and a `DEFAULT` takes the rest; before the next pass, rows go through the
+/// parent and the half leaf is dropped too.
+#[tokio::test]
+async fn several_operations_around_a_node_without_a_usable_text_converge() {
+    let (base, missing) = tree("range");
+    Window {
+        what: "several operations",
+        tree: &base,
+        attach: &format!("create table public.items_x partition of public.items {missing};"),
+        write: WRITE_THROUGH_X,
+        node: "public.items_x",
+        window: "alter table public.items detach partition public.items_x; \
+                 drop table public.items_x; \
+                 drop table public.items_p1; \
+                 create table public.items_h partition of public.items for values from (12) to (14); \
+                 create table public.items_d partition of public.items default;",
+        after: "insert into public.items select 8000 + i, 4 + i % 12, 5 from generate_series(1, 24) i; \
+                drop table public.items_h;",
+        owner_write: "",
+    }
+    .run()
+    .await;
+}
+
+/// A `HASH` middle dropped while a correction naming one of its leaves is
+/// queued and not yet run: a dropped leaf's `gone_node`, a new leaf's
+/// `new_leaf` (whose text embeds the middle's oid), or a leaf read and
+/// detached in the window (no usable text).
+#[tokio::test]
+async fn a_hash_middle_dropped_under_a_queued_correction_converges() {
+    let tree = "create table public.items (id integer not null, g integer not null, \
+             v integer not null, primary key (g, id)) partition by range (g); \
+         create table public.items_lo partition of public.items for values from (0) to (4); \
+         create table public.items_m partition of public.items for values from (4) to (20) \
+             partition by hash (g); \
+         create table public.items_m0 partition of public.items_m \
+             for values with (modulus 4, remainder 0); \
+         create table public.items_m1 partition of public.items_m \
+             for values with (modulus 4, remainder 1); \
+         create table public.items_m2 partition of public.items_m \
+             for values with (modulus 4, remainder 2); \
+         insert into public.items select i, i % 20, i from generate_series(1, 200) i \
+             where i % 20 < 4 \
+                or not satisfies_hash_partition('public.items_m'::regclass, 4, 3, i % 20);";
+    let into_m3 = "insert into public.items select 5000 + i, i % 20, 7 from generate_series(1, 200) i \
+             where i % 20 >= 4 \
+               and satisfies_hash_partition('public.items_m'::regclass, 4, 3, i % 20);";
+    let new_m3 = "create table public.items_m3 partition of public.items_m \
+             for values with (modulus 4, remainder 3);";
+    for case in ["gone_node", "new_leaf", "no usable text"] {
+        let mut fx = Fx::start(tree, ValueType::Numeric).await;
+        fx.exec(new_m3).await;
+        fx.exec(into_m3).await;
+        fx.d.settle().await;
+        match case {
+            "gone_node" => {
+                fx.pass().await;
+                fx.correct().await;
+                fx.exec("drop table public.items_m1").await;
+                fx.pass().await;
+                assert_eq!(kinds(&fx.queue().await), ["gone_node"], "{case}");
+            }
+            "new_leaf" => {
+                fx.pass().await;
+                assert_eq!(kinds(&fx.queue().await), ["new_leaf"], "{case}");
+            }
+            _ => {
+                fx.pass_around_the_fetch(
+                    "alter table public.items_m detach partition public.items_m3",
+                )
+                .await;
+                assert_eq!(fx.recorded_text("public.items_m3").await, Some(None));
+            }
+        }
+        // The middle goes before the engine takes the queued correction.
+        fx.exec("drop table public.items_m").await;
+        if case == "no usable text" {
+            fx.exec("drop table public.items_m3").await;
+        }
+        fx.d.settle().await;
+        let ran = partition_correction::run_pending(fx.d.pool(), &Options::default()).await;
+        if case == "new_leaf" {
+            // The leaf's recorded text embeds the dropped middle's oid: the
+            // engine can't evaluate it until the next pass records the tree
+            // without it.
+            assert!(ran.is_err(), "{case}");
+        } else {
+            ran.expect("run the pending corrections");
+            let plan = fx.d.build_plan("agg").await;
+            fx.d.merge_all(&plan).await;
+        }
+        let (_, queued) = converge(&mut fx, case, 4).await;
+        assert!(
+            queued
+                .iter()
+                .any(|q| q.starts_with("gone_node public.items_m ")),
+            "{case}: {queued:?}"
+        );
+    }
+}
+
+/// A middle dropped and created again under the same name between two
+/// passes, with new rows; and a middle read in the window, detached there,
+/// dropped and created again under the same name.
+#[tokio::test]
+async fn a_middle_dropped_and_created_again_under_its_name_converges() {
+    let head = "create table public.items (id integer not null, g integer not null, \
+             v integer not null, primary key (g, id)) partition by range (g); \
+         create table public.items_lo partition of public.items for values from (0) to (4);";
+    let middle = "create table public.items_m partition of public.items for values from (4) to (12) \
+             partition by list (g); \
+         create table public.items_m1 partition of public.items_m for values in (4, 5, 6, 7); \
+         create table public.items_m2 partition of public.items_m for values in (8, 9, 10, 11);";
+    let rows = "insert into public.items select 100 + i, i % 12, i from generate_series(1, 120) i;";
+    let recreate = "create table public.items_m partition of public.items for values from (4) to (12) \
+             partition by list (g); \
+         create table public.items_m1 partition of public.items_m for values in (4, 5); \
+         insert into public.items select 6000 + i, 4 + i % 2, 9 from generate_series(1, 10) i;";
+
+    // Recorded with its text, dropped and created again between two passes.
+    let mut fx = Fx::start(&format!("{head} {middle} {rows}"), ValueType::Numeric).await;
+    fx.exec(&format!("drop table public.items_m; {recreate}"))
+        .await;
+    let (_, queued) = converge(&mut fx, "middle re-created", 4).await;
+    assert!(
+        queued
+            .iter()
+            .any(|q| q.starts_with("gone_node public.items_m ")),
+        "{queued:?}"
+    );
+
+    // Read in the window as a new middle, detached there: no usable text.
+    Window {
+        what: "middle without a usable text, re-created",
+        tree: &format!(
+            "{head} insert into public.items select i, i % 4, i from generate_series(1, 40) i;"
+        ),
+        attach: middle,
+        write: rows,
+        node: "public.items_m",
+        window: "alter table public.items detach partition public.items_m; \
+                 drop table public.items_m;",
+        after: recreate,
+        owner_write: "",
+    }
+    .run()
+    .await;
+}
+
+/// A plain `DETACH` committed while the pass's text fetch waits on its lock:
+/// the fetch's `pg_get_partition_constraintdef` finds the node no longer a
+/// partition once it has the lock.
+#[tokio::test]
+async fn a_detach_committed_during_the_text_fetch_converges() {
+    for ddl in [
+        "alter table public.items detach partition public.items_x",
+        "drop table public.items_x",
+    ] {
+        let (base, missing) = tree("range");
+        let mut fx = Fx::start(&base, ValueType::Numeric).await;
+        attach_x(&mut fx, missing).await;
+        let mut pass = fx.frozen_pass(PausePoint::BeforeConstraintFetch).await;
+        pass.reached(PausePoint::BeforeConstraintFetch).await;
+        let holder = drain_driver::connect(fx.d.db.dsn()).await;
+        holder
+            .batch_execute(&format!("begin; {ddl}"))
+            .await
+            .expect("hold the DDL");
+        let holder_pid: i32 = holder
+            .query_one("select pg_backend_pid()", &[])
+            .await
+            .expect("pid")
+            .get(0);
+        fx.d.release(&mut pass, PausePoint::BeforeConstraintFetch)
+            .await;
+        fx.d.wait_blocked_behind(holder_pid).await;
+        holder.batch_execute("commit").await.expect("commit");
+        // The fetch takes the node's lock once the DDL commits and finds it
+        // no longer a partition: the pass fails for the source (`XX000`) and
+        // records nothing; or, past the fetch's lock timeout, it retries and
+        // reads no text. Either way the next pass reads the tree afresh.
+        let outcome = pass.finish().await;
+        let recorded = fx.recorded_text("public.items_x").await;
+        assert!(
+            outcome
+                .failed
+                .iter()
+                .any(|(_, e)| e.to_string().contains("could not"))
+                || recorded == Some(None),
+            "{ddl}: {:?} {recorded:?}",
+            outcome.failed
+        );
+        if ddl.starts_with("alter") {
+            fx.exec("drop table public.items_x").await;
+        }
+        converge(&mut fx, ddl, 4).await;
+    }
+}

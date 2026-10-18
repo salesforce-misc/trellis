@@ -115,6 +115,11 @@
 //! catalog reads, before its search (#1066). A test runs the reconcile pass
 //! inside [`with_scope`].
 //!
+//! A partitioned source's deep check (`crate::capture::partitions`) fires
+//! [`PausePoint::BeforeConstraintFetch`] for the source after it reads and
+//! classifies the tree, before it fetches the constraint texts (#1129). A
+//! test runs the reconcile pass inside [`with_scope`].
+//!
 //! A later part that replaces a step moves its hook with it.
 //!
 //! # Stalls
@@ -253,6 +258,12 @@ pub enum PausePoint {
     /// transaction holds no lock, so a leaf can be created, written and
     /// drained here.
     AfterSweepCatalogRead,
+    /// After a deep check of a partitioned source has read and classified
+    /// the tree, before it fetches the new or changed nodes' constraint
+    /// texts, for the source's unquoted `schema.table`
+    /// (`capture::partitions`, #1129). The pass holds no transaction, so a
+    /// node it read can be detached or dropped here.
+    BeforeConstraintFetch,
 }
 
 /// What a frozen worker reports when it reaches its armed point.
@@ -408,6 +419,43 @@ pub(crate) async fn pause_at<C: GenericClient>(
         )
         .await?;
     Ok(())
+}
+
+/// [`pause_at`] for a point between transactions: it waits by polling the
+/// lock in short statements, so the waiting session holds no snapshot. A
+/// `DETACH ... CONCURRENTLY` or `FINALIZE` waits for every older snapshot,
+/// so a wait inside one statement would block the very DDL the window is
+/// for, which production's gap between two transactions does not.
+pub(crate) async fn pause_between_transactions<C: GenericClient>(
+    client: &C,
+    point: PausePoint,
+    target: &str,
+) -> Result<(), tokio_postgres::Error> {
+    let Some(arming) = SCOPE
+        .try_with(|scope| scope.take(point, target))
+        .ok()
+        .flatten()
+    else {
+        return Ok(());
+    };
+    let backend_pid: i32 = client
+        .query_one("select pg_backend_pid()", &[])
+        .await?
+        .get(0);
+    let _ = arming.reached.send(Reached { point, backend_pid });
+    loop {
+        let free: bool = client
+            .query_one(
+                "select pg_try_advisory_xact_lock_shared($1)",
+                &[&arming.lock_key],
+            )
+            .await?
+            .get(0);
+        if free {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 }
 
 /// The in-statement hook, for a point inside one statement

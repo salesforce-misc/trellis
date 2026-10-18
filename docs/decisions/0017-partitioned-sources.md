@@ -307,27 +307,41 @@ backfill it is.
 For `HASH` the sweep finds target groups over the missing remainders; for
 `RANGE` and `LIST`, over the gaps between the current bounds, read from
 `pg_get_expr(relpartbound)` and ordered by the key column's collation. A
-`DEFAULT` under the root means no statement. The full routing form runs, limited
-to the groups the fold changed since the last successful check, only on a pass
-where a recorded node is gone and its text is unusable. On an aggregate, the
-keys of the live ledger entries in the groups it finds are corrected through the
-normal page path, as a node's are; on a to-many target, those parents are
-recomputed. The sweep runs in its own `READ COMMITTED` transaction: the pass
-reads the lifecycle catalog before the constraint texts, re-reads it in a new
-statement after queuing the hits' correction, and rolls back and retries if the
-leaf set changed.
+`DEFAULT` under the root means no statement. On an aggregate, the keys of the
+live ledger entries in the groups it finds are corrected through the normal page
+path, as a node's are; on a to-many target, those parents are recomputed. The
+sweep runs in its own `READ COMMITTED` transaction: the pass reads the lifecycle
+catalog before the constraint texts, re-reads it in a new statement after
+queuing the hits' correction, and rolls back and retries if the leaf set
+changed.
+
+A recorded node can be gone without a usable text: a node detached or dropped
+between the pass's tree read and its text fetch is recorded with none, and its
+correction routes nothing by it. Nothing else is needed for its groups. The
+group key holds every partition-key column, so each target group routes to
+exactly one region of the current tree, and the gone node's region ends in one
+of three states, each corrected: **uncovered**, which the sweep finds; **taken
+by the `DEFAULT`**, whose changed sibling set queues its correction; or **taken
+by a new or re-attached leaf**, which has its own correction. No unchanged leaf
+can take the region: Postgres refuses overlapping bounds, and a bound changes
+only by a detach and an attach, which the pass reads as re-attached. The full
+routing form over the groups the fold changed would find a subset of what the
+sweep finds, so no pass runs it.
 
 The sweep catches a leaf created and dropped between two passes, which no
 fingerprint sees. Its full routing form cost 4.1–7.3 s per pass at 1,000 leaves
 and about 1M target rows, nearly the whole interval. The complement forms cost
 0 ms for `HASH` with nothing missing and 38 ms with two remainders missing,
-under 1 ms for `RANGE`, and 4–8 ms for `LIST`; reading the gaps took 1.9 ms. The
-changed-group fallback brought a never-recorded leaf's groups to zero diff, but
-only when the changed set survives a skipped check and the pass clears only the
-ids it read. Against the model target, without the re-read a leaf created
-between the catalog read and the cleanup lost its rows for a pass; under about
-20 DDL statements a second I counted 264–308 wrongful deletes a minute without
-it and none in about 2,000 passes with it. Reading the constraint texts before
+under 1 ms for `RANGE`, and 4–8 ms for `LIST`; reading the gaps took 1.9 ms.
+Against Postgres 16, 17 and 18, a leaf detached or dropped between the tree read
+and the text fetch, by a plain or a concurrent detach, reached zero diff one
+pass after the pass that recorded it, in each of the three states, beside mixed
+`HASH` moduli, a partitioned `DEFAULT`, a `DEFAULT` under a middle, a middle
+created again under its name, and several operations in one interval. Against
+the model target, without the re-read a leaf created between the catalog read
+and the cleanup lost its rows for a pass; under about 20 DDL statements a second
+I counted 264–308 wrongful deletes a minute without it and none in about 2,000
+passes with it. Reading the constraint texts before
 the lifecycle catalog lost rows even with the re-read, so the order is part of
 the decision.
 
