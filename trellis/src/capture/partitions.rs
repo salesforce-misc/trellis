@@ -1123,6 +1123,13 @@ async fn fetch_constraints(
                         return Ok(None);
                     }
                 }
+                // A DETACH or DROP that committed while the fetch waited
+                // on the node's lock makes `pg_get_partition_constraintdef`
+                // fail with XX000 (internal error). The tree has changed
+                // under the check, so leave it to the next pass.
+                Err(err) if err.code() == Some(&SqlState::INTERNAL_ERROR) => {
+                    return Ok(None);
+                }
                 Err(err) => return Err(err.into()),
             }
         }
@@ -1556,6 +1563,73 @@ mod tests {
         assert_eq!(
             classify_cluster(None, "a", &base(), &base()),
             ClusterChange::Unchanged
+        );
+    }
+
+    /// A `DROP` or `DETACH` that commits while the text fetch waits on the
+    /// node's lock makes `pg_get_partition_constraintdef` fail with `XX000`.
+    /// The fetch leaves the check for the next pass (`None`), as for a lock
+    /// that stays held, rather than failing the source (#1149).
+    #[tokio::test]
+    async fn a_drop_committed_during_the_text_fetch_defers_the_check() {
+        async fn connect(dsn: &str) -> Client {
+            let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+                .await
+                .expect("connect");
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            client
+        }
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_empty_database().await;
+        let mut fetcher = connect(db.dsn()).await;
+        let ddl = connect(db.dsn()).await;
+        ddl.batch_execute(
+            "create table public.items (a int) partition by range (a); \
+             create table public.i1 partition of public.items for values from (0) to (10)",
+        )
+        .await
+        .expect("tree");
+        let oid: u32 = ddl
+            .query_one("select 'public.i1'::regclass::oid", &[])
+            .await
+            .expect("oid")
+            .get(0);
+        // The drop is uncommitted, so the fetch blocks on the leaf's lock.
+        ddl.batch_execute("begin; drop table public.i1")
+            .await
+            .expect("drop");
+        let pid: i32 = fetcher
+            .query_one("select pg_backend_pid()", &[])
+            .await
+            .expect("pid")
+            .get(0);
+        let oids = [oid];
+        let fetched = fetch_constraints(&mut fetcher, &oids);
+        let commit = async {
+            // Waits until the fetch is blocked on the lock, then commits.
+            loop {
+                let waiting: bool = ddl
+                    .query_one(
+                        "select exists (select 1 from pg_stat_activity \
+                         where pid = $1 and wait_event_type = 'Lock')",
+                        &[&pid],
+                    )
+                    .await
+                    .expect("activity")
+                    .get(0);
+                if waiting {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            ddl.batch_execute("commit").await.expect("commit");
+        };
+        let (fetched, ()) = tokio::join!(fetched, commit);
+        assert!(
+            matches!(fetched, Ok(None)),
+            "the check is deferred, not failed: {fetched:?}"
         );
     }
 }

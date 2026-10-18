@@ -1058,6 +1058,70 @@ async fn a_gone_hash_leaf_whose_middle_was_dropped_after_it_is_covered_by_the_mi
     assert_eq!(wrong, 0);
 }
 
+/// A new `HASH` leaf's correction routes by the leaf's text, which embeds its
+/// middle's oid. A middle dropped before the correction has run makes that
+/// text raise `XX000`; the correction is complete without work instead
+/// (#1148), and the middle's own `gone_node`, queued by the next pass,
+/// corrects the region.
+#[tokio::test]
+async fn a_new_hash_leaf_whose_middle_was_dropped_completes_without_error() {
+    const GROUPED: &str = "TRANSFORM agg FROM public.items GROUP BY g, h \
+         SELECT SUM(v) AS total, COUNT(*) AS n";
+    let mut fx = Fx::start_with(
+        "create table public.items (id integer not null, g integer not null, \
+             h smallint not null, v integer not null, primary key (g, h, id)) \
+             partition by range (g); \
+         create table public.items_m0 partition of public.items for values from (0) to (8) \
+             partition by hash (h); \
+         create table public.items_m0a partition of public.items_m0 \
+             for values with (modulus 2, remainder 0); \
+         create table public.items_m0b partition of public.items_m0 \
+             for values with (modulus 2, remainder 1); \
+         create table public.items_m1 partition of public.items for values from (8) to (16); \
+         insert into public.items select i, i % 16, (i % 7)::smallint, i \
+             from generate_series(1, 320) i;",
+        &[GROUPED],
+    )
+    .await;
+    // The remainder-1 leaf is dropped and made again: a new leaf, whose
+    // text names the middle, over groups that hold rows in the remainder 0.
+    fx.exec("drop table public.items_m0b").await;
+    fx.pass().await;
+    fx.exec(
+        "create table public.items_m0b partition of public.items_m0 \
+         for values with (modulus 2, remainder 1)",
+    )
+    .await;
+    fx.pass().await;
+    fx.d.settle().await;
+    assert_eq!(
+        queued(&fx.queue().await),
+        [
+            entry("gone_node", "public.items_m0b"),
+            entry("new_leaf", "public.items_m0b")
+        ]
+    );
+    // Before the leaf's correction runs, its middle goes too.
+    fx.exec("drop table public.items_m0").await;
+    let outcome = fx.run(&Options::default()).await;
+    assert_eq!(outcome.completed, 2);
+    assert!(fx.queue().await.is_empty());
+    fx.correct().await;
+    let wrong: i64 =
+        fx.d.ctl
+            .query_one(
+                "select count(*) from (select g, h, sum(v) as total, count(*) as n \
+                                   from public.items group by g, h) w \
+             full join public.agg a on a.g = w.g and a.h = w.h \
+             where w.total is distinct from a.total or w.n is distinct from a.n",
+                &[],
+            )
+            .await
+            .expect("oracle")
+            .get(0);
+    assert_eq!(wrong, 0);
+}
+
 /// A `catching_up` definition applies, so the correction waits for it: it
 /// gets its row once its catch-up has moved it `live` (the merger folds only
 /// a `backfilling` definition's deltas), and the correction stays queued

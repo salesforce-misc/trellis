@@ -1094,6 +1094,13 @@ async fn correct(
         let client = pool.get().await?;
         partitions::recorded(&**client, &correction.table).await?
     };
+    if ancestor_gone(pool, correction, recorded.as_ref()).await? {
+        return Ok(if mark_done(pool, fence, correction, definition).await? {
+            Step::Done
+        } else {
+            Step::Superseded
+        });
+    }
     let route = route_of(correction, recorded.as_ref());
     let columns = route_columns(ledger, recorded.as_ref(), "l");
     let group_types = group_types(pool, ledger).await?;
@@ -1187,6 +1194,53 @@ async fn covered_by_parent(
         .await?
         .get(0);
     Ok(!alive)
+}
+
+/// Whether `correction` is a new or truncated leaf with an ancestor, in the
+/// recorded tree, that has been dropped since the pass queued it (#1148). The
+/// leaf's text embeds its `HASH` ancestors' oids and cannot be evaluated once
+/// one is dropped. The ancestor's own `gone_node`, queued by the pass that
+/// sees it go, routes every group of its bound, the leaf's among them, so the
+/// leaf's is complete without work.
+async fn ancestor_gone(
+    pool: &Pool,
+    correction: &PendingCorrection,
+    recorded: Option<&Recorded>,
+) -> Result<bool, CorrectionError> {
+    if correction.kind != partitions::Kind::NewLeaf.as_str()
+        && correction.kind != partitions::Kind::Truncated.as_str()
+    {
+        return Ok(false);
+    }
+    let Some(recorded) = recorded else {
+        return Ok(false);
+    };
+    let mut ancestors: Vec<i64> = Vec::new();
+    let mut at = correction.node_oid;
+    while let Some(parent) = recorded
+        .nodes
+        .iter()
+        .find(|n| n.oid == at)
+        .and_then(|n| n.parent)
+    {
+        if ancestors.contains(&i64::from(parent)) {
+            break;
+        }
+        ancestors.push(i64::from(parent));
+        at = parent;
+    }
+    if ancestors.is_empty() {
+        return Ok(false);
+    }
+    let client = pool.get().await?;
+    let alive: i64 = client
+        .query_one(
+            "select count(*) from pg_catalog.pg_class where oid = any($1::bigint[]::oid[])",
+            &[&ancestors],
+        )
+        .await?
+        .get(0);
+    Ok(usize::try_from(alive).unwrap_or(0) < ancestors.len())
 }
 
 /// Whether `correction` is a gone node whose detach is still pending.
