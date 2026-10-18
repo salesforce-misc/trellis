@@ -1501,8 +1501,8 @@ impl GroupTargetPlan {
     /// `GROUP BY` of the whole source, and replaces each group's partials
     /// with its own (zero for a group the `GROUP BY` doesn't have, R4), with
     /// the snapshot as its basis and the segment as its stamp. A group the
-    /// snapshot sees in the source but that wasn't locked (one a page created
-    /// after the lock) is left to its pages.
+    /// snapshot sees in the source but that wasn't locked (one whose first
+    /// change committed after the enumeration) is left to its pages.
     ///
     /// The visible row is replaced too: compared with the row the target
     /// holds, not with what the old partials say, so a rebuild repairs a
@@ -2110,8 +2110,9 @@ pub(crate) async fn release(
 ///
 /// Pages keep applying. One that touches a locked group waits for the
 /// commit, then reads the new basis, which refuses each change the snapshot
-/// saw and lets a later one apply as a delta. A group a page creates after
-/// the lock statement isn't locked, so the replace leaves it to its pages.
+/// saw and lets a later one apply as a delta. A group the enumeration
+/// didn't see (its first change committed after it) isn't locked, so the
+/// replace leaves it to its pages, which apply each of its changes once.
 /// Readers see each group's old values until the commit, then the new ones.
 ///
 /// Each changed visible row is recorded into `mutations`. Returns how many

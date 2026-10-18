@@ -744,8 +744,9 @@ it adds its region's partials to the groups as increments.
   source's groups, the groups named by old images of undrained ring
   changes, and the target's own groups. A group with no source rows goes to
   zero and is collected under R4; its visible row is removed in the same
-  transaction. A group a page creates after the lock statement is not
-  locked, and the rebuild leaves it to its pages.
+  transaction. A group the enumeration doesn't see (its first change
+  commits after it) is not locked, and the rebuild leaves it to its pages,
+  which apply each of its changes once.
 - **Must:** pages keep applying during a rebuild. A change the snapshot saw
   is refused by its group's basis, a later one applies as a delta, and a
   page touching a locked group waits for the statement to commit. Readers
@@ -756,9 +757,12 @@ it adds its region's partials to the groups as increments.
   *Cost:* pages of a structure's groups, in practice its source's drain,
   wait while its statement runs: 1.4–1.9 s at 100M source rows, about
   15–20 s at 1B (extrapolated), one partition's worth at a time on a
-  partitioned source. Clearing the target and building fresh would show
-  readers an empty, then filling target, and a shadow build and swap would
-  make pages write to both states; both are rejected.
+  partitioned source. No ring segment retires while the statement's
+  transaction is open, so once the ring's slots fill no segment seals and
+  every source's drain waits for the commit too; writers aren't held back,
+  and the active segment grows meanwhile. Clearing the target and building
+  fresh would show readers an empty, then filling target, and a shadow
+  build and swap would make pages write to both states; both are rejected.
 
 *Evidence:* in my model, chunk builds with recomputes, garbage collection
 and retirement, by one runner and by eight, were exact in every soak run.

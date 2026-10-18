@@ -361,3 +361,83 @@ async fn a_reader_sees_old_values_until_the_rebuild_commits() {
     assert_eq!(d.rows(ACTUAL).await, ["(1,10,1)", "(2,5,1)"]);
     assert_oracle(&mut d).await;
 }
+
+/// A group whose `GROUP BY` part is `NULL` is replaced like any other: the
+/// replace matches it to its `GROUP BY` row (`NULL` matching `NULL`), so it
+/// keeps its rows rather than going to zero.
+#[tokio::test]
+async fn a_rebuild_replaces_a_group_with_a_null_part() {
+    let mut d = start().await;
+    step(
+        &mut d,
+        "insert into public.src values (1, null, 10), (2, null, 5), (3, 1, 7)",
+    )
+    .await;
+    let hidden = hidden(&d).await;
+    d.ctl
+        .batch_execute(&format!(
+            "update {hidden} set __n = 9, __count_1 = 9, __sum_1 = 99 where g is null; \
+             update public.agg set total = 99, n = 9 where g is null"
+        ))
+        .await
+        .expect("damage the NULL group");
+    write(&d, "insert into public.src values (4, null, 1)").await;
+    let undrained = d.seal().await;
+    request_rebuild(&d).await;
+    rebuild(&d).await;
+    assert_eq!(
+        d.rows(&format!(
+            "select __n, __count_1, __sum_1, __basis is not null from {hidden} where g is null"
+        ))
+        .await,
+        ["(3,3,16,t)"]
+    );
+    assert_eq!(d.rows(ACTUAL).await, d.rows(EXPECTED).await);
+    d.drain(undrained, "undrained").await;
+    assert_oracle(&mut d).await;
+}
+
+/// `AVG`, a `SUM` over `numeric` and a composed field are computed from the
+/// replaced partials, so a rebuild writes the same values the pages do.
+#[tokio::test]
+async fn a_rebuild_writes_averages_numeric_sums_and_composed_fields() {
+    trellis::dev::staging::set_group_basis(true);
+    let mut d = Driver::start(
+        "create table public.src (id integer primary key, g integer, v integer, \
+         m numeric(12, 2))",
+        &[
+            ("id", int4()),
+            ("g", int4()),
+            ("v", int4()),
+            ("m", ValueType::Numeric),
+        ],
+        &["TRANSFORM agg FROM public.src GROUP BY g \
+           SELECT AVG(v) AS a, SUM(m) AS sm, SUM(v) + COUNT(m) AS c"],
+        &[SRC],
+    )
+    .await;
+    const ACTUAL: &str = "select g, a, sm, c from public.agg order by g";
+    const EXPECTED: &str = "select g, avg(v), sum(m), sum(v) + count(m) from public.src \
+                            group by g order by g";
+    step(
+        &mut d,
+        "insert into public.src values (1, 1, 1, 1.25), (2, 1, 2, null), (3, 2, 5, 2.50)",
+    )
+    .await;
+    let hidden = hidden(&d).await;
+    d.ctl
+        .batch_execute(&format!(
+            "update {hidden} set __n = 7, __count_1 = 7, __sum_1 = 70 where g = 1; \
+             delete from public.agg where g = 2"
+        ))
+        .await
+        .expect("damage the target");
+    write(&d, "update public.src set m = 3.75 where id = 2").await;
+    let undrained = d.seal().await;
+    request_rebuild(&d).await;
+    rebuild(&d).await;
+    assert_eq!(d.rows(ACTUAL).await, d.rows(EXPECTED).await);
+    d.drain(undrained, "undrained").await;
+    d.settle().await;
+    assert_eq!(d.rows(ACTUAL).await, d.rows(EXPECTED).await);
+}
