@@ -579,9 +579,15 @@ fn staged_columns(shape: &GroupShape) -> Vec<String> {
 /// definition from sharing a name, and the name within Postgres's 63 bytes
 /// for any `i64` id.
 fn staged_shape_hash(shape: &GroupShape) -> u64 {
-    // FNV-1a: fixed by definition, unlike `DefaultHasher`.
+    shape_hash(&staged_columns(shape).join(","))
+}
+
+/// A stable 64-bit hash of a working table's column list `columns`, for its
+/// name (see [`staged_shape_hash`]; a `JOIN`'s working tables use it too,
+/// `super::join`). FNV-1a: fixed by definition, unlike `DefaultHasher`.
+pub(super) fn shape_hash(columns: &str) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in staged_columns(shape).join(",").bytes() {
+    for byte in columns.bytes() {
         hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash

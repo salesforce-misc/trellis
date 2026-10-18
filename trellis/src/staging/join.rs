@@ -135,6 +135,21 @@ fn substitute(def: &TransformDef, expr: &Expr, depth: usize) -> Option<Expr> {
     })
 }
 
+/// The name of a `JOIN` working table (a session temp table, bare):
+/// `prefix`, the definition id, and a hash of the columns of the hidden
+/// table it copies (`hidden_columns`, from [`hidden_table_columns`]). The
+/// pool keeps its connections, and a connection keeps the temp table it
+/// first created under a name, so the name follows the hidden table's
+/// column types and collations: a definition whose key column was re-typed
+/// or re-collated under the same id gets a new table, and the old one is
+/// never touched again. Within Postgres's 63 bytes for any `i64` id.
+fn working_table_name(prefix: &str, id: i64, hidden_columns: &str) -> String {
+    format!(
+        "trellis_join_{prefix}_{id}_{:016x}",
+        group_basis::shape_hash(hidden_columns)
+    )
+}
+
 /// The qualified hidden table `table` of definition `id`, quoted.
 fn hidden_ident(schema: &str, id: i64, table: HiddenTable) -> String {
     format!("{}.{}", quote_ident(schema), quote_ident(&table.name(id)))
@@ -147,17 +162,25 @@ fn quoted(columns: &[String]) -> Vec<String> {
 impl JoinTargetPlan {
     /// The plan of `definition`, a `JOIN`. `joined` is its joined table
     /// (qualified) and that table's column types, `field_types` the visible
-    /// target's column types (`format_type`), and `identity` the target's
-    /// group identity.
+    /// target's column types (`format_type`), `hidden_columns` its hidden
+    /// tables' column lists ([`hidden_table_columns`]), and `identity` the
+    /// target's group identity.
     pub(crate) fn new(
         catalog_schema: &str,
         definition: &Definition,
         joined: &(String, HashMap<String, ValueType>),
         field_types: &HashMap<String, String>,
+        hidden_columns: &HashMap<String, String>,
         identity: Vec<PrimaryKeyColumn>,
     ) -> Result<Self, ApplyError> {
         let def = &definition.def;
         let id = definition.id;
+        let working = |prefix: &str, table: HiddenTable| {
+            let columns = hidden_columns
+                .get(&table.name(id))
+                .map_or("", String::as_str);
+            working_table_name(prefix, id, columns)
+        };
         let target = definition.target_table.as_str();
         let unsupported = |what: &'static str| ApplyError::GroupBasisUnsupported {
             target: target.to_string(),
@@ -257,13 +280,13 @@ impl JoinTargetPlan {
             let hidden = hidden_ident(catalog_schema, id, table);
             let deltas = format!(
                 "pg_temp.{}",
-                quote_ident(&format!("trellis_join_d{tag}_{id}"))
+                quote_ident(&working(&format!("d{tag}"), table))
             );
             SidePlan {
                 plan: GroupTargetPlan::for_join(
                     target,
                     hidden.clone(),
-                    &format!("trellis_join_{tag}_{id}"),
+                    &working(tag, table),
                     Some(source),
                     Vec::new(),
                     GroupShape {
@@ -295,7 +318,7 @@ impl JoinTargetPlan {
         let t = GroupTargetPlan::for_join(
             target,
             hidden_ident(catalog_schema, id, HiddenTable::TargetPartials),
-            &format!("trellis_join_t_{id}"),
+            &working("t", HiddenTable::TargetPartials),
             None,
             identity,
             t_shape,
@@ -685,6 +708,38 @@ pub(crate) async fn apply_join_target(
     Ok((written, deleted))
 }
 
+/// The column list of each of definition `id`'s hidden tables in
+/// `catalog_schema`, by bare name, for [`JoinTargetPlan::new`]'s working
+/// table names ([`working_table_name`]): each column's name, exact type
+/// (`format_type`) and collation, in column order.
+pub(crate) async fn hidden_table_columns(
+    client: &impl tokio_postgres::GenericClient,
+    catalog_schema: &str,
+    id: i64,
+) -> Result<HashMap<String, String>, tokio_postgres::Error> {
+    let names: Vec<String> = HiddenTable::ALL.iter().map(|t| t.name(id)).collect();
+    Ok(client
+        .query(
+            "select c.relname::text, \
+                    string_agg(pg_catalog.format('%I %s %s', a.attname, \
+                                   pg_catalog.format_type(a.atttypid, a.atttypmod), \
+                                   coalesce(co.collname::text, '')), \
+                               ',' order by a.attnum) \
+             from pg_catalog.pg_class c \
+             join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
+             join pg_catalog.pg_attribute a on a.attrelid = c.oid \
+             left join pg_catalog.pg_collation co on co.oid = a.attcollation \
+             where n.nspname = $1 and c.relname = any($2) \
+               and a.attnum > 0 and not a.attisdropped \
+             group by c.relname",
+            &[&catalog_schema, &names],
+        )
+        .await?
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect())
+}
+
 /// The visible target's column types (`format_type`), by name, for
 /// [`JoinTargetPlan::new`].
 pub(crate) async fn target_column_types(
@@ -702,4 +757,82 @@ pub(crate) async fn target_column_types(
         .into_iter()
         .map(|row| (row.get(0), row.get(1)))
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The name of every `JOIN` working table follows its hidden table's
+    /// column list, and fits a Postgres identifier for any id.
+    #[test]
+    fn a_working_table_name_follows_its_hidden_columns() {
+        let int4 = "g integer ,k text ";
+        assert_eq!(
+            working_table_name("dp", 7, int4),
+            working_table_name("dp", 7, int4)
+        );
+        assert_ne!(
+            working_table_name("dp", 7, int4),
+            working_table_name("dp", 7, "g bigint ,k text ")
+        );
+        assert_ne!(
+            working_table_name("dp", 7, int4),
+            working_table_name("dp", 7, "g integer ,k text C")
+        );
+        assert!(working_table_name("dp", 7, int4).starts_with("trellis_join_dp_7_"));
+        let longest = working_table_name("dp", i64::MIN, int4);
+        assert!(longest.len() <= 63, "{longest} fits a Postgres identifier");
+    }
+
+    /// A re-typed or re-collated key column of a hidden table under the
+    /// same definition id (as after a resume, which keeps the id and
+    /// recreates the hidden tables) gives its working tables a new name, so
+    /// a pooled connection never reuses a temp table of the old shape (#1142).
+    #[tokio::test]
+    async fn a_retyped_or_recollated_hidden_column_renames_the_working_tables() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (client, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(
+                "create schema if not exists trellis_t; \
+                 create table trellis_t.join_7_p (g integer, k text, __n bigint); \
+                 create table trellis_t.join_7_t (g integer, __n bigint)",
+            )
+            .await
+            .expect("hidden tables");
+        let names = |columns: &HashMap<String, String>| {
+            (
+                working_table_name("p", 7, columns.get("join_7_p").map_or("", String::as_str)),
+                working_table_name("t", 7, columns.get("join_7_t").map_or("", String::as_str)),
+            )
+        };
+        let first = hidden_table_columns(&client, "trellis_t", 7)
+            .await
+            .expect("columns");
+        assert_eq!(first.len(), 2, "{first:?}");
+        client
+            .batch_execute("alter table trellis_t.join_7_p alter column g type bigint")
+            .await
+            .expect("re-type");
+        let retyped = hidden_table_columns(&client, "trellis_t", 7)
+            .await
+            .expect("columns");
+        assert_ne!(names(&first).0, names(&retyped).0);
+        assert_eq!(names(&first).1, names(&retyped).1, "T is unchanged");
+        client
+            .batch_execute("alter table trellis_t.join_7_p alter column k type text collate \"C\"")
+            .await
+            .expect("re-collate");
+        let recollated = hidden_table_columns(&client, "trellis_t", 7)
+            .await
+            .expect("columns");
+        assert_ne!(names(&retyped).0, names(&recollated).0);
+    }
 }

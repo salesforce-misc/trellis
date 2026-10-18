@@ -8558,11 +8558,15 @@ pub(super) async fn compute_page(
                                 })?;
                         let field_types =
                             super::join::target_column_types(&**client, &def.target_table).await?;
+                        let hidden_columns =
+                            super::join::hidden_table_columns(&**client, pool.schema(), def.id)
+                                .await?;
                         entry.insert(super::join::JoinTargetPlan::new(
                             pool.schema(),
                             def,
                             &joined,
                             &field_types,
+                            &hidden_columns,
                             identity,
                         )?)
                     }
