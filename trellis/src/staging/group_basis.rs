@@ -133,7 +133,7 @@ pub fn set_enabled(on: bool) {
 
 /// One aggregate call of a definition's fields, over the group's partials.
 #[derive(Debug, Clone, PartialEq)]
-enum Agg {
+pub(super) enum Agg {
     /// `COUNT(*)`: `__n`.
     CountStar,
     /// `COUNT(x)`: argument `x`'s non-null count.
@@ -149,11 +149,14 @@ enum Agg {
 
 /// One distinct aggregate argument.
 #[derive(Debug, Clone, PartialEq)]
-struct Arg {
+pub(super) struct Arg {
     /// The argument over the image populated as the source's row type `s`.
     sql: String,
+    /// The argument, for the audit to render on its own
+    /// (`super::self_check_groups`).
+    pub(super) expr: Expr,
     /// Whether a `SUM` or `AVG` reads it, so it has a `__sum_<i>`.
-    summed: bool,
+    pub(super) summed: bool,
 }
 
 /// What a group-basis definition's target looks like ([`route`]).
@@ -161,22 +164,22 @@ struct Arg {
 pub(crate) struct GroupShape {
     /// The `GROUP BY` columns: the source's, the target's and the hidden
     /// table's column of that name.
-    group_cols: Vec<String>,
+    pub(super) group_cols: Vec<String>,
     /// Each `GROUP BY` column's type in the target and hidden table.
-    group_types: Vec<String>,
-    args: Vec<Arg>,
-    aggs: Vec<Agg>,
+    pub(super) group_types: Vec<String>,
+    pub(super) args: Vec<Arg>,
+    pub(super) aggs: Vec<Agg>,
     /// Each value field: its name, its type in the target, and its
     /// expression with each aggregate call replaced by its placeholder
     /// column ([`placeholder`]).
-    fields: Vec<(String, String, Expr)>,
+    pub(super) fields: Vec<(String, String, Expr)>,
     /// The `numeric` source columns a `SUM` or `AVG` reads, whose declared
     /// scale define checks ([`check_define`]).
     numeric_args: Vec<String>,
 }
 
 /// The column an aggregate call is read from inside a field's expression.
-fn placeholder(k: usize) -> String {
+pub(super) fn placeholder(k: usize) -> String {
     format!("__trellis_a{k}")
 }
 
@@ -223,6 +226,7 @@ fn shape_of(def: &TransformDef, source_columns: &HashMap<String, ValueType>) -> 
             .iter()
             .map(|c| Arg {
                 sql: render_to_one_rel_expr_sql(&c.arg, "s"),
+                expr: c.arg.clone(),
                 summed: false,
             })
             .collect(),
@@ -335,7 +339,7 @@ pub(crate) fn hidden_table_name(id: i64) -> String {
 
 /// The hidden table of definition `id`, quoted and qualified by the catalog
 /// schema `schema`.
-fn hidden_table_ident(schema: &str, id: i64) -> String {
+pub(super) fn hidden_table_ident(schema: &str, id: i64) -> String {
     format!(
         "{}.{}",
         quote_ident(schema),
@@ -1138,10 +1142,12 @@ mod tests {
             vec![
                 Arg {
                     sql: "s.\"a\"".to_string(),
+                    expr: Expr::Column("a".to_string()),
                     summed: true
                 },
                 Arg {
                     sql: "s.\"b\"".to_string(),
+                    expr: Expr::Column("b".to_string()),
                     summed: false
                 },
             ]

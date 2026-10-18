@@ -84,14 +84,16 @@
 //! a repair's own transaction moves the definition out of it, so a caller
 //! that polls for `live` and then checks is checking after the repair.
 //!
-//! # Scope: 1-1 targets only, this issue
+//! # Scope: 1-1 targets and group-basis aggregates
 //!
-//! Aggregate and relationship-enriched targets are out of scope for this
-//! slice ([`SelfCheckError::UnsupportedKeySpace`] /
-//! [`SelfCheckError::UnsupportedExpr`]) — extending [`render_leaf`] to
-//! relationship paths, and [`compare_once`] to bound a group-key space
-//! instead of a plain keyset, is the natural next step, not a rewrite (see
-//! ADR-0013, "Scope: 1-1 targets").
+//! A 1-1 target is compared row by row against its source. An aggregate on
+//! the group basis ([`super::group_basis`], behind its dev knob) is
+//! compared a page of groups at a time by [`super::self_check_groups`]: each
+//! group's hidden partials against a `GROUP BY` of the source, and its
+//! visible row against the partials. It detects and never repairs
+//! (ADR-0013). Any other aggregate (a ledger one) and a relationship-enriched
+//! target are refused ([`SelfCheckError::UnsupportedKeySpace`] /
+//! [`SelfCheckError::UnsupportedExpr`]).
 //!
 //! # One page at a time
 //!
@@ -405,8 +407,8 @@ impl fmt::Display for SelfCheckError {
             }
             SelfCheckError::UnsupportedKeySpace { target } => write!(
                 f,
-                "self_check only audits a 1-1 target this issue; \"{target}\" is an aggregate \
-                 target"
+                "self_check audits a 1-1 target or an aggregate on the group basis; \
+                 \"{target}\" is an aggregate target of another kind"
             ),
             SelfCheckError::UnsupportedExpr { target, detail } => {
                 write!(f, "self_check can't audit \"{target}\": {detail}")
@@ -575,7 +577,7 @@ pub(crate) async fn comparable_definition(
         .await?
         .ok_or_else(|| SelfCheckError::TargetNotFound(target_table.to_string()))?;
 
-    if !matches!(def.def.key_space, KeySpace::OneToOne) {
+    if !matches!(def.def.key_space, KeySpace::OneToOne) && group_shape(&def).is_none() {
         return Err(SelfCheckError::UnsupportedKeySpace {
             target: target_table.to_string(),
         });
@@ -583,10 +585,20 @@ pub(crate) async fn comparable_definition(
     Ok(def)
 }
 
+/// The group-basis shape of `def`, if it is an aggregate on the group basis
+/// (#1104): audited by [`super::self_check_groups`]. Whatever the knob says
+/// at this moment, as it decides the definition's routing.
+fn group_shape(def: &Definition) -> Option<super::group_basis::GroupShape> {
+    super::group_basis::route(&def.def, &def.source_columns)
+}
+
 /// Refuses a definition with a field [`render_leaf`] can't render (a
 /// relationship path), which the comparison would otherwise refuse only once
 /// it got that far.
 pub(crate) fn check_renders(def: &Definition) -> Result<(), SelfCheckError> {
+    if let Some(shape) = group_shape(def) {
+        return super::self_check_groups::check_renders(def, &shape);
+    }
     for field in &def.def.fields {
         render_leaf(&field.expr).map_err(|detail| SelfCheckError::UnsupportedExpr {
             target: def.def.target.clone(),
@@ -679,26 +691,35 @@ pub(crate) async fn audit(
     // Issue #121: this audit now keys on the source's full (possibly
     // composite) primary key, through the shared key-contract text
     // (`ddl::pk_key_sql_expr`) rather than a single named column.
-    let pk = ddl::source_primary_key(pool, &def.source_table).await?;
+    // An aggregate on the group basis is keyed by its `GROUP BY` columns
+    // (its target's identity), and compared by `super::self_check_groups`.
+    let group = group_shape(def);
+    let pk = if group.is_some() {
+        let client = pool.get().await?;
+        ddl::identity_key_columns(&**client, &def.target_table).await?
+    } else {
+        ddl::source_primary_key(pool, &def.source_table).await?
+    };
 
     let schema_divergences = check_schema(pool, def, &pk).await?;
     let paused = paused_columns(pool, &def.def).await?;
 
-    let pass1 = match await_then_compare(pool, def, &pk, &scope, &paused, timeout).await? {
-        AwaitOutcome::NotCaughtUp { attempted } => {
-            return Ok(SelfCheckPage {
-                target: target_table.to_string(),
-                checked_through: attempted,
-                rows_compared: 0,
-                next_after: scope.after.clone(),
-                outcome: SelfCheckOutcome::NotCaughtUp,
-                held_keys: None,
-                drain_failures: Vec::new(),
-                unindexed_joins: Vec::new(),
-            });
-        }
-        AwaitOutcome::CaughtUp(pass) => pass,
-    };
+    let pass1 =
+        match await_then_compare(pool, def, group.as_ref(), &pk, &scope, &paused, timeout).await? {
+            AwaitOutcome::NotCaughtUp { attempted } => {
+                return Ok(SelfCheckPage {
+                    target: target_table.to_string(),
+                    checked_through: attempted,
+                    rows_compared: 0,
+                    next_after: scope.after.clone(),
+                    outcome: SelfCheckOutcome::NotCaughtUp,
+                    held_keys: None,
+                    drain_failures: Vec::new(),
+                    unindexed_joins: Vec::new(),
+                });
+            }
+            AwaitOutcome::CaughtUp(pass) => pass,
+        };
 
     let mut divergences = schema_divergences;
     divergences.extend(pass1.divergences);
@@ -733,21 +754,22 @@ pub(crate) async fn audit(
     // re-check after a fresh await — a genuine divergence is stable; a
     // convergence race resolves." Re-run the exact same bounded comparison
     // from scratch, behind a brand-new watermark token/await.
-    let pass2 = match await_then_compare(pool, def, &pk, &scope, &paused, timeout).await? {
-        AwaitOutcome::NotCaughtUp { attempted } => {
-            return Ok(SelfCheckPage {
-                target: target_table.to_string(),
-                checked_through: attempted,
-                rows_compared: 0,
-                next_after: scope.after.clone(),
-                outcome: SelfCheckOutcome::NotCaughtUp,
-                held_keys: None,
-                drain_failures: Vec::new(),
-                unindexed_joins: Vec::new(),
-            });
-        }
-        AwaitOutcome::CaughtUp(pass) => pass,
-    };
+    let pass2 =
+        match await_then_compare(pool, def, group.as_ref(), &pk, &scope, &paused, timeout).await? {
+            AwaitOutcome::NotCaughtUp { attempted } => {
+                return Ok(SelfCheckPage {
+                    target: target_table.to_string(),
+                    checked_through: attempted,
+                    rows_compared: 0,
+                    next_after: scope.after.clone(),
+                    outcome: SelfCheckOutcome::NotCaughtUp,
+                    held_keys: None,
+                    drain_failures: Vec::new(),
+                    unindexed_joins: Vec::new(),
+                });
+            }
+            AwaitOutcome::CaughtUp(pass) => pass,
+        };
 
     let mut second = check_schema(pool, def, &pk).await?;
     second.extend(pass2.divergences);
@@ -830,11 +852,11 @@ impl DivergenceIdentity {
 
 /// One [`compare_once`] pass's result, plus the token it was checked
 /// through.
-struct ComparePass {
-    checked_through: PgLsn,
-    rows_compared: i64,
-    next_after: Option<String>,
-    divergences: Vec<Divergence>,
+pub(super) struct ComparePass {
+    pub(super) checked_through: PgLsn,
+    pub(super) rows_compared: i64,
+    pub(super) next_after: Option<String>,
+    pub(super) divergences: Vec<Divergence>,
 }
 
 /// [`await_then_compare`]'s result: either the target never caught up to
@@ -852,6 +874,7 @@ enum AwaitOutcome {
 async fn await_then_compare(
     pool: &Pool,
     def: &Definition,
+    group: Option<&super::group_basis::GroupShape>,
     pk: &[PrimaryKeyColumn],
     scope: &SelfCheckScope,
     paused: &HashSet<String>,
@@ -868,7 +891,7 @@ async fn await_then_compare(
         token
     };
 
-    let pass = compare_once(pool, def, pk, scope, paused, token).await?;
+    let pass = compare_once(pool, def, group, pk, scope, paused, token).await?;
     Ok(AwaitOutcome::CaughtUp(pass))
 }
 
@@ -894,11 +917,24 @@ fn caught_up(waited: Result<(), StagingError>) -> Result<bool, SelfCheckError> {
 async fn compare_once(
     pool: &Pool,
     def: &Definition,
+    group: Option<&super::group_basis::GroupShape>,
     pk: &[PrimaryKeyColumn],
     scope: &SelfCheckScope,
     paused: &HashSet<String>,
     checked_through: PgLsn,
 ) -> Result<ComparePass, SelfCheckError> {
+    if let Some(shape) = group {
+        return super::self_check_groups::compare(
+            pool,
+            def,
+            shape,
+            pk,
+            scope,
+            paused,
+            checked_through,
+        )
+        .await;
+    }
     // The recompute `SELECT` below carries no `WHERE` for the definition's
     // own partial-data predicate, which is sound only because `Predicate`
     // has exactly one variant today. Matched exhaustively (rather than
@@ -1009,7 +1045,7 @@ async fn page_collation(
 }
 
 /// `"C"`, byte order.
-const BYTE_ORDER: &str = r#"pg_catalog."C""#;
+pub(super) const BYTE_ORDER: &str = r#"pg_catalog."C""#;
 
 /// The statement [`compare_once`] runs: one keyset page of the recompute
 /// over `def`'s source and of the persisted target, each `LIMIT`ed
@@ -1267,7 +1303,7 @@ async fn check_schema(
 /// production audit path must not panic on a shape it doesn't support yet,
 /// it must fail the one audit call cleanly
 /// ([`SelfCheckError::UnsupportedExpr`]).
-fn render_leaf(expr: &Expr) -> Result<String, String> {
+pub(super) fn render_leaf(expr: &Expr) -> Result<String, String> {
     Ok(match expr {
         Expr::Column(name) | Expr::SourceColumn { column: name, .. } => quote_ident(name),
         Expr::NumberLiteral(text) => format!("{text}::numeric"),
