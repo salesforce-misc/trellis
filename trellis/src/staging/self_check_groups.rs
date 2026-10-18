@@ -15,7 +15,8 @@
 //!    definition names);
 //! 4. the visible target's rows.
 //!
-//! [`diff_groups`] compares 1 against 2 and 3 against 4. It reports, never
+//! [`diff_groups`] compares 1 against 2 and 3 against 4, and reports a group
+//! 1 has and 4 lacks, or the reverse, as a missing or extra row. It reports, never
 //! repairs: the remedy is a `request_backfill` of the source or a
 //! `PAUSE`/`RESUME` (ADR-0013). A group's partials are compared as values (a
 //! sum's trailing zeros are not part of it), the visible row byte for byte.
@@ -31,15 +32,18 @@
 //! path's (`group_basis::GroupTargetPlan`), so a rendering bug there
 //! disagrees with this oracle instead of agreeing with itself.
 //!
-//! Cost: the source side is a scan of the source per page, since the page's
-//! groups are not known before it is read. A page of 1000 groups of a
-//! source of N rows reads N rows.
+//! Cost: the source side is a scan of the source per page, since the group
+//! key is an expression no index orders. Its `GROUP BY` takes only the
+//! groups up to the hidden side's last key, so it aggregates about a page
+//! of groups, not every group past the cursor. A walk of G groups of a
+//! source of N rows, L groups a page, reads about G / L times N source rows,
+//! as a 1-1 walk over an integer key reads N / L times N.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use tokio_postgres::types::PgLsn;
 
-use crate::defs::ast::Expr;
+use crate::defs::ast::{Expr, Predicate};
 use crate::defs::ddl::{self, PrimaryKeyColumn};
 use crate::defs::model::Definition;
 use crate::pool::{Pool, quote_ident};
@@ -147,9 +151,14 @@ fn page_sql(
             ));
         }
     }
+    // Only the groups up to the hidden side's last key, when it filled the
+    // limit: the page ends there or earlier, so a group past it would be
+    // trimmed anyway, and this way the `GROUP BY` holds a page of groups
+    // rather than every group past the cursor.
     let src = format!(
         "select {key} as __k, array[{}]::text[] as __v from {source} \
-         where {after} group by {group_cols} order by __k limit $2",
+         where {after} and ((select e from hid_end) is null or {key} <= (select e from hid_end)) \
+         group by {group_cols} order by __k limit $2",
         src_parts.join(", ")
     );
 
@@ -202,13 +211,14 @@ fn page_sql(
     );
 
     Ok(format!(
-        "with src as materialized ({src}), \
-              hid as materialized ({hid}), \
+        "with hid as materialized ({hid}), \
+              hid_end as (select max(__k) as e from hid having count(*) >= $2), \
+              src as materialized ({src}), \
               vis as materialized ({vis}), \
               page as ( \
                 select least( \
                   (select max(__k) from src having count(*) >= $2), \
-                  (select max(__k) from hid having count(*) >= $2), \
+                  (select e from hid_end), \
                   (select max(__k) from vis having count(*) >= $2)) as page_end) \
          select 1, page.page_end, src.__k, src.__v from src, page \
           where page.page_end is null or src.__k <= page.page_end \
@@ -237,6 +247,11 @@ pub(super) async fn compare(
     paused: &HashSet<String>,
     checked_through: PgLsn,
 ) -> Result<ComparePass, SelfCheckError> {
+    // The source's `GROUP BY` has no `WHERE` for the definition's predicate,
+    // sound only while `Predicate` has one variant (as the 1-1 comparison's).
+    match def.def.predicate {
+        Predicate::True => {}
+    }
     let hidden = group_basis::hidden_table_ident(pool.schema(), def.id);
     let sql = page_sql(
         shape,
@@ -326,6 +341,20 @@ fn diff_groups(
     }
     for key in vis.keys() {
         if !implied.contains_key(key) {
+            divergences.push(Divergence::ExtraRow { key: key.clone() });
+        }
+    }
+
+    // The visible rows against the source's groups (ADR-0013: a group the
+    // source has and the target lacks, or the reverse, is a missing or extra
+    // row), where the partials agree with the target and so didn't say it.
+    for key in src.keys() {
+        if !vis.contains_key(key) && !implied.contains_key(key) {
+            divergences.push(Divergence::MissingRow { key: key.clone() });
+        }
+    }
+    for key in vis.keys() {
+        if !src.contains_key(key) && implied.contains_key(key) {
             divergences.push(Divergence::ExtraRow { key: key.clone() });
         }
     }
