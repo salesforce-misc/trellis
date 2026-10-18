@@ -1311,25 +1311,20 @@ async fn a_worker_that_dies_before_the_last_page_commits_is_resumed_from_its_pro
     ));
     let at = reached.await.expect("the last page reached its commit");
     worker.abort();
-    fx.d.ctl
-        .execute("select pg_terminate_backend($1)", &[&at.backend_pid])
-        .await
-        .expect("end the worker's session");
+    // The two-argument form waits server-side until the backend has exited:
+    // its locks are released (the reclaim sweep skips locked rows, #1124) and
+    // its socket is closed.
+    let ended: bool =
+        fx.d.ctl
+            .query_one("select pg_terminate_backend($1, 10000)", &[&at.backend_pid])
+            .await
+            .expect("end the worker's session")
+            .get(0);
+    assert!(ended, "the worker's backend exited");
     holder
         .execute("select pg_advisory_unlock($1)", &[&KEY])
         .await
         .expect("release");
-    // `pg_terminate_backend` only signals: the dying backend still holds the
-    // page's row locks until it has rolled back, and the reclaim sweep skips
-    // locked rows (#1124). A blocking lock on the chunk returns exactly when
-    // that rollback has released it.
-    fx.d.ctl
-        .execute(
-            "select 1 from backfill_chunks where kind = 'correction' for update",
-            &[],
-        )
-        .await
-        .expect("wait out the dead worker's rollback");
 
     let saved = partition_correction::progress(&fx.d.ctl, correction.id, definition)
         .await
@@ -1356,12 +1351,20 @@ async fn a_worker_that_dies_before_the_last_page_commits_is_resumed_from_its_pro
         .expect("reclaim");
     assert_eq!(freed, 1);
 
-    let rest = fx
-        .run(&Options {
+    // The aborted worker's pooled connection is dead; a pool built now holds
+    // none of it, so the run cannot be handed a closed connection (#1152).
+    let fresh =
+        trellis::Pool::new(&Config::from_dsn(fx.d.db.dsn().to_string()).expect("valid dsn"))
+            .expect("a fresh pool");
+    let rest = partition_correction::run_pending(
+        &fresh,
+        &Options {
             page_keys: 7,
             max_pages: None,
-        })
-        .await;
+        },
+    )
+    .await
+    .expect("run the pending corrections");
     assert_eq!(rest.completed, 1);
     assert_eq!(rest.keys, 5, "only the page that did not commit runs again");
     fx.settle_builds().await;
