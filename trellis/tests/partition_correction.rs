@@ -1351,20 +1351,18 @@ async fn a_worker_that_dies_before_the_last_page_commits_is_resumed_from_its_pro
         .expect("reclaim");
     assert_eq!(freed, 1);
 
-    // The aborted worker's pooled connection is dead; a pool built now holds
-    // none of it, so the run cannot be handed a closed connection (#1152).
-    let fresh =
+    // The aborted worker's pooled connection is dead. Everything from here
+    // on runs on a pool built now, which holds none of it, so no call can be
+    // handed a closed connection (#1152).
+    fx.d.db.pool =
         trellis::Pool::new(&Config::from_dsn(fx.d.db.dsn().to_string()).expect("valid dsn"))
             .expect("a fresh pool");
-    let rest = partition_correction::run_pending(
-        &fresh,
-        &Options {
+    let rest = fx
+        .run(&Options {
             page_keys: 7,
             max_pages: None,
-        },
-    )
-    .await
-    .expect("run the pending corrections");
+        })
+        .await;
     assert_eq!(rest.completed, 1);
     assert_eq!(rest.keys, 5, "only the page that did not commit runs again");
     fx.settle_builds().await;
