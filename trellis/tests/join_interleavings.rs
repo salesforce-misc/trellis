@@ -20,7 +20,8 @@
 //! pages share locks only with each other. The families run on a
 //! single-column key (`a.k = b.k`) and on the two-column `(t, k)` key
 //! (`a.t = b.t AND a.k = b.k`), where decoy rows share a scenario's `k` but
-//! not its `t`.
+//! not its `t`; on the single-column key the decoys sit on a key of their
+//! own, so they never keep a scenario's key matched.
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
@@ -572,15 +573,21 @@ fn schedules(shared: bool, new_key: bool) -> Vec<(usize, Option<PausePoint>, Opt
     out
 }
 
-/// `template` for scenario `n`: `{k}` is its join key's values `(t, k)`,
-/// `(n, n)`; `{dk}` a decoy key `(n + 1000, n)`, which matches `{k}` on the
-/// single-column key and not on the pair; `{k2}` a second key `(n, n +
-/// 5000)`; `{n}` is `n`; `{g1}`…`{g4}` its `ga`/`gb` values `10n + i`;
-/// `{id}` its id base `100n`, which rows add to.
-fn fill(template: &str, n: i32) -> String {
+/// `template` for scenario `n` on `key`: `{k}` is its join key's values
+/// `(t, k)`, `(n, n)`; `{dk}` a decoy key that never matches `{k}`: on the
+/// pair, `(n + 1000, n)`, which shares `{k}`'s `k` but not its `t`; on the
+/// single-column key, `(n + 1000, n + 1000)`, since a decoy dimension row on
+/// `{k}`'s `k` would keep the key matched and hide every flip; `{k2}` a
+/// second key `(n, n + 5000)`; `{n}` is `n`; `{g1}`…`{g4}` its `ga`/`gb`
+/// values `10n + i`; `{id}` its id base `100n`, which rows add to.
+fn fill(template: &str, n: i32, key: Key) -> String {
+    let decoy_k = match key {
+        Key::Single => n + 1000,
+        Key::Pair => n,
+    };
     template
         .replace("{k}", &format!("{n}, {n}"))
-        .replace("{dk}", &format!("{}, {n}", n + 1000))
+        .replace("{dk}", &format!("{}, {decoy_k}", n + 1000))
         .replace("{k2}", &format!("{n}, {}", n + 5000))
         .replace("{n}", &n.to_string())
         .replace("{g1}", &(10 * n + 1).to_string())
@@ -603,15 +610,15 @@ async fn run_races(lab: &mut Lab, races: &[(&str, &str, &str, &str, bool, bool)]
         for (paused, point, queues) in schedules(*shared, *new_key) {
             n += 1;
             if !setup.is_empty() {
-                lab.step(&fill(setup, n)).await;
+                lab.step(&fill(setup, n, lab.key)).await;
             }
             lab.race(
                 &format!(
                     "{:?}/{}: {name}, page {paused} frozen at {point:?}",
                     lab.key, lab.kinds[0].name
                 ),
-                &fill(x, n),
-                &fill(y, n),
+                &fill(x, n, lab.key),
+                &fill(y, n, lab.key),
                 paused,
                 point,
                 queues,
@@ -1042,10 +1049,11 @@ async fn family7_out_of_order_pages() {
                 "insert into public.a values ({id} + 1, {g1}, {k}, 10); \
                  insert into public.b values ({id} + 1, {k}, {g1}, 100)",
                 n,
+                lab.key,
             ))
             .await;
-            let earlier = lab.sealed(&fill(first, n)).await;
-            let later = lab.sealed(&fill(second, n)).await;
+            let earlier = lab.sealed(&fill(first, n, lab.key)).await;
+            let later = lab.sealed(&fill(second, n, lab.key)).await;
             let context = format!("page {j} applied before page {i}");
             assert!(
                 lab.d.drain(later, "x").await.is_some(),
