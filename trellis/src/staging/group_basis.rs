@@ -706,7 +706,8 @@ impl GroupTargetPlan {
     /// group columns names its group), and the group of the current source
     /// row of each key, read by its typed key parts: `$2..`, one `text[]`
     /// per source key column. Each key reads its row by its own index
-    /// probe.
+    /// probe. A nullable key column (another aggregate's grouping column,
+    /// when the source is its target) also matches a `NULL` part.
     fn name_groups_sql(&self) -> String {
         let cols = quoted(&self.shape.group_cols).join(", ");
         let mut on = Vec::with_capacity(self.source_pk.len());
@@ -714,7 +715,12 @@ impl GroupTargetPlan {
         let mut parts = Vec::with_capacity(self.source_pk.len());
         for (i, column) in self.source_pk.iter().enumerate() {
             let p = format!("__p{i}");
-            on.push(format!("s.{} = u.{p}", quote_ident(&column.name)));
+            let c = quote_ident(&column.name);
+            on.push(if column.nullable {
+                format!("(s.{c} = u.{p} or (s.{c} is null and u.{p} is null))")
+            } else {
+                format!("s.{c} = u.{p}")
+            });
             arrays.push(format!("${}::text[]::{}[]", i + 2, column.data_type));
             parts.push(p);
         }
