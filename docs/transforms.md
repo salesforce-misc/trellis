@@ -286,7 +286,7 @@ Its contents and shape, though, belong to Trellis
 ([0014-pause-and-drop-a-transform](decisions/0014-pause-and-drop-a-transform.md)).
 Trellis assumes it is the table's only writer. A change made behind its back is
 not corrected, and whether it reaches anything chained off the table is
-undefined. Treat a target as read-only, and specifically:
+undefined ([known correctness gaps](known-correctness-gaps.md#8-operator-changes-inside-trellis-owned-artifacts)). Treat a target as read-only, and specifically:
 
 * **Do not insert, update or delete rows.** An edited row stays wrong until the
   next event that recomputes it, and a row added by hand is accounted for by

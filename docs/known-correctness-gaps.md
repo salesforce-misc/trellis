@@ -15,9 +15,13 @@ because it only pauses or fails and waits for you.
 The guarantee holds when all of these do. Each entry below is a way one of
 them gets broken without Trellis noticing.
 
-* Trellis is the only writer to its target tables (entry 8).
-* The capture triggers stay installed, enabled and `ENABLE ALWAYS`, and the
-  capture functions keep their bodies (entries 5 and 6).
+* No one changes Trellis's artifacts by hand: its schema (the catalog and ring
+  tables, by DML, DDL or a data load), the target tables and the hidden tables
+  Trellis keeps beside them, and the capture functions and triggers it
+  installs. The install survives a whole-database backup and restore as a
+  unit; any manual change inside it can break the guarantee without Trellis
+  noticing (entry 8).
+* The capture triggers stay installed, enabled and `ENABLE ALWAYS` (entry 5).
 * No DDL rewrites the values of a column a definition reads beyond the
   changes Trellis detects (entry 1). A column dropped and re-added, retyped,
   or rewritten in place to the same type rebuilds its readers, or pauses the
@@ -57,7 +61,7 @@ These are the tools the entries refer to:
   against the live schema, and refuses, leaving the definition paused, while
   define would refuse it. It also refuses in four cases define doesn't: a
   1-1 target's source key was redefined, a definition's ledger table is
-  missing (entry 8), or an aggregate's group-delta table is missing (entry 8)
+  missing, or an aggregate's group-delta table is missing (entry 8)
   or has different running-sum or recompute columns from the ones define would
   create now (a `SUM` or `AVG` argument moved between an exact type and
   floating point). It then brings every column
@@ -99,8 +103,7 @@ These are the tools the entries refer to:
 | 1 | `ALTER COLUMN … TYPE … USING` that rewrites values, with a metadata change to the same column in the same pass window, on a column added with a constant default whose table hasn't been rewritten since, on a column with a compression method set, or as a widening no copy outgrows | yes | `self_check` (1-1 targets only) | none; documented |
 | 3 | A source key re-collated while a `self_check` job runs | the job can skip or repeat keys | no | none filed |
 | 5 | Capture switched off and back on, or the table attached to a hierarchy and detached, between two reconcile passes | yes | `self_check` (1-1 targets only) | #707, study pending |
-| 6 | A capture function body replaced by hand | yes | `self_check` (1-1 targets only) | #707, study pending |
-| 8 | Hand edits to a target table | yes | `self_check` (1-1 targets only) | none; documented |
+| 8 | A manual change inside Trellis's artifacts: a target or hidden table edited or dropped, a capture function body replaced, DML, DDL or a data load into Trellis's schema, or a restore of that schema alone | yes | `self_check` (1-1 and `JOIN` targets); a missing ledger or group-delta table refuses a resume | #707 (capture function body); otherwise none; documented |
 | 9 | An application trigger re-keying a parent's join column within the statement | yes | no | #1115 removes relationships |
 | 10 | `REGEXP_COUNT` on `"C"`-collated data or with Postgres-only regex syntax | yes | `self_check` (1-1 targets only) | #643, with #575 |
 | 11 | Row-level security applying to a role Trellis runs as | only capture, for the ring owner, until the next reconcile pass; elsewhere reads and writes fail | drain, discharge, catch-up and build merge: pause what they reach; one the catalog can't pin shows on `drain_failure` (drain) or `backfill_failure` (discharge, catch-up), or, for a build merge, pauses on its fifth charge with the error on `capture_failure`; build chunk: `backfill_failure` | none |
@@ -246,53 +249,75 @@ routine false positives will be documented here instead.
 Better still, don't disable the capture triggers
 ([embedding — Leave the capture triggers alone](embedding.md)).
 
-## 6. A capture function body replaced by hand
+## 8. Operator changes inside Trellis-owned artifacts
 
-**Trigger:** `CREATE OR REPLACE FUNCTION` on one of Trellis's capture
-functions, with a body that drops or alters what it stages.
+**Trigger:** a manual change to anything Trellis installed or keeps:
 
-**Effect:** the writes it mis-stages are lost or wrong. The pass sees the body
-is stale and rewrites it. That repair is a "widen", which doesn't re-read the
-table, so the writes made in between stay lost.
+* Any `INSERT`, `UPDATE`, `DELETE` or `TRUNCATE` on a target table, changing
+  its columns or key constraints, or dropping a table Trellis keeps beside it:
+  `<target>__ledger`, an aggregate's `<target>__deltas`, or a hidden table in
+  the catalog schema (a group-basis aggregate's partials table `agg_<id>`; a
+  `JOIN`'s `P`, `M`, `J` and `T` tables, and its lock row `join_<id>_*`).
+* `CREATE OR REPLACE FUNCTION` on one of Trellis's capture functions, with a
+  body that drops or alters what it stages. Disabling or dropping the capture
+  triggers is [entry 5](#5-capture-switched-off-and-back-on-between-two-reconcile-passes).
+* DML, DDL or a data load into Trellis's own schema, such as loading another
+  database's `partition_sources` rows into the catalog.
+* Restoring only the Trellis schema.
 
-**Detected?** The function is restored, but the lost writes aren't detected
-automatically. `self_check`'s comparison reports the stale rows on 1-1
-targets.
+**Effect:**
 
-**Planned work:** #707 (case 2). One option there is to have this repair
-re-read the table the way a reinstall does.
+* **Target and side tables.** Trellis assumes it's the only writer and doesn't
+  correct the change. An edited row stays wrong until its key is recomputed
+  for another reason, and a truncated target stays empty. A resume refuses
+  while the definition's ledger table is missing, or an aggregate's
+  group-delta table is, naming the table, and the definition stays paused. A
+  build whose start fails because its ledger is gone (dropped while the
+  definition waited to start) pauses that definition and what reads its
+  target, with the error as its `capture_failure` of kind `halt`; the staging
+  worker's pass goes on to start the other definitions' builds. A live
+  definition whose ledger is dropped fails each drain page that applies a
+  change for it: the keys those pages touch are held once their retries run
+  out, and the definition is quarantined once enough are, while the other
+  definitions on its source carry on. Its resume then refuses the same way.
+  An edited or truncated group-basis or `JOIN` hidden table leaves the
+  groups or cells it held wrong until they are recomputed for another reason.
+* **A capture function body.** The writes it mis-stages are lost or wrong. The
+  pass sees the body is stale and rewrites it. That repair is a "widen", which
+  doesn't re-read the table, so the writes made in between stay lost.
+* **Trellis's schema.** The catalog and the ring are Trellis's record of what
+  every target has applied, so a change to them is believed.
+  * The restore signal compares the stored OID of the catalog table with the
+    live one (#1052, #1067). A physical copy forked *before* Trellis was
+    installed, with Trellis then installed on both sides and one side's
+    catalog rows loaded into the other, gets equal OIDs. No restore is
+    detected, and the pass routes by recorded `HASH` texts that name the wrong
+    OIDs.
+  * Restoring only the Trellis schema rewinds the catalog and the ring
+    without the targets, so they disagree about what has been applied.
+    Restoring the application's schemas alone is
+    [entry 13](#13-partial-restores-and-schema-only-loads).
 
-**Repair:** `request_backfill` the table, or `PAUSE`/`RESUME` its readers.
-
-## 8. Hand edits to a target table
-
-**Trigger:** any `INSERT`, `UPDATE`, `DELETE` or `TRUNCATE` on a target
-table, changing its columns or key constraints, or dropping a table Trellis
-keeps beside it (`<target>__ledger`, or an aggregate's `<target>__deltas`).
-
-**Effect:** Trellis assumes it's the only writer and doesn't correct the
-change. An edited row stays wrong until its key is recomputed for another
-reason, and a truncated target stays empty. A resume refuses while the
-definition's ledger table is missing, or an aggregate's group-delta table is,
-naming the table, and the definition stays paused. A build whose start fails
-because its ledger is gone (dropped while the definition waited to start)
-pauses that definition and what reads its target, with the error as its
-`capture_failure` of kind `halt`; the staging worker's pass goes on to start
-the other definitions' builds. A live definition whose ledger is dropped
-fails each drain page that applies a change for it: the keys those pages
-touch are held once their retries run out, and the definition is
-quarantined once enough are, while the other definitions on its source carry
-on. Its resume then refuses the same way.
-
-**Detected?** `self_check` reports it on 1-1 targets. Nothing reports it on
-aggregate or relationship-enriched targets.
+**Detected?** `self_check` reports an edited 1-1 or `JOIN` target, and audits
+a `JOIN`'s hidden tables, but nothing reports a hand edit of an aggregate or
+relationship-enriched target. The function is restored, but the lost writes
+aren't detected automatically; `self_check`'s comparison reports the stale
+rows on 1-1 targets. A change to Trellis's schema isn't detected.
 
 **Planned work:** none for the edits. This is a documented rule
 ([transforms — Target tables are Trellis-owned](transforms.md#target-tables-are-trellis-owned)).
+#707 (case 2) covers the capture function body; one option there is to have
+the repair re-read the table the way a reinstall does.
 
-**Repair:** `PAUSE`/`RESUME` the transform. If its columns or constraints
-were changed, or a table Trellis keeps beside it was dropped,
-`DROP TRANSFORM` and define it again.
+**Repair:**
+
+* `PAUSE`/`RESUME` the transform. If its columns or constraints were changed,
+  or a table Trellis keeps beside it was dropped, `DROP TRANSFORM` and define
+  it again. A resume drops and recreates a `JOIN`'s hidden tables.
+* After a capture function body replaced by hand, `request_backfill` the
+  table, or `PAUSE`/`RESUME` its readers.
+* After a change to Trellis's schema, restore the whole database from one
+  backup, or drop the transforms and define them again.
 
 ## 9. An application trigger re-keying a parent's join column within the statement
 
@@ -448,7 +473,8 @@ issue is filed.
 * A partial restore is silent. Trellis's catalog, its ring and the targets have
   to come from the same point as the sources. A whole-database or
   whole-cluster restore keeps them consistent and needs no special
-  handling (#236).
+  handling (#236). Restoring only the Trellis schema is
+  [entry 8](#8-operator-changes-inside-trellis-owned-artifacts).
 * A schema load of a plain dump is loud. It carries the target tables but not
   their definitions, so nothing maintains them, and defining again fails with a
   `conflict` error because the target exists. A Rails app's `structure.sql`

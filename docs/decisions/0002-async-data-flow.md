@@ -258,7 +258,7 @@ What it does there is one append.
   documented as uncaptured until the audit runs (see also the known
   correctness gaps
   [Capture switched off and back on between two reconcile passes](../known-correctness-gaps.md#5-capture-switched-off-and-back-on-between-two-reconcile-passes) and
-  [A capture function body replaced by hand](../known-correctness-gaps.md#6-a-capture-function-body-replaced-by-hand)).
+  [Operator changes inside Trellis-owned artifacts](../known-correctness-gaps.md#8-operator-changes-inside-trellis-owned-artifacts)).
 - **Only the staging worker creates or drops triggers**, from the catalog
   alone, on its reconcile pass: a table gains triggers when something
   registers a reader of it and loses them when its last reader is dropped.
@@ -1105,7 +1105,7 @@ Each alternative below is recorded with the number that rejected it.
   the trigger by name, which the audit reports; the others are the
   disable-and-restore and replaced-function cases, the known correctness gaps
   [Capture switched off and back on between two reconcile passes](../known-correctness-gaps.md#5-capture-switched-off-and-back-on-between-two-reconcile-passes) and
-  [A capture function body replaced by hand](../known-correctness-gaps.md#6-a-capture-function-body-replaced-by-hand).
+  [Operator changes inside Trellis-owned artifacts](../known-correctness-gaps.md#8-operator-changes-inside-trellis-owned-artifacts).
 - **Hosted compatibility** is core Postgres for everything required
   (statement triggers, transition tables, `SECURITY DEFINER`, the `TRIGGER`
   privilege); no event trigger is needed.
