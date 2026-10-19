@@ -131,6 +131,7 @@ use crate::intake::IntakeError;
 use crate::pool::Pool;
 use crate::staging::apply::ApplyError;
 use crate::staging::holdup::DrainFailure;
+use crate::staging::join_status::JoinStatus;
 use crate::staging::partition_correction::CorrectingNode;
 use crate::staging::quarantine::{self, HeldKeyRetry, HeldKeys};
 use crate::staging::self_check::{SelfCheckError, SelfCheckMode};
@@ -762,7 +763,7 @@ impl Trellis {
                 .query_opt(
                     &format!(
                         "select d.status, d.id, d.source_table, d.definition_text, d.grammar_version, \
-                            pb.table_name as backfill_table, pb.attempts as backfill_attempts, \
+                            d.join_table, pb.table_name as backfill_table, pb.attempts as backfill_attempts, \
                             pb.last_error as backfill_last_error, \
                             pb.next_attempt_at as backfill_next_attempt_at, \
                             {CHUNK_FAILURE_COLUMNS}, \
@@ -804,6 +805,7 @@ impl Trellis {
             let mut holdup = (None, None);
             let mut drain_failure = None;
             let mut unindexed = Vec::new();
+            let mut join = None;
             let mut correcting = Vec::new();
             if let Some(row) = &row {
                 let status_text: String = row.get(0);
@@ -843,6 +845,15 @@ impl Trellis {
                     unindexed =
                         unindexed_joins::for_definition(&*txn, row.get("source_table"), &def)
                             .await?;
+                    join = crate::staging::join_status::for_definition(
+                        &*txn,
+                        self.config.schema(),
+                        row.get(1),
+                        row.get("source_table"),
+                        row.get("join_table"),
+                        &def,
+                    )
+                    .await?;
                 }
             }
             txn.commit().await?;
@@ -860,6 +871,7 @@ impl Trellis {
                 ),
                 drain_failure,
                 unindexed_joins: unindexed,
+                join,
                 correcting,
                 build_wait: row
                     .get::<_, Option<i64>>("build_fence")
@@ -1976,6 +1988,12 @@ pub struct DefinitionStatus {
     /// do. Read live on each call, so an index created since shows. Empty
     /// when there is none; see `docs/recommendations.md`.
     pub unindexed_joins: Vec<UnindexedJoin>,
+    /// What a `JOIN` transform's hidden tables and join keys look like now
+    /// (#1112): their sizes, the `ON` columns with no usable index, and a
+    /// warning when `P` approaches the fact table's size. `None` for a
+    /// definition that isn't a `JOIN`. Read live on each call; a warning
+    /// only, it never changes the definition's status.
+    pub join: Option<JoinStatus>,
     /// The partitions of its partitioned source the definition is being
     /// corrected for (ADR-0017): one entry per node whose attach, detach,
     /// drop or truncate (or rows routing to no current leaf) the staging

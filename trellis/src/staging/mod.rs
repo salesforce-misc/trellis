@@ -73,6 +73,7 @@ pub(crate) mod holdup;
 #[cfg(any(test, feature = "test-util"))]
 pub mod interleave;
 pub(crate) mod join;
+pub(crate) mod join_status;
 pub(crate) mod ledger;
 pub mod liveness;
 pub(crate) mod one_to_one_ledger;
@@ -134,6 +135,7 @@ pub use seal::{SealConfig, recover_stuck_seals, seal_if_active_nonempty};
 // be unused.
 pub use capture_audit::CaptureFault;
 pub use holdup::DrainFailure;
+pub use join_status::{HiddenTableSize, JoinStatus, PartialsWarning};
 pub use partition_correction::CorrectingNode;
 pub use quarantine::HeldKeys;
 pub use self_check::{Divergence, SelfCheckMode, SelfCheckOutcome};

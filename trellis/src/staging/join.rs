@@ -683,7 +683,9 @@ pub(crate) async fn apply_join_target(
     pause!(txn, BeforeJoinLock, &plan.target);
     txn.execute(&plan.j_insert_sql(), &[]).await?;
     pause!(txn, AfterJoinKeyInsert, &plan.target);
+    let waiting_since = std::time::Instant::now();
     txn.execute(&plan.j_lock_sql(), &[]).await?;
+    crate::metrics::record_join_lock_wait(&plan.target, waiting_since.elapsed());
     pause!(txn, AfterJoinLock, &plan.target);
     for side in sides {
         if !side.plan.sides.is_empty() {

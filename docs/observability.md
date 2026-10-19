@@ -413,6 +413,29 @@ index you create shows on the next one, with no restart. A join column that no
 longer exists isn't listed. The CLI's `trellis status` prints one warning line per
 entry under the transform.
 
+`join` on `DefinitionStatus` is set for a `JOIN` transform (#1112) and `None` for any
+other. It reports three things, all warnings that leave the transform's status alone:
+
+- `hidden_tables`: the estimated rows (`pg_class.reltuples`, 0 before the first
+  analyze) and total on-disk size in bytes of `P`, `M`, `J` and `T`, the
+  transform's hidden tables ([ADR-0019](decisions/0019-join-transforms.md)).
+  Estimates keep the call cheap on large tables; they are as fresh as the table's
+  last `ANALYZE` or autovacuum.
+- `unindexed_on`: one entry per side of the `JOIN` (the `FROM` table and the joined
+  table) when no usable b-tree index leads with one of that side's `ON` columns.
+  `column` lists the side's join key, and the fix is an index on it, which Trellis
+  doesn't create. It is read from the catalog on each call, like `unindexed_joins`.
+- `partials_warning`: set once `P`'s estimated rows reach half of the `FROM` table's
+  (and the `FROM` table has at least 1000 estimated rows). `P` is the `FROM` table
+  grouped by its `GROUP BY` columns and join key, so a `P` near the table's size
+  means the grouping barely compresses it and the hidden table costs about as much
+  as the table it summarises.
+
+The time a `JOIN` page spends waiting for its `J` row locks is the histogram
+`trellis_join_lock_wait_seconds`, labelled by `transform`: a lock wait is another page
+or writer holding a join key, so a rising tail shows contention on hot keys.
+`trellis status` prints a `join tables` line and one warning line per finding.
+
 `self_check` refuses a 1-1 transform that reads a relationship with
 `UnsupportedExpr`, and an aggregate with `UnsupportedKeySpace`, when its job is
 started

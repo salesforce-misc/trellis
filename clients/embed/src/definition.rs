@@ -481,6 +481,7 @@ mod tests {
     #[test]
     fn a_healthy_status_crosses_as_its_word_with_no_failure() {
         let status = DefinitionStatus {
+            join: None,
             status: TransformStatus::Live,
             backfill_failure: None,
             capture_wait: None,
@@ -510,6 +511,7 @@ mod tests {
     #[test]
     fn held_keys_cross_with_their_oldest_poison_time_in_microseconds() {
         let status = DefinitionStatus {
+            join: None,
             status: TransformStatus::Live,
             backfill_failure: None,
             capture_wait: None,
@@ -538,6 +540,7 @@ mod tests {
     #[test]
     fn an_unindexed_join_crosses_with_its_fix() {
         let status = DefinitionStatus {
+            join: None,
             status: TransformStatus::Live,
             backfill_failure: None,
             capture_wait: None,
@@ -567,6 +570,7 @@ mod tests {
     #[test]
     fn a_correcting_node_crosses_with_its_queue_time_in_microseconds() {
         let status = DefinitionStatus {
+            join: None,
             status: TransformStatus::Backfilling,
             backfill_failure: None,
             capture_wait: None,
@@ -613,6 +617,7 @@ mod tests {
     fn a_drain_failure_crosses_with_its_times_in_microseconds() {
         let at = |micros| UNIX_EPOCH + Duration::from_micros(micros);
         let status = DefinitionStatus {
+            join: None,
             status: TransformStatus::Live,
             backfill_failure: None,
             capture_wait: None,
@@ -649,6 +654,7 @@ mod tests {
     #[test]
     fn a_backfill_failure_crosses_with_its_retry_time_in_microseconds() {
         let status = DefinitionStatus {
+            join: None,
             status: TransformStatus::WaitingToBackfill,
             backfill_failure: Some(BackfillFailure {
                 source_table: "public.orders".to_string(),
@@ -689,6 +695,7 @@ mod tests {
     fn a_capture_wait_and_failure_cross_with_their_times_in_microseconds() {
         let at = |micros| UNIX_EPOCH + Duration::from_micros(micros);
         let status = DefinitionStatus {
+            join: None,
             status: TransformStatus::CatchingUp,
             backfill_failure: None,
             capture_wait: Some(CaptureWait {

@@ -43,8 +43,8 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 use trellis::{
-    Config, CorrectingNode, DefinitionSummary, DrainFailure, RelationshipSummary, Trellis,
-    TrellisOptions, UnindexedJoin,
+    Config, CorrectingNode, DefinitionSummary, DrainFailure, JoinStatus, RelationshipSummary,
+    Trellis, TrellisOptions, UnindexedJoin,
 };
 
 use super::release::shell_quote;
@@ -137,6 +137,7 @@ async fn report(trellis: &Trellis) -> Result<String, String> {
             drain_failure: status.drain_failure,
             unindexed_joins: status.unindexed_joins,
             correcting: status.correcting,
+            join: status.join,
         });
         listed.push((def, warnings));
     }
@@ -195,6 +196,7 @@ struct StatusWarnings {
     drain_failure: Option<DrainFailure>,
     unindexed_joins: Vec<UnindexedJoin>,
     correcting: Vec<CorrectingNode>,
+    join: Option<JoinStatus>,
 }
 
 /// One line per definition, each followed by an indented line per thing
@@ -259,6 +261,10 @@ fn format_definitions(definitions: &[(DefinitionSummary, StatusWarnings)]) -> St
             for join in &warnings.unindexed_joins {
                 line.push_str(&format_unindexed_join(join));
             }
+            // #1112: a JOIN's hidden tables, and what to fix about its keys.
+            if let Some(join) = &warnings.join {
+                line.push_str(&format_join(join));
+            }
             line
         })
         .collect()
@@ -292,6 +298,34 @@ fn format_unindexed_join(join: &UnindexedJoin) -> String {
         join.column,
         join.fix()
     )
+}
+
+fn format_join(join: &JoinStatus) -> String {
+    let mut out = String::new();
+    if !join.hidden_tables.is_empty() {
+        let tables: Vec<String> = join
+            .hidden_tables
+            .iter()
+            .map(|t| format!("{}~{}rows/{}B", t.table, t.estimated_rows, t.bytes))
+            .collect();
+        out.push_str(&format!("    join tables {}\n", tables.join(" ")));
+    }
+    for on in &join.unindexed_on {
+        out.push_str(&format!(
+            "    warning: join key {}.({}) has no usable index; {}\n",
+            on.table,
+            on.column,
+            on.fix()
+        ));
+    }
+    if let Some(w) = &join.partials_warning {
+        out.push_str(&format!(
+            "    warning: P holds ~{} rows against ~{} in the fact table; \
+             the GROUP BY barely compresses it\n",
+            w.partials_rows, w.fact_rows
+        ));
+    }
+    out
 }
 
 fn format_drain_failure(failure: &DrainFailure) -> String {
