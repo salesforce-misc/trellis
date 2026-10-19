@@ -83,7 +83,12 @@ the staging worker installed it:
   `ATTACH PARTITION` or `INHERIT`, or the table dropped and recreated as one,
   and a statement trigger fires only for the table a statement names. The
   staging worker's reconcile pass runs the same check
-  (`defs::hierarchy`) and pauses the table's readers.
+  (`defs::hierarchy`) and pauses the table's readers. A partitioned root
+  whose tree the pass has recorded is no such fault: the pass pauses the
+  readers it doesn't comply for
+  ([ADR-0017](0017-partitioned-sources.md)). Its five triggers are checked
+  on each recorded node still in the tree, every one calling the root's
+  functions, and a fault is reported against the node.
 
 Any fault is reported as a `capture` divergence, and the report stops there:
 no recompute comparison runs, because it would only show the symptom. The

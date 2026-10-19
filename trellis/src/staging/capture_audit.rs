@@ -10,7 +10,10 @@
 //! statement names ([`crate::defs::hierarchy`]: define refuses such a table,
 //! but nothing refuses the later `ATTACH PARTITION` or `INHERIT`; the
 //! staging worker's capture pass pauses the table's readers for it, by the
-//! same check the audit runs). A function handed to a role without the privileges its body
+//! same check the audit runs). A partitioned root whose tree the pass has
+//! recorded is no such fault (ADR-0017): its five triggers are audited on
+//! every recorded node still in the tree, each calling the root's functions.
+//! A function handed to a role without the privileges its body
 //! uses, a `SECURITY INVOKER` function, or a privilege revoked from the
 //! Trellis role is loud instead: every captured write to the table fails,
 //! naming the capture function. The audit names the cause either way.
@@ -95,7 +98,7 @@ use serde::{Deserialize, Serialize};
 
 use tokio_postgres::GenericClient;
 
-use crate::capture::install::RING_OWNER;
+use crate::capture::install::{self, RING_OWNER};
 use crate::capture::sql::{CaptureEvent, function_name, trigger_name};
 use crate::capture::{CaptureError, partitions};
 use crate::defs::catalog::{self, CatalogError};
@@ -303,17 +306,13 @@ pub async fn audit(
             // A partitioned root the reconcile pass records complies (a root
             // that doesn't is paused by the pass), so it isn't a fault, but
             // each recorded node carries the root's function set on its own
-            // five triggers (ADR-0017).
+            // five triggers (ADR-0017). Only a node still in the tree is
+            // audited: one attached since the pass is bare until the next
+            // pass installs its triggers, and one detached since keeps them
+            // only until that pass drops them.
             let recorded = partitions::recorded(client, &table)
                 .await
-                .map_err(|e| match e {
-                    CaptureError::Db(e) => CatalogError::Db(e),
-                    CaptureError::Catalog(e) => e,
-                    // Only the read of `partition_sources` runs here.
-                    _ => CatalogError::Backfill(crate::intake::IntakeError::InvalidTableName(
-                        table.clone(),
-                    )),
-                })?;
+                .map_err(|e| capture_error(&table, e))?;
             faults.extend(
                 hierarchy::hierarchy(client, &table)
                     .await?
@@ -321,11 +320,21 @@ pub async fn audit(
                     .filter(|h| !(recorded.is_some() && matches!(h, Hierarchy::Partitioned { .. })))
                     .map(CaptureFault::Hierarchy),
             );
-            for node in recorded.iter().flat_map(|r| r.nodes.iter().skip(1)) {
-                if let Some(node_installed) =
-                    read_installed(client, schema, &table, &node.name).await?
-                {
-                    faults.extend(installed_faults(&node.name, &node_installed));
+            if let Some(recorded) = recorded {
+                let live: BTreeSet<String> = install::descendants(client, &table)
+                    .await
+                    .map_err(|e| capture_error(&table, e))?
+                    .into_iter()
+                    .collect();
+                for node in recorded.nodes.iter().skip(1) {
+                    if !live.contains(&node.name) {
+                        continue;
+                    }
+                    if let Some(node_installed) =
+                        read_installed(client, schema, &table, &node.name).await?
+                    {
+                        faults.extend(installed_faults(&node.name, &node_installed));
+                    }
                 }
             }
         }
@@ -433,8 +442,21 @@ struct EventCapture {
     security_definer: bool,
 }
 
+/// A [`CaptureError`] from the partition reads [`audit`] makes, which only
+/// query the catalog, as a [`CatalogError`].
+fn capture_error(table: &str, error: CaptureError) -> CatalogError {
+    match error {
+        CaptureError::Db(e) => CatalogError::Db(e),
+        CaptureError::Catalog(e) => e,
+        _ => CatalogError::Backfill(crate::intake::IntakeError::InvalidTableName(
+            table.to_string(),
+        )),
+    }
+}
+
 /// Reads `table`'s triggers and functions in one statement. `None` if the
 /// table doesn't exist.
+///
 /// `table` names the functions (a partitioned root's set serves every node);
 /// `node` is the table whose triggers are read (`table` itself, or one of its
 /// nodes).
