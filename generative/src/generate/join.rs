@@ -19,7 +19,9 @@
 //! ([`crate::oracle::render_join_select`]).
 //!
 //! The op stream ([`build_join_program`]) inserts, updates and deletes rows
-//! of both tables, one statement per op, with values `NULL` now and then
+//! of both tables, and now and then truncates one of them (ADR-0019's
+//! per-side `TRUNCATE`, #1110), one statement per op, with values `NULL` now
+//! and then
 //! (a `NULL` join key joins nothing). Its [`KeyShape`] decides how the join
 //! keys spread: over a dozen keys, mostly onto one hot key, over three keys
 //! that both tables keep writing (fan-out on both sides), or over enough
@@ -31,12 +33,10 @@
 //! bursts over several lanes, so both sides' writes race each other into
 //! the same sealed batches and onto the same keys.
 //!
-//! **Not drawn yet:** a `TRUNCATE` of either table. Until J5 (#1110) it
-//! halts the `JOIN` (TODO(#1110): draw `Op::Truncate` on either table once
-//! J5 maintains a `JOIN` across it). Nor are rows written before a
-//! definition exists: until the `JOIN` build (J4, #1109) a `JOIN` goes
-//! `live` only over two empty tables, so every definition is installed up
-//! front and the run waits for it before the first op
+//! **Not drawn yet:** rows written before a definition exists. Until the
+//! `JOIN` build (J4, #1109) a `JOIN` goes `live` only over two empty
+//! tables, so every definition is installed up front and the run waits for
+//! it before the first op
 //! ([`crate::model::ConcurrentPlan::settle_after_install`]).
 
 use trellis::IntWidth;
@@ -244,6 +244,8 @@ pub enum JoinOpKind {
     Insert,
     Update,
     Delete,
+    /// A `TRUNCATE` of the draw's table.
+    Truncate,
 }
 
 /// One drawn op, before [`build_join_program`] resolves it against the rows
@@ -272,9 +274,10 @@ pub struct JoinOpDraw {
 /// Resolves `draws` into ops on [`join_tables`], and builds the program with
 /// one definition per spec (`j0`, `j1`, …), all installed up front.
 ///
-/// An update or delete names a row the stream has inserted and not deleted
-/// yet; with none left on its table, it becomes an insert. Every op
-/// therefore succeeds.
+/// An update, delete or truncate names a row the stream has inserted and
+/// not deleted yet (a truncate, every one of its table's); with none left on
+/// its table, it becomes an insert. Every op therefore succeeds and changes
+/// a row. Ids aren't reused after a truncate.
 pub fn build_join_program(specs: &[JoinDefSpec], shape: KeyShape, draws: &[JoinOpDraw]) -> Program {
     let tables = join_tables();
     let mut live: [Vec<i64>; 2] = [Vec::new(), Vec::new()];
@@ -341,6 +344,13 @@ pub fn build_join_program(specs: &[JoinDefSpec], shape: KeyShape, draws: &[JoinO
                 Op::Delete {
                     table: table.to_string(),
                     pk: id.to_string(),
+                    expect: OpOutcome::Succeeds,
+                }
+            }
+            JoinOpKind::Truncate => {
+                live[side].clear();
+                Op::Truncate {
+                    table: table.to_string(),
                     expect: OpOutcome::Succeeds,
                 }
             }
@@ -435,16 +445,18 @@ mod strategy {
             })
     }
 
-    fn draw(joined_weight: u32) -> impl Strategy<Value = JoinOpDraw> {
+    /// One op draw. Without `truncating`, a drawn truncate is a delete.
+    fn draw(joined_weight: u32, truncating: bool) -> impl Strategy<Value = JoinOpDraw> {
         (
             prop_oneof![
                 10 - joined_weight => Just(false),
                 joined_weight => Just(true),
             ],
             prop_oneof![
-                4 => Just(JoinOpKind::Insert),
-                4 => Just(JoinOpKind::Update),
-                2 => Just(JoinOpKind::Delete),
+                40 => Just(JoinOpKind::Insert),
+                40 => Just(JoinOpKind::Update),
+                20 => Just(JoinOpKind::Delete),
+                1 => Just(JoinOpKind::Truncate),
             ],
             any::<usize>(),
             any::<u8>(),
@@ -453,28 +465,35 @@ mod strategy {
             prop_oneof![1 => Just(None), 9 => (-20i8..60).prop_map(Some)],
             0u8..16,
         )
-            .prop_map(
-                |(joined, kind, pick, key, t, group, value, columns)| JoinOpDraw {
+            .prop_map(move |(joined, kind, pick, key, t, group, value, columns)| {
+                JoinOpDraw {
                     joined,
-                    kind,
+                    kind: if kind == JoinOpKind::Truncate && !truncating {
+                        JoinOpKind::Delete
+                    } else {
+                        kind
+                    },
                     pick,
                     key,
                     t,
                     group,
                     value,
                     columns,
-                },
-            )
+                }
+            })
     }
 
     /// A JOIN-tier case: one to three definitions, a [`KeyShape`], 120 to
     /// [`MAX_OPS`] ops (half on each side for fan-out and wide, about a
-    /// third on the joined side otherwise), bursts of 40 to 600 ops over 2
+    /// third on the joined side otherwise; in half the cases, about one in a
+    /// hundred a `TRUNCATE`), bursts of 40 to 600 ops over 2
     /// to 4 lanes, against 2 to 6 drain workers sealing every 20 to 200 ms.
     /// A burst past the engine's split threshold (256 rows) can seal into
     /// one batch that several workers claim parts of. A `wide` case draws
     /// its burst size past that threshold, as its race needs two workers on
-    /// one batch.
+    /// one batch. A case that truncates a table issues all of that table's
+    /// ops from one lane (`super::concurrent_plan`), so the other half keeps
+    /// several lanes writing each table.
     pub fn join_case_strategy() -> impl Strategy<Value = JoinCase> {
         prop_oneof![
             Just(KeyShape::Spread),
@@ -482,7 +501,8 @@ mod strategy {
             Just(KeyShape::FanOut),
             Just(KeyShape::Wide)
         ]
-        .prop_flat_map(|shape| {
+        .prop_flat_map(|shape| (Just(shape), any::<bool>()))
+        .prop_flat_map(|(shape, truncating)| {
             let joined_weight = if matches!(shape, KeyShape::FanOut | KeyShape::Wide) {
                 5
             } else {
@@ -495,7 +515,7 @@ mod strategy {
             };
             (
                 proptest::collection::vec(spec(), 1..=3),
-                proptest::collection::vec(draw(joined_weight), 120..=MAX_OPS),
+                proptest::collection::vec(draw(joined_weight, truncating), 120..=MAX_OPS),
                 burst_size,
                 2usize..=4,
                 2usize..=6,
@@ -560,8 +580,9 @@ mod tests {
         }
     }
 
-    /// An update or delete always names a live row of its own table, so the
-    /// stream's every op succeeds, and a table with no live row inserts.
+    /// An update, delete or truncate always names a live row of its own
+    /// table, so the stream's every op succeeds, and a table with no live row
+    /// inserts; a truncate leaves its table none, and ids aren't reused.
     #[test]
     fn ops_name_live_rows_of_their_own_table() {
         let draw = |joined, kind, pick| JoinOpDraw {
@@ -583,6 +604,11 @@ mod tests {
                 draw(false, JoinOpKind::Insert, 0),
                 draw(false, JoinOpKind::Delete, 1),
                 draw(false, JoinOpKind::Update, 0),
+                draw(true, JoinOpKind::Truncate, 0),
+                draw(true, JoinOpKind::Update, 0),
+                draw(true, JoinOpKind::Truncate, 0),
+                draw(false, JoinOpKind::Truncate, 0),
+                draw(true, JoinOpKind::Delete, 0),
             ],
         );
         let shapes: Vec<String> = program
@@ -592,6 +618,7 @@ mod tests {
                 Op::Insert { table, row, .. } => format!("insert {table} {:?}", row[0].1),
                 Op::Update { table, pk, .. } => format!("update {table} {pk}"),
                 Op::Delete { table, pk, .. } => format!("delete {table} {pk}"),
+                Op::Truncate { table, .. } => format!("truncate {table}"),
                 other => panic!("{other:?}"),
             })
             .collect();
@@ -603,6 +630,11 @@ mod tests {
                 "insert ja Some(\"2\")",
                 "delete ja 2",
                 "update ja 1",
+                "truncate jb",
+                "insert jb Some(\"2\")",
+                "truncate jb",
+                "truncate ja",
+                "insert jb Some(\"3\")",
             ]
         );
     }

@@ -614,8 +614,9 @@ whose characters past `n` are all spaces (`'abcdefghij   '` after
 `varchar(10)` became `varchar(40)`) written to it and drained before the
 staging worker's next capture pass re-types the column Trellis copied it
 into, up to one `reconcile_interval` later. The copies are a 1-1 target's
-key and passthrough columns, and a to-one relationship projection's key and
-its column for each to-side column read through it.
+key and passthrough columns, a `JOIN` target's `GROUP BY` columns and its
+hidden tables' `GROUP BY` and `ON` columns, and a to-one relationship
+projection's key and its column for each to-side column read through it.
 
 **Effect:** silent. Postgres stores a value whose excess characters are all
 spaces in a `varchar(n)` column truncated to `n`, rather than failing it, so
@@ -625,7 +626,9 @@ its write, and its key is held and then released after the re-type (see
 value and rebuilds nothing, so the copy keeps the truncated value until its
 row is written again. A 1-1 key truncated this way leaves its target row
 under the truncated key: the source's later changes to the row write the
-full key, and nothing deletes the truncated row.
+full key, and nothing deletes the truncated row. A `JOIN` counts the row in
+a group under the truncated value the same way: its later changes are counted
+under the full value, and nothing takes it out of the truncated one.
 
 **Detected?** Only by `self_check`, on a 1-1 target.
 

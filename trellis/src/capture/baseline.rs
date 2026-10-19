@@ -683,10 +683,25 @@ async fn respond(
         Some(ValueType::Integer(_)) => None,
         other => Some(other.cloned()),
     };
-    if reader.source == table
-        && evaluated_as(definition.source_columns.get(column))
-            != evaluated_as(revalidated.source_columns.get(column))
-    {
+    // #1110: a `JOIN` evaluates its joined table's columns as their types
+    // were recorded for it too.
+    let (was, now) = if reader.source == table {
+        (
+            definition.source_columns.get(column).cloned(),
+            revalidated.source_columns.get(column).cloned(),
+        )
+    } else if let Some(sides) = revalidated.join.as_ref().filter(|s| s.joined == table) {
+        let recorded = crate::defs::catalog::join_side_of(txn, reader.id)
+            .await?
+            .and_then(|(_, columns)| columns.get(column).cloned());
+        (
+            recorded,
+            sides.joined_columns.get(column).map(|info| info.value_type),
+        )
+    } else {
+        (None, None)
+    };
+    if evaluated_as(was.as_ref()) != evaluated_as(now.as_ref()) {
         return Ok(Some(Response::Pause(format!(
             "{what}, which changes the type this definition evaluates it as"
         ))));

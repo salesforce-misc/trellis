@@ -550,3 +550,40 @@ async fn each_join_page_records_its_j_lock_wait() {
     }
     assert_eq!(count(), Some(2.0));
 }
+
+/// The capture audit covers both tables of a `JOIN` (#1110): capture
+/// triggers that aren't `ENABLE ALWAYS` on either table are reported as
+/// capture faults on that table, before any comparison, and nothing once
+/// they are again.
+#[tokio::test]
+async fn a_capture_fault_on_either_table_is_reported_before_the_comparison() {
+    let mut d = start(&[INNER]).await;
+    seed(&mut d).await;
+    for table in ["public.a", "public.b"] {
+        d.ctl
+            .batch_execute(&format!("alter table {table} disable trigger user"))
+            .await
+            .expect("disable capture");
+        let (found, compared, _) = walk(&d, "i", 100).await;
+        assert_eq!(compared, 0, "{table}: nothing is compared");
+        assert!(
+            !found.is_empty()
+                && found.iter().all(|f| matches!(
+                    f,
+                    Divergence::Capture(fault) if fault.table() == Some(table)
+                )),
+            "{table}: {found:?}"
+        );
+        d.ctl
+            .batch_execute(&format!(
+                "do $$ declare t text; begin \
+                   for t in select tgname from pg_catalog.pg_trigger \
+                            where tgrelid = '{table}'::regclass and not tgisinternal loop \
+                     execute format('alter table {table} enable always trigger %I', t); \
+                   end loop; end $$"
+            ))
+            .await
+            .expect("enable capture");
+        assert_eq!(walk(&d, "i", 100).await.0, Vec::new(), "{table}");
+    }
+}

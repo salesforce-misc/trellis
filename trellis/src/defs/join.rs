@@ -26,8 +26,11 @@
 //!   and a truncate of either side would take `FOR UPDATE`.
 //!
 //! They're fully derived: define creates them empty, `DROP TRANSFORM` drops
-//! them, and a resume drops and recreates them, so nothing checks their
-//! shape. The visible target holds only the declared columns.
+//! them, and a resume drops and recreates them. Between those, the columns
+//! typed from a side follow that side's widenings as every column Trellis
+//! copies does (`super::copies`): the staging worker's pass re-types them in
+//! place when only the catalog changes, and pauses the definition when one
+//! is outgrown. The visible target holds only the declared columns.
 //! `crate::staging::join` writes them.
 
 use std::collections::{BTreeSet, HashMap};
@@ -116,6 +119,38 @@ pub(crate) fn side_columns(def: &TransformDef, side: Side) -> BTreeSet<String> {
             });
         }
     }
+    columns
+}
+
+/// `def`'s `GROUP BY` keys in the order written, each with its side: the
+/// visible target's and `T`'s group columns.
+pub(crate) fn group_by_sides(def: &TransformDef) -> Vec<(Side, String)> {
+    let Some(join) = spec(def) else {
+        return Vec::new();
+    };
+    join.group_by
+        .iter()
+        .filter_map(|key| {
+            side_of_written(def, join, &key.table).map(|side| (side, key.column.clone()))
+        })
+        .collect()
+}
+
+/// The columns `expr`, one of `def`'s field expressions, reads, each once
+/// with its side, in the order first read.
+pub(crate) fn expr_columns(def: &TransformDef, expr: &Expr) -> Vec<(Side, String)> {
+    let Some(join) = spec(def) else {
+        return Vec::new();
+    };
+    let mut columns = Vec::new();
+    walk_columns(expr, &mut |c| {
+        if let Some(side) = side_of_written(def, join, &c.table) {
+            let read = (side, c.column.clone());
+            if !columns.contains(&read) {
+                columns.push(read);
+            }
+        }
+    });
     columns
 }
 
@@ -413,7 +448,7 @@ fn argument_type(
 /// aggregate's result type as Postgres gives it (`count` and `sum` over
 /// `smallint`/`integer` are `bigint`, `sum` over `bigint`/`numeric` and
 /// `avg` are `numeric`), and a composed field's inferred type.
-fn field_pg_type(
+pub(crate) fn field_pg_type(
     def: &TransformDef,
     field: &super::ast::FieldDef,
     from: &HashMap<String, JoinColumnInfo>,

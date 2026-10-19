@@ -18,7 +18,8 @@
 //! 2. the catalog state of every relation the comparison reads
 //!    ([`crate::defs::copies::inputs`]): the source, the to-side of each
 //!    relationship, the target and, for an aggregate, its ledger and
-//!    group-delta table, and each relationship's projection table.
+//!    group-delta table, each relationship's projection table, and, for a
+//!    `JOIN`, its joined table and its hidden tables.
 //!
 //! The *stamp* of a definition is its context and the [`fingerprint`] of each
 //! of those relations. A fingerprint covers the relation's oid (a dropped and
@@ -189,6 +190,7 @@ fn inputs_of(
         &reader.target,
         &declared,
         &projection_tables,
+        reader.join.as_deref().map(|joined| (reader.id, joined)),
     )
 }
 

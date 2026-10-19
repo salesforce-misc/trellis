@@ -11,7 +11,9 @@
 //! `jb.gb` (#1091 J2's S1), by `ja.ga, jb.gb` (S2) or by `ja.ga`, with
 //! `COUNT`/`SUM`/`AVG` fields on either side, an expression argument and
 //! composed fields; and 120 to 900 inserts, updates and deletes over both
-//! tables, with `NULL` keys, groups and values now and then. Its key shape
+//! tables, with `NULL` keys, groups and values now and then, and about one
+//! op in a hundred a `TRUNCATE` of either table (ADR-0019's per-side
+//! truncate, #1110). Its key shape
 //! is one of:
 //!
 //! - `spread`: a dozen join keys;
@@ -42,8 +44,6 @@
 //!
 //! # What it does not draw yet
 //!
-//! - A `TRUNCATE` of either table: it halts a `JOIN` until J5 (#1110).
-//!   TODO(#1110): add `Op::Truncate` draws on both tables once J5 lands.
 //! - Rows written before a definition exists, a mid-run install, a pause
 //!   and resume, or a re-read: a `JOIN` builds only over two empty tables
 //!   until J4 (#1109), so every definition is installed up front and the run
@@ -76,6 +76,7 @@ struct JoinCoverage {
     definitions: std::collections::BTreeMap<String, usize>,
     from_ops: usize,
     joined_ops: usize,
+    truncates: usize,
     coverage: generative::run::Coverage,
 }
 
@@ -105,6 +106,10 @@ impl JoinCoverage {
                 Op::Insert { table, .. } | Op::Update { table, .. } | Op::Delete { table, .. } => {
                     table
                 }
+                Op::Truncate { table, .. } => {
+                    self.truncates += 1;
+                    table
+                }
                 other => unreachable!("the JOIN tier draws no {other:?}"),
             };
             if table == "jb" {
@@ -124,7 +129,11 @@ impl std::fmt::Display for JoinCoverage {
         writeln!(f, "cases: {}", self.cases)?;
         writeln!(f, "key shapes: {:?}", self.shapes)?;
         writeln!(f, "definitions: {:?}", self.definitions)?;
-        writeln!(f, "ops: {} on ja, {} on jb", self.from_ops, self.joined_ops)?;
+        writeln!(
+            f,
+            "ops: {} on ja, {} on jb, {} of them truncates",
+            self.from_ops, self.joined_ops, self.truncates
+        )?;
         write!(f, "{}", self.coverage)
     }
 }
@@ -243,7 +252,8 @@ proptest! {
 
 /// A small hand-built case: a `LEFT` S1 on `k` and an `INNER` S2 on `(t,
 /// k)`, both tables written, rows moved between keys and groups, keys
-/// matched and unmatched, over two lanes and two workers.
+/// matched and unmatched, each table truncated once mid-stream, over two
+/// lanes and two workers.
 fn hand_built_case() -> JoinCase {
     let specs = [
         JoinDefSpec {
@@ -263,6 +273,7 @@ fn hand_built_case() -> JoinCase {
     for i in 0..48u8 {
         let joined = i % 3 == 0;
         let kind = match i % 5 {
+            _ if i == 21 || i == 34 => JoinOpKind::Truncate,
             0..=2 => JoinOpKind::Insert,
             3 => JoinOpKind::Update,
             _ => JoinOpKind::Delete,

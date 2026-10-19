@@ -72,8 +72,8 @@
 //! before that a missing trigger is expected. A paused or quarantined
 //! definition is frozen and reads nothing until it resumes.
 //!
-//! The tables are the definition's source and the to-side of every
-//! relationship it reads a column through, less any that is some
+//! The tables are the definition's source, a `JOIN`'s joined table, and
+//! the to-side of every relationship it reads a column through, less any that is some
 //! definition's target in this instance: the target-mutation seam feeds
 //! those, not a trigger (`defs::tables_to_capture`).
 //!
@@ -341,14 +341,16 @@ pub async fn audit(
     Ok(faults)
 }
 
-/// The tables `def` reads: its source and the to-side of each relationship
-/// it reads through, sorted, each with whether capture feeds it, which is
+/// The tables `def` reads: its source, a `JOIN`'s joined table, and the
+/// to-side of each relationship it reads through, sorted, each with whether capture feeds it, which is
 /// every table but a definition's target here (the seam feeds those).
 async fn read_tables(
     client: &impl GenericClient,
     def: &Definition,
 ) -> Result<Vec<(String, bool)>, CatalogError> {
     let mut tables = BTreeSet::from([def.source_table.clone()]);
+    // #1110: a `JOIN` reads its joined table as it reads its `FROM`.
+    tables.extend(catalog::join_table_of(client, def.id).await?);
     let names: BTreeSet<String> = crate::defs::eval::relationship_references(&def.def)
         .into_iter()
         .map(|(name, _)| name)

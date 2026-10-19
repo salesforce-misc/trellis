@@ -82,10 +82,13 @@ can serve as a relationship's join key against a column of that type. A
 takes its value family's type: `integer` or `bigint` by width, `text` for any
 string, unconstrained `numeric`, a temporal type at full precision. A to-one
 relationship's projection keys by the to-side column's exact type, and holds
-each to-side column read through it in that column's exact type.
+each to-side column read through it in that column's exact type. A `JOIN`
+holds its `GROUP BY` and `ON` columns in each column's exact type and
+collation, in its target and its hidden tables.
 
-A calculated field's column, an aggregate's field column and its ledger's
-contribution column (typed as the aggregate's argument) take the type
+A calculated field's column, an aggregate's or a `JOIN`'s field column and
+an aggregate ledger's contribution column (typed as the aggregate's
+argument) take the type
 define's inference gives their expression: `SUM` over an `integer` is
 `bigint`, `MIN` over one is `integer`.
 

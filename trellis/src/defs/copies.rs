@@ -13,13 +13,18 @@
 //!   to-side's join column, and the projection's column for each to-side
 //!   column a definition reads through the relationship (`author.name`,
 //!   `GROUP BY author.country`), typed as that to-side column.
+//! - a `JOIN` target's `GROUP BY` columns, and the same columns of its
+//!   hidden `T` table, typed as the column of the side each comes from, and
+//!   each side's hidden partials table's `GROUP BY` and join-key columns and
+//!   the hidden `J` table's join key, typed as that side's columns
+//!   ([`super::join::hidden_tables_ddl`]), each with its collation.
 //!
 //! Others are typed by an expression over source columns, as define's type
 //! inference ([`super::validate::infer_field_types`]) gives it from the
 //! source's column types:
 //!
 //! - a 1-1 target's calculated field (`qty + 1`);
-//! - an aggregate target's field column (`SUM(qty)`, `MIN(qty)`);
+//! - an aggregate or `JOIN` target's field column (`SUM(qty)`, `MIN(qty)`);
 //! - an aggregate ledger's contribution column, typed as the aggregate's
 //!   argument ([`super::ledger::contribution_pg_type`]).
 //!
@@ -52,9 +57,9 @@
 //! runs it for a definition only when a table it reads has changed since a
 //! comparison found every column current (`staging::drift_memo`, [`inputs`]).
 //!
-//! The ledger's `__from_key` is always `text`, and an aggregate's hidden
-//! partials (`numeric` sums, `bigint` counts) have fixed types, so none of
-//! them is checked.
+//! The ledger's `__from_key` is always `text`, and an aggregate's or a
+//! `JOIN`'s hidden partials (`numeric` sums, `bigint` counts) have fixed
+//! types, so none of them is checked.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -92,6 +97,11 @@ pub(crate) enum CopyKind {
     AggregateField,
     /// An aggregate ledger's contribution column, typed as its argument.
     Contribution,
+    /// A `JOIN` target's `GROUP BY` column, typed as its side's column.
+    JoinGroupBy,
+    /// A `JOIN`'s hidden-table column (`P`, `M`, `J` or `T`), typed as the
+    /// side's column it holds.
+    JoinHidden,
 }
 
 impl CopyKind {
@@ -169,10 +179,7 @@ pub(crate) async fn typed_copies(
             inferred: None,
         };
     match &def.key_space {
-        // #1107: a JOIN's hidden tables are rebuilt from scratch on resume,
-        // so they need no re-typing. Its visible target's re-typing on either
-        // side is #1110's (J5); until then it records no copies.
-        KeySpace::Join(_) => return Ok(Vec::new()),
+        KeySpace::Join(_) => return join_copies(client, schema, def, source, target).await,
         KeySpace::OneToOne => {
             let source_columns: HashSet<String> = client
                 .query(
@@ -323,11 +330,139 @@ pub(crate) async fn typed_copies(
     Ok(copies)
 }
 
+/// [`typed_copies`] for a `JOIN` definition, `def`, reading `source` (its
+/// `FROM` table, qualified) into `target` (qualified): its target's `GROUP
+/// BY` columns, its hidden tables' columns typed from a side's
+/// ([`super::join::hidden_tables_ddl`], in `schema`, the catalog schema),
+/// and its target's other fields, typed by
+/// [`super::join::field_pg_type`] from both sides' live columns. A field
+/// is left out while the definition doesn't validate against them, as
+/// [`inferred_copies`] leaves one out.
+async fn join_copies(
+    client: &impl GenericClient,
+    schema: &str,
+    def: &TransformDef,
+    source: &str,
+    target: &str,
+) -> Result<Vec<TypedCopy>, tokio_postgres::Error> {
+    use super::join::{HiddenTable, Side};
+    let Some(row) = client
+        .query_opt(
+            "select id, join_table from transform_definitions \
+             where target_table = $1 and join_table is not null",
+            &[&target],
+        )
+        .await?
+    else {
+        return Ok(Vec::new());
+    };
+    let (id, joined): (i64, String) = (row.get(0), row.get(1));
+    let side_table = |side: Side| match side {
+        Side::From => source.to_string(),
+        Side::Joined => joined.clone(),
+    };
+    let hidden = |table: HiddenTable| {
+        let name = table.name(id);
+        (
+            format!("{}.{}", quote_ident(schema), quote_ident(&name)),
+            format!("{schema}.{name}"),
+        )
+    };
+    let target_table = (
+        super::ddl::qualified_target_table_ident(target),
+        target.to_string(),
+    );
+    // One copy per table and column: a side's `GROUP BY` column may be its
+    // join key too.
+    let mut copies: Vec<TypedCopy> = Vec::new();
+    let mut push = |kind, (table, table_name): (String, String), side: Side, column: &str| {
+        if copies
+            .iter()
+            .any(|c| c.table == table && c.column == column)
+        {
+            return;
+        }
+        copies.push(TypedCopy {
+            kind,
+            table,
+            table_name,
+            column: column.to_string(),
+            reads: vec![(side_table(side), column.to_string())],
+            inferred: None,
+        });
+    };
+    for (side, column) in super::join::group_by_sides(def) {
+        push(CopyKind::JoinGroupBy, target_table.clone(), side, &column);
+        push(
+            CopyKind::JoinHidden,
+            hidden(HiddenTable::TargetPartials),
+            side,
+            &column,
+        );
+    }
+    for (side, table) in [
+        (Side::From, HiddenTable::FromPartials),
+        (Side::Joined, HiddenTable::JoinedPartials),
+    ] {
+        for column in super::join::side_key_columns(def, side) {
+            push(CopyKind::JoinHidden, hidden(table), side, &column);
+        }
+    }
+    // `J` is typed from the `FROM` side's join key: define holds each `ON`
+    // pair to one type.
+    for column in super::join::join_key(def, Side::From) {
+        push(
+            CopyKind::JoinHidden,
+            hidden(HiddenTable::Matches),
+            Side::From,
+            &column,
+        );
+    }
+    let sides =
+        match super::catalog::JoinSides::read(client, source.to_string(), joined.clone()).await {
+            Ok(sides) => sides,
+            Err(super::catalog::CatalogError::Db(err)) => return Err(err),
+            Err(_) => return Ok(copies),
+        };
+    let group_by: Vec<String> = super::join::group_by_sides(def)
+        .into_iter()
+        .map(|(_, column)| column)
+        .collect();
+    for field in &def.fields {
+        if group_by.contains(&field.name) {
+            continue;
+        }
+        let reads: Vec<(String, String)> = super::join::expr_columns(def, &field.expr)
+            .into_iter()
+            .map(|(side, column)| (side_table(side), column))
+            .collect();
+        if reads.is_empty() {
+            continue;
+        }
+        let Ok(inferred) =
+            super::join::field_pg_type(def, field, &sides.from_columns, &sides.joined_columns)
+        else {
+            continue;
+        };
+        copies.push(TypedCopy {
+            kind: CopyKind::AggregateField,
+            table: target_table.0.clone(),
+            table_name: target_table.1.clone(),
+            column: field.name.clone(),
+            reads,
+            inferred: Some(inferred),
+        });
+    }
+    Ok(copies)
+}
+
 /// Every relation [`typed_copies`] and [`inspect`] read for `def`, which
 /// reads `source` (qualified) into `target` (qualified), as SQL resolves
 /// them (`to_regclass` text): the source, the to-side of each of `rels`, the
 /// target and, for an aggregate, its ledger and group-delta table, and
 /// `projections`, the projection tables (bare names, in `schema`) of `rels`.
+/// For a `JOIN`, `join` is its definition id and its joined table
+/// (qualified), which adds that table and the hidden tables.
 /// A superset of the tables the copies are in and read from: the capture
 /// pass fingerprints these to skip the comparison while none changed
 /// (`staging::drift_memo`, #858). A table `typed_copies` starts reading
@@ -339,11 +474,20 @@ pub(crate) fn inputs(
     target: &str,
     rels: &[&RelationshipDefinition],
     projections: &[&str],
+    join: Option<(i64, &str)>,
 ) -> Vec<String> {
     let mut names = vec![
         super::ddl::regclass_arg(source),
         super::ddl::qualified_target_table_ident(target),
     ];
+    if let Some((id, joined)) = join {
+        names.push(super::ddl::regclass_arg(joined));
+        names.extend(
+            super::join::HiddenTable::ALL
+                .iter()
+                .map(|table| format!("{}.{}", quote_ident(schema), quote_ident(&table.name(id)))),
+        );
+    }
     names.extend(
         rels.iter()
             .map(|r| super::ddl::regclass_arg(&r.qualified_to_table())),

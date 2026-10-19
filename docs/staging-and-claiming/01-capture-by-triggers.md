@@ -300,13 +300,15 @@ over the new type: nothing marks the change. The rows the rewrite changes
 fire no trigger at all.
 
 So the same pass also checks, for every definition that reads the table,
-the columns it keys by there (its source key, its `GROUP BY` keys, and each
-relationship it reads through's join columns and to-side key) and the
+the columns it keys by there (its source key, its `GROUP BY` keys, a
+`JOIN`'s `ON` columns, and each relationship it reads through's join
+columns and to-side key) and the
 columns Trellis created from them with a type that comes from the source
 (`defs::copies`: a 1-1 target's key, passthrough and calculated columns, an
 aggregate's `GROUP BY` columns in its target, ledger and group-delta table,
-its field columns and its ledger's contribution columns, and a to-one
-relationship projection's key and its column for each to-side column read
+its field columns and its ledger's contribution columns, a `JOIN`'s
+`GROUP BY` and `ON` columns in its target and hidden tables and its field
+columns, and a to-one relationship projection's key and its column for each to-side column read
 through the relationship). A column typed by an expression is compared
 with the type define's inference gives the expression over the live
 schema. Before

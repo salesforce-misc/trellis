@@ -749,3 +749,217 @@ async fn a_target_a_join_reads_cannot_be_dropped_under_it() {
         1
     );
 }
+
+/// `format_type` of `column` of `table` (qualified), with its collation
+/// when it isn't the type's default.
+async fn column_type(raw: &Client, table: &str, column: &str) -> String {
+    raw.query_one(
+        "select pg_catalog.format_type(a.atttypid, a.atttypmod) \
+                || coalesce(' collate ' || co.collname, '') \
+         from pg_catalog.pg_attribute a \
+         join pg_catalog.pg_type t on t.oid = a.atttypid \
+         left join pg_catalog.pg_collation co \
+           on co.oid = a.attcollation and a.attcollation <> t.typcollation \
+         where a.attrelid = pg_catalog.to_regclass($1) and a.attname = $2",
+        &[&table, &column],
+    )
+    .await
+    .unwrap_or_else(|e| panic!("{table}.{column}: {e}"))
+    .get(0)
+}
+
+/// `target`'s definition is still waiting to be built, not paused.
+async fn assert_unpaused(trellis: &Trellis, target: &str) {
+    let status = trellis
+        .status(target)
+        .await
+        .expect("status")
+        .expect("defined");
+    assert_eq!(
+        status.status,
+        TransformStatus::WaitingToBackfill,
+        "{:?}",
+        status.capture_failure
+    );
+}
+
+/// #1110: the columns a JOIN copies from either table (its target's `GROUP
+/// BY` columns, `P`'s, `M`'s, `J`'s and `T`'s key columns, and its fields)
+/// follow a widening as a 1-1 or aggregate target's copies do. One that
+/// changes only the catalog is re-typed in place on the staging worker's
+/// pass, with its collation, and pauses nothing, an `ON` pair included once
+/// both columns have widened; one that outgrows a column (`SUM(qty)`'s
+/// `bigint` after `qty` goes `bigint`) pauses the JOIN, naming the column,
+/// and its resume re-types it.
+#[tokio::test]
+async fn a_widened_column_of_either_table_is_retyped_in_place_or_pauses_the_join() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect_raw(db.dsn()).await;
+    raw.batch_execute(
+        "set search_path to public;
+         create table orders (id integer primary key, code varchar(10) collate \"C\", \
+                              region varchar(10));
+         create table items (id integer primary key, order_code varchar(10) collate \"C\", \
+                             sku varchar(10), qty integer);
+         set search_path to trellis, public;",
+    )
+    .await
+    .expect("seed");
+    let trellis = define_only(db.dsn()).await;
+    trellis
+        .apply(
+            "TRANSFORM by_code FROM orders LEFT JOIN items \
+             ON orders.code = items.order_code GROUP BY orders.region, items.sku \
+             SELECT orders.region AS region, items.sku AS sku, COUNT(*) AS n, \
+                    SUM(items.qty) AS qty",
+        )
+        .await
+        .expect("define the JOIN");
+    pass(&mut raw, &db.pool).await;
+    let id = definition_id(&raw, "by_code").await;
+    let hidden = |part: &str| format!("{DEFAULT_SCHEMA}.join_{id}_{part}");
+    // A `GROUP BY` column of each table.
+    raw.batch_execute(
+        "alter table public.items alter column sku type varchar(40); \
+         alter table public.orders alter column region type text",
+    )
+    .await
+    .expect("widen");
+    pass(&mut raw, &db.pool).await;
+    assert_unpaused(&trellis, "by_code").await;
+    for (table, column, ty) in [
+        ("public.by_code", "sku", "character varying(40)"),
+        (&hidden("m"), "sku", "character varying(40)"),
+        (&hidden("t"), "sku", "character varying(40)"),
+        ("public.by_code", "region", "text"),
+        (&hidden("p"), "region", "text"),
+        (&hidden("t"), "region", "text"),
+    ] {
+        assert_eq!(
+            column_type(&raw, table, column).await,
+            ty,
+            "{table}.{column}"
+        );
+    }
+
+    // The `ON` pair, widened together, keeps its collation.
+    raw.batch_execute(
+        "begin; \
+         alter table public.orders alter column code type varchar(20) collate \"C\"; \
+         alter table public.items alter column order_code type varchar(20) collate \"C\"; \
+         commit",
+    )
+    .await
+    .expect("widen the ON pair");
+    pass(&mut raw, &db.pool).await;
+    assert_unpaused(&trellis, "by_code").await;
+    for (table, column) in [
+        (hidden("p"), "code"),
+        (hidden("j"), "code"),
+        (hidden("m"), "order_code"),
+    ] {
+        assert_eq!(
+            column_type(&raw, &table, column).await,
+            "character varying(20) collate C",
+            "{table}.{column}"
+        );
+    }
+
+    // A rewriting widening `SUM(items.qty)` outgrows.
+    raw.batch_execute("alter table public.items alter column qty type bigint")
+        .await
+        .expect("widen qty");
+    pass(&mut raw, &db.pool).await;
+    let status = trellis
+        .status("by_code")
+        .await
+        .expect("status")
+        .expect("defined");
+    assert_eq!(status.status, TransformStatus::Paused);
+    let failure = status.capture_failure.expect("the pause says why");
+    assert_eq!(failure.source_table, "public.items");
+    assert_eq!(failure.columns, vec!["qty".to_string()]);
+    assert!(
+        failure.error.contains("public.by_code.qty"),
+        "{}",
+        failure.error
+    );
+    assert_eq!(column_type(&raw, "public.by_code", "qty").await, "bigint");
+    trellis
+        .apply("RESUME TRANSFORM by_code")
+        .await
+        .expect("resume");
+    pass(&mut raw, &db.pool).await;
+    assert_eq!(column_type(&raw, "public.by_code", "qty").await, "numeric");
+}
+
+/// #1110: a column of the joined table retyped without a trigger to a type
+/// the JOIN evaluates differently (`timestamp` to `timestamptz` under a
+/// `COUNT`, which no copy of it outgrows) pauses the JOIN, as it does when
+/// the column is its `FROM` table's: the apply reads the joined table's
+/// images by the types define recorded for it.
+#[tokio::test]
+async fn a_joined_column_retyped_to_another_value_type_pauses_the_join() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect_raw(db.dsn()).await;
+    raw.batch_execute(
+        "set search_path to public;
+         create table orders (id integer primary key, region text, placed timestamp);
+         create table items (id integer primary key, order_id integer, sku text, \
+                             shipped timestamp);
+         insert into orders values (1, 'emea', '2026-01-01');
+         insert into items values (1, 1, 'a', '2026-01-02');
+         set search_path to trellis, public;",
+    )
+    .await
+    .expect("seed");
+    let trellis = define_only(db.dsn()).await;
+    trellis
+        .apply(
+            "TRANSFORM shipped FROM orders LEFT JOIN items \
+             ON orders.id = items.order_id GROUP BY orders.region \
+             SELECT orders.region AS region, COUNT(items.shipped) AS shipped, \
+                    COUNT(orders.placed) AS placed",
+        )
+        .await
+        .expect("define the JOIN");
+    pass(&mut raw, &db.pool).await;
+    assert_unpaused(&trellis, "shipped").await;
+
+    for (table, column) in [("public.items", "shipped"), ("public.orders", "placed")] {
+        raw.batch_execute(&format!(
+            "alter table {table} alter column {column} type timestamptz"
+        ))
+        .await
+        .expect("retype");
+        pass(&mut raw, &db.pool).await;
+        let status = trellis
+            .status("shipped")
+            .await
+            .expect("status")
+            .expect("defined");
+        assert_eq!(status.status, TransformStatus::Paused, "{table}");
+        let failure = status.capture_failure.expect("the pause says why");
+        assert_eq!(failure.source_table, table);
+        assert!(
+            failure
+                .error
+                .contains("changes the type this definition evaluates it as"),
+            "{}",
+            failure.error
+        );
+        raw.batch_execute(&format!(
+            "alter table {table} alter column {column} type timestamp"
+        ))
+        .await
+        .expect("retype back");
+        trellis
+            .apply("RESUME TRANSFORM shipped")
+            .await
+            .expect("resume");
+        pass(&mut raw, &db.pool).await;
+        assert_unpaused(&trellis, "shipped").await;
+    }
+}

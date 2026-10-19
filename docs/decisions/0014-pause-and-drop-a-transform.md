@@ -171,10 +171,11 @@ accepts a change to it without a pause. And the resume brings every column Trell
 created for the definition with a type that comes from the source to the type define
 would give it now. Some are copies of one source column: a 1-1 target's key and
 passthrough columns, an aggregate's `GROUP BY` columns in its target, ledger and
-group-delta table, and a to-one relationship projection's key and its column for each
+group-delta table, a `JOIN`'s `GROUP BY` and `ON` columns in its target and hidden
+tables, and a to-one relationship projection's key and its column for each
 to-side column read through the relationship. Others are typed by an expression, and
 take the type define's inference gives it over the live schema: a 1-1 target's
-calculated fields, an aggregate's field columns (`SUM(qty)` is `bigint` over an
+calculated fields, an aggregate's or a `JOIN`'s field columns (`SUM(qty)` is `bigint` over an
 `integer` `qty` and `numeric` over a `bigint` one), and its ledger's contribution
 columns, typed as the aggregate's argument. The staging worker's capture pass pauses a
 definition when the source widens past one of these columns, and the resume re-types
