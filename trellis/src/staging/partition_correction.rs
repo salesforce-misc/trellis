@@ -1253,9 +1253,9 @@ enum Ancestry {
 /// dropped ancestor's own `gone_node`, queued by the pass that sees it go,
 /// routes every group of its bound, the leaf's among them, so the leaf's
 /// correction is complete without work. If the leaf is still there, its rows
-/// still count: the pass that sees it moved queues a `new_leaf` of it, but
-/// that is this same queue entry while any reader keeps it queued, so this
-/// correction waits for the pass's record rather than completing.
+/// still count: the pass that sees it moved queues a `new_leaf` of it, which
+/// this entry absorbs while no reader has started it, so this correction
+/// waits for the pass's record rather than completing.
 async fn ancestry(
     pool: &Pool,
     correction: &PendingCorrection,

@@ -32,12 +32,14 @@
 //! The recompute ([`group_basis::recompute_routed`]) then locks the set in
 //! one sorted statement and rewrites each group from a `GROUP BY` of its
 //! rows, with that statement's snapshot as the group's basis, in one
-//! transaction with the correction's progress. The rows are read through the
+//! transaction that records the correction done. The rows are read through the
 //! root, one index probe per group, or, for a node in a tree that is still
 //! exactly as recorded, by one `GROUP BY` of the node ([`node_to_read`]).
-//! Every change the operation removed was committed before the pass queued
-//! the correction (the operation's lock on the node waits for its writers; a
-//! detach that is still pending is waited for), so the basis sees its
+//! Every change the operation removed was committed before the reader
+//! recorded its start ([`record_started`], before the enumeration: an
+//! operation the pass detects after it queues an entry of its own), as the
+//! operation's lock on the node waits for its writers and a detach that is
+//! still pending is waited for, so the basis sees its
 //! transaction, and its page refuses it. No `build_seg` stamp and no fence
 //! are needed. The definition reports `backfilling` from the pass that
 //! schedules the correction until the transaction commits, as under the
@@ -94,6 +96,9 @@ pub(super) async fn correct(
     }
     if budget_spent(options, outcome) {
         return Ok(Step::Stopped);
+    }
+    if !record_started(pool, fence, correction, definition).await? {
+        return Ok(Step::Superseded);
     }
     let recorded = {
         let client = pool.get().await?;
@@ -164,6 +169,43 @@ pub(super) async fn correct(
     outcome.pages += 1;
     outcome.keys += count;
     Ok(Step::Done)
+}
+
+/// Records that `definition` has started `correction`, under `fence`, before
+/// it reads anything of the node. The pass and the seal let a queued entry
+/// absorb a later operation on its node only while no reader has a progress
+/// row of it (ADR-0017), and this reader's enumeration may already miss what
+/// that operation changed: once the row is there, the operation queues an
+/// entry of its own. Returns `false`, with nothing written, when the fence no
+/// longer holds.
+async fn record_started(
+    pool: &Pool,
+    fence: &ClaimFence<'_>,
+    correction: &PendingCorrection,
+    definition: &Definition,
+) -> Result<bool, CorrectionError> {
+    let mut client = pool.get().await?;
+    let txn = client.transaction().await?;
+    fence.arm(&*txn).await?;
+    // The definition's row before the claim's (`ClaimFence`): the insert's
+    // foreign key takes it.
+    txn.execute(
+        "select 1 from transform_definitions where id = $1 for key share",
+        &[&definition.id],
+    )
+    .await?;
+    if !fence.hold(&*txn).await? {
+        txn.rollback().await?;
+        return Ok(false);
+    }
+    txn.execute(
+        "insert into partition_correction_progress (correction_id, definition_id, phase) \
+         values ($1, $2, $3) on conflict do nothing",
+        &[&correction.id, &definition.id, &Phase::Fence.as_str()],
+    )
+    .await?;
+    txn.commit().await?;
+    Ok(true)
 }
 
 /// The groups `correction` recomputes for `definition` (see the module

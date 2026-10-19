@@ -591,6 +591,59 @@ async fn a_group_first_written_after_the_enumeration_is_kept() {
     fx.assert_right("late group").await;
 }
 
+/// A re-attach detected after a reader enumerated a queued `new_leaf`'s
+/// groups, and before it recomputed them, queues its own entry (#1151): the
+/// reader has started, so its enumeration misses a group the leaf gained
+/// while it was detached, and the queued entry cannot absorb the operation.
+#[tokio::test]
+async fn a_reattach_detected_after_the_enumeration_queues_its_own_entry() {
+    let mut fx = Fx::start(
+        &tree("range"),
+        "insert into public.items select i, i % 14, i from generate_series(1, 140) i",
+    )
+    .await;
+    let reattach = "alter table public.items attach partition public.items_p3 \
+                    for values from (12) to (16)";
+    fx.exec(&format!(
+        "alter table public.items detach partition public.items_p3; \
+         insert into public.items_p3 values (3000, 12, 1); {reattach}"
+    ))
+    .await;
+    fx.pass().await;
+    assert_eq!(fx.kinds().await, ["new_leaf"]);
+    let mut run =
+        fx.d.run_frozen(
+            &[(PausePoint::BeforeCorrectionRecompute, "public.agg")],
+            |pool| async move {
+                Ok(
+                    partition_correction::run_pending(&pool, &Options::default())
+                        .await
+                        .expect("run the corrections"),
+                )
+            },
+        )
+        .await;
+    run.reached(PausePoint::BeforeCorrectionRecompute).await;
+    // Group 15 first appears in the leaf while it is detached: uncaptured,
+    // and outside the set the paused reader enumerated.
+    fx.exec(&format!(
+        "alter table public.items detach partition public.items_p3; \
+         insert into public.items_p3 values (3100, 15, 7); {reattach}"
+    ))
+    .await;
+    fx.pass().await;
+    assert_eq!(
+        fx.kinds().await,
+        ["new_leaf", "new_leaf"],
+        "the started entry does not absorb the re-attach"
+    );
+    fx.d.release(&mut run, PausePoint::BeforeCorrectionRecompute)
+        .await;
+    run.finish().await;
+    fx.correct().await;
+    fx.assert_right("re-attach after the enumeration").await;
+}
+
 /// X12-7e: writes into the leaf land while its correction holds the
 /// recomputed groups: one committed before the recompute's snapshot is
 /// counted by it and refused by its basis; one after it applies.
