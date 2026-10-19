@@ -372,15 +372,16 @@ async fn an_undrained_change_naming_a_new_group_of_a_dropped_leaf_is_refused() {
     fx.exec("drop table public.items_p1").await;
     fx.pass().await;
     fx.run().await;
-    fx.d.settle().await;
-    fx.assert_right("stale new group").await;
-    // The recompute wrote group 6 at zero with a basis, which refused the
-    // insert's page.
+    // The recompute wrote group 6 at zero with a basis, which refuses the
+    // insert's page. Checked before the drain: once it has drained, the
+    // zero-group collection removes the zero groups.
     assert_eq!(
         fx.hidden_groups().await,
         ["(4,0,t)", "(5,0,t)", "(6,0,t)"],
         "groups corrected: the target's and the ring's"
     );
+    fx.d.settle().await;
+    fx.assert_right("stale new group").await;
 }
 
 /// `P.truncate-leaf`: a leaf truncated with undrained changes, then a new
