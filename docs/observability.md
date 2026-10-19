@@ -320,6 +320,12 @@ pause are arcs of one lifecycle:
     subscription came to apply to a table it reads) or its target came under
     row-level security: `DefinitionStatus::capture_failure` names the table, the
     columns and the cause;
+  * the database was restored from a dump and the transform reads a partitioned
+    source ([ADR-0017](decisions/0017-partitioned-sources.md)): Trellis's
+    recorded partitions name the dump's tables, so nothing is corrected from
+    them. `capture_failure` reads "the database was restored from a dump, so
+    Trellis's recorded partitions of `<table>` no longer match its tables;
+    resume the definition to rebuild it, or drop the definition";
   * its build kept failing in a way no retry gets past: the error stays on
     `backfill_failure`;
   * the drain hit a failure that every key reproduces (a source with no usable

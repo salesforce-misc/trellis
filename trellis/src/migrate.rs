@@ -16,6 +16,15 @@
 //! Before the runner ever touches the schema, [`crate::identity`] decides
 //! whether attaching to it is safe at all — see that module for what
 //! "safe" means.
+//!
+//! # Rebuilding a catalog table
+//!
+//! A migration must never rebuild `partition_sources` or `capture_baselines`
+//! by create-copy-rename; use `ALTER`. Rows copied into a new table look
+//! exactly like a dump and restore: `partition_sources` records the oid of
+//! the table that holds each row, and a stored oid that no longer names it
+//! pauses every definition over a partitioned source (ADR-0017). Any
+//! `ALTER`, rewriting or not, keeps the oid.
 
 mod embedded {
     #![allow(clippy::needless_raw_string_hashes)]

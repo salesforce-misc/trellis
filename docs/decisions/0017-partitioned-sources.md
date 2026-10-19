@@ -390,18 +390,43 @@ target, once.
 
 ### `pg_upgrade` re-baselines the recorded state; a restore pauses for a rebuild
 
-A changed `system_identifier` makes the pass compare the recorded nodes by oid
-and bound. When every recorded oid is present with the same bound it is
-`pg_upgrade`: the pass re-records the `xmin`s and `relpartbound` texts.
+Each recorded source also stores the cluster's `system_identifier` and the oid
+of Trellis's own `partition_sources` table, written with the row. A restore has
+to recreate that table to bring the rows back (a dropped and recreated
+database, `pg_restore --clean`, a restore into another cluster, a data-only
+load into freshly created tables), so the stored oid no longer names it. DDL
+on a source can't change it; `VACUUM FULL`, `CLUSTER` and pg_repack change the
+file node, not the oid; `pg_upgrade`, promoting a replica, point-in-time
+recovery and `CREATE DATABASE … TEMPLATE` keep every oid. Rows copied into a
+new table look exactly like a restore, so a Trellis migration never rebuilds
+`partition_sources` (or `capture_baselines`) by create-copy-rename, only with
+`ALTER`.
+
+A deep check compares them in this order:
+
+1. The stored catalog oid differs from the live one: a restore.
+2. Otherwise a changed `system_identifier` compares the recorded nodes by oid
+   and bound. When every recorded oid is present with the same bound it is
+   `pg_upgrade`; anything else is a restore.
+3. Otherwise the ordinary plan runs. A root dropped and recreated, or swapped
+   in by renames, keeps both values: it is the old tree gone and a new one
+   created, corrected per node, not a restore.
+
+On `pg_upgrade` the pass re-records the `xmin`s and `relpartbound` texts.
 `pg_upgrade` resets every `pg_inherits.xmin` and `pg_class.xmin` to one value,
 and from 16 to 17 it rewrites `relpartbound`'s internal text, so without this
 every leaf would read as new and trigger a full re-aggregate. Oids, constraint
 texts and the hash opclass survive it.
 
-Otherwise it is a dump and restore, which gives new oids and breaks the recorded
-`HASH` texts. The pass pauses every definition with a partitioned source, with a
-`capture_failure` naming the restore, and runs no sweep, no correction and no
-routing from the recorded state. `RESUME` rebuilds as every resume does and
+A dump and restore gives new oids and breaks the recorded `HASH` texts, which
+embed the parent's oid. The pass pauses every definition with a partitioned
+source, with a `capture_failure` naming the restore, and runs no sweep, no
+correction and no routing from the recorded state. That includes corrections
+queued when the dump was taken, which came back with it: the pass removes them
+in the transaction that pauses, and until a pass has classified the change the
+correction engine sees no correction of a source whose stored catalog oid or
+identifier differs from the live one. The pass then records the live tree as a
+first sight. `RESUME` rebuilds as every resume does and
 re-records the nodes, texts and fingerprints; nothing about the definition is
 non-compliant, so it doesn't refuse. Definitions without a partitioned source are
 untouched. Rebuilding automatically would take the choice of when to pay for a
@@ -480,8 +505,8 @@ grouped `BY product_id` is refused at define, naming `order_id`.
   key, or an untested key type, is refused rather than handled slowly.
 - A retention `DROP` takes the definition out of `live` for as long as its
   correction runs, which can be minutes for a large leaf.
-- After a dump and restore into another cluster the pass detects the new oids
-  and pauses every definition on a partitioned source, holding stale values
+- After any dump and restore the pass pauses every definition on a
+  partitioned source, holding stale values
   until an operator runs `RESUME`, which rebuilds.
 - Five cases are left as [known correctness gaps](../known-correctness-gaps.md)
   rather than designed around, because no capture shape or fingerprint sees

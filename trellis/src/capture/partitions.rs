@@ -85,6 +85,32 @@
 //! gone plus created. Capture's functions never need regenerating: they name
 //! the source, and the source is again what the name resolves to.
 //!
+//! # `pg_upgrade` and a restore
+//!
+//! Each row also records the cluster's `system_identifier` and the oid of
+//! `partition_sources` itself. A deep check compares them first
+//! ([`classify_cluster`]):
+//!
+//! 1. a stored catalog oid that no longer names the table holding the row is
+//!    a **restore**: rows only reach a new table by being dumped and loaded
+//!    (or copied, which a migration must never do: [`crate::migrate`]);
+//! 2. otherwise a changed identifier with every recorded oid present under
+//!    the same bound is **`pg_upgrade`**: the pass records the live `xmin`s
+//!    and corrects nothing. Any other changed identifier is a restore;
+//! 3. otherwise the ordinary plan runs. A root dropped and recreated, or
+//!    swapped in by renames, keeps both values: it is gone plus created.
+//!
+//! On a restore the recorded texts name the dump's oids, so nothing is
+//! routed from them: one transaction pauses every definition that reads the
+//! source with a `capture_failure` naming the restore, removes the queued
+//! corrections and forgets the recorded tree, and the pass installs nothing
+//! and runs no sweep. [`pending_corrections`] hides a source's corrections
+//! while its stored catalog oid or identifier differs, so the engine runs
+//! none of them before the pass has classified the change (after
+//! `pg_upgrade` they are valid, and show again once the pass records the new
+//! identifier). The next pass records the live tree as a
+//! first sight, and a resume rebuilds each definition from its source.
+//!
 //! No event trigger is used, and nothing here needs a superuser.
 
 use std::collections::{HashMap, HashSet};
@@ -369,30 +395,45 @@ pub fn plan(prev: Option<&Recorded>, live: &Recorded, renamed: bool) -> Plan {
     Plan { corrections, fetch }
 }
 
-/// What a changed `system_identifier` says happened to the cluster
-/// (ADR-0017 P8).
+/// What the recorded state says happened to the database (ADR-0017 P8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClusterChange {
-    /// The identifier is the one recorded, or none was recorded.
+    /// The catalog oid and the identifier are the ones recorded (or no
+    /// identifier was recorded): the ordinary plan runs.
     Unchanged,
-    /// Every recorded oid is present with the bound it had: `pg_upgrade`,
-    /// which keeps oids and bounds and resets every `xmin`.
+    /// Under a changed identifier, every recorded oid is present with the
+    /// bound it had: `pg_upgrade`, which keeps oids and bounds and resets
+    /// every `xmin`.
     PgUpgrade,
-    /// Some recorded oid is gone or has another bound: the tree was dumped
-    /// and restored.
+    /// The recorded state was dumped and restored: the stored oid of
+    /// `partition_sources` no longer names the table holding the row, or,
+    /// under a changed identifier, some recorded oid is gone or has another
+    /// bound.
     Restored,
 }
 
-/// Classifies the live cluster against the recorded one. `stored` is the
-/// `system_identifier` recorded with the tree, `None` when none was.
+/// Classifies the live database against the recorded state, in the order
+/// #1052 decided: (1) the stored oid of `partition_sources` (`catalog`, as
+/// stored and live) differs: a restore; (2) otherwise a changed
+/// `system_identifier` compares the recorded nodes with the live ones; (3)
+/// otherwise nothing changed. `stored` is the identifier recorded with the
+/// tree, `None` when none was.
+///
+/// A root dropped and recreated, or swapped in by renames, changes neither
+/// the catalog oid nor the identifier: it is no restore, and the ordinary
+/// plan classifies it.
 ///
 /// Pure: the decision over two snapshots, tested without a database.
 pub fn classify_cluster(
+    catalog: (u32, u32),
     stored: Option<&str>,
     live_id: &str,
     prev: &Recorded,
     live: &Recorded,
 ) -> ClusterChange {
+    if catalog.0 != catalog.1 {
+        return ClusterChange::Restored;
+    }
     match stored {
         Some(id) if id != live_id => {}
         _ => return ClusterChange::Unchanged,
@@ -642,6 +683,8 @@ struct Stored {
     lifecycle: String,
     compliance: String,
     system_identifier: Option<String>,
+    /// `(stored, live)` oid of `partition_sources` itself.
+    catalog_oid: (u32, u32),
     recorded: Recorded,
     stale: bool,
     noncompliant: bool,
@@ -654,7 +697,8 @@ async fn load_state(
     let Some(row) = client
         .query_opt(
             "select root_oid, lifecycle_fp, compliance_fp, nodes::text, stale, noncompliant, \
-                    system_identifier \
+                    system_identifier, catalog_oid::bigint, \
+                    pg_catalog.to_regclass('partition_sources')::oid::bigint \
              from partition_sources where table_name = $1",
             &[&table],
         )
@@ -673,6 +717,7 @@ async fn load_state(
         lifecycle: row.get(1),
         compliance: row.get(2),
         system_identifier: row.get(6),
+        catalog_oid: (row.get::<_, i64>(7) as u32, row.get::<_, i64>(8) as u32),
         recorded,
         stale: row.get(4),
         noncompliant: row.get(5),
@@ -765,6 +810,7 @@ pub(crate) async fn begin(
             && s.compliance == fingerprints.compliance
             && s.root_oid == fingerprints.root_oid
             && s.system_identifier.as_deref() == Some(fingerprints.system_identifier.as_str())
+            && s.catalog_oid.0 == s.catalog_oid.1
             && !s.stale
             && !s.noncompliant
     }) && was_checked(instance, table);
@@ -791,6 +837,19 @@ pub(crate) async fn begin(
         // Raced a DDL; the next pass reads it again.
         return Ok(Begin::Held { deep: false });
     };
+    let change = stored.as_ref().map(|s| {
+        classify_cluster(
+            s.catalog_oid,
+            s.system_identifier.as_deref(),
+            &fingerprints.system_identifier,
+            &s.recorded,
+            &live,
+        )
+    });
+    if change == Some(ClusterChange::Restored) {
+        pause_restored(client, catalog, table).await?;
+        return Ok(Begin::Held { deep: true });
+    }
     // Every reader the tree doesn't comply for, paused or not: one paused by
     // an earlier pass (or by this check before a crash) still holds the
     // source, so the pass keeps checking and installs nothing.
@@ -812,13 +871,7 @@ pub(crate) async fn begin(
     // `pg_upgrade` resets every `xmin`; the plan then compares against the
     // recorded tree with the live ones, and the tree is recorded again below.
     let rebaselined = stored.as_ref().and_then(|s| {
-        (classify_cluster(
-            s.system_identifier.as_deref(),
-            &fingerprints.system_identifier,
-            &s.recorded,
-            &live,
-        ) == ClusterChange::PgUpgrade)
-            .then(|| rebaseline(&s.recorded, &live))
+        (change == Some(ClusterChange::PgUpgrade)).then(|| rebaseline(&s.recorded, &live))
     });
     let prev = rebaselined
         .as_ref()
@@ -897,13 +950,15 @@ async fn write_state(
     txn.execute(
         "insert into partition_sources as s \
              (table_name, root_oid, lifecycle_fp, compliance_fp, nodes, stale, noncompliant, \
-              system_identifier) \
-         values ($1, $2, $3, $4, $5::text::jsonb, false, $6, $7) \
+              system_identifier, catalog_oid) \
+         values ($1, $2, $3, $4, $5::text::jsonb, false, $6, $7, \
+                 pg_catalog.to_regclass('partition_sources')) \
          on conflict (table_name) do update set \
              root_oid = excluded.root_oid, lifecycle_fp = excluded.lifecycle_fp, \
              compliance_fp = excluded.compliance_fp, nodes = excluded.nodes, \
              stale = false, noncompliant = excluded.noncompliant, \
-             system_identifier = excluded.system_identifier",
+             system_identifier = excluded.system_identifier, \
+             catalog_oid = excluded.catalog_oid",
         &[
             &table,
             &i64::from(record.fingerprints.root_oid),
@@ -937,6 +992,51 @@ async fn write_state(
         )
         .await?;
     }
+    txn.commit().await?;
+    Ok(())
+}
+
+/// The `capture_failure` of a definition paused because its partitioned
+/// source's recorded state was restored from a dump.
+pub fn restored_reason(table: &str) -> String {
+    format!(
+        "the database was restored from a dump, so Trellis's recorded partitions of {table} \
+         no longer match its tables; resume the definition to rebuild it, or drop the definition"
+    )
+}
+
+/// The response to a restore (ADR-0017 P8, #1052): in one transaction,
+/// pauses every definition that reads `table` with [`restored_reason`],
+/// removes the corrections queued from the restored state (they route by
+/// texts naming the dump's oids) and forgets the recorded tree. Nothing is
+/// routed from the recorded state; the next pass records the live tree as
+/// a first sight, and a resume rebuilds each definition from its source.
+async fn pause_restored(
+    client: &mut Client,
+    catalog: &CaptureCatalog,
+    table: &str,
+) -> Result<(), CaptureError> {
+    let readers =
+        super::columns::readers_of(catalog, table, &std::collections::BTreeSet::new(), true);
+    let error = restored_reason(table);
+    let txn = client.transaction().await?;
+    for id in readers {
+        if crate::defs::lifecycle::pause_for_capture_failure(&txn, id, table, &[], &error, None)
+            .await?
+        {
+            crate::instance_log::warn!(transform_id = id, table = %table, "definition paused: {error}");
+        }
+    }
+    txn.execute(
+        "delete from partition_corrections where table_name = $1",
+        &[&table],
+    )
+    .await?;
+    txn.execute(
+        "delete from partition_sources where table_name = $1",
+        &[&table],
+    )
+    .await?;
     txn.commit().await?;
     Ok(())
 }
@@ -1212,7 +1312,10 @@ pub struct PendingCorrection {
     pub queued_lsn: String,
 }
 
-/// Every queued correction of `table`, oldest first.
+/// Every queued correction of `table`, oldest first. None while the source's
+/// stored catalog oid or `system_identifier` differs from the live one:
+/// until the pass has told `pg_upgrade` from a restore, they may route by
+/// texts naming the dump's oids.
 pub async fn pending_corrections(
     client: &impl GenericClient,
     table: &str,
@@ -1221,7 +1324,15 @@ pub async fn pending_corrections(
         .query(
             "select id, table_name, kind, node_oid, node_name, cause, constraint_text, \
                     node_default, parent_oid, queued_lsn::text \
-             from partition_corrections where table_name = $1 order by id",
+             from partition_corrections c where table_name = $1 \
+               and not exists (select 1 from partition_sources s \
+                               where s.table_name = c.table_name \
+                                 and (s.catalog_oid \
+                                          <> pg_catalog.to_regclass('partition_sources') \
+                                      or s.system_identifier <> \
+                                          (select system_identifier::text \
+                                           from pg_catalog.pg_control_system()))) \
+             order by id",
             &[&table],
         )
         .await?;
@@ -1517,7 +1628,7 @@ mod tests {
             n.inherits_xmin = n.inherits_xmin.as_ref().map(|_| "1".to_string());
         }
         assert_eq!(
-            classify_cluster(Some("a"), "b", &base(), &live),
+            classify_cluster((7, 7), Some("a"), "b", &base(), &live),
             ClusterChange::PgUpgrade
         );
         // Re-baselined, the plan sees nothing to correct.
@@ -1541,7 +1652,7 @@ mod tests {
         live.nodes.push(middle);
         live.nodes.push(node(5, Some(1), "FOR VALUES IN (4)", "1"));
         assert_eq!(
-            classify_cluster(Some("a"), "b", &base(), &live),
+            classify_cluster((7, 7), Some("a"), "b", &base(), &live),
             ClusterChange::PgUpgrade
         );
         let plan = plan(Some(&rebaseline(&base(), &live)), &live, false);
@@ -1556,13 +1667,13 @@ mod tests {
         let mut gone = base();
         gone.nodes.pop();
         assert_eq!(
-            classify_cluster(Some("a"), "b", &base(), &gone),
+            classify_cluster((7, 7), Some("a"), "b", &base(), &gone),
             ClusterChange::Restored
         );
         let mut rebound = base();
         rebound.nodes[1].bound = Some("FOR VALUES IN (9)".to_string());
         assert_eq!(
-            classify_cluster(Some("a"), "b", &base(), &rebound),
+            classify_cluster((7, 7), Some("a"), "b", &base(), &rebound),
             ClusterChange::Restored
         );
     }
@@ -1570,11 +1681,48 @@ mod tests {
     #[test]
     fn the_same_or_an_unrecorded_identifier_is_no_cluster_change() {
         assert_eq!(
-            classify_cluster(Some("a"), "a", &base(), &base()),
+            classify_cluster((7, 7), Some("a"), "a", &base(), &base()),
             ClusterChange::Unchanged
         );
         assert_eq!(
-            classify_cluster(None, "a", &base(), &base()),
+            classify_cluster((7, 7), None, "a", &base(), &base()),
+            ClusterChange::Unchanged
+        );
+    }
+
+    /// #1052 rule 2, step 1: a changed catalog oid is a restore whatever the
+    /// identifier and the nodes say, so it comes before the `pg_upgrade`
+    /// comparison.
+    #[test]
+    fn a_changed_catalog_oid_is_a_restore_before_anything_else() {
+        // Same identifier, every node as recorded.
+        assert_eq!(
+            classify_cluster((7, 8), Some("a"), "a", &base(), &base()),
+            ClusterChange::Restored
+        );
+        // A changed identifier whose nodes would read as `pg_upgrade`.
+        assert_eq!(
+            classify_cluster((7, 8), Some("a"), "b", &base(), &base()),
+            ClusterChange::Restored
+        );
+        assert_eq!(
+            classify_cluster((7, 8), None, "a", &base(), &base()),
+            ClusterChange::Restored
+        );
+    }
+
+    /// Step 3: a root dropped and recreated (every oid new) under the same
+    /// identifier and catalog oid is no restore; the ordinary plan sees the
+    /// old tree gone and the new one created.
+    #[test]
+    fn a_recreated_root_under_the_same_identifier_and_catalog_is_no_restore() {
+        let mut recreated = base();
+        for n in &mut recreated.nodes {
+            n.oid += 100;
+            n.parent = n.parent.map(|p| p + 100);
+        }
+        assert_eq!(
+            classify_cluster((7, 7), Some("a"), "a", &base(), &recreated),
             ClusterChange::Unchanged
         );
     }
