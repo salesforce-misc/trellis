@@ -866,10 +866,14 @@ async fn attempt(
             &format!(
                 "insert into {schema_ident}.partition_corrections \
                      (table_name, kind, node_oid, node_name, cause, constraint_text) \
-                 values ($1, $2, $3, $1, $2, $4) \
-                 on conflict (table_name, kind, node_oid, \
-                              (md5(coalesce(constraint_text, '')))) \
-                     where kind <> 'truncated' do nothing"
+                 select $1::text, $2::text, $3::bigint, $1::text, $2::text, $4::text \
+                 where not exists ( \
+                     select 1 from {schema_ident}.partition_corrections c \
+                     where c.table_name = $1 and c.kind = $2 and c.node_oid = $3 \
+                       and c.constraint_text is not distinct from $4 \
+                       and not exists (select 1 \
+                                       from {schema_ident}.partition_correction_progress p \
+                                       where p.correction_id = c.id))"
             ),
             &[
                 &table,

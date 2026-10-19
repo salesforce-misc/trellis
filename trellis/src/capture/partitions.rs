@@ -975,10 +975,13 @@ async fn write_state(
             "insert into partition_corrections \
                  (table_name, kind, node_oid, node_name, cause, constraint_text, node_default, \
                   parent_oid) \
-             values ($1, $2, $3, $4, $5, $6, $7, $8) \
-             on conflict (table_name, kind, node_oid, \
-                          (md5(coalesce(constraint_text, '')))) \
-                 where kind <> 'truncated' do nothing",
+             select $1::text, $2::text, $3::bigint, $4::text, $5::text, $6::text, $7::boolean, $8::bigint \
+             where not exists ( \
+                 select 1 from partition_corrections c \
+                 where c.table_name = $1 and c.kind = $2 and c.node_oid = $3 \
+                   and c.constraint_text is not distinct from $6 \
+                   and not exists (select 1 from partition_correction_progress p \
+                                   where p.correction_id = c.id))",
             &[
                 &table,
                 &correction.kind.as_str(),

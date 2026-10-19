@@ -1296,6 +1296,128 @@ async fn a_leaf_attached_again_before_its_correction_ran_does_not_hold_the_queue
     }
 }
 
+const SECOND_AGG: &str =
+    "TRANSFORM agg2 FROM public.items GROUP BY g SELECT MAX(v) AS top, COUNT(*) AS n";
+
+const RANGE_P2: &str = "alter table public.items attach partition public.items_p2 \
+     for values from (8) to (12)";
+
+/// A re-attach detected while an older `new_leaf` of the leaf is held by a
+/// paused reader queues its own entry, so the reader that finished the older
+/// one corrects the later operation too (#1151).
+#[tokio::test]
+async fn a_new_leaf_detected_while_an_older_one_is_held_by_a_paused_reader_is_queued_again() {
+    let mut fx = Fx::start_with(&tree("range"), &[DEFINITION, SECOND_AGG]).await;
+    fx.exec("alter table public.items detach partition public.items_p2")
+        .await;
+    fx.correct().await;
+    fx.exec(RANGE_P2).await;
+    fx.pass().await;
+    fx.d.settle().await;
+    partition_correction::schedule(fx.d.pool())
+        .await
+        .expect("schedule");
+    fx.exec("update transform_definitions set status = 'paused' where target_table like '%.agg2'")
+        .await;
+    fx.correct().await;
+    assert_eq!(
+        queued(&fx.queue().await),
+        [entry("new_leaf", "public.items_p2")],
+        "agg2's undone row holds the entry"
+    );
+    fx.exec("alter table public.items detach partition public.items_p2")
+        .await;
+    fx.exec("update public.items_p2 set v = v + 1000").await;
+    fx.exec(RANGE_P2).await;
+    fx.correct().await;
+    assert_eq!(fx.wrong_groups().await, Vec::<String>::new());
+}
+
+/// The same for a `gone_node`: detach, correct, attach, correct, then detach
+/// again while the first `gone_node` is still held. The reader that finished
+/// the first corrects the second.
+#[tokio::test]
+async fn a_gone_node_detected_while_an_older_one_is_held_by_a_paused_reader_is_queued_again() {
+    let mut fx = Fx::start_with(&tree("range"), &[DEFINITION, SECOND_AGG]).await;
+    fx.exec("alter table public.items detach partition public.items_p2")
+        .await;
+    fx.pass().await;
+    fx.d.settle().await;
+    partition_correction::schedule(fx.d.pool())
+        .await
+        .expect("schedule");
+    fx.exec("update transform_definitions set status = 'paused' where target_table like '%.agg2'")
+        .await;
+    fx.correct().await;
+    fx.exec(RANGE_P2).await;
+    fx.correct().await;
+    fx.exec("update public.items_p2 set v = v + 1000").await;
+    fx.exec("alter table public.items detach partition public.items_p2")
+        .await;
+    fx.correct().await;
+    assert_eq!(fx.wrong_groups().await, Vec::<String>::new());
+}
+
+/// A reader part-way through a correction may have walked past rows a later
+/// operation changed, so the later operation queues a fresh entry.
+#[tokio::test]
+async fn an_operation_on_a_node_whose_correction_is_part_way_queues_a_fresh_entry() {
+    let mut fx = Fx::start(&tree("range")).await;
+    fx.exec("alter table public.items detach partition public.items_p2")
+        .await;
+    fx.correct().await;
+    fx.exec(RANGE_P2).await;
+    fx.pass().await;
+    fx.d.settle().await;
+    let part = fx
+        .run(&Options {
+            page_keys: 7,
+            max_pages: Some(2),
+        })
+        .await;
+    assert_eq!((part.pages, part.remaining), (2, 1));
+    fx.exec("alter table public.items detach partition public.items_p2")
+        .await;
+    fx.exec("update public.items_p2 set v = v + 1000").await;
+    fx.exec(RANGE_P2).await;
+    fx.pass().await;
+    assert_eq!(
+        queued(&fx.queue().await),
+        [
+            entry("new_leaf", "public.items_p2"),
+            entry("new_leaf", "public.items_p2")
+        ]
+    );
+    fx.d.settle().await;
+    fx.run(&Options::default()).await;
+    fx.merge().await;
+    assert_eq!(fx.wrong_groups().await, Vec::<String>::new());
+}
+
+/// Detections of the same node and text while no reader has started the
+/// queued entry add nothing.
+#[tokio::test]
+async fn repeated_detections_while_no_reader_has_started_queue_one_entry() {
+    let mut fx = Fx::start(&tree("range")).await;
+    fx.exec("alter table public.items detach partition public.items_p2")
+        .await;
+    fx.pass().await;
+    fx.exec(RANGE_P2).await;
+    fx.pass().await;
+    fx.exec("alter table public.items detach partition public.items_p2")
+        .await;
+    fx.pass().await;
+    fx.exec(RANGE_P2).await;
+    fx.pass().await;
+    assert_eq!(
+        queued(&fx.queue().await),
+        [
+            entry("gone_node", "public.items_p2"),
+            entry("new_leaf", "public.items_p2")
+        ]
+    );
+}
+
 /// `items` partitioned `by` on `g` into two middles, each partitioned again,
 /// with the same 160 rows as [`tree`]. `items_m0` holds half the groups.
 fn nested(kind: &str) -> String {

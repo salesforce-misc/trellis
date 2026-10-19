@@ -180,6 +180,15 @@ leaves only.
   `pg_inherits` row is gone.
 - Then the no-leaf sweep below.
 
+Every detected operation queues its own correction, whatever its kind
+(`new_leaf`, `gone_node`, `complement`), unless an entry of the same node, kind
+and text is queued that no reader has started. A reader that has started an
+entry (it has a progress row, in any phase) may already have walked past the
+rows the new operation changed, and one that finished it never reads it again,
+so a started entry never absorbs a later operation; the reader re-derives the
+node once more for it. Two inserters that race past the test both queue, which
+costs work and never correctness.
+
 On an aggregate, a node's correction is a Re-derive of a key set through the
 normal page path. The set is the keys of the live ledger entries whose group
 routes to the node by its recorded text, found through the ledger's `GROUP BY`
@@ -384,7 +393,8 @@ decision.
 A node truncate's ring row names the truncated node. Without the name, the
 truncate trigger of a leaf would empty the whole ledger and target and raise the
 truncate floor, losing every other leaf's rows until a rebuild. The row queues
-that node's correction, with no floor and no barrier, so the other nodes' entries
+that node's correction under the same rule as any other operation (an
+unstarted entry of the node absorbs it), with no floor and no barrier, so the other nodes' entries
 and groups are untouched. A root `TRUNCATE` is unchanged: it clears the whole
 target, once.
 

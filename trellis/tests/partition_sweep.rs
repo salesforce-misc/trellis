@@ -254,6 +254,40 @@ async fn a_leaf_created_written_and_dropped_between_two_passes_converges() {
     }
 }
 
+/// A second sweep that finds the same complement queues its own entry once a
+/// reader has started the first, and none while no reader has (#1151).
+#[tokio::test]
+async fn a_complement_found_again_is_queued_only_once_a_reader_has_started_the_first() {
+    let (ddl, missing) = tree("range");
+    let mut fx = Fx::start(&ddl, ValueType::Numeric).await;
+    let create = format!("create table public.items_new partition of public.items {missing}");
+    for round in 0..3 {
+        fx.exec(&create).await;
+        fx.exec(WRITE_MISSING).await;
+        fx.d.settle().await;
+        fx.exec("drop table public.items_new").await;
+        assert!(sweep_of(&fx.pass().await).queued, "round {round}");
+        // Before any reader started: one entry however often it is found.
+        // After the reader started it: one more.
+        let want = [1, 1, 2][round];
+        assert_eq!(fx.queue().await.len(), want, "round {round}");
+        if round == 1 {
+            partition_correction::run_pending(
+                fx.d.pool(),
+                &partition_correction::Options {
+                    page_keys: 1,
+                    max_pages: Some(1),
+                },
+            )
+            .await
+            .expect("start the correction");
+            assert_eq!(fx.queue().await.len(), 1, "started, not done");
+        }
+    }
+    fx.correct().await;
+    assert_eq!(fx.wrong_groups().await, Vec::<String>::new());
+}
+
 #[tokio::test]
 async fn no_sweep_statement_runs_beside_a_default_or_with_every_hash_remainder() {
     for ddl in [
