@@ -619,8 +619,9 @@ async fn nodes_missing_capture(
 /// lacks any of its triggers is absent, by oid, from the tree the reconcile
 /// pass recorded (`super::partitions::recorded`). A new or attached leaf is
 /// such a node, and the pass queues its correction
-/// (`crate::staging::partition_correction`), which an aggregate on the group
-/// basis takes instead of a rebuild (`crate::intake::markers::park_table_catch_ups`).
+/// (`crate::staging::partition_correction`), which a reader that engine
+/// serves takes instead of a rebuild and a whole-table catch-up
+/// (`crate::intake::markers::park_table_catch_ups`).
 /// A recorded node whose triggers were dropped by hand is not.
 async fn adds_only_new_nodes(
     client: &impl GenericClient,

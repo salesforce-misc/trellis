@@ -258,12 +258,12 @@ pub(crate) async fn park_target_catchup_if_read(
 /// `new_nodes` says the install that parks the marker only added nodes new
 /// to a captured partitioned root's recorded tree
 /// (`capture::install::adds_only_new_nodes`). A definition reading the
-/// root on the group basis (`staging::group_basis`) is then neither rebuilt
-/// nor caught up: the reconcile pass queues each new node's correction,
-/// which recomputes the groups that route to it, the node's own rows' among
-/// them (#1103). The table's marker is still parked, and its discharge
-/// still enumerates the table for them, as for any applying reader
-/// ([`crate::defs::catalog::table_has_reader`]).
+/// root the partition correction engine serves (an aggregate on the ledger
+/// or the group basis, or a reader through a to-many relationship) is then
+/// neither rebuilt nor caught up: the reconcile pass queues each new node's
+/// correction, which re-derives the keys of the node alone, the node's own
+/// rows' among them (#1103, #1147). With no other reader to catch up and no
+/// rebuild, no marker is parked, so nothing enumerates the whole table.
 pub(crate) async fn park_table_catch_ups(
     client: &impl GenericClient,
     tables: &[String],
@@ -279,12 +279,14 @@ pub(crate) async fn park_table_catch_ups(
     }
     let mut candidates = crate::staging::build::rebuild_candidates(client, tables).await?;
     if new_nodes {
+        // A partitioned root is never the to-side of a to-one relationship
+        // (refused at define), and only a to-one relationship has a
+        // projection for the discharge to refresh.
+        to_sides.clear();
         let mut corrected = Vec::new();
         for &id in readers.iter().chain(&candidates) {
             if let Some(definition) = crate::defs::catalog::definition_by_id_in(client, id).await?
-                && tables.contains(&definition.source_table)
-                && crate::staging::group_basis::route(&definition.def, &definition.source_columns)
-                    .is_some()
+                && corrected_by_new_node(client, &definition, tables).await?
             {
                 corrected.push(id);
             }
@@ -307,12 +309,48 @@ pub(crate) async fn park_table_catch_ups(
     readers.retain(|id| !rebuilt.contains(id));
     readers.sort_unstable();
     readers.dedup();
-    park_catch_up(client, &readers, tables).await?;
+    // Nothing left to re-read: the readers a new node's correction covers
+    // need no enumeration of the whole table, so no marker is parked for them.
+    if !(new_nodes && readers.is_empty() && rebuilt.is_empty() && to_sides.is_empty()) {
+        park_catch_up(client, &readers, tables).await?;
+    }
     // After the markers, so the generation each rebuild records is the one
     // just parked.
     crate::staging::build::start_rebuilds(client, &rebuilt).await?;
     request_projection_refresh(client, &to_sides).await?;
     Ok(rebuilt)
+}
+
+/// Whether the partition correction engine corrects `definition` for a node
+/// new to one of `tables`' recorded trees (`park_table_catch_ups`'s
+/// `new_nodes`): an aggregate over the table that the engine re-derives
+/// ([`crate::staging::build::corrected_on_partitioned_source`]), or a
+/// definition reading the table through a to-many relationship
+/// (`staging::partition_correction::schedule`'s readers).
+async fn corrected_by_new_node(
+    client: &impl GenericClient,
+    definition: &crate::defs::model::Definition,
+    tables: &[String],
+) -> Result<bool, IntakeError> {
+    if tables.contains(&definition.source_table) {
+        return Ok(crate::staging::build::corrected_on_partitioned_source(
+            definition,
+        ));
+    }
+    let Some((schema, table)) = definition.source_table.split_once('.') else {
+        return Ok(false);
+    };
+    let read = crate::defs::eval::relationship_references(&definition.def);
+    Ok(
+        crate::defs::catalog::relationships_from_table_in(client, schema, table)
+            .await?
+            .iter()
+            .any(|r| {
+                r.cardinality == crate::defs::model::RelationshipCardinality::ToMany
+                    && tables.contains(&r.qualified_to_table())
+                    && read.iter().any(|(name, _)| *name == r.def.name)
+            }),
+    )
 }
 
 /// Asks the discharge of each of `tables`' markers, just parked by this

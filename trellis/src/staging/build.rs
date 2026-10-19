@@ -1171,6 +1171,14 @@ fn buildable_shape(definition: &Definition) -> Option<ledger::LedgerShape> {
     shape_of(&definition.def, &definition.source_columns)
 }
 
+/// Whether the partition correction engine
+/// (`super::partition_correction`) can re-derive the keys of `definition`
+/// when a node of its partitioned source is added: an aggregate whose
+/// ledger shape the Re-derive build serves, or one on the group basis.
+pub(crate) fn corrected_on_partitioned_source(definition: &Definition) -> bool {
+    buildable_shape(definition).is_some() || takes_group_basis(definition)
+}
+
 /// Whether `definition` is on the group basis (`super::group_basis`, behind
 /// its dev knob, #1100), a `JOIN` behind the same knob (`super::join`,
 /// #1108) included. A rebuild of a plain aggregate's is its sweep job alone

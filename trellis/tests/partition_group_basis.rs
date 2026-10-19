@@ -1251,6 +1251,69 @@ async fn a_recorded_leaf_whose_capture_was_switched_off_is_rebuilt() {
     );
 }
 
+/// #1147: a new leaf, empty or loaded before its capture, is corrected in the
+/// pass that sees it, leaf alone. The reinstall of its capture parks no
+/// marker (whose discharge would enumerate every key of the source for each
+/// reader) and rebuilds no reader: a group-basis and a ledger aggregate both
+/// stay `live` through the pass, and the oracle holds after the corrections.
+#[tokio::test]
+async fn a_new_leaf_costs_no_rebuild_and_no_source_wide_enumeration() {
+    const LEDGER: &str =
+        "TRANSFORM top FROM public.items GROUP BY g SELECT MAX(v) AS top, COUNT(*) AS n";
+    for loaded in [false, true] {
+        let mut fx = Fx::start_with(&tree("list"), SEED, &[DEFINITION, LEDGER]).await;
+        fx.exec("create table public.items_p4 partition of public.items for values in (16, 17)")
+            .await;
+        if loaded {
+            fx.exec("insert into public.items_p4 select 9000 + i, 16 + i % 2, 3 + i from generate_series(1, 40) i")
+                .await;
+        }
+        // The harness never discharges the install's own marker; what counts
+        // is whether the pass parks another.
+        let parked = "select generation::text from pending_backfill order by table_name";
+        let before = fx.d.rows(parked).await;
+        fx.pass().await;
+        assert_eq!(fx.kinds().await, ["new_leaf"], "loaded: {loaded}");
+        let state =
+            fx.d.rows(
+                "select status || '/' || coalesce(build, '-') from transform_definitions \
+                 order by id",
+            )
+            .await;
+        assert_eq!(state, ["(live/-)", "(live/-)"], "loaded: {loaded}");
+        assert_eq!(
+            fx.d.rows(parked).await,
+            before,
+            "no marker parked, so no whole-source enumeration: loaded {loaded}"
+        );
+        assert_eq!(
+            fx.d.rows("select kind from backfill_chunks where kind <> 'correction'")
+                .await,
+            Vec::<String>::new(),
+            "no rebuild: loaded {loaded}"
+        );
+        fx.run().await;
+        fx.d.settle().await;
+        trellis::staging::build::settle_builds(fx.d.pool()).await;
+        fx.d.settle().await;
+        fx.assert_right("group basis").await;
+        assert_eq!(
+            fx.d.rows(
+                "select g, top, n from public.top \
+                 except select g, max(v), count(*) from public.items group by g"
+            )
+            .await,
+            Vec::<String>::new(),
+            "ledger oracle: loaded {loaded}"
+        );
+        assert_eq!(
+            fx.d.rows("select count(*) from public.top where g in (16, 17)")
+                .await,
+            [if loaded { "(2)" } else { "(0)" }]
+        );
+    }
+}
+
 /// A ledger aggregate over the same source keeps #1062's engine: its
 /// correction moves it to `backfilling` until its deltas are merged, while
 /// the group-basis one is recomputed and stays `live`.

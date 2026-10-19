@@ -235,11 +235,12 @@ routes to the node is then in it. The node's own row isn't enough: a sibling
 attached beside a `DEFAULT` takes some of its groups, whose rows a read of the
 `DEFAULT` alone would zero. Every operation that narrows the node's region
 after the check locks the node, so it waits for the correction. The capture
-install that adds a new node to the tree rebuilds none of these aggregates:
-the node's own correction covers its rows, including those written into it
-directly before its capture existed. The marker that install parks on the root
-still has them as readers, so its discharge stages a recompute of every key of
-the source. Measured on the engine (a debug build, one runner), the correction
+install that adds a new node to the tree rebuilds none of the readers a
+correction covers (these aggregates, and a definition reading the source
+through a to-many relationship): the node's own correction covers its rows,
+including those written into it directly before its capture existed. That
+install parks no marker on the root when nothing else needs one, so no
+discharge stages a recompute of every key of the source. Measured on the engine (a debug build, one runner), the correction
 of a `DROP`, `DETACH` or `TRUNCATE` of a leaf of 1M or of 10M rows over 1,560
 groups takes 27–34 ms and about 0.6 MB of WAL, whatever the leaf's rows; the
 correction of an `ATTACH` of such a leaf reads it twice, once for its groups and

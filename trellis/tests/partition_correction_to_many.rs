@@ -462,6 +462,29 @@ async fn a_new_leaf_with_direct_writes_before_its_capture_is_counted_by_its_corr
     }
 }
 
+/// #1147: a new leaf under a to-many reader leaves it `live` through the pass
+/// and parks no marker, whose discharge would stage a recompute for every
+/// order of the source; the leaf's correction alone counts its items.
+#[tokio::test]
+async fn a_new_leaf_parks_no_marker_and_leaves_the_reader_live() {
+    let mut fx = Fx::start(&tree("list")).await;
+    fx.exec("drop table public.items_p3").await;
+    fx.pass().await;
+    fx.correct().await;
+    let parked = "select generation::text from pending_backfill order by table_name";
+    let before = fx.d.rows(parked).await;
+    fx.exec(
+        "create table public.items_new partition of public.items for values in (12, 13, 14, 15); \
+         insert into public.items_new values (1001, 13, 7), (1002, 13, 9)",
+    )
+    .await;
+    fx.pass().await;
+    assert_eq!(fx.d.rows(parked).await, before, "no marker parked");
+    assert_eq!(fx.status("public.totals").await, "live");
+    fx.run_through(&Options::default()).await;
+    assert_eq!(fx.wrong_parents().await, Vec::<String>::new());
+}
+
 /// A new sibling changes a `DEFAULT`'s text and takes no rows from it; a
 /// dropped sibling's items go, and the `DEFAULT`'s text grows.
 #[tokio::test]

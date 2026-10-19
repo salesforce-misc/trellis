@@ -47,7 +47,7 @@
 //! `build_seg` and has no fence, ledger or node phase. A capture install
 //! that only adds new nodes to the tree rebuilds no such aggregate
 //! (`crate::intake::markers::park_table_catch_ups`): the nodes' corrections
-//! cover them.
+//! cover them, as they do a ledger aggregate and a to-many reader.
 //!
 //! # Routing
 //!
