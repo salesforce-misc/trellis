@@ -49,7 +49,8 @@
 //! - #997: the modifier counts. A catalog-only widening is re-typed in place and a
 //!   narrowing refused (`altering_a_passthrough_into_a_wider_expression_retypes_the_column_in_place`,
 //!   `altering_a_varchar_passthrough_into_a_text_expression_retypes_the_column`,
-//!   `altering_an_expression_into_a_narrower_passthrough_is_refused`)
+//!   `altering_an_expression_into_a_narrower_passthrough_is_refused`,
+//!   `a_retype_a_view_blocks_is_refused_and_rolls_back`)
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -651,6 +652,17 @@ async fn modifier_fixture(
     trellis
 }
 
+/// The file node of target `table`: a table rewrite moves it.
+async fn target_filenode(raw: &Client, table: &str) -> i64 {
+    raw.query_one(
+        &format!("select pg_relation_filenode('{DEFAULT_TARGET_SCHEMA}.{table}')::int8"),
+        &[],
+    )
+    .await
+    .expect("read the file node")
+    .get(0)
+}
+
 /// Issue #997 rule 3 and 5: altering a bare passthrough of `numeric(10,2)`
 /// into an expression of unconstrained `numeric` re-types the column in
 /// place, in the alter's own transaction, so the field build's values keep
@@ -661,13 +673,14 @@ async fn modifier_fixture(
 async fn altering_a_passthrough_into_a_wider_expression_retypes_the_column_in_place() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let mut raw = connect_raw(db.dsn()).await;
     let trellis =
         modifier_fixture(&db, &raw, "TRANSFORM t FROM public.posts SELECT price AS p").await;
     assert_eq!(
         column_pg_type(&raw, DEFAULT_TARGET_SCHEMA, "t", "p").await,
         "numeric(10,2)"
     );
+    let before = target_filenode(&raw, "t").await;
 
     trellis
         .apply("ALTER TRANSFORM t ALTER p AS price + 0.001")
@@ -678,6 +691,13 @@ async fn altering_a_passthrough_into_a_wider_expression_retypes_the_column_in_pl
     assert_eq!(
         column_pg_type(&raw, DEFAULT_TARGET_SCHEMA, "t", "p").await,
         "numeric"
+    );
+    // The re-type changed only the catalog. The field build's re-derive
+    // updates rows, which leaves the file node alone too.
+    assert_eq!(
+        target_filenode(&raw, "t").await,
+        before,
+        "the target was not rewritten"
     );
     let values: Vec<String> = raw
         .query(
@@ -695,8 +715,28 @@ async fn altering_a_passthrough_into_a_wider_expression_retypes_the_column_in_pl
         "the re-derive keeps the third decimal"
     );
 
-    // The column is the one a fresh DEFINE gives, so the capture pass finds
-    // it current: no drift, no "widened" pause.
+    // Rule 5: the next capture pass finds the column current, so it pauses
+    // nothing for a widening or a drift.
+    for _ in 0..2 {
+        trellis::client::reconcile_pass(
+            &mut raw,
+            &db.pool,
+            DEFAULT_SCHEMA,
+            "alter_transform_997",
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("capture pass");
+    }
+    assert_ne!(persisted_status(&raw, "t").await.as_deref(), Some("paused"));
+    let failures: i64 = raw
+        .query_one("select count(*) from capture_failures", &[])
+        .await
+        .expect("read capture failures")
+        .get(0);
+    assert_eq!(failures, 0, "the pass recorded no capture failure");
+
+    // The column is the one a fresh DEFINE gives.
     trellis
         .apply("TRANSFORM oracle FROM public.posts SELECT price + 0.001 AS p")
         .await
@@ -2665,5 +2705,50 @@ async fn altering_a_target_that_is_not_live_is_rejected() {
         other => panic!("expected CatalogError::TransformNotLive, got {other:?}"),
     }
 
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// Issue #997: Postgres refuses to re-type a column a view reads. The
+/// refusal names the field and the view, and the whole edit rolls back: the
+/// column, the definition's version and its build are as they were.
+#[tokio::test]
+async fn a_retype_a_view_blocks_is_refused_and_rolls_back() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    let trellis =
+        modifier_fixture(&db, &raw, "TRANSFORM t FROM public.posts SELECT price AS p").await;
+    raw.batch_execute(&format!(
+        "create view public.v as select p from {DEFAULT_TARGET_SCHEMA}.t"
+    ))
+    .await
+    .expect("create the view");
+    let before_version = persisted_definition_version(&raw, "t").await;
+
+    let err = trellis
+        .apply("ALTER TRANSFORM t ALTER p AS price + 0.001")
+        .await
+        .expect_err("the view blocks the re-type");
+    match err {
+        TrellisError::Catalog(CatalogError::UnsupportedAlter(detail)) => assert!(
+            detail.contains("'p'") && detail.contains("view v"),
+            "the refusal names the field and the view: {detail}"
+        ),
+        other => panic!("expected CatalogError::UnsupportedAlter, got {other:?}"),
+    }
+    assert_eq!(
+        column_pg_type(&raw, DEFAULT_TARGET_SCHEMA, "t", "p").await,
+        "numeric(10,2)"
+    );
+    assert_eq!(
+        persisted_definition_version(&raw, "t").await,
+        before_version
+    );
+    let open_chunks: i64 = raw
+        .query_one("select count(*) from backfill_chunks where not done", &[])
+        .await
+        .expect("read the build")
+        .get(0);
+    assert_eq!(open_chunks, 0, "no field build was registered");
     trellis.shutdown().await.expect("shutdown");
 }

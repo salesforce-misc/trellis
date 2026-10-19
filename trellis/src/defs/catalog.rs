@@ -2008,20 +2008,22 @@ pub async fn alter_transform(
     // target is refused, as ADR-0015 promises no edit does. Best-effort
     // here, same as the `DROP` dependents check just above (re-checked for
     // real under the row lock below, issue #231's discipline).
-    let pre_client = pool.get().await?;
-    check_alter_column_types(
-        &**pre_client,
-        &AlterTypeContext {
-            merged: &merged,
-            source_table: &current.source_table,
-            source_columns: &pre_source_columns,
-            field_types: &field_types,
-            qualified_target: &current.target_table,
-            display_target: &alter.target,
-        },
-        &real_alters,
-    )
-    .await?;
+    {
+        let pre_client = pool.get().await?;
+        check_alter_column_types(
+            &**pre_client,
+            &AlterTypeContext {
+                merged: &merged,
+                source_table: &current.source_table,
+                source_columns: &pre_source_columns,
+                field_types: &field_types,
+                qualified_target: &current.target_table,
+                display_target: &alter.target,
+            },
+            &real_alters,
+        )
+        .await?;
+    }
 
     let target_ident = ddl::qualified_target_table_ident(&current.target_table);
 
@@ -2198,13 +2200,34 @@ pub async fn alter_transform(
     // Anything that would rewrite the target was refused above, before any
     // DDL ran. A same-type `ALTER` needs no physical change at all; only its
     // data is stale, which the field build recomputes, as for an `ADD`.
+    // Postgres refuses the re-type of a column a view or rule reads
+    // (`0A000`); the refusal names the field and the dependent, and the
+    // whole edit rolls back.
     for retype in &retypes {
         let column = quote_ident(&retype.column);
-        txn.batch_execute(&format!(
-            "alter table {target_ident} alter column {column} type {ty} using {column}::{ty}",
-            ty = retype.pg_type
-        ))
-        .await?;
+        if let Err(err) = txn
+            .batch_execute(&format!(
+                "alter table {target_ident} alter column {column} type {ty} using {column}::{ty}",
+                ty = retype.pg_type
+            ))
+            .await
+        {
+            let Some(db) = err
+                .as_db_error()
+                .filter(|db| *db.code() == tokio_postgres::error::SqlState::FEATURE_NOT_SUPPORTED)
+            else {
+                return Err(err.into());
+            };
+            return Err(CatalogError::UnsupportedAlter(format!(
+                "ALTER '{field}' on '{target}' re-types its column to '{ty}', which Postgres \
+                 refuses: {message}{detail}. Drop or change that object, then ALTER again",
+                field = retype.column,
+                target = alter.target,
+                ty = retype.pg_type,
+                message = db.message(),
+                detail = db.detail().map(|d| format!(" ({d})")).unwrap_or_default(),
+            )));
+        }
     }
 
     // Issue #915: an edit that builds fields can pause one at birth that

@@ -376,8 +376,10 @@ pub(crate) fn catalog_only(copy: &ColumnType, live: &ColumnType) -> bool {
 /// Whether `ALTER TRANSFORM` can re-type a column of type `copy` to `live`
 /// without rewriting its table: a [`catalog_only`] widening, or a
 /// constrained `numeric` to an unconstrained one (Postgres keeps every
-/// value as it is). The second isn't a [`catalog_only`] widening, since the
-/// capture pass must not apply it to a column a `JOIN`'s sum reads.
+/// value as it is). The second isn't one of the [`catalog_only`] widenings
+/// the capture pass applies to a copy on its own: a group-basis `SUM` or
+/// `AVG` reading the column would then be over a type define refuses (#1096
+/// decision 2).
 pub(crate) fn alter_retypable(copy: &ColumnType, live: &ColumnType) -> bool {
     catalog_only(copy, live)
         || (copy.builtin()
