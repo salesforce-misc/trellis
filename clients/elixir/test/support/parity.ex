@@ -194,7 +194,7 @@ defmodule Trellis.Parity do
   defp map_key(key) when is_binary(key), do: key
   defp map_key(key), do: mismatch("map key #{inspect(key)} isn't a string")
 
-  @applied_fields [:definition, :relationship, :columns, :added, :dropped, :altered]
+  @applied_fields [:target_table, :relationship, :columns, :added, :dropped, :altered]
 
   @doc """
   A `Trellis.Applied.t()` tagged tuple in canonical form, as the fixture's
@@ -204,8 +204,8 @@ defmodule Trellis.Parity do
   """
   def canonical_applied(kind) when is_atom(kind), do: applied_record(kind, %{})
 
-  def canonical_applied({:transform_defined, definition}),
-    do: applied_record(:transform_defined, %{definition: definition})
+  def canonical_applied({:transform_defined, target_table}),
+    do: applied_record(:transform_defined, %{target_table: target_table})
 
   def canonical_applied({:relationship_defined, relationship}),
     do: applied_record(:relationship_defined, %{relationship: relationship})

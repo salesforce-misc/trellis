@@ -35,7 +35,7 @@ defmodule Trellis do
       # The app, once migrated. The staging worker reads the catalog as it
       # starts, so a `staging: true` handle can't connect before `migrate/1`.
       {:ok, trellis} = Trellis.connect(url: "postgres://localhost/app", staging: true, drain_threads: 2)
-      {:ok, definition} = Trellis.define(trellis, "TRANSFORM widget_prices FROM widgets SELECT price AS price")
+      {:ok, "public.widget_prices"} = Trellis.define(trellis, "TRANSFORM widget_prices FROM widgets SELECT price AS price")
       {:ok, %Trellis.Status{status: :live}} = Trellis.status(trellis, "widget_prices")
       :ok = Trellis.shutdown(trellis)
 
@@ -135,7 +135,6 @@ defmodule Trellis do
   alias Trellis.{
     Applied,
     Config,
-    Definition,
     DefinitionSummary,
     Error,
     Native,
@@ -308,8 +307,9 @@ defmodule Trellis do
   @doc """
   Registers a `TRANSFORM` statement and creates its target table.
 
-  Returns once the definition is registered and its backfill queued, with the
-  definition at `:waiting_to_backfill`; poll `status/2` for `:live`.
+  Returns the transform's fully qualified target table once the definition is
+  registered and its backfill queued, with the transform at
+  `:waiting_to_backfill`; poll `status/2` with the target table for `:live`.
 
   Only `TRANSFORM` statements belong here. Any other statement form (`DROP`,
   `PAUSE`, `RELATIONSHIP`, ...) is refused with a `:validation` error before
@@ -319,15 +319,13 @@ defmodule Trellis do
   Trellis runs this on its own connections, not in the caller's transaction:
   if an enclosing Ecto migration rolls back, the definition stays.
   """
-  @spec define(trellis(), String.t()) :: {:ok, Definition.t()} | {:error, Error.t()}
+  @spec define(trellis(), String.t()) :: {:ok, String.t()} | {:error, Error.t()}
   def define(trellis, text) when is_trellis(trellis) and is_binary(text) do
-    with {:ok, definition} <- native(run(trellis, :define, [text])) do
-      {:ok, Definition.from_native(definition)}
-    end
+    native(run(trellis, :define, [text]))
   end
 
   @doc "Like `define/2`, but raises `Trellis.Error`."
-  @spec define!(trellis(), String.t()) :: Definition.t()
+  @spec define!(trellis(), String.t()) :: String.t()
   def define!(trellis, text), do: bang(define(trellis, text))
 
   @doc """
@@ -351,7 +349,7 @@ defmodule Trellis do
   Runs one statement of Trellis's grammar, whatever its form, and reports
   what it did (see `t:Trellis.Applied.t/0`).
 
-      {:ok, {:transform_defined, definition}} =
+      {:ok, {:transform_defined, "public.order_totals"}} =
         Trellis.apply(trellis, "TRANSFORM order_totals FROM orders SELECT price + tax AS total")
 
       {:ok, {:resumed, ["order_totals.total"]}} =

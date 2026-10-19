@@ -130,7 +130,7 @@ module Trellis
     end
 
     # Registers a transform from a `TRANSFORM` statement and returns its
-    # Definition: Trellis.define, run as the migration reaches it.
+    # target table: Trellis.define, run as the migration reaches it.
     def define(statement)
       trellis_statement("define", statement) { Trellis.define(statement) }
     end

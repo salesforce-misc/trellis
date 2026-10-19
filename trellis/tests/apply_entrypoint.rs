@@ -101,17 +101,22 @@ async fn every_statement_form_dispatches_through_the_one_entrypoint() {
         .expect("a RELATIONSHIP statement registers a relationship");
     assert_eq!(relationship.def.name, "posts");
 
-    // TRANSFORM — reports the definition it registered, with its status.
+    // TRANSFORM — reports the target table it registered.
     let applied = trellis
         .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
         .await
         .expect("define an aggregate transform");
-    let definition = applied
+    let target_table = applied
         .into_transform()
         .expect("a TRANSFORM statement registers a transform");
-    assert_eq!(definition.def.target, "order_rollup");
+    assert!(target_table.ends_with(".order_rollup"), "{target_table}");
     assert_eq!(
-        definition.status,
+        trellis
+            .status("order_rollup")
+            .await
+            .expect("status")
+            .expect("registered")
+            .status,
         TransformStatus::WaitingToBackfill,
         "registration returns before the build (ADR-0002)"
     );

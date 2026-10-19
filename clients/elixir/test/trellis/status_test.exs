@@ -186,10 +186,7 @@ defmodule Trellis.StatusTest do
   test "a definition summary's halt becomes a capture failure of kind halt" do
     summary =
       Trellis.DefinitionSummary.from_native(%{
-        id: 1,
         target_table: "public.t",
-        source_table: "public.s",
-        source_version: 1,
         status: :paused,
         created_at_micros: 1_727_222_400_654_321,
         backfill_failure: nil,

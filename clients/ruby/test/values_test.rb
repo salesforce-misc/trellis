@@ -145,15 +145,14 @@ class ValuesTest < Minitest::Test
 
   def test_a_definition_summarys_backfill_failure_becomes_a_backfill_failure
     summary = Trellis::DefinitionSummary.from_native(
-      id: 1, target_table: "public.t", source_table: "public.s", source_version: 1,
-      status: :waiting_to_backfill, created_at_micros: MICROS,
+      target_table: "public.t", status: :waiting_to_backfill, created_at_micros: MICROS,
       backfill_failure: { source_table: "public.s", attempts: 2, last_error: "timeout",
                           next_attempt_at_micros: MICROS },
       halt: nil
     )
     assert_equal Trellis::DefinitionSummary.new(
-      id: 1, target_table: "public.t", source_table: "public.s", source_version: 1,
-      status: :waiting_to_backfill, created_at: Trellis::EpochMicros.to_time(MICROS),
+      target_table: "public.t", status: :waiting_to_backfill,
+      created_at: Trellis::EpochMicros.to_time(MICROS),
       backfill_failure: Trellis::BackfillFailure.new(
         source_table: "public.s", attempts: 2, last_error: "timeout",
         next_attempt_at: Trellis::EpochMicros.to_time(MICROS)
@@ -164,8 +163,7 @@ class ValuesTest < Minitest::Test
 
   def test_a_definition_summarys_halt_becomes_a_capture_failure_of_kind_halt
     summary = Trellis::DefinitionSummary.from_native(
-      id: 1, target_table: "public.t", source_table: "public.s", source_version: 1,
-      status: :paused, created_at_micros: MICROS, backfill_failure: nil,
+      target_table: "public.t", status: :paused, created_at_micros: MICROS, backfill_failure: nil,
       halt: { kind: :halt, source_table: "public.s", columns: [],
               error: "the drain halted", detected_at_micros: MICROS }
     )
@@ -176,19 +174,17 @@ class ValuesTest < Minitest::Test
   end
 
   def test_an_applied_carries_only_its_kinds_fields
-    definition = { id: 1, target_table: "public.t", source_table: "public.s",
-                   source_version: 1, status: :waiting_to_backfill, source_columns: {} }
-    empty = { definition: nil, relationship: nil, columns: nil, added: nil, dropped: nil,
+    empty = { target_table: nil, relationship: nil, columns: nil, added: nil, dropped: nil,
               altered: nil }
 
-    applied = Trellis::Applied.from_native(empty.merge(kind: :transform_defined, definition:))
-    assert_equal Trellis::Definition.new(**definition), applied.definition
+    applied = Trellis::Applied.from_native(empty.merge(kind: :transform_defined, target_table: "public.t"))
+    assert_equal "public.t", applied.target_table
 
     altered = Trellis::Applied.from_native(
-      empty.merge(kind: :altered, definition:, added: ["a"], dropped: [], altered: ["b"])
+      empty.merge(kind: :altered, target_table: "public.t", added: ["a"], dropped: [], altered: ["b"])
     )
     assert_equal [["a"], [], ["b"]], [altered.added, altered.dropped, altered.altered]
-    assert_instance_of Trellis::Definition, altered.definition
+    assert_equal "public.t", altered.target_table
 
     # An outcome newer than the binding is still a value, not a crash.
     unknown = Trellis::Applied.from_native(empty.merge(kind: :unknown))

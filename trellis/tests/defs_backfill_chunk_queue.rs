@@ -36,7 +36,7 @@ async fn install_and_dispatch(
     text: &str,
     cols: &std::collections::HashMap<String, ValueType>,
     target_schema: &str,
-) -> Result<trellis::defs::Definition, trellis::defs::CatalogError> {
+) -> Result<trellis::defs::model::Definition, trellis::defs::CatalogError> {
     let source = text
         .split_whitespace()
         .skip_while(|word| *word != "FROM")

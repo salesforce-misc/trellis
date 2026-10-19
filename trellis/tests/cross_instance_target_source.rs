@@ -127,7 +127,7 @@ async fn table_exists(client: &Client, qualified: &str) -> bool {
         .get(0)
 }
 
-fn assert_rejected_as_unkeyed(result: Result<trellis::defs::Definition, CatalogError>) {
+fn assert_rejected_as_unkeyed(result: Result<trellis::defs::model::Definition, CatalogError>) {
     match result {
         Err(CatalogError::SourceNotChangeKeyed { source_table }) => {
             assert_eq!(source_table, "public.sku_totals");

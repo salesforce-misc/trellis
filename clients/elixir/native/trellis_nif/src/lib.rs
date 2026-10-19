@@ -59,7 +59,6 @@
 //! `shutdown/1` is the clean, joined stop, and it cancels the calls still in
 //! flight rather than waiting for them.
 
-use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
 
@@ -68,14 +67,14 @@ use rustler::{Atom, Encoder, Env, NifMap, ResourceArc, Term};
 use trellis::{BlockingTrellis, Config, ErrorCode, PendingCall, TrellisOptions};
 use trellis_embed::{
     DIVERGENCE_KINDS, ERROR_CODES, LOG_LEVELS, PlainApplied, PlainBackfillFailure,
-    PlainCaptureFailure, PlainCaptureWait, PlainConfig, PlainCorrectingNode, PlainDefinition,
-    PlainDefinitionStatus, PlainDefinitionSummary, PlainDivergence, PlainDrainFailure, PlainError,
-    PlainHeldKeys, PlainPoisonEntry, PlainQuarantineEntry, PlainRelationship,
-    PlainRelationshipSummary, PlainSamplePage, PlainSelfCheckJob, PlainSelfCheckReport,
-    PlainUnindexedJoin, SELF_CHECK_MODES, SELF_CHECK_OUTCOMES, SELF_CHECK_STATES,
-    capture_failure_kind_names, decode_cursor, decode_watermark, encode_watermark,
-    quarantine_state_names, relationship_cardinality_names, require_transform_statement,
-    self_check_mode, system_time_from_epoch_micros, transform_status_names,
+    PlainCaptureFailure, PlainCaptureWait, PlainConfig, PlainCorrectingNode, PlainDefinitionStatus,
+    PlainDefinitionSummary, PlainDivergence, PlainDrainFailure, PlainError, PlainHeldKeys,
+    PlainPoisonEntry, PlainQuarantineEntry, PlainRelationship, PlainRelationshipSummary,
+    PlainSamplePage, PlainSelfCheckJob, PlainSelfCheckReport, PlainUnindexedJoin, SELF_CHECK_MODES,
+    SELF_CHECK_OUTCOMES, SELF_CHECK_STATES, capture_failure_kind_names, decode_cursor,
+    decode_watermark, encode_watermark, quarantine_state_names, relationship_cardinality_names,
+    require_transform_statement, self_check_mode, system_time_from_epoch_micros,
+    transform_status_names,
 };
 
 /// What every NIF returns: `{:ok, T}` or `{:error, {code, message}}`.
@@ -213,17 +212,6 @@ fn poisoned() -> (&'static str, String) {
         ErrorCode::Internal,
         "a call on this Trellis handle panicked; connect a new handle",
     )
-}
-
-/// A registered definition, as `define/2` returns it.
-#[derive(NifMap)]
-struct DefinitionTerm {
-    id: i64,
-    target_table: String,
-    source_table: String,
-    source_version: i64,
-    status: Atom,
-    source_columns: HashMap<String, String>,
 }
 
 /// A definition's status, as `status/2` returns it.
@@ -418,26 +406,10 @@ fn atom_words() -> impl Iterator<Item = &'static str> {
         .chain(LOG_LEVELS)
 }
 
-impl DefinitionTerm {
-    fn new(env: Env, definition: PlainDefinition) -> NifReply<Self> {
-        Ok(DefinitionTerm {
-            id: definition.id,
-            target_table: definition.target_table,
-            source_table: definition.source_table,
-            source_version: definition.source_version,
-            status: word_atom(env, definition.status)?,
-            source_columns: definition.source_columns.into_iter().collect(),
-        })
-    }
-}
-
 /// A registered definition, as `definitions/1` lists it.
 #[derive(NifMap)]
 struct DefinitionSummaryTerm {
-    id: i64,
     target_table: String,
-    source_table: String,
-    source_version: i64,
     status: Atom,
     created_at_micros: i64,
     backfill_failure: Option<BackfillFailureTerm>,
@@ -475,7 +447,7 @@ struct RelationshipSummaryTerm {
 }
 
 /// What `apply/2` did. `kind` is one of [`PlainApplied::KINDS`]; each
-/// other field is set only for the kinds that carry it (`definition` for
+/// other field is set only for the kinds that carry it (`target_table` for
 /// `transform_defined` and `altered`, `relationship` for
 /// `relationship_defined`, `columns` for `resumed`, and `added`, `dropped`
 /// and `altered` for `altered`), and is `nil` otherwise. `Trellis.Applied`
@@ -483,7 +455,7 @@ struct RelationshipSummaryTerm {
 #[derive(NifMap)]
 struct AppliedTerm {
     kind: Atom,
-    definition: Option<DefinitionTerm>,
+    target_table: Option<String>,
     relationship: Option<RelationshipTerm>,
     columns: Option<Vec<String>>,
     added: Option<Vec<String>>,
@@ -645,7 +617,7 @@ impl AppliedTerm {
     fn new(env: Env, applied: PlainApplied) -> NifReply<Self> {
         let mut term = AppliedTerm {
             kind: word_atom(env, applied.kind())?,
-            definition: None,
+            target_table: None,
             relationship: None,
             columns: None,
             added: None,
@@ -653,20 +625,20 @@ impl AppliedTerm {
             altered: None,
         };
         match applied {
-            PlainApplied::TransformDefined(definition) => {
-                term.definition = Some(DefinitionTerm::new(env, definition)?);
+            PlainApplied::TransformDefined(target_table) => {
+                term.target_table = Some(target_table);
             }
             PlainApplied::RelationshipDefined(relationship) => {
                 term.relationship = Some(RelationshipTerm::new(env, relationship)?);
             }
             PlainApplied::Resumed { columns } => term.columns = Some(columns),
             PlainApplied::Altered {
-                definition,
+                target_table,
                 added,
                 dropped,
                 altered,
             } => {
-                term.definition = Some(DefinitionTerm::new(env, definition)?);
+                term.target_table = Some(target_table);
                 term.added = Some(added);
                 term.dropped = Some(dropped);
                 term.altered = Some(altered);
@@ -730,16 +702,16 @@ fn define<'a>(env: Env<'a>, handle: ResourceArc<Handle>, text: String) -> NifRep
     handle.submit(
         env,
         |trellis| trellis.start_apply(&text),
-        |env, applied| {
+        |_, applied| {
             // Unreachable: the check above is `apply`'s own parser. Kept as
             // defence, so a mistake there is an error rather than a panic.
-            let definition = applied.into_transform().ok_or_else(|| {
+            let target_table = applied.into_transform().ok_or_else(|| {
                 error(
                     ErrorCode::Internal,
                     "define/2 applied a statement that registered no transform",
                 )
             })?;
-            DefinitionTerm::new(env, PlainDefinition::from(&definition))
+            Ok(target_table)
         },
     )
 }
@@ -764,10 +736,7 @@ fn definitions<'a>(env: Env<'a>, handle: ResourceArc<Handle>) -> NifReply<Term<'
             .map(|summary| {
                 let summary = PlainDefinitionSummary::from(summary);
                 Ok(DefinitionSummaryTerm {
-                    id: summary.id,
                     target_table: summary.target_table,
-                    source_table: summary.source_table,
-                    source_version: summary.source_version,
                     status: word_atom(env, summary.status)?,
                     created_at_micros: summary.created_at_micros,
                     backfill_failure: summary.backfill_failure.map(BackfillFailureTerm::from),

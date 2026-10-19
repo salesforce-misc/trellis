@@ -788,8 +788,8 @@ flight the same way: they return `{:error, %Trellis.Error{code: :validation}}`.
 
 ## Poll to `live`, don't wait
 
-`define` (and `apply` with a `TRANSFORM`) returns once the definition is
-registered, with its target table created and empty, and its status
+`define` (and `apply` with a `TRANSFORM`) returns the target table once the
+definition is registered, with that table created and empty, and its status
 `waiting_to_backfill`. The build runs in the background on the dedicated
 worker, and takes as long as the source's size calls for
 ([ADR-0008 decision 1](decisions/0008-public-api-design.md#1-synchronous-calls-at-the-ffi-boundary)).

@@ -39,7 +39,7 @@ class ApplyTest < Minitest::Test
                                              :to_schema, :to_table, :to_col, :cardinality)
     assert_equal 1, relationship.warnings.length
     assert_match "pets", relationship.warnings.first
-    assert_nil applied.definition
+    assert_nil applied.target_table
     covered << "define_relationship"
 
     summary = Trellis.relationships.find { |r| r.id == relationship.id }
@@ -51,14 +51,10 @@ class ApplyTest < Minitest::Test
 
     applied = Trellis.apply("TRANSFORM pet_weights FROM pets SELECT weight AS weight")
     assert_equal :transform_defined, applied.kind
-    definition = applied.definition
-    assert_instance_of Trellis::Definition, definition
-    assert_equal "public.pet_weights", definition.target_table
-    assert_equal "public.pets", definition.source_table
-    assert_equal :waiting_to_backfill, definition.status
+    assert_equal "public.pet_weights", applied.target_table
     covered << "define_transform"
 
-    summary = Trellis.definitions.find { |d| d.id == definition.id }
+    summary = Trellis.definitions.find { |d| d.target_table == applied.target_table }
     assert_instance_of Trellis::DefinitionSummary, summary
     assert_equal "public.pet_weights", summary.target_table
     assert_instance_of Time, summary.created_at
@@ -68,11 +64,11 @@ class ApplyTest < Minitest::Test
 
     applied = Trellis.apply("ALTER TRANSFORM pet_weights ADD weight + weight AS doubled")
     assert_equal :altered, applied.kind
-    assert_equal "public.pet_weights", applied.definition.target_table
+    assert_equal "public.pet_weights", applied.target_table
     assert_equal [["doubled"], [], []], [applied.added, applied.dropped, applied.altered]
     covered << "alter_transform"
 
-    assert_equal Trellis::Applied.new(kind: :paused, definition: nil, relationship: nil,
+    assert_equal Trellis::Applied.new(kind: :paused, target_table: nil, relationship: nil,
                                       columns: nil, added: nil, dropped: nil, altered: nil),
                  Trellis.apply("PAUSE TRANSFORM pet_weights")
     assert_equal :paused, Trellis.status("pet_weights").status

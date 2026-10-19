@@ -5,7 +5,7 @@ defmodule TrellisTest do
 
   import Trellis.Eventually
 
-  alias Trellis.{Definition, Error, Status, TestCluster}
+  alias Trellis.{Error, Status, TestCluster}
 
   setup_all do
     # Migrating is what a deploy's migration step does, on a handle that
@@ -36,13 +36,8 @@ defmodule TrellisTest do
 
     on_exit(fn -> Trellis.shutdown(trellis) end)
 
-    assert {:ok, %Definition{} = definition} =
+    assert {:ok, "public.widget_prices"} =
              Trellis.define(trellis, "TRANSFORM widget_prices FROM widgets SELECT price AS price")
-
-    assert definition.target_table == "public.widget_prices"
-    assert definition.source_table == "public.widgets"
-    assert definition.status == :waiting_to_backfill
-    assert definition.source_columns == %{"id" => "integer", "price" => "integer"}
 
     assert %Status{status: :live, backfill_failure: nil} =
              eventually("widget_prices to reach :live", fn ->
@@ -89,8 +84,10 @@ defmodule TrellisTest do
     trellis = Trellis.connect!(url: TestCluster.info()["dsn"])
     on_exit(fn -> Trellis.shutdown(trellis) end)
 
-    assert {:ok, %Definition{status: :waiting_to_backfill}} =
+    assert {:ok, "public.gadget_prices"} =
              Trellis.define(trellis, "TRANSFORM gadget_prices FROM gadgets SELECT price AS price")
+
+    assert %Status{status: :waiting_to_backfill} = Trellis.status!(trellis, "gadget_prices")
 
     for statement <- [
           "PAUSE TRANSFORM gadget_prices",

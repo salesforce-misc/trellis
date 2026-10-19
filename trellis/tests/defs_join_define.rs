@@ -315,8 +315,8 @@ async fn a_join_registers_both_tables_and_waits_to_be_built() {
     let trellis = define_only(db.dsn()).await;
 
     let applied = trellis.apply(BY_REGION).await.expect("define the JOIN");
-    let definition = applied.into_transform().expect("a transform is defined");
-    assert_eq!(definition.status, TransformStatus::WaitingToBackfill);
+    let target_table = applied.into_transform().expect("a transform is defined");
+    assert!(target_table.ends_with(".by_region"), "{target_table}");
     assert_eq!(
         status(&trellis, "by_region").await,
         Some(TransformStatus::WaitingToBackfill)

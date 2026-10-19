@@ -65,7 +65,7 @@ pub use catalog::{
 };
 pub use error::ParseError;
 pub use model::{
-    Definition, RelationshipCardinality, RelationshipDefinition, RelationshipSide, TransformStatus,
+    RelationshipCardinality, RelationshipDefinition, RelationshipSide, TransformStatus,
 };
 pub use parser::{parse_statement, statement_kind};
 // Stored text loads through `grammar::load`; the integration tests parse

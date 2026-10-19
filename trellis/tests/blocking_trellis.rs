@@ -62,13 +62,12 @@ fn full_lifecycle_is_synchronous_start_to_finish() {
         .expect("define (sync)")
         .into_transform()
         .expect("a TRANSFORM statement registers a transform");
-    assert_eq!(def.def.target, "widget_totals");
+    assert_eq!(def, format!("{DEFAULT_TARGET_SCHEMA}.widget_totals"));
 
     let defs = trellis.definitions().expect("definitions (sync)");
     assert_eq!(defs.len(), 1);
     // Issue #73: `DefinitionSummary.target_table` reports the persisted,
-    // fully-qualified identity now, matching `source_table`'s own
-    // already-qualified precedent from issue #72.
+    // fully-qualified identity now.
     assert_eq!(
         defs[0].target_table,
         format!("{DEFAULT_TARGET_SCHEMA}.widget_totals")

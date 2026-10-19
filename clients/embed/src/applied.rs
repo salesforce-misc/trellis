@@ -9,13 +9,14 @@
 
 use trellis::{Applied, QuarantineTarget};
 
-use crate::{PlainDefinition, PlainRelationship, quarantine_address};
+use crate::{PlainRelationship, quarantine_address};
 
 /// An [`Applied`] flattened to plain data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlainApplied {
-    /// A `TRANSFORM` statement registered this definition.
-    TransformDefined(PlainDefinition),
+    /// A `TRANSFORM` statement registered the transform writing this
+    /// fully-qualified target table.
+    TransformDefined(String),
     /// A `RELATIONSHIP` statement registered this relationship.
     RelationshipDefined(PlainRelationship),
     /// A `PAUSE TRANSFORM` statement froze its subject, or found it frozen.
@@ -27,10 +28,10 @@ pub enum PlainApplied {
     Resumed { columns: Vec<String> },
     /// A `DROP` statement removed its subject, or found it gone.
     Dropped,
-    /// An `ALTER TRANSFORM` statement edited its subject: the definition's new
-    /// state, and the fields this call added, dropped and altered.
+    /// An `ALTER TRANSFORM` statement edited its subject: the transform's
+    /// fully-qualified target table, and the fields this call added, dropped and altered.
     Altered {
-        definition: PlainDefinition,
+        target_table: String,
         added: Vec<String>,
         dropped: Vec<String>,
         altered: Vec<String>,
@@ -72,8 +73,8 @@ impl PlainApplied {
 impl From<&Applied> for PlainApplied {
     fn from(applied: &Applied) -> Self {
         match applied {
-            Applied::TransformDefined(definition) => {
-                PlainApplied::TransformDefined(PlainDefinition::from(definition))
+            Applied::TransformDefined(target_table) => {
+                PlainApplied::TransformDefined(target_table.clone())
             }
             Applied::RelationshipDefined(relationship) => {
                 PlainApplied::RelationshipDefined(PlainRelationship::from(relationship))
@@ -92,12 +93,12 @@ impl From<&Applied> for PlainApplied {
             },
             Applied::Dropped => PlainApplied::Dropped,
             Applied::Altered {
-                definition,
+                target_table,
                 added,
                 dropped,
                 altered,
             } => PlainApplied::Altered {
-                definition: PlainDefinition::from(definition),
+                target_table: target_table.clone(),
                 added: added.clone(),
                 dropped: dropped.clone(),
                 altered: altered.clone(),
@@ -109,51 +110,20 @@ impl From<&Applied> for PlainApplied {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashMap};
-
     use trellis::dev::defs::ast::RelationshipDef;
-    use trellis::dev::defs::{ValueType, parse};
-    use trellis::{
-        Definition, IntWidth, RelationshipCardinality, RelationshipDefinition, TransformStatus,
-    };
+    use trellis::{RelationshipCardinality, RelationshipDefinition};
 
     use super::*;
 
-    fn definition(status: TransformStatus) -> Definition {
-        Definition {
-            id: 7,
-            source_version: 1,
-            def: parse("TRANSFORM widget_prices FROM widgets SELECT price AS price").unwrap(),
-            source_columns: HashMap::from([(
-                "price".to_string(),
-                ValueType::Integer(IntWidth::Int4),
-            )]),
-            status,
-            source_table: "public.widgets".to_string(),
-            target_table: "public.widget_prices".to_string(),
-        }
-    }
-
-    fn plain_definition(status: &'static str) -> PlainDefinition {
-        PlainDefinition {
-            id: 7,
-            target_table: "public.widget_prices".to_string(),
-            source_table: "public.widgets".to_string(),
-            source_version: 1,
-            status,
-            source_columns: BTreeMap::from([("price".to_string(), "integer".to_string())]),
-        }
-    }
-
     #[test]
-    fn a_defined_transform_crosses_as_its_plain_definition() {
-        let applied = Applied::TransformDefined(definition(TransformStatus::WaitingToBackfill));
+    fn a_defined_transform_crosses_as_its_target_table() {
+        let applied = Applied::TransformDefined("public.widget_prices".to_string());
 
         let plain = PlainApplied::from(&applied);
 
         assert_eq!(
             plain,
-            PlainApplied::TransformDefined(plain_definition("waiting_to_backfill"))
+            PlainApplied::TransformDefined("public.widget_prices".to_string())
         );
         assert_eq!(plain.kind(), "transform_defined");
     }
@@ -211,7 +181,7 @@ mod tests {
     #[test]
     fn an_alteration_crosses_with_the_fields_it_changed() {
         let applied = Applied::Altered {
-            definition: definition(TransformStatus::Live),
+            target_table: "public.widget_prices".to_string(),
             added: vec!["doubled".to_string()],
             dropped: Vec::new(),
             altered: vec!["price".to_string()],
@@ -222,7 +192,7 @@ mod tests {
         assert_eq!(
             plain,
             PlainApplied::Altered {
-                definition: plain_definition("live"),
+                target_table: "public.widget_prices".to_string(),
                 added: vec!["doubled".to_string()],
                 dropped: Vec::new(),
                 altered: vec!["price".to_string()],
@@ -242,9 +212,8 @@ mod tests {
 
     #[test]
     fn every_kind_is_in_the_load_time_set() {
-        let definition = plain_definition("live");
         for plain in [
-            PlainApplied::TransformDefined(definition.clone()),
+            PlainApplied::TransformDefined("public.widget_prices".to_string()),
             PlainApplied::RelationshipDefined(PlainRelationship {
                 id: 1,
                 name: "owner".to_string(),
@@ -263,7 +232,7 @@ mod tests {
             },
             PlainApplied::Dropped,
             PlainApplied::Altered {
-                definition,
+                target_table: "public.widget_prices".to_string(),
                 added: Vec::new(),
                 dropped: Vec::new(),
                 altered: Vec::new(),

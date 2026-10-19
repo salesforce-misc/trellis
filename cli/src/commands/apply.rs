@@ -132,10 +132,9 @@ async fn apply(trellis: &Trellis, grammar: &str) -> Result<String, String> {
 /// better than refusing to print anything about work the engine already did.
 fn describe(applied: Applied) -> String {
     match applied {
-        Applied::TransformDefined(def) => format!(
-            "registered transform (id {}): {} -> {}",
-            def.id, def.def.source, def.def.target,
-        ),
+        Applied::TransformDefined(target_table) => {
+            format!("registered transform {target_table}")
+        }
         Applied::RelationshipDefined(def) => format!(
             "registered relationship {:?} (id {}, {} cardinality): {}.{} -> {}.{}",
             def.def.name,

@@ -262,14 +262,19 @@ async fn pausing_twice_is_a_no_op_success() {
     seed_source(&raw, "orders", 6).await;
 
     let trellis = define_only(db.dsn()).await;
-    let def = trellis
+    trellis
         .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
         .await
         .expect("an aggregate definition registers")
         .into_transform()
         .expect("a TRANSFORM statement registers a transform");
     assert_eq!(
-        def.status,
+        trellis
+            .status("order_rollup")
+            .await
+            .expect("status")
+            .expect("registered")
+            .status,
         TransformStatus::WaitingToBackfill,
         "registration only records an aggregate; its build is dispatched by the backfill discharge (#419)"
     );

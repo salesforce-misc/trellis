@@ -10,7 +10,6 @@ defmodule Trellis.ApplyTest do
   import Trellis.Eventually
 
   alias Trellis.{
-    Definition,
     DefinitionSummary,
     Error,
     Relationship,
@@ -74,14 +73,8 @@ defmodule Trellis.ApplyTest do
     assert %RelationshipSummary{name: "owner", cardinality: :one, created_at: %DateTime{}} =
              summary
 
-    assert {:ok, {:transform_defined, %Definition{} = definition}} =
+    assert {:ok, {:transform_defined, "public.pet_weights"}} =
              Trellis.apply(trellis, "TRANSFORM pet_weights FROM pets SELECT weight AS weight")
-
-    assert %Definition{
-             target_table: "public.pet_weights",
-             source_table: "public.pets",
-             status: :waiting_to_backfill
-           } = definition
 
     covered = MapSet.put(covered, "define_transform")
 
@@ -93,7 +86,10 @@ defmodule Trellis.ApplyTest do
                halt: nil
              }
            ] =
-             Enum.filter(Trellis.definitions!(trellis), &(&1.id == definition.id))
+             Enum.filter(
+               Trellis.definitions!(trellis),
+               &(&1.target_table == "public.pet_weights")
+             )
 
     await_status(trellis, "pet_weights", :live)
 
@@ -101,7 +97,7 @@ defmodule Trellis.ApplyTest do
              Trellis.apply(trellis, "ALTER TRANSFORM pet_weights ADD weight + weight AS doubled")
 
     assert %{
-             definition: %Definition{target_table: "public.pet_weights"},
+             target_table: "public.pet_weights",
              added: ["doubled"],
              dropped: [],
              altered: []

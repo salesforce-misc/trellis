@@ -63,7 +63,7 @@ use magnus::{
 use trellis::{BlockingTrellis, Config, ErrorCode, PendingCall, TrellisOptions};
 use trellis_embed::{
     DIVERGENCE_KINDS, ERROR_CODES, PlainApplied, PlainBackfillFailure, PlainCaptureFailure,
-    PlainCaptureWait, PlainConfig, PlainCorrectingNode, PlainDefinition, PlainDefinitionStatus,
+    PlainCaptureWait, PlainConfig, PlainCorrectingNode, PlainDefinitionStatus,
     PlainDefinitionSummary, PlainDivergence, PlainDrainFailure, PlainError, PlainHeldKeys,
     PlainPoisonEntry, PlainQuarantineEntry, PlainRelationship, PlainRelationshipSummary,
     PlainSamplePage, PlainSelfCheckJob, PlainSelfCheckReport, PlainUnindexedJoin, SELF_CHECK_MODES,
@@ -181,16 +181,15 @@ impl Handle {
     /// `trellis-embed`): any other form is a `validation` error and is never
     /// applied, and text that doesn't parse is the `parse` error `apply`
     /// would return.
-    fn define(ruby: &Ruby, rb_self: &Self, text: String) -> Result<RHash, Error> {
+    fn define(ruby: &Ruby, rb_self: &Self, text: String) -> Result<String, Error> {
         rb_self.check_pid(ruby)?;
         require_transform_statement(&text).map_err(|err| raise(ruby, err))?;
-        let definition = rb_self
+        let target_table = rb_self
             .call(ruby, |trellis| trellis.start_apply(&text))?
-            .into_transform()
-            .map(|d| PlainDefinition::from(&d));
+            .into_transform();
         // Unreachable: the check above is `apply`'s own parser. Kept as
         // defence, so a mistake there is an error rather than a panic.
-        let definition = definition.ok_or_else(|| {
+        let target_table = target_table.ok_or_else(|| {
             raise(
                 ruby,
                 PlainError::new(
@@ -199,7 +198,7 @@ impl Handle {
                 ),
             )
         })?;
-        definition_hash(ruby, definition)
+        Ok(target_table)
     }
 
     /// `target_table`'s status, or `nil` when no definition writes it.
@@ -211,7 +210,7 @@ impl Handle {
     }
 
     /// Runs one statement of Trellis's grammar, whatever its form, and
-    /// reports what it did as `{kind:, definition:, relationship:, columns:,
+    /// reports what it did as `{kind:, target_table:, relationship:, columns:,
     /// added:, dropped:, altered:}`: `kind` is one of [`PlainApplied::KINDS`],
     /// and each other field is set only for the kinds that carry it (see
     /// [`applied_hash`]).
@@ -858,24 +857,6 @@ fn array<T, V: IntoValue>(
     Ok(array)
 }
 
-fn definition_hash(ruby: &Ruby, definition: PlainDefinition) -> Result<RHash, Error> {
-    let columns = ruby.hash_new();
-    for (name, type_name) in definition.source_columns {
-        columns.aset(name, type_name)?;
-    }
-    record(
-        ruby,
-        [
-            ("id", ruby.into_value(definition.id)),
-            ("target_table", ruby.into_value(definition.target_table)),
-            ("source_table", ruby.into_value(definition.source_table)),
-            ("source_version", ruby.into_value(definition.source_version)),
-            ("status", word_symbol(ruby, definition.status).as_value()),
-            ("source_columns", columns.as_value()),
-        ],
-    )
-}
-
 fn definition_summary_hash(ruby: &Ruby, summary: PlainDefinitionSummary) -> Result<RHash, Error> {
     let failure = summary
         .backfill_failure
@@ -888,10 +869,7 @@ fn definition_summary_hash(ruby: &Ruby, summary: PlainDefinitionSummary) -> Resu
     record(
         ruby,
         [
-            ("id", ruby.into_value(summary.id)),
             ("target_table", ruby.into_value(summary.target_table)),
-            ("source_table", ruby.into_value(summary.source_table)),
-            ("source_version", ruby.into_value(summary.source_version)),
             ("status", word_symbol(ruby, summary.status).as_value()),
             (
                 "created_at_micros",
@@ -1100,7 +1078,7 @@ fn relationship_summary_hash(
 }
 
 /// What `apply` did. `kind` is one of [`PlainApplied::KINDS`]; each other
-/// field is set only for the kinds that carry it (`definition` for
+/// field is set only for the kinds that carry it (`target_table` for
 /// `transform_defined` and `altered`, `relationship` for
 /// `relationship_defined`, `columns` for `resumed`, and `added`, `dropped`
 /// and `altered` for `altered`), and is `nil` otherwise: the same flat shape
@@ -1108,23 +1086,21 @@ fn relationship_summary_hash(
 fn applied_hash(ruby: &Ruby, applied: PlainApplied) -> Result<RHash, Error> {
     let kind = word_symbol(ruby, applied.kind()).as_value();
     let nil = ruby.qnil().as_value();
-    let (mut definition, mut relationship, mut columns) = (nil, nil, nil);
+    let (mut target_table, mut relationship, mut columns) = (nil, nil, nil);
     let (mut added, mut dropped, mut altered) = (nil, nil, nil);
     match applied {
-        PlainApplied::TransformDefined(plain) => {
-            definition = definition_hash(ruby, plain)?.as_value();
-        }
+        PlainApplied::TransformDefined(plain) => target_table = ruby.into_value(plain),
         PlainApplied::RelationshipDefined(plain) => {
             relationship = relationship_hash(ruby, plain)?.as_value();
         }
         PlainApplied::Resumed { columns: resumed } => columns = ruby.into_value(resumed),
         PlainApplied::Altered {
-            definition: plain,
+            target_table: plain,
             added: plain_added,
             dropped: plain_dropped,
             altered: plain_altered,
         } => {
-            definition = definition_hash(ruby, plain)?.as_value();
+            target_table = ruby.into_value(plain);
             added = ruby.into_value(plain_added);
             dropped = ruby.into_value(plain_dropped);
             altered = ruby.into_value(plain_altered);
@@ -1135,7 +1111,7 @@ fn applied_hash(ruby: &Ruby, applied: PlainApplied) -> Result<RHash, Error> {
         ruby,
         [
             ("kind", kind),
-            ("definition", definition),
+            ("target_table", target_table),
             ("relationship", relationship),
             ("columns", columns),
             ("added", added),

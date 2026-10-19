@@ -5,7 +5,6 @@ defmodule Trellis.ConversionsTest do
 
   alias Trellis.{
     Applied,
-    Definition,
     DefinitionSummary,
     PoisonEntry,
     QuarantineEntry,
@@ -271,22 +270,15 @@ defmodule Trellis.ConversionsTest do
     for state <- [:queued, :running], do: refute(SelfCheckJob.finished?(%{done | state: state}))
   end
 
-  defp native_definition do
-    %{
-      id: 7,
-      target_table: "public.widget_prices",
-      source_table: "public.widgets",
-      source_version: 1,
-      status: :live,
-      source_columns: %{"price" => "integer"}
-    }
-  end
-
   # What the NIF's `definitions/1` returns for one definition.
   defp native_summary do
-    native_definition()
-    |> Map.delete(:source_columns)
-    |> Map.merge(%{created_at_micros: @micros, backfill_failure: nil, halt: nil})
+    %{
+      target_table: "public.widget_prices",
+      status: :live,
+      created_at_micros: @micros,
+      backfill_failure: nil,
+      halt: nil
+    }
   end
 
   defp native_relationship do
@@ -308,7 +300,7 @@ defmodule Trellis.ConversionsTest do
     Map.merge(
       %{
         kind: kind,
-        definition: nil,
+        target_table: nil,
         relationship: nil,
         columns: nil,
         added: nil,
@@ -320,9 +312,9 @@ defmodule Trellis.ConversionsTest do
   end
 
   test "each apply outcome becomes its tagged value" do
-    assert {:transform_defined, %Definition{id: 7, status: :live}} =
+    assert {:transform_defined, "public.widget_prices"} =
              Applied.from_native(
-               native_applied(:transform_defined, %{definition: native_definition()})
+               native_applied(:transform_defined, %{target_table: "public.widget_prices"})
              )
 
     assert {:relationship_defined, %Relationship{name: "owner", cardinality: :one}} =
@@ -338,14 +330,14 @@ defmodule Trellis.ConversionsTest do
 
     assert {:altered,
             %{
-              definition: %Definition{id: 7},
+              target_table: "public.widget_prices",
               added: ["doubled"],
               dropped: ["old"],
               altered: ["price"]
             }} =
              Applied.from_native(
                native_applied(:altered, %{
-                 definition: native_definition(),
+                 target_table: "public.widget_prices",
                  added: ["doubled"],
                  dropped: ["old"],
                  altered: ["price"]

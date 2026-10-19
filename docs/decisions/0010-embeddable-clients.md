@@ -171,11 +171,12 @@ mapping — so adding a code is a deliberate binding change, not a silent downgr
 **Values.** Only plain data crosses; engine types carrying structure are
 flattened on the Rust side, once:
 
-* **`Definition` does not cross** — it carries the `TransformDef` AST and a
-  `HashMap<String, ValueType>`. `define` returns the summary fields (`id`,
-  `target_table`, `source_table`, `source_version`, `status`, `created_at`)
-  plus source columns as a name → type-name map. An embedder wanting the AST
-  wants the Rust crate.
+* **A definition's sources do not cross.** A transform is identified by its
+  target table. `define` returns the target table, and `definitions()` lists
+  `target_table`, `status`, `created_at`, `backfill_failure` and `halt`. The
+  definition's id, source table, source version, source columns and parsed
+  statement are internal state; a source table appears only inside a failure
+  that names it. `dump_definitions_sql` shows what a transform reads.
 * **`SystemTime`** crosses as epoch microseconds, rehydrated to `DateTime` /
   `Time` in the host layer.
 * **`TransformStatus` / `QuarantineState`** cross as `as_str()` and become

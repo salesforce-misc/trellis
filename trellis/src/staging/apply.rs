@@ -1440,7 +1440,7 @@ pub(crate) struct RelationshipGenBump {
 /// are the distinct `from_col` values of the from-side rows this batch will
 /// evaluate — so only the related rows those rows actually need are fetched.
 /// `qualified_source` is the definition's own qualified source table
-/// ([`crate::defs::Definition::source_table`]) — a relationship's from-table,
+/// ([`crate::defs::model::Definition::source_table`]) — a relationship's from-table,
 /// and the key its name is unique under (issue #288).
 ///
 /// **Issue #130, epic #127**: a to-one relationship (`RelationshipCardinality::ToOne`)
@@ -1627,7 +1627,7 @@ struct ProjectionRead {
 
 impl RelationshipReads {
     /// The reads of every relationship `def` references, on its source
-    /// `qualified_source` ([`crate::defs::Definition::source_table`]) — a
+    /// `qualified_source` ([`crate::defs::model::Definition::source_table`]) — a
     /// relationship's from-table, and the key its name is unique under
     /// (issue #288). An unknown relationship is left out, and the evaluator
     /// surfaces `EvalError::UnknownRelationship`, as the pure path does.

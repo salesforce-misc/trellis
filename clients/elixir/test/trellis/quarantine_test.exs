@@ -10,7 +10,7 @@ defmodule Trellis.QuarantineTest do
 
   import Trellis.Eventually
 
-  alias Trellis.{Definition, PoisonSample, QuarantineEntry, SamplePage, Status, TestCluster}
+  alias Trellis.{PoisonSample, QuarantineEntry, SamplePage, Status, TestCluster}
 
   # The column fuse trips once this many distinct rows have failed on one
   # column (`staging::quarantine::DEFAULT_COLUMN_DEATH_THRESHOLD`).
@@ -32,7 +32,7 @@ defmodule Trellis.QuarantineTest do
 
     # `integer + integer` is an `integer`, so doubling anything past
     # 2^30 overflows it, on the engine exactly as on Postgres.
-    assert {:ok, {:transform_defined, %Definition{}}} =
+    assert {:ok, {:transform_defined, "public.doubled_ledger"}} =
              Trellis.apply(
                trellis,
                "TRANSFORM doubled_ledger FROM ledger SELECT n + n AS doubled"

@@ -61,7 +61,7 @@ Nothing in the binding uses it.
   it did as a `Trellis::Applied` whose `kind` names the outcome
   (`:transform_defined`, `:paused`, `:resumed`, ...).
   `Trellis.define(statement)` is an `apply` that refuses anything but a
-  `TRANSFORM`, and returns its `Trellis::Definition`.
+  `TRANSFORM`, and returns its fully qualified target table.
 - `Trellis.status(target_table)`, `Trellis.definitions`,
   `Trellis.relationships`: the catalog reads.
 - `Trellis.quarantined`, `Trellis.quarantine_status(target)`,
@@ -110,8 +110,7 @@ Trellis.shutdown
 # so a `staging: true` handle can't connect before `migrate` has run.
 Trellis.connect(url: "host=localhost dbname=app", staging: true, drain_threads: 2)
 Trellis.define("TRANSFORM widget_prices FROM widgets SELECT price AS price")
-# => #<data Trellis::Definition id=1, target_table="public.widget_prices", ...,
-#    status=:waiting_to_backfill, source_columns={"id"=>"integer", "price"=>"integer"}>
+# => "public.widget_prices"
 Trellis.status("widget_prices")
 # => #<data Trellis::Status status=:live, backfill_failure=nil, capture_wait=nil,
 #    capture_failure=nil>, once backfilled
@@ -224,7 +223,7 @@ default one included.
   returned.
 - **Durations are milliseconds**, as `timeout_ms:`, matching the Elixir
   binding.
-- **Results are `Data` values** (`Trellis::Definition`,
+- **Results are `Data` values** (`Trellis::DefinitionSummary`,
   `Trellis::QuarantineEntry`, ...), so they compare by value and
   pattern-match: `case Trellis.apply(stmt) in { kind: :resumed, columns: }`.
 

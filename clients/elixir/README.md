@@ -55,7 +55,7 @@ The surface mirrors the Rust crate's `BlockingTrellis` (issues #146, #147,
 - `apply/2`: any statement of Trellis's grammar (`TRANSFORM`,
   `RELATIONSHIP`, `PAUSE TRANSFORM`, `RESUME TRANSFORM`, `DROP TRANSFORM`,
   `DROP RELATIONSHIP`, `ALTER TRANSFORM`), returning what it did as a tagged
-  value (`{:transform_defined, definition}`, `:paused`,
+  value (`{:transform_defined, target_table}`, `:paused`,
   `{:resumed, addresses}`, ...). `define/2` is an `apply/2` that refuses
   anything but a `TRANSFORM`.
 - `status/2`, `definitions/1`, `relationships/1`: the catalog reads.

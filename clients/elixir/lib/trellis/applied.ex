@@ -2,8 +2,9 @@ defmodule Trellis.Applied do
   @moduledoc """
   What `Trellis.apply/2` did, one shape per statement form:
 
-  - `{:transform_defined, %Trellis.Definition{}}`: a `TRANSFORM` statement
-    registered a definition, at `:waiting_to_backfill`.
+  - `{:transform_defined, target_table}`: a `TRANSFORM` statement registered
+    the transform writing `target_table` (fully qualified), at
+    `:waiting_to_backfill`.
   - `{:relationship_defined, %Trellis.Relationship{}}`: a `RELATIONSHIP`
     statement registered a relationship.
   - `:paused`: a `PAUSE TRANSFORM` statement froze its subject, or found it
@@ -15,8 +16,8 @@ defmodule Trellis.Applied do
     which drops the transform to `:waiting_to_backfill` to rebuild.
   - `:dropped`: a `DROP` statement removed its subject, or found it already
     gone.
-  - `{:altered, %{definition: %Trellis.Definition{}, added: names, dropped:
-    names, altered: names}}`: an `ALTER TRANSFORM` statement edited its
+  - `{:altered, %{target_table: target_table, added: names, dropped: names,
+    altered: names}}`: an `ALTER TRANSFORM` statement edited its
     subject. The lists name only the fields this call actually changed.
   - `:unknown`: the statement was applied, but its outcome is newer than
     this version of the binding, which has no shape for it. It is still a
@@ -24,14 +25,14 @@ defmodule Trellis.Applied do
   """
 
   @type alteration :: %{
-          definition: Trellis.Definition.t(),
+          target_table: String.t(),
           added: [String.t()],
           dropped: [String.t()],
           altered: [String.t()]
         }
 
   @type t ::
-          {:transform_defined, Trellis.Definition.t()}
+          {:transform_defined, String.t()}
           | {:relationship_defined, Trellis.Relationship.t()}
           | :paused
           | {:resumed, [String.t()]}
@@ -41,8 +42,8 @@ defmodule Trellis.Applied do
 
   @doc false
   @spec from_native(map()) :: t()
-  def from_native(%{kind: :transform_defined, definition: definition}),
-    do: {:transform_defined, Trellis.Definition.from_native(definition)}
+  def from_native(%{kind: :transform_defined, target_table: target_table}),
+    do: {:transform_defined, target_table}
 
   def from_native(%{kind: :relationship_defined, relationship: relationship}),
     do: {:relationship_defined, Trellis.Relationship.from_native(relationship)}
@@ -52,7 +53,7 @@ defmodule Trellis.Applied do
   def from_native(%{kind: :altered} = altered) do
     {:altered,
      %{
-       definition: Trellis.Definition.from_native(altered.definition),
+       target_table: altered.target_table,
        added: altered.added,
        dropped: altered.dropped,
        altered: altered.altered

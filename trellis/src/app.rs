@@ -124,7 +124,7 @@ use tokio_postgres::types::PgLsn;
 use crate::client::{Client, ClientError, ClientOptions};
 use crate::config::Config;
 use crate::defs::{
-    self, CatalogError, Definition, ParseError, RelationshipDefinition, TransformStatus, ValueType,
+    self, CatalogError, ParseError, RelationshipDefinition, TransformStatus, ValueType,
 };
 use crate::error_code::{self, ErrorCode};
 use crate::intake::IntakeError;
@@ -409,7 +409,7 @@ impl Trellis {
     /// `TRANSFORM`/`RELATIONSHIP` register a definition, as the retired
     /// `define`/`define_relationship` did — including that **a transform
     /// returns before its backfill starts** (see this module's doc comment):
-    /// the returned [`Definition`] reports
+    /// the new transform's status is
     /// [`TransformStatus::WaitingToBackfill`] and the target is populated in
     /// the background, whatever the transform's shape. Poll
     /// [`Trellis::status`] for [`TransformStatus::Live`].
@@ -477,7 +477,7 @@ impl Trellis {
                     )
                     .await
                     .map_err(TrellisError::Catalog)?;
-                    Ok(Applied::TransformDefined(definition))
+                    Ok(Applied::TransformDefined(definition.target_table))
                 }
                 defs::Statement::DefineRelationship(_) => {
                     let relationship = defs::create_relationship(&self.pool, statement_text)
@@ -505,7 +505,7 @@ impl Trellis {
             .await
             .map_err(TrellisError::Catalog)?;
         Ok(Applied::Altered {
-            definition: outcome.definition,
+            target_table: outcome.definition.target_table,
             added: outcome.added,
             dropped: outcome.dropped,
             altered: outcome.altered,
@@ -651,7 +651,7 @@ impl Trellis {
         let rows = txn
             .query(
                 &format!(
-                    "select d.id, d.target_table, d.source_table, d.source_version, d.created_at, \
+                    "select d.id, d.target_table, d.created_at, d.source_table, \
                             pb.table_name as backfill_table, pb.attempts as backfill_attempts, \
                             pb.last_error as backfill_last_error, \
                             pb.next_attempt_at as backfill_next_attempt_at, {CHUNK_FAILURE_COLUMNS}, \
@@ -676,12 +676,9 @@ impl Trellis {
             .map(|row| {
                 let id: i64 = row.get(0);
                 DefinitionSummary {
-                    id,
                     target_table: row.get(1),
-                    source_table: row.get(2),
-                    source_version: row.get(3),
                     status: reported[&id],
-                    created_at: row.get(4),
+                    created_at: row.get(2),
                     backfill_failure: backfill_failure(&row),
                     halt: capture_failure(&row),
                 }
@@ -2106,10 +2103,8 @@ pub struct BackfillFailure {
 /// it.
 #[derive(Debug, Clone)]
 pub struct DefinitionSummary {
-    pub id: i64,
+    /// The schema-qualified target table, which identifies the transform.
     pub target_table: String,
-    pub source_table: String,
-    pub source_version: i64,
     /// Where this transform is in its lifecycle (issue #55) — see
     /// [`TransformStatus`].
     pub status: TransformStatus,
@@ -2152,8 +2147,8 @@ pub struct RelationshipSummary {
 ///
 /// One variant per operation, carrying only what that operation has to report
 /// that the caller couldn't already know from the statement it wrote: the
-/// registered [`Definition`]/[`RelationshipDefinition`] for the two defining
-/// forms (an id, and the status a caller then polls), the resumed
+/// registered transform's target table or the [`RelationshipDefinition`] for
+/// the two defining forms, the resumed
 /// `(transform, column)` pairs for a column resume, and nothing at all for a
 /// pause or a drop.
 ///
@@ -2168,7 +2163,7 @@ pub enum Applied {
     /// A `TRANSFORM ...` statement registered a transform definition. Reports
     /// [`TransformStatus::WaitingToBackfill`]: its backfill runs in the
     /// background — see [`Trellis::apply`].
-    TransformDefined(Definition),
+    TransformDefined(String),
     /// A `RELATIONSHIP ...` statement registered a relationship declaration.
     RelationshipDefined(RelationshipDefinition),
     /// A `PAUSE ...` statement froze its subject — or found it already frozen,
@@ -2187,15 +2182,15 @@ pub enum Applied {
     /// which ADR-0014 makes the same success.
     Dropped,
     /// An `ALTER TRANSFORM ...` statement edited its subject's calculated
-    /// fields (ADR-0015, issues #241/#242). `definition` is the edited
-    /// definition's new state; `added`/`dropped`/`altered` name exactly the
+    /// fields (ADR-0015, issues #241/#242). `target_table` is the edited
+    /// transform's schema-qualified target table; `added`/`dropped`/`altered` name exactly the
     /// fields this call actually changed, excluding any clause that turned
     /// out to be an idempotent no-op (re-adding an existing field with the
     /// same formula, re-altering to the formula it already had, dropping an
     /// already-absent field) — all three lists are empty for a statement
     /// whose every clause was one of those.
     Altered {
-        definition: Definition,
+        target_table: String,
         added: Vec<String>,
         dropped: Vec<String>,
         altered: Vec<String>,
@@ -2203,7 +2198,7 @@ pub enum Applied {
 }
 
 impl Applied {
-    /// The [`Definition`] a `TRANSFORM ...` statement registered, or `None`
+    /// The target table a `TRANSFORM ...` statement registered, or `None`
     /// for any other outcome.
     ///
     /// For the common case where the caller wrote the statement itself and so
@@ -2211,9 +2206,9 @@ impl Applied {
     /// reads better than a `match` with an unreachable arm — and much better
     /// than the `let ... else` that an `#[non_exhaustive]` enum otherwise
     /// forces on every such call site.
-    pub fn into_transform(self) -> Option<Definition> {
+    pub fn into_transform(self) -> Option<String> {
         match self {
-            Applied::TransformDefined(definition) => Some(definition),
+            Applied::TransformDefined(target_table) => Some(target_table),
             _ => None,
         }
     }

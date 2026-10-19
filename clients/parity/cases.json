@@ -1,19 +1,8 @@
 {
   "about": "The cross-language parity fixture (issue #155). Both host suites run every step below against a Trellis they connect themselves, and check each result against the same expected shape; neither suite owns this file. See README.md for the shape language and what each host maps onto it.",
   "records": {
-    "Definition": {
-      "id": "integer",
-      "target_table": "string",
-      "source_table": "string",
-      "source_version": "integer",
-      "status": {"word_in": "transform_status"},
-      "source_columns": {"map_of": "string"}
-    },
     "DefinitionSummary": {
-      "id": "integer",
       "target_table": "string",
-      "source_table": "string",
-      "source_version": "integer",
       "status": {"word_in": "transform_status"},
       "created_at": "time",
       "backfill_failure": {"nullable": {"record": "BackfillFailure"}},
@@ -100,7 +89,7 @@
     },
     "Applied": {
       "kind": {"word_in": "applied_kind"},
-      "definition": {"nullable": {"record": "Definition"}},
+      "target_table": {"nullable": "string"},
       "relationship": {"nullable": {"record": "Relationship"}},
       "columns": {"nullable": {"list_of": "string"}},
       "added": {"nullable": {"list_of": "string"}},
@@ -209,7 +198,7 @@
       "covers": {"statement_kind": "define_relationship"},
       "expect": {"record": "Applied", "fields": {
         "kind": {"word": "relationship_defined"},
-        "definition": null,
+        "target_table": null,
         "relationship": {"record": "Relationship", "fields": {
           "name": {"eq": "parity_owner"},
           "from_schema": {"eq": "public"},
@@ -227,15 +216,10 @@
     {"op": "relationships", "expect": {"list": [{"record": "RelationshipSummary", "fields": {"name": {"eq": "parity_owner"}, "cardinality": {"word": "one"}}}]}},
 
     {
-      "about": "define returns a bare Definition, not yet live; source_columns is every source column's name to its type's name.",
+      "about": "define returns the fully qualified target table, not yet live.",
       "op": "define",
       "args": ["TRANSFORM parity_prices FROM parity_items SELECT price AS price"],
-      "expect": {"record": "Definition", "fields": {
-        "target_table": {"eq": "public.parity_prices"},
-        "source_table": {"eq": "public.parity_items"},
-        "source_version": {"eq": 1},
-        "source_columns": {"map": {"id": {"eq": "integer"}, "owner_id": {"eq": "integer"}, "price": {"eq": "integer"}}}
-      }}
+      "expect": {"eq": "public.parity_prices"}
     },
     {"about": "The same target twice clashes.", "op": "define", "args": ["TRANSFORM parity_prices FROM parity_items SELECT price AS price"], "expect": {"error": "conflict"}},
     {
@@ -244,7 +228,7 @@
       "covers": {"statement_kind": "define_transform"},
       "expect": {"record": "Applied", "fields": {
         "kind": {"word": "transform_defined"},
-        "definition": {"record": "Definition", "fields": {"target_table": {"eq": "public.parity_scratch"}}},
+        "target_table": {"eq": "public.parity_scratch"},
         "relationship": null, "columns": null, "added": null, "dropped": null, "altered": null
       }}
     },
@@ -260,7 +244,7 @@
       "op": "apply",
       "args": ["DROP RELATIONSHIP parity_items.parity_owner"],
       "covers": {"statement_kind": "drop_relationship"},
-      "expect": {"record": "Applied", "fields": {"kind": {"word": "dropped"}, "definition": null, "relationship": null, "columns": null, "added": null, "dropped": null, "altered": null}}
+      "expect": {"record": "Applied", "fields": {"kind": {"word": "dropped"}, "target_table": null, "relationship": null, "columns": null, "added": null, "dropped": null, "altered": null}}
     },
     {"op": "relationships", "expect": {"list": []}},
 
@@ -316,7 +300,7 @@
       "covers": {"statement_kind": "alter_transform"},
       "expect": {"record": "Applied", "fields": {
         "kind": {"word": "altered"},
-        "definition": {"record": "Definition", "fields": {"target_table": {"eq": "public.parity_scratch"}}},
+        "target_table": {"eq": "public.parity_scratch"},
         "relationship": null, "columns": null,
         "added": {"list": [{"eq": "doubled"}]}, "dropped": {"list": []}, "altered": {"list": []}
       }}
@@ -325,21 +309,21 @@
       "op": "apply",
       "args": ["PAUSE TRANSFORM parity_scratch"],
       "covers": {"statement_kind": "pause_transform"},
-      "expect": {"record": "Applied", "fields": {"kind": {"word": "paused"}, "definition": null, "relationship": null, "columns": null, "added": null, "dropped": null, "altered": null}}
+      "expect": {"record": "Applied", "fields": {"kind": {"word": "paused"}, "target_table": null, "relationship": null, "columns": null, "added": null, "dropped": null, "altered": null}}
     },
     {
       "about": "A whole-transform resume has no columns to report: an empty list, not nil.",
       "op": "apply",
       "args": ["RESUME TRANSFORM parity_scratch"],
       "covers": {"statement_kind": "resume_transform"},
-      "expect": {"record": "Applied", "fields": {"kind": {"word": "resumed"}, "definition": null, "relationship": null, "columns": {"list": []}, "added": null, "dropped": null, "altered": null}}
+      "expect": {"record": "Applied", "fields": {"kind": {"word": "resumed"}, "target_table": null, "relationship": null, "columns": {"list": []}, "added": null, "dropped": null, "altered": null}}
     },
     {"op": "apply", "args": ["PAUSE TRANSFORM parity_scratch"], "expect": {"record": "Applied", "fields": {"kind": {"word": "paused"}}}},
     {
       "op": "apply",
       "args": ["DROP TRANSFORM parity_scratch"],
       "covers": {"statement_kind": "drop_transform"},
-      "expect": {"record": "Applied", "fields": {"kind": {"word": "dropped"}, "definition": null, "relationship": null, "columns": null, "added": null, "dropped": null, "altered": null}}
+      "expect": {"record": "Applied", "fields": {"kind": {"word": "dropped"}, "target_table": null, "relationship": null, "columns": null, "added": null, "dropped": null, "altered": null}}
     },
     {"op": "status", "args": ["parity_scratch"], "expect": null},
 
@@ -462,20 +446,20 @@
     {
       "about": "A time a microsecond before the epoch lands on that microsecond, not a second off.",
       "type": "DefinitionSummary",
-      "native": {"id": 7, "target_table": "public.t", "source_table": "public.s", "source_version": 2, "status": {"$word": "live"}, "created_at_micros": -1, "backfill_failure": null, "halt": null},
-      "expect": {"record": "DefinitionSummary", "fields": {"id": {"eq": 7}, "created_at": {"time_micros": -1}, "backfill_failure": null, "halt": null}}
+      "native": {"target_table": "public.t", "status": {"$word": "live"}, "created_at_micros": -1, "backfill_failure": null, "halt": null},
+      "expect": {"record": "DefinitionSummary", "fields": {"target_table": {"eq": "public.t"}, "created_at": {"time_micros": -1}, "backfill_failure": null, "halt": null}}
     },
     {
       "about": "A definition the drain halted on (#663), which needs a source whose key the drain can't use, so a live run can't produce it cheaply: the halt is a CaptureFailure of kind halt, and its time is rehydrated from epoch microseconds exactly.",
       "type": "DefinitionSummary",
-      "native": {"id": 8, "target_table": "public.t", "source_table": "public.s", "source_version": 2, "status": {"$word": "paused"}, "created_at_micros": 1727222400123456, "backfill_failure": null, "halt": {"kind": {"$word": "halt"}, "source_table": "public.s", "columns": [], "error": "the drain halted: source table 'public.s' has no primary key; fix the cause, then resume the definition to rebuild it, or drop the definition", "detected_at_micros": 1727222400123459}},
+      "native": {"target_table": "public.t", "status": {"$word": "paused"}, "created_at_micros": 1727222400123456, "backfill_failure": null, "halt": {"kind": {"$word": "halt"}, "source_table": "public.s", "columns": [], "error": "the drain halted: source table 'public.s' has no primary key; fix the cause, then resume the definition to rebuild it, or drop the definition", "detected_at_micros": 1727222400123459}},
       "expect": {"record": "DefinitionSummary", "fields": {"status": {"word": "paused"}, "backfill_failure": null, "halt": {"record": "CaptureFailure", "fields": {"kind": {"word": "halt"}, "source_table": {"eq": "public.s"}, "columns": {"list": []}, "detected_at": {"time_micros": 1727222400123459}}}}}
     },
     {
       "about": "An outcome newer than the binding is still a success, with no detail.",
       "type": "Applied",
-      "native": {"kind": {"$word": "unknown"}, "definition": null, "relationship": null, "columns": null, "added": null, "dropped": null, "altered": null},
-      "expect": {"record": "Applied", "fields": {"kind": {"word": "unknown"}, "definition": null, "relationship": null, "columns": null, "added": null, "dropped": null, "altered": null}}
+      "native": {"kind": {"$word": "unknown"}, "target_table": null, "relationship": null, "columns": null, "added": null, "dropped": null, "altered": null},
+      "expect": {"record": "Applied", "fields": {"kind": {"word": "unknown"}, "target_table": null, "relationship": null, "columns": null, "added": null, "dropped": null, "altered": null}}
     },
     {
       "about": "An error code newer than the binding falls back to unknown rather than crashing.",

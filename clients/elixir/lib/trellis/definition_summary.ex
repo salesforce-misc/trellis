@@ -1,10 +1,9 @@
 defmodule Trellis.DefinitionSummary do
   @moduledoc """
-  A registered transform definition, as `Trellis.definitions/1` lists it:
-  `Trellis.Definition`'s fields, with the time it was registered in place of
-  its source columns.
+  A registered transform definition, as `Trellis.definitions/1` lists it.
 
-  `target_table` and `source_table` are fully qualified (`schema.table`).
+  `target_table` is fully qualified (`schema.table`) and identifies the
+  transform. `created_at` is when it was registered.
   `backfill_failure` is set while its build keeps failing, as in
   `Trellis.Status`. `halt` is set while the drain, or its build's merge,
   has halted on it: a `Trellis.CaptureFailure` of kind `:halt`, the
@@ -13,10 +12,7 @@ defmodule Trellis.DefinitionSummary do
   """
 
   @type t :: %__MODULE__{
-          id: integer(),
           target_table: String.t(),
-          source_table: String.t(),
-          source_version: integer(),
           status: Trellis.Status.status(),
           created_at: DateTime.t(),
           backfill_failure: Trellis.BackfillFailure.t() | nil,
@@ -24,10 +20,7 @@ defmodule Trellis.DefinitionSummary do
         }
 
   @enforce_keys [
-    :id,
     :target_table,
-    :source_table,
-    :source_version,
     :status,
     :created_at,
     :backfill_failure,

@@ -20,28 +20,16 @@ module Trellis
     end
   end
 
-  # A registered transform definition, as Trellis.define returns it (and
-  # Trellis.apply, inside an Applied).
-  #
-  # - id: the definition's id.
-  # - target_table, source_table: fully qualified, "schema.table".
-  # - source_version: the source table's version it was validated against.
-  # - status: a symbol (:waiting_to_backfill, :backfilling, :live, ...), from
-  #   a closed set: never one made from a string the database returned.
-  # - source_columns: each source column's name => its type's name
-  #   ("integer", "numeric", "text", ...).
-  Definition = Data.define(:id, :target_table, :source_table, :source_version, :status,
-                           :source_columns)
-
-  # A registered transform definition, as Trellis.definitions lists it:
-  # Definition's fields, with the time it was registered (a Time) in place
-  # of its source columns. backfill_failure is nil unless its build keeps
+  # A registered transform definition, as Trellis.definitions lists it.
+  # target_table (fully qualified, "schema.table") identifies the transform;
+  # status is a symbol (:waiting_to_backfill, :backfilling, :live, ...) from
+  # a closed set, never one made from a string the database returned;
+  # created_at is when it was registered (a Time). backfill_failure is nil unless its build keeps
   # failing. halt is nil unless the drain, or its build's merge, halted on
   # it: a CaptureFailure of kind :halt, the definition :paused until the
   # cause is fixed and it is resumed. Listing the definitions and looking for
   # a halt is the health check for halts.
-  DefinitionSummary = Data.define(:id, :target_table, :source_table, :source_version, :status,
-                                  :created_at, :backfill_failure, :halt) do
+  DefinitionSummary = Data.define(:target_table, :status, :created_at, :backfill_failure, :halt) do
     def self.from_native(hash)
       failure = hash[:backfill_failure]
       halt = hash[:halt]
@@ -223,8 +211,8 @@ module Trellis
   # What Trellis.apply did. `kind` says which statement form ran, and each
   # other field is set only for the kinds that carry it (nil otherwise):
   #
-  # - :transform_defined: a TRANSFORM statement registered `definition` (a
-  #   Definition), at :waiting_to_backfill.
+  # - :transform_defined: a TRANSFORM statement registered the transform
+  #   writing `target_table` (fully qualified), at :waiting_to_backfill.
   # - :relationship_defined: a RELATIONSHIP statement registered
   #   `relationship` (a Relationship).
   # - :paused: a PAUSE TRANSFORM statement froze its subject, or found it
@@ -236,7 +224,7 @@ module Trellis
   #   transform to :waiting_to_backfill to rebuild.
   # - :dropped: a DROP statement removed its subject, or found it already
   #   gone.
-  # - :altered: an ALTER TRANSFORM statement edited `definition`. `added`,
+  # - :altered: an ALTER TRANSFORM statement edited the transform writing `target_table`. `added`,
   #   `dropped` and `altered` name only the fields this call changed.
   # - :unknown: the statement was applied, but its outcome is newer than this
   #   version of the binding, which has no shape for it. It is still a
@@ -247,13 +235,11 @@ module Trellis
   #   case Trellis.apply("RESUME TRANSFORM order_totals.total")
   #   in { kind: :resumed, columns: } then puts "resumed #{columns.join(', ')}"
   #   end
-  Applied = Data.define(:kind, :definition, :relationship, :columns, :added, :dropped,
+  Applied = Data.define(:kind, :target_table, :relationship, :columns, :added, :dropped,
                         :altered) do
     def self.from_native(hash)
-      definition = hash[:definition]
       relationship = hash[:relationship]
       new(**hash,
-          definition: definition && Definition.new(**definition),
           relationship: relationship && Relationship.new(**relationship))
     end
   end

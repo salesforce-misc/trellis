@@ -13,7 +13,6 @@
 //! | `trellis` value | Crosses as | Here |
 //! |---|---|---|
 //! | any error's `code()` + `Display` | `(code, message)` | [`PlainError`] |
-//! | [`trellis::Definition`] | summary fields + column name → type name | [`PlainDefinition`] |
 //! | [`trellis::DefinitionSummary`] | summary fields + backfill failure + halt | [`PlainDefinitionSummary`] |
 //! | [`trellis::DefinitionStatus`] | status word + backfill failure + capture wait + capture failure + held keys + drain failure + unindexed joins + correcting nodes | [`PlainDefinitionStatus`] |
 //! | [`trellis::HeldKeys`] | count + oldest poison time | [`PlainHeldKeys`] |
@@ -70,8 +69,8 @@ pub use config::PlainConfig;
 pub use cursor::{decode_cursor, encode_cursor, next_cursor};
 pub use definition::{
     PlainBackfillFailure, PlainCaptureFailure, PlainCaptureWait, PlainCorrectingNode,
-    PlainDefinition, PlainDefinitionStatus, PlainDefinitionSummary, PlainDrainFailure,
-    PlainUnindexedJoin, capture_failure_kind_names,
+    PlainDefinitionStatus, PlainDefinitionSummary, PlainDrainFailure, PlainUnindexedJoin,
+    capture_failure_kind_names,
 };
 pub use error::{CodedError, ERROR_CODES, PlainError};
 pub use log::{

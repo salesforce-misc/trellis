@@ -208,7 +208,7 @@ pub use staging::self_check::SelfCheckError;
 // Compiler-forced: a `pub fn` on the facade that returns or accepts one of
 // these would otherwise expose an unnameable type.
 pub use defs::{
-    Definition, RelationshipCardinality, RelationshipDefinition, RelationshipSide, TransformStatus,
+    RelationshipCardinality, RelationshipDefinition, RelationshipSide, TransformStatus,
 };
 // `watermark_token`/`await_converged`'s token, so an embedder names it
 // without its own (version-locked) `tokio-postgres` dependency.

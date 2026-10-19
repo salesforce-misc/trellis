@@ -209,9 +209,7 @@ fn format_definitions(definitions: &[(DefinitionSummary, StatusWarnings)]) -> St
         .iter()
         .map(|(def, warnings)| {
             let mut line = format!(
-                "  id={} source={} target={} status={} created_at={}\n",
-                def.id,
-                def.source_table,
+                "  target={} status={} created_at={}\n",
                 def.target_table,
                 def.status.as_str(),
                 format_timestamp(def.created_at)
@@ -440,18 +438,13 @@ mod tests {
     #[test]
     fn a_definition_is_formatted_with_its_fields() {
         let def = DefinitionSummary {
-            id: 7,
             target_table: "order_totals".to_string(),
-            source_table: "orders".to_string(),
-            source_version: 1,
             status: trellis::TransformStatus::Live,
             created_at: UNIX_EPOCH,
             backfill_failure: None,
             halt: None,
         };
         let formatted = format_definitions(&[(def, StatusWarnings::default())]);
-        assert!(formatted.contains("id=7"));
-        assert!(formatted.contains("source=orders"));
         assert!(formatted.contains("target=order_totals"));
         assert!(formatted.contains("status=live"));
         assert!(formatted.contains("1970-01-01 00:00:00 UTC"));
@@ -460,10 +453,7 @@ mod tests {
     #[test]
     fn a_healthy_definition_is_one_line() {
         let def = DefinitionSummary {
-            id: 7,
             target_table: "order_totals".to_string(),
-            source_table: "orders".to_string(),
-            source_version: 1,
             status: trellis::TransformStatus::Live,
             created_at: UNIX_EPOCH,
             backfill_failure: None,
@@ -479,10 +469,7 @@ mod tests {
         // `date -u -d "2024-01-01 00:00:00" +%s` => 1704067200
         let next_attempt_at = UNIX_EPOCH + Duration::from_secs(1_704_067_200);
         let def = DefinitionSummary {
-            id: 7,
             target_table: "public.order_totals".to_string(),
-            source_table: "public.orders".to_string(),
-            source_version: 1,
             status: trellis::TransformStatus::WaitingToBackfill,
             created_at: UNIX_EPOCH,
             backfill_failure: Some(trellis::BackfillFailure {
@@ -496,7 +483,7 @@ mod tests {
         let formatted = format_definitions(&[(def, StatusWarnings::default())]);
         assert_eq!(
             formatted,
-            "  id=7 source=public.orders target=public.order_totals \
+            "  target=public.order_totals \
              status=waiting_to_backfill created_at=1970-01-01 00:00:00 UTC\n    \
              backfill of public.orders failing: attempts=3 \
              next_attempt_at=2024-01-01 00:00:00 UTC \
@@ -509,10 +496,7 @@ mod tests {
         // `date -u -d "2024-01-01 00:00:00" +%s` => 1704067200
         let detected_at = UNIX_EPOCH + Duration::from_secs(1_704_067_200);
         let def = DefinitionSummary {
-            id: 7,
             target_table: "public.order_totals".to_string(),
-            source_table: "public.orders".to_string(),
-            source_version: 1,
             status: trellis::TransformStatus::Paused,
             created_at: UNIX_EPOCH,
             backfill_failure: None,
@@ -527,7 +511,7 @@ mod tests {
         let formatted = format_definitions(&[(def, StatusWarnings::default())]);
         assert_eq!(
             formatted,
-            "  id=7 source=public.orders target=public.order_totals \
+            "  target=public.order_totals \
              status=paused created_at=1970-01-01 00:00:00 UTC\n    \
              halted on public.orders at 2024-01-01 00:00:00 UTC: \
              error=\"the drain halted: no primary key\"\n"
@@ -539,10 +523,7 @@ mod tests {
         // `date -u -d "2024-01-01 00:00:00" +%s` => 1704067200
         let since = UNIX_EPOCH + Duration::from_secs(1_704_067_200);
         let def = DefinitionSummary {
-            id: 7,
             target_table: "public.order_totals".to_string(),
-            source_table: "public.orders".to_string(),
-            source_version: 1,
             status: trellis::TransformStatus::Live,
             created_at: UNIX_EPOCH,
             backfill_failure: None,
@@ -566,7 +547,7 @@ mod tests {
         )]);
         assert_eq!(
             formatted,
-            "  id=7 source=public.orders target=public.order_totals \
+            "  target=public.order_totals \
              status=live created_at=1970-01-01 00:00:00 UTC\n    \
              drain failing on segment 17 (public.lines, public.orders): attempts=5 \
              since=2024-01-01 00:00:00 UTC last_seen=2024-01-01 00:01:30 UTC \
@@ -577,10 +558,7 @@ mod tests {
     #[test]
     fn an_unindexed_join_is_shown_under_its_definition_with_its_fix() {
         let def = DefinitionSummary {
-            id: 7,
             target_table: "public.order_totals".to_string(),
-            source_table: "public.orders".to_string(),
-            source_version: 1,
             status: trellis::TransformStatus::Live,
             created_at: UNIX_EPOCH,
             backfill_failure: None,
@@ -596,7 +574,7 @@ mod tests {
         };
         assert_eq!(
             format_definitions(&[(def, warnings)]),
-            "  id=7 source=public.orders target=public.order_totals \
+            "  target=public.order_totals \
              status=live created_at=1970-01-01 00:00:00 UTC\n    \
              warning: relationship items joins on public.order_items.order_id, \
              which has no usable index; \
@@ -607,10 +585,7 @@ mod tests {
     #[test]
     fn each_node_under_correction_is_shown_under_its_definition() {
         let def = DefinitionSummary {
-            id: 7,
             target_table: "public.order_totals".to_string(),
-            source_table: "public.orders".to_string(),
-            source_version: 1,
             status: trellis::TransformStatus::Backfilling,
             created_at: UNIX_EPOCH,
             backfill_failure: None,
@@ -633,7 +608,7 @@ mod tests {
         };
         assert_eq!(
             format_definitions(&[(def, warnings)]),
-            "  id=7 source=public.orders target=public.order_totals \
+            "  target=public.order_totals \
              status=backfilling created_at=1970-01-01 00:00:00 UTC\n    \
              correcting public.orders_2026 since=1970-01-01 00:01:00 UTC keys_remaining=1200\n    \
              correcting public.orders_2027 since=1970-01-01 00:01:30 UTC\n"
@@ -672,10 +647,7 @@ mod tests {
     #[test]
     fn a_multi_line_backfill_error_stays_on_its_line() {
         let def = DefinitionSummary {
-            id: 7,
             target_table: "public.order_totals".to_string(),
-            source_table: "public.orders".to_string(),
-            source_version: 1,
             status: trellis::TransformStatus::WaitingToBackfill,
             created_at: UNIX_EPOCH,
             backfill_failure: Some(trellis::BackfillFailure {

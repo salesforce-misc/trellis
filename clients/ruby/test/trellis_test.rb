@@ -21,12 +21,8 @@ class TrellisTest < Minitest::Test
 
     Trellis.connect(url: TestCluster.dsn, staging: true, drain_threads: 1)
 
-    definition = Trellis.define("TRANSFORM widget_prices FROM widgets SELECT price AS price")
-    assert_instance_of Trellis::Definition, definition
-    assert_equal "public.widget_prices", definition.target_table
-    assert_equal "public.widgets", definition.source_table
-    assert_equal :waiting_to_backfill, definition.status
-    assert_equal({ "id" => "integer", "price" => "integer" }, definition.source_columns)
+    target_table = Trellis.define("TRANSFORM widget_prices FROM widgets SELECT price AS price")
+    assert_equal "public.widget_prices", target_table
 
     status = await_status("widget_prices")
     assert_equal Trellis::Status.new(status: :live, backfill_failure: nil, capture_wait: nil,
@@ -56,8 +52,9 @@ class TrellisTest < Minitest::Test
     pg.exec("create table gadgets (id integer primary key, price integer)")
     Trellis.connect(url: TestCluster.dsn)
 
-    assert_equal :waiting_to_backfill,
-                 Trellis.define("TRANSFORM gadget_prices FROM gadgets SELECT price AS price").status
+    assert_equal "public.gadget_prices",
+                 Trellis.define("TRANSFORM gadget_prices FROM gadgets SELECT price AS price")
+    assert_equal :waiting_to_backfill, Trellis.status("gadget_prices").status
 
     ["PAUSE TRANSFORM gadget_prices",
      "  drop transform gadget_prices",
