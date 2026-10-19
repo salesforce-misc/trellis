@@ -276,6 +276,50 @@ async fn a_changed_catalog_oid_under_the_same_identifier_is_a_restore() {
     fx.assert_restore_pauses_then_resume_rebuilds().await;
 }
 
+/// A correction queued before a `pg_upgrade` is valid: the engine doesn't see
+/// it while the stored identifier differs, the pass classifies the change as
+/// `pg_upgrade` and records the new identifier, and from then on the
+/// correction runs to the oracle without pausing anything.
+#[tokio::test]
+async fn a_correction_queued_before_a_pg_upgrade_runs_once_the_pass_rerecords() {
+    let mut fx = Fx::start().await;
+    fx.queue_a_correction().await;
+    fx.exec(
+        "update partition_sources set system_identifier = '1', nodes = jsonb_set(nodes, \
+             '{nodes}', (select jsonb_agg(case when n ? 'inherits_xmin' \
+                 and n->'inherits_xmin' <> 'null'::jsonb \
+                 then jsonb_set(n, '{inherits_xmin}', '\"1\"') else n end) \
+             from jsonb_array_elements(nodes->'nodes') n))",
+    )
+    .await;
+    assert!(
+        partitions::pending_corrections(&fx.d.ctl, SOURCE)
+            .await
+            .expect("the queue")
+            .is_empty(),
+        "hidden until the pass has classified the change"
+    );
+    let outcome = fx.pass().await;
+    assert_eq!(outcome.partition_deep_checks, [SOURCE]);
+    assert_eq!(fx.queued().await, 1, "the upgrade queues nothing new");
+    assert_eq!(
+        partitions::pending_corrections(&fx.d.ctl, SOURCE)
+            .await
+            .expect("the queue")
+            .len(),
+        1,
+        "visible once the pass recorded the live identifier"
+    );
+    for _ in 0..3 {
+        fx.full_pass().await;
+        fx.settle_builds().await;
+    }
+    assert_eq!(fx.status("agg").await, "live");
+    assert_eq!(fx.capture_failure("agg").await, None);
+    assert_eq!(fx.queued().await, 0, "the correction ran");
+    assert_eq!(fx.wrong_groups("items", "agg").await, Vec::<String>::new());
+}
+
 /// A restore into another cluster: a new identifier, and the recorded oids
 /// name nothing live.
 #[tokio::test]
