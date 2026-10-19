@@ -259,10 +259,11 @@ pub(crate) async fn park_target_catchup_if_read(
 /// to a captured partitioned root's recorded tree
 /// (`capture::install::adds_only_new_nodes`). A definition reading the
 /// root the partition correction engine serves (an aggregate on the ledger
-/// or the group basis, or a reader through a to-many relationship) is then
-/// neither rebuilt nor caught up: the reconcile pass queues each new node's
-/// correction, which re-derives the keys of the node alone, the node's own
-/// rows' among them (#1103, #1147). With no other reader to catch up and no
+/// or the group basis, a `JOIN` reading the root as either side, or a reader
+/// through a to-many relationship) is then neither rebuilt nor caught up:
+/// the reconcile pass queues each new node's correction, which re-derives
+/// the keys (or the `JOIN` side's cells) of the node alone, the node's own
+/// rows' among them (#1103, #1111, #1147). With no other reader to catch up and no
 /// rebuild, no marker is parked, so nothing enumerates the whole table.
 pub(crate) async fn park_table_catch_ups(
     client: &impl GenericClient,
@@ -323,8 +324,10 @@ pub(crate) async fn park_table_catch_ups(
 
 /// Whether the partition correction engine corrects `definition` for a node
 /// new to one of `tables`' recorded trees (`park_table_catch_ups`'s
-/// `new_nodes`): an aggregate over the table that the engine re-derives
-/// ([`crate::staging::build::corrected_on_partitioned_source`]), or a
+/// `new_nodes`): a `JOIN` reading the table as either side, whose node
+/// correction recomputes the side's cells that route to the node (#1111);
+/// an aggregate over the table that the engine re-derives
+/// ([`crate::staging::build::corrected_on_partitioned_source`]); or a
 /// definition reading the table through a to-many relationship
 /// (`staging::partition_correction::schedule`'s readers).
 async fn corrected_by_new_node(
@@ -332,6 +335,12 @@ async fn corrected_by_new_node(
     definition: &crate::defs::model::Definition,
     tables: &[String],
 ) -> Result<bool, IntakeError> {
+    if crate::staging::join::applies(&definition.def) {
+        return Ok(tables.contains(&definition.source_table)
+            || crate::defs::catalog::join_table_of(client, definition.id)
+                .await?
+                .is_some_and(|joined| tables.contains(&joined)));
+    }
     if tables.contains(&definition.source_table) {
         return Ok(crate::staging::build::corrected_on_partitioned_source(
             definition,

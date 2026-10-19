@@ -501,3 +501,105 @@ async fn a_partitioned_root_without_a_primary_key_is_refused_as_unkeyed() {
     ));
     let _ = &it.db;
 }
+
+/// A `JOIN` side's partial key is its own `GROUP BY` columns plus its join
+/// key (ADR-0019), and the group-key rule applies to it on either side: a
+/// fact table partitioned on the column it joins by needs nothing in its
+/// `GROUP BY`; one joined by another column needs the partition key grouped;
+/// a dimension partitioned on a column outside its join key and `GROUP BY`
+/// is refused, naming the column (#1111).
+#[tokio::test]
+async fn a_join_side_is_held_to_the_rule_over_its_partial_key() {
+    let cluster = TestCluster::start();
+    let it = instance(
+        &cluster,
+        &format!(
+            "{ORDER_LINES} \
+             create table public.orders (id bigint primary key, customer_id bigint, zone text); \
+             create table public.products (id bigint primary key, name text); \
+             create table public.customers (id bigint not null, region text not null, \
+                primary key (region, id)) partition by list (region); \
+             create table public.customers_eu partition of public.customers \
+                for values in ('eu');"
+        ),
+    )
+    .await;
+    let join = |from: &str, on: &str, group_by: &str| {
+        let fields: Vec<String> = group_by
+            .split(", ")
+            .map(|c| format!("{c} AS {}", c.split_once('.').map_or(c, |(_, b)| b)))
+            .collect();
+        format!(
+            "TRANSFORM j FROM {from} ON {on} GROUP BY {group_by} SELECT {}, COUNT(*) AS n",
+            fields.join(", ")
+        )
+    };
+    // The fact side joins by its partition key.
+    assert_shape_accepted(
+        &refusal(
+            &it,
+            &join(
+                "order_line_items LEFT JOIN orders",
+                "order_line_items.order_id = orders.id",
+                "orders.zone",
+            ),
+        )
+        .await,
+        "public.order_line_items",
+    );
+    // It joins by another column: refused, unless the key is grouped.
+    let err = refusal(
+        &it,
+        &join(
+            "order_line_items JOIN products",
+            "order_line_items.product_id = products.id",
+            "products.name",
+        ),
+    )
+    .await;
+    let refused = assert_refused_naming(&err, "\"order_id\"");
+    assert!(matches!(
+        refused,
+        PartitionRefusal::KeyNotInGroup {
+            role: KeyRole::GroupBy,
+            ..
+        }
+    ));
+    assert_shape_accepted(
+        &refusal(
+            &it,
+            &join(
+                "order_line_items JOIN products",
+                "order_line_items.product_id = products.id",
+                "order_line_items.order_id, products.name",
+            ),
+        )
+        .await,
+        "public.order_line_items",
+    );
+    // The dimension side: its partition key grouped, or not.
+    assert_shape_accepted(
+        &refusal(
+            &it,
+            &join(
+                "orders JOIN customers",
+                "orders.customer_id = customers.id",
+                "customers.region",
+            ),
+        )
+        .await,
+        "public.customers",
+    );
+    let err = refusal(
+        &it,
+        &join(
+            "orders LEFT JOIN customers",
+            "orders.customer_id = customers.id",
+            "orders.zone",
+        ),
+    )
+    .await;
+    assert_refused_naming(&err, "\"region\"");
+    assert_refused_naming(&err, "public.customers");
+    let _ = &it.db;
+}

@@ -251,7 +251,8 @@ the leaf's rows; the correction of an `ATTACH` of such a leaf reads it twice, on
 once for their partials, 0.5–0.6 s at 1M rows and 3.9–4.7 s at 10M.
 
 A correction runs for each definition that reads the source, an aggregate over
-it or a definition reading it through a to-many relationship, as a row of the
+it, a JOIN transform reading it as either side or a definition reading it
+through a to-many relationship, as a row of the
 build-chunk queue, which the pass that queues the correction enqueues. The drain workers claim it as
 they claim a build chunk, behind the ring's backlog, and give it back after
 about a second of pages. The claim makes one runner per correction and
@@ -359,7 +360,10 @@ For `HASH` the sweep finds target groups over the missing remainders; for
 `pg_get_expr(relpartbound)` and ordered by the key column's collation. A
 `DEFAULT` under the root means no statement. On an aggregate, the keys of the
 live ledger entries in the groups it finds are corrected through the normal page
-path, as a node's are; on a to-many target, those parents are recomputed. The
+path, as a node's are; on a JOIN side, the sweep searches the side's partial
+cells, whose key holds every partition-key column where the target's may not,
+and the cells it finds are recomputed under their join-key locks; on a to-many
+target, those parents are recomputed. The
 sweep runs in its own `READ COMMITTED` transaction: the pass reads the lifecycle
 catalog before the constraint texts, re-reads it in a new statement after
 queuing the hits' correction, and rolls back and retries if the leaf set

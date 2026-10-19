@@ -257,10 +257,11 @@ pause are arcs of one lifecycle:
   for a shape neither build can render) never shows this status: it goes from
   `waiting_to_backfill` straight to `live` in the discharge's own transaction (or
   to `catching_up`, when its source is another transform's target).
-  A `live` aggregate over a partitioned source comes back here while it is
-  corrected for a partition of its source that was attached, detached, dropped
-  or truncated, or for rows left in its target that route to no current
-  partition ([ADR-0017](decisions/0017-partitioned-sources.md)). The staging
+  A `live` aggregate over a partitioned source, or a `live` `JOIN` with a
+  partitioned table on either side, comes back here while it is corrected
+  for a partition of that table that was attached, detached, dropped or
+  truncated, or for rows it still counts that route to no current partition
+  ([ADR-0017](decisions/0017-partitioned-sources.md)). The staging
   worker pass that detects the change queues the correction and moves the
   transform `backfilling` in the same transaction; until that pass, at most one
   pass after the DDL, it still reads `live`. It goes back to `live` once the

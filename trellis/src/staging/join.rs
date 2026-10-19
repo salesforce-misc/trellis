@@ -6,10 +6,17 @@
 //! nothing builds a `JOIN` yet (J4, #1109), and with the knob off one stays
 //! `waiting_to_backfill` and never applies. With the knob on, a `JOIN`
 //! definition ([`applies`]) is built like a knob-on aggregate: its plan job
-//! only checks that both tables are empty, unpartitioned and no other
-//! definition's target (`super::build`), so it goes `live` with empty hidden
-//! tables and applies every captured change from then on. A rebuild halts
-//! it (J4's, #1109).
+//! only checks that both tables are empty and no other definition's target
+//! (`super::build`), so it goes `live` with empty hidden tables and applies
+//! every captured change from then on. A rebuild halts it (J4's, #1109).
+//!
+//! Either table may be a partitioned root (#1111, ADR-0019 "Either side may
+//! be partitioned"). A node operation (`DROP`, `DETACH`, `TRUNCATE`,
+//! `ATTACH`, a new leaf, a `DEFAULT` whose siblings changed, the complement
+//! sweep's hit) is corrected by `super::partition_correction`, which
+//! recomputes that side's cells that route to the node through
+//! [`recompute_routed`]: steps 2 to 5 below, so the cells' change reaches
+//! `T` under their `J` locks.
 //!
 //! # One page ([`apply_join_target`])
 //!
@@ -116,6 +123,10 @@ struct SidePlan {
     deltas: String,
     /// Whether the page (or the release) recomputes cells of this side.
     recompute: bool,
+    /// The partition a partition correction reads its cells' rows from, in
+    /// one `GROUP BY` of the node (quoted and qualified), instead of through
+    /// the root ([`recompute_routed`]).
+    node: Option<String>,
 }
 
 impl SidePlan {
@@ -366,6 +377,7 @@ impl JoinTargetPlan {
                     join_cols,
                     deltas,
                     recompute: false,
+                    node: None,
                 }
             };
         let from = side_plan(
@@ -931,7 +943,13 @@ async fn write_locked(
             group_basis::apply_locked_groups(txn, &side.plan, mutations).await?;
         }
         if side.recompute {
-            group_basis::recompute_locked_groups(txn, &side.plan, mutations).await?;
+            group_basis::recompute_locked_groups_from(
+                txn,
+                &side.plan,
+                side.node.as_deref(),
+                mutations,
+            )
+            .await?;
         }
     }
     // 4. The product into `T`'s staging, and `J.matches`. With nested
@@ -1056,6 +1074,44 @@ pub(crate) async fn release(
     let propagation = mutations.into_staged(txn).await?;
     super::append::append(txn, &propagation.changes).await?;
     Ok(true)
+}
+
+/// A partition correction's recompute on `definition`, a `JOIN` that
+/// applies (#1111, ADR-0019 "Either side may be partitioned";
+/// `super::partition_correction`): every cell of `side` named by `cells`
+/// (objects of the side's cell columns: the cells that route to the node,
+/// which the correction enumerates) is locked and rewritten from a
+/// `GROUP BY` of its rows, with the statement's snapshot as its basis,
+/// through steps 2 to 5 of a page, so each cell's change reaches `T` under
+/// its `J` lock in this transaction. The rows are read through the root,
+/// or, when `node` (quoted and qualified) is given, by one `GROUP BY` of
+/// that partition, whose caller has established that it holds every row of
+/// every named cell. Then the seam's rows for every visible row that
+/// changed. A change the node's operation removed that is still in the
+/// ring has a transaction the basis sees, so its page refuses it.
+pub(crate) async fn recompute_routed(
+    txn: &Transaction<'_>,
+    catalog_schema: &str,
+    definition: &Definition,
+    side: Side,
+    cells: &[String],
+    node: Option<&str>,
+) -> Result<(), ApplyError> {
+    let mut plan = plan_for(txn, catalog_schema, definition).await?;
+    let side_plan = plan.side_mut(side);
+    side_plan.recompute = true;
+    side_plan.node = node.map(str::to_string);
+    create_working_tables(txn, &plan).await?;
+    let side_plan = match side {
+        Side::From => &plan.from,
+        Side::Joined => &plan.joined,
+    };
+    group_basis::name_groups(txn, &side_plan.plan, cells, &[]).await?;
+    let mut mutations = TargetMutations::new();
+    write_locked(txn, &plan, &mut mutations).await?;
+    let propagation = mutations.into_staged(txn).await?;
+    super::append::append(txn, &propagation.changes).await?;
+    Ok(())
 }
 
 /// The column list of each of definition `id`'s hidden tables in

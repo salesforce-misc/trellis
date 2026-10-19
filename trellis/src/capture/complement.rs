@@ -48,7 +48,9 @@
 //!
 //! # What the sweep reads
 //!
-//! The groups of every aggregate that reads the source and applies. A to-many
+//! The groups of every aggregate that reads the source and applies, and the
+//! cells of every `JOIN` side it is (`P` or `M`, whose key holds every
+//! partition-key column, where the `JOIN`'s target may not). A to-many
 //! relationship's target is corrected by recomputing its parents, which is
 //! the to-many correction engine's (#1063).
 
@@ -701,15 +703,22 @@ pub(crate) async fn sweep(
     catalog: &CaptureCatalog,
     table: &str,
 ) -> Result<Sweep, CaptureError> {
-    let readers: Vec<i64> = catalog
+    let readers: Vec<(i64, Option<String>)> = catalog
         .definitions
         .iter()
-        .filter(|r| {
-            r.source == table
-                && !r.capture_failed
-                && matches!(r.def.key_space, KeySpace::Aggregate { .. })
+        .filter(|r| !r.capture_failed)
+        .filter_map(|r| match &r.def.key_space {
+            KeySpace::Aggregate { .. } if r.source == table => Some((r.id, None)),
+            // A `JOIN` reading the table as either side: its side's cells
+            // hold the partition-key columns, the target may not (#1111).
+            KeySpace::Join(_) if r.source == table || r.join.as_deref() == Some(table) => {
+                crate::defs::join::side_of_table(&r.def, table).map(|side| {
+                    let hidden = crate::defs::join::HiddenTable::partials(side);
+                    (r.id, Some(hidden.name(r.id)))
+                })
+            }
+            _ => None,
         })
-        .map(|r| r.id)
         .collect();
     let mut outcome = Sweep::default();
     if readers.is_empty() {
@@ -743,7 +752,7 @@ async fn attempt(
     client: &mut Client,
     schema: &str,
     table: &str,
-    readers: &[i64],
+    readers: &[(i64, Option<String>)],
     outcome: &mut Sweep,
 ) -> Result<Attempt, CaptureError> {
     let schema_ident = quote_ident(schema);
@@ -802,18 +811,35 @@ async fn attempt(
             Some(_) => {}
         }
     }
+    let ids: Vec<i64> = readers.iter().map(|(id, _)| *id).collect();
+    // What each applying reader's groups are read from: an aggregate's
+    // target, or a `JOIN` side's hidden cells with a row (a zero cell
+    // counts nothing).
     let targets: Vec<String> = txn
         .query(
             &format!(
-                "select d.target_table from {schema_ident}.transform_definitions d \
+                "select d.id, d.target_table from {schema_ident}.transform_definitions d \
                  where d.id = any($1) and {} order by d.id",
                 applying_sql("d")
             ),
-            &[&readers],
+            &[&ids],
         )
         .await?
         .into_iter()
-        .map(|row| row.get(0))
+        .map(|row| {
+            let (id, target): (i64, String) = (row.get(0), row.get(1));
+            match readers
+                .iter()
+                .find(|(r, _)| *r == id)
+                .and_then(|(_, h)| h.as_ref())
+            {
+                Some(hidden) => format!(
+                    "(select * from {schema_ident}.{} where __n <> 0)",
+                    quote_ident(hidden)
+                ),
+                None => qualified_target_table_ident(&target),
+            }
+        })
         .collect();
     // Test-only pause point (#1066): after every catalog read, before the
     // search. See `staging::interleave`.
@@ -847,9 +873,8 @@ async fn attempt(
                 })
                 .collect();
             format!(
-                "exists (select 1 from (select {} from {} t) as __route where {search})",
+                "exists (select 1 from (select {} from {target} t) as __route where {search})",
                 presented.join(", "),
-                qualified_target_table_ident(target)
             )
         })
         .collect();

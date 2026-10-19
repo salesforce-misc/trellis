@@ -49,6 +49,12 @@
 //! (`crate::intake::markers::park_table_catch_ups`): the nodes' corrections
 //! cover them, as they do a ledger aggregate and a to-many reader.
 //!
+//! A `JOIN` reading the source as either side (`super::join`, #1111) is
+//! corrected the same way, over that side's partial cells (`P` or `M`)
+//! instead of groups: each cell's key holds every partition-key column
+//! (ADR-0019), and its recompute runs through the `J`-locked writer, so the
+//! cell's change reaches the target in the same transaction.
+//!
 //! # Routing
 //!
 //! A group routes to a node when the node's recorded
@@ -99,7 +105,8 @@
 //! # Scheduling
 //!
 //! A correction runs for each definition that reads the source (an aggregate
-//! over it, or one reading it through a to-many relationship) as a
+//! over it, a `JOIN` reading it as either side, or one reading it through a
+//! to-many relationship) as a
 //! `backfill_chunks` row of kind `correction` (V92), one per correction and
 //! definition, which the staging worker's pass enqueues ([`schedule`]) right
 //! after the capture pass that queued the correction. The row gives it what a
@@ -883,13 +890,28 @@ pub(crate) async fn run_chunk(
     );
     let fence = ClaimFence::new(chunk.id, claimed_by, reclaim_ttl);
     let group_shape = super::group_basis::route(&definition.def, &definition.source_columns);
-    let step = if definition.source_table == correction.table
+    // A `JOIN` reads the source as either side (#1111).
+    let join_side = super::join::applies(&definition.def)
+        .then(|| crate::defs::join::side_of_table(&definition.def, &correction.table))
+        .flatten();
+    let step = if let Some(side) = join_side {
+        group::correct(
+            pool,
+            &definition,
+            group::Cells::Join(side),
+            &correction,
+            options,
+            outcome,
+            &fence,
+        )
+        .await?
+    } else if definition.source_table == correction.table
         && let Some(shape) = &group_shape
     {
         group::correct(
             pool,
             &definition,
-            shape,
+            group::Cells::Groups(shape),
             &correction,
             options,
             outcome,
@@ -1008,8 +1030,9 @@ fn budget_spent(options: &Options, outcome: &Outcome) -> bool {
 }
 
 /// The ids of the aggregate definitions reading `source_table` that apply,
-/// and whether one is under an old-path build (`backfilling` without a
-/// Re-derive build), which holds the corrections in the queue.
+/// a `JOIN` reading it as either side among them, and whether one is under
+/// an old-path build (`backfilling` without a Re-derive build), which holds
+/// the corrections in the queue.
 async fn readers(
     client: &impl GenericClient,
     source_table: &str,
@@ -1024,7 +1047,7 @@ async fn readers(
                                  '{{}}'::bigint[]), \
                         coalesce(bool_or(status = $2 and build is distinct from 'rederive'), \
                                  false) \
-                 from transform_definitions where source_table = $1"
+                 from transform_definitions where source_table = $1 or join_table = $1"
             ),
             &[&source_table, &TransformStatus::Backfilling.as_str()],
         )

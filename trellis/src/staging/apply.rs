@@ -180,8 +180,8 @@ pub enum ApplyError {
     /// its change needs, a page folded with the knob off, or a fresh build
     /// or resume over a source with rows or a rebuild over a partitioned
     /// source (#1101); or, on a `JOIN` (`super::join`, #1108), a build over
-    /// a side that is partitioned (#1111) or another definition's target,
-    /// or a rebuild (#1109). Like
+    /// a side that is another definition's target, or a rebuild (#1109).
+    /// Like
     /// [`ApplyError::AggregateOffLedger`], every page of the target would
     /// reproduce it, so it halts the target.
     GroupBasisUnsupported { target: String, what: &'static str },

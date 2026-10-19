@@ -1995,7 +1995,7 @@ pub(crate) async fn recompute_locked_groups(
 
 /// [`recompute_locked_groups`], reading the groups' rows from `node` when
 /// it is given ([`GroupTargetPlan::recompute_sql`]).
-async fn recompute_locked_groups_from(
+pub(super) async fn recompute_locked_groups_from(
     txn: &Transaction<'_>,
     plan: &GroupTargetPlan,
     node: Option<&str>,

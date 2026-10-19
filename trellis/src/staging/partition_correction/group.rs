@@ -1,6 +1,9 @@
 //! The correction of an aggregate on the group basis over a partitioned
 //! source (#1103, ADR-0002 "Aggregates: a basis per group, kept by deltas";
-//! the parent module's "On the group basis").
+//! the parent module's "On the group basis"), and of a `JOIN` whose side is
+//! the partitioned source (#1111, ADR-0019), over that side's partial cells
+//! ([`Cells`]): below, a `JOIN`'s cells read as groups, its `P` or `M` as
+//! the hidden table, and the side's table as the source.
 //!
 //! Every group key contains every partition-key column (ADR-0017), so each
 //! group routes to exactly one node of the tree. A node's operation is
@@ -50,6 +53,7 @@ use tokio_postgres::IsolationLevel;
 
 use crate::capture::partitions::{self, PendingCorrection};
 use crate::defs::ddl;
+use crate::defs::join::{self as join_spec, HiddenTable, Side};
 use crate::defs::model::Definition;
 use crate::pool::{Pool, quote_ident, quote_literal};
 use crate::staging::append::{RING_SIZE, ring_table_name};
@@ -62,12 +66,26 @@ use super::{
 };
 use crate::defs::chunk_queue::ClaimFence;
 
-/// Runs correction `correction` for `definition`, which the group basis
-/// takes with `shape`: one transaction, under `fence`.
+/// What a correction recomputes: a group-basis aggregate's groups, or one
+/// side's partial cells of a `JOIN` (#1111).
+#[derive(Clone, Copy)]
+pub(super) enum Cells<'a> {
+    /// The aggregate's groups, which the group basis takes with this shape.
+    Groups(&'a GroupShape),
+    /// The `P` (`FROM`) or `M` (joined) cells of a `JOIN` whose side is the
+    /// correction's table. Each cell's key holds every partition-key column
+    /// (ADR-0019), so it routes to exactly one node as a group does, and its
+    /// recompute carries its change into `T` under its `J` lock
+    /// (`crate::staging::join::recompute_routed`).
+    Join(Side),
+}
+
+/// Runs correction `correction` for `definition`'s `cells`: one
+/// transaction, under `fence`.
 pub(super) async fn correct(
     pool: &Pool,
     definition: &Definition,
-    shape: &GroupShape,
+    cells: Cells<'_>,
     correction: &PendingCorrection,
     options: &super::Options,
     outcome: &mut Outcome,
@@ -119,7 +137,7 @@ pub(super) async fn correct(
     let groups = routed_groups(
         pool,
         definition,
-        shape,
+        cells,
         correction,
         &route,
         recorded.as_ref(),
@@ -151,8 +169,29 @@ pub(super) async fn correct(
     .await?;
     if !groups.is_empty() {
         let node = node_to_read(&txn, correction, recorded.as_ref()).await?;
-        group_basis::recompute_routed(&txn, pool.schema(), definition, &groups, node.as_deref())
-            .await?;
+        match cells {
+            Cells::Groups(_) => {
+                group_basis::recompute_routed(
+                    &txn,
+                    pool.schema(),
+                    definition,
+                    &groups,
+                    node.as_deref(),
+                )
+                .await?;
+            }
+            Cells::Join(side) => {
+                crate::staging::join::recompute_routed(
+                    &txn,
+                    pool.schema(),
+                    definition,
+                    side,
+                    &groups,
+                    node.as_deref(),
+                )
+                .await?;
+            }
+        }
     }
     let count = i64::try_from(groups.len()).unwrap_or(i64::MAX);
     txn.execute(
@@ -208,27 +247,51 @@ async fn record_started(
     Ok(true)
 }
 
-/// The groups `correction` recomputes for `definition` (see the module
-/// doc), each an object of the group columns as text, read in one statement
-/// under the pinned settings (`partitions::pinned_settings`), which the
-/// constraint text's meaning depends on.
+/// The groups (or cells) `correction` recomputes for `definition` (see the
+/// module doc), each an object of the group columns as text, read in one
+/// statement under the pinned settings (`partitions::pinned_settings`),
+/// which the constraint text's meaning depends on.
 async fn routed_groups(
     pool: &Pool,
     definition: &Definition,
-    shape: &GroupShape,
+    cells: Cells<'_>,
     correction: &PendingCorrection,
     route: &Route,
     recorded: Option<&partitions::Recorded>,
 ) -> Result<Vec<String>, CorrectionError> {
     let schema = quote_ident(pool.schema());
-    let names: Vec<&str> = shape.group_columns().iter().map(String::as_str).collect();
-    let source_row = ddl::qualified_source_table(&definition.source_table);
+    // The group (or cell) columns, each with its hidden column's type; the
+    // hidden table; and the source whose rows and ring images they group.
+    let (names, types, hidden, source_row): (Vec<String>, Vec<String>, String, String) = match cells
+    {
+        Cells::Groups(shape) => (
+            shape.group_columns().to_vec(),
+            shape.group_types().to_vec(),
+            group_basis::hidden_table_ident(pool.schema(), definition.id),
+            ddl::qualified_source_table(&definition.source_table),
+        ),
+        Cells::Join(side) => {
+            let names = join_spec::side_key_columns(&definition.def, side);
+            let bare = HiddenTable::partials(side).name(definition.id);
+            let types = {
+                let client = pool.get().await?;
+                hidden_column_types(&**client, pool.schema(), &bare, &names).await?
+            };
+            (
+                names,
+                types,
+                format!("{schema}.{}", quote_ident(&bare)),
+                ddl::qualified_source_table(&correction.table),
+            )
+        }
+    };
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
     // The group columns of a row aliased `alias`, each as its hidden
     // column's type, so the parts' rows compare and deduplicate as values.
     let values = |alias: &str| -> String {
         names
             .iter()
-            .zip(shape.group_types())
+            .zip(&types)
             .map(|(n, t)| format!("{alias}.{c}::{t} as {c}", c = quote_ident(n)))
             .collect::<Vec<_>>()
             .join(", ")
@@ -243,7 +306,6 @@ async fn routed_groups(
     );
     let mut parts: Vec<String> = Vec::new();
     if *route != Route::Unusable {
-        let hidden = group_basis::hidden_table_ident(pool.schema(), definition.id);
         let predicate = route_predicate(route, &route_columns_named(&names, recorded, "h"));
         parts.push(format!(
             "select {} from {hidden} h where {predicate}",
@@ -306,6 +368,33 @@ async fn routed_groups(
         txn.query(&sql, &[&correction.table]).await?
     };
     txn.commit().await?;
+    Ok(rows.into_iter().map(|row| row.get(0)).collect())
+}
+
+/// The exact type (`format_type`) of each of `columns` of the hidden table
+/// `bare` in `schema`, in `columns`' order.
+async fn hidden_column_types(
+    client: &impl tokio_postgres::GenericClient,
+    schema: &str,
+    bare: &str,
+    columns: &[String],
+) -> Result<Vec<String>, CorrectionError> {
+    let rows = client
+        .query(
+            "select pg_catalog.format_type(a.atttypid, a.atttypmod) \
+             from unnest($3::text[]) with ordinality as c(name, ord) \
+             join pg_catalog.pg_attribute a \
+               on a.attrelid = pg_catalog.to_regclass(pg_catalog.format('%I.%I', $1::text, $2::text)) \
+              and a.attname = c.name and not a.attisdropped \
+             order by c.ord",
+            &[&schema, &bare, &columns],
+        )
+        .await?;
+    if rows.len() != columns.len() {
+        return Err(CorrectionError::Unroutable(format!(
+            "the hidden table {schema}.{bare} lacks a column of {columns:?}"
+        )));
+    }
     Ok(rows.into_iter().map(|row| row.get(0)).collect())
 }
 

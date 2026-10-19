@@ -3122,24 +3122,21 @@ async fn run_plan(
     // resume plans, which needs none: the walk below enqueues no chunk. A
     // rebuild of a live plain aggregate has no plan job ([`start_rebuilds`]).
     // #1108: a `JOIN` behind the same knob takes two empty tables, each
-    // captured (the target feed is #1100's) and unpartitioned (#1111).
+    // captured (the target feed is #1100's); either may be a partitioned
+    // root, whose node operations the partition correction engine corrects
+    // (#1111).
     if cursor.is_none() && chunk.fields.is_none() && takes_group_basis(&definition) {
         let mut tables = vec![definition.source_table.clone()];
         if super::join::applies(&definition.def) {
             tables.extend(catalog::join_table_of(&**client, definition.id).await?);
             for table in &tables {
-                let what = if catalog::is_definition_target(&**client, table).await? {
-                    "a JOIN side that is another definition's target (the target feed is #1100's)"
-                } else if crate::defs::partition_tree::is_partitioned_root(&**client, table).await?
-                {
-                    "a partitioned JOIN side (#1111)"
-                } else {
-                    continue;
-                };
-                return Err(build_error(ApplyError::GroupBasisUnsupported {
-                    target: definition.target_table.clone(),
-                    what,
-                }));
+                if catalog::is_definition_target(&**client, table).await? {
+                    return Err(build_error(ApplyError::GroupBasisUnsupported {
+                        target: definition.target_table.clone(),
+                        what: "a JOIN side that is another definition's target \
+                               (the target feed is #1100's)",
+                    }));
+                }
             }
         }
         for table in &tables {

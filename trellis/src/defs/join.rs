@@ -264,6 +264,14 @@ impl HiddenTable {
         HiddenTable::TruncateLock,
     ];
 
+    /// `side`'s partials: `P` for the `FROM` side, `M` for the joined one.
+    pub(crate) fn partials(side: Side) -> Self {
+        match side {
+            Side::From => HiddenTable::FromPartials,
+            Side::Joined => HiddenTable::JoinedPartials,
+        }
+    }
+
     /// The table's bare name in the catalog schema, for definition `id`.
     pub(crate) fn name(self, id: i64) -> String {
         let part = match self {
