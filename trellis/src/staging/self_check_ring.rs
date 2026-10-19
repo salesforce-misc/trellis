@@ -70,6 +70,13 @@ pub(super) struct Lands<'a> {
     /// `r` (` and …`, or empty): a joined row with a `NULL` join-key part
     /// applies to nothing.
     pub(super) filter: String,
+    /// Whether the basis is probed in [`Ring::weighted_sql`], after the
+    /// page's own conditions on the weighted rows have kept only the images
+    /// in its key range, rather than once per unapplied image in the CTEs. A
+    /// page whose key range bounds its weighted rows wants it: it probes a
+    /// page's images, not every page's. One that reads every weighted row,
+    /// several times over (`JOIN`'s target part), doesn't.
+    pub(super) late_probe: bool,
 }
 
 impl Ring<'_> {
@@ -148,25 +155,26 @@ impl Ring<'_> {
         )
     }
 
-    /// The signed images the page that applies them would apply (`lands`):
-    /// `(__sgn, __i)`.
+    /// The signed images above the truncate floor (`lands`): `(__txid,
+    /// __sgn, __i)`. Unless [`Lands::late_probe`], also only those the page
+    /// that applies them would apply: [`Lands::filter`] and the basis.
     fn kept_sql(&self, lands: &Lands<'_>) -> String {
-        let basis = match lands.basis {
-            Some((hidden, columns)) => format!(
-                " and not coalesce(pg_visible_in_snapshot(d.__txid, {}), false)",
-                basis_probe(hidden, columns, "r")
-            ),
-            None => String::new(),
-        };
+        let floor = format!(
+            "d.__lsn > coalesce( \
+                 (select floor from ledger_truncate_floor where target_table = {}), \
+                 '0/0'::pg_lsn)",
+            quote_literal(lands.floor_key),
+        );
+        let sides = self.cte("sides");
+        if lands.late_probe {
+            return format!("select d.__txid, d.__sgn, d.__i from {sides} d where {floor}");
+        }
         format!(
-            "select d.__sgn, d.__i from {sides} d \
+            "select d.__txid, d.__sgn, d.__i from {sides} d \
              cross join lateral jsonb_populate_record(null::{src}, d.__i) as r \
-             where d.__lsn > coalesce( \
-                       (select floor from ledger_truncate_floor where target_table = {floor}), \
-                       '0/0'::pg_lsn){basis}{filter}",
-            sides = self.cte("sides"),
+             where {floor}{basis}{filter}",
             src = self.source_row,
-            floor = quote_literal(lands.floor_key),
+            basis = unseen_by_basis(lands, "d", "r"),
             filter = lands.filter,
         )
     }
@@ -174,13 +182,21 @@ impl Ring<'_> {
     /// The source's rows as the target has applied them: every current row
     /// at weight `+1` ([`WEIGHT`]) and each kept image at the opposite of its
     /// sign, as a derived table's body, its columns the source's plus the
-    /// weight first.
-    pub(super) fn weighted_sql(&self) -> String {
+    /// weight first. `lands` is what [`Self::ctes`] was given: under
+    /// [`Lands::late_probe`], its filter and basis apply here, after any
+    /// condition the page puts on these rows.
+    pub(super) fn weighted_sql(&self, lands: &Lands<'_>) -> String {
+        let late = if lands.late_probe {
+            format!("{}{}", unseen_by_basis(lands, "k", "r"), lands.filter)
+        } else {
+            String::new()
+        };
         format!(
             "(select 1 as {WEIGHT}, s.* from {src} s \
               union all \
               select -k.__sgn, r.* from {kept} k \
-              cross join lateral jsonb_populate_record(null::{src}, k.__i) as r)",
+              cross join lateral jsonb_populate_record(null::{src}, k.__i) as r \
+              where true{late})",
             src = self.source_row,
             kept = self.cte("kept"),
         )
@@ -239,6 +255,19 @@ impl Ring<'_> {
             id = self.transform_id,
             src = quote_literal(self.src_table),
         )
+    }
+}
+
+/// ` and …`: the change of the image `image` (a row of a CTE carrying its
+/// `__txid`), populated as `alias`, is unseen by the `__basis` of the row
+/// it lands in (`lands`), or empty when `lands` has no basis.
+fn unseen_by_basis(lands: &Lands<'_>, image: &str, alias: &str) -> String {
+    match lands.basis {
+        Some((hidden, columns)) => format!(
+            " and not coalesce(pg_visible_in_snapshot({image}.__txid, {}), false)",
+            basis_probe(hidden, columns, alias)
+        ),
+        None => String::new(),
     }
 }
 

@@ -16,7 +16,7 @@
 //! # Pages
 //!
 //! A page is [`super::self_check::audit`] over [`WorkerOptions::page_keys`]
-//! keys, exactly the comparison the old synchronous call made, including its
+//! keys, exactly the comparison the old synchronous call made, including any
 //! re-check behind a fresh wait ([`SelfCheckMode::Standard`]). After each
 //! page the worker saves the cursor, the count and the divergences so far in
 //! the row, so a page is the unit of progress, of a poll's view, and of

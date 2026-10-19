@@ -466,10 +466,11 @@ impl Audit<'_> {
         }
     }
 
-    /// `ring`'s CTEs, its changes landing where a page applies `side`'s:
-    /// in `P` or `M`, above that table's truncate floor and unseen by its
-    /// cell's basis. A joined row with a `NULL` join-key part lands nowhere.
-    fn ring_ctes(&self, side: JoinSide, ring: &Ring<'_>) -> String {
+    /// `ring`'s CTEs and its weighted rows, its changes landing where a page
+    /// applies `side`'s: in `P` or `M`, above that table's truncate floor and
+    /// unseen by its cell's basis. A joined row with a `NULL` join-key part
+    /// lands nowhere. `late_probe` as [`Lands::late_probe`].
+    fn ring_reads(&self, side: JoinSide, ring: &Ring<'_>, late_probe: bool) -> (String, String) {
         let hidden = self.hidden(match side {
             JoinSide::From => Part::From,
             JoinSide::Joined => Part::Joined,
@@ -482,11 +483,13 @@ impl Audit<'_> {
                 .map(|c| format!(" and r.{} is not null", quote_ident(c)))
                 .collect(),
         };
-        ring.ctes(&Lands {
+        let lands = Lands {
             floor_key: &hidden,
             basis: Some((&hidden, &cells)),
             filter,
-        })
+            late_probe,
+        };
+        (ring.ctes(&lands), ring.weighted_sql(&lands))
     }
 
     /// The key text (`__k`) over `key`'s columns of each image of
@@ -537,8 +540,9 @@ impl Audit<'_> {
             .collect();
         let (values, nonzero) = weighted_partials(&rendered);
         let ring = self.ring(side);
+        let (ctes, weighted) = self.ring_reads(side, &ring, true);
         let reads = RingReads {
-            ctes: self.ring_ctes(side, &ring),
+            ctes,
             uncertain: Self::uncertain_keys(&ring, &key, None),
             global: ring.global_sql(),
         };
@@ -546,7 +550,7 @@ impl Audit<'_> {
             &key,
             &self.hidden(part),
             &Self::hidden_values(&columns),
-            &format!("{} __s", ring.weighted_sql()),
+            &format!("{weighted} __s"),
             &source_where,
             &values,
             &nonzero,
@@ -574,8 +578,9 @@ impl Audit<'_> {
             .collect();
         let key = key_columns(&j_cols);
         let ring = self.ring(JoinSide::Joined);
+        let (ctes, weighted) = self.ring_reads(JoinSide::Joined, &ring, true);
         let reads = RingReads {
-            ctes: self.ring_ctes(JoinSide::Joined, &ring),
+            ctes,
             uncertain: Self::uncertain_keys(&ring, &key, Some(&renamed("__r"))),
             global: ring.global_sql(),
         };
@@ -584,8 +589,7 @@ impl Audit<'_> {
             &self.hidden(Part::Matches),
             &["__matches::text".to_string()],
             &format!(
-                "{} __b cross join lateral (select {}, __b.{WEIGHT} as {WEIGHT}) __s",
-                ring.weighted_sql(),
+                "{weighted} __b cross join lateral (select {}, __b.{WEIGHT} as {WEIGHT}) __s",
                 renamed("__b"),
             ),
             &not_null,
@@ -686,9 +690,11 @@ impl Audit<'_> {
             .map(|key| format!("__g.{}", quote_ident(&key.column)))
             .collect();
         let (ra, rb) = (self.ring(JoinSide::From), self.ring(JoinSide::Joined));
-        let (wa, wb) = (ra.weighted_sql(), rb.weighted_sql());
-        let mut ctes = self.ring_ctes(JoinSide::From, &ra);
-        ctes.push_str(&self.ring_ctes(JoinSide::Joined, &rb));
+        // Every weighted row is read, some twice, so each image is probed
+        // once, in the CTEs.
+        let (mut ctes, wa) = self.ring_reads(JoinSide::From, &ra, false);
+        let (ctes_b, wb) = self.ring_reads(JoinSide::Joined, &rb, false);
+        ctes.push_str(&ctes_b);
         let mut pairs = format!(
             "select __g.*, __a.{WEIGHT} * __b.{WEIGHT} as {WEIGHT}{xs} \
              from {wa} __a join {wb} __b on {on} \

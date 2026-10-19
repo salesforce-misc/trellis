@@ -155,6 +155,12 @@ fn page_sql(
         args.push((render(&arg.expr)?, arg.summed));
     }
     let (src_parts, nonzero) = weighted_partials(&args);
+    let lands = Lands {
+        floor_key,
+        basis: Some((hidden, &shape.group_cols)),
+        filter: String::new(),
+        late_probe: true,
+    };
     // Only the groups up to the hidden side's last key, when it filled the
     // limit: the page ends there or earlier, so a group past it would be
     // trimmed anyway, and this way the `GROUP BY` holds a page of groups
@@ -164,7 +170,7 @@ fn page_sql(
          where {after} and ((select e from hid_end) is null or {key} <= (select e from hid_end)) \
          group by {group_cols} having {nonzero} order by __k limit $2",
         src_parts.join(", "),
-        weighted = ring.weighted_sql(),
+        weighted = ring.weighted_sql(&lands),
     );
 
     // Sides 2 and 3: the hidden table's partials, and the visible row they
@@ -215,11 +221,6 @@ fn page_sql(
         visible.join(", ")
     );
 
-    let lands = Lands {
-        floor_key,
-        basis: Some((hidden, &shape.group_cols)),
-        filter: String::new(),
-    };
     Ok(format!(
         "with {ring_ctes}\
               hid as materialized ({hid}), \

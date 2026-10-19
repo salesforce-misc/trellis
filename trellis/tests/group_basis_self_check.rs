@@ -693,3 +693,33 @@ async fn a_pending_change_a_groups_basis_saw_is_not_subtracted() {
     d.settle().await;
     assert_eq!(walk(&d, 10).await.0, []);
 }
+
+/// A change from before a source `TRUNCATE` that reaches no page until after
+/// the truncate's page raised the truncate floor will be refused by that
+/// floor, so the target never counts it: the comparison doesn't subtract it
+/// either. The driver drains the two segments out of order, which the
+/// barrier never does; the floor is what refuses it.
+#[tokio::test]
+async fn a_pending_change_at_or_below_the_truncate_floor_is_not_subtracted() {
+    let mut d = start().await;
+    step(&mut d, "insert into public.src values (1, 1, 10)").await;
+    exec(&d, "insert into public.src values (2, 1, 5), (3, 2, 7)").await;
+    let before = d.seal().await;
+    exec(
+        &d,
+        "truncate public.src; insert into public.src values (4, 2, 1)",
+    )
+    .await;
+    let truncate = d.seal().await;
+    d.drain(truncate, "a").await;
+    assert_eq!(
+        d.rows("select count(*) from ledger_truncate_floor where target_table = 'public.agg'")
+            .await,
+        ["(1)"],
+        "the truncate raised the floor"
+    );
+    assert_eq!(compare(&d, 10).await, (vec![], vec![], false));
+    d.drain(before, "b").await;
+    assert_eq!(compare(&d, 10).await, (vec![], vec![], false));
+    assert_eq!(walk(&d, 10).await.0, []);
+}

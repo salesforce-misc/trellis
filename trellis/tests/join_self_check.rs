@@ -764,3 +764,79 @@ async fn an_image_less_pending_change_leaves_its_cells_and_t_uncertain() {
         )
     );
 }
+
+/// A change from before a `TRUNCATE` of either table that reaches no page
+/// until after the truncate's page raised that side's truncate floor will be
+/// refused by it, so no part counts it: the comparison doesn't subtract it
+/// either, on any part. The driver drains the two segments out of order,
+/// which the barrier never does; the floor is what refuses it.
+#[tokio::test]
+async fn a_pending_change_at_or_below_a_sides_truncate_floor_is_not_subtracted() {
+    for table in ["a", "b"] {
+        let mut d = start(&[LEFT_PAIR, INNER]).await;
+        seed(&mut d).await;
+        exec(
+            &d,
+            "insert into public.a values (10, 1, 1, 1, 4); \
+             insert into public.b values (10, 1, 1, 10, 3); \
+             update public.a set x = 9 where id = 1; \
+             update public.b set y = 5 where id = 1",
+        )
+        .await;
+        let before = d.seal().await;
+        exec(
+            &d,
+            &format!(
+                "truncate public.{table}; \
+                 insert into public.{table} values (20, 1, 1, 1, 1)"
+            ),
+        )
+        .await;
+        let truncate = d.seal().await;
+        d.drain(truncate, "a").await;
+        check(
+            &d,
+            &format!("{table} truncated, the change before it pending"),
+        )
+        .await;
+        d.drain(before, "b").await;
+        check(
+            &d,
+            &format!("{table} truncated, the change before it refused"),
+        )
+        .await;
+        for target in ["l", "i"] {
+            assert_eq!(walk(&d, target, 3).await.0, [], "{table}: {target}");
+        }
+    }
+}
+
+/// A cell a recompute rewrote from a snapshot that saw a change the drain
+/// hasn't applied yet already counts that change, and its page will refuse
+/// it, on `P` or `M` and so on `J` and `T`: the comparison doesn't subtract
+/// it either, on any part. The driver drains the recompute's segment before
+/// the change's, which the barrier never does; the cell's basis is what
+/// refuses it.
+#[tokio::test]
+async fn a_pending_change_a_cells_basis_saw_is_not_subtracted() {
+    for table in ["a", "b"] {
+        let mut d = start(&[LEFT_PAIR, INNER]).await;
+        seed(&mut d).await;
+        let column = if table == "a" { "x" } else { "y" };
+        exec(
+            &d,
+            &format!("update public.{table} set {column} = 50, k = 2 where id = 1"),
+        )
+        .await;
+        let change = d.seal().await;
+        d.stage_recomputes(&format!("public.{table}"), &["1"]).await;
+        let recompute = d.seal().await;
+        d.drain(recompute, "a").await;
+        check(&d, &format!("{table}: the basis saw the change")).await;
+        d.drain(change, "b").await;
+        check(&d, &format!("{table}: the change refused")).await;
+        for target in ["l", "i"] {
+            assert_eq!(walk(&d, target, 3).await.0, [], "{table}: {target}");
+        }
+    }
+}
