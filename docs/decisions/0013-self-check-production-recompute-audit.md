@@ -181,11 +181,13 @@ columns), so a divergence is reported per key.
 - **A JOIN target** is compared a page of groups at a time against the `JOIN …
   GROUP BY` query, and its internal structures are audited against their
   definitions: each side's per-(group, join key) partials against a `GROUP BY` of
-  that side, each join key's match count against the sum of the other side's row
-  counts for it, and the target's partials against the sum, over join keys, of the
-  products of the two sides' partials
-  ([ADR-0019](0019-join-transforms.md)). A divergence names the structure and the
-  key, so an operator can tell a wrong side from a wrong combination.
+  that side, each join key's match count against the joined side's row count for
+  it, and the target's partials against the query's, which are the sum, over join
+  keys, of the products of the two sides' partials
+  ([ADR-0019](0019-join-transforms.md)). Each structure is compared with the two
+  tables, not with another structure, so a divergence names the structure that is
+  wrong and the key, and an operator can tell a wrong side from a wrong
+  combination.
 
 For aggregate and JOIN targets `self_check` **detects and reports; it never
 repairs.** A target found wrong is repaired by the operator, with the tools any
