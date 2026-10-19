@@ -234,13 +234,36 @@ refusal on its `capture_failure` (the text of a refused request) and no cause, s
 next pass doesn't try it again. Nothing below it was paused, since its target was never
 re-typed. The queue is durable without a table of its own: the cause and the resume
 request are the two states a definition passes through, each move is one transaction,
-and a crash leaves one of them for the next pass to go on from. A `RESUME` by hand of a
-waiting definition resumes it at once, whether or not its upstream is `live`. A `PAUSE`
-of one changes nothing, since it is already paused, so the pass still resumes it once
-the upstream is `live`. A chained definition the
+and a crash leaves one of them for the next pass to go on from. A chained re-type that
+fails ends the request like any other: the definition stays paused with the error and no
+cause, its target keeps its types, and nothing below it is paused. A chained definition the
 re-type leaves refused, failing its own re-validation (a relationship's join columns no
 longer match), keeps its own error and records no cause. So does one already paused for
 another reason, by the operator or by quarantine, and the pass leaves it alone.
+
+A resume never starts a rebuild ahead of its upstream. A definition's upstreams are the
+definitions in the instance whose targets it reads: its source, a `JOIN`'s joined table, or
+a relationship's to-side. A `RESUME` of a definition with an upstream that isn't `live`
+(paused, quarantined, or still rebuilding) is accepted and returns at once, before any
+re-validation: the definition stays paused with a resume request, and its
+`capture_failure` says it is waiting for that upstream to be `live`. This holds whether it
+was waiting on an upstream's chained resume or paused for any other reason. The capture
+pass completes the request once every upstream is `live`, by the same path as a request
+with copies to re-type: it re-validates, re-types copies if needed, then rebuilds. A
+re-validation that fails then ends the request with the refusal on `capture_failure`, and
+it isn't retried. So an operator can resume a whole stack at once, in any order, and it
+comes up in dependency order: the head rebuilds first, and each definition below rebuilds
+once the one above it is `live`. Definitions form no cycle, so the order always exists.
+A definition whose upstream nobody resumes keeps waiting, its `capture_failure` naming
+the upstream; it never resumes past a paused upstream.
+
+A `PAUSE` of a definition waiting to be resumed, on an upstream's chained resume or on a
+resume request, withdraws that resume: in one transaction it clears the cause and deletes
+the request, and the definition stays paused like any operator pause. Its
+`capture_failure` no longer says it resumes: an upstream's reason is kept and ends with how
+to resume it, and a request's "resuming: …" text says the operator withdrew it. The pause
+reports this as its own outcome, apart from the no-op pause of a definition already
+frozen.
 
 Outside a resume, Trellis re-types a column on its own in one case: when every column
 of a table it created that the source widened widened by changing only the catalog.

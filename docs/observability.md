@@ -357,7 +357,13 @@ pause are arcs of one lifecycle:
   converted, the repair is `DROP TRANSFORM` and define it again, which builds the
   target from empty. A re-type of a target pauses the transforms chained off it whose
   own columns were typed from the old type: their `capture_failure` names the upstream
-  resume, and the staging worker resumes them once the upstream is `live` again. The
+  resume, and the staging worker resumes them once the upstream is `live` again. A
+  `RESUME` of a transform that reads another transform's target (its source, a
+  `JOIN`'s joined table or a relationship's to-side) while that transform isn't `live`
+  returns at once, but the transform stays `paused`, its `capture_failure` reading
+  "resuming: waiting for transform `<upstream>` … to be live", until the upstream is
+  `live`; then the staging worker resumes it as above. A `PAUSE` of a transform waiting
+  either way withdraws the resume, and its `capture_failure` says so. The
   resume reconciles the target with current source
   data rather than replaying what was skipped while paused (the change stream is
   drained for the transform's siblings meanwhile), so the cost of a resume scales with

@@ -1089,6 +1089,11 @@ async fn retype_causes(
     Ok(causes)
 }
 
+/// The sentence of [`caused_error`] that says the definition resumes on its
+/// own, up to the upstream's name: an operator's `PAUSE` cuts the text there
+/// (`defs::lifecycle::pause_transform`, #971).
+pub(crate) const CAUSED_RESUMES_ON_ITS_OWN: &str = " This definition resumes on its own once ";
+
 /// The `capture_failure` of a definition `pause` that `cause`'s resume
 /// paused (#828), by re-typing columns of its target `table` the
 /// definition reads. It names that resume, not the columns as if the
@@ -1124,7 +1129,7 @@ fn caused_error(table: &str, cause: &RetypeCause, pause: &Pause) -> String {
     }
     format!(
         "the resume of transform {name} re-typed {retyped}, which this definition reads, so \
-         {effects}. This definition resumes on its own once {name} is live again, \
+         {effects}.{CAUSED_RESUMES_ON_ITS_OWN}{name} is live again, \
          bringing its columns to the new types and rebuilding it. Or drop the definition and \
          define it again",
         name = cause.name,

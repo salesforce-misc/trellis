@@ -3973,7 +3973,10 @@ async fn reads_paused_sibling(
 /// recoverable by replay.
 ///
 /// This function itself only schedules that reconciliation. It drops the
-/// definition to [`TransformStatus::WaitingToBackfill`]. A definition the
+/// definition to [`TransformStatus::WaitingToBackfill`], unless a definition
+/// whose target it reads isn't `live` (#971): then it records a resume
+/// request and returns, and the staging worker resumes it once every such
+/// upstream is ([`resume_locked`]'s step 0). A definition the
 /// Re-derive build takes (`super::build::qualifies`, #625 F3) is then
 /// rebuilt by the staging worker's next pass, which starts a Re-derive build
 /// over its ledger (`super::build::start_ready_builds`): it keeps the
@@ -4088,6 +4091,15 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
                 "transform resume accepted; the staging worker re-types its copies, then rebuilds it"
             );
         }
+        ResumeStep::Waiting(upstream) => {
+            txn.commit().await?;
+            crate::instance_log::info!(
+                transform = %target,
+                upstream = %upstream.name,
+                "transform resume accepted; it waits for its upstream to be live, then the \
+                 staging worker rebuilds it"
+            );
+        }
     }
     Ok(())
 }
@@ -4162,6 +4174,100 @@ enum ResumeStep {
     /// Some of its typed copies have to be re-typed first (their labels);
     /// it stays paused with a resume request.
     Retyping(Vec<String>),
+    /// An upstream of it isn't `live` ([`upstream_not_live`]); it stays
+    /// paused with a resume request until every upstream is.
+    Waiting(Upstream),
+}
+
+/// A definition in this instance whose target another definition reads
+/// (#971): as its source, a `JOIN`'s joined table, or a relationship's
+/// to-side.
+#[derive(Debug)]
+struct Upstream {
+    /// Its bare target, the name `RESUME TRANSFORM` takes.
+    name: String,
+    /// Its target, `schema.table`.
+    table: String,
+}
+
+/// The first upstream (by id) of definition `id`, `def` on `source_table`,
+/// that isn't `live`, if any (#971). A resume waits for every upstream to
+/// be `live`, so its rebuild reads whole upstream targets and each
+/// downstream rebuild starts only after its upstream's has finished.
+/// Definitions form no cycle (`catalog::reject_if_table_cycle`), so every
+/// chain of waits ends at a definition with none.
+async fn upstream_not_live(
+    client: &impl GenericClient,
+    id: i64,
+    def: &TransformDef,
+    source_table: &str,
+) -> Result<Option<Upstream>, ApplyError> {
+    let join_table: Option<String> = client
+        .query_one(
+            "select join_table from transform_definitions where id = $1",
+            &[&id],
+        )
+        .await?
+        .get(0);
+    let mut tables: Vec<String> = vec![source_table.to_string()];
+    tables.extend(join_table);
+    tables.extend(
+        catalog::relationships_read_by(client, def, source_table)
+            .await?
+            .iter()
+            .map(crate::defs::model::RelationshipDefinition::qualified_to_table),
+    );
+    let row = client
+        .query_opt(
+            "select split_part(target_table, '.', 2), target_table from transform_definitions \
+             where target_table = any($1) and id <> $2 and status <> $3 order by id limit 1",
+            &[&tables, &id, &TransformStatus::Live.as_str()],
+        )
+        .await?;
+    Ok(row.map(|row| Upstream {
+        name: row.get(0),
+        table: row.get(1),
+    }))
+}
+
+/// The `capture_failure` of a definition whose resume waits for `upstream`
+/// to be `live` (#971).
+fn waiting_failure(upstream: &Upstream) -> String {
+    format!(
+        "resuming: waiting for transform {name}, whose target {table} this definition reads, \
+         to be live; then the staging worker rebuilds this definition, which stays paused \
+         until then. Resume {name} if it is paused, or pause this definition to withdraw its \
+         resume",
+        name = upstream.name,
+        table = upstream.table,
+    )
+}
+
+/// Records that definition `id`'s resume waits for `upstream` to be `live`
+/// (#971): a resume request (`resume_requests`), which
+/// [`finish_requested_resumes`] completes once every upstream is, and the
+/// `capture_failure` that says so, which replaces whatever reason it was
+/// paused for, as [`request_retype`]'s does.
+async fn request_wait(
+    txn: &Transaction<'_>,
+    id: i64,
+    upstream: &Upstream,
+) -> Result<(), ApplyError> {
+    txn.execute(
+        "insert into resume_requests (transform_id) values ($1) \
+         on conflict (transform_id) do update set requested_at = now(), timeout_cancels = 0",
+        &[&id],
+    )
+    .await?;
+    let columns: Vec<String> = Vec::new();
+    set_capture_failure(
+        txn,
+        id,
+        &upstream.table,
+        &columns,
+        &waiting_failure(upstream),
+    )
+    .await
 }
 
 /// A resume of frozen definition `id` (bare target `target`, qualified
@@ -4172,6 +4278,15 @@ enum ResumeStep {
 /// completion of one that had copies to re-type
 /// ([`finish_requested_resumes`]).
 ///
+/// 0. **It waits for its upstreams** (#971): if a definition whose target
+///    it reads isn't `live` ([`upstream_not_live`]), the operator's resume
+///    (and the capture pass's of a definition whose cause went live), with
+///    `from_pass` false, records a resume request and a `capture_failure`
+///    naming that upstream ([`request_wait`]), and returns
+///    [`ResumeStep::Waiting`] without re-validating anything: the
+///    definition stays paused, and [`finish_requested_resumes`] comes back
+///    here once every upstream is `live`. The worker's own call returns that
+///    too, writing nothing, and its caller leaves the request.
 /// 1. **It re-validates the definition against the live schema**
 ///    ([`catalog::revalidate`], #708, #760), before it changes anything, and
 ///    refuses with [`ApplyError::ResumeRefused`] while define would refuse
@@ -4211,6 +4326,12 @@ async fn resume_locked(
             transform: target.to_string(),
         });
     };
+    if let Some(upstream) = upstream_not_live(txn, id, &definition.def, source_table).await? {
+        if !from_pass {
+            request_wait(txn, id, &upstream).await?;
+        }
+        return Ok(ResumeStep::Waiting(upstream));
+    }
     let revalidated = match catalog::revalidate(txn, schema, &definition).await {
         Ok(revalidated) => revalidated,
         Err(err @ (catalog::CatalogError::Db(_) | catalog::CatalogError::Pool(_))) => {
@@ -4532,6 +4653,10 @@ pub(crate) const RETYPE_LOCK_TIMEOUT: std::time::Duration = std::time::Duration:
 /// in one transaction:
 ///
 /// - **No copy drifted:** the definition is resumed, `waiting_to_backfill`.
+/// - **Another upstream isn't `live`** (a `JOIN`'s joined table, a
+///   relationship's to-side, #971): a resume request is recorded and the
+///   cause cleared ([`request_wait`]), and [`finish_requested_resumes`]
+///   completes it once every upstream is.
 /// - **Copies to re-type:** a resume request is recorded and the cause
 ///   cleared ([`request_retype`]). The [`finish_requested_resumes`] that
 ///   follows re-types them and completes the resume, and its
@@ -4649,6 +4774,16 @@ async fn resume_caused_definition(
                 "transform resumed once its upstream was live; re-parked for a fresh backfill"
             );
         }
+        Ok(ResumeStep::Waiting(waiting_on)) => {
+            txn.commit().await?;
+            crate::instance_log::info!(
+                transform = %target,
+                upstream_id = upstream,
+                waiting_on = %waiting_on.name,
+                "transform resume requested once its upstream was live; it waits for another \
+                 upstream to be live"
+            );
+        }
         Ok(ResumeStep::Retyping(copies)) => {
             txn.commit().await?;
             crate::instance_log::info!(
@@ -4683,8 +4818,12 @@ async fn resume_caused_definition(
 /// each capture pass, before it reads the catalog, so a resume it completes
 /// is `waiting_to_backfill` in that pass's snapshot.
 ///
-/// For each request, in id order, it re-validates the definition (a schema
-/// changed since the `RESUME` is caught here too), then runs
+/// For each request, in id order, it first waits for the definition's
+/// upstreams (#971): while one isn't `live` ([`upstream_not_live`]) it
+/// leaves the request, rewriting the `capture_failure` only when the
+/// upstream it names changes ([`rewrite_waiting`]). Then it re-validates the
+/// definition (a schema changed since the `RESUME` is caught here too), and
+/// runs
 /// [`crate::defs::copies::retype_statements`], one table per transaction,
 /// under a [`RETYPE_LOCK_TIMEOUT`] `lock_timeout`, and then completes the
 /// resume in one transaction through [`resume_locked`], which deletes the
@@ -4778,6 +4917,24 @@ async fn finish_requested_resume(
         let Some(definition) = catalog::definition_by_id_in(&txn, id).await? else {
             return Ok(());
         };
+        // #971: nothing is re-validated or re-typed until every upstream is
+        // live: its re-type may change the types this definition's copies
+        // take from it.
+        if let Some(upstream) = upstream_not_live(&txn, id, &definition.def, &source_table).await? {
+            let error = waiting_failure(&upstream);
+            let current: Option<String> = txn
+                .query_opt(
+                    "select error from capture_failures where transform_id = $1",
+                    &[&id],
+                )
+                .await?
+                .map(|row| row.get(0));
+            drop(txn);
+            if current.as_deref() != Some(error.as_str()) {
+                rewrite_waiting(client, id, &source_table, &upstream, &error).await?;
+            }
+            return Ok(());
+        }
         // The ledger and the group-delta table are checked here too, before anything is
         // re-typed under `ACCESS EXCLUSIVE` that `resume_locked` would then
         // refuse.
@@ -4923,8 +5080,9 @@ async fn finish_requested_resume(
                 "transform resumed once its copies were re-typed; re-parked for a fresh backfill"
             );
         }
-        // A copy drifted again since: the next pass re-types it.
-        Ok(ResumeStep::Retyping(_)) => {}
+        // A copy drifted again since, or an upstream stopped being live:
+        // the next pass re-types it, or waits.
+        Ok(ResumeStep::Retyping(_) | ResumeStep::Waiting(_)) => {}
         Err(ApplyError::ResumeRefused { reason, .. }) => {
             drop(txn);
             end_request(client, id, &source_table, &refused_resume_text(&reason)).await?;
@@ -5160,6 +5318,37 @@ fn retype_cancelled_error(retry: &TransientRetry<'_>) -> String {
         retry.labels.join(", "),
         retry.error,
     )
+}
+
+/// Rewrites the `capture_failure` of definition `id`, whose resume request
+/// waits for an upstream, to `error`, naming the upstream it waits for now
+/// (#971), in a transaction of its own. Locked as [`end_request`] locks, and
+/// does nothing if the request is gone by then: an operator's `PAUSE`
+/// withdrew it (`defs::lifecycle::pause_transform`), and its text stands.
+async fn rewrite_waiting(
+    client: &mut tokio_postgres::Client,
+    id: i64,
+    source_table: &str,
+    upstream: &Upstream,
+    error: &str,
+) -> Result<(), ApplyError> {
+    let txn = client.transaction().await?;
+    if lock_frozen(&txn, "id", &id, source_table).await?.is_none() {
+        return Ok(());
+    }
+    let requested: bool = txn
+        .query_one(
+            "select exists (select 1 from resume_requests where transform_id = $1)",
+            &[&id],
+        )
+        .await?
+        .get(0);
+    if requested {
+        let columns: Vec<String> = Vec::new();
+        set_capture_failure(&txn, id, &upstream.table, &columns, error).await?;
+        txn.commit().await?;
+    }
+    Ok(())
 }
 
 /// Ends definition `id`'s resume request without resuming it, in a
@@ -7589,6 +7778,84 @@ mod unit_tests {
             "the fuse must not quarantine a definition resumed after its read"
         );
         assert_eq!(status_of(&raw).await, "waiting_to_backfill");
+    }
+
+    /// #971: a `PAUSE` of a frozen definition waiting to be resumed
+    /// withdraws that resume, a request or an upstream cause, rewrites its
+    /// `capture_failure` so it no longer says it resumes, and reports
+    /// [`PauseOutcome::Withdrawn`], which a plain no-op
+    /// ([`PauseOutcome::AlreadyFrozen`]) doesn't.
+    #[tokio::test]
+    async fn a_pause_of_a_waiting_definition_withdraws_its_resume() {
+        use crate::defs::lifecycle::{PauseOutcome, pause_transform};
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, raw, _) = fuse_ready(&db).await;
+        let paused = TransformStatus::Paused;
+        let pause = || async { pause_transform(&pool, "order_totals").await.expect("pause") };
+        let record = || async {
+            let row = raw
+                .query_one(
+                    "select f.error, f.caused_by is not null, \
+                            exists (select 1 from resume_requests r \
+                                    where r.transform_id = f.transform_id) \
+                     from capture_failures f join transform_definitions d \
+                       on d.id = f.transform_id \
+                     where d.target_table like '%.order_totals'",
+                    &[],
+                )
+                .await
+                .expect("read the record");
+            (
+                row.get::<_, String>(0),
+                row.get::<_, bool>(1),
+                row.get::<_, bool>(2),
+            )
+        };
+
+        assert_eq!(pause().await, PauseOutcome::Paused);
+        assert_eq!(pause().await, PauseOutcome::AlreadyFrozen(paused));
+
+        // A request (an operator's resume waiting on an upstream).
+        raw.batch_execute(
+            "insert into resume_requests (transform_id) \
+               select id from transform_definitions where target_table like '%.order_totals'; \
+             insert into capture_failures (transform_id, source_table, columns, error, kind) \
+               select id, 'public.up', '{}', 'resuming: waiting for transform up', 'capture' \
+               from transform_definitions where target_table like '%.order_totals'",
+        )
+        .await
+        .expect("a waiting request");
+        assert_eq!(pause().await, PauseOutcome::Withdrawn(paused));
+        let (error, caused, requested) = record().await;
+        assert!(!caused && !requested);
+        assert!(
+            error.starts_with("paused by the operator, which withdrew its resume"),
+            "{error}"
+        );
+        assert_eq!(pause().await, PauseOutcome::AlreadyFrozen(paused));
+        assert_eq!(record().await.0, error);
+
+        // An upstream cause (#970): the reason stands, the sentence saying
+        // it resumes on its own is replaced.
+        raw.batch_execute(
+            "update capture_failures set caused_by = transform_id, \
+               error = 'the resume of transform up re-typed x. This definition resumes on its \
+                        own once up is live again, bringing its columns to the new types and \
+                        rebuilding it. Or drop the definition and define it again'",
+        )
+        .await
+        .expect("a cause");
+        assert_eq!(pause().await, PauseOutcome::Withdrawn(paused));
+        let (error, caused, requested) = record().await;
+        assert!(!caused && !requested);
+        assert_eq!(
+            error,
+            "the resume of transform up re-typed x. It was paused by the operator, so it stays \
+             paused: resume it to bring its columns to the new types and rebuild it, or drop \
+             the definition and define it again"
+        );
+        assert_eq!(pause().await, PauseOutcome::AlreadyFrozen(paused));
     }
 
     /// The positive control for the two tests above: with nothing landing in

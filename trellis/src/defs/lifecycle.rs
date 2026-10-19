@@ -82,6 +82,13 @@ pub(crate) enum PauseOutcome {
     /// poison fuse — and was left exactly as it was. ADR-0014's idempotency
     /// clause: this is a success, not a conflict.
     AlreadyFrozen(TransformStatus),
+    /// The definition was already frozen, but waiting to be resumed: on its
+    /// upstream's resume (`capture_failures.caused_by`, #828), or on a
+    /// resume request (`resume_requests`: an operator's `RESUME` waiting for
+    /// an upstream to be live or for its copies to be re-typed, #971). The
+    /// pause withdrew that resume, so it stays paused like any operator
+    /// pause.
+    Withdrawn(TransformStatus),
 }
 
 /// What [`drop_transform`] actually did — same "distinguish the no-op from
@@ -106,8 +113,10 @@ pub(crate) enum DropOutcome {
 /// for why that, not the qualified spelling, is the addressing scheme.
 ///
 /// Idempotent: a definition already [`TransformStatus::Paused`] *or*
-/// [`TransformStatus::Quarantined`] is left untouched and reported as
-/// [`PauseOutcome::AlreadyFrozen`]. A quarantined definition is deliberately
+/// [`TransformStatus::Quarantined`] keeps its status and is reported as
+/// [`PauseOutcome::AlreadyFrozen`], unless it is waiting to be resumed: then
+/// the pause withdraws that resume ([`withdraw_resume`]) and reports
+/// [`PauseOutcome::Withdrawn`]. A quarantined definition is deliberately
 /// **not** overwritten to `paused`: it is already frozen (which is all a
 /// pause asks for), and flattening the poison trigger into an operator one
 /// would erase the reason from [`crate::Trellis::quarantined`]'s report while
@@ -140,6 +149,15 @@ pub(crate) async fn pause_transform(
     let (id, status) = (locked.id, locked.status);
 
     if status.is_frozen() {
+        if withdraw_resume(&txn, id).await? {
+            txn.commit().await?;
+            crate::instance_log::info!(
+                transform = %target,
+                status = %status.as_str(),
+                "pause withdrew the transform's pending resume; it stays paused"
+            );
+            return Ok(PauseOutcome::Withdrawn(status));
+        }
         // Commit rather than roll back: nothing was written, and committing
         // releases the `for update` lock the same way the mutating arm does.
         txn.commit().await?;
@@ -166,6 +184,66 @@ pub(crate) async fn pause_transform(
     );
     Ok(PauseOutcome::Paused)
 }
+
+/// Withdraws frozen definition `id`'s pending resume, in the pause's
+/// transaction, under its row lock (#971): the resume request
+/// (`resume_requests`) and the upstream cause (`capture_failures.caused_by`)
+/// that the staging worker's capture pass would otherwise complete
+/// (`staging::quarantine::finish_requested_resumes`,
+/// `resume_caused_definitions`). Both resumes take the definition's row lock
+/// and re-read what they act on under it, so whichever commits first wins.
+///
+/// Its `capture_failure` stops saying it resumes: a cause's text keeps the
+/// reason the upstream's resume gave and ends with how to resume it; a
+/// request's (`resuming: ...`) replaced the reason it was paused for when
+/// the operator resumed it, and is replaced in turn. Returns whether there
+/// was anything to withdraw.
+async fn withdraw_resume(txn: &Transaction<'_>, id: i64) -> Result<bool, CatalogError> {
+    let requested = txn
+        .execute(
+            "delete from resume_requests where transform_id = $1",
+            &[&id],
+        )
+        .await?
+        == 1;
+    let record = txn
+        .query_opt(
+            "select error, caused_by is not null from capture_failures where transform_id = $1",
+            &[&id],
+        )
+        .await?;
+    let caused = record.as_ref().is_some_and(|row| row.get::<_, bool>(1));
+    if !requested && !caused {
+        return Ok(false);
+    }
+    let error = match record {
+        Some(row) if caused => {
+            let error: String = row.get(0);
+            let reason = error
+                .split_once(crate::staging::schema_change::CAUSED_RESUMES_ON_ITS_OWN)
+                .map_or(error.as_str(), |(reason, _)| reason);
+            format!("{reason}{WITHDRAWN_CAUSE}")
+        }
+        _ => WITHDRAWN_REQUEST.to_string(),
+    };
+    txn.execute(
+        "update capture_failures set error = $2, caused_by = null, detected_at = now()          where transform_id = $1",
+        &[&id, &error],
+    )
+    .await?;
+    Ok(true)
+}
+
+/// What [`withdraw_resume`] appends to the reason an upstream's resume gave
+/// for pausing a definition, in place of the sentence saying it resumes on
+/// its own.
+const WITHDRAWN_CAUSE: &str = " It was paused by the operator, so it stays paused: resume it to \
+     bring its columns to the new types and rebuild it, or drop the definition and define it again";
+
+/// The `capture_failure` of a definition whose resume request a pause
+/// withdrew ([`withdraw_resume`]).
+const WITHDRAWN_REQUEST: &str = "paused by the operator, which withdrew its resume before the \
+     staging worker finished it. Resume it to rebuild it";
 
 /// Pauses definition `id` because a capture function found `columns` of
 /// `source_table` renamed or dropped (#622 C6), or the capture pass found

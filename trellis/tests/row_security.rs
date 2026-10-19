@@ -1942,11 +1942,27 @@ async fn a_discharge_refused_while_planning_pauses_what_the_refusal_reaches() {
             .await
             .expect("resume");
     }
+    // c_copy_2's resume waits for c_copy to be live (#971), so they
+    // rebuild one after the other.
     capture_pass(&mut it.raw, &it.pool).await;
     markers::settle_registrations(&worker).await;
     seal_and_drain(&mut it.raw, &worker)
         .await
-        .expect("the drain applies the rebuild");
+        .expect("the drain applies c_copy's rebuild");
+    assert_eq!(
+        status(&it.trellis, "c_copy").await.status,
+        TransformStatus::Live
+    );
+    assert_eq!(
+        status(&it.trellis, "c_copy_2").await.status,
+        TransformStatus::Paused,
+        "c_copy_2 waits for c_copy"
+    );
+    capture_pass(&mut it.raw, &it.pool).await;
+    markers::settle_registrations(&worker).await;
+    seal_and_drain(&mut it.raw, &worker)
+        .await
+        .expect("the drain applies c_copy_2's rebuild");
     for target in ["c_copy", "c_copy_2"] {
         let reported = status(&it.trellis, target).await;
         assert_eq!(reported.status, TransformStatus::Live, "{target}");
@@ -2063,11 +2079,27 @@ async fn a_catch_up_refused_for_row_security_pauses_its_definition() {
             .await
             .expect("resume");
     }
+    // c_copy_2's resume waits for c_copy to be live (#971), so they
+    // rebuild one after the other.
     capture_pass(&mut it.raw, &it.pool).await;
     markers::settle_registrations(&worker).await;
     seal_and_drain(&mut it.raw, &worker)
         .await
-        .expect("the drain applies the rebuild");
+        .expect("the drain applies c_copy's rebuild");
+    assert_eq!(
+        status(&it.trellis, "c_copy").await.status,
+        TransformStatus::Live
+    );
+    assert_eq!(
+        status(&it.trellis, "c_copy_2").await.status,
+        TransformStatus::Paused,
+        "c_copy_2 waits for c_copy"
+    );
+    capture_pass(&mut it.raw, &it.pool).await;
+    markers::settle_registrations(&worker).await;
+    seal_and_drain(&mut it.raw, &worker)
+        .await
+        .expect("the drain applies c_copy_2's rebuild");
     for target in ["c_copy", "c_copy_2"] {
         let reported = status(&it.trellis, target).await;
         assert_eq!(reported.status, TransformStatus::Live, "{target}");

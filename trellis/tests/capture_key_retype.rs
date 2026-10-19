@@ -2161,7 +2161,17 @@ async fn an_upstream_sum_re_typed_to_numeric_pauses_and_resume_re_types_its_down
         assert!(error.contains(column), "{column}: {error}");
     }
 
+    // #971: its resume waits for shop_totals to be live.
     resume(&trellis, "smallest").await;
+    assert_requested_wait(&trellis, &raw, "smallest", "shop_totals").await;
+    step_until_live_requested(
+        &trellis,
+        &mut raw,
+        &db.pool,
+        "shop_totals",
+        &[("smallest", "shop_totals")],
+    )
+    .await;
     capture_pass(&mut raw, &db.pool).await;
     assert_eq!(
         column_type(&raw, "public.smallest", "least").await,
@@ -2572,12 +2582,13 @@ async fn a_definition_refused_at_its_automatic_resume_stays_paused_with_the_refu
     assert_eq!(status(&raw, "c_owners").await, TransformStatus::Live);
 }
 
-/// #970: a `RESUME` by hand of a definition waiting on its upstream resumes
-/// it at once, though the upstream isn't live yet: the request replaces the
-/// cause, and the next pass re-types its target and pauses the definition
-/// below it with it as the cause.
+/// #971: a `RESUME` by hand of a definition waiting on its upstream's
+/// chained resume (A not live) is accepted, and the definition keeps
+/// waiting, now on a request naming A instead of a cause. It follows A: the
+/// first pass after A is live re-types its target and resumes it, and
+/// pauses the definition below it with it as the cause.
 #[tokio::test]
-async fn a_resume_by_hand_of_a_waiting_definition_resumes_it_before_its_upstream_is_live() {
+async fn a_resume_by_hand_of_a_waiting_definition_waits_for_its_upstream() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
@@ -2586,17 +2597,408 @@ async fn a_resume_by_hand_of_a_waiting_definition_resumes_it_before_its_upstream
     resume_head_of_chain(&trellis, &mut raw, &db.pool).await;
     assert_waiting_on(&trellis, &raw, "b_names", "item_names").await;
     resume(&trellis, "b_names").await;
-    assert_eq!(caused_by(&raw, "b_names").await, None);
+    assert_requested_wait(&trellis, &raw, "b_names", "item_names").await;
 
     capture_pass(&mut raw, &db.pool).await;
     assert_ne!(status(&raw, "item_names").await, TransformStatus::Live);
+    assert_eq!(column_type(&raw, "public.b_names", "id").await, "integer");
+    step_until_live_requested(
+        &trellis,
+        &mut raw,
+        &db.pool,
+        "item_names",
+        &[("b_names", "item_names")],
+    )
+    .await;
+    assert_unpaused(&trellis, "c_names").await;
+
+    capture_pass(&mut raw, &db.pool).await;
     assert_eq!(column_type(&raw, "public.b_names", "id").await, "bigint");
     assert_eq!(
         status(&raw, "b_names").await,
         TransformStatus::WaitingToBackfill
     );
     assert_waiting_on(&trellis, &raw, "c_names", "b_names").await;
+    step_until_live(&trellis, &mut raw, &db.pool, "b_names", &["c_names"]).await;
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(column_type(&raw, "public.c_names", "id").await, "bigint");
     assert_chain_converges(&trellis, &mut raw, &db.pool).await;
+}
+
+/// `PAUSE TRANSFORM target`, which must succeed.
+async fn pause(trellis: &Trellis, target: &str) {
+    trellis
+        .apply(&format!("PAUSE TRANSFORM {target}"))
+        .await
+        .unwrap_or_else(|err| panic!("pause {target}: {err}"));
+}
+
+/// Whether `target`'s resume request is recorded.
+async fn requested(raw: &Client, target: &str) -> bool {
+    raw.query_one(
+        "select exists (select 1 from resume_requests r join transform_definitions d \
+                        on d.id = r.transform_id \
+                        where split_part(d.target_table, '.', 2) = $1)",
+        &[&target],
+    )
+    .await
+    .expect("read requests")
+    .get(0)
+}
+
+/// Asserts `target`'s resume waits for `upstream` to be live (#971): it is
+/// paused with a resume request and no cause, its `capture_failure` names
+/// `upstream` and its target, and its rebuild hasn't started (no backfill
+/// chunk, no build).
+async fn assert_requested_wait(trellis: &Trellis, raw: &Client, target: &str, upstream: &str) {
+    let reported = trellis.status(target).await.expect("status").expect(target);
+    assert_eq!(reported.status, TransformStatus::Paused, "{target}");
+    let failure = reported.capture_failure.expect("reason");
+    assert_eq!(
+        failure.source_table,
+        format!("public.{upstream}"),
+        "{target}"
+    );
+    assert!(failure.columns.is_empty(), "{target}");
+    assert_eq!(
+        failure.error,
+        format!(
+            "resuming: waiting for transform {upstream}, whose target public.{upstream} this \
+             definition reads, to be live; then the staging worker rebuilds this definition, \
+             which stays paused until then. Resume {upstream} if it is paused, or pause this \
+             definition to withdraw its resume"
+        ),
+        "{target}"
+    );
+    assert_eq!(caused_by(raw, target).await, None, "{target}");
+    assert!(requested(raw, target).await, "{target}");
+    let started: i64 = raw
+        .query_one(
+            "select (select count(*) from backfill_chunks c where c.definition_id = d.id and not c.done) \
+                  + (case when d.build is null then 0 else 1 end) \
+             from transform_definitions d where split_part(d.target_table, '.', 2) = $1",
+            &[&target],
+        )
+        .await
+        .expect("read what started")
+        .get(0);
+    assert_eq!(started, 0, "{target} has chunks or a build");
+}
+
+/// [`step_until_live`] for definitions whose resume requests wait
+/// (`(target, upstream)` pairs, [`assert_requested_wait`]).
+async fn step_until_live_requested(
+    trellis: &Trellis,
+    raw: &mut Client,
+    pool: &trellis::Pool,
+    upstream: &str,
+    waiting: &[(&str, &str)],
+) {
+    for _ in 0..12 {
+        for step in 0..3 {
+            if status(raw, upstream).await == TransformStatus::Live {
+                return;
+            }
+            match step {
+                0 => full_pass(raw, pool).await,
+                1 => run_backfill_chunks(pool).await,
+                _ => drain_to_quiescence(pool, raw).await,
+            }
+            if status(raw, upstream).await != TransformStatus::Live {
+                for (target, its_upstream) in waiting {
+                    assert_requested_wait(trellis, raw, target, its_upstream).await;
+                }
+            }
+        }
+    }
+    panic!("{upstream} did not go live within 12 rounds of steps");
+}
+
+/// #971: an operator can resume a whole stack at once, in any order, and it
+/// comes up in dependency order. A -> B -> C, all paused by the operator,
+/// resumed C, then B, then A: C and B are accepted and wait, naming their
+/// upstream; no build starts early. Once A is live the next pass rebuilds B,
+/// and once B is live, C.
+#[tokio::test]
+async fn a_stack_resumed_in_any_order_comes_up_in_dependency_order() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = chain(db.dsn(), &mut raw, &db.pool).await;
+    for target in ["item_names", "b_names", "c_names"] {
+        pause(&trellis, target).await;
+    }
+    raw.batch_execute("insert into public.items values (7, 'seven', 7)")
+        .await
+        .expect("a write while paused");
+
+    resume(&trellis, "c_names").await;
+    assert_requested_wait(&trellis, &raw, "c_names", "b_names").await;
+    resume(&trellis, "b_names").await;
+    assert_requested_wait(&trellis, &raw, "b_names", "item_names").await;
+    // Passes while A is paused change nothing.
+    full_pass(&mut raw, &db.pool).await;
+    assert_requested_wait(&trellis, &raw, "c_names", "b_names").await;
+    assert_requested_wait(&trellis, &raw, "b_names", "item_names").await;
+
+    resume(&trellis, "item_names").await;
+    assert_eq!(
+        status(&raw, "item_names").await,
+        TransformStatus::WaitingToBackfill
+    );
+    step_until_live_requested(
+        &trellis,
+        &mut raw,
+        &db.pool,
+        "item_names",
+        &[("b_names", "item_names"), ("c_names", "b_names")],
+    )
+    .await;
+
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(
+        status(&raw, "b_names").await,
+        TransformStatus::WaitingToBackfill
+    );
+    assert_unpaused(&trellis, "b_names").await;
+    assert!(!requested(&raw, "b_names").await);
+    assert_requested_wait(&trellis, &raw, "c_names", "b_names").await;
+    step_until_live_requested(
+        &trellis,
+        &mut raw,
+        &db.pool,
+        "b_names",
+        &[("c_names", "b_names")],
+    )
+    .await;
+
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(
+        status(&raw, "c_names").await,
+        TransformStatus::WaitingToBackfill
+    );
+    assert_unpaused(&trellis, "c_names").await;
+    bring_live(&mut raw, &db.pool, &["item_names", "b_names", "c_names"]).await;
+    assert_eq!(
+        rows(
+            &raw,
+            "select id::text, name from public.c_names order by id"
+        )
+        .await,
+        rows(
+            &raw,
+            "select id::text, name::text from public.items order by id"
+        )
+        .await,
+    );
+}
+
+/// #971: a downstream whose upstream nobody resumes keeps waiting across
+/// passes, its record as it was, and an operator `PAUSE` withdraws its
+/// request: it then stays paused, with no request, after the upstream is
+/// resumed and live.
+#[tokio::test]
+async fn a_downstream_waits_on_a_paused_upstream_until_a_pause_withdraws_it() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = chain(db.dsn(), &mut raw, &db.pool).await;
+    pause(&trellis, "item_names").await;
+    pause(&trellis, "b_names").await;
+
+    resume(&trellis, "b_names").await;
+    assert_requested_wait(&trellis, &raw, "b_names", "item_names").await;
+    let detected_at = failure_detected_at(&raw, "b_names").await;
+    for _ in 0..3 {
+        full_pass(&mut raw, &db.pool).await;
+        run_backfill_chunks(&db.pool).await;
+        drain_to_quiescence(&db.pool, &mut raw).await;
+        assert_requested_wait(&trellis, &raw, "b_names", "item_names").await;
+    }
+    assert_eq!(detected_at, failure_detected_at(&raw, "b_names").await);
+
+    pause(&trellis, "b_names").await;
+    assert!(!requested(&raw, "b_names").await);
+    let error = paused_for(&trellis, "b_names", "public.item_names", &[]).await;
+    assert!(
+        error.starts_with("paused by the operator, which withdrew its resume"),
+        "{error}"
+    );
+
+    resume(&trellis, "item_names").await;
+    bring_live(&mut raw, &db.pool, &["item_names"]).await;
+    for _ in 0..2 {
+        full_pass(&mut raw, &db.pool).await;
+        drain_to_quiescence(&db.pool, &mut raw).await;
+    }
+    assert_eq!(status(&raw, "b_names").await, TransformStatus::Paused);
+    assert!(!requested(&raw, "b_names").await);
+    assert_eq!(
+        paused_for(&trellis, "b_names", "public.item_names", &[]).await,
+        error
+    );
+    // C, reading B's paused target, was never paused.
+    assert_unpaused(&trellis, "c_names").await;
+}
+
+/// #971: a waiting request whose re-validation fails when its upstream is
+/// live ends with the refusal on its `capture_failure`, once: later passes
+/// don't try again.
+#[tokio::test]
+async fn a_waiting_resume_refused_once_its_upstream_is_live_is_not_retried() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = items(db.dsn(), &mut raw, &db.pool).await;
+    raw.batch_execute(
+        "create table public.owners (code varchar(10) primary key, label text); \
+         insert into public.owners values ('one', 'First'), ('two', 'Second');",
+    )
+    .await
+    .expect("seed owners");
+    for text in [
+        "RELATIONSHIP owner FROM item_names.name TO owners.code",
+        "TRANSFORM b_owners FROM public.item_names SELECT owner.label AS owner_label",
+    ] {
+        trellis.apply(text).await.expect(text);
+    }
+    bring_live(&mut raw, &db.pool, &["item_names", "b_owners"]).await;
+    pause(&trellis, "item_names").await;
+    pause(&trellis, "b_owners").await;
+    resume(&trellis, "b_owners").await;
+    assert_requested_wait(&trellis, &raw, "b_owners", "item_names").await;
+
+    // The schema changes while it waits: define refuses a join column of
+    // type character(n).
+    raw.batch_execute("alter table public.owners alter column code type character(10)")
+        .await
+        .expect("re-type the to-side join column");
+    resume(&trellis, "item_names").await;
+    step_until_live_requested(
+        &trellis,
+        &mut raw,
+        &db.pool,
+        "item_names",
+        &[("b_owners", "item_names")],
+    )
+    .await;
+
+    capture_pass(&mut raw, &db.pool).await;
+    let error = paused_for(&trellis, "b_owners", "public.item_names", &[]).await;
+    assert!(
+        error.starts_with("the resume was refused: ") && error.contains("character(10)"),
+        "{error}"
+    );
+    assert!(!requested(&raw, "b_owners").await);
+    let detected_at = failure_detected_at(&raw, "b_owners").await;
+    capture_pass(&mut raw, &db.pool).await;
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(
+        paused_for(&trellis, "b_owners", "public.item_names", &[]).await,
+        error
+    );
+    assert_eq!(detected_at, failure_detected_at(&raw, "b_owners").await);
+}
+
+/// #971 item 1: an operator `PAUSE` of B while it waits on A's chained
+/// resume (with A as its cause) takes it out of the chain: the cause is
+/// cleared, its message keeps the reason and no longer says it resumes on
+/// its own, and passes after A is live leave it paused, and C untouched.
+#[tokio::test]
+async fn a_pause_of_a_definition_waiting_on_its_cause_takes_it_out_of_the_chain() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = chain(db.dsn(), &mut raw, &db.pool).await;
+
+    resume_head_of_chain(&trellis, &mut raw, &db.pool).await;
+    assert_waiting_on(&trellis, &raw, "b_names", "item_names").await;
+    pause(&trellis, "b_names").await;
+    assert_eq!(caused_by(&raw, "b_names").await, None);
+    let error = paused_for(&trellis, "b_names", "public.item_names", &["id"]).await;
+    assert_eq!(
+        error,
+        "the resume of transform item_names re-typed public.item_names.id from integer to \
+         bigint, which this definition reads, so the columns Trellis created for this \
+         definition from it can't hold every value of the types define would give them now: \
+         public.b_names.id (integer, now bigint). It was paused by the operator, so it stays \
+         paused: resume it to bring its columns to the new types and rebuild it, or drop the \
+         definition and define it again"
+    );
+
+    bring_live(&mut raw, &db.pool, &["item_names"]).await;
+    for _ in 0..2 {
+        full_pass(&mut raw, &db.pool).await;
+        drain_to_quiescence(&db.pool, &mut raw).await;
+    }
+    assert_eq!(
+        paused_for(&trellis, "b_names", "public.item_names", &["id"]).await,
+        error
+    );
+    assert!(!requested(&raw, "b_names").await);
+    assert_eq!(column_type(&raw, "public.b_names", "id").await, "integer");
+    assert_unpaused(&trellis, "c_names").await;
+    assert_eq!(status(&raw, "c_names").await, TransformStatus::Live);
+}
+
+/// #971 item 1: C, paused by the operator before the chain's resume, stays
+/// paused with no cause after A and B are live, through further passes.
+#[tokio::test]
+async fn a_definition_paused_by_the_operator_before_the_chain_stays_paused() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = chain(db.dsn(), &mut raw, &db.pool).await;
+    pause(&trellis, "c_names").await;
+
+    resume_head_of_chain(&trellis, &mut raw, &db.pool).await;
+    step_until_live(&trellis, &mut raw, &db.pool, "item_names", &["b_names"]).await;
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(column_type(&raw, "public.b_names", "id").await, "bigint");
+    bring_live(&mut raw, &db.pool, &["item_names", "b_names"]).await;
+    for _ in 0..2 {
+        full_pass(&mut raw, &db.pool).await;
+        drain_to_quiescence(&db.pool, &mut raw).await;
+    }
+    assert_eq!(status(&raw, "c_names").await, TransformStatus::Paused);
+    assert_eq!(caused_by(&raw, "c_names").await, None);
+    assert!(!requested(&raw, "c_names").await);
+    assert_eq!(column_type(&raw, "public.c_names", "id").await, "integer");
+}
+
+/// #971 item 3: B's chained resume requests a re-type that fails for a
+/// reason no retry gets past (a view on B's target key column, `0A000`).
+/// The request ends: B stays paused with the re-type error and no cause,
+/// its target keeps its type, so C is never paused. A later pass doesn't
+/// retry.
+#[tokio::test]
+async fn a_chained_re_type_that_fails_stops_the_chain_there() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = chain(db.dsn(), &mut raw, &db.pool).await;
+    raw.batch_execute("create view public.b_ids as select id from public.b_names")
+        .await
+        .expect("a view on B's key");
+
+    resume_head_of_chain(&trellis, &mut raw, &db.pool).await;
+    step_until_live(&trellis, &mut raw, &db.pool, "item_names", &["b_names"]).await;
+    capture_pass(&mut raw, &db.pool).await;
+    let reported = trellis.status("b_names").await.expect("status").expect("b");
+    assert_eq!(reported.status, TransformStatus::Paused);
+    let error = reported.capture_failure.expect("reason").error;
+    assert!(error.contains("b_ids"), "{error}");
+    assert_eq!(caused_by(&raw, "b_names").await, None);
+    assert!(!requested(&raw, "b_names").await);
+    assert_eq!(column_type(&raw, "public.b_names", "id").await, "integer");
+    assert_unpaused(&trellis, "c_names").await;
+    assert_eq!(status(&raw, "c_names").await, TransformStatus::Live);
+
+    let detected_at = failure_detected_at(&raw, "b_names").await;
+    capture_pass(&mut raw, &db.pool).await;
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(detected_at, failure_detected_at(&raw, "b_names").await);
+    assert_unpaused(&trellis, "c_names").await;
 }
 
 /// #828: a definition the operator paused before the upstream's resume
@@ -2682,6 +3084,8 @@ async fn a_definition_the_re_type_leaves_refused_keeps_its_own_error() {
         "{error}"
     );
     assert_eq!(caused_by(&raw, "note_items").await, None);
+    // A resume waits for item_names to be live (#971), then refuses.
+    bring_live(&mut raw, &db.pool, &["item_names"]).await;
     resume_refused(&trellis, "note_items").await;
 }
 
@@ -2742,13 +3146,15 @@ async fn a_definition_refused_on_the_re_typed_target_keeps_its_own_error() {
         "{error}"
     );
     assert_eq!(caused_by(&raw, "note_items").await, None);
-    resume_refused(&trellis, "note_items").await;
     // The sibling the same check pauses for the re-type alone records it.
     paused_for(&trellis, "b_names", "public.item_names", &["id"]).await;
     assert_eq!(
         caused_by(&raw, "b_names").await.as_deref(),
         Some("item_names")
     );
+    // A resume waits for item_names to be live (#971), then refuses.
+    bring_live(&mut raw, &db.pool, &["item_names"]).await;
+    resume_refused(&trellis, "note_items").await;
 }
 
 /// #824: a source change whose columns Trellis created from it hold every

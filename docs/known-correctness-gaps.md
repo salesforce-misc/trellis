@@ -866,15 +866,14 @@ or attach a source's partitions until a pass has run.
   it has finished, and each is a full rebuild, so a chain of depth k stays
   paused below the head for k rebuilds in a row. A definition waiting on an
   upstream that doesn't go live (paused, quarantined, refused its own
-  resume) keeps waiting. A `RESUME` by hand of a waiting definition resumes
-  it at once, whether or not the upstream is live. A `PAUSE` of a waiting
-  definition doesn't take it out of the chain: it is already paused, so the
-  `PAUSE` changes nothing, and the pass still resumes it once the upstream
-  is live (#971). Dropping it is the only way to keep it from resuming. One
-  whose automatic
-  resume is refused, because the schema changed after the pause, stays
-  paused with the refusal, and isn't tried again; resume it by hand once
-  that is fixed, or drop it and define it again.
+  resume) keeps waiting. So does a definition an operator resumes while an
+  upstream isn't live: the `RESUME` returns at once and the rebuild waits
+  for the upstream, so a stack resumed at once rebuilds one level at a time
+  in the same way. A `PAUSE` of a waiting definition withdraws its resume.
+  One whose resume is refused when its upstream is live, because the schema
+  changed after the pause, stays paused with the refusal, and isn't tried
+  again; resume it by hand once that is fixed, or drop it and define it
+  again.
 * **Quarantined keys stay held until they're released.** A key that's
   quarantined after repeated apply failures is held for the definition whose
   apply failed, with its parked work and its poison row, and that
