@@ -14,8 +14,10 @@
 //! `JOIN` has no build yet (#1109): it goes `live` with empty hidden tables
 //! and the seed arrives through capture. The pass, the seal, the drain and
 //! the correction engine are called by hand; nothing waits for convergence
-//! (#297). The oracle is each definition's own `JOIN … GROUP BY`, and
-//! `self_check`'s audit of the hidden `P`, `M`, `J` and `T`.
+//! (#297). The oracle is each definition's own `JOIN … GROUP BY`, and the
+//! hidden `P`, `M`, `J` and `T` against `GROUP BY`s of the tables.
+//! `self_check` compares nothing here: its capture audit reports every
+//! partitioned source as a hierarchy fault, first and alone (#1179).
 //!
 //! The cases are #1043 E1's variant-L scenarios (`P.*`) with a `JOIN` side
 //! operated on, and #958's lifecycle cells (X12-7a two-level trees, X12-7b a
@@ -238,8 +240,10 @@ impl Fx {
         wrong
     }
 
-    /// `self_check` of every target: the visible rows against the query,
-    /// and `P`, `M`, `J` and `T` against what the tables hold.
+    /// `self_check` of every target, less the capture audit's hierarchy
+    /// fault (#1179). That fault is reported first and alone, so over a
+    /// partitioned source this compares nothing else: [`Self::hidden_wrong`]
+    /// audits the hidden tables instead.
     async fn divergences(&self) -> Vec<String> {
         let mut found = Vec::new();
         for (name, _, _) in ORACLES {
@@ -273,6 +277,94 @@ impl Fx {
             }
         }
         found
+    }
+
+    /// The hidden `P`, `M`, `J` and `T` of each definition against what the
+    /// tables hold, each row tagged with the table and `have` or `want`. A
+    /// zero cell (or `J` row) is compared only when a partial of it is not
+    /// zero.
+    async fn hidden_wrong(&self) -> Vec<String> {
+        // Each definition's `P` key, `T` key, `T`'s key as the oracle reads
+        // it, and its join.
+        const SHAPES: [(&str, &str, &str, &str, &str); 2] = [
+            ("l", "k", "gb", "b.gb", "left join"),
+            ("i", "ga, k", "ga, gb", "a.ga, b.gb", "join"),
+        ];
+        let mut out = Vec::new();
+        for (name, p_key, t_key, t_oracle_key, join) in SHAPES {
+            let id: i64 = self
+                .d
+                .ctl
+                .query_one(
+                    "select id from transform_definitions where target_table = $1",
+                    &[&format!("public.{name}")],
+                )
+                .await
+                .expect("definition id")
+                .get(0);
+            let hidden = |part: &str| format!("{DEFAULT_SCHEMA}.join_{id}_{part}");
+            let checks = [
+                (
+                    "p",
+                    format!(
+                        "select {p_key}, __n, __count_1, __sum_1 from {} \
+                         where __n <> 0 or __count_1 <> 0 or __sum_1 <> 0",
+                        hidden("p")
+                    ),
+                    format!(
+                        "select {p_key}, count(*), count(x), coalesce(sum(x), 0) \
+                         from public.a group by {p_key}"
+                    ),
+                ),
+                (
+                    "m",
+                    format!(
+                        "select gb, k, __n, __count_1, __sum_1 from {} \
+                         where __n <> 0 or __count_1 <> 0 or __sum_1 <> 0",
+                        hidden("m")
+                    ),
+                    "select gb, k, count(*), count(y), coalesce(sum(y), 0) \
+                     from public.b where k is not null group by gb, k"
+                        .to_string(),
+                ),
+                (
+                    "j",
+                    format!(
+                        "select k, __matches from {} where __matches <> 0",
+                        hidden("j")
+                    ),
+                    "select k, count(*) from public.b where k is not null group by k".to_string(),
+                ),
+                (
+                    "t",
+                    format!(
+                        "select {t_key}, __n, __count_1, __sum_1, __count_2, __sum_2 from {} \
+                         where __n <> 0 or __count_1 <> 0 or __sum_1 <> 0 \
+                            or __count_2 <> 0 or __sum_2 <> 0",
+                        hidden("t")
+                    ),
+                    format!(
+                        "select {t_oracle_key}, count(*), count(a.x), coalesce(sum(a.x), 0), \
+                                count(b.y), coalesce(sum(b.y), 0) \
+                         from public.a {join} public.b on a.k = b.k group by {t_oracle_key}"
+                    ),
+                ),
+            ];
+            for (part, have, want) in checks {
+                out.extend(
+                    self.d
+                        .rows(&format!(
+                            "select '{name}.{part} have' as what, h::text as cell from \
+                                 (({have}) except all ({want})) h \
+                             union all \
+                             select '{name}.{part} want', o::text from \
+                                 (({want}) except all ({have})) o"
+                        ))
+                        .await,
+                );
+            }
+        }
+        out
     }
 
     /// Hidden partials a delta drove below zero.
@@ -317,11 +409,13 @@ impl Fx {
             .await
     }
 
-    /// Every target equals its oracle, `self_check` finds nothing, no
-    /// partial is negative, and both definitions are `live`.
+    /// Every target equals its oracle, `self_check` finds nothing but
+    /// #1179's fault, the hidden tables match the tables, no partial is
+    /// negative, and both definitions are `live`.
     async fn assert_right(&self, what: &str) {
         assert_eq!(self.wrong_targets().await, Vec::<String>::new(), "{what}");
         assert_eq!(self.divergences().await, Vec::<String>::new(), "{what}");
+        assert_eq!(self.hidden_wrong().await, Vec::<String>::new(), "{what}");
         assert_eq!(
             self.negative_partials().await,
             Vec::<String>::new(),
