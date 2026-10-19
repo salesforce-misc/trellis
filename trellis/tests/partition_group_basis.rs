@@ -1171,8 +1171,9 @@ async fn a_complement_whose_hash_middle_is_dropped_completes_and_converges() {
 
 /// Only an install that adds nodes new to the recorded tree is left to the
 /// corrections: a recorded leaf whose capture was switched off by hand is
-/// repaired by the reinstall's rebuild, as for any table (the rebuild of a
-/// non-empty source is #1101's, so the definition reads `backfilling`).
+/// repaired by the reinstall's rebuild, as for any table. The in-place
+/// rebuild over a partitioned source (one statement per partition) is
+/// #1101's open part, so its sweep job halts the definition.
 #[tokio::test]
 async fn a_recorded_leaf_whose_capture_was_switched_off_is_rebuilt() {
     let mut fx = Fx::start(&tree("range"), SEED).await;
@@ -1181,6 +1182,20 @@ async fn a_recorded_leaf_whose_capture_was_switched_off_is_rebuilt() {
     fx.pass().await;
     assert!(fx.queue().await.is_empty(), "no lifecycle operation");
     assert_eq!(fx.status().await, "backfilling");
+    trellis::staging::build::settle_builds(fx.d.pool()).await;
+    assert_eq!(fx.status().await, "paused");
+    let jobs =
+        fx.d.rows(
+            "select kind || ': ' || coalesce(last_error, '') from backfill_chunks \
+             where definition_id = (select id from transform_definitions \
+                                    where target_table = 'public.agg')",
+        )
+        .await;
+    assert_eq!(jobs.len(), 1, "the sweep job alone: {jobs:?}");
+    assert!(
+        jobs[0].contains("sweep: ") && jobs[0].contains("a rebuild over a partitioned source"),
+        "{jobs:?}"
+    );
 }
 
 /// A ledger aggregate over the same source keeps #1062's engine: its
