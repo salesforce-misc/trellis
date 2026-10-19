@@ -963,3 +963,62 @@ async fn a_joined_column_retyped_to_another_value_type_pauses_the_join() {
         assert_unpaused(&trellis, "shipped").await;
     }
 }
+
+/// #1110: a resume drops and recreates a JOIN's hidden tables, so it never
+/// re-types them first. `J` keeps every join key it has seen (ADR-0019), so
+/// after both `ON` columns narrow (`bigint` to `integer`, the big keys'
+/// rows deleted first) it can still hold a key the narrowed type can't: an
+/// `ALTER` of `J` would fail, and the resume with it, where recreating `J`
+/// succeeds.
+#[tokio::test]
+async fn a_join_resume_recreates_its_hidden_tables_without_re_typing_them() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect_raw(db.dsn()).await;
+    raw.batch_execute(
+        "set search_path to public;
+         create table orders (id integer primary key, code bigint, region text);
+         create table items (id integer primary key, order_code bigint, qty integer);
+         set search_path to trellis, public;",
+    )
+    .await
+    .expect("seed");
+    let trellis = define_only(db.dsn()).await;
+    trellis
+        .apply(
+            "TRANSFORM by_code FROM orders LEFT JOIN items \
+             ON orders.code = items.order_code GROUP BY orders.region \
+             SELECT orders.region AS region, SUM(items.qty) AS qty",
+        )
+        .await
+        .expect("define the JOIN");
+    pass(&mut raw, &db.pool).await;
+    let id = definition_id(&raw, "by_code").await;
+    let j = format!("{DEFAULT_SCHEMA}.join_{id}_j");
+    // A key whose rows are gone: `J` keeps its row.
+    raw.batch_execute(&format!("insert into {j} (code) values (5000000000)"))
+        .await
+        .expect("a key J saw");
+
+    raw.batch_execute(
+        "begin; \
+         alter table public.orders alter column code type integer; \
+         alter table public.items alter column order_code type integer; \
+         commit",
+    )
+    .await
+    .expect("narrow the ON pair");
+    pass(&mut raw, &db.pool).await;
+    trellis
+        .apply("PAUSE TRANSFORM by_code")
+        .await
+        .expect("pause");
+    trellis
+        .apply("RESUME TRANSFORM by_code")
+        .await
+        .expect("resume");
+    pass(&mut raw, &db.pool).await;
+    assert_unpaused(&trellis, "by_code").await;
+    assert_eq!(column_type(&raw, &j, "code").await, "integer");
+    assert_eq!(count(&raw, &format!("select count(*) from {j}")).await, 0);
+}

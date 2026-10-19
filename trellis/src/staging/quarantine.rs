@@ -4249,7 +4249,7 @@ async fn resume_locked(
     let drifted: Vec<crate::defs::copies::CopyState> = crate::defs::copies::inspect(txn, copies)
         .await?
         .into_iter()
-        .filter(|s| s.drifted())
+        .filter(|s| s.drifted() && !s.copy.kind.recreated_by_resume())
         .collect();
     if !drifted.is_empty() {
         let labels: Vec<String> = drifted.iter().map(|s| s.copy.label()).collect();
@@ -4807,7 +4807,12 @@ async fn finish_requested_resume(
             &rel_refs,
         )
         .await?;
-        let states = crate::defs::copies::inspect(&txn, copies).await?;
+        let states: Vec<crate::defs::copies::CopyState> =
+            crate::defs::copies::inspect(&txn, copies)
+                .await?
+                .into_iter()
+                .filter(|s| !s.copy.kind.recreated_by_resume())
+                .collect();
         let retrying = retyping_failure(&source_table, states.iter().filter(|s| s.drifted()));
         // Each table's statements, with the columns of the definition's
         // target they re-type: what a definition chained off the target

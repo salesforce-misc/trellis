@@ -46,7 +46,8 @@
 //! - Otherwise it pauses every definition that owns a column the source has
 //!   outgrown ([`super::key_types::widens`]). A resume brings every column
 //!   whose type differs from define's to it ([`retype_statements`]) before
-//!   it rebuilds.
+//!   it rebuilds, except a `JOIN`'s hidden tables, which it drops and
+//!   creates again at the live types ([`CopyKind::recreated_by_resume`]).
 //!
 //! Trellis re-types a column on its own only in the first case. Either
 //! re-type keeps the column's collation. A narrowing, or a change to another
@@ -105,6 +106,14 @@ pub(crate) enum CopyKind {
 }
 
 impl CopyKind {
+    /// Whether a resume drops and recreates the copy's table at the live
+    /// types (a `JOIN`'s hidden tables), so it re-types nothing there:
+    /// `J` keeps every key it has seen, so a narrowed key column's
+    /// `ALTER` could fail on a key whose rows are gone.
+    pub(crate) fn recreated_by_resume(self) -> bool {
+        self == CopyKind::JoinHidden
+    }
+
     /// Whether the copy is typed as its source column's value family
     /// ([`super::ddl::pg_type_name`]) rather than as the column itself.
     fn by_family(self) -> bool {
