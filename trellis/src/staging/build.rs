@@ -1173,10 +1173,13 @@ fn buildable_shape(definition: &Definition) -> Option<ledger::LedgerShape> {
 
 /// Whether the partition correction engine
 /// (`super::partition_correction`) can re-derive the keys of `definition`
-/// when a node of its partitioned source is added: an aggregate whose
-/// ledger shape the Re-derive build serves, or one on the group basis.
+/// when a node of its partitioned source is added: an aggregate on the group
+/// basis, or one whose ledger shape the Re-derive build serves. These are
+/// the two its runner corrects a reader of the source with; a `JOIN` is
+/// neither.
 pub(crate) fn corrected_on_partitioned_source(definition: &Definition) -> bool {
-    buildable_shape(definition).is_some() || takes_group_basis(definition)
+    super::group_basis::route(&definition.def, &definition.source_columns).is_some()
+        || buildable_shape(definition).is_some()
 }
 
 /// Whether `definition` is on the group basis (`super::group_basis`, behind

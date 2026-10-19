@@ -236,14 +236,18 @@ attached beside a `DEFAULT` takes some of its groups, whose rows a read of the
 `DEFAULT` alone would zero. Every operation that narrows the node's region
 after the check locks the node, so it waits for the correction. The capture
 install that adds a new node to the tree rebuilds none of the readers a
-correction covers (these aggregates, and a definition reading the source
-through a to-many relationship): the node's own correction covers its rows,
-including those written into it directly before its capture existed. That
-install parks no marker on the root when nothing else needs one, so no
-discharge stages a recompute of every key of the source. Measured on the engine (a debug build, one runner), the correction
-of a `DROP`, `DETACH` or `TRUNCATE` of a leaf of 1M or of 10M rows over 1,560
-groups takes 27–34 ms and about 0.6 MB of WAL, whatever the leaf's rows; the
-correction of an `ATTACH` of such a leaf reads it twice, once for its groups and
+correction covers (an aggregate over the source, on the group basis or the
+ledger, and a definition reading it through a to-many relationship): the
+node's own correction covers its rows, including those written into it
+directly before its capture existed. That install parks no marker on the root
+when no other reader needs a catch-up, so no discharge stages a recompute of
+every key of the source. An install that also changes the capture functions,
+for a reader registered in the same pass, parks the marker as any install
+does, since its capture gate holds that reader until the rows the old
+functions staged have drained. Measured on the engine (a debug build, one
+runner), the correction of a `DROP`, `DETACH` or `TRUNCATE` of a leaf of 1M or
+of 10M rows over 1,560 groups takes 27–34 ms and about 0.6 MB of WAL, whatever
+the leaf's rows; the correction of an `ATTACH` of such a leaf reads it twice, once for its groups and
 once for their partials, 0.5–0.6 s at 1M rows and 3.9–4.7 s at 10M.
 
 A correction runs for each definition that reads the source, an aggregate over

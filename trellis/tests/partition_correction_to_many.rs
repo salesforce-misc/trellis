@@ -485,6 +485,75 @@ async fn a_new_leaf_parks_no_marker_and_leaves_the_reader_live() {
     assert_eq!(fx.wrong_parents().await, Vec::<String>::new());
 }
 
+/// #1147: an install that adds a new leaf and also widens the capture, for a
+/// reader registered in the same pass that reads a column the old functions
+/// don't image, still parks the root's marker with its capture gate. The
+/// gate holds the new reader until the rows the old functions staged, which
+/// lack the column, have drained (`capture::reconcile`'s rule 3).
+#[tokio::test]
+async fn a_new_leaf_installed_with_a_widen_keeps_the_capture_gate() {
+    let leaves = (0..4)
+        .map(|i| {
+            format!(
+                "create table public.items_p{i} partition of public.items \
+                 for values in ({}, {}, {}, {});",
+                i * 4,
+                i * 4 + 1,
+                i * 4 + 2,
+                i * 4 + 3
+            )
+        })
+        .collect::<String>();
+    let mut fx = Fx::start(&format!(
+        "create table public.orders (id integer primary key, label integer); \
+         insert into public.orders select i, i * 10 from generate_series(0, 19) i; \
+         create table public.items (id integer not null, order_id integer not null, \
+             v integer not null, w integer not null, primary key (order_id, id)) \
+             partition by list (order_id); \
+         {leaves} \
+         insert into public.items select i, i % 16, i, 2 from generate_series(1, 160) i;"
+    ))
+    .await;
+    // Staged by the old functions, which image no `w`, and left undrained.
+    fx.exec("insert into public.items select 1000 + i, i % 16, i, 5 from generate_series(1, 32) i")
+        .await;
+    let columns: std::collections::HashMap<String, ValueType> = [
+        ("id", ValueType::Numeric),
+        ("label", ValueType::Numeric),
+        ("order_id", ValueType::Numeric),
+        ("v", ValueType::Numeric),
+        ("w", ValueType::Numeric),
+    ]
+    .into_iter()
+    .map(|(name, ty)| (name.to_string(), ty))
+    .collect();
+    let widened = trellis::defs::install_definition(
+        fx.d.pool(),
+        "TRANSFORM widened FROM public.orders SELECT label AS label, SUM(lines.w) AS tw",
+        &columns,
+        "public",
+    )
+    .await
+    .expect("define a reader of a new column")
+    .id;
+    fx.exec("create table public.items_p4 partition of public.items for values in (16, 17)")
+        .await;
+    let outcome = fx.pass().await;
+    assert!(
+        !outcome.ready.contains(&widened),
+        "held by the gate: {:?}",
+        outcome.ready
+    );
+    assert_eq!(
+        fx.d.rows(
+            "select table_name from pending_backfill where capture_gate_lsn is not null \
+             order by 1"
+        )
+        .await,
+        ["(public.items)"]
+    );
+}
+
 /// A new sibling changes a `DEFAULT`'s text and takes no rows from it; a
 /// dropped sibling's items go, and the `DEFAULT`'s text grows.
 #[tokio::test]

@@ -613,43 +613,55 @@ async fn nodes_missing_capture(
         .collect())
 }
 
-/// Whether installing `table`'s capture only adds nodes new to its recorded
-/// tree to a root already captured: `table` is a partitioned root whose own
-/// five triggers are in place, calling its functions, and every node that
-/// lacks any of its triggers is absent, by oid, from the tree the reconcile
-/// pass recorded (`super::partitions::recorded`). A new or attached leaf is
-/// such a node, and the pass queues its correction
+/// Whether installing `spec`'s capture only adds nodes new to its table's
+/// recorded tree to a root already captured: the table is a partitioned root
+/// whose own five triggers are in place, calling its functions, which
+/// already are `spec`'s, and every node that lacks any of its triggers is
+/// absent, by oid, from the tree the reconcile pass recorded
+/// (`super::partitions::recorded`). A new or attached leaf is such a node,
+/// and the pass queues its correction
 /// (`crate::staging::partition_correction`), which a reader that engine
 /// serves takes instead of a rebuild and a whole-table catch-up
 /// (`crate::intake::markers::park_table_catch_ups`).
-/// A recorded node whose triggers were dropped by hand is not.
+///
+/// A recorded node whose triggers were dropped by hand is not. Neither is an
+/// install that also changes the functions (a reader registered in the same
+/// pass needs a column they don't image): its marker carries the capture
+/// gate that holds that reader until every row the old functions staged has
+/// drained (see "Widening and the capture gate").
 async fn adds_only_new_nodes(
     client: &impl GenericClient,
     schema: &str,
-    table: &str,
+    spec: &CaptureSpec,
 ) -> Result<bool, CaptureError> {
+    let table = spec.table();
     let Some(recorded) = super::partitions::recorded(client, table).await? else {
         return Ok(false);
     };
     let functions = function_names(table)?;
     let triggers = trigger_names(schema);
+    let sources: Vec<String> = CaptureEvent::ALL
+        .into_iter()
+        .map(|event| sql::function_source(schema, spec, event))
+        .collect();
     let root = crate::defs::ddl::regclass_arg(table);
     let row = client
         .query_one(
             &format!(
                 "select not exists ( \
-                     select 1 from unnest($2::text[], $4::text[]) as e(function, trigger) \
+                     select 1 from unnest($2::text[], $4::text[], $5::text[]) \
+                         as e(function, trigger, source) \
                      where not exists ( \
                          select 1 from pg_catalog.pg_trigger t \
                          join pg_catalog.pg_proc p on p.oid = t.tgfoid \
                          where t.tgrelid = pg_catalog.to_regclass($3) and t.tgname = e.trigger \
                            and not t.tgisinternal and t.tgenabled = 'A' \
-                           and p.proname = e.function \
+                           and p.proname = e.function and p.prosrc = e.source \
                            and p.pronamespace = ( \
                                select oid from pg_catalog.pg_namespace where nspname = $1))), \
                         array({NODE_OIDS_MISSING_CAPTURE})"
             ),
-            &[&schema, &functions, &root, &triggers],
+            &[&schema, &functions, &root, &triggers, &sources],
         )
         .await?;
     let root_captured: bool = row.get(0);
@@ -768,7 +780,7 @@ async fn install_tree(
     deadline: Option<Instant>,
 ) -> Result<Progress<()>, CaptureError> {
     let nodes = descendants(&*client, spec.table()).await?;
-    let new_nodes = adds_only_new_nodes(&*client, schema, spec.table()).await?;
+    let new_nodes = adds_only_new_nodes(&*client, schema, spec).await?;
     if nodes.len() < SINGLE_TRANSACTION_TABLES {
         let op = Op::Install {
             spec,
