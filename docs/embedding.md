@@ -145,13 +145,12 @@ So:
   works at `read committed`, `repeatable read` and `serializable`.
 * **Leave the capture triggers alone.** Each source table carries five
   triggers named after the instance schema (`trellis_capture_insert` and so on
-  for the default). Don't disable or drop them. The worker reinstalls a
-  missing or disabled one on its next reconcile pass, and `self_check` reports
-  a broken capture as a `capture` divergence before it compares any rows.
-  Replacing a capture function's body is a
-  [known correctness gap](known-correctness-gaps.md#8-operator-changes-inside-trellis-owned-artifacts),
-  as is disabling the triggers around a write
-  ([entry 5](known-correctness-gaps.md#5-capture-switched-off-and-back-on-between-two-reconcile-passes)).
+  for the default). Don't disable or drop them, or replace their functions.
+  The worker reinstalls a missing or disabled one on its next reconcile pass,
+  and `self_check` reports a broken capture as a `capture` divergence before
+  it compares any rows (known correctness gaps:
+  [Operator changes inside Trellis-owned artifacts](known-correctness-gaps.md#8-operator-changes-inside-trellis-owned-artifacts),
+  [Capture switched off and back on between two reconcile passes](known-correctness-gaps.md#5-capture-switched-off-and-back-on-between-two-reconcile-passes)).
 * **A long transaction can delay the triggers' install.** Installing or
   widening a table's triggers needs a brief table lock, which the worker
   retries every pass while a long transaction or an autovacuum holds the

@@ -271,7 +271,7 @@ Grant application roles `SELECT` on target tables and nothing more: no
 `INSERT`, `UPDATE`, `DELETE` or `TRUNCATE`, and never ownership. Only Trellis
 writes a target, and it doesn't correct a hand edit
 ([transforms — Target tables are Trellis-owned](transforms.md#target-tables-are-trellis-owned),
-[known correctness gaps, entry 8](known-correctness-gaps.md#8-operator-changes-inside-trellis-owned-artifacts)).
+[known correctness gaps — Operator changes inside Trellis-owned artifacts](known-correctness-gaps.md#8-operator-changes-inside-trellis-owned-artifacts)).
 A read-only grant turns a hand edit into a permission error instead of a
 silent divergence.
 

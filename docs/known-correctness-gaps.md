@@ -46,8 +46,8 @@ Each entry gives:
 * **Trigger**: what causes it.
 * **Effect**: what goes wrong, and whether it's silent.
 * **Detected?**: whether Trellis notices, automatically or through
-  `self_check`. Only 1-1 targets can be audited (entry 16), so "`self_check`"
-  below always means a plain 1-1 target.
+  `self_check`. Only 1-1 and `JOIN` targets can be audited (entry 16), and
+  each "Detected?" line names the targets its `self_check` covers.
 * **Planned work**: issues, branches and decisions that would close the gap.
 * **Repair**: what you can do today.
 
@@ -94,7 +94,7 @@ These are the tools the entries refer to:
   compares the target with a recompute of it in Postgres, a page of keys at a
   time ([ADR-0013](decisions/0013-self-check-production-recompute-audit.md));
   `self_check_job(id)` reads its progress and verdict. **It only audits 1-1
-  targets** (entry 16).
+  and `JOIN` targets** (entry 16).
 
 ## Summary
 
@@ -103,7 +103,7 @@ These are the tools the entries refer to:
 | 1 | `ALTER COLUMN … TYPE … USING` that rewrites values, with a metadata change to the same column in the same pass window, on a column added with a constant default whose table hasn't been rewritten since, on a column with a compression method set, or as a widening no copy outgrows | yes | `self_check` (1-1 targets only) | none; documented |
 | 3 | A source key re-collated while a `self_check` job runs | the job can skip or repeat keys | no | none filed |
 | 5 | Capture switched off and back on, or the table attached to a hierarchy and detached, between two reconcile passes | yes | `self_check` (1-1 targets only) | #707, study pending |
-| 8 | A manual change inside Trellis's artifacts: a target or hidden table edited or dropped, a capture function body replaced, DML, DDL or a data load into Trellis's schema, or a restore of that schema alone | yes | `self_check` (1-1 and `JOIN` targets); a missing ledger or group-delta table refuses a resume | #707 (capture function body); otherwise none; documented |
+| 8 | A manual change inside Trellis's artifacts: a target or hidden table edited or dropped, a capture function body replaced, DML, DDL or a data load into Trellis's schema, or a restore of that schema alone | yes | `self_check` (1-1 and `JOIN` targets, and a `JOIN`'s hidden tables); a missing ledger or group-delta table refuses a resume; a change to Trellis's schema: no | #707, study pending (capture function body); otherwise none; documented |
 | 9 | An application trigger re-keying a parent's join column within the statement | yes | no | #1115 removes relationships |
 | 10 | `REGEXP_COUNT` on `"C"`-collated data or with Postgres-only regex syntax | yes | `self_check` (1-1 targets only) | #643, with #575 |
 | 11 | Row-level security applying to a role Trellis runs as | only capture, for the ring owner, until the next reconcile pass; elsewhere reads and writes fail | drain, discharge, catch-up and build merge: pause what they reach; one the catalog can't pin shows on `drain_failure` (drain) or `backfill_failure` (discharge, catch-up), or, for a build merge, pauses on its fifth charge with the error on `capture_failure`; build chunk: `backfill_failure` | none |
@@ -257,7 +257,8 @@ Better still, don't disable the capture triggers
   its columns or key constraints, or dropping a table Trellis keeps beside it:
   `<target>__ledger`, an aggregate's `<target>__deltas`, or a hidden table in
   the catalog schema (a group-basis aggregate's partials table `agg_<id>`; a
-  `JOIN`'s `P`, `M`, `J` and `T` tables, and its lock row `join_<id>_*`).
+  `JOIN`'s `P`, `M`, `J` and `T` tables and its one-row lock table, named
+  `join_<id>_p`, `_m`, `_j`, `_t` and `_l`).
 * `CREATE OR REPLACE FUNCTION` on one of Trellis's capture functions, with a
   body that drops or alters what it stages. Disabling or dropping the capture
   triggers is [entry 5](#5-capture-switched-off-and-back-on-between-two-reconcile-passes).
@@ -298,11 +299,16 @@ Better still, don't disable the capture triggers
     Restoring the application's schemas alone is
     [entry 13](#13-partial-restores-and-schema-only-loads).
 
-**Detected?** `self_check` reports an edited 1-1 or `JOIN` target, and audits
-a `JOIN`'s hidden tables, but nothing reports a hand edit of an aggregate or
-relationship-enriched target. The function is restored, but the lost writes
-aren't detected automatically; `self_check`'s comparison reports the stale
-rows on 1-1 targets. A change to Trellis's schema isn't detected.
+**Detected?**
+
+* **Target and side tables.** `self_check` reports an edited 1-1 or `JOIN`
+  target, and compares each of a `JOIN`'s `P`, `M`, `J` and `T` tables
+  against the source tables. For aggregate and relationship-enriched
+  targets, see [entry 16](#16-self_check-audits-1-1-targets-only).
+* **A capture function body.** The function is restored, but the lost writes
+  aren't detected automatically. `self_check`'s comparison reports the stale
+  rows on 1-1 targets.
+* **Trellis's schema.** Not detected.
 
 **Planned work:** none for the edits. This is a documented rule
 ([transforms — Target tables are Trellis-owned](transforms.md#target-tables-are-trellis-owned)).
@@ -311,13 +317,21 @@ the repair re-read the table the way a reinstall does.
 
 **Repair:**
 
-* `PAUSE`/`RESUME` the transform. If its columns or constraints were changed,
-  or a table Trellis keeps beside it was dropped, `DROP TRANSFORM` and define
-  it again. A resume drops and recreates a `JOIN`'s hidden tables.
-* After a capture function body replaced by hand, `request_backfill` the
-  table, or `PAUSE`/`RESUME` its readers.
-* After a change to Trellis's schema, restore the whole database from one
-  backup, or drop the transforms and define them again.
+* **Target and side tables.** `PAUSE`/`RESUME` the transform. A resume drops
+  and recreates a `JOIN`'s hidden tables, so it also repairs one that was
+  edited or dropped. It doesn't recreate the other side tables: if the
+  target's columns or constraints were changed, or its `<target>__ledger`,
+  `<target>__deltas` or `agg_<id>` table was dropped, `DROP TRANSFORM` and
+  define it again. An edited `agg_<id>` is repaired by `request_backfill` of
+  the source, which recomputes every group's partials and visible row from
+  it.
+* **A capture function body.** `request_backfill` the table, or
+  `PAUSE`/`RESUME` its readers.
+* **Trellis's schema.** Restore the whole database from a backup taken before
+  the change, or `DROP TRANSFORM` every transform and define it again, which
+  rebuilds each target from its sources. A target the changed catalog has no
+  definition for is a plain table to Trellis, and defining it again fails
+  with a `conflict` error until you drop it.
 
 ## 9. An application trigger re-keying a parent's join column within the statement
 
