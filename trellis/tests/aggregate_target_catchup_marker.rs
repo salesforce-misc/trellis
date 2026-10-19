@@ -264,9 +264,13 @@ async fn catchup_marker_on_an_aggregate_target_feeding_a_one_to_one_discharges()
     drain_to_quiescence(&db.pool, &mut client).await;
     assert_eq!(
         by_sku(&client, "sku_totals_echo", "echo_total").await,
-        HashMap::from([(some("a"), some("100")), (some("b"), some("2"))]),
+        HashMap::from([
+            (some("a"), some("100")),
+            (some("b"), some("2")),
+            (None, some("6"))
+        ]),
         "the enumeration's keys reach the 1-1 target (the change to 'a' is folded in), and the \
-         NULL-keyed group still has no representable row there"
+         NULL-keyed group has its row there, keyed by a real NULL (issue #1141)"
     );
 }
 

@@ -31,12 +31,11 @@
 //! `discover_pk_ranges`' candidate window outright (`<col> is not null`,
 //! for every key column) — a no-op for a genuine `PRIMARY KEY` (always
 //! `NOT NULL`), and, for the nullable fallback case, it keeps such a row out
-//! of both the paging window and the boundary itself. That matches this
-//! build's own invariant that a `NULL`-keyed group can never be represented
-//! in a 1-1 target (whose own primary key is unconditionally `NOT NULL`):
-//! `stock_echo` backfills to hold every real group and nothing for the
-//! `NULL`-`sku` one, the same answer `sku_totals_echo` already got via the
-//! live-apply path in `one_to_one_chained_off_nullable_aggregate_group_key.rs`.
+//! of both the paging window and the boundary itself. No range reaches the
+//! `NULL`-`sku` group, so the build's plan stages it into the ring instead
+//! (`staging::build`'s `stage_null_keys`), and the drain writes its row:
+//! `stock_echo` is keyed `UNIQUE NULLS NOT DISTINCT` like `stock_totals`,
+//! so it holds that group (issue #1141).
 //!
 //! [`KeySpace::OneToOne`]: trellis::defs::ast::KeySpace::OneToOne
 
@@ -67,14 +66,14 @@ fn columns(pairs: &[(&str, ValueType)]) -> HashMap<String, ValueType> {
 }
 
 /// A plain [`KeySpace::OneToOne`] chained onto a composite aggregate `GROUP
-/// BY` key must not panic (and must correctly omit the `NULL`-keyed group)
-/// when it backfills from scratch over a source that already has a group
-/// keyed partly `NULL` — see this file's own doc comment for exactly which
-/// row shape triggers the bug this pins.
+/// BY` key must not panic when it backfills from scratch over a source that
+/// already has a group keyed partly `NULL` — see this file's own doc comment
+/// for exactly which row shape triggers the bug this pins — and ends holding
+/// that group's row once the key its plan staged drains.
 ///
 /// [`KeySpace::OneToOne`]: trellis::defs::ast::KeySpace::OneToOne
 #[tokio::test]
-async fn backfill_across_a_composite_nullable_group_key_skips_the_null_group_without_panicking() {
+async fn backfill_across_a_composite_nullable_group_key_writes_the_null_group_without_panicking() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let client = connect_raw(db.dsn()).await;
@@ -158,11 +157,12 @@ async fn backfill_across_a_composite_nullable_group_key_skips_the_null_group_wit
         .expect("count rows staged for the chained source")
         .get(0);
     assert_eq!(
-        staged, 0,
-        "the chunked build of the chained transform stages nothing"
+        staged, 1,
+        "the build stages the one key no range reaches: the NULL-sku group's"
     );
+    drain_to_quiescence(&db.pool, db.dsn()).await;
 
-    let echo_rows: HashMap<(String, String), Option<String>> = client
+    let echo_rows: HashMap<(String, Option<String>), Option<String>> = client
         .query("select warehouse, sku, echo_qty::text from stock_echo", &[])
         .await
         .expect("read stock_echo")
@@ -172,11 +172,53 @@ async fn backfill_across_a_composite_nullable_group_key_skips_the_null_group_wit
     assert_eq!(
         echo_rows,
         HashMap::from([
-            (("a".to_string(), "x".to_string()), Some("5".to_string())),
-            (("a".to_string(), "y".to_string()), Some("7".to_string())),
+            (
+                ("a".to_string(), Some("x".to_string())),
+                Some("5".to_string())
+            ),
+            (
+                ("a".to_string(), Some("y".to_string())),
+                Some("7".to_string())
+            ),
+            (("z".to_string(), None), Some("2".to_string())),
         ]),
-        "the NULL-sku group must never appear in the chained target — \
-         stock_echo's own primary key is a real NOT NULL column, so no row \
-         can ever represent that group there"
+        "the NULL-sku group has its row in the chained target, keyed by a \
+         real NULL (issue #1141)"
     );
+}
+
+/// Seals and drains until nothing is pending anywhere in the ring.
+async fn drain_to_quiescence(pool: &trellis::Pool, dsn: &str) {
+    let mut client = connect_raw(dsn).await;
+    let watermark = trellis::staging::StagedWatermark::saturated();
+    for _ in 0..16 {
+        trellis::staging::seal_if_active_nonempty(&mut client, "nullable_group_key_wake")
+            .await
+            .expect("seal");
+        while let Some(seg) = trellis::staging::apply::next_claimable_segment(&client)
+            .await
+            .expect("next claimable segment")
+        {
+            trellis::staging::apply::drain_once(
+                pool,
+                seg,
+                "drainer",
+                1,
+                "nullable_group_key_wake",
+                &watermark,
+            )
+            .await
+            .expect("drain_once");
+        }
+        trellis::staging::retire_drained_segments(&mut client)
+            .await
+            .expect("retire drained segments");
+        if !trellis::staging::has_pending(&client)
+            .await
+            .expect("has_pending")
+        {
+            return;
+        }
+    }
+    panic!("the ring did not quiesce within 16 seal/drain rounds");
 }

@@ -28,7 +28,10 @@
 //! "introspect the whole source schema" question the catalog module (#23)
 //! left open), at whatever arity the source declares it: a composite
 //! (multi-column) source primary key mirrors onto the target as a real,
-//! composite `primary key (...)` table constraint (issue #121) — every
+//! composite `primary key (...)` table constraint (issue #121), and a source
+//! keyed by a nullable unique index (an aggregate or `JOIN` target's `GROUP
+//! BY` columns) gives the target the same `unique nulls not distinct` key
+//! over its nullable columns (issue #1141) — every
 //! consumer of a 1-1 target's own key (this DDL, `defs::backfill`'s
 //! key-range-chunked direct build, `staging::apply`'s live CDC apply,
 //! `staging::quarantine`'s recompute, `staging::self_check`'s divergence
@@ -148,10 +151,11 @@ pub struct PrimaryKeyColumn {
     /// `false` for every real `PRIMARY KEY` column (Postgres makes a primary
     /// key's columns `NOT NULL` unconditionally) and for the all-`NOT NULL`
     /// `UNIQUE` index [`source_primary_key`] also accepts. `true` only for
-    /// the `UNIQUE NULLS NOT DISTINCT` grouping-column constraint
+    /// a column of a `UNIQUE NULLS NOT DISTINCT` key: the grouping columns
     /// [`create_aggregate_target_table`] puts on an aggregate target, whose
-    /// `GROUP BY` columns are deliberately nullable — issue #110's whole
-    /// subject.
+    /// `GROUP BY` columns are deliberately nullable (issue #110's whole
+    /// subject), and the same columns of a 1-1 target over such a source
+    /// ([`target_table_ddl`], issue #1141).
     pub nullable: bool,
     /// The collation the key's index orders this column by, as a quoted,
     /// qualified name ready to interpolate after `collate`
@@ -728,9 +732,11 @@ const KEY_PART_ESCAPE: char = '\u{1e}';
 /// Note this exemption is *only* about this separator/escape layer. Issue
 /// #110's [`NULL_KEY_SENTINEL`] layer has no arity exemption at all: a
 /// nullable arity-1 key (a single-column aggregate `GROUP BY`) still gets
-/// the full [`encode_key_part`] treatment, because a nullable column is
-/// never a 1-1 target's primary key in the first place. The two decisions
-/// are independent — see [`COMPOSITE_KEY_SEPARATOR`]'s composition section.
+/// the full [`encode_key_part`] treatment. A 1-1 target keyed by such a
+/// column (issue #1141) never stores the encoded text: the write path
+/// decodes it back to the value, `NULL` included ([`split_pk_key`]). The
+/// two decisions are independent — see [`COMPOSITE_KEY_SEPARATOR`]'s
+/// composition section.
 fn push_escaped_composite_key_part(out: &mut String, part: &str) {
     for ch in part.chars() {
         if ch == COMPOSITE_KEY_SEPARATOR || ch == KEY_PART_ESCAPE {
@@ -869,7 +875,8 @@ pub(crate) fn null_key_escape_sql(col_text: &str) -> String {
 /// This encoding is applied to a key component **if and only if that
 /// component's key column is nullable** ([`PrimaryKeyColumn::nullable`]) —
 /// in practice, only an aggregate target's `UNIQUE NULLS NOT DISTINCT`
-/// `GROUP BY` columns ([`create_aggregate_target_table`]). A
+/// `GROUP BY` columns ([`create_aggregate_target_table`]) and a 1-1
+/// target's over them ([`target_table_ddl`]). A
 /// `NOT NULL` key column — every real `PRIMARY KEY`, and the all-`NOT NULL`
 /// `UNIQUE` index [`source_primary_key`] also accepts — keeps its raw
 /// `col::text` instead, with no substitution and no escape.
@@ -891,7 +898,6 @@ pub(crate) fn null_key_escape_sql(col_text: &str) -> String {
 /// literal U+0001 (see `trellis/tests/one_to_one_control_char_pk.rs`). Since a not-null key can
 /// never *need* the `NULL` substitution, the only safe encoding for it is
 /// the identity one.
-#[cfg(test)]
 pub(crate) fn encode_key_part(value: Option<&str>) -> Cow<'_, str> {
     match value {
         None => Cow::Borrowed(NULL_KEY_SENTINEL),
@@ -1079,6 +1085,23 @@ pub(crate) fn join_pk_key<S: AsRef<str>>(parts: impl IntoIterator<Item = S>) -> 
         push_escaped_composite_key_part(&mut out, part.as_ref());
     }
     out
+}
+
+/// One row's key text from its decoded parts, `None` for a `NULL` part: the
+/// exact inverse of [`split_pk_key`], and the text [`pk_key_sql_expr`]
+/// renders for the same row. A nullable column's part goes through
+/// [`encode_key_part`], a `NOT NULL` column's is its own text (a `None`
+/// there can't come from [`split_pk_key`]; it renders as the empty string),
+/// and the parts are joined by [`join_pk_key`].
+pub(crate) fn encode_pk_key<S: AsRef<str>>(pk: &[PrimaryKeyColumn], parts: &[Option<S>]) -> String {
+    join_pk_key(pk.iter().zip(parts).map(|(column, part)| {
+        let part = part.as_ref().map(AsRef::as_ref);
+        if column.nullable {
+            encode_key_part(part)
+        } else {
+            Cow::Borrowed(part.unwrap_or_default())
+        }
+    }))
 }
 
 /// Splits `key` into its raw (still-escaped) [`COMPOSITE_KEY_SEPARATOR`]-
@@ -1607,8 +1630,9 @@ fn quote_qualified_ident(qualified: &str) -> String {
     }
 }
 
-/// Creates `def`'s neighbor target table with `pk` as its primary key and
-/// one column per calculated field — failing if a relation with that name
+/// Creates `def`'s neighbor target table keyed by `pk` (a `primary key`, or
+/// `unique nulls not distinct` when a column of `pk` is nullable, see
+/// [`target_table_ddl`]) and one column per calculated field — failing if a relation with that name
 /// already exists (issue #440: Trellis never adopts a table it didn't
 /// create). Renders the statement with [`target_table_ddl`] and runs it on
 /// its own connection; `catalog::install_definition` instead runs that
@@ -1706,6 +1730,14 @@ pub(crate) async fn target_table_ddl(
     // source key's collation explicitly, so it selects the same keys on
     // both sides whatever the target's collation is; the target's index
     // serves the chunk through its `= any(keys)` filter either way.
+    // The target's identity is the source's (issue #1141). A source key with
+    // a nullable column (an aggregate or `JOIN` target's `GROUP BY` columns)
+    // keys the target by `unique nulls not distinct`, so a group with a
+    // `NULL` part has its row here too, each key column as nullable as it is
+    // on the source; any other key is a `primary key`. Mirroring each
+    // column's nullability keeps the target's own key text
+    // (`pk_key_sql_expr`, when a definition reads it in turn) the source's.
+    let nullable_key = pk.iter().any(|c| c.nullable);
     let pk_cols: Vec<String> = pk
         .iter()
         .map(|c| {
@@ -1714,7 +1746,16 @@ pub(crate) async fn target_table_ddl(
                 .as_ref()
                 .map(|collation| format!(" collate {collation}"))
                 .unwrap_or_default();
-            format!("{} {}{collate}", quote_ident(&c.name), c.data_type)
+            let not_null = if nullable_key && !c.nullable {
+                " not null"
+            } else {
+                ""
+            };
+            format!(
+                "{} {}{collate}{not_null}",
+                quote_ident(&c.name),
+                c.data_type
+            )
         })
         .collect();
     sql.push_str(&pk_cols.join(", "));
@@ -1722,13 +1763,15 @@ pub(crate) async fn target_table_ddl(
         let pg_type = &field_pg_types[&field.name];
         sql.push_str(&format!(", {} {}", quote_ident(&field.name), pg_type));
     }
-    // A table-level `primary key (...)` constraint, not an inline
-    // column-level one — works uniformly for one column or several (issue
-    // #121: a composite source primary key mirrors onto the target as a
-    // real composite primary key, the same way a single-column one already
-    // did before this issue).
+    // A table-level constraint, not an inline column-level one: it works
+    // uniformly for one column or several (issue #121).
     let pk_names: Vec<String> = pk.iter().map(|c| quote_ident(&c.name)).collect();
-    sql.push_str(&format!(", primary key ({})", pk_names.join(", ")));
+    let constraint = if nullable_key {
+        "unique nulls not distinct"
+    } else {
+        "primary key"
+    };
+    sql.push_str(&format!(", {constraint} ({})", pk_names.join(", ")));
     sql.push(')');
     // #623 D2: the target's ledger, created with it.
     sql.push_str(&super::ledger::one_to_one_ledger_ddl(

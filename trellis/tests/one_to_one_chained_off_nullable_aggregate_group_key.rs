@@ -17,21 +17,16 @@
 //! decode, binding the still-encoded staged key text straight in as
 //! `sku_totals_echo`'s own literal primary-key value: for a `NULL`-keyed
 //! `sku` group, that meant storing the literal sentinel character (`chr(1)`)
-//! as a real, non-`NULL` `sku` value — a phantom row no from-scratch backfill
-//! would ever produce (`defs::backfill::discover_pk_ranges`'s ordered
-//! `(lo, hi]` PK-range walk structurally never surfaces a `NULL`-keyed source
-//! row, and `sku_totals_echo`'s own primary key is a real `primary key`
-//! column, which Postgres makes `NOT NULL` unconditionally, so no row can
-//! *ever* represent that group there — the only backfill-consistent answer is
-//! "no row").
+//! as a real, non-`NULL` `sku` value: a phantom row keyed by text no source
+//! row has.
 //!
 //! The fix decodes `write.pk_text`/`delete.pk_text` through
-//! `ddl::split_pk_key` before binding/matching it as a literal PK value:
-//! `None` (a genuine `NULL`-keyed group) is now recognized and the key is
-//! simply skipped (no row can represent it, matching backfill), and a real,
-//! non-`NULL` group value that happens to contain a literal U+0001 is
-//! unescaped back to its single-character form instead of being stored
-//! doubled.
+//! `ddl::split_pk_key` before binding/matching it as a literal key value:
+//! `None` (a genuine `NULL`-keyed group) is written and matched as a real
+//! SQL `NULL`, which `sku_totals_echo`'s `UNIQUE NULLS NOT DISTINCT` key
+//! holds (issue #1141), and a real, non-`NULL` group value that happens to
+//! contain a literal U+0001 is unescaped back to its single-character form
+//! instead of being stored doubled.
 //!
 //! [`KeySpace::OneToOne`]: trellis::defs::ast::KeySpace::OneToOne
 
@@ -195,11 +190,12 @@ async fn sku_totals(client: &Client) -> HashMap<Option<String>, Option<String>> 
         .collect()
 }
 
-/// `sku -> echo_total`, including a row whose `sku` is literally the
-/// `ddl::NULL_KEY_SENTINEL` character (`chr(1)`) — the corrupted shape this
-/// issue is about — so a test can assert its *absence* directly rather than
-/// only asserting the correct rows are present.
-async fn sku_totals_echo(client: &Client) -> HashMap<String, Option<String>> {
+/// `sku -> echo_total`, including the `NULL`-keyed group and a row whose
+/// `sku` is literally the `ddl::NULL_KEY_SENTINEL` character (`chr(1)`) —
+/// the corrupted shape issue #205 is about — so a test can assert its
+/// *absence* directly rather than only asserting the correct rows are
+/// present.
+async fn sku_totals_echo(client: &Client) -> HashMap<Option<String>, Option<String>> {
     client
         .query("select sku, echo_total::text from sku_totals_echo", &[])
         .await
@@ -236,8 +232,8 @@ async fn install_the_chain(db: &testkit::TestDatabase, client: &mut Client) {
     assert_eq!(
         sku_totals_echo(client).await,
         HashMap::from([
-            ("a".to_string(), Some("12".to_string())),
-            ("b".to_string(), Some("2".to_string())),
+            (Some("a".to_string()), Some("12".to_string())),
+            (Some("b".to_string()), Some("2".to_string())),
         ]),
         "from-scratch backfill of the chained 1-1 target"
     );
@@ -246,15 +242,14 @@ async fn install_the_chain(db: &testkit::TestDatabase, client: &mut Client) {
 /// Issue #205's exact repro: a brand-new `NULL`-keyed `sales` row creates a
 /// `NULL`-keyed group in `sku_totals` (already correct, per issue #110's
 /// fix — asserted here only as a sanity check), which must then propagate
-/// into `sku_totals_echo` *without* ever materializing a row keyed by the
-/// literal sentinel text.
+/// into `sku_totals_echo` as a row keyed by a real `NULL` (issue #1141),
+/// never by the literal sentinel text.
 ///
 /// Grows the `NULL` group with a second row (exercising the delta path, not
 /// just from-scratch creation) and then extinguishes it entirely, checking
-/// after every step that `sku_totals_echo` never gains a `chr(1)`-keyed row
-/// and its row count never exceeds the two real (`a`, `b`) groups.
+/// after every step that `sku_totals_echo` never gains a `chr(1)`-keyed row.
 #[tokio::test]
-async fn a_null_keyed_upstream_group_never_stores_the_sentinel_in_the_chained_target() {
+async fn a_null_keyed_upstream_group_reaches_the_chained_target_keyed_by_a_real_null() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
@@ -284,24 +279,15 @@ async fn a_null_keyed_upstream_group_never_stores_the_sentinel_in_the_chained_ta
          maintained correctly at the aggregate level"
     );
 
-    let echo_rows = sku_totals_echo(&client).await;
     assert_eq!(
-        echo_rows,
+        sku_totals_echo(&client).await,
         HashMap::from([
-            ("a".to_string(), Some("12".to_string())),
-            ("b".to_string(), Some("2".to_string())),
+            (Some("a".to_string()), Some("12".to_string())),
+            (Some("b".to_string()), Some("2".to_string())),
+            (None, Some("6".to_string())),
         ]),
-        "issue #205: the NULL-keyed group's creation must not add any row to \
-         the chained 1-1 target — sku_totals_echo's own primary key is a \
-         real NOT NULL column, so no row can ever represent this group there \
-         (the same answer a from-scratch backfill would give); before the \
-         fix this asserted a spurious third row keyed by the literal \
-         sentinel character instead"
-    );
-    assert_eq!(
-        echo_rows.len(),
-        2,
-        "no phantom row for the NULL group, however it's keyed"
+        "the NULL-keyed group's creation adds its row to the chained 1-1 \
+         target, keyed by a real NULL and never by the sentinel character"
     );
 
     // Growth: a second NULL-keyed row arrives, exercising the delta
@@ -329,11 +315,11 @@ async fn a_null_keyed_upstream_group_never_stores_the_sentinel_in_the_chained_ta
     assert_eq!(
         sku_totals_echo(&client).await,
         HashMap::from([
-            ("a".to_string(), Some("12".to_string())),
-            ("b".to_string(), Some("2".to_string())),
+            (Some("a".to_string()), Some("12".to_string())),
+            (Some("b".to_string()), Some("2".to_string())),
+            (None, Some("10".to_string())),
         ]),
-        "issue #205: growing the NULL-keyed group must still not add any row \
-         to the chained 1-1 target"
+        "growing the NULL-keyed group updates its row in the chained target"
     );
 
     // Extinction: deleting both rows removes the group entirely upstream.
@@ -369,11 +355,10 @@ async fn a_null_keyed_upstream_group_never_stores_the_sentinel_in_the_chained_ta
     assert_eq!(
         sku_totals_echo(&client).await,
         HashMap::from([
-            ("a".to_string(), Some("12".to_string())),
-            ("b".to_string(), Some("2".to_string())),
+            (Some("a".to_string()), Some("12".to_string())),
+            (Some("b".to_string()), Some("2".to_string())),
         ]),
-        "issue #205: the NULL group's extinction leaves sku_totals_echo \
-         exactly as it started — it never had a row to remove"
+        "the NULL group's extinction removes its row from the chained target"
     );
 }
 

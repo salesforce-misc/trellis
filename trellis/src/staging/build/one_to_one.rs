@@ -16,8 +16,8 @@
 //! `super::super::one_to_one_ledger`), as it orders a page against a page:
 //!
 //! 1. read the keys in the range, leaving out the ones quarantined for the
-//!    definition (`poison`, #799) and any with a `NULL` part, as the old 1-1
-//!    range build did;
+//!    definition (`poison`, #799) and any with a `NULL` part, which the
+//!    plan job stages into the ring instead (`super::stage_null_keys`);
 //! 2. lock their entries in key order (`one_to_one_ledger::lock_entries`:
 //!    an entry for each key with none, then the others `for update`), under
 //!    the build's short [`super::CHUNK_LOCK_TIMEOUT`];
@@ -244,8 +244,9 @@ async fn run_range(
     let mut params = crate::defs::backfill::range_params(&lo, &hi);
 
     // 1. The keys in the range, but for the quarantined ones (#616, #625
-    // F-A5) and any with a `NULL` part (no target row can hold one), as the
-    // old range build's write and `fail_chunk`'s narrowing count them.
+    // F-A5) and any with a `NULL` part, as the old range build's write and
+    // `fail_chunk`'s narrowing count them: the plan stages those
+    // (`super::stage_null_keys`).
     let started = Instant::now();
     let source_param = format!("${}", params.len() + 1);
     let target_param = format!("${}", params.len() + 2);
@@ -474,42 +475,40 @@ pub async fn sweep_batch(
 
     // The source and the target are read by their typed key columns, so
     // each is one index probe per key: `$1` is the keys' `text[]`, `$2..`
-    // one `text[]` per key column.
-    let mut parts = vec![Vec::with_capacity(keys.len()); plan.pk.len()];
+    // one `text[]` per key column. A key with a `NULL` part (a source keyed
+    // by a nullable unique index, issue #1141) is matched by `is null` on
+    // that column, which the index serves where `is not distinct from`
+    // can't, so the keys are re-derived a statement per `NULL` pattern
+    // (`pattern[i]`: part `i` is `NULL`), each binding only its non-`NULL`
+    // columns.
+    let mut patterns: std::collections::BTreeMap<Vec<bool>, PatternKeys<'_>> =
+        std::collections::BTreeMap::new();
     for key in &key_refs {
         let split = ddl::split_pk_key(&plan.pk, &plan.source_table, key)?;
-        for (column, part) in parts.iter_mut().zip(split) {
-            column.push(part.map(|p| p.into_owned()));
+        let pattern: Vec<bool> = split.iter().map(Option::is_none).collect();
+        let (pattern_keys, parts) = patterns.entry(pattern).or_insert_with_key(|pattern| {
+            (
+                Vec::new(),
+                vec![Vec::new(); pattern.iter().filter(|null| !**null).count()],
+            )
+        });
+        pattern_keys.push(key);
+        for (column, part) in parts.iter_mut().zip(split.into_iter().flatten()) {
+            column.push(part.into_owned());
         }
     }
-    let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&key_refs];
-    for part in &parts {
-        params.push(part);
+    let mut outcome = OneToOneOutcome::default();
+    for (pattern, (pattern_keys, parts)) in &patterns {
+        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![pattern_keys];
+        for part in parts {
+            params.push(part);
+        }
+        let pick = sweep_pick(plan, pattern);
+        let done = rederive(txn, plan, None, &pick, &params, pattern_keys.len()).await?;
+        outcome.keys += done.keys;
+        outcome.written += done.written;
+        outcome.deleted += done.deleted;
     }
-    let arrays: Vec<String> = plan
-        .pk
-        .iter()
-        .enumerate()
-        .map(|(i, column)| format!("${}::text[]::{}[]", i + 2, column.data_type))
-        .collect();
-    let columns: Vec<String> = (0..plan.pk.len())
-        .map(|i| format!("__trellis_p{i}"))
-        .collect();
-    let typed = format!("unnest({}) as u({})", arrays.join(", "), columns.join(", "));
-    let on = |alias: &str| -> String {
-        plan.pk
-            .iter()
-            .enumerate()
-            .map(|(i, column)| format!("{alias}.{} = u.__trellis_p{i}", quote_ident(&column.name)))
-            .collect::<Vec<_>>()
-            .join(" and ")
-    };
-    let pick = Pick {
-        src_from: format!("join {typed} on {}", on("s")),
-        target_where: format!("exists (select 1 from {typed} where {})", on("t")),
-        keys: "$1".to_string(),
-    };
-    let outcome = rederive(txn, plan, None, &pick, &params, keys.len()).await?;
     crate::instance_log::debug!(
         target_table = %plan.target,
         scanned,
@@ -525,6 +524,58 @@ pub async fn sweep_batch(
         next,
         finished,
     })
+}
+
+/// One `NULL` pattern's keys in a sweep batch: the keys, and their
+/// non-`NULL` parts, one array per such column in key order.
+type PatternKeys<'a> = (Vec<&'a str>, Vec<Vec<String>>);
+
+/// How a sweep batch picks the rows of its keys of one `NULL` pattern
+/// (`pattern[i]`: part `i` is `NULL`): by `is null` on a `NULL` part's
+/// column, and on the others by a keyset of their typed parts (`$2..`, one
+/// `text[]` per non-`NULL` column, in key order), `$1` being the keys.
+fn sweep_pick(plan: &OneToOnePlan, pattern: &[bool]) -> Pick {
+    let mut arrays = Vec::new();
+    let mut columns = Vec::new();
+    let mut matched: Vec<(String, Option<String>)> = Vec::new();
+    for (column, null) in plan.pk.iter().zip(pattern) {
+        let ident = quote_ident(&column.name);
+        if *null {
+            matched.push((ident, None));
+        } else {
+            let alias = format!("__trellis_p{}", arrays.len());
+            arrays.push(format!(
+                "${}::text[]::{}[]",
+                arrays.len() + 2,
+                column.data_type
+            ));
+            matched.push((ident, Some(alias.clone())));
+            columns.push(alias);
+        }
+    }
+    let on = |alias: &str| -> String {
+        matched
+            .iter()
+            .map(|(ident, part)| match part {
+                Some(part) => format!("{alias}.{ident} = u.{part}"),
+                None => format!("{alias}.{ident} is null"),
+            })
+            .collect::<Vec<_>>()
+            .join(" and ")
+    };
+    if arrays.is_empty() {
+        return Pick {
+            src_from: format!("where {}", on("s")),
+            target_where: on("t"),
+            keys: "$1".to_string(),
+        };
+    }
+    let typed = format!("unnest({}) as u({})", arrays.join(", "), columns.join(", "));
+    Pick {
+        src_from: format!("join {typed} on {}", on("s")),
+        target_where: format!("exists (select 1 from {typed} where {})", on("t")),
+        keys: "$1".to_string(),
+    }
 }
 
 /// A 1-1 chunk's or sweep batch's entry lock

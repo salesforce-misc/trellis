@@ -28,7 +28,7 @@ a key, index or policy itself.
 | A partitioned root with more than 1,000 leaves, or on PostgreSQL before 15 | Yes, stating the limit. No build statement prunes, so each one plans, locks and opens every leaf, and the default lock table runs out for one statement somewhat above 1,000. | n/a | Merge partitions to 1,000 or fewer leaves, or upgrade the server. |
 | A partitioned root as a 1-1 transform's `FROM`, or as the to-side of a to-one relationship | Yes. A 1-1 target over a partitioned source would need its own partitioning, and partitioned targets are not supported. | n/a | Aggregate over the partitioned table instead, or use a plain table. |
 | A partitioned root of a servable shape (every row above passes) | Yes, as `PartitionedSourceNotCaptured`. Capture covers every node of the tree. The reconcile pass queues a correction for each partition attached, detached, dropped or truncated, and for groups in a target that route to no partition, and an aggregate re-derives each correction's keys while it reports `backfilling`. A count through a to-many relationship whose to-side is the partitioned table is corrected by recomputing the routed parents, and the definition reports `backfilling` until those recomputes are applied. | After a dump and restore of the database, the next reconcile pass pauses every transform that reads a partitioned source, with a `capture_failure` naming the restore, and runs no correction queued before it. A `pg_upgrade`, or the root dropped and recreated or swapped in by renames, is no restore. | Use a plain table. After a restore, `RESUME`, which rebuilds. |
-| An aggregate target used as a source (it has no primary key: its identity is a `UNIQUE NULLS NOT DISTINCT` constraint) | Yes, for another Trellis instance. Inside the owning instance it can be chained off, because writes to a target reach its readers in the writing transaction, never through capture triggers. | n/a | Group over a 1-1 transform, or chain within the instance ([instance-identity](instance-identity.md)). |
+| An aggregate target, or a 1-1 target over one, used as a source (it has no primary key: its identity is a `UNIQUE NULLS NOT DISTINCT` constraint) | Yes, for another Trellis instance. Inside the owning instance it can be chained off, because writes to a target reach its readers in the writing transaction, never through capture triggers. | n/a | Group over a 1-1 transform, or chain within the instance ([instance-identity](instance-identity.md)). |
 | Row-level security that applies to a role Trellis runs as (#745, #765, #766) on a source, on a relationship's to-side, or on a target. Policies apply to a role when RLS is enabled and the role neither owns the table (directly or through membership) nor has `BYPASSRLS`, or owns it and the table is `FORCE ROW LEVEL SECURITY`. A superuser is exempt. Every Trellis connection runs with `row_security = off`, so a read or write the policies would filter fails rather than skipping rows. | Yes, checked for the role that owns the ring, and for the defining role on a to-one to-side and on a table that is another transform's target. Define checks before it widens the relationship's projection, its first read of the to-side, so this refusal comes ahead of the cycle, key, collation and unkeyed-source checks. Declaring a to-one relationship is refused when the to-side's policies apply to the session's role, since declaring fills the relationship's projection from it. | For the ring's owner, the staging worker's reconcile pass pauses every transform that reads the table (or, for a target, the transform that writes it), with the reason in `status()`'s `capture_failure`, and `self_check` reports a `capture` divergence. For a role a drain logs in as, its refused read or write pauses the same transforms, and everything downstream of them, with `capture_failure` of kind `halt`. So does a backfill discharge or go-live catch-up whose read the staging worker's role is refused, and a Re-derive build's group-delta merge whose write a drain's role is refused. A refused build chunk pauses its transform after its charged retries, with the error on `backfill_failure`. The window before the pass, and the refusals that only log or retry: [gap 11](known-correctness-gaps.md#11-row-level-security-on-a-role-trellis-runs-as). | Give the role `BYPASSRLS` (not inherited), or make it the table's owner without `FORCE ROW LEVEL SECURITY`; then `RESUME`. |
 | A table a logical-replication subscription in the same database replicates into (#751) | Yes, in any sync state, including a disabled subscription. The subscription's apply worker fires only row-level triggers, so its changes never reach capture. Publishing a table to another database is fine. | Paused and reported as for RLS on the ring's owner. | Remove the table from the publication and `ALTER SUBSCRIPTION … REFRESH PUBLICATION`, or drop the subscription; then `RESUME`. |
 | A nondeterministic collation (an ICU collation with `deterministic = false`) on a key column: a source primary key, a `GROUP BY` key (including a relationship path's to-side column), a relationship join column or an endpoint's primary key (#638). Also on a column passed to `STRPOS` or `REGEXP_COUNT`, directly or through `COALESCE`, another field or a relationship path. | Yes, for the definition, the relationship, and an `ALTER TRANSFORM` that adds or alters such a field. Trellis matches keys by exact text; such a collation's `=` would fold keys it keeps apart. `CHAR_LENGTH` and `OCTET_LENGTH` accept any column. | On a key column, the staging worker pauses every transform that keys by it, with the reason in `status()`'s `capture_failure`, and `RESUME` refuses until it's deterministic again. On a column only a text function reads: not detected. | Keep the column's collation deterministic ([type-support](type-support.md#collation)). |
@@ -87,12 +87,15 @@ isn't built yet (see [Supported sources and targets](#supported-sources-and-targ
 
 ### 1-1
 
-Exactly one target row per source row, inheriting the source's primary key.
+Exactly one target row per source row, inheriting the source's identity: its
+primary key, or, when the source's key is nullable (an aggregate or `JOIN`
+target's grouping columns), a `UNIQUE NULLS NOT DISTINCT` constraint over the
+same columns, so a group whose key has a `NULL` part has its row here too.
 Insertion/deletion maps 1-1. Always a single source table: deriving a target
 from a join of two tables is a [join aggregate](#join-aggregate), not 1-1, even
 when the join is one-to-one in practice.
 
-The target always carries the source's primary key columns, so a field can't
+The target always carries the source's key columns, so a field can't
 reuse a key column's name (see [Supported sources and targets](#supported-sources-and-targets)).
 
 ### Aggregate (`GROUP BY`)
@@ -297,9 +300,10 @@ undefined ([known correctness gaps](known-correctness-gaps.md#8-operator-changes
 * **Do not add, drop, rename or retype columns.** Trellis addresses its columns
   by name and type. Redefining the transform is how a column changes
   ([Changing a definition](#changing-a-definition)).
-* **Do not change the key constraints.** A 1-1 target's primary key and an
-  aggregate target's unique grouping constraint are how Trellis addresses a
-  row when it upserts or deletes it.
+* **Do not change the key constraints.** A 1-1 target's key (its primary key,
+  or its unique constraint over a nullable-keyed source) and an aggregate
+  target's unique grouping constraint are how Trellis addresses a row when it
+  upserts or deletes it.
 * **Do not `TRUNCATE` or `DROP` the table yourself.** `DROP TRANSFORM` removes
   the table and its definition together, and refuses while another definition
   still chains off it. A hand `TRUNCATE` leaves the table empty until the
@@ -331,8 +335,9 @@ statement or is deferred to the commit, fails that row's key like any value its
 target refuses: the key ends up held in quarantine, and rows that fail only
 together hold their page back as a `drain_failure` (see [Status](#status)).
 Another Trellis instance may read
-a 1-1 target as a source, exactly as it would any table with a primary key. An
-aggregate target may not be read that way (see [Supported sources and targets](#supported-sources-and-targets)).
+a 1-1 target keyed by a primary key as a source, exactly as it would any table
+with a primary key. An aggregate target, and a 1-1 target over one, may not be
+read that way (see [Supported sources and targets](#supported-sources-and-targets)).
 
 ## Status
 

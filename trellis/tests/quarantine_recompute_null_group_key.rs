@@ -28,17 +28,12 @@
 //! `NULL`, and the old `let pk_text: String = db_row.get(0);` panics —
 //! `tokio-postgres` refuses to convert a `NULL` into a `String`.
 //!
-//! The fix reads `pk_text` as `Option<String>` and drops a `None` row before
-//! it ever reaches `rows_by_pk`/`order`: exactly the same "no representable
-//! row" reasoning #205 used for `apply_target`'s write path — a
-//! `KeySpace::OneToOne` target's own primary key is always a real `primary
-//! key` column (`ddl::create_target_table`), which Postgres makes `NOT NULL`
-//! unconditionally regardless of the source column's own nullability, so no
-//! row can ever represent a NULL-keyed group there, and there is nothing to
-//! recompute (or write back) for it — matching what a from-scratch backfill
-//! of this same target already, structurally, does
-//! (`defs::backfill::discover_pk_ranges` never surfaces a NULL-keyed source
-//! row into any chunk's range in the first place).
+//! The fix reads `pk_text` as `Option<String>`. A column resume is now a
+//! field build (#625 F8b), whose chunks' `(lo, hi]` ranges never reach a
+//! `NULL`-keyed group either, so its plan stages that group's key into the
+//! ring and the drain re-derives its row: `sku_totals_echo` is keyed `UNIQUE
+//! NULLS NOT DISTINCT` like `sku_totals`, so it holds the `NULL` group's row
+//! (issue #1141), and the resumed column is restored there too.
 
 use std::collections::HashMap;
 
@@ -149,8 +144,9 @@ async fn sku_totals(client: &Client) -> HashMap<Option<String>, Option<String>> 
         .collect()
 }
 
-/// `sku -> echo_total` in the chained 1-1 target.
-async fn sku_totals_echo(client: &Client) -> HashMap<String, Option<String>> {
+/// `sku -> echo_total` in the chained 1-1 target, including the
+/// `NULL`-keyed group.
+async fn sku_totals_echo(client: &Client) -> HashMap<Option<String>, Option<String>> {
     client
         .query("select sku, echo_total::text from sku_totals_echo", &[])
         .await
@@ -163,15 +159,12 @@ async fn sku_totals_echo(client: &Client) -> HashMap<String, Option<String>> {
 /// Issue #211's exact repro: pausing (reached past the mechanism, the same
 /// "insert directly into `column_status`" convention
 /// `tests/column_quarantine.rs` uses throughout) and then resuming
-/// `sku_totals_echo.echo_total` drives `resume_column` into
-/// `recompute_column`, which reads every current row of `sku_totals` (the
-/// source) — including the NULL-keyed group's row — via a raw
-/// `sku::text` cast. Before the fix, `let pk_text: String = db_row.get(0)`
-/// panicked on that row; the fix must instead recognize it has no
-/// representable row in `sku_totals_echo` and simply skip it, exactly the
-/// way #205 taught `apply_target`'s write path to.
+/// `sku_totals_echo.echo_total` re-derives the column over every current row
+/// of `sku_totals` (the source), the NULL-keyed group's included. It must
+/// not panic, and must restore the column on every row, the NULL-keyed
+/// one's too (issue #1141).
 #[tokio::test]
-async fn recompute_column_skips_a_null_keyed_upstream_group_instead_of_panicking() {
+async fn resuming_a_column_restores_a_null_keyed_upstream_group_without_panicking() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
@@ -189,9 +182,8 @@ async fn recompute_column_skips_a_null_keyed_upstream_group_instead_of_panicking
     trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
-    // Sanity checks, matching #205's already-fixed behavior: the upstream
-    // aggregate holds the NULL group, but the chained 1-1 target has no row
-    // for it (its own primary key column is real, NOT NULL).
+    // Sanity checks: the upstream aggregate holds the NULL group, and so
+    // does the chained 1-1 target (issue #1141).
     assert_eq!(
         sku_totals(&client).await.get(&None).cloned(),
         Some(Some("6".to_string())),
@@ -201,10 +193,11 @@ async fn recompute_column_skips_a_null_keyed_upstream_group_instead_of_panicking
     assert_eq!(
         echo_before,
         HashMap::from([
-            ("a".to_string(), Some("12".to_string())),
-            ("b".to_string(), Some("2".to_string())),
+            (Some("a".to_string()), Some("12".to_string())),
+            (Some("b".to_string()), Some("2".to_string())),
+            (None, Some("6".to_string())),
         ]),
-        "sanity check: from-scratch backfill never materializes a row for the NULL group"
+        "sanity check: the build writes the NULL group's row too"
     );
 
     // Pause `echo_total` directly, then resume it — this is issue #211's
@@ -220,15 +213,14 @@ async fn recompute_column_skips_a_null_keyed_upstream_group_instead_of_panicking
         .await
         .expect("seed column_status directly");
 
-    // Anti-vacuity: deliberately corrupt every *representable* row's
-    // `echo_total` first, so the assertion below can tell "recompute skipped
-    // only the NULL-keyed group and recomputed everything else" apart from
-    // "recompute skipped every row" (which, on its own, would also leave
-    // `echo_after == echo_before` and quietly pass a broken skip condition).
+    // Anti-vacuity: deliberately corrupt every row's `echo_total` first, the
+    // NULL-keyed one's included, so the assertion below can tell "the
+    // resume recomputed every row" apart from "it skipped some" (which
+    // would leave a -1 behind).
     client
         .execute("update sku_totals_echo set echo_total = -1", &[])
         .await
-        .expect("corrupt the recomputable rows");
+        .expect("corrupt every row");
 
     let resumed = quarantine::resume_column(&db.pool, "sku_totals_echo", "echo_total")
         .await
@@ -241,16 +233,14 @@ async fn recompute_column_skips_a_null_keyed_upstream_group_instead_of_panicking
         vec![("sku_totals_echo".to_string(), "echo_total".to_string())],
         "only the resumed column itself"
     );
-    // #625 F8b: the resume registers the column's field build; run it.
+    // #625 F8b: the resume registers the column's field build; run it, then
+    // drain the NULL-keyed key its plan staged.
     trellis::staging::build::settle_builds(&db.pool).await;
+    drain_to_quiescence(&db.pool, &mut client).await;
 
     let echo_after = sku_totals_echo(&client).await;
     assert_eq!(
         echo_after, echo_before,
-        "issue #211: recompute must restore every representable row's value (proving the \
-         pass really ran, not that it skipped everything) while creating no phantom row for \
-         the NULL-keyed group — a NULL-keyed source row has no representable row in this \
-         target, so the recompute pass must simply skip it, the same as a from-scratch \
-         backfill already does"
+        "the resume restores every row's value, the NULL-keyed group's included"
     );
 }

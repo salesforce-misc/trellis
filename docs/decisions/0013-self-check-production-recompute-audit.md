@@ -168,7 +168,7 @@ the documented strong guarantee for callers that can quiesce.
 ### Scope: every target; aggregate and JOIN targets detect, never repair
 
 `self_check` audits 1-1, aggregate and JOIN targets. Every comparison projects the
-target's key (a 1-1 target's primary key, an aggregate's or JOIN's `GROUP BY`
+target's key (a 1-1 target's, which is its source's, an aggregate's or JOIN's `GROUP BY`
 columns), so a divergence is reported per key.
 
 - **A 1-1 target** is compared row by row against its source.

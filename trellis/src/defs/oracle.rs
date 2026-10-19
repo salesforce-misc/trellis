@@ -120,10 +120,15 @@ fn quoted_source_from(def: &TransformDef) -> String {
 }
 
 /// Recomputes `def`'s entire target from `def.source`'s current contents,
-/// keyed by `pk_column` (the source table's primary key, e.g. from
+/// keyed by `pk_column` (the source table's single-column key, e.g. from
 /// [`super::ddl::source_primary_key`]). `source_columns` gives each
 /// referenced source column's [`ValueType`], the same map `def` was
 /// validated against.
+///
+/// A source keyed by a nullable unique index (an aggregate target's `GROUP
+/// BY` column) can hold a row whose key is `NULL`, and the 1-1 target keeps
+/// its row (issue #1141): it is keyed here by the key text such a key
+/// renders, [`super::ddl::NULL_KEY_SENTINEL`].
 ///
 /// Reads `pk_column` plus every source column any calculated field
 /// references, as text, then runs each row through [`evaluate`] — the exact
@@ -160,7 +165,9 @@ pub async fn recompute(
     // to the same `Regex` on every row.
     let mut regex_cache = RegexCache::new();
     for db_row in rows {
-        let pk_value: String = db_row.get(0);
+        let pk_value: String = db_row
+            .get::<_, Option<String>>(0)
+            .unwrap_or_else(|| super::ddl::NULL_KEY_SENTINEL.to_string());
         let mut image: Row = HashMap::with_capacity(referenced.len());
         for (i, column) in referenced.iter().enumerate() {
             let value: Option<String> = db_row.get(i + 1);

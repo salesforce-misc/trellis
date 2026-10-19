@@ -5268,7 +5268,10 @@ mod tests {
                 .map(|row| (row.get(0), (1..=pk.len()).map(|i| row.get(i)).collect()))
                 .collect();
             assert_eq!(rows.len(), 5000);
-            let parts: Vec<&Vec<String>> = rows.iter().map(|(_, parts)| parts).collect();
+            let parts: Vec<Vec<&str>> = rows
+                .iter()
+                .map(|(_, parts)| parts.iter().map(String::as_str).collect())
+                .collect();
             let arrays = transpose_pk_parts(pk.len(), &parts);
             let params: Vec<&(dyn ToSql + Sync)> = arrays.iter().map(|a| a as _).collect();
             let sql = composite_lock_statement(table, &pk, &key_sql);
@@ -9383,68 +9386,25 @@ fn flush_relationship_reverse_fairness_escalation_metric(count: u64) {
 /// 65535 regardless of column count.
 const MAX_WRITE_PARAMS_PER_STATEMENT: usize = 60_000;
 
-/// Decodes one [`TargetWrite::pk_text`]/[`TargetDelete::pk_text`] — this
-/// crate's shared key-contract text ([`ddl::pk_key_sql_expr`]/[`ddl::join_pk_key`],
-/// or a source row's own PK straight from CDC/backfill) — back into the real
-/// value(s) [`apply_target`] must treat `key` as, via [`ddl::split_pk_key`]
-/// (issue #205), at `pk`'s own arity (issue #121: a [`KeySpace::OneToOne`]
-/// target's own primary key mirrors the source's in full, composite or not,
-/// rather than narrowing to one column).
+/// Decodes one [`TargetWrite::pk_text`]/[`TargetDelete::pk_text`] (this
+/// crate's shared key-contract text, [`ddl::pk_key_sql_expr`]/
+/// [`ddl::join_pk_key`]) into the value of each of `pk`'s columns, via
+/// [`ddl::split_pk_key`] (issues #205 and #121), `None` for a `NULL` part.
 ///
-/// A `None` result (any one part decoding to a genuine `NULL` component —
-/// only reachable for a [`KeySpace::OneToOne`] definition chained directly
-/// off an aggregate target's own nullable grouping-column PK, issue #110's
-/// `NULL_KEY_SENTINEL`/escape treatment) can never be stored as this target's
-/// own primary-key value: [`ddl::create_target_table`] always declares every
-/// primary-key column a real `primary key` column, which Postgres makes `NOT
-/// NULL` unconditionally, regardless of whether the *source* column this
-/// target's key was narrowed from is itself nullable. [`apply_target`]'s
-/// callers treat `None` as "no representable row" and skip the key entirely
-/// — the same outcome `defs::backfill::discover_pk_ranges`'s ordered
-/// `(lo, hi]` PK-range walk already, structurally, produces for a NULL-keyed
-/// source row: every range's `<=`/`>` bound is `NULL` (unknown) for a `NULL`
-/// operand, so such a row is never selected by any chunk's `WHERE` and a full
-/// backfill never attempts to insert it either. Skipping here keeps live CDC
-/// apply's answer — "this group has no row in the target" — consistent with
-/// backfill's, rather than attempting an insert Postgres's own `NOT NULL`
-/// constraint would reject anyway.
+/// A `NULL` part is reachable only for a source keyed by a nullable unique
+/// index (an aggregate or `JOIN` target's `GROUP BY` columns), whose 1-1
+/// target is keyed `unique nulls not distinct` in turn (issue #1141,
+/// `ddl::target_table_ddl`): [`apply_target`] writes and matches it as a
+/// real SQL `NULL`, never as the sentinel text that encodes it.
 pub(super) fn decode_target_pk_parts(
     pk: &[PrimaryKeyColumn],
     target: &str,
     key: &str,
-) -> Result<Option<Vec<String>>, ApplyError> {
+) -> Result<Vec<Option<String>>, ApplyError> {
     Ok(ddl::split_pk_key(pk, target, key)?
         .into_iter()
-        .map(|part| part.map(|c| c.into_owned()))
+        .map(|part| part.map(Cow::into_owned))
         .collect())
-}
-
-/// [`decode_target_pk_parts`]'s parts, rejoined into this crate's single
-/// shared key-contract text ([`ddl::join_pk_key`]) — the shape
-/// [`apply_and_mark_drained_many`]'s `hop_gen_of`/`src_changed_of` lookups
-/// need to key on (matching what [`apply_target`]'s own `RETURNING`, built
-/// from [`ddl::pk_key_sql_expr`], produces for the same row). A single part
-/// renders verbatim (no join, matching [`ddl::join_pk_key`]'s own arity-1
-/// exemption).
-fn decode_target_pk_text(
-    pk: &[PrimaryKeyColumn],
-    target: &str,
-    key: &str,
-) -> Result<Option<String>, ApplyError> {
-    Ok(decode_target_pk_parts(pk, target, key)?.map(|parts| join_pk_parts(&parts)))
-}
-
-/// Joins already-[`decode_target_pk_parts`]-decoded parts back into this
-/// crate's single shared key-contract text, the same shape
-/// [`ddl::join_pk_key`] produces — a thin wrapper so every call site spells
-/// the arity-1 short-circuit (`parts[0].clone()`, no join) the same way
-/// rather than each re-deriving it.
-fn join_pk_parts(parts: &[String]) -> String {
-    if parts.len() == 1 {
-        parts[0].clone()
-    } else {
-        ddl::join_pk_key(parts.iter().map(|s| s.as_str()))
-    }
 }
 
 /// `c0`, `c1`, … — collision-free column aliases for a keyset `unnest(...)`
@@ -9478,12 +9438,9 @@ pub(super) fn pk_keyset_unnest(pk: &[PrimaryKeyColumn], start: usize) -> String 
 }
 
 /// `<alias>.<col0> = k.c0 and <alias>.<col1> = k.c1 and …` — matches one row
-/// of `alias` against [`pk_keyset_unnest`]'s bound relation. Always plain
-/// `=` (never `is not distinct from`): a 1-1 target's own primary-key columns
-/// are never nullable (`ddl::create_target_table` always declares them a
-/// real `primary key`, which Postgres makes `NOT NULL` unconditionally),
-/// unlike `intake::resume_orphans`'s `GROUP BY` keyset match, which also
-/// needs an `is null` arm for a nullable grouping column.
+/// of `alias` against [`pk_keyset_unnest`]'s bound relation. Plain `=`, so
+/// only for keys with no `NULL` part: a key with one is matched by
+/// [`null_pattern_match`] instead.
 pub(super) fn pk_keyset_match(pk: &[PrimaryKeyColumn], alias: &str) -> String {
     pk.iter()
         .enumerate()
@@ -9673,13 +9630,135 @@ async fn lock_composite_keys(
 }
 
 /// The per-column bind arrays [`pk_keyset_unnest`] needs, transposed from
-/// `rows` (each an already-[`decode_target_pk_parts`]-decoded key, in `pk`'s
-/// own declared column order) so column `j`'s array is every row's `j`th
-/// part.
-pub(super) fn transpose_pk_parts<'a>(arity: usize, rows: &[&'a Vec<String>]) -> Vec<Vec<&'a str>> {
+/// `rows` (each an already-[`decode_target_pk_parts`]-decoded key with no
+/// `NULL` part, in `pk`'s own declared column order) so column `j`'s array
+/// is every row's `j`th part.
+pub(super) fn transpose_pk_parts<'a>(arity: usize, rows: &[Vec<&'a str>]) -> Vec<Vec<&'a str>> {
     (0..arity)
-        .map(|j| rows.iter().map(|r| r[j].as_str()).collect())
+        .map(|j| rows.iter().map(|r| r[j]).collect())
         .collect()
+}
+
+/// Decoded keys ([`decode_target_pk_parts`]) as [`apply_target`] matches
+/// them against its target: `plain`, each key with no `NULL` part (its
+/// parts, in key order), matched by the key's index as before issue #1141;
+/// and `patterns`, the keys with a `NULL` part, by their `NULL` pattern
+/// (`pattern[i]`: part `i` is `NULL`), each pattern's non-`NULL` parts
+/// transposed into one array per such column, as [`null_pattern_match`]
+/// binds them.
+///
+/// Matched per pattern because `is not distinct from` (or an `or … is
+/// null` arm) can't probe the key's index: `col is null` can, so each
+/// pattern's statement reaches its rows through the index, as
+/// `staging::target_mutations` and `intake::resume_orphans` match theirs.
+#[derive(Default)]
+struct MatchKeys<'a> {
+    plain: Vec<Vec<&'a str>>,
+    patterns: BTreeMap<Vec<bool>, Vec<Vec<&'a str>>>,
+}
+
+impl<'a> MatchKeys<'a> {
+    fn of(keys: impl IntoIterator<Item = &'a Vec<Option<String>>>) -> Self {
+        let mut out = Self::default();
+        for key in keys {
+            let pattern: Vec<bool> = key.iter().map(Option::is_none).collect();
+            if !pattern.contains(&true) {
+                out.plain
+                    .push(key.iter().flatten().map(String::as_str).collect());
+                continue;
+            }
+            let columns = out.patterns.entry(pattern).or_insert_with_key(|pattern| {
+                vec![Vec::new(); pattern.iter().filter(|null| !**null).count()]
+            });
+            for (column, part) in columns.iter_mut().zip(key.iter().flatten()) {
+                column.push(part.as_str());
+            }
+        }
+        out
+    }
+}
+
+/// The match of `alias`'s row against the keys of one `NULL` pattern
+/// ([`MatchKeys::patterns`]): `<alias>.<col> is null` for each `NULL` part,
+/// and `<alias>.<col> = k.c<i>` for the others, against their keyset
+/// (`unnest(…) as k(c<i>, …)`, one `text[]` per non-`NULL` column, bound from
+/// `$start`). The keyset is `None` when every part is `NULL`: the pattern is
+/// then one key, matched by its `is null` tests alone.
+fn null_pattern_match(
+    pk: &[PrimaryKeyColumn],
+    pattern: &[bool],
+    alias: &str,
+    start: usize,
+) -> (Option<String>, String) {
+    let mut arrays = Vec::new();
+    let mut cols = Vec::new();
+    let mut matched = Vec::with_capacity(pk.len());
+    for (i, (column, null)) in pk.iter().zip(pattern).enumerate() {
+        let ident = quote_ident(&column.name);
+        if *null {
+            matched.push(format!("{alias}.{ident} is null"));
+        } else {
+            arrays.push(format!(
+                "${}::text[]::{}[]",
+                start + arrays.len(),
+                column.data_type
+            ));
+            cols.push(pk_keyset_col(i));
+            matched.push(format!("{alias}.{ident} = k.{}", pk_keyset_col(i)));
+        }
+    }
+    let keyset = (!arrays.is_empty())
+        .then(|| format!("unnest({}) as k({})", arrays.join(", "), cols.join(", ")));
+    (keyset, matched.join(" and "))
+}
+
+/// [`apply_target`]'s pre-lock of the target rows of one `NULL` pattern's
+/// keys ([`null_pattern_match`] at `$1`), `select`ing `columns`, locked `for
+/// update of t` in key order.
+fn null_pattern_lock_statement(
+    target_ident: &str,
+    pk: &[PrimaryKeyColumn],
+    pattern: &[bool],
+    columns: &str,
+) -> String {
+    let order: Vec<String> = pk
+        .iter()
+        .map(|c| format!("t.{}", quote_ident(&c.name)))
+        .collect();
+    match null_pattern_match(pk, pattern, "t", 1) {
+        (Some(keyset), matched) => format!(
+            "select {columns} from {target_ident} as t join {keyset} on ({matched}) \
+             order by {} for update of t",
+            order.join(", ")
+        ),
+        (None, matched) => {
+            format!("select {columns} from {target_ident} as t where {matched} for update of t")
+        }
+    }
+}
+
+/// [`apply_target`]'s delete of the target rows of one `NULL` pattern's keys
+/// ([`null_pattern_match`] at `$1`), `returning` the key text `returning`.
+fn null_pattern_delete_statement(
+    target_ident: &str,
+    pk: &[PrimaryKeyColumn],
+    pattern: &[bool],
+    returning: &str,
+) -> String {
+    match null_pattern_match(pk, pattern, "t", 1) {
+        (Some(keyset), matched) => format!(
+            "delete from {target_ident} as t using {keyset} where {matched} \
+             returning {returning} as pk"
+        ),
+        (None, matched) => {
+            format!("delete from {target_ident} as t where {matched} returning {returning} as pk")
+        }
+    }
+}
+
+/// `columns` as the bind parameters of [`null_pattern_match`]'s keyset.
+fn pattern_params<'a>(columns: &'a [Vec<&'a str>]) -> Vec<&'a (dyn ToSql + Sync)> {
+    columns.iter().map(|c| c as &(dyn ToSql + Sync)).collect()
 }
 
 /// What [`settle_one_to_one_target`] did to one target: how many keys it
@@ -9903,13 +9982,8 @@ async fn settle_one_to_one_target(
     } else {
         &plan.records
     };
-    // A key that decodes to `None` (a NULL key part) has no target row to
-    // write; it is never settled.
     let mut by_key: BTreeMap<&str, &OneToOneRecord> = BTreeMap::new();
     for record in records {
-        if decode_target_pk_parts(&plan.pk, target, &record.pk_text)?.is_none() {
-            continue;
-        }
         by_key
             .entry(&record.pk_text)
             .and_modify(|kept| {
@@ -10096,7 +10170,9 @@ async fn settle_one_to_one_target(
 /// overlapping target rows. At arity 1 it binds the whole key set as a
 /// single `text[]` parameter; a composite (arity > 1) key instead binds one
 /// typed array per column and joins the target to that bound keyset (issue
-/// #121) —
+/// #121). A key with a `NULL` part (a target over a nullable-keyed source,
+/// issue #1141) is locked and deleted by a statement per `NULL` pattern
+/// after the others ([`MatchKeys`]) —
 /// either way the parameter count is `O(pk.len())`, not `O(batch size)`, so
 /// — unlike the upsert below — it never approaches the bind-parameter cap
 /// regardless of batch size. Because this transaction already holds every
@@ -10162,22 +10238,16 @@ async fn apply_target(
     let lock_key_expr = ddl::pk_key_sql_expr(&plan.pk, Some("t"));
 
     // Issue #205/#121: `write.pk_text`/`delete.pk_text` is this target's
-    // shared key-contract text, not necessarily raw PK value(s) yet — decode
-    // each one through `decode_target_pk_parts` before treating it as a
-    // literal PK value (or a lock/match key) anywhere below. See that
-    // function's doc comment: `None` (a genuine NULL-keyed group, only
-    // reachable for a `KeySpace::OneToOne` definition chained off a nullable
-    // aggregate grouping key) can never be this target's own stored PK
-    // value, so such a key is simply dropped from every step below, rather
-    // than bound as a literal `NULL_KEY_SENTINEL`/escaped string (the
-    // corruption issue #205 closes) or as a literal SQL `NULL` (which this
-    // target's own `NOT NULL` primary-key column(s) would just as reliably
-    // reject).
-    let decoded_writes: Vec<Option<Vec<String>>> = plan_writes
+    // shared key-contract text, not raw key values: decode each one through
+    // `decode_target_pk_parts` before treating it as a key value (or a
+    // lock/match key) anywhere below. A `NULL` part (issue #1141) is a real
+    // SQL `NULL` in the target's `unique nulls not distinct` key, written
+    // as one and matched by `is null` (`MatchKeys`), never the sentinel text.
+    let decoded_writes: Vec<Vec<Option<String>>> = plan_writes
         .iter()
         .map(|w| decode_target_pk_parts(&plan.pk, target, &w.pk_text))
         .collect::<Result<_, _>>()?;
-    let decoded_deletes: Vec<Option<Vec<String>>> = plan_deletes
+    let decoded_deletes: Vec<Vec<Option<String>>> = plan_deletes
         .iter()
         .map(|d| decode_target_pk_parts(&plan.pk, target, &d.pk_text))
         .collect::<Result<_, _>>()?;
@@ -10187,41 +10257,41 @@ async fn apply_target(
     // spellings of the same key) — the actual lock *order* comes from each
     // branch's own `order by` below, not from this collection's order, so a
     // plain dedup is all that's needed here.
-    let mut lock_key_parts: Vec<&Vec<String>> = decoded_writes
+    let mut lock_key_parts: Vec<&Vec<Option<String>>> = decoded_writes
         .iter()
         .chain(decoded_deletes.iter())
-        .filter_map(|k| k.as_ref())
         .collect();
     lock_key_parts.sort_unstable();
     lock_key_parts.dedup();
+    let lock_keys = MatchKeys::of(lock_key_parts);
+    let lock_columns = format!("{lock_key_expr}{prior_select}");
 
-    let locked = if arity == 1 {
+    let mut locked = if lock_keys.plain.is_empty() {
+        Vec::new()
+    } else if arity == 1 {
         // A single bound `text[]` array.
         let pk_ident = &pk_idents[0];
         let pk_cast = plan.pk[0].data_type.as_str();
-        let lock_keys: Vec<&str> = lock_key_parts.iter().map(|p| p[0].as_str()).collect();
-        lock_single_keys(
-            txn,
-            &target_ident,
-            pk_ident,
-            pk_cast,
-            &format!("{lock_key_expr}{prior_select}"),
-            &lock_keys,
-        )
-        .await?
+        let keys: Vec<&str> = lock_keys.plain.iter().map(|p| p[0]).collect();
+        lock_single_keys(txn, &target_ident, pk_ident, pk_cast, &lock_columns, &keys).await?
     } else {
         // Issue #121: a composite key is matched against a bound keyset
         // relation instead; see `composite_lock_statement`.
-        let arrays = transpose_pk_parts(arity, &lock_key_parts);
-        lock_composite_keys(
-            txn,
-            &target_ident,
-            &plan.pk,
-            &format!("{lock_key_expr}{prior_select}"),
-            &arrays,
-        )
-        .await?
+        let arrays = transpose_pk_parts(arity, &lock_keys.plain);
+        lock_composite_keys(txn, &target_ident, &plan.pk, &lock_columns, &arrays).await?
     };
+    // The keys with a `NULL` part, a statement per pattern, after the
+    // others: in ascending key order too, as `NULL` sorts last.
+    for (pattern, columns) in &lock_keys.patterns {
+        locked.extend(
+            super::ledger::query_by_entry_key(
+                txn,
+                &null_pattern_lock_statement(&target_ident, &plan.pk, pattern, &lock_columns),
+                &pattern_params(columns),
+            )
+            .await?,
+        );
+    }
     let prior_images: HashMap<String, String> = if prior_image_expr.is_some() {
         locked
             .into_iter()
@@ -10244,14 +10314,8 @@ async fn apply_target(
         .collect::<Vec<_>>()
         .join(", ");
 
-    // Only a write whose key actually decoded to a representable (non-NULL)
-    // PK value is a candidate for insertion — see `decode_target_pk_parts`'s
-    // doc comment on why a NULL-decoded write has no row to write at all.
-    let writable: Vec<(&TargetWrite, &Vec<String>)> = plan_writes
-        .iter()
-        .zip(decoded_writes.iter())
-        .filter_map(|(w, k)| k.as_ref().map(|k| (w, k)))
-        .collect();
+    let writable: Vec<(&TargetWrite, &Vec<Option<String>>)> =
+        plan_writes.iter().zip(decoded_writes.iter()).collect();
 
     let mut written = Vec::new();
     if !writable.is_empty() {
@@ -10343,40 +10407,36 @@ async fn apply_target(
     // that guarantee — the delete would now run against a snapshot that
     // already includes the write — so it's restored explicitly here
     // instead: never delete a key this same call just wrote. Compared as
-    // decoded keys (issue #205), joined to one canonical text (issue #121)
+    // decoded keys (issue #205), encoded to one canonical text (issue #121)
     // so a composite key compares as a whole tuple, not accidentally by its
-    // first column alone.
+    // first column alone, and a `NULL` part as itself.
     let write_keys: std::collections::HashSet<String> = writable
         .iter()
-        .map(|(_, parts)| join_pk_parts(parts))
+        .map(|(_, parts)| ddl::encode_pk_key(&plan.pk, parts))
         .collect();
 
     let mut deleted = Vec::new();
-    // A `None`-decoded delete has no matching write (a NULL-keyed group
-    // never reaches `writable` either) and no representable row to delete —
-    // see `decode_target_pk_parts`'s doc comment — so it's dropped here the
-    // same way a `None`-decoded write is dropped above.
-    let delete_key_parts: Vec<&Vec<String>> = decoded_deletes
-        .iter()
-        .filter_map(|k| k.as_ref())
-        .filter(|k| !write_keys.contains(&join_pk_parts(k)))
-        .collect();
-    if !delete_key_parts.is_empty() {
-        // `t.`-qualified (issue #121: the composite branch's `exists (...)`
-        // subquery below introduces a second relation into scope, so an
-        // unqualified column reference would become ambiguous).
-        let returning_pk_expr = ddl::pk_key_sql_expr(&plan.pk, Some("t"));
+    let delete_keys = MatchKeys::of(
+        decoded_deletes
+            .iter()
+            .filter(|k| !write_keys.contains(&ddl::encode_pk_key(&plan.pk, k))),
+    );
+    // `t.`-qualified (issue #121: the composite branch's `exists (...)`
+    // subquery below introduces a second relation into scope, so an
+    // unqualified column reference would become ambiguous).
+    let returning_pk_expr = ddl::pk_key_sql_expr(&plan.pk, Some("t"));
+    if !delete_keys.plain.is_empty() {
         let rows = if arity == 1 {
             let pk_ident = &pk_idents[0];
             let pk_cast = plan.pk[0].data_type.as_str();
-            let delete_keys: Vec<&str> = delete_key_parts.iter().map(|p| p[0].as_str()).collect();
+            let keys: Vec<&str> = delete_keys.plain.iter().map(|p| p[0]).collect();
             delete_single_keys(
                 txn,
                 &target_ident,
                 pk_ident,
                 pk_cast,
                 &returning_pk_expr,
-                &delete_keys,
+                &keys,
             )
             .await?
         } else {
@@ -10385,7 +10445,7 @@ async fn apply_target(
             // matches any row whose full key tuple appears in a bound
             // keyset relation (a correlated `exists`, mirroring the
             // pre-lock's join above).
-            let arrays = transpose_pk_parts(arity, &delete_key_parts);
+            let arrays = transpose_pk_parts(arity, &delete_keys.plain);
             let params: Vec<&(dyn ToSql + Sync)> = arrays.iter().map(|a| a as _).collect();
             txn.query(
                 &format!(
@@ -10401,13 +10461,28 @@ async fn apply_target(
         };
         deleted.extend(rows.into_iter().map(|row| row.get::<_, String>(0)));
     }
+    for (pattern, columns) in &delete_keys.patterns {
+        let rows = txn
+            .query(
+                &null_pattern_delete_statement(
+                    &target_ident,
+                    &plan.pk,
+                    pattern,
+                    &returning_pk_expr,
+                ),
+                &pattern_params(columns),
+            )
+            .await?;
+        deleted.extend(rows.into_iter().map(|row| row.get::<_, String>(0)));
+    }
 
     // Issue #315: report every physically-changed key to the seam, with the
     // `hop_gen`/`src_changed` of the change that produced it and the prior
     // image the pre-lock captured (`None` for a key this call created). Keyed
-    // by the *decoded* PK text (issue #205/#121), which for a target chained
-    // off a nullable grouping key can differ from `write.pk_text`'s encoded
-    // form — so the lookups below decode it the same way. A deleted row's
+    // by the key text the statements' `RETURNING` renders
+    // (`ddl::pk_key_sql_expr`): each record's key is decoded and encoded
+    // again (`ddl::encode_pk_key`), so it reaches the lookup in that one
+    // canonical form whatever spelling it was staged in. A deleted row's
     // prior image is what lets a downstream aggregate find the group it left
     // (issues #180/#196, now a recompute hint rather than a delta).
     let mut origin_of: HashMap<String, (i32, Provenance)> = HashMap::new();
@@ -10420,9 +10495,11 @@ async fn apply_target(
                 .map(|d| (&d.pk_text, d.hop_gen, d.src_changed, d.origin_lsn)),
         )
     {
-        if let Some(decoded) = decode_target_pk_text(&plan.pk, target, pk_text)? {
-            origin_of.insert(decoded, (hop_gen, (src_changed, origin_lsn)));
-        }
+        let decoded = decode_target_pk_parts(&plan.pk, target, pk_text)?;
+        origin_of.insert(
+            ddl::encode_pk_key(&plan.pk, &decoded),
+            (hop_gen, (src_changed, origin_lsn)),
+        );
     }
     let mut prior_images = prior_images;
     for key in written.iter().chain(deleted.iter()) {

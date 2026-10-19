@@ -630,8 +630,25 @@ async fn backfill_one_to_one(
                 source_table,
                 pk,
                 &substituted,
-                &lo,
-                &hi,
+                Some((&lo, &hi)),
+            )
+            .await
+        })
+        .await?;
+    }
+    // The keys with a `NULL` part, which no range reaches: only a source
+    // keyed by a nullable unique index has them, and the target holds their
+    // rows (issue #1141).
+    if pk.iter().any(|c| c.nullable) {
+        write_fenced(&mut client, fence, async |client| {
+            write_one_to_one_range(
+                client,
+                def,
+                target_schema,
+                source_table,
+                pk,
+                &substituted,
+                None,
             )
             .await
         })
@@ -642,8 +659,9 @@ async fn backfill_one_to_one(
 }
 
 /// The encoded keys of `source_table`'s rows in `(lo, hi]` of its primary
-/// key `pk`, leaving out a quarantined key and a key with a `NULL` part, as
-/// a first build leaves them out: a field build's chunk over a target the
+/// key `pk`, leaving out a quarantined key and a key with a `NULL` part
+/// (which the build's plan stages instead, [`key_not_null`]), as a first
+/// build leaves them out: a field build's chunk over a target the
 /// Re-derive build's SQL can't render (a relationship-enriched 1-1, #625
 /// F8b, `staging::build`).
 pub(crate) async fn range_keys(
@@ -734,7 +752,9 @@ async fn paused_columns_for(
 /// applies from its first chunk"). `substituted` is the caller's already-computed
 /// [`substitute_all_fields`] output, so a queue-driven caller charged the
 /// `Unsupported`-detecting cost once at plan time doesn't pay it again per
-/// chunk beyond re-deriving the (cheap, pure) substitution itself.
+/// chunk beyond re-deriving the (cheap, pure) substitution itself. `range`
+/// is the chunk's `(lo, hi]`, or `None` for every key with a `NULL` part,
+/// which no range reaches ([`key_not_null`]).
 #[allow(clippy::too_many_arguments)]
 async fn write_one_to_one_range(
     client: &impl GenericClient,
@@ -743,8 +763,7 @@ async fn write_one_to_one_range(
     source_table: &str,
     pk: &[PrimaryKeyColumn],
     substituted: &[Expr],
-    lo: &Option<Vec<String>>,
-    hi: &[String],
+    range: Option<(&Option<Vec<String>>, &[String])>,
 ) -> Result<(), BackfillError> {
     let source = ddl::qualified_source_table(source_table);
     let target = qualified_target_table(target_schema, def);
@@ -802,19 +821,24 @@ async fn write_one_to_one_range(
         format!("on conflict ({pk_col_list}) do update set {update_sets}")
     };
 
-    let mut params = range_params(lo, hi);
     // A quarantined key is left out (#616): it stays out of the target until
     // `release_key` re-derives it, exactly as the drain leaves it out of every
     // batch. The build's own narrowing quarantines the key a chunk fails on
-    // (`chunk_queue::fail_chunk`), and the chunk then runs without it. So is a
-    // key with a `NULL` part, which no target row can represent
-    // ([`key_not_null`]).
-    let where_clause = format!(
-        "{} and {} and {}",
-        pk_range_where(&pk_idents, pk, lo),
-        key_not_null(&pk_idents),
-        not_quarantined(pk, params.len() + 1),
-    );
+    // (`chunk_queue::fail_chunk`), and the chunk then runs without it. A
+    // range leaves out a key with a `NULL` part ([`key_not_null`]), which
+    // the `None` range writes.
+    let (mut params, keys) = match range {
+        Some((lo, hi)) => (
+            range_params(lo, hi),
+            format!(
+                "{} and {}",
+                pk_range_where(&pk_idents, pk, lo),
+                key_not_null(&pk_idents)
+            ),
+        ),
+        None => (Vec::new(), format!("not ({})", key_not_null(&pk_idents))),
+    };
+    let where_clause = format!("{keys} and {}", not_quarantined(pk, params.len() + 1));
     params.push(&source_table);
     params.push(&def.target);
     let insert_sql = format!(
@@ -922,8 +946,7 @@ pub(crate) async fn execute_one_to_one_chunk(
             source_table,
             &pk,
             &substituted,
-            &lo,
-            &hi,
+            Some((&lo, &hi)),
         )
         .await
     })
@@ -956,12 +979,14 @@ fn not_quarantined(pk: &[PrimaryKeyColumn], param: usize) -> String {
 /// `PRIMARY KEY` never has one, but a source keyed by a nullable `UNIQUE
 /// NULLS NOT DISTINCT` index (an aggregate target's grouping columns, issue
 /// #128) can, and a `(lo, hi]` row comparison still admits such a row
-/// whenever an earlier part decides it (`(2, NULL) <= (3, 'a')`). No target
-/// row can represent it (the target's own primary key is `NOT NULL`), so a
-/// 1-1 range write leaves it out, as [`discover_pk_ranges`] does and as the
-/// drain skips the key (issue #205). Writing it would fail the chunk with a
-/// not-null violation that [`narrow_one_to_one_chunk`], which never counts
-/// such a row, would pin on an innocent key beside it.
+/// whenever an earlier part decides it (`(2, NULL) <= (3, 'a')`), while it
+/// leaves out one whose `NULL` part decides it. A range therefore leaves out
+/// every such key, so that the ranges partition exactly the keys without
+/// one, as [`discover_pk_ranges`]' boundaries do. The target holds their
+/// rows all the same (issue #1141): [`backfill_one_to_one`] writes them in a
+/// pass of their own, the Re-derive build's plan stages them into the ring
+/// (`staging::build`), and the old chunked build's go-live catch-up
+/// enumerates them.
 pub(crate) fn key_not_null(pk_idents: &[String]) -> String {
     pk_idents
         .iter()
@@ -1204,11 +1229,9 @@ async fn walk_pk_ranges(
     // decides it, even if `b` is `NULL` (Postgres's row-comparison semantics
     // short-circuit on the first deciding member). Filtering every column
     // to `is not null` up front keeps any such row out of both the paging
-    // window and the boundary itself, matching this build's own invariant
-    // that a NULL-keyed group can never be represented in a 1-1 target
-    // (its own primary key is unconditionally `NOT NULL`) — the same
-    // grouping this test suite already documents for the live-apply path in
-    // `one_to_one_chained_off_nullable_aggregate_group_key.rs`.
+    // window and the boundary itself. The ranges cover exactly the keys
+    // without a `NULL` part, and every build writes the others apart from
+    // its ranges (see [`key_not_null`]).
     let not_null_filter = pk_idents
         .iter()
         .map(|c| format!("{c} is not null"))

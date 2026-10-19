@@ -2906,14 +2906,14 @@ const NULL_KEYS_CURSOR: &str = "trellis_null_keys_cursor";
 const NULL_KEYS_PAGE: i64 = 10_000;
 
 /// Stages an image-less `Recompute` for every key of `source_table` with a
-/// `NULL` part, for a ledger target's build (F6). Only a source keyed by a
-/// nullable unique index has such keys: another aggregate's target, whose
-/// `GROUP BY` columns may be `NULL`, and a ledger target counts its `NULL`
-/// groups like any other. No chunk reaches them. A chunk's range is a row
-/// comparison, which is `NULL` (so the row is out) wherever a `NULL` part
-/// decides it, and a plan's boundaries are keys without one. The oracle of a
-/// 1-1 target leaves them out (no target row can hold one), so only a
-/// ledger target's plan stages them.
+/// `NULL` part, for a ledger or 1-1 target's build (F6). Only a source keyed
+/// by a nullable unique index has such keys: another aggregate's or `JOIN`'s
+/// target, whose `GROUP BY` columns may be `NULL`. A ledger target counts
+/// its `NULL` groups like any other, and a 1-1 target over such a source is
+/// keyed `unique nulls not distinct` so it holds their rows (issue #1141).
+/// No chunk reaches them. A chunk's range is a row comparison, which is
+/// `NULL` (so the row is out) wherever a `NULL` part decides it, and a
+/// plan's boundaries are keys without one.
 ///
 /// A page re-derives a staged key as it does a chunk's: under the key's
 /// entry lock, from the source's live row, so it needs no more than the
@@ -3217,8 +3217,14 @@ async fn run_plan(
         .await?;
         if finished {
             // The keys no range reaches (F6), in the transaction that ends
-            // the plan, so a plan that is done has staged them.
-            if chunk.fields.is_none() && buildable_shape(&definition).is_some() {
+            // the plan, so a plan that is done has staged them. A 1-1
+            // target's field build stages them too: their rows hold the
+            // resumed fields as well (issue #1141).
+            let one_to_one = matches!(
+                definition.def.key_space,
+                crate::defs::ast::KeySpace::OneToOne
+            );
+            if (chunk.fields.is_none() && buildable_shape(&definition).is_some()) || one_to_one {
                 stage_null_keys(&txn, &definition.source_table, &pk)
                     .await
                     .map_err(build_error)?;

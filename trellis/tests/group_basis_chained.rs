@@ -602,3 +602,92 @@ async fn a_rollup_over_a_relationship_fed_upstream_follows_parent_changes() {
     step(&mut d, "update public.par set x = 100 where id = 2").await;
     assert_equal(&mut d, ROLL, ORACLE).await;
 }
+
+// ------------------------------------- 1-1 readers of a nullable key (#1141)
+
+/// A 1-1 reader of a group-basis aggregate holds the groups whose key has a
+/// `NULL` part, as the aggregate does: its key is the aggregate's `UNIQUE
+/// NULLS NOT DISTINCT` one (#1141). A row moves into, within and out of
+/// such a group.
+#[tokio::test]
+async fn a_one_to_one_reader_holds_the_null_keyed_groups() {
+    let mut d = start(
+        "TRANSFORM agg FROM public.src GROUP BY g, h SELECT COUNT(*) AS n, SUM(v) AS t",
+        "TRANSFORM a2 FROM public.agg SELECT n AS n, t + 1 AS t1",
+        &[("g", int4()), ("h", int4()), ("n", int8()), ("t", int8())],
+        1,
+    )
+    .await;
+    const A2: &str = "select g, h, n, t1 from public.a2 order by g, h";
+    const ORACLE: &str =
+        "select g, h, count(*), sum(v) + 1 from public.src group by g, h order by g, h";
+    for sql in [
+        "insert into public.src values (1, 1, null, 1), (2, 1, 2, 1)",
+        "insert into public.src values (3, 1, null, 3), (4, null, null, 4)",
+        "update public.src set h = null where id = 2",
+        "update public.src set v = 10 where id = 1",
+        "update public.src set h = 5 where id = 3",
+        "delete from public.src where h is null",
+    ] {
+        step(&mut d, sql).await;
+        assert_equal(&mut d, A2, ORACLE).await;
+    }
+    step(&mut d, "insert into public.src values (5, null, null, 5)").await;
+    assert_equal(&mut d, A2, ORACLE).await;
+    assert_eq!(
+        d.rows("select n from public.a2 where g is null and h is null")
+            .await,
+        ["(1)"]
+    );
+}
+
+/// A 1-1 reader of a `JOIN` target, whose `GROUP BY` value can be `NULL`,
+/// holds the `NULL` group as the `JOIN` target does (#1141).
+#[tokio::test]
+async fn a_one_to_one_reader_of_a_join_target_holds_the_null_group() {
+    trellis::dev::staging::set_group_basis(true);
+    let mut d = Driver::start(
+        "create table public.a (id integer primary key, ga integer, k integer, x integer); \
+         create table public.b (id integer primary key, k integer, y integer)",
+        &[("id", int4()), ("ga", int4()), ("k", int4()), ("x", int4())],
+        &[
+            "TRANSFORM j FROM public.a JOIN public.b ON a.k = b.k GROUP BY a.ga \
+           SELECT a.ga AS ga, COUNT(*) AS n, SUM(b.y) AS sy",
+        ],
+        &["public.a", "public.b"],
+    )
+    .await;
+    install(
+        &d,
+        "TRANSFORM jr FROM public.j SELECT n AS n, sy + 1 AS sy1",
+        &[("ga", int4()), ("n", int8()), ("sy", int8())],
+    )
+    .await;
+    trellis::intake::markers::settle_registrations(d.pool()).await;
+    d.settle().await;
+    assert_eq!(
+        d.rows("select status from transform_definitions order by id")
+            .await,
+        ["(live)", "(live)"]
+    );
+    const JR: &str = "select ga, n, sy1 from public.jr order by ga";
+    const ORACLE: &str = "select a.ga, count(*), sum(b.y) + 1 from public.a join public.b \
+                          on a.k = b.k group by a.ga order by a.ga";
+    for sql in [
+        "insert into public.b values (1, 1, 10), (2, 2, 20)",
+        "insert into public.a values (1, null, 1, 0), (2, 1, 2, 0), (3, null, 2, 0)",
+        "update public.a set ga = 1 where id = 3",
+        "update public.a set ga = null where id = 2",
+        "delete from public.b where id = 1",
+        "delete from public.a where ga is null",
+    ] {
+        step(&mut d, sql).await;
+        assert_equal(&mut d, JR, ORACLE).await;
+    }
+    step(&mut d, "insert into public.a values (4, null, 2, 0)").await;
+    assert_equal(&mut d, JR, ORACLE).await;
+    assert_eq!(
+        d.rows("select n from public.jr where ga is null").await,
+        ["(1)"]
+    );
+}

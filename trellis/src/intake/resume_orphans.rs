@@ -268,9 +268,11 @@
 //! A key column compared with `IS NOT DISTINCT FROM` forces a nested-loop
 //! anti-join (each target row rescans the source), which took ~20 s for a
 //! 50k-row 1-1 target in #330's spike. `=` lets Postgres hash it. A 1-1
-//! target's key is its `PRIMARY KEY`, all `NOT NULL`, so it always gets `=`.
-//! Every aggregate grouping column is nullable (`ddl::create_aggregate_target_table`,
-//! issue #128), so the anti-join is split by which grouping columns are
+//! target's key is its source's: a `PRIMARY KEY`, all `NOT NULL`, gets `=`,
+//! and over a source keyed by a nullable unique index its columns are as
+//! nullable as a grouping column (issue #1141). Every aggregate grouping
+//! column is nullable (`ddl::create_aggregate_target_table`, issue #128), so
+//! for these keys the anti-join is split by which key columns are
 //! `NULL` in the target row: within one such pattern a `NULL` column matches
 //! a source row whose key is `IS NULL`, and every other column matches with
 //! `=`. That's the same rule [`keyset_match_cols`] applies per
@@ -1587,25 +1589,32 @@ fn delete_statement(target: &SweptTarget, arrays: &[Vec<Option<String>>]) -> Str
         ));
     }
     if let Some(source) = &target.source_guard {
-        // A 1-1 target's key is the source's own key, column for column, all
-        // `NOT NULL` (`one_to_one_match`). The source's side is bounded by
-        // the keys as the target's is ([`keyset_bound`]), so a source whose
-        // statistics lag isn't scanned whole.
+        // A 1-1 target's key is the source's own key, column for column
+        // (`one_to_one_match`). The source's side is bounded by the keys as
+        // the target's is ([`keyset_bound`]), so a source whose statistics
+        // lag isn't scanned whole.
         let source_cols: Vec<String> = target
             .key_cols
             .iter()
             .map(|c| format!("s.{}", quote_ident(&c.name)))
             .collect();
-        let matches: Vec<String> = source_cols
-            .iter()
-            .zip(target_key_cols(target))
-            .map(|(s, t)| format!("{s} = {t}"))
-            .collect();
-        guard.push_str(&format!(
-            " and not exists (select 1 from {source} as s where {}{})",
-            matches.join(" and "),
-            keyset_bound(&source_cols, &target.key_cols, &null_patterns(arrays)),
-        ));
+        let patterns = null_patterns(arrays);
+        let bound = keyset_bound(&source_cols, &target.key_cols, &patterns);
+        if target.key_cols.iter().any(|c| c.nullable) {
+            // A source keyed by a nullable unique index (issue #1141): a
+            // clause per `NULL` pattern, as [`ledger_guard`]'s.
+            guard.push_str(&source_guard(source, &target.key_cols, &patterns, &bound));
+        } else {
+            let matches: Vec<String> = source_cols
+                .iter()
+                .zip(target_key_cols(target))
+                .map(|(s, t)| format!("{s} = {t}"))
+                .collect();
+            guard.push_str(&format!(
+                " and not exists (select 1 from {source} as s where {}{bound})",
+                matches.join(" and "),
+            ));
+        }
     }
     format!(
         "delete from {} as t using {relation} as k where {condition}{guard} returning {}",
@@ -1671,6 +1680,43 @@ fn ledger_guard(ledger: &str, key_cols: &[PrimaryKeyColumn], patterns: &[Vec<boo
                 other.join(" or "),
                 quote_ident(MEMBER_COLUMN),
                 quote_ident(TOMBSTONE_COLUMN),
+                matches.join(" and "),
+            )
+        })
+        .collect()
+}
+
+/// [`delete_statement`]'s guard for a 1-1 target whose key has a nullable
+/// column (issue #1141): it keeps a row (aliased `t`) that `source` (quoted)
+/// still has a row of the key of. One clause per `NULL` pattern of the
+/// batch's keys, matching the source with `=` on the pattern's non-`NULL`
+/// columns and `is null` on its `NULL` ones, for the reasons
+/// [`ledger_guard`] gives. `bound` is [`keyset_bound`]'s over the source's
+/// columns.
+fn source_guard(
+    source: &str,
+    key_cols: &[PrimaryKeyColumn],
+    patterns: &[Vec<bool>],
+    bound: &str,
+) -> String {
+    patterns
+        .iter()
+        .map(|pattern| {
+            let mut other = Vec::with_capacity(key_cols.len());
+            let mut matches = Vec::with_capacity(key_cols.len());
+            for (c, &null) in key_cols.iter().zip(pattern) {
+                let col = quote_ident(&c.name);
+                if null {
+                    other.push(format!("t.{col} is not null"));
+                    matches.push(format!("s.{col} is null"));
+                } else {
+                    other.push(format!("t.{col} is null"));
+                    matches.push(format!("s.{col} = t.{col}"));
+                }
+            }
+            format!(
+                " and ({} or not exists (select 1 from {source} as s where {}{bound}))",
+                other.join(" or "),
                 matches.join(" and "),
             )
         })
@@ -3744,6 +3790,87 @@ mod db_tests {
     /// against 33 ms at 3M rows). A batch with `NULL`-bearing keys in more
     /// than one pattern isn't bounded either, and still probes the index per
     /// key while statistics lag. Every key must still be deleted.
+    /// A 1-1 target over a source keyed by a nullable unique index has the
+    /// same nullable key (issue #1141), and its delete's re-check of the
+    /// source (issue #883) is `NULL`-safe: a `NULL`-keyed row the source
+    /// still has a row of is kept, of every `NULL` pattern, and only the
+    /// unbacked row goes.
+    #[tokio::test]
+    async fn the_one_to_one_delete_keeps_a_null_keyed_row_its_source_backs() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (_pool, mut raw) = connect(&db).await;
+        raw.batch_execute(
+            "create table public.nk_src (g int, h int, unique nulls not distinct (g, h)); \
+             create table public.nk (g int, h int, total int, unique nulls not distinct (g, h)); \
+             insert into public.nk_src values (1, null), (null, null), (null, 3); \
+             insert into public.nk values (1, null, 0), (null, null, 0), (null, 3, 0), \
+                                          (2, 2, 0), (null, 4, 0); \
+             insert into source_table_versions (source_table, version) values ('public.nk_src', 1)",
+        )
+        .await
+        .expect("seed the target and its source");
+        let table = "public.nk";
+        let id: i64 = raw
+            .query_one(
+                "insert into transform_definitions \
+                 (target_table, source_table, source_version, definition_text, status) \
+                 values ($1, 'public.nk_src', 1, 'unused', 'catching_up') returning id",
+                &[&table],
+            )
+            .await
+            .expect("seed the definition")
+            .get(0);
+        let key_cols = ddl::identity_key_columns(&raw, table)
+            .await
+            .expect("identity");
+        assert!(key_cols.iter().all(|c| c.nullable));
+        let target = SweptTarget {
+            id,
+            status: TransformStatus::CatchingUp,
+            lock_order: (false, table.to_string()),
+            target: table.to_string(),
+            target_ident: ddl::qualified_target_table_ident(table),
+            returning: ddl::pk_key_sql_expr(&key_cols, Some("t")),
+            key_cols,
+            branches: Vec::new(),
+            has_image: false,
+            ledger_guard: None,
+            source_guard: Some(ddl::qualified_source_table("public.nk_src")),
+            ledger_rederive: None,
+            page: Vec::new(),
+            staged: StagedKeys::new("unused", String::new(), Vec::new()),
+        };
+        // Every target row's key: the sweep's anti-join named them all.
+        let arrays: Vec<Vec<Option<String>>> = vec![
+            vec![Some("1".into()), None, None, Some("2".into()), None],
+            vec![
+                None,
+                None,
+                Some("3".into()),
+                Some("2".into()),
+                Some("4".into()),
+            ],
+        ];
+        let txn = raw.transaction().await.expect("begin");
+        let mut deleted: Vec<String> = delete_keys(&txn, &target, &arrays)
+            .await
+            .expect("delete")
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        deleted.sort();
+        txn.commit().await.expect("commit");
+        assert_eq!(
+            deleted,
+            [
+                ddl::join_pk_key([ddl::NULL_KEY_SENTINEL, "4"]),
+                ddl::join_pk_key(["2", "2"]),
+            ],
+            "only the rows the source has no row of"
+        );
+    }
+
     #[tokio::test]
     async fn the_sweep_delete_reads_only_its_keys_while_target_statistics_lag() {
         let cluster = testkit::TestCluster::start();
