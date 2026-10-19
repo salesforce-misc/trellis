@@ -244,7 +244,7 @@ module Trellis
     # Registers a transform from a `TRANSFORM` statement, creates its target
     # table, and returns the target table (fully qualified, "schema.table"),
     # at :waiting_to_backfill. Its backfill runs in the background: poll
-    # #status with the target table for :live.
+    # #status with the bare table name (the part after the schema) for :live.
     #
     # Only a `TRANSFORM` statement: any other form (DROP, PAUSE, ...) raises
     # ValidationError without being applied, and a statement that doesn't
@@ -279,7 +279,7 @@ module Trellis
     end
 
     # The Status of the definition writing target_table (a bare table name,
-    # or "schema.table"), or nil when none does.
+    # without its schema), or nil when none does.
     def status(target_table)
       string!("the target table", target_table)
       hash = handle.status(target_table)

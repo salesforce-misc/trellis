@@ -309,7 +309,8 @@ defmodule Trellis do
 
   Returns the transform's fully qualified target table once the definition is
   registered and its backfill queued, with the transform at
-  `:waiting_to_backfill`; poll `status/2` with the target table for `:live`.
+  `:waiting_to_backfill`; poll `status/2` with the bare table name (the part
+  after the schema) for `:live`.
 
   Only `TRANSFORM` statements belong here. Any other statement form (`DROP`,
   `PAUSE`, `RELATIONSHIP`, ...) is refused with a `:validation` error before
@@ -329,8 +330,8 @@ defmodule Trellis do
   def define!(trellis, text), do: bang(define(trellis, text))
 
   @doc """
-  The status of the transform that writes `target_table`, or `nil` if none
-  does.
+  The status of the transform that writes `target_table`, a bare table name
+  without its schema, or `nil` if none does.
   """
   @spec status(trellis(), String.t()) :: {:ok, Status.t() | nil} | {:error, Error.t()}
   def status(trellis, target_table) when is_trellis(trellis) and is_binary(target_table) do

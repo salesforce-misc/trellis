@@ -412,7 +412,7 @@ impl Trellis {
     /// the new transform's status is
     /// [`TransformStatus::WaitingToBackfill`] and the target is populated in
     /// the background, whatever the transform's shape. Poll
-    /// [`Trellis::status`] for [`TransformStatus::Live`].
+    /// [`Trellis::status`] with the bare table name for [`TransformStatus::Live`].
     ///
     /// `PAUSE` freezes a definition at its current value (ADR-0014's
     /// operator-driven half of the pause state whose other half is the poison
@@ -2160,9 +2160,9 @@ pub struct RelationshipSummary {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Applied {
-    /// A `TRANSFORM ...` statement registered a transform definition. Reports
-    /// [`TransformStatus::WaitingToBackfill`]: its backfill runs in the
-    /// background — see [`Trellis::apply`].
+    /// A `TRANSFORM ...` statement registered the transform writing this
+    /// schema-qualified target table, at [`TransformStatus::WaitingToBackfill`]:
+    /// its backfill runs in the background — see [`Trellis::apply`].
     TransformDefined(String),
     /// A `RELATIONSHIP ...` statement registered a relationship declaration.
     RelationshipDefined(RelationshipDefinition),
