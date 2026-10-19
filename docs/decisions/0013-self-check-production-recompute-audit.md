@@ -160,10 +160,40 @@ ends the job as "not caught up."
 
 A snapshot alone is not sufficient under live load: a single snapshot pins source and
 target at one instant, but a correctly-working target legitimately lags its source by
-CDC apply latency. Therefore a divergence is reported as real only if it **survives a
-re-check after a fresh await** — a genuine divergence is stable; a convergence race
-resolves. A strict mode, sound only when writes to the audited tables are stopped, is
-the documented strong guarantee for callers that can quiesce.
+CDC apply latency. A commit after the token is in the source the statement reads,
+and the target may not have applied it yet. Two comparisons handle that lag:
+
+- **Aggregate and JOIN targets compare against the source minus what the target
+  hasn't applied.** Capture writes each change's ring row in the change's own
+  transaction, so under one snapshot a source's rows are exactly what its target has
+  applied plus the changes the ring still holds unapplied. The same statement reads
+  those ring rows (the drain's own pending-row predicate, plus the changes a page
+  parked for a key the definition holds) and evaluates their images with
+  `self_check`'s own renderer: each current row counts `+1`, each unapplied change's
+  old image `+1` and new image `-1`, and the partials and fields are sums of those
+  weights. An image is left out where its page would refuse it: at or below its
+  hidden table's truncate floor, or seen by the basis of the group or cell it lands
+  in, whose absolute write already counted it. A JOIN's target partials are the
+  definition's own `JOIN … GROUP BY` over both tables' weighted rows. The
+  comparison is exact for every group with no lag window, so a divergence is
+  reported from one pass.
+- **Otherwise a divergence is re-checked.** A divergence is reported as real only if it
+  **survives a re-check after a fresh await** — a genuine divergence is stable; a
+  convergence race resolves. This applies to every 1-1 page, and to an aggregate or
+  JOIN page when a divergence falls on a group the subtraction can't vouch for: one
+  an unapplied change with no usable image (a `Recompute`) may touch, or a held key
+  whose parked origin is unknown. An unapplied op of the source that touches every
+  group (a `TRUNCATE`, a partition's truncate, a schema change) makes the whole page
+  re-check, as does any image-less unapplied change of either table for a JOIN's
+  target part.
+
+The subtraction has one trade-off: a change stuck in the ring indefinitely is
+subtracted rather than reported by `self_check`. Such a change is reported where it
+is stuck instead: a page that keeps failing is a `drain_failure` and a key the
+definition holds is a held key, both on every `self_check` report and in `status()`.
+
+A strict mode, sound only when writes to the audited tables are stopped, never
+re-checks; it is the documented strong guarantee for callers that can quiesce.
 
 ### Scope: every target; aggregate and JOIN targets detect, never repair
 
@@ -202,8 +232,7 @@ An aggregate or JOIN page compares the partials under the same convergence rules
 as every page (see [Quiescence](#quiescence-distinguish-diverged-from-not-yet-caught-up)).
 Pages apply out of order, so between them a group's partials can be inconsistent;
 the comparison is meaningful only once the page's convergence wait has returned,
-and a divergence must survive the re-check after a fresh await before it is
-reported.
+and it reads the source minus the ring rows the target hasn't applied yet.
 
 ### Respect column-level quarantine
 

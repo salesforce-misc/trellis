@@ -61,13 +61,21 @@
 //! then reads the target and runs the recompute in a single statement, so
 //! under one snapshot ([`compare_once`]).
 //!
-//! Under [`SelfCheckMode::Standard`], a divergence is only reported as real
-//! if it survives a re-check after a *fresh* await — a genuine divergence is
-//! stable; a convergence race resolves. [`SelfCheckMode::Strict`] skips the
-//! re-check: it is sound only when the caller has already stopped writes to
-//! the audited tables (so there is no race left to resolve), and is what a
-//! caller that can quiesce (e.g. the generative suite, after
-//! `ManualBackend::quiesce`) should reach for.
+//! A commit after the token is in the source that statement reads, and the
+//! target may not have applied it yet. An aggregate on the group basis and a
+//! `JOIN` target compare against the source minus the ring rows the target
+//! hasn't applied yet, read in the same statement
+//! ([`super::self_check_ring`]): capture writes a change's ring row in the
+//! change's own transaction, so that is exactly what the target has applied,
+//! and a divergence is reported from one pass. Under
+//! [`SelfCheckMode::Standard`], a divergence the comparison can't vouch for
+//! (any on a 1-1 page, or one on a group an unsubtractable ring row may
+//! touch) is reported only if it survives a re-check after a *fresh* await —
+//! a genuine divergence is stable; a convergence race resolves.
+//! [`SelfCheckMode::Strict`] skips the re-check: it is sound only when the
+//! caller has already stopped writes to the audited tables (so there is no
+//! race left to resolve), and is what a caller that can quiesce (e.g. the
+//! generative suite, after `ManualBackend::quiesce`) should reach for.
 //!
 //! # Only a `live` definition is compared (#625 F7)
 //!
@@ -165,39 +173,53 @@ pub struct SelfCheckScope {
 /// "Quiescence" section.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SelfCheckMode {
-    /// A divergence is provisional until it survives a re-check after a
-    /// fresh await — sound under live load, at the cost of up to double the
-    /// work when something actually diverges.
+    /// A divergence the comparison can't vouch for is provisional until it
+    /// survives a re-check after a fresh await — sound under live load, at
+    /// the cost of up to double the work for a page that holds one.
     ///
-    /// **Known, accepted limitation: the re-check's guarantee is identity
-    /// stability, not value non-transience.** [`await_then_compare`] takes
-    /// its watermark token and runs [`converge::await_converged`] on one
-    /// connection borrowed from the pool, then [`compare_once`] runs its
-    /// statement on a separate `pool.get()` call — which
-    /// may hand back a *different* connection. A commit landing in that gap
-    /// is visible to the source read but not yet applied to the target. Two
-    /// independent passes can each catch this same lag race on the same hot
-    /// `(key, column)`, with a different transient value each time, and
-    /// because divergences are matched by identity (key/column) across
-    /// passes rather than by exact value (see [`DivergenceIdentity`]), such
-    /// a case is reported as a stable, real divergence even though it is
-    /// still just lag.
+    /// **An aggregate on the group basis or a `JOIN` target** compares
+    /// against the source minus the ring rows the target hasn't applied yet,
+    /// in the one statement that reads the target
+    /// (`super::self_check_ring`, #1140). Under one snapshot that is exactly
+    /// what the target has applied, however hot its groups are, so a
+    /// divergence on such a page is reported from one pass. Only a
+    /// divergence on a group the subtraction can't vouch for is re-checked:
+    /// one an unapplied change with no usable image (a `Recompute`) may
+    /// touch, or a held key whose parked origin is unknown, every group
+    /// while the source has an unapplied `TRUNCATE`, partition truncate or
+    /// schema change, and every group of a `JOIN`'s target part while either
+    /// table has any such change. The trade-off: a change stuck in the ring
+    /// is subtracted rather than reported here. It shows up as a
+    /// [`SelfCheckPage::drain_failures`] entry or a held key
+    /// ([`SelfCheckPage::held_keys`]) instead.
     ///
-    /// This is a deliberate tradeoff, not a bug to fix by changing the
-    /// matching logic: matching by exact value instead would trade this
-    /// narrow false-positive risk for false *negatives* — a genuinely-broken
-    /// column that happens to change value on every pass under active writes
-    /// would then be silently suppressed, which is worse for an audit tool.
-    /// The window is also intrinsic to the whole re-check approach — you
-    /// cannot await convergence for a snapshot you have already pinned — so
-    /// there is no narrower fix available within this design.
+    /// **A 1-1 target** re-checks every divergence (#1176 moves it to the
+    /// same comparison). Known, accepted limitation there: **the re-check's
+    /// guarantee is identity stability, not value non-transience.**
+    /// [`await_then_compare`] takes its watermark token and runs
+    /// [`converge::await_converged`] on one connection borrowed from the
+    /// pool, then [`compare_once`] runs its statement on a separate
+    /// `pool.get()` call — which may hand back a *different* connection. A
+    /// commit landing in that gap is visible to the source read but not yet
+    /// applied to the target. Two independent passes can each catch this
+    /// same lag race on the same hot `(key, column)`, with a different
+    /// transient value each time, and because divergences are matched by
+    /// identity (key/column) across passes rather than by exact value (see
+    /// [`DivergenceIdentity`]), such a case is reported as a stable, real
+    /// divergence even though it is still just lag.
     ///
-    /// In short: a [`SelfCheckOutcome::Diverged`] under `Standard` means
-    /// "this divergence's identity was stable across two passes," not "this
-    /// divergence's value is guaranteed non-transient." Callers needing the
-    /// stronger guarantee should quiesce writes themselves and use
-    /// [`SelfCheckMode::Strict`], which skips the re-check (and therefore
-    /// this window) entirely.
+    /// Matching by exact value instead would trade this narrow
+    /// false-positive risk for false *negatives* — a genuinely-broken column
+    /// that happens to change value on every pass under active writes would
+    /// then be silently suppressed, which is worse for an audit tool.
+    ///
+    /// In short: a [`SelfCheckOutcome::Diverged`] under `Standard` means the
+    /// target differs from what its applied changes say (aggregate and
+    /// `JOIN` targets), or "this divergence's identity was stable across two
+    /// passes" (1-1 targets, and the fallbacks above). Callers needing the
+    /// stronger guarantee on a 1-1 target should quiesce writes themselves
+    /// and use [`SelfCheckMode::Strict`], which skips the re-check (and
+    /// therefore this window) entirely.
     Standard,
     /// Skips the re-check: a divergence found on the first pass is reported
     /// immediately. **Sound only when the caller has already stopped writes
@@ -755,7 +777,12 @@ pub(crate) async fn audit(
         });
     }
 
-    if mode == SelfCheckMode::Strict {
+    // `Strict` reports the first pass. So does `Standard` when no divergence
+    // falls on a key the pass couldn't vouch for exactly: a group-basis or
+    // `JOIN` page compares against the source minus the ring rows its target
+    // hasn't applied yet (`super::self_check_ring`), so what it finds is the
+    // target's, not lag (#1140).
+    if !rechecks(mode, &divergences, &pass1.uncertain) {
         return Ok(SelfCheckPage {
             target: target_table.to_string(),
             checked_through: pass1.checked_through,
@@ -768,10 +795,12 @@ pub(crate) async fn audit(
         });
     }
 
-    // ADR-0013: "a divergence is reported as real only if it survives a
-    // re-check after a fresh await — a genuine divergence is stable; a
-    // convergence race resolves." Re-run the exact same bounded comparison
-    // from scratch, behind a brand-new watermark token/await.
+    // ADR-0013: a divergence the pass couldn't vouch for (any on a 1-1
+    // page; on a group-basis or `JOIN` page, one on a key an image-less or
+    // otherwise unsubtractable ring row touches) is reported as real only if
+    // it survives a re-check after a fresh await. Re-run the exact same
+    // bounded comparison from scratch, behind a brand-new watermark
+    // token/await, and keep what reproduces.
     let pass2 =
         match await_then_compare(pool, def, group.as_ref(), &pk, &scope, &paused, timeout).await? {
             AwaitOutcome::NotCaughtUp { attempted } => {
@@ -811,6 +840,68 @@ pub(crate) async fn audit(
     })
 }
 
+/// Whether `divergences`, a first pass's, are re-checked before any is
+/// reported: under [`SelfCheckMode::Standard`], when one falls on a key the
+/// pass couldn't vouch for exactly (`uncertain`). Never under `Strict`.
+fn rechecks(
+    mode: SelfCheckMode,
+    divergences: &[Divergence],
+    uncertain: &super::self_check_groups::Uncertain,
+) -> bool {
+    mode == SelfCheckMode::Standard && divergences.iter().any(|d| uncertain.covers(d))
+}
+
+/// One comparison of a page of `target_table`, with no convergence wait
+/// and no re-check: what [`check_page`]'s first pass finds, whatever the
+/// ring holds. For the tests of the comparison against the source minus
+/// the ring rows the target hasn't applied yet (#1140), which hold a page
+/// undrained while they compare.
+#[cfg(any(test, feature = "internals"))]
+pub async fn compare_page(
+    pool: &Pool,
+    target_table: &str,
+    scope: SelfCheckScope,
+) -> Result<ComparedPage, SelfCheckError> {
+    let def = comparable_definition(pool, target_table).await?;
+    let group = group_shape(&def);
+    let pk = if group.is_some() || joined(&def) {
+        let client = pool.get().await?;
+        ddl::identity_key_columns(&**client, &def.target_table).await?
+    } else {
+        ddl::source_primary_key(pool, &def.source_table).await?
+    };
+    let paused = paused_columns(pool, &def.def).await?;
+    let pass = compare_once(
+        pool,
+        &def,
+        group.as_ref(),
+        &pk,
+        &scope,
+        &paused,
+        PgLsn::from(0),
+    )
+    .await?;
+    Ok(ComparedPage {
+        divergences: pass.divergences,
+        next_after: pass.next_after,
+        uncertain_all: pass.uncertain.all,
+        uncertain_keys: pass.uncertain.keys.into_iter().collect(),
+    })
+}
+
+/// [`compare_page`]'s result.
+#[cfg(any(test, feature = "internals"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComparedPage {
+    pub divergences: Vec<Divergence>,
+    pub next_after: Option<String>,
+    /// Whether the page couldn't vouch for any key exactly: a 1-1 page, or
+    /// one whose source's ring holds an op that touches every group.
+    pub uncertain_all: bool,
+    /// The keys it couldn't vouch for exactly, sorted.
+    pub uncertain_keys: Vec<String>,
+}
+
 /// The re-check's filter (ADR-0013): of the divergences `second` (the
 /// re-check pass) found, keeps only those whose [`DivergenceIdentity`] was
 /// also in `first`. A divergence that resolved on re-check was a convergence
@@ -835,9 +926,10 @@ fn reproduced(first: &[Divergence], second: Vec<Divergence>) -> Vec<Divergence> 
 ///
 /// Matching by identity rather than by exact value is what makes the
 /// cross-connection lag window documented on [`SelfCheckMode::Standard`]
-/// possible: a hot `(key, column)` caught mid-lag on both passes, with two
-/// different transient values, matches here and is reported as stable. See
-/// that doc comment for why this is the accepted tradeoff rather than a bug.
+/// possible on a re-checked page: a hot `(key, column)` caught mid-lag on
+/// both passes, with two different transient values, matches here and is
+/// reported as stable. See that doc comment for why this is the accepted
+/// tradeoff rather than a bug.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum DivergenceIdentity {
     Cell { key: String, column: String },
@@ -875,6 +967,10 @@ pub(super) struct ComparePass {
     pub(super) rows_compared: i64,
     pub(super) next_after: Option<String>,
     pub(super) divergences: Vec<Divergence>,
+    /// The keys whose divergence may be lag rather than the target's
+    /// (`super::self_check_ring`): under [`SelfCheckMode::Standard`] a
+    /// divergence on one is reported only if it reproduces on a re-check.
+    pub(super) uncertain: super::self_check_groups::Uncertain,
 }
 
 /// [`await_then_compare`]'s result: either the target never caught up to
@@ -1006,6 +1102,9 @@ async fn compare_once(
         rows_compared: diff.rows_compared,
         next_after: diff.next_after,
         divergences: diff.divergences,
+        // A 1-1 comparison subtracts no ring rows: every divergence it finds
+        // is re-checked (#1176).
+        uncertain: super::self_check_groups::Uncertain::everything(),
     })
 }
 
@@ -1546,6 +1645,47 @@ mod tests {
     fn reproduced_keeps_a_stable_divergence_rather_than_erasing_it() {
         let both = vec![cell("1", "9999", "11")];
         assert_eq!(reproduced(&both, both.clone()), both);
+    }
+
+    /// #1140: under `Standard`, a page re-checks only when a divergence falls
+    /// on a key it couldn't vouch for exactly; a divergence on any other key,
+    /// or on the schema, is reported from the one pass. A 1-1 page vouches
+    /// for none, and `Strict` never re-checks.
+    #[test]
+    fn standard_rechecks_only_a_divergence_on_an_uncertain_key() {
+        use super::super::self_check_groups::Uncertain;
+        let exact = Uncertain::default();
+        let one = Uncertain {
+            all: false,
+            keys: BTreeSet::from(["2".to_string()]),
+        };
+        let column = Divergence::MissingColumn {
+            column: "n".to_string(),
+        };
+        let on_1 = [cell("1", "5", "6"), missing("1"), column.clone()];
+        assert!(!rechecks(SelfCheckMode::Standard, &on_1, &exact));
+        assert!(!rechecks(SelfCheckMode::Standard, &on_1, &one));
+        assert!(rechecks(
+            SelfCheckMode::Standard,
+            &[cell("2", "5", "6")],
+            &one
+        ));
+        assert!(rechecks(SelfCheckMode::Standard, &[missing("2")], &one));
+        assert!(rechecks(
+            SelfCheckMode::Standard,
+            std::slice::from_ref(&column),
+            &Uncertain::everything()
+        ));
+        assert!(!rechecks(
+            SelfCheckMode::Strict,
+            &[cell("2", "5", "6")],
+            &Uncertain::everything()
+        ));
+        assert!(!rechecks(
+            SelfCheckMode::Standard,
+            &[],
+            &Uncertain::everything()
+        ));
     }
 
     /// Only the wait running out of time reads as "not caught up yet": a

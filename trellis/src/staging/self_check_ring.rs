@@ -1,0 +1,279 @@
+//! The ring rows a group-basis or `JOIN` target hasn't applied yet, as
+//! `self_check` subtracts them (#1140, ADR-0013 "Quiescence").
+//!
+//! Capture writes a change's ring row in the change's own transaction, so
+//! under one snapshot a source's current rows are exactly what its target
+//! has applied plus the changes its ring still holds unapplied. A page of
+//! [`super::self_check_groups`] or [`super::self_check_joins`] reads the
+//! source as *weighted rows* ([`Ring::weighted_sql`]): every current row at
+//! weight `+1`, and each unapplied change's images at the opposite of their
+//! sign (its old image `+1`, its new image `-1`). Their aggregates are what
+//! the target has applied, in the same statement that reads the target, so
+//! a correct target compares equal whatever the ring holds.
+//!
+//! "Unapplied" is a ring row of the source that
+//!
+//! - no committed drain has applied ([`super::page::ring_row_pending_sql`],
+//!   the drain's own predicate), or
+//! - a page parked for a key the audited definition holds (its `poison_held`
+//!   row's `origin_lsn` and later: once a key is held, every change to it
+//!   parks until its release, which recomputes its groups).
+//!
+//! Of those, an image is subtracted only where its page would apply it:
+//! above the truncate floor of the hidden table it applies to, and not seen
+//! by the basis of the group or cell it lands in (a basis's absolute write
+//! already counted it, and the page will refuse it).
+//!
+//! Some unapplied rows can't be subtracted, and say only where the target may
+//! still differ ([`Ring::uncertain_images_sql`]): an image-less change (a
+//! `Recompute`, or a change missing an image its op needs) and the changes of
+//! a held key whose parked origin is unknown. Their groups fall back to the
+//! re-check. Any other unapplied op of the source (a `TRUNCATE`, a
+//! partition's truncate, a schema change) touches every group, and the whole
+//! page falls back ([`Ring::global_sql`]).
+//!
+//! Every image is evaluated by `jsonb_populate_record` over the source's
+//! row type and then by the audit's own renderer, never by the apply path's
+//! staging SQL (ADR-0013's independence).
+
+use crate::defs::ddl::{self, PrimaryKeyColumn};
+use crate::pool::{quote_ident, quote_literal};
+
+use super::converge::per_ring_table;
+use super::page::ring_row_pending_sql;
+
+/// The weight column of [`Ring::weighted_sql`]'s rows.
+pub(super) const WEIGHT: &str = "__trellis_w";
+
+/// One source table's unapplied ring rows, for one audited definition.
+pub(super) struct Ring<'a> {
+    /// The source as the ring names it (`src_table`).
+    pub(super) src_table: &'a str,
+    /// The source, quoted and qualified: the row type its images populate.
+    pub(super) source_row: String,
+    /// The source's row identity, which a ring row's `key` encodes.
+    pub(super) source_pk: &'a [PrimaryKeyColumn],
+    /// The audited definition.
+    pub(super) transform_id: i64,
+    /// A prefix naming this source's CTEs, unique within the statement.
+    pub(super) tag: &'a str,
+}
+
+/// Where a side of an unapplied change lands, for the page that would apply
+/// it: the `ledger_truncate_floor` key above which it applies, and the
+/// hidden table (quoted, qualified) and its key columns whose row's
+/// `__basis` refuses it, if any.
+pub(super) struct Lands<'a> {
+    pub(super) floor_key: &'a str,
+    pub(super) basis: Option<(&'a str, &'a [String])>,
+    /// More conditions a side must meet to apply, over its populated image
+    /// `r` (` and …`, or empty): a joined row with a `NULL` join-key part
+    /// applies to nothing.
+    pub(super) filter: String,
+}
+
+impl Ring<'_> {
+    /// The name of this source's CTE `what`.
+    fn cte(&self, what: &str) -> String {
+        format!("__{}_{what}", self.tag)
+    }
+
+    /// The CTEs this source contributes to a page's statement, each ending
+    /// with `, ` so a caller writes them before its own: the unapplied rows,
+    /// their signed images, and those images kept by `lands`. Names them by
+    /// [`Self::tag`].
+    pub(super) fn ctes(&self, lands: &Lands<'_>) -> String {
+        format!(
+            "{rows} as materialized ({rows_sql}), \
+             {sides} as materialized ({sides_sql}), \
+             {kept} as materialized ({kept_sql}), ",
+            rows = self.cte("rows"),
+            rows_sql = self.rows_sql(),
+            sides = self.cte("sides"),
+            sides_sql = self.sides_sql(),
+            kept = self.cte("kept"),
+            kept_sql = self.kept_sql(lands),
+        )
+    }
+
+    /// Every unapplied ring row of the source (the module doc), as
+    /// `(__txid, __lsn, __key, __op, __o, __n, __x, __kind)`. `__kind` is
+    /// `side` for a change whose images apply as deltas, `uncertain` for one
+    /// that can't be subtracted but names its groups, and `global` for an op
+    /// that touches every group.
+    fn rows_sql(&self) -> String {
+        let src = quote_literal(self.src_table);
+        let id = self.transform_id;
+        per_ring_table(" union all ", |slot, table| {
+            format!(
+                "select r.row_txid as __txid, r.lsn as __lsn, r.key as __key, r.op as __op, \
+                        r.old_image as __o, r.new_image as __n, r.transition_images as __x, \
+                        case when r.op not in ('insert', 'update', 'delete', 'recompute') \
+                                  then 'global' \
+                             when r.op = 'recompute' or h.unknown then 'uncertain' \
+                             when jsonb_typeof(r.transition_images) = 'object' then 'side' \
+                             when (r.op = 'insert' or jsonb_typeof(r.old_image) = 'object') \
+                              and (r.op = 'delete' or jsonb_typeof(r.new_image) = 'object') \
+                                  then 'side' \
+                             else 'uncertain' end as __kind \
+                 from {table} r \
+                 left join lateral ( \
+                     select ph.origin_lsn is null as unknown, \
+                            ph.origin_lsn is not null and r.origin_lsn >= ph.origin_lsn as parked \
+                     from poison_held ph \
+                     where ph.transform_id = {id} and ph.src_table = r.src_table \
+                       and ph.key = r.key) h on true \
+                 where r.src_table = {src} \
+                   and (coalesce(h.unknown or h.parked, false) or {pending})",
+                pending = ring_row_pending_sql(slot, None),
+            )
+        })
+    }
+
+    /// The signed images of the `side` rows: `(__txid, __lsn, __sgn, __i)`,
+    /// a change's old image at `-1` and its new image at `+1` (or its
+    /// transition images), as its page stages them.
+    fn sides_sql(&self) -> String {
+        let rows = self.cte("rows");
+        format!(
+            "select __txid, __lsn, __sgn, __i from ( \
+                 select __txid, __lsn, -1 as __sgn, \
+                        case when jsonb_typeof(__x) = 'object' then __x -> 'old' else __o end as __i \
+                 from {rows} where __kind = 'side' \
+                 union all \
+                 select __txid, __lsn, 1, \
+                        case when jsonb_typeof(__x) = 'object' then __x -> 'new' else __n end \
+                 from {rows} where __kind = 'side') s \
+             where jsonb_typeof(__i) = 'object'"
+        )
+    }
+
+    /// The signed images the page that applies them would apply (`lands`):
+    /// `(__sgn, __i)`.
+    fn kept_sql(&self, lands: &Lands<'_>) -> String {
+        let basis = match lands.basis {
+            Some((hidden, columns)) => format!(
+                " and not coalesce(pg_visible_in_snapshot(d.__txid, {}), false)",
+                basis_probe(hidden, columns, "r")
+            ),
+            None => String::new(),
+        };
+        format!(
+            "select d.__sgn, d.__i from {sides} d \
+             cross join lateral jsonb_populate_record(null::{src}, d.__i) as r \
+             where d.__lsn > coalesce( \
+                       (select floor from ledger_truncate_floor where target_table = {floor}), \
+                       '0/0'::pg_lsn){basis}{filter}",
+            sides = self.cte("sides"),
+            src = self.source_row,
+            floor = quote_literal(lands.floor_key),
+            filter = lands.filter,
+        )
+    }
+
+    /// The source's rows as the target has applied them: every current row
+    /// at weight `+1` ([`WEIGHT`]) and each kept image at the opposite of its
+    /// sign, as a derived table's body, its columns the source's plus the
+    /// weight first.
+    pub(super) fn weighted_sql(&self) -> String {
+        format!(
+            "(select 1 as {WEIGHT}, s.* from {src} s \
+              union all \
+              select -k.__sgn, r.* from {kept} k \
+              cross join lateral jsonb_populate_record(null::{src}, k.__i) as r)",
+            src = self.source_row,
+            kept = self.cte("kept"),
+        )
+    }
+
+    /// The images naming every group an unapplied row that can't be
+    /// subtracted may touch (`(__i)`, each an object over the source's
+    /// columns): its own images, the current row of its key, and the parked
+    /// image and groups of a held key whose parked origin is unknown. Empty
+    /// when there is no such row, without reading the source.
+    pub(super) fn uncertain_images_sql(&self) -> String {
+        let rows = self.cte("rows");
+        let src = quote_literal(self.src_table);
+        let id = self.transform_id;
+        let held = format!(
+            "poison_held ph \
+             left join lateral unnest(ph.agg_groups) as g on true \
+             where ph.transform_id = {id} and ph.src_table = {src} and ph.origin_lsn is null"
+        );
+        format!(
+            "select i as __i from {rows} \
+             cross join lateral (values (__o), (__n), (__x -> 'old'), (__x -> 'new')) v(i) \
+             where __kind = 'uncertain' and jsonb_typeof(i) = 'object' \
+             union all \
+             select ph.old_image from {held} and jsonb_typeof(ph.old_image) = 'object' \
+             union all \
+             select g::jsonb from {held} and g is not null \
+             union all \
+             select to_jsonb(s) from {source} s \
+             where (exists (select 1 from {rows} where __kind = 'uncertain') \
+                    or exists (select 1 from {held})) \
+               and {key} in (select __key from {rows} where __kind = 'uncertain' \
+                             union all select ph.key from {held})",
+            source = self.source_row,
+            key = ddl::pk_key_sql_expr(self.source_pk, Some("s")),
+        )
+    }
+
+    /// True when the ring holds an unapplied op of the source that touches
+    /// every group (the module doc).
+    pub(super) fn global_sql(&self) -> String {
+        format!(
+            "exists (select 1 from {} where __kind = 'global')",
+            self.cte("rows")
+        )
+    }
+
+    /// True when any unapplied row can't be subtracted: [`Self::global_sql`],
+    /// or any row of [`Self::uncertain_images_sql`]'s.
+    pub(super) fn any_uncertain_sql(&self) -> String {
+        format!(
+            "exists (select 1 from {rows} where __kind <> 'side') \
+             or exists (select 1 from poison_held ph where ph.transform_id = {id} \
+                        and ph.src_table = {src} and ph.origin_lsn is null)",
+            rows = self.cte("rows"),
+            id = self.transform_id,
+            src = quote_literal(self.src_table),
+        )
+    }
+}
+
+/// The `__basis` of the row of `hidden` (quoted, qualified) whose key
+/// columns `columns` equal `alias`'s, `NULL` matching `NULL`, or `NULL` when
+/// there is none. Plain equality first, which the hidden table's key index
+/// serves; only a key with a `NULL` part takes the second lookup, which no
+/// index serves.
+fn basis_probe(hidden: &str, columns: &[String], alias: &str) -> String {
+    if columns.is_empty() {
+        return format!("(select x.__basis from {hidden} x limit 1)");
+    }
+    let equal: Vec<String> = columns
+        .iter()
+        .map(|c| {
+            let c = quote_ident(c);
+            format!("x.{c} = {alias}.{c}")
+        })
+        .collect();
+    let has_null: Vec<String> = columns
+        .iter()
+        .map(|c| format!("{alias}.{} is null", quote_ident(c)))
+        .collect();
+    let same: Vec<String> = columns
+        .iter()
+        .map(|c| {
+            let c = quote_ident(c);
+            format!("x.{c} is not distinct from {alias}.{c}")
+        })
+        .collect();
+    format!(
+        "coalesce((select x.__basis from {hidden} x where {}), \
+                  (select x.__basis from {hidden} x where ({}) and {}))",
+        equal.join(" and "),
+        has_null.join(" or "),
+        same.join(" and "),
+    )
+}

@@ -19,7 +19,7 @@ use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ValueType;
 use trellis::integer::IntWidth;
 use trellis::staging::self_check::{
-    Divergence, SelfCheckMode, SelfCheckOutcome, SelfCheckScope, check_page,
+    Divergence, SelfCheckMode, SelfCheckOutcome, SelfCheckScope, check_page, compare_page,
 };
 
 const SRC: &str = "public.src";
@@ -475,4 +475,221 @@ async fn a_key_on_one_side_only_is_reported_alike_at_every_page_size() {
         "{found:?}"
     );
     assert_eq!(found.len(), 4, "three partials and the row: {found:?}");
+}
+
+// ------------------------------------- the ring rows not applied yet (#1140)
+
+/// Every page of one comparison of `agg`, `limit` groups at a time, with no
+/// convergence wait and no re-check, whatever the ring holds: the
+/// divergences, the groups it couldn't vouch for exactly, and whether it
+/// couldn't vouch for any.
+async fn compare(d: &Driver, limit: i64) -> (Vec<Divergence>, Vec<String>, bool) {
+    let mut after = None;
+    let (mut found, mut uncertain, mut all) = (Vec::new(), Vec::new(), false);
+    loop {
+        let page = compare_page(d.pool(), "agg", SelfCheckScope { after, limit })
+            .await
+            .expect("a comparison");
+        found.extend(page.divergences);
+        uncertain.extend(page.uncertain_keys);
+        all |= page.uncertain_all;
+        after = page.next_after;
+        if after.is_none() {
+            uncertain.sort();
+            uncertain.dedup();
+            return (found, uncertain, all);
+        }
+    }
+}
+
+/// Changes of every kind the drain hasn't applied, some in a sealed segment
+/// nobody drained and some still in the active one, against a correct
+/// target: the comparison reads the source minus them, so it finds nothing,
+/// at every page size, in one pass. Applying them changes nothing either.
+#[tokio::test]
+async fn ring_rows_not_applied_yet_are_subtracted_from_the_source() {
+    let mut d = start().await;
+    step(
+        &mut d,
+        "insert into public.src values (1, 1, 10), (2, 1, 5), (3, 2, 7), (4, null, 1),                                        (5, 3, 2)",
+    )
+    .await;
+    exec(
+        &d,
+        "insert into public.src values (6, 1, 1), (7, 4, 3);          update public.src set g = 2 where id = 2;          update public.src set v = null where id = 1",
+    )
+    .await;
+    let sealed = d.seal().await;
+    exec(
+        &d,
+        "delete from public.src where id = 5;          update public.src set g = null, v = 9 where id = 3;          insert into public.src values (8, 5, 4);          update public.src set v = v + 1 where id = 8",
+    )
+    .await;
+    for limit in [1, 2, 100] {
+        assert_eq!(
+            compare(&d, limit).await,
+            (vec![], vec![], false),
+            "limit {limit}"
+        );
+    }
+    d.drain(sealed, "late").await;
+    assert_eq!(compare(&d, 2).await, (vec![], vec![], false));
+    let rest = d.seal().await;
+    d.drain(rest, "late").await;
+    assert_eq!(compare(&d, 2).await, (vec![], vec![], false));
+    assert_eq!(walk(&d, 2).await.0, []);
+}
+
+/// A planted partial error on a group the ring holds changes for is
+/// reported with its exact delta, in one pass, and so is the visible row the
+/// partials no longer imply: the changes not applied yet are subtracted, so
+/// what remains is the plant.
+#[tokio::test]
+async fn a_planted_error_on_a_group_with_pending_changes_is_reported_exactly() {
+    let mut d = start().await;
+    step(
+        &mut d,
+        "insert into public.src values (1, 1, 10), (2, 1, 5), (3, 2, 7)",
+    )
+    .await;
+    let hidden = hidden(&d).await;
+    let name = hidden.rsplit('.').next().unwrap().to_string();
+    exec(
+        &d,
+        &format!("update {hidden} set __sum_1 = __sum_1 + 1000000 where g = 1"),
+    )
+    .await;
+    exec(
+        &d,
+        "insert into public.src values (4, 1, 100); update public.src set v = 6 where id = 2",
+    )
+    .await;
+    let (found, uncertain, all) = compare(&d, 10).await;
+    assert_eq!(
+        found,
+        [
+            cell("1", &format!("{name}.__sum_1"), Some("1000015"), Some("15")),
+            cell("1", "total", Some("15"), Some("1000015")),
+        ]
+    );
+    assert_eq!((uncertain, all), (vec![], false));
+}
+
+/// A change with no image (a `Recompute`) can't be subtracted: the groups it
+/// may touch, its key's current row's and its prior image's, are the only
+/// ones the comparison can't vouch for, and only a divergence on one of them
+/// is re-checked.
+#[tokio::test]
+async fn an_image_less_pending_change_leaves_only_its_groups_uncertain() {
+    let mut d = start().await;
+    step(
+        &mut d,
+        "insert into public.src values (1, 1, 10), (2, 2, 5), (3, 3, 7)",
+    )
+    .await;
+    d.stage_recomputes(SRC, &["1"]).await;
+    assert_eq!(
+        compare(&d, 10).await,
+        (vec![], vec!["1".to_string()], false)
+    );
+    d.stage_recomputes_with_prior(
+        SRC,
+        &[("2", Some(r#"{"id": 2, "g": 4, "v": 5}"#.to_string()))],
+    )
+    .await;
+    let (found, uncertain, all) = compare(&d, 1).await;
+    assert_eq!(found, []);
+    assert_eq!(uncertain, ["1", "2", "4"]);
+    assert!(!all);
+}
+
+/// A key the definition holds: its changes the drain parked (applied, as the
+/// drain counts it, but left out of the target) and those it hasn't reached
+/// yet are both subtracted, so the comparison finds nothing while the key is
+/// held; its release applies them.
+#[tokio::test]
+async fn a_held_keys_parked_and_pending_changes_are_subtracted() {
+    let mut d = start().await;
+    step(
+        &mut d,
+        "insert into public.src values (1, 1, 10), (2, 2, 20)",
+    )
+    .await;
+    d.ctl
+        .execute(
+            "insert into poison (transform_id, src_table, key, last_error) \
+             select id, $1, '1', 'test' from transform_definitions \
+             where target_table = 'public.agg'",
+            &[&SRC],
+        )
+        .await
+        .expect("hold the key");
+    step(&mut d, "update public.src set g = 2, v = 11 where id = 1").await;
+    assert_eq!(
+        d.rows("select count(*) from poison_held").await,
+        ["(1)"],
+        "the change was parked"
+    );
+    assert_eq!(compare(&d, 10).await, (vec![], vec![], false));
+    exec(&d, "update public.src set g = 3 where id = 1").await;
+    assert_eq!(compare(&d, 10).await, (vec![], vec![], false));
+    let batch = d.seal().await;
+    d.drain(batch, "parks").await;
+    assert_eq!(compare(&d, 10).await, (vec![], vec![], false));
+    trellis::staging::release_key(d.pool(), "agg", SRC, "1")
+        .await
+        .expect("release the key");
+    d.settle().await;
+    assert_eq!(compare(&d, 10).await, (vec![], vec![], false));
+    assert_eq!(walk(&d, 10).await.0, []);
+}
+
+/// A source `TRUNCATE` the drain hasn't applied touches every group: the
+/// comparison can't vouch for any until it applies.
+#[tokio::test]
+async fn a_pending_truncate_leaves_every_group_uncertain() {
+    let mut d = start().await;
+    step(
+        &mut d,
+        "insert into public.src values (1, 1, 10), (2, 2, 20)",
+    )
+    .await;
+    exec(&d, "truncate public.src").await;
+    let (_, _, all) = compare(&d, 10).await;
+    assert!(all);
+    d.settle().await;
+    assert_eq!(compare(&d, 10).await, (vec![], vec![], false));
+}
+
+/// A group an absolute write (a recompute, a rebuild) rewrote from a
+/// snapshot that saw a change the drain hasn't applied yet already counts
+/// that change, and its page will refuse it: the comparison doesn't
+/// subtract it either. A change after the snapshot is subtracted as usual.
+#[tokio::test]
+async fn a_pending_change_a_groups_basis_saw_is_not_subtracted() {
+    let mut d = start().await;
+    step(
+        &mut d,
+        "insert into public.src values (1, 1, 10), (2, 1, 5), (3, 2, 7)",
+    )
+    .await;
+    exec(&d, "insert into public.src values (4, 1, 100)").await;
+    let batch = d.seal().await;
+    let hidden = hidden(&d).await;
+    exec(
+        &d,
+        &format!(
+            "update {hidden} set __n = 3, __count_1 = 3, __sum_1 = 115, \
+                 __basis = pg_current_snapshot() where g = 1; \
+             update public.agg set total = 115, n = 3 where g = 1"
+        ),
+    )
+    .await;
+    assert_eq!(compare(&d, 10).await, (vec![], vec![], false));
+    exec(&d, "insert into public.src values (5, 1, 1)").await;
+    assert_eq!(compare(&d, 10).await, (vec![], vec![], false));
+    d.drain(batch, "refuses").await;
+    assert_eq!(compare(&d, 10).await, (vec![], vec![], false));
+    d.settle().await;
+    assert_eq!(walk(&d, 10).await.0, []);
 }

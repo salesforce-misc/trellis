@@ -21,7 +21,7 @@ use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ValueType;
 use trellis::integer::IntWidth;
 use trellis::staging::self_check::{
-    Divergence, SelfCheckMode, SelfCheckOutcome, SelfCheckScope, check_page,
+    Divergence, SelfCheckMode, SelfCheckOutcome, SelfCheckScope, check_page, compare_page,
 };
 
 const DDL: &str = "create table public.a (id integer primary key, ga integer, t integer, \
@@ -586,4 +586,181 @@ async fn a_capture_fault_on_either_table_is_reported_before_the_comparison() {
             .expect("enable capture");
         assert_eq!(walk(&d, "i", 100).await.0, Vec::new(), "{table}");
     }
+}
+
+// ------------------------------------- the ring rows not applied yet (#1140)
+
+/// One comparison of every part of `target`, `limit` keys a page, with no
+/// convergence wait and no re-check, whatever the ring holds: the
+/// divergences, and per part (`t`, `p`, `m`, `j`) the keys it couldn't vouch
+/// for exactly, `*` for every key.
+async fn compare(d: &Driver, target: &str, limit: i64) -> (Vec<Divergence>, Vec<String>) {
+    let mut after: Option<String> = None;
+    let (mut found, mut uncertain) = (Vec::new(), Vec::new());
+    loop {
+        let part = after
+            .as_deref()
+            .map_or("t", |a| a.split(':').next().unwrap())
+            .to_string();
+        let page = compare_page(d.pool(), target, SelfCheckScope { after, limit })
+            .await
+            .expect("a comparison");
+        found.extend(page.divergences);
+        if page.uncertain_all {
+            uncertain.push(format!("{part}:*"));
+        }
+        uncertain.extend(page.uncertain_keys.iter().map(|k| format!("{part}:{k}")));
+        after = page.next_after;
+        if after.is_none() {
+            uncertain.sort();
+            uncertain.dedup();
+            return (found, uncertain);
+        }
+    }
+}
+
+/// Every part of both targets finds nothing and can vouch for every key,
+/// at every page size.
+async fn check(d: &Driver, when: &str) {
+    for target in ["l", "i"] {
+        for limit in [1, 3, 100] {
+            assert_eq!(
+                compare(d, target, limit).await,
+                (vec![], vec![]),
+                "{target}, limit {limit}, {when}"
+            );
+        }
+    }
+}
+
+/// Changes neither side's drain has applied, on each side alone and on both
+/// sides of the same join keys (a key gaining its first match, one losing
+/// its last, a row moving between keys and groups, `NULL` keys), against a
+/// correct target: every part (`T` and the visible rows, `P`, `M`, `J`)
+/// compares against its tables minus them, so finds nothing, on both kinds,
+/// at every page size. Applying them changes nothing either.
+#[tokio::test]
+async fn ring_rows_not_applied_yet_are_subtracted_on_every_part() {
+    let mut d = start(&[LEFT_PAIR, INNER]).await;
+    seed(&mut d).await;
+    let clean = (vec![], vec![]);
+    // The `FROM` side alone.
+    exec(
+        &d,
+        "insert into public.a values (10, 5, 1, 1, 4), (11, 6, 7, 7, 1); \
+         update public.a set x = x + 1, ga = 2 where id = 1; \
+         update public.a set k = null where id = 2",
+    )
+    .await;
+    let sealed = d.seal().await;
+    check(&d, "the FROM side pending").await;
+    // The joined side alone.
+    exec(
+        &d,
+        "insert into public.b values (10, 1, 9, 60, 2); \
+         update public.b set y = 7 where id = 1; \
+         delete from public.b where id = 7",
+    )
+    .await;
+    check(&d, "both sides pending").await;
+    d.drain(sealed, "late").await;
+    check(&d, "the joined side pending").await;
+    // Both sides of the same keys, in one transaction and across two: key
+    // (7, 7) gains its first match, key (1, 2) loses its last, a joined row
+    // moves to key (1, 1).
+    exec(
+        &d,
+        "begin; \
+         insert into public.b values (11, 7, 7, 70, 5); \
+         update public.a set x = 3 where id = 11; \
+         commit; \
+         delete from public.b where id = 3; \
+         update public.b set k = 1, gb = 20 where id = 10; \
+         insert into public.a values (12, 1, 1, 2, 8)",
+    )
+    .await;
+    check(&d, "both sides of the same keys pending").await;
+    d.settle().await;
+    check(&d, "settled").await;
+    for target in ["l", "i"] {
+        assert_eq!(walk(&d, target, 3).await.0, [], "{target}");
+    }
+    assert_eq!(compare(&d, "l", 2).await, clean);
+}
+
+/// A planted error in `T`, and one in `P`, on a group and a cell the ring
+/// holds changes for, are reported with their exact deltas in one pass: the
+/// changes not applied yet are subtracted, so what remains is the plant.
+#[tokio::test]
+async fn a_planted_error_with_pending_changes_is_reported_exactly() {
+    let mut d = start(&[INNER]).await;
+    seed(&mut d).await;
+    let (t, t_name) = hidden(&d, "i", "t").await;
+    let (p, p_name) = hidden(&d, "i", "p").await;
+    // Group 1 (a's rows 1 and 2, key 1, each matching b's rows 1, 2 and
+    // 5): 6 pairs, `a.x` summed over them 30.
+    exec(
+        &d,
+        &format!("update {t} set __sum_1 = __sum_1 + 1000000 where ga = 1"),
+    )
+    .await;
+    exec(
+        &d,
+        &format!("update {p} set __n = __n + 1000 where ga = 1 and k = 1"),
+    )
+    .await;
+    exec(
+        &d,
+        "update public.a set x = 20 where id = 1; \
+         insert into public.b values (12, 5, 1, 1, 1)",
+    )
+    .await;
+    let (found, uncertain) = compare(&d, "i", 100).await;
+    assert_eq!(uncertain, Vec::<String>::new());
+    assert_eq!(
+        found,
+        [
+            cell(
+                "1",
+                &format!("{t_name}.__sum_1"),
+                Some("1000030"),
+                Some("30")
+            ),
+            cell(
+                "1\u{1f}1",
+                &format!("{p_name}.__n"),
+                Some("1002"),
+                Some("2")
+            ),
+        ]
+    );
+}
+
+/// A change with no image (a `Recompute`) can't be subtracted: on its own
+/// side's part only the cells it may touch are uncertain, and every group of
+/// `T`, since any pair may hold its row.
+#[tokio::test]
+async fn an_image_less_pending_change_leaves_its_cells_and_t_uncertain() {
+    let mut d = start(&[INNER]).await;
+    seed(&mut d).await;
+    d.stage_recomputes("public.a", &["1"]).await;
+    // a's row 1: group 1, key 1.
+    assert_eq!(
+        compare(&d, "i", 100).await,
+        (vec![], vec!["p:1\u{1f}1".to_string(), "t:*".to_string()])
+    );
+    d.stage_recomputes("public.b", &["2"]).await;
+    // b's row 2: no group of its own in `i`, key 1.
+    assert_eq!(
+        compare(&d, "i", 100).await,
+        (
+            vec![],
+            vec![
+                "j:1".to_string(),
+                "m:1".to_string(),
+                "p:1\u{1f}1".to_string(),
+                "t:*".to_string()
+            ]
+        )
+    );
 }

@@ -6,7 +6,7 @@
 //! 1. **`T` and the visible target**, a page of target groups, by the group
 //!    key text (`ddl::pk_key_sql_expr` over the target's identity). One
 //!    statement reads, under one snapshot, the definition's own `JOIN …
-//!    GROUP BY` over the two tables (each group's row count, each
+//!    GROUP BY` over the two tables as the target has applied them (each group's row count, each
 //!    argument's non-null count and, for a summed argument, its sum, and
 //!    each visible field as the definition writes it), `T`'s partials, and
 //!    the visible rows. `T` is compared against the query's partials, which
@@ -37,11 +37,18 @@
 //!
 //! It reports, never repairs (ADR-0013, #1096 decision 3): the remedy is a
 //! `request_backfill` or a `PAUSE`/`RESUME`. Like every page, it is read only
-//! after `super::self_check::audit`'s convergence wait, and under
-//! `SelfCheckMode::Standard` a divergence is reported only if it reproduces
-//! after a second one. That re-check matches a divergence by its key and
-//! column, so a hot group whose value differs on both passes is reported,
-//! as on any other target (#1140). The hidden basis and stamp aren't read.
+//! after `super::self_check::audit`'s convergence wait. Each part reads its
+//! tables minus the ring rows not applied yet ([`super::self_check_ring`]):
+//! every row weighted `+1`, each unapplied change's old image `+1` and new
+//! image `-1` (left out where its page would refuse it, by its `P` or `M`
+//! cell's basis or its side's truncate floor). `P`, `M` and `J` sum their
+//! side's weights; the target's part runs the definition's `JOIN … GROUP BY`
+//! over both tables' weighted rows, each pair weighing the product of its
+//! rows' weights, which is `Σ_k (P − ΔP) ⊗ (M − ΔM)` without the partial
+//! algebra. So a divergence is reported from one pass. An unapplied change
+//! with no usable image names the cells of its side it may touch as
+//! uncertain, and every group of the target's part, which any pair may hold;
+//! a divergence there is reported only if it reproduces after a second wait.
 //!
 //! The SQL here is rendered from the definition separately from the apply
 //! path's (`super::join`): the query is the definition's own `JOIN …
@@ -66,7 +73,8 @@ use crate::pool::{Pool, quote_ident};
 use super::self_check::{
     BYTE_ORDER, ComparePass, Divergence, SelfCheckError, SelfCheckScope, render_leaf,
 };
-use super::self_check_groups::{Side, partial_text};
+use super::self_check_groups::{Side, Uncertain, partial_text, weighted_partials};
+use super::self_check_ring::{Lands, Ring, WEIGHT};
 
 /// One part of the walk (the module doc), in walk order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,13 +235,17 @@ fn value_fields(def: &TransformDef) -> Vec<&crate::defs::ast::FieldDef> {
 /// Refuses a `JOIN` definition with a field or argument [`render`] can't
 /// render.
 pub(super) fn check_renders(def: &Definition) -> Result<(), SelfCheckError> {
+    let args: Vec<Expr> = spec::side_arguments(&def.def, JoinSide::From)
+        .into_iter()
+        .chain(spec::side_arguments(&def.def, JoinSide::Joined))
+        .collect();
     for field in value_fields(&def.def) {
-        render(&def.def, &field.expr, "a", "b").map_err(|detail| {
-            SelfCheckError::UnsupportedExpr {
+        render(&def.def, &field.expr, "a", "b")
+            .and_then(|_| render_signed(&def.def, &field.expr, &args))
+            .map_err(|detail| SelfCheckError::UnsupportedExpr {
                 target: def.def.target.clone(),
                 detail,
-            }
-        })?;
+            })?;
     }
     Ok(())
 }
@@ -281,25 +293,6 @@ fn partial_columns(summed: &[bool]) -> Vec<String> {
     names
 }
 
-/// The source side's partials over `args` (rendered), in
-/// [`partial_columns`]' order, as text.
-fn source_partials(args: &[String], summed: &[bool]) -> Vec<String> {
-    let mut parts = vec![partial_text("__n", "count(*)")];
-    for (i, (arg, summed)) in args.iter().zip(summed).enumerate() {
-        parts.push(partial_text(
-            &format!("__count_{}", i + 1),
-            &format!("count({arg})"),
-        ));
-        if *summed {
-            parts.push(partial_text(
-                &format!("__sum_{}", i + 1),
-                &format!("coalesce(sum(coalesce({arg}, 0)::numeric), 0)"),
-            ));
-        }
-    }
-    parts
-}
-
 /// Key columns `names`, for [`ddl::pk_key_sql_expr`]: nullable, so a `NULL`
 /// part encodes as the ring's key text does.
 fn key_columns(names: &[String]) -> Vec<PrimaryKeyColumn> {
@@ -327,11 +320,24 @@ fn after_sql(key: &str) -> String {
     format!("($1::text is null or {key} > $1)")
 }
 
+/// What a page reads of the ring besides its own sides
+/// (`super::self_check_ring`): the CTEs it needs first (each ending with
+/// `, `), a query of the key text (`__k`) of every key an unsubtractable
+/// ring row may touch, and the condition under which every key may.
+struct RingReads {
+    ctes: String,
+    uncertain: String,
+    global: String,
+}
+
 /// The statement of a page of `P`, `M` or `J`: `$1` is the cursor's key,
 /// `$2` the limit; each row is `(side, page_end, key, values)`, side 1 the
-/// source's and 2 the hidden table's, as `super::self_check_groups`' page.
-/// `source_from` names the source rows as `__s`, carrying `key`'s columns,
-/// and `source_where` (`and …`, or empty) filters them.
+/// source's and 2 the hidden table's, as `super::self_check_groups`' page,
+/// and sides 5 and 6 its uncertain keys and its "every key" row.
+/// `source_from` names the weighted source rows as `__s`, carrying `key`'s
+/// columns, `source_where` (`and …`, or empty) filters them, and `having`
+/// keeps a key whose partials aren't all zero.
+#[allow(clippy::too_many_arguments)]
 fn partials_page_sql(
     key: &[PrimaryKeyColumn],
     hidden: &str,
@@ -339,6 +345,8 @@ fn partials_page_sql(
     source_from: &str,
     source_where: &str,
     source_values: &[String],
+    having: &str,
+    ring: &RingReads,
 ) -> String {
     let hk = key_sql(key, "__h");
     let sk = key_sql(key, "__s");
@@ -347,7 +355,8 @@ fn partials_page_sql(
         .map(|c| format!("__s.{}", quote_ident(&c.name)))
         .collect();
     format!(
-        "with hid as materialized ( \
+        "with {ctes}\
+         hid as materialized ( \
              select {hk} as __k, array[{hv}]::text[] as __v from {hidden} __h \
              where {h_after} order by __k limit $2), \
          hid_end as (select max(__k) as e from hid having count(*) >= $2), \
@@ -355,7 +364,8 @@ fn partials_page_sql(
              select {sk} as __k, array[{sv}]::text[] as __v from {source_from} \
              where {s_after} and ((select e from hid_end) is null or {sk} <= (select e from hid_end)) \
                    {source_where} \
-             group by {group} order by __k limit $2), \
+             group by {group} having {having} order by __k limit $2), \
+         unc as ({uncertain}), \
          page as ( \
              select least((select max(__k) from src having count(*) >= $2), \
                           (select e from hid_end)) as page_end) \
@@ -363,12 +373,19 @@ fn partials_page_sql(
           where page.page_end is null or src.__k <= page.page_end \
          union all \
          select 2, page.page_end, hid.__k, hid.__v from hid, page \
-          where page.page_end is null or hid.__k <= page.page_end",
+          where page.page_end is null or hid.__k <= page.page_end \
+         union all \
+         select 5, page.page_end, unc.__k, null::text[] from unc, page \
+         union all \
+         select 6, page.page_end, '', null::text[] from page where {global}",
+        ctes = ring.ctes,
         hv = hidden_values.join(", "),
         h_after = after_sql(&hk),
         sv = source_values.join(", "),
         s_after = after_sql(&sk),
         group = group.join(", "),
+        uncertain = ring.uncertain,
+        global = ring.global,
     )
 }
 
@@ -381,6 +398,11 @@ struct Audit<'a> {
     /// The two tables, quoted.
     from_table: String,
     joined_table: String,
+    /// The two tables as the ring names them, and their row identities.
+    from_src: &'a str,
+    joined_src: &'a str,
+    from_pk: Vec<PrimaryKeyColumn>,
+    joined_pk: Vec<PrimaryKeyColumn>,
     target: String,
     from_args: Vec<Expr>,
     joined_args: Vec<Expr>,
@@ -411,34 +433,91 @@ impl Audit<'_> {
             .collect()
     }
 
+    fn unsupported(&self, detail: String) -> SelfCheckError {
+        SelfCheckError::UnsupportedExpr {
+            target: self.def.target.clone(),
+            detail,
+        }
+    }
+
     fn render_args(&self, args: &[Expr], alias: &str) -> Result<Vec<String>, SelfCheckError> {
         args.iter()
-            .map(|arg| {
-                render(self.def, arg, alias, alias).map_err(|detail| {
-                    SelfCheckError::UnsupportedExpr {
-                        target: self.def.target.clone(),
-                        detail,
-                    }
-                })
-            })
+            .map(|arg| render(self.def, arg, alias, alias).map_err(|d| self.unsupported(d)))
             .collect()
     }
 
-    /// `P` or `M`'s page statement, and its partial columns.
+    /// `side`'s table's unapplied ring rows (`super::self_check_ring`).
+    fn ring(&self, side: JoinSide) -> Ring<'_> {
+        match side {
+            JoinSide::From => Ring {
+                src_table: self.from_src,
+                source_row: self.from_table.clone(),
+                source_pk: &self.from_pk,
+                transform_id: self.id,
+                tag: "a",
+            },
+            JoinSide::Joined => Ring {
+                src_table: self.joined_src,
+                source_row: self.joined_table.clone(),
+                source_pk: &self.joined_pk,
+                transform_id: self.id,
+                tag: "b",
+            },
+        }
+    }
+
+    /// `ring`'s CTEs, its changes landing where a page applies `side`'s:
+    /// in `P` or `M`, above that table's truncate floor and unseen by its
+    /// cell's basis. A joined row with a `NULL` join-key part lands nowhere.
+    fn ring_ctes(&self, side: JoinSide, ring: &Ring<'_>) -> String {
+        let hidden = self.hidden(match side {
+            JoinSide::From => Part::From,
+            JoinSide::Joined => Part::Joined,
+        });
+        let cells = spec::side_key_columns(self.def, side);
+        let filter: String = match side {
+            JoinSide::From => String::new(),
+            JoinSide::Joined => spec::join_key(self.def, side)
+                .iter()
+                .map(|c| format!(" and r.{} is not null", quote_ident(c)))
+                .collect(),
+        };
+        ring.ctes(&Lands {
+            floor_key: &hidden,
+            basis: Some((&hidden, &cells)),
+            filter,
+        })
+    }
+
+    /// The key text (`__k`) over `key`'s columns of each image of
+    /// `ring`'s uncertain rows, populated as `__s`, after `rename` (a
+    /// lateral `select` over `__r`, the populated row, naming `key`'s
+    /// columns as `__s`'s; `None`: `__s` is the populated row itself).
+    fn uncertain_keys(ring: &Ring<'_>, key: &[PrimaryKeyColumn], rename: Option<&str>) -> String {
+        let populated = match rename {
+            None => format!(
+                "cross join lateral jsonb_populate_record(null::{}, u.__i) as __s",
+                ring.source_row
+            ),
+            Some(rename) => format!(
+                "cross join lateral jsonb_populate_record(null::{}, u.__i) as __r \
+                 cross join lateral (select {rename}) as __s",
+                ring.source_row
+            ),
+        };
+        format!(
+            "select distinct {} as __k from ({}) u {populated}",
+            key_sql(key, "__s"),
+            ring.uncertain_images_sql()
+        )
+    }
+
+    /// `P` or `M`'s page statement, and its partial columns: the side's
+    /// cells against a `GROUP BY` of its table's weighted rows.
     fn side_page(&self, side: JoinSide) -> Result<(String, Vec<String>), SelfCheckError> {
-        let (part, table, args, summed) = match side {
-            JoinSide::From => (
-                Part::From,
-                &self.from_table,
-                &self.from_args,
-                &self.from_summed,
-            ),
-            JoinSide::Joined => (
-                Part::Joined,
-                &self.joined_table,
-                &self.joined_args,
-                &self.joined_summed,
-            ),
+        let (part, args, summed) = match side {
+            JoinSide::From => (Part::From, &self.from_args, &self.from_summed),
+            JoinSide::Joined => (Part::Joined, &self.joined_args, &self.joined_summed),
         };
         let key = key_columns(&spec::side_key_columns(self.def, side));
         // A joined row with a `NULL` join-key part joins nothing, and has no
@@ -451,49 +530,82 @@ impl Audit<'_> {
                 .collect(),
         };
         let columns = partial_columns(summed);
+        let rendered: Vec<(String, bool)> = self
+            .render_args(args, "__s")?
+            .into_iter()
+            .zip(summed.iter().copied())
+            .collect();
+        let (values, nonzero) = weighted_partials(&rendered);
+        let ring = self.ring(side);
+        let reads = RingReads {
+            ctes: self.ring_ctes(side, &ring),
+            uncertain: Self::uncertain_keys(&ring, &key, None),
+            global: ring.global_sql(),
+        };
         let sql = partials_page_sql(
             &key,
             &self.hidden(part),
             &Self::hidden_values(&columns),
-            &format!("{table} __s"),
+            &format!("{} __s", ring.weighted_sql()),
             &source_where,
-            &source_partials(&self.render_args(args, "__s")?, summed),
+            &values,
+            &nonzero,
+            &reads,
         );
         Ok((sql, columns))
     }
 
     /// `J`'s page statement: each join key's `__matches` against the joined
-    /// table's rows for it, read under `J`'s column names.
+    /// table's weighted row count for it, read under `J`'s column names.
     fn matches_page(&self) -> String {
         let j_cols = spec::join_key(self.def, JoinSide::From);
         let joined_cols = spec::join_key(self.def, JoinSide::Joined);
-        let renamed: Vec<String> = joined_cols
-            .iter()
-            .zip(&j_cols)
-            .map(|(b, j)| format!("__b.{} as {}", quote_ident(b), quote_ident(j)))
-            .collect();
+        let renamed = |alias: &str| {
+            joined_cols
+                .iter()
+                .zip(&j_cols)
+                .map(|(b, j)| format!("{alias}.{} as {}", quote_ident(b), quote_ident(j)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
         let not_null: String = j_cols
             .iter()
             .map(|c| format!(" and __s.{} is not null", quote_ident(c)))
             .collect();
+        let key = key_columns(&j_cols);
+        let ring = self.ring(JoinSide::Joined);
+        let reads = RingReads {
+            ctes: self.ring_ctes(JoinSide::Joined, &ring),
+            uncertain: Self::uncertain_keys(&ring, &key, Some(&renamed("__r"))),
+            global: ring.global_sql(),
+        };
         partials_page_sql(
-            &key_columns(&j_cols),
+            &key,
             &self.hidden(Part::Matches),
             &["__matches::text".to_string()],
             &format!(
-                "{} __b cross join lateral (select {}) __s",
-                self.joined_table,
-                renamed.join(", ")
+                "{} __b cross join lateral (select {}, __b.{WEIGHT} as {WEIGHT}) __s",
+                ring.weighted_sql(),
+                renamed("__b"),
             ),
             &not_null,
-            &["count(*)::text".to_string()],
+            &[format!("sum(__s.{WEIGHT})::text")],
+            &format!("sum(__s.{WEIGHT}) <> 0"),
+            &reads,
         )
     }
 
     /// The target part's statement (the module doc): each row is `(side,
     /// page_end, key, values)`, side 1 the query's partials, 2 `T`'s, 3 the
-    /// query's visible rows and 4 the target's. `identity` is the target's
-    /// group key; `field_types` the visible fields' column types.
+    /// query's visible rows and 4 the target's, and side 6 says every group
+    /// may still differ. `identity` is the target's group key;
+    /// `field_types` the visible fields' column types.
+    ///
+    /// The query is the definition's `JOIN … GROUP BY` over both tables'
+    /// weighted rows (`super::self_check_ring`): each pair's weight is the
+    /// product of its rows', and each partial and field sums weights, so it
+    /// reads both tables as the target has applied them. A `LEFT JOIN`'s
+    /// row is unmatched while its key's joined rows weigh 0 in all.
     fn target_page(
         &self,
         identity: &[PrimaryKeyColumn],
@@ -501,10 +613,6 @@ impl Audit<'_> {
         field_types: &HashMap<String, String>,
     ) -> Result<(String, Vec<String>), SelfCheckError> {
         let join = join_of(self.def);
-        let unsupported = |detail: String| SelfCheckError::UnsupportedExpr {
-            target: self.def.target.clone(),
-            detail,
-        };
         let alias = |table: &str| match side_of(self.def, table) {
             Some(JoinSide::Joined) => "__b",
             _ => "__a",
@@ -514,10 +622,17 @@ impl Audit<'_> {
         let vk = key_sql(identity, "__t");
 
         // The query's partials: the `FROM` side's arguments, then the joined
-        // side's, as `T` numbers them.
-        let mut args = Vec::with_capacity(self.from_args.len() + self.joined_args.len());
-        for arg in self.from_args.iter().chain(&self.joined_args) {
-            args.push(render(self.def, arg, "__a", "__b").map_err(unsupported)?);
+        // side's, as `T` numbers them, each a column of the pairs.
+        let all_args: Vec<Expr> = self
+            .from_args
+            .iter()
+            .chain(&self.joined_args)
+            .cloned()
+            .collect();
+        let mut xs = String::new();
+        for (i, arg) in all_args.iter().enumerate() {
+            let rendered = render(self.def, arg, "__a", "__b").map_err(|d| self.unsupported(d))?;
+            xs.push_str(&format!(", {rendered} as __x{}", i + 1));
         }
         let summed: Vec<bool> = self
             .from_summed
@@ -526,12 +641,18 @@ impl Audit<'_> {
             .copied()
             .collect();
         let columns = partial_columns(&summed);
+        let x_columns: Vec<(String, bool)> = summed
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (format!("__x{}", i + 1), *s))
+            .collect();
+        let (sv, nonzero) = weighted_partials(&x_columns);
         let mut oracle_fields = Vec::with_capacity(fields.len());
         for field in fields {
             let pg_type = field_types.get(&field.name).map_or("text", String::as_str);
             oracle_fields.push(format!(
                 "(({})::{pg_type})::text",
-                render(self.def, &field.expr, "__a", "__b").map_err(unsupported)?
+                render_signed(self.def, &field.expr, &all_args).map_err(|d| self.unsupported(d))?
             ));
         }
         let on: Vec<String> = join
@@ -564,26 +685,71 @@ impl Audit<'_> {
             .iter()
             .map(|key| format!("__g.{}", quote_ident(&key.column)))
             .collect();
-        let kind = match join.kind {
-            JoinKind::Inner => "join",
-            JoinKind::Left => "left join",
-        };
+        let (ra, rb) = (self.ring(JoinSide::From), self.ring(JoinSide::Joined));
+        let (wa, wb) = (ra.weighted_sql(), rb.weighted_sql());
+        let mut ctes = self.ring_ctes(JoinSide::From, &ra);
+        ctes.push_str(&self.ring_ctes(JoinSide::Joined, &rb));
+        let mut pairs = format!(
+            "select __g.*, __a.{WEIGHT} * __b.{WEIGHT} as {WEIGHT}{xs} \
+             from {wa} __a join {wb} __b on {on} \
+             cross join lateral (select {groups}) __g",
+            on = on.join(" and "),
+            groups = groups.join(", "),
+        );
+        if join.kind == JoinKind::Left {
+            // Each joined key's rows' weight in all: a `FROM` row whose key's
+            // is 0 (or that has a `NULL` key part) is unmatched.
+            let a_cols = spec::join_key(self.def, JoinSide::From);
+            let b_cols = spec::join_key(self.def, JoinSide::Joined);
+            let b_list: Vec<String> = b_cols
+                .iter()
+                .map(|c| format!("__b.{}", quote_ident(c)))
+                .collect();
+            let b_not_null: Vec<String> = b_cols
+                .iter()
+                .map(|c| format!("__b.{} is not null", quote_ident(c)))
+                .collect();
+            let bn_on: Vec<String> = a_cols
+                .iter()
+                .zip(&b_cols)
+                .map(|(a, b)| format!("__bn.{} = __a.{}", quote_ident(b), quote_ident(a)))
+                .collect();
+            ctes.push_str(&format!(
+                "__bn as materialized ( \
+                     select {b_list}, sum(__b.{WEIGHT}) as {WEIGHT} from {wb} __b \
+                     where {b_not_null} group by {b_list}), ",
+                b_list = b_list.join(", "),
+                b_not_null = b_not_null.join(" and "),
+            ));
+            pairs.push_str(&format!(
+                " union all \
+                 select __g.*, __a.{WEIGHT}{xs} \
+                 from {wa} __a \
+                 cross join lateral (select (null::{b}).*) __b \
+                 cross join lateral (select {groups}) __g \
+                 where not exists (select 1 from __bn where {bn_on} and __bn.{WEIGHT} <> 0)",
+                b = self.joined_table,
+                groups = groups.join(", "),
+                bn_on = bn_on.join(" and "),
+            ));
+        }
         let visible: Vec<String> = fields
             .iter()
             .map(|f| format!("{}::text", quote_ident(&f.name)))
             .collect();
         let sql = format!(
-            "with hid as materialized ( \
+            "with {ctes}\
+             hid as materialized ( \
                  select {hk} as __k, array[{hv}]::text[] as __v from {t} __h \
                  where {h_after} order by __k limit $2), \
              hid_end as (select max(__k) as e from hid having count(*) >= $2), \
              src as materialized ( \
-                 select {gk} as __k, array[{sv}]::text[] as __v, array[{sf}]::text[] as __f \
-                 from {a} __a {kind} {b} __b on {on} \
-                 cross join lateral (select {groups}) __g \
+                 select {gk} as __k, array[{sv}]::text[] as __v, array[{sf}]::text[] as __f, \
+                        sum({WEIGHT}) > 0 as __pos \
+                 from ({pairs}) __g \
                  where {g_after} \
                    and ((select e from hid_end) is null or {gk} <= (select e from hid_end)) \
-                 group by {group_by} order by __k limit $2), \
+                 group by {group_by} having {nonzero} order by __k limit $2), \
              vis as materialized ( \
                  select {vk} as __k, array[{vv}]::text[] as __v from {target} __t \
                  where {v_after} order by __k limit $2), \
@@ -599,27 +765,103 @@ impl Audit<'_> {
               where page.page_end is null or hid.__k <= page.page_end \
              union all \
              select 3, page.page_end, src.__k, src.__f from src, page \
-              where page.page_end is null or src.__k <= page.page_end \
+              where src.__pos and (page.page_end is null or src.__k <= page.page_end) \
              union all \
              select 4, page.page_end, vis.__k, vis.__v from vis, page \
-              where page.page_end is null or vis.__k <= page.page_end",
+              where page.page_end is null or vis.__k <= page.page_end \
+             union all \
+             select 6, page.page_end, '', null::text[] from page \
+              where ({any_a}) or ({any_b})",
             hv = Self::hidden_values(&columns).join(", "),
             t = self.hidden(Part::Target),
             h_after = after_sql(&hk),
-            sv = source_partials(&args, &summed).join(", "),
+            sv = sv.join(", "),
             sf = oracle_fields.join(", "),
-            a = self.from_table,
-            b = self.joined_table,
-            on = on.join(" and "),
-            groups = groups.join(", "),
             g_after = after_sql(&gk),
             group_by = group_by.join(", "),
             vv = visible.join(", "),
             target = self.target,
             v_after = after_sql(&vk),
+            any_a = ra.any_uncertain_sql(),
+            any_b = rb.any_uncertain_sql(),
         );
         Ok((sql, columns))
     }
+}
+
+/// Renders a visible field of a `JOIN` over the weighted pairs of
+/// [`Audit::target_page`] (aliased `__g`): each aggregate sums the pairs'
+/// weights, `COUNT(*)` their weights, `COUNT(x)` those where `x` isn't
+/// `NULL`, `SUM(x)` the positive pairs' `x` less the negative ones' (`NULL`
+/// while that count is 0, as `sum()` is) and `AVG(x)` that sum over that
+/// count, as Postgres's `avg()` divides. `args` are the pairs' `__x<i>`
+/// columns, in order. [`render`]'s twin for weighted rows, written fresh
+/// here, not shared with the apply path.
+fn render_signed(def: &TransformDef, expr: &Expr, args: &[Expr]) -> Result<String, String> {
+    let w = WEIGHT;
+    Ok(match expr {
+        Expr::FunctionCall { name, args: called } => {
+            let upper = name.to_ascii_uppercase();
+            match (upper.as_str(), called.as_slice()) {
+                ("COUNT", []) => format!("sum({w})"),
+                (aggregate @ ("COUNT" | "SUM" | "AVG"), [arg]) => {
+                    let i = args
+                        .iter()
+                        .position(|a| a == arg)
+                        .ok_or_else(|| format!("{aggregate} of an expression it doesn't read"))?;
+                    let x = format!("__x{}", i + 1);
+                    let count = format!("sum({w} * ({x} is not null)::int)");
+                    let sum = format!(
+                        "(coalesce(sum({x}) filter (where {w} > 0), 0) \
+                          - coalesce(sum({x}) filter (where {w} < 0), 0))"
+                    );
+                    match aggregate {
+                        "COUNT" => count,
+                        "SUM" => format!("(case when {count} = 0 then null else {sum} end)"),
+                        _ => format!(
+                            "(case when {count} = 0 then null \
+                              else ({sum})::numeric / ({count})::numeric end)"
+                        ),
+                    }
+                }
+                _ => {
+                    let mut rendered = Vec::with_capacity(called.len());
+                    for arg in called {
+                        rendered.push(render_signed(def, arg, args)?);
+                    }
+                    format!("{}({})", name.to_lowercase(), rendered.join(", "))
+                }
+            }
+        }
+        Expr::BinaryOp { op, lhs, rhs } => {
+            let symbol = match op {
+                Operator::Add => "+",
+                Operator::GreaterThan => ">",
+            };
+            format!(
+                "({} {symbol} {})",
+                render_signed(def, lhs, args)?,
+                render_signed(def, rhs, args)?
+            )
+        }
+        Expr::SourceColumn { table, column, .. }
+            if join_of(def)
+                .group_by
+                .iter()
+                .any(|key| &key.table == table && &key.column == column) =>
+        {
+            format!("__g.{}", quote_ident(column))
+        }
+        Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::TypedLiteral { .. } => {
+            render_leaf(expr)?
+        }
+        _ => {
+            return Err(format!(
+                "a field reading {expr:?} outside an aggregate, which a JOIN definition can't \
+                 hold"
+            ));
+        }
+    })
 }
 
 /// One page of the comparison of a `JOIN` target: the part the cursor names
@@ -646,12 +888,18 @@ pub(super) async fn compare(
         })?;
     let from_args = spec::side_arguments(&def.def, JoinSide::From);
     let joined_args = spec::side_arguments(&def.def, JoinSide::Joined);
+    let from_pk = ddl::source_primary_key(pool, &def.source_table).await?;
+    let joined_pk = ddl::source_primary_key(pool, &joined).await?;
     let audit = Audit {
         def: &def.def,
         id: def.id,
         schema: pool.schema().to_string(),
         from_table: ddl::qualified_source_table(&def.source_table),
         joined_table: ddl::qualified_source_table(&joined),
+        from_src: &def.source_table,
+        joined_src: &joined,
+        from_pk,
+        joined_pk,
         target: ddl::qualified_target_table_ident(&def.target_table),
         from_summed: summed(&def.def, &from_args),
         joined_summed: summed(&def.def, &joined_args),
@@ -676,11 +924,20 @@ pub(super) async fn compare(
     let rows = client.query(sql.as_str(), &[&after, &scope.limit]).await?;
 
     let mut sides: [Side; 4] = Default::default();
+    let mut uncertain = Uncertain::default();
     let mut page_end: Option<String> = None;
     for row in &rows {
         let side: i32 = row.get(0);
         page_end = row.get(1);
-        sides[(side - 1) as usize].insert(row.get(2), row.get(3));
+        match side {
+            5 => {
+                uncertain.keys.insert(row.get(2));
+            }
+            6 => uncertain.all = true,
+            _ => {
+                sides[(side - 1) as usize].insert(row.get(2), row.get(3));
+            }
+        }
     }
     let [src, hid, oracle, vis] = sides;
     let mut divergences = Vec::new();
@@ -701,6 +958,7 @@ pub(super) async fn compare(
         rows_compared: keys.len() as i64,
         next_after: next_cursor(part, page_end),
         divergences,
+        uncertain,
     })
 }
 
