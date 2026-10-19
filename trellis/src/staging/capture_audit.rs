@@ -97,6 +97,7 @@ use tokio_postgres::GenericClient;
 
 use crate::capture::install::RING_OWNER;
 use crate::capture::sql::{CaptureEvent, function_name, trigger_name};
+use crate::capture::{CaptureError, partitions};
 use crate::defs::catalog::{self, CatalogError};
 use crate::defs::ddl::regclass_arg;
 use crate::defs::hierarchy::{self, Hierarchy};
@@ -291,7 +292,7 @@ pub async fn audit(
     let mut runs_as: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for (table, captured) in read_tables(client, def).await? {
         if captured {
-            let Some(installed) = read_installed(client, schema, &table).await? else {
+            let Some(installed) = read_installed(client, schema, &table, &table).await? else {
                 // A dropped table: the recompute's own read of it reports that.
                 continue;
             };
@@ -299,12 +300,34 @@ pub async fn audit(
                 runs_as.entry(owner).or_default().insert(table.clone());
             }
             faults.extend(installed_faults(&table, &installed));
+            // A partitioned root the reconcile pass records complies (a root
+            // that doesn't is paused by the pass), so it isn't a fault, but
+            // each recorded node carries the root's function set on its own
+            // five triggers (ADR-0017).
+            let recorded = partitions::recorded(client, &table)
+                .await
+                .map_err(|e| match e {
+                    CaptureError::Db(e) => CatalogError::Db(e),
+                    CaptureError::Catalog(e) => e,
+                    // Only the read of `partition_sources` runs here.
+                    _ => CatalogError::Backfill(crate::intake::IntakeError::InvalidTableName(
+                        table.clone(),
+                    )),
+                })?;
             faults.extend(
                 hierarchy::hierarchy(client, &table)
                     .await?
                     .into_iter()
+                    .filter(|h| !(recorded.is_some() && matches!(h, Hierarchy::Partitioned { .. })))
                     .map(CaptureFault::Hierarchy),
             );
+            for node in recorded.iter().flat_map(|r| r.nodes.iter().skip(1)) {
+                if let Some(node_installed) =
+                    read_installed(client, schema, &table, &node.name).await?
+                {
+                    faults.extend(installed_faults(&node.name, &node_installed));
+                }
+            }
         }
         // A table the seam feeds has no capture function, so only the
         // workers read it, as their own role, which the caller's stands in
@@ -412,10 +435,14 @@ struct EventCapture {
 
 /// Reads `table`'s triggers and functions in one statement. `None` if the
 /// table doesn't exist.
+/// `table` names the functions (a partitioned root's set serves every node);
+/// `node` is the table whose triggers are read (`table` itself, or one of its
+/// nodes).
 async fn read_installed(
     client: &impl GenericClient,
     schema: &str,
     table: &str,
+    node: &str,
 ) -> Result<Option<InstalledCapture>, CatalogError> {
     // Only a name that isn't a `schema.table` identity has no function name,
     // and the catalog qualifies every table it records.
@@ -449,7 +476,7 @@ async fn read_installed(
             &[
                 &schema,
                 &functions,
-                &crate::defs::ddl::regclass_arg(table),
+                &crate::defs::ddl::regclass_arg(node),
                 &triggers,
             ],
         )
