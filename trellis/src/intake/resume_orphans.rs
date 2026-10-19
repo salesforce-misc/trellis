@@ -1551,20 +1551,37 @@ fn target_key_cols(target: &SweptTarget) -> Vec<String> {
 }
 
 /// [`delete_keys`]'s lock: `target`'s rows of the keys in `arrays` (see
-/// [`keyset`]), `for update` in key order. A drain page locks a 1-1
-/// target's rows in that order (`staging::apply`'s pre-lock) and an
-/// aggregate's groups in it (the group upsert's `order by`), both ascending
-/// with `NULL`s last.
+/// [`keyset`]), `for update` in the order a drain page takes the same rows
+/// (ADR-0002 I5). A page locks an aggregate's groups in key order, ascending
+/// with `NULL`s last (the group upsert's `order by`). It locks a 1-1
+/// target's rows by `NULL` pattern (`staging::apply`'s pre-lock, issue
+/// #1141): the keys with no `NULL` part first, then each pattern's keys, the
+/// patterns ordered by which columns are `NULL` (a key whose first nullable
+/// column is `NULL` after one whose first nullable column isn't), each
+/// ascending by key. So a 1-1 target's nullable key columns lead its order
+/// with their `is null` flags. A key with no nullable column has none, and
+/// for a single nullable column the flag orders as `NULL`s last does.
 fn lock_statement(target: &SweptTarget, arrays: &[Vec<Option<String>>]) -> String {
     let Keyset {
         relation,
         condition,
     } = keyset(target, arrays);
+    let mut order: Vec<String> = Vec::new();
+    if target.source_guard.is_some() {
+        order.extend(
+            target
+                .key_cols
+                .iter()
+                .filter(|c| c.nullable)
+                .map(|c| format!("t.{} is null", quote_ident(&c.name))),
+        );
+    }
+    order.extend(target_key_cols(target));
     format!(
         "select 1 from {} as t, {relation} as k where {condition} \
          order by {} for update of t",
         target.target_ident,
-        target_key_cols(target).join(", "),
+        order.join(", "),
     )
 }
 
@@ -3771,30 +3788,11 @@ mod db_tests {
         }
     }
 
-    /// Issue #790: [`delete_statement`] reads only its keys' rows of a
-    /// single-column key's target whose statistics lag its size: analyzed at
-    /// 100 rows, then grown to 400k with autovacuum off. Left to the keyset
-    /// join alone, the planner hashed 5,000 keys against a sequential scan of
-    /// the target; [`keyset_bound`] caps the target's side at the keys. The
-    /// delete is explained the way [`Sweep::finish`] runs it, under
-    /// `ENTRY_PLAN_SETTINGS`: with the bound alone, PostgreSQL 16 still
-    /// scanned the target and filtered it (CI). [`lock_statement`] reads the
-    /// same keyset the same way, and the scan count below covers it. The
-    /// single-column target is a 1-1 one, whose delete re-checks its source
-    /// (issue #883): the source's statistics lag the same way, and it is read
-    /// through the keys too.
-    ///
-    /// A composite key isn't bounded. With fresh statistics, a four-column
-    /// key at 2M rows must not be matched by comparing every target row with
-    /// every key, which one bound per column made the planner do (2.6 s
-    /// against 33 ms at 3M rows). A batch with `NULL`-bearing keys in more
-    /// than one pattern isn't bounded either, and still probes the index per
-    /// key while statistics lag. Every key must still be deleted.
     /// A 1-1 target over a source keyed by a nullable unique index has the
     /// same nullable key (issue #1141), and its delete's re-check of the
     /// source (issue #883) is `NULL`-safe: a `NULL`-keyed row the source
     /// still has a row of is kept, of every `NULL` pattern, and only the
-    /// unbacked row goes.
+    /// unbacked row goes. Its lock takes the rows in a drain page's order.
     #[tokio::test]
     async fn the_one_to_one_delete_keeps_a_null_keyed_row_its_source_backs() {
         let cluster = testkit::TestCluster::start();
@@ -3852,6 +3850,35 @@ mod db_tests {
                 Some("4".into()),
             ],
         ];
+        // The lock takes the rows in the order a drain page's pre-lock
+        // does: the keys with no `NULL` part, then each `NULL` pattern's
+        // (`staging::apply`'s `MatchKeys`), not ascending with `NULL`s last,
+        // which would take `(1, NULL)` before `(2, 2)` and deadlock against
+        // a page holding `(2, 2)`.
+        let status = target.status.as_str();
+        let mut params: Vec<&(dyn ToSql + Sync)> =
+            arrays.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
+        params.push(&target.id);
+        params.push(&status);
+        let locked: Vec<String> = raw
+            .query(
+                &lock_statement(&target, &arrays).replacen(
+                    "select 1 ",
+                    "select format('(%s,%s)', t.g, t.h) ",
+                    1,
+                ),
+                &params,
+            )
+            .await
+            .expect("the lock's order")
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(
+            locked,
+            ["(2,2)", "(1,)", "(,3)", "(,4)", "(,)"],
+            "a page's lock order"
+        );
         let txn = raw.transaction().await.expect("begin");
         let mut deleted: Vec<String> = delete_keys(&txn, &target, &arrays)
             .await
@@ -3871,6 +3898,25 @@ mod db_tests {
         );
     }
 
+    /// Issue #790: [`delete_statement`] reads only its keys' rows of a
+    /// single-column key's target whose statistics lag its size: analyzed at
+    /// 100 rows, then grown to 400k with autovacuum off. Left to the keyset
+    /// join alone, the planner hashed 5,000 keys against a sequential scan of
+    /// the target; [`keyset_bound`] caps the target's side at the keys. The
+    /// delete is explained the way [`Sweep::finish`] runs it, under
+    /// `ENTRY_PLAN_SETTINGS`: with the bound alone, PostgreSQL 16 still
+    /// scanned the target and filtered it (CI). [`lock_statement`] reads the
+    /// same keyset the same way, and the scan count below covers it. The
+    /// single-column target is a 1-1 one, whose delete re-checks its source
+    /// (issue #883): the source's statistics lag the same way, and it is read
+    /// through the keys too.
+    ///
+    /// A composite key isn't bounded. With fresh statistics, a four-column
+    /// key at 2M rows must not be matched by comparing every target row with
+    /// every key, which one bound per column made the planner do (2.6 s
+    /// against 33 ms at 3M rows). A batch with `NULL`-bearing keys in more
+    /// than one pattern isn't bounded either, and still probes the index per
+    /// key while statistics lag. Every key must still be deleted.
     #[tokio::test]
     async fn the_sweep_delete_reads_only_its_keys_while_target_statistics_lag() {
         let cluster = testkit::TestCluster::start();

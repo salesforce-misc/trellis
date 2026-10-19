@@ -234,19 +234,20 @@ An instance can read another instance's 1-1 target as a source, exactly as it
 would any other table with a primary key. Its capture triggers sit on the
 owner's target table, so every row the owner's drain writes there fires them,
 as an application's write would, and the owner needs no change. It cannot read
-another instance's aggregate target. Trellis requires a source table to have a primary key
+another instance's aggregate target, or a 1-1 target over one. Trellis requires a source table to have a primary key
 ([transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)), and an aggregate
 target has none: its grouping columns may be `NULL`, so its identity is a
-`UNIQUE NULLS NOT DISTINCT` constraint. Inside the owning instance that never
+`UNIQUE NULLS NOT DISTINCT` constraint. A 1-1 target over it takes the same
+identity. Inside the owning instance that never
 matters, because an instance hands each write to one of its own targets on to
 that target's readers in the writing transaction, without capture triggers.
 That internal path stops at the instance boundary. The reading instance's only
 view of the table is its own capture triggers, and they have no primary key
 to identify a change by, so `CREATE TRANSFORM` rejects the definition with
-`SourceNotChangeKeyed` (issue #376). To chain off an aggregate target, define
+`SourceNotChangeKeyed` (issue #376). To chain off an aggregate target, or a 1-1 target over one, define
 the downstream transform in the instance that owns it. The same goes for a relationship: `CREATE
-RELATIONSHIP` rejects an endpoint that is another instance's aggregate target
-with `RelationshipEndpointNotChangeKeyed` (issue #375), since the relationship
+RELATIONSHIP` rejects an endpoint that is another instance's aggregate target,
+or a 1-1 target over one, with `RelationshipEndpointNotChangeKeyed` (issue #375), since the relationship
 would capture it just the same.
 
 ## Convergence waits

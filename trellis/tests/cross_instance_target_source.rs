@@ -263,6 +263,42 @@ async fn another_instances_one_to_one_target_is_still_accepted() {
     assert!(b_captures(&b, "sales_copy").await);
 }
 
+/// A 1-1 target over an aggregate target takes the aggregate's identity, a
+/// `UNIQUE NULLS NOT DISTINCT` constraint, not a primary key (issue #1141),
+/// so capture can't key its changes either, and instance B rejects a
+/// definition over it as it does one over the aggregate.
+#[tokio::test]
+async fn another_instances_one_to_one_target_over_an_aggregate_is_rejected() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (pool_b, mut b) = two_instances(&db).await;
+    install_definition(
+        &db.pool,
+        "TRANSFORM sku_copy FROM sku_totals SELECT total AS total_copy",
+        &sku_totals_columns(),
+        "public",
+    )
+    .await
+    .expect("instance A chains a 1-1 off its own aggregate target");
+
+    let result = install_definition(
+        &pool_b,
+        "TRANSFORM sku_copy_b FROM public.sku_copy SELECT total_copy AS total_b",
+        &columns(&[("sku", ValueType::Text), ("total_copy", ValueType::Numeric)]),
+        "public",
+    )
+    .await;
+    match result {
+        Err(CatalogError::SourceNotChangeKeyed { source_table }) => {
+            assert_eq!(source_table, "public.sku_copy");
+        }
+        other => panic!("expected SourceNotChangeKeyed, got {other:?}"),
+    }
+    reconcile_b(&pool_b, &mut b).await;
+    assert!(!b_captures(&b, "sku_copy").await);
+    assert!(!table_exists(&b, "public.sku_copy_b").await);
+}
+
 /// Issue #375: a relationship endpoint reaches instance B's capture through
 /// `all_source_tables`' relationship walk, not as a definition's source, so it
 /// must pass the same keying rule. Instance A's aggregate target fails it

@@ -691,3 +691,46 @@ async fn a_one_to_one_reader_of_a_join_target_holds_the_null_group() {
         ["(1)"]
     );
 }
+
+/// An aggregate over a 1-1 reader of a nullable key, grouped by a field:
+/// a `NULL`-keyed row that leaves a group (its count changes, or its group
+/// goes extinct upstream) is found in the group it left through its prior
+/// image, which the 1-1 apply captures for a `NULL`-keyed row as for any
+/// other (#1141).
+#[tokio::test]
+async fn a_rollup_over_a_one_to_one_reader_follows_its_null_keyed_rows() {
+    let mut d = start(
+        "TRANSFORM agg FROM public.src GROUP BY g, h SELECT COUNT(*) AS n",
+        "TRANSFORM a2 FROM public.agg SELECT n AS n",
+        &[("g", int4()), ("h", int4()), ("n", int8())],
+        1,
+    )
+    .await;
+    install(
+        &d,
+        "TRANSFORM roll FROM public.a2 GROUP BY n SELECT COUNT(*) AS groups",
+        &[("g", int4()), ("h", int4()), ("n", int8())],
+    )
+    .await;
+    trellis::intake::markers::settle_registrations(d.pool()).await;
+    d.settle().await;
+    assert_eq!(
+        d.rows("select status from transform_definitions order by id")
+            .await,
+        ["(live)", "(live)", "(live)"]
+    );
+    const ROLL: &str = "select n, groups from public.roll order by n";
+    const ORACLE: &str = "select n, count(*) from (select count(*) as n from public.src \
+                          group by g, h) s group by n order by n";
+    for sql in [
+        "insert into public.src values (1, 1, null, 1), (2, null, null, 1), (3, 1, 1, 1)",
+        "insert into public.src values (4, 1, null, 1), (5, null, null, 1)",
+        "insert into public.src values (6, null, null, 1)",
+        "delete from public.src where id = 4",
+        "delete from public.src where g is null and h is null",
+        "update public.src set h = 2 where id = 1",
+    ] {
+        step(&mut d, sql).await;
+        assert_equal(&mut d, ROLL, ORACLE).await;
+    }
+}

@@ -468,3 +468,34 @@ async fn the_direct_build_writes_the_null_keyed_rows() {
         .expect("the direct build");
     assert_eq!(d.rows(A2_ACTUAL).await, d.rows(A2_ORACLE).await);
 }
+
+/// An aggregate over the reader, grouped by a field: a `NULL`-keyed row's
+/// moves between its groups (its count changes, or its group goes extinct
+/// upstream) reach the rollup as any other row's do.
+#[tokio::test]
+async fn a_rollup_over_the_reader_follows_its_null_keyed_rows() {
+    let mut d = start(None).await;
+    install(
+        &d,
+        "TRANSFORM roll FROM public.a2 GROUP BY n SELECT COUNT(*) AS groups",
+        &[("g", int4()), ("h", int4()), ("n", int8()), ("t1", int8())],
+    )
+    .await;
+    trellis::intake::markers::settle_registrations(d.pool()).await;
+    d.settle().await;
+    assert_live(&d).await;
+    const ROLL: &str = "select n, groups from public.roll order by n";
+    const ORACLE: &str = "select n, count(*) from (select count(*) as n from public.src \
+                          group by g, h) s group by n order by n";
+    for sql in [
+        "insert into public.src values (1, 1, null, 1), (2, null, null, 1), (3, 1, 1, 1)",
+        "insert into public.src values (4, 1, null, 1), (5, null, null, 1)",
+        "insert into public.src values (6, null, null, 1)",
+        "delete from public.src where id = 4",
+        "delete from public.src where g is null and h is null",
+        "update public.src set h = 2 where id = 1",
+    ] {
+        step(&mut d, sql).await;
+        assert_equal(&mut d, ROLL, ORACLE).await;
+    }
+}

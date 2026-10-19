@@ -9641,7 +9641,7 @@ pub(super) fn transpose_pk_parts<'a>(arity: usize, rows: &[Vec<&'a str>]) -> Vec
 
 /// Decoded keys ([`decode_target_pk_parts`]) as [`apply_target`] matches
 /// them against its target: `plain`, each key with no `NULL` part (its
-/// parts, in key order), matched by the key's index as before issue #1141;
+/// parts, in key order), matched by the plain-key statements;
 /// and `patterns`, the keys with a `NULL` part, by their `NULL` pattern
 /// (`pattern[i]`: part `i` is `NULL`), each pattern's non-`NULL` parts
 /// transposed into one array per such column, as [`null_pattern_match`]
@@ -10281,7 +10281,11 @@ async fn apply_target(
         lock_composite_keys(txn, &target_ident, &plan.pk, &lock_columns, &arrays).await?
     };
     // The keys with a `NULL` part, a statement per pattern, after the
-    // others: in ascending key order too, as `NULL` sorts last.
+    // others, the patterns in `MatchKeys`' order and each one's keys in key
+    // order. That isn't ascending key order over a composite key (`(1,
+    // NULL)` locks after `(2, 1)`), so the orphan sweep, which locks these
+    // rows without their entries, orders its lock the same way
+    // (`intake::resume_orphans`'s `lock_statement`).
     for (pattern, columns) in &lock_keys.patterns {
         locked.extend(
             super::ledger::query_by_entry_key(
