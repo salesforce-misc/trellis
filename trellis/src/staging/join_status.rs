@@ -13,7 +13,7 @@
 use tokio_postgres::GenericClient;
 
 use crate::defs::ast::TransformDef;
-use crate::defs::ddl::regclass_arg;
+use crate::defs::ddl::{self, regclass_arg};
 use crate::defs::join::{self as spec, HiddenTable, Side};
 
 use super::unindexed_joins::UnindexedJoin;
@@ -58,10 +58,14 @@ pub struct JoinStatus {
     /// `P`, `M`, `J` and `T`, in that order. A table that doesn't exist is
     /// left out.
     pub hidden_tables: Vec<HiddenTableSize>,
-    /// The `ON` columns of each side no usable index leads with (one entry
-    /// per side; `column` lists the side's join key, `relationship` is the
-    /// definition's target). Each batch's lookups of that side scan the
-    /// table until an index exists. Trellis doesn't create it.
+    /// One entry per side none of whose `ON` columns leads a usable index
+    /// (`ddl::key_column_in`'s definition of indexed; `column` lists the
+    /// side's join key, `relationship` is the definition's target). A side
+    /// whose table or any `ON` column no longer exists is left out. Pages
+    /// never read the source tables (they apply captured images to `P` and
+    /// `M`), so this costs them nothing; it is the definition's own `JOIN`
+    /// run against the tables that can't seek that side by key. Trellis
+    /// doesn't create the index.
     pub unindexed_on: Vec<UnindexedJoin>,
     /// Set when `P`'s estimated rows reach
     /// [`PARTIALS_WARNING_PERCENT`] percent of the fact table's.
@@ -113,10 +117,7 @@ pub(crate) async fn for_definition(
     ] {
         let Some(table) = table else { continue };
         let columns = spec::join_key(def, side);
-        if !columns.is_empty()
-            && table_exists(client, &table).await?
-            && !has_leading_index(client, &table, &columns).await?
-        {
+        if !columns.is_empty() && side_unindexed(client, &table, &columns).await? {
             unindexed_on.push(UnindexedJoin {
                 relationship: def.target.clone(),
                 table,
@@ -132,45 +133,24 @@ pub(crate) async fn for_definition(
     }))
 }
 
-async fn table_exists(
-    client: &impl GenericClient,
-    table: &str,
-) -> Result<bool, tokio_postgres::Error> {
-    Ok(client
-        .query_one(
-            "select pg_catalog.to_regclass($1) is not null",
-            &[&regclass_arg(table)],
-        )
-        .await?
-        .get(0))
-}
-
-/// Whether `table` has a usable b-tree index (valid, ready, live, not
-/// partial, under the column's own collation) whose leading column is one of
-/// `columns`: a lookup by the whole key can then seek instead of scan.
-async fn has_leading_index(
+/// Whether no column of `columns` (one side's join key) is indexed in
+/// `table` ([`ddl::key_column_in`]): a usable b-tree index leading with any
+/// of them lets a lookup by the whole key seek instead of scan. `false` if
+/// the table or any of the columns no longer exists: there is no index to
+/// create, and what the drop did to the definition is reported elsewhere.
+async fn side_unindexed(
     client: &impl GenericClient,
     table: &str,
     columns: &[String],
 ) -> Result<bool, tokio_postgres::Error> {
-    Ok(client
-        .query_one(
-            "select exists (select 1 \
-                            from pg_index i \
-                            join pg_class c on c.oid = i.indexrelid \
-                            join pg_am am on am.oid = c.relam \
-                            join pg_attribute a on a.attrelid = i.indrelid \
-                                               and a.attnum = i.indkey[0] \
-                            where i.indrelid = pg_catalog.to_regclass($1) \
-                              and a.attname = any($2) \
-                              and am.amname = 'btree' \
-                              and i.indcollation[0] = a.attcollation \
-                              and i.indisvalid and i.indisready and i.indislive \
-                              and i.indpred is null)",
-            &[&regclass_arg(table), &columns],
-        )
-        .await?
-        .get(0))
+    for column in columns {
+        match ddl::key_column_in(client, table, column).await? {
+            None => return Ok(false),
+            Some(key_column) if key_column.indexed => return Ok(false),
+            Some(_) => {}
+        }
+    }
+    Ok(true)
 }
 
 async fn partials_warning(

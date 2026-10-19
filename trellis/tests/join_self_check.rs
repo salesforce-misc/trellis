@@ -4,7 +4,8 @@
 //! against what the two tables say they hold. A planted divergence in each is
 //! reported on that table alone, and gone once the planted damage is undone
 //! by hand (the repair for real damage, `request_backfill`, needs the `JOIN`
-//! build, #1109).
+//! build, #1109). One test here checks the `J` lock-wait histogram a page
+//! records (#1112 J7b), since it needs the same knob-on driver.
 //!
 //! Every test turns the group-basis dev knob on before its driver starts (a
 //! `JOIN` applies only behind it), drives the pipeline by hand through
@@ -508,4 +509,44 @@ async fn a_group_on_one_side_only_is_reported_alike_at_every_page_size() {
         9,
         "T's five partials, the row, and P's three partials: {found:?}"
     );
+}
+
+/// Each `JOIN` page records its `J` lock statement's time under the
+/// transform's label, one observation per page that applies it.
+#[tokio::test]
+async fn each_join_page_records_its_j_lock_wait() {
+    trellis::dev::staging::set_group_basis(true);
+    let mut d = Driver::start_with_database_defaults(
+        &[],
+        "create table public.a (id integer primary key, ga integer, k integer); \
+         create table public.b (id integer primary key, k integer, y integer)",
+        &[("id", int4()), ("ga", int4()), ("k", int4())],
+        &[],
+        &[
+            "TRANSFORM lock_wait_join FROM public.a JOIN public.b ON a.k = b.k GROUP BY a.ga \
+           SELECT a.ga AS ga, COUNT(*) AS n, SUM(b.y) AS sy",
+        ],
+        &["public.a", "public.b"],
+    )
+    .await;
+    let count = || {
+        let rendered = trellis::metrics::Metrics::new().render_prometheus();
+        rendered
+            .lines()
+            .find(|line| {
+                line.starts_with("trellis_join_lock_wait_seconds_count{")
+                    && line.contains("lock_wait_join")
+            })
+            .map(|line| line.rsplit(' ').next().unwrap().parse::<f64>().unwrap())
+    };
+    assert_eq!(count(), None);
+    for sql in [
+        "insert into public.a values (1, 1, 7)",
+        "insert into public.b values (1, 7, 10)",
+    ] {
+        d.user().await.batch_execute(sql).await.expect(sql);
+        let batch = d.seal().await;
+        d.drain(batch, "step").await;
+    }
+    assert_eq!(count(), Some(2.0));
 }

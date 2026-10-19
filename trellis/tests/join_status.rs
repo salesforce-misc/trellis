@@ -134,3 +134,64 @@ async fn a_plain_transform_has_no_join_status() {
         .expect("exists");
     assert_eq!(status.join, None);
 }
+
+/// A composite `ON` key is indexed when any of its columns leads a usable
+/// index (a lookup by the whole key seeks on it), a partial index doesn't
+/// count, and a side whose `ON` column was dropped is left out: there is no
+/// index to create on a column that doesn't exist.
+#[tokio::test]
+async fn a_composite_key_counts_any_leading_column_and_a_dropped_one_is_left_out() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.orders (id integer primary key, region text); \
+         create table public.items (id integer primary key, order_id integer, \
+                                    region text, qty integer)",
+    )
+    .await
+    .expect("create tables");
+    let trellis = Trellis::connect(
+        Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
+        TrellisOptions::default(),
+    )
+    .await
+    .expect("connect");
+    trellis
+        .apply(
+            "TRANSFORM by_region FROM orders LEFT JOIN items \
+             ON orders.id = items.order_id AND orders.region = items.region \
+             GROUP BY orders.region \
+             SELECT orders.region AS region, COUNT(*) AS n, SUM(items.qty) AS qty",
+        )
+        .await
+        .expect("define");
+
+    let unindexed = join_status(&trellis).await.unindexed_on;
+    let tables: Vec<_> = unindexed
+        .iter()
+        .map(|on| (on.table.as_str(), on.column.as_str()))
+        .collect();
+    assert_eq!(tables, [("public.items", "order_id, region")]);
+
+    raw.batch_execute("create index on public.items (region) where qty > 0")
+        .await
+        .expect("partial index");
+    assert_eq!(
+        join_status(&trellis).await.unindexed_on.len(),
+        1,
+        "a partial index doesn't count"
+    );
+    raw.batch_execute("create index on public.items (region, id)")
+        .await
+        .expect("index");
+    assert_eq!(join_status(&trellis).await.unindexed_on, []);
+
+    raw.batch_execute(
+        "drop index public.items_region_id_idx; \
+         alter table public.items drop column order_id",
+    )
+    .await
+    .expect("drop the key column");
+    assert_eq!(join_status(&trellis).await.unindexed_on, []);
+}

@@ -422,18 +422,24 @@ other. It reports three things, all warnings that leave the transform's status a
   Estimates keep the call cheap on large tables; they are as fresh as the table's
   last `ANALYZE` or autovacuum.
 - `unindexed_on`: one entry per side of the `JOIN` (the `FROM` table and the joined
-  table) when no usable b-tree index leads with one of that side's `ON` columns.
-  `column` lists the side's join key, and the fix is an index on it, which Trellis
-  doesn't create. It is read from the catalog on each call, like `unindexed_joins`.
+  table) when none of that side's `ON` columns leads a usable index (the same test
+  as `unindexed_joins`). `column` lists the side's join key, and the fix is an index
+  on it, which Trellis doesn't create. Pages never read the two tables (they apply
+  captured changes to `P` and `M`), so the index serves the definition's own `JOIN`
+  run against the tables, not Trellis's apply. A side whose `ON` column no longer
+  exists isn't listed. It is read from the catalog on each call.
 - `partials_warning`: set once `P`'s estimated rows reach half of the `FROM` table's
   (and the `FROM` table has at least 1000 estimated rows). `P` is the `FROM` table
   grouped by its `GROUP BY` columns and join key, so a `P` near the table's size
   means the grouping barely compresses it and the hidden table costs about as much
-  as the table it summarises.
+  as the table it summarises. A `FROM` table joined on a unique key (its primary key,
+  say) has one `P` cell per row, so such a `JOIN` warns once the table passes 1000
+  rows.
 
-The time a `JOIN` page spends waiting for its `J` row locks is the histogram
-`trellis_join_lock_wait_seconds`, labelled by `transform`: a lock wait is another page
-or writer holding a join key, so a rising tail shows contention on hot keys.
+The time a `JOIN` page spends in its sorted `select … for update` of its `J` rows is
+the histogram `trellis_join_lock_wait_seconds`, labelled by `transform`: mostly the
+wait for another page or writer holding one of its join keys, so a rising tail shows
+contention on hot keys.
 `trellis status` prints a `join tables` line and one warning line per finding.
 
 `self_check` refuses a 1-1 transform that reads a relationship with
