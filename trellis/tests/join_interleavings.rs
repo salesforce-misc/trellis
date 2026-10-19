@@ -1751,6 +1751,13 @@ impl Lab {
                 .await
                 .expect("release the key");
         }
+        self.check_released(context).await;
+    }
+
+    /// Checks every target against its `JOIN` before anything drains, then
+    /// settles and checks again: the release's own recompute, not the
+    /// `Recompute` it stages, is what must repair them.
+    async fn check_released(&mut self, context: &str) {
         self.check_applied(context).await;
         for kind in &self.kinds {
             assert_eq!(
@@ -1832,8 +1839,7 @@ async fn the_automatic_retry_recomputes_the_held_keys_cells() {
         .await
         .expect("retry the key");
     }
-    lab.check_applied("after the retry").await;
-    lab.check("after the retry").await;
+    lab.check_released("after the retry").await;
 }
 
 /// A release is a `J`-locked writer: frozen at each point of its write, a
@@ -2011,4 +2017,125 @@ async fn a_join_target_feeds_its_readers_through_the_seam() {
             "after {sql}"
         );
     }
+}
+
+/// A `TRUNCATE` of the joined side refills `T` with each fact's unmatched
+/// term, its joined-side group columns `NULL` whatever their types: here
+/// `timestamptz` and `numeric(10, 2)`, on a two-column `text`/`integer`
+/// key, with a fact whose key has a `NULL` part.
+#[tokio::test]
+async fn a_truncate_of_the_joined_side_refills_typed_unmatched_groups() {
+    trellis::dev::staging::set_group_basis(true);
+    let mut d = Driver::start(
+        "create table public.o (id integer primary key, cid text, rid integer, \
+                                region text, amount numeric(10, 2)); \
+         create table public.c (id integer primary key, cid text, rid integer, \
+                                at timestamptz, price numeric(10, 2), w bigint)",
+        &[
+            ("id", int4()),
+            ("cid", ValueType::Text),
+            ("rid", int4()),
+            ("region", ValueType::Text),
+            ("amount", ValueType::Numeric),
+        ],
+        &[
+            "TRANSFORM r FROM public.o LEFT JOIN public.c ON o.cid = c.cid AND o.rid = c.rid \
+             GROUP BY o.region, c.at, c.price \
+             SELECT o.region AS region, c.at AS at, c.price AS price, COUNT(*) AS n, \
+                    SUM(o.amount) AS revenue, SUM(c.w) AS w",
+        ],
+        &["public.o", "public.c"],
+    )
+    .await;
+    let actual = "select region, at::text, price::text, n, revenue::text, w::text \
+                  from public.r order by 1, 2, 3";
+    let expected = "select o.region, c.at::text, c.price::text, count(*), sum(o.amount)::text, \
+                           sum(c.w)::text \
+                    from public.o left join public.c on o.cid = c.cid and o.rid = c.rid \
+                    group by o.region, c.at, c.price order by 1, 2, 3";
+    for sql in [
+        "insert into public.o values (1, 'x', 1, 'emea', 1.5), (2, 'x', 1, 'emea', 2.25), \
+                                     (3, 'y', 2, 'apac', 4), (4, null, 2, 'apac', 3), \
+                                     (5, 'z', 9, null, 1)",
+        "insert into public.c values (1, 'x', 1, '2026-01-01 00:00+00', 9.99, 7), \
+                                     (2, 'x', 1, '2026-02-01 00:00+00', 1.10, 8), \
+                                     (3, 'y', 2, '2026-03-01 00:00+00', null, 9)",
+        "truncate public.c",
+        "insert into public.c values (4, 'y', 2, '2026-04-01 00:00+00', 5.00, 1)",
+        "begin; truncate public.c; \
+         insert into public.c values (5, 'x', 1, '2026-05-01 00:00+00', 2.00, 2); commit",
+        "truncate public.o",
+        "insert into public.o values (6, 'x', 1, 'emea', 1), (7, 'q', 1, 'emea', 2)",
+    ] {
+        d.user().await.batch_execute(sql).await.expect(sql);
+        let batch = d.seal().await;
+        d.drain(batch, "x").await;
+        assert_eq!(d.rows(actual).await, d.rows(expected).await, "after {sql}");
+    }
+}
+
+/// A page that both applies captured changes to a cell and recomputes it:
+/// the cell gets two delta rows (the apply's and the recompute's), which
+/// the product sums, so `P_old`/`M_old` and the `LEFT` flip terms see the
+/// cell's whole change once. On each side, with a drift only the
+/// recompute repairs, a captured change to the recomputed key itself, a
+/// captured change of another row in the same cell, and on `b` a flip to
+/// unmatched hidden behind a captured insert and delete in the same page.
+#[tokio::test]
+async fn a_page_that_applies_and_recomputes_one_cell_counts_it_once() {
+    let mut lab = lab(Key::Single, &SIX).await;
+    for n in 1..=3 {
+        lab.step(&fill(SEED, n, lab.key)).await;
+    }
+    uncaptured(&lab, "public.a", "update public.a set x = 7 where id = 101").await;
+    lab.write(
+        "insert into public.a values (103, 11, 1, 1, 5); \
+         update public.a set x = 9 where id = 101",
+    )
+    .await;
+    lab.d
+        .stage_recomputes_with_prior(
+            "public.a",
+            &[(
+                "101",
+                Some(r#"{"id": 101, "ga": 11, "t": 1, "k": 1, "x": 10}"#.to_string()),
+            )],
+        )
+        .await;
+    let batch = lab.d.seal().await;
+    lab.d.drain(batch, "x").await;
+    lab.check("a: apply and recompute of one P cell").await;
+    uncaptured(
+        &lab,
+        "public.b",
+        "delete from public.b where id in (101, 201, 301)",
+    )
+    .await;
+    lab.write(
+        "insert into public.b values (103, 1, 1, 11, 5), (203, 2, 2, 22, 5), (303, 3, 3, 31, 5); \
+         delete from public.b where id = 303",
+    )
+    .await;
+    lab.d
+        .stage_recomputes_with_prior(
+            "public.b",
+            &[
+                (
+                    "101",
+                    Some(r#"{"id": 101, "t": 1, "k": 1, "gb": 11, "y": 100}"#.to_string()),
+                ),
+                (
+                    "201",
+                    Some(r#"{"id": 201, "t": 2, "k": 2, "gb": 21, "y": 100}"#.to_string()),
+                ),
+                (
+                    "301",
+                    Some(r#"{"id": 301, "t": 3, "k": 3, "gb": 31, "y": 100}"#.to_string()),
+                ),
+            ],
+        )
+        .await;
+    let batch = lab.d.seal().await;
+    lab.d.drain(batch, "x").await;
+    lab.check("b: apply and recompute of one M cell").await;
 }
