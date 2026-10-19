@@ -243,10 +243,12 @@ another reason, by the operator or by quarantine, and the pass leaves it alone.
 
 A resume never starts a rebuild ahead of its upstream. A definition's upstreams are the
 definitions in the instance whose targets it reads: its source, a `JOIN`'s joined table, or
-a relationship's to-side. A `RESUME` of a definition with an upstream that isn't `live`
-(paused, quarantined, or still rebuilding) is accepted and returns at once, before any
-re-validation: the definition stays paused with a resume request, and its
-`capture_failure` says it is waiting for that upstream to be `live`. This holds whether it
+a relationship's to-side. An upstream is `live` as the operator reads it: one that is
+itself running but reads a definition that isn't `live` reports `catching_up`, since its
+target may still change under a rebuild above it. A `RESUME` of a definition with an
+upstream that isn't `live` (paused, quarantined, rebuilding or catching up) is accepted
+and returns at once, before any re-validation: the definition stays paused with a resume
+request, and its `capture_failure` says it is waiting for that upstream to be `live`. This holds whether it
 was waiting on an upstream's chained resume or paused for any other reason. The capture
 pass completes the request once every upstream is `live`, by the same path as a request
 with copies to re-type: it re-validates, re-types copies if needed, then rebuilds. A
@@ -255,15 +257,17 @@ it isn't retried. So an operator can resume a whole stack at once, in any order,
 comes up in dependency order: the head rebuilds first, and each definition below rebuilds
 once the one above it is `live`. Definitions form no cycle, so the order always exists.
 A definition whose upstream nobody resumes keeps waiting, its `capture_failure` naming
-the upstream; it never resumes past a paused upstream.
+the upstream; it never resumes past a paused upstream, or past one reading a paused
+definition further up.
 
 A `PAUSE` of a definition waiting to be resumed, on an upstream's chained resume or on a
 resume request, withdraws that resume: in one transaction it clears the cause and deletes
 the request, and the definition stays paused like any operator pause. Its
 `capture_failure` no longer says it resumes: an upstream's reason is kept and ends with how
-to resume it, and a request's "resuming: …" text says the operator withdrew it. The pause
-reports this as its own outcome, apart from the no-op pause of a definition already
-frozen.
+to resume it, and a request's "resuming: …" text says the operator withdrew it. `apply`
+reports it as a pause, as it does every pause; that changed `capture_failure`, and the
+instance log's line saying the pause withdrew a resume, tell it apart from the no-op
+pause of a definition already frozen.
 
 Outside a resume, Trellis re-types a column on its own in one case: when every column
 of a table it created that the source widened widened by changing only the catalog.

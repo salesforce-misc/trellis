@@ -227,7 +227,8 @@ async fn withdraw_resume(txn: &Transaction<'_>, id: i64) -> Result<bool, Catalog
         _ => WITHDRAWN_REQUEST.to_string(),
     };
     txn.execute(
-        "update capture_failures set error = $2, caused_by = null, detected_at = now()          where transform_id = $1",
+        "update capture_failures set error = $2, caused_by = null, detected_at = now() \
+         where transform_id = $1",
         &[&id, &error],
     )
     .await?;

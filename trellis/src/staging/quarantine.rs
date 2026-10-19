@@ -4217,17 +4217,33 @@ async fn upstream_not_live(
             .iter()
             .map(crate::defs::model::RelationshipDefinition::qualified_to_table),
     );
-    let row = client
-        .query_opt(
-            "select split_part(target_table, '.', 2), target_table from transform_definitions \
-             where target_table = any($1) and id <> $2 and status <> $3 order by id limit 1",
-            &[&tables, &id, &TransformStatus::Live.as_str()],
+    let upstreams = client
+        .query(
+            "select id, split_part(target_table, '.', 2), target_table, status \
+             from transform_definitions where target_table = any($1) and id <> $2 order by id",
+            &[&tables, &id],
         )
         .await?;
-    Ok(row.map(|row| Upstream {
-        name: row.get(0),
-        table: row.get(1),
-    }))
+    let live = TransformStatus::Live.as_str();
+    // `live` as the operator reads it (`catalog::reported_statuses`, #497):
+    // an upstream stored `live` that reads one that isn't reports
+    // `catching_up`, and its target may still change under a rebuild above
+    // it. Derived only when every upstream is stored `live`.
+    let reported = if upstreams.iter().all(|row| row.get::<_, &str>(3) == live) {
+        Some(catalog::reported_statuses(client).await?)
+    } else {
+        None
+    };
+    Ok(upstreams
+        .into_iter()
+        .find(|row| match &reported {
+            Some(reported) => reported.get(&row.get::<_, i64>(0)) != Some(&TransformStatus::Live),
+            None => row.get::<_, &str>(3) != live,
+        })
+        .map(|row| Upstream {
+            name: row.get(1),
+            table: row.get(2),
+        }))
 }
 
 /// The `capture_failure` of a definition whose resume waits for `upstream`

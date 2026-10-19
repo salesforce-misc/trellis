@@ -867,8 +867,8 @@ or attach a source's partitions until a pass has run.
   paused below the head for k rebuilds in a row. A definition waiting on an
   upstream that doesn't go live (paused, quarantined, refused its own
   resume) keeps waiting. So does a definition an operator resumes while an
-  upstream isn't live: the `RESUME` returns at once and the rebuild waits
-  for the upstream, so a stack resumed at once rebuilds one level at a time
+  upstream isn't live, or reads a definition that isn't: the `RESUME`
+  returns at once and the rebuild waits for the upstream, so a stack resumed at once rebuilds one level at a time
   in the same way. A `PAUSE` of a waiting definition withdraws its resume.
   One whose resume is refused when its upstream is live, because the schema
   changed after the pause, stays paused with the refusal, and isn't tried

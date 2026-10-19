@@ -2793,6 +2793,113 @@ async fn a_stack_resumed_in_any_order_comes_up_in_dependency_order() {
     );
 }
 
+/// #971: an upstream is `live` as the operator reads it (#497): one stored
+/// `live` that reads a definition that isn't reports `catching_up`, and a
+/// resume below it waits for it. A -> B -> C, with A and C paused by the
+/// operator and B left running: after `RESUME A; RESUME C`, C waits on B
+/// while A rebuilds under B, and rebuilds only once B reports `live`.
+#[tokio::test]
+async fn a_resume_waits_for_an_upstream_that_reports_catching_up() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = chain(db.dsn(), &mut raw, &db.pool).await;
+    pause(&trellis, "item_names").await;
+    pause(&trellis, "c_names").await;
+    raw.batch_execute("insert into public.items values (7, 'seven', 7)")
+        .await
+        .expect("a write while paused");
+
+    resume(&trellis, "item_names").await;
+    assert_eq!(status(&raw, "b_names").await, TransformStatus::Live);
+    let reported_b = || async {
+        trellis
+            .status("b_names")
+            .await
+            .expect("status")
+            .expect("b_names")
+            .status
+    };
+    assert_eq!(reported_b().await, TransformStatus::CatchingUp);
+    resume(&trellis, "c_names").await;
+    assert_requested_wait(&trellis, &raw, "c_names", "b_names").await;
+
+    let mut rounds = 0;
+    while reported_b().await != TransformStatus::Live {
+        rounds += 1;
+        assert!(rounds <= 36, "b_names did not report live");
+        match rounds % 3 {
+            1 => full_pass(&mut raw, &db.pool).await,
+            2 => run_backfill_chunks(&db.pool).await,
+            _ => drain_to_quiescence(&db.pool, &mut raw).await,
+        }
+        if reported_b().await != TransformStatus::Live {
+            assert_requested_wait(&trellis, &raw, "c_names", "b_names").await;
+        }
+    }
+
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(
+        status(&raw, "c_names").await,
+        TransformStatus::WaitingToBackfill
+    );
+    bring_live(&mut raw, &db.pool, &["item_names", "b_names", "c_names"]).await;
+    assert_eq!(
+        rows(
+            &raw,
+            "select id::text, name from public.c_names order by id"
+        )
+        .await,
+        rows(
+            &raw,
+            "select id::text, name::text from public.items order by id"
+        )
+        .await,
+    );
+}
+
+/// #971 rule 7: a resume waits on every definition whose target it reads,
+/// through its source, a `JOIN`'s joined table and a relationship's to-side,
+/// so those waits end only if no definition can come to read its own target
+/// through them. Define refuses each such loop: one closed by a `JOIN`'s
+/// joined table, and one closed through a relationship's to-side.
+#[tokio::test]
+async fn no_chain_of_upstreams_a_resume_waits_on_can_loop() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = items(db.dsn(), &mut raw, &db.pool).await;
+    raw.batch_execute("create table public.others (id int primary key, region text)")
+        .await
+        .expect("seed others");
+    let refused = |text: &'static str| {
+        let trellis = &trellis;
+        async move {
+            let err = trellis
+                .apply(text)
+                .await
+                .expect_err("a definition that loops is refused");
+            assert!(
+                err.to_string().contains("cycle among tables"),
+                "{text}: {err}"
+            );
+        }
+    };
+    // items -> item_names, and item_names joined into items.
+    refused(
+        "TRANSFORM items FROM public.others JOIN public.item_names \
+         ON others.id = item_names.id GROUP BY others.region SELECT COUNT(*) AS n",
+    )
+    .await;
+    // items -> item_names, item_names the to-side others reads, and others
+    // into items.
+    trellis
+        .apply("RELATIONSHIP named FROM others.id TO item_names.id")
+        .await
+        .expect("define the relationship");
+    refused("TRANSFORM items FROM public.others SELECT named.name AS name").await;
+}
+
 /// #971: a downstream whose upstream nobody resumes keeps waiting across
 /// passes, its record as it was, and an operator `PAUSE` withdraws its
 /// request: it then stays paused, with no request, after the upstream is

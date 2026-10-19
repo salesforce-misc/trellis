@@ -461,8 +461,9 @@ transform against the live schema, refusing while define would or while the
 target's own tables aren't what define would create, and rebuilds
 by a fresh backfill rather than catching up on changes that happened during
 the pause. A `RESUME` of a transform whose upstream (a transform whose target
-it reads) isn't `live` is accepted and waits for it, so a whole stack resumed
-at once, in any order, comes up in dependency order; a `PAUSE` of a waiting
+it reads) isn't `live` is accepted and waits for it, and is re-validated once
+it is, so a whole stack resumed at once, in any order, comes up in dependency
+order; a `PAUSE` of a waiting
 transform withdraws its resume;
 `DROP` removes the target table's data along with the definition, and is refused
 — naming the blockers — while another registered definition still chains off the
