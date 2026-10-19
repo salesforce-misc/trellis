@@ -124,7 +124,7 @@ pub(crate) fn pg_type_name(value_type: ValueType) -> Cow<'static, str> {
 /// to a *different* calculated field that happens to share a source column's
 /// name resolves to that field, not the source column, so it isn't treated as
 /// a source-column passthrough here.
-fn passthrough_source_column<'a>(
+pub(crate) fn passthrough_source_column<'a>(
     field: &'a FieldDef,
     def: &TransformDef,
     source_columns: &HashMap<String, ValueType>,

@@ -492,6 +492,15 @@ field can't read a column whose type the host changed since the transform was
 defined or last resumed, even one it would validate over: `PAUSE` and `RESUME` the
 transform first, which re-types it over the source as it is now, then edit it.
 
+An `ALTER` of a field compares the column's current type, modifier included, with the
+type `DEFINE` would give the altered field: a bare passthrough takes its source column's
+exact type, any other expression its value family's. A widening that changes only the
+catalog (`varchar(8)` to `varchar(20)` or `text`, `numeric(10,2)` to `numeric`) re-types the
+column in place within the `ALTER`'s transaction, under a short `ACCESS EXCLUSIVE` lock on
+the target, before the field's values are re-derived. An `ALTER` that would rewrite the
+target (a narrowing such as `numeric` to `numeric(10,2)`, or another type family) is
+refused, naming the remedy: `DROP` the field, then `ADD` it again.
+
 **`apply` only registers.** Every statement returns once the change is
 recorded; none reads the transform's source rows. A new transform is built in the
 background from `waiting_to_backfill`. An `ALTER TRANSFORM` that adds or

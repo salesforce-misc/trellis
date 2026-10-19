@@ -871,7 +871,7 @@ async fn regtype(
 }
 
 /// `(oid, typmod)` as a [`CopyType`], memoized in `described`.
-async fn describe(
+pub(crate) async fn describe(
     client: &impl GenericClient,
     described: &mut BTreeMap<(u32, i32), CopyType>,
     (oid, typmod): (u32, i32),

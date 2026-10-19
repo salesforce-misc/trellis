@@ -86,22 +86,32 @@ table to change one column. A column-add backfill carries the new version as its
 so live change-application and the in-flight backfill do not race on a half-populated
 column.
 
-### `ALTER` refuses a genuine column-type change
+### `ALTER` re-types a catalog-only widening and refuses a rewrite
 
 The "never rewrites the whole target table" guarantee above is not automatic just because
-`ALTER <field> AS <expr>` only touches one column's formula: if the new formula's result
-type is not the type the column already physically has, Postgres cannot apply that as a
-metadata-only change — it rewrites the *entire* physical heap under an `ACCESS EXCLUSIVE`
-lock, blocking reads and writes to every other column too, not just the one being altered.
-Shipping that would violate this ADR's own guarantee in exactly the case an operator is
-least likely to expect it (an edit that reads like "just this column").
+`ALTER <field> AS <expr>` only touches one column's formula: if the type the altered field
+would have is not the type the column already physically has, Postgres may rewrite the
+*entire* physical heap under an `ACCESS EXCLUSIVE` lock, blocking reads and writes to every
+other column too, not just the one being altered. Shipping that would violate this ADR's own
+guarantee in exactly the case an operator is least likely to expect it (an edit that reads
+like "just this column").
 
-`ALTER TRANSFORM` therefore refuses, before any DDL or backfill runs, whenever an `ALTER`
-clause's inferred result type differs from its column's current physical type — naming the
-field and both types, and pointing at `DROP <field>` followed by `ADD <expr> AS <field>` as
-the supported path instead. That pair pays the same backfill cost, so the refusal makes nothing
-more expensive; it only stops a full-table rewrite posing as a single-column edit. A same-type `ALTER` (a formula change whose result type is unchanged) is unaffected and
-still edits in place as described above.
+`ALTER TRANSFORM` therefore compares the column's current type, modifier included
+(`numeric(10,2)`, `varchar(8)`), with the type `DEFINE` would give the altered field: the
+source column's exact type for a bare passthrough, its value family's type for any other
+expression. Then:
+
+- The same type and modifier changes nothing physical; the field build re-derives the values.
+- A widening that changes only the catalog (`varchar(8)` to `varchar(20)` or `text`,
+  `numeric(10,2)` to `numeric(12,2)` or `numeric`) is applied in place, in the `ALTER`'s own
+  transaction under the definition's row lock, before the field is re-derived. It takes a
+  short `ACCESS EXCLUSIVE` lock on the target, the same at one row as at a billion. The next
+  capture pass finds the column current: no pause and no drift.
+- Anything that would rewrite the target (a narrowing such as `numeric` to `numeric(10,2)` or
+  `text` to `varchar(8)`, or another value family) is refused before any DDL or backfill
+  runs, naming the field and both types and pointing at `DROP <field>` followed by
+  `ADD <expr> AS <field>`. That pair pays the same backfill cost, so the refusal makes
+  nothing more expensive; it only stops a full-table rewrite posing as a single-column edit.
 
 A shadow column, single-pass backfill, and atomic rename-swap would avoid the restriction;
 that is not implemented.
@@ -150,9 +160,9 @@ to the formula it already has, and dropping a column already absent are no-op su
 - A transform's columns evolve in place; only a granularity change forces a new transform.
 - Growing a table costs one source enumeration regardless of how many columns are added.
 - The target table is never rewritten to edit a column — adds are additive, drops remove
-  only the dropped column's data, and an `ALTER` that would require a real type change is
-  refused rather than honored as a whole-table rewrite; `DROP`+`ADD` remains the supported
-  way to change a column's type.
+  only the dropped column's data, and an `ALTER` that would require a table rewrite to change
+  a column's type is refused rather than honored; a widening that changes only the catalog is
+  applied in place, and `DROP`+`ADD` remains the way to change a column's type otherwise.
 - Column-granularity dependency tracking is required, so a drop refusal can name the exact
   column a dependent reads.
 - A framework migration that edits a transform is honest under replay and rollback, because

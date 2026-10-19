@@ -1980,9 +1980,9 @@ pub async fn alter_transform(
     // edited definition against the source as it is now, as a define would
     // read it (issue #980). Authoritative only after the locks below, which
     // read it again.
-    let field_types = {
+    let (field_types, pre_source_columns) = {
         let client = pool.get().await?;
-        validate_edit(
+        let edited = validate_edit(
             &**client,
             &current.source_table,
             &merged,
@@ -1990,8 +1990,8 @@ pub async fn alter_transform(
             &build_fields,
             &current.source_columns,
         )
-        .await?
-        .field_types
+        .await?;
+        (edited.field_types, edited.source_columns)
     };
 
     // Pre-transaction dependency check for every real `DROP` — issue #241's
@@ -2003,34 +2003,25 @@ pub async fn alter_transform(
         check_no_column_dependents(pool, &alter.target, field).await?;
     }
 
-    // Pre-transaction type-change refusal for every real `ALTER` — the
-    // second review round on issue #241/#242: an `ALTER <field> AS <expr>`
-    // whose new formula infers a *different* [`ValueType`] than the field's
-    // current physical column cannot be applied as ADR-0015's "an edit
-    // never rewrites the whole target table to change one column" promises
-    // — Postgres can only skip the table rewrite when the old and new
-    // column share the same physical representation, and this crate's own
-    // [`ValueType`] (every target column is declared from exactly one via
-    // [`ddl::pg_type_name`]) *is* that representation, so two different
-    // `ValueType`s always mean Postgres would have to rewrite the entire
-    // heap under an `ACCESS EXCLUSIVE` lock — blocking reads and writes to
-    // every other column too, not just this one. Refusing here, rather than
-    // building the shadow-column/backfill/rename-swap fix that would avoid
-    // it, is a deliberate v1 scope-down (tracked separately); `DROP`+`ADD`
-    // already pays this same backfill cost today, so it remains the
-    // supported path for a genuine type change. Best-effort here, same as
-    // the `DROP` dependents check just above (re-checked for real under the
-    // row lock below, issue #231's discipline).
-    for field in &real_alters {
-        check_no_type_changing_alter(
-            pool,
-            &current.target_table,
-            &alter.target,
-            field,
-            &field_types,
-        )
-        .await?;
-    }
+    // Pre-transaction type check for every real `ALTER` (see
+    // [`check_alter_column_types`]): a type change that would rewrite the
+    // target is refused, as ADR-0015 promises no edit does. Best-effort
+    // here, same as the `DROP` dependents check just above (re-checked for
+    // real under the row lock below, issue #231's discipline).
+    let pre_client = pool.get().await?;
+    check_alter_column_types(
+        &**pre_client,
+        &AlterTypeContext {
+            merged: &merged,
+            source_table: &current.source_table,
+            source_columns: &pre_source_columns,
+            field_types: &field_types,
+            qualified_target: &current.target_table,
+            display_target: &alter.target,
+        },
+        &real_alters,
+    )
+    .await?;
 
     let target_ident = ddl::qualified_target_table_ident(&current.target_table);
 
@@ -2149,16 +2140,19 @@ pub async fn alter_transform(
     // issued below: this runs strictly before every DDL loop in this
     // function, drops and adds included, so a refusal here still means
     // *nothing* about this edit has touched the target table yet.
-    for field in &real_alters {
-        check_no_type_changing_alter_in_txn(
-            &txn,
-            &current.target_table,
-            &alter.target,
-            field,
-            &field_types,
-        )
-        .await?;
-    }
+    let retypes = check_alter_column_types(
+        &*txn,
+        &AlterTypeContext {
+            merged: &merged,
+            source_table: &current.source_table,
+            source_columns: &source_columns,
+            field_types: &field_types,
+            qualified_target: &current.target_table,
+            display_target: &alter.target,
+        },
+        &real_alters,
+    )
+    .await?;
 
     // Issue #638's follow-up: an added or altered field's `STRPOS`/
     // `REGEXP_COUNT` can't read a nondeterministic-collation column, exactly
@@ -2198,14 +2192,20 @@ pub async fn alter_transform(
         ))
         .await?;
     }
-    // No `ALTER COLUMN ... TYPE` DDL runs here, deliberately: `real_alters`
-    // only ever reaches this point for a field whose new formula infers the
-    // *same* `ValueType` its column already has — [`check_no_type_changing_alter_in_txn`]
-    // above already refused (and rolled back the whole transaction without
-    // issuing a single DDL statement) for any field where that isn't true.
-    // A same-type `ALTER` needs no physical schema change at all; only its
-    // *data* is stale, which the field build registered below recomputes —
-    // same as it already does for a same-type `ADD`.
+    // An altered field whose column only widens in the catalog is re-typed
+    // here, in this transaction under the definition's row lock, before the
+    // field build registered below re-derives its values (issue #997).
+    // Anything that would rewrite the target was refused above, before any
+    // DDL ran. A same-type `ALTER` needs no physical change at all; only its
+    // data is stale, which the field build recomputes, as for an `ADD`.
+    for retype in &retypes {
+        let column = quote_ident(&retype.column);
+        txn.batch_execute(&format!(
+            "alter table {target_ident} alter column {column} type {ty} using {column}::{ty}",
+            ty = retype.pg_type
+        ))
+        .await?;
+    }
 
     // Issue #915: an edit that builds fields can pause one at birth that
     // already has readers (see `pause_readers_of_paused_columns` below). The
@@ -3108,153 +3108,139 @@ async fn check_no_column_dependents_via(
     })
 }
 
-/// [`alter_transform`]'s pre-transaction, best-effort half of the
-/// type-changing-`ALTER` refusal — see [`check_no_type_changing_alter_via`]'s
-/// own doc comment for the full reasoning; this is the [`check_no_column_dependents`]-shaped
-/// counterpart, run against a fresh pooled connection before the transaction
-/// even opens.
-async fn check_no_type_changing_alter(
-    pool: &Pool,
-    qualified_target: &str,
-    display_target: &str,
-    field: &FieldDef,
-    field_types: &HashMap<String, ValueType>,
-) -> Result<(), CatalogError> {
-    let client = pool.get().await?;
-    check_no_type_changing_alter_via(
-        &**client,
-        qualified_target,
-        display_target,
-        field,
-        field_types,
-    )
-    .await
+/// What [`check_alter_column_types`] needs to compare an altered field's
+/// column with the type `DEFINE` would give it.
+struct AlterTypeContext<'a> {
+    /// The definition the edit leaves.
+    merged: &'a TransformDef,
+    source_table: &'a str,
+    source_columns: &'a HashMap<String, ValueType>,
+    field_types: &'a HashMap<String, ValueType>,
+    qualified_target: &'a str,
+    display_target: &'a str,
 }
 
-/// The transaction-scoped counterpart to [`check_no_type_changing_alter`],
-/// re-run under the target definition's own row lock (issue #231's
-/// discipline, [`check_no_column_dependents_in_txn`]'s exact shape) so this
-/// refusal is the last word, not just an optimistic pre-check.
-async fn check_no_type_changing_alter_in_txn(
-    txn: &tokio_postgres::Transaction<'_>,
-    qualified_target: &str,
-    display_target: &str,
-    field: &FieldDef,
-    field_types: &HashMap<String, ValueType>,
-) -> Result<(), CatalogError> {
-    check_no_type_changing_alter_via(txn, qualified_target, display_target, field, field_types)
-        .await
+/// An altered field's column to re-type in place: the column and the type
+/// `DEFINE` would give it, as `format_type` renders it.
+#[derive(Debug)]
+struct ColumnRetype {
+    column: String,
+    pg_type: String,
 }
 
-/// The one check both [`check_no_type_changing_alter`] (pre-transaction,
-/// best-effort) and [`check_no_type_changing_alter_in_txn`] (under the row
-/// lock, authoritative) run: refuses `ALTER <field> AS <expr>` whenever
-/// `field`'s newly-inferred [`ValueType`] differs from the [`ValueType`] its
-/// column *actually, physically* has right now.
+/// The refusal of a type-changing `ALTER <field> AS <expr>`, and the
+/// columns it re-types: `field`'s column as it is now, modifier included,
+/// against the type `DEFINE` would give the altered field (a bare
+/// passthrough's source column's exact type, anything else its value
+/// family's, [`ddl::field_column_pg_types`]'s rule).
 ///
-/// Why [`ValueType`] equality is the right (not just a convenient) test —
-/// ADR-0015 (`docs/decisions/0015-transform-redefinition.md`) promises "An
-/// edit never rewrites the whole target table to change one column."
-/// Postgres can skip a full-table rewrite on `ALTER COLUMN ... TYPE` only
-/// when the transform from old value to new is nothing but a relabeling of
-/// the same bytes (no `USING` computation, no assignment cast) — and every
-/// target column this crate ever creates is declared from exactly one
-/// [`ValueType`] via [`ddl::pg_type_name`], so two columns/formulas sharing
-/// one `ValueType` always share the same physical representation, and two
-/// different `ValueType`s never do (an `Integer(Int4)` and an `Integer(Int8)`
-/// are both "an integer" conversationally, but 4 and 8 physical bytes
-/// respectively — Postgres rewrites for that pair exactly as it would for
-/// `text` to `numeric`). So within this crate's own type model there is no
-/// safe middle ground to special-case: same `ValueType` is always metadata-
-/// only-safe, any different `ValueType` always forces the whole-heap rewrite
-/// the ADR promises never happens. Classifying the column's *current*
-/// physical type via its raw `atttypid` OID and [`super::pg_type::value_type_for_oid`]
-/// — the exact machinery [`resolve_relationships`] already uses to classify
-/// a relationship's to-side column, and the one place in this crate that
-/// turns an OID into a [`ValueType`] — is what makes this comparison honest
-/// (a `format_type` *text* comparison, this function's now-removed
-/// predecessor, was equally correct in practice here only because every
-/// target column's text rendering happens to already be canonical, and
-/// would have quietly mis-detected a hypothetical future modifier-bearing
-/// target type as "no change").
+/// ADR-0015 promises "An edit never rewrites the whole target table to
+/// change one column", so:
 ///
-/// A real fix — a shadow column, single-pass backfill, then an atomic
-/// rename-swap, none of which needs the old column's rewrite at all — is
-/// tracked separately and deliberately out of scope for this pass; this
-/// project is pre-release (no compatibility burden to preserve for a caller
-/// depending on today's unrestricted behavior), so refusing outright is
-/// simpler and more honest than shipping the full-table-lock behavior this
-/// ADR explicitly disclaims. `DROP <field>` followed by `ADD <expr> AS
-/// <field>` remains available and already pays this same backfill cost
-/// today — refusing here only makes that cost explicit instead of a silent
-/// surprise.
+/// - the same type and modifier needs no change;
+/// - a widening that changes only the catalog ([`super::key_types::alter_retypable`]:
+///   `numeric(10,2)` to `numeric`, `varchar(8)` to `varchar(20)` or `text`)
+///   is returned for the caller to apply in the alter's own transaction,
+///   under the definition's row lock, before the field's values are
+///   re-derived;
+/// - anything else (a narrowing, another value family) would rewrite the
+///   target under an `ACCESS EXCLUSIVE` lock, so it is refused. `DROP` and
+///   `ADD` of the field pays that backfill cost explicitly.
 ///
-/// Takes `client: &impl GenericClient` rather than a `Pool` or a concrete
-/// `Transaction` so the same body serves both the pre-transaction pooled
-/// check and the in-transaction authoritative recheck without duplicating
-/// the query or the comparison.
-async fn check_no_type_changing_alter_via(
+/// `client` is a pooled connection for the best-effort pre-check before the
+/// transaction opens, and the transaction itself for the authoritative
+/// re-check under the row lock (issue #231's discipline).
+async fn check_alter_column_types(
     client: &impl GenericClient,
-    qualified_target: &str,
-    display_target: &str,
-    field: &FieldDef,
-    field_types: &HashMap<String, ValueType>,
-) -> Result<(), CatalogError> {
-    let new_type = field_types
-        .get(&field.name)
-        .copied()
-        .unwrap_or(ValueType::Numeric);
-    let Some(current_type_oid) =
-        target_column_type_oid_via(client, qualified_target, &field.name).await?
-    else {
-        // Defensive: every real `ALTER` field is, by construction, a
-        // physical column already (mirrors this crate's other target-column
-        // introspection helpers' own comment to the same effect) — nothing
-        // to compare against, so nothing to refuse.
-        return Ok(());
-    };
-    let current_type = super::pg_type::value_type_for_oid(client, current_type_oid).await?;
-    if current_type == new_type {
-        return Ok(());
+    ctx: &AlterTypeContext<'_>,
+    fields: &[FieldDef],
+) -> Result<Vec<ColumnRetype>, CatalogError> {
+    let mut retypes = Vec::new();
+    for field in fields {
+        let Some(current) =
+            target_column_type_via(client, ctx.qualified_target, &field.name).await?
+        else {
+            // Defensive: every real `ALTER` field is, by construction, a
+            // physical column already.
+            continue;
+        };
+        let wanted = match ddl::passthrough_source_column(field, ctx.merged, ctx.source_columns) {
+            Some(source_column) => {
+                match target_column_type_via(client, ctx.source_table, source_column).await? {
+                    Some(source) => source,
+                    None => continue,
+                }
+            }
+            None => {
+                let family = ctx
+                    .field_types
+                    .get(&field.name)
+                    .copied()
+                    .unwrap_or(ValueType::Numeric);
+                let oid: Option<u32> = client
+                    .query_one(
+                        "select pg_catalog.to_regtype($1)::oid",
+                        &[&ddl::pg_type_name(family)],
+                    )
+                    .await?
+                    .get(0);
+                match oid {
+                    Some(oid) => (oid, -1),
+                    None => continue,
+                }
+            }
+        };
+        if current == wanted {
+            continue;
+        }
+        let mut described = std::collections::BTreeMap::new();
+        let current = super::copies::describe(client, &mut described, current).await?;
+        let wanted = super::copies::describe(client, &mut described, wanted).await?;
+        if super::key_types::alter_retypable(&current.ty, &wanted.ty) {
+            retypes.push(ColumnRetype {
+                column: field.name.clone(),
+                pg_type: wanted.display,
+            });
+            continue;
+        }
+        return Err(CatalogError::UnsupportedAlter(format!(
+            "ALTER '{field}' on '{display_target}' would change its column type from \
+             '{current}' to '{wanted}'; Trellis re-types a column in place only for a widening \
+             that changes just the catalog (such as numeric(10,2) to numeric, or varchar(8) to \
+             text), because Postgres would otherwise rewrite '{display_target}''s entire \
+             physical table under an ACCESS EXCLUSIVE lock, blocking reads and writes to every \
+             other column too, not just this one. Use DROP '{field}' followed by ADD <expr> AS \
+             '{field}' instead — it already pays this same backfill cost explicitly, rather \
+             than paying it as a surprise.",
+            field = field.name,
+            display_target = ctx.display_target,
+            current = current.display,
+            wanted = wanted.display,
+        )));
     }
-    Err(CatalogError::UnsupportedAlter(format!(
-        "ALTER '{field}' on '{display_target}' would change its column type from \
-         '{current_type}' to '{new_type}'; Trellis does not support a type-changing ALTER in \
-         this release because Postgres cannot apply it as a metadata-only change — it would \
-         rewrite '{display_target}''s entire physical table under an ACCESS EXCLUSIVE lock, \
-         blocking reads and writes to every other column too, not just this one. Use DROP \
-         '{field}' followed by ADD <expr> AS '{field}' instead — it already pays this same \
-         backfill cost explicitly, rather than paying it as a surprise.",
-        field = field.name,
-    )))
+    Ok(retypes)
 }
 
-/// The raw `pg_attribute.atttypid` OID of `qualified_target.column`, the
-/// input [`super::pg_type::value_type_for_oid`] classifies — the OID
-/// counterpart to `column_type_in_txn`'s `format_type` rendering, for the
-/// same reason [`resolve_relationships`]' `column_type_oid` prefers the raw
-/// OID over `format_type` text: an OID is stable across a length/precision
-/// modifier, and (issue #241's own reason for reaching for it here)
-/// comparable to another OID's classification without ever needing to
-/// parenthesis-strip or otherwise reparse rendered text. `None` if the
-/// column somehow doesn't exist yet (defensive; see this function's callers).
-async fn target_column_type_oid_via(
+/// The `(atttypid, atttypmod)` of `qualified_table.column`: `None` if the
+/// column somehow doesn't exist (defensive; see this function's callers). A
+/// mixed-case name resolves through [`ddl::regclass_arg`] (issue #487).
+async fn target_column_type_via(
     client: &impl GenericClient,
-    qualified_target: &str,
+    qualified_table: &str,
     column: &str,
-) -> Result<Option<u32>, CatalogError> {
+) -> Result<Option<(u32, i32)>, CatalogError> {
     let row = client
         .query_opt(
-            "select a.atttypid \
+            "select a.atttypid, a.atttypmod \
              from pg_attribute a \
              where a.attrelid = pg_catalog.to_regclass($1) \
                and a.attname = $2 \
                and a.attnum > 0 \
                and not a.attisdropped",
-            &[&ddl::regclass_arg(qualified_target), &column],
+            &[&ddl::regclass_arg(qualified_table), &column],
         )
         .await?;
-    Ok(row.map(|row| row.get(0)))
+    Ok(row.map(|row| (row.get(0), row.get(1))))
 }
 
 /// Validates `source_text` and persists it as a definition in `status`, with
@@ -9829,33 +9815,40 @@ mod type_changing_alter_tests {
             .await
             .expect("seed the mixed-case target");
 
-        let field = FieldDef {
-            name: "total".to_string(),
-            expr: Expr::Column("a".to_string()),
+        let merged = parse("TRANSFORM totals FROM s SELECT a + 1 AS total").expect("parse");
+        let fields = merged.fields.clone();
+        let check = |family: ValueType| {
+            let (merged, fields, client) = (&merged, &fields, &client);
+            async move {
+                let field_types = HashMap::from([("total".to_string(), family)]);
+                check_alter_column_types(
+                    &***client,
+                    &AlterTypeContext {
+                        merged,
+                        source_table: "public.s",
+                        source_columns: &HashMap::new(),
+                        field_types: &field_types,
+                        qualified_target: "Custom.Totals",
+                        display_target: "Totals",
+                    },
+                    fields,
+                )
+                .await
+            }
         };
-        let err = check_no_type_changing_alter_via(
-            &**client,
-            "Custom.Totals",
-            "Totals",
-            &field,
-            &HashMap::from([("total".to_string(), ValueType::Boolean)]),
-        )
-        .await
-        .expect_err("numeric to boolean is a type change");
+        let err = check(ValueType::Boolean)
+            .await
+            .expect_err("numeric to boolean is a type change");
         assert!(
             matches!(err, CatalogError::UnsupportedAlter(_)),
             "expected UnsupportedAlter, got {err:?}"
         );
-
-        check_no_type_changing_alter_via(
-            &**client,
-            "Custom.Totals",
-            "Totals",
-            &field,
-            &HashMap::from([("total".to_string(), ValueType::Numeric)]),
-        )
-        .await
-        .expect("an unchanged type passes");
+        assert!(
+            check(ValueType::Numeric)
+                .await
+                .expect("an unchanged type passes")
+                .is_empty()
+        );
     }
 }
 

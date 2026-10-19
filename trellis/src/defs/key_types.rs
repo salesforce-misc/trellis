@@ -373,6 +373,21 @@ pub(crate) fn catalog_only(copy: &ColumnType, live: &ColumnType) -> bool {
     }
 }
 
+/// Whether `ALTER TRANSFORM` can re-type a column of type `copy` to `live`
+/// without rewriting its table: a [`catalog_only`] widening, or a
+/// constrained `numeric` to an unconstrained one (Postgres keeps every
+/// value as it is). The second isn't a [`catalog_only`] widening, since the
+/// capture pass must not apply it to a column a `JOIN`'s sum reads.
+pub(crate) fn alter_retypable(copy: &ColumnType, live: &ColumnType) -> bool {
+    catalog_only(copy, live)
+        || (copy.builtin()
+            && live.builtin()
+            && copy.base() == "numeric"
+            && live.base() == "numeric"
+            && copy.typmod >= 4
+            && live.typmod < 0)
+}
+
 /// Whether a column retyped from `old` to `new` kept every value's text: a
 /// pure widening (#703 R1), which the capture pass's column check never
 /// acts on. Exactly these:
@@ -1096,6 +1111,28 @@ mod tests {
             (ty("public.varchar", 14), ty("public.varchar", 44)),
         ] {
             assert!(!catalog_only(&copy, &live), "{copy:?} -> {live:?}");
+        }
+    }
+
+    /// `ALTER TRANSFORM` re-types a catalog-only widening, and a constrained
+    /// `numeric` to an unconstrained one; a narrowing it refuses.
+    #[test]
+    fn alter_retypes_catalog_only_widenings_and_the_unconstrained_numeric() {
+        for (copy, live) in [
+            (varchar(10), varchar(40)),
+            (varchar(10), ty("text", -1)),
+            (numeric(10, 2), numeric(12, 2)),
+            (numeric(10, 2), ty("numeric", -1)),
+        ] {
+            assert!(alter_retypable(&copy, &live), "{copy:?} -> {live:?}");
+        }
+        for (copy, live) in [
+            (ty("numeric", -1), numeric(10, 2)),
+            (numeric(12, 2), numeric(10, 2)),
+            (ty("text", -1), varchar(8)),
+            (ty("int4", -1), ty("int8", -1)),
+        ] {
+            assert!(!alter_retypable(&copy, &live), "{copy:?} -> {live:?}");
         }
     }
 }

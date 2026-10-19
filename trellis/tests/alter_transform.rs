@@ -46,6 +46,10 @@
 //!   `altering_a_target_that_is_not_live_is_rejected`,
 //!   `altering_a_field_to_a_different_result_type_is_refused`,
 //!   `a_type_changing_alter_refuses_the_whole_statement`)
+//! - #997: the modifier counts. A catalog-only widening is re-typed in place and a
+//!   narrowing refused (`altering_a_passthrough_into_a_wider_expression_retypes_the_column_in_place`,
+//!   `altering_a_varchar_passthrough_into_a_text_expression_retypes_the_column`,
+//!   `altering_an_expression_into_a_narrower_passthrough_is_refused`)
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -623,6 +627,166 @@ async fn a_type_changing_alter_refuses_the_whole_statement() {
         "a refused combined statement must not bump the definition version"
     );
 
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// A `posts` source whose `price` is `numeric(10,2)` and `author`
+/// `varchar(8)`, with `transform_text` defined and built over it by hand: no
+/// pipeline runs, so nothing waits on convergence.
+async fn modifier_fixture(
+    db: &testkit::TestDatabase,
+    raw: &Client,
+    transform_text: &str,
+) -> Trellis {
+    raw.batch_execute(
+        "create table public.posts (id int primary key, price numeric(10,2), author varchar(8)); \
+         insert into public.posts \
+             select s, s + 0.5, 'a' || s from generate_series(1, 5) s;",
+    )
+    .await
+    .expect("seed");
+    let trellis = define_only(db.dsn()).await;
+    trellis.apply(transform_text).await.expect("define");
+    drain_backfill_chunks(&db.pool).await;
+    trellis
+}
+
+/// Issue #997 rule 3 and 5: altering a bare passthrough of `numeric(10,2)`
+/// into an expression of unconstrained `numeric` re-types the column in
+/// place, in the alter's own transaction, so the field build's values keep
+/// their third decimal and the column is the one a fresh `DEFINE` gives.
+/// Comparing the family without the modifier leaves the column at
+/// `numeric(10,2)` (the mutation this test pins).
+#[tokio::test]
+async fn altering_a_passthrough_into_a_wider_expression_retypes_the_column_in_place() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    let trellis =
+        modifier_fixture(&db, &raw, "TRANSFORM t FROM public.posts SELECT price AS p").await;
+    assert_eq!(
+        column_pg_type(&raw, DEFAULT_TARGET_SCHEMA, "t", "p").await,
+        "numeric(10,2)"
+    );
+
+    trellis
+        .apply("ALTER TRANSFORM t ALTER p AS price + 0.001")
+        .await
+        .expect("a catalog-only widening is accepted");
+    trellis::staging::build::settle_builds(&db.pool).await;
+
+    assert_eq!(
+        column_pg_type(&raw, DEFAULT_TARGET_SCHEMA, "t", "p").await,
+        "numeric"
+    );
+    let values: Vec<String> = raw
+        .query(
+            &format!("select p::text from {DEFAULT_TARGET_SCHEMA}.t order by id"),
+            &[],
+        )
+        .await
+        .expect("read")
+        .into_iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(
+        values,
+        ["1.501", "2.501", "3.501", "4.501", "5.501"],
+        "the re-derive keeps the third decimal"
+    );
+
+    // The column is the one a fresh DEFINE gives, so the capture pass finds
+    // it current: no drift, no "widened" pause.
+    trellis
+        .apply("TRANSFORM oracle FROM public.posts SELECT price + 0.001 AS p")
+        .await
+        .expect("define the oracle");
+    assert_eq!(
+        column_pg_type(&raw, DEFAULT_TARGET_SCHEMA, "oracle", "p").await,
+        column_pg_type(&raw, DEFAULT_TARGET_SCHEMA, "t", "p").await,
+    );
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// Issue #997 rule 3: a `varchar(8)` passthrough altered to an expression of
+/// type `text` is re-typed in place.
+#[tokio::test]
+async fn altering_a_varchar_passthrough_into_a_text_expression_retypes_the_column() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    let trellis = modifier_fixture(
+        &db,
+        &raw,
+        "TRANSFORM t FROM public.posts SELECT author AS who",
+    )
+    .await;
+    assert_eq!(
+        column_pg_type(&raw, DEFAULT_TARGET_SCHEMA, "t", "who").await,
+        "character varying(8)"
+    );
+
+    trellis
+        .apply("ALTER TRANSFORM t ALTER who AS COALESCE(author, 'none')")
+        .await
+        .expect("varchar(8) to text is a catalog-only widening");
+    trellis::staging::build::settle_builds(&db.pool).await;
+
+    assert_eq!(
+        column_pg_type(&raw, DEFAULT_TARGET_SCHEMA, "t", "who").await,
+        "text"
+    );
+    let first: String = raw
+        .query_one(
+            &format!("select who from {DEFAULT_TARGET_SCHEMA}.t where id = 1"),
+            &[],
+        )
+        .await
+        .expect("read")
+        .get(0);
+    assert_eq!(first, "a1");
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// Issue #997 rule 4: an expression field altered into a bare passthrough of
+/// a narrower type would rewrite the target, so it is refused naming
+/// `DROP`/`ADD`, with the column, the definition and its version untouched.
+#[tokio::test]
+async fn altering_an_expression_into_a_narrower_passthrough_is_refused() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    let trellis = modifier_fixture(
+        &db,
+        &raw,
+        "TRANSFORM t FROM public.posts SELECT price + 0.001 AS p",
+    )
+    .await;
+    let before_version = persisted_definition_version(&raw, "t").await;
+
+    let err = trellis
+        .apply("ALTER TRANSFORM t ALTER p AS price")
+        .await
+        .expect_err("numeric to numeric(10,2) narrows");
+    match err {
+        TrellisError::Catalog(CatalogError::UnsupportedAlter(detail)) => {
+            assert!(
+                detail.contains("numeric(10,2)")
+                    && detail.to_uppercase().contains("DROP")
+                    && detail.to_uppercase().contains("ADD"),
+                "the refusal names the types and the remedy: {detail}"
+            );
+        }
+        other => panic!("expected CatalogError::UnsupportedAlter, got {other:?}"),
+    }
+    assert_eq!(
+        column_pg_type(&raw, DEFAULT_TARGET_SCHEMA, "t", "p").await,
+        "numeric"
+    );
+    assert_eq!(
+        persisted_definition_version(&raw, "t").await,
+        before_version
+    );
     trellis.shutdown().await.expect("shutdown");
 }
 
