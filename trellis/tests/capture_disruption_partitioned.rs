@@ -961,3 +961,205 @@ async fn a_root_swapped_recreated_or_renamed_away_pauses_both_readers_until_resu
     }
     assert!(failures.is_empty(), "{failures:#?}");
 }
+
+/// A root swapped by renames after the pass's check that the name still holds
+/// the recorded root, and before its deep check reads the tree, pauses both
+/// readers in that same pass: the new root is never recorded as the source's,
+/// so the next pass can't take it for the one Trellis captured.
+#[tokio::test]
+async fn a_root_swapped_during_the_pass_pauses_both_readers() {
+    use trellis::staging::interleave::{PausePoint, PauseScope, with_scope};
+    trellis::defs::partition_tree::open_gate_for_tests();
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
+    create_case_tables(&raw, &trellis, &["race".to_string()]).await;
+    bring_live(&mut raw, &db.pool).await;
+    let app = connect(db.dsn()).await;
+    let gate = connect(db.dsn()).await;
+    let recorded_root = || async {
+        count(
+            &raw,
+            "select root_oid::text from partition_sources where table_name = 'public.p_race'",
+        )
+        .await
+    };
+    let old_root = recorded_root().await;
+
+    const LOCK: i64 = 1_200_001;
+    gate.execute("select pg_advisory_lock($1)", &[&LOCK])
+        .await
+        .unwrap();
+    let scope = PauseScope::new();
+    let reached = scope.arm(PausePoint::BeforeFingerprintRead, "public.p_race", LOCK);
+    let dsn = db.dsn().to_string();
+    let pool = db.pool.clone();
+    let pass = tokio::spawn(with_scope(scope, async move {
+        let mut client = connect(&dsn).await;
+        let desired = trellis::defs::tables_to_capture(&pool).await.unwrap();
+        reconcile::reconcile(
+            &mut client,
+            SCHEMA,
+            &desired,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .expect("capture pass")
+    }));
+    reached.await.expect("the pass reaches the pause");
+    app.batch_execute(&format!(
+        "{} alter table public.p_race rename to p_race_old; \
+         alter table public.p_race_n rename to p_race",
+        tree_ddl("p_race_n")
+    ))
+    .await
+    .unwrap();
+    gate.execute("select pg_advisory_unlock($1)", &[&LOCK])
+        .await
+        .unwrap();
+    let outcome = pass.await.unwrap();
+    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+
+    let failures = capture_failures(&trellis, &["r_race", "s_race"]).await;
+    assert!(
+        failures.iter().all(|f| f
+            .as_deref()
+            .is_some_and(|f| f.contains("not the one Trellis captured"))),
+        "{failures:?}"
+    );
+    assert_eq!(
+        recorded_root().await,
+        old_root,
+        "the new root isn't recorded"
+    );
+    let queued = count(
+        &raw,
+        "select count(*)::text from partition_corrections where table_name = 'public.p_race'",
+    )
+    .await;
+    assert_eq!(queued, "0");
+}
+
+/// Both of case `id`'s targets equal what its source holds.
+async fn oracle(raw: &Client, id: &str, failures: &mut Vec<String>) {
+    let t = format!("p_{id}");
+    for (target, source) in [
+        (
+            format!("select g::text, total::text from public.s_{id} order by 1"),
+            format!("select g::text, sum(b)::text from public.{t} group by g order by 1"),
+        ),
+        (
+            format!("select g::text, a::text, n::text from public.r_{id} order by 1, 2"),
+            format!(
+                "select g::text, a::text, count(*)::text from public.{t} group by g, a order by 1, 2"
+            ),
+        ),
+    ] {
+        let (target, source) = (rows(raw, &target).await, rows(raw, &source).await);
+        if target != source {
+            failures.push(format!("{id}: {target:?} != {source:?}"));
+        }
+    }
+}
+
+/// A source whose every reader is paused for a capture failure records its
+/// tree and queues nothing, so the resume's rebuild must cover what partition
+/// maintenance and writes did meanwhile: a node's triggers disabled, or the
+/// root renamed away and back, then a leaf attached with rows, one detached,
+/// and rows written, updated and deleted before the `RESUME`.
+#[tokio::test]
+async fn tree_changes_while_every_reader_is_paused_are_covered_by_the_resume() {
+    trellis::defs::partition_tree::open_gate_for_tests();
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
+    let ids = ["node".to_string(), "away".to_string()];
+    create_case_tables(&raw, &trellis, &ids).await;
+    bring_live(&mut raw, &db.pool).await;
+    let app = connect(db.dsn()).await;
+    // `{t}` the root's name now, `{l}` its leaves' prefix.
+    let maintenance = "create table public.{l}_l4 (like public.{t} including defaults); \
+         insert into public.{l}_l4 select i + 500, 3, i, i, i from generate_series(1, 7) i; \
+         alter table public.{t} attach partition public.{l}_l4 for values in (3); \
+         alter table public.{t} detach partition public.{l}_l3; \
+         insert into public.{t} select i + 900, i % 2, i, i * 5, i from generate_series(1, 9) i; \
+         update public.{t} set b = b + 1000 where g = 0; \
+         delete from public.{t} where id < 4";
+    app.batch_execute(&each_trigger(
+        "p_node_l1",
+        "alter table public.p_node_l1 disable trigger %I",
+    ))
+    .await
+    .unwrap();
+    capture_pass(&mut raw, &db.pool).await;
+    app.batch_execute(
+        &maintenance
+            .replace("{l}", "p_node")
+            .replace("{t}", "p_node"),
+    )
+    .await
+    .unwrap();
+    app.batch_execute("alter table public.p_away rename to p_away_x")
+        .await
+        .unwrap();
+    capture_pass(&mut raw, &db.pool).await;
+    app.batch_execute(
+        &maintenance
+            .replace("{l}", "p_away")
+            .replace("{t}", "p_away_x"),
+    )
+    .await
+    .unwrap();
+    app.batch_execute("alter table public.p_away_x rename to p_away")
+        .await
+        .unwrap();
+    for _ in 0..3 {
+        full_pass(&mut raw, &db.pool).await;
+        run_backfill_chunks(&db.pool).await;
+        drain_to_quiescence(&db.pool, &mut raw).await;
+    }
+    for (t, s) in statuses(&raw).await {
+        assert_eq!(s, TransformStatus::Paused, "{t}");
+    }
+    for id in &ids {
+        let queued = count(
+            &raw,
+            &format!(
+                "select count(*)::text from partition_corrections where table_name = 'public.p_{id}'"
+            ),
+        )
+        .await;
+        assert_eq!(
+            queued, "0",
+            "{id}: nothing is queued while every reader is paused"
+        );
+        for reader in ["r", "s"] {
+            trellis
+                .apply(&format!("RESUME TRANSFORM {reader}_{id}"))
+                .await
+                .unwrap_or_else(|e| panic!("{id}: {e}"));
+        }
+        // Written before any pass sees the resume, and on the new leaf after.
+        app.batch_execute(&format!(
+            "insert into public.p_{id} select i + 2000, 3, i, i, i from generate_series(1, 4) i"
+        ))
+        .await
+        .unwrap();
+    }
+    bring_live(&mut raw, &db.pool).await;
+    for id in &ids {
+        app.batch_execute(&format!(
+            "insert into public.p_{id}_l4 select i + 3000, 3, i, i, i from generate_series(1, 4) i"
+        ))
+        .await
+        .unwrap();
+    }
+    bring_live(&mut raw, &db.pool).await;
+    let mut failures = Vec::new();
+    for id in &ids {
+        oracle(&raw, id, &mut failures).await;
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}

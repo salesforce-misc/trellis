@@ -83,8 +83,10 @@
 //! maintenance: before any fingerprint is read,
 //! [`super::triggers::pause_readers_of_gone_table`] finds the name missing or
 //! resolving to a root other than the recorded one and pauses every reader
-//! (#707, #1200), and nothing is corrected or reinstalled until a resume,
-//! which forgets the recorded tree. A root renamed away and back after that
+//! (#707, #1200). [`begin`] checks the root against the record again once it
+//! has read the fingerprints, for a swap that commits in between. Nothing is
+//! corrected or reinstalled until a resume, which forgets the recorded tree.
+//! A root renamed away and back after that
 //! queues nothing either: a source whose every reader is paused for a
 //! capture failure is recorded, not corrected.
 //!
@@ -798,6 +800,15 @@ pub(crate) async fn begin(
     {
         return Ok(Begin::NotPartitioned);
     }
+    // Test-only pause point (#1200): after the pass's gone-table check,
+    // before the fingerprint read. See `staging::interleave`.
+    #[cfg(any(test, feature = "test-util"))]
+    crate::staging::interleave::pause_between_transactions(
+        &*client,
+        crate::staging::interleave::PausePoint::BeforeFingerprintRead,
+        table,
+    )
+    .await?;
     let Some(fingerprints) = read_fingerprints(&*client, table).await? else {
         observe_missing(&*client, table).await?;
         return Ok(Begin::NotPartitioned);
@@ -808,6 +819,19 @@ pub(crate) async fn begin(
         return Ok(Begin::NotPartitioned);
     }
     let stored = load_state(&*client, table).await?;
+    // #1200: a root other than the recorded one, under this database's own
+    // record, is table maintenance, not partition maintenance. The pass's
+    // gone-table check pauses the readers for it before this; a swap that
+    // commits between that check and the fingerprint read above lands here,
+    // and must not be recorded as the source's root.
+    if let Some(s) = &stored
+        && s.root_oid != fingerprints.root_oid
+        && s.catalog_oid.0 == s.catalog_oid.1
+        && s.system_identifier.as_deref() == Some(fingerprints.system_identifier.as_str())
+    {
+        super::triggers::pause_readers_of_replaced_root(client, catalog, table).await?;
+        return Ok(Begin::Held { deep: false });
+    }
     let unchanged = stored.as_ref().is_some_and(|s| {
         s.lifecycle == fingerprints.lifecycle
             && s.compliance == fingerprints.compliance

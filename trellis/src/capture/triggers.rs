@@ -513,6 +513,24 @@ pub(crate) async fn pause_readers_of_gone_table(
     Ok(true)
 }
 
+/// Pauses every reader of the partitioned source `table` that isn't paused
+/// yet, because the root at its name is not the recorded one: what
+/// [`pause_readers_of_gone_table`] does, for a swap that commits after it
+/// ran ([`super::partitions`]).
+pub(crate) async fn pause_readers_of_replaced_root(
+    client: &mut Client,
+    catalog: &CaptureCatalog,
+    table: &str,
+) -> Result<(), CaptureError> {
+    pause_readers(
+        client,
+        catalog,
+        table,
+        &disrupted_error(table, &[root_replaced(table)]),
+    )
+    .await
+}
+
 /// The finding for a partitioned root that isn't the recorded one.
 fn root_replaced(table: &str) -> String {
     format!(
