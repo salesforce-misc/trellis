@@ -36,11 +36,10 @@ reader the Re-derive build serves reports `backfilling` and is rebuilt in
 place; any other reports `catching_up`. Both return to `live` when the re-read
 is done. It's the cheapest repair when you know which table missed changes.
 
-It takes a table's bare name and looks it up only in Trellis's catalog and
-target schemas and `public`, so it can't name a source in another schema
-([#1202](https://github.com/salesforce-misc/trellis/issues/1202)): repair
-such a source's readers with `PAUSE`/`RESUME`. It repairs what a rebuild
-repairs, with the same exceptions (below).
+It takes the table's `schema.table` name, or a bare name when exactly one
+captured table carries it; a bare name two captured tables share is refused,
+naming both. It repairs what a rebuild repairs, with the same exceptions
+(below).
 
 ### `PAUSE` and `RESUME`
 
