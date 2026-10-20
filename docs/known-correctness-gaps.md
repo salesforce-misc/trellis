@@ -340,8 +340,8 @@ options) is refused at define.
 **Detected by:** `self_check`. Under a nondeterministic collation, its
 recompute fails with Postgres's error, as a rebuild does.
 
-**Repair:** use patterns of plain characters. `PAUSE`/`RESUME` rewrites every row with
-Postgres's value, until each row's next write.
+**Repair:** use patterns of plain characters. `PAUSE`/`RESUME` rewrites
+every row with Postgres's value, until each row's next write.
 
 **Ends with:** [#643](https://github.com/salesforce-misc/trellis/issues/643),
 which closes when [#575](https://github.com/salesforce-misc/trellis/issues/575)
