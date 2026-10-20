@@ -223,6 +223,13 @@ pub enum CatalogError {
         /// The table, schema-qualified.
         ledger_table: String,
     },
+    /// A definition's target table doesn't exist, though define creates it.
+    /// Only Trellis writes its targets, so an operator dropped it; the
+    /// rebuild a resume starts writes into it and would fail. A whole-transform
+    /// resume refuses it ([`check_target_table`]), and Trellis doesn't
+    /// re-create the table: the repair is to drop the definition and define
+    /// it again.
+    TargetTableMissing { target: String },
     /// A definition's target schema is a Trellis catalog schema (#979): this
     /// instance's own (`own`), which target tables stay out of so they can't
     /// collide with Trellis's tables, or a schema holding another instance's
@@ -520,6 +527,7 @@ impl CatalogError {
             CatalogError::AggregateDeltasTableMissing { .. } => ErrorCode::Validation,
             CatalogError::GroupBasisUnsupported { .. } => ErrorCode::Validation,
             CatalogError::LedgerTableMissing { .. } => ErrorCode::Validation,
+            CatalogError::TargetTableMissing { .. } => ErrorCode::Validation,
             // A target the definition may not have, like a row-security
             // table: the fix is a different schema in the definition.
             CatalogError::TargetInCatalogSchema { .. } => ErrorCode::Validation,
@@ -565,7 +573,8 @@ impl CatalogError {
     /// opposed to a refusal only a resume makes ([`CatalogError::SourceKeyChanged`],
     /// [`CatalogError::AggregateDeltasShapeChanged`],
     /// [`CatalogError::AggregateDeltasTableMissing`],
-    /// [`CatalogError::LedgerTableMissing`]), where define would
+    /// [`CatalogError::LedgerTableMissing`],
+    /// [`CatalogError::TargetTableMissing`]), where define would
     /// accept the definition and the repair is to drop it and define it again.
     /// A resume's message says which it is: a define refusal's says to fix the
     /// schema and resume. [`CatalogError::TargetInCatalogSchema`] is define's
@@ -581,6 +590,7 @@ impl CatalogError {
                 | CatalogError::AggregateDeltasShapeChanged { .. }
                 | CatalogError::AggregateDeltasTableMissing { .. }
                 | CatalogError::LedgerTableMissing { .. }
+                | CatalogError::TargetTableMissing { .. }
                 | CatalogError::TargetInCatalogSchema { .. }
         )
     }
@@ -681,6 +691,11 @@ impl fmt::Display for CatalogError {
                 "the ledger table of {target}, {ledger_table}, doesn't exist, but define \
                  creates one for every definition. Trellis doesn't re-create it: `DROP \
                  TRANSFORM` and define it again"
+            ),
+            CatalogError::TargetTableMissing { target } => write!(
+                f,
+                "the target table {target} doesn't exist, but define creates it. Trellis \
+                 doesn't re-create it: `DROP TRANSFORM` and define it again"
             ),
             CatalogError::TargetInCatalogSchema {
                 target,
@@ -873,6 +888,7 @@ impl std::error::Error for CatalogError {
             CatalogError::AggregateDeltasTableMissing { .. } => None,
             CatalogError::GroupBasisUnsupported { .. } => None,
             CatalogError::LedgerTableMissing { .. } => None,
+            CatalogError::TargetTableMissing { .. } => None,
             CatalogError::TargetInCatalogSchema { .. } => None,
             CatalogError::TargetTableSuffixCollision { .. } => None,
             CatalogError::TargetTableExists { .. } => None,
@@ -6184,8 +6200,33 @@ pub(crate) async fn check_ledger_table(
     })
 }
 
-/// A whole-transform resume's checks that the tables Trellis keeps beside
-/// the target are what define would create now: the ledger exists
+/// Refuses a whole-transform resume of a definition whose target table
+/// doesn't exist ([`CatalogError::TargetTableMissing`]). Define creates the
+/// target, and the rebuild writes into it, so a resume that passed would
+/// leave the definition failing its build. Refusing before the resume changes
+/// anything leaves the definition paused. Trellis doesn't re-create it.
+pub(crate) async fn check_target_table(
+    txn: &tokio_postgres::Transaction<'_>,
+    definition: &Definition,
+) -> Result<(), CatalogError> {
+    let present: bool = txn
+        .query_one(
+            "select pg_catalog.to_regclass($1) is not null",
+            &[&ddl::regclass_arg(&definition.target_table)],
+        )
+        .await?
+        .get(0);
+    if present {
+        return Ok(());
+    }
+    Err(CatalogError::TargetTableMissing {
+        target: definition.target_table.clone(),
+    })
+}
+
+/// A whole-transform resume's checks that the target exists
+/// ([`check_target_table`]) and that the tables Trellis keeps beside
+/// it are what define would create now: the ledger exists
 /// ([`check_ledger_table`]) and an aggregate's group-delta table exists with
 /// the columns define would give it ([`check_deltas_shape`]).
 pub(crate) async fn check_owned_tables(
@@ -6193,6 +6234,7 @@ pub(crate) async fn check_owned_tables(
     definition: &Definition,
     revalidated: &Revalidated,
 ) -> Result<(), CatalogError> {
+    check_target_table(txn, definition).await?;
     // A JOIN keeps no ledger, and its hidden tables are fully derived: the
     // resume drops and recreates them (#1107), so there's nothing to check.
     if revalidated.join.is_some() {

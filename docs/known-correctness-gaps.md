@@ -145,11 +145,8 @@ fails, and its key is held until the re-type releases it.
 **Detected by:** `self_check`.
 
 **Repair:** after the pass has re-typed the copy, `PAUSE`/`RESUME` every
-transform that copies the column. A rebuild keeps a 1-1 row added under a
-truncated key, as it keeps a row added by hand
-([#1201](https://github.com/salesforce-misc/trellis/issues/1201)): if
-`self_check` still reports one, `PAUSE`, `DROP TRANSFORM` and define it
-again.
+transform that copies the column. A 1-1 rebuild also deletes a row left
+under a truncated key, which no source row backs.
 
 **Ends with:** [#1207](https://github.com/salesforce-misc/trellis/issues/1207).
 
@@ -235,7 +232,8 @@ source. Better, don't use unlogged tables as sources: define accepts them.
 
 Some hand changes are loud instead: a target dropped, one of its columns
 dropped, renamed or re-typed, or its key constraint dropped fails the next
-drain or pauses the definition.
+drain or pauses the definition, and a resume refuses while the target is
+missing.
 
 **What goes wrong:** Trellis assumes it's the only writer and believes what it
 finds. An edited target row stays wrong until its key is recomputed for
@@ -249,10 +247,9 @@ table's. A change to Trellis's schema isn't detected.
 **Repair:** first drop a trigger or rule added by hand, or `SET LOGGED`.
 
 * **A 1-1 target:** `PAUSE`/`RESUME`, or `request_backfill` of its source,
-  repairs edited and deleted rows and a truncate. Rows added or re-keyed by
-  hand survive both
-  ([#1201](https://github.com/salesforce-misc/trellis/issues/1201)): `PAUSE`,
-  `DROP TRANSFORM` and define it again.
+  repairs rows edited, deleted, added or re-keyed by hand and a truncate: a
+  rebuild deletes the target rows no source row backs. A target dropped by
+  hand: `DROP TRANSFORM` and define it again.
 * **An aggregate target:** neither repairs group rows edited, deleted or
   truncated by hand, because a rebuild keeps the per-row ledger and adds
   only differences to the groups. `PAUSE`, `DROP TRANSFORM` and define it

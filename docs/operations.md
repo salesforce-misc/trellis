@@ -50,10 +50,11 @@ repairs, with the same exceptions (below).
 
 **What a resume checks.** A resume first runs define's validation against the
 live schema, and refuses while define would, leaving the definition paused;
-the error names the column and what to change. It also refuses in four cases
+the error names the column and what to change. It also refuses in five cases
 define doesn't, where the only repair is to `DROP TRANSFORM` and define again:
 
 * a 1-1 definition's source key was redefined;
+* its target table is missing;
 * its ledger table is missing;
 * an aggregate's group-delta table is missing;
 * the group-delta table has other running-sum or recompute columns than
@@ -89,12 +90,10 @@ capture is still being widened.
   again.
 
 **What a rebuild doesn't repair.** A rebuild repairs anything that's wrong
-because a change was missed, and a 1-1 target's rows edited or deleted by
-hand. It keeps:
+because a change was missed. On a 1-1 target it also deletes every row no
+source row backs, so it repairs rows edited, deleted, added or re-keyed by
+hand, and rows left under a truncated `varchar` key. It keeps:
 
-* a 1-1 target's rows that no source row backs but the rebuild didn't
-  write: rows added or re-keyed by hand, or left under a truncated
-  `varchar` key;
 * an aggregate's group rows edited by hand, and a `MIN` or `MAX` over a
   re-collated column: the rebuild keeps the per-row ledger, with its
   collations, and adds only differences to the groups;
@@ -103,7 +102,6 @@ hand. It keeps:
 
 `PAUSE`, `DROP TRANSFORM` and define it again repairs each
 ([known correctness gaps](known-correctness-gaps.md): [Rows written into a target, a hidden table or Trellis's schema](known-correctness-gaps.md#rows-written-into-a-target-a-hidden-table-or-trelliss-schema),
-[A space-padded value truncated after a `varchar` widening](known-correctness-gaps.md#a-space-padded-value-truncated-after-a-varchar-widening),
 [A column's values rewritten in place by `ALTER COLUMN TYPE`](known-correctness-gaps.md#a-columns-values-rewritten-in-place-by-alter-column-type),
 [A logical dump restored into another cluster](known-correctness-gaps.md#a-logical-dump-restored-into-another-cluster)).
 

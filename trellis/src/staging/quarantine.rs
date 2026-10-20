@@ -7631,8 +7631,13 @@ mod unit_tests {
         )
         .await
         .expect("create definition");
-        // The ledger define creates with the target, which a resume needs
-        // to exist (#986).
+        // The target and the ledger define creates, which a resume needs to
+        // exist (#986, #1201).
+        raw.batch_execute(
+            "create table public.order_totals (id bigint primary key, total numeric)",
+        )
+        .await
+        .expect("create the target");
         raw.batch_execute(&crate::defs::ledger::one_to_one_ledger_ddl(
             "public.order_totals__ledger",
         ))

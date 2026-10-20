@@ -868,8 +868,19 @@ pub(crate) async fn pause_readers_of_retyped(
             outgrown.entry(from).or_default().push(state);
         }
         for (from, states) in &outgrown {
-            let inputs = input_types(&*client, table, &live, states).await?;
-            reasons.push(outgrown_reason(table, from, &inputs, states));
+            let source = catalog
+                .definitions
+                .iter()
+                .find(|r| r.id == id)
+                .map(|r| r.source.as_str());
+            if source == Some(table)
+                && copies_retyped_by_hand(&*client, id, table, &live, from, states).await?
+            {
+                reasons.push(retyped_by_hand_reason(table, from, states));
+            } else {
+                let inputs = input_types(&*client, table, &live, states).await?;
+                reasons.push(outgrown_reason(table, from, &inputs, states));
+            }
             for column in from {
                 if !columns.contains(column) {
                     columns.push(column.clone());
@@ -1477,6 +1488,59 @@ fn outgrown_reason(
         "Trellis keeps columns typed from {} that can't hold every value of the types define \
          would give them now: {}",
         named.join(", "),
+        outgrown_columns(states)
+    )
+}
+
+/// Whether the source columns `from` of `table`, definition `id`'s source
+/// (the caller checks: its record is of that table alone), are as it
+/// recorded them, so that `states`, the columns Trellis created typed from
+/// them, were re-typed outside Trellis (#1201) rather than outgrown by a
+/// source column that widened. Only a column whose type carries no modifier
+/// (an integer, a float, a `boolean`, a `uuid`) records its type exactly: a
+/// `varchar(50)` that became `text` records as `text` both times. So for any
+/// other column, or a copy typed from another table, the answer is `false`
+/// and the source is the one named.
+async fn copies_retyped_by_hand(
+    client: &impl tokio_postgres::GenericClient,
+    id: i64,
+    table: &str,
+    live: &std::collections::HashMap<String, key_types::LiveColumn>,
+    from: &[String],
+    states: &[copies::CopyState],
+) -> Result<bool, CaptureError> {
+    use crate::defs::ValueType;
+    if states
+        .iter()
+        .any(|s| s.copy.reads.iter().any(|(t, _)| t != table))
+    {
+        return Ok(false);
+    }
+    let recorded = crate::defs::catalog::source_columns_in(client, id).await?;
+    for column in from {
+        let (Some(was), Some(now)) = (recorded.get(column), live.get(column)) else {
+            return Ok(false);
+        };
+        let exact = matches!(
+            was,
+            ValueType::Integer(_) | ValueType::Float(_) | ValueType::Boolean | ValueType::Uuid
+        );
+        if !exact || crate::defs::pg_type::value_type_for_oid(client, now.type_oid).await? != *was {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// The reason for `states`, columns Trellis created from `columns` of
+/// `table` that someone re-typed to a type too narrow for the one define
+/// gives them from the source columns, which are as they were recorded.
+fn retyped_by_hand_reason(table: &str, columns: &[String], states: &[copies::CopyState]) -> String {
+    format!(
+        "Trellis keeps columns typed from {} of {table} that were re-typed outside Trellis \
+         and can't hold every value of the types define gives them from that column, which \
+         hasn't changed: {}",
+        columns.join(", "),
         outgrown_columns(states)
     )
 }
