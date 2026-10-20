@@ -7,9 +7,9 @@
 //! with a range scan, and a walk reads each table about once, not once per
 //! page. The encoded key text ([`ddl::pk_key_sql_expr`]) stays the identity a
 //! divergence is reported by and the walk cursor's persisted form
-//! ([`SelfCheckScope::after`](super::self_check::SelfCheckScope)); it no longer
-//! orders or bounds a page. [`Keyset::params`] decodes a cursor back into its
-//! columns' values.
+//! ([`SelfCheckScope::after`](super::self_check::SelfCheckScope)); it orders
+//! and bounds no page. [`Keyset::set_cursor`] decodes a cursor back into
+//! its columns' values.
 //!
 //! **Order.** Both sides order by the same expressions: each column
 //! ascending, `NULL` last (the default a btree index holds), and each
@@ -116,6 +116,14 @@ impl Keyset {
                 collation: row.get(2),
             })
             .collect();
+        // A column gone from the table would otherwise shrink the key, and
+        // the page would compare keys of another arity than the ring's.
+        if pk.len() != names.len() {
+            return Err(SelfCheckError::UnsupportedExpr {
+                target: table.to_string(),
+                detail: format!("the key columns {names:?} are not all columns of {table}"),
+            });
+        }
         Self::resolve(client, &pk).await
     }
 
@@ -501,5 +509,440 @@ mod tests {
                 "(\"a\" is null)".to_string()
             ]
         );
+    }
+}
+
+/// A walk paged by [`Keyset`] against the unpaged comparison, on tables of
+/// random keys: nullable and composite, `NULL`-heavy, of several types, the
+/// two sides' text columns under different collations, at tiny page sizes.
+#[cfg(test)]
+mod walk_tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use super::*;
+
+    /// A deterministic xorshift, so a failure reproduces.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn pick<'a>(&mut self, of: &[&'a str]) -> &'a str {
+            of[(self.next() % of.len() as u64) as usize]
+        }
+
+        fn chance(&mut self, percent: u64) -> bool {
+            self.next() % 100 < percent
+        }
+    }
+
+    /// One key column: its type in each table, and the literals a value is
+    /// drawn from (`null` among them, often).
+    struct Column {
+        name: &'static str,
+        src_type: String,
+        tgt_type: String,
+        nullable: bool,
+        values: Vec<&'static str>,
+    }
+
+    async fn connect(dsn: &str) -> tokio_postgres::Client {
+        let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+    }
+
+    /// A row of literals for `columns`.
+    fn row(rng: &mut Rng, columns: &[Column]) -> String {
+        let parts: Vec<String> = columns
+            .iter()
+            .map(|c| {
+                let v = rng.pick(&c.values);
+                if v == "null" {
+                    "null".to_string()
+                } else {
+                    format!("{}::{}", quote_literal(v), c.src_type)
+                }
+            })
+            .collect();
+        format!("({})", parts.join(", "))
+    }
+
+    /// Each side's key texts, read whole.
+    async fn keys(client: &tokio_postgres::Client, ks: &Keyset, table: &str) -> BTreeSet<String> {
+        let key = ddl::pk_key_sql_expr(ks.columns(), None);
+        client
+            .query(&format!("select {key} from {table}"), &[])
+            .await
+            .expect("read the keys")
+            .iter()
+            .map(|r| r.get(0))
+            .collect()
+    }
+
+    /// Walks `src` against `tgt`, `limit` keys a page: for each side, the
+    /// page each key was read on.
+    async fn walk(
+        client: &mut tokio_postgres::Client,
+        template: &Keyset,
+        limit: i64,
+    ) -> [BTreeMap<String, usize>; 2] {
+        let mut seen: [BTreeMap<String, usize>; 2] = Default::default();
+        let mut after: Option<String> = None;
+        for page in 0..10_000 {
+            let mut ks = template.clone();
+            ks.set_cursor(after.as_deref()).expect("a cursor");
+            let refs = ks.refs(None);
+            let carried = ks.select_carried(&refs);
+            let order = ks.order_by(&refs);
+            let key = ddl::pk_key_sql_expr(ks.columns(), None);
+            let side = |table: &str| {
+                ks.side(&refs, |cond| {
+                    format!(
+                        "select {key} as __k{carried}, array[]::text[] as __v from {table} \
+                         where {cond} order by {order} limit $1"
+                    )
+                })
+            };
+            let sql = ks.ranked(
+                &format!(
+                    "s as materialized ({}), t as materialized ({}), ",
+                    side("src"),
+                    side("tgt")
+                ),
+                &[(1, "s"), (2, "t")],
+                &[1, 2],
+                "",
+            );
+            let rows = Keyset::run(client, &sql, limit, false)
+                .await
+                .unwrap_or_else(|e| panic!("{e:?}\n{sql}"));
+            let mut end: Option<String> = None;
+            for r in &rows {
+                let side: i32 = r.get(0);
+                end = r.get(1);
+                let key: String = r.get(2);
+                let previous = seen[(side - 1) as usize].insert(key.clone(), page);
+                assert_eq!(previous, None, "side {side} read {key:?} twice");
+            }
+            match end {
+                None => return seen,
+                Some(end) => {
+                    assert_ne!(after.as_deref(), Some(end.as_str()), "no progress");
+                    after = Some(end);
+                }
+            }
+        }
+        panic!("the walk did not end");
+    }
+
+    /// Builds `src` and `tgt` over `columns`, the target `src`'s keys with
+    /// some dropped and some extra, and checks the walk at every page size
+    /// against the unpaged sets: each key read once on each side it is in,
+    /// on the same page on both sides.
+    async fn check(dsn: &str, columns: &[Column], seed: u64) {
+        let mut client = connect(dsn).await;
+        let ddl_of = |tgt: bool| {
+            columns
+                .iter()
+                .map(|c| {
+                    let ty = if tgt { &c.tgt_type } else { &c.src_type };
+                    let null = if c.nullable { "" } else { " not null" };
+                    format!("{} {ty}{null}", c.name)
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let names = columns
+            .iter()
+            .map(|c| c.name)
+            .collect::<Vec<_>>()
+            .join(", ");
+        client
+            .batch_execute(&format!(
+                "drop table if exists src, tgt; \
+                 create table src ({}); create table tgt ({}); \
+                 create unique index on src ({names}) nulls not distinct; \
+                 create unique index on tgt ({names}) nulls not distinct",
+                ddl_of(false),
+                ddl_of(true)
+            ))
+            .await
+            .expect("create the tables");
+        let mut rng = Rng(seed);
+        let mut src = BTreeSet::new();
+        for _ in 0..60 {
+            src.insert(row(&mut rng, columns));
+        }
+        // The target misses some of the source's rows and has some of its
+        // own.
+        let mut tgt: BTreeSet<String> = src.iter().filter(|_| !rng.chance(15)).cloned().collect();
+        if tgt.len() == src.len() {
+            let middle = src.iter().nth(src.len() / 2).expect("a row").clone();
+            tgt.remove(&middle);
+        }
+        for _ in 0..10 {
+            let r = row(&mut rng, columns);
+            if !src.contains(&r) {
+                tgt.insert(r);
+            }
+        }
+        for (table, rows) in [("src", &src), ("tgt", &tgt)] {
+            for r in rows {
+                client
+                    .batch_execute(&format!(
+                        "insert into {table} values {r} on conflict do nothing"
+                    ))
+                    .await
+                    .expect("insert a row");
+            }
+        }
+        let names: Vec<String> = columns.iter().map(|c| c.name.to_string()).collect();
+        let mut template = Keyset::resolve_columns(&client, "public.src", &names)
+            .await
+            .expect("resolve the keyset");
+        for (pk, c) in template.pk.iter_mut().zip(columns) {
+            pk.nullable = c.nullable;
+        }
+        let full = [
+            keys(&client, &template, "src").await,
+            keys(&client, &template, "tgt").await,
+        ];
+        assert!(
+            full[0] != full[1],
+            "seed {seed} plants no divergence: {src:?} {tgt:?}"
+        );
+        for limit in [1, 2, 3, 4, 7, 1000] {
+            let seen = walk(&mut client, &template, limit).await;
+            for side in 0..2 {
+                let read: BTreeSet<String> = seen[side].keys().cloned().collect();
+                assert_eq!(
+                    read, full[side],
+                    "side {side} at limit {limit}, seed {seed}"
+                );
+            }
+            for (key, page) in &seen[0] {
+                if let Some(other) = seen[1].get(key) {
+                    assert_eq!(
+                        page, other,
+                        "{key:?} read on two pages at limit {limit}, seed {seed}"
+                    );
+                }
+            }
+        }
+    }
+
+    fn column(
+        name: &'static str,
+        ty: &str,
+        tgt_ty: &str,
+        nullable: bool,
+        values: &[&'static str],
+    ) -> Column {
+        Column {
+            name,
+            src_type: ty.to_string(),
+            tgt_type: tgt_ty.to_string(),
+            nullable,
+            values: values.to_vec(),
+        }
+    }
+
+    const TEXTS: &[&str] = &[
+        "null",
+        "null",
+        "",
+        "a",
+        "A",
+        "b",
+        "B",
+        "é",
+        "E",
+        "z",
+        "10",
+        "9",
+        "a\u{1f}b",
+        "\u{1}",
+        "\u{1}\u{1}",
+        "\u{1e}",
+    ];
+
+    #[tokio::test]
+    async fn a_paged_walk_reads_what_an_unpaged_comparison_does() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_empty_database().await;
+        let client = connect(db.dsn()).await;
+        // A deterministic collation that orders unlike byte order, and a
+        // nondeterministic one, where ICU is built in.
+        let icu: bool = client
+            .query_one(
+                "select exists (select 1 from pg_catalog.pg_collation \
+                 where collname = 'und-x-icu')",
+                &[],
+            )
+            .await
+            .expect("read the collations")
+            .get(0);
+        let ordered = if icu {
+            client
+                .batch_execute(
+                    "create collation ci (provider = icu, locale = 'und-u-ks-level2', \
+                     deterministic = false)",
+                )
+                .await
+                .expect("create a nondeterministic collation");
+            r#"text collate "und-x-icu""#
+        } else {
+            "text"
+        };
+        let c_text = r#"text collate "C""#;
+        let ints: &[&'static str] = &["null", "null", "1", "2", "-3", "10", "9"];
+        let mut shapes: Vec<Vec<Column>> = vec![
+            // Nullable integer and text, the target's text under "C".
+            vec![
+                column("a", "integer", "integer", true, ints),
+                column("b", ordered, c_text, true, TEXTS),
+            ],
+            // Three nullable columns over tiny domains: NULL in every
+            // position of the cursor.
+            vec![
+                column("a", "integer", "integer", true, &["null", "1", "2"]),
+                column("b", "integer", "bigint", true, &["null", "1", "2"]),
+                column("c", "smallint", "smallint", true, &["null", "1", "2"]),
+            ],
+            // A not-null composite: one row comparison.
+            vec![
+                column("a", "bigint", "bigint", false, &["1", "2", "-3", "10", "9"]),
+                column("b", ordered, c_text, false, &TEXTS[2..]),
+            ],
+            // numeric (1.0 and 1.00 are one key), timestamptz, uuid.
+            vec![
+                column(
+                    "n",
+                    "numeric",
+                    "numeric",
+                    true,
+                    &[
+                        "null", "1.0", "1.00", "-0", "0.001", "10", "9", "NaN", "Infinity",
+                    ],
+                ),
+                column(
+                    "t",
+                    "timestamptz",
+                    "timestamptz",
+                    true,
+                    &[
+                        "null",
+                        "2024-01-01 00:00:00+00",
+                        "2024-01-01 00:00:00.000001+00",
+                        "2023-12-31 23:00:00-02",
+                        "infinity",
+                        "-infinity",
+                    ],
+                ),
+                column(
+                    "u",
+                    "uuid",
+                    "uuid",
+                    true,
+                    &[
+                        "null",
+                        "00000000-0000-0000-0000-000000000000",
+                        "ffffffff-ffff-ffff-ffff-ffffffffffff",
+                        "7a9f0000-0000-0000-0000-000000000001",
+                    ],
+                ),
+            ],
+            // float8: NaN last but before NULL, -0 and 0 one key.
+            vec![column(
+                "f",
+                "double precision",
+                "double precision",
+                true,
+                &[
+                    "null",
+                    "NaN",
+                    "Infinity",
+                    "-Infinity",
+                    "-0",
+                    "0",
+                    "0.1",
+                    "1e300",
+                    "-1.5",
+                ],
+            )],
+        ];
+        if icu {
+            // A nondeterministic source collation (a key re-collated after
+            // define, which refuses one): the walk falls back to byte order
+            // on both sides. A single not-null column, since the key text of
+            // any other (`replace`) can't be computed under one.
+            shapes.push(vec![column(
+                "t",
+                r#"text collate ci"#,
+                c_text,
+                false,
+                &TEXTS[2..],
+            )]);
+        }
+        for (i, shape) in shapes.iter().enumerate() {
+            for seed in 1..=8u64 {
+                check(db.dsn(), shape, seed * 7919 + i as u64).await;
+            }
+        }
+        // A key column the table no longer has is refused, not dropped from
+        // the key.
+        let gone = Keyset::resolve_columns(
+            &client,
+            "public.src",
+            &["t".to_string(), "gone".to_string()],
+        )
+        .await;
+        assert!(
+            matches!(gone, Err(SelfCheckError::UnsupportedExpr { .. })),
+            "{gone:?}"
+        );
+    }
+
+    /// The hash aggregation [`Keyset::run`] turns off for a statement is on
+    /// again for the connection's next one, whether the statement succeeded
+    /// or failed.
+    #[tokio::test]
+    async fn run_leaves_hash_aggregation_as_it_found_it() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_empty_database().await;
+        let mut client = connect(db.dsn()).await;
+        async fn show(c: &tokio_postgres::Client) -> String {
+            c.query_one("show enable_hashagg", &[])
+                .await
+                .expect("show")
+                .get(0)
+        }
+        let rows = Keyset::run(
+            &mut client,
+            "select current_setting('enable_hashagg') from generate_series(1, $1::bigint) g",
+            1,
+            true,
+        )
+        .await
+        .expect("run");
+        assert_eq!(
+            rows[0].get::<_, String>(0),
+            "off",
+            "off inside the statement"
+        );
+        assert_eq!(show(&client).await, "on", "on after a statement");
+        let failed = Keyset::run(&mut client, "select 1 / ($1::bigint - 1)", 1, true).await;
+        assert!(failed.is_err());
+        assert_eq!(show(&client).await, "on", "on after a failed statement");
     }
 }

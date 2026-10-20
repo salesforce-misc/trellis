@@ -806,3 +806,72 @@ async fn an_aggregate_page_reads_its_source_by_an_index_that_leads_with_the_grou
     );
     assert!(with.contains("Index Scan using agg_g_key on agg"), "{with}");
 }
+
+/// A two-column nullable group key, `NULL` in either part, against pending
+/// changes that add groups only the ring knows (a deleted group's rows, a
+/// new group's), with and without an index leading with the group columns
+/// (the ordered, unbounded page of #1178): at every page size the
+/// comparison finds nothing, and a group planted on one side only is
+/// reported alike.
+#[tokio::test]
+async fn nullable_composite_groups_with_ring_only_keys_page_alike_with_and_without_an_index() {
+    let mut d = start_with(
+        "TRANSFORM agg FROM public.src GROUP BY g, h SELECT SUM(v) AS total, COUNT(*) AS n",
+        "create table public.src (id integer primary key, g integer, h integer, v integer)",
+        &[("id", int4()), ("g", int4()), ("h", int4()), ("v", int4())],
+    )
+    .await;
+    let mut rows = Vec::new();
+    let mut id = 0;
+    for g in ["null", "1", "2", "10"] {
+        for h in ["null", "1", "9", "10"] {
+            id += 1;
+            rows.push(format!("({id}, {g}, {h}, {id})"));
+        }
+    }
+    step(
+        &mut d,
+        &format!("insert into public.src values {}", rows.join(", ")),
+    )
+    .await;
+    // Pending: a group emptied (only the ring still holds its rows), a new
+    // group (only in the source and the ring), and a row moved into the
+    // `NULL` region.
+    exec(
+        &d,
+        "delete from public.src where g = 2 and h = 9; \
+         insert into public.src values (100, 3, null, 1), (101, null, 5, 2); \
+         update public.src set g = null, h = null where id = 6",
+    )
+    .await;
+    for indexed in [false, true] {
+        if indexed {
+            exec(&d, "create index src_g_h_idx on public.src (g, h)").await;
+        }
+        for limit in [1, 2, 3, 4, 100] {
+            assert_eq!(
+                compare(&d, limit).await,
+                (vec![], vec![], false),
+                "indexed {indexed}, limit {limit}"
+            );
+        }
+        // A group only the target has, between two in the `NULL` region.
+        exec(
+            &d,
+            "insert into public.agg (g, h, total, n) values (null, 7, 1, 1)",
+        )
+        .await;
+        for limit in [1, 2, 3, 4, 100] {
+            let (found, uncertain, all) = compare(&d, limit).await;
+            assert_eq!(
+                found,
+                [Divergence::ExtraRow {
+                    key: "\u{1}\u{1f}7".into()
+                }],
+                "indexed {indexed}, limit {limit}"
+            );
+            assert_eq!((uncertain, all), (vec![], false));
+        }
+        exec(&d, "delete from public.agg where g is null and h = 7").await;
+    }
+}

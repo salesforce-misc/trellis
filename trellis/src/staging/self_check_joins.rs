@@ -315,9 +315,8 @@ struct RingReads {
     global: String,
 }
 
-/// The statement of a page of `P`, `M` or `J`: `$1` is the cursor's key,
-/// `$2` the limit and `$3…` the cursor's columns ([`Keyset::params`]); each
-/// row is `(side, page_end, key, values)`, side 1 the source's and 2 the
+/// The statement of a page of `P`, `M` or `J`: `$1` is the limit, and the
+/// cursor is in the statement ([`Keyset::set_cursor`]); each row is `(side, page_end, key, values)`, side 1 the source's and 2 the
 /// hidden table's, as `super::self_check_groups`' page, and sides 5 and 6 its
 /// uncertain keys and its "every key" row. `source_from` names the weighted
 /// source rows as `__s`, carrying `keyset`'s columns, `source_where`

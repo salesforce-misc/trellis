@@ -213,10 +213,11 @@ times the table, which is hours at 100M rows.
 * **The key per target kind.** A 1-1 target pages by the source's primary key,
   which always has its index. A group-basis aggregate pages by its `GROUP BY`
   columns, a JOIN's target part by its group columns, `P` by `a`'s group columns
-  and the join key, `M` and `J` by `b`'s join key. The aggregate and JOIN
-  parts are index-served only when the source has an index leading with those
-  columns; without one a page scans the source, so a walk reads G / L times
-  the table.
+  and the join key, `M` and `J` by `b`'s join key. The aggregate, `P`, `M`
+  and `J` are index-served only when their table has an index leading with
+  those columns; without one a page scans the table, so a walk reads G / L
+  times it. A JOIN's target part reads the join of both tables, which no index
+  orders, so each of its pages scans them.
 * **Order.** Each column ascending, `NULL` last (what a btree holds, and the
   order `NULLS NOT DISTINCT` identities need), each collatable column under
   one collation named in the statement and used on both sides: the key index's
@@ -235,7 +236,7 @@ times the table, which is hours at 100M rows.
   the source has an index leading with the key, the page runs without hash
   aggregation and without the bound to the hidden side's last key, which an
   ordered aggregate would read past to the end of the index.
-* **Identity.** The encoded key text is still the key a divergence is reported
+* **Identity.** The encoded key text is the key a divergence is reported
   by and the text a walk saves as its cursor; it neither orders nor bounds a
   page. A cursor is decoded back into its columns' values for the next page.
 * **The page's end.** The two sides are `limit`ed separately, so a page ends at
@@ -243,7 +244,7 @@ times the table, which is hours at 100M rows.
   ranked together in the statement, by a dense rank over the same order, so
   "past the end" is an integer comparison whatever the key's type.
 * **One statement.** A page is one statement under one snapshot, and the
-  ring-weighted comparison runs inside it as before.
+  ring-weighted comparison runs inside it.
 
 The cost of a walk is then about (rows read per page) × (pages). The module docs
 of `self_check`, `self_check_groups` and `self_check_joins` say what each part
@@ -307,7 +308,8 @@ standing cost.
 
 - `self_check` is a real read load: a full recompute reads source and target
   once when a key's index orders each page, and once per page where none does
-  (an aggregate or JOIN part over unindexed group or join columns). It runs page by page beside the drain workers, each page bounded and holding no
+  (an aggregate or JOIN part over unindexed group or join columns). It runs
+  page by page beside the drain workers, each page bounded and holding no
   lock, and its caller never waits on it.
 - It needs a drain worker somewhere in the fleet, as a build does; with none, a
   job stays `queued`.

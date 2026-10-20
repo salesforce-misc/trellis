@@ -115,10 +115,10 @@
 //! walk saves; it orders nothing. A 1-1 target pages by its source's
 //! primary key, which has its index, so each page is a range scan of both
 //! sides and a walk reads each table about once: its cost is linear in the
-//! rows. (Paging by the text, which no index orders, read the whole source
-//! on every page: N / L times the table.) An aggregate or a `JOIN` pages
-//! its source by its group or join columns and is index-ordered only if the
-//! source has an index leading with them
+//! rows, where paging by the text, which no index orders, would read the
+//! whole source on every page: N / L times the table. An aggregate or a
+//! `JOIN` pages its source by its group or join columns and is index-ordered
+//! only if the source has an index leading with them
 //! ([`super::self_check_groups`], [`super::self_check_joins`]).
 //!
 //! # One page at a time

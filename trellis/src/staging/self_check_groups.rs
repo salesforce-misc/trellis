@@ -141,8 +141,8 @@ pub(super) fn bound(keyset: &Keyset, refs: &[String], end: &[String], bounded: b
     )
 }
 
-/// The statement of one page ([`compare`]). `$1` is the cursor, `$2` the
-/// limit; each row is `(side, page_end, key, values)` for the sides in the
+/// The statement of one page ([`compare`]). `$1` is the limit, and the
+/// cursor is in the statement ([`Keyset::set_cursor`]); each row is `(side, page_end, key, values)` for the sides in the
 /// module doc, numbered from 1, and `page_end` is the page's bound, the
 /// lowest last key of the sides that filled the limit (as the 1-1 page's).
 /// Side 5 names each group an unapplied ring row may touch but can't be
