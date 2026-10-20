@@ -2926,3 +2926,53 @@ async fn a_resume_refuses_when_the_target_table_is_gone() {
     );
     assert_eq!(f.status("one").await.as_deref(), Some("paused"));
 }
+
+/// #1201: the orphan sweep of a rebuild walks more hand-added rows than one
+/// batch holds, and never deletes a target row the source backs: a key whose
+/// source row committed after the plan read the source, with its captured
+/// change still in the ring when the sweep runs, is re-derived from the
+/// source, not deleted as unbacked.
+#[tokio::test]
+async fn a_rebuild_sweeps_many_hand_added_rows_and_keeps_a_row_the_source_backs() {
+    let mut f = Fixture::new(150, &[ONE]).await;
+    f.pass().await;
+    f.run("one").await;
+    assert_eq!(f.status("one").await.as_deref(), Some("live"));
+
+    let trellis = f.trellis().await;
+    trellis
+        .request_backfill("src")
+        .await
+        .expect("request a rebuild");
+    f.run_chunks_by_hand(1_000).await;
+    // After the plan read the source: a source row whose change waits in the
+    // ring, a wrong target row for it, and three batches' worth of rows
+    // nothing backs.
+    f.raw
+        .batch_execute(
+            "insert into public.src values (5000, 1, 7); \
+             insert into public.one (id, g, dbl) values (5000, 0, 0); \
+             insert into public.one (id, g, dbl) \
+                 select i, 0, 0 from generate_series(6001, 6025) i",
+        )
+        .await
+        .expect("change the source and the target");
+    assert!(
+        has_pending(&f.raw).await.expect("has_pending"),
+        "the source row's change is still in the ring"
+    );
+    for _ in 0..MAX_STEPS {
+        if !f.step(&OPTIONS).await.progressed() {
+            break;
+        }
+    }
+    assert_eq!(
+        f.rows("select (id, g, dbl)::text from public.one where id >= 5000 order by id")
+            .await,
+        ["(5000,1,14)"],
+        "the sweep re-derived the backed row and deleted every unbacked one"
+    );
+    f.run("one").await;
+    assert_eq!(f.status("one").await.as_deref(), Some("live"));
+    f.assert_one_oracle().await;
+}

@@ -415,7 +415,9 @@ async fn explain_range(
 /// it locks and re-derives them as a chunk does, reading the source by each
 /// key's typed columns: a key with no row any more (deleted while the
 /// definition was frozen) becomes a tombstone and its target row is
-/// deleted.
+/// deleted. Once the ledger is read to its end, each batch also takes up to
+/// `scan` target rows with no live entry ([`orphan_keys`]) and re-derives
+/// them with the rest, and the sweep is finished when a batch finds fewer.
 pub async fn sweep_batch(
     txn: &Transaction<'_>,
     plan: &OneToOnePlan,
@@ -459,21 +461,23 @@ pub async fn sweep_batch(
     metrics::record_build_statement(BuildStatement::ChunkKeys, started.elapsed());
     let scanned: i64 = row.get(0);
     let next: Option<String> = row.get(1);
-    let keys: Vec<String> = row.get(2);
-    let mut rederived = keys.len();
+    let mut keys: Vec<String> = row.get(2);
     let mut finished = scanned < scan;
-    let mut outcome = rederive_keys(txn, plan, &keys).await?;
     if finished {
         // The ledger is read to its end. Target rows with no live entry
         // (added or re-keyed by hand, #1201) are in no ledger page: walk
-        // them here, a batch at a time, until none is left.
+        // them here, a batch at a time, until none is left. They're read
+        // before any entry is locked and locked with the page's keys in one
+        // ordered batch, so the batch holds no lock across the target scan
+        // and takes its locks in the one key order a page takes them in.
         let orphans = orphan_keys(txn, plan, scan).await?;
         finished = i64::try_from(orphans.len()).is_ok_and(|n| n < scan);
-        rederived += orphans.len();
-        let done = rederive_keys(txn, plan, &orphans).await?;
-        outcome.written += done.written;
-        outcome.deleted += done.deleted;
+        keys.extend(orphans);
+        keys.sort_unstable();
+        keys.dedup();
     }
+    let rederived = keys.len();
+    let outcome = rederive_keys(txn, plan, &keys).await?;
     crate::instance_log::debug!(
         target_table = %plan.target,
         scanned,

@@ -868,7 +868,14 @@ pub(crate) async fn pause_readers_of_retyped(
             outgrown.entry(from).or_default().push(state);
         }
         for (from, states) in &outgrown {
-            if copies_retyped_by_hand(&*client, id, table, &live, from, states).await? {
+            let source = catalog
+                .definitions
+                .iter()
+                .find(|r| r.id == id)
+                .map(|r| r.source.as_str());
+            if source == Some(table)
+                && copies_retyped_by_hand(&*client, id, table, &live, from, states).await?
+            {
                 reasons.push(retyped_by_hand_reason(table, from, states));
             } else {
                 let inputs = input_types(&*client, table, &live, states).await?;
@@ -1485,7 +1492,8 @@ fn outgrown_reason(
     )
 }
 
-/// Whether the source columns `from` of `table` are as the definition `id`
+/// Whether the source columns `from` of `table`, definition `id`'s source
+/// (the caller checks: its record is of that table alone), are as it
 /// recorded them, so that `states`, the columns Trellis created typed from
 /// them, were re-typed outside Trellis (#1201) rather than outgrown by a
 /// source column that widened. Only a column whose type carries no modifier
