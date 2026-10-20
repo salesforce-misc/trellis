@@ -41,6 +41,7 @@ wrong rows, on the targets it compares
 | [A trigger that re-keys a parent's join column within the statement](#a-trigger-that-re-keys-a-parents-join-column-within-the-statement) | no | #1115 |
 | [A from-side change pending across a to-side `TRUNCATE`](#a-from-side-change-pending-across-a-to-side-truncate) | no | #1115 |
 | [A to-one field under concurrent writes to both tables](#a-to-one-field-under-concurrent-writes-to-both-tables) | no | #1115 |
+| [A to-side row hidden from capture by a new policy](#a-to-side-row-hidden-from-capture-by-a-new-policy) | no; the next pass pauses it | #1115 |
 | **[Partitioned sources](#partitioned-sources-refused-today)** (refused at define today) | | |
 | [A `MERGE` that moves a row to another partition](#a-merge-that-moves-a-row-to-another-partition) | `self_check` | a Postgres fix ([#942](https://github.com/salesforce-misc/trellis/issues/942)) |
 | [A partition's capture changed outside Trellis](#a-partitions-capture-changed-outside-trellis) | `self_check` | [#1200](https://github.com/salesforce-misc/trellis/issues/1200) |
@@ -50,8 +51,9 @@ wrong rows, on the targets it compares
 
 ## Preconditions
 
-The guarantee rests on these rules. Each entry below is a way one of them
-gets broken without Trellis noticing.
+The guarantee rests on these rules. Most entries below are a way one of them
+gets broken without Trellis noticing; the rest are ways Trellis goes wrong
+while every rule holds.
 
 * **Only Trellis writes what it owns:** the target tables, the tables it
   keeps beside them, and its own schema (the catalog and the ring). Grant
@@ -61,7 +63,7 @@ gets broken without Trellis noticing.
   readers of a table whose capture was changed, but not when the change is
   undone before the next reconcile pass sees it
   ([embedding — What the staging worker needs from the database](embedding.md#what-the-staging-worker-needs-from-the-database)).
-* **Restore the database as a whole, from a physical backup, PITR or
+* **Restore or upgrade the database as a whole: a physical backup, PITR or
   `pg_upgrade`.** Restoring part of the database, or restoring a logical dump
   into another cluster, breaks the guarantee.
 * **Use logged tables as sources.** Postgres empties an unlogged table on a
@@ -105,11 +107,15 @@ COLLATE "C"`) is missed the same way, with no rewrite.
 
 **What goes wrong:** the statement rewrites the table without firing a
 trigger, so every target reading the column keeps the old values until each
-row is written again.
+row is written again. A re-collated `MIN` or `MAX` stays wrong after that
+too: the aggregate's ledger keeps the collation the column had at define, so
+every recompute of the group, a rebuild's included, still orders by it.
 
 **Detected by:** `self_check`.
 
-**Repair:** right after the `ALTER`, `request_backfill` the table.
+**Repair:** right after the `ALTER`, `request_backfill` the table. For a
+re-collated `MIN` or `MAX`, `PAUSE`, `DROP TRANSFORM` and define the
+aggregate again.
 
 **Ends with:** [#1206](https://github.com/salesforce-misc/trellis/issues/1206),
 a false-positive study of signals that would catch these shapes. Event
@@ -130,15 +136,20 @@ relationship's projection.
 **What goes wrong:** Postgres stores such a value truncated to `n` rather
 than refusing it, so the copy holds `'abcde'`. A truncated 1-1 key lands on
 the target row of the real key `'abcde'`, if there is one, and overwrites its
-values. A `JOIN` counts the row in the truncated value's group. The re-type
-changes no value, so the copies keep the truncated values until the rows are
-written again. Any other value too long for the copy fails, and its key is
-held until the re-type releases it.
+values; if there isn't, it adds a row no source row backs. A `JOIN` counts
+the row in the truncated value's group. The re-type changes no value, so the
+copies keep the truncated values until the rows are written again, and a
+row added under a truncated key stays. Any other value too long for the copy
+fails, and its key is held until the re-type releases it.
 
 **Detected by:** `self_check`.
 
 **Repair:** after the pass has re-typed the copy, `PAUSE`/`RESUME` every
-transform that copies the column.
+transform that copies the column. A rebuild keeps a 1-1 row added under a
+truncated key, as it keeps a row added by hand
+([#1201](https://github.com/salesforce-misc/trellis/issues/1201)): if
+`self_check` still reports one, `PAUSE`, `DROP TRANSFORM` and define it
+again.
 
 **Ends with:** [#1207](https://github.com/salesforce-misc/trellis/issues/1207).
 
@@ -216,6 +227,9 @@ source. Better, don't use unlogged tables as sources: define accepts them.
   `<target>__deltas`, a group-basis aggregate's `agg_<id>`, a `JOIN`'s
   `join_<id>_*` tables;
 * a target dropped and created again by hand with the same columns;
+* a trigger or rule added to a target or one of those tables that changes
+  the rows Trellis writes, or the table set `UNLOGGED`, which a crash or
+  failover empties;
 * DML, DDL or a data load into Trellis's own schema, such as another
   database's catalog rows.
 
@@ -232,22 +246,24 @@ a change to them says.
 **Detected by:** `self_check` reports a target's wrong rows, and a hidden
 table's. A change to Trellis's schema isn't detected.
 
-**Repair:**
+**Repair:** first drop a trigger or rule added by hand, or `SET LOGGED`.
 
 * **A 1-1 target:** `PAUSE`/`RESUME`, or `request_backfill` of its source,
   repairs edited and deleted rows and a truncate. Rows added or re-keyed by
   hand survive both
   ([#1201](https://github.com/salesforce-misc/trellis/issues/1201)): `PAUSE`,
   `DROP TRANSFORM` and define it again.
-* **An aggregate target:** neither repairs a group row edited by hand,
-  because a rebuild keeps the per-row ledger and adds only differences to the
-  groups. `PAUSE`, `DROP TRANSFORM` and define it again. Ledger aggregates
-  leave with [#1105](https://github.com/salesforce-misc/trellis/issues/1105).
-  A group-basis aggregate's target and `agg_<id>` are repaired by
+* **An aggregate target:** neither repairs group rows edited, deleted or
+  truncated by hand, because a rebuild keeps the per-row ledger and adds
+  only differences to the groups. `PAUSE`, `DROP TRANSFORM` and define it
+  again. Ledger aggregates leave with
+  [#1105](https://github.com/salesforce-misc/trellis/issues/1105). A
+  group-basis aggregate's target and `agg_<id>` are repaired by
   `request_backfill` of its source.
 * **Trellis's schema:** restore the whole database from a backup taken
   before the change, or `PAUSE`, `DROP TRANSFORM` and define every transform
-  again.
+  again. A target the changed catalog has no definition for is a plain table
+  to Trellis: drop it by hand before defining it again.
 
 **Ends with:** [#1209](https://github.com/salesforce-misc/trellis/issues/1209)
 weighs refusing or detecting such writes. Until then it's a rule
@@ -304,9 +320,10 @@ position and aren't affected.
 ### Text functions in a 1-1 field
 
 **When:** a 1-1 transform's field calls `REGEXP_COUNT` with a pattern that
-uses any regex syntax beyond plain characters, or a column read by `STRPOS` or `REGEXP_COUNT` is
-given a nondeterministic collation after define (define refuses one, and
-nothing checks it afterwards).
+uses any regex syntax beyond plain characters, or a column read by `STRPOS`
+or `REGEXP_COUNT` is given a nondeterministic collation after define. Define
+refuses such a collation, because Postgres refuses both functions under one,
+and nothing checks it afterwards.
 
 **What goes wrong:** the drain evaluates the pattern with Rust's `regex`
 engine, which differs from Postgres's even on ordinary patterns:
@@ -314,12 +331,14 @@ engine, which differs from Postgres's even on ordinary patterns:
 a newline only in Postgres, and `\w` and `\d` disagree on non-ASCII text and
 under `"C"` collation. A build evaluates in Postgres, so the target holds
 Postgres's value on rows a build wrote and Rust's on rows the drain wrote
-since. The drain's evaluator has no collation to consult, so it ignores a
-nondeterministic one. Aggregate arguments evaluate in Postgres and aren't
+since. The drain's evaluator has no collation to consult, so under a
+nondeterministic one it keeps writing values Postgres would refuse to
+compute. An aggregate transform's arguments evaluate in Postgres and aren't
 affected. A pattern Rust's engine rejects (back-references, `\m`, embedded
 options) is refused at define.
 
-**Detected by:** `self_check`.
+**Detected by:** `self_check`. Under a nondeterministic collation, its
+recompute fails with Postgres's error, as a rebuild does.
 
 **Repair:** use patterns of plain characters. `PAUSE`/`RESUME` rewrites every row with
 Postgres's value, until each row's next write.
@@ -331,7 +350,7 @@ moves 1-1 evaluation into Postgres.
 ### An aggregate reading a paused column
 
 **When:** a column of a 1-1 target is paused (its column fuse tripped, or
-`PAUSE TRANSFORM <target>.<column>`), and an aggregate reads that target.
+`PAUSE TRANSFORM <target>.<column>`), and an aggregate reads that column.
 
 **What goes wrong:** the pause cascades to 1-1 readers of the column, not to
 aggregates
@@ -353,7 +372,7 @@ These come from relationship propagation
 ([relationship propagation](relationship-propagation.md)).
 [#1115](https://github.com/salesforce-misc/trellis/issues/1115) removes
 relationships, and the `JOIN` transforms that replace them don't have any of
-the three. `self_check` doesn't compare a target that reads a relationship.
+these. `self_check` doesn't compare a target that reads a relationship.
 
 ### A trigger that re-keys a parent's join column within the statement
 
@@ -409,6 +428,26 @@ to the child corrects it.
 **Repair:** any write to the child, or `request_backfill` of the parent
 table.
 
+### A to-side row hidden from capture by a new policy
+
+**When:** row-level security comes to apply to the role that owns the ring
+on a to-one relationship's to-side (`FORCE ROW LEVEL SECURITY` on a table it
+owns, say), and before the next reconcile pass a statement writes the table
+while another write to it runs inside the same statement (an application
+trigger's, a cascade's or a sibling event's), which makes the statement's
+capture re-read its rows
+([capture by triggers — When capture re-reads](staging-and-claiming/01-capture-by-triggers.md#when-capture-re-reads)).
+
+**What goes wrong:** the re-read can't see a row the policy hides, so it
+stages a delete of a parent that still exists. The relationship's projection
+applies the delete, so a 1-1 field read through the relationship reads that
+parent as gone on every child, while the definition reads `live`. The next
+pass pauses the definition for the row-level security. A target that reads
+the table directly stays right: its apply re-reads a deleted row live.
+
+**Repair:** exempt the role, then `RESUME` the paused definitions, which
+refreshes the projection from the table.
+
 ## Partitioned sources (refused today)
 
 Define refuses a partitioned table as a source today
@@ -418,9 +457,12 @@ so nothing in this section can happen yet. Capture, detection and correction
 for partitioned sources are built behind that refusal
 ([ADR-0017](decisions/0017-partitioned-sources.md), epic
 [#897](https://github.com/salesforce-misc/trellis/issues/897)), and these are
-the ways they can still leave a target wrong. Only aggregates and `JOIN`s can
-read a partitioned source, and `self_check` compares both on the group basis.
-The change that lifts the refusal moves these entries into the groups above.
+the ways they can still leave a target wrong. A 1-1 target can read a
+partitioned source only through a to-many relationship. `self_check`
+compares the group-basis aggregates and `JOIN`s that read one, and refuses a
+ledger aggregate and a relationship's readers
+([What `self_check` can't see](#what-self_check-cant-see)). The change that
+lifts the refusal moves these entries into the groups above.
 
 ### A `MERGE` that moves a row to another partition
 
@@ -567,7 +609,9 @@ fixes and what it costs:
 
 * **Everything Trellis refuses at define, or pauses on when it appears
   later:** a source without a primary key, row-level security on a role
-  Trellis runs as, a logical-replication subscription into a source, a source
+  Trellis runs as (but see
+  [A to-side row hidden from capture by a new policy](#a-to-side-row-hidden-from-capture-by-a-new-policy)),
+  a logical-replication subscription into a source, a source
   in a hierarchy
   ([transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)),
   and a column renamed, dropped or retyped, a primary key redefined, or
@@ -585,5 +629,6 @@ fixes and what it costs:
   `serializable`.** Trellis's connections use `read committed` whatever the
   setting, and capture works at every level.
 * **A whole-database physical backup and restore, PITR or `pg_upgrade`.**
-  Sources and Trellis's state roll back together, except an unlogged source's
-  data ([above](#an-unlogged-source-emptied-by-a-crash-or-failover)).
+  Sources and Trellis's state stay in step, except an unlogged source's data
+  after a physical restore or PITR
+  ([above](#an-unlogged-source-emptied-by-a-crash-or-failover)).

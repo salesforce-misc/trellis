@@ -674,12 +674,17 @@ The re-read runs under the writing session's `row_security`, so a policy
 that comes to apply to the ring's owner hides rows from it, and a hidden row
 reads as gone: the capture stages a delete for a row that still exists.
 Setting `row_security` in the capture functions would turn the policy into a
-failed application write instead. No target shows the wrong delete: a 1-1 or
-ledger apply re-reads a delete's row live as the drain's role, which is
-either exempt from the policy and reads the row, or refused, which halts the
-definition. The group basis sums the statement's own transition rows. The
-next reconcile pass pauses the table's readers
-([transforms — Supported sources and targets](../transforms.md#supported-sources-and-targets)).
+failed application write instead. A target that reads the table directly
+doesn't show the wrong delete: a 1-1 or ledger apply re-reads a delete's row
+live as the drain's role, which is either exempt from the policy and reads
+the row, or refused, which halts the definition, and the group basis sums
+the statement's own transition rows. A to-one relationship's projection
+applies the delete, though, so until the next pass a 1-1 field read through
+the relationship reads the parent as gone
+([known correctness gaps](../known-correctness-gaps.md#a-to-side-row-hidden-from-capture-by-a-new-policy)).
+The next reconcile pass pauses the table's readers
+([transforms — Supported sources and targets](../transforms.md#supported-sources-and-targets)),
+and their `RESUME` refreshes the projection.
 
 One write isn't a statement of its own: the update a foreign key's action
 makes (`ON UPDATE CASCADE`, `SET NULL` or `SET DEFAULT`, or `ON DELETE SET

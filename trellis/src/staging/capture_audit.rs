@@ -88,9 +88,10 @@
 //! functions (holding back a definition until its columns are imaged), so a
 //! mismatch there is the normal state between two passes, not a fault. The
 //! same pass pauses the readers of a plain table whose trigger is missing or
-//! disabled, so a fault this audit reports on a live definition persists only
-//! while no staging worker runs, or while the pass can't land (its lock waits
-//! and failures are on `Trellis::status`).
+//! disabled, and reinstalls one on a partitioned source's node or on a table
+//! a restore brought back that way, so a fault this audit reports on a live
+//! definition persists only while no staging worker runs, or while the pass
+//! can't land (its lock waits and failures are on `Trellis::status`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;

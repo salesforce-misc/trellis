@@ -156,9 +156,8 @@ So:
   or `SET SCHEMA`), a bulk load with triggers disabled, a fixture load that
   runs `ENABLE TRIGGER ALL` (Rails' `disable_referential_integrity`,
   `pg_restore --disable-triggers`). `self_check` reports a broken capture as
-  a `capture` divergence before it compares any rows (known correctness gaps:
-  [Rows written into a target, a hidden table or Trellis's schema](known-correctness-gaps.md#rows-written-into-a-target-a-hidden-table-or-trelliss-schema),
-  [Capture disrupted and restored between two passes](known-correctness-gaps.md#capture-disrupted-and-restored-between-two-passes)).
+  a `capture` divergence before it compares any rows
+  ([known correctness gaps — Capture disrupted and restored between two passes](known-correctness-gaps.md#capture-disrupted-and-restored-between-two-passes)).
 * **A long transaction can delay the triggers' install.** Installing or
   widening a table's triggers needs a brief table lock, which the worker
   retries every pass while a long transaction or an autovacuum holds the
@@ -686,10 +685,12 @@ A schema dump carries a definition only when the dump appends it. `pg_dump
 tables, but a definition is a row in Trellis's own tables, which it doesn't
 write. A database loaded from such a dump has target tables and no
 transforms, and it fails loudly: `Trellis::migrate` fails, because the dump
-carries Trellis's tables without its migration history, every application
+carries Trellis's tables without its migration history; every application
 write to a captured source fails in its capture function, because the dump
-carries the triggers without the rows capture needs, and defining a
-transform again fails with a `conflict` error because its table exists. So
+carries the triggers without the rows capture needs, until a staging
+worker's pass removes the triggers and leaves the target tables as plain
+tables nothing maintains; and defining a transform again fails with a
+`conflict` error because its table exists. So
 a dump appends the rows after the `pg_dump` output, the way Rails and Ecto
 append the `schema_migrations` rows.
 `dump_definitions_sql` (Rust `Trellis` and `BlockingTrellis`, Ruby

@@ -13,7 +13,7 @@ the ways a target can go wrong without a stop, and names the repair for each.
 | You see | It means | Do |
 |---|---|---|
 | `paused`, with a `capture_failure` saying capture was changed outside Trellis, or the table is gone from its name | A trigger was disabled, dropped or recreated, a capture function was replaced, or the table was dropped, renamed away or swapped, so changes may be missing | Put the table back if it was a mistake, then `RESUME` |
-| `paused`, with a `capture_failure` naming a column or the primary key | A schema change the definition can't follow as written, or copies Trellis must re-type | Make the schema acceptable (the message says how), then `RESUME`; or `PAUSE`, `DROP TRANSFORM` and define it again |
+| `paused`, with a `capture_failure` naming a column or the primary key | A schema change the definition can't follow as written, or copies Trellis must re-type | Make the schema acceptable (the message says how), then `RESUME`; or `DROP TRANSFORM` and define it again |
 | `paused`, with a `capture_failure` naming a role and a table | A read or write refused to a role Trellis runs as: a missing privilege or row-level security ([A halting failure](observability.md#a-halting-failure)) | Grant the privilege, or `BYPASSRLS`, then `RESUME` |
 | `paused`, with a `capture_failure` reading "resuming: …" | A `RESUME` is re-typing copies or waiting for an upstream to go `live` | Wait. A `PAUSE` withdraws the resume |
 | `quarantined` | Too many of its keys failed to apply, so the whole-definition fuse tripped | Fix the cause `sample_quarantined` shows, then `RESUME` |
@@ -36,10 +36,11 @@ reader the Re-derive build serves reports `backfilling` and is rebuilt in
 place; any other reports `catching_up`. Both return to `live` when the re-read
 is done. It's the cheapest repair when you know which table missed changes.
 
-It takes the same name a definition's `FROM` does, but resolves only tables
-in `public` or Trellis's own schemas
-([#1202](https://github.com/salesforce-misc/trellis/issues/1202)). It repairs
-what a rebuild repairs, with the same exceptions (below).
+It takes a table's bare name and looks it up only in Trellis's catalog and
+target schemas and `public`, so it can't name a source in another schema
+([#1202](https://github.com/salesforce-misc/trellis/issues/1202)): repair
+such a source's readers with `PAUSE`/`RESUME`. It repairs what a rebuild
+repairs, with the same exceptions (below).
 
 ### `PAUSE` and `RESUME`
 
@@ -89,22 +90,32 @@ capture is still being widened.
 
 **What a rebuild doesn't repair.** A rebuild repairs anything that's wrong
 because a change was missed, and a 1-1 target's rows edited or deleted by
-hand. It keeps rows added or re-keyed by hand on a 1-1 target, group rows of
-an aggregate edited by hand (the rebuild keeps the per-row ledger and adds
-only differences to the groups), and the WAL positions a logical dump
-restored into another cluster left behind. `PAUSE`, `DROP TRANSFORM` and
-define it again repairs all three
-([known correctness gaps — Rows written into a target, a hidden table or Trellis's schema](known-correctness-gaps.md#rows-written-into-a-target-a-hidden-table-or-trelliss-schema),
+hand. It keeps:
+
+* a 1-1 target's rows that no source row backs but the rebuild didn't
+  write: rows added or re-keyed by hand, or left under a truncated
+  `varchar` key;
+* an aggregate's group rows edited by hand, and a `MIN` or `MAX` over a
+  re-collated column: the rebuild keeps the per-row ledger, with its
+  collations, and adds only differences to the groups;
+* the WAL positions a logical dump restored into another cluster left
+  behind.
+
+`PAUSE`, `DROP TRANSFORM` and define it again repairs each
+([known correctness gaps](known-correctness-gaps.md): [Rows written into a target, a hidden table or Trellis's schema](known-correctness-gaps.md#rows-written-into-a-target-a-hidden-table-or-trelliss-schema),
+[A space-padded value truncated after a `varchar` widening](known-correctness-gaps.md#a-space-padded-value-truncated-after-a-varchar-widening),
+[A column's values rewritten in place by `ALTER COLUMN TYPE`](known-correctness-gaps.md#a-columns-values-rewritten-in-place-by-alter-column-type),
 [A logical dump restored into another cluster](known-correctness-gaps.md#a-logical-dump-restored-into-another-cluster)).
 
 ### `DROP TRANSFORM` and define again
 
-`DROP TRANSFORM <target>` removes a paused definition with its target, its
-side tables and its held keys
+`DROP TRANSFORM <target>` removes a paused or quarantined definition with
+its target, its side tables and its held keys
 ([ADR-0014](decisions/0014-pause-and-drop-a-transform.md#drop-always-removes-the-associated-data)).
-It refuses a definition that isn't paused, and one another definition still
-reads. Defining it again builds the target from empty. Indexes and grants on
-the target go with it, so give readers `SELECT` through default privileges
+It refuses a definition in any other status, and one another definition
+still reads. Defining it again builds the target from empty. Indexes and
+grants on the target go with it, so give readers `SELECT` through default
+privileges
 ([recommendations](recommendations.md#application-roles-read-targets-and-nothing-else)).
 It's the repair when a resume refuses, when copies can't be re-typed, and
 when a rebuild keeps something wrong.
@@ -205,9 +216,10 @@ which targets it compares is in
   that ends with `ENABLE TRIGGER ALL`:** the readers of the table are paused.
   `RESUME` each one, which rebuilds it
   ([embedding](embedding.md#what-the-staging-worker-needs-from-the-database)).
-* **After a restore:**
-  * a whole-database physical backup, PITR or `pg_upgrade` needs nothing,
-    except a `request_backfill` of each unlogged source;
+* **After a restore or an upgrade:**
+  * a `pg_upgrade` needs nothing, and a whole-database physical backup or
+    PITR needs only a `request_backfill` of each unlogged source
+    ([known correctness gaps](known-correctness-gaps.md#an-unlogged-source-emptied-by-a-crash-or-failover));
   * a logical dump restored into another cluster needs every transform
     paused, dropped and defined again
     ([known correctness gaps](known-correctness-gaps.md#a-logical-dump-restored-into-another-cluster));
@@ -215,7 +227,8 @@ which targets it compares is in
   * Trellis's schema or the targets restored without the rest need the
     affected transforms paused, dropped and defined again, or the whole
     database restored from one backup.
-* **After a crash or a failover,** `request_backfill` each unlogged source.
+* **After a crash or a failover,** `request_backfill` each unlogged source
+  ([known correctness gaps](known-correctness-gaps.md#an-unlogged-source-emptied-by-a-crash-or-failover)).
 * **After an `ALTER COLUMN … TYPE … USING` that changes a read column's
   values,** `request_backfill` the table
   ([known correctness gaps](known-correctness-gaps.md#a-columns-values-rewritten-in-place-by-alter-column-type)).

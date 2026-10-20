@@ -257,8 +257,7 @@ What it does there is one append.
   `ENABLE ALWAYS`; an owner who disables, drops or recreates a trigger of a
   plain table is seen by the capture pass, which pauses the table's readers
   until a `RESUME` (see also
-  [known correctness gaps — Capture disrupted and restored between two passes](../known-correctness-gaps.md#capture-disrupted-and-restored-between-two-passes) and
-  [Rows written into a target, a hidden table or Trellis's schema](../known-correctness-gaps.md#rows-written-into-a-target-a-hidden-table-or-trelliss-schema)).
+  [known correctness gaps — Capture disrupted and restored between two passes](../known-correctness-gaps.md#capture-disrupted-and-restored-between-two-passes)).
 - **Only the staging worker creates or drops triggers**, from the catalog
   alone, on its reconcile pass: a table gains triggers when something
   registers a reader of it and loses them when its last reader is dropped.
@@ -1103,9 +1102,8 @@ Each alternative below is recorded with the number that rejected it.
   function:
   the application sees the fault at once, not after data is lost. An owner who disables, drops or recreates a
   plain table's trigger, or replaces its function, pauses the table's readers
-  at the next pass; the silent-uncapture paths left are
-  [known correctness gaps — Capture disrupted and restored between two passes](../known-correctness-gaps.md#capture-disrupted-and-restored-between-two-passes) and
-  [Rows written into a target, a hidden table or Trellis's schema](../known-correctness-gaps.md#rows-written-into-a-target-a-hidden-table-or-trelliss-schema).
+  at the next pass; the silent-uncapture paths left are in
+  [known correctness gaps — Capture disrupted and restored between two passes](../known-correctness-gaps.md#capture-disrupted-and-restored-between-two-passes).
 - **Hosted compatibility** is core Postgres for everything required
   (statement triggers, transition tables, `SECURITY DEFINER`, the `TRIGGER`
   privilege); no event trigger is needed.
