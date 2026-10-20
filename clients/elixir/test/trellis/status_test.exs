@@ -172,7 +172,7 @@ defmodule Trellis.StatusTest do
             table: "public.orders",
             columns: ["customer_id"],
             opted_out: false,
-            fix: ~s(create index on "public"."orders" ("customer_id"))
+            fix: ~s|create index on "public"."orders" ("customer_id")|
           }
         ],
         correcting: []
@@ -183,7 +183,7 @@ defmodule Trellis.StatusTest do
                table: "public.orders",
                columns: ["customer_id"],
                opted_out: false,
-               fix: ~s(create index on "public"."orders" ("customer_id"))
+               fix: ~s|create index on "public"."orders" ("customer_id")|
              }
            ]
   end
