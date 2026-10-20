@@ -6198,6 +6198,11 @@ pub(crate) async fn check_owned_tables(
     if revalidated.join.is_some() {
         return Ok(());
     }
+    // A group-basis aggregate keeps neither a ledger nor a group-delta
+    // table (#1222); its partials table is not checked here.
+    if crate::staging::group_basis::route(&definition.def, &revalidated.source_columns).is_some() {
+        return Ok(());
+    }
     check_ledger_table(txn, definition).await?;
     check_deltas_shape(txn, definition, revalidated).await
 }

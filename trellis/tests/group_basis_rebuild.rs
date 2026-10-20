@@ -441,3 +441,26 @@ async fn a_rebuild_writes_averages_numeric_sums_and_composed_fields() {
     d.settle().await;
     assert_eq!(d.rows(ACTUAL).await, d.rows(EXPECTED).await);
 }
+
+/// A whole-transform `RESUME` of a group-basis aggregate is accepted (#1222):
+/// it keeps no ledger and no group-delta table, so the owned-table checks
+/// that a ledger aggregate's resume runs have nothing to find missing.
+#[tokio::test]
+async fn resume_of_a_paused_group_basis_aggregate_is_accepted() {
+    let mut d = start().await;
+    step(
+        &mut d,
+        "insert into public.src values (1, 1, 10), (2, 1, 5)",
+    )
+    .await;
+    d.ctl
+        .batch_execute(
+            "update transform_definitions set status = 'paused' where target_table = 'public.agg'",
+        )
+        .await
+        .expect("pause");
+    trellis::staging::quarantine::resume_transform(d.pool(), "agg")
+        .await
+        .expect("the resume is not refused for a ledger the group basis never creates");
+    assert_ne!(d.rows(STATUS).await, ["(paused)"], "the resume took effect");
+}
