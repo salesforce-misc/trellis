@@ -415,7 +415,9 @@ async fn explain_range(
 /// it locks and re-derives them as a chunk does, reading the source by each
 /// key's typed columns: a key with no row any more (deleted while the
 /// definition was frozen) becomes a tombstone and its target row is
-/// deleted.
+/// deleted. Once the ledger is read to its end, each batch also takes up to
+/// `scan` target rows with no live entry ([`orphan_keys`]) and re-derives
+/// them with the rest, and the sweep is finished when a batch finds fewer.
 pub async fn sweep_batch(
     txn: &Transaction<'_>,
     plan: &OneToOnePlan,
@@ -459,16 +461,89 @@ pub async fn sweep_batch(
     metrics::record_build_statement(BuildStatement::ChunkKeys, started.elapsed());
     let scanned: i64 = row.get(0);
     let next: Option<String> = row.get(1);
-    let keys: Vec<String> = row.get(2);
-    let finished = scanned < scan;
+    let mut keys: Vec<String> = row.get(2);
+    let mut finished = scanned < scan;
+    if finished {
+        // The ledger is read to its end. Target rows with no live entry
+        // (added or re-keyed by hand, #1201) are in no ledger page: walk
+        // them here, a batch at a time, until none is left. They're read
+        // before any entry is locked and locked with the page's keys in one
+        // ordered batch, so the batch holds no lock across the target scan
+        // and takes its locks in the one key order a page takes them in.
+        let orphans = orphan_keys(txn, plan, scan).await?;
+        finished = i64::try_from(orphans.len()).is_ok_and(|n| n < scan);
+        keys.extend(orphans);
+        keys.sort_unstable();
+        keys.dedup();
+    }
+    let rederived = keys.len();
+    let outcome = rederive_keys(txn, plan, &keys).await?;
+    crate::instance_log::debug!(
+        target_table = %plan.target,
+        scanned,
+        rederived,
+        written = outcome.written,
+        deleted = outcome.deleted,
+        "1-1 re-derive build sweep batch re-derived its stale entries"
+    );
+    Ok(SweepOutcome {
+        scanned,
+        rederived,
+        delta_rows: 0,
+        next,
+        finished,
+    })
+}
+
+/// Up to `limit` keys of target rows that have no live ledger entry (no
+/// entry, or a tombstone) and aren't quarantined: rows nothing in the source
+/// backs, which someone added or re-keyed in the target (#1201), or whose
+/// source row exists but the ledger never learned. Every writer of a target
+/// row writes its entry in the same transaction, so a committed target row
+/// without a live entry is one nobody wrote through Trellis. A key
+/// [`rederive_keys`] takes comes back with a live entry, or its row
+/// deleted, so a repeated call makes progress.
+async fn orphan_keys(
+    txn: &Transaction<'_>,
+    plan: &OneToOnePlan,
+    limit: i64,
+) -> Result<Vec<String>, ApplyError> {
+    let target = ddl::qualified_target_table_ident(&plan.target);
+    let k_tgt = ddl::pk_key_sql_expr(&plan.pk, Some("t"));
+    let started = Instant::now();
+    let row = txn
+        .query_one(
+            &format!(
+                "select array(select t.__k from ( \
+                     select {k_tgt} as __k from {target} t \
+                 ) t \
+                 where not exists (select 1 from {ledger} l \
+                                   where l.{key} = t.__k and not l.{tombstone}) \
+                   and not exists (select 1 from poison p \
+                                   join transform_definitions d on d.id = p.transform_id \
+                                   where p.src_table = $2 and p.key = t.__k \
+                                     and d.target_table = $3) \
+                 order by t.__k limit $1)",
+                ledger = one_to_one_ledger::ledger_ident(&plan.target),
+                key = quote_ident(crate::defs::ledger::KEY_COLUMN),
+                tombstone = quote_ident(crate::defs::ledger::TOMBSTONE_COLUMN),
+            ),
+            &[&limit, &plan.source_table, &plan.target],
+        )
+        .await?;
+    metrics::record_build_statement(BuildStatement::ChunkKeys, started.elapsed());
+    Ok(row.get(0))
+}
+
+/// Locks `keys`' entries and re-derives them (the tail of a sweep batch).
+async fn rederive_keys(
+    txn: &Transaction<'_>,
+    plan: &OneToOnePlan,
+    keys: &[String],
+) -> Result<OneToOneOutcome, ApplyError> {
+    let mut outcome = OneToOneOutcome::default();
     if keys.is_empty() {
-        return Ok(SweepOutcome {
-            scanned,
-            rederived: 0,
-            delta_rows: 0,
-            next,
-            finished,
-        });
+        return Ok(outcome);
     }
     let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
     lock_chunk_entries(txn, plan, &key_refs).await?;
@@ -497,7 +572,6 @@ pub async fn sweep_batch(
             column.push(part.into_owned());
         }
     }
-    let mut outcome = OneToOneOutcome::default();
     for (pattern, (pattern_keys, parts)) in &patterns {
         let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![pattern_keys];
         for part in parts {
@@ -509,21 +583,7 @@ pub async fn sweep_batch(
         outcome.written += done.written;
         outcome.deleted += done.deleted;
     }
-    crate::instance_log::debug!(
-        target_table = %plan.target,
-        scanned,
-        rederived = keys.len(),
-        written = outcome.written,
-        deleted = outcome.deleted,
-        "1-1 re-derive build sweep batch re-derived its stale entries"
-    );
-    Ok(SweepOutcome {
-        scanned,
-        rederived: keys.len(),
-        delta_rows: 0,
-        next,
-        finished,
-    })
+    Ok(outcome)
 }
 
 /// One `NULL` pattern's keys in a sweep batch: the keys, and their
