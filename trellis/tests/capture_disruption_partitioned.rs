@@ -264,6 +264,13 @@ async fn settle(
         for reader in ["r", "s"] {
             let status = trellis.status(&format!("{reader}_{id}")).await.unwrap();
             let status = status.expect("the reader exists");
+            // A live reader's pause is a `disruption` (#1181), so the
+            // client test helper's `resume_capture_disruptions` resumes it.
+            if let Some(f) = &status.capture_failure
+                && f.kind != trellis::CaptureFailureKind::Disruption
+            {
+                failures.push(format!("{id}: {reader} paused with kind {:?}", f.kind));
+            }
             now.push((status.status, status.capture_failure.map(|f| f.error)));
         }
         reasons.push(now);
