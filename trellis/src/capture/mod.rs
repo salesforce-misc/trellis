@@ -63,6 +63,7 @@ pub mod install;
 pub mod partitions;
 pub mod reconcile;
 pub mod sql;
+pub(crate) mod triggers;
 
 use std::fmt;
 

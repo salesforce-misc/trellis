@@ -33,7 +33,7 @@ segment with one `INSERT … SELECT`:
   `capture_failure`, and installs or changes no capture on it. A resume
   refuses until the table is plain again. A table that joins and leaves a
   hierarchy between two passes is never seen
-  ([known gap 5](../known-correctness-gaps.md#5-capture-switched-off-and-back-on-between-two-reconcile-passes)).
+  ([known gap 5](../known-correctness-gaps.md#5-changes-the-capture-pass-cant-see-between-two-passes)).
   A relationship's to-side is captured while some definition reads the
   relationship's from-side, whether or not one reads through the
   relationship, so the pass can find a to-side in a hierarchy with nobody to
@@ -479,6 +479,64 @@ The response follows whether the definitions are still valid as written:
   define would. A key column's type change is left to the previous
   section's checks; a key column dropped and re-added rebuilds.
 
+### Capture changed outside Trellis
+
+A statement trigger captures only what it sees, so an operator who removes,
+swaps, disables or recreates Trellis's capture triggers leaves writes that
+the table's current state can't recover. The pass therefore never repairs
+that by itself. It pauses every definition that reads the table, with a
+`capture_failure` naming what it found and saying that changes made
+meanwhile may be missing, so correctness can't be guaranteed, and waits for a
+`RESUME`.
+
+Each install, widen, narrow and repair records, in the transaction that makes
+it, the oid, `xmin` and enabled mode of each of a plain table's five capture
+triggers (`capture_triggers`), and each capture function's comment records a
+hash of the source Trellis generated. Trellis's own changes therefore never
+read as a disruption, a crash in the middle of an install included. A widen
+or narrow changes no trigger and keeps the rows it finds. The pass compares
+the live triggers and functions with them (`capture::triggers`) and pauses
+on any of:
+
+- the table is gone from its name: dropped, renamed away or moved to another
+  schema. This covers a captured source, a `JOIN`'s joined table, a
+  relationship's to-side, and another instance's target read as a source;
+- a recorded trigger is gone from the table at that name: a swap of the
+  table, a drop and recreate, the triggers dropped;
+- a trigger's oid changed: recreated by hand or by a schema tool;
+- a trigger isn't `ENABLE ALWAYS`: disabled, `ORIGIN` or `REPLICA`.
+  `ENABLE TRIGGER ALL|USER`, which `pg_restore --disable-triggers`, Rails
+  fixtures' `disable_referential_integrity` and hand-written bulk loads end
+  with, leaves `ORIGIN`;
+- a trigger's `xmin` moved under the same oid: disabled and enabled again by
+  name, even within one transaction. `ENABLE ALWAYS TRIGGER` takes a trigger
+  name only, so a restore to exactly `ALWAYS` between two passes is done by
+  name, and this catches it;
+- a capture function's source differs from the hash its own comment
+  records: it was replaced by hand.
+
+Routine maintenance moves none of these: `VACUUM FULL`, `CLUSTER`,
+`REINDEX`, pg_repack, a catalog freeze, a rename and back within one
+transaction, and a migration that leaves the triggers alone. Dumps and
+restores are told apart by the rows themselves: they carry the cluster's
+`system_identifier` and the oid of `capture_triggers`, and a stored value
+that isn't the live one means the rows came from another database (a restore
+or `pg_upgrade`, which recreates every trigger under a new oid). The pass
+forgets them and records the live triggers. New trigger oids under the same
+values are a recreation in this database: that pauses.
+
+The pause is immediate (one pass, no threshold) and holds until `RESUME`,
+which refuses while the table is missing, re-validates the definition against
+the table now at that name (it may be a different table), forgets the record,
+and lets the next pass reinstall capture, record it and rebuild. The pass
+installs nothing on the table while its readers are paused. A table swap, a
+bulk load with triggers disabled or a fixture load therefore needs a
+`RESUME` afterwards ([embedding](../embedding.md)).
+
+A partitioned source's tree isn't recorded: its nodes come and go with
+partition maintenance, which has its own corrections (ADR-0017), and its
+broken triggers are reinstalled by the pass.
+
 ### What rebuilds, what pauses, and what's missed
 
 Changes no capture trigger sees, and what the staging worker does about
@@ -486,14 +544,15 @@ them:
 
 - **Repaired on its own, pausing nobody** (a re-read's readers report
   `backfilling` or `catching_up` until it's done):
-  - a capture trigger left missing, disabled or not `ALWAYS`, or a table
-    dropped and recreated as a plain table: the install re-reads the table;
   - a same-type `USING` rewrite of a read column: re-read;
   - a read column dropped and re-added, or retyped other than by a pure
     widening, where every definition reading it is still valid: re-read;
   - a widening that changes only the catalog of a column Trellis created:
-    re-typed in place, with no re-read.
+    re-typed in place, with no re-read;
+  - a capture function an older Trellis generated (its source still is what
+    its own comment hashes): replaced by a widen.
 - **Pauses, until a deliberate `RESUME`:**
+  - capture changed outside Trellis, on a plain table (the next section);
   - a read column renamed or dropped, or the primary key redefined, by a
     marker, the pass or a drain page;
   - a key column retyped or re-collated so define would refuse it, or so the
@@ -510,9 +569,10 @@ them:
   a column added with a constant default whose table no rewrite has touched
   since (the rewrite clears the default the column's row keeps for older
   rows, as `VACUUM FULL` does), on a column with a compression method set
-  (the `ALTER` resets it), or as a pure widening no copy outgrows; capture
-  switched off and on again between two passes; a capture function's body
-  replaced by hand.
+  (the `ALTER` resets it), or as a pure widening no copy outgrows; a table
+  attached to a hierarchy and detached between two passes; a capture
+  function replaced and restored by hand between two passes; capture
+  changed outside Trellis on a partitioned source.
 
 A few routine operations rebuild for nothing, at the cost of one re-read: a
 rewrite that leaves the values as they were (`USING b + 0`, or a column

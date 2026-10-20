@@ -189,6 +189,17 @@ pub async fn reconcile(
     let mut outcome = PassOutcome::default();
 
     for table in desired {
+        // #999: a table some definition reads that is gone from its name
+        // (dropped, renamed away, moved to another schema) pauses its readers;
+        // a resume re-validates them against whatever is there then.
+        match super::triggers::pause_readers_of_gone_table(client, &snapshot.catalog, table).await {
+            Ok(false) => {}
+            Ok(true) => continue,
+            Err(err) => {
+                outcome.failed.push((table.clone(), err));
+                continue;
+            }
+        }
         // #707: a table that joined a partition or inheritance hierarchy
         // after define, or was recreated as one, can't be captured: its
         // readers pause, and its capture is left as it is.
@@ -243,6 +254,16 @@ pub async fn reconcile(
         )
         .await
         {
+            Ok(false) => {}
+            Ok(true) => continue,
+            Err(err) => {
+                outcome.failed.push((table.clone(), err));
+                continue;
+            }
+        }
+        // #707: capture triggers or functions changed outside Trellis pause
+        // the table's readers, and nothing is reinstalled until a resume.
+        match super::triggers::check(client, schema, &snapshot.catalog, table).await {
             Ok(false) => {}
             Ok(true) => continue,
             Err(err) => {
@@ -483,6 +504,7 @@ pub async fn reconcile(
     // Nor a baseline, once nothing captures it.
     let kept: Vec<&str> = known.iter().map(|t| t.as_str()).collect();
     super::baseline::forget_except(&*client, &kept).await?;
+    super::triggers::forget_except(&*client, &kept).await?;
 
     let gated = gated_marker_tables(&*client).await?;
     outcome.ready = ready_definitions(&snapshot, desired, &outcome.captured, &gated, &seam_held);

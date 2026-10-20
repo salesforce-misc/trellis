@@ -254,10 +254,11 @@ What it does there is one append.
   partition or inheritance hierarchy, and reports any fault before any
   recompute comparison (five triggers, one Trellis
   role). Replica-mode sessions are covered by
-  `ENABLE ALWAYS`; an owner who disables or drops the trigger by name is
-  documented as uncaptured until the audit runs (see also the known
+  `ENABLE ALWAYS`; an owner who disables, drops or recreates a trigger of a
+  plain table is seen by the capture pass, which pauses the table's readers
+  until a `RESUME` (see also the known
   correctness gaps
-  [Capture switched off and back on between two reconcile passes](../known-correctness-gaps.md#5-capture-switched-off-and-back-on-between-two-reconcile-passes) and
+  [Changes the capture pass can't see between two passes](../known-correctness-gaps.md#5-changes-the-capture-pass-cant-see-between-two-passes) and
   [Operator changes inside Trellis-owned artifacts](../known-correctness-gaps.md#8-operator-changes-inside-trellis-owned-artifacts)).
 - **Only the staging worker creates or drops triggers**, from the catalog
   alone, on its reconcile pass: a table gains triggers when something
@@ -1101,10 +1102,10 @@ Each alternative below is recorded with the number that rejected it.
   change to a read column never fails the statement (I6). A missing ring
   table or revoked privilege does, with a `CONTEXT` line naming the capture
   function:
-  the application sees the fault at once, not after data is lost. One silent-uncapture path is an owner disabling
-  the trigger by name, which the audit reports; the others are the
-  disable-and-restore and replaced-function cases, the known correctness gaps
-  [Capture switched off and back on between two reconcile passes](../known-correctness-gaps.md#5-capture-switched-off-and-back-on-between-two-reconcile-passes) and
+  the application sees the fault at once, not after data is lost. An owner who disables, drops or recreates a
+  plain table's trigger, or replaces its function, pauses the table's readers
+  at the next pass; the silent-uncapture paths left are the known correctness gaps
+  [Changes the capture pass can't see between two passes](../known-correctness-gaps.md#5-changes-the-capture-pass-cant-see-between-two-passes) and
   [Operator changes inside Trellis-owned artifacts](../known-correctness-gaps.md#8-operator-changes-inside-trellis-owned-artifacts).
 - **Hosted compatibility** is core Postgres for everything required
   (statement triggers, transition tables, `SECURITY DEFINER`, the `TRIGGER`

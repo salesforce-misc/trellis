@@ -21,7 +21,12 @@ them gets broken without Trellis noticing.
   installs. The install survives a whole-database backup and restore as a
   unit; any manual change inside it can break the guarantee without Trellis
   noticing (entry 8).
-* The capture triggers stay installed, enabled and `ENABLE ALWAYS` (entry 5).
+* The capture triggers stay installed, enabled and `ENABLE ALWAYS`, and a
+  table stays out of a partition or inheritance hierarchy, between two
+  reconcile passes. Changing them on a plain table pauses its readers, which a
+  `RESUME` rebuilds
+  ([capture by triggers](staging-and-claiming/01-capture-by-triggers.md#capture-changed-outside-trellis));
+  what the pass can't see is entry 5.
 * No DDL rewrites the values of a column a definition reads beyond the
   changes Trellis detects (entry 1). A column dropped and re-added, retyped,
   or rewritten in place to the same type rebuilds its readers, or pauses the
@@ -102,8 +107,8 @@ These are the tools the entries refer to:
 |---|---|---|---|---|
 | 1 | `ALTER COLUMN … TYPE … USING` that rewrites values, with a metadata change to the same column in the same pass window, on a column added with a constant default whose table hasn't been rewritten since, on a column with a compression method set, or as a widening no copy outgrows | yes | `self_check` (1-1 targets only) | none; documented |
 | 3 | A source key re-collated while a `self_check` job runs | the job can skip or repeat keys | no | none filed |
-| 5 | Capture switched off and back on, or the table attached to a hierarchy and detached, between two reconcile passes | yes | `self_check` (1-1 targets only) | #707, study pending |
-| 8 | A manual change inside Trellis's artifacts: a target or hidden table edited or dropped, a capture function body replaced, DML, DDL or a data load into Trellis's schema, or a restore of that schema alone | yes | `self_check` (1-1 and `JOIN` targets, and a `JOIN`'s hidden tables); a missing ledger or group-delta table refuses a resume; a change to Trellis's schema: no | #707, study pending (capture function body); otherwise none; documented |
+| 5 | A table attached to a hierarchy and detached, or a capture function replaced and restored, between two reconcile passes; capture changed outside Trellis on a partitioned source | yes | `self_check` (1-1 targets only) | none; documented |
+| 8 | A manual change inside Trellis's artifacts: a target or hidden table edited or dropped, DML, DDL or a data load into Trellis's schema, or a restore of that schema alone | yes | `self_check` (1-1 and `JOIN` targets, and a `JOIN`'s hidden tables); a missing ledger or group-delta table refuses a resume; a change to Trellis's schema: no | none; documented |
 | 9 | An application trigger re-keying a parent's join column within the statement | yes | no | #1115 removes relationships |
 | 10 | `REGEXP_COUNT` on `"C"`-collated data or with Postgres-only regex syntax | yes | `self_check` (1-1 targets only) | #643, with #575 |
 | 11 | Row-level security applying to a role Trellis runs as | only capture, for the ring owner, until the next reconcile pass; elsewhere reads and writes fail | drain, discharge, catch-up and build merge: pause what they reach; one the catalog can't pin shows on `drain_failure` (drain) or `backfill_failure` (discharge, catch-up), or, for a build merge, pauses on its fifth charge with the error on `capture_failure`; build chunk: `backfill_failure` | none |
@@ -197,53 +202,46 @@ build that straddles the change is pinned to the collation it planned under
 
 **Repair:** start a new `self_check` after the change.
 
-## 5. Capture switched off and back on between two reconcile passes
+## 5. Changes the capture pass can't see between two passes
 
-**Trigger:** a capture trigger that's disabled, dropped, or switched out of
-`ENABLE ALWAYS`, and restored before the staging worker's next reconcile pass
-(every 5 s) looks:
+Trellis pauses the readers of a plain table whose capture triggers or
+functions were changed outside Trellis, or whose table is gone from its name,
+as soon as a pass sees it
+([capture by triggers](staging-and-claiming/01-capture-by-triggers.md#capture-changed-outside-trellis)).
+It compares the live triggers' oids, `xmin`s and enabled modes with what it
+recorded when it installed them, so a disable and re-enable by name between
+two passes is seen. Three cases are still silent.
 
-```sql
-BEGIN;
-ALTER TABLE orders DISABLE TRIGGER ALL;
-UPDATE orders SET status = 'archived' WHERE created_at < '2025-01-01';
-ALTER TABLE orders ENABLE ALWAYS TRIGGER ALL;
-COMMIT;
-```
+**Trigger:**
 
-The same applies to bulk-load tools that disable triggers around a load and
-restore them to `ALWAYS`, and to a table attached to a partition or
-inheritance hierarchy and detached again between two passes, with writes
-routed through the hierarchy's parent in between: those fire the parent's
-triggers, not the table's.
+* A table attached to a partition or inheritance hierarchy and detached again
+  between two passes, with writes routed through the hierarchy's parent in
+  between: those fire the parent's triggers, not the table's.
 
-```sql
-BEGIN;
-ALTER TABLE orders_all ATTACH PARTITION orders FOR VALUES FROM (MINVALUE) TO (MAXVALUE);
-UPDATE orders_all SET status = 'archived' WHERE created_at < '2025-01-01';
-ALTER TABLE orders_all DETACH PARTITION orders;
-COMMIT;
-```
+  ```sql
+  BEGIN;
+  ALTER TABLE orders_all ATTACH PARTITION orders FOR VALUES FROM (MINVALUE) TO (MAXVALUE);
+  UPDATE orders_all SET status = 'archived' WHERE created_at < '2025-01-01';
+  ALTER TABLE orders_all DETACH PARTITION orders;
+  COMMIT;
+  ```
+
+* A capture function replaced by hand and put back between two passes. The
+  trigger rows don't change, and the function is whole again when the pass
+  looks.
+* Capture changed outside Trellis on a **partitioned source**. Its tree's
+  nodes come and go with partition maintenance and aren't recorded, so the
+  pass reinstalls a missing or disabled trigger (and queues the corrections
+  ADR-0017 defines for a new leaf), but pauses nobody for it.
 
 **Effect:** the writes made while capture was off never reach Trellis.
-Targets stay wrong until each affected row is written again, with nothing
-on status.
+Targets stay wrong until each affected row is written again, with nothing on
+status.
 
-**Detected?** Not automatically. The pass and `self_check`'s capture audit
-both see only the current trigger state, and it looks healthy again.
-`self_check`'s comparison reports the stale rows on 1-1 targets.
+**Detected?** Not by the pass. `self_check`'s comparison reports the stale
+rows on 1-1 targets.
 
-If the pass *does* see the broken trigger, it isn't a gap. Trellis reinstalls
-it and re-reads the table for its readers, so it repairs itself. Examples are a
-trigger left disabled, `ENABLE TRIGGER` restoring it as `ORIGIN` rather than
-`ALWAYS` (which `pg_restore --disable-triggers` does), or a dropped and
-recreated table. The same holds while no staging worker is running: nothing is
-repaired until a worker starts, and then its pass repairs it.
-
-**Planned work:** #707. The candidate signal is the `xmin` of Trellis's
-`pg_trigger` rows, which a disable/enable cycle rewrites. The work is gated on
-a false-positive study that hasn't run yet; cases it can't detect without
-routine false positives will be documented here instead.
+**Planned work:** none; documented.
 
 **Repair:** `request_backfill` the table, or `PAUSE`/`RESUME` its readers.
 Better still, don't disable the capture triggers
@@ -259,9 +257,11 @@ Better still, don't disable the capture triggers
   the catalog schema (a group-basis aggregate's partials table `agg_<id>`; a
   `JOIN`'s `P`, `M`, `J` and `T` tables and its one-row lock table, named
   `join_<id>_p`, `_m`, `_j`, `_t` and `_l`).
-* `CREATE OR REPLACE FUNCTION` on one of Trellis's capture functions, with a
-  body that drops or alters what it stages. Disabling or dropping the capture
-  triggers is [entry 5](#5-capture-switched-off-and-back-on-between-two-reconcile-passes).
+* Replacing a capture function and putting it back between two passes, or
+  disabling or dropping the capture triggers on a partitioned source
+  ([entry 5](#5-changes-the-capture-pass-cant-see-between-two-passes)). A
+  function replaced and left that way, and the triggers of a plain table,
+  pause the readers.
 * DML, DDL or a data load into Trellis's own schema, such as loading another
   database's `partition_sources` rows into the catalog.
 * Restoring only the Trellis schema.
@@ -283,9 +283,8 @@ Better still, don't disable the capture triggers
   definitions on its source carry on. Its resume then refuses the same way.
   An edited or truncated group-basis or `JOIN` hidden table leaves the
   groups or cells it held wrong until they are recomputed for another reason.
-* **A capture function body.** The writes it mis-stages are lost or wrong. The
-  pass sees the body is stale and rewrites it. That repair is a "widen", which
-  doesn't re-read the table, so the writes made in between stay lost.
+* **A capture function body replaced and put back between two passes.** The
+  writes it mis-staged are lost or wrong, and nothing shows it.
 * **Trellis's schema.** The catalog and the ring are Trellis's record of what
   every target has applied, so a change to them is believed.
   * The restore signal compares the stored OID of the catalog table with the
@@ -912,10 +911,11 @@ Trellis handles these cases itself, either by repairing them or by
 refusing them up front:
 
 * **DML under `session_replication_role = replica`.** The capture triggers are
-  `ENABLE ALWAYS`, so they fire. This is only a gap through entry 5.
-* **A capture trigger left disabled, dropped, or not `ALWAYS`, or a source
-  table dropped and recreated as a plain table.** The next reconcile pass
-  reinstalls capture and re-reads the table for its readers.
+  `ENABLE ALWAYS`, so they fire. This is not a gap.
+* **A capture trigger left disabled, dropped, or not `ALWAYS`, a capture
+  function replaced, or a source table dropped, renamed away, swapped or
+  recreated.** The next reconcile pass pauses the table's readers with a
+  `capture_failure` naming what it found, and a `RESUME` rebuilds them.
 * **`TRUNCATE` of a source**, including `CASCADE`.
 * **A read column renamed or dropped, or the primary key redefined.** Trellis
   pauses the readers with a `capture_failure`, and you resume once the schema

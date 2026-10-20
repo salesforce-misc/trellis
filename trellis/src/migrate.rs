@@ -19,7 +19,8 @@
 //!
 //! # Rebuilding a catalog table
 //!
-//! A migration must never rebuild `partition_sources` or `capture_baselines`
+//! A migration must never rebuild `partition_sources`, `capture_baselines` or
+//! `capture_triggers`
 //! by create-copy-rename; use `ALTER`. Rows copied into a new table look
 //! exactly like a dump and restore: `partition_sources` records the oid of
 //! the table that holds each row, and a stored oid that no longer names it

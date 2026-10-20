@@ -488,15 +488,18 @@ pub fn comment_ddl(
     Ok(format!(
         "comment on function {}() is {}",
         qualified_function(schema, spec, event)?,
-        string_constant(&comment_text(spec, event))
+        string_constant(&comment_text(schema, spec, event))
     ))
 }
 
 /// What a capture function's comment records, as a JSON object: the table,
-/// the event, and the key, image and group-key columns. C3's
-/// `installed(table)` reads it back to decide whether the installed
-/// functions match the spec the catalog now asks for.
-pub fn comment_text(spec: &CaptureSpec, event: CaptureEvent) -> String {
+/// the event, the key, image and group-key columns, and a hash of the
+/// function's source as generated ([`body_hash`]). C3's `installed(table)`
+/// reads the spec back to decide whether the installed functions match the
+/// spec the catalog now asks for; the capture pass compares the hash with
+/// the live source to tell a function an older generator left behind (its
+/// source still is what was recorded) from one replaced by hand (#707).
+pub fn comment_text(schema: &str, spec: &CaptureSpec, event: CaptureEvent) -> String {
     let list = |names: &[String]| {
         let items: Vec<String> = names
             .iter()
@@ -505,13 +508,21 @@ pub fn comment_text(spec: &CaptureSpec, event: CaptureEvent) -> String {
         format!("[{}]", items.join(","))
     };
     format!(
-        "{{\"trellis_capture\":1,\"table\":{},\"event\":{},\"key\":{},\"columns\":{},\"group_key\":{}}}",
+        "{{\"trellis_capture\":1,\"table\":{},\"event\":{},\"key\":{},\"columns\":{},\"group_key\":{},\"body\":\"{}\"}}",
         crate::intake::json_string(&spec.table),
         crate::intake::json_string(event.as_str()),
         list(&spec.key),
         list(&spec.columns),
         list(&spec.group_key),
+        body_hash(&function_source(schema, spec, event)),
     )
+}
+
+/// The hash of a capture function's source that its comment records
+/// (`"body"`): 64 bits of FNV-1a in hex. It guards against a hand edit, not
+/// an adversary.
+pub fn body_hash(source: &str) -> String {
+    format!("{:016x}", fnv1a64(source.as_bytes()))
 }
 
 /// `CREATE OR REPLACE TRIGGER` plus `ALTER TABLE … ENABLE ALWAYS TRIGGER` for
@@ -2441,10 +2452,13 @@ mod tests {
     fn the_comment_records_the_column_set() {
         let spec = spec();
         assert_eq!(
-            comment_text(&spec, CaptureEvent::Update),
-            "{\"trellis_capture\":1,\"table\":\"public.orders\",\"event\":\"update\",\
-             \"key\":[\"id\"],\"columns\":[\"amount\",\"customer_id\",\"id\"],\
-             \"group_key\":[\"customer_id\"]}"
+            comment_text("trellis", &spec, CaptureEvent::Update),
+            format!(
+                "{{\"trellis_capture\":1,\"table\":\"public.orders\",\"event\":\"update\",\
+                 \"key\":[\"id\"],\"columns\":[\"amount\",\"customer_id\",\"id\"],\
+                 \"group_key\":[\"customer_id\"],\"body\":\"{}\"}}",
+                body_hash(&function_source("trellis", &spec, CaptureEvent::Update))
+            )
         );
         let sql = comment_ddl("trellis", &spec, CaptureEvent::Update).unwrap();
         assert!(

@@ -401,8 +401,8 @@ async fn routine_maintenance_and_trellis_capture_ddl_pause_nothing() {
     }
 
     // Trellis's own capture DDL on the table: a widen for a definition that
-    // reads a new column, the narrow when it's dropped, and the repair of a
-    // disabled trigger.
+    // reads a new column, and the narrow when it's dropped. (A disabled
+    // trigger pauses the readers: `capture_disruption.rs`.)
     it.trellis
         .apply("TRANSFORM c_pids FROM public.c SELECT pid AS pid")
         .await
@@ -415,12 +415,6 @@ async fn routine_maintenance_and_trellis_capture_ddl_pause_nothing() {
     }
     capture_pass(&mut it.raw, &it.db.pool).await;
     assert_unpaused(&it, "narrow").await;
-    it.raw
-        .batch_execute("alter table public.c disable trigger all")
-        .await
-        .expect("disable capture");
-    capture_pass(&mut it.raw, &it.db.pool).await;
-    assert_unpaused(&it, "repair").await;
     it.trellis.shutdown().await.expect("shutdown");
 }
 

@@ -33,7 +33,7 @@ async fn migrate_up_is_idempotent() {
             27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 42, 43, 44, 45, 46, 47, 48, 49,
             50, 51, 53, 54, 55, 56, 57, 58, 59, 60, 63, 64, 65, 67, 68, 69, 70, 71, 72, 74, 75, 76,
             77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98,
-            99, 100, 101, 102,
+            99, 100, 101, 102, 103,
         ],
         // Issue #73 added V22 (drops `column_status`'s now-unenforceable
         // `target_table` foreign key). Its reviewer follow-up added V23
@@ -143,9 +143,9 @@ async fn migrate_up_is_idempotent() {
         // #938 V80 (`transform_definitions.build_marker_generation`), #625
         // F6 V81 (`backfill_chunks.fence_xid`, a seam-fed build's fence),
         // #894 V82 (`resume_requests.timeout_cancels`), and #877 V83
-        // (`trellis_instance.target_schema`), #1023 V84 (`self_check_jobs`), #864 V85 (`grammar_version`), #273 V86 (the work-wake triggers), #1047 V87 (they also announce a definition entering `waiting_to_backfill` or `live`), #1061 V88 (`partition_sources`, `partition_corrections`), #861 V89 (`retry_attempts` on `poison` and `key_deaths`), #1075 V90 (a queued `self_check` job announces itself), #1062 V91 (`partition_correction_progress`, `partition_corrections.node_default` and `parent_oid`), #1062 V92 (`backfill_chunks.correction_id`, the `correction` chunk kind), #1063 V93 (the progress's `parents` phase), #1064 V94 (the `truncated` correction kind), #1066 V95 (the `complement` correction kind), #1067 V96 (`partition_sources.system_identifier`), #1099 V97 (the ring's `transition_images`), #1107 V98 (`transform_definitions.join_table` and `join_columns`), #703 V99 (`capture_baselines`), #1102 V100 (`poison_held.agg_groups`), #1151 V101 (`partition_corrections_once` becomes a non-unique lookup index), and #1067 V102 (`partition_sources.catalog_oid`).
+        // (`trellis_instance.target_schema`), #1023 V84 (`self_check_jobs`), #864 V85 (`grammar_version`), #273 V86 (the work-wake triggers), #1047 V87 (they also announce a definition entering `waiting_to_backfill` or `live`), #1061 V88 (`partition_sources`, `partition_corrections`), #861 V89 (`retry_attempts` on `poison` and `key_deaths`), #1075 V90 (a queued `self_check` job announces itself), #1062 V91 (`partition_correction_progress`, `partition_corrections.node_default` and `parent_oid`), #1062 V92 (`backfill_chunks.correction_id`, the `correction` chunk kind), #1063 V93 (the progress's `parents` phase), #1064 V94 (the `truncated` correction kind), #1066 V95 (the `complement` correction kind), #1067 V96 (`partition_sources.system_identifier`), #1099 V97 (the ring's `transition_images`), #1107 V98 (`transform_definitions.join_table` and `join_columns`), #703 V99 (`capture_baselines`), #1102 V100 (`poison_held.agg_groups`), #1151 V101 (`partition_corrections_once` becomes a non-unique lookup index), #1067 V102 (`partition_sources.catalog_oid`), and #707 V103 (`capture_triggers`).
         // V73 is unused.
-        "expected exactly V1 through V7, V9 through V24, V26 through V40, V42 through V51, V53 through V60, V63 through V65, V67 through V72, V74 through V102 to be applied"
+        "expected exactly V1 through V7, V9 through V24, V26 through V40, V42 through V51, V53 through V60, V63 through V65, V67 through V72, V74 through V103 to be applied"
     );
 
     // Running again should be a no-op: same ledger, no error.

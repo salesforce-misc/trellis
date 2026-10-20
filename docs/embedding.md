@@ -145,12 +145,18 @@ So:
   works at `read committed`, `repeatable read` and `serializable`.
 * **Leave the capture triggers alone.** Each source table carries five
   triggers named after the instance schema (`trellis_capture_insert` and so on
-  for the default). Don't disable or drop them, or replace their functions.
-  The worker reinstalls a missing or disabled one on its next reconcile pass,
-  and `self_check` reports a broken capture as a `capture` divergence before
-  it compares any rows (known correctness gaps:
+  for the default). Don't disable, drop or recreate them, replace their
+  functions, or swap the table out from under a definition. The worker's next
+  reconcile pass pauses every definition that reads the table, with a
+  `capture_failure` saying that changes made meanwhile may be missing, and
+  waits for a `RESUME`, which rebuilds. It never repairs them on its own.
+  Plan a `RESUME` after anything that disrupts capture: a table swap (rename
+  or `SET SCHEMA`), a bulk load with triggers disabled, a fixture load that
+  runs `ENABLE TRIGGER ALL` (Rails' `disable_referential_integrity`,
+  `pg_restore --disable-triggers`). `self_check` reports a broken capture as
+  a `capture` divergence before it compares any rows (known correctness gaps:
   [Operator changes inside Trellis-owned artifacts](known-correctness-gaps.md#8-operator-changes-inside-trellis-owned-artifacts),
-  [Capture switched off and back on between two reconcile passes](known-correctness-gaps.md#5-capture-switched-off-and-back-on-between-two-reconcile-passes)).
+  [Changes the capture pass can't see between two passes](known-correctness-gaps.md#5-changes-the-capture-pass-cant-see-between-two-passes)).
 * **A long transaction can delay the triggers' install.** Installing or
   widening a table's triggers needs a brief table lock, which the worker
   retries every pass while a long transaction or an autovacuum holds the

@@ -321,6 +321,16 @@ pause are arcs of one lifecycle:
     subscription came to apply to a table it reads) or its target came under
     row-level security: `DefinitionStatus::capture_failure` names the table, the
     columns and the cause;
+  * a table it reads was changed outside Trellis, or is gone from its name
+    ([capture by triggers](staging-and-claiming/01-capture-by-triggers.md#capture-changed-outside-trellis)):
+    `capture_failure` reads "the table `<table>` no longer exists at that name
+    (it was dropped, renamed away or moved to another schema)…", or "Trellis's
+    capture of `<table>` was changed outside Trellis: the capture trigger `<name>`
+    is gone, was dropped and created again, is disabled, is enabled in ORIGIN
+    or REPLICA mode, or was altered; the capture function `<name>` was
+    replaced…", and goes on to say that changes made meanwhile may be missing,
+    so Trellis can't guarantee the definition is correct, and that a resume
+    reinstalls capture and rebuilds it;
   * the database was restored from a dump and the transform reads a partitioned
     source ([ADR-0017](decisions/0017-partitioned-sources.md)): Trellis's
     recorded partitions name the dump's tables, so nothing is corrected from

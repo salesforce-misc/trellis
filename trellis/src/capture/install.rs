@@ -884,6 +884,7 @@ pub async fn narrow(
         }
     }
     super::baseline::record(&txn, spec.table(), spec.columns()).await?;
+    super::triggers::record(&txn, schema, spec.table(), super::triggers::Mode::IfAbsent).await?;
     txn.commit().await?;
     Ok(())
 }
@@ -1187,12 +1188,22 @@ async fn attempt(
     match op {
         Op::Install {
             spec, last: true, ..
+        } => {
+            super::baseline::record(&txn, table, spec.columns()).await?;
+            // #707: the triggers as this install made them.
+            super::triggers::record(&txn, schema, table, super::triggers::Mode::Overwrite).await?;
         }
-        | Op::Widen(spec) => super::baseline::record(&txn, table, spec.columns()).await?,
+        Op::Widen(spec) => {
+            super::baseline::record(&txn, table, spec.columns()).await?;
+            super::triggers::record(&txn, schema, table, super::triggers::Mode::IfAbsent).await?;
+        }
         Op::Uninstall {
             scope: Scope::All | Scope::Root,
             ..
-        } => super::baseline::forget(&txn, table).await?,
+        } => {
+            super::baseline::forget(&txn, table).await?;
+            super::triggers::forget(&txn, table).await?;
+        }
         Op::Install { .. } | Op::Uninstall { .. } => {}
     }
     if parks_marker {

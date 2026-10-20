@@ -106,6 +106,7 @@ pub const CLASSIFICATION: &[(&str, Class)] = &[
     ("capture_baselines", Class::Runtime),
     ("capture_failures", Class::Runtime),
     ("capture_holdups", Class::Runtime),
+    ("capture_triggers", Class::Runtime),
     ("column_deaths", Class::Runtime),
     ("column_failures", Class::Runtime),
     ("column_pause_cascades", Class::Runtime),

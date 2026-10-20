@@ -4639,6 +4639,14 @@ async fn complete_resume(
     // (`staging::schema_change::pause_readers_of_missing`). A key column
     // changed again since the re-validation above is the next pass's to
     // pause (`pause_readers_of_retyped`), against the types just recorded.
+    // #707: the capture the definition was paused over is recorded afresh by
+    // the next pass, which installs it again if the triggers were disrupted.
+    txn.execute(
+        "delete from capture_triggers where table_name in \
+             (select source_table from capture_failures where transform_id = $1)",
+        &[&id],
+    )
+    .await?;
     txn.execute(
         "delete from capture_failures where transform_id = $1",
         &[&id],
