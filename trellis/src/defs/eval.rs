@@ -1783,7 +1783,7 @@ fn fold_jsonb_agg(row_values: Vec<Option<Value>>) -> Option<Value> {
 /// unless empty, `NULL`-spelled, or holding a brace, comma, quote, backslash
 /// or whitespace, in which case double-quoted with `\` escapes. Element
 /// order is the group's own row order, which a server-side recompute does
-/// not promise to reproduce (known-correctness gap 18).
+/// not promise to reproduce (`docs/type-support.md`, `array_agg` and `string_agg`).
 #[cfg(any(test, feature = "test-util"))]
 fn fold_array_agg(row_values: Vec<Option<Value>>) -> Option<Value> {
     if row_values.is_empty() {

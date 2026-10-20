@@ -819,7 +819,7 @@ distinguishable. Resuming while the cause persists halts it again as a new
 episode, and a closure's members can be resumed in any order. A halt that pauses
 nothing because a peer already paused the closure retries the page once. One
 that still pauses nothing (a refused read or write the catalog can't pin on a
-table, [gap 11](../known-correctness-gaps.md#11-row-level-security-on-a-role-trellis-runs-as))
+table, [observability — A halting failure](../observability.md#a-halting-failure))
 surfaces the error and records the page as a drain holdup (#817, ADR-0003's
 retry policy), which `status` reports as `drain_failure` on the definitions
 reading its tables, and the worker re-claims the page at the poll interval

@@ -1282,7 +1282,8 @@ async fn a_start_that_fails_transiently_is_retried_next_pass_and_not_paused() {
     assert_eq!(f.build("one").await.as_deref(), Some("rederive"));
 }
 
-/// Known-gaps entry 8: a live definition whose ledger is dropped fails each
+/// A ledger dropped by hand (`docs/known-correctness-gaps.md`, rows written into
+/// what Trellis owns): a live definition whose ledger is dropped fails each
 /// drain page that applies a change for it, until the keys it touches are
 /// held and the definition is quarantined. The other definition on the
 /// source stays live, and the quarantined one's resume refuses with the

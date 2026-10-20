@@ -172,7 +172,9 @@ per value. So:
   blank-padding is a hazard, not a volatility one.
 
 What happens when a collation changes after define is in
-[known correctness gaps](known-correctness-gaps.md).
+[capture by triggers](staging-and-claiming/01-capture-by-triggers.md#a-re-typed-key-column-or-an-outgrown-copy),
+and what that misses in
+[known correctness gaps](known-correctness-gaps.md#a-columns-values-rewritten-in-place-by-alter-column-type).
 
 ## Exact integers
 
@@ -319,9 +321,12 @@ two columns of different enum types are never joinable.
 - The evaluator has no connection, so it cannot order a multi-value tie; a
   1-1 target's `MIN`/`MAX` over a to-many relationship path is refused.
 
-A `DROP TYPE` of an enum a live definition references is not handled: the
-column stops being recognized and later fails introspection. Checked in
-`trellis/tests/defs_enum.rs`.
+Postgres refuses a `DROP TYPE` of an enum while a column Trellis created
+uses it, and the retype or drop of the source column that has to come first
+pauses the definitions that read it, so the drop can follow their `RESUME`
+or `DROP TRANSFORM`. Renaming the type (`ALTER TYPE … RENAME`) fails the
+drain for its 1-1 readers until their keys are held, and pauses its `GROUP
+BY` readers ([#1204](https://github.com/salesforce-misc/trellis/issues/1204)).
 
 ## `array_agg` and `string_agg`
 
@@ -332,9 +337,10 @@ group's whole input, not a summary of it.
 `ARRAY_AGG` produces `text[]` and keeps a `NULL` row as a `NULL` element.
 `STRING_AGG` skips `NULL` rows and is `NULL` when none remain. The separator
 must be a string literal, and neither aggregate is accepted over a to-many
-relationship path. The grammar has no `ORDER BY` inside the call, so element
-order isn't guaranteed across recomputes ([known correctness gaps, entry
-18](known-correctness-gaps.md#18-jsonb_agg-array_agg-and-string_agg-element-order)).
+relationship path. The grammar has no `ORDER BY` inside the call, so, as in
+Postgres without one, element order isn't guaranteed across recomputes: the
+set of elements is always right, so compare the elements as a set, or sort
+them when you read them.
 A later transform that reads a `text[]` target column sees an unrecognized
 type. Checked in `trellis/tests/defs_list_aggregates.rs`.
 
