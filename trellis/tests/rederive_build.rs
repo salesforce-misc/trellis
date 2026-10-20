@@ -2871,3 +2871,109 @@ async fn a_plan_batch_behind_a_drop_writes_nothing() {
         "and the batch planned no chunk"
     );
 }
+
+/// #1201: a rebuild of a 1-1 target deletes rows someone added or re-keyed
+/// by hand, which the source no longer backs, not only the rows it
+/// re-derives from the source.
+#[tokio::test]
+async fn a_rebuild_deletes_target_rows_added_or_rekeyed_by_hand() {
+    let mut f = Fixture::new(150, &[ONE]).await;
+    f.pass().await;
+    f.run("one").await;
+    assert_eq!(f.status("one").await.as_deref(), Some("live"));
+
+    let trellis = f.trellis().await;
+    trellis.apply("PAUSE TRANSFORM one").await.expect("pause");
+    f.raw
+        .batch_execute(
+            "insert into public.one (id, g, dbl) values (9999, 1, 1); \
+             update public.one set id = 8888 where id = 7",
+        )
+        .await
+        .expect("change the target by hand");
+    trellis.apply("RESUME TRANSFORM one").await.expect("resume");
+    f.pass().await;
+    f.run("one").await;
+    assert_eq!(f.status("one").await.as_deref(), Some("live"));
+    assert_eq!(
+        f.rows(ONE_ACTUAL).await,
+        f.rows(ONE_EXPECTED).await,
+        "the rebuild repaired the hand-made rows"
+    );
+}
+
+/// #1201: a resume of a definition whose target table is gone refuses and
+/// names the repair, as for a missing ledger, instead of succeeding and
+/// leaving a build that fails.
+#[tokio::test]
+async fn a_resume_refuses_when_the_target_table_is_gone() {
+    let mut f = Fixture::new(150, &[ONE]).await;
+    f.pass().await;
+    f.run("one").await;
+    let trellis = f.trellis().await;
+    trellis.apply("PAUSE TRANSFORM one").await.expect("pause");
+    f.raw
+        .batch_execute("drop table public.one")
+        .await
+        .expect("drop the target");
+    let refusal = trellis
+        .apply("RESUME TRANSFORM one")
+        .await
+        .expect_err("a resume without its target is refused")
+        .to_string();
+    assert!(
+        refusal.contains("DROP TRANSFORM") && refusal.contains("public.one"),
+        "{refusal}"
+    );
+    assert_eq!(f.status("one").await.as_deref(), Some("paused"));
+}
+
+/// #1201: the orphan sweep of a rebuild walks more hand-added rows than one
+/// batch holds, and never deletes a target row the source backs: a key whose
+/// source row committed after the plan read the source, with its captured
+/// change still in the ring when the sweep runs, is re-derived from the
+/// source, not deleted as unbacked.
+#[tokio::test]
+async fn a_rebuild_sweeps_many_hand_added_rows_and_keeps_a_row_the_source_backs() {
+    let mut f = Fixture::new(150, &[ONE]).await;
+    f.pass().await;
+    f.run("one").await;
+    assert_eq!(f.status("one").await.as_deref(), Some("live"));
+
+    let trellis = f.trellis().await;
+    trellis
+        .request_backfill("src")
+        .await
+        .expect("request a rebuild");
+    f.run_chunks_by_hand(1_000).await;
+    // After the plan read the source: a source row whose change waits in the
+    // ring, a wrong target row for it, and three batches' worth of rows
+    // nothing backs.
+    f.raw
+        .batch_execute(
+            "insert into public.src values (5000, 1, 7); \
+             insert into public.one (id, g, dbl) values (5000, 0, 0); \
+             insert into public.one (id, g, dbl) \
+                 select i, 0, 0 from generate_series(6001, 6025) i",
+        )
+        .await
+        .expect("change the source and the target");
+    assert!(
+        has_pending(&f.raw).await.expect("has_pending"),
+        "the source row's change is still in the ring"
+    );
+    for _ in 0..MAX_STEPS {
+        if !f.step(&OPTIONS).await.progressed() {
+            break;
+        }
+    }
+    assert_eq!(
+        f.rows("select (id, g, dbl)::text from public.one where id >= 5000 order by id")
+            .await,
+        ["(5000,1,14)"],
+        "the sweep re-derived the backed row and deleted every unbacked one"
+    );
+    f.run("one").await;
+    assert_eq!(f.status("one").await.as_deref(), Some("live"));
+    f.assert_one_oracle().await;
+}

@@ -150,7 +150,9 @@ holds no long snapshot.
 A paused or quarantined definition keeps its ledger, groups and owed deltas.
 Its resume starts a Re-derive build over the existing entries with no
 truncate, plus a **sweep** that re-derives each live entry no chunk did,
-which is a key deleted while the definition was frozen. An `ALTER TRANSFORM`
+which is a key deleted while the definition was frozen, and, for a 1-1
+target, each target row with no live entry, which is one added or re-keyed by
+hand. An `ALTER TRANSFORM`
 that adds columns, and a column resume, run a field build: background chunks
 that rewrite just those columns from one snapshot.
 

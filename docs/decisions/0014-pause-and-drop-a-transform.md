@@ -128,7 +128,8 @@ together in one transaction and read on one snapshot:
 - Every current source row is re-derived, by whichever build the definition
   qualifies for. A definition the Re-derive build serves restarts it over the
   existing ledger entries, and its sweep re-derives each live entry no chunk
-  reached (a key deleted while frozen). Any other definition parks a marker,
+  reached (a key deleted while frozen) and, for a 1-1 target, each target row
+  with no live entry (one added or re-keyed by hand). Any other definition parks a marker,
   and its one-pass build ends in a go-live catch-up that enumerates the
   source's current keys as image-less Recomputes, plus the orphan sweep
   (`intake::resume_orphans`) above. An aggregate's one-pass build rebuilds

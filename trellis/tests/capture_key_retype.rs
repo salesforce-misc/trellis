@@ -4842,3 +4842,33 @@ async fn a_skipped_definition_still_owns_a_projection_re_typed_in_place() {
         .collect();
     assert_eq!(owners, ["post_authors", "post_nicks"]);
 }
+
+/// #1201: a target column someone re-typed by hand, with its source column
+/// untouched, is reported as re-typed outside Trellis, not as a source
+/// column that widened.
+#[tokio::test]
+async fn a_target_column_re_typed_by_hand_is_not_blamed_on_the_source() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = items(db.dsn(), &mut raw, &db.pool).await;
+    raw.batch_execute("alter table public.item_names alter column next type smallint")
+        .await
+        .expect("re-type the target column by hand");
+    capture_pass(&mut raw, &db.pool).await;
+    let error = paused_for(&trellis, "item_names", "public.items", &["qty"]).await;
+    assert!(
+        error.contains("re-typed outside Trellis")
+            && error.contains("public.item_names.next (smallint, now integer)")
+            && !error.contains("widened")
+            && error.contains("Resume the definition"),
+        "{error}"
+    );
+    resume(&trellis, "item_names").await;
+    assert_retyping(&trellis, &raw, "item_names").await;
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(
+        column_type(&raw, "public.item_names", "next").await,
+        "integer"
+    );
+}
