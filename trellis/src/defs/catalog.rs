@@ -212,6 +212,19 @@ pub enum CatalogError {
     /// define refuses an aggregate the knob routes to the group basis when
     /// its source or arguments need what that path doesn't have yet.
     GroupBasisUnsupported { reason: String },
+    /// A group-basis aggregate's hidden partials table (`agg_<id>` in the
+    /// catalog schema, `staging::group_basis`) doesn't exist, though define
+    /// would create one for the definition now. An operator dropped it, or
+    /// the definition was defined on the ledger and a source column it sums
+    /// was re-typed since, so the group basis takes it now. Every page would
+    /// write into a table that isn't there. [`check_owned_tables`] refuses
+    /// it, and Trellis doesn't re-create the table: the repair is to drop
+    /// the definition and define it again.
+    GroupBasisTableMissing {
+        target: String,
+        /// The table, schema-qualified.
+        hidden_table: String,
+    },
     /// A definition's ledger table doesn't exist, though define creates one
     /// for every definition, 1-1 or aggregate (#986). Only Trellis writes its
     /// tables, so an operator dropped it; the build's `start` reads it and
@@ -526,6 +539,7 @@ impl CatalogError {
             CatalogError::AggregateDeltasShapeChanged { .. } => ErrorCode::Validation,
             CatalogError::AggregateDeltasTableMissing { .. } => ErrorCode::Validation,
             CatalogError::GroupBasisUnsupported { .. } => ErrorCode::Validation,
+            CatalogError::GroupBasisTableMissing { .. } => ErrorCode::Validation,
             CatalogError::LedgerTableMissing { .. } => ErrorCode::Validation,
             CatalogError::TargetTableMissing { .. } => ErrorCode::Validation,
             // A target the definition may not have, like a row-security
@@ -573,6 +587,7 @@ impl CatalogError {
     /// opposed to a refusal only a resume makes ([`CatalogError::SourceKeyChanged`],
     /// [`CatalogError::AggregateDeltasShapeChanged`],
     /// [`CatalogError::AggregateDeltasTableMissing`],
+    /// [`CatalogError::GroupBasisTableMissing`],
     /// [`CatalogError::LedgerTableMissing`],
     /// [`CatalogError::TargetTableMissing`]), where define would
     /// accept the definition and the repair is to drop it and define it again.
@@ -589,6 +604,7 @@ impl CatalogError {
             CatalogError::SourceKeyChanged { .. }
                 | CatalogError::AggregateDeltasShapeChanged { .. }
                 | CatalogError::AggregateDeltasTableMissing { .. }
+                | CatalogError::GroupBasisTableMissing { .. }
                 | CatalogError::LedgerTableMissing { .. }
                 | CatalogError::TargetTableMissing { .. }
                 | CatalogError::TargetInCatalogSchema { .. }
@@ -682,6 +698,15 @@ impl fmt::Display for CatalogError {
                 f,
                 "the group-basis dev knob (TRELLIS_DEV_GROUP_BASIS) can't take this aggregate: \
                  {reason}"
+            ),
+            CatalogError::GroupBasisTableMissing {
+                target,
+                hidden_table,
+            } => write!(
+                f,
+                "the group-basis partials table of {target}, {hidden_table}, doesn't exist, but \
+                 define would create one. Trellis doesn't re-create it: `DROP TRANSFORM` and \
+                 define it again"
             ),
             CatalogError::LedgerTableMissing {
                 target,
@@ -887,6 +912,7 @@ impl std::error::Error for CatalogError {
             CatalogError::AggregateDeltasShapeChanged { .. } => None,
             CatalogError::AggregateDeltasTableMissing { .. } => None,
             CatalogError::GroupBasisUnsupported { .. } => None,
+            CatalogError::GroupBasisTableMissing { .. } => None,
             CatalogError::LedgerTableMissing { .. } => None,
             CatalogError::TargetTableMissing { .. } => None,
             CatalogError::TargetInCatalogSchema { .. } => None,
@@ -6228,9 +6254,13 @@ pub(crate) async fn check_target_table(
 /// ([`check_target_table`]) and that the tables Trellis keeps beside
 /// it are what define would create now: the ledger exists
 /// ([`check_ledger_table`]) and an aggregate's group-delta table exists with
-/// the columns define would give it ([`check_deltas_shape`]).
+/// the columns define would give it ([`check_deltas_shape`]), or, for an
+/// aggregate the group basis takes, its hidden partials table exists
+/// ([`CatalogError::GroupBasisTableMissing`]). `schema` is the catalog
+/// schema.
 pub(crate) async fn check_owned_tables(
     txn: &tokio_postgres::Transaction<'_>,
+    schema: &str,
     definition: &Definition,
     revalidated: &Revalidated,
 ) -> Result<(), CatalogError> {
@@ -6240,10 +6270,24 @@ pub(crate) async fn check_owned_tables(
     if revalidated.join.is_some() {
         return Ok(());
     }
-    // A group-basis aggregate keeps neither a ledger nor a group-delta
-    // table (#1222); its partials table is not checked here.
+    // A group-basis aggregate keeps no ledger or group-delta table (#1222),
+    // only its hidden partials table. Routed on the live columns, as define
+    // would: a ledger aggregate whose summed column was re-typed into what
+    // the group basis takes has no partials table, and is refused here
+    // rather than resumed onto one that isn't there.
     if crate::staging::group_basis::route(&definition.def, &revalidated.source_columns).is_some() {
-        return Ok(());
+        let hidden = crate::staging::group_basis::hidden_table_ident(schema, definition.id);
+        let present: bool = txn
+            .query_one("select pg_catalog.to_regclass($1) is not null", &[&hidden])
+            .await?
+            .get(0);
+        if present {
+            return Ok(());
+        }
+        return Err(CatalogError::GroupBasisTableMissing {
+            target: definition.target_table.clone(),
+            hidden_table: hidden,
+        });
     }
     check_ledger_table(txn, definition).await?;
     check_deltas_shape(txn, definition, revalidated).await
