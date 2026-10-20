@@ -19,7 +19,8 @@ defmodule Trellis do
   - **Quarantine:** `quarantined/1`, `quarantine_status/2`,
     `sample_quarantined/3`, `poisoned_since/2`. Pausing and resuming are
     statements: `apply(trellis, "RESUME TRANSFORM order_totals.total")`.
-  - **Operations:** `request_backfill/2`, `has_live_drain_workers/1`,
+  - **Operations:** `request_backfill/2`, `detect_capture_disruptions/1`,
+    `has_live_drain_workers/1`,
     `has_live_staging_worker/1`, the read-your-writes pair
     `watermark_token/1` and `await_converged/3`, and the audit
     `self_check/3`, a background job that `self_check_job/2` reads back.
@@ -579,6 +580,28 @@ defmodule Trellis do
   @doc "Like `has_live_staging_worker/1`, but raises `Trellis.Error`."
   @spec has_live_staging_worker!(trellis()) :: boolean()
   def has_live_staging_worker!(trellis), do: bang(has_live_staging_worker(trellis))
+
+  @doc """
+  Pauses, now, the definitions that read a table whose Trellis capture was
+  changed outside Trellis (a trigger disabled, dropped or recreated, a
+  capture function replaced, the table gone), and returns the qualified
+  names of those tables.
+
+  The staging worker's reconcile pass does the same on its own cadence, with
+  a `Trellis.CaptureFailure` of kind `:disruption` on each paused
+  definition's status. This is for a caller that has just done something
+  that disrupts capture, like a fixture load, and needs the readers paused
+  before it goes on. It installs, repairs and rebuilds nothing, and resuming
+  is still the caller's (`Trellis.TestSupport` does it for a test suite).
+  Safe beside a running staging worker.
+  """
+  @spec detect_capture_disruptions(trellis()) :: {:ok, [String.t()]} | {:error, Error.t()}
+  def detect_capture_disruptions(trellis) when is_trellis(trellis),
+    do: native(run(trellis, :detect_capture_disruptions, []))
+
+  @doc "Like `detect_capture_disruptions/1`, but raises `Trellis.Error`."
+  @spec detect_capture_disruptions!(trellis()) :: [String.t()]
+  def detect_capture_disruptions!(trellis), do: bang(detect_capture_disruptions(trellis))
 
   @typedoc "An opaque `watermark_token/1` token."
   @opaque watermark :: String.t()

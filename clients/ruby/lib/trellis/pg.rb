@@ -45,7 +45,7 @@ require_relative "instance"
 # - Reads: status, definitions, relationships, dump_definitions_sql.
 # - Quarantine: quarantined, quarantine_status, sample_quarantined,
 #   poisoned_since, release_key.
-# - Operations: request_backfill, has_live_drain_workers?,
+# - Operations: request_backfill, detect_capture_disruptions, has_live_drain_workers?,
 #   has_live_staging_worker?, watermark_token, await_converged, self_check,
 #   self_check_job.
 #

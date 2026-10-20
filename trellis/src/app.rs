@@ -986,6 +986,31 @@ impl Trellis {
         .await
     }
 
+    /// Pauses, now, the readers of every captured table whose Trellis
+    /// capture was changed outside Trellis or whose table is gone, and
+    /// returns those tables (#1181). The staging worker's reconcile pass does
+    /// the same on its own cadence (`capture_failure` of kind
+    /// [`CaptureFailureKind::Disruption`]); this is for a caller that has
+    /// just done something that disrupts capture (a fixture or bulk load that
+    /// ends with `ENABLE TRIGGER ALL`) and needs the readers paused before it
+    /// goes on, rather than a pass later. It installs, repairs and rebuilds
+    /// nothing, and runs beside a worker. A `RESUME` of each paused
+    /// definition is still the caller's.
+    pub async fn detect_capture_disruptions(&self) -> Result<Vec<String>, TrellisError> {
+        self.call(async {
+            let desired = crate::defs::tables_to_capture(&self.pool).await?;
+            let mut client = self.pool.get().await?;
+            crate::capture::reconcile::detect_disruptions(
+                &mut client,
+                self.config.schema(),
+                &desired,
+            )
+            .await
+            .map_err(|err| TrellisError::Client(crate::client::capture_pass_error(err)))
+        })
+        .await
+    }
+
     /// What holds up the capture a definition sourced from `source_table`
     /// waits on (issue #622 C5, #687): the lock wait, then the other
     /// failure, that the staging worker's latest pass recorded in
@@ -2060,8 +2085,20 @@ pub struct DefinitionStatus {
     ///   `source_table` names the target. Fix the cause and resume it, which
     ///   rebuilds it and clears this.
     ///
-    /// Every case but the halts has [`CaptureFailureKind::Capture`]. A
-    /// definition an operator paused has none.
+    /// - or Trellis's capture of a table it reads was changed outside
+    ///   Trellis, with [`CaptureFailureKind::Disruption`] (#707, #1181): a
+    ///   capture trigger or function was altered, disabled (`ENABLE TRIGGER
+    ///   ALL` after a bulk load leaves `ORIGIN`), recreated or replaced, or
+    ///   the table is gone. Changes made meanwhile may be missing, so resume
+    ///   the definition, which reinstalls capture and rebuilds it. A
+    ///   definition already frozen when the disruption is seen (an
+    ///   operator's `PAUSE`) gets the same record with
+    ///   [`CaptureFailureKind::Capture`]: it stays the operator's to resume.
+    ///
+    /// The halts have [`CaptureFailureKind::Halt`], the disruptions of a
+    /// definition that wasn't frozen [`CaptureFailureKind::Disruption`], and
+    /// every other case [`CaptureFailureKind::Capture`]. A definition an
+    /// operator paused has none until one of these is seen.
     pub capture_failure: Option<CaptureFailure>,
     /// Set while the definition holds keys in quarantine (#759): source keys
     /// whose changes its apply leaves out, each because a change to it kept
@@ -2148,33 +2185,52 @@ pub struct CaptureFailure {
 pub enum CaptureFailureKind {
     /// Capture of a table the definition reads is broken: a schema change,
     /// row-level security, a subscription, or a failing install or widen.
+    /// Also a [`CaptureFailureKind::Disruption`] seen while the definition
+    /// was already frozen (an operator's `PAUSE`), which stays the
+    /// operator's to resume.
     Capture,
     /// The drain, or a Re-derive build's group-delta merge, halted on the
     /// definition: a failure no retry or quarantine gets past reached it, so
     /// it was paused with the rest of the failure's closure
     /// (`staging::halt`).
     Halt,
+    /// Trellis's capture of a table the definition reads was changed outside
+    /// Trellis, or the table is gone (#707, #999, #1181): a capture trigger
+    /// or function was altered, disabled, recreated or replaced, or the
+    /// table was dropped, renamed away or moved. Bulk loaders leave this
+    /// (`ENABLE TRIGGER ALL` puts the triggers in `ORIGIN` mode). The
+    /// definition waits for a resume, which re-validates, reinstalls
+    /// capture and rebuilds it. A test helper that resumes after a fixture
+    /// load selects on this kind. A definition that was already frozen when
+    /// the disruption was seen gets [`CaptureFailureKind::Capture`] instead.
+    Disruption,
 }
 
 impl CaptureFailureKind {
     /// Every kind, in declaration order.
-    pub const ALL: [CaptureFailureKind; 2] =
-        [CaptureFailureKind::Capture, CaptureFailureKind::Halt];
+    pub const ALL: [CaptureFailureKind; 3] = [
+        CaptureFailureKind::Capture,
+        CaptureFailureKind::Halt,
+        CaptureFailureKind::Disruption,
+    ];
 
-    /// The word `capture_failures.kind` stores: `capture` or `halt`.
+    /// The word `capture_failures.kind` stores: `capture`, `halt` or
+    /// `disruption`.
     pub fn as_str(self) -> &'static str {
         match self {
             CaptureFailureKind::Capture => "capture",
             CaptureFailureKind::Halt => "halt",
+            CaptureFailureKind::Disruption => "disruption",
         }
     }
 
-    /// The kind `capture_failures.kind` stores. Its check constraint (V70)
-    /// admits only these two.
+    /// The kind `capture_failures.kind` stores. Its check constraint (V70,
+    /// V104) admits only these.
     fn from_persisted(kind: &str) -> Self {
         match kind {
             "halt" => CaptureFailureKind::Halt,
             "capture" => CaptureFailureKind::Capture,
+            "disruption" => CaptureFailureKind::Disruption,
             other => panic!("capture_failures.kind held unrecognized value '{other}'"),
         }
     }

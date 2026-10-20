@@ -73,7 +73,9 @@ The surface mirrors the Rust crate's `BlockingTrellis` (issues #146, #147,
   is being corrected for while it reads `:backfilling` for them
   (`correcting`, each a `Trellis.CorrectingNode` with `node`, `since` and
   `keys_remaining`).
-- `request_backfill/2`, `has_live_drain_workers/1`,
+- `request_backfill/2`, `detect_capture_disruptions/1` (pauses now the readers
+  of every table whose Trellis capture was changed outside Trellis, and
+  returns the tables), `has_live_drain_workers/1`,
   `has_live_staging_worker/1`, `watermark_token/1`, `await_converged/3`.
 - `self_check/3` and `self_check_job/2`: check a target against a fresh
   recompute from its source, as a background job. `self_check/3` starts it and
@@ -236,6 +238,45 @@ make it so: Ecto's `schema_migrations` runs each migration once. See
 Add `import_deps: [:trellis_pg]` to the app's `.formatter.exs` to keep
 `define` and `apply` free of parentheses, like Ecto's own commands.
 
+## Fixtures and bulk loads in tests
+
+A loader that disables triggers for the load (`ALTER TABLE ... DISABLE
+TRIGGER ALL`, `pg_restore --disable-triggers`) disables Trellis's capture
+triggers too, and `ENABLE TRIGGER ALL` leaves them in a mode Trellis treats as
+a disruption. The rows it wrote never reached a target, so Trellis pauses
+every definition that reads the table (`capture_failure` has `kind:
+:disruption`) instead of letting a test read silently wrong data, and waits
+for a `RESUME`. `Trellis.TestSupport` does that `RESUME` for a suite, then
+waits for the rebuilt targets to catch up:
+
+```elixir
+setup do
+  # ... load the fixtures with triggers disabled, then re-enabled ...
+  {:ok, _resumed} = Trellis.TestSupport.resume_capture_disruptions(trellis)
+  :ok
+end
+```
+
+`resume_capture_disruptions/2` first pauses the readers of any disrupted
+table itself (`Trellis.detect_capture_disruptions/1`), so it doesn't wait for
+the staging worker's next pass; resumes only the definitions paused with kind
+`:disruption`; waits until each is `:live` and every write committed so far
+has reached its targets; and returns `{:ok, resumed}` (`[]` when nothing was
+disrupted, which costs one catalog read per captured table). A transform an
+operator paused, or one paused by a schema change or another failure, stays
+paused. A `RESUME` the engine refuses (a table that is gone, a table define
+would now refuse) leaves that definition paused; the rest are still resumed,
+and the call then returns `{:error, {:resume_refused, refused}}`, a map of
+target to reason. `resume_capture_disruptions!/2` returns the targets and
+raises `Trellis.TestSupport.ResumeRefused` (or `Trellis.Error`). The
+`:timeout_ms` option (default 30 000) bounds the wait. The handle needs its
+staging worker and a drain worker (`staging: true, drain_threads: 1`),
+because the resume rebuilds through them.
+
+Trellis sees a write when it commits, so with Ecto's SQL sandbox, load the
+fixtures that targets must reflect outside the sandbox transaction (in
+`setup_all`, or with the sandbox in `:auto` mode) and call the helper once.
+
 ## Schema dumps
 
 `mix ecto.dump` writes a schema-only `pg_dump`, which carries the Trellis
@@ -280,6 +321,7 @@ assembles its own dump.
 - `lib/`: the public `Trellis` module and its structs, the process that
   owns a supervised handle (`lib/trellis/owner.ex`), and `Trellis.Migration`, which
   is compiled only when the host depends on `ecto_sql`.
+- `lib/trellis/test_support.ex`: `Trellis.TestSupport`, the test helper above.
 - `native/trellis_nif/`: the NIF crate, a member of the repository's Cargo
   workspace. The release makes the packaged copy stand alone (see
   Releasing). Plain-data conversion and error codes come from

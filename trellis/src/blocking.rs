@@ -101,6 +101,7 @@ enum Job {
     ),
     HasLiveDrainWorkers(oneshot::Sender<Result<bool, TrellisError>>),
     HasLiveStagingWorker(oneshot::Sender<Result<bool, TrellisError>>),
+    DetectCaptureDisruptions(oneshot::Sender<Result<Vec<String>, TrellisError>>),
     WatermarkToken(oneshot::Sender<Result<PgLsn, TrellisError>>),
     AwaitConverged(PgLsn, Duration, oneshot::Sender<Result<(), TrellisError>>),
     SelfCheck(
@@ -419,6 +420,17 @@ impl BlockingTrellis {
     /// Submits [`BlockingTrellis::has_live_staging_worker`] and returns without waiting for it.
     pub fn start_has_live_staging_worker(&self) -> PendingCall<bool> {
         self.start(Job::HasLiveStagingWorker)
+    }
+
+    /// Pauses now the readers of every table whose capture was changed
+    /// outside Trellis. See [`Trellis::detect_capture_disruptions`].
+    pub fn detect_capture_disruptions(&self) -> Result<Vec<String>, TrellisError> {
+        self.start_detect_capture_disruptions().wait()
+    }
+
+    /// Submits [`BlockingTrellis::detect_capture_disruptions`] and returns without waiting for it.
+    pub fn start_detect_capture_disruptions(&self) -> PendingCall<Vec<String>> {
+        self.start(Job::DetectCaptureDisruptions)
     }
 
     /// A read-your-writes watermark token. See [`Trellis::watermark_token`].
@@ -752,6 +764,11 @@ async fn run(
             Job::HasLiveStagingWorker(reply) => {
                 calls.spawn(trellis, submitted, reply, move |t, at| {
                     Box::pin(async move { t.submitted(at, t.has_live_staging_worker()).await })
+                })
+            }
+            Job::DetectCaptureDisruptions(reply) => {
+                calls.spawn(trellis, submitted, reply, move |t, at| {
+                    Box::pin(async move { t.submitted(at, t.detect_capture_disruptions()).await })
                 })
             }
             Job::WatermarkToken(reply) => calls.spawn(trellis, submitted, reply, move |t, at| {

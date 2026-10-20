@@ -43,6 +43,7 @@ module Parity
     "quarantine_status" => ->(args, _opts) { Trellis.quarantine_status(*args) },
     "sample_quarantined" => ->(args, opts) { Trellis.sample_quarantined(*args, **opts) },
     "has_live_drain_workers" => ->(_args, _opts) { Trellis.has_live_drain_workers? },
+    "detect_capture_disruptions" => ->(_args, _opts) { Trellis.detect_capture_disruptions },
     "has_live_staging_worker" => ->(_args, _opts) { Trellis.has_live_staging_worker? },
     "watermark_token" => ->(_args, _opts) { Trellis.watermark_token },
     "await_converged" => ->(args, opts) { Trellis.await_converged(*args, **opts) },

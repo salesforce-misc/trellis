@@ -152,10 +152,20 @@ So:
   reconcile pass pauses every definition that reads the table, with a
   `capture_failure` saying that changes made meanwhile may be missing, and
   waits for a `RESUME`, which rebuilds. It never repairs them on its own.
-  Plan a `RESUME` after anything that disrupts capture: a table swap (rename
-  or `SET SCHEMA`), a bulk load with triggers disabled, a fixture load that
-  runs `ENABLE TRIGGER ALL` (Rails' `disable_referential_integrity`,
-  `pg_restore --disable-triggers`). `self_check` reports a broken capture as
+  The pause is a `capture_failure` of kind `disruption`
+  (`CaptureFailureKind::Disruption`), which a script can select on: it never
+  marks an operator's `PAUSE` or another failure. Plan a `RESUME` after
+  anything that disrupts capture: a table swap (rename or `SET SCHEMA`), a
+  bulk load with triggers disabled, a fixture load that runs
+  `ENABLE TRIGGER ALL` (Rails' `disable_referential_integrity`,
+  `pg_restore --disable-triggers`). A test suite does not script it: the
+  Ruby and Elixir clients have a test helper that resumes exactly the
+  `disruption` pauses after a fixture or bulk load and waits for exact
+  targets (`Trellis::TestSupport.resume_capture_disruptions`,
+  `Trellis.TestSupport.resume_capture_disruptions/2`; see the client READMEs).
+  `Trellis::detect_capture_disruptions` runs the reconcile pass's check on
+  the caller's connection, so a script that has just loaded data pauses the
+  readers at once instead of a pass later. `self_check` reports a broken capture as
   a `capture` divergence before it compares any rows
   ([known correctness gaps — Capture disrupted and restored between two passes](known-correctness-gaps.md#capture-disrupted-and-restored-between-two-passes)).
 * **A long transaction can delay the triggers' install.** Installing or

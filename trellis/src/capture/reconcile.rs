@@ -523,6 +523,34 @@ struct Snapshot {
     targets: HashSet<String>,
 }
 
+/// The disruption half of a capture pass (#707, #999), alone and on the
+/// caller's connection: for each of `desired`, pauses the readers of a table
+/// that is gone from its name or whose capture triggers or functions were
+/// changed outside Trellis, exactly as [`reconcile`] does, and installs and
+/// repairs nothing. Returns the tables it found disrupted (including ones an
+/// earlier pass already paused the readers of).
+///
+/// A test helper calls it after a fixture load so that the readers are
+/// paused when it returns, instead of at the staging worker's next pass
+/// (#1181). It is safe beside a running worker: a pause is recorded once per
+/// definition.
+pub async fn detect_disruptions(
+    client: &mut Client,
+    schema: &str,
+    desired: &[String],
+) -> Result<Vec<String>, CaptureError> {
+    let snapshot = read_snapshot(client, schema).await?;
+    let mut found = Vec::new();
+    for table in desired {
+        if super::triggers::pause_readers_of_gone_table(client, &snapshot.catalog, table).await?
+            || super::triggers::check(client, schema, &snapshot.catalog, table).await?
+        {
+            found.push(table.clone());
+        }
+    }
+    Ok(found)
+}
+
 async fn read_snapshot(client: &mut Client, schema: &str) -> Result<Snapshot, CaptureError> {
     let txn = client
         .build_transaction()
