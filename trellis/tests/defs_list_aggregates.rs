@@ -1,6 +1,6 @@
 //! Bare `array_agg`/`string_agg` (issue #293): recompute-only aggregates over
 //! `text`, like `jsonb_agg`, with no `ORDER BY`. Element order is the one
-//! documented caveat (`docs/known-correctness-gaps.md`, entry 18), so the
+//! documented caveat (`docs/type-support.md`, `array_agg` and `string_agg`), so the
 //! pipeline test compares element sets and the evaluator test feeds both
 //! sides the same row order.
 

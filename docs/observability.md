@@ -292,7 +292,8 @@ pause are arcs of one lifecycle:
   * a resumed column;
   * a rebuild of a transform whose target it reads;
   * a re-read of a table it reads (`Trellis::request_backfill`, the table's
-    capture triggers put back after someone dropped them, or an automatic
+    capture triggers reinstalled after a restore brought them back disabled,
+    or an automatic
     rebuild counted in `capture_auto_rebuilds_total`), unless the Re-derive
     build serves it: that definition goes `backfilling` instead, in the
     call's own transaction (or the capture pass that starts the automatic
@@ -356,7 +357,7 @@ pause are arcs of one lifecycle:
   its 1-1 source key was redefined, its ledger table is missing, or its
   aggregate's group-delta table is missing or has different columns from the
   ones define would create now
-  ([The repair tools](known-correctness-gaps.md#the-repair-tools)). A field resume
+  ([operations — `PAUSE` and `RESUME`](operations.md#pause-and-resume)). A field resume
   (`RESUME TRANSFORM t.col`) runs the same validation, but not the ledger and
   group-delta checks, since it rebuilds nothing. Otherwise the resume returns it to
   `waiting_to_backfill`. If columns
@@ -410,7 +411,7 @@ relationship, and the failure is charged to no key and pauses nothing (#817): a
 refused read or write the catalog can't pin on a table
 ([A halting failure](#a-halting-failure)), records that fail only together, a record
 that fails only in two separate combinations of transforms
-([known gap 24](known-correctness-gaps.md#24-a-change-only-two-separate-pairs-of-definitions-fail-on-together)),
+([operations](operations.md#a-page-that-fails-only-for-several-definitions-together)),
 isolation stopping at its probe limit, or a failure that kept reproducing until the
 page's retries ran out. The drain records such a page as a *drain holdup*, and every
 pass retries it, so the transform's target stops short of it and every watermark token
@@ -471,7 +472,7 @@ contention on hot keys.
 `self_check` refuses a 1-1 transform that reads a relationship with
 `UnsupportedExpr`, and an aggregate with `UnsupportedKeySpace`, when its job is
 started
-([known gap: `self_check` audits 1-1 targets only](known-correctness-gaps.md#16-self_check-audits-1-1-targets-only)),
+([known correctness gaps — What `self_check` can't see](known-correctness-gaps.md#what-self_check-cant-see)),
 so `status` is the place to read the warning.
 
 ### Backfill status and the `xmin` caveat
@@ -591,7 +592,7 @@ without them:
   not attempts. A halt that pauses nothing because a peer already paused the
   closure retries the page once. One that still pauses nothing (a refused
   read or write the catalog can't pin on a table,
-  [gap 11](known-correctness-gaps.md#11-row-level-security-on-a-role-trellis-runs-as))
+  [row-level security](transforms.md#supported-sources-and-targets))
   surfaces the error and records the page as a drain holdup, which `status`
   reports as `drain_failure` on the definitions reading its tables. The drain
   worker re-claims the page at its poll interval under a collapsed warning

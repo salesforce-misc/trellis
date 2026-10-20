@@ -1,5 +1,5 @@
 //! Dumping a database's Trellis definitions as SQL, so a schema-only dump
-//! can carry them (issue #644, `docs/known-correctness-gaps.md` gap 13).
+//! can carry them (issue #644, `docs/embedding.md`, schema dumps).
 //!
 //! `pg_dump --schema-only` carries the Trellis schema's DDL, the target tables
 //! and the capture triggers, but no rows. Rails and Ecto solve the same

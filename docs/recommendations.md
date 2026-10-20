@@ -236,7 +236,7 @@ The role needs:
 Why each is needed, and what Trellis does when one is missing:
 [embedding — What the staging worker needs from the database](embedding.md#what-the-staging-worker-needs-from-the-database),
 [transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)
-and [known correctness gaps, entry 11](known-correctness-gaps.md#11-row-level-security-on-a-role-trellis-runs-as).
+and [observability — A halting failure](observability.md#a-halting-failure).
 Define refuses a source or relationship endpoint whose schema the role lacks
 `USAGE` on, or that the role neither owns nor holds any privilege on, and
 names the table and what the role lacks.
@@ -271,7 +271,7 @@ Grant application roles `SELECT` on target tables and nothing more: no
 `INSERT`, `UPDATE`, `DELETE` or `TRUNCATE`, and never ownership. Only Trellis
 writes a target, and it doesn't correct a hand edit
 ([transforms — Target tables are Trellis-owned](transforms.md#target-tables-are-trellis-owned),
-[known correctness gaps — Operator changes inside Trellis-owned artifacts](known-correctness-gaps.md#8-operator-changes-inside-trellis-owned-artifacts)).
+[known correctness gaps — Rows written into a target, a hidden table or Trellis's schema](known-correctness-gaps.md#rows-written-into-a-target-a-hidden-table-or-trelliss-schema)).
 A read-only grant turns a hand edit into a permission error instead of a
 silent divergence.
 
