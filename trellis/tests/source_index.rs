@@ -138,6 +138,27 @@ async fn partial_and_expression_indexes_do_not_count() {
 }
 
 #[tokio::test]
+async fn an_index_under_a_pattern_operator_class_does_not_count() {
+    // `text_pattern_ops` orders by `~<~`, not `<`: a page's range and
+    // `order by` can't use it.
+    let (_cluster, _db, raw, trellis) =
+        setup("create index on public.orders (region text_pattern_ops)").await;
+    let by_region = "TRANSFORM by_region FROM public.orders GROUP BY region SELECT COUNT(*) AS n";
+    let message = refusal(&trellis, by_region).await;
+    assert!(
+        message.contains(r#"create index on "public"."orders" ("region")"#),
+        "{message}"
+    );
+    raw.batch_execute("create index on public.orders (region)")
+        .await
+        .expect("index");
+    trellis
+        .apply(by_region)
+        .await
+        .expect("an index under the default operator class counts");
+}
+
+#[tokio::test]
 async fn the_opt_out_defines_and_status_reports_it() {
     let (_cluster, _db, raw, trellis) = setup("").await;
     trellis.apply(AGG_OPT_OUT).await.expect("opted out");

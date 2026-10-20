@@ -14,7 +14,9 @@
 //!
 //! An index counts when it is a btree that is valid, ready and live, with no
 //! predicate, whose leading key columns are the plain columns (an expression
-//! has no column) under each column's own collation. A primary key or a
+//! has no column) under each column's own collation and its type's default
+//! operator class (a `text_pattern_ops` column orders by other operators than
+//! a page's). A primary key or a
 //! unique constraint is such an index. Nothing builds an index.
 //!
 //! Define and a whole-transform `RESUME` refuse a definition whose index is
@@ -233,7 +235,11 @@ async fn is_met(
     }
     let indexes = client
         .query(
-            "select i.indkey::int2[], i.indcollation::oid[], i.indnkeyatts::int4 \
+            "select i.indkey::int2[], i.indcollation::oid[], i.indnkeyatts::int4, \
+                    array(select oc.opcdefault \
+                          from unnest(i.indclass::oid[]) with ordinality as u(opclass, n) \
+                          join pg_catalog.pg_opclass oc on oc.oid = u.opclass \
+                          order by u.n) \
              from pg_catalog.pg_index i \
              join pg_catalog.pg_class c on c.oid = i.indexrelid \
              join pg_catalog.pg_am am on am.oid = c.relam \
@@ -246,8 +252,17 @@ async fn is_met(
         let mut attnums: Vec<i16> = row.get(0);
         let mut collations: Vec<u32> = row.get(1);
         let keys: i32 = row.get(2);
+        let default_opclass: Vec<bool> = row.get(3);
         attnums.truncate(keys.max(0) as usize);
         collations.truncate(keys.max(0) as usize);
+        // A column under a non-default operator class (`text_pattern_ops`)
+        // orders by other operators than a page's `>` and `order by`, so the
+        // index can't serve the page: it counts as no column.
+        for (attnum, default) in attnums.iter_mut().zip(&default_opclass) {
+            if !default {
+                *attnum = 0;
+            }
+        }
         meets(
             &IndexKey {
                 attnums,

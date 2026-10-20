@@ -952,10 +952,17 @@ impl Trellis {
                     unindexed =
                         unindexed_joins::for_definition(&*txn, row.get("source_table"), &def)
                             .await?;
-                    let source_columns = defs::catalog::definition_by_id_in(&*txn, row.get(1))
-                        .await?
-                        .map(|d| d.source_columns)
-                        .unwrap_or_default();
+                    // Only an aggregate's requirement reads the recorded
+                    // source columns (whether the group basis takes it).
+                    let source_columns =
+                        if matches!(def.key_space, defs::ast::KeySpace::Aggregate { .. }) {
+                            defs::catalog::definition_by_id_in(&*txn, row.get(1))
+                                .await?
+                                .map(|d| d.source_columns)
+                                .unwrap_or_default()
+                        } else {
+                            Default::default()
+                        };
                     source_index_gaps = defs::source_index::gaps(
                         &*txn,
                         &def,
