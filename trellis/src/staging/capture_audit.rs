@@ -61,8 +61,8 @@
 //!   ring segment, `USAGE` (or `UPDATE`) on `staging_change_id_seq`, which
 //!   the segments' `change_id` default draws from, `USAGE` (or `SELECT`) on
 //!   `ring_slot_mirror`, which `pg_sequence_last_value` reads, and `SELECT`
-//!   on the captured table, which the function re-reads every row it
-//!   captures from (#623 D8a). The ring's owner holds them all (the schema's `USAGE` through a grant
+//!   on the captured table, which the function re-reads when another write
+//!   to the table ran in the same statement (#623 D8a). The ring's owner holds them all (the schema's `USAGE` through a grant
 //!   or membership in the schema's owner, if it isn't that role) unless
 //!   someone revokes them; a superuser always does.
 //!
@@ -87,9 +87,11 @@
 //! and go, and the staging worker's reconcile pass widens or replaces the
 //! functions (holding back a definition until its columns are imaged), so a
 //! mismatch there is the normal state between two passes, not a fault. The
-//! same pass also repairs a missing or disabled trigger, so a fault this
-//! audit reports persists only while no staging worker runs, or while the
-//! pass can't land (its lock waits and failures are on `Trellis::status`).
+//! same pass pauses the readers of a plain table whose trigger is missing or
+//! disabled, and reinstalls one on a partitioned source's node or on a table
+//! a restore brought back that way, so a fault this audit reports on a live
+//! definition persists only while no staging worker runs, or while the pass
+//! can't land (its lock waits and failures are on `Trellis::status`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;

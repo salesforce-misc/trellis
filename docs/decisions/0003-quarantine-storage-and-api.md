@@ -132,9 +132,8 @@ needs pausing, as the per-column tier does.
     is left out in turn, and every one whose absence lets the record apply is
     charged: it is in every failing combination. When no one is (two separate
     failing pairs, say), the record is charged to nobody, as a failure only two
-    records reproduce together is, and the page is a drain holdup (known
-    correctness gap
-    [A change only two separate pairs of definitions fail on together](../known-correctness-gaps.md#24-a-change-only-two-separate-pairs-of-definitions-fail-on-together)).
+    records reproduce together is, and the page is a drain holdup
+    ([operations — A page that fails only for several definitions together](../operations.md#a-page-that-fails-only-for-several-definitions-together)).
   * Each probe counts toward the isolation's probe limit. At the limit, a
     record is charged to the transforms its probes had pinned, and to every
     relationship's readers it hadn't probed yet; a probe that hits a transient
@@ -227,8 +226,8 @@ Settled parameters:
 * **Propagation** — tripping either fuse cascades the pause to 1-1 downstream
   transforms reading the paused column, so no downstream reader silently consumes
   a frozen value. The column-level fuse only ever freezes a column of a 1-1
-  transform, and the cascade stops at aggregates (known correctness gap
-  [A paused column doesn't pause the aggregates that read it](../known-correctness-gaps.md#19-a-paused-column-doesnt-pause-the-aggregates-that-read-it)). Each reader's pause
+  transform, and the cascade stops at aggregates
+  ([known correctness gaps — An aggregate reading a paused column](../known-correctness-gaps.md#an-aggregate-reading-a-paused-column)). Each reader's pause
   commits in a transaction of its own, fenced against its writers in flight, so
   a cascade can fail part-way. The walk is idempotent: it walks on through a
   reader that is paused already, so running it again reaches the readers the
