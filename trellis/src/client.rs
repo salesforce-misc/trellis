@@ -1132,7 +1132,7 @@ async fn complete_pause_cascades(pool: &Pool) {
 
 /// The [`ClientError`] for a capture pass that couldn't run at all. Only
 /// reading the catalog fails a pass; a table's own failure is in its outcome.
-fn capture_pass_error(err: CaptureError) -> ClientError {
+pub(crate) fn capture_pass_error(err: CaptureError) -> ClientError {
     match err {
         CaptureError::Catalog(err) => ClientError::Catalog(err),
         CaptureError::Db(err) => ClientError::Db(err),

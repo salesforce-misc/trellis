@@ -332,7 +332,8 @@ pause are arcs of one lifecycle:
     or REPLICA mode, or was altered; the capture function `<name>` was
     replaced…", and goes on to say that changes made meanwhile may be missing,
     so Trellis can't guarantee the definition is correct, and that a resume
-    reinstalls capture and rebuilds it;
+    reinstalls capture and rebuilds it. The `capture_failure`'s `kind` is
+    `disruption`;
   * the database was restored from a dump and the transform reads a partitioned
     source ([ADR-0017](decisions/0017-partitioned-sources.md)): Trellis's
     recorded partitions name the dump's tables, so nothing is corrected from

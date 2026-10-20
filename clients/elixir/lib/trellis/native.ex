@@ -111,6 +111,7 @@ defmodule Trellis.Native do
 
   def has_live_drain_workers(_handle), do: :erlang.nif_error(:nif_not_loaded)
   def has_live_staging_worker(_handle), do: :erlang.nif_error(:nif_not_loaded)
+  def detect_capture_disruptions(_handle), do: :erlang.nif_error(:nif_not_loaded)
   def watermark_token(_handle), do: :erlang.nif_error(:nif_not_loaded)
   def await_converged(_handle, _token, _timeout_ms), do: :erlang.nif_error(:nif_not_loaded)
 
