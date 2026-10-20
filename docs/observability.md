@@ -329,7 +329,7 @@ pause are arcs of one lifecycle:
     capture of `<table>` was changed outside Trellis: the capture trigger `<name>`
     is gone, was dropped and created again, is disabled, is enabled in ORIGIN
     or REPLICA mode, or was altered; the capture function `<name>` was
-    replaced…", and goes on to say that changes made meanwhile may be missing,
+    replaced…" (on a partitioned source's node, "(on `<node>`)" follows each finding), and goes on to say that changes made meanwhile may be missing,
     so Trellis can't guarantee the definition is correct, and that a resume
     reinstalls capture and rebuilds it;
   * the database was restored from a dump and the transform reads a partitioned

@@ -101,6 +101,20 @@ node, the worst writer commit I saw was 7–56 ms at every size, for about twice
 the total install time. 100 nodes keeps the one-transaction stall within the
 roughly 50 ms writer wait a plain table's install already accepts.
 
+### Each node's triggers are recorded, and maintenance is not a disruption
+
+A trigger disabled, dropped, recreated or altered outside Trellis, or a capture
+function replaced by hand, pauses a partitioned source's readers exactly as it
+does a plain table's (`capture::triggers`). Every install operation records the
+oid, `xmin` and enabled mode of the triggers it made, on the root and on each
+node, in its own transaction, so a larger tree's node-by-node install leaves a
+record for exactly the nodes that carry triggers. The pass checks the recorded
+nodes that are still in the tree. A node that is attached, created, detached or
+dropped is not a recorded node in the tree, so maintenance pauses nothing, and
+the install that adds capture to a new node records it. The rows of a node that
+left the tree are forgotten; a node that returns carrying all five triggers
+`ENABLE ALWAYS` is recorded as found.
+
 ### Capture stages nothing for a table that has left the tree
 
 Each capture function of a partitioned source first compares

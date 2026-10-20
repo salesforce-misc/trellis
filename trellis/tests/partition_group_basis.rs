@@ -1222,20 +1222,17 @@ async fn a_complement_whose_hash_middle_is_dropped_completes_and_converges() {
     assert!(fx.queue().await.is_empty());
 }
 
-/// Only an install that adds nodes new to the recorded tree is left to the
-/// corrections: a recorded leaf whose capture was switched off by hand is
-/// repaired by the reinstall's rebuild, as for any table. The in-place
-/// rebuild over a partitioned source (one statement per partition) is
-/// #1101's open part, so its sweep job halts the definition.
+/// A recorded leaf whose capture was switched off by hand is a disruption
+/// (#707, #1200): the reader pauses, nothing is reinstalled or rebuilt, and
+/// the install's new-nodes shortcut is for nodes the recorded tree never
+/// held.
 #[tokio::test]
-async fn a_recorded_leaf_whose_capture_was_switched_off_is_rebuilt() {
+async fn a_recorded_leaf_whose_capture_was_switched_off_pauses_the_reader() {
     let mut fx = Fx::start(&tree("range"), SEED).await;
     fx.exec("alter table public.items_p1 disable trigger all")
         .await;
     fx.pass().await;
     assert!(fx.queue().await.is_empty(), "no lifecycle operation");
-    assert_eq!(fx.status().await, "backfilling");
-    trellis::staging::build::settle_builds(fx.d.pool()).await;
     assert_eq!(fx.status().await, "paused");
     let jobs =
         fx.d.rows(
@@ -1244,11 +1241,15 @@ async fn a_recorded_leaf_whose_capture_was_switched_off_is_rebuilt() {
                                     where target_table = 'public.agg')",
         )
         .await;
-    assert_eq!(jobs.len(), 1, "the sweep job alone: {jobs:?}");
-    assert!(
-        jobs[0].contains("sweep: ") && jobs[0].contains("a rebuild over a partitioned source"),
-        "{jobs:?}"
-    );
+    assert!(jobs.is_empty(), "no rebuild starts: {jobs:?}");
+    let disabled =
+        fx.d.rows(
+            "select count(*)::text from pg_trigger \
+             where tgrelid = 'public.items_p1'::regclass and tgenabled <> 'A' \
+               and tgname like 'trellis_capture_%'",
+        )
+        .await;
+    assert_eq!(disabled, ["(5)"], "nothing reinstalls");
 }
 
 /// #1147: a new leaf, empty or loaded before its capture, is corrected in the

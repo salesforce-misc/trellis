@@ -107,7 +107,7 @@ These are the tools the entries refer to:
 |---|---|---|---|---|
 | 1 | `ALTER COLUMN … TYPE … USING` that rewrites values, with a metadata change to the same column in the same pass window, on a column added with a constant default whose table hasn't been rewritten since, on a column with a compression method set, or as a widening no copy outgrows | yes | `self_check` (1-1 targets only) | none; documented |
 | 3 | A source key re-collated while a `self_check` job runs | the job can skip or repeat keys | no | none filed |
-| 5 | A table attached to a hierarchy and detached, or a capture function replaced and restored, between two reconcile passes; capture changed outside Trellis on a partitioned source, once partitioned sources are supported (#897) | yes | `self_check` (1-1 targets only) | #707 (partitioned sources); otherwise none; documented |
+| 5 | A table attached to a hierarchy and detached, or a capture function replaced and restored, between two reconcile passes | yes | `self_check` (1-1 targets only) | none; documented |
 | 8 | A manual change inside Trellis's artifacts: a target or hidden table edited or dropped, DML, DDL or a data load into Trellis's schema, or a restore of that schema alone | yes | `self_check` (1-1 and `JOIN` targets, and a `JOIN`'s hidden tables); a missing ledger or group-delta table refuses a resume; a change to Trellis's schema: no | none; documented |
 | 9 | An application trigger re-keying a parent's join column within the statement | yes | no | #1115 removes relationships |
 | 10 | `REGEXP_COUNT` on `"C"`-collated data or with Postgres-only regex syntax | yes | `self_check` (1-1 targets only) | #643, with #575 |
@@ -204,13 +204,14 @@ build that straddles the change is pinned to the collation it planned under
 
 ## 5. Changes the capture pass can't see between two passes
 
-Trellis pauses the readers of a plain table whose capture triggers or
+Trellis pauses the readers of a table (plain, or a partitioned source and
+any node of its tree) whose capture triggers or
 functions were changed outside Trellis, or whose table is gone from its name,
 as soon as a pass sees it
 ([capture by triggers](staging-and-claiming/01-capture-by-triggers.md#capture-changed-outside-trellis)).
 It compares the live triggers' oids, `xmin`s and enabled modes with what it
 recorded when it installed them, so a disable and re-enable by name between
-two passes is seen. Three cases are still silent.
+two passes is seen. Two cases are still silent.
 
 **Trigger:**
 
@@ -229,11 +230,6 @@ two passes is seen. Three cases are still silent.
 * A capture function replaced by hand and put back between two passes. The
   trigger rows don't change, and the function is whole again when the pass
   looks.
-* Capture changed outside Trellis on a **partitioned source**, once
-  partitioned sources are supported (#897). Its tree's nodes come and go with
-  partition maintenance and aren't recorded, so the pass reinstalls a missing
-  or disabled trigger (and queues the corrections ADR-0017 defines for a new
-  leaf), but pauses nobody for it.
 
 **Effect:** the writes made while capture was off never reach Trellis.
 Targets stay wrong until each affected row is written again, with nothing on
@@ -242,8 +238,7 @@ status.
 **Detected?** Not by the pass. `self_check`'s comparison reports the stale
 rows on 1-1 targets.
 
-**Planned work:** #707 records and checks a partitioned source's triggers
-too. None for the other two cases; documented.
+**Planned work:** none; documented.
 
 **Repair:** `request_backfill` the table, or `PAUSE`/`RESUME` its readers.
 Better still, don't disable the capture triggers
@@ -259,11 +254,10 @@ Better still, don't disable the capture triggers
   the catalog schema (a group-basis aggregate's partials table `agg_<id>`; a
   `JOIN`'s `P`, `M`, `J` and `T` tables and its one-row lock table, named
   `join_<id>_p`, `_m`, `_j`, `_t` and `_l`).
-* Replacing a capture function and putting it back between two passes, or
-  disabling or dropping the capture triggers on a partitioned source
+* Replacing a capture function and putting it back between two passes
   ([entry 5](#5-changes-the-capture-pass-cant-see-between-two-passes)). A
-  function replaced and left that way, and the triggers of a plain table,
-  pause the readers.
+  function replaced and left that way, and the triggers of a table or of any
+  node of a partitioned source, pause the readers.
 * DML, DDL or a data load into Trellis's own schema, such as loading another
   database's `partition_sources` rows into the catalog.
 * Restoring only the Trellis schema.
