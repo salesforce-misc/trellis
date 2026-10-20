@@ -296,8 +296,8 @@ restarts, so it doesn't take the table's lock every pass.
 
 A value written between the source's `ALTER` and that re-type fails its write (`22001`
 or `22003`), and its key may be held. One whose characters past the old `varchar`
-length are all spaces is stored truncated instead, and stays so (known correctness gap
-[A value padded with spaces past a widened `varchar`'s old length, drained before Trellis re-types its copy](../known-correctness-gaps.md#23-a-value-padded-with-spaces-past-a-widened-varchars-old-length-drained-before-trellis-re-types-its-copy)).
+length are all spaces is stored truncated instead, and stays so
+([known correctness gaps — A space-padded value truncated after a `varchar` widening](../known-correctness-gaps.md#a-space-padded-value-truncated-after-a-varchar-widening)).
 The re-type's transaction records a release request for each definition with a column
 on the table (`retype_releases`).
 After the pass, the staging worker releases each key such a definition holds whose

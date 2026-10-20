@@ -3896,7 +3896,8 @@ async fn an_alter_adding_a_reader_of_another_definitions_paused_column_pauses_it
 
 /// An aggregate defined while a column it reads is paused is not paused:
 /// column pauses stop at aggregates whenever the aggregate was defined
-/// (known correctness gap 19), so define records nothing for it.
+/// (`docs/known-correctness-gaps.md`, an aggregate reading a paused column), so
+/// define records nothing for it.
 #[tokio::test]
 async fn an_aggregate_defined_over_a_paused_column_is_not_paused() {
     let cluster = TestCluster::start();

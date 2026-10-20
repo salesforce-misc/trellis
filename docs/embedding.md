@@ -123,9 +123,11 @@ So:
   as owner unless someone revokes them: `USAGE` on the schema, `INSERT` on the
   ring segments (`seg_0` to `seg_3`), `USAGE` and `UPDATE` on
   `staging_change_id_seq`, `USAGE` and `SELECT` on `ring_slot_mirror`, and
-  `SELECT` on each captured table (the functions re-read it). Revoking one is
-  loud: writes to the captured table fail, naming the capture function, and
-  `self_check` reports it.
+  `SELECT` on each captured table (the functions re-read it when another
+  write to the table ran in the same statement). Revoking one is loud:
+  writes to the captured table that need it fail, naming the capture
+  function, a drain or build refused a read halts the definitions it reaches,
+  and `self_check` reports it.
 * **Tables Trellis can read.** Row-level security that applies to the Trellis
   role, a logical-replication subscription into a source, a source without a
   primary key, and a partitioned table or a table in a partition or
@@ -154,9 +156,8 @@ So:
   or `SET SCHEMA`), a bulk load with triggers disabled, a fixture load that
   runs `ENABLE TRIGGER ALL` (Rails' `disable_referential_integrity`,
   `pg_restore --disable-triggers`). `self_check` reports a broken capture as
-  a `capture` divergence before it compares any rows (known correctness gaps:
-  [Operator changes inside Trellis-owned artifacts](known-correctness-gaps.md#8-operator-changes-inside-trellis-owned-artifacts),
-  [Changes the capture pass can't see between two passes](known-correctness-gaps.md#5-changes-the-capture-pass-cant-see-between-two-passes)).
+  a `capture` divergence before it compares any rows
+  ([known correctness gaps — Capture disrupted and restored between two passes](known-correctness-gaps.md#capture-disrupted-and-restored-between-two-passes)).
 * **A long transaction can delay the triggers' install.** Installing or
   widening a table's triggers needs a brief table lock, which the worker
   retries every pass while a long transaction or an autovacuum holds the
@@ -682,10 +683,16 @@ migration of its own, not a second define.
 A schema dump carries a definition only when the dump appends it. `pg_dump
 --schema-only` writes the Trellis schema, the capture triggers and the target
 tables, but a definition is a row in Trellis's own tables, which it doesn't
-write. A database loaded from such a dump would have target tables and no
-transforms, and defining one would fail with a `conflict` error because its
-table exists. So a dump appends the rows after the `pg_dump` output, the way
-Rails and Ecto append the `schema_migrations` rows.
+write. A database loaded from such a dump has target tables and no
+transforms, and it fails loudly: `Trellis::migrate` fails, because the dump
+carries Trellis's tables without its migration history; every application
+write to a captured source fails in its capture function, because the dump
+carries the triggers without the rows capture needs, until a staging
+worker's pass removes the triggers and leaves the target tables as plain
+tables nothing maintains; and defining a transform again fails with a
+`conflict` error because its table exists. So
+a dump appends the rows after the `pg_dump` output, the way Rails and Ecto
+append the `schema_migrations` rows.
 `dump_definitions_sql` (Rust `Trellis` and `BlockingTrellis`, Ruby
 `Trellis::Instance#dump_definitions_sql`) returns them as SQL: Trellis's
 migration history, the instance marker, the transform and relationship
@@ -703,8 +710,9 @@ the source rows.
   schemas and target schemas to the `pg_dump`. `db:schema:load`, `db:prepare`
   and `maintain_test_schema!` then load them with the tables. See the
   [Ruby README](../clients/ruby/README.md#schema-dumps).
-* **Ecto** doesn't append them yet: build a database that needs its
-  transforms by running the migrations (`mix ecto.migrate`).
+* **Ecto** appends them through `mix trellis.dump` (below). A plain `mix
+  ecto.dump`, without the alias, writes a dump with no definitions, and
+  gives no warning.
 * **Your own dump** appends `dump_definitions_sql` to a `pg_dump --schema-only`
   of the Trellis schema and the schemas it maintains. `pg_dump` and
   `dump_definitions_sql` read separate snapshots, so a define or drop that
@@ -1026,7 +1034,7 @@ let report = loop {
   longer live, its target no longer caught up, or its capture broken partway
   ends there with what it had found, `truncated`.
 * **A target `self_check` can't compare**
-  ([known gap 16](known-correctness-gaps.md#16-self_check-audits-1-1-targets-only)),
+  ([known correctness gaps — What `self_check` can't see](known-correctness-gaps.md#what-self_check-cant-see)),
   or an unknown name, is refused by the call that would start the job.
 
 In Ruby the job is a `Trellis::SelfCheckJob` (`finished?` says whether to stop

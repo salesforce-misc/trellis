@@ -33,7 +33,7 @@ segment with one `INSERT … SELECT`:
   `capture_failure`, and installs or changes no capture on it. A resume
   refuses until the table is plain again. A table that joins and leaves a
   hierarchy between two passes is never seen
-  ([known gap 5](../known-correctness-gaps.md#5-changes-the-capture-pass-cant-see-between-two-passes)).
+  ([known correctness gaps — Capture disrupted and restored between two passes](../known-correctness-gaps.md#capture-disrupted-and-restored-between-two-passes)).
   A relationship's to-side is captured while some definition reads the
   relationship's from-side, whether or not one reads through the
   relationship, so the pass can find a to-side in a hierarchy with nobody to
@@ -342,7 +342,8 @@ what to do. Nothing clears it but a deliberate `RESUME`, or a drop.
 The fourth check has one exception, which pauses nothing (#824). When every
 widened column of a table Trellis created widened by changing only the
 catalog, the pass re-types that table's columns itself. Only a 1-1 target's
-copies and a relationship projection's can: Trellis types every other
+copies, a `JOIN`'s `GROUP BY` and `ON` copies (in its target and its hidden
+tables) and a relationship projection's can: Trellis types every other
 column by value family or by an expression, with no length or precision. The widenings that qualify
 are exactly `varchar(n)` to a longer `varchar(m)`, `varchar(n)` or
 `varchar` to `text`, `varchar(n)` to `varchar`, and `numeric(p,s)` to a
@@ -366,9 +367,7 @@ the worker restarts.
 A value written after the source widened and before the pass re-typed the
 column failed its write with `22001` (too long) or `22003` (numeric
 overflow), and its key may be held. One whose excess characters are all
-spaces was stored truncated instead, which nothing repairs ([known
-correctness gaps, entry
-23](../known-correctness-gaps.md#23-a-value-padded-with-spaces-past-a-widened-varchars-old-length-drained-before-trellis-re-types-its-copy)).
+spaces was stored truncated instead, which nothing repairs ([known correctness gaps — A space-padded value truncated after a `varchar` widening](../known-correctness-gaps.md#a-space-padded-value-truncated-after-a-varchar-widening)).
 The re-type's transaction records a release request (`retype_releases`) for
 each definition with a column on the table. After the pass, the staging
 worker releases every key such a definition holds whose failure had that
@@ -565,15 +564,21 @@ them:
   - row-level security applying to Trellis's roles, a subscription into a
     source, or a source joining a partition or inheritance hierarchy.
 - **Missed, and documented** in
-  [known correctness gaps](../known-correctness-gaps.md): a `USING`
-  rewrite with a metadata change to the same column in the same window, on
-  a column added with a constant default whose table no rewrite has touched
-  since (the rewrite clears the default the column's row keeps for older
-  rows, as `VACUUM FULL` does), on a column with a compression method set
-  (the `ALTER` resets it), or as a pure widening no copy outgrows; a table
-  attached to a hierarchy and detached between two passes; a capture
-  function replaced and restored by hand between two passes; capture
-  changed outside Trellis on a partitioned source.
+  [known correctness gaps](../known-correctness-gaps.md#a-columns-values-rewritten-in-place-by-alter-column-type):
+  a `USING` rewrite with a metadata change to the same column in the same
+  window; one on a column added with a constant default whose table no
+  rewrite has touched since (the rewrite clears the default the column's row
+  keeps for older rows, as `VACUUM FULL` does); one on a column with a
+  compression method, a storage mode or a non-default collation set (the
+  `ALTER` resets each); a pure widening no copy outgrows; and a column read
+  by `MIN` or `MAX` re-collated, since a field column's collation isn't part
+  of what the pass compares. Between two passes
+  ([known correctness gaps](../known-correctness-gaps.md#capture-disrupted-and-restored-between-two-passes)):
+  a table attached to a hierarchy, or given an inheritance child, and
+  detached or the child dropped; a capture function replaced and restored by
+  hand; a disruption a restore or `pg_upgrade` records before a pass sees
+  it; a subscription that gains the table and loses it; capture changed
+  outside Trellis on a partitioned source.
 
 A few routine operations rebuild for nothing, at the cost of one re-read: a
 rewrite that leaves the values as they were (`USING b + 0`, or a column
@@ -664,6 +669,22 @@ Otherwise it images the transition tables and reads no relation, so a
 statement nothing else touched takes no predicate lock on the table. The
 inexact cases all err towards re-reading: a disabled or missing begin
 trigger makes every capture re-read (and the capture audit reports it).
+
+The re-read runs under the writing session's `row_security`, so a policy
+that comes to apply to the ring's owner hides rows from it, and a hidden row
+reads as gone: the capture stages a delete for a row that still exists.
+Setting `row_security` in the capture functions would turn the policy into a
+failed application write instead. A target that reads the table directly
+doesn't show the wrong delete: a 1-1 or ledger apply re-reads a delete's row
+live as the drain's role, which is either exempt from the policy and reads
+the row, or refused, which halts the definition, and the group basis sums
+the statement's own transition rows. A to-one relationship's projection
+applies the delete, though, so until the next pass a 1-1 field read through
+the relationship reads the parent as gone
+([known correctness gaps](../known-correctness-gaps.md#a-to-side-row-hidden-from-capture-by-a-new-policy)).
+The next reconcile pass pauses the table's readers
+([transforms — Supported sources and targets](../transforms.md#supported-sources-and-targets)),
+and their `RESUME` refreshes the projection.
 
 One write isn't a statement of its own: the update a foreign key's action
 makes (`ON UPDATE CASCADE`, `SET NULL` or `SET DEFAULT`, or `ON DELETE SET
