@@ -365,7 +365,7 @@ mod tests {
     #[test]
     fn every_capture_failure_kind_word_is_in_the_load_time_set_once() {
         let names = capture_failure_kind_names();
-        assert_eq!(names, vec!["capture", "halt"]);
+        assert_eq!(names, vec!["capture", "halt", "disruption"]);
         for kind in CaptureFailureKind::ALL {
             assert!(names.contains(&kind.as_str()));
         }

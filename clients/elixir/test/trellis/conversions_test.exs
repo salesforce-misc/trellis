@@ -58,7 +58,7 @@ defmodule Trellis.ConversionsTest do
     assert Trellis.Native.divergence_kinds() ==
              {:ok, [:cell, :missing_row, :extra_row, :missing_column, :extra_column, :capture]}
 
-    assert Trellis.Native.capture_failure_kinds() == {:ok, [:capture, :halt]}
+    assert Trellis.Native.capture_failure_kinds() == {:ok, [:capture, :halt, :disruption]}
   end
 
   test "a self-check report's divergences become structs" do

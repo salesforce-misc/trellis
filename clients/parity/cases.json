@@ -181,6 +181,7 @@
     {"about": "An unknown target's status is nil (Rust's None), not an error.", "op": "status", "args": ["parity_prices"], "expect": null},
     {"op": "has_live_drain_workers", "expect": {"eq": false}},
     {"op": "has_live_staging_worker", "expect": {"eq": false}},
+    {"about": "A healthy instance has no disrupted capture to pause.", "op": "detect_capture_disruptions", "expect": {"list": []}},
 
     {"about": "The quarantine reads name a transform, so an unknown one is not_found rather than empty.", "op": "quarantine_status", "args": ["parity_nowhere"], "expect": {"error": "not_found"}},
     {"op": "sample_quarantined", "args": ["parity_nowhere"], "expect": {"error": "not_found"}},

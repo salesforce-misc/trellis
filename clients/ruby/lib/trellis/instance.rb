@@ -69,7 +69,7 @@ module Trellis
   # - Quarantine: quarantined, quarantine_status, sample_quarantined,
   #   poisoned_since, release_key. Pausing and resuming are statements:
   #   instance.apply("RESUME TRANSFORM order_totals.total").
-  # - Operations: request_backfill, has_live_drain_workers?,
+  # - Operations: request_backfill, detect_capture_disruptions, has_live_drain_workers?,
   #   has_live_staging_worker?, the read-your-writes pair watermark_token and
   #   await_converged, and the audit self_check, a background job that
   #   self_check_job reads back.
@@ -414,6 +414,20 @@ module Trellis
     # backfills) is alive anywhere in the fleet. The other half of the health check.
     def has_live_staging_worker?
       handle.has_live_staging_worker
+    end
+
+    # Pauses, now, the definitions that read a table whose Trellis capture
+    # was changed outside Trellis (a trigger disabled, dropped or recreated, a
+    # capture function replaced, the table gone), and returns the qualified
+    # names of those tables. The staging worker's reconcile pass does the same
+    # on its own cadence, with a CaptureFailure of kind :disruption on each
+    # paused definition's status; this is for a caller that has just done
+    # something that disrupts capture, like a fixture load, and needs the
+    # readers paused before it goes on. Installs, repairs and rebuilds
+    # nothing, and resuming is still the caller's (Trellis::TestSupport does
+    # it for a test suite). Safe beside a running staging worker.
+    def detect_capture_disruptions
+      handle.detect_capture_disruptions
     end
 
     # A read-your-writes token (an opaque String) covering every write

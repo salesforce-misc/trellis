@@ -929,6 +929,17 @@ fn has_live_staging_worker<'a>(env: Env<'a>, handle: ResourceArc<Handle>) -> Nif
     )
 }
 
+/// Pauses now the readers of every table whose capture was changed outside
+/// Trellis (#1181), and returns the tables.
+#[rustler::nif]
+fn detect_capture_disruptions<'a>(env: Env<'a>, handle: ResourceArc<Handle>) -> NifReply<Term<'a>> {
+    handle.submit(
+        env,
+        BlockingTrellis::start_detect_capture_disruptions,
+        |_, tables| Ok(tables),
+    )
+}
+
 /// A read-your-writes token, as an opaque string.
 #[rustler::nif]
 fn watermark_token<'a>(env: Env<'a>, handle: ResourceArc<Handle>) -> NifReply<Term<'a>> {

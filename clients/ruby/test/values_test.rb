@@ -221,6 +221,6 @@ class ValuesTest < Minitest::Test
     assert_equal %i[converged not_caught_up not_live diverged], Trellis::Native.self_check_outcomes
     assert_equal %i[cell missing_row extra_row missing_column extra_column capture],
                  Trellis::Native.divergence_kinds
-    assert_equal %i[capture halt], Trellis::Native.capture_failure_kinds
+    assert_equal %i[capture halt disruption], Trellis::Native.capture_failure_kinds
   end
 end

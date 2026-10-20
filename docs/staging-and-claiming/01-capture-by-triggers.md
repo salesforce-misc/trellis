@@ -526,6 +526,14 @@ or `pg_upgrade`, which recreates every trigger under a new oid). The pass
 forgets them and records the live triggers. New trigger oids under the same
 values are a recreation in this database: that pauses.
 
+The pause is recorded in `capture_failures` with `kind` `disruption`, so a
+tool can tell it from an operator's `PAUSE` and from every other failure. An
+operator-paused definition gets no record: it already waits for a `RESUME`,
+which rebuilds. `Trellis::detect_capture_disruptions` runs this check
+(`capture::reconcile::detect_disruptions`) on the caller's connection and
+pauses the same readers, installing and repairing nothing, so a caller that
+has just loaded data needn't wait for the next pass.
+
 The pause is immediate (one pass, no threshold) and holds until `RESUME`,
 which refuses while the table is missing, re-validates the definition against
 the table now at that name (it may be a different table), forgets the record,

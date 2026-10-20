@@ -267,6 +267,9 @@ async fn run_cases(cases: &[Case]) {
             for reader in ["r", "s"] {
                 let status = trellis.status(&format!("{reader}_{id}")).await.unwrap();
                 let status = status.expect("the reader exists");
+                if let Some(f) = &status.capture_failure {
+                    assert_eq!(f.kind, trellis::CaptureFailureKind::Disruption, "{id}");
+                }
                 now.push((status.status, status.capture_failure.map(|f| f.error)));
             }
             reasons.push(now);
@@ -805,4 +808,58 @@ async fn a_real_dump_and_restore_pauses_nothing() {
             "the application schema alone: {t}"
         );
     }
+}
+
+/// `detect_capture_disruptions` (#1181) pauses the readers of a disrupted
+/// table at once, on the caller's connection, with no staging-worker pass,
+/// and names the table. A healthy instance finds nothing.
+#[tokio::test]
+async fn detect_capture_disruptions_pauses_readers_without_a_pass() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
+    create_case_tables(&raw, &trellis, &["dd".to_string(), "ok".to_string()]).await;
+    bring_live(&mut raw, &db.pool).await;
+    let app = connect(db.dsn()).await;
+
+    assert_eq!(
+        trellis.detect_capture_disruptions().await.unwrap(),
+        Vec::<String>::new()
+    );
+
+    // An operator's pause is the operator's: a disruption records nothing on
+    // it, so a helper that resumes disruptions never resumes it.
+    trellis.apply("PAUSE TRANSFORM r_dd").await.unwrap();
+
+    // What a fixture load leaves: disabled for the load, then ORIGIN.
+    app.batch_execute("alter table public.t_dd disable trigger all")
+        .await
+        .unwrap();
+    app.batch_execute("alter table public.t_dd enable trigger all")
+        .await
+        .unwrap();
+    assert_eq!(
+        trellis.detect_capture_disruptions().await.unwrap(),
+        vec!["public.t_dd".to_string()]
+    );
+    let statuses = statuses(&raw).await;
+    assert_eq!(statuses["r_dd"], TransformStatus::Paused);
+    assert_eq!(statuses["s_dd"], TransformStatus::Paused);
+    assert_eq!(statuses["r_ok"], TransformStatus::Live);
+    let failure = trellis
+        .status("s_dd")
+        .await
+        .unwrap()
+        .and_then(|s| s.capture_failure)
+        .expect("a capture failure");
+    assert_eq!(failure.kind, trellis::CaptureFailureKind::Disruption);
+    let operator = trellis.status("r_dd").await.unwrap().unwrap();
+    assert_eq!(operator.status, TransformStatus::Paused);
+    assert_eq!(operator.capture_failure, None);
+    // Asking again finds it again, and pauses nothing more.
+    assert_eq!(
+        trellis.detect_capture_disruptions().await.unwrap(),
+        vec!["public.t_dd".to_string()]
+    );
 }

@@ -273,6 +273,34 @@ pub(crate) async fn pause_for_capture_failure(
     pause_with_record(txn, id, source_table, columns, error, "capture", caused_by).await
 }
 
+/// Pauses definition `id` because Trellis's capture of a table it reads was
+/// changed outside Trellis, or the table is gone (#707, #999). The record's
+/// `kind` is `disruption`, which is what a test helper selects to resume
+/// exactly these (#1181). Returns whether this call paused it.
+///
+/// A definition that isn't dispatchable already waits for a resume (an
+/// operator's `PAUSE`, say), and a resume rebuilds it from the tables as they
+/// are then, so it gets no record: it stays the operator's pause, and a
+/// helper that resumes disruptions never resumes it.
+pub(crate) async fn pause_for_disruption(
+    txn: &Transaction<'_>,
+    id: i64,
+    source_table: &str,
+    error: &str,
+) -> Result<bool, CatalogError> {
+    let dispatchable = txn
+        .query_opt(
+            "select 1 from transform_definitions where id = $1 and status = any($2)",
+            &[&id, &TransformStatus::dispatchable()],
+        )
+        .await?
+        .is_some();
+    if !dispatchable {
+        return Ok(false);
+    }
+    pause_with_record(txn, id, source_table, &[], error, "disruption", None).await
+}
+
 /// Pauses definition `id` because it was written under a grammar version
 /// outside this binary's window (ADR-0018), recording `error` as its
 /// `capture_failure`. Returns whether this call paused it.
