@@ -1892,6 +1892,13 @@ pub async fn alter_transform(
             transform: alter.target.clone(),
         });
     };
+    // The edit is keyed by the bare name throughout, whichever spelling the
+    // statement used.
+    let normalized = AlterTransform {
+        target: current.def.target.clone(),
+        clauses: alter.clauses.clone(),
+    };
+    let alter = &normalized;
     // Re-checked under the row lock below, with the definition's build.
     if !current.status.is_applying() && current.status != TransformStatus::Backfilling {
         return Err(CatalogError::TransformNotLive {
@@ -9003,6 +9010,41 @@ pub(crate) async fn definition_by_id_in(
     }))
 }
 
+/// The one predicate every caller-facing transform name goes through: SQL
+/// over `column` (a `transform_definitions.target_table` expression) true
+/// when it is the transform the text parameter `$param` names. A name
+/// containing a `.` is the schema-qualified spelling `define`/`apply` return
+/// and matches `target_table` exactly (so a wrong schema matches nothing); a
+/// name without one is the bare spelling and matches the table-name suffix.
+/// The suffix is globally unique (`transform_definitions_target_suffix_idx`),
+/// so neither form is ever ambiguous.
+pub(crate) fn target_match_sql(column: &str, param: usize) -> String {
+    format!(
+        "(case when position('.' in ${param}::text) > 0 then {column} = ${param}::text \
+         else split_part({column}, '.', 2) = ${param}::text end)"
+    )
+}
+
+/// The bare table-name suffix of the transform `name` (qualified or bare, see
+/// [`target_match_sql`]) names, or `None` when no transform matches. Entry
+/// points that hand a name on to code keyed by the bare suffix
+/// (`column_status`, the quarantine tables) normalize through this once.
+pub(crate) async fn bare_target_name(
+    client: &impl GenericClient,
+    name: &str,
+) -> Result<Option<String>, CatalogError> {
+    let row = client
+        .query_opt(
+            &format!(
+                "select split_part(target_table, '.', 2) from transform_definitions where {}",
+                target_match_sql("target_table", 1)
+            ),
+            &[&name],
+        )
+        .await?;
+    Ok(row.map(|row| row.get(0)))
+}
+
 /// Reads back one definition by its target table name — [`definition_by_id`]
 /// keyed the other way, for callers that only have the address a `Trellis`
 /// caller would use (`docs/decisions/0003-quarantine-storage-and-api.md`:
@@ -9011,17 +9053,11 @@ pub(crate) async fn definition_by_id_in(
 /// `staging::quarantine`'s column-resume path to reconstruct the
 /// [`super::ast::TransformDef`] whose column it's re-deriving.
 ///
-/// `target_table` is — and, per this doc comment, must stay — the *bare*
-/// name every caller here actually has: a `Trellis` API consumer only ever
-/// knows the bare name their `TRANSFORM <name> FROM ...` text declared (the
-/// grammar has no qualified-target syntax yet — issue #76), and
-/// `docs/decisions/0003-quarantine-storage-and-api.md`'s `transform.column`
-/// addressing scheme parses on the first `.`
-/// (`app::QuarantineTarget::parse`) — a qualified address here
-/// would misparse as a column reference the moment a target table lived
-/// outside the default schema. Matched against `target_table`'s bare
-/// table-name suffix (`split_part`), not the qualified column directly,
-/// since it's been fully-qualified since issue #73.
+/// `target_table` is the name a caller has of the transform: the qualified
+/// `schema.table` that `define`/`apply` return, or the bare table name its
+/// `TRANSFORM <name> FROM ...` text declared ([`target_match_sql`]). A
+/// `transform.column` address is not a transform name; callers split that on
+/// its first `.` before they get here.
 pub async fn definition_by_target(
     pool: &Pool,
     target_table: &str,
@@ -9029,11 +9065,14 @@ pub async fn definition_by_target(
     let client = pool.get().await?;
     let rows = client
         .query(
-            "select t.id, t.source_version, t.definition_text, t.status, t.source_table, \
-                    t.target_table, e.key, e.value, t.grammar_version \
-             from transform_definitions t \
-             left join lateral jsonb_each_text(t.source_columns) e on true \
-             where split_part(t.target_table, '.', 2) = $1",
+            &format!(
+                "select t.id, t.source_version, t.definition_text, t.status, t.source_table, \
+                        t.target_table, e.key, e.value, t.grammar_version \
+                 from transform_definitions t \
+                 left join lateral jsonb_each_text(t.source_columns) e on true \
+                 where {}",
+                target_match_sql("t.target_table", 1)
+            ),
             &[&target_table],
         )
         .await?;

@@ -106,11 +106,10 @@ pub(crate) enum DropOutcome {
 /// pause state whose other half is the poison fuse's
 /// [`crate::staging::quarantine::trip_transform_fuse_if_crossed`].
 ///
-/// `target` is the **bare** transform name, matching every other
-/// operator-facing entry point in this crate
+/// `target` is the transform's name, qualified or bare, as every other
+/// operator-facing entry point in this crate takes it
 /// ([`crate::staging::quarantine::resume_transform`],
-/// [`crate::Trellis::status`]) — see [`super::catalog::definition_by_target`]'s doc comment
-/// for why that, not the qualified spelling, is the addressing scheme.
+/// [`crate::Trellis::status`]); see [`super::catalog::target_match_sql`].
 ///
 /// Idempotent: a definition already [`TransformStatus::Paused`] *or*
 /// [`TransformStatus::Quarantined`] keeps its status and is reported as
@@ -411,6 +410,11 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
         return Ok(DropOutcome::Absent);
     };
     let (id, status, qualified) = (locked.id, locked.status, locked.target_table);
+    // Everything below is keyed by the bare name, whichever spelling the
+    // caller used.
+    let target = qualified
+        .split_once('.')
+        .map_or(qualified.as_str(), |(_, t)| t);
 
     if !status.is_frozen() {
         return Err(CatalogError::TransformNotPaused {
@@ -936,8 +940,11 @@ async fn locked_definition(
 ) -> Result<Option<LockedDefinition>, CatalogError> {
     let row = txn
         .query_opt(
-            "select id, status, target_table from transform_definitions \
-             where split_part(target_table, '.', 2) = $1 for update",
+            &format!(
+                "select id, status, target_table from transform_definitions \
+                 where {} for update",
+                super::catalog::target_match_sql("target_table", 1)
+            ),
             &[&target],
         )
         .await?;

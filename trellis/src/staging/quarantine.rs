@@ -4030,14 +4030,18 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
 
-    // `target` is the bare transform name (matching `resume_column`'s own
-    // `transform` parameter convention), but `transform_definitions.target_table`
-    // is persisted fully-qualified (issue #73) — match on its bare suffix,
-    // the same `split_part(target_table, '.', 2)` pattern
-    // `TargetTableSuffixCollision`'s own check already uses, rather than
-    // requiring every caller to know and pass the qualified identity.
+    // `target` is the transform's name in either spelling
+    // ([`catalog::target_match_sql`]); everything below is keyed by the bare
+    // suffix, so normalize once.
+    let original = target;
+    let Some(target) = catalog::bare_target_name(&*txn, original).await? else {
+        return Err(ApplyError::TransformNotFound {
+            transform: original.to_string(),
+        });
+    };
+    let target = target.as_str();
     let not_found = || ApplyError::TransformNotFound {
-        transform: target.to_string(),
+        transform: original.to_string(),
     };
     let fenced_source: String = txn
         .query_opt(
@@ -5510,7 +5514,18 @@ pub async fn release_key(
     src_table: &str,
     key: &str,
 ) -> Result<usize, ApplyError> {
-    release_key_as(pool, transform, src_table, key, None).await
+    // Either spelling of the transform's name; the release is keyed by the
+    // bare suffix.
+    let bare = {
+        let client = pool.get().await?;
+        catalog::bare_target_name(&**client, transform).await?
+    };
+    let Some(bare) = bare else {
+        return Err(ApplyError::TransformNotFound {
+            transform: transform.to_string(),
+        });
+    };
+    release_key_as(pool, &bare, src_table, key, None).await
 }
 
 /// The automatic retry's release of one held key ([`retry_held_keys`],

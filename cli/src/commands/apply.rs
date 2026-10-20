@@ -34,8 +34,10 @@ quoted shell argument. The statement forms:
   trellis apply 'DROP TRANSFORM post_totals'
   trellis apply 'DROP RELATIONSHIP authors.posts'
 
-A transform is addressed by its bare target-table name, and a dotted address
-means <transform>.<column>. A relationship is always addressed scoped to its
+A transform is addressed by its target table, bare (post_totals) or
+schema-qualified (public.post_totals); PAUSE and RESUME also take
+<transform>.<column>, which names one calculated field. A dotted address that
+is a registered transform's qualified name names that transform. A relationship is always addressed scoped to its
 from-table, since its name is unique only there.
 
 PAUSE and RESUME apply to transforms only: a relationship is a reusable part of

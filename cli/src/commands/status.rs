@@ -126,11 +126,11 @@ async fn report(trellis: &Trellis) -> Result<String, String> {
     let definitions = trellis.definitions().await.map_err(|err| err.to_string())?;
     // `definitions()` doesn't carry a drain failure, the unindexed join
     // columns or the nodes under correction, so each definition's own status
-    // is read for them, by the bare target name `status` takes.
+    // is read for them, by the qualified target name `definitions()` lists.
     let mut listed = Vec::with_capacity(definitions.len());
     for def in definitions {
         let status = trellis
-            .status(bare_target(&def.target_table))
+            .status(&def.target_table)
             .await
             .map_err(|err| err.to_string())?;
         let warnings = status.map_or_else(StatusWarnings::default, |status| StatusWarnings {
@@ -266,14 +266,6 @@ fn format_definitions(definitions: &[(DefinitionSummary, StatusWarnings)]) -> St
             line
         })
         .collect()
-}
-
-/// The bare name [`Trellis::status`] finds a qualified target by: the part
-/// after the first `.` and before any next one, which is how `status` itself
-/// matches it (`split_part(target_table, '.', 2)`), so the two agree even on
-/// a name holding a `.` of its own.
-fn bare_target(qualified: &str) -> &str {
-    qualified.split('.').nth(1).unwrap_or(qualified)
 }
 
 fn format_correcting(node: &CorrectingNode) -> String {
@@ -647,15 +639,6 @@ mod tests {
              correcting public.orders_2026 since=1970-01-01 00:01:00 UTC keys_remaining=1200\n    \
              correcting public.orders_2027 since=1970-01-01 00:01:30 UTC\n"
         );
-    }
-
-    #[test]
-    fn a_target_is_polled_by_the_bare_name_status_matches() {
-        assert_eq!(bare_target("public.order_totals"), "order_totals");
-        assert_eq!(bare_target("custom.order_totals"), "order_totals");
-        // `status` matches `split_part(target_table, '.', 2)`.
-        assert_eq!(bare_target("public.a.b"), "a");
-        assert_eq!(bare_target("order_totals"), "order_totals");
     }
 
     #[test]

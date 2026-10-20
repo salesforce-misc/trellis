@@ -410,13 +410,12 @@ each audit (`drain_failures`), whichever target it audits. A holdup clears in
 the transaction that commits its page, so fix the cause the error names; there
 is nothing to resume.
 
-`status` takes the bare target name, the part of `target_table` after the
-schema:
+`status` takes a target's `target_table` as `definitions()` lists it, or the bare
+table name; every call that names a transform takes either form:
 
 ```rust
 for summary in trellis.definitions().await? {
-    let bare = summary.target_table.split('.').nth(1).unwrap_or_default();
-    if let Some(status) = trellis.status(bare).await?
+    if let Some(status) = trellis.status(&summary.target_table).await?
         && let Some(held) = &status.drain_failure
     {
         // The drain has failed on segment `held.seg_seq` since `held.since`,
@@ -435,10 +434,10 @@ in Ruby) and `attempts`:
 ```elixir
 held_up =
   Enum.flat_map(Trellis.definitions!(trellis), fn summary ->
-    bare = summary.target_table |> String.split(".") |> Enum.at(1)
+    case Trellis.status!(trellis, summary.target_table) do
+      %Trellis.Status{drain_failure: %Trellis.DrainFailure{} = held} ->
+        [{summary.target_table, held}]
 
-    case Trellis.status!(trellis, bare) do
-      %Trellis.Status{drain_failure: %Trellis.DrainFailure{} = held} -> [{bare, held}]
       _ -> []
     end
   end)
@@ -446,9 +445,8 @@ held_up =
 
 ```ruby
 held_up = Trellis.definitions.filter_map do |summary|
-  bare = summary.target_table.split(".")[1]
-  held = Trellis.status(bare)&.drain_failure
-  [bare, held] if held
+  held = Trellis.status(summary.target_table)&.drain_failure
+  [summary.target_table, held] if held
 end
 ```
 
@@ -469,8 +467,7 @@ the field:
 
 ```rust
 for summary in trellis.definitions().await? {
-    let bare = summary.target_table.split('.').nth(1).unwrap_or_default();
-    if let Some(status) = trellis.status(bare).await? {
+    if let Some(status) = trellis.status(&summary.target_table).await? {
         for join in &status.unindexed_joins {
             // `join.fix()`: "create an index on public.orders (customer_id)"
         }

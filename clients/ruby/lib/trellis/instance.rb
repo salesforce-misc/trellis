@@ -82,8 +82,12 @@ module Trellis
   # runs out of time a Trellis::TimeoutError.
   #
   # Conventions: times are Times in UTC, at microsecond precision; a
-  # quarantine target is an address string, a transform's bare target table
-  # name ("order_totals") or "transform.column" ("order_totals.total"); the
+  # transform is named by its target table, bare ("order_totals") or qualified as
+  # #define returns it ("public.order_totals"), wherever a call takes one (#status,
+  # #quarantine_status, #sample_quarantined, #release_key, #self_check and the
+  # PAUSE, RESUME, DROP and ALTER statements); a quarantine target is an
+  # address string, a transform's name or "transform.column"
+  # ("order_totals.total", always the bare transform); the
   # cursor sample_quarantined returns, and watermark_token's token, are opaque
   # strings to pass back unchanged; and every symbol in a result comes from a
   # closed set, never from a string the database returned.
@@ -244,7 +248,7 @@ module Trellis
     # Registers a transform from a `TRANSFORM` statement, creates its target
     # table, and returns the target table (fully qualified, "schema.table"),
     # at :waiting_to_backfill. Its backfill runs in the background: poll
-    # #status with the bare table name (the part after the schema) for :live.
+    # #status with the returned name for :live.
     #
     # Only a `TRANSFORM` statement: any other form (DROP, PAUSE, ...) raises
     # ValidationError without being applied, and a statement that doesn't
@@ -278,8 +282,10 @@ module Trellis
       Applied.from_native(handle.apply(statement))
     end
 
-    # The Status of the definition writing target_table (a bare table name,
-    # without its schema), or nil when none does.
+    # The Status of the definition writing target_table, or nil when none
+    # does. target_table is either the fully qualified name #define and #apply
+    # return ("public.order_totals") or the bare table name ("order_totals");
+    # a qualified name with another schema matches nothing.
     def status(target_table)
       string!("the target table", target_table)
       hash = handle.status(target_table)

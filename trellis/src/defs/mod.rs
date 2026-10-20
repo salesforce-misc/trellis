@@ -1348,11 +1348,10 @@ mod statement_grammar_tests {
         );
     }
 
-    /// The addressing fork issue #228 left open: `PAUSE TRANSFORM a.b` is the
-    /// same token shape as a schema-qualified table reference, and this grammar
-    /// reads it as `<transform>.<column>` — the only reading the engine can
-    /// resolve, since a transform's operator-facing identity is its bare target
-    /// name everywhere below the facade.
+    /// `PAUSE TRANSFORM a.b` is the same token shape as a schema-qualified
+    /// table reference. The grammar reads it as `<transform>.<column>`; the
+    /// facade resolves `a.b` to the transform `a.b` when that is a registered
+    /// qualified name (`Trellis::apply`).
     #[test]
     fn a_dotted_transform_address_is_a_column_not_a_schema() {
         assert_eq!(
@@ -1374,22 +1373,40 @@ mod statement_grammar_tests {
         };
         assert_eq!(statement, "PAUSE TRANSFORM");
         assert_eq!(address, "reporting.order_totals.total");
-        assert!(err.to_string().contains("bare target table"), "{err}");
+        assert!(err.to_string().contains("<schema>.<table>"), "{err}");
     }
 
-    /// Decision 2's other half: `DROP` is whole-definition only.
+    /// `DROP` is whole-definition only, so a dotted address is the
+    /// transform's qualified name, never `<transform>.<column>`.
     #[test]
-    fn drop_refuses_a_column_address() {
-        let err = parse_statement("DROP TRANSFORM order_totals.total").unwrap_err();
-        let ParseError::MalformedDefinitionAddress {
-            statement, address, ..
-        } = &err
-        else {
-            panic!("expected a malformed-address error, got {err:?}");
-        };
-        assert_eq!(statement, "DROP TRANSFORM");
-        assert_eq!(address, "order_totals.total");
-        assert!(err.to_string().contains("ALTER TRANSFORM"), "{err}");
+    fn drop_reads_a_dotted_address_as_a_qualified_name() {
+        assert_eq!(
+            parse_statement("DROP TRANSFORM public.order_totals").unwrap(),
+            Statement::Drop(DefinitionRef::Transform("public.order_totals".to_string()))
+        );
+        assert_eq!(
+            parse_statement("DROP TRANSFORM order_totals").unwrap(),
+            Statement::Drop(DefinitionRef::Transform("order_totals".to_string()))
+        );
+        let err = parse_statement("DROP TRANSFORM a.b.c").unwrap_err();
+        assert!(
+            matches!(&err, ParseError::MalformedDefinitionAddress { address, .. } if address == "a.b.c"),
+            "{err:?}"
+        );
+    }
+
+    /// `ALTER TRANSFORM` takes the qualified name `apply` returns, too.
+    #[test]
+    fn alter_accepts_a_qualified_or_bare_target() {
+        for (text, want) in [
+            ("ALTER TRANSFORM public.t ADD a + 1 AS x", "public.t"),
+            ("ALTER TRANSFORM t ADD a + 1 AS x", "t"),
+        ] {
+            let Statement::AlterTransform(alter) = parse_statement(text).unwrap() else {
+                panic!("expected an ALTER for {text}");
+            };
+            assert_eq!(alter.target, want);
+        }
     }
 
     // --- DROP RELATIONSHIP --------------------------------------------------
@@ -1681,7 +1698,7 @@ mod statement_grammar_tests {
             "PAUSE widget_prices",
             "PAUSE RELATIONSHIP widgets.owner",
             "RESUME TRANSFORM",
-            "DROP TRANSFORM widget_prices.price",
+            "DROP TRANSFORM public.widget_prices.price",
             "DROP RELATIONSHIP owner",
             "ALTER TRANSFORM widget_prices",
             "ALTER TRANSFORM widget_prices PAUSE",

@@ -238,6 +238,10 @@
     {"op": "status", "args": ["parity_prices"], "expect": {"record": "Status", "fields": {"backfill_failure": null, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": null}}},
     {"about": "A column that isn't paused is live, with no pause time or error.", "op": "quarantine_status", "args": ["parity_prices.price"], "expect": {"record": "QuarantineEntry", "fields": {"target": {"eq": "parity_prices.price"}, "state": {"word": "live"}, "paused_at": null, "last_error": null}}},
     {"about": "A whole transform reports its lifecycle status as its state.", "op": "quarantine_status", "args": ["parity_prices"], "expect": {"record": "QuarantineEntry", "fields": {"target": {"eq": "parity_prices"}, "state": {"word_in": "transform_status"}, "paused_at": null, "last_error": null}}},
+    {"about": "status(define(...)) round-trips: the qualified name define returned is accepted, and a wrong schema matches nothing (#1168).", "op": "status", "args": ["public.parity_prices"], "expect": {"record": "Status", "fields": {"backfill_failure": null, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": null}}},
+    {"op": "status", "args": ["no_such_schema.parity_prices"], "expect": null},
+    {"about": "The quarantine reads take the qualified name too; it names the whole transform, reported by its bare name.", "op": "quarantine_status", "args": ["public.parity_prices"], "expect": {"record": "QuarantineEntry", "fields": {"target": {"eq": "parity_prices"}, "state": {"word_in": "transform_status"}, "paused_at": null, "last_error": null}}},
+    {"op": "quarantine_status", "args": ["no_such_schema.parity_prices"], "expect": {"error": "not_found"}},
     {"about": "An empty first page has no cursor.", "op": "sample_quarantined", "args": ["parity_prices.price"], "expect": {"record": "SamplePage", "fields": {"samples": {"list": []}, "next_cursor": null}}},
 
     {

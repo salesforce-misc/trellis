@@ -4,7 +4,8 @@ defmodule Trellis.QuarantineEntry do
   `Trellis.quarantine_status/2` reports it.
 
   `target` is an address: a transform's bare target table name
-  (`"order_totals"`) for the whole transform, or `"order_totals.total"` for
+  (`"order_totals"`; `quarantine_status/2` also takes the qualified
+  `"public.order_totals"`) for the whole transform, or `"order_totals.total"` for
   one of its columns. Pass it straight back to `Trellis.quarantine_status/2`,
   `Trellis.sample_quarantined/3`, or a `RESUME TRANSFORM` statement.
 

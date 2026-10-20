@@ -315,8 +315,8 @@ until one of these releases it:
   (`on delete cascade`), so defining it again starts with none.
 * **Per-key release.** `Trellis::release_key(transform, source_table, key)`
   (the CLI's `trellis release`, and `release_key` in each binding) releases one
-  key once its cause is fixed. It takes the transform's bare target, as
-  `status` does, and the source table and key as `sample_quarantined` reports
+  key once its cause is fixed. It takes the transform's target table, bare or
+  qualified, as `status` does, and the source table and key as `sample_quarantined` reports
   them, the table in either spelling. In one transaction it deletes the
   transform's `poison`, `poison_held` and `key_deaths` rows for the key and
   stages one image-less `Recompute` of it, which re-derives the key from its

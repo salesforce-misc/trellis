@@ -21,7 +21,7 @@ poisoned it is fixed. `trellis status` lists the held keys under
 
   trellis release order_totals public.orders 42
 
-<TRANSFORM> is the transform's bare target-table name. <SOURCE_TABLE> may be
+<TRANSFORM> is the transform's target table, bare or `schema.table`. <SOURCE_TABLE> may be
 `schema.table` or a bare table name. <KEY> is the key as status prints it (a
 composite key's columns joined as status shows them). Status quotes each of
 the three for the shell where it needs it ('...', with a ' inside written

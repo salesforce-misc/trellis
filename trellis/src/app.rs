@@ -513,10 +513,36 @@ impl Trellis {
         })
     }
 
+    /// The grammar reads `a.b` as transform `a`, column `b`. When `a.b` is
+    /// exactly a registered transform's qualified name (the spelling `apply`
+    /// returns), it names that whole transform instead: the reference with the
+    /// qualified name as its target and no column. Anything else is returned
+    /// as parsed, so `transform.column` keeps addressing a column.
+    async fn qualified_or_column(
+        &self,
+        reference: defs::TransformRef,
+    ) -> Result<defs::TransformRef, TrellisError> {
+        let Some(column) = &reference.column else {
+            return Ok(reference);
+        };
+        let address = format!("{}.{column}", reference.target);
+        let client = self.pool.get().await?;
+        let found = defs::catalog::bare_target_name(&**client, &address)
+            .await
+            .map_err(TrellisError::Catalog)?;
+        Ok(match found {
+            Some(_) => defs::TransformRef {
+                target: address,
+                column: None,
+            },
+            None => reference,
+        })
+    }
+
     /// [`Statement::Pause`](defs::Statement::Pause)'s half of
     /// [`apply`](Trellis::apply).
     async fn apply_pause(&self, reference: defs::TransformRef) -> Result<Applied, TrellisError> {
-        let defs::TransformRef { target, column } = reference;
+        let defs::TransformRef { target, column } = self.qualified_or_column(reference).await?;
         match column {
             None => defs::lifecycle::pause_transform(&self.pool, &target)
                 .await
@@ -540,7 +566,7 @@ impl Trellis {
     /// [`Statement::Resume`](defs::Statement::Resume)'s half of
     /// [`apply`](Trellis::apply).
     async fn apply_resume(&self, reference: defs::TransformRef) -> Result<Applied, TrellisError> {
-        let defs::TransformRef { target, column } = reference;
+        let defs::TransformRef { target, column } = self.qualified_or_column(reference).await?;
         match column {
             None => quarantine::resume_transform(&self.pool, &target)
                 .await
@@ -735,21 +761,18 @@ impl Trellis {
     /// #616): a failing chunk of it, or a failing backfill of its source
     /// table. Both are retried with backoff, so without this the only sign
     /// would be a warning in a worker's log.
+    ///
+    /// `target_table` is the name `apply` returns (`schema.table`) or the bare table
+    /// name; a qualified name with another schema matches nothing.
     pub async fn status(
         &self,
         target_table: &str,
     ) -> Result<Option<DefinitionStatus>, TrellisError> {
         self.call(async {
             let mut client = self.pool.get().await?;
-            // Issue #73: `transform_definitions.target_table` is persisted
-            // fully-qualified, but every caller here only ever has the bare name
-            // their `TRANSFORM <name> FROM ...` text declared — even once issue
-            // #76 taught the grammar an explicit `schema.table` spelling,
-            // `def.target` itself still always holds just the bare table name
-            // (see `defs::ast::TransformDef`'s own doc comment for why), so this
-            // API's callers never have anything but the bare name to poll with —
-            // match against `target_table`'s bare table-name suffix rather than
-            // the qualified column directly.
+            // `target_table` is either spelling of the transform's name, the
+            // qualified one `apply` returns or the bare one its text declared
+            // (`defs::catalog::target_match_sql`).
             let txn = client
                 .build_transaction()
                 .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
@@ -768,7 +791,8 @@ impl Trellis {
                             cf.error as capture_error, cf.detected_at as capture_detected_at, \
                             cf.kind as capture_kind, \
                             exists (select 1 from column_status cs \
-                                    where cs.transform_table = $1 and cs.awaiting_capture) \
+                                    where cs.transform_table = split_part(d.target_table, '.', 2) \
+                                    and cs.awaiting_capture) \
                               as awaiting_capture, \
                             (select bc.fence_xid::text::bigint from backfill_chunks bc \
                              where bc.definition_id = d.id and bc.kind = 'plan' \
@@ -788,8 +812,9 @@ impl Trellis {
                        on pb.table_name = d.source_table and pb.last_error is not null \
                      {CHUNK_FAILURE_JOIN} \
                      left join capture_failures cf on cf.transform_id = d.id \
-                     where split_part(d.target_table, '.', 2) = $1",
+                     where {matches}",
                         due = quarantine::retry_due_sql(2, 3),
+                        matches = defs::catalog::target_match_sql("d.target_table", 1),
                     ),
                     &[
                         &target_table,
@@ -1146,10 +1171,13 @@ impl Trellis {
     /// construction, but a live one is reported the same way regardless of
     /// whether the name is real, matching "no rows here means live" for
     /// every column not individually tracked).
+    ///
+    /// The transform is named qualified (`schema.table`, as `apply` returns it) or
+    /// bare; `transform.column` takes the bare transform.
     pub async fn quarantine_status(&self, target: &str) -> Result<QuarantineEntry, TrellisError> {
         self.call(async {
-            let target = QuarantineTarget::parse(target);
             let client = self.pool.get().await?;
+            let target = resolve_quarantine_address(&**client, target).await?;
             match &target {
                 QuarantineTarget::Transform(t) => {
                     // Issue #73: `t` is the bare name `QuarantineTarget::parse`
@@ -1240,8 +1268,8 @@ impl Trellis {
         limit: i64,
     ) -> Result<Vec<PoisonSample>, TrellisError> {
         self.call(async {
-            let target = QuarantineTarget::parse(target);
             let client = self.pool.get().await?;
+            let target = resolve_quarantine_address(&**client, target).await?;
             let rows = match &target {
                 QuarantineTarget::Column(t, c) => match &after {
                     Some((after_src, after_key)) => {
@@ -1330,7 +1358,7 @@ impl Trellis {
     /// keys"), once its cause is fixed: `source_table` and `key` as
     /// [`Trellis::sample_quarantined`] and [`Trellis::poisoned_since`] report
     /// them, the table in either spelling, `schema.table` or bare (#283), and
-    /// `transform` the bare target, as [`Trellis::status`] takes it.
+    /// `transform` the target table, bare or qualified, as [`Trellis::status`] takes it.
     ///
     /// In one transaction, it deletes the key's quarantine rows for
     /// `transform` and stages a recompute of the key, which the drain
@@ -2265,6 +2293,27 @@ pub enum QuarantineTarget {
     Transform(String),
     /// One column of a transform, named `(target_table, column_name)`.
     Column(String, String),
+}
+
+/// Parses a quarantine address for the facade's lookups. A dotted address that
+/// is exactly a registered transform's qualified name (`schema.table`, as
+/// `apply` returns it) names that whole transform, as its bare
+/// [`QuarantineTarget::Transform`]; every other address parses as
+/// [`QuarantineTarget::parse`] does, so `transform.column` keeps addressing a
+/// column (ADR-0003) and a qualified name with the wrong schema finds no
+/// transform.
+async fn resolve_quarantine_address(
+    client: &impl tokio_postgres::GenericClient,
+    address: &str,
+) -> Result<QuarantineTarget, TrellisError> {
+    if address.contains('.')
+        && let Some(bare) = defs::catalog::bare_target_name(client, address)
+            .await
+            .map_err(TrellisError::Catalog)?
+    {
+        return Ok(QuarantineTarget::Transform(bare));
+    }
+    Ok(QuarantineTarget::parse(address))
 }
 
 impl QuarantineTarget {

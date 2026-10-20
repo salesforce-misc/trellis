@@ -51,9 +51,13 @@ defmodule Trellis do
   ## Conventions
 
   - Times are `DateTime`s in UTC, at microsecond precision.
-  - A quarantine target is an address string: a transform's bare target
-    table name (`"order_totals"`) or `"transform.column"`
-    (`"order_totals.total"`), exactly as `quarantined/1` reports it.
+  - A transform is named by its target table, bare (`"order_totals"`) or
+    qualified as `define/2` returns it (`"public.order_totals"`), in `status/2`,
+    `quarantine_status/2`, `sample_quarantined/3`, `release_key/4`,
+    `self_check/3` and the `PAUSE`, `RESUME`, `DROP` and `ALTER` statements.
+  - A quarantine target is an address string: a transform's name, or
+    `"transform.column"` (`"order_totals.total"`, always the bare transform),
+    exactly as `quarantined/1` reports it.
   - `sample_quarantined/3`'s cursor and `watermark_token/1`'s token are opaque: pass back what the previous call
     returned.
   - Every atom in a result comes from a closed set allocated when the NIF
@@ -309,8 +313,7 @@ defmodule Trellis do
 
   Returns the transform's fully qualified target table once the definition is
   registered and its backfill queued, with the transform at
-  `:waiting_to_backfill`; poll `status/2` with the bare table name (the part
-  after the schema) for `:live`.
+  `:waiting_to_backfill`; poll `status/2` with the returned name for `:live`.
 
   Only `TRANSFORM` statements belong here. Any other statement form (`DROP`,
   `PAUSE`, `RELATIONSHIP`, ...) is refused with a `:validation` error before
@@ -330,8 +333,10 @@ defmodule Trellis do
   def define!(trellis, text), do: bang(define(trellis, text))
 
   @doc """
-  The status of the transform that writes `target_table`, a bare table name
-  without its schema, or `nil` if none does.
+  The status of the transform that writes `target_table`, or `nil` if none
+  does. `target_table` is either the fully qualified name `define/2` and
+  `apply/2` return (`"public.order_totals"`) or the bare table name
+  (`"order_totals"`). A qualified name with another schema matches nothing.
   """
   @spec status(trellis(), String.t()) :: {:ok, Status.t() | nil} | {:error, Error.t()}
   def status(trellis, target_table) when is_trellis(trellis) and is_binary(target_table) do
