@@ -529,16 +529,27 @@ mod tests {
         };
         for name in ["lock_timeout", "statement_timeout"] {
             for (setting, expected) in cases {
+                // One statement sets, caps and records the value in force:
+                // a 1 ms `statement_timeout` is armed per top-level
+                // statement, so a separate cap or verifying read would run
+                // under it and can time out (#1192). The setting is reset to
+                // 0 before the statement ends, so the read below runs with
+                // no timeout.
+                let cap_sql = cap_timeout_sql(name, cap, false).replace('\'', "''");
                 client
-                    .batch_execute(&format!("set {name} = '{setting}'"))
+                    .batch_execute(&format!(
+                        "do $$ begin \
+                             set {name} = '{setting}'; \
+                             execute '{cap_sql}'; \
+                             perform set_config('test.in_force', \
+                                 (select setting from pg_settings where name = '{name}'), false); \
+                             set {name} = 0; \
+                         end $$"
+                    ))
                     .await
-                    .expect("set");
-                client
-                    .batch_execute(&cap_timeout_sql(name, cap, false))
-                    .await
-                    .expect("cap");
+                    .expect("set, cap and record");
                 let ms: i64 = client
-                    .query_one(&ms_in_force(name), &[])
+                    .query_one("select current_setting('test.in_force')::bigint", &[])
                     .await
                     .expect("read")
                     .get(0);
