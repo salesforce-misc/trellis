@@ -220,10 +220,13 @@ times the table, which is hours at 100M rows.
   orders, so each of its pages scans them.
 * **Order.** Each column ascending, `NULL` last (what a btree holds, and the
   order `NULLS NOT DISTINCT` identities need), each collatable column under
-  one collation named in the statement and used on both sides: the key index's
-  own when it is deterministic, `"C"` when it is not. A target whose key is
-  collated differently from its source's pages in the source's order, and pays a
-  scan on the side its index doesn't order.
+  one collation named in the statement and used on both sides: the key
+  column's own when it is deterministic, `"C"` when it is not. The column is the
+  source key's for a 1-1 target, the target's for an aggregate and a JOIN's
+  target part, and the hidden table's for `P`, `M` and `J`, which keep the
+  collation define gave them when the source is re-collated. When the two
+  sides' columns are collated differently, a page pays a scan on the side whose
+  index doesn't order it.
 * **Nullable keys.** `NULL` sorts last, so the rows past a cursor on a nullable
   column are no single range (`k > c` leaves out the `NULL` rows after it, and
   `k > c or k is null` is no index range). A page reads each way a row can

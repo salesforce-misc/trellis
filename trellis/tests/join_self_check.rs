@@ -840,3 +840,76 @@ async fn a_pending_change_a_cells_basis_saw_is_not_subtracted() {
         }
     }
 }
+
+/// A `FROM`-side group column re-collated (between deterministic
+/// collations, which pauses nothing) while a walk pages through `P`: the
+/// part pages under the collation its hidden table was made with, not the
+/// source's new one, so the walk still reads every cell once (#1178).
+#[tokio::test]
+async fn a_group_column_re_collated_mid_walk_skips_and_repeats_no_cell() {
+    trellis::dev::staging::set_group_basis(true);
+    let mut d = Driver::start_with_database_defaults(
+        &[],
+        "create table public.a (id integer primary key, ga text collate \"C\", k integer); \
+         create table public.b (id integer primary key, k integer, y integer)",
+        &[
+            ("id", int4()),
+            ("ga", ValueType::Text),
+            ("k", int4()),
+            ("y", int4()),
+        ],
+        &[],
+        &[
+            "TRANSFORM tc FROM public.a JOIN public.b ON a.k = b.k GROUP BY a.ga \
+           SELECT a.ga AS ga, COUNT(*) AS n, SUM(b.y) AS sy",
+        ],
+        &["public.a", "public.b"],
+    )
+    .await;
+    // Byte order puts the capitals first; `und-x-icu` interleaves them.
+    step(
+        &mut d,
+        "insert into public.a values (1, 'a', 1), (2, 'B', 1), (3, 'c', 2), (4, 'D', 2), \
+                                     (5, 'e', 1), (6, 'F', 2); \
+         insert into public.b values (1, 1, 10), (2, 2, 20)",
+    )
+    .await;
+    let (found, whole, _) = walk(&d, "tc", 1).await;
+    assert_eq!(found, []);
+
+    let (mut after, mut compared, mut altered) = (None, 0, false);
+    loop {
+        let page = check_page(
+            d.pool(),
+            "tc",
+            SelfCheckScope { after, limit: 1 },
+            SelfCheckMode::Standard,
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("a page of the check");
+        compared += page.rows_compared;
+        assert!(
+            matches!(page.outcome, SelfCheckOutcome::Converged),
+            "{:?}",
+            page.outcome
+        );
+        after = page.next_after;
+        if !altered && after.as_deref().is_some_and(|a| a.starts_with("p:")) {
+            exec(
+                &d,
+                "alter table public.a alter column ga type text collate \"und-x-icu\"",
+            )
+            .await;
+            altered = true;
+        }
+        if after.is_none() {
+            break;
+        }
+    }
+    assert!(altered, "the walk paged through P");
+    assert_eq!(
+        compared, whole,
+        "every key once, as a walk without the change"
+    );
+}

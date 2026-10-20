@@ -954,19 +954,20 @@ pub(super) async fn compare(
     } else {
         HashMap::new()
     };
+    // A part's key columns are typed and collated as its hidden table's,
+    // which define made from the source's and a change between
+    // deterministic collations of the source leaves alone: a walk then pages
+    // in one order from its first page to its last, as an aggregate's does
+    // by its target's columns.
     let mut keyset = match part {
         Part::Target => Keyset::resolve(&client, identity).await?,
-        Part::From => {
-            let names = spec::side_key_columns(&def.def, JoinSide::From);
-            Keyset::resolve_columns(&client, &audit.from_table, &names).await?
-        }
-        Part::Joined => {
-            let names = spec::side_key_columns(&def.def, JoinSide::Joined);
-            Keyset::resolve_columns(&client, &audit.joined_table, &names).await?
-        }
-        Part::Matches => {
-            let names = spec::join_key(&def.def, JoinSide::From);
-            Keyset::resolve_columns(&client, &audit.from_table, &names).await?
+        Part::From | Part::Joined | Part::Matches => {
+            let names = match part {
+                Part::From => spec::side_key_columns(&def.def, JoinSide::From),
+                Part::Joined => spec::side_key_columns(&def.def, JoinSide::Joined),
+                _ => spec::join_key(&def.def, JoinSide::From),
+            };
+            Keyset::resolve_columns(&client, &audit.hidden(part), &names).await?
         }
     };
     // The single-table parts are index-ordered when their table's index
