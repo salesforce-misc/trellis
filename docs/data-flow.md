@@ -194,7 +194,9 @@ A definition that reads a relationship doesn't yet take the Re-derive build
 When the staging worker reinstalls a table's triggers while definitions
 already apply from it (a restored database's triggers came back disabled,
 say), those definitions have missed whatever committed meanwhile. An explicit
-`Trellis::request_backfill` on a captured table asks for the same re-read.
+`Trellis::request_backfill` on a captured table asks for the same re-read. It
+takes the table's `schema.table` name, or a bare name when exactly one captured
+table carries it; a bare name two captured tables share is refused, naming both.
 Either one is repaired in the transaction that makes the call:
 
 - **A reader the Re-derive build serves** (a plain aggregate or a plain 1-1

@@ -187,6 +187,7 @@
     {"op": "sample_quarantined", "args": ["parity_nowhere"], "expect": {"error": "not_found"}},
     {"op": "self_check", "args": ["parity_nowhere"], "opts": {"timeout_ms": 0}, "expect": {"error": "not_found"}},
     {"op": "request_backfill", "args": ["parity_nowhere"], "expect": {"error": "not_found"}},
+    {"about": "A schema-qualified name resolves as exactly that table, so an unknown one is not_found too.", "op": "request_backfill", "args": ["public.parity_nowhere"], "expect": {"error": "not_found"}},
     {"op": "release_key", "args": ["parity_nowhere", "parity_items", "1"], "expect": {"error": "not_found"}},
     {"op": "apply", "args": ["TRANSFORM parity_oops"], "expect": {"error": "parse"}},
     {"about": "define refuses any other statement form before applying it.", "op": "define", "args": ["DROP TRANSFORM parity_prices"], "expect": {"error": "validation"}},
