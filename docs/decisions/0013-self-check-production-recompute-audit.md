@@ -200,6 +200,55 @@ definition holds is a held key, both on every `self_check` report and in `status
 A strict mode, sound only when writes to the audited tables are stopped, never
 re-checks; it is the documented strong guarantee for callers that can quiesce.
 
+### A walk pages by the key's own columns
+
+A page selects its keys by a row comparison on the raw key columns,
+`(k1, …, kn) > ($1, …, $n) order by k1, …, kn limit L`, on the source side and
+on the target side. An index that leads with those columns serves the page with
+a range scan, so a walk reads each table about once and its cost is linear in
+the rows. Paging on the key's encoded text instead, an expression no index
+orders, reads the whole source on every page: a walk of N keys then reads N / L
+times the table, which is hours at 100M rows.
+
+* **The key per target kind.** A 1-1 target pages by the source's primary key,
+  which always has its index. A group-basis aggregate pages by its `GROUP BY`
+  columns, a JOIN's target part by its group columns, `P` by `a`'s group columns
+  and the join key, `M` and `J` by `b`'s join key. The aggregate and JOIN
+  parts are index-served only when the source has an index leading with those
+  columns; without one a page scans the source, so a walk reads G / L times
+  the table.
+* **Order.** Each column ascending, `NULL` last (what a btree holds, and the
+  order `NULLS NOT DISTINCT` identities need), each collatable column under
+  one collation named in the statement and used on both sides: the key index's
+  own when it is deterministic, `"C"` when it is not. A target whose key is
+  collated differently from its source's pages in the source's order, and pays a
+  scan on the side its index doesn't order.
+* **Nullable keys.** `NULL` sorts last, so the rows past a cursor on a nullable
+  column are no single range (`k > c` leaves out the `NULL` rows after it, and
+  `k > c or k is null` is no index range). A page reads each way a row can
+  first differ from the cursor as a branch of its own, each a range of an index
+  on the key, and cuts the union again. A key none of whose columns can be
+  `NULL` is one row comparison.
+* **Planning.** The planner can't estimate how many groups the weighted union
+  of the source and its ring rows holds, and costs an index-ordered aggregate
+  by a default 200, so it hashes the whole source for a page of groups. When
+  the source has an index leading with the key, the page runs without hash
+  aggregation and without the bound to the hidden side's last key, which an
+  ordered aggregate would read past to the end of the index.
+* **Identity.** The encoded key text is still the key a divergence is reported
+  by and the text a walk saves as its cursor; it neither orders nor bounds a
+  page. A cursor is decoded back into its columns' values for the next page.
+* **The page's end.** The two sides are `limit`ed separately, so a page ends at
+  the lowest last key of the sides that filled the limit. The sides' keys are
+  ranked together in the statement, by a dense rank over the same order, so
+  "past the end" is an integer comparison whatever the key's type.
+* **One statement.** A page is one statement under one snapshot, and the
+  ring-weighted comparison runs inside it as before.
+
+The cost of a walk is then about (rows read per page) × (pages). The module docs
+of `self_check`, `self_check_groups` and `self_check_joins` say what each part
+needs indexed.
+
 ### Scope: every target; aggregate and JOIN targets detect, never repair
 
 `self_check` audits 1-1, aggregate and JOIN targets. Every comparison projects the
@@ -256,8 +305,9 @@ standing cost.
 
 ## Consequences
 
-- `self_check` is a real read load: a full recompute scans source and target.
-  It runs page by page beside the drain workers, each page bounded and holding no
+- `self_check` is a real read load: a full recompute reads source and target
+  once when a key's index orders each page, and once per page where none does
+  (an aggregate or JOIN part over unindexed group or join columns). It runs page by page beside the drain workers, each page bounded and holding no
   lock, and its caller never waits on it.
 - It needs a drain worker somewhere in the fleet, as a build does; with none, a
   job stays `queued`.

@@ -106,6 +106,21 @@
 //! target are refused ([`SelfCheckError::UnsupportedKeySpace`] /
 //! [`SelfCheckError::UnsupportedExpr`]).
 //!
+//! # How a page finds its keys
+//!
+//! A page reads its keys by a comparison on the key's raw columns,
+//! `(k1, …, kn) > (c1, …, cn) order by k1, …, kn limit L`, on the source and
+//! on the target ([`super::self_check_keyset`]), not by the key's encoded
+//! text. The text is the key a divergence is reported by and the cursor a
+//! walk saves; it orders nothing. A 1-1 target pages by its source's
+//! primary key, which has its index, so each page is a range scan of both
+//! sides and a walk reads each table about once: its cost is linear in the
+//! rows. (Paging by the text, which no index orders, read the whole source
+//! on every page: N / L times the table.) An aggregate or a `JOIN` pages
+//! its source by its group or join columns and is index-ordered only if the
+//! source has an index leading with them
+//! ([`super::self_check_groups`], [`super::self_check_joins`]).
+//!
 //! # One page at a time
 //!
 //! This module compares one keyset page ([`SelfCheckScope`]) of a target:
@@ -153,6 +168,7 @@ use super::converge;
 use super::error::StagingError;
 use super::holdup::{self, DrainFailure};
 use super::quarantine::{self, HeldKeys};
+use super::self_check_keyset::Keyset;
 use super::unindexed_joins::UnindexedJoin;
 
 /// One page's worth of bound for a [`check_page`] call — see the module doc
@@ -253,9 +269,9 @@ pub struct SelfCheckPage {
     /// The keyset cursor a following call should pass as
     /// [`SelfCheckScope::after`] to continue past this page — the key this
     /// page's bound actually ended at, which is the *lower* of the two
-    /// sides' last keys, in the order both sides are paged in (a
-    /// single-column text key's own collation when it's deterministic, else
-    /// `"C"`, see `page_collation`), whenever either side hit
+    /// sides' last keys, in the order both sides are paged in (the key's
+    /// own columns in order, `NULL` last, each collatable one under one
+    /// collation, see [`super::self_check_keyset`]), whenever either side hit
     /// [`SelfCheckScope::limit`] (keys past it fell off one side's page and
     /// are deliberately left for the next call rather than diffed against a
     /// truncated counterpart). `None` means neither side hit the limit, so
@@ -1075,19 +1091,19 @@ async fn compare_once(
     // (ADR-0013, comparison under one
     // snapshot), and it trims both pages to the same bound.
     let client = pool.get().await?;
-    let collation = page_collation(&client, pk).await?;
-    let sql = page_sql(def, pk, &collation, &comparable)?;
-    let after: Option<&str> = scope.after.as_deref();
-    let rows = client.query(sql.as_str(), &[&after, &scope.limit]).await?;
+    let mut keyset = Keyset::resolve(&client, pk).await?;
+    keyset.set_cursor(scope.after.as_deref())?;
+    let sql = page_sql(def, &keyset, &comparable)?;
+    let rows = client.query(sql.as_str(), &[&scope.limit]).await?;
 
     let mut recomputed = Page::new();
     let mut persisted = Page::new();
     let mut page_end: Option<String> = None;
     for row in &rows {
-        let is_recomputed: bool = row.get(0);
+        let is_recomputed = row.get::<_, i32>(0) == 1;
         page_end = row.get(1);
         let key: String = row.get(2);
-        let values: Vec<Option<String>> = (0..comparable.len()).map(|i| row.get(i + 3)).collect();
+        let values: Vec<Option<String>> = row.get(3);
         if is_recomputed {
             recomputed.insert(key, values);
         } else {
@@ -1108,76 +1124,15 @@ async fn compare_once(
     })
 }
 
-/// The collation [`page_sql`] compares both sides' key text under, so the
-/// source and the target page in one order however their own key columns are
-/// collated (issue #782). A 1-1 target's key is created with its source's
-/// collation (#769), but `alter column … type text collate …` on the source
-/// afterwards leaves the two ordering differently, and two pages read in two
-/// orders hold different keys.
-///
-/// The source key index's collation when the key text is that one column
-/// itself (a not-null collatable key of arity 1, whose `col::text` is the
-/// column): naming the index's own collation keeps the source's index range
-/// scan, and the target's whenever its key has the same collation, which is
-/// always the case until the source is re-collated. After a re-collation the
-/// target's page is read by a sequential scan and a sort, since its index
-/// orders by the other collation; that costs an audit time, never a wrong
-/// answer. Any other key text (a composite key's `array_to_string`, an
-/// integer's `id::text`) is an expression no index orders, so it is compared
-/// under `"C"`, the cheapest to sort.
-///
-/// The index's collation must be deterministic, though, so `"C"` takes its
-/// place when it isn't. Define refuses a nondeterministic key collation
-/// (#638), but an `alter` of the source key to one afterwards isn't refused,
-/// and under one two distinct keys can compare equal: a page's `limit` could
-/// cut between a target key and an extra target row tying with it, and the
-/// next page's `> after` would skip the one cut, hiding it from every sweep.
-/// A deterministic collation breaks every tie by bytes, so distinct keys are
-/// never equal under it, and membership by byte equality ([`diff_page`])
-/// agrees with the page's order.
-///
-/// [`SelfCheckScope::after`] is compared under this collation too, so a
-/// cursor carried across a re-collation of the source key continues in the
-/// new order: keys between the two orders' positions of the cursor may be
-/// skipped or compared twice by that one sweep.
-async fn page_collation(
-    client: &tokio_postgres::Client,
-    pk: &[PrimaryKeyColumn],
-) -> Result<String, SelfCheckError> {
-    let index_collation = match pk {
-        [only] if !only.nullable => only.collation.as_deref(),
-        _ => None,
-    };
-    let Some(collation) = index_collation else {
-        return Ok(BYTE_ORDER.to_string());
-    };
-    let deterministic: Option<bool> = client
-        .query_opt(
-            "select co.collisdeterministic from pg_catalog.pg_collation co \
-             where co.oid = pg_catalog.to_regcollation($1)",
-            &[&collation],
-        )
-        .await?
-        .map(|row| row.get(0));
-    Ok(match deterministic {
-        Some(true) => collation.to_string(),
-        _ => BYTE_ORDER.to_string(),
-    })
-}
-
-/// `"C"`, byte order.
-pub(super) const BYTE_ORDER: &str = r#"pg_catalog."C""#;
-
 /// The statement [`compare_once`] runs: one keyset page of the recompute
 /// over `def`'s source and of the persisted target, each `LIMIT`ed
-/// separately, both ordered and bounded by the key text under `collation`
-/// ([`page_collation`]), and both trimmed to the same end in SQL, where that
-/// collation's ordering is.
+/// separately, both ordered and bounded by the key's raw columns
+/// ([`Keyset`]), and both trimmed to the same end in SQL.
 ///
-/// `$1` is [`SelfCheckScope::after`] and `$2` its `limit`. Each row is
-/// `(recomputed, page_end, key, compared values…)`: `recomputed` says which
-/// side the row is from, and `page_end` is the page's bound, the same on
-/// every row.
+/// `$1` is [`SelfCheckScope::limit`]; the cursor ([`SelfCheckScope::after`]) is
+/// in the statement ([`Keyset::set_cursor`]). Each row is `(recomputed, page_end, key,
+/// compared values…)`: `recomputed` says which side the row is from, and
+/// `page_end` is the page's bound, the same on every row.
 ///
 /// Why the trim: the two `LIMIT`ed reads are independent, so whenever a
 /// divergence makes the two sides' key sets differ, their pages end at
@@ -1188,24 +1143,23 @@ pub(super) const BYTE_ORDER: &str = r#"pg_catalog."C""#;
 /// reproduces on the re-check, so the ADR's re-check can't filter it), and
 /// the cursor would skip past it, so no later page would compare it either.
 /// So whichever side(s) filled the limit bound the page, and the *lowest*
-/// such bound is its end. Keys past it are dropped from both sides and left
-/// for the next page, which starts after `page_end`. A page where neither
-/// side filled the limit reached the end of the keyspace: `page_end` is
-/// null. The lowest bound has to be taken in the order the pages were read
-/// in, which is why it is taken here and not in Rust (whose `String` order is
-/// byte order, `"C"`'s, and not, say, `en-US`'s).
+/// such bound is its end ([`Keyset::ranked`]). Keys past it are dropped from
+/// both sides and left for the next page, which starts after `page_end`. A
+/// page where neither side filled the limit reached the end of the keyspace:
+/// `page_end` is null.
 fn page_sql(
     def: &Definition,
-    pk: &[PrimaryKeyColumn],
-    collation: &str,
+    keyset: &Keyset,
     comparable: &[&FieldDef],
 ) -> Result<String, SelfCheckError> {
     // `pk_key_sql_expr` is the source/target's shared key-contract text at
-    // whatever arity `pk` has (issue #121): a bare `{col}::text` at arity 1.
-    // Both sides page by it, under one collation, so they page in one order.
-    // That order isn't the key's typed order (an integer key sorts as text),
-    // and needn't be: the audit only ever compares the two sides key by key.
-    let key = format!("({}) collate {collation}", ddl::pk_key_sql_expr(pk, None));
+    // whatever arity the key has (issue #121): a bare `{col}::text` at arity
+    // 1. It is the key's identity, the text a divergence is reported by; the
+    // page is ordered and bounded by the raw columns.
+    let key = ddl::pk_key_sql_expr(keyset.columns(), None);
+    let refs = keyset.refs(None);
+    let carried = keyset.select_carried(&refs);
+    let order = keyset.order_by(&refs);
     let source_ident = ddl::qualified_source_table(&def.source_table);
     let target_ident = ddl::qualified_target_table_ident(&def.target_table);
 
@@ -1216,30 +1170,28 @@ fn page_sql(
             target: def.def.target.clone(),
             detail,
         })?;
-        recomputed.push(format!(", ({leaf})::text as v{i}"));
-        persisted.push(format!(", {}::text as v{i}", quote_ident(&field.name)));
+        recomputed.push(format!("({leaf})::text"));
+        persisted.push(format!("{}::text", quote_ident(&field.name)));
+        let _ = i;
     }
     let side = |table: &str, values: &[String]| {
-        format!(
-            "select {key} as k{} from {table} \
-             where ($1::text is null or {key} > $1) order by {key} limit $2",
-            values.concat()
-        )
+        keyset.side(&refs, |cond| {
+            format!(
+                "select {key} as __k{carried}, array[{}]::text[] as __v from {table} \
+                 where {cond} order by {order} limit $1",
+                values.join(", ")
+            )
+        })
     };
-    Ok(format!(
-        "with recomputed as materialized ({}), \
-              persisted as materialized ({}), \
-              page as ( \
-                select least( \
-                  (select max(k) from recomputed having count(*) >= $2), \
-                  (select max(k) from persisted having count(*) >= $2)) as page_end) \
-         select true, page.page_end, recomputed.* from recomputed, page \
-          where page.page_end is null or recomputed.k <= page.page_end \
-         union all \
-         select false, page.page_end, persisted.* from persisted, page \
-          where page.page_end is null or persisted.k <= page.page_end",
-        side(&source_ident, &recomputed),
-        side(&target_ident, &persisted),
+    Ok(keyset.ranked(
+        &format!(
+            "recomputed as materialized ({}), persisted as materialized ({}), ",
+            side(&source_ident, &recomputed),
+            side(&target_ident, &persisted)
+        ),
+        &[(1, "recomputed"), (2, "persisted")],
+        &[1, 2],
+        "",
     ))
 }
 
@@ -1257,15 +1209,24 @@ pub async fn explain_page(
     let def = catalog::definition_by_target(pool, target_table)
         .await?
         .ok_or_else(|| SelfCheckError::TargetNotFound(target_table.to_string()))?;
+    if let Some(shape) = group_shape(&def) {
+        let identity = {
+            let client = pool.get().await?;
+            ddl::identity_key_columns(&**client, &def.target_table).await?
+        };
+        return super::self_check_groups::explain(pool, &def, &shape, &identity, after, limit)
+            .await;
+    }
     let pk = ddl::source_primary_key(pool, &def.source_table).await?;
     let comparable: Vec<&FieldDef> = def.def.fields.iter().collect();
     let mut client = pool.get().await?;
-    let collation = page_collation(&client, &pk).await?;
-    let sql = page_sql(&def, &pk, &collation, &comparable)?;
+    let mut keyset = Keyset::resolve(&client, &pk).await?;
+    keyset.set_cursor(after)?;
+    let sql = page_sql(&def, &keyset, &comparable)?;
     let txn = client.transaction().await?;
     txn.batch_execute("set local enable_seqscan to off").await?;
     let rows = txn
-        .query(format!("explain {sql}").as_str(), &[&after, &limit])
+        .query(format!("explain {sql}").as_str(), &[&limit])
         .await?;
     txn.rollback().await?;
     Ok(rows

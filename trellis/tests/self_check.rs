@@ -1714,7 +1714,7 @@ async fn a_page_reads_both_sides_by_their_key_index() {
 /// source key's new collation: the source is still read by its index, and
 /// the target, whose index orders by its own collation, by a scan. This is
 /// the documented cost of auditing a target whose key no longer orders like
-/// its source's (`staging::self_check::page_collation`).
+/// its source's (`staging::self_check_keyset`).
 #[tokio::test]
 async fn a_page_after_a_re_collation_reads_the_source_by_its_key_index() {
     let cluster = TestCluster::start();
@@ -2843,5 +2843,215 @@ async fn a_shutdown_stops_the_worker_mid_page_and_cancels_its_job() {
     assert!(cancelled.report.is_none());
     holder.rollback().await;
 
+    trellis.shutdown().await.expect("shutdown");
+}
+
+// ---- Typed keyset paging (#1178) ----
+
+/// The `next_after` of each page of a walk of `target`, `limit` keys a page,
+/// and every divergence any page reported.
+async fn walk_cursors(
+    trellis: &Trellis,
+    target: &str,
+    limit: i64,
+) -> (Vec<Option<String>>, Vec<Divergence>, i64) {
+    let (mut cursors, mut divergences, mut compared) = (Vec::new(), Vec::new(), 0);
+    let mut after = None;
+    for _ in 0..100 {
+        let report = trellis
+            .self_check_page(
+                target,
+                SelfCheckScope { after, limit },
+                SelfCheckMode::Standard,
+                GENEROUS_TIMEOUT,
+            )
+            .await
+            .expect("self_check");
+        compared += report.rows_compared;
+        if let SelfCheckOutcome::Diverged(found) = report.outcome {
+            divergences.extend(found);
+        }
+        cursors.push(report.next_after.clone());
+        after = report.next_after;
+        if after.is_none() {
+            return (cursors, divergences, compared);
+        }
+    }
+    panic!("the walk did not end");
+}
+
+/// An integer key is paged in numeric order, not the order of its text
+/// (`10` after `9`, `-5` first): each page ends at the numerically lower of
+/// the sides' last keys, a cursor continues after it with no key skipped or
+/// repeated, and a missing and an extra row in the middle are each reported
+/// once.
+#[tokio::test]
+async fn a_bigint_key_pages_in_numeric_order_and_a_resumed_walk_skips_and_repeats_nothing() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let ids = [-5, 1, 2, 9, 10, 11, 100, 1000];
+    let images: Vec<(String, String)> = ids
+        .iter()
+        .map(|id| (id.to_string(), format!(r#"{{"id":{id},"v":{}}}"#, id * 10)))
+        .collect();
+    let rows: Vec<(&str, &str)> = images
+        .iter()
+        .map(|(k, i)| (k.as_str(), i.as_str()))
+        .collect();
+    let (trellis, raw) = converged_fixture(
+        &db,
+        "create table nums (id bigint primary key, v integer)",
+        "nums",
+        "TRANSFORM num_values FROM nums SELECT v AS v",
+        &rows,
+    )
+    .await;
+
+    let (cursors, divergences, compared) = walk_cursors(&trellis, "num_values", 3).await;
+    assert_eq!(
+        cursors,
+        vec![Some("2".to_string()), Some("11".to_string()), None]
+    );
+    assert_eq!(divergences, vec![]);
+    assert_eq!(compared, 8, "every key once");
+
+    // One mid-walk row gone from the target and one extra in it.
+    raw.batch_execute(
+        "delete from num_values where id = 10; insert into num_values (id, v) values (50, 0)",
+    )
+    .await
+    .expect("damage the target");
+    let (cursors, mut divergences, compared) = walk_cursors(&trellis, "num_values", 3).await;
+    divergences.sort_by_key(|d| format!("{d:?}"));
+    assert_eq!(
+        divergences,
+        vec![
+            Divergence::ExtraRow {
+                key: "50".to_string()
+            },
+            Divergence::MissingRow {
+                key: "10".to_string()
+            }
+        ]
+    );
+    assert_eq!(
+        compared, 9,
+        "the 8 source keys and the extra one, once each"
+    );
+    assert_eq!(cursors.last(), Some(&None));
+
+    // A walk resumed from a cursor carries on after it.
+    let page = trellis
+        .self_check_page(
+            "num_values",
+            SelfCheckScope {
+                after: Some("9".to_string()),
+                limit: 100,
+            },
+            SelfCheckMode::Standard,
+            GENEROUS_TIMEOUT,
+        )
+        .await
+        .expect("self_check");
+    assert_eq!(page.rows_compared, 5, "11, 100, 1000, 10 and 50 (after 9)");
+    assert_eq!(page.next_after, None);
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// A composite key pages by its columns in turn: `(2, a)` before `(10, a)`
+/// whatever the text order says, and a cursor splits mid-group.
+#[tokio::test]
+async fn a_composite_key_pages_column_by_column() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let keys = [(1, "x"), (1, "y"), (2, "a"), (9, "z"), (10, "a"), (10, "b")];
+    let images: Vec<(String, String)> = keys
+        .iter()
+        .map(|(a, b)| {
+            (
+                format!("{a}\u{1f}{b}"),
+                format!(r#"{{"a":{a},"b":"{b}","v":{a}}}"#),
+            )
+        })
+        .collect();
+    let rows: Vec<(&str, &str)> = images
+        .iter()
+        .map(|(k, i)| (k.as_str(), i.as_str()))
+        .collect();
+    let (trellis, raw) = converged_fixture(
+        &db,
+        "create table pairs (a integer, b text, v integer, primary key (a, b))",
+        "pairs",
+        "TRANSFORM pair_values FROM pairs SELECT v AS v",
+        &rows,
+    )
+    .await;
+    raw.batch_execute("delete from pair_values where a = 9")
+        .await
+        .expect("damage the target");
+
+    let (cursors, divergences, compared) = walk_cursors(&trellis, "pair_values", 2).await;
+    assert_eq!(
+        cursors,
+        vec![
+            Some("1\u{1f}y".to_string()),
+            Some("9\u{1f}z".to_string()),
+            Some("10\u{1f}b".to_string()),
+            None
+        ]
+    );
+    assert_eq!(
+        divergences,
+        vec![Divergence::MissingRow {
+            key: "9\u{1f}z".to_string()
+        }]
+    );
+    assert_eq!(compared, 6);
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// A page of a `bigint`-keyed and of a composite-keyed 1-1 target is a range
+/// scan of each side's primary-key index, with sequential scans disabled to
+/// show no other plan was open to it. Paging on the key text again (an
+/// expression no index orders) fails this.
+#[tokio::test]
+async fn a_bigint_and_a_composite_key_page_by_a_range_scan_of_their_index() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (trellis, _raw) = converged_fixture(
+        &db,
+        "create table nums (id bigint primary key, v integer)",
+        "nums",
+        "TRANSFORM num_values FROM nums SELECT v AS v",
+        &[("1", r#"{"id":1,"v":1}"#)],
+    )
+    .await;
+    let explained =
+        trellis::staging::self_check::explain_page(&db.pool, "num_values", Some("5"), 3)
+            .await
+            .expect("explain the page");
+    assert_eq!(seq_scans(&explained), Vec::<&str>::new(), "{explained}");
+    assert!(explained.contains("nums_pkey"), "{explained}");
+    assert!(explained.contains("num_values_pkey"), "{explained}");
+    trellis.shutdown().await.expect("shutdown");
+
+    let db = cluster.create_isolated_database().await;
+    let (trellis, _raw) = converged_fixture(
+        &db,
+        "create table pairs (a integer, b text, v integer, primary key (a, b))",
+        "pairs",
+        "TRANSFORM pair_values FROM pairs SELECT v AS v",
+        &[("1\u{1f}x", r#"{"a":1,"b":"x","v":1}"#)],
+    )
+    .await;
+    let explained =
+        trellis::staging::self_check::explain_page(&db.pool, "pair_values", Some("1\u{1f}x"), 3)
+            .await
+            .expect("explain the page");
+    assert_eq!(seq_scans(&explained), Vec::<&str>::new(), "{explained}");
+    assert!(explained.contains("pairs_pkey"), "{explained}");
+    assert!(explained.contains("pair_values_pkey"), "{explained}");
     trellis.shutdown().await.expect("shutdown");
 }

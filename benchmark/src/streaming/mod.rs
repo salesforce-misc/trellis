@@ -89,6 +89,7 @@ pub mod load;
 pub mod process_memory;
 pub mod rate;
 pub mod scrape;
+pub mod self_check_walk;
 pub mod server_cost;
 pub mod ssi_tax;
 pub mod throughput;

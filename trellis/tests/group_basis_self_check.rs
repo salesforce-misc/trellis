@@ -723,3 +723,86 @@ async fn a_pending_change_at_or_below_the_truncate_floor_is_not_subtracted() {
     assert_eq!(compare(&d, 10).await, (vec![], vec![], false));
     assert_eq!(walk(&d, 10).await.0, []);
 }
+
+/// Groups page in the order of their key's type, `NULL` last, not of its
+/// text (`10` after `9`): a walk at every page size compares each group once
+/// and finds nothing, and the cursor never skips or repeats one (#1178).
+#[tokio::test]
+async fn groups_page_in_their_key_order_with_the_null_group_last() {
+    let mut d = start().await;
+    let mut values = Vec::new();
+    for g in [1, 2, 3, 9, 10, 11, 20, 100] {
+        values.push(format!("({g}, {g}, {g})"));
+    }
+    values.push("(200, null, 5)".to_string());
+    step(
+        &mut d,
+        &format!("insert into public.src values {}", values.join(", ")),
+    )
+    .await;
+    for limit in [1, 2, 3, 4, 100] {
+        let (found, compared, pages) = walk(&d, limit).await;
+        assert_eq!(found, [], "limit {limit}");
+        assert_eq!(compared, 9, "every group once at limit {limit}");
+        assert!(pages >= 1);
+    }
+    // A planted divergence on the group after the `9` boundary is reported
+    // once, in the numeric order.
+    let hidden = hidden(&d).await;
+    exec(
+        &d,
+        &format!("update {hidden} set __n = __n + 1 where g = 10"),
+    )
+    .await;
+    let (found, _, _) = walk(&d, 3).await;
+    assert!(!found.is_empty(), "{found:?}");
+    assert!(
+        found
+            .iter()
+            .all(|d| matches!(d, Divergence::Cell { key, .. } if key == "10")),
+        "{found:?}"
+    );
+}
+
+/// A page of an aggregate's source is a range scan of an index that leads
+/// with the group columns; without one it is a scan of the source (the
+/// documented cost, #1167).
+#[tokio::test]
+async fn an_aggregate_page_reads_its_source_by_an_index_that_leads_with_the_group_column() {
+    let d = start().await;
+    let explain = |d: &Driver| {
+        let pool = d.pool().clone();
+        async move {
+            trellis::staging::self_check::explain_page(&pool, "agg", Some("5"), 3)
+                .await
+                .expect("explain the page")
+        }
+    };
+    let src_seq_scans = |plan: &str| {
+        plan.lines()
+            .filter(|l| l.contains("Seq Scan on src "))
+            .count()
+    };
+    let without = explain(&d).await;
+    assert!(!without.contains("src_g_idx"), "{without}");
+    exec(&d, "create index src_g_idx on public.src (g)").await;
+    let with = explain(&d).await;
+    assert!(
+        with.contains("Index Scan using src_g_idx on src"),
+        "the group page is a range scan of the index:\n{with}"
+    );
+    // Past the cursor the page reads the groups above it and, apart, the
+    // `NULL` group, each by a range of the index. One scan of the source is
+    // left: the branch for image-less ring rows, which reads it only when such
+    // a row exists.
+    assert!(with.contains("Index Cond: (g > 5)"), "{with}");
+    assert!(with.contains("Index Cond: (g IS NULL)"), "{with}");
+    assert_eq!(src_seq_scans(&with), 1, "{with}");
+    assert!(src_seq_scans(&without) > 1, "{without}");
+    // The hidden table and the visible target are read by their keys' indexes.
+    assert!(
+        with.contains("Index Scan using agg_1_g_key on agg_1"),
+        "{with}"
+    );
+    assert!(with.contains("Index Scan using agg_g_key on agg"), "{with}");
+}

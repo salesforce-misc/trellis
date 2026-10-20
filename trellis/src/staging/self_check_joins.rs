@@ -3,8 +3,9 @@
 //! A `JOIN` target is audited in four parts, walked in this order, each a
 //! keyset walk of its own keys:
 //!
-//! 1. **`T` and the visible target**, a page of target groups, by the group
-//!    key text (`ddl::pk_key_sql_expr` over the target's identity). One
+//! 1. **`T` and the visible target**, a page of target groups, by the target's
+//!    identity columns ([`super::self_check_keyset`]), named in a report by
+//!    their key text (`ddl::pk_key_sql_expr`). One
 //!    statement reads, under one snapshot, the definition's own `JOIN …
 //!    GROUP BY` over the two tables as the target has applied them (each group's row count, each
 //!    argument's non-null count and, for a summed argument, its sum, and
@@ -55,9 +56,13 @@
 //! GROUP BY`, so a rendering bug in the product the apply computes
 //! disagrees with it instead of agreeing with itself.
 //!
-//! Cost: each part's source side scans its table (the target's part, the
-//! join of both) per page, aggregating only the keys up to the hidden
-//! side's last key, so about a page of groups.
+//! Cost: `P`, `M` and `J` are index-ordered when their table has an index
+//! leading with the part's key (`a`'s group columns and join key, `b`'s join
+//! key): a page is then a range scan of about a page of keys, and the walk
+//! of that part reads its table about once. Without one the part's source
+//! side scans its table per page, aggregating only the keys up to the hidden
+//! side's last key. The target's part reads the join of both tables, which no
+//! index orders, so each of its pages scans them.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -70,10 +75,9 @@ use crate::defs::join::{self as spec, HiddenTable, Side as JoinSide};
 use crate::defs::model::Definition;
 use crate::pool::{Pool, quote_ident};
 
-use super::self_check::{
-    BYTE_ORDER, ComparePass, Divergence, SelfCheckError, SelfCheckScope, render_leaf,
-};
-use super::self_check_groups::{Side, Uncertain, partial_text, weighted_partials};
+use super::self_check::{ComparePass, Divergence, SelfCheckError, SelfCheckScope, render_leaf};
+use super::self_check_groups::{Side, Uncertain, bound, partial_text, weighted_partials};
+use super::self_check_keyset::{BYTE_ORDER, Keyset};
 use super::self_check_ring::{Lands, Ring, WEIGHT};
 
 /// One part of the walk (the module doc), in walk order.
@@ -293,31 +297,12 @@ fn partial_columns(summed: &[bool]) -> Vec<String> {
     names
 }
 
-/// Key columns `names`, for [`ddl::pk_key_sql_expr`]: nullable, so a `NULL`
-/// part encodes as the ring's key text does.
-fn key_columns(names: &[String]) -> Vec<PrimaryKeyColumn> {
-    names
-        .iter()
-        .map(|name| PrimaryKeyColumn {
-            name: name.clone(),
-            data_type: String::new(),
-            nullable: true,
-            collation: None,
-        })
-        .collect()
-}
-
 /// The key text of `key` read through `alias`, under byte order.
 fn key_sql(key: &[PrimaryKeyColumn], alias: &str) -> String {
     format!(
         "({}) collate {BYTE_ORDER}",
         ddl::pk_key_sql_expr(key, Some(alias))
     )
-}
-
-/// `$1`, the cursor's key, bounds `key` from below.
-fn after_sql(key: &str) -> String {
-    format!("($1::text is null or {key} > $1)")
 }
 
 /// What a page reads of the ring besides its own sides
@@ -331,15 +316,16 @@ struct RingReads {
 }
 
 /// The statement of a page of `P`, `M` or `J`: `$1` is the cursor's key,
-/// `$2` the limit; each row is `(side, page_end, key, values)`, side 1 the
-/// source's and 2 the hidden table's, as `super::self_check_groups`' page,
-/// and sides 5 and 6 its uncertain keys and its "every key" row.
-/// `source_from` names the weighted source rows as `__s`, carrying `key`'s
-/// columns, `source_where` (`and …`, or empty) filters them, and `having`
-/// keeps a key whose partials aren't all zero.
+/// `$2` the limit and `$3…` the cursor's columns ([`Keyset::params`]); each
+/// row is `(side, page_end, key, values)`, side 1 the source's and 2 the
+/// hidden table's, as `super::self_check_groups`' page, and sides 5 and 6 its
+/// uncertain keys and its "every key" row. `source_from` names the weighted
+/// source rows as `__s`, carrying `keyset`'s columns, `source_where`
+/// (`and …`, or empty) filters them, and `having` keeps a key whose partials
+/// aren't all zero.
 #[allow(clippy::too_many_arguments)]
 fn partials_page_sql(
-    key: &[PrimaryKeyColumn],
+    keyset: &Keyset,
     hidden: &str,
     hidden_values: &[String],
     source_from: &str,
@@ -347,46 +333,59 @@ fn partials_page_sql(
     source_values: &[String],
     having: &str,
     ring: &RingReads,
+    bounded: bool,
 ) -> String {
-    let hk = key_sql(key, "__h");
-    let sk = key_sql(key, "__s");
-    let group: Vec<String> = key
+    let key = keyset.columns();
+    let hk = ddl::pk_key_sql_expr(key, Some("__h"));
+    let sk = ddl::pk_key_sql_expr(key, Some("__s"));
+    let h_refs = keyset.refs(Some("__h"));
+    let s_refs = keyset.refs(Some("__s"));
+    let h_carried = keyset.select_carried(&h_refs);
+    let s_carried = keyset.select_carried(&s_refs);
+    let hid_end: Vec<String> = keyset
+        .carried(None)
         .iter()
-        .map(|c| format!("__s.{}", quote_ident(&c.name)))
+        .map(|c| format!("(select {c} from he)"))
         .collect();
-    format!(
-        "with {ctes}\
+    let within_hid = bound(keyset, &s_refs, &hid_end, bounded);
+    let group: Vec<String> = s_refs.clone();
+    let h_order = keyset.order_by(&h_refs);
+    let s_order = keyset.order_by(&s_refs);
+    let hv = hidden_values.join(", ");
+    let sv = source_values.join(", ");
+    let hid = keyset.side(&h_refs, |cond| {
+        format!(
+            "select {hk} as __k{h_carried}, array[{hv}]::text[] as __v from {hidden} __h \
+             where {cond} order by {h_order} limit $1"
+        )
+    });
+    let src = keyset.side(&s_refs, |cond| {
+        format!(
+            "select {sk} as __k{s_carried}, array[{sv}]::text[] as __v from {source_from} \
+             where {cond} and {within_hid} {source_where} \
+             group by {group} having {having} order by {s_order} limit $1",
+            group = group.join(", "),
+        )
+    });
+    let ctes = format!(
+        "{ctes}\
+         hid0 as materialized ({hid}), \
          hid as materialized ( \
-             select {hk} as __k, array[{hv}]::text[] as __v from {hidden} __h \
-             where {h_after} order by __k limit $2), \
-         hid_end as (select max(__k) as e from hid having count(*) >= $2), \
-         src as materialized ( \
-             select {sk} as __k, array[{sv}]::text[] as __v from {source_from} \
-             where {s_after} and ((select e from hid_end) is null or {sk} <= (select e from hid_end)) \
-                   {source_where} \
-             group by {group} having {having} order by __k limit $2), \
-         unc as ({uncertain}), \
-         page as ( \
-             select least((select max(__k) from src having count(*) >= $2), \
-                          (select e from hid_end)) as page_end) \
-         select 1, page.page_end, src.__k, src.__v from src, page \
-          where page.page_end is null or src.__k <= page.page_end \
-         union all \
-         select 2, page.page_end, hid.__k, hid.__v from hid, page \
-          where page.page_end is null or hid.__k <= page.page_end \
-         union all \
-         select 5, page.page_end, unc.__k, null::text[] from unc, page \
-         union all \
-         select 6, page.page_end, '', null::text[] from page where {global}",
+             select hid0.*, row_number() over (order by {c_order}) as __rn from hid0), \
+         he as (select {c_cols} from hid where __rn = $1), \
+         src as materialized ({src}), \
+         unc as ({uncertain}), ",
         ctes = ring.ctes,
-        hv = hidden_values.join(", "),
-        h_after = after_sql(&hk),
-        sv = source_values.join(", "),
-        s_after = after_sql(&sk),
-        group = group.join(", "),
+        c_order = keyset.order_by(&keyset.carried(None)),
+        c_cols = keyset.carried(None).join(", "),
         uncertain = ring.uncertain,
+    );
+    let extra = format!(
+        " union all select 5, page.page_end, unc.__k, null::text[] from unc, page \
+          union all select 6, page.page_end, '', null::text[] from page where {global}",
         global = ring.global,
-    )
+    );
+    keyset.ranked(&ctes, &[(1, "src"), (2, "hid")], &[1, 2], &extra)
 }
 
 /// Everything a page of a `JOIN` target needs, read from the definition and
@@ -517,12 +516,17 @@ impl Audit<'_> {
 
     /// `P` or `M`'s page statement, and its partial columns: the side's
     /// cells against a `GROUP BY` of its table's weighted rows.
-    fn side_page(&self, side: JoinSide) -> Result<(String, Vec<String>), SelfCheckError> {
+    fn side_page(
+        &self,
+        side: JoinSide,
+        keyset: &Keyset,
+        steer: bool,
+    ) -> Result<(String, Vec<String>), SelfCheckError> {
         let (part, args, summed) = match side {
             JoinSide::From => (Part::From, &self.from_args, &self.from_summed),
             JoinSide::Joined => (Part::Joined, &self.joined_args, &self.joined_summed),
         };
-        let key = key_columns(&spec::side_key_columns(self.def, side));
+        let key = keyset.columns();
         // A joined row with a `NULL` join-key part joins nothing, and has no
         // `M` cell.
         let source_where: String = match side {
@@ -543,11 +547,11 @@ impl Audit<'_> {
         let (ctes, weighted) = self.ring_reads(side, &ring, true);
         let reads = RingReads {
             ctes,
-            uncertain: Self::uncertain_keys(&ring, &key, None),
+            uncertain: Self::uncertain_keys(&ring, key, None),
             global: ring.global_sql(),
         };
         let sql = partials_page_sql(
-            &key,
+            keyset,
             &self.hidden(part),
             &Self::hidden_values(&columns),
             &format!("{weighted} __s"),
@@ -555,13 +559,14 @@ impl Audit<'_> {
             &values,
             &nonzero,
             &reads,
+            !steer,
         );
         Ok((sql, columns))
     }
 
     /// `J`'s page statement: each join key's `__matches` against the joined
     /// table's weighted row count for it, read under `J`'s column names.
-    fn matches_page(&self) -> String {
+    fn matches_page(&self, keyset: &Keyset, steer: bool) -> String {
         let j_cols = spec::join_key(self.def, JoinSide::From);
         let joined_cols = spec::join_key(self.def, JoinSide::Joined);
         let renamed = |alias: &str| {
@@ -576,16 +581,16 @@ impl Audit<'_> {
             .iter()
             .map(|c| format!(" and __s.{} is not null", quote_ident(c)))
             .collect();
-        let key = key_columns(&j_cols);
+        let key = keyset.columns();
         let ring = self.ring(JoinSide::Joined);
         let (ctes, weighted) = self.ring_reads(JoinSide::Joined, &ring, true);
         let reads = RingReads {
             ctes,
-            uncertain: Self::uncertain_keys(&ring, &key, Some(&renamed("__r"))),
+            uncertain: Self::uncertain_keys(&ring, key, Some(&renamed("__r"))),
             global: ring.global_sql(),
         };
         partials_page_sql(
-            &key,
+            keyset,
             &self.hidden(Part::Matches),
             &["__matches::text".to_string()],
             &format!(
@@ -596,6 +601,7 @@ impl Audit<'_> {
             &[format!("sum(__s.{WEIGHT})::text")],
             &format!("sum(__s.{WEIGHT}) <> 0"),
             &reads,
+            !steer,
         )
     }
 
@@ -612,7 +618,7 @@ impl Audit<'_> {
     /// row is unmatched while its key's joined rows weigh 0 in all.
     fn target_page(
         &self,
-        identity: &[PrimaryKeyColumn],
+        keyset: &Keyset,
         fields: &[&crate::defs::ast::FieldDef],
         field_types: &HashMap<String, String>,
     ) -> Result<(String, Vec<String>), SelfCheckError> {
@@ -621,9 +627,29 @@ impl Audit<'_> {
             Some(JoinSide::Joined) => "__b",
             _ => "__a",
         };
-        let hk = key_sql(identity, "__h");
-        let gk = key_sql(identity, "__g");
-        let vk = key_sql(identity, "__t");
+        let identity = keyset.columns();
+        let hk = ddl::pk_key_sql_expr(identity, Some("__h"));
+        let gk = ddl::pk_key_sql_expr(identity, Some("__g"));
+        let vk = ddl::pk_key_sql_expr(identity, Some("__t"));
+        let (h_refs, g_refs, v_refs) = (
+            keyset.refs(Some("__h")),
+            keyset.refs(Some("__g")),
+            keyset.refs(Some("__t")),
+        );
+        let (h_carried, g_carried, v_carried) = (
+            keyset.select_carried(&h_refs),
+            keyset.select_carried(&g_refs),
+            keyset.select_carried(&v_refs),
+        );
+        let hid_end: Vec<String> = keyset
+            .carried(None)
+            .iter()
+            .map(|c| format!("(select {c} from he)"))
+            .collect();
+        let within_hid = format!(
+            "(not exists (select 1 from he) or {})",
+            keyset.at_most(&g_refs, &hid_end)
+        );
 
         // The query's partials: the `FROM` side's arguments, then the joined
         // side's, as `T` numbers them, each a column of the pairs.
@@ -743,53 +769,62 @@ impl Audit<'_> {
             .iter()
             .map(|f| format!("{}::text", quote_ident(&f.name)))
             .collect();
-        let sql = format!(
-            "with {ctes}\
-             hid as materialized ( \
-                 select {hk} as __k, array[{hv}]::text[] as __v from {t} __h \
-                 where {h_after} order by __k limit $2), \
-             hid_end as (select max(__k) as e from hid having count(*) >= $2), \
-             src as materialized ( \
-                 select {gk} as __k, array[{sv}]::text[] as __v, array[{sf}]::text[] as __f, \
-                        sum({WEIGHT}) > 0 as __pos \
+        let hv = Self::hidden_values(&columns).join(", ");
+        let (h_order, g_order, v_order) = (
+            keyset.order_by(&h_refs),
+            keyset.order_by(&g_refs),
+            keyset.order_by(&v_refs),
+        );
+        let t = self.hidden(Part::Target);
+        let sv = sv.join(", ");
+        let sf = oracle_fields.join(", ");
+        let group_by = group_by.join(", ");
+        let vv = visible.join(", ");
+        let target = &self.target;
+        let hid = keyset.side(&h_refs, |cond| {
+            format!(
+                "select {hk} as __k{h_carried}, array[{hv}]::text[] as __v from {t} __h \
+                 where {cond} order by {h_order} limit $1"
+            )
+        });
+        let src = keyset.side(&g_refs, |cond| {
+            format!(
+                "select {gk} as __k{g_carried}, array[{sv}]::text[] as __v, \
+                        array[{sf}]::text[] as __f, sum({WEIGHT}) > 0 as __pos \
                  from ({pairs}) __g \
-                 where {g_after} \
-                   and ((select e from hid_end) is null or {gk} <= (select e from hid_end)) \
-                 group by {group_by} having {nonzero} order by __k limit $2), \
-             vis as materialized ( \
-                 select {vk} as __k, array[{vv}]::text[] as __v from {target} __t \
-                 where {v_after} order by __k limit $2), \
-             page as ( \
-                 select least( \
-                     (select max(__k) from src having count(*) >= $2), \
-                     (select e from hid_end), \
-                     (select max(__k) from vis having count(*) >= $2)) as page_end) \
-             select 1, page.page_end, src.__k, src.__v from src, page \
-              where page.page_end is null or src.__k <= page.page_end \
-             union all \
-             select 2, page.page_end, hid.__k, hid.__v from hid, page \
-              where page.page_end is null or hid.__k <= page.page_end \
-             union all \
-             select 3, page.page_end, src.__k, src.__f from src, page \
-              where src.__pos and (page.page_end is null or src.__k <= page.page_end) \
-             union all \
-             select 4, page.page_end, vis.__k, vis.__v from vis, page \
-              where page.page_end is null or vis.__k <= page.page_end \
-             union all \
-             select 6, page.page_end, '', null::text[] from page \
+                 where {cond} and {within_hid} \
+                 group by {group_by} having {nonzero} order by {g_order} limit $1"
+            )
+        });
+        let vis = keyset.side(&v_refs, |cond| {
+            format!(
+                "select {vk} as __k{v_carried}, array[{vv}]::text[] as __v from {target} __t \
+                 where {cond} order by {v_order} limit $1"
+            )
+        });
+        let ctes = format!(
+            "{ctes}\
+             hid0 as materialized ({hid}), \
+             hid as materialized ( \
+                 select hid0.*, row_number() over (order by {c_order}) as __rn from hid0), \
+             he as (select {c_cols} from hid where __rn = $1), \
+             src as materialized ({src}), \
+             pos as (select __k, {c_cols}, __f as __v from src where __pos), \
+             vis as materialized ({vis}), ",
+            c_order = keyset.order_by(&keyset.carried(None)),
+            c_cols = keyset.carried(None).join(", "),
+        );
+        let extra = format!(
+            " union all select 6, page.page_end, '', null::text[] from page \
               where ({any_a}) or ({any_b})",
-            hv = Self::hidden_values(&columns).join(", "),
-            t = self.hidden(Part::Target),
-            h_after = after_sql(&hk),
-            sv = sv.join(", "),
-            sf = oracle_fields.join(", "),
-            g_after = after_sql(&gk),
-            group_by = group_by.join(", "),
-            vv = visible.join(", "),
-            target = self.target,
-            v_after = after_sql(&vk),
             any_a = ra.any_uncertain_sql(),
             any_b = rb.any_uncertain_sql(),
+        );
+        let sql = keyset.ranked(
+            &ctes,
+            &[(1, "src"), (2, "hid"), (3, "pos"), (4, "vis")],
+            &[1, 2, 4],
+            &extra,
         );
         Ok((sql, columns))
     }
@@ -885,7 +920,7 @@ pub(super) async fn compare(
     match def.def.predicate {
         Predicate::True => {}
     }
-    let client = pool.get().await?;
+    let mut client = pool.get().await?;
     let (joined, _) = catalog::join_side_of(&**client, def.id)
         .await?
         .ok_or_else(|| SelfCheckError::UnsupportedExpr {
@@ -920,14 +955,49 @@ pub(super) async fn compare(
     } else {
         HashMap::new()
     };
-    let (sql, columns) = match part {
-        Part::Target => audit.target_page(identity, &fields, &field_types)?,
-        Part::From => audit.side_page(JoinSide::From)?,
-        Part::Joined => audit.side_page(JoinSide::Joined)?,
-        Part::Matches => (audit.matches_page(), vec!["__matches".to_string()]),
+    let mut keyset = match part {
+        Part::Target => Keyset::resolve(&client, identity).await?,
+        Part::From => {
+            let names = spec::side_key_columns(&def.def, JoinSide::From);
+            Keyset::resolve_columns(&client, &audit.from_table, &names).await?
+        }
+        Part::Joined => {
+            let names = spec::side_key_columns(&def.def, JoinSide::Joined);
+            Keyset::resolve_columns(&client, &audit.joined_table, &names).await?
+        }
+        Part::Matches => {
+            let names = spec::join_key(&def.def, JoinSide::From);
+            Keyset::resolve_columns(&client, &audit.from_table, &names).await?
+        }
     };
-    let after: Option<&str> = after.as_deref();
-    let rows = client.query(sql.as_str(), &[&after, &scope.limit]).await?;
+    // The single-table parts are index-ordered when their table's index
+    // leads with the part's key ([`Keyset::run`]).
+    let steer = match part {
+        Part::Target => false,
+        Part::From => {
+            let first = keyset.columns()[0].name.clone();
+            Keyset::index_leads_with(&client, &audit.from_table, &first).await?
+        }
+        Part::Joined => {
+            let first = keyset.columns()[0].name.clone();
+            Keyset::index_leads_with(&client, &audit.joined_table, &first).await?
+        }
+        Part::Matches => {
+            let first = spec::join_key(&def.def, JoinSide::Joined)[0].clone();
+            Keyset::index_leads_with(&client, &audit.joined_table, &first).await?
+        }
+    };
+    keyset.set_cursor(after.as_deref())?;
+    let (sql, columns) = match part {
+        Part::Target => audit.target_page(&keyset, &fields, &field_types)?,
+        Part::From => audit.side_page(JoinSide::From, &keyset, steer)?,
+        Part::Joined => audit.side_page(JoinSide::Joined, &keyset, steer)?,
+        Part::Matches => (
+            audit.matches_page(&keyset, steer),
+            vec!["__matches".to_string()],
+        ),
+    };
+    let rows = Keyset::run(&mut client, sql.as_str(), scope.limit, steer).await?;
 
     let mut sides: [Side; 4] = Default::default();
     let mut uncertain = Uncertain::default();

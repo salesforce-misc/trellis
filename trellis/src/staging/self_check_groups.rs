@@ -1,8 +1,10 @@
 //! `self_check` of an aggregate target on the group basis (#1104, ADR-0013
 //! "Scope", `super::group_basis`).
 //!
-//! One page is a keyset page of groups, by the group key text
-//! (`ddl::pk_key_sql_expr` over the `GROUP BY` columns, under byte order).
+//! One page is a keyset page of groups, by the `GROUP BY` columns
+//! ([`super::self_check_keyset`]); the group key text
+//! (`ddl::pk_key_sql_expr` over them) names a group in a report and is the
+//! walk's cursor.
 //! One statement ([`page_sql`]) reads, under one snapshot, four sides of the
 //! page:
 //!
@@ -36,12 +38,18 @@
 //! path's (`group_basis::GroupTargetPlan`), so a rendering bug there
 //! disagrees with this oracle instead of agreeing with itself.
 //!
-//! Cost: the source side is a scan of the source per page, since the group
-//! key is an expression no index orders. Its `GROUP BY` takes only the
-//! groups up to the hidden side's last key, so it aggregates about a page
-//! of groups, not every group past the cursor. A walk of G groups of a
-//! source of N rows, L groups a page, reads about G / L times N source rows,
-//! as a 1-1 walk over an integer key reads N / L times N.
+//! Cost: the source side is a range scan of an index on the source that
+//! leads with the group columns, if there is one: the page reads about a page
+//! of groups, and a walk of N source rows reads about N, as a 1-1 walk does.
+//! Without one the source side is a scan of the source per page, which
+//! aggregates only the groups up to the hidden side's last key, so a walk of
+//! G groups of N rows, L groups a page, reads about G / L times N source rows.
+//! When an index leads, the statement runs without hash aggregation
+//! ([`Keyset::run`]), since the planner can't estimate the groups of the
+//! weighted union of the source and its ring rows and would otherwise
+//! aggregate the whole source for a page of groups, and it leaves out the
+//! bound to the hidden side's last key ([`bound`]), which the ordered
+//! aggregate would read past to the end of the index.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
@@ -53,9 +61,8 @@ use crate::defs::model::Definition;
 use crate::pool::{Pool, quote_ident};
 
 use super::group_basis::{self, Agg, GroupShape};
-use super::self_check::{
-    BYTE_ORDER, ComparePass, Divergence, SelfCheckError, SelfCheckScope, render_leaf,
-};
+use super::self_check::{ComparePass, Divergence, SelfCheckError, SelfCheckScope, render_leaf};
+use super::self_check_keyset::{BYTE_ORDER, Keyset};
 use super::self_check_ring::{Lands, Ring, WEIGHT};
 
 /// Refuses a definition with an argument or field [`render_leaf`] can't
@@ -115,6 +122,25 @@ fn agg_sql(agg: &Agg) -> String {
     }
 }
 
+/// The condition that a source group is within the hidden side's page, if
+/// that side filled the limit (`he`), or `true` when the source is
+/// index-ordered (`bounded` is false).
+///
+/// The bound keeps an unindexed source's `GROUP BY` to about a page of
+/// groups. An index-ordered `GroupAggregate` stops after a page of groups by
+/// itself, and the bound would make it read on: the last group of the page
+/// is finished by reading the next row, which the bound refuses, and so does
+/// every row after it, to the end of the index.
+pub(super) fn bound(keyset: &Keyset, refs: &[String], end: &[String], bounded: bool) -> String {
+    if !bounded {
+        return "true".to_string();
+    }
+    format!(
+        "(not exists (select 1 from he) or {})",
+        keyset.at_most(refs, end)
+    )
+}
+
 /// The statement of one page ([`compare`]). `$1` is the cursor, `$2` the
 /// limit; each row is `(side, page_end, key, values)` for the sides in the
 /// module doc, numbered from 1, and `page_end` is the page's bound, the
@@ -124,11 +150,12 @@ fn agg_sql(agg: &Agg) -> String {
 /// ([`super::self_check_ring`]).
 fn page_sql(
     shape: &GroupShape,
-    identity: &[PrimaryKeyColumn],
+    keyset: &Keyset,
     ring: &Ring<'_>,
     hidden: &str,
     target: &str,
     floor_key: &str,
+    bounded: bool,
 ) -> Result<String, SelfCheckError> {
     let render = |expr: &Expr| {
         render_leaf(expr).map_err(|detail| SelfCheckError::UnsupportedExpr {
@@ -136,11 +163,18 @@ fn page_sql(
             detail,
         })
     };
-    let key = format!(
-        "({}) collate {BYTE_ORDER}",
-        ddl::pk_key_sql_expr(identity, None)
-    );
-    let after = format!("($1::text is null or {key} > $1)");
+    let identity = keyset.columns();
+    let key = ddl::pk_key_sql_expr(identity, None);
+    let refs = keyset.refs(None);
+    let carried = keyset.select_carried(&refs);
+    let order = keyset.order_by(&refs);
+    // The last key of the hidden side's page when it filled the limit (`he`).
+    let hid_end: Vec<String> = keyset
+        .carried(None)
+        .iter()
+        .map(|c| format!("(select {c} from he)"))
+        .collect();
+    let within_hid = bound(keyset, &refs, &hid_end, bounded);
     let group_cols = shape
         .group_cols
         .iter()
@@ -165,13 +199,15 @@ fn page_sql(
     // limit: the page ends there or earlier, so a group past it would be
     // trimmed anyway, and this way the `GROUP BY` holds a page of groups
     // rather than every group past the cursor.
-    let src = format!(
-        "select {key} as __k, array[{}]::text[] as __v from {weighted} as __s \
-         where {after} and ((select e from hid_end) is null or {key} <= (select e from hid_end)) \
-         group by {group_cols} having {nonzero} order by __k limit $2",
-        src_parts.join(", "),
-        weighted = ring.weighted_sql(&lands),
-    );
+    let weighted = ring.weighted_sql(&lands);
+    let src = keyset.side(&refs, |cond| {
+        format!(
+            "select {key} as __k{carried}, array[{}]::text[] as __v from {weighted} as __s \
+             where {cond} and {within_hid} \
+             group by {group_cols} having {nonzero} order by {order} limit $1",
+            src_parts.join(", "),
+        )
+    });
 
     // Sides 2 and 3: the hidden table's partials, and the visible row they
     // imply.
@@ -201,13 +237,15 @@ fn page_sql(
     } else {
         format!("cross join lateral (select {}) as __a", aggs.join(", "))
     };
-    let hid = format!(
-        "select {key} as __k, array[{}]::text[] as __v, \
-                array[{}]::text[] as __f, __n > 0 as __visible \
-         from {hidden} {lateral} where {after} order by __k limit $2",
-        hid_parts.join(", "),
-        implied.join(", ")
-    );
+    let hid = keyset.side(&refs, |cond| {
+        format!(
+            "select {key} as __k{carried}, array[{}]::text[] as __v, \
+                    array[{}]::text[] as __f, __n > 0 as __visible \
+             from {hidden} {lateral} where {cond} order by {order} limit $1",
+            hid_parts.join(", "),
+            implied.join(", ")
+        )
+    });
 
     // Side 4: the visible rows.
     let visible: Vec<String> = shape
@@ -215,47 +253,49 @@ fn page_sql(
         .iter()
         .map(|(name, _, _)| format!("{}::text", quote_ident(name)))
         .collect();
-    let vis = format!(
-        "select {key} as __k, array[{}]::text[] as __v from {target} \
-         where {after} order by __k limit $2",
-        visible.join(", ")
-    );
+    let vis = keyset.side(&refs, |cond| {
+        format!(
+            "select {key} as __k{carried}, array[{}]::text[] as __v from {target} \
+             where {cond} order by {order} limit $1",
+            visible.join(", ")
+        )
+    });
 
-    Ok(format!(
-        "with {ring_ctes}\
-              hid as materialized ({hid}), \
-              hid_end as (select max(__k) as e from hid having count(*) >= $2), \
-              src as materialized ({src}), \
-              vis as materialized ({vis}), \
-              unc as ( \
-                select distinct ({unc_key}) collate {BYTE_ORDER} as __k \
-                from ({uncertain}) u \
-                cross join lateral jsonb_populate_record(null::{source}, u.__i) as r), \
-              page as ( \
-                select least( \
-                  (select max(__k) from src having count(*) >= $2), \
-                  (select e from hid_end), \
-                  (select max(__k) from vis having count(*) >= $2)) as page_end) \
-         select 1, page.page_end, src.__k, src.__v from src, page \
-          where page.page_end is null or src.__k <= page.page_end \
-         union all \
-         select 2, page.page_end, hid.__k, hid.__v from hid, page \
-          where page.page_end is null or hid.__k <= page.page_end \
-         union all \
-         select 3, page.page_end, hid.__k, hid.__f from hid, page \
-          where hid.__visible and (page.page_end is null or hid.__k <= page.page_end) \
-         union all \
-         select 4, page.page_end, vis.__k, vis.__v from vis, page \
-          where page.page_end is null or vis.__k <= page.page_end \
-         union all \
-         select 5, page.page_end, unc.__k, null::text[] from unc, page \
-         union all \
-         select 6, page.page_end, '', null::text[] from page where {global}",
+    let ctes = format!(
+        "{ring_ctes}\
+         hid0 as materialized ({hid}), \
+         hid as materialized ( \
+            select hid0.*, row_number() over (order by {hid_order}) as __rn from hid0), \
+         he as (select {carried_cols} from hid where __rn = $1), \
+         src as materialized ({src}), \
+         implied as (select __k{carried_cols_lead}, __f as __v from hid where __visible), \
+         vis as materialized ({vis}), \
+         unc as ( \
+            select distinct ({unc_key}) collate {BYTE_ORDER} as __k \
+            from ({uncertain}) u \
+            cross join lateral jsonb_populate_record(null::{source}, u.__i) as r), ",
         ring_ctes = ring.ctes(&lands),
+        hid_order = keyset.order_by(&keyset.carried(None)),
+        carried_cols = keyset.carried(None).join(", "),
+        carried_cols_lead = keyset
+            .carried(None)
+            .iter()
+            .map(|c| format!(", {c}"))
+            .collect::<String>(),
         unc_key = ddl::pk_key_sql_expr(identity, Some("r")),
         uncertain = ring.uncertain_images_sql(),
         source = ring.source_row,
+    );
+    let extra = format!(
+        " union all select 5, page.page_end, unc.__k, null::text[] from unc, page \
+          union all select 6, page.page_end, '', null::text[] from page where {global}",
         global = ring.global_sql(),
+    );
+    Ok(keyset.ranked(
+        &ctes,
+        &[(1, "src"), (2, "hid"), (3, "implied"), (4, "vis")],
+        &[1, 2, 4],
+        &extra,
     ))
 }
 
@@ -323,6 +363,89 @@ impl Uncertain {
 
 pub(super) type Side = BTreeMap<String, Vec<Option<String>>>;
 
+/// [`page_sql`] for `def`, and the keyset it pages by.
+async fn statement(
+    pool: &Pool,
+    client: &tokio_postgres::Client,
+    def: &Definition,
+    shape: &GroupShape,
+    identity: &[PrimaryKeyColumn],
+    after: Option<&str>,
+    steer: bool,
+) -> Result<String, SelfCheckError> {
+    let hidden = group_basis::hidden_table_ident(pool.schema(), def.id);
+    let source_pk = ddl::source_primary_key(pool, &def.source_table).await?;
+    let ring = Ring {
+        src_table: &def.source_table,
+        source_row: ddl::qualified_source_table(&def.source_table),
+        source_pk: &source_pk,
+        transform_id: def.id,
+        tag: "s",
+    };
+    let mut keyset = Keyset::resolve(client, identity).await?;
+    keyset.set_cursor(after)?;
+    let sql = page_sql(
+        shape,
+        &keyset,
+        &ring,
+        &hidden,
+        &ddl::qualified_target_table_ident(&def.target_table),
+        &def.target_table,
+        !steer,
+    )?;
+    Ok(sql)
+}
+
+/// Whether the source has an index that orders a page of groups
+/// ([`Keyset::run`]).
+async fn steers(
+    client: &tokio_postgres::Client,
+    def: &Definition,
+    shape: &GroupShape,
+) -> Result<bool, SelfCheckError> {
+    let first = shape
+        .group_cols
+        .first()
+        .map(String::as_str)
+        .unwrap_or_default();
+    Keyset::index_leads_with(
+        client,
+        &ddl::qualified_source_table(&def.source_table),
+        first,
+    )
+    .await
+}
+
+/// The plan of a page's statement, with sequential scans disabled
+/// ([`super::self_check::explain_page`]).
+#[cfg(any(test, feature = "internals"))]
+pub(super) async fn explain(
+    pool: &Pool,
+    def: &Definition,
+    shape: &GroupShape,
+    identity: &[PrimaryKeyColumn],
+    after: Option<&str>,
+    limit: i64,
+) -> Result<String, SelfCheckError> {
+    let mut client = pool.get().await?;
+    let steer = steers(&client, def, shape).await?;
+    let sql = statement(pool, &client, def, shape, identity, after, steer).await?;
+    let txn = client.transaction().await?;
+    txn.batch_execute("set local enable_seqscan to off").await?;
+    if steer {
+        txn.batch_execute("set local enable_hashagg to off").await?;
+    }
+    let rows = txn
+        .query(format!("explain {sql}").as_str(), &[&limit])
+        .await?;
+    txn.rollback().await?;
+    Ok(rows
+        .iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
 /// One page of the comparison of a group-basis target: [`page_sql`]'s rows,
 /// diffed.
 pub(super) async fn compare(
@@ -339,26 +462,19 @@ pub(super) async fn compare(
     match def.def.predicate {
         Predicate::True => {}
     }
-    let hidden = group_basis::hidden_table_ident(pool.schema(), def.id);
-    let source_pk = ddl::source_primary_key(pool, &def.source_table).await?;
-    let ring = Ring {
-        src_table: &def.source_table,
-        source_row: ddl::qualified_source_table(&def.source_table),
-        source_pk: &source_pk,
-        transform_id: def.id,
-        tag: "s",
-    };
-    let sql = page_sql(
+    let mut client = pool.get().await?;
+    let steer = steers(&client, def, shape).await?;
+    let sql = statement(
+        pool,
+        &client,
+        def,
         shape,
         identity,
-        &ring,
-        &hidden,
-        &ddl::qualified_target_table_ident(&def.target_table),
-        &def.target_table,
-    )?;
-    let client = pool.get().await?;
-    let after: Option<&str> = scope.after.as_deref();
-    let rows = client.query(sql.as_str(), &[&after, &scope.limit]).await?;
+        scope.after.as_deref(),
+        steer,
+    )
+    .await?;
+    let rows = Keyset::run(&mut client, sql.as_str(), scope.limit, steer).await?;
 
     let mut sides: [Side; 4] = Default::default();
     let mut uncertain = Uncertain::default();

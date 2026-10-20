@@ -12,7 +12,7 @@ use crate::streaming::tuning::EngineTuning;
 use crate::streaming::write_tax::{self, CellOptions, ProbeMode, Shape, Variant};
 use crate::streaming::{
     build_under_load, capture_ceiling, disk_tier, fold_in, generator_reach, hop_latency, idle_cost,
-    join, load, ssi_tax, throughput,
+    join, load, self_check_walk, ssi_tax, throughput,
 };
 
 /// Every scenario name this module handles, for `main.rs`'s usage message.
@@ -30,6 +30,7 @@ pub const SCENARIOS: &[&str] = &[
     "generator-reach",
     "build-under-load",
     "join",
+    "self-check-walk",
 ];
 
 /// The latency ladder's defaults. #266: "low offered rate (e.g. 10
@@ -664,6 +665,25 @@ pub fn run(name: &str, args: &[String]) -> Option<bool> {
                 result.wal_bytes_per_sec / 1024.0,
                 result.seals_per_sec,
             );
+            Some(true)
+        }
+
+        // #1178: one `self_check` walk's cost as the table grows.
+        "self-check-walk" => {
+            let cfg = self_check_walk::Config {
+                rows: number(args, "--rows").map_or(1_000_000, |n| n as i64),
+                aggregate: flag(args, "--kind") == Some("aggregate"),
+                groups: number(args, "--groups").map_or(10_000, |n| n as i64),
+                probe_pages: number(args, "--probe-pages").map_or(0, |n| n as usize),
+                walk_after_probe: args.iter().any(|a| a == "--walk-after-probe"),
+                index: args.iter().any(|a| a == "--index"),
+                build_timeout: secs(args, "--build-timeout-secs")
+                    .unwrap_or(Duration::from_secs(7200)),
+                walk_timeout: secs(args, "--walk-timeout-secs")
+                    .unwrap_or(Duration::from_secs(14_400)),
+            };
+            let tuning = throughput_tuning(args);
+            runtime().block_on(self_check_walk::run(cfg, &tuning));
             Some(true)
         }
 
