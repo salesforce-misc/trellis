@@ -9,6 +9,13 @@
 //! the source and the target (`pg_stat_user_tables.seq_tup_read` deltas), so
 //! rows read per page is `seq_tup_read / pages`.
 //!
+//! `--kind join` (#1198) instead walks the `P` and `M` parts of a JOIN target
+//! (`FROM a JOIN b ON a.bid = b.id GROUP BY a.cat, b.region`, `a` indexed on
+//! `bid`, `--rows` rows of `a`, a tenth as many of `b`) with `Standard`
+//! pages of 10 000 keys, each part timed apart, and reports the rows read
+//! from the hidden table and the source of each (sequential tuples plus index
+//! fetches) per page. `--hidden-only-old` is not a flag: run it on a commit.
+//!
 //! `--probe-pages K` (1-1 only) instead times K single pages of today's
 //! statement shape directly (the source side's keyset read and the target
 //! side's, spread across the keyspace), without running the job: for a table
@@ -31,6 +38,8 @@ const PAGE_KEYS: i64 = 10_000;
 pub struct Config {
     pub rows: i64,
     pub aggregate: bool,
+    /// `--kind join` (#1198): walk a JOIN target's `P` and `M` parts.
+    pub join: bool,
     pub groups: i64,
     pub probe_pages: usize,
     /// Run the walk too after probing (`--walk-after-probe`).
@@ -54,6 +63,9 @@ async fn seq_tup_read(raw: &RawClient, table: &str) -> i64 {
 }
 
 pub async fn run(cfg: Config, tuning: &EngineTuning) {
+    if cfg.join {
+        return run_join(cfg, tuning).await;
+    }
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
@@ -304,4 +316,172 @@ async fn probe(raw: &RawClient, cfg: &Config) {
         total_pages,
         mean * total_pages as f64
     );
+}
+
+/// `--kind join`: the `P` and `M` walks of a JOIN target (the module doc).
+async fn run_join(cfg: Config, tuning: &EngineTuning) {
+    use trellis::IntWidth::{Int4, Int8};
+    use trellis::dev::defs::ValueType::Integer;
+    trellis::dev::staging::set_group_basis(true);
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    let keys = (cfg.rows / 10).max(1);
+    raw.batch_execute(
+        "create table public.a (id bigint primary key, bid integer not null, \
+             cat integer not null, amt bigint not null); \
+         create table public.b (id integer primary key, region integer not null, w bigint); \
+         create index a_bid on public.a (bid)",
+    )
+    .await
+    .expect("create the tables");
+    let client = trellis::Client::start(db.dsn(), tuning.client_options()).expect("client start");
+    let columns: HashMap<_, _> = HashMap::from([
+        ("id".to_string(), Integer(Int8)),
+        ("bid".to_string(), Integer(Int4)),
+        ("cat".to_string(), Integer(Int4)),
+        ("amt".to_string(), Integer(Int8)),
+    ]);
+    trellis::dev::defs::install_definition(
+        &db.pool,
+        "TRANSFORM jt FROM public.a JOIN public.b ON a.bid = b.id GROUP BY a.cat, b.region \
+         SELECT a.cat AS cat, b.region AS region, COUNT(*) AS n, SUM(a.amt) AS sa",
+        &columns,
+        "public",
+    )
+    .await
+    .expect("install definition");
+    wait_for_live(&raw, "jt", Instant::now() + cfg.build_timeout).await;
+    // The rows arrive through capture, `b` first. Every `a` row matches one
+    // `b` row; `a` has about `rows / 2` distinct `(bid, cat)` cells.
+    let load_start = Instant::now();
+    raw.batch_execute(&format!(
+        "insert into public.b select g, (g % 5)::integer, g from generate_series(1, {keys}) g"
+    ))
+    .await
+    .expect("load b");
+    let batch = 100_000i64;
+    let mut lo = 1i64;
+    while lo <= cfg.rows {
+        let hi = (lo + batch - 1).min(cfg.rows);
+        raw.batch_execute(&format!(
+            "insert into public.a select g, (g % {keys} + 1)::integer, \
+                 ((g / {keys}) % 5)::integer, g from generate_series({lo}::bigint, {hi}::bigint) g"
+        ))
+        .await
+        .expect("load a");
+        lo = hi + 1;
+    }
+    loop {
+        let n: i64 = raw
+            .query_one("select coalesce(sum(n), 0)::bigint from public.jt", &[])
+            .await
+            .expect("read target")
+            .get(0);
+        if n == cfg.rows {
+            break;
+        }
+        assert!(
+            load_start.elapsed() < cfg.build_timeout,
+            "the join never converged"
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    eprintln!("loaded in {:.1}s", load_start.elapsed().as_secs_f64());
+    raw.batch_execute("vacuum analyze")
+        .await
+        .expect("vacuum analyze");
+    let id: i64 = raw
+        .query_one(
+            "select id from trellis.transform_definitions where target_table = 'public.jt'",
+            &[],
+        )
+        .await
+        .expect("definition id")
+        .get(0);
+    settle(&raw).await;
+
+    // Rows a table has served so far: sequential tuples and index fetches.
+    let rows_read = |table: String| {
+        let raw = &raw;
+        // `~` against the name: a table name is anchored, `seg_` is the ring's
+        // segments.
+        let table = if table == "ring" {
+            "^seg_[0-9]+$".to_string()
+        } else {
+            format!("^{table}$")
+        };
+        async move {
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            let r: i64 = raw
+                .query_one(
+                    "select coalesce(sum(seq_tup_read + idx_tup_fetch), 0)::bigint \
+                     from pg_stat_user_tables where relname ~ $1",
+                    &[&table],
+                )
+                .await
+                .expect("read the table stats")
+                .get(0);
+            r
+        }
+    };
+    for (part, hidden, source, next) in [
+        ("p", format!("join_{id}_p"), "a", "m"),
+        ("m", format!("join_{id}_m"), "b", "j"),
+    ] {
+        let (hidden_before, source_before, ring_before) = (
+            rows_read(hidden.clone()).await,
+            rows_read(source.to_string()).await,
+            rows_read("ring".to_string()).await,
+        );
+        let start = Instant::now();
+        let (mut after, mut pages, mut compared) = (Some(part.to_string()), 0i64, 0i64);
+        while let Some(cursor) = after.take() {
+            let page = trellis::dev::staging::self_check_page(
+                &db.pool,
+                "jt",
+                trellis::dev::staging::SelfCheckScope {
+                    after: Some(cursor),
+                    limit: PAGE_KEYS,
+                },
+                trellis::SelfCheckMode::Standard,
+                Duration::from_secs(120),
+            )
+            .await
+            .expect("a page of the check");
+            assert!(
+                matches!(page.outcome, trellis::SelfCheckOutcome::Converged),
+                "{:?}",
+                page.outcome
+            );
+            pages += 1;
+            compared += page.rows_compared;
+            assert!(
+                start.elapsed() < cfg.walk_timeout,
+                "walk exceeded --walk-timeout-secs"
+            );
+            after = match page.next_after {
+                Some(c) if c.starts_with(&format!("{part}:")) => Some(c),
+                Some(c) => {
+                    assert!(c == next, "the part ended at {c:?}");
+                    None
+                }
+                None => None,
+            };
+        }
+        let secs = start.elapsed().as_secs_f64();
+        let hidden_read = rows_read(hidden).await - hidden_before;
+        let source_read = rows_read(source.to_string()).await - source_before;
+        let ring_read = rows_read("ring".to_string()).await - ring_before;
+        println!(
+            "{{\"scenario\":\"self-check-walk\",\"kind\":\"join\",\"part\":\"{part}\",\
+             \"rows\":{},\"keys_compared\":{compared},\"pages\":{pages},\"walk_secs\":{secs:.2},\
+             \"hidden_rows_read\":{hidden_read},\"source_rows_read\":{source_read},\"ring_rows_read\":{ring_read},\
+             \"hidden_rows_per_page\":{},\"source_rows_per_page\":{}}}",
+            cfg.rows,
+            hidden_read / pages.max(1),
+            source_read / pages.max(1),
+        );
+    }
+    client.shutdown().await.expect("shutdown");
 }

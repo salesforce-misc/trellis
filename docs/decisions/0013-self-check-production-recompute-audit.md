@@ -212,12 +212,19 @@ times the table, which is hours at 100M rows.
 
 * **The key per target kind.** A 1-1 target pages by the source's primary key,
   which always has its index. A group-basis aggregate pages by its `GROUP BY`
-  columns, a JOIN's target part by its group columns, `P` by `a`'s group columns
-  and the join key, `M` and `J` by `b`'s join key. The aggregate, `P`, `M`
-  and `J` are index-served only when their table has an index leading with
-  those columns; without one a page scans the table, so a walk reads G / L
-  times it. A JOIN's target part reads the join of both tables, which no index
-  orders, so each of its pages scans them.
+  columns, a JOIN's target part by its group columns, `P` and `M` by the
+  hidden table's cell identity (the side's join key columns, then its group
+  columns not among them) and `J` by `b`'s join key. The aggregate and `J`
+  are index-served only when their table has an index leading with those
+  columns; without one a page scans the table, so a walk reads G / L times it.
+  `P` and `M` lead with the join key because that is the order of the hidden
+  table's one index: its page is a range scan of that index, so the hidden side
+  costs nothing extra, and an index on the source's join columns (`a`'s for
+  `P`, `b`'s for `M`) serves the source side, with the group columns sorted
+  within each join key. No second hidden index exists for the walk, so the
+  apply path's write cost is unchanged. That source index is the one a JOIN
+  needs for a linear walk (#1167). A JOIN's target part reads the join of both
+  tables, which no index orders, so each of its pages scans them.
 * **Order.** Each column ascending, `NULL` last (what a btree holds, and the
   order `NULLS NOT DISTINCT` identities need), each collatable column under
   one collation named in the statement and used on both sides: the key

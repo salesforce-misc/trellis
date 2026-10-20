@@ -527,7 +527,7 @@ impl From<crate::error::Error> for SelfCheckError {
 /// the full design. The background job ([`super::self_check_job`]) runs this
 /// once per pass of its worker, each from where the last ended; it is
 /// not reached from a public call.
-#[cfg(any(test, feature = "internals"))]
+#[cfg(any(test, feature = "test-util"))]
 pub async fn check_page(
     pool: &Pool,
     target_table: &str,
@@ -1234,6 +1234,26 @@ pub async fn explain_page(
         .map(|row| row.get::<_, String>(0))
         .collect::<Vec<_>>()
         .join("\n"))
+}
+
+/// [`explain_page`] of a `JOIN` target's hidden part `part` (`p`, `m`, `j`
+/// or `t`) after the key text `after`. For tests of the plan's shape.
+#[cfg(any(test, feature = "internals"))]
+pub async fn explain_join_page(
+    pool: &Pool,
+    target_table: &str,
+    part: &str,
+    after: Option<&str>,
+    limit: i64,
+) -> Result<String, SelfCheckError> {
+    let def = catalog::definition_by_target(pool, target_table)
+        .await?
+        .ok_or_else(|| SelfCheckError::TargetNotFound(target_table.to_string()))?;
+    let identity = {
+        let client = pool.get().await?;
+        ddl::identity_key_columns(&**client, &def.target_table).await?
+    };
+    super::self_check_joins::explain(pool, &def, &identity, part, after, limit).await
 }
 
 /// One side of a [`compare_once`] page: key text to the `::text` value of

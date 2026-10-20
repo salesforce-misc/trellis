@@ -15,8 +15,8 @@
 //!    ADR-0019, `LEFT`'s unmatched rows included), and the visible rows
 //!    against the query's rows: a group the query has and the target lacks,
 //!    or the reverse, is a missing or extra row.
-//! 2. **`P`**, a page of `FROM`-side cells (its `GROUP BY` columns and join
-//!    key), against a `GROUP BY` of the `FROM` table over those columns.
+//! 2. **`P`**, a page of `FROM`-side cells (its join key, then its `GROUP BY`
+//!    columns), against a `GROUP BY` of the `FROM` table over those columns.
 //! 3. **`M`**, the same for the joined table, over its rows with no `NULL`
 //!    join-key part (the only ones that can join anything).
 //! 4. **`J`**, a page of join keys: each key's `__matches` against the
@@ -56,13 +56,16 @@
 //! GROUP BY`, so a rendering bug in the product the apply computes
 //! disagrees with it instead of agreeing with itself.
 //!
-//! Cost: `P`, `M` and `J` are index-ordered when their table has an index
-//! leading with the part's key (`a`'s group columns and join key, `b`'s join
-//! key): a page is then a range scan of about a page of keys, and the walk
-//! of that part reads its table about once. Without one the part's source
-//! side scans its table per page, aggregating only the keys up to the hidden
-//! side's last key. The target's part reads the join of both tables, which no
-//! index orders, so each of its pages scans them.
+//! Cost: a page of `P` or `M` is keyed in the hidden table's cell identity
+//! (`spec::side_key_columns`): the join key, then the side's group columns not
+//! among them. The hidden table's one index has that order, so the hidden side
+//! is a range scan of it. The source side is a range scan of an index leading
+//! with the side's join columns (`a`'s for `P`, `b`'s for `M`), the group
+//! columns sorted within each join key, and the walk of the part reads its
+//! table about once. `J` is the same with `b`'s join key. Without such an
+//! index the part's source side scans its table per page, aggregating only the
+//! keys up to the hidden side's last key. The target's part reads the join of
+//! both tables, which no index orders, so each of its pages scans them.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -904,6 +907,152 @@ fn render_signed(def: &TransformDef, expr: &Expr, args: &[Expr]) -> Result<Strin
     })
 }
 
+/// The joined table of `def`, as the catalog records it.
+async fn joined_table(
+    client: &tokio_postgres::Client,
+    def: &Definition,
+) -> Result<String, SelfCheckError> {
+    let (joined, _) = catalog::join_side_of(client, def.id)
+        .await?
+        .ok_or_else(|| SelfCheckError::UnsupportedExpr {
+            target: def.def.target.clone(),
+            detail: "a JOIN definition with no joined table recorded".to_string(),
+        })?;
+    Ok(joined)
+}
+
+/// `def`'s audit over its tables (`joined` from [`joined_table`]).
+async fn build_audit<'a>(
+    pool: &Pool,
+    def: &'a Definition,
+    joined: &'a String,
+) -> Result<Audit<'a>, SelfCheckError> {
+    let from_args = spec::side_arguments(&def.def, JoinSide::From);
+    let joined_args = spec::side_arguments(&def.def, JoinSide::Joined);
+    let from_pk = ddl::source_primary_key(pool, &def.source_table).await?;
+    let joined_pk = ddl::source_primary_key(pool, joined).await?;
+    Ok(Audit {
+        def: &def.def,
+        id: def.id,
+        schema: pool.schema().to_string(),
+        from_table: ddl::qualified_source_table(&def.source_table),
+        joined_table: ddl::qualified_source_table(joined),
+        from_src: &def.source_table,
+        joined_src: joined,
+        from_pk,
+        joined_pk,
+        target: ddl::qualified_target_table_ident(&def.target_table),
+        from_summed: summed(&def.def, &from_args),
+        joined_summed: summed(&def.def, &joined_args),
+        from_args,
+        joined_args,
+    })
+}
+
+impl Audit<'_> {
+    /// `part`'s page statement after `after`, its partial columns, and
+    /// whether the page steers by the source's index ([`Keyset::run`]).
+    async fn page_statement(
+        &self,
+        client: &tokio_postgres::Client,
+        def: &Definition,
+        identity: &[PrimaryKeyColumn],
+        part: Part,
+        after: Option<&str>,
+    ) -> Result<(String, Vec<String>, bool), SelfCheckError> {
+        let audit = self;
+        let fields = value_fields(&def.def);
+        let field_types = if part == Part::Target {
+            super::join::target_column_types(client, &def.target_table).await?
+        } else {
+            HashMap::new()
+        };
+        // A part's key columns are typed and collated as its hidden table's,
+        // which define made from the source's and a change between
+        // deterministic collations of the source leaves alone: a walk then
+        // pages in one order from its first page to its last, as an
+        // aggregate's does by its target's columns. A side's key is its
+        // hidden identity's order, the join key first, so the hidden table's
+        // index serves the hidden side and an index on the source's join
+        // columns serves the source side (#1198).
+        let mut keyset = match part {
+            Part::Target => Keyset::resolve(client, identity).await?,
+            Part::From | Part::Joined | Part::Matches => {
+                let names = match part {
+                    Part::From => spec::side_key_columns(&def.def, JoinSide::From),
+                    Part::Joined => spec::side_key_columns(&def.def, JoinSide::Joined),
+                    _ => spec::join_key(&def.def, JoinSide::From),
+                };
+                Keyset::resolve_columns(client, &audit.hidden(part), &names).await?
+            }
+        };
+        // The single-table parts are index-ordered when their table's index
+        // leads with the part's key ([`Keyset::run`]).
+        let steer = match part {
+            Part::Target => false,
+            Part::From => {
+                let first = keyset.columns()[0].name.clone();
+                Keyset::index_leads_with(client, &audit.from_table, &first).await?
+            }
+            Part::Joined => {
+                let first = keyset.columns()[0].name.clone();
+                Keyset::index_leads_with(client, &audit.joined_table, &first).await?
+            }
+            Part::Matches => {
+                let first = spec::join_key(&def.def, JoinSide::Joined)[0].clone();
+                Keyset::index_leads_with(client, &audit.joined_table, &first).await?
+            }
+        };
+        keyset.set_cursor(after)?;
+        let (sql, columns) = match part {
+            Part::Target => audit.target_page(&keyset, &fields, &field_types)?,
+            Part::From => audit.side_page(JoinSide::From, &keyset, steer)?,
+            Part::Joined => audit.side_page(JoinSide::Joined, &keyset, steer)?,
+            Part::Matches => (
+                audit.matches_page(&keyset, steer),
+                vec!["__matches".to_string()],
+            ),
+        };
+        Ok((sql, columns, steer))
+    }
+}
+
+/// The plan of `part`'s page statement of `def` after `after`, with
+/// sequential scans disabled so that a table still read by one is a table
+/// no index can serve ([`super::self_check::explain_page`]). `part` is a
+/// cursor's part (`p`, `m`, `j`, `t`).
+#[cfg(any(test, feature = "internals"))]
+pub(super) async fn explain(
+    pool: &Pool,
+    def: &Definition,
+    identity: &[PrimaryKeyColumn],
+    part: &str,
+    after: Option<&str>,
+    limit: i64,
+) -> Result<String, SelfCheckError> {
+    let mut client = pool.get().await?;
+    let joined = joined_table(&client, def).await?;
+    let audit = build_audit(pool, def, &joined).await?;
+    let (part, _) = parse_cursor(Some(part));
+    let (sql, _, steer) = audit
+        .page_statement(&client, def, identity, part, after)
+        .await?;
+    let txn = client.transaction().await?;
+    txn.batch_execute("set local enable_seqscan to off").await?;
+    if steer {
+        txn.batch_execute("set local enable_hashagg to off").await?;
+    }
+    let rows = txn
+        .query(format!("explain {sql}").as_str(), &[&limit])
+        .await?;
+    txn.rollback().await?;
+    Ok(rows
+        .iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
 /// One page of the comparison of a `JOIN` target: the part the cursor names
 /// ([`parse_cursor`]), diffed.
 pub(super) async fn compare(
@@ -920,83 +1069,13 @@ pub(super) async fn compare(
         Predicate::True => {}
     }
     let mut client = pool.get().await?;
-    let (joined, _) = catalog::join_side_of(&**client, def.id)
-        .await?
-        .ok_or_else(|| SelfCheckError::UnsupportedExpr {
-            target: def.def.target.clone(),
-            detail: "a JOIN definition with no joined table recorded".to_string(),
-        })?;
-    let from_args = spec::side_arguments(&def.def, JoinSide::From);
-    let joined_args = spec::side_arguments(&def.def, JoinSide::Joined);
-    let from_pk = ddl::source_primary_key(pool, &def.source_table).await?;
-    let joined_pk = ddl::source_primary_key(pool, &joined).await?;
-    let audit = Audit {
-        def: &def.def,
-        id: def.id,
-        schema: pool.schema().to_string(),
-        from_table: ddl::qualified_source_table(&def.source_table),
-        joined_table: ddl::qualified_source_table(&joined),
-        from_src: &def.source_table,
-        joined_src: &joined,
-        from_pk,
-        joined_pk,
-        target: ddl::qualified_target_table_ident(&def.target_table),
-        from_summed: summed(&def.def, &from_args),
-        joined_summed: summed(&def.def, &joined_args),
-        from_args,
-        joined_args,
-    };
-
+    let joined = joined_table(&client, def).await?;
+    let audit = build_audit(pool, def, &joined).await?;
     let (part, after) = parse_cursor(scope.after.as_deref());
     let fields = value_fields(&def.def);
-    let field_types = if part == Part::Target {
-        super::join::target_column_types(&**client, &def.target_table).await?
-    } else {
-        HashMap::new()
-    };
-    // A part's key columns are typed and collated as its hidden table's,
-    // which define made from the source's and a change between
-    // deterministic collations of the source leaves alone: a walk then pages
-    // in one order from its first page to its last, as an aggregate's does
-    // by its target's columns.
-    let mut keyset = match part {
-        Part::Target => Keyset::resolve(&client, identity).await?,
-        Part::From | Part::Joined | Part::Matches => {
-            let names = match part {
-                Part::From => spec::side_key_columns(&def.def, JoinSide::From),
-                Part::Joined => spec::side_key_columns(&def.def, JoinSide::Joined),
-                _ => spec::join_key(&def.def, JoinSide::From),
-            };
-            Keyset::resolve_columns(&client, &audit.hidden(part), &names).await?
-        }
-    };
-    // The single-table parts are index-ordered when their table's index
-    // leads with the part's key ([`Keyset::run`]).
-    let steer = match part {
-        Part::Target => false,
-        Part::From => {
-            let first = keyset.columns()[0].name.clone();
-            Keyset::index_leads_with(&client, &audit.from_table, &first).await?
-        }
-        Part::Joined => {
-            let first = keyset.columns()[0].name.clone();
-            Keyset::index_leads_with(&client, &audit.joined_table, &first).await?
-        }
-        Part::Matches => {
-            let first = spec::join_key(&def.def, JoinSide::Joined)[0].clone();
-            Keyset::index_leads_with(&client, &audit.joined_table, &first).await?
-        }
-    };
-    keyset.set_cursor(after.as_deref())?;
-    let (sql, columns) = match part {
-        Part::Target => audit.target_page(&keyset, &fields, &field_types)?,
-        Part::From => audit.side_page(JoinSide::From, &keyset, steer)?,
-        Part::Joined => audit.side_page(JoinSide::Joined, &keyset, steer)?,
-        Part::Matches => (
-            audit.matches_page(&keyset, steer),
-            vec!["__matches".to_string()],
-        ),
-    };
+    let (sql, columns, steer) = audit
+        .page_statement(&client, def, identity, part, after.as_deref())
+        .await?;
     let rows = Keyset::run(&mut client, sql.as_str(), scope.limit, steer).await?;
 
     let mut sides: [Side; 4] = Default::default();

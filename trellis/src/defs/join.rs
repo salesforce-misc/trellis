@@ -308,11 +308,14 @@ fn partial_columns(arguments: usize) -> Vec<String> {
     columns
 }
 
-/// `side`'s key columns in its hidden partials table: its `GROUP BY`
-/// columns, then its join key columns not already among them.
+/// `side`'s key columns in its hidden partials table, in the order of the
+/// table's cell identity: its join key columns, then its `GROUP BY` columns
+/// not already among them. The join key leads so the table's one index
+/// serves both a `self_check` page's range scan (#1198) and the other
+/// side's lookup of a key's cells.
 pub(crate) fn side_key_columns(def: &TransformDef, side: Side) -> Vec<String> {
-    let mut columns = group_columns(def, side);
-    for column in join_key(def, side) {
+    let mut columns = join_key(def, side);
+    for column in group_columns(def, side) {
         if !columns.contains(&column) {
             columns.push(column);
         }
@@ -347,16 +350,9 @@ pub(crate) fn hidden_tables_ddl(
         body.extend(partial_columns(side_arguments(def, side).len()));
         body.push("__basis pg_snapshot".to_string());
         body.push("__stamp bigint not null default 0".to_string());
-        // The join key leads the cell identity, so its index also serves
-        // the other side's lookup of a key's cells.
-        let mut identity: Vec<String> =
-            join_key(def, side).iter().map(|c| quote_ident(c)).collect();
-        for key in &keys {
-            let key = quote_ident(key);
-            if !identity.contains(&key) {
-                identity.push(key);
-            }
-        }
+        // The cell identity is the key columns in order, the join key first
+        // (`side_key_columns`).
+        let identity: Vec<String> = keys.iter().map(|c| quote_ident(c)).collect();
         body.push(format!(
             "unique nulls not distinct ({})",
             identity.join(", ")
@@ -611,9 +607,9 @@ mod tests {
             ),
         ]);
         let ddl = hidden_tables_ddl("trellis", 7, &def, &from, &joined);
-        assert!(ddl.contains("create table \"trellis\".\"join_7_p\" (\"region\" text, \"id\" integer, \"tenant\" integer, __n bigint"), "{ddl}");
+        assert!(ddl.contains("create table \"trellis\".\"join_7_p\" (\"id\" integer, \"tenant\" integer, \"region\" text, __n bigint"), "{ddl}");
         assert!(
-            ddl.contains("\"join_7_m\" (\"sku\" text, \"order_id\" integer, \"tenant\" integer"),
+            ddl.contains("\"join_7_m\" (\"order_id\" integer, \"tenant\" integer, \"sku\" text"),
             "{ddl}"
         );
         assert!(ddl.contains("\"join_7_j\" (\"id\" integer, \"tenant\" integer, __matches bigint not null default 0, primary key (\"id\", \"tenant\"))"), "{ddl}");

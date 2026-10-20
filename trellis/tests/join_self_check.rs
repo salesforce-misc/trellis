@@ -913,3 +913,97 @@ async fn a_group_column_re_collated_mid_walk_skips_and_repeats_no_cell() {
         "every key once, as a walk without the change"
     );
 }
+
+/// Group columns that are also the join key, and a joined side with no group
+/// columns.
+const GROUP_IS_KEY: &str = "TRANSFORM gk FROM public.a JOIN public.b ON a.k = b.k \
+     GROUP BY a.k, b.gb SELECT a.k AS k, b.gb AS gb, COUNT(*) AS n, SUM(a.x) AS sx";
+
+/// A `P` or `M` page orders by the hidden cell identity, the join key first
+/// (#1198): the hidden side is a range scan of the hidden table's one index
+/// and the source side a range scan of an index on the source's join columns.
+#[tokio::test]
+async fn a_p_or_m_page_is_a_range_scan_of_the_hidden_index_and_the_source_join_index() {
+    let d = start(&[LEFT_PAIR]).await;
+    exec(
+        &d,
+        "create index a_join_idx on public.a (t, k); create index b_join_idx on public.b (t, k)",
+    )
+    .await;
+    for (part, source, index, group) in [
+        ("p", "a", "a_join_idx", "ga"),
+        ("m", "b", "b_join_idx", "gb"),
+    ] {
+        let (hidden, name) = hidden(&d, "l", part).await;
+        let plan = trellis::staging::self_check::explain_join_page(
+            d.pool(),
+            "public.l",
+            part,
+            Some("1\u{1f}1\u{1f}1"),
+            3,
+        )
+        .await
+        .expect("explain the page");
+        // The hidden side's range is bounded by the cursor in the index's
+        // own column order: the join key, then the group column.
+        assert!(
+            plan.contains(&format!(
+                "Index Scan using {name}_t_k_{group}_key on {name} __h"
+            )) && plan.contains(&format!("Index Cond: (ROW(t, k, {group}) > ROW(1, 1, 1))")),
+            "{part}: the hidden side is a range scan of {hidden}'s index:\n{plan}"
+        );
+        assert!(
+            !plan.contains(&format!("Seq Scan on {name} __h")),
+            "{part}: the hidden table is not scanned whole:\n{plan}"
+        );
+        // The source side's range is bounded by the join key alone, so an
+        // index on the join columns serves it.
+        assert!(
+            plan.contains(&format!("Index Scan using {index} on {source} "))
+                && plan.contains("(ROW(t, k) >= ROW(1, 1))"),
+            "{part}: the source side is a range scan of {index}:\n{plan}"
+        );
+    }
+}
+
+/// A walk's findings and the keys it compares do not depend on the page
+/// size, whatever the key's shape: the walk reads every cell once. Every
+/// cell of `P` and `M` is damaged, so a skipped or repeated key shows as a
+/// missing or doubled divergence.
+async fn walk_is_the_same_at_every_page_size(definition: &str, target: &str) {
+    let mut d = start(&[definition]).await;
+    seed(&mut d).await;
+    for part in ["p", "m"] {
+        let (table, _) = hidden(&d, target, part).await;
+        exec(&d, &format!("update {table} set __n = __n + 1")).await;
+    }
+    let sorted = |found: Vec<Divergence>| {
+        let mut found: Vec<String> = found.iter().map(|f| format!("{f:?}")).collect();
+        found.sort();
+        found
+    };
+    let (whole, compared, _) = walk(&d, target, 1000).await;
+    let whole = sorted(whole);
+    assert!(whole.len() > 6, "{whole:?}");
+    for limit in [1, 2, 3, 5] {
+        let (found, count, _) = walk(&d, target, limit).await;
+        let found = sorted(found);
+        assert_eq!(found, whole, "limit {limit}");
+        assert_eq!(count, compared, "limit {limit}");
+    }
+}
+
+#[tokio::test]
+async fn a_composite_nullable_join_key_walks_alike_at_every_page_size() {
+    walk_is_the_same_at_every_page_size(LEFT_PAIR, "l").await;
+}
+
+#[tokio::test]
+async fn a_joined_side_with_no_group_columns_walks_alike_at_every_page_size() {
+    walk_is_the_same_at_every_page_size(INNER, "i").await;
+}
+
+#[tokio::test]
+async fn a_group_column_that_is_also_the_join_key_walks_alike_at_every_page_size() {
+    walk_is_the_same_at_every_page_size(GROUP_IS_KEY, "gk").await;
+}
