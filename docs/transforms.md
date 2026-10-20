@@ -293,11 +293,11 @@ not corrected, and whether it reaches anything chained off the table is
 undefined ([known correctness gaps](known-correctness-gaps.md#8-operator-changes-inside-trellis-owned-artifacts)). Treat a target as read-only, and specifically:
 
 * **Do not insert, update or delete rows.** An edited row stays wrong until the
-  next event that recomputes it, and a row added by hand is accounted for by
-  nothing. `self_check`
+  next event that recomputes it, and a row added or re-keyed by hand stays
+  until a rebuild. `self_check`
   ([0013](decisions/0013-self-check-production-recompute-audit.md)) reports the
   divergence; it does not repair it. `PAUSE` then `RESUME` rebuilds the table
-  from source.
+  from source, and a 1-1 rebuild also deletes the rows the source doesn't back.
 * **Do not add, drop, rename or retype columns.** Trellis addresses its columns
   by name and type. Redefining the transform is how a column changes
   ([Changing a definition](#changing-a-definition)).
@@ -308,7 +308,8 @@ undefined ([known correctness gaps](known-correctness-gaps.md#8-operator-changes
 * **Do not `TRUNCATE` or `DROP` the table yourself.** `DROP TRANSFORM` removes
   the table and its definition together, and refuses while another definition
   still chains off it. A hand `TRUNCATE` leaves the table empty until the
-  transform is paused and resumed.
+  transform is paused and resumed. A resume refuses while the table is
+  missing, and the repair is `DROP TRANSFORM` and defining it again.
 * **Don't let row-level security apply to the role that writes it.**
   Trellis writes a target as the role each worker connects as, with
   `row_security = off`, so a write that policies applying to that role would

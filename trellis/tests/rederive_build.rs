@@ -2870,3 +2870,59 @@ async fn a_plan_batch_behind_a_drop_writes_nothing() {
         "and the batch planned no chunk"
     );
 }
+
+/// #1201: a rebuild of a 1-1 target deletes rows someone added or re-keyed
+/// by hand, which the source no longer backs, not only the rows it
+/// re-derives from the source.
+#[tokio::test]
+async fn a_rebuild_deletes_target_rows_added_or_rekeyed_by_hand() {
+    let mut f = Fixture::new(150, &[ONE]).await;
+    f.pass().await;
+    f.run("one").await;
+    assert_eq!(f.status("one").await.as_deref(), Some("live"));
+
+    let trellis = f.trellis().await;
+    trellis.apply("PAUSE TRANSFORM one").await.expect("pause");
+    f.raw
+        .batch_execute(
+            "insert into public.one (id, g, dbl) values (9999, 1, 1); \
+             update public.one set id = 8888 where id = 7",
+        )
+        .await
+        .expect("change the target by hand");
+    trellis.apply("RESUME TRANSFORM one").await.expect("resume");
+    f.pass().await;
+    f.run("one").await;
+    assert_eq!(f.status("one").await.as_deref(), Some("live"));
+    assert_eq!(
+        f.rows(ONE_ACTUAL).await,
+        f.rows(ONE_EXPECTED).await,
+        "the rebuild repaired the hand-made rows"
+    );
+}
+
+/// #1201: a resume of a definition whose target table is gone refuses and
+/// names the repair, as for a missing ledger, instead of succeeding and
+/// leaving a build that fails.
+#[tokio::test]
+async fn a_resume_refuses_when_the_target_table_is_gone() {
+    let mut f = Fixture::new(150, &[ONE]).await;
+    f.pass().await;
+    f.run("one").await;
+    let trellis = f.trellis().await;
+    trellis.apply("PAUSE TRANSFORM one").await.expect("pause");
+    f.raw
+        .batch_execute("drop table public.one")
+        .await
+        .expect("drop the target");
+    let refusal = trellis
+        .apply("RESUME TRANSFORM one")
+        .await
+        .expect_err("a resume without its target is refused")
+        .to_string();
+    assert!(
+        refusal.contains("DROP TRANSFORM") && refusal.contains("public.one"),
+        "{refusal}"
+    );
+    assert_eq!(f.status("one").await.as_deref(), Some("paused"));
+}

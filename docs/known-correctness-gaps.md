@@ -65,8 +65,8 @@ These are the tools the entries refer to:
   `trellis apply '<statement>'`. A resume first re-runs define's validation
   against the live schema, and refuses, leaving the definition paused, while
   define would refuse it. It also refuses in four cases define doesn't: a
-  1-1 target's source key was redefined, a definition's ledger table is
-  missing, or an aggregate's group-delta table is missing (entry 8)
+  1-1 target's source key was redefined, a definition's target or ledger table
+  is missing, or an aggregate's group-delta table is missing (entry 8)
   or has different running-sum or recompute columns from the ones define would
   create now (a `SUM` or `AVG` argument moved between an exact type and
   floating point). It then brings every column
@@ -74,8 +74,8 @@ These are the tools the entries refer to:
   passthrough and GROUP BY copies, its calculated, aggregate and ledger
   contribution columns, and its relationship projections' columns) to the
   type define would give it now, re-reads every current source row and
-  deletes target rows the source no longer backs
-  ([ADR-0014](decisions/0014-pause-and-drop-a-transform.md)). It doesn't replay
+  deletes target rows the source no longer backs, including a 1-1 target's
+  rows added or re-keyed by hand ([ADR-0014](decisions/0014-pause-and-drop-a-transform.md)). It doesn't replay
   buffered changes, so it repairs anything that's wrong because a change was
   missed. It also releases every key the definition holds in quarantine, and
   only that definition's.
@@ -87,7 +87,7 @@ These are the tools the entries refer to:
   while define would, naming the column and what to change, and a 1-1
   definition whose source key was redefined, an aggregate whose `SUM` or
   `AVG` argument moved between an exact type and floating point, or whose
-  ledger or group-delta table was dropped (entry 8), can only be
+  target, ledger or group-delta table was dropped (entry 8), can only be
   defined again.
   It's also the repair when a resume can't convert the values of a column
   Trellis created to its new type (a key moved from `text` to `uuid` by a
@@ -108,7 +108,7 @@ These are the tools the entries refer to:
 | 1 | `ALTER COLUMN … TYPE … USING` that rewrites values, with a metadata change to the same column in the same pass window, on a column added with a constant default whose table hasn't been rewritten since, on a column with a compression method set, or as a widening no copy outgrows | yes | `self_check` (1-1 targets only) | none; documented |
 | 3 | A source key re-collated while a `self_check` job runs | the job can skip or repeat keys | no | none filed |
 | 5 | A table attached to a hierarchy and detached, or a capture function replaced and restored, between two reconcile passes; capture changed outside Trellis on a partitioned source, once partitioned sources are supported (#897) | yes | `self_check` (1-1 targets only) | #707 (partitioned sources); otherwise none; documented |
-| 8 | A manual change inside Trellis's artifacts: a target or hidden table edited or dropped, DML, DDL or a data load into Trellis's schema, or a restore of that schema alone | yes | `self_check` (1-1 and `JOIN` targets, and a `JOIN`'s hidden tables); a missing ledger or group-delta table refuses a resume; a change to Trellis's schema: no | none; documented |
+| 8 | A manual change inside Trellis's artifacts: a target or hidden table edited or dropped, DML, DDL or a data load into Trellis's schema, or a restore of that schema alone | yes | `self_check` (1-1 and `JOIN` targets, and a `JOIN`'s hidden tables); a missing target, ledger or group-delta table refuses a resume; a change to Trellis's schema: no | none; documented |
 | 9 | An application trigger re-keying a parent's join column within the statement | yes | no | #1115 removes relationships |
 | 10 | `REGEXP_COUNT` on `"C"`-collated data or with Postgres-only regex syntax | yes | `self_check` (1-1 targets only) | #643, with #575 |
 | 11 | Row-level security applying to a role Trellis runs as | only capture, for the ring owner, until the next reconcile pass; elsewhere reads and writes fail | drain, discharge, catch-up and build merge: pause what they reach; one the catalog can't pin shows on `drain_failure` (drain) or `backfill_failure` (discharge, catch-up), or, for a build merge, pauses on its fifth charge with the error on `capture_failure`; build chunk: `backfill_failure` | none |
@@ -273,7 +273,7 @@ Better still, don't disable the capture triggers
 * **Target and side tables.** Trellis assumes it's the only writer and doesn't
   correct the change. An edited row stays wrong until its key is recomputed
   for another reason, and a truncated target stays empty. A resume refuses
-  while the definition's ledger table is missing, or an aggregate's
+  while the definition's target or ledger table is missing, or an aggregate's
   group-delta table is, naming the table, and the definition stays paused. A
   build whose start fails because its ledger is gone (dropped while the
   definition waited to start) pauses that definition and what reads its
@@ -311,10 +311,11 @@ Better still, don't disable the capture triggers
 
 **Repair:**
 
-* **Target and side tables.** `PAUSE`/`RESUME` the transform. A resume drops
+* **Target and side tables.** `PAUSE`/`RESUME` the transform. A 1-1 target's resume also deletes rows
+  added or re-keyed by hand. A resume drops
   and recreates a `JOIN`'s hidden tables, so it also repairs one that was
   edited or dropped. It doesn't recreate the other side tables: if the
-  target's columns or constraints were changed, or its `<target>__ledger`,
+  target's columns or constraints were changed, or it or its `<target>__ledger`,
   `<target>__deltas` or `agg_<id>` table was dropped, `DROP TRANSFORM` and
   define it again. An edited `agg_<id>` is repaired by `request_backfill` of
   the source, which recomputes every group's partials and visible row from
