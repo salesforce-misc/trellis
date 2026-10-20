@@ -946,6 +946,13 @@ async fn a_p_or_m_page_is_a_range_scan_of_the_hidden_index_and_the_source_join_i
             panic!("{part}: one index on {hidden}: {hidden_index:?}");
         };
         let hidden_index = hidden_index.trim_matches(|c| c == '(' || c == ')');
+        // Statistics, so the plan does not depend on whether autovacuum has
+        // analyzed the tables yet.
+        exec(
+            &d,
+            &format!("analyze public.a; analyze public.b; analyze {hidden}"),
+        )
+        .await;
         let plan = trellis::staging::self_check::explain_join_page(
             d.pool(),
             "public.l",
@@ -955,21 +962,30 @@ async fn a_p_or_m_page_is_a_range_scan_of_the_hidden_index_and_the_source_join_i
         )
         .await
         .expect("explain the page");
-        // A scan of `index` on `table` (plain or index-only), and its lines.
-        let scan_of = |index: &str, table: &str| -> Option<String> {
+        // A range scan of `index` on `table` (plain, index-only or the bitmap
+        // index scan under a bitmap heap scan), and its lines. A seq scan is
+        // none of these.
+        let scan_of = |index: &str, table: &str, cond: &str| -> Option<String> {
             let lines: Vec<&str> = plan.lines().collect();
-            let at = lines.iter().position(|l| {
-                l.contains(&format!("Index Scan using {index} on {table} "))
-                    || l.contains(&format!("Index Only Scan using {index} on {table} "))
+            let at = (0..lines.len()).find(|&i| {
+                let l = &lines[i];
+                let block = lines[i..(i + 3).min(lines.len())].join("\n");
+                block.contains(cond)
+                    && (l.contains(&format!("Index Scan using {index} on {table} "))
+                        || l.contains(&format!("Index Only Scan using {index} on {table} "))
+                        || l.contains(&format!("Bitmap Index Scan on {index} ")))
             })?;
             Some(lines[at..(at + 3).min(lines.len())].join("\n"))
         };
         // The hidden side's range is bounded by the cursor in the index's
         // own column order: the join key, then the group column.
-        let scan = scan_of(hidden_index, &name);
+        let scan = scan_of(
+            hidden_index,
+            &name,
+            &format!("Index Cond: (ROW(t, k, {group}) > "),
+        );
         assert!(
-            scan.as_deref()
-                .is_some_and(|s| s.contains(&format!("Index Cond: (ROW(t, k, {group}) > "))),
+            scan.is_some(),
             "{part}: the hidden side is a range scan of {hidden}'s index:\n{plan}"
         );
         assert!(
@@ -979,7 +995,7 @@ async fn a_p_or_m_page_is_a_range_scan_of_the_hidden_index_and_the_source_join_i
         // The source side's range is bounded by the join key alone, so an
         // index on the join columns serves it.
         assert!(
-            scan_of(index, source).is_some_and(|s| s.contains("(ROW(t, k) >= ")),
+            scan_of(index, source, "(ROW(t, k) >= ").is_some(),
             "{part}: the source side is a range scan of {index}:\n{plan}"
         );
     }
