@@ -1004,6 +1004,24 @@ async fn a_to_many_reader_reads_backfilling_until_its_recomputes_drain() {
     assert_eq!(fx.status("public.totals").await, "live");
 }
 
+/// A to-many reader under an old-path build (`backfilling`, no Re-derive
+/// build recorded: `build` NULL) holds the queued correction instead of
+/// panicking on the NULL its applying predicate would otherwise select.
+#[tokio::test]
+async fn a_to_many_reader_under_an_old_path_build_holds_the_correction() {
+    let mut fx = Fx::start(&tree("range")).await;
+    fx.exec("drop table public.items_p1").await;
+    fx.pass().await;
+    fx.d.settle().await;
+    fx.exec(
+        "update transform_definitions set status = 'backfilling', build = null \
+         where target_table = 'public.totals'",
+    )
+    .await;
+    let held = fx.run(&Options::default()).await;
+    assert_eq!((held.completed, held.remaining), (0, 1));
+}
+
 /// The staging worker's whole pass schedules the to-many reader's row and
 /// moves it to `backfilling` in the pass that detects the drop, as it does
 /// an aggregate's.

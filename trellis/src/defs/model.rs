@@ -61,16 +61,16 @@ pub struct Definition {
 /// source's writes for it. A status [`TransformStatus::is_applying`] holds
 /// for, or `backfilling` under a Re-derive build (#625 B1,
 /// `transform_definitions.build = 'rederive'`), which applies from the
-/// commit that started it. Qualify the columns with [`applying_sql`] where
+/// commit that started it. Never NULL, so it is safe to select as a
+/// boolean column. Qualify the columns with [`applying_sql`] where
 /// the row has an alias.
-pub const APPLYING_SQL: &str =
-    "(status in ('live', 'catching_up') or (status = 'backfilling' and build = 'rederive'))";
+pub const APPLYING_SQL: &str = "(status in ('live', 'catching_up') or (status = 'backfilling' and build is not distinct from 'rederive'))";
 
 /// [`APPLYING_SQL`] over a `transform_definitions` row aliased `alias`.
 pub fn applying_sql(alias: &str) -> String {
     format!(
         "({alias}.status in ('live', 'catching_up') \
-         or ({alias}.status = 'backfilling' and {alias}.build = 'rederive'))"
+         or ({alias}.status = 'backfilling' and {alias}.build is not distinct from 'rederive'))"
     )
 }
 
@@ -523,7 +523,7 @@ mod tests {
         assert_eq!(
             applying_sql("t"),
             "(t.status in ('live', 'catching_up') \
-             or (t.status = 'backfilling' and t.build = 'rederive'))"
+             or (t.status = 'backfilling' and t.build is not distinct from 'rederive'))"
         );
     }
 }
