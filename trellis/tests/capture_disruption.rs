@@ -727,3 +727,82 @@ async fn resume_waits_for_the_table_and_rebuilds_after_a_swap() {
         assert_eq!(s, TransformStatus::Live, "{t}");
     }
 }
+
+/// A real `pg_dump` and `pg_restore` of the whole database, into another
+/// database and back over the same one with `--clean`, recreates every
+/// capture trigger under a new oid and pauses nothing: the restored record
+/// names another `capture_triggers` oid, so the pass records afresh. A
+/// restore of the application's schema alone recreates the triggers with
+/// Trellis's record untouched, which is a recreation: it pauses.
+#[tokio::test]
+async fn a_real_dump_and_restore_pauses_nothing() {
+    use std::process::Command;
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
+    create_case_tables(&raw, &trellis, &["rr".to_string()]).await;
+    bring_live(&mut raw, &db.pool).await;
+    capture_pass(&mut raw, &db.pool).await;
+    let dump = cluster.root().join("whole.dump");
+    let run = |command: &mut Command| {
+        let out = command.output().expect("run a client tool");
+        assert!(
+            out.status.success(),
+            "{command:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    run(Command::new("pg_dump")
+        .args(["-Fc", "-f"])
+        .arg(&dump)
+        .arg(db.dsn()));
+
+    // Into another database of the cluster.
+    let other = cluster.create_empty_database().await;
+    run(Command::new("pg_restore")
+        .args(["--no-owner", "-d", other.dsn()])
+        .arg(&dump));
+    let mut restored = connect(other.dsn()).await;
+    capture_pass(&mut restored, &other.pool).await;
+    capture_pass(&mut restored, &other.pool).await;
+    for (t, s) in statuses(&restored).await {
+        assert_eq!(
+            s,
+            TransformStatus::Live,
+            "restored into another database: {t}"
+        );
+    }
+
+    // Back over the same database.
+    run(Command::new("pg_restore")
+        .args(["--clean", "--if-exists", "--no-owner", "-d", db.dsn()])
+        .arg(&dump));
+    let mut raw = connect(db.dsn()).await;
+    capture_pass(&mut raw, &db.pool).await;
+    capture_pass(&mut raw, &db.pool).await;
+    for (t, s) in statuses(&raw).await {
+        assert_eq!(s, TransformStatus::Live, "restored over itself: {t}");
+    }
+
+    // The application's schema alone.
+    run(Command::new("pg_restore")
+        .args([
+            "--clean",
+            "--if-exists",
+            "--no-owner",
+            "-n",
+            "public",
+            "-d",
+            db.dsn(),
+        ])
+        .arg(&dump));
+    capture_pass(&mut raw, &db.pool).await;
+    for (t, s) in statuses(&raw).await {
+        assert_eq!(
+            s,
+            TransformStatus::Paused,
+            "the application schema alone: {t}"
+        );
+    }
+}

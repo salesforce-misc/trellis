@@ -107,7 +107,7 @@ These are the tools the entries refer to:
 |---|---|---|---|---|
 | 1 | `ALTER COLUMN … TYPE … USING` that rewrites values, with a metadata change to the same column in the same pass window, on a column added with a constant default whose table hasn't been rewritten since, on a column with a compression method set, or as a widening no copy outgrows | yes | `self_check` (1-1 targets only) | none; documented |
 | 3 | A source key re-collated while a `self_check` job runs | the job can skip or repeat keys | no | none filed |
-| 5 | A table attached to a hierarchy and detached, or a capture function replaced and restored, between two reconcile passes; capture changed outside Trellis on a partitioned source | yes | `self_check` (1-1 targets only) | none; documented |
+| 5 | A table attached to a hierarchy and detached, or a capture function replaced and restored, between two reconcile passes; capture changed outside Trellis on a partitioned source, once partitioned sources are supported (#897) | yes | `self_check` (1-1 targets only) | #707 (partitioned sources); otherwise none; documented |
 | 8 | A manual change inside Trellis's artifacts: a target or hidden table edited or dropped, DML, DDL or a data load into Trellis's schema, or a restore of that schema alone | yes | `self_check` (1-1 and `JOIN` targets, and a `JOIN`'s hidden tables); a missing ledger or group-delta table refuses a resume; a change to Trellis's schema: no | none; documented |
 | 9 | An application trigger re-keying a parent's join column within the statement | yes | no | #1115 removes relationships |
 | 10 | `REGEXP_COUNT` on `"C"`-collated data or with Postgres-only regex syntax | yes | `self_check` (1-1 targets only) | #643, with #575 |
@@ -229,10 +229,11 @@ two passes is seen. Three cases are still silent.
 * A capture function replaced by hand and put back between two passes. The
   trigger rows don't change, and the function is whole again when the pass
   looks.
-* Capture changed outside Trellis on a **partitioned source**. Its tree's
-  nodes come and go with partition maintenance and aren't recorded, so the
-  pass reinstalls a missing or disabled trigger (and queues the corrections
-  ADR-0017 defines for a new leaf), but pauses nobody for it.
+* Capture changed outside Trellis on a **partitioned source**, once
+  partitioned sources are supported (#897). Its tree's nodes come and go with
+  partition maintenance and aren't recorded, so the pass reinstalls a missing
+  or disabled trigger (and queues the corrections ADR-0017 defines for a new
+  leaf), but pauses nobody for it.
 
 **Effect:** the writes made while capture was off never reach Trellis.
 Targets stay wrong until each affected row is written again, with nothing on
@@ -241,7 +242,8 @@ status.
 **Detected?** Not by the pass. `self_check`'s comparison reports the stale
 rows on 1-1 targets.
 
-**Planned work:** none; documented.
+**Planned work:** #707 records and checks a partitioned source's triggers
+too. None for the other two cases; documented.
 
 **Repair:** `request_backfill` the table, or `PAUSE`/`RESUME` its readers.
 Better still, don't disable the capture triggers
@@ -283,8 +285,6 @@ Better still, don't disable the capture triggers
   definitions on its source carry on. Its resume then refuses the same way.
   An edited or truncated group-basis or `JOIN` hidden table leaves the
   groups or cells it held wrong until they are recomputed for another reason.
-* **A capture function body replaced and put back between two passes.** The
-  writes it mis-staged are lost or wrong, and nothing shows it.
 * **Trellis's schema.** The catalog and the ring are Trellis's record of what
   every target has applied, so a change to them is believed.
   * The restore signal compares the stored OID of the catalog table with the
@@ -304,15 +304,10 @@ Better still, don't disable the capture triggers
   target, and compares each of a `JOIN`'s `P`, `M`, `J` and `T` tables
   against the source tables. For aggregate and relationship-enriched
   targets, see [entry 16](#16-self_check-audits-1-1-targets-only).
-* **A capture function body.** The function is restored, but the lost writes
-  aren't detected automatically. `self_check`'s comparison reports the stale
-  rows on 1-1 targets.
 * **Trellis's schema.** Not detected.
 
 **Planned work:** none for the edits. This is a documented rule
 ([transforms — Target tables are Trellis-owned](transforms.md#target-tables-are-trellis-owned)).
-#707 (case 2) covers the capture function body; one option there is to have
-the repair re-read the table the way a reinstall does.
 
 **Repair:**
 
@@ -324,8 +319,6 @@ the repair re-read the table the way a reinstall does.
   define it again. An edited `agg_<id>` is repaired by `request_backfill` of
   the source, which recomputes every group's partials and visible row from
   it.
-* **A capture function body.** `request_backfill` the table, or
-  `PAUSE`/`RESUME` its readers.
 * **Trellis's schema.** Restore the whole database from a backup taken before
   the change, or `DROP TRANSFORM` every transform and define it again, which
   rebuilds each target from its sources. A target the changed catalog has no

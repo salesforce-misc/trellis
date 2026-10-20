@@ -94,9 +94,9 @@ Any fault is reported as a `capture` divergence, and the report stops there:
 no recompute comparison runs, because it would only show the symptom. The
 audit applies once a definition's capture must be installed (`backfilling`,
 `catching_up`, `live`). A fault is a catalog fact, not a race, so it isn't
-re-checked. The staging worker's reconcile pass reinstalls a missing or
-disabled trigger, so those faults last only while no worker runs or its
-reconcile can't land; the others persist until an operator fixes them.
+re-checked. The staging worker's reconcile pass pauses the readers of a
+plain table whose trigger is missing or disabled, and a `RESUME` reinstalls
+it; the others persist until an operator fixes them.
 
 ### Only a `live` definition is compared
 
