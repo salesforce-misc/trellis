@@ -3847,7 +3847,8 @@ async fn create_definition_inner(
     // the build this registration starts leaves it out rather than writing
     // the column's frozen value. The source's fence above is the one a pause
     // of this definition's fields bumps, so this takes no second one. Only a
-    // 1-1 plan holds a paused column out (known correctness gap 19).
+    // 1-1 plan holds a paused column out (`docs/known-correctness-gaps.md`, an
+    // aggregate reading a paused column).
     if matches!(def.key_space, KeySpace::OneToOne) {
         let upstreams = definition_targets_read(&*txn, &qualified_source, &relationships).await?;
         let all_fields: Vec<String> = def.fields.iter().map(|f| f.name.clone()).collect();

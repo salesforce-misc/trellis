@@ -377,8 +377,8 @@ pub const AGGREGATE_FUNCTION_SPECS: &[FunctionSpec] = &[
         return_type: ValueType::Other(PgType::Jsonb),
     },
     // Issue #293: bare (no `ORDER BY`) `array_agg`/`string_agg`, recompute-only
-    // like `JSONB_AGG`, with the same element-order caveat (known-correctness
-    // gap 18). Both are `IMMUTABLE` and take a `text` argument only: `text[]`
+    // like `JSONB_AGG`, with the same element-order caveat (`docs/type-support.md`,
+    // `array_agg` and `string_agg`). Both are `IMMUTABLE` and take a `text` argument only: `text[]`
     // is the one array family modelled (`PgType::TextArray`), and a `text`
     // element has no GUC-dependent rendering. `STRING_AGG`'s second argument
     // is the separator, which must be a string literal (the validator
