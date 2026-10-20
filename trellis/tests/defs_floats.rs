@@ -185,6 +185,7 @@ fn identity_def() -> TransformDef {
             expr: Expr::Column("a".to_string()),
         }],
         predicate: Predicate::True,
+        without_source_index: false,
     }
 }
 
@@ -912,6 +913,7 @@ async fn the_evaluator_fold_agrees_with_postgres_on_float_aggregates() {
                     },
                 }],
                 predicate: Predicate::True,
+                without_source_index: false,
             };
             let columns = HashMap::from([
                 ("i".to_string(), ValueType::Integer(IntWidth::Int4)),

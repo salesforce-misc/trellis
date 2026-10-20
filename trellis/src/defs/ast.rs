@@ -59,6 +59,12 @@ pub struct TransformDef {
     pub key_space: KeySpace,
     pub fields: Vec<FieldDef>,
     pub predicate: Predicate,
+    /// `WITHOUT SOURCE INDEX` was written (#1167): the definition runs without
+    /// the source index Trellis requires of a `GROUP BY` or `JOIN` target
+    /// (`super::source_index`), accepting the per-page scan a `self_check`
+    /// walk then costs. Never set for a 1-1 target, which pages by its
+    /// primary key.
+    pub without_source_index: bool,
 }
 
 /// A parsed standalone relationship declaration (ADR-0006):
@@ -753,6 +759,10 @@ pub(crate) fn render_definition_text(def: &TransformDef) -> String {
             let keys: Vec<String> = join.group_by.iter().map(qualified).collect();
             out.push_str(&keys.join(", "));
         }
+    }
+
+    if def.without_source_index {
+        out.push_str(" WITHOUT SOURCE INDEX");
     }
 
     out.push_str(" SELECT ");

@@ -105,10 +105,10 @@ fn columns(part: Part) -> &'static str {
 fn plain(part: Part) -> String {
     match part {
         Part::Fact => "create table public.b (id integer primary key, k integer, gb integer, \
-                       y integer);"
+                       y integer); create index on public.b (k);"
             .to_string(),
         Part::Dim => "create table public.a (id integer primary key, ga integer, k integer, \
-                      x integer);"
+                      x integer); create index on public.a (k);"
             .to_string(),
     }
 }

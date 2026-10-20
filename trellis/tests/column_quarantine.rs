@@ -141,6 +141,7 @@ fn order_totals_def() -> TransformDef {
             },
         }],
         predicate: Predicate::True,
+        without_source_index: false,
         explicit_source_schema: None,
         explicit_target_schema: None,
     }
@@ -1890,6 +1891,7 @@ async fn resume_recomputes_correctly_even_when_a_sibling_column_still_throws() {
             },
         ],
         predicate: Predicate::True,
+        without_source_index: false,
         explicit_source_schema: None,
         explicit_target_schema: None,
     };
@@ -2018,6 +2020,7 @@ async fn resume_recomputes_every_row_of_a_composite_key_target_across_chunks() {
             },
         }],
         predicate: Predicate::True,
+        without_source_index: false,
         explicit_source_schema: None,
         explicit_target_schema: None,
     };
@@ -2138,6 +2141,7 @@ async fn ambiguous_field_name_attribution_falls_back_to_no_column_level_attribut
             },
         }],
         predicate: Predicate::True,
+        without_source_index: false,
         explicit_source_schema: None,
         explicit_target_schema: None,
     };
@@ -2164,6 +2168,7 @@ async fn ambiguous_field_name_attribution_falls_back_to_no_column_level_attribut
             },
         }],
         predicate: Predicate::True,
+        without_source_index: false,
         explicit_source_schema: None,
         explicit_target_schema: None,
     };
@@ -2585,6 +2590,7 @@ async fn resume_column_resolves_a_to_one_relationship_from_the_projection_not_li
             },
         }],
         predicate: Predicate::True,
+        without_source_index: false,
         explicit_source_schema: None,
         explicit_target_schema: None,
     };

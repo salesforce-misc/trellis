@@ -448,6 +448,7 @@ pub fn chain_off(program: &Program) -> Option<Program> {
             key_space: KeySpace::OneToOne,
             fields,
             predicate: Predicate::True,
+            without_source_index: false,
         });
         tables.push(Table {
             name: def.target.clone(),

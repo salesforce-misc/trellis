@@ -180,6 +180,7 @@ async fn a_gone_joined_table_or_to_side_pauses_its_readers() {
     raw.batch_execute(
         "create table public.ja (id int primary key, k varchar(5), x int); \
          create table public.jb (id int primary key, k varchar(5), y int); \
+         create index on public.ja (k); create index on public.jb (k); \
          create table public.rc (id int primary key, pid int, amount int); \
          create table public.rp (id int primary key, name text); \
          insert into public.rp select i, 'p' || i from generate_series(1, 3) i; \

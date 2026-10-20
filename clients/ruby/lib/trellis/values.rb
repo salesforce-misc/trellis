@@ -76,6 +76,14 @@ module Trellis
   # ([] when every one is indexed). It leaves status alone, and an index you
   # create shows on the next call.
   #
+  # source_index_gaps is a warning, never a hold-up: the SourceIndexGaps for
+  # the source indexes a GROUP BY or JOIN target needs and lacks ([] when it
+  # needs none or they exist). Define and a resume refuse a definition
+  # without them, so a gap is an index dropped since, or one the definition
+  # opted out of with WITHOUT SOURCE INDEX. Nothing is paused, but
+  # Trellis.self_check refuses to walk the target unless it opted out, when
+  # the walk scans the source once per page.
+  #
   # correcting lists the CorrectingNodes of its partitioned source it is being
   # corrected for, oldest first ([] when none): a partition was attached,
   # detached, dropped or truncated, and the definition re-derives the keys
@@ -83,7 +91,8 @@ module Trellis
   # once they are re-derived and folded into its target. A paused or
   # quarantined definition lists none.
   Status = Data.define(:status, :backfill_failure, :capture_wait, :capture_failure,
-                       :held_keys, :drain_failure, :unindexed_joins, :correcting) do
+                       :held_keys, :drain_failure, :unindexed_joins, :source_index_gaps,
+                       :correcting) do
     def self.from_native(hash)
       failure = hash[:backfill_failure]
       wait = hash[:capture_wait]
@@ -97,6 +106,7 @@ module Trellis
           held_keys: held_keys && HeldKeys.from_native(held_keys),
           drain_failure: drain_failure && DrainFailure.from_native(drain_failure),
           unindexed_joins: hash.fetch(:unindexed_joins).map { |j| UnindexedJoin.new(**j) },
+          source_index_gaps: hash.fetch(:source_index_gaps).map { |g| SourceIndexGap.new(**g) },
           correcting: hash.fetch(:correcting).map { |c| CorrectingNode.from_native(c) })
     end
   end
@@ -121,6 +131,13 @@ module Trellis
   # index to create as a sentence. Trellis doesn't create indexes on your
   # tables.
   UnindexedJoin = Data.define(:relationship, :table, :column, :fix)
+
+  # A source index a GROUP BY or JOIN target needs and lacks, as
+  # Trellis.status reports it: the qualified table (table), the columns the
+  # index should lead with (columns), whether the definition opted out with
+  # WITHOUT SOURCE INDEX (opted_out), and a create index statement to run
+  # (fix). Trellis doesn't create indexes on your tables.
+  SourceIndexGap = Data.define(:table, :columns, :opted_out, :fix)
 
   # A drain page that keeps failing with nothing charged or paused, as
   # Trellis.status and Trellis.self_check report it: the segment whose page

@@ -44,7 +44,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 use trellis::{
     Config, CorrectingNode, DefinitionSummary, DrainFailure, JoinStatus, RelationshipSummary,
-    Trellis, TrellisOptions, UnindexedJoin,
+    SourceIndexGap, Trellis, TrellisOptions, UnindexedJoin,
 };
 
 use super::release::shell_quote;
@@ -137,6 +137,7 @@ async fn report(trellis: &Trellis) -> Result<String, String> {
             drain_failure: status.drain_failure,
             unindexed_joins: status.unindexed_joins,
             correcting: status.correcting,
+            source_index_gaps: status.source_index_gaps,
             join: status.join,
         });
         listed.push((def, warnings));
@@ -196,13 +197,14 @@ struct StatusWarnings {
     drain_failure: Option<DrainFailure>,
     unindexed_joins: Vec<UnindexedJoin>,
     correcting: Vec<CorrectingNode>,
+    source_index_gaps: Vec<SourceIndexGap>,
     join: Option<JoinStatus>,
 }
 
 /// One line per definition, each followed by an indented line per thing
 /// holding it back: a failing backfill, a halt, and the drain failure its
 /// status reports, if any; then one per node it is being corrected for, and
-/// one per join column without an index.
+/// one per source index it lacks.
 fn format_definitions(definitions: &[(DefinitionSummary, StatusWarnings)]) -> String {
     if definitions.is_empty() {
         return "  no transform definitions registered\n".to_string();
@@ -259,7 +261,11 @@ fn format_definitions(definitions: &[(DefinitionSummary, StatusWarnings)]) -> St
             for join in &warnings.unindexed_joins {
                 line.push_str(&format_unindexed_join(join));
             }
-            // #1112: a JOIN's hidden tables, and what to fix about its keys.
+            // #1167: a source index the target's `self_check` pages by.
+            for gap in &warnings.source_index_gaps {
+                line.push_str(&format_source_index_gap(gap));
+            }
+            // #1112: a JOIN's hidden tables and the size of its partials.
             if let Some(join) = &warnings.join {
                 line.push_str(&format_join(join));
             }
@@ -290,6 +296,25 @@ fn format_unindexed_join(join: &UnindexedJoin) -> String {
     )
 }
 
+fn format_source_index_gap(gap: &SourceIndexGap) -> String {
+    let columns = gap.columns.join(", ");
+    if gap.opted_out {
+        format!(
+            "    warning: runs without a source index on {} ({columns}), as defined WITHOUT \
+             SOURCE INDEX; self_check scans the source once per page; {}\n",
+            gap.table,
+            gap.fix()
+        )
+    } else {
+        format!(
+            "    warning: source index on {} ({columns}) is missing; self_check refuses \
+             until it exists; {}\n",
+            gap.table,
+            gap.fix()
+        )
+    }
+}
+
 fn format_join(join: &JoinStatus) -> String {
     let mut out = String::new();
     if !join.hidden_tables.is_empty() {
@@ -299,14 +324,6 @@ fn format_join(join: &JoinStatus) -> String {
             .map(|t| format!("{}~{}rows/{}B", t.table, t.estimated_rows, t.bytes))
             .collect();
         out.push_str(&format!("    join tables {}\n", tables.join(" ")));
-    }
-    for on in &join.unindexed_on {
-        out.push_str(&format!(
-            "    warning: join key {}.({}) has no usable index; {}\n",
-            on.table,
-            on.column,
-            on.fix()
-        ));
     }
     if let Some(w) = &join.partials_warning {
         out.push_str(&format!(
@@ -605,6 +622,43 @@ mod tests {
              warning: relationship items joins on public.order_items.order_id, \
              which has no usable index; \
              create an index on public.order_items (order_id)\n"
+        );
+    }
+
+    #[test]
+    fn a_missing_source_index_is_shown_with_its_fix_and_whether_it_opted_out() {
+        let def = || DefinitionSummary {
+            target_table: "public.order_totals".to_string(),
+            status: trellis::TransformStatus::Live,
+            created_at: UNIX_EPOCH,
+            backfill_failure: None,
+            halt: None,
+        };
+        let gap = |opted_out| StatusWarnings {
+            source_index_gaps: vec![SourceIndexGap {
+                table: "public.orders".to_string(),
+                columns: vec!["customer_id".to_string()],
+                any_order: true,
+                opted_out,
+            }],
+            ..StatusWarnings::default()
+        };
+        let head = "  target=public.order_totals status=live created_at=1970-01-01 00:00:00 UTC\n";
+        assert_eq!(
+            format_definitions(&[(def(), gap(false))]),
+            format!(
+                "{head}    warning: source index on public.orders (customer_id) is missing; \
+                 self_check refuses until it exists; \
+                 create index on \"public\".\"orders\" (\"customer_id\")\n"
+            )
+        );
+        assert_eq!(
+            format_definitions(&[(def(), gap(true))]),
+            format!(
+                "{head}    warning: runs without a source index on public.orders (customer_id), \
+                 as defined WITHOUT SOURCE INDEX; self_check scans the source once per page; \
+                 create index on \"public\".\"orders\" (\"customer_id\")\n"
+            )
         );
     }
 

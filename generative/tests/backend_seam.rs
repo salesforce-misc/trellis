@@ -36,6 +36,7 @@ async fn installs_a_trivial_def_and_converges_dml_to_the_expected_snapshot() {
             },
         }],
         predicate: Predicate::True,
+        without_source_index: false,
         explicit_source_schema: None,
         explicit_target_schema: None,
     };
@@ -169,6 +170,7 @@ async fn forced_seals_lap_the_ring_without_a_maintenance_tick() {
             expr: Expr::Column(a),
         }],
         predicate: Predicate::True,
+        without_source_index: false,
         explicit_source_schema: None,
         explicit_target_schema: None,
     };

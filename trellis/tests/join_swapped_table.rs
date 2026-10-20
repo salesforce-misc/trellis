@@ -25,7 +25,8 @@ async fn a_swapped_joined_table_does_not_panic_the_pass() {
     trellis::dev::staging::set_group_basis(true);
     let mut d = Driver::start(
         "create table public.ja (id integer primary key, g text, k text); \
-         create table public.jb (id integer primary key, k text, y integer)",
+         create table public.jb (id integer primary key, k text, y integer); \
+         create index on public.ja (k); create index on public.jb (k)",
         &[
             ("id", ValueType::Integer(IntWidth::Int4)),
             ("g", ValueType::Text),
@@ -69,6 +70,16 @@ async fn a_swapped_joined_table_does_not_panic_the_pass() {
         .expect("reconcile pass");
     }
 
+    eprintln!(
+        "DBG {:?}",
+        d.rows("select table_name, attempts, last_error from pending_backfill")
+            .await
+    );
+    eprintln!(
+        "DBG2 {:?}",
+        d.rows("select transform_id::text, error from capture_failures")
+            .await
+    );
     let rows = d
         .rows(
             "select attempts, last_error from pending_backfill \

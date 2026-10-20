@@ -10,7 +10,7 @@
 
 use trellis::{
     BackfillFailure, CaptureFailure, CaptureFailureKind, CaptureWait, CorrectingNode,
-    DefinitionStatus, DefinitionSummary, DrainFailure, UnindexedJoin,
+    DefinitionStatus, DefinitionSummary, DrainFailure, SourceIndexGap, UnindexedJoin,
 };
 
 use crate::{PlainHeldKeys, epoch_micros, transform_status};
@@ -71,6 +71,9 @@ pub struct PlainDefinitionStatus {
     /// The join columns of the relationships the definition reads that have
     /// no usable index; see [`DefinitionStatus::unindexed_joins`].
     pub unindexed_joins: Vec<PlainUnindexedJoin>,
+    /// The source indexes a `GROUP BY` or `JOIN` target needs and lacks; see
+    /// [`DefinitionStatus::source_index_gaps`].
+    pub source_index_gaps: Vec<PlainSourceIndexGap>,
     /// The nodes of its partitioned source the definition is being corrected
     /// for, oldest first; see [`DefinitionStatus::correcting`].
     pub correcting: Vec<PlainCorrectingNode>,
@@ -110,6 +113,20 @@ pub struct PlainUnindexedJoin {
     /// The column.
     pub column: String,
     /// What to do about it: the index to create, as a sentence.
+    pub fix: String,
+}
+
+/// A [`SourceIndexGap`] flattened to plain data: a source index a target
+/// needs and lacks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlainSourceIndexGap {
+    /// The qualified table the index is missing on.
+    pub table: String,
+    /// The columns the index should lead with.
+    pub columns: Vec<String>,
+    /// Whether the definition opted out (`WITHOUT SOURCE INDEX`).
+    pub opted_out: bool,
+    /// What to do about it: a `create index` statement.
     pub fix: String,
 }
 
@@ -200,11 +217,27 @@ impl From<&DefinitionStatus> for PlainDefinitionStatus {
                 .iter()
                 .map(PlainUnindexedJoin::from)
                 .collect(),
+            source_index_gaps: status
+                .source_index_gaps
+                .iter()
+                .map(PlainSourceIndexGap::from)
+                .collect(),
             correcting: status
                 .correcting
                 .iter()
                 .map(PlainCorrectingNode::from)
                 .collect(),
+        }
+    }
+}
+
+impl From<&SourceIndexGap> for PlainSourceIndexGap {
+    fn from(gap: &SourceIndexGap) -> Self {
+        PlainSourceIndexGap {
+            table: gap.table.clone(),
+            columns: gap.columns.clone(),
+            opted_out: gap.opted_out,
+            fix: gap.fix(),
         }
     }
 }
@@ -381,6 +414,7 @@ mod tests {
             capture_failure: None,
             held_keys: None,
             drain_failure: None,
+            source_index_gaps: Vec::new(),
             unindexed_joins: Vec::new(),
             correcting: Vec::new(),
             build_wait: None,
@@ -395,6 +429,7 @@ mod tests {
                 capture_failure: None,
                 held_keys: None,
                 drain_failure: None,
+                source_index_gaps: Vec::new(),
                 unindexed_joins: Vec::new(),
                 correcting: Vec::new(),
             }
@@ -416,6 +451,7 @@ mod tests {
                 next_retry_at: None,
             }),
             drain_failure: None,
+            source_index_gaps: Vec::new(),
             unindexed_joins: Vec::new(),
             correcting: Vec::new(),
             build_wait: None,
@@ -440,6 +476,7 @@ mod tests {
             capture_failure: None,
             held_keys: None,
             drain_failure: None,
+            source_index_gaps: Vec::new(),
             unindexed_joins: vec![UnindexedJoin {
                 relationship: "orders".to_string(),
                 table: "public.orders".to_string(),
@@ -470,6 +507,7 @@ mod tests {
             capture_failure: None,
             held_keys: None,
             drain_failure: None,
+            source_index_gaps: Vec::new(),
             unindexed_joins: Vec::new(),
             correcting: vec![
                 CorrectingNode {
@@ -525,6 +563,7 @@ mod tests {
                 last_seen: at(1_727_222_400_654_321),
                 attempts: 5,
             }),
+            source_index_gaps: Vec::new(),
             unindexed_joins: Vec::new(),
             correcting: Vec::new(),
             build_wait: None,
@@ -559,6 +598,7 @@ mod tests {
             capture_failure: None,
             held_keys: None,
             drain_failure: None,
+            source_index_gaps: Vec::new(),
             unindexed_joins: Vec::new(),
             correcting: Vec::new(),
             build_wait: None,
@@ -578,6 +618,7 @@ mod tests {
                 capture_failure: None,
                 held_keys: None,
                 drain_failure: None,
+                source_index_gaps: Vec::new(),
                 unindexed_joins: Vec::new(),
                 correcting: Vec::new(),
             }
@@ -608,6 +649,7 @@ mod tests {
             }),
             held_keys: None,
             drain_failure: None,
+            source_index_gaps: Vec::new(),
             unindexed_joins: Vec::new(),
             correcting: Vec::new(),
             build_wait: None,

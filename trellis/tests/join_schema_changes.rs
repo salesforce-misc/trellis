@@ -21,7 +21,8 @@ use trellis::integer::IntWidth;
 const DDL: &str = "create table public.a (id integer primary key, g varchar(5), \
                        k varchar(5), x integer); \
                    create table public.b (id integer primary key, k varchar(5), \
-                       h varchar(5), y integer)";
+                       h varchar(5), y integer); \
+                   create index on public.a (k); create index on public.b (k)";
 
 const LEFT: &str = "TRANSFORM l FROM public.a LEFT JOIN public.b ON a.k = b.k \
      GROUP BY a.g, b.h \

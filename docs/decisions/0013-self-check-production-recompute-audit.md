@@ -218,6 +218,14 @@ times the table, which is hours at 100M rows.
   those columns; without one a page scans the table, so a walk reads G / L
   times it. A JOIN's target part reads the join of both tables, which no index
   orders, so each of its pages scans them.
+* **The source index define requires.** A group-basis aggregate needs, on its
+  source, a btree index whose leading columns are its `GROUP BY` columns (in any
+  order), and a JOIN needs on each side one leading with that side's `ON`
+  columns in `ON` order, which is the order `P` and `M` page by. Define and a
+  `RESUME` refuse a definition without it, naming a `create index`, unless it is
+  defined `WITHOUT SOURCE INDEX`; a later drop warns in `status` and makes
+  `self_check` refuse, and pauses nothing, since it affects speed, never
+  correctness. A JOIN's target part needs no index.
 * **Order.** Each column ascending, `NULL` last (what a btree holds, and the
   order `NULLS NOT DISTINCT` identities need), each collatable column under
   one collation named in the statement and used on both sides: the key

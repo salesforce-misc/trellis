@@ -38,6 +38,7 @@ fn call_def(function: &str, arg_names: &[&str]) -> TransformDef {
             },
         }],
         predicate: Predicate::True,
+        without_source_index: false,
         explicit_source_schema: None,
         explicit_target_schema: None,
     }

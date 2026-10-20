@@ -75,7 +75,8 @@ async fn scalar(d: &Driver, sql: &str) -> String {
 async fn start() -> Driver {
     start_with(
         AGG,
-        "create table public.src (id integer primary key, g integer, v integer)",
+        "create table public.src (id integer primary key, g integer, v integer); \
+         create index on public.src (g)",
         &[("id", int4()), ("g", int4()), ("v", int4())],
         "",
     )
@@ -216,7 +217,8 @@ async fn a_page_that_changes_nothing_writes_nothing() {
 async fn a_page_that_changes_only_hidden_partials_leaves_the_visible_row() {
     let mut d = start_with(
         "TRANSFORM agg FROM public.src GROUP BY g SELECT SUM(v) AS total",
-        "create table public.src (id integer primary key, g integer, v integer)",
+        "create table public.src (id integer primary key, g integer, v integer); \
+         create index on public.src (g)",
         &[("id", int4()), ("g", int4()), ("v", int4())],
         "",
     )
@@ -242,7 +244,8 @@ async fn composed_fields_and_expression_arguments_equal_postgres() {
          SELECT SUM(a) + COUNT(b) AS mixed, SUM(a + b) AS ab, AVG(a) AS mean, \
                 COALESCE(SUM(b), 0) AS sb, SUM(a) > COUNT(b) AS apart, COUNT(a + b) AS nab, \
                 COUNT(*) AS n",
-        "create table public.src (id integer primary key, g integer, a integer, b integer)",
+        "create table public.src (id integer primary key, g integer, a integer, b integer); \
+         create index on public.src (g)",
         &[("id", int4()), ("g", int4()), ("a", int4()), ("b", int4())],
         "",
     )
@@ -275,7 +278,8 @@ async fn numeric_sums_and_averages_keep_the_declared_scale() {
     let mut d = start_with(
         "TRANSFORM agg FROM public.src GROUP BY g \
          SELECT SUM(m) AS total, AVG(m) AS mean, COUNT(m) AS nm, COUNT(*) AS n",
-        "create table public.src (id integer primary key, g integer, m numeric(10, 2))",
+        "create table public.src (id integer primary key, g integer, m numeric(10, 2)); \
+         create index on public.src (g)",
         &[("id", int4()), ("g", int4()), ("m", ValueType::Numeric)],
         "",
     )
@@ -312,7 +316,8 @@ async fn group_columns_named_like_the_applys_working_columns() {
              SELECT SUM(v) AS total, COUNT(v) AS nv, n + COUNT(*) AS np"
         ),
         &format!(
-            "create table public.src (id integer primary key, {}, v integer)",
+            "create table public.src (id integer primary key, {}, v integer); \
+             create index on public.src ({group})",
             names
                 .iter()
                 .map(|name| format!("{name} integer"))
@@ -351,7 +356,8 @@ async fn group_columns_named_like_the_applys_working_columns() {
 async fn every_pattern_of_null_group_columns_finds_its_group() {
     let mut d = start_with(
         "TRANSFORM agg FROM public.src GROUP BY g, h SELECT SUM(v) AS total, COUNT(*) AS n",
-        "create table public.src (id integer primary key, g integer, h integer, v integer)",
+        "create table public.src (id integer primary key, g integer, h integer, v integer); \
+         create index on public.src (g, h)",
         &[("id", int4()), ("g", int4()), ("h", int4()), ("v", int4())],
         "",
     )
@@ -511,7 +517,8 @@ async fn f2_a_key_through_three_groups_on_one_page() {
 async fn r3_nested_writes_sum_once() {
     let mut d = start_with(
         AGG,
-        "create table public.src (id integer primary key, g integer, v integer)",
+        "create table public.src (id integer primary key, g integer, v integer); \
+         create index on public.src (g)",
         &[("id", int4()), ("g", int4()), ("v", int4())],
         "create function public.app() returns trigger language plpgsql as $$ \
          begin \
@@ -1247,7 +1254,10 @@ async fn define_refuses_an_unconstrained_numeric_sum() {
     let db = cluster.create_isolated_database().await;
     let client = drain_driver::connect(db.dsn()).await;
     client
-        .batch_execute("create table public.src (id integer primary key, g integer, m numeric)")
+        .batch_execute(
+            "create table public.src (id integer primary key, g integer, m numeric); \
+             create index on public.src (g)",
+        )
         .await
         .expect("source");
     let columns = [

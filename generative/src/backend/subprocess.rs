@@ -394,6 +394,7 @@ impl SubprocessBackend {
             })?
             .clone();
         let source_columns = sql::source_columns(&source_table);
+        sql::create_source_indexes(&self.raw, None, def).await?;
         let text = sql::render_definition(def);
         // Same front door real callers and `ManualBackend` use — see
         // `ManualBackend::install_definition`'s doc comment (issue #63 C1).

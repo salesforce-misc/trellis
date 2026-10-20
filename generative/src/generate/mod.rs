@@ -1236,6 +1236,7 @@ pub fn build_program_multi_with_shapes(
                 key_space,
                 fields,
                 predicate: Predicate::True,
+                without_source_index: false,
                 explicit_source_schema: None,
                 explicit_target_schema: None,
             }
@@ -2832,6 +2833,7 @@ pub fn build_bulk_insert_program(row_count: usize) -> Program {
             },
         }],
         predicate: Predicate::True,
+        without_source_index: false,
         explicit_source_schema: None,
         explicit_target_schema: None,
     };
@@ -2850,6 +2852,7 @@ pub fn build_bulk_insert_program(row_count: usize) -> Program {
             aggregate_field_def(AggregateFn::Count, &c1, &c2, None),
         ],
         predicate: Predicate::True,
+        without_source_index: false,
         explicit_source_schema: None,
         explicit_target_schema: None,
     };

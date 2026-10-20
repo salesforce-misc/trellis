@@ -36,7 +36,8 @@ use trellis::staging::interleave::PausePoint;
 
 const SRC: &str = "public.src";
 const SRC_DDL: &str = "create table public.src (id integer primary key, g integer, h integer, \
-                       v integer)";
+                       v integer); \
+                       create index on public.src (g, h)";
 
 fn int4() -> ValueType {
     ValueType::Integer(IntWidth::Int4)
@@ -190,8 +191,7 @@ async fn an_extinct_composite_upstream_group_reduces_its_coarser_rollup() {
 }
 
 const ONE: &str = "TRANSFORM m FROM public.src SELECT g AS g, v + v AS w";
-const OVER_ONE: &str =
-    "TRANSFORM agg FROM public.m GROUP BY g SELECT SUM(w) AS total, COUNT(*) AS n";
+const OVER_ONE: &str = "TRANSFORM agg FROM public.m GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(w) AS total, COUNT(*) AS n";
 const OVER_ONE_ACTUAL: &str = "select g, total, n from public.agg order by g";
 const OVER_ONE_ORACLE: &str =
     "select g, sum(v + v), count(*) from public.src group by g order by g";
@@ -252,7 +252,7 @@ async fn an_upstream_row_that_moves_group_leaves_its_old_group() {
 async fn a_rollup_follows_upstream_groups_emptied_and_refilled_in_one_page() {
     let mut d = start(
         AGG_G,
-        "TRANSFORM roll FROM public.agg GROUP BY n SELECT SUM(total) AS total, COUNT(*) AS groups",
+        "TRANSFORM roll FROM public.agg GROUP BY n WITHOUT SOURCE INDEX SELECT SUM(total) AS total, COUNT(*) AS groups",
         &agg_g_columns(),
         2,
     )
@@ -377,7 +377,8 @@ async fn an_upstream_rebuild_outside_the_seam_rebuilds_the_reader() {
     columns.push(("x", int4()));
     let mut d = Driver::start_with_relationships(
         "create table public.par (id integer primary key, x integer); \
-         create table public.src (id integer primary key, g integer, h integer, v integer)",
+         create table public.src (id integer primary key, g integer, h integer, v integer); \
+         create index on public.src (g, h)",
         &columns,
         &["RELATIONSHIP parent FROM src.h TO par.id"],
         &["TRANSFORM up FROM public.src GROUP BY g SELECT SUM(parent.x) AS total, COUNT(*) AS n"],
@@ -386,7 +387,7 @@ async fn an_upstream_rebuild_outside_the_seam_rebuilds_the_reader() {
     .await;
     install(
         &d,
-        "TRANSFORM roll FROM public.up GROUP BY n SELECT COUNT(*) AS groups",
+        "TRANSFORM roll FROM public.up GROUP BY n WITHOUT SOURCE INDEX SELECT COUNT(*) AS groups",
         &[("g", int4()), ("total", int8()), ("n", int8())],
     )
     .await;
@@ -516,7 +517,7 @@ async fn an_upstream_rebuild_outside_the_seam_rebuilds_the_reader() {
 async fn an_upstream_rebuild_reaches_its_reader_through_the_seam() {
     let mut d = start(
         AGG_G,
-        "TRANSFORM roll FROM public.agg GROUP BY n SELECT COUNT(*) AS groups, SUM(total) AS t",
+        "TRANSFORM roll FROM public.agg GROUP BY n WITHOUT SOURCE INDEX SELECT COUNT(*) AS groups, SUM(total) AS t",
         &agg_g_columns(),
         2,
     )
@@ -570,7 +571,8 @@ async fn a_rollup_over_a_relationship_fed_upstream_follows_parent_changes() {
     columns.push(("x", int4()));
     let mut d = Driver::start_with_relationships(
         "create table public.par (id integer primary key, x integer); \
-         create table public.src (id integer primary key, g integer, h integer, v integer)",
+         create table public.src (id integer primary key, g integer, h integer, v integer); \
+         create index on public.src (g, h)",
         &columns,
         &["RELATIONSHIP parent FROM src.h TO par.id"],
         &["TRANSFORM up FROM public.src GROUP BY g SELECT SUM(parent.x) AS total, COUNT(*) AS n"],
@@ -579,7 +581,7 @@ async fn a_rollup_over_a_relationship_fed_upstream_follows_parent_changes() {
     .await;
     install(
         &d,
-        "TRANSFORM roll FROM public.up GROUP BY total SELECT SUM(n) AS rows, COUNT(*) AS groups",
+        "TRANSFORM roll FROM public.up GROUP BY total WITHOUT SOURCE INDEX SELECT SUM(n) AS rows, COUNT(*) AS groups",
         &[("g", int4()), ("total", int8()), ("n", int8())],
     )
     .await;
@@ -648,7 +650,8 @@ async fn a_one_to_one_reader_of_a_join_target_holds_the_null_group() {
     trellis::dev::staging::set_group_basis(true);
     let mut d = Driver::start(
         "create table public.a (id integer primary key, ga integer, k integer, x integer); \
-         create table public.b (id integer primary key, k integer, y integer)",
+         create table public.b (id integer primary key, k integer, y integer); \
+         create index on public.a (k); create index on public.b (k)",
         &[("id", int4()), ("ga", int4()), ("k", int4()), ("x", int4())],
         &[
             "TRANSFORM j FROM public.a JOIN public.b ON a.k = b.k GROUP BY a.ga \
@@ -708,7 +711,7 @@ async fn a_rollup_over_a_one_to_one_reader_follows_its_null_keyed_rows() {
     .await;
     install(
         &d,
-        "TRANSFORM roll FROM public.a2 GROUP BY n SELECT COUNT(*) AS groups",
+        "TRANSFORM roll FROM public.a2 GROUP BY n WITHOUT SOURCE INDEX SELECT COUNT(*) AS groups",
         &[("g", int4()), ("h", int4()), ("n", int8())],
     )
     .await;

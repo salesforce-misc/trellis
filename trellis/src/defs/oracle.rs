@@ -911,6 +911,7 @@ mod tests {
                 },
             ],
             predicate: Predicate::True,
+            without_source_index: false,
             explicit_source_schema: None,
             explicit_target_schema: None,
         }
@@ -977,6 +978,7 @@ mod tests {
                 expr: Expr::Column("c".to_string()),
             }],
             predicate: Predicate::True,
+            without_source_index: false,
             explicit_source_schema: None,
             explicit_target_schema: None,
         };
@@ -1069,6 +1071,7 @@ mod tests {
                 },
             ],
             predicate: Predicate::True,
+            without_source_index: false,
             explicit_source_schema: None,
             explicit_target_schema: None,
         };
@@ -1099,6 +1102,7 @@ mod tests {
                 },
             }],
             predicate: Predicate::True,
+            without_source_index: false,
             explicit_source_schema: None,
             explicit_target_schema: None,
         };

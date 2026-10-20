@@ -69,7 +69,11 @@ The surface mirrors the Rust crate's `BlockingTrellis` (issues #146, #147,
   columns of the relationships a transform reads that have no usable index
   (`unindexed_joins`, each a `Trellis.UnindexedJoin` with `relationship`,
   `table`, `column` and the `fix` sentence), a warning that never changes its
-  status. `status/2` lists the partitions of a partitioned source a transform
+  status. `status/2` lists the source indexes a `GROUP BY` or `JOIN` target
+  needs and lacks (`source_index_gaps`, each a `Trellis.SourceIndexGap` with
+  `table`, `columns`, `opted_out` and a `create index` statement as `fix`);
+  `self_check/3` refuses such a target unless it was defined `WITHOUT SOURCE
+  INDEX`. `status/2` lists the partitions of a partitioned source a transform
   is being corrected for while it reads `:backfilling` for them
   (`correcting`, each a `Trellis.CorrectingNode` with `node`, `since` and
   `keys_remaining`).
