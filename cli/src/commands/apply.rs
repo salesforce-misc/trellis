@@ -36,9 +36,11 @@ quoted shell argument. The statement forms:
 
 A transform is addressed by its target table, bare (post_totals) or
 schema-qualified (public.post_totals); PAUSE and RESUME also take
-<transform>.<column>, which names one calculated field. A dotted address that
-is a registered transform's qualified name names that transform. A relationship is always addressed scoped to its
-from-table, since its name is unique only there.
+<transform>.<column>, which names one calculated field and always takes the
+bare transform. When a.b reads both ways, it is column b of transform a if a
+declares a field b, and otherwise the transform registered as a.b. A
+relationship is always addressed scoped to its from-table, since its name is
+unique only there.
 
 PAUSE and RESUME apply to transforms only: a relationship is a reusable part of
 a transform, not something that does work of its own, so there is nothing to

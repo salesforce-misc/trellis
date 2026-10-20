@@ -467,10 +467,9 @@ impl Parser {
     /// definition, since a relationship *is* a definition and definitions can
     /// be retired.
     ///
-    /// A `<transform>.<column>` address is refused here rather than silently
-    /// ignoring the column half: `DROP` is whole-definition only (issue #228,
-    /// decision 2), and dropping a single calculated field is an
-    /// `ALTER TRANSFORM ... DROP <field>` (issues #241/#242).
+    /// `DROP` is whole-definition only (issue #228, decision 2), so a dotted
+    /// transform address is its qualified name; dropping a single calculated
+    /// field is an `ALTER TRANSFORM ... DROP <field>` (issues #241/#242).
     fn parse_drop_ref(&mut self) -> Result<DefinitionRef, ParseError> {
         if self.peek_is_keyword("TRANSFORM") {
             self.advance();
@@ -506,19 +505,12 @@ impl Parser {
         })
     }
 
-    /// Parses a `PAUSE`/`RESUME`/`DROP TRANSFORM` address:
-    /// `<target>` (whole definition) or `<target>.<column>` (one calculated
-    /// field, issue #228 decision 2).
-    ///
-    /// **Deliberately not [`Self::parse_table_ref`].** That helper reads
-    /// `a.b` as `<schema>.<table>`, which is right in `TRANSFORM`/`FROM`
-    /// position and wrong here: a transform's operator-facing identity is its
-    /// *bare* target-table name everywhere below the facade (see
-    /// [`DefinitionRef::Transform`]'s doc comment), and the same `ident '.'
-    /// ident` shape has to mean `<transform>.<column>` in this position for
-    /// decision 2's column addressing to exist at all. A third part is
-    /// refused naming the whole address, the way `parse_table_ref` does for
-    /// its own over-qualified case.
+    /// Parses a `PAUSE`/`RESUME`/`DROP TRANSFORM` address: `<target>` or a
+    /// two-part `a.b`, returned as its two halves. `PAUSE`/`RESUME` read the
+    /// halves as `<transform>.<column>` (issue #228 decision 2; the facade
+    /// may resolve them to a qualified name, see [`TransformRef`]), `DROP` as
+    /// `<schema>.<table>`. A third part is refused naming the whole address,
+    /// the way [`Self::parse_table_ref`] does for its own over-qualified case.
     fn parse_transform_address(
         &mut self,
         verb: Verb,

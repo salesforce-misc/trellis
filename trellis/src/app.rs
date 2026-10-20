@@ -514,10 +514,11 @@ impl Trellis {
     }
 
     /// The grammar reads `a.b` as transform `a`, column `b`. When `a.b` is
-    /// exactly a registered transform's qualified name (the spelling `apply`
-    /// returns), it names that whole transform instead: the reference with the
-    /// qualified name as its target and no column. Anything else is returned
-    /// as parsed, so `transform.column` keeps addressing a column.
+    /// instead a registered transform's qualified name (the spelling `apply`
+    /// returns), it names that whole transform: the reference with the
+    /// qualified name as its target and no column. See
+    /// [`Trellis::whole_transform_named`] for which reading wins when both
+    /// resolve.
     async fn qualified_or_column(
         &self,
         reference: defs::TransformRef,
@@ -525,18 +526,70 @@ impl Trellis {
         let Some(column) = &reference.column else {
             return Ok(reference);
         };
-        let address = format!("{}.{column}", reference.target);
-        let client = self.pool.get().await?;
-        let found = defs::catalog::bare_target_name(&**client, &address)
-            .await
-            .map_err(TrellisError::Catalog)?;
-        Ok(match found {
-            Some(_) => defs::TransformRef {
-                target: address,
-                column: None,
+        Ok(
+            match self
+                .whole_transform_named(&reference.target, column)
+                .await?
+            {
+                Some(_) => defs::TransformRef {
+                    target: format!("{}.{column}", reference.target),
+                    column: None,
+                },
+                None => reference,
             },
-            None => reference,
-        })
+        )
+    }
+
+    /// Resolves the `first.second` shape, which is both `<transform>.<column>`
+    /// (ADR-0003) and a qualified `<schema>.<table>` name: the bare name of
+    /// the transform registered as `first.second`, or `None` when the address
+    /// is a column one. Column addressing wins when transform `first` declares
+    /// a field `second`, since a column has no other spelling while the
+    /// transform can still be named bare.
+    async fn whole_transform_named(
+        &self,
+        first: &str,
+        second: &str,
+    ) -> Result<Option<String>, TrellisError> {
+        let bare = {
+            let client = self.pool.get().await?;
+            defs::catalog::bare_target_name(&**client, &format!("{first}.{second}"))
+                .await
+                .map_err(TrellisError::Catalog)?
+        };
+        let Some(bare) = bare else {
+            return Ok(None);
+        };
+        let declares_column = defs::catalog::definition_by_target(&self.pool, first)
+            .await
+            .map_err(TrellisError::Catalog)?
+            .is_some_and(|definition| {
+                definition
+                    .def
+                    .fields
+                    .iter()
+                    .any(|field| field.name == second)
+            });
+        Ok((!declares_column).then_some(bare))
+    }
+
+    /// Parses a quarantine address for the facade's lookups: as
+    /// [`QuarantineTarget::parse`] does, except that a `first.second` address
+    /// naming a registered transform's qualified name
+    /// ([`Trellis::whole_transform_named`]) is that whole transform, as its
+    /// bare [`QuarantineTarget::Transform`]. A qualified name with the wrong
+    /// schema stays a column address, of a transform that isn't there.
+    async fn resolve_quarantine_address(
+        &self,
+        address: &str,
+    ) -> Result<QuarantineTarget, TrellisError> {
+        let parsed = QuarantineTarget::parse(address);
+        if let QuarantineTarget::Column(first, second) = &parsed
+            && let Some(bare) = self.whole_transform_named(first, second).await?
+        {
+            return Ok(QuarantineTarget::Transform(bare));
+        }
+        Ok(parsed)
     }
 
     /// [`Statement::Pause`](defs::Statement::Pause)'s half of
@@ -590,6 +643,36 @@ impl Trellis {
     async fn apply_drop(&self, reference: defs::DefinitionRef) -> Result<Applied, TrellisError> {
         match reference {
             defs::DefinitionRef::Transform(target) => {
+                // A dotted address is a qualified name. One that names no
+                // transform while its first half does reads as
+                // `<transform>.<column>`: refuse it rather than report a
+                // successful drop of nothing.
+                if let Some((first, second)) = target.split_once('.') {
+                    let client = self.pool.get().await?;
+                    let names_none = defs::catalog::bare_target_name(&**client, &target)
+                        .await
+                        .map_err(TrellisError::Catalog)?
+                        .is_none();
+                    if names_none
+                        && defs::catalog::bare_target_name(&**client, first)
+                            .await
+                            .map_err(TrellisError::Catalog)?
+                            .is_some()
+                    {
+                        return Err(TrellisError::Parse(
+                            defs::ParseError::MalformedDefinitionAddress {
+                                statement: "DROP TRANSFORM".to_string(),
+                                address: target.clone(),
+                                detail: format!(
+                                    "DROP removes a whole definition, named bare or \
+                                     '<schema>.<table>', and no transform is '{target}'; \
+                                     dropping the calculated field '{second}' of '{first}' \
+                                     is ALTER TRANSFORM {first} DROP {second}"
+                                ),
+                            },
+                        ));
+                    }
+                }
                 defs::lifecycle::drop_transform(&self.pool, &target)
                     .await
                     .map_err(TrellisError::Catalog)?;
@@ -1176,8 +1259,8 @@ impl Trellis {
     /// bare; `transform.column` takes the bare transform.
     pub async fn quarantine_status(&self, target: &str) -> Result<QuarantineEntry, TrellisError> {
         self.call(async {
+            let target = self.resolve_quarantine_address(target).await?;
             let client = self.pool.get().await?;
-            let target = resolve_quarantine_address(&**client, target).await?;
             match &target {
                 QuarantineTarget::Transform(t) => {
                     // Issue #73: `t` is the bare name `QuarantineTarget::parse`
@@ -1268,8 +1351,8 @@ impl Trellis {
         limit: i64,
     ) -> Result<Vec<PoisonSample>, TrellisError> {
         self.call(async {
+            let target = self.resolve_quarantine_address(target).await?;
             let client = self.pool.get().await?;
-            let target = resolve_quarantine_address(&**client, target).await?;
             let rows = match &target {
                 QuarantineTarget::Column(t, c) => match &after {
                     Some((after_src, after_key)) => {
@@ -1617,8 +1700,7 @@ impl Trellis {
     /// reads the target's rows.
     ///
     /// `target_table` names a registered transform, same convention as
-    /// [`Trellis::status`]/[`Trellis::quarantine_status`] (its bare target
-    /// table name). An unknown one, an aggregate target
+    /// [`Trellis::status`] (its target table, qualified or bare). An unknown one, an aggregate target
     /// ([`SelfCheckError::UnsupportedKeySpace`]) and one that reads through a
     /// relationship ([`SelfCheckError::UnsupportedExpr`]) are refused here,
     /// wrapped in [`TrellisError::SelfCheck`]. A fleet-wide sweep is a
@@ -2293,27 +2375,6 @@ pub enum QuarantineTarget {
     Transform(String),
     /// One column of a transform, named `(target_table, column_name)`.
     Column(String, String),
-}
-
-/// Parses a quarantine address for the facade's lookups. A dotted address that
-/// is exactly a registered transform's qualified name (`schema.table`, as
-/// `apply` returns it) names that whole transform, as its bare
-/// [`QuarantineTarget::Transform`]; every other address parses as
-/// [`QuarantineTarget::parse`] does, so `transform.column` keeps addressing a
-/// column (ADR-0003) and a qualified name with the wrong schema finds no
-/// transform.
-async fn resolve_quarantine_address(
-    client: &impl tokio_postgres::GenericClient,
-    address: &str,
-) -> Result<QuarantineTarget, TrellisError> {
-    if address.contains('.')
-        && let Some(bare) = defs::catalog::bare_target_name(client, address)
-            .await
-            .map_err(TrellisError::Catalog)?
-    {
-        return Ok(QuarantineTarget::Transform(bare));
-    }
-    Ok(QuarantineTarget::parse(address))
 }
 
 impl QuarantineTarget {

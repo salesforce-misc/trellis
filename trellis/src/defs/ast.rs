@@ -248,19 +248,13 @@ impl fmt::Display for StatementKind {
 /// What a [`Statement::Pause`]/[`Statement::Resume`] addresses: a registered
 /// transform, whole (`column: None`) or one of its calculated fields.
 ///
-/// `target` is the **bare** target-table name, never a `schema.table`
-/// spelling — a dotted address is `<transform>.<column>` (issue #228,
-/// decision 2: [`crate::QuarantineTarget`]'s existing
-/// `"transform"`/`"transform.column"` addressing, folded into this grammar).
-/// That is the one place this grammar's addressing deliberately diverges from
-/// `TRANSFORM`/`FROM`'s own `[<schema>.]<table>` table references: every
-/// operator-facing entry point below the facade
-/// ([`super::lifecycle::pause_transform`],
-/// [`crate::staging::quarantine::resume_transform`],
-/// [`crate::Trellis::status`]) already identifies a transform by its bare
-/// name, and `<transform>.<column>` and `<schema>.<transform>` are the same
-/// token shape — so one of the two readings had to win, and the column reading
-/// is the one the engine can actually resolve.
+/// The parser reads a dotted address as `<transform>.<column>` (issue #228,
+/// decision 2: [`crate::QuarantineTarget`]'s `"transform"`/`"transform.column"`
+/// addressing, folded into this grammar), with `target` the bare transform.
+/// `<transform>.<column>` and `<schema>.<table>` are the same token shape, so
+/// [`crate::Trellis::apply`] reads `a.b` as the whole transform registered as
+/// `a.b` when transform `a` declares no field `b`; the column reading wins
+/// otherwise, since the transform can still be named bare.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransformRef {
     pub target: String,
@@ -291,12 +285,14 @@ impl fmt::Display for TransformRef {
 /// lookup that guesses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DefinitionRef {
-    /// `TRANSFORM <target>` — the bare target-table name.
+    /// `TRANSFORM <target>` — the target table, bare or `<schema>.<table>`.
     ///
     /// No column half, unlike [`TransformRef`]: dropping one calculated field
     /// is an `ALTER TRANSFORM ... DROP <field>`, a different operation
-    /// entirely (issue #228 decision 2; issues #241/#242), so a column address
-    /// has nothing to parse into here and the parser refuses one.
+    /// entirely (issue #228 decision 2; issues #241/#242), so a dotted
+    /// address is a qualified name. [`crate::Trellis::apply`] refuses one that
+    /// names no transform while its first half does, as the column address it
+    /// reads as.
     Transform(String),
     /// `[<schema>.]<from_table>.<relationship_name>`.
     ///
@@ -339,12 +335,9 @@ impl fmt::Display for DefinitionRef {
 /// `ALTER TRANSFORM <target> <clause>[, <clause> ...]` (ADR-0015, issues
 /// #241/#242).
 ///
-/// `target` is the **bare** target-table name — the same operator-facing
-/// addressing [`TransformRef`]/[`DefinitionRef::Transform`] use, not the
-/// `TRANSFORM`/`FROM` grammar's schema-qualifiable table reference: an edit
-/// acts on an already-registered definition by its bare identity, exactly
-/// like `PAUSE`/`RESUME`/`DROP TRANSFORM` do, rather than re-declaring the
-/// table.
+/// `target` is the registered transform's target table, bare or
+/// `<schema>.<table>`, as [`DefinitionRef::Transform`] takes it: an edit acts
+/// on an already-registered definition, rather than re-declaring the table.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AlterTransform {
     pub target: String,

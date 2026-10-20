@@ -244,3 +244,77 @@ async fn pause_resume_alter_and_drop_take_either_spelling() {
         .expect("drop by qualified name");
     assert!(persisted_status(&raw).await.is_none(), "dropped");
 }
+
+/// `rollup.total` is both column `total` of transform `rollup` and the
+/// qualified name of a transform `total` in schema `rollup`. Column addressing
+/// wins (ADR-0003): the column has no other spelling, while the transform is
+/// still named by its bare `total`.
+#[tokio::test]
+async fn a_column_address_wins_over_the_qualified_name_it_spells() {
+    let (trellis, raw, _qualified, _db) = setup().await;
+    raw.batch_execute("create schema rollup")
+        .await
+        .expect("create schema");
+    let other = trellis
+        .apply("TRANSFORM rollup.total FROM orders GROUP BY g SELECT count(*) AS n")
+        .await
+        .expect("define rollup.total")
+        .into_transform()
+        .expect("a transform");
+    assert_eq!(other, "rollup.total");
+
+    assert_eq!(
+        trellis
+            .quarantine_status("rollup.total")
+            .await
+            .unwrap()
+            .target,
+        trellis::QuarantineTarget::Column("rollup".to_string(), "total".to_string()),
+    );
+    assert_eq!(
+        trellis.quarantine_status("total").await.unwrap().target,
+        trellis::QuarantineTarget::Transform("total".to_string()),
+    );
+    // `status` takes no column, so there the address is the qualified name.
+    assert!(trellis.status("rollup.total").await.unwrap().is_some());
+
+    // PAUSE reads it as the column too; whatever it does to the column, the
+    // transform `total` is not paused.
+    let _ = trellis.apply("PAUSE TRANSFORM rollup.total").await;
+    let status: String = raw
+        .query_one(
+            "select status from transform_definitions where target_table = 'rollup.total'",
+            &[],
+        )
+        .await
+        .expect("read status")
+        .get(0);
+    assert_ne!(status, "paused");
+}
+
+/// `DROP TRANSFORM <transform>.<column>` is refused, changing nothing, rather
+/// than reported as a drop of a transform named `<transform>.<column>`.
+#[tokio::test]
+async fn drop_refuses_a_column_address_of_a_registered_transform() {
+    let (trellis, raw, _qualified, _db) = setup().await;
+    let err = trellis
+        .apply("DROP TRANSFORM rollup.total")
+        .await
+        .expect_err("a column address is not a DROP target");
+    assert!(
+        matches!(
+            &err,
+            TrellisError::Parse(trellis::ParseError::MalformedDefinitionAddress { .. })
+        ),
+        "{err:?}"
+    );
+    assert!(
+        err.to_string()
+            .contains("ALTER TRANSFORM rollup DROP total"),
+        "{err}"
+    );
+    assert_eq!(
+        persisted_status(&raw).await.as_deref(),
+        Some("waiting_to_backfill")
+    );
+}
