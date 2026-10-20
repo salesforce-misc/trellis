@@ -935,6 +935,17 @@ async fn a_p_or_m_page_is_a_range_scan_of_the_hidden_index_and_the_source_join_i
         ("m", "b", "b_join_idx", "gb"),
     ] {
         let (hidden, name) = hidden(&d, "l", part).await;
+        // The hidden table's one index, whatever define named it.
+        let hidden_index = d
+            .rows(&format!(
+                "select c.relname from pg_index i join pg_class c on c.oid = i.indexrelid \
+                 where i.indrelid = '{hidden}'::regclass"
+            ))
+            .await;
+        let [hidden_index] = hidden_index.as_slice() else {
+            panic!("{part}: one index on {hidden}: {hidden_index:?}");
+        };
+        let hidden_index = hidden_index.trim_matches(|c| c == '(' || c == ')');
         let plan = trellis::staging::self_check::explain_join_page(
             d.pool(),
             "public.l",
@@ -944,12 +955,21 @@ async fn a_p_or_m_page_is_a_range_scan_of_the_hidden_index_and_the_source_join_i
         )
         .await
         .expect("explain the page");
+        // A scan of `index` on `table` (plain or index-only), and its lines.
+        let scan_of = |index: &str, table: &str| -> Option<String> {
+            let lines: Vec<&str> = plan.lines().collect();
+            let at = lines.iter().position(|l| {
+                l.contains(&format!("Index Scan using {index} on {table} "))
+                    || l.contains(&format!("Index Only Scan using {index} on {table} "))
+            })?;
+            Some(lines[at..(at + 3).min(lines.len())].join("\n"))
+        };
         // The hidden side's range is bounded by the cursor in the index's
         // own column order: the join key, then the group column.
+        let scan = scan_of(hidden_index, &name);
         assert!(
-            plan.contains(&format!(
-                "Index Scan using {name}_t_k_{group}_key on {name} __h"
-            )) && plan.contains(&format!("Index Cond: (ROW(t, k, {group}) > ROW(1, 1, 1))")),
+            scan.as_deref()
+                .is_some_and(|s| s.contains(&format!("Index Cond: (ROW(t, k, {group}) > "))),
             "{part}: the hidden side is a range scan of {hidden}'s index:\n{plan}"
         );
         assert!(
@@ -959,8 +979,7 @@ async fn a_p_or_m_page_is_a_range_scan_of_the_hidden_index_and_the_source_join_i
         // The source side's range is bounded by the join key alone, so an
         // index on the join columns serves it.
         assert!(
-            plan.contains(&format!("Index Scan using {index} on {source} "))
-                && plan.contains("(ROW(t, k) >= ROW(1, 1))"),
+            scan_of(index, source).is_some_and(|s| s.contains("(ROW(t, k) >= ")),
             "{part}: the source side is a range scan of {index}:\n{plan}"
         );
     }
@@ -1006,4 +1025,128 @@ async fn a_joined_side_with_no_group_columns_walks_alike_at_every_page_size() {
 #[tokio::test]
 async fn a_group_column_that_is_also_the_join_key_walks_alike_at_every_page_size() {
     walk_is_the_same_at_every_page_size(GROUP_IS_KEY, "gk").await;
+}
+
+/// Cells planted on one side alone of `P` and `M`, at every other key in the
+/// walk's order, so each lands on a page boundary at some page size: every
+/// one is found at every page size, as the unpaged walk finds it. A source
+/// key past the hidden side's last key of a page belongs to the next page,
+/// so a source and hidden side ordered or bounded differently would skip or
+/// double one. `parts` names each part's hidden key columns in the walk's
+/// order (the join key first) and the group column whose value an extra cell
+/// varies, if the side has one apart from its join key.
+async fn one_sided_cells_are_found_at_every_page_size(
+    definition: &str,
+    target: &str,
+    parts: [(&str, &str, Option<&str>); 2],
+) {
+    let mut d = start(&[definition]).await;
+    seed(&mut d).await;
+    let mut planted = 0;
+    for (part, key, group) in parts {
+        let (table, _) = hidden(&d, target, part).await;
+        // Every other live cell in the walk's order (each column ascending,
+        // NULL last): gone from the hidden side alone, a cell only the
+        // source has. (An emptied cell, `__n = 0`, matches its absence.)
+        let live = format!(
+            "select ctid from (select ctid, row_number() over (order by {key}) as rn \
+             from {table} where __n <> 0) r where rn % 2 = 0"
+        );
+        let deleted = d.rows(&live).await.len();
+        assert!(deleted >= 1, "{part}: a cell to delete");
+        exec(&d, &format!("delete from {table} where ctid in ({live})")).await;
+        planted += deleted;
+        // Cells only the hidden side has, interleaved with the real ones:
+        // each remaining join key under a group value no row has.
+        if let Some(group) = group {
+            let join: Vec<&str> = key.split(", ").filter(|c| *c != group).collect();
+            let join = join.join(", ");
+            exec(
+                &d,
+                &format!(
+                    "insert into {table} ({join}, {group}, __n) \
+                     select distinct {join}, 1000, 5 from {table}"
+                ),
+            )
+            .await;
+            planted += d
+                .rows(&format!("select 1 from {table} where __n = 5"))
+                .await
+                .len();
+        }
+    }
+    let sorted = |found: &[Divergence]| -> Vec<String> {
+        let mut found: Vec<String> = found.iter().map(|f| format!("{f:?}")).collect();
+        found.sort();
+        found
+    };
+    let (whole, compared, _) = walk(&d, target, 1000).await;
+    let whole = sorted(&whole);
+    let keys: std::collections::BTreeSet<String> = whole
+        .iter()
+        .filter(|f| f.contains("_p.") || f.contains("_m."))
+        .map(|f| {
+            let (key, rest) = f.split_once(", column").unwrap();
+            format!("{key} {}", &rest[..rest.find('.').unwrap()])
+        })
+        .collect();
+    assert_eq!(
+        keys.len(),
+        planted,
+        "every planted cell is found unpaged, once: {whole:#?}"
+    );
+    for limit in [1, 2, 3, 4, 5] {
+        let (found, count, _) = walk(&d, target, limit).await;
+        assert_eq!(sorted(&found), whole, "limit {limit}");
+        assert_eq!(count, compared, "limit {limit}");
+    }
+    // Again with each source's index on its join columns, which the page
+    // then steers by instead of bounding the source by the hidden side.
+    for (part, key, group) in parts {
+        let source = if part == "p" { "a" } else { "b" };
+        let join = key
+            .split(", ")
+            .filter(|c| Some(*c) != group)
+            .collect::<Vec<_>>();
+        exec(
+            &d,
+            &format!("create index on public.{source} ({})", join.join(", ")),
+        )
+        .await;
+    }
+    for limit in [1, 2, 3, 4, 5] {
+        let (found, count, _) = walk(&d, target, limit).await;
+        assert_eq!(sorted(&found), whole, "indexed, limit {limit}");
+        assert_eq!(count, compared, "indexed, limit {limit}");
+    }
+}
+
+#[tokio::test]
+async fn one_sided_cells_of_a_composite_nullable_join_key_are_found_at_every_page_size() {
+    one_sided_cells_are_found_at_every_page_size(
+        LEFT_PAIR,
+        "l",
+        [("p", "t, k, ga", Some("ga")), ("m", "t, k, gb", Some("gb"))],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn one_sided_cells_of_a_joined_side_with_no_group_columns_are_found_at_every_page_size() {
+    one_sided_cells_are_found_at_every_page_size(
+        INNER,
+        "i",
+        [("p", "k, ga", Some("ga")), ("m", "k", None)],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn one_sided_cells_where_a_group_column_is_the_join_key_are_found_at_every_page_size() {
+    one_sided_cells_are_found_at_every_page_size(
+        GROUP_IS_KEY,
+        "gk",
+        [("p", "k", None), ("m", "k, gb", Some("gb"))],
+    )
+    .await;
 }
