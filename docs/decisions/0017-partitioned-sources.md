@@ -443,9 +443,15 @@ A deep check compares them in this order:
 2. Otherwise a changed `system_identifier` compares the recorded nodes by oid
    and bound. When every recorded oid is present with the same bound it is
    `pg_upgrade`; anything else is a restore.
-3. Otherwise the ordinary plan runs. A root dropped and recreated, or swapped
-   in by renames, keeps both values: it is the old tree gone and a new one
-   created, corrected per node, not a restore.
+3. Otherwise the ordinary plan runs. A root dropped and recreated, renamed
+   away, moved to another schema or swapped in by renames keeps both values,
+   so it is no restore. It is table maintenance, not partition maintenance:
+   the pass pauses every reader before any deep check, like a plain table that
+   is gone or swapped ([capture by
+   triggers](../staging-and-claiming/01-capture-by-triggers.md#capture-changed-outside-trellis)),
+   and corrects and reinstalls nothing. A resume re-validates against the
+   table now at the name, forgets the recorded tree and rebuilds. Only a
+   leaf's or a middle's maintenance is corrected per node.
 
 On `pg_upgrade` the pass re-records the `xmin`s and `relpartbound` texts.
 `pg_upgrade` resets every `pg_inherits.xmin` and `pg_class.xmin` to one value,

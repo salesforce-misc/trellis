@@ -546,7 +546,12 @@ transaction), and records a node that comes back carrying all five triggers
 first and then one table per transaction, each recording its own tables, so a
 pass that stops between two of them leaves a record for exactly the tables
 that carry triggers. A node that is still in the tree and lost, disabled or
-recreated its triggers is a disruption like a plain table's.
+recreated its triggers is a disruption like a plain table's. So is the root
+itself dropped, renamed away, moved to another schema, swapped in by renames or
+dropped and recreated (empty, or with leaves attached): that is table
+maintenance, not partition maintenance, so the pass pauses the readers and
+corrects and reinstalls nothing; `RESUME` forgets the recorded tree and
+rebuilds.
 
 ### What rebuilds, what pauses, and what's missed
 

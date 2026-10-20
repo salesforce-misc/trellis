@@ -802,26 +802,162 @@ async fn an_install_that_stops_between_transactions_pauses_nothing() {
     );
 }
 
-/// Left on ADR-0017's behaviour (the coordinator's instruction; the user has
-/// not decided whether #707 rule 2 should pause these): a partitioned root
-/// renamed away and back, or dropped and recreated, is the partition
-/// pass's to classify (`capture_partition_pass.rs`). The trigger check
-/// forgets what it recorded for the old tree and acts on none of it: it
-/// pauses nothing, and the pass reinstalls capture on the new tree.
+/// One root case: its id, the windows that disrupt the root (a capture pass
+/// after each), the `capture_failure` text both readers must carry, and the
+/// windows that put a table at the name for the resume to re-validate.
+type RootCase = (&'static str, Vec<String>, &'static str, Vec<String>);
+
+async fn count(raw: &Client, sql: &str) -> String {
+    rows(raw, sql).await[0][0].clone().unwrap()
+}
+
+/// A root that is dropped, renamed away, moved to another schema, swapped by
+/// renames or dropped and recreated is table maintenance, not partition
+/// maintenance (#1200): both readers pause on the first pass that sees it,
+/// nothing is corrected and nothing is reinstalled before a `RESUME`, and
+/// after it the targets equal what the source holds.
 #[tokio::test]
-async fn a_renamed_or_replaced_root_stays_with_the_partition_pass() {
-    let cases: Vec<Case> = vec![
+async fn a_root_swapped_recreated_or_renamed_away_pauses_both_readers_until_resumed() {
+    trellis::defs::partition_tree::open_gate_for_tests();
+    let cases: Vec<RootCase> = vec![
         (
-            "renamed".into(),
-            w(&["alter table public.{t} rename to {t}_away; \
-                 alter table public.{t}_away rename to {t}"]),
-            Expect::Nothing,
+            "renamed",
+            w(&["alter table public.{t} rename to {t}_away"]),
+            "no longer exists",
+            w(&["alter table public.{t}_away rename to {t}"]),
         ),
         (
-            "replaced".into(),
-            vec![format!("drop table public.{{t}}; {}", tree_ddl("{t}"))],
-            Expect::Nothing,
+            "schema",
+            w(&["create schema if not exists elsewhere; \
+                 alter table public.{t} set schema elsewhere"]),
+            "no longer exists",
+            w(&["alter table elsewhere.{t} set schema public"]),
+        ),
+        (
+            "swapped",
+            vec![format!(
+                "{} insert into public.{{t}}_n select i + 100, i % 3, i, i * 2, i \
+                    from generate_series(1, 12) i; \
+                 alter table public.{{t}} rename to {{t}}_old; \
+                 alter table public.{{t}}_n rename to {{t}}",
+                tree_ddl("{t}_n")
+            )],
+            "not the one Trellis captured",
+            vec![],
+        ),
+        (
+            "empty",
+            w(&["drop table public.{t}; \
+                 create table public.{t} (id int not null, g int not null, a int, b int, \
+                    u int, primary key (g, id)) partition by list (g)"]),
+            "not the one Trellis captured",
+            vec![],
+        ),
+        (
+            "leaves",
+            vec![format!(
+                "drop table public.{{t}}; {}",
+                tree_ddl("{t}").replace("generate_series(1, 30)", "generate_series(1, 9)")
+            )],
+            "not the one Trellis captured",
+            vec![],
         ),
     ];
-    run_cases(&cases).await;
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
+    let ids: Vec<String> = cases.iter().map(|c| c.0.to_string()).collect();
+    create_case_tables(&raw, &trellis, &ids).await;
+    bring_live(&mut raw, &db.pool).await;
+    let app = connect(db.dsn()).await;
+
+    let mut failures = Vec::new();
+    for (id, windows, text, restore) in &cases {
+        let t = format!("p_{id}");
+        for window in windows {
+            app.batch_execute(&window.replace("{t}", &t))
+                .await
+                .unwrap_or_else(|e| panic!("{id}: {window}: {e:?}"));
+            capture_pass(&mut raw, &db.pool).await;
+        }
+        let now = settle(&mut raw, &db.pool, &trellis, id, &mut failures).await;
+        let ok = now.iter().all(|(s, f)| {
+            *s == TransformStatus::Paused && f.as_deref().is_some_and(|f| f.contains(text))
+        });
+        if !ok {
+            failures.push(format!("{id}: expected a pause naming {text:?}: {now:?}"));
+        }
+        let queued = count(
+            &raw,
+            &format!(
+                "select count(*)::text from partition_corrections where table_name = 'public.{t}'"
+            ),
+        )
+        .await;
+        if queued != "0" {
+            failures.push(format!("{id}: {queued} corrections queued"));
+        }
+        let triggers = count(
+            &raw,
+            &format!(
+                "select count(*)::text from pg_trigger where tgname like 'trellis_capture_%' \
+                   and tgrelid = coalesce(to_regclass('public.{t}'), 0::oid) \
+                   and tgrelid <> (select root_oid::oid from partition_sources \
+                                   where table_name = 'public.{t}')"
+            ),
+        )
+        .await;
+        if triggers != "0" {
+            failures.push(format!("{id}: capture reinstalled on the new root"));
+        }
+        for window in restore {
+            app.batch_execute(&window.replace("{t}", &t))
+                .await
+                .unwrap_or_else(|e| panic!("{id}: {window}: {e:?}"));
+        }
+        for reader in ["r", "s"] {
+            trellis
+                .apply(&format!("RESUME TRANSFORM {reader}_{id}"))
+                .await
+                .unwrap_or_else(|e| panic!("{id}: resume {reader}: {e}"));
+        }
+    }
+    bring_live(&mut raw, &db.pool).await;
+    for (id, ..) in &cases {
+        let t = format!("p_{id}");
+        let target = rows(
+            &raw,
+            &format!("select g::text, total::text from public.s_{id} order by 1"),
+        )
+        .await;
+        let source = rows(
+            &raw,
+            &format!("select g::text, sum(b)::text from public.{t} group by g order by 1"),
+        )
+        .await;
+        if target != source {
+            failures.push(format!("{id}: sum {target:?} != {source:?}"));
+        }
+        let target = rows(
+            &raw,
+            &format!("select g::text, a::text, n::text from public.r_{id} order by 1, 2"),
+        )
+        .await;
+        let source = rows(
+            &raw,
+            &format!("select g::text, a::text, count(*)::text from public.{t} group by g, a order by 1, 2"),
+        )
+        .await;
+        if target != source {
+            failures.push(format!("{id}: count {target:?} != {source:?}"));
+        }
+    }
+    capture_pass(&mut raw, &db.pool).await;
+    for (t, s) in statuses(&raw).await {
+        if s != TransformStatus::Live {
+            failures.push(format!("{t} is {s:?} after the resume"));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
 }

@@ -460,39 +460,65 @@ async fn pause_readers(
 }
 
 /// The capture pass's check that `table`, which some definition reads, still
-/// exists at that name as a table (plain or partitioned). When it doesn't,
-/// pauses every definition that reads it and isn't paused yet (#999) and
-/// returns `true`, and the caller leaves the table alone: its capture can't
-/// be installed, and a table swapped in meanwhile is for a resume to
-/// re-validate. A view, materialized view or foreign table put at the name
-/// (a table renamed away behind a compatibility view, say) is no table: the
-/// table is gone from the name all the same.
+/// exists at that name as a table (plain or partitioned), and, for a
+/// partitioned source the pass has recorded, is still the root it recorded.
+/// When it doesn't, pauses every definition that reads it and isn't paused
+/// yet (#999, #1200) and returns `true`, and the caller leaves the table
+/// alone: its capture can't be installed, and a table swapped in meanwhile is
+/// for a resume to re-validate. A view, materialized view or foreign table put
+/// at the name (a table renamed away behind a compatibility view, say) is no
+/// table: the table is gone from the name all the same.
 ///
-/// A partitioned source the pass has recorded is left to
-/// [`super::partitions`], which tells a root renamed away from a gone one.
+/// A partitioned root renamed away, moved to another schema, swapped in by
+/// renames, or dropped and recreated (empty, or with leaves attached) is table
+/// maintenance, not partition maintenance: the readers pause and nothing is
+/// corrected or reinstalled until a resume. A source whose recorded state
+/// came from another database (a restore, or `pg_upgrade`) is not judged
+/// here: [`super::partitions`] classifies it.
 pub(crate) async fn pause_readers_of_gone_table(
     client: &mut Client,
     catalog: &CaptureCatalog,
     table: &str,
 ) -> Result<bool, CaptureError> {
-    let exists: bool = client
+    let live: Option<(u32, String)> = client
         .query_typed(
-            "select exists (select 1 from pg_catalog.pg_class c \
-                 where c.oid = pg_catalog.to_regclass($1) and c.relkind in ('r', 'p'))",
+            "select c.oid, c.relkind::text from pg_catalog.pg_class c \
+             where c.oid = pg_catalog.to_regclass($1) and c.relkind in ('r', 'p')",
             &[(&crate::defs::ddl::regclass_arg(table), Type::TEXT)],
         )
         .await?
         .first()
-        .is_some_and(|row| row.get(0));
-    if exists
-        || super::partitions::recorded(&*client, table)
-            .await?
-            .is_some()
-    {
-        return Ok(false);
-    }
-    pause_readers(client, catalog, table, &gone_error(table)).await?;
+        .map(|row| (row.get(0), row.get(1)));
+    // The recorded root, if the recorded state is this database's own.
+    let recorded_root: Option<u32> = client
+        .query_typed(
+            "select s.root_oid::oid from partition_sources s \
+             where s.table_name = $1 \
+               and s.catalog_oid = pg_catalog.to_regclass('partition_sources')::oid \
+               and s.system_identifier = \
+                   (select system_identifier::text from pg_catalog.pg_control_system())",
+            &[(&table, Type::TEXT)],
+        )
+        .await?
+        .first()
+        .map(|row| row.get(0));
+    let error = match (&live, recorded_root) {
+        (None, _) => gone_error(table),
+        (Some((oid, _)), Some(root)) if *oid != root => {
+            disrupted_error(table, &[root_replaced(table)])
+        }
+        _ => return Ok(false),
+    };
+    pause_readers(client, catalog, table, &error).await?;
     Ok(true)
+}
+
+/// The finding for a partitioned root that isn't the recorded one.
+fn root_replaced(table: &str) -> String {
+    format!(
+        "the partitioned table {table} at that name is not the one Trellis captured (it was \
+         dropped and created again, or swapped in by renames)"
+    )
 }
 
 /// Whether the rows of `capture_triggers` for `table` came from another
