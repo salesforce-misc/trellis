@@ -2090,12 +2090,15 @@ pub struct DefinitionStatus {
     ///   capture trigger or function was altered, disabled (`ENABLE TRIGGER
     ///   ALL` after a bulk load leaves `ORIGIN`), recreated or replaced, or
     ///   the table is gone. Changes made meanwhile may be missing, so resume
-    ///   the definition, which reinstalls capture and rebuilds it.
+    ///   the definition, which reinstalls capture and rebuilds it. A
+    ///   definition already frozen when the disruption is seen (an
+    ///   operator's `PAUSE`) gets the same record with
+    ///   [`CaptureFailureKind::Capture`]: it stays the operator's to resume.
     ///
-    /// The halts have [`CaptureFailureKind::Halt`], the disruptions
-    /// [`CaptureFailureKind::Disruption`], and every other case
-    /// [`CaptureFailureKind::Capture`]. A definition an operator paused has
-    /// none.
+    /// The halts have [`CaptureFailureKind::Halt`], the disruptions of a
+    /// definition that wasn't frozen [`CaptureFailureKind::Disruption`], and
+    /// every other case [`CaptureFailureKind::Capture`]. A definition an
+    /// operator paused has none until one of these is seen.
     pub capture_failure: Option<CaptureFailure>,
     /// Set while the definition holds keys in quarantine (#759): source keys
     /// whose changes its apply leaves out, each because a change to it kept
@@ -2182,6 +2185,9 @@ pub struct CaptureFailure {
 pub enum CaptureFailureKind {
     /// Capture of a table the definition reads is broken: a schema change,
     /// row-level security, a subscription, or a failing install or widen.
+    /// Also a [`CaptureFailureKind::Disruption`] seen while the definition
+    /// was already frozen (an operator's `PAUSE`), which stays the
+    /// operator's to resume.
     Capture,
     /// The drain, or a Re-derive build's group-delta merge, halted on the
     /// definition: a failure no retry or quarantine gets past reached it, so
@@ -2195,7 +2201,8 @@ pub enum CaptureFailureKind {
     /// (`ENABLE TRIGGER ALL` puts the triggers in `ORIGIN` mode). The
     /// definition waits for a resume, which re-validates, reinstalls
     /// capture and rebuilds it. A test helper that resumes after a fixture
-    /// load selects on this kind.
+    /// load selects on this kind. A definition that was already frozen when
+    /// the disruption was seen gets [`CaptureFailureKind::Capture`] instead.
     Disruption,
 }
 

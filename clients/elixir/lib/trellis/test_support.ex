@@ -177,27 +177,37 @@ defmodule Trellis.TestSupport do
       {:ok, %Status{status: :live}} ->
         :ok
 
-      {:ok, %Status{status: :paused, capture_failure: %CaptureFailure{kind: kind, error: why}}}
+      {:ok,
+       %Status{status: :paused, capture_failure: %CaptureFailure{kind: kind, error: why}} =
+           status}
       when kind != :disruption ->
-        # Paused again by something else: its rebuild failed. (Paused again
-        # by a disruption is waited out, and the timeout reports it.)
-        {:refused, why}
+        # Paused again by something else: its rebuild failed. An error that
+        # starts "resuming:" is the resume still under way (the staging
+        # worker re-types Trellis's columns first, or waits for an upstream
+        # definition), and is waited for. (Paused again by a disruption is
+        # waited out, and the timeout reports it.)
+        if String.starts_with?(why, "resuming:"),
+          do: poll(trellis, target, deadline, status),
+          else: {:refused, why}
 
       {:ok, status} ->
-        if now() > deadline do
-          {:error,
-           %Error{
-             code: :timeout,
-             message:
-               "#{target} was not :live in time after its resume; last saw #{inspect(status)}"
-           }}
-        else
-          Process.sleep(@poll_ms)
-          await_live(trellis, target, deadline)
-        end
+        poll(trellis, target, deadline, status)
 
       {:error, _} = error ->
         error
+    end
+  end
+
+  defp poll(trellis, target, deadline, status) do
+    if now() > deadline do
+      {:error,
+       %Error{
+         code: :timeout,
+         message: "#{target} was not :live in time after its resume; last saw #{inspect(status)}"
+       }}
+    else
+      Process.sleep(@poll_ms)
+      await_live(trellis, target, deadline)
     end
   end
 

@@ -51,6 +51,8 @@ module Trellis
     end
 
     POLL_SECONDS = 0.05
+    # How a CaptureFailure's error starts while a resume is still under way.
+    RESUMING = "resuming:"
 
     module_function
 
@@ -119,10 +121,13 @@ module Trellis
 
         if status&.status == :paused
           failure = status.capture_failure
-          # Paused again by something else: its rebuild failed. (Paused
-          # again by a disruption is waited out: the next resume is the
-          # caller's, and the timeout reports it.)
-          if failure && failure.kind != :disruption
+          # Paused again by something else: its rebuild failed. A failure
+          # whose error starts "resuming:" is the resume still under way (the
+          # staging worker re-types Trellis's columns first, or waits for an
+          # upstream definition), and is waited for. (Paused again by a
+          # disruption is waited out: the next resume is the caller's, and
+          # the timeout reports it.)
+          if failure && failure.kind != :disruption && !failure.error.start_with?(RESUMING)
             refused[target] = failure.error
             return
           end

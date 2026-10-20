@@ -49,10 +49,12 @@ class TestSupportTest < Minitest::Test
       assert_equal pg.exec("select g::text, sum(n)::text from loads group by g order by g").values,
                    pg.exec("select g::text, total::text from load_sums order by g").values
 
-      # The operator's pause is the operator's: still paused, with no failure.
+      # The operator's pause is the operator's: still paused. The disruption
+      # seen while it was paused is recorded as kind :capture, not
+      # :disruption, so the helper leaves it to the operator.
       operator = Trellis.status("load_operator")
       assert_equal :paused, operator.status
-      assert_nil operator.capture_failure
+      assert_equal :capture, operator.capture_failure.kind
 
       # And nothing is left to do.
       assert_equal [], Trellis::TestSupport.resume_capture_disruptions
@@ -105,6 +107,27 @@ class TestSupportTest < Minitest::Test
       assert_equal :disruption, refused.capture_failure.kind
       assert_equal :live, Trellis.status("kept_copy").status
       assert_equal [["7"]], pg.exec("select n::text from kept_copy").values
+    end
+  end
+
+  # A table recreated with a wider column (a test schema reloaded after a
+  # migration): the resume re-types Trellis's copy first, reporting a
+  # "resuming:" capture failure meanwhile, which is a resume in progress,
+  # not a refusal.
+  def test_a_resume_that_re_types_first_is_waited_for
+    with_instance do |pg|
+      pg.exec("create table widened (id integer primary key, n integer not null)")
+      pg.exec("insert into widened values (1, 1)")
+      Trellis.apply("TRANSFORM widened_copy FROM widened SELECT n AS n")
+      await_status("widened_copy")
+
+      pg.exec("drop table widened")
+      pg.exec("create table widened (id integer primary key, n bigint not null)")
+      pg.exec("insert into widened values (1, 5000000000)")
+
+      assert_equal ["public.widened_copy"], Trellis::TestSupport.resume_capture_disruptions
+      assert_equal :live, Trellis.status("widened_copy").status
+      assert_equal [["5000000000"]], pg.exec("select n::text from widened_copy").values
     end
   end
 

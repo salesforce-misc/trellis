@@ -278,27 +278,35 @@ pub(crate) async fn pause_for_capture_failure(
 /// `kind` is `disruption`, which is what a test helper selects to resume
 /// exactly these (#1181). Returns whether this call paused it.
 ///
-/// A definition that isn't dispatchable already waits for a resume (an
-/// operator's `PAUSE`, say), and a resume rebuilds it from the tables as they
-/// are then, so it gets no record: it stays the operator's pause, and a
-/// helper that resumes disruptions never resumes it.
+/// A definition already frozen (an operator's `PAUSE`, say) gets the record
+/// with kind `capture` instead, so it stays the operator's pause, which a
+/// helper that resumes disruptions never resumes. It still gets a record:
+/// the record is what makes its resume forget the table's recorded capture
+/// (`staging::quarantine`), so the next pass reinstalls capture instead of
+/// finding the disruption again and pausing it once more. Its row is locked
+/// before its status is read, so a `PAUSE` committing meanwhile is seen and
+/// never recorded as a disruption.
 pub(crate) async fn pause_for_disruption(
     txn: &Transaction<'_>,
     id: i64,
     source_table: &str,
     error: &str,
 ) -> Result<bool, CatalogError> {
-    let dispatchable = txn
+    let Some(row) = txn
         .query_opt(
-            "select 1 from transform_definitions where id = $1 and status = any($2)",
+            "select status = any($2) from transform_definitions where id = $1 for update",
             &[&id, &TransformStatus::dispatchable()],
         )
         .await?
-        .is_some();
-    if !dispatchable {
+    else {
         return Ok(false);
-    }
-    pause_with_record(txn, id, source_table, &[], error, "disruption", None).await
+    };
+    let kind = if row.get::<_, bool>(0) {
+        "disruption"
+    } else {
+        "capture"
+    };
+    pause_with_record(txn, id, source_table, &[], error, kind, None).await
 }
 
 /// Pauses definition `id` because it was written under a grammar version

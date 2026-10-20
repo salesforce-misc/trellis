@@ -59,8 +59,10 @@ defmodule Trellis.TestSupportTest do
     assert rows(pg, "select g::text, total::text from load_sums order by g") ==
              rows(pg, "select g::text, sum(n)::text from loads group by g order by g")
 
-    # The operator's pause is the operator's: still paused, with no failure.
-    assert %Status{status: :paused, capture_failure: nil} =
+    # The operator's pause is the operator's: still paused. The disruption
+    # seen while it was paused is recorded as kind :capture, not
+    # :disruption, so the helper leaves it to the operator.
+    assert %Status{status: :paused, capture_failure: %CaptureFailure{kind: :capture}} =
              Trellis.status!(trellis, "load_operator")
 
     # And nothing is left to do.
@@ -118,6 +120,25 @@ defmodule Trellis.TestSupportTest do
 
     assert %Status{status: :live} = Trellis.status!(trellis, "kept_copy")
     assert column(pg, "select n::text from kept_copy") == ["7"]
+  end
+
+  # A table recreated with a wider column (a test schema reloaded after a
+  # migration): the resume re-types Trellis's copy first, reporting a
+  # "resuming:" capture failure meanwhile, which is a resume in progress, not
+  # a refusal.
+  test "a resume that re-types first is waited for", %{pg: pg, trellis: trellis} do
+    sql(pg, "create table widened (id integer primary key, n integer not null)")
+    sql(pg, "insert into widened values (1, 1)")
+    Trellis.apply!(trellis, "TRANSFORM widened_copy FROM widened SELECT n AS n")
+    await_live(trellis, "widened_copy")
+
+    sql(pg, "drop table widened")
+    sql(pg, "create table widened (id integer primary key, n bigint not null)")
+    sql(pg, "insert into widened values (1, 5000000000)")
+
+    assert TestSupport.resume_capture_disruptions!(trellis) == ["public.widened_copy"]
+    assert %Status{status: :live} = Trellis.status!(trellis, "widened_copy")
+    assert column(pg, "select n::text from widened_copy") == ["5000000000"]
   end
 
   defp sql(pg, statement), do: Postgrex.query!(pg, statement, [])
