@@ -557,10 +557,15 @@ impl Sweep {
                 None => None,
             };
             let mut matching = match &def.key_space {
+                // A JOIN's rows come from its own build (J4, #1109), not an
+                // orphan sweep. A re-read of its table that reaches here (a
+                // swapped table's reinstalled capture, #1177) fails the marker
+                // so it backs off (#407) instead of taking down the worker.
                 KeySpace::Join(_) => {
-                    unreachable!(
-                        "a JOIN goes live with no marker discharge until its build (J4, #1109), so no orphan sweep reaches it"
-                    )
+                    return Err(IntakeError::UnsweepableTarget {
+                        target,
+                        reason: "a JOIN target is rebuilt, not swept (J4, #1109)".to_string(),
+                    });
                 }
                 KeySpace::OneToOne => one_to_one_match(&key_cols),
                 KeySpace::Aggregate { group_by } => {
