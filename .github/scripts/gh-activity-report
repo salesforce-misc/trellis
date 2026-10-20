@@ -300,6 +300,9 @@ HTML_TEMPLATE = """<!doctype html>
   .mini-grid {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }}
   .chart-card.mini {{ padding: 16px 16px 12px; }}
   .mini-title {{ font-size: 12px; font-weight: 600; color: var(--text-secondary); margin-bottom: 8px; }}
+  .mini-total {{ margin-bottom: 8px; }}
+  .mini-total .value {{ font-size: 24px; font-weight: 600; color: var(--text-primary); }}
+  .mini-total .caption {{ font-size: 12px; color: var(--text-muted); margin-top: 2px; }}
   .empty-state {{ color: var(--text-muted); font-size: 13px; padding: 24px 0; text-align: center; }}
   .legend {{ display: flex; flex-wrap: wrap; gap: 16px; margin-bottom: 12px; font-size: 12px; color: var(--text-secondary); }}
   .legend .item {{
@@ -406,16 +409,19 @@ HTML_TEMPLATE = """<!doctype html>
   <div class="mini-grid" id="logbookGrid">
     <div class="chart-card mini">
       <div class="mini-title">Validation runs</div>
+      <div class="mini-total" id="logbookRunsTotal"></div>
       <svg class="chart" id="logbookRunsChart" viewBox="0 0 280 170" preserveAspectRatio="none"></svg>
       <div class="tooltip" id="logbookRunsTooltip" hidden></div>
     </div>
     <div class="chart-card mini">
       <div class="mini-title">Hours spent validating</div>
+      <div class="mini-total" id="logbookHoursTotal"></div>
       <svg class="chart" id="logbookHoursChart" viewBox="0 0 280 170" preserveAspectRatio="none"></svg>
       <div class="tooltip" id="logbookHoursTooltip" hidden></div>
     </div>
     <div class="chart-card mini">
       <div class="mini-title">Rows validated</div>
+      <div class="mini-total" id="logbookRowsTotal"></div>
       <svg class="chart" id="logbookRowsChart" viewBox="0 0 280 170" preserveAspectRatio="none"></svg>
       <div class="tooltip" id="logbookRowsTooltip" hidden></div>
     </div>
@@ -497,6 +503,26 @@ HTML_TEMPLATE = """<!doctype html>
     return step * magnitude;
   }}
 
+  // Compact y-axis tick label: 950, 2.5k, 40M, 3B, 1.2T, then 1e15 / 2.5e21
+  // beyond T, so a tick never needs a long run of zeros.
+  function formatAxisValue(v) {{
+    if (v === 0) return "0";
+    var sign = v < 0 ? "-" : "";
+    var abs = Math.abs(v);
+    // toPrecision(3) + Number() drops float noise and trailing zeros without
+    // rounding a fractional tick like 0.5 or 2.5 up to a whole number.
+    var trim = function (n) {{ return String(Number(n.toPrecision(3))); }};
+    if (abs < 1e3) return sign + trim(abs);
+    if (abs >= 1e15) {{
+      var parts = abs.toExponential().split("e");
+      return sign + trim(Number(parts[0])) + "e" + parseInt(parts[1], 10);
+    }}
+    var units = [[1e12, "T"], [1e9, "B"], [1e6, "M"], [1e3, "k"]];
+    for (var i = 0; i < units.length; i++) {{
+      if (abs >= units[i][0]) return sign + trim(abs / units[i][0]) + units[i][1];
+    }}
+  }}
+
   function el(tag, attrs) {{
     var node = document.createElementNS(svgNS, tag);
     for (var k in attrs) node.setAttribute(k, attrs[k]);
@@ -576,7 +602,7 @@ HTML_TEMPLATE = """<!doctype html>
           class: frac === 0 ? "baseline" : "gridline"
         }}));
         var label = el("text", {{ x: PAD.left - 8, y: gy + 4, class: "axis-label", "text-anchor": "end" }});
-        label.textContent = Math.round(value).toLocaleString();
+        label.textContent = formatAxisValue(value);
         chart.appendChild(label);
       }});
 
@@ -754,6 +780,33 @@ HTML_TEMPLATE = """<!doctype html>
     }});
   }}
 
+  // Totals over the days in the selected range (so "All" is the all-time
+  // total). Summed before weekly bucketing; bucketing doesn't change a sum.
+  function renderLogbookTotals(days) {{
+    var caption = state.range === "all" ? "Total, all time" : "Total, last " + state.range + " days";
+    var sum = function (key) {{
+      return days.reduce(function (acc, d) {{ return acc + d[key]; }}, 0);
+    }};
+    var oneDecimal = {{ minimumFractionDigits: 1, maximumFractionDigits: 1 }};
+    var totals = [
+      ["logbookRunsTotal", sum("runs").toLocaleString()],
+      ["logbookHoursTotal", sum("hours").toLocaleString(undefined, oneDecimal) + " h"],
+      ["logbookRowsTotal", Math.round(sum("rows_validated")).toLocaleString()]
+    ];
+    totals.forEach(function (t) {{
+      var box = document.getElementById(t[0]);
+      box.innerHTML = "";
+      var value = document.createElement("div");
+      value.className = "value";
+      value.textContent = t[1];
+      var cap = document.createElement("div");
+      cap.className = "caption";
+      cap.textContent = caption;
+      box.appendChild(value);
+      box.appendChild(cap);
+    }});
+  }}
+
   function render() {{
     var githubDays = bucketByGranularity(filterByRange(ALL_DAYS), [
       {{ key: "opened_issues", mode: "sum" }},
@@ -766,7 +819,8 @@ HTML_TEMPLATE = """<!doctype html>
     renderBurndownChart(githubDays, [BURNDOWN_SERIES]);
     renderBurndownTable(githubDays);
 
-    var logbookDays = bucketByGranularity(filterByRange(ALL_LOGBOOK_DAYS), [
+    var logbookRangeDays = filterByRange(ALL_LOGBOOK_DAYS);
+    var logbookDays = bucketByGranularity(logbookRangeDays, [
       {{ key: "runs", mode: "sum" }},
       {{ key: "hours", mode: "sum" }},
       {{ key: "rows_validated", mode: "sum" }}
@@ -776,6 +830,7 @@ HTML_TEMPLATE = """<!doctype html>
     document.getElementById("logbookEmpty").hidden = hasLogbookData;
     document.getElementById("logbookTableToggle").hidden = !hasLogbookData;
     if (hasLogbookData) {{
+      renderLogbookTotals(logbookRangeDays);
       renderLogbookRuns(logbookDays, [LOGBOOK_SERIES.runs]);
       renderLogbookHours(logbookDays, [LOGBOOK_SERIES.hours]);
       renderLogbookRows(logbookDays, [LOGBOOK_SERIES.rows_validated]);
