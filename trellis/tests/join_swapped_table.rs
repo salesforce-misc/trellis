@@ -56,7 +56,7 @@ async fn a_swapped_joined_table_does_not_panic_the_pass() {
         .expect("swap");
 
     let pool = d.pool().clone();
-    // Two passes: the second sees the backed-off marker, not a fresh panic.
+    // Two passes: the second skips the backed-off marker, so it fails once.
     for _ in 0..2 {
         trellis::client::reconcile_pass(
             &mut d.ctl,
@@ -68,4 +68,20 @@ async fn a_swapped_joined_table_does_not_panic_the_pass() {
         .await
         .expect("reconcile pass");
     }
+
+    let rows = d
+        .rows(
+            "select attempts, last_error from pending_backfill \
+             where table_name = 'public.jb'",
+        )
+        .await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "the swapped table's marker stays parked: {rows:?}"
+    );
+    assert!(
+        rows[0].starts_with("(1,") && rows[0].contains("JOIN target is rebuilt"),
+        "failed once and backed off, with the reason recorded: {rows:?}"
+    );
 }

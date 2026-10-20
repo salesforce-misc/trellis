@@ -564,7 +564,11 @@ impl Sweep {
                 KeySpace::Join(_) => {
                     return Err(IntakeError::UnsweepableTarget {
                         target,
-                        reason: "a JOIN target is rebuilt, not swept (J4, #1109)".to_string(),
+                        reason:
+                            "a JOIN target is rebuilt, not swept, and its build isn't wired yet \
+                        (J4, #1109); restore the swapped source table, or drop the JOIN \
+                        transform, to clear this"
+                                .to_string(),
                     });
                 }
                 KeySpace::OneToOne => one_to_one_match(&key_cols),
