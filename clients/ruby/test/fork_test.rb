@@ -27,6 +27,7 @@ class ForkTest < Minitest::Test
     "quarantined" => -> { Trellis.quarantined },
     "quarantine_status" => -> { Trellis.quarantine_status("t.c") },
     "sample_quarantined" => -> { Trellis.sample_quarantined("t.c") },
+    "detect_capture_disruptions" => -> { Trellis.detect_capture_disruptions },
     "has_live_drain_workers?" => -> { Trellis.has_live_drain_workers? },
     "has_live_staging_worker?" => -> { Trellis.has_live_staging_worker? },
     "watermark_token" => -> { Trellis.watermark_token },

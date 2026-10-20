@@ -267,6 +267,9 @@ async fn run_cases(cases: &[Case]) {
             for reader in ["r", "s"] {
                 let status = trellis.status(&format!("{reader}_{id}")).await.unwrap();
                 let status = status.expect("the reader exists");
+                if let Some(f) = &status.capture_failure {
+                    assert_eq!(f.kind, trellis::CaptureFailureKind::Disruption, "{id}");
+                }
                 now.push((status.status, status.capture_failure.map(|f| f.error)));
             }
             reasons.push(now);
@@ -805,4 +808,205 @@ async fn a_real_dump_and_restore_pauses_nothing() {
             "the application schema alone: {t}"
         );
     }
+}
+
+/// `detect_capture_disruptions` (#1181) pauses the readers of a disrupted
+/// table at once, on the caller's connection, with no staging-worker pass,
+/// and names the table. A healthy instance finds nothing.
+#[tokio::test]
+async fn detect_capture_disruptions_pauses_readers_without_a_pass() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
+    create_case_tables(&raw, &trellis, &["dd".to_string(), "ok".to_string()]).await;
+    bring_live(&mut raw, &db.pool).await;
+    let app = connect(db.dsn()).await;
+
+    assert_eq!(
+        trellis.detect_capture_disruptions().await.unwrap(),
+        Vec::<String>::new()
+    );
+
+    // An operator's pause is the operator's: a disruption seen while it is
+    // paused is recorded with kind `capture`, which a helper that resumes
+    // disruptions never resumes.
+    trellis.apply("PAUSE TRANSFORM r_dd").await.unwrap();
+
+    // What a fixture load leaves: disabled for the load, then ORIGIN.
+    app.batch_execute("alter table public.t_dd disable trigger all")
+        .await
+        .unwrap();
+    app.batch_execute("alter table public.t_dd enable trigger all")
+        .await
+        .unwrap();
+    assert_eq!(
+        trellis.detect_capture_disruptions().await.unwrap(),
+        vec!["public.t_dd".to_string()]
+    );
+    let statuses = statuses(&raw).await;
+    assert_eq!(statuses["r_dd"], TransformStatus::Paused);
+    assert_eq!(statuses["s_dd"], TransformStatus::Paused);
+    assert_eq!(statuses["r_ok"], TransformStatus::Live);
+    let failure = trellis
+        .status("s_dd")
+        .await
+        .unwrap()
+        .and_then(|s| s.capture_failure)
+        .expect("a capture failure");
+    assert_eq!(failure.kind, trellis::CaptureFailureKind::Disruption);
+    let operator = trellis.status("r_dd").await.unwrap().unwrap();
+    assert_eq!(operator.status, TransformStatus::Paused);
+    let recorded = operator
+        .capture_failure
+        .expect("the disruption is recorded");
+    assert_eq!(recorded.kind, trellis::CaptureFailureKind::Capture);
+    assert!(
+        recorded.error.contains("changed outside Trellis"),
+        "{}",
+        recorded.error
+    );
+    // Asking again finds it again, and pauses nothing more.
+    assert_eq!(
+        trellis.detect_capture_disruptions().await.unwrap(),
+        vec!["public.t_dd".to_string()]
+    );
+}
+
+/// A disruption while every reader is paused by the operator is recorded on
+/// them with kind `capture`, not `disruption` (#1181), and the operator's
+/// `RESUME` repairs it in one go: it forgets the table's recorded capture, so
+/// the next pass reinstalls it rather than finding the disruption again and
+/// pausing the resumed readers.
+#[tokio::test]
+async fn an_operator_resume_repairs_a_disruption_seen_while_paused() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
+    create_case_tables(&raw, &trellis, &["op".to_string()]).await;
+    bring_live(&mut raw, &db.pool).await;
+    let app = connect(db.dsn()).await;
+
+    for target in ["r_op", "s_op"] {
+        trellis
+            .apply(&format!("PAUSE TRANSFORM {target}"))
+            .await
+            .unwrap();
+    }
+    app.batch_execute(
+        "alter table public.t_op disable trigger all; \
+         update public.t_op set b = b + 100 where id <= 5; \
+         alter table public.t_op enable trigger all",
+    )
+    .await
+    .unwrap();
+    capture_pass(&mut raw, &db.pool).await;
+    for target in ["r_op", "s_op"] {
+        let status = trellis.status(target).await.unwrap().unwrap();
+        assert_eq!(status.status, TransformStatus::Paused, "{target}");
+        let recorded = status.capture_failure.expect("the disruption is recorded");
+        assert_eq!(
+            recorded.kind,
+            trellis::CaptureFailureKind::Capture,
+            "{target}"
+        );
+    }
+
+    for target in ["r_op", "s_op"] {
+        trellis
+            .apply(&format!("RESUME TRANSFORM {target}"))
+            .await
+            .unwrap_or_else(|e| panic!("{target}: {e}"));
+    }
+    bring_live(&mut raw, &db.pool).await;
+    assert_eq!(
+        rows(&raw, "select a::text, b::text from public.r_op order by 1").await,
+        rows(&raw, "select a::text, b::text from public.t_op order by 1").await
+    );
+    capture_pass(&mut raw, &db.pool).await;
+    for (t, s) in statuses(&raw).await {
+        assert_eq!(s, TransformStatus::Live, "{t}");
+    }
+}
+
+/// A `PAUSE` that commits while a disruption is being recorded is seen: the
+/// recording waits for the definition's row lock and reads its status after
+/// the pause, so the operator's pause is recorded with kind `capture`, never
+/// as a `disruption` a helper would resume (#1181).
+#[tokio::test]
+async fn a_pause_committing_meanwhile_is_never_recorded_as_a_disruption() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
+    create_case_tables(&raw, &trellis, &["race".to_string()]).await;
+    bring_live(&mut raw, &db.pool).await;
+    let app = connect(db.dsn()).await;
+    app.batch_execute(
+        "alter table public.t_race disable trigger all; \
+         alter table public.t_race enable trigger all",
+    )
+    .await
+    .unwrap();
+
+    // An operator's PAUSE of r_race, holding the row lock it takes, not yet
+    // committed.
+    let mut operator = connect(db.dsn()).await;
+    let pause = operator.transaction().await.unwrap();
+    pause
+        .execute(
+            "select 1 from transform_definitions where target_table = 'public.r_race' for update",
+            &[],
+        )
+        .await
+        .unwrap();
+    pause
+        .execute(
+            "update transform_definitions set status = 'paused' \
+             where target_table = 'public.r_race'",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let detect = tokio::spawn(async move { trellis.detect_capture_disruptions().await });
+    // Wait until the detection is blocked on that lock.
+    let mut blocked = false;
+    for _ in 0..200 {
+        let waiting: i64 = raw
+            .query_one(
+                "select count(*) from pg_stat_activity \
+                 where datname = current_database() and wait_event_type = 'Lock'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        if waiting > 0 {
+            blocked = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(blocked, "the detection waits for the operator's row lock");
+    pause.commit().await.unwrap();
+    assert_eq!(
+        detect.await.unwrap().unwrap(),
+        vec!["public.t_race".to_string()]
+    );
+
+    let kinds = rows(
+        &raw,
+        "select split_part(d.target_table, '.', 2), f.kind from capture_failures f \
+         join transform_definitions d on d.id = f.transform_id order by 1",
+    )
+    .await;
+    assert_eq!(
+        kinds,
+        vec![
+            vec![Some("r_race".to_string()), Some("capture".to_string())],
+            vec![Some("s_race".to_string()), Some("disruption".to_string())],
+        ]
+    );
 }

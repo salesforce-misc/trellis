@@ -82,6 +82,8 @@ Nothing in the binding uses it.
   (`correcting`, each a `Trellis::CorrectingNode` with `node`, `since` and
   `keys_remaining`).
 - `Trellis.request_backfill(source_table)`,
+  `Trellis.detect_capture_disruptions` (pauses now the readers of every table
+  whose Trellis capture was changed outside Trellis, and returns the tables),
   `Trellis.has_live_drain_workers?`, `Trellis.has_live_staging_worker?`,
   `Trellis.watermark_token`, `Trellis.await_converged(token, timeout_ms:)`.
 - `Trellis.self_check(target_table, timeout_ms:, mode:)` and
@@ -394,6 +396,43 @@ instance and every instance of `config.trellis.instances`. Neither it nor
 Outside Rails, `require "trellis/migration"` and `Trellis.connect` before
 migrating.
 
+## Fixtures and bulk loads in tests
+
+Rails fixtures load with `disable_referential_integrity`, which disables
+every trigger on the loaded tables, Trellis's capture triggers included, and
+ends with `ENABLE TRIGGER ALL`. The rows it wrote never reached a target, so
+Trellis pauses every definition that reads the table (`status.capture_failure`
+has `kind: :disruption`) instead of letting a test read silently wrong data,
+and waits for a `RESUME`. `Trellis::TestSupport` does that `RESUME` for a
+suite, then waits for the rebuilt targets to catch up:
+
+```ruby
+# test/test_helper.rb
+require "trellis/test_support"
+
+class ActiveSupport::TestCase
+  include Trellis::TestSupport
+  fixtures :all
+  # Rails loads the fixtures in its own setup, before this block runs.
+  setup { resume_capture_disruptions }
+end
+```
+
+`Trellis::TestSupport.resume_capture_disruptions(instance = Trellis.default_instance, timeout_ms: 30_000)`
+does the same without the mixin, after any bulk load. It first pauses the
+readers of any disrupted table itself (`Trellis.detect_capture_disruptions`),
+so it doesn't wait for the staging worker's next pass; resumes only the
+definitions paused with `kind: :disruption`; waits until each is `:live` and
+every write committed so far has reached its targets; and returns the targets
+it resumed (`[]` when nothing was disrupted, which costs one catalog read per
+captured table). A definition an operator paused, or one paused by a schema
+change or another failure, stays paused. A `RESUME` the engine refuses (a
+table that is gone, a table define would now refuse) leaves that definition
+paused; the rest are still resumed, and the call then raises
+`Trellis::TestSupport::ResumeRefused` with `refused`, a hash of target to
+reason. The instance needs its staging worker and a drain worker (`staging:
+true, drain_threads: 1`), because the resume rebuilds through them.
+
 ## Schema dumps
 
 A Rails app that uses Trellis dumps its schema as `structure.sql`
@@ -456,8 +495,9 @@ source rows; a test database has none, so that is immediate. Runtime state
 ## Layout
 
 - `lib/`: the `Trellis` module and `Trellis::Instance`, its error classes and its `Data` values,
-  and the Rails integration (`trellis/railtie.rb`, `trellis/migration.rb`),
-  loaded only in an app that has Rails.
+  the Rails integration (`trellis/railtie.rb`, `trellis/migration.rb`),
+  loaded only in an app that has Rails, and the test helpers
+  (`trellis/test_support.rb`), loaded only when required.
 - `ext/trellis_ruby/`: the extension crate, a member of the repository's
   Cargo workspace, and the `extconf.rb` that builds it with rb-sys.
   Plain-data conversion and error codes come from `clients/embed`

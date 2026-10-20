@@ -62,6 +62,7 @@ defmodule Trellis.Parity do
         call(handle, args ++ [Map.to_list(opts)], fun)
       end,
       "has_live_drain_workers" => plain,
+      "detect_capture_disruptions" => plain,
       "has_live_staging_worker" => plain,
       "watermark_token" => plain,
       "await_converged" => fn handle, [token], %{timeout_ms: timeout_ms}, fun ->

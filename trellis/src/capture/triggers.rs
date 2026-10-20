@@ -280,9 +280,7 @@ async fn pause_readers(
     }
     let txn = client.transaction().await?;
     for id in readers {
-        if crate::defs::lifecycle::pause_for_capture_failure(&txn, id, table, &[], error, None)
-            .await?
-        {
+        if crate::defs::lifecycle::pause_for_disruption(&txn, id, table, error).await? {
             crate::instance_log::warn!(transform_id = id, table = %table, "definition paused: {error}");
         }
     }

@@ -344,6 +344,12 @@ impl Handle {
         rb_self.call(ruby, BlockingTrellis::start_has_live_staging_worker)
     }
 
+    /// Pauses now the readers of every table whose capture was changed
+    /// outside Trellis (#1181), and returns the tables.
+    fn detect_capture_disruptions(ruby: &Ruby, rb_self: &Self) -> Result<Vec<String>, Error> {
+        rb_self.call(ruby, BlockingTrellis::start_detect_capture_disruptions)
+    }
+
     /// A read-your-writes token, as an opaque string.
     fn watermark_token(ruby: &Ruby, rb_self: &Self) -> Result<String, Error> {
         rb_self
@@ -1319,6 +1325,10 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     handle.define_method(
         "has_live_drain_workers",
         method!(Handle::has_live_drain_workers, 0),
+    )?;
+    handle.define_method(
+        "detect_capture_disruptions",
+        method!(Handle::detect_capture_disruptions, 0),
     )?;
     handle.define_method(
         "has_live_staging_worker",

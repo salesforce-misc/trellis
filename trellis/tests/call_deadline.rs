@@ -207,6 +207,7 @@ async fn a_call_stuck_on_a_lock_ends_at_its_deadline_and_the_server_drops_it() {
     stuck!(f, "relationships", t => t.relationships());
     stuck!(f, "dump_definitions_sql", t => t.dump_definitions_sql());
     stuck!(f, "request_backfill", t => t.request_backfill("widgets"));
+    stuck!(f, "detect_capture_disruptions", t => t.detect_capture_disruptions());
     stuck!(f, "poisoned_since", t => t.poisoned_since(SystemTime::UNIX_EPOCH));
     stuck!(f, "quarantined", t => t.quarantined());
     stuck!(f, "quarantine_status", t => t.quarantine_status("widget_totals"));
@@ -383,6 +384,7 @@ fn every_public_method_is_tested_or_exempt() {
         "relationships",
         "dump_definitions_sql",
         "request_backfill",
+        "detect_capture_disruptions",
         "poisoned_since",
         "quarantined",
         "quarantine_status",
