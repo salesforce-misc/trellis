@@ -499,7 +499,8 @@ the live triggers and functions with them (`capture::triggers`) and pauses
 on any of:
 
 - the table is gone from its name: dropped, renamed away or moved to another
-  schema. This covers a captured source, a `JOIN`'s joined table, a
+  schema, or a view, materialized view or foreign table put there in its
+  place. This covers a captured source, a `JOIN`'s joined table, a
   relationship's to-side, and another instance's target read as a source;
 - a recorded trigger is gone from the table at that name: a swap of the
   table, a drop and recreate, the triggers dropped;

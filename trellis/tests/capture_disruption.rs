@@ -367,6 +367,15 @@ async fn disruption_of_capture_pauses_the_readers_with_the_cause() {
             Expect::Paused("was replaced"),
         ),
         (
+            "D13",
+            vec![
+                "alter table public.{t} rename to {t}_v2; \
+                  create view public.{t} as select * from public.{t}_v2"
+                    .into(),
+            ],
+            Expect::Paused("no longer exists"),
+        ),
+        (
             "D12",
             vec![each_trigger(
                 "alter table public.{t} disable trigger %1$I; \

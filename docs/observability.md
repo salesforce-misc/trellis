@@ -324,7 +324,8 @@ pause are arcs of one lifecycle:
   * a table it reads was changed outside Trellis, or is gone from its name
     ([capture by triggers](staging-and-claiming/01-capture-by-triggers.md#capture-changed-outside-trellis)):
     `capture_failure` reads "the table `<table>` no longer exists at that name
-    (it was dropped, renamed away or moved to another schema)…", or "Trellis's
+    (it was dropped, renamed away, moved to another schema, or replaced by
+    something that isn't a table)…", or "Trellis's
     capture of `<table>` was changed outside Trellis: the capture trigger `<name>`
     is gone, was dropped and created again, is disabled, is enabled in ORIGIN
     or REPLICA mode, or was altered; the capture function `<name>` was

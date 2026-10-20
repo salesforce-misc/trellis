@@ -258,8 +258,8 @@ fn disrupted_error(table: &str, found: &[Finding]) -> String {
 /// The `capture_failure` sentence for a definition whose `table` is gone.
 fn gone_error(table: &str) -> String {
     format!(
-        "the table {table} no longer exists at that name (it was dropped, renamed away or moved \
-         to another schema). Changes made to it meanwhile may be missing from this definition, \
+        "the table {table} no longer exists at that name (it was dropped, renamed away, moved \
+         to another schema, or replaced by something that isn't a table). Changes made to it meanwhile may be missing from this definition, \
          so Trellis can't guarantee it is correct. Put a table there again and resume the \
          definition to re-validate it against that table and rebuild it (a resume refuses while \
          the table is missing), or drop the definition"
@@ -291,10 +291,13 @@ async fn pause_readers(
 }
 
 /// The capture pass's check that `table`, which some definition reads, still
-/// exists at that name. When it doesn't, pauses every definition that reads
-/// it and isn't paused yet (#999) and returns `true`, and the caller leaves
-/// the table alone: its capture can't be installed, and a table swapped in
-/// meanwhile is for a resume to re-validate.
+/// exists at that name as a table (plain or partitioned). When it doesn't,
+/// pauses every definition that reads it and isn't paused yet (#999) and
+/// returns `true`, and the caller leaves the table alone: its capture can't
+/// be installed, and a table swapped in meanwhile is for a resume to
+/// re-validate. A view, materialized view or foreign table put at the name
+/// (a table renamed away behind a compatibility view, say) is no table: the
+/// table is gone from the name all the same.
 ///
 /// A partitioned source the pass has recorded is left to
 /// [`super::partitions`], which tells a root renamed away from a gone one.
@@ -305,7 +308,8 @@ pub(crate) async fn pause_readers_of_gone_table(
 ) -> Result<bool, CaptureError> {
     let exists: bool = client
         .query_typed(
-            "select pg_catalog.to_regclass($1) is not null",
+            "select exists (select 1 from pg_catalog.pg_class c \
+                 where c.oid = pg_catalog.to_regclass($1) and c.relkind in ('r', 'p'))",
             &[(&crate::defs::ddl::regclass_arg(table), Type::TEXT)],
         )
         .await?
