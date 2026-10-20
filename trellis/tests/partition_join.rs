@@ -16,8 +16,6 @@
 //! the correction engine are called by hand; nothing waits for convergence
 //! (#297). The oracle is each definition's own `JOIN … GROUP BY`, and the
 //! hidden `P`, `M`, `J` and `T` against `GROUP BY`s of the tables.
-//! `self_check` compares nothing here: its capture audit reports every
-//! partitioned source as a hierarchy fault, first and alone (#1179).
 //!
 //! The cases are #1043 E1's variant-L scenarios (`P.*`) with a `JOIN` side
 //! operated on, and #958's lifecycle cells (X12-7a two-level trees, X12-7b a
@@ -240,10 +238,7 @@ impl Fx {
         wrong
     }
 
-    /// `self_check` of every target, less the capture audit's hierarchy
-    /// fault (#1179). That fault is reported first and alone, so over a
-    /// partitioned source this compares nothing else: [`Self::hidden_wrong`]
-    /// audits the hidden tables instead.
+    /// `self_check` of every target; each must report `Converged`.
     async fn divergences(&self) -> Vec<String> {
         let mut found = Vec::new();
         for (name, _, _) in ORACLES {
@@ -260,14 +255,6 @@ impl Fx {
                 .expect("a page of the check");
                 match page.outcome {
                     SelfCheckOutcome::Converged => {}
-                    // #1179: the capture audit reports every partitioned
-                    // source as a hierarchy fault, whatever ADR-0017 admits.
-                    SelfCheckOutcome::Diverged(divergences) => found.extend(
-                        divergences
-                            .iter()
-                            .map(|d| format!("{name}: {d:?}"))
-                            .filter(|d| !d.contains("Capture(Hierarchy(Partitioned")),
-                    ),
                     other => found.push(format!("{name}: {other:?}")),
                 }
                 after = page.next_after;
@@ -409,8 +396,7 @@ impl Fx {
             .await
     }
 
-    /// Every target equals its oracle, `self_check` finds nothing but
-    /// #1179's fault, the hidden tables match the tables, no partial is
+    /// Every target equals its oracle, `self_check` finds nothing, the hidden tables match the tables, no partial is
     /// negative, and both definitions are `live`.
     async fn assert_right(&self, what: &str) {
         assert_eq!(self.wrong_targets().await, Vec::<String>::new(), "{what}");
