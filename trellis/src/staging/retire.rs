@@ -98,12 +98,19 @@ pub async fn retire_drained_segments(client: &mut Client) -> Result<Vec<i64>, St
 /// A drained segment whose `late_rows` isn't counted yet, though its count
 /// can no longer change: every transaction in its fence has finished
 /// (`xmin` of the current snapshot is at or above the fence's `xmax`), so no
-/// writer can still land a row in its slot.
+/// writer can still land a row in its slot. Only a count a reader needs is
+/// made, as it reads the slot whole: one whose fence had a transaction in
+/// flight (with none, the slot holds no late row) and whose successor hasn't
+/// drained (once it has, it applied the late rows). A segment left uncounted
+/// keeps `late_rows` NULL.
 const LATE_ROWS_CANDIDATES_SQL: &str = "\
     select seg_seq, ring_slot from segments s \
     where s.state = 'drained' and s.late_rows is null \
       and s.fence_snapshot is not null \
       and pg_snapshot_xmin(pg_current_snapshot()) >= pg_snapshot_xmax(s.fence_snapshot) \
+      and exists (select 1 from pg_snapshot_xip(s.fence_snapshot)) \
+      and exists (select 1 from segments n \
+                  where n.seg_seq = s.seg_seq + 1 and n.state <> 'drained') \
     order by s.seg_seq asc";
 
 /// Counts the rows of each drained segment's slot that its fence doesn't

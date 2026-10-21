@@ -274,13 +274,25 @@ reads a slot whole, but a slot whose segment is drained is skipped: the statemen
 carries a condition over no row for each slot, evaluated once, that is false when
 every row of the slot is applied, and the slot's scan is not executed. A definition
 that holds keys (`poison_held`) reads every slot, as the keys' parked rows may sit
-in a drained one. A drained slot is skipped when its successor is drained too or gone, or when the
-fence of its segment had no transaction in flight: a writer in flight at the fence
-can have left a late row in the slot, which the successor's window takes. The
-decision and the pending predicate are read in the page's one statement, so a
+in a drained one.
+
+Drained is not enough on its own. A writer in flight at a segment's fence can leave
+a late row in the segment's slot, which the successor's window takes
+([03](../staging-and-claiming/03-sealing-and-the-fence.md)), so the row stays
+pending after the segment drains. A drained slot is skipped when one of these
+holds:
+
+* its fence had no transaction in flight;
+* the retire pass counted no late row in it (`segments.late_rows`, counted once,
+  after every transaction in the fence has finished);
+* its successor is drained too, or gone.
+
+The decision and the pending predicate are read in the page's one statement, so a
 segment that finishes draining mid-statement is read or skipped on one snapshot.
-The walk's ring reads are then bounded by the segment size, not by the rows a ring
-has applied and not yet retired.
+The page's ring reads are then bounded by the segment size, not by the rows a ring
+has applied and not yet retired. The convergence wait before each page asks the
+slot itself ([07](../staging-and-claiming/07-convergence-and-await.md), condition
+3), so it still reads a drained slot whole.
 
 ### Scope: every target; aggregate and JOIN targets detect, never repair
 

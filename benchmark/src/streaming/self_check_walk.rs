@@ -15,6 +15,10 @@
 //! pages of 10 000 keys, each part timed apart, and reports the rows read
 //! from the hidden table and the source of each (sequential tuples plus index
 //! fetches) per page. `--hidden-only-old` is not a flag: run it on a commit.
+//! It also reports the ring rows read while nothing runs (the maintenance
+//! loop's own reads) and by one convergence check. `--write-rate N` updates N
+//! rows of `a` a second while the parts are walked, and reports the pages
+//! that did not end `Converged`.
 //!
 //! `--probe-pages K` (1-1 only) instead times K single pages of today's
 //! statement shape directly (the source side's keyset read and the target
@@ -48,6 +52,9 @@ pub struct Config {
     pub index: bool,
     pub build_timeout: Duration,
     pub walk_timeout: Duration,
+    /// `--write-rate N` (`--kind join` only, #1219): update N rows of `a` a
+    /// second, spread over ten statements, while the parts are walked.
+    pub write_rate: i64,
 }
 
 async fn seq_tup_read(raw: &RawClient, table: &str) -> i64 {
@@ -463,16 +470,51 @@ async fn run_join(cfg: Config, tuning: &EngineTuning) {
             .await
             .expect("wal lsn")
             .get(0);
-        let before = rows_read("ring".to_string()).await;
         let conn = db.pool.get().await.expect("a connection");
-        for _ in 0..10 {
+        let idle_from = rows_read("ring".to_string()).await;
+        let before = rows_read("ring".to_string()).await;
+        // `rows_read` waits 6 s before it reads: the maintenance loop's own
+        // reads over that span, apart from any check.
+        let idle = (before - idle_from) as f64 / 6.0;
+        let t = Instant::now();
+        const CALLS: i64 = 200;
+        for _ in 0..CALLS {
             trellis::dev::staging::converged_through(&**conn, token)
                 .await
                 .expect("converged_through");
         }
-        let per_call = (rows_read("ring".to_string()).await - before) / 10;
-        eprintln!("convergence check: {per_call} ring rows read per call");
+        let calls_secs = t.elapsed().as_secs_f64();
+        let after = rows_read("ring".to_string()).await;
+        let span = calls_secs + 6.0;
+        let per_call = ((after - before) as f64 - idle * span) / CALLS as f64;
+        eprintln!(
+            "idle: {idle:.0} ring rows read per second; convergence check: about {per_call:.0} \
+             ring rows read per call ({CALLS} calls in {calls_secs:.1}s)"
+        );
     }
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = (cfg.write_rate > 0).then(|| {
+        let (stop, dsn, rows) = (stop.clone(), db.dsn().to_string(), cfg.rows);
+        let per_tick = (cfg.write_rate / 10).max(1);
+        tokio::spawn(async move {
+            let w = connect_raw(&dsn).await;
+            let (mut lo, mut written) = (1i64, 0i64);
+            let mut tick = tokio::time::interval(Duration::from_millis(100));
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                tick.tick().await;
+                let hi = (lo + per_tick - 1).min(rows);
+                w.execute(
+                    "update public.a set amt = amt + 1 where id between $1 and $2",
+                    &[&lo, &hi],
+                )
+                .await
+                .expect("a write");
+                written += hi - lo + 1;
+                lo = if hi >= rows { 1 } else { hi + 1 };
+            }
+            written
+        })
+    });
     for (part, hidden, source, next) in [
         ("p", format!("join_{id}_p"), "a", "m"),
         ("m", format!("join_{id}_m"), "b", "j"),
@@ -484,6 +526,7 @@ async fn run_join(cfg: Config, tuning: &EngineTuning) {
         );
         let start = Instant::now();
         let (mut after, mut pages, mut compared) = (Some(part.to_string()), 0i64, 0i64);
+        let mut not_converged = 0i64;
         while let Some(cursor) = after.take() {
             let page = trellis::dev::staging::self_check_page(
                 &db.pool,
@@ -497,11 +540,11 @@ async fn run_join(cfg: Config, tuning: &EngineTuning) {
             )
             .await
             .expect("a page of the check");
-            assert!(
-                matches!(page.outcome, trellis::SelfCheckOutcome::Converged),
-                "{:?}",
-                page.outcome
-            );
+            if !matches!(page.outcome, trellis::SelfCheckOutcome::Converged) {
+                assert!(cfg.write_rate > 0, "{:?}", page.outcome);
+                eprintln!("{part} page {pages}: {:?}", page.outcome);
+                not_converged += 1;
+            }
             pages += 1;
             compared += page.rows_compared;
             assert!(
@@ -525,11 +568,18 @@ async fn run_join(cfg: Config, tuning: &EngineTuning) {
             "{{\"scenario\":\"self-check-walk\",\"kind\":\"join\",\"part\":\"{part}\",\
              \"rows\":{},\"keys_compared\":{compared},\"pages\":{pages},\"walk_secs\":{secs:.2},\
              \"hidden_rows_read\":{hidden_read},\"source_rows_read\":{source_read},\"ring_rows_read\":{ring_read},\
-             \"hidden_rows_per_page\":{},\"source_rows_per_page\":{}}}",
+             \"hidden_rows_per_page\":{},\"source_rows_per_page\":{},\
+             \"write_rate\":{},\"pages_not_converged\":{not_converged}}}",
             cfg.rows,
             hidden_read / pages.max(1),
             source_read / pages.max(1),
+            cfg.write_rate,
         );
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Some(writer) = writer {
+        let written = writer.await.expect("the writer");
+        eprintln!("writer: {written} rows of a updated");
     }
     client.shutdown().await.expect("shutdown");
 }

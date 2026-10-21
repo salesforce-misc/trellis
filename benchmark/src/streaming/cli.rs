@@ -682,6 +682,7 @@ pub fn run(name: &str, args: &[String]) -> Option<bool> {
                     .unwrap_or(Duration::from_secs(7200)),
                 walk_timeout: secs(args, "--walk-timeout-secs")
                     .unwrap_or(Duration::from_secs(14_400)),
+                write_rate: number(args, "--write-rate").map_or(0, |n| n as i64),
             };
             let tuning = throughput_tuning(args);
             runtime().block_on(self_check_walk::run(cfg, &tuning));
