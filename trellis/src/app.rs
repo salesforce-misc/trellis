@@ -2267,7 +2267,9 @@ pub enum CaptureFailureKind {
     /// table was dropped, renamed away or moved. Bulk loaders leave this
     /// (`ENABLE TRIGGER ALL` puts the triggers in `ORIGIN` mode). The
     /// definition waits for a resume, which re-validates, reinstalls
-    /// capture and rebuilds it. A test helper that resumes after a fixture
+    /// capture and rebuilds it. Also every definition of a database restored
+    /// from a logical dump (#1205), whose resume first resets the ordering
+    /// state the dump brought. A test helper that resumes after a fixture
     /// load selects on this kind. A definition that was already frozen when
     /// the disruption was seen gets [`CaptureFailureKind::Capture`] instead.
     Disruption,

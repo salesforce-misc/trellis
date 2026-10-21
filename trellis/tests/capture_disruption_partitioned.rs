@@ -527,8 +527,10 @@ async fn partition_maintenance_pauses_nothing() {
             Expect::Nothing,
         ),
         (
-            // A restore or `pg_upgrade` recreates every trigger under a new
-            // oid: the rows of the other database are re-recorded.
+            // `pg_upgrade` recreates every trigger under a new oid: the rows of
+            // the other database are re-recorded. A restore pauses every
+            // definition of the database (`logical_restore.rs`,
+            // `partition_restore.rs`), so it is not a case among the others.
             "pg_upgrade".into(),
             ["{t}", "{t}_l1", "{t}_l2", "{t}_l2h0", "{t}_l2h1", "{t}_l3"]
                 .iter()
@@ -536,22 +538,6 @@ async fn partition_maintenance_pauses_nothing() {
                 .chain(["update capture_triggers set system_identifier = '1' \
                  where table_name = 'public.{t}'"
                     .to_string()])
-                .collect::<Vec<_>>()
-                .chunks(7)
-                .map(|c| c.join("; "))
-                .collect(),
-            Expect::Nothing,
-        ),
-        (
-            "restore".into(),
-            ["{t}", "{t}_l1", "{t}_l2", "{t}_l2h0", "{t}_l2h1", "{t}_l3"]
-                .iter()
-                .map(|rel| recreate_triggers(rel))
-                .chain([
-                    "update capture_triggers set catalog_oid = (catalog_oid::bigint + 1000)::oid \
-                 where table_name = 'public.{t}'"
-                        .to_string(),
-                ])
                 .collect::<Vec<_>>()
                 .chunks(7)
                 .map(|c| c.join("; "))

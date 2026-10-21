@@ -334,12 +334,16 @@ pause are arcs of one lifecycle:
     so Trellis can't guarantee the definition is correct, and that a resume
     reinstalls capture and rebuilds it. The `capture_failure`'s `kind` is
     `disruption`;
-  * the database was restored from a dump and the transform reads a partitioned
-    source ([ADR-0017](decisions/0017-partitioned-sources.md)): Trellis's
-    recorded partitions name the dump's tables, so nothing is corrected from
-    them. `capture_failure` reads "the database was restored from a dump, so
-    Trellis's recorded partitions of `<table>` no longer match its tables;
-    resume the definition to rebuild it, or drop the definition";
+  * the database was restored from a logical dump (`pg_dump`, `pg_restore`):
+    every definition pauses, whatever its kind and source, because the
+    ordering state the dump brought belongs to the original cluster
+    ([ADR-0002](decisions/0002-async-data-flow.md), [ADR-0017](decisions/0017-partitioned-sources.md)).
+    `capture_failure` reads "the database was restored from a logical dump, so
+    the ordering state Trellis kept for this definition belongs to the
+    original database; resume the definition to reset it and rebuild the
+    target from the restored source, or drop the definition", with kind
+    `disruption` (a definition that was already paused keeps its reason, and
+    its kind `capture`);
   * its build kept failing in a way no retry gets past: the error stays on
     `backfill_failure`;
   * the drain hit a failure that every key reproduces (a source with no usable

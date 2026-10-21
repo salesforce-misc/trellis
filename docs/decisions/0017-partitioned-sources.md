@@ -460,17 +460,20 @@ every leaf would read as new and trigger a full re-aggregate. Oids, constraint
 texts and the hash opclass survive it.
 
 A dump and restore gives new oids and breaks the recorded `HASH` texts, which
-embed the parent's oid. The pass pauses every definition with a partitioned
-source, with a `capture_failure` naming the restore, and runs no sweep, no
+embed the parent's oid. It is one case of the general rule for a logical
+restore ([ADR-0002](0002-async-data-flow.md), I2): the pass pauses every
+definition of the database, whatever its kind and source, with a
+`capture_failure` naming the restore, discards the ring, and runs no sweep, no
 correction and no routing from the recorded state. That includes corrections
 queued when the dump was taken, which came back with it: the pass removes them
 in the transaction that pauses, and until a pass has classified the change the
 correction engine sees no correction of a source whose stored catalog oid or
 identifier differs from the live one. The pass then records the live tree as a
-first sight. `RESUME` rebuilds as every resume does and
-re-records the nodes, texts and fingerprints; nothing about the definition is
-non-compliant, so it doesn't refuse. Definitions without a partitioned source are
-untouched. Rebuilding automatically would take the choice of when to pay for a
+first sight. `RESUME` resets the definition's ordering state, then rebuilds as
+every resume does and re-records the nodes, texts and fingerprints; nothing
+about the definition is non-compliant, so it doesn't refuse. A changed
+`system_identifier` over recorded nodes that did not all survive is a restore
+too, and answers the same way. Rebuilding automatically would take the choice of when to pay for a
 full rebuild away from the operator.
 
 ### Define refuses a shape routing can't serve, and the pass pauses one that appears later

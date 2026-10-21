@@ -62,6 +62,7 @@ pub mod complement;
 pub mod install;
 pub mod partitions;
 pub mod reconcile;
+pub(crate) mod restore;
 pub mod sql;
 pub(crate) mod triggers;
 

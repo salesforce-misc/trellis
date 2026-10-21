@@ -309,6 +309,58 @@ pub(crate) async fn pause_for_disruption(
     pause_with_record(txn, id, source_table, &[], error, kind, None).await
 }
 
+/// Pauses definition `id` because the database was restored from a logical
+/// dump (#1205, `capture::restore`): its ordering state belongs to the
+/// original database, so the record is marked `restored` and its resume resets
+/// that state before the rebuild. Kind `disruption` for a definition that was
+/// running (a test helper resumes those), `capture` for one already frozen,
+/// which stays the operator's pause but resumes with the reset. An existing
+/// record keeps its reason, which the restore's is put before. Returns
+/// whether this call paused it.
+pub(crate) async fn pause_for_restore(
+    txn: &Transaction<'_>,
+    id: i64,
+    source_table: &str,
+    error: &str,
+) -> Result<bool, CatalogError> {
+    let Some(row) = txn
+        .query_opt(
+            "select status = any($2) from transform_definitions where id = $1 for update",
+            &[&id, &TransformStatus::dispatchable()],
+        )
+        .await?
+    else {
+        return Ok(false);
+    };
+    let kind = if row.get::<_, bool>(0) {
+        "disruption"
+    } else {
+        "capture"
+    };
+    txn.execute(
+        "insert into capture_failures (transform_id, source_table, columns, error, kind, restored) \
+         values ($1, $2, '{}', $3, $4, true) \
+         on conflict (transform_id) do update \
+         set restored = true, caused_by = null, \
+             error = case when capture_failures.restored then capture_failures.error \
+                          else excluded.error || ' It was already paused: ' \
+                               || capture_failures.error end",
+        &[&id, &source_table, &error, &kind],
+    )
+    .await?;
+    Ok(txn
+        .execute(
+            "update transform_definitions set status = $2 where id = $1 and status = any($3)",
+            &[
+                &id,
+                &TransformStatus::Paused.as_str(),
+                &TransformStatus::dispatchable(),
+            ],
+        )
+        .await?
+        == 1)
+}
+
 /// Pauses definition `id` because it was written under a grammar version
 /// outside this binary's window (ADR-0018), recording `error` as its
 /// `capture_failure`. Returns whether this call paused it.

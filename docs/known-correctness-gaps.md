@@ -33,7 +33,6 @@ wrong rows, on the targets it compares
 | **Changes made outside Trellis to what it owns** | | |
 | [Rows written into a target, a hidden table or Trellis's schema](#rows-written-into-a-target-a-hidden-table-or-trelliss-schema) | `self_check`, except Trellis's schema | [#1209](https://github.com/salesforce-misc/trellis/issues/1209) |
 | [Part of the database restored from another point in time](#part-of-the-database-restored-from-another-point-in-time) | `self_check` | [#1209](https://github.com/salesforce-misc/trellis/issues/1209) |
-| [A logical dump restored into another cluster](#a-logical-dump-restored-into-another-cluster) | `self_check` | [#1205](https://github.com/salesforce-misc/trellis/issues/1205) |
 | **Values computed differently from the definition** | | |
 | [Text functions in a 1-1 field](#text-functions-in-a-1-1-field) | `self_check` | [#575](https://github.com/salesforce-misc/trellis/issues/575) |
 | [An aggregate reading a paused column](#an-aggregate-reading-a-paused-column) | no | [#1208](https://github.com/salesforce-misc/trellis/issues/1208) |
@@ -62,9 +61,12 @@ while every rule holds.
   readers of a table whose capture was changed, but not when the change is
   undone before the next reconcile pass sees it
   ([embedding — What the staging worker needs from the database](embedding.md#what-the-staging-worker-needs-from-the-database)).
-* **Restore or upgrade the database as a whole: a physical backup, PITR or
-  `pg_upgrade`.** Restoring part of the database, or restoring a logical dump
-  into another cluster, breaks the guarantee.
+* **Restore or upgrade the database as a whole: a physical backup, PITR,
+  `pg_upgrade` or a logical dump.** A physical backup, PITR and `pg_upgrade`
+  need nothing. A logical dump (`pg_dump`, `pg_restore`) pauses every
+  definition until it is resumed
+  ([operations](operations.md#runbooks)). Restoring part of the database
+  breaks the guarantee.
 * **Use logged tables as sources.** Postgres empties an unlogged table on a
   crash, a failover or a physical restore.
 * **Repair after DDL that rewrites a read column's values** in one of the
@@ -296,27 +298,6 @@ ring held.
 TRANSFORM` and define each affected transform again.
 
 **Ends with:** [#1209](https://github.com/salesforce-misc/trellis/issues/1209).
-
-### A logical dump restored into another cluster
-
-**When:** `pg_dump` of a database running Trellis is restored into a cluster
-whose WAL position is behind the original's: a move to a new host by dump, a
-production-to-staging clone, a major-version move by dump instead of
-`pg_upgrade`.
-
-**What goes wrong:** each target's ledger keeps the original cluster's WAL
-positions, so Trellis skips every later update and delete of a key that
-existed before the dump, while everything reads `live`. Inserts of new keys
-apply. `PAUSE`/`RESUME` and `request_backfill` fix the current rows but keep
-the WAL positions, so later writes are skipped again.
-
-**Detected by:** `self_check`.
-
-**Repair:** after the restore, `PAUSE`, `DROP TRANSFORM` and define every
-transform again. A physical backup, PITR and `pg_upgrade` keep the WAL
-position and aren't affected.
-
-**Ends with:** [#1205](https://github.com/salesforce-misc/trellis/issues/1205).
 
 ## Values computed differently from the definition
 
@@ -618,3 +599,9 @@ fixes and what it costs:
   Sources and Trellis's state stay in step, except an unlogged source's data
   after a physical restore or PITR
   ([above](#an-unlogged-source-emptied-by-a-crash-or-failover)).
+* **A whole-database logical dump and restore.** The ordering state in the
+  dump belongs to the original cluster's WAL and transaction counter, so the
+  capture pass pauses every definition, discards the changes staged before it
+  and waits for a `RESUME` of each, which resets that state and rebuilds the
+  target from the restored source. Nothing is skipped or applied wrongly in
+  between ([operations](operations.md#runbooks)).

@@ -172,6 +172,11 @@ pub async fn reconcile(
     // upstream is live; a re-type that requests is done by the next call.
     // #767: a resume left waiting on re-typed copies is finished first, so
     // this pass's snapshot sees the ones it completes as waiting.
+    //
+    // #1205: before any resume, and before any table is looked at: a logical
+    // restore pauses every definition and discards the ring, so nothing below
+    // acts on the original database's records.
+    super::restore::detect(client).await?;
     crate::staging::quarantine::resume_caused_definitions(client, schema).await?;
     crate::staging::quarantine::finish_requested_resumes(client, schema).await?;
     let snapshot = read_snapshot(client, schema).await?;
@@ -541,6 +546,11 @@ pub async fn detect_disruptions(
 ) -> Result<Vec<String>, CaptureError> {
     let snapshot = read_snapshot(client, schema).await?;
     let mut found = Vec::new();
+    // #1205: a logical restore pauses every definition.
+    if super::restore::detect(client).await? {
+        found.extend(desired.iter().cloned());
+        return Ok(found);
+    }
     for table in desired {
         if super::triggers::pause_readers_of_gone_table(client, &snapshot.catalog, table).await?
             || super::triggers::check(client, schema, &snapshot.catalog, table).await?

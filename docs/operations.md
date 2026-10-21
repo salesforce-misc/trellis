@@ -98,14 +98,11 @@ hand, and rows left under a truncated `varchar` key. It keeps:
 
 * an aggregate's group rows edited by hand, and a `MIN` or `MAX` over a
   re-collated column: the rebuild keeps the per-row ledger, with its
-  collations, and adds only differences to the groups;
-* the WAL positions a logical dump restored into another cluster left
-  behind.
+  collations, and adds only differences to the groups.
 
 `PAUSE`, `DROP TRANSFORM` and define it again repairs each
 ([known correctness gaps](known-correctness-gaps.md): [Rows written into a target, a hidden table or Trellis's schema](known-correctness-gaps.md#rows-written-into-a-target-a-hidden-table-or-trelliss-schema),
-[A column's values rewritten in place by `ALTER COLUMN TYPE`](known-correctness-gaps.md#a-columns-values-rewritten-in-place-by-alter-column-type),
-[A logical dump restored into another cluster](known-correctness-gaps.md#a-logical-dump-restored-into-another-cluster)).
+[A column's values rewritten in place by `ALTER COLUMN TYPE`](known-correctness-gaps.md#a-columns-values-rewritten-in-place-by-alter-column-type)).
 
 ### `DROP TRANSFORM` and define again
 
@@ -220,9 +217,17 @@ which targets it compares is in
   * a `pg_upgrade` needs nothing, and a whole-database physical backup or
     PITR needs only a `request_backfill` of each unlogged source
     ([known correctness gaps](known-correctness-gaps.md#an-unlogged-source-emptied-by-a-crash-or-failover));
-  * a logical dump restored into another cluster needs every transform
-    paused, dropped and defined again
-    ([known correctness gaps](known-correctness-gaps.md#a-logical-dump-restored-into-another-cluster));
+  * a logical dump (`pg_dump`, `pg_restore`), into another cluster, another
+    database or over the same one, pauses every transform of every kind on
+    the capture pass's first look, with a `capture_failure` of kind
+    `disruption` that says the database was restored from a logical dump, and
+    discards the changes staged before it. Nothing rebuilds by itself: `RESUME`
+    each transform. The resume resets the ordering state the dump brought
+    (the ledger's positions, a group basis's snapshots, truncate floors) and
+    rebuilds the target from the restored source, so an update, a delete or a
+    group move of a key that existed before the dump applies afterwards. A
+    restore into the same cluster costs the same resumes, though its counters
+    only move forward;
   * the sources restored alone pause their readers: `RESUME` them;
   * Trellis's schema or the targets restored without the rest need the
     affected transforms paused, dropped and defined again, or the whole

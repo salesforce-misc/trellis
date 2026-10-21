@@ -211,12 +211,31 @@ impl Fx {
             .capture_failure("agg")
             .await
             .expect("a capture failure");
-        assert!(failure.contains("restored from a dump"), "{failure}");
+        assert!(
+            failure.contains("restored from a logical dump"),
+            "{failure}"
+        );
         assert_eq!(self.queued().await, 0, "the queued correction is gone");
-        assert!(!self.recorded().await, "the restored record is forgotten");
-        // Definitions without a partitioned source are untouched.
-        assert_eq!(self.status("plain_agg").await, "live");
-        assert_eq!(self.capture_failure("plain_agg").await, None);
+        // The restored record is forgotten: what the same pass recorded since
+        // (a restore the catalog oid shows is answered before the pass looks
+        // at the source) is the live tree's.
+        let foreign: i64 = self
+            .d
+            .ctl
+            .query_one(
+                "select count(*) from partition_sources \
+                 where catalog_oid <> 'partition_sources'::regclass::oid \
+                    or system_identifier <> \
+                       (select system_identifier::text from pg_control_system())",
+                &[],
+            )
+            .await
+            .expect("count the foreign records")
+            .get(0);
+        assert_eq!(foreign, 0, "the restored record is forgotten");
+        // Every definition of the database pauses, whatever its source.
+        assert_eq!(self.status("plain_agg").await, "paused");
+        assert!(self.capture_failure("plain_agg").await.is_some());
 
         // The next pass records the live tree as a first sight and queues
         // nothing; the definition stays paused.
@@ -229,14 +248,17 @@ impl Fx {
             .expect("run the pending corrections");
         assert_eq!(outcome.keys, 0);
 
-        trellis::staging::quarantine::resume_transform(self.d.pool(), "agg")
-            .await
-            .expect("resume");
+        for target in ["agg", "plain_agg"] {
+            trellis::staging::quarantine::resume_transform(self.d.pool(), target)
+                .await
+                .expect("resume");
+        }
         for _ in 0..3 {
             self.full_pass().await;
             self.settle_builds().await;
         }
         assert_eq!(self.status("agg").await, "live");
+        assert_eq!(self.status("plain_agg").await, "live");
         assert_eq!(self.capture_failure("agg").await, None);
         assert_eq!(
             self.wrong_groups("items", "agg").await,

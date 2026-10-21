@@ -106,10 +106,12 @@
 //!    swapped in by renames, keeps both values: it is gone plus created.
 //!
 //! On a restore the recorded texts name the dump's oids, so nothing is
-//! routed from them: one transaction pauses every definition that reads the
-//! source with a `capture_failure` naming the restore, removes the queued
-//! corrections and forgets the recorded tree, and the pass installs nothing
-//! and runs no sweep. [`pending_corrections`] hides a source's corrections
+//! routed from them. A changed catalog oid is answered before any source is
+//! looked at ([`super::restore`]); the other restore shapes land here, and
+//! both answer the same way: one transaction pauses every definition of the
+//! database with a `capture_failure` naming the restore, discards the ring,
+//! removes the queued corrections and forgets the recorded tree, and the pass
+//! installs nothing and runs no sweep. [`pending_corrections`] hides a source's corrections
 //! while its stored catalog oid or identifier differs, so the engine runs
 //! none of them before the pass has classified the change (after
 //! `pg_upgrade` they are valid, and show again once the pass records the new
@@ -874,7 +876,7 @@ pub(crate) async fn begin(
         )
     });
     if change == Some(ClusterChange::Restored) {
-        pause_restored(client, catalog, table).await?;
+        super::restore::respond(client, false).await?;
         return Ok(Begin::Held { deep: true });
     }
     // Every reader the tree doesn't comply for, paused or not: one paused by
@@ -1025,51 +1027,6 @@ async fn write_state(
         )
         .await?;
     }
-    txn.commit().await?;
-    Ok(())
-}
-
-/// The `capture_failure` of a definition paused because its partitioned
-/// source's recorded state was restored from a dump.
-pub fn restored_reason(table: &str) -> String {
-    format!(
-        "the database was restored from a dump, so Trellis's recorded partitions of {table} \
-         no longer match its tables; resume the definition to rebuild it, or drop the definition"
-    )
-}
-
-/// The response to a restore (ADR-0017 P8, #1052): in one transaction,
-/// pauses every definition that reads `table` with [`restored_reason`],
-/// removes the corrections queued from the restored state (they route by
-/// texts naming the dump's oids) and forgets the recorded tree. Nothing is
-/// routed from the recorded state; the next pass records the live tree as
-/// a first sight, and a resume rebuilds each definition from its source.
-async fn pause_restored(
-    client: &mut Client,
-    catalog: &CaptureCatalog,
-    table: &str,
-) -> Result<(), CaptureError> {
-    let readers =
-        super::columns::readers_of(catalog, table, &std::collections::BTreeSet::new(), true);
-    let error = restored_reason(table);
-    let txn = client.transaction().await?;
-    for id in readers {
-        if crate::defs::lifecycle::pause_for_capture_failure(&txn, id, table, &[], &error, None)
-            .await?
-        {
-            crate::instance_log::warn!(transform_id = id, table = %table, "definition paused: {error}");
-        }
-    }
-    txn.execute(
-        "delete from partition_corrections where table_name = $1",
-        &[&table],
-    )
-    .await?;
-    txn.execute(
-        "delete from partition_sources where table_name = $1",
-        &[&table],
-    )
-    .await?;
     txn.commit().await?;
     Ok(())
 }

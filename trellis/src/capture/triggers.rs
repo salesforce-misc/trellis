@@ -43,13 +43,16 @@
 //!   isn't what this build generates is a function an older Trellis left; the
 //!   ordinary widen replaces it, with no pause.
 //!
-//! The record of a restored database is re-recorded instead. A dump and
-//! restore, or `pg_upgrade`, recreates every trigger under a new oid, so the
-//! rows say which they are: the cluster's `system_identifier` and the oid of
-//! `capture_triggers` itself, both written with each row. A stored value that
-//! differs from the live one means the rows came from another database, and
-//! the pass forgets them. New trigger oids under the same values mean the
-//! triggers were recreated in this one: that pauses.
+//! The record of an upgraded database is re-recorded instead. `pg_upgrade`
+//! recreates every trigger under a new oid, so the rows say which they are:
+//! the cluster's `system_identifier` and the oid of `capture_triggers`
+//! itself, both written with each row. A stored `system_identifier` that
+//! differs from the live one, under the same oid, means the rows came from
+//! another cluster's upgrade, and the pass forgets them. New trigger oids
+//! under the same values mean the triggers were recreated in this one: that
+//! pauses. A stored `catalog_oid` that differs is a logical dump restored,
+//! which [`super::restore`] answers before any table is checked, by pausing
+//! every definition.
 //!
 //! # A partitioned source
 //!
@@ -538,17 +541,16 @@ fn root_replaced(table: &str) -> String {
 }
 
 /// Whether the rows of `capture_triggers` for `table` came from another
-/// database: a stored `system_identifier` or `catalog_oid` that isn't the
-/// live one.
+/// cluster: a stored `system_identifier` that isn't the live one
+/// (`pg_upgrade`). A stored `catalog_oid` that differs is a logical restore,
+/// which [`super::restore`] answers before any table is checked.
 async fn restored(client: &impl GenericClient, table: &str) -> Result<bool, CaptureError> {
     Ok(client
         .query_typed(
             "select exists (select 1 from capture_triggers \
                  where table_name = $1 \
-                   and (system_identifier is distinct from \
-                            (select system_identifier::text from pg_catalog.pg_control_system()) \
-                        or catalog_oid is distinct from \
-                            'capture_triggers'::pg_catalog.regclass::pg_catalog.oid))",
+                   and system_identifier is distinct from \
+                            (select system_identifier::text from pg_catalog.pg_control_system()))",
             &[(&table, Type::TEXT)],
         )
         .await?

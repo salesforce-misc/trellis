@@ -469,12 +469,13 @@ async fn routine_maintenance_and_migrations_pause_nothing() {
     .await;
 }
 
-/// The record of a restored database is re-recorded instead of pausing:
-/// another database's `system_identifier` or `capture_triggers` oid, with
-/// triggers that have new oids. Mutation check: without the restore check,
-/// the second case pauses.
+/// `pg_upgrade` recreates every trigger under a new oid and changes the
+/// cluster's identifier, keeping the oid of `capture_triggers`: the record is
+/// re-recorded, not acted on, and nothing pauses. A changed catalog oid is a
+/// logical restore, which pauses every definition (`logical_restore.rs`),
+/// whatever table's record shows it.
 #[tokio::test]
-async fn a_restored_record_is_re_recorded_not_acted_on() {
+async fn a_pg_upgrade_record_is_re_recorded_and_a_changed_catalog_oid_pauses_everything() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
@@ -483,16 +484,6 @@ async fn a_restored_record_is_re_recorded_not_acted_on() {
     create_case_tables(&raw, &trellis, &ids).await;
     bring_live(&mut raw, &db.pool).await;
     let app = connect(db.dsn()).await;
-    // A dump and restore: another oid for the catalog table.
-    app.batch_execute(&recreate_triggers("t_rs1"))
-        .await
-        .unwrap();
-    app.batch_execute(
-        "update capture_triggers set catalog_oid = (catalog_oid::bigint + 1000)::oid \
-                       where table_name = 'public.t_rs1'",
-    )
-    .await
-    .unwrap();
     // `pg_upgrade`: another cluster identifier, with every trigger recreated.
     app.batch_execute(&recreate_triggers("t_rs2"))
         .await
@@ -508,7 +499,7 @@ async fn a_restored_record_is_re_recorded_not_acted_on() {
     for (t, s) in statuses(&raw).await {
         assert_eq!(s, TransformStatus::Live, "{t}");
     }
-    // Re-recorded with the live oids.
+    // Re-recorded with the live values.
     let stale = rows(
         &raw,
         "select c.table_name from capture_triggers c \
@@ -525,6 +516,20 @@ async fn a_restored_record_is_re_recorded_not_acted_on() {
         .unwrap();
     capture_pass(&mut raw, &db.pool).await;
     assert_eq!(statuses(&raw).await["r_rs2"], TransformStatus::Paused);
+    assert_eq!(statuses(&raw).await["r_rs1"], TransformStatus::Live);
+
+    // A dump and restore: another oid for the catalog table, shown by one
+    // table's record. Every definition pauses, those of the other table too.
+    app.batch_execute(
+        "update capture_triggers set catalog_oid = (catalog_oid::bigint + 1000)::oid \
+                       where table_name = 'public.t_rs1'",
+    )
+    .await
+    .unwrap();
+    capture_pass(&mut raw, &db.pool).await;
+    for (t, s) in statuses(&raw).await {
+        assert_eq!(s, TransformStatus::Paused, "{t}");
+    }
 }
 
 /// Trellis's own installs, widens, narrows and uninstalls pause nothing.
@@ -732,13 +737,13 @@ async fn resume_waits_for_the_table_and_rebuilds_after_a_swap() {
 }
 
 /// A real `pg_dump` and `pg_restore` of the whole database, into another
-/// database and back over the same one with `--clean`, recreates every
-/// capture trigger under a new oid and pauses nothing: the restored record
-/// names another `capture_triggers` oid, so the pass records afresh. A
-/// restore of the application's schema alone recreates the triggers with
-/// Trellis's record untouched, which is a recreation: it pauses.
+/// database and back over the same one with `--clean`, is a logical restore:
+/// the restored record names another `capture_triggers` oid, so the pass
+/// pauses every definition (`logical_restore.rs`). A restore of the
+/// application's schema alone recreates the triggers with Trellis's record
+/// untouched, which is a recreation: it pauses.
 #[tokio::test]
-async fn a_real_dump_and_restore_pauses_nothing() {
+async fn a_real_dump_and_restore_pauses_everything() {
     use std::process::Command;
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -772,7 +777,7 @@ async fn a_real_dump_and_restore_pauses_nothing() {
     for (t, s) in statuses(&restored).await {
         assert_eq!(
             s,
-            TransformStatus::Live,
+            TransformStatus::Paused,
             "restored into another database: {t}"
         );
     }
@@ -785,7 +790,7 @@ async fn a_real_dump_and_restore_pauses_nothing() {
     capture_pass(&mut raw, &db.pool).await;
     capture_pass(&mut raw, &db.pool).await;
     for (t, s) in statuses(&raw).await {
-        assert_eq!(s, TransformStatus::Live, "restored over itself: {t}");
+        assert_eq!(s, TransformStatus::Paused, "restored over itself: {t}");
     }
 
     // The application's schema alone.

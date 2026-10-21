@@ -4512,6 +4512,13 @@ async fn complete_resume(
     definition: &crate::defs::model::Definition,
     revalidated: &catalog::Revalidated,
 ) -> Result<(), ApplyError> {
+    let restored: bool = txn
+        .query_opt(
+            "select restored from capture_failures where transform_id = $1",
+            &[&id],
+        )
+        .await?
+        .is_some_and(|row| row.get(0));
     // `fuse_rearmed_at = now()` in the same statement, not a separate one:
     // it is this resume's epoch, part of the same atomic "this transform
     // starts over" transition as the status drop (issue #160), and what a
@@ -4546,6 +4553,13 @@ async fn complete_resume(
         true,
     )
     .await?;
+    // #1205: a definition paused by a logical restore starts over on this
+    // database's own positions. The rebuild below keeps the ledger's
+    // `__applied_lsn` (B4), which is right for an ordinary one and would skip
+    // every later change to a key the dump held.
+    if restored {
+        reset_ordering_state(txn, schema, id, &definition.target_table).await?;
+    }
     // #1107, #1096 decision 7: a JOIN's hidden tables are fully derived, so
     // the resume drops and recreates them, at the shape define would give
     // them now, rather than check them.
@@ -4684,6 +4698,64 @@ async fn complete_resume(
     )
     .await?;
     crate::instance_log::debug!(transform_id = id, from = %status.as_str(), "resume completed");
+    Ok(())
+}
+
+/// Resets the ordering state of definition `id` (target `target`, qualified)
+/// that a logical restore left holding the original database's WAL positions
+/// and transaction ids (#1205, ADR-0002 I2): the 1-1 ledger's and the group
+/// ledger's `__applied_lsn` and `__basis`, the group basis's hidden
+/// `__basis` and `__stamp`, the truncate floors of the target and of a
+/// JOIN's hidden tables. A JOIN's
+/// hidden tables are recreated by the resume itself. Entries keep their other
+/// columns, so the rebuild still diffs each key against what it contributed.
+async fn reset_ordering_state(
+    txn: &Transaction<'_>,
+    schema: &str,
+    id: i64,
+    target: &str,
+) -> Result<(), ApplyError> {
+    let ledger = crate::defs::ledger::ledger_table_name(target);
+    if txn
+        .query_one(
+            "select pg_catalog.to_regclass($1) is not null",
+            &[&ddl::regclass_arg(&ledger)],
+        )
+        .await?
+        .get::<_, bool>(0)
+    {
+        txn.batch_execute(&format!(
+            "update {ledger} set \"__applied_lsn\" = null, \"__basis\" = null \
+             where \"__applied_lsn\" is not null or \"__basis\" is not null",
+            ledger = ddl::regclass_arg(&ledger),
+        ))
+        .await?;
+    }
+    let hidden = super::group_basis::hidden_table_ident(schema, id);
+    if txn
+        .query_one("select pg_catalog.to_regclass($1) is not null", &[&hidden])
+        .await?
+        .get::<_, bool>(0)
+    {
+        txn.batch_execute(&format!(
+            "update {hidden} set __basis = null, __stamp = null \
+             where __basis is not null or __stamp is not null"
+        ))
+        .await?;
+    }
+    let mut floors = vec![target.to_string(), hidden];
+    floors.extend(crate::defs::join::HiddenTable::ALL.iter().map(|table| {
+        format!(
+            "{}.{}",
+            crate::pool::quote_ident(schema),
+            crate::pool::quote_ident(&table.name(id))
+        )
+    }));
+    txn.execute(
+        "delete from ledger_truncate_floor where target_table = any($1)",
+        &[&floors],
+    )
+    .await?;
     Ok(())
 }
 

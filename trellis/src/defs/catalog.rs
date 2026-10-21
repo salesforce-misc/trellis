@@ -6301,6 +6301,9 @@ pub(crate) async fn check_owned_tables(
     if revalidated.join.is_some() {
         return Ok(());
     }
+    if crate::staging::group_basis::route(&definition.def, &revalidated.source_columns).is_some() {
+        return Ok(());
+    }
     check_ledger_table(txn, definition).await?;
     check_deltas_shape(txn, definition, revalidated).await
 }
