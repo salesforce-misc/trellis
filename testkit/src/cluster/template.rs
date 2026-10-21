@@ -149,8 +149,12 @@ fn build(tmp: &Path, name: &str, dir: &Path) {
 
     // The build cluster is transient, so it lives in the system temp dir
     // whatever `tmp` is: its socket path must stay short.
-    let cluster =
-        TestCluster::start_listening_in(&std::env::temp_dir(), false, DataDirSource::Initdb, Vec::new());
+    let cluster = TestCluster::start_listening_in(
+        &std::env::temp_dir(),
+        false,
+        DataDirSource::Initdb,
+        Vec::new(),
+    );
     cluster.create_database(TEMPLATE_DB);
     migrate(&cluster.database_dsn(TEMPLATE_DB));
     // A clean shutdown first, so the copy needs no recovery on first start.
