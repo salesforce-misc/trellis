@@ -357,7 +357,7 @@ fn start_cluster() -> TestCluster {
             "generative: concurrent_convergence cluster in the temp dir; set {CLUSTER_DIR_ENV} \
              for a disk-backed one"
         );
-        return TestCluster::start();
+        return TestCluster::start().long_lived();
     };
     let dir = std::path::PathBuf::from(dir);
     std::fs::create_dir_all(&dir).expect("create the cluster dir");
@@ -392,7 +392,7 @@ fn start_cluster() -> TestCluster {
         "generative: concurrent_convergence cluster under {} ({fs_type})",
         dir.display()
     );
-    TestCluster::start_in(&dir)
+    TestCluster::start_in(&dir).long_lived()
 }
 
 fn proptest_config() -> ProptestConfig {

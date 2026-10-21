@@ -270,3 +270,42 @@ async fn a_cold_backup_restores_data_as_of_the_backup() {
         "the restored cluster's dir is deleted on drop"
     );
 }
+
+/// Whether `cluster` still lists a database called `name`.
+async fn database_exists(cluster: &TestCluster, name: &str) -> bool {
+    let admin = cluster.create_empty_database().await;
+    let row = admin
+        .pool
+        .get()
+        .await
+        .expect("acquire connection")
+        .query_one(
+            "select exists (select 1 from pg_database where datname = $1)",
+            &[&name],
+        )
+        .await
+        .expect("query pg_database");
+    row.get(0)
+}
+
+#[tokio::test]
+async fn a_long_lived_cluster_drops_a_database_with_its_handle() {
+    let cluster = TestCluster::start().long_lived();
+    let db = cluster.create_empty_database().await;
+    let name = db.name().to_string();
+    assert!(database_exists(&cluster, &name).await);
+    drop(db);
+    assert!(!database_exists(&cluster, &name).await);
+}
+
+#[tokio::test]
+async fn a_default_cluster_leaves_the_database_for_its_own_teardown() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_empty_database().await;
+    let name = db.name().to_string();
+    drop(db);
+    assert!(database_exists(&cluster, &name).await);
+    let root = cluster.root().to_path_buf();
+    drop(cluster);
+    assert!(!root.exists());
+}

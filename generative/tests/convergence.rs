@@ -78,7 +78,7 @@ thread_local! {
             // `generative/src/backend/manual.rs` (improvement-plan task C2).
             let timing_enabled = std::env::var_os("GENERATIVE_COST_TIMING").is_some();
             let start = timing_enabled.then(std::time::Instant::now);
-            let cluster = TestCluster::start();
+            let cluster = TestCluster::start().long_lived();
             if let Some(start) = start {
                 eprintln!("COST_TIMING cluster_startup {}", start.elapsed().as_millis());
             }

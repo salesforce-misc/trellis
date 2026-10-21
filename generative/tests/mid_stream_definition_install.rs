@@ -44,7 +44,7 @@ impl Drop for Harness {
 thread_local! {
     static HARNESS: Harness = Harness {
         runtime: tokio::runtime::Runtime::new().expect("build tokio runtime"),
-        cluster: TestCluster::start(),
+        cluster: TestCluster::start().long_lived(),
         coverage: std::cell::RefCell::new(generative::run::Coverage::new()),
     };
 }
