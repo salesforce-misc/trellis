@@ -1,7 +1,8 @@
 //! A live `JOIN` target across a schema change of either table (#1110 J5,
 //! ADR-0019): its copies of a `varchar(n)` column are unbounded (#1207), so a
 //! widening needs no re-type and no value waits for the staging worker's
-//! pass.
+//! pass. No table a `JOIN` or a group-basis aggregate creates holds a bounded
+//! `varchar`.
 //!
 //! The group-basis dev knob is on before the driver starts (a `JOIN`
 //! applies only behind it); the pipeline and the pass are stepped by hand
@@ -9,6 +10,8 @@
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
+#[path = "support/varchar_columns.rs"]
+mod varchar_columns;
 
 use std::time::Duration;
 
@@ -97,7 +100,8 @@ async fn a_widened_varchar_of_either_table_is_applied_before_any_pass_on_a_live_
     let mut d = start().await;
     write(
         &d,
-        "insert into public.a values (1, 'g1', 'k1', 1), (2, 'g2', 'k2', 2);          insert into public.b values (1, 'k1', 'h1', 10), (2, 'k2', 'h2', 20)",
+        "insert into public.a values (1, 'g1', 'k1', 1), (2, 'g2', 'k2', 2); \
+         insert into public.b values (1, 'k1', 'h1', 10), (2, 'k2', 'h2', 20)",
     )
     .await;
     d.settle().await;
@@ -181,4 +185,62 @@ async fn a_widened_varchar_of_either_table_is_applied_before_any_pass_on_a_live_
     .await;
     d.settle().await;
     assert_eq!(diverged(&d).await, Vec::<String>::new());
+}
+
+/// Rule 1 of #1207's decision, over the tables a `JOIN` and a group-basis
+/// aggregate create: a `JOIN` grouped by `varchar(n)` columns of both tables
+/// over a `varchar(n)` `ON` pair, another grouped by a `varchar(n)` key, and
+/// a group-basis aggregate grouped by two `varchar(n)` columns. None of
+/// their columns has a length: the targets, `P`, `M`, `J`, `T`, `agg_<id>`,
+/// and the working tables a page leaves in its session.
+#[tokio::test]
+async fn no_table_a_join_or_group_basis_creates_holds_a_bounded_varchar() {
+    let mut d = Driver::start(
+        "create table public.a (id varchar(5) primary key, g varchar(5), \
+                                k varchar(5), x integer); \
+         create table public.b (id varchar(5) primary key, k varchar(5), \
+                                h varchar(5), y integer)",
+        &[
+            ("id", ValueType::Text),
+            ("g", ValueType::Text),
+            ("k", ValueType::Text),
+            ("x", ValueType::Integer(IntWidth::Int4)),
+        ],
+        &[
+            LEFT,
+            "TRANSFORM by_id FROM public.a JOIN public.b ON a.k = b.k \
+             GROUP BY a.id SELECT a.id AS id, COUNT(*) AS n",
+            "TRANSFORM per_gk FROM public.a GROUP BY g, k \
+             SELECT g AS g, k AS k, COUNT(*) AS n, SUM(x) AS sx",
+        ],
+        &["public.a", "public.b"],
+    )
+    .await;
+    write(
+        &d,
+        "insert into public.a values ('1', 'g1', 'k1', 1), ('2', 'g2', 'k2', 2); \
+         insert into public.b values ('1', 'k1', 'h1', 10)",
+    )
+    .await;
+    d.settle().await;
+    pass(&mut d).await;
+    d.settle().await;
+
+    let columns = varchar_columns::read(&d.ctl, &["public.a", "public.b"]).await;
+    let bounded: Vec<&String> = columns.iter().filter(|c| c.contains('(')).collect();
+    assert_eq!(bounded, Vec::<&String>::new(), "{columns:?}");
+    for copy in ["public.l.g ", "public.l.h ", "public.by_id.id "] {
+        assert!(
+            columns.iter().any(|c| c.starts_with(copy)),
+            "{copy}is a copy: {columns:?}"
+        );
+    }
+    for hidden in ["_p.", "_m.", "_j.", "_t."] {
+        assert!(
+            columns
+                .iter()
+                .any(|c| c.starts_with("trellis.join_") && c.contains(hidden)),
+            "{hidden} holds copies: {columns:?}"
+        );
+    }
 }

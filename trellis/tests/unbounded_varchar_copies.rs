@@ -5,13 +5,17 @@
 //! widened a `varchar(5)` column, a copy still bounded to 5 would store
 //! `'abcde   '` as `'abcde'` when its page drained before the capture pass
 //! re-typed the copy: a 1-1 key would upsert into the row of `'abcde'`, a
-//! passthrough would lose its spaces. Each test widens the source and writes
-//! such a value with no pass in between, then drains. The pipeline and the
+//! passthrough would lose its spaces. The tests widen the source and write
+//! such a value with no pass in between, then drain, and check that no table
+//! Trellis creates without the group-basis knob holds a bounded `varchar`
+//! (`join_schema_changes.rs` checks the `JOIN` and group-basis tables). The pipeline and the
 //! pass are stepped by hand (`support/drain_driver.rs`), and nothing polls for
 //! convergence (#297).
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
+#[path = "support/varchar_columns.rs"]
+mod varchar_columns;
 
 use std::time::Duration;
 
@@ -218,4 +222,65 @@ async fn a_varchar_text_change_of_the_source_reports_no_drift() {
         .expect("filenode")
         .get(0);
     assert_eq!(after, before, "the target was not rewritten");
+}
+
+/// Rule 1 of #1207's decision, over every kind of table Trellis creates
+/// without the group-basis knob: a 1-1 target keyed by a `varchar(n)` with a
+/// passthrough and a field read through a relationship, the 1-1 side ledger,
+/// the relationship's projection, and ledger aggregates grouped by
+/// `varchar(n)` columns and by a relationship path, with a `MIN` over one
+/// (target, ledger, group-delta table). None of their columns has a length.
+/// `join_schema_changes.rs` covers the `JOIN` and group-basis tables.
+#[tokio::test]
+async fn no_table_trellis_creates_holds_a_bounded_varchar() {
+    let mut d = Driver::start_with_relationships(
+        "create table public.o (code varchar(5) primary key, label varchar(5)); \
+         create table public.s (id varchar(5) primary key, g varchar(5), k varchar(5), \
+                                n integer)",
+        &[
+            ("id", ValueType::Text),
+            ("g", ValueType::Text),
+            ("k", ValueType::Text),
+            ("n", ValueType::Integer(IntWidth::Int4)),
+            ("code", ValueType::Text),
+            ("label", ValueType::Text),
+        ],
+        &["RELATIONSHIP owner FROM s.k TO o.code"],
+        &[
+            "TRANSFORM one FROM public.s SELECT g AS g, owner.label AS ol, n AS n",
+            "TRANSFORM per_gk FROM public.s GROUP BY g, k \
+             SELECT g AS g, k AS k, COUNT(*) AS c, MIN(k) AS mk, SUM(n) AS sn",
+            "TRANSFORM per_label FROM public.s GROUP BY owner.label \
+             SELECT owner.label AS l, COUNT(*) AS c",
+        ],
+        &["public.o", "public.s"],
+    )
+    .await;
+    d.user()
+        .await
+        .batch_execute(
+            "insert into public.o values ('a', 'la'); \
+             insert into public.s values ('x', 'g', 'a', 1), ('y', 'g', 'b', 2)",
+        )
+        .await
+        .expect("write");
+    d.settle().await;
+    pass(&mut d).await;
+    d.settle().await;
+
+    let columns = varchar_columns::read(&d.ctl, &["public.o", "public.s"]).await;
+    let bounded: Vec<&String> = columns.iter().filter(|c| c.contains('(')).collect();
+    assert_eq!(bounded, Vec::<&String>::new(), "{columns:?}");
+    for copy in ["public.one.id ", "public.one.g "] {
+        assert!(
+            columns.iter().any(|c| c.starts_with(copy)),
+            "{copy}is a copy: {columns:?}"
+        );
+    }
+    assert!(
+        columns
+            .iter()
+            .any(|c| c.starts_with("trellis._trellis_rel_projection_")),
+        "the projection's columns are copies: {columns:?}"
+    );
 }
