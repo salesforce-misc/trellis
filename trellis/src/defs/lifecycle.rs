@@ -587,6 +587,9 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
     )
     .await?;
 
+    // #1217: this definition may have been the last to read its tables.
+    super::catalog::forget_unread_capture_records(&*txn).await?;
+
     txn.commit().await?;
     crate::instance_log::info!(
         transform = %target,
@@ -717,6 +720,9 @@ pub(crate) async fn drop_relationship(
         ))
         .await?;
     }
+
+    // #1217: its to-side may no longer be read by anything.
+    super::catalog::forget_unread_capture_records(&*txn).await?;
 
     txn.commit().await?;
     crate::instance_log::info!(
