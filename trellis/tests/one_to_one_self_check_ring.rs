@@ -199,3 +199,39 @@ async fn a_pending_truncate_leaves_every_key_uncertain() {
     let (_, _, all) = compare(&d, 10).await;
     assert!(all);
 }
+
+/// A 1-1 page reads the ring through the helper the group and `JOIN` pages
+/// share, so it skips a drained slot (#1219): a slot whose segment is drained
+/// is never scanned, the one holding the active segment is.
+#[tokio::test]
+async fn a_one_to_one_page_never_scans_a_drained_ring_slot() {
+    let mut d = start().await;
+    step(&mut d, "insert into public.src values (1, 10, 1)").await;
+    step(&mut d, "insert into public.src values (2, 20, 2)").await;
+    let states = d.rows("select state from segments order by seg_seq").await;
+    assert_eq!(states.last().map(String::as_str), Some("(active)"));
+    assert_eq!(states[0], "(drained)");
+    let slots: Vec<String> = d
+        .rows("select 'seg_' || ring_slot from segments order by seg_seq")
+        .await
+        .into_iter()
+        .map(|t| t.trim_matches(|c| c == '(' || c == ')').to_string())
+        .collect();
+    let plan = trellis::staging::self_check::explain_page_executed(d.pool(), "t", None, 10)
+        .await
+        .expect("explain the page as run");
+    let scan = |slot: &String| {
+        plan.lines()
+            .filter(|l| l.contains(&format!("Scan on {slot} ")))
+            .map(|l| !l.contains("(never executed)"))
+            .collect::<Vec<bool>>()
+    };
+    let oldest = scan(&slots[0]);
+    assert!(
+        !oldest.is_empty() && oldest.iter().all(|ran| !ran),
+        "the drained slot {} ran:\n{plan}",
+        slots[0]
+    );
+    let active = scan(slots.last().unwrap());
+    assert!(active.iter().any(|ran| *ran), "the active slot:\n{plan}");
+}
