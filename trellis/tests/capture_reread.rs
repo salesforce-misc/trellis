@@ -924,13 +924,44 @@ async fn a_move_of_a_join_column_alone_still_stages() {
 
 // ------------------------------------------------------------ plan shape
 
+/// `(seq_scan, idx_scan)` of `table` once `client`'s own pending counts have
+/// reached the shared counters (they otherwise wait for the session to sit
+/// idle for a second).
+async fn scan_counts(client: &Client, table: &str) -> (i64, i64) {
+    client
+        .batch_execute("select pg_stat_force_next_flush()")
+        .await
+        .expect("force the next stats flush");
+    client.batch_execute("select 1").await.expect("flush stats");
+    client
+        .batch_execute("select pg_stat_clear_snapshot()")
+        .await
+        .expect("clear the stats snapshot");
+    let row = client
+        .query_one(
+            "select seq_scan, idx_scan from pg_stat_user_tables where relid = $1::text::regclass",
+            &[&table],
+        )
+        .await
+        .expect("table stats");
+    (row.get(0), row.get::<_, Option<i64>>(1).unwrap_or(0))
+}
+
 /// The live re-read stays a primary-key probe per captured row after the
 /// table grows, although PL/pgSQL planned it once, on the session's first
 /// write, against a table a `VACUUM` had just seen empty. Costed against
 /// that, a sequential scan beats the index, and a cached sequential scan
 /// would read the whole table for every captured row (a 1,000-row insert
 /// ran at 3% of control before the probe was forced). Inserts don't scan
-/// the table themselves, so any sequential scan of it is the re-read's.
+/// the table themselves, so any sequential scan of it after the setup is the
+/// re-read's.
+///
+/// The counters are cumulative and flushed per backend, lazily: setup (the
+/// primary key's index build, say) leaves a scan pending in the `raw`
+/// session that reaches the shared counters only once that session has been
+/// idle for a second, which is by timing, so under load it lands between any
+/// two reads (#1233). The test therefore flushes every session, reads the
+/// counters as a baseline before the writes, and asserts on the delta.
 #[tokio::test]
 async fn the_reread_never_scans_the_table_after_planning_against_it_empty() {
     let cluster = TestCluster::start();
@@ -945,6 +976,8 @@ async fn the_reread_never_scans_the_table_after_planning_against_it_empty() {
     install_spec(&mut raw, &spec("public.g", &["a"])).await;
     always_reread(&raw, "public.g").await;
 
+    let (seq_before, idx_before) = scan_counts(&raw, "public.g").await;
+
     let writer = connect(db.dsn()).await;
     writer
         .batch_execute(
@@ -957,17 +990,8 @@ async fn the_reread_never_scans_the_table_after_planning_against_it_empty() {
         .expect("writes planned against an empty table");
     writer.batch_execute("select 1").await.expect("flush stats");
 
-    raw.batch_execute("select pg_stat_clear_snapshot()")
-        .await
-        .expect("clear the stats snapshot");
-    let row = raw
-        .query_one(
-            "select seq_scan, idx_scan from pg_stat_user_tables where relid = 'public.g'::regclass",
-            &[],
-        )
-        .await
-        .expect("table stats");
-    let (seq, idx): (i64, i64) = (row.get(0), row.get::<_, Option<i64>>(1).unwrap_or(0));
+    let (seq_after, idx_after) = scan_counts(&raw, "public.g").await;
+    let (seq, idx) = (seq_after - seq_before, idx_after - idx_before);
     assert_eq!(seq, 0, "the re-read scanned public.g");
     assert!(idx >= 4001, "one probe per captured row, got {idx}");
     assert_eq!(ring(&raw, "public.g").await.len(), 4001);
