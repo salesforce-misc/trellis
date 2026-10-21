@@ -495,7 +495,8 @@ async fn resume_refuses_a_missing_partials_table() {
 async fn resume_refuses_a_ledger_aggregate_the_group_basis_takes_now() {
     trellis::dev::staging::set_group_basis(true);
     let d = Driver::start(
-        "create table public.src (id integer primary key, g integer, v double precision)",
+        "create table public.src (id integer primary key, g integer, v double precision); \
+         create index on public.src (g)",
         &[
             ("id", int4()),
             ("g", int4()),
