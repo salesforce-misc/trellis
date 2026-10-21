@@ -911,6 +911,7 @@ fn status_hash(ruby: &Ruby, status: PlainDefinitionStatus) -> Result<RHash, Erro
     let unindexed_joins = array(ruby, status.unindexed_joins, unindexed_join_hash)?;
     let source_index_gaps = array(ruby, status.source_index_gaps, source_index_gap_hash)?;
     let correcting = array(ruby, status.correcting, correcting_hash)?;
+    let paused_upstream_columns = ruby.ary_from_iter(status.paused_upstream_columns);
     record(
         ruby,
         [
@@ -923,6 +924,10 @@ fn status_hash(ruby: &Ruby, status: PlainDefinitionStatus) -> Result<RHash, Erro
             ("unindexed_joins", unindexed_joins.as_value()),
             ("source_index_gaps", source_index_gaps.as_value()),
             ("correcting", correcting.as_value()),
+            (
+                "paused_upstream_columns",
+                paused_upstream_columns.as_value(),
+            ),
         ],
     )
 }

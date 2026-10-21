@@ -301,7 +301,18 @@ pause are arcs of one lifecycle:
     keeps its rows meanwhile: the rebuild rewrites them in place.
 
   A `live` transform that reads an upstream which isn't `live` reports
-  `catching_up` too.
+  `catching_up` too, and so does one that reads a paused column of an
+  upstream 1-1 target (its fuse tripped, or `PAUSE TRANSFORM t.col`): an
+  aggregate or `JOIN` keeps applying over the column's frozen values, exact
+  against the target and stale against the source. `paused_upstream_columns`
+  on `DefinitionStatus` names the column or columns, each `target.column`
+  (the columns it reads and those the transforms it reads are held at,
+  `[]` otherwise), and the CLI's `trellis status` prints a line under the
+  transform. Nothing is paused or rebuilt: resuming the column writes
+  through to the reader, the list empties and the status returns to `live`.
+  A 1-1 reader's own field is paused with the column
+  ([ADR-0003](decisions/0003-quarantine-storage-and-api.md)),
+  and an aggregate that reads only other columns stays `live`.
 * **`live`** — the steady state: a watermark token taken after a commit and
   awaited with `Trellis::await_converged` guarantees the target reflects that
   commit. A ring enumeration's rows may still be draining when it flips, but

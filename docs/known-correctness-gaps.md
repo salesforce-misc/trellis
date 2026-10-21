@@ -36,7 +36,6 @@ wrong rows, on the targets it compares
 | [A logical dump restored into another cluster](#a-logical-dump-restored-into-another-cluster) | `self_check` | [#1205](https://github.com/salesforce-misc/trellis/issues/1205) |
 | **Values computed differently from the definition** | | |
 | [Text functions in a 1-1 field](#text-functions-in-a-1-1-field) | `self_check` | [#575](https://github.com/salesforce-misc/trellis/issues/575) |
-| [An aggregate reading a paused column](#an-aggregate-reading-a-paused-column) | no | [#1208](https://github.com/salesforce-misc/trellis/issues/1208) |
 | **[Relationships](#relationships)** (removed by [#1115](https://github.com/salesforce-misc/trellis/issues/1115)) | | |
 | [A trigger that re-keys a parent's join column within the statement](#a-trigger-that-re-keys-a-parents-join-column-within-the-statement) | no | #1115 |
 | [A from-side change pending across a to-side `TRUNCATE`](#a-from-side-change-pending-across-a-to-side-truncate) | no | #1115 |
@@ -349,25 +348,6 @@ every row with Postgres's value, until each row's next write.
 **Ends with:** [#643](https://github.com/salesforce-misc/trellis/issues/643),
 which closes when [#575](https://github.com/salesforce-misc/trellis/issues/575)
 moves 1-1 evaluation into Postgres.
-
-### An aggregate reading a paused column
-
-**When:** a column of a 1-1 target is paused (its column fuse tripped, or
-`PAUSE TRANSFORM <target>.<column>`), and an aggregate reads that column.
-
-**What goes wrong:** the pause cascades to 1-1 readers of the column, not to
-aggregates
-([ADR-0003](decisions/0003-quarantine-storage-and-api.md)). The aggregate
-keeps applying over the column's frozen values and reports `live`. It agrees
-with the upstream target as it stands, but it's stale against the source.
-
-**Detected by:** nothing on the aggregate. The upstream target's status lists
-the paused column.
-
-**Repair:** resume the upstream column. Its rebuild writes through to the
-aggregate. Until then, treat the aggregate as stale.
-
-**Ends with:** [#1208](https://github.com/salesforce-misc/trellis/issues/1208).
 
 ## Relationships
 

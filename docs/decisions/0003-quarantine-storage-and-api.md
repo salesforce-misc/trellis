@@ -226,8 +226,13 @@ Settled parameters:
 * **Propagation** — tripping either fuse cascades the pause to 1-1 downstream
   transforms reading the paused column, so no downstream reader silently consumes
   a frozen value. The column-level fuse only ever freezes a column of a 1-1
-  transform, and the cascade stops at aggregates
-  ([known correctness gaps — An aggregate reading a paused column](../known-correctness-gaps.md#an-aggregate-reading-a-paused-column)). Each reader's pause
+  transform, and the cascade stops at every other reader kind (an aggregate, a
+  `JOIN`): it keeps applying over the column's frozen values, exact against the
+  upstream target, and the pause propagates to it as reported status. A `live`
+  definition reading a paused column of an upstream 1-1 target reports
+  `catching_up`, transitively, and `DefinitionStatus::paused_upstream_columns`
+  names the column. Nothing is paused or rebuilt: the column's resume writes
+  through to the reader, which reads `live` again. Each reader's pause
   commits in a transaction of its own, fenced against its writers in flight, so
   a cascade can fail part-way. The walk is idempotent: it walks on through a
   reader that is paused already, so running it again reaches the readers the

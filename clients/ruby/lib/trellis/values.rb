@@ -90,9 +90,17 @@ module Trellis
   # it touched. It reads :backfilling while one is listed, and :live again
   # once they are re-derived and folded into its target. A paused or
   # quarantined definition lists none.
+  #
+  # paused_upstream_columns names the paused columns of upstream 1-1 targets
+  # that make a :live definition report :catching_up, each "target.column"
+  # ([] when none). A column is paused when its fuse tripped or PAUSE
+  # TRANSFORM t.col froze it; an aggregate or JOIN reading it keeps applying
+  # over its frozen values, so it is stale against the source. Nothing is
+  # paused or rebuilt: resuming the column writes through to the reader and
+  # it reads :live again.
   Status = Data.define(:status, :backfill_failure, :capture_wait, :capture_failure,
                        :held_keys, :drain_failure, :unindexed_joins, :source_index_gaps,
-                       :correcting) do
+                       :correcting, :paused_upstream_columns) do
     def self.from_native(hash)
       failure = hash[:backfill_failure]
       wait = hash[:capture_wait]
@@ -107,7 +115,8 @@ module Trellis
           drain_failure: drain_failure && DrainFailure.from_native(drain_failure),
           unindexed_joins: hash.fetch(:unindexed_joins).map { |j| UnindexedJoin.new(**j) },
           source_index_gaps: hash.fetch(:source_index_gaps).map { |g| SourceIndexGap.new(**g) },
-          correcting: hash.fetch(:correcting).map { |c| CorrectingNode.from_native(c) })
+          correcting: hash.fetch(:correcting).map { |c| CorrectingNode.from_native(c) },
+          paused_upstream_columns: hash.fetch(:paused_upstream_columns))
     end
   end
 

@@ -25,7 +25,8 @@ defmodule Trellis.StatusTest do
         drain_failure: nil,
         unindexed_joins: [],
         source_index_gaps: [],
-        correcting: []
+        correcting: [],
+        paused_upstream_columns: []
       })
 
     assert %Trellis.Status{
@@ -65,7 +66,8 @@ defmodule Trellis.StatusTest do
         drain_failure: nil,
         unindexed_joins: [],
         source_index_gaps: [],
-        correcting: []
+        correcting: [],
+        paused_upstream_columns: []
       })
 
     assert %Trellis.Status{
@@ -112,7 +114,8 @@ defmodule Trellis.StatusTest do
         },
         unindexed_joins: [],
         source_index_gaps: [],
-        correcting: []
+        correcting: [],
+        paused_upstream_columns: []
       })
 
     assert status.drain_failure == %Trellis.DrainFailure{
@@ -144,7 +147,8 @@ defmodule Trellis.StatusTest do
           }
         ],
         source_index_gaps: [],
-        correcting: []
+        correcting: [],
+        paused_upstream_columns: []
       })
 
     assert status.unindexed_joins == [
@@ -175,7 +179,8 @@ defmodule Trellis.StatusTest do
             fix: ~s|create index on "public"."orders" ("customer_id")|
           }
         ],
-        correcting: []
+        correcting: [],
+        paused_upstream_columns: []
       })
 
     assert status.source_index_gaps == [
@@ -202,8 +207,11 @@ defmodule Trellis.StatusTest do
         correcting: [
           %{node: "public.items_p1", since_micros: 1_727_222_400_654_321, keys_remaining: 5},
           %{node: "public.items_p2", since_micros: 1_727_222_400_654_322, keys_remaining: nil}
-        ]
+        ],
+        paused_upstream_columns: ["t.total"]
       })
+
+    assert status.paused_upstream_columns == ["t.total"]
 
     assert status.correcting == [
              %Trellis.CorrectingNode{
