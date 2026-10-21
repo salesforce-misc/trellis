@@ -19,6 +19,9 @@ jobs:
     # salesforce-misc org, which has no such self-hosted runner. Use the
     # standard GitHub-hosted runner instead.
     runs-on: ubuntu-latest
+    # A safety net for a hung test or runner, not a budget: the slowest runs
+    # take about 40 minutes, and the default would let a hang burn six hours.
+    timeout-minutes: 60
     permissions:
       contents: read
     steps:

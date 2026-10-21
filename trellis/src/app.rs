@@ -908,6 +908,7 @@ impl Trellis {
                 )
                 .await?;
             let mut status = None;
+            let mut paused_upstream_columns = Vec::new();
             let mut holdup = (None, None);
             let mut drain_failure = None;
             let mut unindexed = Vec::new();
@@ -919,7 +920,10 @@ impl Trellis {
                 let stored = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
                     panic!("transform_definitions.status held unrecognized value '{status_text}'")
                 });
-                status = Some(reported_status(&*txn, row.get(1), stored).await?);
+                let (reported, causes) =
+                    reported_status_with_causes(&*txn, row.get(1), stored).await?;
+                status = Some(reported);
+                paused_upstream_columns = causes;
                 correcting =
                     crate::staging::partition_correction::correcting(&*txn, row.get(1)).await?;
                 // #687: an edit whose new field awaits a widen is stuck on
@@ -999,6 +1003,7 @@ impl Trellis {
                 source_index_gaps,
                 join,
                 correcting,
+                paused_upstream_columns,
                 build_wait: row
                     .get::<_, Option<i64>>("build_fence")
                     .map(|xid| BuildWait::Fence { xid }),
@@ -1955,14 +1960,25 @@ async fn reported_status(
     id: i64,
     stored: TransformStatus,
 ) -> Result<TransformStatus, TrellisError> {
+    Ok(reported_status_with_causes(client, id, stored).await?.0)
+}
+
+/// [`reported_status`] and the paused upstream columns behind a reported
+/// `catching_up` (#1208, [`DefinitionStatus::paused_upstream_columns`]).
+async fn reported_status_with_causes(
+    client: &impl tokio_postgres::GenericClient,
+    id: i64,
+    stored: TransformStatus,
+) -> Result<(TransformStatus, Vec<String>), TrellisError> {
     if stored != TransformStatus::Live {
-        return Ok(stored);
+        return Ok((stored, Vec::new()));
     }
-    Ok(crate::defs::catalog::reported_statuses(client)
-        .await?
-        .get(&id)
-        .copied()
-        .unwrap_or(stored))
+    let (statuses, mut causes) =
+        crate::defs::catalog::reported_statuses_with_causes(client).await?;
+    Ok((
+        statuses.get(&id).copied().unwrap_or(stored),
+        causes.remove(&id).unwrap_or_default(),
+    ))
 }
 
 /// The columns [`backfill_failure`] reads a failing build chunk from, joined
@@ -2217,6 +2233,18 @@ pub struct DefinitionStatus {
     /// definition that is paused or quarantined: a correction that kept
     /// failing is reported in [`DefinitionStatus::backfill_failure`].
     pub correcting: Vec<CorrectingNode>,
+    /// The paused columns of upstream 1-1 targets that make a `live`
+    /// definition report [`TransformStatus::CatchingUp`] (#1208), each
+    /// `target.column` as [`Trellis::quarantine_status`] addresses it, sorted:
+    /// the columns it reads, and those read by the definitions it reads
+    /// (transitively). A column is paused when its fuse tripped or `PAUSE
+    /// TRANSFORM t.col` froze it. A reader that is not a 1-1 definition (an
+    /// aggregate, a `JOIN`) keeps applying over the column's frozen values,
+    /// exact against the upstream target and stale against the source.
+    /// Nothing is paused or rebuilt: resuming the column writes through to
+    /// the reader, the list empties and the status returns to `live`. Empty
+    /// when no such column is read.
+    pub paused_upstream_columns: Vec<String>,
     /// Set while the definition's Re-derive build waits on something other
     /// than its own work (#625 F6): see [`BuildWait`]. Cleared once the
     /// wait is over.

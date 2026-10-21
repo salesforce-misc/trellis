@@ -115,7 +115,7 @@ impl Keyset {
             .iter()
             .map(|row| PrimaryKeyColumn {
                 name: row.get(0),
-                data_type: row.get(1),
+                data_type: crate::defs::ddl::key_cast_type(&row.get::<_, String>(1)),
                 nullable: true,
                 collation: row.get(2),
             })

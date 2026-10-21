@@ -77,7 +77,10 @@ Nothing in the binding uses it.
   relationships a definition reads that have no usable index
   (`unindexed_joins`, each a `Trellis::UnindexedJoin` with `relationship`,
   `table`, `column` and the `fix` sentence), a warning that never changes its
-  status. `status` lists the source indexes a `GROUP BY` or `JOIN` target
+  status. `status` names the paused upstream columns
+  (`paused_upstream_columns`, each `"target.column"`) that make a `live`
+  definition report `catching_up`. `status` lists the source indexes a
+  `GROUP BY` or `JOIN` target
   needs and lacks (`source_index_gaps`, each a `Trellis::SourceIndexGap` with
   `table`, `columns`, `opted_out` and a `create index` statement as `fix`);
   `self_check` refuses such a target unless it was defined `WITHOUT SOURCE

@@ -301,7 +301,18 @@ pause are arcs of one lifecycle:
     keeps its rows meanwhile: the rebuild rewrites them in place.
 
   A `live` transform that reads an upstream which isn't `live` reports
-  `catching_up` too.
+  `catching_up` too, and so does one that reads a paused column of an
+  upstream 1-1 target (its fuse tripped, or `PAUSE TRANSFORM t.col`): an
+  aggregate or `JOIN` keeps applying over the column's frozen values, exact
+  against the target and stale against the source. `paused_upstream_columns`
+  on `DefinitionStatus` names the column or columns, each `target.column`
+  (the paused columns it reads, and those behind the transforms it reads,
+  `[]` otherwise), and the CLI's `trellis status` prints a line under the
+  transform. Nothing is paused or rebuilt: resuming the column writes
+  through to the reader, the list empties and the status returns to `live`.
+  A 1-1 reader's own field is paused with the column
+  ([ADR-0003](decisions/0003-quarantine-storage-and-api.md)),
+  and an aggregate that reads only other columns stays `live`.
 * **`live`** — the steady state: a watermark token taken after a commit and
   awaited with `Trellis::await_converged` guarantees the target reflects that
   commit. A ring enumeration's rows may still be draining when it flips, but
@@ -376,7 +387,8 @@ pause are arcs of one lifecycle:
   `JOIN`'s joined table or a relationship's to-side) while that transform isn't `live`
   returns at once, but the transform stays `paused`, its `capture_failure` reading
   "resuming: waiting for transform `<upstream>` … to be live", until the upstream is
-  `live`; then the staging worker resumes it as above. A `PAUSE` of a transform waiting
+  `live` (an upstream `catching_up` only for a paused column it reads doesn't
+  hold it); then the staging worker resumes it as above. A `PAUSE` of a transform waiting
   either way withdraws the resume, and its `capture_failure` says so. The
   resume reconciles the target with current source
   data rather than replaying what was skipped while paused (the change stream is

@@ -1675,6 +1675,46 @@ fn referenced_relationships(def: &TransformDef) -> Vec<String> {
 pub(crate) async fn reported_statuses(
     client: &impl GenericClient,
 ) -> Result<HashMap<i64, TransformStatus>, CatalogError> {
+    Ok(reported_statuses_with_causes(client).await?.0)
+}
+
+/// [`reported_statuses`] plus, per definition, the paused upstream columns
+/// that make it report `catching_up` (#1208), each `target.column`, sorted:
+/// the columns it reads directly and those its upstream readers do. The map
+/// holds only definitions with a cause.
+///
+/// A column of a 1-1 target is paused when it has a `column_status` row
+/// (its fuse tripped, or `PAUSE TRANSFORM t.col`). Its 1-1 readers' fields
+/// are paused with it by the cascade, but any other reader (an aggregate, a
+/// `JOIN`) keeps applying over the column's frozen values and stays `live`,
+/// exact against the upstream target and stale against the source. A `live`
+/// definition reading such a column therefore reports `catching_up` too,
+/// until the column's resume writes through to it. Nothing is paused or
+/// rebuilt. A reader whose reading field the cascade paused already shows
+/// that pause, so it isn't a cause here: the column the cascade paused is.
+pub(crate) async fn reported_statuses_with_causes(
+    client: &impl GenericClient,
+) -> Result<(HashMap<i64, TransformStatus>, HashMap<i64, Vec<String>>), CatalogError> {
+    let mut nodes = status_nodes(client).await?;
+    add_paused_column_causes(client, &mut nodes).await?;
+    Ok(derive_reported(&nodes))
+}
+
+/// [`reported_statuses`] with paused upstream columns left out: `catching_up`
+/// only for a definition with an upstream that isn't stored `live`, down the
+/// chain. What a resume waits on (#971): an upstream that is rebuilding or
+/// paused can still rewrite its target, but one that only reads a paused
+/// column applies as usual, so a reader rebuilt over it is exactly as current
+/// as a `live` reader of it (#1208), and a column paused for good mustn't
+/// hold the resume.
+pub(crate) async fn reported_statuses_ignoring_column_pauses(
+    client: &impl GenericClient,
+) -> Result<HashMap<i64, TransformStatus>, CatalogError> {
+    Ok(derive_reported(&status_nodes(client).await?).0)
+}
+
+/// Every definition as [`derive_reported`] sees it, without paused columns.
+async fn status_nodes(client: &impl GenericClient) -> Result<Vec<StatusNode>, CatalogError> {
     let relationships: HashMap<(String, String, String), String> = client
         .query(
             "select from_schema, from_table, name, to_schema || '.' || to_table \
@@ -1721,9 +1761,60 @@ pub(crate) async fn reported_statuses(
             target: row.get(1),
             status,
             reads,
+            paused_columns: Vec::new(),
         });
     }
-    Ok(derive_reported_statuses(&nodes))
+    Ok(nodes)
+}
+
+/// Records on each `live` node the paused upstream columns it reads (#1208,
+/// [`reported_statuses_with_causes`]), each once.
+async fn add_paused_column_causes(
+    client: &impl GenericClient,
+    nodes: &mut [StatusNode],
+) -> Result<(), CatalogError> {
+    let paused: Vec<(String, String)> = client
+        .query(
+            "select transform_table, column_name from column_status \
+             order by transform_table, column_name",
+            &[],
+        )
+        .await?
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    if !paused.is_empty() {
+        let paused_set: HashSet<&(String, String)> = paused.iter().collect();
+        let by_bare: HashMap<String, usize> = nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| {
+                (
+                    n.target
+                        .split_once('.')
+                        .map_or(n.target.clone(), |(_, t)| t.to_string()),
+                    i,
+                )
+            })
+            .collect();
+        for (table, column) in &paused {
+            for dep in column_dependents_any_keyspace(client, table, column).await? {
+                if paused_set.contains(&dep) {
+                    continue;
+                }
+                let cause = format!("{table}.{column}");
+                // A reader with several fields (or a `GROUP BY` key) reading
+                // the column is listed once per field.
+                if let Some(&i) = by_bare.get(&dep.0)
+                    && nodes[i].status == TransformStatus::Live
+                    && !nodes[i].paused_columns.contains(&cause)
+                {
+                    nodes[i].paused_columns.push(cause);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// One definition as [`derive_reported_statuses`] sees it.
@@ -1735,6 +1826,9 @@ struct StatusNode {
     status: TransformStatus,
     /// Every table it reads, qualified (needed only when `status` is `live`).
     reads: Vec<String>,
+    /// The paused columns (`target.column`) of upstream 1-1 targets it
+    /// reads (#1208), only for a `live` definition.
+    paused_columns: Vec<String>,
 }
 
 /// [`reported_statuses`]' rule over the loaded catalog: starting from every
@@ -1743,7 +1837,19 @@ struct StatusNode {
 /// nothing moves. Each round only ever moves `live` to `catching_up`, so it
 /// ends within one round per definition, and a cycle (which the catalog
 /// can't hold anyway) can't make it loop.
+#[cfg(test)]
 fn derive_reported_statuses(nodes: &[StatusNode]) -> HashMap<i64, TransformStatus> {
+    derive_reported(nodes).0
+}
+
+/// [`derive_reported_statuses`], and the paused upstream columns behind each
+/// `catching_up` it reports (#1208): a `live` definition reading a paused
+/// column of an upstream target reports `catching_up`, and so does its
+/// reader in turn. A definition's causes are its own paused columns and
+/// those of every upstream that isn't reported `live`.
+fn derive_reported(
+    nodes: &[StatusNode],
+) -> (HashMap<i64, TransformStatus>, HashMap<i64, Vec<String>>) {
     let owner: HashMap<&str, i64> = nodes.iter().map(|n| (n.target.as_str(), n.id)).collect();
     let mut reported: HashMap<i64, TransformStatus> =
         nodes.iter().map(|n| (n.id, n.status)).collect();
@@ -1758,15 +1864,49 @@ fn derive_reported_statuses(nodes: &[StatusNode]) -> HashMap<i64, TransformStatu
                     .get(table.as_str())
                     .is_some_and(|up| *up != node.id && reported[up] != TransformStatus::Live)
             });
-            if upstream_not_live {
+            if upstream_not_live || !node.paused_columns.is_empty() {
                 reported.insert(node.id, TransformStatus::CatchingUp);
                 moved = true;
             }
         }
         if !moved {
-            return reported;
+            break;
         }
     }
+    let mut causes: HashMap<i64, Vec<String>> = nodes
+        .iter()
+        .filter(|n| !n.paused_columns.is_empty())
+        .map(|n| (n.id, n.paused_columns.clone()))
+        .collect();
+    loop {
+        let mut grew = false;
+        for node in nodes {
+            for table in &node.reads {
+                let Some(&up) = owner.get(table.as_str()) else {
+                    continue;
+                };
+                if up == node.id || reported[&up] == TransformStatus::Live {
+                    continue;
+                }
+                let inherited = causes.get(&up).cloned().unwrap_or_default();
+                let mine = causes.entry(node.id).or_default();
+                for cause in inherited {
+                    if !mine.contains(&cause) {
+                        mine.push(cause);
+                        grew = true;
+                    }
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    causes.retain(|_, v| !v.is_empty());
+    for v in causes.values_mut() {
+        v.sort_unstable();
+    }
+    (reported, causes)
 }
 
 /// Refuses (with [`CatalogError::TransformNotLive`]) a new definition whose
@@ -2289,6 +2429,39 @@ pub async fn alter_transform(
                 ty = retype.pg_type,
                 message = db.message(),
                 detail = db.detail().map(|d| format!(" ({d})")).unwrap_or_default(),
+            )));
+        }
+    }
+
+    // #1188: the re-types above are in this transaction, so define's own
+    // validation of each definition reading a re-typed column sees them. A
+    // reader define would now refuse (a group-basis `SUM` over a column that
+    // is no longer `numeric(p,s)`, say) refuses the whole edit, which rolls
+    // back: nothing changes and nothing pauses.
+    if !retypes.is_empty() {
+        let columns: Vec<String> = retypes.iter().map(|r| r.column.clone()).collect();
+        let refused = refused_readers(&txn, pool.schema(), &alter.target, &columns).await?;
+        if !refused.is_empty() {
+            return Err(CatalogError::UnsupportedAlter(format!(
+                "ALTER on '{target}' re-types {columns}, which {readers} would now refuse; \
+                 change or drop {them} first (Trellis refuses rather than pausing a reader): {detail}",
+                target = alter.target,
+                columns = columns
+                    .iter()
+                    .map(|c| format!("'{c}'"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                readers = refused
+                    .iter()
+                    .map(|r| format!("'{}'", r.target))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                them = if refused.len() == 1 { "it" } else { "them" },
+                detail = refused
+                    .iter()
+                    .map(|r| format!("'{}': {}", r.target, r.reason))
+                    .collect::<Vec<_>>()
+                    .join("; "),
             )));
         }
     }
@@ -3223,9 +3396,11 @@ struct ColumnRetype {
 /// ADR-0015 promises "An edit never rewrites the whole target table to
 /// change one column", so:
 ///
-/// - the same type and modifier needs no change;
+/// - the same type and modifier needs no change, and neither does a string
+///   column (`text`, `varchar(n)` or `varchar`) altered to another: Trellis's
+///   copies of a string are unbounded (#1207);
 /// - a widening that changes only the catalog ([`super::key_types::alter_retypable`]:
-///   `numeric(10,2)` to `numeric`, `varchar(8)` to `varchar(20)` or `text`)
+///   `numeric(10,2)` to `numeric`)
 ///   is returned for the caller to apply in the alter's own transaction,
 ///   under the definition's row lock, before the field's values are
 ///   re-derived;
@@ -3282,6 +3457,11 @@ async fn check_alter_column_types(
         let mut described = std::collections::BTreeMap::new();
         let current = super::copies::describe(client, &mut described, current).await?;
         let wanted = super::copies::describe(client, &mut described, wanted).await?;
+        // `text` and `varchar(n)` are one family, and a copy of either is an
+        // unbounded `varchar` or `text` (#1207): nothing to change.
+        if current.ty.is_string() && wanted.ty.is_string() {
+            continue;
+        }
         if super::key_types::alter_retypable(&current.ty, &wanted.ty) {
             retypes.push(ColumnRetype {
                 column: field.name.clone(),
@@ -3292,8 +3472,7 @@ async fn check_alter_column_types(
         return Err(CatalogError::UnsupportedAlter(format!(
             "ALTER '{field}' on '{display_target}' would change its column type from \
              '{current}' to '{wanted}'; Trellis re-types a column in place only for a widening \
-             that changes just the catalog (such as numeric(10,2) to numeric, or varchar(8) to \
-             text), because Postgres would otherwise rewrite '{display_target}''s entire \
+             that changes just the catalog (such as numeric(10,2) to numeric), because Postgres would otherwise rewrite '{display_target}''s entire \
              physical table under an ACCESS EXCLUSIVE lock, blocking reads and writes to every \
              other column too, not just this one. Use DROP '{field}' followed by ADD <expr> AS \
              '{field}' instead — it already pays this same backfill cost explicitly, rather \
@@ -3920,8 +4099,8 @@ async fn create_definition_inner(
     // the build this registration starts leaves it out rather than writing
     // the column's frozen value. The source's fence above is the one a pause
     // of this definition's fields bumps, so this takes no second one. Only a
-    // 1-1 plan holds a paused column out (`docs/known-correctness-gaps.md`, an
-    // aggregate reading a paused column).
+    // 1-1 plan holds a paused column out; an aggregate or `JOIN` reading one
+    // reports `catching_up` instead (#1208, `reported_statuses_with_causes`).
     if matches!(def.key_space, KeySpace::OneToOne) {
         let upstreams = definition_targets_read(&*txn, &qualified_source, &relationships).await?;
         let all_fields: Vec<String> = def.fields.iter().map(|f| f.name.clone()).collect();
@@ -6072,6 +6251,11 @@ pub(crate) async fn revalidate(
             });
         }
     }
+    // #1188: the group basis's own refusals (a `SUM`/`AVG` over a numeric
+    // with no declared scale), which define makes once the table exists.
+    if let Some(shape) = crate::staging::group_basis::route(&definition.def, &source_columns) {
+        crate::staging::group_basis::check_define(txn, &shape, source).await?;
+    }
     reject_row_security(
         txn,
         schema,
@@ -7673,9 +7857,10 @@ async fn ensure_relationship_projection_in_txn(
             // unconditionally, not just when `needed_columns` is non-empty)
             // is what actually populates it, using this branch's freshly
             // created, still-empty table as its starting point.
+            let to_col_type = ddl::copy_pg_type(to_col_pg_type);
             txn.batch_execute(&format!(
                 "create table {qualified_projection} (\
-                     {to_col_ident} {to_col_pg_type} primary key, \
+                     {to_col_ident} {to_col_type} primary key, \
                      {gen_col} bigint not null default 0, \
                      {lsn_col} pg_lsn not null)",
                 gen_col = quote_ident(ddl::PROJECTION_GEN_COLUMN),
@@ -7726,6 +7911,7 @@ async fn ensure_relationship_projection_in_txn(
             continue;
         }
         let pg_type = column_type_in_txn(txn, qualified_to_table, to_table_bare, column).await?;
+        let pg_type = ddl::copy_pg_type(&pg_type);
         let col_ident = quote_ident(column);
         txn.batch_execute(&format!(
             "alter table {qualified_projection} add column if not exists {col_ident} {pg_type}"
@@ -9463,6 +9649,79 @@ pub(crate) async fn column_dependents_any_keyspace(
     column_dependents_via(client, upstream_table, upstream_column, false).await
 }
 
+/// A definition that reads a re-typed column of another's target and that
+/// define would now refuse ([`refused_readers`]).
+#[derive(Debug)]
+pub(crate) struct RefusedReader {
+    pub id: i64,
+    /// The reader's bare target name.
+    pub target: String,
+    /// What define's validation of it refuses.
+    pub reason: CatalogError,
+}
+
+/// Every definition that reads one of `columns` of the target `upstream`
+/// (bare name) and that define's whole validation ([`revalidate`]) now
+/// refuses, as the schema stands in `txn` (#1188). The caller has re-typed
+/// the columns in `txn`, so the validation sees the new types. A reader
+/// that stays valid isn't returned; a database error propagates.
+pub(crate) async fn refused_readers(
+    txn: &tokio_postgres::Transaction<'_>,
+    schema: &str,
+    upstream: &str,
+    columns: &[String],
+) -> Result<Vec<RefusedReader>, tokio_postgres::Error> {
+    let mut refused = Vec::new();
+    for (id, target) in column_readers(txn, upstream, columns).await? {
+        let checked = match definition_by_id_in(txn, id).await {
+            Ok(Some(definition)) => revalidate(txn, schema, &definition).await.map(|_| ()),
+            Ok(None) => continue,
+            Err(err) => Err(err),
+        };
+        match checked {
+            Ok(()) => {}
+            Err(CatalogError::Db(err)) => return Err(err),
+            Err(reason) => refused.push(RefusedReader { id, target, reason }),
+        }
+    }
+    Ok(refused)
+}
+
+/// The id and bare target of every definition that reads one of `columns`
+/// of the target `upstream` (bare name), in id order: the definitions
+/// [`refused_readers`] validates. Which definitions read a column doesn't
+/// depend on its type, so a caller can read them before it re-types it.
+pub(crate) async fn column_readers(
+    client: &impl GenericClient,
+    upstream: &str,
+    columns: &[String],
+) -> Result<Vec<(i64, String)>, tokio_postgres::Error> {
+    let mut targets: Vec<String> = Vec::new();
+    for column in columns {
+        match column_dependents_any_keyspace(client, upstream, column).await {
+            Ok(deps) => targets.extend(deps.into_iter().map(|(target, _)| target)),
+            Err(CatalogError::Db(err)) => return Err(err),
+            Err(_) => {}
+        }
+    }
+    targets.sort();
+    targets.dedup();
+    let mut readers = Vec::new();
+    for target in targets {
+        if let Some(row) = client
+            .query_opt(
+                "select id from transform_definitions where split_part(target_table, '.', 2) = $1",
+                &[&target],
+            )
+            .await?
+        {
+            readers.push((row.get(0), target));
+        }
+    }
+    readers.sort();
+    Ok(readers)
+}
+
 async fn column_dependents_via(
     client: &impl GenericClient,
     upstream_table: &str,
@@ -10513,7 +10772,7 @@ mod value_type_codec_tests {
 
 #[cfg(test)]
 mod reported_status_tests {
-    use super::{StatusNode, TransformStatus, derive_reported_statuses};
+    use super::{StatusNode, TransformStatus, derive_reported, derive_reported_statuses};
 
     fn node(id: i64, target: &str, status: TransformStatus, reads: &[&str]) -> StatusNode {
         StatusNode {
@@ -10521,6 +10780,7 @@ mod reported_status_tests {
             target: target.to_string(),
             status,
             reads: reads.iter().map(|t| t.to_string()).collect(),
+            paused_columns: Vec::new(),
         }
     }
 
@@ -10580,6 +10840,26 @@ mod reported_status_tests {
         assert_eq!(reported[&1], CatchingUp);
         assert_eq!(reported[&2], CatchingUp);
         assert_eq!(reported[&3], CatchingUp);
+    }
+
+    #[test]
+    fn a_reader_of_a_paused_column_reports_catching_up_and_names_it_down_the_chain() {
+        use TransformStatus::*;
+        let mut reader = node(2, "public.agg", Live, &["public.t"]);
+        reader.paused_columns = vec!["t.col".to_string()];
+        let (reported, causes) = derive_reported(&[
+            node(1, "public.t", Live, &["public.s"]),
+            reader,
+            node(3, "public.chained", Live, &["public.agg"]),
+            node(4, "public.unrelated", Live, &["public.t"]),
+        ]);
+        assert_eq!(reported[&1], Live, "the paused column's own definition");
+        assert_eq!(reported[&2], CatchingUp);
+        assert_eq!(reported[&3], CatchingUp, "a reader of the reader");
+        assert_eq!(reported[&4], Live, "reads no paused column");
+        assert_eq!(causes[&2], ["t.col"]);
+        assert_eq!(causes[&3], ["t.col"], "names the root cause");
+        assert!(!causes.contains_key(&4));
     }
 
     #[test]

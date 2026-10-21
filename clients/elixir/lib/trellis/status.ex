@@ -59,6 +59,14 @@ defmodule Trellis.Status do
   is listed, and `:live` again once they are re-derived and folded into its
   target. A paused or quarantined transform lists none.
 
+  `paused_upstream_columns` names the paused columns of upstream 1-1 targets
+  that make a `:live` transform report `:catching_up`, each as
+  `"target.column"` (`[]` when none). A column is paused when its fuse
+  tripped or `PAUSE TRANSFORM t.col` froze it; an aggregate or `JOIN`
+  reading it keeps applying over its frozen values, so it is stale against
+  the source. Nothing is paused or rebuilt: resuming the column writes
+  through to the reader and it reads `:live` again.
+
   Every process sees them, whichever one runs the staging worker.
   """
 
@@ -75,7 +83,8 @@ defmodule Trellis.Status do
           drain_failure: Trellis.DrainFailure.t() | nil,
           unindexed_joins: [Trellis.UnindexedJoin.t()],
           source_index_gaps: [Trellis.SourceIndexGap.t()],
-          correcting: [Trellis.CorrectingNode.t()]
+          correcting: [Trellis.CorrectingNode.t()],
+          paused_upstream_columns: [String.t()]
         }
 
   @enforce_keys [
@@ -87,7 +96,8 @@ defmodule Trellis.Status do
     :drain_failure,
     :unindexed_joins,
     :source_index_gaps,
-    :correcting
+    :correcting,
+    :paused_upstream_columns
   ]
   defstruct @enforce_keys
 
@@ -101,7 +111,8 @@ defmodule Trellis.Status do
         drain_failure: drain_failure,
         unindexed_joins: unindexed_joins,
         source_index_gaps: source_index_gaps,
-        correcting: correcting
+        correcting: correcting,
+        paused_upstream_columns: paused_upstream_columns
       }) do
     %__MODULE__{
       status: status,
@@ -112,7 +123,8 @@ defmodule Trellis.Status do
       drain_failure: drain_failure && Trellis.DrainFailure.from_native(drain_failure),
       unindexed_joins: Enum.map(unindexed_joins, &Trellis.UnindexedJoin.from_native/1),
       source_index_gaps: Enum.map(source_index_gaps, &Trellis.SourceIndexGap.from_native/1),
-      correcting: Enum.map(correcting, &Trellis.CorrectingNode.from_native/1)
+      correcting: Enum.map(correcting, &Trellis.CorrectingNode.from_native/1),
+      paused_upstream_columns: paused_upstream_columns
     }
   end
 end

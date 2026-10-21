@@ -515,6 +515,14 @@ dropped since, or one an opted-out definition lacks, as `source_index_gaps`
 pauses nothing, but `self_check` refuses a definition that did not opt out. See
 [Supported sources and targets](transforms.md#supported-sources-and-targets).
 
+### A reader of a paused column
+
+A `live` definition reading a paused column of an upstream 1-1 target (its fuse
+tripped, or `PAUSE TRANSFORM t.col`) reports `catching_up`, and `status(target)`
+names the column or columns as `paused_upstream_columns`, each `target.column`
+(`PlainDefinitionStatus::paused_upstream_columns` in `trellis-embed`). Nothing is
+paused: resuming the column writes through to the reader and it reads `live` again.
+
 ### Partitions under correction
 
 `status(target)` reports, as `correcting`, each partition of a partitioned

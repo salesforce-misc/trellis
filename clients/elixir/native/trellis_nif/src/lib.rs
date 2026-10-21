@@ -226,6 +226,7 @@ struct StatusTerm {
     unindexed_joins: Vec<UnindexedJoinTerm>,
     source_index_gaps: Vec<SourceIndexGapTerm>,
     correcting: Vec<CorrectingNodeTerm>,
+    paused_upstream_columns: Vec<String>,
 }
 
 /// A node of a partitioned source a definition is being corrected for, as
@@ -1087,6 +1088,7 @@ fn status<'a>(
                     .into_iter()
                     .map(CorrectingNodeTerm::from)
                     .collect(),
+                paused_upstream_columns: status.paused_upstream_columns,
             }))
         },
     )

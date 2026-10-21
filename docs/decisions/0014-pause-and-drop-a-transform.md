@@ -242,11 +242,28 @@ re-type leaves refused, failing its own re-validation (a relationship's join col
 longer match), keeps its own error and records no cause. So does one already paused for
 another reason, by the operator or by quarantine, and the pass leaves it alone.
 
+A resume that re-types a column of a definition's target also re-validates, in the
+same transaction, every definition that reads that column, with define's whole
+validation against the schema as the re-type leaves it (a group-basis `SUM` over a
+column that is no longer `numeric(p,s)`, a `JOIN` key pair that no longer matches). A
+reader define would now refuse is paused there, with the refusal and the upstream
+re-type as its `capture_failure` and no cause: its own `RESUME` re-validates and
+refuses until the operator redefines it. A reader that stays valid is untouched by this
+step. The capture pass never sees such a re-type, because a target is not captured, so
+nothing else re-validates the reader. The re-type's transaction locks the definition row
+of every reader of the re-typed columns, in id order, before it takes `ACCESS EXCLUSIVE`
+on the target: a definition's row comes before a table, as in a build's start and an
+`ALTER TRANSFORM`, so a transaction that holds a reader's row and then reads the target
+is never deadlocked by the re-type, and a wait for a row holds nothing on the target. A
+wait that reaches the re-type's lock timeout is retried by the next pass.
+
 A resume never starts a rebuild ahead of its upstream. A definition's upstreams are the
 definitions in the instance whose targets it reads: its source, a `JOIN`'s joined table, or
 a relationship's to-side. An upstream is `live` as the operator reads it: one that is
 itself running but reads a definition that isn't `live` reports `catching_up`, since its
-target may still change under a rebuild above it. A `RESUME` of a definition with an
+target may still change under a rebuild above it. One that reports `catching_up` only
+because it reads a paused column of an upstream 1-1 target (ADR-0003, "Propagation") keeps
+applying as usual, so it counts as `live` here. A `RESUME` of a definition with an
 upstream that isn't `live` (paused, quarantined, rebuilding or catching up) is accepted
 and returns at once, before any re-validation: the definition stays paused with a resume
 request, and its `capture_failure` says it is waiting for that upstream to be `live`. This holds whether it
@@ -272,13 +289,14 @@ pause of a definition already frozen.
 
 Outside a resume, Trellis re-types a column on its own in one case: when every column
 of a table it created that the source widened widened by changing only the catalog.
-Exactly four widenings qualify: `varchar(n)` to a longer `varchar(m)`, `varchar(n)` or
-`varchar` to `text`, `varchar(n)` to `varchar`, and `numeric(p,s)` to a larger
-precision at the same scale. Postgres rewrites nothing for them, changes no value and
-keeps every index. The capture pass then re-types that table's columns itself, one
-table per transaction, under the same lock timeout as a resume's re-type, and nothing
-pauses or rebuilds, a `varchar` key's copy included. The pass records the key's new
-type, as a resume would. Its `ALTER` is the transaction's first statement, so it
+Exactly one widening qualifies: `numeric(p,s)` to a larger precision at the same scale.
+Postgres rewrites nothing for it, changes no value and keeps every index. The capture
+pass then re-types that table's columns itself, one table per transaction, under the
+same lock timeout as a resume's re-type, and nothing pauses or rebuilds. A string
+column needs none: every column Trellis creates from a `varchar(n)` is an unbounded
+`varchar` with the source column's collation, which holds whatever the source holds
+after any change of its bound, and `text` and `varchar(n)` are one family wherever a
+copy and its source column are compared. Its `ALTER` is the transaction's first statement, so it
 waits for the table's `ACCESS EXCLUSIVE` holding no other lock, and once it has the
 table it takes the locks of the table's own indexes and TOAST table, and of any
 object of the application's that depends on the column, such as a foreign key that
@@ -288,18 +306,13 @@ timeout. A cycle through an application object ends in a deadlock error, which c
 as transient. A table whose re-type fails transiently (its lock not got
 in time, a deadlock, a statement timeout) is left as it is, nothing pauses, and the
 next pass tries again. A table where some widened column needs a rewrite pauses its
-definitions as above, and so does one whose re-type fails otherwise while some column
-there outgrew its type. One whose columns all still hold every value (`varchar` to
-`text`) keeps its old types and pauses nothing, since its writes still succeed. The
+definitions as above, and so does one whose re-type fails otherwise. The
 worker doesn't retry a re-type that failed otherwise until the source's type changes
 again, a definition with a column on the table is defined or dropped, or the worker
 restarts, so it doesn't take the table's lock every pass.
 
-A value written between the source's `ALTER` and that re-type fails its write (`22001`
-or `22003`), and its key may be held. One whose characters past the old `varchar`
-length are all spaces is stored truncated instead, and stays so
-([known correctness gaps — A space-padded value truncated after a `varchar` widening](../known-correctness-gaps.md#a-space-padded-value-truncated-after-a-varchar-widening)).
-The re-type's transaction records a release request for each definition with a column
+A value written between the source's `ALTER` and that re-type fails its write (`22003`),
+and its key may be held. The re-type's transaction records a release request for each definition with a column
 on the table (`retype_releases`).
 After the pass, the staging worker releases each key such a definition holds whose
 failure had that SQLSTATE, recorded on its `poison` row, one key at a time through the

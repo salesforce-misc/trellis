@@ -267,7 +267,7 @@ pub(crate) fn is_insufficient_privilege(err: &(dyn std::error::Error + 'static))
 /// The SQLSTATE of the first [`tokio_postgres::Error`] on `err`'s
 /// [`std::error::Error::source`] chain, if it has one: what `poison.sqlstate`
 /// records for a held key (#824), so [`release_retyped_keys`] can tell a
-/// value that didn't fit a column (`22001`, `22003`) from any other failure.
+/// value that didn't fit a column (`22003`) from any other failure.
 pub(crate) fn sqlstate_of(err: &(dyn std::error::Error + 'static)) -> Option<String> {
     let mut link: Option<&(dyn std::error::Error + 'static)> = Some(err);
     while let Some(err) = link {
@@ -4232,9 +4232,11 @@ async fn upstream_not_live(
     // `live` as the operator reads it (`catalog::reported_statuses`, #497):
     // an upstream stored `live` that reads one that isn't reports
     // `catching_up`, and its target may still change under a rebuild above
-    // it. Derived only when every upstream is stored `live`.
+    // it. Derived only when every upstream is stored `live`. An upstream that
+    // reports `catching_up` only for a paused column it reads keeps applying,
+    // so it doesn't hold the resume (#1208).
     let reported = if upstreams.iter().all(|row| row.get::<_, &str>(3) == live) {
-        Some(catalog::reported_statuses(client).await?)
+        Some(catalog::reported_statuses_ignoring_column_pauses(client).await?)
     } else {
         None
     };
@@ -5062,9 +5064,15 @@ async fn finish_requested_resume(
     for (sql, labels, columns) in statements {
         let txn = client.transaction().await?;
         crate::locks::set_local_lock_timeout(&txn, RETYPE_LOCK_TIMEOUT).await?;
-        match txn.batch_execute(&sql).await {
+        let retyped_now = async {
+            lock_column_readers(&txn, &columns).await?;
+            txn.batch_execute(&sql).await?;
+            record_retype_causes(&txn, id, &columns).await?;
+            pause_refused_readers(&txn, schema, &columns).await
+        }
+        .await;
+        match retyped_now {
             Ok(()) => {
-                record_retype_causes(&txn, id, &columns).await?;
                 txn.commit().await?;
                 crate::instance_log::info!(transform_id = id, copies = ?labels, "re-typed copies for a resume");
                 retyped.extend(labels);
@@ -5210,6 +5218,98 @@ async fn record_retype_causes(
             &[&c.table, &c.column, &id, &c.old_type, &c.new_type],
         )
         .await?;
+    }
+    Ok(())
+}
+
+/// Locks the definition row of every definition that reads one of
+/// `columns` (`for no key update`, in id order), before the re-type takes
+/// `ACCESS EXCLUSIVE` on the target: [`pause_refused_readers`] may pause
+/// any of them once the re-type ran. A definition's row comes before a
+/// table lock, as elsewhere (a build's start and an `ALTER TRANSFORM` lock
+/// the definition row and then read or re-type a table), so a
+/// transaction holding a reader's row and reading the target never waits
+/// on a re-type that waits on it. The wait for a row ends at the re-type's
+/// `lock_timeout` with nothing held on the target, and the pass retries.
+/// Locking the valid readers too keeps one of them from being edited (an
+/// `ALTER TRANSFORM` adding a `SUM`) against the old type while the re-type
+/// commits.
+async fn lock_column_readers(
+    txn: &Transaction<'_>,
+    columns: &[RetypedColumn],
+) -> Result<(), tokio_postgres::Error> {
+    let Some(first) = columns.first() else {
+        return Ok(());
+    };
+    let upstream = first.table.rsplit('.').next().unwrap_or(&first.table);
+    let names: Vec<String> = columns.iter().map(|c| c.column.clone()).collect();
+    let ids: Vec<i64> = catalog::column_readers(txn, upstream, &names)
+        .await?
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    if !ids.is_empty() {
+        txn.execute(
+            "select 1 from transform_definitions where id = any($1) order by id \
+             for no key update",
+            &[&ids],
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Pauses, in the re-type's own transaction, each definition that reads one
+/// of `columns` (re-typed by a definition's resume) and that define would
+/// now refuse (#1188), recording the refusal as its `capture_failure`. Their
+/// rows are locked before the re-type ([`lock_column_readers`]). It
+/// has no cause: the resume of the definition that re-typed the column
+/// doesn't release it, and its own resume refuses until the operator
+/// redefines it. A reader that stays valid is left to #828's cause
+/// mechanism ([`record_retype_causes`]).
+async fn pause_refused_readers(
+    txn: &Transaction<'_>,
+    schema: &str,
+    columns: &[RetypedColumn],
+) -> Result<(), tokio_postgres::Error> {
+    let Some(first) = columns.first() else {
+        return Ok(());
+    };
+    let upstream = first.table.rsplit('.').next().unwrap_or(&first.table);
+    let names: Vec<String> = columns.iter().map(|c| c.column.clone()).collect();
+    let refused = catalog::refused_readers(txn, schema, upstream, &names).await?;
+    for reader in refused {
+        let retyped: Vec<String> = columns
+            .iter()
+            .map(|c| {
+                format!(
+                    "{}.{} from {} to {}",
+                    c.table, c.column, c.old_type, c.new_type
+                )
+            })
+            .collect();
+        let error = format!(
+            "{}. A resume of {} re-typed {}. A resume re-validates the definition as define \
+             would, and refuses until that is fixed. Fix it, then resume the definition to \
+             rebuild it, or drop the definition and define it again",
+            reader.reason,
+            first.table,
+            retyped.join(", "),
+        );
+        match crate::defs::lifecycle::pause_for_capture_failure(
+            txn,
+            reader.id,
+            &first.table,
+            &names,
+            &error,
+            None,
+        )
+        .await
+        {
+            Ok(_) => {}
+            Err(catalog::CatalogError::Db(err)) => return Err(err),
+            Err(_) => {}
+        }
     }
     Ok(())
 }
@@ -5803,8 +5903,8 @@ async fn release_key_as(
 
 /// Releases the keys the staging worker's in-place re-types asked for
 /// (#824, `staging::schema_change`): for each `retype_releases` row, every
-/// key its definition holds whose failure had the row's SQLSTATE (`22001`
-/// after a `varchar` was re-typed, `22003` after a `numeric` was), each
+/// key its definition holds whose failure had the row's SQLSTATE (`22003`,
+/// after a `numeric` was re-typed), each
 /// through [`release_key`], so its parked work is applied again. A key held
 /// for any other failure stays held, and so does one whose failure Trellis
 /// recorded no SQLSTATE for.

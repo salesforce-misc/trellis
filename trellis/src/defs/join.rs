@@ -289,11 +289,12 @@ impl HiddenTable {
 /// collation when that isn't the database default, so a key compares in the
 /// hidden table exactly as it does in its source.
 fn column_type(info: &JoinColumnInfo) -> String {
+    let pg_type = super::ddl::copy_pg_type(&info.pg_type);
     match info.collation.as_deref() {
         Some(collation) if collation != "default" => {
-            format!("{} collate {}", info.pg_type, quote_ident(collation))
+            format!("{pg_type} collate {}", quote_ident(collation))
         }
-        _ => info.pg_type.clone(),
+        _ => pg_type.into_owned(),
     }
 }
 

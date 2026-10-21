@@ -77,6 +77,10 @@ pub struct PlainDefinitionStatus {
     /// The nodes of its partitioned source the definition is being corrected
     /// for, oldest first; see [`DefinitionStatus::correcting`].
     pub correcting: Vec<PlainCorrectingNode>,
+    /// The paused upstream columns (`target.column`) that make a `live`
+    /// definition report `catching_up`; see
+    /// [`DefinitionStatus::paused_upstream_columns`].
+    pub paused_upstream_columns: Vec<String>,
 }
 
 /// A [`CorrectingNode`] flattened to plain data: a node of a partitioned
@@ -227,6 +231,7 @@ impl From<&DefinitionStatus> for PlainDefinitionStatus {
                 .iter()
                 .map(PlainCorrectingNode::from)
                 .collect(),
+            paused_upstream_columns: status.paused_upstream_columns.clone(),
         }
     }
 }
@@ -416,6 +421,7 @@ mod tests {
             drain_failure: None,
             source_index_gaps: Vec::new(),
             unindexed_joins: Vec::new(),
+            paused_upstream_columns: Vec::new(),
             correcting: Vec::new(),
             build_wait: None,
         };
@@ -431,6 +437,7 @@ mod tests {
                 drain_failure: None,
                 source_index_gaps: Vec::new(),
                 unindexed_joins: Vec::new(),
+                paused_upstream_columns: Vec::new(),
                 correcting: Vec::new(),
             }
         );
@@ -453,6 +460,7 @@ mod tests {
             drain_failure: None,
             source_index_gaps: Vec::new(),
             unindexed_joins: Vec::new(),
+            paused_upstream_columns: Vec::new(),
             correcting: Vec::new(),
             build_wait: None,
         };
@@ -464,6 +472,27 @@ mod tests {
                 oldest_poisoned_at_micros: 1_727_222_400_654_321,
             })
         );
+    }
+
+    #[test]
+    fn paused_upstream_columns_cross_as_plain_strings() {
+        let status = DefinitionStatus {
+            join: None,
+            status: TransformStatus::CatchingUp,
+            backfill_failure: None,
+            capture_wait: None,
+            capture_failure: None,
+            held_keys: None,
+            drain_failure: None,
+            source_index_gaps: Vec::new(),
+            unindexed_joins: Vec::new(),
+            correcting: Vec::new(),
+            paused_upstream_columns: vec!["t.total".to_string()],
+            build_wait: None,
+        };
+        let plain = PlainDefinitionStatus::from(&status);
+        assert_eq!(plain.status, "catching_up");
+        assert_eq!(plain.paused_upstream_columns, ["t.total"]);
     }
 
     #[test]
@@ -483,6 +512,7 @@ mod tests {
                 column: "customer_id".to_string(),
             }],
             correcting: Vec::new(),
+            paused_upstream_columns: Vec::new(),
             build_wait: None,
         };
 
@@ -509,6 +539,7 @@ mod tests {
             drain_failure: None,
             source_index_gaps: Vec::new(),
             unindexed_joins: Vec::new(),
+            paused_upstream_columns: Vec::new(),
             correcting: vec![
                 CorrectingNode {
                     node: "public.items_p1".to_string(),
@@ -565,6 +596,7 @@ mod tests {
             }),
             source_index_gaps: Vec::new(),
             unindexed_joins: Vec::new(),
+            paused_upstream_columns: Vec::new(),
             correcting: Vec::new(),
             build_wait: None,
         };
@@ -600,6 +632,7 @@ mod tests {
             drain_failure: None,
             source_index_gaps: Vec::new(),
             unindexed_joins: Vec::new(),
+            paused_upstream_columns: Vec::new(),
             correcting: Vec::new(),
             build_wait: None,
         };
@@ -620,6 +653,7 @@ mod tests {
                 drain_failure: None,
                 source_index_gaps: Vec::new(),
                 unindexed_joins: Vec::new(),
+                paused_upstream_columns: Vec::new(),
                 correcting: Vec::new(),
             }
         );
@@ -651,6 +685,7 @@ mod tests {
             drain_failure: None,
             source_index_gaps: Vec::new(),
             unindexed_joins: Vec::new(),
+            paused_upstream_columns: Vec::new(),
             correcting: Vec::new(),
             build_wait: None,
         };

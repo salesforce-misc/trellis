@@ -1,8 +1,8 @@
 //! A live `JOIN` target across a schema change of either table (#1110 J5,
-//! ADR-0019): a widening that changes only the catalog is applied to the
-//! target and the hidden tables in place by the staging worker's pass, and
-//! the keys a too-long value held before the pass are released and
-//! recomputed through the `JOIN`'s release.
+//! ADR-0019): its copies of a `varchar(n)` column are unbounded (#1207), so a
+//! widening needs no re-type and no value waits for the staging worker's
+//! pass. No table a `JOIN` or a group-basis aggregate creates holds a bounded
+//! `varchar`.
 //!
 //! The group-basis dev knob is on before the driver starts (a `JOIN`
 //! applies only behind it); the pipeline and the pass are stepped by hand
@@ -10,6 +10,8 @@
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
+#[path = "support/varchar_columns.rs"]
+mod varchar_columns;
 
 use std::time::Duration;
 
@@ -73,32 +75,6 @@ async fn column_type(d: &Driver, table: &str, column: &str) -> String {
         .get(0)
 }
 
-/// Seals what was written, evicts its one failing key at a threshold of
-/// one, then drains the rest.
-async fn hold_the_failing_key(d: &mut Driver) {
-    use trellis::staging::quarantine::{IsolationOutcome, isolate_and_evict};
-    use trellis::staging::{BucketFilter, claim, fold};
-    let seg = d.seal().await;
-    let folded = {
-        let mut conn = d.pool().get().await.expect("pool");
-        let txn = conn.transaction().await.expect("txn");
-        claim::claim(&txn, seg, "w", 1).await.expect("claim");
-        let folded = fold::fold(&txn, seg, BucketFilter::all())
-            .await
-            .expect("fold");
-        txn.commit().await.expect("commit the claim");
-        folded
-    };
-    let outcome = isolate_and_evict(d.pool(), seg, "w", drain_driver::WAKE, &folded, 1, false)
-        .await
-        .expect("isolation");
-    assert!(
-        matches!(outcome, IsolationOutcome::Evicted { evicted: 1, .. }),
-        "{outcome:?}"
-    );
-    d.drain(seg, "w").await;
-}
-
 async fn pass(d: &mut Driver) {
     let pool = d.pool().clone();
     trellis::client::reconcile_pass(
@@ -113,13 +89,15 @@ async fn pass(d: &mut Driver) {
 }
 
 /// Both `GROUP BY` columns and the `ON` pair widen from `varchar(5)` to
-/// `varchar(20)`. Values too long for the old type, written before the
-/// staging worker's pass on either table, fail their pages and are held;
-/// the pass re-types the target and `P`, `M`, `J` and `T` in place, pauses
-/// nothing, and releases the held keys, whose release recomputes their
-/// cells. Longer values written after it apply as any change does.
+/// `varchar(20)` (#1207). The target and the hidden `P`, `M`, `J` and `T`
+/// hold their copies of these columns as unbounded `varchar`, so a value
+/// the old type couldn't hold, and a value of only trailing spaces past it
+/// (which a `varchar(5)` copy would truncate into the group `'g1'`), is
+/// applied by the first page that reads it, before any pass on either
+/// table: nothing is held, the oracle agrees, and the pass that follows
+/// re-types and pauses nothing.
 #[tokio::test]
-async fn a_catalog_only_widening_of_either_table_is_retyped_in_place_on_a_live_join() {
+async fn a_widened_varchar_of_either_table_is_applied_before_any_pass_on_a_live_join() {
     let mut d = start().await;
     write(
         &d,
@@ -139,23 +117,25 @@ async fn a_catalog_only_widening_of_either_table_is_retyped_in_place_on_a_live_j
         )
         .await
         .expect("widen");
-    // One key too long for each table's old type, each alone in its batch,
-    // held at a threshold of one as the drain's isolation would after its
-    // deaths.
-    for sql in [
-        "insert into public.a values (3, 'group-three', 'k1', 3)",
-        "insert into public.b values (4, 'key-four', 'h-four-long', 40)",
-    ] {
-        write(&d, sql).await;
-        hold_the_failing_key(&mut d).await;
-    }
+    // No pass in between: a group that differs from `'g1'` only by trailing
+    // spaces, a longer group and a longer key, and a longer `h` on each table.
+    write(
+        &d,
+        "insert into public.a values (3, 'g1      ', 'k1', 3), \
+                                     (4, 'a-longer-group', 'a-longer-key', 4); \
+         insert into public.b values (3, 'a-longer-key', 'a-longer-h', 30); \
+         update public.b set h = 'h-two-longer' where id = 2",
+    )
+    .await;
+    d.settle().await;
     let held: i64 = d
         .ctl
         .query_one("select count(*) from poison_held", &[])
         .await
         .expect("held keys")
         .get(0);
-    assert_eq!(held, 2, "each value too long for the old type is held");
+    assert_eq!(held, 0, "nothing fails: the copies hold any length");
+    assert_eq!(diverged(&d).await, Vec::<String>::new());
 
     pass(&mut d).await;
     let status: String = d
@@ -167,7 +147,10 @@ async fn a_catalog_only_widening_of_either_table_is_retyped_in_place_on_a_live_j
         .await
         .expect("status")
         .get(0);
-    assert_eq!(status, "live");
+    assert_eq!(
+        status, "live",
+        "the pass has nothing to re-type or pause for"
+    );
     let id: i64 = d
         .ctl
         .query_one(
@@ -191,27 +174,74 @@ async fn a_catalog_only_widening_of_either_table_is_retyped_in_place_on_a_live_j
     ] {
         assert_eq!(
             column_type(&d, &table, column).await,
-            "character varying(20)",
+            "character varying",
             "{table}.{column}"
         );
     }
-    let held: i64 = d
-        .ctl
-        .query_one("select count(*) from poison_held", &[])
-        .await
-        .expect("held keys")
-        .get(0);
-    assert_eq!(held, 0, "the pass released every held key");
-    d.settle().await;
-    assert_eq!(diverged(&d).await, Vec::<String>::new());
-
     write(
         &d,
-        "insert into public.a values (5, 'a-longer-group', 'a-longer-key', 5); \
-         insert into public.b values (5, 'a-longer-key', 'a-longer-h', 50); \
-         update public.b set h = 'h-two-longer' where id = 2",
+        "insert into public.a values (5, 'g1       ', 'k2', 5); \
+         update public.a set x = 9 where id = 3",
     )
     .await;
     d.settle().await;
     assert_eq!(diverged(&d).await, Vec::<String>::new());
+}
+
+/// Rule 1 of #1207's decision, over the tables a `JOIN` and a group-basis
+/// aggregate create: a `JOIN` grouped by `varchar(n)` columns of both tables
+/// over a `varchar(n)` `ON` pair, another grouped by a `varchar(n)` key, and
+/// a group-basis aggregate grouped by two `varchar(n)` columns. None of
+/// their columns has a length: the targets, `P`, `M`, `J`, `T`, `agg_<id>`,
+/// and the working tables a page leaves in its session.
+#[tokio::test]
+async fn no_table_a_join_or_group_basis_creates_holds_a_bounded_varchar() {
+    let mut d = Driver::start(
+        "create table public.a (id varchar(5) primary key, g varchar(5), \
+                                k varchar(5), x integer); \
+         create table public.b (id varchar(5) primary key, k varchar(5), \
+                                h varchar(5), y integer)",
+        &[
+            ("id", ValueType::Text),
+            ("g", ValueType::Text),
+            ("k", ValueType::Text),
+            ("x", ValueType::Integer(IntWidth::Int4)),
+        ],
+        &[
+            LEFT,
+            "TRANSFORM by_id FROM public.a JOIN public.b ON a.k = b.k \
+             GROUP BY a.id SELECT a.id AS id, COUNT(*) AS n",
+            "TRANSFORM per_gk FROM public.a GROUP BY g, k \
+             SELECT g AS g, k AS k, COUNT(*) AS n, SUM(x) AS sx",
+        ],
+        &["public.a", "public.b"],
+    )
+    .await;
+    write(
+        &d,
+        "insert into public.a values ('1', 'g1', 'k1', 1), ('2', 'g2', 'k2', 2); \
+         insert into public.b values ('1', 'k1', 'h1', 10)",
+    )
+    .await;
+    d.settle().await;
+    pass(&mut d).await;
+    d.settle().await;
+
+    let columns = varchar_columns::read(&d.ctl, &["public.a", "public.b"]).await;
+    let bounded: Vec<&String> = columns.iter().filter(|c| c.contains('(')).collect();
+    assert_eq!(bounded, Vec::<&String>::new(), "{columns:?}");
+    for copy in ["public.l.g ", "public.l.h ", "public.by_id.id "] {
+        assert!(
+            columns.iter().any(|c| c.starts_with(copy)),
+            "{copy}is a copy: {columns:?}"
+        );
+    }
+    for hidden in ["_p.", "_m.", "_j.", "_t."] {
+        assert!(
+            columns
+                .iter()
+                .any(|c| c.starts_with("trellis.join_") && c.contains(hidden)),
+            "{hidden} holds copies: {columns:?}"
+        );
+    }
 }

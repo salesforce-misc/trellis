@@ -28,7 +28,7 @@ class ValuesTest < Minitest::Test
       backfill_failure: { source_table: "public.orders", attempts: 3,
                           last_error: "permission denied", next_attempt_at_micros: MICROS },
       capture_wait: nil, capture_failure: nil, held_keys: nil, drain_failure: nil,
-      unindexed_joins: [], source_index_gaps: [], correcting: []
+      unindexed_joins: [], source_index_gaps: [], correcting: [], paused_upstream_columns: []
     )
     assert_equal Trellis::Status.new(
       status: :waiting_to_backfill,
@@ -41,7 +41,7 @@ class ValuesTest < Minitest::Test
       held_keys: nil,
       drain_failure: nil,
       unindexed_joins: [], source_index_gaps: [],
-      correcting: []
+      correcting: [], paused_upstream_columns: []
     ), status
   end
 
@@ -54,7 +54,7 @@ class ValuesTest < Minitest::Test
       capture_failure: { kind: :capture, source_table: "public.lines", columns: ["qty"],
                          error: "column \"qty\" was dropped", detected_at_micros: MICROS },
       held_keys: { count: 2, oldest_poisoned_at_micros: MICROS + 2 },
-      drain_failure: nil, unindexed_joins: [], source_index_gaps: [], correcting: []
+      drain_failure: nil, unindexed_joins: [], source_index_gaps: [], correcting: [], paused_upstream_columns: []
     )
     assert_equal Trellis::Status.new(
       status: :catching_up, backfill_failure: nil,
@@ -71,7 +71,7 @@ class ValuesTest < Minitest::Test
       held_keys: Trellis::HeldKeys.new(count: 2, oldest_poisoned_at: Trellis::EpochMicros.to_time(MICROS + 2)),
       drain_failure: nil,
       unindexed_joins: [], source_index_gaps: [],
-      correcting: []
+      correcting: [], paused_upstream_columns: []
     ), status
   end
 
@@ -81,7 +81,7 @@ class ValuesTest < Minitest::Test
       drain_failure: { seg_seq: 17, tables: ["public.lines", "public.orders"],
                        error: "permission denied for function audit_hook", sqlstate: "42501",
                        since_micros: MICROS, last_seen_micros: MICROS + 1, attempts: 5 },
-      unindexed_joins: [], source_index_gaps: [], correcting: []
+      unindexed_joins: [], source_index_gaps: [], correcting: [], paused_upstream_columns: []
     )
     assert_equal Trellis::DrainFailure.new(
       seg_seq: 17, tables: ["public.lines", "public.orders"],
@@ -122,7 +122,7 @@ class ValuesTest < Minitest::Test
 
     status = Trellis::Status.from_native(
       status: :live, backfill_failure: nil, capture_wait: nil, capture_failure: nil, held_keys: nil,
-      drain_failure: nil, unindexed_joins: [join], source_index_gaps: [], correcting: []
+      drain_failure: nil, unindexed_joins: [join], source_index_gaps: [], correcting: [], paused_upstream_columns: []
     )
     assert_equal expected, status.unindexed_joins
   end
@@ -132,7 +132,7 @@ class ValuesTest < Minitest::Test
             fix: 'create index on "public"."orders" ("customer_id")' }
     status = Trellis::Status.from_native(
       status: :live, backfill_failure: nil, capture_wait: nil, capture_failure: nil, held_keys: nil,
-      drain_failure: nil, unindexed_joins: [], source_index_gaps: [gap], correcting: []
+      drain_failure: nil, unindexed_joins: [], source_index_gaps: [gap], correcting: [], paused_upstream_columns: []
     )
     assert_equal [Trellis::SourceIndexGap.new(**gap)], status.source_index_gaps
   end
@@ -142,7 +142,8 @@ class ValuesTest < Minitest::Test
       status: :backfilling, backfill_failure: nil, capture_wait: nil, capture_failure: nil,
       held_keys: nil, drain_failure: nil, unindexed_joins: [], source_index_gaps: [],
       correcting: [{ node: "public.items_p1", since_micros: MICROS, keys_remaining: 5 },
-                   { node: "public.items_p2", since_micros: MICROS + 1, keys_remaining: nil }]
+                   { node: "public.items_p2", since_micros: MICROS + 1, keys_remaining: nil }],
+      paused_upstream_columns: []
     )
     assert_equal :backfilling, status.status
     assert_equal [
@@ -151,6 +152,16 @@ class ValuesTest < Minitest::Test
       Trellis::CorrectingNode.new(node: "public.items_p2", since: Trellis::EpochMicros.to_time(MICROS + 1),
                                   keys_remaining: nil)
     ], status.correcting
+  end
+
+  def test_the_paused_upstream_columns_of_a_reader_are_kept_as_strings
+    status = Trellis::Status.from_native(
+      status: :catching_up, backfill_failure: nil, capture_wait: nil, capture_failure: nil,
+      held_keys: nil, drain_failure: nil, unindexed_joins: [], source_index_gaps: [],
+      correcting: [], paused_upstream_columns: ["t.total"]
+    )
+    assert_equal :catching_up, status.status
+    assert_equal ["t.total"], status.paused_upstream_columns
   end
 
   def test_a_definition_summarys_backfill_failure_becomes_a_backfill_failure

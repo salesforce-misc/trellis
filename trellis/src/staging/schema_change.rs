@@ -541,9 +541,9 @@ pub(crate) async fn pause_readers_in_hierarchy(
 ///    ([`crate::defs::copies::CopyState::outgrown`]): `integer` to `bigint`
 ///    under a 1-1 target's key, a `SUM`, a `MIN` or a calculated field,
 ///    `real` to `double precision` under a passthrough. A table whose every
-///    such column widened by changing only the catalog (`varchar(50)` to
-///    `text` under a passthrough or a to-one projection's column) is
-///    re-typed in place instead, and pauses nothing ([`retype_in_place`],
+///    such column widened by changing only the catalog (`numeric(10,2)` to
+///    `numeric(12,2)` under a passthrough or a to-one projection's column)
+///    is re-typed in place instead, and pauses nothing ([`retype_in_place`],
 ///    #824).
 ///
 /// The types the third check compares against are those recorded in
@@ -1166,9 +1166,8 @@ struct Checked {
 
 /// Re-types each table Trellis created whose every widened column, across
 /// all of `checked`, widened by changing only the catalog
-/// ([`copies::CopyState::catalog_only`]): `varchar(n)` to a longer
-/// `varchar`, `text` or an unbounded `varchar`, or `numeric(p,s)` to more
-/// precision at the same scale (#824). A table where some column also
+/// ([`copies::CopyState::catalog_only`]): `numeric(p,s)` to more precision
+/// at the same scale (#824). A table where some column also
 /// outgrew its type by a widening that rewrites (`integer` to `bigint`) is
 /// left to the pause and its resume, which re-type all of it. A drifted
 /// column that wasn't widened (a narrowing, another type family) is left
@@ -1186,8 +1185,8 @@ struct Checked {
 /// - A table it re-types asks, in the same transaction, for the release of
 ///   each owning definition's keys held for a value its old types couldn't
 ///   hold (`retype_releases`, released by
-///   `staging::quarantine::release_retyped_keys` after the pass): `22001`
-///   for a `varchar`, `22003` for a `numeric`. A definition owns the table
+///   `staging::quarantine::release_retyped_keys` after the pass): `22003`.
+///   A definition owns the table
 ///   when it has any column there, so every reader of a shared projection
 ///   does, since a projection write that fails is charged to each.
 /// - A table whose re-type fails transiently
@@ -1197,9 +1196,7 @@ struct Checked {
 ///   again.
 /// - A table whose re-type fails otherwise (a view on the column, say) is
 ///   left to the pause when some column there outgrew its type, as a
-///   rewriting widening is. One whose columns all still hold every value
-///   (an unbounded `varchar` to `text`) pauses nothing, since its writes
-///   still succeed. Either way, the failure is remembered in this process
+///   rewriting widening is. The failure is remembered in this process
 ///   ([`FAILED_RETYPES`]), and while the table's drift asks for the same
 ///   statement for the same definitions, later passes don't try it again:
 ///   it would only take the table's lock, fail and log again every pass.
@@ -1213,12 +1210,10 @@ async fn retype_in_place(
     checked: &[Checked],
 ) -> Result<InPlace, CaptureError> {
     // Every widened column by its table, once each: a projection's columns
-    // are every reader's of the relationship. An unbounded `varchar` to
-    // `text` holds no more values, so it isn't outgrown, but it is re-typed
-    // here all the same, as a resume would.
+    // are every reader's of the relationship.
     let mut widened: BTreeMap<&str, Vec<&copies::CopyState>> = BTreeMap::new();
     for state in checked.iter().flat_map(|c| &c.states) {
-        if !state.outgrown() && !state.catalog_only() {
+        if !state.outgrown() {
             continue;
         }
         let columns = widened.entry(state.copy.table.as_str()).or_default();
@@ -1243,18 +1238,9 @@ async fn retype_in_place(
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
-        let sqlstates: Vec<String> = states
-            .iter()
-            .map(|s| {
-                if s.copy_type.ty.type_name == "pg_catalog.numeric" {
-                    "22003".to_string()
-                } else {
-                    "22001".to_string()
-                }
-            })
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
+        // A numeric overflow is the only failure a catalog-only widening
+        // makes writable that wasn't (#1207: a string column needs none).
+        let sqlstates = vec!["22003".to_string()];
         let owned: Vec<copies::CopyState> = states.iter().map(|s| (*s).clone()).collect();
         let Some((sql, labels)) = copies::retype_statements(&owned).into_iter().next() else {
             continue;
@@ -1311,16 +1297,11 @@ async fn retype_in_place(
             }
             Err(err) => {
                 txn.rollback().await?;
-                let outcome = if states.iter().any(|s| s.outgrown()) {
-                    "pausing their definitions instead"
-                } else {
-                    "leaving them as they are, since they still hold every value"
-                };
                 crate::instance_log::warn!(
                     table = %checked_table,
                     copies = ?labels,
                     error = %err.as_db_error().map(ToString::to_string).unwrap_or_else(|| err.to_string()),
-                    "couldn't re-type Trellis's columns in place; {outcome}"
+                    "couldn't re-type Trellis's columns in place; pausing their definitions instead"
                 );
                 with_failed_retypes(|failed| failed.insert(key, retype));
             }
