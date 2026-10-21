@@ -269,7 +269,8 @@ async fn setup(dsn: &str, raw: &mut Client, pool: &trellis::Pool) -> Trellis {
          create type public.tone as enum ('calm', 'loud', 'brisk'); \
          create table public.items (id int primary key, tone tone, n int); \
          create table public.kinds (tone tone primary key, v int); \
-         create table public.notes (id int primary key, item_id int);",
+         create table public.notes (id int primary key, item_id int); \
+         create index on public.items (tone); create index on public.notes (item_id);",
     )
     .await
     .expect("seed");
@@ -284,6 +285,9 @@ async fn setup(dsn: &str, raw: &mut Client, pool: &trellis::Pool) -> Trellis {
         trellis.apply(text).await.expect(text);
     }
     bring_live(raw, pool, &TARGETS[..4]).await;
+    raw.batch_execute("create index on public.tone_pass (tone)")
+        .await
+        .expect("index the pass target");
     let chained = "TRANSFORM chained FROM public.tone_pass GROUP BY tone \
                    SELECT tone AS tone, COUNT(*) AS n";
     trellis.apply(chained).await.expect(chained);
@@ -591,7 +595,8 @@ async fn a_renamed_type_of_a_partitioned_source_is_followed_in_place() {
          create table public.items (g int not null, id int not null, tone tone, \
              primary key (g, id)) partition by range (g); \
          create table public.items_p0 partition of public.items for values from (0) to (8); \
-         create table public.items_p1 partition of public.items for values from (8) to (16);",
+         create table public.items_p1 partition of public.items for values from (8) to (16); \
+         create index on public.items (g, tone);",
     )
     .await
     .expect("seed");
