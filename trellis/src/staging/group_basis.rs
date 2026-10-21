@@ -2226,9 +2226,9 @@ enum RebuildRead {
     Probe,
 }
 
-/// A rebuild of a group-basis target that already has groups (ADR-0002,
-/// "An aggregate's build adds each chunk's partials under its group locks";
-/// #1101's decision), in the caller's `READ COMMITTED` transaction, which
+/// A build or rebuild of a group-basis target (ADR-0002, "An aggregate's
+/// build is one absolute write per structure"; #1101's decision), in the
+/// caller's `READ COMMITTED` transaction, which
 /// commits it: one absolute write of every group, in three statements.
 ///
 /// 1. **Enumerate** ([`GroupTargetPlan::rebuild_groups_sql`], R8): the

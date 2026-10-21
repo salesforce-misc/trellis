@@ -1,6 +1,6 @@
 //! A rebuild of a `live` group-basis aggregate whose target already has
-//! groups (#1101's decision, ADR-0002 "An aggregate's build adds each
-//! chunk's partials under its group locks"): one absolute write that locks
+//! groups (#1101's decision, ADR-0002 "An aggregate's build is one absolute
+//! write per structure"): one absolute write that locks
 //! every group the enumeration union names (R8) in key order, runs the
 //! source's `GROUP BY` from one snapshot, and replaces each group's partials
 //! and visible row, while pages keep applying.

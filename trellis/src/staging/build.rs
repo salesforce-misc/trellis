@@ -3171,8 +3171,13 @@ async fn run_plan(
             if has_rows {
                 return Err(build_error(ApplyError::GroupBasisUnsupported {
                     target: definition.target_table.clone(),
-                    what: "a fresh build or resume over a source that has rows (the JOIN build \
-                           is #1109, a partitioned source's #1101)",
+                    what: if super::join::applies(&definition.def) {
+                        "a fresh build or resume over a source that has rows (the JOIN build \
+                         is #1109)"
+                    } else {
+                        "a fresh build or resume over a partitioned source that has rows (its \
+                         per-leaf build is #1101)"
+                    },
                 }));
             }
         }
@@ -3467,12 +3472,14 @@ async fn run_group_structure(
         "set local application_name = '{CHUNK_APPLICATION_NAME}'"
     ))
     .await?;
-    // The definition row before the job row, the order `run_plan`'s batches
-    // take them in. A resume or a drop holds the definition row `for update`
-    // and then waits on the job row (`complete_resume`): taken after the
-    // claim, this lock would close a cycle with it. A resume or drop in
-    // flight makes this transaction wait holding nothing, and one that
-    // committed first shows in the claim's stale check.
+    // The definition row before the job row, the order a resume takes them
+    // in. A resume holds the definition row `for update`, clears every
+    // group's basis after a logical restore (row locks on the groups this
+    // write is about to lock), and only then waits on the job row
+    // (`complete_resume`): without this lock the two would wait on each
+    // other. A resume or drop in flight makes this transaction wait holding
+    // nothing, and one that committed first shows in the claim's stale
+    // check.
     fence.arm(&txn).await?;
     txn.execute(
         "select 1 from transform_definitions where id = $1 for key share",

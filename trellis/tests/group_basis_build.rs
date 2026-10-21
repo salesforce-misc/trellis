@@ -1,6 +1,6 @@
 //! A fresh build of a group-basis aggregate over a source that already has
-//! rows (#1101's decision, ADR-0002 "An aggregate's build adds each chunk's
-//! partials under its group locks"): the plan job, after its seam fence,
+//! rows (#1101's decision, ADR-0002 "An aggregate's build is one absolute
+//! write per structure"): the plan job, after its seam fence,
 //! runs one absolute write of every group the enumeration union names (R8)
 //! in key order, from one snapshot taken after the locks, while pages apply
 //! from the build's first moment. An unpartitioned source.
@@ -19,12 +19,13 @@ mod drain_driver;
 use std::time::Duration;
 
 use drain_driver::{Driver, Running};
-use trellis::config::DEFAULT_SCHEMA;
+use trellis::config::{Config, DEFAULT_SCHEMA};
 use trellis::defs::ValueType;
 use trellis::defs::chunk_queue;
 use trellis::integer::IntWidth;
 use trellis::staging::build::{self, WorkerOptions};
 use trellis::staging::interleave::PausePoint;
+use trellis::{Trellis, TrellisOptions};
 
 const SRC: &str = "public.src";
 const TARGET: &str = "public.agg";
@@ -558,4 +559,236 @@ async fn a_build_writes_averages_numeric_sums_and_composed_fields() {
     d.drain(undrained, "undrained").await;
     d.settle().await;
     assert_eq!(d.rows(ACTUAL).await, d.rows(EXPECTED).await);
+}
+
+/// A group only the hidden table names: a change committed before the
+/// definition (a row moving from group 5 to 6) drained after its build
+/// started and before the build ran, so its page took group 5 below zero,
+/// and its segment retired, so no old image in the ring names group 5 any
+/// more. The source has no row in it either. The build still writes it, at
+/// zero with a basis, and a later insert into it counts from there.
+#[tokio::test]
+async fn a_group_only_the_hidden_table_names_goes_to_zero() {
+    let mut d = seeded("(1, 5, 3), (2, 1, 1)").await;
+    write(&d, "update public.src set g = 6 where id = 1").await;
+    let moved = d.seal().await;
+    define(&d).await;
+    d.drain(moved, "moved").await;
+    d.settle().await;
+    assert_eq!(partials(&d, 5).await, ["(-1,-1,-3,f)"]);
+    let images = d
+        .rows(
+            "select count(*) from (select old_image from seg_0 union all \
+               select old_image from seg_1 union all \
+               select old_image from seg_2 union all \
+               select old_image from seg_3) s \
+               where old_image ->> 'g' = '5'",
+        )
+        .await;
+    assert_eq!(images, ["(0)"], "no old image names group 5");
+    run_build(&d).await;
+    assert_eq!(partials(&d, 5).await, ["(0,0,0,t)"]);
+    step(&mut d, "insert into public.src values (3, 5, 10)").await;
+    assert_eq!(partials(&d, 5).await, ["(1,1,10,t)"]);
+    assert_oracle(&mut d).await;
+}
+
+/// A plan job whose session dies frozen before its commit leaves nothing:
+/// its claim is released, it runs again whole, and the rerun is exact, a
+/// change committed while the first attempt held its locks included.
+#[tokio::test]
+async fn a_build_killed_before_its_commit_runs_again_whole() {
+    let mut d = seeded("(1, 1, 10), (2, 2, 5), (3, null, 1)").await;
+    define(&d).await;
+    let mut building = build_frozen(&d, &[PausePoint::BeforeRebuildCommit]).await;
+    let reached = building.reached(PausePoint::BeforeRebuildCommit).await;
+    write(&d, "insert into public.src values (4, 1, 1), (5, 7, 2)").await;
+    let during = d.seal().await;
+    building.kill().await;
+    d.ctl
+        .execute("select pg_terminate_backend($1)", &[&reached.backend_pid])
+        .await
+        .expect("end the build's session");
+    assert_eq!(d.rows(STATUS).await, ["(backfilling)"]);
+    assert_eq!(
+        d.rows(&format!(
+            "select count(*) from {} where __basis is not null",
+            hidden(&d).await
+        ))
+        .await,
+        ["(0)"],
+        "nothing of the first attempt committed"
+    );
+    d.ctl
+        .batch_execute("update backfill_chunks set claimed_by = null, claimed_at = null")
+        .await
+        .expect("release the dead claim");
+    run_build(&d).await;
+    d.drain(during, "during").await;
+    assert_oracle(&mut d).await;
+    assert_eq!(
+        d.rows(ACTUAL).await,
+        ["(1,11,2)", "(2,5,1)", "(7,2,1)", "(,1,1)"]
+    );
+    assert_eq!(d.deadlocks_logged(), Vec::<String>::new());
+}
+
+async fn trellis(d: &Driver) -> Trellis {
+    Trellis::connect(
+        Config::from_dsn(d.db.dsn().to_string()).expect("valid dsn"),
+        TrellisOptions::default(),
+    )
+    .await
+    .expect("connect a Trellis")
+}
+
+/// A `PAUSE` and a `RESUME` after a logical restore, issued while a
+/// resumed definition's build is frozen between its enumeration and its
+/// lock. The resume clears every group's basis, which takes the groups' row
+/// locks, before it waits on the build's job row. The build holds the
+/// definition row from before its job row, so the `PAUSE` waits for the
+/// build to commit and the resume runs after it: no deadlock, and the build
+/// that follows the resume is exact. Without that lock the resume would hold
+/// the groups the build is about to lock while it waits on the build.
+#[tokio::test]
+async fn a_pause_and_resume_wait_for_a_build_in_flight() {
+    let mut d = seeded("(1, 1, 10), (2, 2, 5)").await;
+    define(&d).await;
+    run_build(&d).await;
+    let id: i64 = d
+        .ctl
+        .query_one(
+            "select id from transform_definitions where target_table = 'public.agg'",
+            &[],
+        )
+        .await
+        .expect("the id")
+        .get(0);
+    let t = trellis(&d).await;
+    t.apply("PAUSE TRANSFORM agg").await.expect("pause");
+    write(&d, "insert into public.src values (3, 1, 1), (4, 3, 4)").await;
+    trellis::staging::quarantine::resume_transform(d.pool(), "agg")
+        .await
+        .expect("resume");
+    let pool = d.pool().clone();
+    let taken = build::start_ready_builds(&mut d.ctl, &pool, &[id])
+        .await
+        .expect("start the resumed build");
+    assert_eq!(taken, vec![id]);
+
+    let mut building = build_frozen(&d, &[PausePoint::AfterRebuildEnumerate]).await;
+    let reached = building.reached(PausePoint::AfterRebuildEnumerate).await;
+    let ctl = drain_driver::connect(d.db.dsn()).await;
+    let pool = d.pool().clone();
+    let operator = tokio::spawn(async move {
+        t.apply("PAUSE TRANSFORM agg").await.expect("pause again");
+        ctl.execute(
+            "insert into capture_failures (transform_id, source_table, columns, error, kind, restored) \
+             values ($1, 'public.src', '{}', 'restored', 'capture', true) \
+             on conflict (transform_id) do update set restored = true",
+            &[&id],
+        )
+        .await
+        .expect("mark it restored");
+        trellis::staging::quarantine::resume_transform(&pool, "agg")
+            .await
+            .expect("resume after the restore");
+    });
+    d.wait_blocked_behind(reached.backend_pid).await;
+    d.release(&mut building, PausePoint::AfterRebuildEnumerate)
+        .await;
+    building.finish().await;
+    operator.await.expect("the operator's task");
+    assert_eq!(d.deadlocks_logged(), Vec::<String>::new());
+    assert_eq!(d.rows(STATUS).await, ["(waiting_to_backfill)"]);
+    let pool = d.pool().clone();
+    build::start_ready_builds(&mut d.ctl, &pool, &[id])
+        .await
+        .expect("start the build after the restore");
+    run_build(&d).await;
+    assert_oracle(&mut d).await;
+}
+
+/// A `DROP` of a definition paused after its plan job was claimed waits for
+/// the build in flight, then removes the definition, its job and its tables.
+#[tokio::test]
+async fn a_drop_waits_for_a_build_in_flight() {
+    let d = seeded("(1, 1, 10), (2, 2, 5)").await;
+    define(&d).await;
+    let claimed = chunk_queue::claim_chunks_of(
+        &**d.pool().get().await.expect("pool"),
+        "build",
+        1,
+        &[chunk_queue::KIND_PLAN],
+    )
+    .await
+    .expect("claim the plan job");
+    assert_eq!(claimed.len(), 1);
+    let t = trellis(&d).await;
+    t.apply("PAUSE TRANSFORM agg").await.expect("pause");
+    let chunk = claimed.into_iter().next().expect("the job");
+    let mut building = d
+        .run_frozen(
+            &[(PausePoint::AfterRebuildLock, TARGET)],
+            |pool| async move {
+                build::run_claimed(&pool, &chunk, "build", &OPTIONS).await;
+                Ok(())
+            },
+        )
+        .await;
+    let reached = building.reached(PausePoint::AfterRebuildLock).await;
+    let dropping = tokio::spawn(async move {
+        t.apply("DROP TRANSFORM agg").await.expect("drop");
+    });
+    d.wait_blocked_behind(reached.backend_pid).await;
+    d.release(&mut building, PausePoint::AfterRebuildLock).await;
+    building.finish().await;
+    dropping.await.expect("the drop's task");
+    assert_eq!(d.deadlocks_logged(), Vec::<String>::new());
+    assert_eq!(
+        d.rows(
+            "select (select count(*) from transform_definitions where target_table = 'public.agg'), \
+                    (select count(*) from backfill_chunks), \
+                    to_regclass('public.agg') is null"
+        )
+        .await,
+        ["(0,0,t)"]
+    );
+}
+
+/// A plain aggregate over a partitioned source with rows fails its build
+/// and pauses, naming the partitioned source: its per-leaf fresh build is a
+/// later step. (Over an empty one it builds: `partition_group_basis.rs`.)
+#[tokio::test]
+async fn a_partitioned_source_with_rows_is_refused() {
+    trellis::dev::staging::set_group_basis(true);
+    trellis::defs::partition_tree::open_gate_for_tests();
+    let d = Driver::start(
+        "create table public.src (id integer, g integer, v integer, primary key (id, g)) \
+             partition by range (g); \
+         create table public.src_a partition of public.src for values from (0) to (10); \
+         create table public.src_b partition of public.src for values from (10) to (20); \
+         create index on public.src (g); \
+         insert into public.src values (1, 1, 10), (2, 12, 5)",
+        &columns(),
+        &[],
+        &[SRC],
+    )
+    .await;
+    let columns = columns()
+        .into_iter()
+        .map(|(n, t)| (n.to_string(), t))
+        .collect();
+    trellis::defs::install_definition(d.pool(), AGG, &columns, "public")
+        .await
+        .expect("define the aggregate");
+    trellis::intake::markers::settle_registrations(d.pool()).await;
+    assert_eq!(d.rows(STATUS).await, ["(paused)"], "the build fails");
+    let error = d
+        .rows("select string_agg(last_error, ' | ') from backfill_chunks")
+        .await;
+    assert!(
+        error.len() == 1 && error[0].contains("a partitioned source that has rows"),
+        "{error:?}"
+    );
 }

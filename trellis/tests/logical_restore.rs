@@ -257,8 +257,8 @@ async fn original(cluster: &TestCluster) -> Original {
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
     let trellis = definer(db.dsn()).await;
-    // The group-basis build admits only an empty source (#1101): the rows
-    // arrive through capture.
+    // The rows arrive through capture: the JOIN build admits only empty
+    // sources (#1109).
     raw.batch_execute(
         "create table public.s1 (id int primary key, v int); \
          create table public.g (id int primary key, grp int not null, amt int); \

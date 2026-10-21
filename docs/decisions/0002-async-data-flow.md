@@ -738,8 +738,9 @@ the build's first moment.
 - **Must:** a rebuild over a target that already has groups recomputes
   every group in place, without pausing the definition. That is
   `request_backfill`, a capture re-install, and the automatic rebuilds
-  (`capture_auto_rebuilds_total`), but not `RESUME`, which truncates and
-  builds fresh. It is one absolute write per structure (one per source, or
+  (`capture_auto_rebuilds_total`). A `RESUME` keeps the target too: its
+  build is the fresh build's write (above), over the groups the target
+  kept. It is one absolute write per structure (one per source, or
   one per partition on a partitioned source, each group routing to one
   partition under
   [ADR-0017](0017-partitioned-sources.md)'s group-key rule), each the

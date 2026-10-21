@@ -283,12 +283,11 @@ partitioned on its own id is refused.
 
 ### A build fills `P` and `M` from each source and `T` from them
 
-A build fills `P` and `M` with ADR-0002's group-basis build, each a chunk at a
-time, and each chunk carries its cells' contribution into `T` under the same
-`J` locks and in the same transaction as a page, so pages apply from the first
-chunk. In the model, chunked builds of both sides were exact in every chunk
-order and against pages, recomputes and the other side's chunks, on both
-versions.
+A build fills `P` and `M` a chunk at a time, and each chunk carries its cells'
+contribution into `T` under the same `J` locks and in the same transaction as a
+page, so pages apply from the first chunk. In the model, chunked builds of both
+sides were exact in every chunk order and against pages, recomputes and the
+other side's chunks, on both versions.
 
 [OPEN: Chunked builds cost per (chunk, cell) pair, not per row: with many cells
 they were 3–4x slower than one materialized row per fact, while one `GROUP BY`
