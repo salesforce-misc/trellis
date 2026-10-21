@@ -242,6 +242,16 @@ re-type leaves refused, failing its own re-validation (a relationship's join col
 longer match), keeps its own error and records no cause. So does one already paused for
 another reason, by the operator or by quarantine, and the pass leaves it alone.
 
+A resume that re-types a column of a definition's target also re-validates, in the
+same transaction, every definition that reads that column, with define's whole
+validation against the schema as the re-type leaves it (a group-basis `SUM` over a
+column that is no longer `numeric(p,s)`, a `JOIN` key pair that no longer matches). A
+reader define would now refuse is paused there, with the refusal and the upstream
+re-type as its `capture_failure` and no cause: its own `RESUME` re-validates and
+refuses until the operator redefines it. A reader that stays valid is untouched by this
+step. The capture pass never sees such a re-type, because a target is not captured, so
+nothing else re-validates the reader.
+
 A resume never starts a rebuild ahead of its upstream. A definition's upstreams are the
 definitions in the instance whose targets it reads: its source, a `JOIN`'s joined table, or
 a relationship's to-side. An upstream is `live` as the operator reads it: one that is

@@ -5034,9 +5034,14 @@ async fn finish_requested_resume(
     for (sql, labels, columns) in statements {
         let txn = client.transaction().await?;
         crate::locks::set_local_lock_timeout(&txn, RETYPE_LOCK_TIMEOUT).await?;
-        match txn.batch_execute(&sql).await {
+        let retyped_now = async {
+            txn.batch_execute(&sql).await?;
+            record_retype_causes(&txn, id, &columns).await?;
+            pause_refused_readers(&txn, schema, &columns).await
+        }
+        .await;
+        match retyped_now {
             Ok(()) => {
-                record_retype_causes(&txn, id, &columns).await?;
                 txn.commit().await?;
                 crate::instance_log::info!(transform_id = id, copies = ?labels, "re-typed copies for a resume");
                 retyped.extend(labels);
@@ -5182,6 +5187,56 @@ async fn record_retype_causes(
             &[&c.table, &c.column, &id, &c.old_type, &c.new_type],
         )
         .await?;
+    }
+    Ok(())
+}
+
+/// Pauses, in the re-type's own transaction, each definition that reads one
+/// of `columns` (re-typed by a definition's resume) and that define would
+/// now refuse (#1188), recording the refusal as its `capture_failure`. It
+/// has no cause: the resume of the definition that re-typed the column
+/// doesn't release it, and its own resume refuses until the operator
+/// redefines it. A reader that stays valid is left to #828's cause
+/// mechanism ([`record_retype_causes`]).
+async fn pause_refused_readers(
+    txn: &Transaction<'_>,
+    schema: &str,
+    columns: &[RetypedColumn],
+) -> Result<(), tokio_postgres::Error> {
+    let Some(first) = columns.first() else {
+        return Ok(());
+    };
+    let upstream = first.table.rsplit('.').next().unwrap_or(&first.table);
+    let names: Vec<String> = columns.iter().map(|c| c.column.clone()).collect();
+    let refused = catalog::refused_readers(txn, schema, upstream, &names).await?;
+    for reader in refused {
+        let retyped: Vec<String> = columns
+            .iter()
+            .map(|c| format!("{}.{} from {} to {}", c.table, c.column, c.old_type, c.new_type))
+            .collect();
+        let error = format!(
+            "the resume of {} re-typed {}, and define would now refuse this \
+             definition: {}. Its resume refuses until it is redefined: DROP TRANSFORM {} and \
+             define it again",
+            first.table,
+            retyped.join(", "),
+            reader.reason,
+            reader.target,
+        );
+        match crate::defs::lifecycle::pause_for_capture_failure(
+            txn,
+            reader.id,
+            &first.table,
+            &names,
+            &error,
+            None,
+        )
+        .await
+        {
+            Ok(_) => {}
+            Err(catalog::CatalogError::Db(err)) => return Err(err),
+            Err(_) => {}
+        }
     }
     Ok(())
 }
