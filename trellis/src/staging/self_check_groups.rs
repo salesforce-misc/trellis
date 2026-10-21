@@ -403,15 +403,10 @@ async fn steers(
     def: &Definition,
     shape: &GroupShape,
 ) -> Result<bool, SelfCheckError> {
-    let first = shape
-        .group_cols
-        .first()
-        .map(String::as_str)
-        .unwrap_or_default();
     Keyset::index_leads_with(
         client,
         &ddl::qualified_source_table(&def.source_table),
-        first,
+        &shape.group_cols,
     )
     .await
 }

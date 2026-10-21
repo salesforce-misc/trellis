@@ -9,7 +9,7 @@
 //! | Target | Required on the source |
 //! |---|---|
 //! | 1-1 | nothing new (the primary key) |
-//! | group-basis aggregate | an index leading with the `GROUP BY` columns, in any order |
+//! | group-basis aggregate | an index leading with the `GROUP BY` columns, in `GROUP BY` order |
 //! | `JOIN` | on each side, an index leading with that side's `ON` columns, in `ON` order |
 //!
 //! An index counts when it is a btree that is valid, ready and live, with no
@@ -42,11 +42,8 @@ use crate::pool::quote_ident;
 pub struct SourceIndex {
     /// The table, qualified (`schema.table`).
     pub table: String,
-    /// The columns the index leads with.
+    /// The columns the index leads with, in order.
     pub columns: Vec<String>,
-    /// Whether the columns may come in any order (an aggregate's `GROUP BY`
-    /// set), rather than in this order (a `JOIN` side's `ON` columns).
-    pub any_order: bool,
 }
 
 impl SourceIndex {
@@ -77,8 +74,6 @@ pub struct SourceIndexGap {
     pub table: String,
     /// The columns the index should lead with.
     pub columns: Vec<String>,
-    /// Whether the columns may come in any order.
-    pub any_order: bool,
     /// Whether the definition was defined `WITHOUT SOURCE INDEX`: it runs
     /// without the index and its `self_check` walks at the per-page scan
     /// cost, rather than refusing.
@@ -98,7 +93,6 @@ impl From<&SourceIndexGap> for SourceIndex {
         SourceIndex {
             table: gap.table.clone(),
             columns: gap.columns.clone(),
-            any_order: gap.any_order,
         }
     }
 }
@@ -118,7 +112,6 @@ pub(crate) async fn gaps(
             .map(|index| SourceIndexGap {
                 table: index.table,
                 columns: index.columns,
-                any_order: index.any_order,
                 opted_out: def.without_source_index,
             })
             .collect(),
@@ -151,7 +144,6 @@ pub(crate) fn required(
             vec![SourceIndex {
                 table: source_table.to_string(),
                 columns,
-                any_order: true,
             }]
         }
         KeySpace::Join(_) => [(Side::From, Some(source_table)), (Side::Joined, join_table)]
@@ -164,7 +156,6 @@ pub(crate) fn required(
                 Some(SourceIndex {
                     table: table?.to_string(),
                     columns,
-                    any_order: false,
                 })
             })
             .collect(),
@@ -181,28 +172,15 @@ struct IndexKey {
 }
 
 /// Whether `index` meets `want`: columns' `(attnum, collation)`.
-fn meets(index: &IndexKey, want: &[(i16, u32)], any_order: bool) -> bool {
+fn meets(index: &IndexKey, want: &[(i16, u32)]) -> bool {
     let n = want.len();
     if n == 0 || index.attnums.len() < n || index.collations.len() < n {
         return false;
     }
     let leading = index.attnums.iter().zip(&index.collations).take(n);
-    if any_order {
-        let mut remaining = want.to_vec();
-        for (attnum, collation) in leading {
-            match remaining.iter().position(|w| *w == (*attnum, *collation)) {
-                Some(at) => {
-                    remaining.swap_remove(at);
-                }
-                None => return false,
-            }
-        }
-        true
-    } else {
-        leading
-            .zip(want)
-            .all(|((attnum, collation), w)| (*attnum, *collation) == *w)
-    }
+    leading
+        .zip(want)
+        .all(|((attnum, collation), w)| (*attnum, *collation) == *w)
 }
 
 /// Whether `table` has an index meeting `need`. A table or a column that no
@@ -269,7 +247,6 @@ async fn is_met(
                 collations,
             },
             &want,
-            need.any_order,
         )
     }))
 }
@@ -312,10 +289,9 @@ pub fn refusal_text(target: &str, indexes: &[SourceIndex]) -> String {
     for index in indexes {
         let _ = write!(
             text,
-            " {} has none leading with ({}){}; create one with `{}`;",
+            " {} has none leading with ({}) in that order; create one with `{}`;",
             index.table,
             index.columns.join(", "),
-            if index.any_order { " in any order" } else { "" },
             index.create_index()
         );
     }
@@ -338,20 +314,21 @@ mod tests {
     }
 
     #[test]
-    fn an_aggregate_accepts_its_columns_in_any_order() {
+    fn an_aggregate_needs_its_columns_in_group_by_order() {
         let want = [(1, 0), (2, 0)];
-        assert!(meets(&key(&[1, 2]), &want, true));
-        assert!(meets(&key(&[2, 1, 5]), &want, true));
-        assert!(!meets(&key(&[1, 5, 2]), &want, true));
-        assert!(!meets(&key(&[1]), &want, true));
-        assert!(!meets(&key(&[0, 1, 2]), &want, true));
+        assert!(meets(&key(&[1, 2]), &want));
+        assert!(meets(&key(&[1, 2, 5]), &want));
+        assert!(!meets(&key(&[2, 1, 5]), &want));
+        assert!(!meets(&key(&[1, 5, 2]), &want));
+        assert!(!meets(&key(&[1]), &want));
+        assert!(!meets(&key(&[0, 1, 2]), &want));
     }
 
     #[test]
     fn a_join_side_needs_its_columns_in_on_order() {
         let want = [(1, 0), (2, 0)];
-        assert!(meets(&key(&[1, 2, 9]), &want, false));
-        assert!(!meets(&key(&[2, 1]), &want, false));
+        assert!(meets(&key(&[1, 2, 9]), &want));
+        assert!(!meets(&key(&[2, 1]), &want));
     }
 
     #[test]
@@ -360,8 +337,8 @@ mod tests {
             attnums: vec![1],
             collations: vec![950],
         };
-        assert!(meets(&index, &[(1, 950)], true));
-        assert!(!meets(&index, &[(1, 100)], true));
+        assert!(meets(&index, &[(1, 950)]));
+        assert!(!meets(&index, &[(1, 100)]));
     }
 
     #[test]
@@ -369,7 +346,6 @@ mod tests {
         let need = SourceIndex {
             table: "public.Order Lines".to_string(),
             columns: vec!["customer id".to_string(), "kind".to_string()],
-            any_order: true,
         };
         assert_eq!(
             need.create_index(),

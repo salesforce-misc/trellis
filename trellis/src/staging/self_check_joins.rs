@@ -991,16 +991,16 @@ impl Audit<'_> {
         let steer = match part {
             Part::Target => false,
             Part::From => {
-                let first = keyset.columns()[0].name.clone();
-                Keyset::index_leads_with(client, &audit.from_table, &first).await?
+                let names: Vec<String> = keyset.columns().iter().map(|c| c.name.clone()).collect();
+                Keyset::index_leads_with(client, &audit.from_table, &names).await?
             }
             Part::Joined => {
-                let first = keyset.columns()[0].name.clone();
-                Keyset::index_leads_with(client, &audit.joined_table, &first).await?
+                let names: Vec<String> = keyset.columns().iter().map(|c| c.name.clone()).collect();
+                Keyset::index_leads_with(client, &audit.joined_table, &names).await?
             }
             Part::Matches => {
-                let first = spec::join_key(&def.def, JoinSide::Joined)[0].clone();
-                Keyset::index_leads_with(client, &audit.joined_table, &first).await?
+                let names = spec::join_key(&def.def, JoinSide::Joined);
+                Keyset::index_leads_with(client, &audit.joined_table, &names).await?
             }
         };
         keyset.set_cursor(after)?;

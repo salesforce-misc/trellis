@@ -248,12 +248,12 @@ impl Keyset {
     }
 
     /// Whether `table` (a quoted, qualified name) has a valid, complete
-    /// btree index whose first column is `column`, which can order a page of
-    /// that key.
+    /// btree index whose leading columns are `columns`, in that order, which
+    /// can order a page of that key.
     pub(super) async fn index_leads_with(
         client: &tokio_postgres::Client,
         table: &str,
-        column: &str,
+        columns: &[String],
     ) -> Result<bool, SelfCheckError> {
         Ok(client
             .query_one(
@@ -261,11 +261,15 @@ impl Keyset {
                    select 1 from pg_catalog.pg_index i \
                    join pg_catalog.pg_class c on c.oid = i.indexrelid \
                    join pg_catalog.pg_am am on am.oid = c.relam and am.amname = 'btree' \
-                   join pg_catalog.pg_attribute a \
-                     on a.attrelid = i.indrelid and a.attnum = i.indkey[0] \
                   where i.indrelid = pg_catalog.to_regclass($1) \
-                    and i.indisvalid and i.indpred is null and a.attname = $2)",
-                &[&table, &column],
+                    and i.indisvalid and i.indpred is null \
+                    and i.indnkeyatts >= cardinality($2::text[]) \
+                    and not exists ( \
+                      select 1 from unnest($2::text[]) with ordinality as u(name, n) \
+                      left join pg_catalog.pg_attribute a \
+                        on a.attrelid = i.indrelid and a.attnum = i.indkey[u.n::int - 1] \
+                      where a.attname is distinct from u.name))",
+                &[&table, &columns],
             )
             .await?
             .get(0))
