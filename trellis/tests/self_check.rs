@@ -1682,11 +1682,18 @@ async fn a_page_ends_at_the_lower_of_the_two_sides_last_keys_in_the_key_s_order(
     trellis.shutdown().await.expect("shutdown");
 }
 
-/// The lines of `explain`'s text that read a table by a sequential scan.
+/// The lines of `explain`'s text that read a source or target table by a
+/// sequential scan. The ring's own (small, unindexed) tables are read by
+/// scans, to subtract what the target hasn't applied.
 fn seq_scans(explained: &str) -> Vec<&str> {
     explained
         .lines()
         .filter(|line| line.contains("Seq Scan"))
+        .filter(|line| {
+            !["seg_", "segments", "poison_held"]
+                .iter()
+                .any(|ring| line.contains(&format!("Seq Scan on {ring}")))
+        })
         .collect()
 }
 

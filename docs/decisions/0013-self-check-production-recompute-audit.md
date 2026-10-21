@@ -168,7 +168,7 @@ target at one instant, but a correctly-working target legitimately lags its sour
 CDC apply latency. A commit after the token is in the source the statement reads,
 and the target may not have applied it yet. Two comparisons handle that lag:
 
-- **Aggregate and JOIN targets compare against the source minus what the target
+- **1-1, aggregate and JOIN targets compare against the source minus what the target
   hasn't applied.** Capture writes each change's ring row in the change's own
   transaction, so under one snapshot a source's rows are exactly what its target has
   applied plus the changes the ring still holds unapplied. The same statement reads
@@ -179,17 +179,18 @@ and the target may not have applied it yet. Two comparisons handle that lag:
   weights. An image is left out where its page would refuse it: at or below its
   hidden table's truncate floor, or seen by the basis of the group or cell it lands
   in, whose absolute write already counted it. A JOIN's target partials are the
-  definition's own `JOIN … GROUP BY` over both tables' weighted rows. The
-  comparison is exact for every group with no lag window, so a divergence is
-  reported from one pass.
+  definition's own `JOIN … GROUP BY` over both tables' weighted rows. A 1-1
+  target's expected row for a key with unapplied changes is the old image of its
+  earliest one (no row, for an insert), and the live source row for any other
+  key. The comparison is exact for every key and group with no lag window, so a
+  divergence is reported from one pass.
 - **Otherwise a divergence is re-checked.** A divergence is reported as real only if it
   **survives a re-check after a fresh await** — a genuine divergence is stable; a
-  convergence race resolves. This applies to every 1-1 page, and to an aggregate or
-  JOIN page when a divergence falls on a group the subtraction can't vouch for: one
+  convergence race resolves. This applies to a divergence on a key or group the subtraction can't vouch for: one
   an unapplied change with no usable image (a `Recompute`) may touch, or a held key
   whose parked origin is unknown. An unapplied op of the source that touches every
-  group (a `TRUNCATE`, a partition's truncate, a schema change) makes the whole page
-  re-check, as does any image-less unapplied change of either table for a JOIN's
+  key or group (a `TRUNCATE`, a partition's truncate, a schema change) makes the whole
+  page re-check, as does any image-less unapplied change of either table for a JOIN's
   target part.
 
 The subtraction has one trade-off: a change stuck in the ring indefinitely is
@@ -300,7 +301,8 @@ slot itself ([07](../staging-and-claiming/07-convergence-and-await.md), conditio
 target's key (a 1-1 target's, which is its source's, an aggregate's or JOIN's `GROUP BY`
 columns), so a divergence is reported per key.
 
-- **A 1-1 target** is compared row by row against its source.
+- **A 1-1 target** is compared row by row against its source, as the target has applied
+  it (see [Quiescence](#quiescence-distinguish-diverged-from-not-yet-caught-up)).
 - **An aggregate target** is compared a page of groups at a time: each group's
   hidden partials (its row count, non-null counts and `numeric` sums) against a
   `GROUP BY` of the source over the same groups, and its visible row against the

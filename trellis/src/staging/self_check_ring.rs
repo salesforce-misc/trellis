@@ -1,4 +1,4 @@
-//! The ring rows a group-basis or `JOIN` target hasn't applied yet, as
+//! The ring rows a 1-1, group-basis or `JOIN` target hasn't applied yet, as
 //! `self_check` subtracts them (#1140, ADR-0013 "Quiescence").
 //!
 //! Capture writes a change's ring row in the change's own transaction, so
@@ -10,6 +10,11 @@
 //! sign (its old image `+1`, its new image `-1`). Their aggregates are what
 //! the target has applied, in the same statement that reads the target, so
 //! a correct target compares equal whatever the ring holds.
+//!
+//! A 1-1 page ([`super::self_check`]) reads no weighted rows: a row's
+//! target holds the row as of the *old image of its key's earliest unapplied
+//! change* ([`Ring::one_to_one_ctes`]), or no row for an insert, and the live
+//! row when the key has none.
 //!
 //! "Unapplied" is a ring row of the source that
 //!
@@ -147,6 +152,55 @@ impl Ring<'_> {
                 pending = ring_row_pending_sql(slot, None),
             )
         })
+    }
+
+    /// The CTEs a 1-1 page needs of this source (ending `, `): the unapplied
+    /// rows, and `{tag}_pend`, `(__k, __i)`: for each key whose unapplied
+    /// changes can all be subtracted, the *old image* of its earliest
+    /// unapplied change (JSON `null` for an insert). A 1-1 target holds the
+    /// row as of that image, since it has applied every change before it and
+    /// none from it on. A key with an unapplied row that can't be
+    /// subtracted ([`Self::uncertain_keys_sql`]) isn't in it, and is compared
+    /// against its live source row.
+    pub(super) fn one_to_one_ctes(&self) -> String {
+        let rows = self.cte("rows");
+        let pend = self.cte("pend");
+        format!(
+            "{rows} as materialized ({rows_sql}), \
+             {pend} as materialized ( \
+                 select distinct on (__key) __key as __k, \
+                        case when jsonb_typeof(__x) = 'object' then __x -> 'old' else __o end as __i \
+                 from {rows} \
+                 where __kind = 'side' \
+                   and __key not in (select __key from {rows} where __kind <> 'side') \
+                   and __key not in (select ph.key from poison_held ph \
+                                     where ph.transform_id = {id} and ph.src_table = {src} \
+                                       and ph.origin_lsn is null) \
+                 order by __key, __lsn), ",
+            rows_sql = self.rows_sql(),
+            id = self.transform_id,
+            src = quote_literal(self.src_table),
+        )
+    }
+
+    /// The name of the CTE [`Self::one_to_one_ctes`] defines of each key's
+    /// earliest old image.
+    pub(super) fn pend_cte(&self) -> String {
+        self.cte("pend")
+    }
+
+    /// The keys (`(__k)`) of a 1-1 page the comparison can't vouch for: those
+    /// with an unapplied row that isn't subtractable, and held keys whose
+    /// parked origin is unknown.
+    pub(super) fn uncertain_keys_sql(&self) -> String {
+        format!(
+            "select __key as __k from {rows} where __kind = 'uncertain' \
+             union select ph.key from poison_held ph \
+             where ph.transform_id = {id} and ph.src_table = {src} and ph.origin_lsn is null",
+            rows = self.cte("rows"),
+            id = self.transform_id,
+            src = quote_literal(self.src_table),
+        )
     }
 
     /// The signed images of the `side` rows: `(__txid, __lsn, __sgn, __i)`,

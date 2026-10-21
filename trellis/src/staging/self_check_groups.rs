@@ -337,14 +337,6 @@ pub(crate) struct Uncertain {
 }
 
 impl Uncertain {
-    /// Every key: the 1-1 comparison, which subtracts nothing.
-    pub(crate) fn everything() -> Self {
-        Uncertain {
-            all: true,
-            keys: BTreeSet::new(),
-        }
-    }
-
     /// Whether `divergence` may be the ring's rather than the target's.
     pub(crate) fn covers(&self, divergence: &Divergence) -> bool {
         if self.all {

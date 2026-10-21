@@ -62,15 +62,14 @@
 //! under one snapshot ([`compare_once`]).
 //!
 //! A commit after the token is in the source that statement reads, and the
-//! target may not have applied it yet. An aggregate on the group basis and a
+//! target may not have applied it yet. A 1-1 target, an aggregate on the group basis and a
 //! `JOIN` target compare against the source minus the ring rows the target
 //! hasn't applied yet, read in the same statement
 //! ([`super::self_check_ring`]): capture writes a change's ring row in the
 //! change's own transaction, so that is exactly what the target has applied,
 //! and a divergence is reported from one pass. Under
 //! [`SelfCheckMode::Standard`], a divergence the comparison can't vouch for
-//! (any on a 1-1 page, or one on a group an unsubtractable ring row may
-//! touch) is reported only if it survives a re-check after a *fresh* await —
+//! (one on a key or group an unsubtractable ring row may touch) is reported only if it survives a re-check after a *fresh* await —
 //! a genuine divergence is stable; a convergence race resolves.
 //! [`SelfCheckMode::Strict`] skips the re-check: it is sound only when the
 //! caller has already stopped writes to the audited tables (so there is no
@@ -169,6 +168,7 @@ use super::error::StagingError;
 use super::holdup::{self, DrainFailure};
 use super::quarantine::{self, HeldKeys};
 use super::self_check_keyset::Keyset;
+use super::self_check_ring::Ring;
 use super::unindexed_joins::UnindexedJoin;
 
 /// One page's worth of bound for a [`check_page`] call — see the module doc
@@ -209,13 +209,23 @@ pub enum SelfCheckMode {
     /// [`SelfCheckPage::drain_failures`] entry or a held key
     /// ([`SelfCheckPage::held_keys`]) instead.
     ///
-    /// **A 1-1 target** re-checks every divergence (#1176 moves it to the
-    /// same comparison). Known, accepted limitation there: **the re-check's
+    /// **A 1-1 target** compares each row of a page against what the target
+    /// has applied of it, in the same statement that reads the target
+    /// (`super::self_check_ring`, #1176): the old image of the key's
+    /// earliest unapplied change (no row, for an insert), or the live source
+    /// row when the ring holds nothing unapplied for the key. A divergence on
+    /// a key so compared is reported from one pass. Only a divergence on a
+    /// key the comparison can't vouch for is re-checked: one with an
+    /// unapplied change that has no usable image (a `Recompute`), a held key
+    /// whose parked origin is unknown, or any key while the source has an
+    /// unapplied `TRUNCATE`, partition truncate or schema change.
+    ///
+    /// For those fallbacks, a known and accepted limitation: **the re-check's
     /// guarantee is identity stability, not value non-transience.**
     /// [`await_then_compare`] takes its watermark token and runs
     /// [`converge::await_converged`] on one connection borrowed from the
     /// pool, then [`compare_once`] runs its statement on a separate
-    /// `pool.get()` call — which may hand back a *different* connection. A
+    /// `pool.get()` call, which may hand back a *different* connection. A
     /// commit landing in that gap is visible to the source read but not yet
     /// applied to the target. Two independent passes can each catch this
     /// same lag race on the same hot `(key, column)`, with a different
@@ -225,17 +235,17 @@ pub enum SelfCheckMode {
     /// divergence even though it is still just lag.
     ///
     /// Matching by exact value instead would trade this narrow
-    /// false-positive risk for false *negatives* — a genuinely-broken column
+    /// false-positive risk for false *negatives*: a genuinely-broken column
     /// that happens to change value on every pass under active writes would
     /// then be silently suppressed, which is worse for an audit tool.
     ///
     /// In short: a [`SelfCheckOutcome::Diverged`] under `Standard` means the
-    /// target differs from what its applied changes say (aggregate and
-    /// `JOIN` targets), or "this divergence's identity was stable across two
-    /// passes" (1-1 targets, and the fallbacks above). Callers needing the
-    /// stronger guarantee on a 1-1 target should quiesce writes themselves
-    /// and use [`SelfCheckMode::Strict`], which skips the re-check (and
-    /// therefore this window) entirely.
+    /// target differs from what its applied changes say, except on the
+    /// fallbacks above, where it means "this divergence's identity was
+    /// stable across two passes". Callers needing the stronger guarantee on
+    /// those should quiesce writes themselves and use
+    /// [`SelfCheckMode::Strict`], which skips the re-check (and therefore
+    /// this window) entirely.
     Standard,
     /// Skips the re-check: a divergence found on the first pass is reported
     /// immediately. **Sound only when the caller has already stopped writes
@@ -832,9 +842,8 @@ pub(crate) async fn audit(
         });
     }
 
-    // ADR-0013: a divergence the pass couldn't vouch for (any on a 1-1
-    // page; on a group-basis or `JOIN` page, one on a key an image-less or
-    // otherwise unsubtractable ring row touches) is reported as real only if
+    // ADR-0013: a divergence the pass couldn't vouch for (one on a key an
+    // image-less or otherwise unsubtractable ring row touches) is reported as real only if
     // it survives a re-check after a fresh await. Re-run the exact same
     // bounded comparison from scratch, behind a brand-new watermark
     // token/await, and keep what reproduces.
@@ -932,8 +941,8 @@ pub async fn compare_page(
 pub struct ComparedPage {
     pub divergences: Vec<Divergence>,
     pub next_after: Option<String>,
-    /// Whether the page couldn't vouch for any key exactly: a 1-1 page, or
-    /// one whose source's ring holds an op that touches every group.
+    /// Whether the page couldn't vouch for any key exactly: its source's
+    /// ring holds an op that touches every key.
     pub uncertain_all: bool,
     /// The keys it couldn't vouch for exactly, sorted.
     pub uncertain_keys: Vec<String>,
@@ -1114,21 +1123,30 @@ async fn compare_once(
     let client = pool.get().await?;
     let mut keyset = Keyset::resolve(&client, pk).await?;
     keyset.set_cursor(scope.after.as_deref())?;
-    let sql = page_sql(def, &keyset, &comparable)?;
+    let sql = page_sql(def, pk, &keyset, &comparable)?;
     let rows = client.query(sql.as_str(), &[&scope.limit]).await?;
 
     let mut recomputed = Page::new();
     let mut persisted = Page::new();
     let mut page_end: Option<String> = None;
+    let mut uncertain = super::self_check_groups::Uncertain::default();
     for row in &rows {
-        let is_recomputed = row.get::<_, i32>(0) == 1;
+        let side = row.get::<_, i32>(0);
         page_end = row.get(1);
         let key: String = row.get(2);
-        let values: Vec<Option<String>> = row.get(3);
-        if is_recomputed {
-            recomputed.insert(key, values);
-        } else {
-            persisted.insert(key, values);
+        match side {
+            3 => {
+                uncertain.keys.insert(key);
+            }
+            4 => uncertain.all = true,
+            _ => {
+                let values: Vec<Option<String>> = row.get(3);
+                if side == 1 {
+                    recomputed.insert(key, values);
+                } else {
+                    persisted.insert(key, values);
+                }
+            }
         }
     }
     let columns: Vec<&str> = comparable.iter().map(|f| f.name.as_str()).collect();
@@ -1139,9 +1157,7 @@ async fn compare_once(
         rows_compared: diff.rows_compared,
         next_after: diff.next_after,
         divergences: diff.divergences,
-        // A 1-1 comparison subtracts no ring rows: every divergence it finds
-        // is re-checked (#1176).
-        uncertain: super::self_check_groups::Uncertain::everything(),
+        uncertain,
     })
 }
 
@@ -1170,6 +1186,7 @@ async fn compare_once(
 /// `page_end` is null.
 fn page_sql(
     def: &Definition,
+    pk: &[PrimaryKeyColumn],
     keyset: &Keyset,
     comparable: &[&FieldDef],
 ) -> Result<String, SelfCheckError> {
@@ -1195,6 +1212,27 @@ fn page_sql(
         persisted.push(format!("{}::text", quote_ident(&field.name)));
         let _ = i;
     }
+    // The recompute side reads the source as the target has applied it
+    // (`super::self_check_ring`): a key with an unapplied change is its
+    // earliest such change's old image (no row for an insert), any other key
+    // its live row.
+    let ring = Ring {
+        src_table: &def.source_table,
+        source_row: source_ident.clone(),
+        source_pk: pk,
+        transform_id: def.id,
+        tag: "s",
+    };
+    let pend = ring.pend_cte();
+    let expected = format!(
+        "(select s.* from {source_ident} s \
+          where not exists (select 1 from {pend} p where p.__k = {skey}) \
+          union all \
+          select r.* from {pend} p \
+          cross join lateral jsonb_populate_record(null::{source_ident}, p.__i) r \
+          where jsonb_typeof(p.__i) = 'object') e",
+        skey = ddl::pk_key_sql_expr(pk, Some("s")),
+    );
     let side = |table: &str, values: &[String]| {
         keyset.side(&refs, |cond| {
             format!(
@@ -1206,13 +1244,20 @@ fn page_sql(
     };
     Ok(keyset.ranked(
         &format!(
-            "recomputed as materialized ({}), persisted as materialized ({}), ",
-            side(&source_ident, &recomputed),
+            "{}recomputed as materialized ({}), persisted as materialized ({}), ",
+            ring.one_to_one_ctes(),
+            side(&expected, &recomputed),
             side(&target_ident, &persisted)
         ),
         &[(1, "recomputed"), (2, "persisted")],
         &[1, 2],
-        "",
+        &format!(
+            " union all select 3, page.page_end, u.__k, null::text[] \
+                from page, ({}) u \
+              union all select 4, page.page_end, '', null::text[] from page where {}",
+            ring.uncertain_keys_sql(),
+            ring.global_sql()
+        ),
     ))
 }
 
@@ -1278,7 +1323,7 @@ async fn explain_page_with(
     let mut client = pool.get().await?;
     let mut keyset = Keyset::resolve(&client, &pk).await?;
     keyset.set_cursor(after)?;
-    let sql = page_sql(&def, &keyset, &comparable)?;
+    let sql = page_sql(&def, &pk, &keyset, &comparable)?;
     let txn = client.transaction().await?;
     txn.batch_execute("set local enable_seqscan to off").await?;
     let rows = txn
@@ -1708,12 +1753,17 @@ mod tests {
 
     /// #1140: under `Standard`, a page re-checks only when a divergence falls
     /// on a key it couldn't vouch for exactly; a divergence on any other key,
-    /// or on the schema, is reported from the one pass. A 1-1 page vouches
-    /// for none, and `Strict` never re-checks.
+    /// or on the schema, is reported from the one pass. A page whose source has
+    /// an unapplied op that touches every key vouches for none, and `Strict`
+    /// never re-checks.
     #[test]
     fn standard_rechecks_only_a_divergence_on_an_uncertain_key() {
         use super::super::self_check_groups::Uncertain;
         let exact = Uncertain::default();
+        let all = Uncertain {
+            all: true,
+            keys: BTreeSet::new(),
+        };
         let one = Uncertain {
             all: false,
             keys: BTreeSet::from(["2".to_string()]),
@@ -1733,18 +1783,14 @@ mod tests {
         assert!(rechecks(
             SelfCheckMode::Standard,
             std::slice::from_ref(&column),
-            &Uncertain::everything()
+            &all
         ));
         assert!(!rechecks(
             SelfCheckMode::Strict,
             &[cell("2", "5", "6")],
-            &Uncertain::everything()
+            &all
         ));
-        assert!(!rechecks(
-            SelfCheckMode::Standard,
-            &[],
-            &Uncertain::everything()
-        ));
+        assert!(!rechecks(SelfCheckMode::Standard, &[], &all));
     }
 
     /// Only the wait running out of time reads as "not caught up yet": a
