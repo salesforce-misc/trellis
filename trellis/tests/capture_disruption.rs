@@ -1121,3 +1121,41 @@ async fn a_paused_reader_keeps_the_record_so_a_replaced_table_still_pauses() {
     let failure = status.capture_failure.expect("a reason");
     assert_eq!(failure.kind, trellis::CaptureFailureKind::Disruption);
 }
+
+/// #1217: the last reader goes and a definition is made again on the same,
+/// untouched table before a pass, with its orphaned triggers disabled in
+/// between. The new definition never relied on them: the pass reinstalls and
+/// records capture afresh, pauses nothing, and it goes live with the right
+/// rows.
+#[tokio::test]
+async fn a_definition_made_again_on_the_same_table_before_a_pass_is_not_paused() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
+    raw.batch_execute(T_SQL).await.unwrap();
+    trellis
+        .apply("TRANSFORM r_fg FROM public.t_fg SELECT a AS a, b AS b")
+        .await
+        .unwrap();
+    bring_live(&mut raw, &db.pool).await;
+    for text in ["PAUSE TRANSFORM r_fg", "DROP TRANSFORM r_fg"] {
+        trellis.apply(text).await.expect(text);
+    }
+    raw.batch_execute(&format!(
+        "{}; update public.t_fg set b = b + 1",
+        each_trigger("alter table public.t_fg disable trigger %I").replace("{t}", "t_fg")
+    ))
+    .await
+    .unwrap();
+    trellis
+        .apply("TRANSFORM r_fg FROM public.t_fg SELECT a AS a, b AS b")
+        .await
+        .unwrap();
+    bring_live(&mut raw, &db.pool).await;
+    assert_eq!(
+        rows(&raw, "select a::text, b::text from public.r_fg order by a").await,
+        rows(&raw, "select a::text, b::text from public.t_fg order by a").await
+    );
+    assert_eq!(record_counts(&raw, "public.t_fg").await.0, 5);
+}
