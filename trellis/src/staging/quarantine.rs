@@ -5212,16 +5212,20 @@ async fn pause_refused_readers(
     for reader in refused {
         let retyped: Vec<String> = columns
             .iter()
-            .map(|c| format!("{}.{} from {} to {}", c.table, c.column, c.old_type, c.new_type))
+            .map(|c| {
+                format!(
+                    "{}.{} from {} to {}",
+                    c.table, c.column, c.old_type, c.new_type
+                )
+            })
             .collect();
         let error = format!(
-            "the resume of {} re-typed {}, and define would now refuse this \
-             definition: {}. Its resume refuses until it is redefined: DROP TRANSFORM {} and \
-             define it again",
+            "{}. A resume of {} re-typed {}. A resume re-validates the definition as define \
+             would, and refuses until that is fixed. Fix it, then resume the definition to \
+             rebuild it, or drop the definition and define it again",
+            reader.reason,
             first.table,
             retyped.join(", "),
-            reader.reason,
-            reader.target,
         );
         match crate::defs::lifecycle::pause_for_capture_failure(
             txn,

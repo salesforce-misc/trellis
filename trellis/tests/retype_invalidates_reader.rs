@@ -10,9 +10,9 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use drain_driver::Driver;
 use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
-use drain_driver::Driver;
 use trellis::defs::{TransformStatus, ValueType};
 use trellis::integer::IntWidth;
 use trellis::{Config, Trellis, TrellisError, TrellisOptions};
@@ -61,9 +61,13 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
     let watermark = StagedWatermark::saturated();
     for _ in 0..16 {
         let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
-        seal::seal_phase2(client, outcome.sealed_seg_seq, "retype_invalidates_reader_wake")
-            .await
-            .expect("seal phase 2");
+        seal::seal_phase2(
+            client,
+            outcome.sealed_seg_seq,
+            "retype_invalidates_reader_wake",
+        )
+        .await
+        .expect("seal phase 2");
         while apply::drain_once(
             pool,
             outcome.sealed_seg_seq,
@@ -149,7 +153,6 @@ async fn bring_live(raw: &mut Client, pool: &trellis::Pool, targets: &[&str]) {
     }
     panic!("{targets:?} did not all go live within 8 pass/drain rounds");
 }
-
 
 /// `public.src (id, g, price numeric(10,2))`, empty, with `t` a passthrough of `price` as `p` and these readers of
 /// `t.p`, all live:
@@ -243,7 +246,10 @@ async fn an_alter_that_retypes_a_column_a_reader_cannot_read_is_refused() {
         message.contains("no declared scale"),
         "the refusal is define's: {message}"
     );
-    assert!(!message.contains("'cnt'") && !message.contains("'c'"), "{message}");
+    assert!(
+        !message.contains("'cnt'") && !message.contains("'c'"),
+        "{message}"
+    );
 
     assert_eq!(column_type(&raw, "public.t", "p").await, "numeric(10,2)");
     assert_eq!(definition_texts(&raw).await, before, "nothing changed");
@@ -299,20 +305,13 @@ async fn a_resume_that_retypes_a_column_pauses_the_readers_define_would_refuse()
         .expect("widen the source");
     full_pass(&mut raw, &db.pool).await;
     assert_eq!(status(&raw, "t").await, TransformStatus::Paused);
-    trellis
-        .apply("RESUME TRANSFORM t")
-        .await
-        .expect("resume t");
+    trellis.apply("RESUME TRANSFORM t").await.expect("resume t");
     // `t` is rebuilt and live again before a reader's resume is judged.
     bring_live(&mut raw, &db.pool, &["t"]).await;
 
     assert_eq!(column_type(&raw, "public.t", "p").await, "numeric");
     for reader in ["roll"] {
-        let reported = trellis
-            .status(reader)
-            .await
-            .expect("status")
-            .expect(reader);
+        let reported = trellis.status(reader).await.expect("status").expect(reader);
         assert_eq!(reported.status, TransformStatus::Paused, "{reader}");
         let error = reported.capture_failure.expect("a reason").error;
         assert!(error.contains("no declared scale"), "{reader}: {error}");
@@ -328,11 +327,7 @@ async fn a_resume_that_retypes_a_column_pauses_the_readers_define_would_refuse()
         }
     }
     for reader in ["cnt", "c"] {
-        let reported = trellis
-            .status(reader)
-            .await
-            .expect("status")
-            .expect(reader);
+        let reported = trellis.status(reader).await.expect("status").expect(reader);
         assert!(
             reported
                 .capture_failure
