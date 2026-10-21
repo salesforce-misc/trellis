@@ -426,6 +426,7 @@ pub(super) async fn explain(
     identity: &[PrimaryKeyColumn],
     after: Option<&str>,
     limit: i64,
+    executed: bool,
 ) -> Result<String, SelfCheckError> {
     let mut client = pool.get().await?;
     let steer = steers(&client, def, shape).await?;
@@ -435,8 +436,9 @@ pub(super) async fn explain(
     if steer {
         txn.batch_execute("set local enable_hashagg to off").await?;
     }
+    let verb = super::self_check::explain_verb(executed);
     let rows = txn
-        .query(format!("explain {sql}").as_str(), &[&limit])
+        .query(format!("{verb} {sql}").as_str(), &[&limit])
         .await?;
     txn.rollback().await?;
     Ok(rows

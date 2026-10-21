@@ -68,7 +68,11 @@ the reclaim TTL), whether or not the drain is busy. The pass:
 
 1. recovers any crashed mid-seal batch's fence ([03](03-sealing-and-the-fence.md));
 2. reclaims claims older than the reclaim window (default 30 s);
-3. retires eligible drained batches;
+3. counts each drained batch's late rows, once every transaction in its fence
+   has finished (`segments.late_rows`: the rows of its slot its fence doesn't
+   show, which its successor takes, [03](03-sealing-and-the-fence.md)), so a
+   `self_check` page can skip a drained slot that holds none, then retires
+   eligible drained batches;
 4. collects the tombstones no change can still need.
 
 So a crashed seal is recovered within its 10 s age gate plus about 5 s, and a dead

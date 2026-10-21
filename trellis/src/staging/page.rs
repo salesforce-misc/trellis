@@ -189,6 +189,32 @@ impl ClaimScope<'_> {
     }
 }
 
+/// A condition over no row, true when every row ring slot `slot` holds is
+/// applied ([`ring_row_pending_sql`] is false for each), so a read of the
+/// slot that wants only pending rows can skip it whole. Postgres evaluates
+/// it once per statement.
+///
+/// The slot's segment is `drained`, and no row of the slot can belong to its
+/// successor's window: a late writer's row, one not visible in the
+/// segment's fence, is by the fence's invariant (docs/staging-and-claiming/
+/// 03-sealing-and-the-fence.md, "The `xmax` trap") a transaction in the
+/// fence's in-progress list. So the segment's fence has an empty list, or
+/// the retire pass counted no late row in the slot (`late_rows`, counted
+/// once those transactions finished), or the successor is drained too (it
+/// took the late rows) or gone (retired, which needs it drained). A slot
+/// with no segment holds no pending row.
+pub(crate) fn ring_slot_applied_sql(slot: i16) -> String {
+    format!(
+        "not exists (select 1 from segments s where s.ring_slot = {slot} \
+             and not (s.state = 'drained' \
+                      and (not exists (select 1 from pg_snapshot_xip(s.fence_snapshot)) \
+                           or coalesce(s.late_rows = 0, false) \
+                           or not exists (select 1 from segments n \
+                                          where n.seg_seq = s.seg_seq + 1 \
+                                            and n.state <> 'drained'))))"
+    )
+}
+
 /// SQL, over ring row `r` of ring slot `slot` (issue #762): true while `r`'s
 /// change is still pending, that is, no committed drain has applied it, and
 /// `claim`, when given, is not applying it now.

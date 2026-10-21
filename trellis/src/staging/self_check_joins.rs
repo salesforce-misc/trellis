@@ -1029,6 +1029,7 @@ pub(super) async fn explain(
     part: &str,
     after: Option<&str>,
     limit: i64,
+    executed: bool,
 ) -> Result<String, SelfCheckError> {
     let mut client = pool.get().await?;
     let joined = joined_table(&client, def).await?;
@@ -1043,7 +1044,10 @@ pub(super) async fn explain(
         txn.batch_execute("set local enable_hashagg to off").await?;
     }
     let rows = txn
-        .query(format!("explain {sql}").as_str(), &[&limit])
+        .query(
+            format!("{} {sql}", super::self_check::explain_verb(executed)).as_str(),
+            &[&limit],
+        )
         .await?;
     txn.rollback().await?;
     Ok(rows

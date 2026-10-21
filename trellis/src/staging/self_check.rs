@@ -1227,6 +1227,39 @@ pub async fn explain_page(
     after: Option<&str>,
     limit: i64,
 ) -> Result<String, SelfCheckError> {
+    explain_page_with(pool, target_table, after, limit, false).await
+}
+
+/// [`explain_page`] after running the statement (`explain analyze`): the
+/// plan also says which scans never executed. For tests of the plan's shape.
+#[cfg(any(test, feature = "internals"))]
+pub async fn explain_page_executed(
+    pool: &Pool,
+    target_table: &str,
+    after: Option<&str>,
+    limit: i64,
+) -> Result<String, SelfCheckError> {
+    explain_page_with(pool, target_table, after, limit, true).await
+}
+
+/// `explain`, or `explain analyze` without timings, for the plan tests.
+#[cfg(any(test, feature = "internals"))]
+pub(super) fn explain_verb(executed: bool) -> &'static str {
+    if executed {
+        "explain (analyze, costs off, timing off, summary off)"
+    } else {
+        "explain"
+    }
+}
+
+#[cfg(any(test, feature = "internals"))]
+async fn explain_page_with(
+    pool: &Pool,
+    target_table: &str,
+    after: Option<&str>,
+    limit: i64,
+    executed: bool,
+) -> Result<String, SelfCheckError> {
     let def = catalog::definition_by_target(pool, target_table)
         .await?
         .ok_or_else(|| SelfCheckError::TargetNotFound(target_table.to_string()))?;
@@ -1235,8 +1268,10 @@ pub async fn explain_page(
             let client = pool.get().await?;
             ddl::identity_key_columns(&**client, &def.target_table).await?
         };
-        return super::self_check_groups::explain(pool, &def, &shape, &identity, after, limit)
-            .await;
+        return super::self_check_groups::explain(
+            pool, &def, &shape, &identity, after, limit, executed,
+        )
+        .await;
     }
     let pk = ddl::source_primary_key(pool, &def.source_table).await?;
     let comparable: Vec<&FieldDef> = def.def.fields.iter().collect();
@@ -1247,7 +1282,10 @@ pub async fn explain_page(
     let txn = client.transaction().await?;
     txn.batch_execute("set local enable_seqscan to off").await?;
     let rows = txn
-        .query(format!("explain {sql}").as_str(), &[&limit])
+        .query(
+            format!("{} {sql}", explain_verb(executed)).as_str(),
+            &[&limit],
+        )
         .await?;
     txn.rollback().await?;
     Ok(rows
@@ -1274,7 +1312,26 @@ pub async fn explain_join_page(
         let client = pool.get().await?;
         ddl::identity_key_columns(&**client, &def.target_table).await?
     };
-    super::self_check_joins::explain(pool, &def, &identity, part, after, limit).await
+    super::self_check_joins::explain(pool, &def, &identity, part, after, limit, false).await
+}
+
+/// [`explain_join_page`] after running the statement ([`explain_page_executed`]).
+#[cfg(any(test, feature = "internals"))]
+pub async fn explain_join_page_executed(
+    pool: &Pool,
+    target_table: &str,
+    part: &str,
+    after: Option<&str>,
+    limit: i64,
+) -> Result<String, SelfCheckError> {
+    let def = catalog::definition_by_target(pool, target_table)
+        .await?
+        .ok_or_else(|| SelfCheckError::TargetNotFound(target_table.to_string()))?;
+    let identity = {
+        let client = pool.get().await?;
+        ddl::identity_key_columns(&**client, &def.target_table).await?
+    };
+    super::self_check_joins::explain(pool, &def, &identity, part, after, limit, true).await
 }
 
 /// One side of a [`compare_once`] page: key text to the `::text` value of

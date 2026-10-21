@@ -647,6 +647,255 @@ async fn a_held_keys_parked_and_pending_changes_are_subtracted() {
     assert_eq!(walk(&d, 10).await.0, []);
 }
 
+/// The plan of the first page of `agg` as it ran (`explain analyze`): which
+/// ring slot tables its statement read, and which it never executed.
+async fn ring_scans(d: &Driver) -> (Vec<String>, Vec<String>) {
+    let plan = trellis::staging::self_check::explain_page_executed(d.pool(), "agg", None, 10)
+        .await
+        .expect("explain the page as run");
+    let (mut read, mut skipped) = (Vec::new(), Vec::new());
+    for line in plan.lines().filter(|l| l.contains("Scan on seg_")) {
+        let slot = line
+            .split("Scan on ")
+            .nth(1)
+            .and_then(|t| t.split_whitespace().next())
+            .expect("a table")
+            .to_string();
+        if line.contains("(never executed)") {
+            skipped.push(slot);
+        } else {
+            read.push(slot);
+        }
+    }
+    (read, skipped)
+}
+
+/// The ring slot tables of the segments, oldest first, as `seg_N`.
+async fn segment_tables(d: &Driver) -> Vec<String> {
+    d.rows("select 'seg_' || ring_slot from segments order by seg_seq")
+        .await
+        .into_iter()
+        .map(|t| t.trim_matches(|c| c == '(' || c == ')').to_string())
+        .collect()
+}
+
+/// A drained slot is skipped (#1219): a page reads the ring slots that hold
+/// undrained rows and never executes the scan of one whose segment is
+/// drained, however many rows it still holds, for a definition with no held
+/// key. A slot with no segment is skipped too.
+#[tokio::test]
+async fn a_drained_ring_slot_is_never_scanned_by_a_page() {
+    let mut d = start().await;
+    step(
+        &mut d,
+        "insert into public.src values (1, 1, 10), (2, 2, 20)",
+    )
+    .await;
+    step(&mut d, "insert into public.src values (3, 1, 5)").await;
+    assert_eq!(
+        d.rows("select state from segments order by seg_seq").await,
+        ["(drained)", "(drained)", "(active)"],
+    );
+    let tables = segment_tables(&d).await;
+    let (read, skipped) = ring_scans(&d).await;
+    // The oldest slot's successor is drained, so its late rows were taken;
+    // the unused slot has no segment. The next slot's successor is the
+    // active segment, so it is skipped only when its fence saw no writer in
+    // flight, which other tests running against the cluster can change.
+    let unused = (0..4)
+        .map(|n| format!("seg_{n}"))
+        .find(|t| !tables.contains(t))
+        .expect("an unused slot");
+    for slot in [&tables[0], &unused] {
+        assert!(skipped.contains(slot), "{slot}: {read:?} {skipped:?}");
+    }
+    assert!(read.contains(&tables[2]), "{read:?} {skipped:?}");
+    assert_eq!(compare(&d, 10).await, (vec![], vec![], false));
+}
+
+/// [`ring_scans`] with the fence of the segment before the active one set to
+/// `fence` (text of a `pg_snapshot`), its `late_rows` not counted.
+async fn fence_scans(d: &mut Driver, fence: &str) -> (Vec<String>, Vec<String>) {
+    d.ctl
+        .execute(
+            &format!(
+                "update segments set fence_snapshot = '{fence}'::pg_snapshot, late_rows = null \
+                 where seg_seq = (select max(seg_seq) - 1 from segments)"
+            ),
+            &[],
+        )
+        .await
+        .expect("set the fence");
+    ring_scans(d).await
+}
+
+/// A drained slot whose fence had a writer in flight may hold that writer's
+/// late rows, which the successor's window takes: it is read until the retire
+/// pass has counted none, or the successor is drained; and skipped when the
+/// fence had no writer in flight.
+#[tokio::test]
+async fn a_drained_slot_with_a_writer_in_flight_at_its_fence_is_read_until_no_late_row_is_counted()
+{
+    let mut d = start().await;
+    step(&mut d, "insert into public.src values (1, 1, 10)").await;
+    let tables = segment_tables(&d).await;
+    let before_active = tables[tables.len() - 2].clone();
+    let real_fence = d
+        .rows("select fence_snapshot::text from segments order by seg_seq desc offset 1 limit 1")
+        .await[0]
+        .trim_matches(|c| c == '(' || c == ')')
+        .to_string();
+    let xmax = d
+        .rows("select pg_snapshot_xmax(pg_current_snapshot())")
+        .await[0]
+        .trim_matches(|c| c == '(' || c == ')')
+        .to_string();
+    // A fence every row is visible in, with and without a writer in flight.
+    let (read, skipped) = fence_scans(&mut d, &format!("1:{xmax}:")).await;
+    assert!(skipped.contains(&before_active), "{read:?} {skipped:?}");
+    let (read, skipped) = fence_scans(&mut d, &format!("1:{xmax}:2")).await;
+    assert!(read.contains(&before_active), "{read:?} {skipped:?}");
+    // The retire pass counts the rows the fence doesn't show: none.
+    d.retire().await;
+    assert_eq!(
+        d.rows("select late_rows from segments order by seg_seq desc offset 1 limit 1")
+            .await,
+        ["(0)"]
+    );
+    let (read, skipped) = ring_scans(&d).await;
+    assert!(skipped.contains(&before_active), "{read:?} {skipped:?}");
+    // A fence no row is visible in: the slot's rows are late rows, counted,
+    // and the slot is read.
+    let (read, skipped) = fence_scans(&mut d, "1:3:2").await;
+    assert!(read.contains(&before_active), "{read:?} {skipped:?}");
+    d.retire().await;
+    assert_eq!(
+        d.rows("select late_rows > 0 from segments order by seg_seq desc offset 1 limit 1")
+            .await,
+        ["(t)"]
+    );
+    let (read, skipped) = ring_scans(&d).await;
+    assert!(read.contains(&before_active), "{read:?} {skipped:?}");
+    // The successor drains: it took the late rows, so the slot is skipped.
+    // (Under the fence the segment really had.)
+    fence_scans(&mut d, &real_fence).await;
+    step(&mut d, "insert into public.src values (2, 1, 1)").await;
+    let (read, skipped) = ring_scans(&d).await;
+    assert!(skipped.contains(&before_active), "{read:?} {skipped:?}");
+    assert_eq!(compare(&d, 10).await, (vec![], vec![], false));
+}
+
+/// The slot table of segment `seg_seq` and its `late_rows`, as text.
+async fn slot_and_late_rows(d: &Driver, seg_seq: i64) -> (String, String) {
+    let row = d
+        .ctl
+        .query_one(
+            "select 'seg_' || ring_slot, coalesce(late_rows::text, 'uncounted') \
+             from segments where seg_seq = $1",
+            &[&seg_seq],
+        )
+        .await
+        .expect("the segment");
+    (row.get(0), row.get(1))
+}
+
+/// A real late writer (#1219): a transaction that wrote into the active
+/// segment and is still open when it seals leaves its row in that slot,
+/// outside the fence, and the segment drains without it. The retire pass
+/// doesn't count the slot's late rows while the writer is open (it could
+/// still commit one); once it commits, its row is pending in a drained
+/// segment's slot, so a page reads the slot and subtracts the row, and the
+/// count says one late row. Once the successor drains (it applied the row),
+/// the slot is skipped.
+#[tokio::test]
+async fn a_late_writers_row_in_a_drained_slot_is_read_until_its_successor_drains() {
+    let mut d = start().await;
+    step(&mut d, "insert into public.src values (1, 1, 10)").await;
+    let writer = d.user().await;
+    writer
+        .batch_execute("begin; insert into public.src values (2, 1, 5)")
+        .await
+        .expect("open the writer");
+    let batch = d.seal().await;
+    d.drain(batch, "late").await;
+    assert_eq!(
+        d.rows(&format!(
+            "select state from segments where seg_seq = {batch}"
+        ))
+        .await,
+        ["(drained)"]
+    );
+    // The writer is in the fence's in-progress list, and still open.
+    d.retire().await;
+    let (slot, late) = slot_and_late_rows(&d, batch).await;
+    assert_eq!(late, "uncounted");
+    let (read, skipped) = ring_scans(&d).await;
+    assert!(read.contains(&slot), "{slot}: {read:?} {skipped:?}");
+    assert_eq!(compare(&d, 10).await, (vec![], vec![], false));
+
+    // Committed: the row is in the source and pending in the drained slot.
+    writer.batch_execute("commit").await.expect("commit");
+    let (read, skipped) = ring_scans(&d).await;
+    assert!(read.contains(&slot), "{slot}: {read:?} {skipped:?}");
+    assert_eq!(compare(&d, 10).await, (vec![], vec![], false));
+    d.retire().await;
+    assert_eq!(slot_and_late_rows(&d, batch).await.1, "1");
+    let (read, skipped) = ring_scans(&d).await;
+    assert!(read.contains(&slot), "{slot}: {read:?} {skipped:?}");
+    assert_eq!(compare(&d, 10).await, (vec![], vec![], false));
+
+    // The successor takes the row and drains.
+    let next = d.seal().await;
+    d.drain(next, "successor").await;
+    assert_eq!(
+        slot_and_late_rows(&d, batch).await.0,
+        slot,
+        "not retired yet"
+    );
+    let (read, skipped) = ring_scans(&d).await;
+    assert!(skipped.contains(&slot), "{slot}: {read:?} {skipped:?}");
+    assert_eq!(compare(&d, 10).await, (vec![], vec![], false));
+    assert_eq!(
+        d.rows("select total from public.agg where g = 1").await,
+        ["(15)"]
+    );
+}
+
+/// A definition with a held key reads the drained slots: the held key's
+/// rows are still subtracted from the source, in a drained segment too.
+#[tokio::test]
+async fn a_drained_ring_slot_is_read_for_a_definition_with_a_held_key() {
+    let mut d = start().await;
+    step(
+        &mut d,
+        "insert into public.src values (1, 1, 10), (2, 2, 20)",
+    )
+    .await;
+    step(&mut d, "insert into public.src values (3, 1, 5)").await;
+    let oldest = segment_tables(&d).await[0].clone();
+    assert!(ring_scans(&d).await.1.contains(&oldest));
+    d.ctl
+        .execute(
+            "insert into poison (transform_id, src_table, key, last_error) \
+             select id, $1, '1', 'test' from transform_definitions \
+             where target_table = 'public.agg'",
+            &[&SRC],
+        )
+        .await
+        .expect("hold the key");
+    step(&mut d, "update public.src set g = 2, v = 11 where id = 1").await;
+    step(&mut d, "update public.src set v = 12 where id = 1").await;
+    assert_eq!(d.rows("select count(*) from poison_held").await, ["(1)"]);
+    let oldest = segment_tables(&d).await[0].clone();
+    let (read, skipped) = ring_scans(&d).await;
+    assert!(
+        skipped.is_empty() && read.contains(&oldest),
+        "{read:?} {skipped:?}"
+    );
+    // The parked changes sit in drained segments, and are subtracted.
+    assert_eq!(compare(&d, 10).await, (vec![], vec![], false));
+}
+
 /// A source `TRUNCATE` the drain hasn't applied touches every group: the
 /// comparison can't vouch for any until it applies.
 #[tokio::test]

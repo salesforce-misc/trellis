@@ -485,6 +485,27 @@ async fn resume_and_write(raw: &mut Client, trellis: &Trellis, pool: &trellis::P
         &["one"],
     )
     .await;
+    // `self_check` over the restarted registry (#1219's page filter): the
+    // slots the restore left with no segment count as applied, and the
+    // comparison agrees with the oracle.
+    use trellis::staging::self_check::{CheckPageExt, SelfCheckScope};
+    let report = trellis
+        .self_check_page(
+            "one",
+            SelfCheckScope {
+                after: None,
+                limit: 100,
+            },
+            trellis::SelfCheckMode::Strict,
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("self_check one");
+    assert!(
+        matches!(report.outcome, trellis::SelfCheckOutcome::Converged),
+        "self_check after the resume: {:?}",
+        report.outcome
+    );
 }
 
 /// Like [`bring_live`], for the one definition `target`: the paused others

@@ -78,6 +78,7 @@ const RETIRE_CANDIDATES_SQL: &str = "\
 /// new `seg_seq`, is silently skipped — see the per-candidate doc comment
 /// below on why the delete must be the thing that decides.
 pub async fn retire_drained_segments(client: &mut Client) -> Result<Vec<i64>, StagingError> {
+    count_late_rows(client).await?;
     let candidates: Vec<(i64, i16)> = client
         .query_typed(RETIRE_CANDIDATES_SQL, &[])
         .await?
@@ -92,6 +93,55 @@ pub async fn retire_drained_segments(client: &mut Client) -> Result<Vec<i64>, St
         }
     }
     Ok(retired)
+}
+
+/// A drained segment whose `late_rows` isn't counted yet, though its count
+/// can no longer change: every transaction in its fence has finished
+/// (`xmin` of the current snapshot is at or above the fence's `xmax`), so no
+/// writer can still land a row in its slot. Only a count a reader needs is
+/// made, as it reads the slot whole: one whose fence had a transaction in
+/// flight (with none, the slot holds no late row) and whose successor hasn't
+/// drained (once it has, it applied the late rows). A segment left uncounted
+/// keeps `late_rows` NULL.
+const LATE_ROWS_CANDIDATES_SQL: &str = "\
+    select seg_seq, ring_slot from segments s \
+    where s.state = 'drained' and s.late_rows is null \
+      and s.fence_snapshot is not null \
+      and pg_snapshot_xmin(pg_current_snapshot()) >= pg_snapshot_xmax(s.fence_snapshot) \
+      and exists (select 1 from pg_snapshot_xip(s.fence_snapshot)) \
+      and exists (select 1 from segments n \
+                  where n.seg_seq = s.seg_seq + 1 and n.state <> 'drained') \
+    order by s.seg_seq asc";
+
+/// Counts the rows of each drained segment's slot that its fence doesn't
+/// show (`segments.late_rows`, #1219): the late writers' rows, which its
+/// successor's window takes. `self_check` reads a drained slot only while
+/// the count is more than 0 (or not yet counted) and the successor hasn't
+/// drained. The count is final once [`LATE_ROWS_CANDIDATES_SQL`] holds, so
+/// it is made once.
+async fn count_late_rows(client: &mut Client) -> Result<(), StagingError> {
+    let candidates: Vec<(i64, i16)> = client
+        .query_typed(LATE_ROWS_CANDIDATES_SQL, &[])
+        .await?
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    for (seg_seq, ring_slot) in candidates {
+        let table = ring_table_name(ring_slot)?;
+        client
+            .execute(
+                &format!(
+                    "update segments s set late_rows = ( \
+                         select count(*) from {table} r \
+                         where not pg_visible_in_snapshot(r.row_txid, s.fence_snapshot)) \
+                     where s.seg_seq = $1 and s.ring_slot = $2 \
+                       and s.state = 'drained' and s.late_rows is null"
+                ),
+                &[&seg_seq, &ring_slot],
+            )
+            .await?;
+    }
+    Ok(())
 }
 
 /// One candidate's retire attempt, exactly as

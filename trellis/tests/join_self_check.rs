@@ -1170,3 +1170,44 @@ async fn one_sided_cells_where_a_group_column_is_the_join_key_are_found_at_every
     )
     .await;
 }
+
+/// Every `JOIN` part's page skips the drained ring slots (#1219): with
+/// the pipeline drained, no ring slot holding a drained segment is scanned,
+/// whichever source's ring rows the part subtracts, and a comparison still
+/// finds nothing.
+#[tokio::test]
+async fn a_join_page_never_scans_a_drained_ring_slot() {
+    let mut d = start(&[LEFT_PAIR]).await;
+    seed(&mut d).await;
+    step(&mut d, "insert into public.a values (20, 1, 1, 1, 1)").await;
+    step(&mut d, "insert into public.b values (20, 1, 1, 1, 1)").await;
+    for part in ["p", "m", "j", "t"] {
+        let plan = trellis::staging::self_check::explain_join_page_executed(
+            d.pool(),
+            "public.l",
+            part,
+            None,
+            5,
+        )
+        .await
+        .expect("explain the page as run");
+        let scans: Vec<&str> = plan
+            .lines()
+            .filter(|l| l.contains("Scan on seg_"))
+            .collect();
+        assert!(!scans.is_empty(), "{part}: {plan}");
+        // The segment before the active one may be read (its successor's
+        // fence can have had a writer in flight); every older slot and every
+        // unused slot is skipped.
+        let skipped = scans
+            .iter()
+            .filter(|l| l.contains("(never executed)"))
+            .count();
+        assert!(
+            skipped * 2 >= scans.len(),
+            "{part}: {skipped} of {} ring scans skipped:\n{plan}",
+            scans.len()
+        );
+    }
+    assert_eq!(walk(&d, "public.l", 3).await.0, []);
+}
