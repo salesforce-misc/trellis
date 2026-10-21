@@ -226,6 +226,30 @@ async fn the_first_pass_records_the_tree_and_later_passes_check_nothing() {
     it.trellis.shutdown().await.expect("shutdown");
 }
 
+/// A leaf held under `ACCESS EXCLUSIVE` (a long `ALTER TABLE`, a `VACUUM
+/// FULL`) does not stall a steady pass: no read of the tree locks its nodes.
+/// The test client has no `lock_timeout`, so a stalled pass fails the outer
+/// timeout.
+#[tokio::test]
+async fn a_leaf_held_access_exclusive_does_not_stall_a_steady_pass() {
+    let cluster = TestCluster::start();
+    let mut it = instance(&cluster, TREE).await;
+    clean_pass(&mut it).await;
+
+    let holder = connect(it.db.dsn()).await;
+    holder
+        .batch_execute("begin; lock table public.items_b in access exclusive mode")
+        .await
+        .expect("hold a leaf");
+    let outcome = tokio::time::timeout(Duration::from_secs(10), pass(&mut it.raw, &it.db.pool))
+        .await
+        .expect("the pass stalled on the held leaf");
+    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+    assert!(queued(&it.raw).await.is_empty());
+    holder.batch_execute("rollback").await.expect("release");
+    it.trellis.shutdown().await.expect("shutdown");
+}
+
 /// A new leaf gets capture installed by the pass, and one `new_leaf`
 /// correction; the pass after that finds nothing.
 #[tokio::test]

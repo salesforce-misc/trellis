@@ -58,6 +58,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+use tokio_postgres::error::SqlState;
 use tokio_postgres::{Client, IsolationLevel};
 
 use super::CaptureError;
@@ -726,7 +727,20 @@ pub(crate) async fn sweep(
     }
     while outcome.attempts < ATTEMPTS {
         outcome.attempts += 1;
-        match attempt(client, schema, table, &readers, &mut outcome).await? {
+        let attempted = match attempt(client, schema, table, &readers, &mut outcome).await {
+            Ok(attempted) => attempted,
+            // The bounds are read under a short `lock_timeout`, and a node
+            // held under `ACCESS EXCLUSIVE` outlasts it: not a failure of the
+            // pass, the next one sweeps again.
+            Err(CaptureError::Db(err)) if err.code() == Some(&SqlState::LOCK_NOT_AVAILABLE) => {
+                crate::instance_log::warn!(table = %table, "the partition sweep is blocked behind a lock on the tree; retrying next pass");
+                outcome.queued = false;
+                outcome.skipped = true;
+                return Ok(outcome);
+            }
+            Err(err) => return Err(err),
+        };
+        match attempted {
             Attempt::Done => return Ok(outcome),
             Attempt::Changed => {}
             Attempt::Unreadable(why) => {

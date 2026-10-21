@@ -825,6 +825,91 @@ async fn a_leaf_held_access_exclusive_stalls_no_read_of_the_tree() {
     holder.batch_execute("rollback").await.expect("release");
 }
 
+/// `installed_tables` is the first catalog read of every capture pass, and no
+/// `lock_timeout` bounds it: it must not lock the tree it reads. A leaf held
+/// under `ACCESS EXCLUSIVE` (a long `ALTER TABLE`, a `VACUUM FULL`) must not
+/// stall it. The raw test client has no `lock_timeout`, so a stalled read
+/// fails the outer timeout.
+#[tokio::test]
+async fn a_leaf_held_access_exclusive_does_not_stall_installed_tables() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect(db.dsn()).await;
+    client.batch_execute(TWO_LEVEL).await.expect("tree");
+    landed(
+        install::install(&mut client, DEFAULT_SCHEMA, &spec("public.r"), None)
+            .await
+            .expect("install"),
+    );
+    let holder = connect(db.dsn()).await;
+    holder
+        .batch_execute("begin; lock table public.m1_0 in access exclusive mode")
+        .await
+        .expect("hold the leaf");
+    let tables = tokio::time::timeout(
+        Duration::from_secs(10),
+        trellis::capture::reconcile::installed_tables(&client, DEFAULT_SCHEMA),
+    )
+    .await
+    .expect("installed_tables stalled on the held leaf")
+    .expect("installed tables");
+    assert_eq!(tables.into_iter().collect::<Vec<_>>(), ["public.r"]);
+    holder.batch_execute("rollback").await.expect("release");
+}
+
+/// The same with a detach pending on a middle node (the `pending` subtree
+/// walk): a leaf under another middle is held `ACCESS EXCLUSIVE`.
+#[tokio::test]
+async fn a_leaf_held_access_exclusive_does_not_stall_installed_tables_past_a_pending_detach() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect(db.dsn()).await;
+    client.batch_execute(TWO_LEVEL).await.expect("tree");
+    landed(
+        install::install(&mut client, DEFAULT_SCHEMA, &spec("public.r"), None)
+            .await
+            .expect("install"),
+    );
+    let holder = connect(db.dsn()).await;
+    holder
+        .batch_execute("begin; lock table public.m2 in access share mode")
+        .await
+        .expect("hold the middle");
+    let detacher = connect(db.dsn()).await;
+    detacher
+        .batch_execute("set statement_timeout = '500ms'")
+        .await
+        .expect("timeout");
+    let interrupted = detacher
+        .batch_execute("alter table public.r detach partition public.m2 concurrently")
+        .await;
+    assert!(interrupted.is_err(), "the second phase waits on the holder");
+    holder.batch_execute("rollback").await.expect("release");
+    let pending: bool = client
+        .query_one(
+            "select inhdetachpending from pg_inherits where inhrelid = 'public.m2'::regclass",
+            &[],
+        )
+        .await
+        .expect("pending")
+        .get(0);
+    assert!(pending, "public.m2 is detach-pending");
+
+    holder
+        .batch_execute("begin; lock table public.m1_0 in access exclusive mode")
+        .await
+        .expect("hold a leaf");
+    let tables = tokio::time::timeout(
+        Duration::from_secs(10),
+        trellis::capture::reconcile::installed_tables(&client, DEFAULT_SCHEMA),
+    )
+    .await
+    .expect("installed_tables stalled on the held leaf")
+    .expect("installed tables");
+    assert_eq!(tables.into_iter().collect::<Vec<_>>(), ["public.r"]);
+    holder.batch_execute("rollback").await.expect("release");
+}
+
 /// The lock-free walk behind [`install::descendants`] lists exactly what
 /// `pg_partition_tree` does, in the same order, from every table of a varied
 /// tree: three levels, `DEFAULT` partitions at two of them, a middle whose

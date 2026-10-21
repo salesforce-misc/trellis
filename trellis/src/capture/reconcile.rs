@@ -681,7 +681,10 @@ async fn gated_marker_tables(client: &impl GenericClient) -> Result<HashSet<Stri
 /// write through the parent into it, so its triggers come off only once the
 /// detach has completed (ADR-0017). Both exclusions are each one subtree
 /// walk per recorded table or pending detach, not an ancestor walk per
-/// trigger, so a steady pass over a large tree stays cheap.
+/// trigger, so a steady pass over a large tree stays cheap. The walks read
+/// `pg_inherits` alone: `pg_partition_tree` locks every node, and a leaf under
+/// `ACCESS EXCLUSIVE` would stall the whole pass, which no `lock_timeout`
+/// bounds.
 pub async fn installed_tables(
     client: &impl GenericClient,
     schema: &str,
@@ -692,7 +695,7 @@ pub async fn installed_tables(
         .collect();
     Ok(client
         .query_typed(
-            "with recorded as ( \
+            "with recursive recorded as ( \
                  select c.j ->> 'table' as name from ( \
                      select d.description::jsonb as j \
                      from pg_catalog.pg_proc p \
@@ -704,18 +707,24 @@ pub async fn installed_tables(
                          select oid from pg_catalog.pg_namespace where nspname = $1) \
                        and d.description like '{\"trellis_capture\":1,%') c \
                  where c.j ->> 'table' is not null), \
-             covered as ( \
-                 select d.relid from (select distinct name from recorded) x \
+             covered(relid) as ( \
+                 select k.oid from (select distinct name from recorded) x \
                  join pg_catalog.pg_namespace kn \
                    on kn.nspname = pg_catalog.split_part(x.name, '.', 1)::name \
                  join pg_catalog.pg_class k \
                    on k.relnamespace = kn.oid \
                   and k.relname = pg_catalog.split_part(x.name, '.', 2)::name \
-                 cross join pg_catalog.pg_partition_tree(k.oid) d), \
-             pending as ( \
-                 select d.relid from pg_catalog.pg_inherits i \
-                 cross join pg_catalog.pg_partition_tree(i.inhrelid) d \
-                 where i.inhdetachpending) \
+                 union \
+                 select i.inhrelid from covered c \
+                 join pg_catalog.pg_class p on p.oid = c.relid and p.relkind = 'p' \
+                 join pg_catalog.pg_inherits i \
+                   on i.inhparent = c.relid and not i.inhdetachpending), \
+             pending(relid) as ( \
+                 select i.inhrelid from pg_catalog.pg_inherits i \
+                 where i.inhdetachpending \
+                 union \
+                 select i.inhrelid from pending d \
+                 join pg_catalog.pg_inherits i on i.inhparent = d.relid) \
              select name from recorded \
              union \
              select n.nspname::text || '.' || r.relname::text \
