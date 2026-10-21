@@ -788,14 +788,14 @@ async fn assert_unpaused(trellis: &Trellis, target: &str) {
 
 /// #1110: the columns a JOIN copies from either table (its target's `GROUP
 /// BY` columns, `P`'s, `M`'s, `J`'s and `T`'s key columns, and its fields)
-/// follow a widening as a 1-1 or aggregate target's copies do. One that
-/// changes only the catalog is re-typed in place on the staging worker's
-/// pass, with its collation, and pauses nothing, an `ON` pair included once
-/// both columns have widened; one that outgrows a column (`SUM(qty)`'s
+/// follow a widening as a 1-1 or aggregate target's copies do. A string
+/// column's copies are unbounded `varchar` (#1207), with the column's
+/// collation, so a `varchar(n)` widened, or moved to `text`, re-types
+/// nothing and pauses nothing, an `ON` pair included; one that outgrows a column (`SUM(qty)`'s
 /// `bigint` after `qty` goes `bigint`) pauses the JOIN, naming the column,
 /// and its resume re-types it.
 #[tokio::test]
-async fn a_widened_column_of_either_table_is_retyped_in_place_or_pauses_the_join() {
+async fn a_widened_string_changes_no_copy_and_an_outgrown_column_pauses_the_join() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect_raw(db.dsn()).await;
@@ -833,12 +833,12 @@ async fn a_widened_column_of_either_table_is_retyped_in_place_or_pauses_the_join
     pass(&mut raw, &db.pool).await;
     assert_unpaused(&trellis, "by_code").await;
     for (table, column, ty) in [
-        ("public.by_code", "sku", "character varying(40)"),
-        (&hidden("m"), "sku", "character varying(40)"),
-        (&hidden("t"), "sku", "character varying(40)"),
-        ("public.by_code", "region", "text"),
-        (&hidden("p"), "region", "text"),
-        (&hidden("t"), "region", "text"),
+        ("public.by_code", "sku", "character varying"),
+        (&hidden("m"), "sku", "character varying"),
+        (&hidden("t"), "sku", "character varying"),
+        ("public.by_code", "region", "character varying"),
+        (&hidden("p"), "region", "character varying"),
+        (&hidden("t"), "region", "character varying"),
     ] {
         assert_eq!(
             column_type(&raw, table, column).await,
@@ -865,7 +865,7 @@ async fn a_widened_column_of_either_table_is_retyped_in_place_or_pauses_the_join
     ] {
         assert_eq!(
             column_type(&raw, &table, column).await,
-            "character varying(20) collate C",
+            "character varying collate C",
             "{table}.{column}"
         );
     }

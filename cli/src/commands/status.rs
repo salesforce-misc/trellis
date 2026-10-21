@@ -139,6 +139,7 @@ async fn report(trellis: &Trellis) -> Result<String, String> {
             correcting: status.correcting,
             source_index_gaps: status.source_index_gaps,
             join: status.join,
+            paused_upstream_columns: status.paused_upstream_columns,
         });
         listed.push((def, warnings));
     }
@@ -199,6 +200,7 @@ struct StatusWarnings {
     correcting: Vec<CorrectingNode>,
     source_index_gaps: Vec<SourceIndexGap>,
     join: Option<JoinStatus>,
+    paused_upstream_columns: Vec<String>,
 }
 
 /// One line per definition, each followed by an indented line per thing
@@ -264,6 +266,15 @@ fn format_definitions(definitions: &[(DefinitionSummary, StatusWarnings)]) -> St
             // #1167: a source index the target's `self_check` pages by.
             for gap in &warnings.source_index_gaps {
                 line.push_str(&format_source_index_gap(gap));
+            }
+            // #1208: why a `live` definition reads `catching_up`: it reads
+            // a paused column of an upstream target, and resuming that column
+            // writes through to it.
+            if !warnings.paused_upstream_columns.is_empty() {
+                line.push_str(&format!(
+                    "    reads paused upstream column(s) {}; resuming them brings it back to live\n",
+                    warnings.paused_upstream_columns.join(", ")
+                ));
             }
             // #1112: a JOIN's hidden tables and the size of its partials.
             if let Some(join) = &warnings.join {
@@ -692,6 +703,27 @@ mod tests {
              status=backfilling created_at=1970-01-01 00:00:00 UTC\n    \
              correcting public.orders_2026 since=1970-01-01 00:01:00 UTC keys_remaining=1200\n    \
              correcting public.orders_2027 since=1970-01-01 00:01:30 UTC\n"
+        );
+    }
+
+    #[test]
+    fn a_paused_upstream_column_is_named_under_the_catching_up_reader() {
+        let def = DefinitionSummary {
+            target_table: "public.order_totals".to_string(),
+            status: trellis::TransformStatus::CatchingUp,
+            created_at: UNIX_EPOCH,
+            backfill_failure: None,
+            halt: None,
+        };
+        let warnings = StatusWarnings {
+            paused_upstream_columns: vec!["t.a".to_string(), "t.b".to_string()],
+            ..StatusWarnings::default()
+        };
+        assert_eq!(
+            format_definitions(&[(def, warnings)]),
+            "  target=public.order_totals \
+             status=catching_up created_at=1970-01-01 00:00:00 UTC\n    \
+             reads paused upstream column(s) t.a, t.b; resuming them brings it back to live\n"
         );
     }
 

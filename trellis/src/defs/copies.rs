@@ -28,18 +28,25 @@
 //! - an aggregate ledger's contribution column, typed as the aggregate's
 //!   argument ([`super::ledger::contribution_pg_type`]).
 //!
+//! A copy of a `varchar(n)` column is an unbounded `varchar` (#1207), with the
+//! column's collation: `varchar(n)`, `varchar` and `text` are one type to
+//! Postgres, which checks a length only when a value is assigned, so the
+//! copy holds whatever the source column holds after any change of its
+//! bound, and a `text` and `varchar(n)` source column are one family
+//! ([`CopyState::drifted`]). The other copies keep their source column's
+//! type.
+//!
 //! None of them changes type when the source column does. After the source
-//! column widens (`integer` to `bigint`, `varchar(50)` to `text`), the
-//! first value the column can't hold fails its write (`22003`, `22001`). So
+//! column widens (`integer` to `bigint`, `numeric(10,2)` to `numeric(12,2)`),
+//! the first value the column can't hold fails its write (`22003`). So
 //! the staging worker's capture pass compares each column with the type
 //! define would give it from the live schema ([`inspect`]), and acts on
 //! each table holding a column the source widened
 //! (`staging::schema_change::pause_readers_of_retyped`):
 //!
 //! - When every widened column of the table widened by changing only the
-//!   catalog ([`CopyState::catalog_only`]: a longer `varchar`, `text`, a
-//!   `varchar` without its length, or a `numeric` with more precision at the
-//!   same scale), the pass re-types those columns itself, in place. No value
+//!   catalog ([`CopyState::catalog_only`]: a `numeric` with more precision at
+//!   the same scale), the pass re-types those columns itself, in place. No value
 //!   changes, nothing is rewritten, and no definition pauses or rebuilds.
 //!   Then the keys its definitions held for a value the old type couldn't
 //!   hold are released (`staging::quarantine::release_retyped_keys`).
@@ -695,6 +702,9 @@ fn expr_reads(
     }
 }
 
+/// `pg_type.oid` of `varchar`.
+const VARCHAR_OID: u32 = 1043;
+
 /// A column type: its OID and modifier, its `schema.typname` and modifier
 /// ([`ColumnType`]), and `format_type`'s rendering.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -722,7 +732,15 @@ pub(crate) struct CopyState {
 
 impl CopyState {
     /// Whether the copy's type is no longer the one define would create.
+    ///
+    /// `text` and `varchar` are one family (#1207): Trellis's copy of a
+    /// `varchar(n)` column is an unbounded `varchar`, so a source column
+    /// that changes between `text` and `varchar(n)`, or between bounds,
+    /// leaves every copy as it should be.
     pub(crate) fn drifted(&self) -> bool {
+        if self.copy_type.ty.is_string() && self.live_type.ty.is_string() {
+            return false;
+        }
         (self.copy_type.oid, self.copy_type.typmod) != (self.live_type.oid, self.live_type.typmod)
     }
 
@@ -836,6 +854,9 @@ pub(crate) async fn inspect(
                         Some(oid) => (oid, -1),
                         None => continue,
                     }
+                } else if source_oid == VARCHAR_OID {
+                    // A copy of a `varchar(n)` column is unbounded (#1207).
+                    (source_oid, -1)
                 } else {
                     (source_oid, source_typmod)
                 }
@@ -907,8 +928,8 @@ pub(crate) async fn describe(
 /// type, one batch per table, each to run in its own transaction: an
 /// `alter table … alter column … type … using …`, which takes `ACCESS
 /// EXCLUSIVE` on the table and rewrites it when the change isn't
-/// binary-compatible (`integer` to `bigint`; a `varchar` widening only
-/// changes the catalog). A group-delta table's partition column is
+/// binary-compatible (`integer` to `bigint`; a `numeric` precision widening
+/// at the same scale only changes the catalog). A group-delta table's partition column is
 /// generated from its `GROUP BY` columns, so it is generated again
 /// ([`super::ledger::deltas_retype_sql`]). Each comes with the labels of the
 /// copies it re-types, for messages. Empty when nothing drifted.
@@ -1157,6 +1178,46 @@ mod tests {
             "alter table \"public\".\"t\" alter column \"code\" type varchar(40) \
              using \"code\"::varchar(40)"
         );
+    }
+
+    /// `text` and `varchar(n)` are one family (#1207): a copy of either is
+    /// unbounded, so a source column changing between them, or between
+    /// bounds, drifts nothing and re-types nothing.
+    #[test]
+    fn a_string_column_never_drifts_between_text_and_varchar() {
+        let string = |name: &str, oid, typmod| CopyType {
+            oid,
+            typmod,
+            ty: ColumnType {
+                type_name: format!("pg_catalog.{name}"),
+                typmod,
+            },
+            display: name.to_string(),
+            collatable: true,
+        };
+        let mut s = state(CopyKind::Passthrough, "\"public\".\"t\"", "c", "x", "y");
+        for (copy, live) in [
+            (string("varchar", 1043, -1), string("text", 25, -1)),
+            (string("text", 25, -1), string("varchar", 1043, 12)),
+            (string("varchar", 1043, -1), string("varchar", 1043, 12)),
+            (string("varchar", 1043, 9), string("varchar", 1043, 12)),
+        ] {
+            s.copy_type = copy;
+            s.live_type = live;
+            assert!(!s.drifted() && !s.outgrown() && !s.catalog_only());
+            assert!(retype_statements(std::slice::from_ref(&s)).is_empty());
+        }
+        s.live_type = CopyType {
+            oid: 23,
+            typmod: -1,
+            ty: ColumnType {
+                type_name: "pg_catalog.int4".to_string(),
+                typmod: -1,
+            },
+            display: "integer".to_string(),
+            collatable: false,
+        };
+        assert!(s.drifted(), "another family still drifts");
     }
 
     #[test]

@@ -489,17 +489,23 @@ async fn changes_no_key_copy_or_pairing_depends_on_pause_nothing() {
 }
 
 /// `public.items`, keyed by an `integer`, with a 1-1 definition whose
-/// target copies the key and passes `name` (`varchar(10)`) through, live.
+/// target copies the key and passes `name` (`varchar(10)`, an unbounded
+/// `varchar` on the target, #1207) and `amount` (`numeric(5,2)`) through,
+/// live.
 async fn items(dsn: &str, raw: &mut Client, pool: &trellis::Pool) -> Trellis {
     raw.batch_execute(
-        "create table public.items (id int primary key, name varchar(10), qty int); \
-         insert into public.items values (1, 'one', 1), (2, 'two', 2);",
+        "create table public.items (id int primary key, name varchar(10), qty int, \
+                                    amount numeric(5,2)); \
+         insert into public.items values (1, 'one', 1, 1.50), (2, 'two', 2, 2.50);",
     )
     .await
     .expect("seed");
     let trellis = definer(dsn).await;
     trellis
-        .apply("TRANSFORM item_names FROM public.items SELECT name AS name, qty + 1 AS next")
+        .apply(
+            "TRANSFORM item_names FROM public.items \
+             SELECT name AS name, qty + 1 AS next, amount AS amount",
+        )
         .await
         .expect("define item_names");
     bring_live(raw, pool, &["item_names"]).await;
@@ -578,13 +584,13 @@ async fn widening_a_one_to_one_key_pauses_and_resume_widens_the_target_key() {
     assert_eq!(status(&raw, "item_names").await, TransformStatus::Live);
 }
 
-/// A table where one column widens without a rewrite (a passthrough's
-/// `varchar(10)` to `varchar(40)`) and another with one (the key's
-/// `integer` to `bigint`) isn't re-typed in place (#824): the pass pauses
-/// the definition, naming both, and a resume re-types both and rebuilds, so
-/// a longer value lands. A narrowing of a passthrough pauses nothing and
-/// re-types nothing: every value still fits. It rebuilds the definition
-/// (#703 R1): the narrowing may have dropped trailing spaces.
+/// A passthrough of a `varchar` is an unbounded `varchar` (#1207): the
+/// source column's widening changes nothing there, so only the key's
+/// `integer` to `bigint`, which rewrites, outgrows a copy. The pass pauses
+/// the definition, naming the key alone, and a resume re-types it and
+/// rebuilds, so a longer value lands. A narrowing of the passthrough pauses
+/// nothing and re-types nothing: every value still fits. It rebuilds the
+/// definition (#703 R1): the narrowing may have dropped trailing spaces.
 #[tokio::test]
 async fn a_table_that_also_needs_a_rewrite_pauses_and_resume_re_types_all_of_it() {
     let cluster = TestCluster::start();
@@ -599,7 +605,7 @@ async fn a_table_that_also_needs_a_rewrite_pauses_and_resume_re_types_all_of_it(
     assert!(rebuilding(status(&raw, "item_names").await));
     assert_eq!(
         column_type(&raw, "public.item_names", "name").await,
-        "character varying(10)"
+        "character varying"
     );
     bring_live(&mut raw, &db.pool, &["item_names"]).await;
 
@@ -610,16 +616,14 @@ async fn a_table_that_also_needs_a_rewrite_pauses_and_resume_re_types_all_of_it(
     .await
     .expect("widen the passthrough and the key");
     capture_pass(&mut raw, &db.pool).await;
-    let error = paused_for(&trellis, "item_names", "public.items", &["id", "name"]).await;
+    let error = paused_for(&trellis, "item_names", "public.items", &["id"]).await;
     assert!(
-        error.contains("widened to character varying(40)")
-            && error.contains("public.item_names.name (character varying(10))")
-            && error.contains("widened to bigint"),
+        error.contains("widened to bigint") && !error.contains("character varying"),
         "{error}"
     );
     assert_eq!(
         column_type(&raw, "public.item_names", "name").await,
-        "character varying(10)"
+        "character varying"
     );
 
     resume(&trellis, "item_names").await;
@@ -627,7 +631,7 @@ async fn a_table_that_also_needs_a_rewrite_pauses_and_resume_re_types_all_of_it(
     capture_pass(&mut raw, &db.pool).await;
     assert_eq!(
         column_type(&raw, "public.item_names", "name").await,
-        "character varying(40)"
+        "character varying"
     );
     assert_eq!(column_type(&raw, "public.item_names", "id").await, "bigint");
     bring_live(&mut raw, &db.pool, &["item_names"]).await;
@@ -1347,7 +1351,7 @@ async fn widening_a_group_by_key_read_through_a_relationship_re_types_its_projec
     assert_eq!(status(&raw, "per_country").await, TransformStatus::Live);
     assert_eq!(
         column_type(&raw, &projection, "country").await,
-        "character varying(20)"
+        "character varying"
     );
     assert_eq!(relfilenode(&raw, &projection).await, before, "no rewrite");
     raw.batch_execute("update public.users set country = 'United States' where id = 1")
@@ -2070,7 +2074,7 @@ async fn widening_a_column_a_calculated_field_reads_pauses_and_resume_re_types_t
     capture_pass(&mut raw, &db.pool).await;
     for (column, ty) in [
         ("id", "integer"),
-        ("name", "character varying(10)"),
+        ("name", "character varying"),
         ("next", "bigint"),
     ] {
         assert_eq!(
@@ -2526,7 +2530,7 @@ async fn a_definition_refused_at_its_automatic_resume_stays_paused_with_the_refu
     let mut raw = connect(db.dsn()).await;
     let trellis = items(db.dsn(), &mut raw, &db.pool).await;
     raw.batch_execute(
-        "create table public.owners (code varchar(10) primary key, label text); \
+        "create table public.owners (code varchar primary key, label text); \
          insert into public.owners values ('one', 'First'), ('two', 'Second');",
     )
     .await
@@ -2958,7 +2962,7 @@ async fn a_waiting_resume_refused_once_its_upstream_is_live_is_not_retried() {
     let mut raw = connect(db.dsn()).await;
     let trellis = items(db.dsn(), &mut raw, &db.pool).await;
     raw.batch_execute(
-        "create table public.owners (code varchar(10) primary key, label text); \
+        "create table public.owners (code varchar primary key, label text); \
          insert into public.owners values ('one', 'First'), ('two', 'Second');",
     )
     .await
@@ -3457,6 +3461,7 @@ async fn a_catalog_only_widening_re_types_in_place(
     value: &str,
     (value_to, value_display): (&str, &str),
     (long_key, long_value): (&str, &str),
+    written_before_the_pass: bool,
 ) {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -3477,6 +3482,27 @@ async fn a_catalog_only_widening_re_types_in_place(
         ));
     }
     raw.batch_execute(&alter).await.expect("widen the source");
+    let write_long = async |raw: &Client| {
+        raw.execute(
+            &format!("insert into public.users values ($1, $2::text::{value_to})"),
+            &[&long_key, &long_value],
+        )
+        .await
+        .expect("a key and a value the old types can't hold");
+        raw.execute(
+            &format!("insert into public.posts values (4, $1, $2::text::{value_to})"),
+            &[&long_key, &long_value],
+        )
+        .await
+        .expect("a post by it");
+    };
+    if written_before_the_pass {
+        // #1207: the copies of a string column are unbounded, so the drain
+        // applies these with no pass in between.
+        write_long(&raw).await;
+        drain_to_quiescence(&db.pool, &mut raw).await;
+        assert_widening_targets_match(&raw).await;
+    }
     full_pass(&mut raw, &db.pool).await;
 
     for target in WIDENING_TARGETS {
@@ -3513,18 +3539,9 @@ async fn a_catalog_only_widening_re_types_in_place(
         "no rewrite"
     );
 
-    raw.execute(
-        &format!("insert into public.users values ($1, $2::text::{value_to})"),
-        &[&long_key, &long_value],
-    )
-    .await
-    .expect("a key and a value the old types can't hold");
-    raw.execute(
-        &format!("insert into public.posts values (4, $1, $2::text::{value_to})"),
-        &[&long_key, &long_value],
-    )
-    .await
-    .expect("a post by it");
+    if !written_before_the_pass {
+        write_long(&raw).await;
+    }
     full_pass(&mut raw, &db.pool).await;
     drain_to_quiescence(&db.pool, &mut raw).await;
     for target in WIDENING_TARGETS {
@@ -3543,50 +3560,58 @@ async fn a_catalog_only_widening_re_types_in_place(
     assert_widening_targets_match(&raw).await;
 }
 
+/// #1207: a copy of a `varchar(n)` column is an unbounded `varchar`, so a
+/// source column's change of bound, or to `text`, re-types no copy: the
+/// pass leaves every column and file as it is and pauses nothing, and a key
+/// and a value past the old bound apply before it.
 #[tokio::test]
-async fn a_longer_varchar_is_re_typed_in_place() {
+async fn a_longer_varchar_re_types_no_copy() {
     a_catalog_only_widening_re_types_in_place(
         "varchar(10)",
-        Some(("varchar(40)", "character varying(40)")),
+        Some(("varchar(40)", "character varying")),
         "varchar(10)",
-        ("varchar(40)", "character varying(40)"),
+        ("varchar(40)", "character varying"),
         ("a handle past ten", "a label past ten characters"),
+        true,
     )
     .await;
 }
 
 #[tokio::test]
-async fn a_bounded_varchar_to_text_is_re_typed_in_place() {
+async fn a_bounded_varchar_to_text_re_types_no_copy() {
     a_catalog_only_widening_re_types_in_place(
         "varchar(10)",
-        Some(("text", "text")),
+        Some(("text", "character varying")),
         "varchar(10)",
-        ("text", "text"),
+        ("text", "character varying"),
         ("a handle past ten", "a label past ten characters"),
+        true,
     )
     .await;
 }
 
 #[tokio::test]
-async fn an_unbounded_varchar_to_text_is_re_typed_in_place() {
+async fn an_unbounded_varchar_to_text_re_types_no_copy() {
     a_catalog_only_widening_re_types_in_place(
         "varchar",
-        Some(("text", "text")),
+        Some(("text", "character varying")),
         "varchar",
-        ("text", "text"),
+        ("text", "character varying"),
         ("a handle past ten", "a label past ten characters"),
+        false,
     )
     .await;
 }
 
 #[tokio::test]
-async fn removing_a_varchar_length_is_re_typed_in_place() {
+async fn removing_a_varchar_length_re_types_no_copy() {
     a_catalog_only_widening_re_types_in_place(
         "varchar(10)",
         Some(("varchar", "character varying")),
         "varchar(10)",
         ("varchar", "character varying"),
         ("a handle past ten", "a label past ten characters"),
+        false,
     )
     .await;
 }
@@ -3600,13 +3625,14 @@ async fn more_numeric_precision_at_the_same_scale_is_re_typed_in_place() {
         "numeric(5,2)",
         ("numeric(9,2)", "numeric(9,2)"),
         ("dan", "12345.67"),
+        false,
     )
     .await;
 }
 
 /// #824 rule 3: values written after the source widened and before the
-/// pass re-types Trellis's columns fail their writes, `22001` for a
-/// `varchar` and `22003` for a `numeric`, and their keys are held: a 1-1
+/// pass re-types Trellis's columns fail their writes with `22003` for a `numeric` (#1207: a string column's
+/// copy holds any length), and their keys are held: a 1-1
 /// target's passthroughs, and a to-one projection's data column, whose
 /// failed write holds the to-side key for the definition reading through
 /// it. One pass re-types the columns in place and releases those keys, and
@@ -3621,9 +3647,9 @@ async fn keys_held_for_a_value_the_old_type_couldnt_hold_are_released_after_the_
         "create table public.goods (id int primary key, name varchar(10), price numeric(5,2), \
                                     qty int); \
          insert into public.goods values (1, 'one', 1.00, 1), (2, 'two', 2.00, 2); \
-         create table public.users (id int primary key, name varchar(10)); \
+         create table public.users (id int primary key, score numeric(5,2)); \
          create table public.posts (id int primary key, author_id int); \
-         insert into public.users values (1, 'Ann'), (2, 'Bob'); \
+         insert into public.users values (1, 1.50), (2, 2.50); \
          insert into public.posts values (1, 1), (2, 2), (3, 1);",
     )
     .await
@@ -3632,7 +3658,7 @@ async fn keys_held_for_a_value_the_old_type_couldnt_hold_are_released_after_the_
     for text in [
         "TRANSFORM good_names FROM public.goods SELECT name AS name, price AS price, qty AS qty",
         "RELATIONSHIP author FROM posts.author_id TO users.id",
-        "TRANSFORM post_authors FROM public.posts SELECT author.name AS author_name",
+        "TRANSFORM post_authors FROM public.posts SELECT author.score AS author_score",
     ] {
         trellis.apply(text).await.expect(text);
     }
@@ -3645,10 +3671,10 @@ async fn keys_held_for_a_value_the_old_type_couldnt_hold_are_released_after_the_
     raw.batch_execute(
         "alter table public.goods alter column name type varchar(40), \
                                   alter column price type numeric(9,2); \
-         alter table public.users alter column name type varchar(40); \
+         alter table public.users alter column score type numeric(9,2); \
          insert into public.goods values (3, 'a name past ten characters', 3.00, 3), \
                                          (4, 'four', 12345.67, 4), (5, 'five', 5.00, 500); \
-         update public.users set name = 'Ann With A Long Name' where id = 1;",
+         update public.users set score = 12345.67 where id = 1;",
     )
     .await
     .expect("widen, then write values the copies can't hold");
@@ -3670,10 +3696,9 @@ async fn keys_held_for_a_value_the_old_type_couldnt_hold_are_released_after_the_
     assert_eq!(
         held(&raw).await,
         vec![
-            row("good_names", "public.goods", "3", "22001"),
             row("good_names", "public.goods", "4", "22003"),
             row("good_names", "public.goods", "5", "23514"),
-            row("post_authors", "public.users", "1", "22001"),
+            row("post_authors", "public.users", "1", "22003"),
         ]
     );
 
@@ -3687,7 +3712,7 @@ async fn keys_held_for_a_value_the_old_type_couldnt_hold_are_released_after_the_
     }
     assert_eq!(
         column_type(&raw, "public.good_names", "name").await,
-        "character varying(40)"
+        "character varying"
     );
     assert_eq!(
         column_type(&raw, "public.good_names", "price").await,
@@ -3705,9 +3730,8 @@ async fn keys_held_for_a_value_the_old_type_couldnt_hold_are_released_after_the_
     };
     assert_eq!(
         requests(&raw).await,
-        3,
-        "each request is kept for its window: 22001 and 22003 for good_names, 22001 for \
-         post_authors"
+        2,
+        "each request is kept for its window: 22003 for good_names and for post_authors"
     );
 
     // The goods apply in the first drain. The released `users` key's
@@ -3732,12 +3756,12 @@ async fn keys_held_for_a_value_the_old_type_couldnt_hold_are_released_after_the_
     assert_eq!(
         rows(
             &raw,
-            "select id::text, author_name from public.post_authors order by id"
+            "select id::text, author_score::text from public.post_authors order by id"
         )
         .await,
         rows(
             &raw,
-            "select p.id::text, u.name::text from public.posts p \
+            "select p.id::text, u.score::text from public.posts p \
              join public.users u on u.id = p.author_id order by p.id"
         )
         .await,
@@ -3748,8 +3772,8 @@ async fn keys_held_for_a_value_the_old_type_couldnt_hold_are_released_after_the_
     // pass within the request's window releases it.
     raw.execute(
         "insert into poison (transform_id, src_table, key, last_error, sqlstate) \
-         select id, 'public.goods', '2', 'value too long for type character varying(10)', \
-                '22001' \
+         select id, 'public.goods', '2', 'numeric field overflow', \
+                '22003' \
          from transform_definitions where target_table = 'public.good_names'",
         &[],
     )
@@ -3820,7 +3844,7 @@ async fn a_re_type_that_cant_lock_its_table_changes_nothing_and_pauses_nothing()
     let mut raw = connect(db.dsn()).await;
     items(db.dsn(), &mut raw, &db.pool).await;
 
-    raw.batch_execute("alter table public.items alter column name type varchar(40)")
+    raw.batch_execute("alter table public.items alter column amount type numeric(9,2)")
         .await
         .expect("widen the passthrough");
     let locker = connect(db.dsn()).await;
@@ -3831,8 +3855,8 @@ async fn a_re_type_that_cant_lock_its_table_changes_nothing_and_pauses_nothing()
     capture_pass(&mut raw, &db.pool).await;
     assert_eq!(status(&raw, "item_names").await, TransformStatus::Live);
     assert_eq!(
-        column_type(&raw, "public.item_names", "name").await,
-        "character varying(10)"
+        column_type(&raw, "public.item_names", "amount").await,
+        "numeric(5,2)"
     );
     let requests: i64 = raw
         .query_one("select count(*) from retype_releases", &[])
@@ -3845,8 +3869,8 @@ async fn a_re_type_that_cant_lock_its_table_changes_nothing_and_pauses_nothing()
     capture_pass(&mut raw, &db.pool).await;
     assert_eq!(status(&raw, "item_names").await, TransformStatus::Live);
     assert_eq!(
-        column_type(&raw, "public.item_names", "name").await,
-        "character varying(40)"
+        column_type(&raw, "public.item_names", "amount").await,
+        "numeric(9,2)"
     );
 }
 
@@ -3862,17 +3886,17 @@ async fn a_re_type_in_place_that_fails_pauses_its_definition_instead() {
     let trellis = items(db.dsn(), &mut raw, &db.pool).await;
 
     raw.batch_execute(
-        "create view public.item_name_list as select name from public.item_names; \
-         alter table public.items alter column name type varchar(40)",
+        "create view public.item_name_list as select amount from public.item_names; \
+         alter table public.items alter column amount type numeric(9,2)",
     )
     .await
     .expect("a view on the target's column, then widen the passthrough");
     capture_pass(&mut raw, &db.pool).await;
-    let error = paused_for(&trellis, "item_names", "public.items", &["name"]).await;
-    assert!(error.contains("character varying(40)"), "{error}");
+    let error = paused_for(&trellis, "item_names", "public.items", &["amount"]).await;
+    assert!(error.contains("numeric(9,2)"), "{error}");
     assert_eq!(
-        column_type(&raw, "public.item_names", "name").await,
-        "character varying(10)"
+        column_type(&raw, "public.item_names", "amount").await,
+        "numeric(5,2)"
     );
     let requests: i64 = raw
         .query_one("select count(*) from retype_releases", &[])
@@ -3895,17 +3919,17 @@ async fn a_failed_re_type_in_place_is_not_held_against_a_definition_defined_agai
     let trellis = items(db.dsn(), &mut raw, &db.pool).await;
 
     raw.batch_execute(
-        "create view public.item_name_list as select name from public.item_names; \
-         alter table public.items alter column name type varchar(40)",
+        "create view public.item_name_list as select amount from public.item_names; \
+         alter table public.items alter column amount type numeric(9,2)",
     )
     .await
     .expect("a view on the target's column, then widen the passthrough");
     capture_pass(&mut raw, &db.pool).await;
-    paused_for(&trellis, "item_names", "public.items", &["name"]).await;
+    paused_for(&trellis, "item_names", "public.items", &["amount"]).await;
 
     raw.batch_execute(
         "drop view public.item_name_list; \
-         alter table public.items alter column name type varchar(10)",
+         alter table public.items alter column amount type numeric(5,2)",
     )
     .await
     .expect("drop the view, and narrow the passthrough back");
@@ -3914,21 +3938,24 @@ async fn a_failed_re_type_in_place_is_not_held_against_a_definition_defined_agai
         .await
         .expect("drop item_names");
     trellis
-        .apply("TRANSFORM item_names FROM public.items SELECT name AS name, qty + 1 AS next")
+        .apply(
+            "TRANSFORM item_names FROM public.items \
+             SELECT name AS name, qty + 1 AS next, amount AS amount",
+        )
         .await
         .expect("define item_names again");
     assert_eq!(
-        column_type(&raw, "public.item_names", "name").await,
-        "character varying(10)"
+        column_type(&raw, "public.item_names", "amount").await,
+        "numeric(5,2)"
     );
-    raw.batch_execute("alter table public.items alter column name type varchar(40)")
+    raw.batch_execute("alter table public.items alter column amount type numeric(9,2)")
         .await
         .expect("widen the passthrough again");
     capture_pass(&mut raw, &db.pool).await;
     assert_ne!(status(&raw, "item_names").await, TransformStatus::Paused);
     assert_eq!(
-        column_type(&raw, "public.item_names", "name").await,
-        "character varying(40)"
+        column_type(&raw, "public.item_names", "amount").await,
+        "numeric(9,2)"
     );
     bring_live(&mut raw, &db.pool, &["item_names"]).await;
 }
@@ -3982,7 +4009,7 @@ async fn a_re_type_in_place_that_fails_transiently_pauses_nothing() {
     items(db.dsn(), &mut raw, &db.pool).await;
     watch_item_names_retypes(&raw).await;
 
-    raw.batch_execute("alter table public.items alter column name type varchar(40)")
+    raw.batch_execute("alter table public.items alter column amount type numeric(9,2)")
         .await
         .expect("widen the passthrough");
     for (attempt, code) in ["40P01", "57014"].into_iter().enumerate() {
@@ -3997,8 +4024,8 @@ async fn a_re_type_in_place_that_fails_transiently_pauses_nothing() {
             "{code}"
         );
         assert_eq!(
-            column_type(&raw, "public.item_names", "name").await,
-            "character varying(10)",
+            column_type(&raw, "public.item_names", "amount").await,
+            "numeric(5,2)",
             "{code}"
         );
         raw.batch_execute("delete from public.retype_injection")
@@ -4016,8 +4043,8 @@ async fn a_re_type_in_place_that_fails_transiently_pauses_nothing() {
     assert_eq!(retype_attempts(&raw).await, 3);
     assert_eq!(status(&raw, "item_names").await, TransformStatus::Live);
     assert_eq!(
-        column_type(&raw, "public.item_names", "name").await,
-        "character varying(40)"
+        column_type(&raw, "public.item_names", "amount").await,
+        "numeric(9,2)"
     );
 }
 
@@ -4073,68 +4100,9 @@ async fn a_resume_re_type_that_fails_transiently_keeps_the_request() {
     assert_item_names_match(&raw).await;
 }
 
-/// #824: an in-place re-type that fails for good on a column that isn't
-/// outgrown (an unbounded `varchar` to `text`, with a view on the target's
-/// column) pauses nothing, since the column still holds every value. The
-/// next pass doesn't try it again, so it doesn't take the target's lock
-/// every pass: only once the source's type changes again, here after the
-/// view is gone.
-#[tokio::test]
-async fn a_re_type_in_place_that_fails_on_a_column_not_outgrown_is_not_retried() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut raw = connect(db.dsn()).await;
-    items(db.dsn(), &mut raw, &db.pool).await;
-    raw.batch_execute("alter table public.items alter column name type varchar")
-        .await
-        .expect("drop the passthrough's length");
-    capture_pass(&mut raw, &db.pool).await;
-    assert_eq!(
-        column_type(&raw, "public.item_names", "name").await,
-        "character varying"
-    );
-    watch_item_names_retypes(&raw).await;
-
-    raw.batch_execute(
-        "create view public.item_name_list as select name from public.item_names; \
-         alter table public.items alter column name type text",
-    )
-    .await
-    .expect("a view on the target's column, then move the passthrough to text");
-    for pass in 0..2 {
-        capture_pass(&mut raw, &db.pool).await;
-        assert_eq!(retype_attempts(&raw).await, 1, "pass {pass}");
-        assert_eq!(
-            status(&raw, "item_names").await,
-            TransformStatus::Live,
-            "pass {pass}"
-        );
-        assert_eq!(
-            column_type(&raw, "public.item_names", "name").await,
-            "character varying",
-            "pass {pass}"
-        );
-    }
-
-    raw.batch_execute(
-        "drop view public.item_name_list; \
-         alter table public.items alter column name type varchar",
-    )
-    .await
-    .expect("drop the view, and move the passthrough back");
-    capture_pass(&mut raw, &db.pool).await;
-    assert_eq!(retype_attempts(&raw).await, 1);
-    raw.batch_execute("alter table public.items alter column name type text")
-        .await
-        .expect("move the passthrough to text again");
-    capture_pass(&mut raw, &db.pool).await;
-    assert_eq!(retype_attempts(&raw).await, 2);
-    assert_eq!(status(&raw, "item_names").await, TransformStatus::Live);
-    assert_eq!(column_type(&raw, "public.item_names", "name").await, "text");
-}
-
-/// #824: a 1-1 key re-typed in place (`varchar(10)` to `varchar(40)`)
-/// keeps the collation it copied from the source key, and its index. It is
+/// #824, #1207: a 1-1 key's copy of a `varchar(10)` source key is an
+/// unbounded `varchar` with the source key's collation and its index, and a
+/// widening to `varchar(40)` leaves both as they are. The source key is
 /// recorded at its new type, as a resume records it. Its target stores
 /// keys of that type from then on, so a later narrowing (`varchar(20)`,
 /// truncating a key past it) is measured from it, and pauses the
@@ -4178,7 +4146,7 @@ async fn a_key_re_typed_in_place_is_measured_from_its_new_type() {
     assert_eq!(status(&raw, "code_counts").await, TransformStatus::Live);
     assert_eq!(
         column_type(&raw, "public.code_counts", "code").await,
-        "character varying(40)"
+        "character varying"
     );
     assert_eq!(
         key_index(&raw).await,
@@ -4560,10 +4528,11 @@ async fn a_widening_after_clean_passes_is_caught_on_the_next_pass() {
     assert!(after["per_kind"] > settled["per_kind"], "{after:?}");
 }
 
-/// A catalog-only widening of a column read through a relationship, after
-/// clean passes, is re-typed in place by the next pass, both sides alike.
+/// A widening of a `varchar` column read through a relationship, after clean
+/// passes, is compared again by the next pass, both sides alike, and finds
+/// the unbounded copies current (#1207).
 #[tokio::test]
-async fn a_catalog_only_widening_after_clean_passes_is_re_typed_on_the_next_pass() {
+async fn a_varchar_widening_after_clean_passes_is_compared_again_and_re_types_nothing() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
@@ -4593,7 +4562,7 @@ async fn a_catalog_only_widening_after_clean_passes_is_re_typed_on_the_next_pass
         .get(0);
     assert_eq!(
         column_type(&raw, &format!("trellis.{projection}"), "handle").await,
-        "character varying(40)"
+        "character varying"
     );
     let after = copy_checks(&raw).await;
     assert!(after["post_authors"] > settled["post_authors"], "{after:?}");
@@ -4714,7 +4683,8 @@ async fn a_change_to_a_ledger_or_projection_column_alone_is_compared_again() {
 }
 
 /// A copy found different from what define would give it, though the source
-/// is not past it (here the source narrowed), is compared on every pass.
+/// is not past it (here an integer source narrowed to `smallint`), is
+/// compared on every pass.
 #[tokio::test]
 async fn a_drifted_copy_is_never_skipped() {
     let cluster = TestCluster::start();
@@ -4722,17 +4692,17 @@ async fn a_drifted_copy_is_never_skipped() {
     let mut raw = connect(db.dsn()).await;
     let (_trellis, settled) = settled(&db, &mut raw).await;
 
-    raw.batch_execute("alter table public.posts alter column title type varchar(5)")
+    raw.batch_execute("alter table public.posts alter column kind type smallint")
         .await
         .expect("narrow the source");
     capture_pass(&mut raw, &db.pool).await;
     let first = copy_checks(&raw).await;
-    assert!(first["post_titles"] > settled["post_titles"], "{first:?}");
+    assert!(first["per_kind"] > settled["per_kind"], "{first:?}");
     capture_pass(&mut raw, &db.pool).await;
     let second = copy_checks(&raw).await;
-    assert!(second["post_titles"] > first["post_titles"], "{second:?}");
-    // A narrowing pauses nothing; it rebuilds the readers (#703 R1).
-    assert!(rebuilding(status(&raw, "post_titles").await));
+    assert!(second["per_kind"] > first["per_kind"], "{second:?}");
+    // A narrowing pauses nothing.
+    assert_eq!(status(&raw, "per_kind").await, TransformStatus::Live);
 }
 
 /// `ALTER TRANSFORM` rewrites a definition in place, giving it a column
@@ -4768,8 +4738,8 @@ async fn a_column_added_by_alter_transform_is_compared_after_clean_passes() {
 }
 
 /// A definition whose comparison is skipped still owns the tables it has a
-/// copy on. Here `post_authors` and `post_nicks` share the relationship's
-/// projection; a widening of the to-side column only `post_nicks` reads waits
+/// copy on. Here `post_authors` and `post_scores` share the relationship's
+/// projection; a widening of the to-side column only `post_scores` reads waits
 /// out the projection's lock in one pass, and the next pass, which skips
 /// `post_authors`, re-types the projection in place and asks for the release
 /// of both definitions' held keys, as it would after comparing both.
@@ -4780,16 +4750,16 @@ async fn a_skipped_definition_still_owns_a_projection_re_typed_in_place() {
     let mut raw = connect(db.dsn()).await;
     let (trellis, _) = settled(&db, &mut raw).await;
     raw.batch_execute(
-        "alter table public.users add column nick varchar(4); \
-         update public.users set nick = left(handle, 2)",
+        "alter table public.users add column score numeric(4,1); \
+         update public.users set score = 1.5",
     )
     .await
     .expect("a second to-side column");
     trellis
-        .apply("TRANSFORM post_nicks FROM public.posts SELECT author.nick AS nick")
+        .apply("TRANSFORM post_scores FROM public.posts SELECT author.score AS score")
         .await
-        .expect("define post_nicks");
-    bring_live(&mut raw, &db.pool, &["post_nicks"]).await;
+        .expect("define post_scores");
+    bring_live(&mut raw, &db.pool, &["post_scores"]).await;
     capture_pass(&mut raw, &db.pool).await;
     let projection: String = raw
         .query_one("select projection_table from relationship_projections", &[])
@@ -4805,28 +4775,28 @@ async fn a_skipped_definition_still_owns_a_projection_re_typed_in_place() {
         ))
         .await
         .expect("hold a lock on the projection");
-    raw.batch_execute("alter table public.users alter column nick type varchar(10)")
+    raw.batch_execute("alter table public.users alter column score type numeric(8,1)")
         .await
-        .expect("widen the column only post_nicks reads");
+        .expect("widen the column only post_scores reads");
     capture_pass(&mut raw, &db.pool).await;
     assert_eq!(
-        column_type(&raw, &projection, "nick").await,
-        "character varying(4)"
+        column_type(&raw, &projection, "score").await,
+        "numeric(4,1)"
     );
     let waited = copy_checks(&raw).await;
 
     locker.batch_execute("rollback").await.expect("let go");
     capture_pass(&mut raw, &db.pool).await;
     assert_eq!(
-        column_type(&raw, &projection, "nick").await,
-        "character varying(10)"
+        column_type(&raw, &projection, "score").await,
+        "numeric(8,1)"
     );
     let after = copy_checks(&raw).await;
     assert_eq!(
         after["post_authors"], waited["post_authors"],
         "skipped: {after:?}"
     );
-    assert!(after["post_nicks"] > waited["post_nicks"], "{after:?}");
+    assert!(after["post_scores"] > waited["post_scores"], "{after:?}");
 
     let owners: Vec<String> = raw
         .query(
@@ -4840,7 +4810,7 @@ async fn a_skipped_definition_still_owns_a_projection_re_typed_in_place() {
         .into_iter()
         .map(|row| row.get(0))
         .collect();
-    assert_eq!(owners, ["post_authors", "post_nicks"]);
+    assert_eq!(owners, ["post_authors", "post_scores"]);
 }
 
 /// #1201: a target column someone re-typed by hand, with its source column

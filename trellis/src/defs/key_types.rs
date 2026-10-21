@@ -42,7 +42,8 @@
 //! that no copy holds (an aggregate's source key, a to-many join's to-side),
 //! a `numeric` precision change or wider scale on a `GROUP BY` key (its copy
 //! is unconstrained `numeric`), a wider temporal precision on a `GROUP BY`
-//! key (its copy is the type's full precision), `varchar` to `text`, and a
+//! key (its copy is the type's full precision), a string column's bound or
+//! `varchar` to `text` (its copies are unbounded, #1207), and a
 //! change between deterministic collations. None of them changes an existing
 //! value's identity, and every copy still holds every value.
 //!
@@ -229,6 +230,15 @@ impl ColumnType {
         }
     }
 
+    /// Whether this is `text` or `varchar`, bounded or not: one family to
+    /// Postgres, which checks a `varchar(n)`'s length only on assignment.
+    /// Trellis's copies of a string column are unbounded `varchar`, so a
+    /// copy and its source column are one family however either is spelled
+    /// (#1207).
+    pub(crate) fn is_string(&self) -> bool {
+        self.string_bound().is_some()
+    }
+
     /// A temporal type's fractional-second precision, `-1` meaning the
     /// default, 6.
     fn precision(&self) -> i32 {
@@ -300,15 +310,14 @@ pub(crate) fn renders_differently(old: &ColumnType, new: &ColumnType) -> bool {
 /// - an integer to a `numeric` with fractional digits, or with more integer
 ///   digits than the integer holds, or with no limit at all
 ///   ([`integer_outgrown_by_numeric`]): `bigint` → `numeric`;
-/// - a longer string bound (`varchar(n)` → `varchar(m>n)`, `text`, or an
-///   unbounded `varchar`);
 /// - a `numeric` with room for more integer or fractional digits, or none
 ///   at all ([`numeric_widens`]);
 /// - a wider temporal, `interval` or `bit varying` precision or length.
 ///
 /// Anything else is not a widening: equal types, a narrowing (every value
-/// still fits the copy), or another type altogether (a re-rendering,
-/// [`renders_differently`]'s, for a key).
+/// still fits the copy), a string column of any bound (Trellis's copy of one
+/// is an unbounded `varchar`, which holds every value, #1207), or another
+/// type altogether (a re-rendering, [`renders_differently`]'s, for a key).
 pub(crate) fn widens(copy: &ColumnType, live: &ColumnType) -> bool {
     if copy == live {
         return false;
@@ -316,8 +325,8 @@ pub(crate) fn widens(copy: &ColumnType, live: &ColumnType) -> bool {
     if let (Some(was), Some(is)) = (copy.int_width(), live.int_width()) {
         return is > was;
     }
-    if let (Some(was), Some(is)) = (copy.string_bound(), live.string_bound()) {
-        return narrower_bound(was, is);
+    if copy.is_string() && live.is_string() {
+        return false;
     }
     if copy.builtin() && live.builtin() && copy.base() == "float4" && live.base() == "float8" {
         return true;
@@ -342,14 +351,11 @@ pub(crate) fn widens(copy: &ColumnType, live: &ColumnType) -> bool {
 
 /// Whether a column of type `copy` can be re-typed to `live` by changing
 /// only the catalog: Postgres neither rewrites the table nor changes a value
-/// it holds, and each index on the column is kept. Exactly these widenings
-/// (#824):
+/// it holds, and each index on the column is kept. Exactly one widening
+/// (#824): `numeric(p,s)` to `numeric(q,s)` with `q > p`, the same scale.
 ///
-/// - `varchar(n)` to `varchar(m)` with `m > n`;
-/// - `varchar(n)`, or an unbounded `varchar`, to `text`;
-/// - `varchar(n)` to an unbounded `varchar`;
-/// - `numeric(p,s)` to `numeric(q,s)` with `q > p`: the same scale.
-///
+/// A string column needs none (#1207): Trellis's copy of a `varchar(n)` is
+/// an unbounded `varchar`, so no change of the source's bound re-types it.
 /// Nothing else, though `pg_cast` calls more casts binary-coercible:
 /// `text` to `varchar(n)` is one, and it narrows. A `character(n)` length
 /// change isn't one either, since its values are blank-padded to the
@@ -359,10 +365,6 @@ pub(crate) fn catalog_only(copy: &ColumnType, live: &ColumnType) -> bool {
         return false;
     }
     match (copy.base(), live.base()) {
-        ("varchar", "text") => true,
-        ("varchar", "varchar") => {
-            copy.typmod >= 4 && (live.typmod < 0 || live.typmod > copy.typmod)
-        }
         ("numeric", "numeric") => {
             match (numeric_modifier(copy.typmod), numeric_modifier(live.typmod)) {
                 (Some((p, s)), Some((q, t))) => t == s && q > p,
@@ -947,9 +949,6 @@ mod tests {
             (ty("int4", -1), numeric(5, 2)),
             (ty("int2", -1), numeric(5, 0)),
             (ty("int2", -1), numeric(2, -3)),
-            (varchar(50), varchar(100)),
-            (varchar(50), ty("text", -1)),
-            (varchar(50), ty("varchar", -1)),
             (numeric(10, 2), numeric(12, 2)),
             (numeric(10, 2), numeric(10, 3)),
             (numeric(10, 2), ty("numeric", -1)),
@@ -970,8 +969,14 @@ mod tests {
         for (copy, live) in [
             (ty("int4", -1), ty("int4", -1)),
             (ty("int8", -1), ty("int4", -1)),
+            // A string column of any bound: the copy is an unbounded
+            // `varchar` (#1207).
+            (varchar(50), varchar(100)),
+            (varchar(50), ty("text", -1)),
+            (varchar(50), ty("varchar", -1)),
             (varchar(100), varchar(50)),
             (ty("text", -1), varchar(50)),
+            (ty("varchar", -1), varchar(50)),
             (ty("varchar", -1), ty("text", -1)),
             (ty("text", -1), ty("varchar", -1)),
             (numeric(12, 2), numeric(10, 2)),
@@ -1069,16 +1074,12 @@ mod tests {
             }
         )));
     }
-    /// The four catalog-only widenings #824 names, and none of their
+    /// The catalog-only widenings #824 names, and none of their
     /// neighbours: each of those either rewrites the table or changes a
-    /// value, or narrows.
+    /// value, or narrows. A string column has none (#1207).
     #[test]
     fn only_the_named_widenings_are_catalog_only() {
         for (copy, live) in [
-            (varchar(10), varchar(40)),
-            (varchar(10), ty("text", -1)),
-            (ty("varchar", -1), ty("text", -1)),
-            (varchar(10), ty("varchar", -1)),
             (numeric(10, 2), numeric(12, 2)),
             (numeric(5, 0), numeric(18, 0)),
         ] {
@@ -1087,6 +1088,11 @@ mod tests {
         for (copy, live) in [
             (varchar(10), varchar(10)),
             (varchar(40), varchar(10)),
+            // A string column's copy is unbounded: nothing to re-type.
+            (varchar(10), varchar(40)),
+            (varchar(10), ty("text", -1)),
+            (ty("varchar", -1), ty("text", -1)),
+            (varchar(10), ty("varchar", -1)),
             // Binary-coercible in `pg_cast`, but it narrows.
             (ty("text", -1), varchar(10)),
             (ty("text", -1), ty("varchar", -1)),
@@ -1121,8 +1127,6 @@ mod tests {
     #[test]
     fn alter_retypes_catalog_only_widenings_and_the_unconstrained_numeric() {
         for (copy, live) in [
-            (varchar(10), varchar(40)),
-            (varchar(10), ty("text", -1)),
             (numeric(10, 2), numeric(12, 2)),
             (numeric(10, 2), ty("numeric", -1)),
         ] {

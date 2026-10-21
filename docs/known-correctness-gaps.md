@@ -26,7 +26,6 @@ wrong rows, on the targets it compares
 |---|---|---|
 | **Schema changes Trellis can't tell from routine work** | | |
 | [A column's values rewritten in place by `ALTER COLUMN TYPE`](#a-columns-values-rewritten-in-place-by-alter-column-type) | `self_check` | [#1206](https://github.com/salesforce-misc/trellis/issues/1206) (study) |
-| [A space-padded value truncated after a `varchar` widening](#a-space-padded-value-truncated-after-a-varchar-widening) | `self_check` | [#1207](https://github.com/salesforce-misc/trellis/issues/1207) |
 | **Writes capture never sees** | | |
 | [Capture disrupted and restored between two passes](#capture-disrupted-and-restored-between-two-passes) | `self_check` | [#1206](https://github.com/salesforce-misc/trellis/issues/1206) (study), [#1237](https://github.com/salesforce-misc/trellis/issues/1237), otherwise documented |
 | [An unlogged source emptied by a crash or failover](#an-unlogged-source-emptied-by-a-crash-or-failover) | `self_check` | documented |
@@ -35,7 +34,6 @@ wrong rows, on the targets it compares
 | [Part of the database restored from another point in time](#part-of-the-database-restored-from-another-point-in-time) | `self_check` | [#1209](https://github.com/salesforce-misc/trellis/issues/1209) |
 | **Values computed differently from the definition** | | |
 | [Text functions in a 1-1 field](#text-functions-in-a-1-1-field) | `self_check` | [#575](https://github.com/salesforce-misc/trellis/issues/575) |
-| [An aggregate reading a paused column](#an-aggregate-reading-a-paused-column) | no | [#1208](https://github.com/salesforce-misc/trellis/issues/1208) |
 | **[Relationships](#relationships)** (removed by [#1115](https://github.com/salesforce-misc/trellis/issues/1115)) | | |
 | [A trigger that re-keys a parent's join column within the statement](#a-trigger-that-re-keys-a-parents-join-column-within-the-statement) | no | #1115 |
 | [A from-side change pending across a to-side `TRUNCATE`](#a-from-side-change-pending-across-a-to-side-truncate) | no | #1115 |
@@ -123,33 +121,6 @@ a false-positive study of signals that would catch these shapes. Event
 triggers would see every rewrite but need superuser, and logical decoding has
 the same blind spot: `pgoutput` never sends a rewrite's rows. `MIN` and `MAX`
 leave with [#1105](https://github.com/salesforce-misc/trellis/issues/1105).
-
-### A space-padded value truncated after a `varchar` widening
-
-**When:** a source `varchar(n)` column is widened by changing only the
-catalog (to a longer `varchar`, to `varchar` or to `text`), and a value whose
-characters past `n` are all spaces (`'abcde   '` after `varchar(5)` became
-`varchar(40)`) is written and drained before the next reconcile pass
-re-types the column Trellis copied it into. The copies are a 1-1 target's key
-and passthrough columns, a `JOIN`'s `GROUP BY` and `ON` columns, and a to-one
-relationship's projection.
-
-**What goes wrong:** Postgres stores such a value truncated to `n` rather
-than refusing it, so the copy holds `'abcde'`. A truncated 1-1 key lands on
-the target row of the real key `'abcde'`, if there is one, and overwrites its
-values; if there isn't, it adds a row no source row backs. A `JOIN` counts
-the row in the truncated value's group. The re-type changes no value, so the
-copies keep the truncated values until the rows are written again, and a
-row added under a truncated key stays. Any other value too long for the copy
-fails, and its key is held until the re-type releases it.
-
-**Detected by:** `self_check`.
-
-**Repair:** after the pass has re-typed the copy, `PAUSE`/`RESUME` every
-transform that copies the column. A 1-1 rebuild also deletes a row left
-under a truncated key, which no source row backs.
-
-**Ends with:** [#1207](https://github.com/salesforce-misc/trellis/issues/1207).
 
 ## Writes capture never sees
 
@@ -330,25 +301,6 @@ every row with Postgres's value, until each row's next write.
 **Ends with:** [#643](https://github.com/salesforce-misc/trellis/issues/643),
 which closes when [#575](https://github.com/salesforce-misc/trellis/issues/575)
 moves 1-1 evaluation into Postgres.
-
-### An aggregate reading a paused column
-
-**When:** a column of a 1-1 target is paused (its column fuse tripped, or
-`PAUSE TRANSFORM <target>.<column>`), and an aggregate reads that column.
-
-**What goes wrong:** the pause cascades to 1-1 readers of the column, not to
-aggregates
-([ADR-0003](decisions/0003-quarantine-storage-and-api.md)). The aggregate
-keeps applying over the column's frozen values and reports `live`. It agrees
-with the upstream target as it stands, but it's stale against the source.
-
-**Detected by:** nothing on the aggregate. The upstream target's status lists
-the paused column.
-
-**Repair:** resume the upstream column. Its rebuild writes through to the
-aggregate. Until then, treat the aggregate as stale.
-
-**Ends with:** [#1208](https://github.com/salesforce-misc/trellis/issues/1208).
 
 ## Relationships
 

@@ -76,15 +76,20 @@ aggregate has no exact inverse, so a group is recomputed by Postgres itself
 
 A passthrough and a 1-1 target's key columns take their source column's exact
 type at define (a passthrough an `ALTER TRANSFORM … ADD` adds takes it the same
-way), modifier included (`varchar(50)`, `timestamp(3)`), so either
+way), modifier included (`numeric(10,2)`, `timestamp(3)`), so either
 can serve as a relationship's join key against a column of that type. A
+`varchar(n)` is the exception: every column Trellis creates from one, in
+a target or a hidden table, is an unbounded `varchar` with the source column's
+collation. Postgres checks a length only on assignment, never in a comparison,
+a join or an index, so the copy holds whatever the source column holds after a
+widening, and `text` and `varchar(n)` source columns are one family to it. A
 `GROUP BY` key's column (in the target, its ledger and its group-delta table)
 takes its value family's type: `integer` or `bigint` by width, `text` for any
 string, unconstrained `numeric`, a temporal type at full precision. A to-one
 relationship's projection keys by the to-side column's exact type, and holds
 each to-side column read through it in that column's exact type. A `JOIN`
-holds its `GROUP BY` and `ON` columns in each column's exact type and
-collation, in its target and its hidden tables.
+holds its `GROUP BY` and `ON` columns in each column's exact type (a
+`varchar(n)` unbounded) and collation, in its target and its hidden tables.
 
 A calculated field's column, an aggregate's or a `JOIN`'s field column and
 an aggregate ledger's contribution column (typed as the aggregate's
@@ -93,10 +98,11 @@ define's inference gives their expression: `SUM` over an `integer` is
 `bigint`, `MIN` over one is `integer`.
 
 None of them changes type when the source column does, with one exception.
-A widening that changes only the catalog (`varchar(50)` to `varchar(100)`
-or `text`, a `varchar` losing its length, `numeric(10,2)` to
-`numeric(12,2)`) is applied to Trellis's columns in place by the staging
-worker, with no pause and no rebuild. Any other widening a column can't hold
+A `varchar(n)` column's copies need no change when the source column's bound
+changes or it becomes `text`. A `numeric(10,2)` widened to `numeric(12,2)`
+(more precision at the same scale) changes only the catalog and is applied to
+Trellis's columns in place by the staging worker, with no pause and no
+rebuild. Any other widening a column can't hold
 (`integer` to `bigint`, a wider `numeric` scale or temporal precision,
 `bigint` to `numeric`, `real` to `double precision`) pauses the transforms
 that own the column, and `RESUME` re-types every column to the type define

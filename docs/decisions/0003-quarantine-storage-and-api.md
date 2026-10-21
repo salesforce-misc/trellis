@@ -226,8 +226,13 @@ Settled parameters:
 * **Propagation** — tripping either fuse cascades the pause to 1-1 downstream
   transforms reading the paused column, so no downstream reader silently consumes
   a frozen value. The column-level fuse only ever freezes a column of a 1-1
-  transform, and the cascade stops at aggregates
-  ([known correctness gaps — An aggregate reading a paused column](../known-correctness-gaps.md#an-aggregate-reading-a-paused-column)). Each reader's pause
+  transform, and the cascade stops at every other reader kind (an aggregate, a
+  `JOIN`): it keeps applying over the column's frozen values, exact against the
+  upstream target, and the pause propagates to it as reported status. A `live`
+  definition reading a paused column of an upstream 1-1 target reports
+  `catching_up`, transitively, and `DefinitionStatus::paused_upstream_columns`
+  names the column. Nothing is paused or rebuilt: the column's resume writes
+  through to the reader, which reads `live` again. Each reader's pause
   commits in a transaction of its own, fenced against its writers in flight, so
   a cascade can fail part-way. The walk is idempotent: it walks on through a
   reader that is paused already, so running it again reaches the readers the
@@ -308,7 +313,7 @@ until one of these releases it:
   relationship projections' columns) to the type define would give it now
   ([ADR-0014](0014-pause-and-drop-a-transform.md#resume-reconciles-with-source-not-by-catch-up)),
   so a key quarantined because a widened source value didn't fit a copy
-  (`22003`, `22001`) is rebuilt into the widened copy. A key whose cause is
+  (`22003`) is rebuilt into the widened copy. A key whose cause is
   still there fails again, and is poisoned again.
 * **Drop.** Dropping the transform deletes its held keys with its definition
   (`on delete cascade`), so defining it again starts with none.
@@ -354,8 +359,7 @@ until one of these releases it:
   Trellis created because the source widened it by changing only the catalog
   ([ADR-0014](0014-pause-and-drop-a-transform.md)), it releases, through the
   per-key release, every key a transform with a column on that table holds
-  whose failure was `22001` (after a `varchar` re-type) or `22003` (after a
-  `numeric` one), by the SQLSTATE its `poison` row keeps. A key held for any
+  whose failure was `22003` (after a `numeric` re-type), by the SQLSTATE its `poison` row keeps. A key held for any
   other failure stays held.
 
 The release is purely operational, like `status`, so it is a call of its own

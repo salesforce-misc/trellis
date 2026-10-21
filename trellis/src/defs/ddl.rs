@@ -585,7 +585,7 @@ pub(crate) async fn identity_key_columns(
         .into_iter()
         .map(|row| PrimaryKeyColumn {
             name: row.get(0),
-            data_type: row.get(1),
+            data_type: key_cast_type(&row.get::<_, String>(1)),
             nullable: row.get(2),
             collation: row.get(3),
         })
@@ -1236,6 +1236,49 @@ pub(crate) fn split_pk_key<'a>(
         .collect())
 }
 
+/// The type Trellis gives a column it creates as a copy of a source column
+/// of `format_type` rendering `pg_type`: the same, except that a `varchar(n)`
+/// is an unbounded `varchar` (#1207). `varchar(n)`, `varchar` and `text` are
+/// one type to Postgres, which checks the length only when a value is
+/// assigned, so an unbounded copy holds whatever the column holds now or
+/// after a widening. A copy bounded to `n` would truncate a value whose
+/// excess characters are all spaces, silently, instead of failing it. The
+/// column's collation is kept by the caller.
+pub(crate) fn copy_pg_type(pg_type: &str) -> Cow<'_, str> {
+    const BOUNDED: &str = "character varying(";
+    let Some(start) = pg_type.find(BOUNDED) else {
+        return Cow::Borrowed(pg_type);
+    };
+    let mut out = String::with_capacity(pg_type.len());
+    let mut rest = pg_type;
+    let mut at = start;
+    loop {
+        out.push_str(&rest[..at + BOUNDED.len() - 1]);
+        let after = &rest[at + BOUNDED.len()..];
+        match after.find(')') {
+            Some(close) => rest = &after[close + 1..],
+            None => return Cow::Owned(out),
+        }
+        match rest.find(BOUNDED) {
+            Some(next) => at = next,
+            None => {
+                out.push_str(rest);
+                return Cow::Owned(out);
+            }
+        }
+    }
+}
+
+/// The type a key column's text is cast to when keys are compared, or
+/// looked up, across tables: the column's own, except that a `varchar(n)` is
+/// an unbounded `varchar` ([`copy_pg_type`]). A cast to `varchar(n)` is
+/// explicit and truncates silently, so the key `'abc   '` cast to the type
+/// of a `varchar(3)` column would read as `'abc'`, and match a row it isn't
+/// the key of (#1207). Comparing `varchar`s ignores the bound.
+pub(crate) fn key_cast_type(format_type: &str) -> String {
+    copy_pg_type(format_type).into_owned()
+}
+
 /// Every column of `source_table`, mapped to its *concrete* Postgres type as
 /// rendered by `format_type` (e.g. `integer`, `bigint`, `character
 /// varying(255)`) — the same `pg_catalog` introspection [`source_primary_key`]
@@ -1264,7 +1307,10 @@ async fn source_column_pg_types(
         .await?;
     Ok(rows
         .into_iter()
-        .map(|row| (row.get(0), row.get(1)))
+        .map(|row| {
+            let pg_type: String = row.get(1);
+            (row.get(0), copy_pg_type(&pg_type).into_owned())
+        })
         .collect())
 }
 
@@ -1540,8 +1586,9 @@ pub(crate) fn regclass_arg(table: &str) -> String {
 /// A relationship join column, as [`key_column_in`] introspects it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct KeyColumn {
-    /// The column's exact type, as `format_type` renders it
-    /// (`staging::apply::key_column_pg_type`).
+    /// The column's exact type, as `format_type` renders it, except that a
+    /// `varchar(n)` has no bound ([`key_cast_type`]): the type keys are cast
+    /// to (`staging::apply::key_column_pg_type`).
     pub(crate) pg_type: String,
     /// Whether a lookup of the column by a batch of keys has an index to
     /// use: it is the leading column of a plain btree index on its table,
@@ -1599,7 +1646,7 @@ pub(crate) async fn key_column_in(
         )
         .await?;
     Ok(row.map(|r| KeyColumn {
-        pg_type: r.get(0),
+        pg_type: key_cast_type(&r.get::<_, String>(0)),
         indexed: r.get(1),
     }))
 }
@@ -1754,7 +1801,7 @@ pub(crate) async fn target_table_ddl(
             format!(
                 "{} {}{collate}{not_null}",
                 quote_ident(&c.name),
-                c.data_type
+                copy_pg_type(&c.data_type)
             )
         })
         .collect();
@@ -2281,6 +2328,20 @@ mod tests {
                 message.contains(type_name),
                 "{type_name:?} missing: {message}"
             );
+        }
+    }
+
+    #[test]
+    fn a_copy_of_a_bounded_varchar_is_unbounded() {
+        for (source, copy) in [
+            ("character varying(5)", "character varying"),
+            ("character varying", "character varying"),
+            ("character varying(255)[]", "character varying[]"),
+            ("text", "text"),
+            ("character(5)", "character(5)"),
+            ("numeric(10,2)", "numeric(10,2)"),
+        ] {
+            assert_eq!(copy_pg_type(source), copy, "{source}");
         }
     }
 
