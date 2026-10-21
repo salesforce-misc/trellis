@@ -75,9 +75,9 @@ generative/chaos failure that root-causes to a pure function.
 ## 4. Integration tests
 
 **Real behavior against a real Postgres, scripted end-to-end.** These live in
-`trellis/tests/*` and lean on `testkit`, which owns a disposable cluster
-(`initdb`/`postgres`/`pg_ctl` on a private socket, torn down on `Drop`); CI
-provisions the server binaries. They own:
+`trellis/tests/*` and lean on `testkit`, which owns a disposable cluster (its
+own `postgres` on a private socket, started from a copy of a migrated template
+data directory and torn down on `Drop`); CI provisions the server binaries. They own:
 
 - The capture path end-to-end: source DML → capture trigger → staging ring, with
   each family's images pinned against a golden fixture (`capture_parity.rs`).

@@ -351,6 +351,7 @@ impl TestCluster {
         fs::create_dir_all(&socket_dir).expect("create socket dir");
 
         if let Some(template) = template {
+            template::mark_used(template);
             copy_data_dir(template, &data_dir);
         } else {
             // `initdb`'s bootstrap backend transiently allocates a SysV segment,

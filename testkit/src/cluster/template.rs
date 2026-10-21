@@ -11,8 +11,9 @@
 //! The template is cached across processes in the system temp dir as
 //! `trellis-template-<key>`, so one `cargo test` run builds it once for all
 //! its test binaries. The key hashes the engine's sources and migrations
-//! (`build.rs`), the Postgres version and the `initdb` arguments, so a stale
-//! template is never reused; a builder holds an exclusive lock on
+//! (`build.rs`), the Postgres binary and the `initdb` arguments, so a stale
+//! template is never reused, and the day, so none outlives a temp-dir cleaner
+//! (see [`key`]); a builder holds an exclusive lock on
 //! `trellis-template-<key>.lock` and publishes the directory with a rename, so
 //! a reader sees it whole or not at all. Templates for keys no run has used
 //! for a day are deleted by the next builder.
@@ -37,6 +38,16 @@ pub(super) fn data_dir() -> &'static Path {
     DIR.get_or_init(|| ensure(&std::env::temp_dir()))
 }
 
+/// The cache key: the engine build (`build.rs`), the Postgres binaries, the
+/// `initdb` arguments, the user and the day.
+///
+/// The `postgres` binary's path, size and mtime are in it as well as its
+/// version, so a rebuild of the same version (against a new ICU, say) or a
+/// different installation on `PATH` gets its own template. The user keeps
+/// one user's template (mode 0700) from blocking another's on a shared temp
+/// dir. The day bounds a template's age to two days, so a temp-dir cleaner
+/// that deletes files by age (systemd-tmpfiles, macOS's) never finds one old
+/// enough to empty while it is still in use.
 fn key() -> String {
     let postgres = Command::new("postgres")
         .arg("--version")
@@ -45,14 +56,32 @@ fn key() -> String {
         .unwrap_or_default();
     let mut hasher = DefaultHasher::new();
     postgres.hash(&mut hasher);
+    if let Some(binary) = on_path("postgres") {
+        binary.hash(&mut hasher);
+        if let Ok(meta) = fs::metadata(&binary) {
+            meta.len().hash(&mut hasher);
+            meta.modified().ok().hash(&mut hasher);
+        }
+    }
     for arg in initdb_command(Path::new("DATA")).get_args() {
         arg.hash(&mut hasher);
     }
+    std::env::var_os("USER").hash(&mut hasher);
+    let day = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs() / (24 * 60 * 60));
     format!(
-        "{}-{:016x}",
+        "{}-{:016x}-{day}",
         env!("TRELLIS_SOURCE_FINGERPRINT"),
         hasher.finish()
     )
+}
+
+/// The first `program` on `PATH`, as a spawn would find it.
+fn on_path(program: &str) -> Option<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|dir| dir.join(program))
+        .find(|path| path.is_file())
 }
 
 /// The template under `tmp`, built if absent.
@@ -78,9 +107,22 @@ fn ensure(tmp: &Path) -> PathBuf {
 
 fn build(tmp: &Path, name: &str, dir: &Path) {
     delete_stale(tmp);
-    // A build killed after the copy and before the rename.
-    let staging = tmp.join(format!("{name}.tmp-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&staging);
+    // A build killed after the copy and before the rename leaves its staging
+    // directory. Under the lock no other build of this key is running, so
+    // every one there is such a leftover.
+    let staging_prefix = format!("{name}.tmp-");
+    if let Ok(entries) = fs::read_dir(tmp) {
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(&staging_prefix)
+            {
+                let _ = fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+    let staging = tmp.join(format!("{staging_prefix}{}", std::process::id()));
 
     // The build cluster is transient, so it lives in the system temp dir
     // whatever `tmp` is: its socket path must stay short.
@@ -116,7 +158,9 @@ fn migrate(dsn: &str) {
 }
 
 /// Records that a run is using the template now, so [`delete_stale`] spares it.
-fn mark_used(dir: &Path) {
+/// Called on every copy, not only when a process first finds the template,
+/// so a run that lasts longer than [`STALE_AFTER`] keeps its template.
+pub(super) fn mark_used(dir: &Path) {
     let _ = fs::File::open(dir).and_then(|dir| dir.set_modified(std::time::SystemTime::now()));
 }
 
@@ -164,6 +208,17 @@ mod tests {
         assert_eq!(templates, 1, "no staging or build directory left behind");
         assert!(fs::metadata(&second).and_then(|m| m.modified()).unwrap() >= built);
         assert!(second.join("PG_VERSION").exists());
+        let _ = fs::remove_dir_all(&sandbox);
+    }
+
+    #[test]
+    fn a_build_removes_the_staging_directory_a_killed_build_left() {
+        let sandbox = fresh_sandbox_dir("staging");
+        let leftover = sandbox.join(format!("{TEMPLATE_PREFIX}{}.tmp-999999999", key()));
+        fs::create_dir_all(leftover.join("base")).unwrap();
+        let template = ensure(&sandbox);
+        assert!(!leftover.exists());
+        assert!(template.join("PG_VERSION").exists());
         let _ = fs::remove_dir_all(&sandbox);
     }
 

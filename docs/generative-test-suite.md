@@ -42,8 +42,9 @@ crate's own self dev-dependency, so none can reach a production
 
 `testkit` already provides:
 
-- **A disposable cluster** — `TestCluster` runs its own `initdb`/`postgres`/`pg_ctl`
-  on a private socket, torn down on `Drop`. Unlocks the whole
+- **A disposable cluster** — `TestCluster` runs its own `postgres` on a private
+  socket, started from a copy of a migrated template data directory and torn
+  down on `Drop`. Unlocks the whole
   database-administration action space (restart, checkpoint).
 - **Process lifecycle** — `crash::CrashGuard` supervises a child it can `SIGKILL`,
   so "kill a worker mid-drain" is a real code path.

@@ -173,7 +173,10 @@ async fn run(args: Args) -> ExitCode {
     let mut sighup = signal(SignalKind::hangup()).expect("install SIGHUP handler");
     let stdin_eof = args.watch_stdin.then(watch_stdin);
 
-    let cluster = TestCluster::start();
+    // A cluster of its own from `initdb`, not a copy of the migrated
+    // template: the host suite migrates through its binding, and one cluster
+    // would not repay building the template.
+    let cluster = TestCluster::start_initdb();
     let dsn = cluster.create_database(&args.dbname);
 
     let info = serde_json::json!({
