@@ -24,6 +24,12 @@
 //! by the basis of the group or cell it lands in (a basis's absolute write
 //! already counted it, and the page will refuse it).
 //!
+//! A ring slot whose rows are all applied is not read ([`ring_slot_applied_sql`],
+//! one condition per slot, evaluated once per statement), unless the
+//! definition holds keys of the source: their parked rows count wherever they
+//! sit. A page then reads the slots with undrained segments, not every row
+//! the ring still holds.
+//!
 //! Some unapplied rows can't be subtracted, and say only where the target may
 //! still differ ([`Ring::uncertain_images_sql`]): an image-less change (a
 //! `Recompute`, or a change missing an image its op needs) and the changes of
@@ -40,7 +46,7 @@ use crate::defs::ddl::{self, PrimaryKeyColumn};
 use crate::pool::{quote_ident, quote_literal};
 
 use super::converge::per_ring_table;
-use super::page::ring_row_pending_sql;
+use super::page::{ring_row_pending_sql, ring_slot_applied_sql};
 
 /// The weight column of [`Ring::weighted_sql`]'s rows.
 pub(super) const WEIGHT: &str = "__trellis_w";
@@ -111,6 +117,10 @@ impl Ring<'_> {
     fn rows_sql(&self) -> String {
         let src = quote_literal(self.src_table);
         let id = self.transform_id;
+        let held_keys = format!(
+            "exists (select 1 from poison_held hk \
+                     where hk.transform_id = {id} and hk.src_table = {src})"
+        );
         per_ring_table(" union all ", |slot, table| {
             format!(
                 "select r.row_txid as __txid, r.lsn as __lsn, r.key as __key, r.op as __op, \
@@ -131,7 +141,9 @@ impl Ring<'_> {
                      where ph.transform_id = {id} and ph.src_table = r.src_table \
                        and ph.key = r.key) h on true \
                  where r.src_table = {src} \
+                   and (not {applied} or {held_keys}) \
                    and (coalesce(h.unknown or h.parked, false) or {pending})",
+                applied = ring_slot_applied_sql(slot),
                 pending = ring_row_pending_sql(slot, None),
             )
         })

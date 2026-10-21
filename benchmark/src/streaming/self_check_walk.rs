@@ -62,9 +62,26 @@ async fn seq_tup_read(raw: &RawClient, table: &str) -> i64 {
     .get(0)
 }
 
+/// Rows the ring slot tables have served so far (#1219): sequential tuples
+/// and index fetches of every `seg_N`.
+async fn ring_tup_read(raw: &RawClient) -> i64 {
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    raw.query_one(
+        "select coalesce(sum(seq_tup_read + idx_tup_fetch), 0)::bigint \
+         from pg_stat_user_tables where relname ~ '^seg_[0-9]+$'",
+        &[],
+    )
+    .await
+    .expect("read the ring stats")
+    .get(0)
+}
+
 pub async fn run(cfg: Config, tuning: &EngineTuning) {
     if cfg.join {
         return run_join(cfg, tuning).await;
+    }
+    if cfg.aggregate {
+        trellis::dev::staging::set_group_basis(true);
     }
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -189,6 +206,7 @@ pub async fn run(cfg: Config, tuning: &EngineTuning) {
     settle(&raw).await;
     let src_before = seq_tup_read(&raw, "sc_src").await;
     let tgt_before = seq_tup_read(&raw, "sc_tgt").await;
+    let ring_before = ring_tup_read(&raw).await;
     let start = Instant::now();
     let job = trellis
         .self_check(
@@ -225,13 +243,15 @@ pub async fn run(cfg: Config, tuning: &EngineTuning) {
     let walk_secs = start.elapsed().as_secs_f64();
     let src_delta = seq_tup_read(&raw, "sc_src").await - src_before;
     let tgt_delta = seq_tup_read(&raw, "sc_tgt").await - tgt_before;
+    let ring_delta = ring_tup_read(&raw).await - ring_before;
     let keys = job.rows_compared;
     let pages = (keys + PAGE_KEYS - 1) / PAGE_KEYS + 1;
     println!(
         "{{\"scenario\":\"self-check-walk\",\"indexed\":{},\"kind\":\"{}\",\"rows\":{},\"groups\":{},\
          \"keys_compared\":{},\"state\":\"{}\",\"outcome\":\"{:?}\",\"walk_secs\":{:.2},\
          \"pages_est\":{},\"src_seq_tup_read\":{},\"tgt_seq_tup_read\":{},\
-         \"src_rows_per_page\":{},\"build_secs\":{:.1}}}",
+         \"src_rows_per_page\":{},\"ring_tup_read\":{},\"ring_rows_per_page\":{},\
+         \"build_secs\":{:.1}}}",
         cfg.index,
         if cfg.aggregate {
             "aggregate"
@@ -248,6 +268,8 @@ pub async fn run(cfg: Config, tuning: &EngineTuning) {
         src_delta,
         tgt_delta,
         src_delta / pages.max(1),
+        ring_delta,
+        ring_delta / pages.max(1),
         build_secs,
     );
     client.shutdown().await.expect("shutdown");
@@ -432,6 +454,25 @@ async fn run_join(cfg: Config, tuning: &EngineTuning) {
             r
         }
     };
+    report_ring(&raw).await;
+    // What the convergence wait of each page reads from the ring, apart from
+    // the page's own statement: the walk's ring reads include it.
+    {
+        let token: tokio_postgres::types::PgLsn = raw
+            .query_one("select pg_current_wal_lsn()", &[])
+            .await
+            .expect("wal lsn")
+            .get(0);
+        let before = rows_read("ring".to_string()).await;
+        let conn = db.pool.get().await.expect("a connection");
+        for _ in 0..10 {
+            trellis::dev::staging::converged_through(&**conn, token)
+                .await
+                .expect("converged_through");
+        }
+        let per_call = (rows_read("ring".to_string()).await - before) / 10;
+        eprintln!("convergence check: {per_call} ring rows read per call");
+    }
     for (part, hidden, source, next) in [
         ("p", format!("join_{id}_p"), "a", "m"),
         ("m", format!("join_{id}_m"), "b", "j"),
@@ -491,4 +532,34 @@ async fn run_join(cfg: Config, tuning: &EngineTuning) {
         );
     }
     client.shutdown().await.expect("shutdown");
+}
+
+/// Prints the ring's segments and the rows each slot table holds, so a walk's
+/// ring reads can be read against what the ring held (#1219).
+async fn report_ring(raw: &RawClient) {
+    for row in raw
+        .query(
+            "select s.seg_seq, s.ring_slot, s.state, \
+                    (select count(*) from pg_snapshot_xip(s.fence_snapshot)) as xip, \
+                    s.late_rows \
+             from segments s order by s.seg_seq",
+            &[],
+        )
+        .await
+        .expect("read the segments")
+    {
+        let slot: i16 = row.get(1);
+        let n: i64 = raw
+            .query_one(&format!("select count(*) from seg_{slot}"), &[])
+            .await
+            .expect("count the slot")
+            .get(0);
+        eprintln!(
+            "ring: seg {} slot {slot} {} xip {} late rows {:?} rows {n}",
+            row.get::<_, i64>(0),
+            row.get::<_, String>(2),
+            row.get::<_, i64>(3),
+            row.get::<_, Option<i64>>(4),
+        );
+    }
 }

@@ -268,6 +268,20 @@ The cost of a walk is then about (rows read per page) × (pages). The module doc
 of `self_check`, `self_check_groups` and `self_check_joins` say what each part
 needs indexed.
 
+**Cost.** A page of an aggregate or JOIN target reads its page of keys plus the
+undrained ring segments. No index serves the ring slot tables by source, so a page
+reads a slot whole, but a slot whose segment is drained is skipped: the statement
+carries a condition over no row for each slot, evaluated once, that is false when
+every row of the slot is applied, and the slot's scan is not executed. A definition
+that holds keys (`poison_held`) reads every slot, as the keys' parked rows may sit
+in a drained one. A drained slot is skipped when its successor is drained too or gone, or when the
+fence of its segment had no transaction in flight: a writer in flight at the fence
+can have left a late row in the slot, which the successor's window takes. The
+decision and the pending predicate are read in the page's one statement, so a
+segment that finishes draining mid-statement is read or skipped on one snapshot.
+The walk's ring reads are then bounded by the segment size, not by the rows a ring
+has applied and not yet retired.
+
 ### Scope: every target; aggregate and JOIN targets detect, never repair
 
 `self_check` audits 1-1, aggregate and JOIN targets. Every comparison projects the
