@@ -251,7 +251,7 @@ async fn dropping_the_last_reader_of_a_joined_table_or_to_side_forgets_its_recor
     let trellis = definer(db.dsn()).await;
     for text in [
         "TRANSFORM fj FROM public.fa LEFT JOIN public.fb ON fa.k = fb.k \
-         GROUP BY fa.k SELECT fa.k AS k, COUNT(*) AS n, SUM(fb.y) AS sy",
+         GROUP BY fa.k WITHOUT SOURCE INDEX SELECT fa.k AS k, COUNT(*) AS n, SUM(fb.y) AS sy",
         "RELATIONSHIP parent FROM fc.pid TO fp.id",
         "TRANSFORM fc_named FROM public.fc SELECT amount AS amount, parent.name AS name",
         "TRANSFORM fc_plain FROM public.fc SELECT amount AS amount",
