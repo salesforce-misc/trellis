@@ -803,11 +803,17 @@ async fn r7_concurrent_pages_over_shared_groups_never_deadlock() {
                     (seed >> 20) % 100
                 ));
             }
+            // The writers overlap on the rows they update, and an update
+            // walks them in heap order: two writers could take row locks in
+            // opposite orders and deadlock each other (#1258). Locking the
+            // rows in id order first makes the writers deadlock-free, so a
+            // logged deadlock below can only be between Trellis's pages.
             let sql = format!(
                 "insert into public.src values {}; \
-                 update public.src set g = (g + 7) % 20 where id % 3 = {}",
+                 select id from public.src where id % 3 = {k} order by id for update; \
+                 update public.src set g = (g + 7) % 20 where id % 3 = {k}",
                 rows.join(", "),
-                writer % 3
+                k = writer % 3
             );
             let user = d.user().await;
             writers.push(tokio::spawn(async move {
