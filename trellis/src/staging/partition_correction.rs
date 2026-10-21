@@ -436,14 +436,16 @@ pub(crate) struct RebuildLeaf {
 
 /// The leaves of `recorded` in oid order, each with its route by its
 /// recorded constraint text. `Err` names the first leaf with no usable
-/// route (its text was never fetched and it is no `DEFAULT`), whose groups
-/// nothing could be routed to.
+/// route (its text was never fetched, and it is no `DEFAULT` alone under the
+/// root, whose empty text routes every group to it), whose groups nothing
+/// could be routed to.
 pub(crate) fn rebuild_leaves(recorded: &Recorded) -> Result<Vec<RebuildLeaf>, String> {
+    let alone = recorded.nodes.len() == 2;
     let mut leaves = Vec::new();
     for node in recorded.nodes.iter().skip(1).filter(|n| !n.partitioned) {
         let route = match &node.constraint {
             Some(text) => Route::Text(text.clone()),
-            None if node.is_default => Route::Every,
+            None if node.is_default && alone => Route::Every,
             None => return Err(node.name.clone()),
         };
         leaves.push(RebuildLeaf {
@@ -2098,6 +2100,53 @@ mod tests {
         let cols = [column("a", "integer", "")];
         assert_eq!(route_predicate(&Route::Every, &cols), "true");
         assert_eq!(route_predicate(&Route::Unusable, &cols), "false");
+    }
+
+    /// A rebuild's leaves: in oid order, a `DEFAULT` without a text routes
+    /// every group only while it is the root's one leaf (its text is empty
+    /// then); beside siblings, a missing text is a leaf nothing routes to.
+    #[test]
+    fn a_rebuilds_leaves_route_every_group_to_a_textless_default_only_alone() {
+        let node = |oid: u32, default: bool, text: Option<&str>| partitions::Node {
+            oid,
+            parent: (oid != 1).then_some(1),
+            name: format!("public.n{oid}"),
+            partitioned: oid == 1,
+            is_default: default,
+            bound: None,
+            inherits_xmin: None,
+            constraint: text.map(str::to_string),
+        };
+        let alone = Recorded {
+            nodes: vec![node(1, false, None), node(9, true, None)],
+            keys: Vec::new(),
+        };
+        let leaves = rebuild_leaves(&alone).expect("a lone DEFAULT routes");
+        assert_eq!(leaves.len(), 1);
+        assert_eq!(leaves[0].route, Route::Every);
+        let beside = Recorded {
+            nodes: vec![
+                node(1, false, None),
+                node(9, true, None),
+                node(5, false, Some("(a < 3)")),
+            ],
+            keys: Vec::new(),
+        };
+        assert_eq!(rebuild_leaves(&beside).err().as_deref(), Some("public.n9"));
+        let texts = Recorded {
+            nodes: vec![
+                node(1, false, None),
+                node(9, true, Some("(NOT (a < 3))")),
+                node(5, false, Some("(a < 3)")),
+            ],
+            keys: Vec::new(),
+        };
+        let oids: Vec<u32> = rebuild_leaves(&texts)
+            .expect("every text is there")
+            .iter()
+            .map(|leaf| leaf.oid)
+            .collect();
+        assert_eq!(oids, [5, 9], "oid order");
     }
 
     #[test]

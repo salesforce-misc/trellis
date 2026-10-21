@@ -1866,3 +1866,179 @@ async fn a_leaf_without_a_constraint_text_halts_the_rebuild() {
         "nothing was written: no leaf was rebuilt"
     );
 }
+
+/// Changes still undrained when the rebuild runs, in three leaves: an update
+/// of the first leaf's groups 0 and 1, an update of group 9, and the delete
+/// of every row of group 5, whose hidden and visible rows were removed by
+/// hand, so that only the ring's old images name it. Each leaf's transaction
+/// takes the image groups that route to it and no others: a later leaf's
+/// `GROUP BY` must not zero the first leaf's groups, and group 5 is written
+/// at zero with a basis, which refuses the deletes' pages.
+#[tokio::test]
+async fn undrained_changes_in_several_leaves_are_each_counted_once() {
+    let mut fx = Fx::start(&tree("range"), SEED).await;
+    let hidden = fx.hidden().await;
+    fx.exec(&format!(
+        "delete from {hidden} where g = 5; delete from public.agg where g = 5"
+    ))
+    .await;
+    fx.exec(
+        "update public.items set v = v + 1 where g in (0, 1); \
+         update public.items set v = v + 2 where g = 9; \
+         delete from public.items where g = 5;",
+    )
+    .await;
+    fx.request_rebuild().await;
+    fx.rebuild().await;
+    assert_eq!(
+        fx.wrong_groups().await,
+        Vec::<String>::new(),
+        "right before the pages drain"
+    );
+    fx.assert_rebuilt("after the pages drain").await;
+}
+
+/// The groups of a leaf that only the target or the leaf names: a visible
+/// row of a group the source never had (6), a hidden row with partials of
+/// another (7), and a group whose hidden and visible rows are gone while its
+/// rows are in the leaf (3). No ring image names any of them. Each leaf's
+/// transaction takes them from its routed hidden and visible rows and from
+/// its own rows.
+#[tokio::test]
+async fn a_rebuild_repairs_the_groups_only_the_target_or_the_leaf_names() {
+    for kind in ["list", "range", "hash"] {
+        let mut fx = Fx::start(
+            &tree(kind),
+            "insert into public.items select i, i % 16, i from generate_series(1, 160) i \
+             where i % 16 not in (6, 7)",
+        )
+        .await;
+        let hidden = fx.hidden().await;
+        fx.exec(&format!(
+            "delete from {hidden} where g in (3, 6, 7); delete from public.agg where g = 3; \
+             insert into public.agg (g, total, n) values (6, 5, 1); \
+             insert into {hidden} (g, __n, __count_1, __sum_1) values (7, 3, 3, 30)"
+        ))
+        .await;
+        assert_eq!(fx.wrong_numbers().await, [3, 6], "{kind}");
+        fx.request_rebuild().await;
+        fx.rebuild().await;
+        fx.assert_rebuilt(kind).await;
+        assert_eq!(
+            fx.d.rows(&format!(
+                "select g from {hidden} where g in (6, 7) \
+                 and (__n, __count_1, __sum_1) <> (0, 0, 0)"
+            ))
+            .await,
+            Vec::<String>::new(),
+            "{kind}: no hidden row without source rows keeps partials"
+        );
+    }
+}
+
+/// A leaf detached with its rows between two leaves' transactions, its
+/// correction run before the rebuild reaches it. The leaf no longer is as
+/// recorded, so its turn reads its groups through the root and writes them
+/// at zero, as the correction did: read directly, the detached table's rows
+/// would be counted again, with nothing left to repair them.
+#[tokio::test]
+async fn a_leaf_detached_and_corrected_before_its_turn_is_read_through_the_root() {
+    let mut fx = Fx::start(&tree("range"), SEED).await;
+    fx.damage_every_group().await;
+    fx.request_rebuild().await;
+    let mut rebuilding = fx
+        .rebuild_frozen(&[PausePoint::BetweenRebuildStructures])
+        .await;
+    rebuilding
+        .reached(PausePoint::BetweenRebuildStructures)
+        .await;
+    fx.exec("alter table public.items detach partition public.items_p2")
+        .await;
+    fx.pass().await;
+    assert_eq!(fx.kinds().await, ["gone_node"]);
+    let outcome = partition_correction::run_pending(fx.d.pool(), &Options::default())
+        .await
+        .expect("run the detach's correction");
+    assert_eq!(outcome.completed, 1, "corrected before the rebuild's turn");
+    fx.d.settle().await;
+    fx.d.release(&mut rebuilding, PausePoint::BetweenRebuildStructures)
+        .await;
+    rebuilding.finish().await;
+    fx.assert_rebuilt("the detached leaf's turn").await;
+    assert!(fx.queue().await.is_empty());
+}
+
+/// Groups with a `NULL` part read through the root, one probe each: a
+/// visible row of the remainder, and every group of the leaves after a
+/// detach and re-attach between two leaves' transactions (the tree is no
+/// longer as recorded). Each probe matches the source's own `NULL`s.
+#[tokio::test]
+async fn groups_with_a_null_part_read_through_the_root_are_exact() {
+    trellis::dev::staging::set_group_basis(true);
+    trellis::defs::partition_tree::open_gate_for_tests();
+    let schema = format!(
+        "create table public.items (id integer not null, g integer not null, h integer, \
+         v integer not null, primary key (g, id)) partition by range (g); \
+         create index on public.items (g, h); {}",
+        (0..4)
+            .map(|i| format!(
+                "create table public.items_p{i} partition of public.items \
+                 for values from ({}) to ({});",
+                i * 4,
+                i * 4 + 4
+            ))
+            .collect::<String>()
+    );
+    let d = Driver::start(
+        &schema,
+        &[("id", int4()), ("g", int4()), ("h", int4()), ("v", int4())],
+        &["TRANSFORM agg FROM public.items GROUP BY g, h SELECT SUM(v) AS total, COUNT(*) AS n"],
+        &[SOURCE],
+    )
+    .await;
+    let mut fx = Fx { d };
+    fx.pass().await;
+    fx.exec(
+        "insert into public.items select i, i % 16, nullif(i % 3, 0), i \
+         from generate_series(1, 160) i",
+    )
+    .await;
+    fx.d.settle().await;
+    let wrong = "with want as (select g, h, sum(v) as total, count(*) as n \
+                               from public.items group by g, h) \
+                 select coalesce(w.g, t.g)::text || '/' || coalesce(w.h, t.h)::text \
+                 from want w full join public.agg t \
+                   on t.g = w.g and t.h is not distinct from w.h \
+                 where w.total is distinct from t.total or w.n is distinct from t.n \
+                 order by 1";
+    assert_eq!(fx.d.rows(wrong).await, Vec::<String>::new(), "seeded");
+    let hidden = fx.hidden().await;
+    fx.exec(&format!(
+        "update {hidden} set __sum_1 = __sum_1 + 7; \
+         update public.agg set total = total + 7; \
+         insert into public.agg (g, h, total, n) values (99, null, 5, 1)"
+    ))
+    .await;
+    fx.request_rebuild().await;
+    let mut rebuilding = fx
+        .rebuild_frozen(&[PausePoint::BetweenRebuildStructures])
+        .await;
+    rebuilding
+        .reached(PausePoint::BetweenRebuildStructures)
+        .await;
+    fx.exec(
+        "alter table public.items detach partition public.items_p1; \
+         alter table public.items attach partition public.items_p1 for values from (4) to (8)",
+    )
+    .await;
+    fx.d.release(&mut rebuilding, PausePoint::BetweenRebuildStructures)
+        .await;
+    rebuilding.finish().await;
+    fx.d.settle().await;
+    assert_eq!(fx.d.rows(wrong).await, Vec::<String>::new(), "rebuilt");
+    assert_eq!(
+        fx.d.rows("select count(*) from backfill_chunks").await,
+        ["(0)"]
+    );
+    assert_eq!(fx.status().await, "live");
+}

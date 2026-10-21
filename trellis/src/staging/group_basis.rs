@@ -1349,6 +1349,31 @@ impl GroupTargetPlan {
         )
     }
 
+    /// The source rows of the group `rg` (a lateral reference), read through
+    /// the root: an index probe of the leaf its key routes to. A group with a
+    /// `NULL` part matches each column by `=`, or by `is null` on both sides,
+    /// which prunes to the leaves that can hold it and can use an index;
+    /// `is not distinct from` does neither, and would scan every leaf of the
+    /// source once per such group.
+    fn probe_rows_sql(&self) -> String {
+        let cols = quoted(&self.shape.group_cols);
+        let equal: Vec<String> = cols.iter().map(|c| format!("s.{c} = rg.{c}")).collect();
+        let has_null: Vec<String> = cols.iter().map(|c| format!("rg.{c} is null")).collect();
+        let same: Vec<String> = cols
+            .iter()
+            .map(|c| format!("(s.{c} = rg.{c} or (rg.{c} is null and s.{c} is null))"))
+            .collect();
+        format!(
+            "select s.* from {src} s where {equal} \
+             union all \
+             select s.* from {src} s where ({has_null}) and {same}",
+            src = self.source_row,
+            equal = equal.join(" and "),
+            has_null = has_null.join(" or "),
+            same = same.join(" and "),
+        )
+    }
+
     /// The recompute's statement ([`recompute_locked_groups`], R1, R5): over
     /// the groups of [`Self::recomputed`], already locked, takes the
     /// snapshot and reads the newest segment's `seg_seq` in this one
@@ -1406,12 +1431,6 @@ impl GroupTargetPlan {
             }
         }
         let up_groups: Vec<String> = cols.iter().map(|c| format!("u.{c}")).collect();
-        let equal: Vec<String> = cols.iter().map(|c| format!("s.{c} = rg.{c}")).collect();
-        let has_null: Vec<String> = cols.iter().map(|c| format!("rg.{c} is null")).collect();
-        let same: Vec<String> = cols
-            .iter()
-            .map(|c| format!("s.{c} is not distinct from rg.{c}"))
-            .collect();
         let lookup_hidden = self.group_lookup(
             &self.hidden_ident,
             "rg",
@@ -1422,20 +1441,11 @@ impl GroupTargetPlan {
                 "r as ( \
                      select h.*, a.* from rg \
                      cross join lateral {lookup_hidden} as h(__hc, {old_names}) \
-                     cross join lateral ( \
-                         select {fresh} from ( \
-                             select s.* from {src} s where {equal} \
-                             union all \
-                             select s.* from {src} s where ({has_null}) and {same} \
-                         ) as s \
-                     ) as a \
+                     cross join lateral (select {fresh} from ({probe}) as s) as a \
                  )",
                 old_names = old_names.join(", "),
                 fresh = fresh.join(", "),
-                src = self.source_row,
-                equal = equal.join(" and "),
-                has_null = has_null.join(" or "),
-                same = same.join(" and "),
+                probe = self.probe_rows_sql(),
             ),
             Some(node) => {
                 let matched: Vec<String> = cols
@@ -1694,34 +1704,16 @@ impl GroupTargetPlan {
             // One index probe of the root per group, for a set that is not
             // a leaf's (the remainder's) or a leaf of a tree that is not as
             // recorded.
-            RebuildRead::Probe => {
-                let equal: Vec<String> = cols.iter().map(|c| format!("s.{c} = rg.{c}")).collect();
-                let has_null: Vec<String> =
-                    cols.iter().map(|c| format!("rg.{c} is null")).collect();
-                let same: Vec<String> = cols
-                    .iter()
-                    .map(|c| format!("s.{c} is not distinct from rg.{c}"))
-                    .collect();
-                format!(
-                    "r as ( \
-                         select h.__hc, {kept} from rg \
-                         cross join lateral {lookup_hidden} as h(__hc) \
-                         cross join lateral ( \
-                             select {fresh} from ( \
-                                 select s.* from {src} s where {equal} \
-                                 union all \
-                                 select s.* from {src} s where ({has_null}) and {same} \
-                             ) as s \
-                         ) as a \
-                     )",
-                    kept = kept.join(", "),
-                    fresh = fresh.join(", "),
-                    src = self.source_row,
-                    equal = equal.join(" and "),
-                    has_null = has_null.join(" or "),
-                    same = same.join(" and "),
-                )
-            }
+            RebuildRead::Probe => format!(
+                "r as ( \
+                     select h.__hc, {kept} from rg \
+                     cross join lateral {lookup_hidden} as h(__hc) \
+                     cross join lateral (select {fresh} from ({probe}) as s) as a \
+                 )",
+                kept = kept.join(", "),
+                fresh = fresh.join(", "),
+                probe = self.probe_rows_sql(),
+            ),
         };
         format!(
             "with snap as materialized ( \
@@ -2277,7 +2269,8 @@ pub(crate) async fn rebuild(
     let session = if scope.is_some() {
         // The routing predicates mean what they meant when the tree was
         // recorded only under the pinned settings. Only the enumeration runs
-        // under them, and waits for a lock as the session does.
+        // under them, and waits for a lock as the session does: under its
+        // `lock_timeout` cap, which a `set local ... to default` would drop.
         let row = txn
             .query_one(
                 "select current_setting('search_path'), current_setting('lock_timeout'), \
@@ -2286,11 +2279,10 @@ pub(crate) async fn rebuild(
             )
             .await?;
         let saved: [String; 4] = [row.get(0), row.get(1), row.get(2), row.get(3)];
-        txn.batch_execute(&format!(
-            "{}; set local lock_timeout to default",
-            crate::capture::partitions::pinned_settings()
-        ))
-        .await?;
+        txn.batch_execute(&crate::capture::partitions::pinned_settings())
+            .await?;
+        txn.execute("select set_config('lock_timeout', $1, true)", &[&saved[1]])
+            .await?;
         Some(saved)
     } else {
         None
