@@ -230,7 +230,10 @@ impl CorrectionError {
 impl fmt::Display for CorrectionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            CorrectionError::Db(err) => write!(f, "partition correction: {err}"),
+            CorrectionError::Db(err) => {
+                write!(f, "partition correction: ")?;
+                crate::error::write_pg_error(f, err)
+            }
             CorrectionError::Pool(err) => write!(f, "partition correction: {err}"),
             CorrectionError::Apply(err) => write!(f, "partition correction: {err}"),
             CorrectionError::Capture(err) => write!(f, "partition correction: {err}"),
