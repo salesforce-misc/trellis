@@ -581,17 +581,17 @@ async fn a_source_retype_to_unscaled_numeric_pauses_its_sum_readers() {
     trellis.shutdown().await.expect("shutdown");
 }
 
-/// Rule 3: the check is define's whole validation, not only the scale rule.
-/// A `JOIN` on `t.k = o.k`, both `varchar(10)`: an alter that widens `t.k`
-/// to `text` leaves a key pair define refuses (`JoinKeyTypeMismatch`), so
-/// the alter is refused, naming the `JOIN`.
+/// Rules 1 and 4: an alter that changes a column's type within the string
+/// family leaves a `JOIN` key pair `t.k = o.k` valid (Trellis's copy of a
+/// `varchar(n)` column is unbounded, #1207, and `varchar` and `text` pair),
+/// so the alter is accepted and the `JOIN` is untouched.
 #[tokio::test]
-async fn an_alter_that_breaks_a_join_key_pair_is_refused() {
+async fn an_alter_that_keeps_a_join_key_pair_valid_is_accepted() {
     trellis::dev::staging::set_group_basis(true);
     let int4 = ValueType::Integer(IntWidth::Int4);
     let d = Driver::start(
         "create table public.src (id int primary key, g int, name varchar(10)); \
-         create table public.o (id int primary key, k varchar(10))",
+         create table public.o (id int primary key, k varchar)",
         &[("id", int4), ("g", int4), ("name", ValueType::Text)],
         &["TRANSFORM t FROM public.src SELECT g AS g, name AS k"],
         &["public.src", "public.o"],
@@ -618,18 +618,13 @@ async fn an_alter_that_breaks_a_join_key_pair_is_refused() {
     else {
         panic!("not an ALTER");
     };
-    let err = trellis::defs::alter_transform(d.pool(), &alter)
+    trellis::defs::alter_transform(d.pool(), &alter)
         .await
-        .expect_err("the alter is refused");
-    let message = err.to_string();
-    assert!(message.contains("'j'"), "{message}");
-    assert!(!message.contains("no declared scale"), "{message}");
+        .expect("the alter keeps the key pair valid");
     assert_eq!(
-        d.rows(
-            "select format_type(atttypid, atttypmod) from pg_attribute \
-             where attrelid = 'public.t'::regclass and attname = 'k'"
-        )
-        .await,
-        ["(\"character varying(10)\")"]
+        d.rows("select status from transform_definitions where target_table = 'public.j'")
+            .await,
+        ["(waiting_to_backfill)"],
+        "the JOIN is untouched"
     );
 }
