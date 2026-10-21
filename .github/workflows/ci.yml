@@ -11,16 +11,15 @@ env:
   # backtraces. Full debug info made the ~115 statically linked test
   # binaries ~13GB and a fifth of the build was linking them.
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  # How many `test` job shards there are; the matrix `shard` list below must be
+  # 1..TEST_SHARDS (the `lint` job checks it).
+  TEST_SHARDS: 4
 
 jobs:
-  ci:
-    # This repo moved from a private org with self-hosted runners (whose
-    # token trust required the spiff-ubuntu-4-16 label) to the public
-    # salesforce-misc org, which has no such self-hosted runner. Use the
-    # standard GitHub-hosted runner instead.
+  lint:
+    # Formatting, clippy and the shard-plan check (split out of the old single
+    # `ci` job so it runs beside the test shards, not before them).
     runs-on: ubuntu-latest
-    # A safety net for a hung test or runner, not a budget: the slowest runs
-    # take about 40 minutes, and the default would let a hang burn six hours.
     timeout-minutes: 60
     permissions:
       contents: read
@@ -42,7 +41,8 @@ jobs:
         # on everything that decides them: the compiler, the debug-info
         # setting above and Cargo.lock. A lockfile change still restores the
         # nearest older entry, so only the changed dependencies rebuild. PRs
-        # restore the entry main saved.
+        # restore the entry main saved. This job is the only one that saves it
+        # (the `test` shards, the `elixir` job and the `ruby` job restore only).
         id: cargo-cache
         uses: actions/cache/restore@v4
         with:
@@ -58,6 +58,11 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Check the test shard plan
+        # Every test binary is in exactly one `test` shard, and the shard
+        # matrix below matches TEST_SHARDS; see .github/scripts/test-shards.py.
+        run: python3 .github/scripts/test-shards.py check
+
       - name: Clippy
         # `--all-features` alone makes code whose only caller is feature-gated
         # look live, so dead code and unused imports in narrower builds slip
@@ -70,6 +75,73 @@ jobs:
           cargo clippy --workspace -- -D warnings
           cargo clippy -p benchmark --features engine-access -- -D warnings
           cargo clippy -p generative --features subprocess-backend -- -D warnings
+
+      - name: Build every test's dependencies for the cache
+        # Only on a cache miss, so the saved entry holds the dependencies of
+        # all the shards, not of whichever shard happened to save it.
+        if: steps.cargo-cache.outputs.cache-hit != 'true'
+        run: cargo test --workspace --features benchmark/engine-access --no-run
+
+      - name: Prune target/ to third-party dependencies
+        # A cold build is ~5.6GB, nearly all of it this workspace's own test
+        # binaries, which every run rebuilds anyway. What's left is ~800MB.
+        if: steps.cargo-cache.outputs.cache-hit != 'true'
+        run: .github/scripts/prune-cargo-target.sh
+
+      - name: Save Cargo dependency cache
+        # Only when the exact key missed: an entry's dependencies never change,
+        # so most runs restore and save nothing, and the repo's 10GB cache
+        # quota holds roughly one entry per lockfile.
+        if: steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+
+  test:
+    # The workspace tests, split across TEST_SHARDS parallel jobs. Each shard
+    # builds and runs only its own test binaries, one binary at a time as
+    # before; .github/scripts/test-shards.py assigns binaries to shards by the
+    # seconds in .github/test-shards.txt and fails the shard if cargo built
+    # anything other than its assignment. Refresh the file as
+    # docs/testing-strategy.md describes.
+    name: test (shard ${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    # A safety net for a hung test or runner, not a budget: a shard takes about
+    # 10 minutes, and the default would let a hang burn six hours.
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # Exactly 1..TEST_SHARDS; `lint` checks it.
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        id: toolchain
+        uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: "1.98.0"
+
+      - name: Restore Cargo dependency cache
+        # The `lint` job's entry, restore-only: that job is the one that saves.
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: cargo-deps-${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-line-tables-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-deps-${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-line-tables-
 
       - name: Install PostgreSQL server binaries
         # the shared test harness (see testkit/src/cluster.rs) shells out to
@@ -110,6 +182,10 @@ jobs:
           fi
 
       - name: Test
+        # test-shards.py runs `cargo test --workspace --features
+        # benchmark/engine-access --no-fail-fast` narrowed to the shard's
+        # binaries; the flags are CARGO_FLAGS in the script.
+        #
         # `--workspace`, generative crate included: every proptest property in
         # generative/ is `#[ignore]`d (enforced by generative/tests/meta.rs),
         # so this runs the crate's lib, coverage, meta, oracle, backend_seam,
@@ -137,31 +213,28 @@ jobs:
         # chosen after planning, so it changes no results or plans.
         env:
           TRELLIS_TESTKIT_PG_OPTIONS: jit=off
-        run: cargo test --workspace --features benchmark/engine-access --no-fail-fast
+        run: python3 .github/scripts/test-shards.py run ${{ matrix.shard }}
 
-      - name: Prune target/ to third-party dependencies
-        # A cold build is ~5.6GB, nearly all of it this workspace's own test
-        # binaries, which every run rebuilds anyway. What's left is ~800MB.
-        if: steps.cargo-cache.outputs.cache-hit != 'true'
-        run: .github/scripts/prune-cargo-target.sh
-
-      - name: Save Cargo dependency cache
-        # Only when the exact key missed: an entry's dependencies never change,
-        # so most runs restore and save nothing, and the repo's 10GB cache
-        # quota holds roughly one entry per lockfile.
-        if: steps.cargo-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+  ci:
+    # The one required check: it passes only when every job above passed, so
+    # branch protection names `ci` and never the individual shards.
+    if: always()
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require lint and every test shard
+        env:
+          LINT: ${{ needs.lint.result }}
+          TEST: ${{ needs.test.result }}
+        run: |
+          echo "lint: $LINT"
+          echo "test shards: $TEST"
+          [ "$LINT" = success ] && [ "$TEST" = success ]
 
   elixir:
     # The Elixir binding (clients/elixir, issue #146). Its NIF crate is a
-    # workspace member, so the `ci` job already formats, lints and builds it
+    # workspace member, so the `lint` job already formats, lints and builds it
     # (Rustler needs no Erlang install to compile); this job loads it into a
     # BEAM and runs the ExUnit suite against a `trellis-testkit` cluster.
     runs-on: ubuntu-latest
@@ -177,7 +250,7 @@ jobs:
           toolchain: "1.98.0"
 
       - name: Restore Cargo dependency cache
-        # The `ci` job's entry, restore-only: that job is the one that saves.
+        # The `lint` job's entry, restore-only: that job is the one that saves.
         uses: actions/cache/restore@v4
         with:
           path: |
@@ -191,7 +264,7 @@ jobs:
 
       - name: Install PostgreSQL server binaries
         # trellis-testkit shells out to initdb/postgres/pg_ctl/createdb, the
-        # same as the `ci` job's tests; see that job's step.
+        # same as the `test` shards; see that job's step.
         run: |
           set -euo pipefail
           pg_bin="$(find /usr/lib/postgresql -maxdepth 2 -type d -name bin 2>/dev/null | sort -V | tail -n1 || true)"
@@ -246,7 +319,7 @@ jobs:
     # The Ruby binding (clients/ruby, issue #151). Its extension crate is a
     # workspace member, but everything in it is behind the `ruby` feature,
     # because rb-sys needs a Ruby install to build (see its Cargo.toml): the
-    # `ci` job only formats it and builds it empty. This job lints it with
+    # `lint` and `test` jobs only format it and build it empty. This job lints it with
     # the feature on, then builds it into a Ruby and runs the Minitest suite
     # against a `trellis-testkit` cluster.
     runs-on: ubuntu-latest
@@ -263,7 +336,7 @@ jobs:
           components: clippy
 
       - name: Restore Cargo dependency cache
-        # The `ci` job's entry, restore-only: that job is the one that saves.
+        # The `lint` job's entry, restore-only: that job is the one that saves.
         uses: actions/cache/restore@v4
         with:
           path: |
@@ -277,7 +350,7 @@ jobs:
 
       - name: Install PostgreSQL server binaries
         # trellis-testkit shells out to initdb/postgres/pg_ctl/createdb, the
-        # same as the `ci` job's tests; see that job's step.
+        # same as the `test` shards; see that job's step.
         run: |
           set -euo pipefail
           pg_bin="$(find /usr/lib/postgresql -maxdepth 2 -type d -name bin 2>/dev/null | sort -V | tail -n1 || true)"

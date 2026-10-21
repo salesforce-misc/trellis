@@ -204,6 +204,29 @@ Alongside the generative harness, the chaos tier needs:
 
 ---
 
+## How CI runs the tiers
+
+The `ci` workflow runs `lint` (format, clippy, the shard-plan check) beside four `test`
+shard jobs, and a final job named `ci` that passes only when `lint` and every shard
+passed; `ci` is the one required status check. Each shard builds and runs its own test
+binaries, one at a time, with `cargo test --workspace --features benchmark/engine-access
+--no-fail-fast` narrowed to them, the flags `verify` uses.
+
+`.github/scripts/test-shards.py` assigns the binaries. It lists them from `cargo
+metadata`, so a new test file joins a shard with no edit, and balances them by the
+seconds in `.github/test-shards.txt`, one `unit seconds` line per binary. A binary the
+file does not list runs at the median weight and the run prints a warning. Correctness
+never rests on the weights: `lint` fails if any binary is in no shard or two, or if the
+`shard:` matrix in `ci.yml` is not `1..TEST_SHARDS`, and a shard fails if cargo built
+anything other than its assignment.
+
+To refresh the weights after the suite has changed shape, take the `cargo test` output
+of one full CI run (`gh run view <id> --log > log`, or a local `cargo test --workspace
+--features benchmark/engine-access`) and run `python3 .github/scripts/test-shards.py
+weights <log> > .github/test-shards.txt`. `test-shards.py plan -v` prints the resulting
+balance. Refresh when the warnings name many unlisted binaries or one shard runs
+noticeably longer than the others; a stale file costs balance, never coverage.
+
 ## How the tiers compose
 
 The tiers form a ratchet; when a bug is found, work flows one direction:
