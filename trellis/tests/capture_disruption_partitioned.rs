@@ -331,95 +331,117 @@ fn w(windows: &[&str]) -> Vec<String> {
     windows.iter().map(|w| w.to_string()).collect()
 }
 
-/// Every slice-1 disruption, applied to the root, to a leaf, to a middle node
-/// and to a leaf under it, pauses both readers on the first pass that sees it.
-#[tokio::test]
-async fn a_disruption_of_the_root_or_any_node_pauses_both_readers() {
+/// Every slice-1 disruption applied to `rel` (`label` names its cases) pauses
+/// both readers on the first pass that sees it.
+async fn every_disruption_pauses(label: &str, rel: &str) {
     let mut cases: Vec<Case> = Vec::new();
-    for (label, rel) in [
-        ("root", "{t}"),
-        ("leaf", "{t}_l1"),
-        ("mid", "{t}_l2"),
-        ("deep", "{t}_l2h0"),
-    ] {
-        let kinds: Vec<(&str, String, &'static str)> = vec![
-            (
-                "drop",
-                each_trigger(rel, &format!("drop trigger %I on public.{rel}")),
-                "is gone",
+    let kinds: Vec<(&str, String, &'static str)> = vec![
+        (
+            "drop",
+            each_trigger(rel, &format!("drop trigger %I on public.{rel}")),
+            "is gone",
+        ),
+        (
+            "recreate",
+            recreate_triggers(rel),
+            "dropped and created again",
+        ),
+        (
+            "disable",
+            each_trigger(rel, &format!("alter table public.{rel} disable trigger %I")),
+            "is disabled",
+        ),
+        (
+            "origin",
+            format!(
+                "alter table public.{rel} disable trigger user; \
+                 alter table public.{rel} enable trigger user"
             ),
-            (
-                "recreate",
-                recreate_triggers(rel),
-                "dropped and created again",
+            "ORIGIN mode",
+        ),
+        (
+            "replica",
+            each_trigger(
+                rel,
+                &format!("alter table public.{rel} enable replica trigger %I"),
             ),
-            (
-                "disable",
-                each_trigger(rel, &format!("alter table public.{rel} disable trigger %I")),
-                "is disabled",
-            ),
-            (
-                "origin",
-                format!(
-                    "alter table public.{rel} disable trigger user; \
-                     alter table public.{rel} enable trigger user"
+            "REPLICA mode",
+        ),
+        (
+            "alter",
+            each_trigger(
+                rel,
+                &format!(
+                    "alter table public.{rel} disable trigger %1$I; \
+                     alter table public.{rel} enable always trigger %1$I"
                 ),
-                "ORIGIN mode",
             ),
-            (
-                "replica",
-                each_trigger(
-                    rel,
-                    &format!("alter table public.{rel} enable replica trigger %I"),
-                ),
-                "REPLICA mode",
-            ),
-            (
-                "alter",
-                each_trigger(
-                    rel,
-                    &format!(
-                        "alter table public.{rel} disable trigger %1$I; \
-                         alter table public.{rel} enable always trigger %1$I"
-                    ),
-                ),
-                "was altered",
-            ),
-        ];
-        for (kind, window, text) in kinds {
-            cases.push((
-                format!("{label}_{kind}"),
-                vec![window],
-                Expect::Paused(text),
-            ));
-        }
+            "was altered",
+        ),
+    ];
+    for (kind, window, text) in kinds {
+        cases.push((
+            format!("{label}_{kind}"),
+            vec![window],
+            Expect::Paused(text),
+        ));
     }
-    cases.push((
-        "fn_replaced".into(),
-        vec![
-            "do $$ declare r record; begin \
+    run_cases(&cases).await;
+}
+
+/// The root, a leaf, a middle node and a leaf under it each get every
+/// disruption kind in their own test (own cluster), so the harness runs them
+/// in parallel.
+#[tokio::test]
+async fn a_disruption_of_the_root_pauses_both_readers() {
+    every_disruption_pauses("root", "{t}").await;
+}
+
+#[tokio::test]
+async fn a_disruption_of_a_leaf_pauses_both_readers() {
+    every_disruption_pauses("leaf", "{t}_l1").await;
+}
+
+#[tokio::test]
+async fn a_disruption_of_a_middle_node_pauses_both_readers() {
+    every_disruption_pauses("mid", "{t}_l2").await;
+}
+
+#[tokio::test]
+async fn a_disruption_of_a_leaf_under_a_middle_node_pauses_both_readers() {
+    every_disruption_pauses("deep", "{t}_l2h0").await;
+}
+
+/// A replaced capture function, and a node's triggers named in the finding.
+#[tokio::test]
+async fn a_replaced_function_and_a_named_node_pause_both_readers() {
+    let cases: Vec<Case> = vec![
+        (
+            "fn_replaced".into(),
+            vec![
+                "do $$ declare r record; begin \
                for r in select distinct tgfoid::regproc::text as f from pg_trigger \
                         where tgrelid = 'public.{t}'::regclass and tgname like 'trellis_capture_%' \
                loop execute format('create or replace function %s() returns trigger \
                     language plpgsql security definer as $b$ begin return null; end $b$', r.f); \
                end loop; end $$"
-                .into(),
-        ],
-        Expect::Paused("was replaced"),
-    ));
-    // A node's triggers named in the finding.
-    cases.push((
-        "names_node".into(),
-        vec![each_trigger("{t}_l3", "drop trigger %I on public.{t}_l3")],
-        Expect::Paused("(on public.p_names_node_l3)"),
-    ));
+                    .into(),
+            ],
+            Expect::Paused("was replaced"),
+        ),
+        // A node's triggers named in the finding.
+        (
+            "names_node".into(),
+            vec![each_trigger("{t}_l3", "drop trigger %I on public.{t}_l3")],
+            Expect::Paused("(on public.p_names_node_l3)"),
+        ),
+    ];
     run_cases(&cases).await;
 }
 
 /// Partition maintenance of every routine kind, and the routine operations of
 /// slice 1's matrix applied to nodes, pause nothing.
-#[tokio::test]
-async fn partition_maintenance_pauses_nothing() {
+fn maintenance_cases() -> Vec<Case> {
     let attach = "create table public.{t}_l4 (like public.{t} including defaults); \
                   alter table public.{t} attach partition public.{t}_l4 for values in (3)";
     let resplit = "alter table public.{t}_l2 detach partition public.{t}_l2h0; \
@@ -435,7 +457,7 @@ async fn partition_maintenance_pauses_nothing() {
                    insert into public.{t}_l2 select * from public.{t}_l2h0; \
                    insert into public.{t}_l2 select * from public.{t}_l2h1; \
                    drop table public.{t}_l2h0; drop table public.{t}_l2h1";
-    let cases: Vec<Case> = vec![
+    vec![
         ("attach".into(), w(&[attach]), Expect::Nothing),
         (
             "detach".into(),
@@ -544,8 +566,23 @@ async fn partition_maintenance_pauses_nothing() {
                 .collect(),
             Expect::Nothing,
         ),
-    ];
-    run_cases(&cases).await;
+    ]
+}
+
+/// Part `i` of `n` of `cases` (every case lands in exactly one part).
+fn part(cases: &[Case], i: usize, n: usize) -> &[Case] {
+    let size = cases.len().div_ceil(n);
+    &cases[(i * size).min(cases.len())..((i + 1) * size).min(cases.len())]
+}
+
+#[tokio::test]
+async fn partition_maintenance_pauses_nothing_part_1() {
+    run_cases(part(&maintenance_cases(), 0, 2)).await;
+}
+
+#[tokio::test]
+async fn partition_maintenance_pauses_nothing_part_2() {
+    run_cases(part(&maintenance_cases(), 1, 2)).await;
 }
 
 /// The rows `capture_triggers` holds for `table`, as `(nodes, rows)`.

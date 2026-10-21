@@ -309,11 +309,17 @@ async fn run_cases(cases: &[Case]) {
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
+/// Part `i` of `n` of `cases` (every case lands in exactly one part), so a
+/// long list runs as several tests, each on its own cluster, in parallel.
+fn part(cases: &[Case], i: usize, n: usize) -> &[Case] {
+    let size = cases.len().div_ceil(n);
+    &cases[(i * size).min(cases.len())..((i + 1) * size).min(cases.len())]
+}
+
 /// Maintenance alone, and maintenance in one window with a metadata
 /// `ALTER`: none is a change to what a column holds.
-#[tokio::test]
-async fn maintenance_rebuilds_and_pauses_nothing() {
-    run_cases(&[
+fn maintenance_cases() -> Vec<Case> {
+    vec![
         ("M1", "vacuum full public.{t}", Expect::Nothing),
         ("M2", "cluster public.{t} using {t}_pkey", Expect::Nothing),
         ("M3", "reindex table public.{t}", Expect::Nothing),
@@ -366,16 +372,24 @@ async fn maintenance_rebuilds_and_pauses_nothing() {
              cluster public.{t} using {t}_pkey",
             Expect::Nothing,
         ),
-    ])
-    .await;
+    ]
+}
+
+#[tokio::test]
+async fn maintenance_rebuilds_and_pauses_nothing_part_1() {
+    run_cases(part(&maintenance_cases(), 0, 2)).await;
+}
+
+#[tokio::test]
+async fn maintenance_rebuilds_and_pauses_nothing_part_2() {
+    run_cases(part(&maintenance_cases(), 1, 2)).await;
 }
 
 /// Single migrations. A pure widening never rebuilds or pauses here: the
 /// passthrough's copies a widening outgrows are re-typed in place, or pause
 /// `r` by #767's check, as before. A narrowed `varchar` rebuilds both.
-#[tokio::test]
-async fn single_migrations_act_only_on_a_changed_column() {
-    run_cases(&[
+fn single_migration_cases() -> Vec<Case> {
+    vec![
         (
             "D1",
             "alter table public.{t} alter column a set default 7",
@@ -508,16 +522,29 @@ async fn single_migrations_act_only_on_a_changed_column() {
             "alter table public.{t} alter column n type numeric(9,1)",
             Expect::PausedR,
         ),
-    ])
-    .await;
+    ]
+}
+
+#[tokio::test]
+async fn single_migrations_act_only_on_a_changed_column_part_1() {
+    run_cases(part(&single_migration_cases(), 0, 3)).await;
+}
+
+#[tokio::test]
+async fn single_migrations_act_only_on_a_changed_column_part_2() {
+    run_cases(part(&single_migration_cases(), 1, 3)).await;
+}
+
+#[tokio::test]
+async fn single_migrations_act_only_on_a_changed_column_part_3() {
+    run_cases(part(&single_migration_cases(), 2, 3)).await;
 }
 
 /// Migrations paired in one transaction, or one window, the way framework
 /// migrations run them: R3b ignores a rewrite whose column row changed
 /// visibly (P1, P2, P4, P7, X3, X4), which plain R3 paused for.
-#[tokio::test]
-async fn paired_migrations_rebuild_and_pause_nothing() {
-    run_cases(&[
+fn paired_migration_cases() -> Vec<Case> {
+    vec![
         (
             "P1",
             "begin; alter table public.{t} alter column a set default 9; \
@@ -609,14 +636,22 @@ async fn paired_migrations_rebuild_and_pause_nothing() {
              alter table public.{t} set tablespace pg_default; commit",
             Expect::Nothing,
         ),
-    ])
-    .await;
+    ]
+}
+
+#[tokio::test]
+async fn paired_migrations_rebuild_and_pause_nothing_part_1() {
+    run_cases(part(&paired_migration_cases(), 0, 2)).await;
+}
+
+#[tokio::test]
+async fn paired_migrations_rebuild_and_pause_nothing_part_2() {
+    run_cases(part(&paired_migration_cases(), 1, 2)).await;
 }
 
 /// The study's controls, and R3b's documented residue.
-#[tokio::test]
-async fn real_changes_rebuild_or_pause() {
-    run_cases(&[
+fn real_change_cases() -> Vec<Case> {
+    vec![
         // R1: dropped and re-added with the same type; every definition is
         // still valid, so the readers rebuild.
         (
@@ -754,8 +789,22 @@ async fn real_changes_rebuild_or_pause() {
              alter table public.{t} alter column b set statistics 500",
             Expect::Nothing,
         ),
-    ])
-    .await;
+    ]
+}
+
+#[tokio::test]
+async fn real_changes_rebuild_or_pause_part_1() {
+    run_cases(part(&real_change_cases(), 0, 3)).await;
+}
+
+#[tokio::test]
+async fn real_changes_rebuild_or_pause_part_2() {
+    run_cases(part(&real_change_cases(), 1, 3)).await;
+}
+
+#[tokio::test]
+async fn real_changes_rebuild_or_pause_part_3() {
+    run_cases(part(&real_change_cases(), 2, 3)).await;
 }
 
 /// R3b end to end: the same-type rewrite rebuilds both readers, which
