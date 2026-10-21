@@ -1570,7 +1570,7 @@ async fn blockers_of(
                     or ($4 and l.relation in ( \
                         select relid from ",
                 partition_nodes!("pg_catalog.to_regclass($1)"),
-                "))) \
+                " nodes))) \
                and l.pid is distinct from pg_catalog.pg_backend_pid() \
                and l.mode = any($2) \
              order by l.pid, p.gid, l.mode, l.granted"
