@@ -14,7 +14,9 @@
 //! A 1-1 page ([`super::self_check`]) reads no weighted rows: a row's
 //! target holds the row as of the *old image of its key's earliest unapplied
 //! change* ([`Ring::one_to_one_ctes`]), or no row for an insert, and the live
-//! row when the key has none.
+//! row when the key has none. A change its page would refuse is not counted:
+//! at or below the truncate floor, at or below its key's ledger entry's
+//! `applied_lsn`, or seen by that entry's `basis`.
 //!
 //! "Unapplied" is a ring row of the source that
 //!
@@ -48,6 +50,7 @@
 //! staging SQL (ADR-0013's independence).
 
 use crate::defs::ddl::{self, PrimaryKeyColumn};
+use crate::defs::ledger as ledger_schema;
 use crate::pool::{quote_ident, quote_literal};
 
 use super::converge::per_ring_table;
@@ -162,24 +165,46 @@ impl Ring<'_> {
     /// none from it on. A key with an unapplied row that can't be
     /// subtracted ([`Self::uncertain_keys_sql`]) isn't in it, and is compared
     /// against its live source row.
-    pub(super) fn one_to_one_ctes(&self) -> String {
+    ///
+    /// A change the page that applies it would refuse (ADR-0002's I2, against
+    /// the key's entry on `target`'s ledger, `target` being the target's
+    /// qualified identity) never reaches the target, so it is no unapplied
+    /// change here: one at or below the entry's `applied_lsn` (a later batch
+    /// of the key drained first), one its `basis` saw (a Re-derive read the
+    /// live row after it), and one at or below the target's truncate floor.
+    /// The changes I2 refuses are always a prefix of a key's in `lsn` order,
+    /// so the earliest one it doesn't is the first the target hasn't applied.
+    pub(super) fn one_to_one_ctes(&self, target: &str) -> String {
         let rows = self.cte("rows");
         let pend = self.cte("pend");
+        let q = |c: &str| quote_ident(c);
         format!(
             "{rows} as materialized ({rows_sql}), \
              {pend} as materialized ( \
-                 select distinct on (__key) __key as __k, \
-                        case when jsonb_typeof(__x) = 'object' then __x -> 'old' else __o end as __i \
-                 from {rows} \
-                 where __kind = 'side' \
-                   and __key not in (select __key from {rows} where __kind <> 'side') \
-                   and __key not in (select ph.key from poison_held ph \
-                                     where ph.transform_id = {id} and ph.src_table = {src} \
-                                       and ph.origin_lsn is null) \
-                 order by __key, __lsn), ",
+                 select distinct on (d.__key) d.__key as __k, \
+                        case when jsonb_typeof(d.__x) = 'object' then d.__x -> 'old' \
+                             else d.__o end as __i \
+                 from {rows} d \
+                 left join {ledger} l on l.{key_col} = d.__key \
+                 where d.__kind = 'side' \
+                   and d.__key not in (select __key from {rows} where __kind <> 'side') \
+                   and d.__key not in (select ph.key from poison_held ph \
+                                       where ph.transform_id = {id} and ph.src_table = {src} \
+                                         and ph.origin_lsn is null) \
+                   and (l.{basis} is null or not pg_visible_in_snapshot(d.__txid, l.{basis})) \
+                   and (l.{applied} is null or d.__lsn > l.{applied}) \
+                   and d.__lsn > coalesce( \
+                       (select floor from ledger_truncate_floor where target_table = {floor}), \
+                       '0/0'::pg_lsn) \
+                 order by d.__key, d.__lsn), ",
             rows_sql = self.rows_sql(),
             id = self.transform_id,
             src = quote_literal(self.src_table),
+            ledger = super::one_to_one_ledger::ledger_ident(target),
+            key_col = q(ledger_schema::KEY_COLUMN),
+            basis = q(ledger_schema::BASIS_COLUMN),
+            applied = q(ledger_schema::APPLIED_LSN_COLUMN),
+            floor = quote_literal(target),
         )
     }
 

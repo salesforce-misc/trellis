@@ -212,8 +212,9 @@ pub enum SelfCheckMode {
     /// **A 1-1 target** compares each row of a page against what the target
     /// has applied of it, in the same statement that reads the target
     /// (`super::self_check_ring`, #1176): the old image of the key's
-    /// earliest unapplied change (no row, for an insert), or the live source
-    /// row when the ring holds nothing unapplied for the key. A divergence on
+    /// earliest unapplied change its page would apply (no row, for an
+    /// insert), or the live source row when the ring holds no such change
+    /// for the key. A divergence on
     /// a key so compared is reported from one pass. Only a divergence on a
     /// key the comparison can't vouch for is re-checked: one with an
     /// unapplied change that has no usable image (a `Recompute`), a held key
@@ -1245,7 +1246,7 @@ fn page_sql(
     Ok(keyset.ranked(
         &format!(
             "{}recomputed as materialized ({}), persisted as materialized ({}), ",
-            ring.one_to_one_ctes(),
+            ring.one_to_one_ctes(&def.target_table),
             side(&expected, &recomputed),
             side(&target_ident, &persisted)
         ),

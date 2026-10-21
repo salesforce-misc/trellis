@@ -235,3 +235,52 @@ async fn a_one_to_one_page_never_scans_a_drained_ring_slot() {
     let active = scan(slots.last().unwrap());
     assert!(active.iter().any(|ran| *ran), "the active slot:\n{plan}");
 }
+
+/// A change its page will refuse (ADR-0002's I2) never reaches the target,
+/// so it isn't one the target hasn't applied: a key's later batch drained
+/// first and its earlier batch is still pending.
+#[tokio::test]
+async fn a_change_a_later_batch_overtook_is_not_expected() {
+    let mut d = start().await;
+    step(&mut d, "insert into public.src values (1, 10, 1)").await;
+    exec(&d, "update public.src set v = 11 where id = 1").await;
+    let first = d.seal().await;
+    exec(&d, "update public.src set v = 12 where id = 1").await;
+    let second = d.seal().await;
+    d.drain(second, "second").await;
+    assert_eq!(compare(&d, 10).await, (vec![], vec![], false));
+    d.drain(first, "first").await;
+    assert_eq!(compare(&d, 10).await, (vec![], vec![], false));
+}
+
+/// A Re-derive reads the live row, so the changes its snapshot saw are
+/// already in the target, and their page will refuse them.
+#[tokio::test]
+async fn a_change_a_re_derive_saw_is_not_expected() {
+    let mut d = start().await;
+    step(&mut d, "insert into public.src values (1, 10, 1)").await;
+    d.stage_recomputes(SRC, &["1"]).await;
+    let first = d.seal().await;
+    exec(&d, "update public.src set v = 11 where id = 1").await;
+    let second = d.seal().await;
+    d.drain(first, "first").await;
+    assert_eq!(compare(&d, 10).await, (vec![], vec![], false));
+    d.drain(second, "second").await;
+    assert_eq!(compare(&d, 10).await, (vec![], vec![], false));
+}
+
+/// A change at or below the target's truncate floor is refused: the
+/// `TRUNCATE` that drained first already emptied the target.
+#[tokio::test]
+async fn a_change_below_the_truncate_floor_is_not_expected() {
+    let mut d = start().await;
+    step(&mut d, "insert into public.src values (1, 10, 1)").await;
+    exec(&d, "update public.src set v = 11 where id = 1").await;
+    let first = d.seal().await;
+    exec(&d, "truncate public.src").await;
+    let second = d.seal().await;
+    d.drain(second, "second").await;
+    assert_eq!(compare(&d, 10).await, (vec![], vec![], false));
+    d.drain(first, "first").await;
+    assert_eq!(compare(&d, 10).await, (vec![], vec![], false));
+}
