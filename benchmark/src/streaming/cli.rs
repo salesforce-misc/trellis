@@ -673,6 +673,7 @@ pub fn run(name: &str, args: &[String]) -> Option<bool> {
             let cfg = self_check_walk::Config {
                 rows: number(args, "--rows").map_or(1_000_000, |n| n as i64),
                 aggregate: flag(args, "--kind") == Some("aggregate"),
+                join: flag(args, "--kind") == Some("join"),
                 groups: number(args, "--groups").map_or(10_000, |n| n as i64),
                 probe_pages: number(args, "--probe-pages").map_or(0, |n| n as usize),
                 walk_after_probe: args.iter().any(|a| a == "--walk-after-probe"),

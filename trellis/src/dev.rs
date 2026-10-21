@@ -100,6 +100,10 @@ pub mod staging {
     pub use crate::staging::group_basis::{
         KNOB_ENV as GROUP_BASIS_ENV, enabled as group_basis_enabled, set_enabled as set_group_basis,
     };
+    /// One page of a `self_check` walk, for `benchmark`'s `self-check-walk`
+    /// (#1198): it walks a JOIN target's `P` and `M` parts alone, from the
+    /// cursor `p`, which the job (it walks `T` first) can't.
+    pub use crate::staging::self_check::{SelfCheckScope, check_page as self_check_page};
     /// One pass of the `self_check` worker task, for a harness that runs no
     /// drain workers (so no such task) and hand-drives the job it started
     /// through `Trellis::self_check` (#1023), the way `ManualBackend` drains
