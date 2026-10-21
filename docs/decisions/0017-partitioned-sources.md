@@ -381,7 +381,8 @@ target, those parents are recomputed. The
 sweep runs in its own `READ COMMITTED` transaction: the pass reads the lifecycle
 catalog before the constraint texts, re-reads it in a new statement after
 queuing the hits' correction, and rolls back and retries if the leaf set
-changed.
+changed. Its bound reads wait at most a short `lock_timeout` behind a lock on
+a node, and a pass whose sweep times out leaves the next pass to sweep.
 
 A recorded node can be gone without a usable text: a node detached or dropped
 between the pass's tree read and its text fetch is recorded with none, and its

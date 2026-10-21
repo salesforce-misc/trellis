@@ -858,7 +858,7 @@ async fn a_leaf_held_access_exclusive_does_not_stall_installed_tables() {
 }
 
 /// The same with a detach pending on a middle node (the `pending` subtree
-/// walk): a leaf under another middle is held `ACCESS EXCLUSIVE`.
+/// walk): a leaf under the pending middle is held `ACCESS EXCLUSIVE`.
 #[tokio::test]
 async fn a_leaf_held_access_exclusive_does_not_stall_installed_tables_past_a_pending_detach() {
     let cluster = TestCluster::start();
@@ -896,7 +896,7 @@ async fn a_leaf_held_access_exclusive_does_not_stall_installed_tables_past_a_pen
     assert!(pending, "public.m2 is detach-pending");
 
     holder
-        .batch_execute("begin; lock table public.m1_0 in access exclusive mode")
+        .batch_execute("begin; lock table public.m2_0 in access exclusive mode")
         .await
         .expect("hold a leaf");
     let tables = tokio::time::timeout(
@@ -1023,4 +1023,240 @@ async fn the_tree_walk_matches_pg_partition_tree() {
         ["public.m2_0", "public.m2_1"],
         "the pending middle's own tree is intact"
     );
+}
+
+/// `installed_tables` as it read the tree with `pg_partition_tree`, which
+/// locks every node: the reference its lock-free walk must match.
+const INSTALLED_TABLES_WITH_PG_PARTITION_TREE: &str = "with recorded as ( \
+         select c.j ->> 'table' as name from ( \
+             select d.description::jsonb as j \
+             from pg_catalog.pg_proc p \
+             join pg_catalog.pg_description d \
+               on d.objoid = p.oid \
+              and d.classoid = 'pg_catalog.pg_proc'::pg_catalog.regclass \
+              and d.objsubid = 0 \
+             where p.pronamespace = ( \
+                 select oid from pg_catalog.pg_namespace where nspname = $1) \
+               and d.description like '{\"trellis_capture\":1,%') c \
+         where c.j ->> 'table' is not null), \
+     covered as ( \
+         select d.relid from (select distinct name from recorded) x \
+         join pg_catalog.pg_namespace kn \
+           on kn.nspname = pg_catalog.split_part(x.name, '.', 1)::name \
+         join pg_catalog.pg_class k \
+           on k.relnamespace = kn.oid \
+          and k.relname = pg_catalog.split_part(x.name, '.', 2)::name \
+         cross join pg_catalog.pg_partition_tree(k.oid) d), \
+     pending as ( \
+         select d.relid from pg_catalog.pg_inherits i \
+         cross join pg_catalog.pg_partition_tree(i.inhrelid) d \
+         where i.inhdetachpending) \
+     select name from recorded \
+     union \
+     select n.nspname::text || '.' || r.relname::text \
+     from pg_catalog.pg_class r \
+     join pg_catalog.pg_namespace n on n.oid = r.relnamespace \
+     where r.oid in ( \
+           select t.tgrelid from pg_catalog.pg_trigger t \
+           where t.tgname = any($2) and not t.tgisinternal) \
+       and r.oid not in (select relid from pending) \
+       and not (r.relispartition and r.oid in (select relid from covered))";
+
+/// Detaches `child` from `parent` concurrently and leaves it pending: a
+/// holder's snapshot keeps the second phase waiting until its timeout.
+async fn leave_detach_pending(dsn: &str, parent: &str, child: &str) {
+    let holder = connect(dsn).await;
+    holder
+        .batch_execute(&format!("begin; lock table {child} in access share mode"))
+        .await
+        .expect("hold the child");
+    let detacher = connect(dsn).await;
+    detacher
+        .batch_execute("set statement_timeout = '500ms'")
+        .await
+        .expect("timeout");
+    let interrupted = detacher
+        .batch_execute(&format!(
+            "alter table {parent} detach partition {child} concurrently"
+        ))
+        .await;
+    assert!(interrupted.is_err(), "the second phase waits on the holder");
+    holder.batch_execute("rollback").await.expect("release");
+    let pending: bool = holder
+        .query_one(
+            "select inhdetachpending from pg_inherits where inhrelid = $1::text::regclass",
+            &[&child],
+        )
+        .await
+        .expect("pending")
+        .get(0);
+    assert!(pending, "{child} is detach-pending");
+}
+
+/// `installed_tables`' lock-free walk lists exactly what it did with
+/// `pg_partition_tree`, over a mixed tree and every shape of recorded set:
+/// three levels, `DEFAULT` partitions at two of them, a detach-pending
+/// middle and leaf, a detach-pending leaf under a pending middle, triggers
+/// on every node, and recorded roots, middles, leaves (alone and with their
+/// root), pending nodes, plain tables, a plain-inheritance parent and child,
+/// and a missing name.
+#[tokio::test]
+async fn installed_tables_matches_the_pg_partition_tree_reading() {
+    use trellis::capture::sql::{CaptureEvent, trigger_name};
+
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect(db.dsn()).await;
+    client
+        .batch_execute(&format!(
+            "create schema if not exists {DEFAULT_SCHEMA}; \
+             create table public.r (id int, region int, v text) partition by list (region); \
+             create table public.m1 partition of public.r for values in (1) \
+                 partition by range (id); \
+             create table public.m1_a partition of public.m1 for values from (0) to (10) \
+                 partition by hash (id); \
+             create table public.m1_a0 partition of public.m1_a \
+                 for values with (modulus 2, remainder 0); \
+             create table public.m1_a1 partition of public.m1_a \
+                 for values with (modulus 2, remainder 1); \
+             create table public.m1_b partition of public.m1 for values from (10) to (20); \
+             create table public.m1_c partition of public.m1 for values from (20) to (30); \
+             create table public.m2 partition of public.r for values in (2) \
+                 partition by range (id); \
+             create table public.m2_0 partition of public.m2 for values from (0) to (10); \
+             create table public.m2_1 partition of public.m2 for values from (10) to (20); \
+             create table public.m3 partition of public.r for values in (3); \
+             create table public.plain (id int); \
+             create table public.ip (id int); \
+             create table public.ic () inherits (public.ip); \
+             create function {DEFAULT_SCHEMA}.noop() returns trigger language plpgsql \
+                 as 'begin return null; end'"
+        ))
+        .await
+        .expect("tree");
+    // Every node carries a capture trigger of its own: a parent's clones onto
+    // its partitions under its name, so each level takes another event's.
+    let by_level = [
+        (
+            CaptureEvent::Delete,
+            &["public.r", "public.plain", "public.ip"][..],
+        ),
+        (
+            CaptureEvent::Update,
+            &["public.m1", "public.m2", "public.ic"][..],
+        ),
+        (CaptureEvent::Truncate, &["public.m1_a"][..]),
+        (
+            CaptureEvent::Insert,
+            &[
+                "public.m1_a0",
+                "public.m1_a1",
+                "public.m1_b",
+                "public.m1_c",
+                "public.m2_0",
+                "public.m2_1",
+                "public.m3",
+            ][..],
+        ),
+    ];
+    for (event, tables) in by_level {
+        for table in tables {
+            client
+                .batch_execute(&format!(
+                    "create trigger {} after {} on {table} \
+                     for each statement execute function {DEFAULT_SCHEMA}.noop()",
+                    trigger_name(DEFAULT_SCHEMA, event),
+                    match event {
+                        CaptureEvent::Truncate => "truncate",
+                        CaptureEvent::Update => "update",
+                        CaptureEvent::Delete => "delete",
+                        _ => "insert",
+                    },
+                ))
+                .await
+                .expect("trigger");
+        }
+    }
+    leave_detach_pending(db.dsn(), "public.m2", "public.m2_0").await;
+    leave_detach_pending(db.dsn(), "public.r", "public.m2").await;
+    leave_detach_pending(db.dsn(), "public.m1", "public.m1_c").await;
+    // A pending detach can't start while its parent has a `DEFAULT`.
+    client
+        .batch_execute(
+            "create table public.rd partition of public.r default; \
+             create table public.m1_d partition of public.m1 default",
+        )
+        .await
+        .expect("defaults");
+    for table in ["public.rd", "public.m1_d"] {
+        client
+            .batch_execute(&format!(
+                "create trigger {} after insert on {table} \
+                 for each statement execute function {DEFAULT_SCHEMA}.noop()",
+                trigger_name(DEFAULT_SCHEMA, CaptureEvent::Insert),
+            ))
+            .await
+            .expect("trigger");
+    }
+
+    let triggers: Vec<String> = CaptureEvent::ALL
+        .iter()
+        .map(|event| trigger_name(DEFAULT_SCHEMA, *event))
+        .collect();
+    let recorded_sets: &[&[&str]] = &[
+        &[],
+        &["public.r"],
+        &["public.m1"],
+        &["public.m1_a"],
+        &["public.m1_a0"],
+        &["public.r", "public.m1_a0"],
+        &["public.m1", "public.m1_a0", "public.m1_a"],
+        &["public.m2"],
+        &["public.m2_0"],
+        &["public.m1_c"],
+        &["public.rd"],
+        &["public.m1_d"],
+        &["public.plain"],
+        &["public.ip"],
+        &["public.ic"],
+        &["public.missing"],
+        &[
+            "public.r",
+            "public.m2",
+            "public.plain",
+            "public.ip",
+            "public.missing",
+        ],
+    ];
+    for recorded in recorded_sets {
+        let mut ddl = format!(
+            "drop function if exists {DEFAULT_SCHEMA}.rec0, {DEFAULT_SCHEMA}.rec1, \
+             {DEFAULT_SCHEMA}.rec2, {DEFAULT_SCHEMA}.rec3, {DEFAULT_SCHEMA}.rec4;"
+        );
+        for (i, table) in recorded.iter().enumerate() {
+            ddl.push_str(&format!(
+                "create function {DEFAULT_SCHEMA}.rec{i}() returns void language sql as ''; \
+                 comment on function {DEFAULT_SCHEMA}.rec{i}() is \
+                     '{{\"trellis_capture\":1,\"table\":\"{table}\"}}';"
+            ));
+        }
+        client.batch_execute(&ddl).await.expect("recorded");
+        let expected: std::collections::BTreeSet<String> = client
+            .query_typed(
+                INSTALLED_TABLES_WITH_PG_PARTITION_TREE,
+                &[
+                    (&DEFAULT_SCHEMA, tokio_postgres::types::Type::TEXT),
+                    (&triggers, tokio_postgres::types::Type::TEXT_ARRAY),
+                ],
+            )
+            .await
+            .expect("old reading")
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        let walked = trellis::capture::reconcile::installed_tables(&client, DEFAULT_SCHEMA)
+            .await
+            .expect("installed tables");
+        assert_eq!(walked, expected, "recorded {recorded:?}");
+    }
 }
