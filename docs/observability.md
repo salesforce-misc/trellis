@@ -330,7 +330,7 @@ pause are arcs of one lifecycle:
     capture of `<table>` was changed outside Trellis: the capture trigger `<name>`
     is gone, was dropped and created again, is disabled, is enabled in ORIGIN
     or REPLICA mode, or was altered; the capture function `<name>` was
-    replaced…", and goes on to say that changes made meanwhile may be missing,
+    replaced…" (on a partitioned source's node, "(on `<node>`)" follows each finding), and goes on to say that changes made meanwhile may be missing,
     so Trellis can't guarantee the definition is correct, and that a resume
     reinstalls capture and rebuilds it. The `capture_failure`'s `kind` is
     `disruption`;
@@ -428,6 +428,19 @@ finding, and the CLI's `trellis status` prints it under each transform it holds 
 The holdup is separate from `capture_failure`: it pauses and charges nothing
 ([ADR-0003](decisions/0003-quarantine-storage-and-api.md#retry-policy)).
 
+`source_index_gaps` on `DefinitionStatus` lists the source indexes a `GROUP BY` or `JOIN`
+transform needs and lacks (#1167): one entry per table and leading columns, with
+`opted_out` and a `create index` statement as the fix (`SourceIndexGap::fix`), which
+Trellis doesn't run. Define and a `RESUME` refuse a transform without them, so an
+entry is an index dropped or made invalid since, or one a transform defined `WITHOUT
+SOURCE INDEX` runs without. It is a warning: nothing is paused and the target is
+correct, but `self_check` refuses to walk a transform whose entry is not opted out
+(an opted-out one walks, scanning the source once per page). It is empty for every
+other target and when the indexes exist, is read from the catalog on each call, and
+is one field for every target kind. The CLI's `trellis status` prints one warning line per
+entry. Which indexes a target needs is in
+[Supported sources and targets](transforms.md#supported-sources-and-targets).
+
 `unindexed_joins` on `DefinitionStatus` lists the join columns of the relationships
 the transform reads that have no usable index (#973): a relationship's `from_col`,
 and a to-many relationship's `to_col` (a to-one's `to_col` is unique, so it is never
@@ -442,20 +455,13 @@ longer exists isn't listed. The CLI's `trellis status` prints one warning line p
 entry under the transform.
 
 `join` on `DefinitionStatus` is set for a `JOIN` transform (#1112) and `None` for any
-other. It reports three things, all warnings that leave the transform's status alone:
+other. It reports two things, both warnings that leave the transform's status alone:
 
 - `hidden_tables`: the estimated rows (`pg_class.reltuples`, 0 before the first
   analyze) and total on-disk size in bytes of `P`, `M`, `J` and `T`, the
   transform's hidden tables ([ADR-0019](decisions/0019-join-transforms.md)).
   Estimates keep the call cheap on large tables; they are as fresh as the table's
   last `ANALYZE` or autovacuum.
-- `unindexed_on`: one entry per side of the `JOIN` (the `FROM` table and the joined
-  table) when none of that side's `ON` columns leads a usable index (the same test
-  as `unindexed_joins`). `column` lists the side's join key, and the fix is an index
-  on it, which Trellis doesn't create. Pages never read the two tables (they apply
-  captured changes to `P` and `M`), so the index serves the definition's own `JOIN`
-  run against the tables, not Trellis's apply. A side whose `ON` column no longer
-  exists isn't listed. It is read from the catalog on each call.
 - `partials_warning`: set once `P`'s estimated rows reach half of the `FROM` table's
   (and the `FROM` table has at least 1000 estimated rows). `P` is the `FROM` table
   grouped by its `GROUP BY` columns and join key, so a `P` near the table's size

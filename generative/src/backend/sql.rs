@@ -22,8 +22,8 @@ use std::time::{Duration, Instant};
 
 use trellis::dev::defs::TransformStatus;
 use trellis::dev::defs::ast::{
-    Expr, FieldDef, JoinKind, KeySpace, Operator, Predicate, QualifiedColumn, TransformDef,
-    ValueType,
+    Expr, FieldDef, GroupByKey, JoinKind, KeySpace, Operator, Predicate, QualifiedColumn,
+    TransformDef, ValueType,
 };
 use trellis::dev::staging::{StagingError, await_converged, converged_through, watermark_token};
 
@@ -107,12 +107,84 @@ pub(super) fn render_definition(def: &TransformDef) -> String {
                 .join(", ")
         ),
     };
+    let opt_out = if def.without_source_index {
+        " WITHOUT SOURCE INDEX"
+    } else {
+        ""
+    };
     format!(
-        "TRANSFORM {} FROM {}{key_space_clause} SELECT {}",
+        "TRANSFORM {} FROM {}{key_space_clause}{opt_out} SELECT {}",
         def.target,
         def.source,
         fields.join(", ")
     )
+}
+
+/// The source indexes `def` needs (#1167), as `(table, leading columns)`: an
+/// aggregate's `GROUP BY` columns on its source, and a `JOIN` side's `ON`
+/// columns, in `ON` order, on each side. Asked of every definition whatever
+/// the group-basis knob says, which only decides whether the engine requires
+/// them: the index serves a `self_check` walk either way.
+pub(super) fn required_source_indexes(def: &TransformDef) -> Vec<(String, Vec<String>)> {
+    match &def.key_space {
+        KeySpace::OneToOne => Vec::new(),
+        KeySpace::Aggregate { group_by } => {
+            let columns: Vec<String> = group_by
+                .iter()
+                .filter_map(|key| match key {
+                    GroupByKey::Column(column) => Some(column.clone()),
+                    GroupByKey::RelationshipPath { .. } => None,
+                })
+                .collect();
+            if columns.len() == group_by.len() {
+                vec![(def.source.clone(), columns)]
+            } else {
+                Vec::new()
+            }
+        }
+        KeySpace::Join(join) => [def.source.as_str(), join.right.as_str()]
+            .into_iter()
+            .map(|table| {
+                let columns = join
+                    .on
+                    .iter()
+                    .filter_map(|term| {
+                        [&term.lhs, &term.rhs]
+                            .into_iter()
+                            .find(|c| c.table == table)
+                            .map(|c| c.column.clone())
+                    })
+                    .collect();
+                (table.to_string(), columns)
+            })
+            .collect(),
+    }
+}
+
+/// Creates the source indexes `def` needs ([`required_source_indexes`]) on
+/// tables in `schema` (`None`: the session's `search_path`), if they don't
+/// exist: the engine refuses a `GROUP BY` or `JOIN` definition without them.
+pub(super) async fn create_source_indexes(
+    raw: &tokio_postgres::Client,
+    schema: Option<&str>,
+    def: &TransformDef,
+) -> Result<(), tokio_postgres::Error> {
+    for (table, columns) in required_source_indexes(def) {
+        let qualified = match schema {
+            Some(schema) => format!("{}.{}", quote_ident(schema), quote_ident(&table)),
+            None => quote_ident(&table),
+        };
+        let mut name = format!("gen_{table}_{}_idx", columns.join("_"));
+        name.truncate(60);
+        let cols: Vec<String> = columns.iter().map(|c| quote_ident(c)).collect();
+        raw.batch_execute(&format!(
+            "create index if not exists {} on {qualified} ({})",
+            quote_ident(&name),
+            cols.join(", ")
+        ))
+        .await?;
+    }
+    Ok(())
 }
 
 /// Renders a generator-built [`Expr`] back to source text. Every operand of

@@ -44,7 +44,6 @@ wrong rows, on the targets it compares
 | [A to-side row hidden from capture by a new policy](#a-to-side-row-hidden-from-capture-by-a-new-policy) | no; the next pass pauses it | #1115 |
 | **[Partitioned sources](#partitioned-sources-refused-today)** (refused at define today) | | |
 | [A `MERGE` that moves a row to another partition](#a-merge-that-moves-a-row-to-another-partition) | `self_check` | a Postgres fix ([#942](https://github.com/salesforce-misc/trellis/issues/942)) |
-| [A partition's capture changed outside Trellis](#a-partitions-capture-changed-outside-trellis) | `self_check` | [#1200](https://github.com/salesforce-misc/trellis/issues/1200) |
 | [The source renamed or re-parented and back within one pass](#the-source-renamed-or-re-parented-and-back-within-one-pass) | `self_check` | [#1210](https://github.com/salesforce-misc/trellis/issues/1210) |
 | [A short-lived leaf beside a `DEFAULT` partition](#a-short-lived-leaf-beside-a-default-partition) | `self_check` | documented |
 | [A leaf detached and attached again around a `pg_upgrade`](#a-leaf-detached-and-attached-again-around-a-pg_upgrade) | `self_check` | [#1210](https://github.com/salesforce-misc/trellis/issues/1210) |
@@ -488,29 +487,12 @@ with `DELETE` and `INSERT`.
 **Ends with:** a Postgres fix; it's reported upstream
 ([#942](https://github.com/salesforce-misc/trellis/issues/942)).
 
-### A partition's capture changed outside Trellis
-
-**When:** a capture trigger on a node of a partitioned source's tree is
-disabled, dropped or replaced by hand.
-
-**What goes wrong:** the tree's nodes come and go with partition
-maintenance, so the pass doesn't record their triggers the way it records a
-plain table's. It reinstalls a missing or disabled one and pauses nobody, and
-the writes made meanwhile are lost.
-
-**Detected by:** `self_check`.
-
-**Repair:** `request_backfill` the table.
-
-**Ends with:** [#1200](https://github.com/salesforce-misc/trellis/issues/1200).
-
 ### The source renamed or re-parented and back within one pass
 
 **When:** before the next reconcile pass, the source is renamed away and back
 (`ALTER TABLE orders RENAME TO orders_old`, then back), or attached under
-another partitioned table and detached again. A pass that sees the rename
-corrects every leaf, and one that sees the source attached elsewhere pauses
-its readers.
+another partitioned table and detached again. A pass that sees the source
+renamed away, or attached elsewhere, pauses its readers.
 
 **What goes wrong:** capture stages a write only while the source's name
 resolves to the root of the tree being written, so every write made in

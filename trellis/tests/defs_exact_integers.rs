@@ -341,6 +341,7 @@ fn add_def(lhs: &str, rhs: &str) -> TransformDef {
             },
         }],
         predicate: Predicate::True,
+        without_source_index: false,
     }
 }
 
@@ -680,6 +681,7 @@ async fn integer_text_rendering_is_byte_identical_to_postgres() {
             expr: Expr::Column("a".to_string()),
         }],
         predicate: Predicate::True,
+        without_source_index: false,
     };
 
     for width in IntWidth::ALL {

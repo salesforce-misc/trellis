@@ -628,6 +628,27 @@ pub(crate) async fn comparable_definition(
             target: target_table.to_string(),
         });
     }
+    // #1167: a walk of a `GROUP BY` or `JOIN` target pages its source by an
+    // index, and without one scans it once per page. Refused unless the
+    // definition opted out; nothing else about the definition changes.
+    if !def.def.without_source_index {
+        let client = pool.get().await?;
+        let joined = catalog::join_table_of(&**client, def.id).await?;
+        let missing = crate::defs::source_index::unmet_for(
+            &**client,
+            &def.def,
+            &def.source_columns,
+            &def.source_table,
+            joined.as_deref(),
+        )
+        .await?;
+        if !missing.is_empty() {
+            return Err(SelfCheckError::Catalog(CatalogError::SourceIndexMissing {
+                target: def.def.target.clone(),
+                missing,
+            }));
+        }
+    }
     Ok(def)
 }
 

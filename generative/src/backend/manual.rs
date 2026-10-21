@@ -864,6 +864,14 @@ impl ManualBackend {
             .clone();
         let source_columns = sql::source_columns(&source_table);
 
+        // #1167: the engine refuses a GROUP BY or JOIN definition whose
+        // source lacks the index its self_check walk pages by.
+        let schema = match self.source_tables {
+            SourceTables::Own => None,
+            SourceTables::SharedCreate | SourceTables::SharedExisting => Some("public"),
+        };
+        sql::create_source_indexes(&self.raw, schema, def).await?;
+
         let text = sql::render_definition(def);
 
         // Issue #63 C1: `install_definition` is the same front door real

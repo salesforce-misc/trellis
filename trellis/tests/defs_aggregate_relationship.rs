@@ -209,6 +209,7 @@ fn oracle_def() -> TransformDef {
             },
         ],
         predicate: Predicate::True,
+        without_source_index: false,
         explicit_source_schema: None,
         explicit_target_schema: None,
     }
@@ -721,6 +722,7 @@ async fn avg_over_a_relationship_read_column_maintains_through_backfill_and_forw
                 },
             ],
             predicate: Predicate::True,
+            without_source_index: false,
             explicit_source_schema: None,
             explicit_target_schema: None,
         }
@@ -1000,6 +1002,7 @@ fn mixed_oracle_def() -> TransformDef {
             },
         ],
         predicate: Predicate::True,
+        without_source_index: false,
         explicit_source_schema: None,
         explicit_target_schema: None,
     }

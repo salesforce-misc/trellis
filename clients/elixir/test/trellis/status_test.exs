@@ -24,6 +24,7 @@ defmodule Trellis.StatusTest do
         held_keys: nil,
         drain_failure: nil,
         unindexed_joins: [],
+        source_index_gaps: [],
         correcting: []
       })
 
@@ -63,6 +64,7 @@ defmodule Trellis.StatusTest do
         held_keys: %{count: 2, oldest_poisoned_at_micros: 1_727_222_400_654_323},
         drain_failure: nil,
         unindexed_joins: [],
+        source_index_gaps: [],
         correcting: []
       })
 
@@ -109,6 +111,7 @@ defmodule Trellis.StatusTest do
           attempts: 5
         },
         unindexed_joins: [],
+        source_index_gaps: [],
         correcting: []
       })
 
@@ -140,6 +143,7 @@ defmodule Trellis.StatusTest do
             fix: "create an index on public.orders (customer_id)"
           }
         ],
+        source_index_gaps: [],
         correcting: []
       })
 
@@ -149,6 +153,37 @@ defmodule Trellis.StatusTest do
                table: "public.orders",
                column: "customer_id",
                fix: "create an index on public.orders (customer_id)"
+             }
+           ]
+  end
+
+  test "a source index gap becomes a struct" do
+    status =
+      Trellis.Status.from_native(%{
+        status: :live,
+        backfill_failure: nil,
+        capture_wait: nil,
+        capture_failure: nil,
+        held_keys: nil,
+        drain_failure: nil,
+        unindexed_joins: [],
+        source_index_gaps: [
+          %{
+            table: "public.orders",
+            columns: ["customer_id"],
+            opted_out: false,
+            fix: ~s|create index on "public"."orders" ("customer_id")|
+          }
+        ],
+        correcting: []
+      })
+
+    assert status.source_index_gaps == [
+             %Trellis.SourceIndexGap{
+               table: "public.orders",
+               columns: ["customer_id"],
+               opted_out: false,
+               fix: ~s|create index on "public"."orders" ("customer_id")|
              }
            ]
   end
@@ -163,6 +198,7 @@ defmodule Trellis.StatusTest do
         held_keys: nil,
         drain_failure: nil,
         unindexed_joins: [],
+        source_index_gaps: [],
         correcting: [
           %{node: "public.items_p1", since_micros: 1_727_222_400_654_321, keys_remaining: 5},
           %{node: "public.items_p2", since_micros: 1_727_222_400_654_322, keys_remaining: nil}

@@ -1,22 +1,20 @@
 //! What `Trellis::status` reports about a `JOIN` transform (#1112): how big
-//! its hidden tables are, which `ON` columns have no usable index, and
-//! whether `P` has grown close to the fact table. Detection only
+//! its hidden tables are, and whether `P` has grown close to the fact table.
+//! The source indexes it needs are every target kind's
+//! (`DefinitionStatus::source_index_gaps`, #1167). Detection only
 //! ([#1096 decision 3](https://github.com/salesforce-misc/trellis/issues/1096)):
 //! nothing here changes the definition's status or repairs anything.
 //!
 //! Sizes and row counts are the planner's estimates (`pg_class.reltuples`,
 //! `pg_total_relation_size`), so a status call costs the same on a billion
 //! rows as on ten; they are as fresh as the last `ANALYZE` or autovacuum of
-//! the table. The `ON` columns are read from the catalog on each call, so an
-//! index created or dropped shows on the next one.
+//! the table.
 
 use tokio_postgres::GenericClient;
 
 use crate::defs::ast::TransformDef;
-use crate::defs::ddl::{self, regclass_arg};
-use crate::defs::join::{self as spec, HiddenTable, Side};
-
-use super::unindexed_joins::UnindexedJoin;
+use crate::defs::ddl::regclass_arg;
+use crate::defs::join::{self as spec, HiddenTable};
 
 /// `P` is reported once its estimated rows reach this share of the fact
 /// table's, as a percentage: past it the partials no longer compress the
@@ -51,35 +49,25 @@ pub struct PartialsWarning {
     pub fact_rows: i64,
 }
 
-/// A `JOIN` definition's hidden tables and join keys; see
+/// A `JOIN` definition's hidden tables; see
 /// `DefinitionStatus::join`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JoinStatus {
     /// `P`, `M`, `J` and `T`, in that order. A table that doesn't exist is
     /// left out.
     pub hidden_tables: Vec<HiddenTableSize>,
-    /// One entry per side none of whose `ON` columns leads a usable index
-    /// (`ddl::key_column_in`'s definition of indexed; `column` lists the
-    /// side's join key, `relationship` is the definition's target). A side
-    /// whose table or any `ON` column no longer exists is left out. Pages
-    /// never read the source tables (they apply captured images to `P` and
-    /// `M`), so this costs them nothing; it is the definition's own `JOIN`
-    /// run against the tables that can't seek that side by key. Trellis
-    /// doesn't create the index.
-    pub unindexed_on: Vec<UnindexedJoin>,
     /// Set when `P`'s estimated rows reach
     /// [`PARTIALS_WARNING_PERCENT`] percent of the fact table's.
     pub partials_warning: Option<PartialsWarning>,
 }
 
 /// The status of `def`, definition `id` in `catalog_schema`, if it is a
-/// `JOIN`. `join_table` is its joined table, qualified.
+/// `JOIN`.
 pub(crate) async fn for_definition(
     client: &impl GenericClient,
     catalog_schema: &str,
     id: i64,
     source_table: &str,
-    join_table: Option<String>,
     def: &TransformDef,
 ) -> Result<Option<JoinStatus>, tokio_postgres::Error> {
     if spec::spec(def).is_none() {
@@ -110,47 +98,11 @@ pub(crate) async fn for_definition(
             });
         }
     }
-    let mut unindexed_on = Vec::new();
-    for (side, table) in [
-        (Side::From, Some(source_table.to_string())),
-        (Side::Joined, join_table),
-    ] {
-        let Some(table) = table else { continue };
-        let columns = spec::join_key(def, side);
-        if !columns.is_empty() && side_unindexed(client, &table, &columns).await? {
-            unindexed_on.push(UnindexedJoin {
-                relationship: def.target.clone(),
-                table,
-                column: columns.join(", "),
-            });
-        }
-    }
     let partials_warning = partials_warning(client, &hidden_tables, source_table).await?;
     Ok(Some(JoinStatus {
         hidden_tables,
-        unindexed_on,
         partials_warning,
     }))
-}
-
-/// Whether no column of `columns` (one side's join key) is indexed in
-/// `table` ([`ddl::key_column_in`]): a usable b-tree index leading with any
-/// of them lets a lookup by the whole key seek instead of scan. `false` if
-/// the table or any of the columns no longer exists: there is no index to
-/// create, and what the drop did to the definition is reported elsewhere.
-async fn side_unindexed(
-    client: &impl GenericClient,
-    table: &str,
-    columns: &[String],
-) -> Result<bool, tokio_postgres::Error> {
-    for column in columns {
-        match ddl::key_column_in(client, table, column).await? {
-            None => return Ok(false),
-            Some(key_column) if key_column.indexed => return Ok(false),
-            Some(_) => {}
-        }
-    }
-    Ok(true)
 }
 
 async fn partials_warning(

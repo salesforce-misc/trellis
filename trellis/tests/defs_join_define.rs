@@ -75,7 +75,9 @@ async fn define_validates_a_join_against_both_tables_then_refuses_it() {
                                      loose numeric);
          create table public.items (id integer primary key, order_id integer, sku text,
                                     qty integer, price numeric, tier tier);
-         create table other.lines (id integer primary key, order_id integer, qty integer);",
+         create table other.lines (id integer primary key, order_id integer, qty integer);
+         create index on public.items (order_id); create index on public.items (tier);
+         create index on public.orders (tier); create index on other.lines (order_id);",
     )
     .await;
 
@@ -247,6 +249,7 @@ async fn define_only(dsn: &str) -> Trellis {
 const ORDERS_ITEMS: &str = "set search_path to public;
      create table orders (id integer primary key, region text, total numeric(10,2));
      create table items (id integer primary key, order_id integer, sku text, qty integer);
+     create index on items (order_id);
      insert into orders values (1, 'emea', 10.00), (2, 'apac', 5.50);
      insert into items values (1, 1, 'a', 2), (2, 1, 'b', 3), (3, 2, 'a', 1);
      set search_path to trellis, public;";
@@ -802,6 +805,7 @@ async fn a_widened_column_of_either_table_is_retyped_in_place_or_pauses_the_join
                               region varchar(10));
          create table items (id integer primary key, order_code varchar(10) collate \"C\", \
                              sku varchar(10), qty integer);
+         create index on orders (code); create index on items (order_code);
          set search_path to trellis, public;",
     )
     .await
@@ -909,6 +913,7 @@ async fn a_joined_column_retyped_to_another_value_type_pauses_the_join() {
          create table orders (id integer primary key, region text, placed timestamp);
          create table items (id integer primary key, order_id integer, sku text, \
                              shipped timestamp);
+         create index on items (order_id);
          insert into orders values (1, 'emea', '2026-01-01');
          insert into items values (1, 1, 'a', '2026-01-02');
          set search_path to trellis, public;",
@@ -979,6 +984,7 @@ async fn a_join_resume_recreates_its_hidden_tables_without_re_typing_them() {
         "set search_path to public;
          create table orders (id integer primary key, code bigint, region text);
          create table items (id integer primary key, order_code bigint, qty integer);
+         create index on orders (code); create index on items (order_code);
          set search_path to trellis, public;",
     )
     .await

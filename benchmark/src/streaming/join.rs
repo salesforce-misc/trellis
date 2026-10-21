@@ -473,7 +473,8 @@ impl VariantDb {
             "create table public.b (id bigint primary key, k int not null unique, gb int, \
                  y bigint); \
              create table public.a (id bigint primary key, day int not null, \
-                 k int not null, x bigint, pad text)",
+                 k int not null, x bigint, pad text); \
+             create index on public.a (k)",
         )
         .await
         .expect("create the tables");
@@ -483,7 +484,9 @@ impl VariantDb {
             raw.batch_execute(
                 "create table public.a0 (id bigint primary key, day int not null, \
                      k int not null, x bigint, pad text, gb int, y bigint); \
-                 create index on public.a0 (k)",
+                 create index on public.a0 (k); \
+                 create index on public.a0 (gb); \
+                 create index on public.a0 (day, gb)",
             )
             .await
             .expect("create a0");

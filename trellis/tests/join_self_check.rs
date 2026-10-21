@@ -27,7 +27,9 @@ use trellis::staging::self_check::{
 const DDL: &str = "create table public.a (id integer primary key, ga integer, t integer, \
                        k integer, x integer); \
                    create table public.b (id integer primary key, t integer, k integer, \
-                       gb integer, y integer)";
+                       gb integer, y integer); \
+                   create index on public.a (t, k); create index on public.a (k); \
+                   create index on public.b (t, k); create index on public.b (k)";
 
 /// A `LEFT JOIN` on the pair `(t, k)`, grouped by a column of each side,
 /// with an aggregate of each kind on each side, a composed field and an
@@ -519,7 +521,8 @@ async fn each_join_page_records_its_j_lock_wait() {
     let mut d = Driver::start_with_database_defaults(
         &[],
         "create table public.a (id integer primary key, ga integer, k integer); \
-         create table public.b (id integer primary key, k integer, y integer)",
+         create table public.b (id integer primary key, k integer, y integer); \
+         create index on public.a (k); create index on public.b (k)",
         &[("id", int4()), ("ga", int4()), ("k", int4())],
         &[],
         &[
@@ -851,7 +854,8 @@ async fn a_group_column_re_collated_mid_walk_skips_and_repeats_no_cell() {
     let mut d = Driver::start_with_database_defaults(
         &[],
         "create table public.a (id integer primary key, ga text collate \"C\", k integer); \
-         create table public.b (id integer primary key, k integer, y integer)",
+         create table public.b (id integer primary key, k integer, y integer); \
+         create index on public.a (k); create index on public.b (k)",
         &[
             ("id", int4()),
             ("ga", ValueType::Text),

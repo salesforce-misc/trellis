@@ -499,6 +499,22 @@ as `unindexed_joins`, each entry with `relationship`, `table`, `column` and the
 `fix` sentence. The CLI's
 `trellis status` prints each entry as a warning line under its definition.
 
+### Source indexes
+
+A `GROUP BY` aggregate on the group basis and a `JOIN` need an index on their
+source tables, which you create alongside the definition; Trellis never does.
+For an aggregate it is a btree index leading with the `GROUP BY` columns
+(`create index on orders (customer_id)`); for a `JOIN`, one on each side leading
+with that side's `ON` columns, in `ON` order. A primary key or unique constraint
+that leads with them is enough. Define and `RESUME` refuse without it, with the
+`create index` to run in the message, unless the definition says `WITHOUT SOURCE
+INDEX` after its `GROUP BY` or `JOIN` clause. `status(target)` reports an index
+dropped since, or one an opted-out definition lacks, as `source_index_gaps`
+(`table`, `columns`, `opted_out` and `fix`, the statement to run); in
+`trellis-embed` that is `PlainDefinitionStatus::source_index_gaps`. The warning
+pauses nothing, but `self_check` refuses a definition that did not opt out. See
+[Supported sources and targets](transforms.md#supported-sources-and-targets).
+
 ### Partitions under correction
 
 `status(target)` reports, as `correcting`, each partition of a partitioned

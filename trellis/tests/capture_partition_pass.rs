@@ -806,101 +806,41 @@ async fn the_root_attached_under_another_table_pauses_the_reader() {
     it.trellis.shutdown().await.expect("shutdown");
 }
 
-/// A root renamed away and back between two passes: nothing staged under the
-/// old name meanwhile, so the pass queues every leaf. A root replaced by
-/// another table under the same name queues the old one gone and the new
-/// leaves created.
+/// A root renamed away is table maintenance, not partition maintenance
+/// (#1200): the pass pauses the readers instead of correcting, and renaming
+/// it back queues nothing either; a resume rebuilds. The replaced and swapped
+/// roots are `capture_disruption_partitioned.rs`'s.
 #[tokio::test]
-async fn a_renamed_root_is_noticed_and_a_replaced_one_is_a_new_tree() {
+async fn a_renamed_root_pauses_the_readers_and_queues_nothing() {
     let cluster = TestCluster::start();
     let mut it = instance(&cluster, TREE).await;
     it.raw
         .batch_execute("alter table public.items rename to items_old")
         .await
         .expect("rename away");
-    let outcome = pass(&mut it.raw, &it.db.pool).await;
-    assert_eq!(outcome.failed.len(), 1, "the source is missing by name");
+    let outcome = clean_pass(&mut it).await;
+    assert!(outcome.partition_deep_checks.is_empty());
+    let status = it.trellis.status("totals").await.unwrap().unwrap();
+    assert_eq!(status.status, TransformStatus::Paused);
+    assert!(
+        status
+            .capture_failure
+            .is_some_and(|f| f.error.contains("no longer exists")),
+    );
+    assert!(queued(&it.raw).await.is_empty());
 
     it.raw
         .batch_execute("alter table public.items_old rename to items")
         .await
         .expect("rename back");
-    let outcome = clean_pass(&mut it).await;
-    assert_eq!(outcome.partition_deep_checks, [SOURCE]);
-    let mut got = queued(&it.raw).await;
-    got.sort();
-    assert_eq!(
-        got,
-        [
-            entry("new_leaf", "public.items_a0", "renamed"),
-            entry("new_leaf", "public.items_a1", "renamed"),
-            entry("new_leaf", "public.items_b", "renamed"),
-            entry("new_leaf", "public.items_c", "renamed"),
-        ]
-    );
-    assert!(
-        tables_with_triggers(&it.raw)
-            .await
-            .contains(&"public.items".to_string())
-    );
-    drain(&it.raw).await;
-
-    // Renamed away while a plain table holds the name for a pass: the same.
-    it.raw
-        .batch_execute(
-            "alter table public.items rename to items_old; \
-             create table public.items (id int not null, order_id int not null, \
-                amount int not null default 0, primary key (order_id, id, amount))",
-        )
-        .await
-        .expect("rename away, a plain table takes the name");
-    pass(&mut it.raw, &it.db.pool).await;
-    it.raw
-        .batch_execute(
-            "drop table public.items; \
-             alter table public.items_old rename to items",
-        )
-        .await
-        .expect("rename back");
     clean_pass(&mut it).await;
-    assert_eq!(
-        queued(&it.raw).await.len(),
-        4,
-        "every leaf again: {:?}",
+    assert!(
+        queued(&it.raw).await.is_empty(),
+        "nothing is corrected while the readers wait for a resume: {:?}",
         queued(&it.raw).await
     );
-    drain(&it.raw).await;
-
-    // Replaced: the old tree moves aside, a new one takes the name.
-    it.raw
-        .batch_execute(
-            "alter table public.items rename to items_old; \
-             create table public.items (id int not null, order_id int not null, \
-                amount int not null default 0, primary key (order_id, id, amount)) \
-                partition by list (order_id); \
-             create table public.items_n1 partition of public.items for values in (1, 2); \
-             create table public.items_n2 partition of public.items for values in (3, 4)",
-        )
-        .await
-        .expect("replace the root");
-    clean_pass(&mut it).await;
-    let mut got = queued(&it.raw).await;
-    got.sort();
-    assert_eq!(
-        got,
-        [
-            entry("gone_node", "public.items", "gone"),
-            entry("new_leaf", "public.items_n1", "created"),
-            entry("new_leaf", "public.items_n2", "created"),
-        ]
-    );
-    let tables = tables_with_triggers(&it.raw).await;
-    assert!(
-        ["public.items", "public.items_n1", "public.items_n2"]
-            .iter()
-            .all(|t| tables.contains(&t.to_string())),
-        "{tables:?}"
-    );
+    let status = it.trellis.status("totals").await.unwrap().unwrap();
+    assert_eq!(status.status, TransformStatus::Paused);
     it.trellis.shutdown().await.expect("shutdown");
 }
 

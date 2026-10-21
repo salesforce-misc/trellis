@@ -50,6 +50,7 @@ pub mod partition_tree;
 pub mod pg_type;
 pub mod registry;
 pub mod row_security;
+pub mod source_index;
 pub mod subscription;
 pub mod typed_literal;
 pub mod validate;

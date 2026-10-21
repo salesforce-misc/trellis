@@ -243,7 +243,8 @@ async fn a_join_reading_a_partitioned_side_audits_clean_and_names_a_leafs_disabl
     let db = cluster.create_isolated_database().await;
     let mut raw = drain_driver::connect(db.dsn()).await;
     raw.batch_execute(&format!(
-        "{TREE}; create table public.facts (id integer primary key, k integer, w integer)"
+        "{TREE}; create table public.facts (id integer primary key, k integer, w integer); \
+         create index on public.facts (k)"
     ))
     .await
     .expect("the tables");

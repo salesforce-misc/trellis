@@ -16,6 +16,7 @@
       "held_keys": {"nullable": {"record": "HeldKeys"}},
       "drain_failure": {"nullable": {"record": "DrainFailure"}},
       "unindexed_joins": {"list_of": {"record": "UnindexedJoin"}},
+      "source_index_gaps": {"list_of": {"record": "SourceIndexGap"}},
       "correcting": {"list_of": {"record": "CorrectingNode"}}
     },
     "CorrectingNode": {
@@ -27,6 +28,12 @@
       "relationship": "string",
       "table": "string",
       "column": "string",
+      "fix": "string"
+    },
+    "SourceIndexGap": {
+      "table": "string",
+      "columns": {"list_of": "string"},
+      "opted_out": "boolean",
       "fix": "string"
     },
     "HeldKeys": {
@@ -272,6 +279,27 @@
     {"op": "apply", "args": ["DROP TRANSFORM parity_invoice_view"], "expect": {"record": "Applied", "fields": {"kind": {"word": "dropped"}}}},
     {"op": "apply", "args": ["DROP RELATIONSHIP parity_invoices.parity_account"], "expect": {"record": "Applied", "fields": {"kind": {"word": "dropped"}}}},
 
+    {
+      "about": "A JOIN's source index (#1167): define is refused without an index leading with each side's ON columns, status reports an index dropped later, and WITHOUT SOURCE INDEX opts out. Nothing converges (all catalog reads), so these are plain expects.",
+      "op": "sql",
+      "args": [
+        "create table parity_regions (id integer primary key, name text)",
+        "create table parity_sales (id integer primary key, region_id integer, amount integer)"
+      ]
+    },
+    {"op": "apply", "args": ["TRANSFORM parity_sales_by_region FROM parity_regions LEFT JOIN parity_sales ON parity_regions.id = parity_sales.region_id GROUP BY parity_regions.name SELECT parity_regions.name AS name, COUNT(*) AS n"], "expect": {"error": "validation"}},
+    {"op": "sql", "args": ["create index on parity_sales (region_id)"]},
+    {"op": "apply", "args": ["TRANSFORM parity_sales_by_region FROM parity_regions LEFT JOIN parity_sales ON parity_regions.id = parity_sales.region_id GROUP BY parity_regions.name SELECT parity_regions.name AS name, COUNT(*) AS n"], "expect": {"record": "Applied", "fields": {"kind": {"word": "transform_defined"}}}},
+    {"op": "status", "args": ["parity_sales_by_region"], "expect": {"record": "Status", "fields": {"source_index_gaps": {"list": []}}}},
+    {"op": "sql", "args": ["drop index parity_sales_region_id_idx"]},
+    {"op": "status", "args": ["parity_sales_by_region"], "expect": {"record": "Status", "fields": {"source_index_gaps": {"list": [{"record": "SourceIndexGap", "fields": {"table": {"eq": "public.parity_sales"}, "columns": {"list": [{"eq": "region_id"}]}, "opted_out": {"eq": false}, "fix": {"eq": "create index on \"public\".\"parity_sales\" (\"region_id\")"}}}]}}}},
+    {"op": "apply", "args": ["PAUSE TRANSFORM parity_sales_by_region"], "expect": {"record": "Applied", "fields": {"kind": {"word": "paused"}}}},
+    {"op": "apply", "args": ["DROP TRANSFORM parity_sales_by_region"], "expect": {"record": "Applied", "fields": {"kind": {"word": "dropped"}}}},
+    {"op": "apply", "args": ["TRANSFORM parity_sales_by_region FROM parity_regions LEFT JOIN parity_sales ON parity_regions.id = parity_sales.region_id GROUP BY parity_regions.name WITHOUT SOURCE INDEX SELECT parity_regions.name AS name, COUNT(*) AS n"], "expect": {"record": "Applied", "fields": {"kind": {"word": "transform_defined"}}}},
+    {"op": "status", "args": ["parity_sales_by_region"], "expect": {"record": "Status", "fields": {"source_index_gaps": {"list": [{"record": "SourceIndexGap", "fields": {"table": {"eq": "public.parity_sales"}, "columns": {"list": [{"eq": "region_id"}]}, "opted_out": {"eq": true}, "fix": {"eq": "create index on \"public\".\"parity_sales\" (\"region_id\")"}}}]}}}},
+    {"op": "apply", "args": ["PAUSE TRANSFORM parity_sales_by_region"], "expect": {"record": "Applied", "fields": {"kind": {"word": "paused"}}}},
+    {"op": "apply", "args": ["DROP TRANSFORM parity_sales_by_region"], "expect": {"record": "Applied", "fields": {"kind": {"word": "dropped"}}}},
+
     {"op": "await_converged", "args": ["parity: not a token"], "opts": {"timeout_ms": 0}, "expect": {"error": "validation"}},
     {"op": "shutdown", "expect": null},
 
@@ -404,25 +432,25 @@
     {
       "about": "A failing backfill, which a live run can't produce cheaply: the retry time is rehydrated from epoch microseconds exactly.",
       "type": "Status",
-      "native": {"status": {"$word": "waiting_to_backfill"}, "backfill_failure": {"source_table": "public.orders", "attempts": 3, "last_error": "canceling statement due to statement timeout", "next_attempt_at_micros": 1727222400123456}, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": null, "unindexed_joins": [], "correcting": []},
+      "native": {"status": {"$word": "waiting_to_backfill"}, "backfill_failure": {"source_table": "public.orders", "attempts": 3, "last_error": "canceling statement due to statement timeout", "next_attempt_at_micros": 1727222400123456}, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": null, "unindexed_joins": [], "source_index_gaps": [], "correcting": []},
       "expect": {"record": "Status", "fields": {"status": {"word": "waiting_to_backfill"}, "backfill_failure": {"record": "BackfillFailure", "fields": {"source_table": {"eq": "public.orders"}, "attempts": {"eq": 3}, "next_attempt_at": {"time_micros": 1727222400123456}}}, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": null}}
     },
     {
       "about": "A capture lock wait, a capture failure (#687) and held keys (#759), which need a held lock, a broken source table or a refused write, so a live run can't produce them all cheaply: their times are rehydrated from epoch microseconds exactly.",
       "type": "Status",
-      "native": {"status": {"$word": "catching_up"}, "backfill_failure": null, "capture_wait": {"table": "public.orders", "operation": "widen", "lock_mode": "ShareRowExclusiveLock", "waiting_since_micros": 1727222400123456, "observed_at_micros": 1727222400123457, "blockers": ["pid 42 (client backend) holds RowExclusiveLock"]}, "capture_failure": {"kind": {"$word": "capture"}, "source_table": "public.lines", "columns": ["qty"], "error": "capture of public.lines needs column \"qty\", which the table doesn't have", "detected_at_micros": 1727222400123458}, "held_keys": {"count": 2, "oldest_poisoned_at_micros": 1727222400123459}, "drain_failure": null, "unindexed_joins": [], "correcting": []},
+      "native": {"status": {"$word": "catching_up"}, "backfill_failure": null, "capture_wait": {"table": "public.orders", "operation": "widen", "lock_mode": "ShareRowExclusiveLock", "waiting_since_micros": 1727222400123456, "observed_at_micros": 1727222400123457, "blockers": ["pid 42 (client backend) holds RowExclusiveLock"]}, "capture_failure": {"kind": {"$word": "capture"}, "source_table": "public.lines", "columns": ["qty"], "error": "capture of public.lines needs column \"qty\", which the table doesn't have", "detected_at_micros": 1727222400123458}, "held_keys": {"count": 2, "oldest_poisoned_at_micros": 1727222400123459}, "drain_failure": null, "unindexed_joins": [], "source_index_gaps": [], "correcting": []},
       "expect": {"record": "Status", "fields": {"status": {"word": "catching_up"}, "backfill_failure": null, "capture_wait": {"record": "CaptureWait", "fields": {"table": {"eq": "public.orders"}, "operation": {"eq": "widen"}, "waiting_since": {"time_micros": 1727222400123456}, "observed_at": {"time_micros": 1727222400123457}, "blockers": {"list": [{"eq": "pid 42 (client backend) holds RowExclusiveLock"}]}}}, "capture_failure": {"record": "CaptureFailure", "fields": {"kind": {"word": "capture"}, "source_table": {"eq": "public.lines"}, "columns": {"list": [{"eq": "qty"}]}, "detected_at": {"time_micros": 1727222400123458}}}, "held_keys": {"record": "HeldKeys", "fields": {"count": {"eq": 2}, "oldest_poisoned_at": {"time_micros": 1727222400123459}}}, "drain_failure": null}}
     },
     {
       "about": "A drain failure (#817), which needs a page the drain keeps failing on with nothing charged or paused, so a live run can't produce it cheaply: its tables and SQLSTATE cross as they are, and its times are rehydrated from epoch microseconds exactly.",
       "type": "Status",
-      "native": {"status": {"$word": "live"}, "backfill_failure": null, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": {"seg_seq": 17, "tables": ["public.lines", "public.orders"], "error": "permission denied for function audit_hook", "sqlstate": "42501", "since_micros": 1727222400123456, "last_seen_micros": 1727222400123457, "attempts": 5}, "unindexed_joins": [], "correcting": []},
+      "native": {"status": {"$word": "live"}, "backfill_failure": null, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": {"seg_seq": 17, "tables": ["public.lines", "public.orders"], "error": "permission denied for function audit_hook", "sqlstate": "42501", "since_micros": 1727222400123456, "last_seen_micros": 1727222400123457, "attempts": 5}, "unindexed_joins": [], "source_index_gaps": [], "correcting": []},
       "expect": {"record": "Status", "fields": {"status": {"word": "live"}, "backfill_failure": null, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": {"record": "DrainFailure", "fields": {"seg_seq": {"eq": 17}, "tables": {"list": [{"eq": "public.lines"}, {"eq": "public.orders"}]}, "error": {"eq": "permission denied for function audit_hook"}, "sqlstate": {"eq": "42501"}, "since": {"time_micros": 1727222400123456}, "last_seen": {"time_micros": 1727222400123457}, "attempts": {"eq": 5}}}}}
     },
     {
       "about": "Nodes of a partitioned source under correction (ADR-0017), which need a partition operation and a correction stopped mid-way, so a live run can't produce them cheaply: each crosses with its queue time rehydrated from epoch microseconds exactly, a count not yet taken is null, and the list keeps its order.",
       "type": "Status",
-      "native": {"status": {"$word": "backfilling"}, "backfill_failure": null, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": null, "unindexed_joins": [], "correcting": [{"node": "public.items_p1", "since_micros": 1727222400123456, "keys_remaining": 5}, {"node": "public.items_p2", "since_micros": 1727222400123457, "keys_remaining": null}]},
+      "native": {"status": {"$word": "backfilling"}, "backfill_failure": null, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": null, "unindexed_joins": [], "source_index_gaps": [], "correcting": [{"node": "public.items_p1", "since_micros": 1727222400123456, "keys_remaining": 5}, {"node": "public.items_p2", "since_micros": 1727222400123457, "keys_remaining": null}]},
       "expect": {"record": "Status", "fields": {"status": {"word": "backfilling"}, "correcting": {"list": [{"record": "CorrectingNode", "fields": {"node": {"eq": "public.items_p1"}, "since": {"time_micros": 1727222400123456}, "keys_remaining": {"eq": 5}}}, {"record": "CorrectingNode", "fields": {"node": {"eq": "public.items_p2"}, "since": {"time_micros": 1727222400123457}, "keys_remaining": null}}]}}}
     },
     {
@@ -440,8 +468,14 @@
     {
       "about": "An unindexed join column (#973) in a status: the entry crosses with its fix sentence, and the list keeps its order.",
       "type": "Status",
-      "native": {"status": {"$word": "live"}, "backfill_failure": null, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": null, "unindexed_joins": [{"relationship": "customer", "table": "public.orders", "column": "customer_id", "fix": "create an index on public.orders (customer_id)"}, {"relationship": "items", "table": "public.line_items", "column": "order_id", "fix": "create an index on public.line_items (order_id)"}], "correcting": []},
+      "native": {"status": {"$word": "live"}, "backfill_failure": null, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": null, "unindexed_joins": [{"relationship": "customer", "table": "public.orders", "column": "customer_id", "fix": "create an index on public.orders (customer_id)"}, {"relationship": "items", "table": "public.line_items", "column": "order_id", "fix": "create an index on public.line_items (order_id)"}], "source_index_gaps": [], "correcting": []},
       "expect": {"record": "Status", "fields": {"status": {"word": "live"}, "unindexed_joins": {"list": [{"record": "UnindexedJoin", "fields": {"relationship": {"eq": "customer"}, "table": {"eq": "public.orders"}, "column": {"eq": "customer_id"}, "fix": {"eq": "create an index on public.orders (customer_id)"}}}, {"record": "UnindexedJoin", "fields": {"relationship": {"eq": "items"}, "table": {"eq": "public.line_items"}, "column": {"eq": "order_id"}, "fix": {"eq": "create an index on public.line_items (order_id)"}}}]}}}
+    },
+    {
+      "about": "A source index gap (#1167) in a status: the entry crosses with its columns, whether it opted out, and its create index statement.",
+      "type": "Status",
+      "native": {"status": {"$word": "live"}, "backfill_failure": null, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": null, "unindexed_joins": [], "source_index_gaps": [{"table": "public.orders", "columns": ["customer_id", "region"], "opted_out": true, "fix": "create index on \"public\".\"orders\" (\"customer_id\", \"region\")"}], "correcting": []},
+      "expect": {"record": "Status", "fields": {"source_index_gaps": {"list": [{"record": "SourceIndexGap", "fields": {"table": {"eq": "public.orders"}, "columns": {"list": [{"eq": "customer_id"}, {"eq": "region"}]}, "opted_out": {"eq": true}, "fix": {"eq": "create index on \"public\".\"orders\" (\"customer_id\", \"region\")"}}}]}}}
     },
     {
       "about": "A job that stopped before the end of the target's keys says so: the outcome is not_caught_up, the report is truncated, and the position it stopped at is a token.",

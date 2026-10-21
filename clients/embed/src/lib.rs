@@ -14,10 +14,11 @@
 //! |---|---|---|
 //! | any error's `code()` + `Display` | `(code, message)` | [`PlainError`] |
 //! | [`trellis::DefinitionSummary`] | summary fields + backfill failure + halt | [`PlainDefinitionSummary`] |
-//! | [`trellis::DefinitionStatus`] | status word + backfill failure + capture wait + capture failure + held keys + drain failure + unindexed joins + correcting nodes | [`PlainDefinitionStatus`] |
+//! | [`trellis::DefinitionStatus`] | status word + backfill failure + capture wait + capture failure + held keys + drain failure + unindexed joins + source index gaps + correcting nodes | [`PlainDefinitionStatus`] |
 //! | [`trellis::HeldKeys`] | count + oldest poison time | [`PlainHeldKeys`] |
 //! | [`trellis::DrainFailure`] | fields + first and latest failure times | [`PlainDrainFailure`] |
 //! | [`trellis::UnindexedJoin`] | fields + the fix as a sentence | [`PlainUnindexedJoin`] |
+//! | [`trellis::SourceIndexGap`] | fields + the fix as a `create index` statement | [`PlainSourceIndexGap`] |
 //! | [`trellis::CorrectingNode`] | fields + queue time | [`PlainCorrectingNode`] |
 //! | [`trellis::CaptureFailureKind`] | its `as_str()` word | [`PlainCaptureFailure::kind`] / [`capture_failure_kind_names`] |
 //! | `SystemTime` | epoch microseconds | [`epoch_micros`] / [`system_time_from_epoch_micros`] |
@@ -69,8 +70,8 @@ pub use config::PlainConfig;
 pub use cursor::{decode_cursor, encode_cursor, next_cursor};
 pub use definition::{
     PlainBackfillFailure, PlainCaptureFailure, PlainCaptureWait, PlainCorrectingNode,
-    PlainDefinitionStatus, PlainDefinitionSummary, PlainDrainFailure, PlainUnindexedJoin,
-    capture_failure_kind_names,
+    PlainDefinitionStatus, PlainDefinitionSummary, PlainDrainFailure, PlainSourceIndexGap,
+    PlainUnindexedJoin, capture_failure_kind_names,
 };
 pub use error::{CodedError, ERROR_CODES, PlainError};
 pub use log::{

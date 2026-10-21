@@ -78,12 +78,17 @@
 //! # A renamed root
 //!
 //! Capture's guard names the root, so a renamed root stages nothing under the
-//! old name. The recorded root oid says what happened: when the pass finds
-//! the recorded oid alive under another name it marks the state `stale`, and
-//! the deep check that follows (the name resolves again, or to a new root)
-//! queues every leaf of an unchanged root, or classifies a replaced root as
-//! gone plus created. Capture's functions never need regenerating: they name
-//! the source, and the source is again what the name resolves to.
+//! old name. A root that is renamed away, moved to another schema, swapped in
+//! by renames or dropped and recreated is table maintenance, not partition
+//! maintenance: before any fingerprint is read,
+//! [`super::triggers::pause_readers_of_gone_table`] finds the name missing or
+//! resolving to a root other than the recorded one and pauses every reader
+//! (#707, #1200). [`begin`] checks the root against the record again once it
+//! has read the fingerprints, for a swap that commits in between. Nothing is
+//! corrected or reinstalled until a resume, which forgets the recorded tree.
+//! A root renamed away and back after that
+//! queues nothing either: a source whose every reader is paused for a
+//! capture failure is recorded, not corrected.
 //!
 //! # `pg_upgrade` and a restore
 //!
@@ -795,6 +800,15 @@ pub(crate) async fn begin(
     {
         return Ok(Begin::NotPartitioned);
     }
+    // Test-only pause point (#1200): after the pass's gone-table check,
+    // before the fingerprint read. See `staging::interleave`.
+    #[cfg(any(test, feature = "test-util"))]
+    crate::staging::interleave::pause_between_transactions(
+        &*client,
+        crate::staging::interleave::PausePoint::BeforeFingerprintRead,
+        table,
+    )
+    .await?;
     let Some(fingerprints) = read_fingerprints(&*client, table).await? else {
         observe_missing(&*client, table).await?;
         return Ok(Begin::NotPartitioned);
@@ -805,6 +819,19 @@ pub(crate) async fn begin(
         return Ok(Begin::NotPartitioned);
     }
     let stored = load_state(&*client, table).await?;
+    // #1200: a root other than the recorded one, under this database's own
+    // record, is table maintenance, not partition maintenance. The pass's
+    // gone-table check pauses the readers for it before this; a swap that
+    // commits between that check and the fingerprint read above lands here,
+    // and must not be recorded as the source's root.
+    if let Some(s) = &stored
+        && s.root_oid != fingerprints.root_oid
+        && s.catalog_oid.0 == s.catalog_oid.1
+        && s.system_identifier.as_deref() == Some(fingerprints.system_identifier.as_str())
+    {
+        super::triggers::pause_readers_of_replaced_root(client, catalog, table).await?;
+        return Ok(Begin::Held { deep: false });
+    }
     let unchanged = stored.as_ref().is_some_and(|s| {
         s.lifecycle == fingerprints.lifecycle
             && s.compliance == fingerprints.compliance
@@ -880,17 +907,20 @@ pub(crate) async fn begin(
     let mut plan = plan(prev, &live, renamed);
     let mut live = live;
     carry_constraints(prev, &mut live, &plan.fetch);
-    if remaining == 0 && !refusals.is_empty() {
+    if remaining == 0 && (!refusals.is_empty() || unpaused.is_empty()) {
         // Nothing reads the source until a resume rebuilds it, which covers
-        // whatever changed: record the tree and its fingerprints, queue
-        // nothing, and look again on every pass.
+        // whatever changed (a source whose every reader is paused for a
+        // capture failure included: a root renamed away and back after the
+        // pass paused them, #1200): record the tree and its fingerprints,
+        // queue nothing, and, for a source that doesn't comply, look again on
+        // every pass.
         plan.corrections.clear();
         let record = Record {
             fingerprints,
             live,
             corrections: Vec::new(),
         };
-        write_state(client, table, &record, true).await?;
+        write_state(client, table, &record, !refusals.is_empty()).await?;
         mark_checked(instance, table);
         return Ok(Begin::Held { deep: true });
     }

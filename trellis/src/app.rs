@@ -123,6 +123,7 @@ use tokio_postgres::types::PgLsn;
 
 use crate::client::{Client, ClientError, ClientOptions};
 use crate::config::Config;
+use crate::defs::source_index::SourceIndexGap;
 use crate::defs::{
     self, CatalogError, ParseError, RelationshipDefinition, TransformStatus, ValueType,
 };
@@ -910,6 +911,7 @@ impl Trellis {
             let mut holdup = (None, None);
             let mut drain_failure = None;
             let mut unindexed = Vec::new();
+            let mut source_index_gaps = Vec::new();
             let mut join = None;
             let mut correcting = Vec::new();
             if let Some(row) = &row {
@@ -950,12 +952,30 @@ impl Trellis {
                     unindexed =
                         unindexed_joins::for_definition(&*txn, row.get("source_table"), &def)
                             .await?;
+                    // Only an aggregate's requirement reads the recorded
+                    // source columns (whether the group basis takes it).
+                    let source_columns =
+                        if matches!(def.key_space, defs::ast::KeySpace::Aggregate { .. }) {
+                            defs::catalog::definition_by_id_in(&*txn, row.get(1))
+                                .await?
+                                .map(|d| d.source_columns)
+                                .unwrap_or_default()
+                        } else {
+                            Default::default()
+                        };
+                    source_index_gaps = defs::source_index::gaps(
+                        &*txn,
+                        &def,
+                        &source_columns,
+                        row.get("source_table"),
+                        row.get::<_, Option<String>>("join_table").as_deref(),
+                    )
+                    .await?;
                     join = crate::staging::join_status::for_definition(
                         &*txn,
                         self.config.schema(),
                         row.get(1),
                         row.get("source_table"),
-                        row.get("join_table"),
                         &def,
                     )
                     .await?;
@@ -976,6 +996,7 @@ impl Trellis {
                 ),
                 drain_failure,
                 unindexed_joins: unindexed,
+                source_index_gaps,
                 join,
                 correcting,
                 build_wait: row
@@ -2168,9 +2189,19 @@ pub struct DefinitionStatus {
     /// do. Read live on each call, so an index created since shows. Empty
     /// when there is none; see `docs/recommendations.md`.
     pub unindexed_joins: Vec<UnindexedJoin>,
-    /// What a `JOIN` transform's hidden tables and join keys look like now
-    /// (#1112): their sizes, the `ON` columns with no usable index, and a
-    /// warning when `P` approaches the fact table's size. `None` for a
+    /// The source indexes a `GROUP BY` or `JOIN` target needs and lacks now
+    /// (#1167): one entry per table and columns. Define and a resume refuse
+    /// a definition without them, so an entry here is an index dropped or
+    /// made invalid since, or one the definition opted out of with
+    /// `WITHOUT SOURCE INDEX` ([`SourceIndexGap::opted_out`]). A warning:
+    /// nothing is paused and nothing is wrong, but `self_check` refuses to
+    /// walk the target (unless it opted out, when the walk scans the source
+    /// once per page). [`SourceIndexGap::fix`] is a `create index` to run;
+    /// Trellis never creates one. Read live on each call. Empty for every
+    /// other target, and when the indexes exist.
+    pub source_index_gaps: Vec<SourceIndexGap>,
+    /// What a `JOIN` transform's hidden tables look like now (#1112): their
+    /// sizes, and a warning when `P` approaches the fact table's size. `None` for a
     /// definition that isn't a `JOIN`. Read live on each call; a warning
     /// only, it never changes the definition's status.
     pub join: Option<JoinStatus>,

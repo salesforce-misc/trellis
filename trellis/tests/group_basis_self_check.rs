@@ -37,7 +37,8 @@ async fn start_with(definition: &str, source_ddl: &str, columns: &[(&str, ValueT
 async fn start() -> Driver {
     start_with(
         AGG,
-        "create table public.src (id integer primary key, g integer, v integer)",
+        "create table public.src (id integer primary key, g integer, v integer); \
+         create index on public.src (g)",
         &[("id", int4()), ("g", int4()), ("v", int4())],
     )
     .await
@@ -135,7 +136,8 @@ async fn composed_fields_and_numerics_converge_without_divergence() {
     let mut d = start_with(
         "TRANSFORM agg FROM public.src GROUP BY g \
          SELECT SUM(m) AS total, AVG(m) AS mean, SUM(a) + COUNT(m) AS mixed, COUNT(*) AS n",
-        "create table public.src (id integer primary key, g integer, a integer, m numeric(10, 2))",
+        "create table public.src (id integer primary key, g integer, a integer, m numeric(10, 2)); \
+         create index on public.src (g)",
         &[
             ("id", int4()),
             ("g", int4()),
@@ -373,7 +375,8 @@ async fn composite_keys_with_null_parts_and_expression_arguments() {
          SELECT SUM(a + b) AS ab, COUNT(a + b) AS nab, COALESCE(SUM(b), 0) AS sb, \
                 SUM(a) > COUNT(b) AS apart, h + COUNT(*) AS hp",
         "create table public.src (id integer primary key, g integer, h integer, \
-                                  a integer, b integer)",
+                                  a integer, b integer); \
+         create index on public.src (g, h)",
         &[
             ("id", int4()),
             ("g", int4()),
@@ -769,7 +772,13 @@ async fn groups_page_in_their_key_order_with_the_null_group_last() {
 /// documented cost, #1167).
 #[tokio::test]
 async fn an_aggregate_page_reads_its_source_by_an_index_that_leads_with_the_group_column() {
-    let d = start().await;
+    let d = start_with(
+        "TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX \
+         SELECT SUM(v) AS total, COUNT(*) AS n",
+        "create table public.src (id integer primary key, g integer, v integer)",
+        &[("id", int4()), ("g", int4()), ("v", int4())],
+    )
+    .await;
     let explain = |d: &Driver| {
         let pool = d.pool().clone();
         async move {
@@ -816,7 +825,8 @@ async fn an_aggregate_page_reads_its_source_by_an_index_that_leads_with_the_grou
 #[tokio::test]
 async fn nullable_composite_groups_with_ring_only_keys_page_alike_with_and_without_an_index() {
     let mut d = start_with(
-        "TRANSFORM agg FROM public.src GROUP BY g, h SELECT SUM(v) AS total, COUNT(*) AS n",
+        "TRANSFORM agg FROM public.src GROUP BY g, h WITHOUT SOURCE INDEX \
+         SELECT SUM(v) AS total, COUNT(*) AS n",
         "create table public.src (id integer primary key, g integer, h integer, v integer)",
         &[("id", int4()), ("g", int4()), ("h", int4()), ("v", int4())],
     )

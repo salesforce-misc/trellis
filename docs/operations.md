@@ -49,7 +49,10 @@ naming both. It repairs what a rebuild repairs, with the same exceptions
 
 **What a resume checks.** A resume first runs define's validation against the
 live schema, and refuses while define would, leaving the definition paused;
-the error names the column and what to change. It also refuses in five cases
+the error names the column and what to change. A whole-transform resume also
+refuses, as define does, while a source index the definition's `self_check`
+pages by is missing, unless it was defined `WITHOUT SOURCE INDEX`; create the
+index the message names, then resume. It also refuses in five cases
 define doesn't, where the only repair is to `DROP TRANSFORM` and define again:
 
 * a 1-1 definition's source key was redefined;

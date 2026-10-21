@@ -50,6 +50,7 @@ fn order_totals_def() -> TransformDef {
             },
         ],
         predicate: Predicate::True,
+        without_source_index: false,
         explicit_source_schema: None,
         explicit_target_schema: None,
     }
@@ -157,6 +158,7 @@ async fn function_call_composed_with_greater_than_matches_postgres() {
                 expr: expr.clone(),
             }],
             predicate: Predicate::True,
+            without_source_index: false,
             explicit_source_schema: None,
             explicit_target_schema: None,
         };
@@ -371,6 +373,7 @@ fn order_totals_aggregate_def() -> TransformDef {
         predicate: Predicate::True,
         explicit_source_schema: None,
         explicit_target_schema: None,
+        without_source_index: false,
     }
 }
 
@@ -588,6 +591,7 @@ async fn aggregate_recompute_matches_postgres_group_by_for_a_cross_field_alias()
             },
         ],
         predicate: Predicate::True,
+        without_source_index: false,
         explicit_source_schema: None,
         explicit_target_schema: None,
     };
@@ -678,6 +682,7 @@ async fn to_one_left_join_render_matches_evaluator() {
             },
         ],
         predicate: Predicate::True,
+        without_source_index: false,
         explicit_source_schema: None,
         explicit_target_schema: None,
     };
@@ -815,6 +820,7 @@ async fn to_many_correlated_aggregate_render_matches_evaluator() {
         }))
         .collect(),
         predicate: Predicate::True,
+        without_source_index: false,
         explicit_source_schema: None,
         explicit_target_schema: None,
     };

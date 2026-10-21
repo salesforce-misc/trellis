@@ -175,6 +175,7 @@ async fn end_to_end_latency_fires_only_at_the_terminal_transform_in_a_linear_cha
             },
         }],
         predicate: Predicate::True,
+        without_source_index: false,
         explicit_source_schema: None,
         explicit_target_schema: None,
     };
@@ -355,6 +356,7 @@ async fn end_to_end_latency_fires_for_every_terminal_transform_in_a_fan_out() {
             },
         }],
         predicate: Predicate::True,
+        without_source_index: false,
         explicit_source_schema: None,
         explicit_target_schema: None,
     };
@@ -388,6 +390,7 @@ async fn end_to_end_latency_fires_for_every_terminal_transform_in_a_fan_out() {
             expr: Expr::Column("price".to_string()),
         }],
         predicate: Predicate::True,
+        without_source_index: false,
         explicit_source_schema: None,
         explicit_target_schema: None,
     };

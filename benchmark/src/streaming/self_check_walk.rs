@@ -95,9 +95,16 @@ pub async fn run(cfg: Config, tuning: &EngineTuning) {
     let client = trellis::Client::start(db.dsn(), tuning.client_options()).expect("client start");
     let (text, columns): (String, HashMap<_, _>) = if cfg.aggregate {
         (
-            "TRANSFORM sc_tgt FROM public.sc_src GROUP BY grp \
-             SELECT grp AS grp, SUM(amt) AS total, COUNT(*) AS n"
-                .to_string(),
+            // The unindexed variant measures the walk the opt-out accepts.
+            format!(
+                "TRANSFORM sc_tgt FROM public.sc_src GROUP BY grp{} \
+                 SELECT grp AS grp, SUM(amt) AS total, COUNT(*) AS n",
+                if cfg.index {
+                    ""
+                } else {
+                    " WITHOUT SOURCE INDEX"
+                }
+            ),
             {
                 use trellis::IntWidth::{Int4, Int8};
                 use trellis::dev::defs::ValueType::Integer;

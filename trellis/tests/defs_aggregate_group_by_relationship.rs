@@ -239,6 +239,7 @@ fn oracle_def() -> TransformDef {
         predicate: Predicate::True,
         explicit_source_schema: None,
         explicit_target_schema: None,
+        without_source_index: false,
     }
 }
 
