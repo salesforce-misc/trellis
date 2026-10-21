@@ -92,6 +92,15 @@ deterministic pin that fails before the fix and passes after. Generative and
 integration deliberately **share one action vocabulary**, so a scripted scenario is
 just a generated program with its draws pinned.
 
+**Opt-in third-party tier.** `trellis/tests/pg_partman.rs` drives pg_partman's
+partition maintenance (premake, `run_maintenance`, `partition_data_*`,
+retention by detach and by drop, `undo_partition`, its background worker,
+concurrent writers) under real capture. Its tests are `#[ignore]`d because they
+need pg_partman built for the `postgres` on `PATH` (the file's header says how);
+`cargo test -p trellis --test pg_partman -- --ignored` runs them, one PG version
+per `ASDF_POSTGRES_VERSION`. `TestCluster::start_with_settings` starts the
+cluster with the `shared_preload_libraries` the worker needs.
+
 ## 5. Generative tests
 
 **The combinatorial correctness claim: byte-identical convergence to an independent

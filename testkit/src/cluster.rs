@@ -259,6 +259,9 @@ pub struct TestCluster {
     /// Whether the data directory is a copy of the migrated template, so the
     /// server holds [`template::TEMPLATE_DB`] to clone databases from.
     from_template: bool,
+    /// Extra `key=value` server settings from
+    /// [`TestCluster::start_with_settings`], re-applied by a restart.
+    settings: Vec<String>,
     // Behind a `Mutex` so [`TestCluster::restart`] can replace the process
     // through a shared reference: the generative suite keeps its cluster in
     // a `thread_local` and only ever hands out `&TestCluster`.
@@ -312,7 +315,7 @@ impl TestCluster {
     /// first, as [`TestCluster::start`] does for the temp dir.
     pub fn start_in(parent: &Path) -> Self {
         reap_orphans_in(parent);
-        Self::start_listening_in(parent, false, DataDirSource::Initdb)
+        Self::start_listening_in(parent, false, DataDirSource::Initdb, Vec::new())
     }
 
     /// [`TestCluster::start`], but with a data directory of its own from
@@ -323,7 +326,12 @@ impl TestCluster {
     /// `pg_upgrade`. Costs ~300 ms more than [`TestCluster::start`].
     pub fn start_initdb() -> Self {
         reap_orphans_once();
-        Self::start_listening_in(&std::env::temp_dir(), false, DataDirSource::Initdb)
+        Self::start_listening_in(
+            &std::env::temp_dir(),
+            false,
+            DataDirSource::Initdb,
+            Vec::new(),
+        )
     }
 
     fn start_listening(tcp: bool) -> Self {
@@ -333,10 +341,35 @@ impl TestCluster {
         // this process's segments directly, so nothing new to reap accrues
         // from us mid-run.
         reap_orphans_once();
-        Self::start_listening_in(&std::env::temp_dir(), tcp, DataDirSource::Template)
+        Self::start_listening_in(
+            &std::env::temp_dir(),
+            tcp,
+            DataDirSource::Template,
+            Vec::new(),
+        )
     }
 
-    fn start_listening_in(parent: &Path, tcp: bool, source: DataDirSource) -> Self {
+    /// [`TestCluster::start`], with each `key=value` of `settings` passed to
+    /// `postgres` as `-c key=value` (and again by [`TestCluster::restart`]):
+    /// for a test that needs a postmaster-level setting such as
+    /// `shared_preload_libraries`. They follow the built-in settings, so a
+    /// setting here wins over them.
+    pub fn start_with_settings(settings: &[&str]) -> Self {
+        reap_orphans_once();
+        Self::start_listening_in(
+            &std::env::temp_dir(),
+            false,
+            DataDirSource::Template,
+            settings.iter().map(|s| s.to_string()).collect(),
+        )
+    }
+
+    fn start_listening_in(
+        parent: &Path,
+        tcp: bool,
+        source: DataDirSource,
+        settings: Vec<String>,
+    ) -> Self {
         // The template is built (or found) before taking a permit: building
         // it starts a cluster of its own, and a thread holding a permit while
         // it waits for that one could starve it.
@@ -378,7 +411,7 @@ impl TestCluster {
         let port: u16 = if tcp { free_loopback_port() } else { 5432 };
 
         let log_path = root.join("postgres.log");
-        let server = spawn_server(&data_dir, &socket_dir, port, tcp, &log_path);
+        let server = spawn_server(&data_dir, &socket_dir, port, tcp, &log_path, &settings);
 
         let cluster = Self {
             root,
@@ -388,6 +421,7 @@ impl TestCluster {
             tcp,
             long_lived: false,
             from_template: template.is_some(),
+            settings,
             server: Mutex::new(server),
             _permit: permit,
         };
@@ -519,7 +553,7 @@ impl TestCluster {
 
         let port: u16 = 5432;
         let log_path = root.join("postgres.log");
-        let server = spawn_server(&data_dir, &socket_dir, port, false, &log_path);
+        let server = spawn_server(&data_dir, &socket_dir, port, false, &log_path, &[]);
 
         let cluster = Self {
             root,
@@ -530,6 +564,7 @@ impl TestCluster {
             long_lived: false,
             // The backup's own databases are what it has.
             from_template: false,
+            settings: Vec::new(),
             server: Mutex::new(server),
             _permit: permit,
         };
@@ -590,6 +625,7 @@ impl TestCluster {
             self.port,
             self.tcp,
             &log_path,
+            &self.settings,
         );
         drop(server);
         self.wait_ready(&log_path);
@@ -911,6 +947,7 @@ fn spawn_server(
     port: u16,
     tcp: bool,
     log_path: &Path,
+    settings: &[String],
 ) -> Child {
     let log_file = fs::OpenOptions::new()
         .create(true)
@@ -962,6 +999,7 @@ fn spawn_server(
         // `postgresql.conf` and any later `ALTER SYSTEM`.
         .arg("-c")
         .arg("logging_collector=off")
+        .args(settings.iter().flat_map(|setting| ["-c", setting.as_str()]))
         .args(
             extra_pg_options(&std::env::var(PG_OPTIONS_ENV).unwrap_or_default())
                 .into_iter()
@@ -1693,6 +1731,7 @@ mod tests {
                 5432,
                 false,
                 &dir.join("postgres.log"),
+                &[],
             );
             let postmaster = Self {
                 sandbox,

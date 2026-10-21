@@ -354,3 +354,35 @@ async fn an_isolated_database_is_migrated_with_or_without_the_template() {
         assert_eq!(row.get::<_, i64>(0), 1);
     }
 }
+
+/// `start_with_settings` passes each setting to the server, and a restart
+/// starts the server with them again.
+#[tokio::test]
+async fn start_with_settings_applies_them_and_a_restart_keeps_them() {
+    let cluster = TestCluster::start_with_settings(&["work_mem=7MB", "max_connections=33"]);
+    let db = cluster.create_empty_database().await;
+    let show = |name: &'static str| {
+        let pool = db.pool.clone();
+        async move {
+            let client = pool.get().await.expect("acquire connection");
+            let row = client
+                .query_one(&format!("show {name}"), &[])
+                .await
+                .expect("show");
+            row.get::<_, String>(0)
+        }
+    };
+    assert_eq!(show("work_mem").await, "7MB");
+    assert_eq!(show("max_connections").await, "33");
+    cluster.restart(StopMode::Fast);
+    // The pool's connections were severed: a fresh one is opened.
+    let (client, connection) =
+        tokio_postgres::connect(&cluster.database_dsn(db.name()), tokio_postgres::NoTls)
+            .await
+            .expect("connect after the restart");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let row = client.query_one("show work_mem", &[]).await.expect("show");
+    assert_eq!(row.get::<_, String>(0), "7MB");
+}
