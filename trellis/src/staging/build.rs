@@ -52,8 +52,10 @@
 //!   of the recorded tree, then one for the groups that route to no leaf
 //!   ([`run_group_rebuild`]), so a reader sees a leaf's groups change as its
 //!   transaction commits. A fresh group-basis build never has a sweep, so a
-//!   sweep row is always this rebuild.
-//! - **Plan** ([`run_plan`]). A drain worker walks the source's primary key
+//!   sweep row is always this rebuild; the fresh build is the plan job's
+//!   (below).
+//! - **Plan** ([`run_plan`]). For a plain group-basis aggregate the plan job
+//!   is the whole build ([`run_group_rebuild_held`]). Otherwise a drain worker walks the source's primary key
 //!   and enqueues `rederive` chunks of `ClientOptions::build_chunk_rows`
 //!   rows, [`PLAN_BATCH`] per transaction (Q13). The walk and every chunk
 //!   compare the key under the collations the walk started under, which the
@@ -1187,11 +1189,11 @@ pub(crate) fn corrected_on_partitioned_source(definition: &Definition) -> bool {
 
 /// Whether `definition` is on the group basis (`super::group_basis`, behind
 /// its dev knob, #1100), a `JOIN` behind the same knob (`super::join`,
-/// #1108) included. A rebuild of a plain aggregate's is its sweep job alone
-/// ([`start_rebuilds`], [`run_group_rebuild`]). Their fresh builds are
-/// #1101's open part and #1109's: until then the plan job only checks that
-/// the source (each side of a `JOIN`) is empty
-/// ([`run_plan`]), and enqueues no chunk.
+/// #1108) included. A plain aggregate's rebuild is its sweep job alone
+/// ([`start_rebuilds`], [`run_group_rebuild`]), and its fresh build or resume
+/// is its plan job's one absolute write of the same kind ([`run_plan`],
+/// #1101), with no chunk. A `JOIN`'s fresh build is #1109's: until then the
+/// plan job only checks that each side is empty.
 fn takes_group_basis(definition: &Definition) -> bool {
     super::group_basis::route(&definition.def, &definition.source_columns).is_some()
         || super::join::applies(&definition.def)
@@ -3119,15 +3121,28 @@ async fn run_plan(
             }
         }
     }
+    // A plain group-basis aggregate's fresh build or resume over an
+    // unpartitioned source is its whole build: one absolute write of every
+    // group, as a rebuild of a live definition is (#1101, ADR-0002), run
+    // after the seam fence above so its `GROUP BY` reads a racing writer's
+    // row. It never walks the primary key: a `rederive` chunk has no meaning
+    // without a ledger.
     let mut client = pool.get().await?;
-    // #1100: the group basis has no fresh build yet (#1101's open part), so
-    // its dev knob takes only a source that is empty when a fresh build or a
-    // resume plans, which needs none: the walk below enqueues no chunk. A
-    // rebuild of a live plain aggregate has no plan job ([`start_rebuilds`]).
-    // #1108: a `JOIN` behind the same knob takes two empty tables, each
-    // captured (the target feed is #1100's); either may be a partitioned
+    if chunk.fields.is_none()
+        && !super::join::applies(&definition.def)
+        && takes_group_basis(&definition)
+        && !crate::defs::partition_tree::is_partitioned_root(&**client, &definition.source_table)
+            .await?
+    {
+        drop(client);
+        return run_group_rebuild_held(pool, chunk, claimed_by, &definition, &fence, None).await;
+    }
+    // #1108: a `JOIN` behind the group-basis dev knob takes two empty tables,
+    // each captured (the target feed is #1100's); either may be a partitioned
     // root, whose node operations the partition correction engine corrects
-    // (#1111).
+    // (#1111). Its build is #1109's. A plain aggregate over a partitioned
+    // root takes an empty one the same way, and refuses one with rows: its
+    // build there is per leaf, a later slice of #1101.
     if cursor.is_none() && chunk.fields.is_none() && takes_group_basis(&definition) {
         let mut tables = vec![definition.source_table.clone()];
         if super::join::applies(&definition.def) {
@@ -3156,8 +3171,8 @@ async fn run_plan(
             if has_rows {
                 return Err(build_error(ApplyError::GroupBasisUnsupported {
                     target: definition.target_table.clone(),
-                    what: "a fresh build or resume over a source that has rows (the group-basis \
-                           fresh build is #1101, the JOIN build #1109)",
+                    what: "a fresh build or resume over a source that has rows (the JOIN build \
+                           is #1109, a partitioned source's #1101)",
                 }));
             }
         }
@@ -3304,6 +3319,19 @@ async fn run_group_rebuild(
         options.heartbeat_interval,
     );
     let fence = ClaimFence::new(chunk.id, claimed_by, options.reclaim_ttl);
+    run_group_rebuild_held(pool, chunk, claimed_by, definition, &fence, cursor).await
+}
+
+/// [`run_group_rebuild`] for a caller that already heartbeats the claim and
+/// holds its [`ClaimFence`]: the plan job of a fresh build ([`run_plan`]).
+async fn run_group_rebuild_held(
+    pool: &Pool,
+    chunk: &ClaimedChunk,
+    claimed_by: &str,
+    definition: &Definition,
+    fence: &ClaimFence<'_>,
+    cursor: Option<&str>,
+) -> Result<(), ChunkQueueError> {
     let mut client = pool.get().await?;
     if !crate::defs::partition_tree::is_partitioned_root(&**client, &definition.source_table)
         .await?
@@ -3312,7 +3340,7 @@ async fn run_group_rebuild(
             pool,
             &mut client,
             chunk,
-            &fence,
+            fence,
             definition,
             &Structure::Whole,
         )
@@ -3372,7 +3400,7 @@ async fn run_group_rebuild(
             last: leaf.is_none(),
         };
         let Some((w, d)) =
-            run_group_structure(pool, &mut client, chunk, &fence, definition, &structure).await?
+            run_group_structure(pool, &mut client, chunk, fence, definition, &structure).await?
         else {
             return chunk_queue::discard_if_superseded(pool, chunk, claimed_by).await;
         };
@@ -3438,6 +3466,18 @@ async fn run_group_structure(
     txn.batch_execute(&format!(
         "set local application_name = '{CHUNK_APPLICATION_NAME}'"
     ))
+    .await?;
+    // The definition row before the job row, the order `run_plan`'s batches
+    // take them in. A resume or a drop holds the definition row `for update`
+    // and then waits on the job row (`complete_resume`): taken after the
+    // claim, this lock would close a cycle with it. A resume or drop in
+    // flight makes this transaction wait holding nothing, and one that
+    // committed first shows in the claim's stale check.
+    fence.arm(&txn).await?;
+    txn.execute(
+        "select 1 from transform_definitions where id = $1 for key share",
+        &[&chunk.definition_id],
+    )
     .await?;
     if !fence.hold(&txn).await? {
         txn.rollback().await?;

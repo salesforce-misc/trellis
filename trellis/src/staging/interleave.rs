@@ -133,8 +133,10 @@
 //! fingerprints (#1200). A test runs the reconcile pass inside
 //! [`with_scope`].
 //!
-//! A group-basis rebuild (`super::group_basis::rebuild`, run by a rebuild's
-//! sweep job in `super::build`) fires [`PausePoint::AfterRebuildLock`] for
+//! A group-basis build or rebuild (`super::group_basis::rebuild`, run by a
+//! fresh build's plan job or a rebuild's sweep job in `super::build`) fires
+//! [`PausePoint::AfterRebuildEnumerate`] for the definition's target once it
+//! has enumerated its groups, before it locks them, [`PausePoint::AfterRebuildLock`] for
 //! the definition's target once it has locked its groups, before the
 //! statement that takes its snapshot, and [`PausePoint::BeforeRebuildCommit`]
 //! after its last write, before it commits (#1101). Over a partitioned
@@ -311,7 +313,13 @@ pub enum PausePoint {
     /// #1200). The pass holds no transaction, so the root can be swapped by
     /// renames here.
     BeforeFingerprintRead,
-    /// After a group-basis rebuild has locked every group it covers, before
+    /// After a group-basis build or rebuild has enumerated the groups it
+    /// covers, before the statement that locks them, for the definition's
+    /// target (`super::group_basis::rebuild`, #1101). No group is locked
+    /// here: a page of any of them applies now, and a group a page creates
+    /// is not enumerated.
+    AfterRebuildEnumerate,
+    /// After a group-basis build or rebuild has locked every group it covers, before
     /// the statement that takes its snapshot and replaces them, for the
     /// definition's target (`super::group_basis::rebuild`, #1101). Pages of
     /// those groups queue on their locks here; a group a page creates now

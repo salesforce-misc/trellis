@@ -177,11 +177,12 @@ pub enum ApplyError {
     AggregateOffLedger { target: String },
     /// A group-basis aggregate target (`super::group_basis`, #1100) met
     /// what its dev knob doesn't support yet: a ring row missing the images
-    /// its change needs, a page folded with the knob off, or a fresh build
-    /// or resume over a source with rows, or a rebuild over a partitioned
-    /// source whose tree is not recorded or has a leaf with no usable
-    /// constraint text (#1101); or, on a `JOIN` (`super::join`, #1108), a build over
-    /// a side that is another definition's target, or a rebuild (#1109).
+    /// its change needs, a page folded with the knob off, a fresh build or
+    /// resume over a partitioned source that has rows, or a rebuild over one
+    /// whose tree is not recorded or has a leaf with no usable constraint
+    /// text (#1101); or, on a `JOIN`
+    /// (`super::join`, #1108), a build over a side that is another
+    /// definition's target or has rows, or a rebuild (#1109).
     /// Like
     /// [`ApplyError::AggregateOffLedger`], every page of the target would
     /// reproduce it, so it halts the target.

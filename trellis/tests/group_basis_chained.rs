@@ -6,9 +6,9 @@
 //! seam's image feed (`staging::target_mutations`, "The image feed"). Each
 //! test here drives the pipeline by hand through `support/drain_driver.rs`
 //! with the group-basis dev knob on, and none sleeps or polls for
-//! convergence (#297). Every source starts empty (the knob's build only
-//! accepts an empty source until #1101) and is written through capture once
-//! every definition is live.
+//! convergence (#297). Every source starts empty and is written through
+//! capture once every definition is live, except where a test says it builds
+//! over rows.
 //!
 //! The first tests port the ledger's chained-aggregate tests
 //! (`defs_aggregate_chained_single_column_group_key.rs`,
@@ -289,9 +289,8 @@ async fn a_rollup_follows_upstream_groups_emptied_and_refilled_in_one_page() {
 /// "Multi-hop"): the upstream page resolved `m`'s feed before the reader
 /// existed, so it stages nothing for it, and commits after the reader's
 /// build started. The build's plan waits on its fence until that page has
-/// ended, so it sees the page's row rather than missing it. The group basis
-/// has no build of its own yet (#1101): its plan accepts only an empty
-/// source, so the build is refused, never left `live` without the row.
+/// ended, so it sees the page's row rather than missing it: the build
+/// (#1101) counts it and the reader goes `live` with it.
 #[tokio::test]
 async fn a_reader_defined_while_an_upstream_writer_is_in_flight_does_not_miss_its_write() {
     trellis::dev::staging::set_group_basis(true);
@@ -329,18 +328,44 @@ async fn a_reader_defined_while_an_upstream_writer_is_in_flight_does_not_miss_it
         .await
         .expect("skip the plan's backoff");
     assert!(run_plan(&d).await, "the plan job again");
-    let errors = d
-        .rows("select last_error from backfill_chunks where kind = 'plan'")
-        .await;
-    assert!(
-        errors.iter().any(|e| e.contains("has rows")),
-        "the build sees the writer's row and refuses: {errors:?}"
+    assert_eq!(
+        d.rows("select status from transform_definitions where target_table = 'public.agg'")
+            .await,
+        ["(live)"],
+        "the build counted the writer's row"
     );
-    assert_ne!(
+    assert_equal(&mut d, OVER_ONE_ACTUAL, OVER_ONE_ORACLE).await;
+    assert_eq!(d.rows(OVER_ONE_ACTUAL).await, ["(1,10,1)"]);
+}
+
+/// A reader defined over an upstream that is already live with rows: the
+/// build's plan waits on its fence, then one absolute write counts them.
+#[tokio::test]
+async fn a_reader_defined_over_a_seeded_upstream_builds_from_its_rows() {
+    trellis::dev::staging::set_group_basis(true);
+    let mut d = Driver::start(SRC_DDL, &src_columns(), &[ONE], &[SRC]).await;
+    step(
+        &mut d,
+        "insert into public.src values (1, 1, 0, 5), (2, 1, 0, 6), (3, 2, 0, 7)",
+    )
+    .await;
+    install(&d, OVER_ONE, &one_columns()).await;
+    trellis::intake::markers::discharge_registrations(d.pool())
+        .await
+        .expect("start the reader's build");
+    while run_plan(&d).await {
+        d.ctl
+            .batch_execute("update backfill_chunks set next_attempt_at = null")
+            .await
+            .expect("skip the plan's backoff");
+    }
+    assert_eq!(
         d.rows("select status from transform_definitions where target_table = 'public.agg'")
             .await,
         ["(live)"]
     );
+    assert_equal(&mut d, OVER_ONE_ACTUAL, OVER_ONE_ORACLE).await;
+    assert_eq!(d.rows(OVER_ONE_ACTUAL).await, ["(1,22,2)", "(2,14,1)"]);
 }
 
 /// Claims the one Re-derive plan job, if any is claimable, and runs it.

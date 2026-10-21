@@ -239,9 +239,8 @@
 //!
 //! - A group-basis reader is built by the Re-derive build, whose plan waits
 //!   on its fence (`staging::build`'s "Seam-fed sources") until every such
-//!   writer has ended, so it reads their writes. Until the group basis has a
-//!   build of its own (#1101), that plan only accepts an empty source, so a
-//!   write that raced the build fails it rather than being missed.
+//!   writer has ended, so it reads their writes. The group basis' build
+//!   (#1101) runs after that fence, in the plan job.
 //! - A relationship's own projection seed doesn't see such a write either, so
 //!   its projection misses it. The miss is bounded: no definition can read
 //!   through a relationship before the relationship commits, and the first

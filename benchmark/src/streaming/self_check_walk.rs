@@ -156,8 +156,8 @@ pub async fn run(cfg: Config, tuning: &EngineTuning) {
         .expect("install definition");
     wait_for_live(&raw, "sc_tgt", Instant::now() + cfg.build_timeout).await;
     if cfg.aggregate {
-        // A group-basis build over a populated source isn't built yet (#1101):
-        // the rows arrive through capture instead.
+        // The rows arrive through capture, so the build starts from an empty
+        // source.
         let batch = 100_000i64;
         let mut lo = 1i64;
         while lo <= cfg.rows {

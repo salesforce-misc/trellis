@@ -581,9 +581,9 @@ changes strictly in order would serialize hot groups. Neither is built.
 **Decision point.** A new or rebuilt definition is not built by one
 set-based pass with its changes withheld and recovered afterwards. It is
 built by the same operation apply uses, over chunks of the source, while
-applying: Re-derive per row for a 1-1 target, and a locked `GROUP BY` of the
-chunk's rows for an aggregate
-([An aggregate's build](#an-aggregates-build-adds-each-chunks-partials-under-its-group-locks)).
+applying: Re-derive per row for a 1-1 target, and one absolute write per
+structure for an aggregate
+([An aggregate's build](#an-aggregates-build-is-one-absolute-write-per-structure)).
 
 - **Must:** registration writes the definition and its ledger or group-state
   tables. Once
@@ -643,7 +643,7 @@ chunk's rows for an aggregate
   flips `live`; their origin is unknown, so a token taken after the flip
   waits for them, as for any seam row. An aggregate reader's build covers
   such rows itself
-  ([An aggregate's build](#an-aggregates-build-adds-each-chunks-partials-under-its-group-locks)).
+  ([An aggregate's build](#an-aggregates-build-is-one-absolute-write-per-structure)).
 - **Builds that keep the one-pass path.** The chunked build serves an
   aggregate or 1-1 definition on a captured source or on another
   definition's target. A 1-1 definition whose alias chain is cyclic keeps
@@ -666,8 +666,10 @@ chunk's rows for an aggregate
   *Evidence:* per-chunk cost grew from 3.2 to 5.7 worker-seconds per 10k
   rows between 1M and 10M, and the chunk rate fell from 0.96 to 0.4/s at
   100M.
-- **Should:** the peak `xmin` hold during a build is one chunk's duration,
-  not the build's (270–658 s at 10M in the prototype).
+- **Should:** the peak `xmin` hold during a 1-1 build is one chunk's
+  duration, not the build's (270–658 s at 10M in the prototype). An
+  aggregate's is the build's transaction
+  ([An aggregate's build](#an-aggregates-build-is-one-absolute-write-per-structure)).
 - **Chunks are a durable, claimable work queue on drain threads**, not an
   in-call loop, and the failure contract is: a chunk is heartbeated and
   reclaimed like a sealed segment, a crashed worker's chunk is re-run
@@ -691,40 +693,48 @@ chunk's rows for an aggregate
 | one-pass at 100M | 2,305–2,322 s | – | none: OOM in the drain | – |
 | prototype at 100M | never: 4,131 of 10,001 chunks in 2 h 8 min | 190 GB retained | none: stopped by the disk guard | – |
 
-### An aggregate's build adds each chunk's partials under its group locks
+### An aggregate's build is one absolute write per structure
 
-An aggregate's build keeps no per-row entries and needs no delta table or
-merger: a chunk is a region of the source (a key range, or a partition), and
-it adds its region's partials to the groups as increments.
+An aggregate's build keeps no per-row entries and needs no delta table,
+merger or chunk. A fresh build, and a rebuild in place of a `live`
+definition, are **one absolute write per structure**: one per source, or one
+per leaf of a partitioned source. It is the ordinary group recompute applied
+to all of a structure's groups in one transaction, with pages applying from
+the build's first moment.
 
-- **Must:** a chunk locks its chunk row `FOR UPDATE`, then in one statement
-  takes its snapshot, runs the `GROUP BY` of its region's rows, adds the
-  partials to the groups under their locks (taken in key order) and marks
-  itself done with that snapshot.
-- **Must (the chunk gate):** a page locks `FOR SHARE` the chunk rows its
-  sides fall in, before the page row and the groups (I5). A side is judged
-  by the chunk its own row falls in (for a partition region, the partition
-  of the side's own group): a chunk that hasn't run skips the side, because
-  the chunk will count the row; a done chunk refuses a side its snapshot
-  saw; a retired chunk applies it. A side applies only if the chunk gate and
-  the group's basis both let it.
-- **Must:** a chunk row retires only once the contiguous drained prefix
-  passes its stamp.
-- **Must (a recompute during a build):** a group recompute locks the chunk
-  rows `FOR SHARE` and counts only rows whose chunk is done or retired; a
-  not-run chunk will add the rest.
-- **Must:** a source truncate's page resets every chunk whose snapshot saw
-  the truncate to not-run ([Truncate](#truncate-ddl-drop)).
-- **Must:** over a source keyed by nullable columns (another aggregate's
-  target, or a source with `UNIQUE NULLS NOT DISTINCT`), the rows whose key
-  has a `NULL` part, which no key range holds, get a build chunk of their
-  own, whose region is "any key part is `NULL`". It is a chunk like any
-  other: it takes its snapshot, runs its `GROUP BY` and adds its partials
-  under the group locks; the chunk gate judges a side whose key has a
-  `NULL` part by it (not run skips, done refuses what its snapshot saw,
-  retired applies); a recompute during the build counts those rows only
-  once it is done or retired; and a source truncate resets it like any
-  chunk whose snapshot saw the truncate.
+- **Must:** the write runs, in one `READ COMMITTED` transaction:
+  1. **enumerate** the groups (R8's union, below);
+  2. **lock** every enumerated group in key order, in a statement of its own
+     (R6), creating the hidden rows of those that have none;
+  3. **take one snapshot** and run the `GROUP BY` of the structure's source
+     rows. The snapshot statement follows the lock statement in the same
+     transaction (R1): a snapshot taken before the locks lets a page that
+     applies in between be lost or counted twice. The snapshot may be a
+     statement of its own, a `CREATE TEMP TABLE … AS SELECT
+     pg_current_snapshot(), …, GROUP BY` that Postgres can aggregate in
+     parallel, if the write then reads that table;
+  4. **upsert** each enumerated group's absolute partials and visible row,
+     with that snapshot as the group's basis and its stamp per R5.
+- **Must:** a fresh build's write runs in the plan job, after its fence for
+  a source that is another definition's target, and never walks the key. A
+  fresh build whose hidden table is empty may skip R8's second heap pass.
+- **Must:** the write touches only the groups it enumerated and locked. A
+  group first seen after the enumeration belongs to its pages, which apply
+  each of its changes once.
+- **Must:** pages apply from the build's first moment; a page waits only on
+  the groups the build holds.
+- **Must:** a source truncate has no build state to reset. A truncate's page
+  wipes a build that committed before it, and the barrier (R9) re-applies
+  what follows.
+- **Should:** the build's `xmin` hold is its transaction, not one statement:
+  an open transaction with an xid holds the vacuum horizon until it commits.
+  On an unpartitioned source that is the whole source; on a partitioned
+  source one leaf at a time.
+- **Accepted cost.** On an unpartitioned source the build's lock window,
+  `xmin` hold and ring-retirement stall grow with the source: extrapolated
+  linearly to 1e9 rows, about 13–18 s with parallel aggregation to about 80 s
+  serial. For that window the source's drain waits on the groups the build
+  holds. A partitioned source is bounded per leaf.
 - **Must:** a rebuild over a target that already has groups recomputes
   every group in place, without pausing the definition. That is
   `request_backfill`, a capture re-install, and the automatic rebuilds
@@ -773,24 +783,15 @@ it adds its region's partials to the groups as increments.
   fresh would show readers an empty, then filling target, and a shadow
   build and swap would make pages write to both states; both are rejected.
 
-*Evidence:* in my model, chunk builds with recomputes, garbage collection
-and retirement, by one runner and by eight, were exact in every soak run.
-Removing one rule at a time: a recompute counting not-run chunks was wrong
-in 47 of 50 runs, chunk rows retired before the prefix in 50 of 50. A page
-that didn't lock the chunk rows was wrong only in a deterministic scenario
-(an insert into a group the open chunk never touches), as was a truncate
-page that didn't reset chunks; the soak can't reach those windows, so those
-scenarios are the evidence. I measured the group-basis build of a 10M-row
+*Evidence:* the build-path model (PostgreSQL 15 and 18) was exact in every
+deterministic scenario and soak run with pages applying throughout, and each
+rule above was necessary: moving the snapshot before the locks, leaving a
+`NULL`-key group unlocked, or writing groups outside the locked set each
+failed a scenario. I measured the group-basis build of a 10M-row
 source at 0.28 s and 11 MB of WAL with one `GROUP BY` per partition,
 against 26–32 s and 5.0 GB for the per-row ledger's chunked build, and
 1.4–1.9 s at 100M against 370–380 s; the peak `xmin` hold was 0.3–0.5 s per
 partition at 100M.
-
-[OPEN: the build plan: one `GROUP BY` per structure (one chunk per source,
-or per partition) or key-range chunks, and whether pages apply from the
-build's first moment or wait for it. Recommendation: one `GROUP BY` per
-structure, the measured cheapest, once the build-path model confirms it is
-exact with pages applying throughout.]
 
 ## Convergence and status
 
@@ -857,7 +858,7 @@ exact with pages applying throughout.]
   were collected.
 - Every repair of a definition is a rebuild: Re-derive over the key space
   for a 1-1 target, a group rebuild for an aggregate
-  ([An aggregate's build](#an-aggregates-build-adds-each-chunks-partials-under-its-group-locks)),
+  ([An aggregate's build](#an-aggregates-build-is-one-absolute-write-per-structure)),
   each safe against any pending change by I2. A resume starts one, as does
   an explicit `request_backfill` and a capture re-install (the call's own
   transaction moves each `live` reader to `backfilling` and enqueues its
@@ -962,8 +963,7 @@ combination of values a reader sees
 - **A source truncate resets the target and raises a floor**, an O(1)
   write rather than a tombstone per entry or group. The page that applies
   it empties the target's ordering state (a 1-1 target's ledger; an
-  aggregate's partials, bases and zero groups, resetting to not-run every
-  build chunk whose snapshot saw the truncate), clears the target, and
+  aggregate's partials, bases and zero groups), clears the target, and
   raises the target's
   truncate floor (`ledger_truncate_floor`) to the truncate's ring `lsn`.
   I2 then also refuses any change at or below the floor. The floor is
@@ -1066,8 +1066,9 @@ Each alternative below is recorded with the number that rejected it.
 | **Visibility-only I2** on the per-row ledger, and **Apply stamping its own snapshot as the basis.** | Each fails scenarios of the interleaving experiment: visibility-only fails three, and stamping Apply's own snapshot fails two. A group basis needs no position check, because its writes to a group commute. |
 | **Group rows as absolute writes ordered by position:** forced recomputes from a live `GROUP BY`, an existence probe and pre-lock before incrementing. | Not orderable without a horizon; the probe's scan is the 40k-group cliff where nothing drains; the pre-lock deadlocks on new groups. The group basis orders the same absolute writes by a snapshot per group, taken in the statement that reads, after a sorted lock. |
 | **A per-row ledger for aggregates**: one entry per source row holding its group, contribution and ordering state. | I measured 15.1–15.3 GB of ledger for a 100M-row source in 50k groups (151–153 B per entry, its basis 33–39 B), against 5 MB of group state; a 100M build at 370–380 s and 58–71 GB of WAL against 1.4–1.9 s; a page of 100k changes at 3.2–3.35 s against 0.18–0.31 s; and a partition `DROP` of 10M rows at 45–51 s and 6.2 GB of WAL against 10–30 ms. What the ledger gave in return was self-repair on a row's next write, and the `MIN`/`MAX`-style aggregates this ADR refuses. |
-| **One set-based `GROUP BY` build with changes withheld, then a go-live re-read and orphan sweep.** | The re-read is a full enumeration per build that scales with table size, not with what changed; I ran it at 100M, where it reaches `live` after 2,305 s and its drain then runs out of memory. Nothing can tell a table unchanged since the build from one changed and changed back, so the re-read could never be skipped. A 1-1 build is per-row work and its acceptance bar is linear time; an aggregate's build keeps the one-pass `GROUP BY` and drops the withholding, because its chunks apply alongside pages under the chunk gate. |
+| **One set-based `GROUP BY` build with changes withheld, then a go-live re-read and orphan sweep.** | The re-read is a full enumeration per build that scales with table size, not with what changed; I ran it at 100M, where it reaches `live` after 2,305 s and its drain then runs out of memory. Nothing can tell a table unchanged since the build from one changed and changed back, so the re-read could never be skipped. A 1-1 build is per-row work and its acceptance bar is linear time; an aggregate's build keeps the one-pass `GROUP BY` and drops the withholding, because its absolute write applies alongside pages from its first moment. |
 | **`catching_up` as a stored status with marker fences, generations and go-live catch-ups.** | Needed only by a build that skips changes. A definition on the Re-derive build applies from its first chunk, so there is nothing to catch up; builds not yet on it keep the status ([A build](#a-build-is-re-derive-over-chunks-and-applies-from-its-first-chunk)). |
+| **A chunked aggregate build under a chunk gate:** primary-key-range chunks (a hybrid above a size threshold), or key-range chunks, each adding its region's partials under the group locks, with a gate in every page path (a page locks the chunk rows its sides fall in, before the page row; a chunk that hasn't run skips the side, a done chunk refuses what its snapshot saw, a retired one applies it), retirement once the drained prefix passes the chunk's stamp, a recompute that counts only done or retired chunks, a `NULL`-key chunk, and a truncate page that resets the chunks. | It is the only option that bounds a fresh build on a large unpartitioned source, but a chunk is paid per (chunk, cell) pair: about 5–6x the build time and 12x the WAL on many-cell shapes, against one `GROUP BY` per structure at 2–12x less (84 s against 412–509 s; 213 s against 1,258 s), and it leaves in-place rebuilds unbounded. Key-range chunks bound locks and rows but reread the heap about 2x per chunk, so not I/O. The gate adds a lock to every page and machinery to every truncate and recompute. A build is one absolute write per structure instead, and a large source is partitioned ([#1276](https://github.com/salesforce-misc/trellis/issues/1276) keeps the bounded alternatives open). |
 | **Bounding drain memory by running fewer workers.** | Each worker then holds more buckets; I measured that it bounds nothing. |
 | **Fixing the build's cost by chunk size.** | I ran 10x larger chunks and they left 2.0x the time and 3.7x the WAL. |
 | **Resolve every image-less trigger into an image at staging time**, so Phase 2 never reads live state. | Under trigger capture the only image-less change is a delete, and every other image-less producer is an enumeration this ADR replaces with Re-derive or a recompute under lock. What this leaves untouched on a 1-1 target is out-of-order parallel batches for one key, which needs `applied_lsn`, not images. A resolver on the seal path is itself a live read racing the drains. |
@@ -1149,8 +1150,8 @@ Each alternative below is recorded with the number that rejected it.
 - **A 1-1 build is per-row work on every worker**, not one pass. The
   acceptance bar is linear time with a per-row cost independent of table
   size, checked at 100M ([validation 4](#validation-and-acceptance)). An
-  aggregate's build is a `GROUP BY` per chunk, and holds the `xmin` horizon
-  for one chunk's statement.
+  aggregate's build is one `GROUP BY` per structure, and holds the `xmin`
+  horizon for its transaction.
 - **Registration latency does not depend on table size**, and no definition
   is `live` when registration returns: callers poll `Trellis::status` to
   `live`, then use a token
@@ -1174,9 +1175,9 @@ Nothing below polls for convergence.
    applies to the engine: the read-after-lock and stale-basis cases, the
    fold that straddles a basis, the image chains under nested writes and
    cascades, the enumeration of a build over vacated groups, zero groups
-   and the GC racing a recompute, the truncate barrier's earlier side and
-   the chunk reset, the chunk gate (a page that doesn't lock the chunk
-   rows), a recompute during a chunked build, and the chained-source cases
+   and the GC racing a recompute, the truncate barrier's earlier side,
+   a build's absolute write against pages before, during and after each of
+   its steps, and the chained-source cases
    ([Multi-hop](#multi-hop-a-targets-writes-reach-its-readers-through-the-mutation-seam)).
    Each scenario the soak can't reach is the only evidence for its rule.
 3. **The generative concurrent tier** with planted violations (skip the

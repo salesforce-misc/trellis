@@ -3,9 +3,9 @@
 //!
 //! # The knob
 //!
-//! The group basis is built in steps (#1091), and its fresh build (#1101)
-//! doesn't exist yet. Until it does, the ledger (`super::ledger`) keeps every aggregate by default,
-//! and this path runs only behind a dev/bench knob: [`enabled`], read from
+//! The group basis is built in steps (#1091). Until it replaces the ledger,
+//! the ledger (`super::ledger`) keeps every aggregate by default, and this
+//! path runs only behind a dev/bench knob: [`enabled`], read from
 //! [`KNOB_ENV`] or set with [`set_enabled`] (`trellis::dev::set_group_basis`).
 //! [`route`] is the one routing decision: with the knob on, it takes every
 //! aggregate it admits, and `super::ledger::route` declines those. Deleting
@@ -16,12 +16,10 @@
 //! probe sets it once, before its client starts. With it on, a definition
 //! [`route`] takes:
 //!
-//! - must be defined over a source that is empty and unwritten until it is
-//!   `live`: its build only checks that the source is empty
-//!   (`super::build`'s plan job fails otherwise), since the group-basis
-//!   fresh build is #1101's;
-//! - halts on a resume with a non-empty source, which truncates and builds
-//!   fresh;
+//! - is built, fresh or on a resume, by the plan job's one absolute write of
+//!   every group ([`rebuild`]) over an unpartitioned source, with rows or
+//!   without; over a partitioned source its build only accepts an empty
+//!   source until its per-leaf build (#1101);
 //! - is rebuilt in place once `live` ([`rebuild`]: `request_backfill`, a
 //!   capture re-install, an automatic rebuild, or an upstream's rebuild),
 //!   over a partitioned source one transaction per leaf of its recorded tree
@@ -155,17 +153,19 @@
 //! drain barrier orders that page after every page of earlier segments and
 //! before every page of later ones (R9).
 //!
-//! # A rebuild of a live definition ([`rebuild`], #1101)
+//! # A build or rebuild ([`rebuild`], #1101)
 //!
-//! A rebuild over a target that already has groups recomputes every group
-//! in place, as one absolute write per source: lock the groups of the
+//! A build or rebuild recomputes every group in place, as one absolute write
+//! per source (a fresh build starts from an empty hidden table, and its
+//! enumeration finds the groups in the source and the ring): lock the groups of the
 //! enumeration union (the target's, the source's, and those the ring's old
 //! images name; R8) in key order, then one statement runs the source's
 //! `GROUP BY` from its snapshot and replaces each group's partials, basis,
 //! stamp and visible row. Pages keep applying, against the new bases once it
 //! commits; readers see the old values until then. It runs as the rebuild's
 //! one job (`super::build`'s sweep job, which a group-basis definition's
-//! rebuild is alone).
+//! rebuild is alone), and a fresh build's is its plan job, after the plan's
+//! fence for a source that is another definition's target.
 //!
 //! Sides are never folded per key (#1043 F2): the fold's first old and last
 //! new image are wrong when a group's basis falls between two of a key's
@@ -2047,10 +2047,8 @@ pub(crate) async fn apply_locked_groups(
 /// so the recompute's snapshot sees them, and its basis refuses them from
 /// then on.
 ///
-/// A group-basis definition has no build chunks yet (#1101), so the
-/// recompute counts every source row of its groups: a recompute during a
-/// chunked build will lock the chunk rows `FOR SHARE` first and count only
-/// rows of done or retired chunks (ADR-0002, F6).
+/// A group-basis definition has no build chunks (#1101: its build is one
+/// absolute write), so the recompute counts every source row of its groups.
 pub(crate) async fn recompute_locked_groups(
     txn: &Transaction<'_>,
     plan: &GroupTargetPlan,
@@ -2297,6 +2295,15 @@ pub(crate) async fn rebuild(
         )
         .await?;
     }
+    // Test-only pause point: the groups are enumerated, and none is locked.
+    // See `super::interleave`.
+    #[cfg(any(test, feature = "test-util"))]
+    super::interleave::pause_at(
+        txn,
+        super::interleave::PausePoint::AfterRebuildEnumerate,
+        &plan.target,
+    )
+    .await?;
     txn.execute(&plan.lock_sql(), &[]).await?;
     // Test-only pause point: the groups are locked, and the replace's
     // snapshot is not yet taken. See `super::interleave`.
@@ -2710,9 +2717,8 @@ mod tests {
     }
 
     /// The same connection stages a page for one definition id under two
-    /// shapes, as after a resume that re-typed the group column (resume is
-    /// refused on the group basis until #1101, so the hidden table and the
-    /// plan are rebuilt here by hand): the second page's group, out of the
+    /// shapes, as after a resume that re-typed the group column (the hidden
+    /// table and the plan are rebuilt here by hand): the second page's group, out of the
     /// first shape's range, stages into a table of its own type.
     #[tokio::test]
     async fn a_session_stages_a_retyped_group_into_a_table_of_its_shape() {

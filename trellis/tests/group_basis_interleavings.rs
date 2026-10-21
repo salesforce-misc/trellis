@@ -5,9 +5,8 @@
 //! (`trellis::dev::staging::set_group_basis`) before its driver starts; the
 //! knob is process-wide, and no test here wants the ledger. Each test drives
 //! one interleaving by hand through `support/drain_driver.rs`, and none
-//! sleeps or polls for convergence (#297). Every source starts empty (the
-//! knob's build only accepts an empty source until #1101) and is seeded
-//! through capture.
+//! sleeps or polls for convergence (#297). Every source starts empty and is
+//! seeded through capture.
 //!
 //! The scenarios are #1043 E1's, at group granularity: R1 (a page reads a
 //! group's basis after locking it), R2 (each side is checked against its own
