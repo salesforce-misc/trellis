@@ -241,6 +241,7 @@ async fn dropping_the_last_reader_of_a_joined_table_or_to_side_forgets_its_recor
     raw.batch_execute(
         "create table public.fa (id int primary key, k varchar(5), x int); \
          create table public.fb (id int primary key, k varchar(5), y int); \
+         create index on public.fa (k); create index on public.fb (k); \
          create table public.fc (id int primary key, pid int, amount int); \
          create table public.fp (id int primary key, name text); \
          insert into public.fp select i, 'p' || i from generate_series(1, 3) i; \
