@@ -81,11 +81,9 @@ pub(crate) async fn detect(client: &mut Client) -> Result<bool, CaptureError> {
 /// nothing to do and this returns `false`.
 pub(crate) async fn respond(client: &mut Client, recheck: bool) -> Result<bool, CaptureError> {
     let txn = client.transaction().await?;
-    txn.execute(
-        "select pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended('trellis.restore', 0))",
-        &[],
-    )
-    .await?;
+    // Two passes responding at once take turns, and a seal waits.
+    txn.execute("select 1 from segment_pointer for update", &[])
+        .await?;
     if recheck && !txn.query_one(STALE_RECORDS, &[]).await?.get::<_, bool>(0) {
         return Ok(false);
     }
