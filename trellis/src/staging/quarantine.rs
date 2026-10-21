@@ -5061,6 +5061,7 @@ async fn finish_requested_resume(
         let txn = client.transaction().await?;
         crate::locks::set_local_lock_timeout(&txn, RETYPE_LOCK_TIMEOUT).await?;
         let retyped_now = async {
+            lock_column_readers(&txn, &columns).await?;
             txn.batch_execute(&sql).await?;
             record_retype_causes(&txn, id, &columns).await?;
             pause_refused_readers(&txn, schema, &columns).await
@@ -5217,9 +5218,47 @@ async fn record_retype_causes(
     Ok(())
 }
 
+/// Locks the definition row of every definition that reads one of
+/// `columns` (`for no key update`, in id order), before the re-type takes
+/// `ACCESS EXCLUSIVE` on the target: [`pause_refused_readers`] may pause
+/// any of them once the re-type ran. A definition's row comes before a
+/// table lock, as elsewhere (a build's start and an `ALTER TRANSFORM` lock
+/// the definition row and then read or re-type a table), so a
+/// transaction holding a reader's row and reading the target never waits
+/// on a re-type that waits on it. The wait for a row ends at the re-type's
+/// `lock_timeout` with nothing held on the target, and the pass retries.
+/// Locking the valid readers too keeps one of them from being edited (an
+/// `ALTER TRANSFORM` adding a `SUM`) against the old type while the re-type
+/// commits.
+async fn lock_column_readers(
+    txn: &Transaction<'_>,
+    columns: &[RetypedColumn],
+) -> Result<(), tokio_postgres::Error> {
+    let Some(first) = columns.first() else {
+        return Ok(());
+    };
+    let upstream = first.table.rsplit('.').next().unwrap_or(&first.table);
+    let names: Vec<String> = columns.iter().map(|c| c.column.clone()).collect();
+    let ids: Vec<i64> = catalog::column_readers(txn, upstream, &names)
+        .await?
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    if !ids.is_empty() {
+        txn.execute(
+            "select 1 from transform_definitions where id = any($1) order by id \
+             for no key update",
+            &[&ids],
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 /// Pauses, in the re-type's own transaction, each definition that reads one
 /// of `columns` (re-typed by a definition's resume) and that define would
-/// now refuse (#1188), recording the refusal as its `capture_failure`. It
+/// now refuse (#1188), recording the refusal as its `capture_failure`. Their
+/// rows are locked before the re-type ([`lock_column_readers`]). It
 /// has no cause: the resume of the definition that re-typed the column
 /// doesn't release it, and its own resume refuses until the operator
 /// redefines it. A reader that stays valid is left to #828's cause

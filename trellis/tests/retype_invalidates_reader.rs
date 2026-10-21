@@ -4,8 +4,10 @@
 //!
 //! The readers are group-basis aggregates and a `JOIN` (the group-basis dev
 //! knob is on for this binary), whose `SUM`/`AVG` define refuses over a
-//! numeric with no declared scale (#1096 decision 2). Every step is a
-//! bounded, explicit pass or drain; nothing polls for convergence (#297).
+//! numeric with no declared scale (#1096 decision 2), and a `JOIN` whose
+//! key pair a re-type breaks. Every step is a bounded, explicit pass or
+//! drain; nothing polls for convergence (#297). The one wait, in the
+//! lock-order test, is for a backend to block on a lock.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -175,8 +177,8 @@ async fn setup(dsn: &str, raw: &mut Client, pool: &trellis::Pool) -> Trellis {
         .expect("define t");
     bring_live(raw, pool, &["t"]).await;
     for text in [
-        "TRANSFORM roll FROM public.t GROUP BY g SELECT SUM(p) AS total, COUNT(*) AS n",
-        "TRANSFORM cnt FROM public.t GROUP BY g SELECT COUNT(p) AS c",
+        "TRANSFORM roll FROM public.t GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(p) AS total, COUNT(*) AS n",
+        "TRANSFORM cnt FROM public.t GROUP BY g WITHOUT SOURCE INDEX SELECT COUNT(p) AS c",
         "TRANSFORM c FROM public.t SELECT p AS q",
     ] {
         trellis.apply(text).await.expect(text);
@@ -198,8 +200,8 @@ async fn column_type(raw: &Client, table: &str, column: &str) -> String {
 
 async fn definition_texts(raw: &Client) -> Vec<String> {
     raw.query(
-        "select target_table || ' ' || definition_text from transform_definitions \
-         order by id",
+        "select target_table || ' ' || definition_version || ' ' || definition_text \
+         from transform_definitions order by id",
         &[],
     )
     .await
@@ -220,7 +222,7 @@ async fn statuses(raw: &Client, targets: &[&str]) -> Vec<TransformStatus> {
 /// Rule 1: the alter that would re-type `t.p` to `numeric` is refused,
 /// naming each reader define would refuse, and changes and pauses nothing.
 /// A reader that stays valid (`cnt`, `c`) isn't named. Without the check the
-/// alter commits and `roll` and `j` stay live over a column define refuses.
+/// alter commits and `roll` stays live over a column define refuses.
 #[tokio::test]
 async fn an_alter_that_retypes_a_column_a_reader_cannot_read_is_refused() {
     let cluster = TestCluster::start();
@@ -290,8 +292,8 @@ async fn an_alter_every_reader_survives_is_accepted() {
     trellis.shutdown().await.expect("shutdown");
 }
 
-/// Rule 2: a `RESUME` that re-types `t.p` pauses `roll` and `j`, with
-/// define's refusal as the reason naming the re-type, and their own
+/// Rule 2: a `RESUME` that re-types `t.p` pauses `roll`, with
+/// define's refusal as the reason naming the re-type, and its own
 /// `RESUME` refuses. `cnt` and `c` stay valid and are not paused by it.
 #[tokio::test]
 async fn a_resume_that_retypes_a_column_pauses_the_readers_define_would_refuse() {
@@ -363,7 +365,7 @@ async fn an_alter_that_retypes_a_column_a_join_cannot_read_is_refused() {
     trellis::defs::install_definition(
         d.pool(),
         "TRANSFORM j FROM public.t JOIN public.o ON t.g = o.g GROUP BY t.g \
-         SELECT t.g AS g, SUM(t.p) AS s",
+         WITHOUT SOURCE INDEX SELECT t.g AS g, SUM(t.p) AS s",
         &columns,
         "public",
     )
@@ -390,5 +392,244 @@ async fn an_alter_that_retypes_a_column_a_join_cannot_read_is_refused() {
         )
         .await,
         ["(\"numeric(10,2)\")"]
+    );
+}
+
+/// Polls (bounded) until some backend waits on a lock `pid` holds: the
+/// interleaving test's one wait for a lock-wait state, not for convergence.
+async fn wait_blocked_behind(raw: &Client, pid: i32) {
+    for _ in 0..600 {
+        let blocked: bool = raw
+            .query_one(
+                "select exists (select 1 from pg_catalog.pg_stat_activity \
+                 where $1 = any(pg_catalog.pg_blocking_pids(pid)))",
+                &[&pid],
+            )
+            .await
+            .expect("read lock waits")
+            .get(0);
+        if blocked {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("nothing blocked behind backend {pid} within 30s");
+}
+
+/// Rule 2's lock order: the re-type takes the readers' definition rows
+/// before the target's `ACCESS EXCLUSIVE` lock. A transaction holding the
+/// reader's row (`roll`'s, as its build or an `ALTER TRANSFORM roll` would)
+/// and then reading the target `t` is not deadlocked by the resume's
+/// re-type: the re-type waits on the row holding nothing on `t`, the
+/// holder reads `t` and commits, and the same pass then re-types `t.p` and
+/// pauses `roll`. Taking the rows after the re-type (holding `t`) deadlocks
+/// here, and Postgres aborts one side.
+#[tokio::test]
+async fn a_resume_retype_takes_reader_rows_before_the_target_lock() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = setup(db.dsn(), &mut raw, &db.pool).await;
+    raw.batch_execute("alter table public.src alter column price type numeric")
+        .await
+        .expect("widen the source");
+    full_pass(&mut raw, &db.pool).await;
+    assert_eq!(status(&raw, "t").await, TransformStatus::Paused);
+    trellis.apply("RESUME TRANSFORM t").await.expect("resume t");
+
+    let holder = connect(db.dsn()).await;
+    let holder_pid: i32 = holder
+        .query_one("select pg_catalog.pg_backend_pid()", &[])
+        .await
+        .expect("pid")
+        .get(0);
+    holder
+        .batch_execute(
+            "begin; set local lock_timeout = '10s'; \
+             select 1 from transform_definitions \
+             where split_part(target_table, '.', 2) = 'roll' for update",
+        )
+        .await
+        .expect("hold roll's definition row");
+
+    let pool = db.pool.clone();
+    let dsn = db.dsn().to_string();
+    let pass = tokio::spawn(async move {
+        let mut pass_client = connect(&dsn).await;
+        full_pass(&mut pass_client, &pool).await;
+    });
+    // The pass's re-type of `t.p` now waits on `roll`'s row.
+    wait_blocked_behind(&raw, holder_pid).await;
+    holder
+        .batch_execute("select count(*) from public.t")
+        .await
+        .expect("the holder reads the target without a deadlock");
+    holder.batch_execute("commit").await.expect("commit");
+    pass.await.expect("the pass");
+
+    assert_eq!(
+        column_type(&raw, "public.t", "p").await,
+        "numeric",
+        "the same pass re-typed t.p: its re-type wasn't a deadlock's victim"
+    );
+    assert_eq!(status(&raw, "roll").await, TransformStatus::Paused);
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// Rule 2 down a chain `t -> c -> roll2`: `t`'s resume re-types `t.p`,
+/// which pauses `c` (its copy of `p` is outgrown, #828); `c`'s chained
+/// resume re-types `c.q`, which pauses `roll2`, a `SUM(q)` define would now
+/// refuse. `c` goes live again.
+#[tokio::test]
+async fn a_chained_resume_retype_pauses_the_reader_define_would_refuse() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    trellis::dev::staging::set_group_basis(true);
+    raw.batch_execute("create table public.src (id int primary key, g int, price numeric(10,2))")
+        .await
+        .expect("tables");
+    let trellis = definer(db.dsn()).await;
+    trellis
+        .apply("TRANSFORM t FROM public.src SELECT g AS g, price AS p")
+        .await
+        .expect("define t");
+    bring_live(&mut raw, &db.pool, &["t"]).await;
+    trellis
+        .apply("TRANSFORM c FROM public.t SELECT g AS g, p AS q")
+        .await
+        .expect("define c");
+    bring_live(&mut raw, &db.pool, &["t", "c"]).await;
+    trellis
+        .apply(
+            "TRANSFORM roll2 FROM public.c GROUP BY g WITHOUT SOURCE INDEX \
+             SELECT SUM(q) AS total",
+        )
+        .await
+        .expect("define roll2");
+    bring_live(&mut raw, &db.pool, &["t", "c", "roll2"]).await;
+
+    raw.batch_execute("alter table public.src alter column price type numeric")
+        .await
+        .expect("widen the source");
+    full_pass(&mut raw, &db.pool).await;
+    assert_eq!(status(&raw, "t").await, TransformStatus::Paused);
+    trellis.apply("RESUME TRANSFORM t").await.expect("resume t");
+    bring_live(&mut raw, &db.pool, &["t", "c"]).await;
+
+    assert_eq!(column_type(&raw, "public.c", "q").await, "numeric");
+    let reported = trellis
+        .status("roll2")
+        .await
+        .expect("status")
+        .expect("roll2");
+    assert_eq!(reported.status, TransformStatus::Paused);
+    let error = reported.capture_failure.expect("a reason").error;
+    assert!(error.contains("no declared scale"), "{error}");
+    assert!(
+        error.contains("public.c.q from numeric(10,2) to numeric"),
+        "{error}"
+    );
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// The captured-source path: a source column a group-basis `SUM` and a
+/// `JOIN`'s `SUM` read is re-typed to an unconstrained `numeric`, and the
+/// capture pass's re-validation (#703 R1) pauses both with define's refusal
+/// (#1096 decision 2). For the plain aggregate only `revalidate`'s
+/// group-basis check refuses.
+#[tokio::test]
+async fn a_source_retype_to_unscaled_numeric_pauses_its_sum_readers() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    trellis::dev::staging::set_group_basis(true);
+    raw.batch_execute(
+        "create table public.src (id int primary key, g int, price numeric(10,2)); \
+         create table public.o (id int primary key, g int)",
+    )
+    .await
+    .expect("tables");
+    let trellis = definer(db.dsn()).await;
+    trellis
+        .apply(
+            "TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX \
+             SELECT SUM(price) AS total",
+        )
+        .await
+        .expect("define agg");
+    trellis
+        .apply(
+            "TRANSFORM j FROM public.src JOIN public.o ON src.g = o.g GROUP BY src.g \
+             WITHOUT SOURCE INDEX SELECT src.g AS g, SUM(src.price) AS s",
+        )
+        .await
+        .expect("define j");
+    bring_live(&mut raw, &db.pool, &["agg", "j"]).await;
+
+    raw.batch_execute("alter table public.src alter column price type numeric")
+        .await
+        .expect("widen the source");
+    full_pass(&mut raw, &db.pool).await;
+
+    for reader in ["agg", "j"] {
+        let reported = trellis.status(reader).await.expect("status").expect(reader);
+        assert_eq!(reported.status, TransformStatus::Paused, "{reported:?}");
+        let error = reported.capture_failure.expect("a reason").error;
+        assert!(error.contains("no declared scale"), "{reader}: {error}");
+    }
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// Rule 3: the check is define's whole validation, not only the scale rule.
+/// A `JOIN` on `t.k = o.k`, both `varchar(10)`: an alter that widens `t.k`
+/// to `text` leaves a key pair define refuses (`JoinKeyTypeMismatch`), so
+/// the alter is refused, naming the `JOIN`.
+#[tokio::test]
+async fn an_alter_that_breaks_a_join_key_pair_is_refused() {
+    trellis::dev::staging::set_group_basis(true);
+    let int4 = ValueType::Integer(IntWidth::Int4);
+    let d = Driver::start(
+        "create table public.src (id int primary key, g int, name varchar(10)); \
+         create table public.o (id int primary key, k varchar(10))",
+        &[("id", int4), ("g", int4), ("name", ValueType::Text)],
+        &["TRANSFORM t FROM public.src SELECT g AS g, name AS k"],
+        &["public.src", "public.o"],
+    )
+    .await;
+    let columns: HashMap<String, ValueType> = [
+        ("id".to_string(), int4),
+        ("g".to_string(), int4),
+        ("k".to_string(), ValueType::Text),
+    ]
+    .into();
+    trellis::defs::install_definition(
+        d.pool(),
+        "TRANSFORM j FROM public.t JOIN public.o ON t.k = o.k GROUP BY t.g \
+         WITHOUT SOURCE INDEX SELECT t.g AS g, COUNT(*) AS n",
+        &columns,
+        "public",
+    )
+    .await
+    .expect("define the JOIN");
+    let trellis::defs::Statement::AlterTransform(alter) =
+        trellis::defs::parse_statement("ALTER TRANSFORM t ALTER k AS COALESCE(name, 'x')")
+            .expect("parses")
+    else {
+        panic!("not an ALTER");
+    };
+    let err = trellis::defs::alter_transform(d.pool(), &alter)
+        .await
+        .expect_err("the alter is refused");
+    let message = err.to_string();
+    assert!(message.contains("'j'"), "{message}");
+    assert!(!message.contains("no declared scale"), "{message}");
+    assert_eq!(
+        d.rows(
+            "select format_type(atttypid, atttypmod) from pg_attribute \
+             where attrelid = 'public.t'::regclass and attname = 'k'"
+        )
+        .await,
+        ["(\"character varying(10)\")"]
     );
 }

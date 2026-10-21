@@ -9474,26 +9474,8 @@ pub(crate) async fn refused_readers(
     upstream: &str,
     columns: &[String],
 ) -> Result<Vec<RefusedReader>, tokio_postgres::Error> {
-    let mut targets: Vec<String> = Vec::new();
-    for column in columns {
-        match column_dependents_any_keyspace(txn, upstream, column).await {
-            Ok(deps) => targets.extend(deps.into_iter().map(|(target, _)| target)),
-            Err(CatalogError::Db(err)) => return Err(err),
-            Err(_) => {}
-        }
-    }
-    targets.sort();
-    targets.dedup();
     let mut refused = Vec::new();
-    for target in targets {
-        let id: Option<i64> = txn
-            .query_opt(
-                "select id from transform_definitions where split_part(target_table, '.', 2) = $1",
-                &[&target],
-            )
-            .await?
-            .map(|row| row.get(0));
-        let Some(id) = id else { continue };
+    for (id, target) in column_readers(txn, upstream, columns).await? {
         let checked = match definition_by_id_in(txn, id).await {
             Ok(Some(definition)) => revalidate(txn, schema, &definition).await.map(|_| ()),
             Ok(None) => continue,
@@ -9506,6 +9488,41 @@ pub(crate) async fn refused_readers(
         }
     }
     Ok(refused)
+}
+
+/// The id and bare target of every definition that reads one of `columns`
+/// of the target `upstream` (bare name), in id order: the definitions
+/// [`refused_readers`] validates. Which definitions read a column doesn't
+/// depend on its type, so a caller can read them before it re-types it.
+pub(crate) async fn column_readers(
+    client: &impl GenericClient,
+    upstream: &str,
+    columns: &[String],
+) -> Result<Vec<(i64, String)>, tokio_postgres::Error> {
+    let mut targets: Vec<String> = Vec::new();
+    for column in columns {
+        match column_dependents_any_keyspace(client, upstream, column).await {
+            Ok(deps) => targets.extend(deps.into_iter().map(|(target, _)| target)),
+            Err(CatalogError::Db(err)) => return Err(err),
+            Err(_) => {}
+        }
+    }
+    targets.sort();
+    targets.dedup();
+    let mut readers = Vec::new();
+    for target in targets {
+        if let Some(row) = client
+            .query_opt(
+                "select id from transform_definitions where split_part(target_table, '.', 2) = $1",
+                &[&target],
+            )
+            .await?
+        {
+            readers.push((row.get(0), target));
+        }
+    }
+    readers.sort();
+    Ok(readers)
 }
 
 async fn column_dependents_via(

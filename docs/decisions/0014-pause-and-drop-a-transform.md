@@ -250,7 +250,12 @@ reader define would now refuse is paused there, with the refusal and the upstrea
 re-type as its `capture_failure` and no cause: its own `RESUME` re-validates and
 refuses until the operator redefines it. A reader that stays valid is untouched by this
 step. The capture pass never sees such a re-type, because a target is not captured, so
-nothing else re-validates the reader.
+nothing else re-validates the reader. The re-type's transaction locks the definition row
+of every reader of the re-typed columns, in id order, before it takes `ACCESS EXCLUSIVE`
+on the target: a definition's row comes before a table, as in a build's start and an
+`ALTER TRANSFORM`, so a transaction that holds a reader's row and then reads the target
+is never deadlocked by the re-type, and a wait for a row holds nothing on the target. A
+wait that reaches the re-type's lock timeout is retried by the next pass.
 
 A resume never starts a rebuild ahead of its upstream. A definition's upstreams are the
 definitions in the instance whose targets it reads: its source, a `JOIN`'s joined table, or
