@@ -879,90 +879,127 @@ fn two_level(part: Part) -> String {
     )
 }
 
+/// Declares one `#[tokio::test]` per (operation, root) pair, each running
+/// `$case(part, index)` on its own fixture. The cases used to be one test
+/// looping over sixteen fixtures, a ~25 s tail no other test could overlap;
+/// as separate tests the harness runs them in parallel (#1226).
+macro_rules! case_tests {
+    ($case:ident: $($index:literal => $fact:ident, $dim:ident;)+) => {
+        $(
+            #[tokio::test]
+            async fn $fact() {
+                $case(Part::Fact, $index).await;
+            }
+
+            #[tokio::test]
+            async fn $dim() {
+                $case(Part::Dim, $index).await;
+            }
+        )+
+    };
+}
+
+/// One case's fixture: `schema`, the `op` run on it, then two correction
+/// passes, the target compared with the oracle and the queue empty.
+async fn run_lifecycle_case(part: Part, schema: &str, op: &str) {
+    let what = format!("{part:?}: {op}");
+    let mut fx = Fx::start(part, schema, SEED).await;
+    fx.exec(op).await;
+    fx.correct().await;
+    fx.correct().await;
+    fx.assert_right(&what).await;
+    assert!(fx.queue().await.is_empty(), "{what}");
+}
+
 /// X12-7a: each lifecycle operation on a two-level tree, one per fixture.
-#[tokio::test]
-async fn every_operation_on_a_two_level_tree_converges() {
-    for part in BOTH {
-        for op in [
-            "drop table public.{n}_m1",
-            "alter table public.{n}_m detach partition public.{n}_m2",
-            "truncate public.{n}_m3",
-            "drop table public.{n}_m",
-            "truncate public.{n}_m",
-            "alter table {t} detach partition public.{n}_m; drop table public.{n}_m",
-            "alter table public.{n}_m detach partition public.{n}_m0; \
-             insert into public.{n}_m0 (id, k) select 7000, k from generate_series(8, 15) k \
-                 where satisfies_hash_partition('public.{n}_m'::regclass, 4, 0, k) limit 1; \
-             alter table public.{n}_m attach partition public.{n}_m0 \
-                 for values with (modulus 4, remainder 0)",
-            "drop table public.{n}_m1; \
-             create table public.{n}_m1 partition of public.{n}_m \
-                 for values with (modulus 4, remainder 1); \
-             insert into public.{n}_m1 (id, k) select 7100 + k, k from generate_series(8, 15) k \
-                 where satisfies_hash_partition('public.{n}_m'::regclass, 4, 1, k)",
-        ] {
-            let op = op.replace("{n}", part.name()).replace("{t}", part.table());
-            let mut fx = Fx::start(part, &two_level(part), SEED).await;
-            fx.exec(&op).await;
-            fx.correct().await;
-            fx.correct().await;
-            fx.assert_right(&op).await;
-            assert!(fx.queue().await.is_empty(), "{op}");
-        }
-    }
+async fn two_level_case(part: Part, index: usize) {
+    let op = [
+        "drop table public.{n}_m1",
+        "alter table public.{n}_m detach partition public.{n}_m2",
+        "truncate public.{n}_m3",
+        "drop table public.{n}_m",
+        "truncate public.{n}_m",
+        "alter table {t} detach partition public.{n}_m; drop table public.{n}_m",
+        "alter table public.{n}_m detach partition public.{n}_m0; \
+         insert into public.{n}_m0 (id, k) select 7000, k from generate_series(8, 15) k \
+             where satisfies_hash_partition('public.{n}_m'::regclass, 4, 0, k) limit 1; \
+         alter table public.{n}_m attach partition public.{n}_m0 \
+             for values with (modulus 4, remainder 0)",
+        "drop table public.{n}_m1; \
+         create table public.{n}_m1 partition of public.{n}_m \
+             for values with (modulus 4, remainder 1); \
+         insert into public.{n}_m1 (id, k) select 7100 + k, k from generate_series(8, 15) k \
+             where satisfies_hash_partition('public.{n}_m'::regclass, 4, 1, k)",
+    ][index];
+    let op = op.replace("{n}", part.name()).replace("{t}", part.table());
+    run_lifecycle_case(part, &two_level(part), &op).await;
+}
+
+case_tests! {
+    two_level_case:
+    0 => two_level_drop_a_leaf_fact, two_level_drop_a_leaf_dim;
+    1 => two_level_detach_a_leaf_fact, two_level_detach_a_leaf_dim;
+    2 => two_level_truncate_a_leaf_fact, two_level_truncate_a_leaf_dim;
+    3 => two_level_drop_the_middle_node_fact, two_level_drop_the_middle_node_dim;
+    4 => two_level_truncate_the_middle_node_fact, two_level_truncate_the_middle_node_dim;
+    5 => two_level_detach_and_drop_the_middle_node_fact, two_level_detach_and_drop_the_middle_node_dim;
+    6 => two_level_reattach_a_loaded_leaf_fact, two_level_reattach_a_loaded_leaf_dim;
+    7 => two_level_recreate_a_leaf_loaded_fact, two_level_recreate_a_leaf_loaded_dim;
 }
 
 /// X12-7b: a `DEFAULT` as the node operated on: attached loaded, truncated,
 /// detached, dropped; with siblings, and alone.
-#[tokio::test]
-async fn every_operation_on_a_default_converges() {
-    for part in BOTH {
-        let (t, n) = (part.table(), part.name());
-        let with_siblings = format!(
-            "{} create table public.{n}_a partition of {t} for values from (0) to (8); \
-             create table public.{n}_d partition of {t} default;",
-            head(part, "range")
-        );
-        let alone = format!(
-            "{} create table public.{n}_d partition of {t} default;",
-            head(part, "list")
-        );
-        for (schema, op) in [
-            (&with_siblings, "truncate public.{n}_d"),
-            (&with_siblings, "drop table public.{n}_d"),
-            (
-                &with_siblings,
-                "alter table {t} detach partition public.{n}_d",
-            ),
-            (
-                &with_siblings,
-                "alter table {t} detach partition public.{n}_d; \
-                 insert into public.{n}_d (id, k) values (8000, 30); \
-                 alter table {t} attach partition public.{n}_d default",
-            ),
-            (
-                &with_siblings,
-                "drop table public.{n}_a; insert into {t} (id, k) values (8100, 2)",
-            ),
-            (&alone, "truncate public.{n}_d"),
-            (&alone, "drop table public.{n}_d"),
-            (
-                &alone,
-                "alter table {t} detach partition public.{n}_d; \
-                 insert into public.{n}_d (id, k) values (8000, 30); \
-                 alter table {t} attach partition public.{n}_d default",
-            ),
-        ] {
-            let op = op.replace("{n}", n).replace("{t}", t);
-            let what = format!("{part:?}: {op}");
-            let mut fx = Fx::start(part, schema, SEED).await;
-            fx.exec(&op).await;
-            fx.correct().await;
-            fx.correct().await;
-            fx.assert_right(&what).await;
-            assert!(fx.queue().await.is_empty(), "{what}");
-        }
-    }
+async fn default_case(part: Part, index: usize) {
+    let (t, n) = (part.table(), part.name());
+    let with_siblings = format!(
+        "{} create table public.{n}_a partition of {t} for values from (0) to (8); \
+         create table public.{n}_d partition of {t} default;",
+        head(part, "range")
+    );
+    let alone = format!(
+        "{} create table public.{n}_d partition of {t} default;",
+        head(part, "list")
+    );
+    let (schema, op) = [
+        (&with_siblings, "truncate public.{n}_d"),
+        (&with_siblings, "drop table public.{n}_d"),
+        (
+            &with_siblings,
+            "alter table {t} detach partition public.{n}_d",
+        ),
+        (
+            &with_siblings,
+            "alter table {t} detach partition public.{n}_d; \
+             insert into public.{n}_d (id, k) values (8000, 30); \
+             alter table {t} attach partition public.{n}_d default",
+        ),
+        (
+            &with_siblings,
+            "drop table public.{n}_a; insert into {t} (id, k) values (8100, 2)",
+        ),
+        (&alone, "truncate public.{n}_d"),
+        (&alone, "drop table public.{n}_d"),
+        (
+            &alone,
+            "alter table {t} detach partition public.{n}_d; \
+             insert into public.{n}_d (id, k) values (8000, 30); \
+             alter table {t} attach partition public.{n}_d default",
+        ),
+    ][index];
+    let op = op.replace("{n}", n).replace("{t}", t);
+    run_lifecycle_case(part, schema, &op).await;
+}
+
+case_tests! {
+    default_case:
+    0 => default_truncate_with_siblings_fact, default_truncate_with_siblings_dim;
+    1 => default_drop_with_siblings_fact, default_drop_with_siblings_dim;
+    2 => default_detach_with_siblings_fact, default_detach_with_siblings_dim;
+    3 => default_reattach_loaded_with_siblings_fact, default_reattach_loaded_with_siblings_dim;
+    4 => default_sibling_dropped_then_a_row_fact, default_sibling_dropped_then_a_row_dim;
+    5 => default_truncate_alone_fact, default_truncate_alone_dim;
+    6 => default_drop_alone_fact, default_drop_alone_dim;
+    7 => default_reattach_loaded_alone_fact, default_reattach_loaded_alone_dim;
 }
 
 /// X12-7c: the `HASH` leaves of modulus 2 detached and re-attached, with new
