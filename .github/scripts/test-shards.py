@@ -182,7 +182,7 @@ def cmd_plan():
 
 
 def built_units(json_lines):
-    """The units whose test executables a `--message-format=json` build made."""
+    """The units whose test executables a `--message-format=json*` build made."""
     got = set()
     for line in json_lines:
         try:
@@ -215,8 +215,14 @@ def cmd_run(shard):
     if sel:
         # Build first, so the binaries cargo made can be checked against the
         # assignment before any test runs. The run below reuses this build.
+        # `json-render-diagnostics`: plain `json` would bury compiler errors
+        # and warnings in the captured stdout, leaving the log only "could
+        # not compile".
         build = subprocess.run(
-            ["cargo", "test", *CARGO_FLAGS, *sel, "--no-run", "--message-format=json"],
+            [
+                "cargo", "test", *CARGO_FLAGS, *sel, "--no-run",
+                "--message-format=json-render-diagnostics",
+            ],
             cwd=ROOT,
             stdout=subprocess.PIPE,
             text=True,
