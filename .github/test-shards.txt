@@ -199,4 +199,5 @@ bin:engine_subprocess 0.0
 bin:generative 0.0
 test:binary 0.0
 test:log_bridge_conflict 0.0
+test:pg_partman 0.0  # every test is #[ignore]d (opt-in pg_partman tier)
 bin:trellis-testkit 1.0  # not in the log (no tests ran, or the log is partial)

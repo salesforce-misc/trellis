@@ -7,12 +7,18 @@
 //! uses):
 //!
 //! ```text
-//! # once per PG version (a PGXS build; no Trellis code needs superuser, the
-//! # test cluster is ours):
+//! # once per PG version: a PGXS build into that version's own tree (no
+//! # Trellis code needs superuser; the test cluster is ours). `make clean`
+//! # between versions, or the next install reuses objects built against the
+//! # previous version's headers. With asdf's Postgres:
 //! git clone --branch v5.2.4 https://github.com/pgpartman/pg_partman
-//! make -C pg_partman PG_CONFIG=$(which pg_config) install
+//! for v in 15.19 16.15 17.11 18.6; do
+//!   make -C pg_partman clean
+//!   make -C pg_partman PG_CONFIG=$HOME/.asdf/installs/postgres/$v/bin/pg_config install
+//! done
 //!
-//! cargo test -p trellis --test pg_partman -- --ignored --test-threads 2
+//! ASDF_POSTGRES_VERSION=17.11 \
+//!   cargo test -p trellis --test pg_partman -- --ignored --test-threads 3
 //! ```
 //!
 //! `ASDF_POSTGRES_VERSION=15.19` (and so on) picks the server. Each case
@@ -558,7 +564,7 @@ async fn run_mode(mode: Mode) {
     let sql = format!(
         "{}; {}; update public.ev set b = b + 100 where a = 2; \
          insert into {leaf} (k, a, b) values ({key0}, 9, 9); \
-         update {leaf} set b = b + 1; delete from {leaf} where a = 3",
+         update {leaf} set b = b + 1; delete from {leaf} where b % 2 = 0",
         h.mode.insert("public.ev", near),
         h.mode.insert("public.ev", (near.0, near.0 + 2)),
     );
@@ -613,6 +619,30 @@ async fn run_mode(mode: Mode) {
         }
     }
 
+    // Writes straight to a leaf pg_partman created after the readers were
+    // defined: only the pass's adoption of the leaf captures them.
+    if wrote_default {
+        match h.leaf_of(h.mode.mid.0).await {
+            Some(new_leaf) if !new_leaf.ends_with("default") => {
+                let key = h.mode.key(&h.mode.mid.0.to_string());
+                h.run(
+                    "writes straight to a leaf maintenance created",
+                    &format!(
+                        "insert into {new_leaf} (k, a, b) values ({key}, 3, 7); \
+                         update {new_leaf} set b = b + 1 where a = 1; \
+                         delete from {new_leaf} where a = 3"
+                    ),
+                )
+                .await;
+                h.check("writes straight to a leaf maintenance created")
+                    .await;
+            }
+            other => h.failures.push(format!(
+                "[{name}] no new leaf holds the moved rows: {other:?}"
+            )),
+        }
+    }
+
     // Concurrent writers (through the parent, and straight to a leaf) while
     // maintenance creates leaves and the reconcile pass runs.
     let leaf = h.leaf_of(near.0 + 1).await.unwrap_or(leaf);
@@ -638,7 +668,7 @@ async fn run_mode(mode: Mode) {
     let leaf_ops = vec![
         format!("insert into {leaf} (k, a, b) values ({key0}, 1, 7)"),
         format!("update {leaf} set b = b + 1 where a = 1"),
-        format!("delete from {leaf} where a = 1 and b % 3 = 0"),
+        format!("delete from {leaf} where b % 3 = 0"),
     ];
     let w1 = tokio::spawn(writer(h.db.dsn().to_string(), parent_ops, 150));
     let w2 = tokio::spawn(writer(h.db.dsn().to_string(), leaf_ops, 150));
@@ -678,22 +708,29 @@ async fn run_mode(mode: Mode) {
         "select partman.run_maintenance('public.ev')",
     )
     .await;
-    h.check("retention detaches the oldest leaves").await;
+    // Writes to a detached leaf are not the source's: before the next pass
+    // (the capture functions' own guard) and after it.
     let detached = rows(
         &h.raw,
         "select c.oid::regclass::text from pg_class c \
-         where c.relkind = 'r' and c.relispartition = false and c.relname like 'ev\\_p%' \
+         where c.relkind in ('r', 'p') and c.relispartition = false and c.relname like 'ev\\_p%' \
          order by 1 limit 1",
     )
     .await;
-    if let Some(Some(d)) = detached.first().map(|r| r[0].clone()) {
-        h.run(
-            "write to a detached table",
-            &format!("update {d} set b = b + 5; delete from {d} where a = 0"),
-        )
-        .await;
-        h.check("writes to a detached leaf are not the source's")
-            .await;
+    match detached.first().and_then(|r| r[0].clone()) {
+        Some(d) => {
+            let write = format!("update {d} set b = b + 5; delete from {d} where a = 0");
+            h.run("write to a detached table before a pass", &write)
+                .await;
+            h.check("retention detaches the oldest leaves, one written before a pass")
+                .await;
+            h.run("write to a detached table after a pass", &write)
+                .await;
+            h.check("writes to a detached leaf after a pass").await;
+        }
+        None => h
+            .failures
+            .push(format!("[{name}] retention detached no leaf")),
     }
     h.run(
         "retention drops",
@@ -798,9 +835,10 @@ fn worker_log(h: &Harness) -> (usize, usize) {
 }
 
 /// `pg_partman_bgw` runs `run_maintenance_proc` on its own schedule (1 s
-/// here) while Trellis's pass runs and writers insert through the parent:
-/// with no operator step the readers match the source at every tick the
-/// writers are quiet, and the worker's premake and retention both happen.
+/// here) while Trellis's pass runs and writers insert through the parent and
+/// straight to a leaf: once the worker has changed the leaves (its premake
+/// and retention), the readers match the source with no operator step, and
+/// again after further runs.
 #[tokio::test]
 #[ignore = "needs pg_partman; see the module doc"]
 async fn partman_background_worker() {
@@ -875,7 +913,18 @@ async fn partman_background_worker_blocked_by_rows_in_the_default() {
         "update partman.part_config set premake = 8 where parent_table = 'public.ev'",
     )
     .await;
-    for tick in 0..6 {
+    // Passes until the worker has failed on the DEFAULT's rows three times,
+    // against a deadline rather than a fixed number of ticks, so a loaded
+    // box only waits longer.
+    let refusals = |h: &Harness| {
+        std::fs::read_to_string(h._cluster.root().join("postgres.log"))
+            .unwrap_or_default()
+            .matches("for default partition \"ev_default\" would be violated")
+            .count()
+    };
+    let start = Instant::now();
+    let mut tick = 0;
+    while refusals(&h) < 3 && start.elapsed() < Duration::from_secs(60) {
         full_pass(&mut h.raw, &h.db.pool).await;
         run_backfill_chunks(&h.db.pool).await;
         drain_to_quiescence(&h.db.pool, &mut h.raw).await;
@@ -883,25 +932,35 @@ async fn partman_background_worker_blocked_by_rows_in_the_default() {
             "[bgw-blocked] tick {tick}: {:?}",
             oracle_diff(&h.raw, h.mode.group).await
         );
-        tokio::time::sleep(Duration::from_millis(700)).await;
+        tick += 1;
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
     let (runs, failed) = worker_log(&h);
     println!(
-        "[bgw-blocked] leaves {leaves_before} -> {}; {runs} runs, {failed} failed",
-        leaf_count(&h.raw).await
+        "[bgw-blocked] leaves {leaves_before} -> {}; {runs} runs, {failed} failed, \
+         {} refused on the DEFAULT's rows",
+        leaf_count(&h.raw).await,
+        refusals(&h)
     );
     h.check("beside a worker that cannot attach").await;
-    assert!(failed > 0 && leaf_count(&h.raw).await == leaves_before);
+    assert!(
+        refusals(&h) >= 3,
+        "the worker did not fail on the DEFAULT's rows three times in 60 s"
+    );
+    assert_eq!(leaf_count(&h.raw).await, leaves_before);
     assert!(h.failures.is_empty(), "{:#?}", h.failures);
 }
 
 /// X12-8d: does pg_partman's DEFAULT hit the accepted "DEFAULT plus
 /// short-lived leaf" gap? Retention drops leaves that lived through many
-/// passes, so the realistic case is a leaf the pass recorded. The worst case
-/// is a brand-new leaf (premake raised), written through the parent, applied
-/// by the staging worker and dropped before any pass saw it: that is checked
-/// too, and converged when this was written (the gap's own entry names the
-/// shape that does not).
+/// passes, so the realistic case is a leaf the pass recorded. The case closest
+/// to the gap that pg_partman builds is a brand-new leaf (premake raised),
+/// written through the parent, applied by the staging worker and dropped
+/// before any pass saw it. It converges because the same `run_maintenance`
+/// made the leaf's neighbours too, and they stay: the next pass sees a tree
+/// that changed. The gap needs the tree to look the same at both passes (one
+/// leaf created and removed in between, by hand), which pg_partman's
+/// maintenance does not do.
 #[tokio::test]
 #[ignore = "needs pg_partman; see the module doc"]
 async fn partman_default_beside_short_lived_and_retired_leaves() {
