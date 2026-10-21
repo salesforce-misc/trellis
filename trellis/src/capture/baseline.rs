@@ -75,6 +75,12 @@
 //! key: `pause_readers_of_retyped` owns a key column's type (#760). A key
 //! column dropped and re-added is R1's.
 //!
+//! # A type renamed
+//!
+//! A type renamed or moved to another schema keeps its oid and its values,
+//! so it is none of the above: [`follow_renamed_types`] re-records its name,
+//! before the key-type check compares names, and nothing pauses or rebuilds.
+//!
 //! # What it misses, and what it rebuilds for nothing
 //!
 //! A metadata `ALTER` (`SET DEFAULT`, `SET STATISTICS`) on the same column,
@@ -383,6 +389,123 @@ pub(crate) async fn forget_except(
             &[(&keep, Type::TEXT_ARRAY)],
         )
         .await?;
+    Ok(())
+}
+
+/// Re-records the name of a type renamed or moved to another schema since
+/// the baseline (`ALTER TYPE ... RENAME TO`, `... SET SCHEMA`), in place
+/// (#1204): a read column whose type oid and modifier are as the baseline
+/// recorded and whose `schema.typname` is not. The type's values are what
+/// they were, so nothing pauses, rebuilds or reinstalls; Trellis only has to
+/// cast by the name the type has now.
+///
+/// A type's name is persisted in each definition's `source_columns` and
+/// `join_columns` (as `enum:schema.typname`), in `definition_key_types`, and
+/// in the baseline itself. They are rewritten in one transaction, for every
+/// definition that records the old name (the rename is the type's, not this
+/// table's, and a chained definition's key columns on a table Trellis
+/// creates have no baseline of their own), under those definitions' row
+/// locks taken in id order, the locks a pass takes for any re-record. Each
+/// of them also asks for the release of its keys held for `42704`, the
+/// failure of a cast by the name the type no longer has
+/// (`retype_releases`, released by
+/// `staging::quarantine::release_retyped_keys` after the pass).
+///
+/// Runs before `pause_readers_of_retyped`, which compares the name recorded
+/// for a key column with the live one. A column whose oid or modifier moved
+/// is not a rename: [`check`] and that function respond to it.
+pub(crate) async fn follow_renamed_types(
+    client: &mut Client,
+    table: &str,
+) -> Result<(), CaptureError> {
+    let baseline = recorded(&*client, table).await?;
+    if baseline.is_empty() {
+        return Ok(());
+    }
+    let columns: Vec<String> = baseline
+        .keys()
+        .map(|(_, name)| name.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let live = live(&*client, table, &columns).await?;
+    let mut renamed: BTreeMap<String, String> = BTreeMap::new();
+    for (key, was) in &baseline {
+        if let Some(now) = live.get(key)
+            && (was.type_oid, was.ty.typmod) == (now.type_oid, now.ty.typmod)
+            && was.ty.type_name != now.ty.type_name
+        {
+            renamed.insert(was.ty.type_name.clone(), now.ty.type_name.clone());
+        }
+    }
+    if renamed.is_empty() {
+        return Ok(());
+    }
+    let txn = client.transaction().await?;
+    for (old, new) in &renamed {
+        let (old_token, new_token) = (format!("enum:{old}"), format!("enum:{new}"));
+        let owners: Vec<i64> = txn
+            .query(
+                "select id from transform_definitions d \
+                 where exists (select 1 from jsonb_each_text(d.source_columns) e where e.value = $1) \
+                    or exists (select 1 from jsonb_each_text(d.join_columns) e where e.value = $1) \
+                    or exists (select 1 from definition_key_types k \
+                               where k.transform_id = d.id and k.type_name = $2)",
+                &[&old_token, &old],
+            )
+            .await?
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        if !owners.is_empty() {
+            txn.execute(
+                "select 1 from transform_definitions where id = any($1) order by id for update",
+                &[&owners],
+            )
+            .await?;
+            txn.execute(
+                "update transform_definitions d set \
+                     source_columns = (select coalesce(jsonb_object_agg(e.key, \
+                         case when e.value = to_jsonb($2::text) then to_jsonb($3::text) \
+                              else e.value end), '{}'::jsonb) \
+                         from jsonb_each(d.source_columns) e), \
+                     join_columns = case when d.join_columns is null then null else \
+                         (select coalesce(jsonb_object_agg(e.key, \
+                             case when e.value = to_jsonb($2::text) then to_jsonb($3::text) \
+                                  else e.value end), '{}'::jsonb) \
+                          from jsonb_each(d.join_columns) e) end \
+                 where d.id = any($1)",
+                &[&owners, &old_token, &new_token],
+            )
+            .await?;
+            txn.execute(
+                "update definition_key_types set type_name = $2 \
+                 where transform_id = any($1) and type_name = $3",
+                &[&owners, new, old],
+            )
+            .await?;
+            txn.execute(
+                "insert into retype_releases (transform_id, sqlstate) \
+                 select id, '42704' from unnest($1::int8[]) as id \
+                 on conflict (transform_id, sqlstate) do update set requested_at = now()",
+                &[&owners],
+            )
+            .await?;
+        }
+        txn.execute(
+            "update capture_baselines set type_name = $3 where table_name = $1 and type_name = $2",
+            &[&table, old, new],
+        )
+        .await?;
+        crate::instance_log::info!(
+            table = %table,
+            from = %old,
+            to = %new,
+            definitions = owners.len(),
+            "a type was renamed; recorded its new name"
+        );
+    }
+    txn.commit().await?;
     Ok(())
 }
 

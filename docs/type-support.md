@@ -330,9 +330,15 @@ two columns of different enum types are never joinable.
 Postgres refuses a `DROP TYPE` of an enum while a column Trellis created
 uses it, and the retype or drop of the source column that has to come first
 pauses the definitions that read it, so the drop can follow their `RESUME`
-or `DROP TRANSFORM`. Renaming the type (`ALTER TYPE … RENAME`) fails the
-drain for its 1-1 readers until their keys are held, and pauses its `GROUP
-BY` readers ([#1204](https://github.com/salesforce-misc/trellis/issues/1204)).
+or `DROP TRANSFORM`.
+
+Renaming the type (`ALTER TYPE … RENAME TO`) or moving it to another schema
+(`… SET SCHEMA`) is followed in place. The type keeps its OID and every value,
+so the staging worker's capture pass, on seeing a read column whose OID is as
+recorded and whose qualified name is not, records the new name where Trellis
+casts by it and releases the keys a drain held for the old name. Nothing
+pauses or rebuilds. `ALTER TYPE … RENAME VALUE` relabels the values in the
+columns Trellis created too.
 
 ## `array_agg` and `string_agg`
 

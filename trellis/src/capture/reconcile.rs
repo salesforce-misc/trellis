@@ -298,6 +298,13 @@ pub async fn reconcile(
                 continue;
             }
         }
+        // #1204: a type renamed or moved to another schema keeps its oid and
+        // its values; its name is re-recorded where Trellis casts by it, and
+        // the key-type check below then finds the name it recorded.
+        if let Err(err) = super::baseline::follow_renamed_types(client, table).await {
+            outcome.failed.push((table.clone(), err));
+            continue;
+        }
         // #760, #767: a key column whose type or collation define would
         // refuse now, a join pair that no longer matches, a type change that
         // renders the stored keys differently, or a widening past a typed
