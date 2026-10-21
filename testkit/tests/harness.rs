@@ -309,3 +309,48 @@ async fn a_default_cluster_leaves_the_database_for_its_own_teardown() {
     drop(cluster);
     assert!(!root.exists());
 }
+
+async fn system_identifier(cluster: &TestCluster) -> String {
+    let db = cluster.create_empty_database().await;
+    let row = db
+        .pool
+        .get()
+        .await
+        .expect("acquire connection")
+        .query_one(
+            "select system_identifier::text from pg_control_system()",
+            &[],
+        )
+        .await
+        .expect("pg_control_system");
+    row.get(0)
+}
+
+#[tokio::test]
+async fn clusters_share_the_templates_identifier_unless_started_with_initdb() {
+    let a = TestCluster::start();
+    let b = TestCluster::start();
+    let own = TestCluster::start_initdb();
+    assert_eq!(system_identifier(&a).await, system_identifier(&b).await);
+    assert_ne!(system_identifier(&a).await, system_identifier(&own).await);
+}
+
+#[tokio::test]
+async fn an_isolated_database_is_migrated_with_or_without_the_template() {
+    for cluster in [TestCluster::start(), TestCluster::start_initdb()] {
+        let db = cluster.create_isolated_database().await;
+        let row = db
+            .pool
+            .get()
+            .await
+            .expect("acquire connection")
+            .query_one(
+                "select count(*) from information_schema.tables \
+                 where table_name = 'refinery_schema_history'",
+                &[],
+            )
+            .await
+            .expect("query tables");
+        assert_eq!(row.get::<_, i64>(0), 1);
+    }
+}

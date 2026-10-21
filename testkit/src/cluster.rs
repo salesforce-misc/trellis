@@ -28,6 +28,20 @@
 //! with it either; it's reparented and keeps running, so the reaper also stops
 //! a postmaster whose owning test process is gone (#576).
 //!
+//! **Template.** `initdb` and the migrations run once per engine build, not
+//! once per test: the `template` module keeps a migrated data directory under
+//! `trellis-template-<key>` in the temp dir, shared by every test binary and
+//! built behind a file lock. [`TestCluster::start`] copies it and starts its
+//! own postmaster on the copy, and [`TestCluster::create_isolated_database`]
+//! is `createdb -T trellis_template`. The reaper never touches a template: it
+//! only sweeps `trellis-testkit-*`. Two things follow from the copy. Every
+//! cluster started this way has the same `system_identifier` (as a
+//! [`TestCluster::from_backup`] copy already shares its source's), and holds a
+//! `trellis_template` database next to the test's own. A test that needs two
+//! servers with different identifiers (a restore into another cluster, a
+//! `pg_upgrade`) starts them with [`TestCluster::start_initdb`];
+//! [`TestCluster::start_in`] also runs `initdb`.
+//!
 //! **Teardown.** Dropping a cluster stops the postmaster with SIGQUIT (the
 //! immediate shutdown `pg_ctl stop -m immediate` sends) and waits on the
 //! child, falling back to `pg_ctl` and then SIGKILL; whichever way it dies,
@@ -52,6 +66,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, Once, PoisonError};
 use std::time::{Duration, Instant};
 use trellis::{Config, Pool, migrate};
+
+mod template;
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -240,6 +256,9 @@ pub struct TestCluster {
     /// must drop its database when it goes. See
     /// [`TestCluster::long_lived`].
     long_lived: bool,
+    /// Whether the data directory is a copy of the migrated template, so the
+    /// server holds [`template::TEMPLATE_DB`] to clone databases from.
+    from_template: bool,
     // Behind a `Mutex` so [`TestCluster::restart`] can replace the process
     // through a shared reference: the generative suite keeps its cluster in
     // a `thread_local` and only ever hands out `&TestCluster`.
@@ -293,7 +312,18 @@ impl TestCluster {
     /// first, as [`TestCluster::start`] does for the temp dir.
     pub fn start_in(parent: &Path) -> Self {
         reap_orphans_in(parent);
-        Self::start_listening_in(parent, false)
+        Self::start_listening_in(parent, false, DataDirSource::Initdb)
+    }
+
+    /// [`TestCluster::start`], but with a data directory of its own from
+    /// `initdb` rather than a copy of the shared template, so the cluster has
+    /// its own `system_identifier` (every other cluster here shares one) and
+    /// no `trellis_template` database. For a test that simulates two
+    /// distinct servers, such as a restore into a different cluster or a
+    /// `pg_upgrade`. Costs ~300 ms more than [`TestCluster::start`].
+    pub fn start_initdb() -> Self {
+        reap_orphans_once();
+        Self::start_listening_in(&std::env::temp_dir(), false, DataDirSource::Initdb)
     }
 
     fn start_listening(tcp: bool) -> Self {
@@ -303,10 +333,14 @@ impl TestCluster {
         // this process's segments directly, so nothing new to reap accrues
         // from us mid-run.
         reap_orphans_once();
-        Self::start_listening_in(&std::env::temp_dir(), tcp)
+        Self::start_listening_in(&std::env::temp_dir(), tcp, DataDirSource::Template)
     }
 
-    fn start_listening_in(parent: &Path, tcp: bool) -> Self {
+    fn start_listening_in(parent: &Path, tcp: bool, source: DataDirSource) -> Self {
+        // The template is built (or found) before taking a permit: building
+        // it starts a cluster of its own, and a thread holding a permit while
+        // it waits for that one could starve it.
+        let template = (source == DataDirSource::Template).then(template::data_dir);
         // Gate concurrent clusters before any `initdb`; a local so setup
         // panics release it, then moved into the returned cluster.
         let permit = CLUSTERS.acquire();
@@ -316,20 +350,24 @@ impl TestCluster {
         let socket_dir = root.join("sock");
         fs::create_dir_all(&socket_dir).expect("create socket dir");
 
-        // `initdb`'s bootstrap backend transiently allocates a SysV segment,
-        // so on a machine whose small system-wide table (macOS `shmmni`
-        // defaults to 32) is under pressure from other Postgres instances it
-        // can fail spuriously. Retry a few times with backoff before giving
-        // up — the pressure is transient as other segments are freed.
-        run_with_retries(
-            || {
-                // A failed `initdb` can leave a partial data dir it would then
-                // refuse to reuse, so clear it before each attempt.
-                let _ = fs::remove_dir_all(&data_dir);
-                initdb_command(&data_dir)
-            },
-            "initdb",
-        );
+        if let Some(template) = template {
+            copy_data_dir(template, &data_dir);
+        } else {
+            // `initdb`'s bootstrap backend transiently allocates a SysV segment,
+            // so on a machine whose small system-wide table (macOS `shmmni`
+            // defaults to 32) is under pressure from other Postgres instances it
+            // can fail spuriously. Retry a few times with backoff before giving
+            // up — the pressure is transient as other segments are freed.
+            run_with_retries(
+                || {
+                    // A failed `initdb` can leave a partial data dir it would then
+                    // refuse to reuse, so clear it before each attempt.
+                    let _ = fs::remove_dir_all(&data_dir);
+                    initdb_command(&data_dir)
+                },
+                "initdb",
+            );
+        }
 
         // Unix-socket-only clusters all share 5432: the port only names the
         // socket file, which lives in each cluster's own directory. A TCP
@@ -348,6 +386,7 @@ impl TestCluster {
             port,
             tcp,
             long_lived: false,
+            from_template: template.is_some(),
             server: Mutex::new(server),
             _permit: permit,
         };
@@ -488,6 +527,8 @@ impl TestCluster {
             port,
             tcp: false,
             long_lived: false,
+            // The backup's own databases are what it has.
+            from_template: false,
             server: Mutex::new(server),
             _permit: permit,
         };
@@ -589,6 +630,25 @@ impl TestCluster {
     /// [`TestDatabase`] is dropped, so concurrent callers against the same
     /// [`TestCluster`] never see each other's tables or data.
     pub async fn create_isolated_database(&self) -> TestDatabase {
+        if self.from_template {
+            // A copy of the migrated template database, ~20 ms against ~90
+            // for creating and migrating one.
+            let name = format!("trellis_test_{}", unique_suffix());
+            run_to_completion(
+                Command::new("createdb")
+                    .arg("-h")
+                    .arg(&self.socket_dir)
+                    .arg("-p")
+                    .arg(self.port.to_string())
+                    .arg("-U")
+                    .arg("postgres")
+                    .arg("-T")
+                    .arg(template::TEMPLATE_DB)
+                    .arg(&name),
+                "createdb -T",
+            );
+            return self.test_database(name);
+        }
         let db = self.create_empty_database().await;
         Self::migrate(&db).await;
         db
@@ -1215,6 +1275,15 @@ fn process_alive(pid: i32) -> bool {
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
+}
+
+/// Where a new cluster's data directory comes from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DataDirSource {
+    /// A copy of the shared migrated template (see the `template` module).
+    Template,
+    /// A fresh `initdb`.
+    Initdb,
 }
 
 /// The `initdb` every test (and benchmark) cluster is made with.
