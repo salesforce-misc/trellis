@@ -22,10 +22,10 @@
 //! A migration must never rebuild `partition_sources`, `capture_baselines` or
 //! `capture_triggers`
 //! by create-copy-rename; use `ALTER`. Rows copied into a new table look
-//! exactly like a dump and restore: `partition_sources` records the oid of
-//! the table that holds each row, and a stored oid that no longer names it
-//! pauses every definition over a partitioned source (ADR-0017). Any
-//! `ALTER`, rewriting or not, keeps the oid.
+//! exactly like a dump and restore: `partition_sources` and
+//! `capture_triggers` record the oid of the table that holds each row, and a
+//! stored oid that no longer names it pauses every definition
+//! (`capture::restore`). Any `ALTER`, rewriting or not, keeps the oid.
 
 mod embedded {
     #![allow(clippy::needless_raw_string_hashes)]

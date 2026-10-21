@@ -36,7 +36,9 @@
 //!   from on `RESUME`. Nothing staged before the detection ever applies. The
 //!   segment registry starts again with it, because its fences and transaction
 //!   ids are the original cluster's and would hold the seal gate until this
-//!   cluster's counter passed them;
+//!   cluster's counter passed them, and the slot writers append to is the
+//!   active segment's again. A change captured after the detection stays in
+//!   the ring;
 //! - what the dump brought of the capture record (triggers, baselines,
 //!   partition trees, queued corrections) and of the backfill bookkeeping
 //!   (markers, resume requests) is forgotten: the next pass
@@ -122,6 +124,16 @@ pub(crate) async fn respond(client: &mut Client, recheck: bool) -> Result<bool, 
     .await?;
     txn.execute("update segment_pointer set active_seq = $1", &[&next])
         .await?;
+    // Writers resolve their slot from `ring_slot_mirror`, which a dump reads
+    // outside its snapshot: taken during a seal, it names another slot than
+    // the restored pointer, and every write until the next seal would land in
+    // a slot no segment covers. Pointed at the active slot again (`setval` is
+    // not transactional; the value is the pointer's either way).
+    txn.execute(
+        "select pg_catalog.setval('ring_slot_mirror', ring_slot, true) from segment_pointer",
+        &[],
+    )
+    .await?;
     // A resume request was made against the original database's state.
     txn.batch_execute(
         "delete from resume_requests; \

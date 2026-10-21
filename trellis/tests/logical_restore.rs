@@ -529,6 +529,13 @@ async fn a_logical_restore_behind_the_original_pauses_everything_and_resume_conv
         ring_rows(&raw).await >= 6,
         "the dump holds the pending ring rows"
     );
+    // A dump reads the slot mirror outside its snapshot: one taken during a
+    // seal carries a mirror naming another slot than the pointer.
+    raw.batch_execute(
+        "select setval('ring_slot_mirror', (ring_slot + 2) % 4, true) from segment_pointer",
+    )
+    .await
+    .expect("skew the slot mirror");
 
     capture_pass(&mut raw, &restored.pool).await;
     assert_paused_by_the_restore(&raw, &trellis).await;
@@ -536,7 +543,39 @@ async fn a_logical_restore_behind_the_original_pauses_everything_and_resume_conv
     capture_pass(&mut raw, &restored.pool).await;
     assert_paused_by_the_restore(&raw, &trellis).await;
 
+    // Writes between the detection and the resume. The insert is staged in
+    // the active segment's slot: a write staged in another slot would sit
+    // where no seal looks (the worker seals only a non-empty active
+    // segment), and no change after the restore would ever apply. The
+    // resume's rebuild covers both writes.
+    raw.batch_execute(
+        "update public.s1 set v = 555 where id = 5; insert into public.s1 values (20, 200)",
+    )
+    .await
+    .expect("writes while paused");
+    let slot: i16 = raw
+        .query_one("select ring_slot from segment_pointer", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        (
+            count(&raw, &format!("select count(*) from seg_{slot}")).await,
+            ring_rows(&raw).await
+        ),
+        (1, 1),
+        "the insert is staged in the active segment's slot"
+    );
+
     resume_and_write(&mut raw, &trellis, &restored.pool).await;
+    assert_eq!(
+        rows(
+            &raw,
+            "select v::text from public.one where id in (5, 20) order by id"
+        )
+        .await,
+        vec![vec![Some("555".to_string())], vec![Some("200".to_string())]]
+    );
 }
 
 /// A restore into another database of the same cluster, whose counters only
