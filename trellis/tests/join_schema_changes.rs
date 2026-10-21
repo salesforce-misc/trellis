@@ -200,7 +200,9 @@ async fn no_table_a_join_or_group_basis_creates_holds_a_bounded_varchar() {
         "create table public.a (id varchar(5) primary key, g varchar(5), \
                                 k varchar(5), x integer); \
          create table public.b (id varchar(5) primary key, k varchar(5), \
-                                h varchar(5), y integer)",
+                                h varchar(5), y integer); \
+         create index on public.a (k); create index on public.b (k); \
+         create index on public.a (g, k)",
         &[
             ("id", ValueType::Text),
             ("g", ValueType::Text),
