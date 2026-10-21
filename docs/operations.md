@@ -91,7 +91,8 @@ capture is still being widened.
 **What a rebuild doesn't repair.** A rebuild repairs anything that's wrong
 because a change was missed. On a 1-1 target it also deletes every row no
 source row backs, so it repairs rows edited, deleted, added or re-keyed by
-hand, and rows left under a truncated `varchar` key. It keeps:
+hand, and rows left under the old key of a `varchar` key column narrowed
+in place. It keeps:
 
 * an aggregate's group rows edited by hand, and a `MIN` or `MAX` over a
   re-collated column: the rebuild keeps the per-row ledger, with its
@@ -142,10 +143,10 @@ audit. What clears a held key:
   releases due keys with a growing backoff
   ([ADR-0003 — Retry policy](decisions/0003-quarantine-storage-and-api.md#retry-policy)).
 
-After a widening that changes only the catalog of a column Trellis copies
-with its type, the capture pass re-types the copy and then releases the keys
-it held for values the old type couldn't hold (`22001`, `22003`), in that pass
-and each pass for a minute more. A key held later than that stays held.
+After a `numeric` column Trellis copies with its type gains precision at the
+same scale, the capture pass re-types the copy and then releases the keys it
+held for values the old type couldn't hold (`22003`), in that pass and each
+pass for a minute more. A key held later than that stays held.
 
 ### A page that fails only for several definitions together
 

@@ -26,7 +26,6 @@ wrong rows, on the targets it compares
 |---|---|---|
 | **Schema changes Trellis can't tell from routine work** | | |
 | [A column's values rewritten in place by `ALTER COLUMN TYPE`](#a-columns-values-rewritten-in-place-by-alter-column-type) | `self_check` | [#1206](https://github.com/salesforce-misc/trellis/issues/1206) (study) |
-| [A space-padded value truncated after a `varchar` widening](#a-space-padded-value-truncated-after-a-varchar-widening) | `self_check` | [#1207](https://github.com/salesforce-misc/trellis/issues/1207) |
 | **Writes capture never sees** | | |
 | [Capture disrupted and restored between two passes](#capture-disrupted-and-restored-between-two-passes) | `self_check` | [#1206](https://github.com/salesforce-misc/trellis/issues/1206) (study), otherwise documented |
 | [An unlogged source emptied by a crash or failover](#an-unlogged-source-emptied-by-a-crash-or-failover) | `self_check` | documented |
@@ -122,33 +121,6 @@ a false-positive study of signals that would catch these shapes. Event
 triggers would see every rewrite but need superuser, and logical decoding has
 the same blind spot: `pgoutput` never sends a rewrite's rows. `MIN` and `MAX`
 leave with [#1105](https://github.com/salesforce-misc/trellis/issues/1105).
-
-### A space-padded value truncated after a `varchar` widening
-
-**When:** a source `varchar(n)` column is widened by changing only the
-catalog (to a longer `varchar`, to `varchar` or to `text`), and a value whose
-characters past `n` are all spaces (`'abcde   '` after `varchar(5)` became
-`varchar(40)`) is written and drained before the next reconcile pass
-re-types the column Trellis copied it into. The copies are a 1-1 target's key
-and passthrough columns, a `JOIN`'s `GROUP BY` and `ON` columns, and a to-one
-relationship's projection.
-
-**What goes wrong:** Postgres stores such a value truncated to `n` rather
-than refusing it, so the copy holds `'abcde'`. A truncated 1-1 key lands on
-the target row of the real key `'abcde'`, if there is one, and overwrites its
-values; if there isn't, it adds a row no source row backs. A `JOIN` counts
-the row in the truncated value's group. The re-type changes no value, so the
-copies keep the truncated values until the rows are written again, and a
-row added under a truncated key stays. Any other value too long for the copy
-fails, and its key is held until the re-type releases it.
-
-**Detected by:** `self_check`.
-
-**Repair:** after the pass has re-typed the copy, `PAUSE`/`RESUME` every
-transform that copies the column. A 1-1 rebuild also deletes a row left
-under a truncated key, which no source row backs.
-
-**Ends with:** [#1207](https://github.com/salesforce-misc/trellis/issues/1207).
 
 ## Writes capture never sees
 

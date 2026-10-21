@@ -339,36 +339,36 @@ it regenerates anything, it pauses the definition, with its
 The reason names each column, its old and new type, and each copy, and says
 what to do. Nothing clears it but a deliberate `RESUME`, or a drop.
 
+A string column never makes the fourth check pause (#1207): every column
+Trellis creates from a `varchar(n)` is an unbounded `varchar` with the source
+column's collation, which holds whatever the source column holds after any
+change of its bound, and `text` and `varchar(n)` source columns are one family
+to the check. So a source `varchar(n)` moved to `varchar(m)` or to `text`
+needs no action on the copies, and a value past the old bound, or one whose
+excess characters are all spaces, is stored as it is.
+
 The fourth check has one exception, which pauses nothing (#824). When every
 widened column of a table Trellis created widened by changing only the
 catalog, the pass re-types that table's columns itself. Only a 1-1 target's
 copies, a `JOIN`'s `GROUP BY` and `ON` copies (in its target and its hidden
 tables) and a relationship projection's can: Trellis types every other
-column by value family or by an expression, with no length or precision. The widenings that qualify
-are exactly `varchar(n)` to a longer `varchar(m)`, `varchar(n)` or
-`varchar` to `text`, `varchar(n)` to `varchar`, and `numeric(p,s)` to a
-larger precision at the same scale. `character(n)` changes and `text` to
-`varchar(n)` don't. Postgres then rewrites nothing, changes no value and
-keeps each index, so no definition pauses or rebuilds. A `varchar` key's
-widening is one of them: the key's copy is re-typed and its new type
-recorded. It runs one table per transaction, under the same lock timeout
-as a resume's re-type. A table whose re-type fails transiently (its lock
-not got in time, a deadlock, a statement timeout) is left as it is,
-nothing pauses, and the next pass tries again. A table where some column
-also needs a rewrite (`integer` to `bigint`) pauses as above. A table
-whose re-type fails for another reason (a view on the column) pauses too
-when some column there outgrew its type. When none did (`varchar` to
-`text`), its writes still succeed, so it pauses nothing and keeps its old
-types. Either way the worker doesn't try that re-type again, and so
-doesn't take the table's lock for it every pass, until the source's type
-changes again, a definition with a column there is defined or dropped, or
-the worker restarts.
+column by value family or by an expression, with no length or precision. The
+only widening that qualifies is `numeric(p,s)` to a larger precision at the
+same scale. Postgres then rewrites nothing, changes no value and keeps each
+index, so no definition pauses or rebuilds. It runs one table per
+transaction, under the same lock timeout as a resume's re-type. A table whose
+re-type fails transiently (its lock not got in time, a deadlock, a statement
+timeout) is left as it is, nothing pauses, and the next pass tries again. A
+table where some column also needs a rewrite (`integer` to `bigint`) pauses as
+above. A table whose re-type fails for another reason (a view on the column)
+pauses too. The worker doesn't try that re-type again, and so doesn't take the
+table's lock for it every pass, until the source's type changes again, a
+definition with a column there is defined or dropped, or the worker restarts.
 
 A value written after the source widened and before the pass re-typed the
-column failed its write with `22001` (too long) or `22003` (numeric
-overflow), and its key may be held. One whose excess characters are all
-spaces was stored truncated instead, which nothing repairs ([known correctness gaps — A space-padded value truncated after a `varchar` widening](../known-correctness-gaps.md#a-space-padded-value-truncated-after-a-varchar-widening)).
-The re-type's transaction records a release request (`retype_releases`) for
+column failed its write with `22003` (numeric overflow), and its key may be
+held. The re-type's transaction records a release request
+(`retype_releases`) for
 each definition with a column on the table. After the pass, the staging
 worker releases every key such a definition holds whose failure had that
 SQLSTATE (`poison.sqlstate`), through the same per-key release as
@@ -378,7 +378,8 @@ committing. A key held for any other failure stays held.
 
 Changes that need neither pause nothing: widening a key no copy holds (an
 aggregate's source key, which its ledger keys by text), a `GROUP BY` key's
-`varchar` widening or move to `text` (its copy is `text`), a `numeric`
+`varchar` widening or move to `text` (its copy is `text`), a string column's
+bound or move between `text` and `varchar` (its copies are unbounded), a `numeric`
 precision change or wider scale, or a wider timestamp precision, on a
 `GROUP BY` key (its copy is unconstrained), a narrowing every copy still
 holds, a change to a column read only as a field that every column typed

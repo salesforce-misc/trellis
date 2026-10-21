@@ -272,13 +272,14 @@ pause of a definition already frozen.
 
 Outside a resume, Trellis re-types a column on its own in one case: when every column
 of a table it created that the source widened widened by changing only the catalog.
-Exactly four widenings qualify: `varchar(n)` to a longer `varchar(m)`, `varchar(n)` or
-`varchar` to `text`, `varchar(n)` to `varchar`, and `numeric(p,s)` to a larger
-precision at the same scale. Postgres rewrites nothing for them, changes no value and
-keeps every index. The capture pass then re-types that table's columns itself, one
-table per transaction, under the same lock timeout as a resume's re-type, and nothing
-pauses or rebuilds, a `varchar` key's copy included. The pass records the key's new
-type, as a resume would. Its `ALTER` is the transaction's first statement, so it
+Exactly one widening qualifies: `numeric(p,s)` to a larger precision at the same scale.
+Postgres rewrites nothing for it, changes no value and keeps every index. The capture
+pass then re-types that table's columns itself, one table per transaction, under the
+same lock timeout as a resume's re-type, and nothing pauses or rebuilds. A string
+column needs none: every column Trellis creates from a `varchar(n)` is an unbounded
+`varchar` with the source column's collation, which holds whatever the source holds
+after any change of its bound, and `text` and `varchar(n)` are one family wherever a
+copy and its source column are compared. Its `ALTER` is the transaction's first statement, so it
 waits for the table's `ACCESS EXCLUSIVE` holding no other lock, and once it has the
 table it takes the locks of the table's own indexes and TOAST table, and of any
 object of the application's that depends on the column, such as a foreign key that
@@ -288,18 +289,13 @@ timeout. A cycle through an application object ends in a deadlock error, which c
 as transient. A table whose re-type fails transiently (its lock not got
 in time, a deadlock, a statement timeout) is left as it is, nothing pauses, and the
 next pass tries again. A table where some widened column needs a rewrite pauses its
-definitions as above, and so does one whose re-type fails otherwise while some column
-there outgrew its type. One whose columns all still hold every value (`varchar` to
-`text`) keeps its old types and pauses nothing, since its writes still succeed. The
+definitions as above, and so does one whose re-type fails otherwise. The
 worker doesn't retry a re-type that failed otherwise until the source's type changes
 again, a definition with a column on the table is defined or dropped, or the worker
 restarts, so it doesn't take the table's lock every pass.
 
-A value written between the source's `ALTER` and that re-type fails its write (`22001`
-or `22003`), and its key may be held. One whose characters past the old `varchar`
-length are all spaces is stored truncated instead, and stays so
-([known correctness gaps — A space-padded value truncated after a `varchar` widening](../known-correctness-gaps.md#a-space-padded-value-truncated-after-a-varchar-widening)).
-The re-type's transaction records a release request for each definition with a column
+A value written between the source's `ALTER` and that re-type fails its write (`22003`),
+and its key may be held. The re-type's transaction records a release request for each definition with a column
 on the table (`retype_releases`).
 After the pass, the staging worker releases each key such a definition holds whose
 failure had that SQLSTATE, recorded on its `poison` row, one key at a time through the

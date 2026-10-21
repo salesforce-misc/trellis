@@ -267,7 +267,7 @@ pub(crate) fn is_insufficient_privilege(err: &(dyn std::error::Error + 'static))
 /// The SQLSTATE of the first [`tokio_postgres::Error`] on `err`'s
 /// [`std::error::Error::source`] chain, if it has one: what `poison.sqlstate`
 /// records for a held key (#824), so [`release_retyped_keys`] can tell a
-/// value that didn't fit a column (`22001`, `22003`) from any other failure.
+/// value that didn't fit a column (`22003`) from any other failure.
 pub(crate) fn sqlstate_of(err: &(dyn std::error::Error + 'static)) -> Option<String> {
     let mut link: Option<&(dyn std::error::Error + 'static)> = Some(err);
     while let Some(err) = link {
@@ -5775,8 +5775,8 @@ async fn release_key_as(
 
 /// Releases the keys the staging worker's in-place re-types asked for
 /// (#824, `staging::schema_change`): for each `retype_releases` row, every
-/// key its definition holds whose failure had the row's SQLSTATE (`22001`
-/// after a `varchar` was re-typed, `22003` after a `numeric` was), each
+/// key its definition holds whose failure had the row's SQLSTATE (`22003`,
+/// after a `numeric` was re-typed), each
 /// through [`release_key`], so its parked work is applied again. A key held
 /// for any other failure stays held, and so does one whose failure Trellis
 /// recorded no SQLSTATE for.

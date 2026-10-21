@@ -308,7 +308,7 @@ until one of these releases it:
   relationship projections' columns) to the type define would give it now
   ([ADR-0014](0014-pause-and-drop-a-transform.md#resume-reconciles-with-source-not-by-catch-up)),
   so a key quarantined because a widened source value didn't fit a copy
-  (`22003`, `22001`) is rebuilt into the widened copy. A key whose cause is
+  (`22003`) is rebuilt into the widened copy. A key whose cause is
   still there fails again, and is poisoned again.
 * **Drop.** Dropping the transform deletes its held keys with its definition
   (`on delete cascade`), so defining it again starts with none.
@@ -354,8 +354,7 @@ until one of these releases it:
   Trellis created because the source widened it by changing only the catalog
   ([ADR-0014](0014-pause-and-drop-a-transform.md)), it releases, through the
   per-key release, every key a transform with a column on that table holds
-  whose failure was `22001` (after a `varchar` re-type) or `22003` (after a
-  `numeric` one), by the SQLSTATE its `poison` row keeps. A key held for any
+  whose failure was `22003` (after a `numeric` re-type), by the SQLSTATE its `poison` row keeps. A key held for any
   other failure stays held.
 
 The release is purely operational, like `status`, so it is a call of its own

@@ -3183,9 +3183,11 @@ struct ColumnRetype {
 /// ADR-0015 promises "An edit never rewrites the whole target table to
 /// change one column", so:
 ///
-/// - the same type and modifier needs no change;
+/// - the same type and modifier needs no change, and neither does a string
+///   column (`text`, `varchar(n)` or `varchar`) altered to another: Trellis's
+///   copies of a string are unbounded (#1207);
 /// - a widening that changes only the catalog ([`super::key_types::alter_retypable`]:
-///   `numeric(10,2)` to `numeric`, `varchar(8)` to `varchar(20)` or `text`)
+///   `numeric(10,2)` to `numeric`)
 ///   is returned for the caller to apply in the alter's own transaction,
 ///   under the definition's row lock, before the field's values are
 ///   re-derived;
@@ -3242,6 +3244,11 @@ async fn check_alter_column_types(
         let mut described = std::collections::BTreeMap::new();
         let current = super::copies::describe(client, &mut described, current).await?;
         let wanted = super::copies::describe(client, &mut described, wanted).await?;
+        // `text` and `varchar(n)` are one family, and a copy of either is an
+        // unbounded `varchar` or `text` (#1207): nothing to change.
+        if current.ty.is_string() && wanted.ty.is_string() {
+            continue;
+        }
         if super::key_types::alter_retypable(&current.ty, &wanted.ty) {
             retypes.push(ColumnRetype {
                 column: field.name.clone(),
@@ -3252,8 +3259,7 @@ async fn check_alter_column_types(
         return Err(CatalogError::UnsupportedAlter(format!(
             "ALTER '{field}' on '{display_target}' would change its column type from \
              '{current}' to '{wanted}'; Trellis re-types a column in place only for a widening \
-             that changes just the catalog (such as numeric(10,2) to numeric, or varchar(8) to \
-             text), because Postgres would otherwise rewrite '{display_target}''s entire \
+             that changes just the catalog (such as numeric(10,2) to numeric), because Postgres would otherwise rewrite '{display_target}''s entire \
              physical table under an ACCESS EXCLUSIVE lock, blocking reads and writes to every \
              other column too, not just this one. Use DROP '{field}' followed by ADD <expr> AS \
              '{field}' instead — it already pays this same backfill cost explicitly, rather \
@@ -7563,9 +7569,10 @@ async fn ensure_relationship_projection_in_txn(
             // unconditionally, not just when `needed_columns` is non-empty)
             // is what actually populates it, using this branch's freshly
             // created, still-empty table as its starting point.
+            let to_col_type = ddl::copy_pg_type(to_col_pg_type);
             txn.batch_execute(&format!(
                 "create table {qualified_projection} (\
-                     {to_col_ident} {to_col_pg_type} primary key, \
+                     {to_col_ident} {to_col_type} primary key, \
                      {gen_col} bigint not null default 0, \
                      {lsn_col} pg_lsn not null)",
                 gen_col = quote_ident(ddl::PROJECTION_GEN_COLUMN),
@@ -7616,6 +7623,7 @@ async fn ensure_relationship_projection_in_txn(
             continue;
         }
         let pg_type = column_type_in_txn(txn, qualified_to_table, to_table_bare, column).await?;
+        let pg_type = ddl::copy_pg_type(&pg_type);
         let col_ident = quote_ident(column);
         txn.batch_execute(&format!(
             "alter table {qualified_projection} add column if not exists {col_ident} {pg_type}"

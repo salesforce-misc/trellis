@@ -48,7 +48,7 @@
 //!   `a_type_changing_alter_refuses_the_whole_statement`)
 //! - #997: the modifier counts. A catalog-only widening is re-typed in place and a
 //!   narrowing refused (`altering_a_passthrough_into_a_wider_expression_retypes_the_column_in_place`,
-//!   `altering_a_varchar_passthrough_into_a_text_expression_retypes_the_column`,
+//!   `altering_a_varchar_passthrough_into_a_text_expression_changes_no_column_type`,
 //!   `altering_an_expression_into_a_narrower_passthrough_is_refused`,
 //!   `a_retype_a_view_blocks_is_refused_and_rolls_back`)
 
@@ -226,7 +226,7 @@ fn into_altered(applied: Applied) -> (Vec<String>, Vec<String>, Vec<String>) {
 
 /// Issue #994: `ALTER TRANSFORM ... ADD` creates a bare passthrough column
 /// with the type `DEFINE` gives it (the source column's own, typmod
-/// included, #45), and an expression column with its value family's type.
+/// included, #45; a `varchar(n)` is unbounded, #1207), and an expression column with its value family's type.
 /// A second transform defined with the same select is the oracle, and the
 /// capture pass's typed-copy comparison (`defs::copies`, `CopyState::drifted`)
 /// reads a passthrough as current exactly when its `(atttypid, atttypmod)` is
@@ -269,7 +269,8 @@ async fn an_added_passthrough_column_has_the_type_define_gives_it() {
 
     let expected = [
         ("price", "numeric(10,2)"),
-        ("who", "character varying(8)"),
+        // A copy of a `varchar(n)` column is unbounded (#1207).
+        ("who", "character varying"),
         ("qty", "integer"),
         ("note2", "text"),
         ("ts2", "timestamp with time zone"),
@@ -284,7 +285,7 @@ async fn an_added_passthrough_column_has_the_type_define_gives_it() {
     }
 
     // The comparison's own terms: each passthrough's type oid and typmod are
-    // its source column's.
+    // its source column's (a `varchar(n)`'s without the bound, #1207).
     let drifted: Vec<String> = raw
         .query(
             &format!(
@@ -294,7 +295,8 @@ async fn an_added_passthrough_column_has_the_type_define_gives_it() {
                       when 'note2' then 'note' when 'ts2' then 'ts' else t.attname::text end \
                  where t.attrelid = '{DEFAULT_TARGET_SCHEMA}.edited'::regclass \
                    and t.attname::text in ('price', 'who', 'qty', 'note2', 'ts2') \
-                   and (t.atttypid, t.atttypmod) is distinct from (s.atttypid, s.atttypmod)"
+                   and (t.atttypid, t.atttypmod) is distinct from (s.atttypid, \
+                        case when s.atttypid = 'varchar'::regtype then -1 else s.atttypmod end)"
             ),
             &[],
         )
@@ -748,10 +750,12 @@ async fn altering_a_passthrough_into_a_wider_expression_retypes_the_column_in_pl
     trellis.shutdown().await.expect("shutdown");
 }
 
-/// Issue #997 rule 3: a `varchar(8)` passthrough altered to an expression of
-/// type `text` is re-typed in place.
+/// Issue #997 rule 3, as #1207 leaves it: a `varchar(8)` passthrough is an
+/// unbounded `varchar` column, so altering it to an expression of type `text`
+/// (the same family) re-types nothing: the column and the target's file stay
+/// as they are, and the field build re-derives the values.
 #[tokio::test]
-async fn altering_a_varchar_passthrough_into_a_text_expression_retypes_the_column() {
+async fn altering_a_varchar_passthrough_into_a_text_expression_changes_no_column_type() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
@@ -763,19 +767,21 @@ async fn altering_a_varchar_passthrough_into_a_text_expression_retypes_the_colum
     .await;
     assert_eq!(
         column_pg_type(&raw, DEFAULT_TARGET_SCHEMA, "t", "who").await,
-        "character varying(8)"
+        "character varying"
     );
+    let before = target_filenode(&raw, "t").await;
 
     trellis
         .apply("ALTER TRANSFORM t ALTER who AS COALESCE(author, 'none')")
         .await
-        .expect("varchar(8) to text is a catalog-only widening");
+        .expect("varchar and text are one family: nothing to re-type");
     trellis::staging::build::settle_builds(&db.pool).await;
 
     assert_eq!(
         column_pg_type(&raw, DEFAULT_TARGET_SCHEMA, "t", "who").await,
-        "text"
+        "character varying"
     );
+    assert_eq!(target_filenode(&raw, "t").await, before);
     let first: String = raw
         .query_one(
             &format!("select who from {DEFAULT_TARGET_SCHEMA}.t where id = 1"),
