@@ -1002,6 +1002,14 @@ async fn a_p_or_m_page_is_a_range_scan_of_the_hidden_index_and_the_source_join_i
             scan_of(index, source, "(ROW(t, k) >= ").is_some(),
             "{part}: the source side is a range scan of {index}:\n{plan}"
         );
+        // The page steers by that index, the one define requires, though the
+        // page's key goes on past the join columns to the group column
+        // (#1223): its groups come out of the index in order, so the source
+        // side is not bounded by the hidden side's last key (`he`).
+        assert!(
+            !plan.contains("CTE Scan on he"),
+            "{part}: the page steers by {index}:\n{plan}"
+        );
     }
 }
 

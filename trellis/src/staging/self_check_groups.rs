@@ -397,18 +397,14 @@ async fn statement(
 }
 
 /// Whether the source has an index that orders a page of groups
-/// ([`Keyset::run`]).
+/// ([`Keyset::run`]): the index define requires
+/// ([`crate::defs::source_index`]).
 async fn steers(
     client: &tokio_postgres::Client,
     def: &Definition,
     shape: &GroupShape,
 ) -> Result<bool, SelfCheckError> {
-    Keyset::index_leads_with(
-        client,
-        &ddl::qualified_source_table(&def.source_table),
-        &shape.group_cols,
-    )
-    .await
+    Ok(crate::defs::source_index::has_index(client, &def.source_table, &shape.group_cols).await?)
 }
 
 /// The plan of a page's statement, with sequential scans disabled

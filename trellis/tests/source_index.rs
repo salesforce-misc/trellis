@@ -304,6 +304,41 @@ async fn the_index_must_lead_with_the_group_columns_in_group_by_order() {
     trellis.apply(by_gh).await.expect("(g, h) counts");
 }
 
+/// A page orders each group column ascending, `NULL` last: an index whose
+/// leading columns run that way, or all the other way (read backward), counts;
+/// one mixing directions, or with `NULL` first ascending, leaves each page to
+/// sort and doesn't (#1223).
+#[tokio::test]
+async fn the_index_must_run_in_the_page_order_forward_or_backward() {
+    let (_cluster, _db, raw, trellis) = setup("").await;
+    let by_gh = "TRANSFORM by_gh FROM public.src GROUP BY g, h SELECT SUM(v) AS t";
+    for wrong in [
+        "(g, h desc)",
+        "(g, h nulls first)",
+        "(g desc, h)",
+        "(g desc nulls last, h desc nulls last)",
+    ] {
+        raw.batch_execute(&format!("create index wrong on public.src {wrong}"))
+            .await
+            .expect("index");
+        let message = refusal(&trellis, by_gh).await;
+        assert!(
+            message.contains(r#"create index on "public"."src" ("g", "h")"#),
+            "{wrong}: {message}"
+        );
+        raw.batch_execute("drop index public.wrong")
+            .await
+            .expect("drop");
+    }
+    raw.batch_execute("create index on public.src (g desc, h desc, v)")
+        .await
+        .expect("index");
+    trellis
+        .apply(by_gh)
+        .await
+        .expect("all descending, NULL first, is read backward");
+}
+
 /// A partitioned source's unique index includes the partition key, which a
 /// group-basis aggregate must also group by (ADR-0017): the index leading
 /// with it, as the first `GROUP BY` column, is the required one.

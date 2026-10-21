@@ -817,8 +817,9 @@ async fn an_aggregate_page_reads_its_source_by_an_index_that_leads_with_the_grou
 }
 
 /// A composite group key's page is a range scan of an index that leads with
-/// the group columns in `GROUP BY` order, with or without trailing columns
-/// (#1223). Define refuses any other order (`tests/source_index.rs`).
+/// the group columns in `GROUP BY` order, with or without trailing columns,
+/// read forward or, all descending with `NULL` first, backward (#1223).
+/// Define refuses any other order (`tests/source_index.rs`).
 #[tokio::test]
 async fn a_composite_page_is_index_served_by_an_index_in_group_by_order() {
     let d = start_with(
@@ -828,7 +829,11 @@ async fn a_composite_page_is_index_served_by_an_index_in_group_by_order() {
         &[("id", int4()), ("g", int4()), ("h", int4()), ("v", int4())],
     )
     .await;
-    for (name, columns) in [("src_gh", "g, h"), ("src_ghv", "g, h, v")] {
+    for (name, columns) in [
+        ("src_gh", "g, h"),
+        ("src_ghv", "g, h, v"),
+        ("src_back", "g desc, h desc"),
+    ] {
         exec(
             &d,
             &format!("create index {name} on public.src ({columns})"),
@@ -839,7 +844,8 @@ async fn a_composite_page_is_index_served_by_an_index_in_group_by_order() {
             .await
             .expect("explain the page");
         assert!(
-            plan.contains(&format!("Scan using {name} on src s")),
+            plan.contains(&format!("Scan using {name} on src s"))
+                || plan.contains(&format!("Scan Backward using {name} on src s")),
             "index ({columns}):\n{plan}"
         );
         assert!(
