@@ -259,12 +259,12 @@ impl TestCluster {
         Self::start_listening(false)
     }
 
-    /// Marks this cluster as one that serves many databases over its life, such as a property test's thread-local cluster that every
-    /// case takes a database from. A [`TestDatabase`] on it drops its
-    /// database when it goes, so the cases do not pile up. On a cluster from
-    /// a cluster not so marked the drop is skipped: the cluster is
-    /// deleted with the test, and `DROP DATABASE`'s checkpoint costs ~110 ms
-    /// per test (#1246).
+    /// Marks this cluster as one that serves many databases over its life,
+    /// such as a property test's thread-local cluster that every case takes
+    /// a database from. A [`TestDatabase`] on it drops its database when it
+    /// goes, so the cases do not pile up. On a cluster not so marked the drop
+    /// is skipped: the cluster is deleted with the test, and `DROP
+    /// DATABASE`'s checkpoint costs ~110 ms per test (#1246).
     pub fn long_lived(mut self) -> Self {
         self.long_lived = true;
         self
