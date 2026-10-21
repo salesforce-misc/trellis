@@ -402,13 +402,14 @@ pub(crate) async fn forget_except(
 /// A type's name is persisted in each definition's `source_columns` and
 /// `join_columns` (as `enum:schema.typname`), in `definition_key_types`, and
 /// in the baseline itself. They are rewritten in one transaction, for every
-/// definition that records the old name (the rename is the type's, not this
-/// table's, and a chained definition's key columns on a table Trellis
-/// creates have no baseline of their own), under those definitions' row
-/// locks taken in id order, the locks a pass takes for any re-record. Each
-/// of them also asks for the release of its keys held for `42704`, the
-/// failure of a cast by the name the type no longer has
-/// (`retype_releases`, released by
+/// definition that records the old name for a column whose type is still
+/// the renamed one (the rename is the type's, not this table's, and a
+/// chained definition's key columns on a table Trellis creates have no
+/// baseline of their own; a column of a new type created at the old name
+/// keeps it), under those definitions' row locks taken in id order, the
+/// locks a pass takes for any re-record. Each of them also asks for the
+/// release of its keys held for `42704`, the failure of a cast by the name
+/// the type no longer has (`retype_releases`, released by
 /// `staging::quarantine::release_retyped_keys` after the pass).
 ///
 /// Runs before `pause_readers_of_retyped`, which compares the name recorded
@@ -429,59 +430,103 @@ pub(crate) async fn follow_renamed_types(
         .into_iter()
         .collect();
     let live = live(&*client, table, &columns).await?;
-    let mut renamed: BTreeMap<String, String> = BTreeMap::new();
+    // By type oid: a new type can take a renamed type's old name.
+    let mut renamed: BTreeMap<u32, (String, String)> = BTreeMap::new();
     for (key, was) in &baseline {
         if let Some(now) = live.get(key)
             && (was.type_oid, was.ty.typmod) == (now.type_oid, now.ty.typmod)
             && was.ty.type_name != now.ty.type_name
         {
-            renamed.insert(was.ty.type_name.clone(), now.ty.type_name.clone());
+            renamed.insert(
+                was.type_oid,
+                (was.ty.type_name.clone(), now.ty.type_name.clone()),
+            );
         }
     }
     if renamed.is_empty() {
         return Ok(());
     }
+    // Whether column `{column}` of `{table}` (an unquoted `schema.table`)
+    // still has the renamed type `{oid}`: a column of a new type created at
+    // the old name keeps that name.
+    const ITS_COLUMN: &str = "exists (select 1 from pg_catalog.pg_attribute a \
+         join pg_catalog.pg_class c on c.oid = a.attrelid \
+         join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
+         where n.nspname::text || '.' || c.relname::text = {table} \
+           and a.attname::text = {column} and a.attnum > 0 and not a.attisdropped \
+           and a.atttypid = {oid})";
+    let its_column = |table: &str, column: &str, oid: &str| {
+        ITS_COLUMN
+            .replace("{table}", table)
+            .replace("{column}", column)
+            .replace("{oid}", oid)
+    };
     let txn = client.transaction().await?;
-    for (old, new) in &renamed {
+    for (oid, (old, new)) in &renamed {
         let (old_token, new_token) = (format!("enum:{old}"), format!("enum:{new}"));
-        let owners: Vec<i64> = txn
+        let in_source = its_column("d.source_table", "e.key", "$3");
+        let in_join = its_column("d.join_table", "e.key", "$3");
+        let candidates: Vec<i64> = txn
             .query(
-                "select id from transform_definitions d \
-                 where exists (select 1 from jsonb_each_text(d.source_columns) e where e.value = $1) \
-                    or exists (select 1 from jsonb_each_text(d.join_columns) e where e.value = $1) \
-                    or exists (select 1 from definition_key_types k \
-                               where k.transform_id = d.id and k.type_name = $2)",
-                &[&old_token, &old],
+                &format!(
+                    "select id from transform_definitions d \
+                     where exists (select 1 from jsonb_each_text(d.source_columns) e \
+                                   where e.value = $1 and {in_source}) \
+                        or exists (select 1 from jsonb_each_text(d.join_columns) e \
+                                   where e.value = $1 and {in_join}) \
+                        or exists (select 1 from definition_key_types k \
+                                   where k.transform_id = d.id and k.type_name = $2 \
+                                     and {})",
+                    its_column("k.table_name", "k.column_name", "$3"),
+                ),
+                &[&old_token, old, oid],
             )
             .await?
             .into_iter()
             .map(|row| row.get(0))
             .collect();
+        // Locked in id order; one dropped meanwhile is left out.
+        let owners: Vec<i64> = if candidates.is_empty() {
+            Vec::new()
+        } else {
+            txn.query(
+                "select id from transform_definitions where id = any($1) order by id for update",
+                &[&candidates],
+            )
+            .await?
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect()
+        };
         if !owners.is_empty() {
+            let rename = |table: &str, entries: &str| {
+                format!(
+                    "(select coalesce(jsonb_object_agg(e.key, \
+                         case when e.value = to_jsonb($2::text) and {} \
+                              then to_jsonb($3::text) else e.value end), '{{}}'::jsonb) \
+                      from jsonb_each({entries}) e)",
+                    its_column(table, "e.key", "$4"),
+                )
+            };
             txn.execute(
-                "select 1 from transform_definitions where id = any($1) order by id for update",
-                &[&owners],
+                &format!(
+                    "update transform_definitions d set \
+                         source_columns = {}, \
+                         join_columns = case when d.join_columns is null then null else {} end \
+                     where d.id = any($1)",
+                    rename("d.source_table", "d.source_columns"),
+                    rename("d.join_table", "d.join_columns"),
+                ),
+                &[&owners, &old_token, &new_token, oid],
             )
             .await?;
             txn.execute(
-                "update transform_definitions d set \
-                     source_columns = (select coalesce(jsonb_object_agg(e.key, \
-                         case when e.value = to_jsonb($2::text) then to_jsonb($3::text) \
-                              else e.value end), '{}'::jsonb) \
-                         from jsonb_each(d.source_columns) e), \
-                     join_columns = case when d.join_columns is null then null else \
-                         (select coalesce(jsonb_object_agg(e.key, \
-                             case when e.value = to_jsonb($2::text) then to_jsonb($3::text) \
-                                  else e.value end), '{}'::jsonb) \
-                          from jsonb_each(d.join_columns) e) end \
-                 where d.id = any($1)",
-                &[&owners, &old_token, &new_token],
-            )
-            .await?;
-            txn.execute(
-                "update definition_key_types set type_name = $2 \
-                 where transform_id = any($1) and type_name = $3",
-                &[&owners, new, old],
+                &format!(
+                    "update definition_key_types k set type_name = $2 \
+                     where k.transform_id = any($1) and k.type_name = $4 and {}",
+                    its_column("k.table_name", "k.column_name", "$3"),
+                ),
+                &[&owners, new, oid, old],
             )
             .await?;
             txn.execute(
@@ -493,8 +538,9 @@ pub(crate) async fn follow_renamed_types(
             .await?;
         }
         txn.execute(
-            "update capture_baselines set type_name = $3 where table_name = $1 and type_name = $2",
-            &[&table, old, new],
+            "update capture_baselines set type_name = $3 \
+             where table_name = $1 and type_name = $2 and type_oid = $4",
+            &[&table, old, new, oid],
         )
         .await?;
         crate::instance_log::info!(

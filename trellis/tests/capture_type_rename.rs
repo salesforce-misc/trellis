@@ -479,3 +479,244 @@ async fn a_relabelled_value_is_followed_by_the_copies_typed_as_the_enum() {
     capture_pass(&mut raw, &db.pool).await;
     assert_converged(&raw).await;
 }
+
+async fn source_column_token(raw: &Client, target: &str, column: &str) -> String {
+    raw.query_one(
+        "select source_columns ->> $2 from transform_definitions \
+         where split_part(target_table, '.', 2) = $1",
+        &[&target, &column],
+    )
+    .await
+    .expect("read the recorded token")
+    .get(0)
+}
+
+/// The type is renamed and a new type is created at its old name, read by a
+/// definition defined before the pass that follows the rename (the first
+/// half of the usual migration that drops an enum label). The pass
+/// re-records the old name only for the columns of the renamed type: the
+/// new definition keeps casting by the name its own type has.
+#[tokio::test]
+async fn a_new_type_at_the_old_name_keeps_its_own_readers() {
+    trellis::dev::staging::set_group_basis(true);
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create type public.tone as enum ('calm', 'loud'); \
+         create table public.items (id int primary key, tone tone);",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    trellis
+        .apply("TRANSFORM tone_pass FROM public.items SELECT tone AS tone")
+        .await
+        .expect("define tone_pass");
+    bring_live(&mut raw, &db.pool, &["tone_pass"]).await;
+    raw.batch_execute("insert into public.items values (1, 'calm'), (2, 'loud')")
+        .await
+        .expect("write");
+    full_pass(&mut raw, &db.pool).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+
+    raw.batch_execute(
+        "alter type public.tone rename to tone_old; \
+         create type public.tone as enum ('x', 'y'); \
+         create table public.fresh (id int primary key, tone public.tone);",
+    )
+    .await
+    .expect("rename, and create a new type at the old name");
+    trellis
+        .apply("TRANSFORM fresh_pass FROM public.fresh SELECT tone AS tone")
+        .await
+        .expect("define fresh_pass");
+    bring_live(&mut raw, &db.pool, &["tone_pass", "fresh_pass"]).await;
+    assert_eq!(
+        source_column_token(&raw, "tone_pass", "tone").await,
+        "enum:public.tone_old"
+    );
+    assert_eq!(
+        source_column_token(&raw, "fresh_pass", "tone").await,
+        "enum:public.tone"
+    );
+
+    raw.batch_execute(
+        "insert into public.fresh values (1, 'x'), (2, 'y'); \
+         insert into public.items values (3, 'loud'); \
+         update public.items set tone = 'loud' where id = 1;",
+    )
+    .await
+    .expect("write");
+    full_pass(&mut raw, &db.pool).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    assert_eq!(held_keys(&raw).await, 0, "no key is held");
+    for target in ["tone_pass", "fresh_pass"] {
+        assert_eq!(
+            status(&raw, target).await,
+            TransformStatus::Live,
+            "{target}"
+        );
+    }
+    for (target, source) in [("tone_pass", "items"), ("fresh_pass", "fresh")] {
+        assert_eq!(
+            rows(
+                &raw,
+                &format!("select id::text, tone::text from public.{target} order by id")
+            )
+            .await,
+            rows(
+                &raw,
+                &format!("select id::text, tone::text from public.{source} order by id")
+            )
+            .await,
+            "{target}"
+        );
+    }
+}
+
+/// A partitioned source (an aggregate grouped by its partition key: define
+/// refuses a 1-1 from one, and an enum partition key): the
+/// baseline records each leaf, and the rename is followed for the root's
+/// readers as for a plain table's.
+#[tokio::test]
+async fn a_renamed_type_of_a_partitioned_source_is_followed_in_place() {
+    trellis::dev::staging::set_group_basis(true);
+    trellis::defs::partition_tree::open_gate_for_tests();
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create type public.tone as enum ('calm', 'loud', 'brisk'); \
+         create table public.items (g int not null, id int not null, tone tone, \
+             primary key (g, id)) partition by range (g); \
+         create table public.items_p0 partition of public.items for values from (0) to (8); \
+         create table public.items_p1 partition of public.items for values from (8) to (16);",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    let text = "TRANSFORM per_tone FROM public.items GROUP BY g, tone \
+                SELECT g AS g, tone AS tone, COUNT(*) AS n";
+    trellis.apply(text).await.expect(text);
+    bring_live(&mut raw, &db.pool, &["per_tone"]).await;
+    raw.batch_execute("insert into public.items values (1, 1, 'calm'), (9, 2, 'loud')")
+        .await
+        .expect("write");
+    full_pass(&mut raw, &db.pool).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+
+    raw.batch_execute(
+        "alter type public.tone rename to tone2; \
+         insert into public.items values (1, 3, 'brisk'), (9, 4, 'calm'); \
+         update public.items set tone = 'brisk' where id = 1;",
+    )
+    .await
+    .expect("rename and write");
+    drain_past_failures(&db.pool, &mut raw).await;
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(status(&raw, "per_tone").await, TransformStatus::Live);
+    full_pass(&mut raw, &db.pool).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    assert_eq!(held_keys(&raw).await, 0, "no key is held");
+    assert_eq!(
+        rows(
+            &raw,
+            "select g::text, tone::text, n::text from public.per_tone where n is not null \
+             order by g, tone::text"
+        )
+        .await,
+        rows(
+            &raw,
+            "select g::text, tone::text, count(*)::text from public.items group by g, tone \
+             order by g, tone::text"
+        )
+        .await,
+    );
+}
+
+/// A definition paused by an operator when the type is renamed: the pass
+/// re-records its names too, and `RESUME`, before or after that pass,
+/// re-validates it against the new name.
+#[tokio::test]
+async fn a_paused_reader_resumes_after_a_rename() {
+    for resume_first in [false, true] {
+        let cluster = TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let mut raw = connect(db.dsn()).await;
+        raw.batch_execute(
+            "create type public.tone as enum ('calm', 'loud'); \
+             create table public.items (id int primary key, tone tone); \
+             create table public.kinds (tone tone primary key, v int);",
+        )
+        .await
+        .expect("seed");
+        let trellis = definer(db.dsn()).await;
+        for text in [
+            "TRANSFORM tone_pass FROM public.items SELECT tone AS tone",
+            "TRANSFORM kind_v FROM public.kinds SELECT v AS v",
+        ] {
+            trellis.apply(text).await.expect(text);
+        }
+        bring_live(&mut raw, &db.pool, &["tone_pass", "kind_v"]).await;
+        raw.batch_execute(
+            "insert into public.items values (1, 'calm'), (2, 'loud'); \
+             insert into public.kinds values ('calm', 1)",
+        )
+        .await
+        .expect("write");
+        full_pass(&mut raw, &db.pool).await;
+        drain_to_quiescence(&db.pool, &mut raw).await;
+
+        for text in ["PAUSE TRANSFORM tone_pass", "PAUSE TRANSFORM kind_v"] {
+            trellis.apply(text).await.expect(text);
+        }
+        raw.batch_execute(
+            "alter type public.tone rename to tone2; \
+             insert into public.items values (3, 'loud'); \
+             update public.items set tone = 'loud' where id = 1; \
+             insert into public.kinds values ('loud', 2); update public.kinds set v = 3;",
+        )
+        .await
+        .expect("rename and write");
+        if resume_first {
+            for text in ["RESUME TRANSFORM tone_pass", "RESUME TRANSFORM kind_v"] {
+                trellis.apply(text).await.expect(text);
+            }
+            capture_pass(&mut raw, &db.pool).await;
+        } else {
+            capture_pass(&mut raw, &db.pool).await;
+            for text in ["RESUME TRANSFORM tone_pass", "RESUME TRANSFORM kind_v"] {
+                trellis.apply(text).await.expect(text);
+            }
+        }
+        bring_live(&mut raw, &db.pool, &["tone_pass", "kind_v"]).await;
+        assert_eq!(held_keys(&raw).await, 0, "no key is held");
+        assert_eq!(
+            rows(
+                &raw,
+                "select id::text, tone::text from public.tone_pass order by id"
+            )
+            .await,
+            rows(
+                &raw,
+                "select id::text, tone::text from public.items order by id"
+            )
+            .await,
+            "resume first: {resume_first}"
+        );
+        assert_eq!(
+            rows(
+                &raw,
+                "select tone::text, v::text from public.kind_v order by tone::text"
+            )
+            .await,
+            rows(
+                &raw,
+                "select tone::text, v::text from public.kinds order by tone::text"
+            )
+            .await,
+            "resume first: {resume_first}"
+        );
+    }
+}
