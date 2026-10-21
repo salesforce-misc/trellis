@@ -1669,6 +1669,26 @@ pub(crate) async fn reported_statuses(
 pub(crate) async fn reported_statuses_with_causes(
     client: &impl GenericClient,
 ) -> Result<(HashMap<i64, TransformStatus>, HashMap<i64, Vec<String>>), CatalogError> {
+    let mut nodes = status_nodes(client).await?;
+    add_paused_column_causes(client, &mut nodes).await?;
+    Ok(derive_reported(&nodes))
+}
+
+/// [`reported_statuses`] with paused upstream columns left out: `catching_up`
+/// only for a definition with an upstream that isn't stored `live`, down the
+/// chain. What a resume waits on (#971): an upstream that is rebuilding or
+/// paused can still rewrite its target, but one that only reads a paused
+/// column applies as usual, so a reader rebuilt over it is exactly as current
+/// as a `live` reader of it (#1208), and a column paused for good mustn't
+/// hold the resume.
+pub(crate) async fn reported_statuses_ignoring_column_pauses(
+    client: &impl GenericClient,
+) -> Result<HashMap<i64, TransformStatus>, CatalogError> {
+    Ok(derive_reported(&status_nodes(client).await?).0)
+}
+
+/// Every definition as [`derive_reported`] sees it, without paused columns.
+async fn status_nodes(client: &impl GenericClient) -> Result<Vec<StatusNode>, CatalogError> {
     let relationships: HashMap<(String, String, String), String> = client
         .query(
             "select from_schema, from_table, name, to_schema || '.' || to_table \
@@ -1718,6 +1738,15 @@ pub(crate) async fn reported_statuses_with_causes(
             paused_columns: Vec::new(),
         });
     }
+    Ok(nodes)
+}
+
+/// Records on each `live` node the paused upstream columns it reads (#1208,
+/// [`reported_statuses_with_causes`]), each once.
+async fn add_paused_column_causes(
+    client: &impl GenericClient,
+    nodes: &mut [StatusNode],
+) -> Result<(), CatalogError> {
     let paused: Vec<(String, String)> = client
         .query(
             "select transform_table, column_name from column_status \
@@ -1747,15 +1776,19 @@ pub(crate) async fn reported_statuses_with_causes(
                 if paused_set.contains(&dep) {
                     continue;
                 }
+                let cause = format!("{table}.{column}");
+                // A reader with several fields (or a `GROUP BY` key) reading
+                // the column is listed once per field.
                 if let Some(&i) = by_bare.get(&dep.0)
                     && nodes[i].status == TransformStatus::Live
+                    && !nodes[i].paused_columns.contains(&cause)
                 {
-                    nodes[i].paused_columns.push(format!("{table}.{column}"));
+                    nodes[i].paused_columns.push(cause);
                 }
             }
         }
     }
-    Ok(derive_reported(&nodes))
+    Ok(())
 }
 
 /// One definition as [`derive_reported_statuses`] sees it.

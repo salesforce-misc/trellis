@@ -246,7 +246,9 @@ A resume never starts a rebuild ahead of its upstream. A definition's upstreams 
 definitions in the instance whose targets it reads: its source, a `JOIN`'s joined table, or
 a relationship's to-side. An upstream is `live` as the operator reads it: one that is
 itself running but reads a definition that isn't `live` reports `catching_up`, since its
-target may still change under a rebuild above it. A `RESUME` of a definition with an
+target may still change under a rebuild above it. One that reports `catching_up` only
+because it reads a paused column of an upstream 1-1 target (ADR-0003, "Propagation") keeps
+applying as usual, so it counts as `live` here. A `RESUME` of a definition with an
 upstream that isn't `live` (paused, quarantined, rebuilding or catching up) is accepted
 and returns at once, before any re-validation: the definition stays paused with a resume
 request, and its `capture_failure` says it is waiting for that upstream to be `live`. This holds whether it

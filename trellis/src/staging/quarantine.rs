@@ -4232,9 +4232,11 @@ async fn upstream_not_live(
     // `live` as the operator reads it (`catalog::reported_statuses`, #497):
     // an upstream stored `live` that reads one that isn't reports
     // `catching_up`, and its target may still change under a rebuild above
-    // it. Derived only when every upstream is stored `live`.
+    // it. Derived only when every upstream is stored `live`. An upstream that
+    // reports `catching_up` only for a paused column it reads keeps applying,
+    // so it doesn't hold the resume (#1208).
     let reported = if upstreams.iter().all(|row| row.get::<_, &str>(3) == live) {
-        Some(catalog::reported_statuses(client).await?)
+        Some(catalog::reported_statuses_ignoring_column_pauses(client).await?)
     } else {
         None
     };

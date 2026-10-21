@@ -6016,7 +6016,8 @@ async fn a_resume_holds_a_reader_whose_source_changed_after_the_walk_read_its_de
 // ---------------------------------------------------------------------
 
 /// `sib (total, cost)` over `items` with row 1 drained, read by the live
-/// aggregates `sib_stats` (`SUM(total)`, over the column the tests pause),
+/// aggregates `sib_stats` (`SUM(total)` and `MAX(total)`, two fields over
+/// the column the tests pause),
 /// `sib_costs` (`SUM(cost)`, which reads other columns only) and the 1-1
 /// `sib_chain` over `sib_stats`.
 async fn seed_aggregate_readers(db: &TestDatabase) -> (Client, Trellis) {
@@ -6025,7 +6026,8 @@ async fn seed_aggregate_readers(db: &TestDatabase) -> (Client, Trellis) {
     change_item(&mut client, &db.pool, 1, None, (10, 5, 0)).await;
     let trellis = trellis_on(db).await;
     for define in [
-        "TRANSFORM sib_stats FROM sib GROUP BY id SELECT id AS id, SUM(total) AS s",
+        "TRANSFORM sib_stats FROM sib GROUP BY id SELECT id AS id, SUM(total) AS s, \
+         MAX(total) AS m",
         "TRANSFORM sib_costs FROM sib GROUP BY id SELECT id AS id, SUM(cost) AS c",
     ] {
         trellis.apply(define).await.expect("define an aggregate");
@@ -6164,6 +6166,43 @@ async fn a_reader_of_a_column_paused_by_the_fuse_s_api_reports_catching_up() {
         reported(&trellis, "sib_stats").await,
         ("catching_up", vec!["sib.total".to_string()])
     );
+}
+
+/// A resume waits for an upstream that is rebuilding (#971), but not for
+/// one that reports `catching_up` only because it reads a paused column: that
+/// upstream keeps applying, so a reader rebuilt over it is as current as a
+/// `live` one, and the column may stay paused for good.
+#[tokio::test]
+async fn a_resume_does_not_wait_for_an_upstream_reading_a_paused_column() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (client, trellis) = seed_aggregate_readers(&db).await;
+    trellis
+        .apply("PAUSE TRANSFORM sib_chain")
+        .await
+        .expect("pause the chained reader");
+    trellis
+        .apply("PAUSE TRANSFORM sib.total")
+        .await
+        .expect("pause total");
+    assert_eq!(reported(&trellis, "sib_stats").await.0, "catching_up");
+
+    trellis
+        .apply("RESUME TRANSFORM sib_chain")
+        .await
+        .expect("resume the chained reader");
+    let status = trellis
+        .status("sib_chain")
+        .await
+        .expect("status")
+        .expect("sib_chain exists");
+    assert_ne!(
+        status.status.as_str(),
+        "paused",
+        "the resume went ahead, not waiting on sib_stats: {:?}",
+        status.capture_failure
+    );
+    assert_ne!(status_named(&client, "sib_chain").await, "paused");
 }
 
 /// A `JOIN` reading a paused column of a 1-1 target reports `catching_up`
