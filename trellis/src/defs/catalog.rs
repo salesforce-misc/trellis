@@ -8748,6 +8748,43 @@ pub async fn all_source_tables(pool: &Pool) -> Result<Vec<String>, CatalogError>
     Ok(rows.into_iter().map(|r| r.get(0)).collect())
 }
 
+/// Forgets the capture records of every table no definition reads (#1217):
+/// the trigger, baseline and partition-tree records and the queued partition
+/// corrections. A definition counts as reading a table whatever its status
+/// (paused and quarantined included), as its source, a `JOIN`'s joined table,
+/// or the to-side of a relationship ([`reachable_tables_cte`]); a table read
+/// only as another definition's target never has a record to keep.
+///
+/// Run in the transaction that removes a reader, so a definition defined
+/// afterwards is never judged against the record of a table it did not read:
+/// its table may have been dropped and created again since, and the capture
+/// pass that would have forgotten the record had not run. Deletes by table
+/// name, so it covers a record kept per node as well. Uninstalling the
+/// triggers stays the capture pass's job; the pass's own sweeps stay as the
+/// backstop.
+pub(crate) async fn forget_unread_capture_records(
+    client: &impl GenericClient,
+) -> Result<(), CatalogError> {
+    let cte = reachable_tables_cte("true");
+    for table in [
+        "capture_triggers",
+        "capture_baselines",
+        "partition_corrections",
+        "partition_sources",
+    ] {
+        client
+            .execute(
+                &format!(
+                    "{cte} delete from {table} \
+                     where table_name not in (select table_name from reachable)"
+                ),
+                &[],
+            )
+            .await?;
+    }
+    Ok(())
+}
+
 /// The recursive walk [`all_source_tables`] documents: every anchor
 /// `source_table` of a definition `anchor_filter` (a predicate over
 /// `transform_definitions`) keeps, plus every table reachable from one

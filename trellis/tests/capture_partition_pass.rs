@@ -1013,3 +1013,42 @@ async fn measure_fingerprint_cost_at_a_thousand_leaves() {
         outcome.partition_deep_checks.len()
     );
 }
+
+async fn sources(raw: &Client) -> i64 {
+    raw.query_one("select count(*) from partition_sources", &[])
+        .await
+        .expect("count")
+        .get(0)
+}
+
+/// #1217: the last definition on a partitioned root goes, the root is dropped
+/// and created again, and a definition is made, all before a pass. The new
+/// definition never read the old tree, so the pass records the new one
+/// instead of pausing it for a root that is "not the one Trellis captured".
+#[tokio::test]
+async fn a_definition_made_after_the_root_was_replaced_is_not_paused() {
+    let cluster = TestCluster::start();
+    let mut it = instance(&cluster, TREE).await;
+    assert_eq!(sources(&it.raw).await, 1);
+    for text in ["PAUSE TRANSFORM totals", "DROP TRANSFORM totals"] {
+        it.trellis.apply(text).await.expect(text);
+    }
+    assert_eq!(sources(&it.raw).await, 0, "forgotten with the last reader");
+
+    it.raw
+        .batch_execute(&format!("drop table public.items; {TREE}"))
+        .await
+        .expect("replace the root");
+    it.trellis
+        .apply("TRANSFORM totals FROM public.items GROUP BY order_id SELECT COUNT(*) AS n")
+        .await
+        .expect("define again");
+    clean_pass(&mut it).await;
+    clean_pass(&mut it).await;
+    assert_ne!(
+        status(&it.trellis).await.status,
+        trellis::defs::TransformStatus::Paused
+    );
+    assert_eq!(sources(&it.raw).await, 1);
+    it.trellis.shutdown().await.expect("shutdown");
+}
