@@ -13,10 +13,13 @@
 //! its test binaries. The key hashes the engine's sources and migrations
 //! (`build.rs`), the Postgres binary and the `initdb` arguments, so a stale
 //! template is never reused, and the day, so none outlives a temp-dir cleaner
-//! (see [`key`]); a builder holds an exclusive lock on
+//! (see [`key`]). A builder holds an exclusive lock on
 //! `trellis-template-<key>.lock` and publishes the directory with a rename, so
-//! a reader sees it whole or not at all. Templates for keys no run has used
-//! for a day are deleted by the next builder.
+//! a reader sees it whole or not at all. Every process that uses a template
+//! holds a shared lock on that file for as long as it runs, and a builder
+//! deletes the other templates that no process holds and none has used for
+//! an hour, so templates of earlier engine builds do not fill the temp dir
+//! (each is ~50 MB, and every edit to the engine makes a new one).
 //!
 //! The reaper ([`reap_orphans_in`]) only looks at `trellis-testkit-*`, so it
 //! never sweeps a template.
@@ -29,13 +32,21 @@ use std::sync::OnceLock;
 pub(super) const TEMPLATE_DB: &str = "trellis_template";
 
 const TEMPLATE_PREFIX: &str = "trellis-template-";
-const STALE_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
+/// How long a template no process holds must go unused before a builder
+/// deletes it. Only the gap between test binaries of one run needs covering.
+const STALE_AFTER: Duration = Duration::from_secs(60 * 60);
+/// How old a template's lock file must be before a builder deletes it: older
+/// than any key a process could still compute (see [`key`]'s day), so no
+/// process can be about to open it.
+const LOCK_STALE_AFTER: Duration = Duration::from_secs(3 * 24 * 60 * 60);
 
 /// The template data directory, building it first if no run has yet. Takes
 /// no cluster permit, so it is safe to call before acquiring one.
 pub(super) fn data_dir() -> &'static Path {
-    static DIR: OnceLock<PathBuf> = OnceLock::new();
-    DIR.get_or_init(|| ensure(&std::env::temp_dir()))
+    // The lock file is kept open, its shared lock held, until the process
+    // exits.
+    static TEMPLATE: OnceLock<(PathBuf, fs::File)> = OnceLock::new();
+    &TEMPLATE.get_or_init(|| ensure(&std::env::temp_dir())).0
 }
 
 /// The cache key: the engine build (`build.rs`), the Postgres binaries, the
@@ -84,29 +95,41 @@ fn on_path(program: &str) -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
-/// The template under `tmp`, built if absent.
-fn ensure(tmp: &Path) -> PathBuf {
+/// The template under `tmp`, built if absent, with its lock file, on which
+/// this process now holds a shared lock: while it does, no builder deletes
+/// the template.
+fn ensure(tmp: &Path) -> (PathBuf, fs::File) {
     let name = format!("{TEMPLATE_PREFIX}{}", key());
     let dir = tmp.join(&name);
+    let lock = open_lock(tmp, &name);
+    // Waits out a build in progress.
+    lock.lock_shared().expect("lock the template shared");
     if !dir.exists() {
-        // Held until the end of the build; another process wanting the same
-        // template waits here and finds it done.
-        let lock = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(tmp.join(format!("{name}.lock")))
-            .expect("create template lock file");
+        // Exclusive for the build; another process wanting the same template
+        // waits for it and finds it done.
+        lock.unlock().expect("unlock the template");
         lock.lock().expect("lock the template");
         if !dir.exists() {
             build(tmp, &name, &dir);
         }
+        lock.lock_shared().expect("lock the template shared");
     }
     mark_used(&dir);
-    dir
+    (dir, lock)
+}
+
+/// The lock file for template `name`, created if missing. Never created
+/// exclusively, so every opener shares one file.
+fn open_lock(tmp: &Path, name: &str) -> fs::File {
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(tmp.join(format!("{name}.lock")))
+        .expect("create template lock file")
 }
 
 fn build(tmp: &Path, name: &str, dir: &Path) {
-    delete_stale(tmp);
+    delete_stale(tmp, name);
     // A build killed after the copy and before the rename leaves its staging
     // directory. Under the lock no other build of this key is running, so
     // every one there is such a leftover.
@@ -159,27 +182,42 @@ fn migrate(dsn: &str) {
 
 /// Records that a run is using the template now, so [`delete_stale`] spares it.
 /// Called on every copy, not only when a process first finds the template,
-/// so a run that lasts longer than [`STALE_AFTER`] keeps its template.
+/// so the age [`delete_stale`] goes by is the time since the last copy.
 pub(super) fn mark_used(dir: &Path) {
     let _ = fs::File::open(dir).and_then(|dir| dir.set_modified(std::time::SystemTime::now()));
 }
 
-/// Removes templates (and their lock and staging files) that no run has used
-/// for [`STALE_AFTER`], so keys from old engine builds do not pile up.
-fn delete_stale(tmp: &Path) {
+/// Removes the templates other than `own` that no process holds and none has
+/// used for [`STALE_AFTER`], staging directories of builds killed that long
+/// ago, and lock files older than [`LOCK_STALE_AFTER`] that nothing holds.
+fn delete_stale(tmp: &Path, own: &str) {
     let Ok(entries) = fs::read_dir(tmp) else {
         return;
     };
     for entry in entries.flatten() {
-        let name = entry.file_name();
-        if !name.to_string_lossy().starts_with(TEMPLATE_PREFIX) {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with(TEMPLATE_PREFIX) || name.starts_with(own) {
             continue;
         }
         let path = entry.path();
-        if older_than(&path, STALE_AFTER) {
-            let _ = fs::remove_dir_all(&path).or_else(|_| fs::remove_file(&path));
+        if let Some(template) = name.strip_suffix(".lock") {
+            if older_than(&path, LOCK_STALE_AFTER) && !held(tmp, template) {
+                let _ = fs::remove_file(&path);
+            }
+        } else if name.contains(".tmp-") {
+            if older_than(&path, STALE_AFTER) {
+                let _ = fs::remove_dir_all(&path);
+            }
+        } else if older_than(&path, STALE_AFTER) && !held(tmp, &name) {
+            let _ = fs::remove_dir_all(&path);
         }
     }
+}
+
+/// Whether some process holds template `name`'s lock. Taking it exclusively
+/// and letting it go at once tells, since every user holds it shared.
+fn held(tmp: &Path, name: &str) -> bool {
+    open_lock(tmp, name).try_lock().is_err()
 }
 
 #[cfg(test)]
@@ -194,10 +232,10 @@ mod tests {
     #[test]
     fn a_template_is_built_once_and_a_second_caller_reuses_it() {
         let sandbox = fresh_sandbox_dir("template");
-        let first = ensure(&sandbox);
+        let (first, _first_lock) = ensure(&sandbox);
         let built = fs::metadata(&first).and_then(|m| m.modified()).unwrap();
         std::thread::sleep(Duration::from_millis(20));
-        let second = ensure(&sandbox);
+        let (second, _second_lock) = ensure(&sandbox);
         assert_eq!(first, second);
         // A reuse touches the directory but builds no other.
         let templates = fs::read_dir(&sandbox)
@@ -216,7 +254,7 @@ mod tests {
         let sandbox = fresh_sandbox_dir("staging");
         let leftover = sandbox.join(format!("{TEMPLATE_PREFIX}{}.tmp-999999999", key()));
         fs::create_dir_all(leftover.join("base")).unwrap();
-        let template = ensure(&sandbox);
+        let (template, _lock) = ensure(&sandbox);
         assert!(!leftover.exists());
         assert!(template.join("PG_VERSION").exists());
         let _ = fs::remove_dir_all(&sandbox);
@@ -233,24 +271,39 @@ mod tests {
     }
 
     #[test]
-    fn only_templates_unused_for_a_day_are_deleted() {
+    fn a_builder_deletes_only_old_templates_no_process_holds() {
         let sandbox = fresh_sandbox_dir("stale");
-        let old = sandbox.join(format!("{TEMPLATE_PREFIX}old"));
-        let fresh = sandbox.join(format!("{TEMPLATE_PREFIX}fresh"));
-        let other = sandbox.join("unrelated");
-        for dir in [&old, &fresh, &other] {
+        let path = |name: &str| sandbox.join(format!("{TEMPLATE_PREFIX}{name}"));
+        let (old, held_old, fresh, staging, other) = (
+            path("old"),
+            path("held"),
+            path("fresh"),
+            path("x.tmp-1"),
+            sandbox.join("unrelated"),
+        );
+        for dir in [&old, &held_old, &fresh, &staging, &other] {
             fs::create_dir_all(dir).unwrap();
         }
-        let status = Command::new("touch")
-            .args(["-t", "202001010000"])
-            .arg(&old)
-            .status()
-            .unwrap();
-        assert!(status.success());
-        delete_stale(&sandbox);
-        assert!(!old.exists());
-        assert!(fresh.exists());
-        assert!(other.exists());
+        let holder = open_lock(&sandbox, &format!("{TEMPLATE_PREFIX}held"));
+        holder.lock_shared().unwrap();
+        let old_lock = sandbox.join(format!("{TEMPLATE_PREFIX}gone.lock"));
+        fs::File::create(&old_lock).unwrap();
+        for stale in [&old, &held_old, &staging, &other, &old_lock] {
+            let status = Command::new("touch")
+                .args(["-t", "202001010000"])
+                .arg(stale)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        delete_stale(&sandbox, &format!("{TEMPLATE_PREFIX}own"));
+        assert!(!old.exists(), "an old template nobody holds is deleted");
+        assert!(held_old.exists(), "a template a process holds is kept");
+        assert!(fresh.exists(), "a recently used template is kept");
+        assert!(!staging.exists(), "an old staging directory is deleted");
+        assert!(!old_lock.exists(), "an old lock nobody holds is deleted");
+        assert!(other.exists(), "nothing else is touched");
+        drop(holder);
         let _ = fs::remove_dir_all(&sandbox);
     }
 
