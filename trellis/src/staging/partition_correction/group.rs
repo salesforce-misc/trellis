@@ -434,12 +434,35 @@ async fn node_to_read(
     {
         return Ok(None);
     }
+    Ok(lock_recorded_node(txn, correction.node_oid, recorded)
+        .await?
+        .filter(|node| node.as_recorded)
+        .map(|node| node.name))
+}
+
+/// A node of the recorded tree, locked by [`lock_recorded_node`].
+pub(crate) struct LockedNode {
+    /// Quoted and qualified.
+    pub name: String,
+    /// Whether the whole tree is exactly as recorded (see [`node_to_read`]),
+    /// as of the lock.
+    pub as_recorded: bool,
+}
+
+/// Locks the node `node_oid` of `recorded` `ACCESS SHARE` for the rest of
+/// `txn` and checks the tree against the record (see [`node_to_read`]).
+/// `None` when the node is gone.
+pub(crate) async fn lock_recorded_node(
+    txn: &tokio_postgres::Transaction<'_>,
+    node_oid: u32,
+    recorded: &partitions::Recorded,
+) -> Result<Option<LockedNode>, tokio_postgres::Error> {
     let name: Option<String> = txn
         .query_opt(
             "select pg_catalog.format('%I.%I', n.nspname, c.relname) \
              from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
              where c.oid = $1::bigint::oid and c.relkind in ('r', 'p')",
-            &[&i64::from(correction.node_oid)],
+            &[&i64::from(node_oid)],
         )
         .await?
         .map(|row| row.get(0));
@@ -453,7 +476,10 @@ async fn node_to_read(
     let mut xmins = Vec::new();
     for node in &recorded.nodes[1..] {
         let (Some(parent), Some(xmin)) = (node.parent, node.inherits_xmin.as_ref()) else {
-            return Ok(None);
+            return Ok(Some(LockedNode {
+                name,
+                as_recorded: false,
+            }));
         };
         oids.push(i64::from(node.oid));
         parents.push(i64::from(parent));
@@ -475,5 +501,5 @@ async fn node_to_read(
         )
         .await?
         .get(0);
-    Ok(as_recorded.then_some(name))
+    Ok(Some(LockedNode { name, as_recorded }))
 }

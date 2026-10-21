@@ -137,8 +137,11 @@
 //! sweep job in `super::build`) fires [`PausePoint::AfterRebuildLock`] for
 //! the definition's target once it has locked its groups, before the
 //! statement that takes its snapshot, and [`PausePoint::BeforeRebuildCommit`]
-//! after its last write, before it commits (#1101). A test runs the job
-//! inside [`with_scope`].
+//! after its last write, before it commits (#1101). Over a partitioned
+//! source the job is a transaction per leaf, and each fires
+//! [`PausePoint::BeforeRebuildCommit`] (an armed point fires once, at the
+//! first); between two of them it fires [`PausePoint::BetweenRebuildStructures`].
+//! A test runs the job inside [`with_scope`].
 //!
 //! A later part that replaces a step moves its hook with it.
 //!
@@ -319,6 +322,11 @@ pub enum PausePoint {
     /// (`super::build`'s rebuild job, #1101). Readers still see the old
     /// values here.
     BeforeRebuildCommit,
+    /// Between two transactions of a rebuild of a partitioned source's
+    /// leaves, after one leaf committed and before the next begins, for the
+    /// definition's target (`super::build`'s rebuild job, #1101). Waits as
+    /// [`pause_between_transactions`] does, holding no snapshot.
+    BetweenRebuildStructures,
 }
 
 /// What a frozen worker reports when it reaches its armed point.

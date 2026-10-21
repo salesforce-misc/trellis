@@ -619,6 +619,15 @@ impl<T> Running<T> {
             .is_none_or(|handle| handle.is_finished())
     }
 
+    /// Kills the task where it is, as a worker that dies: nothing it had not
+    /// committed survives, and its claims are left for the test to release.
+    /// The armed points stay held, so nothing runs on past one.
+    pub async fn kill(mut self) {
+        let handle = self.handle.take().expect("task");
+        handle.abort();
+        let _ = handle.await;
+    }
+
     /// Waits for the task to finish, after every armed point was released.
     pub async fn finish(self) -> T {
         self.finish_result().await.expect("the task failed")

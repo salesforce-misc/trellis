@@ -738,7 +738,17 @@ it adds its region's partials to the groups as increments.
   own (R6), runs the `GROUP BY` of the structure's source rows from one
   snapshot, and **replaces**, not adds to, each group's hidden partials and
   visible row, with that snapshot as the group's basis and its stamp per
-  R5.
+  R5. On a partitioned source the structures are the leaves of the source's
+  recorded tree, in oid order, then a remainder: the groups of the target
+  and the ring that route to no recorded leaf, read through the root, which
+  zeroes each. Each is a transaction of its own, and the job's cursor holds
+  the last leaf committed, so a job that dies resumes after it. A page between
+  two transactions sees the earlier leaves' new bases and the later leaves'
+  old ones, which is exact per group. A leaf of a tree that has changed since
+  it was recorded is read through the root, one probe per group, and the
+  change's own correction (ADR-0017) repairs what it moved. A leaf whose
+  routing text was never recorded halts the rebuild: no statement ever covers
+  more than one leaf's groups.
 - **Must:** the groups a rebuild covers are the enumeration union (R8): the
   source's groups, the groups named by old images of undrained ring
   changes, and the target's own groups. A group with no source rows goes to

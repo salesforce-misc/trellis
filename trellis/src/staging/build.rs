@@ -48,8 +48,11 @@
 //!   every group in place in one transaction
 //!   (`super::group_basis::rebuild`, #1101): its readers see the old values
 //!   until that commits, then the new ones, never an empty or partial
-//!   target. A fresh group-basis build never has a sweep, so a sweep row
-//!   is always this rebuild.
+//!   target. Over a partitioned source it is one such transaction per leaf
+//!   of the recorded tree, then one for the groups that route to no leaf
+//!   ([`run_group_rebuild`]), so a reader sees a leaf's groups change as its
+//!   transaction commits. A fresh group-basis build never has a sweep, so a
+//!   sweep row is always this rebuild.
 //! - **Plan** ([`run_plan`]). A drain worker walks the source's primary key
 //!   and enqueues `rederive` chunks of `ClientOptions::build_chunk_rows`
 //!   rows, [`PLAN_BATCH`] per transaction (Q13). The walk and every chunk
@@ -3274,14 +3277,24 @@ async fn run_plan(
 /// and one that committed never does. The rebuild is idempotent: run again,
 /// it writes each group from a newer snapshot. Then [`try_complete`].
 ///
-/// On an unpartitioned source that one transaction is the whole rebuild. A
-/// partitioned source's rebuild (one statement per partition) is #1101's
-/// open part, so it halts here.
+/// On an unpartitioned source that one transaction is the whole rebuild. On
+/// a partitioned source the job is one such transaction per **leaf** of the
+/// source's recorded tree, in oid order, then one for the **remainder**, the
+/// groups that route to no recorded leaf ([`run_group_structure`]). Each
+/// group's key holds every partition-key column (ADR-0017), so each routes to
+/// exactly one structure and the transactions write disjoint sets of groups,
+/// each a whole absolute write: no statement or lock covers more than one
+/// leaf's groups. The job's cursor (`backfill_chunks.lo`) holds the oid of
+/// the last leaf committed, so a job that dies resumes after it; the
+/// remainder's transaction marks the job done. A page between two
+/// transactions sees the first leaf's new bases and the second's old ones,
+/// which is exact per group.
 async fn run_group_rebuild(
     pool: &Pool,
     chunk: &ClaimedChunk,
     claimed_by: &str,
     definition: &Definition,
+    cursor: Option<&str>,
     options: &WorkerOptions,
 ) -> Result<(), ChunkQueueError> {
     let _heartbeat = chunk_queue::ChunkHeartbeat::spawn(
@@ -3292,13 +3305,130 @@ async fn run_group_rebuild(
     );
     let fence = ClaimFence::new(chunk.id, claimed_by, options.reclaim_ttl);
     let mut client = pool.get().await?;
-    if crate::defs::partition_tree::is_partitioned_root(&**client, &definition.source_table).await?
+    if !crate::defs::partition_tree::is_partitioned_root(&**client, &definition.source_table)
+        .await?
     {
-        return Err(build_error(ApplyError::GroupBasisUnsupported {
-            target: definition.target_table.clone(),
-            what: "a rebuild over a partitioned source (one statement per partition is #1101's)",
-        }));
+        let Some((written, deleted)) = run_group_structure(
+            pool,
+            &mut client,
+            chunk,
+            &fence,
+            definition,
+            &Structure::Whole,
+        )
+        .await?
+        else {
+            return chunk_queue::discard_if_superseded(pool, chunk, claimed_by).await;
+        };
+        crate::instance_log::debug!(
+            definition_id = chunk.definition_id,
+            written,
+            deleted,
+            "group-basis rebuild replaced every group"
+        );
+        try_complete(pool, chunk.definition_id).await?;
+        return Ok(());
     }
+    let unsupported = |what: &'static str| {
+        build_error(ApplyError::GroupBasisUnsupported {
+            target: definition.target_table.clone(),
+            what,
+        })
+    };
+    let recorded = crate::capture::partitions::recorded(&**client, &definition.source_table)
+        .await
+        .map_err(|e| ChunkQueueError::Correction(Box::new(e.into())))?;
+    let Some(recorded) = recorded else {
+        return Err(unsupported(
+            "a rebuild over a partitioned source whose tree is not recorded",
+        ));
+    };
+    let Ok(leaves) = super::partition_correction::rebuild_leaves(&recorded) else {
+        return Err(unsupported(
+            "a rebuild over a partitioned source with a leaf that has no usable constraint text",
+        ));
+    };
+    let Some(shape) = super::group_basis::route(&definition.def, &definition.source_columns) else {
+        return Err(unsupported(
+            "a rebuild of a definition the group basis does not take",
+        ));
+    };
+    let names: Vec<&str> = shape.group_columns().iter().map(String::as_str).collect();
+    let after: Option<u32> = cursor.and_then(|c| c.parse().ok());
+    let mut remaining: Vec<&super::partition_correction::RebuildLeaf> = leaves
+        .iter()
+        .filter(|leaf| after.is_none_or(|done| leaf.oid > done))
+        .collect();
+    remaining.reverse();
+    let (mut written, mut deleted) = (0, 0);
+    // The leaves left, then the remainder, which marks the job done.
+    loop {
+        let leaf = remaining.pop();
+        let structure = Structure::Partitioned {
+            names: &names,
+            recorded: &recorded,
+            leaves: &leaves,
+            leaf,
+            last: leaf.is_none(),
+        };
+        let Some((w, d)) =
+            run_group_structure(pool, &mut client, chunk, &fence, definition, &structure).await?
+        else {
+            return chunk_queue::discard_if_superseded(pool, chunk, claimed_by).await;
+        };
+        written += w;
+        deleted += d;
+        if leaf.is_none() {
+            break;
+        }
+        #[cfg(any(test, feature = "test-util"))]
+        super::interleave::pause_between_transactions(
+            &**client,
+            super::interleave::PausePoint::BetweenRebuildStructures,
+            &definition.target_table,
+        )
+        .await?;
+    }
+    crate::instance_log::debug!(
+        definition_id = chunk.definition_id,
+        written,
+        deleted,
+        leaves = leaves.len(),
+        "group-basis rebuild replaced every group, one leaf at a time"
+    );
+    try_complete(pool, chunk.definition_id).await?;
+    Ok(())
+}
+
+/// What one transaction of a group-basis rebuild covers.
+enum Structure<'a> {
+    /// The whole of an unpartitioned source: the job's only transaction.
+    Whole,
+    /// One leaf of a partitioned source's recorded tree, or, with no `leaf`,
+    /// the remainder. `last` marks the job done.
+    Partitioned {
+        names: &'a [&'a str],
+        recorded: &'a crate::capture::partitions::Recorded,
+        leaves: &'a [super::partition_correction::RebuildLeaf],
+        leaf: Option<&'a super::partition_correction::RebuildLeaf>,
+        last: bool,
+    },
+}
+
+/// One transaction of a group-basis rebuild ([`run_group_rebuild`]): the
+/// structure's absolute write ([`super::group_basis::rebuild_definition`]),
+/// and in the same transaction the job's progress (the leaf's oid as its
+/// cursor, or its done mark when `structure` is the last), fenced by the
+/// claim. Returns the visible rows written and deleted, or `None` when the
+/// claim no longer holds.
+async fn run_group_structure(
+    pool: &Pool,
+    client: &mut tokio_postgres::Client,
+    chunk: &ClaimedChunk,
+    fence: &ClaimFence<'_>,
+    definition: &Definition,
+    structure: &Structure<'_>,
+) -> Result<Option<(usize, usize)>, ChunkQueueError> {
     let started = Instant::now();
     let txn = client
         .build_transaction()
@@ -3309,38 +3439,81 @@ async fn run_group_rebuild(
         "set local application_name = '{CHUNK_APPLICATION_NAME}'"
     ))
     .await?;
-    if !fence.hold(&*txn).await? {
+    if !fence.hold(&txn).await? {
         txn.rollback().await?;
-        return chunk_queue::discard_if_superseded(pool, chunk, claimed_by).await;
+        return Ok(None);
     }
+    let (scope, cursor) = match structure {
+        Structure::Whole => (None, None),
+        Structure::Partitioned {
+            names,
+            recorded,
+            leaf: Some(leaf),
+            ..
+        } => {
+            // The leaf locked `ACCESS SHARE` and the tree checked against
+            // the record, both held to the commit: a leaf that is gone, or
+            // a tree that changed, is read through the root, one probe per
+            // group, and the change's own correction repairs what it moved
+            // (ADR-0017).
+            let locked =
+                super::partition_correction::lock_recorded_node(&txn, leaf.oid, recorded).await?;
+            let (node, read_node) = match locked {
+                Some(locked) => (Some(locked.name), locked.as_recorded),
+                None => (None, false),
+            };
+            (
+                Some(super::partition_correction::leaf_scope(
+                    names, recorded, leaf, node, read_node,
+                )),
+                Some(leaf.oid.to_string()),
+            )
+        }
+        Structure::Partitioned {
+            names,
+            recorded,
+            leaves,
+            leaf: None,
+            ..
+        } => (
+            Some(super::partition_correction::remainder_scope(
+                names, recorded, leaves,
+            )),
+            None,
+        ),
+    };
     let (written, deleted) =
-        super::group_basis::rebuild_definition(&txn, pool.schema(), definition)
+        super::group_basis::rebuild_definition(&txn, pool.schema(), definition, scope.as_ref())
             .await
             .map_err(build_error)?
             .unwrap_or((0, 0));
-    txn.execute(
-        "update backfill_chunks set done = true, claimed_by = null, claimed_at = null \
-         where id = $1",
-        &[&chunk.id],
-    )
-    .await?;
+    match (structure, cursor) {
+        (Structure::Partitioned { last: false, .. }, Some(cursor)) => {
+            txn.execute(
+                "update backfill_chunks set lo = $2 where id = $1",
+                &[&chunk.id, &cursor],
+            )
+            .await?;
+        }
+        _ => {
+            txn.execute(
+                "update backfill_chunks set done = true, claimed_by = null, claimed_at = null \
+                 where id = $1",
+                &[&chunk.id],
+            )
+            .await?;
+        }
+    }
     #[cfg(any(test, feature = "test-util"))]
     super::interleave::pause_at(
-        &*txn,
+        &txn,
         super::interleave::PausePoint::BeforeRebuildCommit,
         &definition.target_table,
     )
     .await?;
     txn.commit().await?;
     metrics::record_build_chunk(started.elapsed(), (written + deleted) as u64, 0);
-    crate::instance_log::debug!(
-        definition_id = chunk.definition_id,
-        written,
-        deleted,
-        "group-basis rebuild replaced every group"
-    );
-    try_complete(pool, chunk.definition_id).await?;
-    Ok(())
+    Ok(Some((written, deleted)))
 }
 
 /// Runs a claimed sweep job (#625 F3; see the module doc): [`sweep_batch`]es
@@ -3370,7 +3543,15 @@ async fn run_sweep(
         }));
     }
     if takes_group_basis(&definition) {
-        return run_group_rebuild(pool, chunk, claimed_by, &definition, options).await;
+        return run_group_rebuild(
+            pool,
+            chunk,
+            claimed_by,
+            &definition,
+            cursor.as_deref(),
+            options,
+        )
+        .await;
     }
     let plan = AnyPlan::for_definition(pool, &definition).await?;
     let _heartbeat = chunk_queue::ChunkHeartbeat::spawn(

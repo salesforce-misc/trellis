@@ -165,6 +165,7 @@ use super::build::{self, BuildPlan, CHUNK_APPLICATION_NAME};
 use super::ledger::LedgerTargetPlan;
 
 mod group;
+pub(crate) use group::lock_recorded_node;
 mod to_many;
 
 /// Keys per page by default, the size of a build chunk
@@ -420,6 +421,95 @@ fn route_of(correction: &PendingCorrection, recorded: Option<&Recorded>) -> Rout
         Some(text) => Route::Text(text),
         None if is_default => Route::Every,
         None => Route::Unusable,
+    }
+}
+
+/// A leaf of a partitioned source's recorded tree and how its groups route
+/// to it, for a group-basis rebuild's structures
+/// ([`super::group_basis::RebuildScope`], #1101).
+#[derive(Debug, Clone)]
+pub(crate) struct RebuildLeaf {
+    /// The leaf's oid, which orders the structures and is the job's cursor.
+    pub oid: u32,
+    route: Route,
+}
+
+/// The leaves of `recorded` in oid order, each with its route by its
+/// recorded constraint text. `Err` names the first leaf with no usable
+/// route (its text was never fetched and it is no `DEFAULT`), whose groups
+/// nothing could be routed to.
+pub(crate) fn rebuild_leaves(recorded: &Recorded) -> Result<Vec<RebuildLeaf>, String> {
+    let mut leaves = Vec::new();
+    for node in recorded.nodes.iter().skip(1).filter(|n| !n.partitioned) {
+        let route = match &node.constraint {
+            Some(text) => Route::Text(text.clone()),
+            None if node.is_default => Route::Every,
+            None => return Err(node.name.clone()),
+        };
+        leaves.push(RebuildLeaf {
+            oid: node.oid,
+            route,
+        });
+    }
+    leaves.sort_by_key(|leaf| leaf.oid);
+    Ok(leaves)
+}
+
+/// The scope of the rebuild structure for `leaf`: the groups `names` that
+/// route to it, and its own rows (`node`, locked by the caller;
+/// `read_node` as [`super::group_basis::RebuildScope::read_node`]).
+pub(crate) fn leaf_scope(
+    names: &[&str],
+    recorded: &Recorded,
+    leaf: &RebuildLeaf,
+    node: Option<String>,
+    read_node: bool,
+) -> super::group_basis::RebuildScope {
+    let on = |alias: &str| {
+        route_predicate(
+            &leaf.route,
+            &route_columns_named(names, Some(recorded), alias),
+        )
+    };
+    super::group_basis::RebuildScope {
+        hidden: on("h"),
+        target: on("t"),
+        images: on("s"),
+        node,
+        read_node,
+    }
+}
+
+/// The scope of the rebuild structure after the leaves: the groups of the
+/// target and the ring that route to none of `leaves`. A leaf dropped since
+/// the tree was recorded, a row of the target nothing wrote, and an image
+/// of a node gone are the groups here. Each is read through the root.
+pub(crate) fn remainder_scope(
+    names: &[&str],
+    recorded: &Recorded,
+    leaves: &[RebuildLeaf],
+) -> super::group_basis::RebuildScope {
+    let none = |alias: &str| {
+        if leaves.is_empty() {
+            return "true".to_string();
+        }
+        let any: Vec<String> = leaves
+            .iter()
+            .map(|leaf| {
+                route_predicate(
+                    &leaf.route,
+                    &route_columns_named(names, Some(recorded), alias),
+                )
+            })
+            .collect();
+        format!("not ({})", any.join(" or "))
+    };
+    super::group_basis::RebuildScope {
+        hidden: none("h"),
+        target: none("t"),
+        images: none("s"),
+        node: None,
+        read_node: false,
     }
 }
 

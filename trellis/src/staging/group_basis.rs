@@ -24,7 +24,9 @@
 //!   fresh;
 //! - is rebuilt in place once `live` ([`rebuild`]: `request_backfill`, a
 //!   capture re-install, an automatic rebuild, or an upstream's rebuild),
-//!   except over a partitioned source, whose rebuild halts (#1101);
+//!   over a partitioned source one transaction per leaf of its recorded tree
+//!   and one for the groups that route to no leaf (`super::build`'s
+//!   `run_group_rebuild`);
 //! - is refused at define for `SUM`/`AVG` over a `numeric` column with no
 //!   declared scale (#1096 decision 2).
 //!
@@ -1490,8 +1492,21 @@ impl GroupTargetPlan {
     /// read covers every undrained change, and may name the groups of
     /// drained changes whose segment is not yet retired, which costs only
     /// their recompute.
-    fn rebuild_groups_sql(&self) -> String {
+    ///
+    /// With a `scope` (one structure of a partitioned source's rebuild) it
+    /// adds only the groups the scope's predicates route to the structure,
+    /// and, for a leaf, the groups of the leaf's own rows instead of the
+    /// source's.
+    fn rebuild_groups_sql(&self, scope: Option<&RebuildScope>) -> String {
         let cols = quoted(&self.shape.group_cols).join(", ");
+        let (hidden_filter, target_filter, image_filter) = match scope {
+            Some(scope) => (
+                format!(" where {}", scope.hidden),
+                format!(" where {}", scope.target),
+                format!(" where {}", scope.images),
+            ),
+            None => Default::default(),
+        };
         let images: Vec<String> = self
             .ring
             .iter()
@@ -1509,13 +1524,28 @@ impl GroupTargetPlan {
                 ]
             })
             .collect();
+        // A leaf's own rows; the whole source for an unpartitioned rebuild;
+        // none for the remainder, whose groups have no row of their own.
+        let own = match scope {
+            None => format!(
+                " union all select distinct {values} from {src} s",
+                values = self.group_values().join(", "),
+                src = self.source_row
+            ),
+            Some(RebuildScope {
+                node: Some(node), ..
+            }) => format!(
+                " union all select distinct {values} from {node} s",
+                values = self.group_values().join(", ")
+            ),
+            Some(_) => String::new(),
+        };
         format!(
             "insert into {rc} ({cols}) \
-             select {cols} from {hidden} \
-             union all select {cols} from {target} \
-             union all select distinct {values} from {src} s \
+             select {cols} from {hidden} h{hidden_filter} \
+             union all select {cols} from {target} t{target_filter}{own} \
              union all select {values} from ({images}) as r \
-                 cross join lateral jsonb_populate_record(null::{src}, r.__i) as s",
+                 cross join lateral jsonb_populate_record(null::{src}, r.__i) as s{image_filter}",
             rc = self.recomputed,
             hidden = self.hidden_ident,
             target = self.target_ident,
@@ -1541,7 +1571,7 @@ impl GroupTargetPlan {
     /// image is the row the target held. Returns rows in
     /// [`Self::visible_tail_sql`]'s layout, with each partial's new value in
     /// place of its change.
-    fn rebuild_sql(&self, image_columns: Option<&[String]>) -> String {
+    fn rebuild_sql(&self, image_columns: Option<&[String]>, read: &RebuildRead) -> String {
         let cols = quoted(&self.shape.group_cols);
         let col_list = cols.join(", ");
         let args = &self.shape.args;
@@ -1636,20 +1666,70 @@ impl GroupTargetPlan {
             }
             None => "null::text".to_string(),
         };
+        let lookup_hidden = self.group_lookup(&self.hidden_ident, "rg", "x.ctid");
+        let r = match read {
+            // One `GROUP BY` of the source or of a leaf, matched to the
+            // locked groups.
+            RebuildRead::Source | RebuildRead::Node(_) => {
+                let from = match read {
+                    RebuildRead::Node(node) => node.as_str(),
+                    _ => self.source_row.as_str(),
+                };
+                format!(
+                    "a as ( \
+                         select {values}, {fresh} from {from} s group by {positions} \
+                     ), \
+                     r as ( \
+                         select h.__hc, {kept} from rg \
+                         cross join lateral {lookup_hidden} as h(__hc) \
+                         left join a on {matched} \
+                     )",
+                    values = self.group_values().join(", "),
+                    fresh = fresh.join(", "),
+                    positions = positions.join(", "),
+                    kept = kept.join(", "),
+                    matched = matched.join(" and "),
+                )
+            }
+            // One index probe of the root per group, for a set that is not
+            // a leaf's (the remainder's) or a leaf of a tree that is not as
+            // recorded.
+            RebuildRead::Probe => {
+                let equal: Vec<String> = cols.iter().map(|c| format!("s.{c} = rg.{c}")).collect();
+                let has_null: Vec<String> =
+                    cols.iter().map(|c| format!("rg.{c} is null")).collect();
+                let same: Vec<String> = cols
+                    .iter()
+                    .map(|c| format!("s.{c} is not distinct from rg.{c}"))
+                    .collect();
+                format!(
+                    "r as ( \
+                         select h.__hc, {kept} from rg \
+                         cross join lateral {lookup_hidden} as h(__hc) \
+                         cross join lateral ( \
+                             select {fresh} from ( \
+                                 select s.* from {src} s where {equal} \
+                                 union all \
+                                 select s.* from {src} s where ({has_null}) and {same} \
+                             ) as s \
+                         ) as a \
+                     )",
+                    kept = kept.join(", "),
+                    fresh = fresh.join(", "),
+                    src = self.source_row,
+                    equal = equal.join(" and "),
+                    has_null = has_null.join(" or "),
+                    same = same.join(" and "),
+                )
+            }
+        };
         format!(
             "with snap as materialized ( \
                  select pg_catalog.pg_current_snapshot() as __snap, \
                         coalesce((select max(seg_seq) from segments), 0) as __seg \
              ), \
              rg as (select distinct {col_list} from {recomputed}), \
-             a as ( \
-                 select {values}, {fresh} from {src} s group by {positions} \
-             ), \
-             r as ( \
-                 select h.__hc, {kept} from rg \
-                 cross join lateral {lookup_hidden} as h(__hc) \
-                 left join a on {matched} \
-             ), \
+             {r}, \
              up as ( \
                  update {hidden} u set {sets}, __basis = snap.__snap, __stamp = snap.__seg \
                  from r, snap where u.ctid = r.__hc \
@@ -1676,13 +1756,7 @@ impl GroupTargetPlan {
                     {applied} \
              from cur",
             recomputed = self.recomputed,
-            values = self.group_values().join(", "),
-            fresh = fresh.join(", "),
-            src = self.source_row,
-            positions = positions.join(", "),
-            kept = kept.join(", "),
-            lookup_hidden = self.group_lookup(&self.hidden_ident, "rg", "x.ctid"),
-            matched = matched.join(" and "),
+            r = r,
             hidden = self.hidden_ident,
             sets = sets.join(", "),
             up_groups = up_groups.join(", "),
@@ -2128,6 +2202,40 @@ pub(crate) async fn release(
     Ok(true)
 }
 
+/// One structure of a partitioned source's rebuild (#1101): a leaf of the
+/// recorded tree, or the remainder, the groups that route to no leaf. Every
+/// group key holds every partition-key column (ADR-0017), so a group routes
+/// to exactly one leaf and the structures cover disjoint sets of groups. The
+/// predicates are SQL booleans over a row aliased `h` (a hidden row), `t` (a
+/// visible row) or `s` (a source-row image), each true for the groups the
+/// structure covers; they must run under the pinned settings
+/// (`crate::capture::partitions::pinned_settings`).
+#[derive(Debug, Clone)]
+pub(crate) struct RebuildScope {
+    pub hidden: String,
+    pub target: String,
+    pub images: String,
+    /// The leaf (quoted and qualified), if the structure is one, whose own
+    /// rows' groups the enumeration adds. The caller holds it `ACCESS SHARE`.
+    pub node: Option<String>,
+    /// Whether the replace reads the leaf by one `GROUP BY`: the caller has
+    /// established that the tree is as recorded, so the leaf holds every row
+    /// of every group the scope covers and no row of any other. When it
+    /// isn't, the replace reads each group's rows through the root.
+    pub read_node: bool,
+}
+
+/// Where a rebuild's replace reads the groups' rows from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RebuildRead {
+    /// One `GROUP BY` of the whole source.
+    Source,
+    /// One `GROUP BY` of a partition (quoted and qualified).
+    Node(String),
+    /// One index probe of the source per group.
+    Probe,
+}
+
 /// A rebuild of a group-basis target that already has groups (ADR-0002,
 /// "An aggregate's build adds each chunk's partials under its group locks";
 /// #1101's decision), in the caller's `READ COMMITTED` transaction, which
@@ -2151,17 +2259,52 @@ pub(crate) async fn release(
 /// replace leaves it to its pages, which apply each of its changes once.
 /// Readers see each group's old values until the commit, then the new ones.
 ///
+/// With a `scope`, the write covers one structure of a partitioned source's
+/// rebuild (a leaf, or the groups that route to no leaf): the enumeration
+/// names only the groups that route to it, and the replace reads the leaf's
+/// rows by one `GROUP BY` of it, or each group's through the root.
+///
 /// Each changed visible row is recorded into `mutations`. Returns how many
 /// visible rows it wrote and deleted.
 pub(crate) async fn rebuild(
     txn: &Transaction<'_>,
     plan: &GroupTargetPlan,
+    scope: Option<&RebuildScope>,
     mutations: &mut TargetMutations,
 ) -> Result<(usize, usize), ApplyError> {
     txn.batch_execute(&format!("{}; {}", plan.staged_ddl(), plan.recomputed_ddl()))
         .await?;
-    txn.execute(&plan.rebuild_groups_sql(), &[&plan.source])
+    let session = if scope.is_some() {
+        // The routing predicates mean what they meant when the tree was
+        // recorded only under the pinned settings. Only the enumeration runs
+        // under them, and waits for a lock as the session does.
+        let row = txn
+            .query_one(
+                "select current_setting('search_path'), current_setting('lock_timeout'), \
+                        current_setting('datestyle'), current_setting('timezone')",
+                &[],
+            )
+            .await?;
+        let saved: [String; 4] = [row.get(0), row.get(1), row.get(2), row.get(3)];
+        txn.batch_execute(&format!(
+            "{}; set local lock_timeout to default",
+            crate::capture::partitions::pinned_settings()
+        ))
         .await?;
+        Some(saved)
+    } else {
+        None
+    };
+    txn.execute(&plan.rebuild_groups_sql(scope), &[&plan.source])
+        .await?;
+    if let Some(saved) = session {
+        txn.execute(
+            "select set_config('search_path', $1, true), set_config('lock_timeout', $2, true), \
+                    set_config('datestyle', $3, true), set_config('timezone', $4, true)",
+            &[&saved[0], &saved[1], &saved[2], &saved[3]],
+        )
+        .await?;
+    }
     txn.execute(&plan.lock_sql(), &[]).await?;
     // Test-only pause point: the groups are locked, and the replace's
     // snapshot is not yet taken. See `super::interleave`.
@@ -2173,8 +2316,17 @@ pub(crate) async fn rebuild(
     )
     .await?;
     let image_columns = mutations.image_columns(txn, &plan.target).await?;
+    let read = match scope {
+        None => RebuildRead::Source,
+        Some(RebuildScope {
+            node: Some(node),
+            read_node: true,
+            ..
+        }) => RebuildRead::Node(node.clone()),
+        Some(_) => RebuildRead::Probe,
+    };
     let rows = txn
-        .query(&plan.rebuild_sql(image_columns.as_deref()), &[])
+        .query(&plan.rebuild_sql(image_columns.as_deref(), &read), &[])
         .await?;
     let (_, written, deleted) = written_groups(plan, rows, mutations);
     Ok((written, deleted))
@@ -2188,6 +2340,7 @@ pub(crate) async fn rebuild_definition(
     txn: &Transaction<'_>,
     catalog_schema: &str,
     definition: &crate::defs::model::Definition,
+    scope: Option<&RebuildScope>,
 ) -> Result<Option<(usize, usize)>, ApplyError> {
     let Some(shape) = route(&definition.def, &definition.source_columns) else {
         return Ok(None);
@@ -2204,7 +2357,7 @@ pub(crate) async fn rebuild_definition(
         shape,
     );
     let mut mutations = TargetMutations::new();
-    let counts = rebuild(txn, &plan, &mut mutations).await?;
+    let counts = rebuild(txn, &plan, scope, &mut mutations).await?;
     let propagation = mutations.into_staged(txn).await?;
     super::append::append(txn, &propagation.changes).await?;
     Ok(Some(counts))
