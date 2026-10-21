@@ -442,3 +442,84 @@ async fn a_rebuild_writes_averages_numeric_sums_and_composed_fields() {
     d.settle().await;
     assert_eq!(d.rows(ACTUAL).await, d.rows(EXPECTED).await);
 }
+
+/// Pauses [`AGG`] the way a capture disruption does, by hand.
+async fn pause(d: &Driver) {
+    d.ctl
+        .batch_execute(
+            "update transform_definitions set status = 'paused' where target_table = 'public.agg'",
+        )
+        .await
+        .expect("pause");
+}
+
+/// A whole-transform `RESUME` of a group-basis aggregate is accepted (#1222):
+/// it keeps no ledger and no group-delta table, so the owned-table checks
+/// that a ledger aggregate's resume runs have nothing to find missing.
+#[tokio::test]
+async fn resume_of_a_paused_group_basis_aggregate_is_accepted() {
+    let d = start().await;
+    pause(&d).await;
+    trellis::staging::quarantine::resume_transform(d.pool(), "agg")
+        .await
+        .expect("the resume is not refused for a ledger the group basis never creates");
+    assert_eq!(d.rows(STATUS).await, ["(waiting_to_backfill)"]);
+}
+
+/// A resume refuses a group-basis aggregate whose hidden partials table is
+/// missing (#1222), rather than resuming one whose every page would fail.
+#[tokio::test]
+async fn resume_refuses_a_missing_partials_table() {
+    let d = start().await;
+    pause(&d).await;
+    let hidden = hidden(&d).await;
+    d.ctl
+        .batch_execute(&format!("drop table {hidden}"))
+        .await
+        .expect("drop the partials table");
+    let err = trellis::staging::quarantine::resume_transform(d.pool(), "agg")
+        .await
+        .expect_err("refused");
+    assert!(
+        err.to_string().contains("group-basis partials table"),
+        "{err}"
+    );
+    assert_eq!(d.rows(STATUS).await, ["(paused)"]);
+}
+
+/// An aggregate defined on the ledger, because the group basis doesn't take
+/// a `SUM` over `double precision`, whose argument is re-typed to `integer`
+/// while it is paused, would be on the group basis from its resume on, with
+/// no partials table: the resume refuses it (#1222).
+#[tokio::test]
+async fn resume_refuses_a_ledger_aggregate_the_group_basis_takes_now() {
+    trellis::dev::staging::set_group_basis(true);
+    let d = Driver::start(
+        "create table public.src (id integer primary key, g integer, v double precision); \
+         create index on public.src (g)",
+        &[
+            ("id", int4()),
+            ("g", int4()),
+            ("v", ValueType::Float(trellis::float::FloatWidth::Float8)),
+        ],
+        &[AGG],
+        &[SRC],
+    )
+    .await;
+    assert_eq!(
+        d.rows("select to_regclass('public.agg__ledger') is not null")
+            .await,
+        ["(t)"],
+        "defined on the ledger"
+    );
+    pause(&d).await;
+    write(&d, "alter table public.src alter column v type integer").await;
+    let err = trellis::staging::quarantine::resume_transform(d.pool(), "agg")
+        .await
+        .expect_err("refused");
+    assert!(
+        err.to_string().contains("group-basis partials table"),
+        "{err}"
+    );
+    assert_eq!(d.rows(STATUS).await, ["(paused)"]);
+}

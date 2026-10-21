@@ -986,21 +986,19 @@ impl Audit<'_> {
                 Keyset::resolve_columns(client, &audit.hidden(part), &names).await?
             }
         };
-        // The single-table parts are index-ordered when their table's index
-        // leads with the part's key ([`Keyset::run`]).
+        // The single-table parts are index-ordered when their table has the
+        // index define requires, leading with its join key
+        // ([`crate::defs::source_index`], [`Keyset::run`]): the page's later
+        // columns, a side's group columns, are sorted within each join key.
         let steer = match part {
             Part::Target => false,
             Part::From => {
-                let first = keyset.columns()[0].name.clone();
-                Keyset::index_leads_with(client, &audit.from_table, &first).await?
+                let key = spec::join_key(&def.def, JoinSide::From);
+                crate::defs::source_index::has_index(client, audit.from_src, &key).await?
             }
-            Part::Joined => {
-                let first = keyset.columns()[0].name.clone();
-                Keyset::index_leads_with(client, &audit.joined_table, &first).await?
-            }
-            Part::Matches => {
-                let first = spec::join_key(&def.def, JoinSide::Joined)[0].clone();
-                Keyset::index_leads_with(client, &audit.joined_table, &first).await?
+            Part::Joined | Part::Matches => {
+                let key = spec::join_key(&def.def, JoinSide::Joined);
+                crate::defs::source_index::has_index(client, audit.joined_src, &key).await?
             }
         };
         keyset.set_cursor(after)?;

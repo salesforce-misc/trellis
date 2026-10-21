@@ -306,7 +306,7 @@ struct TamperingHarness {
 thread_local! {
     static TAMPERING_HARNESS: TamperingHarness = TamperingHarness {
         runtime: tokio::runtime::Runtime::new().expect("build tokio runtime"),
-        cluster: TestCluster::start(),
+        cluster: TestCluster::start().long_lived(),
     };
 }
 

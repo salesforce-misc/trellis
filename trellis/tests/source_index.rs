@@ -91,10 +91,10 @@ async fn define_is_refused_without_the_index_and_names_the_fix() {
 }
 
 #[tokio::test]
-async fn a_key_a_unique_constraint_or_another_column_order_counts() {
+async fn a_key_a_unique_constraint_or_extra_trailing_columns_count() {
     let (_cluster, _db, raw, trellis) = setup(
         "create table public.u (id integer primary key, g integer unique, v integer); \
-         create index on public.src (h, g)",
+         create index on public.src (g, h, v)",
     )
     .await;
     // The primary key leads with the group column.
@@ -107,11 +107,11 @@ async fn a_key_a_unique_constraint_or_another_column_order_counts() {
         .apply("TRANSFORM by_u FROM public.u GROUP BY g SELECT SUM(v) AS t")
         .await
         .expect("a unique constraint counts");
-    // The same columns in another order.
+    // The group columns first, then more.
     trellis
         .apply("TRANSFORM by_gh FROM public.src GROUP BY g, h SELECT SUM(v) AS t")
         .await
-        .expect("the group columns in another order count");
+        .expect("the group columns with trailing columns count");
     // Leading columns only: an index with a column in between does not.
     raw.batch_execute("create table public.w (id integer primary key, a int, b int, c int, v int); create index on public.w (a, c, b)")
         .await
@@ -278,4 +278,88 @@ async fn a_join_checks_each_side_separately() {
     let gaps = status_of(&trellis, "j").await.source_index_gaps;
     assert_eq!(gaps.len(), 1, "{gaps:?}");
     assert_eq!(gaps[0].table, "public.items");
+}
+
+#[tokio::test]
+async fn the_index_must_lead_with_the_group_columns_in_group_by_order() {
+    let (_cluster, _db, raw, trellis) = setup("").await;
+    let by_gh = "TRANSFORM by_gh FROM public.src GROUP BY g, h SELECT SUM(v) AS t";
+    for wrong in ["(h, g)", "(g)", "(h)", "(g, v, h)"] {
+        raw.batch_execute(&format!("create index wrong on public.src {wrong}"))
+            .await
+            .expect("index");
+        let message = refusal(&trellis, by_gh).await;
+        assert!(message.contains("(g, h)"), "{wrong}: {message}");
+        assert!(
+            message.contains(r#"create index on "public"."src" ("g", "h")"#),
+            "{wrong}: {message}"
+        );
+        raw.batch_execute("drop index public.wrong")
+            .await
+            .expect("drop");
+    }
+    raw.batch_execute("create index on public.src (g, h)")
+        .await
+        .expect("index");
+    trellis.apply(by_gh).await.expect("(g, h) counts");
+}
+
+/// A page orders each group column ascending, `NULL` last: an index whose
+/// leading columns run that way, or all the other way (read backward), counts;
+/// one mixing directions, or with `NULL` first ascending, leaves each page to
+/// sort and doesn't (#1223).
+#[tokio::test]
+async fn the_index_must_run_in_the_page_order_forward_or_backward() {
+    let (_cluster, _db, raw, trellis) = setup("").await;
+    let by_gh = "TRANSFORM by_gh FROM public.src GROUP BY g, h SELECT SUM(v) AS t";
+    for wrong in [
+        "(g, h desc)",
+        "(g, h nulls first)",
+        "(g desc, h)",
+        "(g desc nulls last, h desc nulls last)",
+    ] {
+        raw.batch_execute(&format!("create index wrong on public.src {wrong}"))
+            .await
+            .expect("index");
+        let message = refusal(&trellis, by_gh).await;
+        assert!(
+            message.contains(r#"create index on "public"."src" ("g", "h")"#),
+            "{wrong}: {message}"
+        );
+        raw.batch_execute("drop index public.wrong")
+            .await
+            .expect("drop");
+    }
+    raw.batch_execute("create index on public.src (g desc, h desc, v)")
+        .await
+        .expect("index");
+    trellis
+        .apply(by_gh)
+        .await
+        .expect("all descending, NULL first, is read backward");
+}
+
+/// A partitioned source's unique index includes the partition key, which a
+/// group-basis aggregate must also group by (ADR-0017): the index leading
+/// with it, as the first `GROUP BY` column, is the required one.
+#[tokio::test]
+async fn a_partitioned_sources_unique_index_leading_with_the_partition_key_counts() {
+    trellis::defs::partition_tree::open_gate_for_tests();
+    let (_cluster, _db, raw, trellis) = setup(
+        "create table public.pitems (g integer not null, id integer not null, v integer not null, \
+           primary key (g, id)) partition by list (g); \
+         create table public.pitems_a partition of public.pitems for values in (1, 2)",
+    )
+    .await;
+    let message = refusal(
+        &trellis,
+        "TRANSFORM by_id_g FROM public.pitems GROUP BY id, g SELECT SUM(v) AS t",
+    )
+    .await;
+    assert!(message.contains("(id, g)"), "{message}");
+    let _ = raw;
+    trellis
+        .apply("TRANSFORM by_g_id FROM public.pitems GROUP BY g, id SELECT SUM(v) AS t")
+        .await
+        .expect("the unique index (g, id) leads with the partition key");
 }

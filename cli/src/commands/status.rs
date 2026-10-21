@@ -649,7 +649,6 @@ mod tests {
             source_index_gaps: vec![SourceIndexGap {
                 table: "public.orders".to_string(),
                 columns: vec!["customer_id".to_string()],
-                any_order: true,
                 opted_out,
             }],
             ..StatusWarnings::default()

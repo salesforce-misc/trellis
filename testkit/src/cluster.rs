@@ -28,6 +28,14 @@
 //! with it either; it's reparented and keeps running, so the reaper also stops
 //! a postmaster whose owning test process is gone (#576).
 //!
+//! **Teardown.** Dropping a cluster stops the postmaster with SIGQUIT (the
+//! immediate shutdown `pg_ctl stop -m immediate` sends) and waits on the
+//! child, falling back to `pg_ctl` and then SIGKILL; whichever way it dies,
+//! the SysV segment is freed. The cluster's directory goes with it, so a
+//! [`TestDatabase`] does not run `dropdb` (its checkpoint costs more than
+//! the rest of the teardown) unless the cluster was marked
+//! [`TestCluster::long_lived`], as a property test's thread-local cluster is.
+//!
 //! **Extra server settings.** `TRELLIS_TESTKIT_PG_OPTIONS` holds
 //! whitespace-separated `key=value` pairs, each passed to `postgres` as its
 //! own `-c key=value` after the built-in ones (so a later one wins), e.g.
@@ -62,7 +70,8 @@ fn unique_suffix() -> String {
 /// the segment table and fail `initdb`.
 ///
 /// Clusters come from two pools, so the most live at once is
-/// `MAX_LIVE_CLUSTERS + MAX_RESTORED_CLUSTERS` (6), still under the limit.
+/// `MAX_LIVE_CLUSTERS + MAX_RESTORED_CLUSTERS` (6 on macOS), still under the
+/// limit.
 /// [`TestCluster::start`] takes from [`CLUSTERS`];
 /// [`TestCluster::from_backup`] takes from [`RESTORED_CLUSTERS`]. A restore
 /// is the one place a test starts a second cluster while it still holds its
@@ -71,6 +80,14 @@ fn unique_suffix() -> String {
 /// #569). With two, a restore only ever waits on other restores, which
 /// wait on nothing unless they restore again, so one level of nesting
 /// can't deadlock.
+///
+/// Linux has no such limit worth a cap (SysV segments are bounded by memory
+/// there), so it allows 16, the width of the box `verify` runs on: a test
+/// binary at 16 threads with 4 clusters spends most of its time waiting for a
+/// permit (#1246).
+#[cfg(target_os = "linux")]
+const MAX_LIVE_CLUSTERS: usize = 16;
+#[cfg(not(target_os = "linux"))]
 const MAX_LIVE_CLUSTERS: usize = 4;
 /// Cap on clusters started by [`TestCluster::from_backup`]; see
 /// [`MAX_LIVE_CLUSTERS`].
@@ -219,6 +236,10 @@ pub struct TestCluster {
     /// Whether the server also listens on `127.0.0.1:port`. See
     /// [`TestCluster::start_with_tcp`].
     tcp: bool,
+    /// Whether this cluster outlives its databases, so a [`TestDatabase`]
+    /// must drop its database when it goes. See
+    /// [`TestCluster::long_lived`].
+    long_lived: bool,
     // Behind a `Mutex` so [`TestCluster::restart`] can replace the process
     // through a shared reference: the generative suite keeps its cluster in
     // a `thread_local` and only ever hands out `&TestCluster`.
@@ -236,6 +257,17 @@ impl TestCluster {
     /// handling.
     pub fn start() -> Self {
         Self::start_listening(false)
+    }
+
+    /// Marks this cluster as one that serves many databases over its life,
+    /// such as a property test's thread-local cluster that every case takes
+    /// a database from. A [`TestDatabase`] on it drops its database when it
+    /// goes, so the cases do not pile up. On a cluster not so marked the drop
+    /// is skipped: the cluster is deleted with the test, and `DROP
+    /// DATABASE`'s checkpoint costs ~110 ms per test (#1246).
+    pub fn long_lived(mut self) -> Self {
+        self.long_lived = true;
+        self
     }
 
     /// [`TestCluster::start`], plus a loopback TCP listener on a free port
@@ -315,6 +347,7 @@ impl TestCluster {
             socket_dir,
             port,
             tcp,
+            long_lived: false,
             server: Mutex::new(server),
             _permit: permit,
         };
@@ -345,7 +378,8 @@ impl TestCluster {
                 panic!("postgres did not become ready in time; log:\n{log}");
             }
 
-            std::thread::sleep(Duration::from_millis(100));
+            // Real startup takes ~15 ms; a coarse poll would be the bulk of it.
+            std::thread::sleep(Duration::from_millis(5));
         }
     }
 
@@ -453,6 +487,7 @@ impl TestCluster {
             socket_dir,
             port,
             tcp: false,
+            long_lived: false,
             server: Mutex::new(server),
             _permit: permit,
         };
@@ -571,6 +606,7 @@ impl TestCluster {
             name,
             dsn,
             pool,
+            drop_on_drop: self.long_lived,
         }
     }
 
@@ -588,48 +624,81 @@ impl Drop for TestCluster {
         // skip shutdown and leak the SysV shared memory segment it allocates
         // as a startup interlock — one per teardown, quickly exhausting the
         // (often tiny, e.g. macOS's 32-segment) system table and breaking
-        // every subsequent `initdb`. Stop through `pg_ctl` first (the
+        // every subsequent `initdb`. Stop it with SIGQUIT first (the
         // postmaster frees its segment on the way out), falling back to
-        // SIGKILL only on timeout.
+        // `pg_ctl` and then SIGKILL on timeout.
         //
-        // `immediate`, not `fast`: the data directory is deleted right after
-        // this, so the shutdown checkpoint `fast` writes buys nothing.
-        // `immediate` still goes through the postmaster, which releases the
-        // SysV segment before it exits.
-        let stopped_via_pg_ctl = Command::new("pg_ctl")
-            .arg("stop")
-            .arg("-D")
-            .arg(&self.data_dir)
-            .arg("-m")
-            .arg("immediate")
-            .arg("-w")
-            .arg("-t")
-            .arg("10")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false);
-
+        // SIGQUIT is the immediate shutdown `pg_ctl stop -m immediate` sends,
+        // but waiting on the child skips `pg_ctl -w`'s 100 ms poll. Immediate,
+        // not fast: the data directory is deleted right after this, so the
+        // shutdown checkpoint buys nothing.
         let server = self.server.get_mut().unwrap_or_else(|e| e.into_inner());
-        if !stopped_via_pg_ctl {
-            // `pg_ctl stop` failed or timed out; SIGKILL can't clean up, so
-            // free the segment ourselves from the pidfile before it's lost.
-            // Log it: a fallback here is the one leak path teardown *can*
-            // see, and a silent one turns into flaky `initdb` failures later.
+        let stopped = signal_and_wait(server, "QUIT", Duration::from_secs(10))
+            || stop_via_pg_ctl(&self.data_dir, server);
+        if !stopped {
+            // Neither stopped it; SIGKILL can't clean up, so free the
+            // segment ourselves from the pidfile before it's lost. Log it: a
+            // fallback here is the one leak path teardown *can* see, and a
+            // silent one turns into flaky `initdb` failures later.
             eprintln!(
-                "testkit: `pg_ctl stop` did not stop postgres cleanly (pid {}); \
+                "testkit: could not stop postgres cleanly (pid {}); \
                  falling back to SIGKILL and reaping its shmem segment",
                 server.id()
             );
             let _ = server.kill();
             let _ = server.wait();
-            reap_shmem_segment(&self.data_dir);
-        } else {
-            let _ = server.wait();
         }
+        // A postmaster that exited cleanly removed its pidfile; one that
+        // did not left the segment behind.
+        reap_shmem_segment(&self.data_dir);
         let _ = fs::remove_dir_all(&self.root);
     }
+}
+
+/// Sends `signal` (`kill -<signal>`) to `server` and waits up to `timeout`
+/// for it to exit. Polls `try_wait` at 1 ms, so a server that exits in a few
+/// milliseconds is reaped in a few milliseconds.
+fn signal_and_wait(server: &mut Child, signal: &str, timeout: Duration) -> bool {
+    if matches!(server.try_wait(), Ok(Some(_))) {
+        return true;
+    }
+    let _ = Command::new("kill")
+        .arg(format!("-{signal}"))
+        .arg(server.id().to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let deadline = Instant::now() + timeout;
+    loop {
+        if matches!(server.try_wait(), Ok(Some(_))) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// The fallback stop: `pg_ctl stop -m immediate`, then reap the child.
+fn stop_via_pg_ctl(data_dir: &Path, server: &mut Child) -> bool {
+    let stopped = Command::new("pg_ctl")
+        .arg("stop")
+        .arg("-D")
+        .arg(data_dir)
+        .arg("-m")
+        .arg("immediate")
+        .arg("-w")
+        .arg("-t")
+        .arg("10")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if stopped {
+        let _ = server.wait();
+    }
+    stopped
 }
 
 /// A cold, file-level copy of a stopped [`TestCluster`]'s data directory,
@@ -673,13 +742,17 @@ fn copy_data_dir(from: &Path, to: &Path) {
 }
 
 /// A uniquely-named database on a [`TestCluster`], with its own connection
-/// pool. Dropped (including the underlying database) when this handle goes
-/// out of scope.
+/// pool. On a cluster from [`TestCluster::long_lived`] the database is
+/// dropped when this handle goes out of scope; on any other it is left for
+/// the cluster's teardown to delete with everything else.
 pub struct TestDatabase {
     socket_dir: PathBuf,
     port: u16,
     name: String,
     dsn: String,
+    /// Whether `Drop` drops the database; see
+    /// [`TestCluster::long_lived`].
+    drop_on_drop: bool,
     pub pool: Pool,
 }
 
@@ -703,6 +776,11 @@ const DROP_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 impl Drop for TestDatabase {
     fn drop(&mut self) {
+        // The cluster is deleted with the test, so the drop (and its
+        // checkpoint) would only delay that.
+        if !self.drop_on_drop {
+            return;
+        }
         // `--force` (PG 13+) disconnects any backends still attached before
         // dropping, so teardown doesn't race connections just released to
         // `pool`. Retried in case a backend is still being torn down.

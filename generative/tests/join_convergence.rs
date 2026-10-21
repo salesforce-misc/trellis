@@ -163,7 +163,7 @@ thread_local! {
         trellis::dev::staging::set_group_basis(true);
         Harness {
             runtime: tokio::runtime::Runtime::new().expect("build tokio runtime"),
-            cluster: TestCluster::start(),
+            cluster: TestCluster::start().long_lived(),
             coverage: std::cell::RefCell::new(JoinCoverage::default()),
         }
     };

@@ -1065,6 +1065,50 @@ async fn an_aggregate_page_reads_its_source_by_an_index_that_leads_with_the_grou
     assert!(with.contains("Index Scan using agg_g_key on agg"), "{with}");
 }
 
+/// A composite group key's page is a range scan of an index that leads with
+/// the group columns in `GROUP BY` order, with or without trailing columns,
+/// read forward or, all descending with `NULL` first, backward (#1223).
+/// Define refuses any other order (`tests/source_index.rs`).
+#[tokio::test]
+async fn a_composite_page_is_index_served_by_an_index_in_group_by_order() {
+    let d = start_with(
+        "TRANSFORM agg FROM public.src GROUP BY g, h WITHOUT SOURCE INDEX \
+         SELECT SUM(v) AS total, COUNT(*) AS n",
+        "create table public.src (id integer primary key, g integer, h integer, v integer)",
+        &[("id", int4()), ("g", int4()), ("h", int4()), ("v", int4())],
+    )
+    .await;
+    for (name, columns) in [
+        ("src_gh", "g, h"),
+        ("src_ghv", "g, h, v"),
+        ("src_back", "g desc, h desc"),
+    ] {
+        exec(
+            &d,
+            &format!("create index {name} on public.src ({columns})"),
+        )
+        .await;
+        let pool = d.pool().clone();
+        let plan = trellis::staging::self_check::explain_page(&pool, "agg", Some("5\u{1f}5"), 3)
+            .await
+            .expect("explain the page");
+        assert!(
+            plan.contains(&format!("Scan using {name} on src s"))
+                || plan.contains(&format!("Scan Backward using {name} on src s")),
+            "index ({columns}):\n{plan}"
+        );
+        assert!(
+            plan.contains("Index Cond: (ROW(g, h) > ROW(5, 5))"),
+            "index ({columns}):\n{plan}"
+        );
+        assert!(
+            !plan.contains("HashAggregate"),
+            "index ({columns}):\n{plan}"
+        );
+        exec(&d, &format!("drop index public.{name}")).await;
+    }
+}
+
 /// A two-column nullable group key, `NULL` in either part, against pending
 /// changes that add groups only the ring knows (a deleted group's rows, a
 /// new group's), with and without an index leading with the group columns

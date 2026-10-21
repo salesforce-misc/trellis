@@ -503,7 +503,7 @@ as `unindexed_joins`, each entry with `relationship`, `table`, `column` and the
 
 A `GROUP BY` aggregate on the group basis and a `JOIN` need an index on their
 source tables, which you create alongside the definition; Trellis never does.
-For an aggregate it is a btree index leading with the `GROUP BY` columns
+For an aggregate it is a btree index leading with the `GROUP BY` columns, in `GROUP BY` order
 (`create index on orders (customer_id)`); for a `JOIN`, one on each side leading
 with that side's `ON` columns, in `ON` order. A primary key or unique constraint
 that leads with them is enough. Define and `RESUME` refuse without it, with the

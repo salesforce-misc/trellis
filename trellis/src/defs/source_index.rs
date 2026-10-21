@@ -9,15 +9,19 @@
 //! | Target | Required on the source |
 //! |---|---|
 //! | 1-1 | nothing new (the primary key) |
-//! | group-basis aggregate | an index leading with the `GROUP BY` columns, in any order |
+//! | group-basis aggregate | an index leading with the `GROUP BY` columns, in `GROUP BY` order |
 //! | `JOIN` | on each side, an index leading with that side's `ON` columns, in `ON` order |
 //!
 //! An index counts when it is a btree that is valid, ready and live, with no
 //! predicate, whose leading key columns are the plain columns (an expression
 //! has no column) under each column's own collation and its type's default
 //! operator class (a `text_pattern_ops` column orders by other operators than
-//! a page's). A primary key or a
-//! unique constraint is such an index. Nothing builds an index.
+//! a page's), all ascending with `NULL` last as a page orders, or all
+//! descending with `NULL` first, which a backward scan reads in that order. A
+//! leading column in another direction leaves each page to sort every row
+//! sharing the columns before it. A primary key or a unique constraint is
+//! such an index. Nothing builds an index. `self_check` steers a page by the
+//! index ([`has_index`]) under the same rule.
 //!
 //! Define and a whole-transform `RESUME` refuse a definition whose index is
 //! missing ([`CatalogError::SourceIndexMissing`](super::catalog::CatalogError)),
@@ -42,11 +46,8 @@ use crate::pool::quote_ident;
 pub struct SourceIndex {
     /// The table, qualified (`schema.table`).
     pub table: String,
-    /// The columns the index leads with.
+    /// The columns the index leads with, in order.
     pub columns: Vec<String>,
-    /// Whether the columns may come in any order (an aggregate's `GROUP BY`
-    /// set), rather than in this order (a `JOIN` side's `ON` columns).
-    pub any_order: bool,
 }
 
 impl SourceIndex {
@@ -77,8 +78,6 @@ pub struct SourceIndexGap {
     pub table: String,
     /// The columns the index should lead with.
     pub columns: Vec<String>,
-    /// Whether the columns may come in any order.
-    pub any_order: bool,
     /// Whether the definition was defined `WITHOUT SOURCE INDEX`: it runs
     /// without the index and its `self_check` walks at the per-page scan
     /// cost, rather than refusing.
@@ -98,7 +97,6 @@ impl From<&SourceIndexGap> for SourceIndex {
         SourceIndex {
             table: gap.table.clone(),
             columns: gap.columns.clone(),
-            any_order: gap.any_order,
         }
     }
 }
@@ -118,7 +116,6 @@ pub(crate) async fn gaps(
             .map(|index| SourceIndexGap {
                 table: index.table,
                 columns: index.columns,
-                any_order: index.any_order,
                 opted_out: def.without_source_index,
             })
             .collect(),
@@ -151,7 +148,6 @@ pub(crate) fn required(
             vec![SourceIndex {
                 table: source_table.to_string(),
                 columns,
-                any_order: true,
             }]
         }
         KeySpace::Join(_) => [(Side::From, Some(source_table)), (Side::Joined, join_table)]
@@ -164,7 +160,6 @@ pub(crate) fn required(
                 Some(SourceIndex {
                     table: table?.to_string(),
                     columns,
-                    any_order: false,
                 })
             })
             .collect(),
@@ -178,31 +173,52 @@ struct IndexKey {
     attnums: Vec<i16>,
     /// Each key column's collation (`indcollation`).
     collations: Vec<u32>,
+    /// Each key column's ordering flags (`indoption`): `INDOPTION_DESC` and
+    /// `INDOPTION_NULLS_FIRST`.
+    options: Vec<i16>,
 }
 
-/// Whether `index` meets `want`: columns' `(attnum, collation)`.
-fn meets(index: &IndexKey, want: &[(i16, u32)], any_order: bool) -> bool {
+/// `indoption`'s `DESC` bit.
+const INDOPTION_DESC: i16 = 0x0001;
+/// `indoption`'s `NULLS FIRST` bit.
+const INDOPTION_NULLS_FIRST: i16 = 0x0002;
+
+/// Whether `index` meets `want`: columns' `(attnum, collation)`, leading the
+/// index in this order, all ascending with `NULL` last or all descending
+/// with `NULL` first (read backward, the same order).
+fn meets(index: &IndexKey, want: &[(i16, u32)]) -> bool {
     let n = want.len();
-    if n == 0 || index.attnums.len() < n || index.collations.len() < n {
+    if n == 0 || index.attnums.len() < n || index.collations.len() < n || index.options.len() < n {
         return false;
     }
     let leading = index.attnums.iter().zip(&index.collations).take(n);
-    if any_order {
-        let mut remaining = want.to_vec();
-        for (attnum, collation) in leading {
-            match remaining.iter().position(|w| *w == (*attnum, *collation)) {
-                Some(at) => {
-                    remaining.swap_remove(at);
-                }
-                None => return false,
-            }
-        }
-        true
-    } else {
-        leading
-            .zip(want)
-            .all(|((attnum, collation), w)| (*attnum, *collation) == *w)
-    }
+    let ordered = leading
+        .zip(want)
+        .all(|((attnum, collation), w)| (*attnum, *collation) == *w);
+    let forward = 0;
+    let backward = INDOPTION_DESC | INDOPTION_NULLS_FIRST;
+    let direction = index.options[0];
+    ordered
+        && (direction == forward || direction == backward)
+        && index.options[..n].iter().all(|o| *o == direction)
+}
+
+/// Whether `table` (qualified, `schema.table`) has an index leading with
+/// `columns` that [`meets`] them: the predicate define requires, which
+/// `self_check` also steers a page by.
+pub(crate) async fn has_index(
+    client: &impl GenericClient,
+    table: &str,
+    columns: &[String],
+) -> Result<bool, tokio_postgres::Error> {
+    is_met(
+        client,
+        &SourceIndex {
+            table: table.to_string(),
+            columns: columns.to_vec(),
+        },
+    )
+    .await
 }
 
 /// Whether `table` has an index meeting `need`. A table or a column that no
@@ -236,6 +252,7 @@ async fn is_met(
     let indexes = client
         .query(
             "select i.indkey::int2[], i.indcollation::oid[], i.indnkeyatts::int4, \
+                    i.indoption::int2[], \
                     array(select oc.opcdefault \
                           from unnest(i.indclass::oid[]) with ordinality as u(opclass, n) \
                           join pg_catalog.pg_opclass oc on oc.oid = u.opclass \
@@ -252,9 +269,11 @@ async fn is_met(
         let mut attnums: Vec<i16> = row.get(0);
         let mut collations: Vec<u32> = row.get(1);
         let keys: i32 = row.get(2);
-        let default_opclass: Vec<bool> = row.get(3);
+        let mut options: Vec<i16> = row.get(3);
+        let default_opclass: Vec<bool> = row.get(4);
         attnums.truncate(keys.max(0) as usize);
         collations.truncate(keys.max(0) as usize);
+        options.truncate(keys.max(0) as usize);
         // A column under a non-default operator class (`text_pattern_ops`)
         // orders by other operators than a page's `>` and `order by`, so the
         // index can't serve the page: it counts as no column.
@@ -267,9 +286,9 @@ async fn is_met(
             &IndexKey {
                 attnums,
                 collations,
+                options,
             },
             &want,
-            need.any_order,
         )
     }))
 }
@@ -312,10 +331,9 @@ pub fn refusal_text(target: &str, indexes: &[SourceIndex]) -> String {
     for index in indexes {
         let _ = write!(
             text,
-            " {} has none leading with ({}){}; create one with `{}`;",
+            " {} has none leading with ({}) in that order; create one with `{}`;",
             index.table,
             index.columns.join(", "),
-            if index.any_order { " in any order" } else { "" },
             index.create_index()
         );
     }
@@ -334,24 +352,33 @@ mod tests {
         IndexKey {
             attnums: attnums.to_vec(),
             collations: vec![0; attnums.len()],
+            options: vec![0; attnums.len()],
+        }
+    }
+
+    fn ordered(attnums: &[i16], options: &[i16]) -> IndexKey {
+        IndexKey {
+            options: options.to_vec(),
+            ..key(attnums)
         }
     }
 
     #[test]
-    fn an_aggregate_accepts_its_columns_in_any_order() {
+    fn an_aggregate_needs_its_columns_in_group_by_order() {
         let want = [(1, 0), (2, 0)];
-        assert!(meets(&key(&[1, 2]), &want, true));
-        assert!(meets(&key(&[2, 1, 5]), &want, true));
-        assert!(!meets(&key(&[1, 5, 2]), &want, true));
-        assert!(!meets(&key(&[1]), &want, true));
-        assert!(!meets(&key(&[0, 1, 2]), &want, true));
+        assert!(meets(&key(&[1, 2]), &want));
+        assert!(meets(&key(&[1, 2, 5]), &want));
+        assert!(!meets(&key(&[2, 1, 5]), &want));
+        assert!(!meets(&key(&[1, 5, 2]), &want));
+        assert!(!meets(&key(&[1]), &want));
+        assert!(!meets(&key(&[0, 1, 2]), &want));
     }
 
     #[test]
     fn a_join_side_needs_its_columns_in_on_order() {
         let want = [(1, 0), (2, 0)];
-        assert!(meets(&key(&[1, 2, 9]), &want, false));
-        assert!(!meets(&key(&[2, 1]), &want, false));
+        assert!(meets(&key(&[1, 2, 9]), &want));
+        assert!(!meets(&key(&[2, 1]), &want));
     }
 
     #[test]
@@ -359,9 +386,30 @@ mod tests {
         let index = IndexKey {
             attnums: vec![1],
             collations: vec![950],
+            options: vec![0],
         };
-        assert!(meets(&index, &[(1, 950)], true));
-        assert!(!meets(&index, &[(1, 100)], true));
+        assert!(meets(&index, &[(1, 950)]));
+        assert!(!meets(&index, &[(1, 100)]));
+    }
+
+    /// A page orders each column ascending, `NULL` last. An index read
+    /// forward (all ascending, `NULL` last) or backward (all descending,
+    /// `NULL` first) gives that order; a mixed one, or `NULL` on the other
+    /// end, leaves the page to sort. Trailing columns past the key are free.
+    #[test]
+    fn the_leading_columns_run_in_the_page_order_forward_or_backward() {
+        let want = [(1, 0), (2, 0)];
+        let desc = INDOPTION_DESC;
+        let nulls_first = INDOPTION_NULLS_FIRST;
+        let backward = desc | nulls_first;
+        assert!(meets(&ordered(&[1, 2], &[0, 0]), &want));
+        assert!(meets(&ordered(&[1, 2], &[backward, backward]), &want));
+        assert!(meets(&ordered(&[1, 2, 3], &[0, 0, desc]), &want));
+        assert!(!meets(&ordered(&[1, 2], &[0, desc]), &want));
+        assert!(!meets(&ordered(&[1, 2], &[0, nulls_first]), &want));
+        assert!(!meets(&ordered(&[1, 2], &[desc, desc]), &want));
+        assert!(!meets(&ordered(&[1, 2], &[backward, 0]), &want));
+        assert!(!meets(&ordered(&[1], &[nulls_first]), &[(1, 0)]));
     }
 
     #[test]
@@ -369,7 +417,6 @@ mod tests {
         let need = SourceIndex {
             table: "public.Order Lines".to_string(),
             columns: vec!["customer id".to_string(), "kind".to_string()],
-            any_order: true,
         };
         assert_eq!(
             need.create_index(),

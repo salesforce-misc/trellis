@@ -226,8 +226,8 @@ times the table, which is hours at 100M rows.
   bullet). A JOIN's target part reads the join of both
   tables, which no index orders, so each of its pages scans them.
 * **The source index define requires.** A group-basis aggregate needs, on its
-  source, a btree index whose leading columns are its `GROUP BY` columns (in any
-  order), and a JOIN needs on each side one leading with that side's `ON`
+  source, a btree index whose leading columns are its `GROUP BY` columns (in
+  `GROUP BY` order), and a JOIN needs on each side one leading with that side's `ON`
   columns in `ON` order, which is the order `P` and `M` page by. Define and a
   `RESUME` refuse a definition without it, naming a `create index`, unless it is
   defined `WITHOUT SOURCE INDEX`; a later drop warns in `status` and makes

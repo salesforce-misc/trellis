@@ -247,30 +247,6 @@ impl Keyset {
         format!("(not {})", self.greater(lhs, rhs))
     }
 
-    /// Whether `table` (a quoted, qualified name) has a valid, complete
-    /// btree index whose first column is `column`, which can order a page of
-    /// that key.
-    pub(super) async fn index_leads_with(
-        client: &tokio_postgres::Client,
-        table: &str,
-        column: &str,
-    ) -> Result<bool, SelfCheckError> {
-        Ok(client
-            .query_one(
-                "select exists ( \
-                   select 1 from pg_catalog.pg_index i \
-                   join pg_catalog.pg_class c on c.oid = i.indexrelid \
-                   join pg_catalog.pg_am am on am.oid = c.relam and am.amname = 'btree' \
-                   join pg_catalog.pg_attribute a \
-                     on a.attrelid = i.indrelid and a.attnum = i.indkey[0] \
-                  where i.indrelid = pg_catalog.to_regclass($1) \
-                    and i.indisvalid and i.indpred is null and a.attname = $2)",
-                &[&table, &column],
-            )
-            .await?
-            .get(0))
-    }
-
     /// Runs a page's statement `sql` with `limit` for `$1`. `steer` says an
     /// index orders the source's page: the planner then costs a grouped page
     /// by the groups it counts in the weighted union of the source and its
