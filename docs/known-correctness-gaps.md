@@ -28,7 +28,7 @@ wrong rows, on the targets it compares
 | [A column's values rewritten in place by `ALTER COLUMN TYPE`](#a-columns-values-rewritten-in-place-by-alter-column-type) | `self_check` | [#1206](https://github.com/salesforce-misc/trellis/issues/1206) (study) |
 | [A space-padded value truncated after a `varchar` widening](#a-space-padded-value-truncated-after-a-varchar-widening) | `self_check` | [#1207](https://github.com/salesforce-misc/trellis/issues/1207) |
 | **Writes capture never sees** | | |
-| [Capture disrupted and restored between two passes](#capture-disrupted-and-restored-between-two-passes) | `self_check` | [#1206](https://github.com/salesforce-misc/trellis/issues/1206) (study), otherwise documented |
+| [Capture disrupted and restored between two passes](#capture-disrupted-and-restored-between-two-passes) | `self_check` | [#1206](https://github.com/salesforce-misc/trellis/issues/1206) (study), [#1237](https://github.com/salesforce-misc/trellis/issues/1237), otherwise documented |
 | [An unlogged source emptied by a crash or failover](#an-unlogged-source-emptied-by-a-crash-or-failover) | `self_check` | documented |
 | **Changes made outside Trellis to what it owns** | | |
 | [Rows written into a target, a hidden table or Trellis's schema](#rows-written-into-a-target-a-hidden-table-or-trelliss-schema) | `self_check`, except Trellis's schema | [#1209](https://github.com/salesforce-misc/trellis/issues/1209) |
@@ -178,7 +178,12 @@ A trigger disabled and enabled again by name is seen. These aren't:
   dump, or upgraded with `pg_upgrade`, before a pass sees it: a restore
   records the triggers it finds;
 * a logical-replication subscription gains the table and loses it again
-  before the next pass. The apply worker fires no statement trigger.
+  before the next pass. The apply worker fires no statement trigger;
+* a transform is defined on a table while the last other definition reading
+  it is dropped, a pass sees the new transform before the drop commits, and
+  capture is then disrupted and put back before the next pass: the drop
+  forgets the table's records, which the new transform now relies on, and the
+  next pass records the triggers it finds.
 
 **What goes wrong:** the writes made in between never reach Trellis, and the
 targets stay wrong until each affected row is written again. A child's rows
@@ -193,6 +198,8 @@ nothing removes them.
 studies a signal for the attach and inherit shapes. The others are documented:
 a replaced function's footprint also moves on routine `GRANT`s and owner
 changes, and a restore leaves nothing to compare.
+[#1237](https://github.com/salesforce-misc/trellis/issues/1237) asks whether
+to serialize a drop's forgetting with a concurrent define.
 
 ### An unlogged source emptied by a crash or failover
 

@@ -1010,3 +1010,152 @@ async fn a_pause_committing_meanwhile_is_never_recorded_as_a_disruption() {
         ]
     );
 }
+
+// ---- #1217: a table's capture records go with its last reader ----
+
+const T_SQL: &str = "create table public.t_fg (id int primary key, g int not null, a int, b int, u int); \
+     insert into public.t_fg select i, i % 3, i, i, i from generate_series(1, 30) i";
+
+async fn record_counts(raw: &Client, table: &str) -> (i64, i64, i64) {
+    let one = |sql: String| async move {
+        raw.query_one(&sql, &[])
+            .await
+            .expect("count")
+            .get::<_, i64>(0)
+    };
+    (
+        one(format!(
+            "select count(*) from capture_triggers where table_name = '{table}'"
+        ))
+        .await,
+        one(format!(
+            "select count(*) from capture_baselines where table_name = '{table}'"
+        ))
+        .await,
+        one(format!(
+            "select count(*) from partition_sources where table_name = '{table}'"
+        ))
+        .await,
+    )
+}
+
+/// The #1217 repro on a plain table: the last definition goes, the table is
+/// dropped and created again, a definition is made, all before a pass. The
+/// new definition never read the old table, so nothing was missed: it is not
+/// paused, capture is installed afresh and it goes live with the right rows.
+#[tokio::test]
+async fn a_definition_made_after_the_table_was_replaced_is_not_a_disruption() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
+    raw.batch_execute(T_SQL).await.unwrap();
+    trellis
+        .apply("TRANSFORM r_fg FROM public.t_fg SELECT a AS a, b AS b")
+        .await
+        .unwrap();
+    bring_live(&mut raw, &db.pool).await;
+    assert_eq!(record_counts(&raw, "public.t_fg").await.0, 5);
+
+    for text in ["PAUSE TRANSFORM r_fg", "DROP TRANSFORM r_fg"] {
+        trellis.apply(text).await.expect(text);
+    }
+    // Forgotten in the drop's own transaction, with no pass in between.
+    assert_eq!(record_counts(&raw, "public.t_fg").await, (0, 0, 0));
+
+    raw.batch_execute("drop table public.t_fg").await.unwrap();
+    raw.batch_execute(T_SQL).await.unwrap();
+    raw.batch_execute("update public.t_fg set b = b * 2")
+        .await
+        .unwrap();
+    trellis
+        .apply("TRANSFORM r_fg FROM public.t_fg SELECT a AS a, b AS b")
+        .await
+        .unwrap();
+    bring_live(&mut raw, &db.pool).await;
+    assert_eq!(
+        rows(&raw, "select a::text, b::text from public.r_fg order by a").await,
+        rows(&raw, "select a::text, b::text from public.t_fg order by a").await
+    );
+    assert_eq!(record_counts(&raw, "public.t_fg").await.0, 5);
+}
+
+/// The same sequence with a second, paused definition still on the table: it
+/// still reads the table, so the record stays and the replacement is a real
+/// disruption for the new definition too.
+#[tokio::test]
+async fn a_paused_reader_keeps_the_record_so_a_replaced_table_still_pauses() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
+    raw.batch_execute(T_SQL).await.unwrap();
+    for text in [
+        "TRANSFORM r_fg FROM public.t_fg SELECT a AS a, b AS b",
+        "TRANSFORM s_fg FROM public.t_fg GROUP BY g SELECT g AS g, SUM(b) AS total",
+    ] {
+        trellis.apply(text).await.unwrap();
+    }
+    bring_live(&mut raw, &db.pool).await;
+
+    trellis.apply("PAUSE TRANSFORM s_fg").await.unwrap();
+    for text in ["PAUSE TRANSFORM r_fg", "DROP TRANSFORM r_fg"] {
+        trellis.apply(text).await.unwrap();
+    }
+    assert_eq!(
+        record_counts(&raw, "public.t_fg").await.0,
+        5,
+        "s_fg still reads it"
+    );
+
+    raw.batch_execute("drop table public.t_fg").await.unwrap();
+    raw.batch_execute(T_SQL).await.unwrap();
+    trellis
+        .apply("TRANSFORM r_fg FROM public.t_fg SELECT a AS a, b AS b")
+        .await
+        .unwrap();
+    capture_pass(&mut raw, &db.pool).await;
+    capture_pass(&mut raw, &db.pool).await;
+    let status = trellis.status("r_fg").await.unwrap().unwrap();
+    assert_eq!(status.status, TransformStatus::Paused);
+    let failure = status.capture_failure.expect("a reason");
+    assert_eq!(failure.kind, trellis::CaptureFailureKind::Disruption);
+}
+
+/// #1217: the last reader goes and a definition is made again on the same,
+/// untouched table before a pass, with its orphaned triggers disabled in
+/// between. The new definition never relied on them: the pass reinstalls and
+/// records capture afresh, pauses nothing, and it goes live with the right
+/// rows.
+#[tokio::test]
+async fn a_definition_made_again_on_the_same_table_before_a_pass_is_not_paused() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
+    raw.batch_execute(T_SQL).await.unwrap();
+    trellis
+        .apply("TRANSFORM r_fg FROM public.t_fg SELECT a AS a, b AS b")
+        .await
+        .unwrap();
+    bring_live(&mut raw, &db.pool).await;
+    for text in ["PAUSE TRANSFORM r_fg", "DROP TRANSFORM r_fg"] {
+        trellis.apply(text).await.expect(text);
+    }
+    raw.batch_execute(&format!(
+        "{}; update public.t_fg set b = b + 1",
+        each_trigger("alter table public.t_fg disable trigger %I").replace("{t}", "t_fg")
+    ))
+    .await
+    .unwrap();
+    trellis
+        .apply("TRANSFORM r_fg FROM public.t_fg SELECT a AS a, b AS b")
+        .await
+        .unwrap();
+    bring_live(&mut raw, &db.pool).await;
+    assert_eq!(
+        rows(&raw, "select a::text, b::text from public.r_fg order by a").await,
+        rows(&raw, "select a::text, b::text from public.t_fg order by a").await
+    );
+    assert_eq!(record_counts(&raw, "public.t_fg").await.0, 5);
+}

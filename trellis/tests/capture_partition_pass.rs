@@ -953,3 +953,106 @@ async fn measure_fingerprint_cost_at_a_thousand_leaves() {
         outcome.partition_deep_checks.len()
     );
 }
+
+async fn sources(raw: &Client) -> i64 {
+    raw.query_one("select count(*) from partition_sources", &[])
+        .await
+        .expect("count")
+        .get(0)
+}
+
+/// #1217: the last definition on a partitioned root goes, the root is dropped
+/// and created again, and a definition is made, all before a pass. The new
+/// definition never read the old tree, so the pass records the new one
+/// instead of pausing it for a root that is "not the one Trellis captured".
+#[tokio::test]
+async fn a_definition_made_after_the_root_was_replaced_is_not_paused() {
+    let cluster = TestCluster::start();
+    let mut it = instance(&cluster, TREE).await;
+    assert_eq!(sources(&it.raw).await, 1);
+    for text in ["PAUSE TRANSFORM totals", "DROP TRANSFORM totals"] {
+        it.trellis.apply(text).await.expect(text);
+    }
+    assert_eq!(sources(&it.raw).await, 0, "forgotten with the last reader");
+
+    it.raw
+        .batch_execute(&format!("drop table public.items; {TREE}"))
+        .await
+        .expect("replace the root");
+    it.trellis
+        .apply("TRANSFORM totals FROM public.items GROUP BY order_id SELECT COUNT(*) AS n")
+        .await
+        .expect("define again");
+    clean_pass(&mut it).await;
+    clean_pass(&mut it).await;
+    assert_ne!(
+        status(&it.trellis).await.status,
+        trellis::defs::TransformStatus::Paused
+    );
+    assert_eq!(sources(&it.raw).await, 1);
+    it.trellis.shutdown().await.expect("shutdown");
+}
+
+/// #1217: the drop that forgets the recorded tree and a queued correction
+/// leaves the triggers to the pass, which still finds every node's from the
+/// catalog and removes them all.
+#[tokio::test]
+async fn the_pass_uninstalls_every_node_after_the_drop_forgot_the_tree() {
+    let cluster = TestCluster::start();
+    let mut it = instance(&cluster, TREE).await;
+    it.raw
+        .batch_execute("create table public.items_d partition of public.items for values in (5)")
+        .await
+        .expect("a new leaf");
+    clean_pass(&mut it).await;
+    assert_eq!(corrections(&it.raw).await.len(), 1, "a queued correction");
+
+    for text in ["PAUSE TRANSFORM totals", "DROP TRANSFORM totals"] {
+        it.trellis.apply(text).await.expect(text);
+    }
+    assert_eq!(sources(&it.raw).await, 0);
+    let queued: i64 = it
+        .raw
+        .query_one("select count(*) from partition_corrections", &[])
+        .await
+        .expect("count")
+        .get(0);
+    assert_eq!(queued, 0, "the queued correction goes with the last reader");
+    assert_eq!(tables_with_triggers(&it.raw).await.len(), NODES.len() + 1);
+
+    clean_pass(&mut it).await;
+    assert!(
+        tables_with_triggers(&it.raw).await.is_empty(),
+        "{:?}",
+        tables_with_triggers(&it.raw).await
+    );
+    it.trellis.shutdown().await.expect("shutdown");
+}
+
+/// #1217: the last reader goes and a definition is made again on the same,
+/// untouched root before a pass. Its triggers are still on every node, with
+/// no record: the pass records the tree afresh and pauses nothing.
+#[tokio::test]
+async fn a_definition_made_again_on_the_same_root_before_a_pass_is_not_paused() {
+    let cluster = TestCluster::start();
+    let mut it = instance(&cluster, TREE).await;
+    for text in ["PAUSE TRANSFORM totals", "DROP TRANSFORM totals"] {
+        it.trellis.apply(text).await.expect(text);
+    }
+    it.trellis
+        .apply("TRANSFORM totals FROM public.items GROUP BY order_id SELECT COUNT(*) AS n")
+        .await
+        .expect("define again");
+    clean_pass(&mut it).await;
+    clean_pass(&mut it).await;
+    let status = status(&it.trellis).await;
+    assert_ne!(
+        status.status,
+        trellis::defs::TransformStatus::Paused,
+        "{:?}",
+        status.capture_failure
+    );
+    assert_eq!(recorded_names(&it.raw).await, NODES);
+    assert!(queued(&it.raw).await.is_empty());
+    it.trellis.shutdown().await.expect("shutdown");
+}

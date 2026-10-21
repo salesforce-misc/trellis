@@ -516,6 +516,16 @@ on any of:
 - a capture function's source differs from the hash its own comment
   records: it was replaced by hand.
 
+A table's records live only while some definition reads it. The transaction
+that drops the last reader (`DROP TRANSFORM`, or `DROP RELATIONSHIP` for a
+relationship's to-side) deletes the table's trigger, column and partition-tree
+records, so a definition made afterwards, on a table dropped and created again
+before the next pass, is judged against nothing: it never read the old table.
+A paused or quarantined definition still reads its tables, so while one is
+left the records stay and a real disruption pauses a new definition beside it
+too. Uninstalling the triggers stays the pass's job, and the pass forgets any
+record of a table nothing reads as well.
+
 Routine maintenance moves none of these: `VACUUM FULL`, `CLUSTER`,
 `REINDEX`, pg_repack, a catalog freeze, a rename and back within one
 transaction, and a migration that leaves the triggers alone. Dumps and
