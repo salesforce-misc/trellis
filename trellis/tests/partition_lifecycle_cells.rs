@@ -311,7 +311,6 @@ async fn a_renamed_leaf_is_still_captured_and_corrected() {
             let mut fx = Fx::start(&tree("range"), SEED).await;
             fx.exec(rename).await;
             fx.pass().await;
-            eprintln!("{what}/{op}: after rename queue {:?}", fx.kinds().await);
             fx.exec(&format!(
                 "insert into public.items values (9001, 5, 10), (9002, 6, 20); \
                  insert into {name} values (9003, 7, 30); \
@@ -326,6 +325,45 @@ async fn a_renamed_leaf_is_still_captured_and_corrected() {
             fx.correct().await;
             fx.assert_right(&format!("{what}/{op}")).await;
             assert!(fx.queue().await.is_empty(), "{what}/{op}");
+        }
+    }
+}
+
+/// A loaded leaf attached, or a new leaf written directly before capture
+/// reaches it, holding a group no target row or ring image has: only a read
+/// of the node finds that group. Its correction is queued under the leaf's
+/// name, then the leaf is renamed or moved to another schema before the
+/// engine runs. The engine reads the node by oid, not by the queued name, so
+/// the group is still counted.
+#[tokio::test]
+async fn a_leaf_renamed_after_its_correction_is_queued_is_still_read() {
+    for (what, between) in [
+        ("rename", "alter table public.items_x rename to items_y"),
+        (
+            "set schema",
+            "create schema other; alter table public.items_x set schema other",
+        ),
+        ("no rename", ""),
+    ] {
+        for add in [
+            "create table public.items_x (like public.items including all); \
+             insert into public.items_x values (9100, 17, 100), (9101, 18, 200); \
+             alter table public.items attach partition public.items_x for values from (16) to (20)",
+            "create table public.items_x partition of public.items for values from (16) to (20); \
+             insert into public.items_x values (9100, 17, 100), (9101, 18, 200)",
+        ] {
+            let mut fx = Fx::start(&tree("range"), SEED).await;
+            fx.exec(add).await;
+            fx.pass().await;
+            assert!(
+                !fx.queue().await.is_empty(),
+                "{what}: the new leaf is queued"
+            );
+            fx.exec(between).await;
+            fx.correct().await;
+            fx.correct().await;
+            fx.assert_right(&format!("{what}: {add}")).await;
+            assert!(fx.queue().await.is_empty(), "{what}");
         }
     }
 }
