@@ -66,11 +66,11 @@ use trellis_embed::{
     PlainCaptureWait, PlainConfig, PlainCorrectingNode, PlainDefinitionStatus,
     PlainDefinitionSummary, PlainDivergence, PlainDrainFailure, PlainError, PlainHeldKeys,
     PlainPoisonEntry, PlainQuarantineEntry, PlainRelationship, PlainRelationshipSummary,
-    PlainSamplePage, PlainSelfCheckJob, PlainSelfCheckReport, PlainUnindexedJoin, SELF_CHECK_MODES,
-    SELF_CHECK_OUTCOMES, SELF_CHECK_STATES, capture_failure_kind_names, decode_cursor,
-    decode_watermark, encode_watermark, quarantine_state_names, relationship_cardinality_names,
-    require_transform_statement, self_check_mode, system_time_from_epoch_micros,
-    transform_status_names,
+    PlainSamplePage, PlainSelfCheckJob, PlainSelfCheckReport, PlainSourceIndexGap,
+    PlainUnindexedJoin, SELF_CHECK_MODES, SELF_CHECK_OUTCOMES, SELF_CHECK_STATES,
+    capture_failure_kind_names, decode_cursor, decode_watermark, encode_watermark,
+    quarantine_state_names, relationship_cardinality_names, require_transform_statement,
+    self_check_mode, system_time_from_epoch_micros, transform_status_names,
 };
 
 /// What a blocking call produces: its value, or the engine's error as plain
@@ -909,6 +909,7 @@ fn status_hash(ruby: &Ruby, status: PlainDefinitionStatus) -> Result<RHash, Erro
         .map(|failure| drain_failure_hash(ruby, failure))
         .transpose()?;
     let unindexed_joins = array(ruby, status.unindexed_joins, unindexed_join_hash)?;
+    let source_index_gaps = array(ruby, status.source_index_gaps, source_index_gap_hash)?;
     let correcting = array(ruby, status.correcting, correcting_hash)?;
     record(
         ruby,
@@ -920,6 +921,7 @@ fn status_hash(ruby: &Ruby, status: PlainDefinitionStatus) -> Result<RHash, Erro
             ("held_keys", ruby.into_value(held_keys)),
             ("drain_failure", ruby.into_value(drain_failure)),
             ("unindexed_joins", unindexed_joins.as_value()),
+            ("source_index_gaps", source_index_gaps.as_value()),
             ("correcting", correcting.as_value()),
         ],
     )
@@ -947,6 +949,19 @@ fn unindexed_join_hash(ruby: &Ruby, join: PlainUnindexedJoin) -> Result<RHash, E
             ("table", ruby.into_value(join.table)),
             ("column", ruby.into_value(join.column)),
             ("fix", ruby.into_value(join.fix)),
+        ],
+    )
+}
+
+/// A source index a `GROUP BY` or `JOIN` target needs and lacks.
+fn source_index_gap_hash(ruby: &Ruby, gap: PlainSourceIndexGap) -> Result<RHash, Error> {
+    record(
+        ruby,
+        [
+            ("table", ruby.into_value(gap.table)),
+            ("columns", ruby.into_value(gap.columns)),
+            ("opted_out", ruby.into_value(gap.opted_out)),
+            ("fix", ruby.into_value(gap.fix)),
         ],
     )
 }

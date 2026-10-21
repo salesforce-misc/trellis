@@ -37,7 +37,9 @@ use trellis::staging::interleave::PausePoint;
 const DDL: &str = "create table public.a (id integer primary key, ga integer, t integer, \
                        k integer, x integer); \
                    create table public.b (id integer primary key, t integer, k integer, \
-                       gb integer, y integer)";
+                       gb integer, y integer); \
+                   create index on public.a (t, k); create index on public.a (k); \
+                   create index on public.b (t, k); create index on public.b (k)";
 
 /// The points of a page's `JOIN` apply, in order.
 const POINTS: [PausePoint; 7] = [
@@ -1352,7 +1354,8 @@ async fn composed_fields_expression_arguments_and_numeric_scale() {
     let mut d = Driver::start(
         "create table public.o (id integer primary key, cid integer, qty integer, \
                                 amount numeric(10, 2)); \
-         create table public.c (id integer primary key, region text, weight integer)",
+         create table public.c (id integer primary key, region text, weight integer); \
+         create index on public.o (cid)",
         &[
             ("id", int4()),
             ("cid", int4()),
@@ -1947,7 +1950,7 @@ async fn the_knob_refuses_a_join_over_a_target() {
     .await;
     trellis::defs::install_definition(
         d.pool(),
-        "TRANSFORM l FROM public.a LEFT JOIN public.c ON a.k = c.k GROUP BY c.gb \
+        "TRANSFORM l FROM public.a LEFT JOIN public.c ON a.k = c.k GROUP BY c.gb WITHOUT SOURCE INDEX \
          SELECT c.gb AS gb, COUNT(*) AS n",
         &[("id".to_string(), int4()), ("k".to_string(), int4())].into(),
         "public",
@@ -2030,7 +2033,8 @@ async fn a_truncate_of_the_joined_side_refills_typed_unmatched_groups() {
         "create table public.o (id integer primary key, cid text, rid integer, \
                                 region text, amount numeric(10, 2)); \
          create table public.c (id integer primary key, cid text, rid integer, \
-                                at timestamptz, price numeric(10, 2), w bigint)",
+                                at timestamptz, price numeric(10, 2), w bigint); \
+         create index on public.o (cid, rid); create index on public.c (cid, rid)",
         &[
             ("id", int4()),
             ("cid", ValueType::Text),

@@ -70,11 +70,11 @@ use trellis_embed::{
     PlainCaptureFailure, PlainCaptureWait, PlainConfig, PlainCorrectingNode, PlainDefinitionStatus,
     PlainDefinitionSummary, PlainDivergence, PlainDrainFailure, PlainError, PlainHeldKeys,
     PlainPoisonEntry, PlainQuarantineEntry, PlainRelationship, PlainRelationshipSummary,
-    PlainSamplePage, PlainSelfCheckJob, PlainSelfCheckReport, PlainUnindexedJoin, SELF_CHECK_MODES,
-    SELF_CHECK_OUTCOMES, SELF_CHECK_STATES, capture_failure_kind_names, decode_cursor,
-    decode_watermark, encode_watermark, quarantine_state_names, relationship_cardinality_names,
-    require_transform_statement, self_check_mode, system_time_from_epoch_micros,
-    transform_status_names,
+    PlainSamplePage, PlainSelfCheckJob, PlainSelfCheckReport, PlainSourceIndexGap,
+    PlainUnindexedJoin, SELF_CHECK_MODES, SELF_CHECK_OUTCOMES, SELF_CHECK_STATES,
+    capture_failure_kind_names, decode_cursor, decode_watermark, encode_watermark,
+    quarantine_state_names, relationship_cardinality_names, require_transform_statement,
+    self_check_mode, system_time_from_epoch_micros, transform_status_names,
 };
 
 /// What every NIF returns: `{:ok, T}` or `{:error, {code, message}}`.
@@ -224,6 +224,7 @@ struct StatusTerm {
     held_keys: Option<HeldKeysTerm>,
     drain_failure: Option<DrainFailureTerm>,
     unindexed_joins: Vec<UnindexedJoinTerm>,
+    source_index_gaps: Vec<SourceIndexGapTerm>,
     correcting: Vec<CorrectingNodeTerm>,
 }
 
@@ -263,6 +264,27 @@ impl From<PlainUnindexedJoin> for UnindexedJoinTerm {
             table: join.table,
             column: join.column,
             fix: join.fix,
+        }
+    }
+}
+
+/// A source index a `GROUP BY` or `JOIN` target needs and lacks, as
+/// `status/2` reports it.
+#[derive(NifMap)]
+struct SourceIndexGapTerm {
+    table: String,
+    columns: Vec<String>,
+    opted_out: bool,
+    fix: String,
+}
+
+impl From<PlainSourceIndexGap> for SourceIndexGapTerm {
+    fn from(gap: PlainSourceIndexGap) -> Self {
+        SourceIndexGapTerm {
+            table: gap.table,
+            columns: gap.columns,
+            opted_out: gap.opted_out,
+            fix: gap.fix,
         }
     }
 }
@@ -1054,6 +1076,11 @@ fn status<'a>(
                     .unindexed_joins
                     .into_iter()
                     .map(UnindexedJoinTerm::from)
+                    .collect(),
+                source_index_gaps: status
+                    .source_index_gaps
+                    .into_iter()
+                    .map(SourceIndexGapTerm::from)
                     .collect(),
                 correcting: status
                     .correcting

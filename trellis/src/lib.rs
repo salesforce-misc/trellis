@@ -199,6 +199,7 @@ pub use staging::{
 pub use defs::catalog::CatalogError;
 pub use defs::ddl::DdlError;
 pub use defs::error::ParseError;
+pub use defs::source_index::SourceIndexGap;
 pub use defs::validate::ValidationError;
 pub use intake::error::IntakeError;
 pub use staging::apply::ApplyError;

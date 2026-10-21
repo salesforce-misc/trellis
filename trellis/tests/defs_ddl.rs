@@ -26,6 +26,7 @@ fn order_totals_def() -> TransformDef {
             },
         }],
         predicate: Predicate::True,
+        without_source_index: false,
         explicit_source_schema: None,
         explicit_target_schema: None,
     }
@@ -260,6 +261,7 @@ async fn text_and_boolean_calculated_fields_get_matching_target_column_types() {
             },
         ],
         predicate: Predicate::True,
+        without_source_index: false,
         explicit_source_schema: None,
         explicit_target_schema: None,
     };
@@ -327,6 +329,7 @@ async fn uuid_column_passthrough_gets_a_matching_target_column_type() {
             expr: Expr::Column("author".to_string()),
         }],
         predicate: Predicate::True,
+        without_source_index: false,
         explicit_source_schema: None,
         explicit_target_schema: None,
     };
@@ -408,6 +411,7 @@ async fn other_typed_passthrough_columns_get_their_real_native_target_type() {
             },
         ],
         predicate: Predicate::True,
+        without_source_index: false,
         explicit_source_schema: None,
         explicit_target_schema: None,
     };
@@ -514,6 +518,7 @@ async fn integer_family_passthrough_keeps_its_concrete_type_but_arithmetic_widen
         predicate: Predicate::True,
         explicit_source_schema: None,
         explicit_target_schema: None,
+        without_source_index: false,
     };
     let source_columns = numeric_columns(&["author", "views", "rank"]);
 
@@ -594,6 +599,7 @@ async fn numeric_family_passthrough_keeps_its_own_concrete_type() {
             },
         ],
         predicate: Predicate::True,
+        without_source_index: false,
         explicit_source_schema: None,
         explicit_target_schema: None,
     };
@@ -672,6 +678,7 @@ async fn uuid_column_works_as_an_aggregate_group_by_key() {
             },
         ],
         predicate: Predicate::True,
+        without_source_index: false,
         explicit_source_schema: None,
         explicit_target_schema: None,
     };
@@ -759,6 +766,7 @@ async fn aggregate_target_table_gets_a_nulls_not_distinct_unique_key_from_the_gr
             },
         ],
         predicate: Predicate::True,
+        without_source_index: false,
         explicit_source_schema: None,
         explicit_target_schema: None,
     };
@@ -905,6 +913,7 @@ async fn aggregate_columns_sharing_an_argument_share_one_count_column() {
             },
         ],
         predicate: Predicate::True,
+        without_source_index: false,
         explicit_source_schema: None,
         explicit_target_schema: None,
     };
@@ -996,6 +1005,7 @@ async fn aggregate_columns_over_different_arguments_keep_separate_count_columns(
             },
         ],
         predicate: Predicate::True,
+        without_source_index: false,
         explicit_source_schema: None,
         explicit_target_schema: None,
     };

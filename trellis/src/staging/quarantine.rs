@@ -4647,6 +4647,32 @@ async fn complete_resume(
         &[&id],
     )
     .await?;
+    // #1200: a partitioned source whose root is no longer the one recorded
+    // (dropped and created again, swapped in by renames, renamed away) is seen
+    // as new by the next pass: its recorded tree and queued corrections name
+    // the old root's nodes, and the resume's rebuild covers the new tree.
+    for row in txn
+        .query(
+            "select source_table from capture_failures where transform_id = $1",
+            &[&id],
+        )
+        .await?
+    {
+        let table: String = row.get(0);
+        txn.execute(
+            "delete from partition_corrections where table_name = $1 and exists ( \
+                 select 1 from partition_sources s where s.table_name = $1 \
+                   and s.root_oid::oid is distinct from pg_catalog.to_regclass($2)::oid)",
+            &[&table, &crate::defs::ddl::regclass_arg(&table)],
+        )
+        .await?;
+        txn.execute(
+            "delete from partition_sources s where s.table_name = $1 \
+               and s.root_oid::oid is distinct from pg_catalog.to_regclass($2)::oid",
+            &[&table, &crate::defs::ddl::regclass_arg(&table)],
+        )
+        .await?;
+    }
     txn.execute(
         "delete from capture_failures where transform_id = $1",
         &[&id],

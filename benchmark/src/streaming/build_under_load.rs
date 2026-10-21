@@ -996,6 +996,7 @@ pub async fn run(cfg: BuildUnderLoad, tuning: &EngineTuning) -> BuildUnderLoadRe
     let index_start = Instant::now();
     raw.batch_execute(&format!(
         "alter table public.{SOURCE} add primary key (id); \
+         create index on public.{SOURCE} (grp); \
          analyze public.{SOURCE};"
     ))
     .await

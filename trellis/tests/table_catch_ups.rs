@@ -409,6 +409,61 @@ async fn a_requested_backfill_rebuilds_a_stale_one_to_one_row() {
     );
 }
 
+/// Issue #1202: a source outside `public` and Trellis's own schemas is named
+/// by its qualified name or, when exactly one captured table carries it, its
+/// bare one; a bare name two captured sources share is refused naming both.
+#[tokio::test]
+async fn request_backfill_names_a_source_outside_the_search_path() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+    client
+        .batch_execute(
+            "create schema shop; create schema blog; \
+             create table shop.orders (id integer primary key, amount integer); \
+             create table blog.orders (id integer primary key, amount integer); \
+             create table shop.refunds (id integer primary key, amount integer)",
+        )
+        .await
+        .expect("create the schemas and tables");
+    let types = HashMap::from([
+        ("id".to_string(), ValueType::Numeric),
+        ("amount".to_string(), ValueType::Numeric),
+    ]);
+    for sql in [
+        "TRANSFORM shop_orders_copy FROM shop.orders SELECT amount AS amt",
+        "TRANSFORM blog_orders_copy FROM blog.orders SELECT amount AS amt",
+        "TRANSFORM refunds_copy FROM shop.refunds SELECT amount AS amt",
+    ] {
+        install_definition(&db.pool, sql, &types, "public")
+            .await
+            .expect("install the 1-1");
+    }
+    let trellis = connect_trellis(db.dsn()).await;
+
+    trellis
+        .request_backfill("shop.orders")
+        .await
+        .expect("a qualified name resolves");
+    trellis
+        .request_backfill("refunds")
+        .await
+        .expect("a bare name only one captured source carries resolves");
+
+    let err = trellis.request_backfill("orders").await.unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        matches!(err, trellis::TrellisError::AmbiguousSourceTable { .. })
+            && msg.contains("shop.orders")
+            && msg.contains("blog.orders"),
+        "an ambiguous bare name is refused naming both: {msg}"
+    );
+    assert!(matches!(
+        trellis.request_backfill("public.orders").await,
+        Err(trellis::TrellisError::SourceTableNotFound(_))
+    ));
+}
+
 /// The aggregate case: group `b` lost its only row and group `a` one of its
 /// rows, neither delete reaching the target. The re-read re-derives `a`
 /// from what it still has, and only the sweep can drop `b`. This is the

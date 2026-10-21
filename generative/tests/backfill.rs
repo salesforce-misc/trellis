@@ -56,6 +56,7 @@ async fn direct_backfill_builds_the_target_from_preexisting_source_rows() {
             },
         }],
         predicate: Predicate::True,
+        without_source_index: false,
         explicit_source_schema: None,
         explicit_target_schema: None,
     };
@@ -242,6 +243,7 @@ async fn quiesce_blocks_until_a_slow_backfill_actually_reaches_live() {
             },
         }],
         predicate: Predicate::True,
+        without_source_index: false,
         explicit_source_schema: None,
         explicit_target_schema: None,
     };

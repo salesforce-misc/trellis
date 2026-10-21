@@ -36,11 +36,10 @@ reader the Re-derive build serves reports `backfilling` and is rebuilt in
 place; any other reports `catching_up`. Both return to `live` when the re-read
 is done. It's the cheapest repair when you know which table missed changes.
 
-It takes a table's bare name and looks it up only in Trellis's catalog and
-target schemas and `public`, so it can't name a source in another schema
-([#1202](https://github.com/salesforce-misc/trellis/issues/1202)): repair
-such a source's readers with `PAUSE`/`RESUME`. It repairs what a rebuild
-repairs, with the same exceptions (below).
+It takes the table's `schema.table` name, or a bare name when exactly one
+captured table carries it; a bare name two captured tables share is refused,
+naming both. It repairs what a rebuild repairs, with the same exceptions
+(below).
 
 ### `PAUSE` and `RESUME`
 
@@ -50,7 +49,10 @@ repairs, with the same exceptions (below).
 
 **What a resume checks.** A resume first runs define's validation against the
 live schema, and refuses while define would, leaving the definition paused;
-the error names the column and what to change. It also refuses in five cases
+the error names the column and what to change. A whole-transform resume also
+refuses, as define does, while a source index the definition's `self_check`
+pages by is missing, unless it was defined `WITHOUT SOURCE INDEX`; create the
+index the message names, then resume. It also refuses in five cases
 define doesn't, where the only repair is to `DROP TRANSFORM` and define again:
 
 * a 1-1 definition's source key was redefined;

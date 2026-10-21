@@ -143,6 +143,7 @@ fn to_one_def() -> TransformDef {
             },
         }],
         predicate: Predicate::True,
+        without_source_index: false,
         explicit_source_schema: None,
         explicit_target_schema: None,
     }
@@ -338,6 +339,7 @@ fn to_many_def() -> TransformDef {
             },
         }],
         predicate: Predicate::True,
+        without_source_index: false,
         explicit_source_schema: None,
         explicit_target_schema: None,
     }

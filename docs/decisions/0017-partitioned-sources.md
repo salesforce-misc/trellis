@@ -101,6 +101,20 @@ node, the worst writer commit I saw was 7–56 ms at every size, for about twice
 the total install time. 100 nodes keeps the one-transaction stall within the
 roughly 50 ms writer wait a plain table's install already accepts.
 
+### Each node's triggers are recorded, and maintenance is not a disruption
+
+A trigger disabled, dropped, recreated or altered outside Trellis, or a capture
+function replaced by hand, pauses a partitioned source's readers exactly as it
+does a plain table's (`capture::triggers`). Every install operation records the
+oid, `xmin` and enabled mode of the triggers it made, on the root and on each
+node, in its own transaction, so a larger tree's node-by-node install leaves a
+record for exactly the nodes that carry triggers. The pass checks the recorded
+nodes that are still in the tree. A node that is attached, created, detached or
+dropped is not a recorded node in the tree, so maintenance pauses nothing, and
+the install that adds capture to a new node records it. The rows of a node that
+left the tree are forgotten; a node that returns carrying all five triggers
+`ENABLE ALWAYS` is recorded as found.
+
 ### Capture stages nothing for a table that has left the tree
 
 Each capture function of a partitioned source first compares
@@ -429,9 +443,15 @@ A deep check compares them in this order:
 2. Otherwise a changed `system_identifier` compares the recorded nodes by oid
    and bound. When every recorded oid is present with the same bound it is
    `pg_upgrade`; anything else is a restore.
-3. Otherwise the ordinary plan runs. A root dropped and recreated, or swapped
-   in by renames, keeps both values: it is the old tree gone and a new one
-   created, corrected per node, not a restore.
+3. Otherwise the ordinary plan runs. A root dropped and recreated, renamed
+   away, moved to another schema or swapped in by renames keeps both values,
+   so it is no restore. It is table maintenance, not partition maintenance:
+   the pass pauses every reader before any deep check, like a plain table that
+   is gone or swapped ([capture by
+   triggers](../staging-and-claiming/01-capture-by-triggers.md#capture-changed-outside-trellis)),
+   and corrects and reinstalls nothing. A resume re-validates against the
+   table now at the name, forgets the recorded tree and rebuilds. Only a
+   leaf's or a middle's maintenance is corrected per node.
 
 On `pg_upgrade` the pass re-records the `xmin`s and `relpartbound` texts.
 `pg_upgrade` resets every `pg_inherits.xmin` and `pg_class.xmin` to one value,
@@ -529,10 +549,9 @@ grouped `BY product_id` is refused at define, naming `order_id`.
 - After any dump and restore the pass pauses every definition on a
   partitioned source, holding stale values
   until an operator runs `RESUME`, which rebuilds.
-- Five cases are left as [known correctness gaps](../known-correctness-gaps.md)
+- Four cases are left as [known correctness gaps](../known-correctness-gaps.md)
   rather than designed around, because no capture shape or fingerprint sees
-  them: "A `MERGE` that moves a row to another partition", "A `DEFAULT`
-  partition beside a leaf created and dropped within one pass", "A
-  partitioned source attached under another table and detached within one
-  pass", "A partitioned source renamed away and back within one pass" and "A
-  leaf detached and attached again around a `pg_upgrade`".
+  them: "A `MERGE` that moves a row to another partition", "The source renamed
+  or re-parented and back within one pass", "A short-lived leaf beside a
+  `DEFAULT` partition" and "A leaf detached and attached again around a
+  `pg_upgrade`".

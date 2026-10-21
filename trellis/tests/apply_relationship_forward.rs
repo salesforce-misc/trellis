@@ -156,6 +156,7 @@ fn to_one_def() -> TransformDef {
             },
         }],
         predicate: Predicate::True,
+        without_source_index: false,
         explicit_source_schema: None,
         explicit_target_schema: None,
     }
@@ -560,6 +561,7 @@ async fn to_many_relationship_context_has_no_projection_and_stays_live() {
             },
         }],
         predicate: Predicate::True,
+        without_source_index: false,
         explicit_source_schema: None,
         explicit_target_schema: None,
     };

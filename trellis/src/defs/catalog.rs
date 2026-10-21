@@ -225,6 +225,15 @@ pub enum CatalogError {
         /// The table, schema-qualified.
         hidden_table: String,
     },
+    /// A `GROUP BY` or `JOIN` target's source lacks the index its `self_check`
+    /// walk pages by (#1167, `super::source_index`). Refused by define and by
+    /// a whole-transform resume, unless the definition says `WITHOUT SOURCE
+    /// INDEX`; `self_check` refuses it later too. The message names each
+    /// table and columns and a `create index` to run.
+    SourceIndexMissing {
+        target: String,
+        missing: Vec<super::source_index::SourceIndex>,
+    },
     /// A definition's ledger table doesn't exist, though define creates one
     /// for every definition, 1-1 or aggregate (#986). Only Trellis writes its
     /// tables, so an operator dropped it; the build's `start` reads it and
@@ -540,6 +549,7 @@ impl CatalogError {
             CatalogError::AggregateDeltasTableMissing { .. } => ErrorCode::Validation,
             CatalogError::GroupBasisUnsupported { .. } => ErrorCode::Validation,
             CatalogError::GroupBasisTableMissing { .. } => ErrorCode::Validation,
+            CatalogError::SourceIndexMissing { .. } => ErrorCode::Validation,
             CatalogError::LedgerTableMissing { .. } => ErrorCode::Validation,
             CatalogError::TargetTableMissing { .. } => ErrorCode::Validation,
             // A target the definition may not have, like a row-security
@@ -694,6 +704,9 @@ impl fmt::Display for CatalogError {
                  would create one. Trellis doesn't re-create it: `DROP TRANSFORM` and define it \
                  again"
             ),
+            CatalogError::SourceIndexMissing { target, missing } => {
+                write!(f, "{}", super::source_index::refusal_text(target, missing))
+            }
             CatalogError::GroupBasisUnsupported { reason } => write!(
                 f,
                 "the group-basis dev knob (TRELLIS_DEV_GROUP_BASIS) can't take this aggregate: \
@@ -913,6 +926,7 @@ impl std::error::Error for CatalogError {
             CatalogError::AggregateDeltasTableMissing { .. } => None,
             CatalogError::GroupBasisUnsupported { .. } => None,
             CatalogError::GroupBasisTableMissing { .. } => None,
+            CatalogError::SourceIndexMissing { .. } => None,
             CatalogError::LedgerTableMissing { .. } => None,
             CatalogError::TargetTableMissing { .. } => None,
             CatalogError::TargetInCatalogSchema { .. } => None,
@@ -3426,6 +3440,23 @@ async fn create_definition_inner(
             None
         }
     };
+    // #1167: the index a `self_check` walk of the target pages its source by.
+    if !def.without_source_index {
+        let missing = super::source_index::unmet_for(
+            &*txn,
+            &def,
+            source_columns,
+            &qualified_source,
+            join_sides.as_ref().map(|sides| sides.joined.as_str()),
+        )
+        .await?;
+        if !missing.is_empty() {
+            return Err(CatalogError::SourceIndexMissing {
+                target: def.target.clone(),
+                missing,
+            });
+        }
+    }
 
     // The source's version fence, bumped as this transaction's first lock
     // (issues #744 and #770). The bump waits for every page holding the
@@ -6226,6 +6257,34 @@ pub(crate) async fn check_ledger_table(
     })
 }
 
+/// Refuses a whole-transform resume while a source index the definition
+/// needs is missing (#1167, `super::source_index`), as define would, unless
+/// it was defined `WITHOUT SOURCE INDEX`.
+async fn check_source_index(
+    txn: &tokio_postgres::Transaction<'_>,
+    definition: &Definition,
+    revalidated: &Revalidated,
+) -> Result<(), CatalogError> {
+    if definition.def.without_source_index {
+        return Ok(());
+    }
+    let missing = super::source_index::unmet_for(
+        txn,
+        &definition.def,
+        &revalidated.source_columns,
+        &definition.source_table,
+        revalidated.join.as_ref().map(|sides| sides.joined.as_str()),
+    )
+    .await?;
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(CatalogError::SourceIndexMissing {
+        target: definition.def.target.clone(),
+        missing,
+    })
+}
+
 /// Refuses a whole-transform resume of a definition whose target table
 /// doesn't exist ([`CatalogError::TargetTableMissing`]). Define creates the
 /// target, and the rebuild writes into it, so a resume that passed would
@@ -6251,7 +6310,8 @@ pub(crate) async fn check_target_table(
 }
 
 /// A whole-transform resume's checks that the target exists
-/// ([`check_target_table`]) and that the tables Trellis keeps beside
+/// ([`check_target_table`]), that the source indexes the definition needs
+/// exist ([`check_source_index`]), and that the tables Trellis keeps beside
 /// it are what define would create now: the ledger exists
 /// ([`check_ledger_table`]) and an aggregate's group-delta table exists with
 /// the columns define would give it ([`check_deltas_shape`]), or, for an
@@ -6265,6 +6325,7 @@ pub(crate) async fn check_owned_tables(
     revalidated: &Revalidated,
 ) -> Result<(), CatalogError> {
     check_target_table(txn, definition).await?;
+    check_source_index(txn, definition, revalidated).await?;
     // A JOIN keeps no ledger, and its hidden tables are fully derived: the
     // resume drops and recreates them (#1107), so there's nothing to check.
     if revalidated.join.is_some() {

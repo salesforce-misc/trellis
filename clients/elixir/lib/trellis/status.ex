@@ -44,6 +44,14 @@ defmodule Trellis.Status do
   index, `[]` when every one is indexed. It leaves `status` alone, and an
   index you create shows on the next call.
 
+  `source_index_gaps` is a warning, never a hold-up: a
+  `Trellis.SourceIndexGap` for each source index a `GROUP BY` or `JOIN`
+  target needs and lacks, `[]` when it needs none or they exist. Define and a
+  resume refuse a transform without them, so a gap is an index dropped
+  since, or one the transform opted out of with `WITHOUT SOURCE INDEX`.
+  Nothing is paused, but `Trellis.self_check/3` refuses to walk the target
+  unless it opted out, when the walk scans the source once per page.
+
   `correcting` lists a `Trellis.CorrectingNode` for each partition of its
   partitioned source it is being corrected for, oldest first (`[]` when
   none): a partition was attached, detached, dropped or truncated, and the
@@ -66,6 +74,7 @@ defmodule Trellis.Status do
           held_keys: Trellis.HeldKeys.t() | nil,
           drain_failure: Trellis.DrainFailure.t() | nil,
           unindexed_joins: [Trellis.UnindexedJoin.t()],
+          source_index_gaps: [Trellis.SourceIndexGap.t()],
           correcting: [Trellis.CorrectingNode.t()]
         }
 
@@ -77,6 +86,7 @@ defmodule Trellis.Status do
     :held_keys,
     :drain_failure,
     :unindexed_joins,
+    :source_index_gaps,
     :correcting
   ]
   defstruct @enforce_keys
@@ -90,6 +100,7 @@ defmodule Trellis.Status do
         held_keys: held_keys,
         drain_failure: drain_failure,
         unindexed_joins: unindexed_joins,
+        source_index_gaps: source_index_gaps,
         correcting: correcting
       }) do
     %__MODULE__{
@@ -100,6 +111,7 @@ defmodule Trellis.Status do
       held_keys: held_keys && Trellis.HeldKeys.from_native(held_keys),
       drain_failure: drain_failure && Trellis.DrainFailure.from_native(drain_failure),
       unindexed_joins: Enum.map(unindexed_joins, &Trellis.UnindexedJoin.from_native/1),
+      source_index_gaps: Enum.map(source_index_gaps, &Trellis.SourceIndexGap.from_native/1),
       correcting: Enum.map(correcting, &Trellis.CorrectingNode.from_native/1)
     }
   end
@@ -155,6 +167,31 @@ defmodule Trellis.UnindexedJoin do
   @doc false
   def from_native(%{relationship: relationship, table: table, column: column, fix: fix}) do
     %__MODULE__{relationship: relationship, table: table, column: column, fix: fix}
+  end
+end
+
+defmodule Trellis.SourceIndexGap do
+  @moduledoc """
+  A source index a `GROUP BY` or `JOIN` target needs and lacks, as
+  `Trellis.status/2` reports it: the qualified `table`, the `columns` the
+  index should lead with, whether the transform opted out with `WITHOUT
+  SOURCE INDEX` (`opted_out`), and a `create index` statement to run (`fix`).
+  Trellis doesn't create indexes on your tables.
+  """
+
+  @type t :: %__MODULE__{
+          table: String.t(),
+          columns: [String.t()],
+          opted_out: boolean(),
+          fix: String.t()
+        }
+
+  @enforce_keys [:table, :columns, :opted_out, :fix]
+  defstruct @enforce_keys
+
+  @doc false
+  def from_native(%{table: table, columns: columns, opted_out: opted_out, fix: fix}) do
+    %__MODULE__{table: table, columns: columns, opted_out: opted_out, fix: fix}
   end
 end
 

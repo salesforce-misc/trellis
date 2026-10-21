@@ -49,7 +49,8 @@ fn int4() -> ValueType {
 async fn start() -> Driver {
     trellis::dev::staging::set_group_basis(true);
     Driver::start(
-        "create table public.src (id integer primary key, g integer, v integer)",
+        "create table public.src (id integer primary key, g integer, v integer); \
+         create index on public.src (g)",
         &[("id", int4()), ("g", int4()), ("v", int4())],
         &[AGG],
         &[SRC],
@@ -404,7 +405,7 @@ async fn a_rebuild_writes_averages_numeric_sums_and_composed_fields() {
     trellis::dev::staging::set_group_basis(true);
     let mut d = Driver::start(
         "create table public.src (id integer primary key, g integer, v integer, \
-         m numeric(12, 2))",
+         m numeric(12, 2)); create index on public.src (g)",
         &[
             ("id", int4()),
             ("g", int4()),

@@ -35,6 +35,7 @@ fn add_def() -> TransformDef {
             },
         }],
         predicate: Predicate::True,
+        without_source_index: false,
         explicit_source_schema: None,
         explicit_target_schema: None,
     }
@@ -271,6 +272,7 @@ async fn to_one_relationship_matches_postgres_left_join() {
             },
         }],
         predicate: Predicate::True,
+        without_source_index: false,
         explicit_source_schema: None,
         explicit_target_schema: None,
     };
@@ -394,6 +396,7 @@ async fn assert_to_many_matches_postgres(client: &tokio_postgres::Client) {
             },
         ],
         predicate: Predicate::True,
+        without_source_index: false,
         explicit_source_schema: None,
         explicit_target_schema: None,
     };

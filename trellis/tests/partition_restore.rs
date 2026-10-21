@@ -337,8 +337,9 @@ async fn a_changed_identifier_with_new_oids_is_a_restore() {
 }
 
 /// A root dropped and recreated, or swapped in by renames, under the same
-/// identifier and catalog oid is no restore: the ordinary path corrects it,
-/// and nothing pauses.
+/// identifier and catalog oid is no restore: it is table maintenance (#1200),
+/// so the pass pauses the readers with the changed-outside-Trellis wording
+/// and corrects nothing.
 #[tokio::test]
 async fn a_recreated_or_swapped_root_is_no_restore() {
     for swap in [false, true] {
@@ -364,21 +365,13 @@ async fn a_recreated_or_swapped_root_is_no_restore() {
             ))
             .await;
         }
-        let outcome = fx.pass().await;
-        assert_eq!(outcome.partition_deep_checks, [SOURCE], "swap {swap}");
-        assert_ne!(fx.status("agg").await, "paused", "swap {swap}");
-        assert_eq!(fx.capture_failure("agg").await, None, "swap {swap}");
-        assert!(fx.recorded().await, "swap {swap}");
+        fx.pass().await;
+        assert_eq!(fx.status("agg").await, "paused", "swap {swap}");
+        let failure = fx.capture_failure("agg").await.expect("a reason");
         assert!(
-            fx.queued().await > 0,
-            "swap {swap}: the ordinary path queues the old tree gone and the new one created"
+            failure.contains("not the one Trellis captured") && !failure.contains("restored"),
+            "swap {swap}: {failure}"
         );
-        assert!(
-            !partitions::pending_corrections(&fx.d.ctl, SOURCE)
-                .await
-                .expect("the queue")
-                .is_empty(),
-            "swap {swap}: the engine sees them"
-        );
+        assert_eq!(fx.queued().await, 0, "swap {swap}: nothing is corrected");
     }
 }

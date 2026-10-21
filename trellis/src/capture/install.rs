@@ -549,6 +549,35 @@ pub async fn descendants(
         .collect())
 }
 
+/// The partitioned root `table` and the tables under it, by oid, with each
+/// one's `schema.table` text; empty for a table that isn't partitioned or
+/// doesn't exist. A node whose detach is pending is left out, as in
+/// [`descendants`]. The trigger record keeps one set of rows per entry
+/// (`super::triggers`).
+pub(crate) async fn tree_nodes(
+    client: &impl GenericClient,
+    table: &str,
+) -> Result<Vec<(u32, String)>, CaptureError> {
+    Ok(client
+        .query(
+            concat!(
+                "select d.relid, n.nspname::text || '.' || c.relname::text from (",
+                "select r.oid as relid from pg_catalog.pg_class r \
+                 where r.oid = pg_catalog.to_regclass($1) and r.relkind = 'p' \
+                 union all select p.relid from ",
+                partition_nodes!("pg_catalog.to_regclass($1)"),
+                " p) d join pg_catalog.pg_class c on c.oid = d.relid \
+                 join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
+                 order by 2"
+            ),
+            &[&crate::defs::ddl::regclass_arg(table)],
+        )
+        .await?
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect())
+}
+
 /// The query behind [`nodes_missing_capture`], which [`installed`] also
 /// embeds: `$1` the instance schema, `$2` the root's functions, `$3` the
 /// root's regclass text and `$4` the triggers, in [`CaptureEvent::ALL`] order.
@@ -884,7 +913,14 @@ pub async fn narrow(
         }
     }
     super::baseline::record(&txn, spec.table(), spec.columns()).await?;
-    super::triggers::record(&txn, schema, spec.table(), super::triggers::Mode::IfAbsent).await?;
+    super::triggers::record(
+        &txn,
+        schema,
+        spec.table(),
+        super::triggers::Mode::IfAbsent,
+        super::triggers::Covers::Whole,
+    )
+    .await?;
     txn.commit().await?;
     Ok(())
 }
@@ -1187,15 +1223,37 @@ async fn attempt(
     // #703: the columns capture images from here on, as they are now.
     match op {
         Op::Install {
-            spec, last: true, ..
+            spec, scope, last, ..
         } => {
-            super::baseline::record(&txn, table, spec.columns()).await?;
-            // #707: the triggers as this install made them.
-            super::triggers::record(&txn, schema, table, super::triggers::Mode::Overwrite).await?;
+            if last {
+                super::baseline::record(&txn, table, spec.columns()).await?;
+            }
+            // #707, #1200: the triggers of the tables this install made them
+            // on, as it made them, whether or not it is the last of several.
+            let covers = match scope {
+                Scope::All => super::triggers::Covers::Whole,
+                Scope::Root => super::triggers::Covers::Root,
+                Scope::Node(node) => super::triggers::Covers::Node(node),
+            };
+            super::triggers::record(
+                &txn,
+                schema,
+                table,
+                super::triggers::Mode::Overwrite,
+                covers,
+            )
+            .await?;
         }
         Op::Widen(spec) => {
             super::baseline::record(&txn, table, spec.columns()).await?;
-            super::triggers::record(&txn, schema, table, super::triggers::Mode::IfAbsent).await?;
+            super::triggers::record(
+                &txn,
+                schema,
+                table,
+                super::triggers::Mode::IfAbsent,
+                super::triggers::Covers::Whole,
+            )
+            .await?;
         }
         Op::Uninstall {
             scope: Scope::All | Scope::Root,
@@ -1204,7 +1262,10 @@ async fn attempt(
             super::baseline::forget(&txn, table).await?;
             super::triggers::forget(&txn, table).await?;
         }
-        Op::Install { .. } | Op::Uninstall { .. } => {}
+        Op::Uninstall {
+            scope: Scope::Node(node),
+            ..
+        } => super::triggers::forget_node(&txn, table, node).await?,
     }
     if parks_marker {
         // The marker row is this transaction's own since the park above, so

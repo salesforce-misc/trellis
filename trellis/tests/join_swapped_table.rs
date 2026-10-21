@@ -26,7 +26,8 @@ async fn a_swapped_joined_table_does_not_panic_the_pass() {
     trellis::dev::staging::set_group_basis(true);
     let mut d = Driver::start(
         "create table public.ja (id integer primary key, g text, k text); \
-         create table public.jb (id integer primary key, k text, y integer)",
+         create table public.jb (id integer primary key, k text, y integer); \
+         create index on public.ja (k); create index on public.jb (k)",
         &[
             ("id", ValueType::Integer(IntWidth::Int4)),
             ("g", ValueType::Text),

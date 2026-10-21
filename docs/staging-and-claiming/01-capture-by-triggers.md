@@ -489,8 +489,9 @@ meanwhile may be missing, so correctness can't be guaranteed, and waits for a
 `RESUME`.
 
 Each install, widen, narrow and repair records, in the transaction that makes
-it, the oid, `xmin` and enabled mode of each of a plain table's five capture
-triggers (`capture_triggers`), and each capture function's comment records a
+it, the oid, `xmin` and enabled mode of each of the five capture triggers of a
+plain table, or of a partitioned source's root and each of its tree's nodes
+(`capture_triggers`, one set of rows per node), and each capture function's comment records a
 hash of the source Trellis generated. Trellis's own changes therefore never
 read as a disruption, a crash in the middle of an install included. A widen
 or narrow changes no trigger and keeps the rows it finds. The pass compares
@@ -542,9 +543,24 @@ installs nothing on the table while its readers are paused. A table swap, a
 bulk load with triggers disabled or a fixture load therefore needs a
 `RESUME` afterwards ([embedding](../embedding.md)).
 
-A partitioned source's tree isn't recorded: its nodes come and go with
-partition maintenance, which has its own corrections (ADR-0017), and its
-broken triggers are reinstalled by the pass.
+A partitioned source's pass checks each recorded node that is still in the
+tree, and the root's functions once; the finding names the node. Partition
+maintenance pauses nothing, because it never changes a recorded node: a leaf
+that is attached, created (a `DEFAULT` and a `HASH` re-split included),
+detached or dropped is either not in the record or no longer in the tree, and
+the tree's corrections are ADR-0017's. The pass forgets the rows of a node
+that left the tree, installs capture on a new one (recording it in the same
+transaction), and records a node that comes back carrying all five triggers
+`ENABLE ALWAYS` as it finds it. A tree of 100 tables or more installs root
+first and then one table per transaction, each recording its own tables, so a
+pass that stops between two of them leaves a record for exactly the tables
+that carry triggers. A node that is still in the tree and lost, disabled or
+recreated its triggers is a disruption like a plain table's. So is the root
+itself dropped, renamed away, moved to another schema, swapped in by renames or
+dropped and recreated (empty, or with leaves attached): that is table
+maintenance, not partition maintenance, so the pass pauses the readers and
+corrects and reinstalls nothing; `RESUME` forgets the recorded tree and
+rebuilds.
 
 ### What rebuilds, what pauses, and what's missed
 
@@ -561,7 +577,8 @@ them:
   - a capture function an older Trellis generated (its source still is what
     its own comment hashes): replaced by a widen.
 - **Pauses, until a deliberate `RESUME`:**
-  - capture changed outside Trellis, on a plain table (the next section);
+  - capture changed outside Trellis, on a plain table or a partitioned source
+    (the next section);
   - a read column renamed or dropped, or the primary key redefined, by a
     marker, the pass or a drain page;
   - a key column retyped or re-collated so define would refuse it, or so the

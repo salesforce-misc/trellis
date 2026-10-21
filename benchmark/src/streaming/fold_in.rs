@@ -317,7 +317,8 @@ pub async fn run_probe(
 
     raw.batch_execute(&format!(
         "create table public.{SOURCE_TABLE} \
-             (id bigint primary key, {GROUP_COLUMN} bigint not null, val numeric(20, 2))"
+             (id bigint primary key, {GROUP_COLUMN} bigint not null, val numeric(20, 2)); \
+         create index on public.{SOURCE_TABLE} ({GROUP_COLUMN})"
     ))
     .await
     .expect("create aggregate source table");

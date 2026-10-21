@@ -127,8 +127,11 @@
 //!
 //! A partitioned source's deep check (`crate::capture::partitions`) fires
 //! [`PausePoint::BeforeConstraintFetch`] for the source after it reads and
-//! classifies the tree, before it fetches the constraint texts (#1129). A
-//! test runs the reconcile pass inside [`with_scope`].
+//! classifies the tree, before it fetches the constraint texts (#1129), and
+//! [`PausePoint::BeforeFingerprintRead`] after the pass's check that the
+//! source's name still holds the recorded root, before it reads the
+//! fingerprints (#1200). A test runs the reconcile pass inside
+//! [`with_scope`].
 //!
 //! A group-basis rebuild (`super::group_basis::rebuild`, run by a rebuild's
 //! sweep job in `super::build`) fires [`PausePoint::AfterRebuildLock`] for
@@ -299,6 +302,12 @@ pub enum PausePoint {
     /// (`capture::partitions`, #1129). The pass holds no transaction, so a
     /// node it read can be detached or dropped here.
     BeforeConstraintFetch,
+    /// After the capture pass's check that a partitioned source's name still
+    /// holds the recorded root, before the deep check reads the fingerprints,
+    /// for the source's unquoted `schema.table` (`capture::partitions`,
+    /// #1200). The pass holds no transaction, so the root can be swapped by
+    /// renames here.
+    BeforeFingerprintRead,
     /// After a group-basis rebuild has locked every group it covers, before
     /// the statement that takes its snapshot and replaces them, for the
     /// definition's target (`super::group_basis::rebuild`, #1101). Pages of

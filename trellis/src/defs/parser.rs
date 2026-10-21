@@ -603,6 +603,21 @@ impl Parser {
 
         let key_space = self.parse_key_space_clause()?;
 
+        let without_source_index = self.peek_is_keyword("WITHOUT");
+        if without_source_index {
+            self.advance();
+            self.expect_keyword("SOURCE")?;
+            self.expect_keyword("INDEX")?;
+            if matches!(key_space, KeySpace::OneToOne) {
+                return Err(ParseError::UnsupportedKeySpace {
+                    construct: "WITHOUT SOURCE INDEX".to_string(),
+                    detail: "only a GROUP BY or JOIN target needs a source index; a 1-1 \
+                             target pages by its source's primary key"
+                        .to_string(),
+                });
+            }
+        }
+
         self.expect_keyword("SELECT")?;
         let fields = self.parse_field_list()?;
 
@@ -624,6 +639,7 @@ impl Parser {
             key_space,
             fields,
             predicate,
+            without_source_index,
         })
     }
 

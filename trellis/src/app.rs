@@ -123,6 +123,7 @@ use tokio_postgres::types::PgLsn;
 
 use crate::client::{Client, ClientError, ClientOptions};
 use crate::config::Config;
+use crate::defs::source_index::SourceIndexGap;
 use crate::defs::{
     self, CatalogError, ParseError, RelationshipDefinition, TransformStatus, ValueType,
 };
@@ -910,6 +911,7 @@ impl Trellis {
             let mut holdup = (None, None);
             let mut drain_failure = None;
             let mut unindexed = Vec::new();
+            let mut source_index_gaps = Vec::new();
             let mut join = None;
             let mut correcting = Vec::new();
             if let Some(row) = &row {
@@ -950,12 +952,30 @@ impl Trellis {
                     unindexed =
                         unindexed_joins::for_definition(&*txn, row.get("source_table"), &def)
                             .await?;
+                    // Only an aggregate's requirement reads the recorded
+                    // source columns (whether the group basis takes it).
+                    let source_columns =
+                        if matches!(def.key_space, defs::ast::KeySpace::Aggregate { .. }) {
+                            defs::catalog::definition_by_id_in(&*txn, row.get(1))
+                                .await?
+                                .map(|d| d.source_columns)
+                                .unwrap_or_default()
+                        } else {
+                            Default::default()
+                        };
+                    source_index_gaps = defs::source_index::gaps(
+                        &*txn,
+                        &def,
+                        &source_columns,
+                        row.get("source_table"),
+                        row.get::<_, Option<String>>("join_table").as_deref(),
+                    )
+                    .await?;
                     join = crate::staging::join_status::for_definition(
                         &*txn,
                         self.config.schema(),
                         row.get(1),
                         row.get("source_table"),
-                        row.get("join_table"),
                         &def,
                     )
                     .await?;
@@ -976,6 +996,7 @@ impl Trellis {
                 ),
                 drain_failure,
                 unindexed_joins: unindexed,
+                source_index_gaps,
                 join,
                 correcting,
                 build_wait: row
@@ -1117,6 +1138,11 @@ impl Trellis {
     /// target, say), refreshes the settled projections of a relationship
     /// whose to-side the table is, and flips the readers back `live`.
     ///
+    /// `source_table` is the captured table's `schema.table` name, matched
+    /// exactly, or a bare name that exactly one captured table carries (any
+    /// schema); a bare name two captured tables share is refused
+    /// ([`TrellisError::AmbiguousSourceTable`]).
+    ///
     /// Only valid for a table the staging worker captures: one some
     /// registered definition reads, directly or through a relationship, and
     /// isn't one of this instance's own targets (issue #622; the set its
@@ -1130,31 +1156,40 @@ impl Trellis {
     pub async fn request_backfill(&self, source_table: &str) -> Result<(), TrellisError> {
         self.call(async {
             let mut client = self.pool.get().await?;
-            // The first schema on the path with the table, as define resolves a
-            // bare name. A table the role can't use doesn't resolve, and is
-            // refused as such rather than as not found (issue #933).
-            let Some(schema_row) = client
-                .query_opt(
-                    "select table_schema from information_schema.tables \
-                 where table_name = $1 and table_schema = any(current_schemas(false)) \
-                 order by array_position(current_schemas(false), table_schema) \
-                 limit 1",
-                    &[&source_table],
-                )
-                .await?
-            else {
-                defs::catalog::reject_inaccessible_table(&**client, None, source_table).await?;
-                return Err(TrellisError::SourceTableNotFound(source_table.to_string()));
+            let captured = crate::defs::tables_to_capture(&self.pool).await?;
+            let qualified = match resolve_backfill_table(&captured, source_table)? {
+                Some(qualified) => qualified,
+                None => {
+                    // Not captured. Tell a table that exists (nothing reads it)
+                    // from one that doesn't. A bare name is looked up the way
+                    // define resolves it; a table the role can't use is refused
+                    // as such rather than as not found (issue #933).
+                    let (schema, table) = match source_table.split_once('.') {
+                        Some((schema, table)) => (Some(schema), table),
+                        None => (None, source_table),
+                    };
+                    let found = client
+                        .query_opt(
+                            "select table_schema from information_schema.tables \
+                             where table_name = $2 \
+                               and (table_schema = $1::text \
+                                    or ($1::text is null \
+                                        and table_schema = any(current_schemas(false)))) \
+                             order by array_position(current_schemas(false), table_schema) \
+                             limit 1",
+                            &[&schema, &table],
+                        )
+                        .await?;
+                    let Some(row) = found else {
+                        defs::catalog::reject_inaccessible_table(&**client, schema, table).await?;
+                        return Err(TrellisError::SourceTableNotFound(source_table.to_string()));
+                    };
+                    let found_schema: String = row.get(0);
+                    return Err(TrellisError::TableNotCaptured {
+                        table: format!("{found_schema}.{table}"),
+                    });
+                }
             };
-            let schema: String = schema_row.get(0);
-            let qualified = format!("{schema}.{source_table}");
-
-            let captured = crate::defs::tables_to_capture(&self.pool)
-                .await?
-                .contains(&qualified);
-            if !captured {
-                return Err(TrellisError::TableNotCaptured { table: qualified });
-            }
 
             // A failure to park is a plain `Db` error.
             let txn = client.transaction().await?;
@@ -1890,6 +1925,28 @@ impl Trellis {
     }
 }
 
+/// Which captured table `request_backfill` names. A dotted name is the exact
+/// `schema.table`; a bare one matches the table part of the captured set and
+/// must match exactly one. `None` means no captured table matches.
+fn resolve_backfill_table(captured: &[String], name: &str) -> Result<Option<String>, TrellisError> {
+    if name.contains('.') {
+        return Ok(captured.iter().find(|t| t.as_str() == name).cloned());
+    }
+    let mut matches: Vec<&String> = captured
+        .iter()
+        .filter(|t| t.rsplit_once('.').map_or(t.as_str(), |(_, bare)| bare) == name)
+        .collect();
+    matches.sort();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [one] => Ok(Some((*one).clone())),
+        many => Err(TrellisError::AmbiguousSourceTable {
+            table: name.to_string(),
+            tables: many.iter().map(|t| (*t).clone()).collect(),
+        }),
+    }
+}
+
 /// The status an operator reads for definition `id`, persisted as `stored`
 /// (issue #497, `defs::catalog::reported_statuses`). Only a `live` one can
 /// differ, so any other skips the catalog read.
@@ -2132,9 +2189,19 @@ pub struct DefinitionStatus {
     /// do. Read live on each call, so an index created since shows. Empty
     /// when there is none; see `docs/recommendations.md`.
     pub unindexed_joins: Vec<UnindexedJoin>,
-    /// What a `JOIN` transform's hidden tables and join keys look like now
-    /// (#1112): their sizes, the `ON` columns with no usable index, and a
-    /// warning when `P` approaches the fact table's size. `None` for a
+    /// The source indexes a `GROUP BY` or `JOIN` target needs and lacks now
+    /// (#1167): one entry per table and columns. Define and a resume refuse
+    /// a definition without them, so an entry here is an index dropped or
+    /// made invalid since, or one the definition opted out of with
+    /// `WITHOUT SOURCE INDEX` ([`SourceIndexGap::opted_out`]). A warning:
+    /// nothing is paused and nothing is wrong, but `self_check` refuses to
+    /// walk the target (unless it opted out, when the walk scans the source
+    /// once per page). [`SourceIndexGap::fix`] is a `create index` to run;
+    /// Trellis never creates one. Read live on each call. Empty for every
+    /// other target, and when the indexes exist.
+    pub source_index_gaps: Vec<SourceIndexGap>,
+    /// What a `JOIN` transform's hidden tables look like now (#1112): their
+    /// sizes, and a warning when `P` approaches the fact table's size. `None` for a
     /// definition that isn't a `JOIN`. Read live on each call; a warning
     /// only, it never changes the definition's status.
     pub join: Option<JoinStatus>,
@@ -2612,6 +2679,10 @@ pub enum TrellisError {
     /// registered definition reads, so the staging worker doesn't capture it
     /// (issue #622).
     TableNotCaptured { table: String },
+    /// [`Trellis::request_backfill`] was given a bare table name that more than
+    /// one captured source table carries, one per entry of `tables`
+    /// (schema-qualified). The caller qualifies the name to say which it means.
+    AmbiguousSourceTable { table: String, tables: Vec<String> },
     /// [`crate::blocking::BlockingTrellis::connect`]'s background thread
     /// failed to spawn.
     BlockingSpawn(std::io::Error),
@@ -2711,7 +2782,9 @@ impl TrellisError {
             // A backfill request against an unpublished table is a rejected
             // call given the connection's current state — same category as
             // any other invalid-configuration error.
-            TrellisError::TableNotCaptured { .. } => ErrorCode::Validation,
+            TrellisError::TableNotCaptured { .. } | TrellisError::AmbiguousSourceTable { .. } => {
+                ErrorCode::Validation
+            }
             TrellisError::SourceTableNotFound(_) => ErrorCode::NotFound,
             // Same category as `ClientError`'s equivalent thread-lifecycle
             // variants — an embedder can't do anything about these beyond
@@ -2753,6 +2826,12 @@ impl std::fmt::Display for TrellisError {
                 f,
                 "\"{table}\" isn't captured: no registered transform reads it, and a table's \
                  first reader backfills it automatically"
+            ),
+            TrellisError::AmbiguousSourceTable { table, tables } => write!(
+                f,
+                "source table \"{table}\" is ambiguous: these captured tables share the name: \
+                 {}; qualify it as <schema>.{table}",
+                tables.join(", ")
             ),
             TrellisError::BlockingSpawn(err) => {
                 write!(f, "failed to spawn BlockingTrellis's runtime thread: {err}")
@@ -2826,6 +2905,7 @@ impl std::error::Error for TrellisError {
             TrellisError::Db(err) => Some(err),
             TrellisError::SourceTableNotFound(_)
             | TrellisError::TableNotCaptured { .. }
+            | TrellisError::AmbiguousSourceTable { .. }
             | TrellisError::BlockingThreadExitedBeforeReady
             | TrellisError::BlockingThreadGone
             | TrellisError::CancelledByShutdown
@@ -3014,6 +3094,34 @@ mod error_code_tests {
         assert_eq!(
             TrellisError::SourceTableNotFound("widgets".to_string()).code(),
             ErrorCode::NotFound
+        );
+    }
+
+    #[test]
+    fn backfill_names_resolve_exactly_or_unambiguously() {
+        let captured = vec!["shop.orders".to_string(), "public.items".to_string()];
+        let resolve = |n| resolve_backfill_table(&captured, n);
+        assert_eq!(
+            resolve("shop.orders").unwrap().as_deref(),
+            Some("shop.orders")
+        );
+        assert_eq!(resolve("orders").unwrap().as_deref(), Some("shop.orders"));
+        assert_eq!(resolve("public.orders").unwrap(), None);
+        assert_eq!(resolve("nope").unwrap(), None);
+
+        let both = vec!["shop.orders".to_string(), "blog.orders".to_string()];
+        let err = resolve_backfill_table(&both, "orders").unwrap_err();
+        assert_eq!(err.code(), ErrorCode::Validation);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("blog.orders") && msg.contains("shop.orders"),
+            "{msg}"
+        );
+        assert_eq!(
+            resolve_backfill_table(&both, "blog.orders")
+                .unwrap()
+                .as_deref(),
+            Some("blog.orders")
         );
     }
 
