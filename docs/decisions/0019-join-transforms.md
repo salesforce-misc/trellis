@@ -311,9 +311,17 @@ over its region: it enumerates the region's cells, locks `J` on their keys in
 one sorted statement, writes the cells from one `GROUP BY` of the region and
 carries the product into `T` as a delta. A final step locks every hidden and
 visible `T` group, compares the visible target with `T` and removes the rows of
-groups with no contributions left. The job's cursor records the last committed
-step, so a killed job resumes after it. Readers see values change leaf by leaf
-until the final step commits.
+groups with no contributions left; its cost grows with `T`'s group count, not
+with source rows. The job's cursor (`side:oid`) records the last committed
+step, so a killed job resumes after it. A tree that was not recorded, or a leaf
+with no usable constraint text, fails the job: no statement ever covers a
+whole partitioned side. Both sides partitioned run the `FROM` side's steps
+first; either order is exact. Readers see progressive values on a partitioned
+side: on a `RESUME`, result groups grow leaf by leaf and read partial sums with
+status `backfilling` until the final step commits; in a rebuild in place each
+result group reads the repaired regions' new contributions and the others' old
+ones. The guarantee is convergence, not the states in between. The old `T`
+until one commit holds only when both sides are unpartitioned.
 
 A `RESUME` keeps the visible target while the hidden tables restart empty, so
 the prior images that pages send the target's readers before the build commits
@@ -322,10 +330,6 @@ therefore parks its readers' catch-up when it commits, once (#1287): a
 group-basis or `JOIN` reader is rebuilt, any other re-derives. Pages keep
 computing prior images from the partials, and a rebuild in place of a `live`
 definition, whose partials match the target, rebuilds no reader.
-
-[OPEN: Neither is built yet (#1109). Until it is, a build halts the definition,
-with the reason, when a side is partitioned and has rows, or when a `RESUME`
-keeps a target that has rows while a reader of it isn't paused.]
 
 ### Define warns when `P` approaches the fact table's size
 

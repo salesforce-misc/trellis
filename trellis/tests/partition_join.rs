@@ -10,9 +10,10 @@
 //! `J`-locked writer, which carries each cell's change into `T`.
 //!
 //! Every test turns the group-basis dev knob on before its driver starts (a
-//! `JOIN` applies only behind it) and starts from two empty tables, since a
-//! `JOIN` build of a partitioned side with rows waits on #1286: it goes `live`
-//! with empty hidden tables and the seed arrives through capture. The pass,
+//! `JOIN` applies only behind it) and starts from two empty tables: the
+//! definition goes `live` with empty hidden tables and the seed arrives
+//! through capture (the per-leaf build of a partitioned side with rows is
+//! `join_interleavings.rs`'s). The pass,
 //! the seal, the drain and the correction engine are called by hand; nothing waits for convergence
 //! (#297). The oracle is each definition's own `JOIN … GROUP BY`, and the
 //! hidden `P`, `M`, `J` and `T` against `GROUP BY`s of the tables.

@@ -3291,9 +3291,7 @@ async fn build_a_pause_and_resume_wait_for_a_build_in_flight() {
 fn partitioned_ddl(a: bool, b: bool) -> String {
     let table = |name: &str, columns: &str, partitioned: bool| -> String {
         if !partitioned {
-            return format!(
-                "create table public.{name} (id integer primary key, {columns}); "
-            );
+            return format!("create table public.{name} (id integer primary key, {columns}); ");
         }
         format!(
             "create table public.{name} (id integer not null, {columns}, primary key (t, id)) \
@@ -3420,14 +3418,11 @@ async fn prepare(lab: &mut Lab, mode: Mode) -> &'static str {
 /// partitioned sides, ends at the oracle with zero diff, and its steps run
 /// per side and leaf: the cursor names the last one (`side:oid`).
 async fn partitioned_case(a: bool, b: bool, mode: Mode, kind: Kind) {
-    let context = format!("a partitioned {a}, b partitioned {b}, {mode:?}, {}", kind.name);
-    let mut lab = seeded_in(
-        &partitioned_ddl(a, b),
-        Key::Pair,
-        &[kind],
-        PARTITIONED_SEED,
-    )
-    .await;
+    let context = format!(
+        "a partitioned {a}, b partitioned {b}, {mode:?}, {}",
+        kind.name
+    );
+    let mut lab = seeded_in(&partitioned_ddl(a, b), Key::Pair, &[kind], PARTITIONED_SEED).await;
     prepare(&mut lab, mode).await;
     lab.build().await;
     lab.assert_built(&context).await;
@@ -3547,7 +3542,9 @@ async fn a_killed_join_build_resumes_after_the_last_committed_step() {
     let m_bases = format!("select count(*), count(__basis) from {m}");
     assert_eq!(
         lab.d.rows(&m_bases).await,
-        lab.d.rows(&format!("select count(*), count(*) from {m}")).await,
+        lab.d
+            .rows(&format!("select count(*), count(*) from {m}"))
+            .await,
         "the joined side's cells carry a basis"
     );
     assert_eq!(
@@ -3594,13 +3591,7 @@ async fn a_killed_join_build_resumes_after_the_last_committed_step() {
 async fn a_page_between_two_steps_of_a_join_build_is_exact() {
     for (a, b) in [(true, false), (false, true), (true, true)] {
         let context = format!("a {a}, b {b}");
-        let mut lab = seeded_in(
-            &partitioned_ddl(a, b),
-            Key::Pair,
-            &[L],
-            PARTITIONED_SEED,
-        )
-        .await;
+        let mut lab = seeded_in(&partitioned_ddl(a, b), Key::Pair, &[L], PARTITIONED_SEED).await;
         lab.build().await;
         lab.assert_built(&context).await;
         // Committed before the rebuild, still undrained: a row of the first
@@ -3615,7 +3606,8 @@ async fn a_page_between_two_steps_of_a_join_build_is_exact() {
         // Two steps in: one side whole or a first leaf has committed.
         lab.run_steps("sweep", 1).await;
         let mut building = lab.next_step("sweep").await;
-        lab.check_applied(&format!("{context}: after two steps")).await;
+        lab.check_applied(&format!("{context}: after two steps"))
+            .await;
         lab.d.drain(undrained, "undrained").await;
         lab.check_applied(&format!("{context}: after the undrained page"))
             .await;
@@ -3624,7 +3616,8 @@ async fn a_page_between_two_steps_of_a_join_build_is_exact() {
              update public.b set y = y + 10 where id in (2, 6, 20)",
         )
         .await;
-        lab.check_applied(&format!("{context}: after a later page")).await;
+        lab.check_applied(&format!("{context}: after a later page"))
+            .await;
         lab.d
             .release(&mut building, PausePoint::BetweenRebuildStructures)
             .await;

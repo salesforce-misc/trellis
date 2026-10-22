@@ -759,7 +759,12 @@ the build's first moment.
   it was recorded is read through the root, one probe per group, and the
   change's own correction (ADR-0017) repairs what it moved. A leaf whose
   routing text was never recorded halts the rebuild: no statement ever covers
-  more than one leaf's groups.
+  more than one leaf's groups. A `JOIN` definition's rebuild with a
+  partitioned side that has rows runs per side and leaf in the same way: each
+  unpartitioned side whole, then each partitioned side's leaves in oid order
+  and its remainder, then a final `T` step, the job's cursor holding
+  `side:oid` for the last step committed
+  ([ADR-0019](0019-join-transforms.md)).
 - **Must:** the groups a rebuild covers are the enumeration union (R8): the
   source's groups, the groups named by old images of undrained ring
   changes, and the target's own groups. A group with no source rows goes to
@@ -1025,9 +1030,8 @@ A group-basis or JOIN reader needs exact images, as capture gives a source.
   rebuild overwrites whatever they did, and a rebuild in place of a `live`
   definition parks nothing, because its hidden state matches its target. The
   park is in the transaction that completes the whole build, once: on a
-  partitioned source, the remainder's, after the last leaf's. A `JOIN`'s
-  `RESUME` build doesn't park yet: it halts while its target has rows and a
-  reader that isn't paused ([ADR-0019](0019-join-transforms.md)). Further
+  partitioned source, the remainder's, after the last leaf's, and a
+  `JOIN`'s, the final `T` step's. Further
   hops need nothing: a reader's visible rows always match its own partials.
 - **Must:** a writer that resolved the target's feed before a new reader's
   define committed must not leave the reader's build missing its write. A

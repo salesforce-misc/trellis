@@ -82,7 +82,7 @@
 //!
 //! # A build ([`build`])
 //!
-//! A fresh build, a `RESUME` (which recreates the hidden tables and keeps the
+//! With both sides unpartitioned (or empty), a fresh build, a `RESUME` (which recreates the hidden tables and keeps the
 //! visible target) and a rebuild in place of a live `JOIN` (a
 //! `request_backfill` of either table, a re-installed capture) are one
 //! `READ COMMITTED` transaction over both structures, #1097's S1T: a page
@@ -117,10 +117,22 @@
 //! tables, and visible rows that disagree with `T`. Not a hand edit of `T` or
 //! of `J.matches`, which change only by delta; a `RESUME` recreates them.
 //!
-//! Not built yet, each halting the definition with the reason: a side that is
-//! partitioned and has rows (its per-side, per-leaf build, #1286), and a
-//! `RESUME` that keeps a target with rows while a reader of it isn't paused
-//! (the readers' rebuild at the build's commit, #1287).
+//! # A build with a partitioned side
+//!
+//! A side that is a partitioned root with rows (#1286) is built per side and
+//! per leaf, in transactions of their own ([`BuildWork`]): every unpartitioned
+//! side whole, then each partitioned side's leaves in oid order and its
+//! remainder, each step the shape of [`recompute_routed`] (steps 1 to 4 above
+//! over the region's cells, `T` written as a delta from the partials), then a
+//! final step that locks every group of the visible target and of `T` and
+//! compares each visible row with the row the target holds. The job's cursor
+//! names the last step committed (`super::build::run_join_steps`). Readers
+//! see progressive values until the final step commits.
+//!
+//! A `RESUME` build parks its readers' catch-up when it commits (#1287): its
+//! pages computed prior images from empty partials while the target kept the
+//! earlier rows, so a reader holds rows those images don't match, and its
+//! rebuild overwrites them. The park is in the last transaction, once.
 //!
 //! # Release ([`release`])
 //!
