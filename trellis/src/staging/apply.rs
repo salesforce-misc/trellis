@@ -7146,6 +7146,124 @@ mod tests {
             "a lost claim is never isolated: {events:?}"
         );
     }
+
+    /// Issue #1314: a page takes its version fences in table-name order, the
+    /// order a define, drop, resume or freeze bumps several in, so a page and
+    /// a bump of the same fences never deadlock. A page of a `JOIN` target
+    /// holds both its tables' fences, and a `JOIN` define bumps both: a page
+    /// that took the second table's fence first and then queued on the
+    /// first, behind a define that held the first and wanted the second,
+    /// closed a cycle (`40P01`, returned to the `DEFINE`).
+    ///
+    /// The interleaving is forced: a blocker holds the first fence, the
+    /// define bumps every fence in name order and queues behind it, and the
+    /// page queues behind the define. A page that took any fence before the
+    /// first one holds it when the blocker lets the define go. The fences
+    /// are many, and the scenario runs a few rounds, so a page taking them
+    /// in any other order holds one in some round.
+    #[tokio::test]
+    async fn a_page_takes_its_fences_in_the_order_a_define_bumps_them() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let connect = async || {
+            let (client, connection) = tokio_postgres::connect(db.dsn(), NoTls)
+                .await
+                .expect("connect");
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            client
+                .batch_execute(&format!(
+                    "set search_path to {}, public",
+                    crate::config::DEFAULT_SCHEMA
+                ))
+                .await
+                .expect("set search_path");
+            let pid: i32 = client
+                .query_one("select pg_backend_pid()", &[])
+                .await
+                .expect("read pid")
+                .get(0);
+            (client, pid)
+        };
+        let (raw, _) = connect().await;
+        let tables: Vec<String> = (0..8).map(|i| format!("public.f{i}")).collect();
+        let waiting_on_lock = async |pid: i32| {
+            for _ in 0..500 {
+                let waiting: bool = raw
+                    .query_one(
+                        "select coalesce((select wait_event_type = 'Lock' \
+                         from pg_stat_activity where pid = $1), false)",
+                        &[&pid],
+                    )
+                    .await
+                    .expect("read pg_stat_activity")
+                    .get(0);
+                if waiting {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("session {pid} never queued on a lock");
+        };
+
+        for round in 1..=3_i64 {
+            for table in &tables {
+                raw.execute(
+                    "insert into source_table_versions (source_table, version) \
+                     values ($1, $2) on conflict (source_table) do update set version = $2",
+                    &[table, &round],
+                )
+                .await
+                .expect("seed the fences");
+            }
+
+            let (mut blocker, _) = connect().await;
+            let blocking = blocker.transaction().await.expect("begin");
+            blocking
+                .execute(
+                    "select 1 from source_table_versions where source_table = $1 for update",
+                    &[&tables[0]],
+                )
+                .await
+                .expect("hold the first fence");
+
+            let (mut definer, define_pid) = connect().await;
+            let defining = tokio::spawn({
+                let tables = tables.clone();
+                async move {
+                    let txn = definer.transaction().await.expect("begin");
+                    for table in &tables {
+                        super::super::build::bump_version_fence(&txn, table).await?;
+                    }
+                    txn.commit().await
+                }
+            });
+            waiting_on_lock(define_pid).await;
+
+            let (mut pager, page_pid) = connect().await;
+            let paging = tokio::spawn({
+                let versions: BTreeMap<String, Option<i64>> =
+                    tables.iter().map(|t| (t.clone(), Some(round))).collect();
+                async move {
+                    let txn = pager.transaction().await.expect("begin");
+                    hold_version_fences(&txn, &versions).await
+                }
+            });
+            waiting_on_lock(page_pid).await;
+
+            blocking.commit().await.expect("let the define go");
+            defining
+                .await
+                .expect("join")
+                .unwrap_or_else(|err| panic!("round {round}: the define failed: {err:?}"));
+            let paged = paging.await.expect("join");
+            assert!(
+                matches!(paged, Err(ApplyError::VersionFenceMiss { .. })),
+                "round {round}: the page waits out the define and misses its fence, got {paged:?}"
+            );
+        }
+    }
 }
 
 /// Phase 2's output: an in-memory plan Phase 3 applies inside one
@@ -7155,13 +7273,14 @@ mod tests {
 /// `versions` is the version-fence's read set: every source table this
 /// batch evaluated against, and the `source_table_versions.version` Phase 2
 /// loaded for it (`None` for a source with no definitions at all — still
-/// fenced, so a definition created against it mid-drain is caught too).
+/// fenced, so a definition created against it mid-drain is caught too),
+/// ordered by table name, the order Phase 3 takes the fences in.
 /// Which targets have downstream readers is *not* decided here: Phase 3's
 /// target-mutation seam (`staging::target_mutations`) resolves that inside
 /// its own transaction, for every target any step wrote.
 #[derive(Debug, Clone, Default)]
 pub struct ApplyPlan {
-    versions: HashMap<String, Option<i64>>,
+    versions: BTreeMap<String, Option<i64>>,
     targets: BTreeMap<String, TargetPlan>,
     /// The aggregate targets, all on the ledger (`super::ledger`, #623 D3 to
     /// D5), each with this page's records for it, keyed by the definition's
@@ -7382,7 +7501,7 @@ async fn source_key_for_apply(
     pool: &Pool,
     qualified_source: &str,
     source_key: &str,
-    versions: &mut HashMap<String, Option<i64>>,
+    versions: &mut BTreeMap<String, Option<i64>>,
 ) -> Result<Option<Vec<PrimaryKeyColumn>>, ApplyError> {
     let err = match ddl::source_primary_key(pool, qualified_source).await {
         Ok(pk) => return Ok(Some(pk)),
@@ -7427,10 +7546,10 @@ async fn source_key_for_apply(
 async fn no_unfrozen_reader(
     pool: &Pool,
     source_key: &str,
-    versions: &mut HashMap<String, Option<i64>>,
+    versions: &mut BTreeMap<String, Option<i64>>,
 ) -> Result<bool, ApplyError> {
     for rel in catalog::relationships_to_table(pool, source_key).await? {
-        if let std::collections::hash_map::Entry::Vacant(entry) =
+        if let std::collections::btree_map::Entry::Vacant(entry) =
             versions.entry(rel.qualified_from_table())
         {
             let version = catalog::source_table_version(pool, entry.key()).await?;
@@ -7527,9 +7646,9 @@ async fn from_side_key(
 async fn read_fence(
     pool: &Pool,
     table: &str,
-    versions: &mut HashMap<String, Option<i64>>,
+    versions: &mut BTreeMap<String, Option<i64>>,
 ) -> Result<(), ApplyError> {
-    if let std::collections::hash_map::Entry::Vacant(entry) = versions.entry(table.to_string()) {
+    if let std::collections::btree_map::Entry::Vacant(entry) = versions.entry(table.to_string()) {
         let version = catalog::source_table_version(pool, entry.key()).await?;
         entry.insert(version);
     }
@@ -7541,12 +7660,12 @@ async fn read_fence(
 /// (`skip_frozen`, [`compute_page`]'s), which [`from_side_key`] judges its
 /// skips under.
 struct FromSideFence<'a> {
-    versions: &'a mut HashMap<String, Option<i64>>,
+    versions: &'a mut BTreeMap<String, Option<i64>>,
     skip_frozen: bool,
 }
 
 impl<'a> FromSideFence<'a> {
-    fn new(versions: &'a mut HashMap<String, Option<i64>>, skip_frozen: bool) -> Self {
+    fn new(versions: &'a mut BTreeMap<String, Option<i64>>, skip_frozen: bool) -> Self {
         Self {
             versions,
             skip_frozen,
@@ -7945,7 +8064,7 @@ pub(super) async fn compute_page(
     }
     tracing::Span::current().record("sources", by_source.len());
 
-    let mut versions: HashMap<String, Option<i64>> = HashMap::new();
+    let mut versions: BTreeMap<String, Option<i64>> = BTreeMap::new();
     let mut targets: BTreeMap<String, TargetPlan> = BTreeMap::new();
     // #623 D3: aggregate targets on the ledger, in target order, so every
     // page takes their locks in one order.
@@ -10718,6 +10837,47 @@ pub(crate) struct PageClaim {
     pub(crate) next: Option<fold::PageKey>,
 }
 
+/// Takes the page's version fences (`versions`, the fence's read set) `for
+/// share`, its transaction's first locks, and fails with
+/// [`ApplyError::VersionFenceMiss`] if any moved since the page read it.
+///
+/// It takes them in table-name order (`versions` is ordered), the order a
+/// define, drop, resume or freeze bumps several fences in (issue #1314). A
+/// `JOIN` target's page holds both its tables' fences, and a `JOIN` define
+/// bumps both: a page that held the second while it queued on the first,
+/// behind a define that held the first, would close a cycle with it.
+///
+/// `source_key` is the canonical (qualified, where resolvable) source
+/// identity `compute` keyed `versions` on, and
+/// `source_table_versions.source_table` is qualified (issue #72), so this
+/// matches exactly — see `defs::source_table_version`, which reads the same
+/// row the same way.
+async fn hold_version_fences(
+    txn: &Transaction<'_>,
+    versions: &BTreeMap<String, Option<i64>>,
+) -> Result<(), ApplyError> {
+    for (source_key, loaded_version) in versions {
+        let row = txn
+            .query_opt(
+                "select version from source_table_versions \
+                 where source_table = $1 for share",
+                &[source_key],
+            )
+            .await?;
+        let current: Option<i64> = row.map(|r| r.get(0));
+        if current != *loaded_version {
+            crate::instance_log::debug!(
+                src_table = %source_key,
+                "version fence miss: source table's definitions changed mid-drain"
+            );
+            return Err(ApplyError::VersionFenceMiss {
+                src_table: source_key.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// [`apply_and_mark_drained_many`] with an explicit claim ending per segment
 /// (issue #620 A2a): a non-final page's transaction applies, checks the claim
 /// and advances the cursor; a final page's applies and completes. Everything
@@ -10741,30 +10901,8 @@ pub(crate) async fn apply_page(
     wake_channel: &str,
     watermark: &StagedWatermark,
 ) -> Result<ManyApplyOutcome, ApplyError> {
-    // 1. Version fence. `source_key` is the canonical (qualified, where
-    // resolvable) source identity `compute` keyed `plan.versions` on, and
-    // `source_table_versions.source_table` is qualified (issue #72), so this
-    // matches exactly — see `defs::source_table_version`, which reads the same
-    // row the same way.
-    for (source_key, loaded_version) in &plan.versions {
-        let row = txn
-            .query_opt(
-                "select version from source_table_versions \
-                 where source_table = $1 for share",
-                &[source_key],
-            )
-            .await?;
-        let current: Option<i64> = row.map(|r| r.get(0));
-        if current != *loaded_version {
-            crate::instance_log::debug!(
-                src_table = %source_key,
-                "version fence miss: source table's definitions changed mid-drain"
-            );
-            return Err(ApplyError::VersionFenceMiss {
-                src_table: source_key.clone(),
-            });
-        }
-    }
+    // 1. Version fence.
+    hold_version_fences(txn, &plan.versions).await?;
 
     // 1b. Issue #16: park this batch's own folded contribution for every
     // already-poisoned key it's excluding, before the drained mark below —

@@ -622,7 +622,10 @@ batches for one key draining out of order is closed separately, by the 1-1
 ledger ([above](#absolute-writes-do-not-commute-the-1-1-ledger)).
 
 **The fence runs first in Phase 3**, so a superseded batch rolls back before
-touching a derived row. The fence set must include tables that are *evaluated* but
+touching a derived row. It takes its tables' fences in table-name order, the
+order every transaction that bumps more than one (a `JOIN` definition's define,
+drop, resume or freeze bumps both its tables') takes them in, so a page and a
+bump never each hold a fence the other wants. The fence set must include tables that are *evaluated* but
 absent from the one-to-one write plan — an aggregate-only source, an equi-join
 parent — or a grain change mid-batch slips through.
 
