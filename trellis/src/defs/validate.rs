@@ -6025,6 +6025,35 @@ mod tests {
         }
     }
 
+    /// ADR-0020, rule 7: a `numeric` column of a table Trellis creates has no
+    /// declared scale whatever the column it copies had, so a chained `SUM` or
+    /// `AVG` over it gets its own named refusal; the same column of a source
+    /// keeps the plain one.
+    #[test]
+    fn a_chained_sum_over_a_trellis_targets_numeric_is_a_named_refusal() {
+        let arg = |trellis_target| AggregateArg {
+            column: "p",
+            value_type: ValueType::Numeric,
+            pg_type: "numeric",
+            typmod: -1,
+            trellis_target,
+        };
+        for function in ["SUM", "AVG"] {
+            assert!(matches!(
+                check_aggregate_admitted(function, Some(&arg(true))),
+                Err(ValidationError::ChainedNumericAggregate { .. })
+            ));
+            assert!(matches!(
+                check_aggregate_admitted(function, Some(&arg(false))),
+                Err(ValidationError::UnconstrainedNumericAggregate { .. })
+            ));
+        }
+        let message = check_aggregate_admitted("SUM", Some(&arg(true)))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("#1120") && message.contains("no declared scale"));
+    }
+
     #[test]
     fn join_refuses_sum_and_avg_over_unconstrained_numeric_on_either_side() {
         for call in ["SUM(items.price)", "AVG(items.price)"] {
