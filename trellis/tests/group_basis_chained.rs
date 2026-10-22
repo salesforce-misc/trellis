@@ -826,7 +826,10 @@ async fn a_pause_and_drop_of_a_reader_wait_for_a_page_that_planned_it() {
         () = d.wait_blocked(2) => {}
         _ = &mut dropping => {}
     }
-    assert!(!dropping.is_finished(), "the drop waits for the page in flight");
+    assert!(
+        !dropping.is_finished(),
+        "the drop waits for the page in flight"
+    );
     holder.batch_execute("commit").await.expect("release");
     let outcome = page.finish_result().await.expect("the page applies");
     assert!(outcome.is_some(), "the page committed");
