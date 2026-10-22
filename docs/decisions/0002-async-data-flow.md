@@ -1018,7 +1018,15 @@ A group-basis or JOIN reader needs exact images, as capture gives a source.
 - **Must:** a write that never reaches the seam (an upstream's own build or
   rebuild, at a resume or by its own Re-derive build) parks a catch-up for
   its readers. For a group-basis or JOIN reader that catch-up is a rebuild
-  of the reader.
+  of the reader. A `RESUME` build parks it even though it writes through the
+  seam: it starts from hidden state the resume emptied, while its target
+  keeps the earlier rows, so the images a page or the build stages meanwhile
+  can carry prior values that match no row the readers hold. The reader's
+  rebuild overwrites whatever they did, and a rebuild in place of a `live`
+  definition parks nothing, because its hidden state matches its target. The
+  park is in the transaction that completes the whole build (the last leaf's,
+  on a partitioned source). Further hops need nothing: a reader's visible
+  rows always match its own partials.
 - **Must:** a writer that resolved the target's feed before a new reader's
   define committed must not leave the reader's build missing its write. A
   deterministic test freezes such a writer between its check and its

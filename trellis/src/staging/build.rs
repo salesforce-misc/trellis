@@ -3121,28 +3121,45 @@ async fn run_plan(
             }
         }
     }
-    // A plain group-basis aggregate's fresh build or resume over an
-    // unpartitioned source is its whole build: one absolute write of every
-    // group, as a rebuild of a live definition is (#1101, ADR-0002), run
-    // after the seam fence above so its `GROUP BY` reads a racing writer's
-    // row. It never walks the primary key: a `rederive` chunk has no meaning
-    // without a ledger.
+    // A plain group-basis aggregate's fresh build or resume is its whole
+    // build: one absolute write of every group, as a rebuild of a live
+    // definition is (#1101, ADR-0002), run after the seam fence above so its
+    // `GROUP BY` reads a racing writer's row. Over a partitioned source it is
+    // one transaction per leaf of the recorded tree, then one for the groups
+    // that route to no leaf, the job's `lo` holding the last leaf done. It
+    // never walks the primary key: a `rederive` chunk has no meaning without
+    // a ledger. Its commit parks its target's readers (#1287).
     let mut client = pool.get().await?;
-    if chunk.fields.is_none()
+    let aggregate = chunk.fields.is_none()
         && !super::join::applies(&definition.def)
-        && takes_group_basis(&definition)
-        && !crate::defs::partition_tree::is_partitioned_root(&**client, &definition.source_table)
+        && takes_group_basis(&definition);
+    let recorded = aggregate
+        && (!crate::defs::partition_tree::is_partitioned_root(&**client, &definition.source_table)
             .await?
-    {
+            || crate::capture::partitions::recorded(&**client, &definition.source_table)
+                .await
+                .map_err(|e| ChunkQueueError::Correction(Box::new(e.into())))?
+                .is_some());
+    if recorded {
         drop(client);
-        return run_group_rebuild_held(pool, chunk, claimed_by, &definition, &fence, None).await;
+        return run_group_rebuild_held(
+            pool,
+            chunk,
+            claimed_by,
+            &definition,
+            &fence,
+            cursor.as_deref(),
+            ReadersOnCommit::Park,
+        )
+        .await;
     }
     // #1108: a `JOIN` behind the group-basis dev knob takes two empty tables,
     // each captured (the target feed is #1100's); either may be a partitioned
     // root, whose node operations the partition correction engine corrects
     // (#1111). Its build is #1109's. A plain aggregate over a partitioned
-    // root takes an empty one the same way, and refuses one with rows: its
-    // build there is per leaf, a later slice of #1101.
+    // root whose tree the capture pass hasn't recorded yet takes an empty one
+    // the same way, and refuses one with rows: its per-leaf build needs the
+    // record.
     if cursor.is_none() && chunk.fields.is_none() && takes_group_basis(&definition) {
         let mut tables = vec![definition.source_table.clone()];
         if super::join::applies(&definition.def) {
@@ -3175,8 +3192,8 @@ async fn run_plan(
                         "a fresh build or resume over a source that has rows (the JOIN build \
                          is #1109)"
                     } else {
-                        "a fresh build or resume over a partitioned source that has rows (its \
-                         per-leaf build is #1101)"
+                        "a fresh build or resume over a partitioned source that has rows \
+                         before its capture records the tree"
                     },
                 }));
             }
@@ -3324,7 +3341,34 @@ async fn run_group_rebuild(
         options.heartbeat_interval,
     );
     let fence = ClaimFence::new(chunk.id, claimed_by, options.reclaim_ttl);
-    run_group_rebuild_held(pool, chunk, claimed_by, definition, &fence, cursor).await
+    run_group_rebuild_held(
+        pool,
+        chunk,
+        claimed_by,
+        definition,
+        &fence,
+        cursor,
+        ReadersOnCommit::Keep,
+    )
+    .await
+}
+
+/// What the commit of a group-basis build does for the readers of its target
+/// ([`run_group_structure`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReadersOnCommit {
+    /// Nothing: a rebuild in place of a `live` definition starts from hidden
+    /// state that matches its target, so the seam rows it stages carry exact
+    /// images.
+    Keep,
+    /// The readers' catch-up is parked, and the group-basis ones rebuilt
+    /// (`intake::markers::park_target_catchup_if_read`, #1287): the plan job
+    /// of a fresh build or a resume. A resume starts from partials that are
+    /// empty while its target holds the rows of the earlier life, so the
+    /// seam rows a page or the build stages meanwhile can carry prior images
+    /// that match no row the readers hold. A fresh build has no reader, and
+    /// the park finds none.
+    Park,
 }
 
 /// [`run_group_rebuild`] for a caller that already heartbeats the claim and
@@ -3336,6 +3380,7 @@ async fn run_group_rebuild_held(
     definition: &Definition,
     fence: &ClaimFence<'_>,
     cursor: Option<&str>,
+    readers: ReadersOnCommit,
 ) -> Result<(), ChunkQueueError> {
     let mut client = pool.get().await?;
     if !crate::defs::partition_tree::is_partitioned_root(&**client, &definition.source_table)
@@ -3348,6 +3393,7 @@ async fn run_group_rebuild_held(
             fence,
             definition,
             &Structure::Whole,
+            readers,
         )
         .await?
         else {
@@ -3404,8 +3450,16 @@ async fn run_group_rebuild_held(
             leaf,
             last: leaf.is_none(),
         };
-        let Some((w, d)) =
-            run_group_structure(pool, &mut client, chunk, fence, definition, &structure).await?
+        let Some((w, d)) = run_group_structure(
+            pool,
+            &mut client,
+            chunk,
+            fence,
+            definition,
+            &structure,
+            readers,
+        )
+        .await?
         else {
             return chunk_queue::discard_if_superseded(pool, chunk, claimed_by).await;
         };
@@ -3461,6 +3515,7 @@ async fn run_group_structure(
     fence: &ClaimFence<'_>,
     definition: &Definition,
     structure: &Structure<'_>,
+    readers: ReadersOnCommit,
 ) -> Result<Option<(usize, usize)>, ChunkQueueError> {
     let started = Instant::now();
     let txn = client
@@ -3473,13 +3528,15 @@ async fn run_group_structure(
     ))
     .await?;
     // The definition row before the job row, the order a resume takes them
-    // in. A resume holds the definition row `for update`, clears every
-    // group's basis after a logical restore (row locks on the groups this
-    // write is about to lock), and only then waits on the job row
+    // in. A resume holds the definition row `for update`, waits on the job
+    // row, and only then drops and recreates the hidden table, which takes
+    // `ACCESS EXCLUSIVE` on a table this write holds rows of
     // (`complete_resume`): without this lock the two would wait on each
     // other. A resume or drop in flight makes this transaction wait holding
     // nothing, and one that committed first shows in the claim's stale
-    // check.
+    // check. The readers' rows the commit's park locks `for update`
+    // (`ReadersOnCommit::Park`) come last, in id order, as
+    // `complete_direct_backfill`'s do.
     fence.arm(&txn).await?;
     txn.execute(
         "select 1 from transform_definitions where id = $1 for key share",
@@ -3558,6 +3615,18 @@ async fn run_group_structure(
         &definition.target_table,
     )
     .await?;
+    // The transaction that completes the whole build parks its readers'
+    // catch-up (#1287), once, not per leaf; the segment stamp is the last
+    // statement before the commit.
+    let finished = !matches!(structure, Structure::Partitioned { last: false, .. });
+    let rebuilt = if finished && readers == ReadersOnCommit::Park {
+        crate::intake::markers::park_target_catchup_if_read(&txn, chunk.definition_id)
+            .await
+            .map_err(build_error)?
+    } else {
+        Vec::new()
+    };
+    stamp_rebuild_seg(&txn, &rebuilt).await?;
     txn.commit().await?;
     metrics::record_build_chunk(started.elapsed(), (written + deleted) as u64, 0);
     Ok(Some((written, deleted)))

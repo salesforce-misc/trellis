@@ -17,9 +17,10 @@
 //! [`route`] takes:
 //!
 //! - is built, fresh or on a resume, by the plan job's one absolute write of
-//!   every group ([`rebuild`]) over an unpartitioned source, with rows or
-//!   without; over a partitioned source its build only accepts an empty
-//!   source until its per-leaf build (#1101);
+//!   every group ([`rebuild`]), over a partitioned source one transaction per
+//!   leaf of its recorded tree and one for the groups that route to no leaf
+//!   (an unrecorded tree only builds over an empty source); a resume drops
+//!   and recreates the hidden table and keeps the visible target;
 //! - is rebuilt in place once `live` ([`rebuild`]: `request_backfill`, a
 //!   capture re-install, an automatic rebuild, or an upstream's rebuild),
 //!   over a partitioned source one transaction per leaf of its recorded tree
@@ -48,7 +49,11 @@
 //! An upstream build or rebuild that writes the target outside the seam
 //! parks a catch-up for its readers, and a group-basis reader is rebuilt
 //! instead (`crate::intake::markers::park_target_catchup_if_read`): an
-//! image-less catch-up names keys, not the deltas a group needs.
+//! image-less catch-up names keys, not the deltas a group needs. A group-basis
+//! build that is a fresh build or a resume parks it too, though it writes
+//! through the seam: a resume empties the partials and keeps the target, so
+//! the prior images of the seam rows it and its pages stage match no row the
+//! readers hold, and the readers' rebuilds overwrite what they did (#1287).
 //!
 //! # Which definitions
 //!

@@ -4366,7 +4366,7 @@ async fn resume_locked(
             });
         }
     };
-    match catalog::check_owned_tables(txn, schema, &definition, &revalidated).await {
+    match catalog::check_owned_tables(txn, &definition, &revalidated).await {
         Ok(()) => {}
         Err(err @ (catalog::CatalogError::Db(_) | catalog::CatalogError::Pool(_))) => {
             return Err(err.into());
@@ -4602,6 +4602,19 @@ async fn complete_resume(
     )
     .await?;
 
+    // #1101: a group-basis aggregate's partials are fully derived, so the
+    // resume drops and recreates them at the shape define would give them
+    // now (a re-typed `GROUP BY` column included), and its build writes
+    // every group afresh. The visible target is kept: the build's absolute
+    // write replaces the rows of the groups the source still has and
+    // removes the others. After the wait above, so a build or rebuild that
+    // passed its fence before the pause commits first and is overwritten,
+    // rather than this `ACCESS EXCLUSIVE` waiting inside the resume while it
+    // holds the definition row.
+    if let Some(shape) = super::group_basis::route(&definition.def, &revalidated.source_columns) {
+        catalog::recreate_group_table(txn, schema, id, &shape).await?;
+    }
+
     // A definition the Re-derive build takes (#625 F3) gets no marker: the
     // staging worker's next pass starts its rebuild from `waiting_to_backfill`
     // (`super::build::start_ready_builds`), over the ledger, groups and group
@@ -4706,10 +4719,9 @@ async fn complete_resume(
 /// Resets the ordering state of definition `id` (target `target`, qualified)
 /// that a logical restore left holding the original database's WAL positions
 /// and transaction ids (#1205, ADR-0002 I2): the 1-1 ledger's and the group
-/// ledger's `__applied_lsn` and `__basis`, the group basis's hidden
-/// `__basis` and `__stamp`, the truncate floors of the target and of a
-/// JOIN's hidden tables. A JOIN's
-/// hidden tables are recreated by the resume itself. Entries keep their other
+/// ledger's `__applied_lsn` and `__basis`, the truncate floors of the target
+/// and of the hidden tables. A group-basis aggregate's and a JOIN's hidden
+/// tables are recreated by the resume itself, with no basis or stamp. Entries keep their other
 /// columns, so the rebuild still diffs each key against what it contributed.
 async fn reset_ordering_state(
     txn: &Transaction<'_>,
@@ -4734,17 +4746,6 @@ async fn reset_ordering_state(
         .await?;
     }
     let hidden = super::group_basis::hidden_table_ident(schema, id);
-    if txn
-        .query_one("select pg_catalog.to_regclass($1) is not null", &[&hidden])
-        .await?
-        .get::<_, bool>(0)
-    {
-        txn.batch_execute(&format!(
-            "update {hidden} set __basis = null, __stamp = null \
-             where __basis is not null or __stamp is not null"
-        ))
-        .await?;
-    }
     let mut floors = vec![target.to_string(), hidden];
     floors.extend(crate::defs::join::HiddenTable::ALL.iter().map(|table| {
         format!(
@@ -5067,9 +5068,7 @@ async fn finish_requested_resume(
         // re-typed under `ACCESS EXCLUSIVE` that `resume_locked` would then
         // refuse.
         let checked = match catalog::revalidate(&txn, schema, &definition).await {
-            Ok(revalidated) => {
-                catalog::check_owned_tables(&txn, schema, &definition, &revalidated).await
-            }
+            Ok(revalidated) => catalog::check_owned_tables(&txn, &definition, &revalidated).await,
             Err(err) => Err(err),
         };
         match checked {

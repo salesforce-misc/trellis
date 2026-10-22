@@ -765,9 +765,11 @@ async fn a_drop_waits_for_a_build_in_flight() {
     );
 }
 
-/// A plain aggregate over a partitioned source with rows fails its build
-/// and pauses, naming the partitioned source: its per-leaf fresh build is a
-/// later step. (Over an empty one it builds: `partition_group_basis.rs`.)
+/// A plain aggregate over a partitioned source with rows whose capture has
+/// not recorded the tree yet fails its build and pauses, naming the
+/// partitioned source: its per-leaf build needs the record. (Over an empty
+/// one it builds, and over a recorded tree it builds per leaf:
+/// `partition_group_basis.rs`.)
 #[tokio::test]
 async fn a_partitioned_source_with_rows_is_refused() {
     trellis::dev::staging::set_group_basis(true);

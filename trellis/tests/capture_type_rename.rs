@@ -292,7 +292,8 @@ async fn setup(dsn: &str, raw: &mut Client, pool: &trellis::Pool) -> Trellis {
                    SELECT tone AS tone, COUNT(*) AS n";
     trellis.apply(chained).await.expect(chained);
     bring_live(raw, pool, &TARGETS).await;
-    // The group-basis builds start from empty sources (#1101, #1109).
+    // The JOIN build admits only empty sources (#1109), so the rows arrive
+    // through capture.
     raw.batch_execute(
         "insert into public.items values (1, 'calm', 1), (2, 'loud', 2), (3, 'calm', 3); \
          insert into public.kinds values ('calm', 10), ('loud', 20); \

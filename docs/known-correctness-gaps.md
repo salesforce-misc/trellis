@@ -235,7 +235,8 @@ table's. A change to Trellis's schema isn't detected.
   again. Ledger aggregates leave with
   [#1105](https://github.com/salesforce-misc/trellis/issues/1105). A
   group-basis aggregate's target and `agg_<id>` are repaired by
-  `request_backfill` of its source.
+  `request_backfill` of its source, or by `PAUSE`/`RESUME`, which drops and
+  recreates `agg_<id>` and rewrites every group.
 * **Trellis's schema:** restore the whole database from a backup taken
   before the change, or `PAUSE`, `DROP TRANSFORM` and define every transform
   again. A target the changed catalog has no definition for is a plain table

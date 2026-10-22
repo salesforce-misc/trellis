@@ -178,9 +178,9 @@ pub enum ApplyError {
     /// A group-basis aggregate target (`super::group_basis`, #1100) met
     /// what its dev knob doesn't support yet: a ring row missing the images
     /// its change needs, a page folded with the knob off, a fresh build or
-    /// resume over a partitioned source that has rows, or a rebuild over one
-    /// whose tree is not recorded or has a leaf with no usable constraint
-    /// text (#1101); or, on a `JOIN`
+    /// resume over a partitioned source that has rows before its tree is
+    /// recorded, or a build or rebuild over one whose tree is not recorded or
+    /// has a leaf with no usable constraint text (#1101); or, on a `JOIN`
     /// (`super::join`, #1108), a build over a side that is another
     /// definition's target or has rows, or a rebuild (#1109).
     /// Like
