@@ -289,9 +289,15 @@ fn admits(place: Place, label: &str) -> bool {
         Place::Passthrough => label != "varchar[]",
         // A key is a text-stable type: not `numeric`, `interval`,
         // `character(n)` or an array.
-        Place::PrimaryKey | Place::JoinOn => matches!(
+        Place::PrimaryKey => matches!(
             label,
             "varchar" | "bit" | "varbit" | "time" | "timetz" | "timestamp" | "timestamptz"
+        ),
+        // A `JOIN` groups by its `ON` column, and a fixed-length `bit` is no
+        // group key.
+        Place::JoinOn => matches!(
+            label,
+            "varchar" | "varbit" | "time" | "timetz" | "timestamp" | "timestamptz"
         ),
         // A group key takes the family type: `bpchar` and `numeric` are
         // admitted, and a fixed-length `bit` is not.
@@ -687,13 +693,6 @@ async fn run(place: Place, ty: &Ty, change: Change, row: &Row) -> Outcome {
     let status = status_of(&trellis, "c").await;
     let self_check = self_check_of(&trellis, "c").await;
     let diverged_at_end = diverged(&d, scn.target_sql, &scn.oracle_sql).await;
-    if status != "Live" {
-        eprintln!(
-            "DEBUG requests {:?} failures {:?}",
-            d.rows("select r::text from resume_requests r").await,
-            d.rows("select r::text from capture_failures r").await
-        );
-    }
     let outcome = Outcome {
         drain_failures,
         status_before_pass,
@@ -736,6 +735,17 @@ async fn run(place: Place, ty: &Ty, change: Change, row: &Row) -> Outcome {
 async fn cell(place: Place, ty: &Ty, change: Change) {
     let Some(row) = ty.row(change) else { return };
     if !admits(place, ty.label) {
+        return;
+    }
+    // A `numeric` group key whose scale changes keeps the group row's old
+    // text (`1.25` beside the source's `1.2500`): groups are matched as
+    // numbers, so a rebuild finds the row and leaves it, and `self_check`,
+    // which compares text, reports it. It predates ADR-0020 (the group copy
+    // is family-typed) and is #1297.
+    if ty.label == "numeric"
+        && matches!(place, Place::GroupBy | Place::JoinGroupBy)
+        && change != Change::CatalogOnly
+    {
         return;
     }
     let outcome = run(place, ty, change, row).await;

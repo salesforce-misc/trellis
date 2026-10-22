@@ -339,42 +339,15 @@ it regenerates anything, it pauses the definition, with its
 The reason names each column, its old and new type, and each copy, and says
 what to do. Nothing clears it but a deliberate `RESUME`, or a drop.
 
-A string column never makes the fourth check pause (#1207): every column
-Trellis creates from a `varchar(n)` is an unbounded `varchar` with the source
-column's collation, which holds whatever the source column holds after any
-change of its bound, and `text` and `varchar(n)` source columns are one family
-to the check. So a source `varchar(n)` moved to `varchar(m)` or to `text`
-needs no action on the copies, and a value past the old bound, or one whose
-excess characters are all spaces, is stored as it is.
-
-The fourth check has one exception, which pauses nothing (#824). When every
-widened column of a table Trellis created widened by changing only the
-catalog, the pass re-types that table's columns itself. Only a 1-1 target's
-copies, a `JOIN`'s `GROUP BY` and `ON` copies (in its target and its hidden
-tables) and a relationship projection's can: Trellis types every other
-column by value family or by an expression, with no length or precision. The
-only widening that qualifies is `numeric(p,s)` to a larger precision at the
-same scale. Postgres then rewrites nothing, changes no value and keeps each
-index, so no definition pauses or rebuilds. It runs one table per
-transaction, under the same lock timeout as a resume's re-type. A table whose
-re-type fails transiently (its lock not got in time, a deadlock, a statement
-timeout) is left as it is, nothing pauses, and the next pass tries again. A
-table where some column also needs a rewrite (`integer` to `bigint`) pauses as
-above. A table whose re-type fails for another reason (a view on the column)
-pauses too. The worker doesn't try that re-type again, and so doesn't take the
-table's lock for it every pass, until the source's type changes again, a
-definition with a column there is defined or dropped, or the worker restarts.
-
-A value written after the source widened and before the pass re-typed the
-column failed its write with `22003` (numeric overflow), and its key may be
-held. The re-type's transaction records a release request
-(`retype_releases`) for
-each definition with a column on the table. After the pass, the staging
-worker releases every key such a definition holds whose failure had that
-SQLSTATE (`poison.sqlstate`), through the same per-key release as
-`Trellis::release_key`, so the key's parked work is applied again, and does
-so after each pass for a minute more, for a key whose eviction was still
-committing. A key held for any other failure stays held.
+A modifier never makes the fourth check pause (ADR-0020, #1207, #1288): every
+column Trellis creates from a source column has the source column's type with
+no modifier, and its collation. It holds whatever the source column holds
+after any change of a modifier (a string bound, a `numeric` precision or
+scale, a temporal or `interval` precision, a `bit` length), and `text` and
+`varchar(n)` source columns are one family to the check. So a widening of a
+modifier needs no action on the copies, and a value past the old modifier is
+stored as it is, with no pass in between. Only an integer or float width
+outgrows a copy.
 
 Changes that need neither pause nothing: widening a key no copy holds (an
 aggregate's source key, which its ledger keys by text), a `GROUP BY` key's
@@ -583,8 +556,8 @@ them:
   - a same-type `USING` rewrite of a read column: re-read;
   - a read column dropped and re-added, or retyped other than by a pure
     widening, where every definition reading it is still valid: re-read;
-  - a widening that changes only the catalog of a column Trellis created:
-    re-typed in place, with no re-read;
+  - a widening of a modifier that changes only the catalog: nothing to do,
+    since no copy has a modifier;
   - a capture function an older Trellis generated (its source still is what
     its own comment hashes): replaced by a widen.
 - **Pauses, until a deliberate `RESUME`:**

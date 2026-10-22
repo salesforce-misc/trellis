@@ -74,22 +74,29 @@ aggregate has no exact inverse, so a group is recomputed by Postgres itself
 
 ### The types of the columns Trellis creates
 
-A passthrough and a 1-1 target's key columns take their source column's exact
-type at define (a passthrough an `ALTER TRANSFORM … ADD` adds takes it the same
-way), modifier included (`numeric(10,2)`, `timestamp(3)`), so either
-can serve as a relationship's join key against a column of that type. A
-`varchar(n)` is the exception: every column Trellis creates from one, in
-a target or a hidden table, is an unbounded `varchar` with the source column's
-collation. Postgres checks a length only on assignment, never in a comparison,
-a join or an index, so the copy holds whatever the source column holds after a
-widening, and `text` and `varchar(n)` source columns are one family to it. A
+A passthrough and a 1-1 target's key columns take their source column's type
+at define, with no type modifier (a passthrough an `ALTER TRANSFORM … ADD` adds
+takes it the same way). A `numeric(10,2)`, a `timestamp(3)`, a `char(5)`, a
+`bit(8)`, a `varchar(40)` and an `interval(3)` column are each copied as
+`numeric`, `timestamp`, `bpchar`, `"bit"`, `character varying` and `interval`,
+with the source column's collation. A modifier constrains what the source can
+hold. It plays no part in a comparison, a join or an index, and Postgres rounds
+silently when it assigns a value into a `numeric(p,s)`, `timestamp(p)`,
+`timestamptz(p)`, `time(p)`, `timetz(p)` or `interval` column, so a copy that
+kept the modifier would lose values after a catalog-only widening that fires no
+trigger. The type is the source column's type OID, rendered schema-qualified
+whatever the session's `search_path`, by one function (`defs::copy_type`) that
+every column Trellis creates and every cast to one goes through
+([ADR-0020](decisions/0020-type-identity.md)). So `\d` on a target shows no
+modifiers.
+A
 `GROUP BY` key's column (in the target, its ledger and its group-delta table)
 takes its value family's type: `integer` or `bigint` by width, `text` for any
 string, unconstrained `numeric`, a temporal type at full precision. A to-one
 relationship's projection keys by the to-side column's exact type, and holds
-each to-side column read through it in that column's exact type. A `JOIN`
-holds its `GROUP BY` and `ON` columns in each column's exact type (a
-`varchar(n)` unbounded) and collation, in its target and its hidden tables.
+each to-side column read through it in that column's type. A `JOIN`
+holds its `GROUP BY` and `ON` columns in each column's type and collation, in
+its target and its hidden tables, with no modifier.
 
 A calculated field's column, an aggregate's or a `JOIN`'s field column and
 an aggregate ledger's contribution column (typed as the aggregate's
@@ -97,16 +104,17 @@ argument) take the type
 define's inference gives their expression: `SUM` over an `integer` is
 `bigint`, `MIN` over one is `integer`.
 
-None of them changes type when the source column does, with one exception.
-A `varchar(n)` column's copies need no change when the source column's bound
-changes or it becomes `text`. A `numeric(10,2)` widened to `numeric(12,2)`
-(more precision at the same scale) changes only the catalog and is applied to
-Trellis's columns in place by the staging worker, with no pause and no
-rebuild. Any other widening a column can't hold
-(`integer` to `bigint`, a wider `numeric` scale or temporal precision,
-`bigint` to `numeric`, `real` to `double precision`) pauses the transforms
-that own the column, and `RESUME` re-types every column to the type define
-would give it from the live schema before it rebuilds
+None of them changes type when the source column does, with one exception:
+an integer or float *width* (`integer` to `bigint`, `real` to `double
+precision`, `bigint` to `numeric`), which has no unmodified form to copy as. A
+change of any modifier (a wider or narrower `numeric` precision or scale, a
+temporal or `interval` precision, a `char(n)` or `bit(n)` length, a `varchar`
+bound or its move to `text`) changes no copy, and a widening of one needs no
+pause and no rebuild. A change that re-renders the stored values (a `char(n)`
+length, a `bit(n)` rewrite, a `numeric` scale, a narrower precision) rebuilds the
+column's readers, or pauses one that keys by it. A width change pauses the
+transforms that own the column, and `RESUME` re-types every column to the type
+define would give it from the live schema before it rebuilds
 ([transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)).
 The re-type honours the operator's `statement_timeout`: a rewrite it cancels three times
 ends the resume, and the transform stays paused with the remedies in its
