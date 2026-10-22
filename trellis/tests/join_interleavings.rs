@@ -3818,3 +3818,63 @@ async fn a_reader_of_a_join_resumed_per_leaf_is_rebuilt_once() {
             .await
     );
 }
+
+/// A `PAUSE` and a `DROP` of a `JOIN` while a page of its joined table that
+/// planned it is in flight (#1291). The page holds only `b`'s fence, the
+/// joined table's, and is frozen on `i` before it reaches `l`, so it holds no
+/// lock on `l`'s tables. The drop takes the joined table's fence as well as
+/// its source's, so it waits for the page, which commits, and nothing is
+/// charged.
+#[tokio::test]
+async fn a_pause_and_drop_of_a_join_wait_for_a_page_of_its_joined_table() {
+    let mut lab = lab(Key::Single, &[I, L]).await;
+    lab.step(
+        "insert into public.a (id, ga, k, x) values (1, 1, 1, 10); \
+         insert into public.b (id, k, gb, y) values (1, 1, 1, 100)",
+    )
+    .await;
+    let batch = lab.sealed("update public.b set y = 200 where id = 1").await;
+    let mut page = lab
+        .d
+        .drain_frozen(batch, "page", &[(PausePoint::BeforeJoinLock, "public.i")])
+        .await;
+    page.reached(PausePoint::BeforeJoinLock).await;
+
+    let t = trellis::Trellis::connect(
+        trellis::config::Config::from_dsn(lab.d.db.dsn().to_string()).expect("valid dsn"),
+        trellis::TrellisOptions::default(),
+    )
+    .await
+    .expect("connect a Trellis");
+    t.apply("PAUSE TRANSFORM l").await.expect("pause");
+    let mut dropping = tokio::spawn(async move {
+        t.apply("DROP TRANSFORM l").await.expect("drop");
+    });
+    // The drop queues on the page's fence, or, without one, completes.
+    tokio::select! {
+        () = lab.d.wait_blocked(2) => {}
+        _ = &mut dropping => {}
+    }
+    assert!(
+        !dropping.is_finished(),
+        "the drop waits for the page in flight"
+    );
+    lab.d.release(&mut page, PausePoint::BeforeJoinLock).await;
+    let outcome = page.finish_result().await.expect("the page applies");
+    assert!(outcome.is_some(), "the page committed");
+    dropping.await.expect("the drop's task");
+    assert_eq!(
+        lab.d
+            .rows(
+                "select (select count(*) from drain_holdups), (select count(*) from poison), \
+                        (select count(*) from key_deaths), \
+                        (select count(*) from capture_failures), \
+                        to_regclass('public.l') is null"
+            )
+            .await,
+        ["(0,0,0,0,t)"],
+        "the page failed no one"
+    );
+    lab.kinds = vec![I];
+    lab.check("after the drop").await;
+}

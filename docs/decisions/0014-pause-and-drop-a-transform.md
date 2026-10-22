@@ -365,8 +365,12 @@ a drain worker holds is released on its own heartbeat. Everything else that in-f
 touches — ring segments and claims — is keyed to the *source* table and co-owned by every
 definition reading it, and each sibling definition's quarantine is its own. A drop never
 deletes that state out from under a running worker. The pause is what makes this safe: once paused, the fold no longer
-dispatches to the target, so a batch still draining for the source skips it while its
-siblings continue, and the drop then removes only what the target itself owns.
+dispatches to the target, so a page planned after the pause skips it while its siblings
+continue, and the drop then removes only what the target itself owns. A page planned
+before the pause can still write the target after the pause returns. The drop waits for
+it: as its first lock, the drop bumps the version fence of every table the definition
+reads (both tables of a `JOIN`), which waits for each page holding that fence and makes a
+later page plan again without the definition.
 
 ### Quarantine state follows its owner
 
