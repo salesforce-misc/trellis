@@ -474,12 +474,45 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
 
+    // The version fence of every table the definition reads, bumped as this
+    // transaction's first lock (#1291, #744). A frozen definition is out of
+    // every page planned from now on, but a page that planned it before it
+    // froze (a pause by the operator, or a halt or quarantine from a peer
+    // drain) may still be in flight, and would fail on the tables dropped
+    // below. The bump waits for every page holding the fence `for share`
+    // (Phase 3 holds it to its commit), and a page that reaches the fence
+    // after this commit misses it and plans again, without the definition.
+    // The names are read without a lock and bumped in name order, so two
+    // drops that share a source take the fences in one order.
+    let mut fences: Vec<String> = txn
+        .query(
+            &format!(
+                "select t.source_table from transform_definitions t where {m} \
+                 union \
+                 select f.table_name \
+                 from transform_definitions t \
+                 join schema_nodes n on n.table_name = t.target_table \
+                 join schema_edges e on e.to_node_id = n.id and e.kind = 'join' \
+                 join schema_nodes f on f.id = e.from_node_id \
+                 where {m}",
+                m = super::catalog::target_match_sql("t.target_table", 1),
+            ),
+            &[&target],
+        )
+        .await?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    fences.sort();
+    for source in &fences {
+        crate::staging::build::bump_version_fence(&*txn, source).await?;
+    }
+
     // The column-pause lock, exclusive (#922, #921): this deletes the
     // target's pause rows and the cascade edges into and out of them, which
-    // a column resume deletes too, in walk order, and a define reads. No
-    // fence: a paused definition has no writer to wait out. First, so it
-    // precedes the definition row below, as every taker of the lock orders
-    // it (`crate::locks::lock_column_pauses`).
+    // a column resume deletes too, in walk order, and a define reads. After
+    // the fences, so it precedes the definition row below, as every taker of
+    // the lock orders it (`crate::locks::lock_column_pauses`).
     crate::locks::lock_column_pauses(
         &*txn,
         pool.schema(),

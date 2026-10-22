@@ -762,3 +762,84 @@ async fn a_rollup_over_a_one_to_one_reader_follows_its_null_keyed_rows() {
         assert_equal(&mut d, ROLL, ORACLE).await;
     }
 }
+
+/// A `PAUSE` and a `DROP` of a reader while a page that planned it is in
+/// flight (#1291). The page holds the reader's feed from its plan; the drop
+/// removes the reader's hidden table under it. The page must not fail on the
+/// dropped table, and nothing may be charged for it.
+#[tokio::test]
+async fn a_pause_and_drop_of_a_reader_wait_for_a_page_that_planned_it() {
+    let mut d = start(
+        AGG_G,
+        "TRANSFORM roll FROM public.agg GROUP BY g SELECT SUM(total) AS total2",
+        &agg_g_columns(),
+        2,
+    )
+    .await;
+    const AGG: &str = "select g, total, n from public.agg order by g";
+    const ORACLE: &str = "select g, sum(v), count(*) from public.src group by g order by g";
+    step(
+        &mut d,
+        "insert into public.src values (1, 1, 0, 5), (2, 2, 0, 7)",
+    )
+    .await;
+    // Group 1's change reaches `roll` through the seam: its rows are pending
+    // when the next page is planned, with group 2's change beside them.
+    write(&d, "insert into public.src values (3, 1, 0, 1)").await;
+    let seam = d.seal().await;
+    d.drain(seam, "seam").await;
+    write(&d, "insert into public.src values (4, 2, 0, 1)").await;
+    let batch = d.seal().await;
+    let agg_id: i64 = d
+        .ctl
+        .query_one(
+            "select id from transform_definitions where target_table = 'public.agg'",
+            &[],
+        )
+        .await
+        .expect("agg's id")
+        .get(0);
+    // Another transaction holds group 2 of `agg`, so the page queues on it
+    // with its plan already loaded.
+    let holder = d.user().await;
+    holder
+        .batch_execute(&format!(
+            "begin; select 1 from {DEFAULT_SCHEMA}.agg_{agg_id} where g = 2 for update"
+        ))
+        .await
+        .expect("hold group 2");
+    let page = d.drain_frozen(batch, "page", &[]).await;
+    d.wait_blocked(1).await;
+
+    let t = trellis::Trellis::connect(
+        trellis::config::Config::from_dsn(d.db.dsn().to_string()).expect("valid dsn"),
+        trellis::TrellisOptions::default(),
+    )
+    .await
+    .expect("connect a Trellis");
+    t.apply("PAUSE TRANSFORM roll").await.expect("pause");
+    let mut dropping = tokio::spawn(async move {
+        t.apply("DROP TRANSFORM roll").await.expect("drop");
+    });
+    // The drop queues on the page's fence, or, without one, completes.
+    tokio::select! {
+        () = d.wait_blocked(2) => {}
+        _ = &mut dropping => {}
+    }
+    assert!(!dropping.is_finished(), "the drop waits for the page in flight");
+    holder.batch_execute("commit").await.expect("release");
+    let outcome = page.finish_result().await.expect("the page applies");
+    assert!(outcome.is_some(), "the page committed");
+    dropping.await.expect("the drop's task");
+    assert_eq!(
+        d.rows(
+            "select (select count(*) from drain_holdups), (select count(*) from poison), \
+                    (select count(*) from key_deaths), (select count(*) from capture_failures), \
+                    to_regclass('public.roll') is null"
+        )
+        .await,
+        ["(0,0,0,0,t)"],
+        "the page failed no one"
+    );
+    assert_equal(&mut d, AGG, ORACLE).await;
+}
