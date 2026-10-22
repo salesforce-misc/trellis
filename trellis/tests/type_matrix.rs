@@ -1,0 +1,876 @@
+//! The type matrix (ADR-0020, #1289): every type with a modifier, under every
+//! kind of change to its source column, in every place Trellis keeps a copy
+//! of it, ends exact, or paused with a reason and exact after `RESUME`.
+//!
+//! The seam it owns is the type of the columns Trellis creates from a source
+//! column and the values it casts to them. A copy is the source column's type
+//! with no modifier, so a change of the source's modifier that fires no
+//! trigger (`timestamp(0)` to `timestamp(3)`, `numeric(6,2)` to `numeric`)
+//! reaches every copy exactly: Postgres rounds silently on plain assignment
+//! into `numeric(p,s)`, `timestamp(p)`, `timestamptz(p)`, `time(p)`,
+//! `timetz(p)` and `interval` columns, so only an unmodified column protects
+//! one (#1288, from the research of #1224).
+//!
+//! **Axes.**
+//! - The type ([`TYPES`]): `varchar`, `bpchar`, `bit`, `varbit`, `numeric`,
+//!   `time`, `timetz`, `timestamp`, `timestamptz`, `interval` and an array.
+//! - The change ([`Change`]): a catalog-only widening, a widening or `USING`
+//!   rewrite that re-renders the stored values, and a narrowing.
+//! - The place ([`Place`]): a 1-1 primary key and passthrough, a group-basis
+//!   `GROUP BY` key, a `JOIN`'s `ON` columns and its `GROUP BY` key. The two
+//!   `JOIN` places keep their columns in the hidden tables `P`, `M`, `J` and
+//!   `T`.
+//!
+//! A cell whose type the place refuses at define is skipped by [`admits`], and
+//! [`a_type_a_place_refuses_is_refused`] holds that table to the live
+//! validator, so a type that becomes admissible is a cell that has to be
+//! filled in.
+//!
+//! **Outcome.** A catalog-only widening is exact with no pause at all, before
+//! and after the capture pass ([`Change::CatalogOnly`]). The others are exact
+//! once the definition has converged: nothing may be left diverged, and a
+//! pause must carry a reason, after which `RESUME` rebuilds exactly. Every
+//! step is an explicit pass or drain; nothing polls for convergence (#297).
+//!
+//! **Not in the matrix** (each is a later step of #1289, or has its own test):
+//! - the pairing axis (a one-sided widening or narrowing of an `ON` pair, a
+//!   Trellis copy against a source column): step 2;
+//! - the rename row (a type renamed before a baseline records it): step 3;
+//! - integer and float widths, the only changes that re-type a copy
+//!   (`capture_key_retype.rs`);
+//! - the ledger `GROUP BY` path, whose copies are family-typed like the
+//!   group-basis ones and which needs the group-basis knob off.
+
+#[path = "support/drain_driver.rs"]
+mod drain_driver;
+
+use std::time::Duration;
+
+use drain_driver::Driver;
+use testkit::TestCluster;
+use trellis::config::DEFAULT_SCHEMA;
+use trellis::defs::{PgType, ValueType, chunk_queue};
+use trellis::integer::IntWidth;
+use trellis::staging::self_check::CheckPageExt;
+use trellis::staging::{StagedWatermark, apply};
+use trellis::{Config, SelfCheckMode, Trellis, TrellisOptions};
+
+/// The kind of change to a source column.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Change {
+    /// A widening that changes only the catalog: nothing is rewritten, no
+    /// trigger fires, and no stored value changes.
+    CatalogOnly,
+    /// A widening, or a `USING` expression, that rewrites the table and
+    /// re-renders the values stored.
+    Rewrite,
+    /// A narrowing that rounds or truncates the values stored.
+    Narrow,
+}
+
+/// Where Trellis keeps a copy of the column.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Place {
+    /// A 1-1 target's bare passthrough field.
+    Passthrough,
+    /// A 1-1 target's primary key.
+    PrimaryKey,
+    /// A group-basis aggregate's `GROUP BY` key.
+    GroupBy,
+    /// A `JOIN`'s `ON` columns (both tables), also its `GROUP BY` key.
+    JoinOn,
+    /// A `JOIN`'s `GROUP BY` key on one table, joined on an integer.
+    JoinGroupBy,
+}
+
+const PLACES: [Place; 5] = [
+    Place::Passthrough,
+    Place::PrimaryKey,
+    Place::GroupBy,
+    Place::JoinOn,
+    Place::JoinGroupBy,
+];
+
+/// One change of a type: the source column starts as `start` holding `seed`,
+/// is altered with `type {alter}` (`{c}` is the column's name, for a
+/// `USING`), and then takes `hi`, a value only the altered type can hold or
+/// that is new to it.
+struct Row {
+    start: &'static str,
+    alter: &'static str,
+    seed: &'static str,
+    hi: &'static str,
+}
+
+/// One type with a modifier and its rows. `None` when the type has no change
+/// of that kind.
+struct Ty {
+    label: &'static str,
+    value_type: ValueType,
+    catalog_only: Option<Row>,
+    rewrite: Option<Row>,
+    narrow: Option<Row>,
+}
+
+impl Ty {
+    fn row(&self, change: Change) -> Option<&Row> {
+        match change {
+            Change::CatalogOnly => self.catalog_only.as_ref(),
+            Change::Rewrite => self.rewrite.as_ref(),
+            Change::Narrow => self.narrow.as_ref(),
+        }
+    }
+}
+
+const fn row(
+    start: &'static str,
+    alter: &'static str,
+    seed: &'static str,
+    hi: &'static str,
+) -> Option<Row> {
+    Some(Row {
+        start,
+        alter,
+        seed,
+        hi,
+    })
+}
+
+/// Every type with a modifier. A `Rewrite` row forces the table rewrite with
+/// a `USING` expression where Postgres would not otherwise rewrite.
+const TYPES: &[Ty] = &[
+    Ty {
+        label: "varchar",
+        value_type: ValueType::Text,
+        catalog_only: row("varchar(5)", "varchar(8)", "abc", "abcdefg"),
+        rewrite: row(
+            "varchar(5)",
+            "varchar(8) using ({c}::text || '')::varchar(8)",
+            "abc",
+            "abcdefg",
+        ),
+        narrow: row("varchar(8)", "varchar(3) using left({c}, 3)", "abc", "xyz"),
+    },
+    Ty {
+        label: "bpchar",
+        value_type: ValueType::Text,
+        catalog_only: None,
+        rewrite: row("char(5)", "char(8)", "abc", "abcdefg"),
+        narrow: row(
+            "char(8)",
+            "char(3) using left({c}, 3)::char(3)",
+            "abc",
+            "xyz",
+        ),
+    },
+    Ty {
+        label: "bit",
+        value_type: ValueType::Other(PgType::Bit),
+        catalog_only: None,
+        rewrite: row("bit(5)", "bit(8) using {c}::bit(8)", "10101", "11111111"),
+        narrow: row("bit(8)", "bit(3) using {c}::bit(3)", "10101000", "110"),
+    },
+    Ty {
+        label: "varbit",
+        value_type: ValueType::Other(PgType::VarBit),
+        catalog_only: row("bit varying(5)", "bit varying(8)", "10101", "10101000"),
+        rewrite: row(
+            "bit varying(5)",
+            "bit varying(8) using ({c}::text)::bit varying(8)",
+            "10101",
+            "10101000",
+        ),
+        narrow: row(
+            "bit varying(8)",
+            "bit varying(3) using {c}::bit varying(3)",
+            "101",
+            "110",
+        ),
+    },
+    Ty {
+        label: "numeric",
+        value_type: ValueType::Numeric,
+        catalog_only: row("numeric(6,2)", "numeric", "1.25", "1.23456789"),
+        rewrite: row("numeric(6,2)", "numeric(8,4)", "1.25", "1.2345"),
+        narrow: row("numeric(8,4)", "numeric(6,1)", "1.2000", "2.5"),
+    },
+    Ty {
+        label: "time",
+        value_type: ValueType::Other(PgType::Time),
+        catalog_only: row("time(0)", "time(3)", "10:00:00", "10:00:00.4"),
+        rewrite: None,
+        narrow: row("time(3)", "time(0)", "10:00:00", "11:00:00"),
+    },
+    Ty {
+        label: "timetz",
+        value_type: ValueType::Other(PgType::TimeTz),
+        catalog_only: row("timetz(0)", "timetz(3)", "10:00:00+00", "10:00:00.4+00"),
+        rewrite: None,
+        narrow: row("timetz(3)", "timetz(0)", "10:00:00+00", "11:00:00+00"),
+    },
+    Ty {
+        label: "timestamp",
+        value_type: ValueType::Other(PgType::Timestamp),
+        catalog_only: row(
+            "timestamp(0)",
+            "timestamp(3)",
+            "2024-01-01 00:00:00",
+            "2024-01-01 00:00:00.4",
+        ),
+        rewrite: None,
+        narrow: row(
+            "timestamp(3)",
+            "timestamp(0)",
+            "2024-01-01 00:00:00",
+            "2024-01-02 00:00:00",
+        ),
+    },
+    Ty {
+        label: "timestamptz",
+        value_type: ValueType::Other(PgType::TimestampTz),
+        catalog_only: row(
+            "timestamptz(0)",
+            "timestamptz(3)",
+            "2024-01-01 00:00:00+00",
+            "2024-01-01 00:00:00.4+00",
+        ),
+        rewrite: None,
+        narrow: row(
+            "timestamptz(3)",
+            "timestamptz(0)",
+            "2024-01-01 00:00:00+00",
+            "2024-01-02 00:00:00+00",
+        ),
+    },
+    Ty {
+        label: "interval",
+        value_type: ValueType::Other(PgType::Interval),
+        catalog_only: row(
+            "interval(0)",
+            "interval(3)",
+            "1 day 00:00:01",
+            "1 day 00:00:01.4",
+        ),
+        rewrite: None,
+        narrow: row(
+            "interval(3)",
+            "interval(0)",
+            "1 day 00:00:01",
+            "2 days 00:00:01",
+        ),
+    },
+    Ty {
+        label: "interval fields",
+        value_type: ValueType::Other(PgType::Interval),
+        catalog_only: row(
+            "interval day",
+            "interval day to second",
+            "1 day",
+            "1 day 00:00:01.5",
+        ),
+        rewrite: None,
+        narrow: None,
+    },
+    Ty {
+        label: "varchar[]",
+        value_type: ValueType::Other(PgType::Unrecognized),
+        catalog_only: None,
+        rewrite: row("varchar(5)[]", "varchar(8)[]", "{abc}", "{abcdefg}"),
+        narrow: None,
+    },
+];
+
+/// Whether `place` admits a column of the type `label` at define. The table
+/// is held to the validator by [`a_type_a_place_refuses_is_refused`].
+fn admits(place: Place, label: &str) -> bool {
+    match place {
+        // A passthrough takes any type the registry places. An array it
+        // doesn't place is out of the definition.
+        Place::Passthrough => label != "varchar[]",
+        // A key is a text-stable type: not `numeric`, `interval`,
+        // `character(n)` or an array.
+        Place::PrimaryKey | Place::JoinOn => matches!(
+            label,
+            "varchar" | "bit" | "varbit" | "time" | "timetz" | "timestamp" | "timestamptz"
+        ),
+        // A group key takes the family type: `bpchar` and `numeric` are
+        // admitted, and a fixed-length `bit` is not.
+        Place::GroupBy | Place::JoinGroupBy => matches!(
+            label,
+            "varchar"
+                | "bpchar"
+                | "varbit"
+                | "numeric"
+                | "time"
+                | "timetz"
+                | "timestamp"
+                | "timestamptz"
+        ),
+    }
+}
+
+/// What Trellis reported after one cell.
+struct Outcome {
+    /// How many drain attempts failed before a page committed (a copy that
+    /// refuses a value errors the drain and charges the key a death).
+    drain_failures: usize,
+    /// The status and `self_check` verdict after the drain and before any
+    /// pass.
+    status_before_pass: String,
+    self_check_before_pass: String,
+    /// Rows of the target that differ from the source before any pass.
+    diverged_before_pass: Vec<String>,
+    /// The first pass's status, with what differs, before any `RESUME`.
+    status_after_pass: String,
+    diverged_after_pass: Vec<String>,
+    /// Every pause the definition went through to converge, each a reason.
+    pauses: Vec<String>,
+    /// The status each round of the convergence loop found.
+    trace: Vec<String>,
+    /// The end state, once converged.
+    status: String,
+    self_check: String,
+    diverged: Vec<String>,
+}
+
+async fn pass(d: &mut Driver) {
+    let pool = d.pool().clone();
+    trellis::client::reconcile_pass(
+        &mut d.ctl,
+        &pool,
+        DEFAULT_SCHEMA,
+        "type_matrix_wake",
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("reconcile pass");
+}
+
+async fn facade(dsn: &str) -> Trellis {
+    let config = Config::with_schema(dsn.to_string(), DEFAULT_SCHEMA).expect("config");
+    Trellis::connect(config, TrellisOptions::default())
+        .await
+        .expect("connect")
+}
+
+async fn status_of(trellis: &Trellis, target: &str) -> String {
+    let reported = trellis
+        .status(target)
+        .await
+        .expect("status")
+        .expect("the definition");
+    let held = match &reported.held_keys {
+        Some(held) => format!(" (held keys: {})", held.count),
+        None => String::new(),
+    };
+    match reported.capture_failure {
+        Some(failure) => format!("{:?}: {}{held}", reported.status, failure.error),
+        None => format!("{:?}{held}", reported.status),
+    }
+}
+
+/// `self_check`'s verdict. Nothing drains in the background, so whether the
+/// target has caught up is settled before the call: the timeout only bounds
+/// how long a held key (which never catches up) takes to report
+/// `NotCaughtUp`.
+async fn self_check_of(trellis: &Trellis, target: &str) -> String {
+    match trellis
+        .self_check_to_end(target, SelfCheckMode::Strict, Duration::from_secs(3))
+        .await
+    {
+        Ok(report) => format!("{:?}", report.outcome),
+        Err(err) => format!("error: {err}"),
+    }
+}
+
+/// The rows that differ between the target's and the oracle's (the source's)
+/// shape of `target_sql`.
+async fn diverged(d: &Driver, target_sql: &str, source_sql: &str) -> Vec<String> {
+    d.rows(&format!(
+        "(({target_sql}) except ({source_sql})) union all (({source_sql}) except ({target_sql}))"
+    ))
+    .await
+}
+
+/// Seals and drains eight times, tolerating a drain that fails because a
+/// copy refuses a value: each failure charges the key a death, so the page
+/// commits once the key is held. A fixed number of rounds with no sleep and
+/// no exit on a condition, so it is not a wait for convergence (#297).
+/// Returns how many attempts failed.
+async fn settle_tolerant(d: &mut Driver) -> usize {
+    let mut failures = 0;
+    for _ in 0..8 {
+        let batch = d.seal().await;
+        loop {
+            match apply::drain_once(
+                d.pool(),
+                batch,
+                "worker",
+                1,
+                drain_driver::WAKE,
+                &StagedWatermark::saturated(),
+            )
+            .await
+            {
+                Ok(Some(_)) => continue,
+                Ok(None) => break,
+                Err(err) => {
+                    failures += 1;
+                    assert!(failures <= 40, "the batch never drained: {err}");
+                }
+            }
+        }
+        d.retire().await;
+    }
+    failures
+}
+
+/// Claims, runs and finishes every pending backfill chunk, then settles the
+/// builds.
+async fn run_backfill_chunks(pool: &trellis::Pool) {
+    const CLAIMED_BY: &str = "type_matrix_backfill";
+    loop {
+        let client = pool.get().await.expect("acquire connection");
+        let claimed = chunk_queue::claim_chunks(&**client, CLAIMED_BY, 1000)
+            .await
+            .expect("claim_chunks");
+        drop(client);
+        if claimed.is_empty() {
+            trellis::staging::build::settle_builds(pool).await;
+            return;
+        }
+        for chunk in &claimed {
+            chunk_queue::run_claimed_chunk(
+                pool,
+                chunk,
+                CLAIMED_BY,
+                Duration::from_secs(5),
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("run_claimed_chunk");
+            chunk_queue::finish_chunk(pool, chunk, CLAIMED_BY)
+                .await
+                .expect("finish_chunk");
+        }
+    }
+}
+
+async fn write(d: &Driver, sql: &str) {
+    d.user().await.batch_execute(sql).await.expect(sql);
+}
+
+fn int4() -> ValueType {
+    ValueType::Integer(IntWidth::Int4)
+}
+
+/// One cell: a source, one definition named `c`, a seed, an alter, a write,
+/// and the SQL that reads the target and its oracle (the source) in the same
+/// shape.
+struct Scenario {
+    ddl: String,
+    columns: Vec<(&'static str, ValueType)>,
+    definition: &'static str,
+    captured: &'static [&'static str],
+    seed_sql: String,
+    alter_sql: String,
+    hi_sql: String,
+    target_sql: &'static str,
+    oracle_sql: String,
+}
+
+/// `row`'s alter clause for `column`.
+fn alter_clause(row: &Row, column: &str) -> String {
+    row.alter.replace("{c}", column)
+}
+
+fn scenario(place: Place, ty: &Ty, row: &Row) -> Scenario {
+    let value_type = ty.value_type;
+    let alter = |table: &str, column: &str| {
+        format!(
+            "alter table public.{table} alter column {column} type {}",
+            alter_clause(row, column)
+        )
+    };
+    match place {
+        // A 1-1 target over `t(id integer primary key, v <T>, n integer)`
+        // copying `v` as a passthrough.
+        Place::Passthrough => Scenario {
+            ddl: format!(
+                "create table public.t (id integer primary key, v {}, n integer)",
+                row.start
+            ),
+            columns: vec![("id", int4()), ("v", value_type), ("n", int4())],
+            definition: "TRANSFORM c FROM public.t SELECT v AS v, n AS n",
+            captured: &["public.t"],
+            seed_sql: format!("insert into public.t values (1, '{}', 1)", row.seed),
+            alter_sql: alter("t", "v"),
+            hi_sql: format!("insert into public.t values (2, '{}', 2)", row.hi),
+            target_sql: "select id, v::text, n from public.c",
+            oracle_sql: "select id, v::text, n from public.t".into(),
+        },
+        // A 1-1 target over `t(k <T> primary key, n integer)`, keyed by `k`.
+        Place::PrimaryKey => Scenario {
+            ddl: format!(
+                "create table public.t (k {} primary key, n integer)",
+                row.start
+            ),
+            columns: vec![("k", value_type), ("n", int4())],
+            definition: "TRANSFORM c FROM public.t SELECT n AS n",
+            captured: &["public.t"],
+            seed_sql: format!("insert into public.t values ('{}', 1)", row.seed),
+            alter_sql: alter("t", "k"),
+            hi_sql: format!("insert into public.t values ('{}', 2)", row.hi),
+            target_sql: "select k::text, n from public.c",
+            oracle_sql: "select k::text, n from public.t".into(),
+        },
+        // A group-basis aggregate over `t(id integer primary key, g <T>, x
+        // integer)` grouped by `g`.
+        Place::GroupBy => Scenario {
+            ddl: format!(
+                "create table public.t (id integer primary key, g {}, x integer); \
+                 create index on public.t (g)",
+                row.start
+            ),
+            columns: vec![("id", int4()), ("g", value_type), ("x", int4())],
+            definition: "TRANSFORM c FROM public.t GROUP BY g \
+                         SELECT g AS g, COUNT(*) AS n, SUM(x) AS sx",
+            captured: &["public.t"],
+            seed_sql: format!("insert into public.t values (1, '{}', 1)", row.seed),
+            alter_sql: alter("t", "g"),
+            hi_sql: format!("insert into public.t values (2, '{}', 2)", row.hi),
+            target_sql: "select g::text, n, sx from public.c",
+            oracle_sql: "select g::text, count(*)::bigint, sum(x)::bigint \
+                         from public.t group by g"
+                .into(),
+        },
+        // A `JOIN` on `a.k = b.k` of two tables whose `k` is `<T>`, grouped
+        // by `k`. Both tables change `k`.
+        Place::JoinOn => Scenario {
+            ddl: format!(
+                "create table public.a (id integer primary key, k {0}, x integer); \
+                 create table public.b (id integer primary key, k {0}, y integer); \
+                 create index on public.a (k); create index on public.b (k)",
+                row.start
+            ),
+            columns: vec![
+                ("id", int4()),
+                ("k", value_type),
+                ("x", int4()),
+                ("y", int4()),
+            ],
+            definition: "TRANSFORM c FROM public.a LEFT JOIN public.b ON a.k = b.k \
+                         GROUP BY a.k SELECT a.k AS k, COUNT(*) AS n, SUM(b.y) AS sy",
+            captured: &["public.a", "public.b"],
+            seed_sql: format!(
+                "insert into public.a values (1, '{0}', 1); \
+                 insert into public.b values (1, '{0}', 10)",
+                row.seed
+            ),
+            alter_sql: format!("{}; {}", alter("a", "k"), alter("b", "k")),
+            hi_sql: format!(
+                "insert into public.a values (2, '{0}', 2); \
+                 insert into public.b values (2, '{0}', 20)",
+                row.hi
+            ),
+            target_sql: "select k::text, n, sy from public.c",
+            oracle_sql: "select a.k::text, count(*)::bigint, sum(b.y)::bigint \
+                         from public.a left join public.b on a.k = b.k group by a.k"
+                .into(),
+        },
+        // A `JOIN` on an integer, grouped by a `<T>` column of the left
+        // table.
+        Place::JoinGroupBy => Scenario {
+            ddl: format!(
+                "create table public.a (id integer primary key, g {}, j integer); \
+                 create table public.b (id integer primary key, j integer, y integer); \
+                 create index on public.a (j); create index on public.b (j)",
+                row.start
+            ),
+            columns: vec![
+                ("id", int4()),
+                ("g", value_type),
+                ("j", int4()),
+                ("y", int4()),
+            ],
+            definition: "TRANSFORM c FROM public.a LEFT JOIN public.b ON a.j = b.j \
+                         GROUP BY a.g SELECT a.g AS g, COUNT(*) AS n, SUM(b.y) AS sy",
+            captured: &["public.a", "public.b"],
+            seed_sql: format!(
+                "insert into public.a values (1, '{}', 1); insert into public.b values (1, 1, 10)",
+                row.seed
+            ),
+            alter_sql: alter("a", "g"),
+            hi_sql: format!(
+                "insert into public.a values (2, '{}', 2); insert into public.b values (2, 2, 20)",
+                row.hi
+            ),
+            target_sql: "select g::text, n, sy from public.c",
+            oracle_sql: "select a.g::text, count(*)::bigint, sum(b.y)::bigint \
+                         from public.a left join public.b on a.j = b.j group by a.g"
+                .into(),
+        },
+    }
+}
+
+/// The columns of the tables Trellis created for the definition that have a
+/// type modifier: none may (ADR-0020). The target is `public.c`; a `JOIN`'s
+/// hidden tables are `join_<id>_*` in Trellis's schema.
+async fn copies_with_a_modifier(d: &Driver) -> Vec<String> {
+    d.rows(&format!(
+        "select c.relname::text, a.attname::text, \
+                pg_catalog.format_type(a.atttypid, a.atttypmod) \
+         from pg_catalog.pg_attribute a \
+         join pg_catalog.pg_class c on c.oid = a.attrelid and c.relkind = 'r' \
+         join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
+         where a.attnum > 0 and not a.attisdropped and a.atttypmod <> -1 \
+           and ((n.nspname = 'public' and c.relname = 'c') \
+                or (n.nspname = '{DEFAULT_SCHEMA}' and c.relname like 'join\\_%')) \
+         order by 1, 2"
+    ))
+    .await
+}
+
+async fn run(place: Place, ty: &Ty, change: Change, row: &Row) -> Outcome {
+    let scn = scenario(place, ty, row);
+    trellis::dev::staging::set_group_basis(true);
+    let mut d = Driver::start(&scn.ddl, &scn.columns, &[scn.definition], scn.captured).await;
+    assert_eq!(
+        copies_with_a_modifier(&d).await,
+        Vec::<String>::new(),
+        "{place:?}, {}: a column Trellis created has a type modifier",
+        ty.label
+    );
+    write(&d, &scn.seed_sql).await;
+    d.settle().await;
+    d.ctl.batch_execute(&scn.alter_sql).await.expect("alter");
+    write(&d, &scn.hi_sql).await;
+    let drain_failures = settle_tolerant(&mut d).await;
+    let diverged_before_pass = diverged(&d, scn.target_sql, &scn.oracle_sql).await;
+    let trellis = facade(d.db.dsn()).await;
+    let status_before_pass = status_of(&trellis, "c").await;
+    let self_check_before_pass = self_check_of(&trellis, "c").await;
+
+    pass(&mut d).await;
+    settle_tolerant(&mut d).await;
+    let status_after_pass = status_of(&trellis, "c").await;
+    let diverged_after_pass = diverged(&d, scn.target_sql, &scn.oracle_sql).await;
+
+    // Converge: explicit rounds of the builds a pass asks for, a drain and a
+    // pass, resuming a pause. A change that is not a catalog-only widening
+    // may pause (the rewrite, the narrowing), and `RESUME` rebuilds.
+    let mut pauses = Vec::new();
+    let mut trace = Vec::new();
+    for _ in 0..8 {
+        run_backfill_chunks(d.pool()).await;
+        settle_tolerant(&mut d).await;
+        let status = status_of(&trellis, "c").await;
+        trace.push(status.clone());
+        // A pause with a reason of its own is resumed once. A resume the
+        // staging worker has yet to finish reads `resuming: …` (or, once its
+        // request is done, no reason): the next pass finishes it.
+        let own_reason = status
+            .strip_prefix("Paused: ")
+            .is_some_and(|why| !why.starts_with("resuming:"));
+        if own_reason {
+            pauses.push(status);
+            trellis
+                .apply("RESUME TRANSFORM c")
+                .await
+                .expect("resume the paused definition");
+        } else if status == "Live" {
+            break;
+        }
+        pass(&mut d).await;
+        settle_tolerant(&mut d).await;
+    }
+    let status = status_of(&trellis, "c").await;
+    let self_check = self_check_of(&trellis, "c").await;
+    let diverged_at_end = diverged(&d, scn.target_sql, &scn.oracle_sql).await;
+    if status != "Live" {
+        eprintln!(
+            "DEBUG requests {:?} failures {:?}",
+            d.rows("select r::text from resume_requests r").await,
+            d.rows("select r::text from capture_failures r").await
+        );
+    }
+    let outcome = Outcome {
+        drain_failures,
+        status_before_pass,
+        self_check_before_pass,
+        diverged_before_pass,
+        status_after_pass,
+        diverged_after_pass,
+        pauses,
+        trace,
+        status,
+        self_check,
+        diverged: diverged_at_end,
+    };
+    trellis.shutdown().await.expect("shutdown");
+    eprintln!(
+        "REPORT {place:?} | {} {change:?} | before pass: {} failed drains, {}, {}, diverged {:?} \
+         | after pass: {}, diverged {:?} | pauses {:?} | rounds {:?} | end: {}, {}, diverged {:?}",
+        ty.label,
+        outcome.drain_failures,
+        outcome.status_before_pass,
+        outcome.self_check_before_pass,
+        outcome.diverged_before_pass,
+        outcome.status_after_pass,
+        outcome.diverged_after_pass,
+        outcome.pauses,
+        outcome.trace,
+        outcome.status,
+        outcome.self_check,
+        outcome.diverged
+    );
+    outcome
+}
+
+/// One cell. A catalog-only widening is exact all the way: the target equals
+/// the source before the pass (no value rounded, no two keys merged),
+/// `self_check` agrees, and the pass changes nothing: the definition stays
+/// live, nothing is held and no `RESUME` is needed. Any other change must
+/// converge: the end state is live, `self_check` agrees and nothing differs
+/// from the source, with every pause on the way carrying its reason.
+async fn cell(place: Place, ty: &Ty, change: Change) {
+    let Some(row) = ty.row(change) else { return };
+    if !admits(place, ty.label) {
+        return;
+    }
+    let outcome = run(place, ty, change, row).await;
+    let tag = format!("{place:?}, {} {change:?}", ty.label);
+    if change == Change::CatalogOnly {
+        assert_eq!(
+            outcome.diverged_before_pass,
+            Vec::<String>::new(),
+            "{tag}: the target differs from the source before the pass (a rounded value or \
+             merged keys); status {}, self_check {}",
+            outcome.status_before_pass,
+            outcome.self_check_before_pass
+        );
+        assert_eq!(
+            (
+                outcome.drain_failures,
+                outcome.status_before_pass.as_str(),
+                outcome.self_check_before_pass.as_str(),
+                outcome.status_after_pass.as_str(),
+            ),
+            (0, "Live", "Converged", "Live"),
+            "{tag}: before and after the pass"
+        );
+        assert_eq!(
+            outcome.diverged_after_pass,
+            Vec::<String>::new(),
+            "{tag}: after the pass"
+        );
+        assert!(
+            outcome.pauses.is_empty(),
+            "{tag}: a catalog-only widening paused the definition: {:?}",
+            outcome.pauses
+        );
+    }
+    for pause in &outcome.pauses {
+        assert!(
+            pause
+                .split_once(": ")
+                .is_some_and(|(_, why)| !why.is_empty()),
+            "{tag}: a pause without a reason: {pause}"
+        );
+    }
+    assert_eq!(
+        (outcome.status.as_str(), outcome.self_check.as_str()),
+        ("Live", "Converged"),
+        "{tag}: the definition did not converge; pauses {:?}",
+        outcome.pauses
+    );
+    assert_eq!(
+        outcome.diverged,
+        Vec::<String>::new(),
+        "{tag}: the target differs from the source at the end; pauses {:?}",
+        outcome.pauses
+    );
+}
+
+/// The cells [`admits`] skips are refused at define: the table is the
+/// validator's, not a guess, so a type that becomes admissible in a place
+/// fails here until its cells are filled in.
+#[tokio::test]
+async fn a_type_a_place_refuses_is_refused() {
+    trellis::dev::staging::set_group_basis(true);
+    let cluster = TestCluster::start();
+    let mut accepted = Vec::new();
+    for ty in TYPES {
+        let Some(row) = [&ty.catalog_only, &ty.rewrite, &ty.narrow]
+            .into_iter()
+            .find_map(Option::as_ref)
+        else {
+            continue;
+        };
+        for place in PLACES {
+            if admits(place, ty.label) {
+                continue;
+            }
+            let scn = scenario(place, ty, row);
+            let db = cluster.create_isolated_database().await;
+            db.pool
+                .get()
+                .await
+                .expect("connection")
+                .batch_execute(&scn.ddl)
+                .await
+                .expect("source DDL");
+            let trellis = facade(db.dsn()).await;
+            if trellis.apply(scn.definition).await.is_ok() {
+                accepted.push(format!("{place:?}, {}", ty.label));
+            }
+            trellis.shutdown().await.expect("shutdown");
+        }
+    }
+    assert_eq!(
+        accepted,
+        Vec::<String>::new(),
+        "define accepts these, which `admits` skips: add their cells"
+    );
+}
+
+/// One test per (type, change), each running the type's cells in every
+/// place that admits it.
+macro_rules! matrix {
+    ($($name:ident: $label:literal, $change:expr;)*) => {$(
+        #[tokio::test]
+        async fn $name() {
+            let ty = TYPES.iter().find(|t| t.label == $label).expect("a listed type");
+            for place in PLACES {
+                cell(place, ty, $change).await;
+            }
+        }
+    )*};
+}
+
+matrix! {
+    varchar_catalog_only: "varchar", Change::CatalogOnly;
+    varchar_rewrite: "varchar", Change::Rewrite;
+    varchar_narrow: "varchar", Change::Narrow;
+    bpchar_rewrite: "bpchar", Change::Rewrite;
+    bpchar_narrow: "bpchar", Change::Narrow;
+    bit_rewrite: "bit", Change::Rewrite;
+    bit_narrow: "bit", Change::Narrow;
+    varbit_catalog_only: "varbit", Change::CatalogOnly;
+    varbit_rewrite: "varbit", Change::Rewrite;
+    varbit_narrow: "varbit", Change::Narrow;
+    numeric_catalog_only: "numeric", Change::CatalogOnly;
+    numeric_rewrite: "numeric", Change::Rewrite;
+    numeric_narrow: "numeric", Change::Narrow;
+    time_catalog_only: "time", Change::CatalogOnly;
+    time_narrow: "time", Change::Narrow;
+    timetz_catalog_only: "timetz", Change::CatalogOnly;
+    timetz_narrow: "timetz", Change::Narrow;
+    timestamp_catalog_only: "timestamp", Change::CatalogOnly;
+    timestamp_narrow: "timestamp", Change::Narrow;
+    timestamptz_catalog_only: "timestamptz", Change::CatalogOnly;
+    timestamptz_narrow: "timestamptz", Change::Narrow;
+    interval_catalog_only: "interval", Change::CatalogOnly;
+    interval_narrow: "interval", Change::Narrow;
+    interval_fields_catalog_only: "interval fields", Change::CatalogOnly;
+}

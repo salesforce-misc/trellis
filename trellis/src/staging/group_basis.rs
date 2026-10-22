@@ -560,6 +560,25 @@ pub(crate) async fn check_define(
             .await?
             .map(|row| row.get(0));
         if typmod == Some(-1) {
+            // A column of a table Trellis creates has no declared scale
+            // whatever the scale of the column it copies: Trellis creates
+            // its columns with no type modifier (ADR-0020), and no rule
+            // reads a copy's modifier.
+            let chained: bool = txn
+                .query_one(
+                    "select exists (select 1 from transform_definitions \
+                                    where target_table = $1)",
+                    &[&qualified_source],
+                )
+                .await?
+                .get(0);
+            if chained {
+                return refuse(format!(
+                    "SUM/AVG({column}) is over a column of {qualified_source}, a table Trellis \
+                     creates, whose numeric columns have no declared scale: a chained \
+                     SUM/AVG over one is not supported yet (tracked in #1120)"
+                ));
+            }
             return refuse(format!(
                 "SUM/AVG({column}) is over a numeric with no declared scale (#1096 decision 2)"
             ));

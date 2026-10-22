@@ -184,6 +184,11 @@ pub enum ValidationError {
     /// `SUM`/`AVG` over an unconstrained `numeric` column, whose display
     /// scale a running sum can't track (#1096 decision 2).
     UnconstrainedNumericAggregate { function: String, column: String },
+    /// `SUM`/`AVG` over a `numeric` column of a table Trellis creates (a
+    /// target): Trellis creates its columns with no type modifier, so the
+    /// column has no declared scale whatever the scale of the column it
+    /// copies (ADR-0020, #1120).
+    ChainedNumericAggregate { function: String, column: String },
     /// `SUM`/`AVG` over a column whose type is not an integer or a
     /// `numeric(p,s)`.
     UnsupportedAggregateArgument {
@@ -954,6 +959,14 @@ impl fmt::Display for ValidationError {
                  track. Sum a numeric(p,s) column directly (ALTER TABLE ... ALTER COLUMN ... \
                  TYPE numeric(p,s)); an expression over numeric has no declared scale"
             ),
+            ValidationError::ChainedNumericAggregate { function, column } => write!(
+                f,
+                "{function}({column}) is over a numeric column of a table Trellis creates, \
+                 which has no declared scale: Trellis creates its columns with no type \
+                 modifier, so a chained SUM/AVG over one is not supported yet (tracked in \
+                 #1120). Sum the source's numeric(p,s) column in the transform that reads \
+                 the source"
+            ),
             ValidationError::UnsupportedAggregateArgument {
                 function,
                 column,
@@ -1635,6 +1648,14 @@ pub struct JoinColumnInfo {
     pub collation_deterministic: bool,
     /// The type is a live enum, which is a text-stable join key too.
     pub is_enum: bool,
+    /// The type a copy of the column is declared and cast as: no modifier,
+    /// qualified ([`super::copy_type::type_sql`]).
+    pub copy_type: String,
+    /// The collation a copy declares (`collate <qualified name>`), `None`
+    /// for the database default ([`super::copy_type::collation_sql`]).
+    pub copy_collation: Option<String>,
+    /// The column belongs to a table Trellis creates (a transform's target).
+    pub trellis_target: bool,
 }
 
 /// Which table of a `JOIN` a column belongs to.
@@ -1677,6 +1698,8 @@ pub(crate) struct AggregateArg<'a> {
     pub pg_type: &'a str,
     /// `atttypmod`; `-1` means no modifier, i.e. an unconstrained `numeric`.
     pub typmod: i32,
+    /// The column is a column of a table Trellis creates.
+    pub trellis_target: bool,
 }
 
 /// The per-family refusal of #1096 decision 1: whether `function` (an
@@ -1709,6 +1732,12 @@ pub(crate) fn check_aggregate_admitted(
             match arg.value_type {
                 ValueType::Integer(_) => Ok(()),
                 ValueType::Numeric if arg.typmod != -1 => Ok(()),
+                ValueType::Numeric if arg.trellis_target => {
+                    Err(ValidationError::ChainedNumericAggregate {
+                        function,
+                        column: arg.column.to_string(),
+                    })
+                }
                 ValueType::Numeric => Err(ValidationError::UnconstrainedNumericAggregate {
                     function,
                     column: arg.column.to_string(),
@@ -2092,12 +2121,12 @@ fn check_join_field_expr<'a>(
                 .map(|(name, info)| (name.clone(), info.value_type))
                 .collect();
             let value_type = infer_expr_type(arg, &value_types, &HashMap::new())?;
-            let (pg_type, typmod) = match arg {
+            let (pg_type, typmod, trellis_target) = match arg {
                 Expr::SourceColumn { column, .. } => columns
                     .get(column)
-                    .map(|info| (info.pg_type.clone(), info.typmod))
+                    .map(|info| (info.pg_type.clone(), info.typmod, info.trellis_target))
                     .unwrap_or_default(),
-                _ => (super::ddl::pg_type_name(value_type).into_owned(), -1),
+                _ => (super::ddl::pg_type_name(value_type).into_owned(), -1, false),
             };
             check_aggregate_admitted(
                 &upper,
@@ -2106,6 +2135,7 @@ fn check_join_field_expr<'a>(
                     value_type,
                     pg_type: &pg_type,
                     typmod,
+                    trellis_target,
                 }),
             )
         }
@@ -5856,6 +5886,9 @@ mod tests {
             collation: None,
             collation_deterministic: true,
             is_enum: false,
+            copy_type: pg_type.split('(').next().unwrap_or(pg_type).to_string(),
+            copy_collation: None,
+            trellis_target: false,
         }
     }
 

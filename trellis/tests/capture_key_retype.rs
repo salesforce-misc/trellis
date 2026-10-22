@@ -1310,12 +1310,11 @@ async fn a_field_resume_refuses_a_definition_define_would_refuse_now() {
 /// An aggregate's `GROUP BY` key read through a to-one relationship
 /// (`GROUP BY author.country`) is read from the relationship's projection,
 /// whose column for it copies the to-side column's type. Widening the
-/// to-side column (`varchar(2)` to `varchar(20)`) outgrows that copy, but
-/// without a rewrite: one pass re-types the projection's column in place
-/// (#824), and the aggregate stays live, so a longer value groups.
+/// to-side column (`varchar(2)` to `varchar(20)`) changes no copy (it is an
+/// unbounded `varchar`, #1207), and the aggregate stays live, so a longer
+/// value groups.
 #[tokio::test]
-async fn widening_a_group_by_key_read_through_a_relationship_re_types_its_projection_column_in_place()
- {
+async fn widening_a_group_by_key_read_through_a_relationship_re_types_no_projection_column() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
@@ -3448,14 +3447,15 @@ async fn assert_widening_targets_match(raw: &Client) {
     }
 }
 
-/// #824 rule 2: one catalog-only widening. The source's key columns are
-/// re-typed `key_to` (or kept, when `None`) and its value columns
-/// `value_to`; one staging-worker pass re-types every column Trellis copied
-/// from them in place, to `key_display` and `value_display`, without a
-/// rewrite, a pause or a rebuild: every definition stays live. A key and a
-/// value the old types couldn't hold then apply. The contribution column is
-/// typed by the value's family, so it holds them already and is left alone.
-async fn a_catalog_only_widening_re_types_in_place(
+/// One widening of a type modifier (ADR-0020, #824, #1207, #1288). The
+/// source's key columns are re-typed `key_to` (or kept, when `None`) and its
+/// value columns `value_to`. A copy has no modifier, so no column Trellis
+/// copied from them changes: a pass re-types nothing, rewrites nothing and
+/// pauses or rebuilds nothing, and every definition stays live. A key and a
+/// value the old types couldn't hold apply, with or without a pass before
+/// them. `key_to`'s and `value_to`'s second element is the copy's type,
+/// before and after.
+async fn a_modifier_widening_re_types_no_copy(
     key: &str,
     key_to: Option<(&str, &str)>,
     value: &str,
@@ -3566,7 +3566,7 @@ async fn a_catalog_only_widening_re_types_in_place(
 /// and a value past the old bound apply before it.
 #[tokio::test]
 async fn a_longer_varchar_re_types_no_copy() {
-    a_catalog_only_widening_re_types_in_place(
+    a_modifier_widening_re_types_no_copy(
         "varchar(10)",
         Some(("varchar(40)", "character varying")),
         "varchar(10)",
@@ -3579,7 +3579,7 @@ async fn a_longer_varchar_re_types_no_copy() {
 
 #[tokio::test]
 async fn a_bounded_varchar_to_text_re_types_no_copy() {
-    a_catalog_only_widening_re_types_in_place(
+    a_modifier_widening_re_types_no_copy(
         "varchar(10)",
         Some(("text", "character varying")),
         "varchar(10)",
@@ -3592,7 +3592,7 @@ async fn a_bounded_varchar_to_text_re_types_no_copy() {
 
 #[tokio::test]
 async fn an_unbounded_varchar_to_text_re_types_no_copy() {
-    a_catalog_only_widening_re_types_in_place(
+    a_modifier_widening_re_types_no_copy(
         "varchar",
         Some(("text", "character varying")),
         "varchar",
@@ -3605,7 +3605,7 @@ async fn an_unbounded_varchar_to_text_re_types_no_copy() {
 
 #[tokio::test]
 async fn removing_a_varchar_length_re_types_no_copy() {
-    a_catalog_only_widening_re_types_in_place(
+    a_modifier_widening_re_types_no_copy(
         "varchar(10)",
         Some(("varchar", "character varying")),
         "varchar(10)",
@@ -3616,30 +3616,30 @@ async fn removing_a_varchar_length_re_types_no_copy() {
     .await;
 }
 
-/// `numeric` can't be a key, so only the value columns widen.
+/// `numeric` can't be a key, so only the value columns widen. The copy is an
+/// unconstrained `numeric`, so a value past the old precision applies with no
+/// pass before it.
 #[tokio::test]
-async fn more_numeric_precision_at_the_same_scale_is_re_typed_in_place() {
-    a_catalog_only_widening_re_types_in_place(
+async fn more_numeric_precision_at_the_same_scale_re_types_no_copy() {
+    a_modifier_widening_re_types_no_copy(
         "varchar(10)",
         None,
         "numeric(5,2)",
-        ("numeric(9,2)", "numeric(9,2)"),
+        ("numeric(9,2)", "numeric"),
         ("dan", "12345.67"),
-        false,
+        true,
     )
     .await;
 }
 
-/// #824 rule 3: values written after the source widened and before the
-/// pass re-types Trellis's columns fail their writes with `22003` for a `numeric` (#1207: a string column's
-/// copy holds any length), and their keys are held: a 1-1
-/// target's passthroughs, and a to-one projection's data column, whose
-/// failed write holds the to-side key for the definition reading through
-/// it. One pass re-types the columns in place and releases those keys, and
-/// the next drain applies them. A key held for another reason (a check
-/// constraint on the target, `23514`) stays held.
+/// ADR-0020: a value past a widened `numeric(p,s)` or `varchar(n)` applies
+/// with no pass between the `ALTER` and the drain, to a 1-1 passthrough and
+/// to a to-one projection's data column. Nothing is held, nothing pauses
+/// and no column changes. A key held for another reason (a check
+/// constraint on the target, `23514`) stays held, and the pass releases
+/// nothing.
 #[tokio::test]
-async fn keys_held_for_a_value_the_old_type_couldnt_hold_are_released_after_the_re_type() {
+async fn a_value_the_old_modifier_couldnt_hold_applies_with_no_pass_and_no_hold() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
@@ -3677,7 +3677,7 @@ async fn keys_held_for_a_value_the_old_type_couldnt_hold_are_released_after_the_
          update public.users set score = 12345.67 where id = 1;",
     )
     .await
-    .expect("widen, then write values the copies can't hold");
+    .expect("widen, then write values the old modifiers can't hold");
     drain_past_failures(&db.pool, &mut raw).await;
     let held = async |raw: &Client| {
         rows(
@@ -3693,16 +3693,15 @@ async fn keys_held_for_a_value_the_old_type_couldnt_hold_are_released_after_the_
             .map(|v| Some(v.to_string()))
             .collect::<Vec<_>>()
     };
+    let expected_held = vec![row("good_names", "public.goods", "5", "23514")];
     assert_eq!(
         held(&raw).await,
-        vec![
-            row("good_names", "public.goods", "4", "22003"),
-            row("good_names", "public.goods", "5", "23514"),
-            row("post_authors", "public.users", "1", "22003"),
-        ]
+        expected_held,
+        "only the check holds a key"
     );
 
     full_pass(&mut raw, &db.pool).await;
+    drain_past_failures(&db.pool, &mut raw).await;
     for target in targets {
         assert_eq!(
             status(&raw, target).await,
@@ -3711,35 +3710,16 @@ async fn keys_held_for_a_value_the_old_type_couldnt_hold_are_released_after_the_
         );
     }
     assert_eq!(
-        column_type(&raw, "public.good_names", "name").await,
-        "character varying"
-    );
-    assert_eq!(
         column_type(&raw, "public.good_names", "price").await,
-        "numeric(9,2)"
+        "numeric"
     );
-    assert_eq!(
-        held(&raw).await,
-        vec![row("good_names", "public.goods", "5", "23514")]
-    );
-    let requests = async |raw: &Client| -> i64 {
-        raw.query_one("select count(*) from retype_releases", &[])
-            .await
-            .expect("read retype_releases")
-            .get(0)
-    };
-    assert_eq!(
-        requests(&raw).await,
-        2,
-        "each request is kept for its window: 22003 for good_names and for post_authors"
-    );
-
-    // The goods apply in the first drain. The released `users` key's
-    // re-derive reaches `post_authors`' rows through the reverse records it
-    // stages, which the second drain applies (#754). Key 5's held rows keep
-    // the ring from quiescence, so each drain is one bounded round.
-    drain_past_failures(&db.pool, &mut raw).await;
-    drain_past_failures(&db.pool, &mut raw).await;
+    assert_eq!(held(&raw).await, expected_held);
+    let requests: i64 = raw
+        .query_one("select count(*) from retype_releases", &[])
+        .await
+        .expect("read retype_releases")
+        .get(0);
+    assert_eq!(requests, 0, "no re-type asked for a release");
     assert_eq!(
         rows(
             &raw,
@@ -3766,41 +3746,15 @@ async fn keys_held_for_a_value_the_old_type_couldnt_hold_are_released_after_the_
         )
         .await,
     );
-
-    // A drain that reproduced a key's failure before the re-type can commit
-    // its eviction after the pass's release read the keys held. The next
-    // pass within the request's window releases it.
-    raw.execute(
-        "insert into poison (transform_id, src_table, key, last_error, sqlstate) \
-         select id, 'public.goods', '2', 'numeric field overflow', \
-                '22003' \
-         from transform_definitions where target_table = 'public.good_names'",
-        &[],
-    )
-    .await
-    .expect("a key evicted after the release");
-    full_pass(&mut raw, &db.pool).await;
-    assert_eq!(
-        held(&raw).await,
-        vec![row("good_names", "public.goods", "5", "23514")]
-    );
-    // Past the window, a pass that finds nothing more to release consumes
-    // the requests.
-    raw.batch_execute("update retype_releases set requested_at = requested_at - interval '1 hour'")
-        .await
-        .expect("age the requests past their window");
-    full_pass(&mut raw, &db.pool).await;
-    assert_eq!(requests(&raw).await, 0, "every requested release was made");
 }
 
-/// #824: only the named widenings are re-typed in place. A `character(n)`
-/// length change (its values are blank-padded to the length) and a `text`
-/// column made `varchar(n)` (binary-coercible, but a narrowing) are left
-/// as they were, and, as before, pause nothing: every value still fits a
+/// A `character(n)` length change (its values are blank-padded to the
+/// length) and a `text` column made `varchar(n)` (binary-coercible, but a
+/// narrowing) re-type no copy and pause nothing: every value still fits a
 /// passthrough of either. Neither is a pure widening, so the definition
 /// rebuilds (#703 R1).
 #[tokio::test]
-async fn character_and_text_to_varchar_changes_are_not_re_typed_in_place() {
+async fn character_and_text_to_varchar_changes_re_type_no_copy() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
@@ -3828,136 +3782,9 @@ async fn character_and_text_to_varchar_changes_are_not_re_typed_in_place() {
     bring_live(&mut raw, &db.pool, &["tag_codes"]).await;
     assert_eq!(
         column_type(&raw, "public.tag_codes", "code").await,
-        "character(5)"
+        "bpchar"
     );
     assert_eq!(column_type(&raw, "public.tag_codes", "note").await, "text");
-}
-
-/// #824: the in-place re-type waits for its table's lock at most
-/// `RETYPE_LOCK_TIMEOUT`. While another session holds a lock on the
-/// target, the pass changes nothing and pauses nothing; the next pass,
-/// with the lock gone, re-types it.
-#[tokio::test]
-async fn a_re_type_that_cant_lock_its_table_changes_nothing_and_pauses_nothing() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut raw = connect(db.dsn()).await;
-    items(db.dsn(), &mut raw, &db.pool).await;
-
-    raw.batch_execute("alter table public.items alter column amount type numeric(9,2)")
-        .await
-        .expect("widen the passthrough");
-    let locker = connect(db.dsn()).await;
-    locker
-        .batch_execute("begin; lock table public.item_names in access share mode")
-        .await
-        .expect("hold a lock on the target");
-    capture_pass(&mut raw, &db.pool).await;
-    assert_eq!(status(&raw, "item_names").await, TransformStatus::Live);
-    assert_eq!(
-        column_type(&raw, "public.item_names", "amount").await,
-        "numeric(5,2)"
-    );
-    let requests: i64 = raw
-        .query_one("select count(*) from retype_releases", &[])
-        .await
-        .expect("read retype_releases")
-        .get(0);
-    assert_eq!(requests, 0);
-
-    locker.batch_execute("rollback").await.expect("let go");
-    capture_pass(&mut raw, &db.pool).await;
-    assert_eq!(status(&raw, "item_names").await, TransformStatus::Live);
-    assert_eq!(
-        column_type(&raw, "public.item_names", "amount").await,
-        "numeric(9,2)"
-    );
-}
-
-/// #824: an in-place re-type that fails for another reason than its lock
-/// (a view on the target's column) leaves the table as it was, asks for no
-/// release, and pauses the definition as a widening that needs a rewrite
-/// does, naming the column, for its resume to re-type.
-#[tokio::test]
-async fn a_re_type_in_place_that_fails_pauses_its_definition_instead() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut raw = connect(db.dsn()).await;
-    let trellis = items(db.dsn(), &mut raw, &db.pool).await;
-
-    raw.batch_execute(
-        "create view public.item_name_list as select amount from public.item_names; \
-         alter table public.items alter column amount type numeric(9,2)",
-    )
-    .await
-    .expect("a view on the target's column, then widen the passthrough");
-    capture_pass(&mut raw, &db.pool).await;
-    let error = paused_for(&trellis, "item_names", "public.items", &["amount"]).await;
-    assert!(error.contains("numeric(9,2)"), "{error}");
-    assert_eq!(
-        column_type(&raw, "public.item_names", "amount").await,
-        "numeric(5,2)"
-    );
-    let requests: i64 = raw
-        .query_one("select count(*) from retype_releases", &[])
-        .await
-        .expect("read retype_releases")
-        .get(0);
-    assert_eq!(requests, 0);
-}
-
-/// #824: a failed in-place re-type is remembered for the definitions that
-/// owned the table, not for the table's name. A definition dropped and
-/// defined again under the same target, with no pass in between to see the
-/// old one gone, tries the same re-type afresh: it doesn't pause for the
-/// old definition's failure.
-#[tokio::test]
-async fn a_failed_re_type_in_place_is_not_held_against_a_definition_defined_again() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut raw = connect(db.dsn()).await;
-    let trellis = items(db.dsn(), &mut raw, &db.pool).await;
-
-    raw.batch_execute(
-        "create view public.item_name_list as select amount from public.item_names; \
-         alter table public.items alter column amount type numeric(9,2)",
-    )
-    .await
-    .expect("a view on the target's column, then widen the passthrough");
-    capture_pass(&mut raw, &db.pool).await;
-    paused_for(&trellis, "item_names", "public.items", &["amount"]).await;
-
-    raw.batch_execute(
-        "drop view public.item_name_list; \
-         alter table public.items alter column amount type numeric(5,2)",
-    )
-    .await
-    .expect("drop the view, and narrow the passthrough back");
-    trellis
-        .apply("DROP TRANSFORM item_names")
-        .await
-        .expect("drop item_names");
-    trellis
-        .apply(
-            "TRANSFORM item_names FROM public.items \
-             SELECT name AS name, qty + 1 AS next, amount AS amount",
-        )
-        .await
-        .expect("define item_names again");
-    assert_eq!(
-        column_type(&raw, "public.item_names", "amount").await,
-        "numeric(5,2)"
-    );
-    raw.batch_execute("alter table public.items alter column amount type numeric(9,2)")
-        .await
-        .expect("widen the passthrough again");
-    capture_pass(&mut raw, &db.pool).await;
-    assert_ne!(status(&raw, "item_names").await, TransformStatus::Paused);
-    assert_eq!(
-        column_type(&raw, "public.item_names", "amount").await,
-        "numeric(9,2)"
-    );
-    bring_live(&mut raw, &db.pool, &["item_names"]).await;
 }
 
 /// Counts each in-place re-type of `public.item_names` the server starts,
@@ -3996,56 +3823,6 @@ async fn retype_attempts(raw: &Client) -> i64 {
     .await
     .expect("read retype_attempts")
     .get(0)
-}
-
-/// #824: an in-place re-type that fails transiently (a deadlock, a
-/// statement or lock timeout's cancel) changes nothing and pauses nothing,
-/// as one that can't get its lock doesn't: the next pass tries again.
-#[tokio::test]
-async fn a_re_type_in_place_that_fails_transiently_pauses_nothing() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut raw = connect(db.dsn()).await;
-    items(db.dsn(), &mut raw, &db.pool).await;
-    watch_item_names_retypes(&raw).await;
-
-    raw.batch_execute("alter table public.items alter column amount type numeric(9,2)")
-        .await
-        .expect("widen the passthrough");
-    for (attempt, code) in ["40P01", "57014"].into_iter().enumerate() {
-        raw.execute("insert into public.retype_injection values ($1)", &[&code])
-            .await
-            .expect("inject the error");
-        capture_pass(&mut raw, &db.pool).await;
-        assert_eq!(retype_attempts(&raw).await, attempt as i64 + 1, "{code}");
-        assert_eq!(
-            status(&raw, "item_names").await,
-            TransformStatus::Live,
-            "{code}"
-        );
-        assert_eq!(
-            column_type(&raw, "public.item_names", "amount").await,
-            "numeric(5,2)",
-            "{code}"
-        );
-        raw.batch_execute("delete from public.retype_injection")
-            .await
-            .expect("stop injecting");
-    }
-    let requests: i64 = raw
-        .query_one("select count(*) from retype_releases", &[])
-        .await
-        .expect("read retype_releases")
-        .get(0);
-    assert_eq!(requests, 0);
-
-    capture_pass(&mut raw, &db.pool).await;
-    assert_eq!(retype_attempts(&raw).await, 3);
-    assert_eq!(status(&raw, "item_names").await, TransformStatus::Live);
-    assert_eq!(
-        column_type(&raw, "public.item_names", "amount").await,
-        "numeric(9,2)"
-    );
 }
 
 /// #828: a resume's re-type that fails transiently (a deadlock, a statement
@@ -4735,82 +4512,6 @@ async fn a_column_added_by_alter_transform_is_compared_after_clean_passes() {
     // The new copy is among those found outgrown, with the group-by key.
     let error = paused_for(&trellis, "post_titles", "public.posts", &["kind"]).await;
     assert!(error.contains("public.post_titles.k"), "{error}");
-}
-
-/// A definition whose comparison is skipped still owns the tables it has a
-/// copy on. Here `post_authors` and `post_scores` share the relationship's
-/// projection; a widening of the to-side column only `post_scores` reads waits
-/// out the projection's lock in one pass, and the next pass, which skips
-/// `post_authors`, re-types the projection in place and asks for the release
-/// of both definitions' held keys, as it would after comparing both.
-#[tokio::test]
-async fn a_skipped_definition_still_owns_a_projection_re_typed_in_place() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut raw = connect(db.dsn()).await;
-    let (trellis, _) = settled(&db, &mut raw).await;
-    raw.batch_execute(
-        "alter table public.users add column score numeric(4,1); \
-         update public.users set score = 1.5",
-    )
-    .await
-    .expect("a second to-side column");
-    trellis
-        .apply("TRANSFORM post_scores FROM public.posts SELECT author.score AS score")
-        .await
-        .expect("define post_scores");
-    bring_live(&mut raw, &db.pool, &["post_scores"]).await;
-    capture_pass(&mut raw, &db.pool).await;
-    let projection: String = raw
-        .query_one("select projection_table from relationship_projections", &[])
-        .await
-        .expect("projection")
-        .get(0);
-    let projection = format!("trellis.{projection}");
-
-    let locker = connect(db.dsn()).await;
-    locker
-        .batch_execute(&format!(
-            "begin; lock table {projection} in access share mode"
-        ))
-        .await
-        .expect("hold a lock on the projection");
-    raw.batch_execute("alter table public.users alter column score type numeric(8,1)")
-        .await
-        .expect("widen the column only post_scores reads");
-    capture_pass(&mut raw, &db.pool).await;
-    assert_eq!(
-        column_type(&raw, &projection, "score").await,
-        "numeric(4,1)"
-    );
-    let waited = copy_checks(&raw).await;
-
-    locker.batch_execute("rollback").await.expect("let go");
-    capture_pass(&mut raw, &db.pool).await;
-    assert_eq!(
-        column_type(&raw, &projection, "score").await,
-        "numeric(8,1)"
-    );
-    let after = copy_checks(&raw).await;
-    assert_eq!(
-        after["post_authors"], waited["post_authors"],
-        "skipped: {after:?}"
-    );
-    assert!(after["post_scores"] > waited["post_scores"], "{after:?}");
-
-    let owners: Vec<String> = raw
-        .query(
-            "select distinct split_part(d.target_table, '.', 2) \
-             from retype_releases r join transform_definitions d on d.id = r.transform_id \
-             order by 1",
-            &[],
-        )
-        .await
-        .expect("read retype_releases")
-        .into_iter()
-        .map(|row| row.get(0))
-        .collect();
-    assert_eq!(owners, ["post_authors", "post_scores"]);
 }
 
 /// #1201: a target column someone re-typed by hand, with its source column

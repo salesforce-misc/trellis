@@ -99,16 +99,19 @@ impl Keyset {
     ) -> Result<Keyset, SelfCheckError> {
         let rows = client
             .query(
-                "select u.name, pg_catalog.format_type(a.atttypid, a.atttypmod), \
-                        (select pg_catalog.format('%I.%I', n.nspname, co.collname) \
-                         from pg_catalog.pg_collation co \
-                         join pg_catalog.pg_namespace n on n.oid = co.collnamespace \
-                         where co.oid = a.attcollation) \
-                 from unnest($2::text[]) with ordinality as u(name, ord) \
-                 join pg_catalog.pg_attribute a \
-                   on a.attrelid = pg_catalog.to_regclass($1) and a.attname = u.name \
-                  and not a.attisdropped \
-                 order by u.ord",
+                &format!(
+                    "select u.name, {}, \
+                            (select pg_catalog.format('%I.%I', n.nspname, co.collname) \
+                             from pg_catalog.pg_collation co \
+                             join pg_catalog.pg_namespace n on n.oid = co.collnamespace \
+                             where co.oid = a.attcollation) \
+                     from unnest($2::text[]) with ordinality as u(name, ord) \
+                     join pg_catalog.pg_attribute a \
+                       on a.attrelid = pg_catalog.to_regclass($1) and a.attname = u.name \
+                      and not a.attisdropped \
+                     order by u.ord",
+                    crate::defs::copy_type::type_sql("a.atttypid")
+                ),
                 &[&table, &names],
             )
             .await?;
@@ -116,7 +119,7 @@ impl Keyset {
             .iter()
             .map(|row| PrimaryKeyColumn {
                 name: row.get(0),
-                data_type: crate::defs::ddl::key_cast_type(&row.get::<_, String>(1)),
+                data_type: row.get(1),
                 nullable: true,
                 collation: row.get(2),
             })

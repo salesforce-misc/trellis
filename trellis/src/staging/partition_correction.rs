@@ -1579,10 +1579,13 @@ async fn group_types(
         .collect();
     let rows = client
         .query(
-            "select a.attname::text, pg_catalog.format_type(a.atttypid, a.atttypmod) \
-             from pg_catalog.pg_attribute a \
-             where a.attrelid = $1::text::regclass and a.attname::text = any($2) \
-               and not a.attisdropped",
+            &format!(
+                "select a.attname::text, {} \
+                 from pg_catalog.pg_attribute a \
+                 where a.attrelid = $1::text::regclass and a.attname::text = any($2) \
+                   and not a.attisdropped",
+                crate::defs::copy_type::type_sql("a.atttypid")
+            ),
             &[&ledger.ledger_ident(), &names],
         )
         .await?;

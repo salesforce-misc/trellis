@@ -220,7 +220,8 @@ async fn enum_join_key_and_primary_key_are_admitted() {
         .await
         .unwrap_or_else(|e| panic!("a single-column enum primary key must be accepted: {e}"));
     assert_eq!(pk.len(), 1);
-    assert_eq!(pk[0].data_type, "priority_enum");
+    // Rendered qualified, whatever the search path (ADR-0020).
+    assert_eq!(pk[0].data_type, "trellis.priority_enum");
 }
 
 /// A hand-built enum type must never be conflated with a different one, even

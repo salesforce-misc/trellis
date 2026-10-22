@@ -389,12 +389,15 @@ async fn hidden_column_types(
 ) -> Result<Vec<String>, CorrectionError> {
     let rows = client
         .query(
-            "select pg_catalog.format_type(a.atttypid, a.atttypmod) \
-             from unnest($3::text[]) with ordinality as c(name, ord) \
-             join pg_catalog.pg_attribute a \
-               on a.attrelid = pg_catalog.to_regclass(pg_catalog.format('%I.%I', $1::text, $2::text)) \
-              and a.attname = c.name and not a.attisdropped \
-             order by c.ord",
+            &format!(
+                "select {} \
+                 from unnest($3::text[]) with ordinality as c(name, ord) \
+                 join pg_catalog.pg_attribute a \
+                   on a.attrelid = pg_catalog.to_regclass(pg_catalog.format('%I.%I', $1::text, $2::text)) \
+                  and a.attname = c.name and not a.attisdropped \
+                 order by c.ord",
+                crate::defs::copy_type::type_sql("a.atttypid")
+            ),
             &[&schema, &bare, &columns],
         )
         .await?;

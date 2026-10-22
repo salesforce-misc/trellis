@@ -540,11 +540,10 @@ pub(crate) async fn pause_readers_in_hierarchy(
 ///    hold every value of the type define would give it now
 ///    ([`crate::defs::copies::CopyState::outgrown`]): `integer` to `bigint`
 ///    under a 1-1 target's key, a `SUM`, a `MIN` or a calculated field,
-///    `real` to `double precision` under a passthrough. A table whose every
-///    such column widened by changing only the catalog (`numeric(10,2)` to
-///    `numeric(12,2)` under a passthrough or a to-one projection's column)
-///    is re-typed in place instead, and pauses nothing ([`retype_in_place`],
-///    #824).
+///    `real` to `double precision` under a passthrough. A change of a
+///    modifier (`numeric(10,2)` to `numeric(12,2)`, a wider temporal
+///    precision) is no widening: a copy has none (ADR-0020), so it holds
+///    every value and pauses nothing.
 ///
 /// The types the third check compares against are those recorded in
 /// `definition_key_types`; a key column with none recorded (one that joined
@@ -575,8 +574,7 @@ pub(crate) async fn pause_readers_in_hierarchy(
 /// A key column the table no longer has is
 /// [`pause_readers_of_missing`]'s, which the pass runs first. Returns whether
 /// it paused any. Costs no query for a table no unpaused definition reads.
-/// `instance` is the capture pass's key for its database and schema, which
-/// keeps the in-place re-types that failed ([`retype_in_place`]).
+/// `instance` is the capture pass's key for its database and schema.
 pub(crate) async fn pause_readers_of_retyped(
     client: &mut Client,
     schema: &str,
@@ -784,9 +782,10 @@ pub(crate) async fn pause_readers_of_retyped(
         // last comparison found every column current
         // ([`drift_memo`]).
         let stamp = drift.stamp(schema, catalog, reader);
-        if let Some(copy_tables) = stamp
+        if stamp
             .as_deref()
             .and_then(|stamp| drift_memo::skippable(instance, table, reader.id, stamp))
+            .is_some()
         {
             checked.push(Checked {
                 id: reader.id,
@@ -794,7 +793,6 @@ pub(crate) async fn pause_readers_of_retyped(
                 reasons,
                 refused,
                 states: Vec::new(),
-                skipped: copy_tables,
             });
             continue;
         }
@@ -831,13 +829,8 @@ pub(crate) async fn pause_readers_of_retyped(
             reasons,
             refused,
             states,
-            skipped: Vec::new(),
         });
     }
-
-    // #824: each created table whose every drifted column widened by
-    // changing only the catalog is re-typed here, and pauses nothing.
-    let in_place = retype_in_place(client, instance, table, &checked).await?;
 
     let mut pauses: Vec<Pause> = Vec::new();
     for Checked {
@@ -846,7 +839,6 @@ pub(crate) async fn pause_readers_of_retyped(
         mut reasons,
         refused,
         states,
-        skipped: _,
     } in checked
     {
         // Without a refusal, every key column flagged above is one whose
@@ -857,7 +849,7 @@ pub(crate) async fn pause_readers_of_retyped(
         // typed from.
         let mut outgrown: BTreeMap<Vec<String>, Vec<copies::CopyState>> = BTreeMap::new();
         for state in states {
-            if !state.outgrown() || in_place.handles(&state.copy.table) {
+            if !state.outgrown() {
                 continue;
             }
             let from: Vec<String> = state.copy.columns_of(table).map(str::to_string).collect();
@@ -1063,7 +1055,7 @@ struct RetypeCause {
 /// re-typed (`retype_causes`, recorded by
 /// `staging::quarantine::finish_requested_resumes`), by column. A record
 /// counts only while its definition still writes `table` and the column
-/// still has the type it re-typed it to (`live`): a later change to the
+/// still has the type (OID) it re-typed it to (`live`): a later change to the
 /// column is another cause.
 async fn retype_causes(
     client: &impl tokio_postgres::GenericClient,
@@ -1074,7 +1066,7 @@ async fn retype_causes(
     for row in client
         .query(
             "select r.column_name, r.transform_id, split_part(d.target_table, '.', 2), \
-                    r.old_type, r.new_type \
+                    r.old_type, r.new_type, r.new_type_oid \
              from retype_causes r \
              join transform_definitions d \
                on d.id = r.transform_id and d.target_table = r.table_name \
@@ -1085,7 +1077,11 @@ async fn retype_causes(
     {
         let column: String = row.get(0);
         let new_type: String = row.get(4);
-        if live.get(&column).is_none_or(|now| now.display != new_type) {
+        let new_type_oid = row.get::<_, i64>(5) as u32;
+        if live
+            .get(&column)
+            .is_none_or(|now| now.type_oid != new_type_oid)
+        {
             continue;
         }
         causes.insert(
@@ -1157,214 +1153,8 @@ struct Checked {
     columns: Vec<String>,
     reasons: Vec<String>,
     refused: bool,
+    /// Empty when the comparison of its copies was skipped (#858).
     states: Vec<copies::CopyState>,
-    /// When the comparison of its copies was skipped (#858): the tables
-    /// holding a column the last comparison found, none of them drifted.
-    /// `states` is empty then.
-    skipped: Vec<String>,
-}
-
-/// Re-types each table Trellis created whose every widened column, across
-/// all of `checked`, widened by changing only the catalog
-/// ([`copies::CopyState::catalog_only`]): `numeric(p,s)` to more precision
-/// at the same scale (#824). A table where some column also
-/// outgrew its type by a widening that rewrites (`integer` to `bigint`) is
-/// left to the pause and its resume, which re-type all of it. A drifted
-/// column that wasn't widened (a narrowing, another type family) is left
-/// as it is, as the pause leaves it, and doesn't stop the table's re-type.
-///
-/// One table per transaction, under the resume's own lock timeout
-/// (`staging::quarantine::RETYPE_LOCK_TIMEOUT`). The `ALTER` is the
-/// transaction's first statement, so it waits for the table's `ACCESS
-/// EXCLUSIVE` while holding no lock of its own, and once it has it, takes
-/// only the locks of that table's own indexes and TOAST table, which nothing
-/// takes without the table's lock first. So it can't close a cycle with a
-/// drain page, a build or a release, whatever order they take their locks
-/// in: at worst a page queued behind it waits out the timeout.
-///
-/// - A table it re-types asks, in the same transaction, for the release of
-///   each owning definition's keys held for a value its old types couldn't
-///   hold (`retype_releases`, released by
-///   `staging::quarantine::release_retyped_keys` after the pass): `22003`.
-///   A definition owns the table
-///   when it has any column there, so every reader of a shared projection
-///   does, since a projection write that fails is charged to each.
-/// - A table whose re-type fails transiently
-///   (`staging::quarantine::is_transient_error`: its lock not got within the
-///   timeout, a deadlock, a statement timeout's cancel, a lost connection)
-///   is left as it is, and nothing is paused for it: the next pass tries
-///   again.
-/// - A table whose re-type fails otherwise (a view on the column, say) is
-///   left to the pause when some column there outgrew its type, as a
-///   rewriting widening is. The failure is remembered in this process
-///   ([`FAILED_RETYPES`]), and while the table's drift asks for the same
-///   statement for the same definitions, later passes don't try it again:
-///   it would only take the table's lock, fail and log again every pass.
-///
-/// Returns the tables it re-typed, and those it left waiting for their
-/// lock: no definition pauses for either.
-async fn retype_in_place(
-    client: &mut Client,
-    instance: &str,
-    checked_table: &str,
-    checked: &[Checked],
-) -> Result<InPlace, CaptureError> {
-    // Every widened column by its table, once each: a projection's columns
-    // are every reader's of the relationship.
-    let mut widened: BTreeMap<&str, Vec<&copies::CopyState>> = BTreeMap::new();
-    for state in checked.iter().flat_map(|c| &c.states) {
-        if !state.outgrown() {
-            continue;
-        }
-        let columns = widened.entry(state.copy.table.as_str()).or_default();
-        if !columns.iter().any(|s| s.copy.column == state.copy.column) {
-            columns.push(state);
-        }
-    }
-    let mut in_place = InPlace::default();
-    // Each table's re-type this pass, tried or not.
-    let mut attempted: Vec<(String, FailedRetype)> = Vec::new();
-    for (table, states) in widened {
-        if !states.iter().all(|s| s.catalog_only()) {
-            continue;
-        }
-        let owners: Vec<i64> = checked
-            .iter()
-            .filter(|c| {
-                c.states.iter().any(|s| s.copy.table == table)
-                    || c.skipped.contains(&table.to_string())
-            })
-            .map(|c| c.id)
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        // A numeric overflow is the only failure a catalog-only widening
-        // makes writable that wasn't (#1207: a string column needs none).
-        let sqlstates = vec!["22003".to_string()];
-        let owned: Vec<copies::CopyState> = states.iter().map(|s| (*s).clone()).collect();
-        let Some((sql, labels)) = copies::retype_statements(&owned).into_iter().next() else {
-            continue;
-        };
-        let key = (
-            instance.to_string(),
-            checked_table.to_string(),
-            table.to_string(),
-        );
-        let retype = FailedRetype {
-            owners: owners.clone(),
-            sql: sql.clone(),
-        };
-        let failed_before = with_failed_retypes(|failed| failed.get(&key) == Some(&retype));
-        attempted.push((key.2.clone(), retype.clone()));
-        if failed_before {
-            crate::instance_log::debug!(
-                table = %checked_table,
-                copies = ?labels,
-                "not re-typing Trellis's columns in place: the same re-type failed before"
-            );
-            continue;
-        }
-        let txn = client.transaction().await?;
-        crate::locks::set_local_lock_timeout(&txn, crate::staging::quarantine::RETYPE_LOCK_TIMEOUT)
-            .await?;
-        match txn.batch_execute(&sql).await {
-            Ok(()) => {
-                txn.execute(
-                    "insert into retype_releases (transform_id, sqlstate) \
-                     select id, sqlstate from unnest($1::int8[]) as id \
-                     cross join unnest($2::text[]) as sqlstate \
-                     on conflict (transform_id, sqlstate) do update set requested_at = now()",
-                    &[&owners, &sqlstates],
-                )
-                .await?;
-                txn.commit().await?;
-                crate::instance_log::info!(
-                    table = %checked_table,
-                    copies = ?labels,
-                    "re-typed Trellis's columns in place: the source widened them without a rewrite"
-                );
-                in_place.retyped.insert(table.to_string());
-            }
-            Err(err) if crate::staging::quarantine::is_transient_error(&err) => {
-                drop(txn);
-                crate::instance_log::info!(
-                    table = %checked_table,
-                    copies = ?labels,
-                    error = %err.as_db_error().map(ToString::to_string).unwrap_or_else(|| err.to_string()),
-                    "re-typing Trellis's columns in place failed transiently; retrying next pass"
-                );
-                in_place.waiting.insert(table.to_string());
-            }
-            Err(err) => {
-                txn.rollback().await?;
-                crate::instance_log::warn!(
-                    table = %checked_table,
-                    copies = ?labels,
-                    error = %err.as_db_error().map(ToString::to_string).unwrap_or_else(|| err.to_string()),
-                    "couldn't re-type Trellis's columns in place; pausing their definitions instead"
-                );
-                with_failed_retypes(|failed| failed.insert(key, retype));
-            }
-        }
-    }
-    // A failure is forgotten once its table's drift no longer asks for the
-    // statement that failed, for the same definitions: the drift went or
-    // changed, or a definition joined or left the table.
-    with_failed_retypes(|failed| {
-        failed.retain(|(i, checked, table), retype| {
-            i != instance
-                || checked != checked_table
-                || attempted.iter().any(|(t, r)| t == table && r == retype)
-        })
-    });
-    Ok(in_place)
-}
-
-/// The in-place re-types ([`retype_in_place`]) that failed for good, by
-/// capture instance (`capture::reconcile`'s key for a database and schema),
-/// the table checked and the table Trellis created. Kept in this process
-/// only, so a restarted worker tries each once more.
-type FailedRetypes = BTreeMap<(String, String, String), FailedRetype>;
-
-/// One in-place re-type that failed: the definitions that owned the table
-/// then, and the statement. A definition defined again under the same
-/// target has a new id, so it tries the re-type afresh instead of inheriting
-/// a failure whose cause (a view since dropped) may be gone.
-#[derive(Clone, PartialEq, Eq)]
-struct FailedRetype {
-    owners: Vec<i64>,
-    sql: String,
-}
-
-static FAILED_RETYPES: std::sync::Mutex<FailedRetypes> = std::sync::Mutex::new(BTreeMap::new());
-
-fn with_failed_retypes<T>(f: impl FnOnce(&mut FailedRetypes) -> T) -> T {
-    let mut guard = FAILED_RETYPES
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    f(&mut guard)
-}
-
-/// Forgets every in-place re-type that failed for `instance`: its staging
-/// worker in this process stopped, so a worker that takes over tries each
-/// once more.
-pub(crate) fn forget_failed_retypes(instance: &str) {
-    with_failed_retypes(|failed| failed.retain(|(i, _, _), _| i != instance));
-}
-
-/// The tables [`retype_in_place`] re-typed, and those it left to retry next
-/// pass after a transient failure.
-#[derive(Default)]
-struct InPlace {
-    retyped: BTreeSet<String>,
-    waiting: BTreeSet<String>,
-}
-
-impl InPlace {
-    /// Whether `table`'s drift is the in-place re-type's, not a pause's.
-    fn handles(&self, table: &str) -> bool {
-        self.retyped.contains(table) || self.waiting.contains(table)
-    }
 }
 
 /// Every source column `states` are typed from, once each, as
@@ -1605,6 +1395,7 @@ mod tests {
                 typmod: -1,
             },
             display: display.to_string(),
+            sql: display.to_string(),
             collatable: false,
         }
     }
@@ -1628,6 +1419,7 @@ mod tests {
             },
             copy_type: ty("integer"),
             live_type: ty("bigint"),
+            source_typmod: -1,
             collation: None,
         }
     }

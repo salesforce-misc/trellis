@@ -34,18 +34,17 @@
 //! The same pass also pauses on a relationship whose two join columns no
 //! longer have the same type, modifier and collation (#590, through
 //! `catalog::validate_join_pair`), and on a widening of a column Trellis
-//! keeps a typed copy of ([`super::copies`], [`widens`]). A widening that
-//! changes only the catalog ([`catalog_only`]) re-types the copy in place
-//! instead.
+//! keeps a typed copy of ([`super::copies`], [`widens`]). Only an integer or
+//! float width change is one: a copy has no type modifier (ADR-0020), so a
+//! catalog-only widening of a modifier needs no re-type.
 //!
-//! Routine changes that need neither: widening an integer or string key
-//! that no copy holds (an aggregate's source key, a to-many join's to-side),
-//! a `numeric` precision change or wider scale on a `GROUP BY` key (its copy
-//! is unconstrained `numeric`), a wider temporal precision on a `GROUP BY`
-//! key (its copy is the type's full precision), a string column's bound or
-//! `varchar` to `text` (its copies are unbounded, #1207), and a
-//! change between deterministic collations. None of them changes an existing
-//! value's identity, and every copy still holds every value.
+//! Routine changes that need neither: widening an integer key that no copy
+//! holds (an aggregate's source key, a to-many join's to-side), a wider
+//! modifier of any kind (a `numeric` precision or scale, a temporal or
+//! `interval` precision, a `bit varying` length, a string bound, `varchar`
+//! to `text`: every copy has no modifier, ADR-0020), and a change between
+//! deterministic collations. None of them changes an existing value's
+//! identity, and every copy still holds every value.
 //!
 //! A resume re-records these types ([`record_definition`]), after it has
 //! re-validated the definition and brought its copies to their live types.
@@ -303,21 +302,21 @@ pub(crate) fn renders_differently(old: &ColumnType, new: &ColumnType) -> bool {
 }
 
 /// Whether a typed copy of type `copy` can't hold every value of its source
-/// column's live type `live`, because `live` is a widening of it (#767):
+/// column's live type `live`, because `live` is a wider *type* than it
+/// (#767, #824):
 ///
 /// - a wider integer (`smallint` → `integer` → `bigint`), or `real` →
 ///   `double precision`;
 /// - an integer to a `numeric` with fractional digits, or with more integer
 ///   digits than the integer holds, or with no limit at all
-///   ([`integer_outgrown_by_numeric`]): `bigint` → `numeric`;
-/// - a `numeric` with room for more integer or fractional digits, or none
-///   at all ([`numeric_widens`]);
-/// - a wider temporal, `interval` or `bit varying` precision or length.
+///   ([`integer_outgrown_by_numeric`]): `bigint` → `numeric`.
 ///
-/// Anything else is not a widening: equal types, a narrowing (every value
-/// still fits the copy), a string column of any bound (Trellis's copy of one
-/// is an unbounded `varchar`, which holds every value, #1207), or another
-/// type altogether (a re-rendering, [`renders_differently`]'s, for a key).
+/// `live` carries the source column's own modifier; `copy` has none, because
+/// a copy is declared with no modifier (ADR-0020). So no change of a
+/// modifier is a widening here: `numeric(10,2)` to `numeric(12,2)`, a
+/// temporal or `interval` precision, a `bit varying` length, a string bound.
+/// A copy of any of them holds every value of every modifier. These integer
+/// and float widths are the only types with no unmodified form to copy as.
 pub(crate) fn widens(copy: &ColumnType, live: &ColumnType) -> bool {
     if copy == live {
         return false;
@@ -337,59 +336,7 @@ pub(crate) fn widens(copy: &ColumnType, live: &ColumnType) -> bool {
     {
         return integer_outgrown_by_numeric(width, live.typmod);
     }
-    if copy.type_name != live.type_name || !copy.builtin() {
-        return false;
-    }
-    match copy.base() {
-        "numeric" => numeric_widens(copy.typmod, live.typmod),
-        "varbit" => live.typmod < 0 || (copy.typmod >= 0 && live.typmod > copy.typmod),
-        "time" | "timetz" | "timestamp" | "timestamptz" => live.precision() > copy.precision(),
-        "interval" => interval_widens(copy.typmod, live.typmod),
-        _ => false,
-    }
-}
-
-/// Whether a column of type `copy` can be re-typed to `live` by changing
-/// only the catalog: Postgres neither rewrites the table nor changes a value
-/// it holds, and each index on the column is kept. Exactly one widening
-/// (#824): `numeric(p,s)` to `numeric(q,s)` with `q > p`, the same scale.
-///
-/// A string column needs none (#1207): Trellis's copy of a `varchar(n)` is
-/// an unbounded `varchar`, so no change of the source's bound re-types it.
-/// Nothing else, though `pg_cast` calls more casts binary-coercible:
-/// `text` to `varchar(n)` is one, and it narrows. A `character(n)` length
-/// change isn't one either, since its values are blank-padded to the
-/// length.
-pub(crate) fn catalog_only(copy: &ColumnType, live: &ColumnType) -> bool {
-    if copy == live || !copy.builtin() || !live.builtin() {
-        return false;
-    }
-    match (copy.base(), live.base()) {
-        ("numeric", "numeric") => {
-            match (numeric_modifier(copy.typmod), numeric_modifier(live.typmod)) {
-                (Some((p, s)), Some((q, t))) => t == s && q > p,
-                _ => false,
-            }
-        }
-        _ => false,
-    }
-}
-
-/// Whether `ALTER TRANSFORM` can re-type a column of type `copy` to `live`
-/// without rewriting its table: a [`catalog_only`] widening, or a
-/// constrained `numeric` to an unconstrained one (Postgres keeps every
-/// value as it is). The second isn't one of the [`catalog_only`] widenings
-/// the capture pass applies to a copy on its own: a group-basis `SUM` or
-/// `AVG` reading the column would then be over a type define refuses (#1096
-/// decision 2).
-pub(crate) fn alter_retypable(copy: &ColumnType, live: &ColumnType) -> bool {
-    catalog_only(copy, live)
-        || (copy.builtin()
-            && live.builtin()
-            && copy.base() == "numeric"
-            && live.base() == "numeric"
-            && copy.typmod >= 4
-            && live.typmod < 0)
+    false
 }
 
 /// Whether a column retyped from `old` to `new` kept every value's text: a
@@ -400,9 +347,10 @@ pub(crate) fn alter_retypable(copy: &ColumnType, live: &ColumnType) -> bool {
 /// - a string bound that doesn't narrow: `varchar(n)` to `varchar(m>n)`, an
 ///   unbounded `varchar` or `text`, and `varchar` to `text` or back;
 /// - `numeric(p,s)` to `numeric(q,s)` with `q > p`: more precision at the
-///   same scale;
+///   same scale, or to an unconstrained `numeric`;
 /// - a wider fractional-second precision of the same temporal type, or a
-///   longer `bit varying`.
+///   longer `bit varying`;
+/// - an `interval` with a wider field range and precision.
 ///
 /// Anything else changes the text of some value (`real` to `double
 /// precision`, a `numeric` scale change, which re-renders `1.50` as
@@ -423,26 +371,14 @@ pub(crate) fn pure_widening(old: &ColumnType, new: &ColumnType) -> bool {
     match old.base() {
         "numeric" => match (numeric_modifier(old.typmod), numeric_modifier(new.typmod)) {
             (Some((p, s)), Some((q, t))) => t == s && q > p,
+            // Constrained to unconstrained: every value keeps its digits.
+            (Some(_), None) => true,
             _ => false,
         },
         "varbit" => new.typmod < 0 || (old.typmod >= 0 && new.typmod > old.typmod),
         "time" | "timetz" | "timestamp" | "timestamptz" => new.precision() >= old.precision(),
+        "interval" => !interval_narrows(old.typmod, new.typmod),
         _ => false,
-    }
-}
-
-/// Whether a `numeric(p,s)` copy of type `copy` renders a value of its
-/// source column's live type `live` with another number of fractional
-/// digits: a scale change pads (`1.5` stored as `1.50`) or rounds. Only a
-/// copy with a scale can; any other type holds a value of a narrower or
-/// equal live type with its text (#703 R1).
-pub(crate) fn rescales(copy: &ColumnType, live: &ColumnType) -> bool {
-    if !(copy.builtin() && live.builtin() && copy.base() == "numeric" && live.base() == "numeric") {
-        return false;
-    }
-    match numeric_modifier(copy.typmod) {
-        Some((_, s)) => numeric_modifier(live.typmod).map(|(_, t)| t) != Some(s),
-        None => false,
     }
 }
 
@@ -485,41 +421,53 @@ fn integer_outgrown_by_numeric(width: u8, live: i32) -> bool {
     }
 }
 
-/// Whether a `numeric` of modifier `live` holds a value a copy of modifier
-/// `copy` can't: it is unconstrained and the copy isn't, or it has more
-/// fractional digits, or more integer digits (`p - s`).
-fn numeric_widens(copy: i32, live: i32) -> bool {
-    match (numeric_modifier(copy), numeric_modifier(live)) {
-        (_, None) => copy >= 4,
-        (None, Some(_)) => false,
-        (Some((p, s)), Some((lp, ls))) => ls > s || lp - ls > p - s,
-    }
+/// Whether a pure widening ([`pure_widening`]) takes away the declared scale
+/// of a `numeric` (`numeric(10,2)` to `numeric`). No value changes, but a
+/// reader that needs a declared scale (a `SUM`, #1096 decision 2) may no
+/// longer be valid.
+pub(crate) fn loses_declared_scale(old: &ColumnType, new: &ColumnType) -> bool {
+    old.builtin()
+        && new.builtin()
+        && old.base() == "numeric"
+        && new.base() == "numeric"
+        && numeric_modifier(old.typmod).is_some()
+        && numeric_modifier(new.typmod).is_none()
 }
 
-/// Whether an `interval` of modifier `live` holds a value a copy of
-/// modifier `copy` can't: its field range covers fields the copy's doesn't,
-/// or its fractional-second precision is wider. A modifier is
-/// `(range << 16) | precision`, the precision `0xffff` for the full one;
-/// `-1` is the full range at full precision.
-fn interval_widens(copy: i32, live: i32) -> bool {
+/// Whether an `interval` of modifier `new` rounds a value stored under
+/// modifier `old` finer than `new` keeps it: its finest field is coarser, or
+/// its fractional-second precision is smaller. Only the finest field of a
+/// modifier rounds a value; the coarser fields are kept as they are. A
+/// modifier is `(range << 16) | precision`, the range a bit mask of fields
+/// (`YEAR` 2, `MONTH` 1, `DAY` 3, `HOUR` 10, `MINUTE` 11, `SECOND` 12, as
+/// bit positions), the precision `0xffff` for the full one; `-1` is the full
+/// range at full precision.
+fn interval_narrows(old: i32, new: i32) -> bool {
     const FULL_PRECISION: i32 = 0xffff;
-    let split = |typmod: i32| {
+    // Fields from the coarsest to the finest, by bit position.
+    const FIELDS: [i32; 6] = [2, 1, 3, 10, 11, 12];
+    let finest = |typmod: i32| -> (usize, i32) {
         if typmod < 0 {
-            (0x7fff, 6)
-        } else {
-            let precision = typmod & 0xffff;
-            (
-                (typmod >> 16) & 0x7fff,
-                if precision == FULL_PRECISION {
-                    6
-                } else {
-                    precision
-                },
-            )
+            return (FIELDS.len() - 1, 6);
         }
+        let range = (typmod >> 16) & 0x7fff;
+        let rank = FIELDS
+            .iter()
+            .rposition(|bit| range & (1 << bit) != 0)
+            .unwrap_or(FIELDS.len() - 1);
+        let precision = typmod & 0xffff;
+        (
+            rank,
+            if rank != FIELDS.len() - 1 {
+                0
+            } else if precision == FULL_PRECISION {
+                6
+            } else {
+                precision
+            },
+        )
     };
-    let ((copy_range, copy_precision), (live_range, live_precision)) = (split(copy), split(live));
-    live_range & !copy_range != 0 || live_precision > copy_precision
+    finest(new) < finest(old)
 }
 
 /// A live column's type, as [`refusal`] and [`renders_differently`] need it.
@@ -893,9 +841,16 @@ mod tests {
             (varchar(50), ty("varchar", -1)),
             (ty("text", -1), ty("varchar", -1)),
             (numeric(10, 2), numeric(12, 2)),
+            (numeric(10, 2), ty("numeric", -1)),
             (ty("timestamp", 3), ty("timestamp", 6)),
             (ty("timestamp", 6), ty("timestamp", -1)),
             (ty("varbit", 8), ty("varbit", -1)),
+            (interval(0x1000, 3), interval(0x1000, 6)),
+            (interval(0x0008, 0xffff), ty("interval", -1)),
+            (interval(0x0008, 0xffff), interval(0x000c, 0xffff)),
+            // `interval hour` to `interval minute`.
+            (interval(0x0400, 0xffff), interval(0x0800, 0xffff)),
+            (ty("interval", -1), ty("interval", -1)),
         ] {
             assert!(pure_widening(&old, &new), "{old:?} -> {new:?}");
         }
@@ -905,29 +860,21 @@ mod tests {
             (ty("text", -1), varchar(255)),
             (numeric(10, 2), numeric(10, 4)),
             (numeric(10, 2), numeric(10, 1)),
-            (numeric(10, 2), ty("numeric", -1)),
             (numeric(12, 2), numeric(10, 2)),
             (ty("timestamp", 6), ty("timestamp", 3)),
             (ty("float4", -1), ty("float8", -1)),
             (ty("int4", -1), ty("float8", -1)),
             (ty("int4", -1), ty("numeric", -1)),
             (ty("int4", -1), ty("text", -1)),
+            (ty("numeric", -1), numeric(10, 2)),
+            (ty("interval", -1), interval(0x0008, 0xffff)),
+            (ty("interval", -1), interval(0x1000, 3)),
+            (interval(0x1000, 6), interval(0x1000, 3)),
             (ty("bpchar", 9), ty("bpchar", 12)),
             (ty("public.int4", -1), ty("pg_catalog.int8", -1)),
         ] {
             assert!(!pure_widening(&old, &new), "{old:?} -> {new:?}");
         }
-    }
-
-    #[test]
-    fn only_a_numeric_copy_with_another_scale_rescales() {
-        assert!(rescales(&numeric(10, 2), &numeric(10, 1)));
-        assert!(rescales(&numeric(12, 2), &numeric(10, 4)));
-        assert!(rescales(&numeric(10, 2), &ty("numeric", -1)));
-        assert!(!rescales(&numeric(12, 2), &numeric(10, 2)));
-        assert!(!rescales(&ty("numeric", -1), &numeric(10, 1)));
-        assert!(!rescales(&varchar(50), &varchar(10)));
-        assert!(!rescales(&ty("bpchar", 9), &ty("bpchar", 12)));
     }
 
     /// `interval`'s `atttypmod` for a field range and a precision.
@@ -949,20 +896,6 @@ mod tests {
             (ty("int4", -1), numeric(5, 2)),
             (ty("int2", -1), numeric(5, 0)),
             (ty("int2", -1), numeric(2, -3)),
-            (numeric(10, 2), numeric(12, 2)),
-            (numeric(10, 2), numeric(10, 3)),
-            (numeric(10, 2), ty("numeric", -1)),
-            (ty("timestamp", 3), ty("timestamp", 6)),
-            (ty("timestamp", 3), ty("timestamp", -1)),
-            (ty("timestamptz", 0), ty("timestamptz", 3)),
-            (ty("time", 2), ty("time", -1)),
-            (ty("timetz", 0), ty("timetz", 6)),
-            (ty("varbit", 8), ty("varbit", 16)),
-            (ty("varbit", 8), ty("varbit", -1)),
-            // `interval second(3)` -> `interval second(6)`, and `interval
-            // day` -> `interval`.
-            (interval(0x1000, 3), interval(0x1000, 6)),
-            (interval(0x0008, 0xffff), ty("interval", -1)),
         ] {
             assert!(widens(&copy, &live), "{copy:?} -> {live:?}");
         }
@@ -979,8 +912,17 @@ mod tests {
             (ty("varchar", -1), varchar(50)),
             (ty("varchar", -1), ty("text", -1)),
             (ty("text", -1), ty("varchar", -1)),
-            (numeric(12, 2), numeric(10, 2)),
+            // A copy has no modifier, so no modifier change is a widening
+            // (ADR-0020).
+            (ty("numeric", -1), numeric(12, 2)),
             (ty("numeric", -1), numeric(10, 2)),
+            (ty("timestamp", -1), ty("timestamp", 3)),
+            (ty("timestamptz", -1), ty("timestamptz", 3)),
+            (ty("time", -1), ty("time", 2)),
+            (ty("timetz", -1), ty("timetz", 6)),
+            (ty("varbit", -1), ty("varbit", 16)),
+            (ty("interval", -1), interval(0x1000, 6)),
+            (ty("interval", -1), interval(0x0008, 0xffff)),
             (ty("timestamp", 6), ty("timestamp", 3)),
             (ty("timestamp", 6), ty("timestamp", -1)),
             (ty("timestamp", -1), ty("timestamptz", -1)),
@@ -1073,72 +1015,5 @@ mod tests {
                 rel: "author".to_string()
             }
         )));
-    }
-    /// The catalog-only widenings #824 names, and none of their
-    /// neighbours: each of those either rewrites the table or changes a
-    /// value, or narrows. A string column has none (#1207).
-    #[test]
-    fn only_the_named_widenings_are_catalog_only() {
-        for (copy, live) in [
-            (numeric(10, 2), numeric(12, 2)),
-            (numeric(5, 0), numeric(18, 0)),
-        ] {
-            assert!(catalog_only(&copy, &live), "{copy:?} -> {live:?}");
-        }
-        for (copy, live) in [
-            (varchar(10), varchar(10)),
-            (varchar(40), varchar(10)),
-            // A string column's copy is unbounded: nothing to re-type.
-            (varchar(10), varchar(40)),
-            (varchar(10), ty("text", -1)),
-            (ty("varchar", -1), ty("text", -1)),
-            (varchar(10), ty("varchar", -1)),
-            // Binary-coercible in `pg_cast`, but it narrows.
-            (ty("text", -1), varchar(10)),
-            (ty("text", -1), ty("varchar", -1)),
-            (ty("varchar", -1), varchar(10)),
-            // Blank-padded: a length change changes the values.
-            (ty("bpchar", 5), ty("bpchar", 9)),
-            (ty("bpchar", 5), ty("text", -1)),
-            (varchar(10), ty("bpchar", 14)),
-            // A scale change, an unbounded `numeric`, a narrower precision.
-            (numeric(10, 2), numeric(12, 3)),
-            (numeric(10, 2), numeric(10, 3)),
-            (numeric(10, 2), ty("numeric", -1)),
-            (numeric(12, 2), numeric(10, 2)),
-            (ty("numeric", -1), numeric(12, 2)),
-            // Rewrites.
-            (ty("int4", -1), ty("int8", -1)),
-            (ty("float4", -1), ty("float8", -1)),
-            (ty("int4", -1), ty("numeric", -1)),
-            // Outside the named set, though Postgres changes only the
-            // catalog for them too.
-            (ty("timestamp", 3), ty("timestamp", 6)),
-            (ty("varbit", 8), ty("varbit", 16)),
-            // Not builtin.
-            (ty("public.varchar", 14), ty("public.varchar", 44)),
-        ] {
-            assert!(!catalog_only(&copy, &live), "{copy:?} -> {live:?}");
-        }
-    }
-
-    /// `ALTER TRANSFORM` re-types a catalog-only widening, and a constrained
-    /// `numeric` to an unconstrained one; a narrowing it refuses.
-    #[test]
-    fn alter_retypes_catalog_only_widenings_and_the_unconstrained_numeric() {
-        for (copy, live) in [
-            (numeric(10, 2), numeric(12, 2)),
-            (numeric(10, 2), ty("numeric", -1)),
-        ] {
-            assert!(alter_retypable(&copy, &live), "{copy:?} -> {live:?}");
-        }
-        for (copy, live) in [
-            (ty("numeric", -1), numeric(10, 2)),
-            (numeric(12, 2), numeric(10, 2)),
-            (ty("text", -1), varchar(8)),
-            (ty("int4", -1), ty("int8", -1)),
-        ] {
-            assert!(!alter_retypable(&copy, &live), "{copy:?} -> {live:?}");
-        }
     }
 }

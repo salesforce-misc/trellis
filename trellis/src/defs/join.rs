@@ -293,16 +293,14 @@ impl HiddenTable {
     }
 }
 
-/// The `create table` column type of `info`: its exact type, and its
-/// collation when that isn't the database default, so a key compares in the
-/// hidden table exactly as it does in its source.
+/// The `create table` column type of `info`: its type with no modifier,
+/// schema-qualified, and its collation when that isn't the database default,
+/// so a key compares in the hidden table exactly as it does in its source
+/// ([`super::copy_type`]).
 fn column_type(info: &JoinColumnInfo) -> String {
-    let pg_type = super::ddl::copy_pg_type(&info.pg_type);
-    match info.collation.as_deref() {
-        Some(collation) if collation != "default" => {
-            format!("{pg_type} collate {}", quote_ident(collation))
-        }
-        _ => pg_type.into_owned(),
+    match info.copy_collation.as_deref() {
+        Some(collation) => format!("{} collate {collation}", info.copy_type),
+        None => info.copy_type.clone(),
     }
 }
 
@@ -543,6 +541,9 @@ mod tests {
             collation: None,
             collation_deterministic: true,
             is_enum: false,
+            copy_type: pg_type.split('(').next().unwrap_or(pg_type).to_string(),
+            copy_collation: None,
+            trellis_target: false,
         }
     }
 

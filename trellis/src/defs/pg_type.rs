@@ -279,6 +279,10 @@ impl PgType {
                     crate::pool::quote_ident(typname)
                 ))
             }
+            // Unquoted, `bit` is `bit(1)`, which holds one bit and fails (or
+            // truncates a cast to) every wider value. The quoted name is the
+            // type with no length ([`super::copy_type::UNLIMITED_BIT`]).
+            PgType::Bit => std::borrow::Cow::Borrowed(super::copy_type::UNLIMITED_BIT),
             other => std::borrow::Cow::Borrowed(other.name()),
         }
     }
@@ -619,6 +623,7 @@ mod tests {
                 // `CREATE TYPE`, not by this crate. See `PgType::sql_type_name`'s
                 // own doc comment.
                 PgType::Enum(_) => assert_eq!(sql, "\"public\".\"demo_enum\""),
+                PgType::Bit => assert_eq!(sql, "\"bit\""),
                 _ => assert_eq!(
                     sql,
                     pg_type.name(),

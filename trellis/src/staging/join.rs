@@ -1242,18 +1242,20 @@ pub(crate) async fn hidden_table_columns(
     let names: Vec<String> = HiddenTable::ALL.iter().map(|t| t.name(id)).collect();
     Ok(client
         .query(
-            "select c.relname::text, \
-                    string_agg(pg_catalog.format('%I %s %s', a.attname, \
-                                   pg_catalog.format_type(a.atttypid, a.atttypmod), \
-                                   coalesce(co.collname::text, '')), \
-                               ',' order by a.attnum) \
-             from pg_catalog.pg_class c \
-             join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
-             join pg_catalog.pg_attribute a on a.attrelid = c.oid \
-             left join pg_catalog.pg_collation co on co.oid = a.attcollation \
-             where n.nspname = $1 and c.relname = any($2) \
-               and a.attnum > 0 and not a.attisdropped \
-             group by c.relname",
+            &format!(
+                "select c.relname::text, \
+                        string_agg(pg_catalog.format('%I %s %s', a.attname, {}, \
+                                       coalesce({}, '')), \
+                                   ',' order by a.attnum) \
+                 from pg_catalog.pg_class c \
+                 join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
+                 join pg_catalog.pg_attribute a on a.attrelid = c.oid \
+                 where n.nspname = $1 and c.relname = any($2) \
+                   and a.attnum > 0 and not a.attisdropped \
+                 group by c.relname",
+                crate::defs::copy_type::type_sql("a.atttypid"),
+                crate::defs::copy_type::collation_sql("a.attcollation")
+            ),
             &[&catalog_schema, &names],
         )
         .await?
@@ -1270,9 +1272,12 @@ pub(crate) async fn target_column_types(
 ) -> Result<HashMap<String, String>, tokio_postgres::Error> {
     Ok(client
         .query(
-            "select attname::text, pg_catalog.format_type(atttypid, atttypmod) \
-             from pg_catalog.pg_attribute \
-             where attrelid = pg_catalog.to_regclass($1) and attnum > 0 and not attisdropped",
+            &format!(
+                "select attname::text, {} \
+                 from pg_catalog.pg_attribute \
+                 where attrelid = pg_catalog.to_regclass($1) and attnum > 0 and not attisdropped",
+                crate::defs::copy_type::type_sql("atttypid")
+            ),
             &[&crate::defs::ddl::regclass_arg(target)],
         )
         .await?

@@ -838,6 +838,10 @@ fn rederive_statement(
             .map(|(name, sql)| format!("{sql} as {}", q(name))),
     );
     let insert_cols: Vec<String> = pk_idents.iter().chain(&field_idents).cloned().collect();
+    // A rebuild writes a row whose text differs: a `numeric` rewritten with
+    // another scale (`1.25` to `1.2500`) is equal as a number and not as the
+    // value the source shows, and a copy has no modifier to normalize it
+    // (ADR-0020).
     // Every column can be paused at once; a new key still gets its bare row.
     let on_conflict = if field_idents.is_empty() {
         "do nothing".to_string()
@@ -852,7 +856,7 @@ fn rederive_statement(
             .map(|f| format!("excluded.{f}"))
             .collect();
         format!(
-            "do update set {} where ({}) is distinct from ({})",
+            "do update set {} where ({})::text is distinct from ({})::text",
             sets.join(", "),
             old.join(", "),
             new.join(", ")
@@ -993,7 +997,7 @@ fn field_statement(
              update {target} t set {sets} \
              from src r \
              where {join} and {target_where} \
-               and ({old}) is distinct from ({new}) \
+               and ({old})::text is distinct from ({new})::text \
              returning {k_tgt} as __k \
          ) \
          select 0::bigint, (select count(*) from upd), 0::bigint{seam}",

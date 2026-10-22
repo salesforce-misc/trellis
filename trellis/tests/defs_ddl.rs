@@ -632,7 +632,7 @@ async fn numeric_family_passthrough_keeps_its_own_concrete_type() {
         columns,
         vec![
             ("id".to_string(), "integer".to_string()),
-            ("price".to_string(), "numeric(10,2)".to_string()),
+            ("price".to_string(), "numeric".to_string()),
             ("ratio".to_string(), "real".to_string()),
             ("amount".to_string(), "double precision".to_string()),
         ]

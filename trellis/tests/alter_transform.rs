@@ -268,8 +268,8 @@ async fn an_added_passthrough_column_has_the_type_define_gives_it() {
     wait_for_live(&raw, "edited").await;
 
     let expected = [
-        ("price", "numeric(10,2)"),
-        // A copy of a `varchar(n)` column is unbounded (#1207).
+        // A copy has no type modifier (ADR-0020).
+        ("price", "numeric"),
         ("who", "character varying"),
         ("qty", "integer"),
         ("note2", "text"),
@@ -285,7 +285,7 @@ async fn an_added_passthrough_column_has_the_type_define_gives_it() {
     }
 
     // The comparison's own terms: each passthrough's type oid and typmod are
-    // its source column's (a `varchar(n)`'s without the bound, #1207).
+    // its source column's, with no modifier (ADR-0020).
     let drifted: Vec<String> = raw
         .query(
             &format!(
@@ -295,8 +295,7 @@ async fn an_added_passthrough_column_has_the_type_define_gives_it() {
                       when 'note2' then 'note' when 'ts2' then 'ts' else t.attname::text end \
                  where t.attrelid = '{DEFAULT_TARGET_SCHEMA}.edited'::regclass \
                    and t.attname::text in ('price', 'who', 'qty', 'note2', 'ts2') \
-                   and (t.atttypid, t.atttypmod) is distinct from (s.atttypid, \
-                        case when s.atttypid = 'varchar'::regtype then -1 else s.atttypmod end)"
+                   and (t.atttypid, t.atttypmod) is distinct from (s.atttypid, -1)"
             ),
             &[],
         )
@@ -665,14 +664,13 @@ async fn target_filenode(raw: &Client, table: &str) -> i64 {
     .get(0)
 }
 
-/// Issue #997 rule 3 and 5: altering a bare passthrough of `numeric(10,2)`
-/// into an expression of unconstrained `numeric` re-types the column in
-/// place, in the alter's own transaction, so the field build's values keep
-/// their third decimal and the column is the one a fresh `DEFINE` gives.
-/// Comparing the family without the modifier leaves the column at
-/// `numeric(10,2)` (the mutation this test pins).
+/// Issue #997 rule 3 and 5, as ADR-0020 leaves them: a bare passthrough of
+/// `numeric(10,2)` is an unconstrained `numeric` column, so altering it into
+/// an expression of unconstrained `numeric` re-types nothing. The target is
+/// not rewritten, the field build's values keep their third decimal, and the
+/// column is the one a fresh `DEFINE` gives.
 #[tokio::test]
-async fn altering_a_passthrough_into_a_wider_expression_retypes_the_column_in_place() {
+async fn altering_a_passthrough_into_a_wider_expression_changes_no_column_type() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect_raw(db.dsn()).await;
@@ -680,22 +678,22 @@ async fn altering_a_passthrough_into_a_wider_expression_retypes_the_column_in_pl
         modifier_fixture(&db, &raw, "TRANSFORM t FROM public.posts SELECT price AS p").await;
     assert_eq!(
         column_pg_type(&raw, DEFAULT_TARGET_SCHEMA, "t", "p").await,
-        "numeric(10,2)"
+        "numeric"
     );
     let before = target_filenode(&raw, "t").await;
 
     trellis
         .apply("ALTER TRANSFORM t ALTER p AS price + 0.001")
         .await
-        .expect("a catalog-only widening is accepted");
+        .expect("the column is already unconstrained: nothing to re-type");
     trellis::staging::build::settle_builds(&db.pool).await;
 
     assert_eq!(
         column_pg_type(&raw, DEFAULT_TARGET_SCHEMA, "t", "p").await,
         "numeric"
     );
-    // The re-type changed only the catalog. The field build's re-derive
-    // updates rows, which leaves the file node alone too.
+    // The field build's re-derive updates rows, which leaves the file node
+    // alone.
     assert_eq!(
         target_filenode(&raw, "t").await,
         before,
@@ -794,11 +792,12 @@ async fn altering_a_varchar_passthrough_into_a_text_expression_changes_no_column
     trellis.shutdown().await.expect("shutdown");
 }
 
-/// Issue #997 rule 4: an expression field altered into a bare passthrough of
-/// a narrower type would rewrite the target, so it is refused naming
-/// `DROP`/`ADD`, with the column, the definition and its version untouched.
+/// Issue #997 rule 4: an expression field altered into another value family
+/// (here a `numeric` expression into an `integer` passthrough) would rewrite
+/// the target, so it is refused naming `DROP`/`ADD`, with the column, the
+/// definition and its version untouched.
 #[tokio::test]
-async fn altering_an_expression_into_a_narrower_passthrough_is_refused() {
+async fn altering_an_expression_into_another_family_is_refused() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
@@ -811,13 +810,14 @@ async fn altering_an_expression_into_a_narrower_passthrough_is_refused() {
     let before_version = persisted_definition_version(&raw, "t").await;
 
     let err = trellis
-        .apply("ALTER TRANSFORM t ALTER p AS price")
+        .apply("ALTER TRANSFORM t ALTER p AS id")
         .await
-        .expect_err("numeric to numeric(10,2) narrows");
+        .expect_err("numeric to integer rewrites the target");
     match err {
         TrellisError::Catalog(CatalogError::UnsupportedAlter(detail)) => {
             assert!(
-                detail.contains("numeric(10,2)")
+                detail.contains("numeric")
+                    && detail.contains("integer")
                     && detail.to_uppercase().contains("DROP")
                     && detail.to_uppercase().contains("ADD"),
                 "the refusal names the types and the remedy: {detail}"
@@ -2711,50 +2711,5 @@ async fn altering_a_target_that_is_not_live_is_rejected() {
         other => panic!("expected CatalogError::TransformNotLive, got {other:?}"),
     }
 
-    trellis.shutdown().await.expect("shutdown");
-}
-
-/// Issue #997: Postgres refuses to re-type a column a view reads. The
-/// refusal names the field and the view, and the whole edit rolls back: the
-/// column, the definition's version and its build are as they were.
-#[tokio::test]
-async fn a_retype_a_view_blocks_is_refused_and_rolls_back() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
-    let trellis =
-        modifier_fixture(&db, &raw, "TRANSFORM t FROM public.posts SELECT price AS p").await;
-    raw.batch_execute(&format!(
-        "create view public.v as select p from {DEFAULT_TARGET_SCHEMA}.t"
-    ))
-    .await
-    .expect("create the view");
-    let before_version = persisted_definition_version(&raw, "t").await;
-
-    let err = trellis
-        .apply("ALTER TRANSFORM t ALTER p AS price + 0.001")
-        .await
-        .expect_err("the view blocks the re-type");
-    match err {
-        TrellisError::Catalog(CatalogError::UnsupportedAlter(detail)) => assert!(
-            detail.contains("'p'") && detail.contains("view v"),
-            "the refusal names the field and the view: {detail}"
-        ),
-        other => panic!("expected CatalogError::UnsupportedAlter, got {other:?}"),
-    }
-    assert_eq!(
-        column_pg_type(&raw, DEFAULT_TARGET_SCHEMA, "t", "p").await,
-        "numeric(10,2)"
-    );
-    assert_eq!(
-        persisted_definition_version(&raw, "t").await,
-        before_version
-    );
-    let open_chunks: i64 = raw
-        .query_one("select count(*) from backfill_chunks where not done", &[])
-        .await
-        .expect("read the build")
-        .get(0);
-    assert_eq!(open_chunks, 0, "no field build was registered");
     trellis.shutdown().await.expect("shutdown");
 }

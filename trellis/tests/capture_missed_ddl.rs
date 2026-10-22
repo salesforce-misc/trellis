@@ -385,9 +385,10 @@ async fn maintenance_rebuilds_and_pauses_nothing_part_2() {
     run_cases(part(&maintenance_cases(), 1, 2)).await;
 }
 
-/// Single migrations. A pure widening never rebuilds or pauses here: the
-/// passthrough's copies a widening outgrows are re-typed in place, or pause
-/// `r` by #767's check, as before. A narrowed `varchar` rebuilds both.
+/// Single migrations. A pure widening never rebuilds or pauses here, except
+/// that an integer width a copy is outgrown by pauses `r` by #767's check
+/// (a copy has no modifier, ADR-0020, so a modifier never outgrows one). A
+/// narrowed `varchar` and a `numeric` scale change rebuild.
 fn single_migration_cases() -> Vec<Case> {
     vec![
         (
@@ -441,16 +442,18 @@ fn single_migration_cases() -> Vec<Case> {
             "alter table public.{t} alter column n type numeric(12,2)",
             Expect::Nothing,
         ),
-        // #767: the passthrough's `numeric(10,2)` copy is outgrown.
+        // ADR-0020: the passthrough's copy is an unconstrained `numeric`,
+        // which holds every scale. The rewrite re-renders the stored values
+        // (`1.50` as `1.5000`, or rounded), so the column's readers rebuild.
         (
             "D11",
             "alter table public.{t} alter column n type numeric(10,4)",
-            Expect::PausedR,
+            Expect::Rebuilt("column_changed"),
         ),
         (
             "D12",
             "alter table public.{t} alter column n type numeric(10,1)",
-            Expect::PausedR,
+            Expect::Rebuilt("column_changed"),
         ),
         (
             "D13",
@@ -513,14 +516,13 @@ fn single_migration_cases() -> Vec<Case> {
             "alter table public.{t} alter column g type bigint",
             Expect::PausedS,
         ),
-        // R1: a narrower scale that the passthrough's `numeric(10,2)` copy
-        // still holds, but renders with another number of fractional digits
-        // (`1.5` as `1.50`): the copy must be re-typed, so `r` pauses; `s`
-        // doesn't read `n`.
+        // R1: a narrower scale renders the stored values with another number
+        // of fractional digits (`1.50` as `1.5`): the readers of the column
+        // rebuild; `s` doesn't read `n`.
         (
             "D24",
             "alter table public.{t} alter column n type numeric(9,1)",
-            Expect::PausedR,
+            Expect::Rebuilt("column_changed"),
         ),
     ]
 }

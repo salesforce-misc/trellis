@@ -2318,7 +2318,7 @@ pub async fn alter_transform(
     // issued below: this runs strictly before every DDL loop in this
     // function, drops and adds included, so a refusal here still means
     // *nothing* about this edit has touched the target table yet.
-    let retypes = check_alter_column_types(
+    check_alter_column_types(
         &*txn,
         &AlterTypeContext {
             merged: &merged,
@@ -2370,74 +2370,10 @@ pub async fn alter_transform(
         ))
         .await?;
     }
-    // An altered field whose column only widens in the catalog is re-typed
-    // here, in this transaction under the definition's row lock, before the
-    // field build registered below re-derives its values (issue #997).
-    // Anything that would rewrite the target was refused above, before any
-    // DDL ran. A same-type `ALTER` needs no physical change at all; only its
-    // data is stale, which the field build recomputes, as for an `ADD`.
-    // Postgres refuses the re-type of a column a view or rule reads
-    // (`0A000`); the refusal names the field and the dependent, and the
-    // whole edit rolls back.
-    for retype in &retypes {
-        let column = quote_ident(&retype.column);
-        if let Err(err) = txn
-            .batch_execute(&format!(
-                "alter table {target_ident} alter column {column} type {ty} using {column}::{ty}",
-                ty = retype.pg_type
-            ))
-            .await
-        {
-            let Some(db) = err
-                .as_db_error()
-                .filter(|db| *db.code() == tokio_postgres::error::SqlState::FEATURE_NOT_SUPPORTED)
-            else {
-                return Err(err.into());
-            };
-            return Err(CatalogError::UnsupportedAlter(format!(
-                "ALTER '{field}' on '{target}' re-types its column to '{ty}', which Postgres \
-                 refuses: {message}{detail}. Drop or change that object, then ALTER again",
-                field = retype.column,
-                target = alter.target,
-                ty = retype.pg_type,
-                message = db.message(),
-                detail = db.detail().map(|d| format!(" ({d})")).unwrap_or_default(),
-            )));
-        }
-    }
-
-    // #1188: the re-types above are in this transaction, so define's own
-    // validation of each definition reading a re-typed column sees them. A
-    // reader define would now refuse (a group-basis `SUM` over a column that
-    // is no longer `numeric(p,s)`, say) refuses the whole edit, which rolls
-    // back: nothing changes and nothing pauses.
-    if !retypes.is_empty() {
-        let columns: Vec<String> = retypes.iter().map(|r| r.column.clone()).collect();
-        let refused = refused_readers(&txn, pool.schema(), &alter.target, &columns).await?;
-        if !refused.is_empty() {
-            return Err(CatalogError::UnsupportedAlter(format!(
-                "ALTER on '{target}' re-types {columns}, which {readers} would now refuse; \
-                 change or drop {them} first (Trellis refuses rather than pausing a reader): {detail}",
-                target = alter.target,
-                columns = columns
-                    .iter()
-                    .map(|c| format!("'{c}'"))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                readers = refused
-                    .iter()
-                    .map(|r| format!("'{}'", r.target))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                them = if refused.len() == 1 { "it" } else { "them" },
-                detail = refused
-                    .iter()
-                    .map(|r| format!("'{}': {}", r.target, r.reason))
-                    .collect::<Vec<_>>()
-                    .join("; "),
-            )));
-        }
-    }
+    // An altered field never re-types its column: anything that would
+    // rewrite the target was refused above, before any DDL ran, and a
+    // same-type `ALTER` needs no physical change at all; only its data is
+    // stale, which the field build recomputes, as for an `ADD`.
 
     // Issue #915: an edit that builds fields can pause one at birth that
     // already has readers (see `pause_readers_of_paused_columns` below). The
@@ -3352,32 +3288,19 @@ struct AlterTypeContext<'a> {
     display_target: &'a str,
 }
 
-/// An altered field's column to re-type in place: the column and the type
-/// `DEFINE` would give it, as `format_type` renders it.
-#[derive(Debug)]
-struct ColumnRetype {
-    column: String,
-    pg_type: String,
-}
-
-/// The refusal of a type-changing `ALTER <field> AS <expr>`, and the
-/// columns it re-types: `field`'s column as it is now, modifier included,
-/// against the type `DEFINE` would give the altered field (a bare
-/// passthrough's source column's exact type, anything else its value
+/// The refusal of a type-changing `ALTER <field> AS <expr>`: `field`'s
+/// column as it is now against the type `DEFINE` would give the altered
+/// field (a bare passthrough's source column's type, anything else its value
 /// family's, [`ddl::field_column_pg_types`]'s rule).
 ///
 /// ADR-0015 promises "An edit never rewrites the whole target table to
 /// change one column", so:
 ///
-/// - the same type and modifier needs no change, and neither does a string
-///   column (`text`, `varchar(n)` or `varchar`) altered to another: Trellis's
-///   copies of a string are unbounded (#1207);
-/// - a widening that changes only the catalog ([`super::key_types::alter_retypable`]:
-///   `numeric(10,2)` to `numeric`)
-///   is returned for the caller to apply in the alter's own transaction,
-///   under the definition's row lock, before the field's values are
-///   re-derived;
-/// - anything else (a narrowing, another value family) would rewrite the
+/// - the same type needs no change, and neither does a string column
+///   (`text`, `varchar(n)` or `varchar`) altered to another: Trellis's
+///   copies of a string are unbounded (#1207), and no copy has a modifier
+///   (ADR-0020), so a change of one never changes a column;
+/// - anything else (another width or value family) would rewrite the
 ///   target under an `ACCESS EXCLUSIVE` lock, so it is refused. `DROP` and
 ///   `ADD` of the field pays that backfill cost explicitly.
 ///
@@ -3388,8 +3311,7 @@ async fn check_alter_column_types(
     client: &impl GenericClient,
     ctx: &AlterTypeContext<'_>,
     fields: &[FieldDef],
-) -> Result<Vec<ColumnRetype>, CatalogError> {
-    let mut retypes = Vec::new();
+) -> Result<(), CatalogError> {
     for field in fields {
         let Some(current) =
             target_column_type_via(client, ctx.qualified_target, &field.name).await?
@@ -3400,8 +3322,9 @@ async fn check_alter_column_types(
         };
         let wanted = match ddl::passthrough_source_column(field, ctx.merged, ctx.source_columns) {
             Some(source_column) => {
+                // A copy has the source column's type and no modifier.
                 match target_column_type_via(client, ctx.source_table, source_column).await? {
-                    Some(source) => source,
+                    Some((oid, _)) => (oid, -1),
                     None => continue,
                 }
             }
@@ -3435,18 +3358,11 @@ async fn check_alter_column_types(
         if current.ty.is_string() && wanted.ty.is_string() {
             continue;
         }
-        if super::key_types::alter_retypable(&current.ty, &wanted.ty) {
-            retypes.push(ColumnRetype {
-                column: field.name.clone(),
-                pg_type: wanted.display,
-            });
-            continue;
-        }
         return Err(CatalogError::UnsupportedAlter(format!(
             "ALTER '{field}' on '{display_target}' would change its column type from \
-             '{current}' to '{wanted}'; Trellis re-types a column in place only for a widening \
-             that changes just the catalog (such as numeric(10,2) to numeric), because Postgres would otherwise rewrite '{display_target}''s entire \
-             physical table under an ACCESS EXCLUSIVE lock, blocking reads and writes to every \
+             '{current}' to '{wanted}'; Trellis never re-types a column in an edit, because Postgres \
+             would rewrite '{display_target}''s entire physical table under an ACCESS EXCLUSIVE \
+             lock, blocking reads and writes to every \
              other column too, not just this one. Use DROP '{field}' followed by ADD <expr> AS \
              '{field}' instead — it already pays this same backfill cost explicitly, rather \
              than paying it as a surprise.",
@@ -3456,7 +3372,7 @@ async fn check_alter_column_types(
             wanted = wanted.display,
         )));
     }
-    Ok(retypes)
+    Ok(())
 }
 
 /// The `(atttypid, atttypmod)` of `qualified_table.column`: `None` if the
@@ -5599,23 +5515,37 @@ async fn join_columns_of(
 ) -> Result<HashMap<String, super::validate::JoinColumnInfo>, CatalogError> {
     let rows = client
         .query(
-            "select a.attname::text,
+            &format!(
+                "select a.attname::text,
                     pg_catalog.format_type(a.atttypid, a.atttypmod),
                     a.atttypid,
                     a.atttypmod,
                     a.attcollation,
                     co.collname::text,
                     coalesce(co.collisdeterministic, true),
-                    t.typtype = 'e'
+                    t.typtype = 'e',
+                    {},
+                    {}
              from pg_attribute a
              join pg_catalog.pg_type t on t.oid = a.atttypid
              left join pg_catalog.pg_collation co on co.oid = a.attcollation
              where a.attrelid = pg_catalog.to_regclass($1)
                and a.attnum > 0
                and not a.attisdropped",
+                super::copy_type::type_sql("a.atttypid"),
+                super::copy_type::collation_sql("a.attcollation")
+            ),
             &[&ddl::regclass_arg(qualified)],
         )
         .await?;
+    // A column of a table Trellis creates has no type modifier (ADR-0020).
+    let trellis_target: bool = client
+        .query_one(
+            "select exists (select 1 from transform_definitions where target_table = $1)",
+            &[&qualified],
+        )
+        .await?
+        .get(0);
     let mut columns = HashMap::with_capacity(rows.len());
     for row in rows {
         let type_oid: u32 = row.get(2);
@@ -5634,6 +5564,9 @@ async fn join_columns_of(
                 collation: row.get(5),
                 collation_deterministic: row.get(6),
                 is_enum: row.get(7),
+                copy_type: row.get(8),
+                copy_collation: row.get(9),
+                trellis_target,
             },
         );
     }
@@ -5807,7 +5740,7 @@ async fn column_type_in_txn(
 ) -> Result<String, CatalogError> {
     Ok(join_column_in_txn(txn, query_table, display_table, column)
         .await?
-        .pg_type)
+        .copy_type)
 }
 
 /// A relationship join column's type and collation as Postgres reports them
@@ -5820,6 +5753,9 @@ struct JoinColumn {
     /// modifier, as the runtime casts join keys to it
     /// (`staging::apply::key_array_filter`).
     pg_type: String,
+    /// The type a copy of the column is declared and cast as, with no
+    /// modifier ([`super::copy_type::type_sql`]).
+    copy_type: String,
     /// `atttypid`. A domain has its own OID, distinct from its base type's.
     type_oid: u32,
     /// `atttypmod`: `-1` for no modifier, else the encoded length or
@@ -5878,18 +5814,22 @@ async fn column_in_txn(
 ) -> Result<Option<JoinColumn>, CatalogError> {
     let row = txn
         .query_opt(
-            "select pg_catalog.format_type(a.atttypid, a.atttypmod),
+            &format!(
+                "select pg_catalog.format_type(a.atttypid, a.atttypmod),
                     a.atttypid,
                     a.atttypmod,
                     a.attcollation,
                     co.collname::text,
-                    coalesce(co.collisdeterministic, true)
+                    coalesce(co.collisdeterministic, true),
+                    {}
              from pg_attribute a
              left join pg_catalog.pg_collation co on co.oid = a.attcollation
              where a.attrelid = pg_catalog.to_regclass($1)
                and a.attname = $2
                and a.attnum > 0
                and not a.attisdropped",
+                super::copy_type::type_sql("a.atttypid")
+            ),
             &[&ddl::regclass_arg(query_table), &column],
         )
         .await?;
@@ -5900,6 +5840,7 @@ async fn column_in_txn(
         collation_oid: row.get(3),
         collation: row.get(4),
         collation_deterministic: row.get(5),
+        copy_type: row.get(6),
     }))
 }
 
@@ -7142,7 +7083,8 @@ pub(crate) fn supported_join_key_types() -> String {
 /// strings.
 pub(crate) fn is_text_stable_join_key_type(pg_type: &str) -> bool {
     let base = base_type_name(pg_type);
-    TEXT_STABLE_JOIN_KEY_TYPES.contains(&base.as_ref())
+    // A copy renders `bit` as the quoted `"bit"` ([`super::copy_type`]).
+    TEXT_STABLE_JOIN_KEY_TYPES.contains(&base.trim_matches('"'))
 }
 
 /// The dynamic counterpart to [`TEXT_STABLE_JOIN_KEY_TYPES`]/
@@ -7219,7 +7161,7 @@ pub(crate) async fn validate_join_pair(
         assert_joinable_as_is(def, &from, &to)?;
     }
     assert_deterministic_join_collation(def, &from, &to)?;
-    Ok(to.pg_type)
+    Ok(to.copy_type)
 }
 
 /// Rejects `def` if either endpoint's join key type isn't
@@ -7837,7 +7779,7 @@ async fn ensure_relationship_projection_in_txn(
             // unconditionally, not just when `needed_columns` is non-empty)
             // is what actually populates it, using this branch's freshly
             // created, still-empty table as its starting point.
-            let to_col_type = ddl::copy_pg_type(to_col_pg_type);
+            let to_col_type = to_col_pg_type;
             txn.batch_execute(&format!(
                 "create table {qualified_projection} (\
                      {to_col_ident} {to_col_type} primary key, \
@@ -7891,7 +7833,6 @@ async fn ensure_relationship_projection_in_txn(
             continue;
         }
         let pg_type = column_type_in_txn(txn, qualified_to_table, to_table_bare, column).await?;
-        let pg_type = ddl::copy_pg_type(&pg_type);
         let col_ident = quote_ident(column);
         txn.batch_execute(&format!(
             "alter table {qualified_projection} add column if not exists {col_ident} {pg_type}"
@@ -9634,8 +9575,6 @@ pub(crate) async fn column_dependents_any_keyspace(
 #[derive(Debug)]
 pub(crate) struct RefusedReader {
     pub id: i64,
-    /// The reader's bare target name.
-    pub target: String,
     /// What define's validation of it refuses.
     pub reason: CatalogError,
 }
@@ -9652,7 +9591,7 @@ pub(crate) async fn refused_readers(
     columns: &[String],
 ) -> Result<Vec<RefusedReader>, tokio_postgres::Error> {
     let mut refused = Vec::new();
-    for (id, target) in column_readers(txn, upstream, columns).await? {
+    for (id, _) in column_readers(txn, upstream, columns).await? {
         let checked = match definition_by_id_in(txn, id).await {
             Ok(Some(definition)) => revalidate(txn, schema, &definition).await.map(|_| ()),
             Ok(None) => continue,
@@ -9661,7 +9600,7 @@ pub(crate) async fn refused_readers(
         match checked {
             Ok(()) => {}
             Err(CatalogError::Db(err)) => return Err(err),
-            Err(reason) => refused.push(RefusedReader { id, target, reason }),
+            Err(reason) => refused.push(RefusedReader { id, reason }),
         }
     }
     Ok(refused)
@@ -10336,10 +10275,8 @@ mod type_changing_alter_tests {
             "expected UnsupportedAlter, got {err:?}"
         );
         assert!(
-            check(ValueType::Numeric)
-                .await
-                .expect("an unchanged type passes")
-                .is_empty()
+            check(ValueType::Numeric).await.is_ok(),
+            "an unchanged type passes"
         );
     }
 }
@@ -10883,6 +10820,7 @@ mod join_column_tests {
     fn column(pg_type: &str, type_oid: u32, typmod: i32) -> JoinColumn {
         JoinColumn {
             pg_type: pg_type.to_string(),
+            copy_type: pg_type.to_string(),
             type_oid,
             typmod,
             collation_oid: 0,

@@ -196,7 +196,8 @@ async fn to_jsonb_and_text_agree_for_bit_and_varbit() {
 /// the `GROUP BY` key role (below) never applies here.
 #[tokio::test]
 async fn bit_and_varbit_join_keys_and_primary_keys_are_admitted() {
-    for (pg_decl, expected_pk_type) in [("bit(4)", "bit(4)"), ("bit varying", "bit varying")] {
+    // A copy has no modifier, so `bit(4)` is the unlimited `"bit"` (ADR-0020).
+    for (pg_decl, expected_pk_type) in [("bit(4)", "\"bit\""), ("bit varying", "bit varying")] {
         let cluster = TestCluster::start();
         let db = cluster.create_isolated_database().await;
         let client = connect_raw(db.dsn()).await;

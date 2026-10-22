@@ -5121,6 +5121,7 @@ async fn finish_requested_resume(
                     column: s.copy.column.clone(),
                     old_type: s.copy_type.display.clone(),
                     new_type: s.live_type.display.clone(),
+                    new_type_oid: s.live_type.oid,
                 })
                 .collect();
             for (sql, labels) in crate::defs::copies::retype_statements(&states) {
@@ -5254,6 +5255,9 @@ struct RetypedColumn {
     column: String,
     old_type: String,
     new_type: String,
+    /// `new_type`'s OID, which the capture pass compares the column's type
+    /// with.
+    new_type_oid: u32,
 }
 
 /// Records, in the re-type's own transaction, that definition `id`'s resume
@@ -5281,12 +5285,21 @@ async fn record_retype_causes(
     .await?;
     for c in columns {
         txn.execute(
-            "insert into retype_causes (table_name, column_name, transform_id, old_type, new_type) \
-             values ($1, $2, $3, $4, $5) \
+            "insert into retype_causes \
+                 (table_name, column_name, transform_id, old_type, new_type, new_type_oid) \
+             values ($1, $2, $3, $4, $5, $6::int8) \
              on conflict (table_name, column_name) do update \
              set transform_id = excluded.transform_id, old_type = excluded.old_type, \
-                 new_type = excluded.new_type, retyped_at = now()",
-            &[&c.table, &c.column, &id, &c.old_type, &c.new_type],
+                 new_type = excluded.new_type, new_type_oid = excluded.new_type_oid, \
+                 retyped_at = now()",
+            &[
+                &c.table,
+                &c.column,
+                &id,
+                &c.old_type,
+                &c.new_type,
+                &i64::from(c.new_type_oid),
+            ],
         )
         .await?;
     }
