@@ -1,17 +1,19 @@
 //! A type renamed or moved to another schema after define is followed in
-//! place (issue #1204).
+//! place (issues #1204, #1242).
 //!
 //! `ALTER TYPE tone RENAME TO tone2` and `ALTER TYPE tone SET SCHEMA other`
 //! change no value and touch nothing Trellis created, but Trellis casts
-//! staged values by the type's name as it recorded it. The staging worker's
-//! capture pass sees a read column whose type oid is as the baseline
-//! recorded and whose `schema.typname` is not, re-records the name wherever
-//! Trellis persists it, and releases the keys held for the failed cast
-//! (`42704`). Nothing pauses, rebuilds or reinstalls.
+//! staged values by the type's name as it recorded it. Each definition
+//! records the OID of every type it names beside the name (ADR-0020). The
+//! staging worker's capture pass finds a recorded OID whose `schema.typname`
+//! is not the recorded one, re-records the name wherever Trellis persists it,
+//! and releases the keys held for the failed cast (`42704`). Nothing pauses,
+//! rebuilds or reinstalls, whenever the rename happens.
 //!
 //! Every test is stepped by hand: writes, then explicit capture passes and
 //! drains. Nothing polls for convergence (#297).
 
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use testkit::TestCluster;
@@ -427,8 +429,8 @@ async fn a_type_moved_to_another_schema_is_followed_in_place_by_every_reader() {
     .await;
 }
 
-/// A restore leaves the baseline out and the types' oids new, but their
-/// names as they were: the pass records a baseline and re-records nothing.
+/// A pass with no baseline (a restore forgets them) and a column retyped
+/// meanwhile: the pass records a baseline and re-records nothing.
 #[tokio::test]
 async fn an_unchanged_name_is_never_re_recorded() {
     trellis::dev::staging::set_group_basis(true);
@@ -724,4 +726,386 @@ async fn a_paused_reader_resumes_after_a_rename() {
             "resume first: {resume_first}"
         );
     }
+}
+
+/// What each definition recorded for the enum, by OID: `definition_types`
+/// and `definition_key_types`, as `(target, oid, name)` rows.
+async fn recorded_oids(raw: &Client) -> Vec<Vec<Option<String>>> {
+    rows(
+        raw,
+        "select split_part(d.target_table, '.', 2), r.type_oid::text, r.type_name \
+         from transform_definitions d \
+         join (select transform_id, type_oid, type_name from definition_types \
+               union all select transform_id, type_oid, type_name from definition_key_types \
+               where type_name not like 'pg_catalog.%') r on r.transform_id = d.id \
+         order by 1, 2, 3",
+    )
+    .await
+}
+
+async fn type_oid(raw: &Client, name: &str) -> String {
+    raw.query_one(&format!("select '{name}'::regtype::oid::text"), &[])
+        .await
+        .expect("read a type's oid")
+        .get(0)
+}
+
+async fn capture_failures(raw: &Client) -> Vec<Vec<Option<String>>> {
+    rows(
+        raw,
+        "select d.target_table, f.error from capture_failures f \
+         join transform_definitions d on d.id = f.transform_id order by 1",
+    )
+    .await
+}
+
+/// Each target against its oracle, for a 1-1 passthrough `tone_pass` of
+/// `items` and a `GROUP BY tone` count `per_tone`.
+async fn assert_pass_and_counts(raw: &Client) {
+    for target in ["tone_pass", "per_tone"] {
+        assert_eq!(status(raw, target).await, TransformStatus::Live, "{target}");
+    }
+    assert_eq!(held_keys(raw).await, 0, "no key is held");
+    assert_eq!(
+        rows(
+            raw,
+            "select id::text, tone::text from public.tone_pass order by id"
+        )
+        .await,
+        rows(
+            raw,
+            "select id::text, tone::text from public.items order by id"
+        )
+        .await,
+    );
+    assert_eq!(
+        rows(
+            raw,
+            "select tone::text, n::text from public.per_tone where n is not null \
+             order by tone::text"
+        )
+        .await,
+        rows(
+            raw,
+            "select tone::text, count(*)::text from public.items group by tone \
+             order by tone::text"
+        )
+        .await,
+    );
+}
+
+const PASS_AND_COUNTS: [&str; 2] = [
+    "TRANSFORM tone_pass FROM public.items SELECT tone AS tone",
+    "TRANSFORM per_tone FROM public.items GROUP BY tone SELECT tone AS tone, COUNT(*) AS n",
+];
+
+/// #1242 window 1: the type is renamed between define and the pass that
+/// installs the source's capture, so the baseline that pass records already
+/// has the new name. The definitions' own record still has the type's OID
+/// beside the old name: the first pass follows the rename, nothing pauses,
+/// nothing is held, and the targets equal their oracles.
+#[tokio::test]
+async fn a_rename_before_the_first_pass_is_followed() {
+    trellis::dev::staging::set_group_basis(true);
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create type public.tone as enum ('calm', 'loud', 'brisk'); \
+         create table public.items (id int primary key, tone tone, n int); \
+         create index on public.items (tone); \
+         insert into public.items values (1, 'calm', 1), (2, 'loud', 2), (3, 'calm', 3);",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    for text in PASS_AND_COUNTS {
+        trellis.apply(text).await.expect(text);
+    }
+    let oid = type_oid(&raw, "public.tone").await;
+    raw.batch_execute("alter type public.tone rename to tone2")
+        .await
+        .expect("rename before any pass");
+
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(
+        capture_failures(&raw).await,
+        Vec::<Vec<Option<String>>>::new()
+    );
+    for row in recorded_oids(&raw).await {
+        assert_eq!(row[1].as_deref(), Some(oid.as_str()), "{row:?}");
+        assert_eq!(row[2].as_deref(), Some("public.tone2"), "{row:?}");
+    }
+    assert_eq!(
+        source_column_token(&raw, "tone_pass", "tone").await,
+        "enum:public.tone2"
+    );
+
+    bring_live(&mut raw, &db.pool, &["tone_pass", "per_tone"]).await;
+    assert_pass_and_counts(&raw).await;
+    raw.batch_execute(
+        "insert into public.items values (4, 'brisk', 4); \
+         update public.items set tone = 'brisk' where id = 1; \
+         delete from public.items where id = 2;",
+    )
+    .await
+    .expect("write");
+    full_pass(&mut raw, &db.pool).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    assert_pass_and_counts(&raw).await;
+    assert_eq!(
+        capture_failures(&raw).await,
+        Vec::<Vec<Option<String>>>::new()
+    );
+}
+
+/// #1242 window 2: a chained reader over an upstream paused for a capture
+/// failure. The paused upstream no longer counts toward its source's
+/// captured columns, and no other captured table has the type, so no
+/// capture baseline records it; the chained definition reads the upstream's
+/// target, which has none. Its own record still has the type's OID: the
+/// rename is followed, with no misleading re-render pause.
+#[tokio::test]
+async fn a_rename_is_followed_for_a_chained_reader_of_a_paused_upstream() {
+    trellis::dev::staging::set_group_basis(true);
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create type public.tone as enum ('calm', 'loud', 'brisk'); \
+         create table public.items (id int primary key, tone tone, x int);",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    let upstream = "TRANSFORM tone_pass FROM public.items SELECT tone AS tone, x AS x";
+    trellis.apply(upstream).await.expect(upstream);
+    bring_live(&mut raw, &db.pool, &["tone_pass"]).await;
+    raw.batch_execute("create index on public.tone_pass (tone)")
+        .await
+        .expect("index the upstream's target");
+    let chained = "TRANSFORM chained FROM public.tone_pass GROUP BY tone \
+                   SELECT tone AS tone, COUNT(*) AS n";
+    trellis.apply(chained).await.expect(chained);
+    bring_live(&mut raw, &db.pool, &["tone_pass", "chained"]).await;
+    raw.batch_execute(
+        "insert into public.items values (1, 'calm', 1), (2, 'loud', 2), (3, 'calm', 3)",
+    )
+    .await
+    .expect("write");
+    full_pass(&mut raw, &db.pool).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+
+    // The upstream pauses for a column it reads, dropped.
+    raw.batch_execute("alter table public.items drop column x")
+        .await
+        .expect("drop a read column");
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(status(&raw, "tone_pass").await, TransformStatus::Paused);
+    capture_pass(&mut raw, &db.pool).await;
+    let oid = type_oid(&raw, "public.tone").await;
+    let baselines: i64 = raw
+        .query_one(
+            &format!("select count(*) from capture_baselines where type_oid = {oid}"),
+            &[],
+        )
+        .await
+        .expect("count")
+        .get(0);
+    assert_eq!(baselines, 0, "no capture baseline records the type");
+
+    raw.batch_execute("alter type public.tone rename to tone2")
+        .await
+        .expect("rename");
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(status(&raw, "chained").await, TransformStatus::Live);
+    let failures = capture_failures(&raw).await;
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert_eq!(failures[0][0].as_deref(), Some("public.tone_pass"));
+    for row in recorded_oids(&raw).await {
+        assert_eq!(row[1].as_deref(), Some(oid.as_str()), "{row:?}");
+        assert_eq!(row[2].as_deref(), Some("public.tone2"), "{row:?}");
+    }
+    full_pass(&mut raw, &db.pool).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    assert_eq!(status(&raw, "chained").await, TransformStatus::Live);
+    assert_eq!(held_keys(&raw).await, 0, "no key is held");
+    assert_eq!(
+        rows(
+            &raw,
+            "select tone::text, n::text from public.chained where n is not null \
+             order by tone::text"
+        )
+        .await,
+        rows(
+            &raw,
+            "select tone::text, count(*)::text from public.tone_pass group by tone \
+             order by tone::text"
+        )
+        .await,
+    );
+}
+
+fn run(command: &mut Command) {
+    let out = command.output().expect("run a client tool");
+    assert!(
+        out.status.success(),
+        "{command:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// #1242, a logical restore: every OID is new. The pass pauses every
+/// definition for the restore and compares none of their recorded OIDs, even
+/// one that names another type here (a decoy, standing in for the original
+/// database's OID taken by an unrelated type). `RESUME` records the new OIDs,
+/// and a later rename is followed.
+#[tokio::test]
+async fn a_logical_restore_is_re_recorded_by_resume_and_a_later_rename_followed() {
+    trellis::dev::staging::set_group_basis(true);
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create type public.tone as enum ('calm', 'loud', 'brisk'); \
+         create table public.items (id int primary key, tone tone, n int); \
+         create index on public.items (tone);",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    for text in PASS_AND_COUNTS {
+        trellis.apply(text).await.expect(text);
+    }
+    bring_live(&mut raw, &db.pool, &["tone_pass", "per_tone"]).await;
+    raw.batch_execute("insert into public.items values (1, 'calm', 1), (2, 'loud', 2)")
+        .await
+        .expect("write");
+    full_pass(&mut raw, &db.pool).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    let original_oid = type_oid(&raw, "public.tone").await;
+    let dump = cluster.root().join("type_identity.dump");
+    run(Command::new("pg_dump")
+        .args(["-Fc", "-f"])
+        .arg(&dump)
+        .arg(db.dsn()));
+
+    let restored = cluster.create_empty_database().await;
+    run(Command::new("pg_restore")
+        .args(["--no-owner", "-d", restored.dsn()])
+        .arg(&dump));
+    let mut raw = connect(restored.dsn()).await;
+    let trellis = definer(restored.dsn()).await;
+    let oid = type_oid(&raw, "public.tone").await;
+    assert_ne!(oid, original_oid, "a restore gives the type a new OID");
+    // The original's OID for `per_tone`'s record names an unrelated type here.
+    raw.batch_execute(
+        "create type public.decoy as enum ('x'); \
+         update definition_types set type_oid = 'public.decoy'::regtype \
+         where transform_id = (select id from transform_definitions \
+                               where target_table = 'public.per_tone'); \
+         update definition_key_types set type_oid = 'public.decoy'::regtype \
+         where type_name = 'public.tone'",
+    )
+    .await
+    .expect("a decoy at a recorded OID");
+    let before = recorded_oids(&raw).await;
+
+    capture_pass(&mut raw, &restored.pool).await;
+    capture_pass(&mut raw, &restored.pool).await;
+    for target in ["tone_pass", "per_tone"] {
+        assert_eq!(
+            status(&raw, target).await,
+            TransformStatus::Paused,
+            "{target}"
+        );
+        let failure = trellis
+            .status(target)
+            .await
+            .expect("status")
+            .expect(target)
+            .capture_failure
+            .expect("a capture failure");
+        assert!(
+            failure.error.contains("restored from a logical dump"),
+            "{target}: {}",
+            failure.error
+        );
+    }
+    assert_eq!(
+        recorded_oids(&raw).await,
+        before,
+        "nothing compared a restored definition's OIDs"
+    );
+    let releases: i64 = raw
+        .query_one("select count(*) from retype_releases", &[])
+        .await
+        .expect("count")
+        .get(0);
+    assert_eq!(releases, 0, "nothing was re-recorded");
+
+    for target in ["tone_pass", "per_tone"] {
+        trellis
+            .apply(&format!("RESUME TRANSFORM {target}"))
+            .await
+            .unwrap_or_else(|e| panic!("{target}: {e}"));
+    }
+    let recorded = recorded_oids(&raw).await;
+    assert!(!recorded.is_empty());
+    for row in &recorded {
+        assert_eq!(row[1].as_deref(), Some(oid.as_str()), "{row:?}");
+        assert_eq!(row[2].as_deref(), Some("public.tone"), "{row:?}");
+    }
+    bring_live(&mut raw, &restored.pool, &["tone_pass", "per_tone"]).await;
+    assert_pass_and_counts(&raw).await;
+
+    raw.batch_execute(
+        "alter type public.tone rename to tone2; \
+         insert into public.items values (3, 'brisk', 3); \
+         update public.items set tone = 'brisk' where id = 1;",
+    )
+    .await
+    .expect("rename and write");
+    full_pass(&mut raw, &restored.pool).await;
+    assert_eq!(
+        capture_failures(&raw).await,
+        Vec::<Vec<Option<String>>>::new()
+    );
+    full_pass(&mut raw, &restored.pool).await;
+    drain_to_quiescence(&restored.pool, &mut raw).await;
+    assert_pass_and_counts(&raw).await;
+    for row in recorded_oids(&raw).await {
+        assert_eq!(row[2].as_deref(), Some("public.tone2"), "{row:?}");
+    }
+}
+
+/// #1242, a simulated `pg_upgrade`: the cluster's identifier changes and
+/// every OID and name stays. Nothing is re-recorded and nothing pauses.
+#[tokio::test]
+async fn a_simulated_pg_upgrade_re_records_nothing() {
+    trellis::dev::staging::set_group_basis(true);
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let _trellis = setup(db.dsn(), &mut raw, &db.pool).await;
+    let oids = recorded_oids(&raw).await;
+    let names = recorded_names(&raw).await;
+    assert!(!oids.is_empty());
+    raw.batch_execute("update capture_triggers set system_identifier = '1'")
+        .await
+        .expect("simulate pg_upgrade");
+    capture_pass(&mut raw, &db.pool).await;
+    capture_pass(&mut raw, &db.pool).await;
+    let releases: i64 = raw
+        .query_one("select count(*) from retype_releases", &[])
+        .await
+        .expect("count")
+        .get(0);
+    assert_eq!(releases, 0, "nothing was re-recorded");
+    assert_eq!(recorded_oids(&raw).await, oids);
+    assert_eq!(recorded_names(&raw).await, names);
+    write(&raw, "tone", 1).await;
+    full_pass(&mut raw, &db.pool).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    assert_converged(&raw).await;
 }

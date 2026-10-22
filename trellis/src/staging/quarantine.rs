@@ -4544,6 +4544,10 @@ async fn complete_resume(
     // and the capture pass compares the key columns against what it builds
     // from.
     catalog::record_source_columns(txn, id, &revalidated.source_columns).await?;
+    if let Some(sides) = &revalidated.join {
+        catalog::record_join_columns(txn, id, &sides.joined_value_types()).await?;
+    }
+    // #1242: after both, whose enum tokens it records the type OIDs of.
     let joined = revalidated.join.as_ref().map(|sides| sides.joined.as_str());
     crate::defs::key_types::record_definition(
         txn,
@@ -4566,7 +4570,6 @@ async fn complete_resume(
     // the resume drops and recreates them, at the shape define would give
     // them now, rather than check them.
     if let Some(sides) = &revalidated.join {
-        catalog::record_join_columns(txn, id, &sides.joined_value_types()).await?;
         catalog::recreate_hidden_tables(txn, schema, id, &definition.def, sides).await?;
     }
 

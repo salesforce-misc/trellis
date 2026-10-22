@@ -187,13 +187,26 @@ pub(crate) fn key_uses(
     uses
 }
 
-/// A column's type, as `definition_key_types` records it: the type's
-/// `schema.typname` and the column's `atttypmod`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A column's type, as `definition_key_types` records it: the type's OID,
+/// its identity (ADR-0020), its `schema.typname`, the rendering Trellis
+/// casts by, and the column's `atttypmod`. Two types are the same type when
+/// their OIDs are: a renamed type keeps its OID, and the pass re-records its
+/// name before it compares ([`crate::capture::baseline::follow_renamed_types`]).
+/// Two are equal when their OIDs and modifiers are: the name never counts.
+#[derive(Debug, Clone)]
 pub(crate) struct ColumnType {
+    pub type_oid: u32,
     pub type_name: String,
     pub typmod: i32,
 }
+
+impl PartialEq for ColumnType {
+    fn eq(&self, other: &Self) -> bool {
+        (self.type_oid, self.typmod) == (other.type_oid, other.typmod)
+    }
+}
+
+impl Eq for ColumnType {}
 
 impl ColumnType {
     fn base(&self) -> &str {
@@ -289,7 +302,7 @@ pub(crate) fn renders_differently(old: &ColumnType, new: &ColumnType) -> bool {
     if let (Some(was), Some(is)) = (old.string_bound(), new.string_bound()) {
         return narrower_bound(is, was);
     }
-    if old.type_name != new.type_name || !old.builtin() {
+    if old.type_oid != new.type_oid || !old.builtin() {
         return true;
     }
     match old.base() {
@@ -364,7 +377,7 @@ pub(crate) fn pure_widening(old: &ColumnType, new: &ColumnType) -> bool {
     if let (Some(was), Some(is)) = (old.string_bound(), new.string_bound()) {
         return !narrower_bound(is, was);
     }
-    if old.type_name != new.type_name || !old.builtin() {
+    if old.type_oid != new.type_oid || !old.builtin() {
         return false;
     }
     match old.base() {
@@ -512,6 +525,7 @@ pub(crate) async fn live_columns(
                 row.get(0),
                 LiveColumn {
                     ty: ColumnType {
+                        type_oid: row.get(4),
                         type_name: row.get(1),
                         typmod: row.get(2),
                     },
@@ -586,8 +600,9 @@ pub(crate) fn retyped_error(
 }
 
 /// Records, for definition `id`, the live type of each `(table, column)` in
-/// `columns` that has none recorded yet (`definition_key_types`). A column
-/// that doesn't exist is skipped.
+/// `columns` that has none recorded yet (`definition_key_types`), by OID and
+/// name, and the OID of each such type that isn't builtin beside its name
+/// ([`record_types`]). A column that doesn't exist is skipped.
 pub(crate) async fn record(
     client: &impl GenericClient,
     id: i64,
@@ -608,7 +623,8 @@ pub(crate) async fn rerecord(
         client,
         id,
         columns,
-        "update set type_name = excluded.type_name, typmod = excluded.typmod",
+        "update set type_oid = excluded.type_oid, type_name = excluded.type_name, \
+         typmod = excluded.typmod",
     )
     .await
 }
@@ -633,8 +649,9 @@ async fn upsert(
         .execute(
             &format!(
                 "insert into definition_key_types \
-                 (transform_id, table_name, column_name, type_name, typmod) \
-             select $1, k.t, k.c, n.nspname::text || '.' || ty.typname::text, a.atttypmod \
+                 (transform_id, table_name, column_name, type_oid, type_name, typmod) \
+             select $1, k.t, k.c, a.atttypid, n.nspname::text || '.' || ty.typname::text, \
+                    a.atttypmod \
              from unnest($2::text[], $3::text[], $4::text[]) as k(t, r, c) \
              join pg_catalog.pg_attribute a \
                on a.attrelid = pg_catalog.to_regclass(k.r) and a.attname = k.c \
@@ -646,13 +663,70 @@ async fn upsert(
             &[&id, &tables, &regclasses, &names],
         )
         .await?;
+    record_types(client, id, false).await
+}
+
+/// Records, for definition `id`, the OID of every user-defined type it names
+/// beside the name it persists for it (`definition_types`, ADR-0020): each
+/// key column's type that isn't builtin (`definition_key_types`), and each
+/// enum token (`enum:schema.typname`) in its `source_columns` and
+/// `join_columns`, by the OID of the type its column has, while that type
+/// still has the name the token gives. A type already recorded keeps its
+/// row; with `replace`, the definition's rows are deleted first (a resume,
+/// which records every type from the live columns).
+///
+/// The capture pass compares these rows with `pg_type` by OID: the same OID
+/// under another name is a rename, which it follows in place
+/// ([`crate::capture::baseline::follow_renamed_types`]).
+pub(crate) async fn record_types(
+    client: &impl GenericClient,
+    id: i64,
+    replace: bool,
+) -> Result<(), tokio_postgres::Error> {
+    if replace {
+        client
+            .execute(
+                "delete from definition_types where transform_id = $1",
+                &[&id],
+            )
+            .await?;
+    }
+    client
+        .execute(
+            "insert into definition_types (transform_id, type_oid, type_name) \
+             select $1, k.type_oid, k.type_name from definition_key_types k \
+             where k.transform_id = $1 and k.type_name not like 'pg_catalog.%' \
+             union \
+             select $1, a.atttypid, n.nspname::text || '.' || ty.typname::text \
+             from transform_definitions d \
+             cross join lateral ( \
+                 select d.source_table as tbl, e.key, e.value \
+                 from pg_catalog.jsonb_each_text(d.source_columns) e \
+                 union all \
+                 select d.join_table, e.key, e.value \
+                 from pg_catalog.jsonb_each_text(coalesce(d.join_columns, '{}'::jsonb)) e) e \
+             join pg_catalog.pg_attribute a \
+               on a.attrelid = pg_catalog.to_regclass( \
+                      pg_catalog.quote_ident(pg_catalog.split_part(e.tbl, '.', 1)) || '.' || \
+                      pg_catalog.quote_ident(pg_catalog.split_part(e.tbl, '.', 2))) \
+              and a.attname = e.key and a.attnum > 0 and not a.attisdropped \
+             join pg_catalog.pg_type ty on ty.oid = a.atttypid \
+             join pg_catalog.pg_namespace n on n.oid = ty.typnamespace \
+             where d.id = $1 \
+               and e.value = 'enum:' || n.nspname::text || '.' || ty.typname::text \
+             on conflict (transform_id, type_oid) do nothing",
+            &[&id],
+        )
+        .await?;
     Ok(())
 }
 
 /// Records the live type of every key column definition `id` uses
 /// ([`key_uses`]): on its qualified `source`, keyed by the source's
 /// row-identity key, on a JOIN's qualified `joined` table, keyed by its own,
-/// and on the to-side of each relationship in `rels`, keyed by that table's.
+/// and on the to-side of each relationship in `rels`, keyed by that table's;
+/// then the OID of every type the definition names ([`record_types`]), so
+/// its `source_columns` and `join_columns` must already be written.
 /// Define calls it with nothing recorded yet; a
 /// resume with `replace`, which deletes what was recorded first, so the
 /// types the capture pass compares against are the ones the rebuild builds
@@ -694,21 +768,39 @@ pub(crate) async fn record_definition(
                 &[&id],
             )
             .await?;
+        client
+            .execute(
+                "delete from definition_types where transform_id = $1",
+                &[&id],
+            )
+            .await?;
     }
-    record(client, id, &columns).await
+    record(client, id, &columns).await?;
+    // `record` records nothing for a definition with no key column on a
+    // table that exists; its source and joined columns still name types.
+    record_types(client, id, false).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// A type by its qualified name, with an OID made up from it: distinct
+    /// names, distinct OIDs, as in a catalog with no rename.
     fn ty(type_name: &str, typmod: i32) -> ColumnType {
         let type_name = if type_name.contains('.') {
             type_name.to_string()
         } else {
             format!("pg_catalog.{type_name}")
         };
-        ColumnType { type_name, typmod }
+        let type_oid = type_name.bytes().fold(2_166_136_261_u32, |h, b| {
+            (h ^ u32::from(b)).wrapping_mul(16_777_619)
+        });
+        ColumnType {
+            type_oid,
+            type_name,
+            typmod,
+        }
     }
 
     /// `varchar(n)`'s `atttypmod` is `n + 4`.
@@ -807,6 +899,29 @@ mod tests {
         ] {
             assert!(renders_differently(&old, &new), "{old:?} -> {new:?}");
         }
+    }
+
+    /// A renamed type keeps its OID: the same type, whatever either name.
+    #[test]
+    fn a_type_is_its_oid_not_its_name() {
+        let was = ColumnType {
+            type_oid: 16_400,
+            type_name: "public.tone".to_string(),
+            typmod: -1,
+        };
+        let renamed = ColumnType {
+            type_name: "other.tone2".to_string(),
+            ..was.clone()
+        };
+        assert!(!renders_differently(&was, &renamed));
+        assert!(pure_widening(&was, &renamed));
+        assert!(!widens(&was, &renamed));
+        let recreated = ColumnType {
+            type_oid: 16_500,
+            ..was.clone()
+        };
+        assert!(renders_differently(&was, &recreated));
+        assert!(!pure_widening(&was, &recreated));
     }
 
     /// A user type named like a builtin family is not in it.

@@ -598,8 +598,9 @@ pub(crate) async fn pause_readers_of_retyped(
     for row in client
         .query_typed(
             "select transform_id, column_name, type_name, typmod, \
-                    coalesce(pg_catalog.format_type(pg_catalog.to_regtype(type_name), typmod), \
-                             type_name) \
+                    coalesce((select pg_catalog.format_type(t.oid, typmod) \
+                              from pg_catalog.pg_type t where t.oid = type_oid), type_name), \
+                    type_oid \
              from definition_key_types \
              where transform_id = any($1) and table_name = $2",
             &[(&readers, Type::INT8_ARRAY), (&table, Type::TEXT)],
@@ -610,6 +611,7 @@ pub(crate) async fn pause_readers_of_retyped(
             (row.get(0), row.get(1)),
             (
                 key_types::ColumnType {
+                    type_oid: row.get(5),
                     type_name: row.get(2),
                     typmod: row.get(3),
                 },
@@ -1380,10 +1382,16 @@ mod tests {
     use crate::defs::key_types::ColumnType;
 
     fn ty(display: &str) -> CopyType {
+        let oid = match display {
+            "integer" => 23,
+            "bigint" => 20,
+            _ => 0,
+        };
         CopyType {
-            oid: 0,
+            oid,
             typmod: -1,
             ty: ColumnType {
+                type_oid: oid,
                 type_name: format!("pg_catalog.{display}"),
                 typmod: -1,
             },

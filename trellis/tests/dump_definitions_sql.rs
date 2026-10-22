@@ -160,8 +160,10 @@ async fn count(raw: &Client, sql: &str) -> i64 {
 }
 
 const SOURCE_DDL: &str = "\
+    create type public.mood as enum ('calm', 'loud'); \
     create table public.cats (id bigint primary key, name text); \
-    create table public.orders (id bigint primary key, g bigint, a bigint, cat_id bigint); \
+    create table public.orders (id bigint primary key, g bigint, a bigint, cat_id bigint, \
+                                m public.mood); \
     insert into public.cats values (1, 'tom'), (2, 'kit'); \
     insert into public.orders values (1, 1, 10, 1), (2, 1, 20, 2), (3, 2, 30, 1)";
 
@@ -172,7 +174,7 @@ async fn define_and_build(t: &Trellis, raw: &mut Client) {
     t.apply("RELATIONSHIP cat FROM orders.cat_id TO cats.id")
         .await
         .expect("relationship");
-    t.apply("TRANSFORM o1 FROM orders SELECT g AS g, a + 1 AS b")
+    t.apply("TRANSFORM o1 FROM orders SELECT g AS g, a + 1 AS b, m AS m")
         .await
         .expect("o1");
     build_everything(t.pool()).await;
@@ -250,6 +252,8 @@ async fn a_dump_loads_as_defined_not_built() {
         "select to_jsonb(t) - 'created_at' from schema_edges t order by id",
         "select to_jsonb(t) from source_table_versions t order by source_table",
         "select to_jsonb(t) from definition_key_types t order by transform_id, table_name, column_name",
+        // #1242: a type's OID is the database's own; the name beside it loads.
+        "select to_jsonb(t) - 'type_oid' from definition_types t order by transform_id, type_name",
         "select to_jsonb(t) from trellis_instance t",
         "select to_jsonb(t) - 'applied_on' from refinery_schema_history t order by version",
         "select to_jsonb(t) - 'created_at' - 'status' - 'build' - 'build_seg' - 'build_marker_generation' - 'fuse_rearmed_at' from transform_definitions t order by id",
@@ -258,6 +262,24 @@ async fn a_dump_loads_as_defined_not_built() {
         assert!(!want.is_empty(), "{sql} has rows to compare");
         assert_eq!(rows_json(&after, sql).await, want, "{sql}");
     }
+
+    // The enum's OID differs between the two databases, and the loaded
+    // record holds the loaded database's (ADR-0020).
+    let mood_oid = "select 'public.mood'::regtype::oid::bigint";
+    assert_ne!(count(&raw, mood_oid).await, count(&after, mood_oid).await);
+    assert_eq!(
+        count(
+            &after,
+            "select count(*) from definition_types where type_oid = 'public.mood'::regtype"
+        )
+        .await,
+        3,
+        "each definition reading a column of the enum records the loaded database's OID"
+    );
+    assert_eq!(
+        count(&after, "select count(*) from definition_types").await,
+        3
+    );
 
     // Every definition is defined, not built.
     let statuses = rows_json(&after, STATUSES).await;

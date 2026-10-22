@@ -103,25 +103,12 @@ pub enum PgType {
     /// The payload is an **interned** (see [`intern_enum_token`]) copy of
     /// this type's *own persisted token* (`"enum:<schema>.<typname>"`,
     /// [`Self::name`]'s exact return value for this variant) — not the raw
-    /// OID. Two reasons OID was rejected as the identity, both concrete
-    /// rather than theoretical:
-    ///
-    /// * `ALTER TYPE ... ADD VALUE` (adding a label, possibly
-    ///   `BEFORE`/`AFTER` an existing one) never changes the type's own
-    ///   OID — only `DROP TYPE`/`CREATE TYPE` does — so an OID identity
-    ///   would already have been stable across the exact schema change this
-    ///   issue's "type-versioning" framing worries about. That is not why
-    ///   it was rejected.
-    /// * The real reason: every `transform_definitions.source_columns`
-    ///   entry this crate ever persists is expected to remain meaningfully
-    ///   decodable after a restart, and Postgres does **not** guarantee a
-    ///   user-defined type's OID survives a `pg_dump`/`pg_restore` cycle —
-    ///   an ordinary operational event, not a schema change at all — the
-    ///   way it guarantees a *name* survives. A restart that silently
-    ///   remapped a persisted OID to a *different*, wrong (or dangling) enum
-    ///   type would be a far worse failure mode than anything `ALTER TYPE`
-    ///   can cause. The schema-qualified *name* (the same identity ADR-0011
-    ///   already uses for every table this crate tracks) has no such gap.
+    /// OID. The token is the rendering Trellis casts the column's values by,
+    /// and what the evaluator, which has no connection, carries for the
+    /// type. The type's identity is its OID (ADR-0020): each definition records
+    /// it beside the token (`definition_types`, `defs::key_types::record_types`),
+    /// and the staging worker's capture pass follows a rename by that OID,
+    /// rewriting the token in place (`capture::baseline::follow_renamed_types`).
     ///
     /// Interning keeps this variant, and therefore [`PgType`] and
     /// [`ValueType`], `Copy` — the same cheap-by-value shape every sibling

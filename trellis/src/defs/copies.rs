@@ -746,6 +746,7 @@ impl CopyState {
     /// ([`super::key_types::widens`]).
     pub(crate) fn outgrown(&self) -> bool {
         let source = ColumnType {
+            type_oid: self.live_type.oid,
             type_name: self.live_type.ty.type_name.clone(),
             typmod: self.source_typmod,
         };
@@ -912,6 +913,7 @@ pub(crate) async fn describe(
         oid,
         typmod,
         ty: ColumnType {
+            type_oid: oid,
             type_name: row.get(0),
             typmod,
         },
@@ -985,6 +987,7 @@ mod tests {
             oid,
             typmod: -1,
             ty: ColumnType {
+                type_oid: oid,
                 type_name: format!("pg_catalog.{display}"),
                 typmod: -1,
             },
@@ -1188,6 +1191,7 @@ mod tests {
             oid,
             typmod,
             ty: ColumnType {
+                type_oid: oid,
                 type_name: format!("pg_catalog.{name}"),
                 typmod,
             },
@@ -1211,6 +1215,7 @@ mod tests {
             oid: 23,
             typmod: -1,
             ty: ColumnType {
+                type_oid: 23,
                 type_name: "pg_catalog.int4".to_string(),
                 typmod: -1,
             },

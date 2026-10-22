@@ -65,6 +65,7 @@ pub const CLASSIFICATION: &[(&str, Class)] = &[
         },
     ),
     ("definition_key_types", Class::Definition { reset: NONE }),
+    ("definition_types", Class::Definition { reset: NONE }),
     (
         "relationship_definitions",
         Class::Definition { reset: NONE },
@@ -134,6 +135,29 @@ pub const CLASSIFICATION: &[(&str, Class)] = &[
     ("self_check_jobs", Class::Runtime),
     ("transform_fuse_gate", Class::Runtime),
     ("worker_registry", Class::Runtime),
+];
+
+/// Statements the appendix ends with, `{s}` standing for the quoted schema
+/// name: a type's OID is the database's own, so the loaded database's
+/// differs from the dumped one's. Each type a definition recorded
+/// (`definition_key_types`, `definition_types`, ADR-0020) is resolved again
+/// by the name recorded beside it, which names the same type in the loaded
+/// schema, as `RESUME` re-records it after a logical restore. A
+/// `definition_types` row whose name names no type is dropped, and so is one
+/// that resolves to a type the same definition records under another row.
+pub const RESOLVE_TYPE_OIDS: &[&str] = &[
+    "update {s}.definition_key_types k set type_oid = t.oid \
+     from pg_catalog.pg_type t join pg_catalog.pg_namespace n on n.oid = t.typnamespace \
+     where n.nspname::text || '.' || t.typname::text = k.type_name",
+    "create temporary table trellis_resolved_types as \
+     select distinct on (r.transform_id, t.oid) r.transform_id, t.oid as type_oid, r.type_name \
+     from {s}.definition_types r \
+     join pg_catalog.pg_type t on true \
+     join pg_catalog.pg_namespace n on n.oid = t.typnamespace \
+     where n.nspname::text || '.' || t.typname::text = r.type_name",
+    "delete from {s}.definition_types",
+    "insert into {s}.definition_types select * from trellis_resolved_types",
+    "drop table trellis_resolved_types",
 ];
 
 /// Whether `table` is a relationship's parent projection, which Trellis
@@ -236,6 +260,9 @@ pub async fn dump_definitions_sql(pool: &Pool, config: &Config) -> Result<String
                 }
             }
         }
+    }
+    for statement in RESOLVE_TYPE_OIDS {
+        sql.push_str(&format!("{};\n", statement.replace("{s}", &schema)));
     }
     txn.commit().await?;
     Ok(sql)

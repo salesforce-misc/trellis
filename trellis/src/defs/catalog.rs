@@ -2724,6 +2724,9 @@ async fn record_added_source_columns(
             &[&id, &keys, &vals],
         )
         .await?;
+    // #1242: the OID of an added column's type, beside the name its token
+    // gives (`definition_types`). A type already recorded keeps its row.
+    super::key_types::record_types(client, id, false).await?;
     Ok(())
 }
 

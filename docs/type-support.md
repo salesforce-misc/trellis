@@ -329,10 +329,11 @@ and is never a key. `MIN`/`MAX(jsonb)` is not supported. Checked in
 
 ## Enums
 
-An enum type is identified by its schema-qualified name (`enum:<schema>.<type>`),
-not its OID, because Postgres does not guarantee an OID survives
-`pg_dump`/`pg_restore`. Two distinct enum types are distinct `ValueType`s, and
-two columns of different enum types are never joinable.
+An enum type is identified by its OID ([ADR-0020](decisions/0020-type-identity.md)).
+Each definition records the OID of every enum it reads beside the
+schema-qualified name it casts by (`enum:<schema>.<type>`). Two distinct enum
+types are distinct `ValueType`s, and two columns of different enum types are
+never joinable.
 
 - `enumout` is a bijection with no second renderer. Enums are join, `GROUP BY`
   and primary keys; the join/primary-key check is a live `to_regtype` probe
@@ -352,11 +353,15 @@ pauses the definitions that read it, so the drop can follow their `RESUME`
 or `DROP TRANSFORM`.
 
 Renaming the type (`ALTER TYPE … RENAME TO`) or moving it to another schema
-(`… SET SCHEMA`) is followed in place. The type keeps its OID and every value,
-so the staging worker's capture pass, on seeing a read column whose OID is as
-recorded and whose qualified name is not, records the new name where Trellis
-casts by it and releases the keys a drain held for the old name. Nothing
-pauses or rebuilds. `ALTER TYPE … RENAME VALUE` relabels the values in the
+(`… SET SCHEMA`) is followed in place, whenever it happens: before the
+staging worker's first pass over a new definition, or while the definition,
+or the one whose target it reads, is paused. The type keeps its OID and every
+value, so the worker's capture pass, on finding an OID a definition recorded
+under another qualified name now, records the new name where Trellis casts by
+it and releases the keys a drain held for the old name. Nothing pauses or
+rebuilds. A logical dump and restore gives every type a new OID: the restore
+pauses every definition, the pass compares none of their recorded OIDs, and
+`RESUME` records the new ones. `pg_upgrade` keeps them. `ALTER TYPE … RENAME VALUE` relabels the values in the
 columns Trellis created too.
 
 ## `array_agg` and `string_agg`

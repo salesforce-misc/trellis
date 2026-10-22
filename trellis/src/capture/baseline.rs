@@ -81,8 +81,9 @@
 //! # A type renamed
 //!
 //! A type renamed or moved to another schema keeps its oid and its values,
-//! so it is none of the above: [`follow_renamed_types`] re-records its name,
-//! before the key-type check compares names, and nothing pauses or rebuilds.
+//! so it is none of the above: [`follow_renamed_types`] finds it by the OID
+//! each definition recorded beside the type's name, re-records the name once
+//! per pass before any table is checked, and nothing pauses or rebuilds.
 //!
 //! # What it misses, and what it rebuilds for nothing
 //!
@@ -198,6 +199,7 @@ async fn live(
                     attnum: row.get(3),
                     type_oid: row.get(4),
                     ty: ColumnType {
+                        type_oid: row.get(4),
                         type_name: row.get(5),
                         typmod: row.get(6),
                     },
@@ -229,6 +231,7 @@ async fn recorded(client: &impl GenericClient, table: &str) -> Result<Columns, C
                     attnum: row.get(3),
                     type_oid: row.get(4),
                     ty: ColumnType {
+                        type_oid: row.get(4),
                         type_name: row.get(5),
                         typmod: row.get(6),
                     },
@@ -395,57 +398,64 @@ pub(crate) async fn forget_except(
     Ok(())
 }
 
-/// Re-records the name of a type renamed or moved to another schema since
-/// the baseline (`ALTER TYPE ... RENAME TO`, `... SET SCHEMA`), in place
-/// (#1204): a read column whose type oid and modifier are as the baseline
-/// recorded and whose `schema.typname` is not. The type's values are what
-/// they were, so nothing pauses, rebuilds or reinstalls; Trellis only has to
-/// cast by the name the type has now.
+/// Re-records the name of every type renamed or moved to another schema
+/// (`ALTER TYPE ... RENAME TO`, `... SET SCHEMA`) since a definition recorded
+/// it, in place (#1204, #1242). Each definition records the OID of every
+/// user-defined type it names beside the name (`definition_types`,
+/// [`crate::defs::key_types::record_types`]), and this compares that record
+/// with `pg_type` by OID: the same OID under another qualified name is a
+/// rename. The type's values are what they were, so nothing pauses, rebuilds
+/// or reinstalls; Trellis only has to cast by the name the type has now. An
+/// OID that no longer names the type a column has is a re-type, which
+/// [`check`] and `pause_readers_of_retyped` respond to; a type that no longer
+/// exists is left as recorded, for the same reason.
+///
+/// The comparison is against the definition's own record, so a rename is
+/// followed whenever it happens: before the pass that first installs a
+/// source's capture, and for a definition whose source no capture baseline
+/// covers (a chained reader of a paused upstream's target).
+///
+/// A definition paused for a logical restore is left out: its record holds
+/// the original database's OIDs, which may name any type here. Its `RESUME`
+/// records the new ones. `pg_upgrade` keeps every OID and name, so nothing
+/// is re-recorded.
 ///
 /// A type's name is persisted in each definition's `source_columns` and
-/// `join_columns` (as `enum:schema.typname`), in `definition_key_types`, and
-/// in the baseline itself. They are rewritten in one transaction, for every
-/// definition that records the old name for a column whose type is still
-/// the renamed one (the rename is the type's, not this table's, and a
-/// chained definition's key columns on a table Trellis creates have no
-/// baseline of their own; a column of a new type created at the old name
-/// keeps it), under those definitions' row locks taken in id order, the
-/// locks a pass takes for any re-record. Each of them also asks for the
-/// release of its keys held for `42704`, the failure of a cast by the name
-/// the type no longer has (`retype_releases`, released by
+/// `join_columns` (as `enum:schema.typname`), in `definition_key_types`,
+/// beside its OID in `definition_types`, and in the capture baselines. For
+/// each renamed type, they are rewritten in one transaction, for every
+/// definition whose record names it, under those definitions' row locks taken
+/// in id order, the locks a pass takes for any re-record. A token is
+/// rewritten only for a column whose type is still the renamed one: a column
+/// of a new type created at the old name keeps it. Each definition also asks
+/// for the release of its keys held for `42704`, the failure of a cast by the
+/// name the type no longer has (`retype_releases`, released by
 /// `staging::quarantine::release_retyped_keys` after the pass).
 ///
-/// Runs before `pause_readers_of_retyped`, which compares the name recorded
-/// for a key column with the live one. A column whose oid or modifier moved
-/// is not a rename: [`check`] and that function respond to it.
-pub(crate) async fn follow_renamed_types(
-    client: &mut Client,
-    table: &str,
-) -> Result<(), CaptureError> {
-    let baseline = recorded(&*client, table).await?;
-    if baseline.is_empty() {
-        return Ok(());
-    }
-    let columns: Vec<String> = baseline
-        .keys()
-        .map(|(_, name)| name.clone())
-        .collect::<BTreeSet<_>>()
+/// Runs once per pass, after the restore check and before any table's
+/// checks, so `pause_readers_of_retyped` finds the names current.
+pub(crate) async fn follow_renamed_types(client: &mut Client) -> Result<(), CaptureError> {
+    // Each recorded type whose OID names it under another name now, with the
+    // definitions that record it.
+    let renamed: Vec<(u32, String, String, Vec<i64>)> = client
+        .query_typed(
+            "select r.type_oid, r.type_name, \
+                    n.nspname::text || '.' || t.typname::text, \
+                    array_agg(r.transform_id order by r.transform_id) \
+             from definition_types r \
+             join pg_catalog.pg_type t on t.oid = r.type_oid \
+             join pg_catalog.pg_namespace n on n.oid = t.typnamespace \
+             where r.type_name <> n.nspname::text || '.' || t.typname::text \
+               and not exists (select 1 from capture_failures f \
+                               where f.transform_id = r.transform_id and f.restored) \
+             group by 1, 2, 3 \
+             order by 1, 2",
+            &[],
+        )
+        .await?
         .into_iter()
+        .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
         .collect();
-    let live = live(&*client, table, &columns).await?;
-    // By type oid: a new type can take a renamed type's old name.
-    let mut renamed: BTreeMap<u32, (String, String)> = BTreeMap::new();
-    for (key, was) in &baseline {
-        if let Some(now) = live.get(key)
-            && (was.type_oid, was.ty.typmod) == (now.type_oid, now.ty.typmod)
-            && was.ty.type_name != now.ty.type_name
-        {
-            renamed.insert(
-                was.type_oid,
-                (was.ty.type_name.clone(), now.ty.type_name.clone()),
-            );
-        }
-    }
     if renamed.is_empty() {
         return Ok(());
     }
@@ -465,42 +475,18 @@ pub(crate) async fn follow_renamed_types(
             .replace("{oid}", oid)
     };
     let txn = client.transaction().await?;
-    for (oid, (old, new)) in &renamed {
+    for (oid, old, new, candidates) in &renamed {
         let (old_token, new_token) = (format!("enum:{old}"), format!("enum:{new}"));
-        let in_source = its_column("d.source_table", "e.key", "$3");
-        let in_join = its_column("d.join_table", "e.key", "$3");
-        let candidates: Vec<i64> = txn
+        // Locked in id order; one dropped meanwhile is left out.
+        let owners: Vec<i64> = txn
             .query(
-                &format!(
-                    "select id from transform_definitions d \
-                     where exists (select 1 from jsonb_each_text(d.source_columns) e \
-                                   where e.value = $1 and {in_source}) \
-                        or exists (select 1 from jsonb_each_text(d.join_columns) e \
-                                   where e.value = $1 and {in_join}) \
-                        or exists (select 1 from definition_key_types k \
-                                   where k.transform_id = d.id and k.type_name = $2 \
-                                     and {})",
-                    its_column("k.table_name", "k.column_name", "$3"),
-                ),
-                &[&old_token, old, oid],
+                "select id from transform_definitions where id = any($1) order by id for update",
+                &[candidates],
             )
             .await?
             .into_iter()
             .map(|row| row.get(0))
             .collect();
-        // Locked in id order; one dropped meanwhile is left out.
-        let owners: Vec<i64> = if candidates.is_empty() {
-            Vec::new()
-        } else {
-            txn.query(
-                "select id from transform_definitions where id = any($1) order by id for update",
-                &[&candidates],
-            )
-            .await?
-            .into_iter()
-            .map(|row| row.get(0))
-            .collect()
-        };
         if !owners.is_empty() {
             let rename = |table: &str, entries: &str| {
                 format!(
@@ -524,12 +510,15 @@ pub(crate) async fn follow_renamed_types(
             )
             .await?;
             txn.execute(
-                &format!(
-                    "update definition_key_types k set type_name = $2 \
-                     where k.transform_id = any($1) and k.type_name = $4 and {}",
-                    its_column("k.table_name", "k.column_name", "$3"),
-                ),
-                &[&owners, new, oid, old],
+                "update definition_key_types set type_name = $2 \
+                 where transform_id = any($1) and type_oid = $3",
+                &[&owners, new, oid],
+            )
+            .await?;
+            txn.execute(
+                "update definition_types set type_name = $2 \
+                 where transform_id = any($1) and type_oid = $3",
+                &[&owners, new, oid],
             )
             .await?;
             txn.execute(
@@ -541,13 +530,11 @@ pub(crate) async fn follow_renamed_types(
             .await?;
         }
         txn.execute(
-            "update capture_baselines set type_name = $3 \
-             where table_name = $1 and type_name = $2 and type_oid = $4",
-            &[&table, old, new, oid],
+            "update capture_baselines set type_name = $2 where type_oid = $1",
+            &[oid, new],
         )
         .await?;
         crate::instance_log::info!(
-            table = %table,
             from = %old,
             to = %new,
             definitions = owners.len(),
@@ -933,16 +920,18 @@ mod tests {
     use super::*;
 
     fn column(attnum: i16, ty: &str, typmod: i32, xmin: &str, filenode: u32, hash: &str) -> Column {
+        let type_oid = match ty {
+            "int4" => 23,
+            "int8" => 20,
+            "numeric" => 1700,
+            _ => 0,
+        };
         Column {
             filenode: Some(filenode),
             attnum,
-            type_oid: match ty {
-                "int4" => 23,
-                "int8" => 20,
-                "numeric" => 1700,
-                _ => 0,
-            },
+            type_oid,
             ty: ColumnType {
+                type_oid,
                 type_name: format!("pg_catalog.{ty}"),
                 typmod,
             },

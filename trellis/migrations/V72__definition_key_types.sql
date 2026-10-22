@@ -21,13 +21,17 @@
 -- #687). `ALTER TRANSFORM` adds no key column: it edits only 1-1,
 -- relationship-free definitions' fields.
 --
--- `type_name` is `schema.typname`, which survives a dump and restore where
--- an OID wouldn't.
+-- `type_oid` is the type's identity (ADR-0020), what the capture pass
+-- compares; `type_name` is its `schema.typname`, kept as the rendering and
+-- re-recorded when the type is renamed (`capture::baseline::follow_renamed_types`).
+-- A logical restore changes the OID: the pass pauses every definition first
+-- and compares none of a definition paused for it, and `RESUME` re-records.
 create table definition_key_types (
     transform_id bigint not null
         references transform_definitions (id) on delete cascade,
     table_name text not null,
     column_name text not null,
+    type_oid oid not null,
     type_name text not null,
     typmod integer not null,
     primary key (transform_id, table_name, column_name)
