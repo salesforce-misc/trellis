@@ -49,8 +49,7 @@
 //! A resume re-records these types ([`record_definition`]), after it has
 //! re-validated the definition and brought its copies to their live types.
 //! So does the capture pass, for each key column whose type changed in one
-//! of these routine ways or by a widening it re-typed in place, unless it
-//! pauses the definition ([`rerecord`]). The definition stores keys of the
+//! of these routine ways, unless it pauses the definition ([`rerecord`]). The definition stores keys of the
 //! new type from then on, so the next change is measured from it: a
 //! `GROUP BY` key widened from `numeric(10,2)` to `numeric(10,3)` and then
 //! narrowed back to `numeric(10,2)` rounds the keys stored in between, and

@@ -1103,15 +1103,15 @@ async fn first_capture_pass(
     Ok(())
 }
 
-/// Releases the keys a capture pass's in-place re-types asked for (#824,
-/// [`staging::quarantine::release_retyped_keys`]). A failure is logged, and
+/// Releases the keys a capture pass asked for when it followed a renamed
+/// type (#1204, [`staging::quarantine::release_retyped_keys`]). A failure is logged, and
 /// the next pass tries again: the requests stay until their keys are
 /// released.
 async fn release_retyped_keys(pool: &Pool) {
     if let Err(err) = staging::quarantine::release_retyped_keys(pool).await {
         crate::instance_log::warn!(
             error = %err,
-            "couldn't release the keys held before an in-place re-type; retrying next pass"
+            "couldn't release the keys held before a type rename was followed; retrying next pass"
         );
     }
 }

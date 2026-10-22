@@ -88,10 +88,8 @@ trigger. The type is the source column's type OID, rendered schema-qualified
 whatever the session's `search_path`, by one function (`defs::copy_type`) that
 every column Trellis creates and every cast to one goes through
 ([ADR-0020](decisions/0020-type-identity.md)). So `\d` on a target shows no
-modifiers.
-A
-`GROUP BY` key's column (in the target, its ledger and its group-delta table)
-takes its value family's type: `integer` or `bigint` by width, `text` for any
+modifiers. A `GROUP BY` key's column (in the target, its ledger and its
+group-delta table) takes its value family's type: `integer` or `bigint` by width, `text` for any
 string, unconstrained `numeric`, a temporal type at full precision. A to-one
 relationship's projection keys by the to-side column's exact type, and holds
 each to-side column read through it in that column's type. A `JOIN`
@@ -112,7 +110,9 @@ temporal or `interval` precision, a `char(n)` or `bit(n)` length, a `varchar`
 bound or its move to `text`) changes no copy, and a widening of one needs no
 pause and no rebuild. A change that re-renders the stored values (a `char(n)`
 length, a `bit(n)` rewrite, a `numeric` scale, a narrower precision) rebuilds the
-column's readers, or pauses one that keys by it. A width change pauses the
+column's readers, or pauses one that keys by it, except that a `numeric`
+`GROUP BY` key's group rows keep their old text ([known correctness
+gaps](known-correctness-gaps.md#a-numeric-group-by-keys-scale-changed)). A width change pauses the
 transforms that own the column, and `RESUME` re-types every column to the type
 define would give it from the live schema before it rebuilds
 ([transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)).

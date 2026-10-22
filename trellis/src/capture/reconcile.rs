@@ -45,10 +45,9 @@
 //! differently, whose relationship's join columns no longer match, or that
 //! created a column, typed from one the table widened, that can't hold
 //! the type define would give it now (#760, #767, #824,
-//! [`crate::staging::schema_change::pause_readers_of_retyped`]). A table
-//! Trellis created whose every such column widened by changing only the
-//! catalog (a longer `varchar`, say) is re-typed in place instead, with no
-//! pause. That check runs on the seam-fed tables too. It compares a
+//! [`crate::staging::schema_change::pause_readers_of_retyped`]). Only an
+//! integer or float width outgrows such a column: Trellis creates it with
+//! no type modifier (ADR-0020). That check runs on the seam-fed tables too. It compares a
 //! definition's typed copies with the live schema only when something it
 //! reads has changed since the last comparison found them all current: the
 //! pass fingerprints those tables' columns once, before any check

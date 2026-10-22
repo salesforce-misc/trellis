@@ -12,9 +12,11 @@
 //!   narrower `varchar` drops trailing spaces, `integer` to `double
 //!   precision` changes what a definition can do with it. A pure widening
 //!   ([`key_types::pure_widening`]: a wider integer, a longer string bound,
-//!   more `numeric` precision at the same scale, a wider temporal precision)
-//!   keeps every value's text, and is never acted on here; a copy Trellis
-//!   made that it outgrows is `pause_readers_of_retyped`'s.
+//!   more `numeric` precision at the same scale or none, a wider temporal or
+//!   `interval` precision) keeps every value's text, and is acted on here
+//!   only when it takes a `numeric`'s declared scale away, which a reader
+//!   may need; a copy Trellis made that it outgrows is
+//!   `pause_readers_of_retyped`'s.
 //! - **R3b, a same-type value rewrite.** `ALTER COLUMN b TYPE integer USING
 //!   b * 10` on an `integer` column rewrites the table with no DML trigger,
 //!   and leaves the column's name, `attnum`, type and modifier as they were.
@@ -62,14 +64,15 @@
 //!   and counts `capture_auto_rebuilds_total{source_table, cause}`
 //!   ([`CaptureRebuildCause`]).
 //! - **R1 where a definition reading the column may no longer be valid:**
-//!   define would now refuse it (`defs::catalog::revalidate`), a column
-//!   Trellis created for it from the column must be re-typed to hold the
-//!   new values with their text (it was outgrown, or it's a `numeric` whose
-//!   scale is no longer the column's, [`key_types::rescales`]; a narrowing
-//!   needs no re-type, as #824 has it), or the value type it evaluates the
-//!   column as changed (`integer` to `double precision`). The pass pauses
-//!   that definition with a `capture_failure` naming the change; `RESUME`
-//!   re-validates, re-types and rebuilds.
+//!   define would now refuse it (`defs::catalog::revalidate`: a `SUM` over
+//!   a `numeric` that lost its declared scale), a column Trellis created for
+//!   it from the column was outgrown by an integer or float width (a copy
+//!   has no type modifier, ADR-0020, so no modifier change outgrows one), or
+//!   the value type it evaluates the column as changed (`integer` to
+//!   `double precision`). The pass pauses that definition with a
+//!   `capture_failure` naming the change; `RESUME` re-validates, re-types
+//!   and rebuilds. A widening that only took a declared scale away, and
+//!   left every reader valid, changed no value: nothing rebuilds.
 //!
 //! R1's type check leaves alone a definition that uses the column as a
 //! key: `pause_readers_of_retyped` owns a key column's type (#760). A key
@@ -896,9 +899,9 @@ async fn respond(
     .into_iter()
     .filter(|c| c.columns_of(table).any(|c| c == column))
     .collect();
-    // A copy that still holds every value with its text (a narrowing, a
-    // `character(n)` length) needs no re-type (#824); one the source
-    // outgrew is `pause_readers_of_retyped`'s, which ran first.
+    // A copy has no type modifier (ADR-0020), so it holds every value of
+    // the source column's type whatever its modifier; one an integer or
+    // float width outgrew is `pause_readers_of_retyped`'s, which ran first.
     let drifted: Vec<String> = crate::defs::copies::inspect(txn, copies)
         .await?
         .into_iter()

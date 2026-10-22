@@ -86,7 +86,7 @@ table to change one column. A column-add backfill carries the new version as its
 so live change-application and the in-flight backfill do not race on a half-populated
 column.
 
-### `ALTER` re-types a catalog-only widening and refuses a rewrite
+### `ALTER` never re-types a column
 
 The "never rewrites the whole target table" guarantee above is not automatic just because
 `ALTER <field> AS <expr>` only touches one column's formula: if the type the altered field
@@ -96,23 +96,19 @@ other column too, not just the one being altered. Shipping that would violate th
 guarantee in exactly the case an operator is least likely to expect it (an edit that reads
 like "just this column").
 
-`ALTER TRANSFORM` therefore compares the column's current type, modifier included
-(`numeric(10,2)`), with the type `DEFINE` would give the altered field: the
-source column's exact type for a bare passthrough, its value family's type for any other
+`ALTER TRANSFORM` therefore compares the column's current type with the type `DEFINE`
+would give the altered field: the source column's type with no modifier for a bare
+passthrough ([ADR-0020](0020-type-identity.md)), its value family's type for any other
 expression. Then:
 
-- The same type and modifier changes nothing physical; the field build re-derives the values.
-- A string column (`text`, `varchar(n)`, `varchar`) altered to another changes nothing
-  physical: Trellis's copy of a `varchar(n)` is an unbounded `varchar`.
-- A widening that changes only the catalog (`numeric(10,2)` to `numeric(12,2)` or
-  `numeric`) is applied in place, in the `ALTER`'s own
-  transaction under the definition's row lock, before the field is re-derived. It takes a
-  short `ACCESS EXCLUSIVE` lock on the target, the same at one row as at a billion. The next
-  capture pass finds the column current: no pause and no drift.
-- Anything that would rewrite the target (a narrowing such as `numeric` to `numeric(10,2)`, or another value family) is refused before any DDL or backfill
-  runs, naming the field and both types and pointing at `DROP <field>` followed by
-  `ADD <expr> AS <field>`. That pair pays the same backfill cost, so the refusal makes
-  nothing more expensive; it only stops a full-table rewrite posing as a single-column edit.
+- The same type changes nothing physical; the field build re-derives the values. A
+  modifier never differs: `numeric(10,2)` and `numeric`, or `varchar(n)`, `varchar` and
+  `text`, are one type to a copy.
+- Anything else (another integer or float width, another value family) would rewrite the
+  target, so it is refused before any DDL or backfill runs, naming the field and both
+  types and pointing at `DROP <field>` followed by `ADD <expr> AS <field>`. That pair pays
+  the same backfill cost, so the refusal makes nothing more expensive; it only stops a
+  full-table rewrite posing as a single-column edit.
 
 A shadow column, single-pass backfill, and atomic rename-swap would avoid the restriction;
 that is not implemented.

@@ -30,6 +30,7 @@ test:convergence 13.4
 test:capture_schema_change 13.4
 test:partition_correction_to_many 13.0
 test:unchanged_toast_images 12.9
+test:type_matrix 12.0  # estimated: 7 s locally, not yet measured on CI
 test:capture_install 11.5
 test:backup_restore 11.4
 test:capture_disruption 10.9
@@ -70,7 +71,6 @@ test:resume_drops_deleted_keys 3.8
 test:held_key_retry 3.8
 bin:benchmark 3.7
 test:blocking_trellis 3.6
-test:type_modifier_rounding 3.6  # 25 of its 36 tests are #[ignore]d (known gap #1288)
 test:one_to_one_nullable_key 3.5
 test:capture_reread 3.5
 test:defs_temporal 3.3

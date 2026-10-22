@@ -355,12 +355,11 @@ until one of these releases it:
   `TransformNotFound`, and a key the transform doesn't hold (a table it doesn't
   read, a key it never held or one already released) is `KeyNotHeld`; both are
   `not_found`, and neither changes anything.
-* **After an in-place re-type.** When the staging worker re-types a column
-  Trellis created because the source widened it by changing only the catalog
-  ([ADR-0014](0014-pause-and-drop-a-transform.md)), it releases, through the
-  per-key release, every key a transform with a column on that table holds
-  whose failure was `22003` (after a `numeric` re-type), by the SQLSTATE its `poison` row keeps. A key held for any
-  other failure stays held.
+* **After a type rename is followed.** When the staging worker records the
+  new name of a type a transform reads (renamed, or moved to another schema),
+  it releases, through the per-key release, every key that transform holds
+  whose failure was `42704` (a cast by the old name), by the SQLSTATE its
+  `poison` row keeps. A key held for any other failure stays held.
 
 The release is purely operational, like `status`, so it is a call of its own
 rather than a statement of `apply`'s grammar: releasing a key changes nothing

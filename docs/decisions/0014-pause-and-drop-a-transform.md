@@ -287,39 +287,10 @@ reports it as a pause, as it does every pause; that changed `capture_failure`, a
 instance log's line saying the pause withdrew a resume, tell it apart from the no-op
 pause of a definition already frozen.
 
-Outside a resume, Trellis re-types a column on its own in one case: when every column
-of a table it created that the source widened widened by changing only the catalog.
-Exactly one widening qualifies: `numeric(p,s)` to a larger precision at the same scale.
-Postgres rewrites nothing for it, changes no value and keeps every index. The capture
-pass then re-types that table's columns itself, one table per transaction, under the
-same lock timeout as a resume's re-type, and nothing pauses or rebuilds. A string
-column needs none: every column Trellis creates from a `varchar(n)` is an unbounded
-`varchar` with the source column's collation, which holds whatever the source holds
-after any change of its bound, and `text` and `varchar(n)` are one family wherever a
-copy and its source column are compared. Its `ALTER` is the transaction's first statement, so it
-waits for the table's `ACCESS EXCLUSIVE` holding no other lock, and once it has the
-table it takes the locks of the table's own indexes and TOAST table, and of any
-object of the application's that depends on the column, such as a foreign key that
-references it. Trellis's own pages, builds and releases take nothing it waits on, so
-it can't close a lock cycle with them: a page queued behind it waits at most the
-timeout. A cycle through an application object ends in a deadlock error, which counts
-as transient. A table whose re-type fails transiently (its lock not got
-in time, a deadlock, a statement timeout) is left as it is, nothing pauses, and the
-next pass tries again. A table where some widened column needs a rewrite pauses its
-definitions as above, and so does one whose re-type fails otherwise. The
-worker doesn't retry a re-type that failed otherwise until the source's type changes
-again, a definition with a column on the table is defined or dropped, or the worker
-restarts, so it doesn't take the table's lock every pass.
-
-A value written between the source's `ALTER` and that re-type fails its write (`22003`),
-and its key may be held. The re-type's transaction records a release request for each definition with a column
-on the table (`retype_releases`).
-After the pass, the staging worker releases each key such a definition holds whose
-failure had that SQLSTATE, recorded on its `poison` row, one key at a time through the
-same release as `Trellis::release_key`, and the key's parked work is applied again. It
-does so again after each pass for twice the session lock timeout, so a key whose
-eviction reproduced its failure before the re-type but committed after the release read
-the held keys is released too. A key held for any other failure stays held.
+Outside a resume, Trellis never re-types a column: every column it creates from a source
+column has the source column's type with no type modifier
+([ADR-0020](0020-type-identity.md)), so a change of a modifier leaves it holding every
+value, and only an integer or float width outgrows it, which pauses as above.
 
 Resume also releases every key the definition holds in quarantine: it deletes the
 definition's own `poison`, `poison_held` and `key_deaths` rows in the same transaction.

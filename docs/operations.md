@@ -152,10 +152,10 @@ audit. What clears a held key:
   releases due keys with a growing backoff
   ([ADR-0003 — Retry policy](decisions/0003-quarantine-storage-and-api.md#retry-policy)).
 
-After a `numeric` column Trellis copies with its type gains precision at the
-same scale, the capture pass re-types the copy and then releases the keys it
-held for values the old type couldn't hold (`22003`), in that pass and each
-pass for a minute more. A key held later than that stays held.
+After a type a definition reads is renamed or moved to another schema, the
+capture pass records its new name and then releases the keys held for a cast
+by the old one (`42704`), in that pass and each pass for a minute more. A key
+held later than that stays held.
 
 ### A page that fails only for several definitions together
 
@@ -189,9 +189,7 @@ which targets it compares is in
 * **A resume that re-types copies holds `ACCESS EXCLUSIVE` on them.** After a
   widening, the resume's `ALTER … TYPE` on the target (and its ledger, or a
   relationship's projection) waits for every reader of the table, and readers
-  queue behind it. The capture pass's in-place re-type of a widening that
-  changes only the catalog takes the same lock, waiting at most two seconds
-  for it and holding it briefly.
+  queue behind it.
 * **A re-type changes the table's row type**, so a client that prepared a
   statement returning one of its columns gets `cached plan must not change
   result type` the next time it runs it, once per prepared statement.

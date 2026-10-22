@@ -26,6 +26,7 @@ wrong rows, on the targets it compares
 |---|---|---|
 | **Schema changes Trellis can't tell from routine work** | | |
 | [A column's values rewritten in place by `ALTER COLUMN TYPE`](#a-columns-values-rewritten-in-place-by-alter-column-type) | `self_check` | [#1206](https://github.com/salesforce-misc/trellis/issues/1206) (study) |
+| [A `numeric` `GROUP BY` key's scale changed](#a-numeric-group-by-keys-scale-changed) | `self_check` | [#1297](https://github.com/salesforce-misc/trellis/issues/1297) |
 | **Writes capture never sees** | | |
 | [Capture disrupted and restored between two passes](#capture-disrupted-and-restored-between-two-passes) | `self_check` | [#1206](https://github.com/salesforce-misc/trellis/issues/1206) (study), [#1237](https://github.com/salesforce-misc/trellis/issues/1237), otherwise documented |
 | [An unlogged source emptied by a crash or failover](#an-unlogged-source-emptied-by-a-crash-or-failover) | `self_check` | documented |
@@ -68,7 +69,8 @@ while every rule holds.
 * **Use logged tables as sources.** Postgres empties an unlogged table on a
   crash, a failover or a physical restore.
 * **Repair after DDL that rewrites a read column's values** in one of the
-  shapes [listed below](#a-columns-values-rewritten-in-place-by-alter-column-type).
+  shapes [listed below](#a-columns-values-rewritten-in-place-by-alter-column-type),
+  or [changes the scale of a `numeric` `GROUP BY` key](#a-numeric-group-by-keys-scale-changed).
 
 ## Schema changes Trellis can't tell from routine work
 
@@ -121,6 +123,28 @@ a false-positive study of signals that would catch these shapes. Event
 triggers would see every rewrite but need superuser, and logical decoding has
 the same blind spot: `pgoutput` never sends a rewrite's rows. `MIN` and `MAX`
 leave with [#1105](https://github.com/salesforce-misc/trellis/issues/1105).
+
+### A `numeric` `GROUP BY` key's scale changed
+
+**When:** a `numeric(p,s)` column an aggregate or a `JOIN` groups by is altered
+to another scale, which rewrites the table and re-renders every value:
+
+```sql
+ALTER TABLE orders ALTER COLUMN amount TYPE numeric(12,4);  -- 1.25 becomes 1.2500
+```
+
+**What goes wrong:** each group row keeps the key text it had (`1.25`) while
+the source shows `1.2500`. Groups match as numbers, so later writes, the
+rebuild after the rewrite and a `RESUME` all find the row and leave its key
+as it is. A wider scale pauses nothing; a narrower one pauses the transform,
+and its `RESUME` ends the same way. The keys are equal as numbers; only their
+text differs.
+
+**Detected by:** `self_check`, which compares text.
+
+**Repair:** `DROP TRANSFORM` and define it again.
+
+**Ends with:** [#1297](https://github.com/salesforce-misc/trellis/issues/1297).
 
 ## Writes capture never sees
 

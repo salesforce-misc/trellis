@@ -217,17 +217,9 @@ select k.name, \
 from pg_catalog.unnest($1::text[]) as k(name) \
 left join pg_catalog.pg_class c on c.oid = pg_catalog.to_regclass(k.name)";
 
-/// What the memo remembers of one definition's check of one table: the stamp
-/// it found every column current at, and the tables Trellis created that it
-/// found a column on (for the in-place re-type's owners).
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Entry {
-    stamp: String,
-    copy_tables: Vec<String>,
-}
-
-/// By capture instance, table checked and definition id.
-type Memo = BTreeMap<(String, String, i64), Entry>;
+/// By capture instance, table checked and definition id: the stamp that
+/// definition's last check of that table found every column current at.
+type Memo = BTreeMap<(String, String, i64), String>;
 
 static MEMO: Mutex<Memo> = Mutex::new(BTreeMap::new());
 
@@ -235,24 +227,23 @@ fn with_memo<T>(f: impl FnOnce(&mut Memo) -> T) -> T {
     f(&mut MEMO.lock().unwrap_or_else(PoisonError::into_inner))
 }
 
-/// The tables holding a column `id`'s last check of `table` found, if that
-/// check found every column current at `stamp`.
-pub(crate) fn skippable(instance: &str, table: &str, id: i64, stamp: &str) -> Option<Vec<String>> {
+/// Whether `id`'s last check of `table` found every column current at
+/// `stamp`.
+pub(crate) fn skippable(instance: &str, table: &str, id: i64, stamp: &str) -> bool {
     with_memo(|memo| {
         memo.get(&(instance.to_string(), table.to_string(), id))
-            .filter(|entry| entry.stamp == stamp)
-            .map(|entry| entry.copy_tables.clone())
+            .is_some_and(|found| found == stamp)
     })
 }
 
 /// Records the outcome of one full comparison of `id`'s copies on `table`:
-/// `Some` of the stamp (read before the comparison) and the tables holding a
-/// copy when every column was current, `None` when one had drifted.
-pub(crate) fn record(instance: &str, table: &str, id: i64, current: Option<(String, Vec<String>)>) {
+/// `Some` of the stamp (read before the comparison) when every column was
+/// current, `None` when one had drifted.
+pub(crate) fn record(instance: &str, table: &str, id: i64, current: Option<String>) {
     let key = (instance.to_string(), table.to_string(), id);
     with_memo(|memo| match current {
-        Some((stamp, copy_tables)) => {
-            memo.insert(key, Entry { stamp, copy_tables });
+        Some(stamp) => {
+            memo.insert(key, stamp);
         }
         None => {
             memo.remove(&key);
@@ -322,25 +313,25 @@ pub fn checks(database: &str, schema: &str, id: i64) -> u64 {
 mod tests {
     use super::*;
 
-    fn current(stamp: &str) -> Option<(String, Vec<String>)> {
-        Some((stamp.to_string(), vec!["t".to_string()]))
+    fn current(stamp: &str) -> Option<String> {
+        Some(stamp.to_string())
     }
 
     #[test]
     fn an_equal_stamp_skips_and_a_different_one_does_not() {
         record("i1", "public.a", 1, current("s1"));
-        assert_eq!(skippable("i1", "public.a", 1, "s1"), Some(vec!["t".into()]));
-        assert_eq!(skippable("i1", "public.a", 1, "s2"), None);
-        assert_eq!(skippable("i1", "public.b", 1, "s1"), None);
-        assert_eq!(skippable("i1", "public.a", 2, "s1"), None);
-        assert_eq!(skippable("other", "public.a", 1, "s1"), None);
+        assert!(skippable("i1", "public.a", 1, "s1"));
+        assert!(!skippable("i1", "public.a", 1, "s2"));
+        assert!(!skippable("i1", "public.b", 1, "s1"));
+        assert!(!skippable("i1", "public.a", 2, "s1"));
+        assert!(!skippable("other", "public.a", 1, "s1"));
     }
 
     #[test]
     fn a_drifted_check_forgets_the_entry() {
         record("i2", "public.a", 1, current("s1"));
         record("i2", "public.a", 1, None);
-        assert_eq!(skippable("i2", "public.a", 1, "s1"), None);
+        assert!(!skippable("i2", "public.a", 1, "s1"));
     }
 
     #[test]
@@ -350,14 +341,14 @@ mod tests {
         record("i3", "public.b", 1, current("s"));
         record("i4", "public.a", 1, current("s"));
         retain_readers("i3", "public.a", &[2]);
-        assert_eq!(skippable("i3", "public.a", 1, "s"), None);
-        assert!(skippable("i3", "public.a", 2, "s").is_some());
-        assert!(skippable("i3", "public.b", 1, "s").is_some());
+        assert!(!skippable("i3", "public.a", 1, "s"));
+        assert!(skippable("i3", "public.a", 2, "s"));
+        assert!(skippable("i3", "public.b", 1, "s"));
         retain_tables("i3", &BTreeSet::from(["public.a"]));
-        assert_eq!(skippable("i3", "public.b", 1, "s"), None);
-        assert!(skippable("i4", "public.a", 1, "s").is_some());
+        assert!(!skippable("i3", "public.b", 1, "s"));
+        assert!(skippable("i4", "public.a", 1, "s"));
         forget_instance("i4");
-        assert_eq!(skippable("i4", "public.a", 1, "s"), None);
+        assert!(!skippable("i4", "public.a", 1, "s"));
     }
 
     use crate::{Config, Trellis, TrellisOptions};
@@ -454,7 +445,7 @@ mod tests {
         let stamp = before
             .stamp(SCHEMA, &catalog, &catalog.definitions[0])
             .expect("stamp");
-        assert_eq!(skippable(instance, "public.posts", ids[0], &stamp), None);
+        assert!(!skippable(instance, "public.posts", ids[0], &stamp));
 
         // Recorded as current, then retyped after the read.
         let (_db, mut raw, catalog, ids) = fixture(&cluster).await;

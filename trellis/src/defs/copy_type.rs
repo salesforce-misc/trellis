@@ -22,9 +22,13 @@
 //!   which is unlimited; the unquoted keyword is `bit(1)`.
 //!
 //! Nothing else formats type text for a column Trellis creates or a cast to
-//! one: every builder reads the type through [`type_sql`] (inside a catalog
-//! query) or [`render`] (from a recorded OID), and a test fails on a
-//! `format_type(…, atttypmod)` that reaches DDL or a cast.
+//! one: every builder reads the type through [`type_sql`] and the collation
+//! through [`collation_sql`], inside the catalog query that finds the
+//! column. A value-family column (a `GROUP BY` key's, an aggregate's) is
+//! typed by `PgType::sql_type_name`, which has no modifier to render. The
+//! test `format_type_is_called_only_where_listed` fails on a new
+//! `format_type` call anywhere in the crate until it is listed there with
+//! the reason it can't reach a column Trellis creates or a cast to one.
 
 /// A SQL expression, over the `oid`-typed SQL expression `oid_expr`, for the
 /// text of that type as a copy declares and casts to it: no modifier,
@@ -73,8 +77,214 @@ mod tests {
     #[test]
     fn the_type_expression_never_renders_a_modifier_or_reads_the_search_path() {
         let sql = type_sql("a.atttypid");
-        assert!(sql.contains("format_type(ct_t.oid, -1)"), "{sql}");
+        assert!(
+            sql.contains(concat!("format", "_type(ct_t.oid, -1)")),
+            "{sql}"
+        );
         assert!(!sql.contains("atttypmod"), "{sql}");
         assert!(sql.contains("quote_ident(ct_n.nspname)"), "{sql}");
+    }
+
+    /// Every `format_type` call in the crate, by file, and why none of them
+    /// types a column Trellis creates or a cast to one (ADR-0020, rule 8's
+    /// completeness): a new call fails here until it is listed with its
+    /// reason, or goes through [`type_sql`] instead.
+    const FORMAT_TYPE_CALLS: &[(&str, usize, &str)] = &[
+        (
+            "capture/baseline.rs",
+            2,
+            "a column's type with its modifier, for the reason a pause gives",
+        ),
+        (
+            "capture/partitions.rs",
+            1,
+            "a partition key's own type, to rank the source's own bounds as \
+             Postgres routes them; partitioned sources are refused at define",
+        ),
+        (
+            "defs/catalog.rs",
+            2,
+            "a JOIN or relationship column's declared type, for the key \
+             allowlist and messages; its copy is `copy_type`",
+        ),
+        (
+            "defs/copies.rs",
+            1,
+            "`CopyType::display`, for messages; the copy is `CopyType::sql`",
+        ),
+        (
+            "defs/copy_type.rs",
+            1,
+            "`type_sql` itself, with no modifier",
+        ),
+        (
+            "defs/ddl.rs",
+            1,
+            "the type a refused primary key column declares, for the message",
+        ),
+        (
+            "defs/key_types.rs",
+            1,
+            "`LiveColumn::display`, for the key allowlist and messages",
+        ),
+        (
+            "defs/partition_tree.rs",
+            1,
+            "a partition key's type name for the partition key allowlist",
+        ),
+        (
+            "staging/partition_correction/to_many.rs",
+            1,
+            "a relationship's join column, compared with a partition key's \
+             type; relationships are removed by #1115",
+        ),
+        (
+            "staging/schema_change.rs",
+            2,
+            "the recorded and live types a pause's reason names",
+        ),
+    ];
+
+    #[test]
+    fn format_type_is_called_only_where_listed() {
+        // Split so this file's own source doesn't count as a call.
+        let needle = concat!("format", "_type(");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut found: Vec<(String, usize)> = Vec::new();
+        let mut dirs = vec![root.clone()];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read src") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    dirs.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).expect("read a source file");
+                let calls: usize = source
+                    .lines()
+                    .filter(|line| !line.trim_start().starts_with("//"))
+                    .map(|line| line.matches(needle).count())
+                    .sum();
+                if calls > 0 {
+                    let relative = path
+                        .strip_prefix(&root)
+                        .expect("under src")
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    found.push((relative, calls));
+                }
+            }
+        }
+        found.sort();
+        let listed: Vec<(String, usize)> = FORMAT_TYPE_CALLS
+            .iter()
+            .map(|(file, calls, _)| ((*file).to_string(), *calls))
+            .collect();
+        assert_eq!(
+            found, listed,
+            "a format_type call that isn't listed: a column Trellis creates, or a cast to one, \
+             takes its type from `type_sql` (ADR-0020); list any other call with its reason"
+        );
+    }
+
+    /// Each class of type a source column can have, and a collation in a
+    /// quoted schema, rendered in a session that sees every one of them by
+    /// its bare name, resolves to the same type and collation, with no
+    /// modifier, in a session whose `search_path` finds a decoy of the same
+    /// name first (ADR-0020, I-T1).
+    #[tokio::test]
+    async fn a_rendering_resolves_to_the_same_type_whatever_the_search_path() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (client, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(
+                "create schema \"My.Sch\"\"ema\"; \
+                 create schema decoy; \
+                 create type \"My.Sch\"\"ema\".\"Mood X\" as enum ('a', 'b'); \
+                 create type public.mood as enum ('x'); \
+                 create domain public.posint as integer check (value > 0); \
+                 create collation \"My.Sch\"\"ema\".cc (provider = libc, locale = 'C'); \
+                 create type decoy.\"Mood X\" as enum ('zzz'); \
+                 create type decoy.mood as enum ('zzz'); \
+                 create domain decoy.posint as text; \
+                 create collation decoy.cc (provider = libc, locale = 'POSIX'); \
+                 create table public.t ( \
+                     a bit(5), b bit varying(8), c char(4), d \"char\", e name, \
+                     f timetz(2), g interval day to second(3), h numeric(6,2), \
+                     i \"My.Sch\"\"ema\".\"Mood X\", j \"My.Sch\"\"ema\".\"Mood X\"[], \
+                     k posint, l mood, m timestamptz(0)[], n varchar(3)[], \
+                     o text collate \"My.Sch\"\"ema\".cc, p text collate \"C\", q text, \
+                     r bit, s varchar(9), u time(1), v timestamp(2))",
+            )
+            .await
+            .expect("types");
+        client
+            .batch_execute("set search_path to public, \"My.Sch\"\"ema\"")
+            .await
+            .expect("every type visible");
+        let rendered = client
+            .query(
+                &format!(
+                    "select a.attname::text, a.atttypid, a.attcollation, {}, {} \
+                     from pg_catalog.pg_attribute a \
+                     where a.attrelid = 'public.t'::regclass and a.attnum > 0 \
+                     order by a.attnum",
+                    type_sql("a.atttypid"),
+                    collation_sql("a.attcollation")
+                ),
+                &[],
+            )
+            .await
+            .expect("render");
+        assert_eq!(rendered.len(), 21);
+        for path in ["decoy, public", "pg_catalog, pg_temp"] {
+            client
+                .batch_execute(&format!("set search_path to {path}"))
+                .await
+                .expect("another search_path");
+            for row in &rendered {
+                let column: String = row.get(0);
+                let (type_oid, collation_oid): (u32, u32) = (row.get(1), row.get(2));
+                let ty: String = row.get(3);
+                let collation: Option<String> = row.get(4);
+                let collate = collation
+                    .map(|c| format!(" collate {c}"))
+                    .unwrap_or_default();
+                let declared = format!("{ty}{collate}");
+                client
+                    .batch_execute(&format!(
+                        "drop table if exists pg_temp.copy; \
+                         create temp table copy (c {declared})"
+                    ))
+                    .await
+                    .unwrap_or_else(|err| panic!("{column} as {declared} under {path}: {err}"));
+                let copied = client
+                    .query_one(
+                        "select atttypid, atttypmod, attcollation from pg_catalog.pg_attribute \
+                         where attrelid = 'pg_temp.copy'::regclass and attname = 'c'",
+                        &[],
+                    )
+                    .await
+                    .expect("the copy");
+                assert_eq!(
+                    (
+                        copied.get::<_, u32>(0),
+                        copied.get::<_, i32>(1),
+                        copied.get::<_, u32>(2)
+                    ),
+                    (type_oid, -1, collation_oid),
+                    "{column} rendered {declared} resolves elsewhere under {path}"
+                );
+            }
+        }
     }
 }

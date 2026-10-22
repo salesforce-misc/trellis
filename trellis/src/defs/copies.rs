@@ -28,38 +28,30 @@
 //! - an aggregate ledger's contribution column, typed as the aggregate's
 //!   argument ([`super::ledger::contribution_pg_type`]).
 //!
-//! A copy of a `varchar(n)` column is an unbounded `varchar` (#1207), with the
-//! column's collation: `varchar(n)`, `varchar` and `text` are one type to
-//! Postgres, which checks a length only when a value is assigned, so the
-//! copy holds whatever the source column holds after any change of its
-//! bound, and a `text` and `varchar(n)` source column are one family
-//! ([`CopyState::drifted`]). The other copies keep their source column's
-//! type.
+//! A copy has its source column's type with no type modifier, and the
+//! column's collation (ADR-0020, [`super::copy_type`]): a `numeric(10,2)` is
+//! copied as `numeric`, a `varchar(n)` as `varchar`, a `char(n)` as
+//! `bpchar`. A modifier constrains what the source can hold and plays no
+//! part in a comparison, so the copy holds whatever the source column holds
+//! after any change of its modifier, and a `text` and `varchar(n)` source
+//! column are one family ([`CopyState::drifted`]).
 //!
 //! None of them changes type when the source column does. After the source
-//! column widens (`integer` to `bigint`, `numeric(10,2)` to `numeric(12,2)`),
-//! the first value the column can't hold fails its write (`22003`). So
-//! the staging worker's capture pass compares each column with the type
-//! define would give it from the live schema ([`inspect`]), and acts on
-//! each table holding a column the source widened
-//! (`staging::schema_change::pause_readers_of_retyped`):
+//! column widens to a wider type (`integer` to `bigint`, `real` to `double
+//! precision`, `bigint` to `numeric`), the first value the column can't hold
+//! fails its write (`22003`). So the staging worker's capture pass compares
+//! each column with the type define would give it from the live schema
+//! ([`inspect`]), and pauses every definition that owns a column the source
+//! has outgrown ([`super::key_types::widens`],
+//! `staging::schema_change::pause_readers_of_retyped`). A resume brings
+//! every column whose type differs from define's to it
+//! ([`retype_statements`]), keeping its collation, before it rebuilds,
+//! except a `JOIN`'s hidden tables, which it drops and creates again at the
+//! live types ([`CopyKind::recreated_by_resume`]).
 //!
-//! - When every widened column of the table widened by changing only the
-//!   catalog ([`CopyState::catalog_only`]: a `numeric` with more precision at
-//!   the same scale), the pass re-types those columns itself, in place. No value
-//!   changes, nothing is rewritten, and no definition pauses or rebuilds.
-//!   Then the keys its definitions held for a value the old type couldn't
-//!   hold are released (`staging::quarantine::release_retyped_keys`).
-//! - Otherwise it pauses every definition that owns a column the source has
-//!   outgrown ([`super::key_types::widens`]). A resume brings every column
-//!   whose type differs from define's to it ([`retype_statements`]) before
-//!   it rebuilds, except a `JOIN`'s hidden tables, which it drops and
-//!   creates again at the live types ([`CopyKind::recreated_by_resume`]).
-//!
-//! Trellis re-types a column on its own only in the first case. Either
-//! re-type keeps the column's collation. A narrowing, or a change to another
-//! type family, pauses nothing here and is re-typed only by a resume: every
-//! value still fits, or define's own checks own it.
+//! Trellis never re-types a column on its own. A narrowing, or a change to
+//! another type family, pauses nothing here and is re-typed only by a
+//! resume: every value still fits, or define's own checks own it.
 //!
 //! The comparison costs a few queries per definition, so the capture pass
 //! runs it for a definition only when a table it reads has changed since a

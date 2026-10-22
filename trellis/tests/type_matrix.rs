@@ -13,7 +13,8 @@
 //!
 //! **Axes.**
 //! - The type ([`TYPES`]): `varchar`, `bpchar`, `bit`, `varbit`, `numeric`,
-//!   `time`, `timetz`, `timestamp`, `timestamptz`, `interval` and an array.
+//!   `time`, `timetz`, `timestamp`, `timestamptz`, `interval` and an array
+//!   (refused in every place), and `char(n)` moved to `text`.
 //! - The change ([`Change`]): a catalog-only widening, a widening or `USING`
 //!   rewrite that re-renders the stored values, and a narrowing.
 //! - The place ([`Place`]): a 1-1 primary key and passthrough, a group-basis
@@ -26,16 +27,21 @@
 //! validator, so a type that becomes admissible is a cell that has to be
 //! filled in.
 //!
-//! **Outcome.** A catalog-only widening is exact with no pause at all, before
-//! and after the capture pass ([`Change::CatalogOnly`]). The others are exact
-//! once the definition has converged: nothing may be left diverged, and a
-//! pause must carry a reason, after which `RESUME` rebuilds exactly. Every
-//! step is an explicit pass or drain; nothing polls for convergence (#297).
+//! **Outcome.** A captured write before the change is exact. A catalog-only
+//! widening is exact with no pause at all, before and after the capture pass
+//! ([`Change::CatalogOnly`]). The others are exact once the definition has
+//! converged: nothing may be left diverged, and a pause must carry a reason,
+//! after which `RESUME` rebuilds exactly. A passthrough never fails a write
+//! or pauses. Every step is an explicit pass or drain; nothing polls for
+//! convergence (#297).
 //!
 //! **Not in the matrix** (each is a later step of #1289, or has its own test):
 //! - the pairing axis (a one-sided widening or narrowing of an `ON` pair, a
 //!   Trellis copy against a source column): step 2;
-//! - the rename row (a type renamed before a baseline records it): step 3;
+//! - the rename row: a rename after define is `capture_type_rename.rs`'s, and
+//!   one before a baseline records it is step 3;
+//! - a `numeric` `GROUP BY` key whose scale a rewrite changes, which keeps
+//!   the group row's old text (#1297, [`cell`] skips it);
 //! - integer and float widths, the only changes that re-type a copy
 //!   (`capture_key_retype.rs`);
 //! - the ledger `GROUP BY` path, whose copies are family-typed like the
@@ -162,6 +168,14 @@ const TYPES: &[Ty] = &[
             "abc",
             "xyz",
         ),
+    },
+    // Not a modifier change: `char(n)` to `text` is #1238's other shape.
+    Ty {
+        label: "bpchar to text",
+        value_type: ValueType::Text,
+        catalog_only: None,
+        rewrite: row("char(5)", "text", "abc", "abcdefg"),
+        narrow: None,
     },
     Ty {
         label: "bit",
@@ -305,6 +319,7 @@ fn admits(place: Place, label: &str) -> bool {
             label,
             "varchar"
                 | "bpchar"
+                | "bpchar to text"
                 | "varbit"
                 | "numeric"
                 | "time"
@@ -649,6 +664,15 @@ async fn run(place: Place, ty: &Ty, change: Change, row: &Row) -> Outcome {
     );
     write(&d, &scn.seed_sql).await;
     d.settle().await;
+    // The seed is a captured write before any change: the apply's cast of
+    // it to the copy's type must keep it whole (a bare `bit` is `bit(1)`,
+    // #1262).
+    assert_eq!(
+        diverged(&d, scn.target_sql, &scn.oracle_sql).await,
+        Vec::<String>::new(),
+        "{place:?}, {}: a captured write before any change differs",
+        ty.label
+    );
     d.ctl.batch_execute(&scn.alter_sql).await.expect("alter");
     write(&d, &scn.hi_sql).await;
     let drain_failures = settle_tolerant(&mut d).await;
@@ -780,6 +804,15 @@ async fn cell(place: Place, ty: &Ty, change: Change) {
             outcome.pauses
         );
     }
+    // A passthrough copy has no modifier, so no change of one fails a write
+    // or pauses it: a rewrite rebuilds it on its own (#1238, #1261).
+    if place == Place::Passthrough {
+        assert_eq!(
+            (outcome.drain_failures, outcome.pauses.as_slice()),
+            (0, &[] as &[String]),
+            "{tag}: a passthrough failed a write or paused"
+        );
+    }
     for pause in &outcome.pauses {
         assert!(
             pause
@@ -844,6 +877,108 @@ async fn a_type_a_place_refuses_is_refused() {
     );
 }
 
+/// A `JOIN`'s `ON` columns keep their collation in its target and hidden
+/// tables by OID, whatever schema it is in: the copy names it
+/// schema-qualified, so a collation of the same name earlier on Trellis's
+/// `search_path` (`public` here) is never the one it gets (ADR-0020).
+#[tokio::test]
+async fn a_join_key_keeps_its_collation_from_another_schema() {
+    trellis::dev::staging::set_group_basis(true);
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("connection");
+    client
+        .batch_execute(
+            "create schema other; \
+             create collation other.cc (provider = libc, locale = 'C'); \
+             create collation public.cc (provider = libc, locale = 'POSIX'); \
+             create table public.a (id integer primary key, k text collate other.cc, x integer); \
+             create table public.b (id integer primary key, k text collate other.cc, y integer); \
+             create index on public.a (k); create index on public.b (k)",
+        )
+        .await
+        .expect("source DDL");
+    let trellis = facade(db.dsn()).await;
+    trellis
+        .apply(
+            "TRANSFORM c FROM public.a JOIN public.b ON a.k = b.k \
+             GROUP BY a.k SELECT a.k AS k, COUNT(*) AS n",
+        )
+        .await
+        .expect("define the JOIN");
+    let copies: Vec<(String, bool)> = client
+        .query(
+            &format!(
+                "select c.relname::text, a.attcollation = 'other.cc'::regcollation::oid \
+                 from pg_catalog.pg_attribute a \
+                 join pg_catalog.pg_class c on c.oid = a.attrelid and c.relkind = 'r' \
+                 join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
+                 where a.attname = 'k' and not a.attisdropped \
+                   and ((n.nspname = 'public' and c.relname = 'c') \
+                        or (n.nspname = '{DEFAULT_SCHEMA}' and c.relname like 'join\\_%')) \
+                 order by 1"
+            ),
+            &[],
+        )
+        .await
+        .expect("the copies")
+        .iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    assert!(
+        copies.len() >= 2,
+        "the target and a hidden table copy `k`: {copies:?}"
+    );
+    assert!(
+        copies.iter().all(|(_, same)| *same),
+        "a copy of `k` has another collation: {copies:?}"
+    );
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// ADR-0020 rule 7: a 1-1 target's copy of a `numeric(10,2)` column is an
+/// unconstrained `numeric`, so a group-basis aggregate's or a `JOIN`'s `SUM`
+/// over it is refused at define with the chained refusal, which names
+/// #1120; the same `SUM` over the source column is accepted.
+#[tokio::test]
+async fn a_chained_sum_over_a_targets_numeric_copy_is_refused_by_name() {
+    trellis::dev::staging::set_group_basis(true);
+    let d = Driver::start(
+        "create table public.t (id integer primary key, g integer, price numeric(10,2)); \
+         create table public.o (id integer primary key, g integer); \
+         create index on public.o (g)",
+        &[("id", int4()), ("g", int4()), ("price", ValueType::Numeric)],
+        &["TRANSFORM up FROM public.t SELECT g AS g, price AS p"],
+        &["public.t"],
+    )
+    .await;
+    let trellis = facade(d.db.dsn()).await;
+    for chained in [
+        "TRANSFORM agg FROM public.up GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(p) AS s",
+        "TRANSFORM j FROM public.up JOIN public.o ON up.g = o.g GROUP BY up.g \
+         WITHOUT SOURCE INDEX SELECT up.g AS g, SUM(up.p) AS s",
+        "TRANSFORM javg FROM public.o JOIN public.up ON o.g = up.g GROUP BY o.g \
+         WITHOUT SOURCE INDEX SELECT o.g AS g, AVG(up.p) AS s",
+    ] {
+        let error = trellis
+            .apply(chained)
+            .await
+            .expect_err("a chained SUM/AVG over a target's numeric")
+            .to_string();
+        assert!(
+            error.contains("#1120") && error.contains("a table Trellis creates"),
+            "{chained}: {error}"
+        );
+    }
+    trellis
+        .apply(
+            "TRANSFORM direct FROM public.t GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(price) AS s",
+        )
+        .await
+        .expect("a SUM over the source's numeric(10,2)");
+    trellis.shutdown().await.expect("shutdown");
+}
+
 /// One test per (type, change), each running the type's cells in every
 /// place that admits it.
 macro_rules! matrix {
@@ -864,6 +999,7 @@ matrix! {
     varchar_narrow: "varchar", Change::Narrow;
     bpchar_rewrite: "bpchar", Change::Rewrite;
     bpchar_narrow: "bpchar", Change::Narrow;
+    bpchar_to_text_rewrite: "bpchar to text", Change::Rewrite;
     bit_rewrite: "bit", Change::Rewrite;
     bit_narrow: "bit", Change::Narrow;
     varbit_catalog_only: "varbit", Change::CatalogOnly;

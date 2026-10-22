@@ -227,6 +227,10 @@ async fn a_resume_that_retypes_a_column_pauses_the_readers_define_would_refuse()
         let error = reported.capture_failure.expect("a reason").error;
         assert!(error.contains("no declared scale"), "{reader}: {error}");
         assert!(
+            error.contains("a table Trellis creates"),
+            "{reader} reads a target's column: the chained refusal: {error}"
+        );
+        assert!(
             error.contains("from integer to numeric"),
             "{reader} names the upstream re-type: {error}"
         );
@@ -443,6 +447,10 @@ async fn a_chained_resume_retype_pauses_the_reader_define_would_refuse() {
     let error = reported.capture_failure.expect("a reason").error;
     assert!(error.contains("no declared scale"), "{error}");
     assert!(
+        error.contains("a table Trellis creates"),
+        "the chained refusal: {error}"
+    );
+    assert!(
         error.contains("public.c.q from integer to numeric"),
         "{error}"
     );
@@ -493,6 +501,10 @@ async fn a_source_retype_to_unscaled_numeric_pauses_its_sum_readers() {
         assert_eq!(reported.status, TransformStatus::Paused, "{reported:?}");
         let error = reported.capture_failure.expect("a reason").error;
         assert!(error.contains("no declared scale"), "{reader}: {error}");
+        assert!(
+            !error.contains("a table Trellis creates"),
+            "{reader} reads a source: not the chained refusal: {error}"
+        );
     }
     trellis.shutdown().await.expect("shutdown");
 }

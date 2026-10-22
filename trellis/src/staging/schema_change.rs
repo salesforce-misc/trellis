@@ -784,8 +784,7 @@ pub(crate) async fn pause_readers_of_retyped(
         let stamp = drift.stamp(schema, catalog, reader);
         if stamp
             .as_deref()
-            .and_then(|stamp| drift_memo::skippable(instance, table, reader.id, stamp))
-            .is_some()
+            .is_some_and(|stamp| drift_memo::skippable(instance, table, reader.id, stamp))
         {
             checked.push(Checked {
                 id: reader.id,
@@ -815,13 +814,7 @@ pub(crate) async fn pause_readers_of_retyped(
             instance,
             table,
             reader.id,
-            stamp
-                .filter(|_| states.iter().all(|s| !s.drifted()))
-                .map(|stamp| {
-                    let tables: BTreeSet<String> =
-                        states.iter().map(|s| s.copy.table.clone()).collect();
-                    (stamp, tables.into_iter().collect())
-                }),
+            stamp.filter(|_| states.iter().all(|s| !s.drifted())),
         );
         checked.push(Checked {
             id: reader.id,
@@ -844,9 +837,8 @@ pub(crate) async fn pause_readers_of_retyped(
         // Without a refusal, every key column flagged above is one whose
         // change re-renders the keys stored.
         let rerendered: Vec<String> = if refused { Vec::new() } else { columns.clone() };
-        // A column that outgrew the type define would give it now, on a
-        // table not re-typed in place, by the columns of this table each is
-        // typed from.
+        // A column that outgrew the type define would give it now, by the
+        // columns of this table each is typed from.
         let mut outgrown: BTreeMap<Vec<String>, Vec<copies::CopyState>> = BTreeMap::new();
         for state in states {
             if !state.outgrown() {
