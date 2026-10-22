@@ -1896,11 +1896,11 @@ async fn a_release_takes_the_j_lock_against_the_other_sides_pages() {
     }
 }
 
-/// A `JOIN` whose side is a partitioned root that has rows halts with the
-/// reason (its per-leaf build waits on #1286); a partitioned side with no
-/// rows builds like any other.
+/// A `JOIN` whose side is a partitioned root with no rows builds like any
+/// other (there is nothing to bound); with rows it builds per leaf
+/// ("Partitioned sides" below).
 #[tokio::test]
-async fn the_build_halts_on_a_partitioned_side_with_rows() {
+async fn a_partitioned_side_with_no_rows_builds_whole() {
     trellis::dev::staging::set_group_basis(true);
     trellis::defs::partition_tree::open_gate_for_tests();
     let ddl = "create table public.a (id integer not null, ga integer, t integer, \
@@ -1909,41 +1909,30 @@ async fn the_build_halts_on_a_partitioned_side_with_rows() {
                create table public.a1 partition of public.a default; \
                create table public.b (id integer primary key, t integer, k integer, \
                    gb integer, y integer); create index on public.b (k)";
-    for (rows, built) in [
-        ("", true),
-        ("insert into public.a values (1, 1, 0, 1, 1)", false),
-    ] {
-        let d = Driver::start_unbuilt(
-            &[],
-            &format!("{ddl}; {rows}"),
-            &[
-                ("id", int4()),
-                ("ga", int4()),
-                ("t", int4()),
-                ("k", int4()),
-                ("x", int4()),
-            ],
-            &[
-                "TRANSFORM l FROM public.a LEFT JOIN public.b ON a.k = b.k GROUP BY a.ga \
-               SELECT a.ga AS ga, COUNT(*) AS n",
-            ],
-            &["public.a", "public.b"],
-        )
-        .await;
-        let lab = Lab {
-            d,
-            key: Key::Single,
-            kinds: vec![L],
-        };
-        lab.build().await;
-        let error = lab.d.rows("select last_error from backfill_chunks").await;
-        if built {
-            lab.assert_built("a partitioned side with no rows").await;
-        } else {
-            assert_eq!(lab.statuses().await, ["(paused)"]);
-            assert!(error.len() == 1 && error[0].contains("#1286"), "{error:?}");
-        }
-    }
+    let d = Driver::start_unbuilt(
+        &[],
+        ddl,
+        &[
+            ("id", int4()),
+            ("ga", int4()),
+            ("t", int4()),
+            ("k", int4()),
+            ("x", int4()),
+        ],
+        &[
+            "TRANSFORM l FROM public.a LEFT JOIN public.b ON a.k = b.k GROUP BY a.ga \
+           SELECT a.ga AS ga, COUNT(*) AS n",
+        ],
+        &["public.a", "public.b"],
+    )
+    .await;
+    let lab = Lab {
+        d,
+        key: Key::Single,
+        kinds: vec![L],
+    };
+    lab.build().await;
+    lab.assert_built("a partitioned side with no rows").await;
 }
 
 /// A side that is another transform's target (whose feed is #1100's) fails
@@ -2185,12 +2174,18 @@ const BUILD_SEED: &str = "\
 /// whose builds have started: each definition is `backfilling` with its plan
 /// job unclaimed.
 async fn seeded(key: Key, kinds: &[Kind], seed: &str) -> Lab {
+    seeded_in(DDL, key, kinds, seed).await
+}
+
+/// [`seeded`] over tables created by `ddl`.
+async fn seeded_in(ddl: &str, key: Key, kinds: &[Kind], seed: &str) -> Lab {
     trellis::dev::staging::set_group_basis(true);
+    trellis::defs::partition_tree::open_gate_for_tests();
     let definitions: Vec<String> = kinds.iter().map(|k| k.definition(key)).collect();
     let definitions: Vec<&str> = definitions.iter().map(String::as_str).collect();
     let d = Driver::start_unbuilt(
         &[],
-        &format!("{DDL}; {seed}"),
+        &format!("{ddl}; {seed}"),
         &[
             ("id", int4()),
             ("ga", int4()),
@@ -2202,11 +2197,17 @@ async fn seeded(key: Key, kinds: &[Kind], seed: &str) -> Lab {
         &["public.a", "public.b"],
     )
     .await;
-    Lab {
+    let mut lab = Lab {
         d,
         key,
         kinds: kinds.to_vec(),
+    };
+    if ddl.contains("partition by") {
+        // The capture pass records a partitioned root's tree, which a
+        // per-leaf build routes by.
+        lab.pass().await;
     }
+    lab
 }
 
 const BUILD_OPTIONS: trellis::staging::build::WorkerOptions =
@@ -2769,7 +2770,7 @@ async fn resume(lab: &Lab, kind: Kind) {
     trellis::intake::markers::discharge_registrations(lab.d.pool())
         .await
         .expect("start the build");
-    assert_eq!(lab.statuses().await, ["(backfilling)"]);
+    assert_eq!(reader_status(lab, kind.name).await, ["(backfilling)"]);
 }
 
 /// Test 11: a `RESUME` keeps the visible target, recreates the hidden tables
@@ -2984,28 +2985,32 @@ async fn build_refuses_a_field_build() {
     );
 }
 
-/// A `RESUME` of a `JOIN` whose target has rows and a reader that isn't paused
-/// is refused at the build (#1287): the resume keeps the target and recreates
-/// the hidden tables, so a page that applies before the build (here one on
-/// both sides of a key) sends the reader prior images from the empty
-/// partials, and a group-basis reader would keep the error for good. The
-/// remedy the reason names repairs it: with the reader paused the `JOIN`
-/// builds, and the reader's own resume rebuilds it.
-#[tokio::test]
-async fn build_resume_with_a_live_reader_halts() {
+// ---------------------------------------------------- the readers (#1287)
+
+const I2_EXPECTED: &str = "select ga, sum(n), sum(sx) from ( \
+        select a.ga as ga, count(*) as n, sum(a.x) as sx from public.a \
+        join public.b on a.k = b.k group by a.ga, b.gb) s group by ga order by ga";
+const I3_EXPECTED: &str = "select n, count(*), sum(sx) from ( \
+        select ga, sum(n) as n, sum(sx) as sx from ( \
+            select a.ga as ga, count(*) as n, sum(a.x) as sx from public.a \
+            join public.b on a.k = b.k group by a.ga, b.gb) s group by ga) r \
+        group by n order by n";
+
+/// `I` live over the seeded tables with a group-basis reader `i2` of its
+/// target, and with `deeper` a reader `i3` of that.
+async fn chained(deeper: bool) -> Lab {
     let mut lab = seeded(Key::Single, &[I], BUILD_SEED).await;
     lab.build().await;
+    lab.assert_built("the JOIN before its readers").await;
+    let columns = |c: &[(&str, ValueType)]| -> std::collections::HashMap<String, ValueType> {
+        c.iter().map(|(n, t)| (n.to_string(), *t)).collect()
+    };
+    let int8 = ValueType::Integer(IntWidth::Int8);
     trellis::defs::install_definition(
         lab.d.pool(),
         "TRANSFORM i2 FROM public.i GROUP BY ga WITHOUT SOURCE INDEX \
          SELECT ga AS ga, SUM(n) AS n, SUM(sx) AS sx",
-        &[
-            ("ga".to_string(), int4()),
-            ("gb".to_string(), int4()),
-            ("n".to_string(), ValueType::Integer(IntWidth::Int8)),
-            ("sx".to_string(), ValueType::Integer(IntWidth::Int8)),
-        ]
-        .into(),
+        &columns(&[("ga", int4()), ("gb", int4()), ("n", int8), ("sx", int8)]),
         "public",
     )
     .await
@@ -3013,71 +3018,111 @@ async fn build_resume_with_a_live_reader_halts() {
     trellis::intake::markers::settle_registrations(lab.d.pool()).await;
     lab.build().await;
     lab.d.settle().await;
-    pause(&lab, I).await;
-    trellis::staging::quarantine::resume_transform(lab.d.pool(), "i")
+    if deeper {
+        trellis::defs::install_definition(
+            lab.d.pool(),
+            "TRANSFORM i3 FROM public.i2 GROUP BY n WITHOUT SOURCE INDEX \
+             SELECT COUNT(*) AS groups, SUM(sx) AS t",
+            &columns(&[("ga", int4()), ("n", int8), ("sx", int8)]),
+            "public",
+        )
         .await
-        .expect("resume");
-    trellis::intake::markers::discharge_registrations(lab.d.pool())
+        .expect("define the second reader");
+        trellis::intake::markers::settle_registrations(lab.d.pool()).await;
+        lab.build().await;
+        lab.d.settle().await;
+    }
+    lab
+}
+
+async fn reader_status(lab: &Lab, target: &str) -> Vec<String> {
+    lab.d
+        .rows(&format!(
+            "select status::text from transform_definitions where target_table = 'public.{target}'"
+        ))
         .await
-        .expect("start the build");
-    lab.step(
-        "insert into public.b values (60, 0, 1, 10, 1); \
-         update public.a set x = x + 1 where id = 1",
-    )
-    .await;
-    lab.build().await;
-    assert_eq!(
-        lab.d
-            .rows("select status::text from transform_definitions where target_table = 'public.i'")
-            .await,
-        ["(paused)"]
-    );
-    let error = lab.d.rows("select last_error from backfill_chunks").await;
-    assert!(error.len() == 1 && error[0].contains("#1287"), "{error:?}");
-    // The remedy the reason names: pause the reader, resume the JOIN, which
-    // builds, then resume the reader, which rebuilds from the JOIN's target.
-    lab.write("insert into public.a values (41, 1, 0, 1, 2)")
-        .await;
-    let trellis = trellis::Trellis::connect(
-        trellis::Config::from_dsn(lab.d.db.dsn().to_string()).expect("valid dsn"),
-        trellis::TrellisOptions::default(),
-    )
-    .await
-    .expect("connect");
-    trellis
-        .apply("PAUSE TRANSFORM i2")
-        .await
-        .expect("pause the reader");
-    trellis::staging::quarantine::resume_transform(lab.d.pool(), "i")
-        .await
-        .expect("resume the JOIN");
-    trellis::intake::markers::discharge_registrations(lab.d.pool())
-        .await
-        .expect("start the build");
-    lab.build().await;
-    trellis
-        .apply("RESUME TRANSFORM i2")
-        .await
-        .expect("resume the reader");
-    trellis::intake::markers::settle_registrations(lab.d.pool()).await;
-    lab.build().await;
+}
+
+/// The chain after the `JOIN`'s resumed build has committed: every reader the
+/// build parked is rebuilt, then each level agrees with its oracle.
+async fn chain_converges(lab: &mut Lab, deeper: bool) {
+    trellis::staging::build::settle_builds(lab.d.pool()).await;
+    lab.d.settle().await;
+    trellis::staging::build::settle_builds(lab.d.pool()).await;
     lab.d.settle().await;
     assert_eq!(
         lab.d
             .rows("select status::text from transform_definitions order by id")
             .await,
-        ["(live)", "(live)"]
+        vec!["(live)"; 2 + usize::from(deeper)]
     );
-    lab.check("the JOIN after the remedy").await;
+    lab.check("the JOIN").await;
     assert_eq!(
         lab.d
             .rows("select ga, n, sx from public.i2 order by ga")
             .await,
-        lab.d
-            .rows("select ga, sum(n), sum(sx) from public.i group by ga order by ga")
-            .await,
-        "the reader follows the rebuilt JOIN"
+        lab.d.rows(I2_EXPECTED).await,
+        "i2"
     );
+    if deeper {
+        assert_eq!(
+            lab.d
+                .rows("select n, groups, t from public.i3 order by n")
+                .await,
+            lab.d.rows(I3_EXPECTED).await,
+            "i3"
+        );
+    }
+}
+
+/// A page applied to a held group between a `JOIN`'s `RESUME` and the build's
+/// lock statement computes its prior image from the empty partials, so the
+/// seam row it stages moves the reader's groups by a delta against a value
+/// the reader never held. The build's commit parks the target's readers
+/// instead: a group-basis reader is rebuilt, and converges (#1287).
+async fn a_chained_reader_is_rebuilt(deeper: bool) {
+    let mut lab = chained(deeper).await;
+    pause(&lab, I).await;
+    resume(&lab, I).await;
+    let mut building = lab
+        .build_frozen("plan", &[PausePoint::BeforeJoinLock])
+        .await;
+    building.reached(PausePoint::BeforeJoinLock).await;
+    // A held group (ga 1) on both sides, before the build's lock statement.
+    lab.write(
+        "update public.a set x = x + 100 where id = 1; \
+         update public.b set y = y + 7 where id = 2",
+    )
+    .await;
+    let batch = lab.d.seal().await;
+    lab.d.drain(batch, "page").await;
+    lab.d
+        .release(&mut building, PausePoint::BeforeJoinLock)
+        .await;
+    building.finish().await;
+    assert_eq!(
+        reader_status(&lab, "i2").await,
+        ["(backfilling)"],
+        "the build's commit rebuilds the reader"
+    );
+    if deeper {
+        assert_eq!(
+            reader_status(&lab, "i3").await,
+            ["(live)"],
+            "the second reader is not rebuilt"
+        );
+    }
+    chain_converges(&mut lab, deeper).await;
+}
+
+#[tokio::test]
+async fn build_a_group_basis_reader_of_a_resumed_join_is_rebuilt_and_converges() {
+    a_chained_reader_is_rebuilt(false).await;
+}
+
+#[tokio::test]
+async fn build_the_second_reader_of_a_resumed_join_converges_without_being_rebuilt() {
+    a_chained_reader_is_rebuilt(true).await;
 }
 
 /// Test 9 (rule 7): the build holds the lock row `FOR SHARE`, so a page that
@@ -3235,4 +3280,548 @@ async fn build_a_pause_and_resume_wait_for_a_build_in_flight() {
     lab.build().await;
     lab.assert_built("a pause and resume during a build").await;
     lab.check("a pause and resume during a build").await;
+}
+
+// ------------------------------------------ partitioned sides (#1286, #1109)
+
+/// `a` and `b` (the [`DDL`] columns), each partitioned by list on `t` into
+/// three leaves (`t` 0, 1 and 2 or 3) when its flag is set. The join key
+/// `(t, k)` holds the partition key, and `k` is nullable, so a cell can have
+/// a `NULL` key part.
+fn partitioned_ddl(a: bool, b: bool) -> String {
+    let table = |name: &str, columns: &str, partitioned: bool| -> String {
+        if !partitioned {
+            return format!(
+                "create table public.{name} (id integer primary key, {columns}); "
+            );
+        }
+        format!(
+            "create table public.{name} (id integer not null, {columns}, primary key (t, id)) \
+                 partition by list (t); \
+             create table public.{name}0 partition of public.{name} for values in (0); \
+             create table public.{name}1 partition of public.{name} for values in (1); \
+             create table public.{name}2 partition of public.{name} for values in (2, 3); "
+        )
+    };
+    // Column order as in `DDL`: a (id, ga, t, k, x), b (id, t, k, gb, y).
+    format!(
+        "{}{}create index on public.a (t, k); create index on public.a (k); \
+         create index on public.b (t, k); create index on public.b (k)",
+        table(
+            "a",
+            "ga integer, t integer not null, k integer, x integer",
+            a
+        ),
+        table(
+            "b",
+            "t integer not null, k integer, gb integer, y integer",
+            b
+        ),
+    )
+}
+
+/// [`BUILD_SEED`] plus rows in the third leaf (`t` 2 and 3) of each side.
+const PARTITIONED_SEED: &str = "\
+    insert into public.a values (1, 1, 0, 1, 10), (2, 1, 0, 1, 5), (3, 2, 0, 2, 7), \
+        (4, 2, 0, 3, null), (5, 3, 0, null, 4), (6, null, 0, 2, 1), (7, 1, 1, 1, 100), \
+        (8, 4, 0, 8, 2), (20, 5, 2, 1, 3), (21, 5, 2, 2, 4), (22, 6, 3, null, 8); \
+    insert into public.b values (1, 0, 1, 10, 3), (2, 0, 1, 11, 4), (3, 0, 2, 10, null), \
+        (4, 0, null, 12, 5), (5, 0, 9, 13, 6), (6, 1, 1, 14, 50), (7, 0, 1, 10, 1), \
+        (20, 2, 1, 30, 2), (21, 3, 2, 31, 3)";
+
+/// What a build of a partitioned `JOIN` starts from.
+#[derive(Debug, Clone, Copy)]
+enum Mode {
+    /// A fresh build over seeded tables.
+    Fresh,
+    /// A `RESUME` over a kept target, after writes while paused and hand
+    /// edits.
+    Resume,
+    /// A rebuild in place of a `live` definition over tables that drifted.
+    InPlace,
+}
+
+/// Changes capture never saw, on both sides: a row of a leaf, a row with a
+/// `NULL` key part, a row of the last leaf and of the joined side.
+async fn drift_partitioned(lab: &Lab) {
+    uncaptured(
+        lab,
+        "public.a",
+        "update public.a set x = x + 100 where id = 1; delete from public.a where id = 4; \
+         update public.a set x = x + 50 where id = 5; update public.a set x = x + 7 where id = 20",
+    )
+    .await;
+    uncaptured(
+        lab,
+        "public.b",
+        "delete from public.b where k = 1 and t = 0; \
+         insert into public.b values (50, 0, 8, 20, 9); update public.b set y = 99 where id = 20",
+    )
+    .await;
+}
+
+/// Sets `lab` (one `kinds[0]` definition, `live`) up so its next build is
+/// `mode`'s, and returns the job kind that build runs as.
+async fn prepare(lab: &mut Lab, mode: Mode) -> &'static str {
+    let kind = lab.kinds[0];
+    match mode {
+        Mode::Fresh => "plan",
+        Mode::Resume => {
+            lab.build().await;
+            lab.assert_built("before the pause").await;
+            pause(lab, kind).await;
+            for sql in [
+                "insert into public.a values (70, 5, 0, 1, 1), (71, 7, 2, 1, 2); \
+                 insert into public.b values (70, 0, 3, 15, 1)",
+                "update public.a set x = 99 where id = 2; update public.b set y = 33 where id = 2",
+                "update public.a set k = 9 where id = 3; delete from public.b where id = 7",
+                "delete from public.a where id in (5, 22)",
+                "delete from public.b where k = 2",
+            ] {
+                lab.step(sql).await;
+            }
+            let t = lab.hidden(kind, "t").await;
+            lab.write(&format!(
+                "update public.{} set n = n + 5; update {t} set __n = __n + 5",
+                kind.name
+            ))
+            .await;
+            resume(lab, kind).await;
+            "plan"
+        }
+        Mode::InPlace => {
+            lab.build().await;
+            lab.assert_built("before the drift").await;
+            drift_partitioned(lab).await;
+            lab.write(&format!(
+                "update public.{name} set n = n + 1000; \
+                 insert into public.{name} ({columns}, n) values ({values}, 1)",
+                name = kind.name,
+                columns = kind.groups().join(", "),
+                values = kind
+                    .groups()
+                    .iter()
+                    .map(|_| "424242")
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ))
+            .await;
+            request_rebuild(lab, "a").await;
+            assert_eq!(
+                lab.d.rows("select kind from backfill_chunks").await,
+                ["(sweep)"]
+            );
+            "sweep"
+        }
+    }
+}
+
+/// A build with a partitioned side, in each mode and for each choice of
+/// partitioned sides, ends at the oracle with zero diff, and its steps run
+/// per side and leaf: the cursor names the last one (`side:oid`).
+async fn partitioned_case(a: bool, b: bool, mode: Mode, kind: Kind) {
+    let context = format!("a partitioned {a}, b partitioned {b}, {mode:?}, {}", kind.name);
+    let mut lab = seeded_in(
+        &partitioned_ddl(a, b),
+        Key::Pair,
+        &[kind],
+        PARTITIONED_SEED,
+    )
+    .await;
+    prepare(&mut lab, mode).await;
+    lab.build().await;
+    lab.assert_built(&context).await;
+    lab.check(&context).await;
+}
+
+#[tokio::test]
+async fn partitioned_from_side_with_an_unpartitioned_joined_side_builds() {
+    for mode in [Mode::Fresh, Mode::Resume, Mode::InPlace] {
+        partitioned_case(true, false, mode, L).await;
+    }
+    partitioned_case(true, false, Mode::Resume, I).await;
+}
+
+#[tokio::test]
+async fn partitioned_joined_side_with_an_unpartitioned_from_side_builds() {
+    for mode in [Mode::Fresh, Mode::Resume, Mode::InPlace] {
+        partitioned_case(false, true, mode, L).await;
+    }
+    partitioned_case(false, true, Mode::InPlace, I).await;
+}
+
+#[tokio::test]
+async fn both_sides_partitioned_build() {
+    for mode in [Mode::Fresh, Mode::Resume, Mode::InPlace] {
+        partitioned_case(true, true, mode, L).await;
+    }
+    partitioned_case(true, true, Mode::Resume, I).await;
+    partitioned_case(true, true, Mode::InPlace, I).await;
+}
+
+impl Lab {
+    /// Runs `job` frozen between two of its transactions, and returns once
+    /// the transaction before the pause has committed: the job's next step is
+    /// the one after.
+    async fn next_step(&self, job: &'static str) -> drain_driver::Running<()> {
+        let mut building = self
+            .build_frozen(job, &[PausePoint::BetweenRebuildStructures])
+            .await;
+        building.reached(PausePoint::BetweenRebuildStructures).await;
+        building
+    }
+
+    /// Kills `building` where it is, as a worker that dies, and frees its
+    /// claim for the next run.
+    async fn abandon(&self, building: drain_driver::Running<()>) {
+        building.kill().await;
+        self.write("update backfill_chunks set claimed_by = null, claimed_at = null")
+            .await;
+    }
+
+    /// The job's cursor.
+    async fn cursor(&self) -> String {
+        self.scalar("select coalesce(lo, '') from backfill_chunks where not done")
+            .await
+    }
+
+    /// Runs the job `steps` steps in, each run killed after its first step
+    /// (the cursor is what carries the job on), leaving the cursor after the
+    /// last of them.
+    async fn run_steps(&self, job: &'static str, steps: usize) {
+        for _ in 0..steps {
+            let building = self.next_step(job).await;
+            self.abandon(building).await;
+        }
+    }
+
+    /// One pass of the capture reconcile, which records the trees.
+    async fn pass(&mut self) {
+        let desired = trellis::defs::tables_to_capture(self.d.pool())
+            .await
+            .expect("tables to capture");
+        let outcome = trellis::capture::reconcile::reconcile(
+            &mut self.d.ctl,
+            DEFAULT_SCHEMA,
+            &desired,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .expect("pass");
+        assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+    }
+
+    /// The pass, a seal, the correction engine before any drain, and a drain.
+    async fn correct(&mut self) {
+        self.pass().await;
+        let batch = self.d.seal().await;
+        trellis::staging::partition_correction::run_pending(
+            self.d.pool(),
+            &trellis::staging::partition_correction::Options::default(),
+        )
+        .await
+        .expect("run the pending corrections");
+        self.d.drain(batch, "after").await;
+        self.d.settle().await;
+    }
+}
+
+/// A job killed after a step resumes at its cursor and does not write a
+/// committed step again: the cursor names the last step (`side:oid`), and
+/// the cells of the steps before it keep their bases.
+#[tokio::test]
+async fn a_killed_join_build_resumes_after_the_last_committed_step() {
+    let mut lab = seeded_in(
+        &partitioned_ddl(true, false),
+        Key::Pair,
+        &[L],
+        PARTITIONED_SEED,
+    )
+    .await;
+    let p = lab.hidden(L, "p").await;
+    let m = lab.hidden(L, "m").await;
+    // Steps: the unpartitioned joined side whole, then the `FROM` side's three
+    // leaves and its remainder, then the final `T` step.
+    lab.run_steps("plan", 1).await;
+    assert_eq!(lab.cursor().await, "joined:whole");
+    let m_bases = format!("select count(*), count(__basis) from {m}");
+    assert_eq!(
+        lab.d.rows(&m_bases).await,
+        lab.d.rows(&format!("select count(*), count(*) from {m}")).await,
+        "the joined side's cells carry a basis"
+    );
+    assert_eq!(
+        lab.d.rows(&format!("select count(*) from {p}")).await,
+        ["(0)"],
+        "no cell of the FROM side yet"
+    );
+    lab.run_steps("plan", 1).await;
+    let cursor = lab.cursor().await;
+    assert!(
+        cursor.starts_with("from:") && cursor != "from:remainder",
+        "{cursor}"
+    );
+    let leaf = format!("select ga, t, k, __n, __basis::text from {p} where t = 0 order by 1, 2, 3");
+    let first_leaf = lab.d.rows(&leaf).await;
+    assert!(!first_leaf.is_empty());
+    let basis_of_m = format!("select t, k, gb, __basis::text from {m} order by 1, 2, 3");
+    let m_before = lab.d.rows(&basis_of_m).await;
+    // The check holds at every committed step.
+    lab.check_applied("after a leaf").await;
+    lab.run_steps("plan", 1).await;
+    lab.check_applied("after a second leaf").await;
+    lab.build().await;
+    lab.assert_built("the resumed job").await;
+    lab.check("the resumed job").await;
+    assert_eq!(
+        lab.d.rows(&leaf).await,
+        first_leaf,
+        "the first leaf was not written again"
+    );
+    assert_eq!(
+        lab.d.rows(&basis_of_m).await,
+        m_before,
+        "the joined side was not written again"
+    );
+}
+
+/// A page between two leaves' transactions of a rebuild in place: one that
+/// committed before the rebuild (undrained) is refused by the rebuilt cell's
+/// basis, counted once; one committed after applies as a delta; a leaf not
+/// yet rebuilt counts the page that applied to its old cells. `T` equals
+/// `Σ P ⊗ M` at every committed state, and the end is the oracle.
+#[tokio::test]
+async fn a_page_between_two_steps_of_a_join_build_is_exact() {
+    for (a, b) in [(true, false), (false, true), (true, true)] {
+        let context = format!("a {a}, b {b}");
+        let mut lab = seeded_in(
+            &partitioned_ddl(a, b),
+            Key::Pair,
+            &[L],
+            PARTITIONED_SEED,
+        )
+        .await;
+        lab.build().await;
+        lab.assert_built(&context).await;
+        // Committed before the rebuild, still undrained: a row of the first
+        // leaf of each side, one of the second, and a joined key.
+        let undrained = lab
+            .sealed(
+                "update public.a set x = x + 1 where id in (1, 7); \
+                 update public.b set y = y + 1 where id in (1, 6)",
+            )
+            .await;
+        request_rebuild(&lab, "a").await;
+        // Two steps in: one side whole or a first leaf has committed.
+        lab.run_steps("sweep", 1).await;
+        let mut building = lab.next_step("sweep").await;
+        lab.check_applied(&format!("{context}: after two steps")).await;
+        lab.d.drain(undrained, "undrained").await;
+        lab.check_applied(&format!("{context}: after the undrained page"))
+            .await;
+        lab.step(
+            "update public.a set x = x + 10 where id in (2, 7, 20); \
+             update public.b set y = y + 10 where id in (2, 6, 20)",
+        )
+        .await;
+        lab.check_applied(&format!("{context}: after a later page")).await;
+        lab.d
+            .release(&mut building, PausePoint::BetweenRebuildStructures)
+            .await;
+        building.finish().await;
+        lab.assert_built(&context).await;
+        lab.check(&context).await;
+    }
+}
+
+/// `T`-level R8 is the final step's: a visible group no contribution backs
+/// any more (a group of the earlier life that the source lost while paused)
+/// stays through every side and leaf step and is removed by the final one.
+#[tokio::test]
+async fn only_the_final_step_removes_a_visible_group_without_contributions() {
+    let mut lab = seeded_in(
+        &partitioned_ddl(true, false),
+        Key::Pair,
+        &[L],
+        PARTITIONED_SEED,
+    )
+    .await;
+    lab.build().await;
+    lab.assert_built("before the pause").await;
+    pause(&lab, L).await;
+    lab.step("delete from public.a where ga = 6").await;
+    let held = "select count(*) from public.l where ga = 6";
+    assert_eq!(lab.d.rows(held).await, ["(1)"]);
+    resume(&lab, L).await;
+    // The joined side whole, then three leaves and the remainder: five steps.
+    lab.run_steps("plan", 4).await;
+    let mut building = lab.next_step("plan").await;
+    assert_eq!(
+        lab.d.rows(held).await,
+        ["(1)"],
+        "the side and leaf steps leave the group's visible row"
+    );
+    lab.d
+        .release(&mut building, PausePoint::BetweenRebuildStructures)
+        .await;
+    building.finish().await;
+    assert_eq!(lab.d.rows(held).await, ["(0)"], "the final step removes it");
+    lab.assert_built("the resume").await;
+    lab.check("the resume").await;
+}
+
+/// A cell that routes to no recorded leaf (a leaf created after the tree was
+/// recorded) is built by the remainder, read through the root; so is a cell
+/// with a `NULL` key part, which has no `J` row.
+#[tokio::test]
+async fn a_cell_that_routes_to_no_recorded_leaf_is_built_by_the_remainder() {
+    let mut lab = seeded_in(
+        &partitioned_ddl(true, false),
+        Key::Pair,
+        &[L],
+        PARTITIONED_SEED,
+    )
+    .await;
+    lab.build().await;
+    lab.assert_built("before").await;
+    lab.write("create table public.a3 partition of public.a for values in (4)")
+        .await;
+    lab.step("insert into public.a values (30, 7, 4, 1, 5), (31, 8, 4, null, 6)")
+        .await;
+    uncaptured(
+        &lab,
+        "public.a",
+        "update public.a set x = x + 40 where id in (30, 31); \
+         update public.a set x = x + 50 where id = 5",
+    )
+    .await;
+    request_rebuild(&lab, "a").await;
+    lab.build().await;
+    lab.assert_built("the remainder").await;
+    lab.check("the remainder").await;
+}
+
+/// Partition DDL between two steps of the build: a detach with a row written
+/// to the detached table, and an attach. The build and the corrections
+/// converge, and neither deadlocks the other.
+#[tokio::test]
+async fn partition_ddl_between_two_join_build_steps_converges() {
+    let mut lab = seeded_in(
+        &partitioned_ddl(true, false),
+        Key::Pair,
+        &[L],
+        PARTITIONED_SEED,
+    )
+    .await;
+    lab.build().await;
+    lab.assert_built("before").await;
+    request_rebuild(&lab, "a").await;
+    lab.run_steps("sweep", 1).await;
+    let mut building = lab.next_step("sweep").await;
+    lab.write(
+        "alter table public.a detach partition public.a1; \
+         insert into public.a1 values (9000, 8, 1, 1, 5); \
+         alter table public.a attach partition public.a1 for values in (1)",
+    )
+    .await;
+    lab.pass().await;
+    lab.d
+        .release(&mut building, PausePoint::BetweenRebuildStructures)
+        .await;
+    building.finish().await;
+    lab.correct().await;
+    lab.correct().await;
+    lab.d.settle().await;
+    assert_eq!(lab.d.deadlocks_logged(), Vec::<String>::new());
+    lab.assert_built("after the DDL and the build").await;
+    lab.check("after the DDL and the build").await;
+}
+
+/// A leaf with no usable constraint text can't have its cells routed: the
+/// job fails rather than build the side in one statement over the root.
+#[tokio::test]
+async fn a_leaf_without_a_constraint_text_halts_a_join_build() {
+    let lab = seeded_in(
+        &partitioned_ddl(true, false),
+        Key::Pair,
+        &[L],
+        PARTITIONED_SEED,
+    )
+    .await;
+    lab.write(
+        "update partition_sources set nodes = jsonb_set(nodes, \
+             array['nodes', (select (i - 1)::text from jsonb_array_elements(nodes->'nodes') \
+                             with ordinality as e(n, i) \
+                             where n->>'name' = 'public.a1'), 'constraint'], \
+             'null'::jsonb)",
+    )
+    .await;
+    lab.build().await;
+    let error = lab.d.rows("select last_error from backfill_chunks").await;
+    assert!(
+        error.len() == 1 && error[0].contains("no usable constraint text"),
+        "{error:?}"
+    );
+}
+
+/// A chained reader of a partitioned `JOIN`'s resume is parked once, by the
+/// final step, not by any leaf.
+#[tokio::test]
+async fn a_reader_of_a_join_resumed_per_leaf_is_rebuilt_once() {
+    let mut lab = seeded_in(
+        &partitioned_ddl(true, true),
+        Key::Pair,
+        &[I],
+        PARTITIONED_SEED,
+    )
+    .await;
+    lab.build().await;
+    let int8 = ValueType::Integer(IntWidth::Int8);
+    trellis::defs::install_definition(
+        lab.d.pool(),
+        "TRANSFORM i2 FROM public.i GROUP BY ga WITHOUT SOURCE INDEX \
+         SELECT ga AS ga, SUM(n) AS n, SUM(sx) AS sx",
+        &[("ga", int4()), ("gb", int4()), ("n", int8), ("sx", int8)]
+            .into_iter()
+            .map(|(n, t)| (n.to_string(), t))
+            .collect(),
+        "public",
+    )
+    .await
+    .expect("define the reader");
+    trellis::intake::markers::settle_registrations(lab.d.pool()).await;
+    lab.build().await;
+    lab.d.settle().await;
+    pause(&lab, I).await;
+    resume(&lab, I).await;
+    // Both sides partitioned: three leaves and a remainder each, then final.
+    lab.run_steps("plan", 3).await;
+    assert_eq!(
+        reader_status(&lab, "i2").await,
+        ["(live)"],
+        "a leaf's transaction parks nothing"
+    );
+    lab.run_steps("plan", 5).await;
+    assert_eq!(
+        reader_status(&lab, "i2").await,
+        ["(live)"],
+        "no side or leaf step parks anything"
+    );
+    lab.build_frozen("plan", &[]).await.finish().await;
+    assert_eq!(
+        reader_status(&lab, "i2").await,
+        ["(backfilling)"],
+        "the final step rebuilds the reader"
+    );
+    trellis::staging::build::settle_builds(lab.d.pool()).await;
+    lab.d.settle().await;
+    lab.check("the JOIN").await;
+    assert_eq!(
+        lab.d
+            .rows("select ga, n, sx from public.i2 order by ga")
+            .await,
+        lab.d
+            .rows(&I2_EXPECTED.replace("a.k = b.k", "a.t = b.t and a.k = b.k"))
+            .await
+    );
 }

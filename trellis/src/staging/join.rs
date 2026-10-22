@@ -1210,24 +1210,75 @@ pub(crate) async fn build(
     txn: &Transaction<'_>,
     catalog_schema: &str,
     definition: &Definition,
+    work: &BuildWork<'_>,
 ) -> Result<(usize, usize), ApplyError> {
     let mut plan = plan_for(txn, catalog_schema, definition).await?;
     pause!(txn, BeforeJoinBuild, &plan.target);
-    for side in [&mut plan.from, &mut plan.joined] {
-        side.recompute = true;
-        side.node = Some(side.plan.source_row().to_string());
-    }
     create_working_tables(txn, &plan).await?;
-    txn.execute(&format!("select 1 from {} for share", plan.lock_ident), &[])
-        .await?;
-    for side in [&plan.from, &plan.joined] {
-        group_basis::enumerate_cells(txn, &side.plan).await?;
-    }
     let mut mutations = TargetMutations::new();
-    let (written, deleted) = write_locked(txn, &plan, &mut mutations, true).await?;
+    let counts = match work {
+        BuildWork::Single => {
+            for side in [&mut plan.from, &mut plan.joined] {
+                side.recompute = true;
+                side.node = Some(side.plan.source_row().to_string());
+            }
+            txn.execute(&format!("select 1 from {} for share", plan.lock_ident), &[])
+                .await?;
+            for side in [&plan.from, &plan.joined] {
+                group_basis::enumerate_cells(txn, &side.plan, None).await?;
+            }
+            write_locked(txn, &plan, &mut mutations, true).await?
+        }
+        BuildWork::Side { side, scope } => {
+            let side_plan = plan.side_mut(*side);
+            side_plan.recompute = true;
+            // The region's rows come from one `GROUP BY` of the table (a whole
+            // side) or of the leaf, if the tree is as recorded; otherwise
+            // each cell's rows are probed through the root.
+            side_plan.node = match scope {
+                None => Some(side_plan.plan.source_row().to_string()),
+                Some(scope) if scope.read_node => scope.node.clone(),
+                Some(_) => None,
+            };
+            txn.execute(&format!("select 1 from {} for share", plan.lock_ident), &[])
+                .await?;
+            let side_plan = match side {
+                Side::From => &plan.from,
+                Side::Joined => &plan.joined,
+            };
+            group_basis::enumerate_cells(txn, &side_plan.plan, *scope).await?;
+            write_locked(txn, &plan, &mut mutations, false).await?
+        }
+        BuildWork::Final => {
+            txn.execute(&format!("select 1 from {} for share", plan.lock_ident), &[])
+                .await?;
+            group_basis::enumerate_target_groups(txn, &plan.t).await?;
+            txn.execute(&plan.t.lock_sql(), &[]).await?;
+            pause!(txn, AfterJoinTargetLock, &plan.target);
+            group_basis::apply_join_build_groups(txn, &plan.t, &mut mutations).await?
+        }
+    };
     let propagation = mutations.into_staged(txn).await?;
     super::append::append(txn, &propagation.changes).await?;
-    Ok((written, deleted))
+    Ok(counts)
+}
+
+/// What one transaction of a `JOIN`'s build does ([`build`]).
+#[derive(Clone, Copy)]
+pub(crate) enum BuildWork<'a> {
+    /// The whole build: both sides unpartitioned (or empty), S1T.
+    Single,
+    /// One side's cells in a region, a step of the per-side, per-leaf build
+    /// of a `JOIN` with a partitioned side that has rows (#1286): the whole
+    /// side (`scope` none), or the cells a leaf or the remainder of its
+    /// recorded tree covers.
+    Side {
+        side: Side,
+        scope: Option<&'a group_basis::RebuildScope>,
+    },
+    /// The last step of that build: every group of `T` and of the visible
+    /// target compared.
+    Final,
 }
 
 /// The column list of each of definition `id`'s hidden tables in

@@ -3114,17 +3114,17 @@ async fn run_plan(
                 what: "a field build of a JOIN (ALTER TRANSFORM takes only a 1-1 target)",
             }));
         }
-        // Its commit keeps its target's readers as they are: a `RESUME` over a
-        // target that has rows halts unless they are paused
-        // (`join_build_refusal`), so there is none to park.
+        // Its commit parks its target's readers (#1287), once, in the
+        // transaction that completes the build (the last step, if it has
+        // several).
         return run_group_rebuild_held(
             pool,
             chunk,
             claimed_by,
             &definition,
             &fence,
-            None,
-            ReadersOnCommit::Keep,
+            cursor.as_deref(),
+            ReadersOnCommit::Park,
         )
         .await;
     }
@@ -3387,17 +3387,26 @@ async fn run_group_rebuild_held(
 ) -> Result<(), ChunkQueueError> {
     let mut client = pool.get().await?;
     if super::join::applies(&definition.def) {
-        if let Some(what) = join_build_refusal(
-            &**client,
-            definition,
-            matches!(chunk.work, chunk_queue::ChunkWork::Plan { .. }),
-        )
-        .await?
-        {
+        if let Some(what) = join_build_refusal(&**client, definition).await? {
             return Err(build_error(ApplyError::GroupBasisUnsupported {
                 target: definition.target_table.clone(),
                 what,
             }));
+        }
+        let partitioned = join_partitioned_sides(&**client, definition).await?;
+        if !partitioned.is_empty() {
+            drop(client);
+            return run_join_steps(
+                pool,
+                chunk,
+                claimed_by,
+                definition,
+                fence,
+                cursor,
+                readers,
+                &partitioned,
+            )
+            .await;
         }
         let Some((written, deleted)) = run_group_structure(
             pool,
@@ -3526,78 +3535,290 @@ async fn run_group_rebuild_held(
 }
 
 /// Why a `JOIN`'s build ([`run_group_rebuild_held`]) can't run, if it can't
-/// (#1109): the reason becomes the definition's halting failure. `fresh` is
-/// the plan job of a fresh build or a `RESUME`.
+/// (#1109): the reason becomes the definition's halting failure.
 ///
 /// - **A side that is another definition's target.** The target feed isn't
 ///   wired into the build; when it is, the seam fence of [`run_plan`] must
 ///   test both tables, not only the `FROM` one.
-/// - **A partitioned side that has rows.** The build there is per side and
-///   per leaf (#1286), which isn't built yet. A partitioned side with no rows
-///   builds as an unpartitioned one: there is nothing to bound.
-/// - **A `RESUME` over a target that has rows and unfrozen readers.** A
-///   `RESUME` keeps the visible target and recreates the hidden tables, so a
-///   page that applies before the build commits computes its prior image from
-///   the empty partials, not from the row the target holds, and a reader
-///   chained on the target double-counts for good. A group-basis aggregate's
-///   build parks and rebuilds those readers at its commit
-///   ([`ReadersOnCommit::Park`], #1287); a `JOIN`'s doesn't yet, so it halts
-///   instead. A rebuild in place has no such window: the partials it
-///   replaces are the ones the pages read.
 async fn join_build_refusal(
     client: &impl GenericClient,
     definition: &Definition,
-    fresh: bool,
 ) -> Result<Option<&'static str>, ChunkQueueError> {
     let mut tables = vec![definition.source_table.clone()];
     tables.extend(catalog::join_table_of(client, definition.id).await?);
-    let mut rows = false;
     for table in &tables {
         if catalog::is_definition_target(client, table).await? {
             return Ok(Some(
                 "a JOIN side that is another definition's target (the target feed is #1100's)",
             ));
         }
-        if crate::defs::partition_tree::is_partitioned_root(client, table).await? {
-            let has_rows: bool = client
-                .query_one(
-                    &format!(
-                        "select exists (select 1 from {})",
-                        ddl::qualified_source_table(table)
-                    ),
-                    &[],
-                )
-                .await?
-                .get(0);
-            rows |= has_rows;
+    }
+    Ok(None)
+}
+
+/// The sides of a `JOIN` that are a partitioned root with rows, `FROM` side
+/// first: the sides whose build is per leaf (#1286). A partitioned side with
+/// no rows builds as an unpartitioned one: there is nothing to bound.
+async fn join_partitioned_sides(
+    client: &impl GenericClient,
+    definition: &Definition,
+) -> Result<Vec<(crate::defs::join::Side, String)>, ChunkQueueError> {
+    use crate::defs::join::Side;
+    let mut sides = vec![(Side::From, definition.source_table.clone())];
+    sides.extend(
+        catalog::join_table_of(client, definition.id)
+            .await?
+            .map(|t| (Side::Joined, t)),
+    );
+    let mut partitioned = Vec::new();
+    for (side, table) in sides {
+        if !crate::defs::partition_tree::is_partitioned_root(client, &table).await? {
+            continue;
         }
-    }
-    if rows {
-        return Ok(Some(
-            "a JOIN build over a partitioned side that has rows (its per-leaf build, #1286, \
-             isn't built yet); drop the transform, or define it over unpartitioned tables",
-        ));
-    }
-    if fresh {
-        let held: bool = client
+        let has_rows: bool = client
             .query_one(
                 &format!(
                     "select exists (select 1 from {})",
-                    ddl::qualified_target_table_ident(&definition.target_table)
+                    ddl::qualified_source_table(&table)
                 ),
                 &[],
             )
             .await?
             .get(0);
-        if held && catalog::has_unfrozen_reader(client, &definition.target_table).await? {
-            return Ok(Some(
-                "a RESUME of a JOIN whose target has rows and a reader that is not paused: the \
-                 reader would double-count what the resume keeps (#1287); pause the target's \
-                 readers first, then resume the JOIN and its readers",
-            ));
+        if has_rows {
+            partitioned.push((side, table));
         }
     }
-    Ok(None)
+    Ok(partitioned)
+}
+
+/// One side's recorded tree, for a `JOIN` build's per-leaf steps.
+struct SideTree {
+    side: crate::defs::join::Side,
+    /// The side's cell columns (its `P` or `M` key), which a leaf's
+    /// constraint text routes.
+    names: Vec<String>,
+    recorded: crate::capture::partitions::Recorded,
+    leaves: Vec<super::partition_correction::RebuildLeaf>,
+}
+
+/// A `JOIN` build with a partitioned side that has rows (#1286, ADR-0019): a
+/// sequence of bounded transactions, the job's cursor (`backfill_chunks.lo`,
+/// `side:oid`) written in each, so a job that dies resumes after its last
+/// committed step.
+///
+/// 1. Every unpartitioned side, whole, in one transaction each (`FROM`
+///    first).
+/// 2. Each partitioned side, `FROM` first: its leaves in oid order, then its
+///    remainder, the cells that route to no recorded leaf.
+/// 3. The final `T` step, which marks the job done and parks the readers'
+///    catch-up ([`ReadersOnCommit::Park`]), once, in its transaction.
+///
+/// An unrecorded tree, or a leaf without usable constraint text, fails the
+/// job: there is no statement over the whole root to fall back to.
+#[allow(clippy::too_many_arguments)]
+async fn run_join_steps(
+    pool: &Pool,
+    chunk: &ClaimedChunk,
+    claimed_by: &str,
+    definition: &Definition,
+    fence: &ClaimFence<'_>,
+    cursor: Option<&str>,
+    readers: ReadersOnCommit,
+    partitioned: &[(crate::defs::join::Side, String)],
+) -> Result<(), ChunkQueueError> {
+    use crate::defs::join::Side;
+    let unsupported = |what: &'static str| {
+        build_error(ApplyError::GroupBasisUnsupported {
+            target: definition.target_table.clone(),
+            what,
+        })
+    };
+    let mut client = pool.get().await?;
+    let mut trees: Vec<SideTree> = Vec::new();
+    for (side, table) in partitioned {
+        let recorded = crate::capture::partitions::recorded(&**client, table)
+            .await
+            .map_err(|e| ChunkQueueError::Correction(Box::new(e.into())))?;
+        let Some(recorded) = recorded else {
+            return Err(unsupported(
+                "a JOIN build over a partitioned side whose tree is not recorded",
+            ));
+        };
+        let Ok(leaves) = super::partition_correction::rebuild_leaves(&recorded) else {
+            return Err(unsupported(
+                "a JOIN build over a partitioned side with a leaf that has no usable \
+                 constraint text",
+            ));
+        };
+        trees.push(SideTree {
+            side: *side,
+            names: crate::defs::join::side_key_columns(&definition.def, *side),
+            recorded,
+            leaves,
+        });
+    }
+    let names: Vec<Vec<&str>> = trees
+        .iter()
+        .map(|t| t.names.iter().map(String::as_str).collect())
+        .collect();
+    // The steps in order, each with its position (`order`), which the cursor
+    // names: the group (whole unpartitioned sides, then partitioned ones),
+    // the side, the leaf's oid (the remainder last).
+    let side_index = |side: Side| u8::from(side == Side::Joined);
+    let mut steps: Vec<(JoinStep<'_>, (u8, u8, u64))> = Vec::new();
+    for side in [Side::From, Side::Joined] {
+        if !trees.iter().any(|t| t.side == side) {
+            steps.push((JoinStep::Whole { side }, (0, side_index(side), 0)));
+        }
+    }
+    for side in [Side::From, Side::Joined] {
+        let Some(at) = trees.iter().position(|t| t.side == side) else {
+            continue;
+        };
+        let tree = &trees[at];
+        for leaf in &tree.leaves {
+            steps.push((
+                JoinStep::Leaf {
+                    side,
+                    names: &names[at],
+                    recorded: &tree.recorded,
+                    leaf,
+                },
+                (1, side_index(side), u64::from(leaf.oid)),
+            ));
+        }
+        steps.push((
+            JoinStep::Remainder {
+                side,
+                names: &names[at],
+                recorded: &tree.recorded,
+                leaves: &tree.leaves,
+            },
+            (1, side_index(side), u64::MAX),
+        ));
+    }
+    // A cursor that names none of these steps (the tree or a side's
+    // partitioning changed since) starts over: every step is idempotent.
+    let after = cursor
+        .filter(|c| steps.iter().any(|(step, _)| join_cursor(step) == *c))
+        .and_then(parse_join_cursor);
+    let (mut written, mut deleted) = (0, 0);
+    for (step, _) in steps.iter().filter(|(_, o)| after.is_none_or(|a| *o > a)) {
+        let structure = Structure::Join {
+            piece: JoinPiece::Step(step),
+            cursor: Some(join_cursor(step)),
+        };
+        let Some((w, d)) = run_group_structure(
+            pool,
+            &mut client,
+            chunk,
+            fence,
+            definition,
+            &structure,
+            readers,
+        )
+        .await?
+        else {
+            return chunk_queue::discard_if_superseded(pool, chunk, claimed_by).await;
+        };
+        written += w;
+        deleted += d;
+        #[cfg(any(test, feature = "test-util"))]
+        super::interleave::pause_between_transactions(
+            &**client,
+            super::interleave::PausePoint::BetweenRebuildStructures,
+            &definition.target_table,
+        )
+        .await?;
+    }
+    let structure = Structure::Join {
+        piece: JoinPiece::Final,
+        cursor: None,
+    };
+    let Some((w, d)) = run_group_structure(
+        pool,
+        &mut client,
+        chunk,
+        fence,
+        definition,
+        &structure,
+        readers,
+    )
+    .await?
+    else {
+        return chunk_queue::discard_if_superseded(pool, chunk, claimed_by).await;
+    };
+    crate::instance_log::debug!(
+        definition_id = chunk.definition_id,
+        written = written + w,
+        deleted = deleted + d,
+        "JOIN build replaced both structures, one side and leaf at a time"
+    );
+    try_complete(pool, chunk.definition_id).await?;
+    Ok(())
+}
+
+/// One step of [`run_join_steps`] before its final one.
+enum JoinStep<'a> {
+    /// A whole unpartitioned side.
+    Whole { side: crate::defs::join::Side },
+    /// One leaf of a partitioned side's recorded tree.
+    Leaf {
+        side: crate::defs::join::Side,
+        names: &'a [&'a str],
+        recorded: &'a crate::capture::partitions::Recorded,
+        leaf: &'a super::partition_correction::RebuildLeaf,
+    },
+    /// The cells of a partitioned side that route to none of its leaves.
+    Remainder {
+        side: crate::defs::join::Side,
+        names: &'a [&'a str],
+        recorded: &'a crate::capture::partitions::Recorded,
+        leaves: &'a [super::partition_correction::RebuildLeaf],
+    },
+}
+
+/// What one transaction of a `JOIN`'s per-leaf build covers
+/// ([`Structure::Join`]).
+enum JoinPiece<'a> {
+    Step(&'a JoinStep<'a>),
+    /// The final `T` step.
+    Final,
+}
+
+fn side_name(side: crate::defs::join::Side) -> &'static str {
+    match side {
+        crate::defs::join::Side::From => "from",
+        crate::defs::join::Side::Joined => "joined",
+    }
+}
+
+/// A step's cursor (`backfill_chunks.lo`): `side:oid`, `side:whole` or
+/// `side:remainder`.
+fn join_cursor(step: &JoinStep<'_>) -> String {
+    match step {
+        JoinStep::Whole { side } => format!("{}:whole", side_name(*side)),
+        JoinStep::Leaf { side, leaf, .. } => format!("{}:{}", side_name(*side), leaf.oid),
+        JoinStep::Remainder { side, .. } => format!("{}:remainder", side_name(*side)),
+    }
+}
+
+/// The position of the step a cursor names, as [`run_join_steps`] orders
+/// them: (group, side, leaf oid). `None` for a cursor it doesn't know, which
+/// starts the build over (every step is idempotent).
+fn parse_join_cursor(cursor: &str) -> Option<(u8, u8, u64)> {
+    let (side, rest) = cursor.split_once(':')?;
+    let side = match side {
+        "from" => 0,
+        "joined" => 1,
+        _ => return None,
+    };
+    match rest {
+        "whole" => Some((0, side, 0)),
+        "remainder" => Some((1, side, u64::MAX)),
+        oid => Some((1, side, oid.parse().ok()?)),
+    }
 }
 
 /// What one transaction of a group-basis rebuild covers.
@@ -3613,6 +3834,33 @@ enum Structure<'a> {
         leaf: Option<&'a super::partition_correction::RebuildLeaf>,
         last: bool,
     },
+    /// One transaction of a `JOIN`'s per-side, per-leaf build
+    /// ([`run_join_steps`]): `cursor` is what the job's `lo` holds after a
+    /// step, none for the final one, which marks the job done.
+    Join {
+        piece: JoinPiece<'a>,
+        cursor: Option<String>,
+    },
+}
+
+/// The scope of `leaf` in `txn`: the leaf locked `ACCESS SHARE` and the tree
+/// checked against the record, both held to the commit. A leaf that is gone,
+/// or a tree that changed, is read through the root, one probe per group,
+/// and the change's own correction repairs what it moved (ADR-0017).
+async fn locked_leaf_scope(
+    txn: &tokio_postgres::Transaction<'_>,
+    names: &[&str],
+    recorded: &crate::capture::partitions::Recorded,
+    leaf: &super::partition_correction::RebuildLeaf,
+) -> Result<super::group_basis::RebuildScope, ChunkQueueError> {
+    let locked = super::partition_correction::lock_recorded_node(txn, leaf.oid, recorded).await?;
+    let (node, read_node) = match locked {
+        Some(locked) => (Some(locked.name), locked.as_recorded),
+        None => (None, false),
+    };
+    Ok(super::partition_correction::leaf_scope(
+        names, recorded, leaf, node, read_node,
+    ))
 }
 
 /// One transaction of a group-basis rebuild ([`run_group_rebuild`]): the
@@ -3667,25 +3915,10 @@ async fn run_group_structure(
             recorded,
             leaf: Some(leaf),
             ..
-        } => {
-            // The leaf locked `ACCESS SHARE` and the tree checked against
-            // the record, both held to the commit: a leaf that is gone, or
-            // a tree that changed, is read through the root, one probe per
-            // group, and the change's own correction repairs what it moved
-            // (ADR-0017).
-            let locked =
-                super::partition_correction::lock_recorded_node(&txn, leaf.oid, recorded).await?;
-            let (node, read_node) = match locked {
-                Some(locked) => (Some(locked.name), locked.as_recorded),
-                None => (None, false),
-            };
-            (
-                Some(super::partition_correction::leaf_scope(
-                    names, recorded, leaf, node, read_node,
-                )),
-                Some(leaf.oid.to_string()),
-            )
-        }
+        } => (
+            Some(locked_leaf_scope(&txn, names, recorded, leaf).await?),
+            Some(leaf.oid.to_string()),
+        ),
         Structure::Partitioned {
             names,
             recorded,
@@ -3698,9 +3931,48 @@ async fn run_group_structure(
             )),
             None,
         ),
+        Structure::Join { piece, cursor } => {
+            let scope = match piece {
+                JoinPiece::Step(JoinStep::Leaf {
+                    names,
+                    recorded,
+                    leaf,
+                    ..
+                }) => Some(locked_leaf_scope(&txn, names, recorded, leaf).await?),
+                JoinPiece::Step(JoinStep::Remainder {
+                    names,
+                    recorded,
+                    leaves,
+                    ..
+                }) => Some(super::partition_correction::remainder_scope(
+                    names, recorded, leaves,
+                )),
+                JoinPiece::Step(JoinStep::Whole { .. }) | JoinPiece::Final => None,
+            };
+            (scope, cursor.clone())
+        }
     };
     let (written, deleted) = if super::join::applies(&definition.def) {
-        super::join::build(&txn, pool.schema(), definition)
+        let work = match structure {
+            Structure::Join {
+                piece: JoinPiece::Step(step),
+                ..
+            } => {
+                let (JoinStep::Whole { side }
+                | JoinStep::Leaf { side, .. }
+                | JoinStep::Remainder { side, .. }) = step;
+                super::join::BuildWork::Side {
+                    side: *side,
+                    scope: scope.as_ref(),
+                }
+            }
+            Structure::Join {
+                piece: JoinPiece::Final,
+                ..
+            } => super::join::BuildWork::Final,
+            _ => super::join::BuildWork::Single,
+        };
+        super::join::build(&txn, pool.schema(), definition, &work)
             .await
             .map_err(build_error)?
     } else {
@@ -3709,22 +3981,24 @@ async fn run_group_structure(
             .map_err(build_error)?
             .unwrap_or((0, 0))
     };
-    match (structure, cursor) {
-        (Structure::Partitioned { last: false, .. }, Some(cursor)) => {
-            txn.execute(
-                "update backfill_chunks set lo = $2 where id = $1",
-                &[&chunk.id, &cursor],
-            )
-            .await?;
-        }
-        _ => {
-            txn.execute(
-                "update backfill_chunks set done = true, claimed_by = null, claimed_at = null \
-                 where id = $1",
-                &[&chunk.id],
-            )
-            .await?;
-        }
+    let advances = match structure {
+        Structure::Partitioned { last: false, .. } => cursor.is_some(),
+        Structure::Join { cursor, .. } => cursor.is_some(),
+        _ => false,
+    };
+    if let (true, Some(cursor)) = (advances, &cursor) {
+        txn.execute(
+            "update backfill_chunks set lo = $2 where id = $1",
+            &[&chunk.id, cursor],
+        )
+        .await?;
+    } else {
+        txn.execute(
+            "update backfill_chunks set done = true, claimed_by = null, claimed_at = null \
+             where id = $1",
+            &[&chunk.id],
+        )
+        .await?;
     }
     #[cfg(any(test, feature = "test-util"))]
     super::interleave::pause_at(
@@ -3736,7 +4010,7 @@ async fn run_group_structure(
     // The transaction that completes the whole build parks its readers'
     // catch-up (#1287), once, not per leaf; the segment stamp is the last
     // statement before the commit.
-    let finished = !matches!(structure, Structure::Partitioned { last: false, .. });
+    let finished = !advances;
     let rebuilt = if finished && readers == ReadersOnCommit::Park {
         crate::intake::markers::park_target_catchup_if_read(&txn, chunk.definition_id)
             .await

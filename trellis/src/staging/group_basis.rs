@@ -2187,17 +2187,63 @@ pub(crate) async fn apply_locked_groups(
     Ok(written_groups(plan, rows, mutations))
 }
 
+/// Pins the settings a recorded constraint text's meaning depends on
+/// (`crate::capture::partitions::pinned_settings`) for the rest of the
+/// transaction, or until [`restore_settings`], and returns what to restore.
+/// Only a routed enumeration runs under them, and it waits for a lock as the
+/// session does: under its `lock_timeout` cap, which a `set local ... to
+/// default` would drop.
+pub(super) async fn pin_settings(txn: &Transaction<'_>) -> Result<[String; 4], ApplyError> {
+    let row = txn
+        .query_one(
+            "select current_setting('search_path'), current_setting('lock_timeout'), \
+                    current_setting('datestyle'), current_setting('timezone')",
+            &[],
+        )
+        .await?;
+    let saved: [String; 4] = [row.get(0), row.get(1), row.get(2), row.get(3)];
+    txn.batch_execute(&crate::capture::partitions::pinned_settings())
+        .await?;
+    txn.execute("select set_config('lock_timeout', $1, true)", &[&saved[1]])
+        .await?;
+    Ok(saved)
+}
+
+/// Undoes [`pin_settings`].
+pub(super) async fn restore_settings(
+    txn: &Transaction<'_>,
+    saved: &[String; 4],
+) -> Result<(), ApplyError> {
+    txn.execute(
+        "select set_config('search_path', $1, true), set_config('lock_timeout', $2, true), \
+                set_config('datestyle', $3, true), set_config('timezone', $4, true)",
+        &[&saved[0], &saved[1], &saved[2], &saved[3]],
+    )
+    .await?;
+    Ok(())
+}
+
 /// A JOIN build's enumeration of one side's cells (`super::join::build`,
 /// ADR-0002's R8): adds to [`GroupTargetPlan::recomputed`] every cell the
 /// side's hidden table holds, every cell of its table's rows, and the cell of
 /// every old image of the ring's changes to the table
-/// ([`GroupTargetPlan::rebuild_groups_sql`]). Reads without a lock.
+/// ([`GroupTargetPlan::rebuild_groups_sql`]). With a `scope` (one leaf of a
+/// partitioned side, or its remainder, #1286) only the cells the scope routes
+/// to the structure. Reads without a lock.
 pub(super) async fn enumerate_cells(
     txn: &Transaction<'_>,
     plan: &GroupTargetPlan,
+    scope: Option<&RebuildScope>,
 ) -> Result<(), ApplyError> {
-    txn.execute(&plan.rebuild_groups_sql(None), &[&plan.source])
+    let saved = match scope {
+        Some(_) => Some(pin_settings(txn).await?),
+        None => None,
+    };
+    txn.execute(&plan.rebuild_groups_sql(scope), &[&plan.source])
         .await?;
+    if let Some(saved) = saved {
+        restore_settings(txn, &saved).await?;
+    }
     Ok(())
 }
 
@@ -2463,35 +2509,14 @@ pub(crate) async fn rebuild(
     txn.batch_execute(&format!("{}; {}", plan.staged_ddl(), plan.recomputed_ddl()))
         .await?;
     let session = if scope.is_some() {
-        // The routing predicates mean what they meant when the tree was
-        // recorded only under the pinned settings. Only the enumeration runs
-        // under them, and waits for a lock as the session does: under its
-        // `lock_timeout` cap, which a `set local ... to default` would drop.
-        let row = txn
-            .query_one(
-                "select current_setting('search_path'), current_setting('lock_timeout'), \
-                        current_setting('datestyle'), current_setting('timezone')",
-                &[],
-            )
-            .await?;
-        let saved: [String; 4] = [row.get(0), row.get(1), row.get(2), row.get(3)];
-        txn.batch_execute(&crate::capture::partitions::pinned_settings())
-            .await?;
-        txn.execute("select set_config('lock_timeout', $1, true)", &[&saved[1]])
-            .await?;
-        Some(saved)
+        Some(pin_settings(txn).await?)
     } else {
         None
     };
     txn.execute(&plan.rebuild_groups_sql(scope), &[&plan.source])
         .await?;
     if let Some(saved) = session {
-        txn.execute(
-            "select set_config('search_path', $1, true), set_config('lock_timeout', $2, true), \
-                    set_config('datestyle', $3, true), set_config('timezone', $4, true)",
-            &[&saved[0], &saved[1], &saved[2], &saved[3]],
-        )
-        .await?;
+        restore_settings(txn, &saved).await?;
     }
     // Test-only pause point: the groups are enumerated, and none is locked.
     // See `super::interleave`.
