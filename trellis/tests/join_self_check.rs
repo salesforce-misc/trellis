@@ -4,7 +4,9 @@
 //! against what the two tables say they hold. A planted divergence in each is
 //! reported on that table alone, and gone once the planted damage is undone
 //! by hand (the repair for real damage is `request_backfill`, whose rebuild
-//! `join_interleavings.rs` tests). One test here checks the `J` lock-wait
+//! `join_interleavings.rs` tests; the last tests here run the loop, check,
+//! repair, check, for `P`/`M` by `request_backfill` and for `J`/`T` by
+//! `PAUSE`/`RESUME`). One test here checks the `J` lock-wait
 //! histogram a page records (#1112 J7b), since it needs the same knob-on
 //! driver.
 //!
@@ -24,6 +26,7 @@ use trellis::integer::IntWidth;
 use trellis::staging::self_check::{
     Divergence, SelfCheckMode, SelfCheckOutcome, SelfCheckScope, check_page, compare_page,
 };
+use trellis::{Config, Trellis, TrellisOptions};
 
 const DDL: &str = "create table public.a (id integer primary key, ga integer, t integer, \
                        k integer, x integer); \
@@ -1219,4 +1222,176 @@ async fn a_join_page_never_scans_a_drained_ring_slot() {
         );
     }
     assert_eq!(walk(&d, "public.l", 3).await.0, []);
+}
+
+/// `Trellis::request_backfill` of `table`, then the rebuild's sweep job run
+/// by hand to its commit (as `join_interleavings.rs`): the rebuild in place
+/// a user asks for.
+async fn request_backfill_and_rebuild(d: &Driver, target: &str, table: &str) {
+    let trellis = Trellis::connect(
+        Config::from_dsn(d.db.dsn().to_string()).expect("valid dsn"),
+        TrellisOptions::default(),
+    )
+    .await
+    .expect("connect a Trellis");
+    trellis
+        .request_backfill(table)
+        .await
+        .expect("request a rebuild");
+    assert_eq!(
+        d.rows("select kind from backfill_chunks").await,
+        ["(sweep)"],
+        "a JOIN rebuild is its sweep job alone"
+    );
+    trellis::staging::build::settle_builds(d.pool()).await;
+    assert_eq!(
+        d.rows(&format!(
+            "select status, (select count(*) from backfill_chunks) \
+             from transform_definitions where target_table = 'public.{target}'"
+        ))
+        .await,
+        ["(live,0)"],
+        "the rebuild committed and left the definition live"
+    );
+}
+
+/// The hidden tables `tables` each have a divergence in `found`.
+fn assert_reported_on(found: &[Divergence], tables: &[&str]) {
+    for table in tables {
+        assert!(
+            found
+                .iter()
+                .any(|d| matches!(d, Divergence::Cell { column, .. }
+                if column.starts_with(&format!("{table}.")))),
+            "{table}: {found:?}"
+        );
+    }
+}
+
+/// #1112's acceptance for `P` and `M`: a write made on each side while
+/// capture was off leaves `P`, `M` (and `J`, `T` and the target, which follow
+/// them by delta) stale; the check reports it, `request_backfill` of each
+/// side (a rebuild in place, which writes `P`/`M` absolutely and pushes the
+/// difference on to `J` and `T`) repairs all of them, and the check is then
+/// clean.
+///
+/// Only a write capture missed is planted: a hand edit of `P` alone would be
+/// pushed through to `T` by the rebuild as well (see the PR body).
+async fn p_and_m_are_repaired_by_request_backfill(definition: &str, target: &str) {
+    let mut d = start(&[definition]).await;
+    seed(&mut d).await;
+    assert_eq!(
+        walk(&d, target, 100).await.0,
+        [],
+        "{target}: before the plant"
+    );
+    let (_, p) = hidden(&d, target, "p").await;
+    let (_, m) = hidden(&d, target, "m").await;
+
+    for table in ["a", "b"] {
+        exec(
+            &d,
+            &format!("alter table public.{table} disable trigger trellis_capture_insert"),
+        )
+        .await;
+    }
+    exec(&d, "insert into public.a values (20, 6, 1, 3, 1)").await;
+    exec(&d, "insert into public.b values (20, 1, 3, 5, 1)").await;
+    for table in ["a", "b"] {
+        exec(
+            &d,
+            &format!("alter table public.{table} enable always trigger trellis_capture_insert"),
+        )
+        .await;
+    }
+    d.settle().await;
+
+    for limit in [1, 100] {
+        let found = walk(&d, target, limit).await.0;
+        assert_reported_on(&found, &[&p, &m]);
+    }
+
+    request_backfill_and_rebuild(&d, target, "a").await;
+    request_backfill_and_rebuild(&d, target, "b").await;
+
+    let (found, compared, _) = walk(&d, target, 100).await;
+    assert_eq!(found, [], "{target}: the rebuilds repaired every plant");
+    assert!(compared > 0);
+    assert_eq!(walk(&d, target, 1).await.0, []);
+}
+
+#[tokio::test]
+async fn a_capture_off_write_is_reported_until_request_backfill_repairs_it_left_pair() {
+    p_and_m_are_repaired_by_request_backfill(LEFT_PAIR, "l").await;
+}
+
+#[tokio::test]
+async fn a_capture_off_write_is_reported_until_request_backfill_repairs_it_inner() {
+    p_and_m_are_repaired_by_request_backfill(INNER, "i").await;
+}
+
+/// The documented limit (known-correctness-gaps: "Rows written into a target,
+/// a hidden table or Trellis's schema"): `request_backfill` does not repair
+/// a hand edit of `join_<id>_t` or `join_<id>_j`, because they change only
+/// by delta (#1097); `PAUSE`/`RESUME` recreates the hidden tables and does.
+#[tokio::test]
+async fn j_and_t_divergences_are_reported_until_resume_repairs_them() {
+    let mut d = start(&[INNER]).await;
+    seed(&mut d).await;
+    let (j, j_name) = hidden(&d, "i", "j").await;
+    let (t, t_name) = hidden(&d, "i", "t").await;
+    exec(
+        &d,
+        &format!("update {j} set __matches = __matches + 1 where k = 1"),
+    )
+    .await;
+    exec(&d, &format!("update {t} set __n = __n + 5 where ga = 1")).await;
+    let planted = [
+        cell("1", &format!("{t_name}.__n"), Some("11"), Some("6")),
+        cell("1", &format!("{j_name}.__matches"), Some("4"), Some("3")),
+    ];
+    assert_eq!(walk(&d, "i", 100).await.0, planted);
+
+    // A rebuild in place of either side leaves both edits.
+    request_backfill_and_rebuild(&d, "i", "a").await;
+    request_backfill_and_rebuild(&d, "i", "b").await;
+    // The rebuild renders the visible row from the edited `T`, so the
+    // target now carries the edit too.
+    assert_eq!(
+        walk(&d, "i", 100).await.0,
+        [
+            planted[0].clone(),
+            cell("1", "n", Some("11"), Some("6")),
+            planted[1].clone()
+        ],
+        "request_backfill doesn't repair J or T"
+    );
+
+    // Pause the definition and resume it: the plan job rebuilds the hidden
+    // tables from the sources.
+    exec(
+        &d,
+        "update transform_definitions set status = 'paused' where target_table = 'public.i'",
+    )
+    .await;
+    trellis::staging::quarantine::resume_transform(d.pool(), "i")
+        .await
+        .expect("resume");
+    trellis::intake::markers::discharge_registrations(d.pool())
+        .await
+        .expect("start the build");
+    assert_eq!(
+        d.rows("select kind from backfill_chunks").await,
+        ["(plan)"],
+        "a resume is a fresh build"
+    );
+    trellis::staging::build::settle_builds(d.pool()).await;
+    assert_eq!(
+        d.rows("select status from transform_definitions where target_table = 'public.i'")
+            .await,
+        ["(live)"]
+    );
+    let (found, compared, _) = walk(&d, "i", 100).await;
+    assert_eq!(found, [], "the resume recreated J and T");
+    assert!(compared > 0);
 }

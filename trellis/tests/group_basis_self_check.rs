@@ -2,7 +2,8 @@
 //! "Scope"). It detects and never repairs: a planted divergence is reported,
 //! and gone once the planted damage is undone (the repair for real damage
 //! is `request_backfill` of the source, which rebuilds the groups in place:
-//! `group_basis_rebuild.rs`).
+//! `group_basis_rebuild.rs`; the last test here runs the whole loop, check,
+//! `request_backfill`, check).
 //!
 //! Every test turns the group-basis dev knob on before its driver starts,
 //! drives the pipeline by hand through `support/drain_driver.rs` and never
@@ -15,12 +16,15 @@ mod drain_driver;
 use std::time::Duration;
 
 use drain_driver::Driver;
-use trellis::config::DEFAULT_SCHEMA;
+use trellis::config::{Config, DEFAULT_SCHEMA};
 use trellis::defs::ValueType;
+use trellis::defs::chunk_queue;
 use trellis::integer::IntWidth;
+use trellis::staging::build::{self, WorkerOptions};
 use trellis::staging::self_check::{
     Divergence, SelfCheckMode, SelfCheckOutcome, SelfCheckScope, check_page, compare_page,
 };
+use trellis::{Trellis, TrellisOptions};
 
 const SRC: &str = "public.src";
 const AGG: &str = "TRANSFORM agg FROM public.src GROUP BY g SELECT SUM(v) AS total, COUNT(*) AS n";
@@ -1177,4 +1181,131 @@ async fn nullable_composite_groups_with_ring_only_keys_page_alike_with_and_witho
         }
         exec(&d, "delete from public.agg where g is null and h = 7").await;
     }
+}
+
+const OPTIONS: WorkerOptions = WorkerOptions {
+    chunk_rows: 1_000,
+    drain_batch_cap: usize::MAX,
+    heartbeat_interval: Duration::from_secs(5),
+    reclaim_ttl: Duration::from_secs(60),
+};
+
+/// `Trellis::request_backfill` of the source, then the rebuild's one sweep
+/// job claimed and run by hand to its commit (as `group_basis_rebuild.rs`).
+async fn request_backfill_and_rebuild(d: &Driver) {
+    let trellis = Trellis::connect(
+        Config::from_dsn(d.db.dsn().to_string()).expect("valid dsn"),
+        TrellisOptions::default(),
+    )
+    .await
+    .expect("connect a Trellis");
+    trellis
+        .request_backfill("src")
+        .await
+        .expect("request a rebuild");
+    d.run_frozen(&[], |pool| async move {
+        let claimed = chunk_queue::claim_chunks_of(
+            &**pool.get().await.expect("pool"),
+            "rebuild",
+            1,
+            &[chunk_queue::KIND_SWEEP],
+        )
+        .await
+        .expect("claim the rebuild");
+        assert_eq!(claimed.len(), 1, "one rebuild job to claim");
+        build::run_claimed(&pool, &claimed[0], "rebuild", &OPTIONS).await;
+        Ok(())
+    })
+    .await
+    .finish()
+    .await;
+    assert_eq!(
+        d.rows(
+            "select status, (select count(*) from backfill_chunks) \
+             from transform_definitions where target_table = 'public.agg'"
+        )
+        .await,
+        ["(live,0)"],
+        "the rebuild committed and flipped the definition live"
+    );
+}
+
+/// #1104's acceptance end to end: planted damage of every kind (a hand-edited
+/// partial, a hand-edited visible row, a group missing from both tables, a
+/// visible row of no group, and a write made while capture was off, which
+/// no undo of a plant could repair) is reported by the check, the user's
+/// `request_backfill` rebuilds the groups in place, and the check is then clean
+/// over every group.
+#[tokio::test]
+async fn a_planted_divergence_is_reported_until_request_backfill_repairs_it() {
+    let mut d = start().await;
+    step(
+        &mut d,
+        "insert into public.src values (1, 1, 10), (2, 1, 5), (3, 2, 7), (4, 3, 1), (5, 4, 2)",
+    )
+    .await;
+    assert_eq!(walk(&d, 100).await.0, [], "converged before the plant");
+    let hidden = hidden(&d).await;
+    let name = hidden.rsplit('.').next().unwrap().to_string();
+
+    exec(
+        &d,
+        &format!(
+            "update {hidden} set __sum_1 = __sum_1 + 1000 where g = 1; \
+             update public.agg set total = 99 where g = 2; \
+             delete from {hidden} where g = 3; delete from public.agg where g = 3; \
+             insert into public.agg (g, total, n) values (42, 1, 1)"
+        ),
+    )
+    .await;
+    exec(
+        &d,
+        "alter table public.src disable trigger trellis_capture_insert",
+    )
+    .await;
+    exec(&d, "insert into public.src values (6, 4, 100), (7, 7, 1)").await;
+    exec(
+        &d,
+        "alter table public.src enable always trigger trellis_capture_insert",
+    )
+    .await;
+    d.settle().await;
+
+    let (found, _, _) = walk(&d, 100).await;
+    let expected = [
+        // g = 1: the hand-edited partial, and the visible row it no longer matches.
+        cell("1", &format!("{name}.__sum_1"), Some("1015"), Some("15")),
+        cell("1", "total", Some("15"), Some("1015")),
+        // g = 2: the hand-edited visible row.
+        cell("2", "total", Some("99"), Some("7")),
+        // g = 4: the capture-off write.
+        cell("4", &format!("{name}.__sum_1"), Some("2"), Some("102")),
+    ];
+    for want in &expected {
+        assert!(found.contains(want), "missing {want:?} in {found:?}");
+    }
+    for want in [
+        Divergence::MissingRow { key: "3".into() },
+        Divergence::MissingRow { key: "7".into() },
+        Divergence::ExtraRow { key: "42".into() },
+    ] {
+        assert!(found.contains(&want), "missing {want:?} in {found:?}");
+    }
+    // Nothing else: group 1 (partial, visible row), group 2 (visible row), groups 3
+    // and 7 (three partials each, and the missing row), group 4 (three
+    // partials), and the extra row of 42.
+    assert_eq!(found.len(), 15, "{found:?}");
+
+    request_backfill_and_rebuild(&d).await;
+
+    let (found, compared, _) = walk(&d, 100).await;
+    assert_eq!(found, [], "the rebuild repaired every plant");
+    let groups = d.rows(&format!("select count(*) from {hidden}")).await;
+    assert_eq!(
+        groups,
+        [format!("({compared})")],
+        "every group the rebuild left was compared"
+    );
+    // The same walk, a page at a time.
+    assert_eq!(walk(&d, 1).await.0, []);
 }
