@@ -32,6 +32,11 @@
 //! ([`Keyset::ranked`]): a dense rank over the typed order, in the one
 //! statement, so "past the end" is an integer comparison however the key
 //! sorts, and the end's key text is read off the row that ranks last.
+//!
+//! **Matching.** A 1-1 page matches the sides' keys by their text, as a 1-1
+//! target holds its source's exact text. An aggregate's and a `JOIN`'s page
+//! matches them by the rank ([`Keyset::ranked_by_value`]), so keys that are
+//! equal values are one key whatever their text (ADR-0020).
 
 use std::fmt::Write as _;
 
@@ -392,6 +397,38 @@ impl Keyset {
         bounds: &[i32],
         extra: &str,
     ) -> String {
+        self.ranked_as(ctes, sides, bounds, extra, Match::Text)
+    }
+
+    /// [`Keyset::ranked`], keys matched by the key columns' types' equality
+    /// rather than their text: keys that are equal values (`1.25` and
+    /// `1.2500` of a `numeric` key) are one key, named by the text of the
+    /// lowest-numbered side that has it. For an aggregate's and a `JOIN`'s
+    /// groups and cells, whose key is one of the equal values a `GROUP BY`
+    /// may render (ADR-0020).
+    ///
+    /// Equality is the page's order's: the type's default btree equality, the
+    /// `=` a `GROUP BY` merges by, and for a collatable column the walk's
+    /// collation, which is deterministic, so text equal under it is equal
+    /// byte for byte.
+    pub(super) fn ranked_by_value(
+        &self,
+        ctes: &str,
+        sides: &[(i32, &str)],
+        bounds: &[i32],
+        extra: &str,
+    ) -> String {
+        self.ranked_as(ctes, sides, bounds, extra, Match::Value)
+    }
+
+    fn ranked_as(
+        &self,
+        ctes: &str,
+        sides: &[(i32, &str)],
+        bounds: &[i32],
+        extra: &str,
+        by: Match,
+    ) -> String {
         let all: Vec<String> = sides
             .iter()
             .map(|(n, cte)| {
@@ -406,19 +443,48 @@ impl Keyset {
                 format!("(select max(__r) from ranked where __side = {n} having count(*) >= $1)")
             })
             .collect();
+        // The key text each rank is reported by: a row's own, or under
+        // `Match::Value` one text for the equal keys of a rank, the
+        // lowest-numbered side's (a side has one key of a rank: its keys are
+        // a `GROUP BY`'s or a unique index's, distinct under `=`).
+        let (named, rows) = match by {
+            Match::Text => ("ranked", "ranked r"),
+            Match::Value => (
+                "named",
+                "(select r.__side, r.__r, n.__k, r.__v from ranked r \
+                  join named n on n.__r = r.__r) r",
+            ),
+        };
+        let named_cte = match by {
+            Match::Text => "",
+            Match::Value => {
+                "named as (select __r, (array_agg(__k order by __side))[1] as __k \
+                 from ranked group by __r), "
+            }
+        };
         format!(
             "with {ctes}\
              allk as ({all}), \
              ranked as (select a.*, dense_rank() over (order by {order}) as __r from allk a), \
+             {named_cte}\
              page as ( \
-                select e.pe_r, (select __k from ranked where __r = e.pe_r limit 1) as page_end \
+                select e.pe_r, (select __k from {named} where __r = e.pe_r limit 1) as page_end \
                 from (select least({ends}) as pe_r) e) \
-             select r.__side, page.page_end, r.__k, r.__v from ranked r, page \
+             select r.__side, page.page_end, r.__k, r.__v from {rows}, page \
               where page.pe_r is null or r.__r <= page.pe_r{extra}",
             all = all.join(" union all "),
             ends = ends.join(", "),
         )
     }
+}
+
+/// How [`Keyset::ranked_as`] matches the sides' keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Match {
+    /// By key text: a 1-1 target holds the source key's text.
+    Text,
+    /// By the key columns' types' equality.
+    Value,
 }
 
 #[cfg(test)]

@@ -7,7 +7,9 @@ deciders: Michael Ries
 # `self_check`: A Production Recompute Audit
 
 Trellis's one hard correctness promise is convergence to a from-scratch recompute
-at any caught-up LSN, **byte-identical** (see [Comparison semantics](#comparison-semantics-byte-identical)
+at any caught-up LSN: byte-identical for a 1-1 target, equal values for an
+aggregate or JOIN target (see
+[Comparison semantics](#comparison-semantics-exact-text-for-1-1-equal-values-for-aggregates-and-joins)
 below). The failure mode that promise guards
 against is a *silently stale target*: a wrong answer with no error raised and no
 metric out of range, invisible without an independent recompute. `self_check` makes
@@ -129,18 +131,33 @@ the answer from source rows independently. This also matches the failure class t
 audit exists to catch: a stale target diverges as persisted-vs-recompute, where an
 independent query is exactly the detector and the evaluator adds nothing.
 
-### Comparison semantics: byte-identical
+### Comparison semantics: exact text for 1-1, equal values for aggregates and JOINs
 
-`self_check` compares a persisted cell against its recompute **byte-for-byte**.
-Byte-identity is the strongest, simplest yardstick ("diff the text"), and it is
-exactly what the join, `GROUP BY` and primary-key roles rely on. Every admitted
-aggregate meets it: `COUNT` is an integer, and `SUM` and `AVG` take only integer
-or `numeric(p,s)` arguments, so a sum or average kept from partials carries exactly
-the scale Postgres's own `sum()` and `avg()` show
+A 1-1 target holds its source's exact text, and `self_check` compares a 1-1
+persisted cell against its recompute **byte-for-byte**: the strongest, simplest
+yardstick ("diff the text"), and what the primary-key role relies on.
+
+An aggregate or JOIN target holds an **equal value**
+([ADR-0020](0020-type-identity.md)): a group key and an aggregate result are
+correct when they are equal, under the column type's `=`, to what a fresh
+`GROUP BY` computes, and their text is one of the equal values' texts, as
+Postgres's own `GROUP BY` gives. A `numeric` group written as `1.25` is the
+source's `1.2500` after a rewrite re-renders it. So `self_check` matches an
+aggregate's groups, and a JOIN's groups, cells and join keys, by the key
+columns' types' equality (the page's dense rank, see
+[A walk pages by the key's own columns](#a-walk-pages-by-the-keys-own-columns)), and compares a visible field whose
+text differs by its type's `=`. A field of a type with no `=` is compared as
+text; no group key is one, since `GROUP BY` needs `=`. The partials compare as
+values: counts as integers, a sum without trailing zeros. Text identity is no
+yardstick for these shapes: `GROUP BY` merges equal values with different
+texts, so a fresh recompute doesn't give text identity either, and a rebuild
+doesn't rewrite a key whose text alone changed.
+
+A sum or average kept from partials carries exactly the scale Postgres's own
+`sum()` and `avg()` show
 ([ADR-0002](0002-async-data-flow.md#numeric-arguments-declare-their-scale)). An
 aggregate whose `=` admits several textually distinct representatives of one value
-(`MIN`/`MAX` over `real` or `interval`) would need a looser comparison; such
-aggregates are refused at define.
+(`MIN`/`MAX` over `real` or `interval`) is refused at define.
 
 ### The audit query is rendered independently of the write path
 
@@ -262,6 +279,9 @@ times the table, which is hours at 100M rows.
 * **Identity.** The encoded key text is the key a divergence is reported
   by and the text a walk saves as its cursor; it neither orders nor bounds a
   page. A cursor is decoded back into its columns' values for the next page.
+  An aggregate's and a JOIN's sides are matched by the dense rank below, so
+  keys that are equal values are one key, reported by the text of the first
+  side that has it (the source's, when it does).
 * **The page's end.** The two sides are `limit`ed separately, so a page ends at
   the lowest last key of the sides that filled the limit. The sides' keys are
   ranked together in the statement, by a dense rank over the same order, so

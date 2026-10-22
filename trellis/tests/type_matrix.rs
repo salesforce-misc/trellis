@@ -44,8 +44,6 @@
 //!   define-time pairing only;
 //! - the rename row: a rename after define is `capture_type_rename.rs`'s, and
 //!   one before a baseline records it is step 3;
-//! - a `numeric` `GROUP BY` key whose scale a rewrite changes, which keeps
-//!   the group row's old text (#1297, [`cell`] skips it);
 //! - integer and float widths, the only changes that re-type a copy
 //!   (`capture_key_retype.rs`);
 //! - the ledger `GROUP BY` path, whose copies are family-typed like the
@@ -554,7 +552,9 @@ fn scenario(place: Place, ty: &Ty, row: &Row) -> Scenario {
             oracle_sql: "select k::text, n from public.t".into(),
         },
         // A group-basis aggregate over `t(id integer primary key, g <T>, x
-        // integer)` grouped by `g`.
+        // integer)` grouped by `g`. The key compares by value: a group row
+        // holds one of the equal values' texts, as a `GROUP BY` does
+        // (`1.25` beside the source's `1.2500`, ADR-0020).
         Place::GroupBy => Scenario {
             ddl: format!(
                 "create table public.t (id integer primary key, g {}, x integer); \
@@ -568,8 +568,8 @@ fn scenario(place: Place, ty: &Ty, row: &Row) -> Scenario {
             seed_sql: format!("insert into public.t values (1, '{}', 1)", row.seed),
             alter_sql: alter("t", "g"),
             hi_sql: format!("insert into public.t values (2, '{}', 2)", row.hi),
-            target_sql: "select g::text, n, sx from public.c",
-            oracle_sql: "select g::text, count(*)::bigint, sum(x)::bigint \
+            target_sql: "select g, n, sx from public.c",
+            oracle_sql: "select g, count(*)::bigint, sum(x)::bigint \
                          from public.t group by g"
                 .into(),
         },
@@ -621,7 +621,7 @@ fn scenario(place: Place, ty: &Ty, row: &Row) -> Scenario {
             ..scenario(Place::JoinOn, ty, row)
         },
         // A `JOIN` on an integer, grouped by a `<T>` column of the left
-        // table.
+        // table, the key compared by value as `GroupBy`'s.
         Place::JoinGroupBy => Scenario {
             ddl: format!(
                 "create table public.a (id integer primary key, g {}, j integer); \
@@ -647,8 +647,8 @@ fn scenario(place: Place, ty: &Ty, row: &Row) -> Scenario {
                 "insert into public.a values (2, '{}', 2); insert into public.b values (2, 2, 20)",
                 row.hi
             ),
-            target_sql: "select g::text, n, sy from public.c",
-            oracle_sql: "select a.g::text, count(*)::bigint, sum(b.y)::bigint \
+            target_sql: "select g, n, sy from public.c",
+            oracle_sql: "select a.g, count(*)::bigint, sum(b.y)::bigint \
                          from public.a left join public.b on a.j = b.j group by a.g"
                 .into(),
         },
@@ -780,17 +780,6 @@ async fn run(place: Place, ty: &Ty, change: Change, row: &Row) -> Outcome {
 async fn cell(place: Place, ty: &Ty, change: Change) {
     let Some(row) = ty.row(change) else { return };
     if !admits(place, ty.label) {
-        return;
-    }
-    // A `numeric` group key whose scale changes keeps the group row's old
-    // text (`1.25` beside the source's `1.2500`): groups are matched as
-    // numbers, so a rebuild finds the row and leaves it, and `self_check`,
-    // which compares text, reports it. It predates ADR-0020 (the group copy
-    // is family-typed) and is #1297.
-    if ty.label == "numeric"
-        && matches!(place, Place::GroupBy | Place::JoinGroupBy)
-        && change != Change::CatalogOnly
-    {
         return;
     }
     let outcome = run(place, ty, change, row).await;

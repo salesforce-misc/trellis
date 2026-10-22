@@ -121,9 +121,9 @@ temporal or `interval` precision, a `char(n)` or `bit(n)` length, a `varchar`
 bound or its move to `text`) changes no copy, and a widening of one needs no
 pause and no rebuild. A change that re-renders the stored values (a `char(n)`
 length, a `bit(n)` rewrite, a `numeric` scale, a narrower precision) rebuilds the
-column's readers, or pauses one that keys by it, except that a `numeric`
-`GROUP BY` key's group rows keep their old text ([known correctness
-gaps](known-correctness-gaps.md#a-numeric-group-by-keys-scale-changed)). A width change pauses the
+column's readers, or pauses one that keys by it. A `numeric` `GROUP BY` key's
+group rows keep the text they were written with, which is still an equal value
+([Numeric and floating point](#numeric-and-floating-point)). A width change pauses the
 transforms that own the column, and `RESUME` re-types every column to the type
 define would give it from the live schema before it rebuilds
 ([transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)).
@@ -216,7 +216,15 @@ server in `trellis/tests/defs_exact_integers.rs`.
 
 `numeric`/`decimal` is `ValueType::Numeric`. `1.0` and `1.00` are equal in
 Postgres but render differently, so `numeric` is refused as a join key and
-primary key. It is admitted as a `GROUP BY` key.
+primary key. It is admitted as a `GROUP BY` key, where a group is one equal
+value, as Postgres's own `GROUP BY` makes it: a group row holds one of the
+equal values' texts. A group written as `1.25` stays `1.25` when a rewrite
+re-renders the source's values as `1.2500`, and that is correct; a rebuild
+doesn't rewrite a key whose rendering alone changed. An aggregate result is
+likewise one equal value: a `SUM` over `numeric` may render `1.5` or `1.50`.
+`self_check` matches an aggregate's and a `JOIN`'s groups, and compares their
+results, by the type's `=`
+([ADR-0013](decisions/0013-self-check-production-recompute-audit.md)).
 
 `real` and `double precision` are `ValueType::Float` (`trellis/src/float.rs`).
 Postgres, not IEEE 754, is the oracle: `NaN = NaN` is true, `NaN` sorts above

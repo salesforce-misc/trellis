@@ -29,6 +29,9 @@
 //! key is the cell's, the join key's or the group's key text. A cell or key
 //! on one side only is all zeros on the other: the hidden tables keep a cell
 //! that emptied, and `J` keeps every key a page ever named.
+//! Keys, cells and visible fields compare as values, as an aggregate's do
+//! (`super::self_check_groups`): a key by its columns' equality, a field
+//! whose text differs by its type's `=`.
 //!
 //! The walk's cursor ([`super::self_check::SelfCheckScope::after`]) carries
 //! the part: `t:<key>`, `p:<key>`, `m:<key>` or `j:<key>` continues a part
@@ -79,7 +82,9 @@ use crate::defs::model::Definition;
 use crate::pool::{Pool, quote_ident};
 
 use super::self_check::{ComparePass, Divergence, SelfCheckError, SelfCheckScope, render_leaf};
-use super::self_check_groups::{Side, Uncertain, bound, partial_text, weighted_partials};
+use super::self_check_groups::{
+    Side, Uncertain, bound, drop_equal_values, partial_text, weighted_partials,
+};
 use super::self_check_keyset::{BYTE_ORDER, Keyset};
 use super::self_check_ring::{Lands, Ring, WEIGHT};
 
@@ -387,7 +392,7 @@ fn partials_page_sql(
           union all select 6, page.page_end, '', null::text[] from page where {global}",
         global = ring.global,
     );
-    keyset.ranked(&ctes, &[(1, "src"), (2, "hid")], &[1, 2], &extra)
+    keyset.ranked_by_value(&ctes, &[(1, "src"), (2, "hid")], &[1, 2], &extra)
 }
 
 /// Everything a page of a `JOIN` target needs, read from the definition and
@@ -822,7 +827,7 @@ impl Audit<'_> {
             any_a = ra.any_uncertain_sql(),
             any_b = rb.any_uncertain_sql(),
         );
-        let sql = keyset.ranked(
+        let sql = keyset.ranked_by_value(
             &ctes,
             &[(1, "src"), (2, "hid"), (3, "pos"), (4, "vis")],
             &[1, 2, 4],
@@ -1109,6 +1114,15 @@ pub(super) async fn compare(
     if part == Part::Target {
         let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
         diff_rows(&names, paused, &oracle, &vis, &mut divergences);
+        if !divergences.is_empty() {
+            let field_types =
+                super::join::target_column_types(&**client, &def.target_table).await?;
+            let types: HashMap<&str, &str> = names
+                .iter()
+                .map(|n| (*n, field_types.get(*n).map_or("text", String::as_str)))
+                .collect();
+            drop_equal_values(&client, &types, &mut divergences).await?;
+        }
     }
     Ok(ComparePass {
         checked_through,
