@@ -12,14 +12,30 @@
 //! Each test creates the source with the narrow type and seeds a row, widens
 //! the column, writes a value only the wide type can hold (and, for a key, a
 //! second key the narrow type rounds onto the first), and drains with **no
-//! pass in between**: the target must equal the source then. Then it runs one
-//! pass and reports the definition's status, its pause reason and the
-//! `self_check` verdict on stderr (`--nocapture`), so the outcome of a failing
-//! case is on record. The pipeline and the pass are stepped by hand
-//! (`support/drain_driver.rs`); nothing polls for convergence (#297).
+//! pass in between**. Then it runs one pass and drains again. It prints the
+//! definition's status, its pause reason and the `self_check` verdict before
+//! and after the pass on stderr (`--nocapture`, lines starting `REPORT`).
+//! The pipeline and the pass are stepped by hand (`support/drain_driver.rs`);
+//! nothing polls for convergence (#297).
 //!
-//! A case that fails on main is `#[ignore = "known gap #1288"]`; it is the
-//! test the fix turns green.
+//! The `cases!` table is place x type. Every cell is a catalog-only
+//! widening, and every cell expects the same outcome ([`exact`], the rule
+//! #1224's research proposes): the target equals the source before and
+//! after the pass, `self_check` agrees, and nothing pauses or is held. A cell
+//! that fails on main is `#[ignore = "known gap #1288"]`; the fix turns it
+//! green. The `detected!` guards are live: for one cell per place they pin
+//! how the gap shows today ([`detected_today`]), which is what keeps it a
+//! detected gap rather than a silent one.
+//!
+//! Not in the table:
+//! - widenings that rewrite the source (`numeric(6,2)` -> `numeric(8,4)`, any
+//!   change of an array's element modifier): the rewrite rebuild covers them,
+//!   and their window is the existing rewrite gap;
+//! - the keys define refuses: `interval` as any key, `numeric` as a `JOIN
+//!   ON` key;
+//! - the ledger `GROUP BY` path: its copies are family-typed like the
+//!   group-basis ones, and it needs the group-basis knob off, which is
+//!   process-global, so it needs its own test binary.
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
@@ -114,6 +130,22 @@ const INTERVAL_FIELDS: Case = Case {
     hi: "1 day 00:00:01.5",
     value_type: ValueType::Other(PgType::Interval),
 };
+const INTERVAL_YM: Case = Case {
+    label: "interval year to month -> interval",
+    narrow: "interval year to month",
+    wide: "interval",
+    seed: "1 year 2 mons",
+    hi: "1 year 2 mons 3 days",
+    value_type: ValueType::Other(PgType::Interval),
+};
+const INTERVAL_HOUR: Case = Case {
+    label: "interval hour -> interval minute",
+    narrow: "interval hour",
+    wide: "interval minute",
+    seed: "02:00:00",
+    hi: "02:30:00",
+    value_type: ValueType::Other(PgType::Interval),
+};
 const VARBIT: Case = Case {
     label: "varbit(5) -> varbit(8)",
     narrow: "bit varying(5)",
@@ -196,9 +228,13 @@ async fn status_of(trellis: &Trellis, target: &str) -> String {
     }
 }
 
+/// `self_check`'s verdict. Nothing drains in the background, so whether the
+/// target has caught up is settled before the call: the timeout only bounds
+/// how long a held key (which never catches up) takes to report
+/// `NotCaughtUp`.
 async fn self_check_of(trellis: &Trellis, target: &str) -> String {
     match trellis
-        .self_check_to_end(target, SelfCheckMode::Strict, Duration::from_secs(30))
+        .self_check_to_end(target, SelfCheckMode::Strict, Duration::from_secs(3))
         .await
     {
         Ok(report) => format!("{:?}", report.outcome),
@@ -214,10 +250,11 @@ async fn diverged(d: &Driver, target_sql: &str, source_sql: &str) -> Vec<String>
     .await
 }
 
-/// Seals and drains until nothing is pending, tolerating a drain that fails
-/// because a copy refuses a value: each failure charges the key a death, so
-/// the page commits once the key is held. Bounded, not a wait for
-/// convergence. Returns how many attempts failed.
+/// Seals and drains eight times, tolerating a drain that fails because a
+/// copy refuses a value: each failure charges the key a death, so the page
+/// commits once the key is held. A fixed number of rounds with no sleep and
+/// no exit on a condition, so it is not a wait for convergence (#297).
+/// Returns how many attempts failed.
 async fn settle_tolerant(d: &mut Driver) -> usize {
     let mut failures = 0;
     for _ in 0..8 {
@@ -431,31 +468,134 @@ fn join_group_by(case: &Case) -> Scenario {
     }
 }
 
-/// Runs `scn`, prints what Trellis reported, and asserts that the target
-/// equals the source after the drain that precedes any pass: no value
-/// rounded, no two keys merged.
-async fn exact_before_the_pass(place: &str, case: Case, scn: Scenario) {
+/// Runs `scn`, prints what Trellis reported, and asserts every cell's
+/// expected-correct outcome for a catalog-only widening (#1224's research,
+/// section 4): the target equals the source after the drain that precedes
+/// any pass (no value rounded, no two keys merged), `self_check` agrees, and
+/// the pass changes nothing: the definition stays live, nothing is held and
+/// the target still equals the source.
+async fn exact(place: &str, case: Case, scn: Scenario) {
     let outcome = run(scn).await;
     outcome.report(place, &case);
+    let label = case.label;
     assert_eq!(
         outcome.diverged_before_pass,
         Vec::<String>::new(),
-        "{place}, {}: the target differs from the source before the pass (a rounded value or \
-         merged keys); status {}, self_check {}",
-        case.label,
+        "{place}, {label}: the target differs from the source before the pass (a rounded \
+         value or merged keys); status {}, self_check {}",
         outcome.status_before_pass,
         outcome.self_check_before_pass
     );
+    assert_eq!(
+        (
+            outcome.drain_failures,
+            outcome.status_before_pass.as_str(),
+            outcome.self_check_before_pass.as_str()
+        ),
+        (0, "Live", "Converged"),
+        "{place}, {label}: before the pass"
+    );
+    assert_eq!(
+        (outcome.status.as_str(), outcome.self_check.as_str()),
+        ("Live", "Converged"),
+        "{place}, {label}: the pass paused or held something for a widening every copy holds"
+    );
+    assert_eq!(
+        outcome.diverged_after_pass,
+        Vec::<String>::new(),
+        "{place}, {label}: after the pass"
+    );
 }
 
+/// Pins how #1288's window shows today, for a cell [`exact`] fails: what
+/// makes it a detected gap rather than a silent one. Before the pass the
+/// status still says live (the silent part) while `self_check` already
+/// reports the difference; the pass then pauses the definition for the
+/// widened column, `self_check` says the definition isn't live, and the
+/// rounded rows stay in the target (a `RESUME` rebuilds them). If the fix
+/// makes the cell exact, this fails: delete the guard and un-ignore the
+/// cell. If the pass stopped pausing, the gap would be silent and
+/// undetected and belong in `docs/known-correctness-gaps.md`.
+async fn detected_today(place: &str, case: Case, scn: Scenario) {
+    let outcome = run(scn).await;
+    outcome.report(place, &case);
+    let label = case.label;
+    assert_ne!(
+        outcome.diverged_before_pass,
+        Vec::<String>::new(),
+        "{place}, {label}: the target is exact: #1288 is fixed here, so delete this guard and \
+         un-ignore the cell"
+    );
+    if outcome.drain_failures == 0 {
+        // A rounded value: written silently.
+        assert_eq!(outcome.status_before_pass, "Live", "{place}, {label}");
+        assert!(
+            outcome.self_check_before_pass.starts_with("Diverged("),
+            "{place}, {label}: self_check before the pass: {}",
+            outcome.self_check_before_pass
+        );
+    } else {
+        // A copy refusing the value (`varbit`): the key is held.
+        assert_eq!(
+            (
+                outcome.status_before_pass.as_str(),
+                outcome.self_check_before_pass.as_str()
+            ),
+            ("Live (held keys: 1)", "NotCaughtUp"),
+            "{place}, {label}"
+        );
+    }
+    assert!(
+        outcome.status.starts_with("Paused: column ")
+            && outcome.status.contains(" widened to ")
+            && outcome
+                .status
+                .contains("Trellis keeps a copy of it that can't hold every value of that type"),
+        "{place}, {label}: the pass did not pause the definition for the widening: {}",
+        outcome.status
+    );
+    assert_eq!(outcome.self_check, "NotLive(Paused)", "{place}, {label}");
+    assert_eq!(
+        outcome.diverged_after_pass, outcome.diverged_before_pass,
+        "{place}, {label}: the pause changed the target"
+    );
+}
+
+/// One test per cell of the place x type table, each asserting [`exact`].
+/// Every cell here is a catalog-only widening, so every cell's expected
+/// outcome is the same: [`exact`]. A cell that fails on main carries
+/// `#[ignore = "known gap #1288"]`; the fix removes it. Extending the table
+/// (#1289's generated matrix) is adding a [`Case`] and a row; a change kind
+/// with another expected outcome (a rewrite, a narrowing) needs its own
+/// assertion beside [`exact`].
 macro_rules! cases {
     ($($name:ident: $place:literal, $case:ident, $scenario:ident $(, $ignore:literal)?;)*) => {$(
         #[tokio::test]
         $(#[ignore = $ignore])?
         async fn $name() {
-            exact_before_the_pass($place, $case, $scenario(&$case)).await;
+            exact($place, $case, $scenario(&$case)).await;
         }
     )*};
+}
+
+/// A live guard per place (and the held-key path) that [`detected_today`]
+/// holds for a cell [`cases!`] ignores.
+macro_rules! detected {
+    ($($name:ident: $place:literal, $case:ident, $scenario:ident;)*) => {$(
+        #[tokio::test]
+        async fn $name() {
+            detected_today($place, $case, $scenario(&$case)).await;
+        }
+    )*};
+}
+
+detected! {
+    detected_ts_passthrough: "1-1 passthrough", TS0, passthrough;
+    detected_numeric_passthrough: "1-1 passthrough", NUMERIC, passthrough;
+    detected_varbit_passthrough: "1-1 passthrough", VARBIT, passthrough;
+    detected_ts_primary_key: "1-1 primary key", TS0, primary_key;
+    detected_ts_join_on: "JOIN ON + GROUP BY", TS0, join_on;
+    detected_numeric_join_group_by: "JOIN GROUP BY", NUMERIC, join_group_by;
 }
 
 cases! {
@@ -468,17 +608,28 @@ cases! {
     interval_precision_passthrough: "1-1 passthrough", INTERVAL0, passthrough, "known gap #1288";
     interval_fields_passthrough: "1-1 passthrough", INTERVAL_FIELDS, passthrough, "known gap #1288";
     varbit_passthrough: "1-1 passthrough", VARBIT, passthrough, "known gap #1288";
+    interval_ym_passthrough: "1-1 passthrough", INTERVAL_YM, passthrough, "known gap #1288";
+    interval_hour_passthrough: "1-1 passthrough", INTERVAL_HOUR, passthrough, "known gap #1288";
 
     ts_primary_key: "1-1 primary key", TS0, primary_key, "known gap #1288";
     ts_unbounded_primary_key: "1-1 primary key", TS0_UNBOUNDED, primary_key, "known gap #1288";
     tstz_primary_key: "1-1 primary key", TSTZ0, primary_key, "known gap #1288";
+    time_primary_key: "1-1 primary key", TIME0, primary_key, "known gap #1288";
+    timetz_primary_key: "1-1 primary key", TIMETZ0, primary_key, "known gap #1288";
+    varbit_primary_key: "1-1 primary key", VARBIT, primary_key, "known gap #1288";
 
     ts_group_by: "group-basis GROUP BY", TS0, group_by;
     tstz_group_by: "group-basis GROUP BY", TSTZ0, group_by;
     numeric_group_by: "group-basis GROUP BY", NUMERIC, group_by;
+    time_group_by: "group-basis GROUP BY", TIME0, group_by;
+    varbit_group_by: "group-basis GROUP BY", VARBIT, group_by;
 
     ts_join_on: "JOIN ON + GROUP BY", TS0, join_on, "known gap #1288";
     tstz_join_on: "JOIN ON + GROUP BY", TSTZ0, join_on, "known gap #1288";
+    varbit_join_on: "JOIN ON + GROUP BY", VARBIT, join_on, "known gap #1288";
     ts_join_group_by: "JOIN GROUP BY", TS0, join_group_by, "known gap #1288";
+    tstz_join_group_by: "JOIN GROUP BY", TSTZ0, join_group_by, "known gap #1288";
+    time_join_group_by: "JOIN GROUP BY", TIME0, join_group_by, "known gap #1288";
     numeric_join_group_by: "JOIN GROUP BY", NUMERIC, join_group_by, "known gap #1288";
+    varbit_join_group_by: "JOIN GROUP BY", VARBIT, join_group_by, "known gap #1288";
 }
