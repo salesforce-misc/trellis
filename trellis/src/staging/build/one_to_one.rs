@@ -856,7 +856,7 @@ fn rederive_statement(
             .map(|f| format!("excluded.{f}"))
             .collect();
         format!(
-            "do update set {} where ({})::text is distinct from ({})::text",
+            "do update set {} where row({})::text is distinct from row({})::text",
             sets.join(", "),
             old.join(", "),
             new.join(", ")
@@ -997,7 +997,7 @@ fn field_statement(
              update {target} t set {sets} \
              from src r \
              where {join} and {target_where} \
-               and ({old})::text is distinct from ({new})::text \
+               and row({old})::text is distinct from row({new})::text \
              returning {k_tgt} as __k \
          ) \
          select 0::bigint, (select count(*) from upd), 0::bigint{seam}",

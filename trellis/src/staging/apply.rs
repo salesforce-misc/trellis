@@ -10477,9 +10477,15 @@ async fn apply_target(
                 .map(|f| format!("excluded.{f}"))
                 .collect::<Vec<_>>()
                 .join(", ");
+            // By text, as the rebuild merges do (ADR-0020): a 1-1 copy holds the
+            // source's exact rendering, so `1.25` to `1.2500`, a case change
+            // under a nondeterministic collation or an `interval` respelling
+            // must write although the type's `=` calls the two equal. A
+            // record's text, not a bare `col::text`: a text column cast to
+            // text keeps its collation, and the comparison with it.
             format!(
                 "on conflict ({pk_col_list}) do update set {set_list} \
-                 where ({target_cols}) is distinct from ({excluded_cols})"
+                 where row({target_cols})::text is distinct from row({excluded_cols})::text"
             )
         };
 
