@@ -110,14 +110,25 @@ values render, not one that only widens what the column can hold.
 
 ## A key's identity includes its collation
 
-Key columns need a deterministic collation, so key equality is exact text
-equality, and a change from one deterministic collation to another leaves it
-unchanged. Ordering-dependent work (paging a walk, chunk bounds, range
-predicates) uses the key's own collation, as it is now. Trellis adds no detector
-for collation changes. Where one can leave a target wrong, the case is in
-[known correctness gaps](../known-correctness-gaps.md), and any detector would
-be an auto-pause signal that needs a false-positive study first and must not
-require superuser.
+A collation decides two things about a string key: which values are equal, and
+how they sort. Trellis matches keys by exact text, so it needs equality to
+mean byte equality. That is what a deterministic collation gives, and why key
+columns need one. A nondeterministic collation makes `=` true for values that
+render differently, so one group or row would split across several keys.
+
+Moving a key from one deterministic collation to another leaves equality
+unchanged, so key identity survives it. Ordering does not. Anything computed
+from the order of keys or values under the old collation can be wrong under the
+new one: a page boundary, a chunk bound, a range predicate, a `MIN` or `MAX`
+over text. So ordering-dependent work reads the key's collation when it runs,
+and never relies on an order recorded under an earlier one.
+
+A collation can change with no trigger firing: by an `ALTER COLUMN … COLLATE`
+that rewrites nothing, or by a collation library upgrade that changes no
+catalog row at all. Trellis can see such a change only by comparing the catalog
+afterwards. A pause driven by that comparison must first be shown not to fire on
+routine maintenance and migrations, and must not need superuser. This ADR adds
+no such detector.
 
 ## Columns pair by type and collation; modifiers never count
 
