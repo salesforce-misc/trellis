@@ -82,8 +82,9 @@
 //!
 //! # A build ([`build`])
 //!
-//! With both sides unpartitioned (or empty), a fresh build, a `RESUME` (which recreates the hidden tables and keeps the
-//! visible target) and a rebuild in place of a live `JOIN` (a
+//! With both sides unpartitioned (or empty), a fresh build, a `RESUME`
+//! (which recreates the hidden tables and keeps the visible target) and a
+//! rebuild in place of a live `JOIN` (a
 //! `request_backfill` of either table, a re-installed capture) are one
 //! `READ COMMITTED` transaction over both structures, #1097's S1T: a page
 //! whose two sides both recompute every cell they enumerate from one `GROUP
@@ -1188,10 +1189,13 @@ pub(crate) async fn recompute_routed(
     Ok(())
 }
 
-/// A `JOIN`'s fresh build, `RESUME` and rebuild in place (#1109, #1097's
-/// decision): both structures, `P` and `M`, and `T` in the caller's one
-/// `READ COMMITTED` transaction, which commits it. Readers see the old `T`
-/// and the old visible target until that commit.
+/// One transaction of a `JOIN`'s fresh build, `RESUME` or rebuild in place
+/// (#1109, #1097's decision), in the caller's `READ COMMITTED` transaction,
+/// which commits it. `work` is what it covers ([`BuildWork`]).
+///
+/// [`BuildWork::Single`], both sides unpartitioned (or empty): both
+/// structures, `P` and `M`, and `T`, so readers see the old `T` and the old
+/// visible target until the commit.
 ///
 /// 1. The lock row `FOR SHARE`, before the enumeration, so a `TRUNCATE` page
 ///    (the row `FOR UPDATE`) waits for the commit and clears what it empties
@@ -1214,6 +1218,13 @@ pub(crate) async fn recompute_routed(
 ///    compared with the row the target holds, which removes the row of a
 ///    group no source row backs and repairs a row that disagrees with `T`'s
 ///    partials.
+///
+/// [`BuildWork::Side`], one step of a build with a partitioned side: steps 1
+/// to 3 over that side's cells in the region alone, `J` on their keys, `T`
+/// locked and written as a page writes it (only the product's groups, as a
+/// delta from the partials). [`BuildWork::Final`]: the lock row, then step 4's
+/// lock of every group of the visible target and of `T`'s hidden table, and
+/// its compare, with no product.
 ///
 /// A hand edit of `T` or of `J.matches` is not repaired: they change only by
 /// delta (a `RESUME` recreates them). Returns the visible rows written and
