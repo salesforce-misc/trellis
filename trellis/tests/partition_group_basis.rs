@@ -8,8 +8,8 @@
 //! the operation as each group's basis (#1043 F4). Never by a zero.
 //!
 //! Every test turns the group-basis dev knob on before its driver starts
-//! (the knob is process-wide), starts from an empty source (the knob's build
-//! only accepts one until #1101) and seeds it through capture. The pass, the
+//! (the knob is process-wide), starts from an empty source, built before
+//! its tree is recorded, and seeds it through capture. The pass, the
 //! drain and the engine are called by hand; nothing waits for convergence
 //! (#297). The oracle is a from-scratch `GROUP BY` over the source, and the
 //! hidden partials must never go negative.
@@ -89,6 +89,10 @@ fn tree(kind: &str) -> String {
 
 /// 160 rows through the parent: ten per group 0-15, `v` the id.
 const SEED: &str = "insert into public.items select i, i % 16, i from generate_series(1, 160) i";
+
+fn int8() -> ValueType {
+    ValueType::Integer(IntWidth::Int8)
+}
 
 fn int4() -> ValueType {
     ValueType::Integer(IntWidth::Int4)
@@ -2041,4 +2045,190 @@ async fn groups_with_a_null_part_read_through_the_root_are_exact() {
         ["(0)"]
     );
     assert_eq!(fx.status().await, "live");
+}
+
+// --- A RESUME over a partitioned source: one transaction per leaf (#1101) ---
+
+/// `RESUME` of the aggregate over a four-leaf source keeps the visible
+/// target and rebuilds it one leaf at a time, then the groups no leaf
+/// routes to: pause-era writes are built in, the rows of a group whose leaf
+/// lost them are removed, and a target row no leaf backs goes with the
+/// remainder.
+#[tokio::test]
+async fn a_resume_rebuilds_a_partitioned_source_per_leaf() {
+    for kind in ["range", "list", "hash"] {
+        let mut fx = Fx::start(&tree(kind), SEED).await;
+        let id: i64 =
+            fx.d.ctl
+                .query_one(
+                    "select id from transform_definitions where target_table = 'public.agg'",
+                    &[],
+                )
+                .await
+                .expect("id")
+                .get(0);
+        fx.exec(
+            "update transform_definitions set status = 'paused' where target_table = 'public.agg'",
+        )
+        .await;
+        fx.exec(
+            "delete from public.items where g = 5; \
+             update public.items set v = v + 1000 where g = 9; \
+             insert into public.items values (1000, 14, 3); \
+             insert into public.agg (g, total, n) values (99, 5, 1)",
+        )
+        .await;
+        trellis::staging::quarantine::resume_transform(fx.d.pool(), "agg")
+            .await
+            .expect("resume");
+        let pool = fx.d.pool().clone();
+        build::start_ready_builds(&mut fx.d.ctl, &pool, &[id])
+            .await
+            .expect("start the resumed build");
+        assert_eq!(fx.status().await, "backfilling", "{kind}");
+        build::settle_builds(fx.d.pool()).await;
+        fx.d.settle().await;
+        fx.assert_right(&format!("{kind}: resumed")).await;
+        assert_eq!(
+            fx.d.rows("select count(*) from public.agg where g in (5, 99)")
+                .await,
+            ["(0)"],
+            "{kind}: the groups no leaf backs are gone"
+        );
+    }
+}
+
+/// A second aggregate defined over the seeded source builds per leaf.
+#[tokio::test]
+async fn a_fresh_build_over_a_partitioned_source_with_rows_goes_per_leaf() {
+    let mut fx = Fx::start(&tree("range"), SEED).await;
+    let defs = [("id", int4()), ("g", int4()), ("v", int4())]
+        .into_iter()
+        .map(|(n, t)| (n.to_string(), t))
+        .collect();
+    trellis::defs::install_definition(
+        fx.d.pool(),
+        "TRANSFORM agg2 FROM public.items GROUP BY g SELECT COUNT(*) AS c, SUM(v) AS s",
+        &defs,
+        "public",
+    )
+    .await
+    .expect("define a second aggregate");
+    trellis::intake::markers::discharge_registrations(fx.d.pool())
+        .await
+        .expect("start its build");
+    build::settle_builds(fx.d.pool()).await;
+    fx.d.settle().await;
+    assert_eq!(
+        fx.d.rows("select g, c, s from public.agg2 order by g")
+            .await,
+        fx.d.rows("select g, count(*), sum(v) from public.items group by g order by g")
+            .await
+    );
+    assert_eq!(
+        fx.d.rows("select status from transform_definitions order by id")
+            .await,
+        ["(live)", "(live)"]
+    );
+}
+
+/// A group-basis reader of an aggregate resumed over a partitioned source:
+/// a page between two leaves' transactions, on a group of a leaf not yet
+/// built, computes its prior image from the empty partials, so the reader
+/// is rebuilt by the transaction that completes the whole build (the
+/// remainder's), not by any leaf's, and converges.
+#[tokio::test]
+async fn a_reader_of_an_aggregate_resumed_per_leaf_is_rebuilt_once() {
+    let mut fx = Fx::start(&tree("range"), SEED).await;
+    let columns = [("g", int4()), ("total", int8()), ("n", int8())]
+        .into_iter()
+        .map(|(n, t)| (n.to_string(), t))
+        .collect();
+    trellis::defs::install_definition(
+        fx.d.pool(),
+        "TRANSFORM roll FROM public.agg GROUP BY n WITHOUT SOURCE INDEX \
+         SELECT COUNT(*) AS groups, SUM(total) AS t",
+        &columns,
+        "public",
+    )
+    .await
+    .expect("define the reader");
+    trellis::intake::markers::settle_registrations(fx.d.pool()).await;
+    fx.d.settle().await;
+    build::settle_builds(fx.d.pool()).await;
+    fx.d.settle().await;
+    const ROLL: &str = "select n, groups, t from public.roll order by n";
+    const ROLL_EXPECTED: &str = "select n, count(*), sum(total) from ( \
+                                     select count(*) as n, sum(v) as total \
+                                     from public.items group by g) s group by n order by n";
+    assert_eq!(fx.d.rows(ROLL).await, fx.d.rows(ROLL_EXPECTED).await);
+    let id: i64 =
+        fx.d.ctl
+            .query_one(
+                "select id from transform_definitions where target_table = 'public.agg'",
+                &[],
+            )
+            .await
+            .expect("id")
+            .get(0);
+    fx.exec("update transform_definitions set status = 'paused' where target_table = 'public.agg'")
+        .await;
+    trellis::staging::quarantine::resume_transform(fx.d.pool(), "agg")
+        .await
+        .expect("resume");
+    let pool = fx.d.pool().clone();
+    build::start_ready_builds(&mut fx.d.ctl, &pool, &[id])
+        .await
+        .expect("start the resumed build");
+    let mut building =
+        fx.d.run_frozen(
+            &[(PausePoint::BetweenRebuildStructures, "public.agg")],
+            |pool| async move {
+                let claimed = chunk_queue::claim_chunks_of(
+                    &**pool.get().await.expect("pool"),
+                    "build",
+                    1,
+                    &[chunk_queue::KIND_PLAN],
+                )
+                .await
+                .expect("claim the plan job");
+                assert_eq!(claimed.len(), 1, "one plan job to claim");
+                build::run_claimed(&pool, &claimed[0], "build", &REBUILD_OPTIONS).await;
+                Ok(())
+            },
+        )
+        .await;
+    building.reached(PausePoint::BetweenRebuildStructures).await;
+    assert_eq!(
+        fx.d.rows("select status from transform_definitions where target_table = 'public.roll'")
+            .await,
+        ["(live)"],
+        "a leaf's transaction parks nothing"
+    );
+    // Group 13 is the last leaf's, not yet built: its page sees no partials.
+    fx.exec("insert into public.items values (2013, 13, 1)")
+        .await;
+    let batch = fx.d.seal().await;
+    fx.d.drain(batch, "page").await;
+    fx.d.release(&mut building, PausePoint::BetweenRebuildStructures)
+        .await;
+    building.finish().await;
+    assert_eq!(
+        fx.d.rows("select status from transform_definitions where target_table = 'public.roll'")
+            .await,
+        ["(backfilling)"],
+        "the build's last transaction rebuilds the reader"
+    );
+    build::settle_builds(fx.d.pool()).await;
+    fx.d.settle().await;
+    build::settle_builds(fx.d.pool()).await;
+    fx.d.settle().await;
+    fx.assert_right("resumed").await;
+    assert_eq!(fx.d.rows(ROLL).await, fx.d.rows(ROLL_EXPECTED).await);
+    assert_eq!(
+        fx.d.rows("select status from transform_definitions order by id")
+            .await,
+        ["(live)", "(live)"]
+    );
+    assert_eq!(fx.d.deadlocks_logged(), Vec::<String>::new());
 }

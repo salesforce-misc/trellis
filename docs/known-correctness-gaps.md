@@ -235,7 +235,8 @@ table's. A change to Trellis's schema isn't detected.
   again. Ledger aggregates leave with
   [#1105](https://github.com/salesforce-misc/trellis/issues/1105). A
   group-basis aggregate's target and `agg_<id>` are repaired by
-  `request_backfill` of its source.
+  `request_backfill` of its source, or by `PAUSE`/`RESUME`, which drops and
+  recreates `agg_<id>` and rewrites every group.
 * **A `JOIN` target:** `PAUSE`/`RESUME` repairs the target's rows and every
   `join_<id>_*` table: the resume recreates the hidden tables, rebuilds them
   from both sources and keeps the target, removing a row no source row backs.

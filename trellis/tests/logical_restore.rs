@@ -421,8 +421,8 @@ async fn hidden_ids(raw: &Client) -> (i64, i64) {
 }
 
 /// The resumes of the group-basis aggregate and the `JOIN` reset their
-/// ordering state before the rebuild. The aggregate is paused again for the
-/// passes that follow; the `JOIN` is left to build.
+/// ordering state before the rebuild: each drops and recreates its hidden
+/// tables. Both builds run in the passes that follow.
 async fn resume_groups_and_check_the_reset(raw: &Client, trellis: &Trellis) {
     let (agg, join) = hidden_ids(raw).await;
     for target in ["gsum", "jl"] {
@@ -432,15 +432,9 @@ async fn resume_groups_and_check_the_reset(raw: &Client, trellis: &Trellis) {
             .unwrap_or_else(|e| panic!("{target}: {e}"));
     }
     assert_eq!(
-        count(
-            raw,
-            &format!(
-                "select count(*) from agg_{agg} where __basis is not null or __stamp is not null"
-            )
-        )
-        .await,
+        count(raw, &format!("select count(*) from agg_{agg}")).await,
         0,
-        "the group basis starts over"
+        "the group basis starts over, with no partials, basis or stamp"
     );
     for part in ["p", "m", "j", "t"] {
         assert_eq!(
@@ -449,10 +443,6 @@ async fn resume_groups_and_check_the_reset(raw: &Client, trellis: &Trellis) {
             "the JOIN's {part} is recreated"
         );
     }
-    trellis
-        .apply("PAUSE TRANSFORM gsum")
-        .await
-        .expect("pause gsum");
 }
 
 /// RESUME the 1-1, bring it live, then an update, a delete and an insert of
@@ -481,12 +471,16 @@ async fn resume_and_write(raw: &mut Client, trellis: &Trellis, pool: &trellis::P
         .await
         .expect("resume one");
     bring_live_only(raw, pool, "one").await;
-    assert_oracle(raw, "after the resume", &["one"]).await;
+    bring_live_only(raw, pool, "gsum").await;
+    assert_oracle(raw, "after the resume", &["one", "gsum"]).await;
     raw.batch_execute(
         "update public.s1 set v = 1000 where id = 1; \
          delete from public.s1 where id = 2; \
          insert into public.s1 values (10, 100); \
-         update public.s1 set v = v + 1 where id = 4",
+         update public.s1 set v = v + 1 where id = 4; \
+         update public.g set amt = amt + 1000 where id <= 2; \
+         delete from public.g where id = 3; \
+         insert into public.g values (30, 7, 5)",
     )
     .await
     .expect("writes");
@@ -494,7 +488,7 @@ async fn resume_and_write(raw: &mut Client, trellis: &Trellis, pool: &trellis::P
     assert_oracle(
         raw,
         "after writes to keys that existed before the dump",
-        &["one"],
+        &["one", "gsum"],
     )
     .await;
     // `self_check` over the restarted registry (#1219's page filter): the

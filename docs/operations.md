@@ -68,10 +68,12 @@ its hidden tables instead, keeps the target, and rebuilds both sides and the
 target's groups from the sources in one transaction. That build halts the
 `JOIN` again, with the reason, while its target has rows and a reader of it
 isn't paused: pause the readers, resume the `JOIN`, then resume the readers,
-which rebuild. An aggregate on the group basis has neither: its resume
-refuses while its hidden partials table is missing, with the same repair. A field resume (`RESUME TRANSFORM <target>.<column>`)
-runs define's validation and the source-key check, and refuses a field whose
-capture is still being widened.
+which rebuild. The resume of an aggregate on the group basis, which has
+neither table either, drops and recreates its hidden partials table and keeps
+the visible target, which its rebuild rewrites; its build rebuilds the
+target's readers when it commits, so they need no pause. A field resume
+(`RESUME TRANSFORM <target>.<column>`) runs define's validation and the
+source-key check, and refuses a field whose capture is still being widened.
 
 **What a resume changes.**
 
