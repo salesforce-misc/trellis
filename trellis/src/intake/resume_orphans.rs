@@ -557,17 +557,18 @@ impl Sweep {
                 None => None,
             };
             let mut matching = match &def.key_space {
-                // A JOIN's rows come from its own build (J4, #1109), not an
-                // orphan sweep. A re-read of its table that reaches here (a
-                // swapped table's reinstalled capture, #1177) fails the marker
-                // so it backs off (#407) instead of taking down the worker.
+                // A JOIN's rows come from its own build (#1109), not an orphan
+                // sweep, and a request or a reinstalled capture on either of
+                // its tables rebuilds it (`staging::build::rebuild_candidates`),
+                // so no marker reaches here for a live one. A re-read that
+                // does (a JOIN not applying) fails the marker so it backs off
+                // (#407) instead of taking down the worker.
                 KeySpace::Join(_) => {
                     return Err(IntakeError::UnsweepableTarget {
                         target,
                         reason:
-                            "a JOIN target is rebuilt, not swept, and its build isn't wired yet \
-                        (J4, #1109); restore the swapped source table, or drop the JOIN \
-                        transform, to clear this"
+                            "a JOIN target is rebuilt, not swept; resume the JOIN transform, or \
+                        drop it, to clear this"
                                 .to_string(),
                     });
                 }

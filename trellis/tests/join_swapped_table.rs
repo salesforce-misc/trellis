@@ -1,9 +1,9 @@
 //! A live `JOIN` whose joined table is swapped for a copy (#1177): the
-//! staging worker's pass reinstalls capture on the recreated table and its
-//! re-read reaches the orphan sweep, which has no arm for a `JOIN` until its
-//! build (J4, #1109). The pass fails that marker and backs it off rather than
-//! panicking the worker. Since #707 the swap is first a disruption of capture
-//! that pauses the `JOIN`: the test resumes it and steps the passes after.
+//! staging worker's pass reinstalls capture on the recreated table. Since
+//! #707 the swap is first a disruption of capture that pauses the `JOIN`: the
+//! test resumes it and steps the passes after. The reinstall's re-read of the
+//! joined table rebuilds the `JOIN` (#1109) rather than park a catch-up the
+//! orphan sweep, which has no arm for a `JOIN`, would fail for good.
 //!
 //! The group-basis dev knob is on before the driver starts (a `JOIN` applies
 //! only behind it); the pass is stepped by hand and nothing polls (#297).

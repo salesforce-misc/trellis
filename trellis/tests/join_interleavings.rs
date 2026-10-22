@@ -3,8 +3,9 @@
 //! cases.
 //!
 //! Every test turns the group-basis dev knob on before its driver starts:
-//! a `JOIN` applies only behind it, and goes `live` only over two empty
-//! tables until its build (#1109) exists. Rows arrive through capture.
+//! a `JOIN` applies only behind it. Rows arrive through capture, except the
+//! tests of the build at the end of the file, which define over tables that
+//! hold rows.
 //!
 //! Each scenario writes its source changes, seals them into batches, and
 //! drives the pages by hand (`support/drain_driver.rs`): one page frozen at a
@@ -1895,43 +1896,58 @@ async fn a_release_takes_the_j_lock_against_the_other_sides_pages() {
     }
 }
 
-/// Until #1109 the knob builds a `JOIN` only over two empty captured
-/// tables: a side with rows, or a side that is another transform's target
-/// (whose feed is #1100's), fails the build and pauses the definition.
+/// A `JOIN` whose side is a partitioned root that has rows halts with the
+/// reason (its per-leaf build waits on #1286); a partitioned side with no
+/// rows builds like any other.
 #[tokio::test]
-async fn the_knob_builds_a_join_only_over_empty_tables() {
+async fn the_build_halts_on_a_partitioned_side_with_rows() {
     trellis::dev::staging::set_group_basis(true);
-    let d = Driver::start(
-        &format!("{DDL}; insert into public.b values (1, 0, 1, 1, 1)"),
-        &[("id", int4())],
-        &[],
-        &["public.a", "public.b"],
-    )
-    .await;
-    trellis::defs::install_definition(
-        d.pool(),
-        &L.definition(Key::Single),
-        &Default::default(),
-        "public",
-    )
-    .await
-    .expect("define");
-    trellis::intake::markers::settle_registrations(d.pool()).await;
-    assert_eq!(
-        d.rows("select status::text from transform_definitions")
-            .await,
-        ["(paused)"],
-        "the build fails on a side with rows"
-    );
-    let error = d
-        .rows("select string_agg(last_error, ' | ') from backfill_chunks")
+    trellis::defs::partition_tree::open_gate_for_tests();
+    let ddl = "create table public.a (id integer not null, ga integer, t integer, \
+                   k integer not null, x integer, primary key (k, id)) partition by list (k); \
+               create table public.a0 partition of public.a for values in (1, 2); \
+               create table public.a1 partition of public.a default; \
+               create table public.b (id integer primary key, t integer, k integer, \
+                   gb integer, y integer); create index on public.b (k)";
+    for (rows, built) in [
+        ("", true),
+        ("insert into public.a values (1, 1, 0, 1, 1)", false),
+    ] {
+        let d = Driver::start_unbuilt(
+            &[],
+            &format!("{ddl}; {rows}"),
+            &[
+                ("id", int4()),
+                ("ga", int4()),
+                ("t", int4()),
+                ("k", int4()),
+                ("x", int4()),
+            ],
+            &[
+                "TRANSFORM l FROM public.a LEFT JOIN public.b ON a.k = b.k GROUP BY a.ga \
+               SELECT a.ga AS ga, COUNT(*) AS n",
+            ],
+            &["public.a", "public.b"],
+        )
         .await;
-    assert!(
-        error.len() == 1 && error[0].contains("a source that has rows"),
-        "{error:?}"
-    );
+        let lab = Lab {
+            d,
+            key: Key::Single,
+            kinds: vec![L],
+        };
+        lab.build().await;
+        let error = lab.d.rows("select last_error from backfill_chunks").await;
+        if built {
+            lab.assert_built("a partitioned side with no rows").await;
+        } else {
+            assert_eq!(lab.statuses().await, ["(paused)"]);
+            assert!(error.len() == 1 && error[0].contains("#1286"), "{error:?}");
+        }
+    }
 }
 
+/// A side that is another transform's target (whose feed is #1100's) fails
+/// the build and pauses the definition.
 #[tokio::test]
 async fn the_knob_refuses_a_join_over_a_target() {
     trellis::dev::staging::set_group_basis(true);
@@ -2142,4 +2158,938 @@ async fn a_page_that_applies_and_recomputes_one_cell_counts_it_once() {
     let batch = lab.d.seal().await;
     lab.d.drain(batch, "x").await;
     lab.check("b: apply and recompute of one M cell").await;
+}
+
+// ------------------------------------------------------------ the build
+
+// A `JOIN`'s fresh build, rebuild in place and `RESUME` (#1109, #1097's
+// decision): both structures in one transaction (`join::build`), run here by
+// hand from the plan job (a fresh build or a `RESUME`) or the sweep job (a
+// rebuild in place), frozen at the pause points of the build's transaction.
+// Every scenario ends at the oracle: each target equals its `JOIN … GROUP
+// BY`, `P` and `M` each side's `GROUP BY`, `J.matches = Σ M.n`, and
+// `T = Σ_k P ⊗ M`.
+
+/// Rows for the tables a build is defined over: duplicates in a cell, `NULL`
+/// join keys on both sides (a fact's key is a cell of `P`; a dimension's
+/// joins nothing), `NULL` group columns and values, a key only one side
+/// has, and decoys on a second `t` for the pair key.
+const BUILD_SEED: &str = "\
+    insert into public.a values (1, 1, 0, 1, 10), (2, 1, 0, 1, 5), (3, 2, 0, 2, 7), \
+        (4, 2, 0, 3, null), (5, 3, 0, null, 4), (6, null, 0, 2, 1), (7, 1, 1, 1, 100), \
+        (8, 4, 0, 8, 2); \
+    insert into public.b values (1, 0, 1, 10, 3), (2, 0, 1, 11, 4), (3, 0, 2, 10, null), \
+        (4, 0, null, 12, 5), (5, 0, 9, 13, 6), (6, 1, 1, 14, 50), (7, 0, 1, 10, 1)";
+
+/// A lab whose tables hold `seed` before `kinds` are defined over them, and
+/// whose builds have started: each definition is `backfilling` with its plan
+/// job unclaimed.
+async fn seeded(key: Key, kinds: &[Kind], seed: &str) -> Lab {
+    trellis::dev::staging::set_group_basis(true);
+    let definitions: Vec<String> = kinds.iter().map(|k| k.definition(key)).collect();
+    let definitions: Vec<&str> = definitions.iter().map(String::as_str).collect();
+    let d = Driver::start_unbuilt(
+        &[],
+        &format!("{DDL}; {seed}"),
+        &[
+            ("id", int4()),
+            ("ga", int4()),
+            ("t", int4()),
+            ("k", int4()),
+            ("x", int4()),
+        ],
+        &definitions,
+        &["public.a", "public.b"],
+    )
+    .await;
+    Lab {
+        d,
+        key,
+        kinds: kinds.to_vec(),
+    }
+}
+
+const BUILD_OPTIONS: trellis::staging::build::WorkerOptions =
+    trellis::staging::build::WorkerOptions {
+        chunk_rows: 1_000,
+        drain_batch_cap: usize::MAX,
+        heartbeat_interval: Duration::from_secs(5),
+        reclaim_ttl: Duration::from_secs(60),
+    };
+
+impl Lab {
+    /// Claims the one job of `kind` (`plan` for a fresh build or a `RESUME`,
+    /// `sweep` for a rebuild in place) and runs it in its own task, frozen at
+    /// each of `points` on `kind`'s target once reached.
+    async fn build_frozen(
+        &self,
+        job: &'static str,
+        points: &[PausePoint],
+    ) -> drain_driver::Running<()> {
+        let target = self.kinds[0].target();
+        let points: Vec<(PausePoint, &str)> =
+            points.iter().map(|p| (*p, target.as_str())).collect();
+        self.d
+            .run_frozen(&points, |pool| async move {
+                let claimed = trellis::defs::chunk_queue::claim_chunks_of(
+                    &**pool.get().await.expect("pool"),
+                    "build",
+                    1,
+                    &[job],
+                )
+                .await
+                .expect("claim the build");
+                assert_eq!(claimed.len(), 1, "one {job} job to claim");
+                trellis::staging::build::run_claimed(&pool, &claimed[0], "build", &BUILD_OPTIONS)
+                    .await;
+                Ok(())
+            })
+            .await
+    }
+
+    /// Runs every build to its end, as the staging worker does.
+    async fn build(&self) {
+        trellis::staging::build::settle_builds(self.d.pool()).await;
+    }
+
+    async fn statuses(&self) -> Vec<String> {
+        self.d
+            .rows("select status::text from transform_definitions order by id")
+            .await
+    }
+
+    /// Every definition is `live` and no job is left.
+    async fn assert_built(&self, context: &str) {
+        let errors = self
+            .d
+            .rows("select last_error from backfill_chunks where last_error is not null")
+            .await;
+        assert!(errors.is_empty(), "{context}: a job failed: {errors:?}");
+        assert_eq!(
+            self.statuses().await,
+            vec!["(live)"; self.kinds.len()],
+            "{context}: every definition is live"
+        );
+        assert_eq!(
+            self.d
+                .rows("select kind, last_error from backfill_chunks")
+                .await,
+            Vec::<String>::new(),
+            "{context}: no job is left"
+        );
+    }
+}
+
+/// Test 1: a fresh build over seeded tables, on every kind and both key
+/// shapes, ends `live` with the oracle's rows and hidden structures.
+async fn fresh_build(key: Key) {
+    let mut lab = seeded(key, &SIX, BUILD_SEED).await;
+    assert_eq!(
+        lab.statuses().await,
+        vec!["(backfilling)"; SIX.len()],
+        "the builds started"
+    );
+    lab.build().await;
+    lab.assert_built("fresh build").await;
+    lab.check("fresh build").await;
+}
+
+#[tokio::test]
+async fn build_fresh_over_seeded_tables() {
+    fresh_build(Key::Single).await;
+}
+
+#[tokio::test]
+async fn build_fresh_over_seeded_tables_pair_key() {
+    fresh_build(Key::Pair).await;
+}
+
+/// What a page between a build's start and its commit changes, and from
+/// which pause point of the build on it queues behind the build's locks (a
+/// key it names is held from `AfterJoinLock`, a cell with a `NULL` key part
+/// from `AfterEntryLock`; a key or cell the enumeration didn't see is not
+/// held, but its `T` group may be, from `AfterJoinTargetLock`).
+const AROUND: [(&str, &str, &str, Option<PausePoint>); 8] = [
+    (
+        "a: a row of an enumerated cell",
+        "update public.a set x = x + 1 where id = 1",
+        "update public.a set x = x + 1 where id = 2",
+        Some(PausePoint::AfterJoinLock),
+    ),
+    (
+        "a: a new cell on an enumerated key",
+        "insert into public.a values (32, 77, 0, 1, 1)",
+        "insert into public.a values (33, 78, 0, 1, 1)",
+        Some(PausePoint::AfterJoinLock),
+    ),
+    (
+        "a: a new key",
+        "insert into public.a values (30, 1, 0, 40, 1)",
+        "insert into public.a values (34, 1, 0, 41, 1)",
+        None,
+    ),
+    (
+        "a: a cell with a NULL key",
+        "update public.a set x = 9 where id = 5",
+        "update public.a set x = 10 where id = 5",
+        Some(PausePoint::AfterEntryLock),
+    ),
+    (
+        "a: a row moves between enumerated keys",
+        "update public.a set k = 8 where id = 3",
+        "update public.a set k = 3 where id = 3",
+        Some(PausePoint::AfterJoinLock),
+    ),
+    (
+        "b: a row of an enumerated cell",
+        "update public.b set y = 7 where id = 1",
+        "update public.b set y = 8 where id = 1",
+        Some(PausePoint::AfterJoinLock),
+    ),
+    (
+        "b: a new cell on an enumerated key",
+        "insert into public.b values (31, 0, 1, 99, 1)",
+        "insert into public.b values (35, 0, 1, 98, 1)",
+        Some(PausePoint::AfterJoinLock),
+    ),
+    (
+        "b: the last row of a key goes (a flip to unmatched)",
+        "delete from public.b where id = 5",
+        "insert into public.b values (36, 0, 9, 15, 2)",
+        Some(PausePoint::AfterJoinLock),
+    ),
+];
+
+const BUILD_POINTS: [PausePoint; 6] = [
+    PausePoint::BeforeJoinLock,
+    PausePoint::AfterJoinLock,
+    PausePoint::AfterEntryLock,
+    PausePoint::BetweenJoinSideWrites,
+    PausePoint::AfterJoinTargetLock,
+    PausePoint::BeforeRebuildCommit,
+];
+
+fn at_or_after(point: PausePoint, from: Option<PausePoint>) -> bool {
+    from.is_some_and(|from| {
+        BUILD_POINTS.iter().position(|p| *p == point)
+            >= BUILD_POINTS.iter().position(|p| *p == from)
+    })
+}
+
+/// Test 2 (F2, G2): changes committed before the build starts and drained
+/// after it, and a page drained while the build is frozen at each step,
+/// whether it queues behind the build's locks or runs through; the build's
+/// commit leaves the oracle's rows either way.
+async fn pages_around_a_build(key: Key, kind: Kind) {
+    for point in BUILD_POINTS {
+        for (name, sql, during_sql, held_from) in AROUND {
+            let context = format!("{key:?} {} at {point:?}, {name}", kind.name);
+            // A new key's cell is unmatched: its `T` group (`LEFT`'s) is one
+            // the build locked after the product.
+            let held_from = match (name, kind.left) {
+                ("a: a new key", true) => Some(PausePoint::AfterJoinTargetLock),
+                _ => held_from,
+            };
+            let mut lab = seeded(key, &[kind], BUILD_SEED).await;
+            // Committed and sealed before the build starts, drained after it
+            // commits: the build's snapshot sees it, and its basis refuses
+            // the change.
+            lab.write(sql).await;
+            let before = lab.d.seal().await;
+            let mut building = lab.build_frozen("plan", &[point]).await;
+            let reached = building.reached(point).await;
+            // A second change, on the same shape of cell, while it is frozen.
+            lab.write(during_sql).await;
+            let during = lab.d.seal().await;
+            let page = lab.d.drain_frozen(during, "during", &[]).await;
+            let queued = lab.queued_or_done(&page, reached.backend_pid).await;
+            assert_eq!(
+                queued,
+                at_or_after(point, held_from),
+                "{context}: the page queues behind the build exactly when it names a lock \
+                 the build holds"
+            );
+            lab.d.release(&mut building, point).await;
+            building.finish().await;
+            page.finish().await;
+            lab.d.drain(before, "before").await;
+            lab.assert_built(&context).await;
+            lab.check(&context).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn build_pages_around_a_build_left() {
+    pages_around_a_build(Key::Single, L).await;
+}
+
+#[tokio::test]
+async fn build_pages_around_a_build_inner_pair_key() {
+    pages_around_a_build(Key::Pair, I).await;
+}
+
+/// Runs `sql` on `lab`'s connection to `part` of `kind`'s hidden tables.
+async fn hidden_rows(
+    lab: &Lab,
+    kind: Kind,
+    part: &str,
+    columns: &str,
+    filter: &str,
+) -> Vec<String> {
+    let table = lab.hidden(kind, part).await;
+    lab.d
+        .rows(&format!("select {columns} from {table} {filter}"))
+        .await
+}
+
+/// `Trellis::request_backfill` of `table`, the rebuild a user asks for.
+async fn request_rebuild(lab: &Lab, table: &str) {
+    let trellis = trellis::Trellis::connect(
+        trellis::Config::from_dsn(lab.d.db.dsn().to_string()).expect("valid dsn"),
+        trellis::TrellisOptions::default(),
+    )
+    .await
+    .expect("connect a Trellis");
+    trellis
+        .request_backfill(table)
+        .await
+        .expect("request a rebuild");
+}
+
+/// Test 3 (rule 3): a page creates a `P` cell on an enumerated key after the
+/// enumeration, before the build's `J` lock. The build's `M` changes that
+/// key, so the product has a `T` group for the new cell that the
+/// enumeration did not name: it is locked with the product's groups, and its
+/// delta lands.
+#[tokio::test]
+async fn build_t_lock_set_covers_a_cell_created_after_the_enumeration() {
+    let mut lab = seeded(Key::Single, &[L], BUILD_SEED).await;
+    let mut building = lab
+        .build_frozen("plan", &[PausePoint::BeforeJoinLock])
+        .await;
+    building.reached(PausePoint::BeforeJoinLock).await;
+    lab.step("insert into public.a values (32, 77, 0, 1, 1)")
+        .await;
+    lab.d
+        .release(&mut building, PausePoint::BeforeJoinLock)
+        .await;
+    building.finish().await;
+    lab.assert_built("a cell created after the enumeration")
+        .await;
+    assert_eq!(
+        hidden_rows(
+            &lab,
+            L,
+            "t",
+            "ga, gb, __n",
+            "where ga = 77 and __n <> 0 order by gb"
+        )
+        .await,
+        ["(77,10,2)", "(77,11,1)", "(77,14,1)"],
+        "the new cell's T groups hold the page's and the build's deltas"
+    );
+    lab.check("a cell created after the enumeration").await;
+}
+
+/// Test 5 (rule 5): the build writes the cells it enumerated. A key first
+/// seen after the enumeration is left to its page, though the build's
+/// snapshot sees its row; the page applies it once.
+#[tokio::test]
+async fn build_writes_only_the_cells_it_enumerated() {
+    let mut lab = seeded(Key::Single, &[L], BUILD_SEED).await;
+    let mut building = lab
+        .build_frozen("plan", &[PausePoint::BeforeJoinLock])
+        .await;
+    building.reached(PausePoint::BeforeJoinLock).await;
+    lab.write("insert into public.a values (30, 1, 0, 40, 1)")
+        .await;
+    let late = lab.d.seal().await;
+    lab.d
+        .release(&mut building, PausePoint::BeforeJoinLock)
+        .await;
+    building.finish().await;
+    assert_eq!(
+        hidden_rows(&lab, L, "p", "ga, k, __n", "where k = 40").await,
+        Vec::<String>::new(),
+        "the cell the enumeration didn't see is not written"
+    );
+    lab.d.drain(late, "late").await;
+    assert_eq!(
+        hidden_rows(&lab, L, "p", "ga, k, __n", "where k = 40").await,
+        ["(1,40,1)"],
+        "its page applies it once"
+    );
+    lab.assert_built("a key first seen after the enumeration")
+        .await;
+    lab.check("a key first seen after the enumeration").await;
+}
+
+/// Test 6 (R8): a cell whose only row moved out, undrained, before the build
+/// is a zero cell with a basis, so the later `-1` of the move is refused.
+#[tokio::test]
+async fn build_enumerates_the_cell_an_undrained_old_image_names() {
+    let mut lab = seeded(Key::Single, &[L], BUILD_SEED).await;
+    lab.write("update public.a set ga = 9 where id = 4").await;
+    let moved = lab.d.seal().await;
+    lab.build().await;
+    assert_eq!(
+        hidden_rows(
+            &lab,
+            L,
+            "p",
+            "ga, k, __n, __basis is not null",
+            "where ga = 2 and k = 3"
+        )
+        .await,
+        ["(2,3,0,t)"],
+        "the old image's cell is zero, with the build's snapshot as its basis"
+    );
+    lab.d.drain(moved, "moved").await;
+    lab.assert_built("an undrained move").await;
+    lab.check("an undrained move").await;
+}
+
+/// Edits the sources behind capture's back, so `P`, `M` and `T` agree with
+/// the old rows and the tables hold new ones: a fact edited, one that was
+/// alone in its cell deleted (a cell only the hidden table names), a key's
+/// dimension rows deleted (a flip to unmatched) and a dimension row added to
+/// a key that had none (a flip to matched).
+async fn drift(lab: &Lab) {
+    uncaptured(
+        lab,
+        "public.a",
+        "update public.a set x = x + 100 where id = 1; delete from public.a where id = 4",
+    )
+    .await;
+    uncaptured(
+        lab,
+        "public.b",
+        "delete from public.b where k = 1; insert into public.b values (50, 0, 8, 20, 9)",
+    )
+    .await;
+}
+
+/// Test 13: a `request_backfill` of the `FROM` table and of the joined table
+/// each rebuild the `JOIN` in place (a sweep job alone), repairing what
+/// drifted from the tables, and leave no catch-up marker failing.
+async fn rebuild_in_place(key: Key, kind: Kind) {
+    for table in ["a", "b"] {
+        let context = format!("{key:?} {} rebuild of {table}", kind.name);
+        let mut lab = seeded(key, &[kind], BUILD_SEED).await;
+        lab.build().await;
+        lab.assert_built(&context).await;
+        drift(&lab).await;
+        // A visible row that disagrees with its partials, and one with no
+        // group at all.
+        lab.write(&format!(
+            "update public.{name} set n = n + 1000; \
+             insert into public.{name} ({columns}, n) values ({values}, 1)",
+            name = kind.name,
+            columns = kind.groups().join(", "),
+            values = kind
+                .groups()
+                .iter()
+                .map(|_| "424242")
+                .collect::<Vec<_>>()
+                .join(", "),
+        ))
+        .await;
+        request_rebuild(&lab, table).await;
+        assert_eq!(lab.statuses().await, ["(backfilling)"], "{context}");
+        assert_eq!(
+            lab.d.rows("select kind from backfill_chunks").await,
+            ["(sweep)"],
+            "{context}: a JOIN rebuild is its sweep job alone"
+        );
+        lab.build().await;
+        lab.assert_built(&context).await;
+        lab.check(&context).await;
+        assert_eq!(
+            lab.d
+                .rows("select table_name from pending_backfill where last_error is not null")
+                .await,
+            Vec::<String>::new(),
+            "{context}: no catch-up marker is failing"
+        );
+        // The request's marker is discharged without a catch-up of the
+        // JOIN, which would fail in the orphan sweep for good.
+        trellis::intake::markers::settle_registrations(lab.d.pool()).await;
+        assert_eq!(
+            lab.d
+                .rows("select table_name from pending_backfill where last_error is not null")
+                .await,
+            Vec::<String>::new(),
+            "{context}: the discharge failed no marker"
+        );
+        lab.assert_built(&context).await;
+    }
+}
+
+#[tokio::test]
+async fn build_rebuild_in_place_left() {
+    rebuild_in_place(Key::Single, L).await;
+}
+
+#[tokio::test]
+async fn build_rebuild_in_place_inner_pair_key() {
+    rebuild_in_place(Key::Pair, I).await;
+}
+
+/// Test 10 (rule 8, G6): a reader of the target sees the old rows, hand edit
+/// and all, until the build's one commit, whichever step it is frozen at, and
+/// the oracle's rows after.
+#[tokio::test]
+async fn build_readers_see_the_old_target_until_the_commit() {
+    let mut lab = seeded(Key::Single, &[L], BUILD_SEED).await;
+    lab.build().await;
+    drift(&lab).await;
+    lab.write("update public.l set n = n + 1000").await;
+    let old = lab.d.rows(&L.actual()).await;
+    request_rebuild(&lab, "a").await;
+    let points = [
+        PausePoint::AfterJoinLock,
+        PausePoint::BetweenJoinSideWrites,
+        PausePoint::AfterJoinTargetLock,
+        PausePoint::BeforeRebuildCommit,
+    ];
+    let mut building = lab.build_frozen("sweep", &points).await;
+    for point in points {
+        building.reached(point).await;
+        assert_eq!(
+            lab.d.rows(&L.actual()).await,
+            old,
+            "a reader sees the old target at {point:?}"
+        );
+        lab.d.release(&mut building, point).await;
+    }
+    building.finish().await;
+    lab.assert_built("a rebuild under a reader").await;
+    lab.check("a rebuild under a reader").await;
+    assert_ne!(lab.d.rows(&L.actual()).await, old);
+}
+
+/// Test 9 (rule 7): a `TRUNCATE` whose page drains after the build wipes what
+/// the build wrote, and the barrier reapplies what follows it.
+#[tokio::test]
+async fn build_truncates_committed_before_the_build_drain_after_it() {
+    for table in ["a", "b"] {
+        let mut lab = seeded(Key::Single, &[L], BUILD_SEED).await;
+        lab.write(&format!("truncate public.{table}")).await;
+        let truncated = lab.d.seal().await;
+        lab.write(&format!(
+            "insert into public.{table} values (60, 1, 0, 1, 5)"
+        ))
+        .await;
+        let after = lab.d.seal().await;
+        lab.build().await;
+        lab.assert_built("truncate before the build").await;
+        lab.d.drain(truncated, "truncate").await;
+        lab.d.drain(after, "after").await;
+        lab.check(&format!("truncate of {table} before the build"))
+            .await;
+    }
+}
+
+/// Test 9 (rule 7): a `TRUNCATE` statement issued while the build holds its
+/// tables queues behind the build's `ACCESS SHARE` and runs after its commit;
+/// its page then clears what the build wrote.
+#[tokio::test]
+async fn build_a_truncate_statement_queues_behind_the_build() {
+    let mut lab = seeded(Key::Single, &[L], BUILD_SEED).await;
+    let mut building = lab
+        .build_frozen("plan", &[PausePoint::AfterEntryLock])
+        .await;
+    let reached = building.reached(PausePoint::AfterEntryLock).await;
+    let user = lab.d.user().await;
+    let truncating = tokio::spawn(async move { user.batch_execute("truncate public.a").await });
+    lab.d.wait_blocked_behind(reached.backend_pid).await;
+    assert!(!truncating.is_finished(), "the TRUNCATE queues");
+    lab.d
+        .release(&mut building, PausePoint::AfterEntryLock)
+        .await;
+    building.finish().await;
+    truncating
+        .await
+        .expect("task")
+        .expect("the truncate runs after the build");
+    lab.d.settle().await;
+    lab.assert_built("a truncate during the build").await;
+    lab.check("a truncate during the build").await;
+    assert_eq!(
+        lab.d.rows("select count(*) from public.l").await,
+        ["(0)"],
+        "the truncate's page cleared what the build wrote"
+    );
+}
+
+/// Test 9 (rule 7): a page carrying a `TRUNCATE` holds the lock row `FOR
+/// UPDATE`, so a build that starts meanwhile waits for it, then builds from
+/// the emptied table.
+#[tokio::test]
+async fn build_waits_for_a_truncate_page_holding_the_lock_row() {
+    let mut lab = seeded(Key::Single, &[L], BUILD_SEED).await;
+    lab.write("truncate public.b").await;
+    let truncated = lab.d.seal().await;
+    let target = L.target();
+    let mut page = lab
+        .d
+        .drain_frozen(
+            truncated,
+            "truncate",
+            &[(PausePoint::BeforeJoinLock, target.as_str())],
+        )
+        .await;
+    let reached = page.reached(PausePoint::BeforeJoinLock).await;
+    let building = lab.build_frozen("plan", &[]).await;
+    lab.d.wait_blocked_behind(reached.backend_pid).await;
+    assert!(!building.is_finished(), "the build waits for the page");
+    lab.d.release(&mut page, PausePoint::BeforeJoinLock).await;
+    page.finish().await;
+    building.finish().await;
+    lab.assert_built("a build behind a truncate page").await;
+    lab.check("a build behind a truncate page").await;
+}
+
+/// Pauses `kind`'s definition the way a capture disruption does, by hand.
+async fn pause(lab: &Lab, kind: Kind) {
+    lab.write(&format!(
+        "update transform_definitions set status = 'paused' where target_table = 'public.{}'",
+        kind.name
+    ))
+    .await;
+}
+
+/// Resumes `kind`'s definition and starts its build (`backfilling`, its plan
+/// job unclaimed).
+async fn resume(lab: &Lab, kind: Kind) {
+    trellis::staging::quarantine::resume_transform(lab.d.pool(), kind.name)
+        .await
+        .expect("resume");
+    trellis::intake::markers::discharge_registrations(lab.d.pool())
+        .await
+        .expect("start the build");
+    assert_eq!(lab.statuses().await, ["(backfilling)"]);
+}
+
+/// Test 11: a `RESUME` keeps the visible target, recreates the hidden tables
+/// and builds them. The definition was paused through writes on both sides (a
+/// group emptied among them) and a hand edit of the target and of `T`; frozen
+/// before its commit, a reader sees the old rows, and after it the oracle's:
+/// the emptied group's visible row, which no `T` group names, is gone.
+async fn resume_keeps_the_target(key: Key, kind: Kind) {
+    let mut lab = seeded(key, &[kind], BUILD_SEED).await;
+    lab.build().await;
+    lab.assert_built("before the pause").await;
+    pause(&lab, kind).await;
+    for sql in [
+        "insert into public.a values (70, 5, 0, 1, 1); insert into public.b values (70, 0, 3, 15, 1)",
+        "update public.a set x = 99 where id = 2; update public.b set y = 33 where id = 2",
+        "update public.a set k = 9 where id = 3; delete from public.b where id = 7",
+        "delete from public.a where id = 5",
+        "delete from public.b where k = 2",
+    ] {
+        lab.step(sql).await;
+    }
+    let t = lab.hidden(kind, "t").await;
+    lab.write(&format!(
+        "update public.{} set n = n + 5; update {t} set __n = __n + 5",
+        kind.name
+    ))
+    .await;
+    let old = lab.d.rows(&kind.actual()).await;
+    resume(&lab, kind).await;
+    let mut building = lab
+        .build_frozen("plan", &[PausePoint::BeforeRebuildCommit])
+        .await;
+    building.reached(PausePoint::BeforeRebuildCommit).await;
+    assert_eq!(
+        lab.d.rows(&kind.actual()).await,
+        old,
+        "a reader sees the old rows until the commit"
+    );
+    lab.d
+        .release(&mut building, PausePoint::BeforeRebuildCommit)
+        .await;
+    building.finish().await;
+    lab.assert_built("the resume").await;
+    lab.check("the resume").await;
+}
+
+#[tokio::test]
+async fn build_resume_keeps_the_target_left() {
+    resume_keeps_the_target(Key::Single, L).await;
+}
+
+#[tokio::test]
+async fn build_resume_keeps_the_target_inner_pair_key() {
+    resume_keeps_the_target(Key::Pair, I).await;
+}
+
+/// A `RESUME` over two empty tables removes the visible rows the old build
+/// left (nothing else ever would): the target ends empty.
+#[tokio::test]
+async fn build_resume_over_two_empty_tables_removes_the_old_rows() {
+    let mut lab = seeded(Key::Single, &[L], BUILD_SEED).await;
+    lab.build().await;
+    pause(&lab, L).await;
+    lab.step("delete from public.a; delete from public.b").await;
+    assert_ne!(
+        lab.d.rows("select count(*) from public.l").await,
+        ["(0)"],
+        "the old rows are still there"
+    );
+    resume(&lab, L).await;
+    lab.build().await;
+    lab.assert_built("a resume over empty tables").await;
+    assert_eq!(
+        lab.d.rows("select * from public.l").await,
+        Vec::<String>::new()
+    );
+    lab.check("a resume over empty tables").await;
+}
+
+/// Test 14: a job that dies before its commit leaves nothing and runs again
+/// whole; a `PAUSE` and `DROP TRANSFORM` meanwhile wait for it and log no
+/// deadlock.
+#[tokio::test]
+async fn build_job_lifecycle() {
+    let mut lab = seeded(Key::Single, &[L], BUILD_SEED).await;
+    let building = {
+        let mut building = lab
+            .build_frozen("plan", &[PausePoint::AfterEntryLock])
+            .await;
+        building.reached(PausePoint::AfterEntryLock).await;
+        building
+    };
+    building.kill().await;
+    lab.write("update backfill_chunks set claimed_by = null, claimed_at = null")
+        .await;
+    assert_eq!(
+        hidden_rows(&lab, L, "p", "count(*)", "").await,
+        ["(0)"],
+        "a job that died before its commit wrote nothing"
+    );
+    lab.build().await;
+    lab.assert_built("a job that died").await;
+    lab.check("a job that died").await;
+
+    // A second rebuild changes nothing.
+    request_rebuild(&lab, "a").await;
+    lab.build().await;
+    lab.assert_built("a second build").await;
+    lab.check("a second build").await;
+
+    // A PAUSE waits for a build in flight.
+    request_rebuild(&lab, "b").await;
+    let mut building = lab
+        .build_frozen("sweep", &[PausePoint::AfterEntryLock])
+        .await;
+    let reached = building.reached(PausePoint::AfterEntryLock).await;
+    let trellis = trellis::Trellis::connect(
+        trellis::Config::from_dsn(lab.d.db.dsn().to_string()).expect("valid dsn"),
+        trellis::TrellisOptions::default(),
+    )
+    .await
+    .expect("connect");
+    let pausing = tokio::spawn(async move {
+        trellis.apply("PAUSE TRANSFORM l").await?;
+        trellis.apply("DROP TRANSFORM l").await
+    });
+    lab.d.wait_blocked_behind(reached.backend_pid).await;
+    assert!(!pausing.is_finished(), "the PAUSE waits for the build");
+    lab.d
+        .release(&mut building, PausePoint::AfterEntryLock)
+        .await;
+    building.finish().await;
+    pausing
+        .await
+        .expect("task")
+        .expect("the PAUSE and DROP run after the build");
+    assert_eq!(
+        lab.d
+            .rows("select count(*) from transform_definitions")
+            .await,
+        ["(0)"]
+    );
+    assert_eq!(lab.d.deadlocks_logged(), Vec::<String>::new());
+}
+
+/// Test 15: a page that holds a key past the build's `lock_timeout` makes its
+/// `J` statement fail with `55P03`; the job is released for a retry, the
+/// definition stays `backfilling`, and the retry converges.
+#[tokio::test]
+async fn build_a_lock_timeout_is_retried() {
+    trellis::dev::staging::set_group_basis(true);
+    let d = Driver::start_unbuilt(
+        &[("lock_timeout", "300ms")],
+        &format!("{DDL}; {BUILD_SEED}"),
+        &[
+            ("id", int4()),
+            ("ga", int4()),
+            ("t", int4()),
+            ("k", int4()),
+            ("x", int4()),
+        ],
+        &[&L.definition(Key::Single)],
+        &["public.a", "public.b"],
+    )
+    .await;
+    let mut lab = Lab {
+        d,
+        key: Key::Single,
+        kinds: vec![L],
+    };
+    let j = lab.hidden(L, "j").await;
+    let holder = lab.d.user().await;
+    holder
+        .batch_execute(&format!(
+            "begin; insert into {j} (k) values (1) on conflict do nothing; \
+             select 1 from {j} where k = 1 for update"
+        ))
+        .await
+        .expect("hold a key");
+    lab.build_frozen("plan", &[]).await.finish().await;
+    assert_eq!(lab.statuses().await, ["(backfilling)"], "not paused");
+    let failed = lab
+        .d
+        .rows("select attempts, last_error is not null, claimed_by is null from backfill_chunks")
+        .await;
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert!(failed[0].ends_with(",t,t)"), "{failed:?}");
+    holder.batch_execute("commit").await.expect("release");
+    lab.write("update backfill_chunks set next_attempt_at = null")
+        .await;
+    lab.build().await;
+    lab.assert_built("a lock timeout").await;
+    lab.check("a lock timeout").await;
+}
+
+/// Test 17: what stays refused. A field build of a `JOIN` (nothing can ask
+/// for one: `ALTER TRANSFORM` takes only a 1-1 target), here forged on the
+/// job, fails it rather than walk a primary key.
+#[tokio::test]
+async fn build_refuses_a_field_build() {
+    let lab = seeded(Key::Single, &[L], BUILD_SEED).await;
+    lab.write("update backfill_chunks set fields = array['n'] where kind = 'plan'")
+        .await;
+    lab.build_frozen("plan", &[]).await.finish().await;
+    let error = lab
+        .d
+        .rows("select kind, last_error from backfill_chunks")
+        .await;
+    assert!(
+        error.len() == 1 && error[0].contains("a field build of a JOIN"),
+        "the job fails, and plans no chunk: {error:?}"
+    );
+}
+
+/// A `RESUME` of a `JOIN` whose target has rows and a reader that isn't paused
+/// is refused at the build (#1287): the resume keeps the target, and the
+/// reader would double-count it. With the reader paused (frozen), it builds.
+#[tokio::test]
+async fn build_resume_with_a_live_reader_halts() {
+    let mut lab = seeded(Key::Single, &[I], BUILD_SEED).await;
+    lab.build().await;
+    trellis::defs::install_definition(
+        lab.d.pool(),
+        "TRANSFORM i2 FROM public.i SELECT n AS n, sx AS sx",
+        &[
+            ("n".to_string(), ValueType::Integer(IntWidth::Int8)),
+            ("sx".to_string(), ValueType::Integer(IntWidth::Int8)),
+        ]
+        .into(),
+        "public",
+    )
+    .await
+    .expect("define the reader");
+    trellis::intake::markers::settle_registrations(lab.d.pool()).await;
+    lab.d.settle().await;
+    pause(&lab, I).await;
+    trellis::staging::quarantine::resume_transform(lab.d.pool(), "i")
+        .await
+        .expect("resume");
+    trellis::intake::markers::discharge_registrations(lab.d.pool())
+        .await
+        .expect("start the build");
+    lab.build().await;
+    assert_eq!(
+        lab.d
+            .rows("select status::text from transform_definitions where target_table = 'public.i'")
+            .await,
+        ["(paused)"]
+    );
+    let error = lab.d.rows("select last_error from backfill_chunks").await;
+    assert!(error.len() == 1 && error[0].contains("#1287"), "{error:?}");
+    let _ = &mut lab;
+}
+
+/// Test 9 (rule 7): the build holds the lock row `FOR SHARE`, so a page that
+/// carries a `TRUNCATE` (the row `FOR UPDATE`) waits for its commit, then
+/// clears what the build wrote.
+#[tokio::test]
+async fn build_holds_the_lock_row_against_a_truncate_page() {
+    let mut lab = seeded(Key::Single, &[L], BUILD_SEED).await;
+    lab.write("truncate public.a").await;
+    let truncated = lab.d.seal().await;
+    let mut building = lab
+        .build_frozen("plan", &[PausePoint::BeforeJoinLock])
+        .await;
+    let reached = building.reached(PausePoint::BeforeJoinLock).await;
+    let page = lab.d.drain_frozen(truncated, "truncate", &[]).await;
+    lab.d.wait_blocked_behind(reached.backend_pid).await;
+    assert!(!page.is_finished(), "the truncate page waits for the build");
+    lab.d
+        .release(&mut building, PausePoint::BeforeJoinLock)
+        .await;
+    building.finish().await;
+    page.finish().await;
+    lab.assert_built("a truncate page behind the build").await;
+    assert_eq!(lab.d.rows("select count(*) from public.l").await, ["(0)"]);
+    lab.check("a truncate page behind the build").await;
+}
+
+/// Rule 1 on a rebuild in place, where every `J` row exists already: the
+/// build's one sorted `FOR UPDATE` of the union of both sides' keys makes a
+/// page that names an enumerated key, of either side, wait for the commit,
+/// while a key the enumeration didn't see runs through.
+#[tokio::test]
+async fn build_in_place_holds_the_j_rows_of_both_sides_keys() {
+    let mut lab = seeded(Key::Single, &[I], BUILD_SEED).await;
+    lab.build().await;
+    request_rebuild(&lab, "a").await;
+    let mut building = lab
+        .build_frozen("sweep", &[PausePoint::AfterJoinLock])
+        .await;
+    let reached = building.reached(PausePoint::AfterJoinLock).await;
+    for (sql, queues) in [
+        ("update public.a set x = x + 1 where id = 1", true),
+        ("update public.b set y = y + 1 where id = 3", true),
+        ("insert into public.a values (80, 1, 0, 45, 1)", false),
+    ] {
+        lab.write(sql).await;
+        let batch = lab.d.seal().await;
+        let page = lab.d.drain_frozen(batch, "page", &[]).await;
+        assert_eq!(
+            lab.queued_or_done(&page, reached.backend_pid).await,
+            queues,
+            "{sql}"
+        );
+        if !queues {
+            page.finish().await;
+        } else {
+            lab.d
+                .release(&mut building, PausePoint::AfterJoinLock)
+                .await;
+            building.finish().await;
+            page.finish().await;
+            building = lab
+                .build_frozen("sweep", &[PausePoint::AfterJoinLock])
+                .await;
+            building.kill().await;
+            break;
+        }
+    }
+    lab.d.settle().await;
+    lab.check("pages around a rebuild in place").await;
 }

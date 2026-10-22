@@ -283,21 +283,30 @@ partitioned on its own id is refused.
 
 ### A build fills `P` and `M` from each source and `T` from them
 
-A build fills `P` and `M` a chunk at a time, and each chunk carries its cells'
-contribution into `T` under the same `J` locks and in the same transaction as a
-page, so pages apply from the first chunk. In the model, chunked builds of both
-sides were exact in every chunk order and against pages, recomputes and the
-other side's chunks, on both versions.
+A build, a `RESUME` and a rebuild in place are one transaction over both
+structures. It takes the lock row `FOR SHARE`, enumerates each side's cells
+(its hidden table's, its table's and those of the ring's old images), locks
+`J` on the union of both sides' keys in one sorted statement, locks the cells,
+and writes each side's enumerated cells from one `GROUP BY` of its table under
+a snapshot taken after the lock statements. A cell first seen after the
+enumeration belongs to its pages. It then carries both sides' changes into `T`
+as the product, as a page does. `T`'s groups are locked after the product,
+together with every group of the visible target and of `T`'s hidden table; `T`
+changes only as a delta, and each locked group's visible row is compared with
+the row the target holds. Pages apply from the build's first moment, and a page
+that names a key the build holds waits for its commit. Readers see the old `T`
+and the old visible rows until then. One `GROUP BY` per structure was 2–12x
+cheaper than chunks in the model (84 s against 412–509 s on a 100M-row fact
+table grouped by day and dimension attribute), and the model found it exact
+against pages, recomputes and truncates on both versions.
 
-[OPEN: Chunked builds cost per (chunk, cell) pair, not per row: with many cells
-they were 3–4x slower than one materialized row per fact, while one `GROUP BY`
-per structure was 2–12x cheaper than chunks (84 s against 412–509 s on a 100M-row
-fact table grouped by day and dimension attribute). Which locks make filling `P`
-and `M` by one `GROUP BY` each, and `T` from `P ⋈ M` in one statement, exact
-while both sides take writes, and whether pages can apply during that fill,
-awaits the build-path correctness model in #1097, and the build itself is
-decided in #1109. Recommendation: build that way if the model shows it exact,
-and keep chunks otherwise.]
+[OPEN: A partitioned side that has rows isn't built yet (#1286): one
+transaction per leaf can't keep the readers' single commit. A `RESUME` keeps
+the visible target while the hidden tables restart empty, so a page that
+applies before the build commits computes its prior image from the empty
+partials, and a reader chained on the target double-counts (#1287); the build
+refuses a `RESUME` that keeps a target with rows under a reader that isn't
+paused.]
 
 ### Define warns when `P` approaches the fact table's size
 

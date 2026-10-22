@@ -53,9 +53,12 @@
 //!   ([`run_group_rebuild`]), so a reader sees a leaf's groups change as its
 //!   transaction commits. A fresh group-basis build never has a sweep, so a
 //!   sweep row is always this rebuild; the fresh build is the plan job's
-//!   (below).
-//! - **Plan** ([`run_plan`]). For a plain group-basis aggregate the plan job
-//!   is the whole build ([`run_group_rebuild_held`]). Otherwise a drain worker walks the source's primary key
+//!   (below). A `JOIN` (`super::join`) is rebuilt the same way, by the sweep
+//!   job alone, whichever of its two tables the request names
+//!   ([`rebuild_candidates`]): both structures and `T` in one transaction
+//!   ([`super::join::build`], #1109).
+//! - **Plan** ([`run_plan`]). For a plain group-basis aggregate or a `JOIN`
+//!   the plan job is the whole build ([`run_group_rebuild_held`]). Otherwise a drain worker walks the source's primary key
 //!   and enqueues `rederive` chunks of `ClientOptions::build_chunk_rows`
 //!   rows, [`PLAN_BATCH`] per transaction (Q13). The walk and every chunk
 //!   compare the key under the collations the walk started under, which the
@@ -1192,8 +1195,7 @@ pub(crate) fn corrected_on_partitioned_source(definition: &Definition) -> bool {
 /// #1108) included. A plain aggregate's rebuild is its sweep job alone
 /// ([`start_rebuilds`], [`run_group_rebuild`]), and its fresh build or resume
 /// is its plan job's one absolute write of the same kind ([`run_plan`],
-/// #1101), with no chunk. A `JOIN`'s fresh build is #1109's: until then the
-/// plan job only checks that each side is empty.
+/// #1101), with no chunk, as is a `JOIN`'s (#1109, [`super::join::build`]).
 fn takes_group_basis(definition: &Definition) -> bool {
     super::group_basis::route(&definition.def, &definition.source_columns).is_some()
         || super::join::applies(&definition.def)
@@ -1325,10 +1327,9 @@ pub async fn start_ready_builds(
         if definition.status != TransformStatus::WaitingToBackfill {
             continue;
         }
-        // #1107: nothing builds a JOIN yet (J4, #1109), and no other build
-        // may take one: it stays `waiting_to_backfill`, with no marker. Behind
-        // the group-basis knob, one over two empty tables starts as a knob-on
-        // aggregate does (#1108, `super::join`).
+        // No build but the JOIN build may take a JOIN (#1107, #1109): without
+        // the group-basis knob it stays `waiting_to_backfill`, with no marker.
+        // Behind it, the plan job builds both structures (`super::join`).
         let join = match &definition.def.key_space {
             crate::defs::ast::KeySpace::Join(_) => {
                 if !super::join::applies(&definition.def) {
@@ -1722,8 +1723,9 @@ async fn start(
     Ok(Some(dependents))
 }
 
-/// The definitions reading one of `tables` as their source that a rebuild
-/// could take (#625 F7): applying ones (`live`, and `backfilling` under a
+/// The definitions reading one of `tables` as their source, or a `JOIN`
+/// reading one as its joined table, that a rebuild could take (#625 F7,
+/// #1109): applying ones (`live`, and `backfilling` under a
 /// Re-derive build; not `catching_up`, whose catch-up is parked), in id
 /// order. A candidate only: [`rebuildable`] decides, under the row locks.
 pub(crate) async fn rebuild_candidates(
@@ -1733,7 +1735,7 @@ pub(crate) async fn rebuild_candidates(
     Ok(client
         .query(
             "select id from transform_definitions \
-             where source_table = any($1) \
+             where (source_table = any($1) or join_table = any($1)) \
                and (status = $2 or (status = $3 and build = $4)) \
              order by id",
             &[
@@ -1816,8 +1818,8 @@ pub(crate) async fn rebuildable_on_group_basis(
 /// the table has and sweeps the entries it no longer backs. That is one row
 /// of each per definition, so the call stays fast whatever the table's size.
 /// A group-basis definition (one with a hidden group table,
-/// `super::group_basis`) gets the sweep job alone, which recomputes its
-/// groups in place ([`run_group_rebuild`]).
+/// `super::group_basis`, or a `JOIN`'s hidden tables) gets the sweep job
+/// alone, which recomputes its groups in place ([`run_group_rebuild`]).
 ///
 /// The definition applies throughout (B1), as it did before the call, so
 /// nothing is parked for it: the caller leaves it out of its catch-up. Its
@@ -1858,12 +1860,13 @@ pub(crate) async fn start_rebuilds(
                  from transform_definitions d where id = any($1) \
                    and ($2 = '{sweep}' or not exists ( \
                        select 1 from pg_catalog.pg_class c \
-                       where c.relname = {hidden} \
+                       where c.relname in ({hidden}, {join_hidden}) \
                          and c.relnamespace = (select relnamespace from pg_catalog.pg_class \
                                                where oid = 'transform_definitions'::regclass))) \
                  order by id",
                 sweep = chunk_queue::KIND_SWEEP,
                 hidden = super::group_basis::hidden_table_name_sql("d.id"),
+                join_hidden = crate::defs::join::HiddenTable::TruncateLock.name_sql("d.id"),
             ),
             &[&ids, &kind],
         )
@@ -3100,6 +3103,19 @@ async fn run_plan(
             }
         }
     }
+    // A `JOIN`'s fresh build or resume is its whole build (#1109, ADR-0019):
+    // both structures in one transaction, never a walk of the primary key.
+    // Neither side is seam-fed (a side that is another definition's target is
+    // refused), so there is no fence to wait for.
+    if super::join::applies(&definition.def) {
+        if chunk.fields.is_some() {
+            return Err(build_error(ApplyError::GroupBasisUnsupported {
+                target: definition.target_table.clone(),
+                what: "a field build of a JOIN (ALTER TRANSFORM takes only a 1-1 target)",
+            }));
+        }
+        return run_group_rebuild_held(pool, chunk, claimed_by, &definition, &fence, None).await;
+    }
     // A seam-fed source's build waits for its fence before the walk, so
     // before any chunk (F6).
     if chunk.fields.is_none()
@@ -3129,7 +3145,6 @@ async fn run_plan(
     // without a ledger.
     let mut client = pool.get().await?;
     if chunk.fields.is_none()
-        && !super::join::applies(&definition.def)
         && takes_group_basis(&definition)
         && !crate::defs::partition_tree::is_partitioned_root(&**client, &definition.source_table)
             .await?
@@ -3137,49 +3152,26 @@ async fn run_plan(
         drop(client);
         return run_group_rebuild_held(pool, chunk, claimed_by, &definition, &fence, None).await;
     }
-    // #1108: a `JOIN` behind the group-basis dev knob takes two empty tables,
-    // each captured (the target feed is #1100's); either may be a partitioned
-    // root, whose node operations the partition correction engine corrects
-    // (#1111). Its build is #1109's. A plain aggregate over a partitioned
-    // root takes an empty one the same way, and refuses one with rows: its
-    // build there is per leaf, a later slice of #1101.
+    // A plain aggregate over a partitioned root takes an empty one, and
+    // refuses one with rows: its build there is per leaf, a later slice of
+    // #1101.
     if cursor.is_none() && chunk.fields.is_none() && takes_group_basis(&definition) {
-        let mut tables = vec![definition.source_table.clone()];
-        if super::join::applies(&definition.def) {
-            tables.extend(catalog::join_table_of(&**client, definition.id).await?);
-            for table in &tables {
-                if catalog::is_definition_target(&**client, table).await? {
-                    return Err(build_error(ApplyError::GroupBasisUnsupported {
-                        target: definition.target_table.clone(),
-                        what: "a JOIN side that is another definition's target \
-                               (the target feed is #1100's)",
-                    }));
-                }
-            }
-        }
-        for table in &tables {
-            let has_rows: bool = client
-                .query_one(
-                    &format!(
-                        "select exists (select 1 from {})",
-                        ddl::qualified_source_table(table)
-                    ),
-                    &[],
-                )
-                .await?
-                .get(0);
-            if has_rows {
-                return Err(build_error(ApplyError::GroupBasisUnsupported {
-                    target: definition.target_table.clone(),
-                    what: if super::join::applies(&definition.def) {
-                        "a fresh build or resume over a source that has rows (the JOIN build \
-                         is #1109)"
-                    } else {
-                        "a fresh build or resume over a partitioned source that has rows (its \
-                         per-leaf build is #1101)"
-                    },
-                }));
-            }
+        let has_rows: bool = client
+            .query_one(
+                &format!(
+                    "select exists (select 1 from {})",
+                    ddl::qualified_source_table(&definition.source_table)
+                ),
+                &[],
+            )
+            .await?
+            .get(0);
+        if has_rows {
+            return Err(build_error(ApplyError::GroupBasisUnsupported {
+                target: definition.target_table.clone(),
+                what: "a fresh build or resume over a partitioned source that has rows (its \
+                       per-leaf build is #1101)",
+            }));
         }
     }
     loop {
@@ -3291,7 +3283,8 @@ async fn run_plan(
 
 /// Runs a group-basis definition's claimed sweep job, which is its whole
 /// rebuild (#1101's decision; see the module doc's "Rebuild of an applying
-/// definition"): [`super::group_basis::rebuild_definition`] and the job's
+/// definition"): [`super::group_basis::rebuild_definition`] (a `JOIN`'s,
+/// [`super::join::build`], #1109) and the job's
 /// done mark in one `read committed` transaction, fenced by the claim
 /// ([`ClaimFence`]), so a job that dies before its commit runs again whole
 /// and one that committed never does. The rebuild is idempotent: run again,
@@ -3338,6 +3331,40 @@ async fn run_group_rebuild_held(
     cursor: Option<&str>,
 ) -> Result<(), ChunkQueueError> {
     let mut client = pool.get().await?;
+    if super::join::applies(&definition.def) {
+        if let Some(what) = join_build_refusal(
+            &**client,
+            definition,
+            matches!(chunk.work, chunk_queue::ChunkWork::Plan { .. }),
+        )
+        .await?
+        {
+            return Err(build_error(ApplyError::GroupBasisUnsupported {
+                target: definition.target_table.clone(),
+                what,
+            }));
+        }
+        let Some((written, deleted)) = run_group_structure(
+            pool,
+            &mut client,
+            chunk,
+            fence,
+            definition,
+            &Structure::Whole,
+        )
+        .await?
+        else {
+            return chunk_queue::discard_if_superseded(pool, chunk, claimed_by).await;
+        };
+        crate::instance_log::debug!(
+            definition_id = chunk.definition_id,
+            written,
+            deleted,
+            "JOIN build replaced both structures and every group"
+        );
+        try_complete(pool, chunk.definition_id).await?;
+        return Ok(());
+    }
     if !crate::defs::partition_tree::is_partitioned_root(&**client, &definition.source_table)
         .await?
     {
@@ -3431,6 +3458,79 @@ async fn run_group_rebuild_held(
     );
     try_complete(pool, chunk.definition_id).await?;
     Ok(())
+}
+
+/// Why a `JOIN`'s build ([`run_group_rebuild_held`]) can't run, if it can't
+/// (#1109): the reason becomes the definition's halting failure. `fresh` is
+/// the plan job of a fresh build or a `RESUME`.
+///
+/// - **A side that is another definition's target.** The target feed isn't
+///   wired into the build; when it is, the seam fence of [`run_plan`] must
+///   test both tables, not only the `FROM` one.
+/// - **A partitioned side that has rows.** The build there is per leaf, which
+///   needs a decision first (#1286). A partitioned side with no rows builds
+///   as an unpartitioned one: there is nothing to bound.
+/// - **A `RESUME` over a target that has rows and unfrozen readers.** A
+///   `RESUME` keeps the visible target and recreates the hidden tables, so a
+///   page that applies before the build commits computes its prior image from
+///   the empty partials, not from the row the target holds, and a reader
+///   chained on the target double-counts for good (#1287). A rebuild in place
+///   has no such window: the partials it replaces are the ones the pages read.
+async fn join_build_refusal(
+    client: &impl GenericClient,
+    definition: &Definition,
+    fresh: bool,
+) -> Result<Option<&'static str>, ChunkQueueError> {
+    let mut tables = vec![definition.source_table.clone()];
+    tables.extend(catalog::join_table_of(client, definition.id).await?);
+    let mut rows = false;
+    for table in &tables {
+        if catalog::is_definition_target(client, table).await? {
+            return Ok(Some(
+                "a JOIN side that is another definition's target (the target feed is #1100's)",
+            ));
+        }
+        if crate::defs::partition_tree::is_partitioned_root(client, table).await? {
+            let has_rows: bool = client
+                .query_one(
+                    &format!(
+                        "select exists (select 1 from {})",
+                        ddl::qualified_source_table(table)
+                    ),
+                    &[],
+                )
+                .await?
+                .get(0);
+            rows |= has_rows;
+        }
+    }
+    if rows {
+        return Ok(Some(
+            "a JOIN build over a partitioned side that has rows (its per-leaf build waits on \
+             the decision in #1286); partition the data out of the way or build over an \
+             unpartitioned copy",
+        ));
+    }
+    if fresh {
+        let held: bool = client
+            .query_one(
+                &format!(
+                    "select exists (select 1 from {})",
+                    ddl::qualified_target_table_ident(&definition.target_table)
+                ),
+                &[],
+            )
+            .await?
+            .get(0);
+        if held && catalog::has_unfrozen_reader(client, &definition.target_table).await? {
+            return Ok(Some(
+                "a RESUME of a JOIN whose target has rows and a reader that is not paused: the \
+                 reader would double-count what the resume keeps (#1287); pause the target's \
+                 readers first, then resume the JOIN and its readers",
+            ));
+        }
+    }
+    Ok(None)
 }
 
 /// What one transaction of a group-basis rebuild covers.
@@ -3529,11 +3629,16 @@ async fn run_group_structure(
             None,
         ),
     };
-    let (written, deleted) =
+    let (written, deleted) = if super::join::applies(&definition.def) {
+        super::join::build(&txn, pool.schema(), definition)
+            .await
+            .map_err(build_error)?
+    } else {
         super::group_basis::rebuild_definition(&txn, pool.schema(), definition, scope.as_ref())
             .await
             .map_err(build_error)?
-            .unwrap_or((0, 0));
+            .unwrap_or((0, 0))
+    };
     match (structure, cursor) {
         (Structure::Partitioned { last: false, .. }, Some(cursor)) => {
             txn.execute(
@@ -3583,12 +3688,6 @@ async fn run_sweep(
         .ok_or(ChunkQueueError::DefinitionNotFound {
             definition_id: chunk.definition_id,
         })?;
-    if super::join::applies(&definition.def) {
-        return Err(build_error(ApplyError::GroupBasisUnsupported {
-            target: definition.target_table.clone(),
-            what: "a JOIN rebuild's sweep (the JOIN build is #1109)",
-        }));
-    }
     if takes_group_basis(&definition) {
         return run_group_rebuild(
             pool,

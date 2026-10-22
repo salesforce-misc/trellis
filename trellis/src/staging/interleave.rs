@@ -204,6 +204,10 @@ pub enum PausePoint {
     /// On a `JOIN` target, after the page locked its `J` rows, before it
     /// locks its `P` and `M` cells.
     AfterJoinLock,
+    /// On a `JOIN` target, after each side's cells are written (the `FROM`
+    /// side's, then the joined side's), before the next side or the product:
+    /// a build's cross term (`super::join::build`, #1109).
+    BetweenJoinSideWrites,
     /// On a `JOIN` target, after the page applied its `P` and `M` changes and
     /// locked the `T` groups their product changes, before it writes them.
     AfterJoinTargetLock,

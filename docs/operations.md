@@ -64,7 +64,8 @@ define doesn't, where the only repair is to `DROP TRANSFORM` and define again:
   type and floating point).
 
 A `JOIN` has no ledger or group-delta table. Its resume drops and recreates
-its hidden tables instead. An aggregate on the group basis has neither: its
+its hidden tables instead, keeps the target, and rebuilds both sides and the
+target's groups from the sources in one transaction. An aggregate on the group basis has neither: its
 resume refuses while its hidden partials table is missing, with the same
 repair. A field resume (`RESUME TRANSFORM <target>.<column>`)
 runs define's validation and the source-key check, and refuses a field whose

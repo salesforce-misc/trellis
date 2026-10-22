@@ -765,7 +765,6 @@ impl GroupTargetPlan {
             staged: format!("pg_temp.{}", quote_ident(staged)),
             recomputed,
             source_row,
-            // A `JOIN` isn't rebuilt in place (#1109), so nothing reads these.
             source: source_name.to_string(),
             ring: Vec::new(),
             source_pk,
@@ -781,6 +780,15 @@ impl GroupTargetPlan {
             floor_key,
             stage_filter,
         }
+    }
+
+    /// This plan with the ring's segment tables, whose old images a build's
+    /// enumeration reads ([`enumerate_cells`]).
+    pub(super) fn with_ring(mut self, catalog_schema: &str) -> Self {
+        self.ring = (0..super::append::RING_SIZE)
+            .map(|slot| format!("{}.seg_{slot}", quote_ident(catalog_schema)))
+            .collect();
+        self
     }
 
     /// Adds one folded change's ring rows. An image-less change (a
@@ -903,6 +911,12 @@ impl GroupTargetPlan {
             }
             _ => None,
         }
+    }
+
+    /// The plan's source table, quoted and qualified: what a `FROM` or a
+    /// whole-table `GROUP BY` of it names.
+    pub(super) fn source_row(&self) -> &str {
+        &self.source_row
     }
 
     /// The hidden table, quoted and qualified.
@@ -1246,6 +1260,21 @@ impl GroupTargetPlan {
     /// `$1` is the target (for its truncate floor). `image_columns` are the
     /// target's columns when a reader needs prior images.
     fn apply_sql(&self, image_columns: Option<&[String]>) -> String {
+        let tail = match &self.writer {
+            Writer::JoinPartials { deltas } => self.deltas_tail_sql(deltas),
+            Writer::Aggregate | Writer::JoinTarget => self.visible_tail_sql(image_columns),
+        };
+        self.apply_sql_with(&tail)
+    }
+
+    /// [`Self::apply_sql`] of `T` in a JOIN build ([`Self::compare_held_sql`]):
+    /// adds the staged deltas to the hidden partials and writes no visible
+    /// row. Returns how many groups it wrote.
+    fn apply_hidden_sql(&self) -> String {
+        self.apply_sql_with("n as (select 1) select count(*) from up")
+    }
+
+    fn apply_sql_with(&self, tail: &str) -> String {
         let cols = quoted(&self.shape.group_cols);
         let col_list = cols.join(", ");
         let args = &self.shape.args;
@@ -1323,10 +1352,6 @@ impl GroupTargetPlan {
             nonzero = nonzero.join(" or "),
             up_groups = up_groups.join(", "),
             returning = returning.join(", "),
-            tail = match &self.writer {
-                Writer::JoinPartials { deltas } => self.deltas_tail_sql(deltas),
-                Writer::Aggregate | Writer::JoinTarget => self.visible_tail_sql(image_columns),
-            },
         )
     }
 
@@ -1538,9 +1563,10 @@ impl GroupTargetPlan {
         // none for the remainder, whose groups have no row of their own.
         let own = match scope {
             None => format!(
-                " union all select distinct {values} from {src} s",
+                " union all select distinct {values} from {src} s where true{filter}",
                 values = self.group_values().join(", "),
-                src = self.source_row
+                src = self.source_row,
+                filter = self.stage_filter,
             ),
             Some(RebuildScope {
                 node: Some(node), ..
@@ -1550,15 +1576,29 @@ impl GroupTargetPlan {
             ),
             Some(_) => String::new(),
         };
+        // A `JOIN` side's cells have no visible target of their own, and the
+        // stage filter keeps a joined row with a `NULL` key part out of `M`
+        // as it keeps it out of a page.
+        let (target_branch, image_filter) = match self.writer {
+            Writer::JoinPartials { .. } => (
+                String::new(),
+                format!("{image_filter} where true{}", self.stage_filter),
+            ),
+            _ => (
+                format!(
+                    " union all select {cols} from {} t{target_filter}",
+                    self.target_ident
+                ),
+                image_filter,
+            ),
+        };
         format!(
             "insert into {rc} ({cols}) \
-             select {cols} from {hidden} h{hidden_filter} \
-             union all select {cols} from {target} t{target_filter}{own} \
+             select {cols} from {hidden} h{hidden_filter}{target_branch}{own} \
              union all select {values} from ({images}) as r \
                  cross join lateral jsonb_populate_record(null::{src}, r.__i) as s{image_filter}",
             rc = self.recomputed,
             hidden = self.hidden_ident,
-            target = self.target_ident,
             values = self.group_values().join(", "),
             src = self.source_row,
             images = images.join(" union all "),
@@ -1589,7 +1629,6 @@ impl GroupTargetPlan {
         let mut kept = vec!["coalesce(a.__rn, 0) as __rn".to_string()];
         let mut sets = vec!["__n = r.__rn".to_string()];
         let mut returning = vec!["u.__n as __nn".to_string()];
-        let mut applied = vec!["cur.__nn".to_string()];
         for (i, arg) in args.iter().enumerate() {
             let i = i + 1;
             fresh.push(format!(
@@ -1599,7 +1638,6 @@ impl GroupTargetPlan {
             kept.push(format!("coalesce(a.__rc{i}, 0) as __rc{i}"));
             sets.push(format!("__count_{i} = r.__rc{i}"));
             returning.push(format!("u.__count_{i} as __nc{i}"));
-            applied.push(format!("cur.__nc{i}"));
             if arg.summed {
                 fresh.push(format!(
                     "coalesce(sum(({})::numeric), 0) as __rs{i}",
@@ -1608,7 +1646,6 @@ impl GroupTargetPlan {
                 kept.push(format!("coalesce(a.__rs{i}, 0) as __rs{i}"));
                 sets.push(format!("__sum_{i} = r.__rs{i}"));
                 returning.push(format!("u.__sum_{i} as __ns{i}"));
-                applied.push(format!("cur.__ns{i}::text"));
             }
         }
         let positions: Vec<String> = (1..=cols.len()).map(|p| p.to_string()).collect();
@@ -1617,6 +1654,87 @@ impl GroupTargetPlan {
             .map(|c| format!("array[a.{c}] = array[rg.{c}]"))
             .collect();
         let up_groups: Vec<String> = cols.iter().map(|c| format!("u.{c}")).collect();
+        let lookup_hidden = self.group_lookup(&self.hidden_ident, "rg", "x.ctid");
+        let r = match read {
+            // One `GROUP BY` of the source or of a leaf, matched to the
+            // locked groups.
+            RebuildRead::Source | RebuildRead::Node(_) => {
+                let from = match read {
+                    RebuildRead::Node(node) => node.as_str(),
+                    _ => self.source_row.as_str(),
+                };
+                format!(
+                    "a as ( \
+                         select {values}, {fresh} from {from} s group by {positions} \
+                     ), \
+                     r as ( \
+                         select h.__hc, {kept} from rg \
+                         cross join lateral {lookup_hidden} as h(__hc) \
+                         left join a on {matched} \
+                     )",
+                    values = self.group_values().join(", "),
+                    fresh = fresh.join(", "),
+                    positions = positions.join(", "),
+                    kept = kept.join(", "),
+                    matched = matched.join(" and "),
+                )
+            }
+            // One index probe of the root per group, for a set that is not
+            // a leaf's (the remainder's) or a leaf of a tree that is not as
+            // recorded.
+            RebuildRead::Probe => format!(
+                "r as ( \
+                     select h.__hc, {kept} from rg \
+                     cross join lateral {lookup_hidden} as h(__hc) \
+                     cross join lateral (select {fresh} from ({probe}) as s) as a \
+                 )",
+                kept = kept.join(", "),
+                fresh = fresh.join(", "),
+                probe = self.probe_rows_sql(),
+            ),
+        };
+        format!(
+            "with snap as materialized ( \
+                 select pg_catalog.pg_current_snapshot() as __snap, \
+                        coalesce((select max(seg_seq) from segments), 0) as __seg \
+             ), \
+             rg as (select distinct {col_list} from {recomputed}), \
+             {r}, \
+             up as ( \
+                 update {hidden} u set {sets}, __basis = snap.__snap, __stamp = snap.__seg \
+                 from r, snap where u.ctid = r.__hc \
+                 returning {up_groups}, {returning} \
+             ), \
+             {tail}",
+            recomputed = self.recomputed,
+            r = r,
+            hidden = self.hidden_ident,
+            sets = sets.join(", "),
+            up_groups = up_groups.join(", "),
+            returning = returning.join(", "),
+            tail = self.held_tail_sql(image_columns),
+        )
+    }
+
+    /// The end of [`Self::rebuild_sql`] and [`Self::compare_held_sql`], after
+    /// their `up` CTE, which returns each group's columns and its partials'
+    /// values (`__nn`, `__nc<i>`, `__ns<i>`): the visible row each group's
+    /// partials give is compared with the row the target **holds**, upserted
+    /// where its values differ, deleted where the count is 0, and each prior
+    /// image is the held row. Returns rows in [`Self::visible_tail_sql`]'s
+    /// layout, with each partial's value in place of its change.
+    fn held_tail_sql(&self, image_columns: Option<&[String]>) -> String {
+        let cols = quoted(&self.shape.group_cols);
+        let col_list = cols.join(", ");
+        let args = &self.shape.args;
+        let mut applied = vec!["cur.__nn".to_string()];
+        for (i, arg) in args.iter().enumerate() {
+            let i = i + 1;
+            applied.push(format!("cur.__nc{i}"));
+            if arg.summed {
+                applied.push(format!("cur.__ns{i}::text"));
+            }
+        }
         let field_count = self.shape.fields.len();
         let field_names: Vec<String> = self
             .shape
@@ -1676,58 +1794,8 @@ impl GroupTargetPlan {
             }
             None => "null::text".to_string(),
         };
-        let lookup_hidden = self.group_lookup(&self.hidden_ident, "rg", "x.ctid");
-        let r = match read {
-            // One `GROUP BY` of the source or of a leaf, matched to the
-            // locked groups.
-            RebuildRead::Source | RebuildRead::Node(_) => {
-                let from = match read {
-                    RebuildRead::Node(node) => node.as_str(),
-                    _ => self.source_row.as_str(),
-                };
-                format!(
-                    "a as ( \
-                         select {values}, {fresh} from {from} s group by {positions} \
-                     ), \
-                     r as ( \
-                         select h.__hc, {kept} from rg \
-                         cross join lateral {lookup_hidden} as h(__hc) \
-                         left join a on {matched} \
-                     )",
-                    values = self.group_values().join(", "),
-                    fresh = fresh.join(", "),
-                    positions = positions.join(", "),
-                    kept = kept.join(", "),
-                    matched = matched.join(" and "),
-                )
-            }
-            // One index probe of the root per group, for a set that is not
-            // a leaf's (the remainder's) or a leaf of a tree that is not as
-            // recorded.
-            RebuildRead::Probe => format!(
-                "r as ( \
-                     select h.__hc, {kept} from rg \
-                     cross join lateral {lookup_hidden} as h(__hc) \
-                     cross join lateral (select {fresh} from ({probe}) as s) as a \
-                 )",
-                kept = kept.join(", "),
-                fresh = fresh.join(", "),
-                probe = self.probe_rows_sql(),
-            ),
-        };
         format!(
-            "with snap as materialized ( \
-                 select pg_catalog.pg_current_snapshot() as __snap, \
-                        coalesce((select max(seg_seq) from segments), 0) as __seg \
-             ), \
-             rg as (select distinct {col_list} from {recomputed}), \
-             {r}, \
-             up as ( \
-                 update {hidden} u set {sets}, __basis = snap.__snap, __stamp = snap.__seg \
-                 from r, snap where u.ctid = r.__hc \
-                 returning {up_groups}, {returning} \
-             ), \
-             nv as (select up.*, {nf_all} from up cross join {new_fields}), \
+            "nv as (select up.*, {nf_all} from up cross join {new_fields}), \
              cur as ( \
                  select nv.*, t.* , \
                         (nv.__nn > 0) is distinct from (t.__tc is not null) \
@@ -1747,12 +1815,6 @@ impl GroupTargetPlan {
              select {key}, cur.__changed, cur.__nn > 0, cur.__tc is not null, {prior_image}, \
                     {applied} \
              from cur",
-            recomputed = self.recomputed,
-            r = r,
-            hidden = self.hidden_ident,
-            sets = sets.join(", "),
-            up_groups = up_groups.join(", "),
-            returning = returning.join(", "),
             nf_all = if field_count == 0 {
                 "true as __trellis_none".to_string()
             } else {
@@ -1773,6 +1835,85 @@ impl GroupTargetPlan {
                 .collect::<String>(),
             key = ddl::pk_key_sql_expr(&self.identity, Some("cur")),
             applied = applied.join(", "),
+        )
+    }
+
+    /// A JOIN build's visible compare for `T` ([`apply_join_build_groups`]),
+    /// over every group of the staging table (the product's groups and
+    /// [`Self::target_groups_sql`]'s zero rows), already locked and with the
+    /// staged deltas applied to the hidden partials: each group's visible
+    /// row, computed from the partials it now holds, is compared with the row
+    /// the target holds ([`Self::held_tail_sql`]). That repairs a visible row
+    /// that disagrees with the partials, and removes one whose group has no
+    /// partial left, which a delta alone never reaches.
+    fn compare_held_sql(&self, image_columns: Option<&[String]>) -> String {
+        let cols = quoted(&self.shape.group_cols);
+        let col_list = cols.join(", ");
+        let mut names = vec!["__nn".to_string()];
+        let mut columns = vec!["x.__n".to_string()];
+        for (i, arg) in self.shape.args.iter().enumerate() {
+            let i = i + 1;
+            names.push(format!("__nc{i}"));
+            columns.push(format!("x.__count_{i}"));
+            if arg.summed {
+                names.push(format!("__ns{i}"));
+                columns.push(format!("x.__sum_{i}"));
+            }
+        }
+        let up_groups: Vec<String> = cols.iter().map(|c| format!("rg.{c}")).collect();
+        let up_values: Vec<String> = names.iter().map(|n| format!("h.{n}")).collect();
+        format!(
+            "with rg as (select distinct {col_list} from {staged}), \
+             up as ( \
+                 select {up_groups}, {up_values} from rg \
+                 cross join lateral {lookup_hidden} as h({names}) \
+             ), \
+             {tail}",
+            staged = self.staged,
+            up_groups = up_groups.join(", "),
+            up_values = up_values.join(", "),
+            lookup_hidden = self.group_lookup(&self.hidden_ident, "rg", &columns.join(", ")),
+            names = names.join(", "),
+            tail = self.held_tail_sql(image_columns),
+        )
+    }
+
+    /// A JOIN build's enumeration of `T`'s groups (ADR-0002's R8, one level
+    /// up): a zero row in `T`'s staging table for every group the visible
+    /// target holds and every group `T`'s hidden table holds, so the lock of
+    /// [`Self::lock_sql`] covers them with the product's groups, and the
+    /// compare reaches a visible row whose group has no source row left. A
+    /// zero row changes no partial.
+    fn target_groups_sql(&self) -> String {
+        let cols = quoted(&self.shape.group_cols).join(", ");
+        let mut insert = vec!["__txid", "__lsn", "__n"]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>();
+        let mut zeros = vec![
+            "pg_current_xact_id()".to_string(),
+            "'0/0'::pg_lsn".to_string(),
+            "0".to_string(),
+        ];
+        for (i, arg) in self.shape.args.iter().enumerate() {
+            let i = i + 1;
+            insert.push(format!("__c{i}"));
+            zeros.push("0".to_string());
+            if arg.summed {
+                insert.push(format!("__s{i}"));
+                zeros.push("0".to_string());
+            }
+        }
+        format!(
+            "insert into {staged} ({cols}, {insert}) \
+             select {cols}, {zeros} from ( \
+                 select {cols} from {hidden} union select {cols} from {target} \
+             ) as g",
+            staged = self.staged,
+            insert = insert.join(", "),
+            zeros = zeros.join(", "),
+            hidden = self.hidden_ident,
+            target = self.target_ident,
         )
     }
 
@@ -2034,6 +2175,53 @@ pub(crate) async fn apply_locked_groups(
     };
     txn.batch_execute(PLAN_RESET).await?;
     Ok(written_groups(plan, rows, mutations))
+}
+
+/// A JOIN build's enumeration of one side's cells (`super::join::build`,
+/// ADR-0002's R8): adds to [`GroupTargetPlan::recomputed`] every cell the
+/// side's hidden table holds, every cell of its table's rows, and the cell of
+/// every old image of the ring's changes to the table
+/// ([`GroupTargetPlan::rebuild_groups_sql`]). Reads without a lock.
+pub(super) async fn enumerate_cells(
+    txn: &Transaction<'_>,
+    plan: &GroupTargetPlan,
+) -> Result<(), ApplyError> {
+    txn.execute(&plan.rebuild_groups_sql(None), &[&plan.source])
+        .await?;
+    Ok(())
+}
+
+/// A JOIN build's enumeration of `T`'s groups: one zero row per group of the
+/// visible target and of `T`'s hidden table, into `T`'s staging table
+/// ([`GroupTargetPlan::target_groups_sql`]).
+pub(super) async fn enumerate_target_groups(
+    txn: &Transaction<'_>,
+    plan: &GroupTargetPlan,
+) -> Result<(), ApplyError> {
+    txn.execute(&plan.target_groups_sql(), &[]).await?;
+    Ok(())
+}
+
+/// `T`'s write in a JOIN build, over the groups [`GroupTargetPlan::lock_sql`]
+/// locked: adds the product's deltas to the hidden partials, then replaces
+/// every locked group's visible row by comparing what its partials give with
+/// the row the target holds ([`GroupTargetPlan::compare_held_sql`]). Each
+/// changed visible row is recorded into `mutations`, with the held row as its
+/// prior image. Returns the rows it wrote and deleted.
+pub(super) async fn apply_join_build_groups(
+    txn: &Transaction<'_>,
+    plan: &GroupTargetPlan,
+    mutations: &mut TargetMutations,
+) -> Result<(usize, usize), ApplyError> {
+    txn.batch_execute(PLAN_SETTINGS).await?;
+    txn.query_one(&plan.apply_hidden_sql(), &[]).await?;
+    txn.batch_execute(PLAN_RESET).await?;
+    let image_columns = mutations.image_columns(txn, &plan.target).await?;
+    let rows = txn
+        .query(&plan.compare_held_sql(image_columns.as_deref()), &[])
+        .await?;
+    let (_, written, deleted) = written_groups(plan, rows, mutations);
+    Ok((written, deleted))
 }
 
 /// The recompute of the groups in [`GroupTargetPlan::recomputed`], which

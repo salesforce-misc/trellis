@@ -4613,7 +4613,7 @@ async fn complete_resume(
     // `"schema.table"` form (issue #72) — re-resolving it via
     // `resolve_source_schema_in_txn` (bare names only) or re-`qualify`-ing it
     // would reject it outright (`DottedIdentifierComponent`).
-    // A JOIN gets none either: nothing builds one yet, so it waits
+    // A JOIN gets none either: its plan job builds it
     // (`super::build::start_ready_builds`).
     if revalidated.join.is_none() && !super::build::qualifies(txn, definition).await? {
         crate::intake::markers::park_marker(txn, source_table).await?;
