@@ -205,6 +205,54 @@ With one, a recompute reads only its groups' rows: about 1.3 ms for a
 each recompute scans the source. Small groups don't need it. An index you
 create or drop changes speed only, never results.
 
+## Partition large sources
+
+This applies to an aggregate kept on the group basis and to a `JOIN`, which
+today run only behind a development switch (see the previous section). Their
+targets are built, resumed and rebuilt in place from the source, and the size
+of the source decides how long that takes.
+
+A fresh build, a `RESUME` and a rebuild in place of an **unpartitioned** source
+run as one absolute write per structure, in one transaction. A `JOIN` with both
+sides unpartitioned writes both of its structures in one transaction. The
+transaction locks the groups it writes and holds its snapshot until it commits,
+so its lock window, its hold on `xmin` and the stall in retiring ring segments
+grow with the source. Extrapolated linearly from the measurements to a
+billion source rows, that is about 13 to 18 seconds (parallel) or about 80
+seconds (serial) for a plain aggregate, and about 1 to 36 minutes per structure
+for a `JOIN`, which holds the sum of both. For that whole window the source's
+drain waits, and on a `JOIN` so do the other side's pages on the same keys.
+Readers of the target see the old values until the commit, then the new ones
+([ADR-0002](decisions/0002-async-data-flow.md)).
+
+A **partitioned** source is bounded per leaf instead. A group-basis build,
+`RESUME` or rebuild writes one leaf per transaction, then the groups no leaf
+routes, and a killed build continues after the last leaf it committed. A `JOIN`
+with a partitioned side builds each unpartitioned side first, each as one
+transaction, then each partitioned side's leaves, then a final step for the
+result groups. While a `JOIN` builds this way its readers see progressive
+values on the partitioned sides, and the status reads `backfilling` until the
+final step commits. An unpartitioned side of such a `JOIN` is still one
+transaction as large as that side. The partition key must be in the group key
+or the join columns ([transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)).
+
+So:
+
+* Partition a large source when its aggregate or `JOIN` is kept on the group
+  basis. Each leaf then costs what a source of its size costs, and a build
+  never holds more than one leaf at a time.
+* Keep the unpartitioned side of a `JOIN` small (a dimension table), since it
+  builds as one transaction.
+* Schedule a `RESUME` or a rebuild of a large unpartitioned source for a quiet
+  time. The drain of that source waits for it.
+* A `RESUME` keeps the target's rows and recomputes them in place, so readers
+  keep seeing the old values, and the groups pages touch while it runs may show
+  partial values until the status is `live`. A group-basis aggregate or `JOIN`
+  that reads the resumed target is rebuilt when the `RESUME` commits, once for
+  the whole build and not per leaf. The reader reports `backfilling` and may
+  show wrong values until its own rebuild commits, and that rebuild is as
+  large as its own source.
+
 ## Roles and permissions
 
 ### One Trellis role
