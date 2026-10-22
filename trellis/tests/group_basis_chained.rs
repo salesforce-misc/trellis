@@ -19,7 +19,9 @@
 //! reader defined while an upstream writer is in flight, and an upstream
 //! rebuild that rebuilds the reader. The last covers a ledger upstream fed
 //! through a relationship, whose writes reach the reader through the seam
-//! like any other writer's.
+//! like any other writer's. The last group is a reader's build over an
+//! upstream target whose keys have `NULL` parts, with writes and source
+//! `TRUNCATE`s around it (#1102).
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
@@ -27,7 +29,7 @@ mod drain_driver;
 use std::collections::HashMap;
 use std::time::Duration;
 
-use drain_driver::Driver;
+use drain_driver::{Driver, Running};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ValueType;
 use trellis::defs::chunk_queue;
@@ -914,4 +916,231 @@ async fn a_pause_and_drop_of_a_one_to_one_wait_for_a_page_that_planned_it() {
         "the page failed no one"
     );
     assert_equal(&mut d, A1, ORACLE).await;
+}
+
+// ------------------------------------------ a build over NULL-part keys
+
+const UP_HG: &str =
+    "TRANSFORM up FROM public.src GROUP BY g, h SELECT SUM(v) AS total, COUNT(*) AS n";
+const ROLL_H: &str = "TRANSFORM roll FROM public.up GROUP BY h SELECT SUM(total) AS t2, \
+                      SUM(n) AS n2";
+const ROLL: &str = "public.roll";
+const ROLL_ACTUAL: &str = "select h, t2, n2 from public.roll order by h";
+const ROLL_ORACLE: &str = "select h, sum(total), sum(n) from \
+     (select g, h, sum(v) as total, count(*) as n from public.src group by g, h) u \
+     group by h order by h";
+
+fn up_columns() -> Vec<(&'static str, ValueType)> {
+    vec![
+        ("g", int4()),
+        ("h", int4()),
+        ("total", int8()),
+        ("n", int8()),
+    ]
+}
+
+/// `up` (keyed `(g, h)`, a key with `NULL` parts when a row's `g` or `h` is
+/// `NULL`) live over a captured `src` seeded with rows in `NULL`-part groups,
+/// and `roll` not yet defined over it.
+async fn seeded_upstream() -> Driver {
+    trellis::dev::staging::set_group_basis(true);
+    let mut d = Driver::start(SRC_DDL, &src_columns(), &[UP_HG], &[SRC]).await;
+    step(
+        &mut d,
+        "insert into public.src values (1, 1, null, 10), (2, null, null, 5), (3, 2, 5, 7), \
+         (4, null, 5, 3), (5, 3, null, 1)",
+    )
+    .await;
+    d
+}
+
+/// Defines `roll` over `up`: it applies from here, with its plan job claimable.
+async fn define_roll(d: &Driver) {
+    write(d, "create index on public.up (h)").await;
+    install(d, ROLL_H, &up_columns()).await;
+    trellis::intake::markers::discharge_registrations(d.pool())
+        .await
+        .expect("start the reader's build");
+    assert_eq!(
+        d.rows("select status from transform_definitions where target_table = 'public.roll'")
+            .await,
+        ["(backfilling)"],
+        "the build started"
+    );
+}
+
+const ROLL_OPTIONS: trellis::staging::build::WorkerOptions =
+    trellis::staging::build::WorkerOptions {
+        chunk_rows: 1_000,
+        drain_batch_cap: usize::MAX,
+        heartbeat_interval: Duration::from_secs(5),
+        reclaim_ttl: Duration::from_secs(60),
+    };
+
+/// Claims the reader's plan job and runs it in its own task, frozen at each
+/// of `points` on `roll`'s target once reached.
+async fn build_frozen(d: &Driver, points: &[PausePoint]) -> Running<()> {
+    let points: Vec<(PausePoint, &str)> = points.iter().map(|p| (*p, ROLL)).collect();
+    let dsn = d.db.dsn().to_string();
+    d.run_frozen(&points, |_shared| async move {
+        let pool = trellis::Pool::new(&trellis::config::Config::from_dsn(dsn).expect("dsn"))
+            .expect("the build's own pool");
+        let claimed = chunk_queue::claim_chunks_of(
+            &**pool.get().await.expect("pool"),
+            "build",
+            1,
+            &[chunk_queue::KIND_PLAN],
+        )
+        .await
+        .expect("claim the plan job");
+        assert_eq!(claimed.len(), 1, "one plan job to claim");
+        trellis::staging::build::run_claimed(&pool, &claimed[0], "build", &ROLL_OPTIONS).await;
+        Ok(())
+    })
+    .await
+}
+
+async fn assert_roll_finished(d: &Driver) {
+    assert_eq!(
+        d.rows(
+            "select status, (select count(*) from backfill_chunks where definition_id = d.id) \
+             from transform_definitions d where target_table = 'public.roll'"
+        )
+        .await,
+        ["(live,0)"],
+        "the build committed and flipped the reader live"
+    );
+}
+
+/// Writes to `NULL`-part groups of the upstream before, during and after the
+/// reader's build, over an upstream target whose keys have `NULL` parts. The
+/// before-write is in the build's snapshot; the during-write's seam page
+/// queues on the build's group lock and is refused (its snapshot saw the
+/// change); the after-write applies as a delta.
+#[tokio::test]
+async fn a_reader_build_over_null_part_keys_with_writes_around_it() {
+    let mut d = seeded_upstream().await;
+    step(&mut d, "update public.src set v = 11 where id = 2").await;
+    define_roll(&d).await;
+    // The reader is defined and its build not started: this write's upstream
+    // page runs, and its seam page is sealed, ahead of the build's snapshot.
+    write(
+        &d,
+        "update public.src set v = 20 where id = 1; \
+               insert into public.src values (6, null, null, 4)",
+    )
+    .await;
+    let batch = d.seal().await;
+    d.drain(batch, "during").await;
+    let seam = d.seal().await;
+
+    let mut building = build_frozen(&d, &[PausePoint::AfterRebuildLock]).await;
+    let locked = building.reached(PausePoint::AfterRebuildLock).await;
+    let page = d.drain_frozen(seam, "seam", &[]).await;
+    d.wait_blocked_behind(locked.backend_pid).await;
+    assert!(
+        !page.is_finished(),
+        "the seam page waits for the build's lock"
+    );
+    // Left in the active segment: the build's open transaction holds the
+    // seal of a later one.
+    write(&d, "update public.src set v = 6 where id = 3").await;
+    d.release(&mut building, PausePoint::AfterRebuildLock).await;
+    building.finish().await;
+    page.finish().await;
+    assert_roll_finished(&d).await;
+    assert_eq!(
+        d.rows(ROLL_ACTUAL).await,
+        ["(5,10,2)", "(,36,4)"],
+        "the build's snapshot saw the seam page's changes"
+    );
+    assert_equal(&mut d, ROLL_ACTUAL, ROLL_ORACLE).await;
+
+    step(
+        &mut d,
+        "update public.src set v = 30 where id = 4; delete from public.src where id = 5",
+    )
+    .await;
+    assert_equal(&mut d, ROLL_ACTUAL, ROLL_ORACLE).await;
+    assert_eq!(d.rows(ROLL_ACTUAL).await, ["(5,36,2)", "(,35,3)"]);
+}
+
+/// A write to a `NULL`-part group committed before the reader was defined,
+/// with its seam page undrained until after the build: the build's snapshot
+/// saw the upstream target's new row, and the page is refused by the group's
+/// basis rather than counted twice.
+#[tokio::test]
+async fn an_undrained_seam_page_from_before_a_null_part_build_is_refused() {
+    let mut d = seeded_upstream().await;
+    write(&d, "update public.src set v = 11 where id = 2").await;
+    let batch = d.seal().await;
+    d.drain(batch, "before").await;
+    let seam = d.seal().await;
+    define_roll(&d).await;
+    let building = build_frozen(&d, &[]).await;
+    building.finish().await;
+    assert_roll_finished(&d).await;
+    assert_eq!(d.rows(ROLL_ACTUAL).await, ["(5,10,2)", "(,22,3)"]);
+    d.drain(seam, "seam").await;
+    assert_equal(&mut d, ROLL_ACTUAL, ROLL_ORACLE).await;
+    assert_eq!(d.rows(ROLL_ACTUAL).await, ["(5,10,2)", "(,22,3)"]);
+}
+
+/// Upstream source `TRUNCATE`s across the reader's build, over an upstream
+/// target with `NULL`-part keys:
+///
+/// - one whose upstream page ran and whose seam page (the target's clear,
+///   with images, then the new row) is sealed ahead of the build: the build's
+///   snapshot saw the cleared target, and the page queued on the build's
+///   lock is refused;
+/// - one committed while the build holds its locks, drained after it: its
+///   clear reaches the reader as deltas, removing the `NULL`-part groups the
+///   build wrote;
+/// - one after the build.
+#[tokio::test]
+async fn upstream_truncates_across_a_reader_build_over_null_part_keys() {
+    let mut d = seeded_upstream().await;
+    define_roll(&d).await;
+    write(
+        &d,
+        "truncate public.src; insert into public.src values (6, 1, null, 9), (7, null, 5, 2)",
+    )
+    .await;
+    let batch = d.seal().await;
+    d.drain(batch, "truncate").await;
+    let seam = d.seal().await;
+
+    let mut building = build_frozen(&d, &[PausePoint::AfterRebuildLock]).await;
+    let locked = building.reached(PausePoint::AfterRebuildLock).await;
+    let page = d.drain_frozen(seam, "seam", &[]).await;
+    d.wait_blocked_behind(locked.backend_pid).await;
+    assert!(
+        !page.is_finished(),
+        "the seam page waits for the build's lock"
+    );
+    // Left in the active segment, drained after the build.
+    write(
+        &d,
+        "truncate public.src; insert into public.src values (8, null, null, 4), (9, 2, 5, 1)",
+    )
+    .await;
+    d.release(&mut building, PausePoint::AfterRebuildLock).await;
+    building.finish().await;
+    page.finish().await;
+    assert_roll_finished(&d).await;
+    assert_eq!(
+        d.rows(ROLL_ACTUAL).await,
+        ["(5,2,1)", "(,9,1)"],
+        "the build counted the first truncate's rows"
+    );
+    assert_equal(&mut d, ROLL_ACTUAL, ROLL_ORACLE).await;
+    assert_eq!(d.rows(ROLL_ACTUAL).await, ["(5,1,1)", "(,4,1)"]);
+
+    step(
+        &mut d,
+        "truncate public.src; insert into public.src values (10, null, null, 6)",
+    )
+    .await;
+    assert_equal(&mut d, ROLL_ACTUAL, ROLL_ORACLE).await;
+    assert_eq!(d.rows(ROLL_ACTUAL).await, ["(,6,1)"]);
 }
