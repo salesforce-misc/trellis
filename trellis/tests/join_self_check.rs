@@ -1276,7 +1276,7 @@ fn assert_reported_on(found: &[Divergence], tables: &[&str]) {
 /// clean.
 ///
 /// Only a write capture missed is planted: a hand edit of `P` alone would be
-/// pushed through to `T` by the rebuild as well (see the PR body).
+/// pushed through to `T` by the rebuild as well (#1308).
 async fn p_and_m_are_repaired_by_request_backfill(definition: &str, target: &str) {
     let mut d = start(&[definition]).await;
     seed(&mut d).await;
@@ -1306,9 +1306,17 @@ async fn p_and_m_are_repaired_by_request_backfill(definition: &str, target: &str
     }
     d.settle().await;
 
+    let (_, j) = hidden(&d, target, "j").await;
+    let (_, t) = hidden(&d, target, "t").await;
     for limit in [1, 100] {
         let found = walk(&d, target, limit).await.0;
-        assert_reported_on(&found, &[&p, &m]);
+        assert_reported_on(&found, &[&p, &m, &j, &t]);
+        assert!(
+            found
+                .iter()
+                .any(|d| matches!(d, Divergence::MissingRow { .. })),
+            "{target}: the target lacks the new group: {found:?}"
+        );
     }
 
     request_backfill_and_rebuild(&d, target, "a").await;
