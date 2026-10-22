@@ -67,18 +67,20 @@ I tested every decision here against real clusters with Trellis's generated
 capture and an oracle diff after each step: the trigger and lifecycle behaviour
 on PostgreSQL 14 through 18, routing and bound evaluation on 15 through 18, and
 the detach check, the cheap cleanup forms, to-many targets and the cleanup race
-on 16 through 18. No result differed by version. The one difference is the
-`ATTACH` of a table that still carries capture triggers: it succeeded on 17 and
-18, and PostgreSQL 16.8 refused it (`trigger "trellis_capture_delete" prevents
-table … from becoming a partition`), so there the triggers have to be dropped
-first.
+on 16 through 18. No result differed by version, except one that differs by
+minor release: PostgreSQL 16.8 refuses to `ATTACH` a table that still carries
+capture triggers (`trigger "trellis_capture_delete" prevents table … from
+becoming a partition`), taking the statement triggers' transition tables for a
+row trigger's. 15.19, 16.15, 17.10, 17.11, 18.2 and 18.6 attach it. On a
+server that refuses, the triggers are dropped before the attach.
 
 ### Trees of up to 1,000 leaves are supported; larger ones are refused
 
 No build statement prunes: each one plans, locks and opens every leaf, about two
 locks per leaf. At 1,000 leaves a statement holds about 2,000 locks, 29% of the
-default lock table's 6,912 slots (`max_locks_per_transaction` 64,
-`max_connections` 100), and plans in 25–28 ms, or 59–63 ms for a build chunk's
+lock table's 6,912 slots (the default `max_locks_per_transaction` of 64
+times `max_connections` 100 plus the test cluster's `max_prepared_transactions`
+8), and plans in 25–28 ms, or 59–63 ms for a build chunk's
 statement. Define, capture install and the build of a 1,000-leaf tree complete
 inside the default lock table on PostgreSQL 17.11. One statement first ran out
 of shared memory at about 5,500 leaves. Define refuses a larger tree, and a

@@ -266,10 +266,10 @@ pause are arcs of one lifecycle:
   transform `backfilling` in the same transaction; until that pass, at most one
   pass after the DDL, it still reads `live`. It goes back to `live` once the
   correction's keys are re-derived and folded into its target, as at the end of
-  a Re-derive build. While it drains, the groups that route to the partition
-  still read as they did before the DDL: rows an `ATTACH` added aren't counted
-  yet, and rows a `DROP`, `DETACH` or `TRUNCATE` removed still are; groups of
-  other partitions are exact. The correction's progress is persisted, so a
+  a Re-derive build. Until a group that routes to the partition is corrected,
+  rows an `ATTACH` added aren't counted in it yet, and rows a `DROP`, `DETACH`
+  or `TRUNCATE` removed still are; groups of other partitions are exact. The
+  correction's progress is persisted, so a
   restart resumes it and the transform still reads `backfilling`.
   `DefinitionStatus::correcting` lists one entry per partition it is being
   corrected for, oldest first: `node`, the schema-qualified partition (the
