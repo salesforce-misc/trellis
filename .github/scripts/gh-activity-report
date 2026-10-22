@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Fetch issue/PR activity from a repo and (re)generate a standalone HTML
 report with charts of issues opened, issues closed, PRs merged, the open-issue
-burndown, and (optionally) validation logbook totals.
+burndown (split into Next Release / Roadmap / Other buckets, replayed from each
+issue's label history), and (optionally) validation logbook totals.
 
 Usage: gh-activity-report [--repo OWNER/NAME] [--out-dir DIR]
                            [--logbook TSV_PATH | --logbook-json JSON_PATH]
@@ -27,15 +28,49 @@ import json
 import os
 import subprocess
 import sys
+import time
+from bisect import bisect_right
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 
+# Only the events that change what an issue counted as on a given day: label
+# changes (the open-issue buckets) and close/reopen (whether it was open).
+TIMELINE_ITEMS = """timelineItems(
+        first: 100, %s
+        itemTypes: [LABELED_EVENT, UNLABELED_EVENT, CLOSED_EVENT, REOPENED_EVENT]
+      ) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          __typename
+          ... on LabeledEvent { createdAt label { name } }
+          ... on UnlabeledEvent { createdAt label { name } }
+          ... on ClosedEvent { createdAt }
+          ... on ReopenedEvent { createdAt }
+        }
+      }"""
+
 ISSUES_QUERY = """
-query($owner: String!, $name: String!, $endCursor: String) {
+query($owner: String!, $name: String!, $after: String) {
   repository(owner: $owner, name: $name) {
-    issues(first: 100, after: $endCursor, orderBy: {field: CREATED_AT, direction: ASC}) {
+    issues(first: 50, after: $after, orderBy: {field: CREATED_AT, direction: ASC}) {
       pageInfo { hasNextPage endCursor }
-      nodes { createdAt closedAt }
+      nodes {
+        number createdAt closedAt
+        labels(first: 50) { nodes { name } }
+        """ + TIMELINE_ITEMS % "" + """
+      }
+    }
+  }
+}
+"""
+
+# The rare issue with more than 100 label/close events gets its remaining
+# events fetched one page at a time.
+ISSUE_TIMELINE_QUERY = """
+query($owner: String!, $name: String!, $number: Int!, $after: String) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      """ + TIMELINE_ITEMS % "after: $after," + """
     }
   }
 }
@@ -106,6 +141,53 @@ def fetch_nodes(token: str, owner: str, name: str, query: str, jq_path: str) -> 
     return [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
 
 
+def graphql(token: str, query: str, **variables) -> dict:
+    """One GraphQL request through `gh`, retried with backoff: the network
+    drops intermittently and a full refresh makes dozens of requests."""
+    cmd = ["gh", "api", "graphql", "-f", f"query={query}"]
+    for key, value in variables.items():
+        if value is None:
+            continue
+        # -F types the value (needed for Int!); -f keeps strings raw.
+        cmd += ["-F" if isinstance(value, int) else "-f", f"{key}={value}"]
+    for delay in (0, 2, 4, 8, 16):
+        time.sleep(delay)
+        proc = subprocess.run(cmd, capture_output=True, text=True, env={**os.environ, "GH_TOKEN": token})
+        if proc.returncode == 0:
+            return json.loads(proc.stdout)
+    sys.exit(f"error: gh api graphql failed:\n{proc.stderr}")
+
+
+def fetch_issues(token: str, owner: str, name: str) -> list[dict]:
+    """Every issue with its current labels and its label/close/reopen events
+    (chronological), paginated by hand: `gh --paginate` can't follow the
+    top-level cursor when the response has nested pageInfo too."""
+    issues = []
+    after = None
+    while True:
+        page = graphql(token, ISSUES_QUERY, owner=owner, name=name, after=after)["data"]["repository"]["issues"]
+        for node in page["nodes"]:
+            events = list(node["timelineItems"]["nodes"])
+            more = node["timelineItems"]["pageInfo"]
+            while more["hasNextPage"]:
+                rest = graphql(
+                    token, ISSUE_TIMELINE_QUERY, owner=owner, name=name,
+                    number=node["number"], after=more["endCursor"],
+                )["data"]["repository"]["issue"]["timelineItems"]
+                events += rest["nodes"]
+                more = rest["pageInfo"]
+            issues.append({
+                "number": node["number"],
+                "createdAt": node["createdAt"],
+                "closedAt": node["closedAt"],
+                "labels": [l["name"] for l in node["labels"]["nodes"]],
+                "events": events,
+            })
+        if not page["pageInfo"]["hasNextPage"]:
+            return issues
+        after = page["pageInfo"]["endCursor"]
+
+
 LOCAL_TZ = datetime.now().astimezone().tzinfo
 
 
@@ -115,6 +197,79 @@ def parse_date(ts: str) -> date:
     # day UTC happens to be at the moment.
     utc_dt = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
     return utc_dt.astimezone(LOCAL_TZ).date()
+
+
+# Open-issue buckets. An issue counts in exactly one, by its labels:
+#   next_release  has "Next Release" (must close before the release)
+#   roadmap       else has "low priority" or "Research" (brainstorm/long-term)
+#   other         everything else
+# Label names are matched case-insensitively.
+BUCKETS = ("next_release", "roadmap", "other")
+NEXT_RELEASE_LABEL = "next release"
+ROADMAP_LABELS = {"low priority", "research"}
+
+
+def bucket_for(labels: set[str]) -> str:
+    if NEXT_RELEASE_LABEL in labels:
+        return "next_release"
+    if labels & ROADMAP_LABELS:
+        return "roadmap"
+    return "other"
+
+
+def parse_utc(ts: str) -> datetime:
+    return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+
+
+def issue_states(issue: dict) -> list[tuple[datetime, str | None]]:
+    """Replays an issue's label and close/reopen events into
+    [(when, bucket)], one entry per change in order: the bucket it counts in
+    from `when` on, or None while it is closed."""
+    labels: set[str] = set()
+    is_open = True
+    states = [(parse_utc(issue["createdAt"]), bucket_for(labels))]
+    for event in sorted(issue["events"], key=lambda e: e["createdAt"]):
+        kind = event["__typename"]
+        name = (event.get("label") or {}).get("name", "").lower()
+        if kind == "LabeledEvent" and name:
+            labels.add(name)
+        elif kind == "UnlabeledEvent" and name:
+            labels.discard(name)
+        elif kind == "ClosedEvent":
+            is_open = False
+        elif kind == "ReopenedEvent":
+            is_open = True
+        states.append((parse_utc(event["createdAt"]), bucket_for(labels) if is_open else None))
+    return states
+
+
+def open_issue_buckets(issues: list[dict], days: list[date]) -> dict[date, dict[str, int]]:
+    """For each day, how many issues were open in each bucket as of the start
+    of that day (local midnight): an issue that gains or loses a label, closes
+    or reopens during the day moves on the next day's count, and one opened
+    today first counts tomorrow."""
+    starts = [datetime.combine(d, datetime.min.time(), tzinfo=LOCAL_TZ).astimezone(timezone.utc) for d in days]
+    counts = {d: dict.fromkeys(BUCKETS, 0) for d in days}
+    for issue in issues:
+        states = issue_states(issue)
+        times = [when for when, _ in states]
+        for d, start in zip(days, starts):
+            i = bisect_right(times, start) - 1
+            if i >= 0 and states[i][1] is not None:
+                counts[d][states[i][1]] += 1
+    return counts
+
+
+def replay_mismatches(issues: list[dict]) -> list[int]:
+    """Numbers of issues whose replayed latest state disagrees with their
+    current labels/open state (e.g. an event for a since-deleted label), so a
+    drifting backfill is reported instead of silently charted."""
+    bad = []
+    for issue in issues:
+        current = None if issue["closedAt"] else bucket_for({l.lower() for l in issue["labels"]})
+        if issue_states(issue)[-1][1] != current:
+            bad.append(issue["number"])
+    return bad
 
 
 def aggregate(issues: list[dict], prs: list[dict]) -> list[dict]:
@@ -146,24 +301,21 @@ def aggregate(issues: list[dict], prs: list[dict]) -> list[dict]:
     start = min(seen_dates)
     end = max(max(seen_dates), datetime.now(LOCAL_TZ).date())
 
-    days = []
-    d = start
-    open_total = 0
-    while d <= end:
-        opened = opened_issues.get(d, 0)
-        closed = closed_issues.get(d, 0)
-        open_total += opened - closed
-        days.append(
-            {
-                "date": d.isoformat(),
-                "opened_issues": opened,
-                "closed_issues": closed,
-                "merged_prs": merged_prs.get(d, 0),
-                "open_issues_total": open_total,
-            }
-        )
-        d += timedelta(days=1)
-    return days
+    dates = [start + timedelta(days=n) for n in range((end - start).days + 1)]
+    open_by_bucket = open_issue_buckets(issues, dates)
+    return [
+        {
+            "date": d.isoformat(),
+            "opened_issues": opened_issues.get(d, 0),
+            "closed_issues": closed_issues.get(d, 0),
+            "merged_prs": merged_prs.get(d, 0),
+            "open_next_release": open_by_bucket[d]["next_release"],
+            "open_roadmap": open_by_bucket[d]["roadmap"],
+            "open_other": open_by_bucket[d]["other"],
+            "open_issues_total": sum(open_by_bucket[d].values()),
+        }
+        for d in dates
+    ]
 
 
 def read_logbook(path: str) -> list[dict]:
@@ -388,17 +540,18 @@ HTML_TEMPLATE = """<!doctype html>
   </div>
 
   <h2>Open issues</h2>
-  <p class="subtitle">Net backlog &mdash; opened minus closed, running total</p>
+  <p class="subtitle">Open at the start of each day, by bucket &mdash; <strong>Next Release</strong> must close before the release; <strong>Roadmap</strong> is low priority / Research without Next Release; <strong>Other</strong> is everything else. An issue counts in whichever bucket its labels put it in that day.</p>
 
   <div class="chart-card">
-    <svg class="chart" id="burndownChart" viewBox="0 0 900 220" preserveAspectRatio="none"></svg>
+    <div class="legend" id="burndownLegend"></div>
+    <svg class="chart" id="burndownChart" viewBox="0 0 900 240" preserveAspectRatio="none"></svg>
     <div class="tooltip" id="burndownTooltip" hidden></div>
   </div>
 
   <button class="table-toggle" id="burndownTableToggle" type="button">View as table</button>
   <div class="table-wrap" id="burndownTableWrap" hidden>
     <table id="burndownTable">
-      <thead><tr><th>Date</th><th>Open issues</th></tr></thead>
+      <thead><tr><th>Date</th><th>Total</th><th>Next Release</th><th>Roadmap</th><th>Other</th></tr></thead>
       <tbody id="burndownTableBody"></tbody>
     </table>
   </div>
@@ -447,7 +600,13 @@ HTML_TEMPLATE = """<!doctype html>
     {{ key: "closed_issues", name: "Issues closed", color: "var(--series-2)" }},
     {{ key: "merged_prs", name: "PRs merged", color: "var(--series-3)" }}
   ];
-  var BURNDOWN_SERIES = {{ key: "open_issues_total", name: "Open issues", color: "var(--series-1)" }};
+  // Total is neutral; the three buckets take the fixed categorical order.
+  var BURNDOWN_SERIES = [
+    {{ key: "open_issues_total", name: "Total", color: "var(--text-secondary)" }},
+    {{ key: "open_next_release", name: "Next Release", color: "var(--series-1)" }},
+    {{ key: "open_roadmap", name: "Roadmap", color: "var(--series-2)" }},
+    {{ key: "open_other", name: "Other", color: "var(--series-3)" }}
+  ];
   var LOGBOOK_SERIES = {{
     runs: {{ key: "runs", name: "Validation runs", color: "var(--series-1)", format: function (v) {{ return String(v); }} }},
     hours: {{ key: "hours", name: "Hours spent validating", color: "var(--series-1)", format: function (v) {{ return v.toFixed(1) + "h"; }} }},
@@ -538,7 +697,7 @@ HTML_TEMPLATE = """<!doctype html>
   // one or more {{ key, name, color, format? }} definitions; a single series
   // gets no legend (the panel title already names it) and a terser end-label.
   // Clicking a legend item isolates the chart to just that series (click
-  // again to restore all); `opts.area` fills under a lone series' line.
+  // again to restore all).
   function makeChartRenderer(chart, legend, tooltip, opts) {{
     var W = opts.W, H = opts.H, PAD = opts.PAD;
     var isolatedKey = null;
@@ -614,15 +773,6 @@ HTML_TEMPLATE = """<!doctype html>
         var label = el("text", {{ x: tx, y: H - PAD.bottom + 16, class: "axis-label", "text-anchor": "middle" }});
         label.textContent = formatDateLabel(days[idx].date);
         chart.appendChild(label);
-      }}
-
-      // Soft area fill under a lone trend line (burndown-style charts only)
-      if (opts.area && visible.length === 1) {{
-        var s0 = visible[0];
-        var top = days.map(function (d, i) {{ return x(i) + "," + y(d[s0.key]); }});
-        var baseY = H - PAD.bottom;
-        var areaPoints = top.concat([x(days.length - 1) + "," + baseY, x(0) + "," + baseY]);
-        chart.appendChild(el("polygon", {{ points: areaPoints.join(" "), style: "fill:" + s0.color + ";fill-opacity:0.1;stroke:none" }}));
       }}
 
       // Lines + end markers + end labels (stacked by value order to avoid overlap)
@@ -724,8 +874,9 @@ HTML_TEMPLATE = """<!doctype html>
     {{ W: 900, H: 320, PAD: {{ top: 12, right: 16, bottom: 28, left: 36 }} }}
   );
   var renderBurndownChart = makeChartRenderer(
-    document.getElementById("burndownChart"), null, document.getElementById("burndownTooltip"),
-    {{ W: 900, H: 220, PAD: {{ top: 12, right: 16, bottom: 28, left: 48 }}, area: true }}
+    document.getElementById("burndownChart"), document.getElementById("burndownLegend"),
+    document.getElementById("burndownTooltip"),
+    {{ W: 900, H: 240, PAD: {{ top: 12, right: 110, bottom: 28, left: 48 }} }}
   );
   var miniOpts = {{ W: 280, H: 170, PAD: {{ top: 10, right: 12, bottom: 24, left: 40 }} }};
   var renderLogbookRuns = makeChartRenderer(
@@ -757,7 +908,7 @@ HTML_TEMPLATE = """<!doctype html>
     tableBody.innerHTML = "";
     days.forEach(function (d) {{
       var tr = document.createElement("tr");
-      [d.date, d.open_issues_total].forEach(function (v) {{
+      [d.date, d.open_issues_total, d.open_next_release, d.open_roadmap, d.open_other].forEach(function (v) {{
         var td = document.createElement("td");
         td.textContent = String(v);
         tr.appendChild(td);
@@ -812,11 +963,14 @@ HTML_TEMPLATE = """<!doctype html>
       {{ key: "opened_issues", mode: "sum" }},
       {{ key: "closed_issues", mode: "sum" }},
       {{ key: "merged_prs", mode: "sum" }},
-      {{ key: "open_issues_total", mode: "last" }}
+      {{ key: "open_issues_total", mode: "last" }},
+      {{ key: "open_next_release", mode: "last" }},
+      {{ key: "open_roadmap", mode: "last" }},
+      {{ key: "open_other", mode: "last" }}
     ]);
     renderGithubChart(githubDays, GITHUB_SERIES);
     renderGithubTable(githubDays);
-    renderBurndownChart(githubDays, [BURNDOWN_SERIES]);
+    renderBurndownChart(githubDays, BURNDOWN_SERIES);
     renderBurndownTable(githubDays);
 
     var logbookRangeDays = filterByRange(ALL_LOGBOOK_DAYS);
@@ -922,7 +1076,7 @@ def main() -> None:
     token = resolve_token()
 
     print(f"Fetching issues from {args.repo}...")
-    issues = fetch_nodes(token, owner, name, ISSUES_QUERY, ".data.repository.issues.nodes[]")
+    issues = fetch_issues(token, owner, name)
     print(f"Fetching pull requests from {args.repo}...")
     prs = fetch_nodes(token, owner, name, PRS_QUERY, ".data.repository.pullRequests.nodes[]")
 
@@ -966,6 +1120,9 @@ def main() -> None:
         f.write(html)
 
     print(f"{len(issues)} issues, {len(prs)} PRs, {len(days)} days of activity")
+    mismatches = replay_mismatches(issues)
+    if mismatches:
+        print(f"warning: replayed label history disagrees with current state for {len(mismatches)} issues: {mismatches[:20]}")
     print(f"{logbook_run_count} logbook runs, {len(logbook_days)} days of validation history")
     print(f"Wrote {data_path}")
     print(f"Wrote {report_path}")
