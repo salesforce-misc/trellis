@@ -9936,7 +9936,8 @@ mod go_live_tests {
     use super::*;
 
     /// #1107: the fixtures that flip a definition `live` without a build
-    /// refuse a `JOIN`, which nothing builds yet; any other shape passes.
+    /// refuse a `JOIN`, which only its build makes `live`; any other shape
+    /// passes.
     #[test]
     #[should_panic(expected = "a JOIN definition can't be registered `live`")]
     fn the_live_fixtures_refuse_a_join() {

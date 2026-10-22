@@ -6207,10 +6207,10 @@ async fn a_resume_does_not_wait_for_an_upstream_reading_a_paused_column() {
 
 /// A `JOIN` reading a paused column of a 1-1 target reports `catching_up`
 /// and names it, like an aggregate (#1208). A `JOIN` side can't be a target
-/// until #1109 (J4) lets it: then this is `seed_aggregate_readers`' shape
+/// until #1108 lets it: then this is `seed_aggregate_readers`' shape
 /// with a `JOIN` over `sib`.
 #[tokio::test]
-#[ignore = "needs #1109: a JOIN side can't be a 1-1 target yet"]
+#[ignore = "needs #1108: a JOIN side can't be a 1-1 target yet"]
 async fn a_join_reading_a_paused_column_reports_catching_up() {
-    unimplemented!("write once #1109 lets a JOIN side be a target");
+    unimplemented!("write once #1108 lets a JOIN side be a target");
 }

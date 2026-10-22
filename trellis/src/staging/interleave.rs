@@ -195,6 +195,10 @@ pub enum PausePoint {
     /// After the page has locked the entries (off the ledger, the group
     /// rows; on a `JOIN`, its `P` and `M` cells) it will write.
     AfterEntryLock,
+    /// On a `JOIN` target (`super::join`), at the start of a build's write
+    /// (`super::join::build`, #1109): the definition row and the job row are
+    /// held, and no hidden table has been read yet.
+    BeforeJoinBuild,
     /// On a `JOIN` target (`super::join`), after the page took the pair's
     /// lock row, before it creates and locks its `J` rows.
     BeforeJoinLock,

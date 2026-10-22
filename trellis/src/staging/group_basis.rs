@@ -1559,37 +1559,42 @@ impl GroupTargetPlan {
                 ]
             })
             .collect();
+        // The stage filter (` and …`, a `JOIN`'s joined side's: a row with a
+        // `NULL` key part is no `M` cell, as on a page) added to `filter` (a
+        // ` where …` or nothing). Empty for every other writer, so the
+        // statement is unchanged for them.
+        let staged = |filter: &str| -> String {
+            match (filter.is_empty(), self.stage_filter.is_empty()) {
+                (_, true) => filter.to_string(),
+                (true, false) => format!(" where true{}", self.stage_filter),
+                (false, false) => format!("{filter}{}", self.stage_filter),
+            }
+        };
         // A leaf's own rows; the whole source for an unpartitioned rebuild;
         // none for the remainder, whose groups have no row of their own.
         let own = match scope {
             None => format!(
-                " union all select distinct {values} from {src} s where true{filter}",
+                " union all select distinct {values} from {src} s{filter}",
                 values = self.group_values().join(", "),
                 src = self.source_row,
-                filter = self.stage_filter,
+                filter = staged(""),
             ),
             Some(RebuildScope {
                 node: Some(node), ..
             }) => format!(
-                " union all select distinct {values} from {node} s",
-                values = self.group_values().join(", ")
+                " union all select distinct {values} from {node} s{filter}",
+                values = self.group_values().join(", "),
+                filter = staged(""),
             ),
             Some(_) => String::new(),
         };
-        // A `JOIN` side's cells have no visible target of their own, and the
-        // stage filter keeps a joined row with a `NULL` key part out of `M`
-        // as it keeps it out of a page.
-        let (target_branch, image_filter) = match self.writer {
-            Writer::JoinPartials { .. } => (
-                String::new(),
-                format!("{image_filter} where true{}", self.stage_filter),
-            ),
-            _ => (
-                format!(
-                    " union all select {cols} from {} t{target_filter}",
-                    self.target_ident
-                ),
-                image_filter,
+        let image_filter = staged(&image_filter);
+        // A `JOIN` side's cells have no visible target of their own.
+        let target_branch = match self.writer {
+            Writer::JoinPartials { .. } => String::new(),
+            _ => format!(
+                " union all select {cols} from {} t{target_filter}",
+                self.target_ident
             ),
         };
         format!(

@@ -283,12 +283,12 @@ partitioned on its own id is refused.
 
 ### A build fills `P` and `M` from each source and `T` from them
 
-A build, a `RESUME` and a rebuild in place are one transaction over both
-structures. It takes the lock row `FOR SHARE`, enumerates each side's cells
-(its hidden table's, its table's and those of the ring's old images), locks
-`J` on the union of both sides' keys in one sorted statement, locks the cells,
-and writes each side's enumerated cells from one `GROUP BY` of its table under
-a snapshot taken after the lock statements. A cell first seen after the
+When neither side is partitioned, a build, a `RESUME` and a rebuild in place
+are one transaction over both structures. It takes the lock row `FOR SHARE`,
+enumerates each side's cells (its hidden table's, its table's and those of the
+ring's old images), locks `J` on the union of both sides' keys in one sorted
+statement, locks the cells, and writes each side's enumerated cells from one
+`GROUP BY` of its table under a snapshot taken after the lock statements. A cell first seen after the
 enumeration belongs to its pages. It then carries both sides' changes into `T`
 as the product, as a page does. `T`'s groups are locked after the product,
 together with every group of the visible target and of `T`'s hidden table; `T`
@@ -300,13 +300,30 @@ cheaper than chunks in the model (84 s against 412–509 s on a 100M-row fact
 table grouped by day and dimension attribute), and the model found it exact
 against pages, recomputes and truncates on both versions.
 
-[OPEN: A partitioned side that has rows isn't built yet (#1286): one
-transaction per leaf can't keep the readers' single commit. A `RESUME` keeps
-the visible target while the hidden tables restart empty, so a page that
-applies before the build commits computes its prior image from the empty
-partials, and a reader chained on the target double-counts (#1287); the build
-refuses a `RESUME` that keeps a target with rows under a reader that isn't
-paused.]
+A side that is partitioned and has rows is built per side and per leaf
+instead (#1286). Each unpartitioned side runs first, as one transaction over
+that side alone. Then come each partitioned side's leaves in the recorded
+tree's oid order, followed by its remainder: the cells that route to no
+recorded leaf, read through the root. Each of those steps is the same writer
+over its region: it enumerates the region's cells, locks `J` on their keys in
+one sorted statement, writes the cells from one `GROUP BY` of the region and
+carries the product into `T` as a delta. A final step locks every hidden and
+visible `T` group, compares the visible target with `T` and removes the rows of
+groups with no contributions left. The job's cursor records the last committed
+step, so a killed job resumes after it. Readers see values change leaf by leaf
+until the final step commits.
+
+A `RESUME` keeps the visible target while the hidden tables restart empty, so
+the prior images that pages send the target's readers before the build commits
+don't match the rows those readers hold. The build that completes a `RESUME`
+therefore parks its readers' catch-up when it commits, once (#1287): a
+group-basis or `JOIN` reader is rebuilt, any other re-derives. Pages keep
+computing prior images from the partials, and a rebuild in place of a `live`
+definition, whose partials match the target, rebuilds no reader.
+
+[OPEN: Neither is built yet (#1109). Until it is, a build halts the definition,
+with the reason, when a side is partitioned and has rows, or when a `RESUME`
+keeps a target that has rows while a reader of it isn't paused.]
 
 ### Define warns when `P` approaches the fact table's size
 

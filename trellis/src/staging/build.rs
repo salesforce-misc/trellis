@@ -3467,15 +3467,17 @@ async fn run_group_rebuild_held(
 /// - **A side that is another definition's target.** The target feed isn't
 ///   wired into the build; when it is, the seam fence of [`run_plan`] must
 ///   test both tables, not only the `FROM` one.
-/// - **A partitioned side that has rows.** The build there is per leaf, which
-///   needs a decision first (#1286). A partitioned side with no rows builds
-///   as an unpartitioned one: there is nothing to bound.
+/// - **A partitioned side that has rows.** The build there is per side and
+///   per leaf (#1286), which isn't built yet. A partitioned side with no rows
+///   builds as an unpartitioned one: there is nothing to bound.
 /// - **A `RESUME` over a target that has rows and unfrozen readers.** A
 ///   `RESUME` keeps the visible target and recreates the hidden tables, so a
 ///   page that applies before the build commits computes its prior image from
 ///   the empty partials, not from the row the target holds, and a reader
-///   chained on the target double-counts for good (#1287). A rebuild in place
-///   has no such window: the partials it replaces are the ones the pages read.
+///   chained on the target double-counts for good. The build that completes
+///   a `RESUME` is to rebuild those readers at its commit (#1287), which isn't
+///   built yet. A rebuild in place has no such window: the partials it
+///   replaces are the ones the pages read.
 async fn join_build_refusal(
     client: &impl GenericClient,
     definition: &Definition,
@@ -3506,9 +3508,8 @@ async fn join_build_refusal(
     }
     if rows {
         return Ok(Some(
-            "a JOIN build over a partitioned side that has rows (its per-leaf build waits on \
-             the decision in #1286); partition the data out of the way or build over an \
-             unpartitioned copy",
+            "a JOIN build over a partitioned side that has rows (its per-leaf build, #1286, \
+             isn't built yet); drop the transform, or define it over unpartitioned tables",
         ));
     }
     if fresh {

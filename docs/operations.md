@@ -65,9 +65,11 @@ define doesn't, where the only repair is to `DROP TRANSFORM` and define again:
 
 A `JOIN` has no ledger or group-delta table. Its resume drops and recreates
 its hidden tables instead, keeps the target, and rebuilds both sides and the
-target's groups from the sources in one transaction. An aggregate on the group basis has neither: its
-resume refuses while its hidden partials table is missing, with the same
-repair. A field resume (`RESUME TRANSFORM <target>.<column>`)
+target's groups from the sources in one transaction. That build halts the
+`JOIN` again, with the reason, while its target has rows and a reader of it
+isn't paused: pause the readers, resume the `JOIN`, then resume the readers,
+which rebuild. An aggregate on the group basis has neither: its resume
+refuses while its hidden partials table is missing, with the same repair. A field resume (`RESUME TRANSFORM <target>.<column>`)
 runs define's validation and the source-key check, and refuses a field whose
 capture is still being widened.
 

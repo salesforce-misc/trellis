@@ -2985,16 +2985,23 @@ async fn build_refuses_a_field_build() {
 }
 
 /// A `RESUME` of a `JOIN` whose target has rows and a reader that isn't paused
-/// is refused at the build (#1287): the resume keeps the target, and the
-/// reader would double-count it. With the reader paused (frozen), it builds.
+/// is refused at the build (#1287): the resume keeps the target and recreates
+/// the hidden tables, so a page that applies before the build (here one on
+/// both sides of a key) sends the reader prior images from the empty
+/// partials, and a group-basis reader would keep the error for good. The
+/// remedy the reason names repairs it: with the reader paused the `JOIN`
+/// builds, and the reader's own resume rebuilds it.
 #[tokio::test]
 async fn build_resume_with_a_live_reader_halts() {
     let mut lab = seeded(Key::Single, &[I], BUILD_SEED).await;
     lab.build().await;
     trellis::defs::install_definition(
         lab.d.pool(),
-        "TRANSFORM i2 FROM public.i SELECT n AS n, sx AS sx",
+        "TRANSFORM i2 FROM public.i GROUP BY ga WITHOUT SOURCE INDEX \
+         SELECT ga AS ga, SUM(n) AS n, SUM(sx) AS sx",
         &[
+            ("ga".to_string(), int4()),
+            ("gb".to_string(), int4()),
             ("n".to_string(), ValueType::Integer(IntWidth::Int8)),
             ("sx".to_string(), ValueType::Integer(IntWidth::Int8)),
         ]
@@ -3004,6 +3011,7 @@ async fn build_resume_with_a_live_reader_halts() {
     .await
     .expect("define the reader");
     trellis::intake::markers::settle_registrations(lab.d.pool()).await;
+    lab.build().await;
     lab.d.settle().await;
     pause(&lab, I).await;
     trellis::staging::quarantine::resume_transform(lab.d.pool(), "i")
@@ -3012,6 +3020,11 @@ async fn build_resume_with_a_live_reader_halts() {
     trellis::intake::markers::discharge_registrations(lab.d.pool())
         .await
         .expect("start the build");
+    lab.step(
+        "insert into public.b values (60, 0, 1, 10, 1); \
+         update public.a set x = x + 1 where id = 1",
+    )
+    .await;
     lab.build().await;
     assert_eq!(
         lab.d
@@ -3021,7 +3034,50 @@ async fn build_resume_with_a_live_reader_halts() {
     );
     let error = lab.d.rows("select last_error from backfill_chunks").await;
     assert!(error.len() == 1 && error[0].contains("#1287"), "{error:?}");
-    let _ = &mut lab;
+    // The remedy the reason names: pause the reader, resume the JOIN, which
+    // builds, then resume the reader, which rebuilds from the JOIN's target.
+    lab.write("insert into public.a values (41, 1, 0, 1, 2)")
+        .await;
+    let trellis = trellis::Trellis::connect(
+        trellis::Config::from_dsn(lab.d.db.dsn().to_string()).expect("valid dsn"),
+        trellis::TrellisOptions::default(),
+    )
+    .await
+    .expect("connect");
+    trellis
+        .apply("PAUSE TRANSFORM i2")
+        .await
+        .expect("pause the reader");
+    trellis::staging::quarantine::resume_transform(lab.d.pool(), "i")
+        .await
+        .expect("resume the JOIN");
+    trellis::intake::markers::discharge_registrations(lab.d.pool())
+        .await
+        .expect("start the build");
+    lab.build().await;
+    trellis
+        .apply("RESUME TRANSFORM i2")
+        .await
+        .expect("resume the reader");
+    trellis::intake::markers::settle_registrations(lab.d.pool()).await;
+    lab.build().await;
+    lab.d.settle().await;
+    assert_eq!(
+        lab.d
+            .rows("select status::text from transform_definitions order by id")
+            .await,
+        ["(live)", "(live)"]
+    );
+    lab.check("the JOIN after the remedy").await;
+    assert_eq!(
+        lab.d
+            .rows("select ga, n, sx from public.i2 order by ga")
+            .await,
+        lab.d
+            .rows("select ga, sum(n), sum(sx) from public.i group by ga order by ga")
+            .await,
+        "the reader follows the rebuilt JOIN"
+    );
 }
 
 /// Test 9 (rule 7): the build holds the lock row `FOR SHARE`, so a page that
@@ -3092,4 +3148,91 @@ async fn build_in_place_holds_the_j_rows_of_both_sides_keys() {
     }
     lab.d.settle().await;
     lab.check("pages around a rebuild in place").await;
+}
+
+/// Rule 1 (`twoJ`): the build's `J` lock is one sorted statement over the
+/// union of both sides' keys. A page that names a key only the joined side
+/// has (9) and a `FROM` side key above it (20) queues behind the build on the
+/// lower key, holding nothing the build waits on. Had the build locked one
+/// side's keys and then the other's, the page would hold 9 while waiting on
+/// 20, and the build's second statement would wait on 9: a deadlock.
+#[tokio::test]
+async fn build_locks_both_sides_keys_in_one_statement() {
+    let mut lab = seeded(
+        Key::Single,
+        &[L],
+        &format!("{BUILD_SEED}; insert into public.a values (9, 1, 0, 20, 1)"),
+    )
+    .await;
+    lab.build().await;
+    request_rebuild(&lab, "a").await;
+    let mut building = lab
+        .build_frozen("sweep", &[PausePoint::AfterJoinLock])
+        .await;
+    let reached = building.reached(PausePoint::AfterJoinLock).await;
+    lab.write(
+        "begin; update public.b set y = y + 1 where id = 5; \
+         update public.a set x = x + 1 where id = 9; commit",
+    )
+    .await;
+    let batch = lab.d.seal().await;
+    let page = lab.d.drain_frozen(batch, "page", &[]).await;
+    assert!(
+        lab.queued_or_done(&page, reached.backend_pid).await,
+        "the page queues behind the build"
+    );
+    lab.d
+        .release(&mut building, PausePoint::AfterJoinLock)
+        .await;
+    building.finish().await;
+    page.finish().await;
+    assert_eq!(lab.d.deadlocks_logged(), Vec::<String>::new());
+    lab.assert_built("a page on both sides' keys").await;
+    lab.check("a page on both sides' keys").await;
+}
+
+/// Test 14: a `PAUSE` and `RESUME` while a resumed definition's build is
+/// frozen after it took its job row, before it read a hidden table. The
+/// `JOIN`'s resume drops and recreates the hidden tables the build is about
+/// to read, and only then waits on the build's job row. The build holds the definition row from before its
+/// job row, so the `PAUSE` waits for its commit and the resume runs after it:
+/// no deadlock, and the build that follows the resume is exact.
+#[tokio::test]
+async fn build_a_pause_and_resume_wait_for_a_build_in_flight() {
+    let mut lab = seeded(Key::Single, &[L], BUILD_SEED).await;
+    lab.build().await;
+    pause(&lab, L).await;
+    lab.step("insert into public.a values (40, 1, 0, 2, 3)")
+        .await;
+    resume(&lab, L).await;
+    let mut building = lab
+        .build_frozen("plan", &[PausePoint::BeforeJoinBuild])
+        .await;
+    let reached = building.reached(PausePoint::BeforeJoinBuild).await;
+    let trellis = trellis::Trellis::connect(
+        trellis::Config::from_dsn(lab.d.db.dsn().to_string()).expect("valid dsn"),
+        trellis::TrellisOptions::default(),
+    )
+    .await
+    .expect("connect");
+    let pool = lab.d.pool().clone();
+    let operator = tokio::spawn(async move {
+        trellis.apply("PAUSE TRANSFORM l").await.expect("pause");
+        trellis::staging::quarantine::resume_transform(&pool, "l")
+            .await
+            .expect("resume");
+    });
+    lab.d.wait_blocked_behind(reached.backend_pid).await;
+    lab.d
+        .release(&mut building, PausePoint::BeforeJoinBuild)
+        .await;
+    building.finish().await;
+    operator.await.expect("the operator's task");
+    assert_eq!(lab.d.deadlocks_logged(), Vec::<String>::new());
+    trellis::intake::markers::discharge_registrations(lab.d.pool())
+        .await
+        .expect("start the build");
+    lab.build().await;
+    lab.assert_built("a pause and resume during a build").await;
+    lab.check("a pause and resume during a build").await;
 }

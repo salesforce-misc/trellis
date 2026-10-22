@@ -479,7 +479,7 @@ async fn a_join_registers_both_tables_and_waits_to_be_built() {
     assert_eq!(
         count(&raw, "select count(*) from pending_backfill").await,
         0,
-        "nothing builds a JOIN yet, so no marker is parked for it"
+        "a JOIN is built by its plan job, never through a marker, so none is parked for it"
     );
 }
 

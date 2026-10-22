@@ -117,9 +117,10 @@
 //! tables, and visible rows that disagree with `T`. Not a hand edit of `T` or
 //! of `J.matches`, which change only by delta; a `RESUME` recreates them.
 //!
-//! A partitioned side that has rows isn't built yet (#1286), and neither is a
-//! `RESUME` that keeps a target a reader that isn't paused is chained on
-//! (#1287); both halt the definition with the reason.
+//! Not built yet, each halting the definition with the reason: a side that is
+//! partitioned and has rows (its per-side, per-leaf build, #1286), and a
+//! `RESUME` that keeps a target with rows while a reader of it isn't paused
+//! (the readers' rebuild at the build's commit, #1287).
 //!
 //! # Release ([`release`])
 //!
@@ -1211,6 +1212,7 @@ pub(crate) async fn build(
     definition: &Definition,
 ) -> Result<(usize, usize), ApplyError> {
     let mut plan = plan_for(txn, catalog_schema, definition).await?;
+    pause!(txn, BeforeJoinBuild, &plan.target);
     for side in [&mut plan.from, &mut plan.joined] {
         side.recompute = true;
         side.node = Some(side.plan.source_row().to_string());
