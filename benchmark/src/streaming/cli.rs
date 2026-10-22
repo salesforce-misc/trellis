@@ -254,7 +254,10 @@ fn tuning(args: &[String], default: EngineTuning) -> EngineTuning {
 /// `--variants s1,s2,b0`, `--facts` (2,000,000), `--a-page` (20,000),
 /// `--a-pages` (5), `--b-page` (2% of D1's keys), `--b-pages` (3),
 /// `--hot-pages` (160; 0 skips the hot-key runs), `--hot-writers` (8),
-/// `--hot-keys` (10), `--load-chunk` (100,000), `--seed`, `--timeout-secs`.
+/// `--hot-keys` (10), `--load-chunk` (100,000), `--seed`, `--timeout-secs`,
+/// and the build-from-seed mode (see [`join::build`]): `--load direct|capture`
+/// (`direct`), `--loaders` (8), `--build-timeout-secs` (3,600),
+/// `--build-only` and `--rebuild` (switches).
 fn join_config(args: &[String]) -> join::JoinBench {
     let default = join::JoinBench::default();
     let count = |name: &str, default: usize| number(args, name).map_or(default, |v| v as usize);
@@ -276,18 +279,28 @@ fn join_config(args: &[String]) -> join::JoinBench {
         load_chunk: number(args, "--load-chunk").map_or(default.load_chunk, |v| v as i64),
         seed: number(args, "--seed").map_or(default.seed, |v| v as u64),
         timeout: secs(args, "--timeout-secs").unwrap_or(default.timeout),
+        load: flag(args, "--load").map_or(default.load, join::build::LoadMode::parse),
+        loaders: count("--loaders", default.loaders),
+        build_timeout: secs(args, "--build-timeout-secs").unwrap_or(default.build_timeout),
+        build_only: args.iter().any(|a| a == "--build-only"),
+        rebuild: args.iter().any(|a| a == "--rebuild"),
     }
 }
 
-/// `join`'s engine: 8 drain workers, as the throughput scenarios, and a
-/// 10 ms seal cadence, so a page's apply time isn't mostly waiting for the
-/// next seal.
+/// `join`'s reconcile interval: a definition's build starts on a reconcile
+/// pass, so the stock 5 s would pad every define-to-`live` by up to that.
+const JOIN_RECONCILE_INTERVAL: Duration = Duration::from_millis(250);
+
+/// `join`'s engine: 8 drain workers, as the throughput scenarios, a 10 ms
+/// seal cadence, so a page's apply time isn't mostly waiting for the next
+/// seal, and a [`JOIN_RECONCILE_INTERVAL`] reconcile pass.
 fn join_tuning(args: &[String]) -> EngineTuning {
     tuning(
         args,
         EngineTuning {
             application_threads: throughput::THROUGHPUT_APPLICATION_THREADS,
             maintenance_interval: Duration::from_millis(10),
+            reconcile_interval: JOIN_RECONCILE_INTERVAL,
             ..Default::default()
         },
     )
@@ -925,6 +938,45 @@ mod tests {
 
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn join_builds_from_a_direct_seed_by_default() {
+        let cfg = join_config(&argv(&["join"]));
+        assert_eq!(cfg.load, join::build::LoadMode::Direct);
+        assert_eq!(cfg.loaders, 8);
+        assert_eq!(cfg.build_timeout, Duration::from_secs(3_600));
+        assert!(!cfg.build_only && !cfg.rebuild);
+    }
+
+    #[test]
+    fn join_reads_the_build_from_seed_flags() {
+        let cfg = join_config(&argv(&[
+            "join",
+            "--load",
+            "capture",
+            "--loaders",
+            "3",
+            "--build-timeout-secs",
+            "90",
+            "--build-only",
+            "--rebuild",
+            "--facts",
+            "1000",
+        ]));
+        assert_eq!(cfg.load, join::build::LoadMode::Capture);
+        assert_eq!(cfg.loaders, 3);
+        assert_eq!(cfg.build_timeout, Duration::from_secs(90));
+        assert!(cfg.build_only && cfg.rebuild);
+        assert_eq!(cfg.facts, 1000);
+    }
+
+    #[test]
+    fn join_runs_a_short_reconcile_pass_unless_the_flag_says_otherwise() {
+        let t = join_tuning(&argv(&["join"]));
+        assert_eq!(t.reconcile_interval, JOIN_RECONCILE_INTERVAL);
+        let t = join_tuning(&argv(&["join", "--reconcile-interval-ms", "1000"]));
+        assert_eq!(t.reconcile_interval, Duration::from_secs(1));
     }
 
     #[test]

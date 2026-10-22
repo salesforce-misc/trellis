@@ -213,6 +213,23 @@ Alongside the generative harness, the chaos tier needs:
 
 ---
 
+## Benchmarks: building a `JOIN` over seeded tables
+
+The streaming benchmark (`benchmark/`, run through `.claude/scripts/bench`) is
+not a test tier, but `bench join` has a mode that measures a `JOIN` *build*: by
+default (`--load direct`) it seeds the fact and dimension tables server-side
+with parallel `INSERT ... SELECT` before any definition exists, so nothing
+enters the capture ring and a 100M-row dataset loads in minutes. It then
+defines each target and reports, per target, define-to-`live` time, the build
+transaction's own duration, WAL and temp bytes, how long a snapshot was held
+and the oracle result. `--rebuild` adds in-place rebuilds (`request_backfill`
+of each source table, `PAUSE` and `RESUME` of each target), `--build-only`
+stops after the builds, `--build-timeout-secs` bounds each one, and
+`--reconcile-interval-ms` (250 ms for `join`) bounds the padding a reconcile
+tick adds to define-to-`live`. `--load capture` loads the same rows through
+capture instead, and each target's row digest is printed so the two paths can
+be compared.
+
 ## How CI runs the tiers
 
 The `ci` workflow runs `lint` (format, clippy, the shard-plan check) beside four `test`

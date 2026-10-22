@@ -34,10 +34,20 @@
 //!   (S1's and S2's), as J2's B0 maintained both targets. Nothing reads `a`
 //!   there, so it isn't captured.
 //!
-//! A `JOIN` builds only over two empty tables until #1109, and every
-//! aggregate runs on the group basis (the dev knob, which `join` turns on):
-//! the definitions are installed over empty tables, and the data is loaded
-//! through capture, in `--load-chunk`-row transactions.
+//! Every aggregate runs on the group basis (the dev knob, which `join` turns
+//! on). The data gets in one of two ways (`--load`, [`build::LoadMode`]):
+//!
+//! - `direct` (the default): the tables are seeded server-side before any
+//!   definition exists, and each target is then *built* over the rows, timed
+//!   and measured (see [`build`]). `--build-only` stops after the builds and
+//!   their oracle check; `--rebuild` adds in-place rebuilds. This is how a
+//!   100M-fact dataset gets in.
+//! - `capture`: the definitions are installed over empty tables, and the data
+//!   is loaded through capture, in `--load-chunk`-row transactions. Slow, but
+//!   it feeds the same rows through the apply path, so its targets are the
+//!   control for `direct`'s builds.
+//!
+//! `--build-timeout-secs` bounds each define-to-`live`.
 //!
 //! # The pages (J2's "Pages")
 //!
@@ -102,6 +112,9 @@ use crate::streaming::chain::wait_for_live;
 use crate::streaming::disk_tier::json_escape;
 use crate::streaming::idle_cost::{wal_bytes_since, wal_lsn};
 use crate::streaming::tuning::EngineTuning;
+
+pub mod build;
+use build::{BuildMeasure, BuildProbe, LoadMode, SeedStats};
 
 /// J2's two data shapes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,8 +201,17 @@ pub struct JoinBench {
     pub hot_keys: usize,
     pub load_chunk: i64,
     pub seed: u64,
-    /// The longest one page, or the load, may take to converge.
+    /// The longest one page, or the capture load, may take to converge.
     pub timeout: Duration,
+    pub load: LoadMode,
+    /// Connections that seed in `direct` mode.
+    pub loaders: usize,
+    /// The longest one define (or rebuild) may take to read `live`.
+    pub build_timeout: Duration,
+    /// Stop after the builds (and `--rebuild`) and their checks.
+    pub build_only: bool,
+    /// Rebuild in place after the fresh builds.
+    pub rebuild: bool,
 }
 
 impl Default for JoinBench {
@@ -208,6 +230,11 @@ impl Default for JoinBench {
             load_chunk: 100_000,
             seed: 1113,
             timeout: Duration::from_secs(1_800),
+            load: LoadMode::Direct,
+            loaders: 8,
+            build_timeout: Duration::from_secs(3_600),
+            build_only: false,
+            rebuild: false,
         }
     }
 }
@@ -379,6 +406,16 @@ struct VariantDb {
     writer: RawClient,
     client: Option<trellis::Client>,
     targets: Vec<String>,
+    /// `direct` mode: what seeding did.
+    seed: Option<SeedStats>,
+    /// `direct` mode: each target's fresh build.
+    builds: Vec<BuildMeasure>,
+}
+
+/// The key space of a dataset.
+struct Shape {
+    keys: i64,
+    all_keys: i64,
 }
 
 /// One timed page.
@@ -465,32 +502,44 @@ async fn timed_converge(raw: &RawClient, timeout: Duration, what: &str) {
 }
 
 impl VariantDb {
-    async fn start(cluster: &TestCluster, variant: Variant, tuning: &EngineTuning) -> VariantDb {
+    async fn start(
+        cluster: &TestCluster,
+        variant: Variant,
+        tuning: &EngineTuning,
+        cfg: &JoinBench,
+        shape: &Shape,
+    ) -> VariantDb {
         let db = cluster.create_isolated_database().await;
         let raw = connect_raw(db.dsn()).await;
         let writer = connect_raw(db.dsn()).await;
-        raw.batch_execute(
-            "create table public.b (id bigint primary key, k int not null unique, gb int, \
-                 y bigint); \
-             create table public.a (id bigint primary key, day int not null, \
-                 k int not null, x bigint, pad text); \
-             create index on public.a (k)",
-        )
-        .await
-        .expect("create the tables");
-        if variant == Variant::B0 {
-            // J2's B0 table, with its index on `k`: a dimension change finds
-            // a key's facts through it.
+        let direct = cfg.load == LoadMode::Direct;
+        let seed = if direct {
+            Some(build::seed_direct(&db, &raw, variant, cfg, shape).await)
+        } else {
             raw.batch_execute(
-                "create table public.a0 (id bigint primary key, day int not null, \
-                     k int not null, x bigint, pad text, gb int, y bigint); \
-                 create index on public.a0 (k); \
-                 create index on public.a0 (gb); \
-                 create index on public.a0 (day, gb)",
+                "create table public.b (id bigint primary key, k int not null unique, gb int, \
+                     y bigint); \
+                 create table public.a (id bigint primary key, day int not null, \
+                     k int not null, x bigint, pad text); \
+                 create index on public.a (k)",
             )
             .await
-            .expect("create a0");
-        }
+            .expect("create the tables");
+            if variant == Variant::B0 {
+                // J2's B0 table, with its index on `k`: a dimension change
+                // finds a key's facts through it.
+                raw.batch_execute(
+                    "create table public.a0 (id bigint primary key, day int not null, \
+                         k int not null, x bigint, pad text, gb int, y bigint); \
+                     create index on public.a0 (k); \
+                     create index on public.a0 (gb); \
+                     create index on public.a0 (day, gb)",
+                )
+                .await
+                .expect("create a0");
+            }
+            None
+        };
         let client = trellis::Client::start(db.dsn(), tuning.client_options()).expect("client");
         let int4 = ValueType::Integer(trellis::IntWidth::Int4);
         let int8 = ValueType::Integer(trellis::IntWidth::Int8);
@@ -509,21 +558,40 @@ impl VariantDb {
             columns.insert("y".to_string(), int8);
         }
         let mut targets = Vec::new();
+        let mut builds = Vec::new();
         for (target, text) in definitions(variant) {
+            // Over rows, the define is a build, so it is measured.
+            let probe = if direct {
+                Some(BuildProbe::start(&db, &raw).await)
+            } else {
+                None
+            };
+            let started = Instant::now();
             trellis::dev::defs::install_definition(&db.pool, &text, &columns, "public")
                 .await
                 .unwrap_or_else(|e| panic!("define {target}: {e:?}"));
-            wait_for_live(&raw, target, Instant::now() + Duration::from_secs(120)).await;
+            wait_for_live(&raw, target, started + cfg.build_timeout).await;
+            if let Some(probe) = probe {
+                builds.push(probe.finish(&raw, "fresh", target).await);
+            }
             targets.push(target.to_string());
         }
-        VariantDb {
+        let mut db = VariantDb {
             variant,
             db,
             raw,
             writer,
             client: Some(client),
             targets,
+            seed,
+            builds,
+        };
+        let mut builds = std::mem::take(&mut db.builds);
+        for m in &mut builds {
+            m.state_bytes = db.state_bytes().await;
         }
+        db.builds = builds;
+        db
     }
 
     /// Loads `b` then the facts, through capture, and waits for the targets.
@@ -959,20 +1027,63 @@ pub async fn run(cfg: &JoinBench, tuning: &EngineTuning) -> JoinOutcome {
             dataset.name(),
             cfg.facts
         );
+        let shape = Shape { keys, all_keys };
         let mut dbs = Vec::new();
         for &variant in &cfg.variants {
-            let mut db = VariantDb::start(&cluster, variant, tuning).await;
-            let load_s = db.load(cfg, keys, all_keys).await;
+            let mut db = VariantDb::start(&cluster, variant, tuning, cfg, &shape).await;
+            let load_s = match &db.seed {
+                Some(seed) => seed.total_s(),
+                None => db.load(cfg, keys, all_keys).await,
+            };
             outcome.rows_written += (cfg.facts + keys) as u64;
             let state = db.state_bytes().await;
+            let seed = db.seed.as_ref().map_or(String::new(), |s| {
+                format!(
+                    "\"seed_load_s\":{:.3},\"seed_index_s\":{:.3},\"seed_vacuum_s\":{:.3},\
+                     \"seed_checkpoint_s\":{:.3},\"seeded_bytes\":{},",
+                    s.load_s,
+                    s.index_s,
+                    s.vacuum_s,
+                    s.checkpoint_s,
+                    s.sizes_json()
+                )
+            });
             println!(
                 "{{\"scenario\":\"join\",\"dataset\":\"{}\",\"variant\":\"{}\",\"kind\":\"load\",\
-                 \"load_s\":{load_s:.3},\"keys\":{keys},\"orphan_keys\":{orphans},\
-                 \"state_bytes\":{state},{common}}}",
+                 \"load\":\"{}\",\"load_s\":{load_s:.3},{seed}\"keys\":{keys},\
+                 \"orphan_keys\":{orphans},\"state_bytes\":{state},{common}}}",
                 dataset.name(),
-                variant.name()
+                variant.name(),
+                cfg.load.name()
             );
+            for m in &db.builds {
+                println!(
+                    "{}",
+                    m.to_json(dataset.name(), variant.name(), cfg.load, &common)
+                );
+            }
             dbs.push(db);
+        }
+        report_check(&mut outcome, &dbs, dataset, "build_check", &common).await;
+        if cfg.rebuild {
+            for db in &dbs {
+                let mut failures = Vec::new();
+                for m in db.rebuild_all(cfg, &mut failures).await {
+                    println!(
+                        "{}",
+                        m.to_json(dataset.name(), db.variant.name(), cfg.load, &common)
+                    );
+                }
+                outcome.failures.extend(failures);
+            }
+            report_check(&mut outcome, &dbs, dataset, "rebuild_check", &common).await;
+        }
+        if cfg.build_only {
+            cross_check(&mut outcome, &dbs, dataset).await;
+            for db in &mut dbs {
+                db.shutdown().await;
+            }
+            continue;
         }
 
         let mut generator = Generator {
@@ -1075,19 +1186,7 @@ pub async fn run(cfg: &JoinBench, tuning: &EngineTuning) -> JoinOutcome {
                 db.variant.name()
             );
         }
-        // The same pages reached every database, so a `JOIN` target equals
-        // the B0 target with its `GROUP BY`.
-        if let Some(b0) = dbs.iter().find(|d| d.variant == Variant::B0) {
-            for db in dbs.iter().filter(|d| d.variant != Variant::B0) {
-                let target = &db.targets[0];
-                if db.target_rows(target).await != b0.target_rows(&format!("b0_{target}")).await {
-                    outcome.failures.push(format!(
-                        "{}: {target} differs from b0_{target}",
-                        dataset.name()
-                    ));
-                }
-            }
-        }
+        cross_check(&mut outcome, &dbs, dataset).await;
         for db in &mut dbs {
             db.shutdown().await;
         }
@@ -1118,6 +1217,51 @@ pub async fn run(cfg: &JoinBench, tuning: &EngineTuning) -> JoinOutcome {
         outcome.rows_written
     );
     outcome
+}
+
+/// Every target against its oracle, printed as one line with each target's
+/// row digest (equal across `--load` modes); mismatches fail the run.
+async fn report_check(
+    outcome: &mut JoinOutcome,
+    dbs: &[VariantDb],
+    dataset: Dataset,
+    kind: &str,
+    common: &str,
+) {
+    for db in dbs {
+        let failures = db.check().await;
+        let digests: Vec<String> = db
+            .digests()
+            .await
+            .iter()
+            .map(|(t, d)| format!("\"{t}\":\"{d}\""))
+            .collect();
+        println!(
+            "{{\"scenario\":\"join\",\"dataset\":\"{}\",\"variant\":\"{}\",\"kind\":\"{kind}\",\
+             \"oracle_ok\":{},\"digests\":{{{}}},{common}}}",
+            dataset.name(),
+            db.variant.name(),
+            failures.is_empty(),
+            digests.join(",")
+        );
+        outcome.failures.extend(failures);
+    }
+}
+
+/// The same data reached every database, so a `JOIN` target equals the B0
+/// target with its `GROUP BY`.
+async fn cross_check(outcome: &mut JoinOutcome, dbs: &[VariantDb], dataset: Dataset) {
+    if let Some(b0) = dbs.iter().find(|d| d.variant == Variant::B0) {
+        for db in dbs.iter().filter(|d| d.variant != Variant::B0) {
+            let target = &db.targets[0];
+            if db.target_rows(target).await != b0.target_rows(&format!("b0_{target}")).await {
+                outcome.failures.push(format!(
+                    "{}: {target} differs from b0_{target}",
+                    dataset.name()
+                ));
+            }
+        }
+    }
 }
 
 /// One writer's hot pages, in order.
