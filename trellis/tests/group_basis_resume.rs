@@ -36,6 +36,8 @@ const ROLL: &str = "TRANSFORM roll FROM public.agg GROUP BY n WITHOUT SOURCE IND
                     SELECT COUNT(*) AS groups, SUM(total) AS t";
 const TOP: &str = "TRANSFORM top FROM public.roll GROUP BY groups WITHOUT SOURCE INDEX \
                    SELECT COUNT(*) AS k, SUM(t) AS tt";
+const MIRROR: &str = "TRANSFORM mirror FROM public.agg SELECT total AS total, n AS n";
+const MIRROR_ACTUAL: &str = "select g, total, n from public.mirror order by g";
 const ACTUAL: &str = "select g, total, n from public.agg order by g";
 const EXPECTED: &str = "select g, sum(v), count(*) from public.src group by g order by g";
 const ROLL_ACTUAL: &str = "select n, groups, t from public.roll order by n";
@@ -171,6 +173,12 @@ async fn resume(d: &mut Driver) {
     trellis::staging::quarantine::resume_transform(d.pool(), "agg")
         .await
         .expect("resume");
+    start_resumed_build(d).await;
+}
+
+/// The build of a resume that has committed: the re-type a staging pass
+/// finishes, then `start_ready_builds`.
+async fn start_resumed_build(d: &mut Driver) {
     if d.rows(&status(TARGET)).await == ["(paused,)"] {
         let pool = d.pool().clone();
         trellis::client::reconcile_pass(
@@ -561,4 +569,157 @@ async fn a_one_to_one_reader_of_a_resumed_target_is_caught_up() {
         d.rows(ACTUAL).await
     );
     assert_oracle(&mut d).await;
+}
+
+// ------------------------------------------- races with work in flight
+
+async fn trellis(d: &Driver) -> trellis::Trellis {
+    trellis::Trellis::connect(
+        trellis::config::Config::from_dsn(d.db.dsn().to_string()).expect("valid dsn"),
+        trellis::TrellisOptions::default(),
+    )
+    .await
+    .expect("connect a Trellis")
+}
+
+/// A `PAUSE` and `RESUME` issued while a rebuild in place of the `live`
+/// aggregate (`request_backfill`) holds every group, frozen after its lock
+/// statement: the `PAUSE` waits for the rebuild to commit, and the resume
+/// that follows drops the partials it wrote and builds again. No deadlock,
+/// and the target and its reader converge.
+#[tokio::test]
+async fn a_pause_and_resume_wait_for_a_live_rebuild_in_flight() {
+    let mut d = start_chain("(1, 1, 10), (2, 1, 5), (3, 2, 7)", false).await;
+    let t = trellis(&d).await;
+    t.request_backfill("src").await.expect("request a rebuild");
+    let mut rebuilding = d
+        .run_frozen(
+            &[(PausePoint::AfterRebuildLock, TARGET)],
+            |pool| async move {
+                let claimed = chunk_queue::claim_chunks_of(
+                    &**pool.get().await.expect("pool"),
+                    "rebuild",
+                    1,
+                    &[chunk_queue::KIND_SWEEP],
+                )
+                .await
+                .expect("claim the rebuild");
+                assert_eq!(claimed.len(), 1, "one rebuild job to claim");
+                build::run_claimed(&pool, &claimed[0], "rebuild", &OPTIONS).await;
+                Ok(())
+            },
+        )
+        .await;
+    let reached = rebuilding.reached(PausePoint::AfterRebuildLock).await;
+    write(&d, "insert into public.src values (4, 1, 100), (5, 3, 1)").await;
+    let pool = d.pool().clone();
+    let operator = tokio::spawn(async move {
+        t.apply("PAUSE TRANSFORM agg").await.expect("pause");
+        trellis::staging::quarantine::resume_transform(&pool, "agg")
+            .await
+            .expect("resume");
+    });
+    d.wait_blocked_behind(reached.backend_pid).await;
+    d.release(&mut rebuilding, PausePoint::AfterRebuildLock)
+        .await;
+    rebuilding.finish().await;
+    operator.await.expect("the operator's task");
+    assert_eq!(d.deadlocks_logged(), Vec::<String>::new());
+    assert_eq!(
+        d.rows(&format!("select count(*) from {}", hidden(&d).await))
+            .await,
+        ["(0)"],
+        "the resume dropped what the rebuild wrote"
+    );
+    start_resumed_build(&mut d).await;
+    run_build(&d).await;
+    converge(&mut d, false).await;
+}
+
+/// The build's commit parks its readers last, taking their definition rows
+/// `for update` while it holds its groups. Issued while the resumed build
+/// holds them, frozen just before that park: a drain whose batch holds a
+/// page of the aggregate on a held group (queued behind the build) and the
+/// readers' pages of the seam rows an earlier page staged, plus a `PAUSE` of
+/// either reader (which completes at once) or an `ALTER TRANSFORM` of the
+/// 1-1 one (which queues behind the drain). Nothing deadlocks, and every
+/// reader still applying converges.
+#[tokio::test]
+async fn reader_operations_and_pages_while_the_build_parks() {
+    for op in [
+        None,
+        Some("PAUSE TRANSFORM roll"),
+        Some("PAUSE TRANSFORM mirror"),
+        Some("ALTER TRANSFORM mirror ADD total + 1 AS t1"),
+    ] {
+        let what = op.unwrap_or("pages only");
+        let mut d = start_chain("(1, 1, 10), (2, 1, 5), (3, 2, 7)", false).await;
+        install(
+            &d,
+            MIRROR,
+            &[("g", int4()), ("total", int8()), ("n", int8())],
+        )
+        .await;
+        trellis::intake::markers::settle_registrations(d.pool()).await;
+        d.settle().await;
+        build::settle_builds(d.pool()).await;
+        d.settle().await;
+        let t = trellis(&d).await;
+        pause(&d).await;
+        resume(&mut d).await;
+        write(&d, "insert into public.src values (4, 1, 100)").await;
+        let batch = d.seal().await;
+        d.drain(batch, "page").await;
+        write(&d, "insert into public.src values (5, 1, 1), (6, 2, 2)").await;
+        let batch = d.seal().await;
+        let mut building = build_frozen(&d, &[PausePoint::BeforeRebuildCommit]).await;
+        let reached = building.reached(PausePoint::BeforeRebuildCommit).await;
+        let page = d.drain_frozen(batch, "held", &[]).await;
+        d.wait_blocked_behind(reached.backend_pid).await;
+        match op {
+            Some(op) if op.starts_with("PAUSE") => {
+                t.apply(op).await.unwrap_or_else(|e| panic!("{op}: {e}"));
+            }
+            _ => {}
+        }
+        let altering = match op {
+            Some(op) if op.starts_with("ALTER") => {
+                let altering = tokio::spawn(async move {
+                    t.apply(op).await.unwrap_or_else(|e| panic!("{op}: {e}"));
+                });
+                // The build (behind its gate), the drain and the `ALTER`.
+                d.wait_blocked(3).await;
+                Some(altering)
+            }
+            _ => None,
+        };
+        d.release(&mut building, PausePoint::BeforeRebuildCommit)
+            .await;
+        building.finish().await;
+        page.finish().await;
+        if let Some(altering) = altering {
+            altering.await.expect("the ALTER's task");
+        }
+        assert_eq!(d.deadlocks_logged(), Vec::<String>::new(), "{what}");
+        for _ in 0..2 {
+            build::settle_builds(d.pool()).await;
+            trellis::intake::markers::settle_registrations(d.pool()).await;
+            d.settle().await;
+        }
+        assert_eq!(d.rows(ACTUAL).await, d.rows(EXPECTED).await, "{what}: agg");
+        if op != Some("PAUSE TRANSFORM roll") {
+            assert_eq!(
+                d.rows(ROLL_ACTUAL).await,
+                d.rows(ROLL_EXPECTED).await,
+                "{what}: roll"
+            );
+        }
+        if op != Some("PAUSE TRANSFORM mirror") {
+            assert_eq!(
+                d.rows(MIRROR_ACTUAL).await,
+                d.rows(ACTUAL).await,
+                "{what}: mirror"
+            );
+        }
+    }
 }

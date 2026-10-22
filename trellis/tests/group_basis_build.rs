@@ -653,12 +653,11 @@ async fn trellis(d: &Driver) -> Trellis {
 
 /// A `PAUSE` and a `RESUME` after a logical restore, issued while a
 /// resumed definition's build is frozen between its enumeration and its
-/// lock. The resume clears every group's basis, which takes the groups' row
-/// locks, before it waits on the build's job row. The build holds the
-/// definition row from before its job row, so the `PAUSE` waits for the
-/// build to commit and the resume runs after it: no deadlock, and the build
-/// that follows the resume is exact. Without that lock the resume would hold
-/// the groups the build is about to lock while it waits on the build.
+/// lock. The resume waits on the build's job row, then drops and recreates
+/// the hidden table the build holds rows of. The build holds the definition
+/// row from before its job row, so the `PAUSE` waits for the build to commit
+/// and the resume runs after it: no deadlock, and the build that follows the
+/// resume is exact.
 #[tokio::test]
 async fn a_pause_and_resume_wait_for_a_build_in_flight() {
     let mut d = seeded("(1, 1, 10), (2, 2, 5)").await;
