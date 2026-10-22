@@ -79,8 +79,8 @@ Other writers are not affected by the subscription rule: a session with
 `session_replication_role = replica` fires the capture triggers, which are
 `ENABLE ALWAYS` ([stage 1](staging-and-claiming/01-capture-by-triggers.md)).
 Changing a source key's collation to another deterministic one is safe, though
-the rest of any build then scans the source and `self_check` reads the target
-by scan rather than by index.
+the rest of any build then scans the source and `self_check` reads the source
+by scan rather than by index (it pages under the target key's collation).
 
 ## Granularity
 

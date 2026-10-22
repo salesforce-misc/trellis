@@ -284,3 +284,51 @@ async fn a_change_below_the_truncate_floor_is_not_expected() {
     d.drain(first, "first").await;
     assert_eq!(compare(&d, 10).await, (vec![], vec![], false));
 }
+
+/// The ring's keys and old images are matched to source rows by key value,
+/// never by order, so a source key re-collated after define (#1203) changes
+/// nothing: pages follow the target key's collation (`en-US`: `k01 < K02 <
+/// k03`; `"C"` puts every `K…` first), and a pending update, delete and insert
+/// are each subtracted once, at every page size. A planted error is still
+/// reported.
+#[tokio::test]
+async fn pending_changes_are_subtracted_by_key_value_after_a_source_key_re_collation() {
+    let mut d = Driver::start(
+        "create table public.src (id text primary key, v integer, w integer)",
+        &[("id", ValueType::Text), ("v", int4()), ("w", int4())],
+        &["TRANSFORM t FROM public.src SELECT v + w AS total, w AS w"],
+        &[SRC],
+    )
+    .await;
+    step(
+        &mut d,
+        "insert into public.src values ('k01', 10, 1), ('K02', 20, 2), ('k03', 30, 3), \
+         ('K04', 40, 4), ('k05', 50, 5)",
+    )
+    .await;
+    exec(
+        &d,
+        r#"alter table public.src alter column id type text collate "C""#,
+    )
+    .await;
+    exec(
+        &d,
+        "update public.src set v = 21 where id = 'K02'; delete from public.src where id = 'K04'; \
+         insert into public.src values ('k06', 60, 6); update public.src set v = 11 where id = 'k01'",
+    )
+    .await;
+    for limit in [1, 2, 100] {
+        assert_eq!(
+            compare(&d, limit).await,
+            (vec![], vec![], false),
+            "limit {limit}"
+        );
+    }
+    exec(
+        &d,
+        "update public.t set total = total + 1000 where id = 'k03'",
+    )
+    .await;
+    let (found, _, _) = compare(&d, 2).await;
+    assert_eq!(found, [cell("k03", "total", "1033", "33")]);
+}
