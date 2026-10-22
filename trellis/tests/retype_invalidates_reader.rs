@@ -426,6 +426,35 @@ async fn wait_blocked_behind(raw: &Client, pid: i32) {
 /// here, and Postgres aborts one side.
 #[tokio::test]
 async fn a_resume_retype_takes_reader_rows_before_the_target_lock() {
+    resume_retype_against_a_reader_row_holder(Duration::ZERO, false).await;
+}
+
+/// The same interleaving with the holder stalled past the re-type's
+/// `lock_timeout` while the pass waits on `roll`'s row (what a box under load
+/// does to the test above, #1281): the pass gives the re-type up for its next
+/// one, and that one re-types `t.p`, pausing `roll`.
+#[tokio::test]
+async fn a_resume_retype_whose_row_wait_times_out_is_retried_by_the_next_pass() {
+    // `staging::quarantine::RETYPE_LOCK_TIMEOUT` is 2 s. The test checks
+    // that the first pass did time out, so a longer timeout fails it here
+    // rather than leaving it to pass without a retry.
+    resume_retype_against_a_reader_row_holder(Duration::from_millis(2500), true).await;
+}
+
+/// The last re-type failure recorded on `t` (empty if none).
+async fn t_failure(raw: &Client) -> String {
+    raw.query_one(
+        "select coalesce(string_agg(f.error, ' | '), '') \
+         from capture_failures f join transform_definitions d on d.id = f.transform_id \
+         where split_part(d.target_table, '.', 2) = 't'",
+        &[],
+    )
+    .await
+    .expect("read t's capture_failure")
+    .get(0)
+}
+
+async fn resume_retype_against_a_reader_row_holder(stall: Duration, expect_retry: bool) {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
@@ -460,17 +489,49 @@ async fn a_resume_retype_takes_reader_rows_before_the_target_lock() {
     });
     // The pass's re-type of `t.p` now waits on `roll`'s row.
     wait_blocked_behind(&raw, holder_pid).await;
+    tokio::time::sleep(stall).await;
     holder
         .batch_execute("select count(*) from public.t")
         .await
         .expect("the holder reads the target without a deadlock");
     holder.batch_execute("commit").await.expect("commit");
     pass.await.expect("the pass");
+    if expect_retry {
+        assert_eq!(
+            column_type(&raw, "public.t", "p").await,
+            "numeric(10,2)",
+            "the stalled holder outlasted the re-type's lock_timeout: the first pass left it"
+        );
+        let failure = t_failure(&raw).await;
+        assert!(failure.contains("lock timeout"), "{failure}");
+    }
 
+    // The re-type's wait on `roll`'s row is capped by its 2 s lock_timeout
+    // (`RETYPE_LOCK_TIMEOUT`); a box so loaded that this task stalls past it
+    // between the pass blocking and the holder committing makes the pass
+    // leave the re-type for its next one (#1281), which is the engine's
+    // contract, not the ordering bug. What the ordering bug produces is a
+    // deadlock, which Postgres breaks by aborting a side: the holder (its
+    // read above would have failed) or the pass, whose recorded last error
+    // then says so. So: a bounded number of explicit further passes, each
+    // only after a failure that was the lock timeout (a deadlock, or any
+    // other failure, fails the test).
+    for _ in 0..4 {
+        if column_type(&raw, "public.t", "p").await == "numeric" {
+            break;
+        }
+        let failure = t_failure(&raw).await;
+        assert!(
+            failure.contains("lock timeout") && !failure.contains("deadlock"),
+            "the re-type failed other than by its lock_timeout (a deadlock is the ordering \
+             bug): {failure}"
+        );
+        full_pass(&mut raw, &db.pool).await;
+    }
     assert_eq!(
         column_type(&raw, "public.t", "p").await,
         "numeric",
-        "the same pass re-typed t.p: its re-type wasn't a deadlock's victim"
+        "t.p was re-typed within a few passes"
     );
     assert_eq!(status(&raw, "roll").await, TransformStatus::Paused);
     trellis.shutdown().await.expect("shutdown");

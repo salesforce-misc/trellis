@@ -18,11 +18,12 @@
 //! order. The collation is the key column's own when that is deterministic
 //! (so its index serves the page) and `"C"` when it is not: under a
 //! nondeterministic one two distinct keys could compare equal and a page's
-//! `limit` could cut between them. The column is the source key's for a 1-1
-//! target, the target's for an aggregate and a `JOIN`'s target part, and the
-//! hidden table's for `P`, `M` and `J`. The last two keep the collation define
-//! made them with when the source is re-collated, so a walk that straddles that
-//! pages in one order throughout.
+//! `limit` could cut between them. The column is the target's for a 1-1
+//! target, an aggregate and a `JOIN`'s target part, and the hidden table's for
+//! `P`, `M` and `J`. Each keeps the collation define made it with (a 1-1
+//! target key gets the source key's) when the source is re-collated, so a walk
+//! that straddles that pages in one order throughout. A 1-1 walk still casts
+//! its cursor by the source key's columns and types.
 //!
 //! **Trimming.** Each side is `limit`ed separately, so whenever the sides'
 //! key sets differ their pages end at different keys. A page ends at the
@@ -862,9 +863,9 @@ mod walk_tests {
             )],
         ];
         if icu {
-            // A nondeterministic source collation (a key re-collated after
-            // define, which refuses one): the walk falls back to byte order
-            // on both sides. A single not-null column, since the key text of
+            // A nondeterministic walk collation (a target's or hidden
+            // table's key re-collated by hand after define, which refuses
+            // one): the walk falls back to byte order on both sides. A single not-null column, since the key text of
             // any other (`replace`) can't be computed under one.
             shapes.push(vec![column(
                 "t",

@@ -711,6 +711,29 @@ pub(crate) async fn findings(pool: &Pool, def: &Definition) -> Result<Findings, 
     })
 }
 
+/// A 1-1 target's walk key: the source key's columns and types (the
+/// cursor's cast and the ring's encoding), each collation the target key
+/// column's. Define gives the target key the source's collation and nothing
+/// re-collates it afterwards, so the walk's order holds when the source key
+/// is re-collated between pages (#1203). The target's key columns are named
+/// as the source's (`ddl::target_table_ddl`), so they pair by name; a source
+/// key column with no namesake there was renamed since define, which pauses
+/// the transform, and keeps its own collation meanwhile.
+async fn walk_key(
+    pool: &Pool,
+    def: &Definition,
+) -> Result<Vec<ddl::PrimaryKeyColumn>, SelfCheckError> {
+    let mut pk = ddl::source_primary_key(pool, &def.source_table).await?;
+    let client = pool.get().await?;
+    let target = ddl::identity_key_columns(&**client, &def.target_table).await?;
+    for column in &mut pk {
+        if let Some(t) = target.iter().find(|t| t.name == column.name) {
+            column.collation = t.collation.clone();
+        }
+    }
+    Ok(pk)
+}
+
 /// [`check_page`]'s audit of `def`, the definition registered under
 /// `target_table`, with no [`SelfCheckPage::held_keys`] yet.
 pub(crate) async fn audit(
@@ -786,7 +809,7 @@ pub(crate) async fn audit(
         let client = pool.get().await?;
         ddl::identity_key_columns(&**client, &def.target_table).await?
     } else {
-        ddl::source_primary_key(pool, &def.source_table).await?
+        walk_key(pool, def).await?
     };
 
     let schema_divergences = check_schema(pool, def, &pk).await?;
@@ -915,7 +938,7 @@ pub async fn compare_page(
         let client = pool.get().await?;
         ddl::identity_key_columns(&**client, &def.target_table).await?
     } else {
-        ddl::source_primary_key(pool, &def.source_table).await?
+        walk_key(pool, &def).await?
     };
     let paused = paused_columns(pool, &def.def).await?;
     let pass = compare_once(
@@ -1319,7 +1342,7 @@ async fn explain_page_with(
         )
         .await;
     }
-    let pk = ddl::source_primary_key(pool, &def.source_table).await?;
+    let pk = walk_key(pool, &def).await?;
     let comparable: Vec<&FieldDef> = def.def.fields.iter().collect();
     let mut client = pool.get().await?;
     let mut keyset = Keyset::resolve(&client, &pk).await?;

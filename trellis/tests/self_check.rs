@@ -1475,9 +1475,18 @@ async fn recollate_words(raw: &Client) {
 /// start of the keyspace to its end: every divergence any page reported, and
 /// the sum of the pages' `rows_compared`.
 async fn audit_every_page(trellis: &Trellis, target: &str, limit: i64) -> (Vec<Divergence>, i64) {
+    audit_pages_from(trellis, target, limit, None).await
+}
+
+/// [`audit_every_page`] from the cursor `after`.
+async fn audit_pages_from(
+    trellis: &Trellis,
+    target: &str,
+    limit: i64,
+    mut after: Option<String>,
+) -> (Vec<Divergence>, i64) {
     let mut divergences = Vec::new();
     let mut compared = 0;
-    let mut after = None;
     for _ in 0..100 {
         let report = trellis
             .self_check_page(
@@ -1609,13 +1618,59 @@ async fn an_extra_target_row_just_past_a_page_boundary_is_reported_under_the_key
     trellis.shutdown().await.expect("shutdown");
 }
 
+/// The source key is re-collated to `"C"` between page 1 and page 2 of a walk
+/// (#1203). Page 1 (`en-US`: `k01 < K02 < k03`) saves the cursor `k03`; under
+/// `"C"` every `K…` sorts before it, so a walk that followed the source's new
+/// collation would skip `K04`, `K06`, … and never see the planted missing
+/// `K06`. The walk pages under the target key's collation, which the
+/// re-collation didn't move: every key is compared once and `K06` is reported.
+#[tokio::test]
+async fn a_re_collation_between_pages_skips_no_key_and_reports_a_missing_row() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (trellis, raw) = words_fixture(&db).await;
+    raw.execute("delete from word_values where id = 'K06'", &[])
+        .await
+        .expect("delete a target row");
+
+    let first = trellis
+        .self_check_page(
+            "word_values",
+            SelfCheckScope {
+                after: None,
+                limit: 3,
+            },
+            SelfCheckMode::Standard,
+            GENEROUS_TIMEOUT,
+        )
+        .await
+        .expect("self_check page 1");
+    assert!(matches!(first.outcome, SelfCheckOutcome::Converged));
+    assert_eq!(first.next_after, Some("k03".to_string()));
+    recollate_words(&raw).await;
+
+    let (divergences, compared) =
+        audit_pages_from(&trellis, "word_values", 3, first.next_after).await;
+    assert_eq!(
+        divergences,
+        vec![Divergence::MissingRow {
+            key: "K06".to_string()
+        }]
+    );
+    assert_eq!(compared, 9, "the other nine keys, each once");
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
 /// A source key re-collated after define to a *nondeterministic* collation
 /// (case-insensitive here; define refuses one, #638, but a later `alter`
 /// isn't refused). Under it, `k03` and an extra target row `K03` compare
 /// equal, so paging by it would let a page's `limit` cut between the two and
-/// the next page's `> k03` skip whichever was cut: the extra row is never
-/// compared, or `k03` is reported missing when it isn't. Distinct keys must
-/// never tie in the order the pages are read in.
+/// the next page's `> k03` skip whichever was cut. A 1-1 walk pages under
+/// the target key's collation (#1203), which the `alter` didn't touch, so the
+/// two never tie: the extra row is reported and `k03` isn't. The `"C"`
+/// fallback for a nondeterministic walk collation is tested on
+/// `staging::self_check_keyset`'s own walk.
 #[tokio::test]
 async fn a_re_collation_to_a_nondeterministic_collation_hides_no_row_at_a_page_boundary() {
     let cluster = TestCluster::start();
@@ -1717,13 +1772,11 @@ async fn a_page_reads_both_sides_by_their_key_index() {
     trellis.shutdown().await.expect("shutdown");
 }
 
-/// After the source key is re-collated, the page is compared under the
-/// source key's new collation: the source is still read by its index, and
-/// the target, whose index orders by its own collation, by a scan. This is
-/// the documented cost of auditing a target whose key no longer orders like
-/// its source's (`staging::self_check_keyset`).
+/// After the source key is re-collated, the page is still compared under
+/// the target key's collation (#1203): the target is read by its key index
+/// and the source, whose index now orders otherwise, by a scan.
 #[tokio::test]
-async fn a_page_after_a_re_collation_reads_the_source_by_its_key_index() {
+async fn a_page_after_a_re_collation_reads_the_target_by_its_key_index() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let (trellis, raw) = words_fixture(&db).await;
@@ -1733,13 +1786,20 @@ async fn a_page_after_a_re_collation_reads_the_source_by_its_key_index() {
         trellis::staging::self_check::explain_page(&db.pool, "word_values", Some("K04"), 3)
             .await
             .expect("explain the page");
-    assert!(explained.contains("words_pkey"), "{explained}");
-    assert_eq!(
-        seq_scans(&explained).len(),
-        1,
-        "only the target is scanned: {explained}"
-    );
-    assert!(!explained.contains("word_values_pkey"), "{explained}");
+    // The target's page is a range scan of its index. The source's index
+    // orders otherwise, so the cursor is a filter on a full index scan (the
+    // planner has no scan to prefer), never an index condition.
+    let lines: Vec<&str> = explained.lines().collect();
+    let range_of = |index: &str| -> Option<String> {
+        let at = lines
+            .iter()
+            .position(|l| l.contains(&format!("using {index} on")))?;
+        Some(lines[at + 1].trim().to_string())
+    };
+    let target = range_of("word_values_pkey").expect("the target index is read");
+    assert!(target.starts_with("Index Cond:"), "{explained}");
+    let source = range_of("words_pkey").expect("the source index is read");
+    assert!(source.starts_with("Filter:"), "{explained}");
 
     trellis.shutdown().await.expect("shutdown");
 }

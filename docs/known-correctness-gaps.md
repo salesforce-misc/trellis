@@ -503,10 +503,6 @@ limits belong here:
 | Aggregate on the per-row ledger (every aggregate by default) | refused (`UnsupportedKeySpace`) | [#1105](https://github.com/salesforce-misc/trellis/issues/1105) moves every aggregate to the group basis |
 | Group-basis aggregate, `JOIN` (behind the development switch) | compared, hidden tables included | — |
 
-* **A source key re-collated while a job runs** (`ALTER COLUMN id TYPE text
-  COLLATE "C"`) can make a 1-1 walk skip or repeat keys. Start a new
-  `self_check` after the change
-  ([#1203](https://github.com/salesforce-misc/trellis/issues/1203)).
 * Each audit also reports the definition's held keys and the instance's drain
   holdups. They aren't gaps, but they explain a target that stops short.
 

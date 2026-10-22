@@ -133,9 +133,18 @@ async fn partials(d: &Driver, g: i32) -> Vec<String> {
 
 /// Claims the build's plan job and runs it in its own task, frozen at each
 /// of `points` on the target once reached.
+///
+/// The build runs on a pool of its own: a test that kills it and ends its
+/// session (`pg_terminate_backend`) leaves a dead connection in the pool it
+/// used, which the pool's fast recycle check hands out again until its
+/// driver notices the close. The next build, on the shared pool, must never
+/// meet that connection.
 async fn build_frozen(d: &Driver, points: &[PausePoint]) -> Running<()> {
     let points: Vec<(PausePoint, &str)> = points.iter().map(|p| (*p, TARGET)).collect();
-    d.run_frozen(&points, |pool| async move {
+    let dsn = d.db.dsn().to_string();
+    d.run_frozen(&points, |_shared| async move {
+        let pool = trellis::Pool::new(&Config::from_dsn(dsn).expect("valid dsn"))
+            .expect("the build's own pool");
         let claimed = chunk_queue::claim_chunks_of(
             &**pool.get().await.expect("pool"),
             "build",

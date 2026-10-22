@@ -240,9 +240,11 @@ times the table, which is hours at 100M rows.
   order `NULLS NOT DISTINCT` identities need), each collatable column under
   one collation named in the statement and used on both sides: the key
   column's own when it is deterministic, `"C"` when it is not. The column is the
-  source key's for a 1-1 target, the target's for an aggregate and a JOIN's
-  target part, and the hidden table's for `P`, `M` and `J`, which keep the
-  collation define gave them when the source is re-collated. When the two
+  target's for a 1-1 target, an aggregate and a JOIN's target part, and the
+  hidden table's for `P`, `M` and `J`. Each keeps the collation define gave it
+  (a 1-1 target key gets the source key's) when the source is re-collated, so
+  a walk that straddles the change pages in one order throughout; a 1-1 walk
+  still casts its cursor by the source key's columns and types. When the two
   sides' columns are collated differently, a page pays a scan on the side whose
   index doesn't order it.
 * **Nullable keys.** `NULL` sorts last, so the rows past a cursor on a nullable
