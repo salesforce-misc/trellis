@@ -114,6 +114,10 @@
 //! [`streaming::tuning::EngineTuning`], which is also where a later child of
 //! #269 adds a knob of its own. `write-tax` and `capture-ceiling` take
 //! none of them: they run no client, and nothing drains in either.
+//!
+//! `TRELLIS_BENCH_HOUSEKEEPING_MS=<ms>` sets the housekeeping interval (stock
+//! 5 s) for a run: a hot run's convergence tail is quantised by that
+//! interval, which biases its changes/s.
 //! Each prints one JSON line per measurement
 //! point, cross-checks `trellis_changes_applied_total` against the rows its
 //! generator committed, and runs an independent SQL oracle over the terminal
