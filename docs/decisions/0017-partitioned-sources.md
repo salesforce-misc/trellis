@@ -1,5 +1,5 @@
 ---
-status: draft
+status: accepted
 date: 2026-10-17
 deciders: Michael Ries
 ---
@@ -67,15 +67,23 @@ I tested every decision here against real clusters with Trellis's generated
 capture and an oracle diff after each step: the trigger and lifecycle behaviour
 on PostgreSQL 14 through 18, routing and bound evaluation on 15 through 18, and
 the detach check, the cheap cleanup forms, to-many targets and the cleanup race
-on 16 through 18. No result differed by version; a table that still carries
-capture triggers re-attaches on each of 16, 17 and 18.
+on 16 through 18. No result differed by version. The one difference is the
+`ATTACH` of a table that still carries capture triggers: it succeeded on 17 and
+18, and PostgreSQL 16.8 refused it (`trigger "trellis_capture_delete" prevents
+table … from becoming a partition`), so there the triggers have to be dropped
+first.
 
-### Trees of up to 1,000 leaves are supported; larger ones are unsupported, not refused
+### Trees of up to 1,000 leaves are supported; larger ones are refused
 
 No build statement prunes: each one plans, locks and opens every leaf, about two
-locks per leaf and 19–27 ms of planning at 1,000. That is acceptable at this
-size and is tested there. The default lock table runs out for one statement
-somewhere above that, so a larger tree waits until someone needs it.
+locks per leaf. At 1,000 leaves a statement holds about 2,000 locks, 29% of the
+default lock table's 6,912 slots (`max_locks_per_transaction` 64,
+`max_connections` 100), and plans in 25–28 ms, or 59–63 ms for a build chunk's
+statement. Define, capture install and the build of a 1,000-leaf tree complete
+inside the default lock table on PostgreSQL 17.11. One statement first ran out
+of shared memory at about 5,500 leaves. Define refuses a larger tree, and a
+tree that grows past the limit after define pauses its readers with a capture
+failure that names it. A larger tree waits until someone needs it.
 
 ### Every node carries capture, staging under the root's identity
 
@@ -88,8 +96,9 @@ missed writes named on a middle. With every node, each change was captured
 exactly once, and a row moved between partitions by an `UPDATE` through a
 parent staged as a matched delete and insert. The generated bodies are
 name-based, so one function set serves leaves whose attnums or dropped columns
-differ. Capture cost the same per write as on a plain table at 10, 100 and
-1,000 leaves.
+differ. Capture cost the same per write at 10, 100 and 1,000 leaves as
+at none: at 1,000 leaves it added about 0.2–0.4 ms to a write, as it does to a
+plain table.
 
 ### Up to 100 nodes install in one transaction; a larger tree installs node by node
 
@@ -97,9 +106,12 @@ A larger tree installs the root first, then one node per transaction.
 Installing in one transaction blocked every writer for about 0.3 ms per leaf:
 34–44 ms at 100 leaves and 271–305 ms at 1,000, and the existing 50 ms
 `lock_timeout` bounds the wait for the lock, not how long it is held. Node by
-node, the worst writer commit I saw was 7–56 ms at every size, for about twice
-the total install time. 100 nodes keeps the one-transaction stall within the
-roughly 50 ms writer wait a plain table's install already accepts.
+node, the slowest application-writer commit during the one-time install of a
+1,000-leaf tree was typically 12–65 ms, with occasional spikes of 0.2–1.5 s
+that varied between runs on a quiet box. The install took 1.6–4.6 s in total,
+against 0.2–0.7 s in one transaction (5–10 times as long). 100 nodes keeps the
+one-transaction stall within the roughly 50 ms writer wait a plain table's
+install already accepts.
 
 ### Each node's triggers are recorded, and maintenance is not a disruption
 
@@ -143,7 +155,8 @@ fingerprint (the source's own identity and its `pg_inherits` rows in both
 directions), both stored with the definition. A deep check runs when either
 changes, when none is stored, and after a restart.
 
-The two cost 2.3–2.9 ms per pass at 1,000 leaves and gave no false positive
+The two cost 2.3–2.9 ms per pass at 1,000 leaves (2.56–2.61 ms in the
+1,000-leaf sweep) and gave no false positive
 under DML, every `VACUUM` variant, `ANALYZE`, `CREATE INDEX` or Trellis's own
 install. The lifecycle fingerprint alone misses a source that joins a hierarchy
 or gains a level two deep, which the compliance fingerprint sees.
@@ -321,19 +334,21 @@ closed the oracle diff in every lifecycle cell I measured on `HASH`, `RANGE` and
 which a "recompute the groups found in the leaf" rule never converged on, and
 every window closed within 5.2 s under load. Those figures show the routing is
 exact, not what a correction costs. On the real path the work scales with the
-node's rows. Measured on the engine (one runner, a debug build, the cluster on
-tmpfs), a `DROP` of a leaf of 1M rows over 50,000 groups re-derives its 1M keys
-in about 12 s and writes about 480 MB of WAL, about 480 bytes a key: the entry
-lock, the entry's rewrite as a tombstone (not HOT, so an insert into the key
-index and the tombstone index) and the full-page images those touch. Folding the
-correction's group deltas takes the merger about 0.5 s and 26 MB. At that rate a
-retention `DROP` of 100M rows takes about 20 minutes and about 48 GB of WAL, then
-the garbage collector's deletes of those tombstones; that figure is a linear
-extrapolation from a leaf whose ledger stays in cache, and it is a floor. Past
-the cache, finding each key through the ledger's `GROUP BY` index reads a random
-heap page and a random index page: a model of that walk (#1085) ran at
-17.5–21.5k keys a second and 9–12 KB of WAL a key, which projects to 78–95
-minutes and 0.9–1.2 TB of WAL for a leaf of 100M rows. Rows an operation adds
+node's rows. Measured on the ledger build in the 1,000-leaf sweep (a release
+build, PostgreSQL 17.11, the cluster on disk), the correction of a dropped leaf
+of 1,000,000 rows takes 13.0 s in the engine: 1,000,000 keys in 101 pages and
+489 MB of WAL, about 490 bytes a key. Each key costs an entry lock, the entry's
+rewrite as a tombstone (not HOT, so an insert into the key index and the
+tombstone index) and the full-page images those touch. The pass that detects
+the drop takes 256 ms, and folding the correction's group deltas takes the
+merger 0.35 s and 23 MB. At that rate a retention `DROP` of 100M rows takes
+about 22 minutes and about 49 GB of WAL, then the garbage collector's deletes of
+those tombstones; that figure is a linear extrapolation from a leaf whose
+ledger stays in cache, and it is a floor. Past the cache, finding each key
+through the ledger's `GROUP BY` index reads a random heap page and a random
+index page: a model of that walk (#1085) ran at 17.5–21.5k keys a second and
+9–12 KB of WAL a key, which projects to 78–95 minutes and 0.9–1.2 TB of WAL for
+a leaf of 100M rows. Rows an operation adds
 are undercounted until its correction drains, rows it removes are overcounted,
 and writes through the parent have no window at all. For a to-many target,
 deleting rows lost them for good in 180 of 189 trials; recomputing the routed
@@ -401,7 +416,8 @@ The sweep catches a leaf created and dropped between two passes, which no
 fingerprint sees. Its full routing form cost 4.1–7.3 s per pass at 1,000 leaves
 and about 1M target rows, nearly the whole interval. The complement forms cost
 0 ms for `HASH` with nothing missing and 38 ms with two remainders missing,
-under 1 ms for `RANGE`, and 4–8 ms for `LIST`; reading the gaps took 1.9 ms.
+under 1 ms for `RANGE`, and 4–8 ms for `LIST`; reading the gaps took 1.9 ms. At 1,000 leaves the sweep is one statement per
+pass: 8.0–9.2 ms to read the bounds and 1.6–1.7 ms to search.
 Against Postgres 15 to 18, a node detached between the tree read and the text
 fetch, by a plain or a concurrent detach, and then dropped reached zero diff one
 pass after the pass that recorded it, in each of the three states, also beside
@@ -531,21 +547,29 @@ grouped `BY product_id` is refused at define, naming `order_id`.
   capture costing no more per write than on a plain table.
 - Partition maintenance needs no operator step, but counts can be wrong for
   about one interval plus a correction that costs O(rows in the node), not
-  O(groups): about 12 s and 480 MB of WAL for a leaf of 1M rows, and for a
-  retention `DROP` of 100M rows at least 20 minutes and 48 GB of WAL, and as
-  much as 78–95 minutes and 0.9–1.2 TB once the ledger outgrows the cache
-  (#1085's model). An operator who needs exact counts throughout moves rows with DML
+  O(groups): on the ledger build, 13.0 s and 489 MB of WAL for a dropped leaf of
+  1M rows (measured), and for a retention `DROP` of 100M rows at least 22
+  minutes and 49 GB of WAL (extrapolated), and as much as 78–95 minutes and
+  0.9–1.2 TB once the ledger outgrows the cache (#1085's model). An operator who needs exact counts throughout moves rows with DML
   through the parent instead, which I measured at about 4–5 s and 0.5–0.6 GB of
   WAL per 1M-row leaf; creating an empty leaf and writing through the parent
   costs nothing.
 - The reconcile pass carries per-source catalog state (recorded nodes and two
-  fingerprints), a few milliseconds per pass at 1,000 leaves, and a durable
+  fingerprints), a few milliseconds per pass at 1,000 leaves (a whole steady
+  pass there takes 233–252 ms), and a durable
   queue of pending corrections, and capture gains one catalog call per
   statement on a partitioned source.
-- Installing capture stalls writers up to about 50 ms, or, on a tree of more
-  than 100 nodes, takes about twice as long node by node.
+- Installing capture stalls writers up to about 50 ms. On a tree of more than
+  100 nodes it installs node by node, which takes 5–10 times as long in total
+  (1.6–4.6 s at 1,000 leaves), with a slowest writer commit typically of 12–65
+  ms and occasionally 0.2–1.5 s.
 - Build statements don't prune, so their planning and locking grow with the
-  leaf count, and trees beyond 1,000 leaves wait until someone needs them.
+  leaf count (about 2,000 locks and 25–28 ms of planning at 1,000 leaves), and
+  trees beyond 1,000 leaves wait until someone needs them.
+- A `DROP` or `DETACH` of a leaf can deadlock against a per-leaf rebuild or a
+  page that holds the leaf's groups. Postgres aborts one transaction with
+  `40P01`: the job and the page retry, and the DDL may be the one aborted, so
+  the operator retries it. The error is visible and nothing is lost.
 - The supported shapes are narrow by design: a group key that omits a partition
   key, or an untested key type, is refused rather than handled slowly.
 - A retention `DROP` takes the definition out of `live` for as long as its

@@ -15,6 +15,7 @@ the ways a target can go wrong without a stop, and names the repair for each.
 | `paused`, with a `capture_failure` saying capture was changed outside Trellis, or the table is gone from its name | A trigger was disabled, dropped or recreated, a capture function was replaced, or the table was dropped, renamed away or swapped, so changes may be missing | Put the table back if it was a mistake, then `RESUME` |
 | `paused`, with a `capture_failure` naming a column or the primary key | A schema change the definition can't follow as written, or copies Trellis must re-type | Make the schema acceptable (the message says how), then `RESUME`; or `DROP TRANSFORM` and define it again |
 | `paused`, with a `capture_failure` naming a role and a table | A read or write refused to a role Trellis runs as: a missing privilege or row-level security ([A halting failure](observability.md#a-halting-failure)) | Grant the privilege, or `BYPASSRLS`, then `RESUME` |
+| `paused`, with a `capture_failure` naming a partition-key column, the leaf limit or a restore | A partitioned source stopped meeting the shape define accepts, or the database was restored from a logical dump | Make the tree comply ([the refusal table](transforms.md#supported-sources-and-targets)), or after a restore, nothing to fix; then `RESUME` |
 | `paused`, with a `capture_failure` reading "resuming: …" | A `RESUME` is re-typing copies or waiting for an upstream to go `live` | Wait. A `PAUSE` withdraws the resume |
 | `quarantined` | Too many of its keys failed to apply, so the whole-definition fuse tripped | Fix the cause `sample_quarantined` shows, then `RESUME` |
 | `held_keys` | Keys that keep failing to apply are held, with their target rows frozen | Fix the cause, then [release them](#releasing-held-keys) |
@@ -213,6 +214,81 @@ which targets it compares is in
   resume is refused once its upstream is live, because the schema changed
   after the pause, stays paused with the refusal and isn't tried again:
   resume it by hand once that's fixed, or drop it and define it again.
+
+## Partitioned sources
+
+[Transforms — Partitioned sources](transforms.md#partitioned-sources) says what a
+partition operation does to the counts and how to avoid the window. This is what
+each one costs and what to expect around it
+([ADR-0017](decisions/0017-partitioned-sources.md)).
+
+* **A correction costs the work of the partition's rows.** On the ledger build,
+  the correction of a dropped partition of 1,000,000 rows took 13.0 s in the
+  engine (1,000,000 keys in 101 pages, 489 MB of WAL), plus 0.35 s and 23 MB to
+  fold the result and a 0.26 s pass to detect the drop (release build,
+  PostgreSQL 17.11, a 1,000-leaf tree on disk; measured on the ledger build).
+  On the group basis the correction of a `DROP`, `DETACH` or `TRUNCATE` took
+  27-34 ms and about 0.6 MB of WAL for a partition of 1M or 10M rows over 1,560
+  groups (a debug build), and the correction of an `ATTACH` took 0.5-0.6 s at 1M
+  rows and 3.9-4.7 s at 10M. Moving rows with DML through the parent instead
+  costs about 4-5 s and 0.5-0.6 GB of WAL per 1M-row partition and has no
+  window.
+* **A retention `DROP` of a large partition takes the definition out of `live`
+  for minutes.** On the ledger build, a linear extrapolation of the 1M-row
+  figure gives about 22 minutes and 49 GB of WAL for 100M rows, a floor that
+  assumes the ledger stays in cache, followed by the garbage collector's deletes
+  of the tombstones. A model of the walk once the ledger outgrows the cache gave
+  78-95 minutes and 0.9-1.2 TB of WAL for 100M rows. The definition reads
+  `backfilling` with the partition in `correcting` until it drains, and every
+  other partition's groups stay exact. Delete the partition's rows through the
+  parent first to avoid the window.
+* **A `DROP` or `DETACH` of a partition can deadlock against a rebuild or a
+  page, and Postgres may abort your DDL with `40P01`.** The DDL holds the
+  parent `ACCESS EXCLUSIVE` while it waits for the partition. A per-partition
+  rebuild of a group-basis aggregate (a build, `RESUME` or rebuild in place), or
+  a drain page that holds the partition's groups, takes the same locks in the
+  other order. Postgres breaks the cycle by aborting one of the transactions.
+  The rebuild job and the page retry. If the DDL is the one aborted, you get
+  `deadlock detected` (`40P01`): run the DDL again. Nothing is lost.
+* **Installing capture on a large tree stalls writers briefly, once.** A tree
+  of up to 100 nodes installs in one transaction, which blocks writers for up to
+  about 50 ms (34-44 ms at 100 leaves). A larger tree installs node by node: the
+  slowest application-writer commit at 1,000 leaves was typically 12-65 ms, with
+  occasional spikes of 0.2-1.5 s, and the install took 1.6-4.6 s in all, against
+  0.2-0.7 s in one transaction.
+* **A pass over a 1,000-leaf tree takes about a quarter of a second.** The
+  fingerprints take 2.6 ms and a steady pass 233-252 ms. A build statement holds
+  about 2,000 locks and plans in 25-28 ms, within the default lock table.
+* **PostgreSQL 16.8 refused to `ATTACH` a table that still carried the capture
+  triggers** (`trigger "trellis_capture_delete" prevents table … from becoming
+  a partition`); 17 and 18 accepted it. Drop the table's `trellis_capture_*`
+  triggers before attaching it. The next pass installs capture on it.
+* **A logical dump and restore** pauses every definition of the database, with
+  a `capture_failure` naming the restore, discards the changes staged before it
+  and the corrections queued, and runs no correction from the recorded
+  partition state: the dump's partition oids and `HASH` bounds are no longer
+  the live ones. `RESUME` each definition, which rebuilds it from the restored
+  source ([After a restore or an upgrade](#runbooks)).
+* **`pg_upgrade` needs nothing.** The pass sees the new cluster, compares the
+  recorded partitions by oid and bound, and records the upgrade's reset
+  `pg_inherits` and `pg_class` `xmin`s and its rewritten bound texts without
+  reading any partition as new, so no rebuild or correction runs. Let a pass run
+  after partition maintenance before an upgrade, and after the upgrade before
+  more maintenance
+  ([known correctness gaps](known-correctness-gaps.md)).
+* **pg_partman's maintenance needs no operator step on Trellis's side.** The
+  opt-in test tier (`trellis/tests/pg_partman.rs`, [testing
+  strategy](testing-strategy.md)) drove pg_partman 5.2.4 on PostgreSQL 15.19,
+  16.15, 17.11 and 18.6 through six modes (time daily, time without a
+  `DEFAULT`, id range, id list, epoch seconds, and time with id
+  sub-partitions), with premake, `run_maintenance`, `partition_data_*`,
+  retention by detach and by drop, `undo_partition`, its background worker
+  running beside Trellis's pass, and concurrent writers through the parent and
+  straight to a partition. The readers matched the source after every step and
+  none paused. Rows left in pg_partman's `DEFAULT` within its premake horizon
+  make pg_partman's own `run_maintenance` fail on `ATTACH`, and its worker fail
+  on every interval, until `partition_data_*` moves them, with or without
+  Trellis. Other partition managers and pg_partman versions are not tested.
 
 ## Runbooks
 
