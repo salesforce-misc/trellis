@@ -114,16 +114,17 @@
 //! [`streaming::tuning::EngineTuning`], which is also where a later child of
 //! #269 adds a knob of its own. `write-tax` and `capture-ceiling` take
 //! none of them: they run no client, and nothing drains in either.
-//!
-//! `TRELLIS_BENCH_HOUSEKEEPING_MS=<ms>` sets the housekeeping interval (stock
-//! 5 s) for a run: a hot run's convergence tail is quantised by that
-//! interval, which biases its changes/s.
 //! Each prints one JSON line per measurement
 //! point, cross-checks `trellis_changes_applied_total` against the rows its
 //! generator committed, and runs an independent SQL oracle over the terminal
 //! target — the process exits non-zero on an oracle or cross-check failure,
 //! but **not** on a missed latency target or a rate the engine couldn't
 //! keep, which are measurements rather than errors.
+//!
+//! `TRELLIS_BENCH_HOUSEKEEPING_MS=<ms>` sets the housekeeping interval (stock
+//! 5 s) for a run: a hot run's convergence tail is quantised by that
+//! interval, which biases its changes/s. A value that is not a whole number
+//! of milliseconds fails the run.
 //!
 //! `--release` matters: this pushes 1M rows through a real Postgres
 //! instance and a real CDC pipeline, and the debug-build overhead is large

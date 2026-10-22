@@ -131,11 +131,14 @@ impl EngineTuning {
             // housekeeping interval (segment retirement frees a full ring),
             // which biases its changes/s; `TRELLIS_BENCH_HOUSEKEEPING_MS`
             // shortens it for the run.
-            housekeeping_interval: std::env::var("TRELLIS_BENCH_HOUSEKEEPING_MS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .map(Duration::from_millis)
-                .unwrap_or(ClientOptions::default().housekeeping_interval),
+            // An unparsable value fails the run rather than silently
+            // measuring the stock interval under a label that says otherwise.
+            housekeeping_interval: match std::env::var("TRELLIS_BENCH_HOUSEKEEPING_MS") {
+                Ok(v) => Duration::from_millis(v.trim().parse().unwrap_or_else(|_| {
+                    panic!("TRELLIS_BENCH_HOUSEKEEPING_MS={v:?} is not a whole number of ms")
+                })),
+                Err(_) => ClientOptions::default().housekeeping_interval,
+            },
             ..Default::default()
         }
     }

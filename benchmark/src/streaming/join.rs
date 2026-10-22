@@ -1404,19 +1404,62 @@ async fn write_dimension_page(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn pick_owned_terminates_when_a_page_asks_for_more_than_is_owned() {
         use rand::SeedableRng;
         let owned: Vec<i64> = (0..5).collect();
         let mut rng = StdRng::seed_from_u64(1);
         let mut taken = HashSet::new();
-        let a = super::pick_owned(&owned, 3, &mut rng, &mut taken);
-        let b = super::pick_owned(&owned, 3, &mut rng, &mut taken);
-        let c = super::pick_owned(&owned, 3, &mut rng, &mut taken);
+        let a = pick_owned(&owned, 3, &mut rng, &mut taken);
+        let b = pick_owned(&owned, 3, &mut rng, &mut taken);
+        let c = pick_owned(&owned, 3, &mut rng, &mut taken);
         assert_eq!((a.len(), b.len(), c.len()), (3, 2, 0));
     }
 
-    use super::*;
+    /// Every (owned, already taken, wanted) up to small sizes: a pick
+    /// returns `min(wanted, owned - taken)` distinct owned ids none of which
+    /// were taken, and records them in `taken`. When enough are left it
+    /// draws exactly what the uncapped picker drew from the same RNG.
+    #[test]
+    fn pick_owned_takes_what_is_left_and_draws_as_before_when_enough_is() {
+        use rand::SeedableRng;
+        for owned_len in 0..8usize {
+            let owned: Vec<i64> = (0..owned_len as i64).map(|i| i * 7 + 3).collect();
+            for taken_len in 0..=owned_len {
+                for wanted in 0..owned_len + 3 {
+                    for seed in 0..4u64 {
+                        let mut rng = StdRng::seed_from_u64(seed);
+                        let mut taken: HashSet<i64> =
+                            owned.iter().copied().take(taken_len).collect();
+                        let before = taken.clone();
+                        let got = pick_owned(&owned, wanted, &mut rng, &mut taken);
+                        let left = owned_len - taken_len;
+                        assert_eq!(got.len(), wanted.min(left));
+                        let distinct: HashSet<i64> = got.iter().copied().collect();
+                        assert_eq!(distinct.len(), got.len());
+                        assert!(got.iter().all(|id| owned.contains(id)));
+                        assert!(got.iter().all(|id| !before.contains(id)));
+                        assert_eq!(taken.len(), before.len() + got.len());
+                        if wanted <= left {
+                            // The picker before the cap, on the same draws.
+                            let mut rng = StdRng::seed_from_u64(seed);
+                            let mut taken = before.clone();
+                            let mut old = Vec::new();
+                            while old.len() < wanted.min(owned_len) {
+                                let id = owned[rng.random_range(0..owned_len)];
+                                if taken.insert(id) {
+                                    old.push(id);
+                                }
+                            }
+                            assert_eq!(got, old);
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     fn generator() -> Generator {
         Generator {
