@@ -11,9 +11,9 @@
 //!
 //! Every test turns the group-basis dev knob on before its driver starts (a
 //! `JOIN` applies only behind it) and starts from two empty tables, since a
-//! `JOIN` has no build yet (#1109): it goes `live` with empty hidden tables
-//! and the seed arrives through capture. The pass, the seal, the drain and
-//! the correction engine are called by hand; nothing waits for convergence
+//! `JOIN` build of a partitioned side with rows waits on #1286: it goes `live`
+//! with empty hidden tables and the seed arrives through capture. The pass,
+//! the seal, the drain and the correction engine are called by hand; nothing waits for convergence
 //! (#297). The oracle is each definition's own `JOIN … GROUP BY`, and the
 //! hidden `P`, `M`, `J` and `T` against `GROUP BY`s of the tables.
 //!

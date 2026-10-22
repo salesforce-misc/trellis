@@ -61,11 +61,13 @@ would break a stored definition, which is stored as text and re-parsed.
   the tuple of join columns, in `ON` order. A row with a `NULL` in any join-key
   column never matches, so a `LEFT` row with no match lands in the group with a
   `NULL` `gb`.
-- **Join-key types.** Each column pair has the same type, type modifier and
-  deterministic collation, with no casting or widening, from the same set of
-  text-stable types any join key admits, so that grouping by the key and
-  joining on it agree on equality. A retype of one side pauses the transform
-  until the other side matches.
+- **Join-key types.** Each column pair has the same type (or both are strings)
+  and the same deterministic collation, with no casting or widening, from the
+  same set of text-stable types any join key admits, so that grouping by the
+  key and joining on it agree on equality. Modifiers never count
+  ([ADR-0020](0020-type-identity.md) extends this). A retype of one side to
+  another type or collation pauses the transform until the other side
+  matches.
 - **Cardinality.** The join may be many-to-many: `b`'s join key needn't be
   unique, and `M` counts multiplicity, so the results match SQL's fan-out.
 - **`GROUP BY`.** Required, with at least one key, from either side. Each key
@@ -283,21 +285,47 @@ partitioned on its own id is refused.
 
 ### A build fills `P` and `M` from each source and `T` from them
 
-A build fills `P` and `M` a chunk at a time, and each chunk carries its cells'
-contribution into `T` under the same `J` locks and in the same transaction as a
-page, so pages apply from the first chunk. In the model, chunked builds of both
-sides were exact in every chunk order and against pages, recomputes and the
-other side's chunks, on both versions.
+When neither side is partitioned, a build, a `RESUME` and a rebuild in place
+are one transaction over both structures. It takes the lock row `FOR SHARE`,
+enumerates each side's cells (its hidden table's, its table's and those of the
+ring's old images), locks `J` on the union of both sides' keys in one sorted
+statement, locks the cells, and writes each side's enumerated cells from one
+`GROUP BY` of its table under a snapshot taken after the lock statements. A cell first seen after the
+enumeration belongs to its pages. It then carries both sides' changes into `T`
+as the product, as a page does. `T`'s groups are locked after the product,
+together with every group of the visible target and of `T`'s hidden table; `T`
+changes only as a delta, and each locked group's visible row is compared with
+the row the target holds. Pages apply from the build's first moment, and a page
+that names a key the build holds waits for its commit. Readers see the old `T`
+and the old visible rows until then. One `GROUP BY` per structure was 2–12x
+cheaper than chunks in the model (84 s against 412–509 s on a 100M-row fact
+table grouped by day and dimension attribute), and the model found it exact
+against pages, recomputes and truncates on both versions.
 
-[OPEN: Chunked builds cost per (chunk, cell) pair, not per row: with many cells
-they were 3–4x slower than one materialized row per fact, while one `GROUP BY`
-per structure was 2–12x cheaper than chunks (84 s against 412–509 s on a 100M-row
-fact table grouped by day and dimension attribute). Which locks make filling `P`
-and `M` by one `GROUP BY` each, and `T` from `P ⋈ M` in one statement, exact
-while both sides take writes, and whether pages can apply during that fill,
-awaits the build-path correctness model in #1097, and the build itself is
-decided in #1109. Recommendation: build that way if the model shows it exact,
-and keep chunks otherwise.]
+A side that is partitioned and has rows is built per side and per leaf
+instead (#1286). Each unpartitioned side runs first, as one transaction over
+that side alone. Then come each partitioned side's leaves in the recorded
+tree's oid order, followed by its remainder: the cells that route to no
+recorded leaf, read through the root. Each of those steps is the same writer
+over its region: it enumerates the region's cells, locks `J` on their keys in
+one sorted statement, writes the cells from one `GROUP BY` of the region and
+carries the product into `T` as a delta. A final step locks every hidden and
+visible `T` group, compares the visible target with `T` and removes the rows of
+groups with no contributions left. The job's cursor records the last committed
+step, so a killed job resumes after it. Readers see values change leaf by leaf
+until the final step commits.
+
+A `RESUME` keeps the visible target while the hidden tables restart empty, so
+the prior images that pages send the target's readers before the build commits
+don't match the rows those readers hold. The build that completes a `RESUME`
+therefore parks its readers' catch-up when it commits, once (#1287): a
+group-basis or `JOIN` reader is rebuilt, any other re-derives. Pages keep
+computing prior images from the partials, and a rebuild in place of a `live`
+definition, whose partials match the target, rebuilds no reader.
+
+[OPEN: Neither is built yet (#1109). Until it is, a build halts the definition,
+with the reason, when a side is partitioned and has rows, or when a `RESUME`
+keeps a target that has rows while a reader of it isn't paused.]
 
 ### Define warns when `P` approaches the fact table's size
 

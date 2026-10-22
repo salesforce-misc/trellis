@@ -1514,7 +1514,8 @@ async fn plan_waiting_builds(
         let id: i64 = row.get(0);
         let text: String = row.get(1);
         let def = crate::defs::grammar::load(&text, row.get(2)).map_err(CatalogError::from)?;
-        // #1107: nothing builds a JOIN yet (J4, #1109); it stays waiting.
+        // A JOIN is built by its plan job (`staging::build`, #1109), never by a ring
+        // enumeration.
         if rederive.contains(&id) || matches!(def.key_space, KeySpace::Join(_)) {
             continue;
         }

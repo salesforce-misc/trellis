@@ -113,6 +113,50 @@ impl Driver {
         definitions: &[&str],
         captured: &[&str],
     ) -> Self {
+        Self::start_inner(
+            defaults,
+            source_ddl,
+            columns,
+            relationships,
+            definitions,
+            captured,
+            true,
+        )
+        .await
+    }
+
+    /// [`Self::start`] for definitions over tables that hold rows: the
+    /// builds are started (`backfilling`, their jobs unclaimed) and left for
+    /// the test to run, frozen where the scenario needs it, instead of run to
+    /// `live`.
+    pub async fn start_unbuilt(
+        defaults: &[(&str, &str)],
+        source_ddl: &str,
+        columns: &[(&str, ValueType)],
+        definitions: &[&str],
+        captured: &[&str],
+    ) -> Self {
+        Self::start_inner(
+            defaults,
+            source_ddl,
+            columns,
+            &[],
+            definitions,
+            captured,
+            false,
+        )
+        .await
+    }
+
+    async fn start_inner(
+        defaults: &[(&str, &str)],
+        source_ddl: &str,
+        columns: &[(&str, ValueType)],
+        relationships: &[&str],
+        definitions: &[&str],
+        captured: &[&str],
+        built: bool,
+    ) -> Self {
         let cluster = TestCluster::start();
         let mut db = cluster.create_isolated_database().await;
         let mut ctl = connect(db.dsn()).await;
@@ -170,7 +214,13 @@ impl Driver {
         }
         phases.push(("capture_install", started.elapsed()));
         let started = Instant::now();
-        markers::settle_registrations(&db.pool).await;
+        if built {
+            markers::settle_registrations(&db.pool).await;
+        } else {
+            markers::discharge_registrations(&db.pool)
+                .await
+                .expect("start the builds");
+        }
         let mut driver = Driver {
             cluster,
             db,
@@ -179,6 +229,9 @@ impl Driver {
             next_lock: AtomicI64::new(623_000),
             phases,
         };
+        if !built {
+            return driver;
+        }
         driver.settle().await;
         let settled = started.elapsed();
         driver.phases.push(("settle", settled));

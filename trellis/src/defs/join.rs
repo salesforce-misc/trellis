@@ -272,16 +272,24 @@ impl HiddenTable {
         }
     }
 
-    /// The table's bare name in the catalog schema, for definition `id`.
-    pub(crate) fn name(self, id: i64) -> String {
-        let part = match self {
+    fn part(self) -> &'static str {
+        match self {
             HiddenTable::FromPartials => "p",
             HiddenTable::JoinedPartials => "m",
             HiddenTable::Matches => "j",
             HiddenTable::TargetPartials => "t",
             HiddenTable::TruncateLock => "l",
-        };
-        format!("join_{id}_{part}")
+        }
+    }
+
+    /// The table's bare name in the catalog schema, for definition `id`.
+    pub(crate) fn name(self, id: i64) -> String {
+        format!("join_{id}_{}", self.part())
+    }
+
+    /// [`Self::name`] as SQL, over the definition id expression `id`.
+    pub(crate) fn name_sql(self, id: &str) -> String {
+        format!("('join_' || {id} || '_{}')", self.part())
     }
 }
 

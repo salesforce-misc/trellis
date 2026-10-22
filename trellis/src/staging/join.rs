@@ -3,12 +3,11 @@
 //! # When it runs
 //!
 //! Only behind the group-basis dev knob (`super::group_basis::enabled`):
-//! nothing builds a `JOIN` yet (J4, #1109), and with the knob off one stays
-//! `waiting_to_backfill` and never applies. With the knob on, a `JOIN`
-//! definition ([`applies`]) is built like a knob-on aggregate: its plan job
-//! only checks that both tables are empty and no other definition's target
-//! (`super::build`), so it goes `live` with empty hidden tables and applies
-//! every captured change from then on. A rebuild halts it (J4's, #1109).
+//! with the knob off a `JOIN` stays `waiting_to_backfill` and never applies.
+//! With the knob on, a `JOIN` definition ([`applies`]) is built by its plan
+//! job (a fresh build or a `RESUME`) or its sweep job (a rebuild in place) in
+//! one transaction ([`build`], "A build" below), and applies every captured
+//! change from the build's start on.
 //!
 //! Either table may be a partitioned root (#1111, ADR-0019 "Either side may
 //! be partitioned"). A node operation (`DROP`, `DETACH`, `TRUNCATE`,
@@ -80,6 +79,48 @@
 //! hidden tables are emptied by `DELETE`, not `TRUNCATE`: another writer
 //! (a release) may hold a hidden table's `ACCESS SHARE` from its working
 //! tables' `create … as select` while it queues on the lock row.
+//!
+//! # A build ([`build`])
+//!
+//! A fresh build, a `RESUME` (which recreates the hidden tables and keeps the
+//! visible target) and a rebuild in place of a live `JOIN` (a
+//! `request_backfill` of either table, a re-installed capture) are one
+//! `READ COMMITTED` transaction over both structures, #1097's S1T: a page
+//! whose two sides both recompute every cell they enumerate from one `GROUP
+//! BY` of the whole table, through the same writer ([`write_locked`]).
+//!
+//! 1. The lock row `FOR SHARE`.
+//! 2. **Enumerate** each side's cells (ADR-0002's R8): its hidden table's,
+//!    its table's, and those of the old images in the ring.
+//! 3. `J` `FOR UPDATE` on the union of both sides' keys, in one sorted
+//!    statement, then the cells of both sides. Pages of keys the build holds
+//!    wait for its commit; the other keys' pages run through.
+//! 4. Each side's snapshot and absolute write of the cells it enumerated, as
+//!    a recompute does (the statement's snapshot is each cell's basis, taken
+//!    after every lock statement; a cell first seen after the enumeration is
+//!    left to its pages), then the product of both sides' changes into `T`.
+//! 5. `T`: its groups are locked **after** the product, so the set is exactly
+//!    the groups the product reads under `J`, with every group of the visible
+//!    target and of `T`'s hidden table added (R8 one level up). `T` changes
+//!    only as the product's delta; each locked group's visible row is then
+//!    compared with the row the target holds (prior images are the held
+//!    rows), which also removes the row of a group no source row backs.
+//!
+//! Readers see the old `T` and the old visible rows until the commit. A
+//! `TRUNCATE` page waits for the commit on the lock row and then clears what
+//! the build wrote; the build holds `ACCESS SHARE` of both tables, so a
+//! `TRUNCATE` statement queues behind it. The build's hold on both
+//! structures, the xmin horizon and the ring's retirement lasts the whole
+//! transaction (`docs/recommendations.md`).
+//!
+//! What a rebuild in place repairs: `P` and `M` that disagree with their
+//! tables, and visible rows that disagree with `T`. Not a hand edit of `T` or
+//! of `J.matches`, which change only by delta; a `RESUME` recreates them.
+//!
+//! Not built yet, each halting the definition with the reason: a side that is
+//! partitioned and has rows (its per-side, per-leaf build, #1286), and a
+//! `RESUME` that keeps a target with rows while a reader of it isn't paused
+//! (the readers' rebuild at the build's commit, #1287).
 //!
 //! # Release ([`release`])
 //!
@@ -373,7 +414,8 @@ impl JoinTargetPlan {
                         // Each side's own truncate floor (ADR-0019).
                         Some(hidden),
                         stage_filter,
-                    ),
+                    )
+                    .with_ring(catalog_schema),
                     join_cols,
                     deltas,
                     recompute: false,
@@ -881,7 +923,7 @@ pub(crate) async fn apply_join_target(
             group_basis::name_groups(txn, &side.plan, &[], side.plan.recompute_keys()).await?;
         }
     }
-    write_locked(txn, plan, mutations).await
+    write_locked(txn, plan, mutations, false).await
 }
 
 /// Creates every working table of `plan`'s writers, once a session.
@@ -902,10 +944,15 @@ async fn create_working_tables(
 /// Steps 2 to 5 of a page (see the module doc), over the sides already
 /// staged and the cells already named: the lock row and a truncate's clear,
 /// `J`, the cells, the cells' changes, the product and `T`.
+///
+/// With `build`, this is the transaction of [`build`]: `T`'s write is the
+/// build's (every group of the visible target and of `T`'s hidden table is
+/// locked, and every visible row compared with the row the target holds).
 async fn write_locked(
     txn: &Transaction<'_>,
     plan: &JoinTargetPlan,
     mutations: &mut TargetMutations,
+    build: bool,
 ) -> Result<(usize, usize), ApplyError> {
     let sides = [&plan.from, &plan.joined];
     // 2. The pair's lock row, a truncate's clear, `J`, then the cells.
@@ -928,7 +975,10 @@ async fn write_locked(
     pause!(txn, AfterJoinKeyInsert, &plan.target);
     let waiting_since = std::time::Instant::now();
     txn.execute(&plan.j_lock_sql(), &[]).await?;
-    crate::metrics::record_join_lock_wait(&plan.target, waiting_since.elapsed());
+    // A build's wait for the keys its pages hold is not a page's contention.
+    if !build {
+        crate::metrics::record_join_lock_wait(&plan.target, waiting_since.elapsed());
+    }
     pause!(txn, AfterJoinLock, &plan.target);
     for side in sides {
         if side.writes() {
@@ -951,15 +1001,27 @@ async fn write_locked(
             )
             .await?;
         }
+        pause!(txn, BetweenJoinSideWrites, &plan.target);
     }
     // 4. The product into `T`'s staging, and `J.matches`. With nested
     // loops left on: its joins look up the other side's cells of a key
     // through the cell identity's index.
     txn.execute(&plan.product_sql(), &[]).await?;
-    // 5. `T`: lock the changed groups, sorted, then write them.
+    // 5. `T`: lock the changed groups, sorted, then write them. A build
+    // locks every group of the visible target and of `T` as well, and
+    // compares each visible row with the one the target holds.
+    if build {
+        group_basis::enumerate_target_groups(txn, &plan.t).await?;
+    }
     txn.execute(&plan.t.lock_sql(), &[]).await?;
     pause!(txn, AfterJoinTargetLock, &plan.target);
-    let (_, written, removed) = group_basis::apply_locked_groups(txn, &plan.t, mutations).await?;
+    let (written, removed) = if build {
+        group_basis::apply_join_build_groups(txn, &plan.t, mutations).await?
+    } else {
+        let (_, written, removed) =
+            group_basis::apply_locked_groups(txn, &plan.t, mutations).await?;
+        (written, removed)
+    };
     pause!(txn, AfterGroupUpsert, &plan.target);
     Ok((written, deleted + removed))
 }
@@ -1070,7 +1132,7 @@ pub(crate) async fn release(
     };
     group_basis::name_groups(txn, &side_plan.plan, cells, &[key.to_string()]).await?;
     let mut mutations = TargetMutations::new();
-    write_locked(txn, &plan, &mut mutations).await?;
+    write_locked(txn, &plan, &mut mutations, false).await?;
     let propagation = mutations.into_staged(txn).await?;
     super::append::append(txn, &propagation.changes).await?;
     Ok(true)
@@ -1108,10 +1170,64 @@ pub(crate) async fn recompute_routed(
     };
     group_basis::name_groups(txn, &side_plan.plan, cells, &[]).await?;
     let mut mutations = TargetMutations::new();
-    write_locked(txn, &plan, &mut mutations).await?;
+    write_locked(txn, &plan, &mut mutations, false).await?;
     let propagation = mutations.into_staged(txn).await?;
     super::append::append(txn, &propagation.changes).await?;
     Ok(())
+}
+
+/// A `JOIN`'s fresh build, `RESUME` and rebuild in place (#1109, #1097's
+/// decision): both structures, `P` and `M`, and `T` in the caller's one
+/// `READ COMMITTED` transaction, which commits it. Readers see the old `T`
+/// and the old visible target until that commit.
+///
+/// 1. The lock row `FOR SHARE`, before the enumeration, so a `TRUNCATE` page
+///    (the row `FOR UPDATE`) waits for the commit and clears what it empties
+///    after; a `TRUNCATE` statement queues on the `ACCESS SHARE` the
+///    enumeration takes on each table.
+/// 2. **Enumerate** each side's cells (R8, [`group_basis::enumerate_cells`]):
+///    its hidden table's, its table's, and those of the ring's old images.
+/// 3. Steps 2 to 5 of a page ([`write_locked`]) with every enumerated cell
+///    of both sides recomputed by one `GROUP BY` of its whole table: `J` on
+///    the union of both sides' keys in one sorted statement, the cells of
+///    both sides, `M`'s and `P`'s snapshots and absolute writes (the
+///    statement's snapshot is each cell's basis, taken after every lock
+///    statement), then the product of the cells' changes into `T`.
+///    A cell first seen after the enumeration is not locked, so it is not
+///    written: its pages apply it.
+/// 4. `T`: its groups are locked after the product, so the set is the
+///    product's groups, read from rows held under `J`, plus every group of the
+///    visible target and of `T`'s hidden table (R8 one level up). `T` changes
+///    only as the product's delta; every locked group's visible row is then
+///    compared with the row the target holds, which removes the row of a
+///    group no source row backs and repairs a row that disagrees with `T`'s
+///    partials.
+///
+/// A hand edit of `T` or of `J.matches` is not repaired: they change only by
+/// delta (a `RESUME` recreates them). Returns the visible rows written and
+/// deleted.
+pub(crate) async fn build(
+    txn: &Transaction<'_>,
+    catalog_schema: &str,
+    definition: &Definition,
+) -> Result<(usize, usize), ApplyError> {
+    let mut plan = plan_for(txn, catalog_schema, definition).await?;
+    pause!(txn, BeforeJoinBuild, &plan.target);
+    for side in [&mut plan.from, &mut plan.joined] {
+        side.recompute = true;
+        side.node = Some(side.plan.source_row().to_string());
+    }
+    create_working_tables(txn, &plan).await?;
+    txn.execute(&format!("select 1 from {} for share", plan.lock_ident), &[])
+        .await?;
+    for side in [&plan.from, &plan.joined] {
+        group_basis::enumerate_cells(txn, &side.plan).await?;
+    }
+    let mut mutations = TargetMutations::new();
+    let (written, deleted) = write_locked(txn, &plan, &mut mutations, true).await?;
+    let propagation = mutations.into_staged(txn).await?;
+    super::append::append(txn, &propagation.changes).await?;
+    Ok((written, deleted))
 }
 
 /// The column list of each of definition `id`'s hidden tables in

@@ -222,8 +222,7 @@ unblocks it.
   workers, a short seal cadence), so both sides' writes race into the same
   batches and onto the same keys; every burst is checked once it settles, and every definition must still
   be `live` at the end. Every definition is installed over the two empty tables,
-  and the run waits for it before its first write: a join aggregate builds only
-  over empty tables until its build exists (#1109). About one op in a hundred
+  and the run waits for it before its first write. About one op in a hundred
   is a `TRUNCATE` of either table. Run it with `cargo test -p generative --test
   join_convergence -- --ignored`.
 - **A second, structural oracle** *(needs an engine consistency auditor, if one

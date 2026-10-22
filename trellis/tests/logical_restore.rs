@@ -257,8 +257,7 @@ async fn original(cluster: &TestCluster) -> Original {
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
     let trellis = definer(db.dsn()).await;
-    // The rows arrive through capture: the JOIN build admits only empty
-    // sources (#1109).
+    // The rows arrive through capture.
     raw.batch_execute(
         "create table public.s1 (id int primary key, v int); \
          create table public.g (id int primary key, grp int not null, amt int); \
@@ -422,9 +421,8 @@ async fn hidden_ids(raw: &Client) -> (i64, i64) {
 }
 
 /// The resumes of the group-basis aggregate and the `JOIN` reset their
-/// ordering state before the rebuild. The rebuilds themselves wait on #1101
-/// and #1109 (a group-basis or `JOIN` build over a source with rows), so the
-/// definitions are paused again for the passes that follow.
+/// ordering state before the rebuild: each drops and recreates its hidden
+/// tables. Both builds run in the passes that follow.
 async fn resume_groups_and_check_the_reset(raw: &Client, trellis: &Trellis) {
     let (agg, join) = hidden_ids(raw).await;
     for target in ["gsum", "jl"] {
@@ -434,15 +432,9 @@ async fn resume_groups_and_check_the_reset(raw: &Client, trellis: &Trellis) {
             .unwrap_or_else(|e| panic!("{target}: {e}"));
     }
     assert_eq!(
-        count(
-            raw,
-            &format!(
-                "select count(*) from agg_{agg} where __basis is not null or __stamp is not null"
-            )
-        )
-        .await,
+        count(raw, &format!("select count(*) from agg_{agg}")).await,
         0,
-        "the group basis starts over"
+        "the group basis starts over, with no partials, basis or stamp"
     );
     for part in ["p", "m", "j", "t"] {
         assert_eq!(
@@ -451,12 +443,6 @@ async fn resume_groups_and_check_the_reset(raw: &Client, trellis: &Trellis) {
             "the JOIN's {part} is recreated"
         );
     }
-    for target in ["gsum", "jl"] {
-        trellis
-            .apply(&format!("PAUSE TRANSFORM {target}"))
-            .await
-            .unwrap_or_else(|e| panic!("{target}: {e}"));
-    }
 }
 
 /// RESUME the 1-1, bring it live, then an update, a delete and an insert of
@@ -464,17 +450,37 @@ async fn resume_groups_and_check_the_reset(raw: &Client, trellis: &Trellis) {
 /// query's.
 async fn resume_and_write(raw: &mut Client, trellis: &Trellis, pool: &trellis::Pool) {
     resume_groups_and_check_the_reset(raw, trellis).await;
+    // The `JOIN`'s resume rebuilt both its tables, keeping its target (#1109):
+    // zero diff, and later changes on either side apply, among them a flip.
+    bring_live_only(raw, pool, "jl").await;
+    assert_oracle(raw, "the JOIN after the resume", &["jl"]).await;
+    raw.batch_execute(
+        "update public.ja set x = x + 5 where id = 1; \
+         update public.jb set y = y + 5 where id = 3; \
+         delete from public.jb where id = 3; \
+         insert into public.jb values (10, 'c', 7); \
+         delete from public.ja where id = 2; \
+         insert into public.ja values (10, 'd', 1)",
+    )
+    .await
+    .expect("join writes");
+    drain_to_quiescence(pool, raw).await;
+    assert_oracle(raw, "the JOIN after writes", &["jl"]).await;
     trellis
         .apply("RESUME TRANSFORM one")
         .await
         .expect("resume one");
     bring_live_only(raw, pool, "one").await;
-    assert_oracle(raw, "after the resume", &["one"]).await;
+    bring_live_only(raw, pool, "gsum").await;
+    assert_oracle(raw, "after the resume", &["one", "gsum"]).await;
     raw.batch_execute(
         "update public.s1 set v = 1000 where id = 1; \
          delete from public.s1 where id = 2; \
          insert into public.s1 values (10, 100); \
-         update public.s1 set v = v + 1 where id = 4",
+         update public.s1 set v = v + 1 where id = 4; \
+         update public.g set amt = amt + 1000 where id <= 2; \
+         delete from public.g where id = 3; \
+         insert into public.g values (30, 7, 5)",
     )
     .await
     .expect("writes");
@@ -482,7 +488,7 @@ async fn resume_and_write(raw: &mut Client, trellis: &Trellis, pool: &trellis::P
     assert_oracle(
         raw,
         "after writes to keys that existed before the dump",
-        &["one"],
+        &["one", "gsum"],
     )
     .await;
     // `self_check` over the restarted registry (#1219's page filter): the

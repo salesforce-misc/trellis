@@ -248,7 +248,7 @@ pub(crate) async fn backfill_definition_fenced(
 ) -> Result<(), BackfillError> {
     match &def.key_space {
         KeySpace::Join(_) => {
-            unreachable!("nothing dispatches a JOIN definition's build yet (J4, #1109)")
+            unreachable!("a JOIN is built by its plan job (staging::build), never by this dispatch")
         }
         KeySpace::OneToOne => {
             // Issue #121: the 1-1 direct build's PK-range chunking
@@ -1502,7 +1502,7 @@ pub(crate) async fn check_direct_build(
     }
     match &def.key_space {
         KeySpace::Join(_) => {
-            unreachable!("nothing dispatches a JOIN definition's build yet (J4, #1109)")
+            unreachable!("a JOIN is built by its plan job (staging::build), never by this dispatch")
         }
         KeySpace::Aggregate { .. } => {
             substituted_field_exprs(def)?;
