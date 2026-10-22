@@ -20,7 +20,9 @@
 //! - The place ([`Place`]): a 1-1 primary key and passthrough, a group-basis
 //!   `GROUP BY` key, a `JOIN`'s `ON` columns and its `GROUP BY` key. The two
 //!   `JOIN` places keep their columns in the hidden tables `P`, `M`, `J` and
-//!   `T`.
+//!   `T`. The pairing axis is [`Place::JoinOnOneSided`]: only one table's
+//!   `ON` column changes, so a catalog-only widening pauses nothing (ADR-0020
+//!   rule 6).
 //!
 //! A cell whose type the place refuses at define is skipped by [`admits`], and
 //! [`a_type_a_place_refuses_is_refused`] holds that table to the live
@@ -36,8 +38,10 @@
 //! convergence (#297).
 //!
 //! **Not in the matrix** (each is a later step of #1289, or has its own test):
-//! - the pairing axis (a one-sided widening or narrowing of an `ON` pair, a
-//!   Trellis copy against a source column): step 2;
+//! - a Trellis copy against a source column in a `JOIN`'s `ON`: a `JOIN` over
+//!   another definition's target doesn't run yet (#1100), so
+//!   [`a_trellis_copy_pairs_with_a_source_column_of_any_modifier`] holds the
+//!   define-time pairing only;
 //! - the rename row: a rename after define is `capture_type_rename.rs`'s, and
 //!   one before a baseline records it is step 3;
 //! - a `numeric` `GROUP BY` key whose scale a rewrite changes, which keeps
@@ -87,14 +91,18 @@ enum Place {
     JoinOn,
     /// A `JOIN`'s `GROUP BY` key on one table, joined on an integer.
     JoinGroupBy,
+    /// The pairing axis (ADR-0020 rule 6): a `JOIN`'s `ON` columns, of which
+    /// only the left table's column changes, so the pair is one-sided.
+    JoinOnOneSided,
 }
 
-const PLACES: [Place; 5] = [
+const PLACES: [Place; 6] = [
     Place::Passthrough,
     Place::PrimaryKey,
     Place::GroupBy,
     Place::JoinOn,
     Place::JoinGroupBy,
+    Place::JoinOnOneSided,
 ];
 
 /// One change of a type: the source column starts as `start` holding `seed`,
@@ -309,7 +317,7 @@ fn admits(place: Place, label: &str) -> bool {
         ),
         // A `JOIN` groups by its `ON` column, and a fixed-length `bit` is no
         // group key.
-        Place::JoinOn => matches!(
+        Place::JoinOn | Place::JoinOnOneSided => matches!(
             label,
             "varchar" | "varbit" | "time" | "timetz" | "timestamp" | "timestamptz"
         ),
@@ -598,6 +606,19 @@ fn scenario(place: Place, ty: &Ty, row: &Row) -> Scenario {
             oracle_sql: "select a.k::text, count(*)::bigint, sum(b.y)::bigint \
                          from public.a left join public.b on a.k = b.k group by a.k"
                 .into(),
+        },
+        // The pairing axis: the same `JOIN` as `JoinOn`, but only `a.k`
+        // changes, so the pair's two columns differ in modifier.
+        Place::JoinOnOneSided => Scenario {
+            alter_sql: alter("a", "k"),
+            // `b.k` keeps its type, so it takes the seed; `a.k` takes the
+            // value only the altered type holds.
+            hi_sql: format!(
+                "insert into public.a values (2, '{}', 2); \
+                 insert into public.b values (2, '{}', 20)",
+                row.hi, row.seed
+            ),
+            ..scenario(Place::JoinOn, ty, row)
         },
         // A `JOIN` on an integer, grouped by a `<T>` column of the left
         // table.
@@ -1019,4 +1040,194 @@ matrix! {
     interval_catalog_only: "interval", Change::CatalogOnly;
     interval_narrow: "interval", Change::Narrow;
     interval_fields_catalog_only: "interval fields", Change::CatalogOnly;
+}
+
+/// ADR-0020 rule 6, at define: a Trellis target's copy of `k` (no modifier)
+/// pairs in a `JOIN`'s `ON` with a source column of the same type however
+/// that column is modified, for every type the `ON` admits and every kind of
+/// change to the source column.
+#[tokio::test]
+async fn a_trellis_copy_pairs_with_a_source_column_of_any_modifier() {
+    trellis::dev::staging::set_group_basis(true);
+    let mut refused = Vec::new();
+    let mut tried = 0;
+    for ty in TYPES.iter().filter(|ty| admits(Place::JoinOn, ty.label)) {
+        for row in [&ty.catalog_only, &ty.rewrite, &ty.narrow]
+            .into_iter()
+            .filter_map(Option::as_ref)
+        {
+            // `b.k` as it starts, and as it is after the change.
+            for altered in [false, true] {
+                let d = Driver::start(
+                    &format!(
+                        "create table public.t (id integer primary key, k {0}, x integer); \
+                         create table public.b (id integer primary key, k {0}, y integer); \
+                         create index on public.b (k)",
+                        row.start
+                    ),
+                    &[("id", int4()), ("k", ty.value_type), ("x", int4())],
+                    &["TRANSFORM up FROM public.t SELECT k AS k, x AS x"],
+                    &["public.t"],
+                )
+                .await;
+                if altered {
+                    d.ctl
+                        .batch_execute(&format!(
+                            "alter table public.b alter column k type {}",
+                            alter_clause(row, "k")
+                        ))
+                        .await
+                        .expect("alter");
+                }
+                let trellis = facade(d.db.dsn()).await;
+                tried += 1;
+                if let Err(err) = trellis
+                    .apply(
+                        "TRANSFORM c FROM public.up LEFT JOIN public.b ON up.k = b.k \
+                         GROUP BY up.k WITHOUT SOURCE INDEX \
+                         SELECT up.k AS k, COUNT(*) AS n",
+                    )
+                    .await
+                {
+                    refused.push(format!(
+                        "{} {}, altered {altered}: {err}",
+                        ty.label, row.start
+                    ));
+                }
+                trellis.shutdown().await.expect("shutdown");
+            }
+        }
+    }
+    assert!(tried >= 20, "the loop ran {tried} cells");
+    assert_eq!(refused, Vec::<String>::new(), "a copy didn't pair");
+}
+
+/// ADR-0020 rule 6, at define: `text` and `varchar` of any bound pair, and a
+/// bound, a precision or a length never counts; another type
+/// (`integer` against `bigint`) or another collation is refused.
+#[tokio::test]
+async fn join_on_pairs_the_string_family_and_refuses_other_types_and_collations() {
+    trellis::dev::staging::set_group_basis(true);
+    let cluster = TestCluster::start();
+    let define = |left: &'static str, right: &'static str, collate: &'static str| {
+        let cluster = &cluster;
+        async move {
+            let db = cluster.create_isolated_database().await;
+            db.pool
+                .get()
+                .await
+                .expect("connection")
+                .batch_execute(&format!(
+                    "create collation public.other (provider = libc, locale = 'POSIX'); \
+                     create table public.a (id integer primary key, k {left}); \
+                     create table public.b (id integer primary key, k {right} {collate}); \
+                     create index on public.a (k); create index on public.b (k)"
+                ))
+                .await
+                .expect("source DDL");
+            let trellis = facade(db.dsn()).await;
+            let result = trellis
+                .apply(
+                    "TRANSFORM c FROM public.a JOIN public.b ON a.k = b.k \
+                     GROUP BY a.k SELECT a.k AS k, COUNT(*) AS n",
+                )
+                .await
+                .map(|_| ())
+                .map_err(|err| err.to_string());
+            trellis.shutdown().await.expect("shutdown");
+            result
+        }
+    };
+    for (left, right) in [
+        ("varchar(10)", "varchar(50)"),
+        ("text", "varchar(10)"),
+        ("varchar", "text"),
+        ("varchar(10)", "varchar"),
+        ("bit varying(5)", "bit varying(8)"),
+        ("timestamp(0)", "timestamp(3)"),
+        ("time(0)", "time"),
+    ] {
+        assert_eq!(
+            define(left, right, "").await,
+            Ok(()),
+            "{left} against {right}"
+        );
+    }
+    for (left, right, collate) in [
+        ("integer", "bigint", ""),
+        ("text", "text", "collate public.other"),
+        ("varchar(10)", "text", "collate public.other"),
+    ] {
+        let err = define(left, right, collate)
+            .await
+            .expect_err(&format!("{left} against {right} {collate}"));
+        assert!(
+            err.contains("don't match") && err.contains("a type modifier never counts"),
+            "{left} against {right} {collate}: {err}"
+        );
+    }
+}
+
+/// ADR-0020 rule 6, at run time: a `varchar(10)` key against a `varchar(50)`
+/// one and a `text` one pair without truncating either: a 12-character key
+/// matches nothing against a row of its first 10 characters, and the target
+/// equals the oracle.
+#[tokio::test]
+async fn paired_string_keys_of_different_bounds_never_truncate() {
+    trellis::dev::staging::set_group_basis(true);
+    let mut d = Driver::start(
+        "create table public.a (id integer primary key, k varchar(50), x integer); \
+         create table public.b (id integer primary key, k varchar(10), y integer); \
+         create table public.e (id integer primary key, k text, y integer); \
+         create index on public.a (k); create index on public.b (k); create index on public.e (k)",
+        &[
+            ("id", int4()),
+            ("k", ValueType::Text),
+            ("x", int4()),
+            ("y", int4()),
+        ],
+        &[
+            "TRANSFORM c FROM public.a LEFT JOIN public.b ON a.k = b.k \
+             GROUP BY a.k SELECT a.k AS k, COUNT(*) AS n, SUM(b.y) AS sy",
+            "TRANSFORM d FROM public.a LEFT JOIN public.e ON a.k = e.k \
+             GROUP BY a.k SELECT a.k AS k, COUNT(*) AS n, SUM(e.y) AS sy",
+        ],
+        &["public.a", "public.b", "public.e"],
+    )
+    .await;
+    write(
+        &d,
+        "insert into public.a values (1, 'abcdefghijkl', 1), (2, 'abcdefghij', 2); \
+         insert into public.b values (1, 'abcdefghij', 10); \
+         insert into public.e values (1, 'abcdefghij', 10), (2, 'abcdefghijkl', 20)",
+    )
+    .await;
+    d.settle().await;
+    pass(&mut d).await;
+    d.settle().await;
+    for (target, other) in [("c", "b"), ("d", "e")] {
+        let oracle = format!(
+            "select a.k::text, count(*)::bigint, sum({other}.y)::bigint \
+             from public.a left join public.{other} on a.k = {other}.k group by a.k"
+        );
+        assert_eq!(
+            diverged(
+                &d,
+                &format!("select k::text, n, sy from public.{target}"),
+                &oracle
+            )
+            .await,
+            Vec::<String>::new(),
+            "{target}"
+        );
+    }
+    assert_eq!(
+        d.rows("select k, sy from public.c order by k").await,
+        ["(abcdefghij,10)", "(abcdefghijkl,)"],
+        "the 12-character key matched nothing in the 10-character column"
+    );
+    let trellis = facade(d.db.dsn()).await;
+    assert_eq!(status_of(&trellis, "c").await, "Live");
+    assert_eq!(status_of(&trellis, "d").await, "Live");
+    trellis.shutdown().await.expect("shutdown");
 }

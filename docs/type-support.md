@@ -96,6 +96,16 @@ each to-side column read through it in that column's type. A `JOIN`
 holds its `GROUP BY` and `ON` columns in each column's type and collation, in
 its target and its hidden tables, with no modifier.
 
+Two `JOIN` `ON` columns pair when they have the same type (`text` and
+`varchar` count as one type) and the same deterministic collation. A type
+modifier never counts: a `varchar(10)` column pairs with a `varchar(50)`, a
+`text` or a Trellis target's unbounded copy of one, and a `timestamp(0)` with a
+`timestamp(3)`, because the modifier plays no part in a comparison, and the
+key lookups cast to the unbounded type, so no key is truncated. So a one-sided
+modifier change, which is routine, pauses nothing. `integer` against `bigint`
+still doesn't pair, because Trellis never casts a join key
+([ADR-0020](decisions/0020-type-identity.md)).
+
 A calculated field's column, an aggregate's or a `JOIN`'s field column and
 an aggregate ledger's contribution column (typed as the aggregate's
 argument) take the type

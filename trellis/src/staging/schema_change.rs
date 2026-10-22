@@ -736,8 +736,9 @@ pub(crate) async fn pause_readers_of_retyped(
             }
         }
 
-        // #1107: a JOIN's `ON` pairs, which define holds to one type,
-        // modifier and collation each, after a retype of this table's side
+        // #1107: a JOIN's `ON` pairs, which define holds to one type
+        // (`text` and `varchar` are one) and collation each, never a
+        // modifier (ADR-0020), after a retype of this table's side
         // (the side whose join column moved from its recorded type, so the
         // failure names the table that changed). The whole definition
         // pauses, and a resume revalidates both sides.

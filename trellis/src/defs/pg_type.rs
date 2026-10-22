@@ -335,6 +335,24 @@ impl fmt::Display for PgType {
     }
 }
 
+/// Whether `type_oid` is `text` or `varchar`: one family to Postgres, which
+/// compares both as `text` and checks a `varchar(n)`'s length only on
+/// assignment (ADR-0020, the string family of a `JOIN` `ON` pair).
+pub(crate) fn is_string_oid(type_oid: u32) -> bool {
+    matches!(type_oid, oid::TEXT | oid::VARCHAR)
+}
+
+/// Whether two columns pair in a `JOIN`'s `ON` (ADR-0020): the same type OID,
+/// or both in the string family, and the same collation. A type modifier
+/// never counts.
+pub(crate) fn columns_pair(
+    (left_oid, left_collation): (u32, u32),
+    (right_oid, right_collation): (u32, u32),
+) -> bool {
+    left_collation == right_collation
+        && (left_oid == right_oid || (is_string_oid(left_oid) && is_string_oid(right_oid)))
+}
+
 // Well-known builtin `pg_type.oid` values this registry classifies. Every
 // one of these is a fixed Postgres catalog constant (`src/include/catalog/pg_type.dat`
 // upstream), not something that varies by server version or installation.

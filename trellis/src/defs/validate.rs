@@ -152,8 +152,9 @@ pub enum ValidationError {
     /// An `ON` term pairs the same two columns as an earlier one (in either
     /// order).
     JoinOnRepeatedPair { term: String },
-    /// The two columns of an `ON` term differ in type, type modifier or
-    /// collation. Trellis never casts a join key.
+    /// The two columns of an `ON` term differ in type or collation (a type
+    /// modifier never counts, and `text` and `varchar` are one type).
+    /// Trellis never casts a join key.
     JoinKeyTypeMismatch {
         lhs: String,
         lhs_type: String,
@@ -918,7 +919,8 @@ impl fmt::Display for ValidationError {
             } => write!(
                 f,
                 "ON joins {lhs} ({lhs_type}) to {rhs} ({rhs_type}), which don't match: join \
-                 columns must have the same type, type modifier and collation, because \
+                 columns must have the same type and collation (a type modifier never \
+                 counts, and text and varchar columns pair whatever their length), because \
                  Trellis never casts a join key. Alter one column to match the other"
             ),
             ValidationError::JoinUnsupportedKeyType { reference, pg_type } => write!(
@@ -1874,9 +1876,10 @@ pub fn validate_join(
         }
         check_key_type(&term.lhs, lhs)?;
         check_key_type(&term.rhs, rhs)?;
-        if (lhs.type_oid, lhs.typmod, lhs.collation_oid)
-            != (rhs.type_oid, rhs.typmod, rhs.collation_oid)
-        {
+        if !super::pg_type::columns_pair(
+            (lhs.type_oid, lhs.collation_oid),
+            (rhs.type_oid, rhs.collation_oid),
+        ) {
             let with_collation = lhs.collation_oid != rhs.collation_oid;
             let describe = |info: &JoinColumnInfo| match (&info.collation, with_collation) {
                 (Some(collation), true) => format!("{} COLLATE \"{collation}\"", info.pg_type),
@@ -6155,23 +6158,48 @@ mod tests {
     }
 
     #[test]
-    fn join_key_modifiers_and_collations_must_match() {
-        let (mut left, mut right) = tables();
-        left.insert(
-            "v50".into(),
-            jcol(ValueType::Text, "character varying(50)", 1043, 54),
-        );
-        right.insert(
-            "v255".into(),
-            jcol(ValueType::Text, "character varying(255)", 1043, 259),
-        );
-        let def = parse_text(
-            "TRANSFORM t FROM orders JOIN items ON orders.v50 = items.v255 \
-             GROUP BY orders.region SELECT COUNT(*) AS n",
-        )
-        .unwrap();
+    fn join_key_pairing_ignores_modifiers_but_not_types_or_collations() {
+        // ADR-0020 rule 6: modifiers never count, `text` and `varchar` are
+        // one family, `integer` against `bigint` and another collation are
+        // refused.
+        let pairs = |lhs: (&str, u32, i32), rhs: (&str, u32, i32), rhs_collation: u32| {
+            let (mut left, mut right) = tables();
+            left.insert("k".into(), jcol(ValueType::Text, lhs.0, lhs.1, lhs.2));
+            let mut info = jcol(ValueType::Text, rhs.0, rhs.1, rhs.2);
+            info.collation_oid = rhs_collation;
+            right.insert("k".into(), info);
+            let def = parse_text(
+                "TRANSFORM t FROM orders JOIN items ON orders.k = items.k \
+                 GROUP BY orders.region SELECT COUNT(*) AS n",
+            )
+            .unwrap();
+            validate_join(&def, &left, &right)
+        };
+        let v50 = ("character varying(50)", 1043, 54);
+        let v255 = ("character varying(255)", 1043, 259);
+        let varchar = ("character varying", 1043, -1);
+        let text = ("text", 25, -1);
+        let default = 0;
+        for (lhs, rhs) in [
+            (v50, v255),
+            (v50, varchar),
+            (text, v50),
+            (varchar, text),
+            (
+                ("time(0) without time zone", 1083, 0),
+                ("time without time zone", 1083, -1),
+            ),
+            (("bit varying(5)", 1562, 5), ("bit varying(8)", 1562, 8)),
+        ] {
+            pairs(lhs, rhs, default).unwrap_or_else(|err| panic!("{lhs:?} against {rhs:?}: {err}"));
+        }
+        // Another type, even of one width family, or another collation.
         assert!(matches!(
-            validate_join(&def, &left, &right),
+            pairs(("integer", 23, -1), ("bigint", 20, -1), default),
+            Err(ValidationError::JoinKeyTypeMismatch { .. })
+        ));
+        assert!(matches!(
+            pairs(text, text, default + 1),
             Err(ValidationError::JoinKeyTypeMismatch { .. })
         ));
 
