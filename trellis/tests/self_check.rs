@@ -1666,9 +1666,11 @@ async fn a_re_collation_between_pages_skips_no_key_and_reports_a_missing_row() {
 /// (case-insensitive here; define refuses one, #638, but a later `alter`
 /// isn't refused). Under it, `k03` and an extra target row `K03` compare
 /// equal, so paging by it would let a page's `limit` cut between the two and
-/// the next page's `> k03` skip whichever was cut: the extra row is never
-/// compared, or `k03` is reported missing when it isn't. Distinct keys must
-/// never tie in the order the pages are read in.
+/// the next page's `> k03` skip whichever was cut. A 1-1 walk pages under
+/// the target key's collation (#1203), which the `alter` didn't touch, so the
+/// two never tie: the extra row is reported and `k03` isn't. The `"C"`
+/// fallback for a nondeterministic walk collation is tested on
+/// `staging::self_check_keyset`'s own walk.
 #[tokio::test]
 async fn a_re_collation_to_a_nondeterministic_collation_hides_no_row_at_a_page_boundary() {
     let cluster = TestCluster::start();

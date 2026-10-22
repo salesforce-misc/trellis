@@ -715,7 +715,10 @@ pub(crate) async fn findings(pool: &Pool, def: &Definition) -> Result<Findings, 
 /// cursor's cast and the ring's encoding), each collation the target key
 /// column's. Define gives the target key the source's collation and nothing
 /// re-collates it afterwards, so the walk's order holds when the source key
-/// is re-collated between pages (#1203).
+/// is re-collated between pages (#1203). The target's key columns are named
+/// as the source's (`ddl::target_table_ddl`), so they pair by name; a source
+/// key column with no namesake there was renamed since define, which pauses
+/// the transform, and keeps its own collation meanwhile.
 async fn walk_key(
     pool: &Pool,
     def: &Definition,

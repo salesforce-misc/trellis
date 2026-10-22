@@ -863,9 +863,9 @@ mod walk_tests {
             )],
         ];
         if icu {
-            // A nondeterministic source collation (a key re-collated after
-            // define, which refuses one): the walk falls back to byte order
-            // on both sides. A single not-null column, since the key text of
+            // A nondeterministic walk collation (a target's or hidden
+            // table's key re-collated by hand after define, which refuses
+            // one): the walk falls back to byte order on both sides. A single not-null column, since the key text of
             // any other (`replace`) can't be computed under one.
             shapes.push(vec![column(
                 "t",
