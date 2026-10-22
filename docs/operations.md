@@ -113,7 +113,9 @@ in place. It keeps:
 its target, its side tables and its held keys
 ([ADR-0014](decisions/0014-pause-and-drop-a-transform.md#drop-always-removes-the-associated-data)).
 It refuses a definition in any other status, and one another definition
-still reads. Defining it again builds the target from empty. Indexes and
+still reads. It first waits for any drain page still writing the definition
+that was planned before the pause. Defining it again builds the target from
+empty. Indexes and
 grants on the target go with it, so give readers `SELECT` through default
 privileges
 ([recommendations](recommendations.md#application-roles-read-targets-and-nothing-else)).

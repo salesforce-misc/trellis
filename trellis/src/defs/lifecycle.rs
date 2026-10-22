@@ -482,20 +482,16 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
     // below. The bump waits for every page holding the fence `for share`
     // (Phase 3 holds it to its commit), and a page that reaches the fence
     // after this commit misses it and plans again, without the definition.
-    // The names are read without a lock and bumped in name order, so two
-    // drops that share a source take the fences in one order.
+    // A `JOIN` reads two tables, and a page of either may have planned it
+    // (#1107). The names are read without a lock and bumped in table-name
+    // order, the order every taker of two fences takes them in.
     let mut fences: Vec<String> = txn
         .query(
             &format!(
-                "select t.source_table from transform_definitions t where {m} \
-                 union \
-                 select f.table_name \
-                 from transform_definitions t \
-                 join schema_nodes n on n.table_name = t.target_table \
-                 join schema_edges e on e.to_node_id = n.id and e.kind = 'join' \
-                 join schema_nodes f on f.id = e.from_node_id \
-                 where {m}",
-                m = super::catalog::target_match_sql("t.target_table", 1),
+                "select distinct f from transform_definitions, \
+                     unnest(array[source_table, join_table]) f \
+                 where f is not null and {}",
+                super::catalog::target_match_sql("target_table", 1),
             ),
             &[&target],
         )
@@ -503,7 +499,7 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
         .into_iter()
         .map(|row| row.get(0))
         .collect();
-    fences.sort();
+    fences.sort_unstable();
     for source in &fences {
         crate::staging::build::bump_version_fence(&*txn, source).await?;
     }

@@ -846,3 +846,72 @@ async fn a_pause_and_drop_of_a_reader_wait_for_a_page_that_planned_it() {
     );
     assert_equal(&mut d, AGG, ORACLE).await;
 }
+
+/// A `PAUSE` and a `DROP` of a 1-1 definition while a page that planned it
+/// is in flight (#1291). The page writes its 1-1 targets in name order and
+/// queues on a row of `a1` before it reaches `m`, so it holds no lock on `m`
+/// yet, only its source's fence from its plan. The drop waits for the page,
+/// which commits, and nothing is charged.
+#[tokio::test]
+async fn a_pause_and_drop_of_a_one_to_one_wait_for_a_page_that_planned_it() {
+    let mut d = start(
+        "TRANSFORM a1 FROM public.src SELECT g AS g, v AS w",
+        "TRANSFORM m FROM public.src SELECT g AS g, v AS w",
+        &src_columns(),
+        0,
+    )
+    .await;
+    const A1: &str = "select id, g, w from public.a1 order by id";
+    const ORACLE: &str = "select id, g, v from public.src order by id";
+    step(
+        &mut d,
+        "insert into public.src values (1, 1, 0, 5), (2, 2, 0, 7)",
+    )
+    .await;
+    write(&d, "update public.src set v = 9 where id = 2").await;
+    let batch = d.seal().await;
+    // Another transaction holds `a1`'s row 2, so the page queues on it with
+    // its plan already loaded and `m` not yet written.
+    let holder = d.user().await;
+    holder
+        .batch_execute("begin; select 1 from public.a1 where id = 2 for update")
+        .await
+        .expect("hold row 2");
+    let page = d.drain_frozen(batch, "page", &[]).await;
+    d.wait_blocked(1).await;
+
+    let t = trellis::Trellis::connect(
+        trellis::config::Config::from_dsn(d.db.dsn().to_string()).expect("valid dsn"),
+        trellis::TrellisOptions::default(),
+    )
+    .await
+    .expect("connect a Trellis");
+    t.apply("PAUSE TRANSFORM m").await.expect("pause");
+    let mut dropping = tokio::spawn(async move {
+        t.apply("DROP TRANSFORM m").await.expect("drop");
+    });
+    // The drop queues on the page's fence, or, without one, completes.
+    tokio::select! {
+        () = d.wait_blocked(2) => {}
+        _ = &mut dropping => {}
+    }
+    assert!(
+        !dropping.is_finished(),
+        "the drop waits for the page in flight"
+    );
+    holder.batch_execute("commit").await.expect("release");
+    let outcome = page.finish_result().await.expect("the page applies");
+    assert!(outcome.is_some(), "the page committed");
+    dropping.await.expect("the drop's task");
+    assert_eq!(
+        d.rows(
+            "select (select count(*) from drain_holdups), (select count(*) from poison), \
+                    (select count(*) from key_deaths), (select count(*) from capture_failures), \
+                    to_regclass('public.m') is null"
+        )
+        .await,
+        ["(0,0,0,0,t)"],
+        "the page failed no one"
+    );
+    assert_equal(&mut d, A1, ORACLE).await;
+}
