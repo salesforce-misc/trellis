@@ -1042,9 +1042,9 @@ async fn a_reader_build_over_null_part_keys_with_writes_around_it() {
         !page.is_finished(),
         "the seam page waits for the build's lock"
     );
-    // Left in the active segment: the build's open transaction holds the
-    // seal of a later one.
-    write(&d, "update public.src set v = 6 where id = 3").await;
+    // A write to a `NULL`-part row left in the active segment: the build's
+    // open transaction holds the seal of a later one.
+    write(&d, "update public.src set v = 6 where id = 4").await;
     d.release(&mut building, PausePoint::AfterRebuildLock).await;
     building.finish().await;
     page.finish().await;
@@ -1062,7 +1062,7 @@ async fn a_reader_build_over_null_part_keys_with_writes_around_it() {
     )
     .await;
     assert_equal(&mut d, ROLL_ACTUAL, ROLL_ORACLE).await;
-    assert_eq!(d.rows(ROLL_ACTUAL).await, ["(5,36,2)", "(,35,3)"]);
+    assert_eq!(d.rows(ROLL_ACTUAL).await, ["(5,37,2)", "(,35,3)"]);
 }
 
 /// A write to a `NULL`-part group committed before the reader was defined,
@@ -1143,4 +1143,37 @@ async fn upstream_truncates_across_a_reader_build_over_null_part_keys() {
     .await;
     assert_equal(&mut d, ROLL_ACTUAL, ROLL_ORACLE).await;
     assert_eq!(d.rows(ROLL_ACTUAL).await, ["(,6,1)"]);
+}
+
+/// An insert of a `NULL`-part row from before an upstream source `TRUNCATE`,
+/// its upstream page run only after the truncate's and after the reader's
+/// build over the cleared upstream target: the upstream's truncate floor
+/// refuses it, so neither the upstream nor the reader counts a row the
+/// truncate removed.
+#[tokio::test]
+async fn a_change_from_before_an_upstream_truncate_is_refused_after_the_build() {
+    let mut d = seeded_upstream().await;
+    write(&d, "insert into public.src values (7, null, 5, 30)").await;
+    let before = d.seal().await;
+    write(
+        &d,
+        "truncate public.src; insert into public.src values (6, null, null, 9)",
+    )
+    .await;
+    let truncate = d.seal().await;
+    d.drain(truncate, "truncate").await;
+    define_roll(&d).await;
+    let building = build_frozen(&d, &[]).await;
+    building.finish().await;
+    assert_roll_finished(&d).await;
+    assert_eq!(d.rows(ROLL_ACTUAL).await, ["(,9,1)"]);
+    d.drain(before, "before").await;
+    assert_equal(
+        &mut d,
+        "select g, h, total, n from public.up order by g, h",
+        "select g, h, sum(v), count(*) from public.src group by g, h order by g, h",
+    )
+    .await;
+    assert_equal(&mut d, ROLL_ACTUAL, ROLL_ORACLE).await;
+    assert_eq!(d.rows(ROLL_ACTUAL).await, ["(,9,1)"]);
 }
