@@ -89,9 +89,6 @@ const SAMPLE: Duration = Duration::from_millis(100);
 /// Postgres flushes a backend's statistics about once a second; wait this
 /// long after a build before reading `temp_bytes`.
 const STATS_FLUSH: Duration = Duration::from_millis(1_500);
-/// The longest a `request_backfill` may take to show up as a target leaving
-/// `live`.
-const REQUEST_VISIBLE: Duration = Duration::from_secs(60);
 
 /// Fact ids `1..=facts` as `(lo, hi)` ranges of at most `chunk` ids.
 pub(super) fn chunk_ranges(facts: i64, chunk: i64) -> Vec<(i64, i64)> {
@@ -132,15 +129,20 @@ impl SeedStats {
     }
 }
 
-/// The indexes (and keys) built after the load, one statement each.
+/// The indexes (and keys) built after the load, each on a connection of its
+/// own. A key is built as a unique index and then attached: `ADD PRIMARY KEY`
+/// would take an `ACCESS EXCLUSIVE` lock for its whole build and serialize the
+/// table's other index builds behind it.
 fn index_statements(variant: Variant) -> Vec<&'static str> {
     let mut out = vec![
-        "alter table public.a add primary key (id)",
+        "create unique index a_pkey on public.a (id); \
+         alter table public.a add constraint a_pkey primary key using index a_pkey",
         "create index on public.a (k)",
     ];
     if variant == Variant::B0 {
         out.extend([
-            "alter table public.a0 add primary key (id)",
+            "create unique index a0_pkey on public.a0 (id); \
+             alter table public.a0 add constraint a0_pkey primary key using index a0_pkey",
             "create index on public.a0 (k)",
             "create index on public.a0 (gb)",
             "create index on public.a0 (day, gb)",
@@ -463,8 +465,8 @@ impl VariantDb {
     }
 
     /// Rebuilds in place: every source table by `request_backfill`, then
-    /// every target by `PAUSE` and `RESUME`. A rebuild that never showed as
-    /// leaving `live` is pushed to `failures`: its time would be garbage.
+    /// every target by `PAUSE` and `RESUME`. A request that took no rebuild
+    /// is pushed to `failures`: its time would be garbage.
     pub async fn rebuild_all(
         &self,
         cfg: &JoinBench,
@@ -479,14 +481,15 @@ impl VariantDb {
         let all = self.targets.join(",");
         let mut out = Vec::new();
         for table in self.rebuild_sources() {
+            let before = self.definition_versions().await;
             let probe = BuildProbe::start(&self.db, &self.raw).await;
             trellis
                 .request_backfill(&format!("public.{table}"))
                 .await
                 .unwrap_or_else(|e| panic!("request a rebuild of {table}: {e:?}"));
-            if !self.wait_rebuilt(cfg.build_timeout).await {
+            if !self.wait_rebuilt(&before, cfg.build_timeout).await {
                 failures.push(format!(
-                    "{}: the rebuild of {table} never showed as leaving live",
+                    "{}: the request to rebuild {table} took no rebuild",
                     self.variant.name()
                 ));
             }
@@ -514,32 +517,34 @@ impl VariantDb {
         out
     }
 
-    /// After a rebuild was requested: waits for a target to leave `live`,
-    /// then for every target to be `live` again. `false` if none left.
-    async fn wait_rebuilt(&self, timeout: Duration) -> bool {
+    /// Each definition's row version (`xmin`): a request that takes a
+    /// rebuild rewrites the row (`status` to `backfilling`, its build
+    /// segment), and so does the build going `live` again.
+    async fn definition_versions(&self) -> Vec<(i64, String)> {
+        self.raw
+            .query(
+                "select id, xmin::text from transform_definitions order by id",
+                &[],
+            )
+            .await
+            .expect("read definition versions")
+            .iter()
+            .map(|r| (r.get(0), r.get(1)))
+            .collect()
+    }
+
+    /// After a rebuild was requested: whether it took one (some definition's
+    /// row changed since `before`, read before the request), then waits for
+    /// every target to be `live` again. Comparing row versions rather than
+    /// polling for a status other than `live` can't miss a rebuild that
+    /// finished before the first poll.
+    async fn wait_rebuilt(&self, before: &[(i64, String)], timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
-        let visible_by = Instant::now() + REQUEST_VISIBLE.min(timeout);
-        let mut left = false;
-        while Instant::now() < visible_by {
-            let not_live: i64 = self
-                .raw
-                .query_one(
-                    "select count(*) from transform_definitions where status <> 'live'",
-                    &[],
-                )
-                .await
-                .expect("read statuses")
-                .get(0);
-            if not_live > 0 {
-                left = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        let took = self.definition_versions().await != before;
         for target in &self.targets {
             wait_for_live(&self.raw, target, deadline).await;
         }
-        left
+        took
     }
 }
 
