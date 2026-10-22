@@ -42,12 +42,26 @@
 //! `cargo test -p generative --test join_convergence -- --ignored`
 //! (`PROPTEST_CASES` sets the case count, 16 by default).
 //!
-//! # What it does not draw yet
+//! # Builds over rows
 //!
-//! - Rows written before a definition exists, a mid-run install, a pause
-//!   and resume, or a re-read: a `JOIN` builds only over two empty tables
-//!   until J4 (#1109), so every definition is installed up front and the run
-//!   waits for it to go `live` before its first op.
+//! A definition is installed up front or part way through the stream, so most
+//! `JOIN`s build (per-side steps and the final `T` step, #1109) over tables
+//! that hold rows, or that the lanes are still writing. Later bursts pause
+//! and resume a definition (the resume rebuilds its target in place) and
+//! re-read `ja` or `jb` (`request_backfill`), while the lanes keep writing
+//! both tables. About a quarter of the cases first settle the up-front
+//! definitions over the empty tables, as the tier did before it drew builds.
+//! The oracle is the same per-burst comparison with the definition's own
+//! query, so a build that lost or doubled a row diverges at the burst it ran
+//! in, and a definition a build left paused, halted or quarantined fails the
+//! end check. The coverage report's `builds` lines count, per run, the
+//! installs, resumes and re-reads that fired over rows left by earlier
+//! bursts (so the build certainly read rows), the ones that fired in a burst
+//! whose own writes were still landing, and the cases that drew none of
+//! either; a run with none over rows has drawn nothing worth reading.
+//!
+//! Not drawn: partitioned sides, `DDL` between a build's steps, and
+//! definitions that read another's target.
 //!
 //! Every definition here runs behind the group-basis dev knob, which this
 //! binary turns on before its first client starts: a `JOIN` applies only
@@ -58,8 +72,9 @@
 
 use generative::backend::{Backend, ManualBackend};
 use generative::generate::join::{
-    JoinCase, JoinDefSpec, JoinField, JoinGroups, JoinKey, JoinOpDraw, JoinOpKind, KeyShape,
-    join_case, join_case_strategy,
+    BuildCoverage, JoinActionDraw, JoinActionKind, JoinBuildDraws, JoinCase, JoinDefSpec,
+    JoinField, JoinGroups, JoinKey, JoinOpDraw, JoinOpKind, KeyShape, build_coverage, join_case,
+    join_case_strategy,
 };
 use generative::model::Op;
 use generative::run::{RunError, check_program, run_convergence_concurrent};
@@ -77,6 +92,11 @@ struct JoinCoverage {
     from_ops: usize,
     joined_ops: usize,
     truncates: usize,
+    builds: BuildCoverage,
+    /// Cases with at least one build over rows from earlier bursts.
+    cases_building_over_rows: usize,
+    /// Cases that settled their up-front definitions over empty tables.
+    cases_settled: usize,
     coverage: generative::run::Coverage,
 }
 
@@ -118,6 +138,10 @@ impl JoinCoverage {
                 self.from_ops += 1;
             }
         }
+        let builds = build_coverage(&case.program, &case.plan);
+        self.cases_building_over_rows += usize::from(builds.builds_over_rows() > 0);
+        self.cases_settled += usize::from(case.plan.settle_after_install);
+        self.builds.add(&builds);
         self.coverage.record_program(&case.program);
         self.coverage
             .record_concurrent_plan(&case.program, &case.plan);
@@ -133,6 +157,30 @@ impl std::fmt::Display for JoinCoverage {
             f,
             "ops: {} on ja, {} on jb, {} of them truncates",
             self.from_ops, self.joined_ops, self.truncates
+        )?;
+        let b = &self.builds;
+        writeln!(
+            f,
+            "builds: {} of {} cases build over rows from earlier bursts, {} settled their \
+             up-front definitions first",
+            self.cases_building_over_rows, self.cases, self.cases_settled
+        )?;
+        writeln!(
+            f,
+            "builds: installs after the first op {} ({} over rows, {} racing their burst's \
+             writes)",
+            b.deferred_installs, b.installs_over_rows, b.installs_racing
+        )?;
+        writeln!(
+            f,
+            "builds: pauses {}, resumes {} ({} over rows), re-reads {} of ja and {} of jb \
+             ({} over rows)",
+            b.pauses,
+            b.resumes,
+            b.resumes_over_rows,
+            b.rebuilds_from,
+            b.rebuilds_joined,
+            b.rebuilds_over_rows
         )?;
         write!(f, "{}", self.coverage)
     }
@@ -253,8 +301,10 @@ proptest! {
 /// A small hand-built case: a `LEFT` S1 on `k` and an `INNER` S2 on `(t,
 /// k)`, both tables written, rows moved between keys and groups, keys
 /// matched and unmatched, each table truncated once mid-stream, over two
-/// lanes and two workers.
-fn hand_built_case() -> JoinCase {
+/// lanes and two workers. With `builds`, the S1 installs part way through
+/// the first burst's successor, over rows, and the last burst pauses and
+/// resumes it and re-reads both tables.
+fn hand_built_case(with_builds: bool) -> JoinCase {
     let specs = [
         JoinDefSpec {
             left: true,
@@ -289,12 +339,56 @@ fn hand_built_case() -> JoinCase {
             columns: i % 16,
         });
     }
-    join_case(&specs, KeyShape::Spread, &draws, 16, 2, 2, 50)
+    let action = |kind, target| JoinActionDraw {
+        kind,
+        burst: 1,
+        target,
+        start: 200,
+        span: 400,
+    };
+    let builds = if with_builds {
+        JoinBuildDraws {
+            installs: vec![400, 0],
+            actions: vec![
+                action(JoinActionKind::PauseResume, 0),
+                action(JoinActionKind::PauseResume, 1),
+                action(JoinActionKind::RebuildFrom, 0),
+                action(JoinActionKind::RebuildJoined, 0),
+            ],
+            settle_after_install: false,
+        }
+    } else {
+        JoinBuildDraws {
+            settle_after_install: true,
+            ..JoinBuildDraws::default()
+        }
+    };
+    join_case(&specs, KeyShape::Spread, &draws, &builds, 16, 2, 2, 50)
 }
 
+/// The empty-table path: both definitions install up front and settle over
+/// the empty tables before the first write.
 #[test]
 fn a_hand_built_join_case_converges() {
-    let case = hand_built_case();
+    let case = hand_built_case(false);
+    if let Err(message) = run_case(&case) {
+        panic!("{message}");
+    }
+}
+
+/// The build path: a definition installs over rows, then is paused and
+/// resumed (rebuilt in place) and both tables are re-read while the lanes
+/// write. The case must draw builds over rows, or it tests nothing.
+#[test]
+fn a_hand_built_join_case_builds_over_rows_and_converges() {
+    let case = hand_built_case(true);
+    let builds = build_coverage(&case.program, &case.plan);
+    assert!(builds.installs_over_rows >= 1, "{builds:?}");
+    assert!(builds.resumes_over_rows >= 1, "{builds:?}");
+    assert!(
+        builds.rebuilds_from >= 1 && builds.rebuilds_joined >= 1,
+        "{builds:?}"
+    );
     if let Err(message) = run_case(&case) {
         panic!("{message}");
     }
@@ -304,7 +398,7 @@ fn a_hand_built_join_case_converges() {
 /// converged run, one target cell changed by hand, now diverges.
 #[test]
 fn the_join_oracle_catches_a_corrupted_target() {
-    let case = hand_built_case();
+    let case = hand_built_case(false);
     HARNESS.with(|h| {
         h.runtime.block_on(async {
             let db = h.cluster.create_isolated_database().await;

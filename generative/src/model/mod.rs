@@ -442,10 +442,10 @@ pub struct ConcurrentPlan {
     /// burst flat out (#720, #725).
     pub steady_load: Option<SteadyLoad>,
     /// Whether the run waits, after installing, for every definition to
-    /// settle before the first burst's first op. The JOIN tier (#1113) sets
-    /// it: until the `JOIN` build (#1109), a `JOIN` goes `live` only over two
-    /// empty tables, so a write that lands before then pauses it. Every
-    /// other tier leaves it off, so its builds race the first burst.
+    /// settle before the first burst's first op. The JOIN tier (#1113) draws
+    /// it for some cases, so their up-front definitions build over empty
+    /// tables; the others race the first burst. Every other tier leaves it
+    /// off.
     pub settle_after_install: bool,
 }
 
