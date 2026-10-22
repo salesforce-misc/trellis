@@ -61,13 +61,12 @@ would break a stored definition, which is stored as text and re-parsed.
   the tuple of join columns, in `ON` order. A row with a `NULL` in any join-key
   column never matches, so a `LEFT` row with no match lands in the group with a
   `NULL` `gb`.
-- **Join-key types.** Each column pair has the same type (or both are strings)
-  and the same deterministic collation, with no casting or widening, from the
-  same set of text-stable types any join key admits, so that grouping by the
-  key and joining on it agree on equality. Modifiers never count
-  ([ADR-0020](0020-type-identity.md) extends this). A retype of one side to
-  another type or collation pauses the transform until the other side
-  matches.
+- **Join-key types.** Each column pair has the same type (`text` and `varchar`
+  count as one) and the same deterministic collation, with no casting or
+  widening, from the same set of text-stable types any join key admits, so
+  that grouping by the key and joining on it agree on equality. Modifiers never
+  count ([ADR-0020](0020-type-identity.md) extends this). A retype of one side
+  to another type pauses the transform until the other side matches.
 - **Cardinality.** The join may be many-to-many: `b`'s join key needn't be
   unique, and `M` counts multiplicity, so the results match SQL's fan-out.
 - **`GROUP BY`.** Required, with at least one key, from either side. Each key

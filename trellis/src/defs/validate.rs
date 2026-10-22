@@ -6190,12 +6190,20 @@ mod tests {
                 ("time without time zone", 1083, -1),
             ),
             (("bit varying(5)", 1562, 5), ("bit varying(8)", 1562, 8)),
+            // Two lengths of `bit` never hold equal values, so they pair and
+            // match nothing (ADR-0020 rule 6 over #1261 rule 5).
+            (("bit(5)", 1560, 5), ("bit(8)", 1560, 8)),
+            (("bit(5)", 1560, 5), ("\"bit\"", 1560, -1)),
         ] {
             pairs(lhs, rhs, default).unwrap_or_else(|err| panic!("{lhs:?} against {rhs:?}: {err}"));
         }
         // Another type, even of one width family, or another collation.
         assert!(matches!(
             pairs(("integer", 23, -1), ("bigint", 20, -1), default),
+            Err(ValidationError::JoinKeyTypeMismatch { .. })
+        ));
+        assert!(matches!(
+            pairs(("bit(5)", 1560, 5), ("bit varying(5)", 1562, 5), default),
             Err(ValidationError::JoinKeyTypeMismatch { .. })
         ));
         assert!(matches!(

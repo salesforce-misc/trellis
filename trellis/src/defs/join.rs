@@ -370,8 +370,9 @@ pub(crate) fn hidden_tables_ddl(
             body.join(", ")
         ));
     }
-    // `J` keys on the `FROM` side's join key columns; each pair has one type,
-    // modifier and collation (define checks it), so either side's would do.
+    // `J` keys on the `FROM` side's join key columns; each pair has one type
+    // (`text` and `varchar` are one) and collation (define checks it), and a
+    // copy has no modifier, so either side's would do.
     let key = join_key(def, Side::From);
     let mut body: Vec<String> = key.iter().map(|c| typed(from, c)).collect();
     body.push("__matches bigint not null default 0".to_string());

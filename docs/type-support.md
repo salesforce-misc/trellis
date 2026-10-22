@@ -101,9 +101,10 @@ Two `JOIN` `ON` columns pair when they have the same type (`text` and
 modifier never counts: a `varchar(10)` column pairs with a `varchar(50)`, a
 `text` or a Trellis target's unbounded copy of one, and a `timestamp(0)` with a
 `timestamp(3)`, because the modifier plays no part in a comparison, and the
-key lookups cast to the unbounded type, so no key is truncated. So a one-sided
-modifier change, which is routine, pauses nothing. `integer` against `bigint`
-still doesn't pair, because Trellis never casts a join key
+key lookups cast to the unbounded type, so no key is truncated. So widening
+one side's modifier, which is routine, pauses nothing; a narrowing that
+re-renders the stored keys pauses as any key column's does. `integer` against
+`bigint` doesn't pair, because Trellis never casts a join key
 ([ADR-0020](decisions/0020-type-identity.md)).
 
 A calculated field's column, an aggregate's or a `JOIN`'s field column and
