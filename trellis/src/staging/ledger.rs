@@ -1494,29 +1494,37 @@ pub(super) fn sweep_statement(plan: &LedgerTargetPlan, nulls: &[bool]) -> String
     )
 }
 
-/// The statement that retires every live entry of the ledger (#1324;
-/// called from [`super::build::retire_ledger`]): [`sweep_statement`] for
-/// every key whose entry is live, each read as a key with no row, never
-/// decoded against the source's key. Each entry becomes a tombstone and its
-/// group sheds it through the group deltas, as a key deleted while the
-/// definition was frozen does. For a ledger keyed under a key the source no
-/// longer has, whose keys name no row of the table now at the name. Binds
-/// nothing.
+/// The statement that retires the live entries of the keys `$1` (`text[]`)
+/// (#1324; called from [`super::build::retire_ledger`]): [`sweep_statement`]
+/// with each key read as a key with no row, never decoded against the
+/// source's key. Each entry becomes a tombstone and its group sheds it
+/// through the group deltas, as a key deleted while the definition was
+/// frozen does. For a ledger keyed under a key the source no longer has,
+/// whose keys name no row of the table now at the name. Returns what
+/// [`sweep_statement`] does.
 pub(super) fn retire_statement(plan: &LedgerTargetPlan) -> String {
-    let live = format!(
-        "array(select {key} from {ledger} where {member} and not {tombstone})",
-        key = quote_ident(schema::KEY_COLUMN),
-        ledger = plan.ledger_ident,
-        member = quote_ident(schema::MEMBER_COLUMN),
-        tombstone = quote_ident(schema::TOMBSTONE_COLUMN),
-    );
     rederive_statement(
         plan,
         SourceRead::Probed {
-            keys_from: format!("unnest({live}) as u(__k)"),
+            keys_from: "unnest($1::text[]) as u(__k)".to_string(),
             on: "false".to_string(),
         },
-        &live,
+        "$1",
+    )
+}
+
+/// The statement that reads the next batch of [`retire_statement`]'s keys:
+/// up to `$2` live entries of the ledger after the key `$1` (all of them from
+/// the first with `NULL`), in key order, as one `text[]`.
+pub(super) fn retire_keys_statement(plan: &LedgerTargetPlan) -> String {
+    let key = quote_ident(schema::KEY_COLUMN);
+    format!(
+        "select array(select {key} from {ledger} \
+             where {member} and not {tombstone} and ($1::text is null or {key} > $1) \
+             order by {key} limit $2)",
+        ledger = plan.ledger_ident,
+        member = quote_ident(schema::MEMBER_COLUMN),
+        tombstone = quote_ident(schema::TOMBSTONE_COLUMN),
     )
 }
 

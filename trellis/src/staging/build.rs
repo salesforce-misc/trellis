@@ -1179,6 +1179,9 @@ fn buildable_shape(definition: &Definition) -> Option<ledger::LedgerShape> {
     shape_of(&definition.def, &definition.source_columns)
 }
 
+/// The live entries [`retire_ledger`] retires per statement.
+const RETIRE_BATCH: i64 = 10_000;
+
 /// Retires every live entry of `definition`'s ledger, in a resume's `txn`
 /// (#1324): each becomes a tombstone, read as a key with no row
 /// ([`ledger::retire_statement`]), and its group sheds it through the group
@@ -1211,10 +1214,32 @@ pub(crate) async fn retire_ledger(
         identity,
         shape,
     );
-    let row = ledger::query_one_by_entry_key(txn, &ledger::retire_statement(&plan), &[]).await?;
+    // In batches of [`RETIRE_BATCH`] keys, so no statement's key array grows
+    // with the ledger, as a sweep's batches don't (F-A8).
+    let (read, retire) = (
+        ledger::retire_keys_statement(&plan),
+        ledger::retire_statement(&plan),
+    );
+    let mut cursor: Option<String> = None;
+    let mut retired: i64 = 0;
+    loop {
+        let keys: Vec<String> = txn
+            .query_one(&read, &[&cursor, &RETIRE_BATCH])
+            .await?
+            .get(0);
+        let Some(last) = keys.last().cloned() else {
+            break;
+        };
+        let row = ledger::query_one_by_entry_key(txn, &retire, &[&keys]).await?;
+        retired += row.get::<_, i64>(0);
+        if keys.len() < RETIRE_BATCH as usize {
+            break;
+        }
+        cursor = Some(last);
+    }
     crate::instance_log::info!(
         target = %definition.target_table,
-        retired = row.get::<_, i64>(0),
+        retired,
         "the source's key changed while the definition was paused; its ledger entries \
          are retired and the rebuild re-derives every row"
     );

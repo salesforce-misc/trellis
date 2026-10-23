@@ -152,10 +152,11 @@ Its resume starts a Re-derive build over the existing entries with no
 truncate, plus a **sweep** that re-derives each live entry no chunk did,
 which is a key deleted while the definition was frozen, and, for a 1-1
 target, each target row with no live entry, which is one added or re-keyed by
-hand. An aggregate whose source's primary key is no longer the one its ledger
-is keyed under (the table dropped and created again with another key, such
-as a plain table converted to a partitioned one, or its key constraint
-replaced) keeps none of its entries: the resume retires each as a key with no
+hand. An aggregate whose source's key columns, by name and in key order, are
+no longer the ones recorded at define or at its last resume (the table dropped
+and created again with another key, such as a plain table converted to a
+partitioned one, its key constraint replaced, or a key column renamed) keeps
+none of its entries: the resume retires each, in batches, as a key with no
 row, its groups shed them through the deltas, and the build re-derives every
 row of the table now at the name, so no key stored under the old key is
 decoded against the new one. A 1-1 target, keyed by the source's key, refuses
