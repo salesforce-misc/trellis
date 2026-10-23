@@ -1792,8 +1792,17 @@ pub(crate) fn validate_aggregate_admitted(
         .iter()
         .map(|(name, info)| (name.clone(), info.value_type))
         .collect();
+    // Each field with the calculated fields it reads by name substituted, as
+    // the group basis routes it: an argument that names a grouped calculated
+    // field (`(qty + 1) AS q, SUM(q)`) is typed as that field's expression,
+    // not as an unknown column. A definition substitution can't take is
+    // refused by `validate` already.
+    let Ok(substituted) = super::backfill::substituted_field_exprs(def) else {
+        return Ok(());
+    };
     for field in &def.fields {
-        check_aggregate_calls(&field.expr, columns, &value_types)?;
+        let expr = substituted.get(&field.name).unwrap_or(&field.expr);
+        check_aggregate_calls(expr, columns, &value_types)?;
     }
     Ok(())
 }
@@ -6218,6 +6227,33 @@ mod tests {
             "SUM(qty + order_id) AS s, COALESCE(SUM(cost), 0) + COUNT(*) AS c",
         ] {
             if let Err(err) = check(fields) {
+                panic!("{fields}: {err:?}");
+            }
+        }
+        // An argument that names a calculated field is typed as that field's
+        // expression: an integer one is admitted, a float one is refused by
+        // family. (This check doesn't look at `GROUP BY`; `validate` refuses
+        // a calculated field over an ungrouped column.)
+        let grouped = |fields: &str| {
+            let def = parse_text(&format!(
+                "TRANSFORM t FROM items GROUP BY sku, qty \
+                 SELECT sku AS sku, qty AS qty, {fields}"
+            ))
+            .unwrap_or_else(|e| panic!("{fields}: {e}"));
+            validate_aggregate_admitted(&def, &items)
+        };
+        assert!(
+            matches!(
+                grouped("(weight + weight) AS w2, SUM(w2) AS s"),
+                Err(ValidationError::DeferredAggregate { issue: 1119, .. })
+            ),
+            "a float calculated field's SUM"
+        );
+        for fields in [
+            "(qty + 1) AS q, SUM(q) AS s",
+            "(qty + qty) AS q, COUNT(*) AS n, AVG(q) AS a",
+        ] {
+            if let Err(err) = grouped(fields) {
                 panic!("{fields}: {err:?}");
             }
         }
