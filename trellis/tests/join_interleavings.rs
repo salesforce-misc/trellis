@@ -24,14 +24,34 @@
 //! not its `t`; on the single-column key the decoys sit on a key of their
 //! own, so they never keep a scenario's key matched.
 //!
-//! A test is named for the J1 family it ports (`family1_…` to
-//! `family14_…`). Family 8's recompute is an image-less change's page, and
-//! a held key's release is the same recompute in a transaction of its own
-//! (`a_release_takes_the_j_lock_against_the_other_sides_pages`). Family 9's
-//! chunked builds are the engine's builds: `family9_…` writes on both sides
-//! of one build, and the tests from "the build" on cover one side's writes
-//! (`build_pages_around_a_build_…`), the lock statements and the steps of
-//! a build with a partitioned side.
+//! A test is named for the J1 family it ports:
+//!
+//! - 1, a fact write against a dimension row moving groups: `family1_…`.
+//! - 2, matched/unmatched flips and a key's first sight: `family2_…`.
+//! - 3, two dimension pages on one key: `family3_…`.
+//! - 4 and 5, duplicate dimension rows and `NULL` keys and values:
+//!   `families4_5_…` and `a_null_key_takes_no_j_row_or_lock`.
+//! - 6, key changes, sorted `J` locks and deadlock probes: `family6_…`.
+//! - 7, out-of-order pages: `family7_out_of_order_pages`.
+//! - 8, a `P` or `M` cell's recompute against a page of the other side:
+//!   `family8_…`. The recompute is an image-less change's page; a held
+//!   key's release is the same recompute in a transaction of its own
+//!   (`a_release_takes_the_j_lock_against_the_other_sides_pages`).
+//! - 9, chunked builds of `P` and `M` under writes: `family9_…`. The engine
+//!   builds both sides in one transaction, in a fixed order, or per side and
+//!   leaf when a side is partitioned, so J1's permuted chunk orders and its
+//!   chunk-against-chunk races have no counterpart. `family9_…` races pages
+//!   of both sides against a build frozen at each point, a build against a
+//!   page frozen at each point, and recomputes between two steps of a
+//!   build; the tests from "the build" on cover one side's writes
+//!   (`build_pages_around_a_build_…`), the lock statements and the steps of
+//!   a build with a partitioned side.
+//! - 10, `TRUNCATE` of either side: `family10_…`.
+//! - 11, savepoints, rolled-back sources and two-phase commit:
+//!   `family11_…` and `a_j_row_inserted_by_a_rolled_back_page_leaves_nothing`.
+//! - 12, mixed pages: `family12_…`.
+//! - 13, tombstone collection before stale pages drain: `family13_…`.
+//! - 14, `T` in the page's own transaction: `family14_…`.
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
@@ -448,8 +468,8 @@ impl Lab {
 
     /// Whether `other` queued behind backend `pid` (`true`) or ran to its
     /// end (`false`). Both are states the scenario forced; this only waits
-    /// for the second drain to reach one of them.
-    async fn queued_or_done(&self, other: &RunningDrain, pid: i32) -> bool {
+    /// for the second drain (or build) to reach one of them.
+    async fn queued_or_done<T>(&self, other: &drain_driver::Running<T>, pid: i32) -> bool {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             if other.is_finished() {
@@ -1108,6 +1128,51 @@ async fn family11_savepoints_and_rolled_back_sources() {
         ["(1,1)"],
         "the rolled-back key has no J row"
     );
+}
+
+/// J1 family 11's two-phase commit: a source transaction that changes both
+/// sides of a key is prepared, then committed or rolled back, with or
+/// without a recompute of the key's cells (image-less changes, drained)
+/// while it is prepared. The prepared transaction is in progress in the
+/// recompute's snapshot, so the recompute's basis doesn't count it, and its
+/// pages apply once it commits; rolled back, it leaves nothing.
+#[tokio::test]
+async fn family11_two_phase_commit() {
+    const PREPARED: &str = "insert into public.a values ({id} + 5, {g3}, {k}, 5); \
+                            update public.b set gb = {g2} where id = {id} + 1; \
+                            insert into public.b values ({id} + 5, {k}, {g3}, 5)";
+    let mut lab = lab(Key::Pair, &[L, I]).await;
+    let mut n = 0;
+    for commit in [true, false] {
+        for recompute in [false, true] {
+            n += 1;
+            let context = format!("commit: {commit}, a recompute while prepared: {recompute}");
+            lab.step(&fill(SEED, n, lab.key)).await;
+            let gid = format!("family11_{n}");
+            lab.write(&format!(
+                "begin; {}; prepare transaction '{gid}'",
+                fill(PREPARED, n, lab.key)
+            ))
+            .await;
+            if recompute {
+                let row = (100 * n + 1).to_string();
+                lab.d
+                    .stage_recomputes_with_prior("public.a", &[(row.as_str(), None)])
+                    .await;
+                lab.d
+                    .stage_recomputes_with_prior("public.b", &[(row.as_str(), None)])
+                    .await;
+                let recomputed = lab.d.seal().await;
+                lab.d.drain(recomputed, "recompute").await;
+                lab.check_applied(&context).await;
+            }
+            let end = if commit { "commit" } else { "rollback" };
+            lab.write(&format!("{end} prepared '{gid}'")).await;
+            let batch = lab.d.seal().await;
+            lab.d.drain(batch, "prepared").await;
+            lab.check(&context).await;
+        }
+    }
 }
 
 /// The decision on #1108: a `J` row a page inserts for a key no row had,
@@ -2140,9 +2205,12 @@ async fn family8_a_cell_recomputed_twice_around_a_change() {
 
 /// J1 family 13: a recompute takes cells of both sides to zero while the
 /// captured deletes that emptied them are still undrained, and tombstone
-/// collection runs before those pages drain. The zero cells keep their
-/// basis (no collection removes a `JOIN`'s `P` or `M` cell), so the stale
-/// pages are refused rather than applied a second time.
+/// collection runs before those pages drain. A zero cell's basis is what
+/// refuses its stale pages, so no collection may remove a zero cell before
+/// the drained prefix passes them: the cells and their basis outlive the
+/// collection, and the stale pages are refused rather than applied a second
+/// time. A collection that ignored the drained prefix (J1's `S13.gc-early`
+/// control) fails both checks.
 #[tokio::test]
 async fn family13_zero_cells_outlive_collection_until_their_stale_pages_drain() {
     for key in [Key::Single, Key::Pair] {
@@ -2833,6 +2901,65 @@ async fn family9_writes_on_both_sides_around_a_build_inner_pair_key() {
     for (mixed, in_place) in [(false, false), (true, false), (false, true), (true, true)] {
         writes_on_both_sides_around_a_build(Key::Pair, I, mixed, in_place).await;
     }
+}
+
+/// J1 family 9's other role: a page of either side, on an enumerated key,
+/// frozen at each point of its apply while a fresh build or a rebuild in
+/// place starts. The build queues behind the page once the page holds the
+/// key's `J` row (from its `J` insert where the build has yet to create the
+/// row, from its `J` lock where the row exists) and builds through before
+/// that, so the page then meets cells whose basis already counts its change.
+/// The end is the oracle either way.
+async fn a_build_against_a_frozen_page(key: Key, kind: Kind) {
+    for in_place in [false, true] {
+        for (side, sql) in [
+            ("a", "update public.a set x = x + 1 where id = 1"),
+            ("b", "update public.b set y = y + 1 where id = 1"),
+        ] {
+            for point in POINTS {
+                let context = format!(
+                    "{key:?} {}: the {side} page frozen at {point:?}, in place: {in_place}",
+                    kind.name
+                );
+                let mut lab = seeded(key, &[kind], BUILD_SEED).await;
+                let job = if in_place {
+                    lab.build().await;
+                    request_rebuild(&lab, "a").await;
+                    "sweep"
+                } else {
+                    "plan"
+                };
+                let batch = lab.sealed(sql).await;
+                let target = kind.target();
+                let mut page = lab
+                    .d
+                    .drain_frozen(batch, "page", &[(point, target.as_str())])
+                    .await;
+                let reached = page.reached(point).await;
+                let building = lab.build_frozen(job, &[]).await;
+                assert_eq!(
+                    lab.queued_or_done(&building, reached.backend_pid).await,
+                    holds_j(point, !in_place),
+                    "{context}: does the build queue behind the page?"
+                );
+                lab.d.release(&mut page, point).await;
+                page.finish().await;
+                building.finish().await;
+                lab.assert_built(&context).await;
+                lab.check(&context).await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn family9_a_build_against_a_frozen_page_left() {
+    a_build_against_a_frozen_page(Key::Single, L).await;
+}
+
+#[tokio::test]
+async fn family9_a_build_against_a_frozen_page_inner_pair_key() {
+    a_build_against_a_frozen_page(Key::Pair, I).await;
 }
 
 /// Runs `sql` on `lab`'s connection to `part` of `kind`'s hidden tables.
@@ -4029,6 +4156,94 @@ async fn a_page_between_two_steps_of_a_join_build_is_exact() {
         building.finish().await;
         lab.assert_built(&context).await;
         lab.check(&context).await;
+    }
+}
+
+/// J1 family 9's recomputes during a chunked build: between two steps of a
+/// fresh build or a rebuild in place with a partitioned side, rows of every
+/// leaf of both sides change behind capture's back (a value, and a
+/// dimension row moving to another `gb`, named by its prior image), and
+/// their recomputes drain, while a captured change of the same rows waits
+/// undrained. A recompute reads its cells from the whole table, so it
+/// counts leaves no step has built yet, and the steps that build them later
+/// write the same cells absolutely; the captured change's page, drained
+/// last, is refused by the basis that counts it. The end is the oracle.
+#[tokio::test]
+async fn family9_a_recompute_between_two_steps_of_a_join_build_is_exact() {
+    // A row's primary-key text: `(t, id)` on a partitioned side.
+    fn row_key(partitioned: bool, t: i32, id: i32) -> String {
+        if partitioned {
+            format!("{t}\u{1f}{id}")
+        } else {
+            id.to_string()
+        }
+    }
+    for in_place in [false, true] {
+        for (a, b) in [(true, false), (false, true), (true, true)] {
+            let context = format!("in place: {in_place}, a {a}, b {b}");
+            let mut lab =
+                seeded_in(&partitioned_ddl(a, b), Key::Pair, &[L], PARTITIONED_SEED).await;
+            let job = if in_place {
+                lab.build().await;
+                request_rebuild(&lab, "a").await;
+                "sweep"
+            } else {
+                "plan"
+            };
+            lab.run_steps(job, 1).await;
+            let mut building = lab.next_step(job).await;
+            // Captured and undrained until the build ends: the recompute's
+            // basis counts it, so its page is refused then.
+            let stale = lab
+                .sealed("update public.a set x = x + 1 where id in (1, 7, 20)")
+                .await;
+            uncaptured(
+                &lab,
+                "public.a",
+                "update public.a set x = x + 7 where id in (1, 7, 20)",
+            )
+            .await;
+            uncaptured(
+                &lab,
+                "public.b",
+                "update public.b set y = y + 7, gb = gb + 100 where id in (1, 6, 20)",
+            )
+            .await;
+            let a_keys: Vec<String> = [(0, 1), (1, 7), (2, 20)]
+                .iter()
+                .map(|(t, id)| row_key(a, *t, *id))
+                .collect();
+            let a_keys: Vec<(&str, Option<String>)> =
+                a_keys.iter().map(|k| (k.as_str(), None)).collect();
+            let b_rows = [
+                (0, 1, r#"{"id": 1, "t": 0, "k": 1, "gb": 10, "y": 3}"#),
+                (1, 6, r#"{"id": 6, "t": 1, "k": 1, "gb": 14, "y": 50}"#),
+                (2, 20, r#"{"id": 20, "t": 2, "k": 1, "gb": 30, "y": 2}"#),
+            ];
+            let b_keys: Vec<String> = b_rows
+                .iter()
+                .map(|(t, id, _)| row_key(b, *t, *id))
+                .collect();
+            let b_keys: Vec<(&str, Option<String>)> = b_keys
+                .iter()
+                .zip(b_rows)
+                .map(|(k, (_, _, prior))| (k.as_str(), Some(prior.to_string())))
+                .collect();
+            lab.d.stage_recomputes_with_prior("public.a", &a_keys).await;
+            lab.d.stage_recomputes_with_prior("public.b", &b_keys).await;
+            let recomputed = lab.d.seal().await;
+            lab.d.drain(recomputed, "recompute").await;
+            lab.check_applied(&format!("{context}: after the recompute"))
+                .await;
+            lab.d
+                .release(&mut building, PausePoint::BetweenRebuildStructures)
+                .await;
+            building.finish().await;
+            lab.build().await;
+            lab.d.drain(stale, "stale").await;
+            lab.assert_built(&context).await;
+            lab.check(&context).await;
+        }
     }
 }
 
