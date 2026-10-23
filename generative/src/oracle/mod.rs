@@ -1690,6 +1690,7 @@ mod tests {
                 },
             ],
             unique_cols: vec!["k".to_string()],
+            partitioning: None,
         };
         let (from_col, to_col) = match cardinality {
             Cardinality::ToOne => ("f", "k"),

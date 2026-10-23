@@ -86,7 +86,6 @@ impl Fx {
     }
 
     async fn start_with(ddl: &str, definitions: &[&str]) -> Fx {
-        trellis::defs::partition_tree::open_gate_for_tests();
         let d = Driver::start(
             ddl,
             &[

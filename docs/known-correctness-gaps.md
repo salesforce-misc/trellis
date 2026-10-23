@@ -30,6 +30,10 @@ wrong rows, on the targets it compares
 | **Writes capture never sees** | | |
 | [Capture disrupted and restored between two passes](#capture-disrupted-and-restored-between-two-passes) | `self_check` | [#1206](https://github.com/salesforce-misc/trellis/issues/1206) (study), [#1237](https://github.com/salesforce-misc/trellis/issues/1237), otherwise documented |
 | [An unlogged source emptied by a crash or failover](#an-unlogged-source-emptied-by-a-crash-or-failover) | `self_check` | documented |
+| [A `MERGE` that moves a row to another partition](#a-merge-that-moves-a-row-to-another-partition) | `self_check` | a Postgres fix ([#942](https://github.com/salesforce-misc/trellis/issues/942)) |
+| [The source renamed or re-parented and back within one pass](#the-source-renamed-or-re-parented-and-back-within-one-pass) | `self_check` | [#1210](https://github.com/salesforce-misc/trellis/issues/1210) |
+| [A short-lived leaf beside a `DEFAULT` partition](#a-short-lived-leaf-beside-a-default-partition) | `self_check` | documented |
+| [A leaf detached and attached again around a `pg_upgrade`](#a-leaf-detached-and-attached-again-around-a-pg_upgrade) | `self_check` | [#1210](https://github.com/salesforce-misc/trellis/issues/1210) |
 | **Changes made outside Trellis to what it owns** | | |
 | [Rows written into a target, a hidden table or Trellis's schema](#rows-written-into-a-target-a-hidden-table-or-trelliss-schema) | `self_check`, except Trellis's schema | [#1209](https://github.com/salesforce-misc/trellis/issues/1209) |
 | [Part of the database restored from another point in time](#part-of-the-database-restored-from-another-point-in-time) | `self_check` | [#1209](https://github.com/salesforce-misc/trellis/issues/1209) |
@@ -40,11 +44,6 @@ wrong rows, on the targets it compares
 | [A from-side change pending across a to-side `TRUNCATE`](#a-from-side-change-pending-across-a-to-side-truncate) | no | #1115 |
 | [A to-one field under concurrent writes to both tables](#a-to-one-field-under-concurrent-writes-to-both-tables) | no | #1115 |
 | [A to-side row hidden from capture by a new policy](#a-to-side-row-hidden-from-capture-by-a-new-policy) | no; the next pass pauses it | #1115 |
-| **[Partitioned sources](#partitioned-sources-refused-today)** (refused at define today) | | |
-| [A `MERGE` that moves a row to another partition](#a-merge-that-moves-a-row-to-another-partition) | `self_check` | a Postgres fix ([#942](https://github.com/salesforce-misc/trellis/issues/942)) |
-| [The source renamed or re-parented and back within one pass](#the-source-renamed-or-re-parented-and-back-within-one-pass) | `self_check` | [#1210](https://github.com/salesforce-misc/trellis/issues/1210) |
-| [A short-lived leaf beside a `DEFAULT` partition](#a-short-lived-leaf-beside-a-default-partition) | `self_check` | documented |
-| [A leaf detached and attached again around a `pg_upgrade`](#a-leaf-detached-and-attached-again-around-a-pg_upgrade) | `self_check` | [#1210](https://github.com/salesforce-misc/trellis/issues/1210) |
 
 ## Preconditions
 
@@ -68,6 +67,12 @@ while every rule holds.
   breaks the guarantee.
 * **Use logged tables as sources.** Postgres empties an unlogged table on a
   crash, a failover or a physical restore.
+* **On a partitioned source, change a partition key with `UPDATE`** (or
+  `DELETE` and `INSERT`), not `MERGE`; rename or re-parent the source only
+  while its transforms are paused; and let a reconcile pass run between
+  creating a leaf beside a `DEFAULT` partition and removing it, and between
+  partition maintenance and a `pg_upgrade`
+  ([below](#a-merge-that-moves-a-row-to-another-partition)).
 * **Repair after DDL that rewrites a read column's values** in one of the
   shapes [listed below](#a-columns-values-rewritten-in-place-by-alter-column-type),
   or [changes the scale of a `numeric` `GROUP BY` key](#a-numeric-group-by-keys-scale-changed).
@@ -215,6 +220,92 @@ apply over the empty table.
 source. Better, don't use unlogged tables as sources: define accepts them.
 
 **Ends with:** nothing filed.
+
+### A `MERGE` that moves a row to another partition
+
+**When:** a `MERGE` whose `UPDATE` action (`WHEN NOT MATCHED BY SOURCE …
+UPDATE` included) changes a row's partition. A plain `UPDATE` that moves a
+row, and a `MERGE` that keeps every row in its partition, are unaffected.
+
+**What goes wrong:** a Postgres bug in the transition tables Trellis's
+capture reads:
+
+* **15.6+, 16.2+, 17 and 18:** the moved row's images never reach the
+  `UPDATE` tables. With only an `UPDATE` action the change is lost. With an
+  `INSERT` action but no `DELETE` action the row is counted in both its old
+  and new place, and with a `DELETE` action but no `INSERT` action in
+  neither. Only a `MERGE` with both is exact.
+* **15.0–15.5 and 16.0–16.1:** an `INSERT` or `DELETE` action also puts the
+  moved row's new or old image in its own table, so that image is applied
+  twice.
+
+**Detected by:** `self_check`.
+
+**Repair:** `PAUSE`/`RESUME` the transforms that read the table, or
+`request_backfill` it. To avoid it, change a partition key with `UPDATE`, or
+with `DELETE` and `INSERT`.
+
+**Ends with:** a Postgres fix; it's reported upstream
+([#942](https://github.com/salesforce-misc/trellis/issues/942)).
+
+### The source renamed or re-parented and back within one pass
+
+**When:** before the next reconcile pass, the source is renamed away and back
+(`ALTER TABLE orders RENAME TO orders_old`, then back), or attached under
+another partitioned table and detached again. A pass that sees the source
+renamed away, or attached elsewhere, pauses its readers.
+
+**What goes wrong:** capture stages a write only while the source's name
+resolves to the root of the tree being written, so every write made in
+between is lost, including writes named on the source and its leaves.
+Nothing in the catalog differs afterwards.
+
+**Detected by:** `self_check`.
+
+**Repair:** `PAUSE`/`RESUME` the transforms that read the table, or
+`request_backfill` it. To avoid it, rename or re-parent a source only while
+its transforms are paused.
+
+**Ends with:** [#1210](https://github.com/salesforce-misc/trellis/issues/1210).
+
+### A short-lived leaf beside a `DEFAULT` partition
+
+**When:** a leaf is created beside a `DEFAULT` partition, written through the
+parent, and dropped or detached before the next reconcile pass. A leaf still
+there at a pass is recorded, and without a `DEFAULT` beside it each pass's
+sweep finds the rows it leaves behind.
+
+**What goes wrong:** the removed rows stay counted in their groups. The
+`DEFAULT` takes every row its siblings don't, so no group routes to no
+partition for the sweep to find.
+
+**Detected by:** `self_check`.
+
+**Repair:** `PAUSE`/`RESUME` the transforms that read the table, or
+`request_backfill` it. To avoid it, delete a short-lived leaf's rows through
+the parent before removing it, or keep it until a pass has run.
+
+**Ends with:** documented; accepted in epic #897's design.
+
+### A leaf detached and attached again around a `pg_upgrade`
+
+**When:** a leaf is detached, written while detached, and attached again under
+the same parent and bound, with no reconcile pass completing a deep check
+between that and a `pg_upgrade`. Outside an upgrade, the pass sees the leaf's
+new `pg_inherits` row and corrects it.
+
+**What goes wrong:** a detached leaf's capture stages nothing, and the
+upgrade resets every `xmin`, so the pass records the leaf as unchanged. The
+groups the missed writes touched stay as they were.
+
+**Detected by:** `self_check`.
+
+**Repair:** `PAUSE`/`RESUME` the transforms that read the table, or
+`request_backfill` it. To avoid it, let a pass run after partition
+maintenance before an upgrade, and after the upgrade before detaching or
+attaching a partition.
+
+**Ends with:** [#1210](https://github.com/salesforce-misc/trellis/issues/1210).
 
 ## Changes made outside Trellis to what it owns
 
@@ -414,108 +505,6 @@ the table directly stays right: its apply re-reads a deleted row live.
 
 **Repair:** exempt the role, then `RESUME` the paused definitions, which
 refreshes the projection from the table.
-
-## Partitioned sources (refused today)
-
-Define refuses a partitioned table as a source today
-(`PartitionedSourceNotCaptured`;
-[transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)),
-so nothing in this section can happen yet. Capture, detection and correction
-for partitioned sources are built behind that refusal
-([ADR-0017](decisions/0017-partitioned-sources.md), epic
-[#897](https://github.com/salesforce-misc/trellis/issues/897)), and these are
-the ways they can still leave a target wrong. A 1-1 target can read a
-partitioned source only through a to-many relationship. `self_check`
-compares the group-basis aggregates and `JOIN`s that read one, and refuses a
-ledger aggregate and a relationship's readers
-([What `self_check` can't see](#what-self_check-cant-see)). The change that
-lifts the refusal moves these entries into the groups above.
-
-### A `MERGE` that moves a row to another partition
-
-**When:** a `MERGE` whose `UPDATE` action (`WHEN NOT MATCHED BY SOURCE …
-UPDATE` included) changes a row's partition. A plain `UPDATE` that moves a
-row, and a `MERGE` that keeps every row in its partition, are unaffected.
-
-**What goes wrong:** a Postgres bug in the transition tables Trellis's
-capture reads:
-
-* **15.6+, 16.2+, 17 and 18:** the moved row's images never reach the
-  `UPDATE` tables. With only an `UPDATE` action the change is lost. With an
-  `INSERT` action but no `DELETE` action the row is counted in both its old
-  and new place, and with a `DELETE` action but no `INSERT` action in
-  neither. Only a `MERGE` with both is exact.
-* **15.0–15.5 and 16.0–16.1:** an `INSERT` or `DELETE` action also puts the
-  moved row's new or old image in its own table, so that image is applied
-  twice.
-
-**Detected by:** `self_check`.
-
-**Repair:** `PAUSE`/`RESUME` the transforms that read the table, or
-`request_backfill` it. To avoid it, change a partition key with `UPDATE`, or
-with `DELETE` and `INSERT`.
-
-**Ends with:** a Postgres fix; it's reported upstream
-([#942](https://github.com/salesforce-misc/trellis/issues/942)).
-
-### The source renamed or re-parented and back within one pass
-
-**When:** before the next reconcile pass, the source is renamed away and back
-(`ALTER TABLE orders RENAME TO orders_old`, then back), or attached under
-another partitioned table and detached again. A pass that sees the source
-renamed away, or attached elsewhere, pauses its readers.
-
-**What goes wrong:** capture stages a write only while the source's name
-resolves to the root of the tree being written, so every write made in
-between is lost, including writes named on the source and its leaves.
-Nothing in the catalog differs afterwards.
-
-**Detected by:** `self_check`.
-
-**Repair:** `PAUSE`/`RESUME` the transforms that read the table, or
-`request_backfill` it. To avoid it, rename or re-parent a source only while
-its transforms are paused.
-
-**Ends with:** [#1210](https://github.com/salesforce-misc/trellis/issues/1210).
-
-### A short-lived leaf beside a `DEFAULT` partition
-
-**When:** a leaf is created beside a `DEFAULT` partition, written through the
-parent, and dropped or detached before the next reconcile pass. A leaf still
-there at a pass is recorded, and without a `DEFAULT` beside it each pass's
-sweep finds the rows it leaves behind.
-
-**What goes wrong:** the removed rows stay counted in their groups. The
-`DEFAULT` takes every row its siblings don't, so no group routes to no
-partition for the sweep to find.
-
-**Detected by:** `self_check`.
-
-**Repair:** `PAUSE`/`RESUME` the transforms that read the table, or
-`request_backfill` it. To avoid it, delete a short-lived leaf's rows through
-the parent before removing it, or keep it until a pass has run.
-
-**Ends with:** documented; accepted in epic #897's design.
-
-### A leaf detached and attached again around a `pg_upgrade`
-
-**When:** a leaf is detached, written while detached, and attached again under
-the same parent and bound, with no reconcile pass completing a deep check
-between that and a `pg_upgrade`. Outside an upgrade, the pass sees the leaf's
-new `pg_inherits` row and corrects it.
-
-**What goes wrong:** a detached leaf's capture stages nothing, and the
-upgrade resets every `xmin`, so the pass records the leaf as unchanged. The
-groups the missed writes touched stay as they were.
-
-**Detected by:** `self_check`.
-
-**Repair:** `PAUSE`/`RESUME` the transforms that read the table, or
-`request_backfill` it. To avoid it, let a pass run after partition
-maintenance before an upgrade, and after the upgrade before detaching or
-attaching a partition.
-
-**Ends with:** [#1210](https://github.com/salesforce-misc/trellis/issues/1210).
 
 ## What `self_check` can't see
 

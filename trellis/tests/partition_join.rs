@@ -183,7 +183,6 @@ impl Fx {
     /// through capture and applied, and the tree recorded.
     async fn start(part: Part, schema: &str, seed: &str) -> Fx {
         trellis::dev::staging::set_group_basis(true);
-        trellis::defs::partition_tree::open_gate_for_tests();
         let d = Driver::start(
             schema,
             &[("id", int4()), ("ga", int4()), ("k", int4()), ("x", int4())],

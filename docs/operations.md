@@ -221,9 +221,7 @@ which targets it compares is in
 [Transforms — Partitioned sources](transforms.md#partitioned-sources) says what a
 partition operation does to the counts and how to avoid the window. This is what
 each one costs and what to expect around it
-([ADR-0017](decisions/0017-partitioned-sources.md)). Define refuses a
-partitioned source today, so this describes the path built behind that refusal
-([#1228](https://github.com/salesforce-misc/trellis/issues/1228)).
+([ADR-0017](decisions/0017-partitioned-sources.md)).
 
 * **A correction costs the work of the partition's rows.** On the ledger build,
   the correction of a dropped partition of 1,000,000 rows took 13.0 s in the

@@ -133,7 +133,7 @@ use crate::defs::ast::{GroupByKey, KeySpace};
 use crate::defs::ddl::regclass_arg;
 use crate::defs::model::RelationshipCardinality;
 use crate::defs::partition_tree::{
-    self, KeyRole, PartitionRefusal, PartitionTree, read_partition_tree, server_version_num,
+    KeyRole, PartitionRefusal, PartitionTree, read_partition_tree, server_version_num,
 };
 
 /// Constraint texts fetched in one transaction. A transaction holds one lock
@@ -795,13 +795,6 @@ pub(crate) async fn begin(
     catalog: &CaptureCatalog,
     table: &str,
 ) -> Result<Begin, CaptureError> {
-    // Until the gate opens, a partitioned root in `desired` is a table in a
-    // hierarchy, which the pass pauses its readers for.
-    if !crate::defs::catalog::PARTITIONED_SOURCES_CAPTURED
-        && !partition_tree::gate_opened_for_tests()
-    {
-        return Ok(Begin::NotPartitioned);
-    }
     // Test-only pause point (#1200): after the pass's gone-table check,
     // before the fingerprint read. See `staging::interleave`.
     #[cfg(any(test, feature = "test-util"))]

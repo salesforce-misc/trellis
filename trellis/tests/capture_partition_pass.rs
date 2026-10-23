@@ -4,9 +4,7 @@
 //!
 //! The corrections are consumed by P4; these tests read the durable queue
 //! (`partition_corrections`) directly. Every pass is stepped by hand and
-//! nothing waits for convergence (#297). The gate that keeps partitioned
-//! sources from being defined is opened for this process, so a transform can
-//! read a partitioned root.
+//! nothing waits for convergence (#297).
 
 use std::time::{Duration, Instant};
 
@@ -70,7 +68,6 @@ const NODES: [&str; 6] = [
 ];
 
 async fn instance(cluster: &TestCluster, tree: &str) -> Instance {
-    trellis::defs::partition_tree::open_gate_for_tests();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
     raw.batch_execute(tree)

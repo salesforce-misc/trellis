@@ -265,10 +265,10 @@ async fn an_inheritance_child_or_parent_pauses_its_readers() {
 }
 
 /// A source dropped and recreated under the same name in a hierarchy, as a
-/// partitioned table, a partition or an inheritance child, has none of
-/// Trellis's capture: the pass would install it from scratch. It pauses the
-/// readers instead, and installs nothing on the table, on that pass or a
-/// later one.
+/// partitioned table its reader can't serve, a partition or an inheritance
+/// child, has none of Trellis's capture: the pass would install it from
+/// scratch. It pauses the readers instead, and installs nothing on the table,
+/// on that pass or a later one.
 #[tokio::test]
 async fn a_source_recreated_in_a_hierarchy_pauses_its_readers_and_gets_no_capture() {
     let cluster = TestCluster::start();
@@ -278,7 +278,7 @@ async fn a_source_recreated_in_a_hierarchy_pauses_its_readers_and_gets_no_captur
                  partition by range (id); \
              create table public.c_1 partition of public.c \
                  for values from (minvalue) to (maxvalue)",
-            "public.c is a partitioned table",
+            "partitioned table public.c is partitioned by \"id\"",
         ),
         (
             "create table public.c_all (id int primary key, pid int, amount int) \
@@ -317,11 +317,10 @@ async fn a_source_recreated_in_a_hierarchy_pauses_its_readers_and_gets_no_captur
 }
 
 /// ADR-0017: a source recreated as a partitioned root whose shape the
-/// aggregate could read (partitioned by its `GROUP BY` column) still pauses
-/// its readers, and `RESUME` is refused with
-/// `PartitionedSourceNotCaptured`, since capture can't yet cover the tree.
+/// aggregate can read (partitioned by its `GROUP BY` column) pauses its
+/// readers like any recreated source, and `RESUME` rebuilds onto the tree.
 #[tokio::test]
-async fn a_resume_onto_a_servable_partitioned_source_is_refused_until_capture_covers_it() {
+async fn a_resume_onto_a_servable_partitioned_source_rebuilds_onto_the_tree() {
     let cluster = TestCluster::start();
     let mut it = instance(
         &cluster,
@@ -340,31 +339,31 @@ async fn a_resume_onto_a_servable_partitioned_source_is_refused_until_capture_co
         .await
         .expect("recreate the source as a partitioned root");
     capture_pass(&mut it.raw, &it.db.pool).await;
-    assert_paused(
-        &it.trellis,
-        "c_sums",
-        "public.c",
-        "public.c is a partitioned table",
-    )
-    .await;
-    let err = it
-        .trellis
+    let reported = status(&it.trellis, "c_sums").await;
+    assert_eq!(reported.status, TransformStatus::Paused);
+    let failure = reported.capture_failure.expect("the reason is reported");
+    assert!(
+        failure.error.starts_with(
+            "Trellis's capture of public.c was changed outside Trellis: public.c was a plain \
+             table and is now a partitioned table"
+        ),
+        "{failure:?}"
+    );
+    capture_pass(&mut it.raw, &it.db.pool).await;
+    assert_eq!(
+        status(&it.trellis, "c_sums").await.status,
+        TransformStatus::Paused,
+        "a later pass leaves it paused"
+    );
+    it.trellis
         .apply("RESUME TRANSFORM c_sums")
         .await
-        .expect_err("a resume onto a partitioned source is refused");
-    assert!(
-        matches!(
-            &err,
-            TrellisError::Apply(ApplyError::ResumeRefused { reason, .. })
-                if matches!(**reason, CatalogError::PartitionedSourceNotCaptured { .. })
-        ),
-        "{err:?}"
-    );
-    assert_eq!(
+        .expect("a resume onto a servable partitioned source");
+    capture_pass(&mut it.raw, &it.db.pool).await;
+    assert_ne!(
         status(&it.trellis, "c_sums").await.status,
         TransformStatus::Paused
     );
-    assert_eq!(triggers(&it.raw, "public.c").await, Vec::<String>::new());
     it.trellis.shutdown().await.expect("shutdown");
 }
 

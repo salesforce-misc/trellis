@@ -16,14 +16,12 @@
 //! that table's capture as it is. Define refuses such a table, but it can
 //! join a hierarchy later, or be dropped and recreated as one.
 //!
-//! Once partitioned sources are served (`defs::catalog`'s
-//! `PARTITIONED_SOURCES_CAPTURED`), a partitioned root is not "in a
-//! hierarchy": the pass fingerprints its tree, pauses the readers it stopped
-//! complying for, and records the tree and the corrections for its partition
-//! maintenance once capture covers every node ([`super::partitions`], ADR-0017
-//! P3). Then it sweeps the source for groups that route to no current leaf
-//! and queues their correction ([`super::complement`], P7). While that gate
-//! is closed, the check above pauses its readers.
+//! A partitioned root is not "in a hierarchy": the pass fingerprints its
+//! tree, pauses the readers it stopped complying for, and records the tree
+//! and the corrections for its partition maintenance once capture covers
+//! every node ([`super::partitions`], ADR-0017 P3). Then it sweeps the source
+//! for groups that route to no current leaf and queues their correction
+//! ([`super::complement`], P7).
 //!
 //! Before it regenerates a table's functions, the pass pauses every
 //! definition that reads a column the table no longer has (#622 C6,

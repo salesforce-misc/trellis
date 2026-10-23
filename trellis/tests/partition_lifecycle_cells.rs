@@ -91,7 +91,6 @@ impl Fx {
 
     async fn start_with(schema: &str, seed: &str, definitions: &[&str]) -> Fx {
         trellis::dev::staging::set_group_basis(true);
-        trellis::defs::partition_tree::open_gate_for_tests();
         let d = Driver::start(
             schema,
             &[("id", int4()), ("g", int4()), ("v", int4())],

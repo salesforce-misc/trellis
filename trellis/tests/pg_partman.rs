@@ -364,7 +364,6 @@ impl Harness {
     /// partitioned source, two live readers over it.
     async fn start(mode: Mode, bgw: bool) -> Self {
         require_partman();
-        trellis::defs::partition_tree::open_gate_for_tests();
         let cluster = if bgw {
             TestCluster::start_with_settings(&[
                 "shared_preload_libraries=pg_partman_bgw",

@@ -714,11 +714,10 @@ async fn another_handle_sees_the_capture_wait_and_failure() {
     assert_eq!(rows, 0, "a landed install clears its row");
 }
 
-/// A partitioned table can't be captured by statement triggers on its
-/// parent (a write aimed at a partition bypasses them, and a partition
-/// attached later has none), so it is refused as a source at define time.
+/// A 1-1 transform over a partitioned table is refused at define time: its
+/// target would need a partitioning of its own (ADR-0017).
 #[tokio::test]
-async fn a_partitioned_source_is_refused_at_define_time() {
+async fn a_1_1_transform_over_a_partitioned_source_is_refused_at_define_time() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect(db.dsn()).await;

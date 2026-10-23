@@ -6,10 +6,9 @@
 //! Each case runs on a partitioned table of its own, `p_<case>`, a two-level
 //! tree, with two readers: `r_<case>`, a `COUNT(*)` by `a` (not the
 //! partition key), and `s_<case>`, `SUM(b)` by `g`. (A 1-1 transform over a
-//! partitioned source is refused at define, so aggregates are the readers.) The case's windows run between calls of the capture
-//! pass, which is called directly. Nothing polls for convergence (#297).
-//! This file is its own test binary: it opens the partitioned-source gate
-//! for the process.
+//! partitioned source is refused at define, so aggregates are the readers.)
+//! The case's windows run between calls of the capture pass, which is called
+//! directly. Nothing polls for convergence (#297).
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -283,7 +282,6 @@ async fn settle(
 }
 
 async fn run_cases(cases: &[Case]) {
-    trellis::defs::partition_tree::open_gate_for_tests();
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
@@ -612,7 +610,6 @@ async fn capture_failures(trellis: &Trellis, names: &[&str]) -> Vec<Option<Strin
 /// pauses too; a node that leaves the tree loses its rows.
 #[tokio::test]
 async fn nodes_added_by_maintenance_are_recorded_and_then_checked() {
-    trellis::defs::partition_tree::open_gate_for_tests();
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
@@ -677,7 +674,6 @@ async fn nodes_added_by_maintenance_are_recorded_and_then_checked() {
 /// records the whole tree afresh; the next passes pause nothing.
 #[tokio::test]
 async fn resume_reinstalls_and_records_a_disrupted_tree() {
-    trellis::defs::partition_tree::open_gate_for_tests();
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
@@ -742,7 +738,6 @@ async fn resume_reinstalls_and_records_a_disrupted_tree() {
 /// record the rest.
 #[tokio::test]
 async fn an_install_that_stops_between_transactions_pauses_nothing() {
-    trellis::defs::partition_tree::open_gate_for_tests();
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
@@ -848,7 +843,6 @@ async fn count(raw: &Client, sql: &str) -> String {
 /// after it the targets equal what the source holds.
 #[tokio::test]
 async fn a_root_swapped_recreated_or_renamed_away_pauses_both_readers_until_resumed() {
-    trellis::defs::partition_tree::open_gate_for_tests();
     let cases: Vec<RootCase> = vec![
         (
             "renamed",
@@ -999,7 +993,6 @@ async fn a_root_swapped_recreated_or_renamed_away_pauses_both_readers_until_resu
 #[tokio::test]
 async fn a_root_swapped_during_the_pass_pauses_both_readers() {
     use trellis::staging::interleave::{PausePoint, PauseScope, with_scope};
-    trellis::defs::partition_tree::open_gate_for_tests();
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
@@ -1100,7 +1093,6 @@ async fn oracle(raw: &Client, id: &str, failures: &mut Vec<String>) {
 /// and rows written, updated and deleted before the `RESUME`.
 #[tokio::test]
 async fn tree_changes_while_every_reader_is_paused_are_covered_by_the_resume() {
-    trellis::defs::partition_tree::open_gate_for_tests();
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;

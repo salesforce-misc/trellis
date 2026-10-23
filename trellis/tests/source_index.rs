@@ -344,7 +344,6 @@ async fn the_index_must_run_in_the_page_order_forward_or_backward() {
 /// with it, as the first `GROUP BY` column, is the required one.
 #[tokio::test]
 async fn a_partitioned_sources_unique_index_leading_with_the_partition_key_counts() {
-    trellis::defs::partition_tree::open_gate_for_tests();
     let (_cluster, _db, raw, trellis) = setup(
         "create table public.pitems (g integer not null, id integer not null, v integer not null, \
            primary key (g, id)) partition by list (g); \

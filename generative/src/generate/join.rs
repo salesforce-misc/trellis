@@ -65,6 +65,7 @@ pub fn join_tables() -> Vec<Table> {
         }))
         .collect(),
         unique_cols: Vec::new(),
+        partitioning: None,
     };
     vec![
         table(FROM_TABLE, &["ga", "t", "k", "x"]),

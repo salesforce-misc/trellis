@@ -99,7 +99,7 @@ mod tests {
             "capture/partitions.rs",
             1,
             "a partition key's own type, to rank the source's own bounds as \
-             Postgres routes them; partitioned sources are refused at define",
+             Postgres routes them",
         ),
         (
             "defs/catalog.rs",

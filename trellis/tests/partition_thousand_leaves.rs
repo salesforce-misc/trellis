@@ -49,7 +49,6 @@ struct Fx {
 
 impl Fx {
     async fn start(ddl: &str) -> Fx {
-        trellis::defs::partition_tree::open_gate_for_tests();
         let d = Driver::start(ddl, &columns(), &[DEFINITION], &[SOURCE]).await;
         Fx { d }
     }

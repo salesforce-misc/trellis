@@ -1,11 +1,9 @@
 //! Define accepts the shape of a partitioned source and refuses every shape
 //! routing can't serve (ADR-0017, issue #1058).
 //!
-//! A partitioned root of a servable shape passes every shape check and is
-//! then refused with `PartitionedSourceNotCaptured`, because capture is
-//! installed on the root alone. So "accepted" below means the refusal is that
-//! one, not a shape refusal. Nothing polls (#297): every check is a catalog
-//! read or one `apply` call.
+//! A partitioned root of a servable shape defines; each accepted definition is
+//! dropped again so the next check can reuse its name. Nothing polls (#297):
+//! every check is a catalog read or an `apply` call.
 
 use testkit::{TestCluster, TestDatabase};
 use tokio_postgres::{Client, NoTls};
@@ -68,10 +66,30 @@ async fn refusal(it: &Instance, statement: &str) -> CatalogError {
     }
 }
 
-fn assert_shape_accepted(err: &CatalogError, table: &str) {
-    match err {
-        CatalogError::PartitionedSourceNotCaptured { table: t } => assert_eq!(t, table),
-        other => panic!("expected the shape to pass, got {other:?}"),
+/// Defines `statement`, which must be accepted, then drops what it defined.
+async fn assert_accepted(it: &Instance, statement: &str) {
+    if let Err(err) = it.trellis.apply(statement).await {
+        panic!("{statement} was refused: {err:?}");
+    }
+    let mut words = statement.split_whitespace();
+    let drops = match (words.next(), words.next(), words.next(), words.next()) {
+        (Some("TRANSFORM"), Some(name), _, _) => {
+            vec![
+                format!("PAUSE TRANSFORM {name}"),
+                format!("DROP TRANSFORM {name}"),
+            ]
+        }
+        (Some("RELATIONSHIP"), Some(name), Some("FROM"), Some(from)) => {
+            let table = from.split_once('.').map_or(from, |(t, _)| t);
+            vec![format!("DROP RELATIONSHIP {table}.{name}")]
+        }
+        _ => panic!("no drop for {statement}"),
+    };
+    for drop in drops {
+        it.trellis
+            .apply(&drop)
+            .await
+            .unwrap_or_else(|err| panic!("{drop}: {err:?}"));
     }
 }
 
@@ -98,18 +116,12 @@ async fn the_adr_example_defines_and_grouping_by_another_column_names_the_key() 
     let cluster = TestCluster::start();
     let it = instance(&cluster, ORDER_LINES).await;
 
-    assert_shape_accepted(
-        &refusal(&it, &aggregate("public.order_line_items", "order_id")).await,
-        "public.order_line_items",
-    );
-    assert_shape_accepted(
-        &refusal(
-            &it,
-            &aggregate("public.order_line_items", "order_id, product_id"),
-        )
-        .await,
-        "public.order_line_items",
-    );
+    assert_accepted(&it, &aggregate("public.order_line_items", "order_id")).await;
+    assert_accepted(
+        &it,
+        &aggregate("public.order_line_items", "order_id, product_id"),
+    )
+    .await;
     let err = refusal(&it, &aggregate("public.order_line_items", "product_id")).await;
     let refused = assert_refused_naming(&err, "\"order_id\"");
     assert!(matches!(
@@ -222,10 +234,7 @@ async fn a_multi_level_tree_needs_the_key_of_every_level() {
             for values with (modulus 1, remainder 0);",
     )
     .await;
-    assert_shape_accepted(
-        &refusal(&it, &aggregate("public.metrics", "day, device")).await,
-        "public.metrics",
-    );
+    assert_accepted(&it, &aggregate("public.metrics", "day, device")).await;
     // The second level's column is the one named.
     assert_refused_naming(
         &refusal(&it, &aggregate("public.metrics", "day")).await,
@@ -249,10 +258,7 @@ async fn a_range_tree_with_a_default_partition_defines() {
          create table public.events_other partition of public.events default;",
     )
     .await;
-    assert_shape_accepted(
-        &refusal(&it, &aggregate("public.events", "at")).await,
-        "public.events",
-    );
+    assert_accepted(&it, &aggregate("public.events", "at")).await;
 }
 
 #[tokio::test]
@@ -309,7 +315,7 @@ async fn every_listed_key_type_a_primary_key_can_hold_passes_the_type_check() {
     let it = instance(&cluster, &ddl).await;
     for i in 0..types.len() {
         let table = format!("public.k{i}");
-        assert_shape_accepted(&refusal(&it, &aggregate(&table, "k")).await, &table);
+        assert_accepted(&it, &aggregate(&table, "k")).await;
     }
 }
 
@@ -365,10 +371,7 @@ async fn a_tree_over_the_leaf_limit_is_refused_stating_the_limit() {
     )
     .await;
     // 1,000 leaves is the limit, inclusive.
-    assert_shape_accepted(
-        &refusal(&it, &aggregate("public.small", "k")).await,
-        "public.small",
-    );
+    assert_accepted(&it, &aggregate("public.small", "k")).await;
     let err = refusal(&it, &aggregate("public.big", "k")).await;
     let refused = assert_refused_naming(&err, "1001 partitions");
     assert!(refused.to_string().contains("1000 leaves"), "{refused}");
@@ -440,14 +443,11 @@ async fn a_to_many_to_side_follows_the_same_rules() {
     )
     .await;
     // To-many onto the partition key: passes the shape checks.
-    assert_shape_accepted(
-        &refusal(
-            &it,
-            "RELATIONSHIP lines FROM orders.id TO order_line_items.order_id",
-        )
-        .await,
-        "public.order_line_items",
-    );
+    assert_accepted(
+        &it,
+        "RELATIONSHIP lines FROM orders.id TO order_line_items.order_id",
+    )
+    .await;
     // To-many onto another column.
     assert_refused_naming(
         &refusal(
@@ -517,10 +517,13 @@ async fn a_join_side_is_held_to_the_rule_over_its_partial_key() {
             "{ORDER_LINES} \
              create table public.orders (id bigint primary key, customer_id bigint, zone text); \
              create table public.products (id bigint primary key, name text); \
+             create index on public.order_line_items (product_id); \
+             create index on public.orders (customer_id); \
              create table public.customers (id bigint not null, region text not null, \
                 primary key (region, id)) partition by list (region); \
              create table public.customers_eu partition of public.customers \
-                for values in ('eu');"
+                for values in ('eu'); \
+             create index on public.customers (id);"
         ),
     )
     .await;
@@ -535,18 +538,15 @@ async fn a_join_side_is_held_to_the_rule_over_its_partial_key() {
         )
     };
     // The fact side joins by its partition key.
-    assert_shape_accepted(
-        &refusal(
-            &it,
-            &join(
-                "order_line_items LEFT JOIN orders",
-                "order_line_items.order_id = orders.id",
-                "orders.zone",
-            ),
-        )
-        .await,
-        "public.order_line_items",
-    );
+    assert_accepted(
+        &it,
+        &join(
+            "order_line_items LEFT JOIN orders",
+            "order_line_items.order_id = orders.id",
+            "orders.zone",
+        ),
+    )
+    .await;
     // It joins by another column: refused, unless the key is grouped.
     let err = refusal(
         &it,
@@ -565,31 +565,25 @@ async fn a_join_side_is_held_to_the_rule_over_its_partial_key() {
             ..
         }
     ));
-    assert_shape_accepted(
-        &refusal(
-            &it,
-            &join(
-                "order_line_items JOIN products",
-                "order_line_items.product_id = products.id",
-                "order_line_items.order_id, products.name",
-            ),
-        )
-        .await,
-        "public.order_line_items",
-    );
+    assert_accepted(
+        &it,
+        &join(
+            "order_line_items JOIN products",
+            "order_line_items.product_id = products.id",
+            "order_line_items.order_id, products.name",
+        ),
+    )
+    .await;
     // The dimension side: its partition key grouped, or not.
-    assert_shape_accepted(
-        &refusal(
-            &it,
-            &join(
-                "orders JOIN customers",
-                "orders.customer_id = customers.id",
-                "customers.region",
-            ),
-        )
-        .await,
-        "public.customers",
-    );
+    assert_accepted(
+        &it,
+        &join(
+            "orders JOIN customers",
+            "orders.customer_id = customers.id",
+            "customers.region",
+        ),
+    )
+    .await;
     let err = refusal(
         &it,
         &join(

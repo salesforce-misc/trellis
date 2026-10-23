@@ -772,7 +772,6 @@ async fn a_drop_waits_for_a_build_in_flight() {
 #[tokio::test]
 async fn a_partitioned_source_with_rows_is_refused() {
     trellis::dev::staging::set_group_basis(true);
-    trellis::defs::partition_tree::open_gate_for_tests();
     let d = Driver::start(
         "create table public.src (id integer, g integer, v integer, primary key (id, g)) \
              partition by range (g); \

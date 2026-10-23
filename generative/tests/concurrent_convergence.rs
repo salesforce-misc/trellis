@@ -253,7 +253,7 @@ use generative::generate::{
     ActionDraw, ActionKind, AggregateColumn, AggregateFn, ConcurrentCase, DefShape, Mutate,
     TableSpec, add_burst_actions, build_program, build_program_multi_with_shapes, concurrent_plan,
     cooling_backfill_case, cooling_key_case, defer_def_install, hot_key_case, mid_burst_case,
-    schedule_restart, schedule_scale_out, steady_load_case, trivial_program,
+    partitioned_program, schedule_restart, schedule_scale_out, steady_load_case, trivial_program,
 };
 use generative::run::{
     RunError, check_program, run_convergence, run_convergence_bursty, run_convergence_concurrent,
@@ -570,6 +570,18 @@ proptest! {
     #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
     fn property_convergence_holds_under_the_concurrent_backend(
         program in trivial_program(),
+        burst_size in burst_size(),
+    ) {
+        run_one(&program, burst_size)?;
+    }
+
+    /// ADR-0017: `partitioned_program` under the concurrent backend, so
+    /// writes to different leaves of one partitioned source drain in
+    /// parallel.
+    #[test]
+    #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
+    fn property_a_partitioned_source_converges_under_the_concurrent_backend(
+        program in partitioned_program(),
         burst_size in burst_size(),
     ) {
         run_one(&program, burst_size)?;
@@ -1102,6 +1114,7 @@ fn pin_table(
             })
             .collect(),
         unique_cols: unique.iter().map(|c| c.to_string()).collect(),
+        partitioning: None,
     }
 }
 

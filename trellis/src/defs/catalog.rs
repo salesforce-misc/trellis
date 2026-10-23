@@ -350,12 +350,6 @@ pub enum CatalogError {
     /// ([`super::partition_tree::PartitionRefusal`]; every message names the
     /// column or the limit).
     PartitionedSource(super::partition_tree::PartitionRefusal),
-    /// ADR-0017: a partitioned root of a servable shape. Capture is installed
-    /// on the root alone, and a statement trigger fires only for the table a
-    /// statement names, so a write aimed at a partition would go unseen; the
-    /// definition is refused until capture covers every node of the tree
-    /// ([`PARTITIONED_SOURCES_CAPTURED`]).
-    PartitionedSourceNotCaptured { table: String },
     /// Issue #375: a relationship endpoint that isn't one of this instance's
     /// targets fails [`change_keyed`]. The relationship walk in
     /// [`all_source_tables`] captures it, so it is held to the same rule as a
@@ -549,7 +543,6 @@ impl CatalogError {
             CatalogError::TargetTableExists { .. } => ErrorCode::Conflict,
             CatalogError::SourceNotChangeKeyed { .. } => ErrorCode::Validation,
             CatalogError::PartitionedSource(_) => ErrorCode::Validation,
-            CatalogError::PartitionedSourceNotCaptured { .. } => ErrorCode::Validation,
             CatalogError::RelationshipEndpointNotChangeKeyed { .. } => ErrorCode::Validation,
             CatalogError::RowSecurityApplies(_) => ErrorCode::Validation,
             CatalogError::Subscribed(_) => ErrorCode::Validation,
@@ -783,12 +776,6 @@ impl fmt::Display for CatalogError {
                  an instance propagates writes to its own targets without capturing them"
             ),
             CatalogError::PartitionedSource(refusal) => write!(f, "{refusal}"),
-            CatalogError::PartitionedSourceNotCaptured { table } => write!(
-                f,
-                "partitioned table {table} has a shape Trellis can read, but capture is \
-                 installed on the partitioned table alone, so a write aimed at one of its \
-                 partitions would go unseen. Use a plain table"
-            ),
             CatalogError::RelationshipEndpointNotChangeKeyed { side, endpoint } => write!(
                 f,
                 "Trellis can't capture {side} relationship endpoint \"{endpoint}\"'s changes: it \
@@ -908,7 +895,6 @@ impl std::error::Error for CatalogError {
             CatalogError::TargetTableExists { .. } => None,
             CatalogError::SourceNotChangeKeyed { .. } => None,
             CatalogError::PartitionedSource(_) => None,
-            CatalogError::PartitionedSourceNotCaptured { .. } => None,
             CatalogError::RelationshipEndpointNotChangeKeyed { .. } => None,
             CatalogError::RowSecurityApplies(_) => None,
             CatalogError::Subscribed(_) => None,
@@ -7328,24 +7314,6 @@ async fn to_col_cardinality_in_txn(
     })
 }
 
-/// Whether a definition may read a partitioned root whose shape passed
-/// [`super::partition_tree::PartitionTree::refusal`] (ADR-0017). Capture is
-/// installed on every node of the tree and stages each write once under the
-/// root's identity, and nothing for a table that has left the tree. That is
-/// not enough to serve a definition on its own: `ATTACH`, `DETACH` and `DROP`
-/// of a partition change the root's rows without a write the triggers see, and
-/// a leaf or middle `TRUNCATE` stages the root's truncate sentinel, which
-/// empties the whole target. The reconcile pass detects the lifecycle changes
-/// and queues a correction request for each ([`crate::capture::partitions`],
-/// P3), the seal queues one for a node-named `TRUNCATE` (P5), and the
-/// correction engine consumes the queue (P4). The gate stays closed until the
-/// remaining phases land; until then the pass still treats a partitioned root
-/// as a table in a hierarchy and pauses its readers.
-/// While this is `false`, [`accept_partitioned`] refuses every servable tree
-/// with [`CatalogError::PartitionedSourceNotCaptured`], after every shape
-/// check, so a refusal for the shape still names its column.
-pub(crate) const PARTITIONED_SOURCES_CAPTURED: bool = false;
-
 /// Whether `qualified` (an unquoted `schema.table`) has a primary key, the
 /// part of [`change_keyed`]'s rule a partitioned root is held to as well.
 async fn has_primary_key(
@@ -7360,17 +7328,6 @@ async fn has_primary_key(
         )
         .await?
         .get(0))
-}
-
-/// The last check on a partitioned root of a servable shape: refuses it
-/// unless [`PARTITIONED_SOURCES_CAPTURED`].
-fn accept_partitioned(table: &str) -> Result<(), CatalogError> {
-    if PARTITIONED_SOURCES_CAPTURED || super::partition_tree::gate_opened_for_tests() {
-        return Ok(());
-    }
-    Err(CatalogError::PartitionedSourceNotCaptured {
-        table: table.to_string(),
-    })
 }
 
 /// Whether trigger capture can key `schema.table`'s changes (issue #622 C5):
@@ -7487,7 +7444,7 @@ async fn reject_unkeyed_source(
         if let Some(refusal) = refusal {
             return Err(CatalogError::PartitionedSource(refusal));
         }
-        return accept_partitioned(qualified_source);
+        return Ok(());
     }
     if change_keyed(client, schema, table).await? {
         return Ok(());
@@ -7584,7 +7541,7 @@ async fn reject_unkeyed_relationship_endpoint(
         if let Some(refusal) = refusal {
             return Err(CatalogError::PartitionedSource(refusal));
         }
-        return accept_partitioned(qualified_endpoint);
+        return Ok(());
     }
     let keyed = match qualified_endpoint.split_once('.') {
         Some((schema, table)) => change_keyed(client, schema, table).await?,

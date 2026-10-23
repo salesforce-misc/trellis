@@ -27,7 +27,7 @@ use trellis::dev::defs::ast::{
 };
 use trellis::dev::staging::{StagingError, await_converged, converged_through, watermark_token};
 
-use crate::model::{Column, Op, Relationship, Table};
+use crate::model::{Column, Op, PartitionStrategy, Partitioning, Relationship, Table};
 
 /// Quotes a Postgres identifier for safe interpolation into SQL text,
 /// mirroring `trellis::pool`'s own (crate-private) helper of the same name.
@@ -330,6 +330,11 @@ pub(super) async fn create_source_table(
         Some(schema) => format!("{}.{}", quote_ident(schema), quote_ident(&table.name)),
         None => quote_ident(&table.name),
     };
+    if let Some(partitioning) = &table.partitioning {
+        raw.batch_execute(&partitioned_source_ddl(&name, table, partitioning))
+            .await?;
+        return Ok(());
+    }
     let mut sql = format!("create table {name} (");
     for (i, column) in table.columns.iter().enumerate() {
         if i > 0 {
@@ -350,6 +355,95 @@ pub(super) async fn create_source_table(
     sql.push(')');
     raw.batch_execute(&sql).await?;
     Ok(())
+}
+
+/// The DDL of a partitioned source table (ADR-0017): the root, keyed by
+/// `(pk_col, partition column)` with the partition column `NOT NULL`, and
+/// its leaves, each named after the root with a `_p<n>` suffix (`_pd` for a
+/// `DEFAULT` leaf).
+fn partitioned_source_ddl(name: &str, table: &Table, partitioning: &Partitioning) -> String {
+    assert!(
+        table.unique_cols.is_empty(),
+        "a partitioned table can't carry a single-column UNIQUE constraint — a generator bug"
+    );
+    let key = quote_ident(&partitioning.column);
+    let mut columns: Vec<String> = table
+        .columns
+        .iter()
+        .map(|column| {
+            let mut sql = format!(
+                "{} {}",
+                quote_ident(&column.name),
+                pg_type_name(column.value_type)
+            );
+            if column.name == table.pk_col || column.name == partitioning.column {
+                sql.push_str(" not null");
+            }
+            sql
+        })
+        .collect();
+    columns.push(format!(
+        "primary key ({}, {key})",
+        quote_ident(&table.pk_col)
+    ));
+    let (method, leaves): (&str, Vec<String>) = match partitioning.strategy {
+        PartitionStrategy::Hash { modulus } => (
+            "hash",
+            (0..modulus)
+                .map(|r| format!("for values with (modulus {modulus}, remainder {r})"))
+                .collect(),
+        ),
+        PartitionStrategy::List { values, default } => (
+            "list",
+            (0..values)
+                .map(|v| format!("for values in ({v})"))
+                .chain(default.then(|| "default".to_string()))
+                .collect(),
+        ),
+        PartitionStrategy::Range { bounds } => (
+            "range",
+            (0..bounds)
+                .map(|b| {
+                    let from = if b == 0 {
+                        "minvalue".to_string()
+                    } else {
+                        b.to_string()
+                    };
+                    let to = if b + 1 == bounds {
+                        "maxvalue".to_string()
+                    } else {
+                        (b + 1).to_string()
+                    };
+                    format!("for values from ({from}) to ({to})")
+                })
+                .collect(),
+        ),
+    };
+    let mut sql = format!(
+        "create table {name} ({}) partition by {method} ({key});",
+        columns.join(", ")
+    );
+    for (i, bound) in leaves.iter().enumerate() {
+        let suffix = if bound == "default" {
+            "pd".to_string()
+        } else {
+            format!("p{i}")
+        };
+        // The leaf sits beside the root: `name` is the root's (maybe
+        // schema-qualified, quoted) name, so the leaf's is built from the
+        // table's own bare name and the same qualifier.
+        let leaf = match name.rsplit_once('.') {
+            Some((schema, _)) => format!(
+                "{schema}.{}",
+                quote_ident(&format!("{}_{suffix}", table.name))
+            ),
+            None => quote_ident(&format!("{}_{suffix}", table.name)),
+        };
+        sql.push_str(&format!(
+            " create table {leaf} partition of {name} {bound};"
+        ));
+    }
+    sql
 }
 
 /// [`apply_op`]'s failure modes: either an unknown table — `apply_op` was
@@ -816,6 +910,61 @@ pub(super) async fn settled(
 mod tests {
     use super::*;
     use trellis::dev::defs::parse;
+
+    /// A partitioned source keys on `(pk, partition column)`, both `NOT
+    /// NULL`, and its leaves cover every value each strategy routes.
+    #[test]
+    fn a_partitioned_source_keys_on_its_partition_column_and_routes_every_value() {
+        let table = Table {
+            name: "t0".to_string(),
+            pk_col: "c0".to_string(),
+            columns: vec![
+                Column {
+                    name: "c0".to_string(),
+                    value_type: crate::model::PRIMARY_KEY_VALUE_TYPE,
+                },
+                Column {
+                    name: "g".to_string(),
+                    value_type: crate::model::PRIMARY_KEY_VALUE_TYPE,
+                },
+            ],
+            unique_cols: Vec::new(),
+            partitioning: None,
+        };
+        let ddl = |strategy| {
+            partitioned_source_ddl(
+                "\"public\".\"t0\"",
+                &table,
+                &Partitioning {
+                    column: "g".to_string(),
+                    strategy,
+                },
+            )
+        };
+        assert_eq!(
+            ddl(PartitionStrategy::Range { bounds: 2 }),
+            "create table \"public\".\"t0\" (\"c0\" bigint not null, \"g\" bigint not null, \
+             primary key (\"c0\", \"g\")) partition by range (\"g\"); \
+             create table \"public\".\"t0_p0\" partition of \"public\".\"t0\" \
+             for values from (minvalue) to (1); \
+             create table \"public\".\"t0_p1\" partition of \"public\".\"t0\" \
+             for values from (1) to (maxvalue);"
+        );
+        assert!(
+            ddl(PartitionStrategy::List {
+                values: 1,
+                default: true
+            })
+            .ends_with(
+                "\"t0_p0\" partition of \"public\".\"t0\" for values in (0); \
+                 create table \"public\".\"t0_pd\" partition of \"public\".\"t0\" default;"
+            )
+        );
+        assert!(
+            ddl(PartitionStrategy::Hash { modulus: 2 })
+                .ends_with("for values with (modulus 2, remainder 1);")
+        );
+    }
 
     /// The reviewer-flagged follow-up to issue #67 (real operator
     /// precedence): a nested, mixed-operator `Expr` must round-trip through

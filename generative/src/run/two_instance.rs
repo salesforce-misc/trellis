@@ -455,6 +455,7 @@ pub fn chain_off(program: &Program) -> Option<Program> {
             pk_col: source.pk_col.clone(),
             columns,
             unique_cols: Vec::new(),
+            partitioning: None,
         });
     }
     (!defs.is_empty()).then(|| read_only_program(tables, Vec::new(), defs))

@@ -77,7 +77,10 @@
 //! root's.
 //!
 //! A name held by the other kind of table than the rows were recorded for
-//! (a plain table's rows, a partitioned root now) is forgotten, not acted on.
+//! (a plain table's rows, a partitioned root now, or the reverse) is a table
+//! dropped and created again, since no `ALTER` turns one into the other: it
+//! pauses like any other disruption. Rows from another cluster are forgotten
+//! instead.
 
 use std::collections::BTreeMap;
 
@@ -540,6 +543,17 @@ fn root_replaced(table: &str) -> String {
     )
 }
 
+/// The finding for a table at `table` of the other kind than the one Trellis
+/// captured there.
+fn kind_replaced(table: &str, partitioned: bool) -> String {
+    let (was, now) = if partitioned {
+        ("a plain table", "a partitioned table")
+    } else {
+        ("a partitioned table", "a plain table")
+    };
+    format!("{table} was {was} and is now {now} (it was dropped and created again)")
+}
+
 /// Whether the rows of `capture_triggers` for `table` came from another
 /// cluster: a stored `system_identifier` that isn't the live one
 /// (`pg_upgrade`). A stored `catalog_oid` that differs is a logical restore,
@@ -677,14 +691,28 @@ pub(crate) async fn check(
     let mut recorded = recorded_triggers(&*client, table).await?;
     let kind = relkind(&*client, table).await?;
     let partitioned = kind.as_deref() == Some("p");
-    // Rows recorded for the other kind of table than the one at the name now
-    // (a plain table's, a partitioned root holds the name; or the reverse), or
-    // for nothing: nothing recorded applies.
-    let other_kind = recorded.keys().any(|node| (*node == 0) == partitioned)
-        || !matches!(kind.as_deref(), Some("r" | "p"));
-    if !recorded.is_empty() && other_kind {
+    // Rows recorded for nothing at the name now: nothing recorded applies.
+    if !recorded.is_empty() && !matches!(kind.as_deref(), Some("r" | "p")) {
         forget(&*client, table).await?;
         return Ok(false);
+    }
+    // Rows recorded for the other kind of table than the one at the name now
+    // (a plain table's, a partitioned root holds the name; or the reverse):
+    // no `ALTER` turns one into the other, so the table was dropped and
+    // created again, unless the rows came from another cluster.
+    if recorded.keys().any(|node| (*node == 0) == partitioned) {
+        if restored(&*client, table).await? {
+            forget(&*client, table).await?;
+            return Ok(false);
+        }
+        pause_readers(
+            client,
+            catalog,
+            table,
+            &disrupted_error(table, &[kind_replaced(table, partitioned)]),
+        )
+        .await?;
+        return Ok(true);
     }
     if !recorded.is_empty() && restored(&*client, table).await? {
         forget(&*client, table).await?;

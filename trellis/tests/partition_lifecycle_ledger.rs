@@ -67,7 +67,6 @@ async fn wrong_groups(d: &Driver) -> Vec<String> {
 
 #[tokio::test]
 async fn a_renamed_partition_key_column_pauses_the_reader_and_resume_rebuilds() {
-    trellis::defs::partition_tree::open_gate_for_tests();
     let mut d = Driver::start(
         TREE,
         &[

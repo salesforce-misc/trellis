@@ -42,7 +42,6 @@ struct Fx {
 
 impl Fx {
     async fn start() -> Fx {
-        trellis::defs::partition_tree::open_gate_for_tests();
         let d = Driver::start(
             DDL,
             &[

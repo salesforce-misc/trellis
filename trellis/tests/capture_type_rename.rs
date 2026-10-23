@@ -586,7 +586,6 @@ async fn a_new_type_at_the_old_name_keeps_its_own_readers() {
 #[tokio::test]
 async fn a_renamed_type_of_a_partitioned_source_is_followed_in_place() {
     trellis::dev::staging::set_group_basis(true);
-    trellis::defs::partition_tree::open_gate_for_tests();
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;

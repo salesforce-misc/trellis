@@ -1902,7 +1902,6 @@ async fn a_release_takes_the_j_lock_against_the_other_sides_pages() {
 #[tokio::test]
 async fn a_partitioned_side_with_no_rows_builds_whole() {
     trellis::dev::staging::set_group_basis(true);
-    trellis::defs::partition_tree::open_gate_for_tests();
     let ddl = "create table public.a (id integer not null, ga integer, t integer, \
                    k integer not null, x integer, primary key (k, id)) partition by list (k); \
                create table public.a0 partition of public.a for values in (1, 2); \
@@ -2180,7 +2179,6 @@ async fn seeded(key: Key, kinds: &[Kind], seed: &str) -> Lab {
 /// [`seeded`] over tables created by `ddl`.
 async fn seeded_in(ddl: &str, key: Key, kinds: &[Kind], seed: &str) -> Lab {
     trellis::dev::staging::set_group_basis(true);
-    trellis::defs::partition_tree::open_gate_for_tests();
     let definitions: Vec<String> = kinds.iter().map(|k| k.definition(key)).collect();
     let definitions: Vec<&str> = definitions.iter().map(String::as_str).collect();
     let d = Driver::start_unbuilt(

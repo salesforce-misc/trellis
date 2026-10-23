@@ -240,8 +240,8 @@ use trellis::dev::defs::ast::{
 };
 
 use crate::model::{
-    Burst, BurstAction, Cardinality, Column, ConcurrentPlan, NamePool, Op, OpOutcome, Program,
-    Relationship, Table, TimedAction,
+    Burst, BurstAction, Cardinality, Column, ConcurrentPlan, NamePool, Op, OpOutcome,
+    PartitionStrategy, Partitioning, Program, Relationship, Table, TimedAction,
 };
 
 /// The inclusive upper bound of the calculated-field value domain.
@@ -2194,6 +2194,83 @@ pub fn interleave_tables(mut program: Program, schedule: &[usize]) -> Program {
     program
 }
 
+/// Makes `program.tables[table]` a partitioned source (ADR-0017), partitioned
+/// by `strategy` on its grain column (`columns[6]`, see
+/// [`build_program_multi_with_shapes`]), the one column every `Aggregate`
+/// def groups by, so each group lives in one partition.
+///
+/// A partition key is part of the primary key, so the grain column becomes a
+/// `bigint`, and it can't be `NULL`: every
+/// op on the table that writes a `NULL` grain writes `0` instead, which keeps
+/// the seeded rows and their revivals ([`Mutate::DuplicateInsert`]) in the
+/// same group, so each op's expected outcome stands. The table's `UNIQUE`
+/// relationship key is dropped, since a unique index on a partitioned table
+/// must hold the partition key.
+///
+/// Layered on top of an already-built program, like [`interleave_tables`].
+///
+/// # Panics
+///
+/// If a definition reads the table other than as an `Aggregate` grouped by
+/// its grain column alone (a 1-1 transform over a partitioned source is
+/// refused at define), or a relationship has the table at either end, or the
+/// program moves a row between groups ([`Mutate::MoveGroup`], whose
+/// revival would no longer collide): all generator bugs.
+pub fn partition_table(mut program: Program, table: usize, strategy: PartitionStrategy) -> Program {
+    let source = &program.tables[table];
+    let name = source.name.clone();
+    let grain = source.columns[6].name.clone();
+    for def in program.defs.iter().filter(|d| d.source == name) {
+        assert!(
+            matches!(&def.key_space, KeySpace::Aggregate { group_by }
+                if group_by == &[GroupByKey::Column(grain.clone())]),
+            "partition_table: {} reads {name} other than grouped by {grain} — a generator bug",
+            def.target
+        );
+    }
+    assert!(
+        program
+            .relationships
+            .iter()
+            .all(|r| r.from_table != name && r.to_table != name),
+        "partition_table: a relationship has {name} at one end — a generator bug"
+    );
+    for op in &mut program.ops {
+        let writes: Vec<&mut (String, Option<String>)> = match op {
+            Op::Insert { table: t, row, .. } if *t == name => row.iter_mut().collect(),
+            Op::Update {
+                table: t, changes, ..
+            } if *t == name => {
+                assert!(
+                    changes.iter().all(|(c, _)| *c != grain),
+                    "partition_table: an update moves a row of {name} between groups — a \
+                     generator bug"
+                );
+                Vec::new()
+            }
+            Op::BulkInsert { table: t, rows, .. } if *t == name => {
+                rows.iter_mut().flat_map(|r| r.iter_mut()).collect()
+            }
+            _ => Vec::new(),
+        };
+        for (column, value) in writes {
+            if *column == grain && value.is_none() {
+                *value = Some("0".to_string());
+            }
+        }
+    }
+    let source = &mut program.tables[table];
+    source.unique_cols.clear();
+    // A primary-key column must be an exact type (`numeric` is refused as
+    // one), and the grain's values are small integers.
+    source.columns[6].value_type = crate::model::PRIMARY_KEY_VALUE_TYPE;
+    source.partitioning = Some(Partitioning {
+        column: grain,
+        strategy,
+    });
+    program
+}
+
 /// Puts `program.ops` in `order`, a permutation of their indices.
 fn reorder_ops(program: &mut Program, order: Vec<usize>) {
     let mut ops: Vec<Option<Op>> = std::mem::take(&mut program.ops)
@@ -3147,6 +3224,7 @@ pub fn noise_table(name: &str, pk_col: &str, extra_col: &str, extra_type: ValueT
             },
         ],
         unique_cols: Vec::new(),
+        partitioning: None,
     }
 }
 
@@ -3873,6 +3951,77 @@ mod strategy {
                     build_program_multi_with_relationships(&tables, &defs, &derived, &rel_fields),
                     &schedule,
                 )
+            })
+    }
+
+    /// How a partitioned table routes its rows ([`partition_table`]): `HASH`
+    /// over one to four leaves, `LIST` with a leaf per grain value and no
+    /// `DEFAULT`, or with fewer and a `DEFAULT` that takes the rest, or
+    /// `RANGE` over one to three bounds. Every draw routes every grain value
+    /// [`grain_value`] draws (`0..=GRAIN_MAX`).
+    fn partition_strategy() -> impl Strategy<Value = PartitionStrategy> {
+        prop_oneof![
+            (1u8..=4).prop_map(|modulus| PartitionStrategy::Hash { modulus }),
+            Just(PartitionStrategy::List {
+                values: GRAIN_MAX as u8 + 1,
+                default: false,
+            }),
+            (1u8..=GRAIN_MAX as u8).prop_map(|values| PartitionStrategy::List {
+                values,
+                default: true,
+            }),
+            (1u8..=GRAIN_MAX as u8 + 1).prop_map(|bounds| PartitionStrategy::Range { bounds }),
+        ]
+    }
+
+    /// A [`trivial_program_with`] program (awkward values on) whose first
+    /// table is a partitioned source ([`partition_table`], ADR-0017), read by
+    /// at least one `GROUP BY` definition over its grain column. Any other
+    /// definition drawn over that table is kept only as an `Aggregate`,
+    /// without a relationship: a 1-1 transform over a partitioned source, or
+    /// one as a relationship's from-side, is refused at define. The other
+    /// tables draw as usual. Seeds and mutates write through the root, so
+    /// each write lands in, and is captured from, one leaf.
+    pub fn partitioned_program() -> impl Strategy<Value = Program> {
+        prop::collection::vec(table_spec(true), 1..=MAX_TABLES)
+            .prop_flat_map(|tables| {
+                let table_count = tables.len();
+                let defs = prop::collection::vec(def_draw(table_count), 0..MAX_DEFS);
+                let op_count = tables
+                    .iter()
+                    .map(|t| t.seed_values.len() + t.mutates.len())
+                    .sum();
+                (
+                    Just(tables),
+                    partition_strategy(),
+                    interleave_schedule(op_count),
+                    aggregate_functions(),
+                    defs,
+                )
+            })
+            .prop_map(|(tables, strategy, schedule, functions, draws)| {
+                let mut defs: Vec<(usize, DefShape)> = vec![(0, DefShape::Aggregate { functions })];
+                let mut derived: Vec<Option<DerivedShape>> = vec![None];
+                let mut rel_fields: Vec<Option<RelFieldSpec>> = vec![None];
+                for (idx, shape, derived_shape, rel_field) in draws {
+                    if idx == 0 {
+                        if matches!(shape, DefShape::OneToOne) {
+                            continue;
+                        }
+                        defs.push((idx, shape));
+                        derived.push(None);
+                        rel_fields.push(None);
+                    } else {
+                        defs.push((idx, shape));
+                        derived.push(derived_shape);
+                        rel_fields.push(rel_field);
+                    }
+                }
+                let program = interleave_tables(
+                    build_program_multi_with_relationships(&tables, &defs, &derived, &rel_fields),
+                    &schedule,
+                );
+                partition_table(program, 0, strategy)
             })
     }
 
@@ -4941,14 +5090,87 @@ pub use strategy::{
     COOLING_BACKFILL_AT, COOLING_BACKFILL_LAG, LOAD_CHUNK_ROWS, LOAD_PACE_MICROS, LOAD_STALL_SEALS,
     MAX_ACTION_DRAWS, bulk_insert_program, checkpoint_plan_for, cooling_backfill_case,
     cooling_key_case, db_admin_plan_for, hot_key_case, mid_burst_case, noise_plan_for,
-    program_with_client_restart, program_with_mid_stream_def_install, program_with_scale_out,
-    restore_plan_for, steady_load_case, trivial_one_to_one_program_with, trivial_program,
-    trivial_program_with,
+    partitioned_program, program_with_client_restart, program_with_mid_stream_def_install,
+    program_with_scale_out, restore_plan_for, steady_load_case, trivial_one_to_one_program_with,
+    trivial_program, trivial_program_with,
 };
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn one_table_program(shape: DefShape, grain: Option<&str>) -> Program {
+        build_program_multi_with_shapes(
+            &[TableSpec {
+                grain_values: vec![grain.map(str::to_string)],
+                ..TableSpec::numeric_only(
+                    vec![(Some(1), Some(2))],
+                    vec![
+                        Mutate::Delete { pk: 1 },
+                        Mutate::DuplicateInsert {
+                            pk: 1,
+                            c1: None,
+                            c2: None,
+                        },
+                    ],
+                )
+            }],
+            &[(0, shape)],
+        )
+    }
+
+    /// A partitioned table's grain is a `bigint` written `0` for `NULL`
+    /// (it is part of the primary key), its `UNIQUE` key is gone, and the
+    /// revival writes the same grain as the seed, so it still collides.
+    #[test]
+    fn partition_table_writes_a_null_grain_as_zero_and_drops_the_unique_key() {
+        let program = partition_table(
+            one_table_program(
+                DefShape::Aggregate {
+                    functions: vec![AggregateFn::Count],
+                },
+                None,
+            ),
+            0,
+            PartitionStrategy::Hash { modulus: 2 },
+        );
+        let table = &program.tables[0];
+        let grain = table.columns[6].name.clone();
+        assert!(table.unique_cols.is_empty());
+        assert_eq!(
+            table.columns[6].value_type,
+            crate::model::PRIMARY_KEY_VALUE_TYPE
+        );
+        assert_eq!(
+            table.partitioning,
+            Some(Partitioning {
+                column: grain.clone(),
+                strategy: PartitionStrategy::Hash { modulus: 2 },
+            })
+        );
+        let grains: Vec<_> = program
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::Insert { row, .. } => row.iter().find(|(c, _)| *c == grain).cloned(),
+                _ => None,
+            })
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(grains, vec![Some("0".to_string()), Some("0".to_string())]);
+    }
+
+    /// A 1-1 transform over a partitioned source is refused at define, so
+    /// asking for one is a generator bug.
+    #[test]
+    #[should_panic(expected = "other than grouped by")]
+    fn partition_table_refuses_a_one_to_one_reader() {
+        partition_table(
+            one_table_program(DefShape::OneToOne, Some("1")),
+            0,
+            PartitionStrategy::Range { bounds: 3 },
+        );
+    }
 
     /// Two tables, one definition, one relationship — the smallest program
     /// that can carry a relationship at all, reused by the tests below.

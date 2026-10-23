@@ -39,6 +39,34 @@ pub struct Table {
     /// declaration with a *non*-unique to-side column, so this one list
     /// decides both cardinalities.
     pub unique_cols: Vec<String>,
+    /// How the table is partitioned (ADR-0017), or `None` for a plain table.
+    /// A partitioned table's primary key is `(pk_col, column)`, the
+    /// partition column is `NOT NULL`, and it has no `UNIQUE` constraint
+    /// (`unique_cols` is empty): Postgres requires every unique index on a
+    /// partitioned table to hold the partition key.
+    pub partitioning: Option<Partitioning>,
+}
+
+/// A partitioned [`Table`]'s single level: the column it is partitioned by,
+/// and how.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Partitioning {
+    pub column: String,
+    pub strategy: PartitionStrategy,
+}
+
+/// How a partitioned [`Table`] routes its rows to its leaves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartitionStrategy {
+    /// `HASH`, with this many leaves (`1..`).
+    Hash { modulus: u8 },
+    /// `LIST`: one leaf per value in `0..=values - 1`, plus a `DEFAULT` leaf
+    /// when `default`. Without one, the strategy must hold every value the
+    /// program writes.
+    List { values: u8, default: bool },
+    /// `RANGE`: leaves `(MINVALUE, 1)`, `[1, 2)`, ..., `[bounds - 1,
+    /// MAXVALUE)`, so every value routes.
+    Range { bounds: u8 },
 }
 
 /// The [`ValueType`] every generated table's primary-key column carries.
@@ -89,6 +117,7 @@ impl Table {
             pk_col,
             columns,
             unique_cols: Vec::new(),
+            partitioning: None,
         }
     }
 

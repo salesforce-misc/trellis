@@ -24,7 +24,8 @@ use generative::backend::{Backend, ManualBackend};
 use generative::generate::{
     AggregateColumn, AggregateFn, DefShape, DerivedShape, Mutate, RelAggregateFn, RelFieldKind,
     RelFieldSpec, TableSpec, build_program, build_program_multi, build_program_multi_with_derived,
-    build_program_multi_with_relationships, build_program_multi_with_shapes, trivial_program,
+    build_program_multi_with_relationships, build_program_multi_with_shapes, partition_table,
+    partitioned_program, trivial_program,
 };
 use generative::model::group_key;
 use generative::run::{RunError, check_program, run_convergence};
@@ -157,6 +158,107 @@ proptest! {
     #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
     fn property_convergence_holds_for_trivial_programs(program in trivial_program()) {
         run_one(&program)?;
+    }
+
+    /// ADR-0017: a program whose first table is a partitioned source, read
+    /// by `GROUP BY` definitions over its partition column. See
+    /// `partitioned_program`.
+    #[test]
+    #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
+    fn property_convergence_holds_over_a_partitioned_source(program in partitioned_program()) {
+        run_one(&program)?;
+    }
+}
+
+/// ADR-0017: a hand-built program over a partitioned source, one per
+/// partitioning strategy, converges end to end: seeds and writes through the
+/// root land in each leaf, a `NULL` grain is written as `0` (the partition
+/// key is part of the primary key), and the aggregate grouped by the
+/// partition column follows deletes and a truncate of the root.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_program_over_a_partitioned_source_converges_end_to_end() {
+    use generative::model::PartitionStrategy;
+    let cluster = TestCluster::start();
+    for strategy in [
+        PartitionStrategy::Hash { modulus: 3 },
+        PartitionStrategy::List {
+            values: 3,
+            default: false,
+        },
+        PartitionStrategy::List {
+            values: 1,
+            default: true,
+        },
+        PartitionStrategy::Range { bounds: 3 },
+    ] {
+        let db = cluster.create_isolated_database().await;
+        let program = partition_table(
+            build_program_multi_with_shapes(
+                &[TableSpec {
+                    seed_values: vec![
+                        (Some(10), Some(1)),
+                        (Some(20), Some(2)),
+                        (Some(30), Some(3)),
+                        (Some(40), None),
+                    ],
+                    text_values: vec![None; 4],
+                    bool_values: vec![None; 4],
+                    uuid_values: vec![None; 4],
+                    grain_values: vec![
+                        Some("0".to_string()),
+                        Some("1".to_string()),
+                        Some("2".to_string()),
+                        None,
+                    ],
+                    rel_fk_values: vec![None; 4],
+                    mutates: vec![
+                        Mutate::Update {
+                            pk: 2,
+                            c1: Some(7),
+                            c2: None,
+                        },
+                        Mutate::Delete { pk: 3 },
+                        Mutate::DuplicateInsert {
+                            pk: 1,
+                            c1: Some(5),
+                            c2: Some(5),
+                        },
+                        Mutate::DuplicateInsert {
+                            pk: 3,
+                            c1: Some(9),
+                            c2: Some(9),
+                        },
+                        Mutate::Truncate,
+                        Mutate::DuplicateInsert {
+                            pk: 4,
+                            c1: Some(1),
+                            c2: Some(1),
+                        },
+                    ],
+                }],
+                &[(
+                    0,
+                    DefShape::Aggregate {
+                        functions: vec![
+                            AggregateFn::Sum(AggregateColumn::C1),
+                            AggregateFn::Count,
+                            AggregateFn::Min(AggregateColumn::C2),
+                        ],
+                    },
+                )],
+            ),
+            0,
+            strategy,
+        );
+        let mut backend = ManualBackend::connect(db.dsn())
+            .await
+            .expect("connect manual backend");
+        let pool =
+            Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
+        let outcome = run_convergence(&mut backend, &pool, &program)
+            .await
+            .unwrap_or_else(|err| panic!("{strategy:?}: {err:?}"));
+        assert!(outcome.as_pass(), "{strategy:?}: {outcome}");
     }
 }
 

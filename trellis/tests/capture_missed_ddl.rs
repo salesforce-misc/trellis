@@ -998,7 +998,6 @@ async fn bring_live_except(raw: &mut Client, pool: &trellis::Pool, paused: &[&st
 /// that covers it, and rebuilds nothing.
 #[tokio::test]
 async fn a_same_type_rewrite_of_a_partitioned_source_rebuilds_its_readers() {
-    trellis::defs::partition_tree::open_gate_for_tests();
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;

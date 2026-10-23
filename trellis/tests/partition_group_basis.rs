@@ -111,7 +111,6 @@ impl Fx {
 
     async fn start_with(schema: &str, seed: &str, definitions: &[&str]) -> Fx {
         trellis::dev::staging::set_group_basis(true);
-        trellis::defs::partition_tree::open_gate_for_tests();
         let d = Driver::start(
             schema,
             &[("id", int4()), ("g", int4()), ("v", int4())],
@@ -1979,7 +1978,6 @@ async fn a_leaf_detached_and_corrected_before_its_turn_is_read_through_the_root(
 #[tokio::test]
 async fn groups_with_a_null_part_read_through_the_root_are_exact() {
     trellis::dev::staging::set_group_basis(true);
-    trellis::defs::partition_tree::open_gate_for_tests();
     let schema = format!(
         "create table public.items (id integer not null, g integer not null, h integer, \
          v integer not null, primary key (g, id)) partition by range (g); \
