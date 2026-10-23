@@ -2243,7 +2243,6 @@ async fn a_leaf_read_matches_a_varchar_group_column_at_its_held_type() {
         "label varchar(10) not null, v integer not null,",
     ) + "create index on public.items (g, label);";
     trellis::dev::staging::set_group_basis(true);
-    trellis::defs::partition_tree::open_gate_for_tests();
     let d = Driver::start(
         &schema,
         &[
