@@ -4109,7 +4109,7 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
             crate::instance_log::info!(
                 transform = %target,
                 "transform resume accepted; it waits for the changes staged before an enum \
-                 relabel to drain, then the staging worker rebuilds it"
+                 relabel or re-type to drain, then the staging worker rebuilds it"
             );
         }
     }
@@ -4189,8 +4189,9 @@ enum ResumeStep {
     /// An upstream of it isn't `live` ([`upstream_not_live`]); it stays
     /// paused with a resume request until every upstream is.
     Waiting(Upstream),
-    /// It was paused for a relabelled enum value, and a change staged before
-    /// the relabel is still pending on a table it reads
+    /// It was paused for a relabelled enum value or a column re-typed to
+    /// another enum, and a change staged before that is still pending on a
+    /// table it reads
     /// ([`relabel_changes_pending`]); it stays paused with a resume request
     /// until none is.
     Draining,
@@ -4306,7 +4307,8 @@ async fn request_wait(
 }
 
 /// Whether definition `id` (on `source_table`) was paused for a relabelled
-/// enum value (`capture_failures.relabel_lsn`, #1241) and a change at or
+/// enum value or a column re-typed to another enum
+/// (`capture_failures.relabel_lsn`, #1241, #1327) and a change at or
 /// below that position is still pending on its source or joined table
 /// ([`super::converge::table_rows_pending_through`]), an image-less
 /// `recompute` included. Such a change holds the old label as text, which
@@ -4340,13 +4342,15 @@ async fn relabel_changes_pending(
 }
 
 /// The `capture_failure` of a definition whose resume waits for the changes
-/// staged before an enum relabel to drain ([`relabel_changes_pending`]).
+/// staged before an enum relabel or re-type to drain
+/// ([`relabel_changes_pending`]).
 const DRAINING_FAILURE: &str = "resuming: waiting for the changes staged before an enum value \
-     this definition reads was renamed to drain, since they name the old label; then the \
-     staging worker rebuilds this definition from the source, which stays paused until then";
+     this definition reads was renamed, or its column re-typed to another enum, to drain, since \
+     they name the old label; then the staging worker rebuilds this definition from the source, \
+     which stays paused until then";
 
 /// Records that definition `id`'s resume waits for the changes staged before
-/// an enum relabel to drain (#1241): a resume request, which
+/// an enum relabel or re-type to drain (#1241, #1327): a resume request, which
 /// [`finish_requested_resumes`] completes once none is pending, and the
 /// `capture_failure` that says so. The record's `relabel_lsn` stays, so the
 /// completion still rebuilds as a relabel's resume.
@@ -4648,9 +4652,12 @@ async fn complete_resume(
     if restored {
         reset_ordering_state(txn, schema, id, &definition.target_table).await?;
     }
-    // #1241: a definition paused for a relabelled enum value rebuilds without
-    // casting any label it stored. Its resume waited until every change
-    // staged before the relabel had drained ([`relabel_changes_pending`]);
+    // #1241, #1327: a definition paused for a relabelled enum value, or a
+    // column re-typed to another enum, rebuilds without casting any label it
+    // stored; its copies were re-typed without a cast
+    // ([`crate::defs::copies::CopyState::discards_values`]). Its resume
+    // waited until every change staged before the change had drained
+    // ([`relabel_changes_pending`]);
     // those still in their ring slot are discarded, since a group-basis or
     // JOIN rebuild reads the old images in the ring. A ledger keyed by a
     // source key with an enum column holds the old label as `__from_key`,
@@ -5146,7 +5153,7 @@ async fn resume_caused_definition(
                 transform = %target,
                 upstream_id = upstream,
                 "transform resume requested once its upstream was live; it waits for the \
-                 changes staged before an enum relabel to drain"
+                 changes staged before an enum relabel or re-type to drain"
             );
         }
         Ok(ResumeStep::Retyping(copies)) => {

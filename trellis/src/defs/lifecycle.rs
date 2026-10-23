@@ -361,11 +361,13 @@ pub(crate) async fn pause_for_restore(
         == 1)
 }
 
-/// Pauses definition `id` because an enum type it reads was relabelled
-/// (`ALTER TYPE ... RENAME VALUE`, #1241, ADR-0020): the label text Trellis
-/// staged and keyed by names a value that no longer exists. The record's
+/// Pauses definition `id` because the enum values it reads changed identity
+/// (ADR-0020): an enum type it reads was relabelled (`ALTER TYPE ... RENAME
+/// VALUE`, #1241), or a column it reads was re-typed from one enum to
+/// another (#1327). The label text Trellis staged and keyed by names no
+/// value of the column's type. The record's
 /// `relabel_lsn` is `lsn`, the WAL insert position the capture pass read
-/// after finding it, raised by a later relabel; its resume waits until no
+/// after finding it, raised by a later such change; its resume waits until no
 /// change at or below it is pending on the tables the definition reads, and
 /// rebuilds from the source (`staging::quarantine`). Kind `capture`. A
 /// definition already frozen keeps its status but gets the record, so its

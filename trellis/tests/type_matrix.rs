@@ -15,7 +15,8 @@
 //! - The type ([`TYPES`]): `varchar`, `bpchar`, `bit`, `varbit`, `numeric`,
 //!   `time`, `timetz`, `timestamp`, `timestamptz`, `interval` and an array
 //!   (refused in every place), `char(n)` moved to `text`, and an enum, whose
-//!   value identity is its labels.
+//!   value identity is its labels, relabelled or re-typed to another enum
+//!   (#1327), which pauses every reader in every place.
 //! - The change ([`Change`]): a catalog-only widening, a widening or `USING`
 //!   rewrite that re-renders the stored values, a narrowing, and an enum
 //!   relabel (`RENAME VALUE`), which pauses every reader of the type in every
@@ -353,6 +354,24 @@ const TYPES: &[Ty] = &[
             "calm",
         ),
     },
+    // A re-type from one enum to another (#1327): a value-identity change
+    // like a relabel. The new type shares no label with the old one, so no
+    // stored label casts to it; the source's own `USING` maps the values.
+    Ty {
+        label: "enum to enum",
+        value_type: ValueType::Other(PgType::Enum("enum:public.tone")),
+        prelude: "create type public.tone as enum ('brisk', 'calm'); \
+                  create type public.mood as enum ('fast', 'slow'); ",
+        catalog_only: None,
+        rewrite: row(
+            "public.tone",
+            "public.mood using (case {c} when 'brisk' then 'fast' else 'slow' end)::public.mood",
+            "brisk",
+            "slow",
+        ),
+        narrow: None,
+        relabel: None,
+    },
 ];
 
 /// Whether `place` admits a column of the type `label` at define. The table
@@ -363,7 +382,7 @@ fn admits(place: Place, label: &str) -> bool {
         // doesn't place is out of the definition.
         Place::Passthrough => label != "varchar[]",
         // An enum is a key, join and group key in every place.
-        _ if label == "enum" => true,
+        _ if label.starts_with("enum") => true,
         // A key is a text-stable type: not `numeric`, `interval`,
         // `character(n)` or an array.
         Place::PrimaryKey => matches!(
@@ -559,7 +578,7 @@ struct Scenario {
     seed_sql: String,
     alter_sql: String,
     hi_sql: String,
-    target_sql: &'static str,
+    target_sql: String,
     oracle_sql: String,
 }
 
@@ -570,6 +589,14 @@ fn alter_clause(row: &Row, column: &str) -> String {
 
 fn scenario(place: Place, ty: &Ty, row: &Row) -> Scenario {
     let value_type = ty.value_type;
+    // A group key compares by value, as a `GROUP BY` does. An enum's is its
+    // label, and its text compares a target re-typed from another enum
+    // with the source before a `RESUME` re-types it.
+    let g = if ty.label.starts_with("enum") {
+        "g::text"
+    } else {
+        "g"
+    };
     let alter = |table: &str, column: &str| {
         format!(
             "alter table public.{table} alter column {column} type {}",
@@ -590,7 +617,7 @@ fn scenario(place: Place, ty: &Ty, row: &Row) -> Scenario {
             seed_sql: format!("insert into public.t values (1, '{}', 1)", row.seed),
             alter_sql: alter("t", "v"),
             hi_sql: format!("insert into public.t values (2, '{}', 2)", row.hi),
-            target_sql: "select id, v::text, n from public.c",
+            target_sql: "select id, v::text, n from public.c".into(),
             oracle_sql: "select id, v::text, n from public.t".into(),
         },
         // A 1-1 target over `t(k <T> primary key, n integer)`, keyed by `k`.
@@ -605,7 +632,7 @@ fn scenario(place: Place, ty: &Ty, row: &Row) -> Scenario {
             seed_sql: format!("insert into public.t values ('{}', 1)", row.seed),
             alter_sql: alter("t", "k"),
             hi_sql: format!("insert into public.t values ('{}', 2)", row.hi),
-            target_sql: "select k::text, n from public.c",
+            target_sql: "select k::text, n from public.c".into(),
             oracle_sql: "select k::text, n from public.t".into(),
         },
         // A group-basis aggregate over `t(id integer primary key, g <T>, x
@@ -625,10 +652,10 @@ fn scenario(place: Place, ty: &Ty, row: &Row) -> Scenario {
             seed_sql: format!("insert into public.t values (1, '{}', 1)", row.seed),
             alter_sql: alter("t", "g"),
             hi_sql: format!("insert into public.t values (2, '{}', 2)", row.hi),
-            target_sql: "select g, n, sx from public.c",
-            oracle_sql: "select g, count(*)::bigint, sum(x)::bigint \
-                         from public.t group by g"
-                .into(),
+            target_sql: format!("select {g}, n, sx from public.c"),
+            oracle_sql: format!(
+                "select {g}, count(*)::bigint, sum(x)::bigint from public.t group by g"
+            ),
         },
         // A `JOIN` on `a.k = b.k` of two tables whose `k` is `<T>`, grouped
         // by `k`. Both tables change `k`.
@@ -659,7 +686,7 @@ fn scenario(place: Place, ty: &Ty, row: &Row) -> Scenario {
                  insert into public.b values (2, '{0}', 20)",
                 row.hi
             ),
-            target_sql: "select k::text, n, sy from public.c",
+            target_sql: "select k::text, n, sy from public.c".into(),
             oracle_sql: "select a.k::text, count(*)::bigint, sum(b.y)::bigint \
                          from public.a left join public.b on a.k = b.k group by a.k"
                 .into(),
@@ -704,10 +731,11 @@ fn scenario(place: Place, ty: &Ty, row: &Row) -> Scenario {
                 "insert into public.a values (2, '{}', 2); insert into public.b values (2, 2, 20)",
                 row.hi
             ),
-            target_sql: "select g, n, sy from public.c",
-            oracle_sql: "select a.g, count(*)::bigint, sum(b.y)::bigint \
-                         from public.a left join public.b on a.j = b.j group by a.g"
-                .into(),
+            target_sql: format!("select {g}, n, sy from public.c"),
+            oracle_sql: format!(
+                "select a.{g}, count(*)::bigint, sum(b.y)::bigint \
+                 from public.a left join public.b on a.j = b.j group by a.g"
+            ),
         },
     }
 }
@@ -747,7 +775,7 @@ async fn run(place: Place, ty: &Ty, change: Change, row: &Row) -> Outcome {
     // it to the copy's type must keep it whole (a bare `bit` is `bit(1)`,
     // #1262).
     assert_eq!(
-        diverged(&d, scn.target_sql, &scn.oracle_sql).await,
+        diverged(&d, &scn.target_sql, &scn.oracle_sql).await,
         Vec::<String>::new(),
         "{place:?}, {}: a captured write before any change differs",
         ty.label
@@ -761,7 +789,7 @@ async fn run(place: Place, ty: &Ty, change: Change, row: &Row) -> Outcome {
     d.ctl.batch_execute(&alter_sql).await.expect("alter");
     write(&d, &scn.hi_sql).await;
     let drain_failures = settle_tolerant(&mut d).await;
-    let diverged_before_pass = diverged(&d, scn.target_sql, &scn.oracle_sql).await;
+    let diverged_before_pass = diverged(&d, &scn.target_sql, &scn.oracle_sql).await;
     let trellis = facade(d.db.dsn()).await;
     let status_before_pass = status_of(&trellis, "c").await;
     let self_check_before_pass = self_check_of(&trellis, "c").await;
@@ -769,7 +797,7 @@ async fn run(place: Place, ty: &Ty, change: Change, row: &Row) -> Outcome {
     pass(&mut d).await;
     settle_tolerant(&mut d).await;
     let status_after_pass = status_of(&trellis, "c").await;
-    let diverged_after_pass = diverged(&d, scn.target_sql, &scn.oracle_sql).await;
+    let diverged_after_pass = diverged(&d, &scn.target_sql, &scn.oracle_sql).await;
 
     // Converge: explicit rounds of the builds a pass asks for, a drain and a
     // pass, resuming a pause. A change that is not a catalog-only widening
@@ -801,7 +829,7 @@ async fn run(place: Place, ty: &Ty, change: Change, row: &Row) -> Outcome {
     }
     let status = status_of(&trellis, "c").await;
     let self_check = self_check_of(&trellis, "c").await;
-    let diverged_at_end = diverged(&d, scn.target_sql, &scn.oracle_sql).await;
+    let diverged_at_end = diverged(&d, &scn.target_sql, &scn.oracle_sql).await;
     let outcome = Outcome {
         drain_failures,
         status_before_pass,
@@ -851,6 +879,11 @@ async fn cell(place: Place, ty: &Ty, change: Change) {
     if change == Change::Relabel && place == Place::JoinOnOneSided {
         return;
     }
+    // Nor does a re-type to another enum: the pair would have no `=`.
+    let enum_to_enum = ty.label == "enum to enum";
+    if enum_to_enum && place == Place::JoinOnOneSided {
+        return;
+    }
     let outcome = run(place, ty, change, row).await;
     let tag = format!("{place:?}, {} {change:?}", ty.label);
     if change == Change::CatalogOnly {
@@ -885,7 +918,7 @@ async fn cell(place: Place, ty: &Ty, change: Change) {
     }
     // A passthrough copy has no modifier, so no change of one fails a write
     // or pauses it: a rewrite rebuilds it on its own (#1238, #1261).
-    if place == Place::Passthrough && change != Change::Relabel {
+    if place == Place::Passthrough && change != Change::Relabel && !enum_to_enum {
         assert_eq!(
             (outcome.drain_failures, outcome.pauses.as_slice()),
             (0, &[] as &[String]),
@@ -902,6 +935,17 @@ async fn cell(place: Place, ty: &Ty, change: Change) {
                 .any(|pause| pause.contains("was renamed to 'zippy'")),
             "{tag}: the relabel paused nothing: {:?}",
             outcome.pauses
+        );
+    }
+    // A re-type to another enum changes every value's identity: no stored
+    // label is one of the new type's, so it pauses every reader of the
+    // column, whatever the place, and `RESUME` rebuilds without casting
+    // one (ADR-0020, #1327).
+    if enum_to_enum {
+        assert!(
+            !outcome.pauses.is_empty(),
+            "{tag}: the re-type to another enum paused nothing; trace {:?}",
+            outcome.trace
         );
     }
     for pause in &outcome.pauses {
@@ -1111,6 +1155,7 @@ matrix! {
     interval_narrow: "interval", Change::Narrow;
     interval_fields_catalog_only: "interval fields", Change::CatalogOnly;
     enum_relabel: "enum", Change::Relabel;
+    enum_to_enum_rewrite: "enum to enum", Change::Rewrite;
 }
 
 /// ADR-0020 rule 6, at define: a Trellis target's copy of `k` (no modifier)
@@ -1122,7 +1167,12 @@ async fn a_trellis_copy_pairs_with_a_source_column_of_any_modifier() {
     trellis::dev::staging::set_group_basis(true);
     let mut refused = Vec::new();
     let mut tried = 0;
-    for ty in TYPES.iter().filter(|ty| admits(Place::JoinOn, ty.label)) {
+    // A re-type to another enum changes the type, not a modifier: the pair
+    // would have no `=`.
+    for ty in TYPES
+        .iter()
+        .filter(|ty| admits(Place::JoinOn, ty.label) && ty.label != "enum to enum")
+    {
         for row in [&ty.catalog_only, &ty.rewrite, &ty.narrow]
             .into_iter()
             .filter_map(Option::as_ref)

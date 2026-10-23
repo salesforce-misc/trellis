@@ -297,9 +297,9 @@ async fn a_new_value_pauses_nothing_and_is_recorded() {
 }
 
 /// A relabel of an enum type a definition no longer reads (its source's
-/// column was re-typed to another enum, and the old type's
-/// `definition_types` row stays until a resume) pauses nothing, and a
-/// relabel of the type it reads now does.
+/// column was re-typed to another enum, which pauses it, and its resume
+/// records the new type) pauses nothing, and a relabel of the type it reads
+/// now does.
 #[tokio::test]
 async fn a_relabel_of_a_type_no_longer_read_pauses_nothing() {
     trellis::dev::staging::set_group_basis(true);
@@ -314,7 +314,7 @@ async fn a_relabel_of_a_type_no_longer_read_pauses_nothing() {
         "alter table public.s alter column tone type public.mood using tone::text::public.mood",
     )
     .await;
-    // However the re-type is taken up (a rebuild, or a pause and a resume).
+    // The re-type pauses it (#1327), and the resume rebuilds it.
     for _ in 0..4 {
         h.pass().await;
         if h.status("t1").await == TransformStatus::Paused {
@@ -326,8 +326,8 @@ async fn a_relabel_of_a_type_no_longer_read_pauses_nothing() {
     h.converge("after the re-type").await;
     assert_eq!(
         h.rows("select type_name from definition_types").await,
-        ["(public.tone)"],
-        "the re-type paused nothing, so the old type's row stays"
+        ["(public.mood)"],
+        "the resume records the type the column has now"
     );
     let types = "select count(*) from definition_enum_values v \
                  where v.type_oid = 'public.tone'::regtype";

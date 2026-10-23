@@ -484,7 +484,22 @@ Nothing else changes a label: `pg_upgrade` keeps the OIDs and the labels,
 and a logical restore pauses every definition first, compares none of
 them, and `RESUME` records the new OIDs.
 
-`RESUME` of a definition paused for a relabel:
+A column re-typed from one enum to another (`ALTER COLUMN tone TYPE mood
+USING …`) is the same kind of change: no value of `tone` is a value of
+`mood`, so every label Trellis kept for the column names nothing under its
+type. The same pass finds each column a definition reads whose recorded
+enum (the `enum:<schema>.<type>` token of its source or joined column, or
+its key column's recorded type) isn't the column's enum now, and pauses the
+definition the same way, with `column "tone" of public.s, which this
+definition reads, changed type from enum public.tone to enum public.mood;
+…` and the same `relabel_lsn`. It records the new type in the same
+transaction, so a later pass finds nothing new. A re-type to a type that
+isn't an enum (`text`, say) keeps every label as a value of the new type and
+is answered as any other re-type is
+([a re-typed key column](#a-re-typed-key-column-or-an-outgrown-copy),
+[a column changed without a trigger](#a-column-changed-or-rewritten-without-a-trigger)).
+
+`RESUME` of a definition paused for a relabel or a re-type to another enum:
 
 1. waits, as `resuming: …`, while a change at or below `relabel_lsn` is
    still pending on its source or joined table, an image-less `recompute`
@@ -494,12 +509,17 @@ them, and `RESUME` records the new OIDs.
 2. deletes those changes from their ring slots once drained, since a
    group-basis or `JOIN` rebuild names groups from the old images there, and
    the definition's held keys and parked images, as every resume does;
-3. rebuilds from the source. A target whose ledger is keyed by a source key
+3. re-types each column Trellis created of the old enum to the new one
+   without a cast: `USING NULL`, after deleting the rows of a table whose key
+   column it is, since nulling a key in place would merge every group onto
+   one. The status reads `backfilling` until the rebuild has written them
+   back: the old keys can't be expressed in the new type at all;
+4. rebuilds from the source. A target whose ledger is keyed by a source key
    with an enum column (a 1-1, or a ledger aggregate, over a table keyed by
    an enum) is emptied with its ledger first and rebuilt as define builds
    it, so no stored label is cast; its readers see it empty until then.
    Every other shape rebuilds in place;
-4. records the labels again.
+5. records the labels again.
 
 Two narrow windows still leave the old label in a change Trellis then
 casts: a value added, written and relabelled between two passes (the pass

@@ -113,6 +113,23 @@ impl CopyKind {
         self == CopyKind::JoinHidden
     }
 
+    /// Whether the copy is a key of its table's rows: a target's, a
+    /// ledger's or a group-delta table's `GROUP BY` column, a 1-1 target's
+    /// key, a projection's key or group column. Such a column can't be
+    /// nulled in place ([`retype_statements`]).
+    fn is_key(self) -> bool {
+        matches!(
+            self,
+            CopyKind::TargetKey
+                | CopyKind::GroupBy
+                | CopyKind::LedgerGroup
+                | CopyKind::DeltasGroup
+                | CopyKind::ProjectionKey
+                | CopyKind::ProjectionGroupBy
+                | CopyKind::JoinGroupBy
+        )
+    }
+
     /// Whether the copy is typed as its source column's value family
     /// ([`super::ddl::pg_type_name`]) rather than as the column itself.
     fn by_family(self) -> bool {
@@ -708,6 +725,9 @@ pub(crate) struct CopyType {
     pub sql: String,
     /// Whether the type takes a collation.
     pub collatable: bool,
+    /// Whether it is an enum type, whose values are its own labels
+    /// (ADR-0020): no value of one enum is a value of another.
+    pub is_enum: bool,
 }
 
 /// A [`TypedCopy`] with its own type now and the type define would give it
@@ -739,6 +759,15 @@ impl CopyState {
             return false;
         }
         (self.copy_type.oid, self.copy_type.typmod) != (self.live_type.oid, self.live_type.typmod)
+    }
+
+    /// Whether a re-type to its live type discards the values the copy holds
+    /// rather than casting them: its type is one enum and its live type
+    /// another (#1327). No value of the old type is one of the new, and a
+    /// stored label is trusted only under its own type's value identity
+    /// (ADR-0020), so the resume's rebuild refills the copy from the source.
+    pub(crate) fn discards_values(&self) -> bool {
+        self.copy_type.is_enum && self.live_type.is_enum && self.drifted()
     }
 
     /// Whether the source widened past what the column holds: the type
@@ -900,7 +929,8 @@ pub(crate) async fn describe(
         .query_one(
             &format!(
                 "select n.nspname::text || '.' || t.typname::text, \
-                        pg_catalog.format_type(t.oid, $2), t.typcollation <> 0, {} \
+                        pg_catalog.format_type(t.oid, $2), t.typcollation <> 0, {}, \
+                        t.typtype = 'e' \
                  from pg_catalog.pg_type t \
                  join pg_catalog.pg_namespace n on n.oid = t.typnamespace \
                  where t.oid = $1",
@@ -920,6 +950,7 @@ pub(crate) async fn describe(
         display: row.get(1),
         collatable: row.get(2),
         sql: row.get(3),
+        is_enum: row.get(4),
     };
     described.insert((oid, typmod), ty.clone());
     Ok(ty)
@@ -934,6 +965,14 @@ pub(crate) async fn describe(
 /// generated from its `GROUP BY` columns, so it is generated again
 /// ([`super::ledger::deltas_retype_sql`]). Each comes with the labels of the
 /// copies it re-types, for messages. Empty when nothing drifted.
+///
+/// A copy re-typed from one enum to another casts no stored value
+/// ([`CopyState::discards_values`], #1327): it is re-typed `using null`,
+/// and the resume's rebuild refills it from the source. A key copy
+/// ([`CopyKind::is_key`]) can't be nulled in place, which would merge every
+/// group onto one key, so the table's rows with a key of the old type are
+/// deleted first, in the same transaction, and the rebuild writes each
+/// back.
 pub(crate) fn retype_statements(states: &[CopyState]) -> Vec<(String, Vec<String>)> {
     let mut by_table: BTreeMap<&str, Vec<&CopyState>> = BTreeMap::new();
     for state in states.iter().filter(|s| s.drifted()) {
@@ -952,13 +991,31 @@ pub(crate) fn retype_statements(states: &[CopyState]) -> Vec<(String, Vec<String
                         }
                         _ => String::new(),
                     };
+                    let using = if s.discards_values() {
+                        "null".to_string()
+                    } else {
+                        column.clone()
+                    };
                     format!(
-                        "alter column {column} type {ty}{collate} using {column}::{ty}",
+                        "alter column {column} type {ty}{collate} using {using}::{ty}",
                         ty = s.live_type.sql
                     )
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
+            let discarded_keys: Vec<String> = drifted
+                .iter()
+                .filter(|s| s.discards_values() && s.copy.kind.is_key())
+                .map(|s| format!("{} is not null", quote_ident(&s.copy.column)))
+                .collect();
+            let delete = if discarded_keys.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "delete from {table} where {}; ",
+                    discarded_keys.join(" or ")
+                )
+            };
             let sql = if drifted[0].copy.kind == CopyKind::DeltasGroup {
                 let group_columns: Vec<super::ledger::LedgerColumn> = states
                     .iter()
@@ -973,6 +1030,7 @@ pub(crate) fn retype_statements(states: &[CopyState]) -> Vec<(String, Vec<String
             } else {
                 format!("alter table {table} {alter}")
             };
+            let sql = format!("{delete}{sql}");
             (sql, drifted.iter().map(|s| s.copy.label()).collect())
         })
         .collect()
@@ -994,6 +1052,7 @@ mod tests {
             display: display.to_string(),
             sql: display.to_string(),
             collatable: false,
+            is_enum: false,
         };
         CopyState {
             copy: TypedCopy {
@@ -1082,6 +1141,63 @@ mod tests {
             "{sql}"
         );
         assert!(sql.ends_with("(\"__part\", \"__seq\")"), "{sql}");
+    }
+
+    /// #1327: a copy re-typed from one enum to another casts no stored
+    /// label. A passthrough is re-typed `using null`; a key's rows with a
+    /// value are deleted first, in the same batch, and a `NULL` group keeps
+    /// its row. A non-enum copy beside them is still cast.
+    #[test]
+    fn a_re_type_between_enums_discards_the_values_and_a_key_s_rows() {
+        let as_enum = |mut s: CopyState, from: (&str, u32), to: (&str, u32)| {
+            for (ty, (name, oid)) in [(&mut s.copy_type, from), (&mut s.live_type, to)] {
+                ty.oid = oid;
+                ty.ty.type_oid = oid;
+                ty.ty.type_name = name.to_string();
+                ty.sql = name.to_string();
+                ty.display = name.to_string();
+                ty.is_enum = true;
+            }
+            s
+        };
+        let tone = ("public.tone", 70_001);
+        let mood = ("public.mood", 70_002);
+        let passthrough = as_enum(
+            state(CopyKind::Passthrough, "\"public\".\"c\"", "v", "x", "x"),
+            tone,
+            mood,
+        );
+        let widened = state(
+            CopyKind::Passthrough,
+            "\"public\".\"c\"",
+            "n",
+            "integer",
+            "bigint",
+        );
+        assert_eq!(
+            retype_statements(&[passthrough, widened])[0].0,
+            "alter table \"public\".\"c\" alter column \"v\" type public.mood \
+             using null::public.mood, alter column \"n\" type bigint using \"n\"::bigint"
+        );
+        let group = as_enum(
+            state(CopyKind::GroupBy, "\"public\".\"g\"", "k", "x", "x"),
+            tone,
+            mood,
+        );
+        assert_eq!(
+            retype_statements(&[group])[0].0,
+            "delete from \"public\".\"g\" where \"k\" is not null; \
+             alter table \"public\".\"g\" alter column \"k\" type public.mood \
+             using null::public.mood"
+        );
+        // An enum re-recorded under the same type casts nothing either way:
+        // nothing drifted.
+        let same = as_enum(
+            state(CopyKind::GroupBy, "\"public\".\"g\"", "k", "x", "x"),
+            tone,
+            tone,
+        );
+        assert!(retype_statements(&[same]).is_empty());
     }
 
     /// The source columns an expression-typed column reads: each once,
@@ -1198,6 +1314,7 @@ mod tests {
             display: name.to_string(),
             sql: name.to_string(),
             collatable: true,
+            is_enum: false,
         };
         let mut s = state(CopyKind::Passthrough, "\"public\".\"t\"", "c", "x", "y");
         for (copy, live) in [
@@ -1222,6 +1339,7 @@ mod tests {
             display: "integer".to_string(),
             sql: "integer".to_string(),
             collatable: false,
+            is_enum: false,
         };
         assert!(s.drifted(), "another family still drifts");
     }

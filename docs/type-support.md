@@ -389,6 +389,16 @@ from empty for a target keyed by an enum source key
 ([capture by triggers](staging-and-claiming/01-capture-by-triggers.md#an-enum-value-relabelled)).
 Adding a value (`ADD VALUE`) changes no label and pauses nothing.
 
+Re-typing a column from one enum to another (`ALTER COLUMN … TYPE other_enum
+USING …`) pauses every definition that reads it the same way, whatever the
+place: no value of the old enum is a value of the new one, so no label
+Trellis kept for the column casts to it. `RESUME` re-types each column
+Trellis created of the old enum without casting a value (a key column's rows
+are deleted first, since its old keys can't be expressed in the new type),
+and rebuilds from the source, so the target reads `backfilling` until it
+converges. A re-type from an enum to `text` keeps each label as a value and
+is handled as any other re-type.
+
 ## `array_agg` and `string_agg`
 
 `ARRAY_AGG(<text>)` and `STRING_AGG(<text>, '<separator>')` take a `text`,

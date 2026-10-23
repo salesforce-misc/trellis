@@ -978,32 +978,40 @@ pub(crate) async fn pause_readers_of_retyped(
     Ok(true)
 }
 
-/// The capture pass's check for a relabelled enum value (#1241, ADR-0020
-/// "Stored value text is trusted only under the type's current value
-/// identity"). Trellis keeps an enum value as its label text: in ring
-/// images, held and parked keys, a 1-1 ledger's `__from_key`. `ALTER TYPE
-/// ... RENAME VALUE` changes the label, keeping the value's `pg_enum` OID,
-/// and fires no trigger, so that text then names a label that no longer
-/// exists.
+/// The capture pass's check of the enum value identity each definition
+/// reads under (#1241, #1327, ADR-0020 "Stored value text is trusted only
+/// under the type's current value identity"). Trellis keeps an enum value as
+/// its label text: in ring images, held and parked keys, a 1-1 ledger's
+/// `__from_key`, and in the columns it creates of the type. Two changes fire
+/// no trigger and leave that text naming no value of the column's type:
 ///
-/// Each definition records the OID and label of every value of every enum
-/// type it reads (`definition_enum_values`,
-/// [`key_types::record_enum_values`]). For the types each reads now
-/// ([`key_types::READ_ENUM_TYPES`]), this compares the recorded labels with
-/// `pg_enum` by OID:
+/// - **A relabel.** `ALTER TYPE ... RENAME VALUE` changes the label, keeping
+///   the value's `pg_enum` OID. Each definition records the OID and label of
+///   every value of every enum type it reads (`definition_enum_values`,
+///   [`key_types::record_enum_values`]). For the types each reads now
+///   ([`key_types::READ_ENUM_TYPES`]), a recorded OID whose label changed is
+///   a relabel. Its recorded labels then take the new ones, so a later
+///   relabel is found again.
+/// - **A re-type to another enum.** `ALTER COLUMN ... TYPE other_enum USING
+///   ...` gives the column values of a type that shares none with the old
+///   one. A column it reads whose recorded type (its enum token in
+///   `source_columns` or `join_columns`, or its `definition_key_types`
+///   type) is one enum and whose live type is another is one
+///   ([`RETYPED_ENUM_COLUMNS`]). Its recorded type then takes the live one
+///   ([`rerecord_retyped_enums`]), so the next pass doesn't find it again.
 ///
-/// - **A recorded OID whose label changed** is a relabel. Every definition
-///   that reads a column of the type, however it reads it, pauses
-///   ([`crate::defs::lifecycle::pause_for_relabel`]) with the reason and
-///   the WAL insert position read after the relabel committed, which every
-///   change staged with the old label is below. Its recorded labels then
-///   take the new ones, so a later relabel is found again. Its resume waits
-///   for those changes to drain and rebuilds from the source without
-///   casting any stored label (`staging::quarantine`).
-/// - **A new OID** (`ADD VALUE`, or a type the definition reads since a
-///   re-type of its column) is recorded, and pauses nothing.
-/// - **A type the definition no longer reads** (its column re-typed) has
-///   its rows deleted: a relabel of it pauses nothing.
+/// Every definition that reads such a value, however it reads it, pauses
+/// ([`crate::defs::lifecycle::pause_for_relabel`]) with the reason and the
+/// WAL insert position read after the change committed, which every change
+/// staged with the old text is below. Its resume waits for those changes to
+/// drain and rebuilds from the source without casting any stored label
+/// (`staging::quarantine`); a copy re-typed to the other enum is re-typed
+/// without a cast ([`copies::CopyState::discards_values`]).
+///
+/// Then, for the values: **a new OID** (`ADD VALUE`, or a type the
+/// definition reads since a re-type of its column) is recorded, and pauses
+/// nothing; **a type the definition no longer reads** has its rows deleted:
+/// a relabel of it pauses nothing.
 ///
 /// A definition paused by a logical restore is left out: its OIDs are the
 /// original database's, and its resume records them afresh. No other
@@ -1030,12 +1038,27 @@ pub(crate) async fn pause_readers_of_relabelled(client: &mut Client) -> Result<b
             read = key_types::READ_ENUM_TYPES,
         )
     };
-    let candidates: BTreeSet<i64> = client
-        .query(&relabelled(""), &[])
-        .await?
-        .into_iter()
-        .map(|row| row.get(0))
-        .collect();
+    // Every column a definition reads whose type moved from one enum to
+    // another, likewise.
+    let retyped = |ids: &str| {
+        format!(
+            "select v.transform_id, d.source_table, v.tbl, v.col, v.kind, v.was, v.now \
+             from ({RETYPED_ENUM_COLUMNS}) v \
+             join transform_definitions d on d.id = v.transform_id \
+             where {not_restored} {ids} \
+             order by v.transform_id, v.tbl, v.col, v.kind"
+        )
+    };
+    let mut candidates: BTreeSet<i64> = BTreeSet::new();
+    for sql in [relabelled(""), retyped("")] {
+        candidates.extend(
+            client
+                .query(&sql, &[])
+                .await?
+                .into_iter()
+                .map(|row| row.get::<_, i64>(0)),
+        );
+    }
     let mut paused = false;
     if !candidates.is_empty() {
         let candidates: Vec<i64> = candidates.into_iter().collect();
@@ -1050,6 +1073,9 @@ pub(crate) async fn pause_readers_of_relabelled(client: &mut Client) -> Result<b
         .await?;
         let found = txn
             .query(&relabelled("and v.transform_id = any($1)"), &[&candidates])
+            .await?;
+        let found_retyped = txn
+            .query(&retyped("and v.transform_id = any($1)"), &[&candidates])
             .await?;
         let lsn: crate::PgLsn = txn
             .query_one("select pg_catalog.pg_current_wal_insert_lsn()", &[])
@@ -1067,8 +1093,28 @@ pub(crate) async fn pause_readers_of_relabelled(client: &mut Client) -> Result<b
                     "enum value '{was}' of type {type_name} was renamed to '{now}'"
                 ));
         }
-        for (id, (source, renames)) in &by_definition {
-            let error = relabel_reason(renames);
+        let mut retyped_columns: Vec<RetypedEnum> = Vec::new();
+        for row in &found_retyped {
+            let column = RetypedEnum {
+                id: row.get(0),
+                table: row.get(2),
+                column: row.get(3),
+                kind: row.get(4),
+                was: row.get(5),
+                now: row.get(6),
+            };
+            let reasons = &mut by_definition
+                .entry(column.id)
+                .or_insert_with(|| (row.get(1), Vec::new()))
+                .1;
+            let reason = column.reason();
+            if !reasons.contains(&reason) {
+                reasons.push(reason);
+            }
+            retyped_columns.push(column);
+        }
+        for (id, (source, changes)) in &by_definition {
+            let error = relabel_reason(changes);
             if crate::defs::lifecycle::pause_for_relabel(&txn, *id, source, &error, lsn).await? {
                 crate::instance_log::warn!(transform_id = id, table = %source, "definition paused: {error}");
             }
@@ -1083,6 +1129,7 @@ pub(crate) async fn pause_readers_of_relabelled(client: &mut Client) -> Result<b
             &[&ids],
         )
         .await?;
+        rerecord_retyped_enums(&txn, &retyped_columns).await?;
         txn.commit().await?;
     }
     // The types a definition no longer reads, and the values it reads that
@@ -1115,6 +1162,118 @@ pub(crate) async fn pause_readers_of_relabelled(client: &mut Client) -> Result<b
         )
         .await?;
     Ok(paused)
+}
+
+/// `(transform_id, tbl, col, kind, was, now)`, one row for each column a
+/// definition reads whose recorded type is one enum and whose live type is
+/// another (#1327): `kind` `source` or `join` for a column of its
+/// `source_columns` or `join_columns` whose token (`enum:schema.typname`)
+/// names another type than the column's, `key` for a key column whose
+/// `definition_key_types` OID is an enum's and isn't the column's. `was`
+/// and `now` are the types' qualified names. A SQL subquery.
+///
+/// A token names its type, which the rename follower keeps current
+/// (`capture::baseline::follow_renamed_types`, which the pass runs first),
+/// so a renamed type is no re-type.
+const RETYPED_ENUM_COLUMNS: &str = "\
+    select d.id as transform_id, c.tbl, c.col, c.kind, \
+           pg_catalog.substr(c.was, 6) as was, \
+           n.nspname::text || '.' || t.typname::text as now \
+    from transform_definitions d \
+    cross join lateral ( \
+        select d.source_table as tbl, e.key as col, 'source' as kind, e.value as was \
+        from pg_catalog.jsonb_each_text(d.source_columns) e \
+        union all \
+        select d.join_table, e.key, 'join', e.value \
+        from pg_catalog.jsonb_each_text(coalesce(d.join_columns, '{}'::jsonb)) e) c \
+    join pg_catalog.pg_attribute a \
+      on a.attrelid = pg_catalog.to_regclass( \
+             pg_catalog.quote_ident(pg_catalog.split_part(c.tbl, '.', 1)) || '.' || \
+             pg_catalog.quote_ident(pg_catalog.split_part(c.tbl, '.', 2))) \
+     and a.attname = c.col and a.attnum > 0 and not a.attisdropped \
+    join pg_catalog.pg_type t on t.oid = a.atttypid and t.typtype = 'e' \
+    join pg_catalog.pg_namespace n on n.oid = t.typnamespace \
+    where c.was like 'enum:%' and c.was <> 'enum:' || n.nspname::text || '.' || t.typname::text \
+    union all \
+    select k.transform_id, k.table_name, k.column_name, 'key', \
+           ont.nspname::text || '.' || ot.typname::text, \
+           n.nspname::text || '.' || t.typname::text \
+    from definition_key_types k \
+    join pg_catalog.pg_type ot on ot.oid = k.type_oid and ot.typtype = 'e' \
+    join pg_catalog.pg_namespace ont on ont.oid = ot.typnamespace \
+    join pg_catalog.pg_attribute a \
+      on a.attrelid = pg_catalog.to_regclass( \
+             pg_catalog.quote_ident(pg_catalog.split_part(k.table_name, '.', 1)) || '.' || \
+             pg_catalog.quote_ident(pg_catalog.split_part(k.table_name, '.', 2))) \
+     and a.attname = k.column_name and a.attnum > 0 and not a.attisdropped \
+    join pg_catalog.pg_type t on t.oid = a.atttypid and t.typtype = 'e' \
+    join pg_catalog.pg_namespace n on n.oid = t.typnamespace \
+    where t.oid <> k.type_oid";
+
+/// One row of [`RETYPED_ENUM_COLUMNS`].
+struct RetypedEnum {
+    id: i64,
+    table: String,
+    column: String,
+    kind: String,
+    was: String,
+    now: String,
+}
+
+impl RetypedEnum {
+    /// The pause's reason for it.
+    fn reason(&self) -> String {
+        format!(
+            "column {:?} of {}, which this definition reads, changed type from enum {} to enum {}",
+            self.column, self.table, self.was, self.now
+        )
+    }
+}
+
+/// Records each of `columns` at its live type, for its definition: a
+/// `source` or `join` column's token in `source_columns` or `join_columns`
+/// takes the live type's, and its OID is recorded beside it
+/// ([`key_types::record_types`]), and a `key` column is re-recorded
+/// ([`key_types::rerecord`]). The definition is paused, so it evaluates
+/// nothing under them before its resume, which records every type afresh.
+async fn rerecord_retyped_enums(
+    txn: &tokio_postgres::Transaction<'_>,
+    columns: &[RetypedEnum],
+) -> Result<(), tokio_postgres::Error> {
+    let mut ids: BTreeSet<i64> = BTreeSet::new();
+    for c in columns {
+        let token = format!("enum:{}", c.now);
+        match c.kind.as_str() {
+            "source" => {
+                txn.execute(
+                    "update transform_definitions \
+                     set source_columns = pg_catalog.jsonb_set(source_columns, array[$2], \
+                                                               pg_catalog.to_jsonb($3::text)) \
+                     where id = $1",
+                    &[&c.id, &c.column, &token],
+                )
+                .await?;
+            }
+            "join" => {
+                txn.execute(
+                    "update transform_definitions \
+                     set join_columns = pg_catalog.jsonb_set(join_columns, array[$2], \
+                                                             pg_catalog.to_jsonb($3::text)) \
+                     where id = $1",
+                    &[&c.id, &c.column, &token],
+                )
+                .await?;
+            }
+            _ => {
+                key_types::rerecord(txn, c.id, &[(c.table.clone(), c.column.clone())]).await?;
+            }
+        }
+        ids.insert(c.id);
+    }
+    for id in ids {
+        key_types::record_types(txn, id, false).await?;
+    }
+    Ok(())
 }
 
 /// The `capture_failure` of a definition [`pause_readers_of_relabelled`]
@@ -1562,6 +1721,7 @@ mod tests {
             display: display.to_string(),
             sql: display.to_string(),
             collatable: false,
+            is_enum: false,
         }
     }
 

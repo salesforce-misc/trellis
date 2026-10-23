@@ -99,16 +99,22 @@ rebuilds from the source without casting any stored text. The changes are:
 
 - an enum `RENAME VALUE`. A new label (`ADD VALUE`) changes no stored text and
   pauses nothing.
+- a re-type of a column from one enum to another: no value of the old type is
+  a value of the new one.
 - a rewrite that re-renders existing key text: a `character(n)` length change,
   a `bit(n)` change with `USING`, a narrower `numeric` scale or one added to an
   unconstrained `numeric` (the rewrite rounds), a narrower temporal precision.
   A wider `numeric` scale pauses nothing: a group key's stored text is still an
   equal value ([below](#an-aggregate-or-join-target-holds-an-equal-value)).
 
-Enum values are detected by their value OIDs, recorded with the definition.
-A relabel's `RESUME` waits until no change staged before the relabel is
-pending, so none of their text is applied or re-derived, and a target whose
-ledger keys are label text is rebuilt from empty.
+Enum values are detected by their value OIDs, and the enum each column is
+read as by its type, both recorded with the definition. The `RESUME` after
+either enum change waits until no change staged before it is pending, so none
+of their text is applied or re-derived, and a target whose ledger keys are
+label text is rebuilt from empty. A column Trellis created of the old enum is
+re-typed with no cast: its values are discarded and the rebuild refills them,
+and a key column's rows are deleted first, since its old keys can't be
+expressed in the new type at all.
 
 This is the one place a modifier matters: a change that alters how stored
 values render, not one that only widens what the column can hold.
