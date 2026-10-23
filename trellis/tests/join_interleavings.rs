@@ -23,6 +23,15 @@
 //! (`a.t = b.t AND a.k = b.k`), where decoy rows share a scenario's `k` but
 //! not its `t`; on the single-column key the decoys sit on a key of their
 //! own, so they never keep a scenario's key matched.
+//!
+//! A test is named for the J1 family it ports (`family1_…` to
+//! `family14_…`). Family 8's recompute is an image-less change's page, and
+//! a held key's release is the same recompute in a transaction of its own
+//! (`a_release_takes_the_j_lock_against_the_other_sides_pages`). Family 9's
+//! chunked builds are the engine's builds: `family9_…` writes on both sides
+//! of one build, and the tests from "the build" on cover one side's writes
+//! (`build_pages_around_a_build_…`), the lock statements and the steps of
+//! a build with a partitioned side.
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
@@ -1897,6 +1906,304 @@ async fn a_release_takes_the_j_lock_against_the_other_sides_pages() {
     }
 }
 
+// ------------------------------------------------------------- family 8
+
+/// When J1 family 8's late change to the recomputed row commits, relative
+/// to the recompute: before either page starts (`Pre`); while one of the two
+/// pages is frozen (`Mid`); after both committed (`Post`); or in a
+/// transaction opened before either page starts and committed after both,
+/// so it is in progress at the recompute's snapshot (`Xip`). Its own page
+/// drains after both, whichever it is.
+#[derive(Debug, Clone, Copy)]
+enum Late {
+    Pre,
+    Mid,
+    Post,
+    Xip,
+}
+
+/// One side's recompute in a J1 family 8 scenario (templates for [`fill`]):
+/// the change capture never sees, which the recompute repairs; whether the
+/// recompute carries the row's prior image (the row is gone, so only the
+/// hint names its cell); the late change of the recomputed cell; and a page
+/// of the other side on the same key.
+struct Recompute {
+    name: &'static str,
+    table: &'static str,
+    drift: &'static str,
+    prior: bool,
+    late: &'static str,
+    other: &'static str,
+}
+
+const OTHER_A: &str = "update public.a set ga = {g3}, x = x + 1 where id = {id} + 2; \
+                       insert into public.a values ({id} + 3, {g4}, {k}, 2)";
+
+const RECOMPUTES: [Recompute; 3] = [
+    Recompute {
+        name: "a P cell's recompute against a b page",
+        table: "public.a",
+        drift: "update public.a set x = x + 5 where id = {id} + 1",
+        prior: false,
+        late: "update public.a set x = x + 100 where id = {id} + 1",
+        other: "update public.b set gb = {g2}, y = y + 1 where id = {id} + 1",
+    },
+    Recompute {
+        name: "an M cell's recompute against an a page",
+        table: "public.b",
+        drift: "update public.b set y = y + 5 where id = {id} + 1",
+        prior: false,
+        late: "update public.b set y = y + 100 where id = {id} + 1",
+        other: OTHER_A,
+    },
+    Recompute {
+        name: "an M recompute that crosses matches to 0, against an a page",
+        table: "public.b",
+        drift: "delete from public.b where id = {id} + 1",
+        prior: true,
+        late: "insert into public.b values ({id} + 4, {k}, {g1}, 7)",
+        other: OTHER_A,
+    },
+];
+
+impl Recompute {
+    /// Stages the recompute of scenario `n`'s row `{id} + 1` and seals it
+    /// into a batch of its own.
+    async fn sealed(&self, lab: &mut Lab, n: i32) -> i64 {
+        let row = (100 * n + 1).to_string();
+        // SEED's row `{id} + 1` of `b`, the only one of its key.
+        let prior = self.prior.then(|| {
+            format!(
+                r#"{{"id": {row}, "t": {n}, "k": {n}, "gb": {}, "y": 100}}"#,
+                10 * n + 1
+            )
+        });
+        lab.d
+            .stage_recomputes_with_prior(self.table, &[(row.as_str(), prior)])
+            .await;
+        lab.d.seal().await
+    }
+}
+
+/// One J1 family 8 scenario on key `n`: `r`'s recompute and a page of the
+/// other side on the same key, one frozen at `point` while the other
+/// drains (queued behind it once it holds the key's `J` row), with the late
+/// change committed at `late`.
+async fn recompute_race(
+    lab: &mut Lab,
+    n: i32,
+    r: &Recompute,
+    late: Late,
+    recompute_frozen: bool,
+    point: PausePoint,
+) {
+    let context = format!(
+        "{:?}/{}: {}, late change {late:?}, {} frozen at {point:?}",
+        lab.key,
+        lab.kinds[0].name,
+        r.name,
+        if recompute_frozen {
+            "the recompute"
+        } else {
+            "the other side's page"
+        }
+    );
+    let key = lab.key;
+    lab.step(&fill(SEED, n, key)).await;
+    uncaptured(lab, r.table, &fill(r.drift, n, key)).await;
+    let recompute = r.sealed(lab, n).await;
+    let other = lab.sealed(&fill(r.other, n, key)).await;
+    let xip = match late {
+        Late::Pre => {
+            lab.write(&fill(r.late, n, key)).await;
+            None
+        }
+        Late::Xip => {
+            let client = lab.d.user().await;
+            client
+                .batch_execute(&format!("begin; {}", fill(r.late, n, key)))
+                .await
+                .expect("open the late transaction");
+            Some(client)
+        }
+        _ => None,
+    };
+    let (first, second) = if recompute_frozen {
+        (recompute, other)
+    } else {
+        (other, recompute)
+    };
+    let target = lab.kinds[0].target();
+    let mut frozen = lab
+        .d
+        .drain_frozen(first, "x", &[(point, target.as_str())])
+        .await;
+    let reached = frozen.reached(point).await;
+    let page = lab.d.drain_frozen(second, "y", &[]).await;
+    let queued = lab.queued_or_done(&page, reached.backend_pid).await;
+    assert_eq!(
+        queued,
+        holds_j(point, false),
+        "{context}: does the second page queue behind the frozen one?"
+    );
+    if let Late::Mid = late {
+        lab.write(&fill(r.late, n, key)).await;
+    }
+    lab.d.release(&mut frozen, point).await;
+    frozen.finish().await;
+    page.finish().await;
+    lab.check_applied(&context).await;
+    match late {
+        Late::Post => lab.write(&fill(r.late, n, key)).await,
+        Late::Xip => xip
+            .expect("the late transaction")
+            .batch_execute("commit")
+            .await
+            .expect("commit the late transaction"),
+        Late::Pre | Late::Mid => {}
+    }
+    // The late change's page: refused where the recompute's basis covers
+    // it, applied as a delta where it doesn't.
+    lab.check(&context).await;
+}
+
+/// J1 family 8: a `P` cell's recompute against a page of `b` on the same
+/// key, and an `M` cell's (one of them crossing `J.matches` to 0) against a
+/// page of `a`, either one frozen at each point before its commit, with a
+/// late change of the recomputed cell committed before, during, after or
+/// across the recompute. The recompute is an image-less change's (a
+/// `Recompute` ring row), which repairs a change capture never saw.
+/// [`a_release_takes_the_j_lock_against_the_other_sides_pages`] pins the
+/// same lock order for a held key's release.
+async fn recomputes_vs_the_other_side(key: Key, kind: Kind) {
+    let mut lab = lab(key, &[kind]).await;
+    let mut n = 0;
+    for r in &RECOMPUTES {
+        for late in [Late::Pre, Late::Mid, Late::Post, Late::Xip] {
+            for recompute_frozen in [true, false] {
+                for point in &POINTS[..6] {
+                    n += 1;
+                    recompute_race(&mut lab, n, r, late, recompute_frozen, *point).await;
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn family8_recomputes_vs_the_other_side_left() {
+    recomputes_vs_the_other_side(Key::Single, L).await;
+}
+
+#[tokio::test]
+async fn family8_recomputes_vs_the_other_side_inner_pair_key() {
+    recomputes_vs_the_other_side(Key::Pair, I).await;
+}
+
+/// J1 family 8: a cell recomputed twice around a captured change of it,
+/// with capture missing a change before each recompute. The change commits
+/// after the first recompute and before the second; its page drains between
+/// the two recomputes' pages (applied as a delta, then rewritten by the
+/// second) or after both (refused by the second's basis), and the end is
+/// the oracle either way.
+#[tokio::test]
+async fn family8_a_cell_recomputed_twice_around_a_change() {
+    let mut lab = lab(Key::Single, &[L, I]).await;
+    let mut n = 0;
+    for r in &RECOMPUTES[..2] {
+        for change_between in [true, false] {
+            n += 1;
+            let context = format!("{}, the change drained between: {change_between}", r.name);
+            lab.step(&fill(SEED, n, lab.key)).await;
+            uncaptured(&lab, r.table, &fill(r.drift, n, lab.key)).await;
+            let first = r.sealed(&mut lab, n).await;
+            lab.d.drain(first, "x").await;
+            lab.check_applied(&context).await;
+            let change = lab.sealed(&fill(r.late, n, lab.key)).await;
+            uncaptured(&lab, r.table, &fill(r.drift, n, lab.key)).await;
+            let second = r.sealed(&mut lab, n).await;
+            if change_between {
+                lab.d.drain(change, "x").await;
+                lab.check_applied(&context).await;
+                lab.d.drain(second, "x").await;
+            } else {
+                lab.d.drain(second, "x").await;
+                lab.check_applied(&context).await;
+                lab.d.drain(change, "x").await;
+            }
+            lab.check(&context).await;
+        }
+    }
+}
+
+// ------------------------------------------------------------ family 13
+
+/// J1 family 13: a recompute takes cells of both sides to zero while the
+/// captured deletes that emptied them are still undrained, and tombstone
+/// collection runs before those pages drain. The zero cells keep their
+/// basis (no collection removes a `JOIN`'s `P` or `M` cell), so the stale
+/// pages are refused rather than applied a second time.
+#[tokio::test]
+async fn family13_zero_cells_outlive_collection_until_their_stale_pages_drain() {
+    for key in [Key::Single, Key::Pair] {
+        let mut lab = lab(key, &[L, I]).await;
+        lab.step(&fill(SEED, 1, key)).await;
+        let stale = lab
+            .sealed(
+                "delete from public.a where id in (101, 102); \
+                 delete from public.b where id = 101",
+            )
+            .await;
+        lab.d
+            .stage_recomputes_with_prior(
+                "public.a",
+                &[
+                    (
+                        "101",
+                        Some(r#"{"id": 101, "ga": 11, "t": 1, "k": 1, "x": 10}"#.to_string()),
+                    ),
+                    (
+                        "102",
+                        Some(r#"{"id": 102, "ga": 12, "t": 1, "k": 1, "x": null}"#.to_string()),
+                    ),
+                ],
+            )
+            .await;
+        lab.d
+            .stage_recomputes_with_prior(
+                "public.b",
+                &[(
+                    "101",
+                    Some(r#"{"id": 101, "t": 1, "k": 1, "gb": 11, "y": 100}"#.to_string()),
+                )],
+            )
+            .await;
+        let recompute = lab.d.seal().await;
+        lab.d.drain(recompute, "r").await;
+        lab.check_applied("after the recompute").await;
+        lab.d.retire().await;
+        lab.d.collect_tombstones().await;
+        for kind in [L, I] {
+            for (part, cells) in [("p", 2), ("m", 1)] {
+                let hidden = lab.hidden(kind, part).await;
+                assert_eq!(
+                    lab.scalar(&format!(
+                        "select count(*) from {hidden} \
+                         where k = 1 and __n = 0 and __basis is not null"
+                    ))
+                    .await,
+                    cells.to_string(),
+                    "{key:?}/{}: {part}'s zero cells stay through the collection",
+                    kind.name
+                );
+            }
+        }
+        lab.d.drain(stale, "stale").await;
+        lab.check(&format!("{key:?}: the stale pages drained"))
+            .await;
+    }
+}
+
 /// A `JOIN` whose side is a partitioned root with no rows builds like any
 /// other (there is nothing to bound); with rows it builds per leaf
 /// ("Partitioned sides" below).
@@ -2384,6 +2691,148 @@ async fn build_pages_around_a_build_left() {
 #[tokio::test]
 async fn build_pages_around_a_build_inner_pair_key() {
     pages_around_a_build(Key::Pair, I).await;
+}
+
+/// J1 family 9's writes on both sides of one build, on [`BUILD_SEED`]'s
+/// keys (all enumerated): before it starts, while it is frozen (one
+/// statement per side), and after its commit.
+const BOTH_BEFORE: &str = "update public.a set ga = 2 where id = 2; \
+                           insert into public.b values (40, 0, 3, 10, 9)";
+const BOTH_DURING_A: &str = "update public.a set x = x + 1 where id = 3; \
+                             insert into public.a values (41, 4, 0, 8, 6)";
+const BOTH_DURING_B: &str = "update public.b set y = y + 1 where id = 2; \
+                             delete from public.b where id = 5";
+const BOTH_AFTER: &str = "delete from public.a where id = 1; \
+                          update public.b set k = 2 where id = 1";
+
+/// J1 family 9: a build with writes landing on both sides, before it
+/// starts, while it is frozen at each step and after its commit. While it
+/// is frozen, either a page of each side drains (on keys of their own, so
+/// each queues on the build, not on the other) or one mixed page carrying
+/// both; each queues behind the build once it holds its `J` rows, and runs
+/// through before that. The build's commit and the pages leave the
+/// oracle's rows. A fresh build, whose `J` inserts hold the keys, and a
+/// rebuild in place, where every `J` row exists and its `J` lock holds them.
+async fn writes_on_both_sides_around_a_build(key: Key, kind: Kind, mixed: bool, in_place: bool) {
+    for point in BUILD_POINTS {
+        let context = format!(
+            "{key:?} {} at {point:?}, mixed: {mixed}, in place: {in_place}",
+            kind.name
+        );
+        let held = at_or_after(point, Some(PausePoint::AfterJoinLock));
+        let mut lab = seeded(key, &[kind], BUILD_SEED).await;
+        let job = if in_place {
+            lab.build().await;
+            request_rebuild(&lab, "a").await;
+            "sweep"
+        } else {
+            "plan"
+        };
+        // The ring holds two undrained batches here, and the frozen build
+        // lets only one seal through (it is open across the predecessor
+        // segment's fence). So with one mixed page during the build, both
+        // sides' changes committed before it drain after its commit; with
+        // a page per side, the `a` page commits before the build starts
+        // and drains while it is frozen, and the `b` page commits during.
+        let (before, a) = if mixed {
+            (Some(lab.sealed(BOTH_BEFORE).await), None)
+        } else {
+            (None, Some(lab.sealed(BOTH_DURING_A).await))
+        };
+        let mut building = lab.build_frozen(job, &[point]).await;
+        let reached = building.reached(point).await;
+        let pages = if let Some(a) = a {
+            let b = lab.sealed(BOTH_DURING_B).await;
+            let pages = vec![
+                lab.d.drain_frozen(a, "during a", &[]).await,
+                lab.d.drain_frozen(b, "during b", &[]).await,
+            ];
+            lab.both_queued_or_done(&pages, reached.backend_pid, held, &context)
+                .await;
+            pages
+        } else {
+            let batch = lab
+                .sealed(&format!("{BOTH_DURING_A}; {BOTH_DURING_B}"))
+                .await;
+            let page = lab.d.drain_frozen(batch, "during", &[]).await;
+            assert_eq!(
+                lab.queued_or_done(&page, reached.backend_pid).await,
+                held,
+                "{context}: does the mixed page queue behind the build?"
+            );
+            vec![page]
+        };
+        lab.d.release(&mut building, point).await;
+        building.finish().await;
+        for page in pages {
+            page.finish().await;
+        }
+        let after = lab.sealed(BOTH_AFTER).await;
+        lab.d.drain(after, "after").await;
+        if let Some(before) = before {
+            lab.d.drain(before, "before").await;
+        }
+        lab.assert_built(&context).await;
+        lab.check(&context).await;
+    }
+}
+
+impl Lab {
+    /// Waits until every one of `pages` queued behind backend `pid` (`held`)
+    /// or ran to its end (`!held`).
+    async fn both_queued_or_done(
+        &self,
+        pages: &[RunningDrain],
+        pid: i32,
+        held: bool,
+        context: &str,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let queued: i64 = self
+                .d
+                .ctl
+                .query_one(
+                    "select count(*) from pg_stat_activity \
+                     where $1 = any(pg_blocking_pids(pid))",
+                    &[&pid],
+                )
+                .await
+                .expect("read pg_stat_activity")
+                .get(0);
+            let finished = pages.iter().filter(|p| p.is_finished()).count();
+            if held {
+                assert_eq!(finished, 0, "{context}: a page ran through the build");
+                if queued == pages.len() as i64 {
+                    return;
+                }
+            } else {
+                assert_eq!(queued, 0, "{context}: a page queued behind the build");
+                if finished == pages.len() {
+                    return;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{context}: the pages neither queued nor finished within 60 s"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn family9_writes_on_both_sides_around_a_build_left() {
+    for (mixed, in_place) in [(false, false), (true, false), (false, true), (true, true)] {
+        writes_on_both_sides_around_a_build(Key::Single, L, mixed, in_place).await;
+    }
+}
+
+#[tokio::test]
+async fn family9_writes_on_both_sides_around_a_build_inner_pair_key() {
+    for (mixed, in_place) in [(false, false), (true, false), (false, true), (true, true)] {
+        writes_on_both_sides_around_a_build(Key::Pair, I, mixed, in_place).await;
+    }
 }
 
 /// Runs `sql` on `lab`'s connection to `part` of `kind`'s hidden tables.
