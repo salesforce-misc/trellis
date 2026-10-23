@@ -370,8 +370,20 @@ under another qualified name now, records the new name where Trellis casts by
 it and releases the keys a drain held for the old name. Nothing pauses or
 rebuilds. A logical dump and restore gives every type a new OID: the restore
 pauses every definition, the pass compares none of their recorded OIDs, and
-`RESUME` records the new ones. `pg_upgrade` keeps them. `ALTER TYPE … RENAME VALUE` relabels the values in the
-columns Trellis created too.
+`RESUME` records the new ones. `pg_upgrade` keeps them.
+
+Renaming a value (`ALTER TYPE … RENAME VALUE`) pauses every definition that
+reads a column of the type, whatever the place: passthrough, key, `GROUP BY`,
+`JOIN` column or an input to a calculated field. The columns Trellis created
+follow the new label, but Trellis also keeps values as label text (staged
+changes, held keys, a 1-1 ledger's keys), and that text names a label that
+no longer exists. Each definition records its enum values by their
+`pg_enum` OIDs, and the capture pass finds the one whose label changed;
+`capture_failure` names the old and new label. `RESUME` waits for the changes
+staged before the relabel to drain and rebuilds the target from the source,
+from empty for a target keyed by an enum source key
+([capture by triggers](staging-and-claiming/01-capture-by-triggers.md#an-enum-value-relabelled)).
+Adding a value (`ADD VALUE`) changes no label and pauses nothing.
 
 ## `array_agg` and `string_agg`
 

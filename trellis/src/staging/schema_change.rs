@@ -978,6 +978,156 @@ pub(crate) async fn pause_readers_of_retyped(
     Ok(true)
 }
 
+/// The capture pass's check for a relabelled enum value (#1241, ADR-0020
+/// "Stored value text is trusted only under the type's current value
+/// identity"). Trellis keeps an enum value as its label text: in ring
+/// images, held and parked keys, a 1-1 ledger's `__from_key`. `ALTER TYPE
+/// ... RENAME VALUE` changes the label, keeping the value's `pg_enum` OID,
+/// and fires no trigger, so that text then names a label that no longer
+/// exists.
+///
+/// Each definition records the OID and label of every value of every enum
+/// type it reads (`definition_enum_values`,
+/// [`key_types::record_enum_values`]). For the types each reads now
+/// ([`key_types::READ_ENUM_TYPES`]), this compares the recorded labels with
+/// `pg_enum` by OID:
+///
+/// - **A recorded OID whose label changed** is a relabel. Every definition
+///   that reads a column of the type, however it reads it, pauses
+///   ([`crate::defs::lifecycle::pause_for_relabel`]) with the reason and
+///   the WAL insert position read after the relabel committed, which every
+///   change staged with the old label is below. Its recorded labels then
+///   take the new ones, so a later relabel is found again. Its resume waits
+///   for those changes to drain and rebuilds from the source without
+///   casting any stored label (`staging::quarantine`).
+/// - **A new OID** (`ADD VALUE`, or a type the definition reads since a
+///   re-type of its column) is recorded, and pauses nothing.
+/// - **A type the definition no longer reads** (its column re-typed) has
+///   its rows deleted: a relabel of it pauses nothing.
+///
+/// A definition paused by a logical restore is left out: its OIDs are the
+/// original database's, and its resume records them afresh. No other
+/// operation changes `pg_enum.enumlabel`, and `pg_upgrade` keeps both OIDs
+/// and labels. Returns whether it paused any definition.
+pub(crate) async fn pause_readers_of_relabelled(client: &mut Client) -> Result<bool, CaptureError> {
+    let not_restored = "not exists (select 1 from capture_failures f \
+                        where f.transform_id = v.transform_id and f.restored)";
+    // Every recorded value of a type its definition reads now whose label
+    // is not the recorded one, read again below under the definitions'
+    // locks.
+    let relabelled = |ids: &str| {
+        format!(
+            "select v.transform_id, d.source_table, \
+                    n.nspname::text || '.' || t.typname::text, v.label, e.enumlabel::text \
+             from definition_enum_values v \
+             join ({read}) r on r.transform_id = v.transform_id and r.type_oid = v.type_oid \
+             join pg_catalog.pg_enum e on e.oid = v.value_oid \
+             join pg_catalog.pg_type t on t.oid = v.type_oid \
+             join pg_catalog.pg_namespace n on n.oid = t.typnamespace \
+             join transform_definitions d on d.id = v.transform_id \
+             where e.enumlabel::text <> v.label and {not_restored} {ids} \
+             order by v.transform_id, e.enumsortorder",
+            read = key_types::READ_ENUM_TYPES,
+        )
+    };
+    let candidates: BTreeSet<i64> = client
+        .query(&relabelled(""), &[])
+        .await?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    let mut paused = false;
+    if !candidates.is_empty() {
+        let candidates: Vec<i64> = candidates.into_iter().collect();
+        let txn = client.transaction().await?;
+        // Every candidate locked at once, in id order, before any is
+        // written; one dropped meanwhile is left out. Under the locks, a
+        // resume that re-recorded the labels has committed or waits.
+        txn.execute(
+            "select 1 from transform_definitions where id = any($1) order by id for update",
+            &[&candidates],
+        )
+        .await?;
+        let found = txn
+            .query(&relabelled("and v.transform_id = any($1)"), &[&candidates])
+            .await?;
+        let lsn: crate::PgLsn = txn
+            .query_one("select pg_catalog.pg_current_wal_insert_lsn()", &[])
+            .await?
+            .get(0);
+        let mut by_definition: BTreeMap<i64, (String, Vec<String>)> = BTreeMap::new();
+        for row in &found {
+            let (id, source, type_name, was, now): (i64, String, String, String, String) =
+                (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4));
+            by_definition
+                .entry(id)
+                .or_insert_with(|| (source, Vec::new()))
+                .1
+                .push(format!(
+                    "enum value '{was}' of type {type_name} was renamed to '{now}'"
+                ));
+        }
+        for (id, (source, renames)) in &by_definition {
+            let error = relabel_reason(renames);
+            if crate::defs::lifecycle::pause_for_relabel(&txn, *id, source, &error, lsn).await? {
+                crate::instance_log::warn!(transform_id = id, table = %source, "definition paused: {error}");
+            }
+            paused = true;
+        }
+        let ids: Vec<i64> = by_definition.keys().copied().collect();
+        txn.execute(
+            "update definition_enum_values v set label = e.enumlabel::text \
+             from pg_catalog.pg_enum e \
+             where e.oid = v.value_oid and v.transform_id = any($1) \
+               and v.label <> e.enumlabel::text",
+            &[&ids],
+        )
+        .await?;
+        txn.commit().await?;
+    }
+    // The types a definition no longer reads, and the values it reads that
+    // it hasn't recorded.
+    client
+        .execute(
+            &format!(
+                "delete from definition_enum_values v \
+                 where {not_restored} and not exists ( \
+                     select 1 from ({read}) r \
+                     where r.transform_id = v.transform_id and r.type_oid = v.type_oid)",
+                read = key_types::READ_ENUM_TYPES,
+            ),
+            &[],
+        )
+        .await?;
+    client
+        .execute(
+            &format!(
+                "insert into definition_enum_values (transform_id, type_oid, value_oid, label) \
+                 select r.transform_id, e.enumtypid, e.oid, e.enumlabel::text \
+                 from ({read}) r \
+                 join pg_catalog.pg_enum e on e.enumtypid = r.type_oid \
+                 where not exists (select 1 from capture_failures f \
+                                   where f.transform_id = r.transform_id and f.restored) \
+                 on conflict (transform_id, value_oid) do nothing",
+                read = key_types::READ_ENUM_TYPES,
+            ),
+            &[],
+        )
+        .await?;
+    Ok(paused)
+}
+
+/// The `capture_failure` of a definition [`pause_readers_of_relabelled`]
+/// pauses, from the relabels it found (`enum value 'a' of type s.t was
+/// renamed to 'b'`, each).
+fn relabel_reason(renames: &[String]) -> String {
+    format!(
+        "{}; Trellis's staged changes and keys still name the old label; resume to rebuild the \
+         target from the source",
+        renames.join("; ")
+    )
+}
+
 /// One definition [`pause_readers_of_retyped`] pauses, and why.
 struct Pause {
     id: i64,
@@ -1380,6 +1530,20 @@ mod tests {
     use super::*;
     use crate::defs::copies::{CopyKind, CopyState, CopyType, TypedCopy};
     use crate::defs::key_types::ColumnType;
+
+    /// #1241: the reason names each relabel, then the remedy.
+    #[test]
+    fn a_relabel_reason_names_each_relabel_then_the_remedy() {
+        assert_eq!(
+            super::relabel_reason(&[
+                "enum value 'brisk' of type public.tone was renamed to 'zippy'".to_string(),
+                "enum value 'calm' of type public.tone was renamed to 'cool'".to_string(),
+            ]),
+            "enum value 'brisk' of type public.tone was renamed to 'zippy'; enum value 'calm' \
+             of type public.tone was renamed to 'cool'; Trellis's staged changes and keys still \
+             name the old label; resume to rebuild the target from the source"
+        );
+    }
 
     fn ty(display: &str) -> CopyType {
         let oid = match display {

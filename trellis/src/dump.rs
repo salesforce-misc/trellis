@@ -66,6 +66,7 @@ pub const CLASSIFICATION: &[(&str, Class)] = &[
     ),
     ("definition_key_types", Class::Definition { reset: NONE }),
     ("definition_types", Class::Definition { reset: NONE }),
+    ("definition_enum_values", Class::Definition { reset: NONE }),
     (
         "relationship_definitions",
         Class::Definition { reset: NONE },
@@ -145,10 +146,27 @@ pub const CLASSIFICATION: &[(&str, Class)] = &[
 /// schema, as `RESUME` re-records it after a logical restore. A
 /// `definition_types` row whose name names no type is dropped, and so is one
 /// that resolves to a type the same definition records under another row.
+///
+/// Each enum value a definition recorded (`definition_enum_values`, #1241)
+/// is resolved by its label within its type, the type named by the
+/// definition's `definition_types` row for the dumped OID, before those rows
+/// are replaced. One whose type or label resolves to nothing is dropped: the
+/// first capture pass in the loaded database records the values of every
+/// enum type a definition reads that it has none recorded for.
 pub const RESOLVE_TYPE_OIDS: &[&str] = &[
     "update {s}.definition_key_types k set type_oid = t.oid \
      from pg_catalog.pg_type t join pg_catalog.pg_namespace n on n.oid = t.typnamespace \
      where n.nspname::text || '.' || t.typname::text = k.type_name",
+    "create temporary table trellis_resolved_enum_values as \
+     select distinct on (v.transform_id, e.oid) \
+            v.transform_id, t.oid as type_oid, e.oid as value_oid, v.label \
+     from {s}.definition_enum_values v \
+     join {s}.definition_types r on r.transform_id = v.transform_id and r.type_oid = v.type_oid \
+     join pg_catalog.pg_type t on true \
+     join pg_catalog.pg_namespace n on n.oid = t.typnamespace \
+     join pg_catalog.pg_enum e on e.enumtypid = t.oid and e.enumlabel::text = v.label \
+     where n.nspname::text || '.' || t.typname::text = r.type_name",
+    "delete from {s}.definition_enum_values",
     "create temporary table trellis_resolved_types as \
      select distinct on (r.transform_id, t.oid) r.transform_id, t.oid as type_oid, r.type_name \
      from {s}.definition_types r \
@@ -157,6 +175,8 @@ pub const RESOLVE_TYPE_OIDS: &[&str] = &[
      where n.nspname::text || '.' || t.typname::text = r.type_name",
     "delete from {s}.definition_types",
     "insert into {s}.definition_types select * from trellis_resolved_types",
+    "insert into {s}.definition_enum_values select * from trellis_resolved_enum_values",
+    "drop table trellis_resolved_enum_values",
     "drop table trellis_resolved_types",
 ];
 

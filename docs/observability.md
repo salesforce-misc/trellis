@@ -348,6 +348,17 @@ pause are arcs of one lifecycle:
     so Trellis can't guarantee the definition is correct, and that a resume
     reinstalls capture and rebuilds it. The `capture_failure`'s `kind` is
     `disruption`;
+  * an enum value of a type it reads was relabelled (`ALTER TYPE … RENAME
+    VALUE`), so the label text Trellis staged and keyed by names a value that
+    no longer exists
+    ([capture by triggers](staging-and-claiming/01-capture-by-triggers.md#an-enum-value-relabelled)):
+    `capture_failure` reads "enum value '`<old>`' of type `<schema>.<type>` was
+    renamed to '`<new>`'; Trellis's staged changes and keys still name the old
+    label; resume to rebuild the target from the source", kind `capture`. Every
+    definition reading a column of the type pauses, and one already paused
+    gets the reason before its own. `RESUME` waits, its `capture_failure`
+    reading "resuming: waiting for the changes staged before an enum value …
+    to drain", until none is pending, then rebuilds;
   * the database was restored from a logical dump (`pg_dump`, `pg_restore`):
     every definition pauses, whatever its kind and source, because the
     ordering state the dump brought belongs to the original cluster

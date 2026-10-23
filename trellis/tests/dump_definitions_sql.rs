@@ -254,6 +254,9 @@ async fn a_dump_loads_as_defined_not_built() {
         // #1242: a type's OID is the database's own; the name beside it loads.
         "select to_jsonb(t) - 'type_oid' from definition_key_types t order by transform_id, table_name, column_name",
         "select to_jsonb(t) - 'type_oid' from definition_types t order by transform_id, type_name",
+        // #1241: an enum value's OID too; its label loads.
+        "select to_jsonb(t) - 'type_oid' - 'value_oid' from definition_enum_values t \
+         order by transform_id, label",
         "select to_jsonb(t) from trellis_instance t",
         "select to_jsonb(t) - 'applied_on' from refinery_schema_history t order by version",
         "select to_jsonb(t) - 'created_at' - 'status' - 'build' - 'build_seg' - 'build_marker_generation' - 'fuse_rearmed_at' from transform_definitions t order by id",
@@ -279,6 +282,25 @@ async fn a_dump_loads_as_defined_not_built() {
     assert_eq!(
         count(&after, "select count(*) from definition_types").await,
         3
+    );
+    // #1241: each recorded value resolves to the loaded database's value of
+    // the same label, so a relabel there is found by OID.
+    assert_eq!(
+        count(
+            &after,
+            "select count(*) from definition_enum_values v \
+             join pg_enum e on e.oid = v.value_oid \
+             where e.enumtypid = 'public.mood'::regtype and v.type_oid = e.enumtypid \
+               and e.enumlabel::text = v.label"
+        )
+        .await,
+        count(&raw, "select count(*) from definition_enum_values").await,
+        "every recorded enum value resolves by its label"
+    );
+    assert_eq!(
+        count(&raw, "select count(*) from definition_enum_values").await,
+        6,
+        "two values for each definition reading the enum"
     );
     // `tot` groups by the enum: its key type's OID is the loaded one too.
     assert_eq!(

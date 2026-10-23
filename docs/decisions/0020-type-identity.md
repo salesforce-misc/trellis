@@ -106,6 +106,9 @@ rebuilds from the source without casting any stored text. The changes are:
   equal value ([below](#an-aggregate-or-join-target-holds-an-equal-value)).
 
 Enum values are detected by their value OIDs, recorded with the definition.
+A relabel's `RESUME` waits until no change staged before the relabel is
+pending, so none of their text is applied or re-derived, and a target whose
+ledger keys are label text is rebuilt from empty.
 
 This is the one place a modifier matters: a change that alters how stored
 values render, not one that only widens what the column can hold.
