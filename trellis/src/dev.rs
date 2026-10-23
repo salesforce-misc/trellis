@@ -93,6 +93,10 @@ pub mod staging {
     /// tests.
     #[cfg(any(test, feature = "internals"))]
     pub use crate::staging::group_basis::explain_apply as explain_group_apply;
+    /// The plans of a group-basis target's whole-source reads (its node-form
+    /// recompute and its rebuild), for plan-shape tests.
+    #[cfg(any(test, feature = "internals"))]
+    pub use crate::staging::group_basis::explain_whole_source_reads;
     /// The group-basis dev knob (#1100): tests and `benchmark` turn the group
     /// basis on for admitted aggregates, once, before a client starts. See
     /// `staging::group_basis`'s module doc for what it supports until the

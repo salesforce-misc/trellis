@@ -671,7 +671,6 @@ impl JoinTargetPlan {
         let p_args = self.from.plan.shape.args.clone();
         let m_args = self.joined.plan.shape.args.clone();
         let fa = p_args.len();
-        let p_keys = quoted(&self.from.plan.shape.group_cols);
         let pj = quoted(&self.from.join_cols);
         let mj = quoted(&self.joined.join_cols);
         let jc = quoted(&self.j_cols);
@@ -685,12 +684,8 @@ impl JoinTargetPlan {
                 .join(" and ")
         };
         // A `P` cell `p`'s delta row `d`, matched on every key column,
-        // `NULL` matching `NULL` (the array form hashes).
-        let cell_eq: String = p_keys
-            .iter()
-            .map(|c| format!("array[d.{c}] = array[p.{c}]"))
-            .collect::<Vec<_>>()
-            .join(" and ");
+        // `NULL` matching `NULL`.
+        let cell_eq = self.from.plan.group_match("d", "p");
         // One term's select list: `T`'s group columns (`P`'s from `a`, `M`'s
         // from `b`, or `NULL` when `b` is `None`), then `__n`, then per
         // argument its count and, when summed, its sum.

@@ -802,3 +802,48 @@ async fn a_partitioned_source_with_rows_is_refused() {
         "{error:?}"
     );
 }
+
+/// The statements that read the whole source by one `GROUP BY` (a `JOIN`
+/// side's node-form recompute and a plain aggregate's rebuild) match its
+/// groups to the locked ones by a hash or merge join, never by a nested loop
+/// that rescans the `GROUP BY`'s result once per group: on a two-column
+/// group with hundreds of thousands of cells that loop is quadratic (#1318).
+/// Planned with nested loops disabled, so a nested-loop match (a `Join
+/// Filter` tested on every pair) shows only where its condition can't be
+/// hashed or merged, whatever the table sizes; the lateral index probes of
+/// the hidden and visible rows stay nested loops with no filter. The match
+/// still pairs `NULL` with `NULL`: the build writes every `NULL` group.
+#[tokio::test]
+async fn the_whole_source_reads_match_groups_by_hash_or_merge() {
+    let mut d = seeded("(1, 1, 10), (2, null, 5), (3, 2, null), (4, null, null)").await;
+    write(&d, "create index on public.src (g, v)").await;
+    define_as(
+        &d,
+        "TRANSFORM agg FROM public.src GROUP BY g, v SELECT COUNT(*) AS n",
+    )
+    .await;
+    run_build(&d).await;
+    d.settle().await;
+    assert_eq!(
+        d.rows("select g, v, n from public.agg order by g, v").await,
+        d.rows("select g, v, count(*) from public.src group by g, v order by g, v")
+            .await,
+        "every group, `NULL`s included, built"
+    );
+    let plans = trellis::dev::staging::explain_whole_source_reads(d.pool(), "agg")
+        .await
+        .expect("explain");
+    for plan in plans {
+        assert!(
+            !plan.contains("Join Filter"),
+            "a join is a nested loop that tests every pair:\n{plan}"
+        );
+        assert!(
+            plan.lines().any(|line| {
+                (line.contains("Hash Cond") || line.contains("Merge Cond"))
+                    && line.contains("ARRAY[")
+            }),
+            "the groups are matched by a hash or merge join:\n{plan}"
+        );
+    }
+}
