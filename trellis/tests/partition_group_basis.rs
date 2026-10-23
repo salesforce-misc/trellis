@@ -722,6 +722,213 @@ async fn writes_into_the_leaf_during_its_correction_converge() {
     fx.assert_right("writes during the correction").await;
 }
 
+/// How a leaf operation's correction meets the page in flight of changes the
+/// operation removed (#1309).
+#[derive(Debug, Clone, Copy)]
+enum Race {
+    /// The page holds the groups; the correction's recompute queues behind
+    /// it, then reads after the page commits.
+    CorrectionWaitsOnPage,
+    /// The correction has recomputed and holds the groups; the page queues
+    /// behind it, then reads the new bases.
+    PageWaitsOnCorrection,
+    /// The correction has enumerated its groups; the page then locks them,
+    /// and the correction's recompute queues behind it.
+    PageBetweenEnumerationAndRecompute,
+}
+
+/// #1309: a leaf `TRUNCATE`, `DETACH` or `DROP` while a page applying rows
+/// of the leaf's groups, committed before the operation, is in flight. The
+/// page is frozen right after its group lock or after its increments, and
+/// meets the operation's correction each way round ([`Race`]); a write into
+/// the truncated leaf after the operation, committed before the recompute,
+/// drains after it. Two rows of an existing group and one of a group only
+/// the ring names: whichever commits second, each row is counted once (the
+/// #1117 soak's one failing run read as two rows counted twice).
+#[tokio::test]
+async fn a_leaf_operation_racing_a_page_in_flight_counts_each_row_once() {
+    let mut wrong = Vec::new();
+    for op in [
+        "truncate public.items_p1",
+        "alter table public.items detach partition public.items_p1",
+        "drop table public.items_p1",
+    ] {
+        for page_point in [PausePoint::AfterEntryLock, PausePoint::AfterGroupUpsert] {
+            for race in [
+                Race::CorrectionWaitsOnPage,
+                Race::PageWaitsOnCorrection,
+                Race::PageBetweenEnumerationAndRecompute,
+            ] {
+                wrong.extend(leaf_operation_races_a_page(op, page_point, race).await);
+            }
+        }
+    }
+    assert_eq!(wrong, Vec::<String>::new());
+}
+
+/// Runs leaf operation `op` on `items_p1` and queues its correction. After a
+/// truncate, whose correction the seal queues, a write into the emptied leaf
+/// (to `old` and `new`) lands before the recompute. Returns the batch the
+/// seal sealed, if any, undrained.
+async fn operate(fx: &mut Fx, op: &str, old: i32, new: i32) -> Option<i64> {
+    fx.exec(op).await;
+    let truncate = op.starts_with("truncate");
+    let mut sealed = None;
+    if truncate {
+        sealed = Some(fx.d.seal().await);
+        fx.exec(&format!(
+            "insert into public.items values (950, {old}, 19), (951, {new}, 23)"
+        ))
+        .await;
+    } else {
+        fx.pass().await;
+    }
+    assert_eq!(
+        fx.kinds().await,
+        [if truncate { "truncated" } else { "gone_node" }],
+        "{op}: the correction is queued"
+    );
+    sealed
+}
+
+/// One cell of [`a_leaf_operation_racing_a_page_in_flight_counts_each_row_once`]:
+/// what is wrong after it, if anything.
+async fn leaf_operation_races_a_page(
+    op: &str,
+    page_point: PausePoint,
+    race: Race,
+) -> Option<String> {
+    let what = format!("{op}, page at {page_point:?}, {race:?}");
+    let mut fx = Fx::start(&tree("hash"), SEED).await;
+    let leaf_groups: Vec<i32> =
+        fx.d.ctl
+            .query(
+                "select g from generate_series(0, 63) g \
+                 where satisfies_hash_partition('public.items'::regclass, 4, 1, g) order by g",
+                &[],
+            )
+            .await
+            .expect("leaf groups")
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+    let (old, new) = (
+        leaf_groups[0],
+        *leaf_groups.iter().find(|g| **g > 15).unwrap(),
+    );
+    // The page's changes: committed before the operation, sealed, undrained.
+    fx.exec(&format!(
+        "insert into public.items values (900, {old}, 13), (901, {old}, 17), (902, {new}, 5)"
+    ))
+    .await;
+    let batch = fx.d.seal().await;
+    let correct = |pool: trellis::Pool| async move {
+        Ok(
+            partition_correction::run_pending(&pool, &Options::default())
+                .await
+                .expect("run the corrections"),
+        )
+    };
+    let page_points = [(page_point, "public.agg")];
+    let marker;
+    match race {
+        Race::CorrectionWaitsOnPage => {
+            let mut page = fx.d.drain_frozen(batch, "page", &page_points).await;
+            let held = page.reached(page_point).await;
+            marker = operate(&mut fx, op, old, new).await;
+            let corrected = fx.d.run_frozen(&[], correct).await;
+            fx.d.wait_blocked_behind(held.backend_pid).await;
+            fx.d.release(&mut page, page_point).await;
+            page.finish().await;
+            assert_eq!(corrected.finish().await.completed, 1, "{what}");
+        }
+        Race::PageWaitsOnCorrection => {
+            marker = operate(&mut fx, op, old, new).await;
+            let point = PausePoint::BeforeCorrectionCommit;
+            let mut corrected = fx.d.run_frozen(&[(point, "public.agg")], correct).await;
+            let held = corrected.reached(point).await;
+            let mut page = fx.d.drain_frozen(batch, "page", &page_points).await;
+            fx.d.wait_blocked_behind(held.backend_pid).await;
+            fx.d.release(&mut corrected, point).await;
+            assert_eq!(corrected.finish().await.completed, 1, "{what}");
+            page.reached(page_point).await;
+            fx.d.release(&mut page, page_point).await;
+            page.finish().await;
+        }
+        Race::PageBetweenEnumerationAndRecompute => {
+            marker = operate(&mut fx, op, old, new).await;
+            let point = PausePoint::BeforeCorrectionRecompute;
+            let mut corrected = fx.d.run_frozen(&[(point, "public.agg")], correct).await;
+            corrected.reached(point).await;
+            let mut page = fx.d.drain_frozen(batch, "page", &page_points).await;
+            let held = page.reached(page_point).await;
+            fx.d.release(&mut corrected, point).await;
+            fx.d.wait_blocked_behind(held.backend_pid).await;
+            fx.d.release(&mut page, page_point).await;
+            page.finish().await;
+            assert_eq!(corrected.finish().await.completed, 1, "{what}");
+        }
+    }
+    if let Some(marker) = marker {
+        fx.d.drain(marker, "after").await;
+    }
+    fx.d.settle().await;
+    assert!(fx.queue().await.is_empty(), "{what}");
+    assert_eq!(fx.status().await, "live", "{what}");
+    let (groups, partials) = (fx.wrong_groups().await, fx.negative_partials().await);
+    (!groups.is_empty() || !partials.is_empty())
+        .then(|| format!("{what}: {groups:?}, negative {partials:?}"))
+}
+
+/// #1309: a leaf truncate's correction whose recompute gives up on a group a
+/// page holds (its `lock_timeout`) stays queued and runs again, so the
+/// truncated rows are not left counted. (The #1117 soak's model ran its
+/// correction once, on a session with a 100 ms `lock_timeout`, and moved on
+/// when it timed out.)
+#[tokio::test]
+async fn a_leaf_correction_that_times_out_behind_a_page_runs_again() {
+    let mut fx = Fx::start(&tree("hash"), SEED).await;
+    let old: i32 =
+        fx.d.ctl
+            .query_one(
+                "select min(g) from generate_series(0, 15) g \
+                 where satisfies_hash_partition('public.items'::regclass, 4, 1, g)",
+                &[],
+            )
+            .await
+            .expect("a leaf group")
+            .get(0);
+    fx.exec(&format!(
+        "insert into public.items values (900, {old}, 13), (901, {old}, 17)"
+    ))
+    .await;
+    let batch = fx.d.seal().await;
+    let point = PausePoint::AfterEntryLock;
+    let mut page =
+        fx.d.drain_frozen(batch, "page", &[(point, "public.agg")])
+            .await;
+    page.reached(point).await;
+    fx.exec("truncate public.items_p1").await;
+    let marker = fx.d.seal().await;
+    assert_eq!(fx.kinds().await, ["truncated"]);
+    // A worker whose sessions wait 200 ms for a lock.
+    let impatient = trellis::Pool::new(
+        &Config::from_dsn(format!("{} options='-c lock_timeout=200'", fx.d.db.dsn()))
+            .expect("valid dsn"),
+    )
+    .expect("a pool");
+    let timed_out = partition_correction::run_pending(&impatient, &Options::default()).await;
+    let err = timed_out.expect_err("the recompute waits on the page");
+    assert!(format!("{err:?}").contains("lock timeout"), "{err:?}");
+    assert_eq!(fx.kinds().await, ["truncated"], "still queued");
+    fx.d.release(&mut page, point).await;
+    page.finish().await;
+    assert_eq!(fx.run().await.completed, 1);
+    fx.drain(marker).await;
+    fx.assert_right("the correction ran again").await;
+    assert!(fx.queue().await.is_empty());
+}
+
 /// A leaf detached `CONCURRENTLY`: its correction waits while the detach is
 /// pending, and runs once it is finalized.
 #[tokio::test]
