@@ -4104,6 +4104,14 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
                  staging worker rebuilds it"
             );
         }
+        ResumeStep::Draining => {
+            txn.commit().await?;
+            crate::instance_log::info!(
+                transform = %target,
+                "transform resume accepted; it waits for the changes staged before an enum \
+                 relabel to drain, then the staging worker rebuilds it"
+            );
+        }
     }
     Ok(())
 }
@@ -4181,6 +4189,11 @@ enum ResumeStep {
     /// An upstream of it isn't `live` ([`upstream_not_live`]); it stays
     /// paused with a resume request until every upstream is.
     Waiting(Upstream),
+    /// It was paused for a relabelled enum value, and a change staged before
+    /// the relabel is still pending on a table it reads
+    /// ([`relabel_changes_pending`]); it stays paused with a resume request
+    /// until none is.
+    Draining,
 }
 
 /// A definition in this instance whose target another definition reads
@@ -4292,6 +4305,65 @@ async fn request_wait(
     .await
 }
 
+/// Whether definition `id` (on `source_table`) was paused for a relabelled
+/// enum value (`capture_failures.relabel_lsn`, #1241) and a change at or
+/// below that position is still pending on its source or joined table
+/// ([`super::converge::table_rows_pending_through`]), an image-less
+/// `recompute` included. Such a change holds the old label as text, which
+/// no longer casts to the type: applied after the resume, or re-derived by
+/// its key, it would fail and hold its key again. While the definition is paused the drain skips its share of
+/// each one, so the resume waits for that rather than discarding them.
+async fn relabel_changes_pending(
+    txn: &Transaction<'_>,
+    id: i64,
+    source_table: &str,
+) -> Result<bool, ApplyError> {
+    let Some(row) = txn
+        .query_opt(
+            "select f.relabel_lsn, d.join_table from capture_failures f \
+             join transform_definitions d on d.id = f.transform_id \
+             where f.transform_id = $1 and f.relabel_lsn is not null",
+            &[&id],
+        )
+        .await?
+    else {
+        return Ok(false);
+    };
+    let gate: crate::PgLsn = row.get(0);
+    let joined: Option<String> = row.get(1);
+    for table in std::iter::once(source_table).chain(joined.as_deref()) {
+        if super::converge::table_rows_pending_through(txn, table, gate).await? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The `capture_failure` of a definition whose resume waits for the changes
+/// staged before an enum relabel to drain ([`relabel_changes_pending`]).
+const DRAINING_FAILURE: &str = "resuming: waiting for the changes staged before an enum value \
+     this definition reads was renamed to drain, since they name the old label; then the \
+     staging worker rebuilds this definition from the source, which stays paused until then";
+
+/// Records that definition `id`'s resume waits for the changes staged before
+/// an enum relabel to drain (#1241): a resume request, which
+/// [`finish_requested_resumes`] completes once none is pending, and the
+/// `capture_failure` that says so. The record's `relabel_lsn` stays, so the
+/// completion still rebuilds as a relabel's resume.
+async fn request_drain(
+    txn: &Transaction<'_>,
+    id: i64,
+    source_table: &str,
+) -> Result<(), ApplyError> {
+    txn.execute(
+        "insert into resume_requests (transform_id) values ($1) \
+         on conflict (transform_id) do update set requested_at = now(), timeout_cancels = 0",
+        &[&id],
+    )
+    .await?;
+    set_capture_failure(txn, id, source_table, &[], DRAINING_FAILURE).await
+}
+
 /// A resume of frozen definition `id` (bare target `target`, qualified
 /// source `source_table`), in `txn`, which [`lock_frozen`] has locked it
 /// in. Every resume goes through here: the operator's
@@ -4353,6 +4425,12 @@ async fn resume_locked(
             request_wait(txn, id, &upstream).await?;
         }
         return Ok(ResumeStep::Waiting(upstream));
+    }
+    if relabel_changes_pending(txn, id, source_table).await? {
+        if !from_pass {
+            request_drain(txn, id, source_table).await?;
+        }
+        return Ok(ResumeStep::Draining);
     }
     let revalidated = match catalog::revalidate(txn, schema, &definition).await {
         Ok(revalidated) => revalidated,
@@ -4514,13 +4592,13 @@ async fn complete_resume(
     definition: &crate::defs::model::Definition,
     revalidated: &catalog::Revalidated,
 ) -> Result<(), ApplyError> {
-    let restored: bool = txn
+    let (restored, relabelled): (bool, Option<crate::PgLsn>) = txn
         .query_opt(
-            "select restored from capture_failures where transform_id = $1",
+            "select restored, relabel_lsn from capture_failures where transform_id = $1",
             &[&id],
         )
         .await?
-        .is_some_and(|row| row.get(0));
+        .map_or((false, None), |row| (row.get(0), row.get(1)));
     // `fuse_rearmed_at = now()` in the same statement, not a separate one:
     // it is this resume's epoch, part of the same atomic "this transform
     // starts over" transition as the status drop (issue #160), and what a
@@ -4565,6 +4643,24 @@ async fn complete_resume(
     // every later change to a key the dump held.
     if restored {
         reset_ordering_state(txn, schema, id, &definition.target_table).await?;
+    }
+    // #1241: a definition paused for a relabelled enum value rebuilds without
+    // casting any label it stored. Its resume waited until every change
+    // staged before the relabel had drained ([`relabel_changes_pending`]);
+    // those still in their ring slot are discarded, since a group-basis or
+    // JOIN rebuild reads the old images in the ring. A ledger keyed by a
+    // source key with an enum column holds the old label as `__from_key`,
+    // which the rebuild's sweep would cast: such a target starts again from
+    // empty.
+    if let Some(gate) = relabelled {
+        let mut tables = vec![source_table.to_string()];
+        tables.extend(revalidated.join.as_ref().map(|sides| sides.joined.clone()));
+        discard_drained_changes(txn, &tables, gate).await?;
+        if revalidated.join.is_none()
+            && super::group_basis::route(&definition.def, &revalidated.source_columns).is_none()
+        {
+            empty_if_keyed_by_an_enum(txn, source_table, &definition.target_table).await?;
+        }
     }
     // #1107, #1096 decision 7: a JOIN's hidden tables are fully derived, so
     // the resume drops and recreates them, at the shape define would give
@@ -4716,6 +4812,91 @@ async fn complete_resume(
     )
     .await?;
     crate::instance_log::debug!(transform_id = id, from = %status.as_str(), "resume completed");
+    Ok(())
+}
+
+/// Deletes the ring rows of `tables` with an `origin_lsn` at or below `gate`
+/// that every definition has drained (#1241): their segment is `drained`
+/// and its fence saw them. They wait in their slot until a later segment
+/// reuses it, and a group-basis or JOIN rebuild names groups from the old
+/// images of every row there (`super::group_basis`), casting their text.
+/// After a relabel, below `gate` that text may name a label that no longer
+/// exists. A drained row has reached every definition it will, so no
+/// reader loses a change.
+async fn discard_drained_changes(
+    txn: &Transaction<'_>,
+    tables: &[String],
+    gate: crate::PgLsn,
+) -> Result<(), ApplyError> {
+    for slot in 0..super::append::RING_SIZE {
+        let ring = super::append::ring_table_name(slot)?;
+        txn.execute(
+            &format!(
+                "delete from {ring} r \
+                 where r.src_table = any($1) and r.origin_lsn <= $2 \
+                   and exists (select 1 from segments s \
+                               where s.ring_slot = $3 and s.state = 'drained' \
+                                 and pg_visible_in_snapshot(r.row_txid, s.fence_snapshot)) \
+                   and not exists (select 1 from segments s \
+                                   where s.ring_slot = $3 and s.state <> 'drained')"
+            ),
+            &[&tables, &gate, &slot],
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Empties the ledger target `target` (qualified), its ledger and its
+/// group-delta table, when the row-identity key of `source_table` has a
+/// column of an enum type (#1241). Its ledger's `__from_key` is that key as
+/// text, and after a relabel an entry may name a label that no longer
+/// exists, which the rebuild's sweep would cast to the key's type. Emptied,
+/// the target is rebuilt as define builds it: every key from the source,
+/// with no sweep (`super::build`), so no stored label is ever cast. Its
+/// readers see it empty until the rebuild has written each key.
+async fn empty_if_keyed_by_an_enum(
+    txn: &Transaction<'_>,
+    source_table: &str,
+    target: &str,
+) -> Result<(), ApplyError> {
+    let key: Vec<String> = ddl::identity_key_columns(txn, source_table)
+        .await?
+        .into_iter()
+        .map(|c| c.name)
+        .collect();
+    let keyed_by_an_enum: bool = txn
+        .query_one(
+            "select exists (select 1 from pg_catalog.pg_attribute a \
+                 join pg_catalog.pg_type t on t.oid = a.atttypid \
+                 where a.attrelid = pg_catalog.to_regclass($1) and a.attname = any($2) \
+                   and a.attnum > 0 and not a.attisdropped and t.typtype = 'e')",
+            &[&ddl::regclass_arg(source_table), &key],
+        )
+        .await?
+        .get(0);
+    if !keyed_by_an_enum {
+        return Ok(());
+    }
+    let mut tables = Vec::new();
+    for table in [
+        target.to_string(),
+        crate::defs::ledger::ledger_table_name(target),
+        crate::defs::ledger::deltas_table_name(target),
+    ] {
+        let arg = ddl::regclass_arg(&table);
+        let exists: bool = txn
+            .query_one("select pg_catalog.to_regclass($1) is not null", &[&arg])
+            .await?
+            .get(0);
+        if exists {
+            tables.push(arg);
+        }
+    }
+    if !tables.is_empty() {
+        txn.batch_execute(&format!("truncate {}", tables.join(", ")))
+            .await?;
+    }
     Ok(())
 }
 
@@ -4914,6 +5095,15 @@ async fn resume_caused_definition(
                 waiting_on = %waiting_on.name,
                 "transform resume requested once its upstream was live; it waits for another \
                  upstream to be live"
+            );
+        }
+        Ok(ResumeStep::Draining) => {
+            txn.commit().await?;
+            crate::instance_log::info!(
+                transform = %target,
+                upstream_id = upstream,
+                "transform resume requested once its upstream was live; it waits for the \
+                 changes staged before an enum relabel to drain"
             );
         }
         Ok(ResumeStep::Retyping(copies)) => {
@@ -5221,7 +5411,7 @@ async fn finish_requested_resume(
         }
         // A copy drifted again since, or an upstream stopped being live:
         // the next pass re-types it, or waits.
-        Ok(ResumeStep::Retyping(_) | ResumeStep::Waiting(_)) => {}
+        Ok(ResumeStep::Retyping(_) | ResumeStep::Waiting(_) | ResumeStep::Draining) => {}
         Err(ApplyError::ResumeRefused { reason, .. }) => {
             drop(txn);
             end_request(client, id, &source_table, &refused_resume_text(&reason)).await?;

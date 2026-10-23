@@ -186,6 +186,16 @@ pub async fn reconcile(
             "a renamed type's new name could not be recorded; retrying next pass: {err}"
         );
     }
+    // #1241: an enum value relabelled (`RENAME VALUE`) pauses every reader of
+    // its type, whose staged changes and keys name the old label. After the
+    // restore check too, and before the resumes below, so a resume finishing
+    // in this pass is never one the relabel should have stopped. A failure
+    // is retried by the next pass.
+    if let Err(err) = crate::staging::schema_change::pause_readers_of_relabelled(client).await {
+        crate::instance_log::warn!(
+            "the enum labels the definitions read could not be compared; retrying next pass: {err}"
+        );
+    }
     crate::staging::quarantine::resume_caused_definitions(client, schema).await?;
     crate::staging::quarantine::finish_requested_resumes(client, schema).await?;
     let snapshot = read_snapshot(client, schema).await?;

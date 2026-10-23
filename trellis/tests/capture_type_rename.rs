@@ -463,19 +463,18 @@ async fn an_unchanged_name_is_never_re_recorded() {
     }
 }
 
-/// `ALTER TYPE ... RENAME VALUE` after the writes drained: the copies typed
-/// as the enum follow the relabel, and nothing pauses. (A ring row staged
-/// before a relabel and drained after it holds the old label, which no longer
-/// casts: its keys are held, a separate matter from a type's name.)
+/// `ALTER TYPE ... RENAME VALUE` after the writes drained is no rename: the
+/// labels Trellis stored no longer name a value (#1241), so every reader of
+/// the type pauses, the chained one over the passthrough's copy included,
+/// and `RESUME` rebuilds each (`capture_enum_relabel.rs` has each shape).
 #[tokio::test]
-async fn a_relabelled_value_is_followed_by_the_copies_typed_as_the_enum() {
+async fn a_relabelled_value_pauses_every_reader_and_resume_rebuilds() {
     trellis::dev::staging::set_group_basis(true);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
-    let _trellis = setup(db.dsn(), &mut raw, &db.pool).await;
+    let trellis = setup(db.dsn(), &mut raw, &db.pool).await;
 
-    // Staged and drained, then relabelled.
     write(&raw, "tone", 1).await;
     full_pass(&mut raw, &db.pool).await;
     drain_to_quiescence(&db.pool, &mut raw).await;
@@ -483,6 +482,29 @@ async fn a_relabelled_value_is_followed_by_the_copies_typed_as_the_enum() {
         .await
         .expect("relabel");
     capture_pass(&mut raw, &db.pool).await;
+    for target in TARGETS {
+        assert_eq!(
+            status(&raw, target).await,
+            TransformStatus::Paused,
+            "{target}"
+        );
+        let reported = trellis.status(target).await.expect("status").expect(target);
+        let reason = reported
+            .capture_failure
+            .map(|f| f.error)
+            .unwrap_or_default();
+        assert!(
+            reason.starts_with("enum value 'brisk' of type public.tone was renamed to 'zippy'"),
+            "{target}: {reason}"
+        );
+    }
+    for target in TARGETS {
+        trellis
+            .apply(&format!("RESUME TRANSFORM {target}"))
+            .await
+            .expect(target);
+    }
+    bring_live(&mut raw, &db.pool, &TARGETS).await;
     assert_converged(&raw).await;
 }
 

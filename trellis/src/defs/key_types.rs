@@ -673,7 +673,8 @@ async fn upsert(
 /// `join_columns`, by the OID of the type its column has, while that type
 /// still has the name the token gives. A type already recorded keeps its
 /// row; with `replace`, the definition's rows are deleted first (a resume,
-/// which records every type from the live columns).
+/// which records every type from the live columns). Then the values of
+/// every enum type it reads ([`record_enum_values`]).
 ///
 /// The capture pass compares these rows with `pg_type` by OID: the same OID
 /// under another name is a rename, which it follows in place
@@ -687,6 +688,12 @@ pub(crate) async fn record_types(
         client
             .execute(
                 "delete from definition_types where transform_id = $1",
+                &[&id],
+            )
+            .await?;
+        client
+            .execute(
+                "delete from definition_enum_values where transform_id = $1",
                 &[&id],
             )
             .await?;
@@ -715,6 +722,66 @@ pub(crate) async fn record_types(
              where d.id = $1 \
                and e.value = 'enum:' || n.nspname::text || '.' || ty.typname::text \
              on conflict (transform_id, type_oid) do nothing",
+            &[&id],
+        )
+        .await?;
+    record_enum_values(client, id).await
+}
+
+/// `(transform_id, type_oid)`, one row for each enum type each definition
+/// reads now, by the live type of every column it reads: its
+/// `source_columns` on its source, its `join_columns` on its joined table,
+/// and its key columns (`definition_key_types`), the source's row-identity
+/// key among them. A SQL subquery.
+///
+/// The type a definition read before a re-type of its column isn't in it:
+/// that type's `definition_types` row stays until the next resume
+/// ([`record_types`] only adds rows outside one), so the relabel check
+/// reads this, not those rows.
+pub(crate) const READ_ENUM_TYPES: &str = "\
+    select d.id as transform_id, a.atttypid as type_oid \
+    from transform_definitions d \
+    cross join lateral ( \
+        select d.source_table as tbl, e.col \
+        from pg_catalog.jsonb_object_keys(d.source_columns) as e(col) \
+        union all \
+        select d.join_table, e.col \
+        from pg_catalog.jsonb_object_keys(coalesce(d.join_columns, '{}'::jsonb)) as e(col) \
+        union all \
+        select k.table_name, k.column_name from definition_key_types k \
+        where k.transform_id = d.id) c \
+    join pg_catalog.pg_attribute a \
+      on a.attrelid = pg_catalog.to_regclass( \
+             pg_catalog.quote_ident(pg_catalog.split_part(c.tbl, '.', 1)) || '.' || \
+             pg_catalog.quote_ident(pg_catalog.split_part(c.tbl, '.', 2))) \
+     and a.attname = c.col and a.attnum > 0 and not a.attisdropped \
+    join pg_catalog.pg_type t on t.oid = a.atttypid and t.typtype = 'e' \
+    group by 1, 2";
+
+/// Records, for definition `id`, every value of every enum type it reads
+/// now ([`READ_ENUM_TYPES`]) by its `pg_enum` OID, beside its label
+/// (`definition_enum_values`, ADR-0020, #1241). A value already recorded
+/// keeps its label: a relabel the capture pass hasn't seen yet stays
+/// visible to it. A resume deletes the rows first
+/// ([`record_definition`]).
+///
+/// The capture pass compares these rows with `pg_enum` by OID: a recorded
+/// OID whose label changed is a relabel, which pauses the definition
+/// (`staging::schema_change::pause_readers_of_relabelled`).
+pub(crate) async fn record_enum_values(
+    client: &impl GenericClient,
+    id: i64,
+) -> Result<(), tokio_postgres::Error> {
+    client
+        .execute(
+            &format!(
+                "insert into definition_enum_values (transform_id, type_oid, value_oid, label) \
+                 select r.transform_id, e.enumtypid, e.oid, e.enumlabel::text \
+                 from ({READ_ENUM_TYPES}) r \
+                 join pg_catalog.pg_enum e on e.enumtypid = r.type_oid \
+                 where r.transform_id = $1 \
+                 on conflict (transform_id, value_oid) do nothing"
+            ),
             &[&id],
         )
         .await?;
@@ -771,6 +838,13 @@ pub(crate) async fn record_definition(
         client
             .execute(
                 "delete from definition_types where transform_id = $1",
+                &[&id],
+            )
+            .await?;
+        // #1241: the labels a resume rebuilds under.
+        client
+            .execute(
+                "delete from definition_enum_values where transform_id = $1",
                 &[&id],
             )
             .await?;

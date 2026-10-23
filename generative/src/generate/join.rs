@@ -33,16 +33,32 @@
 //! bursts over several lanes, so both sides' writes race each other into
 //! the same sealed batches and onto the same keys.
 //!
-//! **Not drawn yet:** rows written before a definition exists. Until the
-//! `JOIN` build (J4, #1109) a `JOIN` goes `live` only over two empty
-//! tables, so every definition is installed up front and the run waits for
-//! it before the first op
-//! ([`crate::model::ConcurrentPlan::settle_after_install`]).
+//! **Builds over rows.** A definition is installed up front or part way
+//! through the stream ([`JoinBuildDraws::installs`]), so most `JOIN`s build
+//! (#1109's per-side steps and `T` step) over tables that already hold rows,
+//! or that both lanes are still writing. Later bursts pause and resume a
+//! definition (a `RESUME` rebuilds it in place) and re-read one side
+//! ([`BurstAction::RequestBackfill`] on `ja` or `jb`), each while the lanes
+//! keep writing both tables ([`add_join_actions`]). The oracle is unchanged:
+//! each burst's targets are compared with the definition's own query over the
+//! tables, so the build's outcome is part of every check, and every
+//! definition must be `live` at the end. In a quarter of the cases the run
+//! first waits for the up-front definitions to go `live` over the empty
+//! tables ([`crate::model::ConcurrentPlan::settle_after_install`]), the
+//! shape the tier had before it drew builds. [`build_coverage`] counts, from
+//! a case's program and plan, the builds that run over rows, so a run can show
+//! that they happen.
+//!
+//! The tables are unpartitioned and no definition reads another's target;
+//! partitioned sides and chained readers are separate draw dimensions.
 
 use trellis::IntWidth;
 use trellis::dev::defs::ast::{TransformDef, ValueType};
 
-use crate::model::{Column, Op, OpOutcome, PRIMARY_KEY_VALUE_TYPE, Program, Table};
+use crate::model::{
+    BurstAction, Column, ConcurrentPlan, Op, OpOutcome, PRIMARY_KEY_VALUE_TYPE, Program, Table,
+    TimedAction,
+};
 
 /// The `FROM` table.
 pub const FROM_TABLE: &str = "ja";
@@ -273,13 +289,21 @@ pub struct JoinOpDraw {
 }
 
 /// Resolves `draws` into ops on [`join_tables`], and builds the program with
-/// one definition per spec (`j0`, `j1`, …), all installed up front.
+/// one definition per spec (`j0`, `j1`, …). Definition `i` is installed up
+/// front when `installs[i]` is `0` or missing, and otherwise before the op
+/// that `installs[i]` thousandths of the way through the stream name; a
+/// share that rounds down to the first op installs it up front too.
 ///
 /// An update, delete or truncate names a row the stream has inserted and
 /// not deleted yet (a truncate, every one of its table's); with none left on
 /// its table, it becomes an insert. Every op therefore succeeds and changes
 /// a row. Ids aren't reused after a truncate.
-pub fn build_join_program(specs: &[JoinDefSpec], shape: KeyShape, draws: &[JoinOpDraw]) -> Program {
+pub fn build_join_program(
+    specs: &[JoinDefSpec],
+    shape: KeyShape,
+    draws: &[JoinOpDraw],
+    installs: &[u16],
+) -> Program {
     let tables = join_tables();
     let mut live: [Vec<i64>; 2] = [Vec::new(), Vec::new()];
     let mut next_id = [1i64, 1i64];
@@ -366,7 +390,12 @@ pub fn build_join_program(specs: &[JoinDefSpec], shape: KeyShape, draws: &[JoinO
     Program {
         tables,
         relationships: Vec::new(),
-        def_install_after_op: vec![0; defs.len()],
+        def_install_after_op: (0..defs.len())
+            .map(|i| {
+                let thousandths = usize::from(installs.get(i).copied().unwrap_or(0).min(999));
+                thousandths * ops.len() / 1000
+            })
+            .collect(),
         defs,
         ops,
         restart_after_ops: Vec::new(),
@@ -390,21 +419,263 @@ pub struct JoinCase {
     pub seal_interval_ms: u64,
 }
 
+/// What a case draws besides its definitions and ops: when each definition
+/// installs, which operator actions the later bursts take, and whether the
+/// run first settles the up-front definitions over the empty tables.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct JoinBuildDraws {
+    /// Per definition, how far into the stream it installs, in thousandths
+    /// of the ops; `0` (or missing) installs it up front, before any write.
+    pub installs: Vec<u16>,
+    /// The pauses, resumes and re-reads of the bursts after the first.
+    pub actions: Vec<JoinActionDraw>,
+    /// Whether the run waits for the up-front definitions to go `live`
+    /// before the first op, so they build over empty tables.
+    pub settle_after_install: bool,
+}
+
+/// What a [`JoinActionDraw`] asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinActionKind {
+    /// `PAUSE TRANSFORM`, then `RESUME TRANSFORM` later in the same burst:
+    /// the resume rebuilds the target over the rows as they are then.
+    PauseResume,
+    /// `request_backfill(ja)`: every definition rebuilds in place.
+    RebuildFrom,
+    /// `request_backfill(jb)`.
+    RebuildJoined,
+}
+
+/// One drawn operator action, before [`add_join_actions`] resolves it. Plain
+/// numbers, so it shrinks toward the earliest burst and the first
+/// definition, at the burst's start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JoinActionDraw {
+    pub kind: JoinActionKind,
+    /// Picks a burst after the first, modulo how many there are.
+    pub burst: usize,
+    /// Picks the definition of a pause, modulo how many qualify.
+    pub target: usize,
+    /// Where in the burst the action (or a pair's pause) fires, in
+    /// thousandths of the burst's ops.
+    pub start: u16,
+    /// How much further on a pair's resume fires, in thousandths of the
+    /// burst's ops, capped at the burst's end.
+    pub span: u16,
+}
+
+/// The burst each definition of `program` is installed in: `0` for one
+/// installed up front, otherwise the burst holding its install action.
+fn install_bursts(program: &Program, plan: &ConcurrentPlan) -> Vec<usize> {
+    let mut out = vec![0; program.defs.len()];
+    for (index, burst) in plan.bursts.iter().enumerate() {
+        for timed in &burst.actions {
+            if let BurstAction::Install { def } = timed.action {
+                out[def] = index;
+            }
+        }
+    }
+    out
+}
+
+/// Adds `draws` to `plan`'s bursts. Every action lands in a burst after the
+/// first, and names only definitions installed in an earlier burst: by then
+/// the earlier burst has settled, so the definition is `live` and its tables
+/// are captured, which a pause and a re-read both need.
+///
+/// A draw that can't apply is dropped rather than bent into something else:
+/// a plan with one burst, no definition installed early enough, and a second
+/// pause pair on a definition in a burst that already has one.
+pub fn add_join_actions(
+    mut plan: ConcurrentPlan,
+    program: &Program,
+    draws: &[JoinActionDraw],
+) -> ConcurrentPlan {
+    if plan.bursts.len() < 2 {
+        return plan;
+    }
+    let installed_in = install_bursts(program, &plan);
+    let mut paired: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+    for draw in draws {
+        let burst_index = 1 + draw.burst % (plan.bursts.len() - 1);
+        let eligible: Vec<usize> = (0..program.defs.len())
+            .filter(|&def| installed_in[def] < burst_index)
+            .collect();
+        if eligible.is_empty() {
+            continue;
+        }
+        let ops = plan.bursts[burst_index].ops().len();
+        let at = usize::from(draw.start.min(1000)) * ops / 1000;
+        let end = (at + usize::from(draw.span.min(1000)) * ops / 1000).min(ops);
+        let actions = &mut plan.bursts[burst_index].actions;
+        match draw.kind {
+            JoinActionKind::RebuildFrom | JoinActionKind::RebuildJoined => {
+                let table = if draw.kind == JoinActionKind::RebuildFrom {
+                    FROM_TABLE
+                } else {
+                    JOINED_TABLE
+                };
+                actions.push(TimedAction {
+                    after: at,
+                    action: BurstAction::RequestBackfill {
+                        table: table.to_string(),
+                    },
+                });
+            }
+            JoinActionKind::PauseResume => {
+                let def = eligible[draw.target % eligible.len()];
+                if !paired.insert((burst_index, def)) {
+                    continue;
+                }
+                let target = program.defs[def].target.clone();
+                actions.push(TimedAction {
+                    after: at,
+                    action: BurstAction::Pause {
+                        target: target.clone(),
+                        column: None,
+                    },
+                });
+                actions.push(TimedAction {
+                    after: end,
+                    action: BurstAction::Resume {
+                        target,
+                        column: None,
+                    },
+                });
+            }
+        }
+    }
+    for burst in &mut plan.bursts {
+        burst.actions.sort_by_key(|action| action.after);
+    }
+    plan
+}
+
+/// How often a case's builds run over rows, counted from its program and
+/// plan. A build "over rows" is an install, a resume or a re-read in a burst
+/// whose predecessors, already quiesced, left rows on both tables, more on
+/// each than the burst's own deletes and truncates can remove: whenever in
+/// the burst it fires, it reads rows on both sides. An install is also
+/// counted as racing when it fires part way through its burst, whose own
+/// writes are still landing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BuildCoverage {
+    /// Definitions installed after the first op.
+    pub deferred_installs: usize,
+    /// Of those, ones that fire with rows on both tables from earlier bursts.
+    pub installs_over_rows: usize,
+    /// Installs that fire after some of their own burst's ops (the tables may
+    /// have been empty before the burst).
+    pub installs_racing: usize,
+    pub pauses: usize,
+    /// `RESUME`s (each a rebuild in place of the target).
+    pub resumes: usize,
+    pub resumes_over_rows: usize,
+    pub rebuilds_from: usize,
+    pub rebuilds_joined: usize,
+    pub rebuilds_over_rows: usize,
+}
+
+impl BuildCoverage {
+    /// Builds of every kind that fire over rows from earlier bursts.
+    pub fn builds_over_rows(&self) -> usize {
+        self.installs_over_rows + self.resumes_over_rows + self.rebuilds_over_rows
+    }
+
+    pub fn add(&mut self, other: &BuildCoverage) {
+        self.deferred_installs += other.deferred_installs;
+        self.installs_over_rows += other.installs_over_rows;
+        self.installs_racing += other.installs_racing;
+        self.pauses += other.pauses;
+        self.resumes += other.resumes;
+        self.resumes_over_rows += other.resumes_over_rows;
+        self.rebuilds_from += other.rebuilds_from;
+        self.rebuilds_joined += other.rebuilds_joined;
+        self.rebuilds_over_rows += other.rebuilds_over_rows;
+    }
+}
+
+/// [`BuildCoverage`] of `program` issued as `plan`.
+pub fn build_coverage(program: &Program, plan: &ConcurrentPlan) -> BuildCoverage {
+    let mut out = BuildCoverage::default();
+    // Rows the model says each table holds before each burst.
+    let mut rows = [0i64; 2];
+    for burst in &plan.bursts {
+        let ops = burst.ops();
+        // The lanes race, so an action may fire after any of the burst's
+        // ops: a side certainly holds rows throughout the burst only if it
+        // held more rows than the burst deletes from it, and the burst
+        // doesn't truncate it.
+        let mut emptying = [0i64; 2];
+        for &i in &ops {
+            let (table, by) = match &program.ops[i] {
+                Op::Delete { table, .. } => (table, 1),
+                Op::Truncate { table, .. } => (table, i64::MAX),
+                _ => continue,
+            };
+            let side = usize::from(table == JOINED_TABLE);
+            emptying[side] = emptying[side].saturating_add(by);
+        }
+        let over_rows = (0..2).all(|side| rows[side] > emptying[side]);
+        for timed in &burst.actions {
+            match &timed.action {
+                BurstAction::Install { .. } => {
+                    out.deferred_installs += 1;
+                    out.installs_over_rows += usize::from(over_rows);
+                    out.installs_racing += usize::from(timed.after > 0);
+                }
+                BurstAction::Pause { .. } => out.pauses += 1,
+                BurstAction::Resume { .. } => {
+                    out.resumes += 1;
+                    out.resumes_over_rows += usize::from(over_rows);
+                }
+                BurstAction::RequestBackfill { table } => {
+                    if table == FROM_TABLE {
+                        out.rebuilds_from += 1;
+                    } else {
+                        out.rebuilds_joined += 1;
+                    }
+                    out.rebuilds_over_rows += usize::from(over_rows);
+                }
+            }
+        }
+        for &i in &ops {
+            let (table, delta) = match &program.ops[i] {
+                Op::Insert { table, .. } => (table, 1),
+                Op::Delete { table, .. } => (table, -1),
+                Op::Truncate { table, .. } => (table, i64::MIN),
+                _ => continue,
+            };
+            let side = usize::from(table == JOINED_TABLE);
+            rows[side] = if delta == i64::MIN {
+                0
+            } else {
+                (rows[side] + delta).max(0)
+            };
+        }
+    }
+    out
+}
+
 /// [`build_join_program`] issued by [`super::concurrent_plan`] in bursts of
-/// `burst_size` over `lanes` lanes, waiting for the definitions to go
-/// `live` before the first op.
+/// `burst_size` over `lanes` lanes, with `builds`' installs and actions. The
+/// run waits for the up-front definitions to go `live` before the first op
+/// only if `builds` says so.
+#[allow(clippy::too_many_arguments)]
 pub fn join_case(
     specs: &[JoinDefSpec],
     shape: KeyShape,
     draws: &[JoinOpDraw],
+    builds: &JoinBuildDraws,
     burst_size: usize,
     lanes: usize,
     workers: usize,
     seal_interval_ms: u64,
 ) -> JoinCase {
-    let program = build_join_program(specs, shape, draws);
+    let program = build_join_program(specs, shape, draws, &builds.installs);
     let mut plan = super::concurrent_plan(&program, burst_size, lanes);
-    plan.settle_after_install = true;
+    plan = add_join_actions(plan, &program, &builds.actions);
+    plan.settle_after_install = builds.settle_after_install;
     JoinCase {
         program,
         shape,
@@ -446,6 +717,44 @@ mod strategy {
             })
     }
 
+    fn action() -> impl Strategy<Value = JoinActionDraw> {
+        (
+            prop_oneof![
+                3 => Just(JoinActionKind::PauseResume),
+                1 => Just(JoinActionKind::RebuildFrom),
+                1 => Just(JoinActionKind::RebuildJoined),
+            ],
+            any::<usize>(),
+            any::<usize>(),
+            0u16..=1000,
+            0u16..=1000,
+        )
+            .prop_map(|(kind, burst, target, start, span)| JoinActionDraw {
+                kind,
+                burst,
+                target,
+                start,
+                span,
+            })
+    }
+
+    /// When each of up to three definitions installs (a third up front, the
+    /// rest anywhere in the stream's first 95%, so most build over rows),
+    /// up to four pauses and re-reads, and (a quarter of the cases) a settle
+    /// over the empty tables before the first op.
+    fn builds() -> impl Strategy<Value = JoinBuildDraws> {
+        (
+            proptest::collection::vec(prop_oneof![1 => Just(0u16), 2 => 1u16..=950], 3),
+            proptest::collection::vec(action(), 0..=4),
+            prop_oneof![3 => Just(false), 1 => Just(true)],
+        )
+            .prop_map(|(installs, actions, settle_after_install)| JoinBuildDraws {
+                installs,
+                actions,
+                settle_after_install,
+            })
+    }
+
     /// One op draw. Without `truncating`, a drawn truncate is a delete.
     fn draw(joined_weight: u32, truncating: bool) -> impl Strategy<Value = JoinOpDraw> {
         (
@@ -484,7 +793,9 @@ mod strategy {
             })
     }
 
-    /// A JOIN-tier case: one to three definitions, a [`KeyShape`], 120 to
+    /// A JOIN-tier case: one to three definitions, each installed up front
+    /// or part way through the stream, with pauses, resumes and re-reads
+    /// in the later bursts ([`JoinBuildDraws`]), a [`KeyShape`], 120 to
     /// [`MAX_OPS`] ops (half on each side for fan-out and wide, about a
     /// third on the joined side otherwise; in half the cases, about one in a
     /// hundred a `TRUNCATE`), bursts of 40 to 600 ops over 2
@@ -521,13 +832,15 @@ mod strategy {
                 2usize..=4,
                 2usize..=6,
                 20u64..=200,
+                builds(),
             )
                 .prop_map(
-                    move |(specs, draws, burst_size, lanes, workers, seal_interval_ms)| {
+                    move |(specs, draws, burst_size, lanes, workers, seal_interval_ms, builds)| {
                         join_case(
                             &specs,
                             shape,
                             &draws,
+                            &builds,
                             burst_size,
                             lanes,
                             workers,
@@ -611,6 +924,7 @@ mod tests {
                 draw(false, JoinOpKind::Truncate, 0),
                 draw(true, JoinOpKind::Delete, 0),
             ],
+            &[],
         );
         let shapes: Vec<String> = program
             .ops
@@ -662,5 +976,209 @@ mod tests {
             .filter_map(|raw| KeyShape::Wide.key(raw))
             .collect();
         assert_eq!(wide.len(), usize::from(WIDE_KEYS));
+    }
+
+    fn inserts(n: usize) -> Vec<JoinOpDraw> {
+        (0..n)
+            .map(|i| JoinOpDraw {
+                joined: i % 2 == 1,
+                kind: JoinOpKind::Insert,
+                pick: 0,
+                key: i as u8,
+                t: 0,
+                group: Some(1),
+                value: Some(1),
+                columns: 0,
+            })
+            .collect()
+    }
+
+    fn one_spec() -> Vec<JoinDefSpec> {
+        let spec = JoinDefSpec {
+            left: true,
+            key: JoinKey::Single,
+            groups: JoinGroups::Joined,
+            fields: vec![JoinField::SumX],
+        };
+        vec![spec.clone(), spec.clone(), spec]
+    }
+
+    /// A definition installs up front for `0`, otherwise after the share of
+    /// the ops its draw names, and the plan installs each exactly once.
+    #[test]
+    fn installs_land_at_their_drawn_point() {
+        let builds = JoinBuildDraws {
+            installs: vec![0, 500, 999],
+            ..JoinBuildDraws::default()
+        };
+        let case = join_case(
+            &one_spec(),
+            KeyShape::Spread,
+            &inserts(100),
+            &builds,
+            30,
+            2,
+            2,
+            50,
+        );
+        assert_eq!(case.program.def_install_after_op, [0, 50, 99]);
+        assert!(!case.plan.settle_after_install);
+        let installs: Vec<(usize, usize)> = case
+            .plan
+            .bursts
+            .iter()
+            .enumerate()
+            .flat_map(|(i, b)| {
+                b.actions.iter().filter_map(move |a| match a.action {
+                    BurstAction::Install { def } => Some((i, def)),
+                    _ => None,
+                })
+            })
+            .collect();
+        assert_eq!(installs, [(1, 1), (3, 2)]);
+    }
+
+    /// Actions land only in bursts after the first, name only definitions
+    /// installed in an earlier burst, and pair each pause with a later resume.
+    #[test]
+    fn actions_name_only_definitions_installed_earlier() {
+        let builds = JoinBuildDraws {
+            installs: vec![0, 500, 999],
+            actions: (0..12)
+                .map(|i| JoinActionDraw {
+                    kind: [
+                        JoinActionKind::PauseResume,
+                        JoinActionKind::RebuildFrom,
+                        JoinActionKind::RebuildJoined,
+                    ][i % 3],
+                    burst: i,
+                    target: i,
+                    start: 100 * (i as u16 % 5),
+                    span: 300,
+                })
+                .collect(),
+            settle_after_install: true,
+        };
+        let case = join_case(
+            &one_spec(),
+            KeyShape::Spread,
+            &inserts(100),
+            &builds,
+            30,
+            2,
+            2,
+            50,
+        );
+        assert!(case.plan.settle_after_install);
+        let installed_in = install_bursts(&case.program, &case.plan);
+        assert_eq!(installed_in, [0, 1, 3]);
+        assert!(case.plan.bursts[0].actions.is_empty());
+        let mut pauses = 0;
+        for (index, burst) in case.plan.bursts.iter().enumerate() {
+            let mut open = std::collections::HashSet::new();
+            for timed in &burst.actions {
+                match &timed.action {
+                    BurstAction::Pause { target, .. } => {
+                        pauses += 1;
+                        let def = case
+                            .program
+                            .defs
+                            .iter()
+                            .position(|d| &d.target == target)
+                            .unwrap();
+                        assert!(installed_in[def] < index, "{target} in burst {index}");
+                        assert!(open.insert(target.clone()), "paired twice in {index}");
+                    }
+                    BurstAction::Resume { target, .. } => {
+                        assert!(open.remove(target), "resume without pause");
+                    }
+                    _ => {}
+                }
+            }
+            assert!(open.is_empty(), "burst {index}: {open:?}");
+        }
+        assert!(pauses > 0);
+        let coverage = build_coverage(&case.program, &case.plan);
+        assert_eq!(coverage.pauses, pauses);
+        assert_eq!(coverage.resumes, pauses);
+        assert!(coverage.rebuilds_from > 0 && coverage.rebuilds_joined > 0);
+    }
+
+    /// The coverage counts a build as over rows only when earlier bursts
+    /// left rows on both tables: an install in the first burst never is.
+    #[test]
+    fn coverage_counts_builds_over_rows() {
+        let builds = JoinBuildDraws {
+            installs: vec![100, 600, 0],
+            actions: vec![JoinActionDraw {
+                kind: JoinActionKind::RebuildJoined,
+                burst: 0,
+                target: 0,
+                start: 0,
+                span: 0,
+            }],
+            settle_after_install: false,
+        };
+        let case = join_case(
+            &one_spec(),
+            KeyShape::Spread,
+            &inserts(100),
+            &builds,
+            30,
+            2,
+            2,
+            50,
+        );
+        let coverage = build_coverage(&case.program, &case.plan);
+        assert_eq!(coverage.deferred_installs, 2);
+        // Install at op 10 is in burst 0 (no earlier rows); at op 60, in
+        // burst 2.
+        assert_eq!(coverage.installs_over_rows, 1);
+        assert_eq!(coverage.installs_racing, 1);
+        assert_eq!(coverage.rebuilds_joined, 1);
+        assert_eq!(coverage.rebuilds_over_rows, 1);
+        assert_eq!(coverage.builds_over_rows(), 2);
+    }
+
+    /// A burst that could empty a side before its action fires doesn't count
+    /// that action as over rows: the lanes race, so it may fire after the
+    /// delete.
+    #[test]
+    fn coverage_skips_a_burst_that_can_empty_a_side() {
+        let mut draws = inserts(2);
+        // Burst 1: delete `ja`'s only row, then insert another.
+        draws.push(JoinOpDraw {
+            kind: JoinOpKind::Delete,
+            ..draws[0]
+        });
+        draws.push(draws[0]);
+        // Burst 2: inserts only.
+        draws.extend(inserts(2));
+        let action = |burst| JoinActionDraw {
+            kind: JoinActionKind::RebuildJoined,
+            burst,
+            target: 0,
+            start: 1000,
+            span: 0,
+        };
+        let builds = JoinBuildDraws {
+            installs: vec![0],
+            actions: vec![action(0), action(1)],
+            settle_after_install: false,
+        };
+        let case = join_case(
+            &one_spec()[..1],
+            KeyShape::Spread,
+            &draws,
+            &builds,
+            2,
+            2,
+            2,
+            50,
+        );
+        assert!(matches!(case.program.ops[2], Op::Delete { .. }));
+        let coverage = build_coverage(&case.program, &case.plan);
+        assert_eq!(coverage.rebuilds_joined, 2);
+        assert_eq!(coverage.rebuilds_over_rows, 1);
     }
 }

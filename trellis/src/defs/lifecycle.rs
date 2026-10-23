@@ -361,6 +361,50 @@ pub(crate) async fn pause_for_restore(
         == 1)
 }
 
+/// Pauses definition `id` because an enum type it reads was relabelled
+/// (`ALTER TYPE ... RENAME VALUE`, #1241, ADR-0020): the label text Trellis
+/// staged and keyed by names a value that no longer exists. The record's
+/// `relabel_lsn` is `lsn`, the WAL insert position the capture pass read
+/// after finding it, raised by a later relabel; its resume waits until no
+/// change at or below it is pending on the tables the definition reads, and
+/// rebuilds from the source (`staging::quarantine`). Kind `capture`. A
+/// definition already frozen keeps its status but gets the record, so its
+/// resume is the relabel's. An existing record's reason is kept, the
+/// relabel's put before it the first time. Returns whether this call paused
+/// it.
+pub(crate) async fn pause_for_relabel(
+    txn: &Transaction<'_>,
+    id: i64,
+    source_table: &str,
+    error: &str,
+    lsn: crate::PgLsn,
+) -> Result<bool, CatalogError> {
+    txn.execute(
+        "insert into capture_failures \
+             (transform_id, source_table, columns, error, kind, relabel_lsn) \
+         select id, $2, '{}', $3, 'capture', $4 from transform_definitions where id = $1 \
+         on conflict (transform_id) do update \
+         set relabel_lsn = greatest(capture_failures.relabel_lsn, excluded.relabel_lsn), \
+             error = case when capture_failures.relabel_lsn is not null \
+                          then capture_failures.error \
+                          else excluded.error || ' It was already paused: ' \
+                               || capture_failures.error end",
+        &[&id, &source_table, &error, &lsn],
+    )
+    .await?;
+    Ok(txn
+        .execute(
+            "update transform_definitions set status = $2 where id = $1 and status = any($3)",
+            &[
+                &id,
+                &TransformStatus::Paused.as_str(),
+                &TransformStatus::dispatchable(),
+            ],
+        )
+        .await?
+        == 1)
+}
+
 /// Pauses definition `id` because it was written under a grammar version
 /// outside this binary's window (ADR-0018), recording `error` as its
 /// `capture_failure`. Returns whether this call paused it.

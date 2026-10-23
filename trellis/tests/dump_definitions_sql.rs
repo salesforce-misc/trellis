@@ -205,6 +205,33 @@ async fn ledger_rows(raw: &Client) -> i64 {
     count(raw, "select count(*) from public.tot__ledger").await
 }
 
+/// The Elixir client replaces an earlier appendix in a structure file only
+/// if every line from its marker starts with one of the prefixes it lists
+/// (`@appendix_starts` in `Trellis.StructureDump`); a line it doesn't know
+/// leaves the old appendix in place and the definitions load twice. The list
+/// is read from the Elixir source, so it lives in one place.
+fn every_line_is_one_the_elixir_client_strips(appendix: &str) {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../clients/elixir/lib/trellis/structure_dump.ex"
+    );
+    let source = std::fs::read_to_string(path).expect("read structure_dump.ex");
+    let list = source
+        .split_once("@appendix_starts [")
+        .and_then(|(_, rest)| rest.split_once(']'))
+        .expect("@appendix_starts list")
+        .0;
+    let starts: Vec<&str> = list.split('"').skip(1).step_by(2).collect();
+    assert!(starts.len() > 3, "parsed {starts:?}");
+    assert!(appendix.starts_with("-- Trellis definitions ("));
+    for line in appendix.lines() {
+        assert!(
+            line.is_empty() || starts.iter().any(|start| line.starts_with(start)),
+            "the Elixir client wouldn't strip this appendix line: {line}"
+        );
+    }
+}
+
 const STATUSES: &str =
     "select target_table || ' ' || status from transform_definitions order by id";
 
@@ -239,6 +266,7 @@ async fn a_dump_loads_as_defined_not_built() {
         "pg_dump",
     );
     let appendix = t.dump_definitions_sql().await.expect("dump definitions");
+    every_line_is_one_the_elixir_client_strips(&appendix);
 
     let loaded = cluster.create_empty_database().await;
     load(loaded.dsn(), &schema_sql, &appendix);
@@ -254,6 +282,9 @@ async fn a_dump_loads_as_defined_not_built() {
         // #1242: a type's OID is the database's own; the name beside it loads.
         "select to_jsonb(t) - 'type_oid' from definition_key_types t order by transform_id, table_name, column_name",
         "select to_jsonb(t) - 'type_oid' from definition_types t order by transform_id, type_name",
+        // #1241: an enum value's OID too; its label loads.
+        "select to_jsonb(t) - 'type_oid' - 'value_oid' from definition_enum_values t \
+         order by transform_id, label",
         "select to_jsonb(t) from trellis_instance t",
         "select to_jsonb(t) - 'applied_on' from refinery_schema_history t order by version",
         "select to_jsonb(t) - 'created_at' - 'status' - 'build' - 'build_seg' - 'build_marker_generation' - 'fuse_rearmed_at' from transform_definitions t order by id",
@@ -279,6 +310,25 @@ async fn a_dump_loads_as_defined_not_built() {
     assert_eq!(
         count(&after, "select count(*) from definition_types").await,
         3
+    );
+    // #1241: each recorded value resolves to the loaded database's value of
+    // the same label, so a relabel there is found by OID.
+    assert_eq!(
+        count(
+            &after,
+            "select count(*) from definition_enum_values v \
+             join pg_enum e on e.oid = v.value_oid \
+             where e.enumtypid = 'public.mood'::regtype and v.type_oid = e.enumtypid \
+               and e.enumlabel::text = v.label"
+        )
+        .await,
+        count(&raw, "select count(*) from definition_enum_values").await,
+        "every recorded enum value resolves by its label"
+    );
+    assert_eq!(
+        count(&raw, "select count(*) from definition_enum_values").await,
+        6,
+        "two values for each definition reading the enum"
     );
     // `tot` groups by the enum: its key type's OID is the loaded one too.
     assert_eq!(

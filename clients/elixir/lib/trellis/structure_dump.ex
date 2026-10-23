@@ -51,15 +51,17 @@ defmodule Trellis.StructureDump do
   # the first's appendix rather than loading the definitions twice.
   @marker "-- Trellis definitions ("
 
-  # How each line of the engine's appendix starts (`trellis::dump`).
+  # How each line of the engine's appendix starts (`trellis::dump`; each
+  # statement is one line). The engine's `dump_definitions_sql` test reads
+  # this list and checks every line of a dump against it.
   @appendix_starts [
     "--",
     "insert into ",
     "select setval(",
     "update ",
-    "create temporary table trellis_resolved_types ",
+    "create temporary table trellis_resolved_",
     "delete from ",
-    "drop table trellis_resolved_types;"
+    "drop table trellis_resolved_"
   ]
 
   # How many times `dump/2` redoes a dump that a define or drop raced.

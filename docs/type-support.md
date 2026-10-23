@@ -78,8 +78,9 @@ A passthrough and a 1-1 target's key columns take their source column's type
 at define, with no type modifier (a passthrough an `ALTER TRANSFORM … ADD` adds
 takes it the same way). A `numeric(10,2)`, a `timestamp(3)`, a `char(5)`, a
 `bit(8)`, a `varchar(40)` and an `interval(3)` column are each copied as
-`numeric`, `timestamp`, `bpchar`, `"bit"`, `character varying` and `interval`,
-with the source column's collation. A modifier constrains what the source can
+`numeric`, `timestamp`, `bpchar`, `"bit"`, `character varying` and `interval`.
+A 1-1 target's key columns keep the source column's collation; a passthrough
+takes the database default. A modifier constrains what the source can
 hold. It plays no part in a comparison, a join or an index, and Postgres rounds
 silently when it assigns a value into a `numeric(p,s)`, `timestamp(p)`,
 `timestamptz(p)`, `time(p)`, `timetz(p)` or `interval` column, so a copy that
@@ -88,7 +89,10 @@ trigger. The type is the source column's type OID, rendered schema-qualified
 whatever the session's `search_path`, by one function (`defs::copy_type`) that
 every column Trellis creates and every cast to one goes through
 ([ADR-0020](decisions/0020-type-identity.md)). So `\d` on a target shows no
-modifiers. A `GROUP BY` key's column (in the target, its ledger and its
+modifiers. A 1-1 copy holds the source's exact rendering: a `numeric` rewritten from
+`1.25` to `1.2500`, an `interval` from `'1 day'` to `'24 hours'` and a float
+from `-0` to `0` reach the copy, though each pair is equal as a value
+([ADR-0020](decisions/0020-type-identity.md)). A `GROUP BY` key's column (in the target, its ledger and its
 group-delta table) takes its value family's type: `integer` or `bigint` by width, `text` for any
 string, unconstrained `numeric`, a temporal type at full precision. A to-one
 relationship's projection keys by the to-side column's exact type, and holds
@@ -370,8 +374,20 @@ under another qualified name now, records the new name where Trellis casts by
 it and releases the keys a drain held for the old name. Nothing pauses or
 rebuilds. A logical dump and restore gives every type a new OID: the restore
 pauses every definition, the pass compares none of their recorded OIDs, and
-`RESUME` records the new ones. `pg_upgrade` keeps them. `ALTER TYPE … RENAME VALUE` relabels the values in the
-columns Trellis created too.
+`RESUME` records the new ones. `pg_upgrade` keeps them.
+
+Renaming a value (`ALTER TYPE … RENAME VALUE`) pauses every definition that
+reads a column of the type, whatever the place: passthrough, key, `GROUP BY`,
+`JOIN` column or an input to a calculated field. The columns Trellis created
+follow the new label, but Trellis also keeps values as label text (staged
+changes, held keys, a 1-1 ledger's keys), and that text names a label that
+no longer exists. Each definition records its enum values by their
+`pg_enum` OIDs, and the capture pass finds the one whose label changed;
+`capture_failure` names the old and new label. `RESUME` waits for the changes
+staged before the relabel to drain and rebuilds the target from the source,
+from empty for a target keyed by an enum source key
+([capture by triggers](staging-and-claiming/01-capture-by-triggers.md#an-enum-value-relabelled)).
+Adding a value (`ADD VALUE`) changes no label and pauses nothing.
 
 ## `array_agg` and `string_agg`
 

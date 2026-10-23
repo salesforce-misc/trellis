@@ -14,9 +14,12 @@
 //! **Axes.**
 //! - The type ([`TYPES`]): `varchar`, `bpchar`, `bit`, `varbit`, `numeric`,
 //!   `time`, `timetz`, `timestamp`, `timestamptz`, `interval` and an array
-//!   (refused in every place), and `char(n)` moved to `text`.
+//!   (refused in every place), `char(n)` moved to `text`, and an enum, whose
+//!   value identity is its labels.
 //! - The change ([`Change`]): a catalog-only widening, a widening or `USING`
-//!   rewrite that re-renders the stored values, and a narrowing.
+//!   rewrite that re-renders the stored values, a narrowing, and an enum
+//!   relabel (`RENAME VALUE`), which pauses every reader of the type in every
+//!   place (#1241).
 //! - The place ([`Place`]): a 1-1 primary key and passthrough, a group-basis
 //!   `GROUP BY` key, a `JOIN`'s `ON` columns and its `GROUP BY` key. The two
 //!   `JOIN` places keep their columns in the hidden tables `P`, `M`, `J` and
@@ -74,6 +77,11 @@ enum Change {
     Rewrite,
     /// A narrowing that rounds or truncates the values stored.
     Narrow,
+    /// An enum value relabelled (`ALTER TYPE ... RENAME VALUE`): no column
+    /// changes, but the label text Trellis stored names a value that no
+    /// longer exists (#1241). It pauses every reader of the type, and
+    /// `RESUME` rebuilds.
+    Relabel,
 }
 
 /// Where Trellis keeps a copy of the column.
@@ -119,9 +127,13 @@ struct Row {
 struct Ty {
     label: &'static str,
     value_type: ValueType,
+    /// DDL the source's needs first (the enum type).
+    prelude: &'static str,
     catalog_only: Option<Row>,
     rewrite: Option<Row>,
     narrow: Option<Row>,
+    /// For [`Change::Relabel`], `alter` is the whole statement.
+    relabel: Option<Row>,
 }
 
 impl Ty {
@@ -130,6 +142,7 @@ impl Ty {
             Change::CatalogOnly => self.catalog_only.as_ref(),
             Change::Rewrite => self.rewrite.as_ref(),
             Change::Narrow => self.narrow.as_ref(),
+            Change::Relabel => self.relabel.as_ref(),
         }
     }
 }
@@ -154,6 +167,7 @@ const TYPES: &[Ty] = &[
     Ty {
         label: "varchar",
         value_type: ValueType::Text,
+        prelude: "",
         catalog_only: row("varchar(5)", "varchar(8)", "abc", "abcdefg"),
         rewrite: row(
             "varchar(5)",
@@ -162,10 +176,12 @@ const TYPES: &[Ty] = &[
             "abcdefg",
         ),
         narrow: row("varchar(8)", "varchar(3) using left({c}, 3)", "abc", "xyz"),
+        relabel: None,
     },
     Ty {
         label: "bpchar",
         value_type: ValueType::Text,
+        prelude: "",
         catalog_only: None,
         rewrite: row("char(5)", "char(8)", "abc", "abcdefg"),
         narrow: row(
@@ -174,25 +190,31 @@ const TYPES: &[Ty] = &[
             "abc",
             "xyz",
         ),
+        relabel: None,
     },
     // Not a modifier change: `char(n)` to `text` is #1238's other shape.
     Ty {
         label: "bpchar to text",
         value_type: ValueType::Text,
+        prelude: "",
         catalog_only: None,
         rewrite: row("char(5)", "text", "abc", "abcdefg"),
         narrow: None,
+        relabel: None,
     },
     Ty {
         label: "bit",
         value_type: ValueType::Other(PgType::Bit),
+        prelude: "",
         catalog_only: None,
         rewrite: row("bit(5)", "bit(8) using {c}::bit(8)", "10101", "11111111"),
         narrow: row("bit(8)", "bit(3) using {c}::bit(3)", "10101000", "110"),
+        relabel: None,
     },
     Ty {
         label: "varbit",
         value_type: ValueType::Other(PgType::VarBit),
+        prelude: "",
         catalog_only: row("bit varying(5)", "bit varying(8)", "10101", "10101000"),
         rewrite: row(
             "bit varying(5)",
@@ -206,31 +228,39 @@ const TYPES: &[Ty] = &[
             "101",
             "110",
         ),
+        relabel: None,
     },
     Ty {
         label: "numeric",
         value_type: ValueType::Numeric,
+        prelude: "",
         catalog_only: row("numeric(6,2)", "numeric", "1.25", "1.23456789"),
         rewrite: row("numeric(6,2)", "numeric(8,4)", "1.25", "1.2345"),
         narrow: row("numeric(8,4)", "numeric(6,1)", "1.2000", "2.5"),
+        relabel: None,
     },
     Ty {
         label: "time",
         value_type: ValueType::Other(PgType::Time),
+        prelude: "",
         catalog_only: row("time(0)", "time(3)", "10:00:00", "10:00:00.4"),
         rewrite: None,
         narrow: row("time(3)", "time(0)", "10:00:00", "11:00:00"),
+        relabel: None,
     },
     Ty {
         label: "timetz",
         value_type: ValueType::Other(PgType::TimeTz),
+        prelude: "",
         catalog_only: row("timetz(0)", "timetz(3)", "10:00:00+00", "10:00:00.4+00"),
         rewrite: None,
         narrow: row("timetz(3)", "timetz(0)", "10:00:00+00", "11:00:00+00"),
+        relabel: None,
     },
     Ty {
         label: "timestamp",
         value_type: ValueType::Other(PgType::Timestamp),
+        prelude: "",
         catalog_only: row(
             "timestamp(0)",
             "timestamp(3)",
@@ -244,10 +274,12 @@ const TYPES: &[Ty] = &[
             "2024-01-01 00:00:00",
             "2024-01-02 00:00:00",
         ),
+        relabel: None,
     },
     Ty {
         label: "timestamptz",
         value_type: ValueType::Other(PgType::TimestampTz),
+        prelude: "",
         catalog_only: row(
             "timestamptz(0)",
             "timestamptz(3)",
@@ -261,10 +293,12 @@ const TYPES: &[Ty] = &[
             "2024-01-01 00:00:00+00",
             "2024-01-02 00:00:00+00",
         ),
+        relabel: None,
     },
     Ty {
         label: "interval",
         value_type: ValueType::Other(PgType::Interval),
+        prelude: "",
         catalog_only: row(
             "interval(0)",
             "interval(3)",
@@ -278,10 +312,12 @@ const TYPES: &[Ty] = &[
             "1 day 00:00:01",
             "2 days 00:00:01",
         ),
+        relabel: None,
     },
     Ty {
         label: "interval fields",
         value_type: ValueType::Other(PgType::Interval),
+        prelude: "",
         catalog_only: row(
             "interval day",
             "interval day to second",
@@ -290,13 +326,32 @@ const TYPES: &[Ty] = &[
         ),
         rewrite: None,
         narrow: None,
+        relabel: None,
     },
     Ty {
         label: "varchar[]",
         value_type: ValueType::Other(PgType::Unrecognized),
+        prelude: "",
         catalog_only: None,
         rewrite: row("varchar(5)[]", "varchar(8)[]", "{abc}", "{abcdefg}"),
         narrow: None,
+        relabel: None,
+    },
+    // No modifier: its value identity is its labels (ADR-0020, #1241).
+    Ty {
+        label: "enum",
+        value_type: ValueType::Other(PgType::Enum("enum:public.tone")),
+        prelude: "create type public.tone as enum ('brisk', 'calm'); ",
+        catalog_only: None,
+        rewrite: None,
+        narrow: None,
+        relabel: row(
+            "public.tone",
+            "alter type public.tone rename value 'brisk' to 'zippy'",
+            "brisk",
+            // The seed is `zippy` now, a key in some places.
+            "calm",
+        ),
     },
 ];
 
@@ -307,6 +362,8 @@ fn admits(place: Place, label: &str) -> bool {
         // A passthrough takes any type the registry places. An array it
         // doesn't place is out of the definition.
         Place::Passthrough => label != "varchar[]",
+        // An enum is a key, join and group key in every place.
+        _ if label == "enum" => true,
         // A key is a text-stable type: not `numeric`, `interval`,
         // `character(n)` or an array.
         Place::PrimaryKey => matches!(
@@ -676,7 +733,8 @@ async fn copies_with_a_modifier(d: &Driver) -> Vec<String> {
 async fn run(place: Place, ty: &Ty, change: Change, row: &Row) -> Outcome {
     let scn = scenario(place, ty, row);
     trellis::dev::staging::set_group_basis(true);
-    let mut d = Driver::start(&scn.ddl, &scn.columns, &[scn.definition], scn.captured).await;
+    let ddl = format!("{}{}", ty.prelude, scn.ddl);
+    let mut d = Driver::start(&ddl, &scn.columns, &[scn.definition], scn.captured).await;
     assert_eq!(
         copies_with_a_modifier(&d).await,
         Vec::<String>::new(),
@@ -694,7 +752,13 @@ async fn run(place: Place, ty: &Ty, change: Change, row: &Row) -> Outcome {
         "{place:?}, {}: a captured write before any change differs",
         ty.label
     );
-    d.ctl.batch_execute(&scn.alter_sql).await.expect("alter");
+    // A relabel alters the type, not a column.
+    let alter_sql = if change == Change::Relabel {
+        row.alter.to_string()
+    } else {
+        scn.alter_sql.clone()
+    };
+    d.ctl.batch_execute(&alter_sql).await.expect("alter");
     write(&d, &scn.hi_sql).await;
     let drain_failures = settle_tolerant(&mut d).await;
     let diverged_before_pass = diverged(&d, scn.target_sql, &scn.oracle_sql).await;
@@ -782,6 +846,11 @@ async fn cell(place: Place, ty: &Ty, change: Change) {
     if !admits(place, ty.label) {
         return;
     }
+    // A relabel changes the type, so both tables' `ON` columns at once:
+    // there is no one-sided pair.
+    if change == Change::Relabel && place == Place::JoinOnOneSided {
+        return;
+    }
     let outcome = run(place, ty, change, row).await;
     let tag = format!("{place:?}, {} {change:?}", ty.label);
     if change == Change::CatalogOnly {
@@ -816,11 +885,23 @@ async fn cell(place: Place, ty: &Ty, change: Change) {
     }
     // A passthrough copy has no modifier, so no change of one fails a write
     // or pauses it: a rewrite rebuilds it on its own (#1238, #1261).
-    if place == Place::Passthrough {
+    if place == Place::Passthrough && change != Change::Relabel {
         assert_eq!(
             (outcome.drain_failures, outcome.pauses.as_slice()),
             (0, &[] as &[String]),
             "{tag}: a passthrough failed a write or paused"
+        );
+    }
+    // A relabel pauses every reader of the type with its reason, whatever
+    // the place (ADR-0020, #1241).
+    if change == Change::Relabel {
+        assert!(
+            outcome
+                .pauses
+                .iter()
+                .any(|pause| pause.contains("was renamed to 'zippy'")),
+            "{tag}: the relabel paused nothing: {:?}",
+            outcome.pauses
         );
     }
     for pause in &outcome.pauses {
@@ -854,7 +935,7 @@ async fn a_type_a_place_refuses_is_refused() {
     let cluster = TestCluster::start();
     let mut accepted = Vec::new();
     for ty in TYPES {
-        let Some(row) = [&ty.catalog_only, &ty.rewrite, &ty.narrow]
+        let Some(row) = [&ty.catalog_only, &ty.rewrite, &ty.narrow, &ty.relabel]
             .into_iter()
             .find_map(Option::as_ref)
         else {
@@ -870,7 +951,7 @@ async fn a_type_a_place_refuses_is_refused() {
                 .get()
                 .await
                 .expect("connection")
-                .batch_execute(&scn.ddl)
+                .batch_execute(&format!("{}{}", ty.prelude, scn.ddl))
                 .await
                 .expect("source DDL");
             let trellis = facade(db.dsn()).await;
@@ -1029,6 +1110,7 @@ matrix! {
     interval_catalog_only: "interval", Change::CatalogOnly;
     interval_narrow: "interval", Change::Narrow;
     interval_fields_catalog_only: "interval fields", Change::CatalogOnly;
+    enum_relabel: "enum", Change::Relabel;
 }
 
 /// ADR-0020 rule 6, at define: a Trellis target's copy of `k` (no modifier)

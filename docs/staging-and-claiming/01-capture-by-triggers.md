@@ -452,6 +452,63 @@ The response follows whether the definitions are still valid as written:
   define would. A key column's type change is left to the previous
   section's checks; a key column dropped and re-added rebuilds.
 
+### An enum value relabelled
+
+`ALTER TYPE tone RENAME VALUE 'brisk' TO 'zippy'` changes no column and
+fires no trigger, but Trellis keeps an enum value as its label text: in the
+ring's images, in held keys and parked images, and in a 1-1 ledger's
+`__from_key` when the source key has an enum column. After the relabel that
+text names a value that no longer exists, so it no longer casts to the type
+([ADR-0020](../decisions/0020-type-identity.md)).
+
+Each definition records, in `definition_enum_values`, the `pg_enum` OID and
+label of every value of every enum type it reads: the types of the source
+columns it records (every column of its source), of a `JOIN`'s joined
+columns, and of its key columns. It records them at define, at an
+`ALTER TRANSFORM` that adds a read, and at `RESUME`. Each capture pass
+compares them with `pg_enum` by OID, for the types each definition reads
+now (`staging::schema_change::pause_readers_of_relabelled`):
+
+- **A recorded OID whose label changed** pauses the definition, kind
+  `capture`, with `enum value 'brisk' of type public.tone was renamed to
+  'zippy'; Trellis's staged changes and keys still name the old label;
+  resume to rebuild the target from the source`. The record keeps the WAL
+  insert position the pass read (`capture_failures.relabel_lsn`): every
+  change staged with the old label is below it. A definition already paused
+  keeps its status and gets the record.
+- **A new OID** (`ADD VALUE`) is recorded and pauses nothing.
+- **A type the definition no longer reads** (its column re-typed to another
+  enum) has its rows deleted, so a relabel of it pauses nothing.
+
+Nothing else changes a label: `pg_upgrade` keeps the OIDs and the labels,
+and a logical restore pauses every definition first, compares none of
+them, and `RESUME` records the new OIDs.
+
+`RESUME` of a definition paused for a relabel:
+
+1. waits, as `resuming: …`, while a change at or below `relabel_lsn` is
+   still pending on its source or joined table, an image-less `recompute`
+   of a key (a released key's) included. The drain skips a paused
+   definition's share of each, so none of them is applied or re-derived
+   after the resume;
+2. deletes those changes from their ring slots once drained, since a
+   group-basis or `JOIN` rebuild names groups from the old images there, and
+   the definition's held keys and parked images, as every resume does;
+3. rebuilds from the source. A target whose ledger is keyed by a source key
+   with an enum column (a 1-1, or a ledger aggregate, over a table keyed by
+   an enum) is emptied with its ledger first and rebuilt as define builds
+   it, so no stored label is cast; its readers see it empty until then.
+   Every other shape rebuilds in place;
+4. records the labels again.
+
+Two narrow windows still leave the old label in a change Trellis then
+casts: a value added, written and relabelled between two passes (the pass
+records the new label as a new OID), and a transaction that staged a change
+before the relabel and commits only after the resume has waited out the
+others. The cast fails and the key is held, unless a value with the old
+label was added since: then the text casts to that value, with no error
+([known correctness gaps](../known-correctness-gaps.md#an-enum-label-renamed-and-added-again)).
+
 ### Capture changed outside Trellis
 
 A statement trigger captures only what it sees, so an operator who removes,

@@ -220,11 +220,21 @@ unblocks it.
   a partial cell, so only the per-key join lock orders them. The ops are issued
   as the concurrent tier issues them (bursts split over lanes, several drain
   workers, a short seal cadence), so both sides' writes race into the same
-  batches and onto the same keys; every burst is checked once it settles, and every definition must still
-  be `live` at the end. Every definition is installed over the two empty tables,
-  and the run waits for it before its first write. About one op in a hundred
-  is a `TRUNCATE` of either table. Run it with `cargo test -p generative --test
-  join_convergence -- --ignored`.
+  batches and onto the same keys; every burst is checked once it settles, and
+  every definition must still be `live` at the end. A definition installs up
+  front or part way through the stream, so most `JOIN`s build over tables that
+  hold rows or are still being written; later bursts pause and resume a
+  definition (the resume rebuilds its target in place) and re-read either
+  table (`request_backfill`) while the lanes keep writing. The per-burst check
+  compares each target with the definition's own query, so it covers the build's
+  outcome. In a quarter of the cases the run first settles the up-front
+  definitions over the empty tables. The coverage report counts the builds that
+  fire over rows left by earlier bursts, so a run shows that they happen, and
+  reads the engine's build-rows counter around each case to show that its
+  builds wrote rows. About
+  one op in a hundred is a `TRUNCATE` of either table. The tables are
+  unpartitioned and no definition reads another's target. Run it with `cargo
+  test -p generative --test join_convergence -- --ignored`.
 - **Partitioned-source convergence** *(ADR-0017)*. The first table of a
   generated program is a partitioned source: `HASH` over one to four leaves,
   `LIST` with a leaf per grain value or fewer and a `DEFAULT`, or `RANGE` over
