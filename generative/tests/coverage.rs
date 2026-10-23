@@ -221,7 +221,9 @@ fn all_op_values(program: &generative::model::Program) -> Vec<Option<String>> {
                 .filter(|(name, _)| not_grain(table, name))
                 .map(|(_, v)| v.clone())
                 .collect(),
-            Op::Delete { .. } | Op::Truncate { .. } => Vec::new(),
+            Op::Delete { .. } | Op::Truncate { .. } | Op::Leaf { .. } | Op::Partition { .. } => {
+                Vec::new()
+            }
             Op::BulkInsert { table, rows, .. } => rows
                 .iter()
                 .flat_map(|row| {
@@ -1677,8 +1679,9 @@ fn the_cooling_key_tier_draws_cooling_keys_and_every_hot_key_shape() {
 
 /// ADR-0017: every `partitioned_program` case reads a partitioned source (its
 /// first table, through at least one definition), and 500 samples draw every
-/// partitioning strategy, so the partitioned properties can't pass vacuously
-/// over plain tables.
+/// partitioning strategy and every partition operation (issue #1320), so the
+/// partitioned properties can't pass vacuously over plain tables or a tree
+/// that never changes.
 #[test]
 fn partitioned_program_always_reads_a_partitioned_source_and_draws_every_strategy() {
     let mut runner = TestRunner::default();
@@ -1710,6 +1713,28 @@ fn partitioned_program_always_reads_a_partitioned_source_and_draws_every_strateg
                 .unwrap_or(0)
                 > 0,
             "no {name} partitioning across 500 samples:\n{coverage}"
+        );
+    }
+    // Issue #1320: partition maintenance, partition-key updates and writes
+    // named on a leaf, each drawn, and the outcomes that turn on the tree.
+    for name in [
+        "detach",
+        "detach_concurrently",
+        "attach",
+        "drop",
+        "truncate_leaf",
+        "create_empty",
+        "create_written",
+        "create_attached",
+        "leaf_insert",
+        "leaf_update",
+        "leaf_delete",
+        "key_update",
+        "key_update_refused",
+    ] {
+        assert!(
+            coverage.partition_ops.get(name).copied().unwrap_or(0) > 0,
+            "no {name} across 500 samples:\n{coverage}"
         );
     }
 }

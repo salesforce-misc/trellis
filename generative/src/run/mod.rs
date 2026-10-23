@@ -509,7 +509,7 @@ pub async fn run_convergence_bursty<B: Backend>(
     install_result.map_err(|e| RunError::Install(format!("{e:?}")))?;
 
     let mut op_index = 0usize;
-    for burst in program.ops.chunks(burst_size) {
+    for burst in bursts(&program.ops, burst_size) {
         for op in burst {
             apply_and_check_outcome(backend, op_index, op, timing_enabled).await?;
             op_index += 1;
@@ -527,6 +527,31 @@ pub async fn run_convergence_bursty<B: Backend>(
     }
 
     Ok(Outcome::Ran)
+}
+
+/// `ops` in bursts of up to `burst_size` consecutive ops, each holding at most
+/// one partition-maintenance op ([`Op::is_partition_maintenance`]): a second
+/// one starts a new burst. [`run_convergence_bursty`] settles between
+/// bursts, which waits for the reconcile pass that records the first, so no
+/// leaf is created and removed again between two passes (beside a `DEFAULT`,
+/// a documented gap: `docs/known-correctness-gaps.md`, "A short-lived leaf
+/// beside a `DEFAULT` partition").
+fn bursts(ops: &[Op], burst_size: usize) -> Vec<&[Op]> {
+    let mut out = Vec::new();
+    let (mut start, mut maintenance) = (0, false);
+    for (i, op) in ops.iter().enumerate() {
+        let full = i - start == burst_size;
+        if full || (maintenance && op.is_partition_maintenance()) {
+            out.push(&ops[start..i]);
+            start = i;
+            maintenance = false;
+        }
+        maintenance |= op.is_partition_maintenance();
+    }
+    if start < ops.len() {
+        out.push(&ops[start..]);
+    }
+    out
 }
 
 /// Runs the three-way oracle check for every definition in `program` against
@@ -603,7 +628,47 @@ pub async fn check_defs(
 
 #[cfg(test)]
 mod tests {
-    use super::Outcome;
+    use super::{Outcome, bursts};
+    use crate::model::{Op, OpOutcome, PartitionAction};
+
+    /// Issue #1320: a burst holds at most one partition-maintenance op, and
+    /// otherwise splits every `burst_size` ops.
+    #[test]
+    fn a_second_partition_operation_starts_a_new_burst() {
+        let write = Op::Delete {
+            table: "t0".into(),
+            pk: "1".into(),
+            expect: OpOutcome::AffectsNoRows,
+        };
+        let ddl = Op::Partition {
+            table: "t0".into(),
+            action: PartitionAction::Drop {
+                leaf: "t0_p0".into(),
+            },
+            expect: OpOutcome::Succeeds,
+        };
+        let truncate_leaf = Op::Leaf {
+            leaf: "t0_p1".into(),
+            op: Box::new(Op::Truncate {
+                table: "t0".into(),
+                expect: OpOutcome::Succeeds,
+            }),
+        };
+        let ops = vec![
+            write.clone(),
+            ddl.clone(),
+            write.clone(),
+            truncate_leaf,
+            ddl,
+            write.clone(),
+            write.clone(),
+            write,
+        ];
+        let sizes: Vec<usize> = bursts(&ops, 3).iter().map(|b| b.len()).collect();
+        assert_eq!(sizes, vec![3, 1, 3, 1]);
+        let sizes: Vec<usize> = bursts(&ops[..2], 3).iter().map(|b| b.len()).collect();
+        assert_eq!(sizes, vec![2]);
+    }
 
     /// Design doc §6 / issue #4: only `Ran` passes. Fast, no database —
     /// this is the classifier logic itself, not the harness sanity check

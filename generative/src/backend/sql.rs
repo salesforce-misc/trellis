@@ -27,7 +27,9 @@ use trellis::dev::defs::ast::{
 };
 use trellis::dev::staging::{StagingError, await_converged, converged_through, watermark_token};
 
-use crate::model::{Column, Op, PartitionStrategy, Partitioning, Relationship, Table};
+use crate::model::{
+    Column, Op, PartitionAction, PartitionStrategy, Partitioning, Relationship, Table,
+};
 
 /// Quotes a Postgres identifier for safe interpolation into SQL text,
 /// mirroring `trellis::pool`'s own (crate-private) helper of the same name.
@@ -474,6 +476,106 @@ pub(super) async fn apply_op(
     tables: &HashMap<String, Table>,
     op: &Op,
 ) -> Result<u64, ApplyOpError> {
+    match op {
+        Op::Leaf { leaf, op } => {
+            assert!(
+                !matches!(**op, Op::Leaf { .. } | Op::Partition { .. }),
+                "apply_op: an Op::Leaf wraps a write — a generator bug"
+            );
+            apply_write(raw, tables, op, Some(leaf)).await
+        }
+        Op::Partition { table, action, .. } => {
+            if !tables.contains_key(table) {
+                return Err(ApplyOpError::UnknownTable(table.clone()));
+            }
+            raw.batch_execute(&partition_action_sql(tables, table, action))
+                .await?;
+            Ok(1)
+        }
+        _ => apply_write(raw, tables, op, None).await,
+    }
+}
+
+/// The SQL of one [`PartitionAction`] on the root `table`, sent as one
+/// simple-query string. A `Create`'s statements run as one implicit
+/// transaction, so a refused bound leaves nothing behind (an explicit
+/// `BEGIN` would leave the session in an aborted transaction instead).
+fn partition_action_sql(
+    tables: &HashMap<String, Table>,
+    table: &str,
+    action: &PartitionAction,
+) -> String {
+    let root = quote_ident(table);
+    match action {
+        PartitionAction::Detach { leaf, concurrently } => format!(
+            "alter table {root} detach partition {}{}",
+            quote_ident(leaf),
+            if *concurrently { " concurrently" } else { "" }
+        ),
+        PartitionAction::Attach { leaf, bound } => {
+            format!(
+                "alter table {root} attach partition {} {bound}",
+                quote_ident(leaf)
+            )
+        }
+        PartitionAction::Drop { leaf } => format!("drop table {}", quote_ident(leaf)),
+        PartitionAction::Create {
+            leaf,
+            bound,
+            rows,
+            standalone,
+        } => {
+            let quoted = quote_ident(leaf);
+            let mut sql = String::new();
+            if *standalone {
+                sql.push_str(&format!("create table {quoted} (like {root}); "));
+            } else {
+                sql.push_str(&format!(
+                    "create table {quoted} partition of {root} {bound}; "
+                ));
+            }
+            for row in rows {
+                let columns: Vec<String> = row.iter().map(|(c, _)| quote_ident(c)).collect();
+                let values: Vec<String> = row
+                    .iter()
+                    .map(|(c, v)| match v {
+                        Some(v) => {
+                            format!("{}::{}", quote_literal(v), column_pg_type(tables, table, c))
+                        }
+                        None => "null".to_string(),
+                    })
+                    .collect();
+                sql.push_str(&format!(
+                    "insert into {quoted} ({}) values ({}); ",
+                    columns.join(", "),
+                    values.join(", ")
+                ));
+            }
+            if *standalone {
+                sql.push_str(&format!(
+                    "alter table {root} attach partition {quoted} {bound}; "
+                ));
+            }
+            sql
+        }
+    }
+}
+
+/// `value` as a single-quoted SQL string literal.
+fn quote_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+/// [`apply_op`] for a single write: issued against `relation` when given (a
+/// leaf of the op's partitioned table), else against the op's own table,
+/// whose [`Table`] types every value either way.
+async fn apply_write(
+    raw: &mut tokio_postgres::Client,
+    tables: &HashMap<String, Table>,
+    op: &Op,
+    relation: Option<&str>,
+) -> Result<u64, ApplyOpError> {
+    let relation = |table: &str| quote_ident(relation.unwrap_or(table));
     let affected = match op {
         Op::Insert { table, row, .. } => {
             let columns: Vec<&str> = row.iter().map(|(c, _)| c.as_str()).collect();
@@ -497,7 +599,7 @@ pub(super) async fn apply_op(
                 .join(", ");
             let sql = format!(
                 "insert into {} ({column_list}) values ({placeholders})",
-                quote_ident(table)
+                relation(table)
             );
             let params: Vec<Option<String>> = assignments.into_iter().map(|a| a.value).collect();
             let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
@@ -524,7 +626,7 @@ pub(super) async fn apply_op(
                 .join(", ");
             let sql = format!(
                 "update {} set {set_clause} where {}=${}::text::{}",
-                quote_ident(table),
+                relation(table),
                 quote_ident(&pk_col),
                 changes.len() + 1,
                 column_pg_type(tables, table, &pk_col),
@@ -545,7 +647,7 @@ pub(super) async fn apply_op(
                 .ok_or_else(|| ApplyOpError::UnknownTable(table.clone()))?;
             let sql = format!(
                 "delete from {} where {}=$1::text::{}",
-                quote_ident(table),
+                relation(table),
                 quote_ident(&pk_col),
                 column_pg_type(tables, table, &pk_col),
             );
@@ -561,7 +663,7 @@ pub(super) async fn apply_op(
             // `SELECT count(*)` in the *same transaction* as the `TRUNCATE`,
             // taken before it runs, so nothing can slip a concurrent write in
             // between the count and the clear.
-            let quoted = quote_ident(table);
+            let quoted = relation(table);
             let txn = raw.transaction().await?;
             let count_row = txn
                 .query_one(&format!("select count(*) from {quoted}"), &[])
@@ -611,7 +713,7 @@ pub(super) async fn apply_op(
 
             let sql = format!(
                 "insert into {} ({column_list}) values {}",
-                quote_ident(table),
+                relation(table),
                 placeholder_groups.join(", ")
             );
             let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
@@ -619,6 +721,9 @@ pub(super) async fn apply_op(
                 .map(|v| v as &(dyn tokio_postgres::types::ToSql + Sync))
                 .collect();
             raw.execute(&sql, &params).await?
+        }
+        Op::Leaf { .. } | Op::Partition { .. } => {
+            unreachable!("apply_op handles these before apply_write")
         }
     };
     Ok(affected)
@@ -728,6 +833,13 @@ pub(super) enum QuiesceError {
         unsettled: Vec<String>,
         waited: Duration,
     },
+    /// `unsettled` names every partitioned source (ADR-0017) whose tree the
+    /// reconcile pass hadn't recorded yet, or that still had a correction
+    /// queued, when the budget ran out after `waited`.
+    PartitionsUnsettled {
+        unsettled: Vec<String>,
+        waited: Duration,
+    },
 }
 
 impl From<tokio_postgres::Error> for QuiesceError {
@@ -780,6 +892,41 @@ async fn unsettled_definitions(
         }
     }
     Ok(unsettled)
+}
+
+/// Every partitioned source (ADR-0017) whose partition maintenance a target
+/// may not reflect yet: its tree as the catalog has it now (each node's oid
+/// and `pg_inherits.xmin`, which an attach, detach, drop or new leaf
+/// changes) isn't the tree the reconcile pass last recorded, or a correction
+/// is still queued for it. The pass records the tree and queues the
+/// corrections in one transaction, and a correction leaves the queue once
+/// every definition reading the source has applied it, so a source that
+/// passes this has no maintenance left to correct. A definition reads
+/// `live` throughout the first part (until the pass sees the DDL) and the
+/// queued part of the second (until the pass schedules the correction), so
+/// definition status alone can't show either.
+async fn unsettled_partitions(
+    raw: &tokio_postgres::Client,
+) -> Result<Vec<String>, tokio_postgres::Error> {
+    let rows = raw
+        .query(
+            "select s.table_name from partition_sources s \
+             where (select array_agg((n->>'oid') || ':' || coalesce(n->>'inherits_xmin', '') \
+                                     order by (n->>'oid')::bigint) \
+                    from jsonb_array_elements(s.nodes->'nodes') n) \
+                   is distinct from \
+                   (select array_agg(t.relid::oid::bigint::text || ':' \
+                                     || coalesce(i.xmin::text, '') \
+                                     order by t.relid::oid::bigint) \
+                    from pg_catalog.pg_partition_tree(s.root_oid::oid) t \
+                    left join pg_catalog.pg_inherits i on i.inhrelid = t.relid) \
+             union \
+             select table_name from partition_corrections \
+             order by 1",
+            &[],
+        )
+        .await?;
+    Ok(rows.iter().map(|r| r.get(0)).collect())
 }
 
 /// Polls `probe` every [`SETTLE_POLL`] until it returns an empty list or
@@ -836,6 +983,14 @@ const SETTLE_POLL: Duration = Duration::from_millis(20);
 ///   after the mutations of interest: the public read-your-writes path, so
 ///   every quiesce in the suite exercises it (issue #452).
 ///
+/// - **Partition maintenance corrected** (ADR-0017). An attach, detach,
+///   drop or new leaf reaches a target only through the correction the next
+///   reconcile pass queues, and a leaf `TRUNCATE` through the one its seal
+///   queues; until the pass schedules it, the definition still reads `live`.
+///   [`unsettled_partitions`] waits for the pass to record the tree and for
+///   the queue to empty, ahead of the status check, and is checked again at
+///   the end, since the ring wait is what seals a truncate's marker.
+///
 /// The order is what makes this sound. Status first, then the ring: a
 /// definition reports `live` only once the enumeration that took it there
 /// has committed its `Recompute` rows to the ring, in the same transaction
@@ -860,6 +1015,12 @@ pub(super) async fn quiesce(
 ) -> Result<(), QuiesceError> {
     let started = Instant::now();
     loop {
+        poll_until_empty(started, timeout, || unsettled_partitions(raw))
+            .await?
+            .map_err(|(unsettled, waited)| QuiesceError::PartitionsUnsettled {
+                unsettled,
+                waited,
+            })?;
         poll_until_empty(started, timeout, || unsettled_definitions(raw, defs))
             .await?
             .map_err(|(unsettled, waited)| QuiesceError::DefinitionsUnsettled {
@@ -871,7 +1032,7 @@ pub(super) async fn quiesce(
         await_converged(raw, token, timeout.saturating_sub(started.elapsed())).await?;
 
         let unsettled = unsettled_definitions(raw, defs).await?;
-        if unsettled.is_empty() {
+        if unsettled.is_empty() && unsettled_partitions(raw).await?.is_empty() {
             // A catch-up parked and discharged between the ring wait and the
             // read above leaves its definition `live` again, with only its
             // enumeration in the ring. Those rows have no origin, so they
@@ -899,7 +1060,9 @@ pub(super) async fn settled(
     raw: &tokio_postgres::Client,
     defs: &[TransformDef],
 ) -> Result<bool, QuiesceError> {
-    if !unsettled_definitions(raw, defs).await?.is_empty() {
+    if !unsettled_partitions(raw).await?.is_empty()
+        || !unsettled_definitions(raw, defs).await?.is_empty()
+    {
         return Ok(false);
     }
     let token = watermark_token(raw).await?;
@@ -1259,5 +1422,88 @@ mod tests {
             .await
             .expect("go live");
         txn.commit().await.expect("commit");
+    }
+
+    /// Issue #1320: the partition model's `HASH` routing table is the one
+    /// Postgres computes, for every modulus and grain it covers.
+    #[tokio::test]
+    async fn the_hash_remainders_are_postgres_own() {
+        use crate::generate::partition::{HASH_REMAINDERS, PARTITION_GRAIN_MAX};
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let raw = session(db.dsn()).await;
+        raw.batch_execute("create table h (g bigint not null) partition by hash (g)")
+            .await
+            .expect("create");
+        for (m, row) in HASH_REMAINDERS.iter().enumerate() {
+            let modulus = m as i32 + 1;
+            for (grain, &remainder) in row.iter().enumerate() {
+                let found: i32 = raw
+                    .query_one(
+                        "select r from generate_series(0, $1 - 1) r \
+                         where satisfies_hash_partition('h'::regclass, $1, r, $2::bigint)",
+                        &[&modulus, &(grain as i64)],
+                    )
+                    .await
+                    .expect("remainder")
+                    .get(0);
+                assert_eq!(
+                    found,
+                    i32::from(remainder),
+                    "modulus {modulus}, grain {grain} (of 0..={PARTITION_GRAIN_MAX})"
+                );
+            }
+        }
+    }
+
+    /// Issue #1320: a partitioned source is unsettled while its tree differs
+    /// from the one recorded (here: a leaf attached since), and while a
+    /// correction is queued for it.
+    #[tokio::test]
+    async fn a_partitioned_source_is_unsettled_until_recorded_and_corrected() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let raw = session(db.dsn()).await;
+        raw.batch_execute(
+            "create table public.r (g bigint not null) partition by list (g); \
+             create table public.r0 partition of public.r for values in (0);",
+        )
+        .await
+        .expect("create");
+        let record = "insert into partition_sources \
+                          (table_name, root_oid, lifecycle_fp, compliance_fp, nodes, \
+                           catalog_oid) \
+                      select 'public.r', 'public.r'::regclass::oid::bigint, '', '', \
+                             jsonb_build_object('nodes', jsonb_agg(jsonb_build_object( \
+                                 'oid', t.relid::oid::bigint, \
+                                 'inherits_xmin', i.xmin::text))), \
+                             pg_catalog.to_regclass('partition_sources') \
+                      from pg_partition_tree('public.r') t \
+                      left join pg_inherits i on i.inhrelid = t.relid \
+                      on conflict (table_name) do update set nodes = excluded.nodes";
+        raw.batch_execute(record).await.expect("record");
+        assert!(unsettled_partitions(&raw).await.expect("probe").is_empty());
+
+        raw.batch_execute("create table public.r1 partition of public.r for values in (1)")
+            .await
+            .expect("attach");
+        assert_eq!(
+            unsettled_partitions(&raw).await.expect("probe"),
+            vec!["public.r".to_string()]
+        );
+        raw.batch_execute(record).await.expect("record again");
+        assert!(unsettled_partitions(&raw).await.expect("probe").is_empty());
+
+        raw.batch_execute(
+            "insert into partition_corrections (table_name, kind, node_oid, node_name, cause) \
+             values ('public.r', 'new_leaf', 'public.r1'::regclass::oid::bigint, \
+                     'public.r1', 'attached')",
+        )
+        .await
+        .expect("queue");
+        assert_eq!(
+            unsettled_partitions(&raw).await.expect("probe"),
+            vec!["public.r".to_string()]
+        );
     }
 }

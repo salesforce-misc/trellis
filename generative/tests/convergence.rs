@@ -126,6 +126,9 @@ fn run_one(program: &generative::model::Program) -> Result<(), TestCaseError> {
             let mut backend = ManualBackend::connect(db.dsn())
                 .await
                 .expect("connect manual backend");
+            if program.tables.iter().any(|t| t.partitioning.is_some()) {
+                backend.set_reconcile_interval(generative::generate::partition::RECONCILE_INTERVAL);
+            }
             let pool =
                 Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
 
@@ -258,6 +261,137 @@ async fn a_program_over_a_partitioned_source_converges_end_to_end() {
         let outcome = run_convergence(&mut backend, &pool, &program)
             .await
             .unwrap_or_else(|err| panic!("{strategy:?}: {err:?}"));
+        assert!(outcome.as_pass(), "{strategy:?}: {outcome}");
+    }
+}
+
+/// Issue #1320: partition maintenance, partition-key updates and writes
+/// named on a leaf or a detached table converge end to end, one program per
+/// partitioning strategy. Each check after a maintenance op waits for the
+/// reconcile pass that queues its correction, and for the correction.
+#[tokio::test(flavor = "multi_thread")]
+async fn partition_maintenance_converges_end_to_end() {
+    use generative::generate::partition::{
+        MaintenanceKind, PartitionDraw, RECONCILE_INTERVAL, add_partition_maintenance,
+    };
+    use generative::model::{Op, PartitionStrategy};
+    let cluster = TestCluster::start();
+    for strategy in [
+        PartitionStrategy::Hash { modulus: 2 },
+        PartitionStrategy::List {
+            values: 2,
+            default: true,
+        },
+        PartitionStrategy::Range { bounds: 3 },
+    ] {
+        let db = cluster.create_isolated_database().await;
+        let mut spec = TableSpec::numeric_only(
+            vec![
+                (Some(10), Some(1)),
+                (Some(20), Some(2)),
+                (Some(30), Some(3)),
+            ],
+            vec![
+                Mutate::Update {
+                    pk: 2,
+                    c1: Some(7),
+                    c2: None,
+                },
+                Mutate::DuplicateInsert {
+                    pk: 1,
+                    c1: Some(5),
+                    c2: Some(5),
+                },
+            ],
+        );
+        spec.grain_values = vec![Some("0".into()), Some("1".into()), Some("2".into())];
+        let base = partition_table(
+            build_program_multi_with_shapes(
+                &[spec],
+                &[(
+                    0,
+                    DefShape::Aggregate {
+                        functions: vec![AggregateFn::Sum(AggregateColumn::C1), AggregateFn::Count],
+                    },
+                )],
+            ),
+            0,
+            strategy,
+        );
+        let maintenance = |at, pick, kind| PartitionDraw::Maintenance { at, pick, kind };
+        let program = add_partition_maintenance(
+            base,
+            0,
+            &[
+                PartitionDraw::MoveRow {
+                    at: 3,
+                    pk: 1,
+                    grain: 2,
+                    via_leaf: false,
+                },
+                PartitionDraw::ViaLeaf {
+                    at: 3,
+                    detached: false,
+                },
+                maintenance(4, 0, MaintenanceKind::TruncateLeaf),
+                maintenance(4, 1, MaintenanceKind::Detach { concurrently: true }),
+                PartitionDraw::ViaLeaf {
+                    at: 4,
+                    detached: true,
+                },
+                maintenance(5, 0, MaintenanceKind::Attach),
+                maintenance(5, 0, MaintenanceKind::Drop),
+                maintenance(
+                    5,
+                    0,
+                    MaintenanceKind::Create {
+                        rows: 2,
+                        standalone: false,
+                    },
+                ),
+                maintenance(
+                    5,
+                    1,
+                    MaintenanceKind::Detach {
+                        concurrently: false,
+                    },
+                ),
+                maintenance(
+                    5,
+                    0,
+                    MaintenanceKind::Create {
+                        rows: 1,
+                        standalone: true,
+                    },
+                ),
+                PartitionDraw::MoveRow {
+                    at: 5,
+                    pk: 3,
+                    grain: 3,
+                    via_leaf: true,
+                },
+            ],
+        );
+        assert!(
+            program
+                .ops
+                .iter()
+                .filter(|op| matches!(op, Op::Partition { .. }))
+                .count()
+                >= 4
+                && program.ops.iter().any(|op| matches!(op, Op::Leaf { .. })),
+            "{strategy:?}: {:#?}",
+            program.ops
+        );
+        let mut backend = ManualBackend::connect(db.dsn())
+            .await
+            .expect("connect manual backend");
+        backend.set_reconcile_interval(RECONCILE_INTERVAL);
+        let pool =
+            Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
+        let outcome = run_convergence(&mut backend, &pool, &program)
+            .await
+            .unwrap_or_else(|err| panic!("{strategy:?}: {err:?}\n{:#?}", program.ops));
         assert!(outcome.as_pass(), "{strategy:?}: {outcome}");
     }
 }

@@ -104,7 +104,10 @@ One module drives the engine, and its job is narrow:
   (`docs/data-flow.md#capture-by-triggers`);
 - `quiesce()` — block until the engine catches up, defined exactly as a *client's*
   read-your-own-writes check: watermark the LSN after the last commit, `await`
-  until derived state converges past it (stage 07, #12). Not a `sleep`.
+  until derived state converges past it (stage 07, #12). Not a `sleep`. Over a
+  partitioned source it first waits for the reconcile pass to record the tree
+  and for each correction it queued to finish, since partition maintenance
+  reaches a target only through a correction.
 - `snapshot()` — read back merged source+derived state as a deterministic,
   **ordered** map (table → pk → column), so diffs and equality are stable.
 
@@ -246,10 +249,25 @@ unblocks it.
   `tests/convergence.rs`) and under the concurrent backend
   (`property_a_partitioned_source_converges_under_the_concurrent_backend`).
   The coverage report's `partition_strategies` line counts the strategies
-  drawn. Every write names the root, so a write aimed at a leaf is not
-  drawn. Rows never move between partitions, and partition maintenance
-  (attach, detach, drop, truncate of a leaf) is not drawn either
-  ([#1320](https://github.com/salesforce-misc/trellis/issues/1320)).
+  drawn. On top of its seeds and mutates, the partitioned table draws
+  partition maintenance (a leaf detached, also `CONCURRENTLY`, attached
+  again with its rows, dropped or truncated, and a new leaf created empty,
+  written directly, or built outside the tree and attached with rows),
+  partition-key updates that move a row to another partition (or are
+  refused, to a value no leaf holds), and writes named on a leaf, or on a
+  detached table, instead of the root. Each op's expected outcome comes from
+  a model of which leaf holds each `(pk, grain)` row, so a revival of a
+  moved row, a write into a detached bound, or an attach the `DEFAULT`'s
+  rows forbid is expected to succeed or fail as Postgres decides. Every
+  check waits for the reconcile pass to record the tree and for every
+  correction it queued to finish, so the oracle compares only settled
+  states, after each op serially and after each burst concurrently; a burst
+  holds at most one maintenance op, so a leaf is never created and removed
+  between two passes (the short-lived-leaf gap in
+  [known correctness gaps](known-correctness-gaps.md#a-short-lived-leaf-beside-a-default-partition)).
+  The `partition_ops` line counts each kind drawn. The hot-key tier has no
+  partitioned variant yet
+  ([#1331](https://github.com/salesforce-misc/trellis/issues/1331)).
 - **A second, structural oracle** *(needs an engine consistency auditor, if one
   exists)*. Run the engine's internal consistency check at end of run, require zero
   findings, prove the wiring with a negative test.

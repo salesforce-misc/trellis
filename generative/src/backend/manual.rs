@@ -224,6 +224,12 @@ pub enum ManualBackendError {
         unsettled: Vec<String>,
         waited: Duration,
     },
+    /// `quiesce` gave up waiting for these partitioned sources' maintenance
+    /// to be recorded and corrected (ADR-0017; see `sql::quiesce`).
+    PartitionSettleTimeout {
+        unsettled: Vec<String>,
+        waited: Duration,
+    },
     /// Issue #236: a statement sent through the `Trellis` facade (the
     /// operator's `RESUME TRANSFORM`) failed.
     Facade(trellis::TrellisError),
@@ -284,6 +290,9 @@ impl From<sql::QuiesceError> for ManualBackendError {
             sql::QuiesceError::Staging(err) => ManualBackendError::Staging(err),
             sql::QuiesceError::DefinitionsUnsettled { unsettled, waited } => {
                 ManualBackendError::DefinitionSettleTimeout { unsettled, waited }
+            }
+            sql::QuiesceError::PartitionsUnsettled { unsettled, waited } => {
+                ManualBackendError::PartitionSettleTimeout { unsettled, waited }
             }
         }
     }

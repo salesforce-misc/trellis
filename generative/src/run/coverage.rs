@@ -18,8 +18,8 @@ use trellis::dev::defs::registry;
 
 use crate::backend::{DrainAudit, SPLIT_THRESHOLD_ROWS};
 use crate::model::{
-    BurstAction, Cardinality, ConcurrentPlan, Op, OpOutcome, PartitionStrategy, Program,
-    Relationship,
+    BurstAction, Cardinality, ConcurrentPlan, Op, OpOutcome, PartitionAction, PartitionStrategy,
+    Program, Relationship,
 };
 
 /// Per-run coverage tallies over any number of [`Program`]s. Every field is
@@ -139,6 +139,15 @@ pub struct Coverage {
     /// value), `"list_default"` (fewer leaves and a `DEFAULT`) and
     /// `"range"`. Zero everywhere means no case read a partitioned source.
     pub partition_strategies: HashMap<&'static str, usize>,
+    /// How many of each partitioned-source op the recorded programs drew
+    /// (ADR-0017, issue #1320), by [`partition_op_name`]: partition
+    /// maintenance (`"detach"`, `"detach_concurrently"`, `"attach"`,
+    /// `"drop"`, `"truncate_leaf"`, a new leaf `"create_empty"`,
+    /// `"create_written"` or `"create_attached"`), writes named on a leaf
+    /// (`"leaf_insert"`, `"leaf_update"`, `"leaf_delete"`), and
+    /// partition-key updates through the root that move a row
+    /// (`"key_update"`) or are refused (`"key_update_refused"`).
+    pub partition_ops: HashMap<&'static str, usize>,
     /// Bursts recorded by [`Coverage::record_concurrent_plan`] (issue #557).
     pub concurrent_bursts: usize,
     /// How many recorded concurrent-tier cases contain at least one burst of
@@ -174,6 +183,9 @@ impl Coverage {
         self.cases += 1;
 
         for op in &program.ops {
+            if let Some(name) = partition_op_name(program, op) {
+                *self.partition_ops.entry(name).or_insert(0) += 1;
+            }
             *self.ops_by_kind.entry(op_kind(op)).or_insert(0) += 1;
             *self
                 .ops_by_outcome
@@ -546,17 +558,17 @@ fn apply_to_rows(op: &Op, pk_col: &str, rows: &mut HashMap<String, SimRow>) {
             rows.remove(pk);
         }
         Op::Truncate { .. } => rows.clear(),
+        // ADR-0017: a partitioned table is never a relationship's end or a
+        // lane-split concurrent plan's table, so the replay treats a write
+        // named on a leaf as written through the root, and partition
+        // maintenance as touching nothing.
+        Op::Leaf { op, .. } => apply_to_rows(op, pk_col, rows),
+        Op::Partition { .. } => {}
     }
 }
 
 fn op_table_name(op: &Op) -> &str {
-    match op {
-        Op::Insert { table, .. }
-        | Op::Update { table, .. }
-        | Op::Delete { table, .. }
-        | Op::Truncate { table, .. }
-        | Op::BulkInsert { table, .. } => table,
-    }
+    op.table()
 }
 
 /// Replays `program.ops` against in-memory copies of its source tables and
@@ -813,7 +825,10 @@ fn concurrent_shapes(program: &Program, plan: &ConcurrentPlan) -> HashSet<Concur
             Op::Update { table, pk, .. } | Op::Delete { table, pk, .. } => {
                 (table, Some(pk.clone()))
             }
-            Op::Truncate { .. } | Op::BulkInsert { .. } => continue,
+            Op::Truncate { .. }
+            | Op::BulkInsert { .. }
+            | Op::Leaf { .. }
+            | Op::Partition { .. } => continue,
         };
         if let Some(pk) = pk {
             last_write.insert((table.as_str(), pk), index);
@@ -846,7 +861,10 @@ fn concurrent_shapes(program: &Program, plan: &ConcurrentPlan) -> HashSet<Concur
             let Some(pk_col) = pk_cols.get(table) else {
                 continue;
             };
-            whole_table |= matches!(op, Op::Truncate { .. } | Op::BulkInsert { .. });
+            whole_table |= matches!(
+                op,
+                Op::Truncate { .. } | Op::BulkInsert { .. } | Op::Partition { .. }
+            );
             if matches!(op.expect(), OpOutcome::Succeeds) {
                 changes += match op {
                     Op::BulkInsert { rows, .. } => rows.len(),
@@ -868,7 +886,9 @@ fn concurrent_shapes(program: &Program, plan: &ConcurrentPlan) -> HashSet<Concur
                     .filter_map(|(_, v)| v.clone())
                     .collect(),
                 Op::Update { pk, .. } | Op::Delete { pk, .. } => vec![pk.clone()],
-                Op::Truncate { .. } => rows.keys().cloned().collect(),
+                Op::Truncate { .. } | Op::Leaf { .. } | Op::Partition { .. } => {
+                    rows.keys().cloned().collect()
+                }
             };
             pks.sort_unstable();
             pks.dedup();
@@ -1026,6 +1046,8 @@ fn op_kind(op: &Op) -> &'static str {
         Op::Delete { .. } => "Delete",
         Op::Truncate { .. } => "Truncate",
         Op::BulkInsert { .. } => "BulkInsert",
+        Op::Leaf { .. } => "Leaf",
+        Op::Partition { .. } => "Partition",
     }
 }
 
@@ -1055,6 +1077,58 @@ fn value_type_name(value_type: ValueType) -> &'static str {
         ValueType::Boolean => "boolean",
         ValueType::Uuid => "uuid",
         ValueType::Other(pg_type) => pg_type.name(),
+    }
+}
+
+/// The [`Coverage::partition_ops`] name of `op`, if it is one of the
+/// partitioned-source ops counted there.
+fn partition_op_name(program: &Program, op: &Op) -> Option<&'static str> {
+    match op {
+        Op::Partition { action, .. } => Some(match action {
+            PartitionAction::Detach {
+                concurrently: false,
+                ..
+            } => "detach",
+            PartitionAction::Detach {
+                concurrently: true, ..
+            } => "detach_concurrently",
+            PartitionAction::Attach { .. } => "attach",
+            PartitionAction::Drop { .. } => "drop",
+            PartitionAction::Create {
+                standalone: true, ..
+            } => "create_attached",
+            PartitionAction::Create { rows, .. } if rows.is_empty() => "create_empty",
+            PartitionAction::Create { .. } => "create_written",
+        }),
+        Op::Leaf { op, .. } => match **op {
+            Op::Truncate { .. } => Some("truncate_leaf"),
+            Op::Insert { .. } | Op::BulkInsert { .. } => Some("leaf_insert"),
+            Op::Update { .. } => Some("leaf_update"),
+            Op::Delete { .. } => Some("leaf_delete"),
+            Op::Leaf { .. } | Op::Partition { .. } => None,
+        },
+        Op::Update {
+            table,
+            changes,
+            expect,
+            ..
+        } => {
+            let partitioning = program
+                .tables
+                .iter()
+                .find(|t| t.name == *table)?
+                .partitioning
+                .as_ref()?;
+            if !changes.iter().any(|(c, _)| *c == partitioning.column) {
+                return None;
+            }
+            match expect {
+                OpOutcome::Succeeds => Some("key_update"),
+                OpOutcome::Fails => Some("key_update_refused"),
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 
@@ -1167,6 +1241,11 @@ impl fmt::Display for Coverage {
         writeln!(f, "max_bulk_insert_rows: {}", self.max_bulk_insert_rows)?;
         write!(f, "partition_strategies:")?;
         for (name, count) in sorted_counts(&self.partition_strategies) {
+            write!(f, " {name}={count}")?;
+        }
+        writeln!(f)?;
+        write!(f, "partition_ops:")?;
+        for (name, count) in sorted_counts(&self.partition_ops) {
             write!(f, " {name}={count}")?;
         }
         writeln!(f)?;

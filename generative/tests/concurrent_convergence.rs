@@ -423,6 +423,9 @@ fn run_one(program: &generative::model::Program, burst_size: usize) -> Result<()
             let mut backend = ManualBackend::connect_with_workers(db.dsn(), PROPERTY_WORKERS)
                 .await
                 .expect("connect concurrent backend");
+            if program.tables.iter().any(|t| t.partitioning.is_some()) {
+                backend.set_reconcile_interval(generative::generate::partition::RECONCILE_INTERVAL);
+            }
             let pool =
                 Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
 

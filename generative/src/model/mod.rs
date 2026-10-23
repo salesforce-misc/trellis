@@ -274,6 +274,46 @@ pub enum Op {
         rows: Vec<Vec<(String, Option<String>)>>,
         expect: OpOutcome,
     },
+    /// `op`, a write on a partitioned table (ADR-0017), issued naming the
+    /// table `leaf` instead of the root: a leaf of the tree, or a table
+    /// detached from it. `op` names the root, whose [`Table`] gives the
+    /// columns' types; only the statement's relation changes. `op.expect()`
+    /// is this op's expectation.
+    Leaf { leaf: String, op: Box<Op> },
+    /// Partition maintenance on the partitioned `table` (ADR-0017): DDL that
+    /// changes which rows the root holds without a write any capture trigger
+    /// sees. A backend reports a successful one as one affected row, so its
+    /// `expect` is [`OpOutcome::Succeeds`] or [`OpOutcome::Fails`].
+    Partition {
+        table: String,
+        action: PartitionAction,
+        expect: OpOutcome,
+    },
+}
+
+/// One [`Op::Partition`] statement. Every leaf is named unqualified, beside
+/// its root, and `bound` is a partition bound clause as `CREATE TABLE ...
+/// PARTITION OF` takes it (`for values in (1)`, `default`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum PartitionAction {
+    /// `ALTER TABLE <root> DETACH PARTITION <leaf> [CONCURRENTLY]`. The
+    /// table stays, with its rows, outside the tree.
+    Detach { leaf: String, concurrently: bool },
+    /// `ALTER TABLE <root> ATTACH PARTITION <leaf> <bound>` of a table
+    /// detached earlier, with whatever rows it holds.
+    Attach { leaf: String, bound: String },
+    /// `DROP TABLE <leaf>` of a leaf in the tree.
+    Drop { leaf: String },
+    /// A new leaf holding `rows` (each a full row of the root's columns), in
+    /// one transaction: created `PARTITION OF` the root and then written
+    /// directly, or, when `standalone`, created `LIKE` the root, written,
+    /// and then attached.
+    Create {
+        leaf: String,
+        bound: String,
+        rows: Vec<Vec<(String, Option<String>)>>,
+        standalone: bool,
+    },
 }
 
 impl Op {
@@ -285,7 +325,48 @@ impl Op {
             | Op::Update { expect, .. }
             | Op::Delete { expect, .. }
             | Op::Truncate { expect, .. }
-            | Op::BulkInsert { expect, .. } => expect,
+            | Op::BulkInsert { expect, .. }
+            | Op::Partition { expect, .. } => expect,
+            Op::Leaf { op, .. } => op.expect(),
+        }
+    }
+
+    /// Sets the outcome the generator expects of this op (of the wrapped
+    /// write, for an [`Op::Leaf`]).
+    pub fn set_expect(&mut self, outcome: OpOutcome) {
+        match self {
+            Op::Insert { expect, .. }
+            | Op::Update { expect, .. }
+            | Op::Delete { expect, .. }
+            | Op::Truncate { expect, .. }
+            | Op::BulkInsert { expect, .. }
+            | Op::Partition { expect, .. } => *expect = outcome,
+            Op::Leaf { op, .. } => op.set_expect(outcome),
+        }
+    }
+
+    /// The program table this op writes: the root, for an [`Op::Leaf`].
+    pub fn table(&self) -> &str {
+        match self {
+            Op::Insert { table, .. }
+            | Op::Update { table, .. }
+            | Op::Delete { table, .. }
+            | Op::Truncate { table, .. }
+            | Op::BulkInsert { table, .. }
+            | Op::Partition { table, .. } => table,
+            Op::Leaf { op, .. } => op.table(),
+        }
+    }
+
+    /// Whether this op changes the rows of a partitioned table without a
+    /// write its capture sees (ADR-0017), so its effect reaches a target only
+    /// through the correction a reconcile pass queues: partition DDL, or a
+    /// `TRUNCATE` naming a leaf.
+    pub fn is_partition_maintenance(&self) -> bool {
+        match self {
+            Op::Partition { .. } => true,
+            Op::Leaf { op, .. } => matches!(**op, Op::Truncate { .. }),
+            _ => false,
         }
     }
 }

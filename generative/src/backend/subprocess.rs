@@ -123,6 +123,12 @@ pub enum SubprocessBackendError {
         unsettled: Vec<String>,
         waited: Duration,
     },
+    /// `quiesce` gave up waiting for these partitioned sources' maintenance
+    /// to be recorded and corrected (ADR-0017; see `sql::quiesce`).
+    PartitionSettleTimeout {
+        unsettled: Vec<String>,
+        waited: Duration,
+    },
     Config(trellis::Error),
     Trellis(trellis::TrellisError),
     Catalog(CatalogError),
@@ -138,6 +144,9 @@ impl From<sql::QuiesceError> for SubprocessBackendError {
             sql::QuiesceError::Staging(err) => SubprocessBackendError::Staging(err),
             sql::QuiesceError::DefinitionsUnsettled { unsettled, waited } => {
                 SubprocessBackendError::DefinitionSettleTimeout { unsettled, waited }
+            }
+            sql::QuiesceError::PartitionsUnsettled { unsettled, waited } => {
+                SubprocessBackendError::PartitionSettleTimeout { unsettled, waited }
             }
         }
     }

@@ -232,6 +232,7 @@
 //! [`Strategy`]: proptest::strategy::Strategy
 
 pub mod join;
+pub mod partition;
 
 use std::collections::HashMap;
 
@@ -2200,12 +2201,16 @@ pub fn interleave_tables(mut program: Program, schedule: &[usize]) -> Program {
 /// def groups by, so each group lives in one partition.
 ///
 /// A partition key is part of the primary key, so the grain column becomes a
-/// `bigint`, and it can't be `NULL`: every
-/// op on the table that writes a `NULL` grain writes `0` instead, which keeps
-/// the seeded rows and their revivals ([`Mutate::DuplicateInsert`]) in the
-/// same group, so each op's expected outcome stands. The table's `UNIQUE`
-/// relationship key is dropped, since a unique index on a partitioned table
-/// must hold the partition key.
+/// `bigint`, and it can't be `NULL`: every op on the table that writes a
+/// `NULL` grain writes `0` instead. The table's `UNIQUE` relationship key is
+/// dropped, since a unique index on a partitioned table must hold the
+/// partition key.
+///
+/// With the grain in the primary key, a row moved to another group
+/// ([`Mutate::MoveGroup`], which moves it to another partition) no longer
+/// collides with its revival ([`Mutate::DuplicateInsert`] at its seeded
+/// grain), so every op on the table takes its expected outcome from a
+/// replay of the partitioned table ([`partition::resimulate`]).
 ///
 /// Layered on top of an already-built program, like [`interleave_tables`].
 ///
@@ -2213,9 +2218,8 @@ pub fn interleave_tables(mut program: Program, schedule: &[usize]) -> Program {
 ///
 /// If a definition reads the table other than as an `Aggregate` grouped by
 /// its grain column alone (a 1-1 transform over a partitioned source is
-/// refused at define), or a relationship has the table at either end, or the
-/// program moves a row between groups ([`Mutate::MoveGroup`], whose
-/// revival would no longer collide): all generator bugs.
+/// refused at define), or a relationship has the table at either end: both
+/// generator bugs.
 pub fn partition_table(mut program: Program, table: usize, strategy: PartitionStrategy) -> Program {
     let source = &program.tables[table];
     let name = source.name.clone();
@@ -2240,14 +2244,7 @@ pub fn partition_table(mut program: Program, table: usize, strategy: PartitionSt
             Op::Insert { table: t, row, .. } if *t == name => row.iter_mut().collect(),
             Op::Update {
                 table: t, changes, ..
-            } if *t == name => {
-                assert!(
-                    changes.iter().all(|(c, _)| *c != grain),
-                    "partition_table: an update moves a row of {name} between groups — a \
-                     generator bug"
-                );
-                Vec::new()
-            }
+            } if *t == name => changes.iter_mut().collect(),
             Op::BulkInsert { table: t, rows, .. } if *t == name => {
                 rows.iter_mut().flat_map(|r| r.iter_mut()).collect()
             }
@@ -2268,6 +2265,7 @@ pub fn partition_table(mut program: Program, table: usize, strategy: PartitionSt
         column: grain,
         strategy,
     });
+    partition::resimulate(&mut program, table);
     program
 }
 
@@ -2489,7 +2487,7 @@ pub fn concurrent_plan(program: &Program, burst_size: usize, lanes: usize) -> Co
     let whole_table: std::collections::HashSet<&str> = program
         .ops
         .iter()
-        .filter(|op| matches!(op, Op::Truncate { .. } | Op::BulkInsert { .. }))
+        .filter(|op| op_touches_whole_table(op))
         .map(op_table)
         .collect();
     let lane_key = |op: &Op| -> (String, Option<String>) {
@@ -2968,15 +2966,19 @@ pub fn build_bulk_insert_program(row_count: usize) -> Program {
 // column values for `Aggregate` — means both key-spaces share one
 // correctness argument instead of two.
 
+/// Whether `op` can touch any row of its table at once: a `TRUNCATE`, a
+/// multi-row insert or partition maintenance, also when named on a leaf.
+fn op_touches_whole_table(op: &Op) -> bool {
+    match op {
+        Op::Truncate { .. } | Op::BulkInsert { .. } | Op::Partition { .. } => true,
+        Op::Leaf { op, .. } => op_touches_whole_table(op),
+        Op::Insert { .. } | Op::Update { .. } | Op::Delete { .. } => false,
+    }
+}
+
 /// The table an [`Op`] targets, regardless of its kind.
 fn op_table(op: &Op) -> &str {
-    match op {
-        Op::Insert { table, .. }
-        | Op::Update { table, .. }
-        | Op::Delete { table, .. }
-        | Op::Truncate { table, .. }
-        | Op::BulkInsert { table, .. } => table,
-    }
+    op.table()
 }
 
 /// The value of `table`'s own primary-key column that `op` (which must
@@ -2995,7 +2997,8 @@ fn op_pk_value(op: &Op, table: &Table) -> Option<String> {
             .find(|(name, _)| name == &table.pk_col)
             .and_then(|(_, value)| value.clone()),
         Op::Update { pk, .. } | Op::Delete { pk, .. } => Some(pk.clone()),
-        Op::Truncate { .. } | Op::BulkInsert { .. } => None,
+        Op::Leaf { op, .. } => op_pk_value(op, table),
+        Op::Truncate { .. } | Op::BulkInsert { .. } | Op::Partition { .. } => None,
     }
 }
 
@@ -3050,6 +3053,10 @@ pub fn target_key_for(def: &TransformDef, table: &Table, op: &Op) -> Option<Stri
             // multi-row `BulkInsert` can touch more than one group at once —
             // conservatively unresolved, same as `Update`/`Delete` above.
             Op::Truncate { .. } | Op::BulkInsert { .. } => None,
+            // ADR-0017: a write naming a leaf lands in the same group as
+            // through the root; partition maintenance can touch any group.
+            Op::Leaf { op, .. } => target_key_for(def, table, op),
+            Op::Partition { .. } => None,
         },
     }
 }
@@ -3980,49 +3987,112 @@ mod strategy {
     /// definition drawn over that table is kept only as an `Aggregate`,
     /// without a relationship: a 1-1 transform over a partitioned source, or
     /// one as a relationship's from-side, is refused at define. The other
-    /// tables draw as usual. Seeds and mutates write through the root, so
-    /// each write lands in, and is captured from, one leaf.
+    /// tables draw as usual.
+    ///
+    /// Issue #1320: on top of its seeds and mutates, the partitioned table
+    /// draws up to [`MAX_PARTITION_DRAWS`] [`partition::PartitionDraw`]s
+    /// ([`partition::add_partition_maintenance`]): partition maintenance
+    /// (a leaf detached, also `CONCURRENTLY`, attached again with its rows,
+    /// dropped, truncated, or a new leaf created empty, written directly, or
+    /// built outside the tree and attached), partition-key updates that move
+    /// a row to another partition, and writes named on a leaf, or on a
+    /// detached table, rather than the root.
     pub fn partitioned_program() -> impl Strategy<Value = Program> {
         prop::collection::vec(table_spec(true), 1..=MAX_TABLES)
             .prop_flat_map(|tables| {
                 let table_count = tables.len();
                 let defs = prop::collection::vec(def_draw(table_count), 0..MAX_DEFS);
-                let op_count = tables
+                let op_count: usize = tables
                     .iter()
                     .map(|t| t.seed_values.len() + t.mutates.len())
                     .sum();
+                let partition_draws = prop::collection::vec(
+                    partition_draw(op_count, tables[0].seed_values.len()),
+                    0..=MAX_PARTITION_DRAWS,
+                );
                 (
                     Just(tables),
                     partition_strategy(),
                     interleave_schedule(op_count),
                     aggregate_functions(),
                     defs,
+                    partition_draws,
                 )
             })
-            .prop_map(|(tables, strategy, schedule, functions, draws)| {
-                let mut defs: Vec<(usize, DefShape)> = vec![(0, DefShape::Aggregate { functions })];
-                let mut derived: Vec<Option<DerivedShape>> = vec![None];
-                let mut rel_fields: Vec<Option<RelFieldSpec>> = vec![None];
-                for (idx, shape, derived_shape, rel_field) in draws {
-                    if idx == 0 {
-                        if matches!(shape, DefShape::OneToOne) {
-                            continue;
+            .prop_map(
+                |(tables, strategy, schedule, functions, draws, partition_draws)| {
+                    let mut defs: Vec<(usize, DefShape)> =
+                        vec![(0, DefShape::Aggregate { functions })];
+                    let mut derived: Vec<Option<DerivedShape>> = vec![None];
+                    let mut rel_fields: Vec<Option<RelFieldSpec>> = vec![None];
+                    for (idx, shape, derived_shape, rel_field) in draws {
+                        if idx == 0 {
+                            if matches!(shape, DefShape::OneToOne) {
+                                continue;
+                            }
+                            defs.push((idx, shape));
+                            derived.push(None);
+                            rel_fields.push(None);
+                        } else {
+                            defs.push((idx, shape));
+                            derived.push(derived_shape);
+                            rel_fields.push(rel_field);
                         }
-                        defs.push((idx, shape));
-                        derived.push(None);
-                        rel_fields.push(None);
-                    } else {
-                        defs.push((idx, shape));
-                        derived.push(derived_shape);
-                        rel_fields.push(rel_field);
                     }
-                }
-                let program = interleave_tables(
-                    build_program_multi_with_relationships(&tables, &defs, &derived, &rel_fields),
-                    &schedule,
-                );
-                partition_table(program, 0, strategy)
-            })
+                    let program = interleave_tables(
+                        build_program_multi_with_relationships(
+                            &tables,
+                            &defs,
+                            &derived,
+                            &rel_fields,
+                        ),
+                        &schedule,
+                    );
+                    partition::add_partition_maintenance(
+                        partition_table(program, 0, strategy),
+                        0,
+                        &partition_draws,
+                    )
+                },
+            )
+    }
+
+    /// How many [`partition::PartitionDraw`]s [`partitioned_program`] layers
+    /// on its partitioned table, at most. Each maintenance op costs the run a
+    /// reconcile pass and a correction before its check.
+    const MAX_PARTITION_DRAWS: usize = 6;
+
+    /// One [`partition::PartitionDraw`] for a program of `op_count` ops whose
+    /// partitioned table seeds `seed_count` rows: maintenance and
+    /// partition-key updates anywhere in the stream, and leaf-named writes.
+    /// A partition-key update draws a grain up to one past [`GRAIN_MAX`],
+    /// which routes to a `LIST`'s `DEFAULT`, or to no leaf without one.
+    fn partition_draw(
+        op_count: usize,
+        seed_count: usize,
+    ) -> impl Strategy<Value = partition::PartitionDraw> {
+        use partition::{MaintenanceKind, PartitionDraw};
+        let kind = prop_oneof![
+            any::<bool>().prop_map(|concurrently| MaintenanceKind::Detach { concurrently }),
+            Just(MaintenanceKind::Attach),
+            Just(MaintenanceKind::Drop),
+            Just(MaintenanceKind::TruncateLeaf),
+            (0u8..=3, any::<bool>())
+                .prop_map(|(rows, standalone)| MaintenanceKind::Create { rows, standalone }),
+        ];
+        prop_oneof![
+            3 => (0..=op_count, 0..8usize, kind)
+                .prop_map(|(at, pick, kind)| PartitionDraw::Maintenance { at, pick, kind }),
+            2 => (0..=op_count, 1..=seed_count as i64 + 1, 0..=GRAIN_MAX + 1, any::<bool>())
+                .prop_map(|(at, pk, grain, via_leaf)| PartitionDraw::MoveRow {
+                    at,
+                    pk,
+                    grain,
+                    via_leaf,
+                }),
+            2 => (0..=op_count, any::<bool>())
+                .prop_map(|(at, detached)| PartitionDraw::ViaLeaf { at, detached }),
+        ]
     }
 
     /// The [`interleave_tables`] schedule `trivial_program_with` draws (issue

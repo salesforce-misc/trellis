@@ -285,13 +285,7 @@ async fn run_across_a_seal_boundary(variant: RelInterleavingVariant, workers: us
 
 /// The table `op` writes.
 fn op_table(op: &Op) -> &str {
-    match op {
-        Op::Insert { table, .. }
-        | Op::Update { table, .. }
-        | Op::Delete { table, .. }
-        | Op::Truncate { table, .. }
-        | Op::BulkInsert { table, .. } => table,
-    }
+    op.table()
 }
 
 /// How often [`run_across_a_seal_boundary`]'s maintenance tick (and, with
