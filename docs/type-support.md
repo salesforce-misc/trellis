@@ -373,17 +373,10 @@ is handled as any other re-type.
 
 ## Aggregates that are not supported
 
-Each family is refused at define in an aggregate or `JOIN` transform, by name,
-with the issue that tracks it
-([transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)):
-
-| Family | Why | Issue |
-|---|---|---|
-| `MIN`, `MAX` | Deleting a group's current minimum or maximum needs the source read again. | [#1117](https://github.com/salesforce-misc/trellis/issues/1117) |
-| `bool_and`, `bool_or`, `bit_and`, `bit_or` | The current value can't tell which of two deletions happened. | [#1118](https://github.com/salesforce-misc/trellis/issues/1118) |
-| `SUM`, `AVG` over a float, an `interval` or another type | Float addition isn't associative, and `NaN` and `Infinity` absorb. | [#1119](https://github.com/salesforce-misc/trellis/issues/1119) |
-| `array_agg`, `string_agg`, `jsonb_agg` | A delta needs the group's whole input, not a summary of it. | [#1040](https://github.com/salesforce-misc/trellis/issues/1040) |
-| `SUM`, `AVG` over a `numeric` with no declared scale | Postgres shows a sum with as many decimal places as the group's most precise value, which a running sum can't track. Declare a scale (`numeric(p,s)`). | [#1120](https://github.com/salesforce-misc/trellis/issues/1120) |
+An aggregate or `JOIN` transform admits `COUNT(*)`, `COUNT(col)`, and `SUM` or `AVG`
+over `smallint`, `integer`, `bigint` and `numeric(p,s)`. Every other aggregate is
+refused at define, by name, with the issue that tracks it: see
+[transforms — Supported sources and targets](transforms.md#supported-sources-and-targets).
 
 ## Typed literals and casts
 
