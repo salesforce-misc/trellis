@@ -374,8 +374,7 @@ pub fn run(name: &str, args: &[String]) -> Option<bool> {
     // #1100: every aggregate runs on the group basis. `--ledger` forces the
     // per-row ledger instead, for this whole run (the engine's dev knob, set
     // once before any client starts): the same-session control for a
-    // group-basis measurement until #1105 deletes the ledger. `--group-basis`
-    // is the default and accepted for older command lines.
+    // group-basis measurement until #1105 deletes the ledger.
     if args.iter().any(|a| a == "--ledger") {
         trellis::dev::staging::set_group_basis(false);
         eprintln!("group basis: off (--ledger: every aggregate on the per-row ledger)");
@@ -508,6 +507,10 @@ pub fn run(name: &str, args: &[String]) -> Option<bool> {
             // default `sum` is the incremental path.
             let aggregate = match flag(args, "--aggregate").unwrap_or("sum") {
                 "sum" => "SUM",
+                // Define refuses `MAX` on the group basis (#1117).
+                "max" if trellis::dev::staging::group_basis_enabled() => {
+                    panic!("--aggregate max needs --ledger: define refuses MAX (#1117)")
+                }
                 "max" => "MAX",
                 other => panic!("--aggregate is sum or max, not {other}"),
             };
@@ -547,6 +550,10 @@ pub fn run(name: &str, args: &[String]) -> Option<bool> {
         // #617's large aggregate build under write load (#620, #629).
         "build-under-load" => {
             let cfg = build_under_load_config(args);
+            assert!(
+                !cfg.min_max || !trellis::dev::staging::group_basis_enabled(),
+                "--min-max needs --ledger: define refuses MIN/MAX (#1117)"
+            );
             let tuning = throughput_tuning(args);
             let result = runtime().block_on(build_under_load::run(cfg, &tuning));
             println!("{}", result.to_json(name));
