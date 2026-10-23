@@ -507,8 +507,8 @@ contention on hot keys.
 `trellis status` prints a `join tables` line and one warning line per finding.
 
 `self_check` refuses a 1-1 transform that reads a relationship with
-`UnsupportedExpr`, and an aggregate with `UnsupportedKeySpace`, when its job is
-started
+`UnsupportedExpr`, and an aggregate that reads a relationship path with
+`UnsupportedKeySpace`, when its job is started
 ([known correctness gaps — What `self_check` can't see](known-correctness-gaps.md#what-self_check-cant-see)),
 so `status` is the place to read the warning.
 

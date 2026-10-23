@@ -179,11 +179,9 @@ with the index to create
 
 ## Index an aggregate's group key when groups are large
 
-This applies to an aggregate kept on the group basis
-([ADR-0002](decisions/0002-async-data-flow.md#aggregates-a-basis-per-group-kept-by-deltas)),
-which today runs only behind a development switch; by default an aggregate
-is kept on its per-row ledger, which never reads a group's rows from the
-source.
+This applies to every aggregate that reads no relationship path, which Trellis
+keeps on the group basis
+([ADR-0002](decisions/0002-async-data-flow.md#aggregates-a-basis-per-group-kept-by-deltas)).
 
 On the group basis, some writes recompute an aggregate's groups from the
 source instead of adding a change to them: releasing a held key, its
@@ -207,9 +205,8 @@ create or drop changes speed only, never results.
 
 ## Partition large sources
 
-This applies to an aggregate kept on the group basis and to a `JOIN`, which
-today run only behind a development switch (see the previous section). Their
-targets are built, resumed and rebuilt in place from the source, and the size
+This applies to an aggregate kept on the group basis and to a `JOIN` (see the
+previous section). Their targets are built, resumed and rebuilt in place from the source, and the size
 of the source decides how long that takes.
 
 A fresh build, a `RESUME` and a rebuild in place of an **unpartitioned** source

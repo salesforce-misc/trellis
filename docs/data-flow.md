@@ -322,6 +322,31 @@ Derived tables are eventually consistent. Two ways to reason about staleness:
 * **Lag telemetry** — always-on metrics exposing how far derived data trails the
   source LSN.
 
+**The contract.** A value read before `await_converged` may be inconsistent.
+After it, values are exact: `await_converged` is how a reader gets exact
+values.
+
+What inconsistent looks like depends on the size of the group an aggregate
+reads:
+
+* **Groups of many rows** (thousands or more) read as slightly behind or ahead
+  by the changes still in flight. A count doesn't go negative and a group
+  doesn't disappear.
+* **Small or hot groups** (a handful of rows, fast concurrent writers) can
+  briefly show values no source state could produce: a negative `COUNT(x)`,
+  `COUNT(x)` above `COUNT(*)`, an `AVG` far off, or a group missing for a
+  moment. A `JOIN` target
+  ([ADR-0019](decisions/0019-join-transforms.md)) can show the same.
+
+An aggregate or `JOIN` target holds a group's row only while the group's row
+count is above 0, so a group whose count falls to 0 or below, even for a
+moment, has no row.
+
+This is by design. Pages apply in parallel and commit out of order, and the
+deltas commute, so the converged state is exact while a state between two
+out-of-order pages can describe no real data
+([ADR-0002](decisions/0002-async-data-flow.md#readers-see-a-group-only-while-its-row-count-is-above-0)).
+
 The predicate behind `await` — the one that must never falsely report
 "converged" — is [stage 07](staging-and-claiming/07-convergence-and-await.md).
 

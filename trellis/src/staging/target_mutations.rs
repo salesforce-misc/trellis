@@ -311,10 +311,9 @@ struct ImageFeed {
 /// definition with a hidden table named by its id in the catalog's schema
 /// (`super::group_basis::hidden_table_name`).
 ///
-/// A constant `false` while the group-basis dev knob is off
+/// A constant `false` while a test has forced the group-basis knob off
 /// (`super::group_basis::enabled`): no aggregate is on the group basis then,
-/// and a `JOIN` transform's apply, which consumes the images, is #1108's and
-/// builds on the group basis. So with the knob off the check costs nothing.
+/// and no `JOIN` applies.
 fn image_readers_sql() -> String {
     if !super::group_basis::enabled() {
         return "false".to_string();

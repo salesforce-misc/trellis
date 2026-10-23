@@ -11,10 +11,12 @@ Anything Trellis reports isn't a gap: a refusal at define, a pause with a
 stops, and [operations](operations.md) says what to do about each one. A gap
 leaves this page when Trellis repairs it, or starts reporting it.
 
-This page describes the default build. `JOIN` targets, and aggregates kept on
-per-group partials (the group basis), run today only behind a development
-switch, and an entry mentions them only where their code differs
-([epic #1091](https://github.com/salesforce-misc/trellis/issues/1091)).
+An aggregate keeps each group's partials (its row count and running sums) and
+applies each captured change to them as a delta, and a `JOIN` does the same for
+each table's partials ([epic #1091](https://github.com/salesforce-misc/trellis/issues/1091)).
+A delta is computed from the change's own images, so a group that missed a
+change stays wrong until it's rebuilt: `request_backfill` of the source, or
+`PAUSE`/`RESUME`. A later write to the same rows doesn't repair it.
 
 ## Summary
 
@@ -107,26 +109,19 @@ or a same-type `USING` rewrite of a column that has:
   STORAGE`), rewritten for the first time since;
 * a non-default collation, rewritten without restating `COLLATE`.
 
-A column read by `MIN` or `MAX` and re-collated (`ALTER COLUMN name TYPE text
-COLLATE "C"`) is missed the same way, with no rewrite.
-
 **What goes wrong:** the statement rewrites the table without firing a
-trigger, so every target reading the column keeps the old values until each
-row is written again. A re-collated `MIN` or `MAX` stays wrong after that
-too: the aggregate's ledger keeps the collation the column had at define, so
-every recompute of the group, a rebuild's included, still orders by it.
+trigger, so every target reading the column keeps the old values. A 1-1
+target's row is repaired when its source row is next written; an aggregate or
+`JOIN` target stays wrong until it's rebuilt.
 
 **Detected by:** `self_check`.
 
-**Repair:** right after the `ALTER`, `request_backfill` the table. For a
-re-collated `MIN` or `MAX`, `PAUSE`, `DROP TRANSFORM` and define the
-aggregate again.
+**Repair:** right after the `ALTER`, `request_backfill` the table.
 
 **Ends with:** [#1206](https://github.com/salesforce-misc/trellis/issues/1206),
 a false-positive study of signals that would catch these shapes. Event
 triggers would see every rewrite but need superuser, and logical decoding has
-the same blind spot: `pgoutput` never sends a rewrite's rows. `MIN` and `MAX`
-leave with [#1105](https://github.com/salesforce-misc/trellis/issues/1105).
+the same blind spot: `pgoutput` never sends a rewrite's rows.
 
 ### An enum label renamed and added again
 
@@ -195,10 +190,11 @@ A trigger disabled and enabled again by name is seen. These aren't:
   forgets the table's records, which the new transform now relies on, and the
   next pass records the triggers it finds.
 
-**What goes wrong:** the writes made in between never reach Trellis, and the
-targets stay wrong until each affected row is written again. A child's rows
-written through an inheritance parent are staged as the parent's own, and
-nothing removes them.
+**What goes wrong:** the writes made in between never reach Trellis. A 1-1
+target's row stays wrong until its source row is written again; an aggregate
+or `JOIN` target stays wrong until it's rebuilt. A child's rows written
+through an inheritance parent are staged as the parent's own, and nothing
+removes them.
 
 **Detected by:** `self_check`.
 
@@ -322,9 +318,10 @@ attaching a partition.
 **When:** anything but Trellis writes to what it owns:
 
 * `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE` or a data load into a target, or
-  into a table Trellis keeps beside one: `<target>__ledger`, an aggregate's
-  `<target>__deltas`, a group-basis aggregate's `agg_<id>`, a `JOIN`'s
-  `join_<id>_*` tables;
+  into a table Trellis keeps beside one: a 1-1 target's `<target>__ledger`,
+  an aggregate's `agg_<id>`, a `JOIN`'s `join_<id>_*` tables, or the
+  `<target>__ledger` and `<target>__deltas` of an aggregate that reads a
+  relationship path;
 * a target dropped and created again by hand with the same columns;
 * a trigger or rule added to a target or one of those tables that changes
   the rows Trellis writes, or the table set `UNLOGGED`, which a crash or
@@ -352,14 +349,11 @@ table's. A change to Trellis's schema isn't detected.
   repairs rows edited, deleted, added or re-keyed by hand and a truncate: a
   rebuild deletes the target rows no source row backs. A target dropped by
   hand: `DROP TRANSFORM` and define it again.
-* **An aggregate target:** neither repairs group rows edited, deleted or
-  truncated by hand, because a rebuild keeps the per-row ledger and adds
-  only differences to the groups. `PAUSE`, `DROP TRANSFORM` and define it
-  again. Ledger aggregates leave with
-  [#1105](https://github.com/salesforce-misc/trellis/issues/1105). A
-  group-basis aggregate's target and `agg_<id>` are repaired by
-  `request_backfill` of its source, or by `PAUSE`/`RESUME`, which drops and
-  recreates `agg_<id>` and rewrites every group.
+* **An aggregate target:** `request_backfill` of its source rewrites every
+  group of the target and `agg_<id>`, and `PAUSE`/`RESUME` drops and
+  recreates `agg_<id>` and rewrites every group. An aggregate that reads a
+  relationship path keeps a per-row ledger, which neither repairs: `PAUSE`,
+  `DROP TRANSFORM` and define it again.
 * **A `JOIN` target:** `PAUSE`/`RESUME` repairs the target's rows and every
   `join_<id>_*` table: the resume recreates the hidden tables, rebuilds them
   from both sources and keeps the target, removing a row no source row backs.
@@ -528,8 +522,8 @@ limits belong here:
 |---|---|---|
 | 1-1, including one over another target | compared | — |
 | 1-1 reading a field through a relationship | refused (`UnsupportedExpr`) | [#1115](https://github.com/salesforce-misc/trellis/issues/1115) removes relationships |
-| Aggregate on the per-row ledger (every aggregate by default) | refused (`UnsupportedKeySpace`) | [#1105](https://github.com/salesforce-misc/trellis/issues/1105) moves every aggregate to the group basis |
-| Group-basis aggregate, `JOIN` (behind the development switch) | compared, hidden tables included | — |
+| Aggregate, `JOIN` | compared, hidden tables included | — |
+| Aggregate reading a relationship path | refused (`UnsupportedKeySpace`) | [#1115](https://github.com/salesforce-misc/trellis/issues/1115) removes relationships |
 
 * Each audit also reports the definition's held keys and the instance's drain
   holdups. They aren't gaps, but they explain a target that stops short.

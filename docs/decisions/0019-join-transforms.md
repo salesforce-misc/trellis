@@ -253,12 +253,16 @@ type, so a `sum` that overflows `bigint` fails where Postgres's would.
 `P`, `M`, `J` and `T`'s partials are hidden from readers. The target shows a
 group only while its row count is above 0, with the aggregates computed from its
 partials. Pages apply in parallel and can commit out of order, so before
-`await_converged` a visible group can hold a combination no source state
-produces: `count(x) > count(*)`, a negative sum, a far-off `AVG`. In the model,
-about half of mid-run reads under fast writers showed such a row, and every read
-taken once all committed changes were applied was exact (6,765 of 6,765). After
-`await_converged`, values are exact. That contract, shared with plain
-aggregates, is stated in [data flow](../data-flow.md#reading-derived-data).
+`await_converged` a small or hot group can hold a combination no source state
+produces: `count(x) > count(*)`, a negative `COUNT(x)`, a far-off `AVG`, or be
+missing for a moment; a group of many rows reads as slightly behind or ahead.
+In the model, about half of mid-run reads under fast writers showed such a row,
+and every read taken once all committed changes were applied was exact (6,765
+of 6,765). After `await_converged`, values are exact. That contract, shared with
+plain aggregates, is stated in
+[data flow](../data-flow.md#reading-derived-data), and
+[ADR-0002](0002-async-data-flow.md#readers-see-a-group-only-while-its-row-count-is-above-0)
+records why the visible row isn't gated on sane partials.
 
 ### A side may be another transform's target, through the target change feed
 

@@ -531,15 +531,29 @@ exact.
   changed. A drop removes the hidden table by definition id; a resume drops
   and recreates it.
 - **The contract:** before `await_converged`, aggregate values may be
-  inconsistent, including combinations no source state could produce;
-  after it they are exact. In my model, draining every batch up to a cut
-  and none above it left exactly the state at the cut, and 5.0% of
-  mid-drain reads of the raw partials showed a group with a negative or
-  hidden count.
+  inconsistent; after it they are exact. Groups of many rows (thousands or
+  more) read as slightly behind or ahead by the changes in flight, with no
+  negative count and no vanished group. Small or hot groups can briefly show
+  combinations no source state could produce: a negative `COUNT(x)`, `COUNT(x)`
+  above `COUNT(*)`, an `AVG` far off, a group missing for a moment. In my
+  model, draining every batch up to a cut and none above it left exactly the
+  state at the cut, and 5.0% of mid-drain reads of the raw partials showed a
+  group with a negative or hidden count.
 
-Writing the visible row only from partials that look sane would narrow the
-anomalies but can't catch a wrong sum or average; applying each group's
-changes strictly in order would serialize hot groups. Neither is built.
+Writing the visible row only from partials that could be real (counts
+non-negative, `0 <= count(x) <= count(*)`) was rejected for 0.1.0. It costs
+a few comparisons per group per page against 25–35 µs of apply CPU per row,
+and it doesn't touch builds or rebuilds, but it changes nothing for the
+large-group workloads 0.1.0 targets: at 2B rows over ~25k groups a group holds
+~80k rows, so an impossible value needs more than 80k in-flight deletes in
+one group, and a mid-run value is off only by the changes in flight. The
+anomalies sit on small or hot groups, where the check can't catch a wrong sum
+(the column's domain is unknown) and an `AVG` over a transiently small count
+can still be far off. Applying each group's changes strictly in order was
+rejected because it serializes hot groups, giving up the out-of-order
+parallelism the group basis relies on. Readers that need consistency use
+`await_converged`; stronger consistency as an opt-in is
+[#1185](https://github.com/salesforce-misc/trellis/issues/1185).
 
 ### Apply is one set-based statement per batch per target, and the batch is bounded
 

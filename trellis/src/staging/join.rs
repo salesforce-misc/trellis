@@ -2,9 +2,7 @@
 //!
 //! # When it runs
 //!
-//! Only behind the group-basis dev knob (`super::group_basis::enabled`):
-//! with the knob off a `JOIN` stays `waiting_to_backfill` and never applies.
-//! With the knob on, a `JOIN` definition ([`applies`]) is built by its plan
+//! A `JOIN` definition ([`applies`]) is built by its plan
 //! job (a fresh build or a `RESUME`) or its sweep job (a rebuild in place) in
 //! one transaction ([`build`], "A build" below), and applies every captured
 //! change from the build's start on.
@@ -160,8 +158,9 @@ use super::fold::{FoldedChange, earliest_origin};
 use super::group_basis::{self, Arg, GroupShape, GroupTargetPlan, Writer};
 use super::target_mutations::TargetMutations;
 
-/// Whether `def` is a `JOIN` that applies: only behind the group-basis knob
-/// (see the module doc).
+/// Whether `def` is a `JOIN` that applies: always, unless a test forced the
+/// group-basis knob off (`super::group_basis::enabled`), when it stays
+/// `waiting_to_backfill`.
 pub(crate) fn applies(def: &TransformDef) -> bool {
     matches!(def.key_space, KeySpace::Join(_)) && group_basis::enabled()
 }
