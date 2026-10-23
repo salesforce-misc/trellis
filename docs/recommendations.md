@@ -217,10 +217,12 @@ run as one absolute write per structure, in one transaction. A `JOIN` whose
 sides are both unpartitioned writes both of its structures in one transaction.
 The transaction locks the groups it writes and holds its snapshot until it
 commits, so its lock window, its hold on `xmin` and the stall in retiring ring
-segments grow with the source. Extrapolated linearly from measurements at 100
-million rows to a billion, that is about 80 seconds for a plain aggregate,
-whose build statement runs serially, and about 1 to 36 minutes per structure
-for a `JOIN`, depending on its shape, which holds the sum of both. For that
+segments grow with the source. On a `JOIN` over an unpartitioned
+100-million-row fact table, a fresh build held `xmin` for 23 seconds grouped by
+a dimension attribute, and for 932 seconds, writing 15.9 GB of WAL, grouped by
+day and attribute
+([#1346](https://github.com/salesforce-misc/trellis/issues/1346) tracks the
+second). For that
 whole window the source's drain waits on the groups the build holds, and on a
 `JOIN` so do the other side's pages on the same keys. No ring segment retires
 until the build commits, so once the ring's slots fill, every source's drain

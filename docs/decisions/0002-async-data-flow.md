@@ -733,10 +733,15 @@ the build's first moment.
   On an unpartitioned source that is the whole source; on a partitioned
   source one leaf at a time.
 - **Accepted cost.** On an unpartitioned source the build's lock window,
-  `xmin` hold and ring-retirement stall grow with the source, unbounded.
-  For that window the source's drain waits on the groups the build holds.
-  A partitioned source is bounded per leaf: in the build-path model the
-  peak `xmin` hold was 0.3–0.5 s per partition for a 100M-row source.
+  `xmin` hold and ring-retirement stall grow with the source. On a `JOIN`
+  over an unpartitioned 100M-row fact table, the engine's fresh build held
+  `xmin` for 23.0 s grouped by a dimension attribute, and for 932 s with
+  15.9 GB of WAL grouped by day and attribute (#1113's benchmark;
+  [#1346](https://github.com/salesforce-misc/trellis/issues/1346) tracks the
+  second against my `JOIN` model's 84 s). For that window the source's drain
+  waits on the groups the build holds. A partitioned source is bounded per
+  leaf: in my group-basis model the peak `xmin` hold was 0.3–0.5 s per
+  partition for a 100M-row source in 32 partitions.
 - **Must:** a rebuild over a target that already has groups recomputes
   every group in place, without pausing the definition. That is
   `request_backfill`, a capture re-install, and the automatic rebuilds
@@ -783,11 +788,12 @@ the build's first moment.
   automatic rebuild, until every structure has committed, then `live`.
   *Cost:* pages of a structure's groups, in practice its source's drain,
   wait while its statement runs. That grows with an unpartitioned source and
-  is one partition's worth at a time on a partitioned one: in the build-path
-  model, one `GROUP BY` per partition built a 100M-row source in 1.4–1.9 s
-  in all. No ring segment retires while the statement's transaction is open, so once the ring's slots fill no segment seals and
-  every source's drain waits for the commit too; writers aren't held back,
-  and the active segment grows meanwhile. Clearing the target and building
+  is one partition's worth at a time on a partitioned one: in my group-basis
+  model, one `GROUP BY` per partition built a 100M-row source in 32
+  partitions in 1.4–1.9 s in all. No ring segment retires while the
+  statement's transaction is open, so once the ring's slots fill no segment
+  seals and every source's drain waits for the commit too; writers aren't
+  held back, and the active segment grows meanwhile. Clearing the target and building
   fresh would show readers an empty, then filling target, and a shadow
   build and swap would make pages write to both states; both are rejected.
 
@@ -1092,7 +1098,7 @@ Each alternative below is recorded with the number that rejected it.
 | **A per-row ledger for aggregates**: one entry per source row holding its group, contribution and ordering state. | I measured 15.1–15.3 GB of ledger for a 100M-row source in 50k groups (151–153 B per entry, its basis 33–39 B), against 5 MB of group state; a 100M build at 370–380 s and 58–71 GB of WAL against 1.4–1.9 s; a page of 100k changes at 3.2–3.35 s against 0.18–0.31 s; and a partition `DROP` of 10M rows at 45–51 s and 6.2 GB of WAL against 10–30 ms. What the ledger gave in return was self-repair on a row's next write, and the `MIN`/`MAX`-style aggregates this ADR refuses. |
 | **One set-based `GROUP BY` build with changes withheld, then a go-live re-read and orphan sweep.** | The re-read is a full enumeration per build that scales with table size, not with what changed; I ran it at 100M, where it reaches `live` after 2,305 s and its drain then runs out of memory. Nothing can tell a table unchanged since the build from one changed and changed back, so the re-read could never be skipped. A 1-1 build is per-row work and its acceptance bar is linear time; an aggregate's build keeps the one-pass `GROUP BY` and drops the withholding, because its absolute write applies alongside pages from its first moment. |
 | **`catching_up` as a stored status with marker fences, generations and go-live catch-ups.** | Needed only by a build that skips changes. A definition on the Re-derive build applies from its first chunk, so there is nothing to catch up; builds not yet on it keep the status ([A build](#a-build-is-re-derive-over-chunks-and-applies-from-its-first-chunk)). |
-| **A chunked aggregate build under a chunk gate:** primary-key-range chunks (a hybrid above a size threshold), or key-range chunks, each adding its region's partials under the group locks, with a gate in every page path (a page locks the chunk rows its sides fall in, before the page row; a chunk that hasn't run skips the side, a done chunk refuses what its snapshot saw, a retired one applies it), retirement once the drained prefix passes the chunk's stamp, a recompute that counts only done or retired chunks, a `NULL`-key chunk, and a truncate page that resets the chunks. | It is the only option that bounds a fresh build on a large unpartitioned source, but a chunk is paid per (chunk, cell) pair: about 5–6x the build time and 12x the WAL on many-cell shapes, against one `GROUP BY` per structure at 2–12x less (84 s against 412–509 s; 213 s against 1,258 s), and it leaves in-place rebuilds unbounded. Key-range chunks bound locks and rows but reread the heap about 2x per chunk, so not I/O. The gate adds a lock to every page and machinery to every truncate and recompute. A build is one absolute write per structure instead, and a large source is partitioned ([#1276](https://github.com/salesforce-misc/trellis/issues/1276) keeps the bounded alternatives open). |
+| **A chunked aggregate build under a chunk gate:** primary-key-range chunks (a hybrid above a size threshold), or key-range chunks, each adding its region's partials under the group locks, with a gate in every page path (a page locks the chunk rows its sides fall in, before the page row; a chunk that hasn't run skips the side, a done chunk refuses what its snapshot saw, a retired one applies it), retirement once the drained prefix passes the chunk's stamp, a recompute that counts only done or retired chunks, a `NULL`-key chunk, and a truncate page that resets the chunks. | It is the only option that bounds a fresh build on a large unpartitioned source, but a chunk is paid per (chunk, cell) pair: about 5–6x the build time and 12x the WAL on many-cell shapes, against one `GROUP BY` per structure at 2–12x less in my `JOIN` model (84 s against 412–509 s; 213 s against 1,258 s), and it leaves in-place rebuilds unbounded. Key-range chunks bound locks and rows but reread the heap about 2x per chunk, so not I/O. The gate adds a lock to every page and machinery to every truncate and recompute. A build is one absolute write per structure instead, and a large source is partitioned ([#1276](https://github.com/salesforce-misc/trellis/issues/1276) keeps the bounded alternatives open). |
 | **Bounding drain memory by running fewer workers.** | Each worker then holds more buckets; I measured that it bounds nothing. |
 | **Fixing the build's cost by chunk size.** | I ran 10x larger chunks and they left 2.0x the time and 3.7x the WAL. |
 | **Resolve every image-less trigger into an image at staging time**, so Phase 2 never reads live state. | Under trigger capture the only image-less change is a delete, and every other image-less producer is an enumeration this ADR replaces with Re-derive or a recompute under lock. What this leaves untouched on a 1-1 target is out-of-order parallel batches for one key, which needs `applied_lsn`, not images. A resolver on the seal path is itself a live read racing the drains. |
