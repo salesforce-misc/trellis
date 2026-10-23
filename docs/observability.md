@@ -485,7 +485,7 @@ longer exists isn't listed. The CLI's `trellis status` prints one warning line p
 entry under the transform.
 
 `join` on `DefinitionStatus` is set for a `JOIN` transform (#1112) and `None` for any
-other. It reports two things, both warnings that leave the transform's status alone:
+other. It reports three things, none of which changes the transform's status:
 
 - `hidden_tables`: the estimated rows (`pg_class.reltuples`, 0 before the first
   analyze) and total on-disk size in bytes of `P`, `M`, `J` and `T`, the
@@ -499,12 +499,28 @@ other. It reports two things, both warnings that leave the transform's status al
   as the table it summarises. A `FROM` table joined on a unique key (its primary key,
   say) has one `P` cell per row, so such a `JOIN` warns once the table passes 1000
   rows.
+- `building`: the step the transform's build (a fresh build, a `RESUME` or a
+  `request_backfill` rebuild) runs now, or runs next while no worker holds its job;
+  `None` when no build is under way. A `JOIN` whose sides are both unpartitioned, or
+  partitioned with no rows, builds in one transaction (`Whole`). One with a
+  partitioned side that has rows builds in steps: each unpartitioned side whole, then
+  each partitioned side (`FROM` first) one leaf at a time in oid order (`Leaf`, named
+  `schema.table`) and then its `Remainder` (the cells that route to no recorded
+  leaf), then a `Final` step that writes `T` and the target and completes the build.
+  A side whose partition tree isn't recorded, or has a leaf without a usable
+  constraint text, is `Unroutable`: the build fails there and `backfill_failure` says
+  why. The report comes from the build job's cursor, which each step writes in its own
+  transaction, through a plain read that takes no lock, so a status call neither
+  waits on a running step nor holds one up; it names the step after the last one that
+  committed.
 
-The time a `JOIN` page spends in its sorted `select … for update` of its `J` rows is
-the histogram `trellis_join_lock_wait_seconds`, labelled by `transform`: mostly the
-wait for another page or writer holding one of its join keys, so a rising tail shows
+The `J` lock wait is a metric rather than a status field: the time a `JOIN` page
+spends in its sorted `select … for update` of its `J` rows is the histogram
+`trellis_join_lock_wait_seconds`, labelled by `transform`. It is mostly the wait for
+another page or writer holding one of its join keys, so a rising tail shows
 contention on hot keys.
-`trellis status` prints a `join tables` line and one warning line per finding.
+`trellis status` prints a `join tables` line, a `join build` line while a build is
+under way, and one warning line per finding.
 
 `self_check` refuses a 1-1 transform that reads a relationship with
 `UnsupportedExpr`, and an aggregate with `UnsupportedKeySpace`, when its job is

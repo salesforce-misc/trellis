@@ -114,9 +114,11 @@
 //! structures, the xmin horizon and the ring's retirement lasts the whole
 //! transaction (`docs/recommendations.md`).
 //!
-//! What a rebuild in place repairs: `P` and `M` that disagree with their
-//! tables, and visible rows that disagree with `T`. Not a hand edit of `T` or
-//! of `J.matches`, which change only by delta; a `RESUME` recreates them.
+//! What a rebuild in place repairs: `P` and `M` stale by writes capture
+//! missed (it writes them absolutely and moves `T` by the difference), and
+//! visible rows that disagree with `T`. Not a hand edit of any hidden table:
+//! `T` and `J.matches` change only by delta, and a hand-edited `P` or `M`
+//! cell turns into a wrong delta to `T`. A `RESUME` recreates them all.
 //!
 //! # A build with a partitioned side
 //!

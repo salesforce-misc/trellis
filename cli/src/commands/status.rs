@@ -43,8 +43,8 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 use trellis::{
-    Config, CorrectingNode, DefinitionSummary, DrainFailure, JoinStatus, RelationshipSummary,
-    SourceIndexGap, Trellis, TrellisOptions, UnindexedJoin,
+    Config, CorrectingNode, DefinitionSummary, DrainFailure, JoinBuildStep, JoinSide, JoinSidePart,
+    JoinStatus, RelationshipSummary, SourceIndexGap, Trellis, TrellisOptions, UnindexedJoin,
 };
 
 use super::release::shell_quote;
@@ -336,6 +336,9 @@ fn format_join(join: &JoinStatus) -> String {
             .collect();
         out.push_str(&format!("    join tables {}\n", tables.join(" ")));
     }
+    if let Some(step) = &join.building {
+        out.push_str(&format!("    join build {}\n", format_join_step(step)));
+    }
     if let Some(w) = &join.partials_warning {
         out.push_str(&format!(
             "    warning: P holds ~{} rows against ~{} in the fact table; \
@@ -344,6 +347,28 @@ fn format_join(join: &JoinStatus) -> String {
         ));
     }
     out
+}
+
+/// The step a `JOIN` build runs now or next ([`JoinStatus::building`]).
+fn format_join_step(step: &JoinBuildStep) -> String {
+    match step {
+        JoinBuildStep::Whole => "both sides in one transaction".to_string(),
+        JoinBuildStep::Final => "final step (T and the target)".to_string(),
+        JoinBuildStep::Side { side, part } => {
+            let side = match side {
+                JoinSide::From => "FROM side",
+                JoinSide::Joined => "JOIN side",
+            };
+            match part {
+                JoinSidePart::Whole => format!("{side} whole"),
+                JoinSidePart::Leaf(name) => format!("{side} leaf {name}"),
+                JoinSidePart::Remainder => format!("{side} remainder"),
+                JoinSidePart::Unroutable => {
+                    format!("{side}: its partition tree can't be routed (see the backfill failure)")
+                }
+            }
+        }
+    }
 }
 
 fn format_drain_failure(failure: &DrainFailure) -> String {
@@ -449,6 +474,29 @@ mod tests {
         let args = vec!["one".to_string(), "two".to_string()];
         let err = parse(&args).unwrap_err();
         assert!(err.contains("got 2"));
+    }
+
+    #[test]
+    fn a_join_build_step_is_printed_only_while_building() {
+        let mut join = JoinStatus {
+            hidden_tables: Vec::new(),
+            partials_warning: None,
+            building: None,
+        };
+        assert_eq!(format_join(&join), "");
+        join.building = Some(JoinBuildStep::Side {
+            side: JoinSide::From,
+            part: JoinSidePart::Leaf("public.a1".to_string()),
+        });
+        assert_eq!(
+            format_join(&join),
+            "    join build FROM side leaf public.a1\n"
+        );
+        join.building = Some(JoinBuildStep::Final);
+        assert_eq!(
+            format_join(&join),
+            "    join build final step (T and the target)\n"
+        );
     }
 
     #[test]
