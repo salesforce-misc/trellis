@@ -221,8 +221,17 @@ ring slot *and* blocking reads for its band forever.
 
 The escape hatch is a targeted purge — delete that table's rows from every ring
 table and the quarantine track — invoked only when a full schema reload still does
-not know the table. It is the **only** sanctioned write to a sealed batch's rows,
-and worth marking as such in code so nothing else grows into the exception.
+not know the table. It is the **only** sanctioned write to rows a batch has
+still to apply, and worth marking as such in code so nothing else grows into
+the exception.
+
+The one other write to a ring row deletes rows every definition has already
+drained: the `RESUME` of a definition paused for an enum relabel deletes its
+tables' drained rows staged before the relabel, which still hold the old
+label. Nothing applies a drained row again, but a group-basis or `JOIN`
+rebuild names groups from the old images of every row left in a slot, and
+would fail to cast the old label
+([capture by triggers — An enum value relabelled](01-capture-by-triggers.md#an-enum-value-relabelled)).
 
 ## Failure matrix
 

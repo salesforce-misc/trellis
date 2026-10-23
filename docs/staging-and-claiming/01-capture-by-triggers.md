@@ -487,7 +487,8 @@ them, and `RESUME` records the new OIDs.
 `RESUME` of a definition paused for a relabel:
 
 1. waits, as `resuming: …`, while a change at or below `relabel_lsn` is
-   still pending on its source or joined table. The drain skips a paused
+   still pending on its source or joined table, an image-less `recompute`
+   of a key (a released key's) included. The drain skips a paused
    definition's share of each, so none of them is applied or re-derived
    after the resume;
 2. deletes those changes from their ring slots once drained, since a
@@ -501,10 +502,12 @@ them, and `RESUME` records the new OIDs.
 4. records the labels again.
 
 Two narrow windows still leave the old label in a change Trellis then
-casts, and each is reported as a held key, not missed: a value added,
-written and relabelled between two passes (the pass records the new label
-as a new OID), and a transaction that staged a change before the relabel
-and commits only after the resume has waited out the others.
+casts: a value added, written and relabelled between two passes (the pass
+records the new label as a new OID), and a transaction that staged a change
+before the relabel and commits only after the resume has waited out the
+others. The cast fails and the key is held, unless a value with the old
+label was added since: then the text casts to that value, with no error
+([known correctness gaps](../known-correctness-gaps.md#an-enum-label-renamed-and-added-again)).
 
 ### Capture changed outside Trellis
 

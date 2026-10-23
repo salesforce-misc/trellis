@@ -26,6 +26,7 @@ wrong rows, on the targets it compares
 |---|---|---|
 | **Schema changes Trellis can't tell from routine work** | | |
 | [A column's values rewritten in place by `ALTER COLUMN TYPE`](#a-columns-values-rewritten-in-place-by-alter-column-type) | `self_check` | [#1206](https://github.com/salesforce-misc/trellis/issues/1206) (study) |
+| [An enum label renamed and added again](#an-enum-label-renamed-and-added-again) | `self_check` | documented |
 | **Writes capture never sees** | | |
 | [Capture disrupted and restored between two passes](#capture-disrupted-and-restored-between-two-passes) | `self_check` | [#1206](https://github.com/salesforce-misc/trellis/issues/1206) (study), [#1237](https://github.com/salesforce-misc/trellis/issues/1237), otherwise documented |
 | [An unlogged source emptied by a crash or failover](#an-unlogged-source-emptied-by-a-crash-or-failover) | `self_check` | documented |
@@ -126,6 +127,37 @@ a false-positive study of signals that would catch these shapes. Event
 triggers would see every rewrite but need superuser, and logical decoding has
 the same blind spot: `pgoutput` never sends a rewrite's rows. `MIN` and `MAX`
 leave with [#1105](https://github.com/salesforce-misc/trellis/issues/1105).
+
+### An enum label renamed and added again
+
+**When:** a change is staged with an enum label, the label is renamed away
+and a new value is added with the old label, and the capture pass can't
+pause the readers for the rename before the change is applied, because:
+
+* the renamed value was itself added since the pass before, so the pass has
+  no record of its OID and takes it for a new value:
+
+  ```sql
+  ALTER TYPE tone ADD VALUE 'x';
+  INSERT INTO orders (id, tone) VALUES (2, 'x');
+  ALTER TYPE tone RENAME VALUE 'x' TO 'y';
+  ALTER TYPE tone ADD VALUE 'x';  -- all before the next pass
+  ```
+
+* or the change's transaction was open across the rename and commits only
+  after the readers' `RESUME`.
+
+**What goes wrong:** Trellis keeps the staged value as its label text, and
+the text now names the new value. An aggregate, a `JOIN`, and a 1-1 beside
+either on the same table apply the new value instead of the renamed one, with
+no error. Without the re-add, the label fails to cast and the key is held
+([capture by triggers — An enum value relabelled](staging-and-claiming/01-capture-by-triggers.md#an-enum-value-relabelled)).
+
+**Detected by:** `self_check`.
+
+**Repair:** `request_backfill` the table.
+
+**Ends with:** documented.
 
 ## Writes capture never sees
 

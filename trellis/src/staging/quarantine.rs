@@ -4308,10 +4308,10 @@ async fn request_wait(
 /// Whether definition `id` (on `source_table`) was paused for a relabelled
 /// enum value (`capture_failures.relabel_lsn`, #1241) and a change at or
 /// below that position is still pending on its source or joined table
-/// ([`super::converge::table_changes_pending_through`]). Such a change
-/// holds the old label as text, which no longer casts to the type: applied
-/// after the resume, or re-derived by its key, it would fail and hold its
-/// key again. While the definition is paused the drain skips its share of
+/// ([`super::converge::table_rows_pending_through`]), an image-less
+/// `recompute` included. Such a change holds the old label as text, which
+/// no longer casts to the type: applied after the resume, or re-derived by
+/// its key, it would fail and hold its key again. While the definition is paused the drain skips its share of
 /// each one, so the resume waits for that rather than discarding them.
 async fn relabel_changes_pending(
     txn: &Transaction<'_>,
@@ -4332,7 +4332,7 @@ async fn relabel_changes_pending(
     let gate: crate::PgLsn = row.get(0);
     let joined: Option<String> = row.get(1);
     for table in std::iter::once(source_table).chain(joined.as_deref()) {
-        if super::converge::table_changes_pending_through(txn, table, gate).await? {
+        if super::converge::table_rows_pending_through(txn, table, gate).await? {
             return Ok(true);
         }
     }
@@ -4836,8 +4836,7 @@ async fn discard_drained_changes(
                  where r.src_table = any($1) and r.origin_lsn <= $2 \
                    and exists (select 1 from segments s \
                                where s.ring_slot = $3 and s.state = 'drained' \
-                                 and (s.fence_snapshot is null \
-                                      or pg_visible_in_snapshot(r.row_txid, s.fence_snapshot))) \
+                                 and pg_visible_in_snapshot(r.row_txid, s.fence_snapshot)) \
                    and not exists (select 1 from segments s \
                                    where s.ring_slot = $3 and s.state <> 'drained')"
             ),

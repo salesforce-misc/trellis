@@ -148,6 +148,41 @@ async fn an_enum_keyed_one_to_one_with_changes_pending_resumes_exactly() {
         .await;
 }
 
+/// A 1-1 keyed by an enum whose released key's `recompute` is still pending
+/// across the relabel. The `recompute` carries no image, but its key is the
+/// old label's text: the resume waits for it to drain too, or the rebuilt
+/// definition re-derives the old label and holds the key.
+#[tokio::test]
+async fn an_enum_keyed_one_to_one_waits_for_a_pending_recompute_of_the_old_label() {
+    trellis::dev::staging::set_group_basis(true);
+    let mut h = H::new(ENUM_KEYED, &["TRANSFORM kt FROM public.k SELECT n AS n"]).await;
+    // Hold 'brisk' with a constraint its write breaks, then release it: the
+    // release stages a `recompute` keyed 'brisk'.
+    h.write("alter table public.kt add constraint small check (n < 100)")
+        .await;
+    h.write("update public.k set n = 1000 where tone = 'brisk'")
+        .await;
+    h.drain_past_failures().await;
+    assert!(h.held().await > 0, "the failing write holds its key");
+    h.write("alter table public.kt drop constraint small").await;
+    h.trellis
+        .release_key("kt", "public.k", "brisk")
+        .await
+        .expect("release_key");
+    h.write(RELABEL).await;
+    h.capture_pass().await;
+    h.assert_paused_by_the_relabel(&["kt"]).await;
+    h.resume(&["kt"]).await;
+    let waiting = h.capture_failure("kt").await.unwrap_or_default();
+    assert!(
+        waiting.starts_with("resuming: waiting for the changes staged before an enum value"),
+        "{waiting}"
+    );
+    h.converge("after resume").await;
+    h.assert_exact("kt", ENUM_KEYED_TARGET, ENUM_KEYED_ORACLE)
+        .await;
+}
+
 /// `GROUP BY tone` on the group basis, with a change staged across the
 /// relabel and the resume made before it drains.
 #[tokio::test]

@@ -322,11 +322,40 @@ pub async fn table_changes_pending_through(
     table: &str,
     gate: PgLsn,
 ) -> Result<bool, StagingError> {
-    const IMAGED: &str = "op not in ('recompute', 'truncate', 'schema_changed', 'node_truncate')";
+    pending_through(
+        client,
+        table,
+        gate,
+        " and r.op not in ('recompute', 'truncate', 'schema_changed', 'node_truncate')",
+    )
+    .await
+}
+
+/// [`table_changes_pending_through`], counting every row of `table`, an
+/// image-less one included: a `recompute` names its key as text, which an
+/// enum relabel (#1241) can leave naming a label that no longer exists, so
+/// a relabel's resume waits for those too.
+pub(crate) async fn table_rows_pending_through(
+    client: &impl GenericClient,
+    table: &str,
+    gate: PgLsn,
+) -> Result<bool, StagingError> {
+    pending_through(client, table, gate, "").await
+}
+
+/// The statement behind [`table_changes_pending_through`] and
+/// [`table_rows_pending_through`]: `ops` (` and …`, or nothing) restricts
+/// which of `table`'s own rows count.
+async fn pending_through(
+    client: &impl GenericClient,
+    table: &str,
+    gate: PgLsn,
+    ops: &str,
+) -> Result<bool, StagingError> {
     let arms = per_ring_table(" union all ", |slot, ring| {
         format!(
             "select 1 from {ring} r \
-             where (r.src_table = $1 and r.{IMAGED} \
+             where (r.src_table = $1{ops} \
                     or r.op = 'rel_reverse_deferred' and r.relationship_id in ( \
                         select rd.id from relationship_definitions rd \
                         where rd.to_schema || '.' || rd.to_table = $1)) \
