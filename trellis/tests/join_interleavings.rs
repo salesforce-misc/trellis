@@ -1934,49 +1934,6 @@ async fn a_partitioned_side_with_no_rows_builds_whole() {
     lab.assert_built("a partitioned side with no rows").await;
 }
 
-/// A side that is another transform's target (whose feed is #1100's) fails
-/// the build and pauses the definition.
-#[tokio::test]
-async fn the_knob_refuses_a_join_over_a_target() {
-    trellis::dev::staging::set_group_basis(true);
-    let d = Driver::start(
-        DDL,
-        &[
-            ("id", int4()),
-            ("t", int4()),
-            ("k", int4()),
-            ("gb", int4()),
-            ("y", int4()),
-        ],
-        &["TRANSFORM c FROM public.b SELECT t AS t, k AS k, gb AS gb, y AS y"],
-        &["public.a", "public.b"],
-    )
-    .await;
-    trellis::defs::install_definition(
-        d.pool(),
-        "TRANSFORM l FROM public.a LEFT JOIN public.c ON a.k = c.k GROUP BY c.gb WITHOUT SOURCE INDEX \
-         SELECT c.gb AS gb, COUNT(*) AS n",
-        &[("id".to_string(), int4()), ("k".to_string(), int4())].into(),
-        "public",
-    )
-    .await
-    .expect("define");
-    trellis::intake::markers::settle_registrations(d.pool()).await;
-    assert_eq!(
-        d.rows("select status::text from transform_definitions where target_table = 'public.l'")
-            .await,
-        ["(paused)"],
-        "the build fails on a side that is a target"
-    );
-    let error = d
-        .rows("select string_agg(last_error, ' | ') from backfill_chunks")
-        .await;
-    assert!(
-        error.len() == 1 && error[0].contains("another definition's target"),
-        "{error:?}"
-    );
-}
-
 /// Each changed `T` group reaches the target-mutation seam with its prior
 /// image, so a transform reading the `JOIN` target follows it: a group
 /// written, changed, moved and deleted. (An `INNER` join, whose groups here

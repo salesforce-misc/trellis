@@ -205,8 +205,9 @@
 //!
 //! # Seam-fed sources (F6)
 //!
-//! A source that is another definition's target is never captured: its
-//! writes reach Apply through the target-mutation seam
+//! A source that is another definition's target (or a `JOIN`'s joined table
+//! that is one) is never captured: its writes reach Apply through the
+//! target-mutation seam
 //! (`super::target_mutations`), whose writer reads the list of applying
 //! definitions inside its own apply transaction. A writer that read it before
 //! this build's start committed doesn't stage its rows for the definition, and
@@ -216,7 +217,9 @@
 //! the start commit, so every change a page holds without the definition was
 //! committed before the start and is in every chunk's snapshot.)
 //!
-//! So the build of a seam-fed source is fenced, once per build. The plan
+//! So the build of a seam-fed source is fenced, once per build ([`run_plan`];
+//! a group-basis aggregate's or a `JOIN`'s one-transaction build runs after
+//! the fence, in the plan job). The plan
 //! job's first act is to take a fence: the id of a transaction that began
 //! after the start commit (`intake::markers`' `confirm_fence`, #431's rule),
 //! recorded on the plan row (`backfill_chunks.fence_xid`). It enqueues no
@@ -3170,10 +3173,33 @@ async fn run_plan(
             }
         }
     }
+    // A seam-fed source's build waits for its fence before the walk, so
+    // before any chunk (F6). A `JOIN` waits for it when either side is
+    // another definition's target, before its one transaction: a writer of
+    // that target that resolved its feed before the `JOIN` applied staged
+    // nothing for it, and the build's `GROUP BY` must see its row.
+    if chunk.fields.is_none()
+        && cursor.is_none()
+        && reads_a_target(&**pool.get().await?, &definition).await?
+    {
+        match fence_settled(pool, chunk, claimed_by).await? {
+            FenceState::Settled => {}
+            FenceState::Pending(fence) => {
+                crate::instance_log::debug!(
+                    definition_id = chunk.definition_id,
+                    fence_xid = fence,
+                    "re-derive build waits for its fence before planning a chunk"
+                );
+                return defer_claim(pool, chunk, claimed_by, FENCE_RETRY).await;
+            }
+            FenceState::Superseded => {
+                return chunk_queue::discard_if_superseded(pool, chunk, claimed_by).await;
+            }
+        }
+    }
     // A `JOIN`'s fresh build or resume is its whole build (#1109, ADR-0019):
     // both structures in one transaction, never a walk of the primary key.
-    // Neither side is seam-fed (a side that is another definition's target is
-    // refused), so there is no fence to wait for.
+    // It runs after the seam fence above, as a plain aggregate's does.
     if super::join::applies(&definition.def) {
         if chunk.fields.is_some() {
             return Err(build_error(ApplyError::GroupBasisUnsupported {
@@ -3194,27 +3220,6 @@ async fn run_plan(
             ReadersOnCommit::Park,
         )
         .await;
-    }
-    // A seam-fed source's build waits for its fence before the walk, so
-    // before any chunk (F6).
-    if chunk.fields.is_none()
-        && cursor.is_none()
-        && catalog::is_definition_target(&**pool.get().await?, &definition.source_table).await?
-    {
-        match fence_settled(pool, chunk, claimed_by).await? {
-            FenceState::Settled => {}
-            FenceState::Pending(fence) => {
-                crate::instance_log::debug!(
-                    definition_id = chunk.definition_id,
-                    fence_xid = fence,
-                    "re-derive build waits for its fence before planning a chunk"
-                );
-                return defer_claim(pool, chunk, claimed_by, FENCE_RETRY).await;
-            }
-            FenceState::Superseded => {
-                return chunk_queue::discard_if_superseded(pool, chunk, claimed_by).await;
-            }
-        }
     }
     // A plain group-basis aggregate's fresh build or resume is its whole
     // build: one absolute write of every group, as a rebuild of a live
@@ -3454,12 +3459,6 @@ async fn run_group_rebuild_held(
 ) -> Result<(), ChunkQueueError> {
     let mut client = pool.get().await?;
     if super::join::applies(&definition.def) {
-        if let Some(what) = join_build_refusal(&**client, definition).await? {
-            return Err(build_error(ApplyError::GroupBasisUnsupported {
-                target: definition.target_table.clone(),
-                what,
-            }));
-        }
         let partitioned = join_partitioned_sides(&**client, definition).await?;
         if !partitioned.is_empty() {
             drop(client);
@@ -3601,26 +3600,22 @@ async fn run_group_rebuild_held(
     Ok(())
 }
 
-/// Why a `JOIN`'s build ([`run_group_rebuild_held`]) can't run, if it can't
-/// (#1109): the reason becomes the definition's halting failure.
-///
-/// - **A side that is another definition's target.** The target feed isn't
-///   wired into the build; when it is, the seam fence of [`run_plan`] must
-///   test both tables, not only the `FROM` one.
-async fn join_build_refusal(
+/// Whether `definition` reads another definition's target: its source, or a
+/// `JOIN`'s joined table. Such a table is fed by the target-mutation seam,
+/// so a fresh build or a resume waits on its fence ([`fence_settled`]).
+async fn reads_a_target(
     client: &impl GenericClient,
     definition: &Definition,
-) -> Result<Option<&'static str>, ChunkQueueError> {
-    let mut tables = vec![definition.source_table.clone()];
-    tables.extend(catalog::join_table_of(client, definition.id).await?);
-    for table in &tables {
-        if catalog::is_definition_target(client, table).await? {
-            return Ok(Some(
-                "a JOIN side that is another definition's target (the target feed is #1100's)",
-            ));
-        }
+) -> Result<bool, ChunkQueueError> {
+    if catalog::is_definition_target(client, &definition.source_table).await? {
+        return Ok(true);
     }
-    Ok(None)
+    if super::join::applies(&definition.def)
+        && let Some(joined) = catalog::join_table_of(client, definition.id).await?
+    {
+        return Ok(catalog::is_definition_target(client, &joined).await?);
+    }
+    Ok(false)
 }
 
 /// The sides of a `JOIN` that are a partitioned root with rows, `FROM` side

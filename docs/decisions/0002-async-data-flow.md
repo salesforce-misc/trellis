@@ -628,7 +628,9 @@ structure for an aggregate
   the ring carries its write. The plan job's first act is a fence, the id of
   a transaction begun after the start commit (the marker fence's rule),
   and it plans no chunk until the oldest running transaction began
-  after it. That covers a writer only if it held its transaction id when it
+  after it. A group-basis build, and a JOIN build either of whose tables is
+  another definition's target, waits on the same fence before its one
+  transaction. That covers a writer only if it held its transaction id when it
   checked, so the seam's check takes the id first, in a statement of its
   own. Only a seam-fed build waits, and only on older transactions;
   `status` names the fence (`BuildWait::Fence`). The seam stays, so this

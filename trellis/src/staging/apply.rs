@@ -181,9 +181,8 @@ pub enum ApplyError {
     /// resume over a partitioned source that has rows before its tree is
     /// recorded, or a build or rebuild over one whose tree is not recorded or
     /// has a leaf with no usable constraint text (#1101); or, on a `JOIN`
-    /// (`super::join`, #1108), a build over a side that is another
-    /// definition's target, a field build, or a partitioned side whose tree is not
-    /// recorded or has a leaf with no usable constraint text (#1286).
+    /// (`super::join`, #1108), a field build, or a partitioned side whose tree
+    /// is not recorded or has a leaf with no usable constraint text (#1286).
     /// Like
     /// [`ApplyError::AggregateOffLedger`], every page of the target would
     /// reproduce it, so it halts the target.

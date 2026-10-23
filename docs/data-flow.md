@@ -130,7 +130,9 @@ snapshot, with its rows staged for no one, so the plan job first takes a
 fence, a transaction id assigned after the start commit, and enqueues no
 chunk until the oldest running transaction in the cluster began after it. The
 seam's check takes the writer's transaction id before it reads the list, so
-every writer that read it too early has an id below the fence.
+every writer that read it too early has an id below the fence. A group-basis
+aggregate, and a `JOIN` either of whose tables is another definition's target,
+take the same fence before their one-transaction build.
 While it waits, the definition's `status().build_wait` reads
 `BuildWait::Fence { xid }`, naming the id to look for in `pg_stat_activity`.
 Only these builds wait, and only on transactions older than the fence. A

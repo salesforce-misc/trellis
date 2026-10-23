@@ -9,6 +9,17 @@
 //! one transaction ([`build`], "A build" below), and applies every captured
 //! change from the build's start on.
 //!
+//! Either table may be another definition's target (#1096 decision 5,
+//! ADR-0019). A target is never captured: its writers stage each changed key
+//! through the target-mutation seam as exact old and new images ordered by
+//! the write token (`super::target_mutations`, "The image feed"), and the side
+//! consumes them as it consumes captured images. A target is never truncated
+//! as a ring operation (a source `TRUNCATE` upstream clears the target key by
+//! key), so such a side's truncate floor never rises. Its fresh build or
+//! `RESUME` waits for the seam fence first (`super::build`'s "Seam-fed
+//! sources"). An upstream build that writes its target outside the seam
+//! rebuilds the `JOIN` (`intake::markers::park_target_catchup_if_read`).
+//!
 //! Either table may be a partitioned root (#1111, ADR-0019 "Either side may
 //! be partitioned"). A node operation (`DROP`, `DETACH`, `TRUNCATE`,
 //! `ATTACH`, a new leaf, a `DEFAULT` whose siblings changed, the complement

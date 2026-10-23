@@ -265,9 +265,14 @@ aggregates, is stated in [data flow](../data-flow.md#reading-derived-data).
 A side that is a transform's target is read from that target's change feed:
 the exact old and new images per changed key, in write-token order, which
 ADR-0002's mutation seam stages for any target with an aggregate or JOIN
-reader. The side consumes them as it consumes captured images. An upstream build
-or rebuild bypasses the seam, so it rebuilds the JOIN transform. A JOIN
-transform's own target feeds its readers the same way as any aggregate target.
+reader. The side consumes them as it consumes captured images. A target is
+never truncated as a change of its own: a `TRUNCATE` upstream clears it key by
+key through the seam. A build or `RESUME` of the JOIN transform first waits out
+every transaction that began before its start (the seam fence), so an upstream
+writer that decided it had no JOIN reader before the build started has
+committed before the build reads the target. An upstream build or rebuild that
+bypasses the seam rebuilds the JOIN transform. A JOIN transform's own target
+feeds its readers the same way as any aggregate target.
 
 ### Either side may be partitioned when its partial key holds every partition-key column
 
