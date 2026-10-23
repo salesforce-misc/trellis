@@ -121,8 +121,9 @@ temporal or `interval` precision, a `char(n)` or `bit(n)` length, a `varchar`
 bound or its move to `text`) changes no copy, and a widening of one needs no
 pause and no rebuild. A change that re-renders the stored values (a `char(n)`
 length, a `bit(n)` rewrite, a `numeric` scale, a narrower precision) rebuilds the
-column's readers, or pauses one that keys by it. A `numeric` `GROUP BY` key's
-group rows keep the text they were written with, which is still an equal value
+column's readers, or pauses one that keys by it, except that a wider `numeric`
+scale pauses no `GROUP BY` key: its group rows keep the text they were written
+with, which is still an equal value
 ([Numeric and floating point](#numeric-and-floating-point)). A width change pauses the
 transforms that own the column, and `RESUME` re-types every column to the type
 define would give it from the live schema before it rebuilds

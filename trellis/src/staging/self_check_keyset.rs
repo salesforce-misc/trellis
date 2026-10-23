@@ -421,6 +421,33 @@ impl Keyset {
         self.ranked_as(ctes, sides, bounds, extra, Match::Value)
     }
 
+    /// In a statement of [`Keyset::ranked_by_value`]'s, the text the page
+    /// reports a key by, for a row `alias` that carries the key's columns
+    /// (`alias.__c0`, …) but no side's text: the text of the equal key the
+    /// page ranked, or `fallback` when the page ranked none. So an uncertain
+    /// image's key, rendered from its own value (`1.250`), names the group
+    /// the page reports (`1.25`).
+    pub(super) fn named_key(&self, alias: &str, fallback: &str) -> String {
+        let equal: Vec<String> = self
+            .carried(Some("__x"))
+            .iter()
+            .zip(self.carried(Some(alias)))
+            .enumerate()
+            .map(|(i, (x, a))| {
+                format!(
+                    "{} is not distinct from {}",
+                    self.collated(i, x),
+                    self.collated(i, &a)
+                )
+            })
+            .collect();
+        format!(
+            "coalesce((select __n.__k from ranked __x join named __n on __n.__r = __x.__r \
+              where {} limit 1), {fallback})",
+            equal.join(" and ")
+        )
+    }
+
     fn ranked_as(
         &self,
         ctes: &str,

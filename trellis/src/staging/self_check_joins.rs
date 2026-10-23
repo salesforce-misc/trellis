@@ -315,8 +315,9 @@ fn key_sql(key: &[PrimaryKeyColumn], alias: &str) -> String {
 
 /// What a page reads of the ring besides its own sides
 /// (`super::self_check_ring`): the CTEs it needs first (each ending with
-/// `, `), a query of the key text (`__k`) of every key an unsubtractable
-/// ring row may touch, and the condition under which every key may.
+/// `, `), a query of the key text (`__k`) and columns (`__c0`, …) of every
+/// key an unsubtractable ring row may touch, and the condition under which
+/// every key may.
 struct RingReads {
     ctes: String,
     uncertain: String,
@@ -387,9 +388,12 @@ fn partials_page_sql(
         c_cols = keyset.carried(None).join(", "),
         uncertain = ring.uncertain,
     );
+    // An uncertain image's key is the page's equal key's text
+    // ([`Keyset::named_key`]).
     let extra = format!(
-        " union all select 5, page.page_end, unc.__k, null::text[] from unc, page \
+        " union all select 5, page.page_end, {unc_named}, null::text[] from unc, page \
           union all select 6, page.page_end, '', null::text[] from page where {global}",
+        unc_named = keyset.named_key("unc", "unc.__k"),
         global = ring.global,
     );
     keyset.ranked_by_value(&ctes, &[(1, "src"), (2, "hid")], &[1, 2], &extra)
@@ -498,8 +502,8 @@ impl Audit<'_> {
         (ring.ctes(&lands), ring.weighted_sql(&lands))
     }
 
-    /// The key text (`__k`) over `key`'s columns of each image of
-    /// `ring`'s uncertain rows, populated as `__s`, after `rename` (a
+    /// The key text (`__k`) over `key`'s columns, and the columns (`__c0`,
+    /// …), of each image of `ring`'s uncertain rows, populated as `__s`, after `rename` (a
     /// lateral `select` over `__r`, the populated row, naming `key`'s
     /// columns as `__s`'s; `None`: `__s` is the populated row itself).
     fn uncertain_keys(ring: &Ring<'_>, key: &[PrimaryKeyColumn], rename: Option<&str>) -> String {
@@ -514,8 +518,13 @@ impl Audit<'_> {
                 ring.source_row
             ),
         };
+        let carried: String = key
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!(", __s.{} as __c{i}", quote_ident(&c.name)))
+            .collect();
         format!(
-            "select distinct {} as __k from ({}) u {populated}",
+            "select distinct {} as __k{carried} from ({}) u {populated}",
             key_sql(key, "__s"),
             ring.uncertain_images_sql()
         )

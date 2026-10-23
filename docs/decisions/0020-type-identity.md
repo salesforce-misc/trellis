@@ -100,8 +100,10 @@ rebuilds from the source without casting any stored text. The changes are:
 - an enum `RENAME VALUE`. A new label (`ADD VALUE`) changes no stored text and
   pauses nothing.
 - a rewrite that re-renders existing key text: a `character(n)` length change,
-  a `bit(n)` change with `USING`, a `numeric` scale change, a narrower temporal
-  precision.
+  a `bit(n)` change with `USING`, a narrower `numeric` scale or one added to an
+  unconstrained `numeric` (the rewrite rounds), a narrower temporal precision.
+  A wider `numeric` scale pauses nothing: a group key's stored text is still an
+  equal value ([below](#an-aggregate-or-join-target-holds-an-equal-value)).
 
 Enum values are detected by their value OIDs, recorded with the definition.
 

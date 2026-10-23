@@ -281,7 +281,8 @@ times the table, which is hours at 100M rows.
   page. A cursor is decoded back into its columns' values for the next page.
   An aggregate's and a JOIN's sides are matched by the dense rank below, so
   keys that are equal values are one key, reported by the text of the first
-  side that has it (the source's, when it does).
+  side that has it (the source's, when it does), and so is the key of an
+  unapplied ring row the page can't vouch for.
 * **The page's end.** The two sides are `limit`ed separately, so a page ends at
   the lowest last key of the sides that filled the limit. The sides' keys are
   ranked together in the statement, by a dense rank over the same order, so

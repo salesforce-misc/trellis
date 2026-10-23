@@ -277,7 +277,7 @@ fn page_sql(
          implied as (select __k{carried_cols_lead}, __f as __v from hid where __visible), \
          vis as materialized ({vis}), \
          unc as ( \
-            select distinct ({unc_key}) collate {BYTE_ORDER} as __k \
+            select distinct ({unc_key}) collate {BYTE_ORDER} as __k{unc_carried} \
             from ({uncertain}) u \
             cross join lateral jsonb_populate_record(null::{source}, u.__i) as r), ",
         ring_ctes = ring.ctes(&lands),
@@ -289,12 +289,16 @@ fn page_sql(
             .map(|c| format!(", {c}"))
             .collect::<String>(),
         unc_key = ddl::pk_key_sql_expr(identity, Some("r")),
+        unc_carried = keyset.select_carried(&keyset.refs(Some("r"))),
         uncertain = ring.uncertain_images_sql(),
         source = ring.source_row,
     );
+    // An uncertain image's key is the page's equal key's text, which may not
+    // be the image's own (`1.250` of the group the page reports as `1.25`).
     let extra = format!(
-        " union all select 5, page.page_end, unc.__k, null::text[] from unc, page \
+        " union all select 5, page.page_end, {unc_named}, null::text[] from unc, page \
           union all select 6, page.page_end, '', null::text[] from page where {global}",
+        unc_named = keyset.named_key("unc", "unc.__k"),
         global = ring.global_sql(),
     );
     Ok(keyset.ranked_by_value(
@@ -516,84 +520,80 @@ pub(super) async fn compare(
 /// texts differ, and text is all it can be compared by.
 ///
 /// Only a cell whose texts differ is a diverged cell, so this reads nothing
-/// but the cells already reported, in one statement.
+/// but the cells already reported: one statement per type, linear in the
+/// cells (a page of a target whose every result re-rendered has thousands).
 pub(super) async fn drop_equal_values(
     client: &tokio_postgres::Client,
     types: &HashMap<&str, &str>,
     divergences: &mut Vec<Divergence>,
 ) -> Result<(), SelfCheckError> {
-    let cells: Vec<(usize, &str, &str, &str)> = divergences
-        .iter()
-        .enumerate()
-        .filter_map(|(i, d)| match d {
-            Divergence::Cell {
-                column,
-                persisted: Some(p),
-                recomputed: Some(r),
-                ..
-            } => types
-                .get(column.as_str())
-                .map(|ty| (i, *ty, p.as_str(), r.as_str())),
-            _ => None,
-        })
-        .collect();
-    if cells.is_empty() {
-        return Ok(());
-    }
-    // The `n`th cell's texts are elements `2n + 1` and `2n + 2` of `$1`.
-    let equal = |n: usize, ty: &str| {
-        format!(
-            "coalesce((($1::text[])[{a}])::{ty} = (($1::text[])[{b}])::{ty}, false)",
-            a = 2 * n + 1,
-            b = 2 * n + 2
-        )
-    };
-    let texts = |cells: &[(usize, &str, &str, &str)]| -> Vec<String> {
-        cells
-            .iter()
-            .flat_map(|(_, _, p, r)| [p.to_string(), r.to_string()])
-            .collect()
-    };
-    let all: Vec<String> = cells
-        .iter()
-        .enumerate()
-        .map(|(n, (_, ty, _, _))| equal(n, ty))
-        .collect();
-    let batch = client
-        .query_one(
-            &format!("select array[{}]::bool[]", all.join(", ")),
-            &[&texts(&cells)],
-        )
-        .await;
-    let verdicts: Vec<bool> = match batch {
-        Ok(row) => row.get(0),
-        // A type with no `=`, or a text it doesn't read: each cell on its
-        // own, so the others are still compared by value.
-        Err(err) if err.as_db_error().is_some() => {
-            let mut verdicts = Vec::with_capacity(cells.len());
-            for cell in &cells {
-                let one = client
-                    .query_one(
-                        &format!("select {}", equal(0, cell.1)),
-                        &[&texts(std::slice::from_ref(cell))],
-                    )
-                    .await;
-                verdicts.push(match one {
-                    Ok(row) => row.get(0),
-                    Err(err) if err.as_db_error().is_some() => false,
-                    Err(err) => return Err(err.into()),
-                });
-            }
-            verdicts
+    let mut by_type: BTreeMap<&str, Vec<(usize, &str, &str)>> = BTreeMap::new();
+    for (i, d) in divergences.iter().enumerate() {
+        if let Divergence::Cell {
+            column,
+            persisted: Some(p),
+            recomputed: Some(r),
+            ..
+        } = d
+            && let Some(ty) = types.get(column.as_str())
+        {
+            by_type
+                .entry(*ty)
+                .or_default()
+                .push((i, p.as_str(), r.as_str()));
         }
-        Err(err) => return Err(err.into()),
-    };
-    let equal_cells: HashSet<usize> = cells
-        .iter()
-        .zip(verdicts)
-        .filter(|(_, equal)| *equal)
-        .map(|((i, ..), _)| *i)
-        .collect();
+    }
+    let mut equal_cells: HashSet<usize> = HashSet::new();
+    for (ty, cells) in &by_type {
+        let (persisted, recomputed): (Vec<&str>, Vec<&str>) =
+            cells.iter().map(|(_, p, r)| (*p, *r)).unzip();
+        let batch = client
+            .query(
+                &format!(
+                    "select coalesce(u.p::{ty} = u.r::{ty}, false) \
+                     from unnest($1::text[], $2::text[]) with ordinality as u(p, r, o) \
+                     order by u.o"
+                ),
+                &[&persisted, &recomputed],
+            )
+            .await;
+        let verdicts: Vec<bool> = match batch {
+            Ok(rows) => rows.iter().map(|row| row.get(0)).collect(),
+            // A type with no `=`: every cell of it is compared as text.
+            Err(err)
+                if err.code() == Some(&tokio_postgres::error::SqlState::UNDEFINED_FUNCTION) =>
+            {
+                continue;
+            }
+            // A text the type doesn't read: each cell on its own, so the
+            // others are still compared by value.
+            Err(err) if err.as_db_error().is_some() => {
+                let mut verdicts = Vec::with_capacity(cells.len());
+                for (_, p, r) in cells {
+                    let one = client
+                        .query_one(
+                            &format!("select coalesce($1::text::{ty} = $2::text::{ty}, false)"),
+                            &[p, r],
+                        )
+                        .await;
+                    verdicts.push(match one {
+                        Ok(row) => row.get(0),
+                        Err(err) if err.as_db_error().is_some() => false,
+                        Err(err) => return Err(err.into()),
+                    });
+                }
+                verdicts
+            }
+            Err(err) => return Err(err.into()),
+        };
+        equal_cells.extend(
+            cells
+                .iter()
+                .zip(verdicts)
+                .filter(|(_, equal)| *equal)
+                .map(|((i, ..), _)| *i),
+        );
+    }
     let mut i = 0;
     divergences.retain(|_| {
         let keep = !equal_cells.contains(&i);
@@ -789,6 +789,69 @@ mod tests {
         );
     }
 
+    /// An uncertain image's key is reported by the page's equal key's text:
+    /// an image keyed `1.250` covers the group the page reports as `1.25`,
+    /// so a divergence there is re-checked; a key the page doesn't hold
+    /// keeps its own text.
+    #[tokio::test]
+    async fn an_uncertain_images_key_names_the_pages_equal_key() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_empty_database().await;
+        let mut client = connect(db.dsn()).await;
+        client
+            .batch_execute(
+                "create table public.src (g numeric, n bigint); \
+                 create table public.tgt (g numeric, n bigint); \
+                 create table public.images (g numeric); \
+                 insert into public.src values (1.25, 1); \
+                 insert into public.tgt values (1.25, 1); \
+                 insert into public.images values (1.250), (7)",
+            )
+            .await
+            .expect("seed");
+        let keyset = Keyset::resolve_columns(&client, "public.tgt", &["g".to_string()])
+            .await
+            .expect("resolve the keyset");
+        let refs = keyset.refs(None);
+        let key = ddl::pk_key_sql_expr(keyset.columns(), None);
+        let carried = keyset.select_carried(&refs);
+        let order = keyset.order_by(&refs);
+        let side = |table: &str| {
+            keyset.side(&refs, |cond| {
+                format!(
+                    "select {key} as __k{carried}, array[n::text]::text[] as __v from {table} \
+                     where {cond} order by {order} limit $1"
+                )
+            })
+        };
+        let sql = keyset.ranked_by_value(
+            &format!(
+                "src as materialized ({}), vis as materialized ({}), \
+                 unc as (select {key} as __k{carried} from public.images), ",
+                side("public.src"),
+                side("public.tgt"),
+            ),
+            &[(1, "src"), (2, "vis")],
+            &[1, 2],
+            &format!(
+                " union all select 5, page.page_end, {}, null::text[] from unc, page",
+                keyset.named_key("unc", "unc.__k")
+            ),
+        );
+        let rows = Keyset::run(&mut client, &sql, 100, false)
+            .await
+            .unwrap_or_else(|e| panic!("{e:?}\n{sql}"));
+        let uncertain: BTreeSet<String> = rows
+            .iter()
+            .filter(|row| row.get::<_, i32>(0) == 5)
+            .map(|row| row.get(2))
+            .collect();
+        assert_eq!(
+            uncertain,
+            BTreeSet::from(["1.25".to_string(), "7".to_string()])
+        );
+    }
+
     fn cell(column: &str, persisted: &str, recomputed: &str) -> Divergence {
         Divergence::Cell {
             key: "1".to_string(),
@@ -836,5 +899,42 @@ mod tests {
             .await
             .expect("compare");
         assert_eq!(divergences, [cell("j", r#"{"a":1}"#, r#"{"a": 1}"#)]);
+
+        // A text its type doesn't read stays, and the type's other cells are
+        // still compared by value.
+        let mut divergences = vec![
+            cell("s", "1.5", "not a number"),
+            cell("s", "2.0", "2"),
+            cell("s", "3", "4"),
+        ];
+        drop_equal_values(&client, &types, &mut divergences)
+            .await
+            .expect("compare");
+        assert_eq!(
+            divergences,
+            [cell("s", "1.5", "not a number"), cell("s", "3", "4")]
+        );
+
+        // Thousands of cells: one statement for the type, in their order.
+        let mut divergences: Vec<Divergence> = (0..20_000)
+            .map(|i| {
+                if i % 2 == 0 {
+                    cell("s", &format!("{i}.5"), &format!("{i}.50"))
+                } else {
+                    cell("s", &format!("{i}"), &format!("{}", i + 1))
+                }
+            })
+            .collect();
+        drop_equal_values(&client, &types, &mut divergences)
+            .await
+            .expect("compare");
+        assert_eq!(divergences.len(), 10_000);
+        assert!(
+            divergences
+                .iter()
+                .enumerate()
+                .all(|(n, d)| *d == cell("s", &format!("{}", 2 * n + 1), &format!("{}", 2 * n + 2))),
+            "the unequal half, in order"
+        );
     }
 }
