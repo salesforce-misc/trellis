@@ -307,8 +307,9 @@ pub(super) async fn correct(
 /// none routes to the node) after the ring sealed the earlier pages'
 /// segment. The staging worker seals an empty segment only while its
 /// predecessor's slot holds rows that need a successor read (`staging::seal`'s
-/// idle and straggler seals), so on an idle ring it might never drain. Every row the correction staged committed before this
-/// check, so an empty active slot holds none of them, and when its
+/// idle and straggler seals), so on an idle ring it might never drain. Every
+/// row the correction staged committed before this check, so an empty active
+/// slot holds none of them, and when its
 /// predecessor holds no row its own fence left out (a straggler the active
 /// segment's read would claim, `staging::seal`'s phase-gap
 /// straggler), the segments before it are all there is to wait for. The

@@ -322,6 +322,36 @@ async fn an_empty_active_segment_with_an_undrained_fully_fenced_predecessor_does
     );
 }
 
+/// The straggler seal for a predecessor that isn't drained yet: an empty
+/// active segment seals when its sealed (not drained) predecessor's slot
+/// holds a row its own fence doesn't show, and the successor read claims it.
+/// The idle seal never sees this case (it needs a drained predecessor), so
+/// this is the test of `predecessor_has_unfenced_row`'s own scan.
+#[tokio::test]
+async fn an_empty_active_segment_seals_for_a_straggler_of_an_undrained_predecessor() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut sealer = connect_raw(db.dsn()).await;
+    insert_recompute(&sealer, "seg_0", "ordinary").await;
+    let outcome = seal::seal_phase1(&mut sealer).await.expect("seal phase 1");
+    seal::seal_phase2(&sealer, outcome.sealed_seg_seq, "wake")
+        .await
+        .expect("seal phase 2");
+
+    // Commits into segment 1's slot after S_1 was captured: invisible in S_1.
+    // Segment 1 stays `sealed`.
+    let straggler = connect_raw(db.dsn()).await;
+    insert_recompute(&straggler, "seg_0", "straggler").await;
+
+    let sealed = seal::seal_if_active_nonempty(&mut sealer, "wake")
+        .await
+        .expect("straggler seal")
+        .expect("an empty active segment seals for an undrained predecessor's straggler");
+    assert_eq!(sealed.sealed_seg_seq, 2);
+    assert_claimed_exactly_once(&sealer, &[1, 2], "ordinary").await;
+    assert_claimed_exactly_once(&sealer, &[1, 2], "straggler").await;
+}
+
 /// Marks `seg_seq` drained, standing in for the real apply-and-mark the way
 /// the tests above do.
 async fn mark_drained(client: &Client, seg_seq: i64) {

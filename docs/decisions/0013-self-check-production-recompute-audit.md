@@ -318,7 +318,9 @@ segment that finishes draining mid-statement is read or skipped on one snapshot.
 The page's ring reads are then bounded by the segment size, not by the rows a ring
 has applied and not yet retired. The convergence wait before each page asks the
 slot itself ([07](../staging-and-claiming/07-convergence-and-await.md), condition
-3), so it still reads a drained slot whole.
+3), so it still reads a drained slot whole. That cost lasts only while writes keep a
+drained segment resident: an idle ring retires its drained tail
+([06](../staging-and-claiming/06-cleanup-and-reclaim.md#retiring-a-batch)).
 
 ### Scope: every target; aggregate and JOIN targets detect, never repair
 
