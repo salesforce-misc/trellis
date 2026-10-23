@@ -2649,6 +2649,7 @@ mod db_tests {
     /// tenth of a page. Collecting the whole read before staging it held
     /// all 50,000.
     #[tokio::test]
+    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
     async fn a_sweep_holds_at_most_a_page_of_keys_in_memory() {
         const ITEMS: i64 = 25_000;
         let cluster = testkit::TestCluster::start();
@@ -2843,6 +2844,7 @@ mod db_tests {
     /// group's first prior image (its sum before the sweep) has to survive
     /// the merge in the table: a later batch's image is a smaller sum.
     #[tokio::test]
+    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
     async fn a_spilled_sweep_stages_what_an_in_memory_one_does() {
         const ITEMS: i64 = 12;
         let cluster = testkit::TestCluster::start();

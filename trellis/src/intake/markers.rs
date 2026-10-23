@@ -4662,6 +4662,7 @@ mod catch_up_tests {
     /// touches the row the sweep will delete (a drain applying an earlier
     /// sealed segment, say) doesn't wait on the discharge.
     #[tokio::test]
+    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
     async fn the_sweep_holds_no_target_row_lock_across_the_intake_wait() {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;

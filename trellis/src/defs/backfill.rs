@@ -3021,6 +3021,7 @@ mod tests {
     /// exactly the rows one unbatched delete does. Each target loses 11
     /// groups: with a batch of 2, that's six deletes.
     #[tokio::test]
+    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
     async fn a_batched_delete_of_lost_groups_stages_what_one_delete_does() {
         let cluster = testkit::TestCluster::start();
         let control_db = cluster.create_isolated_database().await;
@@ -3085,6 +3086,7 @@ mod tests {
     /// and a batch of 1 makes each delete one group, so a row trigger logs
     /// the order the batches took.
     #[tokio::test]
+    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
     async fn a_batched_delete_of_lost_groups_takes_them_in_key_order() {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;

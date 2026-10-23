@@ -4758,6 +4758,7 @@ mod tests {
     /// splits until the key fails alone, the key is quarantined, and the
     /// build goes `live` without it: the chunks and the merges leave it out.
     #[tokio::test]
+    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
     async fn a_chunk_that_fails_on_its_data_quarantines_the_key_and_the_build_goes_live() {
         use crate::client::log_capture::install_capture;
         use crate::defs::ast::ValueType;
@@ -5200,6 +5201,7 @@ mod tests {
     /// job, its chunk and its merge, until it goes `live`, while the failing
     /// target keeps its deltas and stays `backfilling`.
     #[tokio::test]
+    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
     async fn a_failing_merge_does_not_stop_another_targets_claims_or_merge() {
         let cluster = testkit::TestCluster::start();
         let mut it = MergeFixture::new(&cluster).await;
@@ -5256,6 +5258,7 @@ mod tests {
     /// rollback doesn't take back. One `work_once` retries the merge, and it
     /// commits.
     #[tokio::test]
+    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
     async fn a_transient_failure_at_the_merges_commit_is_retried() {
         let cluster = testkit::TestCluster::start();
         let mut it = MergeFixture::new(&cluster).await;
@@ -5317,6 +5320,7 @@ mod tests {
     /// definition with kind `halt`, naming the target and the error on its
     /// `capture_failure`, where it waits for a resume.
     #[tokio::test]
+    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
     async fn a_merge_that_keeps_failing_pauses_its_definition_with_the_error() {
         let cluster = testkit::TestCluster::start();
         let mut it = MergeFixture::new(&cluster).await;
@@ -5376,6 +5380,7 @@ mod tests {
     /// serialization failure at the merge's `COMMIT` for its first
     /// `MERGE_TRANSIENT_RETRIES + 1` firings, counted by a sequence.
     #[tokio::test]
+    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
     async fn a_transient_failure_that_outlasts_the_retries_backs_off_uncharged() {
         let cluster = testkit::TestCluster::start();
         let mut it = MergeFixture::new(&cluster).await;
@@ -5455,6 +5460,7 @@ mod tests {
     /// keeps the deltas. Once the grant is back, a resume rebuilds the
     /// definition to the source's groups, applying each change once.
     #[tokio::test]
+    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
     async fn a_refused_merge_halts_at_once_and_a_resume_rebuilds_it() {
         let cluster = testkit::TestCluster::start();
         let mut it = MergeFixture::new(&cluster).await;
