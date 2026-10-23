@@ -357,9 +357,9 @@ table's. A change to Trellis's schema isn't detected.
 * **A `JOIN` target:** `PAUSE`/`RESUME` repairs the target's rows and every
   `join_<id>_*` table: the resume recreates the hidden tables, rebuilds them
   from both sources and keeps the target, removing a row no source row backs.
-  `request_backfill` of either source repairs the target's rows and the
-  per-side partials that disagree with the sources, but not a hand edit of
-  `join_<id>_t` or `join_<id>_j`, which only change by delta.
+  So does `PAUSE`, `DROP TRANSFORM` and define it again. `request_backfill`
+  of either source repairs target rows edited by hand, but not a hand edit
+  of a `join_<id>_*` table.
 * **Trellis's schema:** restore the whole database from a backup taken
   before the change, or `PAUSE`, `DROP TRANSFORM` and define every transform
   again. A target the changed catalog has no definition for is a plain table

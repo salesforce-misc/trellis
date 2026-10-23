@@ -115,6 +115,8 @@ in place. It keeps:
 * an aggregate's group rows edited by hand, and a `MIN` or `MAX` over a
   re-collated column: the rebuild keeps the per-row ledger, with its
   collations, and adds only differences to the groups.
+* a hand edit of a `JOIN`'s hidden tables, which a `PAUSE` and `RESUME`
+  recreates.
 
 `PAUSE`, `DROP TRANSFORM` and define it again repairs each
 ([known correctness gaps](known-correctness-gaps.md): [Rows written into a target, a hidden table or Trellis's schema](known-correctness-gaps.md#rows-written-into-a-target-a-hidden-table-or-trelliss-schema),

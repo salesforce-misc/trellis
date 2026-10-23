@@ -34,6 +34,7 @@ use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ValueType;
 use trellis::integer::IntWidth;
 use trellis::staging::interleave::PausePoint;
+use trellis::{JoinBuildStep, JoinSide, JoinSidePart};
 
 const DDL: &str = "create table public.a (id integer primary key, ga integer, t integer, \
                        k integer, x integer); \
@@ -1934,49 +1935,6 @@ async fn a_partitioned_side_with_no_rows_builds_whole() {
     lab.assert_built("a partitioned side with no rows").await;
 }
 
-/// A side that is another transform's target (whose feed is #1100's) fails
-/// the build and pauses the definition.
-#[tokio::test]
-async fn the_knob_refuses_a_join_over_a_target() {
-    trellis::dev::staging::set_group_basis(true);
-    let d = Driver::start(
-        DDL,
-        &[
-            ("id", int4()),
-            ("t", int4()),
-            ("k", int4()),
-            ("gb", int4()),
-            ("y", int4()),
-        ],
-        &["TRANSFORM c FROM public.b SELECT t AS t, k AS k, gb AS gb, y AS y"],
-        &["public.a", "public.b"],
-    )
-    .await;
-    trellis::defs::install_definition(
-        d.pool(),
-        "TRANSFORM l FROM public.a LEFT JOIN public.c ON a.k = c.k GROUP BY c.gb WITHOUT SOURCE INDEX \
-         SELECT c.gb AS gb, COUNT(*) AS n",
-        &[("id".to_string(), int4()), ("k".to_string(), int4())].into(),
-        "public",
-    )
-    .await
-    .expect("define");
-    trellis::intake::markers::settle_registrations(d.pool()).await;
-    assert_eq!(
-        d.rows("select status::text from transform_definitions where target_table = 'public.l'")
-            .await,
-        ["(paused)"],
-        "the build fails on a side that is a target"
-    );
-    let error = d
-        .rows("select string_agg(last_error, ' | ') from backfill_chunks")
-        .await;
-    assert!(
-        error.len() == 1 && error[0].contains("another definition's target"),
-        "{error:?}"
-    );
-}
-
 /// Each changed `T` group reaches the target-mutation seam with its prior
 /// image, so a transform reading the `JOIN` target follows it: a group
 /// written, changed, moved and deleted. (An `INNER` join, whose groups here
@@ -3747,11 +3705,190 @@ async fn a_leaf_without_a_constraint_text_halts_a_join_build() {
              'null'::jsonb)",
     )
     .await;
+    assert_eq!(
+        lab.building().await,
+        side_step(JoinSide::From, JoinSidePart::Unroutable),
+        "status() names the side the build can't route"
+    );
     lab.build().await;
     let error = lab.d.rows("select last_error from backfill_chunks").await;
     assert!(
         error.len() == 1 && error[0].contains("no usable constraint text"),
         "{error:?}"
+    );
+}
+
+// ------------------------------------------- the side under build (#1112)
+
+impl Lab {
+    /// What `status()` reports of the definition's build
+    /// (`JoinStatus::building`). Bounded: the read must not wait on a build
+    /// that is frozen with a step's transaction open.
+    async fn building(&self) -> Option<JoinBuildStep> {
+        let trellis = trellis::Trellis::connect(
+            trellis::Config::from_dsn(self.d.db.dsn().to_string()).expect("valid dsn"),
+            trellis::TrellisOptions::default(),
+        )
+        .await
+        .expect("connect a Trellis");
+        tokio::time::timeout(Duration::from_secs(30), trellis.status(self.kinds[0].name))
+            .await
+            .expect("status() never waits on the build")
+            .expect("status")
+            .expect("the definition exists")
+            .join
+            .expect("a JOIN reports its join status")
+            .building
+    }
+}
+
+fn side_step(side: JoinSide, part: JoinSidePart) -> Option<JoinBuildStep> {
+    Some(JoinBuildStep::Side { side, part })
+}
+
+fn leaf(name: &str) -> JoinSidePart {
+    JoinSidePart::Leaf(format!("public.{name}"))
+}
+
+/// The steps a build with these partitioned sides runs, in order, as
+/// `status()` names them: unpartitioned sides whole, each partitioned side's
+/// leaves in oid order (`*0`, `*1`, `*2` were created in that order) and its
+/// remainder, then the final `T` step.
+fn expected_steps(a: bool, b: bool) -> Vec<Option<JoinBuildStep>> {
+    use JoinSide::{From, Joined};
+    let mut steps = Vec::new();
+    if !a {
+        steps.push(side_step(From, JoinSidePart::Whole));
+    }
+    if !b {
+        steps.push(side_step(Joined, JoinSidePart::Whole));
+    }
+    for (partitioned, side, table) in [(a, From, "a"), (b, Joined, "b")] {
+        if partitioned {
+            for n in 0..3 {
+                steps.push(side_step(side, leaf(&format!("{table}{n}"))));
+            }
+            steps.push(side_step(side, JoinSidePart::Remainder));
+        }
+    }
+    steps.push(Some(JoinBuildStep::Final));
+    steps
+}
+
+/// `status()` reports the step a partitioned `JOIN`'s build runs next, read
+/// while the job is frozen between two steps: each side and leaf in turn,
+/// then the final step, read again while that step's transaction is open;
+/// `None` once the build is done. For a fresh build, a `RESUME` and a rebuild
+/// in place.
+async fn side_under_build_case(a: bool, b: bool, mode: Mode) {
+    let context = format!("a partitioned {a}, b partitioned {b}, {mode:?}");
+    let mut lab = seeded_in(&partitioned_ddl(a, b), Key::Pair, &[L], PARTITIONED_SEED).await;
+    let job = prepare(&mut lab, mode).await;
+    let steps = expected_steps(a, b);
+    assert_eq!(lab.building().await, steps[0], "{context}: queued");
+    for (done, next) in steps.iter().skip(1).enumerate() {
+        let building = lab.next_step(job).await;
+        assert_eq!(
+            lab.building().await,
+            *next,
+            "{context}: after step {done}, cursor {}",
+            lab.cursor().await
+        );
+        lab.abandon(building).await;
+    }
+    let mut building = lab
+        .build_frozen(job, &[PausePoint::BeforeRebuildCommit])
+        .await;
+    building.reached(PausePoint::BeforeRebuildCommit).await;
+    assert_eq!(
+        lab.building().await,
+        Some(JoinBuildStep::Final),
+        "{context}: the final step's transaction is open"
+    );
+    lab.d
+        .release(&mut building, PausePoint::BeforeRebuildCommit)
+        .await;
+    building.finish().await;
+    lab.assert_built(&context).await;
+    assert_eq!(lab.building().await, None, "{context}: built");
+    lab.check(&context).await;
+}
+
+#[tokio::test]
+async fn status_reports_the_side_under_build_of_a_partitioned_from_side() {
+    for mode in [Mode::Fresh, Mode::Resume, Mode::InPlace] {
+        side_under_build_case(true, false, mode).await;
+    }
+}
+
+#[tokio::test]
+async fn status_reports_the_side_under_build_of_a_partitioned_joined_side() {
+    side_under_build_case(false, true, Mode::Fresh).await;
+    side_under_build_case(false, true, Mode::InPlace).await;
+}
+
+#[tokio::test]
+async fn status_reports_the_side_under_build_of_two_partitioned_sides() {
+    side_under_build_case(true, true, Mode::Resume).await;
+}
+
+/// A `JOIN` with no partitioned side builds in one transaction: `status()`
+/// reports `Whole` while the job is queued and while its transaction is
+/// open, and `None` once it committed. A fresh build and a rebuild in place.
+#[tokio::test]
+async fn status_reports_an_unpartitioned_join_build_as_whole() {
+    for job in ["plan", "sweep"] {
+        let lab = seeded(Key::Single, &[L], BUILD_SEED).await;
+        if job == "sweep" {
+            lab.build().await;
+            assert_eq!(lab.building().await, None, "built");
+            request_rebuild(&lab, "a").await;
+        }
+        assert_eq!(lab.building().await, Some(JoinBuildStep::Whole), "{job}");
+        let mut building = lab
+            .build_frozen(job, &[PausePoint::BeforeRebuildCommit])
+            .await;
+        building.reached(PausePoint::BeforeRebuildCommit).await;
+        assert_eq!(
+            lab.building().await,
+            Some(JoinBuildStep::Whole),
+            "{job}: its transaction is open"
+        );
+        lab.d
+            .release(&mut building, PausePoint::BeforeRebuildCommit)
+            .await;
+        building.finish().await;
+        lab.assert_built(job).await;
+        assert_eq!(lab.building().await, None, "{job}: built");
+    }
+}
+
+/// A paused `JOIN` reports no build, though its build's job is still queued
+/// with its cursor: no worker is handed the job while it is paused, and its
+/// `RESUME` discards it and reports the new build from its first step.
+#[tokio::test]
+async fn status_reports_no_build_while_a_join_is_paused() {
+    let mut lab = seeded_in(
+        &partitioned_ddl(true, false),
+        Key::Pair,
+        &[L],
+        PARTITIONED_SEED,
+    )
+    .await;
+    let job = prepare(&mut lab, Mode::Fresh).await;
+    lab.run_steps(job, 2).await;
+    assert_eq!(lab.building().await, side_step(JoinSide::From, leaf("a1")));
+    pause(&lab, L).await;
+    assert!(
+        lab.cursor().await.starts_with("from:"),
+        "the paused job keeps its cursor"
+    );
+    assert_eq!(lab.building().await, None, "paused");
+    resume(&lab, L).await;
+    assert_eq!(
+        lab.building().await,
+        side_step(JoinSide::Joined, JoinSidePart::Whole),
+        "the resume's build starts over"
     );
 }
 

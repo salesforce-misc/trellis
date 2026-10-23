@@ -36,8 +36,9 @@
 //! `backfilling`. A `drain_seg` that is still the active segment and empty,
 //! with no straggler of the one before, holds none of them (the last page
 //! staged nothing after the ring sealed the earlier pages'), so only the
-//! segments before it are waited for: the staging worker never seals an
-//! empty segment, and an idle ring would otherwise never let it finish.
+//! segments before it are waited for: the staging worker seals an empty
+//! segment only while its predecessor's slot holds rows that need a
+//! successor read, so an idle ring would otherwise never let it finish.
 //!
 //! # Routing
 //!
@@ -304,9 +305,11 @@ pub(super) async fn correct(
 /// `drain_seg` can still be the active segment with nothing in it: the last
 /// page staged nothing (the parents filled the pages before it exactly, or
 /// none routes to the node) after the ring sealed the earlier pages'
-/// segment. The staging worker seals no empty segment, so on an idle ring it
-/// would never drain. Every row the correction staged committed before this
-/// check, so an empty active slot holds none of them, and when its
+/// segment. The staging worker seals an empty segment only while its
+/// predecessor's slot holds rows that need a successor read (`staging::seal`'s
+/// idle and straggler seals), so on an idle ring it might never drain. Every
+/// row the correction staged committed before this check, so an empty active
+/// slot holds none of them, and when its
 /// predecessor holds no row its own fence left out (a straggler the active
 /// segment's read would claim, `staging::seal`'s phase-gap
 /// straggler), the segments before it are all there is to wait for. The

@@ -980,6 +980,7 @@ impl Trellis {
                         self.config.schema(),
                         row.get(1),
                         row.get("source_table"),
+                        row.get::<_, Option<String>>("join_table").as_deref(),
                         &def,
                     )
                     .await?;
@@ -2217,7 +2218,8 @@ pub struct DefinitionStatus {
     /// other target, and when the indexes exist.
     pub source_index_gaps: Vec<SourceIndexGap>,
     /// What a `JOIN` transform's hidden tables look like now (#1112): their
-    /// sizes, and a warning when `P` approaches the fact table's size. `None` for a
+    /// sizes, a warning when `P` approaches the fact table's size, and the step
+    /// its build runs while one is under way. `None` for a
     /// definition that isn't a `JOIN`. Read live on each call; a warning
     /// only, it never changes the definition's status.
     pub join: Option<JoinStatus>,

@@ -15,10 +15,10 @@
 //! pages of 10 000 keys, each part timed apart, and reports the rows read
 //! from the hidden table and the source of each (sequential tuples plus index
 //! fetches) per page. `--hidden-only-old` is not a flag: run it on a commit.
-//! It also reports the ring rows read while nothing runs (the maintenance
+//! It also reports the ring rows read in the background (the maintenance
 //! loop's own reads) and by one convergence check. `--write-rate N` updates N
-//! rows of `a` a second while the parts are walked, and reports the pages
-//! that did not end `Converged`.
+//! rows of `a` a second from before those two are measured until the parts
+//! are walked, and reports the pages that did not end `Converged`.
 //!
 //! `--probe-pages K` (1-1 only) instead times K single pages of today's
 //! statement shape directly (the source side's keyset read and the target
@@ -462,36 +462,6 @@ async fn run_join(cfg: Config, tuning: &EngineTuning) {
         }
     };
     report_ring(&raw).await;
-    // What the convergence wait of each page reads from the ring, apart from
-    // the page's own statement: the walk's ring reads include it.
-    {
-        let token: tokio_postgres::types::PgLsn = raw
-            .query_one("select pg_current_wal_lsn()", &[])
-            .await
-            .expect("wal lsn")
-            .get(0);
-        let conn = db.pool.get().await.expect("a connection");
-        let idle_from = rows_read("ring".to_string()).await;
-        let before = rows_read("ring".to_string()).await;
-        // `rows_read` waits 6 s before it reads: the maintenance loop's own
-        // reads over that span, apart from any check.
-        let idle = (before - idle_from) as f64 / 6.0;
-        let t = Instant::now();
-        const CALLS: i64 = 200;
-        for _ in 0..CALLS {
-            trellis::dev::staging::converged_through(&**conn, token)
-                .await
-                .expect("converged_through");
-        }
-        let calls_secs = t.elapsed().as_secs_f64();
-        let after = rows_read("ring".to_string()).await;
-        let span = calls_secs + 6.0;
-        let per_call = ((after - before) as f64 - idle * span) / CALLS as f64;
-        eprintln!(
-            "idle: {idle:.0} ring rows read per second; convergence check: about {per_call:.0} \
-             ring rows read per call ({CALLS} calls in {calls_secs:.1}s)"
-        );
-    }
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let writer = (cfg.write_rate > 0).then(|| {
         let (stop, dsn, rows) = (stop.clone(), db.dsn().to_string(), cfg.rows);
@@ -515,6 +485,38 @@ async fn run_join(cfg: Config, tuning: &EngineTuning) {
             written
         })
     });
+    // What the convergence wait of each page reads from the ring, apart from
+    // the page's own statement: the walk's ring reads include it.
+    {
+        let token: tokio_postgres::types::PgLsn = raw
+            .query_one("select pg_current_wal_lsn()", &[])
+            .await
+            .expect("wal lsn")
+            .get(0);
+        let conn = db.pool.get().await.expect("a connection");
+        let idle_from = rows_read("ring".to_string()).await;
+        let before = rows_read("ring".to_string()).await;
+        // `rows_read` waits 6 s before it reads: the maintenance loop's own
+        // reads over that span (and the drain's, under `--write-rate`), apart
+        // from any check.
+        let idle = (before - idle_from) as f64 / 6.0;
+        let t = Instant::now();
+        const CALLS: i64 = 200;
+        for _ in 0..CALLS {
+            trellis::dev::staging::converged_through(&**conn, token)
+                .await
+                .expect("converged_through");
+        }
+        let calls_secs = t.elapsed().as_secs_f64();
+        let after = rows_read("ring".to_string()).await;
+        let span = calls_secs + 6.0;
+        let per_call = ((after - before) as f64 - idle * span) / CALLS as f64;
+        eprintln!(
+            "background (write rate {}/s): {idle:.0} ring rows read per second; convergence \
+             check: about {per_call:.0} ring rows read per call ({CALLS} calls in {calls_secs:.1}s)",
+            cfg.write_rate
+        );
+    }
     for (part, hidden, source, next) in [
         ("p", format!("join_{id}_p"), "a", "m"),
         ("m", format!("join_{id}_m"), "b", "j"),

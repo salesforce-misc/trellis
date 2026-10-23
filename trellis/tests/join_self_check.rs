@@ -3,10 +3,9 @@
 //! definition's own `JOIN … GROUP BY`, and the hidden `P`, `M`, `J` and `T`
 //! against what the two tables say they hold. A planted divergence in each is
 //! reported on that table alone, and gone once the planted damage is undone
-//! by hand (the repair for real damage is `request_backfill`, whose rebuild
-//! `join_interleavings.rs` tests; the last tests here run the loop, check,
-//! repair, check, for `P`/`M` by `request_backfill` and for `J`/`T` by
-//! `PAUSE`/`RESUME`). One test here checks the `J` lock-wait
+//! by hand. The last tests here run the loop, check, repair, check: writes
+//! capture missed repaired by `request_backfill`, hand edits of `J`/`T` by
+//! `PAUSE`/`RESUME`. One test here checks the `J` lock-wait
 //! histogram a page records (#1112 J7b), since it needs the same knob-on
 //! driver.
 //!

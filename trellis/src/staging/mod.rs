@@ -137,7 +137,9 @@ pub use seal::{SealConfig, recover_stuck_seals, seal_if_active_nonempty};
 // be unused.
 pub use capture_audit::CaptureFault;
 pub use holdup::DrainFailure;
-pub use join_status::{HiddenTableSize, JoinStatus, PartialsWarning};
+pub use join_status::{
+    HiddenTableSize, JoinBuildStep, JoinSide, JoinSidePart, JoinStatus, PartialsWarning,
+};
 pub use partition_correction::CorrectingNode;
 pub use quarantine::HeldKeys;
 pub use self_check::{Divergence, SelfCheckMode, SelfCheckOutcome};

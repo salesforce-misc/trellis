@@ -194,8 +194,8 @@
 //!
 //! The last two count only while the group-basis dev knob is on
 //! (`super::group_basis`'s "The knob"): until it is the default, no
-//! aggregate is on the group basis, and the `JOIN` apply (#1108) builds on
-//! it.
+//! aggregate is on the group basis, and a `JOIN` never applies. A `JOIN`
+//! side consumes the images as it consumes captured ones (`super::join`).
 //!
 //! A target with any of them ([`TargetInfo::image_feed`]) stages each
 //! changed key as a [`StagedChange::Cdc`] row rather than a `Recompute`:

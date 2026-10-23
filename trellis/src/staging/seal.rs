@@ -417,22 +417,29 @@ pub async fn seal_phase2(
     Ok(())
 }
 
-/// Whether `predecessor_seg_seq`'s own physical ring table still holds a row
-/// that was never visible in its own already-published fence — a genuine
-/// **phase-gap straggler** (docs/staging-and-claiming/03-sealing-and-the-fence.md,
-/// "The scoping bug worth knowing about"/"The `xmax` trap"): a writer that
-/// resolved the pointer as `predecessor_seg_seq` but committed into its slot
-/// only *after* that segment's own fence (`S_k`) was captured. By
-/// construction such a row can never become visible in `S_k` — that fence is
-/// immutable once published (`seal_phase2`'s doc comment) — so the *only*
-/// thing that can ever fold it in is the immediate successor's own fenced
-/// read, via [`fenced_window`]'s predecessor-half union clause. That read
-/// only ever runs once the successor itself gets sealed. Returns `false`
-/// (nothing to catch) for a genesis segment, an already-retired predecessor,
-/// or one still mid-crash-window (no fence published yet — a separate,
-/// already-tracked stall `recover_stuck_seals` owns) — none of those are
-/// this function's job to resolve.
-async fn predecessor_has_unfenced_row(
+/// Whether an **empty** active segment must seal anyway, because of what its
+/// immediate predecessor (`predecessor_seg_seq`) leaves in its ring slot.
+/// Two cases, both answered by asking the slot itself, never by trusting the
+/// fence invariant (docs/staging-and-claiming/07-convergence-and-await.md):
+///
+/// - **The idle seal.** The predecessor is `drained` and its slot still holds
+///   any row (`exists (select 1 from seg_N)`, which stops at the first row).
+///   A drained segment retires only once its successor has sealed and drained
+///   ([`super::retire`]'s conditions 1 and 3), so without this seal an idle
+///   ring keeps its last batch resident, and every reader that asks the slot
+///   (this check's straggler scan each tick, `converge`'s condition 3) reads
+///   it whole, indefinitely. Sealing the empty active segment lets it drain
+///   and the predecessor retire, freeing the slot. A straggler in the slot
+///   needs no separate scan here: the seal's successor read
+///   ([`fenced_window`]'s predecessor half) folds it exactly as the straggler
+///   seal does. Self-limiting: the next active segment's predecessor is the
+///   empty segment just sealed, whose slot holds a row only if a write landed
+///   in it, so a quiet ring seals one empty segment and then stops.
+/// - **The straggler seal** ([`predecessor_has_unfenced_row`]), for a
+///   predecessor that isn't drained yet.
+///
+/// Returns `false` for a genesis segment and an already-retired predecessor.
+async fn empty_active_segment_needs_seal(
     client: &impl GenericClient,
     predecessor_seg_seq: i64,
 ) -> Result<bool, StagingError> {
@@ -441,7 +448,8 @@ async fn predecessor_has_unfenced_row(
     }
     let Some(row) = client
         .query_opt(
-            "select ring_slot, fence_snapshot::text from segments where seg_seq = $1",
+            "select ring_slot, state = 'drained', fence_snapshot::text \
+             from segments where seg_seq = $1",
             &[&predecessor_seg_seq],
         )
         .await?
@@ -449,11 +457,42 @@ async fn predecessor_has_unfenced_row(
         return Ok(false);
     };
     let ring_slot: i16 = row.get(0);
-    let fence: Option<String> = row.get(1);
+    let drained: bool = row.get(1);
+    let fence: Option<String> = row.get(2);
+    let table = ring_table_name(ring_slot)?;
+    if drained {
+        // An empty drained slot holds no straggler either, so this one
+        // `exists` answers both cases.
+        let holds_row: bool = client
+            .query_typed_one(&format!("select exists (select 1 from {table})"), &[])
+            .await?
+            .get(0);
+        return Ok(holds_row);
+    }
+    predecessor_has_unfenced_row(client, table, fence).await
+}
+
+/// Whether a not-yet-drained predecessor's ring table (`table`) still holds
+/// a row that was never visible in its own already-published fence — a
+/// genuine **phase-gap straggler** (docs/staging-and-claiming/03-sealing-and-the-fence.md,
+/// "The phase-gap straggler"/"The `xmax` trap"): a writer that resolved the
+/// pointer as the predecessor but committed into its slot only *after* that
+/// segment's own fence (`S_k`) was captured. By construction such a row can
+/// never become visible in `S_k` — that fence is immutable once published
+/// (`seal_phase2`'s doc comment) — so the *only* thing that can ever fold it
+/// in is the immediate successor's own fenced read, via [`fenced_window`]'s
+/// predecessor-half union clause. That read only ever runs once the
+/// successor itself gets sealed. Returns `false` for a predecessor still
+/// mid-crash-window (no fence published yet — a separate, already-tracked
+/// stall `recover_stuck_seals` owns).
+async fn predecessor_has_unfenced_row(
+    client: &impl GenericClient,
+    table: &str,
+    fence: Option<String>,
+) -> Result<bool, StagingError> {
     let Some(fence) = fence else {
         return Ok(false);
     };
-    let table = ring_table_name(ring_slot)?;
     let exists: bool = client
         .query_typed_one(
             &format!(
@@ -469,25 +508,19 @@ async fn predecessor_has_unfenced_row(
 
 /// Seal-on-demand (docs/staging-and-claiming/03-sealing-and-the-fence.md,
 /// "Who seals, and when"): seals the active segment if it's non-empty — the
-/// busy-loop guard — **or** if it's empty but its immediate predecessor is
-/// still stranding an unfenced phase-gap straggler ([`predecessor_has_unfenced_row`]):
-/// without this second case, a predecessor's straggler that lands right as
-/// the ring goes quiet (no further real traffic to seal the successor on its
-/// own account) is stranded forever — the predecessor already reports
-/// `state = 'drained'`, which `converge::converged_through`'s condition 3 no
-/// longer treats as pending, so nothing ever revisits it, and the straggler
-/// is silently never applied to any target (issue found via the generative
-/// suite's client-restart/scale-out lifecycle properties: both simply
-/// perturb timing enough to make this always-latent race common, though the
-/// race itself has nothing to do with a client joining or leaving — see
-/// `generative/tests/client_lifecycle.rs`'s doc comments for the full
-/// writeup). This still seals **at most one** segment per call, and the
-/// second case is self-limiting: it only ever fires while the *current*
-/// active segment's immediate predecessor genuinely has an unfenced row, so
-/// once that row is folded in by this seal's own successor read, the next
-/// active segment's own (different, now-fully-fenced) predecessor no longer
-/// qualifies and this stops recursing — it does not degrade into resealing
-/// empty segments forever on a truly idle ring.
+/// busy-loop guard — **or** if it's empty but its immediate predecessor's
+/// slot needs a successor read ([`empty_active_segment_needs_seal`]): a
+/// drained predecessor whose slot still holds rows (the idle seal, which
+/// lets an idle ring retire its last batch), or a not-yet-drained one
+/// stranding an unfenced phase-gap straggler (which only the successor's
+/// fenced read can ever fold; without it, a straggler that lands right as
+/// the ring goes quiet is never applied — found via the generative suite's
+/// client-restart/scale-out lifecycle properties, see
+/// `generative/tests/client_lifecycle.rs`). This seals **at most one**
+/// segment per call, and both empty-segment cases are self-limiting: after
+/// the seal, the new active segment's predecessor is the empty segment just
+/// sealed, so a quiet ring seals once and stops rather than resealing empty
+/// segments forever.
 ///
 /// A `RingFull` guard is answered with exactly one retirement pass
 /// ([`super::retire::retire_drained_segments`], stage 06) plus one retry, per
@@ -511,7 +544,7 @@ pub async fn seal_if_active_nonempty(
     wake_channel: &str,
 ) -> Result<Option<SealOutcome>, StagingError> {
     let (active_seq, nonempty) = active_pointer_and_nonempty(client).await?;
-    if !nonempty && !predecessor_has_unfenced_row(client, active_seq - 1).await? {
+    if !nonempty && !empty_active_segment_needs_seal(client, active_seq - 1).await? {
         return Ok(None);
     }
 

@@ -205,8 +205,9 @@
 //!
 //! # Seam-fed sources (F6)
 //!
-//! A source that is another definition's target is never captured: its
-//! writes reach Apply through the target-mutation seam
+//! A source that is another definition's target (or a `JOIN`'s joined table
+//! that is one) is never captured: its writes reach Apply through the
+//! target-mutation seam
 //! (`super::target_mutations`), whose writer reads the list of applying
 //! definitions inside its own apply transaction. A writer that read it before
 //! this build's start committed doesn't stage its rows for the definition, and
@@ -216,7 +217,9 @@
 //! the start commit, so every change a page holds without the definition was
 //! committed before the start and is in every chunk's snapshot.)
 //!
-//! So the build of a seam-fed source is fenced, once per build. The plan
+//! So the build of a seam-fed source is fenced, once per build ([`run_plan`];
+//! a group-basis aggregate's or a `JOIN`'s one-transaction build runs after
+//! the fence, in the plan job). The plan
 //! job's first act is to take a fence: the id of a transaction that began
 //! after the start commit (`intake::markers`' `confirm_fence`, #431's rule),
 //! recorded on the plan row (`backfill_chunks.fence_xid`). It enqueues no
@@ -3170,10 +3173,33 @@ async fn run_plan(
             }
         }
     }
+    // A seam-fed source's build waits for its fence before the walk, so
+    // before any chunk (F6). A `JOIN` waits for it when either side is
+    // another definition's target, before its one transaction: a writer of
+    // that target that resolved its feed before the `JOIN` applied staged
+    // nothing for it, and the build's `GROUP BY` must see its row.
+    if chunk.fields.is_none()
+        && cursor.is_none()
+        && reads_a_target(&**pool.get().await?, &definition).await?
+    {
+        match fence_settled(pool, chunk, claimed_by).await? {
+            FenceState::Settled => {}
+            FenceState::Pending(fence) => {
+                crate::instance_log::debug!(
+                    definition_id = chunk.definition_id,
+                    fence_xid = fence,
+                    "re-derive build waits for its fence before planning a chunk"
+                );
+                return defer_claim(pool, chunk, claimed_by, FENCE_RETRY).await;
+            }
+            FenceState::Superseded => {
+                return chunk_queue::discard_if_superseded(pool, chunk, claimed_by).await;
+            }
+        }
+    }
     // A `JOIN`'s fresh build or resume is its whole build (#1109, ADR-0019):
     // both structures in one transaction, never a walk of the primary key.
-    // Neither side is seam-fed (a side that is another definition's target is
-    // refused), so there is no fence to wait for.
+    // It runs after the seam fence above, as a plain aggregate's does.
     if super::join::applies(&definition.def) {
         if chunk.fields.is_some() {
             return Err(build_error(ApplyError::GroupBasisUnsupported {
@@ -3194,27 +3220,6 @@ async fn run_plan(
             ReadersOnCommit::Park,
         )
         .await;
-    }
-    // A seam-fed source's build waits for its fence before the walk, so
-    // before any chunk (F6).
-    if chunk.fields.is_none()
-        && cursor.is_none()
-        && catalog::is_definition_target(&**pool.get().await?, &definition.source_table).await?
-    {
-        match fence_settled(pool, chunk, claimed_by).await? {
-            FenceState::Settled => {}
-            FenceState::Pending(fence) => {
-                crate::instance_log::debug!(
-                    definition_id = chunk.definition_id,
-                    fence_xid = fence,
-                    "re-derive build waits for its fence before planning a chunk"
-                );
-                return defer_claim(pool, chunk, claimed_by, FENCE_RETRY).await;
-            }
-            FenceState::Superseded => {
-                return chunk_queue::discard_if_superseded(pool, chunk, claimed_by).await;
-            }
-        }
     }
     // A plain group-basis aggregate's fresh build or resume is its whole
     // build: one absolute write of every group, as a rebuild of a live
@@ -3454,12 +3459,6 @@ async fn run_group_rebuild_held(
 ) -> Result<(), ChunkQueueError> {
     let mut client = pool.get().await?;
     if super::join::applies(&definition.def) {
-        if let Some(what) = join_build_refusal(&**client, definition).await? {
-            return Err(build_error(ApplyError::GroupBasisUnsupported {
-                target: definition.target_table.clone(),
-                what,
-            }));
-        }
         let partitioned = join_partitioned_sides(&**client, definition).await?;
         if !partitioned.is_empty() {
             drop(client);
@@ -3601,26 +3600,22 @@ async fn run_group_rebuild_held(
     Ok(())
 }
 
-/// Why a `JOIN`'s build ([`run_group_rebuild_held`]) can't run, if it can't
-/// (#1109): the reason becomes the definition's halting failure.
-///
-/// - **A side that is another definition's target.** The target feed isn't
-///   wired into the build; when it is, the seam fence of [`run_plan`] must
-///   test both tables, not only the `FROM` one.
-async fn join_build_refusal(
+/// Whether `definition` reads another definition's target: its source, or a
+/// `JOIN`'s joined table. Such a table is fed by the target-mutation seam,
+/// so a fresh build or a resume waits on its fence ([`fence_settled`]).
+async fn reads_a_target(
     client: &impl GenericClient,
     definition: &Definition,
-) -> Result<Option<&'static str>, ChunkQueueError> {
-    let mut tables = vec![definition.source_table.clone()];
-    tables.extend(catalog::join_table_of(client, definition.id).await?);
-    for table in &tables {
-        if catalog::is_definition_target(client, table).await? {
-            return Ok(Some(
-                "a JOIN side that is another definition's target (the target feed is #1100's)",
-            ));
-        }
+) -> Result<bool, ChunkQueueError> {
+    if catalog::is_definition_target(client, &definition.source_table).await? {
+        return Ok(true);
     }
-    Ok(None)
+    if super::join::applies(&definition.def)
+        && let Some(joined) = catalog::join_table_of(client, definition.id).await?
+    {
+        return Ok(catalog::is_definition_target(client, &joined).await?);
+    }
+    Ok(false)
 }
 
 /// The sides of a `JOIN` that are a partitioned root with rows, `FROM` side
@@ -3639,24 +3634,96 @@ async fn join_partitioned_sides(
     );
     let mut partitioned = Vec::new();
     for (side, table) in sides {
-        if !crate::defs::partition_tree::is_partitioned_root(client, &table).await? {
-            continue;
-        }
-        let has_rows: bool = client
-            .query_one(
-                &format!(
-                    "select exists (select 1 from {})",
-                    ddl::qualified_source_table(&table)
-                ),
-                &[],
-            )
-            .await?
-            .get(0);
-        if has_rows {
+        if builds_per_leaf(client, &table).await? {
             partitioned.push((side, table));
         }
     }
     Ok(partitioned)
+}
+
+/// Whether a `JOIN` side `table` builds per leaf: a partitioned root with
+/// rows ([`join_partitioned_sides`]; `status()` reads the side under build
+/// by the same rule).
+pub(crate) async fn builds_per_leaf(
+    client: &impl GenericClient,
+    table: &str,
+) -> Result<bool, tokio_postgres::Error> {
+    if !crate::defs::partition_tree::is_partitioned_root(client, table).await? {
+        return Ok(false);
+    }
+    Ok(client
+        .query_one(
+            &format!(
+                "select exists (select 1 from {})",
+                ddl::qualified_source_table(table)
+            ),
+            &[],
+        )
+        .await?
+        .get(0))
+}
+
+/// One step of a `JOIN` build with a partitioned side, before its final `T`
+/// step, as its cursor (`backfill_chunks.lo`) names it ([`run_join_steps`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JoinStepId {
+    /// A whole unpartitioned side.
+    Whole(crate::defs::join::Side),
+    /// The leaf with this oid of a partitioned side's recorded tree.
+    Leaf(crate::defs::join::Side, u32),
+    /// The cells of a partitioned side that route to none of its leaves.
+    Remainder(crate::defs::join::Side),
+}
+
+impl JoinStepId {
+    /// The cursor the step's transaction writes: `side:whole`, `side:oid` or
+    /// `side:remainder`.
+    fn cursor(self) -> String {
+        match self {
+            JoinStepId::Whole(side) => format!("{}:whole", side_name(side)),
+            JoinStepId::Leaf(side, oid) => format!("{}:{oid}", side_name(side)),
+            JoinStepId::Remainder(side) => format!("{}:remainder", side_name(side)),
+        }
+    }
+}
+
+/// The steps of a `JOIN` build before its final one, in the order
+/// [`run_join_steps`] runs them, for the sides that build per leaf
+/// (`partitioned`, each with its leaves' oids in oid order):
+///
+/// 1. every unpartitioned side whole, `FROM` first;
+/// 2. each partitioned side, `FROM` first: its leaves, then its remainder.
+pub(crate) fn join_steps(partitioned: &[(crate::defs::join::Side, Vec<u32>)]) -> Vec<JoinStepId> {
+    use crate::defs::join::Side;
+    let mut steps = Vec::new();
+    for side in [Side::From, Side::Joined] {
+        if !partitioned.iter().any(|(s, _)| *s == side) {
+            steps.push(JoinStepId::Whole(side));
+        }
+    }
+    for side in [Side::From, Side::Joined] {
+        let Some((_, leaves)) = partitioned.iter().find(|(s, _)| *s == side) else {
+            continue;
+        };
+        steps.extend(leaves.iter().map(|oid| JoinStepId::Leaf(side, *oid)));
+        steps.push(JoinStepId::Remainder(side));
+    }
+    steps
+}
+
+/// The steps of `steps` ([`join_steps`]) a job whose cursor is `cursor` has
+/// still to run, the final `T` step aside: those after the step the cursor
+/// names. A cursor that names none of them (the tree or a side's
+/// partitioning changed since) starts the build over: every step is
+/// idempotent.
+pub(crate) fn join_steps_after<'s>(
+    steps: &'s [JoinStepId],
+    cursor: Option<&str>,
+) -> &'s [JoinStepId] {
+    match cursor.and_then(|c| steps.iter().position(|s| s.cursor() == c)) {
+        Some(done) => &steps[done + 1..],
+        None => steps,
+    }
 }
 
 /// One side's recorded tree, for a `JOIN` build's per-leaf steps.
@@ -3729,52 +3796,54 @@ async fn run_join_steps(
         .iter()
         .map(|t| t.names.iter().map(String::as_str).collect())
         .collect();
-    // The steps in order, each with its position (`order`), which the cursor
-    // names: the group (whole unpartitioned sides, then partitioned ones),
-    // the side, the leaf's oid (the remainder last).
-    let side_index = |side: Side| u8::from(side == Side::Joined);
-    let mut steps: Vec<(JoinStep<'_>, (u8, u8, u64))> = Vec::new();
-    for side in [Side::From, Side::Joined] {
-        if !trees.iter().any(|t| t.side == side) {
-            steps.push((JoinStep::Whole { side }, (0, side_index(side), 0)));
-        }
-    }
-    for side in [Side::From, Side::Joined] {
-        let Some(at) = trees.iter().position(|t| t.side == side) else {
-            continue;
-        };
-        let tree = &trees[at];
-        for leaf in &tree.leaves {
-            steps.push((
-                JoinStep::Leaf {
-                    side,
-                    names: &names[at],
-                    recorded: &tree.recorded,
-                    leaf,
-                },
-                (1, side_index(side), u64::from(leaf.oid)),
-            ));
-        }
-        steps.push((
-            JoinStep::Remainder {
-                side,
-                names: &names[at],
-                recorded: &tree.recorded,
-                leaves: &tree.leaves,
-            },
-            (1, side_index(side), u64::MAX),
-        ));
-    }
-    // A cursor that names none of these steps (the tree or a side's
-    // partitioning changed since) starts over: every step is idempotent.
-    let after = cursor
-        .filter(|c| steps.iter().any(|(step, _)| join_cursor(step) == *c))
-        .and_then(parse_join_cursor);
+    let order: Vec<(Side, Vec<u32>)> = trees
+        .iter()
+        .map(|t| (t.side, t.leaves.iter().map(|l| l.oid).collect()))
+        .collect();
+    let ids = join_steps(&order);
+    let tree_of = |side: Side| {
+        let at = trees
+            .iter()
+            .position(|t| t.side == side)
+            .expect("a leaf or remainder step is of a side with a tree");
+        (&trees[at], names[at].as_slice())
+    };
+    let steps: Vec<(JoinStep<'_>, JoinStepId)> = join_steps_after(&ids, cursor)
+        .iter()
+        .map(|id| {
+            let step = match *id {
+                JoinStepId::Whole(side) => JoinStep::Whole { side },
+                JoinStepId::Leaf(side, oid) => {
+                    let (tree, names) = tree_of(side);
+                    JoinStep::Leaf {
+                        side,
+                        names,
+                        recorded: &tree.recorded,
+                        leaf: tree
+                            .leaves
+                            .iter()
+                            .find(|l| l.oid == oid)
+                            .expect("a leaf step names a leaf of its tree"),
+                    }
+                }
+                JoinStepId::Remainder(side) => {
+                    let (tree, names) = tree_of(side);
+                    JoinStep::Remainder {
+                        side,
+                        names,
+                        recorded: &tree.recorded,
+                        leaves: &tree.leaves,
+                    }
+                }
+            };
+            (step, *id)
+        })
+        .collect();
     let (mut written, mut deleted) = (0, 0);
-    for (step, _) in steps.iter().filter(|(_, o)| after.is_none_or(|a| *o > a)) {
+    for (step, id) in &steps {
         let structure = Structure::Join {
             piece: JoinPiece::Step(step),
-            cursor: Some(join_cursor(step)),
+            cursor: Some(id.cursor()),
         };
         let Some((w, d)) = run_group_structure(
             pool,
@@ -3858,33 +3927,6 @@ fn side_name(side: crate::defs::join::Side) -> &'static str {
     match side {
         crate::defs::join::Side::From => "from",
         crate::defs::join::Side::Joined => "joined",
-    }
-}
-
-/// A step's cursor (`backfill_chunks.lo`): `side:oid`, `side:whole` or
-/// `side:remainder`.
-fn join_cursor(step: &JoinStep<'_>) -> String {
-    match step {
-        JoinStep::Whole { side } => format!("{}:whole", side_name(*side)),
-        JoinStep::Leaf { side, leaf, .. } => format!("{}:{}", side_name(*side), leaf.oid),
-        JoinStep::Remainder { side, .. } => format!("{}:remainder", side_name(*side)),
-    }
-}
-
-/// The position of the step a cursor names, as [`run_join_steps`] orders
-/// them: (group, side, leaf oid). `None` for a cursor it doesn't know, which
-/// starts the build over (every step is idempotent).
-fn parse_join_cursor(cursor: &str) -> Option<(u8, u8, u64)> {
-    let (side, rest) = cursor.split_once(':')?;
-    let side = match side {
-        "from" => 0,
-        "joined" => 1,
-        _ => return None,
-    };
-    match rest {
-        "whole" => Some((0, side, 0)),
-        "remainder" => Some((1, side, u64::MAX)),
-        oid => Some((1, side, oid.parse().ok()?)),
     }
 }
 
@@ -4749,6 +4791,55 @@ async fn only_capture_waits(pool: &Pool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `JOIN` build's steps: unpartitioned sides whole (`FROM` first), then
+    /// each partitioned side's leaves in the given order and its remainder;
+    /// a cursor resumes after the step it names, and one it doesn't know
+    /// starts over.
+    #[test]
+    fn join_steps_order_and_resume_after_the_cursor() {
+        use crate::defs::join::Side::{From, Joined};
+        let steps = join_steps(&[(From, vec![11, 12])]);
+        assert_eq!(
+            steps,
+            [
+                JoinStepId::Whole(Joined),
+                JoinStepId::Leaf(From, 11),
+                JoinStepId::Leaf(From, 12),
+                JoinStepId::Remainder(From),
+            ]
+        );
+        let cursors: Vec<String> = steps.iter().map(|s| s.cursor()).collect();
+        assert_eq!(
+            cursors,
+            ["joined:whole", "from:11", "from:12", "from:remainder"]
+        );
+        assert_eq!(join_steps_after(&steps, None), &steps[..]);
+        assert_eq!(join_steps_after(&steps, Some("from:11")), &steps[2..]);
+        assert_eq!(
+            join_steps_after(&steps, Some("from:remainder")),
+            &[] as &[JoinStepId]
+        );
+        assert_eq!(
+            join_steps_after(&steps, Some("from:99")),
+            &steps[..],
+            "a leaf the tree no longer has starts over"
+        );
+        assert_eq!(
+            join_steps(&[(Joined, vec![5]), (From, vec![7])]),
+            [
+                JoinStepId::Leaf(From, 7),
+                JoinStepId::Remainder(From),
+                JoinStepId::Leaf(Joined, 5),
+                JoinStepId::Remainder(Joined),
+            ],
+            "both sides partitioned: FROM first"
+        );
+        assert_eq!(
+            join_steps(&[(Joined, vec![])]),
+            [JoinStepId::Whole(From), JoinStepId::Remainder(Joined)]
+        );
+    }
 
     /// #625 F-A5 for a Re-derive chunk (#616): a plain aggregate's build over
     /// a source of several chunks, whose `SUM(x + x)` overflows on one row.

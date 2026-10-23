@@ -42,10 +42,10 @@
 //! convergence (#297).
 //!
 //! **Not in the matrix** (each is a later step of #1289, or has its own test):
-//! - a Trellis copy against a source column in a `JOIN`'s `ON`: a `JOIN` over
-//!   another definition's target doesn't run yet (#1100), so
-//!   [`a_trellis_copy_pairs_with_a_source_column_of_any_modifier`] holds the
-//!   define-time pairing only;
+//! - a Trellis copy against a source column in a `JOIN`'s `ON` has its own
+//!   tests: [`a_trellis_copy_pairs_with_a_source_column_of_any_modifier`] at
+//!   define, [`a_trellis_copy_joins_a_modified_source_column_end_to_end`] as
+//!   rows flow;
 //! - the rename row: a rename after define is `capture_type_rename.rs`'s, and
 //!   one before a baseline records it is step 3;
 //! - integer and float widths, the only changes that re-type a copy
@@ -1221,6 +1221,103 @@ async fn a_trellis_copy_pairs_with_a_source_column_of_any_modifier() {
     }
     assert!(tried >= 20, "the loop ran {tried} cells");
     assert_eq!(refused, Vec::<String>::new(), "a copy didn't pair");
+}
+
+/// ADR-0020 rule 6, end to end: a `JOIN` whose `FROM` side is a Trellis
+/// target pairs that target's copy of `k` (no modifier) with a captured
+/// source column whose modifier was changed, for every type the `ON` admits
+/// and every kind of change, and the target equals the query over the
+/// captured tables as rows reach both sides.
+#[tokio::test]
+async fn a_trellis_copy_joins_a_modified_source_column_end_to_end() {
+    trellis::dev::staging::set_group_basis(true);
+    let mut cells = 0;
+    for ty in TYPES
+        .iter()
+        .filter(|ty| admits(Place::JoinOn, ty.label) && ty.label != "enum to enum")
+    {
+        for row in [&ty.catalog_only, &ty.rewrite, &ty.narrow]
+            .into_iter()
+            .filter_map(Option::as_ref)
+        {
+            let cell = format!("{} {} -> {}", ty.label, row.start, row.alter);
+            let mut d = Driver::start(
+                &format!(
+                    "{prelude}\
+                     create table public.t (id integer primary key, k {start}, x integer); \
+                     create table public.b (id integer primary key, k {start}, y integer); \
+                     create index on public.b (k); \
+                     alter table public.b alter column k type {alter}",
+                    prelude = ty.prelude,
+                    start = row.start,
+                    alter = alter_clause(row, "k"),
+                ),
+                &[("id", int4()), ("k", ty.value_type), ("x", int4())],
+                &["TRANSFORM up FROM public.t SELECT k AS k, x AS x"],
+                &["public.t"],
+            )
+            .await;
+            let trellis = facade(d.db.dsn()).await;
+            trellis
+                .apply(
+                    "TRANSFORM c FROM public.up LEFT JOIN public.b ON up.k = b.k \
+                     GROUP BY up.k WITHOUT SOURCE INDEX \
+                     SELECT up.k AS k, COUNT(*) AS n, SUM(b.y) AS sy",
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{cell}: define: {e}"));
+            trellis.shutdown().await.expect("shutdown");
+            // The staging worker's capture pass: `b` had no reader before.
+            let desired = trellis::defs::tables_to_capture(d.pool())
+                .await
+                .expect("read the tables to capture");
+            trellis::capture::reconcile::reconcile(
+                &mut d.ctl,
+                DEFAULT_SCHEMA,
+                &desired,
+                std::time::Instant::now() + Duration::from_secs(5),
+            )
+            .await
+            .expect("capture pass");
+            trellis::intake::markers::settle_registrations(d.pool()).await;
+            d.settle().await;
+            assert_eq!(
+                d.rows("select status::text from transform_definitions order by id")
+                    .await,
+                ["(live)", "(live)"],
+                "{cell}"
+            );
+            const ACTUAL: &str = "select k::text, n, sy from public.c order by 1";
+            const ORACLE: &str = "select t.k::text, count(*), sum(b.y) from public.t \
+                                  left join public.b on t.k = b.k group by t.k order by 1";
+            for sql in [
+                format!(
+                    "insert into public.t values (1, '{seed}', 1), (2, null, 2); \
+                     insert into public.b values (1, '{seed}', 10), (2, '{hi}', 20), \
+                         (3, '{seed}', 30)",
+                    seed = row.seed,
+                    hi = row.hi,
+                ),
+                "delete from public.b where id in (1, 3)".to_string(),
+                format!(
+                    "insert into public.b values (4, '{seed}', 40)",
+                    seed = row.seed
+                ),
+            ] {
+                d.user().await.batch_execute(&sql).await.expect(&sql);
+                d.settle().await;
+                assert_eq!(d.rows(ACTUAL).await, d.rows(ORACLE).await, "{cell}: {sql}");
+            }
+            assert_eq!(
+                d.rows("select n, sy from public.c where k is not null")
+                    .await,
+                ["(1,40)"],
+                "{cell}: the copy matched the modified column"
+            );
+            cells += 1;
+        }
+    }
+    assert!(cells >= 10, "the loop ran {cells} cells");
 }
 
 /// ADR-0020 rule 6, at define: `text` and `varchar` of any bound pair, and a

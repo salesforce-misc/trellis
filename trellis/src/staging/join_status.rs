@@ -1,5 +1,6 @@
 //! What `Trellis::status` reports about a `JOIN` transform (#1112): how big
-//! its hidden tables are, and whether `P` has grown close to the fact table.
+//! its hidden tables are, whether `P` has grown close to the fact table, and
+//! the step its build runs.
 //! The source indexes it needs are every target kind's
 //! (`DefinitionStatus::source_index_gaps`, #1167). Detection only
 //! ([#1096 decision 3](https://github.com/salesforce-misc/trellis/issues/1096)):
@@ -12,9 +13,14 @@
 
 use tokio_postgres::GenericClient;
 
+use super::build::{self, JoinStepId};
+use super::partition_correction;
+use crate::capture::{CaptureError, partitions};
 use crate::defs::ast::TransformDef;
+use crate::defs::chunk_queue::{KIND_PLAN, KIND_SWEEP};
 use crate::defs::ddl::regclass_arg;
-use crate::defs::join::{self as spec, HiddenTable};
+use crate::defs::join::{self as spec, HiddenTable, Side};
+use crate::defs::model::TransformStatus;
 
 /// `P` is reported once its estimated rows reach this share of the fact
 /// table's, as a percentage: past it the partials no longer compress the
@@ -59,15 +65,61 @@ pub struct JoinStatus {
     /// Set when `P`'s estimated rows reach
     /// [`PARTIALS_WARNING_PERCENT`] percent of the fact table's.
     pub partials_warning: Option<PartialsWarning>,
+    /// The step the definition's build runs now, or runs next if no worker
+    /// holds its job; `None` when no build is under way or the definition
+    /// is paused or quarantined.
+    pub building: Option<JoinBuildStep>,
 }
 
-/// The status of `def`, definition `id` in `catalog_schema`, if it is a
-/// `JOIN`.
+/// A side of a `JOIN`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinSide {
+    /// The `FROM` table, whose partials are `P`.
+    From,
+    /// The `JOIN` table, whose partials are `M`.
+    Joined,
+}
+
+/// The step of a `JOIN` build; see [`JoinStatus::building`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JoinBuildStep {
+    /// The whole build in one transaction: neither side is a partitioned
+    /// table with rows, so the build has no steps.
+    Whole,
+    /// A step of a build with a partitioned side: one side, or one part of
+    /// it.
+    Side { side: JoinSide, part: JoinSidePart },
+    /// The final step, which writes `T` and the target and completes the
+    /// build.
+    Final,
+}
+
+/// What a [`JoinBuildStep::Side`] step builds of its side.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JoinSidePart {
+    /// The whole side: it isn't a partitioned table with rows.
+    Whole,
+    /// One leaf of the side's recorded partition tree, by its recorded
+    /// `schema.table` name. Leaves build in oid order.
+    Leaf(String),
+    /// The side's cells that route to none of its recorded leaves, after
+    /// its last leaf.
+    Remainder,
+    /// The side's partition tree isn't recorded yet, or one of its leaves
+    /// has no usable constraint text, so the build can't route its cells to
+    /// leaves and fails on this side (`DefinitionStatus::backfill_failure`
+    /// says why).
+    Unroutable,
+}
+
+/// The status of `def`, definition `id` in `catalog_schema` over
+/// `source_table` and `join_table`, if it is a `JOIN`.
 pub(crate) async fn for_definition(
     client: &impl GenericClient,
     catalog_schema: &str,
     id: i64,
     source_table: &str,
+    join_table: Option<&str>,
     def: &TransformDef,
 ) -> Result<Option<JoinStatus>, tokio_postgres::Error> {
     if spec::spec(def).is_none() {
@@ -99,10 +151,109 @@ pub(crate) async fn for_definition(
         }
     }
     let partials_warning = partials_warning(client, &hidden_tables, source_table).await?;
+    let building = building(client, id, source_table, join_table).await?;
     Ok(Some(JoinStatus {
         hidden_tables,
         partials_warning,
+        building,
     }))
+}
+
+/// The step the definition's build runs now or next ([`JoinStatus::building`]):
+/// the one after the step its job's cursor names, by the build's own order
+/// (`build::join_steps`).
+///
+/// The job is the definition's current plan (fresh build or `RESUME`) or
+/// sweep (rebuild in place) job that isn't done, while the definition isn't
+/// frozen: a paused or quarantined definition's job is never handed out, and
+/// its `RESUME` discards it. Each step writes the cursor
+/// in its own transaction, so this plain `select`, which takes no row lock,
+/// sees the last step that committed: it neither waits on a running step nor
+/// holds one up.
+async fn building(
+    client: &impl GenericClient,
+    id: i64,
+    source_table: &str,
+    join_table: Option<&str>,
+) -> Result<Option<JoinBuildStep>, tokio_postgres::Error> {
+    let Some(job) = client
+        .query_opt(
+            "select bc.lo from backfill_chunks bc \
+             join transform_definitions d on d.id = bc.definition_id \
+             where bc.definition_id = $1 and bc.kind = any($2) and bc.fields is null \
+               and not bc.done and bc.fuse_rearmed_at is not distinct from d.fuse_rearmed_at \
+               and d.status = any($3) \
+             order by bc.id desc limit 1",
+            &[
+                &id,
+                &[KIND_PLAN, KIND_SWEEP].as_slice(),
+                &TransformStatus::dispatchable(),
+            ],
+        )
+        .await?
+    else {
+        return Ok(None);
+    };
+    let cursor: Option<String> = job.get(0);
+    let mut sides = vec![(Side::From, source_table)];
+    sides.extend(join_table.map(|t| (Side::Joined, t)));
+    let mut partitioned = Vec::new();
+    for (side, table) in sides {
+        if !build::builds_per_leaf(client, table).await? {
+            continue;
+        }
+        let recorded = match partitions::recorded(client, table).await {
+            Ok(recorded) => recorded,
+            Err(CaptureError::Db(e)) => return Err(e),
+            Err(_) => None,
+        };
+        let leaves = recorded
+            .as_ref()
+            .and_then(|r| partition_correction::rebuild_leaves(r).ok());
+        let (Some(recorded), Some(leaves)) = (recorded, leaves) else {
+            // The build fails on the first side it can't route, before any
+            // step.
+            return Ok(Some(JoinBuildStep::Side {
+                side: public_side(side),
+                part: JoinSidePart::Unroutable,
+            }));
+        };
+        partitioned.push((side, recorded, leaves));
+    }
+    if partitioned.is_empty() {
+        return Ok(Some(JoinBuildStep::Whole));
+    }
+    let order: Vec<(Side, Vec<u32>)> = partitioned
+        .iter()
+        .map(|(side, _, leaves)| (*side, leaves.iter().map(|l| l.oid).collect()))
+        .collect();
+    let steps = build::join_steps(&order);
+    let Some(next) = build::join_steps_after(&steps, cursor.as_deref()).first() else {
+        return Ok(Some(JoinBuildStep::Final));
+    };
+    let (side, part) = match *next {
+        JoinStepId::Whole(side) => (side, JoinSidePart::Whole),
+        JoinStepId::Remainder(side) => (side, JoinSidePart::Remainder),
+        JoinStepId::Leaf(side, oid) => {
+            let name = partitioned
+                .iter()
+                .find(|(s, _, _)| *s == side)
+                .and_then(|(_, recorded, _)| recorded.nodes.iter().find(|n| n.oid == oid))
+                .map_or_else(|| oid.to_string(), |n| n.name.clone());
+            (side, JoinSidePart::Leaf(name))
+        }
+    };
+    Ok(Some(JoinBuildStep::Side {
+        side: public_side(side),
+        part,
+    }))
+}
+
+fn public_side(side: Side) -> JoinSide {
+    match side {
+        Side::From => JoinSide::From,
+        Side::Joined => JoinSide::Joined,
+    }
 }
 
 async fn partials_warning(

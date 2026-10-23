@@ -51,6 +51,15 @@ Demanding a present-and-drained successor would strand a batch forever whenever
 its successor retired first — a lock skip can retire *s+1* and leave *s*
 ineligible, leaking a ring slot into a permanent `RingFull` wedge.
 
+**An idle ring retires its tail.** Condition 1 needs the successor to have
+sealed, which ordinary traffic does only on the next write. So when the active
+segment is empty and its predecessor is drained with rows still in its slot, the
+seal step seals the empty active segment anyway (the idle seal,
+[03](03-sealing-and-the-fence.md#who-seals-and-when)). Once that empty batch
+drains, the old batch meets all four conditions and the next pass frees its slot.
+An idle ring holds no drained rows: only the empty segment sealed when it went
+idle, and the empty active one.
+
 **Condition 4 is why an undrainable batch would be an instance-wide stop**, not a
 per-table one: one batch stuck below the boundary makes *every* candidate
 ineligible, so the ring fills and seals fail. That is why no failure class must

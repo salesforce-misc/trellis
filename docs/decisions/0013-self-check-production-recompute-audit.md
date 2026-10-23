@@ -1,6 +1,6 @@
 ---
-status: draft
-date: 2026-10-17
+status: accepted
+date: 2026-10-23
 deciders: Michael Ries
 ---
 
@@ -318,7 +318,9 @@ segment that finishes draining mid-statement is read or skipped on one snapshot.
 The page's ring reads are then bounded by the segment size, not by the rows a ring
 has applied and not yet retired. The convergence wait before each page asks the
 slot itself ([07](../staging-and-claiming/07-convergence-and-await.md), condition
-3), so it still reads a drained slot whole.
+3), so it still reads a drained slot whole. That cost lasts only while writes keep a
+drained segment resident: an idle ring retires its drained tail
+([06](../staging-and-claiming/06-cleanup-and-reclaim.md#retiring-a-batch)).
 
 ### Scope: every target; aggregate and JOIN targets detect, never repair
 
@@ -348,7 +350,10 @@ columns), so a divergence is reported per key.
 For aggregate and JOIN targets `self_check` **detects and reports; it never
 repairs.** A target found wrong is repaired by the operator, with the tools any
 definition has: `request_backfill` of the source table, which rebuilds each reading
-definition without pausing it, or `PAUSE` and `RESUME`. There is no background
+definition without pausing it, or `PAUSE` and `RESUME`, or `DROP TRANSFORM` and
+define it again. A hand edit of a JOIN's hidden tables needs one of the last two
+([known correctness gaps](../known-correctness-gaps.md#rows-written-into-a-target-a-hidden-table-or-trelliss-schema)).
+There is no background
 repair sweep. A sweep would put a continuous source `GROUP BY` load on the
 database, hold group locks that compete with pages, and silently mask Trellis's own
 bugs, which an audit exists to surface. A repair of only the groups an audit
