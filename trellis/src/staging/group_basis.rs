@@ -1215,6 +1215,12 @@ impl GroupTargetPlan {
     /// the rest, sorted, in one statement (R1, R7). A `JOIN`'s `T` has only
     /// its staged rows.
     pub(super) fn lock_sql(&self) -> String {
+        self.lock_sql_where("")
+    }
+
+    /// [`Self::lock_sql`] over only the groups that meet `filter` (` where …`
+    /// over the group columns, with its leading space, or empty for all).
+    pub(super) fn lock_sql_where(&self, filter: &str) -> String {
         let cols = quoted(&self.shape.group_cols).join(", ");
         let recomputed = if !matches!(self.writer, Writer::JoinTarget) {
             format!(" union all select {cols} from {}", self.recomputed)
@@ -1225,7 +1231,7 @@ impl GroupTargetPlan {
             "insert into {hidden} ({cols}) \
              select distinct {cols} from ( \
                  select {cols} from {staged}{recomputed} \
-             ) as g \
+             ) as g{filter} \
              order by {cols} \
              on conflict ({cols}) do update set __n = excluded.__n where false",
             hidden = self.hidden_ident,
@@ -1561,6 +1567,144 @@ impl GroupTargetPlan {
         )
     }
 
+    /// A `JOIN` build's snapshot statement for one side ([`write_join_build_cells`],
+    /// #1097's rule 4): after every lock statement of the build, one `GROUP
+    /// BY` of `node` (the side's table or leaf, quoted and qualified) into
+    /// `grouped` (a session temp table, quoted and `pg_temp.`-qualified,
+    /// dropped at commit), with one more row (`__meta`) holding the
+    /// statement's snapshot and the newest segment's `seg_seq`. A `create …
+    /// as select` reads in parallel where Postgres can; the data-modifying
+    /// write that follows can't.
+    fn join_group_sql(&self, node: &str, grouped: &str) -> String {
+        let cols = quoted(&self.shape.group_cols);
+        let mut fresh = vec!["count(*)::bigint as __rn".to_string()];
+        let mut nulls = vec!["null".to_string(); cols.len() + 1];
+        for (i, arg) in self.shape.args.iter().enumerate() {
+            let i = i + 1;
+            fresh.push(format!(
+                "(count(*) filter (where ({}) is not null))::bigint as __rc{i}",
+                arg.sql
+            ));
+            nulls.push("null".to_string());
+            if arg.summed {
+                fresh.push(format!(
+                    "coalesce(sum(({})::numeric), 0) as __rs{i}",
+                    arg.sql
+                ));
+                nulls.push("null".to_string());
+            }
+        }
+        let positions: Vec<String> = (4..4 + cols.len()).map(|p| p.to_string()).collect();
+        format!(
+            "create temp table {table} on commit drop as \
+             select false as __meta, null::pg_snapshot as __snap, null::bigint as __seg, \
+                    {values}, {fresh} \
+             from {node} s group by {positions} \
+             union all \
+             select true, pg_catalog.pg_current_snapshot(), \
+                    coalesce((select max(seg_seq) from segments), 0), {nulls}",
+            table = grouped.trim_start_matches("pg_temp."),
+            values = self.group_values().join(", "),
+            fresh = fresh.join(", "),
+            positions = positions.join(", "),
+            nulls = nulls.join(", "),
+        )
+    }
+
+    /// A `JOIN` build's write of one side's cells ([`write_join_build_cells`],
+    /// #1097's rules 5 and 6), after [`Self::join_group_sql`] filled
+    /// `grouped`: over the cells of [`Self::recomputed`], whose keys the
+    /// build holds under `J` and whose `NULL`-key cells it has locked, writes
+    /// each cell's partials once from `grouped`: an update of a cell the
+    /// hidden table holds, an insert of one it doesn't (zero for a cell the
+    /// `GROUP BY` doesn't have, R4), with `grouped`'s snapshot as its basis
+    /// and its segment as its stamp. Each cell's change (new partials less the
+    /// held ones, which the locks keep as they were at the snapshot) goes to
+    /// `deltas`. A cell the snapshot sees in the table but the enumeration
+    /// didn't name is left to its pages.
+    ///
+    /// The cells are matched to the hidden rows and to the `GROUP BY` by
+    /// hash or merge joins on [`Self::group_match`], not by a lookup per
+    /// cell: a build's cells are every cell of the side.
+    fn join_build_sql(&self, grouped: &str, deltas: &str) -> String {
+        let cols = quoted(&self.shape.group_cols);
+        let col_list = cols.join(", ");
+        let args = &self.shape.args;
+        let mut held = vec!["x.__n as __on".to_string()];
+        let mut cell = vec![
+            "coalesce(h.__on, 0) as __on".to_string(),
+            "coalesce(n.__rn, 0) as __rn".to_string(),
+        ];
+        let mut sets = vec!["__n = r.__rn".to_string()];
+        let mut insert_cols = cols.clone();
+        insert_cols.push("__n".to_string());
+        let mut insert_values: Vec<String> = cols.iter().map(|c| format!("r.{c}")).collect();
+        insert_values.push("r.__rn".to_string());
+        let mut delta_cols = cols.clone();
+        delta_cols.push("__dn".to_string());
+        let mut delta_values: Vec<String> = cols.iter().map(|c| format!("r.{c}")).collect();
+        delta_values.push("r.__rn - r.__on".to_string());
+        for (i, arg) in args.iter().enumerate() {
+            let i = i + 1;
+            held.push(format!("x.__count_{i} as __oc{i}"));
+            cell.push(format!("coalesce(h.__oc{i}, 0) as __oc{i}"));
+            cell.push(format!("coalesce(n.__rc{i}, 0) as __rc{i}"));
+            sets.push(format!("__count_{i} = r.__rc{i}"));
+            insert_cols.push(format!("__count_{i}"));
+            insert_values.push(format!("r.__rc{i}"));
+            delta_cols.push(format!("__dc{i}"));
+            delta_values.push(format!("r.__rc{i} - r.__oc{i}"));
+            if arg.summed {
+                held.push(format!("x.__sum_{i} as __os{i}"));
+                cell.push(format!("coalesce(h.__os{i}, 0) as __os{i}"));
+                cell.push(format!("coalesce(n.__rs{i}, 0) as __rs{i}"));
+                sets.push(format!("__sum_{i} = r.__rs{i}"));
+                insert_cols.push(format!("__sum_{i}"));
+                insert_values.push(format!("r.__rs{i}"));
+                delta_cols.push(format!("__ds{i}"));
+                delta_values.push(format!("r.__rs{i} - r.__os{i}"));
+            }
+        }
+        insert_cols.extend(["__basis", "__stamp"].map(String::from));
+        insert_values.extend(["snap.__snap", "snap.__seg"].map(String::from));
+        let rg_cols: Vec<String> = cols.iter().map(|c| format!("rg.{c}")).collect();
+        let x_cols: Vec<String> = cols.iter().map(|c| format!("x.{c}")).collect();
+        format!(
+            "with snap as materialized (select __snap, __seg from {grouped} where __meta), \
+             rg as (select distinct {col_list} from {recomputed}), \
+             h as (select x.ctid as __hc, {x_cols}, {held} from {hidden} x), \
+             n as (select * from {grouped} where not __meta), \
+             r as materialized ( \
+                 select {rg_cols}, h.__hc, {cell} from rg \
+                 left join h on {h_match} \
+                 left join n on {n_match} \
+             ), \
+             up as ( \
+                 update {hidden} u set {sets}, __basis = snap.__snap, __stamp = snap.__seg \
+                 from r, snap where u.ctid = r.__hc \
+             ), \
+             ins as ( \
+                 insert into {hidden} ({insert_cols}) \
+                 select {insert_values} from r, snap where r.__hc is null \
+             ), \
+             d as (insert into {deltas} ({delta_cols}) select {delta_values} from r) \
+             select count(*) from r",
+            recomputed = self.recomputed,
+            hidden = self.hidden_ident,
+            x_cols = x_cols.join(", "),
+            held = held.join(", "),
+            rg_cols = rg_cols.join(", "),
+            cell = cell.join(", "),
+            h_match = self.group_match("h", "rg"),
+            n_match = self.group_match("n", "rg"),
+            sets = sets.join(", "),
+            insert_cols = insert_cols.join(", "),
+            insert_values = insert_values.join(", "),
+            delta_cols = delta_cols.join(", "),
+            delta_values = delta_values.join(", "),
+        )
+    }
+
     /// A rebuild's enumeration ([`rebuild`], R8): adds to
     /// [`Self::recomputed`] every group of the target's own (its hidden
     /// rows, zero groups included, and its visible rows), every group of the
@@ -1575,6 +1719,17 @@ impl GroupTargetPlan {
     /// and, for a leaf, the groups of the leaf's own rows instead of the
     /// source's.
     fn rebuild_groups_sql(&self, scope: Option<&RebuildScope>) -> String {
+        format!(
+            "insert into {} ({}) {}",
+            self.recomputed,
+            quoted(&self.shape.group_cols).join(", "),
+            self.rebuild_groups_select(scope, "$1")
+        )
+    }
+
+    /// The `select` of [`Self::rebuild_groups_sql`]: `source` is the SQL of
+    /// the ring's name for the source (`src_table`).
+    fn rebuild_groups_select(&self, scope: Option<&RebuildScope>, source: &str) -> String {
         let cols = quoted(&self.shape.group_cols).join(", ");
         let (hidden_filter, target_filter, image_filter) = match scope {
             Some(scope) => (
@@ -1591,11 +1746,11 @@ impl GroupTargetPlan {
                 [
                     format!(
                         "select old_image as __i from {seg} \
-                         where src_table = $1 and jsonb_typeof(old_image) = 'object'"
+                         where src_table = {source} and jsonb_typeof(old_image) = 'object'"
                     ),
                     format!(
                         "select transition_images -> 'old' from {seg} \
-                         where src_table = $1 \
+                         where src_table = {source} \
                            and jsonb_typeof(transition_images -> 'old') = 'object'"
                     ),
                 ]
@@ -1640,11 +1795,9 @@ impl GroupTargetPlan {
             ),
         };
         format!(
-            "insert into {rc} ({cols}) \
-             select {cols} from {hidden} h{hidden_filter}{target_branch}{own} \
+            "select {cols} from {hidden} h{hidden_filter}{target_branch}{own} \
              union all select {values} from ({images}) as r \
                  cross join lateral jsonb_populate_record(null::{src}, r.__i) as s{image_filter}",
-            rc = self.recomputed,
             hidden = self.hidden_ident,
             values = self.group_values().join(", "),
             src = self.source_row,
@@ -2089,6 +2242,13 @@ const PLAN_SETTINGS: &str = "set local enable_nestloop = off; set local enable_s
 const PLAN_RESET: &str =
     "set local enable_nestloop to default; set local enable_seqscan to default";
 
+/// A `JOIN` build's settings for its statements over every cell
+/// ([`write_join_build_cells`], `super::join`'s product): they join cell sets
+/// on [`GroupTargetPlan::group_match`]'s arrays, which a merge join must sort,
+/// and sorting arrays costs several times hashing them.
+pub(super) const BULK_PLAN_SETTINGS: &str = "set local enable_mergejoin = off";
+pub(super) const BULK_PLAN_RESET: &str = "set local enable_mergejoin to default";
+
 /// The most `GROUP BY` columns a group lookup writes one index probe per
 /// pattern of `NULL`s for (`GroupTargetPlan::group_lookup`): 15 probes at 4.
 const MAX_NULL_PATTERN_COLUMNS: usize = 4;
@@ -2257,27 +2417,36 @@ pub(super) async fn restore_settings(
 }
 
 /// A JOIN build's enumeration of one side's cells (`super::join::build`,
-/// ADR-0002's R8): adds to [`GroupTargetPlan::recomputed`] every cell the
-/// side's hidden table holds, every cell of its table's rows, and the cell of
-/// every old image of the ring's changes to the table
-/// ([`GroupTargetPlan::rebuild_groups_sql`]). With a `scope` (one leaf of a
-/// partitioned side, or its remainder, #1286) only the cells the scope routes
-/// to the structure. Reads without a lock.
+/// ADR-0002's R8): every cell the side's hidden table holds, every cell of
+/// its table's rows, and the cell of every old image of the ring's changes
+/// to the table ([`GroupTargetPlan::rebuild_groups_select`]), into `cells`
+/// (a session temp table, quoted and `pg_temp.`-qualified, dropped at
+/// commit), which becomes the plan's [`GroupTargetPlan::recomputed`]. A
+/// `create … as select`, so the read of the table runs in parallel where
+/// Postgres can. With a `scope` (one leaf of a partitioned side, or its
+/// remainder, #1286) only the cells the scope routes to the structure.
+/// Reads without a lock.
 pub(super) async fn enumerate_cells(
     txn: &Transaction<'_>,
-    plan: &GroupTargetPlan,
+    plan: &mut GroupTargetPlan,
     scope: Option<&RebuildScope>,
+    cells: &str,
 ) -> Result<(), ApplyError> {
     let saved = match scope {
         Some(_) => Some(pin_settings(txn).await?),
         None => None,
     };
-    txn.execute(&plan.rebuild_groups_sql(scope), &[&plan.source])
-        .await?;
+    txn.batch_execute(&format!(
+        "create temp table {} on commit drop as {}",
+        cells.trim_start_matches("pg_temp."),
+        plan.rebuild_groups_select(scope, &crate::pool::quote_literal(&plan.source))
+    ))
+    .await?;
     if let Some(saved) = saved {
         restore_settings(txn, &saved).await?;
     }
-    Ok(())
+    plan.recomputed = cells.to_string();
+    analyze(txn, &[cells]).await
 }
 
 /// A JOIN build's enumeration of `T`'s groups: one zero row per group of the
@@ -2354,6 +2523,46 @@ pub(super) async fn recompute_locked_groups_from(
         .await?;
     let (_, written, deleted) = written_groups(plan, rows, mutations);
     Ok((written, deleted))
+}
+
+/// A `JOIN` build's write of one side's cells, `plan` a
+/// [`Writer::JoinPartials`] (`super::join::build`): the snapshot statement,
+/// one `GROUP BY` of `node` into `grouped` ([`GroupTargetPlan::join_group_sql`]),
+/// then every cell of [`GroupTargetPlan::recomputed`] written once from it
+/// ([`GroupTargetPlan::join_build_sql`]). The caller holds `J` on every key
+/// the cells name and has locked the cells with a `NULL` key part, so the
+/// snapshot follows every lock statement.
+pub(super) async fn write_join_build_cells(
+    txn: &Transaction<'_>,
+    plan: &GroupTargetPlan,
+    node: &str,
+    grouped: &str,
+) -> Result<(), ApplyError> {
+    let Writer::JoinPartials { deltas } = &plan.writer else {
+        return Err(plan.unsupported("a JOIN build's cell write on a structure with no cells"));
+    };
+    txn.batch_execute(&plan.join_group_sql(node, grouped))
+        .await?;
+    analyze(txn, &[grouped]).await?;
+    txn.batch_execute(BULK_PLAN_SETTINGS).await?;
+    txn.query_one(&plan.join_build_sql(grouped, deltas), &[])
+        .await?;
+    txn.batch_execute(BULK_PLAN_RESET).await?;
+    Ok(())
+}
+
+/// Refreshes the planner's statistics of `tables` (session temp tables,
+/// quoted and qualified) after a bulk statement filled them. Postgres never
+/// analyzes a temp table on its own, so without this a build's statements
+/// are planned for a few hundred rows where there are millions: nested
+/// loops and sorts where a hash join is right.
+pub(super) async fn analyze(txn: &Transaction<'_>, tables: &[&str]) -> Result<(), ApplyError> {
+    if tables.is_empty() {
+        return Ok(());
+    }
+    txn.batch_execute(&format!("analyze {}", tables.join(", ")))
+        .await?;
+    Ok(())
 }
 
 /// A release's recompute on a group-basis target (#1102 decision 1): every

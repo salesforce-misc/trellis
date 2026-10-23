@@ -2524,6 +2524,40 @@ async fn build_writes_only_the_cells_it_enumerated() {
     lab.check("a key first seen after the enumeration").await;
 }
 
+/// #1346: a fresh build writes each `P` and `M` cell once, not an insert that
+/// a second statement rewrites: every version of a hidden row is its live
+/// one, so each page's live rows fill its line pointers from 1 with no dead
+/// version among them. Its join keys have no `NULL` part (a `NULL`-key `P`
+/// cell is locked as a cell, which writes it, before its write).
+#[tokio::test]
+async fn build_writes_each_cell_once_on_a_fresh_build() {
+    let seed = "insert into public.a select g, g % 7, 0, g % 13, g \
+                    from generate_series(1, 400) g; \
+                insert into public.b select g, 0, g % 13, g % 3, g \
+                    from generate_series(1, 60) g";
+    let mut lab = seeded(Key::Single, &[L], seed).await;
+    lab.build().await;
+    lab.assert_built("a fresh build").await;
+    for part in ["p", "m"] {
+        let table = lab.hidden(L, part).await;
+        let pages = lab
+            .d
+            .rows(&format!(
+                "select count(*) = max(off) from ( \
+                     select (ctid::text::point)[0] as blk, (ctid::text::point)[1] as off \
+                     from {table}) v \
+                 group by blk"
+            ))
+            .await;
+        assert!(!pages.is_empty(), "{part} holds cells");
+        assert!(
+            pages.iter().all(|dense| dense == "(t)"),
+            "{part}'s cells were each written once: {pages:?}"
+        );
+    }
+    lab.check("a fresh build").await;
+}
+
 /// Test 6 (R8): a cell whose only row moved out, undrained, before the build
 /// is a zero cell with a basis, so the later `-1` of the move is refused.
 #[tokio::test]
