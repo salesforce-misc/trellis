@@ -201,3 +201,103 @@ async fn a_re_type_to_text_is_no_value_identity_change() {
         0
     );
 }
+
+/// A resume that waits for the changes staged before the re-type re-types
+/// nothing meanwhile: the target keeps its rows and its column's old type
+/// while it reads `paused`, and deletes a key's rows only once the resume
+/// goes on to rebuild it.
+#[tokio::test]
+async fn a_draining_resume_keeps_the_target_until_the_changes_drain() {
+    trellis::dev::staging::set_group_basis(true);
+    let mut h = H::new(
+        SOURCE,
+        &["TRANSFORM per_tone FROM public.s GROUP BY tone \
+           SELECT tone AS tone, COUNT(*) AS c, SUM(n) AS sn"],
+    )
+    .await;
+    let before = h
+        .rows("select tone::text, c, sn from public.per_tone")
+        .await;
+    h.write("insert into public.s values (4, 'calm', 4)").await;
+    h.write(&retype()).await;
+    h.capture_pass().await;
+    h.resume(&["per_tone"]).await;
+    let waiting = h.capture_failure("per_tone").await.unwrap_or_default();
+    assert!(waiting.starts_with("resuming: waiting"), "{waiting}");
+    // A whole pass with the staged insert still pending.
+    h.capture_pass().await;
+    assert_eq!(h.status("per_tone").await, TransformStatus::Paused);
+    assert_eq!(
+        h.rows("select tone::text, c, sn from public.per_tone")
+            .await,
+        before,
+        "the target kept its rows while the resume waits"
+    );
+    assert_eq!(
+        h.rows(
+            "select atttypid::regtype::text from pg_attribute \
+             where attrelid = 'public.per_tone'::regclass and attname = 'tone'"
+        )
+        .await,
+        ["(tone)"],
+        "nothing is re-typed while the resume waits"
+    );
+    h.converge("after the drain").await;
+    h.assert_exact(
+        "per_tone",
+        "select tone::text, c, sn from public.per_tone",
+        "select tone::text, count(*), sum(n) from public.s group by tone",
+    )
+    .await;
+}
+
+/// A definition chained off a target whose `GROUP BY` key the upstream's
+/// resume re-types to the other enum (deleting the key's rows, which the
+/// chained definition captures) is paused with that resume as its cause,
+/// and resumes on its own once the upstream is live: one `RESUME` brings
+/// both back exact.
+#[tokio::test]
+async fn a_definition_chained_off_a_re_typed_key_resumes_with_its_upstream() {
+    trellis::dev::staging::set_group_basis(true);
+    let mut h = H::new(
+        SOURCE,
+        &["TRANSFORM per_tone FROM public.s GROUP BY tone \
+           SELECT tone AS tone, COUNT(*) AS c, SUM(n) AS sn"],
+    )
+    .await;
+    let down = "TRANSFORM down FROM public.per_tone SELECT sn AS sn";
+    h.trellis.apply(down).await.expect(down);
+    h.targets.push("down".into());
+    h.converge("down live").await;
+    h.write(&retype()).await;
+    h.capture_pass().await;
+    assert_eq!(h.status("per_tone").await, TransformStatus::Paused);
+    assert_eq!(h.status("down").await, TransformStatus::Live);
+    h.resume(&["per_tone"]).await;
+    // The pass that re-types the upstream's key pauses `down` for it.
+    h.pass().await;
+    assert_eq!(h.status("down").await, TransformStatus::Paused);
+    assert_eq!(
+        h.rows(
+            "select u.target_table from capture_failures f \
+             join transform_definitions d on d.id = f.transform_id \
+             join transform_definitions u on u.id = f.caused_by \
+             where d.target_table = 'public.down'"
+        )
+        .await,
+        ["(public.per_tone)"]
+    );
+    h.converge("both resumed").await;
+    h.assert_exact(
+        "per_tone",
+        "select tone::text, c, sn from public.per_tone",
+        "select tone::text, count(*), sum(n) from public.s group by tone",
+    )
+    .await;
+    h.assert_exact(
+        "down",
+        "select tone::text, sn from public.down",
+        "select tone::text, sum(n) from public.s group by tone",
+    )
+    .await;
+}

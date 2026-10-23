@@ -5193,7 +5193,10 @@ async fn resume_caused_definition(
 /// For each request, in id order, it first waits for the definition's
 /// upstreams (#971): while one isn't `live` ([`upstream_not_live`]) it
 /// leaves the request, rewriting the `capture_failure` only when the
-/// upstream it names changes ([`rewrite_waiting`]). Then it re-validates the
+/// upstream it names changes ([`rewrite_waiting`]). It leaves the request
+/// too while a change staged before the enum relabel or re-type the
+/// definition was paused for is pending ([`relabel_changes_pending`]), so a
+/// re-type that deletes a key's rows waits for it. Then it re-validates the
 /// definition (a schema changed since the `RESUME` is caught here too), and
 /// runs
 /// [`crate::defs::copies::retype_statements`], one table per transaction,
@@ -5305,6 +5308,14 @@ async fn finish_requested_resume(
             if current.as_deref() != Some(error.as_str()) {
                 rewrite_waiting(client, id, &source_table, &upstream, &error).await?;
             }
+            return Ok(());
+        }
+        // #1327: nor while the changes staged before an enum change still
+        // drain ([`relabel_changes_pending`]): a re-type to another enum
+        // deletes a key's rows, which only the resume's rebuild writes back,
+        // so the target keeps them until the resume goes on to it. The
+        // request keeps its `resuming: waiting ...` text.
+        if relabel_changes_pending(&txn, id, &source_table).await? {
             return Ok(());
         }
         // The ledger and the group-delta table are checked here too, before anything is
