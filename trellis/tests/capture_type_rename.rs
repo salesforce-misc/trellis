@@ -1109,3 +1109,69 @@ async fn a_simulated_pg_upgrade_re_records_nothing() {
     drain_to_quiescence(&db.pool, &mut raw).await;
     assert_converged(&raw).await;
 }
+
+/// A rename while another transaction holds a reader's definition row past
+/// the pass's `lock_timeout` (a long build chunk, an operator's open
+/// transaction): the pass goes on without following it, pausing nothing, and
+/// the next pass after the lock is released follows it.
+#[tokio::test]
+async fn a_rename_blocked_by_a_locked_definition_is_followed_by_a_later_pass() {
+    trellis::dev::staging::set_group_basis(true);
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create type public.tone as enum ('calm', 'loud', 'brisk'); \
+         create table public.items (id int primary key, tone tone, n int); \
+         create index on public.items (tone); \
+         insert into public.items values (1, 'calm', 1), (2, 'loud', 2);",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    for text in PASS_AND_COUNTS {
+        trellis.apply(text).await.expect(text);
+    }
+    bring_live(&mut raw, &db.pool, &["tone_pass", "per_tone"]).await;
+
+    let mut holder = connect(db.dsn()).await;
+    let lock = holder.transaction().await.expect("begin");
+    lock.execute(
+        "select 1 from transform_definitions where target_table = 'public.per_tone' \
+         for key share",
+        &[],
+    )
+    .await
+    .expect("hold the definition row");
+    raw.batch_execute(
+        "alter type public.tone rename to tone2; set lock_timeout = '200ms'; \
+         insert into public.items values (3, 'brisk', 3);",
+    )
+    .await
+    .expect("rename");
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(
+        capture_failures(&raw).await,
+        Vec::<Vec<Option<String>>>::new()
+    );
+    assert_eq!(
+        source_column_token(&raw, "tone_pass", "tone").await,
+        "enum:public.tone",
+        "not followed while the row is locked"
+    );
+    lock.rollback().await.expect("release");
+    raw.batch_execute("reset lock_timeout")
+        .await
+        .expect("reset");
+
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(
+        source_column_token(&raw, "tone_pass", "tone").await,
+        "enum:public.tone2"
+    );
+    full_pass(&mut raw, &db.pool).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    full_pass(&mut raw, &db.pool).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    assert_pass_and_counts(&raw).await;
+}

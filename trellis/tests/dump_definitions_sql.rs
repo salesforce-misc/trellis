@@ -165,7 +165,7 @@ const SOURCE_DDL: &str = "\
     create table public.orders (id bigint primary key, g bigint, a bigint, cat_id bigint, \
                                 m public.mood); \
     insert into public.cats values (1, 'tom'), (2, 'kit'); \
-    insert into public.orders values (1, 1, 10, 1), (2, 1, 20, 2), (3, 2, 30, 1)";
+    insert into public.orders values (1, 1, 10, 1, 'calm'), (2, 1, 20, 2, 'loud'), (3, 2, 30, 1, 'calm')";
 
 /// A 1-1 transform, an aggregate chained off it, and a 1-1 reading through a
 /// relationship, all built, with the capture triggers installed.
@@ -178,7 +178,7 @@ async fn define_and_build(t: &Trellis, raw: &mut Client) {
         .await
         .expect("o1");
     build_everything(t.pool()).await;
-    t.apply("TRANSFORM tot FROM o1 GROUP BY g SELECT g AS g, SUM(b) AS total")
+    t.apply("TRANSFORM tot FROM o1 GROUP BY g, m SELECT g AS g, m AS m, SUM(b) AS total")
         .await
         .expect("tot");
     t.apply("TRANSFORM oc FROM orders SELECT cat.name AS cat_name")
@@ -251,8 +251,8 @@ async fn a_dump_loads_as_defined_not_built() {
         "select to_jsonb(t) - 'created_at' from schema_nodes t order by id",
         "select to_jsonb(t) - 'created_at' from schema_edges t order by id",
         "select to_jsonb(t) from source_table_versions t order by source_table",
-        "select to_jsonb(t) from definition_key_types t order by transform_id, table_name, column_name",
         // #1242: a type's OID is the database's own; the name beside it loads.
+        "select to_jsonb(t) - 'type_oid' from definition_key_types t order by transform_id, table_name, column_name",
         "select to_jsonb(t) - 'type_oid' from definition_types t order by transform_id, type_name",
         "select to_jsonb(t) from trellis_instance t",
         "select to_jsonb(t) - 'applied_on' from refinery_schema_history t order by version",
@@ -279,6 +279,16 @@ async fn a_dump_loads_as_defined_not_built() {
     assert_eq!(
         count(&after, "select count(*) from definition_types").await,
         3
+    );
+    // `tot` groups by the enum: its key type's OID is the loaded one too.
+    assert_eq!(
+        count(
+            &after,
+            "select count(*) from definition_key_types where type_name = 'public.mood' \
+             and type_oid = 'public.mood'::regtype"
+        )
+        .await,
+        1
     );
 
     // Every definition is defined, not built.
@@ -415,7 +425,7 @@ async fn a_loaded_database_builds_its_definitions() {
     after
         .batch_execute(
             "insert into public.cats values (1, 'tom'), (2, 'kit'); \
-             insert into public.orders values (1, 1, 10, 1), (2, 1, 20, 2), (3, 2, 30, 1)",
+             insert into public.orders values (1, 1, 10, 1, 'calm'), (2, 1, 20, 2, 'loud'), (3, 2, 30, 1, 'calm')",
         )
         .await
         .expect("load source rows");

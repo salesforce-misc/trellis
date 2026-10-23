@@ -433,7 +433,11 @@ pub(crate) async fn forget_except(
 /// `staging::quarantine::release_retyped_keys` after the pass).
 ///
 /// Runs once per pass, after the restore check and before any table's
-/// checks, so `pause_readers_of_retyped` finds the names current.
+/// checks, so `pause_readers_of_retyped` finds the names current. The pass
+/// goes on when it fails (a definition's row locked past the pass's
+/// `lock_timeout`): no check compares a type's name, so a rename followed by
+/// a later pass pauses nothing meanwhile, and only the drains' casts by the
+/// old name fail, holding their keys until the release this asks for.
 pub(crate) async fn follow_renamed_types(client: &mut Client) -> Result<(), CaptureError> {
     // Each recorded type whose OID names it under another name now, with the
     // definitions that record it.
@@ -475,17 +479,30 @@ pub(crate) async fn follow_renamed_types(client: &mut Client) -> Result<(), Capt
             .replace("{oid}", oid)
     };
     let txn = client.transaction().await?;
+    // Every owner locked at once, in id order, before any is written: two
+    // renamed types' owners taken type by type would interleave the order.
+    // One dropped meanwhile is left out.
+    let all: Vec<i64> = renamed
+        .iter()
+        .flat_map(|(_, _, _, candidates)| candidates.iter().copied())
+        .collect::<BTreeSet<i64>>()
+        .into_iter()
+        .collect();
+    let locked: BTreeSet<i64> = txn
+        .query(
+            "select id from transform_definitions where id = any($1) order by id for update",
+            &[&all],
+        )
+        .await?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
     for (oid, old, new, candidates) in &renamed {
         let (old_token, new_token) = (format!("enum:{old}"), format!("enum:{new}"));
-        // Locked in id order; one dropped meanwhile is left out.
-        let owners: Vec<i64> = txn
-            .query(
-                "select id from transform_definitions where id = any($1) order by id for update",
-                &[candidates],
-            )
-            .await?
-            .into_iter()
-            .map(|row| row.get(0))
+        let owners: Vec<i64> = candidates
+            .iter()
+            .copied()
+            .filter(|id| locked.contains(id))
             .collect();
         if !owners.is_empty() {
             let rename = |table: &str, entries: &str| {
