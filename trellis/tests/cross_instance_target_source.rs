@@ -17,10 +17,7 @@ use std::collections::HashMap;
 use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::defs::model::RelationshipSide;
-use trellis::defs::{
-    CatalogError, ValueType, create_relationship, install_definition, tables_to_capture,
-};
+use trellis::defs::{CatalogError, ValueType, install_definition, tables_to_capture};
 use trellis::integer::IntWidth;
 use trellis::{Config, Pool, migrate};
 
@@ -302,96 +299,7 @@ async fn another_instances_one_to_one_target_over_an_aggregate_is_rejected() {
     assert!(!table_exists(&b, "public.sku_copy_b").await);
 }
 
-/// Issue #375: a relationship endpoint reaches instance B's capture through
-/// `all_source_tables`' relationship walk, not as a definition's source, so it
-/// must pass the same keying rule. Instance A's aggregate target fails it
-/// whichever side of the relationship it is on; a plain table without a
-/// primary key fails it too. A 1-1 target of A's has a key and is accepted.
-#[tokio::test]
-async fn a_relationship_endpoint_capture_cant_key_is_rejected() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let (pool_b, mut b) = two_instances(&db).await;
-    let a = connect_raw(db.dsn(), DEFAULT_SCHEMA).await;
-    a.batch_execute(
-        "create table public.visits (id integer primary key, region integer); \
-         create table public.stores (id integer primary key, region integer); \
-         create table public.keyless (region integer not null unique, name text)",
-    )
-    .await
-    .expect("create instance A's tables");
-    let int_columns = columns(&[
-        ("id", ValueType::Integer(IntWidth::Int4)),
-        ("region", ValueType::Integer(IntWidth::Int4)),
-    ]);
-    install_definition(
-        &db.pool,
-        "TRANSFORM region_visits FROM visits GROUP BY region WITHOUT SOURCE INDEX SELECT COUNT(*) AS n",
-        &int_columns,
-        "public",
-    )
-    .await
-    .expect("instance A installs an aggregate grouped on an integer");
-    install_definition(
-        &db.pool,
-        "TRANSFORM stores_copy FROM stores SELECT region AS region",
-        &int_columns,
-        "public",
-    )
-    .await
-    .expect("instance A installs a 1-1");
-
-    for (text, side, endpoint) in [
-        (
-            "RELATIONSHIP visits FROM stores.region TO region_visits.region",
-            RelationshipSide::To,
-            "public.region_visits",
-        ),
-        (
-            "RELATIONSHIP store FROM region_visits.region TO stores.region",
-            RelationshipSide::From,
-            "public.region_visits",
-        ),
-        (
-            "RELATIONSHIP named FROM stores.region TO keyless.region",
-            RelationshipSide::To,
-            "public.keyless",
-        ),
-    ] {
-        match create_relationship(&pool_b, text).await {
-            Err(CatalogError::RelationshipEndpointNotChangeKeyed {
-                side: got_side,
-                endpoint: got,
-            }) => {
-                assert_eq!(got_side, side, "{text}");
-                assert_eq!(got, endpoint, "{text}");
-            }
-            other => {
-                panic!("expected RelationshipEndpointNotChangeKeyed for {text}, got {other:?}")
-            }
-        }
-    }
-
-    // A's 1-1 target is keyed, so B may relate to it.
-    create_relationship(
-        &pool_b,
-        "RELATIONSHIP copy FROM stores.id TO stores_copy.id",
-    )
-    .await
-    .expect("instance B relates to A's 1-1 target");
-    install_definition(
-        &pool_b,
-        "TRANSFORM store_view FROM public.stores SELECT copy.region AS copied_region",
-        &int_columns,
-        "public",
-    )
-    .await
-    .expect("instance B reads through the relationship");
-    let desired = reconcile_b(&pool_b, &mut b).await;
-    assert!(b_captures(&b, "stores_copy").await, "{desired:?}");
-}
-
-/// The rule is about the table, not its owner, so a plain source table the
+/// The keying rule is about the table, not its owner, so a plain source table the
 /// capture triggers can't key is held to it too (issue #622 C5): every ring
 /// row is keyed by the primary key, so a table without one is refused even
 /// with a unique constraint or unique index on its key columns, and so is a

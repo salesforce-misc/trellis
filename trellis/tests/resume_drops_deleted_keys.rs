@@ -402,13 +402,7 @@ fn text(values: &[&[Option<&str>]]) -> Vec<Vec<Option<String>>> {
 
 async fn apply_all(operator: &Trellis, statements: &[&str]) {
     for statement in statements {
-        if statement.starts_with("RELATIONSHIP") {
-            trellis::dev::defs::create_relationship(operator.pool(), statement)
-                .await
-                .expect(statement);
-        } else {
-            operator.apply(statement).await.expect(statement);
-        }
+        operator.apply(statement).await.expect(statement);
     }
 }
 
@@ -576,69 +570,18 @@ async fn resume_drops_extinct_composite_and_null_groups() {
     operator.shutdown().await.expect("shut down");
 }
 
-/// A relationship-path `GROUP BY` key. Three groups go extinct three ways
-/// while paused: `eu` loses every order, `apac` loses its only customer to
-/// `us` (a to-side change, no order touched), and the `NULL` group (an order
-/// whose customer doesn't exist) loses its only order. Only an anti-join
-/// that joins the to-side table, as the build does, can see the `apac` case.
-#[tokio::test]
-async fn resume_drops_groups_a_relationship_key_no_longer_reaches() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
-    client
-        .batch_execute(
-            "create table customers (id bigint primary key, region text); \
-             create table orders (id bigint primary key, customer_id bigint, a numeric); \
-             insert into customers values (1, 'eu'), (2, 'us'), (3, 'apac'); \
-             insert into orders values (1, 1, 1), (2, 1, 2), (3, 2, 3), (4, 3, 4), (5, 99, 5);",
-        )
-        .await
-        .expect("seed customers and orders");
-    let operator = define_only(db.dsn()).await;
-    apply_all(
-        &operator,
-        &[
-            "RELATIONSHIP customer FROM orders.customer_id TO customers.id",
-            "TRANSFORM region_totals FROM orders GROUP BY customer.region WITHOUT SOURCE INDEX SELECT sum(a) AS total",
-        ],
+/// Holds the aggregate over `orders` writing `target` out of the Re-derive
+/// build, so that its builds and rebuilds are the old direct build's
+/// (`markers::hold_target_out_of_the_rederive_build`). That build loads the
+/// per-row ledger, so the tests using it run with the group-basis knob off.
+async fn hold_direct_build(client: &Client, target: &str) {
+    markers::hold_target_out_of_the_rederive_build(
+        client,
+        &format!("{DEFAULT_SCHEMA}.orders"),
+        &format!("{DEFAULT_TARGET_SCHEMA}.{target}"),
     )
-    .await;
-    settle(&db.pool, &mut client).await;
-    assert_eq!(
-        text_rows(
-            &client,
-            "select region, total::text from region_totals order by region"
-        )
-        .await,
-        text(&[
-            &[Some("apac"), Some("4")],
-            &[Some("eu"), Some("3")],
-            &[Some("us"), Some("3")],
-            &[None, Some("5")],
-        ]),
-        "precondition: the build grouped every order through its customer"
-    );
-
-    pause_write_resume(
-        &db,
-        &mut client,
-        &operator,
-        &["region_totals"],
-        "delete from orders where id in (1, 2, 5); \
-         update customers set region = 'us' where id = 3;",
-    )
-    .await;
-
-    assert_eq!(
-        text_rows(
-            &client,
-            "select region, total::text from region_totals order by region"
-        )
-        .await,
-        text(&[&[Some("us"), Some("7")]]),
-    );
-    operator.shutdown().await.expect("shut down");
+    .await
+    .expect("hold the aggregate out of the Re-derive build");
 }
 
 /// Claims and runs every job in the chunk queue, and nothing else: no
@@ -671,9 +614,9 @@ async fn run_queued_jobs(pool: &trellis::Pool) {
     }
 }
 
-/// Issue #815: a resumed aggregate the direct build rebuilds (here, one that
-/// reads a relationship) must not keep a group the rebuilt ledger has no
-/// entry for. The resume's sweep judges group 0 backed (order 1 is in it),
+/// Issue #815: a resumed aggregate the direct build rebuilds (here, one held
+/// out of the Re-derive build, [`hold_direct_build`]) must not keep a group
+/// the rebuilt ledger has no entry for. The resume's sweep judges group 0 backed (order 1 is in it),
 /// order 1 leaves before the build reads the source, so the build's ledger
 /// has nothing in group 0, and order 1 comes back afterwards. Its re-derive
 /// (the `Recompute` the discharge enumerated for the live sibling `g_count`,
@@ -682,38 +625,36 @@ async fn run_queued_jobs(pool: &trellis::Pool) {
 /// it twice, and the go-live sweep would keep that row, since group 0 has a
 /// live entry by then.
 #[tokio::test]
+#[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
 async fn a_resumed_direct_build_drops_the_groups_its_ledger_has_no_entry_for() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
     client
         .batch_execute(
-            "create table customers (id bigint primary key, region text); \
-             create table orders (id bigint primary key, customer_id bigint, g bigint); \
-             insert into customers values (1, 'eu'), (2, 'us'); \
-             insert into orders values (1, 1, 0), (2, 2, 1), (3, 2, null);",
+            "create table orders (id bigint primary key, g bigint); \
+             insert into orders values (1, 0), (2, 1), (3, null);",
         )
         .await
-        .expect("seed customers and orders");
+        .expect("seed orders");
+    hold_direct_build(&client, "by_g").await;
     let operator = define_only(db.dsn()).await;
     apply_all(
         &operator,
         &[
-            "RELATIONSHIP customer FROM orders.customer_id TO customers.id",
-            "TRANSFORM by_g FROM orders GROUP BY g \
-            WITHOUT SOURCE INDEX SELECT count(*) AS n, max(customer.region) AS region",
+            "TRANSFORM by_g FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT count(*) AS n",
             "TRANSFORM g_count FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT count(*) AS n",
         ],
     )
     .await;
     settle(&db.pool, &mut client).await;
-    let by_g = "select g::text, n::text, region from by_g order by g";
+    let by_g = "select g::text, n::text from by_g order by g";
     assert_eq!(
         text_rows(&client, by_g).await,
         text(&[
-            &[Some("0"), Some("1"), Some("eu")],
-            &[Some("1"), Some("1"), Some("us")],
-            &[None, Some("1"), Some("us")],
+            &[Some("0"), Some("1")],
+            &[Some("1"), Some("1")],
+            &[None, Some("1")],
         ]),
         "precondition: both groups built"
     );
@@ -748,15 +689,12 @@ async fn a_resumed_direct_build_drops_the_groups_its_ledger_has_no_entry_for() {
     assert_eq!(status(&client, "by_g").await, "catching_up");
     assert_eq!(
         text_rows(&client, by_g).await,
-        text(&[
-            &[Some("1"), Some("1"), Some("us")],
-            &[None, Some("1"), Some("us")],
-        ]),
+        text(&[&[Some("1"), Some("1")], &[None, Some("1")]]),
         "the build leaves no group its ledger has no live entry for, and keeps the NULL group"
     );
 
     client
-        .batch_execute("insert into orders values (1, 1, 0)")
+        .batch_execute("insert into orders values (1, 0)")
         .await
         .expect("order 1 comes back");
     // `by_g` applies now: the drain re-derives order 1 into group 0, before
@@ -767,9 +705,9 @@ async fn a_resumed_direct_build_drops_the_groups_its_ledger_has_no_entry_for() {
     assert_eq!(
         text_rows(&client, by_g).await,
         text(&[
-            &[Some("0"), Some("1"), Some("eu")],
-            &[Some("1"), Some("1"), Some("us")],
-            &[None, Some("1"), Some("us")],
+            &[Some("0"), Some("1")],
+            &[Some("1"), Some("1")],
+            &[None, Some("1")],
         ]),
         "order 1 is counted in group 0 once"
     );
@@ -786,28 +724,24 @@ async fn a_resumed_direct_build_drops_the_groups_its_ledger_has_no_entry_for() {
 /// strict only deletes a live group the build's group writes then write
 /// again, which this can't see.
 #[tokio::test]
+#[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
 async fn a_resumed_direct_build_matches_composite_groups_with_nulls() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
     client
         .batch_execute(
-            "create table customers (id bigint primary key, region text); \
-             create table orders (id bigint primary key, customer_id bigint, g bigint, h bigint); \
-             insert into customers values (1, 'eu'); \
-             insert into orders values (1, 1, 0, null), (2, 1, 1, null), (3, 1, null, 5), \
-                                       (4, 1, null, null), (5, 1, 0, 7);",
+            "create table orders (id bigint primary key, g bigint, h bigint); \
+             insert into orders values (1, 0, null), (2, 1, null), (3, null, 5), \
+                                       (4, null, null), (5, 0, 7);",
         )
         .await
-        .expect("seed customers and orders");
+        .expect("seed orders");
+    hold_direct_build(&client, "by_gh").await;
     let operator = define_only(db.dsn()).await;
     apply_all(
         &operator,
-        &[
-            "RELATIONSHIP customer FROM orders.customer_id TO customers.id",
-            "TRANSFORM by_gh FROM orders GROUP BY g, h \
-            WITHOUT SOURCE INDEX SELECT count(*) AS n, max(customer.region) AS region",
-        ],
+        &["TRANSFORM by_gh FROM orders GROUP BY g, h WITHOUT SOURCE INDEX SELECT count(*) AS n"],
     )
     .await;
     settle(&db.pool, &mut client).await;
@@ -854,94 +788,6 @@ async fn a_resumed_direct_build_matches_composite_groups_with_nulls() {
             &[None, None, Some("1")],
         ]),
         "only (0, NULL) is gone"
-    );
-    operator.shutdown().await.expect("shut down");
-}
-
-/// Issue #815 review: a group the direct build deletes must reach a
-/// consumer that reads the resumed target through a to-one relationship.
-/// `tag_view` reads `by_g.n` for tag 10 through group 0, which the build
-/// deletes because order 1 left between the resume's sweep and the build's
-/// read. The target catch-up enumerates `by_g`'s current keys, which no
-/// longer include 0, so only the delete itself can tell `tag_view`.
-#[tokio::test]
-async fn a_group_a_resumed_direct_build_deletes_reaches_a_to_one_consumer() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
-    client
-        .batch_execute(
-            "create table customers (id bigint primary key, region text); \
-             create table orders (id bigint primary key, customer_id bigint, g bigint); \
-             create table tags (id bigint primary key, g bigint); \
-             insert into customers values (1, 'eu'), (2, 'us'); \
-             insert into orders values (1, 1, 0), (2, 2, 1); \
-             insert into tags values (10, 0), (11, 1);",
-        )
-        .await
-        .expect("seed");
-    let operator = define_only(db.dsn()).await;
-    apply_all(
-        &operator,
-        &[
-            "RELATIONSHIP customer FROM orders.customer_id TO customers.id",
-            "TRANSFORM by_g FROM orders GROUP BY g \
-            WITHOUT SOURCE INDEX SELECT count(*) AS n, max(customer.region) AS region",
-        ],
-    )
-    .await;
-    settle(&db.pool, &mut client).await;
-    apply_all(
-        &operator,
-        &[
-            "RELATIONSHIP grp FROM tags.g TO by_g.g",
-            "TRANSFORM tag_view FROM tags SELECT grp.n AS n",
-        ],
-    )
-    .await;
-    settle(&db.pool, &mut client).await;
-    let tag_view = "select id::text, n::text from tag_view order by id";
-    assert_eq!(
-        text_rows(&client, tag_view).await,
-        text(&[&[Some("10"), Some("1")], &[Some("11"), Some("1")]]),
-        "precondition: tag_view reads both groups"
-    );
-
-    operator.apply("PAUSE TRANSFORM by_g").await.expect("pause");
-    operator
-        .apply("RESUME TRANSFORM by_g")
-        .await
-        .expect("resume");
-    client
-        .batch_execute("select txid_current()")
-        .await
-        .expect("consume an xid");
-    markers::run_pending_backfills(
-        &mut client,
-        "wake",
-        &StagedWatermark::saturated(),
-        Duration::ZERO,
-    )
-    .await
-    .expect("discharge the resume's marker");
-    assert_eq!(status(&client, "by_g").await, "backfilling");
-    client
-        .batch_execute("delete from orders where id = 1")
-        .await
-        .expect("delete order 1 before the build reads it");
-    run_queued_jobs(&db.pool).await;
-    drain_to_quiescence(&db.pool, &mut client).await;
-    settle(&db.pool, &mut client).await;
-    assert_eq!(status(&client, "by_g").await, "live");
-    assert_eq!(
-        text_rows(&client, "select g::text, n::text from by_g order by g").await,
-        text(&[&[Some("1"), Some("1")]]),
-        "group 0 is gone"
-    );
-    assert_eq!(
-        text_rows(&client, tag_view).await,
-        text(&[&[Some("10"), None], &[Some("11"), Some("1")]]),
-        "tag 10's group is gone, so it reads nothing through grp"
     );
     operator.shutdown().await.expect("shut down");
 }
@@ -1118,32 +964,24 @@ async fn resume_drops_orphans_from_mixed_case_targets() {
 /// The failure is a trigger on `pending_backfill` that refuses the marker's
 /// delete, which runs after the sweep, the dispatch and the enumeration's
 /// staging. A lock timeout, a conflict or a lost connection there rolls back
-/// the same way. The resumed aggregate is relationship-fed (an extra field
-/// reads a to-one relationship's column), so its rebuild is still a
-/// direct-build job behind a marker until #625 F9 (every plain aggregate is
-/// the Re-derive build's since #625 F5, and parks none), and a live 1-1
-/// sibling on the same source is what makes this discharge enumerate (its
-/// catch-up) and stage.
+/// the same way. The resumed aggregate is held out of the Re-derive build
+/// ([`hold_direct_build`]), so its rebuild is a direct-build job behind a
+/// marker (every other aggregate is the Re-derive build's since #625 F5, and
+/// parks none), and a live 1-1 sibling on the same source is what makes this
+/// discharge enumerate (its catch-up) and stage.
 #[tokio::test]
+#[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
 async fn a_discharge_that_fails_after_its_sweep_leaves_the_target_as_it_was() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
     create_orders(&client).await;
-    client
-        .batch_execute(
-            "create table grps (id bigint primary key, w numeric); \
-             insert into grps values (0, 10), (1, 11)",
-        )
-        .await
-        .expect("create + seed the relationship's to-side");
+    hold_direct_build(&client, "order_rollup").await;
     let operator = define_only(db.dsn()).await;
     apply_all(
         &operator,
         &[
-            "RELATIONSHIP grp FROM orders.g TO grps.id",
-            "TRANSFORM order_rollup FROM orders GROUP BY g \
-            WITHOUT SOURCE INDEX SELECT sum(a) AS total, max(grp.w) AS w",
+            "TRANSFORM order_rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total",
             "TRANSFORM order_doubles FROM orders SELECT a + a AS x",
         ],
     )

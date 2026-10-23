@@ -8,8 +8,8 @@
 //!
 //! Trellis runs as a non-superuser login role, `holdup_trellis`, owning the
 //! application's tables, and the drain as a second one, `holdup_worker`,
-//! granted what it uses, so a column grant can be taken away from the drain
-//! alone (capture's functions run as the tables' owner and keep reading).
+//! granted what it uses, so a column grant on a target can be taken away
+//! from the drain alone.
 //! Nothing polls for convergence (#297): every seal, capture pass and drain
 //! is stepped by hand, one drain call at a time.
 
@@ -41,9 +41,8 @@ struct Instance {
 }
 
 /// `public.p` (3 rows), `public.c` (6 rows, `pid` naming a `p`) and
-/// `public.q` (6 rows), owned by `holdup_trellis`, which runs Trellis;
-/// `c.pid` related to `p.id` as `parent`, and `c.id` to `q.id` as `twin`;
-/// and `ddl`'s definitions, live, with nothing left to drain.
+/// `public.q` (6 rows), owned by `holdup_trellis`, which runs Trellis; and
+/// `ddl`'s definitions, live, with nothing left to drain.
 async fn instance(cluster: &TestCluster, ddl: &[&str]) -> Instance {
     let db = cluster.create_empty_database().await;
     let admin = connect(db.dsn()).await;
@@ -76,14 +75,6 @@ async fn instance(cluster: &TestCluster, ddl: &[&str]) -> Instance {
     let trellis = trellis::Trellis::connect(config, trellis::TrellisOptions::default())
         .await
         .expect("connect");
-    for relationship in [
-        "RELATIONSHIP parent FROM c.pid TO p.id",
-        "RELATIONSHIP twin FROM c.id TO q.id",
-    ] {
-        trellis::dev::defs::create_relationship(trellis.pool(), relationship)
-            .await
-            .expect(relationship);
-    }
     for statement in ddl {
         trellis.apply(statement).await.expect(statement);
     }
@@ -132,9 +123,8 @@ async fn capture_pass(raw: &mut Client, pool: &trellis::Pool) {
 }
 
 /// A drain role, `holdup_worker`, holding every privilege the drain uses on
-/// Trellis's schema and the application's tables, but on `public.c` only
-/// `SELECT`, column by column. Returns a pool logged in as it, and one whose
-/// sessions also run with `options`.
+/// Trellis's schema and the application's tables. Returns a pool logged in
+/// as it, whose sessions also run with `options`.
 async fn worker(it: &Instance, options: &str) -> trellis::Pool {
     it.admin
         .batch_execute(&format!(
@@ -146,9 +136,7 @@ async fn worker(it: &Instance, options: &str) -> trellis::Pool {
              grant usage on schema {SCHEMA}, public to holdup_worker; \
              grant all on all tables in schema {SCHEMA} to holdup_worker; \
              grant all on all sequences in schema {SCHEMA} to holdup_worker; \
-             grant all on all tables in schema public to holdup_worker; \
-             revoke all on public.c from holdup_worker; \
-             grant select (id, pid, amount) on public.c to holdup_worker;"
+             grant all on all tables in schema public to holdup_worker;"
         ))
         .await
         .expect("a drain role");
@@ -243,39 +231,50 @@ async fn charged(admin: &Client) -> i64 {
 }
 
 const READERS: [&str; 4] = [
-    // Reads `c`, and `p` through `parent`.
-    "TRANSFORM c_named FROM public.c SELECT amount AS amount, parent.name AS name",
+    // Reads `c`, writing a column the drain's role keeps.
+    "TRANSFORM c_pid FROM public.c SELECT pid AS pid",
     // Reads `p`.
     "TRANSFORM p_copy FROM public.p SELECT name AS name",
-    // Reads `c` alone: `twin` is declared on `c`, but it doesn't read through it.
+    // Reads `c`, writing the column [`refuse_a_column_and_write`] takes away.
     "TRANSFORM c_copy FROM public.c SELECT amount AS amount",
-    // Reads `q` alone.
+    // Reads `q`.
     "TRANSFORM q_copy FROM public.q SELECT v AS v",
 ];
 
-/// Takes `SELECT` on `c.pid` from the drain's role, keeping it on `c`'s
-/// other columns, and renames `p` row `id`. `c_named` reads that name, so
-/// its page holds the change to `p` and a recompute of each `c` row naming
-/// it, whose re-read of `c` Postgres refuses. The catalog can't pin the
-/// refusal on `c`: a column grant counts as holding the privilege.
-async fn refuse_a_column_and_rename(it: &Instance, id: i32) {
+/// Takes `UPDATE` on `c_copy.amount` from the drain's role, keeping it on
+/// `c_copy`'s key, and changes `c` row `id`'s amount, so the page holding
+/// that change writes `c_copy.amount`, which Postgres refuses. The catalog
+/// can't pin the refusal on `c_copy`: a column grant counts as holding the
+/// privilege.
+async fn refuse_a_column_and_write(it: &Instance, id: i32) {
     it.admin
-        .batch_execute("revoke select (pid) on public.c from holdup_worker")
+        .batch_execute(
+            "revoke update on public.c_copy from holdup_worker; \
+             grant update (id) on public.c_copy to holdup_worker",
+        )
         .await
         .expect("take a column grant away");
     it.admin
         .execute(
-            "update public.p set name = 'renamed' || id where id = $1",
+            "update public.c set amount = amount + 100 where id = $1",
             &[&id],
         )
         .await
-        .expect("write the to-side");
+        .expect("write the source");
 }
 
-/// The issue's first two cases. A refused read the catalog can't pin on a
+/// Gives `UPDATE` on `c_copy.amount` back to the drain's role.
+async fn restore_the_column(it: &Instance) {
+    it.admin
+        .batch_execute("grant update (amount) on public.c_copy to holdup_worker")
+        .await
+        .expect("restore the grant");
+}
+
+/// The issue's first two cases. A refused write the catalog can't pin on a
 /// table pauses nothing, so the drain records a holdup. `status` reports it
-/// on each reader of the page's tables, `c` and `p`, and not on `q_copy`,
-/// which reads neither, and `self_check` reports it for the instance.
+/// on each reader of the page's table, `c`, and not on `p_copy` or `q_copy`,
+/// which don't read it, and `self_check` reports it for the instance.
 /// Nothing is paused or charged. Another failed pass counts an attempt,
 /// keeping `since`. Restoring the grant, the next drain commits the page and
 /// the holdup goes with it.
@@ -284,14 +283,14 @@ async fn an_unpinned_refusal_is_a_holdup_its_readers_report_until_the_page_commi
     let cluster = TestCluster::start();
     let mut it = instance(&cluster, &READERS).await;
     let worker = worker(&it, "").await;
-    refuse_a_column_and_rename(&it, 2).await;
+    refuse_a_column_and_write(&it, 2).await;
     let seg = seal(&mut it.raw).await;
     let err = drain(&worker, seg)
         .await
-        .expect_err("the refused read surfaces");
+        .expect_err("the refused write surfaces");
     assert!(err.contains("permission denied"), "{err}");
 
-    let page = vec!["public.c".to_string(), "public.p".to_string()];
+    let page = vec!["public.c".to_string()];
     let rows = holdups(&it.admin).await;
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0].seg_seq, seg);
@@ -300,7 +299,7 @@ async fn an_unpinned_refusal_is_a_holdup_its_readers_report_until_the_page_commi
     assert_eq!(rows[0].attempts, 1);
     assert!(!rows[0].buckets.is_empty());
 
-    for reader in ["c_named", "p_copy", "c_copy"] {
+    for reader in ["c_pid", "c_copy"] {
         let reported = status(&it, reader).await;
         assert_eq!(
             reported.status,
@@ -318,11 +317,10 @@ async fn an_unpinned_refusal_is_a_holdup_its_readers_report_until_the_page_commi
         assert!(failure.error.contains("permission denied"), "{failure:?}");
         assert_eq!(failure.since, rows[0].since);
     }
-    let unaffected = status(&it, "q_copy").await;
-    assert_eq!(
-        unaffected.drain_failure, None,
-        "q_copy reads neither c nor p"
-    );
+    for reader in ["p_copy", "q_copy"] {
+        let unaffected = status(&it, reader).await;
+        assert_eq!(unaffected.drain_failure, None, "{reader} doesn't read c");
+    }
     assert_eq!(charged(&it.admin).await, 0, "no key was charged");
 
     let report = it
@@ -346,16 +344,13 @@ async fn an_unpinned_refusal_is_a_holdup_its_readers_report_until_the_page_commi
 
     drain(&worker, seg)
         .await
-        .expect_err("the refused read surfaces again");
+        .expect_err("the refused write surfaces again");
     let again = holdups(&it.admin).await;
     assert_eq!(again.len(), 1, "{again:?}");
     assert_eq!(again[0].attempts, 2);
     assert_eq!(again[0].since, rows[0].since, "since is the first failure");
 
-    it.admin
-        .batch_execute("grant select (pid) on public.c to holdup_worker")
-        .await
-        .expect("restore the grant");
+    restore_the_column(&it).await;
     drain(&worker, seg)
         .await
         .expect("the page commits once the grant is back");
@@ -375,11 +370,11 @@ async fn an_unpinned_refusal_is_a_holdup_its_readers_report_until_the_page_commi
 #[tokio::test]
 async fn each_failing_page_has_its_own_holdup_cleared_by_its_own_commit() {
     let cluster = TestCluster::start();
-    let mut it = instance(&cluster, &READERS[..1]).await;
+    let mut it = instance(&cluster, &READERS[2..3]).await;
     let worker = worker(&it, "").await;
     let mut segs = Vec::new();
     for id in [1, 2] {
-        refuse_a_column_and_rename(&it, id).await;
+        refuse_a_column_and_write(&it, id).await;
         segs.push(seal(&mut it.raw).await);
     }
     for &seg in &segs {
@@ -393,18 +388,12 @@ async fn each_failing_page_has_its_own_holdup_cleared_by_its_own_commit() {
         "{rows:?}"
     );
     assert_eq!(
-        status(&it, "c_named")
-            .await
-            .drain_failure
-            .map(|f| f.seg_seq),
+        status(&it, "c_copy").await.drain_failure.map(|f| f.seg_seq),
         Some(segs[0]),
         "status reports the oldest"
     );
 
-    it.admin
-        .batch_execute("grant select (pid) on public.c to holdup_worker")
-        .await
-        .expect("restore the grant");
+    restore_the_column(&it).await;
     drain(&worker, segs[0])
         .await
         .expect("the first page commits");
@@ -418,25 +407,20 @@ async fn each_failing_page_has_its_own_holdup_cleared_by_its_own_commit() {
         "the second page's holdup stays until its own page commits"
     );
     assert_eq!(
-        status(&it, "c_named")
-            .await
-            .drain_failure
-            .map(|f| f.seg_seq),
+        status(&it, "c_copy").await.drain_failure.map(|f| f.seg_seq),
         Some(segs[1])
     );
     drain(&worker, segs[1])
         .await
         .expect("the second page commits");
     assert!(holdups(&it.admin).await.is_empty());
-    assert_eq!(status(&it, "c_named").await.drain_failure, None);
+    assert_eq!(status(&it, "c_copy").await.drain_failure, None);
     it.trellis.shutdown().await.expect("shutdown");
 }
 
 /// Who `status` reports a holdup on, from hand-written rows: every
-/// definition reading a table on the page as its source, or through a
-/// relationship its fields name, unless it is frozen. A relationship
-/// declared on a definition's source that it doesn't read through doesn't
-/// count.
+/// definition reading a table on the page as its source, unless it is
+/// frozen.
 #[tokio::test]
 async fn status_reports_a_holdup_on_each_unfrozen_reader_of_its_tables() {
     let cluster = TestCluster::start();
@@ -468,25 +452,17 @@ async fn status_reports_a_holdup_on_each_unfrozen_reader_of_its_tables() {
         .batch_execute(&holdup("{public.p}"))
         .await
         .expect("hold a page of p");
-    assert_eq!(
-        reporting(&it).await,
-        vec!["c_named", "p_copy"],
-        "p's reader, and c_named through parent"
-    );
+    assert_eq!(reporting(&it).await, vec!["p_copy"], "p's reader alone");
     it.admin
         .batch_execute(&holdup("{public.q}"))
         .await
         .expect("hold a page of q");
-    assert_eq!(
-        reporting(&it).await,
-        vec!["q_copy"],
-        "c_copy and c_named don't read through twin"
-    );
+    assert_eq!(reporting(&it).await, vec!["q_copy"], "q's reader alone");
     it.admin
         .batch_execute(&holdup("{public.c}"))
         .await
         .expect("hold a page of c");
-    assert_eq!(reporting(&it).await, vec!["c_named", "c_copy"]);
+    assert_eq!(reporting(&it).await, vec!["c_pid", "c_copy"]);
 
     it.trellis
         .apply("PAUSE TRANSFORM c_copy")
@@ -494,7 +470,7 @@ async fn status_reports_a_holdup_on_each_unfrozen_reader_of_its_tables() {
         .expect("pause c_copy");
     assert_eq!(
         reporting(&it).await,
-        vec!["c_named"],
+        vec!["c_pid"],
         "a paused definition applies nothing, so it isn't held back"
     );
     it.trellis.shutdown().await.expect("shutdown");

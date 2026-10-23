@@ -43,7 +43,6 @@ async fn installs_a_trivial_def_and_converges_dml_to_the_expected_snapshot() {
 
     let program = Program {
         tables: vec![source.clone()],
-        relationships: Vec::new(),
         defs: vec![def],
         def_install_after_op: vec![0],
         ops: vec![
@@ -144,7 +143,7 @@ async fn installs_a_trivial_def_and_converges_dml_to_the_expected_snapshot() {
 /// `ManualBackend::force_seal_active_segment` has to keep working past one
 /// lap of the staging ring (4 slots, `trellis::staging::append::RING_SIZE`)
 /// even when no maintenance tick runs in between to retire drained slots.
-/// `relationship_interleaving.rs`'s seal-boundary pins used to fail
+/// Seal-boundary pins that force their own seals used to fail
 /// intermittently with `RingFull { ring_slot: 2 }`: a forced seal hit a
 /// slot whose drained occupant was retirable, but only the engine's
 /// maintenance tick ever retired anything, and whether a tick had landed in
@@ -176,7 +175,6 @@ async fn forced_seals_lap_the_ring_without_a_maintenance_tick() {
     };
     let program = Program {
         tables: vec![source],
-        relationships: Vec::new(),
         defs: vec![def],
         def_install_after_op: vec![0],
         ops: Vec::new(),

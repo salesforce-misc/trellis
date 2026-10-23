@@ -15,22 +15,7 @@
 //! - a second 1-1 over the source (`apply_one`): define, `PAUSE`, `RESUME`,
 //!   `PAUSE` again and `DROP` (a drop needs a paused definition), back to
 //!   back, its build left running in between;
-//! - an aggregate over the source (`apply_agg`): define, `PAUSE`, `DROP`;
-//! - a to-one relationship from the source to a `--groups`-row table
-//!   (`agg_grp`), then `DROP RELATIONSHIP`;
-//! - with `--apply-latency-big-to-side`, also a relationship whose to-side is
-//!   the loaded source itself (from a one-row `apply_parent`), then its
-//!   `DROP`: declaring a to-one relationship seeds its parent projection
-//!   from the whole to-side inside the call (`defs::catalog::
-//!   ensure_relationship_projection_in_txn`), which milestone E (#624)
-//!   replaces, so this measures that cost rather than gating on it. On the
-//!   100M source that seed outlasts the stock 30 s call deadline (#599), so
-//!   these two statements go through a second handle whose deadline is the
-//!   build timeout ([`long_call_options`]); every other statement keeps the
-//!   stock deadline, so one that outlasts it still shows as a failure.
-//!   Relationships are declared and dropped through the dev door now
-//!   (`trellis::dev::defs`), which no call deadline bounds, until #1115
-//!   removes them.
+//! - an aggregate over the source (`apply_agg`): define, `PAUSE`, `DROP`.
 //!
 //! The added field is dropped again, so the scenario's oracle still compares
 //! the target's own columns.
@@ -144,39 +129,14 @@ impl ApplyAudit {
     }
 }
 
-/// The options of the handle that carries `--apply-latency-big-to-side`'s two
-/// statements: the stock ones with the call deadline raised to `build_timeout`
-/// (the scenario's bound on any one wait), so the seed of a 100M-row to-side
-/// is timed instead of ending in `CallTimeout` at 30 s (#1011).
-fn long_call_options(build_timeout: Duration) -> trellis::TrellisOptions {
-    trellis::TrellisOptions {
-        call_deadline: Some(build_timeout.max(trellis::DEFAULT_CALL_BUDGET)),
-        ..Default::default()
-    }
-}
-
-/// Times `statement` through `trellis.apply`. `RELATIONSHIP` and
-/// `DROP RELATIONSHIP` are no longer statements `apply` takes (#1115): they go
-/// through the dev door's `create_relationship`/`drop_relationship` on the
-/// handle's pool, which no call deadline bounds.
+/// Times `statement` through `trellis.apply`.
 async fn timed(trellis: &trellis::Trellis, name: &'static str, statement: &str) -> Timed {
     let started = Instant::now();
-    let result = if let Some(address) = statement.strip_prefix("DROP RELATIONSHIP ") {
-        trellis::dev::defs::drop_relationship(trellis.pool(), address)
-            .await
-            .map_err(|e| e.to_string())
-    } else if statement.starts_with("RELATIONSHIP") {
-        trellis::dev::defs::create_relationship(trellis.pool(), statement)
-            .await
-            .map(|_| ())
-            .map_err(|e| e.to_string())
-    } else {
-        trellis
-            .apply(statement)
-            .await
-            .map(|_| ())
-            .map_err(|e| e.to_string())
-    };
+    let result = trellis
+        .apply(statement)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string());
     let secs = started.elapsed().as_secs_f64();
     let error = result.err();
     match &error {
@@ -216,16 +176,14 @@ async fn built(raw: &RawClient, target: &str, since: Instant, deadline: Duration
     }
 }
 
-/// Runs the audit over `source` (`public.<source>`, `groups` distinct
-/// `grp`s) and the live 1-1 `target` (see the module doc). `build_timeout`
-/// bounds each rebuild's wait.
+/// Runs the audit over `source` (`public.<source>`) and the live 1-1
+/// `target` (see the module doc). `build_timeout` bounds each rebuild's
+/// wait.
 pub async fn run(
     dsn: &str,
     raw: &RawClient,
     source: &str,
     target: &str,
-    groups: i32,
-    big_to_side: bool,
     build_timeout: Duration,
 ) -> ApplyAudit {
     let trellis = trellis::Trellis::connect(
@@ -234,15 +192,6 @@ pub async fn run(
     )
     .await
     .expect("connect a define-only Trellis");
-    raw.batch_execute(&format!(
-        "create table public.agg_grp (id integer primary key, label text); \
-         insert into public.agg_grp select g, 'g' || g from generate_series(0, {groups}) g; \
-         create table public.apply_parent (id bigint primary key); \
-         insert into public.apply_parent values (1);"
-    ))
-    .await
-    .expect("create the relationship to-sides");
-
     let mut audit = ApplyAudit::default();
 
     let started = Instant::now();
@@ -330,51 +279,6 @@ pub async fn run(
         .statements
         .push(timed(&trellis, "drop_agg", "DROP TRANSFORM apply_agg").await);
 
-    audit.statements.push(
-        timed(
-            &trellis,
-            "define_relationship",
-            &format!("RELATIONSHIP apply_rel FROM {source}.grp TO agg_grp.id"),
-        )
-        .await,
-    );
-    audit.statements.push(
-        timed(
-            &trellis,
-            "drop_relationship",
-            &format!("DROP RELATIONSHIP {source}.apply_rel"),
-        )
-        .await,
-    );
-
-    if big_to_side {
-        let long = trellis::Trellis::connect(
-            trellis::Config::from_dsn(dsn.to_string()).expect("valid dsn"),
-            long_call_options(build_timeout),
-        )
-        .await
-        .expect("connect the long-deadline define-only Trellis");
-        audit.statements.push(
-            timed(
-                &long,
-                "define_relationship_big_to_side",
-                &format!("RELATIONSHIP apply_big FROM apply_parent.id TO {source}.id"),
-            )
-            .await,
-        );
-        audit.statements.push(
-            timed(
-                &long,
-                "drop_relationship_big_to_side",
-                "DROP RELATIONSHIP apply_parent.apply_big",
-            )
-            .await,
-        );
-        long.shutdown()
-            .await
-            .expect("shut the long-deadline Trellis down");
-    }
-
     trellis
         .shutdown()
         .await
@@ -385,15 +289,6 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_big_to_side_handle_outlasts_the_stock_call_deadline() {
-        let long = long_call_options(Duration::from_secs(3600));
-        assert_eq!(long.call_deadline, Some(Duration::from_secs(3600)));
-        // A short build timeout never lowers it below the stock deadline.
-        let short = long_call_options(Duration::from_secs(5));
-        assert_eq!(short.call_deadline, Some(trellis::DEFAULT_CALL_BUDGET));
-    }
 
     #[test]
     fn a_failed_statement_is_counted_and_reported() {

@@ -5,11 +5,9 @@
 //! Bare names resolve through `information_schema.tables` and the
 //! connection's `search_path`, which hide a table the role holds no
 //! privilege on and skip a schema it lacks `USAGE` on. Before #933, a
-//! `RELATIONSHIP` to such a table was refused as "must be a plain table ...
-//! with a primary key" or as a column that "does not exist", and a
-//! `TRANSFORM` from it as "not found". Each case here covers a define path
-//! that resolves a name: a `TRANSFORM`'s bare and qualified `FROM`, and a
-//! `RELATIONSHIP`'s endpoints.
+//! `TRANSFORM` from such a table was refused as "not found". Each case here
+//! covers a define path that resolves a name: a `TRANSFORM`'s bare and
+//! qualified `FROM`, and either side of a `JOIN`.
 //!
 //! The roles follow `docs/recommendations.md` ("One Trellis role"): the
 //! `trellis` login role is a member of `app_owner`, which owns the sources,
@@ -24,6 +22,11 @@ use trellis::{CatalogError, Config, ErrorCode, Trellis, TrellisOptions};
 
 const SCHEMA: &str = trellis::config::DEFAULT_SCHEMA;
 const TARGETS: &str = "trellis_targets";
+
+/// A `JOIN` from `orders` to `customers`.
+const JOIN_CUSTOMERS: &str = "TRANSFORM by_amount FROM public.orders JOIN public.customers \
+     ON orders.customer_id = customers.id GROUP BY orders.amount WITHOUT SOURCE INDEX \
+     SELECT orders.amount AS amount, COUNT(*) AS n";
 
 async fn connect(dsn: &str) -> Client {
     let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
@@ -86,23 +89,14 @@ async fn set_up(cluster: &TestCluster) -> (testkit::TestDatabase, Client, trelli
 
 /// `statement` is refused with #933's message: it names `table`, says what
 /// the role lacks (`lacks`), and points at the doc section that lists the
-/// grants. A `RELATIONSHIP` goes through the dev door's `create_relationship`, the
-/// only way left to declare one.
+/// grants.
 async fn assert_refused(trellis: &Trellis, statement: &str, table: &str, lacks: &str) {
-    let (message, code) = if statement.starts_with("RELATIONSHIP") {
-        let err = trellis::dev::defs::create_relationship(trellis.pool(), statement)
-            .await
-            .err()
-            .unwrap_or_else(|| panic!("{statement}: accepted"));
-        (err.to_string(), err.code())
-    } else {
-        let err = trellis
-            .apply(statement)
-            .await
-            .err()
-            .unwrap_or_else(|| panic!("{statement}: accepted"));
-        (err.to_string(), err.code())
-    };
+    let err = trellis
+        .apply(statement)
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("{statement}: accepted"));
+    let (message, code) = (err.to_string(), err.code());
     for wanted in [
         format!("\"{table}\""),
         "role \"trellis\"".to_string(),
@@ -129,18 +123,14 @@ async fn a_table_the_role_holds_no_privilege_on_is_refused_naming_its_owner() {
     let (_db, _admin, _pool, trellis) = set_up(&cluster).await;
     let lacks = "isn't a member of \"other_owner\", the table's owner";
 
-    // The to-side: `orders` is visible, `customers` isn't.
+    // The joined side: `orders` is visible, `customers` isn't.
+    assert_refused(&trellis, JOIN_CUSTOMERS, "public.customers", lacks).await;
+    // The `FROM` side.
     assert_refused(
         &trellis,
-        "RELATIONSHIP customer FROM orders.customer_id TO customers.id",
-        "public.customers",
-        lacks,
-    )
-    .await;
-    // The from-side.
-    assert_refused(
-        &trellis,
-        "RELATIONSHIP order_of FROM customers.id TO orders.id",
+        "TRANSFORM by_order FROM public.customers JOIN public.orders \
+         ON customers.id = orders.customer_id GROUP BY orders.amount WITHOUT SOURCE INDEX \
+         SELECT orders.amount AS amount, COUNT(*) AS n",
         "public.customers",
         lacks,
     )
@@ -177,13 +167,7 @@ async fn a_table_in_a_schema_the_role_lacks_usage_on_is_refused_naming_the_schem
         .expect("revoke USAGE on public");
 
     let lacks = "lacks USAGE on schema \"public\"";
-    assert_refused(
-        &trellis,
-        "RELATIONSHIP customer FROM orders.customer_id TO customers.id",
-        "public.orders",
-        lacks,
-    )
-    .await;
+    assert_refused(&trellis, JOIN_CUSTOMERS, "public.orders", lacks).await;
     assert_refused(
         &trellis,
         "TRANSFORM order_copy FROM orders SELECT amount AS amount",

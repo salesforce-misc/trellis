@@ -63,10 +63,6 @@ pub mod validate;
 // `cargo build` free of `unused_imports` rather than an `allow`.
 pub use ast::{AlterTransform, DefinitionRef, Statement, StatementKind, TransformRef, ValueType};
 pub use catalog::{CatalogError, alter_transform, install_definition, tables_to_capture};
-// No statement reaches it: only tests and `dev` declare a relationship, until
-// #1115 removes them.
-#[cfg(any(test, feature = "test-util"))]
-pub use catalog::create_relationship;
 pub use error::ParseError;
 pub use model::{RelationshipDefinition, TransformStatus};
 pub use parser::{parse_statement, statement_kind};
@@ -126,11 +122,9 @@ pub use invertibility::{AggregateArg, CountArg, Invertibility, PartialField, Ver
 #[cfg(any(test, feature = "internals"))]
 pub use model::{EdgeKind, NodeKind, SchemaEdge, SchemaNode};
 #[cfg(any(test, feature = "internals"))]
-pub use parser::parse_relationship;
-#[cfg(any(test, feature = "internals"))]
 pub use validate::{
     KeyColumnRole, NondeterministicCollationTextFunction, NondeterministicKeyCollation,
-    RelationshipTypeMismatch, RelationshipWarning, ValidationError,
+    RelationshipTypeMismatch, ValidationError,
 };
 
 #[cfg(test)]
@@ -873,115 +867,6 @@ mod tests {
                 },
             }]
         );
-    }
-
-    #[test]
-    fn parses_a_relationship_declaration() {
-        let rel = parse_relationship(
-            "RELATIONSHIP product FROM order_line_items.product_id TO products.id",
-        )
-        .unwrap();
-        assert_eq!(
-            rel,
-            RelationshipDef {
-                name: "product".to_string(),
-                from_table: "order_line_items".to_string(),
-                from_col: "product_id".to_string(),
-                to_table: "products".to_string(),
-                to_col: "id".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn parses_a_second_relationship_declaration_with_different_names() {
-        let rel =
-            parse_relationship("RELATIONSHIP author FROM posts.author_id TO users.id").unwrap();
-        assert_eq!(
-            rel,
-            RelationshipDef {
-                name: "author".to_string(),
-                from_table: "posts".to_string(),
-                from_col: "author_id".to_string(),
-                to_table: "users".to_string(),
-                to_col: "id".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn relationship_keywords_are_case_insensitive() {
-        let rel = parse_relationship(
-            "relationship product from order_line_items.product_id to products.id",
-        )
-        .unwrap();
-        assert_eq!(rel.name, "product");
-    }
-
-    #[test]
-    fn rejects_relationship_missing_from() {
-        let err =
-            parse_relationship("RELATIONSHIP product order_line_items.product_id TO products.id")
-                .unwrap_err();
-        match err {
-            ParseError::UnexpectedToken { expected, .. } => assert_eq!(expected, "'FROM'"),
-            other => panic!("expected UnexpectedToken, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn rejects_relationship_missing_dot_on_from_column() {
-        let err = parse_relationship("RELATIONSHIP product FROM order_line_items TO products.id")
-            .unwrap_err();
-        match err {
-            ParseError::UnexpectedToken { expected, .. } => assert_eq!(expected, "'.'"),
-            other => panic!("expected UnexpectedToken, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn rejects_relationship_missing_to() {
-        let err =
-            parse_relationship("RELATIONSHIP product FROM order_line_items.product_id products.id")
-                .unwrap_err();
-        match err {
-            ParseError::UnexpectedToken { expected, .. } => assert_eq!(expected, "'TO'"),
-            other => panic!("expected UnexpectedToken, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn rejects_relationship_missing_name() {
-        let err =
-            parse_relationship("RELATIONSHIP FROM order_line_items.product_id TO products.id")
-                .unwrap_err();
-        match err {
-            ParseError::UnexpectedToken { expected, .. } => assert_eq!(expected, "'FROM'"),
-            other => panic!("expected UnexpectedToken, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn rejects_relationship_trailing_garbage() {
-        let err = parse_relationship(
-            "RELATIONSHIP product FROM order_line_items.product_id TO products.id EXTRA",
-        )
-        .unwrap_err();
-        match err {
-            ParseError::UnexpectedToken { expected, .. } => assert_eq!(expected, "end of input"),
-            other => panic!("expected UnexpectedToken, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn rejects_relationship_missing_dot_on_to_column() {
-        let err =
-            parse_relationship("RELATIONSHIP product FROM order_line_items.product_id TO products")
-                .unwrap_err();
-        match err {
-            ParseError::UnexpectedEof { expected } => assert_eq!(expected, "'.'"),
-            other => panic!("expected UnexpectedEof, got {other:?}"),
-        }
     }
 
     #[test]

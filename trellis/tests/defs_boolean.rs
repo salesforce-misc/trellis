@@ -80,8 +80,8 @@ use trellis::defs::ast::ValueType;
 use trellis::defs::eval::{RegexCache, Row, Value, evaluate_aggregate};
 use trellis::defs::invertibility::{AggregateArg, Invertibility, classify};
 use trellis::defs::{
-    create_aggregate_target_table, create_definition, create_relationship, parse, registry,
-    source_primary_key, validate,
+    CatalogError, ValidationError, create_aggregate_target_table, create_definition,
+    install_definition, parse, registry, source_primary_key, validate,
 };
 use trellis::integer::IntWidth;
 use trellis::staging::{StagedWatermark, apply, seal};
@@ -109,6 +109,24 @@ async fn connect_raw(dsn: &str) -> Client {
         .await
         .expect("session bootstrap");
     client
+}
+
+/// Defines a `JOIN` whose one `ON` term pairs `left.lcol` with
+/// `right.rcol`. `JOIN` key admission reads the same allowlist
+/// (`catalog::is_text_stable_join_key_type`) a 1-1 primary key does.
+async fn define_join_on(
+    pool: &trellis::pool::Pool,
+    target: &str,
+    (left, lcol): (&str, &str),
+    (right, rcol): (&str, &str),
+) -> Result<(), CatalogError> {
+    let text = format!(
+        "TRANSFORM {target} FROM {left} JOIN {right} ON {left}.{lcol} = {right}.{rcol} \
+         GROUP BY {left}.id WITHOUT SOURCE INDEX SELECT COUNT(*) AS n"
+    );
+    install_definition(pool, &text, &HashMap::new(), "public")
+        .await
+        .map(|_| ())
 }
 
 // ---------------------------------------------------------------------
@@ -208,7 +226,7 @@ async fn boolout_and_the_text_cast_disagree_on_a_live_column() {
 // 2. Join key / primary key role: still refused, deliberately
 // ---------------------------------------------------------------------
 
-/// `boolean` must be refused as a relationship join key and as a 1-1
+/// `boolean` must be refused as a `JOIN` `ON` key and as a 1-1
 /// primary key — the join/PK-key roles gate on the same
 /// `catalog::TEXT_STABLE_JOIN_KEY_TYPES` allowlist, and `boolean` is not on
 /// it (see `catalog.rs`'s doc comment and this file's module doc for why).
@@ -217,7 +235,7 @@ async fn boolout_and_the_text_cast_disagree_on_a_live_column() {
 /// still do raw `{col}::text = $1` matching, this is the test that should
 /// catch it turning `Ok`.
 #[tokio::test]
-async fn boolean_is_refused_as_a_relationship_join_key_and_primary_key() {
+async fn boolean_is_refused_as_a_join_key_and_primary_key() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let client = connect_raw(db.dsn()).await;
@@ -228,12 +246,19 @@ async fn boolean_is_refused_as_a_relationship_join_key_and_primary_key() {
              create table child (id bigint primary key, k boolean)",
         )
         .await
-        .expect("create relationship tables");
+        .expect("create join tables");
 
-    let err = create_relationship(&db.pool, "RELATIONSHIP r FROM child.k TO parent.k")
+    let err = define_join_on(&db.pool, "j", ("child", "k"), ("parent", "k"))
         .await
         .expect_err("a boolean column must still be refused as a join key");
-    let _ = err; // the specific CatalogError variant isn't load-bearing here
+    assert!(
+        matches!(
+            &err,
+            CatalogError::Validate(ValidationError::JoinUnsupportedKeyType { pg_type, .. })
+                if pg_type == "boolean"
+        ),
+        "{err:?}"
+    );
 
     let err = source_primary_key(&db.pool, "parent")
         .await
@@ -438,7 +463,7 @@ async fn bool_and_or_deletion_cannot_be_inverted_from_the_aggregate_alone() {
 /// file's other tests establish.
 ///
 /// This is the positive counterpart to
-/// `boolean_is_refused_as_a_relationship_join_key_and_primary_key`: the
+/// `boolean_is_refused_as_a_join_key_and_primary_key`: the
 /// same underlying two-renderer fact, safe here and unsafe there, for a
 /// mechanical reason pinned by both tests together.
 #[tokio::test]

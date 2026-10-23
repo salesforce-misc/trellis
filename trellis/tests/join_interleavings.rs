@@ -253,7 +253,6 @@ async fn lab_with_defaults(key: Key, kinds: &[Kind], defaults: &[(&str, &str)]) 
             ("k", int4()),
             ("x", int4()),
         ],
-        &[],
         &definitions,
         &["public.a", "public.b"],
     )

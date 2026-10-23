@@ -1626,18 +1626,6 @@ pub(crate) async fn key_column_in(
     }))
 }
 
-/// Whether `table`'s `column` is indexed ([`KeyColumn::indexed`]). A column
-/// that doesn't exist is not.
-pub(crate) async fn column_is_indexed_in(
-    client: &impl GenericClient,
-    table: &str,
-    column: &str,
-) -> Result<bool, tokio_postgres::Error> {
-    Ok(key_column_in(client, table, column)
-        .await?
-        .is_some_and(|column| column.indexed))
-}
-
 /// Shared quoting logic for [`qualified_source_table`]/
 /// [`qualified_target_table_ident`]: splits an already-qualified
 /// `"schema.table"` string on its first `.` and quotes each component

@@ -913,13 +913,14 @@ async fn self_check_refuses_a_non_positive_limit_rather_than_vacuously_convergin
 }
 
 /// ADR-0013's "Scope": an aggregate off the group basis (a ledger aggregate,
-/// here one grouping by a relationship path) is out of scope, and
+/// which only the group-basis knob turned off defines now) is out of scope, and
 /// `self_check` must *refuse* it rather than silently run a plain keyset
 /// comparison that would mis-audit the group-key space (every group would
 /// read as a divergence). A tool that silently mis-audits an unsupported
 /// shape is worse than one that declines. A group-basis aggregate is audited
 /// (`group_basis_self_check.rs`).
 #[tokio::test]
+#[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
 async fn self_check_refuses_a_ledger_aggregate_target_rather_than_mis_auditing_it() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -928,12 +929,9 @@ async fn self_check_refuses_a_ledger_aggregate_target_rather_than_mis_auditing_i
         .get()
         .await
         .expect("connection")
-        .batch_execute(
-            "create table regions (id integer primary key, name text); \
-             create table orders (id integer primary key, region_id integer)",
-        )
+        .batch_execute("create table orders (id integer primary key, region_id integer)")
         .await
-        .expect("create source tables");
+        .expect("create the source table");
 
     let trellis = Trellis::connect(
         Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
@@ -941,14 +939,8 @@ async fn self_check_refuses_a_ledger_aggregate_target_rather_than_mis_auditing_i
     )
     .await
     .expect("connect");
-    trellis::dev::defs::create_relationship(
-        trellis.pool(),
-        "RELATIONSHIP reg FROM orders.region_id TO regions.id",
-    )
-    .await
-    .expect("declare the relationship");
     trellis
-        .apply("TRANSFORM region_counts FROM orders GROUP BY reg.name WITHOUT SOURCE INDEX SELECT COUNT(*) AS n")
+        .apply("TRANSFORM region_counts FROM orders GROUP BY region_id WITHOUT SOURCE INDEX SELECT COUNT(*) AS n")
         .await
         .expect("define aggregate transform");
 
@@ -1296,76 +1288,6 @@ async fn a_repointed_capture_trigger_and_an_invoker_capture_function_are_reporte
                 function: update,
             },
         ]
-    );
-
-    trellis.shutdown().await.expect("shutdown");
-}
-
-/// #622 C9 review: the audit covers the to-side of a relationship the
-/// definition reads through, not only its source. `self_check` doesn't
-/// compare a relationship-enriched target yet, so a healthy capture ends in
-/// that refusal, and a broken to-side capture is reported ahead of it.
-#[tokio::test]
-async fn a_relationship_to_sides_capture_is_audited_too() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut raw = connect_raw(db.dsn()).await;
-    raw.batch_execute(
-        "create table makers (id integer primary key, name text); \
-         create table widgets (id integer primary key, maker_id integer)",
-    )
-    .await
-    .expect("create tables");
-    let trellis = Trellis::connect(
-        Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
-        TrellisOptions::default(),
-    )
-    .await
-    .expect("connect");
-    trellis::dev::defs::create_relationship(
-        trellis.pool(),
-        "RELATIONSHIP maker FROM widgets.maker_id TO makers.id",
-    )
-    .await
-    .expect("relationship");
-    trellis
-        .apply("TRANSFORM widget_makers FROM widgets SELECT maker.name AS maker_name")
-        .await
-        .expect("define");
-    capture_tables(&mut raw, &[WIDGETS, "trellis.makers"]).await;
-    trellis::intake::markers::discharge_registrations(&db.pool)
-        .await
-        .expect("dispatch the build");
-    let self_check = || {
-        trellis.self_check_page(
-            "widget_makers",
-            SelfCheckScope {
-                after: None,
-                limit: 100,
-            },
-            SelfCheckMode::Strict,
-            GENEROUS_TIMEOUT,
-        )
-    };
-    let healthy = self_check().await;
-    assert!(
-        healthy.as_ref().is_err_and(|e| e
-            .to_string()
-            .contains("doesn't audit a relationship-enriched target")),
-        "a healthy capture reaches the comparison, which refuses the relationship path: \
-         {healthy:?}"
-    );
-
-    raw.batch_execute("alter table makers disable trigger trellis_capture_update")
-        .await
-        .expect("disable the to-side's update capture");
-    assert_eq!(
-        capture_faults(&self_check().await.expect("self_check")),
-        vec![CaptureFault::TriggerNotAlways {
-            table: "trellis.makers".to_string(),
-            trigger: "trellis_capture_update".to_string(),
-            enabled: "D".to_string(),
-        }]
     );
 
     trellis.shutdown().await.expect("shutdown");
@@ -1813,125 +1735,6 @@ async fn a_page_after_a_re_collation_reads_the_target_by_its_key_index() {
     assert!(target.starts_with("Index Cond:"), "{explained}");
     let source = range_of("words_pkey").expect("the source index is read");
     assert!(source.starts_with("Filter:"), "{explained}");
-
-    trellis.shutdown().await.expect("shutdown");
-}
-
-/// #973: `order_view` over `orders`, reading `customer` (to-one,
-/// `orders.customer_id` to `customers.id`) and `items` (to-many, `orders.id`
-/// to `line_items.order_id`), live over empty tables with their capture
-/// installed. `orders.customer_id` and `line_items.order_id` have no index.
-async fn order_view_fixture(db: &TestDatabase) -> (Trellis, Client) {
-    let mut raw = connect_raw(db.dsn()).await;
-    raw.batch_execute(
-        "create table customers (id int primary key, name text); \
-         create table orders (id int primary key, customer_id int); \
-         create table line_items (id int primary key, order_id int, qty int)",
-    )
-    .await
-    .expect("create tables");
-    let trellis = Trellis::connect(
-        Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
-        TrellisOptions::default(),
-    )
-    .await
-    .expect("connect");
-    for statement in [
-        "RELATIONSHIP customer FROM orders.customer_id TO customers.id",
-        "RELATIONSHIP items FROM orders.id TO line_items.order_id",
-        "TRANSFORM order_view FROM orders \
-         SELECT customer.name AS customer_name, SUM(items.qty) AS total_qty",
-    ] {
-        if statement.starts_with("RELATIONSHIP") {
-            trellis::dev::defs::create_relationship(trellis.pool(), statement)
-                .await
-                .expect(statement);
-        } else {
-            trellis.apply(statement).await.expect(statement);
-        }
-    }
-    capture_tables(
-        &mut raw,
-        &["trellis.orders", "trellis.customers", "trellis.line_items"],
-    )
-    .await;
-    trellis::intake::markers::settle_registrations(&db.pool).await;
-    (trellis, raw)
-}
-
-async fn audit_order_view(trellis: &Trellis) -> trellis::staging::self_check::SelfCheckPage {
-    trellis
-        .self_check_page(
-            "order_view",
-            SelfCheckScope {
-                after: None,
-                limit: 100,
-            },
-            SelfCheckMode::Strict,
-            GENEROUS_TIMEOUT,
-        )
-        .await
-        .expect("self_check")
-}
-
-fn join(relationship: &str, table: &str, column: &str) -> trellis::UnindexedJoin {
-    trellis::UnindexedJoin {
-        relationship: relationship.to_string(),
-        table: table.to_string(),
-        column: column.to_string(),
-    }
-}
-
-/// #973: an unindexed `from_col` and an unindexed to-many `to_col` are each
-/// reported next to the outcome, which they don't change; a to-one's
-/// `to_col` never is. Creating an index clears its entry on the next audit.
-///
-/// The definition is paused, because `self_check` doesn't compare a target
-/// that reads a relationship yet (it refuses with `UnsupportedExpr`); the
-/// warnings ride on every report it does return, this `NotLive` one
-/// included.
-#[tokio::test]
-async fn self_check_names_an_unindexed_join_column_until_it_is_indexed() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let (trellis, raw) = order_view_fixture(&db).await;
-    trellis
-        .apply("PAUSE TRANSFORM order_view")
-        .await
-        .expect("pause");
-
-    let report = audit_order_view(&trellis).await;
-    assert!(
-        matches!(
-            report.outcome,
-            SelfCheckOutcome::NotLive(TransformStatus::Paused)
-        ),
-        "{report:?}"
-    );
-    assert_eq!(
-        report.unindexed_joins,
-        vec![
-            join("customer", "trellis.orders", "customer_id"),
-            join("items", "trellis.line_items", "order_id"),
-        ]
-    );
-
-    raw.batch_execute("create index on orders (customer_id)")
-        .await
-        .expect("index the from_col");
-    let report = audit_order_view(&trellis).await;
-    assert!(matches!(report.outcome, SelfCheckOutcome::NotLive(_)));
-    assert_eq!(
-        report.unindexed_joins,
-        vec![join("items", "trellis.line_items", "order_id")]
-    );
-
-    raw.batch_execute("create index on line_items (order_id)")
-        .await
-        .expect("index the to-many to_col");
-    let report = audit_order_view(&trellis).await;
-    assert!(matches!(report.outcome, SelfCheckOutcome::NotLive(_)));
-    assert_eq!(report.unindexed_joins, Vec::new());
 
     trellis.shutdown().await.expect("shutdown");
 }
@@ -2614,8 +2417,7 @@ async fn a_finished_jobs_report_reads_the_findings_live() {
 }
 
 /// What a check could never run on is refused when the job is started, as
-/// the call used to refuse it: an aggregate target, an unknown one, and one
-/// that reads through a relationship.
+/// the call used to refuse it: here an unknown target.
 #[tokio::test]
 async fn self_check_refuses_at_the_start_what_it_could_never_compare() {
     let cluster = TestCluster::start();
@@ -2643,29 +2445,6 @@ async fn self_check_refuses_at_the_start_what_it_could_never_compare() {
         .expect("count")
         .get(0);
     assert_eq!(rows, 0, "a refused call registers nothing");
-
-    trellis.shutdown().await.expect("shutdown");
-}
-
-/// A target that reads through a relationship can't be compared (its leaf
-/// renderer has no relationship path), and the job isn't started for it.
-#[tokio::test]
-async fn self_check_refuses_a_relationship_reading_target_at_the_start() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let (trellis, _raw) = order_view_fixture(&db).await;
-
-    let err = trellis
-        .self_check("order_view", SelfCheckMode::Strict, GENEROUS_TIMEOUT)
-        .await
-        .expect_err("a relationship-reading target");
-    assert!(
-        matches!(
-            err,
-            TrellisError::SelfCheck(SelfCheckError::UnsupportedExpr { .. })
-        ),
-        "{err}"
-    );
 
     trellis.shutdown().await.expect("shutdown");
 }

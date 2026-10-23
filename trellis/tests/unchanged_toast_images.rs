@@ -2,14 +2,9 @@
 //! column unchanged, through capture.
 //!
 //! The change stream Trellis consumed before #622 didn't resend such a
-//! column in the new tuple. Before intake filled it in from the old tuple,
-//! the new image simply lacked it, so:
-//! - a 1:1 field reading a parent column through a to-one relationship went
-//!   silently stale (the reverse path read the absent column as `NULL`);
-//! - once #677 made relationship reads strict, an aggregate over the same
-//!   relationship, which the live-row check used to repair, and a to-many
-//!   reverse recompute keyed by the TOASTed `to_col`, both failed the key
-//!   with `MissingColumn` instead.
+//! column in the new tuple, so a new image could lack a column a definition
+//! reads. Here that column is a `JOIN`'s group key on the joined table, and a
+//! `JOIN`'s key on both of its sides.
 //!
 //! Capture triggers read the transition tables, which carry every column of
 //! both images detoasted, so each case here must converge.
@@ -65,7 +60,8 @@ async fn an_unchanged_toasted_column_is_read_from_the_old_image() {
          create table articles (id bigint primary key, ref text unique, title text); \
          alter table articles alter column ref set storage external; \
          create table comments (id bigint primary key, article_ref text, word_count int); \
-         alter table comments alter column article_ref set storage external",
+         alter table comments alter column article_ref set storage external; \
+         create index on post_tags (post_id); create index on comments (article_ref)",
     )
     .await
     .expect("source tables");
@@ -91,23 +87,20 @@ async fn an_unchanged_toasted_column_is_read_from_the_old_image() {
     .await
     .expect("connect running trellis");
     for statement in [
-        "RELATIONSHIP post FROM post_tags.post_id TO posts.id",
-        "TRANSFORM by_author FROM post_tags GROUP BY post.author WITHOUT SOURCE INDEX SELECT COUNT(*) AS n, SUM(weight) AS w",
-        "TRANSFORM by_tag FROM post_tags GROUP BY tag WITHOUT SOURCE INDEX SELECT tag AS tag, SUM(post.word_count) AS words",
-        "TRANSFORM tag_view FROM post_tags SELECT post.author AS author, post.word_count AS wc",
-        "RELATIONSHIP comments FROM articles.ref TO comments.article_ref",
-        "TRANSFORM article_words FROM articles SELECT sum(comments.word_count) AS total_words",
+        "TRANSFORM by_author FROM post_tags LEFT JOIN posts ON post_tags.post_id = posts.id \
+         GROUP BY posts.author WITHOUT SOURCE INDEX \
+         SELECT posts.author AS author, COUNT(*) AS n, SUM(post_tags.weight) AS w",
+        "TRANSFORM by_tag FROM post_tags LEFT JOIN posts ON post_tags.post_id = posts.id \
+         GROUP BY post_tags.tag WITHOUT SOURCE INDEX \
+         SELECT post_tags.tag AS tag, SUM(posts.word_count) AS words",
+        "TRANSFORM article_words FROM articles LEFT JOIN comments \
+         ON articles.ref = comments.article_ref GROUP BY articles.id WITHOUT SOURCE INDEX \
+         SELECT articles.id AS id, SUM(comments.word_count) AS total_words",
     ] {
-        if statement.starts_with("RELATIONSHIP") {
-            trellis::dev::defs::create_relationship(trellis.pool(), statement)
-                .await
-                .unwrap_or_else(|e| panic!("{statement}: {e}"));
-        } else {
-            trellis
-                .apply(statement)
-                .await
-                .unwrap_or_else(|e| panic!("{statement}: {e}"));
-        }
+        trellis
+            .apply(statement)
+            .await
+            .unwrap_or_else(|e| panic!("{statement}: {e}"));
     }
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
@@ -126,8 +119,8 @@ async fn an_unchanged_toasted_column_is_read_from_the_old_image() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    // Each UPDATE leaves the TOASTed column (`posts.author`, and the to-many
-    // join key `comments.article_ref`) unchanged.
+    // Each UPDATE leaves the TOASTed column (the group key `posts.author`,
+    // and the join key `comments.article_ref`) unchanged.
     raw.batch_execute(
         "update posts set word_count = word_count + 7 where id = 1; \
          update comments set word_count = word_count + 10 where id = 100",
@@ -164,15 +157,9 @@ async fn an_unchanged_toasted_column_is_read_from_the_old_image() {
              from post_tags t left join posts p on p.id = t.post_id group by t.tag",
         ),
         (
-            "select id, md5(author), wc::numeric from tag_view",
-            "select t.id, md5(p.author), p.word_count::numeric \
-             from post_tags t left join posts p on p.id = t.post_id",
-        ),
-        (
             "select id, total_words::numeric from article_words",
-            "select a.id, (select sum(c.word_count) from comments c \
-                           where c.article_ref = a.ref)::numeric \
-             from articles a",
+            "select a.id, sum(c.word_count)::numeric \
+             from articles a left join comments c on c.article_ref = a.ref group by a.id",
         ),
     ] {
         assert_eq!(

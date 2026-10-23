@@ -72,7 +72,7 @@ use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::ValueType;
 use trellis::defs::eval::{RegexCache, Row, Value, evaluate_aggregate};
 use trellis::defs::pg_type::PgType;
-use trellis::defs::{create_relationship, parse, validate};
+use trellis::defs::{CatalogError, ValidationError, install_definition, parse, validate};
 use trellis::integer::IntWidth;
 use trellis::temporal::{self, Interval};
 
@@ -128,6 +128,24 @@ async fn connect_raw(dsn: &str) -> Client {
         .await
         .expect("session bootstrap");
     client
+}
+
+/// Defines a `JOIN` whose one `ON` term pairs `left.lcol` with
+/// `right.rcol`. `JOIN` key admission reads the same allowlist
+/// (`catalog::is_text_stable_join_key_type`) a 1-1 primary key does.
+async fn define_join_on(
+    pool: &trellis::pool::Pool,
+    target: &str,
+    (left, lcol): (&str, &str),
+    (right, rcol): (&str, &str),
+) -> Result<(), trellis::defs::CatalogError> {
+    let text = format!(
+        "TRANSFORM {target} FROM {left} JOIN {right} ON {left}.{lcol} = {right}.{rcol} \
+         GROUP BY {left}.id WITHOUT SOURCE INDEX SELECT COUNT(*) AS n"
+    );
+    install_definition(pool, &text, &HashMap::new(), "public")
+        .await
+        .map(|_| ())
 }
 
 /// Postgres's own type for `sql_expr`, normalized through `format_type` so
@@ -1026,8 +1044,8 @@ async fn sum_interval_is_exact_on_finite_values_but_still_recompute_only() {
 /// as a key must render *identically* under both of the engine's two
 /// renderers — the per-column `<col>::text` most paths use, and the
 /// whole-row `to_jsonb(t.*)`/`jsonb_each_text` the live-row reads use
-/// (`staging::apply`'s `read_live_rows_batch`, `fetch_to_side_rows`,
-/// `fetch_relationship_projection_rows`; `staging::quarantine`'s sweep).
+/// (`staging::apply`'s `read_live_rows_batch`; `staging::quarantine`'s
+/// sweep).
 ///
 /// A type that disagrees is one value with two spellings, and a key seeded
 /// once through a backfill and once through CDC-then-live-read lands as two
@@ -1252,7 +1270,7 @@ async fn the_engine_s_own_row_renderer_agrees_with_text_for_every_temporal_famil
 // ---------------------------------------------------------------------
 
 /// `date`/`timestamp`/`time`/`timetz`/`timestamptz` are **accepted** as
-/// relationship join keys (and therefore as 1-1 primary keys — one
+/// `JOIN` `ON` keys (and therefore as 1-1 primary keys — one
 /// allowlist, `catalog::TEXT_STABLE_JOIN_KEY_TYPES`, gates both), while
 /// `interval` alone is refused.
 ///
@@ -1281,47 +1299,44 @@ async fn temporal_join_keys_are_admitted_per_family() {
                tmtz timetz, tstz timestamptz, iv interval)",
         )
         .await
-        .expect("create relationship tables");
+        .expect("create join tables");
 
     for (name, from_col, to_table) in [
-        ("r_date", "d", "p_date"),
-        ("r_tm", "tm", "p_tm"),
-        ("r_tmtz", "tmtz", "p_tmtz"),
+        ("j_date", "d", "p_date"),
+        ("j_tm", "tm", "p_tm"),
+        ("j_tmtz", "tmtz", "p_tmtz"),
         // `timestamp` used to be refused for the #113 review's reason: it is
         // a bijection under `::text` but `to_jsonb` spelled it with an
         // ISO-8601 `T`, and the engine used both renderers. Issue #248 fixed
         // that (see `to_jsonb_and_text_agree_for_every_admitted_key_type`
         // and `the_engine_s_own_row_renderer_agrees_with_text_for_every_temporal_family`
         // below), so `timestamp` now joins the accepted group.
-        ("r_ts", "ts", "p_ts"),
+        ("j_ts", "ts", "p_ts"),
         // `timestamptz` used to be refused for a *second*, independent
         // reason on top of the `to_jsonb` one above: its rendering moved
         // with `TimeZone`, and issue #113 could pin that on the pool but
         // not on the walsender. Issue #246 closed that gap, so `timestamptz`
         // joins the accepted group too.
-        ("r_tstz", "tstz", "p_tstz"),
+        ("j_tstz", "tstz", "p_tstz"),
     ] {
-        create_relationship(
-            &db.pool,
-            &format!("RELATIONSHIP {name} FROM child.{from_col} TO {to_table}.k"),
-        )
-        .await
-        .unwrap_or_else(|e| panic!("{from_col} must be accepted as a join key: {e}"));
+        define_join_on(&db.pool, name, ("child", from_col), (to_table, "k"))
+            .await
+            .unwrap_or_else(|e| panic!("{from_col} must be accepted as a join key: {e}"));
     }
 
     // `interval` is the one remaining refusal: `'24 hours'` and `'1 day'`
     // are `=` in Postgres but render differently, so no GUC or renderer
     // reconciliation fixes it — see this module's doc comment.
-    let (name, from_col, to_table, pg_name) = ("r_iv", "iv", "p_iv", "interval");
-    let err = create_relationship(
-        &db.pool,
-        &format!("RELATIONSHIP {name} FROM child.{from_col} TO {to_table}.k"),
-    )
-    .await
-    .expect_err("an interval join key must be refused");
+    let err = define_join_on(&db.pool, "j_iv", ("child", "iv"), ("p_iv", "k"))
+        .await
+        .expect_err("an interval join key must be refused");
     assert!(
-        err.to_string().contains(pg_name),
-        "the rejection must name the offending type ({pg_name}): {err}"
+        matches!(
+            &err,
+            CatalogError::Validate(ValidationError::JoinUnsupportedKeyType { pg_type, .. })
+                if pg_type == "interval"
+        ),
+        "the rejection must name the offending type (interval): {err:?}"
     );
 }
 
@@ -1371,7 +1386,7 @@ async fn a_precision_modified_temporal_key_is_still_recognized() {
         )
         .await
         .expect("create modified-precision tables");
-    create_relationship(&db.pool, "RELATIONSHIP r3 FROM c3.k TO p3.k")
+    define_join_on(&db.pool, "j3", ("c3", "k"), ("p3", "k"))
         .await
         .expect("a timetz(2) join key must be accepted");
 }

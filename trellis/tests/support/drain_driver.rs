@@ -22,7 +22,7 @@ use tokio_postgres::{Client, NoTls};
 use trellis::capture::columns::{capture_spec, load_catalog};
 use trellis::capture::install::{self, Progress};
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::defs::{ValueType, create_relationship, install_definition};
+use trellis::defs::{ValueType, install_definition};
 use trellis::intake::markers;
 use trellis::staging::build::{self, BuildPlan, ChunkOutcome, MergeOutcome};
 use trellis::staging::interleave::{PausePoint, PauseScope, Reached, with_scope};
@@ -75,30 +75,10 @@ impl Driver {
         definitions: &[&str],
         captured: &[&str],
     ) -> Self {
-        Self::start_with_relationships(source_ddl, columns, &[], definitions, captured).await
+        Self::start_with_database_defaults(&[], source_ddl, columns, definitions, captured).await
     }
 
-    /// [`Self::start`], with `relationships` declared before the
-    /// definitions are installed.
-    pub async fn start_with_relationships(
-        source_ddl: &str,
-        columns: &[(&str, ValueType)],
-        relationships: &[&str],
-        definitions: &[&str],
-        captured: &[&str],
-    ) -> Self {
-        Self::start_with_database_defaults(
-            &[],
-            source_ddl,
-            columns,
-            relationships,
-            definitions,
-            captured,
-        )
-        .await
-    }
-
-    /// [`Self::start_with_relationships`] on a database whose defaults
+    /// [`Self::start`] on a database whose defaults
     /// (`alter database ... set name to value`) include `defaults`. The
     /// engine's pool only opens connections once they are set, so every
     /// session Trellis opens starts from them. `ctl` and `gate` connect
@@ -109,20 +89,10 @@ impl Driver {
         defaults: &[(&str, &str)],
         source_ddl: &str,
         columns: &[(&str, ValueType)],
-        relationships: &[&str],
         definitions: &[&str],
         captured: &[&str],
     ) -> Self {
-        Self::start_inner(
-            defaults,
-            source_ddl,
-            columns,
-            relationships,
-            definitions,
-            captured,
-            true,
-        )
-        .await
+        Self::start_inner(defaults, source_ddl, columns, definitions, captured, true).await
     }
 
     /// [`Self::start`] for definitions over tables that hold rows: the
@@ -136,23 +106,13 @@ impl Driver {
         definitions: &[&str],
         captured: &[&str],
     ) -> Self {
-        Self::start_inner(
-            defaults,
-            source_ddl,
-            columns,
-            &[],
-            definitions,
-            captured,
-            false,
-        )
-        .await
+        Self::start_inner(defaults, source_ddl, columns, definitions, captured, false).await
     }
 
     async fn start_inner(
         defaults: &[(&str, &str)],
         source_ddl: &str,
         columns: &[(&str, ValueType)],
-        relationships: &[&str],
         definitions: &[&str],
         captured: &[&str],
         built: bool,
@@ -180,11 +140,6 @@ impl Driver {
         let started = Instant::now();
         ctl.batch_execute(source_ddl).await.expect("source DDL");
         phases.push(("source_ddl", started.elapsed()));
-        for relationship in relationships {
-            create_relationship(&db.pool, relationship)
-                .await
-                .expect("declare relationship");
-        }
         let columns: HashMap<String, ValueType> = columns
             .iter()
             .map(|(name, ty)| (name.to_string(), *ty))

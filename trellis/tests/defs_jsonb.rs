@@ -45,7 +45,10 @@ use trellis::defs::ast::ValueType;
 use trellis::defs::eval::{RegexCache, Row, Value, evaluate_aggregate};
 use trellis::defs::invertibility::{AggregateArg, Invertibility, classify};
 use trellis::defs::pg_type::PgType;
-use trellis::defs::{create_relationship, parse, registry, source_primary_key, validate};
+use trellis::defs::{
+    CatalogError, ValidationError, install_definition, parse, registry, source_primary_key,
+    validate,
+};
 use trellis::integer::IntWidth;
 
 // ---------------------------------------------------------------------
@@ -70,6 +73,24 @@ async fn connect_raw(dsn: &str) -> Client {
         .await
         .expect("session bootstrap");
     client
+}
+
+/// Defines a `JOIN` whose one `ON` term pairs `left.lcol` with
+/// `right.rcol`. `JOIN` key admission reads the same allowlist
+/// (`catalog::is_text_stable_join_key_type`) a 1-1 primary key does.
+async fn define_join_on(
+    pool: &trellis::pool::Pool,
+    target: &str,
+    (left, lcol): (&str, &str),
+    (right, rcol): (&str, &str),
+) -> Result<(), trellis::defs::CatalogError> {
+    let text = format!(
+        "TRANSFORM {target} FROM {left} JOIN {right} ON {left}.{lcol} = {right}.{rcol} \
+         GROUP BY {left}.id WITHOUT SOURCE INDEX SELECT COUNT(*) AS n"
+    );
+    install_definition(pool, &text, &HashMap::new(), "public")
+        .await
+        .map(|_| ())
 }
 
 // ---------------------------------------------------------------------
@@ -211,11 +232,11 @@ async fn key_order_is_canonicalized_but_embedded_number_scale_is_not() {
     );
 }
 
-/// A `jsonb` column is refused as a relationship join key and as a 1-1
+/// A `jsonb` column is refused as a `JOIN` `ON` key and as a 1-1
 /// primary key — the live-facing regression pin for
 /// `catalog::TEXT_STABLE_JOIN_KEY_TYPES`'s deliberate `jsonb` absence.
 #[tokio::test]
-async fn jsonb_is_refused_as_a_relationship_join_key_and_primary_key() {
+async fn jsonb_is_refused_as_a_join_key_and_primary_key() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let client = connect_raw(db.dsn()).await;
@@ -226,11 +247,19 @@ async fn jsonb_is_refused_as_a_relationship_join_key_and_primary_key() {
              create table child (id bigint primary key, k jsonb)",
         )
         .await
-        .expect("create relationship tables");
+        .expect("create join tables");
 
-    create_relationship(&db.pool, "RELATIONSHIP r FROM child.k TO parent.k")
+    let err = define_join_on(&db.pool, "j", ("child", "k"), ("parent", "k"))
         .await
         .expect_err("a jsonb column must be refused as a join key");
+    assert!(
+        matches!(
+            &err,
+            CatalogError::Validate(ValidationError::JoinUnsupportedKeyType { pg_type, .. })
+                if pg_type == "jsonb"
+        ),
+        "{err:?}"
+    );
 
     source_primary_key(&db.pool, "parent")
         .await

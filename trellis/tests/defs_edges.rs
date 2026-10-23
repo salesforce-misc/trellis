@@ -96,18 +96,12 @@ async fn a_node_with_no_dependents_of_a_kind_returns_empty() {
     .await
     .expect("valid definition should be stored");
 
-    // No relationship or join edges are ever persisted today (issue #21's
-    // explicit out-of-scope) — querying for them must come back empty, not
-    // error or fall back to source edges.
+    // A single-table definition persists no join edge — querying for one
+    // must come back empty, not error or fall back to source edges.
     let joins = dependents_of(&db.pool, "public.orders", EdgeKind::Join)
         .await
         .expect("query join dependents");
     assert!(joins.is_empty());
-
-    let relationships = dependents_of(&db.pool, "public.orders", EdgeKind::Relationship)
-        .await
-        .expect("query relationship dependents");
-    assert!(relationships.is_empty());
 
     let unrelated = dependents_of(&db.pool, "public.nonexistent_table", EdgeKind::Source)
         .await

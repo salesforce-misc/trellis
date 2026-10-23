@@ -5,18 +5,15 @@
 //! per key class, and a deterministic non-default collation (`"C"`) still
 //! passes in every one of them.
 //!
-//! The join-column twin of this rule (#590) is pinned in
-//! `defs_relationship_catalog.rs`; the pure check is covered by
-//! `defs::catalog`'s `join_column_tests`.
+//! The `JOIN` key twin of this rule is pinned in `defs_join_define.rs`.
 
 use std::collections::HashMap;
 
 use testkit::TestCluster;
-use trellis::defs::model::RelationshipSide;
 use trellis::defs::{
     CatalogError, KeyColumnRole, NondeterministicCollationTextFunction,
     NondeterministicKeyCollation, Statement, ValidationError, ValueType, alter_transform,
-    create_relationship, install_definition, parse_statement,
+    install_definition, parse_statement,
 };
 
 /// Only ICU provides nondeterministic collations. Every test cluster's
@@ -146,78 +143,10 @@ async fn a_group_by_column_with_a_nondeterministic_collation_is_refused() {
     assert_no_target(&db.pool, "region_totals").await;
 }
 
-/// A `GROUP BY` over a to-one relationship path is refused when the to-side
-/// column has a nondeterministic collation; the error names the to-side
-/// column, since that's the column to alter.
-#[tokio::test]
-async fn a_group_by_relationship_path_with_a_nondeterministic_collation_is_refused() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    create_case_insensitive_collation(&db.pool).await;
-    batch(
-        &db.pool,
-        "create table posts (id bigint primary key, author text collate case_insensitive); \
-         create table post_tags (id bigint primary key, post bigint, tag text)",
-    )
-    .await;
-    create_relationship(
-        &db.pool,
-        "RELATIONSHIP post FROM post_tags.post TO posts.id",
-    )
-    .await
-    .expect("the join columns are bigint, so the relationship is fine");
-    let err = install_definition(
-        &db.pool,
-        "TRANSFORM author_counts FROM post_tags GROUP BY post.author WITHOUT SOURCE INDEX SELECT count(*) AS n",
-        &columns(&[
-            ("id", ValueType::Numeric),
-            ("post", ValueType::Numeric),
-            ("tag", ValueType::Text),
-        ]),
-        "public",
-    )
-    .await
-    .expect_err("a nondeterministic GROUP BY relationship path must be refused");
-    assert_refused(err, KeyColumnRole::GroupBy, "trellis.posts", "author");
-    assert_no_target(&db.pool, "author_counts").await;
-}
-
-/// A relationship whose endpoint's key has a nondeterministic collation is
-/// refused even though its join columns are fine: apply keys every change
-/// the relationship propagates by that key.
-#[tokio::test]
-async fn a_relationship_endpoint_key_with_a_nondeterministic_collation_is_refused() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    create_case_insensitive_collation(&db.pool).await;
-    batch(
-        &db.pool,
-        "create table order_line_items \
-             (code text collate case_insensitive primary key, product_id bigint); \
-         create table products (id bigint primary key)",
-    )
-    .await;
-    let err = create_relationship(
-        &db.pool,
-        "RELATIONSHIP product FROM order_line_items.product_id TO products.id",
-    )
-    .await
-    .expect_err("a nondeterministic endpoint key must be refused");
-    assert_refused(
-        err,
-        KeyColumnRole::RelationshipEndpointKey {
-            name: "product".to_string(),
-            side: RelationshipSide::From,
-        },
-        "trellis.order_line_items",
-        "code",
-    );
-}
-
 /// Every key class above passes under a deterministic non-default collation
-/// (`"C"`): a `"C"` source key and relationship endpoint key, a `"C"`
-/// `GROUP BY` column and a `"C"` relationship-path `GROUP BY` key. Needs no
-/// ICU, so it runs on every cluster.
+/// (`"C"`): a `"C"` source key, a `"C"` `GROUP BY` column, and a `"C"`
+/// `GROUP BY` key read from a `JOIN`'s joined table. Needs no ICU, so it runs
+/// on every cluster.
 #[tokio::test]
 async fn deterministic_non_default_key_collations_pass() {
     let cluster = TestCluster::start();
@@ -229,15 +158,9 @@ async fn deterministic_non_default_key_collations_pass() {
                (id text collate "C" primary key, post bigint, tag text collate "C");"#,
     )
     .await;
-    create_relationship(
-        &db.pool,
-        "RELATIONSHIP post FROM post_tags.post TO posts.id",
-    )
-    .await
-    .expect("a \"C\" endpoint key is deterministic");
     install_definition(
         &db.pool,
-        "TRANSFORM author_tag_counts FROM post_tags GROUP BY tag, post.author \
+        "TRANSFORM tag_counts FROM post_tags GROUP BY tag \
         WITHOUT SOURCE INDEX SELECT count(*) AS n",
         &columns(&[
             ("id", ValueType::Text),
@@ -247,7 +170,16 @@ async fn deterministic_non_default_key_collations_pass() {
         "public",
     )
     .await
-    .expect("\"C\" source key and GROUP BY keys are deterministic");
+    .expect("\"C\" source key and GROUP BY key are deterministic");
+    install_definition(
+        &db.pool,
+        "TRANSFORM author_tag_counts FROM post_tags JOIN posts ON post_tags.post = posts.id \
+         GROUP BY post_tags.tag, posts.author WITHOUT SOURCE INDEX SELECT count(*) AS n",
+        &HashMap::new(),
+        "public",
+    )
+    .await
+    .expect("\"C\" GROUP BY keys on either side of a JOIN are deterministic");
 }
 
 /// Unwraps `err` as [`ValidationError::NondeterministicCollationTextFunction`]
@@ -286,9 +218,8 @@ fn assert_text_function_refused(
 /// Issue #638's follow-up: Postgres refuses `strpos` and `regexp_count` under
 /// a nondeterministic collation (`0A000`), while the engine would compute
 /// them from the exact text, so a field that calls either on such a column
-/// is refused: directly, through `COALESCE` and another field, and through a
-/// relationship path. `char_length`/`octet_length` don't depend on collation
-/// and install.
+/// is refused: directly, and through `COALESCE` and another field.
+/// `char_length`/`octet_length` don't depend on collation and install.
 #[tokio::test]
 async fn substring_and_regex_functions_on_a_nondeterministic_column_are_refused() {
     let cluster = TestCluster::start();
@@ -296,14 +227,10 @@ async fn substring_and_regex_functions_on_a_nondeterministic_column_are_refused(
     create_case_insensitive_collation(&db.pool).await;
     batch(
         &db.pool,
-        "create table posts (id bigint primary key, author text collate case_insensitive); \
-         create table notes (id bigint primary key, title text collate case_insensitive, \
+        "create table notes (id bigint primary key, title text collate case_insensitive, \
                              body text, post bigint)",
     )
     .await;
-    create_relationship(&db.pool, "RELATIONSHIP post FROM notes.post TO posts.id")
-        .await
-        .expect("the join columns are bigint, so the relationship is fine");
     let note_columns = columns(&[
         ("id", ValueType::Numeric),
         ("title", ValueType::Text),
@@ -333,17 +260,6 @@ async fn substring_and_regex_functions_on_a_nondeterministic_column_are_refused(
     .expect_err("regexp_count reaching a nondeterministic column must be refused");
     assert_text_function_refused(err, "n", "REGEXP_COUNT", "trellis.notes", "title");
     assert_no_target(&db.pool, "note_counts").await;
-
-    let err = install_definition(
-        &db.pool,
-        "TRANSFORM note_authors FROM notes SELECT strpos(post.author, 'x') AS pos",
-        &note_columns,
-        "public",
-    )
-    .await
-    .expect_err("strpos on a nondeterministic relationship column must be refused");
-    assert_text_function_refused(err, "pos", "STRPOS", "trellis.posts", "author");
-    assert_no_target(&db.pool, "note_authors").await;
 
     install_definition(
         &db.pool,

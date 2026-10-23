@@ -45,8 +45,7 @@ use std::time::Duration;
 use tokio_postgres::NoTls;
 use trellis::dev::defs::ast::{KeySpace, TransformDef, ValueType};
 use trellis::dev::defs::{
-    CatalogError, DdlError, create_relationship, install_definition, qualified_target_table,
-    source_primary_key,
+    CatalogError, DdlError, install_definition, qualified_target_table, source_primary_key,
 };
 use trellis::dev::staging::{
     StagingError, has_pending as staging_has_pending, retire_drained_segments,
@@ -103,9 +102,7 @@ const _: () = assert!(SERVER_STOP_RECLAIM_TTL.as_secs() * 3 <= QUIESCE_TIMEOUT.a
 /// (both seal helpers retire on `RingFull` themselves), stuck-seal recovery
 /// (every seal here runs both phases at once, so none sticks), reclaiming
 /// stale claims (no worker dies), and further reconcile passes. A pin that
-/// needs any of those keeps a real interval. A definition that reads a
-/// relationship's to-side, for one, may be ready only on a later pass
-/// (`capture::reconcile`'s readiness rules), so it would never go live.
+/// needs any of those keeps a real interval.
 pub const SEAL_ON_DEMAND_INTERVAL: Duration = Duration::from_secs(3600);
 
 /// [`ManualBackend::restart`]'s bounded retry budget (issue #251) for the
@@ -731,11 +728,10 @@ impl ManualBackend {
     }
 
     /// Whether anything committed so far is still sitting in the ring,
-    /// un-drained (issue #138, epic #127 phase 2): a thin wrapper around
-    /// `trellis::dev::staging::has_pending`, exposed so a caller stressing the
-    /// relationship-delta interleaving scenarios
-    /// (`crate::generate::build_relationship_interleaving_scenario`) can
-    /// confirm "the op I just committed is in the ring" before calling
+    /// un-drained (issue #138): a thin wrapper around
+    /// `trellis::dev::staging::has_pending`, exposed so a pin that seals by
+    /// hand can confirm "the op I just committed is in the ring" before
+    /// calling
     /// [`ManualBackend::force_seal_active_segment`] — sealing an empty (or
     /// stale) active segment would silently defeat the deterministic
     /// seal-boundary reproduction the caller is trying to build. A capture
@@ -750,15 +746,11 @@ impl ManualBackend {
     }
 
     /// Forces whatever is currently active in the ring to seal immediately
-    /// (issue #138, epic #127 phase 2), returning the sealed segment's
-    /// `seg_seq`: a direct wrapper around
-    /// `trellis::dev::staging::seal_phase1`/`seal_phase2`, the same two-phase
-    /// seal the engine's own maintenance loop performs on its normal
-    /// cadence. Mirrors `trellis/tests/spike_102.rs`'s
-    /// `spike_a2_a_from_side_insert_drains_before_the_parents_reverse_work`
-    /// (branch `spike/issue-102-validation-v2`): sealing the parent's own
-    /// change into its own segment, then sealing a from-side change into a
-    /// strictly later one, lands the two in different segments
+    /// (issue #138), returning the sealed segment's `seg_seq`: a direct
+    /// wrapper around `trellis::dev::staging::seal_phase1`/`seal_phase2`, the
+    /// same two-phase seal the engine's own maintenance loop performs on its
+    /// normal cadence. Sealing one change into its own segment, then a later
+    /// change into a strictly later one, lands the two in different segments
     /// deterministically instead of hoping a maintenance tick's timing does
     /// it for you.
     ///
@@ -818,9 +810,8 @@ impl ManualBackend {
     /// [`Backend::quiesce`](super::Backend::quiesce) that seals what the
     /// maintenance tick would have, instead of waiting for the tick (issue
     /// #453): for a backend whose tick is off ([`SEAL_ON_DEMAND_INTERVAL`])
-    /// or widened. Draining stages more rows into the active segment (a
-    /// relationship's `Recompute`s, say), and only a seal makes them
-    /// drainable.
+    /// or widened. Draining can stage more rows into the active segment, and
+    /// only a seal makes them drainable.
     ///
     /// Each pass seals the active segment if it holds anything, with the
     /// tick's own seal step (`seal_if_active_nonempty`), then checks
@@ -1118,17 +1109,6 @@ impl super::Backend for ManualBackend {
             }
             self.tables.insert(table.name.clone(), table.clone());
         }
-        // Issue #34: every relationship is declared before any definition,
-        // since a definition naming an undeclared relationship is rejected
-        // at validation time. Both endpoints already exist by now — a
-        // program's relationships only ever join two of its own tables, and
-        // every one of those was just created above (or, for a mid-stream
-        // definition install, in the very first `install` call — see
-        // `crate::run::run_convergence`, which passes relationships only
-        // alongside the tables).
-        for rel in &program.relationships {
-            create_relationship(&self.pool, &sql::render_relationship(rel)).await?;
-        }
         for def in &program.defs {
             self.install_definition(def).await?;
             self.defs.push(def.clone());
@@ -1254,11 +1234,8 @@ impl super::Backend for ManualBackend {
                     sql::read_table(&self.raw, &qualified, &pk[0].name, &target_columns).await?
                 }
                 KeySpace::Aggregate { group_by } => {
-                    // The generative suite never constructs a relationship-path
-                    // `GROUP BY` key (issue #137 scopes that support out of this
-                    // crate) — every key's target column name is read straight
-                    // off the target table either way, so mapping to that name
-                    // here needs no relationship awareness.
+                    // Every key's target column name is read straight off
+                    // the target table.
                     let group_by_names: Vec<String> = group_by
                         .iter()
                         .map(|k| k.target_column_name().to_string())
@@ -1503,14 +1480,13 @@ impl super::ConcurrentBackend for ManualBackend {
         action: &BurstAction,
     ) -> Result<(), ManualBackendError> {
         if let BurstAction::Install { def } = action {
-            // The same front door as an up-front install: the relationships
-            // and tables went in with the first `install`.
+            // The same front door as an up-front install: the tables went
+            // in with the first `install`.
             let def = program.defs[*def].clone();
             return super::Backend::install(
                 self,
                 &Program {
                     tables: Vec::new(),
-                    relationships: Vec::new(),
                     defs: vec![def],
                     def_install_after_op: vec![0],
                     ops: Vec::new(),

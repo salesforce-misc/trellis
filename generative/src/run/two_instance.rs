@@ -329,15 +329,10 @@ fn reject_unsupported_schedule<B: Backend>(
 /// What `run_two_instance_convergence` needs from a program that is not the
 /// one writing: nothing scheduled, so every definition installs up front and
 /// no op, restart or scale-out is left for the other side to run.
-fn read_only_program(
-    tables: Vec<Table>,
-    relationships: Vec<crate::model::Relationship>,
-    defs: Vec<TransformDef>,
-) -> Program {
+fn read_only_program(tables: Vec<Table>, defs: Vec<TransformDef>) -> Program {
     Program {
         def_install_after_op: vec![0; defs.len()],
         tables,
-        relationships,
         defs,
         ops: Vec::new(),
         restart_after_ops: Vec::new(),
@@ -367,11 +362,7 @@ pub fn share_source(program: &Program) -> (Program, Program) {
     let mut writer = program.clone();
     writer.defs.truncate(n.div_ceil(2));
     writer.def_install_after_op.truncate(n.div_ceil(2));
-    let reader = read_only_program(
-        program.tables.clone(),
-        program.relationships.clone(),
-        program.defs[n / 2..].to_vec(),
-    );
+    let reader = read_only_program(program.tables.clone(), program.defs[n / 2..].to_vec());
     (writer, reader)
 }
 
@@ -410,7 +401,7 @@ pub fn chain_off(program: &Program) -> Option<Program> {
             .iter()
             .map(|c| (c.name.clone(), c.value_type))
             .collect();
-        let field_types = oracle::field_types(program, def, &source_columns);
+        let field_types = oracle::field_types(def, &source_columns);
 
         let mut columns = vec![Column {
             name: source.pk_col.clone(),
@@ -458,7 +449,7 @@ pub fn chain_off(program: &Program) -> Option<Program> {
             partitioning: None,
         });
     }
-    (!defs.is_empty()).then(|| read_only_program(tables, Vec::new(), defs))
+    (!defs.is_empty()).then(|| read_only_program(tables, defs))
 }
 
 #[cfg(test)]

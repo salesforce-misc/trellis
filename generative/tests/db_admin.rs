@@ -147,7 +147,6 @@ fn one_to_one_and_aggregate_program() -> Program {
                 Some("0".to_string()),
                 Some("1".to_string()),
             ],
-            rel_fk_values: vec![None, None, None],
             mutates: vec![
                 Mutate::Update {
                     pk: 1,

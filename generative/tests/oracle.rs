@@ -47,7 +47,6 @@ fn numeric_add_program() -> (Program, TransformDef, Table, String) {
 
     let program = Program {
         tables: vec![source.clone()],
-        relationships: Vec::new(),
         defs: vec![def.clone()],
         def_install_after_op: vec![0],
         ops: vec![
@@ -112,7 +111,7 @@ async fn sql_oracle_matches_the_persisted_target_and_a_hand_computed_expected() 
     let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
 
     // The SQL oracle equals a hand-computed expected: 10.00+1.50, 20.00+2.00.
-    let sql = sql_oracle(&pool, &program, &def, &pk_column)
+    let sql = sql_oracle(&pool, &def, &pk_column)
         .await
         .expect("sql oracle");
     assert_eq!(sql["1"]["total"], Some("11.50".to_string()));
@@ -211,7 +210,7 @@ async fn an_evaluator_disagreement_reads_as_evaluator_not_sql() {
         ..def.clone()
     };
 
-    let sql = sql_oracle(&pool, &program, &def, &pk_column)
+    let sql = sql_oracle(&pool, &def, &pk_column)
         .await
         .expect("sql oracle");
     let evaluator = evaluator_oracle(&pool, &drifted, &pk_column, &columns)

@@ -120,7 +120,6 @@ fn numeric_add_program() -> (Program, TransformDef, Table, String) {
 
     let program = Program {
         tables: vec![source.clone()],
-        relationships: Vec::new(),
         defs: vec![def.clone()],
         def_install_after_op: vec![0],
         ops: vec![
@@ -180,7 +179,7 @@ async fn self_check_and_the_generative_sql_oracle_agree_the_target_is_correct() 
     let pool = Pool::new(&config).expect("pool");
 
     // generative::oracle's own, independently-rendered recompute.
-    let sql = sql_oracle(&pool, &program, &def, &pk_column)
+    let sql = sql_oracle(&pool, &def, &pk_column)
         .await
         .expect("sql oracle");
     assert_eq!(sql["1"]["total"], Some("11.50".to_string()));
@@ -244,7 +243,7 @@ async fn self_checks_recompute_matches_the_generative_sql_oracles_recompute_for_
 
     // generative::oracle's own independent recompute — the value ADR-0013
     // says self_check's *own* independent recompute must also land on.
-    let sql = sql_oracle(&pool, &program, &def, &pk_column)
+    let sql = sql_oracle(&pool, &def, &pk_column)
         .await
         .expect("sql oracle");
     let expected_recompute = sql["1"]["total"].clone();
@@ -336,10 +335,10 @@ fn tampering_proptest_config() -> ProptestConfig {
 /// the full [`generative::generate::trivial_program_with`] mix.**
 /// `self_check` (`trellis/src/staging/self_check.rs`) only audits a
 /// `KeySpace::OneToOne` target this issue
-/// (`SelfCheckError::UnsupportedKeySpace`) and only renders a
-/// relationship-free leaf expression (`SelfCheckError::UnsupportedExpr` on a
-/// `RelationshipPath`) — so drawing an `Aggregate` def or a
-/// relationship-reading field would make this property fail on
+/// (`SelfCheckError::UnsupportedKeySpace`) and only renders a leaf
+/// expression over the source's own columns (`SelfCheckError::UnsupportedExpr`
+/// on a path into another table) — so drawing an `Aggregate` def would make
+/// this property fail on
 /// `self_check`'s own documented, deliberate scope boundary instead of on a
 /// real tampering-detection question. `trivial_one_to_one_program_with`
 /// already exists, restricted to exactly that same boundary, for the
@@ -584,7 +583,7 @@ fn run_swept_tampering_case(
             // ADR-0013 says self_check's own independent recompute must also
             // land on. The source data is untouched, so this is exactly the
             // pre-corruption correct answer.
-            let sql = sql_oracle(&pool, program, def, &source.pk_col)
+            let sql = sql_oracle(&pool, def, &source.pk_col)
                 .await
                 .expect("sql oracle");
             let expected_recompute: Option<String> = sql

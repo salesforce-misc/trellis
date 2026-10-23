@@ -59,22 +59,8 @@ fn aggregate(source: &str, group_by: &str) -> String {
     )
 }
 
-fn is_relationship(statement: &str) -> bool {
-    statement
-        .trim_start()
-        .to_ascii_uppercase()
-        .starts_with("RELATIONSHIP")
-}
-
-/// The catalog error `apply` (or, for a relationship, the dev door's
-/// `create_relationship`) refused with.
+/// The catalog error `apply` refused with.
 async fn refusal(it: &Instance, statement: &str) -> CatalogError {
-    if is_relationship(statement) {
-        return match trellis::dev::defs::create_relationship(it.trellis.pool(), statement).await {
-            Err(err) => err,
-            Ok(_) => panic!("{statement} was accepted"),
-        };
-    }
     match it.trellis.apply(statement).await {
         Err(TrellisError::Catalog(err)) => err,
         Err(other) => panic!("expected a catalog refusal of {statement}, got {other:?}"),
@@ -84,30 +70,16 @@ async fn refusal(it: &Instance, statement: &str) -> CatalogError {
 
 /// Defines `statement`, which must be accepted, then drops what it defined.
 async fn assert_accepted(it: &Instance, statement: &str) {
-    if is_relationship(statement) {
-        if let Err(err) =
-            trellis::dev::defs::create_relationship(it.trellis.pool(), statement).await
-        {
-            panic!("{statement} was refused: {err:?}");
-        }
-    } else if let Err(err) = it.trellis.apply(statement).await {
+    if let Err(err) = it.trellis.apply(statement).await {
         panic!("{statement} was refused: {err:?}");
     }
     let mut words = statement.split_whitespace();
-    let drops = match (words.next(), words.next(), words.next(), words.next()) {
-        (Some("TRANSFORM"), Some(name), _, _) => {
+    let drops = match (words.next(), words.next()) {
+        (Some("TRANSFORM"), Some(name)) => {
             vec![
                 format!("PAUSE TRANSFORM {name}"),
                 format!("DROP TRANSFORM {name}"),
             ]
-        }
-        (Some("RELATIONSHIP"), Some(name), Some("FROM"), Some(from)) => {
-            let table = from.split_once('.').map_or(from, |(t, _)| t);
-            let address = format!("{table}.{name}");
-            trellis::dev::defs::drop_relationship(it.trellis.pool(), &address)
-                .await
-                .unwrap_or_else(|err| panic!("drop relationship {address}: {err:?}"));
-            return;
         }
         _ => panic!("no drop for {statement}"),
     };
@@ -453,56 +425,10 @@ async fn a_partition_a_hierarchy_and_a_one_to_one_from_stay_refused() {
     ));
 }
 
-#[tokio::test]
-async fn a_to_many_to_side_follows_the_same_rules() {
-    let cluster = TestCluster::start();
-    let it = instance(
-        &cluster,
-        &format!(
-            "{ORDER_LINES} \
-             create table public.orders (id bigint primary key); \
-             create table public.by_id (id bigint primary key, tag text) \
-                partition by hash (id); \
-             create table public.by_id_0 partition of public.by_id \
-                for values with (modulus 1, remainder 0);"
-        ),
-    )
-    .await;
-    // To-many onto the partition key: passes the shape checks.
-    assert_accepted(
-        &it,
-        "RELATIONSHIP lines FROM orders.id TO order_line_items.order_id",
-    )
-    .await;
-    // To-many onto another column.
-    assert_refused_naming(
-        &refusal(
-            &it,
-            "RELATIONSHIP lines FROM orders.id TO order_line_items.product_id",
-        )
-        .await,
-        "\"order_id\"",
-    );
-    // A to-one to-side stays refused.
-    let err = refusal(&it, "RELATIONSHIP tag FROM orders.id TO by_id.id").await;
-    let refused = assert_refused_naming(&err, "public.by_id");
-    assert!(matches!(refused, PartitionRefusal::ToOneToSide { .. }));
-    // A partitioned from-side stays refused as a plain endpoint.
-    assert!(matches!(
-        refusal(
-            &it,
-            "RELATIONSHIP owner FROM order_line_items.order_id TO orders.id"
-        )
-        .await,
-        CatalogError::RelationshipEndpointNotChangeKeyed { .. }
-    ));
-    let _ = &it.db;
-}
-
 /// A partitioned root is held to the plain-table rule's primary key: one
 /// keyed only by a unique index on not-null columns, which
 /// `ddl::source_primary_key` would take, is refused before its shape is
-/// read, as a source and as a to-many to-side.
+/// read, as a source and as a `JOIN`'s joined side.
 #[tokio::test]
 async fn a_partitioned_root_without_a_primary_key_is_refused_as_unkeyed() {
     let cluster = TestCluster::start();
@@ -521,10 +447,18 @@ async fn a_partitioned_root_without_a_primary_key_is_refused_as_unkeyed() {
         }
         other => panic!("expected SourceNotChangeKeyed, got {other:?}"),
     }
-    assert!(matches!(
-        refusal(&it, "RELATIONSHIP lines FROM orders.id TO lines.order_id").await,
-        CatalogError::RelationshipEndpointNotChangeKeyed { .. }
-    ));
+    match refusal(
+        &it,
+        "TRANSFORM j FROM public.orders JOIN public.lines ON orders.id = lines.order_id \
+         GROUP BY orders.id WITHOUT SOURCE INDEX SELECT orders.id AS id, COUNT(*) AS n",
+    )
+    .await
+    {
+        CatalogError::SourceNotChangeKeyed { source_table } => {
+            assert_eq!(source_table, "public.lines")
+        }
+        other => panic!("expected SourceNotChangeKeyed, got {other:?}"),
+    }
     let _ = &it.db;
 }
 

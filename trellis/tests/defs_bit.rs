@@ -32,7 +32,7 @@
 //!    `create table t(x bit); insert into t values ('101')` raises `bit
 //!    string length 3 does not match type bit(1)`). A role that instead
 //!    reuses an *already-existing* column's own concrete introspected type
-//!    (a relationship join key's bound-array cast, a 1-1 primary key's
+//!    (a `JOIN` key's bound-array cast, a 1-1 primary key's
 //!    `format_type`-sourced declaration) never hits this at all. `bit
 //!    varying`'s bare default is genuinely unconstrained and has no such
 //!    trap.
@@ -61,7 +61,7 @@ use trellis::defs::eval::{EvalError, RegexCache, Row, Value, evaluate_aggregate}
 use trellis::defs::invertibility::{AggregateArg, Invertibility, classify};
 use trellis::defs::pg_type::PgType;
 use trellis::defs::{
-    create_aggregate_target_table, create_definition, create_relationship, parse, registry,
+    create_aggregate_target_table, create_definition, install_definition, parse, registry,
     source_primary_key, validate,
 };
 use trellis::integer::IntWidth;
@@ -91,6 +91,24 @@ async fn connect_raw(dsn: &str) -> Client {
         .await
         .expect("session bootstrap");
     client
+}
+
+/// Defines a `JOIN` whose one `ON` term pairs `left.lcol` with
+/// `right.rcol`. `JOIN` key admission reads the same allowlist
+/// (`catalog::is_text_stable_join_key_type`) a 1-1 primary key does.
+async fn define_join_on(
+    pool: &trellis::pool::Pool,
+    target: &str,
+    (left, lcol): (&str, &str),
+    (right, rcol): (&str, &str),
+) -> Result<(), trellis::defs::CatalogError> {
+    let text = format!(
+        "TRANSFORM {target} FROM {left} JOIN {right} ON {left}.{lcol} = {right}.{rcol} \
+         GROUP BY {left}.id WITHOUT SOURCE INDEX SELECT COUNT(*) AS n"
+    );
+    install_definition(pool, &text, &HashMap::new(), "public")
+        .await
+        .map(|_| ())
 }
 
 // ---------------------------------------------------------------------
@@ -186,7 +204,7 @@ async fn to_jsonb_and_text_agree_for_bit_and_varbit() {
 // 2. Key roles: split by DDL typmod, not by rendering
 // ---------------------------------------------------------------------
 
-/// Both `bit(n)` and `bit varying` are accepted as a relationship join key
+/// Both `bit(n)` and `bit varying` are accepted as a `JOIN` `ON` key
 /// and, because both roles gate on the same
 /// `catalog::TEXT_STABLE_JOIN_KEY_TYPES` allowlist, as a 1-1 primary key
 /// too — neither role ever asks a bare `ValueType` to declare a new column
@@ -208,9 +226,9 @@ async fn bit_and_varbit_join_keys_and_primary_keys_are_admitted() {
                  create table child (id bigint primary key, k {pg_decl})"
             ))
             .await
-            .expect("create relationship tables");
+            .expect("create join tables");
 
-        create_relationship(&db.pool, "RELATIONSHIP r FROM child.k TO parent.k")
+        define_join_on(&db.pool, "j", ("child", "k"), ("parent", "k"))
             .await
             .unwrap_or_else(|e| panic!("a {pg_decl} column must be accepted as a join key: {e}"));
 

@@ -175,40 +175,14 @@
 //!   binding, `::text` casts, this harness's own snapshot diffing) — just not
 //!   of that specific key-encoding risk, which remains open.
 //!
-//! Issue **#34** ("relationship edges in the program generator", ADR-0006)
-//! adds the first *cross-table* derivations. Every table gains two more
-//! `Text` columns — a `UNIQUE` relationship key ([`REL_KEY_COLUMN`]) and a
-//! nullable foreign key ([`REL_FK_COLUMN`]) — and a definition may draw an
-//! extra field that reads a *related* table through a named relationship.
-//! The three shapes drawn are exactly the three the engine supports; see
-//! [`RelFieldKind`] for the full shape table and
-//! [`attach_relationship_fields`] for how a declaration's endpoints are
-//! fixed. Two invariants are worth naming here because they are what keep
-//! "only valid programs" structural rather than probabilistic:
-//!
-//! - **A relationship's join key must be text-stable** (see
-//!   [`TEXT_STABLE_JOIN_KEY_TYPES`]), which is why both endpoint columns are
-//!   `Text` and not the numeric primary key.
-//! - **Relationships always point from a lower-indexed table to a
-//!   higher-indexed one**, so the cross-table dependency graph ADR-0006
-//!   requires to be acyclic is acyclic by construction.
-//!
-//! Like the grain column, the relationship columns are seeded once and never
-//! mutated — but unlike it, the *related* table's own `c1` is freely mutated
-//! and deleted, which is what makes a generated program exercise ADR-0006's
-//! reverse propagation rather than only the forward direction.
-//!
-//! Issue **#505** makes that reverse direction reachable in earnest. The
-//! builders emit one table's whole op stream before the next, so on their
-//! own every parent-side op would come after every from-side op: a parent
-//! change would only ever meet a settled from-side, and no from-side change
-//! would ever land after a parent change it has to observe.
-//! `trivial_program_with` therefore draws one interleaving of the per-table
-//! streams ([`interleave_tables`]); only each table's own order is a real
-//! constraint. [`Mutate::ToggleNull`] then moves a row's `c1` across `NULL`
-//! on purpose, which on a referenced parent is the sharpest reverse-path
-//! edge. `run::Coverage::relationship_path_cases` reports how often each
-//! reverse path is reached.
+//! Issue **#505** interleaves the tables' op streams. The builders emit one
+//! table's whole op stream before the next, so on their own a program's
+//! writes to different tables would never interleave. `trivial_program_with`
+//! therefore draws one interleaving of the per-table streams
+//! ([`interleave_tables`]); only each table's own order is a real
+//! constraint. [`Mutate::ToggleNull`] moves a row's `c1` across `NULL` on
+//! purpose, so a `COUNT(<col>)` or `SUM` fold starts or stops counting the
+//! row.
 //!
 //! # Awkward values (issue #7, design doc §3)
 //!
@@ -240,8 +214,8 @@ use trellis::dev::defs::ast::{
 };
 
 use crate::model::{
-    Burst, BurstAction, Cardinality, Column, ConcurrentPlan, NamePool, Op, OpOutcome,
-    PartitionStrategy, Partitioning, Program, Relationship, Table, TimedAction,
+    Burst, BurstAction, Column, ConcurrentPlan, NamePool, Op, OpOutcome, PartitionStrategy,
+    Partitioning, Program, Table, TimedAction,
 };
 
 /// The inclusive upper bound of the calculated-field value domain.
@@ -378,70 +352,6 @@ pub const COOLING_WORKERS: std::ops::RangeInclusive<usize> = 3..=6;
 /// batches, and a cooling key's writes into the same one.
 pub const COOLING_SEAL_INTERVAL_MS: std::ops::RangeInclusive<u64> = 5..=20;
 
-/// Index, within every generated source table's `columns`, of the
-/// relationship **key** column (issue #34): a `Text` column carrying a real
-/// single-column `UNIQUE` constraint (`crate::model::Table::unique_cols`),
-/// so a relationship whose *to*-side is this column is **to-one** under
-/// ADR-0006's cardinality rule.
-///
-/// `Text` specifically, not the numeric primary key, because a
-/// relationship's join key must be a *text-stable* type — see
-/// [`TEXT_STABLE_JOIN_KEY_TYPES`].
-pub const REL_KEY_COLUMN: usize = 7;
-
-/// Index, within every generated source table's `columns`, of the
-/// relationship **foreign-key** column (issue #34): a nullable `Text` column
-/// with no unique constraint, so a relationship whose *to*-side is this
-/// column is **to-many**. As a *from*-side it is the ordinary FK of a to-one
-/// relationship.
-pub const REL_FK_COLUMN: usize = 8;
-
-/// The Postgres type names whose equality is *text-stable* — the engine
-/// rejects any relationship whose join key isn't one of these
-/// (`ValidationError::RelationshipUnsupportedJoinKeyType`), because Trellis's
-/// join is `a::text = b::text` while the Postgres oracle's is the type's
-/// native `=`, and the two disagree for `numeric`/`real` (scale:
-/// `1.0::text != 1.00::text`), `character(n)` (blank padding), `citext`
-/// (case), and the date/time types (session-dependent rendering).
-///
-/// **Deliberately duplicated here rather than imported.** The engine's own
-/// copy (`defs::catalog`'s `TEXT_STABLE_JOIN_KEY_TYPES`) is private
-/// to that module, and the design doc's seam (§1/§2) says this crate should
-/// not reach into engine internals to decide what a valid program is — the
-/// generator's job is to *independently* know the rules and only emit
-/// programs that satisfy them, exactly as [`crate::oracle`] independently
-/// renders SQL rather than calling the engine's renderer. Exposing the
-/// engine's constant would also be an `trellis/` change, which issue #34 is
-/// explicitly scoped out of. The cost of the duplication is bounded: if the
-/// two ever drift, the generator emits a relationship the engine rejects,
-/// and an install rejection is a **hard failure, never a skip** (design
-/// doc §3) — so the drift surfaces as a loud test failure on the very next
-/// run, not as silently-lost coverage.
-///
-/// Only [`trellis::dev::defs::ast::ValueType::Text`] and
-/// [`trellis::dev::defs::ast::ValueType::Uuid`] of this crate's four value types
-/// map into this set (`Numeric` renders as `numeric` and `Boolean` as
-/// `boolean`, neither of which is listed), which is why the relationship
-/// key/FK columns are `Text`.
-pub const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
-    "smallint",
-    "integer",
-    "bigint",
-    "uuid",
-    "text",
-    "character varying",
-];
-
-/// The relationship **key** column's value for seeded primary key `pk`
-/// (issue #34): derived from the pk rather than drawn, so it is distinct for
-/// every row of a table by construction and its `UNIQUE` constraint can
-/// never be violated by any draw. Shares its `k`-prefixed shape with
-/// [`strategy::rel_fk_value`]'s pool so a foreign key really does find
-/// matching related rows some of the time.
-pub fn rel_key_value(pk: i64) -> String {
-    format!("k{pk}")
-}
-
 /// Renders an `Option<i64>` value to the rendered-text form
 /// [`crate::model::Op`] wants: `None` (SQL `NULL`) stays `None`.
 fn render(value: Option<i64>) -> Option<String> {
@@ -481,11 +391,9 @@ pub enum Mutate {
     /// currently non-`NULL`, otherwise to `value`. Renders to an `UPDATE` of
     /// `c1` alone. A plain [`Mutate::Update`] draws `c1` independently of
     /// what the row holds, so it crosses `NULL` only about a third of the
-    /// time; this always does. A relationship reads the to-side table's
-    /// `c1`, so on a referenced parent this is the sharpest reverse-path
-    /// edge: the related value leaves or joins every fold that reads it, and
-    /// `COUNT(<rel>.<col>)` starts or stops counting the row. A `pk` naming
-    /// no live row is a source no-op, exactly like `Update`.
+    /// time; this always does, so a `COUNT(c1)` or `SUM(c1)` fold starts or
+    /// stops counting the row. A `pk` naming no live row is a source no-op,
+    /// exactly like `Update`.
     ToggleNull { pk: i64, value: i64 },
     /// Delete row `pk`. A `pk` naming no seeded row is likewise a no-op.
     Delete { pk: i64 },
@@ -565,8 +473,7 @@ pub enum AggregateColumn {
 /// `COUNT(*)`, `COUNT(<col>)`, and `SUM`/`AVG` over a `numeric(p,s)` column
 /// (every generated `Numeric` column is declared `numeric(14,2)`; see
 /// `backend::sql::column_ddl_type`). Define refuses every other aggregate
-/// function for a plain aggregate, so the generator draws nothing else; the
-/// relationship draws ([`RelAggregateFn`]) are a separate, older path.
+/// function for a plain aggregate, so the generator draws nothing else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AggregateFn {
     Sum(AggregateColumn),
@@ -648,22 +555,6 @@ pub struct TableSpec {
     /// [`Mutate::MoveGroup`] (issue #557's concurrent tier) touches it — see
     /// the module doc comment's B4 scope cuts.
     pub grain_values: Vec<Option<String>>,
-    /// `rel_fk_values[i]` is the rendered value for seeded primary key
-    /// `i + 1`'s relationship **foreign-key** column (issue #34) — the
-    /// non-unique `Text` column at index [`REL_FK_COLUMN`]. Drawn from
-    /// [`strategy::rel_fk_value`]'s tiny pool so a generated relationship
-    /// really exercises all three join outcomes: a value that matches a
-    /// related row's key, a value that matches nothing, and SQL `NULL`.
-    /// Same length contract as `text_values`. Never touched by [`Mutate`],
-    /// like every other non-numeric column here.
-    ///
-    /// The matching relationship **key** column ([`REL_KEY_COLUMN`]) has no
-    /// field here on purpose: it is derived from the row's own primary key
-    /// ([`rel_key_value`]) rather than drawn, which is what makes its
-    /// `UNIQUE` constraint unfalsifiable by any draw — a drawn key column
-    /// could collide across two seed rows and turn a legal program into an
-    /// insert that Postgres rejects.
-    pub rel_fk_values: Vec<Option<String>>,
     /// Mutates appended after this table's seed inserts (seed-before-mutate,
     /// design doc §3), targeting only this table's own pks. Never touches
     /// the `Text`/`Boolean`/`Uuid`/grain columns above — see the module doc
@@ -689,7 +580,6 @@ impl TableSpec {
             bool_values: vec![None; row_count],
             uuid_values: vec![None; row_count],
             grain_values: vec![None; row_count],
-            rel_fk_values: vec![None; row_count],
             mutates,
         }
     }
@@ -831,22 +721,6 @@ fn render_mutate(
                     (
                         table.columns[6].name.clone(),
                         spec.grain_values[seed_index].clone(),
-                    ),
-                    // Issue #34: the relationship key/foreign-key columns
-                    // are seeded once and never mutated either, so a
-                    // revival carries them forward for the same reason.
-                    // The key column specifically *must* come back with its
-                    // original value: it carries a real `UNIQUE` constraint
-                    // (see `crate::model::Table::unique_cols`), and a
-                    // revival that defaulted it to `NULL` would silently
-                    // stop being the row a to-many relationship joins to.
-                    (
-                        table.columns[REL_KEY_COLUMN].name.clone(),
-                        Some(rel_key_value(*pk)),
-                    ),
-                    (
-                        table.columns[REL_FK_COLUMN].name.clone(),
-                        spec.rel_fk_values[seed_index].clone(),
                     ),
                 ],
                 expect,
@@ -1019,13 +893,6 @@ pub fn build_program_multi_with_shapes(
              ({row_count} seed rows, {} grain values) — a generator bug",
             spec.grain_values.len()
         );
-        assert_eq!(
-            spec.rel_fk_values.len(),
-            row_count,
-            "build_program_multi_with_shapes: rel_fk_values must have one entry per seed row \
-             ({row_count} seed rows, {} relationship FK values) — a generator bug",
-            spec.rel_fk_values.len()
-        );
 
         // Tasks B1/B4: every table gets a Text/Boolean/Uuid column and a
         // grain column, always — see the module doc comment. `Table::new`
@@ -1035,7 +902,7 @@ pub fn build_program_multi_with_shapes(
         // column is appended last (rather than interleaved) so every
         // existing `columns[1..=5]` index above is untouched by this
         // widening.
-        let mut source = Table::new(
+        let source = Table::new(
             &mut pool,
             &[
                 ValueType::Numeric,
@@ -1044,31 +911,14 @@ pub fn build_program_multi_with_shapes(
                 ValueType::Boolean,
                 ValueType::Uuid,
                 ValueType::Numeric,
-                // Issue #34: the relationship key (index `REL_KEY_COLUMN`)
-                // and foreign key (index `REL_FK_COLUMN`) columns, appended
-                // last for the same "leave every existing index untouched"
-                // reason the grain column was.
-                ValueType::Text,
-                ValueType::Text,
             ],
         );
-        // The key column is what makes a to-one relationship *provably*
-        // to-one: ADR-0006 derives cardinality from a primary-key/UNIQUE
-        // index on the to-side column, introspected live at
-        // `create_relationship` time. Without this the engine would resolve
-        // every generated relationship as to-many and reject the bare
-        // enrichment shape outright.
-        source
-            .unique_cols
-            .push(source.columns[REL_KEY_COLUMN].name.clone());
         let c1 = source.columns[1].name.clone();
         let c2 = source.columns[2].name.clone();
         let text_col = source.columns[3].name.clone();
         let bool_col = source.columns[4].name.clone();
         let uuid_col = source.columns[5].name.clone();
         let grain_col = source.columns[6].name.clone();
-        let rel_key_col = source.columns[REL_KEY_COLUMN].name.clone();
-        let rel_fk_col = source.columns[REL_FK_COLUMN].name.clone();
 
         // This table's own pk-liveness simulation, independent of every
         // other table's — see [`render_mutate`] and the function doc
@@ -1100,12 +950,6 @@ pub fn build_program_multi_with_shapes(
                     // Task B4: likewise seeded once and never mutated — see
                     // the module doc comment's B4 scope cuts.
                     (grain_col.clone(), spec.grain_values[i].clone()),
-                    // Issue #34: the key column is derived from the pk (so
-                    // its UNIQUE constraint holds by construction), the
-                    // foreign key is drawn (so it matches, misses, or is
-                    // NULL) — see `TableSpec::rel_fk_values`.
-                    (rel_key_col.clone(), Some(rel_key_value(pk))),
-                    (rel_fk_col.clone(), spec.rel_fk_values[i].clone()),
                 ],
                 expect: OpOutcome::Succeeds,
             });
@@ -1226,12 +1070,6 @@ pub fn build_program_multi_with_shapes(
 
     Program {
         tables: built_tables,
-        // Relationships are layered on afterward by
-        // [`attach_relationship_fields`], the same "layer a widening on top
-        // rather than thread it through the base builder" idiom
-        // [`build_program_multi_with_shapes_and_derived`] uses for derived
-        // fields.
-        relationships: Vec::new(),
         defs,
         def_install_after_op,
         ops,
@@ -1537,541 +1375,19 @@ pub fn build_program_multi_with_shapes_and_derived(
 }
 
 // ---------------------------------------------------------------------
-// Issue #34: relationship edges in the program generator (ADR-0006).
-// ---------------------------------------------------------------------
-
-/// The aggregate functions a generated relationship path may be wrapped in
-/// (issue #34). A deliberately narrower set than [`AggregateFn`]: the
-/// argument is always a `<rel>.<column>` path (the to-side table's numeric
-/// `c1`), never `c1`/`c2`, so there is no `COUNT(*)` form and no
-/// `BOOL_AND`/`BOOL_OR` (no Boolean path is drawn). [`RelAggregateFn::Count`]
-/// is `COUNT(<rel>.<column>)`, the non-`NULL` count of the related values.
-///
-/// Every variant is drawn both over a **to-many** path in a row-grain
-/// (`OneToOne`) definition and over a **to-one** path inside a `GROUP BY`
-/// definition — see [`strategy::rel_aggregate_fn`]. (Before #120 the parser
-/// accepted only `COUNT(*)` inside a `GROUP BY` definition, so `Count` was
-/// kept out of [`RelFieldKind::ToOneAggregate`]; issue #294 lifted that.)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RelAggregateFn {
-    Sum,
-    Min,
-    Max,
-    Avg,
-    Count,
-}
-
-impl RelAggregateFn {
-    /// This function's canonical uppercased name, as
-    /// `trellis::dev::defs::registry::AGGREGATE_FUNCTIONS` spells it.
-    pub fn name(self) -> &'static str {
-        match self {
-            RelAggregateFn::Sum => "SUM",
-            RelAggregateFn::Min => "MIN",
-            RelAggregateFn::Max => "MAX",
-            RelAggregateFn::Avg => "AVG",
-            RelAggregateFn::Count => "COUNT",
-        }
-    }
-}
-
-/// Which of the three **engine-supported** relationship-reference shapes a
-/// generated definition takes (issue #34). Every other combination of
-/// cardinality × wrapping × key-space is rejected by
-/// `defs::validate`, and an install rejection is a hard failure,
-/// never a skip (design doc §3), so those are structurally unrepresentable
-/// here rather than merely undrawn:
-///
-/// | key-space | to-one bare | to-one in aggregate | to-many bare | to-many in aggregate |
-/// |---|---|---|---|---|
-/// | `OneToOne` | [`RelFieldKind::ToOneBare`] | rejected (`RelationshipToOneWrappedInAggregate`) | rejected (`RelationshipToManyRequiresAggregate`) | [`RelFieldKind::ToManyAggregate`] |
-/// | `Aggregate` | rejected (`UngroupedRelationshipReference`) | [`RelFieldKind::ToOneAggregate`] | rejected | rejected (`RelationshipPathInAggregate`) |
-///
-/// The `Aggregate` row's rejected corners are worth naming explicitly
-/// because they are the *newest* boundary: aggregating a to-one path inside
-/// a `GROUP BY` only became legal on this branch, while a bare path and a
-/// nested to-many-inside-`GROUP BY` (aggregating an aggregate) both remain
-/// unimplemented.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RelFieldKind {
-    /// A bare `<rel>.<column>` enrichment on a `OneToOne` definition: a
-    /// `LEFT JOIN` to the related row, `NULL` when the FK matches nothing or
-    /// is itself `NULL` (ADR-0006's to-one nullability rule).
-    ToOneBare,
-    /// `<fn>(<rel>.<column>)` over a **to-many** relationship on a
-    /// `OneToOne` definition: a correlated aggregate over the related rows,
-    /// with Postgres's empty-set semantics (`COUNT` → `0`, everything else →
-    /// `NULL`).
-    ToManyAggregate(RelAggregateFn),
-    /// `<fn>(<rel>.<column>)` over a **to-one** relationship inside a
-    /// `GROUP BY` definition: an ordinary aggregate over the `LEFT JOIN`ed
-    /// column, folding one related value per source row.
-    ToOneAggregate(RelAggregateFn),
-}
-
-impl RelFieldKind {
-    /// The [`Cardinality`] the relationship this field reads must have.
-    fn cardinality(self) -> Cardinality {
-        match self {
-            RelFieldKind::ToOneBare | RelFieldKind::ToOneAggregate(_) => Cardinality::ToOne,
-            RelFieldKind::ToManyAggregate(_) => Cardinality::ToMany,
-        }
-    }
-
-    /// Whether this shape belongs on a `GROUP BY` definition (`true`) or a
-    /// row-grain one (`false`) — see the variant table on [`RelFieldKind`].
-    fn wants_aggregate_key_space(self) -> bool {
-        matches!(self, RelFieldKind::ToOneAggregate(_))
-    }
-}
-
-/// One definition's optional relationship enrichment (issue #34):
-/// *which* other table it relates to, and *how* it reads it.
-///
-/// `to_table` is an index into the program's `tables`, and must be **greater
-/// than the definition's own source table's index**. That ordering rule is
-/// what keeps the cross-table dependency graph acyclic without any cycle
-/// detection of this crate's own: ADR-0006 makes every relationship an edge
-/// in the same graph as transforms, and cycles are rejected at definition
-/// time — so two relationships pointing at each other (`t0 → t1` and
-/// `t1 → t0`) would be an install rejection, i.e. a hard failure. Ordering
-/// every edge low-index → high-index makes a cycle unrepresentable.
-/// [`attach_relationship_fields`] asserts it rather than trusting callers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RelFieldSpec {
-    pub to_table: usize,
-    pub kind: RelFieldKind,
-}
-
-/// Layers relationship declarations and the calculated fields that read them
-/// onto an already-built `program` (issue #34): `rel_fields[j]` is
-/// definition `j`'s optional enrichment, index-aligned with `program.defs`
-/// exactly as [`build_program_multi_with_shapes_and_derived`]'s `derived` is.
-///
-/// Relationships are **deduplicated by endpoint**: two definitions reading
-/// the same `(from_table, from_col, to_table, to_col)` share one declaration
-/// rather than each minting a differently-named duplicate. That is both more
-/// realistic (ADR-0006's whole point is that a relationship is reusable
-/// across transforms) and closer to the interesting engine path — one
-/// relationship's reverse propagation feeding several targets.
-///
-/// Each relationship's endpoints are fixed by the drawn [`RelFieldKind`]'s
-/// cardinality, using the two columns issue #34 gives every table:
-///
-/// * **to-one** — `FROM <source>.<fk> TO <to>.<key>`; the to-side key column
-///   carries a real `UNIQUE` constraint ([`crate::model::Table::unique_cols`]),
-///   which is what makes the engine's live `pg_catalog` introspection resolve
-///   it as to-one.
-/// * **to-many** — `FROM <source>.<key> TO <to>.<fk>`; the to-side FK column
-///   has no unique constraint, so the same introspection resolves it as
-///   to-many.
-///
-/// Both endpoints are `Text`, the only one of this crate's value types that
-/// is both in [`TEXT_STABLE_JOIN_KEY_TYPES`] and freely drawable — see that
-/// constant for why the engine rejects anything else.
-///
-/// The referenced to-side column is always that table's `c1` (Numeric), so
-/// every shape — bare enrichment and all five aggregate functions — is
-/// type-correct without the spec having to carry a column choice too.
-///
-/// # Panics
-///
-/// On any index/shape mismatch — an out-of-range or non-increasing
-/// `to_table`, a `rel_fields` list of the wrong length, or a [`RelFieldKind`]
-/// paired with the wrong key-space. All generator bugs, all of which would
-/// otherwise reach the engine as an install rejection.
-pub fn attach_relationship_fields(
-    mut program: Program,
-    rel_fields: &[Option<RelFieldSpec>],
-) -> Program {
-    assert_eq!(
-        rel_fields.len(),
-        program.defs.len(),
-        "attach_relationship_fields: rel_fields must have one entry per definition ({} \
-         definitions, {} relationship slots) — a generator bug",
-        program.defs.len(),
-        rel_fields.len()
-    );
-
-    // Snapshotted up front so the mutable loop over `program.defs` below
-    // doesn't need to borrow `program.tables` at the same time.
-    let table_index: HashMap<String, usize> = program
-        .tables
-        .iter()
-        .enumerate()
-        .map(|(i, t)| (t.name.clone(), i))
-        .collect();
-    let tables = program.tables.clone();
-
-    let mut relationships: Vec<Relationship> = std::mem::take(&mut program.relationships);
-
-    for (def, spec) in program.defs.iter_mut().zip(rel_fields) {
-        let Some(spec) = spec else {
-            continue;
-        };
-        let from_index = *table_index.get(&def.source).unwrap_or_else(|| {
-            panic!(
-                "attach_relationship_fields: def.source {:?} names no table in the program — a \
-                 generator bug",
-                def.source
-            )
-        });
-        assert!(
-            spec.to_table < tables.len(),
-            "attach_relationship_fields: to_table index {} out of range for {} tables — a \
-             generator bug",
-            spec.to_table,
-            tables.len()
-        );
-        assert!(
-            spec.to_table > from_index,
-            "attach_relationship_fields: a relationship must point from a lower-indexed table \
-             to a higher-indexed one (got {from_index} -> {}), so the cross-table dependency \
-             graph stays acyclic by construction — a generator bug (see RelFieldSpec)",
-            spec.to_table
-        );
-        let is_aggregate_def = matches!(def.key_space, KeySpace::Aggregate { .. });
-        assert_eq!(
-            spec.kind.wants_aggregate_key_space(),
-            is_aggregate_def,
-            "attach_relationship_fields: relationship shape {:?} does not belong on a \
-             definition whose key_space is {:?} (target {:?}) — see RelFieldKind's shape table; \
-             the engine would reject this at validation time, and an install rejection is a \
-             hard failure, never a skip",
-            spec.kind,
-            def.key_space,
-            def.target
-        );
-
-        let from_table = &tables[from_index];
-        let to_table = &tables[spec.to_table];
-        let cardinality = spec.kind.cardinality();
-        let (from_col, to_col) = match cardinality {
-            Cardinality::ToOne => (
-                from_table.columns[REL_FK_COLUMN].name.clone(),
-                to_table.columns[REL_KEY_COLUMN].name.clone(),
-            ),
-            Cardinality::ToMany => (
-                from_table.columns[REL_KEY_COLUMN].name.clone(),
-                to_table.columns[REL_FK_COLUMN].name.clone(),
-            ),
-        };
-
-        let existing = relationships.iter().find(|r| {
-            r.from_table == from_table.name
-                && r.from_col == from_col
-                && r.to_table == to_table.name
-                && r.to_col == to_col
-        });
-        let rel_name = match existing {
-            Some(rel) => rel.name.clone(),
-            None => {
-                let name = format!("r{}", relationships.len());
-                relationships.push(Relationship {
-                    name: name.clone(),
-                    from_table: from_table.name.clone(),
-                    from_col,
-                    to_table: to_table.name.clone(),
-                    to_col,
-                    cardinality,
-                });
-                name
-            }
-        };
-
-        // Always the to-side table's `c1`: Numeric, nullable, and mutated by
-        // the op stream, so a to-side update really does have to propagate
-        // back into this field (ADR-0006's reverse propagation).
-        let path = Expr::RelationshipPath {
-            rel: rel_name,
-            column: to_table.columns[1].name.clone(),
-        };
-        let field = match spec.kind {
-            RelFieldKind::ToOneBare => FieldDef {
-                name: "rel_enrich".to_string(),
-                expr: path,
-            },
-            RelFieldKind::ToManyAggregate(func) | RelFieldKind::ToOneAggregate(func) => FieldDef {
-                name: "rel_agg".to_string(),
-                expr: Expr::FunctionCall {
-                    name: func.name().to_string(),
-                    args: vec![path],
-                },
-            },
-        };
-        def.fields.push(field);
-    }
-
-    program.relationships = relationships;
-    program
-}
-
-/// [`build_program_multi_with_shapes_and_derived`]'s relationship-aware form
-/// (issue #34): the same three lists, plus `rel_fields[j]` giving definition
-/// `j`'s optional relationship enrichment (see [`RelFieldSpec`]).
-///
-/// A thin composition — build, layer derived fields, layer relationship
-/// fields — kept as its own entry point so `rel_fields` doesn't have to be
-/// threaded through the two dozen existing call sites of the narrower
-/// builders, exactly as [`build_program_multi_with_derived`]'s doc comment
-/// argues for its own signature.
-pub fn build_program_multi_with_relationships(
-    tables: &[TableSpec],
-    defs: &[(usize, DefShape)],
-    derived: &[Option<DerivedShape>],
-    rel_fields: &[Option<RelFieldSpec>],
-) -> Program {
-    let program = build_program_multi_with_shapes_and_derived(tables, defs, derived);
-    attach_relationship_fields(program, rel_fields)
-}
-
-// ---------------------------------------------------------------------
-// Issue #138 (epic #127 phase 2): the relationship-delta interleaving
-// scenarios. #34 already gave every table a to-one-capable relationship
-// key/FK pair and #34/#132 the reverse-propagation machinery that keeps a
-// to-one enrichment settled; what #138 asks the generative suite to stress
-// is *timing* — a parent (to-side) change landing close enough to a
-// from-side change on the *same* parent that the two can race across a
-// seal boundary, within one batch, or through an out-of-order segment drain
-// (see `trellis/tests/spike_102.rs`'s `spike_a2_a_from_side_insert_drains_before_the_parents_reverse_work`,
-// branch `spike/issue-102-validation-v2`, for the real-engine scenario
-// shape this mirrors).
-//
-// [`build_program_multi_with_shapes_and_derived`] can't produce that shape
-// on its own: it emits one table's *entire* seed+mutate stream before the
-// next table's (see `render_mutate`'s call site above), and a relationship
-// always points from a lower-indexed table to a higher-indexed one, so the
-// parent table's ops always come strictly after every from-side op. Issue
-// #505's [`interleave_tables`] now lets the drawn strategies reach it at
-// random; the scenarios below stay as its deterministic pins.
-// [`build_relationship_interleaving_scenario`] reuses the builder for the
-// base schema/relationship/definition (via
-// [`build_program_multi_with_relationships`]), then appends the two
-// critical, deliberately-adjacent ops by hand.
-// ---------------------------------------------------------------------
-
-/// Which shape the parent-side and from-side halves of a
-/// [`build_relationship_interleaving_scenario`] take. The first is the
-/// canonical shape (the parent's own enriched field changes while a
-/// from-side row starts pointing at it); the remaining four are #138's own
-/// named variants.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RelInterleavingVariant {
-    /// The parent (pk 1, key `k1`) already exists; its own `c1` changes
-    /// while a brand-new from-side row is inserted pointing at it.
-    ParentFieldUpdate,
-    /// The parent does not exist yet: it is inserted (a fresh key, `k3`)
-    /// while a brand-new from-side row that names that same fresh key is
-    /// inserted alongside it.
-    ParentInsert,
-    /// The parent (pk 1, key `k1`) is deleted while a still-live from-side
-    /// row (previously pointing at the *other* seeded parent) is
-    /// re-pointed onto it in the same window.
-    ParentDelete,
-    /// The parent's own `c1` changes while, in the same window, the
-    /// from-side row that used to point at it re-points to a key that
-    /// names no row at all.
-    RepointToNonexistentParent,
-    /// The parent's own `c1` changes while, in the same window, the
-    /// from-side row that used to point at it has its foreign key set to
-    /// `NULL`.
-    RepointToNullParent,
-}
-
-/// One [`Program`] built by [`build_relationship_interleaving_scenario`],
-/// plus the indices of its two deliberately-adjacent critical ops: the
-/// parent-side change ([`RelInterleavingScenario::parent_op`]) and the
-/// from-side change on the same parent
-/// ([`RelInterleavingScenario::from_side_op`], always `parent_op + 1`).
-/// Every op before `parent_op` is ordinary seeding, safe to apply and
-/// quiesce on one at a time; a caller stressing #138's race applies
-/// `parent_op` and `from_side_op` back-to-back with no intervening
-/// `quiesce()` (and, for a deterministic seal-boundary reproduction,
-/// forces a seal between them — see `generative::backend::ManualBackend::
-/// force_seal_active_segment`).
-#[derive(Debug, Clone)]
-pub struct RelInterleavingScenario {
-    pub program: Program,
-    pub parent_op: usize,
-    pub from_side_op: usize,
-}
-
-/// Builds the base two-table relationship program every
-/// [`RelInterleavingVariant`] shares (issue #138): `tables[0]` is the
-/// from-side ("child"/`post_tags`-shaped) table, `tables[1]` the to-side
-/// ("parent"/`posts`-shaped) one, joined by a to-one bare enrichment
-/// (`rel_enrich = <rel>.c1`, exactly [`RelFieldKind::ToOneBare`]) — the
-/// shape that reads the parent's own `c1` back onto every from-side row,
-/// so a parent-side `c1` change is exactly the kind of change whose
-/// reverse propagation this whole scenario stresses.
-///
-/// Seeds three from-side rows (pk 1 -> key `k1`, pk 2 -> key `k2`, pk 3 ->
-/// `NULL`) and two parent rows (pk 1 = key `k1`/`c1` 100, pk 2 = key
-/// `k2`/`c1` 200) — parent 2 and from-side rows 2/3 are decoys that no
-/// variant's critical section ever touches, so a divergence localizes to
-/// the row the scenario actually interleaves rather than a blanket
-/// relationship bug.
-fn base_interleaving_program() -> Program {
-    let from_side = TableSpec {
-        seed_values: vec![(Some(10), None), (Some(20), None), (Some(30), None)],
-        text_values: vec![None; 3],
-        bool_values: vec![None; 3],
-        uuid_values: vec![None; 3],
-        grain_values: vec![None; 3],
-        rel_fk_values: vec![Some("k1".to_string()), Some("k2".to_string()), None],
-        mutates: Vec::new(),
-    };
-    let to_side = TableSpec {
-        seed_values: vec![(Some(100), None), (Some(200), None)],
-        text_values: vec![None; 2],
-        bool_values: vec![None; 2],
-        uuid_values: vec![None; 2],
-        grain_values: vec![None; 2],
-        rel_fk_values: vec![None; 2],
-        mutates: Vec::new(),
-    };
-    build_program_multi_with_relationships(
-        &[from_side, to_side],
-        &[(0, DefShape::OneToOne)],
-        &[None],
-        &[Some(RelFieldSpec {
-            to_table: 1,
-            kind: RelFieldKind::ToOneBare,
-        })],
-    )
-}
-
-/// Builds one [`RelInterleavingScenario`] for `variant` (issue #138). See
-/// [`RelInterleavingVariant`] for what each variant's two critical ops are.
-pub fn build_relationship_interleaving_scenario(
-    variant: RelInterleavingVariant,
-) -> RelInterleavingScenario {
-    let mut program = base_interleaving_program();
-
-    let from_table = program.tables[0].name.clone();
-    let from_pk_col = program.tables[0].pk_col.clone();
-    let from_c1_col = program.tables[0].columns[1].name.clone();
-    let from_fk_col = program.tables[0].columns[REL_FK_COLUMN].name.clone();
-    let to_table = program.tables[1].name.clone();
-    let to_pk_col = program.tables[1].pk_col.clone();
-    let to_c1_col = program.tables[1].columns[1].name.clone();
-    let to_key_col = program.tables[1].columns[REL_KEY_COLUMN].name.clone();
-
-    match variant {
-        RelInterleavingVariant::ParentFieldUpdate => {
-            program.ops.push(Op::Update {
-                table: to_table,
-                pk: "1".to_string(),
-                changes: vec![(to_c1_col, Some("999".to_string()))],
-                expect: OpOutcome::Succeeds,
-            });
-            program.ops.push(Op::Insert {
-                table: from_table,
-                row: vec![
-                    (from_pk_col, Some("4".to_string())),
-                    (from_c1_col, Some("40".to_string())),
-                    (from_fk_col, Some("k1".to_string())),
-                ],
-                expect: OpOutcome::Succeeds,
-            });
-        }
-        RelInterleavingVariant::ParentInsert => {
-            let fresh_key = rel_key_value(3);
-            program.ops.push(Op::Insert {
-                table: to_table,
-                row: vec![
-                    (to_pk_col, Some("3".to_string())),
-                    (to_c1_col, Some("777".to_string())),
-                    (to_key_col, Some(fresh_key.clone())),
-                ],
-                expect: OpOutcome::Succeeds,
-            });
-            program.ops.push(Op::Insert {
-                table: from_table,
-                row: vec![
-                    (from_pk_col, Some("4".to_string())),
-                    (from_c1_col, Some("40".to_string())),
-                    (from_fk_col, Some(fresh_key)),
-                ],
-                expect: OpOutcome::Succeeds,
-            });
-        }
-        RelInterleavingVariant::ParentDelete => {
-            program.ops.push(Op::Delete {
-                table: to_table,
-                pk: "1".to_string(),
-                expect: OpOutcome::Succeeds,
-            });
-            // From-side pk 2 was pointing at the *other*, untouched parent
-            // (key `k2`); re-pointing it onto the parent being deleted in
-            // the same window is the sharper case: its enrichment must
-            // land NULL, never a stale copy of the deleted parent's `c1`.
-            program.ops.push(Op::Update {
-                table: from_table,
-                pk: "2".to_string(),
-                changes: vec![(from_fk_col, Some("k1".to_string()))],
-                expect: OpOutcome::Succeeds,
-            });
-        }
-        RelInterleavingVariant::RepointToNonexistentParent => {
-            program.ops.push(Op::Update {
-                table: to_table,
-                pk: "1".to_string(),
-                changes: vec![(to_c1_col, Some("999".to_string()))],
-                expect: OpOutcome::Succeeds,
-            });
-            program.ops.push(Op::Update {
-                table: from_table,
-                pk: "1".to_string(),
-                changes: vec![(from_fk_col, Some("k9".to_string()))],
-                expect: OpOutcome::Succeeds,
-            });
-        }
-        RelInterleavingVariant::RepointToNullParent => {
-            program.ops.push(Op::Update {
-                table: to_table,
-                pk: "1".to_string(),
-                changes: vec![(to_c1_col, Some("999".to_string()))],
-                expect: OpOutcome::Succeeds,
-            });
-            program.ops.push(Op::Update {
-                table: from_table,
-                pk: "1".to_string(),
-                changes: vec![(from_fk_col, None)],
-                expect: OpOutcome::Succeeds,
-            });
-        }
-    }
-
-    let from_side_op = program.ops.len() - 1;
-    let parent_op = from_side_op - 1;
-    RelInterleavingScenario {
-        program,
-        parent_op,
-        from_side_op,
-    }
-}
-
-// ---------------------------------------------------------------------
 // Issue #505: interleaving the per-table op streams.
 //
 // The builders above emit each table's whole stream before the next
-// table's, and a relationship always points to a higher-indexed table, so
-// in a table-ordered program every parent-side op comes after every
-// from-side op. The engine's reverse path (a parent change recomputing
-// from-side targets) then only ever runs against a settled from-side, and a
-// from-side change never lands after a parent change it has to observe.
+// table's, so in a table-ordered program no two tables' writes ever
+// interleave.
 //
 // The only ordering a program really needs is *within* a table: its seeds
 // come first (every mutate draws its pk from the seeded range, and the
 // pk-liveness simulation in `render_mutate` assumes that order), and its
 // mutates keep their drawn order (that simulation's `expect`s depend on
-// it). Across tables there is nothing to respect: a relationship is a
-// logical join, not a Postgres foreign key, so a from-side row may name a
-// parent that doesn't exist yet (the join simply misses until it does), and
-// no op on one table changes another table's rows. That is also what
-// `ops_commute` already says: ops on different tables always commute at the
-// source.
+// it). Across tables there is nothing to respect: no op on one table
+// changes another table's rows. That is also what `ops_commute` already
+// says: ops on different tables always commute at the source.
 //
 // So a program is a set of per-table streams ([`table_streams`]) plus one
 // linearization of them ([`interleave_tables`]). The concurrent tier (#557)
@@ -2164,9 +1480,8 @@ pub fn interleave_tables(mut program: Program, schedule: &[usize]) -> Program {
 ///
 /// A partition key is part of the primary key, so the grain column becomes a
 /// `bigint`, and it can't be `NULL`: every op on the table that writes a
-/// `NULL` grain writes `0` instead. The table's `UNIQUE` relationship key is
-/// dropped, since a unique index on a partitioned table must hold the
-/// partition key.
+/// `NULL` grain writes `0` instead. Any `UNIQUE` column is dropped, since a
+/// unique index on a partitioned table must hold the partition key.
 ///
 /// With the grain in the primary key, a row moved to another group
 /// ([`Mutate::MoveGroup`], which moves it to another partition) no longer
@@ -2180,8 +1495,7 @@ pub fn interleave_tables(mut program: Program, schedule: &[usize]) -> Program {
 ///
 /// If a definition reads the table other than as an `Aggregate` grouped by
 /// its grain column alone (a 1-1 transform over a partitioned source is
-/// refused at define), or a relationship has the table at either end: both
-/// generator bugs.
+/// refused at define): a generator bug.
 pub fn partition_table(mut program: Program, table: usize, strategy: PartitionStrategy) -> Program {
     let source = &program.tables[table];
     let name = source.name.clone();
@@ -2194,13 +1508,6 @@ pub fn partition_table(mut program: Program, table: usize, strategy: PartitionSt
             def.target
         );
     }
-    assert!(
-        program
-            .relationships
-            .iter()
-            .all(|r| r.from_table != name && r.to_table != name),
-        "partition_table: a relationship has {name} at one end — a generator bug"
-    );
     for op in &mut program.ops {
         let writes: Vec<&mut (String, Option<String>)> = match op {
             Op::Insert { table: t, row, .. } if *t == name => row.iter_mut().collect(),
@@ -2898,7 +2205,6 @@ pub fn build_bulk_insert_program(row_count: usize) -> Program {
 
     Program {
         tables: vec![table],
-        relationships: Vec::new(),
         defs,
         def_install_after_op,
         ops,
@@ -3149,12 +2455,6 @@ pub fn reordered_by_commute_groups(program: &Program) -> Program {
     }
     Program {
         tables: program.tables.clone(),
-        // Carried through unchanged: a relationship is a schema-level
-        // declaration, not an op, so reordering the op stream cannot affect
-        // it — and dropping it would leave every definition that reads one
-        // referencing an undeclared relationship, which the engine rejects
-        // at install time.
-        relationships: program.relationships.clone(),
         defs: program.defs.clone(),
         // Carried over unchanged, not reinterpreted against the new op
         // order: this function is only ever exercised (`tests/order_insensitivity.rs`)
@@ -3560,140 +2860,16 @@ mod strategy {
         ]
     }
 
-    /// One seed row's relationship **foreign-key** value (issue #34):
-    /// drawn from a tiny fixed pool so all three join outcomes ADR-0006
-    /// distinguishes really occur across a run, rather than only the happy
-    /// one:
-    ///
-    /// * `"k1"`/`"k2"`/`"k3"` — match a related row, since a table's
-    ///   relationship *key* column is [`rel_key_value`] of its primary key
-    ///   and seeded pks run `1..=MAX_SEED_ROWS`;
-    /// * `"k9"` — syntactically fine, matches nothing (no program ever seeds
-    ///   pk 9), so a to-one enrichment must come back `NULL` and a to-many
-    ///   aggregate must see the empty set;
-    /// * `None` — a `NULL` foreign key, which under `LEFT JOIN` semantics
-    ///   also matches nothing but reaches that answer down a different code
-    ///   path (`NULL = anything` is `NULL`, not `false`).
-    ///
-    /// The "matches nothing" case is deliberately *not* rare: together with
-    /// the `NULL` case it is the whole nullability contract issue #33
-    /// pinned on the engine side, and a run that only ever drew matching
-    /// keys would never check it.
-    ///
-    /// `awkward_values` gates the `NULL` draw only, exactly as it does for
-    /// [`value`]/[`text_value`]/[`bool_value`]/[`uuid_value`] — a `NULL`
-    /// foreign key is an awkward value like any other. The `"k9"`
-    /// matches-nothing case is *not* gated: it is an ordinary non-`NULL`
-    /// text value that simply happens to resolve to no related row, so the
-    /// unmatched-join half of the nullability contract stays covered even
-    /// with awkward values off.
-    fn rel_fk_value(awkward_values: bool) -> BoxedStrategy<Option<String>> {
-        let present = prop_oneof![
-            2 => Just(Some("k1".to_string())),
-            2 => Just(Some("k2".to_string())),
-            2 => Just(Some("k3".to_string())),
-            1 => Just(Some("k9".to_string())),
-        ];
-        if !awkward_values {
-            return present.boxed();
-        }
-        prop_oneof![
-            NULL_WEIGHT => Just(None),
-            VALUE_WEIGHT => present,
-        ]
-        .boxed()
-    }
-
-    /// Which aggregate function wraps a generated relationship path.
-    ///
-    /// Every [`RelAggregateFn`] is legal in both places a path can be
-    /// aggregated: over a to-many path in a row-grain definition, and over a
-    /// to-one path inside a `GROUP BY` definition. `COUNT(<rel>.<col>)` is
-    /// the interesting one in both: it is the only aggregate whose empty-set
-    /// answer is `0` rather than `NULL` (the to-many half of ADR-0006's
-    /// nullability rule), and inside a `GROUP BY` it counts only the source
-    /// rows whose related value is non-`NULL` — a row whose foreign key
-    /// misses, is `NULL`, or points at a row with a `NULL` `c1` still belongs
-    /// to the group but must not be counted (issue #294; the parser has
-    /// accepted `COUNT(<expr>)` since #120).
-    fn rel_aggregate_fn() -> impl Strategy<Value = RelAggregateFn> {
-        prop_oneof![
-            Just(RelAggregateFn::Sum),
-            Just(RelAggregateFn::Min),
-            Just(RelAggregateFn::Max),
-            Just(RelAggregateFn::Avg),
-            Just(RelAggregateFn::Count),
-        ]
-    }
-
-    /// The optional relationship enrichment for a definition sourced from
-    /// table `source_index` of `table_count` (issue #34).
-    ///
-    /// Always `None` when `source_index` is the last table: a relationship
-    /// must point at a strictly higher-indexed table so the cross-table
-    /// dependency graph stays acyclic by construction (see [`RelFieldSpec`]).
-    ///
-    /// Otherwise the shape is fully determined by the definition's
-    /// key-space, because only one of the three legal shapes fits each (see
-    /// [`RelFieldKind`]'s table): a `GROUP BY` definition can only aggregate
-    /// a *to-one* path, while a row-grain one can either read a to-one path
-    /// bare or aggregate a *to-many* one. Drawing the shape from the
-    /// already-drawn key-space — rather than independently, then filtering —
-    /// is what keeps "the generator emits only valid programs" structural
-    /// rather than probabilistic.
-    ///
-    /// Weighted 2:1 toward drawing a relationship at all, so the three
-    /// relationship shapes get real coverage across a 16-case default run
-    /// while plain relationship-free programs stay common.
-    fn rel_field_spec(
-        source_index: usize,
-        table_count: usize,
-        is_aggregate_def: bool,
-    ) -> BoxedStrategy<Option<RelFieldSpec>> {
-        if source_index + 1 >= table_count {
-            return Just(None).boxed();
-        }
-        let kind = if is_aggregate_def {
-            rel_aggregate_fn()
-                .prop_map(RelFieldKind::ToOneAggregate)
-                .boxed()
-        } else {
-            prop_oneof![
-                1 => Just(RelFieldKind::ToOneBare),
-                1 => rel_aggregate_fn().prop_map(RelFieldKind::ToManyAggregate),
-            ]
-            .boxed()
-        };
-        let present = ((source_index + 1)..table_count, kind)
-            .prop_map(|(to_table, kind)| Some(RelFieldSpec { to_table, kind }));
-        prop_oneof![
-            1 => Just(None),
-            2 => present,
-        ]
-        .boxed()
-    }
-
-    /// One definition's full draw (issue #34): which table it sources from,
-    /// its [`DefShape`], its optional [`DerivedShape`], and its optional
-    /// [`RelFieldSpec`]. Drawn as one unit — rather than four independent
-    /// vectors zipped up later — so an illegal pairing (a derived field on
-    /// an `Aggregate` def, a to-many relationship inside a `GROUP BY`, a
-    /// relationship pointing at a table that can't be a to-side) is
-    /// unrepresentable rather than merely unlikely.
+    /// One definition's full draw: which table it sources from, its
+    /// [`DefShape`], and its optional [`DerivedShape`]. Drawn as one unit —
+    /// rather than independent vectors zipped up later — so an illegal
+    /// pairing (a derived field on an `Aggregate` def) is unrepresentable
+    /// rather than merely unlikely.
     fn def_draw(
         table_count: usize,
-    ) -> impl Strategy<Value = (usize, DefShape, Option<DerivedShape>, Option<RelFieldSpec>)> {
-        (0..table_count, def_shape_and_derived()).prop_flat_map(
-            move |(source_index, (shape, derived))| {
-                let is_aggregate = matches!(shape, DefShape::Aggregate { .. });
-                (
-                    Just(source_index),
-                    Just(shape),
-                    Just(derived),
-                    rel_field_spec(source_index, table_count, is_aggregate),
-                )
-            },
-        )
+    ) -> impl Strategy<Value = (usize, DefShape, Option<DerivedShape>)> {
+        (0..table_count, def_shape_and_derived())
+            .prop_map(|(source_index, (shape, derived))| (source_index, shape, derived))
     }
 
     /// Pairs a drawn [`DefShape`] with the optional [`DerivedShape`]
@@ -3808,28 +2984,18 @@ mod strategy {
                 let bools = prop::collection::vec(bool_value(awkward_values), seed_count);
                 let uuids = prop::collection::vec(uuid_value(awkward_values), seed_count);
                 let grains = prop::collection::vec(grain_value(), seed_count);
-                let rel_fks = prop::collection::vec(rel_fk_value(awkward_values), seed_count);
                 let mutates =
                     prop::collection::vec(mutate(seed_count, awkward_values), 0..=MAX_MUTATES);
-                (seeds, texts, bools, uuids, grains, rel_fks, mutates)
+                (seeds, texts, bools, uuids, grains, mutates)
             })
             .prop_map(
-                |(
-                    seed_values,
-                    text_values,
-                    bool_values,
-                    uuid_values,
-                    grain_values,
-                    rel_fk_values,
-                    mutates,
-                )| {
+                |(seed_values, text_values, bool_values, uuid_values, grain_values, mutates)| {
                     TableSpec {
                         seed_values,
                         text_values,
                         bool_values,
                         uuid_values,
                         grain_values,
-                        rel_fk_values,
                         mutates,
                     }
                 },
@@ -3855,16 +3021,8 @@ mod strategy {
     /// reproducing program — a 1-table/1-def counterexample is the readable
     /// one.
     ///
-    /// Issue #34: each definition additionally draws an optional
-    /// relationship enrichment ([`rel_field_spec`]), so a multi-table
-    /// program's definitions sometimes read a *related* table too. The
-    /// relationship's shape is derived from the definition's already-drawn
-    /// key-space rather than drawn independently, so an illegal pairing is
-    /// unrepresentable — see [`def_draw`].
-    ///
     /// `awkward_values` gates every other column's `NULL` draw (see
-    /// [`value`], [`text_value`], [`bool_value`], [`uuid_value`],
-    /// [`rel_fk_value`]); it does
+    /// [`value`], [`text_value`], [`bool_value`], [`uuid_value`]); it does
     /// not gate [`grain_value`] (which draws its own occasional `NULL`
     /// unconditionally — see its own doc comment for issue #128, the engine
     /// bug that used to force a scope cut here), nor does it affect
@@ -3876,8 +3034,7 @@ mod strategy {
     ///
     /// Issue #505: the built program's per-table op streams are then
     /// interleaved by a drawn schedule ([`interleave_schedule`],
-    /// [`interleave_tables`]), so parent-side and from-side ops mix. The
-    /// schedule shrinks toward the table-by-table order.
+    /// [`interleave_tables`]), so the tables' ops mix. The schedule shrinks toward the table-by-table order.
     pub fn trivial_program_with(awkward_values: bool) -> impl Strategy<Value = Program> {
         prop::collection::vec(table_spec(awkward_values), 1..=MAX_TABLES)
             .prop_flat_map(|tables| {
@@ -3894,14 +3051,12 @@ mod strategy {
             .prop_map(|(tables, schedule, draws)| {
                 let mut defs: Vec<(usize, DefShape)> = Vec::with_capacity(draws.len());
                 let mut derived: Vec<Option<DerivedShape>> = Vec::with_capacity(draws.len());
-                let mut rel_fields: Vec<Option<RelFieldSpec>> = Vec::with_capacity(draws.len());
-                for (idx, shape, derived_shape, rel_field) in draws {
+                for (idx, shape, derived_shape) in draws {
                     defs.push((idx, shape));
                     derived.push(derived_shape);
-                    rel_fields.push(rel_field);
                 }
                 interleave_tables(
-                    build_program_multi_with_relationships(&tables, &defs, &derived, &rel_fields),
+                    build_program_multi_with_shapes_and_derived(&tables, &defs, &derived),
                     &schedule,
                 )
             })
@@ -3930,9 +3085,8 @@ mod strategy {
     /// A [`trivial_program_with`] program (awkward values on) whose first
     /// table is a partitioned source ([`partition_table`], ADR-0017), read by
     /// at least one `GROUP BY` definition over its grain column. Any other
-    /// definition drawn over that table is kept only as an `Aggregate`,
-    /// without a relationship: a 1-1 transform over a partitioned source, or
-    /// one as a relationship's from-side, is refused at define. The other
+    /// definition drawn over that table is kept only as an `Aggregate`: a 1-1
+    /// transform over a partitioned source is refused at define. The other
     /// tables draw as usual.
     ///
     /// Issue #1320: on top of its seeds and mutates, the partitioned table
@@ -3970,28 +3124,20 @@ mod strategy {
                     let mut defs: Vec<(usize, DefShape)> =
                         vec![(0, DefShape::Aggregate { functions })];
                     let mut derived: Vec<Option<DerivedShape>> = vec![None];
-                    let mut rel_fields: Vec<Option<RelFieldSpec>> = vec![None];
-                    for (idx, shape, derived_shape, rel_field) in draws {
+                    for (idx, shape, derived_shape) in draws {
                         if idx == 0 {
                             if matches!(shape, DefShape::OneToOne) {
                                 continue;
                             }
                             defs.push((idx, shape));
                             derived.push(None);
-                            rel_fields.push(None);
                         } else {
                             defs.push((idx, shape));
                             derived.push(derived_shape);
-                            rel_fields.push(rel_field);
                         }
                     }
                     let program = interleave_tables(
-                        build_program_multi_with_relationships(
-                            &tables,
-                            &defs,
-                            &derived,
-                            &rel_fields,
-                        ),
+                        build_program_multi_with_shapes_and_derived(&tables, &defs, &derived),
                         &schedule,
                     );
                     partition::add_partition_maintenance(
@@ -4124,43 +3270,33 @@ mod strategy {
                     prop::collection::vec(bool_value(true), seed_count),
                     prop::collection::vec(uuid_value(true), seed_count),
                     prop::collection::vec(grain_value(), seed_count),
-                    prop::collection::vec(rel_fk_value(true), seed_count),
                     prop::collection::vec(hot_mutate(seed_count), mutates.clone()),
                 )
             })
             .prop_map(
-                |(
-                    seed_values,
-                    text_values,
-                    bool_values,
-                    uuid_values,
-                    grain_values,
-                    rel_fk_values,
-                    mutates,
-                )| TableSpec {
-                    seed_values,
-                    text_values,
-                    bool_values,
-                    uuid_values,
-                    grain_values,
-                    rel_fk_values,
-                    mutates: slide_group_window(mutates),
+                |(seed_values, text_values, bool_values, uuid_values, grain_values, mutates)| {
+                    TableSpec {
+                        seed_values,
+                        text_values,
+                        bool_values,
+                        uuid_values,
+                        grain_values,
+                        mutates: slide_group_window(mutates),
+                    }
                 },
             )
     }
 
     /// The most mutates the hot-key shape's optional second table draws. It
-    /// is there to be a relationship's parent, written now and then while
-    /// the hot table churns, not to be hot itself.
-    const HOT_PARENT_MUTATES: usize = 60;
+    /// is written now and then while the hot table churns, not hot itself.
+    const HOT_SECOND_MUTATES: usize = 60;
 
     /// The concurrent tier's hot-key case (issue #557): a hot table of
     /// [`HOT_KEYS`] rows taking [`HOT_MUTATES`] writes, always read by a
     /// `GROUP BY` definition over its grain column, plus up to two more
     /// drawn definitions. Half the cases add a small second table that
-    /// definitions can reach through a relationship ([`rel_field_spec`]),
-    /// its ops spread evenly through the hot table's (see
-    /// [`spread_schedule`]).
+    /// drawn definitions can read, its ops spread evenly through the hot
+    /// table's (see [`spread_schedule`]).
     ///
     /// Issued in bursts of [`HOT_BURST_SIZE`] ops over `2..=MAX_LANES`
     /// lanes ([`concurrent_plan`]), against an engine with [`HOT_WORKERS`]
@@ -4181,10 +3317,9 @@ mod strategy {
     /// - One to [`MAX_ACTION_DRAWS`] operator actions ([`ActionDraw`]),
     ///   placed by [`add_burst_actions`]: `request_backfill`, a pause and
     ///   resume, or a column pause and resume.
-    /// - Three cases in four that have a relationship's to-side table also
-    ///   truncate it once, somewhere in its op stream, while the from-side
-    ///   hot table keeps changing. Parent updates come with the to-side
-    ///   table's ops, spread through the hot table's (#505).
+    /// - Three cases in four that have a second table also truncate it once,
+    ///   somewhere in its op stream, while the hot table keeps changing. The
+    ///   second table's ops are spread through the hot table's (#505).
     pub fn mid_burst_case() -> impl Strategy<Value = ConcurrentCase> {
         hot_key_case_with(mid_burst_draws().prop_map(CaseExtras::MidBurst).boxed())
     }
@@ -4263,7 +3398,7 @@ mod strategy {
     /// ones (2).
     ///
     /// Its programs are the hot table and the cooling table alone: no
-    /// second table, no relationship and no drawn definition, only the hot
+    /// second table and no drawn definition, only the hot
     /// table's `GROUP BY` and the cooling table's. The cooling table's
     /// always has a `SUM`, so a change applied twice moves a value, not
     /// only a count.
@@ -4488,9 +3623,8 @@ mod strategy {
                             bool_values,
                             uuid_values,
                             // Only the 1-1 definition reads the cooling
-                            // table: no group, no relationship.
+                            // table: no group.
                             grain_values: vec![None; keys],
-                            rel_fk_values: vec![None; keys],
                             mutates,
                         },
                         derived,
@@ -4513,9 +3647,9 @@ mod strategy {
     /// What [`mid_burst_case`] adds to a [`hot_key_case`].
     #[derive(Debug, Clone)]
     struct MidBurstDraws {
-        /// Where in the to-side table's mutates a `TRUNCATE` goes, in
+        /// Where in the second table's mutates a `TRUNCATE` goes, in
         /// thousandths.
-        parent_truncate: Option<u16>,
+        second_truncate: Option<u16>,
         /// A `GROUP BY` definition over the hot table, and where in the
         /// program it installs, in thousandths of the ops.
         deferred: Option<(Vec<AggregateFn>, u16)>,
@@ -4596,8 +3730,8 @@ mod strategy {
             prop::option::weighted(0.75, (install_functions(), 0..=1000u16)),
             prop::collection::vec(action, 1..=MAX_ACTION_DRAWS),
         )
-            .prop_map(|(parent_truncate, deferred, actions)| MidBurstDraws {
-                parent_truncate,
+            .prop_map(|(second_truncate, deferred, actions)| MidBurstDraws {
+                second_truncate,
                 deferred,
                 actions,
                 load: None,
@@ -4619,10 +3753,10 @@ mod strategy {
                 (
                     hot_table_spec(HOT_KEYS, HOT_MUTATES),
                     prop::collection::vec(
-                        hot_table_spec(3..=MAX_SEED_ROWS, 0..=HOT_PARENT_MUTATES),
+                        hot_table_spec(3..=MAX_SEED_ROWS, 0..=HOT_SECOND_MUTATES),
                         table_count - 1,
                     ),
-                    (aggregate_functions(), rel_field_spec(0, table_count, true)),
+                    aggregate_functions(),
                     prop::collection::vec(def_draw(table_count), 0..MAX_DEFS),
                     HOT_BURST_SIZE,
                     2..=MAX_LANES,
@@ -4635,7 +3769,7 @@ mod strategy {
                 |(
                     hot,
                     mut others,
-                    (functions, mut hot_rel),
+                    functions,
                     mut extra,
                     burst_size,
                     lanes,
@@ -4655,11 +3789,10 @@ mod strategy {
                         // The hot table and the cooling table alone: see
                         // `cooling_backfill_case`.
                         others.clear();
-                        hot_rel = None;
                         extra.clear();
                     }
                     let extras = extras.unwrap_or(MidBurstDraws {
-                        parent_truncate: None,
+                        second_truncate: None,
                         deferred: None,
                         actions: Vec::new(),
                         load: None,
@@ -4668,15 +3801,13 @@ mod strategy {
                     tables.extend(others);
                     let mut defs = vec![(0, DefShape::Aggregate { functions })];
                     let mut derived = vec![None];
-                    let mut rel_fields = vec![hot_rel];
-                    for (source, shape, derived_shape, rel_field) in extra {
+                    for (source, shape, derived_shape) in extra {
                         defs.push((source, shape));
                         derived.push(derived_shape);
-                        rel_fields.push(rel_field);
                     }
-                    if let (Some(at), Some(parent)) = (extras.parent_truncate, tables.get_mut(1)) {
-                        let position = usize::from(at) * parent.mutates.len() / 1000;
-                        parent.mutates.insert(position, Mutate::Truncate);
+                    if let (Some(at), Some(second)) = (extras.second_truncate, tables.get_mut(1)) {
+                        let position = usize::from(at) * second.mutates.len() / 1000;
+                        second.mutates.insert(position, Mutate::Truncate);
                     }
                     if let Some((functions, _)) = &extras.deferred {
                         let mut functions = functions.clone();
@@ -4685,10 +3816,7 @@ mod strategy {
                         }
                         defs.push((0, DefShape::Aggregate { functions }));
                         derived.push(None);
-                        rel_fields.push(None);
                     }
-                    // The cooling table goes last, so no relationship drawn
-                    // above can point at it.
                     let cooling_table = tables.len();
                     if let Some(cooling) = &cooling {
                         tables.push(cooling.table.clone());
@@ -4703,14 +3831,9 @@ mod strategy {
                                 derived.push(Some(cooling.derived.clone()));
                             }
                         }
-                        rel_fields.push(None);
                     }
-                    let program = build_program_multi_with_relationships(
-                        &tables,
-                        &defs,
-                        &derived,
-                        &rel_fields,
-                    );
+                    let program =
+                        build_program_multi_with_shapes_and_derived(&tables, &defs, &derived);
                     let mut program = match &cooling {
                         Some(cooling) => {
                             let places = match &backfill {
@@ -5124,16 +4247,15 @@ mod tests {
     /// revival writes the same grain as the seed, so it still collides.
     #[test]
     fn partition_table_writes_a_null_grain_as_zero_and_drops_the_unique_key() {
-        let program = partition_table(
-            one_table_program(
-                DefShape::Aggregate {
-                    functions: vec![AggregateFn::Count],
-                },
-                None,
-            ),
-            0,
-            PartitionStrategy::Hash { modulus: 2 },
+        let mut unpartitioned = one_table_program(
+            DefShape::Aggregate {
+                functions: vec![AggregateFn::Count],
+            },
+            None,
         );
+        let text_col = unpartitioned.tables[0].columns[3].name.clone();
+        unpartitioned.tables[0].unique_cols.push(text_col);
+        let program = partition_table(unpartitioned, 0, PartitionStrategy::Hash { modulus: 2 });
         let table = &program.tables[0];
         let grain = table.columns[6].name.clone();
         assert!(table.unique_cols.is_empty());
@@ -5169,113 +4291,6 @@ mod tests {
             one_table_program(DefShape::OneToOne, Some("1")),
             0,
             PartitionStrategy::Range { bounds: 3 },
-        );
-    }
-
-    /// Two tables, one definition, one relationship — the smallest program
-    /// that can carry a relationship at all, reused by the tests below.
-    fn two_table_rel_program(kind: RelFieldKind) -> Program {
-        let shape = match kind {
-            RelFieldKind::ToOneAggregate(_) => DefShape::Aggregate {
-                functions: vec![AggregateFn::Count],
-            },
-            _ => DefShape::OneToOne,
-        };
-        let spec = || TableSpec {
-            seed_values: vec![(Some(1), Some(2))],
-            text_values: vec![None],
-            bool_values: vec![None],
-            uuid_values: vec![None],
-            grain_values: vec![Some("0".to_string())],
-            rel_fk_values: vec![Some("k1".to_string())],
-            mutates: vec![Mutate::Delete { pk: 1 }],
-        };
-        build_program_multi_with_relationships(
-            &[spec(), spec()],
-            &[(0, shape)],
-            &[None],
-            &[Some(RelFieldSpec { to_table: 1, kind })],
-        )
-    }
-
-    /// Issue #34: a to-one relationship joins the from-side's foreign key to
-    /// the to-side's *unique* key column — that uniqueness is the whole
-    /// reason the engine resolves it as to-one — and a to-many one is the
-    /// same declaration with the endpoints swapped so the to-side column is
-    /// the non-unique one.
-    #[test]
-    fn a_relationships_endpoints_follow_its_cardinality() {
-        let one = two_table_rel_program(RelFieldKind::ToOneBare);
-        let rel = &one.relationships[0];
-        assert_eq!(rel.cardinality, Cardinality::ToOne);
-        assert_eq!(rel.from_col, one.tables[0].columns[REL_FK_COLUMN].name);
-        assert_eq!(rel.to_col, one.tables[1].columns[REL_KEY_COLUMN].name);
-        assert!(one.tables[1].unique_cols.contains(&rel.to_col));
-
-        let many = two_table_rel_program(RelFieldKind::ToManyAggregate(RelAggregateFn::Sum));
-        let rel = &many.relationships[0];
-        assert_eq!(rel.cardinality, Cardinality::ToMany);
-        assert_eq!(rel.from_col, many.tables[0].columns[REL_KEY_COLUMN].name);
-        assert_eq!(rel.to_col, many.tables[1].columns[REL_FK_COLUMN].name);
-        assert!(!many.tables[1].unique_cols.contains(&rel.to_col));
-    }
-
-    /// A relationship is a schema-level declaration, so reordering the op
-    /// stream must carry it through untouched. Regression pin: an earlier
-    /// version of `reordered_by_commute_groups` rebuilt the `Program` with
-    /// an empty relationship list, which left every definition referencing
-    /// an undeclared relationship and made the order-insensitivity property
-    /// fail at *install* time rather than on a real ordering difference.
-    #[test]
-    fn reordering_a_program_preserves_its_relationship_declarations() {
-        let program = two_table_rel_program(RelFieldKind::ToOneBare);
-        assert_eq!(program.relationships.len(), 1);
-        let reordered = reordered_by_commute_groups(&program);
-        assert_eq!(reordered.relationships, program.relationships);
-    }
-
-    /// Issue #98 removed the `TRUNCATE`-on-relationship-to-side scope cut
-    /// (formerly `without_truncates_on_relationship_to_sides`) once the
-    /// engine defect it steered around was fixed: a relationship to-side
-    /// table's truncate is now generated like any other table's, and its
-    /// reverse-propagation is exercised for real by the property suite
-    /// rather than being excluded from it.
-    #[test]
-    fn a_truncate_is_generated_on_a_relationship_to_side_table_like_any_other() {
-        let spec = || TableSpec {
-            seed_values: vec![(Some(1), Some(2))],
-            text_values: vec![None],
-            bool_values: vec![None],
-            uuid_values: vec![None],
-            grain_values: vec![Some("0".to_string())],
-            rel_fk_values: vec![Some("k1".to_string())],
-            mutates: vec![Mutate::Truncate],
-        };
-        let program = build_program_multi_with_relationships(
-            &[spec(), spec()],
-            &[(0, DefShape::OneToOne)],
-            &[None],
-            &[Some(RelFieldSpec {
-                to_table: 1,
-                kind: RelFieldKind::ToOneBare,
-            })],
-        );
-        let truncated: Vec<&str> = program
-            .ops
-            .iter()
-            .filter_map(|op| match op {
-                Op::Truncate { table, .. } => Some(table.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            truncated,
-            vec![
-                program.tables[0].name.as_str(),
-                program.tables[1].name.as_str(),
-            ],
-            "both tables' truncates are generated, including the relationship to-side: {:?}",
-            program.ops
         );
     }
 
@@ -6228,24 +5243,22 @@ mod tests {
         }
 
         #[cfg(feature = "proptest")]
-        /// The drawn steady-load cases (#720, #725, #786): some have a
-        /// relationship, each has small build chunks, a reconcile pass at
-        /// its seal cadence and a stall of a few seal intervals; and the
-        /// mid-burst tier's cases stay flat out, at the engine's defaults.
+        /// The drawn steady-load cases (#720, #725, #786): each has small
+        /// build chunks, a reconcile pass at its seal cadence and a stall of
+        /// a few seal intervals; and the mid-burst tier's cases stay flat
+        /// out, at the engine's defaults.
         #[test]
-        fn steady_load_cases_draw_relationships_and_mid_burst_cases_no_load() {
+        fn steady_load_cases_draw_a_load_and_mid_burst_cases_no_load() {
             use proptest::strategy::{Strategy, ValueTree};
             use proptest::test_runner::TestRunner;
 
             let mut runner = TestRunner::deterministic();
-            let mut loaded_related = 0usize;
             for _ in 0..16 {
                 let case = steady_load_case()
                     .new_tree(&mut runner)
                     .expect("a case")
                     .current();
                 let load = case.plan.steady_load.expect("a steady load");
-                loaded_related += usize::from(!case.program.relationships.is_empty());
                 assert!(LOAD_CHUNK_ROWS.contains(&case.build_chunk_rows.expect("rows")));
                 assert_eq!(case.reconcile_interval_ms, Some(case.seal_interval_ms));
                 let pace = u64::try_from(load.pace.as_micros()).expect("micros");
@@ -6254,11 +5267,6 @@ mod tests {
                     u64::try_from(load.stall.as_millis()).expect("millis") / case.seal_interval_ms;
                 assert!(LOAD_STALL_SEALS.contains(&u32::try_from(seals).expect("seals")));
             }
-            assert!(
-                loaded_related > 0,
-                "the steady-load tier draws relationships"
-            );
-            let mut related = 0usize;
             for _ in 0..16 {
                 let case = mid_burst_case()
                     .new_tree(&mut runner)
@@ -6267,9 +5275,7 @@ mod tests {
                 assert_eq!(case.plan.steady_load, None);
                 assert_eq!(case.build_chunk_rows, None);
                 assert_eq!(case.reconcile_interval_ms, None);
-                related += usize::from(!case.program.relationships.is_empty());
             }
-            assert!(related > 0, "the mid-burst tier still draws relationships");
         }
 
         #[cfg(feature = "proptest")]

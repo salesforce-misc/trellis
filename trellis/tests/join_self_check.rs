@@ -64,7 +64,6 @@ async fn start(definitions: &[&str]) -> Driver {
             ("k", int4()),
             ("x", int4()),
         ],
-        &[],
         definitions,
         &["public.a", "public.b"],
     )
@@ -527,7 +526,6 @@ async fn each_join_page_records_its_j_lock_wait() {
          create table public.b (id integer primary key, k integer, y integer); \
          create index on public.a (k); create index on public.b (k)",
         &[("id", int4()), ("ga", int4()), ("k", int4())],
-        &[],
         &[
             "TRANSFORM lock_wait_join FROM public.a JOIN public.b ON a.k = b.k GROUP BY a.ga \
           WITHOUT SOURCE INDEX SELECT a.ga AS ga, COUNT(*) AS n, SUM(b.y) AS sy",
@@ -865,7 +863,6 @@ async fn a_group_column_re_collated_mid_walk_skips_and_repeats_no_cell() {
             ("k", int4()),
             ("y", int4()),
         ],
-        &[],
         &[
             "TRANSFORM tc FROM public.a JOIN public.b ON a.k = b.k GROUP BY a.ga \
           WITHOUT SOURCE INDEX SELECT a.ga AS ga, COUNT(*) AS n, SUM(b.y) AS sy",

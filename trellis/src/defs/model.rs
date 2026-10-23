@@ -4,7 +4,6 @@
 use std::collections::HashMap;
 
 use super::ast::{RelationshipDef, TransformDef, ValueType};
-use super::validate::RelationshipWarning;
 
 /// A transform definition as stored in the catalog: the parsed AST — source
 /// table, target table name, and calculated fields are all on
@@ -277,13 +276,6 @@ pub struct RelationshipDefinition {
     pub to_schema: String,
     pub def: RelationshipDef,
     pub cardinality: RelationshipCardinality,
-    /// Non-fatal caveats surfaced alongside this (still-successful)
-    /// definition (issue #31) — e.g. a missing from-side index. Empty on the
-    /// read-back path ([`super::catalog::relationship_by_name`]): a warning
-    /// is creation-time guidance, not a fact about the persisted row, and
-    /// `pg_catalog` state (an index dropped later) can drift from what was
-    /// true at creation anyway.
-    pub warnings: Vec<RelationshipWarning>,
 }
 
 impl RelationshipDefinition {
@@ -420,13 +412,11 @@ pub struct SchemaNode {
 /// Which kind of dependency a [`super::catalog`] edge represents (issue
 /// #21). A transform persists a [`EdgeKind::Source`] edge from its `FROM`
 /// table to its target, and a `JOIN` transform a [`EdgeKind::Join`] edge
-/// from its joined table too (#1107). [`EdgeKind::Relationship`] is
-/// persisted by `create_relationship` (issue #26).
+/// from its joined table too (#1107).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EdgeKind {
     Source,
     Join,
-    Relationship,
 }
 
 impl EdgeKind {
@@ -435,7 +425,6 @@ impl EdgeKind {
         match self {
             EdgeKind::Source => "source",
             EdgeKind::Join => "join",
-            EdgeKind::Relationship => "relationship",
         }
     }
 }

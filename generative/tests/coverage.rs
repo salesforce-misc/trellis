@@ -15,10 +15,10 @@ use generative::generate::{
     table_streams, trivial_program, trivial_program_with,
 };
 use generative::model::{NoiseAction, NoiseEventKind, Op, Program, Table};
-use generative::run::{ConcurrentShape, Coverage, RelPath};
+use generative::run::{ConcurrentShape, Coverage};
 use proptest::strategy::{Strategy, ValueTree};
 use proptest::test_runner::{Config, RngAlgorithm, TestCaseError, TestError, TestRng, TestRunner};
-use trellis::dev::defs::ast::{Expr, KeySpace, Operator, TransformDef, ValueType};
+use trellis::dev::defs::ast::{Expr, KeySpace, Operator, ValueType};
 
 /// `ValueType` has no `Hash` impl (it's an engine type, not owned by this
 /// crate), so scalar-type-surface comparisons here go through a sorted `Vec`
@@ -126,16 +126,16 @@ fn collect_column_types(expr: &Expr, source: &Table, out: &mut Vec<ValueType>) {
         // A literal carries no *source column* type — including issue
         // #109's typed literal, whose type is its own, not a column's.
         Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::TypedLiteral { .. } => {}
-        // Issue #34: a relationship path's column lives on another table
-        // entirely, so there is no type to collect from `source`. The one
-        // caller feeds this a `build_program` program — a single table, one
-        // definition, no relationships declared at all, so no path can
-        // reach here. Refusing rather than returning nothing keeps that
-        // precondition enforced instead of assumed.
+        // A `<table>.<column>` path reads another table (only a `JOIN`
+        // does), so there is no type to collect from `source`. The one
+        // caller feeds this a `build_program` program — a single table and
+        // one 1-1 definition — so no path can reach here. Refusing rather
+        // than returning nothing keeps that precondition enforced instead of
+        // assumed.
         Expr::RelationshipPath { rel, column } => {
             unreachable!(
-                "collect_column_types is only ever called on `build_program`'s single-table, \
-                 relationship-free program, which cannot contain the path '{rel}.{column}'"
+                "collect_column_types is only ever called on `build_program`'s single-table \
+                 program, which cannot contain the path '{rel}.{column}'"
             )
         }
     }
@@ -718,8 +718,7 @@ fn trivial_program_sometimes_draws_a_nested_expression() {
     );
 }
 
-/// The aggregate calls a plain (relationship-free) `GROUP BY` definition can
-/// draw: the group basis's admitted set (issue #1100). Define refuses every
+/// The aggregate calls a `GROUP BY` definition can draw: the group basis's admitted set (issue #1100). Define refuses every
 /// other aggregate function on a plain aggregate.
 const ADMITTED_AGGREGATE_CALLS: &[(&str, &str)] = &[
     ("COUNT", "*"),
@@ -728,22 +727,7 @@ const ADMITTED_AGGREGATE_CALLS: &[(&str, &str)] = &[
     ("AVG", "column"),
 ];
 
-/// Whether any field of `def` reads a relationship path. Such a definition
-/// stays on the ledger until relationships are removed (#1115), so the
-/// admitted-set rule does not apply to it.
-fn reads_a_relationship(def: &TransformDef) -> bool {
-    fn walk(expr: &Expr) -> bool {
-        match expr {
-            Expr::RelationshipPath { .. } => true,
-            Expr::FunctionCall { args, .. } => args.iter().any(walk),
-            Expr::BinaryOp { lhs, rhs, .. } => walk(lhs) || walk(rhs),
-            _ => false,
-        }
-    }
-    def.fields.iter().any(|field| walk(&field.expr))
-}
-
-/// Issue #1100: every aggregate function the generator draws on a plain
+/// Issue #1100: every aggregate function the generator draws on a
 /// `GROUP BY` definition is one the group basis admits, and every admitted
 /// call shape is actually drawn. A `SUM`/`AVG` argument is a bare column of a
 /// `numeric` (declared `numeric(14,2)` by the DDL) or integer type, never an
@@ -758,9 +742,11 @@ fn trivial_program_draws_exactly_the_admitted_aggregate_set() {
             .new_tree(&mut runner)
             .expect("strategy must produce a value")
             .current();
-        for def in program.defs.iter().filter(|def| {
-            matches!(def.key_space, KeySpace::Aggregate { .. }) && !reads_a_relationship(def)
-        }) {
+        for def in program
+            .defs
+            .iter()
+            .filter(|def| matches!(def.key_space, KeySpace::Aggregate { .. }))
+        {
             let source = program
                 .tables
                 .iter()
@@ -768,7 +754,7 @@ fn trivial_program_draws_exactly_the_admitted_aggregate_set() {
                 .expect("a definition's source is one of the program's tables");
             for field in &def.fields[1..] {
                 let Expr::FunctionCall { name, args } = &field.expr else {
-                    panic!("a plain aggregate field must be an aggregate call: {def:#?}");
+                    panic!("an aggregate field must be an aggregate call: {def:#?}");
                 };
                 let argument_type = match args.as_slice() {
                     [] => None,
@@ -1173,110 +1159,13 @@ fn bulk_insert_row_count_gets_meaningfully_large() {
     );
 }
 
-// ---------------------------------------------------------------------
-// Issue #34: relationship coverage floors (ADR-0006).
-// ---------------------------------------------------------------------
-
-/// Accumulates [`generative::run::Coverage`] over `samples` draws of the
-/// default strategy — the shape the three relationship floors below share.
-/// Uses the same accumulator the live convergence property reports with, so
-/// these floors and that report can never disagree about what a shape is
-/// called.
-fn sampled_coverage(samples: usize) -> generative::run::Coverage {
-    let mut runner = TestRunner::default();
-    let strategy = trivial_program();
-    let mut coverage = generative::run::Coverage::new();
-    for _ in 0..samples {
-        let program = strategy
-            .new_tree(&mut runner)
-            .expect("strategy must produce a value")
-            .current();
-        coverage.record_program(&program);
-    }
-    coverage
-}
-
-/// The generator must actually *declare* relationships, not merely be
-/// capable of it. A program needs two or more tables for a relationship to
-/// have anywhere to point (see `generate::strategy::rel_field_spec`), so
-/// this is a floor on the composition of two independent draws, not one.
-#[test]
-fn trivial_program_sometimes_declares_a_relationship() {
-    let coverage = sampled_coverage(500);
-    assert!(
-        coverage.relationships_declared > 0,
-        "the generator must sometimes declare a relationship across 500 samples: {coverage}"
-    );
-}
-
-/// Both cardinalities must appear. They are not two spellings of one
-/// feature: a to-one relationship resolves through a unique to-side column
-/// and reverse-propagates off the to-side's own key, while a to-many one
-/// folds many related rows over the to-side's non-PK join key (ADR-0006).
-/// A run that drew only to-one
-/// relationships would leave the whole to-many path untested while still
-/// reporting relationship coverage.
-#[test]
-fn trivial_program_draws_both_relationship_cardinalities() {
-    let coverage = sampled_coverage(500);
-    for cardinality in ["to_one", "to_many"] {
-        assert!(
-            coverage
-                .relationship_cardinalities
-                .get(cardinality)
-                .is_some_and(|&n| n > 0),
-            "the generator must sometimes declare a {cardinality} relationship across 500 \
-             samples: {coverage}"
-        );
-    }
-}
-
-/// Each of the three engine-supported relationship *reference* shapes must
-/// be drawn — this is the floor that would catch any one of them silently
-/// ceasing to be generated (design doc §3's "coverage that silently drops
-/// out is otherwise invisible"):
-///
-/// * `to_one_bare` — a bare `<rel>.<col>` enrichment on a row-grain def;
-/// * `to_many_in_aggregate` — an aggregate over a to-many path on a
-///   row-grain def;
-/// * `to_one_in_aggregate_def` — an aggregate over a to-one path inside a
-///   `GROUP BY` def, the newest of the three.
-///
-/// `other` must stay at zero: it is the accumulator's catch-all for a shape
-/// nobody taught it about, which in this generator can only mean a shape the
-/// engine's validator would have rejected.
-#[test]
-fn trivial_program_draws_every_supported_relationship_reference_shape() {
-    let coverage = sampled_coverage(500);
-    for shape in [
-        "to_one_bare",
-        "to_many_in_aggregate",
-        "to_one_in_aggregate_def",
-    ] {
-        assert!(
-            coverage
-                .relationship_shapes
-                .get(shape)
-                .is_some_and(|&n| n > 0),
-            "the generator must sometimes draw the {shape} relationship shape across 500 \
-             samples: {coverage}"
-        );
-    }
-    assert_eq!(
-        coverage.relationship_shapes.get("other").copied(),
-        None,
-        "the generator drew a relationship reference shape the coverage accumulator cannot \
-         classify — in this generator that can only be a shape validate() rejects: {coverage}"
-    );
-}
-
-/// Issue #294: the generator draws `COUNT(<rel>.<col>)` over a to-one path
-/// inside a `GROUP BY` def.
+/// Issue #294: the generator draws `COUNT(<col>)` inside a `GROUP BY` def,
+/// which counts only the group's rows whose column is not `NULL`.
 ///
 /// Sampled with [`TestRunner::deterministic`] rather than `default()`, so
 /// this pins what a fixed seed draws instead of being a probabilistic floor.
 #[test]
-fn trivial_program_draws_count_of_a_relationship_path_in_a_group_by() {
+fn trivial_program_draws_count_of_a_column_in_a_group_by() {
     let mut runner = TestRunner::deterministic();
     let strategy = trivial_program();
     let mut coverage = generative::run::Coverage::new();
@@ -1290,91 +1179,11 @@ fn trivial_program_draws_count_of_a_relationship_path_in_a_group_by() {
     assert!(
         coverage
             .aggregate_call_cases
-            .get(&("Aggregate", "COUNT", "rel"))
+            .get(&("Aggregate", "COUNT", "column"))
             .is_some_and(|&n| n > 0),
-        "the generator must draw COUNT(rel) inside a GROUP BY def across 500 deterministic          samples: {coverage}"
+        "the generator must draw COUNT(column) inside a GROUP BY def across 500 deterministic \
+         samples: {coverage}"
     );
-}
-
-/// The relationship key/foreign-key columns must really exercise all three
-/// join outcomes ADR-0006 distinguishes, not just the matching one: a
-/// foreign key that resolves, one that resolves to nothing, and a `NULL`
-/// one. The two miss cases are the entire nullability contract (issue #33),
-/// so a run that only ever drew matching keys would check none of it.
-#[test]
-fn trivial_program_draws_matching_missing_and_null_relationship_foreign_keys() {
-    let mut runner = TestRunner::default();
-    let strategy = trivial_program();
-    let mut saw_match = false;
-    let mut saw_miss = false;
-    let mut saw_null = false;
-    for _ in 0..500 {
-        let program = strategy
-            .new_tree(&mut runner)
-            .expect("strategy must produce a value")
-            .current();
-        for table in &program.tables {
-            let fk_col = &table.columns[generative::generate::REL_FK_COLUMN].name;
-            for op in &program.ops {
-                let Op::Insert { row, .. } = op else { continue };
-                let Some((_, value)) = row.iter().find(|(c, _)| c == fk_col) else {
-                    continue;
-                };
-                match value.as_deref() {
-                    None => saw_null = true,
-                    // `rel_key_value` of a seeded pk; pks run from 1, and no
-                    // program seeds anywhere near 9 rows.
-                    Some("k9") => saw_miss = true,
-                    Some(_) => saw_match = true,
-                }
-            }
-        }
-    }
-    assert!(
-        saw_match && saw_miss && saw_null,
-        "relationship foreign keys must cover all three join outcomes across 500 samples \
-         (matching={saw_match}, missing={saw_miss}, null={saw_null})"
-    );
-}
-
-/// Issue #505: every relationship shape reaches every reverse-propagation
-/// path ([`RelPath`]), including a from-side write landing after the parent
-/// it joins changed. That last path needs the tables' op streams
-/// interleaved (`generate::interleave_tables`): with each table's whole
-/// stream emitted in turn, every parent-side op came after every from-side
-/// op, and it was never drawn at all.
-///
-/// Sampled with [`TestRunner::deterministic`], so this pins what a fixed
-/// seed draws rather than being a probabilistic floor.
-#[test]
-fn trivial_program_drives_every_relationship_reverse_path() {
-    let mut runner = TestRunner::deterministic();
-    let strategy = trivial_program();
-    let mut coverage = generative::run::Coverage::new();
-    for _ in 0..1_000 {
-        let program = strategy
-            .new_tree(&mut runner)
-            .expect("strategy must produce a value")
-            .current();
-        coverage.record_program(&program);
-    }
-    for shape in [
-        "to_one_bare",
-        "to_many_in_aggregate",
-        "to_one_in_aggregate_def",
-    ] {
-        for path in RelPath::ALL {
-            let path = path.name();
-            assert!(
-                coverage
-                    .relationship_path_cases
-                    .get(&(shape, path))
-                    .is_some_and(|&n| n > 0),
-                "the {shape} relationship shape must reach the {path} reverse path across 1,000 \
-                 deterministic samples: {coverage}"
-            );
-        }
-    }
 }
 
 /// Issue #505: a failure that doesn't need the tables interleaved shrinks
@@ -1384,11 +1193,11 @@ fn trivial_program_drives_every_relationship_reverse_path() {
 /// least two tables", which op order can't affect. Each run is seeded, so
 /// this pins what the shrinker does rather than being a probabilistic floor.
 ///
-/// Over 250 seeds about 87% of the shrunk counterexamples come back in table
-/// order, both before and after #1100 narrowed the aggregate draws (213/245
-/// and 212/244); the rest run out of shrink budget. The bar is 85% over 250
-/// seeds: a 90% bar over 40 seeds sat at the mean and passed or failed with
-/// whichever seeds a generator change happened to shift.
+/// Over 250 seeds about 78% of the shrunk counterexamples come back in table
+/// order (from 176/243 to 197/236 across five seed families); the rest run
+/// out of shrink budget. The bar is 70% over 250 seeds, below the lowest of
+/// those: a bar at the mean passes or fails with whichever seeds a generator
+/// change happens to shift.
 #[test]
 fn an_order_independent_failure_shrinks_to_the_table_by_table_order() {
     let is_table_ordered = |program: &Program| {
@@ -1426,7 +1235,7 @@ fn an_order_independent_failure_shrinks_to_the_table_by_table_order() {
         "the planted failure must be found: {failures}/250 seeds"
     );
     assert!(
-        table_ordered * 100 >= failures * 85,
+        table_ordered * 100 >= failures * 70,
         "an order-independent failure must shrink to the table-by-table order: only \
          {table_ordered} of {failures} shrunk counterexamples did"
     );
@@ -1490,7 +1299,7 @@ fn the_hot_key_tier_draws_every_concurrent_shape() {
 }
 
 /// Issue #557 part 2: the mid-burst cases reach every [`ConcurrentShape`],
-/// the mid-burst actions and to-side ops included (`hot_key_case` takes no
+/// the mid-burst actions included (`hot_key_case` takes no
 /// action at all: `the_hot_key_tier_draws_every_concurrent_shape` checks
 /// that). Prints the shape tally and the per-action counts. The action
 /// shapes depend on which actions a case draws, so their floors are lower
@@ -1649,8 +1458,7 @@ fn partitioned_program_always_reads_a_partitioned_source_and_draws_every_strateg
 
 /// Issue #1100: the aggregate definitions the generator draws really land
 /// on the group basis, checked against the catalog: after a real run, the
-/// instance has one `agg_<id>` hidden table per plain (relationship-free)
-/// `GROUP BY` definition. Without this floor a generator or engine change
+/// instance has one `agg_<id>` hidden table per `GROUP BY` definition. Without this floor a generator or engine change
 /// that silently routed definitions to the ledger would still pass every
 /// convergence property.
 #[tokio::test(flavor = "multi_thread")]
@@ -1673,9 +1481,7 @@ async fn drawn_aggregate_definitions_land_on_the_group_basis() {
         let plain_aggregates = program
             .defs
             .iter()
-            .filter(|def| {
-                matches!(def.key_space, KeySpace::Aggregate { .. }) && !reads_a_relationship(def)
-            })
+            .filter(|def| matches!(def.key_space, KeySpace::Aggregate { .. }))
             .count();
         if plain_aggregates == 0 {
             continue;

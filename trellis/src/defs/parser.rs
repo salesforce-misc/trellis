@@ -37,8 +37,8 @@
 
 use super::ast::{
     AlterClause, AlterTransform, DefinitionRef, Expr, FieldDef, GroupByKey, JoinKind, JoinOn,
-    JoinSpec, KeySpace, Predicate, QualifiedColumn, RelationshipDef, Statement, StatementKind,
-    TransformDef, TransformRef,
+    JoinSpec, KeySpace, Predicate, QualifiedColumn, Statement, StatementKind, TransformDef,
+    TransformRef,
 };
 use super::error::ParseError;
 use super::lexer::{Token, lex};
@@ -72,21 +72,6 @@ pub fn parse(input: &str) -> Result<TransformDef, ParseError> {
         joined: None,
     }
     .parse_transform_def()
-}
-
-/// Parses a relationship declaration's source text into a
-/// [`RelationshipDef`]. No public statement reaches it: only the test-only
-/// `defs::create_relationship` does, until #1115 removes relationships.
-pub fn parse_relationship(input: &str) -> Result<RelationshipDef, ParseError> {
-    let tokens = lex(input)?;
-    Parser {
-        tokens,
-        pos: 0,
-        is_aggregate: false,
-        source: None,
-        joined: None,
-    }
-    .parse_relationship_def()
 }
 
 /// Parses **any** statement in this grammar into a [`Statement`] — the one
@@ -284,21 +269,6 @@ impl Parser {
                 found: other.describe(),
             }),
         }
-    }
-
-    /// Parses a dot-qualified `<table>.<col>` reference, the new-relative-to
-    /// existing-statement-forms syntax ADR-0006 introduces for a
-    /// relationship's endpoints. There's no reuse target in the expression
-    /// grammar for this: `parse_primary`'s `a.b` handling (issue #25) builds
-    /// an [`Expr::RelationshipPath`] whose head is a relationship name, not
-    /// a table — a different semantic than a relationship declaration's
-    /// `<table>.<col>` endpoints, so malformed input here still gets its own
-    /// report rather than being unified with the expression-grammar path.
-    fn expect_table_dot_column(&mut self) -> Result<(String, String), ParseError> {
-        let table = self.expect_ident()?;
-        self.expect_symbol('.')?;
-        let column = self.expect_ident()?;
-        Ok((table, column))
     }
 
     /// Parses a `TRANSFORM`/`FROM` table reference (issue #76, ADR-0011
@@ -511,34 +481,6 @@ impl Parser {
             fields,
             predicate,
             without_source_index,
-        })
-    }
-
-    /// Parses `RELATIONSHIP <name> FROM <from_table>.<fk_col> TO
-    /// <to_table>.<pk_col>` (ADR-0006, issue #24). `RELATIONSHIP`/`FROM`/`TO`
-    /// are matched case-insensitively, matching every other keyword in this
-    /// grammar (`expect_keyword`); `name` and the four table/column
-    /// components are captured as raw identifiers, exactly like
-    /// `parse_transform_def`'s `target`/`source` — validating them as real
-    /// tables/columns (cardinality, existence, cycles) is deferred to a
-    /// later issue per ADR-0006's own scoping.
-    fn parse_relationship_def(&mut self) -> Result<RelationshipDef, ParseError> {
-        self.expect_keyword("RELATIONSHIP")?;
-        let name = self.expect_ident()?;
-
-        self.expect_keyword("FROM")?;
-        let (from_table, from_col) = self.expect_table_dot_column()?;
-
-        self.expect_keyword("TO")?;
-        let (to_table, to_col) = self.expect_table_dot_column()?;
-        self.expect_eof()?;
-
-        Ok(RelationshipDef {
-            name,
-            from_table,
-            from_col,
-            to_table,
-            to_col,
         })
     }
 

@@ -18,8 +18,8 @@
 //!    per-row one: it does for `inet` (real, live, load-bearing — the exact
 //!    `boolean` shape) and does not for `cidr` (verified never to differ).
 //! 2. **Key roles.** `cidr`/`macaddr`/`macaddr8` are admitted as
-//!    relationship/primary keys and `GROUP BY` keys. `inet` is refused as a
-//!    relationship/primary key (same reason `boolean` is) but *admitted* as
+//!    `JOIN`/primary keys and `GROUP BY` keys. `inet` is refused as a
+//!    `JOIN`/primary key (same reason `boolean` is) but *admitted* as
 //!    a `GROUP BY` key, the same split `boolean` got in #119, because
 //!    the aggregate path's keyset match never does raw-text
 //!    comparison and `inet_in` reconciles both spellings — demonstrated here
@@ -54,8 +54,8 @@ use trellis::defs::ast::ValueType;
 use trellis::defs::eval::{RegexCache, Row, Value, evaluate_aggregate};
 use trellis::defs::pg_type::PgType;
 use trellis::defs::{
-    create_aggregate_target_table, create_definition, create_relationship, parse, registry,
-    source_primary_key, validate,
+    CatalogError, ValidationError, create_aggregate_target_table, create_definition,
+    install_definition, parse, registry, source_primary_key, validate,
 };
 use trellis::integer::IntWidth;
 use trellis::netaddr;
@@ -86,6 +86,24 @@ async fn connect_raw(dsn: &str) -> Client {
         .await
         .expect("session bootstrap");
     client
+}
+
+/// Defines a `JOIN` whose one `ON` term pairs `left.lcol` with
+/// `right.rcol`. `JOIN` key admission reads the same allowlist
+/// (`catalog::is_text_stable_join_key_type`) a 1-1 primary key does.
+async fn define_join_on(
+    pool: &trellis::pool::Pool,
+    target: &str,
+    (left, lcol): (&str, &str),
+    (right, rcol): (&str, &str),
+) -> Result<(), trellis::defs::CatalogError> {
+    let text = format!(
+        "TRANSFORM {target} FROM {left} JOIN {right} ON {left}.{lcol} = {right}.{rcol} \
+         GROUP BY {left}.id WITHOUT SOURCE INDEX SELECT COUNT(*) AS n"
+    );
+    install_definition(pool, &text, &HashMap::new(), "public")
+        .await
+        .map(|_| ())
 }
 
 // ---------------------------------------------------------------------
@@ -222,7 +240,7 @@ async fn cidr_out_and_the_text_cast_always_agree() {
 // 2. Key roles
 // ---------------------------------------------------------------------
 
-/// `cidr`/`macaddr`/`macaddr8` are accepted as relationship join keys and,
+/// `cidr`/`macaddr`/`macaddr8` are accepted as `JOIN` `ON` keys and,
 /// because both roles gate on the same `catalog::TEXT_STABLE_JOIN_KEY_TYPES`
 /// allowlist, as 1-1 primary keys too.
 #[tokio::test]
@@ -240,14 +258,11 @@ async fn cidr_macaddr_macaddr8_join_keys_and_primary_keys_are_admitted() {
                  create table {child} (id bigint primary key, k {pg_type})"
             ))
             .await
-            .unwrap_or_else(|e| panic!("create relationship tables for {pg_type}: {e}"));
+            .unwrap_or_else(|e| panic!("create join tables for {pg_type}: {e}"));
 
-        create_relationship(
-            &db.pool,
-            &format!("RELATIONSHIP r_{idx} FROM {child}.k TO {parent}.k"),
-        )
-        .await
-        .unwrap_or_else(|e| panic!("a {pg_type} column must be accepted as a join key: {e}"));
+        define_join_on(&db.pool, &format!("j_{idx}"), (&child, "k"), (&parent, "k"))
+            .await
+            .unwrap_or_else(|e| panic!("a {pg_type} column must be accepted as a join key: {e}"));
 
         let pk = source_primary_key(&db.pool, &parent)
             .await
@@ -259,11 +274,11 @@ async fn cidr_macaddr_macaddr8_join_keys_and_primary_keys_are_admitted() {
     }
 }
 
-/// `inet` must be refused as a relationship join key and as a 1-1 primary
+/// `inet` must be refused as a `JOIN` `ON` key and as a 1-1 primary
 /// key — the same shape `defs_boolean.rs`'s
-/// `boolean_is_refused_as_a_relationship_join_key_and_primary_key` pins.
+/// `boolean_is_refused_as_a_join_key_and_primary_key` pins.
 #[tokio::test]
-async fn inet_is_refused_as_a_relationship_join_key_and_primary_key() {
+async fn inet_is_refused_as_a_join_key_and_primary_key() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let client = connect_raw(db.dsn()).await;
@@ -274,12 +289,19 @@ async fn inet_is_refused_as_a_relationship_join_key_and_primary_key() {
              create table child (id bigint primary key, k inet)",
         )
         .await
-        .expect("create relationship tables");
+        .expect("create join tables");
 
-    let err = create_relationship(&db.pool, "RELATIONSHIP r FROM child.k TO parent.k")
+    let err = define_join_on(&db.pool, "j", ("child", "k"), ("parent", "k"))
         .await
         .expect_err("an inet column must be refused as a join key");
-    let _ = err;
+    assert!(
+        matches!(
+            &err,
+            CatalogError::Validate(ValidationError::JoinUnsupportedKeyType { pg_type, .. })
+                if pg_type == "inet"
+        ),
+        "{err:?}"
+    );
 
     let err = source_primary_key(&db.pool, "parent")
         .await

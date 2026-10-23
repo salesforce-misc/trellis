@@ -21,9 +21,9 @@
 //! `bit varying` reached (#118) for a structurally different reason (a
 //! fixed alphabet rather than a fixed label set).
 //!
-//! **Key roles.** Both land cleanly: the relationship/primary-key role gains
+//! **Key roles.** Both land cleanly: the `JOIN` key/primary-key role gains
 //! a *dynamic* counterpart to the static `catalog::TEXT_STABLE_JOIN_KEY_TYPES`
-//! allowlist (`catalog::is_enum_type_name`, a live `to_regtype` probe, since
+//! allowlist (a live catalog probe of the column's type, since
 //! there is no way to enumerate "every enum type" ahead of time the way a
 //! fixed builtin family can be), and the `GROUP BY` key gate admits
 //! `Other(PgType::Enum(_))` outright — no DDL-typmod trap the way
@@ -59,8 +59,8 @@ use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::ValueType;
 use trellis::defs::pg_type::PgType;
 use trellis::defs::{
-    create_aggregate_target_table, create_definition, create_relationship, parse, registry,
-    source_primary_key, validate,
+    CatalogError, ValidationError, create_aggregate_target_table, create_definition,
+    install_definition, parse, registry, source_primary_key, validate,
 };
 use trellis::integer::IntWidth;
 use trellis::staging::{StagedWatermark, apply, seal};
@@ -94,6 +94,24 @@ async fn connect_raw(dsn: &str) -> Client {
         .await
         .expect("session bootstrap");
     client
+}
+
+/// Defines a `JOIN` whose one `ON` term pairs `left.lcol` with
+/// `right.rcol`. `JOIN` key admission reads the same allowlist
+/// (`catalog::is_text_stable_join_key_type`) a 1-1 primary key does.
+async fn define_join_on(
+    pool: &trellis::pool::Pool,
+    target: &str,
+    (left, lcol): (&str, &str),
+    (right, rcol): (&str, &str),
+) -> Result<(), trellis::defs::CatalogError> {
+    let text = format!(
+        "TRANSFORM {target} FROM {left} JOIN {right} ON {left}.{lcol} = {right}.{rcol} \
+         GROUP BY {left}.id WITHOUT SOURCE INDEX SELECT COUNT(*) AS n"
+    );
+    install_definition(pool, &text, &HashMap::new(), "public")
+        .await
+        .map(|_| ())
 }
 
 // ---------------------------------------------------------------------
@@ -175,10 +193,10 @@ async fn to_jsonb_and_text_agree_for_enum() {
 // 2. Key roles
 // ---------------------------------------------------------------------
 
-/// An enum column is admitted as both a relationship join key and a 1-1
-/// primary key — the dynamic, `to_regtype`-based counterpart to the static
+/// An enum column is admitted as both a `JOIN` `ON` key and a 1-1
+/// primary key — the dynamic, catalog-probed counterpart to the static
 /// `catalog::TEXT_STABLE_JOIN_KEY_TYPES` allowlist every other admitted
-/// family reaches through (`catalog::is_enum_type_name`).
+/// family reaches through.
 #[tokio::test]
 async fn enum_join_key_and_primary_key_are_admitted() {
     let cluster = TestCluster::start();
@@ -192,9 +210,9 @@ async fn enum_join_key_and_primary_key_are_admitted() {
              create table child (id bigint primary key, k priority_enum)",
         )
         .await
-        .expect("create relationship tables");
+        .expect("create join tables");
 
-    create_relationship(&db.pool, "RELATIONSHIP r FROM child.k TO parent.k")
+    define_join_on(&db.pool, "j", ("child", "k"), ("parent", "k"))
         .await
         .unwrap_or_else(|e| panic!("an enum column must be accepted as a join key: {e}"));
 
@@ -207,13 +225,13 @@ async fn enum_join_key_and_primary_key_are_admitted() {
 }
 
 /// A hand-built enum type must never be conflated with a different one, even
-/// when both are otherwise perfectly good join key types: the relationship
-/// type-check (`assert_joinable_as_is`) still rejects joining two distinct
-/// enum types against each other exactly as it would `uuid` against
-/// `bigint`, since [`registry::PgType::Enum`]'s whole point is carrying each
-/// type's own identity rather than conflating "enum-ness".
+/// when both are otherwise perfectly good join key types: a `JOIN`'s `ON`
+/// type-check still rejects joining two distinct enum types against each
+/// other exactly as it would `uuid` against `bigint`, since
+/// [`registry::PgType::Enum`]'s whole point is carrying each type's own
+/// identity rather than conflating "enum-ness".
 #[tokio::test]
-async fn two_distinct_enum_types_are_not_comparable_as_a_relationship_join() {
+async fn two_distinct_enum_types_are_not_comparable_as_a_join_key() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let client = connect_raw(db.dsn()).await;
@@ -226,12 +244,19 @@ async fn two_distinct_enum_types_are_not_comparable_as_a_relationship_join() {
              create table child (id bigint primary key, k priority_enum)",
         )
         .await
-        .expect("create relationship tables");
+        .expect("create join tables");
 
-    let err = create_relationship(&db.pool, "RELATIONSHIP r FROM child.k TO parent.k")
+    let err = define_join_on(&db.pool, "j", ("child", "k"), ("parent", "k"))
         .await
         .expect_err("two distinct enum types must not be treated as comparable");
-    let _ = err;
+    assert!(
+        matches!(
+            &err,
+            CatalogError::Validate(ValidationError::JoinKeyTypeMismatch { lhs_type, rhs_type, .. })
+                if lhs_type.ends_with("priority_enum") && rhs_type.ends_with("status_enum")
+        ),
+        "{err:?}"
+    );
 }
 
 /// The `GROUP BY` key gate admits an enum type outright: unlike fixed-length

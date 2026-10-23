@@ -1855,10 +1855,10 @@ mod db_tests {
     //! cost one hashed anti-join per target, not a probe of the source per
     //! target row.
     //!
-    //! The aggregates here are relationship-fed ([`BY_G`]): every plain
-    //! aggregate is built by the Re-derive build since #625 F5, which never
-    //! reaches this sweep, and a relationship-fed one keeps the old build
-    //! until #625 F9.
+    //! The aggregates here are held out of the Re-derive build
+    //! ([`hold_orders_out`]): every plain aggregate is built by the Re-derive
+    //! build since #625 F5, which never reaches this sweep, and a held-out one
+    //! keeps the old build until #625 F10.
 
     use super::*;
     use crate::defs::ValueType;
@@ -1885,24 +1885,18 @@ mod db_tests {
         (pool, raw)
     }
 
-    /// `orders_by_g`, relationship-fed: `w` reads [`relate_orders`]'s to-one
-    /// relationship, so it still takes the old build (and reaches this sweep)
-    /// until #625 F9.
+    /// `orders_by_g`, held out of the Re-derive build by [`hold_orders_out`],
+    /// so it still takes the old build (and reaches this sweep) until #625
+    /// F10.
     const BY_G: &str = "TRANSFORM orders_by_g FROM orders GROUP BY g \
-        WITHOUT SOURCE INDEX SELECT max(a) AS total, max(gs.w) AS w";
+        WITHOUT SOURCE INDEX SELECT max(a) AS total";
 
-    /// Creates `public.gs` (keyed by `orders.g`'s text values) and the to-one
-    /// relationship `gs` from `orders.g` to it, which [`BY_G`] reads.
-    async fn relate_orders(pool: &Pool, raw: &tokio_postgres::Client) {
-        raw.batch_execute(
-            "create table public.gs (g text primary key, w numeric); \
-             insert into public.gs values ('a', 1), ('b', 2)",
-        )
-        .await
-        .expect("seed gs");
-        crate::defs::catalog::create_relationship(pool, "RELATIONSHIP gs FROM orders.g TO gs.g")
+    /// Holds every definition over `public.orders` out of the Re-derive
+    /// build, so [`BY_G`] takes the old build.
+    async fn hold_orders_out(raw: &tokio_postgres::Client) {
+        crate::intake::markers::hold_out_of_the_rederive_build(raw, "public.orders")
             .await
-            .expect("create the to-one relationship");
+            .expect("hold orders' definitions out of the Re-derive build");
     }
 
     /// Runs `ids`' sweep on its own: the discharge's read with nothing to
@@ -1947,6 +1941,7 @@ mod db_tests {
     /// read the patterns, is the exception: it only scans rows no other
     /// branch covers. A planted orphan shows the sweep isn't vacuous.
     #[tokio::test]
+    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
     async fn a_sweep_with_no_orphans_deletes_nothing_through_an_anti_join() {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
@@ -1958,7 +1953,7 @@ mod db_tests {
         )
         .await
         .expect("seed orders");
-        relate_orders(&pool, &raw).await;
+        hold_orders_out(&raw).await;
         let columns = HashMap::from([
             ("id".to_string(), ValueType::Numeric),
             ("g".to_string(), ValueType::Text),
@@ -1993,7 +1988,7 @@ mod db_tests {
             .branches()
             .partition(|sql| sql.contains("is not distinct from"));
         // The copy's branch, and the aggregate's entry sweep and ledger
-        // guard: a relationship-fed aggregate is on the ledger (#623 D5).
+        // guard: a held-out aggregate is on the ledger (#623 D5).
         assert_eq!(
             hashable.len(),
             3,
@@ -2062,6 +2057,7 @@ mod db_tests {
     /// deletes' changes, re-derive it). A group with a `NULL` pattern that
     /// appeared after the sweep read the patterns is still found.
     #[tokio::test]
+    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
     async fn a_sweep_judges_rows_on_its_reads_snapshot() {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
@@ -2072,7 +2068,7 @@ mod db_tests {
         )
         .await
         .expect("seed orders");
-        relate_orders(&pool, &raw).await;
+        hold_orders_out(&raw).await;
         let columns = HashMap::from([
             ("id".to_string(), ValueType::Numeric),
             ("g".to_string(), ValueType::Text),
@@ -2255,6 +2251,7 @@ mod db_tests {
     /// (issue #884) holds the lowest, the page queues on it holding nothing,
     /// the sweep's second batch takes the highest, and both commit.
     #[tokio::test]
+    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
     async fn a_sweep_locks_entries_in_key_order_across_the_reads_pages() {
         use crate::staging::interleave::{PausePoint, PauseScope};
         let cluster = testkit::TestCluster::start();
@@ -2267,7 +2264,7 @@ mod db_tests {
         )
         .await
         .expect("seed orders");
-        relate_orders(&pool, &raw).await;
+        hold_orders_out(&raw).await;
         let columns = HashMap::from([
             ("id".to_string(), ValueType::Numeric),
             ("g".to_string(), ValueType::Text),
@@ -2356,6 +2353,7 @@ mod db_tests {
     /// sweep holds the row there, the page waits for its commit, and both
     /// commit.
     #[tokio::test]
+    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
     async fn a_sweep_takes_one_to_one_targets_before_ledger_entries() {
         use crate::staging::interleave::{PausePoint, PauseScope};
         let cluster = testkit::TestCluster::start();
@@ -2367,7 +2365,7 @@ mod db_tests {
         )
         .await
         .expect("seed orders");
-        relate_orders(&pool, &raw).await;
+        hold_orders_out(&raw).await;
         let columns = HashMap::from([
             ("id".to_string(), ValueType::Numeric),
             ("g".to_string(), ValueType::Text),
@@ -2530,8 +2528,7 @@ mod db_tests {
     }
 
     /// [`BY_G`] and a 1-1 copy over `public.orders`, both `catching_up`,
-    /// with `rows` (`(id, g)`) in orders and `gs` holding every group they
-    /// name. Returns a same-crate pool, a raw connection and the
+    /// with `rows` (`(id, g)`) in orders. Returns a same-crate pool, a raw connection and the
     /// definitions.
     async fn by_g_and_copy(
         db: &testkit::TestDatabase,
@@ -2549,13 +2546,7 @@ mod db_tests {
             .await
             .expect("seed orders");
         }
-        relate_orders(&pool, &raw).await;
-        raw.batch_execute(
-            "insert into public.gs select distinct g, 0 from public.orders \
-             on conflict do nothing",
-        )
-        .await
-        .expect("seed every group's gs row");
+        hold_orders_out(&raw).await;
         let columns = HashMap::from([
             ("id".to_string(), ValueType::Numeric),
             ("g".to_string(), ValueType::Text),
@@ -2583,6 +2574,7 @@ mod db_tests {
     /// several batches, and the sweep still deletes every row, as one
     /// statement per class did.
     #[tokio::test]
+    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
     async fn a_sweep_binds_at_most_a_batch_of_keys_per_statement() {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
@@ -2728,11 +2720,9 @@ mod db_tests {
     }
 
     /// Issue #924's setup: a 1-1 copy and a ledger aggregate (by `k % 3`)
-    /// over `items` rows `1..=count`, both read: the copy as a
-    /// relationship's to-side, so the seam stages CDC-shaped rows for it
-    /// and re-reads their new images, and the aggregate by a `live`
-    /// definition, so it stages `Recompute`s with prior images. Then every
-    /// item is deleted. Returns a raw connection and the definitions.
+    /// over `items` rows `1..=count`, each read by a `live` definition, so
+    /// the seam stages a row with its prior image for every key the sweep
+    /// changes. Then every item is deleted. Returns a raw connection and the definitions.
     async fn read_items_all_unbacked(
         db: &testkit::TestDatabase,
         count: i64,
@@ -2740,8 +2730,7 @@ mod db_tests {
         let (pool, raw) = connect(db).await;
         raw.batch_execute(&format!(
             "create table public.items (k bigint primary key, g bigint, a numeric); \
-             insert into public.items select i, i % 3, i from generate_series(1, {count}) i; \
-             create table public.reports (id bigint primary key, oid bigint)"
+             insert into public.items select i, i % 3, i from generate_series(1, {count}) i"
         ))
         .await
         .expect("seed items");
@@ -2764,21 +2753,18 @@ mod db_tests {
         crate::intake::markers::settle_builds(&pool).await;
         let ids = catching_up(&raw).await;
         assert_eq!(ids.len(), 2, "both builds finished");
-        crate::defs::catalog::create_relationship(
-            &pool,
-            "RELATIONSHIP rollup FROM reports.oid TO items_copy.k",
-        )
-        .await
-        .expect("make the copy a relationship endpoint");
         raw.batch_execute(&format!(
             "insert into source_table_versions (source_table, version) \
-                 values ('public.items_by_g', 1) on conflict do nothing; \
+                 values ('public.items_by_g', 1), ('public.items_copy', 1) \
+                 on conflict do nothing; \
              insert into transform_definitions \
                  (target_table, source_table, source_version, definition_text, status) \
              values ('public.by_g_reader', 'public.items_by_g', 1, \
-                     'TRANSFORM by_g_reader FROM items_by_g SELECT total AS total', '{}'); \
+                     'TRANSFORM by_g_reader FROM items_by_g SELECT total AS total', '{live}'), \
+                    ('public.copy_reader', 'public.items_copy', 1, \
+                     'TRANSFORM copy_reader FROM items_copy SELECT a AS a', '{live}'); \
              delete from public.items",
-            TransformStatus::Live.as_str()
+            live = TransformStatus::Live.as_str()
         ))
         .await
         .expect("read the aggregate, and unback every item");
@@ -2837,8 +2823,8 @@ mod db_tests {
     /// Issue #924: a sweep whose seam spills to its temporary table stages
     /// exactly the rows one in-memory flush stages, while holding and
     /// binding at most about a batch of changed keys. Both runs sweep 12
-    /// unbacked items out of a read copy (12 CDC-shaped deletes, each
-    /// re-read for its new image) and a read aggregate over 3 groups (one
+    /// unbacked items out of a read copy (a staged row per deleted key)
+    /// and a read aggregate over 3 groups (one
     /// `Recompute` per group). With a batch of 2, the Re-derive writes each
     /// group across several batches, and a spill lands between them, so a
     /// group's first prior image (its sum before the sweep) has to survive
@@ -2896,6 +2882,7 @@ mod db_tests {
     /// target's order, the sweep holds only row 1 while it waits, and both
     /// commit.
     #[tokio::test]
+    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
     async fn a_sweep_batches_keys_in_the_targets_own_order() {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
@@ -3069,6 +3056,7 @@ mod db_tests {
     /// sweep holds entry 3 by then, the page waits for its commit, and both
     /// commit.
     #[tokio::test]
+    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
     async fn a_batched_sweep_locks_every_entry_before_a_group() {
         use crate::staging::interleave::{PausePoint, PauseScope};
         let cluster = testkit::TestCluster::start();
@@ -3139,6 +3127,7 @@ mod db_tests {
     /// Locking both first, the sweep holds `a` by then, the page waits for
     /// its commit, and both commit.
     #[tokio::test]
+    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
     async fn a_sweep_locks_its_orphan_groups_with_its_rederived_ones() {
         use crate::staging::interleave::{PausePoint, PauseScope};
         let cluster = testkit::TestCluster::start();
@@ -3215,6 +3204,7 @@ mod db_tests {
     /// row for, it leaves entry 3 live in `c` and both commit. The
     /// re-insert's own Apply then moves the entry to `a` and empties `c`.
     #[tokio::test]
+    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
     async fn a_sweep_leaves_an_entry_its_source_backs_again_to_the_insert() {
         use crate::staging::interleave::{PausePoint, PauseScope};
         let cluster = testkit::TestCluster::start();
@@ -3684,6 +3674,7 @@ mod db_tests {
     /// column (its primary key altered by hand) is an error the discharge
     /// backs off on, not a panic.
     #[tokio::test]
+    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
     async fn a_sweep_of_an_aggregate_missing_a_grouping_key_column_is_an_error() {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
@@ -3694,7 +3685,7 @@ mod db_tests {
         )
         .await
         .expect("seed orders");
-        relate_orders(&pool, &raw).await;
+        hold_orders_out(&raw).await;
         let columns = HashMap::from([
             ("id".to_string(), ValueType::Numeric),
             ("g".to_string(), ValueType::Text),
@@ -3727,77 +3718,6 @@ mod db_tests {
             matches!(&err, IntakeError::UnsweepableTarget { target, .. } if target == "public.orders_by_g"),
             "the mismatch is returned, got {err:?}"
         );
-    }
-
-    /// Issue #518: an aggregate grouped through a relationship its source no
-    /// longer declares as to-one (its catalog row edited, then deleted, by
-    /// hand) is an error the discharge backs off on, not a panic.
-    #[tokio::test]
-    async fn a_sweep_through_a_relationship_no_longer_to_one_is_an_error() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (pool, mut raw) = connect(&db).await;
-        raw.batch_execute(
-            "create table public.posts (id integer primary key, author text); \
-             create table public.post_tags (id integer primary key, post integer, tag text); \
-             create index on public.post_tags (post); \
-             insert into public.posts values (1, 'alice'); \
-             insert into public.post_tags values (10, 1, 'rust')",
-        )
-        .await
-        .expect("seed posts and post_tags");
-        crate::defs::catalog::create_relationship(
-            &pool,
-            "RELATIONSHIP post FROM post_tags.post TO posts.id",
-        )
-        .await
-        .expect("create the to-one relationship");
-        let columns = HashMap::from([
-            ("id".to_string(), ValueType::Numeric),
-            ("post".to_string(), ValueType::Numeric),
-            ("tag".to_string(), ValueType::Text),
-        ]);
-        crate::defs::catalog::install_definition(
-            &pool,
-            "TRANSFORM author_tags FROM post_tags GROUP BY tag, post.author \
-            WITHOUT SOURCE INDEX SELECT count(*) AS n",
-            &columns,
-            "public",
-        )
-        .await
-        .expect("register");
-        crate::intake::markers::settle_builds(&pool).await;
-        let ids = catching_up(&raw).await;
-        assert_eq!(ids.len(), 1, "the build finished");
-
-        for (edit, reason) in [
-            (
-                "update relationship_definitions set cardinality = 'many' where name = 'post'",
-                "which is not to-one",
-            ),
-            (
-                "delete from relationship_definitions where name = 'post'",
-                "which public.post_tags doesn't declare",
-            ),
-        ] {
-            raw.batch_execute(edit)
-                .await
-                .expect("edit the catalog by hand");
-            let txn = raw.transaction().await.expect("begin");
-            let mut sweep = Sweep::default();
-            let err = sweep
-                .add(&txn, &ids, TransformStatus::CatchingUp)
-                .await
-                .expect_err("the sweep can't join through the relationship");
-            assert!(
-                matches!(
-                    &err,
-                    IntakeError::UnsweepableTarget { target, reason: r }
-                        if target == "public.author_tags" && r.ends_with(reason)
-                ),
-                "after {edit:?}, got {err:?}"
-            );
-        }
     }
 
     /// A 1-1 target over a source keyed by a nullable unique index has the

@@ -443,7 +443,6 @@ mod tests {
                 to_col: to.2.to_string(),
             },
             cardinality,
-            warnings: Vec::new(),
         }
     }
 

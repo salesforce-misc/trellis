@@ -49,8 +49,7 @@ use testkit::crash::OpenTransaction;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
 use trellis::defs::{
-    TransformStatus, ValueType, chunk_queue, create_definition, create_relationship,
-    install_definition,
+    TransformStatus, ValueType, chunk_queue, create_definition, install_definition,
 };
 use trellis::intake::markers;
 use trellis::staging::apply;
@@ -407,8 +406,9 @@ async fn evict_keys_for_real(
 /// #625 F8a: a plain 1-1 over a captured table is the Re-derive build's,
 /// which applies from its start and takes no fence
 /// ([`a_plain_one_to_one_is_not_held_by_the_xmin_fence`]). The fenced
-/// discharge is kept by a 1-1 that also counts over a to-many relationship,
-/// which still takes the old direct build and its go-live catch-up.
+/// discharge is kept by a 1-1 whose source is held out of the Re-derive
+/// build ([`markers::hold_out_of_the_rederive_build`]), which takes the old
+/// chunked build and its go-live catch-up.
 #[tokio::test]
 async fn a_fresh_transform_waits_on_the_xmin_fence_then_reaches_live() {
     let cluster = TestCluster::start();
@@ -417,15 +417,13 @@ async fn a_fresh_transform_waits_on_the_xmin_fence_then_reaches_live() {
 
     raw.batch_execute(
         "create table s (id bigint primary key, a numeric); \
-         insert into s (id, a) select g, g from generate_series(1, 25) g; \
-         create table kids (id bigint primary key, s_id bigint); \
-         insert into kids (id, s_id) select g, g % 5 + 1 from generate_series(1, 20) g",
+         insert into s (id, a) select g, g from generate_series(1, 25) g",
     )
     .await
     .expect("seed source table");
-    create_relationship(&db.pool, "RELATIONSHIP kids FROM s.id TO kids.s_id")
+    markers::hold_out_of_the_rederive_build(&raw, &qualify_fixture_table("s"))
         .await
-        .expect("a to-many relationship");
+        .expect("hold s out of the Re-derive build");
 
     // A straggler holds an xid open before the table is captured, so the
     // marker the reconcile pass parks must name it as in-flight.
@@ -438,7 +436,7 @@ async fn a_fresh_transform_waits_on_the_xmin_fence_then_reaches_live() {
     let cols = numeric(&["a"]);
     let def = install_definition(
         &db.pool,
-        "TRANSFORM t FROM s SELECT a + a AS x, COUNT(kids.id) AS n",
+        "TRANSFORM t FROM s SELECT a + a AS x",
         &cols,
         "public",
     )
@@ -482,8 +480,7 @@ async fn a_fresh_transform_waits_on_the_xmin_fence_then_reaches_live() {
 
     // A reconcile pass while the straggler is still open installs the
     // capture and parks the marker, and must leave the definition exactly
-    // where it was — no flicker, no partial progress. (`kids`, captured for
-    // the relationship, gets a marker of its own.)
+    // where it was — no flicker, no partial progress.
     reconcile_pass(&db.pool, &mut raw).await;
     let markers: i64 = raw
         .query_one(
@@ -509,7 +506,7 @@ async fn a_fresh_transform_waits_on_the_xmin_fence_then_reaches_live() {
     reconcile_pass(&db.pool, &mut raw).await;
 
     // The pass only *dispatches* the build (for this definition, its
-    // direct-build job); running the job is what actually populates the
+    // chunks); running the chunks is what actually populates the
     // target, and its go-live catch-up takes the definition `live`.
     drain_to_quiescence(&db.pool, &mut raw).await;
 
@@ -522,8 +519,7 @@ async fn a_fresh_transform_waits_on_the_xmin_fence_then_reaches_live() {
     let mismatches: i64 = raw
         .query_one(
             "select count(*) from s left join t on t.id = s.id \
-             where t.id is null or t.x is distinct from s.a + s.a \
-                or t.n is distinct from (select count(*) from kids where kids.s_id = s.id)",
+             where t.id is null or t.x is distinct from s.a + s.a",
             &[],
         )
         .await
@@ -1056,10 +1052,9 @@ async fn resume_transform_reports_not_found_for_an_unregistered_target() {
 
 /// Regression coverage (this issue's items 2/3): with no unsettled marker at
 /// creation time, every background build reaches `live`: a plain 1-1
-/// definition's chunks and a relationship-fed aggregate's direct-build job
-/// (the old build until #625 F9) through the discharge, and a plain `SUM`'s
-/// Re-derive build (#625 F3, every plain aggregate since F5) through its
-/// start, with three stored states and no `catching_up` between them.
+/// definition's chunks through the discharge, and a plain `SUM`'s Re-derive
+/// build (#625 F3, every plain aggregate since F5) through its start, with
+/// three stored states and no `catching_up` between them.
 #[tokio::test]
 async fn every_backfill_mechanism_still_reaches_live_with_no_unsettled_marker() {
     let cluster = TestCluster::start();
@@ -1070,14 +1065,12 @@ async fn every_backfill_mechanism_still_reaches_live_with_no_unsettled_marker() 
         "create table plain_s (id bigint primary key, a numeric); \
          insert into plain_s (id, a) select g, g from generate_series(1, 10) g; \
          create table agg_s (id bigint primary key, grp bigint, a numeric(12,0)); \
-         insert into agg_s (id, grp, a) select g, g % 3, g from generate_series(1, 10) g; \
-         create table grp_s (id bigint primary key, w numeric); \
-         insert into grp_s (id, w) select g, g * 10 from generate_series(0, 2) g;",
+         insert into agg_s (id, grp, a) select g, g % 3, g from generate_series(1, 10) g;",
     )
     .await
     .expect("seed source tables");
 
-    // Chunked path: a plain (non-relationship) 1-1 definition.
+    // Chunked path: a plain 1-1 definition.
     let cols = numeric(&["a"]);
     let plain = install_definition(
         &db.pool,
@@ -1091,45 +1084,7 @@ async fn every_backfill_mechanism_still_reaches_live_with_no_unsettled_marker() 
     drain_backfill_chunks(&db.pool).await;
     assert_eq!(status_of(&raw, "plain_t").await, TransformStatus::Live);
 
-    // Direct/set-based path: an aggregate the Re-derive build doesn't take,
-    // a relationship-fed one (until #625 F9).
-    trellis::defs::create_relationship(&db.pool, "RELATIONSHIP grp_row FROM agg_s.grp TO grp_s.id")
-        .await
-        .expect("create the to-one relationship");
     let agg_cols = numeric(&["grp", "a"]);
-    let agg = install_definition(
-        &db.pool,
-        "TRANSFORM agg_t FROM agg_s GROUP BY grp \
-        WITHOUT SOURCE INDEX SELECT grp AS grp, MAX(a) AS top, MAX(grp_row.w) AS w",
-        &agg_cols,
-        "public",
-    )
-    .await
-    .expect("install_definition (direct/aggregate path)");
-    assert_eq!(
-        agg.status,
-        TransformStatus::WaitingToBackfill,
-        "the direct/set-based path registers without building (ADR-0002, #419)"
-    );
-    trellis::intake::markers::discharge_registrations(&db.pool)
-        .await
-        .expect("dispatch the build");
-    let direct: i64 = raw
-        .query_one(
-            "select count(*) from backfill_chunks c \
-             join transform_definitions d on d.id = c.definition_id \
-             where d.target_table = 'public.agg_t' and c.kind = 'direct' and d.build is null",
-            &[],
-        )
-        .await
-        .expect("count the direct-build jobs")
-        .get(0);
-    assert_eq!(
-        direct, 1,
-        "the discharge dispatched the old direct-build job"
-    );
-    drain_backfill_chunks(&db.pool).await;
-    assert_eq!(status_of(&raw, "agg_t").await, TransformStatus::Live);
 
     // The Re-derive build (#625 F3): a plain `SUM`.
     let summed = install_definition(
@@ -1196,18 +1151,17 @@ async fn backfill_failures_listed(
 /// #625 F8a: a plain 1-1 over a captured table is the Re-derive build's,
 /// whose start reads no key (a failing plan job shows through status as a
 /// failing chunk, #616). The marker discharge that fails on the missing key
-/// is the old paths', which a 1-1 that also reads through a to-one
-/// relationship still takes (its source is enumerated into the ring), so
-/// both readers do.
+/// is the old paths', which a 1-1 over a source held out of the Re-derive
+/// build ([`markers::hold_out_of_the_rederive_build`]) still takes, so both
+/// readers do.
 #[tokio::test]
 async fn a_failing_backfill_shows_through_status_until_it_goes_through() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
     raw.batch_execute(
-        "create table public.makers (id bigint primary key, name text); \
-         create table public.widgets (id bigint primary key, price numeric, maker_id bigint); \
-         insert into public.widgets values (1, 2, null);",
+        "create table public.widgets (id bigint primary key, price numeric); \
+         insert into public.widgets values (1, 2);",
     )
     .await
     .expect("seed the source");
@@ -1217,23 +1171,17 @@ async fn a_failing_backfill_shows_through_status_until_it_goes_through() {
     )
     .await
     .expect("connect a define-only Trellis");
-    trellis::dev::defs::create_relationship(
-        trellis.pool(),
-        "RELATIONSHIP maker FROM widgets.maker_id TO makers.id",
-    )
-    .await
-    .expect("a to-one relationship");
+    markers::hold_out_of_the_rederive_build(&raw, "public.widgets")
+        .await
+        .expect("hold widgets out of the Re-derive build");
     trellis
-        .apply(
-            "TRANSFORM widget_totals FROM widgets \
-             SELECT price + price AS total, maker.name AS maker",
-        )
+        .apply("TRANSFORM widget_totals FROM widgets SELECT price + price AS total")
         .await
         .expect("register a 1-1 transform");
     // A second reader of the same source, so the listing shows the one
     // marker's failure on both (issue #461).
     trellis
-        .apply("TRANSFORM widget_prices FROM widgets SELECT price AS price, maker.name AS maker")
+        .apply("TRANSFORM widget_prices FROM widgets SELECT price AS price")
         .await
         .expect("register a second transform on the same source");
     // Their build enumerates the source by its primary key, so without one
@@ -1307,6 +1255,9 @@ async fn a_failing_backfill_shows_through_status_until_it_goes_through() {
     markers::discharge_registrations(&db.pool)
         .await
         .expect("the retry goes through");
+    // The discharge dispatched the chunked build; its chunks and go-live
+    // catch-up take it live.
+    drain_backfill_chunks(&db.pool).await;
     let status = trellis
         .status("widget_totals")
         .await
@@ -1316,6 +1267,6 @@ async fn a_failing_backfill_shows_through_status_until_it_goes_through() {
     assert_eq!(
         status.status,
         TransformStatus::Live,
-        "the retry enumerated the source into the ring, which takes it live"
+        "the retry's build takes it live"
     );
 }

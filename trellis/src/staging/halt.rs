@@ -509,7 +509,6 @@ mod tests {
                     to_col: "handle".to_string(),
                 },
                 cardinality: RelationshipCardinality::ToOne,
-                warnings: Vec::new(),
             }],
             projection_columns: HashMap::new(),
         }
