@@ -51,6 +51,17 @@ defmodule Trellis.StructureDump do
   # the first's appendix rather than loading the definitions twice.
   @marker "-- Trellis definitions ("
 
+  # How each line of the engine's appendix starts (`trellis::dump`).
+  @appendix_starts [
+    "--",
+    "insert into ",
+    "select setval(",
+    "update ",
+    "create temporary table trellis_resolved_types ",
+    "delete from ",
+    "drop table trellis_resolved_types;"
+  ]
+
   # How many times `dump/2` redoes a dump that a define or drop raced.
   @attempts 3
 
@@ -275,9 +286,10 @@ defmodule Trellis.StructureDump do
   # in the file, and none of its later lines starts with the marker (its
   # values are JSON, whose newlines are escaped), so it starts at the last
   # line that does, if everything from there on is appendix-shaped: comments
-  # and the `insert`s and `select`s the engine writes. A marker line in the
-  # dump itself (a function body, say) is followed by something else, and is
-  # kept.
+  # and the statements the engine writes (`trellis::dump`: the `insert`s and
+  # `setval`s that load the definitions, then the statements that resolve
+  # each recorded type's OID by name). A marker line in the dump itself (a
+  # function body, say) is followed by something else, and is kept.
   defp strip(text) do
     starts =
       if(String.starts_with?(text, @marker), do: [0], else: []) ++
@@ -297,7 +309,7 @@ defmodule Trellis.StructureDump do
     tail
     |> String.split("\n")
     |> Enum.all?(fn line ->
-      line == "" or String.starts_with?(line, ["--", "insert into ", "select setval("])
+      line == "" or String.starts_with?(line, @appendix_starts)
     end)
   end
 end
