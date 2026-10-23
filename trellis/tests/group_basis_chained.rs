@@ -119,8 +119,7 @@ async fn assert_equal(d: &mut Driver, actual: &str, expected: &str) {
 
 // ---------------------------------------------- ported chained aggregates
 
-const AGG_G: &str =
-    "TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n";
+const AGG_G: &str = "TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n";
 
 fn agg_g_columns() -> Vec<(&'static str, ValueType)> {
     vec![("g", int4()), ("total", int8()), ("n", int8())]
@@ -920,8 +919,7 @@ async fn a_pause_and_drop_of_a_one_to_one_wait_for_a_page_that_planned_it() {
 
 // ------------------------------------------ a build over NULL-part keys
 
-const UP_HG: &str =
-    "TRANSFORM up FROM public.src GROUP BY g, h WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n";
+const UP_HG: &str = "TRANSFORM up FROM public.src GROUP BY g, h WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n";
 const ROLL_H: &str = "TRANSFORM roll FROM public.up GROUP BY h WITHOUT SOURCE INDEX SELECT SUM(total) AS t2, \
                       SUM(n) AS n2";
 const ROLL: &str = "public.roll";

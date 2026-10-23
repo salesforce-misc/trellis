@@ -2988,7 +2988,7 @@ async fn build_refuses_a_field_build() {
 const I2_EXPECTED: &str = "select ga, sum(n), sum(sx) from ( \
         select a.ga as ga, count(*) as n, sum(a.x) as sx from public.a \
         join public.b on a.k = b.k group by a.ga, b.gb) s group by ga order by ga";
-const I3_EXPECTED: &str = "select n, count(*), sum(sx) from ( \
+const I3_EXPECTED: &str = "select n, count(*), count(sx) from ( \
         select ga, sum(n) as n, sum(sx) as sx from ( \
             select a.ga as ga, count(*) as n, sum(a.x) as sx from public.a \
             join public.b on a.k = b.k group by a.ga, b.gb) s group by ga) r \
@@ -3020,7 +3020,7 @@ async fn chained(deeper: bool) -> Lab {
         trellis::defs::install_definition(
             lab.d.pool(),
             "TRANSFORM i3 FROM public.i2 GROUP BY n WITHOUT SOURCE INDEX \
-             SELECT COUNT(*) AS groups, SUM(sx) AS t",
+             SELECT COUNT(*) AS groups, COUNT(sx) AS t",
             &columns(&[("ga", int4()), ("n", int8), ("sx", int8)]),
             "public",
         )

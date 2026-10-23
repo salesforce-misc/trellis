@@ -38,8 +38,7 @@ use trellis::staging::partition_correction::{self, Options, Outcome};
 use trellis::{Trellis, TrellisOptions};
 
 const SOURCE: &str = "public.items";
-const DEFINITION: &str =
-    "TRANSFORM agg FROM public.items GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n";
+const DEFINITION: &str = "TRANSFORM agg FROM public.items GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n";
 
 /// `items (id, g, v)` partitioned `kind` on `g`, empty.
 fn head(kind: &str) -> String {
@@ -1261,14 +1260,12 @@ async fn a_recorded_leaf_whose_capture_was_switched_off_pauses_the_reader() {
 /// #1147: a new leaf, empty or loaded before its capture, is corrected in the
 /// pass that sees it, leaf alone. The reinstall of its capture parks no
 /// marker (whose discharge would enumerate every key of the source for each
-/// reader) and rebuilds no reader: a group-basis and a ledger aggregate both
-/// stay `live` through the pass, and the oracle holds after the corrections.
+/// reader) and rebuilds no reader: the aggregate stays `live` through the
+/// pass, and the oracle holds after the correction.
 #[tokio::test]
 async fn a_new_leaf_costs_no_rebuild_and_no_source_wide_enumeration() {
-    const LEDGER: &str =
-        "TRANSFORM top FROM public.items GROUP BY g WITHOUT SOURCE INDEX SELECT MAX(v) AS top, COUNT(*) AS n";
     for loaded in [false, true] {
-        let mut fx = Fx::start_with(&tree("list"), SEED, &[DEFINITION, LEDGER]).await;
+        let mut fx = Fx::start(&tree("list"), SEED).await;
         fx.exec("create table public.items_p4 partition of public.items for values in (16, 17)")
             .await;
         if loaded {
@@ -1287,7 +1284,7 @@ async fn a_new_leaf_costs_no_rebuild_and_no_source_wide_enumeration() {
                  order by id",
             )
             .await;
-        assert_eq!(state, ["(live/-)", "(live/-)"], "loaded: {loaded}");
+        assert_eq!(state, ["(live/-)"], "loaded: {loaded}");
         assert_eq!(
             fx.d.rows(parked).await,
             before,
@@ -1305,57 +1302,11 @@ async fn a_new_leaf_costs_no_rebuild_and_no_source_wide_enumeration() {
         fx.d.settle().await;
         fx.assert_right("group basis").await;
         assert_eq!(
-            fx.d.rows(
-                "select g, top, n from public.top \
-                 except select g, max(v), count(*) from public.items group by g"
-            )
-            .await,
-            Vec::<String>::new(),
-            "ledger oracle: loaded {loaded}"
-        );
-        assert_eq!(
-            fx.d.rows("select count(*) from public.top where g in (16, 17)")
+            fx.d.rows("select count(*) from public.agg where g in (16, 17)")
                 .await,
             [if loaded { "(2)" } else { "(0)" }]
         );
     }
-}
-
-/// A ledger aggregate over the same source keeps #1062's engine: its
-/// correction moves it to `backfilling` until its deltas are merged, while
-/// the group-basis one is recomputed and stays `live`.
-#[tokio::test]
-async fn a_ledger_aggregate_beside_keeps_its_engine() {
-    const LEDGER: &str =
-        "TRANSFORM top FROM public.items GROUP BY g WITHOUT SOURCE INDEX SELECT MAX(v) AS top, COUNT(*) AS n";
-    let mut fx = Fx::start_with(&tree("list"), SEED, &[DEFINITION, LEDGER]).await;
-    let ledger_right = "select g, top, n from public.top \
-                        except select g, max(v), count(*) from public.items group by g";
-    assert_eq!(fx.d.rows(ledger_right).await, Vec::<String>::new());
-    fx.exec("drop table public.items_p1").await;
-    fx.pass().await;
-    fx.run().await;
-    let ledger_status: String =
-        fx.d.ctl
-            .query_one(
-                "select status from transform_definitions where target_table = 'public.top'",
-                &[],
-            )
-            .await
-            .expect("status")
-            .get(0);
-    assert_eq!(ledger_status, "backfilling");
-    fx.d.settle().await;
-    trellis::staging::build::settle_builds(fx.d.pool()).await;
-    fx.d.settle().await;
-    fx.assert_right("group basis beside a ledger").await;
-    assert_eq!(fx.d.rows(ledger_right).await, Vec::<String>::new());
-    assert_eq!(
-        fx.d.rows("select g from public.top where g between 4 and 7")
-            .await,
-        Vec::<String>::new()
-    );
-    assert!(fx.queue().await.is_empty());
 }
 
 /// `--ignored`: what a leaf's correction costs on the group basis (#1043

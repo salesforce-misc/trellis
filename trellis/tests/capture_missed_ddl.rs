@@ -240,7 +240,9 @@ async fn run_cases(cases: &[Case]) {
                 "TRANSFORM r_{id} FROM public.{t} \
                  SELECT a AS a, b AS b, v AS v, n AS n, x AS x"
             ),
-            format!("TRANSFORM s_{id} FROM public.{t} GROUP BY g WITHOUT SOURCE INDEX SELECT g AS g, SUM(b) AS total"),
+            format!(
+                "TRANSFORM s_{id} FROM public.{t} GROUP BY g WITHOUT SOURCE INDEX SELECT g AS g, SUM(b) AS total"
+            ),
         ] {
             trellis.apply(&text).await.expect(&text);
         }

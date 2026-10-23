@@ -139,8 +139,8 @@ async fn an_ambiguous_bare_name_is_refused_at_define() {
     );
 }
 
-/// The qualified spelling defines, builds and applies `SUM` and `MAX` over the
-/// source column, beside the field that shadows it.
+/// Both qualified spellings define, build and apply `SUM` over the source
+/// column, beside the field that shadows it.
 #[tokio::test]
 async fn a_qualified_name_aggregates_the_source_column() {
     let cluster = TestCluster::start();
@@ -158,7 +158,7 @@ async fn a_qualified_name_aggregates_the_source_column() {
         &db.pool,
         "TRANSFORM amb_totals FROM amb_src GROUP BY grp \
         WITHOUT SOURCE INDEX SELECT grp AS grp, (grp + 1) AS val, SUM(amb_src.val) AS total, \
-         MAX(public.amb_src.val) AS biggest",
+         SUM(public.amb_src.val) AS biggest",
         &source_columns(),
         "public",
     )
@@ -181,7 +181,7 @@ async fn a_qualified_name_aggregates_the_source_column() {
     };
     assert_eq!(
         read_totals(&client).await,
-        vec![row(1, "2", "12", "7"), row(2, "3", "9", "9")]
+        vec![row(1, "2", "12", "12"), row(2, "3", "9", "9")]
     );
 
     // Live Apply folds the source column too, not the field: an insert and an
@@ -217,7 +217,7 @@ async fn a_qualified_name_aggregates_the_source_column() {
     drain_to_quiescence(&db.pool, &mut client).await;
     assert_eq!(
         read_totals(&client).await,
-        vec![row(1, "2", "112", "100"), row(2, "3", "1", "1")]
+        vec![row(1, "2", "112", "112"), row(2, "3", "1", "1")]
     );
 }
 
@@ -361,7 +361,7 @@ async fn a_resume_refuses_a_name_a_later_source_column_made_ambiguous() {
     trellis
         .apply(
             "TRANSFORM amb_totals FROM amb_src GROUP BY grp \
-            WITHOUT SOURCE INDEX SELECT grp AS grp, (grp + 1) AS adj, SUM(adj) AS total",
+            WITHOUT SOURCE INDEX SELECT grp AS grp, (grp + 1) AS adj, COUNT(adj) AS total",
         )
         .await
         .expect("no source column is named adj yet");

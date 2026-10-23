@@ -19,7 +19,8 @@ use trellis::staging::self_check::{
 };
 
 const SOURCE: &str = "public.items";
-const AGG: &str = "TRANSFORM agg FROM public.items GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total";
+const AGG: &str =
+    "TRANSFORM agg FROM public.items GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total";
 const TREE: &str = "create table public.items (id integer not null, g integer not null, \
         v integer not null, primary key (g, id)) partition by list (g); \
      create table public.items_a partition of public.items for values in (1, 2); \

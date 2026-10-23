@@ -40,9 +40,9 @@
 //! cargo run -p benchmark --features engine-access --release -- group-contention --groups 10,100,400,4000,40000
 //! cargo run -p benchmark --features engine-access --release -- group-contention --groups 400 --threads 1,2,4,8,16
 //! cargo run -p benchmark --features engine-access --release -- group-contention --groups 10,400 --aggregate max
-//! # #1100: any streaming scenario on the group basis instead of the ledger (the dev knob);
-//! # the same command without the flag is its same-session ledger control
-//! cargo run -p benchmark --features engine-access --release -- group-contention --groups 10,400 --group-basis
+//! # #1100: every aggregate runs on the group basis; `--ledger` forces the per-row ledger
+//! # (the dev knob) for a same-session control until #1105 deletes it
+//! cargo run -p benchmark --features engine-access --release -- group-contention --groups 10,400 --ledger
 //! # #1113: #1091 J2's JOIN scenario (D1/D2 x S1/S2, a-side and b-side pages, hot keys)
 //! # against its same-session per-fact control (B0); turns the group-basis knob on itself
 //! cargo run -p benchmark --features engine-access --release -- join

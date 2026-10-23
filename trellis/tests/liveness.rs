@@ -464,7 +464,9 @@ async fn a_long_page_leaves_its_claim_stamped_at_commit_time_not_transaction_sta
     let mut client = connect_raw(db.dsn()).await;
 
     client
-        .batch_execute("create table items (id integer primary key, grp integer, amount numeric)")
+        .batch_execute(
+            "create table items (id integer primary key, grp integer, amount numeric(12,0))",
+        )
         .await
         .expect("create items");
     let columns: HashMap<String, ValueType> = ["id", "grp", "amount"]

@@ -27,8 +27,7 @@ use trellis::staging::partition_correction::{self, Options, Outcome};
 use trellis::{Config, CorrectingNode, TransformStatus, Trellis, TrellisOptions};
 
 const SOURCE: &str = "public.items";
-const DEFINITION: &str =
-    "TRANSFORM agg FROM public.items GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n";
+const DEFINITION: &str = "TRANSFORM agg FROM public.items GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n";
 
 /// `items` partitioned `by` on `g`, with the primary key a partitioned table
 /// needs. Leaves hold the groups 0-3, 4-7, 8-11 and 12-15.
@@ -753,8 +752,7 @@ async fn a_detach_pending_leaf_waits_for_the_detach_to_finalize() {
 async fn every_aggregate_reading_the_source_is_corrected_before_the_queue_clears() {
     // The per-row ledger, which this file pins, until #1105 deletes it.
     trellis::dev::staging::set_group_basis(false);
-    const SECOND: &str =
-        "TRANSFORM agg2 FROM public.items GROUP BY g WITHOUT SOURCE INDEX SELECT MAX(v) AS top, COUNT(*) AS n";
+    const SECOND: &str = "TRANSFORM agg2 FROM public.items GROUP BY g WITHOUT SOURCE INDEX SELECT MAX(v) AS top, COUNT(*) AS n";
     let mut fx = Fx::start_with(&tree("range"), &[DEFINITION, SECOND]).await;
     fx.exec("drop table public.items_p2").await;
     fx.pass().await;
@@ -1339,8 +1337,7 @@ async fn a_leaf_attached_again_before_its_correction_ran_does_not_hold_the_queue
     }
 }
 
-const SECOND_AGG: &str =
-    "TRANSFORM agg2 FROM public.items GROUP BY g WITHOUT SOURCE INDEX SELECT MAX(v) AS top, COUNT(*) AS n";
+const SECOND_AGG: &str = "TRANSFORM agg2 FROM public.items GROUP BY g WITHOUT SOURCE INDEX SELECT MAX(v) AS top, COUNT(*) AS n";
 
 const RANGE_P2: &str = "alter table public.items attach partition public.items_p2 \
      for values from (8) to (12)";
@@ -1849,8 +1846,7 @@ async fn status_lists_the_node_under_correction_until_its_keys_drain() {
 async fn a_failing_correction_holds_up_no_other_definition_and_pauses_its_own() {
     // The per-row ledger, which this file pins, until #1105 deletes it.
     trellis::dev::staging::set_group_basis(false);
-    const SECOND: &str =
-        "TRANSFORM agg2 FROM public.items GROUP BY g WITHOUT SOURCE INDEX SELECT MAX(v) AS top, COUNT(*) AS n";
+    const SECOND: &str = "TRANSFORM agg2 FROM public.items GROUP BY g WITHOUT SOURCE INDEX SELECT MAX(v) AS top, COUNT(*) AS n";
     let mut fx = Fx::start_with(&tree("range"), &[DEFINITION, SECOND]).await;
     let ledger: String =
         fx.d.ctl

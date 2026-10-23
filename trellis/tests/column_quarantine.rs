@@ -1729,7 +1729,7 @@ async fn pausing_an_upstream_column_never_cascades_into_a_downstream_aggregate()
     let stats_def = create_definition(
         &db.pool,
         "TRANSFORM order_stats FROM order_totals GROUP BY id WITHOUT SOURCE INDEX SELECT id AS id, \
-         SUM(total) AS total_sum",
+         COUNT(total) AS total_sum",
         &order_totals_columns,
     )
     .await
@@ -3062,14 +3062,29 @@ async fn a_row_changed_after_a_column_resume_needs_no_catch_up() {
 /// Creates source `items (id, price, tax, bonus)` and the 1-1 transform
 /// `sib` over it from `select` (its `SELECT` list), with its target table.
 async fn seed_items_transform(db: &TestDatabase, client: &Client, select: &str) {
+    seed_items_transform_of(db, client, select, "numeric", ValueType::Numeric).await;
+}
+
+/// [`seed_items_transform`] with `price`, `tax` and `bonus` of the SQL type
+/// `sql_type`, which is `value_type`.
+async fn seed_items_transform_of(
+    db: &TestDatabase,
+    client: &Client,
+    select: &str,
+    sql_type: &str,
+    value_type: ValueType,
+) {
     client
-        .batch_execute(
-            "create table items (id integer primary key, price numeric, tax numeric, \
-             bonus numeric)",
-        )
+        .batch_execute(&format!(
+            "create table items (id integer primary key, price {sql_type}, tax {sql_type}, \
+             bonus {sql_type})"
+        ))
         .await
         .expect("seed source table");
-    let source_columns = numeric_columns(&["id", "price", "tax", "bonus"]);
+    let mut source_columns = numeric_columns(&["id"]);
+    for name in ["price", "tax", "bonus"] {
+        source_columns.insert(name.to_string(), value_type);
+    }
     let definition = create_definition(
         &db.pool,
         &format!("TRANSFORM sib FROM items SELECT {select}"),
@@ -3917,7 +3932,7 @@ async fn an_aggregate_defined_over_a_paused_column_is_not_paused() {
 
     let trellis = trellis_on(&db).await;
     trellis
-        .apply("TRANSFORM sib_stats FROM sib GROUP BY id WITHOUT SOURCE INDEX SELECT id AS id, SUM(total) AS total_sum")
+        .apply("TRANSFORM sib_stats FROM sib GROUP BY id WITHOUT SOURCE INDEX SELECT id AS id, COUNT(total) AS total_sum")
         .await
         .expect("define an aggregate over the paused column");
     assert_eq!(
@@ -6015,19 +6030,27 @@ async fn a_resume_holds_a_reader_whose_source_changed_after_the_walk_read_its_de
 // Issue #1208: a reader of a paused upstream column reports catching_up.
 // ---------------------------------------------------------------------
 
-/// `sib (total, cost)` over `items` with row 1 drained, read by the live
-/// aggregates `sib_stats` (`SUM(total)` and `MAX(total)`, two fields over
+/// `sib (total, cost)` over a `bigint` `items` (a `SUM` over a target's
+/// `numeric` column is refused) with row 1 drained, read by the live
+/// aggregates `sib_stats` (`SUM(total)` and `COUNT(total)`, two fields over
 /// the column the tests pause),
 /// `sib_costs` (`SUM(cost)`, which reads other columns only) and the 1-1
 /// `sib_chain` over `sib_stats`.
 async fn seed_aggregate_readers(db: &TestDatabase) -> (Client, Trellis) {
     let mut client = connect_raw(db.dsn()).await;
-    seed_items_transform(db, &client, "price + tax AS total, price + 0 AS cost").await;
+    seed_items_transform_of(
+        db,
+        &client,
+        "price + tax AS total, price + 0 AS cost",
+        "bigint",
+        ValueType::Integer(trellis::integer::IntWidth::Int8),
+    )
+    .await;
     change_item(&mut client, &db.pool, 1, None, (10, 5, 0)).await;
     let trellis = trellis_on(db).await;
     for define in [
         "TRANSFORM sib_stats FROM sib GROUP BY id WITHOUT SOURCE INDEX SELECT id AS id, SUM(total) AS s, \
-         MAX(total) AS m",
+         COUNT(total) AS m",
         "TRANSFORM sib_costs FROM sib GROUP BY id WITHOUT SOURCE INDEX SELECT id AS id, SUM(cost) AS c",
     ] {
         trellis.apply(define).await.expect("define an aggregate");

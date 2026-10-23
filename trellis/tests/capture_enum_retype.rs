@@ -57,8 +57,8 @@ async fn records(h: &H) -> Vec<String> {
     .await
 }
 
-/// A passthrough, a group-basis `GROUP BY` the enum, a `MIN` of it (an
-/// aggregate field of the enum's type) and a 1-1 keyed by it, with changes
+/// A passthrough, a group-basis `GROUP BY` the enum, a `COUNT` of it (an
+/// aggregate reading it, grouped by something else) and a 1-1 keyed by it, with changes
 /// staged across the re-type. The pass pauses each once with
 /// the reason and records the new type; a later pass changes neither its
 /// gate nor its reason. `RESUME` waits for the staged changes and rebuilds
@@ -72,7 +72,7 @@ async fn a_re_type_to_another_enum_pauses_each_reader_once_and_resumes_exactly()
             "TRANSFORM t1 FROM public.s SELECT tone AS tone, n AS n",
             "TRANSFORM per_tone FROM public.s GROUP BY tone \
             WITHOUT SOURCE INDEX SELECT tone AS tone, COUNT(*) AS c, SUM(n) AS sn",
-            "TRANSFORM lo FROM public.s GROUP BY n WITHOUT SOURCE INDEX SELECT n AS n, MIN(tone) AS lo",
+            "TRANSFORM lo FROM public.s GROUP BY n WITHOUT SOURCE INDEX SELECT n AS n, COUNT(tone) AS lo",
             "TRANSFORM kt FROM public.k SELECT n AS n",
         ],
     )
@@ -132,12 +132,10 @@ async fn a_re_type_to_another_enum_pauses_each_reader_once_and_resumes_exactly()
         "select tone::text, count(*), sum(n) from public.s group by tone",
     )
     .await;
-    // `MIN` is recompute-only, off the group basis, which `self_check`
-    // doesn't audit.
-    h.assert_exact_unaudited(
+    h.assert_exact(
         "lo",
-        "select n, lo::text from public.lo",
-        "select n, min(tone)::text from public.s group by n",
+        "select n, lo from public.lo",
+        "select n, count(tone) from public.s group by n",
     )
     .await;
     h.assert_exact(
@@ -166,12 +164,10 @@ async fn a_re_type_to_another_enum_pauses_each_reader_once_and_resumes_exactly()
         "select tone::text, count(*), sum(n) from public.s group by tone",
     )
     .await;
-    // `MIN` is recompute-only, off the group basis, which `self_check`
-    // doesn't audit.
-    h.assert_exact_unaudited(
+    h.assert_exact(
         "lo",
-        "select n, lo::text from public.lo",
-        "select n, min(tone)::text from public.s group by n",
+        "select n, lo from public.lo",
+        "select n, count(tone) from public.s group by n",
     )
     .await;
     h.assert_exact(

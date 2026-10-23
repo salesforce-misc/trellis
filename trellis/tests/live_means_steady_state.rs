@@ -650,6 +650,7 @@ async fn a_one_to_one_direct_build_row_deleted_during_its_build_is_gone_at_live(
 /// The chunk is held by a row trigger on the target's group-delta table,
 /// after its entry lock and its read.
 #[tokio::test]
+#[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
 async fn a_rederive_build_applies_while_backfilling_and_is_steady_at_live() {
     const HOLD: i64 = 6253;
     let cluster = TestCluster::start();

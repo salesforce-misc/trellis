@@ -1271,7 +1271,7 @@ async fn a_batch_failure_that_only_reproduces_combined_surfaces_unblamed() {
 
     client
         .batch_execute(
-            "create table order_items (id integer primary key, order_id integer, amount numeric)",
+            "create table order_items (id integer primary key, order_id integer, amount numeric(12,2))",
         )
         .await
         .expect("create source table");
@@ -2263,7 +2263,7 @@ async fn isolation_pins_a_key_masked_by_a_batch_mate_in_its_half() {
 
     client
         .batch_execute(
-            "create table order_items (id integer primary key, order_id integer, amount numeric)",
+            "create table order_items (id integer primary key, order_id integer, amount numeric(12,2))",
         )
         .await
         .expect("create source table");

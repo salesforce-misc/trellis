@@ -863,7 +863,7 @@ async fn install_definition_fast_path_builds_an_aggregate_cross_field_alias_chai
     client
         .batch_execute(
             "create table order_items \
-             (id bigint primary key, order_id bigint, amount numeric); \
+             (id bigint primary key, order_id bigint, amount numeric(12,0)); \
              insert into order_items (id, order_id, amount) values \
              (1, 10, 5), (2, 10, 7), (3, 20, 3)",
         )
@@ -945,7 +945,7 @@ async fn install_definition_builds_a_bare_alias_of_a_sum_field_declared_before_i
     client
         .batch_execute(
             "create table order_items \
-             (id bigint primary key, order_id bigint, amount numeric); \
+             (id bigint primary key, order_id bigint, amount numeric(12,0)); \
              insert into order_items (id, order_id, amount) values \
              (1, 10, 5), (2, 10, 7), (3, 20, 3)",
         )
@@ -1014,7 +1014,7 @@ async fn install_definition_shares_one_count_column_across_several_aliases_of_a_
     client
         .batch_execute(
             "create table order_items \
-             (id bigint primary key, order_id bigint, amount numeric); \
+             (id bigint primary key, order_id bigint, amount numeric(12,0)); \
              insert into order_items (id, order_id, amount) values \
              (1, 10, 5), (2, 10, 7), (3, 20, null)",
         )

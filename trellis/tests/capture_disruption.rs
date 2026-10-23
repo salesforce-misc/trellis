@@ -233,7 +233,9 @@ async fn create_case_tables(raw: &Client, trellis: &Trellis, ids: &[String]) {
         .expect("create the case's table");
         for text in [
             format!("TRANSFORM r_{id} FROM public.{t} SELECT a AS a, b AS b"),
-            format!("TRANSFORM s_{id} FROM public.{t} GROUP BY g WITHOUT SOURCE INDEX SELECT g AS g, SUM(b) AS total"),
+            format!(
+                "TRANSFORM s_{id} FROM public.{t} GROUP BY g WITHOUT SOURCE INDEX SELECT g AS g, SUM(b) AS total"
+            ),
         ] {
             trellis.apply(&text).await.expect(&text);
         }

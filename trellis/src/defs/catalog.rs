@@ -5512,9 +5512,7 @@ async fn check_aggregate_admitted(
         return Ok(());
     }
     let columns = join_columns_of(client, qualified_source).await?;
-    Ok(super::validate::validate_aggregate_admitted(
-        def, &columns,
-    )?)
+    Ok(super::validate::validate_aggregate_admitted(def, &columns)?)
 }
 
 /// Every column of `qualified` as [`super::validate::validate_join`] reads

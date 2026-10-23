@@ -168,7 +168,7 @@ fn orders_columns() -> HashMap<String, ValueType> {
     [
         ("id", ValueType::Numeric),
         ("g", ValueType::Integer(trellis::integer::IntWidth::Int8)),
-        ("a", ValueType::Numeric),
+        ("a", ValueType::Integer(trellis::integer::IntWidth::Int4)),
     ]
     .into_iter()
     .map(|(name, ty)| (name.to_string(), ty))
@@ -179,7 +179,7 @@ fn orders_columns() -> HashMap<String, ValueType> {
 async fn create_orders(client: &Client) {
     client
         .batch_execute(
-            "create table orders (id bigint primary key, g bigint, a numeric); \
+            "create table orders (id bigint primary key, g bigint, a integer); \
              insert into orders (id, g, a) select s, s % 2, s from generate_series(1, 6) s;",
         )
         .await
@@ -531,7 +531,7 @@ async fn resume_drops_extinct_composite_and_null_groups() {
     let mut client = connect_raw(db.dsn()).await;
     client
         .batch_execute(
-            "create table lines (id bigint primary key, g bigint, h text, a numeric); \
+            "create table lines (id bigint primary key, g bigint, h text, a integer); \
              insert into lines values \
                  (1, 0, null, 1), (2, 0, null, 2), (3, 1, null, 3), \
                  (4, 1, 'x', 4), (5, 2, 'y', 5), (6, 2, 'y', 6);",

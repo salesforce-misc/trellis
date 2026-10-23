@@ -1015,7 +1015,9 @@ async fn a_nested_rewrite_of_the_same_key_lands_in_the_right_group() {
     .expect("seed");
     let trellis = definer(db.dsn()).await;
     trellis
-        .apply("TRANSFORM by_grp FROM public.s GROUP BY grp WITHOUT SOURCE INDEX SELECT COUNT(*) AS n")
+        .apply(
+            "TRANSFORM by_grp FROM public.s GROUP BY grp WITHOUT SOURCE INDEX SELECT COUNT(*) AS n",
+        )
         .await
         .expect("define");
     let client = trellis::Client::start(db.dsn(), quick_options()).expect("start the client");

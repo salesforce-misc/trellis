@@ -126,10 +126,9 @@ async fn an_aggregate_over_a_mixed_case_table_backfills_and_applies_cdc() {
     );
 }
 
-/// #623 D4: recompute-only fields (MIN/MAX, a composed field, an
-/// expression argument) over mixed-case columns of a mixed-case table
-/// recompute from ledger entries whose contribution and group columns carry
-/// those names quoted.
+/// #623 D4: a composed field and an expression argument over mixed-case
+/// columns of a mixed-case table follow CDC, with the group and argument
+/// columns carrying those names quoted.
 #[tokio::test]
 async fn recomputed_fields_over_mixed_case_columns_follow_cdc() {
     let (cluster, db, raw) = trigger_pipeline::database().await;
@@ -143,7 +142,7 @@ async fn recomputed_fields_over_mixed_case_columns_follow_cdc() {
     install_over(
         &db,
         "TRANSFORM qty_span FROM Shop.OrderItems GROUP BY OrderId \
-        WITHOUT SOURCE INDEX SELECT MIN(Qty) AS lo, MAX(Qty + 1) AS hi1, MAX(Qty) + MIN(Qty) AS ends",
+        WITHOUT SOURCE INDEX SELECT COUNT(Qty) AS lo, SUM(Qty + 1) AS hi1, SUM(Qty) + COUNT(Qty) AS ends",
         &["id", "OrderId", "Qty"],
     )
     .await;
@@ -152,7 +151,7 @@ async fn recomputed_fields_over_mixed_case_columns_follow_cdc() {
     const SPANS: &str = "select \"OrderId\"::text, concat_ws(',', lo, hi1, ends) from qty_span";
     assert_eq!(
         pipeline.rows(SPANS).await,
-        rows(&[("10", "2,4,5"), ("20", "5,6,10")]),
+        rows(&[("10", "2,7,7"), ("20", "1,6,6")]),
         "the backfill folded every pre-existing row"
     );
 
@@ -169,8 +168,8 @@ async fn recomputed_fields_over_mixed_case_columns_follow_cdc() {
     pipeline.drain().await;
     assert_eq!(
         pipeline.rows(SPANS).await,
-        rows(&[("10", "30,31,60"), ("20", "7,8,14")]),
-        "CDC retracted the old extremes and recomputed each group"
+        rows(&[("10", "1,31,31"), ("20", "1,8,8")]),
+        "CDC retracted the old rows and recomputed each group"
     );
 }
 

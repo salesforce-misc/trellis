@@ -398,7 +398,7 @@ async fn plain_aggregate_over_a_composite_pk_source_drains_with_no_relationship_
     client
         .batch_execute(
             "create table order_lines ( \
-                 order_id integer, line_no integer, category text, amount numeric, \
+                 order_id integer, line_no integer, category text, amount numeric(12,0), \
                  primary key (order_id, line_no) \
              ); \
              insert into order_lines (order_id, line_no, category, amount) values \

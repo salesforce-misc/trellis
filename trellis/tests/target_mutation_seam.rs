@@ -349,7 +349,7 @@ async fn defining_a_transform_off_a_target_that_is_still_backfilling_is_refused(
 async fn resuming_an_aggregate_column_succeeds() {
     let (_cluster, db, raw) = setup().await;
     raw.batch_execute(
-        "create table public.src (id integer primary key, k integer, v numeric); \
+        "create table public.src (id integer primary key, k integer, v numeric(12,0)); \
          insert into public.src values (1, 1, 10), (2, 1, 20), (3, 2, 5)",
     )
     .await
@@ -458,7 +458,7 @@ async fn resuming_a_column_propagates_each_changed_row_to_a_chained_reader() {
 async fn an_aggregate_targets_truncate_clear_reaches_a_chained_reader() {
     let (_cluster, db, mut raw) = setup().await;
     raw.batch_execute(
-        "create table public.src (id integer primary key, k text, v numeric); \
+        "create table public.src (id integer primary key, k text, v numeric(12,0)); \
          insert into public.src values (1, 'a', 10), (2, 'a', 20), (3, 'b', 5)",
     )
     .await
@@ -1983,12 +1983,12 @@ fn fenced_columns() -> (Vec<(&'static str, ValueType)>, HashMap<String, ValueTyp
     let src = vec![
         ("id", ValueType::Integer(IntWidth::Int4)),
         ("g", ValueType::Integer(IntWidth::Int4)),
-        ("v", ValueType::Numeric),
+        ("v", ValueType::Integer(IntWidth::Int4)),
     ];
     let t = [
         ("id", ValueType::Integer(IntWidth::Int4)),
         ("g", ValueType::Integer(IntWidth::Int4)),
-        ("dbl", ValueType::Numeric),
+        ("dbl", ValueType::Integer(IntWidth::Int4)),
     ]
     .into_iter()
     .map(|(name, ty)| (name.to_string(), ty))
@@ -2001,7 +2001,7 @@ fn fenced_columns() -> (Vec<(&'static str, ValueType)>, HashMap<String, ValueTyp
 async fn fenced_upstream() -> drain_driver::Driver {
     let (src_columns, _) = fenced_columns();
     drain_driver::Driver::start(
-        "create table public.src (id integer primary key, g integer, v numeric); \
+        "create table public.src (id integer primary key, g integer, v integer); \
          insert into public.src values (1, 1, 1), (2, 1, 2), (3, 2, 3)",
         &src_columns,
         &["TRANSFORM t FROM public.src SELECT g AS g, v + v AS dbl"],
@@ -2176,30 +2176,42 @@ async fn a_seam_fed_build_plans_no_chunk_until_the_writer_open_at_its_fence_ends
     assert_eq!(actual, expected, "tot holds what t holds");
 }
 
-/// The upstream aggregate `u` over `src (id, a, b, x)`, its target keyed by
-/// the nullable grouping columns `(a, b)`, and the columns of `u` a
-/// downstream reads.
-async fn nullable_keyed_upstream(rows: &str) -> (drain_driver::Driver, HashMap<String, ValueType>) {
+/// The upstream aggregate `u` over `src (id, a, b, x)`, `function(x) AS x`,
+/// its target keyed by the nullable grouping columns `(a, b)`, and the
+/// columns of `u` a downstream reads.
+async fn nullable_keyed_upstream(
+    rows: &str,
+    function: &str,
+) -> (drain_driver::Driver, HashMap<String, ValueType>) {
     let src_columns = vec![
         ("id", ValueType::Integer(IntWidth::Int4)),
         ("a", ValueType::Integer(IntWidth::Int4)),
         ("b", ValueType::Integer(IntWidth::Int4)),
         ("x", ValueType::Integer(IntWidth::Int4)),
     ];
+    let definition = format!(
+        "TRANSFORM u FROM public.src GROUP BY a, b WITHOUT SOURCE INDEX SELECT {function}(x) AS x"
+    );
     let d = drain_driver::Driver::start(
         &format!(
             "create table public.src (id integer primary key, a integer, b integer, x integer); \
              {rows}"
         ),
         &src_columns,
-        &["TRANSFORM u FROM public.src GROUP BY a, b WITHOUT SOURCE INDEX SELECT MAX(x) AS x"],
+        &[definition.as_str()],
         &["public.src"],
     )
     .await;
+    // `SUM` over an `integer` is a `bigint`; `MAX` keeps the `integer`.
+    let x = if function == "SUM" {
+        IntWidth::Int8
+    } else {
+        IntWidth::Int4
+    };
     let u_columns = [
         ("a", ValueType::Integer(IntWidth::Int4)),
         ("b", ValueType::Integer(IntWidth::Int4)),
-        ("x", ValueType::Integer(IntWidth::Int4)),
+        ("x", ValueType::Integer(x)),
     ]
     .into_iter()
     .map(|(name, ty)| (name.to_string(), ty))
@@ -2297,6 +2309,7 @@ async fn a_build_over_a_seam_fed_aggregate_counts_its_null_keyed_groups() {
         "insert into public.src values \
          (1, 1, 1, 1), (2, 2, 1, 2), (3, null, 1, 4), (4, null, 2, 8), \
          (5, 3, null, 16), (6, null, null, 32)",
+        "SUM",
     )
     .await;
     build_over_u(
@@ -2338,6 +2351,7 @@ async fn a_rebuild_over_a_seam_fed_aggregate_keeps_its_null_keyed_groups() {
         "insert into public.src values \
          (1, 1, 1, 1), (2, 2, 1, 2), (3, null, 1, 4), (4, null, 2, 8), \
          (5, 3, null, 16), (6, null, null, 32)",
+        "SUM",
     )
     .await;
     build_over_u(
@@ -2366,10 +2380,9 @@ async fn a_rebuild_over_a_seam_fed_aggregate_keeps_its_null_keyed_groups() {
     trellis.apply("RESUME TRANSFORM w").await.expect("resume w");
     let id = definition_id(&d.ctl, "w").await;
     let pool = d.pool().clone();
-    let taken = build::start_ready_builds(&mut d.ctl, &pool, &[id])
+    build::start_ready_builds(&mut d.ctl, &pool, &[id])
         .await
         .expect("start the rebuild");
-    assert_eq!(taken, vec![id]);
     build::settle_builds(&pool).await;
     settle_through_failures(&mut d).await;
     assert_eq!(stored(&d.ctl, "w").await, "live");
@@ -2380,8 +2393,9 @@ async fn a_rebuild_over_a_seam_fed_aggregate_keeps_its_null_keyed_groups() {
     .await;
     assert_eq!(
         expected,
-        ["(1,7,3)", "(,180,3)"],
-        "the oracle: b = NULL holds (3, NULL) 16, (NULL, NULL) 100 and (9, NULL) 64; group 2 is gone"
+        ["(1,8,3)", "(,180,3)"],
+        "the oracle: b = 1 holds (1, 1) 1, (2, 1) 2 and (NULL, 1) 4 + 1; b = NULL holds \
+         (3, NULL) 16, (NULL, NULL) 100 and (9, NULL) 64; group 2 is gone"
     );
     assert_eq!(
         text_rows(
@@ -2406,12 +2420,14 @@ async fn a_rebuild_over_a_seam_fed_aggregate_keeps_its_null_keyed_groups() {
 /// that key in turn. The build finishes without them and the target is the
 /// oracle over everything else.
 #[tokio::test]
+#[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
 async fn a_failing_chunk_over_a_seam_fed_source_is_narrowed_past_its_null_keyed_rows() {
     let (mut d, u_columns) = nullable_keyed_upstream(
         "insert into public.src select i, 2 * i, i % 3, i from generate_series(1, 300) i; \
          update public.src set x = 2147483647 where id = 150; \
          insert into public.src values (301, null, 1, 5), (302, 121, null, 2147483647), \
                                        (303, 123, null, 7)",
+        "MAX",
     )
     .await;
     build_over_u(
@@ -2456,7 +2472,7 @@ async fn a_failing_chunk_over_a_seam_fed_source_is_narrowed_past_its_null_keyed_
 /// #625 F6: only a seam-fed source's build is fenced. A captured source has
 /// no writer that can commit unseen by the build (its page reads the
 /// definition list after the seal fence), so its plan job takes no fence and
-/// plans past a transaction that is open, whatever its age.
+/// builds past a transaction that is open, whatever its age.
 #[tokio::test]
 async fn a_captured_sources_build_takes_no_fence_and_waits_for_no_transaction() {
     let mut d = fenced_upstream().await;
@@ -2505,21 +2521,11 @@ async fn a_captured_sources_build_takes_no_fence_and_waits_for_no_transaction() 
         .expect("the plan job"),
         Step::Planned
     );
-    assert!(
-        planned_chunks(&d.ctl, id).await > 0,
-        "it planned its chunks"
+    assert_eq!(
+        stored(&d.ctl, "agg").await,
+        "live",
+        "the plan job, the whole build of a group-basis aggregate, ran past the open transaction"
     );
-    let fence: Option<i64> = d
-        .ctl
-        .query_one(
-            "select fence_xid::text::bigint from backfill_chunks \
-             where definition_id = $1 and kind = 'plan'",
-            &[&id],
-        )
-        .await
-        .expect("read the plan row")
-        .get(0);
-    assert_eq!(fence, None, "no fence");
     assert_eq!(
         trellis
             .status("agg")
@@ -2540,11 +2546,13 @@ async fn a_captured_sources_build_takes_no_fence_and_waits_for_no_transaction() 
 /// source's index condition without the key's columns, and read the source
 /// whole per batch.
 #[tokio::test]
+#[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
 async fn the_sweep_reads_a_nullable_keyed_source_by_its_whole_key() {
     let (d, u_columns) = nullable_keyed_upstream(
         "insert into public.src select i, i % 4, i, i from generate_series(1, 20000) i; \
          insert into public.src values (20001, null, 5, 1), (20002, 3, null, 1), \
                                        (20003, null, null, 1)",
+        "MAX",
     )
     .await;
     install_definition(

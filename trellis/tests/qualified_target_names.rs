@@ -58,14 +58,16 @@ async fn setup() -> (
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
     raw.batch_execute(
-        "create table orders (id bigint primary key, g bigint, a numeric); \
+        "create table orders (id bigint primary key, g bigint, a numeric(20,0)); \
          insert into orders select s, s % 2, s from generate_series(1, 4) s;",
     )
     .await
     .expect("seed");
     let trellis = define_only(db.dsn()).await;
     let qualified = trellis
-        .apply("TRANSFORM rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total")
+        .apply(
+            "TRANSFORM rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total",
+        )
         .await
         .expect("define")
         .into_transform()

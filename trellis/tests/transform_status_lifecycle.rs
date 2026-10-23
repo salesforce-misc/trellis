@@ -1069,7 +1069,7 @@ async fn every_backfill_mechanism_still_reaches_live_with_no_unsettled_marker() 
     raw.batch_execute(
         "create table plain_s (id bigint primary key, a numeric); \
          insert into plain_s (id, a) select g, g from generate_series(1, 10) g; \
-         create table agg_s (id bigint primary key, grp bigint, a numeric); \
+         create table agg_s (id bigint primary key, grp bigint, a numeric(12,0)); \
          insert into agg_s (id, grp, a) select g, g % 3, g from generate_series(1, 10) g; \
          create table grp_s (id bigint primary key, w numeric); \
          insert into grp_s (id, w) select g, g * 10 from generate_series(0, 2) g;",

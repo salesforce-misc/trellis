@@ -18,8 +18,7 @@ use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ValueType;
 
 const SOURCE: &str = "public.items";
-const DEFINITION: &str =
-    "TRANSFORM agg FROM public.items GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n";
+const DEFINITION: &str = "TRANSFORM agg FROM public.items GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n";
 
 const TREE: &str = "create table public.items (id integer not null, g integer not null, \
          v integer not null, primary key (g, id)) partition by range (g); \

@@ -42,7 +42,8 @@ struct Fx {
 
 impl Fx {
     async fn start() -> Fx {
-        let d = Driver::start(
+        let d = Driver::start_unbuilt(
+            &[],
             DDL,
             &[
                 ("id", ValueType::Numeric),
@@ -58,8 +59,14 @@ impl Fx {
         )
         .await;
         let mut fx = Fx { d };
+        // The first sight records the tree, which the group-basis build over
+        // a partitioned source with rows needs, so the builds run after it.
         fx.pass().await;
         assert_eq!(fx.queued().await, 0);
+        trellis::intake::markers::settle_registrations(fx.d.pool()).await;
+        fx.d.settle().await;
+        assert_eq!(fx.status("agg").await, "live");
+        assert_eq!(fx.status("plain_agg").await, "live");
         assert!(fx.wrong_groups("items", "agg").await.is_empty());
         fx
     }

@@ -6182,7 +6182,11 @@ mod tests {
             ("SUM(weight)", "float and interval SUM/AVG", 1119),
             ("AVG(wait)", "float and interval SUM/AVG", 1119),
             ("ARRAY_AGG(note)", "array_agg/string_agg/jsonb_agg", 1040),
-            ("STRING_AGG(note, ',')", "array_agg/string_agg/jsonb_agg", 1040),
+            (
+                "STRING_AGG(note, ',')",
+                "array_agg/string_agg/jsonb_agg",
+                1040,
+            ),
             // Inside a composed field too.
             ("COUNT(*) + MAX(qty)", "MIN/MAX", 1117),
         ] {
@@ -6195,7 +6199,12 @@ mod tests {
                 other => panic!("{call}: expected DeferredAggregate, got {other:?}"),
             }
         }
-        for call in ["SUM(price)", "AVG(price)", "SUM(cost + 1)", "AVG(cost + qty)"] {
+        for call in [
+            "SUM(price)",
+            "AVG(price)",
+            "SUM(cost + 1)",
+            "AVG(cost + qty)",
+        ] {
             let err = check(&format!("{call} AS v")).unwrap_err();
             assert!(
                 matches!(err, ValidationError::UnconstrainedNumericAggregate { .. }),

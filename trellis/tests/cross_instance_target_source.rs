@@ -47,14 +47,17 @@ fn columns(pairs: &[(&str, ValueType)]) -> HashMap<String, ValueType> {
 
 fn sales_columns() -> HashMap<String, ValueType> {
     columns(&[
-        ("id", ValueType::Numeric),
+        ("id", ValueType::Integer(IntWidth::Int4)),
         ("sku", ValueType::Text),
-        ("amount", ValueType::Numeric),
+        ("amount", ValueType::Integer(IntWidth::Int4)),
     ])
 }
 
 fn sku_totals_columns() -> HashMap<String, ValueType> {
-    columns(&[("sku", ValueType::Text), ("total", ValueType::Numeric)])
+    columns(&[
+        ("sku", ValueType::Text),
+        ("total", ValueType::Integer(IntWidth::Int8)),
+    ])
 }
 
 /// Instance A (the isolated database's default instance) owns `sales` and the

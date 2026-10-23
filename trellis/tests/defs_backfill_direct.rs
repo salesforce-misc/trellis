@@ -41,6 +41,8 @@ async fn text_pairs(client: &trellis::pool::Client, sql: &str) -> Vec<(String, O
 
 #[tokio::test]
 async fn one_to_one_build_is_exhaustive_across_chunk_boundaries() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
 
@@ -97,6 +99,8 @@ async fn one_to_one_build_is_exhaustive_across_chunk_boundaries() {
 
 #[tokio::test]
 async fn one_to_one_build_handles_pk_gaps() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
 
@@ -158,6 +162,8 @@ async fn one_to_one_build_handles_pk_gaps() {
 /// `(16667, 3)`.
 #[tokio::test]
 async fn one_to_one_build_with_a_composite_key_is_exhaustive_across_a_boundary_inside_a_group() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
 
@@ -232,6 +238,8 @@ async fn one_to_one_build_with_a_composite_key_is_exhaustive_across_a_boundary_i
 
 #[tokio::test]
 async fn aggregate_build_matches_oracle_across_group_key_chunks() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
 
@@ -269,6 +277,8 @@ async fn aggregate_build_matches_oracle_across_group_key_chunks() {
 
 #[tokio::test]
 async fn aggregate_build_handles_null_group_keys() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
 
@@ -329,6 +339,8 @@ async fn aggregate_build_handles_null_group_keys() {
 
 #[tokio::test]
 async fn aggregate_build_computes_min_max_avg() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
 
@@ -395,6 +407,8 @@ async fn aggregate_build_computes_min_max_avg() {
 
 #[tokio::test]
 async fn aggregate_build_is_idempotent_on_rerun() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
 
@@ -435,6 +449,8 @@ async fn aggregate_build_is_idempotent_on_rerun() {
 
 #[tokio::test]
 async fn aggregate_build_scans_source_once_not_per_chunk() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
 

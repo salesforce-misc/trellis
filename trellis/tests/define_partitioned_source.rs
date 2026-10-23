@@ -54,7 +54,9 @@ const ORDER_LINES: &str = "create table public.order_line_items ( \
         for values with (modulus 4, remainder 3);";
 
 fn aggregate(source: &str, group_by: &str) -> String {
-    format!("TRANSFORM totals FROM {source} GROUP BY {group_by} WITHOUT SOURCE INDEX SELECT COUNT(*) AS n")
+    format!(
+        "TRANSFORM totals FROM {source} GROUP BY {group_by} WITHOUT SOURCE INDEX SELECT COUNT(*) AS n"
+    )
 }
 
 /// The catalog error `apply` refused with.

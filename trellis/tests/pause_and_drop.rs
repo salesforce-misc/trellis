@@ -234,7 +234,7 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
 /// direct-build job in place of the staging worker and a drain thread.
 async fn seed_source(raw: &Client, table: &str, rows: i64) {
     raw.batch_execute(&format!(
-        "create table {table} (id bigint primary key, g bigint, a numeric); \
+        "create table {table} (id bigint primary key, g bigint, a numeric(20,0)); \
          insert into {table} (id, g, a) select s, s % 2, s from generate_series(1, {rows}) s;"
     ))
     .await
@@ -479,8 +479,8 @@ async fn resume_rebuilds_by_backfill_and_a_paused_definition_never_pins_the_ring
 
     // Claim 2, mechanism continued: a plain `SUM` is the Re-derive build's
     // (#625 F3). Its resume parks no marker; the staging worker's next pass
-    // starts the same build a freshly registered one gets, over the ledger
-    // the pause left: a plan job and, the ledger not being empty, a sweep.
+    // starts the same build a freshly registered one gets: on the group basis
+    // that is one plan job, with no ledger to sweep (#1100).
     assert_eq!(
         count(&raw, "select count(*) from pending_backfill").await,
         0,
@@ -503,8 +503,8 @@ async fn resume_rebuilds_by_backfill_and_a_paused_definition_never_pins_the_ring
                and c.kind in ('plan', 'sweep') and not c.done"
         )
         .await,
-        2,
-        "the rebuild is a plan job and a sweep, not a replay of buffered changes"
+        1,
+        "the rebuild is a plan job, not a replay of buffered changes"
     );
 
     // Claim 2, outcome: the target comes back reconciled against the *current*
@@ -794,7 +794,7 @@ async fn dropping_is_refused_and_names_the_live_dependents() {
     // job takes it there (#419).
     markers::settle_registrations(&db.pool).await;
     trellis
-        .apply("TRANSFORM grand_total FROM order_rollup GROUP BY g WITHOUT SOURCE INDEX SELECT sum(total) AS t")
+        .apply("TRANSFORM grand_total FROM order_rollup GROUP BY g WITHOUT SOURCE INDEX SELECT count(*) AS t")
         .await
         .expect("define a transform chained off the first one's target");
     markers::settle_registrations(&db.pool).await;
@@ -887,7 +887,7 @@ async fn dropping_is_refused_by_a_dependent_in_any_status_not_only_live() {
     // job takes it there (#419).
     markers::settle_registrations(&db.pool).await;
     trellis
-        .apply("TRANSFORM grand_total FROM order_rollup GROUP BY g WITHOUT SOURCE INDEX SELECT sum(total) AS t")
+        .apply("TRANSFORM grand_total FROM order_rollup GROUP BY g WITHOUT SOURCE INDEX SELECT count(*) AS t")
         .await
         .expect("define a transform chained off the first one's target");
     trellis

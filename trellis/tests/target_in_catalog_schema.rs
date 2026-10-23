@@ -104,7 +104,10 @@ async fn a_target_qualified_into_another_instances_catalog_schema_is_refused() {
     // Both an aggregate and a 1-1 target create a ledger beside the target.
     for (name, body) in [
         ("cat_one", "SELECT v AS v"),
-        ("cat_agg", "GROUP BY v WITHOUT SOURCE INDEX SELECT v AS v, COUNT(*) AS n"),
+        (
+            "cat_agg",
+            "GROUP BY v WITHOUT SOURCE INDEX SELECT v AS v, COUNT(*) AS n",
+        ),
     ] {
         let (_, schema, own, message) = refusal(
             trellis

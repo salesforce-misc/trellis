@@ -1443,7 +1443,8 @@ async fn a_flip_missed_by_a_dead_worker_is_made_by_the_next_idle_step() {
 async fn the_start_waits_for_the_widens_capture_gate() {
     // The per-row ledger, which this file pins, until #1105 deletes it.
     trellis::dev::staging::set_group_basis(false);
-    const COUNTS: &str = "TRANSFORM cnt FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT COUNT(*) AS n";
+    const COUNTS: &str =
+        "TRANSFORM cnt FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT COUNT(*) AS n";
     let mut f = Fixture::new(50, &[COUNTS]).await;
     f.pass().await;
     f.run("cnt").await;
@@ -2277,8 +2278,7 @@ async fn a_one_to_one_whose_source_lost_its_key_fails_through_its_plan_job() {
 
 /// A second `SUM` and `COUNT(*)` by `g` over the same source, registered
 /// once the first is live.
-const AGG2: &str =
-    "TRANSFORM agg2 FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n";
+const AGG2: &str = "TRANSFORM agg2 FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n";
 
 /// #733: a change committed before a build starts, in a batch drained only
 /// after the start, while a later change to its key was drained before the

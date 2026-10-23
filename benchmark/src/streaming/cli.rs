@@ -371,14 +371,14 @@ fn writer_runtime() -> tokio::runtime::Runtime {
 /// until it passes. Only a harness- or correctness-level failure is an error.
 pub fn run(name: &str, args: &[String]) -> Option<bool> {
     let runtime = || tokio::runtime::Runtime::new().expect("build tokio runtime");
-    // #1100: `--group-basis` routes every admitted aggregate (`COUNT`,
-    // `SUM`/`AVG` over integers and `numeric(p,s)`) to the group basis
-    // instead of the ledger, for this whole run: the engine's dev knob, set
-    // once before any client starts. A same-session ledger control is the
-    // same command without it.
-    if args.iter().any(|a| a == "--group-basis") {
-        trellis::dev::staging::set_group_basis(true);
-        eprintln!("group basis: on (admitted aggregates skip the ledger)");
+    // #1100: every aggregate runs on the group basis. `--ledger` forces the
+    // per-row ledger instead, for this whole run (the engine's dev knob, set
+    // once before any client starts): the same-session control for a
+    // group-basis measurement until #1105 deletes the ledger. `--group-basis`
+    // is the default and accepted for older command lines.
+    if args.iter().any(|a| a == "--ledger") {
+        trellis::dev::staging::set_group_basis(false);
+        eprintln!("group basis: off (--ledger: every aggregate on the per-row ledger)");
     }
 
     match name {

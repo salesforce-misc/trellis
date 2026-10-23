@@ -564,8 +564,7 @@ async fn to_jsonb_agrees_with_text_except_for_inet() {
 /// pins, here for the family issue #116 found the analogous divergence in.
 #[tokio::test]
 async fn an_inet_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two() {
-    const DEF_SQL: &str =
-        "TRANSFORM totals FROM events GROUP BY grp WITHOUT SOURCE INDEX SELECT grp AS grp, SUM(amount) AS total";
+    const DEF_SQL: &str = "TRANSFORM totals FROM events GROUP BY grp WITHOUT SOURCE INDEX SELECT grp AS grp, SUM(amount) AS total";
 
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -574,7 +573,7 @@ async fn an_inet_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two()
     client
         .batch_execute(
             "create table events ( \
-               id integer primary key, grp inet, amount numeric)",
+               id integer primary key, grp inet, amount numeric(12,0))",
         )
         .await
         .expect("create source table");

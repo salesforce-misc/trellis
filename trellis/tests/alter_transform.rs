@@ -2652,7 +2652,7 @@ async fn altering_an_aggregate_transform_is_unsupported() {
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
     raw.batch_execute(
-        "create table orders (id bigint primary key, g bigint, a numeric); \
+        "create table orders (id bigint primary key, g bigint, a numeric(20,0)); \
          insert into orders (id, g, a) select s, s % 2, s from generate_series(1, 6) s;",
     )
     .await

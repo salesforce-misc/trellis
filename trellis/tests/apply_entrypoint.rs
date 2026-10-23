@@ -62,7 +62,7 @@ async fn seed(raw: &Client) {
     raw.batch_execute(
         "create table authors (id bigint primary key, name text); \
          create table posts (id bigint primary key, author bigint); \
-         create table orders (id bigint primary key, g bigint, a numeric); \
+         create table orders (id bigint primary key, g bigint, a numeric(20,0)); \
          insert into authors (id, name) values (1, 'a'), (2, 'b'); \
          insert into posts (id, author) values (1, 1), (2, 1), (3, 2); \
          insert into orders (id, g, a) select s, s % 2, s from generate_series(1, 6) s;",
