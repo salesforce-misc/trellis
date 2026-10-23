@@ -20,6 +20,7 @@ use crate::defs::ast::TransformDef;
 use crate::defs::chunk_queue::{KIND_PLAN, KIND_SWEEP};
 use crate::defs::ddl::regclass_arg;
 use crate::defs::join::{self as spec, HiddenTable, Side};
+use crate::defs::model::TransformStatus;
 
 /// `P` is reported once its estimated rows reach this share of the fact
 /// table's, as a percentage: past it the partials no longer compress the
@@ -65,7 +66,8 @@ pub struct JoinStatus {
     /// [`PARTIALS_WARNING_PERCENT`] percent of the fact table's.
     pub partials_warning: Option<PartialsWarning>,
     /// The step the definition's build runs now, or runs next if no worker
-    /// holds its job; `None` when no build is under way.
+    /// holds its job; `None` when no build is under way or the definition
+    /// is paused or quarantined.
     pub building: Option<JoinBuildStep>,
 }
 
@@ -162,7 +164,9 @@ pub(crate) async fn for_definition(
 /// (`build::join_steps`).
 ///
 /// The job is the definition's current plan (fresh build or `RESUME`) or
-/// sweep (rebuild in place) job that isn't done. Each step writes the cursor
+/// sweep (rebuild in place) job that isn't done, while the definition isn't
+/// frozen: a paused or quarantined definition's job is never handed out, and
+/// its `RESUME` discards it. Each step writes the cursor
 /// in its own transaction, so this plain `select`, which takes no row lock,
 /// sees the last step that committed: it neither waits on a running step nor
 /// holds one up.
@@ -178,8 +182,13 @@ async fn building(
              join transform_definitions d on d.id = bc.definition_id \
              where bc.definition_id = $1 and bc.kind = any($2) and bc.fields is null \
                and not bc.done and bc.fuse_rearmed_at is not distinct from d.fuse_rearmed_at \
+               and d.status = any($3) \
              order by bc.id desc limit 1",
-            &[&id, &[KIND_PLAN, KIND_SWEEP].as_slice()],
+            &[
+                &id,
+                &[KIND_PLAN, KIND_SWEEP].as_slice(),
+                &TransformStatus::dispatchable(),
+            ],
         )
         .await?
     else {

@@ -3906,6 +3906,35 @@ async fn status_reports_an_unpartitioned_join_build_as_whole() {
     }
 }
 
+/// A paused `JOIN` reports no build, though its build's job is still queued
+/// with its cursor: no worker is handed the job while it is paused, and its
+/// `RESUME` discards it and reports the new build from its first step.
+#[tokio::test]
+async fn status_reports_no_build_while_a_join_is_paused() {
+    let mut lab = seeded_in(
+        &partitioned_ddl(true, false),
+        Key::Pair,
+        &[L],
+        PARTITIONED_SEED,
+    )
+    .await;
+    let job = prepare(&mut lab, Mode::Fresh).await;
+    lab.run_steps(job, 2).await;
+    assert_eq!(lab.building().await, side_step(JoinSide::From, leaf("a1")));
+    pause(&lab, L).await;
+    assert!(
+        lab.cursor().await.starts_with("from:"),
+        "the paused job keeps its cursor"
+    );
+    assert_eq!(lab.building().await, None, "paused");
+    resume(&lab, L).await;
+    assert_eq!(
+        lab.building().await,
+        side_step(JoinSide::Joined, JoinSidePart::Whole),
+        "the resume's build starts over"
+    );
+}
+
 /// A chained reader of a partitioned `JOIN`'s resume is parked once, by the
 /// final step, not by any leaf.
 #[tokio::test]
