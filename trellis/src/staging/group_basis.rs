@@ -972,7 +972,10 @@ impl GroupTargetPlan {
     /// equal, so it matches exactly the groups `GROUP BY` forms, and,
     /// unlike `is not distinct from`, it can be hashed or merged: a join of
     /// two group sets on it is a hash or merge join, not a nested loop
-    /// rescanning one set per row of the other (#1318).
+    /// rescanning one set per row of the other (#1318). Both sides must hold
+    /// each column at the same type (the hidden table's, as
+    /// [`Self::group_values`] reads a source): unlike `is not distinct
+    /// from`, array equality coerces no element type.
     pub(super) fn group_match(&self, left: &str, right: &str) -> String {
         quoted(&self.shape.group_cols)
             .iter()
@@ -1509,17 +1512,24 @@ impl GroupTargetPlan {
                 probe = self.probe_rows_sql(),
             ),
             Some(node) => {
+                // The node's group columns at the hidden table's types, as
+                // `rg`'s: array equality needs both sides' element types
+                // the same (a `varchar` source column against a `text`
+                // group column has no `=`).
                 let matched = self.group_match("n", "rg");
+                let positions: Vec<String> = (1..=cols.len()).map(|p| p.to_string()).collect();
                 format!(
                     "n as materialized ( \
-                         select {col_list}, {fresh} from {node} s group by {col_list} \
+                         select {values}, {fresh} from {node} s group by {positions} \
                      ), \
                      r as ( \
                          select h.*, {zeroed} from rg \
                          cross join lateral {lookup_hidden} as h(__hc, {old_names}) \
                          left join n on {matched} \
                      )",
+                    values = self.group_values().join(", "),
                     fresh = fresh.join(", "),
+                    positions = positions.join(", "),
                     zeroed = zeroed.join(", "),
                     old_names = old_names.join(", "),
                 )

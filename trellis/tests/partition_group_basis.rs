@@ -2232,3 +2232,54 @@ async fn a_reader_of_an_aggregate_resumed_per_leaf_is_rebuilt_once() {
     );
     assert_eq!(fx.d.deadlocks_logged(), Vec::<String>::new());
 }
+
+/// A leaf's correction that reads it by one `GROUP BY` matches the leaf's
+/// groups to the locked ones at the hidden table's types: a `varchar` group
+/// column is held as `text`, and its array match with the leaf's own
+/// `varchar` column would have no `=` (#1318's review). One label per `g`,
+/// so the oracle by `g` still checks every `(g, label)` group.
+#[tokio::test]
+async fn a_leaf_read_matches_a_varchar_group_column_at_its_held_type() {
+    let schema = tree("list").replace(
+        "v integer not null,",
+        "label varchar(10) not null, v integer not null,",
+    ) + "create index on public.items (g, label);";
+    trellis::dev::staging::set_group_basis(true);
+    trellis::defs::partition_tree::open_gate_for_tests();
+    let d = Driver::start(
+        &schema,
+        &[
+            ("id", int4()),
+            ("g", int4()),
+            ("label", ValueType::Text),
+            ("v", int4()),
+        ],
+        &["TRANSFORM agg FROM public.items GROUP BY g, label \
+           SELECT SUM(v) AS total, COUNT(*) AS n"],
+        &[SOURCE],
+    )
+    .await;
+    let mut fx = Fx { d };
+    fx.pass().await;
+    fx.exec(
+        "insert into public.items select i, i % 16, 'L' || (i % 16), i \
+         from generate_series(1, 160) i",
+    )
+    .await;
+    fx.d.settle().await;
+    fx.assert_right("seeded").await;
+    fx.exec("alter table public.items detach partition public.items_p3")
+        .await;
+    fx.correct().await;
+    fx.assert_right("detached").await;
+    fx.exec(
+        "insert into public.items_p3 select 3000 + i, 13, 'L13', 2 from generate_series(1, 3) i; \
+         alter table public.items attach partition public.items_p3 for values in (12, 13, 14, 15);",
+    )
+    .await;
+    fx.pass().await;
+    assert_eq!(fx.kinds().await, ["new_leaf"]);
+    fx.run().await;
+    fx.d.settle().await;
+    fx.assert_right("attached").await;
+}
