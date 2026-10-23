@@ -999,13 +999,19 @@ impl JoinOutcome {
     }
 }
 
+/// The cluster's `max_connections`: up to three databases each run an engine
+/// (a pool of up to 20) beside the bench's own connections, a build's sampler
+/// and `--rebuild`'s `Trellis` handle, past the stock 100 once the pools
+/// have grown.
+const JOIN_MAX_CONNECTIONS: &str = "max_connections=300";
+
 /// Runs the scenario; prints one JSON line per measurement and a summary.
 pub async fn run(cfg: &JoinBench, tuning: &EngineTuning) -> JoinOutcome {
     assert!(
         trellis::dev::staging::group_basis_enabled(),
         "join runs behind the group-basis knob; the CLI turns it on"
     );
-    let cluster = TestCluster::start();
+    let cluster = TestCluster::start_with_settings(&[JOIN_MAX_CONNECTIONS]);
     let d1_keys = (cfg.facts / Dataset::D1.facts_per_key()).max(10);
     let b_rows = cfg.b_page.unwrap_or_else(|| (d1_keys as usize / 50).max(1));
     let mut outcome = JoinOutcome::default();
