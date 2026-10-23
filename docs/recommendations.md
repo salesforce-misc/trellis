@@ -17,16 +17,12 @@ The first change to a page after a checkpoint logs the whole page (a full-page
 image); later changes before the next checkpoint log only the change. The
 more often checkpoints run, the more of the WAL is full-page images.
 
-The share depends on the target's shape. An aggregate's ledger keeps a
-`GROUP BY` index when the aggregate has a recomputed field (`MIN`, `MAX`, a
-float `SUM`, a composed field), a relationship feeds it, or its source is a
-partitioned table (a partition correction finds the entries of a node's groups
-through the index). A build inserts
-into that index at random positions, so once the index outgrows what a
-checkpoint interval leaves clean, almost every insert logs a full page. An
-invertible aggregate built by the Re-derive build keeps no such index, and
-writes few full-page images (0.18 million over 100M rows, against 25 million
-with the index) (#723).
+The share depends on the target's shape. An aggregate that reads a
+relationship path keeps a per-row ledger with a `GROUP BY` index; every other
+aggregate keeps no ledger. A build inserts into that index at random
+positions, so once the index outgrows what a checkpoint interval leaves
+clean, almost every insert logs a full page: 25 million full-page images over
+100M rows, against 0.18 million for a ledger without the index (#723).
 
 The #723 benchmark runs set `checkpoint_timeout=1min` and `max_wal_size=4GB`
 to stress a build, giving a requested checkpoint about every 10 seconds. There,
