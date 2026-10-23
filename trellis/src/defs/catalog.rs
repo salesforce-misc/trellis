@@ -3961,7 +3961,19 @@ async fn create_definition_inner(
     // partials in a hidden table in the catalog schema, named by this
     // definition's id, created empty with its row. A JOIN's key space is
     // never an aggregate's, so it never routes here.
-    if let Some(shape) = crate::staging::group_basis::route(&def, source_columns) {
+    let shape = crate::staging::group_basis::route(&def, source_columns);
+    // Define's refusals and the routing agree: every aggregate define
+    // accepts without a relationship path is on the group basis, never
+    // silently on the ledger.
+    debug_assert!(
+        shape.is_some()
+            || !crate::staging::group_basis::enabled()
+            || !matches!(def.key_space, KeySpace::Aggregate { .. })
+            || !super::eval::relationship_references(&def).is_empty(),
+        "an admitted aggregate the group basis doesn't route: {}",
+        def.target
+    );
+    if let Some(shape) = shape {
         txn.batch_execute(&crate::staging::group_basis::hidden_table_ddl(
             pool.schema(),
             id,

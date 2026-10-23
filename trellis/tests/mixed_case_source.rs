@@ -139,13 +139,27 @@ async fn recomputed_fields_over_mixed_case_columns_follow_cdc() {
     )
     .await
     .expect("seed the source");
-    install_over(
-        &db,
+    // The columns' real types: `SUM(Qty + 1)` over a `numeric` would be an
+    // expression with no declared scale, which the group basis doesn't take.
+    let int = |w| ValueType::Integer(w);
+    let columns: HashMap<String, ValueType> = [
+        ("id", int(trellis::IntWidth::Int8)),
+        ("OrderId", int(trellis::IntWidth::Int8)),
+        ("Qty", int(trellis::IntWidth::Int4)),
+    ]
+    .into_iter()
+    .map(|(n, t)| (n.to_string(), t))
+    .collect();
+    install_definition(
+        &db.pool,
         "TRANSFORM qty_span FROM Shop.OrderItems GROUP BY OrderId \
         WITHOUT SOURCE INDEX SELECT COUNT(Qty) AS lo, SUM(Qty + 1) AS hi1, SUM(Qty) + COUNT(Qty) AS ends",
-        &["id", "OrderId", "Qty"],
+        &columns,
+        "public",
     )
-    .await;
+    .await
+    .expect("install qty_span");
+    trellis::intake::markers::settle_registrations(&db.pool).await;
 
     let mut pipeline = Pipeline::attach(cluster, db, raw, &["Shop.OrderItems"]).await;
     const SPANS: &str = "select \"OrderId\"::text, concat_ws(',', lo, hi1, ends) from qty_span";
