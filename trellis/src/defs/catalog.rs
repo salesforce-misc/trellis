@@ -9951,8 +9951,9 @@ mod go_live_tests {
     }
 
     /// #1306: a direct build's completion asks for the release of the keys
-    /// its target's direct readers hold, in its own transaction, and a frozen
-    /// upstream's completion asks for nothing.
+    /// its target's direct readers hold (a source reader and a `JOIN` side
+    /// reader), in its own transaction, and a frozen upstream's completion
+    /// asks for nothing.
     #[tokio::test]
     async fn chunk_completion_asks_for_its_readers_releases() {
         let cluster = testkit::TestCluster::start();
@@ -9972,6 +9973,7 @@ mod go_live_tests {
             ("public.frozen_up", "public.orders", TransformStatus::Paused),
             ("public.r", "public.up", TransformStatus::Live),
             ("public.other", "public.orders", TransformStatus::Live),
+            ("public.j", "public.orders", TransformStatus::Live),
         ] {
             let id: i64 = client
                 .query_one(
@@ -9990,6 +9992,15 @@ mod go_live_tests {
                 .get(0);
             ids.push(id);
         }
+        // `j` reads `up` as its `JOIN` side.
+        client
+            .execute(
+                "update transform_definitions set join_table = 'public.up', join_columns = '{}' \
+                 where id = $1",
+                &[&ids[4]],
+            )
+            .await
+            .expect("make j a JOIN reader of up");
         let txn = client.transaction().await.expect("begin");
         complete_direct_backfill(&txn, ids[1])
             .await
@@ -10002,7 +10013,11 @@ mod go_live_tests {
             .await
             .expect("complete up's build");
         txn.commit().await.expect("commit");
-        assert_eq!(requested(&client).await, vec![ids[2]], "only r reads up");
+        assert_eq!(
+            requested(&client).await,
+            vec![ids[2], ids[4]],
+            "only r and j read up"
+        );
     }
 
     async fn requested(client: &tokio_postgres::Client) -> Vec<i64> {
