@@ -1632,6 +1632,94 @@ async fn widening_a_summed_column_pauses_and_resume_re_types_its_contribution_an
     assert_eq!(status(&raw, "per_shop").await, TransformStatus::Live);
 }
 
+/// The group basis's #824: widening a column an aggregate sums (`integer`
+/// to `bigint`) outgrows the target's `SUM` column, which define now gives
+/// `numeric` (`sum(bigint)`'s type) rather than `bigint`. The pass pauses the
+/// aggregate; a resume re-types the column, recreates the partials and
+/// rebuilds, and values above 2^31 and 2^63 land exactly. Nothing pauses again.
+#[tokio::test]
+async fn widening_a_summed_column_on_the_group_basis_pauses_and_resume_re_types_its_target() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.orders (id int primary key, shop int, amount int); \
+         insert into public.orders values (1, 1, 10), (2, 1, 20), (3, 2, 5);",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    trellis
+        .apply(
+            "TRANSFORM per_shop FROM public.orders GROUP BY shop WITHOUT SOURCE INDEX \
+             SELECT shop AS shop, SUM(amount) AS total, AVG(amount) AS mean, COUNT(*) AS n",
+        )
+        .await
+        .expect("define per_shop");
+    bring_live(&mut raw, &db.pool, &["per_shop"]).await;
+    let types = async |raw: &Client| {
+        let mut types = Vec::new();
+        for column in ["shop", "total", "mean", "n"] {
+            types.push(column_type(raw, "public.per_shop", column).await);
+        }
+        types
+    };
+    assert_eq!(
+        types(&raw).await,
+        ["integer", "bigint", "numeric", "bigint"]
+    );
+
+    raw.batch_execute("alter table public.orders alter column amount type bigint")
+        .await
+        .expect("widen the summed column");
+    capture_pass(&mut raw, &db.pool).await;
+    let error = paused_for(&trellis, "per_shop", "public.orders", &["amount"]).await;
+    assert!(
+        error.contains("public.per_shop.total (bigint, now numeric)"),
+        "{error}"
+    );
+
+    resume(&trellis, "per_shop").await;
+    let error = assert_retyping(&trellis, &raw, "per_shop").await;
+    assert!(
+        error.contains("public.per_shop.total from bigint to numeric"),
+        "{error}"
+    );
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(
+        types(&raw).await,
+        ["integer", "numeric", "numeric", "bigint"]
+    );
+    bring_live(&mut raw, &db.pool, &["per_shop"]).await;
+    raw.batch_execute(
+        "insert into public.orders values (4, 1, 3000000000), (5, 3, 9000000000000000000), \
+                                          (6, 3, 9000000000000000000)",
+    )
+    .await
+    .expect("values above 2^31 and a sum above 2^63");
+    full_pass(&mut raw, &db.pool).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    assert_eq!(status(&raw, "per_shop").await, TransformStatus::Live);
+    assert_eq!(
+        rows(
+            &raw,
+            "select shop::text, total::text, mean::text, n::text from public.per_shop \
+             order by shop"
+        )
+        .await,
+        rows(
+            &raw,
+            "select shop::text, sum(amount)::text, avg(amount)::text, count(*)::text \
+             from public.orders group by shop order by shop"
+        )
+        .await,
+    );
+
+    // The types moved with the resume: nothing pauses again.
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(status(&raw, "per_shop").await, TransformStatus::Live);
+}
+
 /// #857: a `SUM` whose argument moved from `numeric` to a float type is
 /// recompute-only now, but its group-delta table keeps the running-sum column
 /// define gave the old `SUM`. A resume refuses rather than rebuild into it,
@@ -4536,4 +4624,33 @@ async fn a_target_column_re_typed_by_hand_is_not_blamed_on_the_source() {
         column_type(&raw, "public.item_names", "next").await,
         "integer"
     );
+}
+
+/// A `COUNT` over a `jsonb` or `json` column on the group basis counts a JSON
+/// `'null'` value and skips a SQL `NULL`, as Postgres does, both in the build
+/// and in deltas computed from captured images.
+#[tokio::test]
+async fn a_group_basis_count_tells_a_json_null_from_a_sql_null() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.docs (id int primary key, g int, doc jsonb, j json); \
+         insert into public.docs values (1, 1, 'null', 'null'), (2, 1, null, null), (3, 1, '{\"a\":1}', '{\"a\":1}');",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    trellis
+        .apply("TRANSFORM per_g FROM public.docs GROUP BY g WITHOUT SOURCE INDEX SELECT g AS g, COUNT(doc) AS nd, COUNT(j) AS nj, COUNT(*) AS n")
+        .await
+        .expect("define");
+    bring_live(&mut raw, &db.pool, &["per_g"]).await;
+    let q = "select g::text, nd::text, nj::text, n::text from public.per_g order by g";
+    let o = "select g::text, count(doc)::text, count(j)::text, count(*)::text from public.docs group by g order by g";
+    assert_eq!(rows(&raw, q).await, rows(&raw, o).await, "the build");
+    raw.batch_execute("insert into public.docs values (4, 1, 'null', 'null'), (5, 2, 'null', 'null'); update public.docs set doc = 'null', j = 'null' where id = 3; delete from public.docs where id = 1").await.unwrap();
+    full_pass(&mut raw, &db.pool).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    assert_eq!(rows(&raw, q).await, rows(&raw, o).await, "applied changes");
 }
