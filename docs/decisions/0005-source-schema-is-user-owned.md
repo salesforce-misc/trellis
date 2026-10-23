@@ -27,9 +27,8 @@ Instead:
    Trellis never silently produces wrong answers, and never reshapes the source
    to make a definition work.
 2. **Guide the user to a fix.** Every rejection or warning names the exact change
-   to make — e.g. "`orders` has no primary key; add one," or "`orders` has no
-   index leading with `region` for `self_check` to page by — run
-   `create index on orders (region)`, or define it `WITHOUT SOURCE INDEX`."
+   to make — e.g. a source index dropped after define is reported in `status()`
+   with the statement that restores it, `create index on public.orders (region)`.
 
 ## A missing correctness prerequisite rejects; a missing performance one warns
 

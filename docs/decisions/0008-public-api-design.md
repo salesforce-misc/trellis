@@ -71,7 +71,7 @@ methods.
 A status read isn't a declaration — it's a filtered, paginated query
 ("everything paused," "page 2 of poisoned rows"), and the highest-frequency
 call in the API (the status poller from decision 1 hits it repeatedly). `TRANSFORM`
-earns a grammar because they need declarative structure (source
+earns a grammar because it needs declarative structure (source
 table, joins, field expressions); a status query's structure is
 filters/sort/pagination. Expressing that as text means growing the grammar into
 a `WHERE`-clause sublanguage — a far bigger parsing surface, paid on the

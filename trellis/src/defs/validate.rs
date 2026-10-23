@@ -1053,8 +1053,8 @@ impl fmt::Display for ValidationError {
             ),
             ValidationError::UnknownGroupByRelationship { rel } => write!(
                 f,
-                "GROUP BY references relationship '{rel}', which is not declared on this \
-                 definition's source table (relationship names are scoped per from-table)"
+                "GROUP BY references '{rel}.<column>', but '{rel}' is not this definition's \
+                 FROM table; write a source column bare or as <table>.<column>"
             ),
             ValidationError::GroupByRelationshipMustBeToOne { rel, column } => write!(
                 f,
@@ -1079,9 +1079,7 @@ impl fmt::Display for ValidationError {
                 f,
                 "GROUP BY keys '{first}' and '{second}' would both become target column \
                  '{column}', and a target table can't have two columns with the same name. \
-                 GROUP BY keys can't be aliased yet, so group by only one of them (or by the \
-                 relationship's from-side column instead), or group over a 1-1 transform \
-                 that selects them under distinct names (e.g. `buyer.name AS buyer_name`)"
+                 GROUP BY keys can't be aliased yet, so group by only one of them"
             ),
             ValidationError::UngroupedColumnReference { field, column } => write!(
                 f,
@@ -1124,8 +1122,8 @@ impl fmt::Display for ValidationError {
             } => write!(
                 f,
                 "calculated field '{field}' reads '{reference}', but a qualified column must \
-                 name this transform's FROM table ('{source}'); a column of another table is \
-                 read through a relationship"
+                 name this transform's FROM table ('{source}'); a second table is read with \
+                 a JOIN"
             ),
             ValidationError::GroupingColumnFieldMustBePassthrough { field } => write!(
                 f,
@@ -1141,9 +1139,9 @@ impl fmt::Display for ValidationError {
             ),
             ValidationError::UnknownRelationship { field, rel } => write!(
                 f,
-                "calculated field '{field}' references relationship '{rel}', which is not \
-                 declared on this definition's source table (relationship names are scoped \
-                 per from-table)"
+                "calculated field '{field}' references '{rel}.<column>', but '{rel}' is not \
+                 this definition's FROM table; write a source column bare or as \
+                 <table>.<column>"
             ),
             ValidationError::RelationshipToOneWrappedInAggregate { field, rel, column } => write!(
                 f,
@@ -5256,7 +5254,6 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("'buyer.name'"), "{message}");
         assert!(message.contains("'seller.name'"), "{message}");
-        assert!(message.contains("buyer.name AS buyer_name"), "{message}");
         assert_eq!(err.code(), ErrorCode::Validation);
     }
 

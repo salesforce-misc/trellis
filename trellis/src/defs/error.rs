@@ -150,8 +150,7 @@ impl fmt::Display for ParseError {
             ParseError::TooManyColumnNameParts { reference } => write!(
                 f,
                 "'{reference}' is not a valid column reference: a column is written \
-                 <column>, <table>.<column> or <schema>.<table>.<column> (the FROM table's), \
-                 or <relationship>.<column>"
+                 <column>, <table>.<column> or <schema>.<table>.<column> (the FROM table's)"
             ),
             ParseError::TooManyQualifiedNameParts { reference } => write!(
                 f,

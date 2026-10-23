@@ -6,9 +6,9 @@ deciders: Michael Ries
 
 # Pausing and Dropping a Definition
 
-Defining derived state is only half a lifecycle. A definition — a transform — can also
-need to stop: frozen while an operator investigates or stages a schema change, or removed
-entirely. This ADR settles that other half.
+Defining derived state is only half a lifecycle. A transform can also need to stop:
+frozen while an operator investigates or stages a schema change, or removed entirely.
+This ADR settles that other half.
 
 ## The lifecycle
 

@@ -32,7 +32,7 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ErrorCode {
-    /// Input text failed to parse — a `TRANSFORM`/`RELATIONSHIP` statement,
+    /// Input text failed to parse — a statement of Trellis's grammar,
     /// or previously-persisted text that's expected to re-parse.
     Parse,
     /// Structurally valid input was semantically rejected: type mismatches,

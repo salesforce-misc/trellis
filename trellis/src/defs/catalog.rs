@@ -644,8 +644,8 @@ impl fmt::Display for CatalogError {
                 write!(
                     f,
                     ". Trellis needs USAGE on the schema of every source, and must own each \
-                     source and relationship to-side table or be a member of the role that owns \
-                     it, with INHERIT: see \"One Trellis role\" in docs/recommendations.md"
+                     source table or be a member of the role that owns it, with INHERIT: see \
+                     \"One Trellis role\" in docs/recommendations.md"
                 )
             }
             CatalogError::SourceKeyChanged {
@@ -821,8 +821,7 @@ impl fmt::Display for CatalogError {
             CatalogError::TransformNotLive { transform, status } => write!(
                 f,
                 "'{transform}' is {}, not live; only a fully-built, live definition can be \
-                 edited with ALTER TRANSFORM, read by another transform, or made a \
-                 relationship endpoint",
+                 edited with ALTER TRANSFORM or read by another transform",
                 status.as_str()
             ),
             CatalogError::AlterFieldNotFound {

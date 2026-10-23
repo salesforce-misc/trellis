@@ -488,12 +488,9 @@ for summary in trellis.definitions().await? {
 }
 ```
 
-`self_check` refuses a target that reads a relationship
-([observability](observability.md#transform-status-lifecycle)), so the warning
-is read from `status`. In `trellis-embed`, `PlainDefinitionStatus` carries it
-as `unindexed_joins`, each entry with `relationship`, `table`, `column` and the
-`fix` sentence. The CLI's
-`trellis status` prints each entry as a warning line under its definition.
+In `trellis-embed`, `PlainDefinitionStatus` carries it as `unindexed_joins`,
+each entry with `relationship`, `table`, `column` and the `fix` sentence. The
+CLI's `trellis status` prints each entry as a warning line under its definition.
 
 ### Source indexes
 

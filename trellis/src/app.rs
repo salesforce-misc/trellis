@@ -2,8 +2,9 @@
 //! meant to use.
 //!
 //! Everything an embedder needs to stand up and run a Trellis instance hangs
-//! off [`Trellis`]: apply migrations, register transform definitions, list what's registered, request an ad-hoc backfill, and run
-//! the live CDC/apply pipeline. It composes the lower-level building blocks
+//! off [`Trellis`]: apply migrations, register transform definitions, list
+//! what's registered, request an ad-hoc backfill, and run the live CDC/apply
+//! pipeline. It composes the lower-level building blocks
 //! (`defs`, `client`, `intake`, `staging`) into one coherent surface so
 //! callers never have to stitch those together themselves — and, critically,
 //! never accidentally pick the wrong path: definition registration always
@@ -40,9 +41,8 @@
 //! a transform's initial backfill runs in the background:
 //! `apply()` returns once the definition is registered, with
 //! [`TransformStatus::WaitingToBackfill`], having read no source rows. The
-//! staging worker's backfill discharge then builds it in the background.
-//! Running drain (`application_threads`) workers execute either —
-//! anywhere in the fleet, not necessarily on the connection that called
+//! staging worker's backfill discharge then dispatches the build, and running
+//! drain (`application_threads`) workers execute it — anywhere in the fleet, not necessarily on the connection that called
 //! `apply()`. Callers that need the target actually populated poll
 //! [`Trellis::status`] until it reports [`TransformStatus::Live`] — which
 //! requires a staging worker and *some* client in the fleet running with
@@ -239,7 +239,7 @@ impl Trellis {
     /// background work, starts it before returning.
     ///
     /// With the default options nothing background runs — the returned handle
-    /// is purely for defining transforms/relationships and inspecting the
+    /// is purely for defining transforms and inspecting the
     /// catalog. With `staging` set, the staging worker starts: it installs
     /// capture triggers on whatever tables the registered definitions read
     /// (none yet is fine) and runs ring maintenance; with a non-zero `drain_threads`,
@@ -741,7 +741,7 @@ impl Trellis {
 
     /// SQL that loads this instance's definitions into a database built from
     /// a schema-only dump (issue #644): `INSERT`s for the Trellis migration
-    /// history, the instance marker and the transform and relationship
+    /// history, the instance marker and the transform
     /// definitions with the catalog rows they need, and for nothing else.
     /// Append it to a schema-only `pg_dump` of the Trellis schema and the
     /// schemas it maintains, the way Rails appends `schema_migrations`.
@@ -776,7 +776,7 @@ impl Trellis {
     /// partition that was attached, detached, dropped or truncated (ADR-0017),
     /// each listed in [`DefinitionStatus::correcting`]. So does
     /// a `live` one reading an upstream (another definition's target, as its
-    /// source or through a relationship) that isn't `live` itself: paused,
+    /// source or as a `JOIN`'s joined table) that isn't `live` itself: paused,
     /// quarantined, rebuilding or catching up, down the whole chain (issue
     /// #497). That one is derived from the upstream's status when read.
     ///
@@ -1031,8 +1031,8 @@ impl Trellis {
         Ok((wait, failure))
     }
 
-    /// Re-reads `source_table` for every applying definition that reads it,
-    /// directly or through a relationship, to re-derive from. A newly
+    /// Re-reads `source_table` for every applying definition that reads it, to
+    /// re-derive from. A newly
     /// registered transform doesn't need this: the staging worker starts
     /// its build itself.
     ///
@@ -1050,8 +1050,7 @@ impl Trellis {
     /// until the staging worker has discharged the marker. The discharge
     /// re-derives every row the table still has, deletes each reader's
     /// target rows the table no longer backs (a delete that never reached the
-    /// target, say), refreshes the settled projections of a relationship
-    /// whose to-side the table is, and flips the readers back `live`.
+    /// target, say), and flips the readers back `live`.
     ///
     /// `source_table` is the captured table's `schema.table` name, matched
     /// exactly, or a bare name that exactly one captured table carries (any
@@ -1059,8 +1058,8 @@ impl Trellis {
     /// ([`TrellisError::AmbiguousSourceTable`]).
     ///
     /// Only valid for a table the staging worker captures: one some
-    /// registered definition reads, directly or through a relationship, and
-    /// isn't one of this instance's own targets (issue #622; the set its
+    /// registered definition reads, and that isn't one of this instance's own
+    /// targets (issue #622; the set its
     /// reconcile pass installs capture triggers on). Any other table is
     /// refused ([`TrellisError::TableNotCaptured`]): nothing reads it, and a
     /// table's first reader backfills it in full anyway. The check is the
@@ -1675,10 +1674,9 @@ impl Trellis {
     /// reads the target's rows.
     ///
     /// `target_table` names a registered transform, same convention as
-    /// [`Trellis::status`] (its target table, qualified or bare). An unknown one, an aggregate target
-    /// ([`SelfCheckError::UnsupportedKeySpace`]) and one that reads through a
-    /// relationship ([`SelfCheckError::UnsupportedExpr`]) are refused here,
-    /// wrapped in [`TrellisError::SelfCheck`]. A fleet-wide sweep is a
+    /// [`Trellis::status`] (its target table, qualified or bare). An unknown
+    /// one, and one `self_check` can't walk ([`SelfCheckError`]), are refused
+    /// here, wrapped in [`TrellisError::SelfCheck`]. A fleet-wide sweep is a
     /// caller-side loop over [`Trellis::definitions`]. `mode` picks
     /// [`SelfCheckMode::Standard`] (safe under live load: a divergence must
     /// survive a re-check behind a fresh await before it's reported) or
@@ -2004,9 +2002,8 @@ pub struct DefinitionStatus {
     pub backfill_failure: Option<BackfillFailure>,
     /// Set while the definition waits on capture, because the staging worker
     /// can't yet take the lock it needs to install or widen the capture
-    /// triggers on its source, or on the to-side of a relationship declared
-    /// on it (issue #622). It clears on its own once the lock holder lets
-    /// go. A definition waits on capture while it is `waiting_to_backfill`,
+    /// triggers on its source or a `JOIN`'s joined table (issue #622). It
+    /// clears on its own once the lock holder lets go. A definition waits on capture while it is `waiting_to_backfill`,
     /// or while an `ALTER TRANSFORM` field it gained is paused until the
     /// capture images the column it reads (it is `backfilling` then, its
     /// field build waiting to start, #687, #625 F8b).
@@ -2044,7 +2041,7 @@ pub struct DefinitionStatus {
     ///   and it clears once one succeeds. Recorded like `capture_wait`;
     /// - or a column it keys by changed type or collation, or a column it
     ///   keeps a typed copy of widened (issues #760, #767): define would now
-    ///   refuse the column, a relationship's join columns no longer match,
+    ///   refuse the column, a `JOIN`'s `ON` columns no longer match,
     ///   the stored keys render differently, or a copy can't hold the new
     ///   type. The staging worker's capture pass pauses it, naming the
     ///   columns, their types and what to do. Resume it once define would
@@ -2093,7 +2090,7 @@ pub struct DefinitionStatus {
     /// pages the keys themselves, with each one's error.
     pub held_keys: Option<HeldKeys>,
     /// Set while the drain keeps failing on a page holding changes to a
-    /// table the definition reads, as its source or through a relationship,
+    /// table the definition reads, as its source or a `JOIN`'s joined table,
     /// with nothing charged or paused (#817): a refused read or write the
     /// catalog can't pin on a table (a column grant, a function's
     /// `EXECUTE`, one of Trellis's own tables), records that fail only
@@ -2571,7 +2568,7 @@ pub struct PoisonSample {
 pub enum TrellisError {
     /// A definition failed to parse before it could be registered.
     Parse(ParseError),
-    /// A catalog operation (define/relationship/install/pause/drop) failed.
+    /// A catalog operation (define/alter/install/pause/drop) failed.
     Catalog(CatalogError),
     /// Starting or stopping the background client failed.
     Client(ClientError),
