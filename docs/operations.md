@@ -152,6 +152,12 @@ audit. What clears a held key:
 * The automatic retry, off by default (`TrellisOptions::held_key_retry`),
   releases due keys with a growing backoff
   ([ADR-0003 — Retry policy](decisions/0003-quarantine-storage-and-api.md#retry-policy)).
+* A build of the target the definition reads (an automatic rebuild,
+  `request_backfill`, a capture re-install or a `RESUME` of that upstream)
+  retries every key the definition holds once it completes, so a key held
+  for a failure the upstream caused while it was being rebuilt clears by
+  itself. A key whose failure persists is held again after one attempt, and
+  a paused definition keeps its keys.
 
 After a type a definition reads is renamed or moved to another schema, the
 capture pass records its new name and then releases the keys held for a cast

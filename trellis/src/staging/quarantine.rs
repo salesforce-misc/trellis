@@ -6102,6 +6102,174 @@ pub(crate) async fn release_retyped_keys(pool: &Pool) -> Result<(), ApplyError> 
 pub(crate) const RETYPE_RELEASE_WINDOW: std::time::Duration =
     std::time::Duration::from_secs(2 * crate::locks::LOCK_TIMEOUT.as_secs());
 
+/// Asks, in the transaction that completes a build of `upstream`'s target,
+/// for the release of every key each direct reader of that target holds
+/// (#1306): each definition whose source, or `JOIN` side, is the target
+/// (`upstream_releases`, released by [`release_upstream_rebuilt_keys`] after
+/// the next capture pass). A reader can hold a key for a failure the
+/// upstream caused while it was rebuilt (its copy held values of two widths
+/// at once, say); the build has repaired it, and a key that still fails is
+/// held again on its first failure. A reader through a relationship is not
+/// asked for.
+///
+/// Takes no lock on any definition row: the request rows are locked in
+/// reader id order, and nothing else locks them while holding a definition
+/// row.
+pub(crate) async fn request_upstream_releases(
+    client: &impl GenericClient,
+    upstream: i64,
+) -> Result<(), tokio_postgres::Error> {
+    client
+        .execute(
+            "insert into upstream_releases (transform_id) \
+             select r.id from transform_definitions u join transform_definitions r \
+               on r.source_table = u.target_table or r.join_table = u.target_table \
+             where u.id = $1 \
+             order by r.id \
+             on conflict (transform_id) do update \
+               set requested_at = now(), first_read_at = null",
+            &[&upstream],
+        )
+        .await?;
+    Ok(())
+}
+
+/// Releases the keys the completion of an upstream build asked for
+/// ([`request_upstream_releases`], #1306): for each `upstream_releases` row,
+/// every key its definition holds, whatever the failure, each through the
+/// automatic retry's release ([`retry_held_key`]): the key's death counter
+/// is written one below the threshold, so a key whose failure persists is
+/// held again on its first failure, with its attempt count raised. A paused
+/// or quarantined definition keeps its keys held, as its resume releases
+/// them.
+///
+/// The staging worker runs it after each capture pass, so a release the
+/// build's transaction asked for is made even if the worker stopped in
+/// between. A row is kept, and its release run again after each pass, for
+/// [`UPSTREAM_RELEASE_WINDOW`] after the build asked for it: a drain that
+/// read the upstream before the build committed can commit the key's
+/// eviction after the first release read the keys held. A later release of
+/// the same request takes only keys held since before the first one read
+/// them (`first_read_at`), so a key its retry held again is not retried
+/// again; a key whose eviction began after the first release read the keys
+/// stays held until it is released by hand or retried. A row is deleted
+/// once its keys are released and the window has passed, and only if no
+/// build asked again since it was read (`requested_at`); a build that asks
+/// again starts its keys over. A release that waits out its lock timeout,
+/// or fails otherwise, keeps the row for the next pass. A row whose
+/// definition was dropped is deleted. Errs only when the rows can't be
+/// read, stamped or deleted.
+pub(crate) async fn release_upstream_rebuilt_keys(pool: &Pool) -> Result<(), ApplyError> {
+    let requests = {
+        let client = pool.get().await?;
+        client
+            .execute_typed(
+                "delete from upstream_releases r where not exists \
+                 (select 1 from transform_definitions d where d.id = r.transform_id)",
+                &[],
+            )
+            .await?;
+        client
+            .query_typed(
+                "select r.transform_id, r.requested_at, r.first_read_at, \
+                        split_part(d.target_table, '.', 2) \
+                 from upstream_releases r join transform_definitions d on d.id = r.transform_id \
+                 order by r.transform_id",
+                &[],
+            )
+            .await?
+    };
+    for request in requests {
+        let id: i64 = request.get(0);
+        let requested_at: SystemTime = request.get(1);
+        let first_read_at: Option<SystemTime> = request.get(2);
+        let transform: String = request.get(3);
+        // `statement_timestamp()` is no later than the snapshot this read
+        // takes: an eviction that began before it and commits after the
+        // read has an earlier `poisoned_at`, and a later release finds it.
+        // A frozen definition reads no row, so nothing is released and its
+        // request is never stamped.
+        let keys = pool
+            .get()
+            .await?
+            .query(
+                &format!(
+                    "select p.src_table, p.key, p.poisoned_at, statement_timestamp() \
+                     from transform_definitions t \
+                     left join poison p on p.transform_id = t.id \
+                       and ($2::timestamptz is null or p.poisoned_at < $2) \
+                     where t.id = $1 and {} \
+                     order by p.src_table, p.key",
+                    not_frozen_sql(),
+                ),
+                &[&id, &first_read_at],
+            )
+            .await?;
+        let read_at: Option<SystemTime> = keys.first().map(|row| row.get(3));
+        let mut done = true;
+        let mut released = 0usize;
+        for row in &keys {
+            let (Some(src_table), Some(key), Some(poisoned_at)) = (
+                row.get::<_, Option<String>>(0),
+                row.get::<_, Option<String>>(1),
+                row.get::<_, Option<SystemTime>>(2),
+            ) else {
+                continue;
+            };
+            match retry_held_key(pool, &transform, &src_table, &key, poisoned_at).await {
+                Ok(_) => released += 1,
+                // Released, held again since the read, or dropped meanwhile.
+                Err(ApplyError::KeyNotHeld { .. } | ApplyError::TransformNotFound { .. }) => {}
+                Err(err) => {
+                    done = false;
+                    crate::instance_log::warn!(
+                        transform = %transform,
+                        src_table = %src_table,
+                        key = %key,
+                        error = %err,
+                        "couldn't release a key held while its upstream was rebuilt; \
+                         retrying next pass"
+                    );
+                }
+            }
+        }
+        if released > 0 {
+            crate::instance_log::info!(
+                transform = %transform,
+                released,
+                "retried the held keys of a definition whose upstream's build completed"
+            );
+        }
+        let client = pool.get().await?;
+        if let (None, Some(read_at)) = (first_read_at, read_at) {
+            client
+                .execute(
+                    "update upstream_releases set first_read_at = $3 \
+                     where transform_id = $1 and requested_at = $2 and first_read_at is null",
+                    &[&id, &requested_at, &read_at],
+                )
+                .await?;
+        }
+        if done {
+            client
+                .execute(
+                    "delete from upstream_releases \
+                     where transform_id = $1 and requested_at = $2 \
+                       and requested_at < now() - $3::float8 * interval '1 second'",
+                    &[&id, &requested_at, &UPSTREAM_RELEASE_WINDOW.as_secs_f64()],
+                )
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+/// How long [`release_upstream_rebuilt_keys`] keeps releasing the keys a
+/// completed upstream build asked for: [`RETYPE_RELEASE_WINDOW`], for the
+/// same reason (an eviction from a drain that read the upstream before the
+/// build committed commits within it).
+pub(crate) const UPSTREAM_RELEASE_WINDOW: std::time::Duration = RETYPE_RELEASE_WINDOW;
+
 /// The opt-in automatic retry of held keys (#861,
 /// [`TrellisOptions::held_key_retry`](crate::TrellisOptions::held_key_retry)).
 ///

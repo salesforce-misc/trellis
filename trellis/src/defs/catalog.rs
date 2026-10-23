@@ -1410,6 +1410,12 @@ pub(crate) async fn complete_direct_backfill(
     }
     let tables = definition_tables_read(txn, definition_id).await?;
     crate::intake::markers::park_catch_up(txn, &[definition_id], &tables).await?;
+    if status == TransformStatus::CatchingUp {
+        // #1306: the build repaired what its readers may have held keys
+        // for; the staging worker retries them once this commits. After the
+        // definition rows the parks above lock.
+        crate::staging::quarantine::request_upstream_releases(txn, definition_id).await?;
+    }
     // Last here, so the active segment's share lock is held only for the
     // rest of the caller's transaction.
     crate::staging::build::stamp_rebuild_seg(txn, &rebuilt).await?;
@@ -9942,6 +9948,74 @@ mod go_live_tests {
                 "{status:?}: a catch-up marker is parked exactly when the definition is unfrozen"
             );
         }
+    }
+
+    /// #1306: a direct build's completion asks for the release of the keys
+    /// its target's direct readers hold, in its own transaction, and a frozen
+    /// upstream's completion asks for nothing.
+    #[tokio::test]
+    async fn chunk_completion_asks_for_its_readers_releases() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let mut client = db.pool.get().await.expect("acquire connection");
+        client
+            .execute(
+                "insert into source_table_versions (source_table, version) \
+                 values ('public.orders', 1), ('public.up', 1)",
+                &[],
+            )
+            .await
+            .expect("seed source_table_versions");
+        let mut ids = Vec::new();
+        for (target, source, status) in [
+            ("public.up", "public.orders", TransformStatus::Backfilling),
+            ("public.frozen_up", "public.orders", TransformStatus::Paused),
+            ("public.r", "public.up", TransformStatus::Live),
+            ("public.other", "public.orders", TransformStatus::Live),
+        ] {
+            let id: i64 = client
+                .query_one(
+                    "insert into transform_definitions \
+                     (target_table, source_table, source_version, definition_text, status) \
+                     values ($1, $2, 1, $3, $4) returning id",
+                    &[
+                        &target,
+                        &source,
+                        &format!("TRANSFORM x FROM {source} SELECT a AS x"),
+                        &status.as_str(),
+                    ],
+                )
+                .await
+                .expect("seed a definition")
+                .get(0);
+            ids.push(id);
+        }
+        let txn = client.transaction().await.expect("begin");
+        complete_direct_backfill(&txn, ids[1])
+            .await
+            .expect("complete the frozen build");
+        txn.commit().await.expect("commit");
+        assert_eq!(requested(&client).await, Vec::<i64>::new());
+
+        let txn = client.transaction().await.expect("begin");
+        complete_direct_backfill(&txn, ids[0])
+            .await
+            .expect("complete up's build");
+        txn.commit().await.expect("commit");
+        assert_eq!(requested(&client).await, vec![ids[2]], "only r reads up");
+    }
+
+    async fn requested(client: &tokio_postgres::Client) -> Vec<i64> {
+        client
+            .query(
+                "select transform_id from upstream_releases order by transform_id",
+                &[],
+            )
+            .await
+            .expect("read the requests")
+            .iter()
+            .map(|row| row.get::<_, i64>(0))
+            .collect()
     }
 }
 

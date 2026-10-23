@@ -1033,6 +1033,13 @@ A group-basis or JOIN reader needs exact images, as capture gives a source.
   partitioned source, the remainder's, after the last leaf's, and a
   `JOIN`'s, the final `T` step's. Further
   hops need nothing: a reader's visible rows always match its own partials.
+- **Must:** the transaction that completes any build of a target, parked
+  catch-up or not, asks for a retry of every key the target's direct readers
+  hold, made by the staging worker after it commits, with the automatic
+  retry's semantics: a key held for a failure the upstream caused while it
+  was rebuilt applies, and one whose failure persists is held again on its
+  first failure. A paused or quarantined reader keeps its keys
+  ([ADR-0003](0003-quarantine-storage-and-api.md#retry-policy)).
 - **Must:** a writer that resolved the target's feed before a new reader's
   define committed must not leave the reader's build missing its write. A
   deterministic test freezes such a writer between its check and its

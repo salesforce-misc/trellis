@@ -4470,6 +4470,10 @@ pub async fn try_complete(pool: &Pool, id: i64) -> Result<bool, ChunkQueueError>
         &[&id, &TransformStatus::Live.as_str()],
     )
     .await?;
+    // #1306: the rebuild repaired what its readers may have held keys for
+    // (a copy holding values of two widths while it ran, say); the staging
+    // worker retries them once this commits.
+    super::quarantine::request_upstream_releases(&*txn, id).await?;
     txn.commit().await?;
     crate::instance_log::info!(
         definition_id = id,

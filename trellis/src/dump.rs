@@ -134,6 +134,7 @@ pub const CLASSIFICATION: &[(&str, Class)] = &[
     ("seg_claims", Class::Runtime),
     ("self_check_jobs", Class::Runtime),
     ("transform_fuse_gate", Class::Runtime),
+    ("upstream_releases", Class::Runtime),
     ("worker_registry", Class::Runtime),
 ];
 

@@ -475,6 +475,22 @@ whose fence wait runs out the lock timeout ends the pass. Each release re-reads 
 pass judged it due, so a key poisoned again in between (by another staging worker's pass, or
 after an operator's release) waits out its own backoff.
 
+A build of a Trellis target that completes retries every key its direct readers hold (a
+definition whose source, or `JOIN` side, is that target), whatever the failure and whether
+or not the automatic retry is on. A reader can hold a key for a failure the upstream caused
+while it was being rebuilt, such as a chained `BIT_AND` over a copy that held values of two
+widths between a source rewrite and the upstream's rebuild, and the build has repaired the
+cause. The transaction that completes the build (a Re-derive build's flip to `live`, or a
+chunked build's completion) writes one `upstream_releases` row per reader, so the request
+survives a worker stop, and the staging worker's release after each capture pass retries
+the keys through the automatic retry's release, so a key whose failure persists is held
+again on its first failure, with its attempt count one higher. A paused or quarantined
+reader keeps its keys held, as its resume releases them. A row is kept, and its release run
+after each pass, for twice the lock timeout, so a key evicted by a drain that read the
+upstream before the build committed is retried too; a later release of the same request
+takes only keys held since before its first one read them, so each key is retried once per
+build.
+
 A retried key that fails again is poisoned on its first failure, not after the death
 threshold. The retry's release writes the key's `key_deaths` row one below the threshold with
 `retry_attempts` one higher, which carries the count through the release; the drain's

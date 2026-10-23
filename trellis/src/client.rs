@@ -1095,6 +1095,7 @@ async fn first_capture_pass(
             .await
             .map_err(capture_pass_error)?;
     release_retyped_keys(pool).await;
+    release_upstream_rebuilt_keys(pool).await;
     complete_pause_cascades(pool).await;
     let taken =
         staging::build::start_ready_builds(session.client_mut(), pool, &outcome.ready).await?;
@@ -1112,6 +1113,19 @@ async fn release_retyped_keys(pool: &Pool) {
         crate::instance_log::warn!(
             error = %err,
             "couldn't release the keys held before a type rename was followed; retrying next pass"
+        );
+    }
+}
+
+/// Retries the keys the completion of an upstream build asked for (#1306,
+/// [`staging::quarantine::release_upstream_rebuilt_keys`]). A failure is
+/// logged, and the next pass tries again: the requests stay until their keys
+/// are released.
+async fn release_upstream_rebuilt_keys(pool: &Pool) {
+    if let Err(err) = staging::quarantine::release_upstream_rebuilt_keys(pool).await {
+        crate::instance_log::warn!(
+            error = %err,
+            "couldn't retry the keys held while an upstream was rebuilt; retrying next pass"
         );
     }
 }
@@ -1822,6 +1836,7 @@ async fn reconcile_source_tables(
     let deadline = Instant::now() + RECONCILE_DDL_BUDGET;
     let mut outcome = capture::reconcile::reconcile(client, schema, &desired, deadline).await?;
     release_retyped_keys(pool).await;
+    release_upstream_rebuilt_keys(pool).await;
     complete_pause_cascades(pool).await;
     // ADR-0017 P4a: the corrections the pass above queued get their rows in
     // the same pass, so a definition reads `backfilling` from the pass that
