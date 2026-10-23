@@ -291,8 +291,8 @@ pub struct JoinOpDraw {
 /// Resolves `draws` into ops on [`join_tables`], and builds the program with
 /// one definition per spec (`j0`, `j1`, …). Definition `i` is installed up
 /// front when `installs[i]` is `0` or missing, and otherwise before the op
-/// that `installs[i]` thousandths of the way through the stream name (so
-/// after at least one op).
+/// that `installs[i]` thousandths of the way through the stream name; a
+/// share that rounds down to the first op installs it up front too.
 ///
 /// An update, delete or truncate names a row the stream has inserted and
 /// not deleted yet (a truncate, every one of its table's); with none left on
@@ -552,11 +552,12 @@ pub fn add_join_actions(
 }
 
 /// How often a case's builds run over rows, counted from its program and
-/// plan. A build "over rows" is an install, a resume or a re-read that fires
-/// when the model says the tables hold rows: `settled` when the burst's
-/// predecessors, already quiesced, left rows on both tables (so the build
-/// certainly reads rows), `racing` when it fires part way through a burst
-/// whose own writes are still landing.
+/// plan. A build "over rows" is an install, a resume or a re-read in a burst
+/// whose predecessors, already quiesced, left rows on both tables, more on
+/// each than the burst's own deletes and truncates can remove: whenever in
+/// the burst it fires, it reads rows on both sides. An install is also
+/// counted as racing when it fires part way through its burst, whose own
+/// writes are still landing.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BuildCoverage {
     /// Definitions installed after the first op.
@@ -600,10 +601,23 @@ pub fn build_coverage(program: &Program, plan: &ConcurrentPlan) -> BuildCoverage
     // Rows the model says each table holds before each burst.
     let mut rows = [0i64; 2];
     for burst in &plan.bursts {
-        let both = rows[0] > 0 && rows[1] > 0;
         let ops = burst.ops();
+        // The lanes race, so an action may fire after any of the burst's
+        // ops: a side certainly holds rows throughout the burst only if it
+        // held more rows than the burst deletes from it, and the burst
+        // doesn't truncate it.
+        let mut emptying = [0i64; 2];
+        for &i in &ops {
+            let (table, by) = match &program.ops[i] {
+                Op::Delete { table, .. } => (table, 1),
+                Op::Truncate { table, .. } => (table, i64::MAX),
+                _ => continue,
+            };
+            let side = usize::from(table == JOINED_TABLE);
+            emptying[side] = emptying[side].saturating_add(by);
+        }
+        let over_rows = (0..2).all(|side| rows[side] > emptying[side]);
         for timed in &burst.actions {
-            let over_rows = both;
             match &timed.action {
                 BurstAction::Install { .. } => {
                     out.deferred_installs += 1;
@@ -1124,5 +1138,47 @@ mod tests {
         assert_eq!(coverage.rebuilds_joined, 1);
         assert_eq!(coverage.rebuilds_over_rows, 1);
         assert_eq!(coverage.builds_over_rows(), 2);
+    }
+
+    /// A burst that could empty a side before its action fires doesn't count
+    /// that action as over rows: the lanes race, so it may fire after the
+    /// delete.
+    #[test]
+    fn coverage_skips_a_burst_that_can_empty_a_side() {
+        let mut draws = inserts(2);
+        // Burst 1: delete `ja`'s only row, then insert another.
+        draws.push(JoinOpDraw {
+            kind: JoinOpKind::Delete,
+            ..draws[0]
+        });
+        draws.push(draws[0]);
+        // Burst 2: inserts only.
+        draws.extend(inserts(2));
+        let action = |burst| JoinActionDraw {
+            kind: JoinActionKind::RebuildJoined,
+            burst,
+            target: 0,
+            start: 1000,
+            span: 0,
+        };
+        let builds = JoinBuildDraws {
+            installs: vec![0],
+            actions: vec![action(0), action(1)],
+            settle_after_install: false,
+        };
+        let case = join_case(
+            &one_spec()[..1],
+            KeyShape::Spread,
+            &draws,
+            &builds,
+            2,
+            2,
+            2,
+            50,
+        );
+        assert!(matches!(case.program.ops[2], Op::Delete { .. }));
+        let coverage = build_coverage(&case.program, &case.plan);
+        assert_eq!(coverage.rebuilds_joined, 2);
+        assert_eq!(coverage.rebuilds_over_rows, 1);
     }
 }

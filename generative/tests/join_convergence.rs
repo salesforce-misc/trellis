@@ -56,9 +56,15 @@
 //! in, and a definition a build left paused, halted or quarantined fails the
 //! end check. The coverage report's `builds` lines count, per run, the
 //! installs, resumes and re-reads that fired over rows left by earlier
-//! bursts (so the build certainly read rows), the ones that fired in a burst
-//! whose own writes were still landing, and the cases that drew none of
-//! either; a run with none over rows has drawn nothing worth reading.
+//! bursts (more rows than their own burst can delete, so the build certainly
+//! read rows on both sides), the installs that fired in a burst whose own
+//! writes were still landing, and the cases that drew a build over rows; a
+//! run with none has drawn nothing worth reading. A last line reads the
+//! engine's build-rows counter (`trellis_build_rows_total`) around each
+//! passed case: the rows its builds wrote, the cases where they wrote any,
+//! and the cases with a build over rows in the model where the engine's
+//! builds wrote none (an `INNER` build with no matching key writes none, so
+//! that count is a prompt to look, not a failure).
 //!
 //! Not drawn: partitioned sides, `DDL` between a build's steps, and
 //! definitions that read another's target.
@@ -97,6 +103,12 @@ struct JoinCoverage {
     cases_building_over_rows: usize,
     /// Cases that settled their up-front definitions over empty tables.
     cases_settled: usize,
+    /// Read back from the engine: cases whose run moved the build-rows
+    /// counter, its total over the run, and the cases with a build over rows
+    /// in the model whose run didn't move it.
+    cases_engine_built: usize,
+    engine_build_rows: u64,
+    cases_over_rows_engine_silent: usize,
     coverage: generative::run::Coverage,
 }
 
@@ -146,6 +158,26 @@ impl JoinCoverage {
         self.coverage
             .record_concurrent_plan(&case.program, &case.plan);
     }
+
+    /// Records what a passed run's engine says its builds wrote.
+    fn record_engine_builds(&mut self, case: &JoinCase, rows: u64) {
+        self.cases_engine_built += usize::from(rows > 0);
+        self.engine_build_rows += rows;
+        let over_rows = build_coverage(&case.program, &case.plan).builds_over_rows() > 0;
+        self.cases_over_rows_engine_silent += usize::from(over_rows && rows == 0);
+    }
+}
+
+/// The engine's `trellis_build_rows_total`, summed over its instances: the
+/// group rows its builds' chunks and steps have written so far in this
+/// process.
+fn engine_build_rows() -> u64 {
+    trellis::Metrics::new()
+        .render_prometheus()
+        .lines()
+        .filter(|line| line.starts_with("trellis_build_rows_total"))
+        .filter_map(|line| line.rsplit(' ').next()?.parse::<f64>().ok())
+        .sum::<f64>() as u64
 }
 
 impl std::fmt::Display for JoinCoverage {
@@ -181,6 +213,12 @@ impl std::fmt::Display for JoinCoverage {
             b.rebuilds_from,
             b.rebuilds_joined,
             b.rebuilds_over_rows
+        )?;
+        writeln!(
+            f,
+            "builds: the engine wrote {} build rows in {} passed cases; {} cases with a build \
+             over rows in the model wrote none",
+            self.engine_build_rows, self.cases_engine_built, self.cases_over_rows_engine_silent
         )?;
         write!(f, "{}", self.coverage)
     }
@@ -256,9 +294,14 @@ fn run_case(case: &JoinCase) -> Result<(), String> {
                 case.workers,
                 case.seal_interval_ms
             );
+            let build_rows_before = engine_build_rows();
             match run_convergence_concurrent(&mut backend, &pool, &case.program, &case.plan).await {
                 Ok(run) => {
-                    h.coverage.borrow_mut().coverage.record_drain(&run.drain);
+                    let build_rows = engine_build_rows().saturating_sub(build_rows_before);
+                    let mut coverage = h.coverage.borrow_mut();
+                    coverage.coverage.record_drain(&run.drain);
+                    coverage.record_engine_builds(case, build_rows);
+                    drop(coverage);
                     if !run.outcome.as_pass() {
                         return Err(format!("run did not pass ({shape}): {}", run.outcome));
                     }
@@ -301,9 +344,10 @@ proptest! {
 /// A small hand-built case: a `LEFT` S1 on `k` and an `INNER` S2 on `(t,
 /// k)`, both tables written, rows moved between keys and groups, keys
 /// matched and unmatched, each table truncated once mid-stream, over two
-/// lanes and two workers. With `builds`, the S1 installs part way through
-/// the first burst's successor, over rows, and the last burst pauses and
-/// resumes it and re-reads both tables.
+/// lanes and two workers. With `builds`, only `jb` is truncated (in the
+/// second burst), and in the last burst, over rows that its deletes can't
+/// remove, the S1 installs part way through while the S2 is paused and
+/// resumed and both tables are re-read.
 fn hand_built_case(with_builds: bool) -> JoinCase {
     let specs = [
         JoinDefSpec {
@@ -323,7 +367,7 @@ fn hand_built_case(with_builds: bool) -> JoinCase {
     for i in 0..48u8 {
         let joined = i % 3 == 0;
         let kind = match i % 5 {
-            _ if i == 21 || i == 34 => JoinOpKind::Truncate,
+            _ if i == 21 || (!with_builds && i == 34) => JoinOpKind::Truncate,
             0..=2 => JoinOpKind::Insert,
             3 => JoinOpKind::Update,
             _ => JoinOpKind::Delete,
@@ -348,7 +392,7 @@ fn hand_built_case(with_builds: bool) -> JoinCase {
     };
     let builds = if with_builds {
         JoinBuildDraws {
-            installs: vec![400, 0],
+            installs: vec![700, 0],
             actions: vec![
                 action(JoinActionKind::PauseResume, 0),
                 action(JoinActionKind::PauseResume, 1),
@@ -389,9 +433,14 @@ fn a_hand_built_join_case_builds_over_rows_and_converges() {
         builds.rebuilds_from >= 1 && builds.rebuilds_joined >= 1,
         "{builds:?}"
     );
+    let build_rows_before = engine_build_rows();
     if let Err(message) = run_case(&case) {
         panic!("{message}");
     }
+    // The counter is process-wide and this binary's tests run in parallel,
+    // so this can't tell this case's builds from another test's; it does
+    // catch builds that never write a row.
+    assert!(engine_build_rows() > build_rows_before);
 }
 
 /// The oracle tells a corrupted `JOIN` target from a good one: the same

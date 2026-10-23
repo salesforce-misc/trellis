@@ -229,7 +229,9 @@ unblocks it.
   compares each target with the definition's own query, so it covers the build's
   outcome. In a quarter of the cases the run first settles the up-front
   definitions over the empty tables. The coverage report counts the builds that
-  fire over rows left by earlier bursts, so a run shows that they happen. About
+  fire over rows left by earlier bursts, so a run shows that they happen, and
+  reads the engine's build-rows counter around each case to show that its
+  builds wrote rows. About
   one op in a hundred is a `TRUNCATE` of either table. The tables are
   unpartitioned and no definition reads another's target. Run it with `cargo
   test -p generative --test join_convergence -- --ignored`.
