@@ -18,8 +18,7 @@ use generative::model::{NoiseAction, NoiseEventKind, Op, Program, Table};
 use generative::run::{ConcurrentShape, Coverage, RelPath};
 use proptest::strategy::{Strategy, ValueTree};
 use proptest::test_runner::{Config, RngAlgorithm, TestCaseError, TestError, TestRng, TestRunner};
-use trellis::dev::defs::ast::{Expr, KeySpace, Operator, ValueType};
-use trellis::dev::defs::invertibility::{AggregateArg, CountArg, Invertibility, classify};
+use trellis::dev::defs::ast::{Expr, KeySpace, Operator, TransformDef, ValueType};
 
 /// `ValueType` has no `Hash` impl (it's an engine type, not owned by this
 /// crate), so scalar-type-surface comparisons here go through a sorted `Vec`
@@ -719,149 +718,88 @@ fn trivial_program_sometimes_draws_a_nested_expression() {
     );
 }
 
-/// Every [`Expr::FunctionCall`] name appearing anywhere in `program`'s defs
-/// (recursing into arguments, though today's `KeySpace::Aggregate` generator
-/// only ever nests one level deep — a `SUM`/`AVG`/`MIN`/`MAX` call wrapping a
-/// bare `Column`, or a bare `COUNT`).
-fn all_function_call_names(program: &Program) -> HashSet<String> {
-    let mut names = HashSet::new();
-    fn walk(expr: &Expr, out: &mut HashSet<String>) {
-        if let Expr::FunctionCall { name, args } = expr {
-            out.insert(name.clone());
-            for arg in args {
-                walk(arg, out);
-            }
+/// The aggregate calls a plain (relationship-free) `GROUP BY` definition can
+/// draw: the group basis's admitted set (issue #1100). Define refuses every
+/// other aggregate function on a plain aggregate.
+const ADMITTED_AGGREGATE_CALLS: &[(&str, &str)] = &[
+    ("COUNT", "*"),
+    ("COUNT", "column"),
+    ("SUM", "column"),
+    ("AVG", "column"),
+];
+
+/// Whether any field of `def` reads a relationship path. Such a definition
+/// stays on the ledger until relationships are removed (#1115), so the
+/// admitted-set rule does not apply to it.
+fn reads_a_relationship(def: &TransformDef) -> bool {
+    fn walk(expr: &Expr) -> bool {
+        match expr {
+            Expr::RelationshipPath { .. } => true,
+            Expr::FunctionCall { args, .. } => args.iter().any(walk),
+            Expr::BinaryOp { lhs, rhs, .. } => walk(lhs) || walk(rhs),
+            _ => false,
         }
     }
-    for def in &program.defs {
-        for field in &def.fields {
-            walk(&field.expr, &mut names);
-        }
-    }
-    names
+    def.fields.iter().any(|field| walk(&field.expr))
 }
 
-/// Improvement-plan task B4 (the widening unit's coverage meta-test): every
-/// aggregate function the generator draws (`SUM`/`COUNT`/`AVG`/`MIN`/`MAX`,
-/// plus `BOOL_AND`/`BOOL_OR` since issue #255 — see
-/// [`AGGREGATE_FUNCTION_NAMES`]) must actually get drawn
-/// across enough sampled programs — this is the floor that would catch B4's
-/// aggregate-function widening silently regressing (design doc §3 "coverage
-/// that silently drops out"), the same principle every other floor test in
-/// this file already checks for an earlier widening.
-///
-/// **Post-merge fix.** The early-exit condition below used to read
-/// `seen.len() >= 5` unfiltered — a correct "all five aggregate names have
-/// been seen" check back when a generated program's `FunctionCall`s could
-/// only ever be aggregate ones. Now that improvement-plan task B2's scalar
-/// `DerivedShape` functions (`STRPOS`/`OCTET_LENGTH`/`CHAR_LENGTH`/
-/// `REGEXP_COUNT`/`COALESCE`) are drawn too (see
-/// [`AGGREGATE_FUNCTION_NAMES`]'s own doc comment), `seen` can reach 5
-/// distinct names from scalar functions alone, breaking out before any
-/// aggregate def — let alone `AVG` specifically — has actually been drawn.
-/// The loop now only counts aggregate names toward the early exit.
+/// Issue #1100: every aggregate function the generator draws on a plain
+/// `GROUP BY` definition is one the group basis admits, and every admitted
+/// call shape is actually drawn. A `SUM`/`AVG` argument is a bare column of a
+/// `numeric` (declared `numeric(14,2)` by the DDL) or integer type, never an
+/// expression, whose type would be unconstrained `numeric`.
 #[test]
-fn trivial_program_draws_every_aggregate_function_across_enough_samples() {
+fn trivial_program_draws_exactly_the_admitted_aggregate_set() {
     let mut runner = TestRunner::default();
     let strategy = trivial_program();
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut coverage = generative::run::Coverage::new();
     for _ in 0..1000 {
         let program = strategy
             .new_tree(&mut runner)
             .expect("strategy must produce a value")
             .current();
-        seen.extend(all_function_call_names(&program));
-        let aggregate_names_seen = seen
-            .iter()
-            .filter(|name| AGGREGATE_FUNCTION_NAMES.contains(&name.as_str()))
-            .count();
-        if aggregate_names_seen >= AGGREGATE_FUNCTION_NAMES.len() {
-            break;
+        for def in program.defs.iter().filter(|def| {
+            matches!(def.key_space, KeySpace::Aggregate { .. }) && !reads_a_relationship(def)
+        }) {
+            let source = program
+                .tables
+                .iter()
+                .find(|t| t.name == def.source)
+                .expect("a definition's source is one of the program's tables");
+            for field in &def.fields[1..] {
+                let Expr::FunctionCall { name, args } = &field.expr else {
+                    panic!("a plain aggregate field must be an aggregate call: {def:#?}");
+                };
+                let argument_type = match args.as_slice() {
+                    [] => None,
+                    [Expr::Column(column)] => Some(
+                        source
+                            .columns
+                            .iter()
+                            .find(|c| &c.name == column)
+                            .expect("an aggregated column exists")
+                            .value_type,
+                    ),
+                    _ => panic!("an aggregate argument must be a bare column: {def:#?}"),
+                };
+                match (name.as_str(), argument_type) {
+                    ("COUNT", _) => {}
+                    ("SUM" | "AVG", Some(ValueType::Numeric | ValueType::Integer(_))) => {}
+                    _ => panic!("{name} over {argument_type:?} is not admitted: {def:#?}"),
+                }
+            }
         }
+        coverage.record_program(&program);
     }
-    for name in AGGREGATE_FUNCTION_NAMES {
+    for (function, argument) in ADMITTED_AGGREGATE_CALLS {
         assert!(
-            seen.contains(*name),
-            "expected {name} to be drawn among aggregate function calls across 1000 samples; \
-             saw: {seen:?}"
+            coverage
+                .aggregate_call_cases
+                .get(&("Aggregate", function, argument))
+                .is_some_and(|&n| n > 0),
+            "expected {function}({argument}) inside a GROUP BY def across 1000 samples:              {coverage}"
         );
     }
-}
-
-/// The `KeySpace::Aggregate` function names the generator draws (a subset of
-/// `trellis::dev::defs::registry::AGGREGATE_FUNCTIONS`), duplicated here as a
-/// `const` rather than imported: `generative` doesn't re-export the engine's
-/// `registry` module, and this list is short/stable enough (the same seven
-/// [`AggregateFn`] already hardcodes) that a local copy is clearer than
-/// plumbing a new import through for one test.
-///
-/// **Why this filter is needed post-merge.** [`all_function_call_names`]
-/// collects *every* `FunctionCall` name in a program's defs, including the
-/// five scalar functions (`STRPOS`/`OCTET_LENGTH`/`CHAR_LENGTH`/
-/// `REGEXP_COUNT`/`COALESCE`) improvement-plan task B2's `DerivedShape` draws
-/// on `OneToOne` defs — B4 was developed before B2 merged in, when the only
-/// `FunctionCall`s a generated program could ever contain were aggregate
-/// ones, so `trivial_program_draws_both_invertibility_classes_across_enough_samples`
-/// below used to call [`classify`] on every collected name unfiltered. Now
-/// that both widenings are merged, an unfiltered name can be a scalar
-/// function `classify` has never heard of (it only knows the aggregate
-/// registry) — filtering to this list keeps that test checking what it always
-/// meant to check.
-///
-/// [`AggregateFn`]: generative::generate::AggregateFn
-const AGGREGATE_FUNCTION_NAMES: &[&str] =
-    &["SUM", "COUNT", "AVG", "MIN", "MAX", "BOOL_AND", "BOOL_OR"];
-
-/// The other half of B4's coverage floor: both invertibility classes
-/// (`trellis::dev::defs::invertibility::Invertibility`) must appear across a run —
-/// at least one `Invertible` function (`SUM`/`COUNT`/`AVG`) and at least one
-/// `RecomputeOnly` function (`MIN`/`MAX`) — not just "all five names appear"
-/// in the abstract. This is what makes the generative suite a real exerciser
-/// of the engine's invertibility split (`docs/generative-test-suite.md` §4
-/// calls the aggregate delta path "the hardest guarantee" precisely because
-/// of this split), not just a name-coverage checklist.
-#[test]
-fn trivial_program_draws_both_invertibility_classes_across_enough_samples() {
-    let mut runner = TestRunner::default();
-    let strategy = trivial_program();
-    let mut saw_invertible = false;
-    let mut saw_recompute_only = false;
-    for _ in 0..1000 {
-        let program = strategy
-            .new_tree(&mut runner)
-            .expect("strategy must produce a value")
-            .current();
-        // Only classify the aggregate functions — see
-        // `AGGREGATE_FUNCTION_NAMES`'s doc comment for why a post-merge
-        // program's `FunctionCall`s aren't all aggregate ones anymore.
-        for name in all_function_call_names(&program)
-            .into_iter()
-            .filter(|name| AGGREGATE_FUNCTION_NAMES.contains(&name.as_str()))
-        {
-            let arg = match name.as_str() {
-                "COUNT" => AggregateArg::Count(CountArg::Star),
-                "BOOL_AND" | "BOOL_OR" => AggregateArg::Column(ValueType::Boolean),
-                _ => AggregateArg::Column(ValueType::Numeric),
-            };
-            let verdict = classify(&name, arg)
-                .unwrap_or_else(|| panic!("{name} must be a known aggregate function"));
-            match verdict.invertibility {
-                Invertibility::Invertible => saw_invertible = true,
-                Invertibility::RecomputeOnly => saw_recompute_only = true,
-            }
-        }
-        if saw_invertible && saw_recompute_only {
-            break;
-        }
-    }
-    assert!(
-        saw_invertible,
-        "expected at least one Invertible aggregate function (SUM/COUNT/AVG) across 1000 samples"
-    );
-    assert!(
-        saw_recompute_only,
-        "expected at least one RecomputeOnly aggregate function (MIN/MAX) across 1000 samples"
-    );
 }
 
 /// The key-space half of B4's coverage floor: the default strategy must
@@ -1332,70 +1270,30 @@ fn trivial_program_draws_every_supported_relationship_reference_shape() {
     );
 }
 
-/// Issues #255/#294: the generator can draw each aggregate shape it used to
-/// leave out — `BOOL_AND`/`BOOL_OR` over the `Boolean` column in a `GROUP BY`
-/// def, `COUNT(<rel>.<col>)` over a to-one path inside a `GROUP BY` def — and
-/// pairs a `BOOL_*` def with an in-place flip of the column it folds
-/// ([`Mutate::UpdateFlag`]), so the recompute path sees a value retracted
-/// from a live group, not only rows joining and leaving it.
+/// Issue #294: the generator draws `COUNT(<rel>.<col>)` over a to-one path
+/// inside a `GROUP BY` def.
 ///
 /// Sampled with [`TestRunner::deterministic`] rather than `default()`, so
 /// this pins what a fixed seed draws instead of being a probabilistic floor.
 #[test]
-fn trivial_program_draws_bool_aggregates_and_count_of_a_relationship_path_in_a_group_by() {
+fn trivial_program_draws_count_of_a_relationship_path_in_a_group_by() {
     let mut runner = TestRunner::deterministic();
     let strategy = trivial_program();
     let mut coverage = generative::run::Coverage::new();
-    let mut saw_flag_flip_under_a_bool_aggregate = false;
     for _ in 0..500 {
         let program = strategy
             .new_tree(&mut runner)
             .expect("strategy must produce a value")
             .current();
         coverage.record_program(&program);
-        saw_flag_flip_under_a_bool_aggregate |= flips_a_column_a_bool_aggregate_folds(&program);
-    }
-    for (function, argument) in [
-        ("BOOL_AND", "column"),
-        ("BOOL_OR", "column"),
-        ("COUNT", "rel"),
-    ] {
-        assert!(
-            coverage
-                .aggregate_call_cases
-                .get(&("Aggregate", function, argument))
-                .is_some_and(|&n| n > 0),
-            "the generator must draw {function}({argument}) inside a GROUP BY def across 500 \
-             deterministic samples: {coverage}"
-        );
     }
     assert!(
-        saw_flag_flip_under_a_bool_aggregate,
-        "the generator must sometimes flip the Boolean column a BOOL_AND/BOOL_OR def folds, on a \
-         live row, across 500 deterministic samples"
+        coverage
+            .aggregate_call_cases
+            .get(&("Aggregate", "COUNT", "rel"))
+            .is_some_and(|&n| n > 0),
+        "the generator must draw COUNT(rel) inside a GROUP BY def across 500 deterministic          samples: {coverage}"
     );
-}
-
-/// Whether `program` has a `BOOL_AND`/`BOOL_OR` field and a successful
-/// `UPDATE` of that field's argument column on the same source table.
-fn flips_a_column_a_bool_aggregate_folds(program: &Program) -> bool {
-    program.defs.iter().any(|def| {
-        def.fields.iter().any(|field| match &field.expr {
-            Expr::FunctionCall { name, args } if name == "BOOL_AND" || name == "BOOL_OR" => {
-                let [Expr::Column(column)] = args.as_slice() else {
-                    return false;
-                };
-                program.ops.iter().any(|op| {
-                    matches!(
-                        op,
-                        Op::Update { table, changes, expect: generative::model::OpOutcome::Succeeds, .. }
-                            if *table == def.source && changes.iter().any(|(c, _)| c == column)
-                    )
-                })
-            }
-            _ => false,
-        })
-    })
 }
 
 /// The relationship key/foreign-key columns must really exercise all three
@@ -1485,6 +1383,12 @@ fn trivial_program_drives_every_relationship_reverse_path() {
 /// case count). The planted failure is "a `TRUNCATE` in a program with at
 /// least two tables", which op order can't affect. Each run is seeded, so
 /// this pins what the shrinker does rather than being a probabilistic floor.
+///
+/// Over 250 seeds about 87% of the shrunk counterexamples come back in table
+/// order, both before and after #1100 narrowed the aggregate draws (213/245
+/// and 212/244); the rest run out of shrink budget. The bar is 85% over 250
+/// seeds: a 90% bar over 40 seeds sat at the mean and passed or failed with
+/// whichever seeds a generator change happened to shift.
 #[test]
 fn an_order_independent_failure_shrinks_to_the_table_by_table_order() {
     let is_table_ordered = |program: &Program| {
@@ -1492,7 +1396,7 @@ fn an_order_independent_failure_shrinks_to_the_table_by_table_order() {
         order.iter().copied().eq(0..program.ops.len())
     };
     let (mut failures, mut table_ordered) = (0, 0);
-    for seed in 1..=40u8 {
+    for seed in 1..=250u8 {
         let mut runner = TestRunner::new_with_rng(
             Config {
                 cases: 16,
@@ -1518,11 +1422,11 @@ fn an_order_independent_failure_shrinks_to_the_table_by_table_order() {
         }
     }
     assert!(
-        failures >= 20,
-        "the planted failure must be found: {failures}/40 seeds"
+        failures >= 125,
+        "the planted failure must be found: {failures}/250 seeds"
     );
     assert!(
-        table_ordered * 10 >= failures * 9,
+        table_ordered * 100 >= failures * 85,
         "an order-independent failure must shrink to the table-by-table order: only \
          {table_ordered} of {failures} shrunk counterexamples did"
     );
@@ -1741,4 +1645,63 @@ fn partitioned_program_always_reads_a_partitioned_source_and_draws_every_strateg
             "no {name} across 500 deterministic samples:\n{coverage}"
         );
     }
+}
+
+/// Issue #1100: the aggregate definitions the generator draws really land
+/// on the group basis, checked against the catalog: after a real run, the
+/// instance has one `agg_<id>` hidden table per plain (relationship-free)
+/// `GROUP BY` definition. Without this floor a generator or engine change
+/// that silently routed definitions to the ledger would still pass every
+/// convergence property.
+#[tokio::test(flavor = "multi_thread")]
+async fn drawn_aggregate_definitions_land_on_the_group_basis() {
+    use generative::backend::ManualBackend;
+    use generative::run::run_convergence;
+    use trellis::{Config, Pool};
+
+    const PROGRAMS: usize = 4;
+    let cluster = testkit::TestCluster::start();
+    let mut runner = TestRunner::deterministic();
+    let strategy = trivial_program();
+    let mut checked = 0;
+    let mut group_basis_defs = 0;
+    while checked < PROGRAMS {
+        let program = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        let plain_aggregates = program
+            .defs
+            .iter()
+            .filter(|def| {
+                matches!(def.key_space, KeySpace::Aggregate { .. }) && !reads_a_relationship(def)
+            })
+            .count();
+        if plain_aggregates == 0 {
+            continue;
+        }
+        let db = cluster.create_isolated_database().await;
+        let mut backend = ManualBackend::connect(db.dsn())
+            .await
+            .expect("connect manual backend");
+        let pool =
+            Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
+        let outcome = run_convergence(&mut backend, &pool, &program)
+            .await
+            .unwrap_or_else(|err| panic!("{err:?}\n{program:#?}"));
+        assert!(outcome.as_pass(), "{outcome}");
+        let tables = backend
+            .group_basis_table_count()
+            .await
+            .expect("count group-basis tables");
+        assert_eq!(
+            tables,
+            i64::try_from(plain_aggregates).expect("small"),
+            "every plain aggregate definition must be maintained on the group basis: \
+             {program:#?}"
+        );
+        checked += 1;
+        group_basis_defs += plain_aggregates;
+    }
+    assert!(group_basis_defs >= PROGRAMS);
 }

@@ -1240,8 +1240,12 @@ fn pin_ops_rejects_malformed_lines() {
 ///
 /// `t2`, `t3` and `t4` all group `t0` by `c6`: `t2` with SUM, COUNT, AVG,
 /// MIN, MAX, BOOL_AND, BOOL_OR and `MIN(r0.c10)` through the to-one
-/// relationship `r0` (`t0.c8 -> t1.c16`), `t3` with AVG, MIN and MAX, `t4`
-/// with SUM, AVG, MIN, MAX, BOOL_OR and `SUM(r0.c10)`. The ops are three
+/// relationship `r0` (`t0.c8 -> t1.c16`), `t3` with AVG, `COUNT(c1)` and
+/// `SUM(c2)`, `t4` with SUM, AVG, MIN, MAX, BOOL_OR and `SUM(r0.c10)`. `t2`
+/// and `t4` read a relationship, so they stay on the ledger; `t3` is a plain
+/// aggregate and runs on the group basis, which admits only `COUNT`/`SUM`/
+/// `AVG` (#1100), so its drawn `MIN(c1)`/`MAX(c2)` are now `COUNT(c1)`/
+/// `SUM(c2)`. The ops are three
 /// bursts over two lanes, 1,270 in all: 4 `t1` inserts and, on `t0`, 117
 /// inserts, 101 deletes, 601 updates to `c1` and `c2`, 273 that move a row
 /// between `c6` groups, and 174 to `c1` or `c4` alone. None changes the join
@@ -1301,7 +1305,7 @@ fn hot_key_case_3_11() -> (
          COUNT(*) AS cnt, AVG(c1) AS avg_c1, MIN(c2) AS min_c2, MAX(c1) AS max_c1, \
          BOOL_AND(c4) AS bool_and_c4, BOOL_OR(c4) AS bool_or_c4, MIN(r0.c10) AS rel_agg",
         "TRANSFORM t3 FROM t0 GROUP BY c6 SELECT c6 AS c6, AVG(c1) AS avg_c1, \
-         MIN(c1) AS min_c1, MAX(c2) AS max_c2",
+         COUNT(c1) AS count_c1, SUM(c2) AS sum_c2",
         "TRANSFORM t4 FROM t0 GROUP BY c6 SELECT c6 AS c6, SUM(c2) AS sum_c2, \
          AVG(c1) AS avg_c1, MIN(c2) AS min_c2, MAX(c1) AS max_c1, \
          BOOL_OR(c4) AS bool_or_c4, SUM(r0.c10) AS rel_agg",

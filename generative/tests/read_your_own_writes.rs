@@ -114,14 +114,15 @@ async fn reading_without_quiesce_can_observe_state_that_has_not_caught_up_yet() 
             .and_then(|cols| cols.get(c1_col))
             .cloned()
             .flatten()
-            == Some(new_c1.to_string());
+            == Some(format!("{new_c1}.00"));
         assert!(
             source_reflects_the_write,
             "the source statement itself must have committed synchronously by the time \
              apply() returned (attempt {attempt}): {snapshot:#?}"
         );
 
-        let expected_total = (new_c1 + 2).to_string();
+        // A `numeric(14,2)` column and the sum of two read back at scale 2.
+        let expected_total = format!("{}.00", new_c1 + 2);
         let target_already_reflects_it = snapshot
             .get(target_table)
             .and_then(|rows| rows.get("1"))
@@ -251,13 +252,13 @@ async fn awaiting_after_a_write_to_a_related_row_makes_the_enrichment_visible() 
     let snapshot = backend.snapshot().await.expect("snapshot after quiesce");
     assert_eq!(
         snapshot[&program.defs[0].target]["1"]["rel_enrich"],
-        Some("777".to_string()),
+        Some("777.00".to_string()),
         "the to-one enrichment must reflect the related row's new value after quiesce: \
          {snapshot:#?}"
     );
     assert_eq!(
         snapshot[&program.defs[1].target]["1"]["rel_agg"],
-        Some("777".to_string()),
+        Some("777.00".to_string()),
         "the to-many aggregate must reflect the related row's new value after quiesce: \
          {snapshot:#?}"
     );

@@ -245,7 +245,7 @@ async fn a_program_over_a_partitioned_source_converges_end_to_end() {
                         functions: vec![
                             AggregateFn::Sum(AggregateColumn::C1),
                             AggregateFn::Count,
-                            AggregateFn::Min(AggregateColumn::C2),
+                            AggregateFn::CountColumn(AggregateColumn::C2),
                         ],
                     },
                 )],
@@ -908,8 +908,7 @@ async fn an_aggregate_group_emptied_by_deletes_converges_and_the_row_disappears(
                     AggregateFn::Sum(AggregateColumn::C1),
                     AggregateFn::Count,
                     AggregateFn::Avg(AggregateColumn::C1),
-                    AggregateFn::Min(AggregateColumn::C1),
-                    AggregateFn::Max(AggregateColumn::C1),
+                    AggregateFn::CountColumn(AggregateColumn::C1),
                 ],
             },
         )],
@@ -929,8 +928,8 @@ async fn an_aggregate_group_emptied_by_deletes_converges_and_the_row_disappears(
 
     let snapshot = backend.snapshot().await.expect("snapshot after the run");
     let target = &snapshot[&program.defs[0].target];
-    let emptied_group = group_key(&[Some("0".to_string())]);
-    let surviving_group = group_key(&[Some("1".to_string())]);
+    let emptied_group = group_key(&[Some("0.00".to_string())]);
+    let surviving_group = group_key(&[Some("1.00".to_string())]);
     assert!(
         !target.contains_key(&emptied_group),
         "group \"0\" was emptied by deleting both its members and must have no target row at \
@@ -941,72 +940,12 @@ async fn an_aggregate_group_emptied_by_deletes_converges_and_the_row_disappears(
         "group \"1\" (pk 3, untouched) must still have its target row: {target:?}"
     );
     let g1 = &target[&surviving_group];
-    assert_eq!(g1["sum_c1"], Some("99".to_string()), "group 1's sum");
+    assert_eq!(g1["sum_c1"], Some("99.00".to_string()), "group 1's sum");
     assert_eq!(g1["cnt"], Some("1".to_string()), "group 1's count");
-    assert_eq!(g1["min_c1"], Some("99".to_string()), "group 1's min");
-    assert_eq!(g1["max_c1"], Some("99".to_string()), "group 1's max");
-}
-
-/// Improvement-plan task B4: `MIN`/`MAX` are always
-/// `trellis::dev::defs::invertibility::Invertibility::RecomputeOnly` (never
-/// delta-maintained) — deleting a group's *current* extreme member must
-/// recompute the new extreme from the group's remaining rows, not fall back
-/// to a stale cached value. `trellis/tests/apply_aggregate.rs` already covers
-/// this shape by hand at the engine layer; this pin drives the identical
-/// edge through the generative harness's own convergence property, so a
-/// regression here is caught by the same three-way (target/evaluator/SQL)
-/// machinery every other case in this suite is.
-#[tokio::test(flavor = "multi_thread")]
-async fn deleting_a_groups_current_min_and_max_forces_a_real_recompute() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-
-    let program = build_program_multi_with_shapes(
-        &[TableSpec {
-            seed_values: vec![(Some(5), Some(0)), (Some(20), Some(0)), (Some(1), Some(0))],
-            text_values: vec![None, None, None],
-            bool_values: vec![None, None, None],
-            uuid_values: vec![None, None, None],
-            grain_values: vec![Some("0".to_string()); 3],
-            rel_fk_values: vec![None; 3],
-            // Delete the current max (pk 2, c1=20) and the current min
-            // (pk 3, c1=1); only pk 1 (c1=5) survives.
-            mutates: vec![Mutate::Delete { pk: 2 }, Mutate::Delete { pk: 3 }],
-        }],
-        &[(
-            0,
-            DefShape::Aggregate {
-                functions: vec![
-                    AggregateFn::Min(AggregateColumn::C1),
-                    AggregateFn::Max(AggregateColumn::C1),
-                ],
-            },
-        )],
-    );
-
-    let mut backend = ManualBackend::connect(db.dsn())
-        .await
-        .expect("connect manual backend");
-    let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
-
-    let outcome = run_convergence(&mut backend, &pool, &program)
-        .await
-        .expect("deleting the current min/max must still converge via recompute");
-    assert!(outcome.as_pass(), "run did not pass: {outcome}");
-
-    let snapshot = backend.snapshot().await.expect("snapshot after the run");
-    let target = &snapshot[&program.defs[0].target];
-    let group = group_key(&[Some("0".to_string())]);
-    let row = &target[&group];
     assert_eq!(
-        row["min_c1"],
-        Some("5".to_string()),
-        "min must recompute to the one surviving row (5), not stay stale at 1"
-    );
-    assert_eq!(
-        row["max_c1"],
-        Some("5".to_string()),
-        "max must recompute to the one surviving row (5), not stay stale at 20"
+        g1["count_c1"],
+        Some("1".to_string()),
+        "group 1's column count"
     );
 }
 
@@ -1066,9 +1005,9 @@ async fn avg_and_sum_over_the_same_column_share_a_partial_and_stay_correct_throu
 
     let snapshot = backend.snapshot().await.expect("snapshot after the run");
     let target = &snapshot[&program.defs[0].target];
-    let group = group_key(&[Some("0".to_string())]);
+    let group = group_key(&[Some("0.00".to_string())]);
     let row = &target[&group];
-    assert_eq!(row["sum_c1"], Some("50".to_string()), "final sum");
+    assert_eq!(row["sum_c1"], Some("50.00".to_string()), "final sum");
     // Postgres's numeric division picks its own display scale (e.g.
     // `50.0000000000000000`), which this grammar's `AVG` inherits rather
     // than reformats — compare by parsed value, not exact text, matching
@@ -1346,7 +1285,7 @@ async fn a_to_one_relationship_aggregated_inside_a_group_by_converges_end_to_end
 
     let snapshot = backend.snapshot().await.expect("snapshot after the run");
     let target = &snapshot[&program.defs[0].target];
-    for (grain, expected_sum) in [("0", "10"), ("1", "20")] {
+    for (grain, expected_sum) in [("0.00", "10.00"), ("1.00", "20.00")] {
         let row = &target[&group_key(&[Some(grain.to_string())])];
         assert_eq!(
             row["cnt"],

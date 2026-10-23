@@ -69,10 +69,6 @@
 //! Not drawn: partitioned sides, `DDL` between a build's steps, and
 //! definitions that read another's target.
 //!
-//! Every definition here runs behind the group-basis dev knob, which this
-//! binary turns on before its first client starts: a `JOIN` applies only
-//! behind it.
-//!
 //! The fast tests below (not ignored) run one hand-built case end to end,
 //! and check that the oracle tells a corrupted target from a good one.
 
@@ -243,15 +239,10 @@ impl Drop for Harness {
 }
 
 thread_local! {
-    static HARNESS: Harness = {
-        // A `JOIN` applies only behind the group-basis knob, which must be
-        // set before any client starts.
-        trellis::dev::staging::set_group_basis(true);
-        Harness {
-            runtime: tokio::runtime::Runtime::new().expect("build tokio runtime"),
-            cluster: TestCluster::start().long_lived(),
-            coverage: std::cell::RefCell::new(JoinCoverage::default()),
-        }
+    static HARNESS: Harness = Harness {
+        runtime: tokio::runtime::Runtime::new().expect("build tokio runtime"),
+        cluster: TestCluster::start().long_lived(),
+        coverage: std::cell::RefCell::new(JoinCoverage::default()),
     };
 }
 

@@ -45,10 +45,10 @@
 //! `grain_value` strategy below) — and each definition independently draws
 //! either the existing `total = c1 + c2` [`KeySpace::OneToOne`] shape, or a
 //! new [`KeySpace::Aggregate`] shape grouped by that table's grain column,
-//! with 2–5 fields drawn from `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` over `c1`/`c2`
-//! (see [`DefShape`], [`AggregateFn`], and the `aggregate_functions`/
-//! `def_shape` strategies below). Issue #255 adds `BOOL_AND`/`BOOL_OR` over
-//! the `Boolean` column to that pool. The grain column is deliberately **not**
+//! with 2–4 fields drawn from the group basis's admitted set (`COUNT(*)`,
+//! and `COUNT`/`SUM`/`AVG` over `c1`/`c2`, issue #1100; see [`DefShape`],
+//! [`AggregateFn`], and the `aggregate_functions`/`def_shape` strategies
+//! below). The grain column is deliberately **not**
 //! `c1`/`c2` (which keep their existing wider `0..=VALUE_MAX` range and
 //! remain the *values being aggregated*) — it's a tiny three-value domain
 //! (`0`, `1`, or `2`, see [`GRAIN_MAX`]) specifically so a handful of seed
@@ -134,8 +134,7 @@
 //!   [`Mutate::Update`]/[`Mutate::Delete`]/[`Mutate::DuplicateInsert`], which
 //!   continue to read/write only `c1`/`c2` exactly as before. (The one later
 //!   exception is the `Boolean` column, which issue #255's
-//!   [`Mutate::UpdateFlag`] rewrites in place so `BOOL_AND`/`BOOL_OR` see
-//!   value flips, not just rows joining and leaving a group.) This fully
+//!   [`Mutate::UpdateFlag`] rewrites in place.) This fully
 //!   covers "every column scalar type appears via a derivation"
 //!   (`generative/tests/coverage.rs`'s
 //!   `every_column_scalar_type_appears_via_a_derivation`) without also
@@ -156,7 +155,7 @@
 //!   `defs::validate::validate`'s `UngroupedColumnReference` check
 //!   would reject a derived field's bare, unaggregated column reference on
 //!   an `Aggregate` def; every `DerivedShape` references `c1`/`c2`/the text
-//!   column bare, none of them wrapped in `SUM`/`COUNT`/`AVG`/`MIN`/`MAX`).
+//!   column bare, none of them wrapped in `SUM`/`COUNT`/`AVG`).
 //! - Only syntactically-valid UUID text is ever drawn, or `NULL` — never a
 //!   malformed UUID string. A malformed one would fail the `INSERT`/
 //!   `UPDATE` statement's own `$n::text::uuid` cast, which is real, separate
@@ -474,12 +473,9 @@ pub enum Mutate {
     /// Set row `pk`'s `Boolean` column to `flag` (`"true"`/`"false"`, or
     /// `None` for SQL `NULL`), and nothing else (issue #255). The one
     /// exception to the "non-numeric columns are seeded once, never mutated"
-    /// scope cut (see the module doc comment): without it, a `BOOL_AND`/
-    /// `BOOL_OR` field would only ever see whole rows join or leave its group,
-    /// never a value flip inside it — the retraction that makes a
-    /// `RecomputeOnly` aggregate hard, and the one `MIN`/`MAX` get from
-    /// [`Mutate::Update`]'s `c1`/`c2` writes. A `pk` naming no live row is a
-    /// source no-op, exactly like `Update`.
+    /// scope cut (see the module doc comment): it changes a passthrough
+    /// column in place. A `pk` naming no live row is a source no-op, exactly
+    /// like `Update`.
     UpdateFlag { pk: i64, flag: Option<String> },
     /// Move row `pk`'s `c1` across `NULL` (issue #505): to `NULL` if it is
     /// currently non-`NULL`, otherwise to `value`. Renders to an `UPDATE` of
@@ -552,11 +548,8 @@ pub enum Mutate {
 }
 
 /// Which of a source table's two aggregated columns (`c1`/`c2`) a generated
-/// `SUM`/`AVG`/`MIN`/`MAX` field aggregates over (improvement-plan task B4).
-/// `COUNT(*)` has no column argument at all (see [`AggregateFn::Count`]), and
-/// `BOOL_AND`/`BOOL_OR` always fold the table's one `Boolean` column (see
-/// [`AggregateFn::BoolAnd`]), so this only shows up nested inside the four
-/// numeric variants.
+/// `SUM`/`AVG`/`COUNT(<col>)` field aggregates over (improvement-plan task
+/// B4). `COUNT(*)` has no column argument at all (see [`AggregateFn::Count`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AggregateColumn {
     C1,
@@ -564,39 +557,24 @@ pub enum AggregateColumn {
 }
 
 /// One calculated field of a generated [`KeySpace::Aggregate`] definition
-/// (task B4): one of the functions
-/// `trellis::dev::defs::registry::AGGREGATE_FUNCTIONS` accepts, carrying which
-/// column it aggregates where there is a choice. Kept as a small enum — rather
-/// than a bare `(name, column)` pair — so [`aggregate_field_def`]'s match
-/// stays exhaustive: adding another aggregate function to the generator needs
-/// a new variant here, which then has to be given an argument before it
-/// compiles, not just a new string someone forgot to type-check.
+/// (task B4), carrying which column it aggregates where there is a choice.
+/// Kept as a small enum — rather than a bare `(name, column)` pair — so
+/// [`aggregate_field_def`]'s match stays exhaustive.
 ///
-/// `SUM`/`COUNT`/`AVG` are
-/// [`trellis::dev::defs::invertibility::Invertibility::Invertible`]
-/// (delta-maintained); `MIN`/`MAX`/`BOOL_AND`/`BOOL_OR` are always
-/// [`trellis::dev::defs::invertibility::Invertibility::RecomputeOnly`] — see that
-/// module's doc comment. Drawing a real mix of both classes in the same
-/// aggregate def (not just across different defs) is exactly what
-/// `tests/coverage.rs`'s B4 floor tests assert actually happens.
-///
-/// The registry's other aggregates (`BIT_AND`/`BIT_OR`/`JSONB_AGG`) are not
-/// drawn: they need argument types this generator's schema doesn't have.
+/// The variants are exactly the group basis's admitted set (issue #1100):
+/// `COUNT(*)`, `COUNT(<col>)`, and `SUM`/`AVG` over a `numeric(p,s)` column
+/// (every generated `Numeric` column is declared `numeric(14,2)`; see
+/// `backend::sql::column_ddl_type`). Define refuses every other aggregate
+/// function for a plain aggregate, so the generator draws nothing else; the
+/// relationship draws ([`RelAggregateFn`]) are a separate, older path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AggregateFn {
     Sum(AggregateColumn),
     /// `COUNT(*)`: row counting, no argument.
     Count,
+    /// `COUNT(<col>)`: counts the group's rows whose column is not `NULL`.
+    CountColumn(AggregateColumn),
     Avg(AggregateColumn),
-    Min(AggregateColumn),
-    Max(AggregateColumn),
-    /// `BOOL_AND(<bool col>)` over the table's one `Boolean` column (issue
-    /// #255) — the only column `BOOL_AND` type-checks against, so there is
-    /// nothing to draw. Postgres's semantics are the oracle: `NULL`s are
-    /// skipped, and a group whose values are all `NULL` folds to `NULL`.
-    BoolAnd,
-    /// `BOOL_OR(<bool col>)`, the same shape as [`AggregateFn::BoolAnd`].
-    BoolOr,
 }
 
 impl AggregateFn {
@@ -605,12 +583,8 @@ impl AggregateFn {
     fn name(self) -> &'static str {
         match self {
             AggregateFn::Sum(_) => "SUM",
-            AggregateFn::Count => "COUNT",
+            AggregateFn::Count | AggregateFn::CountColumn(_) => "COUNT",
             AggregateFn::Avg(_) => "AVG",
-            AggregateFn::Min(_) => "MIN",
-            AggregateFn::Max(_) => "MAX",
-            AggregateFn::BoolAnd => "BOOL_AND",
-            AggregateFn::BoolOr => "BOOL_OR",
         }
     }
 }
@@ -1210,9 +1184,8 @@ pub fn build_program_multi_with_shapes(
                     // `defs::validate::validate` rejects any other
                     // expression under a grouping column's own name — and
                     // every other field is one of `functions`, drawn from
-                    // `SUM`/`COUNT(*)`/`AVG`/`MIN`/`MAX` over `c1`/`c2` and
-                    // `BOOL_AND`/`BOOL_OR` over the Boolean column (see
-                    // [`AggregateFn`]/`aggregate_field_def`).
+                    // the group basis's admitted set (see [`AggregateFn`]/
+                    // `aggregate_field_def`).
                     let mut fields = vec![FieldDef {
                         name: grain_col.clone(),
                         expr: Expr::Column(grain_col.clone()),
@@ -1220,7 +1193,7 @@ pub fn build_program_multi_with_shapes(
                     fields.extend(
                         functions
                             .iter()
-                            .map(|func| aggregate_field_def(*func, &c1, &c2, Some(&bool_col))),
+                            .map(|func| aggregate_field_def(*func, &c1, &c2)),
                     );
                     (
                         KeySpace::Aggregate {
@@ -1269,30 +1242,19 @@ pub fn build_program_multi_with_shapes(
 
 /// Builds one [`FieldDef`] for a drawn [`AggregateFn`] (improvement-plan task
 /// B4): the field name encodes both the function and its aggregated column
-/// (`sum_c1`, `avg_c2`, `bool_and_c4`, ...) so distinct `(function, column)`
+/// (`sum_c1`, `avg_c2`, `count_c1`, ...) so distinct `(function, column)`
 /// draws — even two functions sharing the same column, e.g. `SUM(c1)` and
-/// `AVG(c1)`, which deliberately exercises `defs::ddl::count_column_names`'s
-/// shared hidden-count-column path — never collide; `COUNT(*)` has no column
-/// and always takes the fixed name `cnt`. `c1`/`c2`/`bool_col` are the source
-/// table's own rendered column names (as everywhere else in this module);
-/// `bool_col` is `None` only for [`build_bulk_insert_program`]'s all-numeric
-/// table, which never builds a `BOOL_AND`/`BOOL_OR` field.
-fn aggregate_field_def(func: AggregateFn, c1: &str, c2: &str, bool_col: Option<&str>) -> FieldDef {
+/// `AVG(c1)` — never collide; `COUNT(*)` has no column and always takes the
+/// fixed name `cnt`. `c1`/`c2` are the source table's own rendered column
+/// names (as everywhere else in this module).
+fn aggregate_field_def(func: AggregateFn, c1: &str, c2: &str) -> FieldDef {
     let column = match func {
-        AggregateFn::Sum(column)
-        | AggregateFn::Avg(column)
-        | AggregateFn::Min(column)
-        | AggregateFn::Max(column) => match column {
-            AggregateColumn::C1 => c1,
-            AggregateColumn::C2 => c2,
-        },
-        AggregateFn::BoolAnd | AggregateFn::BoolOr => bool_col.unwrap_or_else(|| {
-            panic!(
-                "aggregate_field_def: {} needs the source table's Boolean column, and this \
-                 table has none — a generator bug",
-                func.name()
-            )
-        }),
+        AggregateFn::Sum(column) | AggregateFn::Avg(column) | AggregateFn::CountColumn(column) => {
+            match column {
+                AggregateColumn::C1 => c1,
+                AggregateColumn::C2 => c2,
+            }
+        }
         AggregateFn::Count => {
             return FieldDef {
                 name: "cnt".to_string(),
@@ -2923,8 +2885,8 @@ pub fn build_bulk_insert_program(row_count: usize) -> Program {
                 name: grain.clone(),
                 expr: Expr::Column(grain),
             },
-            aggregate_field_def(AggregateFn::Sum(AggregateColumn::C1), &c1, &c2, None),
-            aggregate_field_def(AggregateFn::Count, &c1, &c2, None),
+            aggregate_field_def(AggregateFn::Sum(AggregateColumn::C1), &c1, &c2),
+            aggregate_field_def(AggregateFn::Count, &c1, &c2),
         ],
         predicate: Predicate::True,
         without_source_index: false,
@@ -3523,7 +3485,7 @@ mod strategy {
     }
 
     /// Which of a source table's two aggregated columns (`c1`/`c2`) a drawn
-    /// `SUM`/`AVG`/`MIN`/`MAX` field aggregates over (task B4).
+    /// `SUM`/`AVG`/`COUNT(<col>)` field aggregates over (task B4).
     fn aggregate_column() -> impl Strategy<Value = AggregateColumn> {
         prop_oneof![Just(AggregateColumn::C1), Just(AggregateColumn::C2),]
     }
@@ -3533,69 +3495,53 @@ mod strategy {
     /// `proptest::sample::subsequence` (which needs a concrete, `Clone`
     /// element type to draw an order-preserving, duplicate-free subset from)
     /// has something to draw over; [`aggregate_functions`] then pairs each
-    /// drawn numeric kind with an independently-drawn column.
+    /// drawn kind that takes a column with an independently-drawn column.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum FnKind {
         Sum,
         Count,
+        CountColumn,
         Avg,
-        Min,
-        Max,
-        BoolAnd,
-        BoolOr,
     }
 
-    const ALL_FN_KINDS: [FnKind; 7] = [
-        FnKind::Sum,
-        FnKind::Count,
-        FnKind::Avg,
-        FnKind::Min,
-        FnKind::Max,
-        FnKind::BoolAnd,
-        FnKind::BoolOr,
-    ];
+    const ALL_FN_KINDS: [FnKind; 4] =
+        [FnKind::Sum, FnKind::Count, FnKind::CountColumn, FnKind::Avg];
 
-    /// A drawn `Aggregate` def's non-grouping fields (task B4): 2 to 7 of the
-    /// seven aggregate functions in [`ALL_FN_KINDS`], each drawn at most once
-    /// (`subsequence` never repeats an element), so multiple functions
-    /// genuinely co-occur on the same def without ever needing two fields of
-    /// the same name. Every numeric function's column is drawn independently
-    /// per *function* (not per occurrence, since each function occurs at
-    /// most once anyway), so two different functions landing on the *same*
-    /// column — e.g. `SUM(c1)` and `AVG(c1)` — is a real, reachable draw:
-    /// that's precisely the shape that exercises
-    /// `defs::ddl::count_column_names`'s shared hidden-count-column path (two
-    /// fields aggregating the exact same argument share one partial column)
-    /// from the generative side, not just `trellis/tests/apply_aggregate.rs`'s
-    /// hand-built fixture. `BOOL_AND`/`BOOL_OR` (issue #255) always fold the
-    /// table's `Boolean` column — the only column they type-check against —
-    /// so when both are drawn they share an argument too.
+    /// A drawn `Aggregate` def's non-grouping fields (task B4): 2 to 4 of the
+    /// group basis's admitted functions in [`ALL_FN_KINDS`], each drawn at
+    /// most once (`subsequence` never repeats an element), so multiple
+    /// functions genuinely co-occur on the same def without ever needing two
+    /// fields of the same name. Every function's column is drawn
+    /// independently per *function*, so two different functions landing on
+    /// the *same* column — e.g. `SUM(c1)` and `AVG(c1)` — is a real, reachable
+    /// draw: two fields aggregating the exact same argument share partial
+    /// state on the group basis.
     ///
     /// The lower bound of 2 (not 1) guarantees at least two functions always
-    /// co-occur, per the improvement-plan task's explicit ask ("draw at least
-    /// 2-3 of the five per aggregate def so multiple functions actually
-    /// co-occur"); the upper bound lets every function appear in the same
-    /// def when proptest happens to draw it. Shrinking is `subsequence`'s
-    /// own: it drops functions from the def toward the two-function floor.
+    /// co-occur; the upper bound lets every function appear in the same def.
+    /// Shrinking is `subsequence`'s own: it drops functions from the def
+    /// toward the two-function floor.
     fn aggregate_functions() -> impl Strategy<Value = Vec<AggregateFn>> {
+        functions_from(2)
+    }
+
+    /// `min..=4` distinct admitted functions, each column-taking one paired
+    /// with an independently drawn column.
+    fn functions_from(min: usize) -> impl Strategy<Value = Vec<AggregateFn>> {
         (
-            proptest::sample::subsequence(ALL_FN_KINDS.to_vec(), 2..=ALL_FN_KINDS.len()),
-            aggregate_column(),
+            proptest::sample::subsequence(ALL_FN_KINDS.to_vec(), min..=ALL_FN_KINDS.len()),
             aggregate_column(),
             aggregate_column(),
             aggregate_column(),
         )
-            .prop_map(|(kinds, sum_col, avg_col, min_col, max_col)| {
+            .prop_map(|(kinds, sum_col, count_col, avg_col)| {
                 kinds
                     .into_iter()
                     .map(|kind| match kind {
                         FnKind::Sum => AggregateFn::Sum(sum_col),
                         FnKind::Count => AggregateFn::Count,
+                        FnKind::CountColumn => AggregateFn::CountColumn(count_col),
                         FnKind::Avg => AggregateFn::Avg(avg_col),
-                        FnKind::Min => AggregateFn::Min(min_col),
-                        FnKind::Max => AggregateFn::Max(max_col),
-                        FnKind::BoolAnd => AggregateFn::BoolAnd,
-                        FnKind::BoolOr => AggregateFn::BoolOr,
                     })
                     .collect()
             })
@@ -3923,7 +3869,7 @@ mod strategy {
     /// unconditionally — see its own doc comment for issue #128, the engine
     /// bug that used to force a scope cut here), nor does it affect
     /// [`Mutate::DuplicateInsert`], [`def_shape`] (which of a def's fields
-    /// are `SUM`/`COUNT`/`AVG`/`MIN`/`MAX`/`BOOL_AND`/`BOOL_OR` over), or
+    /// are `SUM`/`COUNT`/`AVG` over), or
     /// [`DerivedShape`] (every `OneToOne` def always gets one `derived`
     /// field) — all distinct, structural widenings, always available
     /// regardless of the flag.
@@ -4658,28 +4604,11 @@ mod strategy {
             })
     }
 
-    /// The fields of [`mid_burst_case`]'s mid-burst install: half the time
-    /// any of [`aggregate_functions`], and half the time only `SUM`, `AVG`
-    /// and `COUNT` of plain columns, the shape the Re-derive build takes
-    /// (#625 F3). Few draws of the first kind are invertible-only, so
-    /// without the second the build (and its plants) would run in few cases.
+    /// The fields of [`mid_burst_case`]'s mid-burst install: 1 to 4 of the
+    /// admitted functions. Unlike [`aggregate_functions`], a single-function
+    /// install is reachable.
     fn install_functions() -> impl Strategy<Value = Vec<AggregateFn>> {
-        let invertible = (
-            proptest::sample::subsequence(vec![FnKind::Sum, FnKind::Count, FnKind::Avg], 1..=3),
-            aggregate_column(),
-            aggregate_column(),
-        )
-            .prop_map(|(kinds, sum_col, avg_col)| {
-                kinds
-                    .into_iter()
-                    .map(|kind| match kind {
-                        FnKind::Sum => AggregateFn::Sum(sum_col),
-                        FnKind::Avg => AggregateFn::Avg(avg_col),
-                        _ => AggregateFn::Count,
-                    })
-                    .collect::<Vec<_>>()
-            });
-        prop_oneof![1 => aggregate_functions(), 1 => invertible]
+        functions_from(1)
     }
 
     fn hot_key_case_with(
@@ -5490,10 +5419,10 @@ mod tests {
         }
     }
 
-    /// Issue #255: `BOOL_AND`/`BOOL_OR` fold the source table's `Boolean`
-    /// column, each under its own field name.
+    /// `COUNT(<col>)` counts its column under a column-specific name, so it
+    /// never collides with `COUNT(*)`'s `cnt` when both are drawn.
     #[test]
-    fn bool_aggregates_fold_the_boolean_column() {
+    fn count_of_a_column_is_named_apart_from_count_star() {
         let program = build_program_multi_with_shapes(
             &[TableSpec::numeric_only(
                 vec![(Some(1), Some(2))],
@@ -5502,11 +5431,14 @@ mod tests {
             &[(
                 0,
                 DefShape::Aggregate {
-                    functions: vec![AggregateFn::BoolAnd, AggregateFn::BoolOr],
+                    functions: vec![
+                        AggregateFn::Count,
+                        AggregateFn::CountColumn(AggregateColumn::C2),
+                    ],
                 },
             )],
         );
-        let bool_col = program.tables[0].columns[4].name.clone();
+        let c2 = program.tables[0].columns[2].name.clone();
         let calls: Vec<(String, String, Vec<Expr>)> = program.defs[0].fields[1..]
             .iter()
             .map(|field| match &field.expr {
@@ -5519,15 +5451,11 @@ mod tests {
         assert_eq!(
             calls,
             vec![
+                ("cnt".to_string(), "COUNT".to_string(), Vec::new()),
                 (
-                    format!("bool_and_{bool_col}"),
-                    "BOOL_AND".to_string(),
-                    vec![Expr::Column(bool_col.clone())]
-                ),
-                (
-                    format!("bool_or_{bool_col}"),
-                    "BOOL_OR".to_string(),
-                    vec![Expr::Column(bool_col.clone())]
+                    format!("count_{c2}"),
+                    "COUNT".to_string(),
+                    vec![Expr::Column(c2.clone())]
                 ),
             ]
         );
