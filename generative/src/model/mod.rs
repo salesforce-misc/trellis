@@ -357,18 +357,6 @@ impl Op {
             Op::Leaf { op, .. } => op.table(),
         }
     }
-
-    /// Whether this op changes the rows of a partitioned table without a
-    /// write its capture sees (ADR-0017), so its effect reaches a target only
-    /// through the correction a reconcile pass queues: partition DDL, or a
-    /// `TRUNCATE` naming a leaf.
-    pub fn is_partition_maintenance(&self) -> bool {
-        match self {
-            Op::Partition { .. } => true,
-            Op::Leaf { op, .. } => matches!(**op, Op::Truncate { .. }),
-            _ => false,
-        }
-    }
 }
 
 /// A generated program: a schema, the transform definitions over it, and a

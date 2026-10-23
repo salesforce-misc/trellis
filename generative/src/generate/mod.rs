@@ -4077,7 +4077,8 @@ mod strategy {
             Just(MaintenanceKind::Attach),
             Just(MaintenanceKind::Drop),
             Just(MaintenanceKind::TruncateLeaf),
-            (0u8..=3, any::<bool>())
+            // An empty new leaf as often as a written one.
+            (prop_oneof![Just(0u8), 1u8..=3], any::<bool>())
                 .prop_map(|(rows, standalone)| MaintenanceKind::Create { rows, standalone }),
         ];
         prop_oneof![

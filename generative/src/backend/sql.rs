@@ -905,6 +905,12 @@ async fn unsettled_definitions(
 /// `live` throughout the first part (until the pass sees the DDL) and the
 /// queued part of the second (until the pass schedules the correction), so
 /// definition status alone can't show either.
+///
+/// It reads the engine's recorded tree as `capture::partitions` writes it
+/// (`nodes.nodes[]`, each `oid` and `inherits_xmin` as `xmin::text`). A
+/// change to that format leaves every source unsettled, so a quiesce times
+/// out naming it (`partition_maintenance_converges_end_to_end` fails); it
+/// can't make one look settled early.
 async fn unsettled_partitions(
     raw: &tokio_postgres::Client,
 ) -> Result<Vec<String>, tokio_postgres::Error> {

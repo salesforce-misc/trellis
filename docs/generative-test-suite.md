@@ -252,7 +252,8 @@ unblocks it.
   drawn. On top of its seeds and mutates, the partitioned table draws
   partition maintenance (a leaf detached, also `CONCURRENTLY`, attached
   again with its rows, dropped or truncated, and a new leaf created empty,
-  written directly, or built outside the tree and attached with rows),
+  written directly, or built outside the tree and attached with rows, in
+  place of a dropped leaf when every bound is held),
   partition-key updates that move a row to another partition (or are
   refused, to a value no leaf holds), and writes named on a leaf, or on a
   detached table, instead of the root. Each op's expected outcome comes from
@@ -261,10 +262,11 @@ unblocks it.
   rows forbid is expected to succeed or fail as Postgres decides. Every
   check waits for the reconcile pass to record the tree and for every
   correction it queued to finish, so the oracle compares only settled
-  states, after each op serially and after each burst concurrently; a burst
-  holds at most one maintenance op, so a leaf is never created and removed
-  between two passes (the short-lived-leaf gap in
-  [known correctness gaps](known-correctness-gaps.md#a-short-lived-leaf-beside-a-default-partition)).
+  states, after each op serially and after each burst concurrently. A burst
+  may change the tree several times, so one pass sees them all, except that
+  over a source that may have a `DEFAULT` it never both brings a leaf in
+  (created or attached) and removes it: that is the short-lived-leaf gap in
+  [known correctness gaps](known-correctness-gaps.md#a-short-lived-leaf-beside-a-default-partition).
   The `partition_ops` line counts each kind drawn. The hot-key tier has no
   partitioned variant yet
   ([#1331](https://github.com/salesforce-misc/trellis/issues/1331)).

@@ -58,7 +58,8 @@ pub enum MaintenanceKind {
     TruncateLeaf,
     /// A new leaf for a bound no leaf holds, with `rows` rows written into
     /// it directly; when `standalone`, created outside the tree and
-    /// attached with them.
+    /// attached with them. When every bound is held, a leaf is dropped
+    /// first and the new one takes its bound.
     Create { rows: u8, standalone: bool },
 }
 
@@ -581,6 +582,15 @@ pub fn add_partition_maintenance(
         for draw in draws {
             match *draw {
                 PartitionDraw::Maintenance { at, pick, kind } if at % slots == index => {
+                    // A new leaf needs a bound no leaf holds: with none free,
+                    // it replaces a leaf, dropped first.
+                    if matches!(kind, MaintenanceKind::Create { .. })
+                        && (0..sim.layout.slots()).all(|s| sim.occupant(s).is_some())
+                        && let Some(op) =
+                            maintenance_op(&mut sim, &spec, pick, MaintenanceKind::Drop)
+                    {
+                        emit(&mut sim, op, &mut out);
+                    }
                     if let Some(op) = maintenance_op(&mut sim, &spec, pick, kind) {
                         emit(&mut sim, op, &mut out);
                     }

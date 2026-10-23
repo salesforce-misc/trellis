@@ -70,8 +70,8 @@ while every rule holds.
 * **On a partitioned source, change a partition key with `UPDATE`** (or
   `DELETE` and `INSERT`), not `MERGE`; rename or re-parent the source only
   while its transforms are paused; and let a reconcile pass run between
-  creating a leaf beside a `DEFAULT` partition and removing it, and between
-  partition maintenance and a `pg_upgrade`
+  creating or attaching a leaf beside a `DEFAULT` partition and removing it,
+  and between partition maintenance and a `pg_upgrade`
   ([below](#a-merge-that-moves-a-row-to-another-partition)).
 * **Repair after DDL that rewrites a read column's values** in one of the
   shapes [listed below](#a-columns-values-rewritten-in-place-by-alter-column-type).
@@ -278,10 +278,10 @@ its transforms are paused.
 
 ### A short-lived leaf beside a `DEFAULT` partition
 
-**When:** a leaf is created beside a `DEFAULT` partition, written through the
-parent, and dropped or detached before the next reconcile pass. A leaf still
-there at a pass is recorded, and without a `DEFAULT` beside it each pass's
-sweep finds the rows it leaves behind.
+**When:** a leaf is created or attached beside a `DEFAULT` partition, written
+through the parent, and dropped or detached before the next reconcile pass. A
+leaf still there at a pass is recorded, and without a `DEFAULT` beside it each
+pass's sweep finds the rows it leaves behind.
 
 **What goes wrong:** the removed rows stay counted in their groups. The
 `DEFAULT` takes every row its siblings don't, so no group routes to no
