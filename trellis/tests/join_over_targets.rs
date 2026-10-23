@@ -309,6 +309,64 @@ async fn a_join_defined_while_an_upstream_writer_is_in_flight_does_not_miss_its_
     }
 }
 
+/// As [`a_join_defined_while_an_upstream_writer_is_in_flight_does_not_miss_its_write`],
+/// for a `JOIN` whose `FROM` side is a captured table and whose joined table
+/// alone is a target: the plan waits on the seam fence for the joined table
+/// too.
+#[tokio::test]
+async fn a_join_whose_joined_table_alone_is_a_target_waits_for_an_upstream_writer() {
+    const JC: &str = "TRANSFORM jc FROM public.fa LEFT JOIN public.b1 ON fa.k = b1.k \
+                      GROUP BY fa.g, b1.gb WITHOUT SOURCE INDEX \
+                      SELECT fa.g AS g, b1.gb AS gb, COUNT(*) AS n, SUM(b1.ys) AS sy";
+    const JC_ACTUAL: &str = "select g, gb, n, sy from public.jc order by g, gb";
+    const JC_ORACLE: &str = "select a.g, b.gb, count(*), sum(b.ys) from public.fa a \
+                             left join (select k, gb, sum(y) as ys from public.db \
+                                        group by k, gb) b on a.k = b.k \
+                             group by a.g, b.gb order by a.g, b.gb";
+    let mut d = upstreams().await;
+    step(
+        &mut d,
+        "insert into public.fa values (9, 2, 10, 1); insert into public.db values (9, 10, 2, 1)",
+    )
+    .await;
+    write(&d, "insert into public.db values (1, 10, 1, 5)").await;
+    let batch = d.seal().await;
+    let mut page = d
+        .drain_frozen(batch, "writer", &[(PausePoint::BeforeCommit, "public.b1")])
+        .await;
+    page.reached(PausePoint::BeforeCommit).await;
+
+    let columns: HashMap<String, ValueType> =
+        [("id", int4()), ("g", int4()), ("k", int4()), ("v", int4())]
+            .into_iter()
+            .map(|(name, ty)| (name.to_string(), ty))
+            .collect();
+    trellis::defs::install_definition(d.pool(), JC, &columns, "public")
+        .await
+        .expect("define the JOIN");
+    trellis::intake::markers::discharge_registrations(d.pool())
+        .await
+        .expect("start the JOIN's build");
+    assert!(run_plan(&d).await, "a plan job to claim");
+    assert_eq!(
+        d.rows("select done, fence_xid is not null from backfill_chunks where kind = 'plan'")
+            .await,
+        ["(f,t)"],
+        "the plan defers on its fence"
+    );
+
+    d.release(&mut page, PausePoint::BeforeCommit).await;
+    page.finish().await;
+    d.ctl
+        .batch_execute("update backfill_chunks set next_attempt_at = null")
+        .await
+        .expect("skip the plan's backoff");
+    assert!(run_plan(&d).await, "the plan job again");
+    assert_eq!(statuses(&d).await, ["(a1,live)", "(b1,live)", "(jc,live)"]);
+    d.settle().await;
+    assert_eq!(d.rows(JC_ACTUAL).await, d.rows(JC_ORACLE).await);
+}
+
 /// A rebuild in place of either upstream (`request_backfill` of its source)
 /// writes through the seam, so it reaches the `JOIN` as images, folding in
 /// changes its snapshot saw before they drained, and the `JOIN` is not
@@ -370,10 +428,17 @@ async fn an_upstream_resume_reaches_the_join() {
             ))
             .await
             .expect("pause the upstream");
+        // Rows deleted while the upstream is paused leave its target only
+        // through its rebuild, and the `JOIN` must follow.
+        let (fa_gone, db_gone) = if upstream == "a1" { (2, 3) } else { (5, 2) };
         step(
             &mut d,
-            "update public.fa set g = coalesce(g, 0) + 1 where id in (1, 4); \
-             update public.db set y = y + 1 where id in (1, 6)",
+            &format!(
+                "update public.fa set g = coalesce(g, 0) + 1 where id in (1, 4); \
+                 update public.db set y = y + 1 where id in (1, 6); \
+                 delete from public.fa where id = {fa_gone}; \
+                 delete from public.db where id = {db_gone}"
+            ),
         )
         .await;
         trellis::staging::quarantine::resume_transform(d.pool(), upstream)
@@ -445,7 +510,13 @@ async fn an_upstream_paused_for_a_capture_failure_is_repaired_by_its_resume() {
         ["(paused,t)"],
         "the upstream pauses for the disruption"
     );
-    step(&mut d, "update public.fa set k = 20 where id = 3").await;
+    // A row deleted while uncaptured: only the upstream's rebuild removes
+    // it from its target, and the `JOIN` must follow that delete.
+    step(
+        &mut d,
+        "update public.fa set k = 20 where id = 3; delete from public.fa where id = 2",
+    )
+    .await;
     step(&mut d, "insert into public.db values (9, 20, 1, 9)").await;
     assert_eq!(
         d.rows("select status::text from transform_definitions where target_table = 'public.j'")

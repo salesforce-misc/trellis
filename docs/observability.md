@@ -520,9 +520,10 @@ checks that the snapshot's `xmin` is past the fence), except the Re-derive build
 plain aggregate or a plain 1-1 transform: it starts with no fence, and each
 of its chunks reads under its own short snapshot after locking the ledger
 entries it rewrites, so a long transaction elsewhere doesn't hold it, and it holds no
-long snapshot of its own. The one exception is a Re-derive build whose source is
-another transform's target, which takes one fence, after it starts, before its
-first chunk: a transaction that held a transaction id then (one that had
+long snapshot of its own. The one exception is a build that reads another
+transform's target (its source, or a `JOIN`'s joined table), which takes one
+fence, after it starts, before its first chunk or its one-transaction build: a
+transaction that held a transaction id then (one that had
 written or locked a row) holds it, and `status().build_wait` names the fence
 (`BuildWait::Fence { xid }`, a `backend_xid` at or below it in
 `pg_stat_activity`) until every such transaction has ended
