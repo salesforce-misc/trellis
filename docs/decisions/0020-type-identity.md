@@ -153,7 +153,7 @@ afterwards. A pause driven by that comparison must first be shown not to fire on
 routine maintenance and migrations, and must not need superuser. This ADR adds
 no such detector.
 
-## A 1-1 copy holds the source's text; an aggregate or `JOIN` target an equal value
+## A 1-1 copy holds the source's text
 
 A type's `=` can be coarser than its text: `numeric` `1.25` and `1.2500`,
 `interval` `'1 day'` and `'24 hours'`, float `-0` and `0`, and strings that differ
@@ -168,10 +168,9 @@ target answer "is this row right?" differently.
   collation, and the comparison with it. It needs only an output function, so
   it also works for `json` and `xml`, which have no `=`. The cost is a text
   cast of both rows on the update path.
-- **An aggregate or `JOIN` target holds an equal value** under the column
-  type's `=`, as Postgres's own `GROUP BY` and `min()` do. A group is the set of
-  rows whose key values are equal, and two renderings of one group are not two
-  groups.
+- **An aggregate or `JOIN` target holds an equal value**, as the section
+  above says: a group is the set of rows whose key values are equal, and two
+  renderings of one group are not two groups.
 
 ## Columns pair by type and collation; modifiers never count
 
