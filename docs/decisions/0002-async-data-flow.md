@@ -1,6 +1,6 @@
 ---
-status: draft
-date: 2026-10-17
+status: accepted
+date: 2026-10-23
 deciders: Michael Ries
 ---
 
@@ -733,10 +733,10 @@ the build's first moment.
   On an unpartitioned source that is the whole source; on a partitioned
   source one leaf at a time.
 - **Accepted cost.** On an unpartitioned source the build's lock window,
-  `xmin` hold and ring-retirement stall grow with the source: extrapolated
-  linearly to 1e9 rows, about 13–18 s with parallel aggregation to about 80 s
-  serial. For that window the source's drain waits on the groups the build
-  holds. A partitioned source is bounded per leaf.
+  `xmin` hold and ring-retirement stall grow with the source, unbounded.
+  For that window the source's drain waits on the groups the build holds.
+  A partitioned source is bounded per leaf: in the build-path model the
+  peak `xmin` hold was 0.3–0.5 s per partition for a 100M-row source.
 - **Must:** a rebuild over a target that already has groups recomputes
   every group in place, without pausing the definition. That is
   `request_backfill`, a capture re-install, and the automatic rebuilds
@@ -782,10 +782,10 @@ the build's first moment.
   status reads `backfilling` from the call, or from the pass that starts an
   automatic rebuild, until every structure has committed, then `live`.
   *Cost:* pages of a structure's groups, in practice its source's drain,
-  wait while its statement runs: 1.4–1.9 s at 100M source rows, about
-  15–20 s at 1B (extrapolated), one partition's worth at a time on a
-  partitioned source. No ring segment retires while the statement's
-  transaction is open, so once the ring's slots fill no segment seals and
+  wait while its statement runs. That grows with an unpartitioned source and
+  is one partition's worth at a time on a partitioned one: in the build-path
+  model, one `GROUP BY` per partition built a 100M-row source in 1.4–1.9 s
+  in all. No ring segment retires while the statement's transaction is open, so once the ring's slots fill no segment seals and
   every source's drain waits for the commit too; writers aren't held back,
   and the active segment grows meanwhile. Clearing the target and building
   fresh would show readers an empty, then filling target, and a shadow
