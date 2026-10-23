@@ -660,7 +660,7 @@ impl fmt::Display for CatalogError {
             } => write!(
                 f,
                 "the primary key of {source_table} is now ({}), but this definition's target \
-                 is keyed by ({}). Restore the key, or drop the definition and define it again",
+                 is keyed by ({}). Restore the key, or `DROP TRANSFORM` and define it again",
                 source_key.join(", "),
                 target_key.join(", ")
             ),

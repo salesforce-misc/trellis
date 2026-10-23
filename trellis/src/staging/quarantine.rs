@@ -4618,6 +4618,10 @@ async fn complete_resume(
         &[&TransformStatus::WaitingToBackfill.as_str(), &id],
     )
     .await?;
+    // #1324: whether the source's key is still the one the definition's
+    // stored keys are keyed under, read before `record_definition` below
+    // records the key it has now.
+    let key_changed = source_key_changed(txn, id, source_table).await?;
     // #708, #767: the rebuild casts each source value through its live type,
     // and the capture pass compares the key columns against what it builds
     // from.
@@ -4700,6 +4704,18 @@ async fn complete_resume(
         &[&id],
     )
     .await?;
+
+    // #1324: a ledger keyed under a key the source no longer has (it was
+    // dropped and created again with another, or its key constraint was
+    // replaced) names no row of the table now at the name. Its entries are
+    // retired rather than kept for the rebuild, which would decode them
+    // against the new key. After the wait above, so no chunk of the old
+    // build is still writing them. A 1-1 target in that case was refused
+    // (`catalog::revalidate`), and the group basis and a `JOIN` recreate
+    // what they keep, below and above.
+    if key_changed {
+        super::build::retire_ledger(txn, definition).await?;
+    }
 
     // #1101: a group-basis aggregate's partials are fully derived, so the
     // resume drops and recreates them at the shape define would give them
@@ -4944,6 +4960,33 @@ async fn reset_ordering_state(
     )
     .await?;
     Ok(())
+}
+
+/// Whether definition `id`'s `source` no longer has the key its stored keys
+/// are keyed under (#1324): the key columns, in key order, recorded at define
+/// or at its last resume (`transform_definitions.source_key`), against the
+/// source's now. `false` when none is recorded.
+async fn source_key_changed(
+    txn: &Transaction<'_>,
+    id: i64,
+    source: &str,
+) -> Result<bool, ApplyError> {
+    let recorded: Option<Vec<String>> = txn
+        .query_one(
+            "select source_key from transform_definitions where id = $1",
+            &[&id],
+        )
+        .await?
+        .get(0);
+    let Some(recorded) = recorded else {
+        return Ok(false);
+    };
+    let live: Vec<String> = ddl::identity_key_columns(txn, source)
+        .await?
+        .into_iter()
+        .map(|c| c.name)
+        .collect();
+    Ok(recorded != live)
 }
 
 /// How long the staging worker waits for the lock on a table whose copies

@@ -1179,6 +1179,48 @@ fn buildable_shape(definition: &Definition) -> Option<ledger::LedgerShape> {
     shape_of(&definition.def, &definition.source_columns)
 }
 
+/// Retires every live entry of `definition`'s ledger, in a resume's `txn`
+/// (#1324): each becomes a tombstone, read as a key with no row
+/// ([`ledger::retire_statement`]), and its group sheds it through the group
+/// deltas. For a resume whose source's key is no longer the one the ledger is
+/// keyed under (`transform_definitions.source_key`): the entries' keys name
+/// rows of a key the table now at the name doesn't have, so no build may
+/// decode them against its key. The rebuild then re-derives every row the
+/// table has, over a ledger with no live entry, and its merger retracts the
+/// old groups as it adds the new ones. Nothing for a definition the
+/// Re-derive build doesn't take; the group basis and a `JOIN` keep no
+/// ledger.
+///
+/// `definition` is as the definition was paused, its `source_columns` the
+/// ones the ledger was made from. The definition is frozen: no page writes
+/// its entries, and the resume has waited out every chunk still writing
+/// them.
+pub(crate) async fn retire_ledger(
+    txn: &Transaction<'_>,
+    definition: &Definition,
+) -> Result<(), ApplyError> {
+    let Some(shape) = buildable_shape(definition) else {
+        return Ok(());
+    };
+    let pk = ddl::source_primary_key_in_txn(txn, &definition.source_table).await?;
+    let identity = ddl::identity_key_columns(txn, &definition.target_table).await?;
+    let plan = LedgerTargetPlan::new(
+        &definition.target_table,
+        &definition.source_table,
+        pk,
+        identity,
+        shape,
+    );
+    let row = ledger::query_one_by_entry_key(txn, &ledger::retire_statement(&plan), &[]).await?;
+    crate::instance_log::info!(
+        target = %definition.target_table,
+        retired = row.get::<_, i64>(0),
+        "the source's key changed while the definition was paused; its ledger entries \
+         are retired and the rebuild re-derives every row"
+    );
+    Ok(())
+}
+
 /// Whether the partition correction engine
 /// (`super::partition_correction`) can re-derive the keys of `definition`
 /// when a node of its partitioned source is added: an aggregate on the group

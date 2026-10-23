@@ -790,7 +790,8 @@ pub(crate) async fn record_enum_values(
 
 /// Records the live type of every key column definition `id` uses
 /// ([`key_uses`]): on its qualified `source`, keyed by the source's
-/// row-identity key, on a JOIN's qualified `joined` table, keyed by its own,
+/// row-identity key (whose columns, in key order, it records as the
+/// definition's `source_key`, #1324), on a JOIN's qualified `joined` table, keyed by its own,
 /// and on the to-side of each relationship in `rels`, keyed by that table's;
 /// then the OID of every type the definition names ([`record_types`]), so
 /// its `source_columns` and `join_columns` must already be written.
@@ -821,6 +822,17 @@ pub(crate) async fn record_definition(
             .into_iter()
             .map(|c| c.name)
             .collect();
+        if table == source {
+            // #1324: the key its ledger entries are keyed under, in key
+            // order, which a resume compares with the source's key then
+            // (`staging::quarantine`'s `complete_resume`).
+            client
+                .execute(
+                    "update transform_definitions set source_key = $2 where id = $1",
+                    &[&id, &key],
+                )
+                .await?;
+        }
         for (column, _) in key_uses(def, source, rels, table, &key) {
             let entry = (table.to_string(), column);
             if !columns.contains(&entry) {

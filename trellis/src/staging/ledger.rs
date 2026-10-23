@@ -1494,6 +1494,32 @@ pub(super) fn sweep_statement(plan: &LedgerTargetPlan, nulls: &[bool]) -> String
     )
 }
 
+/// The statement that retires every live entry of the ledger (#1324;
+/// called from [`super::build::retire_ledger`]): [`sweep_statement`] for
+/// every key whose entry is live, each read as a key with no row, never
+/// decoded against the source's key. Each entry becomes a tombstone and its
+/// group sheds it through the group deltas, as a key deleted while the
+/// definition was frozen does. For a ledger keyed under a key the source no
+/// longer has, whose keys name no row of the table now at the name. Binds
+/// nothing.
+pub(super) fn retire_statement(plan: &LedgerTargetPlan) -> String {
+    let live = format!(
+        "array(select {key} from {ledger} where {member} and not {tombstone})",
+        key = quote_ident(schema::KEY_COLUMN),
+        ledger = plan.ledger_ident,
+        member = quote_ident(schema::MEMBER_COLUMN),
+        tombstone = quote_ident(schema::TOMBSTONE_COLUMN),
+    );
+    rederive_statement(
+        plan,
+        SourceRead::Probed {
+            keys_from: format!("unnest({live}) as u(__k)"),
+            on: "false".to_string(),
+        },
+        &live,
+    )
+}
+
 /// How a Re-derive's read ([`rederive_read_ctes`]) reaches its keys' source
 /// rows.
 enum SourceRead<'a> {

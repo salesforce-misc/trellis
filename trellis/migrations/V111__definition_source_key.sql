@@ -1,0 +1,12 @@
+-- #1324: the source's row-identity key columns, in key order, that a
+-- definition's ledger entries are keyed under. A resume keeps an aggregate's
+-- ledger and rebuilds over it (ADR-0002), which is right only while the
+-- source still has that key. A source dropped and created again with
+-- another key (a plain table converted to a partitioned one, whose key must
+-- hold the partition key, say), or whose key constraint was replaced, has
+-- none of the old keys: the resume that finds the key changed retires every
+-- entry as a key with no row, and the rebuild reads the table now at the
+-- name (`staging::build::retire_ledger`).
+--
+-- Written at define and at `RESUME` (`defs::key_types::record_definition`).
+alter table transform_definitions add column source_key text[];

@@ -1264,7 +1264,7 @@ async fn resume_refuses_a_redefined_source_key() {
     assert!(
         refused.contains("primary key of public.items is now (name)")
             && refused.contains("keyed by (id)")
-            && refused.contains("drop the definition and define it again"),
+            && refused.contains("`DROP TRANSFORM` and define it again"),
         "{refused}"
     );
     // Define would accept this definition: only a resume refuses it (#967).
