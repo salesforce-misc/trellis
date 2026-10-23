@@ -18,7 +18,8 @@ use trellis::dev::defs::registry;
 
 use crate::backend::{DrainAudit, SPLIT_THRESHOLD_ROWS};
 use crate::model::{
-    BurstAction, Cardinality, ConcurrentPlan, Op, OpOutcome, Program, Relationship,
+    BurstAction, Cardinality, ConcurrentPlan, Op, OpOutcome, PartitionStrategy, Program,
+    Relationship,
 };
 
 /// Per-run coverage tallies over any number of [`Program`]s. Every field is
@@ -133,6 +134,11 @@ pub struct Coverage {
     /// [`crate::generate::bulk_insert_program`], not just that a small one
     /// occasionally shows up.
     pub max_bulk_insert_rows: usize,
+    /// How many partitioned source tables (ADR-0017) the recorded programs
+    /// drew, by [`PartitionStrategy`]: `"hash"`, `"list"` (a leaf per
+    /// value), `"list_default"` (fewer leaves and a `DEFAULT`) and
+    /// `"range"`. Zero everywhere means no case read a partitioned source.
+    pub partition_strategies: HashMap<&'static str, usize>,
     /// Bursts recorded by [`Coverage::record_concurrent_plan`] (issue #557).
     pub concurrent_bursts: usize,
     /// How many recorded concurrent-tier cases contain at least one burst of
@@ -189,6 +195,12 @@ impl Coverage {
             for column in &table.columns {
                 self.types_exercised
                     .insert(value_type_name(column.value_type));
+            }
+            if let Some(partitioning) = &table.partitioning {
+                *self
+                    .partition_strategies
+                    .entry(partition_strategy_name(partitioning.strategy))
+                    .or_insert(0) += 1;
             }
         }
 
@@ -1046,6 +1058,16 @@ fn value_type_name(value_type: ValueType) -> &'static str {
     }
 }
 
+/// The [`Coverage::partition_strategies`] name of `strategy`.
+fn partition_strategy_name(strategy: PartitionStrategy) -> &'static str {
+    match strategy {
+        PartitionStrategy::Hash { .. } => "hash",
+        PartitionStrategy::List { default: false, .. } => "list",
+        PartitionStrategy::List { default: true, .. } => "list_default",
+        PartitionStrategy::Range { .. } => "range",
+    }
+}
+
 fn cardinality_name(cardinality: Cardinality) -> &'static str {
     match cardinality {
         Cardinality::ToOne => "to_one",
@@ -1143,6 +1165,11 @@ impl fmt::Display for Coverage {
         writeln!(f, "client_restarts: {}", self.client_restarts)?;
         writeln!(f, "client_scale_outs: {}", self.client_scale_outs)?;
         writeln!(f, "max_bulk_insert_rows: {}", self.max_bulk_insert_rows)?;
+        write!(f, "partition_strategies:")?;
+        for (name, count) in sorted_counts(&self.partition_strategies) {
+            write!(f, " {name}={count}")?;
+        }
+        writeln!(f)?;
 
         writeln!(f, "relationships_declared: {}", self.relationships_declared)?;
         write!(f, "relationship_cardinalities:")?;

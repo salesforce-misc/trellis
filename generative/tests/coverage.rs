@@ -10,12 +10,12 @@ use std::collections::HashSet;
 
 use generative::generate::{
     Mutate, build_program, bulk_insert_program, checkpoint_plan_for, concurrent_plan,
-    cooling_key_case, hot_key_case, mid_burst_case, noise_plan_for, program_with_client_restart,
-    program_with_mid_stream_def_install, program_with_scale_out, table_streams, trivial_program,
-    trivial_program_with,
+    cooling_key_case, hot_key_case, mid_burst_case, noise_plan_for, partitioned_program,
+    program_with_client_restart, program_with_mid_stream_def_install, program_with_scale_out,
+    table_streams, trivial_program, trivial_program_with,
 };
 use generative::model::{NoiseAction, NoiseEventKind, Op, Program, Table};
-use generative::run::{ConcurrentShape, RelPath};
+use generative::run::{ConcurrentShape, Coverage, RelPath};
 use proptest::strategy::{Strategy, ValueTree};
 use proptest::test_runner::{Config, RngAlgorithm, TestCaseError, TestError, TestRng, TestRunner};
 use trellis::dev::defs::ast::{Expr, KeySpace, Operator, ValueType};
@@ -1673,4 +1673,43 @@ fn the_cooling_key_tier_draws_cooling_keys_and_every_hot_key_shape() {
         SAMPLES,
         "every cooling_key_case has cooling keys: {after}"
     );
+}
+
+/// ADR-0017: every `partitioned_program` case reads a partitioned source (its
+/// first table, through at least one definition), and 500 samples draw every
+/// partitioning strategy, so the partitioned properties can't pass vacuously
+/// over plain tables.
+#[test]
+fn partitioned_program_always_reads_a_partitioned_source_and_draws_every_strategy() {
+    let mut runner = TestRunner::default();
+    let strategy = partitioned_program();
+    let mut coverage = Coverage::new();
+    for _ in 0..500 {
+        let program = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        let partitioned: Vec<&Table> = program
+            .tables
+            .iter()
+            .filter(|t| t.partitioning.is_some())
+            .collect();
+        assert_eq!(partitioned.len(), 1, "{program:?}");
+        assert!(
+            program.defs.iter().any(|d| d.source == partitioned[0].name),
+            "no definition reads the partitioned source: {program:?}"
+        );
+        coverage.record_program(&program);
+    }
+    for name in ["hash", "list", "list_default", "range"] {
+        assert!(
+            coverage
+                .partition_strategies
+                .get(name)
+                .copied()
+                .unwrap_or(0)
+                > 0,
+            "no {name} partitioning across 500 samples:\n{coverage}"
+        );
+    }
 }
