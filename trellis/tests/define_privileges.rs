@@ -86,14 +86,23 @@ async fn set_up(cluster: &TestCluster) -> (testkit::TestDatabase, Client, trelli
 
 /// `statement` is refused with #933's message: it names `table`, says what
 /// the role lacks (`lacks`), and points at the doc section that lists the
-/// grants.
+/// grants. A `RELATIONSHIP` goes through the dev door's `create_relationship`, the
+/// only way left to declare one.
 async fn assert_refused(trellis: &Trellis, statement: &str, table: &str, lacks: &str) {
-    let err = trellis
-        .apply(statement)
-        .await
-        .err()
-        .unwrap_or_else(|| panic!("{statement}: accepted"));
-    let message = err.to_string();
+    let (message, code) = if statement.starts_with("RELATIONSHIP") {
+        let err = trellis::dev::defs::create_relationship(trellis.pool(), statement)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{statement}: accepted"));
+        (err.to_string(), err.code())
+    } else {
+        let err = trellis
+            .apply(statement)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{statement}: accepted"));
+        (err.to_string(), err.code())
+    };
     for wanted in [
         format!("\"{table}\""),
         "role \"trellis\"".to_string(),
@@ -111,7 +120,7 @@ async fn assert_refused(trellis: &Trellis, statement: &str, table: &str, lacks: 
             "{statement}: misleading {misleading:?} in: {message}"
         );
     }
-    assert_eq!(err.code(), ErrorCode::Validation, "{statement}: {message}");
+    assert_eq!(code, ErrorCode::Validation, "{statement}: {message}");
 }
 
 #[tokio::test]

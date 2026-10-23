@@ -212,35 +212,11 @@ module Trellis
     end
   end
 
-  # A relationship a RELATIONSHIP statement registered, as Trellis.apply
-  # reports it (inside an Applied).
-  #
-  # cardinality is :one when to_col is the sole column of a primary key or
-  # unique index on to_table (at most one related row), and :many otherwise.
-  # warnings holds each non-fatal caveat the declaration raised, such as a
-  # missing index on from_col, as its message.
-  Relationship = Data.define(:id, :name, :from_schema, :from_table, :from_col, :to_schema,
-                             :to_table, :to_col, :cardinality, :warnings)
-
-  # A registered relationship, as Trellis.relationships lists it:
-  # Relationship's fields, with the time it was declared (a Time) in place of
-  # its creation-time warnings.
-  RelationshipSummary = Data.define(:id, :name, :from_schema, :from_table, :from_col,
-                                    :to_schema, :to_table, :to_col, :cardinality,
-                                    :created_at) do
-    def self.from_native(hash)
-      new(**hash.except(:created_at_micros),
-          created_at: EpochMicros.to_time(hash.fetch(:created_at_micros)))
-    end
-  end
-
   # What Trellis.apply did. `kind` says which statement form ran, and each
   # other field is set only for the kinds that carry it (nil otherwise):
   #
   # - :transform_defined: a TRANSFORM statement registered the transform
   #   writing `target_table` (fully qualified), at :waiting_to_backfill.
-  # - :relationship_defined: a RELATIONSHIP statement registered
-  #   `relationship` (a Relationship).
   # - :paused: a PAUSE TRANSFORM statement froze its subject, or found it
   #   already frozen.
   # - :resumed: a RESUME TRANSFORM statement unfroze its subject. `columns`
@@ -261,12 +237,9 @@ module Trellis
   #   case Trellis.apply("RESUME TRANSFORM order_totals.total")
   #   in { kind: :resumed, columns: } then puts "resumed #{columns.join(', ')}"
   #   end
-  Applied = Data.define(:kind, :target_table, :relationship, :columns, :added, :dropped,
-                        :altered) do
+  Applied = Data.define(:kind, :target_table, :columns, :added, :dropped, :altered) do
     def self.from_native(hash)
-      relationship = hash[:relationship]
-      new(**hash,
-          relationship: relationship && Relationship.new(**relationship))
+      new(**hash)
     end
   end
 

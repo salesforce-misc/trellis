@@ -2,8 +2,8 @@
 //! data transformations in PostgreSQL.
 //!
 //! [`app::Trellis`] is the embedder's entry point — one facade covering the
-//! whole lifecycle: apply migrations, register relationships and transform
-//! definitions, list them, request backfills, and run the live pipeline
+//! whole lifecycle: apply migrations, register transform definitions, list
+//! them, request backfills, and run the live pipeline
 //! (capture, ring maintenance, and N application workers). It composes
 //! everything below into one interface so callers never stitch the
 //! primitives together themselves; [`client::Client`] is the runtime it
@@ -167,7 +167,7 @@ pub(crate) mod plant;
 pub use app::{
     Applied, BackfillFailure, BuildWait, CaptureFailure, CaptureFailureKind, CaptureWait,
     DefinitionStatus, DefinitionSummary, PoisonEntry, PoisonSample, QuarantineEntry,
-    QuarantineState, QuarantineTarget, RelationshipSummary, Trellis, TrellisError, TrellisOptions,
+    QuarantineState, QuarantineTarget, Trellis, TrellisError, TrellisOptions,
 };
 pub use blocking::{BlockingTrellis, PendingCall, Shutdown};
 pub use client::{Client, ClientError, ClientOptions};
@@ -209,9 +209,7 @@ pub use staging::self_check::SelfCheckError;
 // --- Tier 2: the types tier-1/tier-2 signatures traffic in ----------------
 // Compiler-forced: a `pub fn` on the facade that returns or accepts one of
 // these would otherwise expose an unnameable type.
-pub use defs::{
-    RelationshipCardinality, RelationshipDefinition, RelationshipSide, TransformStatus,
-};
+pub use defs::TransformStatus;
 // `watermark_token`/`await_converged`'s token, so an embedder names it
 // without its own (version-locked) `tokio-postgres` dependency.
 pub use tokio_postgres::types::PgLsn;

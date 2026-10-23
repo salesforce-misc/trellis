@@ -1054,8 +1054,7 @@ impl fmt::Display for ValidationError {
             ValidationError::UnknownGroupByRelationship { rel } => write!(
                 f,
                 "GROUP BY references relationship '{rel}', which is not declared on this \
-                 definition's source table (relationship names are scoped per from-table, \
-                 ADR-0006)"
+                 definition's source table (relationship names are scoped per from-table)"
             ),
             ValidationError::GroupByRelationshipMustBeToOne { rel, column } => write!(
                 f,
@@ -1144,19 +1143,19 @@ impl fmt::Display for ValidationError {
                 f,
                 "calculated field '{field}' references relationship '{rel}', which is not \
                  declared on this definition's source table (relationship names are scoped \
-                 per from-table, ADR-0006)"
+                 per from-table)"
             ),
             ValidationError::RelationshipToOneWrappedInAggregate { field, rel, column } => write!(
                 f,
                 "calculated field '{field}' wraps to-one relationship path '{rel}.{column}' in \
                  an aggregate; a to-one relationship already resolves to a single related value, \
-                 so drop the aggregate and reference '{rel}.{column}' directly (ADR-0006)"
+                 so drop the aggregate and reference '{rel}.{column}' directly"
             ),
             ValidationError::RelationshipToManyRequiresAggregate { field, rel, column } => write!(
                 f,
                 "calculated field '{field}' references to-many relationship path '{rel}.{column}' \
                  bare; a to-many relationship denotes a set of related values, so wrap it in an \
-                 aggregate such as SUM({rel}.{column}) or COUNT({rel}.{column}) (ADR-0006)"
+                 aggregate such as SUM({rel}.{column}) or COUNT({rel}.{column})"
             ),
             ValidationError::RelationshipPathInAggregate { field, rel, column } => write!(
                 f,
@@ -1203,7 +1202,7 @@ impl fmt::Display for ValidationError {
             ValidationError::DuplicateRelationshipName { from_table, name } => write!(
                 f,
                 "relationship '{name}' is already declared on '{from_table}'; relationship \
-                 names must be unique per from-table (ADR-0006), so pick a different name"
+                 names must be unique per from-table, so pick a different name"
             ),
             ValidationError::RelationshipUnsupportedJoinKeyType {
                 name,

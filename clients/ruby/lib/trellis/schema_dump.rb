@@ -9,9 +9,8 @@ module Trellis
   # carry `schema_migrations`: after `pg_dump` writes the schema, the dump
   # appends the `INSERT`s that describe how the schema came to be. A database
   # built from the file (`db:schema:load`, `db:prepare`, the test database
-  # `maintain_test_schema!` loads) then has every transform and relationship
-  # defined, with no Trellis step to run: Trellis's worker finds the
-  # definitions unbuilt and builds them (issue #644, ADR-0010).
+  # `maintain_test_schema!` loads) then has every transform defined, with no
+  # Trellis step to run: Trellis's worker finds the definitions unbuilt and builds them (issue #644, ADR-0010).
   #
   # Needs `config.active_record.schema_format = :sql`: a `schema.rb` can't
   # carry another schema's tables or triggers. With `:ruby`, the dump raises

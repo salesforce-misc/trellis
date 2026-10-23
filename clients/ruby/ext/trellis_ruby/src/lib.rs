@@ -31,8 +31,7 @@
 //! - **Only plain data crosses** (decision 4). The flattening is
 //!   `trellis-embed`'s; this crate turns its plain values into hashes, and
 //!   `lib/trellis/pg.rb` turns those into `Data` objects. Words become symbols
-//!   (statuses, quarantine states, relationship cardinalities, `apply`
-//!   outcome kinds, `self_check` outcomes and divergence kinds), but only
+//!   (statuses, quarantine states, `apply` outcome kinds, `self_check` outcomes and divergence kinds), but only
 //!   words from the closed sets `trellis-embed` lists, which [`init`] interns
 //!   up front, never a string read from the database.
 //! - **Errors cross as `(code, message)`.** Ruby's `Trellis::Error.from_native`
@@ -65,11 +64,10 @@ use trellis_embed::{
     DIVERGENCE_KINDS, ERROR_CODES, PlainApplied, PlainBackfillFailure, PlainCaptureFailure,
     PlainCaptureWait, PlainConfig, PlainCorrectingNode, PlainDefinitionStatus,
     PlainDefinitionSummary, PlainDivergence, PlainDrainFailure, PlainError, PlainHeldKeys,
-    PlainPoisonEntry, PlainQuarantineEntry, PlainRelationship, PlainRelationshipSummary,
-    PlainSamplePage, PlainSelfCheckJob, PlainSelfCheckReport, PlainSourceIndexGap,
-    PlainUnindexedJoin, SELF_CHECK_MODES, SELF_CHECK_OUTCOMES, SELF_CHECK_STATES,
-    capture_failure_kind_names, decode_cursor, decode_watermark, encode_watermark,
-    quarantine_state_names, relationship_cardinality_names, require_transform_statement,
+    PlainPoisonEntry, PlainQuarantineEntry, PlainSamplePage, PlainSelfCheckJob,
+    PlainSelfCheckReport, PlainSourceIndexGap, PlainUnindexedJoin, SELF_CHECK_MODES,
+    SELF_CHECK_OUTCOMES, SELF_CHECK_STATES, capture_failure_kind_names, decode_cursor,
+    decode_watermark, encode_watermark, quarantine_state_names, require_transform_statement,
     self_check_mode, system_time_from_epoch_micros, transform_status_names,
 };
 
@@ -210,8 +208,8 @@ impl Handle {
     }
 
     /// Runs one statement of Trellis's grammar, whatever its form, and
-    /// reports what it did as `{kind:, target_table:, relationship:, columns:,
-    /// added:, dropped:, altered:}`: `kind` is one of [`PlainApplied::KINDS`],
+    /// reports what it did as `{kind:, target_table:, columns:, added:,
+    /// dropped:, altered:}`: `kind` is one of [`PlainApplied::KINDS`],
     /// and each other field is set only for the kinds that carry it (see
     /// [`applied_hash`]).
     fn apply(ruby: &Ruby, rb_self: &Self, text: String) -> Result<RHash, Error> {
@@ -227,18 +225,6 @@ impl Handle {
             .map(PlainDefinitionSummary::from)
             .collect::<Vec<_>>();
         array(ruby, summaries, definition_summary_hash)
-    }
-
-    /// Every registered relationship, oldest first.
-    fn relationships(ruby: &Ruby, rb_self: &Self) -> Result<RArray, Error> {
-        let summaries = rb_self
-            .call(ruby, BlockingTrellis::start_relationships)?
-            .iter()
-            .map(|summary| {
-                PlainRelationshipSummary::try_from(summary).map_err(|err| raise(ruby, err))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        array(ruby, summaries, relationship_summary_hash)
     }
 
     /// The SQL to append to a schema-only dump of the database, so a load
@@ -831,7 +817,6 @@ fn symbol_words() -> impl Iterator<Item = &'static str> {
     transform_status_names()
         .into_iter()
         .chain(quarantine_state_names())
-        .chain(relationship_cardinality_names())
         .chain(PlainApplied::KINDS)
         .chain(SELF_CHECK_OUTCOMES)
         .chain(SELF_CHECK_STATES)
@@ -1055,70 +1040,18 @@ fn backfill_failure_hash(ruby: &Ruby, failure: PlainBackfillFailure) -> Result<R
     )
 }
 
-fn relationship_hash(ruby: &Ruby, relationship: PlainRelationship) -> Result<RHash, Error> {
-    record(
-        ruby,
-        [
-            ("id", ruby.into_value(relationship.id)),
-            ("name", ruby.into_value(relationship.name)),
-            ("from_schema", ruby.into_value(relationship.from_schema)),
-            ("from_table", ruby.into_value(relationship.from_table)),
-            ("from_col", ruby.into_value(relationship.from_col)),
-            ("to_schema", ruby.into_value(relationship.to_schema)),
-            ("to_table", ruby.into_value(relationship.to_table)),
-            ("to_col", ruby.into_value(relationship.to_col)),
-            (
-                "cardinality",
-                word_symbol(ruby, relationship.cardinality).as_value(),
-            ),
-            ("warnings", ruby.into_value(relationship.warnings)),
-        ],
-    )
-}
-
-fn relationship_summary_hash(
-    ruby: &Ruby,
-    summary: PlainRelationshipSummary,
-) -> Result<RHash, Error> {
-    record(
-        ruby,
-        [
-            ("id", ruby.into_value(summary.id)),
-            ("name", ruby.into_value(summary.name)),
-            ("from_schema", ruby.into_value(summary.from_schema)),
-            ("from_table", ruby.into_value(summary.from_table)),
-            ("from_col", ruby.into_value(summary.from_col)),
-            ("to_schema", ruby.into_value(summary.to_schema)),
-            ("to_table", ruby.into_value(summary.to_table)),
-            ("to_col", ruby.into_value(summary.to_col)),
-            (
-                "cardinality",
-                word_symbol(ruby, summary.cardinality).as_value(),
-            ),
-            (
-                "created_at_micros",
-                ruby.into_value(summary.created_at_micros),
-            ),
-        ],
-    )
-}
-
 /// What `apply` did. `kind` is one of [`PlainApplied::KINDS`]; each other
 /// field is set only for the kinds that carry it (`target_table` for
-/// `transform_defined` and `altered`, `relationship` for
-/// `relationship_defined`, `columns` for `resumed`, and `added`, `dropped`
+/// `transform_defined` and `altered`, `columns` for `resumed`, and `added`, `dropped`
 /// and `altered` for `altered`), and is `nil` otherwise: the same flat shape
 /// the Elixir NIF hands `Trellis.Applied`.
 fn applied_hash(ruby: &Ruby, applied: PlainApplied) -> Result<RHash, Error> {
     let kind = word_symbol(ruby, applied.kind()).as_value();
     let nil = ruby.qnil().as_value();
-    let (mut target_table, mut relationship, mut columns) = (nil, nil, nil);
+    let (mut target_table, mut columns) = (nil, nil);
     let (mut added, mut dropped, mut altered) = (nil, nil, nil);
     match applied {
         PlainApplied::TransformDefined(plain) => target_table = ruby.into_value(plain),
-        PlainApplied::RelationshipDefined(plain) => {
-            relationship = relationship_hash(ruby, plain)?.as_value();
-        }
         PlainApplied::Resumed { columns: resumed } => columns = ruby.into_value(resumed),
         PlainApplied::Altered {
             target_table: plain,
@@ -1138,7 +1071,6 @@ fn applied_hash(ruby: &Ruby, applied: PlainApplied) -> Result<RHash, Error> {
         [
             ("kind", kind),
             ("target_table", target_table),
-            ("relationship", relationship),
             ("columns", columns),
             ("added", added),
             ("dropped", dropped),
@@ -1258,11 +1190,6 @@ fn quarantine_states(ruby: &Ruby) -> RArray {
     word_symbols(ruby, quarantine_state_names())
 }
 
-/// Every cardinality symbol a relationship can carry.
-fn cardinality_names(ruby: &Ruby) -> RArray {
-    word_symbols(ruby, relationship_cardinality_names())
-}
-
 /// Every outcome kind `apply`'s result can carry.
 fn applied_kinds(ruby: &Ruby) -> RArray {
     word_symbols(ruby, PlainApplied::KINDS)
@@ -1315,7 +1242,6 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     native.define_module_function("error_codes", function!(error_codes, 0))?;
     native.define_module_function("status_names", function!(status_names, 0))?;
     native.define_module_function("quarantine_states", function!(quarantine_states, 0))?;
-    native.define_module_function("cardinality_names", function!(cardinality_names, 0))?;
     native.define_module_function("applied_kinds", function!(applied_kinds, 0))?;
     native.define_module_function("self_check_outcomes", function!(self_check_outcomes, 0))?;
     native.define_module_function("self_check_modes", function!(self_check_modes, 0))?;
@@ -1331,7 +1257,6 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     handle.define_method("apply", method!(Handle::apply, 1))?;
     handle.define_method("status", method!(Handle::status, 1))?;
     handle.define_method("definitions", method!(Handle::definitions, 0))?;
-    handle.define_method("relationships", method!(Handle::relationships, 0))?;
     handle.define_method(
         "dump_definitions_sql",
         method!(Handle::dump_definitions_sql, 0),

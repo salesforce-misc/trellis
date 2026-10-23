@@ -941,10 +941,12 @@ async fn self_check_refuses_a_ledger_aggregate_target_rather_than_mis_auditing_i
     )
     .await
     .expect("connect");
-    trellis
-        .apply("RELATIONSHIP reg FROM orders.region_id TO regions.id")
-        .await
-        .expect("declare the relationship");
+    trellis::dev::defs::create_relationship(
+        trellis.pool(),
+        "RELATIONSHIP reg FROM orders.region_id TO regions.id",
+    )
+    .await
+    .expect("declare the relationship");
     trellis
         .apply("TRANSFORM region_counts FROM orders GROUP BY reg.name WITHOUT SOURCE INDEX SELECT COUNT(*) AS n")
         .await
@@ -1320,10 +1322,12 @@ async fn a_relationship_to_sides_capture_is_audited_too() {
     )
     .await
     .expect("connect");
-    trellis
-        .apply("RELATIONSHIP maker FROM widgets.maker_id TO makers.id")
-        .await
-        .expect("relationship");
+    trellis::dev::defs::create_relationship(
+        trellis.pool(),
+        "RELATIONSHIP maker FROM widgets.maker_id TO makers.id",
+    )
+    .await
+    .expect("relationship");
     trellis
         .apply("TRANSFORM widget_makers FROM widgets SELECT maker.name AS maker_name")
         .await
@@ -1838,7 +1842,13 @@ async fn order_view_fixture(db: &TestDatabase) -> (Trellis, Client) {
         "TRANSFORM order_view FROM orders \
          SELECT customer.name AS customer_name, SUM(items.qty) AS total_qty",
     ] {
-        trellis.apply(statement).await.expect(statement);
+        if statement.starts_with("RELATIONSHIP") {
+            trellis::dev::defs::create_relationship(trellis.pool(), statement)
+                .await
+                .expect(statement);
+        } else {
+            trellis.apply(statement).await.expect(statement);
+        }
     }
     capture_tables(
         &mut raw,

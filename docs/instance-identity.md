@@ -190,10 +190,9 @@ One thing remains the operator's responsibility, not the engine's:
   Whichever instance defines a name second is the one refused. Give the
   instances distinct target names, or distinct target schemas
   (`Config::target_schema`). Only the targets you name need this. The tables
-  Trellis generates for itself, such as a to-one relationship's projection
-  (`_trellis_rel_projection_<id>`, numbered per instance), live in the instance
-  schema, so two instances sharing a target schema can't collide on them
-  (issue #435).
+  Trellis generates for itself, such as an aggregate's `agg_<id>` and a
+  `JOIN`'s `join_<id>_*` tables (numbered per instance), live in the instance
+  schema, so two instances sharing a target schema can't collide on them.
 
 ## What two instances in one database share
 
@@ -245,10 +244,7 @@ That internal path stops at the instance boundary. The reading instance's only
 view of the table is its own capture triggers, and they have no primary key
 to identify a change by, so `CREATE TRANSFORM` rejects the definition with
 `SourceNotChangeKeyed` (issue #376). To chain off an aggregate target, or a 1-1 target over one, define
-the downstream transform in the instance that owns it. The same goes for a relationship: `CREATE
-RELATIONSHIP` rejects an endpoint that is another instance's aggregate target,
-or a 1-1 target over one, with `RelationshipEndpointNotChangeKeyed` (issue #375), since the relationship
-would capture it just the same.
+the downstream transform in the instance that owns it.
 
 ## Convergence waits
 

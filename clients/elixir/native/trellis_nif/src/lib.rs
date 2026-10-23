@@ -46,8 +46,8 @@
 //!   after the shutdown.
 //! - **Only plain data crosses** (decision 4). The flattening itself is
 //!   `trellis-embed`'s; this crate only turns its plain values into terms.
-//!   Words become atoms here (statuses, quarantine states, relationship
-//!   cardinalities, `apply` outcome kinds, `self_check` outcomes and
+//!   Words become atoms here (statuses, quarantine states, `apply` outcome
+//!   kinds, `self_check` outcomes and
 //!   divergence kinds, log levels), but only ever words from the
 //!   closed sets `trellis-embed` lists, which [`load`] allocates up front,
 //!   never a string read from the database.
@@ -69,11 +69,10 @@ use trellis_embed::{
     DIVERGENCE_KINDS, ERROR_CODES, LOG_LEVELS, PlainApplied, PlainBackfillFailure,
     PlainCaptureFailure, PlainCaptureWait, PlainConfig, PlainCorrectingNode, PlainDefinitionStatus,
     PlainDefinitionSummary, PlainDivergence, PlainDrainFailure, PlainError, PlainHeldKeys,
-    PlainPoisonEntry, PlainQuarantineEntry, PlainRelationship, PlainRelationshipSummary,
-    PlainSamplePage, PlainSelfCheckJob, PlainSelfCheckReport, PlainSourceIndexGap,
-    PlainUnindexedJoin, SELF_CHECK_MODES, SELF_CHECK_OUTCOMES, SELF_CHECK_STATES,
-    capture_failure_kind_names, decode_cursor, decode_watermark, encode_watermark,
-    quarantine_state_names, relationship_cardinality_names, require_transform_statement,
+    PlainPoisonEntry, PlainQuarantineEntry, PlainSamplePage, PlainSelfCheckJob,
+    PlainSelfCheckReport, PlainSourceIndexGap, PlainUnindexedJoin, SELF_CHECK_MODES,
+    SELF_CHECK_OUTCOMES, SELF_CHECK_STATES, capture_failure_kind_names, decode_cursor,
+    decode_watermark, encode_watermark, quarantine_state_names, require_transform_statement,
     self_check_mode, system_time_from_epoch_micros, transform_status_names,
 };
 
@@ -419,7 +418,6 @@ fn atom_words() -> impl Iterator<Item = &'static str> {
     transform_status_names()
         .into_iter()
         .chain(quarantine_state_names())
-        .chain(relationship_cardinality_names())
         .chain(PlainApplied::KINDS)
         .chain(SELF_CHECK_OUTCOMES)
         .chain(SELF_CHECK_STATES)
@@ -439,47 +437,15 @@ struct DefinitionSummaryTerm {
     halt: Option<CaptureFailureTerm>,
 }
 
-/// A relationship `apply/2` registered.
-#[derive(NifMap)]
-struct RelationshipTerm {
-    id: i64,
-    name: String,
-    from_schema: String,
-    from_table: String,
-    from_col: String,
-    to_schema: String,
-    to_table: String,
-    to_col: String,
-    cardinality: Atom,
-    warnings: Vec<String>,
-}
-
-/// A registered relationship, as `relationships/1` lists it.
-#[derive(NifMap)]
-struct RelationshipSummaryTerm {
-    id: i64,
-    name: String,
-    from_schema: String,
-    from_table: String,
-    from_col: String,
-    to_schema: String,
-    to_table: String,
-    to_col: String,
-    cardinality: Atom,
-    created_at_micros: i64,
-}
-
 /// What `apply/2` did. `kind` is one of [`PlainApplied::KINDS`]; each
 /// other field is set only for the kinds that carry it (`target_table` for
-/// `transform_defined` and `altered`, `relationship` for
-/// `relationship_defined`, `columns` for `resumed`, and `added`, `dropped`
+/// `transform_defined` and `altered`, `columns` for `resumed`, and `added`, `dropped`
 /// and `altered` for `altered`), and is `nil` otherwise. `Trellis.Applied`
 /// turns this into the tagged value `apply/2` returns.
 #[derive(NifMap)]
 struct AppliedTerm {
     kind: Atom,
     target_table: Option<String>,
-    relationship: Option<RelationshipTerm>,
     columns: Option<Vec<String>>,
     added: Option<Vec<String>>,
     dropped: Option<Vec<String>>,
@@ -619,29 +585,11 @@ impl DivergenceTerm {
     }
 }
 
-impl RelationshipTerm {
-    fn new(env: Env, relationship: PlainRelationship) -> NifReply<Self> {
-        Ok(RelationshipTerm {
-            id: relationship.id,
-            name: relationship.name,
-            from_schema: relationship.from_schema,
-            from_table: relationship.from_table,
-            from_col: relationship.from_col,
-            to_schema: relationship.to_schema,
-            to_table: relationship.to_table,
-            to_col: relationship.to_col,
-            cardinality: word_atom(env, relationship.cardinality)?,
-            warnings: relationship.warnings,
-        })
-    }
-}
-
 impl AppliedTerm {
     fn new(env: Env, applied: PlainApplied) -> NifReply<Self> {
         let mut term = AppliedTerm {
             kind: word_atom(env, applied.kind())?,
             target_table: None,
-            relationship: None,
             columns: None,
             added: None,
             dropped: None,
@@ -650,9 +598,6 @@ impl AppliedTerm {
         match applied {
             PlainApplied::TransformDefined(target_table) => {
                 term.target_table = Some(target_table);
-            }
-            PlainApplied::RelationshipDefined(relationship) => {
-                term.relationship = Some(RelationshipTerm::new(env, relationship)?);
             }
             PlainApplied::Resumed { columns } => term.columns = Some(columns),
             PlainApplied::Altered {
@@ -781,35 +726,6 @@ fn dump_definitions_sql<'a>(env: Env<'a>, handle: ResourceArc<Handle>) -> NifRep
         env,
         BlockingTrellis::start_dump_definitions_sql,
         |_, sql| Ok(sql),
-    )
-}
-
-/// Every registered relationship, oldest first.
-#[rustler::nif]
-fn relationships<'a>(env: Env<'a>, handle: ResourceArc<Handle>) -> NifReply<Term<'a>> {
-    handle.submit(
-        env,
-        BlockingTrellis::start_relationships,
-        |env, summaries| {
-            summaries
-                .iter()
-                .map(|summary| {
-                    let summary = PlainRelationshipSummary::try_from(summary).map_err(plain)?;
-                    Ok(RelationshipSummaryTerm {
-                        id: summary.id,
-                        name: summary.name,
-                        from_schema: summary.from_schema,
-                        from_table: summary.from_table,
-                        from_col: summary.from_col,
-                        to_schema: summary.to_schema,
-                        to_table: summary.to_table,
-                        to_col: summary.to_col,
-                        cardinality: word_atom(env, summary.cardinality)?,
-                        created_at_micros: summary.created_at_micros,
-                    })
-                })
-                .collect::<NifReply<Vec<_>>>()
-        },
     )
 }
 
@@ -1129,12 +1045,6 @@ fn status_names(env: Env) -> NifReply<Vec<Atom>> {
 #[rustler::nif(schedule = "DirtyIo", name = "quarantine_state_names")]
 fn quarantine_state_names_nif(env: Env) -> NifReply<Vec<Atom>> {
     word_atoms(env, quarantine_state_names())
-}
-
-/// Every cardinality atom a relationship can carry.
-#[rustler::nif(schedule = "DirtyIo")]
-fn cardinality_names(env: Env) -> NifReply<Vec<Atom>> {
-    word_atoms(env, relationship_cardinality_names())
 }
 
 /// Every outcome kind `apply/2`'s result can carry.

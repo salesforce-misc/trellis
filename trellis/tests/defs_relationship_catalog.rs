@@ -5,11 +5,12 @@
 use std::collections::HashMap;
 
 use testkit::TestCluster;
+use trellis::defs::model::{RelationshipCardinality, RelationshipSide};
 use trellis::defs::{
-    CatalogError, EdgeKind, RelationshipCardinality, RelationshipDefinition, RelationshipSide,
-    RelationshipTypeMismatch, RelationshipWarning, ValidationError, ValueType, create_definition,
-    create_relationship, create_target_table, edges_from, install_definition, parse,
-    relationship_by_name, relationship_projection, relationships_to_table, source_primary_key,
+    CatalogError, EdgeKind, RelationshipDefinition, RelationshipTypeMismatch, RelationshipWarning,
+    ValidationError, ValueType, create_definition, create_relationship, create_target_table,
+    edges_from, install_definition, parse, relationship_by_name, relationship_projection,
+    relationships_to_table, source_primary_key,
 };
 
 /// The schema this file's bare `CREATE TABLE`s land in, and so the schema a
@@ -1660,16 +1661,13 @@ async fn same_named_relationships_on_same_named_tables_in_different_schemas_coex
     )
     .await
     .expect("connect a define-only Trellis");
-    let err = trellis
-        .apply("DROP RELATIONSHIP posts.author")
+    let err = trellis::dev::defs::drop_relationship(trellis.pool(), "posts.author")
         .await
         .expect_err("a bare address naming two relationships is ambiguous");
     assert!(
         matches!(
             &err,
-            trellis::TrellisError::Catalog(CatalogError::AmbiguousRelationshipAddress {
-                schemas, ..
-            }) if schemas == &["blog".to_string(), "shop".to_string()]
+            CatalogError::AmbiguousRelationshipAddress { schemas, .. } if schemas == &["blog".to_string(), "shop".to_string()]
         ),
         "expected AmbiguousRelationshipAddress naming both schemas, got {err:?}"
     );
@@ -1677,16 +1675,14 @@ async fn same_named_relationships_on_same_named_tables_in_different_schemas_coex
     assert_eq!(count("shop").await, 1, "a refused drop drops nothing");
 
     // Each qualified address drops exactly its own relationship.
-    trellis
-        .apply("DROP RELATIONSHIP shop.posts.author")
+    trellis::dev::defs::drop_relationship(trellis.pool(), "shop.posts.author")
         .await
         .expect("drop shop.posts.author");
     assert_eq!(count("shop").await, 0);
     assert_eq!(count("blog").await, 1, "blog.posts.author is untouched");
 
     // With only one left, the bare address is no longer ambiguous.
-    trellis
-        .apply("DROP RELATIONSHIP posts.author")
+    trellis::dev::defs::drop_relationship(trellis.pool(), "posts.author")
         .await
         .expect("a bare address naming one relationship drops it");
     assert_eq!(count("blog").await, 0);

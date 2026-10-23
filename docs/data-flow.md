@@ -94,9 +94,9 @@ uninstalls the triggers of a table nothing reads any more.
 
 ### The Re-derive build
 
-A plain 1-1 definition (no relationship in any field) is built by the
-**Re-derive build** (`staging::build`), whether its source is a captured table
-or another definition's target. It needs no marker and no
+A plain 1-1 definition is built by the **Re-derive build** (`staging::build`),
+whether its source is a captured table or another definition's target. It
+needs no marker and no
 go-live catch-up, because the definition **applies from its first chunk**. A
 captured source needs no fence wait either; a source that is another
 definition's target takes one fence per build (see below):
@@ -157,7 +157,7 @@ that rewrite just those columns from one snapshot.
 
 ### An aggregate's or a `JOIN`'s build
 
-An aggregate that reads no relationship path, and a `JOIN`, keep each group's
+An aggregate and a `JOIN` keep each group's
 partials (its row count and running sums) in hidden tables, not a per-row
 ledger, so their build is **one absolute write per structure**
 ([ADR-0002](decisions/0002-async-data-flow.md#an-aggregates-build-is-one-absolute-write-per-structure)).
@@ -179,7 +179,7 @@ new ones, never an empty or partial target.
 
 ### Builds that still use a marker and a go-live catch-up
 
-A definition that reads a relationship doesn't yet take the Re-derive build
+A 1-1 definition whose alias chain is cyclic doesn't yet take the Re-derive build
 (milestone F, #625, moves it). Its build is dispatched by a **marker** on the source table
 (`intake::markers`):
 
@@ -233,7 +233,7 @@ Either one is repaired in the transaction that makes the call:
   `backfilling` when the call returns, so polling for `live` waits out the
   rebuild. A second request while a rebuild runs enqueues another plan and
   sweep.
-- **Any other reader** (a relationship consumer, a ring-enumerated shape)
+- **Any other reader** (a ring-enumerated shape)
   gets a go-live catch-up. It reports `catching_up` until the discharge has
   re-read the table and swept its target for rows the source no longer
   backs.
@@ -255,11 +255,7 @@ Either one is repaired in the transaction that makes the call:
   transforms needs catalog access and the right to create target tables; the
   reconcile pass uninstalls a dropped transform's capture up to one
   `reconcile_interval` (5s by default) later, and apply skips the changes
-  staged meanwhile because nothing reads the table. One that declares a
-  to-one relationship also needs to create a table in the instance schema,
-  where the relationship's projection lives, and one that applies a
-  transform reading a parent column the projection doesn't carry yet must own
-  the projection, since it adds that column.
+  staged meanwhile because nothing reads the table.
 
 ## Staging and batching
 

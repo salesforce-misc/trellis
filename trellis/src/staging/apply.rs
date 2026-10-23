@@ -1184,9 +1184,8 @@ pub fn row_as_text_jsonb_sql(alias: &str, columns: &[String]) -> String {
 
 /// Issue #173 phase 3: what a to-side (parent) event implies about the
 /// from-side rows a relationship-propagation path must reprocess — the one
-/// shared decision every path in `docs/relationship-propagation.md`'s
-/// obligation table that enumerates from-side rows in reaction to a to-side
-/// change is built to make by constructing one of these and driving its own
+/// shared decision every path that enumerates from-side rows in reaction to
+/// a to-side change is built to make by constructing one of these and driving its own
 /// enumeration off a `match` over it, rather than deciding independently
 /// (which is exactly how TRUNCATE's key-less sentinel got forgotten three
 /// times — #98, regressed by epic #127 and re-filed as #165, re-filed again

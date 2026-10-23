@@ -12,8 +12,6 @@ defmodule Trellis.ApplyTest do
   alias Trellis.{
     DefinitionSummary,
     Error,
-    Relationship,
-    RelationshipSummary,
     Status,
     TestCluster
   }
@@ -33,8 +31,6 @@ defmodule Trellis.ApplyTest do
   end
 
   test "every statement form round-trips through apply/2", %{pg: pg, trellis: trellis} do
-    Postgrex.query!(pg, "create table owners (id integer primary key, name text)", [])
-
     Postgrex.query!(
       pg,
       "create table pets (id integer primary key, owner_id integer, weight integer)",
@@ -46,32 +42,6 @@ defmodule Trellis.ApplyTest do
     # Keyed on each kind's `trellis::StatementKind` name, so a statement form
     # the engine adds fails the last assertion until it is covered here.
     covered = MapSet.new()
-
-    # `owners.id` is the primary key, so each pet has at most one owner. No
-    # index on `pets.owner_id` comes back as a warning, not an error.
-    assert {:ok, {:relationship_defined, %Relationship{} = relationship}} =
-             Trellis.apply(trellis, "RELATIONSHIP owner FROM pets.owner_id TO owners.id")
-
-    assert %Relationship{
-             name: "owner",
-             from_schema: "public",
-             from_table: "pets",
-             from_col: "owner_id",
-             to_schema: "public",
-             to_table: "owners",
-             to_col: "id",
-             cardinality: :one,
-             warnings: [warning]
-           } = relationship
-
-    assert warning =~ "pets"
-    covered = MapSet.put(covered, "define_relationship")
-
-    assert [%RelationshipSummary{} = summary] =
-             Enum.filter(Trellis.relationships!(trellis), &(&1.id == relationship.id))
-
-    assert %RelationshipSummary{name: "owner", cardinality: :one, created_at: %DateTime{}} =
-             summary
 
     assert {:ok, {:transform_defined, "public.pet_weights"}} =
              Trellis.apply(trellis, "TRANSFORM pet_weights FROM pets SELECT weight AS weight")
@@ -122,10 +92,6 @@ defmodule Trellis.ApplyTest do
     assert {:ok, nil} = Trellis.status(trellis, "pet_weights")
     covered = MapSet.put(covered, "drop_transform")
 
-    assert {:ok, :dropped} = Trellis.apply(trellis, "DROP RELATIONSHIP pets.owner")
-    refute Enum.any?(Trellis.relationships!(trellis), &(&1.id == relationship.id))
-    covered = MapSet.put(covered, "drop_relationship")
-
     assert {:ok, kinds} = Trellis.Native.statement_kinds()
     assert covered == MapSet.new(kinds)
   end
@@ -133,6 +99,14 @@ defmodule Trellis.ApplyTest do
   test "a statement apply/2 can't carry out is an error, and apply!/2 raises it",
        %{trellis: trellis} do
     assert {:error, %Error{code: :parse}} = Trellis.apply(trellis, "TRANSFORM oops")
+
+    for statement <- [
+          "RELATIONSHIP owner FROM pets.owner_id TO owners.id",
+          "DROP RELATIONSHIP pets.owner"
+        ] do
+      assert {:error, %Error{code: :parse}} = Trellis.apply(trellis, statement)
+    end
+
     assert_raise Error, fn -> Trellis.apply!(trellis, "TRANSFORM oops") end
 
     assert {:error, %Error{code: :not_found}} =

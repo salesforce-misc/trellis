@@ -168,7 +168,7 @@ shape:
   A side is named by its bare table name, with no aliases, and every source
   column is written `<side>.<col>` in `ON`, `GROUP BY` and fields alike; a bare
   name means a field, and a dotted name whose head isn't a side is an unknown
-  table qualifier (a JOIN transform has no relationship paths). `<cond>` is one
+  table qualifier. `<cond>` is one
   or more equalities joined by `AND`, each between one column of each side
   (either order), with no column pair repeated. Each `GROUP BY` key becomes a
   target column named after its bare column name, so two keys sharing a bare
@@ -180,9 +180,7 @@ shape:
   `RIGHT`, `FULL`, `CROSS`, a comma join and a second `JOIN`; an expression
   key, a non-equality condition, `OR`, a one-side predicate, an equality
   between two columns of one side, `USING` and `NATURAL`; and a `JOIN` with no
-  `GROUP BY`. Relationship reference syntax is defined with the relationship
-  feature ([0006-relationships](0006-relationships.md)), which JOIN transforms
-  replace.
+  `GROUP BY`.
 
 ## Growth policy
 

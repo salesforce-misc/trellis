@@ -30,7 +30,7 @@ wrong rows, on the targets it compares
 | [A column's values rewritten in place by `ALTER COLUMN TYPE`](#a-columns-values-rewritten-in-place-by-alter-column-type) | `self_check` | [#1206](https://github.com/salesforce-misc/trellis/issues/1206) (study) |
 | [An enum label renamed and added again](#an-enum-label-renamed-and-added-again) | `self_check` | documented |
 | **Writes capture never sees** | | |
-| [Capture disrupted and restored between two passes](#capture-disrupted-and-restored-between-two-passes) | `self_check` | [#1206](https://github.com/salesforce-misc/trellis/issues/1206) (study), [#1237](https://github.com/salesforce-misc/trellis/issues/1237), otherwise documented |
+| [Capture disrupted and restored between two passes](#capture-disrupted-and-restored-between-two-passes) | `self_check` | [#1206](https://github.com/salesforce-misc/trellis/issues/1206) (study), otherwise documented |
 | [An unlogged source emptied by a crash or failover](#an-unlogged-source-emptied-by-a-crash-or-failover) | `self_check` | documented |
 | [A `MERGE` that moves a row to another partition](#a-merge-that-moves-a-row-to-another-partition) | `self_check` | a Postgres fix ([#942](https://github.com/salesforce-misc/trellis/issues/942)) |
 | [The source renamed or re-parented and back within one pass](#the-source-renamed-or-re-parented-and-back-within-one-pass) | `self_check` | [#1210](https://github.com/salesforce-misc/trellis/issues/1210) |
@@ -41,11 +41,6 @@ wrong rows, on the targets it compares
 | [Part of the database restored from another point in time](#part-of-the-database-restored-from-another-point-in-time) | `self_check` | [#1209](https://github.com/salesforce-misc/trellis/issues/1209) |
 | **Values computed differently from the definition** | | |
 | [Text functions in a 1-1 field](#text-functions-in-a-1-1-field) | `self_check` | [#575](https://github.com/salesforce-misc/trellis/issues/575) |
-| **[Relationships](#relationships)** (removed by [#1115](https://github.com/salesforce-misc/trellis/issues/1115)) | | |
-| [A trigger that re-keys a parent's join column within the statement](#a-trigger-that-re-keys-a-parents-join-column-within-the-statement) | no | #1115 |
-| [A from-side change pending across a to-side `TRUNCATE`](#a-from-side-change-pending-across-a-to-side-truncate) | no | #1115 |
-| [A to-one field under concurrent writes to both tables](#a-to-one-field-under-concurrent-writes-to-both-tables) | no | #1115 |
-| [A to-side row hidden from capture by a new policy](#a-to-side-row-hidden-from-capture-by-a-new-policy) | no; the next pass pauses it | #1115 |
 
 ## Preconditions
 
@@ -183,12 +178,7 @@ A trigger disabled and enabled again by name is seen. These aren't:
   dump, or upgraded with `pg_upgrade`, before a pass sees it: a restore
   records the triggers it finds;
 * a logical-replication subscription gains the table and loses it again
-  before the next pass. The apply worker fires no statement trigger;
-* a transform is defined on a table while the last other definition reading
-  it is dropped, a pass sees the new transform before the drop commits, and
-  capture is then disrupted and put back before the next pass: the drop
-  forgets the table's records, which the new transform now relies on, and the
-  next pass records the triggers it finds.
+  before the next pass. The apply worker fires no statement trigger.
 
 **What goes wrong:** the writes made in between never reach Trellis. A 1-1
 target's row stays wrong until its source row is written again; an aggregate
@@ -204,8 +194,6 @@ removes them.
 studies a signal for the attach and inherit shapes. The others are documented:
 a replaced function's footprint also moves on routine `GRANT`s and owner
 changes, and a restore leaves nothing to compare.
-[#1237](https://github.com/salesforce-misc/trellis/issues/1237) asks whether
-to serialize a drop's forgetting with a concurrent define.
 
 ### An unlogged source emptied by a crash or failover
 
@@ -319,9 +307,7 @@ attaching a partition.
 
 * `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE` or a data load into a target, or
   into a table Trellis keeps beside one: a 1-1 target's `<target>__ledger`,
-  an aggregate's `agg_<id>`, a `JOIN`'s `join_<id>_*` tables, or the
-  `<target>__ledger` and `<target>__deltas` of an aggregate that reads a
-  relationship path;
+  an aggregate's `agg_<id>`, or a `JOIN`'s `join_<id>_*` tables;
 * a target dropped and created again by hand with the same columns;
 * a trigger or rule added to a target or one of those tables that changes
   the rows Trellis writes, or the table set `UNLOGGED`, which a crash or
@@ -351,9 +337,7 @@ table's. A change to Trellis's schema isn't detected.
   hand: `DROP TRANSFORM` and define it again.
 * **An aggregate target:** `request_backfill` of its source rewrites every
   group of the target and `agg_<id>`, and `PAUSE`/`RESUME` drops and
-  recreates `agg_<id>` and rewrites every group. An aggregate that reads a
-  relationship path keeps a per-row ledger, which neither repairs: `PAUSE`,
-  `DROP TRANSFORM` and define it again.
+  recreates `agg_<id>` and rewrites every group.
 * **A `JOIN` target:** `PAUSE`/`RESUME` repairs the target's rows and every
   `join_<id>_*` table: the resume recreates the hidden tables, rebuilds them
   from both sources and keeps the target, removing a row no source row backs.
@@ -426,88 +410,6 @@ every row with Postgres's value, until each row's next write.
 which closes when [#575](https://github.com/salesforce-misc/trellis/issues/575)
 moves 1-1 evaluation into Postgres.
 
-## Relationships
-
-These come from relationship propagation
-([relationship propagation](relationship-propagation.md)).
-[#1115](https://github.com/salesforce-misc/trellis/issues/1115) removes
-relationships, and the `JOIN` transforms that replace them don't have any of
-these. `self_check` doesn't compare a target that reads a relationship.
-
-### A trigger that re-keys a parent's join column within the statement
-
-**When:** an application `AFTER ROW` trigger, or a self-referencing cascade,
-changes a parent's non-key join column again inside the statement that
-changed it (`parents.code` goes `'a'` to `'x'`, and the trigger changes it to
-`'y'`).
-
-**What goes wrong:** the nested statement's capture runs first, so the fold
-keeps the uncommitted `'x'` as the old value, and nothing names the committed
-`'a'`. The children that joined through `'a'` are never re-derived:
-aggregates over them keep stale values, and a to-one field read through
-`'a'` isn't cleared. A key join column isn't affected. Two ignored tests in
-`trellis/tests/ledger_interleavings.rs` pin it
-(`a_nested_rekey_of_a_non_key_to_col_*`).
-
-**Repair:** `PAUSE`/`RESUME` the definitions that read through the
-relationship, or `request_backfill` the child table. Avoid triggers that
-re-key a join column inside the statement that wrote it.
-
-### A from-side change pending across a to-side `TRUNCATE`
-
-**When:** an aggregate groups by a column read through a relationship
-(`GROUP BY region, buyer.name`), the to-side table is truncated, and a
-from-side row changes a grouping column while its change is still undrained,
-so the two land in different batches:
-
-```sql
-TRUNCATE users;
-UPDATE orders SET region = 'us' WHERE id = 10;
-```
-
-**What goes wrong:** nothing names the row's old group with its old to-side
-value (`(eu, a)`), so that group keeps its old value. An ignored test in
-`trellis/tests/apply_relationships.rs` pins it
-(`a_from_side_change_pending_across_a_to_side_truncate_leaves_no_stale_group`).
-
-**Repair:** `PAUSE`/`RESUME` the aggregate.
-
-### A to-one field under concurrent writes to both tables
-
-**When:** a 1-1 definition reads a field through a to-one relationship
-(`author.name AS author_name`). A child joins a parent (inserted under it,
-inserted again after a delete, or moved onto it) while a page applies an
-update, delete or `TRUNCATE` of that parent, and another page or a build
-chunk writes the child before that page commits. No generated case is known
-to hit it.
-
-**What goes wrong:** the child keeps the value its parent held before the
-change. The relationship's projection holds the new value, so any later write
-to the child corrects it.
-
-**Repair:** any write to the child, or `request_backfill` of the parent
-table.
-
-### A to-side row hidden from capture by a new policy
-
-**When:** row-level security comes to apply to the role that owns the ring
-on a to-one relationship's to-side (`FORCE ROW LEVEL SECURITY` on a table it
-owns, say), and before the next reconcile pass a statement writes the table
-while another write to it runs inside the same statement (an application
-trigger's, a cascade's or a sibling event's), which makes the statement's
-capture re-read its rows
-([capture by triggers — When capture re-reads](staging-and-claiming/01-capture-by-triggers.md#when-capture-re-reads)).
-
-**What goes wrong:** the re-read can't see a row the policy hides, so it
-stages a delete of a parent that still exists. The relationship's projection
-applies the delete, so a 1-1 field read through the relationship reads that
-parent as gone on every child, while the definition reads `live`. The next
-pass pauses the definition for the row-level security. A target that reads
-the table directly stays right: its apply re-reads a deleted row live.
-
-**Repair:** exempt the role, then `RESUME` the paused definitions, which
-refreshes the projection from the table.
-
 ## What `self_check` can't see
 
 `self_check(target)` starts a background job that audits the target's
@@ -521,9 +423,7 @@ limits belong here:
 | Target | `self_check` | Until |
 |---|---|---|
 | 1-1, including one over another target | compared | — |
-| 1-1 reading a field through a relationship | refused (`UnsupportedExpr`) | [#1115](https://github.com/salesforce-misc/trellis/issues/1115) removes relationships |
 | Aggregate, `JOIN` | compared, hidden tables included | — |
-| Aggregate reading a relationship path | refused (`UnsupportedKeySpace`) | [#1115](https://github.com/salesforce-misc/trellis/issues/1115) removes relationships |
 
 * Each audit also reports the definition's held keys and the instance's drain
   holdups. They aren't gaps, but they explain a target that stops short.
@@ -546,8 +446,7 @@ fixes and what it costs:
 
 * **Everything Trellis refuses at define, or pauses on when it appears
   later:** a source without a primary key, row-level security on a role
-  Trellis runs as (but see
-  [A to-side row hidden from capture by a new policy](#a-to-side-row-hidden-from-capture-by-a-new-policy)),
+  Trellis runs as,
   a logical-replication subscription into a source, a source
   in a hierarchy
   ([transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)),

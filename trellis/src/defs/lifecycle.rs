@@ -758,6 +758,10 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
 /// second freezing mechanism ADR-0014 rules out, so the verb is deliberately
 /// absent rather than faked. A relationship is dropped outright, once nothing
 /// live still reads it.
+#[cfg_attr(
+    not(any(test, feature = "test-util")),
+    expect(dead_code, reason = "test-only until #1115 R2 deletes it")
+)]
 #[tracing::instrument(
     name = "lifecycle.drop_relationship",
     skip(pool),

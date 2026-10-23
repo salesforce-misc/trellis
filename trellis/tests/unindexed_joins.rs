@@ -50,7 +50,13 @@ async fn fixture(db: &TestDatabase) -> (Trellis, Client) {
         "TRANSFORM order_view FROM orders \
          SELECT customer.name AS customer_name, SUM(items.qty) AS total_qty",
     ] {
-        trellis.apply(statement).await.expect(statement);
+        if statement.starts_with("RELATIONSHIP") {
+            trellis::dev::defs::create_relationship(trellis.pool(), statement)
+                .await
+                .expect(statement);
+        } else {
+            trellis.apply(statement).await.expect(statement);
+        }
     }
     (trellis, raw)
 }

@@ -1217,10 +1217,12 @@ async fn a_failing_backfill_shows_through_status_until_it_goes_through() {
     )
     .await
     .expect("connect a define-only Trellis");
-    trellis
-        .apply("RELATIONSHIP maker FROM widgets.maker_id TO makers.id")
-        .await
-        .expect("a to-one relationship");
+    trellis::dev::defs::create_relationship(
+        trellis.pool(),
+        "RELATIONSHIP maker FROM widgets.maker_id TO makers.id",
+    )
+    .await
+    .expect("a to-one relationship");
     trellis
         .apply(
             "TRANSFORM widget_totals FROM widgets \

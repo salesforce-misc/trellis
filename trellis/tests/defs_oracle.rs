@@ -12,10 +12,10 @@ use trellis::defs::eval::{
     RegexCache, RelationshipContext, Row, ToManyRelationship, ToOneRelationship, Value, evaluate,
     evaluate_aggregate, evaluate_with_relationships,
 };
+use trellis::defs::model::RelationshipCardinality;
 use trellis::defs::{
-    RelationshipCardinality, create_target_table, recompute, recompute_aggregate,
-    render_aggregate_select_sql, render_expr_sql, render_relationship_select_sql,
-    source_primary_key,
+    create_target_table, recompute, recompute_aggregate, render_aggregate_select_sql,
+    render_expr_sql, render_relationship_select_sql, source_primary_key,
 };
 use trellis::numeric::Numeric;
 

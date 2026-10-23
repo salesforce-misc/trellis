@@ -4,12 +4,12 @@ defmodule Trellis.CallsTest do
   # parallel, and a shutdown cancels the calls in flight instead of waiting
   # for them.
   #
-  # The stuck call is `relationships/1` against a catalog table another
-  # session holds an exclusive lock on, so it queues on the server for as long
-  # as the lock is held (the engine's own 30-second deadline would end it). A
-  # test knows the call has reached the lock by reading `pg_stat_activity`
-  # before it asserts anything, so nothing here depends on how fast the
-  # call gets there.
+  # The stuck call is `has_live_drain_workers/1` against a catalog table
+  # another session holds an exclusive lock on, so it queues on the server for
+  # as long as the lock is held (the engine's own 30-second deadline would end
+  # it). A test knows the call has reached the lock by reading
+  # `pg_stat_activity` before it asserts anything, so nothing here depends on
+  # how fast the call gets there.
   #
   # Uses a catalog schema of its own in the suite's one database, so the lock
   # blocks no other test's handle; it still doesn't run concurrently with them.
@@ -23,9 +23,9 @@ defmodule Trellis.CallsTest do
   @target_schema "calls_test_targets"
   @name Trellis.CallsTest.Instance
 
-  # The table `relationships/1` reads and `status/2` and `watermark_token/1`
-  # don't, so a call stuck on it delays no other.
-  @locked_table "relationship_definitions"
+  # The table `has_live_drain_workers/1` reads and `status/2` and
+  # `watermark_token/1` don't, so a call stuck on it delays no other.
+  @locked_table "worker_registry"
 
   # Far more than a test needs, and far less than the engine's 30 seconds:
   # what a call that should return at once is allowed.
@@ -145,7 +145,7 @@ defmodule Trellis.CallsTest do
     # More stuck calls than the VM has dirty IO schedulers: if each held one,
     # the last would not even start.
     stuck = :erlang.system_info(:dirty_io_schedulers) + 2
-    tasks = for _ <- 1..stuck, do: Task.async(fn -> Trellis.relationships(trellis) end)
+    tasks = for _ <- 1..stuck, do: Task.async(fn -> Trellis.has_live_drain_workers(trellis) end)
     assert await_lock_waiters!(observer, stuck) == stuck
 
     # A dirty IO job still runs at once. (Statistics would only count the
@@ -157,7 +157,7 @@ defmodule Trellis.CallsTest do
     assert {:ok, nil} = promptly!("status/2", fn -> Trellis.status(trellis, "no_such_target") end)
 
     :ok = release.()
-    assert Enum.all?(Task.await_many(tasks, @prompt_ms), &(&1 == {:ok, []}))
+    assert Enum.all?(Task.await_many(tasks, @prompt_ms), &(&1 == {:ok, false}))
   end
 
   test "a killed caller exits at once, and the other callers go on", %{observer: observer} do
@@ -165,7 +165,7 @@ defmodule Trellis.CallsTest do
     release = hold_lock!()
 
     {caller, monitor} =
-      spawn_monitor(fn -> Trellis.relationships(trellis) end)
+      spawn_monitor(fn -> Trellis.has_live_drain_workers(trellis) end)
 
     await_lock_waiters!(observer, 1)
 
@@ -183,7 +183,12 @@ defmodule Trellis.CallsTest do
     # Once the lock goes, the abandoned call ends and its reply is dropped; the
     # handle is as good as before.
     :ok = release.()
-    assert {:ok, []} = promptly!("relationships/1", fn -> Trellis.relationships(trellis) end)
+
+    assert {:ok, false} =
+             promptly!("has_live_drain_workers/1", fn ->
+               Trellis.has_live_drain_workers(trellis)
+             end)
+
     assert lock_waiters(observer) == 0
   end
 
@@ -192,7 +197,7 @@ defmodule Trellis.CallsTest do
     start_supervised!({Trellis, [{:name, @name} | options()]})
     release = hold_lock!()
 
-    stuck = Task.async(fn -> Trellis.relationships(@name) end)
+    stuck = Task.async(fn -> Trellis.has_live_drain_workers(@name) end)
     await_lock_waiters!(observer, 1)
 
     # Through the name, as the stuck call is: neither the owner nor the
@@ -207,7 +212,7 @@ defmodule Trellis.CallsTest do
     assert Task.yield(stuck, 0) == nil
 
     :ok = release.()
-    assert {:ok, []} = Task.await(stuck, @prompt_ms)
+    assert {:ok, false} = Task.await(stuck, @prompt_ms)
   end
 
   test "a shutdown returns at once with a call stuck on a lock, and cancels the call",
@@ -215,7 +220,7 @@ defmodule Trellis.CallsTest do
     start_supervised!({Trellis, [{:name, @name} | options()]})
     release = hold_lock!()
 
-    stuck = Task.async(fn -> Trellis.relationships(@name) end)
+    stuck = Task.async(fn -> Trellis.has_live_drain_workers(@name) end)
     await_lock_waiters!(observer, 1)
 
     # The supervisor's stop is the shutdown. Waiting for the call would take
@@ -237,7 +242,7 @@ defmodule Trellis.CallsTest do
     release = hold_lock!()
     observer = TestCluster.postgrex!()
 
-    stuck = Task.async(fn -> Trellis.relationships(trellis) end)
+    stuck = Task.async(fn -> Trellis.has_live_drain_workers(trellis) end)
     await_lock_waiters!(observer, 1)
 
     {microseconds, :ok} = :timer.tc(fn -> Trellis.shutdown(trellis) end)
@@ -249,7 +254,9 @@ defmodule Trellis.CallsTest do
     assert cancelled =~ "cancelled"
 
     # Later calls are refused outright.
-    assert {:error, %Error{code: :validation, message: refused}} = Trellis.relationships(trellis)
+    assert {:error, %Error{code: :validation, message: refused}} =
+             Trellis.has_live_drain_workers(trellis)
+
     assert refused =~ "has been shut down"
 
     :ok = release.()

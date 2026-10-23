@@ -17,9 +17,9 @@ use std::collections::HashMap;
 use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
+use trellis::defs::model::RelationshipSide;
 use trellis::defs::{
-    CatalogError, RelationshipSide, ValueType, create_relationship, install_definition,
-    tables_to_capture,
+    CatalogError, ValueType, create_relationship, install_definition, tables_to_capture,
 };
 use trellis::integer::IntWidth;
 use trellis::{Config, Pool, migrate};

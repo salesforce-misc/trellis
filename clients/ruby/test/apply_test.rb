@@ -20,34 +20,12 @@ class ApplyTest < Minitest::Test
   end
 
   def test_every_statement_form_round_trips_through_apply
-    @pg.exec("create table owners (id integer primary key, name text)")
     @pg.exec("create table pets (id integer primary key, owner_id integer, weight integer)")
     @pg.exec("insert into pets (id, owner_id, weight) values (1, 1, 4)")
 
     # Keyed on each kind's `trellis::StatementKind` name, so a statement form
     # the engine adds fails the last assertion until it is covered here.
     covered = []
-
-    # `owners.id` is the primary key, so each pet has at most one owner. No
-    # index on `pets.owner_id` comes back as a warning, not an error.
-    applied = Trellis.apply("RELATIONSHIP owner FROM pets.owner_id TO owners.id")
-    assert_equal :relationship_defined, applied.kind
-    relationship = applied.relationship
-    assert_instance_of Trellis::Relationship, relationship
-    assert_equal ["owner", "public", "pets", "owner_id", "public", "owners", "id", :one],
-                 relationship.to_h.values_at(:name, :from_schema, :from_table, :from_col,
-                                             :to_schema, :to_table, :to_col, :cardinality)
-    assert_equal 1, relationship.warnings.length
-    assert_match "pets", relationship.warnings.first
-    assert_nil applied.target_table
-    covered << "define_relationship"
-
-    summary = Trellis.relationships.find { |r| r.id == relationship.id }
-    assert_instance_of Trellis::RelationshipSummary, summary
-    assert_equal "owner", summary.name
-    assert_equal :one, summary.cardinality
-    assert_instance_of Time, summary.created_at
-    assert_in_delta Time.now, summary.created_at, 60
 
     applied = Trellis.apply("TRANSFORM pet_weights FROM pets SELECT weight AS weight")
     assert_equal :transform_defined, applied.kind
@@ -68,8 +46,8 @@ class ApplyTest < Minitest::Test
     assert_equal [["doubled"], [], []], [applied.added, applied.dropped, applied.altered]
     covered << "alter_transform"
 
-    assert_equal Trellis::Applied.new(kind: :paused, target_table: nil, relationship: nil,
-                                      columns: nil, added: nil, dropped: nil, altered: nil),
+    assert_equal Trellis::Applied.new(kind: :paused, target_table: nil, columns: nil,
+                                      added: nil, dropped: nil, altered: nil),
                  Trellis.apply("PAUSE TRANSFORM pet_weights")
     assert_equal :paused, Trellis.status("pet_weights").status
     covered << "pause_transform"
@@ -89,14 +67,15 @@ class ApplyTest < Minitest::Test
     assert_nil Trellis.status("pet_weights")
     covered << "drop_transform"
 
-    assert_equal :dropped, Trellis.apply("DROP RELATIONSHIP pets.owner").kind
-    refute(Trellis.relationships.any? { |r| r.id == relationship.id })
-    covered << "drop_relationship"
-
     assert_equal Trellis::Native.statement_kinds.sort, covered.sort
   end
 
   def test_a_statement_apply_cannot_carry_out_raises
+    ["RELATIONSHIP owner FROM pets.owner_id TO owners.id",
+     "DROP RELATIONSHIP pets.owner"].each do |statement|
+      assert_raises(Trellis::ParseError) { Trellis.apply(statement) }
+    end
+
     error = assert_raises(Trellis::ParseError) { Trellis.apply("TRANSFORM oops") }
     assert_equal :parse, error.code
     assert_raises(Trellis::NotFoundError) { Trellis.apply("PAUSE TRANSFORM no_such_transform") }

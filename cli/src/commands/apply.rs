@@ -3,16 +3,9 @@
 //!
 //! One command for every definition-changing operation, because the engine
 //! facade has one method for them: [`trellis::Trellis::apply`] takes the
-//! statement text and the *parse* decides whether it defines a transform,
-//! declares a relationship, pauses, resumes, or drops (issue #227, ADR-0012).
-//!
-//! This module used to sniff the grammar's first keyword itself to pick
-//! between two typed facade methods (`define`/`define_relationship`). That
-//! dispatch is gone: it lived here only because the facade had no single
-//! entrypoint, and duplicating it — once per statement form, in every
-//! operator tool and every host-language binding — is exactly what `apply`
-//! exists to stop. All this module decides now is how to phrase the
-//! confirmation it prints.
+//! statement text and the *parse* decides whether it defines, alters,
+//! pauses, resumes, or drops a transform (issue #227, ADR-0012). All this
+//! module decides is how to phrase the confirmation it prints.
 
 use trellis::{Applied, Config, Trellis, TrellisOptions};
 
@@ -25,27 +18,18 @@ Runs one Trellis statement. <GRAMMAR> is the full statement text as a single,
 quoted shell argument. The statement forms:
 
   trellis apply 'TRANSFORM post_totals FROM posts SELECT count(*) AS n'
-  trellis apply 'RELATIONSHIP posts FROM authors.id TO posts.author_id'
 
   trellis apply 'PAUSE TRANSFORM post_totals'
   trellis apply 'PAUSE TRANSFORM post_totals.n'
   trellis apply 'RESUME TRANSFORM post_totals'
   trellis apply 'RESUME TRANSFORM post_totals.n'
   trellis apply 'DROP TRANSFORM post_totals'
-  trellis apply 'DROP RELATIONSHIP authors.posts'
 
 A transform is addressed by its target table, bare (post_totals) or
 schema-qualified (public.post_totals); PAUSE and RESUME also take
 <transform>.<column>, which names one calculated field and always takes the
 bare transform. When a.b reads both ways, it is column b of transform a if a
-declares a field b, and otherwise the transform registered as a.b. A
-relationship is always addressed scoped to its from-table, since its name is
-unique only there.
-
-PAUSE and RESUME apply to transforms only: a relationship is a reusable part of
-a transform, not something that does work of its own, so there is nothing to
-suspend. Pause the transform that uses it instead. A relationship can still be
-dropped.
+declares a field b, and otherwise the transform registered as a.b.
 
 PAUSE and DROP are idempotent. RESUME rebuilds by a fresh backfill rather than
 catching up. DROP removes the target table's data too, and is refused (naming
@@ -139,16 +123,6 @@ fn describe(applied: Applied) -> String {
         Applied::TransformDefined(target_table) => {
             format!("registered transform {target_table}")
         }
-        Applied::RelationshipDefined(def) => format!(
-            "registered relationship {:?} (id {}, {} cardinality): {}.{} -> {}.{}",
-            def.def.name,
-            def.id,
-            def.cardinality.as_str(),
-            def.def.from_table,
-            def.def.from_col,
-            def.def.to_table,
-            def.def.to_col,
-        ),
         Applied::Paused => "paused".to_string(),
         Applied::Resumed { ref columns } if columns.is_empty() => {
             "resumed; it will rebuild by a fresh backfill".to_string()
@@ -202,13 +176,11 @@ mod tests {
     fn usage_documents_every_statement_form() {
         for form in [
             "TRANSFORM post_totals FROM",
-            "RELATIONSHIP posts FROM",
             "PAUSE TRANSFORM post_totals'",
             "PAUSE TRANSFORM post_totals.n",
             "RESUME TRANSFORM post_totals'",
             "RESUME TRANSFORM post_totals.n",
             "DROP TRANSFORM post_totals",
-            "DROP RELATIONSHIP authors.posts",
         ] {
             assert!(USAGE.contains(form), "USAGE is missing {form:?}");
         }

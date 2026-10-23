@@ -467,10 +467,12 @@ async fn a_reader_of_a_widened_to_side_waits_for_the_to_sides_gate() {
     .await
     .expect("seed");
     let trellis = definer(db.dsn()).await;
-    trellis
-        .apply("RELATIONSHIP parent FROM c.pid TO p.id")
-        .await
-        .expect("relationship");
+    trellis::dev::defs::create_relationship(
+        trellis.pool(),
+        "RELATIONSHIP parent FROM c.pid TO p.id",
+    )
+    .await
+    .expect("relationship");
     trellis
         .apply("TRANSFORM c_named FROM public.c SELECT amount AS amount, parent.name AS name")
         .await
@@ -909,10 +911,12 @@ async fn an_on_delete_cascade_parent_child_pair_converges() {
     .await
     .expect("seed");
     let trellis = definer(db.dsn()).await;
-    trellis
-        .apply("RELATIONSHIP parent FROM c.pid TO p.id")
-        .await
-        .expect("relationship");
+    trellis::dev::defs::create_relationship(
+        trellis.pool(),
+        "RELATIONSHIP parent FROM c.pid TO p.id",
+    )
+    .await
+    .expect("relationship");
     trellis
         .apply("TRANSFORM c_named FROM public.c SELECT amount AS amount, parent.name AS name")
         .await

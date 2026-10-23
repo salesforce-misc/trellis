@@ -171,9 +171,12 @@ const SOURCE_DDL: &str = "\
 /// relationship, all built, with the capture triggers installed.
 async fn define_and_build(t: &Trellis, raw: &mut Client) {
     raw.batch_execute(SOURCE_DDL).await.expect("source ddl");
-    t.apply("RELATIONSHIP cat FROM orders.cat_id TO cats.id")
-        .await
-        .expect("relationship");
+    trellis::dev::defs::create_relationship(
+        t.pool(),
+        "RELATIONSHIP cat FROM orders.cat_id TO cats.id",
+    )
+    .await
+    .expect("relationship");
     t.apply("TRANSFORM o1 FROM orders SELECT g AS g, a + 1 AS b, m AS m")
         .await
         .expect("o1");

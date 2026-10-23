@@ -9,11 +9,10 @@ deciders: Michael Ries
 The queries most worth precomputing aggregate many fine-grained rows (facts)
 across attributes that live in other tables (dimensions): revenue by customer
 region, line items by product category. A transform that reads one table can't
-express them. Relationships ([ADR-0006](0006-relationships.md)) reached a second
-table by reading it live while applying the first, and a fact write concurrent
-with a dimension change shares no lock with it, so the two can each miss the
-other. Keeping that exact needed per-row state and a growing set of
-special-case rules.
+express them. Reading the second table live while applying the first doesn't
+stay exact: a fact write concurrent with a dimension change shares no lock with
+it, so the two can each miss the other, and keeping that exact needs per-row
+state and a growing set of special-case rules.
 
 This ADR adds JOIN transforms:
 
@@ -26,8 +25,8 @@ SELECT <group columns>, <aggregates over a and/or b>
 
 It settles their scope and semantics, the hidden state that keeps them exact
 without per-row state, the locks that make that state transactional, how they
-build, truncate, chain and read partitioned sources, and what readers see. They
-replace relationships, which leave Trellis. It extends
+build, truncate, chain and read partitioned sources, and what readers see. It
+extends
 [ADR-0002](0002-async-data-flow.md)'s group-level basis, which every structure
 here is maintained by, and the grammar of
 [ADR-0004](0004-transform-definition-grammar.md). Three or more tables,
@@ -50,8 +49,7 @@ would break a stored definition, which is stored as text and re-parsed.
   `ON`, `GROUP BY` and fields alike; a bare name means a field. Resolving a
   bare name to whichever side has it would let a column later added to the
   other side change or break a stored definition. A dotted name whose head
-  isn't a side is an unknown table qualifier: a JOIN transform has no
-  relationship paths.
+  isn't a side is an unknown table qualifier.
 - **Join kind.** `JOIN` and `INNER JOIN` are `INNER`; `LEFT JOIN` and
   `LEFT OUTER JOIN` are `LEFT`, and `a` is the side `LEFT` keeps. A definition
   stores and renders them as `INNER JOIN` and `LEFT JOIN`. Exactly one join.
@@ -184,7 +182,7 @@ values, I measured 51 MB in all, against 15 GB for one materialized row per fact
   `P ⊗ U` into or out of the `NULL` `gb` group, in the same transaction as its
   change to `M`.
 
-The race that defeats relationships can't arise: neither side ever reads the
+The race that defeats reading the other table live can't arise: neither side ever reads the
 other's source table, only its applied partials, and only under `J[k]`, which
 every writer of either side holds exclusively while it reads and writes.
 
@@ -357,18 +355,11 @@ the invariants `P = GROUP BY a`, `M = GROUP BY b`, `J.matches = Σ M.n` and
 `T = Σ_k P ⊗ M`. It detects and reports, and never repairs; the scope and
 semantics are in [ADR-0013](0013-self-check-production-recompute-audit.md).
 
-### JOIN transforms replace relationships
+### Enrichment at the fact's own grain is out of scope
 
-Relationships are removed rather than kept beside JOIN transforms. Grouping by a
-relationship path, their main use, is a JOIN transform grouped by the
-dimension's column. Enrichment at the fact's own grain (copying a dimension
-attribute onto every fact row) is not served: its output is per fact row, which
-is per-row state by definition, and readers join the dimension at query time
-instead.
-
-Why not keep both? Relationships carry the per-row state and the propagation
-rules this design exists to avoid, and keeping them would ship two ways to reach
-a second table with different correctness rules.
+Copying a dimension attribute onto every fact row is not served: its output is
+per fact row, which is per-row state by definition, the state this design
+exists to avoid. Readers join the dimension at query time instead.
 
 ## Example
 
@@ -429,6 +420,5 @@ query shows them.
   scaled `numeric`, with arguments over one side. Each other aggregate, an
   argument mixing the sides, and the out-of-scope
   join shapes are refused until designed.
-- Relationships, their reverse propagation and their dedicated tests leave
-  Trellis, and a transform that copied a dimension attribute onto every fact row
-  has no replacement inside Trellis.
+- A transform that copies a dimension attribute onto every fact row has no
+  form inside Trellis.

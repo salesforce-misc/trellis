@@ -57,9 +57,7 @@ class TrellisTest < Minitest::Test
     assert_equal :waiting_to_backfill, Trellis.status("gadget_prices").status
 
     ["PAUSE TRANSFORM gadget_prices",
-     "  drop transform gadget_prices",
-     "RELATIONSHIP owner FROM gadgets.id TO gadgets.id",
-     "DROP RELATIONSHIP gadgets.owner"].each do |statement|
+     "  drop transform gadget_prices"].each do |statement|
       error = assert_raises(Trellis::ValidationError) { Trellis.define(statement) }
       assert_equal :validation, error.code
       assert_match "nothing was applied", error.message

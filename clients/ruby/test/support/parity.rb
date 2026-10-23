@@ -15,7 +15,6 @@ module Parity
   WORD_SETS = {
     "transform_status" => -> { Trellis::Native.status_names },
     "quarantine_state" => -> { Trellis::Native.quarantine_states },
-    "cardinality" => -> { Trellis::Native.cardinality_names },
     "applied_kind" => -> { Trellis::Native.applied_kinds },
     "self_check_outcome" => -> { Trellis::Native.self_check_outcomes },
     "self_check_mode" => -> { Trellis::Native.self_check_modes },
@@ -35,7 +34,6 @@ module Parity
     "apply" => ->(args, _opts) { Trellis.apply(*args) },
     "status" => ->(args, _opts) { Trellis.status(*args) },
     "definitions" => ->(_args, _opts) { Trellis.definitions },
-    "relationships" => ->(_args, _opts) { Trellis.relationships },
     "request_backfill" => ->(args, _opts) { Trellis.request_backfill(*args) },
     "release_key" => ->(args, _opts) { Trellis.release_key(*args) },
     "poisoned_since" => ->(args, _opts) { Trellis.poisoned_since(*args) },

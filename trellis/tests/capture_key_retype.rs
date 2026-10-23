@@ -324,7 +324,13 @@ async fn setup(dsn: &str, raw: &mut Client, pool: &trellis::Pool) -> Trellis {
         "TRANSFORM post_titles FROM public.posts SELECT title AS title",
         "TRANSFORM per_kind FROM public.posts GROUP BY kind WITHOUT SOURCE INDEX SELECT kind AS kind, COUNT(*) AS n",
     ] {
-        trellis.apply(text).await.expect(text);
+        if text.starts_with("RELATIONSHIP") {
+            trellis::dev::defs::create_relationship(trellis.pool(), text)
+                .await
+                .expect(text);
+        } else {
+            trellis.apply(text).await.expect(text);
+        }
     }
     bring_live(raw, pool, &["post_authors", "post_titles", "per_kind"]).await;
     trellis
@@ -722,7 +728,13 @@ async fn post_authors(dsn: &str, raw: &mut Client, pool: &trellis::Pool) -> Trel
         "RELATIONSHIP author FROM posts.author_id TO users.id",
         "TRANSFORM post_authors FROM public.posts SELECT author.name AS author_name",
     ] {
-        trellis.apply(text).await.expect(text);
+        if text.starts_with("RELATIONSHIP") {
+            trellis::dev::defs::create_relationship(trellis.pool(), text)
+                .await
+                .expect(text);
+        } else {
+            trellis.apply(text).await.expect(text);
+        }
     }
     bring_live(raw, pool, &["post_authors"]).await;
     trellis
@@ -1324,7 +1336,13 @@ async fn widening_a_group_by_key_read_through_a_relationship_re_types_no_project
         "TRANSFORM per_country FROM public.posts GROUP BY author.country \
         WITHOUT SOURCE INDEX SELECT author.country AS country, COUNT(*) AS n",
     ] {
-        trellis.apply(text).await.expect(text);
+        if text.starts_with("RELATIONSHIP") {
+            trellis::dev::defs::create_relationship(trellis.pool(), text)
+                .await
+                .expect(text);
+        } else {
+            trellis.apply(text).await.expect(text);
+        }
     }
     bring_live(&mut raw, &db.pool, &["per_country"]).await;
     let projection: String = raw
@@ -2623,7 +2641,13 @@ async fn a_definition_refused_at_its_automatic_resume_stays_paused_with_the_refu
         "RELATIONSHIP owner FROM item_names.name TO owners.code",
         "TRANSFORM b_owners FROM public.item_names SELECT owner.label AS owner_label",
     ] {
-        trellis.apply(text).await.expect(text);
+        if text.starts_with("RELATIONSHIP") {
+            trellis::dev::defs::create_relationship(trellis.pool(), text)
+                .await
+                .expect(text);
+        } else {
+            trellis.apply(text).await.expect(text);
+        }
     }
     bring_live(&mut raw, &db.pool, &["item_names", "b_owners"]).await;
     trellis
@@ -2981,10 +3005,12 @@ async fn no_chain_of_upstreams_a_resume_waits_on_can_loop() {
     .await;
     // items -> item_names, item_names the to-side others reads, and others
     // into items.
-    trellis
-        .apply("RELATIONSHIP named FROM others.id TO item_names.id")
-        .await
-        .expect("define the relationship");
+    trellis::dev::defs::create_relationship(
+        trellis.pool(),
+        "RELATIONSHIP named FROM others.id TO item_names.id",
+    )
+    .await
+    .expect("define the relationship");
     refused("TRANSFORM items FROM public.others SELECT named.name AS name").await;
 }
 
@@ -3055,7 +3081,13 @@ async fn a_waiting_resume_refused_once_its_upstream_is_live_is_not_retried() {
         "RELATIONSHIP owner FROM item_names.name TO owners.code",
         "TRANSFORM b_owners FROM public.item_names SELECT owner.label AS owner_label",
     ] {
-        trellis.apply(text).await.expect(text);
+        if text.starts_with("RELATIONSHIP") {
+            trellis::dev::defs::create_relationship(trellis.pool(), text)
+                .await
+                .expect(text);
+        } else {
+            trellis.apply(text).await.expect(text);
+        }
     }
     bring_live(&mut raw, &db.pool, &["item_names", "b_owners"]).await;
     pause(&trellis, "item_names").await;
@@ -3259,7 +3291,13 @@ async fn a_definition_the_re_type_leaves_refused_keeps_its_own_error() {
         "RELATIONSHIP item FROM notes.item TO item_names.id",
         "TRANSFORM note_items FROM public.notes SELECT item.name AS item_name",
     ] {
-        trellis.apply(text).await.expect(text);
+        if text.starts_with("RELATIONSHIP") {
+            trellis::dev::defs::create_relationship(trellis.pool(), text)
+                .await
+                .expect(text);
+        } else {
+            trellis.apply(text).await.expect(text);
+        }
     }
     bring_live(&mut raw, &db.pool, &["item_names", "note_items"]).await;
 
@@ -3316,7 +3354,13 @@ async fn a_definition_refused_on_the_re_typed_target_keeps_its_own_error() {
         "TRANSFORM note_items FROM public.z_notes \
          SELECT item.name AS item_name, item.next AS item_next",
     ] {
-        trellis.apply(text).await.expect(text);
+        if text.starts_with("RELATIONSHIP") {
+            trellis::dev::defs::create_relationship(trellis.pool(), text)
+                .await
+                .expect(text);
+        } else {
+            trellis.apply(text).await.expect(text);
+        }
     }
     bring_live(
         &mut raw,
@@ -3499,7 +3543,13 @@ async fn widening_fixture(
         "TRANSFORM per_author FROM public.posts GROUP BY author \
         WITHOUT SOURCE INDEX SELECT author AS author, COUNT(amount) AS top",
     ] {
-        trellis.apply(text).await.expect(text);
+        if text.starts_with("RELATIONSHIP") {
+            trellis::dev::defs::create_relationship(trellis.pool(), text)
+                .await
+                .expect(text);
+        } else {
+            trellis.apply(text).await.expect(text);
+        }
     }
     bring_live(raw, pool, &WIDENING_TARGETS).await;
     let projection: String = raw
@@ -3741,7 +3791,13 @@ async fn a_value_the_old_modifier_couldnt_hold_applies_with_no_pass_and_no_hold(
         "RELATIONSHIP author FROM posts.author_id TO users.id",
         "TRANSFORM post_authors FROM public.posts SELECT author.score AS author_score",
     ] {
-        trellis.apply(text).await.expect(text);
+        if text.starts_with("RELATIONSHIP") {
+            trellis::dev::defs::create_relationship(trellis.pool(), text)
+                .await
+                .expect(text);
+        } else {
+            trellis.apply(text).await.expect(text);
+        }
     }
     let targets = ["good_names", "post_authors"];
     bring_live(&mut raw, &db.pool, &targets).await;

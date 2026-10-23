@@ -195,7 +195,13 @@ async fn a_gone_joined_table_or_to_side_pauses_its_readers() {
         "RELATIONSHIP parent FROM rc.pid TO rp.id",
         "TRANSFORM rc_named FROM public.rc SELECT amount AS amount, parent.name AS name",
     ] {
-        trellis.apply(text).await.expect(text);
+        if text.starts_with("RELATIONSHIP") {
+            trellis::dev::defs::create_relationship(trellis.pool(), text)
+                .await
+                .expect(text);
+        } else {
+            trellis.apply(text).await.expect(text);
+        }
     }
     bring_live(&mut raw, &db.pool).await;
     let app = connect(db.dsn()).await;
@@ -257,7 +263,13 @@ async fn dropping_the_last_reader_of_a_joined_table_or_to_side_forgets_its_recor
         "TRANSFORM fc_named FROM public.fc SELECT amount AS amount, parent.name AS name",
         "TRANSFORM fc_plain FROM public.fc SELECT amount AS amount",
     ] {
-        trellis.apply(text).await.expect(text);
+        if text.starts_with("RELATIONSHIP") {
+            trellis::dev::defs::create_relationship(trellis.pool(), text)
+                .await
+                .expect(text);
+        } else {
+            trellis.apply(text).await.expect(text);
+        }
     }
     capture_pass(&mut raw, &db.pool).await;
     for t in ["public.fa", "public.fb", "public.fc", "public.fp"] {
@@ -274,7 +286,9 @@ async fn dropping_the_last_reader_of_a_joined_table_or_to_side_forgets_its_recor
     // A reader of `fc` still reaches `fp` through the relationship.
     assert!(record_counts(&raw, "public.fc").await.0 > 0);
     assert!(record_counts(&raw, "public.fp").await.0 > 0);
-    trellis.apply("DROP RELATIONSHIP fc.parent").await.unwrap();
+    trellis::dev::defs::drop_relationship(trellis.pool(), "fc.parent")
+        .await
+        .unwrap();
     assert!(
         record_counts(&raw, "public.fc").await.0 > 0,
         "fc_plain reads it"

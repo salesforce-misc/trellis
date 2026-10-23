@@ -12,10 +12,11 @@
 use std::collections::HashMap;
 
 use testkit::TestCluster;
+use trellis::defs::model::RelationshipSide;
 use trellis::defs::{
     CatalogError, KeyColumnRole, NondeterministicCollationTextFunction,
-    NondeterministicKeyCollation, RelationshipSide, Statement, ValidationError, ValueType,
-    alter_transform, create_relationship, install_definition, parse_statement,
+    NondeterministicKeyCollation, Statement, ValidationError, ValueType, alter_transform,
+    create_relationship, install_definition, parse_statement,
 };
 
 /// Only ICU provides nondeterministic collations. Every test cluster's

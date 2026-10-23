@@ -51,11 +51,11 @@ an unnameable public error type is not an acceptable surface.
 ### One grammar-driven entrypoint for every definition change
 
 The facade does not grow a typed method per operation — `define`,
-`define_relationship`, `pause`, `resume`, `amend`, `drop`, and whatever comes next.
+`pause`, `resume`, `amend`, `drop`, and whatever comes next.
 Every definition-changing operation enters through a **single `apply` entrypoint**
 (and its blocking mirror) that accepts a statement in Trellis's grammar — the same
 grammar the CLI client speaks. The statement itself discriminates the operation:
-define a transform, define a relationship, pause, resume, amend, drop. Parsing the
+define a transform, pause, resume, amend, drop. Parsing the
 statement is where the operation is decided; the facade signature does not change as
 operations are added.
 
@@ -84,7 +84,7 @@ module.
 `benchmark` and `generative` are consumers of the public API, held to the same
 boundary as any embedder — with one narrow, sanctioned exception (below).
 
-- **Drive the system through the facade.** Registering definitions and relationships,
+- **Drive the system through the facade.** Registering definitions,
   requesting backfills, reading status, and awaiting convergence all go through
   `Trellis`/`Client`. A test or benchmark does not call engine functions to reach a
   state; it reaches states the way a user does. This keeps the suites honest — they

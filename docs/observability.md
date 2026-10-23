@@ -246,7 +246,7 @@ pause are arcs of one lifecycle:
   enqueued the transform's build, which is running: chunks, or one direct
   set-based build job, on drain threads. The target is partial.
   A plain aggregate (grouped by plain source columns, on a captured source) and
-  a plain 1-1 transform (no relationship, on a captured source) are built by the
+  a plain 1-1 transform (on a captured source) are built by the
   Re-derive build instead
   ([data-flow — The Re-derive build](data-flow.md#the-re-derive-build)).
   The staging worker starts it with no marker, and it is maintained from the start, so it goes
@@ -277,8 +277,7 @@ pause are arcs of one lifecycle:
   queued the correction; and `keys_remaining`, the keys still to re-derive from
   the correction's persisted progress (`None` until its first page has counted
   them, and an estimate while it reads the partition's own rows). An entry
-  leaves once its keys are re-derived. A to-many count's entry stays at
-  `keys_remaining` 0 until the recomputes it staged are applied. A paused or quarantined transform lists
+  leaves once its keys are re-derived. A paused or quarantined transform lists
   none; a correction that keeps failing is reported in `backfill_failure`. The
   CLI's `trellis status` prints one `correcting` line per entry under the
   transform.
@@ -379,7 +378,7 @@ pause are arcs of one lifecycle:
 
   `RESUME TRANSFORM` first re-runs define's validation against the live schema. While
   define would refuse the transform (a column it reads is gone or retyped into
-  something it can't use, a relationship's join columns no longer match), the
+  something it can't use), the
   resume fails with `ApplyError::ResumeRefused`, whose message is define's own
   error naming the column and what to change, and the transform stays paused,
   untouched. The resume also refuses in four cases define doesn't, where define
@@ -401,8 +400,8 @@ pause are arcs of one lifecycle:
   target from empty. A re-type of a target pauses the transforms chained off it whose
   own columns were typed from the old type: their `capture_failure` names the upstream
   resume, and the staging worker resumes them once the upstream is `live` again. A
-  `RESUME` of a transform that reads another transform's target (its source, a
-  `JOIN`'s joined table or a relationship's to-side) while that transform isn't `live`
+  `RESUME` of a transform that reads another transform's target (its source or a
+  `JOIN`'s joined table) while that transform isn't `live`
   returns at once, but the transform stays `paused`, its `capture_failure` reading
   "resuming: waiting for transform `<upstream>` … to be live", until the upstream is
   `live` (an upstream `catching_up` only for a paused column it reads doesn't
@@ -437,8 +436,7 @@ none), and each `sample_quarantined` row carries its `retry_attempts` and `next_
 transform ([ADR-0003](decisions/0003-quarantine-storage-and-api.md#releasing-held-keys)).
 
 `drain_failure` on `DefinitionStatus` is set while the drain keeps failing on a page
-holding changes to a table the transform reads, as its source or through a
-relationship, and the failure is charged to no key and pauses nothing (#817): a
+holding changes to a table the transform reads, and the failure is charged to no key and pauses nothing (#817): a
 refused read or write the catalog can't pin on a table
 ([A halting failure](#a-halting-failure)), records that fail only together, a record
 that fails only in two separate combinations of transforms
@@ -475,9 +473,8 @@ entry. Which indexes a target needs is in
 the transform reads that have no usable index (#973): a relationship's `from_col`,
 and a to-many relationship's `to_col` (a to-one's `to_col` is unique, so it is never
 listed). Each entry names the relationship, the table, the column and the fix, an
-index on that table and column, which Trellis doesn't create on your tables
-([Index relationship join columns](recommendations.md#index-relationship-join-columns)
-says what counts as indexed and why it matters). It is a warning: the transform
+index on that table and column, which Trellis doesn't create on your tables.
+It is a warning: the transform
 reads the column either way, each read scanning the table until the index exists,
 and its status is unaffected. The list is read from the catalog on each call, so an
 index you create shows on the next one, with no restart. A join column that no
@@ -521,12 +518,6 @@ another page or writer holding one of its join keys, so a rising tail shows
 contention on hot keys.
 `trellis status` prints a `join tables` line, a `join build` line while a build is
 under way, and one warning line per finding.
-
-`self_check` refuses a 1-1 transform that reads a relationship with
-`UnsupportedExpr`, and an aggregate that reads a relationship path with
-`UnsupportedKeySpace`, when its job is started
-([known correctness gaps — What `self_check` can't see](known-correctness-gaps.md#what-self_check-cant-see)),
-so `status` is the place to read the warning.
 
 ### Backfill status and the `xmin` caveat
 
@@ -601,8 +592,8 @@ down to the row's key, which is quarantined as the drain quarantines a key
 it, `held_keys` counts it, and `Trellis::sample_quarantined` lists it. The key is held for this transform only:
 every other transform reading the table keeps applying it, and the whole-transform fuse
 counts it against this transform alone. Any other failure is retried, and its
-fifth charged attempt pauses the transform (an aggregate's or relationship-enriched
-transform's build, which can't be narrowed to a key, is paused the same way). Fix the
+fifth charged attempt pauses the transform (an aggregate's
+build, which can't be narrowed to a key, is paused the same way). Fix the
 cause and resume the transform, which rebuilds it. Meanwhile
 `DefinitionStatus::backfill_failure` carries the failing chunk's error, attempt count
 and next attempt time, ahead of any failure of the source table's marker; a transform
@@ -620,8 +611,8 @@ and quarantining a key would blame one for nobody's fault. Instead the drain
 **halts** the definitions the failure reaches (#663) and drains the page
 without them:
 
-* **What it pauses.** For a key error, every definition that reads the table,
-  as its source or as a relationship's to-side. For a hop bound outside a
+* **What it pauses.** For a key error, every definition that reads the table.
+  For a hop bound outside a
   cycle, the readers of the table the wave ran away through, not the
   definition that wrote it; inside a cycle, every member. For an aggregate off
   the ledger, the definition that writes that target. For a refused read or
@@ -677,7 +668,7 @@ without them:
 * **Resuming.** Fix the cause, then `RESUME TRANSFORM` each halted definition,
   in any order; each resume rebuilds that definition as for any pause, and
   clears its halt. A resume re-validates the definition as define would, so
-  while its source key, or a relationship endpoint's, is still of a type define
+  while its source key is still of a type define
   refuses, the resume is refused and the halt stands. A cause define doesn't
   check (a propagation wave past the hop bound) halts it again after the
   resume, as a new episode with its own count and error line.

@@ -763,7 +763,13 @@ async fn renaming_a_to_side_column_pauses_only_its_readers_through_the_relations
         "TRANSFORM by_tier FROM public.c GROUP BY parent.tier \
         WITHOUT SOURCE INDEX SELECT parent.tier AS tier, COUNT(*) AS n",
     ] {
-        trellis.apply(text).await.expect(text);
+        if text.starts_with("RELATIONSHIP") {
+            trellis::dev::defs::create_relationship(trellis.pool(), text)
+                .await
+                .expect(text);
+        } else {
+            trellis.apply(text).await.expect(text);
+        }
     }
     let targets = ["c_named", "c_tiered", "by_tier"];
     bring_live(&mut raw, &db.pool, &targets).await;
@@ -1372,7 +1378,13 @@ async fn retyped_to_side_setup(dsn: &str, raw: &mut Client, pool: &trellis::Pool
         "TRANSFORM posts_plain FROM public.posts SELECT author AS author",
         "TRANSFORM o_copy FROM public.o SELECT v AS v",
     ] {
-        trellis.apply(text).await.expect(text);
+        if text.starts_with("RELATIONSHIP") {
+            trellis::dev::defs::create_relationship(trellis.pool(), text)
+                .await
+                .expect(text);
+        } else {
+            trellis.apply(text).await.expect(text);
+        }
     }
     bring_live(raw, pool, &["posts_named", "posts_plain", "o_copy"]).await;
     trellis
@@ -2160,7 +2172,13 @@ async fn a_from_side_key_retyped_off_the_allowlist_does_not_halt_the_drain_once_
         "RELATIONSHIP notes FROM posts.id TO notes.post_id",
         "TRANSFORM posts_noted FROM public.posts SELECT count(notes.id) AS notes",
     ] {
-        trellis.apply(text).await.expect(text);
+        if text.starts_with("RELATIONSHIP") {
+            trellis::dev::defs::create_relationship(trellis.pool(), text)
+                .await
+                .expect(text);
+        } else {
+            trellis.apply(text).await.expect(text);
+        }
     }
     bring_live(
         &mut raw,

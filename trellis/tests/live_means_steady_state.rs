@@ -184,10 +184,12 @@ async fn register_related_sku_totals(dsn: &str) {
         )
         .await
         .expect("create and seed skus");
-    trellis
-        .apply("RELATIONSHIP item FROM sales.sku TO skus.sku")
-        .await
-        .expect("register the relationship");
+    trellis::dev::defs::create_relationship(
+        trellis.pool(),
+        "RELATIONSHIP item FROM sales.sku TO skus.sku",
+    )
+    .await
+    .expect("register the relationship");
     trellis
         .apply(SKU_TOTALS_RELATED)
         .await
@@ -284,10 +286,12 @@ async fn register_related_order_view(raw: &Client, dsn: &str, rows: &str) {
     .await
     .expect("create and seed orders and lines");
     let trellis = define_only(dsn).await;
-    trellis
-        .apply("RELATIONSHIP lines FROM orders.id TO lines.order_id")
-        .await
-        .expect("register the relationship");
+    trellis::dev::defs::create_relationship(
+        trellis.pool(),
+        "RELATIONSHIP lines FROM orders.id TO lines.order_id",
+    )
+    .await
+    .expect("register the relationship");
     trellis
         .apply("TRANSFORM order_view FROM orders SELECT a AS a, COUNT(lines.id) AS n")
         .await

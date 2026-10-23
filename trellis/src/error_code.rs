@@ -23,10 +23,9 @@ use std::fmt;
 /// enum — and expected to grow rarely: adding a new internal error variant
 /// should fold into one of these existing categories, not add a new one.
 ///
-/// `#[non_exhaustive]`: unlike [`crate::defs::TransformStatus`] or
-/// [`crate::defs::RelationshipCardinality`], which round-trip through a
-/// Postgres `check` constraint and so are exhaustively matched against a
-/// closed set of persisted strings, this type's whole purpose is to be
+/// `#[non_exhaustive]`: unlike [`crate::defs::TransformStatus`], which
+/// round-trips through a Postgres `check` constraint and so is exhaustively
+/// matched against a closed set of persisted strings, this type's whole purpose is to be
 /// matched on from outside this crate (eventually outside Rust entirely) as
 /// the taxonomy evolves — so a match on it must already tolerate an
 /// unrecognized category rather than assume the set is closed forever.

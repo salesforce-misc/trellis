@@ -59,10 +59,12 @@ async fn instance(cluster: &TestCluster, definitions: &[&str]) -> Instance {
     )
     .await
     .expect("connect");
-    trellis
-        .apply("RELATIONSHIP parent FROM c.pid TO p.id")
-        .await
-        .expect("declare a relationship");
+    trellis::dev::defs::create_relationship(
+        trellis.pool(),
+        "RELATIONSHIP parent FROM c.pid TO p.id",
+    )
+    .await
+    .expect("declare a relationship");
     for definition in definitions {
         trellis.apply(definition).await.expect("define");
     }

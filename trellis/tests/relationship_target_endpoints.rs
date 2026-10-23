@@ -14,9 +14,8 @@
 use std::collections::HashMap;
 
 use trellis::defs::ast::ValueType;
-use trellis::defs::{
-    CatalogError, RelationshipSide, create_relationship, install_definition, tables_to_capture,
-};
+use trellis::defs::model::RelationshipSide;
+use trellis::defs::{CatalogError, create_relationship, install_definition, tables_to_capture};
 use trellis::integer::IntWidth;
 
 #[path = "support/trigger_pipeline.rs"]

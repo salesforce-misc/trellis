@@ -2,8 +2,7 @@
 //! meant to use.
 //!
 //! Everything an embedder needs to stand up and run a Trellis instance hangs
-//! off [`Trellis`]: apply migrations, register relationships and transform
-//! definitions, list what's registered, request an ad-hoc backfill, and run
+//! off [`Trellis`]: apply migrations, register transform definitions, list what's registered, request an ad-hoc backfill, and run
 //! the live CDC/apply pipeline. It composes the lower-level building blocks
 //! (`defs`, `client`, `intake`, `staging`) into one coherent surface so
 //! callers never have to stitch those together themselves — and, critically,
@@ -28,7 +27,7 @@
 //! **Every definition-changing operation goes through one entrypoint.**
 //! [`Trellis::apply`] takes a single statement of Trellis's own grammar — the
 //! same grammar the CLI speaks — and the parse decides which operation runs:
-//! define a transform, define a relationship, pause, resume, drop (issue #227;
+//! define a transform, alter, pause, resume, drop (issue #227;
 //! ADR-0012, ADR-0014). There is deliberately no typed method per operation,
 //! so adding one is a grammar addition rather than new surface every
 //! host-language binding has to mirror. Read paths (status, `self_check`,
@@ -41,11 +40,8 @@
 //! a transform's initial backfill runs in the background:
 //! `apply()` returns once the definition is registered, with
 //! [`TransformStatus::WaitingToBackfill`], having read no source rows. The
-//! staging worker's backfill discharge then dispatches the build by shape: a
-//! plain (non-relationship) 1-1 transform as a durable, claimable queue of
-//! chunks, and an aggregate (`GROUP BY`) or relationship-enriched 1-1
-//! transform (like the `count(posts.id)` example below) as one direct-build
-//! job. Running drain (`application_threads`) workers execute either —
+//! staging worker's backfill discharge then builds it in the background.
+//! Running drain (`application_threads`) workers execute either —
 //! anywhere in the fleet, not necessarily on the connection that called
 //! `apply()`. Callers that need the target actually populated poll
 //! [`Trellis::status`] until it reports [`TransformStatus::Live`] — which
@@ -58,11 +54,7 @@
 //! TRANSFORM` that adds or changes fields, and a column `RESUME`, register a
 //! background field build and return, the definition reading
 //! [`TransformStatus::Backfilling`] until it is done. The statements that
-//! pause, resume and drop write only the catalog. The one statement that
-//! still reads table rows inside the call is a to-one relationship's
-//! declaration (or a transform reading through one), which seeds the
-//! relationship's projection from its to-side table (milestone E, #624,
-//! replaces it).
+//! pause, resume and drop write only the catalog.
 //!
 //! **Every call returns within a deadline** (issue #599, `crate::deadline`):
 //! 30 seconds ([`DEFAULT_CALL_BUDGET`](crate::DEFAULT_CALL_BUDGET)) from when
@@ -87,10 +79,7 @@
 //! let trellis = Trellis::connect(Config::resolve(None)?, TrellisOptions::default()).await?;
 //! trellis.migrate().await?;
 //! trellis
-//!     .apply("RELATIONSHIP posts FROM authors.id TO posts.author")
-//!     .await?;
-//! trellis
-//!     .apply("TRANSFORM authors_calc FROM authors SELECT count(posts.id) AS post_count")
+//!     .apply("TRANSFORM post_counts FROM posts GROUP BY author_id SELECT count(*) AS post_count")
 //!     .await?;
 //!
 //! // Separately, run the live pipeline: staging worker + two drain threads.
@@ -106,7 +95,7 @@
 //! )
 //! .await?;
 //! // Poll until every registered transform is done backfilling.
-//! while running.status("authors_calc").await?.map(|s| s.status) != Some(TransformStatus::Live) {
+//! while running.status("post_counts").await?.map(|s| s.status) != Some(TransformStatus::Live) {
 //!     // ... sleep, then re-check ...
 //! }
 //! // ... run until shutdown ...
@@ -124,9 +113,7 @@ use tokio_postgres::types::PgLsn;
 use crate::client::{Client, ClientError, ClientOptions};
 use crate::config::Config;
 use crate::defs::source_index::SourceIndexGap;
-use crate::defs::{
-    self, CatalogError, ParseError, RelationshipDefinition, TransformStatus, ValueType,
-};
+use crate::defs::{self, CatalogError, ParseError, TransformStatus, ValueType};
 use crate::error_code::{self, ErrorCode};
 use crate::intake::IntakeError;
 use crate::pool::Pool;
@@ -365,9 +352,9 @@ impl Trellis {
     /// [`Applied`] variant, not a new method every binding has to mirror. That
     /// is the whole point: text is the simplest thing to carry across an FFI
     /// boundary (one string in, plain data out), which is why the typed
-    /// `define`/`define_relationship`/`pause_transform`/`resume_transform`/
-    /// `resume_column`/`drop_transform`/`drop_relationship` methods this
-    /// replaces are gone rather than kept alongside it.
+    /// `define`/`pause_transform`/`resume_transform`/`resume_column`/
+    /// `drop_transform` methods this replaces are gone rather than kept
+    /// alongside it.
     ///
     /// A caller that accepts only some forms (a binding's `define` takes only
     /// `TRANSFORM`) asks [`crate::statement_kind`] first: it parses the text
@@ -379,37 +366,27 @@ impl Trellis {
     ///
     /// ```text
     /// TRANSFORM <target> FROM <source> [GROUP BY <keys>] SELECT <fields> [WHERE <predicate>]
-    /// RELATIONSHIP <name> FROM <from_table>.<fk_col> TO <to_table>.<pk_col>
+    /// TRANSFORM <target> FROM <source> [LEFT|INNER] JOIN <other> ON <equi-join>
+    ///   GROUP BY <keys> SELECT <fields> [WHERE <predicate>]
     ///
     /// PAUSE  TRANSFORM <target>[.<column>]
     /// RESUME TRANSFORM <target>[.<column>]
     /// DROP   TRANSFORM <target>
-    /// DROP   RELATIONSHIP [<schema>.]<from_table>.<relationship_name>
+    ///
+    /// ALTER TRANSFORM <target> <clause>[, <clause> ...]
     /// ```
     ///
     /// # Addressing
     ///
     /// A transform is addressed by its **bare** target-table name, and a
     /// dotted address means `<transform>.<column>` — not
-    /// `<schema>.<transform>`. A relationship is always addressed **scoped to
-    /// its from-table** (`posts.author`), because its name is unique only
-    /// there. Both follow from how the engine itself identifies a definition;
-    /// see [`defs::DefinitionRef`] for the reasoning behind each.
-    ///
-    /// A schema-qualified relationship address (`blog.posts.author`) is
-    /// accepted, and names exactly the relationship declared on that schema's
-    /// `posts` — the schema its from-table resolved to when it was declared
-    /// (`relationship_definitions.from_schema`, issues #285/#288). A
-    /// relationship name is unique per *qualified* from-table, so
-    /// `blog.posts.author` and `shop.posts.author` can both exist; a bare
-    /// `posts.author` then matches both and is refused as ambiguous rather
-    /// than guessed at. An address naming no registered relationship is
-    /// `DROP`'s ordinary idempotent no-op.
+    /// `<schema>.<transform>`, except under `DROP`, which removes a whole
+    /// definition and so reads `a.b` as its qualified name.
     ///
     /// # What each statement does
     ///
-    /// `TRANSFORM`/`RELATIONSHIP` register a definition, as the retired
-    /// `define`/`define_relationship` did — including that **a transform
+    /// `TRANSFORM` registers a definition, as the retired `define` did —
+    /// including that **a transform
     /// returns before its backfill starts** (see this module's doc comment):
     /// the new transform's status is
     /// [`TransformStatus::WaitingToBackfill`] and the target is populated in
@@ -444,19 +421,7 @@ impl Trellis {
     /// more once it commits, and is
     /// **idempotent** — dropping something already gone succeeds.
     ///
-    /// # Pause and resume are transform-only
-    ///
-    /// The statement list above is exhaustive, and there is deliberately no
-    /// `PAUSE`/`RESUME RELATIONSHIP`. A relationship is a reusable *component*
-    /// of a transform, not something that does work of its own, so it has
-    /// nothing to suspend — which is also why ADR-0014 gives it no lifecycle
-    /// status and nothing in the fold gates on one. `PAUSE RELATIONSHIP x.y` is
-    /// consequently not a form this grammar knows at all, and fails as an
-    /// ordinary parse error about an unexpected keyword, not a special-cased
-    /// refusal. Retiring a relationship *is* meaningful — it is a definition —
-    /// so `DROP RELATIONSHIP` exists.
-    ///
-    /// `DROP TRANSFORM <target>.<column>` is likewise not a form: dropping one
+    /// `DROP TRANSFORM <target>.<column>` is not a form: dropping one
     /// calculated field is an `ALTER TRANSFORM ... DROP <field>`, tracked
     /// separately (issues #241/#242), not a `DROP`.
     pub async fn apply(&self, statement_text: &str) -> Result<Applied, TrellisError> {
@@ -480,12 +445,6 @@ impl Trellis {
                     .await
                     .map_err(TrellisError::Catalog)?;
                     Ok(Applied::TransformDefined(definition.target_table))
-                }
-                defs::Statement::DefineRelationship(_) => {
-                    let relationship = defs::create_relationship(&self.pool, statement_text)
-                        .await
-                        .map_err(TrellisError::Catalog)?;
-                    Ok(Applied::RelationshipDefined(relationship))
                 }
                 defs::Statement::Pause(reference) => self.apply_pause(reference).await,
                 defs::Statement::Resume(reference) => self.apply_resume(reference).await,
@@ -677,25 +636,6 @@ impl Trellis {
                 defs::lifecycle::drop_transform(&self.pool, &target)
                     .await
                     .map_err(TrellisError::Catalog)?;
-            }
-            defs::DefinitionRef::Relationship {
-                schema,
-                from_table,
-                name,
-            } => {
-                // Issues #285/#288: a qualified address names exactly the
-                // relationship declared on `schema.from_table`; a bare one
-                // must match only one schema's `from_table`, and is refused as
-                // ambiguous otherwise. See
-                // `defs::catalog::relationship_at_address`.
-                defs::lifecycle::drop_relationship(
-                    &self.pool,
-                    schema.as_deref(),
-                    &from_table,
-                    &name,
-                )
-                .await
-                .map_err(TrellisError::Catalog)?;
             }
         }
         Ok(Applied::Dropped)
@@ -1089,37 +1029,6 @@ impl Trellis {
             })
         });
         Ok((wait, failure))
-    }
-
-    /// Every registered relationship declaration, oldest first.
-    pub async fn relationships(&self) -> Result<Vec<RelationshipSummary>, TrellisError> {
-        self.call(async {
-            let client = self.pool.get().await?;
-            let rows = client
-                .query(
-                    "select id, name, from_schema, from_table, from_col, to_schema, to_table, \
-                 to_col, cardinality, created_at \
-                 from relationship_definitions order by id",
-                    &[],
-                )
-                .await?;
-            Ok(rows
-                .into_iter()
-                .map(|row| RelationshipSummary {
-                    id: row.get(0),
-                    name: row.get(1),
-                    from_schema: row.get(2),
-                    from_table: row.get(3),
-                    from_col: row.get(4),
-                    to_schema: row.get(5),
-                    to_table: row.get(6),
-                    to_col: row.get(7),
-                    cardinality: row.get(8),
-                    created_at: row.get(9),
-                })
-                .collect())
-        })
-        .await
     }
 
     /// Re-reads `source_table` for every applying definition that reads it,
@@ -2404,34 +2313,12 @@ pub struct DefinitionSummary {
     pub halt: Option<CaptureFailure>,
 }
 
-/// One registered relationship declaration, as [`Trellis::relationships`]
-/// reports it. `cardinality` is the persisted `"to_one"`/`"to_many"` string.
-#[derive(Debug, Clone)]
-pub struct RelationshipSummary {
-    pub id: i64,
-    pub name: String,
-    /// The schema `from_table` resolved to when the relationship was declared
-    /// — part of the relationship's identity alongside `from_table` and
-    /// `name` (issue #288).
-    pub from_schema: String,
-    pub from_table: String,
-    pub from_col: String,
-    /// The schema `to_table` resolved to when the relationship was declared
-    /// (issue #372): the to-side every reader uses.
-    pub to_schema: String,
-    pub to_table: String,
-    pub to_col: String,
-    pub cardinality: String,
-    pub created_at: SystemTime,
-}
-
 /// What [`Trellis::apply`] did — the one return type every
 /// definition-changing statement shares (issue #227).
 ///
 /// One variant per operation, carrying only what that operation has to report
 /// that the caller couldn't already know from the statement it wrote: the
-/// registered transform's target table or the [`RelationshipDefinition`] for
-/// the two defining forms, the resumed
+/// registered transform's target table for the defining form, the resumed
 /// `(transform, column)` pairs for a column resume, and nothing at all for a
 /// pause or a drop.
 ///
@@ -2447,8 +2334,6 @@ pub enum Applied {
     /// schema-qualified target table, at [`TransformStatus::WaitingToBackfill`]:
     /// its backfill runs in the background — see [`Trellis::apply`].
     TransformDefined(String),
-    /// A `RELATIONSHIP ...` statement registered a relationship declaration.
-    RelationshipDefined(RelationshipDefinition),
     /// A `PAUSE ...` statement froze its subject — or found it already frozen,
     /// which ADR-0014 makes the same success.
     Paused,
@@ -2492,16 +2377,6 @@ impl Applied {
     pub fn into_transform(self) -> Option<String> {
         match self {
             Applied::TransformDefined(target_table) => Some(target_table),
-            _ => None,
-        }
-    }
-
-    /// The [`RelationshipDefinition`] a `RELATIONSHIP ...` statement
-    /// registered, or `None` for any other outcome — see
-    /// [`into_transform`](Applied::into_transform).
-    pub fn into_relationship(self) -> Option<RelationshipDefinition> {
-        match self {
-            Applied::RelationshipDefined(relationship) => Some(relationship),
             _ => None,
         }
     }

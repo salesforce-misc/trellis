@@ -767,8 +767,7 @@ live as the drain's role, which is either exempt from the policy and reads
 the row, or refused, which halts the definition, and the group basis sums
 the statement's own transition rows. A to-one relationship's projection
 applies the delete, though, so until the next pass a 1-1 field read through
-the relationship reads the parent as gone
-([known correctness gaps](../known-correctness-gaps.md#a-to-side-row-hidden-from-capture-by-a-new-policy)).
+the relationship reads the parent as gone.
 The next reconcile pass pauses the table's readers
 ([transforms — Supported sources and targets](../transforms.md#supported-sources-and-targets)),
 and their `RESUME` refreshes the projection.

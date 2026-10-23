@@ -98,10 +98,16 @@ async fn an_unchanged_toasted_column_is_read_from_the_old_image() {
         "RELATIONSHIP comments FROM articles.ref TO comments.article_ref",
         "TRANSFORM article_words FROM articles SELECT sum(comments.word_count) AS total_words",
     ] {
-        trellis
-            .apply(statement)
-            .await
-            .unwrap_or_else(|e| panic!("{statement}: {e}"));
+        if statement.starts_with("RELATIONSHIP") {
+            trellis::dev::defs::create_relationship(trellis.pool(), statement)
+                .await
+                .unwrap_or_else(|e| panic!("{statement}: {e}"));
+        } else {
+            trellis
+                .apply(statement)
+                .await
+                .unwrap_or_else(|e| panic!("{statement}: {e}"));
+        }
     }
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {

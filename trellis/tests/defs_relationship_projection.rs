@@ -10,10 +10,8 @@
 use std::collections::HashMap;
 
 use testkit::TestCluster;
-use trellis::defs::{
-    RelationshipCardinality, ValueType, create_definition, create_relationship,
-    relationship_projection,
-};
+use trellis::defs::model::RelationshipCardinality;
+use trellis::defs::{ValueType, create_definition, create_relationship, relationship_projection};
 
 fn numeric_columns(names: &[&str]) -> HashMap<String, ValueType> {
     names
@@ -562,8 +560,7 @@ async fn two_instances_sharing_a_target_schema_keep_independent_projections() {
     )
     .await
     .expect("connect a define-only Trellis for instance A");
-    trellis_a
-        .apply("DROP RELATIONSHIP articles.category")
+    trellis::dev::defs::drop_relationship(trellis_a.pool(), "articles.category")
         .await
         .expect("nothing reads A's relationship, so it drops");
     let projection_exists = |schema: &'static str, table: String| {

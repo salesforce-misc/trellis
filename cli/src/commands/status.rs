@@ -21,8 +21,7 @@
 //! back (`drain_failure` from [`Trellis::status`], issue #817), and one per
 //! join column of a relationship it reads that has no usable index
 //! (`unindexed_joins`, issue #973), and one per node of its partitioned
-//! source it is being corrected for (`correcting`, ADR-0017) — and every
-//! relationship ([`Trellis::relationships`]). Finer-grained per-`(transform,
+//! source it is being corrected for (`correcting`, ADR-0017). Finer-grained per-`(transform,
 //! column)` pause state (docs/decisions/0008-public-api-design.md's
 //! decision 5 and
 //! docs/decisions/0003-quarantine-storage-and-api.md) is implemented on the
@@ -44,7 +43,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 use trellis::{
     Config, CorrectingNode, DefinitionSummary, DrainFailure, JoinBuildStep, JoinSide, JoinSidePart,
-    JoinStatus, RelationshipSummary, SourceIndexGap, Trellis, TrellisOptions, UnindexedJoin,
+    JoinStatus, SourceIndexGap, Trellis, TrellisOptions, UnindexedJoin,
 };
 
 use super::release::shell_quote;
@@ -54,7 +53,7 @@ use super::release::shell_quote;
 pub const USAGE: &str = "\
 Usage: trellis status [--database-url <URL>]
 
-Prints every registered TRANSFORM definition and RELATIONSHIP, and a note on
+Prints every registered TRANSFORM definition, and a note on
 what lifecycle/quarantine status isn't tracked yet (issue #55). Read-only:
 unlike `define`/`run`, this does not apply pending migrations, so it fails
 plainly against a database with no Trellis schema yet.
@@ -91,7 +90,7 @@ pub fn parse(args: &[String]) -> Result<Args, String> {
 }
 
 /// Connects (without migrating — see the module doc comment for why),
-/// prints the definition/relationship listing plus the "status not
+/// prints the definition listing plus the "status not
 /// implemented yet" note, then disconnects.
 ///
 /// `shutdown` is called even if the listing failed, per [`Trellis::shutdown`]'s
@@ -120,7 +119,7 @@ Note: the status shown per definition above is whole-transform (issue #55). \
 Finer-grained per-column pause state is not yet surfaced by this command, \
 even though the engine tracks it.";
 
-/// Builds the full human-readable status report: definitions, relationships,
+/// Builds the full human-readable status report: definitions, poisoned keys,
 /// then [`STATUS_NOTE`].
 async fn report(trellis: &Trellis) -> Result<String, String> {
     let definitions = trellis.definitions().await.map_err(|err| err.to_string())?;
@@ -143,10 +142,6 @@ async fn report(trellis: &Trellis) -> Result<String, String> {
         });
         listed.push((def, warnings));
     }
-    let relationships = trellis
-        .relationships()
-        .await
-        .map_err(|err| err.to_string())?;
     let poisoned = trellis
         .poisoned_since(UNIX_EPOCH)
         .await
@@ -155,9 +150,6 @@ async fn report(trellis: &Trellis) -> Result<String, String> {
     let mut out = String::new();
     out.push_str("Transform definitions:\n");
     out.push_str(&format_definitions(&listed));
-    out.push('\n');
-    out.push_str("Relationships:\n");
-    out.push_str(&format_relationships(&relationships));
     out.push('\n');
     out.push_str(&format_poisoned(&poisoned));
     out.push('\n');
@@ -388,30 +380,6 @@ fn format_drain_failure(failure: &DrainFailure) -> String {
     )
 }
 
-fn format_relationships(relationships: &[RelationshipSummary]) -> String {
-    if relationships.is_empty() {
-        return "  no relationships registered\n".to_string();
-    }
-    relationships
-        .iter()
-        .map(|rel| {
-            format!(
-                "  id={} name={:?} {}.{}.{} -> {}.{}.{} cardinality={} created_at={}\n",
-                rel.id,
-                rel.name,
-                rel.from_schema,
-                rel.from_table,
-                rel.from_col,
-                rel.to_schema,
-                rel.to_table,
-                rel.to_col,
-                rel.cardinality,
-                format_timestamp(rel.created_at)
-            )
-        })
-        .collect()
-}
-
 /// Formats a `created_at`/`poisoned_at`-style timestamp as `YYYY-MM-DD
 /// HH:MM:SS UTC`. Hand-rolled off [`civil_from_days`] rather than pulling in
 /// a date/time crate, matching this workspace's dependency-minimalism
@@ -530,11 +498,6 @@ mod tests {
             format_definitions(&[]),
             "  no transform definitions registered\n"
         );
-    }
-
-    #[test]
-    fn empty_relationships_say_so_clearly() {
-        assert_eq!(format_relationships(&[]), "  no relationships registered\n");
     }
 
     #[test]
@@ -816,27 +779,6 @@ mod tests {
             formatted.contains(r"orders\nDETAIL: role lacks SELECT\nHINT: grant it"),
             "got {formatted:?}"
         );
-    }
-
-    #[test]
-    fn a_relationship_is_formatted_with_its_fields() {
-        let rel = RelationshipSummary {
-            id: 3,
-            name: "posts_by_author".to_string(),
-            from_schema: "shop".to_string(),
-            from_table: "authors".to_string(),
-            from_col: "id".to_string(),
-            to_schema: "blog".to_string(),
-            to_table: "posts".to_string(),
-            to_col: "author_id".to_string(),
-            cardinality: "to_many".to_string(),
-            created_at: UNIX_EPOCH,
-        };
-        let formatted = format_relationships(std::slice::from_ref(&rel));
-        assert!(formatted.contains("id=3"));
-        assert!(formatted.contains("name=\"posts_by_author\""));
-        assert!(formatted.contains("shop.authors.id -> blog.posts.author_id"));
-        assert!(formatted.contains("cardinality=to_many"));
     }
 
     #[test]

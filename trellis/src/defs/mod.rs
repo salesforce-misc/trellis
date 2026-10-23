@@ -62,13 +62,13 @@ pub mod validate;
 // compiled only behind those gates, which is what keeps a plain
 // `cargo build` free of `unused_imports` rather than an `allow`.
 pub use ast::{AlterTransform, DefinitionRef, Statement, StatementKind, TransformRef, ValueType};
-pub use catalog::{
-    CatalogError, alter_transform, create_relationship, install_definition, tables_to_capture,
-};
+pub use catalog::{CatalogError, alter_transform, install_definition, tables_to_capture};
+// No statement reaches it: only tests and `dev` declare a relationship, until
+// #1115 removes them.
+#[cfg(any(test, feature = "test-util"))]
+pub use catalog::create_relationship;
 pub use error::ParseError;
-pub use model::{
-    RelationshipCardinality, RelationshipDefinition, RelationshipSide, TransformStatus,
-};
+pub use model::{RelationshipDefinition, TransformStatus};
 pub use parser::{parse_statement, statement_kind};
 // Stored text loads through `grammar::load`; the integration tests parse
 // fresh text directly.
@@ -1264,15 +1264,7 @@ mod statement_grammar_tests {
         }
     }
 
-    fn relationship(schema: Option<&str>, from_table: &str, name: &str) -> DefinitionRef {
-        DefinitionRef::Relationship {
-            schema: schema.map(str::to_string),
-            from_table: from_table.to_string(),
-            name: name.to_string(),
-        }
-    }
-
-    // --- the two defining forms still route through the unified entry point --
+    // --- the defining form still routes through the unified entry point -----
 
     /// `apply`ing a definition must produce exactly what `define` used to
     /// parse, so folding dispatch inside the parser can't have changed what a
@@ -1288,14 +1280,37 @@ mod statement_grammar_tests {
         assert_eq!(def.explicit_target_schema, Some("reporting".to_string()));
     }
 
+    /// `RELATIONSHIP` and `DROP RELATIONSHIP` are not statements of this
+    /// grammar: each fails as an ordinary parse error, like any other keyword
+    /// that doesn't belong where it was written, and so does `RELATIONSHIP`
+    /// after `PAUSE`/`RESUME`.
     #[test]
-    fn a_relationship_statement_parses_to_the_same_def_parse_relationship_produces() {
-        let text = "RELATIONSHIP product FROM order_line_items.product_id TO products.id";
-        let Statement::DefineRelationship(def) = parse_statement(text).unwrap() else {
-            panic!("a RELATIONSHIP statement must parse as one");
-        };
-        assert_eq!(def, parser::parse_relationship(text).unwrap());
-        assert_eq!(def.name, "product");
+    fn relationship_statements_are_not_part_of_this_grammar() {
+        for text in [
+            "RELATIONSHIP product FROM order_line_items.product_id TO products.id",
+            "relationship product from order_line_items.product_id to products.id",
+        ] {
+            let err = parse_statement(text).unwrap_err();
+            assert!(
+                matches!(&err, ParseError::UnexpectedToken { found, .. } if found == "identifier 'RELATIONSHIP'" || found == "identifier 'relationship'"),
+                "got {err:?}"
+            );
+            assert_eq!(statement_kind(text).unwrap_err(), err);
+        }
+        for text in [
+            "DROP RELATIONSHIP posts.author",
+            "DROP RELATIONSHIP blog.posts.author",
+            "PAUSE RELATIONSHIP posts.author",
+            "RESUME RELATIONSHIP posts.author",
+        ] {
+            let err = parse_statement(text).unwrap_err();
+            let ParseError::UnexpectedToken { expected, found } = &err else {
+                panic!("expected an ordinary unexpected-token error for {text:?}, got {err:?}");
+            };
+            assert_eq!(expected, "'TRANSFORM'");
+            assert_eq!(found, "identifier 'RELATIONSHIP'");
+            assert_eq!(statement_kind(text).unwrap_err(), err);
+        }
     }
 
     /// An aggregate definition reaches the same key-space clause through
@@ -1411,83 +1426,6 @@ mod statement_grammar_tests {
         }
     }
 
-    // --- DROP RELATIONSHIP --------------------------------------------------
-
-    /// Decision 1: always scoped to the from-table, optionally schema-qualified.
-    #[test]
-    fn drop_relationship_accepts_both_scoped_spellings() {
-        assert_eq!(
-            parse_statement("DROP RELATIONSHIP posts.author").unwrap(),
-            Statement::Drop(relationship(None, "posts", "author"))
-        );
-        assert_eq!(
-            parse_statement("DROP RELATIONSHIP blog.posts.author").unwrap(),
-            Statement::Drop(relationship(Some("blog"), "posts", "author"))
-        );
-    }
-
-    /// Decision 1's refusal: a bare relationship name identifies nothing,
-    /// since `relationship_definitions` is unique on
-    /// `(from_schema, from_table, name)`.
-    #[test]
-    fn drop_relationship_refuses_a_bare_unscoped_name() {
-        let err = parse_statement("DROP RELATIONSHIP author").unwrap_err();
-        assert!(
-            matches!(&err, ParseError::UnscopedRelationshipAddress { address } if address == "author"),
-            "expected an unscoped-address error, got {err:?}"
-        );
-        assert!(err.to_string().contains("posts.author"), "{err}");
-    }
-
-    #[test]
-    fn drop_relationship_refuses_a_four_part_address() {
-        let err = parse_statement("DROP RELATIONSHIP a.b.c.d").unwrap_err();
-        let ParseError::MalformedDefinitionAddress { address, .. } = &err else {
-            panic!("expected a malformed-address error, got {err:?}");
-        };
-        assert_eq!(address, "a.b.c.d");
-    }
-
-    /// **Pausing is transform-only.** A relationship is a reusable component of
-    /// a transform, not something that does work of its own, so there is
-    /// nothing for a pause to suspend — `PAUSE`/`RESUME RELATIONSHIP` is simply
-    /// not a form of this grammar. It must therefore fail the way any other
-    /// misplaced keyword fails: an ordinary
-    /// [`ParseError::UnexpectedToken`] saying `TRANSFORM` was expected, with no
-    /// special case anywhere for the phrase.
-    #[test]
-    fn pause_and_resume_are_transform_only() {
-        for text in [
-            "PAUSE RELATIONSHIP posts.author",
-            "RESUME RELATIONSHIP posts.author",
-            // The same whether or not the address that follows is well-formed:
-            // the keyword is rejected before any address is looked at.
-            "PAUSE RELATIONSHIP author",
-            "RESUME RELATIONSHIP blog.posts.author",
-        ] {
-            let err = parse_statement(text).unwrap_err();
-            let ParseError::UnexpectedToken { expected, found } = &err else {
-                panic!("expected an ordinary unexpected-token error for {text:?}, got {err:?}");
-            };
-            assert_eq!(expected, "'TRANSFORM'");
-            assert_eq!(found, "identifier 'RELATIONSHIP'");
-        }
-    }
-
-    /// The flip side of the rule, pinned so a future refactor can't quietly
-    /// make `DROP` transform-only too: `DROP` is the one verb that takes either
-    /// kind, because a relationship is a definition and definitions can be
-    /// retired. (The accepting cases are
-    /// `drop_relationship_accepts_both_scoped_spellings` above; this is the
-    /// contrast against `PAUSE`/`RESUME`.)
-    #[test]
-    fn drop_is_the_one_verb_that_accepts_either_kind() {
-        assert!(parse_statement("DROP RELATIONSHIP posts.author").is_ok());
-        assert!(parse_statement("DROP TRANSFORM order_totals").is_ok());
-        assert!(parse_statement("PAUSE RELATIONSHIP posts.author").is_err());
-        assert!(parse_statement("RESUME RELATIONSHIP posts.author").is_err());
-    }
-
     // --- keyword handling and general malformation ---------------------------
 
     /// Every keyword in this grammar is case-insensitive and lexes as a plain
@@ -1503,8 +1441,8 @@ mod statement_grammar_tests {
             Statement::Resume(transform("order_totals", Some("total")))
         );
         assert_eq!(
-            parse_statement("dRoP rElAtIoNsHiP posts.author").unwrap(),
-            Statement::Drop(relationship(None, "posts", "author"))
+            parse_statement("dRoP tRaNsFoRm order_totals").unwrap(),
+            Statement::Drop(DefinitionRef::Transform("order_totals".to_string()))
         );
     }
 
@@ -1512,9 +1450,10 @@ mod statement_grammar_tests {
     fn an_unrecognized_leading_keyword_names_every_statement_form() {
         let err = parse_statement("DELETE TRANSFORM order_totals").unwrap_err();
         let message = err.to_string();
-        for keyword in ["TRANSFORM", "RELATIONSHIP", "PAUSE", "RESUME", "DROP"] {
+        for keyword in ["TRANSFORM", "PAUSE", "RESUME", "DROP", "ALTER"] {
             assert!(message.contains(keyword), "{message} is missing {keyword}");
         }
+        assert!(!message.contains("RELATIONSHIP"), "{message}");
     }
 
     #[test]
@@ -1531,15 +1470,10 @@ mod statement_grammar_tests {
     /// there is no unified namespace to drop it in favour of.
     #[test]
     fn the_kind_keyword_is_required_after_the_verb() {
-        // `PAUSE`/`RESUME` only ever take `TRANSFORM`, so that is all their
-        // message names; `DROP` takes either kind and names both.
-        let err = parse_statement("PAUSE order_totals").unwrap_err();
-        assert!(err.to_string().contains("TRANSFORM"), "{err}");
-
-        let err = parse_statement("DROP order_totals").unwrap_err();
-        let message = err.to_string();
-        assert!(message.contains("TRANSFORM"), "{message}");
-        assert!(message.contains("RELATIONSHIP"), "{message}");
+        for text in ["PAUSE order_totals", "DROP order_totals"] {
+            let err = parse_statement(text).unwrap_err();
+            assert!(err.to_string().contains("TRANSFORM"), "{err}");
+        }
     }
 
     #[test]
@@ -1549,7 +1483,7 @@ mod statement_grammar_tests {
             ParseError::UnexpectedEof { .. }
         ));
         assert!(matches!(
-            parse_statement("DROP RELATIONSHIP").unwrap_err(),
+            parse_statement("DROP TRANSFORM").unwrap_err(),
             ParseError::UnexpectedEof { .. }
         ));
     }
@@ -1590,9 +1524,9 @@ mod statement_grammar_tests {
     // --- statement_kind (issue #580) -------------------------------------
 
     /// One well-formed statement of every form, with the kind it must
-    /// classify as. Both `DROP` subjects (schema-qualified or not) and every
+    /// classify as. Both `DROP` spellings (schema-qualified or not) and every
     /// `ALTER` clause are here, since each is its own path through the parser.
-    const EVERY_FORM: [(&str, StatementKind); 12] = [
+    const EVERY_FORM: [(&str, StatementKind); 10] = [
         (
             "TRANSFORM widget_prices FROM widgets SELECT price AS price",
             StatementKind::DefineTransform,
@@ -1601,10 +1535,6 @@ mod statement_grammar_tests {
             "TRANSFORM widget_totals FROM widgets GROUP BY owner_id \
              SELECT owner_id AS owner_id, SUM(price) AS total",
             StatementKind::DefineTransform,
-        ),
-        (
-            "RELATIONSHIP owner FROM widgets.owner_id TO users.id",
-            StatementKind::DefineRelationship,
         ),
         (
             "PAUSE TRANSFORM widget_prices",
@@ -1620,12 +1550,8 @@ mod statement_grammar_tests {
         ),
         ("DROP TRANSFORM widget_prices", StatementKind::DropTransform),
         (
-            "DROP RELATIONSHIP widgets.owner",
-            StatementKind::DropRelationship,
-        ),
-        (
-            "DROP RELATIONSHIP shop.widgets.owner",
-            StatementKind::DropRelationship,
+            "DROP TRANSFORM shop.widget_prices",
+            StatementKind::DropTransform,
         ),
         (
             "ALTER TRANSFORM widget_prices ADD price + price AS doubled",
@@ -1696,12 +1622,9 @@ mod statement_grammar_tests {
         for text in [
             "TRANSFORM oops",
             "TRANSFORM t FROM widgets SELECT price AS price garbage",
-            "RELATIONSHIP owner FROM widgets.owner_id",
             "PAUSE widget_prices",
-            "PAUSE RELATIONSHIP widgets.owner",
             "RESUME TRANSFORM",
             "DROP TRANSFORM public.widget_prices.price",
-            "DROP RELATIONSHIP owner",
             "ALTER TRANSFORM widget_prices",
             "ALTER TRANSFORM widget_prices PAUSE",
         ] {
@@ -1727,6 +1650,8 @@ mod statement_grammar_tests {
             "_TRANSFORM t FROM widgets SELECT price AS price",
             "SELECT 1",
             "'TRANSFORM'",
+            "RELATIONSHIP owner FROM widgets.owner_id TO users.id",
+            "DROP RELATIONSHIP widgets.owner",
         ] {
             assert!(statement_kind(text).is_err(), "{text:?}");
         }
@@ -1738,11 +1663,9 @@ mod statement_grammar_tests {
     fn every_statement_kind_is_listed_in_all() {
         crate::error_code::assert_all_is_every_variant!(
             StatementKind: DefineTransform,
-            DefineRelationship,
             PauseTransform,
             ResumeTransform,
             DropTransform,
-            DropRelationship,
             AlterTransform,
         );
         let names: std::collections::HashSet<&str> = StatementKind::ALL

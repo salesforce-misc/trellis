@@ -91,9 +91,7 @@ defmodule TrellisTest do
 
     for statement <- [
           "PAUSE TRANSFORM gadget_prices",
-          "  drop transform gadget_prices",
-          "RELATIONSHIP owner FROM gadgets.id TO gadgets.id",
-          "DROP RELATIONSHIP gadgets.owner"
+          "  drop transform gadget_prices"
         ] do
       assert {:error, %Error{code: :validation, message: message}} =
                Trellis.define(trellis, statement)

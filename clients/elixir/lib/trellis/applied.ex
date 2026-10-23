@@ -5,8 +5,6 @@ defmodule Trellis.Applied do
   - `{:transform_defined, target_table}`: a `TRANSFORM` statement registered
     the transform writing `target_table` (fully qualified), at
     `:waiting_to_backfill`.
-  - `{:relationship_defined, %Trellis.Relationship{}}`: a `RELATIONSHIP`
-    statement registered a relationship.
   - `:paused`: a `PAUSE TRANSFORM` statement froze its subject, or found it
     already frozen.
   - `{:resumed, addresses}`: a `RESUME TRANSFORM` statement unfroze its
@@ -33,7 +31,6 @@ defmodule Trellis.Applied do
 
   @type t ::
           {:transform_defined, String.t()}
-          | {:relationship_defined, Trellis.Relationship.t()}
           | :paused
           | {:resumed, [String.t()]}
           | :dropped
@@ -44,9 +41,6 @@ defmodule Trellis.Applied do
   @spec from_native(map()) :: t()
   def from_native(%{kind: :transform_defined, target_table: target_table}),
     do: {:transform_defined, target_table}
-
-  def from_native(%{kind: :relationship_defined, relationship: relationship}),
-    do: {:relationship_defined, Trellis.Relationship.from_native(relationship)}
 
   def from_native(%{kind: :resumed, columns: columns}), do: {:resumed, columns}
 

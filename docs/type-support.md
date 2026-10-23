@@ -12,16 +12,15 @@ ordered floor to ceiling:
 1. **Passthrough** — captured as text and copied into a derived table
    unchanged. Nearly every type clears it (see
    [Unreferenceable types](#unreferenceable-types) for the exceptions).
-2. **Join / `GROUP BY` key** — matched by equality. A relationship join column
+2. **Join / `GROUP BY` key** — matched by equality. A `JOIN`'s `ON` column
    must be on the join-key allowlist (`TEXT_STABLE_JOIN_KEY_TYPES` in
    `trellis/src/defs/catalog.rs`, by Postgres type name, plus any enum). A
    `GROUP BY` key is gated on its `ValueType` instead
    (`validate::reject_unsupported_group_by_key_type`).
 3. **Primary key** — identifies a row. A source's key must be on the same
    allowlist as join columns (`DdlError::UnsupportedPrimaryKeyType`). The role
-   covers every table whose rows Trellis keys: both endpoints of a
-   relationship too, including an aggregate target whose `GROUP BY` key is
-   off the allowlist.
+   covers every table whose rows Trellis keys, both tables of a `JOIN`
+   included.
 4. **Computed 1-1 target** — a scalar calculated field produces this type.
    Needs an immutable evaluator arm and, for a constant, a typed literal.
 5. **Aggregate target** — an aggregate calculated field folds to this type.
@@ -67,11 +66,7 @@ aggregates Trellis keeps exact from each change alone. Every other aggregate
 is refused at define, named by its family: `MIN`/`MAX`, `bool_and`/`bool_or`/
 `bit_and`/`bit_or`, `SUM`/`AVG` over a float, an `interval` or another type,
 and `array_agg`/`string_agg`/`jsonb_agg`
-([Aggregates that are not supported](#aggregates-that-are-not-supported)). An
-aggregate that reads a relationship path, and one over a to-many relationship
-path in a 1-1 target, are exempt until
-[#1115](https://github.com/salesforce-misc/trellis/issues/1115) removes
-relationships.
+([Aggregates that are not supported](#aggregates-that-are-not-supported)).
 
 ### The types of the columns Trellis creates
 
@@ -94,9 +89,7 @@ modifiers. A 1-1 copy holds the source's exact rendering: a `numeric` rewritten 
 `1.25` to `1.2500`, an `interval` from `'1 day'` to `'24 hours'` and a float
 from `-0` to `0` reach the copy, though each pair is equal as a value
 ([ADR-0020](decisions/0020-type-identity.md)). A `GROUP BY` key's column (in the target and its hidden table) takes its value family's type: `integer` or `bigint` by width, `text` for any
-string, unconstrained `numeric`, a temporal type at full precision. A to-one
-relationship's projection keys by the to-side column's exact type, and holds
-each to-side column read through it in that column's type. A `JOIN`
+string, unconstrained `numeric`, a temporal type at full precision. A `JOIN`
 holds its `GROUP BY` and `ON` columns in each column's type and collation, in
 its target and its hidden tables, with no modifier.
 
@@ -179,15 +172,14 @@ per value. So:
 - **Key columns need a deterministic collation.** Trellis matches keys by exact
   text, but a nondeterministic collation's `=` (an ICU collation with
   `deterministic = false`) treats strings that differ as equal. The rule covers
-  a source's primary key, each `GROUP BY` key, each relationship join column
-  and each endpoint's primary key, and is refused at define time with an error
+  a source's primary key, each `GROUP BY` key and each `JOIN` `ON` column,
+  and is refused at define time with an error
   naming the column and collation. A deterministic non-default collation such
   as `"C"` is fine. A 1-1 target's key columns take the source key's
   collation; an aggregate target's take the database default, which is always
   deterministic.
 - **`STRPOS` and `REGEXP_COUNT` need a deterministic collation** on the column
-  they read, directly or through `COALESCE`, another field or a relationship
-  path, because Postgres refuses them under a nondeterministic one while
+  they read, directly or through `COALESCE` or another field, because Postgres refuses them under a nondeterministic one while
   Trellis would compute them from the exact text. `CHAR_LENGTH` and
   `OCTET_LENGTH` accept any column.
 - **`char(n)`** is treated as `text` but is not on the key allowlist: its

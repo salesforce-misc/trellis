@@ -17,12 +17,11 @@ The first change to a page after a checkpoint logs the whole page (a full-page
 image); later changes before the next checkpoint log only the change. The
 more often checkpoints run, the more of the WAL is full-page images.
 
-The share depends on the target's shape. An aggregate that reads a
-relationship path keeps a per-row ledger with a `GROUP BY` index; every other
-aggregate keeps no ledger. A build inserts into that index at random
-positions, so once the index outgrows what a checkpoint interval leaves
-clean, almost every insert logs a full page: 25 million full-page images over
-100M rows, against 0.18 million for a ledger without the index (#723).
+The share depends on the target's shape. A build that inserts into an index
+at random positions logs a full page for almost every insert once the index
+outgrows what a checkpoint interval leaves clean: in #723, a per-row ledger
+with a `GROUP BY` index wrote 25 million full-page images over 100M rows,
+against 0.18 million for a ledger without the index.
 
 The #723 benchmark runs set `checkpoint_timeout=1min` and `max_wal_size=4GB`
 to stress a build, giving a requested checkpoint about every 10 seconds. There,
@@ -37,9 +36,9 @@ restart.
 
 On the 100M-row build above, `lz4` alone cut WAL from 3,370 to 1,918 B per
 built row and define-to-`live` from 1,446 to 1,090 seconds, and the writers
-rose from 1,269 to 1,751 writes per second (#723). The gain is largest for
-targets whose ledger keeps the `GROUP BY` index; an invertible aggregate built
-by Re-derive writes 1,036 B per row and reaches `live` in 396 seconds.
+rose from 1,269 to 1,751 writes per second (#723). The gain is largest for a
+build that inserts into such an index; the same build without the index wrote
+1,036 B per row and reached `live` in 396 seconds.
 
 ### `max_wal_size` and `checkpoint_timeout`
 
@@ -101,7 +100,7 @@ At 10,000 changes per second, a one-hour outage needs about 6.8 GB.
 
 * Take the change rate from your own database: sum `n_tup_ins`, `n_tup_upd`
   and `n_tup_del` in `pg_stat_user_tables` over the tables Trellis captures
-  (each definition's source, and every table its relationships reach) at two
+  (each definition's source, and each table a `JOIN` reads) at two
   points of steady load, and divide by the seconds between. It errs high:
   capture skips an update that changes no column a definition reads. Leave
   out Trellis's own targets: Trellis stages a target's changes for the
@@ -140,43 +139,9 @@ the two ways out:
 A `statement_timeout` meant for application queries belongs on the
 application's roles.
 
-## Index relationship join columns
-
-Index the column each relationship joins by, on the table that holds it:
-
-* `from_col`, on the from-side table. A change to a related row finds the
-  from-side rows to re-derive by looking up `from_col`.
-* `to_col` of a to-many relationship, on the to-side table. A definition
-  that aggregates the related rows reads them by `to_col`. (A to-one's
-  `to_col` is unique, so it has an index already.)
-
-```sql
-CREATE INDEX ON orders (customer_id);
-```
-
-Trellis doesn't create indexes on your tables, so without one each of those
-reads scans the table, and the scan grows with the table, not with the batch
-of keys it looks up. With one, a batch reads only its keys' rows.
-
-Trellis checks for the index each time it prepares a batch's relationship
-reads. A column counts as indexed if it is the leading column of a plain btree
-index that is valid, not partial, and under the column's own collation. For an
-indexed column, Trellis plans the read to use the index, which matters most on
-PostgreSQL 16: while a table's statistics lag its size, it can price thousands
-of probes of a near-unique index above a parallel sequential scan, and read
-the whole table. For an unindexed column, it leaves the plan to PostgreSQL,
-since with no index to use, turning sequential scans off would only cost the
-read its parallel scan. An index you create or drop takes effect on a later
-batch, with no restart or redefine. It changes speed only, never results.
-
-`status()` lists each join column a definition reads that has no such index,
-with the index to create
-([observability](observability.md#transform-status-lifecycle)).
-
 ## Index an aggregate's group key when groups are large
 
-This applies to every aggregate that reads no relationship path, which Trellis
-keeps on the group basis
+This applies to every aggregate, which Trellis keeps on the group basis
 ([ADR-0002](decisions/0002-async-data-flow.md#aggregates-a-basis-per-group-kept-by-deltas)).
 
 On the group basis, some writes recompute an aggregate's groups from the
@@ -281,8 +246,7 @@ The role needs:
   temporary tables.
 * `CREATE` and `USAGE` on the schema each target goes in (owning the schema
   gives both), and `USAGE` on the schema of every source.
-* Ownership of each source table and each relationship to-side table, or
-  membership in the role that owns it, with `INHERIT`.
+* Ownership of each source table, or membership in the role that owns it, with `INHERIT`.
 * `BYPASSRLS` if row-level security applies to it on any table it reads or
   writes, and on the ring's owner, which doesn't inherit it.
 
@@ -290,7 +254,7 @@ Why each is needed, and what Trellis does when one is missing:
 [embedding — What the staging worker needs from the database](embedding.md#what-the-staging-worker-needs-from-the-database),
 [transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)
 and [observability — A halting failure](observability.md#a-halting-failure).
-Define refuses a source or relationship endpoint whose schema the role lacks
+Define refuses a source whose schema the role lacks
 `USAGE` on, or that the role neither owns nor holds any privilege on, and
 names the table and what the role lacks.
 

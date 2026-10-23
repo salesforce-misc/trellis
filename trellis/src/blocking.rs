@@ -38,12 +38,7 @@
 //! [`Trellis::apply`] (see `app`'s module doc), which only registers: a new
 //! definition is built in the background from `waiting_to_backfill`
 //! (ADR-0002), and an `ALTER TRANSFORM` or a column resume starts a
-//! background field build (#666, #625 F8b). The one statement that still
-//! reads table rows inside the call is a to-one relationship's declaration
-//! (or a transform reading through one), which seeds the relationship's
-//! projection from its to-side table. It is bound by the deadline like any
-//! call: on a to-side table too large to seed in time it returns the timeout
-//! error and registers nothing.
+//! background field build (#666, #625 F8b).
 
 use std::future::Future;
 use std::pin::Pin;
@@ -56,7 +51,7 @@ use tokio_postgres::types::PgLsn;
 
 use crate::app::{
     Applied, DefinitionStatus, DefinitionSummary, PoisonEntry, PoisonSample, QuarantineEntry,
-    RelationshipSummary, Trellis, TrellisError, TrellisOptions,
+    Trellis, TrellisError, TrellisOptions,
 };
 use crate::client::build_runtime;
 use crate::config::Config;
@@ -71,7 +66,6 @@ enum Job {
     Migrate(oneshot::Sender<Result<(), TrellisError>>),
     Apply(String, oneshot::Sender<Result<Applied, TrellisError>>),
     Definitions(oneshot::Sender<Result<Vec<DefinitionSummary>, TrellisError>>),
-    Relationships(oneshot::Sender<Result<Vec<RelationshipSummary>, TrellisError>>),
     DumpDefinitionsSql(oneshot::Sender<Result<String, TrellisError>>),
     RequestBackfill(String, oneshot::Sender<Result<(), TrellisError>>),
     PoisonedSince(
@@ -235,13 +229,13 @@ impl BlockingTrellis {
         crate::metrics::Metrics::new()
     }
 
-    /// Runs one statement of Trellis's grammar — define a transform, define a
-    /// relationship, pause, resume, or drop. The single entrypoint for every
+    /// Runs one statement of Trellis's grammar — define, alter, pause,
+    /// resume, or drop a transform. The single entrypoint for every
     /// definition-changing operation; see [`Trellis::apply`] for the grammar,
     /// the addressing rules, and each statement's semantics.
     ///
-    /// In particular, registering a plain (non-relationship) 1-1 transform
-    /// returns before its backfill finishes; poll
+    /// In particular, registering a transform returns before its backfill
+    /// finishes; poll
     /// [`BlockingTrellis::status`] for [`TransformStatus::Live`](crate::TransformStatus::Live).
     pub fn apply(&self, statement_text: &str) -> Result<Applied, TrellisError> {
         self.start_apply(statement_text).wait()
@@ -262,17 +256,6 @@ impl BlockingTrellis {
     /// Submits [`BlockingTrellis::definitions`] and returns without waiting for it.
     pub fn start_definitions(&self) -> PendingCall<Vec<DefinitionSummary>> {
         self.start(Job::Definitions)
-    }
-
-    /// Every registered relationship declaration, oldest first. See
-    /// [`Trellis::relationships`].
-    pub fn relationships(&self) -> Result<Vec<RelationshipSummary>, TrellisError> {
-        self.start_relationships().wait()
-    }
-
-    /// Submits [`BlockingTrellis::relationships`] and returns without waiting for it.
-    pub fn start_relationships(&self) -> PendingCall<Vec<RelationshipSummary>> {
-        self.start(Job::Relationships)
     }
 
     /// SQL that loads this instance's definitions into a database built from
@@ -710,9 +693,6 @@ async fn run(
             }),
             Job::Definitions(reply) => calls.spawn(trellis, submitted, reply, move |t, at| {
                 Box::pin(async move { t.submitted(at, t.definitions()).await })
-            }),
-            Job::Relationships(reply) => calls.spawn(trellis, submitted, reply, move |t, at| {
-                Box::pin(async move { t.submitted(at, t.relationships()).await })
             }),
             Job::DumpDefinitionsSql(reply) => {
                 calls.spawn(trellis, submitted, reply, move |t, at| {

@@ -402,7 +402,13 @@ fn text(values: &[&[Option<&str>]]) -> Vec<Vec<Option<String>>> {
 
 async fn apply_all(operator: &Trellis, statements: &[&str]) {
     for statement in statements {
-        operator.apply(statement).await.expect(statement);
+        if statement.starts_with("RELATIONSHIP") {
+            trellis::dev::defs::create_relationship(operator.pool(), statement)
+                .await
+                .expect(statement);
+        } else {
+            operator.apply(statement).await.expect(statement);
+        }
     }
 }
 

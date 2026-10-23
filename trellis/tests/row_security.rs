@@ -346,6 +346,15 @@ fn refused_for_row_security(result: Result<trellis::Applied, TrellisError>) -> R
     }
 }
 
+fn relationship_refused_for_row_security(
+    result: Result<trellis::defs::RelationshipDefinition, CatalogError>,
+) -> RowSecurity {
+    match result {
+        Err(CatalogError::RowSecurityApplies(rls)) => rls,
+        other => panic!("expected a row-level security refusal, got {other:?}"),
+    }
+}
+
 /// Defining refuses a source, or a relationship's to-side the definition
 /// reads through, whose policies apply to the Trellis role. Enabling RLS on
 /// a table the role owns, for the application's other roles, is routine and
@@ -354,10 +363,12 @@ fn refused_for_row_security(result: Result<trellis::Applied, TrellisError>) -> R
 async fn defining_refuses_a_table_whose_policies_apply_to_the_trellis_role() {
     let cluster = TestCluster::start();
     let it = instance(&cluster).await;
-    it.trellis
-        .apply("RELATIONSHIP parent FROM c.pid TO p.id")
-        .await
-        .expect("declare a relationship");
+    trellis::dev::defs::create_relationship(
+        it.trellis.pool(),
+        "RELATIONSHIP parent FROM c.pid TO p.id",
+    )
+    .await
+    .expect("declare a relationship");
 
     it.admin
         .batch_execute(
@@ -607,10 +618,12 @@ async fn defining_refuses_a_to_one_to_side_whose_policies_apply_to_the_session_r
     let definer = trellis::Trellis::connect(config, trellis::TrellisOptions::default())
         .await
         .expect("connect as the definer");
-    let rls = refused_for_row_security(
-        definer
-            .apply("RELATIONSHIP parent FROM c.pid TO p.id")
-            .await,
+    let rls = relationship_refused_for_row_security(
+        trellis::dev::defs::create_relationship(
+            definer.pool(),
+            "RELATIONSHIP parent FROM c.pid TO p.id",
+        )
+        .await,
     );
     assert_eq!(
         rls,
@@ -621,10 +634,12 @@ async fn defining_refuses_a_to_one_to_side_whose_policies_apply_to_the_session_r
             target: false,
         }
     );
-    it.trellis
-        .apply("RELATIONSHIP parent FROM c.pid TO p.id")
-        .await
-        .expect("the ring's owner, with BYPASSRLS, declares it");
+    trellis::dev::defs::create_relationship(
+        it.trellis.pool(),
+        "RELATIONSHIP parent FROM c.pid TO p.id",
+    )
+    .await
+    .expect("the ring's owner, with BYPASSRLS, declares it");
     let rls = refused_for_row_security(
         definer
             .apply("TRANSFORM c_named FROM public.c SELECT amount AS amount, parent.name AS name")
@@ -909,10 +924,12 @@ async fn a_drain_as_an_unchecked_role_pauses_the_writer_instead_of_skipping_rows
 async fn a_drain_as_an_unchecked_role_pauses_the_reader_of_a_hidden_to_side() {
     let cluster = TestCluster::start();
     let mut it = instance(&cluster).await;
-    it.trellis
-        .apply("RELATIONSHIP parent FROM c.pid TO p.id")
-        .await
-        .expect("declare a relationship");
+    trellis::dev::defs::create_relationship(
+        it.trellis.pool(),
+        "RELATIONSHIP parent FROM c.pid TO p.id",
+    )
+    .await
+    .expect("declare a relationship");
     it.trellis
         .apply("TRANSFORM c_named FROM public.c SELECT amount AS amount, parent.name AS name")
         .await
@@ -980,10 +997,12 @@ async fn a_drain_as_an_unchecked_role_pauses_the_reader_of_a_hidden_to_side() {
 async fn a_refused_read_halts_while_a_key_failure_beside_it_is_held_for_its_definition() {
     let cluster = TestCluster::start();
     let mut it = instance(&cluster).await;
-    it.trellis
-        .apply("RELATIONSHIP parent FROM c.pid TO p.id")
-        .await
-        .expect("declare a relationship");
+    trellis::dev::defs::create_relationship(
+        it.trellis.pool(),
+        "RELATIONSHIP parent FROM c.pid TO p.id",
+    )
+    .await
+    .expect("declare a relationship");
     for ddl in [
         "TRANSFORM c_named FROM public.c SELECT amount AS amount, parent.name AS name",
         "TRANSFORM c_cheap FROM public.c SELECT amount AS amount",
@@ -1412,10 +1431,12 @@ async fn a_seam_fed_table_its_readers_own_is_not_checked_for_the_ring_owner() {
         .expect("define the upstream as the member");
     capture_pass(&mut raw, &pool).await;
     markers::settle_registrations(&pool).await;
-    worker
-        .apply("RELATIONSHIP mirror FROM p.id TO c_copy.id")
-        .await
-        .expect("declare a relationship to the upstream's target");
+    trellis::dev::defs::create_relationship(
+        worker.pool(),
+        "RELATIONSHIP mirror FROM p.id TO c_copy.id",
+    )
+    .await
+    .expect("declare a relationship to the upstream's target");
     worker
         .apply("TRANSFORM c_again FROM public.c_copy SELECT amount AS amount")
         .await
@@ -1516,10 +1537,12 @@ async fn a_seam_fed_table_its_readers_own_is_not_checked_for_the_ring_owner() {
 async fn a_to_side_whose_readers_are_paused_for_row_security_drains_past_the_refusal() {
     let cluster = TestCluster::start();
     let mut it = instance(&cluster).await;
-    it.trellis
-        .apply("RELATIONSHIP parent FROM c.pid TO p.id")
-        .await
-        .expect("declare a relationship");
+    trellis::dev::defs::create_relationship(
+        it.trellis.pool(),
+        "RELATIONSHIP parent FROM c.pid TO p.id",
+    )
+    .await
+    .expect("declare a relationship");
     it.trellis
         .apply("TRANSFORM c_named FROM public.c SELECT amount AS amount, parent.name AS name")
         .await
@@ -1633,7 +1656,13 @@ async fn a_healthy_to_side_skipped_beside_a_refused_one_is_refreshed_by_the_next
         "RELATIONSHIP tag FROM d.qid TO q.id",
         "TRANSFORM d_tagged FROM public.d SELECT tag.label AS label",
     ] {
-        it.trellis.apply(statement).await.expect(statement);
+        if statement.starts_with("RELATIONSHIP") {
+            trellis::dev::defs::create_relationship(it.trellis.pool(), statement)
+                .await
+                .expect(statement);
+        } else {
+            it.trellis.apply(statement).await.expect(statement);
+        }
     }
     capture_pass(&mut it.raw, &it.pool).await;
     markers::settle_registrations(&it.pool).await;
@@ -1708,10 +1737,12 @@ async fn a_healthy_to_side_skipped_beside_a_refused_one_is_refreshed_by_the_next
 async fn a_to_side_recompute_skips_a_from_side_whose_readers_are_halted_for_row_security() {
     let cluster = TestCluster::start();
     let mut it = instance(&cluster).await;
-    it.trellis
-        .apply("RELATIONSHIP parent FROM c.pid TO p.id")
-        .await
-        .expect("declare a relationship");
+    trellis::dev::defs::create_relationship(
+        it.trellis.pool(),
+        "RELATIONSHIP parent FROM c.pid TO p.id",
+    )
+    .await
+    .expect("declare a relationship");
     for ddl in [
         "TRANSFORM c_named FROM public.c SELECT amount AS amount, parent.name AS name",
         "TRANSFORM p_copy FROM public.p SELECT name AS name",
@@ -2134,10 +2165,12 @@ async fn a_catch_up_refused_for_row_security_pauses_its_definition() {
 async fn a_catch_up_refused_on_a_to_side_skips_the_refresh_its_frozen_readers_redo() {
     let cluster = TestCluster::start();
     let mut it = instance(&cluster).await;
-    it.trellis
-        .apply("RELATIONSHIP parent FROM c.pid TO p.id")
-        .await
-        .expect("declare a relationship");
+    trellis::dev::defs::create_relationship(
+        it.trellis.pool(),
+        "RELATIONSHIP parent FROM c.pid TO p.id",
+    )
+    .await
+    .expect("declare a relationship");
     it.trellis
         .apply("TRANSFORM c_named FROM public.c SELECT amount AS amount, parent.name AS name")
         .await
