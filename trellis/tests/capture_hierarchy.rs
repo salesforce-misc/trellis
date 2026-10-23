@@ -120,7 +120,7 @@ async fn assert_paused(trellis: &Trellis, target: &str, table: &str, starts: &st
     assert_eq!(failure.source_table, table, "{failure:?}");
     assert!(failure.columns.is_empty(), "{failure:?}");
     assert!(
-        failure.error.starts_with(starts) && failure.error.contains("resume"),
+        failure.error.starts_with(starts) && failure.error.to_lowercase().contains("resume"),
         "{failure:?}"
     );
 }
@@ -331,10 +331,11 @@ async fn a_resume_onto_a_servable_partitioned_source_rebuilds_onto_the_tree() {
     it.raw
         .batch_execute(
             "drop table public.c; \
-             create table public.c (id int not null, pid int not null, amount int, \
-                 primary key (pid, id)) partition by hash (pid); \
+             create table public.c (id int not null, pid int primary key, amount int) \
+                 partition by hash (pid); \
              create table public.c_0 partition of public.c \
-                 for values with (modulus 1, remainder 0)",
+                 for values with (modulus 1, remainder 0); \
+             insert into public.c values (1, 7, 100), (3, 8, 1000)",
         )
         .await
         .expect("recreate the source as a partitioned root");
@@ -360,10 +361,113 @@ async fn a_resume_onto_a_servable_partitioned_source_rebuilds_onto_the_tree() {
         .await
         .expect("a resume onto a servable partitioned source");
     capture_pass(&mut it.raw, &it.db.pool).await;
+    markers::settle_registrations(&it.db.pool).await;
+    assert_live(&it.trellis, "c_sums").await;
+    // The rebuild read the new tree, not the dropped table, and capture
+    // covers the leaf as well as the root.
+    let totals: Vec<(i32, i64)> = it
+        .raw
+        .query(
+            "select pid, total::bigint from public.c_sums order by pid",
+            &[],
+        )
+        .await
+        .expect("read the target")
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    assert_eq!(totals, vec![(7, 100), (8, 1000)]);
+    assert_eq!(triggers(&it.raw, "public.c_0").await.len(), 5);
+    it.trellis.shutdown().await.expect("shutdown");
+}
+
+/// The reverse kind swap: a partitioned source whose tree was never recorded
+/// (an install that stopped before the pass recorded it) dropped and created
+/// again as a plain table pauses its readers, like any recreated source,
+/// instead of forgetting the tree's trigger records.
+#[tokio::test]
+async fn a_partitioned_source_recreated_as_a_plain_table_pauses_its_readers() {
+    let cluster = TestCluster::start();
+    let mut it = instance(&cluster, &[]).await;
+    it.raw
+        .batch_execute(
+            "create table public.q (id int not null, pid int not null, amount int, \
+                 primary key (pid, id)) partition by list (pid); \
+             create table public.q_1 partition of public.q for values in (1); \
+             insert into public.q values (1, 1, 5)",
+        )
+        .await
+        .expect("a partitioned source");
+    it.trellis
+        .apply("TRANSFORM q_sums FROM public.q GROUP BY pid SELECT SUM(amount) AS total")
+        .await
+        .expect("define over the partitioned source");
+    capture_pass(&mut it.raw, &it.db.pool).await;
+    markers::settle_registrations(&it.db.pool).await;
+    assert_live(&it.trellis, "q_sums").await;
+    it.raw
+        .batch_execute(
+            "delete from partition_sources where table_name = 'public.q'; \
+             drop table public.q; \
+             create table public.q (id int not null, pid int not null, amount int, \
+                 primary key (pid, id))",
+        )
+        .await
+        .expect("recreate the source as a plain table");
+    capture_pass(&mut it.raw, &it.db.pool).await;
+    assert_paused(
+        &it.trellis,
+        "q_sums",
+        "public.q",
+        "Trellis's capture of public.q was changed outside Trellis: public.q was a \
+         partitioned table and is now a plain table",
+    )
+    .await;
+    assert_eq!(triggers(&it.raw, "public.q").await, Vec::<String>::new());
+    it.trellis.shutdown().await.expect("shutdown");
+}
+
+/// Trigger records from another cluster (`pg_upgrade`) for a name now held
+/// by the other kind of table are forgotten, as any other cluster's records
+/// are, and the pass installs and records capture on the table there.
+#[tokio::test]
+async fn another_clusters_records_for_the_other_kind_of_table_are_forgotten() {
+    let cluster = TestCluster::start();
+    let mut it = instance(
+        &cluster,
+        &["TRANSFORM c_sums FROM public.c GROUP BY pid SELECT SUM(amount) AS total"],
+    )
+    .await;
+    assert_live(&it.trellis, "c_sums").await;
+    it.raw
+        .batch_execute(
+            "update capture_triggers set system_identifier = '1' \
+                 where table_name = 'public.c'; \
+             drop table public.c; \
+             create table public.c (id int not null, pid int not null, amount int, \
+                 primary key (pid, id)) partition by hash (pid); \
+             create table public.c_0 partition of public.c \
+                 for values with (modulus 1, remainder 0)",
+        )
+        .await
+        .expect("recreate the source as a partitioned root");
+    capture_pass(&mut it.raw, &it.db.pool).await;
     assert_ne!(
         status(&it.trellis, "c_sums").await.status,
         TransformStatus::Paused
     );
+    assert_eq!(triggers(&it.raw, "public.c_0").await.len(), 5);
+    let stale: i64 = it
+        .raw
+        .query_one(
+            "select count(*) from capture_triggers \
+             where table_name = 'public.c' and (system_identifier = '1' or node_oid = 0)",
+            &[],
+        )
+        .await
+        .expect("read the records")
+        .get(0);
+    assert_eq!(stale, 0, "the other cluster's records are gone");
     it.trellis.shutdown().await.expect("shutdown");
 }
 
