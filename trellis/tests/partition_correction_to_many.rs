@@ -800,7 +800,7 @@ async fn a_correction_resumes_after_its_last_committed_page() {
 #[tokio::test]
 async fn an_aggregate_and_a_to_many_reader_are_both_corrected_before_the_queue_clears() {
     const AGGREGATE: &str =
-        "TRANSFORM agg FROM public.items GROUP BY order_id SELECT COUNT(*) AS n";
+        "TRANSFORM agg FROM public.items GROUP BY order_id WITHOUT SOURCE INDEX SELECT COUNT(*) AS n";
     let mut fx = Fx::start_with(&tree("list"), &[DEFINITION, AGGREGATE]).await;
     fx.exec("drop table public.items_p2").await;
     fx.pass().await;

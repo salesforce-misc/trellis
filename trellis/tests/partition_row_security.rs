@@ -88,7 +88,7 @@ async fn instance(cluster: &TestCluster) -> Instance {
         .await
         .expect("connect as the login role");
     trellis
-        .apply("TRANSFORM agg FROM public.items GROUP BY g SELECT COUNT(*) AS n, SUM(v) AS total")
+        .apply("TRANSFORM agg FROM public.items GROUP BY g WITHOUT SOURCE INDEX SELECT COUNT(*) AS n, SUM(v) AS total")
         .await
         .expect("define");
     let mut it = Instance {

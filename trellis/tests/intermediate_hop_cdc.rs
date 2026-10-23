@@ -61,7 +61,7 @@ async fn start() -> Pipeline {
     // target-mutation seam feeds it (#315).
     install_definition(
         &db.pool,
-        "TRANSFORM h3 FROM public.h1 GROUP BY val SELECT COUNT(*) AS n",
+        "TRANSFORM h3 FROM public.h1 GROUP BY val WITHOUT SOURCE INDEX SELECT COUNT(*) AS n",
         &columns,
         "public",
     )

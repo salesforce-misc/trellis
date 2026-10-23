@@ -271,10 +271,10 @@ async fn original(cluster: &TestCluster) -> Original {
     .expect("create the sources");
     for text in [
         "TRANSFORM one FROM public.s1 SELECT v AS v",
-        "TRANSFORM gsum FROM public.g GROUP BY grp SELECT grp AS grp, SUM(amt) AS s, \
+        "TRANSFORM gsum FROM public.g GROUP BY grp WITHOUT SOURCE INDEX SELECT grp AS grp, SUM(amt) AS s, \
          COUNT(*) AS n",
         "TRANSFORM jl FROM public.ja LEFT JOIN public.jb ON ja.k = jb.k \
-         GROUP BY ja.k SELECT ja.k AS k, COUNT(*) AS n, SUM(jb.y) AS sy",
+         GROUP BY ja.k WITHOUT SOURCE INDEX SELECT ja.k AS k, COUNT(*) AS n, SUM(jb.y) AS sy",
     ] {
         trellis.apply(text).await.expect(text);
     }

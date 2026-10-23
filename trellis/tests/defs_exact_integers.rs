@@ -285,7 +285,7 @@ async fn aggregate_column_types_match_postgres() {
         .join(", ");
     install_definition(
         &db.pool,
-        &format!("TRANSFORM t FROM s GROUP BY a4 SELECT a4 AS a4, {select_list}"),
+        &format!("TRANSFORM t FROM s GROUP BY a4 WITHOUT SOURCE INDEX SELECT a4 AS a4, {select_list}"),
         &source_columns(),
         "public",
     )
@@ -517,7 +517,7 @@ async fn an_integer_group_by_target_matches_a_hand_written_sql_query() {
     install_definition(
         &db.pool,
         "TRANSFORM t FROM s GROUP BY a2 \
-         SELECT a2 AS a2, SUM(a4) AS total, MAX(a8) AS biggest, MIN(a4) AS smallest, \
+        WITHOUT SOURCE INDEX SELECT a2 AS a2, SUM(a4) AS total, MAX(a8) AS biggest, MIN(a4) AS smallest, \
                 AVG(a8) AS mean",
         &source_columns(),
         "public",
@@ -579,7 +579,7 @@ async fn an_oid_column_is_a_valid_group_by_key() {
 
     install_definition(
         &db.pool,
-        "TRANSFORM t FROM s GROUP BY o SELECT o AS o, SUM(a4) AS total",
+        "TRANSFORM t FROM s GROUP BY o WITHOUT SOURCE INDEX SELECT o AS o, SUM(a4) AS total",
         &source_columns(),
         "public",
     )
@@ -756,7 +756,7 @@ async fn an_incremental_bigint_sum_stays_equal_to_a_hand_written_group_by() {
     definer
         .apply(
             "TRANSFORM t FROM s GROUP BY a2 \
-             SELECT a2 AS a2, SUM(a4) AS total, MAX(a8) AS biggest, AVG(a4) AS mean",
+            WITHOUT SOURCE INDEX SELECT a2 AS a2, SUM(a4) AS total, MAX(a8) AS biggest, AVG(a4) AS mean",
         )
         .await
         .expect("define");

@@ -380,7 +380,7 @@ mod tests {
         .await
         .expect("connect a definer");
         for text in [
-            "TRANSFORM per_kind FROM public.posts GROUP BY kind SELECT kind AS kind, COUNT(*) AS n",
+            "TRANSFORM per_kind FROM public.posts GROUP BY kind WITHOUT SOURCE INDEX SELECT kind AS kind, COUNT(*) AS n",
             "TRANSFORM labels FROM public.posts SELECT label AS label",
         ] {
             trellis.apply(text).await.expect(text);

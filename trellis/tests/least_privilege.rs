@@ -361,7 +361,7 @@ async fn the_documented_privileges_run_the_whole_lifecycle() {
     apply(
         &trellis,
         "TRANSFORM order_totals FROM public.orders GROUP BY customer_id \
-         SELECT customer_id AS customer_id, COUNT(*) AS n, SUM(amount) AS total",
+        WITHOUT SOURCE INDEX SELECT customer_id AS customer_id, COUNT(*) AS n, SUM(amount) AS total",
     )
     .await;
     apply(

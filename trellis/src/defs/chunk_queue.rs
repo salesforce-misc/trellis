@@ -2545,7 +2545,7 @@ mod tests {
     /// The tables [`seed_waiting_aggregate`]'s definition builds into: its
     /// target, ledger and group deltas.
     async fn create_rollup_target(pool: &Pool) {
-        let text = "TRANSFORM rollup FROM orders GROUP BY g SELECT g AS g, sum(a) AS total";
+        let text = "TRANSFORM rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT g AS g, sum(a) AS total";
         let columns: std::collections::HashMap<String, super::super::ast::ValueType> =
             ["id", "g", "a"]
                 .into_iter()
@@ -2569,7 +2569,7 @@ mod tests {
         raw: &tokio_postgres::Client,
         with_target: bool,
     ) -> i64 {
-        let text = "TRANSFORM rollup FROM orders GROUP BY g SELECT g AS g, sum(a) AS total";
+        let text = "TRANSFORM rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT g AS g, sum(a) AS total";
         raw.batch_execute(
             "create table public.orders (id bigint primary key, g numeric, a numeric); \
              insert into public.orders values (1, 1, 10), (2, 1, 20), (3, 2, 5); \

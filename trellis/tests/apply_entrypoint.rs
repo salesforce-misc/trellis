@@ -103,7 +103,7 @@ async fn every_statement_form_dispatches_through_the_one_entrypoint() {
 
     // TRANSFORM — reports the target table it registered.
     let applied = trellis
-        .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
+        .apply("TRANSFORM order_rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total")
         .await
         .expect("define an aggregate transform");
     let target_table = applied
@@ -376,7 +376,7 @@ async fn statements_outside_the_grammar_are_parse_errors_that_change_nothing() {
         .await
         .expect("declare a relationship to aim the invalid statements at");
     trellis
-        .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
+        .apply("TRANSFORM order_rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total")
         .await
         .expect("define a transform to aim the invalid statements at");
 

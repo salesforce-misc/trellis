@@ -31,7 +31,7 @@ const SRC: &str = "public.src";
 const TARGET: &str = "public.agg";
 const SRC_DDL: &str = "create table public.src (id integer primary key, g integer, v integer); \
                        create index on public.src (g)";
-const AGG: &str = "TRANSFORM agg FROM public.src GROUP BY g SELECT SUM(v) AS total, COUNT(*) AS n";
+const AGG: &str = "TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n";
 const ROLL: &str = "TRANSFORM roll FROM public.agg GROUP BY n WITHOUT SOURCE INDEX \
                     SELECT COUNT(*) AS groups, SUM(total) AS t";
 const TOP: &str = "TRANSFORM top FROM public.roll GROUP BY groups WITHOUT SOURCE INDEX \

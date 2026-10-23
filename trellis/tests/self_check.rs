@@ -937,7 +937,7 @@ async fn self_check_refuses_an_aggregate_target_rather_than_mis_auditing_it() {
     .await
     .expect("connect");
     trellis
-        .apply("TRANSFORM region_counts FROM orders GROUP BY region SELECT region AS region, COUNT(*) AS n")
+        .apply("TRANSFORM region_counts FROM orders GROUP BY region WITHOUT SOURCE INDEX SELECT region AS region, COUNT(*) AS n")
         .await
         .expect("define aggregate transform");
 

@@ -30,7 +30,7 @@ use trellis::{Trellis, TrellisOptions};
 const SRC: &str = "public.src";
 const TARGET: &str = "public.agg";
 const ONE: &str = "TRANSFORM one FROM public.src SELECT g AS g, v AS w";
-const AGG: &str = "TRANSFORM agg FROM public.src GROUP BY g SELECT SUM(v) AS total, COUNT(*) AS n";
+const AGG: &str = "TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n";
 const ACTUAL: &str = "select g, total, n from public.agg order by g";
 const EXPECTED: &str = "select g, sum(v), count(*) from public.src group by g order by g";
 const STATUS: &str = "select status from transform_definitions where target_table = 'public.agg'";
@@ -549,7 +549,7 @@ async fn a_build_writes_averages_numeric_sums_and_composed_fields() {
     trellis::defs::install_definition(
         d.pool(),
         "TRANSFORM agg FROM public.src GROUP BY g \
-         SELECT AVG(v) AS a, SUM(m) AS sm, SUM(v) + COUNT(m) AS c",
+        WITHOUT SOURCE INDEX SELECT AVG(v) AS a, SUM(m) AS sm, SUM(v) + COUNT(m) AS c",
         &columns,
         "public",
     )
@@ -818,7 +818,7 @@ async fn the_whole_source_reads_match_groups_by_hash_or_merge() {
     write(&d, "create index on public.src (g, v)").await;
     define_as(
         &d,
-        "TRANSFORM agg FROM public.src GROUP BY g, v SELECT COUNT(*) AS n",
+        "TRANSFORM agg FROM public.src GROUP BY g, v WITHOUT SOURCE INDEX SELECT COUNT(*) AS n",
     )
     .await;
     run_build(&d).await;

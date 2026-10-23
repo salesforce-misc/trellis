@@ -65,7 +65,7 @@ async fn setup() -> (
     .expect("seed");
     let trellis = define_only(db.dsn()).await;
     let qualified = trellis
-        .apply("TRANSFORM rollup FROM orders GROUP BY g SELECT sum(a) AS total")
+        .apply("TRANSFORM rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total")
         .await
         .expect("define")
         .into_transform()
@@ -256,7 +256,7 @@ async fn a_column_address_wins_over_the_qualified_name_it_spells() {
         .await
         .expect("create schema");
     let other = trellis
-        .apply("TRANSFORM rollup.total FROM orders GROUP BY g SELECT count(*) AS n")
+        .apply("TRANSFORM rollup.total FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT count(*) AS n")
         .await
         .expect("define rollup.total")
         .into_transform()

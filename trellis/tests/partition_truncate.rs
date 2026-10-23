@@ -21,7 +21,7 @@ use trellis::staging::partition_correction::{self, Options, Outcome};
 
 const SOURCE: &str = "public.items";
 const DEFINITION: &str =
-    "TRANSFORM agg FROM public.items GROUP BY g SELECT SUM(v) AS total, COUNT(*) AS n";
+    "TRANSFORM agg FROM public.items GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n";
 
 /// `items` range-partitioned on `g`: leaves `items_p0`..`items_p3` hold the
 /// groups 0-3, 4-7, 8-11 and 12-15. 160 rows, ten per group, `v` the id.

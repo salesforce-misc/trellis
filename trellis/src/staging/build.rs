@@ -4750,46 +4750,6 @@ async fn only_capture_waits(pool: &Pool) -> bool {
 mod tests {
     use super::*;
 
-    /// Whether `text`'s ledger gets its `GROUP BY` index over a source of
-    /// `(id, g, v numeric, x float8)`.
-    fn indexes_groups(text: &str) -> bool {
-        let def = crate::defs::parse(text).expect("parse");
-        let columns: HashMap<String, ValueType> = [
-            ("id", ValueType::Numeric),
-            ("g", ValueType::Numeric),
-            ("v", ValueType::Numeric),
-            ("x", ValueType::Float(crate::float::FloatWidth::Float8)),
-        ]
-        .into_iter()
-        .map(|(c, t)| (c.to_string(), t))
-        .collect();
-        ledger_indexes_groups(&def, &columns, false)
-    }
-
-    /// #723: a target the Re-derive build takes, with only maintained
-    /// fields, gets no `GROUP BY` index on its ledger. One with a recomputed
-    /// field gets it, and so does one the Re-derive build doesn't take: a
-    /// relationship-fed target ([`buildable_shape`] has no relationships to
-    /// route it with). A source that is another definition's target changes
-    /// nothing (#625 F6).
-    #[test]
-    fn only_an_invertible_re_derive_built_ledger_goes_without_its_group_index() {
-        let invertible = "TRANSFORM t FROM src GROUP BY g \
-                          SELECT SUM(v) AS total, AVG(v) AS mean, COUNT(v) AS nv, COUNT(*) AS n";
-        assert!(!indexes_groups(invertible), "invertible, Re-derive built");
-        for recomputed in [
-            "TRANSFORM t FROM src GROUP BY g SELECT MAX(v) AS hi, COUNT(*) AS n",
-            "TRANSFORM t FROM src GROUP BY g SELECT SUM(x) AS total",
-            "TRANSFORM t FROM src GROUP BY g SELECT SUM(v) + COUNT(v) AS both",
-        ] {
-            assert!(indexes_groups(recomputed), "recomputed: {recomputed}");
-        }
-        assert!(
-            indexes_groups("TRANSFORM t FROM src GROUP BY g SELECT SUM(parent.w) AS total"),
-            "a relationship-fed target: !qualifies"
-        );
-    }
-
     /// #625 F-A5 for a Re-derive chunk (#616): a plain aggregate's build over
     /// a source of several chunks, whose `SUM(x + x)` overflows on one row.
     /// (The grammar has no `/`, so this is the overflow #616's own repro
@@ -4832,7 +4792,7 @@ mod tests {
         ]);
         let def = crate::defs::install_definition(
             &pool,
-            "TRANSFORM sums FROM nums GROUP BY g SELECT SUM(x + x) AS doubled, COUNT(*) AS n",
+            "TRANSFORM sums FROM nums GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(x + x) AS doubled, COUNT(*) AS n",
             &columns,
             "public",
         )
@@ -5148,7 +5108,7 @@ mod tests {
                 &self.pool,
                 &format!(
                     "TRANSFORM {target} FROM {target}_src GROUP BY g \
-                     SELECT SUM(x) AS total, COUNT(*) AS n"
+                    WITHOUT SOURCE INDEX SELECT SUM(x) AS total, COUNT(*) AS n"
                 ),
                 &columns,
                 "public",

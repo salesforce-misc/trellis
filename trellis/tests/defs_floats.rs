@@ -431,7 +431,7 @@ async fn float_aggregate_column_types_match_postgres() {
         .join(", ");
     install_definition(
         &db.pool,
-        &format!("TRANSFORM t FROM s GROUP BY i SELECT i AS i, {select_list}"),
+        &format!("TRANSFORM t FROM s GROUP BY i WITHOUT SOURCE INDEX SELECT i AS i, {select_list}"),
         &source_columns(),
         "public",
     )
@@ -731,7 +731,7 @@ async fn a_float_aggregate_target_matches_a_hand_written_sql_query() {
     install_definition(
         &db.pool,
         "TRANSFORM t FROM s GROUP BY i \
-         SELECT i AS i, SUM(f4) AS total4, SUM(f8) AS total8, MIN(f4) AS smallest, \
+        WITHOUT SOURCE INDEX SELECT i AS i, SUM(f4) AS total4, SUM(f8) AS total8, MIN(f4) AS smallest, \
                 MAX(f8) AS biggest, AVG(f4) AS mean",
         &source_columns(),
         "public",
@@ -809,7 +809,7 @@ async fn min_and_max_over_nan_follow_postgres() {
 
     install_definition(
         &db.pool,
-        "TRANSFORM t FROM s GROUP BY i SELECT i AS i, MIN(f8) AS lo, MAX(f8) AS hi",
+        "TRANSFORM t FROM s GROUP BY i WITHOUT SOURCE INDEX SELECT i AS i, MIN(f8) AS lo, MAX(f8) AS hi",
         &source_columns(),
         "public",
     )
@@ -1046,7 +1046,7 @@ async fn a_float_relationship_join_key_is_rejected_by_name() {
 fn a_float_group_by_key_is_rejected() {
     for column in ["f4", "f8"] {
         let def = parse(&format!(
-            "TRANSFORM t FROM s GROUP BY {column} SELECT {column} AS k, SUM(n) AS total"
+            "TRANSFORM t FROM s GROUP BY {column} WITHOUT SOURCE INDEX SELECT {column} AS k, SUM(n) AS total"
         ))
         .expect("parses");
         let err = validate(&def, &source_columns(), &HashMap::new())
@@ -1060,7 +1060,7 @@ fn a_float_group_by_key_is_rejected() {
     // The control: a `numeric` key is still accepted (knowingly weaker, and
     // #110's to tighten), so this is a claim about floats specifically.
     let def =
-        parse("TRANSFORM t FROM s GROUP BY n SELECT n AS k, SUM(n) AS total").expect("parses");
+        parse("TRANSFORM t FROM s GROUP BY n WITHOUT SOURCE INDEX SELECT n AS k, SUM(n) AS total").expect("parses");
     validate(&def, &source_columns(), &HashMap::new()).expect("a numeric GROUP BY key still works");
 }
 
@@ -1206,7 +1206,7 @@ async fn an_incremental_float_aggregate_stays_equal_to_a_hand_written_group_by()
     definer
         .apply(
             "TRANSFORM t FROM s GROUP BY i \
-             SELECT i AS i, SUM(f8) AS total, AVG(f8) AS mean, MAX(f4) AS biggest",
+            WITHOUT SOURCE INDEX SELECT i AS i, SUM(f8) AS total, AVG(f8) AS mean, MAX(f4) AS biggest",
         )
         .await
         .expect("define");

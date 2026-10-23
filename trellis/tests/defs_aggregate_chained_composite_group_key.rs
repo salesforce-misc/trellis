@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! TRANSFORM stock_totals    FROM inventory     GROUP BY warehouse, sku SELECT sum(qty)       AS total_qty
-//! TRANSFORM stock_totals_v2 FROM stock_totals  GROUP BY warehouse      SELECT sum(total_qty) AS total_qty
+//! TRANSFORM stock_totals_v2 FROM stock_totals  GROUP BY warehouse     WITHOUT SOURCE INDEX SELECT sum(total_qty) AS total_qty
 //! ```
 //!
 //! No relationship is involved — this is the plainest possible two-column
@@ -166,9 +166,9 @@ fn stock_totals_columns() -> HashMap<String, ValueType> {
 }
 
 const STOCK_TOTALS: &str = "TRANSFORM stock_totals FROM inventory GROUP BY warehouse, sku \
-     SELECT sum(qty) AS total_qty";
+    WITHOUT SOURCE INDEX SELECT sum(qty) AS total_qty";
 const STOCK_TOTALS_V2: &str = "TRANSFORM stock_totals_v2 FROM stock_totals GROUP BY warehouse \
-     SELECT sum(total_qty) AS total_qty";
+    WITHOUT SOURCE INDEX SELECT sum(total_qty) AS total_qty";
 
 /// The issue's own schema.
 async fn create_schema(client: &Client) {

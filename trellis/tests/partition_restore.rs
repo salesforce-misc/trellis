@@ -50,8 +50,8 @@ impl Fx {
                 ("v", ValueType::Numeric),
             ],
             &[
-                "TRANSFORM agg FROM public.items GROUP BY g SELECT SUM(v) AS total, COUNT(*) AS n",
-                "TRANSFORM plain_agg FROM public.plain GROUP BY g SELECT SUM(v) AS total, \
+                "TRANSFORM agg FROM public.items GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n",
+                "TRANSFORM plain_agg FROM public.plain GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total, \
                  COUNT(*) AS n",
             ],
             &[SOURCE, PLAIN],

@@ -823,7 +823,7 @@ async fn an_aggregate_definition_with_an_unresolvable_group_by_column_is_rejecte
 
     let err = create_definition(
         &db.pool,
-        "TRANSFORM t FROM s GROUP BY a SELECT a AS x",
+        "TRANSFORM t FROM s GROUP BY a WITHOUT SOURCE INDEX SELECT a AS x",
         &HashMap::new(),
     )
     .await
@@ -1451,7 +1451,7 @@ async fn an_aggregate_transform_on_a_plain_table_is_accepted() {
 
     create_definition(
         &db.pool,
-        "TRANSFORM posts_totals FROM posts GROUP BY author SELECT author AS author, \
+        "TRANSFORM posts_totals FROM posts GROUP BY author WITHOUT SOURCE INDEX SELECT author AS author, \
          COUNT(*) AS post_count",
         &source_columns,
     )
@@ -1499,7 +1499,7 @@ async fn an_aggregate_against_a_bare_source_chained_off_an_explicitly_qualified_
     // RowCount error.
     create_definition(
         &db.pool,
-        "TRANSFORM totals FROM t GROUP BY x SELECT x AS x, COUNT(*) AS n",
+        "TRANSFORM totals FROM t GROUP BY x WITHOUT SOURCE INDEX SELECT x AS x, COUNT(*) AS n",
         &columns(&["x"]),
     )
     .await

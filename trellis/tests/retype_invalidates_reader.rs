@@ -509,6 +509,39 @@ async fn a_source_retype_to_unscaled_numeric_pauses_its_sum_readers() {
     trellis.shutdown().await.expect("shutdown");
 }
 
+/// #1096 decision 1 after define: a `SUM` argument re-typed from `integer`
+/// to `double precision` pauses its aggregate on the capture pass, and the
+/// resume refuses with define's family refusal (#1119) until the column is
+/// an admitted type again.
+#[tokio::test]
+async fn a_source_retype_to_a_float_pauses_its_sum_reader_and_the_resume_refuses() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute("create table public.src (id int primary key, g int, q int)")
+        .await
+        .expect("table");
+    let trellis = definer(db.dsn()).await;
+    trellis
+        .apply("TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(q) AS s")
+        .await
+        .expect("define agg");
+    bring_live(&mut raw, &db.pool, &["agg"]).await;
+
+    raw.batch_execute("alter table public.src alter column q type double precision")
+        .await
+        .expect("retype q");
+    full_pass(&mut raw, &db.pool).await;
+    let reported = trellis.status("agg").await.expect("status").expect("agg");
+    assert_eq!(reported.status, TransformStatus::Paused, "{reported:?}");
+
+    match trellis.apply("RESUME TRANSFORM agg").await {
+        Err(err) => assert!(err.to_string().contains("#1119"), "{err}"),
+        Ok(applied) => panic!("the resume should be refused: {applied:?}"),
+    }
+    trellis.shutdown().await.expect("shutdown");
+}
+
 /// Rules 1 and 4: an alter that changes a column's type within the string
 /// family leaves a `JOIN` key pair `t.k = o.k` valid (Trellis's copy of a
 /// `varchar(n)` column is unbounded, #1207, and `varchar` and `text` pair),

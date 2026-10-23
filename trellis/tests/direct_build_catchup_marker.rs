@@ -54,7 +54,7 @@ const HOLD_LOCK: i64 = 430;
 /// relationship, which keeps the definition on the old direct build until
 /// #625 F9.
 const SKU_TOTALS: &str = "TRANSFORM sku_totals FROM sales GROUP BY sku \
-     SELECT sum(amount) AS total, max(item.weight) AS weight";
+    WITHOUT SOURCE INDEX SELECT sum(amount) AS total, max(item.weight) AS weight";
 
 async fn connect_raw(dsn: &str) -> Client {
     let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
@@ -504,7 +504,7 @@ async fn aggregate_build_does_not_double_count_a_read_to_side_change_drained_aft
 
     install_definition(
         &db.pool,
-        "TRANSFORM region_totals FROM orders GROUP BY customer.region SELECT sum(a) AS total",
+        "TRANSFORM region_totals FROM orders GROUP BY customer.region WITHOUT SOURCE INDEX SELECT sum(a) AS total",
         &columns(&[
             ("id", ValueType::Numeric),
             ("customer_id", ValueType::Numeric),

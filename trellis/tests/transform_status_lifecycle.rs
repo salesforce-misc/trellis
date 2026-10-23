@@ -1100,7 +1100,7 @@ async fn every_backfill_mechanism_still_reaches_live_with_no_unsettled_marker() 
     let agg = install_definition(
         &db.pool,
         "TRANSFORM agg_t FROM agg_s GROUP BY grp \
-         SELECT grp AS grp, MAX(a) AS top, MAX(grp_row.w) AS w",
+        WITHOUT SOURCE INDEX SELECT grp AS grp, MAX(a) AS top, MAX(grp_row.w) AS w",
         &agg_cols,
         "public",
     )
@@ -1134,7 +1134,7 @@ async fn every_backfill_mechanism_still_reaches_live_with_no_unsettled_marker() 
     // The Re-derive build (#625 F3): a plain `SUM`.
     let summed = install_definition(
         &db.pool,
-        "TRANSFORM sum_t FROM agg_s GROUP BY grp SELECT grp AS grp, SUM(a) AS total",
+        "TRANSFORM sum_t FROM agg_s GROUP BY grp WITHOUT SOURCE INDEX SELECT grp AS grp, SUM(a) AS total",
         &agg_cols,
         "public",
     )

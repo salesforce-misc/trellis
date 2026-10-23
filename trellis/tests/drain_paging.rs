@@ -26,7 +26,7 @@ use trellis::staging::{StagedWatermark, TRUNCATE_SENTINEL_KEY, claim, liveness};
 const WAKE: &str = "trellis_drain_paging_test";
 
 const GROUP_TOTALS: &str = "TRANSFORM grp_totals FROM items GROUP BY grp \
-     SELECT grp AS grp, SUM(amount) AS total, COUNT(*) AS n";
+    WITHOUT SOURCE INDEX SELECT grp AS grp, SUM(amount) AS total, COUNT(*) AS n";
 
 const ITEM_COPY: &str = "TRANSFORM item_copy FROM items SELECT amount AS amount";
 

@@ -249,9 +249,9 @@ async fn no_table_trellis_creates_holds_a_bounded_varchar() {
         &[
             "TRANSFORM one FROM public.s SELECT g AS g, owner.label AS ol, n AS n",
             "TRANSFORM per_gk FROM public.s GROUP BY g, k \
-             SELECT g AS g, k AS k, COUNT(*) AS c, MIN(k) AS mk, SUM(n) AS sn",
+            WITHOUT SOURCE INDEX SELECT g AS g, k AS k, COUNT(*) AS c, MIN(k) AS mk, SUM(n) AS sn",
             "TRANSFORM per_label FROM public.s GROUP BY owner.label \
-             SELECT owner.label AS l, COUNT(*) AS c",
+            WITHOUT SOURCE INDEX SELECT owner.label AS l, COUNT(*) AS c",
         ],
         &["public.o", "public.s"],
     )

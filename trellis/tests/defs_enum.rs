@@ -261,7 +261,7 @@ async fn two_distinct_enum_types_are_not_comparable_as_a_relationship_join() {
 #[test]
 fn enum_group_by_key_is_admitted() {
     let def =
-        parse("TRANSFORM t FROM s GROUP BY p SELECT p AS k, SUM(n) AS total").expect("parses");
+        parse("TRANSFORM t FROM s GROUP BY p WITHOUT SOURCE INDEX SELECT p AS k, SUM(n) AS total").expect("parses");
     validate(&def, &source_columns(), &HashMap::new())
         .unwrap_or_else(|e| panic!("an enum column must be accepted as a GROUP BY key: {e}"));
 }
@@ -279,7 +279,7 @@ fn enum_group_by_key_is_admitted() {
 #[tokio::test]
 async fn an_enum_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two() {
     const DEF_SQL: &str =
-        "TRANSFORM totals FROM events GROUP BY grp SELECT grp AS grp, SUM(amount) AS total";
+        "TRANSFORM totals FROM events GROUP BY grp WITHOUT SOURCE INDEX SELECT grp AS grp, SUM(amount) AS total";
 
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -477,7 +477,7 @@ async fn enum_group_by_min_max_matches_a_server_side_recompute() {
         .expect("create source table");
 
     let def_sql = "TRANSFORM totals FROM events GROUP BY grp \
-                   SELECT grp AS grp, MIN(p) AS lo, MAX(p) AS hi";
+                  WITHOUT SOURCE INDEX SELECT grp AS grp, MIN(p) AS lo, MAX(p) AS hi";
     let columns = HashMap::from([
         ("id".to_string(), ValueType::Integer(IntWidth::Int4)),
         ("grp".to_string(), ValueType::Integer(IntWidth::Int4)),
@@ -620,7 +620,7 @@ async fn alter_type_add_value_is_reflected_on_the_next_recompute_with_nothing_ca
         .expect("create source table");
 
     let def_sql = "TRANSFORM totals FROM events GROUP BY grp \
-                   SELECT grp AS grp, MIN(p) AS lo, MAX(p) AS hi";
+                  WITHOUT SOURCE INDEX SELECT grp AS grp, MIN(p) AS lo, MAX(p) AS hi";
     let columns = HashMap::from([
         ("id".to_string(), ValueType::Integer(IntWidth::Int4)),
         ("grp".to_string(), ValueType::Integer(IntWidth::Int4)),

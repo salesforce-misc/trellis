@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! TRANSFORM sku_totals    FROM sales       GROUP BY sku SELECT sum(amount) AS total
-//! TRANSFORM sku_totals_v2 FROM sku_totals  GROUP BY sku SELECT sum(total)  AS total2
+//! TRANSFORM sku_totals_v2 FROM sku_totals  GROUP BY sku WITHOUT SOURCE INDEX SELECT sum(total)  AS total2
 //! ```
 //!
 //! The issue's own writeup is explicit that this bug is encoding-independent
@@ -155,9 +155,9 @@ fn sku_totals_columns() -> HashMap<String, ValueType> {
     columns(&[("sku", ValueType::Text), ("total", ValueType::Numeric)])
 }
 
-const SKU_TOTALS: &str = "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT sum(amount) AS total";
+const SKU_TOTALS: &str = "TRANSFORM sku_totals FROM sales GROUP BY sku WITHOUT SOURCE INDEX SELECT sum(amount) AS total";
 const SKU_TOTALS_V2: &str =
-    "TRANSFORM sku_totals_v2 FROM sku_totals GROUP BY sku SELECT sum(total) AS total2";
+    "TRANSFORM sku_totals_v2 FROM sku_totals GROUP BY sku WITHOUT SOURCE INDEX SELECT sum(total) AS total2";
 
 /// `sales` is an aggregate source, and `sku_totals` becomes one once
 /// `sku_totals_v2` chains onto it.

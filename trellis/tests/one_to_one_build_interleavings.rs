@@ -578,7 +578,7 @@ async fn a_chunk_feeds_a_reader_of_its_target_through_the_seam() {
     .await;
     trellis::defs::install_definition(
         d.pool(),
-        "TRANSFORM byg FROM public.one GROUP BY g SELECT COUNT(*) AS n, SUM(dbl) AS s",
+        "TRANSFORM byg FROM public.one GROUP BY g WITHOUT SOURCE INDEX SELECT COUNT(*) AS n, SUM(dbl) AS s",
         &std::collections::HashMap::from([
             ("id".to_string(), int4),
             ("g".to_string(), int4),

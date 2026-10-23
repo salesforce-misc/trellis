@@ -2923,7 +2923,7 @@ mod tests {
         for target in LOST_GROUP_TARGETS {
             crate::defs::catalog::install_definition(
                 &pool,
-                &format!("TRANSFORM {target} FROM items GROUP BY g SELECT sum(a) AS total"),
+                &format!("TRANSFORM {target} FROM items GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total"),
                 &columns,
                 "public",
             )
@@ -3255,7 +3255,7 @@ mod tests {
     #[test]
     fn substitute_reads_a_source_column_in_an_aggregate_argument() {
         let def = crate::defs::parse(
-            "TRANSFORM t FROM s GROUP BY grp SELECT grp AS grp, SUM(val) AS val, \
+            "TRANSFORM t FROM s GROUP BY grp WITHOUT SOURCE INDEX SELECT grp AS grp, SUM(val) AS val, \
              MIN(val) AS lo, MAX(val) + 1 AS hi, val + COUNT(*) AS mean",
         )
         .expect("parse");
@@ -3274,7 +3274,7 @@ mod tests {
     #[test]
     fn substitute_reads_the_source_column_for_a_qualified_name() {
         let def = crate::defs::parse(
-            "TRANSFORM t FROM s GROUP BY grp SELECT grp AS grp, (grp + 1) AS val, \
+            "TRANSFORM t FROM s GROUP BY grp WITHOUT SOURCE INDEX SELECT grp AS grp, (grp + 1) AS val, \
              SUM(s.val) AS total, s.grp + val AS mixed",
         )
         .expect("parse");

@@ -96,7 +96,7 @@ async fn an_aggregate_over_a_mixed_case_table_backfills_and_applies_cdc() {
         .expect("seed the source");
     install(
         &db,
-        "TRANSFORM qty_by_order FROM Shop.OrderItems GROUP BY order_id SELECT SUM(qty) AS total",
+        "TRANSFORM qty_by_order FROM Shop.OrderItems GROUP BY order_id WITHOUT SOURCE INDEX SELECT SUM(qty) AS total",
     )
     .await;
 
@@ -143,7 +143,7 @@ async fn recomputed_fields_over_mixed_case_columns_follow_cdc() {
     install_over(
         &db,
         "TRANSFORM qty_span FROM Shop.OrderItems GROUP BY OrderId \
-         SELECT MIN(Qty) AS lo, MAX(Qty + 1) AS hi1, MAX(Qty) + MIN(Qty) AS ends",
+        WITHOUT SOURCE INDEX SELECT MIN(Qty) AS lo, MAX(Qty + 1) AS hi1, MAX(Qty) + MIN(Qty) AS ends",
         &["id", "OrderId", "Qty"],
     )
     .await;

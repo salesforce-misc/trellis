@@ -132,7 +132,7 @@ async fn a_three_hop_chain_ending_in_an_aggregate_converges() {
         &[
             "TRANSFORM h1 FROM public.src SELECT val AS val",
             "TRANSFORM h2 FROM public.h1 SELECT val AS val",
-            "TRANSFORM h3 FROM public.h2 GROUP BY val SELECT COUNT(*) AS n",
+            "TRANSFORM h3 FROM public.h2 GROUP BY val WITHOUT SOURCE INDEX SELECT COUNT(*) AS n",
         ],
         &numeric_columns(&["id", "val"]),
     )
@@ -182,7 +182,7 @@ async fn an_aggregate_chained_off_an_aggregate_target_converges_and_follows_grou
         .expect("create src");
     install_chain(
         &db,
-        &["TRANSFORM agg FROM public.src GROUP BY val SELECT COUNT(*) AS n"],
+        &["TRANSFORM agg FROM public.src GROUP BY val WITHOUT SOURCE INDEX SELECT COUNT(*) AS n"],
         &HashMap::from([
             ("id".to_string(), ValueType::Numeric),
             ("val".to_string(), ValueType::Text),
@@ -191,7 +191,7 @@ async fn an_aggregate_chained_off_an_aggregate_target_converges_and_follows_grou
     .await;
     install_chain(
         &db,
-        &["TRANSFORM hist FROM public.agg GROUP BY n SELECT COUNT(*) AS groups"],
+        &["TRANSFORM hist FROM public.agg GROUP BY n WITHOUT SOURCE INDEX SELECT COUNT(*) AS groups"],
         &HashMap::from([
             ("val".to_string(), ValueType::Text),
             ("n".to_string(), ValueType::Numeric),

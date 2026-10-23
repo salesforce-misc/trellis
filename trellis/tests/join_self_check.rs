@@ -40,14 +40,14 @@ const DDL: &str = "create table public.a (id integer primary key, ga integer, t 
 /// argument only counted (whose hidden sum isn't kept).
 const LEFT_PAIR: &str = "TRANSFORM l FROM public.a LEFT JOIN public.b \
      ON a.t = b.t AND a.k = b.k GROUP BY a.ga, b.gb \
-     SELECT a.ga AS ga, b.gb AS gb, COUNT(*) AS n, COUNT(a.x) AS cx, SUM(a.x) AS sx, \
+    WITHOUT SOURCE INDEX SELECT a.ga AS ga, b.gb AS gb, COUNT(*) AS n, COUNT(a.x) AS cx, SUM(a.x) AS sx, \
             AVG(b.y) AS ay, COALESCE(SUM(b.y), 0) + COUNT(*) AS mixed, COUNT(b.y) AS cy, \
             COUNT(a.t) AS ct";
 
 /// An inner `JOIN` on `k`, grouped by the `FROM` side only: its target's
 /// key is `ga`'s text.
 const INNER: &str = "TRANSFORM i FROM public.a JOIN public.b ON a.k = b.k GROUP BY a.ga \
-     SELECT a.ga AS ga, COUNT(*) AS n, SUM(a.x) AS sx, SUM(b.y) AS sy";
+    WITHOUT SOURCE INDEX SELECT a.ga AS ga, COUNT(*) AS n, SUM(a.x) AS sx, SUM(b.y) AS sy";
 
 fn int4() -> ValueType {
     ValueType::Integer(IntWidth::Int4)
@@ -531,7 +531,7 @@ async fn each_join_page_records_its_j_lock_wait() {
         &[],
         &[
             "TRANSFORM lock_wait_join FROM public.a JOIN public.b ON a.k = b.k GROUP BY a.ga \
-           SELECT a.ga AS ga, COUNT(*) AS n, SUM(b.y) AS sy",
+          WITHOUT SOURCE INDEX SELECT a.ga AS ga, COUNT(*) AS n, SUM(b.y) AS sy",
         ],
         &["public.a", "public.b"],
     )
@@ -869,7 +869,7 @@ async fn a_group_column_re_collated_mid_walk_skips_and_repeats_no_cell() {
         &[],
         &[
             "TRANSFORM tc FROM public.a JOIN public.b ON a.k = b.k GROUP BY a.ga \
-           SELECT a.ga AS ga, COUNT(*) AS n, SUM(b.y) AS sy",
+          WITHOUT SOURCE INDEX SELECT a.ga AS ga, COUNT(*) AS n, SUM(b.y) AS sy",
         ],
         &["public.a", "public.b"],
     )
@@ -925,7 +925,7 @@ async fn a_group_column_re_collated_mid_walk_skips_and_repeats_no_cell() {
 /// Group columns that are also the join key, and a joined side with no group
 /// columns.
 const GROUP_IS_KEY: &str = "TRANSFORM gk FROM public.a JOIN public.b ON a.k = b.k \
-     GROUP BY a.k, b.gb SELECT a.k AS k, b.gb AS gb, COUNT(*) AS n, SUM(a.x) AS sx";
+     GROUP BY a.k, b.gb WITHOUT SOURCE INDEX SELECT a.k AS k, b.gb AS gb, COUNT(*) AS n, SUM(a.x) AS sx";
 
 /// A `P` or `M` page orders by the hidden cell identity, the join key first
 /// (#1198): the hidden side is a range scan of the hidden table's one index

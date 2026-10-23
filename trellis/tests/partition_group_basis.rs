@@ -39,7 +39,7 @@ use trellis::{Trellis, TrellisOptions};
 
 const SOURCE: &str = "public.items";
 const DEFINITION: &str =
-    "TRANSFORM agg FROM public.items GROUP BY g SELECT SUM(v) AS total, COUNT(*) AS n";
+    "TRANSFORM agg FROM public.items GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n";
 
 /// `items (id, g, v)` partitioned `kind` on `g`, empty.
 fn head(kind: &str) -> String {
@@ -1266,7 +1266,7 @@ async fn a_recorded_leaf_whose_capture_was_switched_off_pauses_the_reader() {
 #[tokio::test]
 async fn a_new_leaf_costs_no_rebuild_and_no_source_wide_enumeration() {
     const LEDGER: &str =
-        "TRANSFORM top FROM public.items GROUP BY g SELECT MAX(v) AS top, COUNT(*) AS n";
+        "TRANSFORM top FROM public.items GROUP BY g WITHOUT SOURCE INDEX SELECT MAX(v) AS top, COUNT(*) AS n";
     for loaded in [false, true] {
         let mut fx = Fx::start_with(&tree("list"), SEED, &[DEFINITION, LEDGER]).await;
         fx.exec("create table public.items_p4 partition of public.items for values in (16, 17)")
@@ -1327,7 +1327,7 @@ async fn a_new_leaf_costs_no_rebuild_and_no_source_wide_enumeration() {
 #[tokio::test]
 async fn a_ledger_aggregate_beside_keeps_its_engine() {
     const LEDGER: &str =
-        "TRANSFORM top FROM public.items GROUP BY g SELECT MAX(v) AS top, COUNT(*) AS n";
+        "TRANSFORM top FROM public.items GROUP BY g WITHOUT SOURCE INDEX SELECT MAX(v) AS top, COUNT(*) AS n";
     let mut fx = Fx::start_with(&tree("list"), SEED, &[DEFINITION, LEDGER]).await;
     let ledger_right = "select g, top, n from public.top \
                         except select g, max(v), count(*) from public.items group by g";
@@ -1994,7 +1994,7 @@ async fn groups_with_a_null_part_read_through_the_root_are_exact() {
     let d = Driver::start(
         &schema,
         &[("id", int4()), ("g", int4()), ("h", int4()), ("v", int4())],
-        &["TRANSFORM agg FROM public.items GROUP BY g, h SELECT SUM(v) AS total, COUNT(*) AS n"],
+        &["TRANSFORM agg FROM public.items GROUP BY g, h WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n"],
         &[SOURCE],
     )
     .await;
@@ -2106,7 +2106,7 @@ async fn a_fresh_build_over_a_partitioned_source_with_rows_goes_per_leaf() {
         .collect();
     trellis::defs::install_definition(
         fx.d.pool(),
-        "TRANSFORM agg2 FROM public.items GROUP BY g SELECT COUNT(*) AS c, SUM(v) AS s",
+        "TRANSFORM agg2 FROM public.items GROUP BY g WITHOUT SOURCE INDEX SELECT COUNT(*) AS c, SUM(v) AS s",
         &defs,
         "public",
     )
@@ -2252,7 +2252,7 @@ async fn a_leaf_read_matches_a_varchar_group_column_at_its_held_type() {
             ("v", int4()),
         ],
         &["TRANSFORM agg FROM public.items GROUP BY g, label \
-           SELECT SUM(v) AS total, COUNT(*) AS n"],
+          WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n"],
         &[SOURCE],
     )
     .await;

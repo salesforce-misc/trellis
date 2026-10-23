@@ -109,7 +109,7 @@ async fn drain(pool: &trellis::Pool, seg_seq: i64, claimed_by: &str) -> apply::A
 }
 
 const ORDER_SUMMARY_SOURCE: &str = "TRANSFORM order_summary FROM order_items GROUP BY order_id \
-     SELECT order_id AS order_id, SUM(amount) AS total, AVG(amount) AS avg_amount, \
+    WITHOUT SOURCE INDEX SELECT order_id AS order_id, SUM(amount) AS total, AVG(amount) AS avg_amount, \
      MAX(amount) AS max_amount, MIN(amount) AS min_amount";
 
 /// Fetches `order_summary`'s current rows, keyed by `order_id` text, as
@@ -188,6 +188,8 @@ async fn setup(db: &testkit::TestDatabase) -> trellis::defs::ast::TransformDef {
 
 #[tokio::test]
 async fn drain_matches_the_oracle_for_aggregate_insert_update_delete_and_grain_migration() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
@@ -405,6 +407,8 @@ async fn drain_matches_the_oracle_for_aggregate_insert_update_delete_and_grain_m
 /// (`insert_cdc_row` + `drain`) and asserts neither `poison_held` nor `key_deaths` ever gets a row.
 #[tokio::test]
 async fn a_null_grouping_key_flows_through_the_live_delta_path_without_quarantine() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
@@ -572,6 +576,8 @@ async fn a_null_grouping_key_flows_through_the_live_delta_path_without_quarantin
 
 #[tokio::test]
 async fn independent_aggregate_batches_deltas_commute_under_out_of_order_drain() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
@@ -635,6 +641,8 @@ async fn independent_aggregate_batches_deltas_commute_under_out_of_order_drain()
 
 #[tokio::test]
 async fn an_aggregate_claim_lost_mid_drain_rolls_back_and_applies_nothing() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
@@ -738,6 +746,8 @@ async fn an_aggregate_claim_lost_mid_drain_rolls_back_and_applies_nothing() {
 
 #[tokio::test]
 async fn a_definition_change_on_an_aggregate_only_source_trips_the_version_fence() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
@@ -820,6 +830,8 @@ async fn a_definition_change_on_an_aggregate_only_source_trips_the_version_fence
 
 #[tokio::test]
 async fn a_definition_change_on_an_unrelated_source_does_not_trip_the_aggregate_fence() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
@@ -910,6 +922,8 @@ async fn a_definition_change_on_an_unrelated_source_does_not_trip_the_aggregate_
 /// batches real, contending writes against both groups.
 #[tokio::test]
 async fn two_overlapping_group_writers_serialize_via_ascending_lock_order_not_deadlock() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
@@ -1057,6 +1071,8 @@ async fn two_overlapping_group_writers_serialize_via_ascending_lock_order_not_de
 /// SUM.
 #[tokio::test]
 async fn explicitly_qualified_aggregate_source_probes_the_right_table_not_a_same_named_decoy() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
@@ -1073,7 +1089,7 @@ async fn explicitly_qualified_aggregate_source_probes_the_right_table_not_a_same
         .expect("seed the public.order_items decoy and the real custom.order_items");
 
     const SOURCE: &str = "TRANSFORM order_summary FROM custom.order_items GROUP BY order_id \
-         SELECT order_id AS order_id, SUM(amount) AS total";
+        WITHOUT SOURCE INDEX SELECT order_id AS order_id, SUM(amount) AS total";
     let def = parse(SOURCE).expect("parse the explicitly-qualified aggregate definition");
     let source_columns = numeric_columns(&["id", "order_id", "amount"]);
     create_definition(&db.pool, SOURCE, &source_columns)
@@ -1166,6 +1182,8 @@ async fn explicitly_qualified_aggregate_source_probes_the_right_table_not_a_same
 /// the group's write and its delete run at least once.
 #[tokio::test]
 async fn explicitly_qualified_aggregate_target_receives_a_live_cdc_write() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
@@ -1179,7 +1197,7 @@ async fn explicitly_qualified_aggregate_target_receives_a_live_cdc_write() {
         .expect("seed source table and the custom schema");
 
     const SOURCE: &str = "TRANSFORM custom.order_summary FROM order_items GROUP BY order_id \
-         SELECT order_id AS order_id, SUM(amount) AS total";
+        WITHOUT SOURCE INDEX SELECT order_id AS order_id, SUM(amount) AS total";
     let def = parse(SOURCE).expect("parse the explicitly-qualified aggregate target");
     let source_columns = numeric_columns(&["id", "order_id", "amount"]);
     create_aggregate_target_table(&db.pool, &def, "custom", &source_columns)
@@ -1283,6 +1301,8 @@ async fn explicitly_qualified_aggregate_target_receives_a_live_cdc_write() {
 /// group's last non-null contributor was gone.
 #[tokio::test]
 async fn sum_goes_null_not_zero_when_a_groups_remaining_rows_are_all_null() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
@@ -1370,6 +1390,8 @@ async fn sum_goes_null_not_zero_when_a_groups_remaining_rows_are_all_null() {
 /// target row removed), not left behind as a stale row.
 #[tokio::test]
 async fn a_brand_new_null_only_group_still_gets_a_target_row_and_is_removed_when_emptied() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
@@ -1385,7 +1407,7 @@ async fn a_brand_new_null_only_group_still_gets_a_target_row_and_is_removed_when
     // has no `AggFieldKind::RecomputeOnly` field, which is exactly the shape
     // that let a NULL-only group's write get suppressed entirely.
     let source_sql = "TRANSFORM null_seed_totals FROM null_seed_items GROUP BY grp \
-         SELECT grp AS grp, SUM(amount) AS total, AVG(amount) AS avg_amount";
+        WITHOUT SOURCE INDEX SELECT grp AS grp, SUM(amount) AS total, AVG(amount) AS avg_amount";
     let def = parse(source_sql).expect("parse null-seed aggregate definition");
     let source_columns = numeric_columns(&["id", "grp", "amount"]);
     create_definition(&db.pool, source_sql, &source_columns)
@@ -1515,6 +1537,8 @@ async fn a_brand_new_null_only_group_still_gets_a_target_row_and_is_removed_when
 /// division, no inflation.
 #[tokio::test]
 async fn avg_maintenance_matches_the_oracle_across_three_single_row_drains_into_one_group() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
@@ -1582,7 +1606,7 @@ async fn avg_maintenance_matches_the_oracle_across_three_single_row_drains_into_
 /// keep their own hidden running-count partial, because `word_count` and
 /// `byte_size` can go NULL independently of each other on the same row.
 const POSTS_TOTALS_SOURCE: &str = "TRANSFORM posts_totals FROM posts_calc GROUP BY author \
-     SELECT author AS author, SUM(word_count) AS total_words, SUM(byte_size) AS total_bytes";
+    WITHOUT SOURCE INDEX SELECT author AS author, SUM(word_count) AS total_words, SUM(byte_size) AS total_bytes";
 
 async fn setup_posts_totals(db: &testkit::TestDatabase) -> trellis::defs::ast::TransformDef {
     let def = parse(POSTS_TOTALS_SOURCE).expect("parse posts_totals aggregate definition");
@@ -1647,6 +1671,8 @@ async fn read_posts_totals_oracle(
 #[tokio::test]
 async fn aggregate_columns_over_different_arguments_maintain_independent_counts_through_insert_and_delete()
  {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
@@ -1744,7 +1770,7 @@ async fn aggregate_columns_over_different_arguments_maintain_independent_counts_
 // ---------------------------------------------------------------------
 
 const ORDER_COUNTS_SOURCE: &str = "TRANSFORM order_counts FROM order_items GROUP BY order_id \
-     SELECT order_id AS order_id, COUNT(*) AS item_count, AVG(amount) AS avg_amount";
+    WITHOUT SOURCE INDEX SELECT order_id AS order_id, COUNT(*) AS item_count, AVG(amount) AS avg_amount";
 
 /// Fetches `order_counts`'s current rows, keyed by `order_id` text, as
 /// `(item_count, avg_amount)` text tuples.
@@ -1821,6 +1847,8 @@ async fn setup_counts(db: &testkit::TestDatabase) -> trellis::defs::ast::Transfo
 /// hidden partials while `AVG` tracks its own independent sum/count pair.
 #[tokio::test]
 async fn count_star_composes_with_avg_across_insert_update_delete_and_grain_migration() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
@@ -2034,6 +2062,8 @@ fn logged_statements_naming(log: &str, table_ident: &str) -> Vec<String> {
 /// timing: locally it usually saw 0, and under a loaded CI run it saw 1,501.
 #[tokio::test]
 async fn backfilling_many_groups_matches_the_oracle_without_per_group_source_scans() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     const GROUP_COUNT: i64 = 750;
 
     let cluster = TestCluster::start();
@@ -2136,7 +2166,7 @@ async fn backfilling_many_groups_matches_the_oracle_without_per_group_source_sca
 
 const REGION_SALES_SOURCE: &str = "TRANSFORM region_sales FROM sales \
      GROUP BY region, order_id \
-     SELECT region AS region, order_id AS order_id, SUM(amount) AS total, COUNT(*) AS cnt";
+    WITHOUT SOURCE INDEX SELECT region AS region, order_id AS order_id, SUM(amount) AS total, COUNT(*) AS cnt";
 
 fn region_sales_columns() -> HashMap<String, ValueType> {
     HashMap::from([
@@ -2194,6 +2224,8 @@ async fn read_region_oracle(
 /// match the oracle exactly.
 #[tokio::test]
 async fn backfilling_a_multi_column_group_by_matches_the_oracle() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
@@ -2260,6 +2292,8 @@ async fn backfilling_a_multi_column_group_by_matches_the_oracle() {
 /// land both groups correctly against the oracle.
 #[tokio::test]
 async fn a_mixed_forced_and_delta_batch_matches_the_oracle() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
@@ -2358,6 +2392,8 @@ async fn a_mixed_forced_and_delta_batch_matches_the_oracle() {
 ///   coalescing, group 30 would never appear at all.
 #[tokio::test]
 async fn drain_many_coalesces_two_sealed_segments_into_one_aggregate_apply_pass() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
@@ -2561,7 +2597,7 @@ async fn drain_many_coalesces_two_sealed_segments_into_one_aggregate_apply_pass(
 // ---------------------------------------------------------------------
 
 const ORDER_ALIAS_SOURCE: &str = "TRANSFORM order_alias_totals FROM order_items GROUP BY order_id \
-     SELECT order_id AS order_id, SUM(amount) AS total, total + total AS double_total";
+    WITHOUT SOURCE INDEX SELECT order_id AS order_id, SUM(amount) AS total, total + total AS double_total";
 
 async fn setup_order_alias_totals(db: &testkit::TestDatabase) -> trellis::defs::ast::TransformDef {
     let def = parse(ORDER_ALIAS_SOURCE).expect("parse order_alias_totals aggregate definition");
@@ -2637,6 +2673,8 @@ async fn read_order_alias_totals_oracle(
 /// against `total`'s current value.
 #[tokio::test]
 async fn drain_computes_an_aggregate_cross_field_alias_through_insert_and_update() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
@@ -2758,6 +2796,8 @@ async fn drain_computes_an_aggregate_cross_field_alias_through_insert_and_update
 /// succeeds and correctly propagates the row.
 #[tokio::test]
 async fn chaining_onto_a_single_group_by_column_aggregate_target_does_not_misread_the_group_key() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
@@ -2772,7 +2812,7 @@ async fn chaining_onto_a_single_group_by_column_aggregate_target_does_not_misrea
         .expect("create source table");
 
     const AGG_SOURCE: &str = "TRANSFORM order_summary FROM order_items GROUP BY order_id \
-         SELECT order_id AS order_id, SUM(amount) AS total";
+        WITHOUT SOURCE INDEX SELECT order_id AS order_id, SUM(amount) AS total";
     let agg_def = parse(AGG_SOURCE).expect("parse aggregate definition");
     let order_items_columns = HashMap::from([
         ("id".to_string(), ValueType::Numeric),
@@ -2909,7 +2949,7 @@ async fn chaining_onto_a_single_group_by_column_aggregate_target_does_not_misrea
 // ---------------------------------------------------------------------------
 
 const SKU_TOTALS_SOURCE: &str =
-    "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT SUM(amount) AS total";
+    "TRANSFORM sku_totals FROM sales GROUP BY sku WITHOUT SOURCE INDEX SELECT SUM(amount) AS total";
 
 /// `sales (id, sku, amount)` seeded with `rows`, and `sku_totals` defined over
 /// it with its target table created. Every row is staged as an insert and
@@ -3050,6 +3090,8 @@ async fn count_row_4_by_a_forced_recompute(
 /// delete empties it.
 #[tokio::test]
 async fn an_insert_and_delete_folded_across_a_recompute_horizon_still_empty_the_group() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
@@ -3080,6 +3122,8 @@ async fn an_insert_and_delete_folded_across_a_recompute_horizon_still_empty_the_
 /// the delete's leaves neither, so the entry has to name the group.
 #[tokio::test]
 async fn an_insert_and_delete_merged_across_segments_and_a_horizon_still_empty_the_group() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
@@ -3120,6 +3164,8 @@ async fn an_insert_and_delete_merged_across_segments_and_a_horizon_still_empty_t
 /// don't create a group row.
 #[tokio::test]
 async fn an_insert_and_delete_folded_with_no_entry_leave_no_group() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
@@ -3147,6 +3193,8 @@ async fn an_insert_and_delete_folded_with_no_entry_leave_no_group() {
 /// row out of `z` (#623 D5).
 #[tokio::test]
 async fn an_update_chain_through_a_recomputed_group_folded_in_one_batch_leaves_it_correct() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
@@ -3214,6 +3262,8 @@ async fn an_update_chain_through_a_recomputed_group_folded_in_one_batch_leaves_i
 /// fold to nothing and leave no row behind.
 #[tokio::test]
 async fn an_insert_and_delete_folded_after_a_probe_saw_the_key_still_empty_the_group() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;

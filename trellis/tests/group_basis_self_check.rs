@@ -27,7 +27,7 @@ use trellis::staging::self_check::{
 use trellis::{Trellis, TrellisOptions};
 
 const SRC: &str = "public.src";
-const AGG: &str = "TRANSFORM agg FROM public.src GROUP BY g SELECT SUM(v) AS total, COUNT(*) AS n";
+const AGG: &str = "TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n";
 
 fn int4() -> ValueType {
     ValueType::Integer(IntWidth::Int4)
@@ -139,7 +139,7 @@ async fn a_converged_group_target_reports_no_divergence_page_by_page() {
 async fn composed_fields_and_numerics_converge_without_divergence() {
     let mut d = start_with(
         "TRANSFORM agg FROM public.src GROUP BY g \
-         SELECT SUM(m) AS total, AVG(m) AS mean, SUM(a) + COUNT(m) AS mixed, COUNT(*) AS n",
+        WITHOUT SOURCE INDEX SELECT SUM(m) AS total, AVG(m) AS mean, SUM(a) + COUNT(m) AS mixed, COUNT(*) AS n",
         "create table public.src (id integer primary key, g integer, a integer, m numeric(10, 2)); \
          create index on public.src (g)",
         &[
@@ -376,7 +376,7 @@ async fn a_write_made_while_capture_was_off_is_reported() {
 async fn composite_keys_with_null_parts_and_expression_arguments() {
     let mut d = start_with(
         "TRANSFORM agg FROM public.src GROUP BY g, h \
-         SELECT SUM(a + b) AS ab, COUNT(a + b) AS nab, COALESCE(SUM(b), 0) AS sb, \
+        WITHOUT SOURCE INDEX SELECT SUM(a + b) AS ab, COUNT(a + b) AS nab, COALESCE(SUM(b), 0) AS sb, \
                 SUM(a) > COUNT(b) AS apart, h + COUNT(*) AS hp",
         "create table public.src (id integer primary key, g integer, h integer, \
                                   a integer, b integer); \

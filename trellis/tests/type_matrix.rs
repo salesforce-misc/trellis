@@ -647,7 +647,7 @@ fn scenario(place: Place, ty: &Ty, row: &Row) -> Scenario {
             ),
             columns: vec![("id", int4()), ("g", value_type), ("x", int4())],
             definition: "TRANSFORM c FROM public.t GROUP BY g \
-                         SELECT g AS g, COUNT(*) AS n, SUM(x) AS sx",
+                        WITHOUT SOURCE INDEX SELECT g AS g, COUNT(*) AS n, SUM(x) AS sx",
             captured: &["public.t"],
             seed_sql: format!("insert into public.t values (1, '{}', 1)", row.seed),
             alter_sql: alter("t", "g"),
@@ -673,7 +673,7 @@ fn scenario(place: Place, ty: &Ty, row: &Row) -> Scenario {
                 ("y", int4()),
             ],
             definition: "TRANSFORM c FROM public.a LEFT JOIN public.b ON a.k = b.k \
-                         GROUP BY a.k SELECT a.k AS k, COUNT(*) AS n, SUM(b.y) AS sy",
+                         GROUP BY a.k WITHOUT SOURCE INDEX SELECT a.k AS k, COUNT(*) AS n, SUM(b.y) AS sy",
             captured: &["public.a", "public.b"],
             seed_sql: format!(
                 "insert into public.a values (1, '{0}', 1); \
@@ -720,7 +720,7 @@ fn scenario(place: Place, ty: &Ty, row: &Row) -> Scenario {
                 ("y", int4()),
             ],
             definition: "TRANSFORM c FROM public.a LEFT JOIN public.b ON a.j = b.j \
-                         GROUP BY a.g SELECT a.g AS g, COUNT(*) AS n, SUM(b.y) AS sy",
+                         GROUP BY a.g WITHOUT SOURCE INDEX SELECT a.g AS g, COUNT(*) AS n, SUM(b.y) AS sy",
             captured: &["public.a", "public.b"],
             seed_sql: format!(
                 "insert into public.a values (1, '{}', 1); insert into public.b values (1, 1, 10)",
@@ -1037,7 +1037,7 @@ async fn a_join_key_keeps_its_collation_from_another_schema() {
     trellis
         .apply(
             "TRANSFORM c FROM public.a JOIN public.b ON a.k = b.k \
-             GROUP BY a.k SELECT a.k AS k, COUNT(*) AS n",
+             GROUP BY a.k WITHOUT SOURCE INDEX SELECT a.k AS k, COUNT(*) AS n",
         )
         .await
         .expect("define the JOIN");
@@ -1250,7 +1250,7 @@ async fn join_on_pairs_the_string_family_and_refuses_other_types_and_collations(
             let result = trellis
                 .apply(
                     "TRANSFORM c FROM public.a JOIN public.b ON a.k = b.k \
-                     GROUP BY a.k SELECT a.k AS k, COUNT(*) AS n",
+                     GROUP BY a.k WITHOUT SOURCE INDEX SELECT a.k AS k, COUNT(*) AS n",
                 )
                 .await
                 .map(|_| ())
@@ -1309,9 +1309,9 @@ async fn paired_string_keys_of_different_bounds_never_truncate() {
         ],
         &[
             "TRANSFORM c FROM public.a LEFT JOIN public.b ON a.k = b.k \
-             GROUP BY a.k SELECT a.k AS k, COUNT(*) AS n, SUM(b.y) AS sy",
+             GROUP BY a.k WITHOUT SOURCE INDEX SELECT a.k AS k, COUNT(*) AS n, SUM(b.y) AS sy",
             "TRANSFORM d FROM public.a LEFT JOIN public.e ON a.k = e.k \
-             GROUP BY a.k SELECT a.k AS k, COUNT(*) AS n, SUM(e.y) AS sy",
+             GROUP BY a.k WITHOUT SOURCE INDEX SELECT a.k AS k, COUNT(*) AS n, SUM(e.y) AS sy",
         ],
         &["public.a", "public.b", "public.e"],
     )

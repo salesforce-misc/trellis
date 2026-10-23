@@ -178,7 +178,7 @@ async fn define_and_build(t: &Trellis, raw: &mut Client) {
         .await
         .expect("o1");
     build_everything(t.pool()).await;
-    t.apply("TRANSFORM tot FROM o1 GROUP BY g, m SELECT g AS g, m AS m, SUM(b) AS total")
+    t.apply("TRANSFORM tot FROM o1 GROUP BY g, m WITHOUT SOURCE INDEX SELECT g AS g, m AS m, SUM(b) AS total")
         .await
         .expect("tot");
     t.apply("TRANSFORM oc FROM orders SELECT cat.name AS cat_name")

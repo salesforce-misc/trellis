@@ -174,9 +174,9 @@ fn sku_totals_columns() -> HashMap<String, ValueType> {
 }
 
 const SKU_TOTALS: &str =
-    "TRANSFORM e2e_latency_agg_sku_totals FROM sales GROUP BY sku SELECT sum(amount) AS total";
+    "TRANSFORM e2e_latency_agg_sku_totals FROM sales GROUP BY sku WITHOUT SOURCE INDEX SELECT sum(amount) AS total";
 const SKU_TOTALS_V2: &str = "TRANSFORM e2e_latency_agg_sku_totals_v2 FROM e2e_latency_agg_sku_totals \
-     GROUP BY sku SELECT sum(total) AS total2";
+     GROUP BY sku WITHOUT SOURCE INDEX SELECT sum(total) AS total2";
 
 /// A one-histogram-family text scrape of `rendered` for `metric{transform="target"}`
 /// — see `end_to_end_latency.rs`'s identical helper.

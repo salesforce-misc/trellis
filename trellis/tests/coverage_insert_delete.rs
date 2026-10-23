@@ -184,7 +184,7 @@ async fn start_held_build(pool: &trellis::Pool, client: &Client) -> tokio::task:
     install_definition(
         pool,
         "TRANSFORM sku_totals FROM sales GROUP BY sku \
-         SELECT max(amount) AS total, max(item.weight) AS weight",
+        WITHOUT SOURCE INDEX SELECT max(amount) AS total, max(item.weight) AS weight",
         &HashMap::from([
             ("id".to_string(), ValueType::Numeric),
             ("sku".to_string(), ValueType::Text),

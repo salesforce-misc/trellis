@@ -40,7 +40,7 @@ async fn a_passthrough_beside_an_aggregate_pauses_and_resumes_exactly() {
          insert into public.s values (1, 'calm', 1, 1), (3, 'calm', 2, 3);",
         &[
             "TRANSFORM t1 FROM public.s SELECT tone AS tone, n AS n",
-            "TRANSFORM agg FROM public.s GROUP BY g SELECT g AS g, COUNT(*) AS c, SUM(n) AS sn",
+            "TRANSFORM agg FROM public.s GROUP BY g WITHOUT SOURCE INDEX SELECT g AS g, COUNT(*) AS c, SUM(n) AS sn",
         ],
     )
     .await;
@@ -193,7 +193,7 @@ async fn a_group_basis_group_by_the_enum_with_a_change_pending_resumes_exactly()
          create index on public.s (tone); \
          insert into public.s values (1, 'brisk', 1), (2, 'calm', 2), (3, 'brisk', 3);",
         &["TRANSFORM per_tone FROM public.s GROUP BY tone \
-           SELECT tone AS tone, COUNT(*) AS c, SUM(n) AS sn"],
+          WITHOUT SOURCE INDEX SELECT tone AS tone, COUNT(*) AS c, SUM(n) AS sn"],
     )
     .await;
     h.write(
@@ -226,7 +226,7 @@ async fn a_join_grouped_by_the_enum_with_a_change_pending_resumes_exactly() {
          insert into public.notes values (1, 1), (2, 2), (3, 1);",
         &[
             "TRANSFORM by_tone FROM public.items JOIN public.notes ON items.id = notes.item_id \
-             GROUP BY items.tone SELECT items.tone AS tone, COUNT(*) AS c",
+             GROUP BY items.tone WITHOUT SOURCE INDEX SELECT items.tone AS tone, COUNT(*) AS c",
         ],
     )
     .await;
@@ -260,7 +260,7 @@ async fn a_new_value_pauses_nothing_and_is_recorded() {
          create table public.k (tone public.tone primary key, n int);",
         &[
             "TRANSFORM t1 FROM public.s SELECT tone AS tone",
-            "TRANSFORM per_tone FROM public.s GROUP BY tone SELECT tone AS tone, COUNT(*) AS c",
+            "TRANSFORM per_tone FROM public.s GROUP BY tone WITHOUT SOURCE INDEX SELECT tone AS tone, COUNT(*) AS c",
             "TRANSFORM kt FROM public.k SELECT n AS n",
         ],
     )

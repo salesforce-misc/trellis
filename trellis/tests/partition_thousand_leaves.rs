@@ -31,7 +31,7 @@ use trellis::staging::partition_correction::{self, Options};
 
 const SOURCE: &str = "public.items";
 const DEFINITION: &str =
-    "TRANSFORM agg FROM public.items GROUP BY g SELECT SUM(v) AS total, COUNT(*) AS n";
+    "TRANSFORM agg FROM public.items GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n";
 
 fn columns() -> Vec<(&'static str, ValueType)> {
     vec![
@@ -558,7 +558,7 @@ async fn measure_a_thousand_leaf_source() {
         .collect();
     let refused = install_definition(
         fx.d.pool(),
-        "TRANSFORM agg2 FROM public.items GROUP BY g SELECT COUNT(*) AS n",
+        "TRANSFORM agg2 FROM public.items GROUP BY g WITHOUT SOURCE INDEX SELECT COUNT(*) AS n",
         &columns,
         "public",
     )

@@ -1728,7 +1728,7 @@ async fn pausing_an_upstream_column_never_cascades_into_a_downstream_aggregate()
     let order_totals_columns = numeric_columns(&["id", "total"]);
     let stats_def = create_definition(
         &db.pool,
-        "TRANSFORM order_stats FROM order_totals GROUP BY id SELECT id AS id, \
+        "TRANSFORM order_stats FROM order_totals GROUP BY id WITHOUT SOURCE INDEX SELECT id AS id, \
          SUM(total) AS total_sum",
         &order_totals_columns,
     )
@@ -3917,7 +3917,7 @@ async fn an_aggregate_defined_over_a_paused_column_is_not_paused() {
 
     let trellis = trellis_on(&db).await;
     trellis
-        .apply("TRANSFORM sib_stats FROM sib GROUP BY id SELECT id AS id, SUM(total) AS total_sum")
+        .apply("TRANSFORM sib_stats FROM sib GROUP BY id WITHOUT SOURCE INDEX SELECT id AS id, SUM(total) AS total_sum")
         .await
         .expect("define an aggregate over the paused column");
     assert_eq!(
@@ -6026,9 +6026,9 @@ async fn seed_aggregate_readers(db: &TestDatabase) -> (Client, Trellis) {
     change_item(&mut client, &db.pool, 1, None, (10, 5, 0)).await;
     let trellis = trellis_on(db).await;
     for define in [
-        "TRANSFORM sib_stats FROM sib GROUP BY id SELECT id AS id, SUM(total) AS s, \
+        "TRANSFORM sib_stats FROM sib GROUP BY id WITHOUT SOURCE INDEX SELECT id AS id, SUM(total) AS s, \
          MAX(total) AS m",
-        "TRANSFORM sib_costs FROM sib GROUP BY id SELECT id AS id, SUM(cost) AS c",
+        "TRANSFORM sib_costs FROM sib GROUP BY id WITHOUT SOURCE INDEX SELECT id AS id, SUM(cost) AS c",
     ] {
         trellis.apply(define).await.expect("define an aggregate");
         trellis::intake::markers::settle_registrations(&db.pool).await;

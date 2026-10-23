@@ -96,7 +96,7 @@ async fn a_target_that_becomes_a_to_many_from_side_reaches_its_aggregate_through
     .expect("create sources");
     for text in [
         "TRANSFORM h1 FROM public.src SELECT val AS val",
-        "TRANSFORM agg FROM public.h1 GROUP BY val SELECT COUNT(*) AS n",
+        "TRANSFORM agg FROM public.h1 GROUP BY val WITHOUT SOURCE INDEX SELECT COUNT(*) AS n",
     ] {
         install_definition(&db.pool, text, &numeric_columns(&["id", "val"]), "public")
             .await
@@ -149,7 +149,7 @@ async fn an_aggregate_target_is_accepted_as_a_relationship_endpoint() {
     .expect("create sources");
     install_definition(
         &db.pool,
-        "TRANSFORM region_totals FROM sales GROUP BY region SELECT SUM(amount) AS total",
+        "TRANSFORM region_totals FROM sales GROUP BY region WITHOUT SOURCE INDEX SELECT SUM(amount) AS total",
         &HashMap::from([
             ("id".to_string(), ValueType::Integer(IntWidth::Int4)),
             ("region".to_string(), ValueType::Integer(IntWidth::Int4)),
@@ -241,7 +241,7 @@ async fn an_aggregate_target_keyed_on_an_unsupported_type_is_refused_as_an_endpo
     .expect("create sources");
     install_definition(
         &db.pool,
-        "TRANSFORM tier_totals FROM sales GROUP BY region, tier SELECT SUM(amount) AS total",
+        "TRANSFORM tier_totals FROM sales GROUP BY region, tier WITHOUT SOURCE INDEX SELECT SUM(amount) AS total",
         &HashMap::from([
             ("id".to_string(), ValueType::Integer(IntWidth::Int4)),
             ("region".to_string(), ValueType::Integer(IntWidth::Int4)),

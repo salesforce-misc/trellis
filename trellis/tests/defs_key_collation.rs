@@ -131,7 +131,7 @@ async fn a_group_by_column_with_a_nondeterministic_collation_is_refused() {
     .await;
     let err = install_definition(
         &db.pool,
-        "TRANSFORM region_totals FROM sales GROUP BY region SELECT sum(amount) AS total",
+        "TRANSFORM region_totals FROM sales GROUP BY region WITHOUT SOURCE INDEX SELECT sum(amount) AS total",
         &columns(&[
             ("id", ValueType::Numeric),
             ("region", ValueType::Text),
@@ -167,7 +167,7 @@ async fn a_group_by_relationship_path_with_a_nondeterministic_collation_is_refus
     .expect("the join columns are bigint, so the relationship is fine");
     let err = install_definition(
         &db.pool,
-        "TRANSFORM author_counts FROM post_tags GROUP BY post.author SELECT count(*) AS n",
+        "TRANSFORM author_counts FROM post_tags GROUP BY post.author WITHOUT SOURCE INDEX SELECT count(*) AS n",
         &columns(&[
             ("id", ValueType::Numeric),
             ("post", ValueType::Numeric),
@@ -237,7 +237,7 @@ async fn deterministic_non_default_key_collations_pass() {
     install_definition(
         &db.pool,
         "TRANSFORM author_tag_counts FROM post_tags GROUP BY tag, post.author \
-         SELECT count(*) AS n",
+        WITHOUT SOURCE INDEX SELECT count(*) AS n",
         &columns(&[
             ("id", ValueType::Text),
             ("post", ValueType::Numeric),

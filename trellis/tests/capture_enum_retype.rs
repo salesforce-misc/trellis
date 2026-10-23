@@ -71,8 +71,8 @@ async fn a_re_type_to_another_enum_pauses_each_reader_once_and_resumes_exactly()
         &[
             "TRANSFORM t1 FROM public.s SELECT tone AS tone, n AS n",
             "TRANSFORM per_tone FROM public.s GROUP BY tone \
-             SELECT tone AS tone, COUNT(*) AS c, SUM(n) AS sn",
-            "TRANSFORM lo FROM public.s GROUP BY n SELECT n AS n, MIN(tone) AS lo",
+            WITHOUT SOURCE INDEX SELECT tone AS tone, COUNT(*) AS c, SUM(n) AS sn",
+            "TRANSFORM lo FROM public.s GROUP BY n WITHOUT SOURCE INDEX SELECT n AS n, MIN(tone) AS lo",
             "TRANSFORM kt FROM public.k SELECT n AS n",
         ],
     )
@@ -212,7 +212,7 @@ async fn a_draining_resume_keeps_the_target_until_the_changes_drain() {
     let mut h = H::new(
         SOURCE,
         &["TRANSFORM per_tone FROM public.s GROUP BY tone \
-           SELECT tone AS tone, COUNT(*) AS c, SUM(n) AS sn"],
+          WITHOUT SOURCE INDEX SELECT tone AS tone, COUNT(*) AS c, SUM(n) AS sn"],
     )
     .await;
     let before = h
@@ -262,7 +262,7 @@ async fn a_definition_chained_off_a_re_typed_key_resumes_with_its_upstream() {
     let mut h = H::new(
         SOURCE,
         &["TRANSFORM per_tone FROM public.s GROUP BY tone \
-           SELECT tone AS tone, COUNT(*) AS c, SUM(n) AS sn"],
+          WITHOUT SOURCE INDEX SELECT tone AS tone, COUNT(*) AS c, SUM(n) AS sn"],
     )
     .await;
     let down = "TRANSFORM down FROM public.per_tone SELECT sn AS sn";

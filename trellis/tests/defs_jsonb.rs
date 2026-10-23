@@ -247,7 +247,7 @@ async fn jsonb_is_refused_as_a_relationship_join_key_and_primary_key() {
 #[test]
 fn jsonb_group_by_key_is_refused() {
     let def =
-        parse("TRANSFORM t FROM s GROUP BY j SELECT j AS k, SUM(n) AS total").expect("parses");
+        parse("TRANSFORM t FROM s GROUP BY j WITHOUT SOURCE INDEX SELECT j AS k, SUM(n) AS total").expect("parses");
     validate(&def, &source_columns(), &HashMap::new())
         .expect_err("jsonb must still be refused as a GROUP BY key");
 }
@@ -399,7 +399,7 @@ async fn jsonb_agg_includes_null_rows_unlike_every_other_aggregate() {
     assert_eq!(empty_group, None, "a genuinely empty group is SQL NULL");
 
     // The Rust evaluator must reproduce this exactly (`fold_jsonb_agg`).
-    let def = parse("TRANSFORM out FROM t GROUP BY g SELECT g AS g, JSONB_AGG(v) AS items")
+    let def = parse("TRANSFORM out FROM t GROUP BY g WITHOUT SOURCE INDEX SELECT g AS g, JSONB_AGG(v) AS items")
         .expect("parses");
     let columns = HashMap::from([
         ("g".to_string(), ValueType::Integer(IntWidth::Int4)),
@@ -502,7 +502,7 @@ async fn jsonb_agg_fold_matches_a_server_side_aggregate() {
             .unwrap_or_else(|e| panic!("server jsonb_agg over {group:?}: {e}"))
             .get(0);
 
-        let def = parse("TRANSFORM t FROM s GROUP BY id SELECT id AS k, JSONB_AGG(j) AS items")
+        let def = parse("TRANSFORM t FROM s GROUP BY id WITHOUT SOURCE INDEX SELECT id AS k, JSONB_AGG(j) AS items")
             .expect("parses");
         let columns = source_columns();
         validate(&def, &columns, &HashMap::new()).expect("validate");
@@ -540,7 +540,7 @@ async fn jsonb_agg_fold_matches_a_server_side_aggregate() {
 #[tokio::test]
 async fn a_cdc_apply_produces_a_jsonb_agg_matching_the_live_elements() {
     const DEF_SQL: &str =
-        "TRANSFORM totals FROM events GROUP BY grp SELECT grp AS grp, JSONB_AGG(payload) AS items";
+        "TRANSFORM totals FROM events GROUP BY grp WITHOUT SOURCE INDEX SELECT grp AS grp, JSONB_AGG(payload) AS items";
 
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;

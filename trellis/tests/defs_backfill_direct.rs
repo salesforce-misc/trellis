@@ -250,7 +250,7 @@ async fn aggregate_build_matches_oracle_across_group_key_chunks() {
     drop(client);
 
     let src = "TRANSFORM t FROM s GROUP BY author \
-               SELECT author AS author, SUM(sz) AS total, COUNT(*) AS n";
+              WITHOUT SOURCE INDEX SELECT author AS author, SUM(sz) AS total, COUNT(*) AS n";
     let def = parse(src).expect("parse");
     let cols = numeric(&["author", "sz"]);
     create_definition_without_backfill(&db.pool, src, &cols)
@@ -284,7 +284,7 @@ async fn aggregate_build_handles_null_group_keys() {
     drop(client);
 
     let src = "TRANSFORM t FROM s GROUP BY author \
-               SELECT author AS author, SUM(sz) AS total, COUNT(*) AS n";
+              WITHOUT SOURCE INDEX SELECT author AS author, SUM(sz) AS total, COUNT(*) AS n";
     let def = parse(src).expect("parse");
     let cols = numeric(&["author", "sz"]);
     create_definition_without_backfill(&db.pool, src, &cols)
@@ -347,7 +347,7 @@ async fn aggregate_build_computes_min_max_avg() {
     // direct build computes each with its own aggregate rather than a blanket
     // additive `+` (M3 concern #3).
     let src = "TRANSFORM t FROM s GROUP BY author \
-               SELECT author AS author, MIN(sz) AS lo, MAX(sz) AS hi, AVG(sz) AS mean";
+              WITHOUT SOURCE INDEX SELECT author AS author, MIN(sz) AS lo, MAX(sz) AS hi, AVG(sz) AS mean";
     let def = parse(src).expect("parse");
     let cols = numeric(&["author", "sz"]);
     create_definition_without_backfill(&db.pool, src, &cols)
@@ -410,7 +410,7 @@ async fn aggregate_build_is_idempotent_on_rerun() {
     drop(client);
 
     let src = "TRANSFORM t FROM s GROUP BY author \
-               SELECT author AS author, SUM(sz) AS total, COUNT(*) AS n";
+              WITHOUT SOURCE INDEX SELECT author AS author, SUM(sz) AS total, COUNT(*) AS n";
     let def = parse(src).expect("parse");
     let cols = numeric(&["author", "sz"]);
     create_definition_without_backfill(&db.pool, src, &cols)
@@ -459,7 +459,7 @@ async fn aggregate_build_scans_source_once_not_per_chunk() {
     drop(client);
 
     let src = "TRANSFORM t FROM s GROUP BY author \
-               SELECT author AS author, SUM(sz) AS total, COUNT(*) AS n";
+              WITHOUT SOURCE INDEX SELECT author AS author, SUM(sz) AS total, COUNT(*) AS n";
     let def = parse(src).expect("parse");
     let cols = numeric(&["author", "sz"]);
     create_definition_without_backfill(&db.pool, src, &cols)

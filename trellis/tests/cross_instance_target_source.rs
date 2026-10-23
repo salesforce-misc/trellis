@@ -70,7 +70,7 @@ async fn two_instances(db: &testkit::TestDatabase) -> (Pool, Client) {
     .expect("create instance A's source");
     install_definition(
         &db.pool,
-        "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT sum(amount) AS total",
+        "TRANSFORM sku_totals FROM sales GROUP BY sku WITHOUT SOURCE INDEX SELECT sum(amount) AS total",
         &sales_columns(),
         "public",
     )
@@ -191,7 +191,7 @@ async fn an_aggregate_over_another_instances_aggregate_target_is_rejected() {
 
     let result = install_definition(
         &pool_b,
-        "TRANSFORM sku_rollup FROM public.sku_totals GROUP BY sku SELECT sum(total) AS total2",
+        "TRANSFORM sku_rollup FROM public.sku_totals GROUP BY sku WITHOUT SOURCE INDEX SELECT sum(total) AS total2",
         &sku_totals_columns(),
         "public",
     )
@@ -214,7 +214,7 @@ async fn the_owning_instance_can_still_chain_off_its_own_aggregate_target() {
 
     install_definition(
         &db.pool,
-        "TRANSFORM sku_rollup FROM sku_totals GROUP BY sku SELECT sum(total) AS total2",
+        "TRANSFORM sku_rollup FROM sku_totals GROUP BY sku WITHOUT SOURCE INDEX SELECT sum(total) AS total2",
         &sku_totals_columns(),
         "public",
     )
@@ -323,7 +323,7 @@ async fn a_relationship_endpoint_capture_cant_key_is_rejected() {
     ]);
     install_definition(
         &db.pool,
-        "TRANSFORM region_visits FROM visits GROUP BY region SELECT COUNT(*) AS n",
+        "TRANSFORM region_visits FROM visits GROUP BY region WITHOUT SOURCE INDEX SELECT COUNT(*) AS n",
         &int_columns,
         "public",
     )

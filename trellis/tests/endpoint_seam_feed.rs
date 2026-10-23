@@ -323,7 +323,7 @@ async fn a_seam_row_on_a_target_to_side_drives_an_aggregates_reverse_delta() {
     install_definition(
         &db.pool,
         "TRANSFORM public.tag_totals FROM public.post_tags GROUP BY tag \
-         SELECT SUM(post.word_count) AS total_words",
+        WITHOUT SOURCE INDEX SELECT SUM(post.word_count) AS total_words",
         &tag_columns,
         "public",
     )
@@ -598,7 +598,7 @@ async fn an_aggregate_target_endpoint_is_fed_by_the_seam_null_group_included() {
     install_definition(
         &db.pool,
         "TRANSFORM public.region_totals FROM public.sales GROUP BY region \
-         SELECT SUM(amount) AS total",
+        WITHOUT SOURCE INDEX SELECT SUM(amount) AS total",
         &int_columns(&["id", "region", "amount"]),
         "public",
     )
@@ -911,7 +911,7 @@ async fn an_avg_target_endpoints_prior_images_carry_its_old_means() {
     install_definition(
         &db.pool,
         "TRANSFORM public.region_avgs FROM public.sales GROUP BY region \
-         SELECT AVG(amount) AS mean",
+        WITHOUT SOURCE INDEX SELECT AVG(amount) AS mean",
         &int_columns(&["id", "region", "amount"]),
         "public",
     )
@@ -930,7 +930,7 @@ async fn an_avg_target_endpoints_prior_images_carry_its_old_means() {
     install_definition(
         &db.pool,
         "TRANSFORM public.kind_means FROM public.stores GROUP BY kind \
-         SELECT SUM(avgs.mean) AS total",
+        WITHOUT SOURCE INDEX SELECT SUM(avgs.mean) AS total",
         &store_columns,
         "public",
     )
@@ -1106,7 +1106,7 @@ async fn a_min_max_target_endpoints_prior_images_carry_its_old_extremes() {
     install_definition(
         &db.pool,
         "TRANSFORM public.region_tops FROM public.sales GROUP BY region \
-         SELECT MAX(amount) AS top, MIN(amount) AS low",
+        WITHOUT SOURCE INDEX SELECT MAX(amount) AS top, MIN(amount) AS low",
         &int_columns(&["id", "region", "amount"]),
         "public",
     )
@@ -1125,7 +1125,7 @@ async fn a_min_max_target_endpoints_prior_images_carry_its_old_extremes() {
     install_definition(
         &db.pool,
         "TRANSFORM public.kind_tops FROM public.stores GROUP BY kind \
-         SELECT SUM(tops.top) AS total",
+        WITHOUT SOURCE INDEX SELECT SUM(tops.top) AS total",
         &store_columns,
         "public",
     )

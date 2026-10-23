@@ -9,7 +9,7 @@
 //! documents for the live-apply path.
 //!
 //! ```text
-//! TRANSFORM stock_totals FROM inventory     GROUP BY warehouse, sku SELECT sum(qty) AS total_qty
+//! TRANSFORM stock_totals FROM inventory     GROUP BY warehouse, sku WITHOUT SOURCE INDEX SELECT sum(qty) AS total_qty
 //! TRANSFORM stock_echo   FROM stock_totals                          SELECT total_qty AS echo_qty
 //! ```
 //!
@@ -96,7 +96,7 @@ async fn backfill_across_a_composite_nullable_group_key_writes_the_null_group_wi
 
     install_definition(
         &db.pool,
-        "TRANSFORM stock_totals FROM inventory GROUP BY warehouse, sku SELECT sum(qty) AS total_qty",
+        "TRANSFORM stock_totals FROM inventory GROUP BY warehouse, sku WITHOUT SOURCE INDEX SELECT sum(qty) AS total_qty",
         &columns(&[
             ("id", ValueType::Numeric),
             ("warehouse", ValueType::Text),

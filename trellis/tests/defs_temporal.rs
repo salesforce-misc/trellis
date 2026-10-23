@@ -849,7 +849,7 @@ async fn the_min_max_fold_matches_a_server_side_aggregate() {
 
         for (aggregate, expected) in [("MIN", &server_min), ("MAX", &server_max)] {
             let def = parse(&format!(
-                "TRANSFORM t FROM s GROUP BY id SELECT id AS k, {aggregate}(col) AS out"
+                "TRANSFORM t FROM s GROUP BY id WITHOUT SOURCE INDEX SELECT id AS k, {aggregate}(col) AS out"
             ))
             .expect("parses");
             let columns = HashMap::from([
@@ -915,7 +915,7 @@ async fn the_sum_interval_fold_matches_a_server_side_sum() {
             .unwrap_or_else(|e| panic!("sum over {group:?}: {e}"))
             .get(0);
 
-        let def = parse("TRANSFORM t FROM s GROUP BY id SELECT id AS k, SUM(col) AS out")
+        let def = parse("TRANSFORM t FROM s GROUP BY id WITHOUT SOURCE INDEX SELECT id AS k, SUM(col) AS out")
             .expect("parses");
         let columns = HashMap::from([
             ("id".to_string(), ValueType::Integer(IntWidth::Int8)),
@@ -1380,7 +1380,7 @@ async fn a_precision_modified_temporal_key_is_still_recognized() {
 fn the_group_by_key_gate_follows_the_same_split() {
     for column in ["d", "tm", "tmtz", "ts", "tstz"] {
         let def = parse(&format!(
-            "TRANSFORM t FROM s GROUP BY {column} SELECT {column} AS k, SUM(n) AS total"
+            "TRANSFORM t FROM s GROUP BY {column} WITHOUT SOURCE INDEX SELECT {column} AS k, SUM(n) AS total"
         ))
         .expect("parses");
         validate(&def, &source_columns(), &HashMap::new())
@@ -1390,7 +1390,7 @@ fn the_group_by_key_gate_follows_the_same_split() {
     {
         let column = "iv";
         let def = parse(&format!(
-            "TRANSFORM t FROM s GROUP BY {column} SELECT {column} AS k, SUM(n) AS total"
+            "TRANSFORM t FROM s GROUP BY {column} WITHOUT SOURCE INDEX SELECT {column} AS k, SUM(n) AS total"
         ))
         .expect("parses");
         let err = validate(&def, &source_columns(), &HashMap::new())
@@ -1569,7 +1569,7 @@ async fn sum_interval_and_max_date_are_maintained_end_to_end_through_a_drain() {
     use trellis::staging::{StagedWatermark, apply, seal};
 
     const DEF_SQL: &str = "TRANSFORM shift_totals FROM shifts GROUP BY crew \
-         SELECT crew AS crew, SUM(worked) AS total_worked, MAX(on_day) AS last_day";
+        WITHOUT SOURCE INDEX SELECT crew AS crew, SUM(worked) AS total_worked, MAX(on_day) AS last_day";
 
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -1841,7 +1841,7 @@ async fn a_timestamp_group_key_seeded_by_backfill_and_by_live_read_is_one_group_
     use trellis::staging::{StagedWatermark, apply, seal};
 
     const DEF_SQL: &str =
-        "TRANSFORM totals FROM events GROUP BY grp SELECT grp AS grp, SUM(amount) AS total";
+        "TRANSFORM totals FROM events GROUP BY grp WITHOUT SOURCE INDEX SELECT grp AS grp, SUM(amount) AS total";
 
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;

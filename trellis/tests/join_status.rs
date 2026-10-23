@@ -11,7 +11,7 @@ use trellis::{Config, JoinStatus, Trellis, TrellisOptions};
 
 const BY_REGION: &str = "TRANSFORM by_region FROM orders LEFT JOIN items \
      ON orders.id = items.order_id GROUP BY orders.region \
-     SELECT orders.region AS region, COUNT(*) AS n, SUM(items.qty) AS qty";
+    WITHOUT SOURCE INDEX SELECT orders.region AS region, COUNT(*) AS n, SUM(items.qty) AS qty";
 
 async fn connect_raw(dsn: &str) -> Client {
     let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");

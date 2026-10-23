@@ -191,7 +191,7 @@ async fn a_gone_joined_table_or_to_side_pauses_its_readers() {
     let trellis = definer(db.dsn()).await;
     for text in [
         "TRANSFORM jl FROM public.ja LEFT JOIN public.jb ON ja.k = jb.k \
-         GROUP BY ja.k SELECT ja.k AS k, COUNT(*) AS n, SUM(jb.y) AS sy",
+         GROUP BY ja.k WITHOUT SOURCE INDEX SELECT ja.k AS k, COUNT(*) AS n, SUM(jb.y) AS sy",
         "RELATIONSHIP parent FROM rc.pid TO rp.id",
         "TRANSFORM rc_named FROM public.rc SELECT amount AS amount, parent.name AS name",
     ] {

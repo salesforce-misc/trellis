@@ -20,7 +20,7 @@ const TEST_NAME: &str = "defs_aggregate_field_named_like_source_column_test";
 
 /// The definition from the issue.
 const AGG_TOTALS: &str = "TRANSFORM agg_totals FROM public.agg_src GROUP BY grp \
-    SELECT grp AS grp, SUM(val) AS val, COUNT(*) AS row_count, MIN(val) AS lo, MAX(val) AS hi";
+   WITHOUT SOURCE INDEX SELECT grp AS grp, SUM(val) AS val, COUNT(*) AS row_count, MIN(val) AS lo, MAX(val) AS hi";
 
 fn source_columns() -> HashMap<String, ValueType> {
     HashMap::from([
@@ -180,7 +180,7 @@ async fn an_aggregate_of_another_aggregate_field_is_refused_at_define() {
     let err = install_definition(
         &db.pool,
         "TRANSFORM nested FROM public.agg_src GROUP BY grp \
-         SELECT grp AS grp, SUM(val) AS total, MAX(total) AS biggest",
+        WITHOUT SOURCE INDEX SELECT grp AS grp, SUM(val) AS total, MAX(total) AS biggest",
         &source_columns(),
         "public",
     )

@@ -602,8 +602,7 @@ pub fn aggregate_result_type(name: &str, arg: ValueType) -> Option<ValueType> {
     // falls through to `None` below (`uuid.is_numeric_family()` is `false`,
     // same as `Text`, and `uuid` gets no early-return arm of its own the way
     // `Boolean`/`Text` do — the `_ => None` path several lines down is what
-    // actually returns `None` for it). `trellis/tests/defs_min_max_text_and_uuid.rs`
-    // pins this live.
+    // actually returns `None` for it).
     //
     // Whether the *pure evaluator* (`defs::eval::reduce_numeric_aggregate`)
     // could honor `text`'s ordering with no live connection is a separate

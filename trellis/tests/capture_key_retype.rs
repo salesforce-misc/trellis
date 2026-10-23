@@ -322,7 +322,7 @@ async fn setup(dsn: &str, raw: &mut Client, pool: &trellis::Pool) -> Trellis {
         "RELATIONSHIP author FROM posts.author TO users.handle",
         "TRANSFORM post_authors FROM public.posts SELECT author.name AS author_name",
         "TRANSFORM post_titles FROM public.posts SELECT title AS title",
-        "TRANSFORM per_kind FROM public.posts GROUP BY kind SELECT kind AS kind, COUNT(*) AS n",
+        "TRANSFORM per_kind FROM public.posts GROUP BY kind WITHOUT SOURCE INDEX SELECT kind AS kind, COUNT(*) AS n",
     ] {
         trellis.apply(text).await.expect(text);
     }
@@ -418,10 +418,10 @@ async fn changes_no_key_copy_or_pairing_depends_on_pause_nothing() {
     .expect("seed");
     let trellis = definer(db.dsn()).await;
     for text in [
-        "TRANSFORM per_kind FROM public.events GROUP BY kind SELECT kind AS kind, COUNT(*) AS n",
-        "TRANSFORM per_at FROM public.events GROUP BY at SELECT at AS at, COUNT(*) AS n",
+        "TRANSFORM per_kind FROM public.events GROUP BY kind WITHOUT SOURCE INDEX SELECT kind AS kind, COUNT(*) AS n",
+        "TRANSFORM per_at FROM public.events GROUP BY at WITHOUT SOURCE INDEX SELECT at AS at, COUNT(*) AS n",
         "TRANSFORM per_price FROM public.events GROUP BY price \
-         SELECT price AS price, COUNT(*) AS n",
+        WITHOUT SOURCE INDEX SELECT price AS price, COUNT(*) AS n",
     ] {
         trellis.apply(text).await.expect(text);
     }
@@ -663,7 +663,7 @@ async fn widening_a_group_by_key_pauses_and_resume_widens_the_target_and_ledger_
     trellis
         .apply(
             "TRANSFORM per_shop FROM public.orders GROUP BY shop \
-             SELECT shop AS shop, SUM(amount) AS total, COUNT(*) AS n",
+            WITHOUT SOURCE INDEX SELECT shop AS shop, SUM(amount) AS total, COUNT(*) AS n",
         )
         .await
         .expect("define per_shop");
@@ -992,7 +992,7 @@ async fn a_type_change_that_re_renders_the_keys_pauses_and_resume_rebuilds_it() 
     let trellis = definer(db.dsn()).await;
     for text in [
         "TRANSFORM by_taken FROM public.readings SELECT v AS v",
-        "TRANSFORM per_day FROM public.readings GROUP BY at_day SELECT at_day AS at_day, \
+        "TRANSFORM per_day FROM public.readings GROUP BY at_day WITHOUT SOURCE INDEX SELECT at_day AS at_day, \
          SUM(v) AS total",
     ] {
         trellis.apply(text).await.expect(text);
@@ -1085,7 +1085,7 @@ async fn a_nondeterministic_collation_on_a_group_by_column_pauses_its_reader() {
     let mut raw = connect(db.dsn()).await;
     let trellis = setup(db.dsn(), &mut raw, &db.pool).await;
     trellis
-        .apply("TRANSFORM per_title FROM public.posts GROUP BY title SELECT COUNT(*) AS n")
+        .apply("TRANSFORM per_title FROM public.posts GROUP BY title WITHOUT SOURCE INDEX SELECT COUNT(*) AS n")
         .await
         .expect("define per_title");
     bring_live(&mut raw, &db.pool, &["per_title"]).await;
@@ -1131,7 +1131,7 @@ async fn a_wider_numeric_scale_on_a_group_by_key_keeps_its_groups_and_a_narrower
     trellis
         .apply(
             "TRANSFORM per_price FROM public.posts GROUP BY price \
-             SELECT price AS price, COUNT(*) AS n, SUM(kind) AS kinds",
+            WITHOUT SOURCE INDEX SELECT price AS price, COUNT(*) AS n, SUM(kind) AS kinds",
         )
         .await
         .expect("define per_price");
@@ -1330,7 +1330,7 @@ async fn widening_a_group_by_key_read_through_a_relationship_re_types_no_project
     for text in [
         "RELATIONSHIP author FROM posts.author_id TO users.id",
         "TRANSFORM per_country FROM public.posts GROUP BY author.country \
-         SELECT author.country AS country, COUNT(*) AS n",
+        WITHOUT SOURCE INDEX SELECT author.country AS country, COUNT(*) AS n",
     ] {
         trellis.apply(text).await.expect(text);
     }
@@ -1471,7 +1471,7 @@ async fn a_crash_between_two_tables_re_types_leaves_the_rest_to_the_next_pass() 
     trellis
         .apply(
             "TRANSFORM per_shop FROM public.orders GROUP BY shop \
-             SELECT shop AS shop, SUM(amount) AS total",
+            WITHOUT SOURCE INDEX SELECT shop AS shop, SUM(amount) AS total",
         )
         .await
         .expect("define per_shop");
@@ -1546,7 +1546,7 @@ async fn widening_a_summed_column_pauses_and_resume_re_types_its_contribution_an
     trellis
         .apply(
             "TRANSFORM per_shop FROM public.orders GROUP BY shop \
-             SELECT shop AS shop, SUM(amount) AS total, MIN(amount) AS least, \
+            WITHOUT SOURCE INDEX SELECT shop AS shop, SUM(amount) AS total, MIN(amount) AS least, \
                     MAX(note) AS last_note, COUNT(*) AS n",
         )
         .await
@@ -1658,7 +1658,7 @@ async fn a_resume_refuses_an_aggregate_whose_sum_argument_moved_between_numeric_
     trellis
         .apply(
             "TRANSFORM per_shop FROM public.orders GROUP BY shop \
-             SELECT shop AS shop, SUM(amount) AS total, COUNT(*) AS n",
+            WITHOUT SOURCE INDEX SELECT shop AS shop, SUM(amount) AS total, COUNT(*) AS n",
         )
         .await
         .expect("define per_shop");
@@ -1717,7 +1717,7 @@ async fn a_resume_refuses_an_aggregate_whose_sum_argument_moved_from_float_to_nu
     trellis
         .apply(
             "TRANSFORM per_shop FROM public.orders GROUP BY shop \
-             SELECT shop AS shop, SUM(amount) AS total, COUNT(*) AS n",
+            WITHOUT SOURCE INDEX SELECT shop AS shop, SUM(amount) AS total, COUNT(*) AS n",
         )
         .await
         .expect("define per_shop");
@@ -1760,7 +1760,7 @@ async fn the_worker_refuses_a_requested_resume_whose_delta_table_s_shape_changed
     trellis
         .apply(
             "TRANSFORM per_shop FROM public.orders GROUP BY shop \
-             SELECT shop AS shop, SUM(amount) AS total, COUNT(*) AS n",
+            WITHOUT SOURCE INDEX SELECT shop AS shop, SUM(amount) AS total, COUNT(*) AS n",
         )
         .await
         .expect("define per_shop");
@@ -1815,7 +1815,7 @@ async fn the_worker_refuses_a_requested_resume_whose_ledger_was_dropped_first() 
     for define in [
         "TRANSFORM one_to_one FROM public.orders SELECT shop AS shop, amount AS amount",
         "TRANSFORM per_shop FROM public.orders GROUP BY shop \
-         SELECT shop AS shop, SUM(amount) AS total, COUNT(*) AS n",
+        WITHOUT SOURCE INDEX SELECT shop AS shop, SUM(amount) AS total, COUNT(*) AS n",
     ] {
         trellis.apply(define).await.expect("define");
     }
@@ -1875,7 +1875,7 @@ async fn a_resume_refuses_an_aggregate_whose_group_delta_table_is_missing() {
     trellis
         .apply(
             "TRANSFORM per_shop FROM public.orders GROUP BY shop \
-             SELECT shop AS shop, SUM(amount) AS total, COUNT(*) AS n",
+            WITHOUT SOURCE INDEX SELECT shop AS shop, SUM(amount) AS total, COUNT(*) AS n",
         )
         .await
         .expect("define per_shop");
@@ -1928,7 +1928,7 @@ async fn a_resume_refuses_a_definition_whose_ledger_table_is_missing() {
     for define in [
         "TRANSFORM one_to_one FROM public.orders SELECT shop AS shop, amount AS amount",
         "TRANSFORM per_shop FROM public.orders GROUP BY shop \
-         SELECT shop AS shop, SUM(amount) AS total, COUNT(*) AS n",
+        WITHOUT SOURCE INDEX SELECT shop AS shop, SUM(amount) AS total, COUNT(*) AS n",
     ] {
         trellis.apply(define).await.expect("define");
     }
@@ -1981,7 +1981,7 @@ async fn a_resume_goes_ahead_when_a_sum_argument_retype_keeps_the_delta_table_s_
     trellis
         .apply(
             "TRANSFORM per_shop FROM public.orders GROUP BY shop \
-             SELECT shop AS shop, SUM(amount) AS total, MIN(amount) AS least, COUNT(*) AS n",
+            WITHOUT SOURCE INDEX SELECT shop AS shop, SUM(amount) AS total, MIN(amount) AS least, COUNT(*) AS n",
         )
         .await
         .expect("define per_shop");
@@ -2017,7 +2017,7 @@ async fn a_column_resume_of_an_aggregate_field_ignores_the_delta_table_s_shape()
     trellis
         .apply(
             "TRANSFORM per_shop FROM public.orders GROUP BY shop \
-             SELECT shop AS shop, SUM(amount) AS total, COUNT(*) AS n",
+            WITHOUT SOURCE INDEX SELECT shop AS shop, SUM(amount) AS total, COUNT(*) AS n",
         )
         .await
         .expect("define per_shop");
@@ -2115,7 +2115,7 @@ async fn an_upstream_sum_re_typed_to_numeric_pauses_and_resume_re_types_its_down
     trellis
         .apply(
             "TRANSFORM shop_totals FROM public.sales GROUP BY shop \
-             SELECT shop AS shop, SUM(amount) AS total",
+            WITHOUT SOURCE INDEX SELECT shop AS shop, SUM(amount) AS total",
         )
         .await
         .expect("define shop_totals");
@@ -2123,7 +2123,7 @@ async fn an_upstream_sum_re_typed_to_numeric_pauses_and_resume_re_types_its_down
     trellis
         .apply(
             "TRANSFORM smallest FROM public.shop_totals GROUP BY shop \
-             SELECT shop AS shop, MIN(total) AS least",
+            WITHOUT SOURCE INDEX SELECT shop AS shop, MIN(total) AS least",
         )
         .await
         .expect("define smallest");
@@ -2891,7 +2891,7 @@ async fn no_chain_of_upstreams_a_resume_waits_on_can_loop() {
     // items -> item_names, and item_names joined into items.
     refused(
         "TRANSFORM items FROM public.others JOIN public.item_names \
-         ON others.id = item_names.id GROUP BY others.region SELECT COUNT(*) AS n",
+         ON others.id = item_names.id GROUP BY others.region WITHOUT SOURCE INDEX SELECT COUNT(*) AS n",
     )
     .await;
     // items -> item_names, item_names the to-side others reads, and others
@@ -3290,7 +3290,7 @@ async fn changes_no_created_column_outgrows_pause_nothing() {
         "TRANSFORM line_sizes FROM public.lines \
          SELECT CHAR_LENGTH(name) AS len, qty + 2.5 AS scaled, qty + 1 AS next",
         "TRANSFORM per_kind FROM public.lines GROUP BY kind \
-         SELECT kind AS kind, MAX(name) AS top, SUM(price) AS total, SUM(qty) AS qty_total, \
+        WITHOUT SOURCE INDEX SELECT kind AS kind, MAX(name) AS top, SUM(price) AS total, SUM(qty) AS qty_total, \
                 MIN(qty) AS least",
     ] {
         trellis.apply(text).await.expect(text);
@@ -3411,7 +3411,7 @@ async fn widening_fixture(
         "TRANSFORM user_labels FROM public.users SELECT label AS label",
         "TRANSFORM post_labels FROM public.posts SELECT author.label AS author_label",
         "TRANSFORM per_author FROM public.posts GROUP BY author \
-         SELECT author AS author, MAX(amount) AS top",
+        WITHOUT SOURCE INDEX SELECT author AS author, MAX(amount) AS top",
     ] {
         trellis.apply(text).await.expect(text);
     }

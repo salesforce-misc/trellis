@@ -263,7 +263,7 @@ async fn pausing_twice_is_a_no_op_success() {
 
     let trellis = define_only(db.dsn()).await;
     trellis
-        .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
+        .apply("TRANSFORM order_rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total")
         .await
         .expect("an aggregate definition registers")
         .into_transform()
@@ -374,11 +374,11 @@ async fn resume_rebuilds_by_backfill_and_a_paused_definition_never_pins_the_ring
     // precondition holds instead of polled for under a wall-clock budget.
     let trellis = define_only(db.dsn()).await;
     trellis
-        .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
+        .apply("TRANSFORM order_rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total")
         .await
         .expect("define the transform under test");
     trellis
-        .apply("TRANSFORM order_echo FROM orders GROUP BY g SELECT sum(a) AS total")
+        .apply("TRANSFORM order_echo FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total")
         .await
         .expect("define a sibling over the same source");
     // Registration only records the two aggregates (#419); their direct-build
@@ -568,7 +568,7 @@ async fn dropping_takes_the_target_table_and_its_data_with_it() {
     trellis
         .apply(
             "TRANSFORM order_rollup FROM orders GROUP BY g \
-             SELECT sum(a) AS total, max(grp.w) AS w",
+            WITHOUT SOURCE INDEX SELECT sum(a) AS total, max(grp.w) AS w",
         )
         .await
         .expect("define");
@@ -731,7 +731,7 @@ async fn dropping_reaps_the_targets_schema_nodes_row() {
 
     let trellis = define_only(db.dsn()).await;
     trellis
-        .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
+        .apply("TRANSFORM order_rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total")
         .await
         .expect("define");
     assert_eq!(
@@ -787,14 +787,14 @@ async fn dropping_is_refused_and_names_the_live_dependents() {
 
     let trellis = define_only(db.dsn()).await;
     trellis
-        .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
+        .apply("TRANSFORM order_rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total")
         .await
         .expect("define the upstream");
     // A transform chains only off a live target; the upstream's direct-build
     // job takes it there (#419).
     markers::settle_registrations(&db.pool).await;
     trellis
-        .apply("TRANSFORM grand_total FROM order_rollup GROUP BY g SELECT sum(total) AS t")
+        .apply("TRANSFORM grand_total FROM order_rollup GROUP BY g WITHOUT SOURCE INDEX SELECT sum(total) AS t")
         .await
         .expect("define a transform chained off the first one's target");
     markers::settle_registrations(&db.pool).await;
@@ -880,14 +880,14 @@ async fn dropping_is_refused_by_a_dependent_in_any_status_not_only_live() {
 
     let trellis = define_only(db.dsn()).await;
     trellis
-        .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
+        .apply("TRANSFORM order_rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total")
         .await
         .expect("define the upstream");
     // A transform chains only off a live target; the upstream's direct-build
     // job takes it there (#419).
     markers::settle_registrations(&db.pool).await;
     trellis
-        .apply("TRANSFORM grand_total FROM order_rollup GROUP BY g SELECT sum(total) AS t")
+        .apply("TRANSFORM grand_total FROM order_rollup GROUP BY g WITHOUT SOURCE INDEX SELECT sum(total) AS t")
         .await
         .expect("define a transform chained off the first one's target");
     trellis
@@ -971,7 +971,7 @@ async fn dropping_an_unregistered_definition_is_a_no_op_success() {
         .expect("dropping something that was never defined is a success");
 
     trellis
-        .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
+        .apply("TRANSFORM order_rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total")
         .await
         .expect("define");
     trellis
@@ -1005,7 +1005,7 @@ async fn dropping_a_live_definition_is_refused_until_it_is_paused() {
 
     let trellis = define_only(db.dsn()).await;
     trellis
-        .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
+        .apply("TRANSFORM order_rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total")
         .await
         .expect("define");
     markers::settle_registrations(&db.pool).await;
@@ -1054,11 +1054,11 @@ async fn dropping_takes_target_owned_quarantine_rows_and_leaves_a_siblings_poiso
 
     let trellis = define_only(db.dsn()).await;
     trellis
-        .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
+        .apply("TRANSFORM order_rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total")
         .await
         .expect("define the definition under test");
     trellis
-        .apply("TRANSFORM order_echo FROM orders GROUP BY g SELECT sum(a) AS total")
+        .apply("TRANSFORM order_echo FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total")
         .await
         .expect("a sibling over the same source, which co-owns the poison band");
 
@@ -1504,7 +1504,7 @@ async fn dropping_leaves_capture_to_the_staging_worker() {
 
     let trellis = define_only(db.dsn()).await;
     trellis
-        .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
+        .apply("TRANSFORM order_rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total")
         .await
         .expect("define");
     let desired = trellis::defs::tables_to_capture(&db.pool)

@@ -480,7 +480,7 @@ async fn a_requested_backfill_sweeps_a_stale_aggregate_group() {
         .expect("hold sales out of the Re-derive build");
     install_definition(
         &db.pool,
-        "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT sum(amount) AS total",
+        "TRANSFORM sku_totals FROM sales GROUP BY sku WITHOUT SOURCE INDEX SELECT sum(amount) AS total",
         &sales_types(),
         "public",
     )
@@ -520,7 +520,7 @@ async fn a_requested_backfill_rebuilds_a_stale_aggregate_group() {
     seed_sales(&client).await;
     install_definition(
         &db.pool,
-        "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT sum(amount) AS total",
+        "TRANSFORM sku_totals FROM sales GROUP BY sku WITHOUT SOURCE INDEX SELECT sum(amount) AS total",
         &sales_types(),
         "public",
     )
@@ -576,7 +576,7 @@ async fn a_requested_backfill_during_a_rebuild_enqueues_another() {
     seed_sales(&client).await;
     install_definition(
         &db.pool,
-        "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT sum(amount) AS total",
+        "TRANSFORM sku_totals FROM sales GROUP BY sku WITHOUT SOURCE INDEX SELECT sum(amount) AS total",
         &sales_types(),
         "public",
     )

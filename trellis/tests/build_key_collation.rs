@@ -30,7 +30,7 @@ const ONE: &str = "TRANSFORM one FROM public.src SELECT g AS g, v + v AS dbl";
 const ONE_ACTUAL: &str = "select (id, g, dbl)::text from public.one order by id collate \"C\"";
 const ONE_EXPECTED: &str = "select (id, g, v + v)::text from public.src order by id collate \"C\"";
 
-const AGG: &str = "TRANSFORM agg FROM public.src GROUP BY g SELECT SUM(v) AS total, COUNT(*) AS n";
+const AGG: &str = "TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n";
 const AGG_ACTUAL: &str = "select (g, total, n)::text from public.agg order by g";
 const AGG_EXPECTED: &str =
     "select (g, sum(v), count(*))::text from public.src group by g order by g";

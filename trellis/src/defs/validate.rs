@@ -4794,8 +4794,7 @@ mod tests {
     /// Issue #120: `MIN`/`MAX(<uuid column>)` is refused *unconditionally* —
     /// checked live rather than assumed, Postgres has no `min(uuid)`/
     /// `max(uuid)` aggregate at all (the same "opclass but no aggregate"
-    /// shape #114/#116 found for `bytea`/`macaddr` — `trellis/tests/
-    /// defs_min_max_text_and_uuid.rs` pins this against a live server), so
+    /// shape #114/#116 found for `bytea`/`macaddr`), so
     /// `registry::aggregate_result_type("MIN"/"MAX", ValueType::Uuid)` is
     /// `None` and this is an ordinary `FunctionArgTypeMismatch`, independent
     /// of relationship shape — a plain `GROUP BY` field's own

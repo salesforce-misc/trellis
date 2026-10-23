@@ -115,7 +115,7 @@ async fn an_ambiguous_bare_name_is_refused_at_define() {
     let err = install_definition(
         &db.pool,
         "TRANSFORM amb_totals FROM amb_src GROUP BY grp \
-         SELECT grp AS grp, (grp + 1) AS val, SUM(val) AS total",
+        WITHOUT SOURCE INDEX SELECT grp AS grp, (grp + 1) AS val, SUM(val) AS total",
         &source_columns(),
         "public",
     )
@@ -157,7 +157,7 @@ async fn a_qualified_name_aggregates_the_source_column() {
     install_definition(
         &db.pool,
         "TRANSFORM amb_totals FROM amb_src GROUP BY grp \
-         SELECT grp AS grp, (grp + 1) AS val, SUM(amb_src.val) AS total, \
+        WITHOUT SOURCE INDEX SELECT grp AS grp, (grp + 1) AS val, SUM(amb_src.val) AS total, \
          MAX(public.amb_src.val) AS biggest",
         &source_columns(),
         "public",
@@ -361,7 +361,7 @@ async fn a_resume_refuses_a_name_a_later_source_column_made_ambiguous() {
     trellis
         .apply(
             "TRANSFORM amb_totals FROM amb_src GROUP BY grp \
-             SELECT grp AS grp, (grp + 1) AS adj, SUM(adj) AS total",
+            WITHOUT SOURCE INDEX SELECT grp AS grp, (grp + 1) AS adj, SUM(adj) AS total",
         )
         .await
         .expect("no source column is named adj yet");

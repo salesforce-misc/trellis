@@ -131,7 +131,7 @@ fn sku_totals_columns() -> HashMap<String, ValueType> {
     columns(&[("sku", ValueType::Text), ("total", ValueType::Numeric)])
 }
 
-const SKU_TOTALS: &str = "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT sum(amount) AS total";
+const SKU_TOTALS: &str = "TRANSFORM sku_totals FROM sales GROUP BY sku WITHOUT SOURCE INDEX SELECT sum(amount) AS total";
 
 /// Installs [`SKU_TOTALS`], settles its background build (#419), and
 /// discharges the catch-up marker its build parks on `sales` when it goes
@@ -294,7 +294,7 @@ async fn catchup_marker_on_an_aggregate_target_feeding_an_aggregate_discharges()
         .expect("hold sku_totals' readers out of the Re-derive build");
     install_definition(
         &db.pool,
-        "TRANSFORM sku_totals_v2 FROM sku_totals GROUP BY sku SELECT sum(total) AS total2",
+        "TRANSFORM sku_totals_v2 FROM sku_totals GROUP BY sku WITHOUT SOURCE INDEX SELECT sum(total) AS total2",
         &sku_totals_columns(),
         "public",
     )

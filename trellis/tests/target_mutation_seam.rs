@@ -226,7 +226,7 @@ async fn a_chained_target_is_never_captured_even_as_a_relationship_endpoint() {
     columns.insert("k".to_string(), ValueType::Integer(IntWidth::Int4));
     install_definition(
         &db.pool,
-        "TRANSFORM public.agg FROM public.src GROUP BY k SELECT COUNT(*) AS n",
+        "TRANSFORM public.agg FROM public.src GROUP BY k WITHOUT SOURCE INDEX SELECT COUNT(*) AS n",
         &columns,
         "public",
     )
@@ -236,7 +236,7 @@ async fn a_chained_target_is_never_captured_even_as_a_relationship_endpoint() {
     // An aggregate over a seam-only target never reads its capture.
     install_definition(
         &db.pool,
-        "TRANSFORM public.hist FROM public.agg GROUP BY n SELECT COUNT(*) AS groups",
+        "TRANSFORM public.hist FROM public.agg GROUP BY n WITHOUT SOURCE INDEX SELECT COUNT(*) AS groups",
         &HashMap::from([
             ("k".to_string(), ValueType::Integer(IntWidth::Int4)),
             ("n".to_string(), ValueType::Numeric),
@@ -356,7 +356,7 @@ async fn resuming_an_aggregate_column_succeeds() {
     .expect("create src");
     install_definition(
         &db.pool,
-        "TRANSFORM public.agg FROM public.src GROUP BY k SELECT SUM(v) AS total",
+        "TRANSFORM public.agg FROM public.src GROUP BY k WITHOUT SOURCE INDEX SELECT SUM(v) AS total",
         &numeric_columns(&["id", "k", "v"]),
         "public",
     )
@@ -465,7 +465,7 @@ async fn an_aggregate_targets_truncate_clear_reaches_a_chained_reader() {
     .expect("create tables");
     install_definition(
         &db.pool,
-        "TRANSFORM public.agg FROM public.src GROUP BY k SELECT SUM(v) AS total",
+        "TRANSFORM public.agg FROM public.src GROUP BY k WITHOUT SOURCE INDEX SELECT SUM(v) AS total",
         &HashMap::from([
             ("id".to_string(), ValueType::Numeric),
             ("k".to_string(), ValueType::Text),
@@ -478,7 +478,7 @@ async fn an_aggregate_targets_truncate_clear_reaches_a_chained_reader() {
     trellis::intake::markers::settle_registrations(&db.pool).await;
     install_definition(
         &db.pool,
-        "TRANSFORM public.d FROM public.agg GROUP BY total SELECT COUNT(*) AS n",
+        "TRANSFORM public.d FROM public.agg GROUP BY total WITHOUT SOURCE INDEX SELECT COUNT(*) AS n",
         &HashMap::from([
             ("k".to_string(), ValueType::Text),
             ("total".to_string(), ValueType::Numeric),
@@ -546,7 +546,7 @@ async fn a_numeric_grouped_aggregates_truncate_clear_drains_without_halting() {
     .expect("create tables");
     install_definition(
         &db.pool,
-        "TRANSFORM public.agg FROM public.src GROUP BY p SELECT SUM(q) AS t",
+        "TRANSFORM public.agg FROM public.src GROUP BY p WITHOUT SOURCE INDEX SELECT SUM(q) AS t",
         &numeric_columns(&["id", "p", "q"]),
         "public",
     )
@@ -664,7 +664,7 @@ async fn a_reverse_relationship_write_to_an_aggregate_target_reaches_a_chained_r
     install_definition(
         &db.pool,
         "TRANSFORM public.tag_totals FROM public.post_tags GROUP BY tag \
-         SELECT SUM(post.word_count) AS total_words",
+        WITHOUT SOURCE INDEX SELECT SUM(post.word_count) AS total_words",
         &HashMap::from([
             ("id".to_string(), ValueType::Numeric),
             ("post".to_string(), ValueType::Numeric),
@@ -678,7 +678,7 @@ async fn a_reverse_relationship_write_to_an_aggregate_target_reaches_a_chained_r
     install_definition(
         &db.pool,
         "TRANSFORM public.tag_view FROM public.tag_totals GROUP BY tag \
-         SELECT SUM(total_words) AS total_words",
+        WITHOUT SOURCE INDEX SELECT SUM(total_words) AS total_words",
         &HashMap::from([
             ("tag".to_string(), ValueType::Text),
             ("total_words".to_string(), ValueType::Numeric),
@@ -1489,7 +1489,7 @@ async fn stale_seam_rows_drain_after_a_rebuilds_refresh(
             "select id::text, coalesce(x::text, 'null') from public.report_view",
         ),
         Consumer::Aggregate => (
-            "TRANSFORM report_totals FROM reports GROUP BY grp SELECT SUM(rollup.x) AS total",
+            "TRANSFORM report_totals FROM reports GROUP BY grp WITHOUT SOURCE INDEX SELECT SUM(rollup.x) AS total",
             "select grp::text, total::text from public.report_totals",
         ),
     };
@@ -2086,7 +2086,7 @@ async fn a_seam_fed_build_plans_no_chunk_until_the_writer_open_at_its_fence_ends
     // `tot` is registered and started with the writer still open.
     trellis::defs::install_definition(
         d.pool(),
-        "TRANSFORM tot FROM public.t GROUP BY g SELECT SUM(dbl) AS total, COUNT(*) AS n",
+        "TRANSFORM tot FROM public.t GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(dbl) AS total, COUNT(*) AS n",
         &t_columns,
         "public",
     )
@@ -2192,7 +2192,7 @@ async fn nullable_keyed_upstream(rows: &str) -> (drain_driver::Driver, HashMap<S
              {rows}"
         ),
         &src_columns,
-        &["TRANSFORM u FROM public.src GROUP BY a, b SELECT MAX(x) AS x"],
+        &["TRANSFORM u FROM public.src GROUP BY a, b WITHOUT SOURCE INDEX SELECT MAX(x) AS x"],
         &["public.src"],
     )
     .await;
@@ -2302,7 +2302,7 @@ async fn a_build_over_a_seam_fed_aggregate_counts_its_null_keyed_groups() {
     build_over_u(
         &mut d,
         &u_columns,
-        "TRANSFORM w FROM public.u GROUP BY b SELECT SUM(x) AS total, COUNT(*) AS n",
+        "TRANSFORM w FROM public.u GROUP BY b WITHOUT SOURCE INDEX SELECT SUM(x) AS total, COUNT(*) AS n",
         "w",
     )
     .await;
@@ -2343,7 +2343,7 @@ async fn a_rebuild_over_a_seam_fed_aggregate_keeps_its_null_keyed_groups() {
     build_over_u(
         &mut d,
         &u_columns,
-        "TRANSFORM w FROM public.u GROUP BY b SELECT SUM(x) AS total, COUNT(*) AS n",
+        "TRANSFORM w FROM public.u GROUP BY b WITHOUT SOURCE INDEX SELECT SUM(x) AS total, COUNT(*) AS n",
         "w",
     )
     .await;
@@ -2417,7 +2417,7 @@ async fn a_failing_chunk_over_a_seam_fed_source_is_narrowed_past_its_null_keyed_
     build_over_u(
         &mut d,
         &u_columns,
-        "TRANSFORM w FROM public.u GROUP BY b SELECT SUM(x + x) AS doubled, COUNT(*) AS n",
+        "TRANSFORM w FROM public.u GROUP BY b WITHOUT SOURCE INDEX SELECT SUM(x + x) AS doubled, COUNT(*) AS n",
         "w",
     )
     .await;
@@ -2482,7 +2482,7 @@ async fn a_captured_sources_build_takes_no_fence_and_waits_for_no_transaction() 
 
     trellis::defs::install_definition(
         d.pool(),
-        "TRANSFORM agg FROM public.src GROUP BY g SELECT SUM(v) AS total, COUNT(*) AS n",
+        "TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n",
         &columns,
         "public",
     )
@@ -2549,7 +2549,7 @@ async fn the_sweep_reads_a_nullable_keyed_source_by_its_whole_key() {
     .await;
     install_definition(
         d.pool(),
-        "TRANSFORM w FROM public.u GROUP BY b SELECT SUM(x) AS total, COUNT(*) AS n",
+        "TRANSFORM w FROM public.u GROUP BY b WITHOUT SOURCE INDEX SELECT SUM(x) AS total, COUNT(*) AS n",
         &u_columns,
         "public",
     )
@@ -2622,7 +2622,7 @@ async fn a_writer_that_checked_for_readers_before_a_seam_fed_build_holds_its_fen
 
     trellis::defs::install_definition(
         d.pool(),
-        "TRANSFORM tot FROM public.t GROUP BY g SELECT SUM(dbl) AS total, COUNT(*) AS n",
+        "TRANSFORM tot FROM public.t GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(dbl) AS total, COUNT(*) AS n",
         &t_columns,
         "public",
     )
