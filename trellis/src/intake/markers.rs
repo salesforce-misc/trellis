@@ -1040,13 +1040,17 @@ pub(super) async fn fetch_read(
 ///
 /// The enumeration stages one image-less `Recompute` row per source key, for
 /// every applying reader of the table to re-derive. It runs when a
-/// ring-built definition needs it, or when an applying reader needs it
-/// ([`crate::defs::catalog::table_has_reader`], issues #417, #732, #938): a
-/// `live` or `catching_up` definition (a catch-up's reader) with no Re-derive
-/// build running. A marker on a table nothing of that kind reads is discharged
-/// without enumerating. Three kinds of definition that read the table don't
-/// count, because a page would drop their share of the rows or the build
-/// already covers them:
+/// ring-built definition needs it, or when a catch-up's reader needs it
+/// ([`crate::defs::catalog::table_has_reader`], issues #417, #732, #938,
+/// #1322): a `catching_up` definition with no Re-derive build running. A
+/// marker on a table nothing of that kind reads is discharged without
+/// enumerating. A `live` reader doesn't count: its build read every row, and
+/// a park that leaves it possibly missing changes moves it to `catching_up`
+/// ([`park_catch_up`]). It does on a marker that refreshes a relationship's
+/// projections, whose enumeration re-derives the consumers reading through
+/// the refreshed projection. Nor do these kinds of definition that read the table,
+/// because a page would drop their share of the rows or the build already
+/// covers them:
 ///
 /// - **One that isn't applying yet**, `waiting_to_backfill` (including one
 ///   this pass doesn't dispatch, such as a relationship reader whose to-side
@@ -1661,7 +1665,13 @@ async fn discharge_marker(
         .add(&txn, &catching_up_now, TransformStatus::CatchingUp)
         .await?;
     let enumerate = !ring.is_empty()
-        || crate::defs::catalog::table_has_reader(&txn, &marker.table, marker.generation).await?;
+        || crate::defs::catalog::table_has_reader(
+            &txn,
+            &marker.table,
+            marker.generation,
+            marker.refresh_projections,
+        )
+        .await?;
     let declared = declare_read(&txn, enumerate.then_some(marker.table.as_str()), &sweep).await?;
     if enumerate {
         let horizon: PgLsn = txn
@@ -2924,11 +2934,11 @@ mod catch_up_tests {
             .execute(
                 "insert into transform_definitions \
                  (target_table, source_table, source_version, definition_text, status) \
-                 values ('public.d', 'public.nokey', 1, $1, 'live')",
+                 values ('public.d', 'public.nokey', 1, $1, 'catching_up')",
                 &[&"TRANSFORM d FROM nokey SELECT id AS x"],
             )
             .await
-            .expect("seed the broken table's live reader");
+            .expect("seed the broken table's reader, waiting on a catch-up");
         register_reader(&db, "public.t", "t_reader").await;
         capture_for_test(&mut client, &["public.nokey", "public.t"]).await;
         client
@@ -3348,7 +3358,17 @@ mod catch_up_tests {
         // The join, held open.
         let mut joiner = connect(&db).await;
         let join = joiner.transaction().await.expect("begin the join");
-        park_marker(&join, "public.t")
+        // The install's park, which catches the live reader up
+        // (`park_table_catch_ups`).
+        let reader: i64 = join
+            .query_one(
+                "select id from transform_definitions where target_table = 'public.t_reader'",
+                &[],
+            )
+            .await
+            .expect("the reader's id")
+            .get(0);
+        park_catch_up(&join, &[reader], &["public.t".to_string()])
             .await
             .expect("park the join marker");
         client
@@ -3407,7 +3427,17 @@ mod catch_up_tests {
 
         let mut joiner = connect(&db).await;
         let join = joiner.transaction().await.expect("begin the join");
-        park_marker(&join, "public.t")
+        // The install's park, which catches the live reader up
+        // (`park_table_catch_ups`).
+        let reader: i64 = join
+            .query_one(
+                "select id from transform_definitions where target_table = 'public.t_reader'",
+                &[],
+            )
+            .await
+            .expect("the reader's id")
+            .get(0);
+        park_catch_up(&join, &[reader], &["public.t".to_string()])
             .await
             .expect("park the join marker");
         let mut other = connect(&db).await;

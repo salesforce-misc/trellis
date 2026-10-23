@@ -481,6 +481,7 @@ impl VariantDb {
         let all = self.targets.join(",");
         let mut out = Vec::new();
         for table in self.rebuild_sources() {
+            self.settle(cfg, &format!("rebuild {table}")).await;
             let before = self.definition_versions().await;
             let probe = BuildProbe::start(&self.db, &self.raw).await;
             trellis
@@ -500,6 +501,7 @@ impl VariantDb {
             out.push(m);
         }
         for target in &self.targets {
+            self.settle(cfg, &format!("pause_resume {target}")).await;
             trellis
                 .apply(&format!("PAUSE TRANSFORM {target}"))
                 .await
@@ -515,6 +517,38 @@ impl VariantDb {
             out.push(m);
         }
         out
+    }
+
+    /// Waits until no backfill marker is pending and the ring has drained,
+    /// so work left over from the previous step (a marker's enumeration and
+    /// the pages applying it) isn't charged to the next timed step. Prints
+    /// how long that took as a `settle` line.
+    async fn settle(&self, cfg: &JoinBench, before: &str) {
+        let started = Instant::now();
+        let deadline = started + cfg.build_timeout;
+        loop {
+            let pending: bool = self
+                .raw
+                .query_one("select exists (select 1 from pending_backfill)", &[])
+                .await
+                .expect("read pending markers")
+                .get(0);
+            if !pending {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "a marker stayed pending before {before}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        super::timed_converge(&self.raw, deadline - Instant::now(), before).await;
+        println!(
+            "{{\"scenario\":\"join\",\"variant\":\"{}\",\"kind\":\"settle\",\
+             \"before\":\"{before}\",\"settle_s\":{:.3}}}",
+            self.variant.name(),
+            started.elapsed().as_secs_f64()
+        );
     }
 
     /// Each definition's row version (`xmin`): a request that takes a

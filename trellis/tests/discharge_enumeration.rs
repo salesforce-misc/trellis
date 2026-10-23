@@ -1,9 +1,10 @@
 //! Which marker discharges enumerate the table into the ring: every one on a
-//! table an applying definition reads (issue #417), except for one whose
-//! Re-derive build will read it, is reading it, or started after the marker
-//! was parked (issues #732, #938). A direct build's go-live catch-up always
-//! does, even for a table that hasn't changed since the build read it
-//! (issues #468, #485).
+//! table a catch-up's reader (a `catching_up` definition) reads (issues #417,
+//! #1322), except for one whose Re-derive build will read it, is reading it,
+//! or started after the marker was parked (issues #732, #938). A direct
+//! build's go-live catch-up always does, even for a table that hasn't changed
+//! since the build read it (issues #468, #485). A `live` reader alone never
+//! makes a discharge enumerate (`second_definition_enumeration.rs`).
 
 use std::collections::HashMap;
 
@@ -562,10 +563,10 @@ async fn a_rederive_build_finished_before_its_install_markers_discharge_is_not_e
     assert_eq!(copied, 3, "the build itself read every row");
 }
 
-/// Issue #938 (a), the other direction: a park after the build started draws a
-/// newer generation than the one its start read, so the build counts as a
-/// reader of the new marker again. The skip is for a marker the start has
-/// seen, not for every marker on the table.
+/// Issue #938 (a), the other direction: a catch-up parked after the build
+/// started draws a newer generation than the one its start read, so the
+/// build counts as a reader of the new marker again. The skip is for a
+/// marker the start has seen, not for every marker on the table.
 #[tokio::test]
 async fn a_marker_parked_after_a_rederive_builds_start_is_still_enumerated() {
     let cluster = testkit::TestCluster::start();
@@ -573,7 +574,15 @@ async fn a_marker_parked_after_a_rederive_builds_start_is_still_enumerated() {
     let (mut client, _) = build_finished_before_the_install_marker_is_discharged(&db, false).await;
     let table = format!("{DEFAULT_SCHEMA}.widgets");
     let started_at = build_marker_generation(&client, "widget_copy").await;
-    // A park, as `markers::park_marker` makes one.
+    // A catch-up's park, as `markers::park_catch_up` makes one: the reader
+    // moves to `catching_up` and the marker draws a new generation.
+    client
+        .batch_execute(
+            "update transform_definitions set status = 'catching_up' \
+             where target_table = 'public.widget_copy'",
+        )
+        .await
+        .expect("catch the reader up");
     client
         .execute(
             "update pending_backfill set generation = default where table_name = $1",

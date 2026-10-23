@@ -8991,18 +8991,31 @@ fn reachable_tables_cte(anchor_filter: &str) -> String {
     )
 }
 
-/// Whether `qualified_table` has a reader that would fold the rows of an
-/// enumeration of it: a definition that applies (`live` or `catching_up`,
-/// [`TransformStatus::is_applying`]) and has no Re-derive build running,
-/// reading the table as its anchor source or through a relationship path
-/// ([`all_source_tables`]'s set). The backfill discharge
-/// ([`crate::intake::markers::run_pending_backfills`]) skips enumerating a
-/// table this says `false` for, since nothing would consume the `Recompute`
-/// rows (issues #417, #732, #938).
+/// Whether `qualified_table` has a reader that needs the rows of an
+/// enumeration of it: a `catching_up` definition (a catch-up's reader) with
+/// no Re-derive build running, reading the table as its anchor source or
+/// through a relationship path ([`all_source_tables`]'s set). The backfill
+/// discharge ([`crate::intake::markers::run_pending_backfills`]) skips
+/// enumerating a table this says `false` for (issues #417, #732, #938, #1322).
 ///
 /// Any other definition reading the table doesn't count: either the drain
 /// would drop its share of the rows, or a build already read them, and
 /// something else covers it:
+///
+/// - **A `live` definition** (#1322): its build read every row and capture has
+///   staged every change since. Every park that leaves a reader possibly
+///   missing changes goes through
+///   [`crate::intake::markers::park_catch_up`], which moves it to
+///   `catching_up`. The other parks (a registration, a widen, a failed direct
+///   build, a resume) dispatch a definition that isn't applying, and their
+///   discharge enumerates only for a ring-built one. Counting a `live` reader
+///   had a second definition's registration re-read the whole table for it,
+///   and a group-basis reader recomputes nearly every group per page of that.
+///   Except on a marker that refreshes a relationship's projections
+///   (`refresh_projections`, a to-side's): the refresh corrects the
+///   projection, and the enumeration is what re-derives the consumers that
+///   read through it, `live` ones included, by reverse propagation
+///   ([`refresh_relationship_projections_in_txn`]).
 ///
 /// - **A definition whose Re-derive build is running** (#625 F2) reads the
 ///   table in its chunks, and applies the changes after its start.
@@ -9027,14 +9040,14 @@ pub(crate) async fn table_has_reader(
     client: &impl GenericClient,
     qualified_table: &str,
     marker_generation: i64,
+    refresh_projections: bool,
 ) -> Result<bool, tokio_postgres::Error> {
-    readers_exist(
-        client,
-        qualified_table,
-        &TransformStatus::applying(),
-        Some(marker_generation),
-    )
-    .await
+    let statuses = if refresh_projections {
+        TransformStatus::applying()
+    } else {
+        vec![TransformStatus::CatchingUp.as_str()]
+    };
+    readers_exist(client, qualified_table, &statuses, Some(marker_generation)).await
 }
 
 /// Whether `qualified_table` has readers of any non-frozen status and every
