@@ -2335,9 +2335,13 @@ async fn an_edit_building_a_field_over_a_retyped_column_is_refused_until_a_resum
     wait_for_live(&raw, "reading_calc").await;
     let version = persisted_definition_version(&raw, "reading_calc").await;
     let recorded = persisted_source_columns(&raw, "reading_calc").await;
+    // Another type family changes the type the definition evaluates `x` as,
+    // so the next capture pass pauses it (#703 R1). No capture pass runs
+    // until the pipeline restarts below, so the edits meet a live
+    // definition over the retyped column.
+    trellis.shutdown().await.expect("stop the pipeline");
+    let trellis = define_only(db.dsn()).await;
 
-    // Another type family: nothing pauses, and the passthrough `x` keeps
-    // applying through the recorded `integer`.
     raw.batch_execute("alter table readings alter column x type double precision")
         .await
         .expect("the host retypes x");
@@ -2377,13 +2381,34 @@ async fn an_edit_building_a_field_over_a_retyped_column_is_refused_until_a_resum
         persisted_source_columns(&raw, "reading_calc").await,
         recorded
     );
-    wait_for_live(&raw, "reading_calc").await;
 
-    // A resume re-types the definition, and the edit goes ahead after it.
+    // The pipeline's capture pass pauses the definition for the retype, and
+    // a resume re-types it; the edit goes ahead after it.
     trellis
-        .apply("PAUSE TRANSFORM reading_calc")
+        .shutdown()
         .await
-        .expect("pause");
+        .expect("stop the define-only facade");
+    let trellis = running(db.dsn()).await;
+    poll_until(
+        Duration::from_secs(60),
+        "the capture pass pauses reading_calc for the retyped x",
+        async || persisted_status(&raw, "reading_calc").await.as_deref() == Some("paused"),
+    )
+    .await;
+    let failure: String = raw
+        .query_one(
+            "select f.error from capture_failures f \
+             join transform_definitions d on d.id = f.transform_id \
+             where split_part(d.target_table, '.', 2) = 'reading_calc'",
+            &[],
+        )
+        .await
+        .expect("the pause is a capture failure")
+        .get(0);
+    assert!(
+        failure.contains("from integer to double precision"),
+        "{failure}"
+    );
     trellis
         .apply("RESUME TRANSFORM reading_calc")
         .await
