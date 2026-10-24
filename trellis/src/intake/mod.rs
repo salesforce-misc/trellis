@@ -1,19 +1,37 @@
 //! What is left of intake (issue #7) after trigger capture replaced the
-//! logical-replication stream (issue #622, ADR-0002): the backfill markers,
-//! their discharge and the orphan sweep. F (#625) deletes these; the module
-//! keeps its name until then (issue #622 plan, Q6).
+//! logical-replication stream (issue #622, ADR-0002): the table-name helper
+//! and the rebuild of a table's readers.
 //!
-//! - [`markers`] parks `pending_backfill` markers and discharges them:
-//!   the transaction fence, enumeration into the ring, dispatch of waiting
-//!   definitions, and go-live catch-ups.
-//! - `resume_orphans` is the discharge's sweep of target rows no source row
-//!   backs any more (issue #330).
+//! - [`catch_up`] rebuilds the readers of a table that may be missing
+//!   changes to it.
+//! - `harness` stands in for the staging worker's build start in tests.
 
+pub(crate) mod catch_up;
 pub mod error;
-pub mod markers;
-mod resume_orphans;
+#[cfg(any(test, feature = "internals"))]
+pub mod harness;
 
 pub use error::IntakeError;
+
+/// Joins `schema` and `table` into the `"schema.table"` shape a ring row's
+/// `src_table` uses throughout this crate: the *only* place that string is
+/// built. A schema or table literally named `a.b` is legal Postgres (quoted),
+/// but the joined-string representation has no way to tell that dot apart
+/// from the separator, so this turns it into a loud error at the point the
+/// ambiguous string would otherwise be built.
+pub(crate) fn qualify(schema: &str, table: &str) -> Result<String, IntakeError> {
+    if schema.contains('.') {
+        return Err(IntakeError::DottedIdentifierComponent {
+            component: schema.to_string(),
+        });
+    }
+    if table.contains('.') {
+        return Err(IntakeError::DottedIdentifierComponent {
+            component: table.to_string(),
+        });
+    }
+    Ok(format!("{schema}.{table}"))
+}
 
 /// A minimal, dependency-free JSON string-literal encoder (quote, backslash,
 /// control characters) — just enough for column names and text-format

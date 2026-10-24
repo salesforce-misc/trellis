@@ -11,8 +11,7 @@ defmodule Trellis.Status do
   nothing holds it up:
 
     * `backfill_failure` is set while its build keeps failing (one of its
-      build chunks, or the backfill of its source table), and names the
-      cause.
+      build chunks), and names the cause.
     * `capture_wait` is set while installing or widening capture on a table
       it reads waits for a lock another session holds. It clears once that
       session lets go.

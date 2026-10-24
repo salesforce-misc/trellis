@@ -640,7 +640,7 @@ structure for an aggregate
   whether a definition applies, so one that decided before the build's start
   committed can commit after a chunk's snapshot, and neither the chunk nor
   the ring carries its write. The plan job's first act is a fence, the id of
-  a transaction begun after the start commit (the marker fence's rule),
+  a transaction begun after the start commit,
   and it plans no chunk until the oldest running transaction began
   after it. A group-basis build, and a JOIN build either of whose tables is
   another definition's target, waits on the same fence before its one
@@ -660,12 +660,10 @@ structure for an aggregate
   waits for them, as for any seam row. An aggregate reader's build covers
   such rows itself
   ([An aggregate's build](#an-aggregates-build-is-one-absolute-write-per-structure)).
-- **Builds that keep the one-pass path.** The chunked build serves an
-  aggregate or 1-1 definition on a captured source or on another
-  definition's target. A 1-1 definition whose alias chain is cyclic keeps
-  the one-pass build, with a fence wait and a go-live catch-up that re-reads
-  every table the build read and sweeps the target for unbacked rows (the
-  definition reports `catching_up` meanwhile).
+- **Every definition has a build.** The chunked build serves a 1-1
+  definition on a captured source or on another definition's target. Define
+  refuses a definition whose fields inline into more than a build can render
+  (a chain of fields that each read the previous one more than once).
 - **Must (I7):** chunk transactions are short (one range, under
   `lock_timeout`), and a captured-change batch never waits inside its
   transaction for a chunk's lock.
@@ -836,8 +834,7 @@ partition at 100M.
   is no capture watermark to check.
 - **Must:** three stored statuses: `waiting_to_backfill` (registered, chunk
   plan not yet written; normally momentary), `backfilling` (applying, chunks
-  outstanding), `live`. A one-pass build adds
-  `catching_up` (applying, awaiting its go-live re-read). Plus `paused` and
+  outstanding), `live`. Plus `paused` and
   `quarantined` from
   [ADR-0014](0014-pause-and-drop-a-transform.md) and
   [ADR-0003](0003-quarantine-storage-and-api.md).
@@ -1043,20 +1040,20 @@ A group-basis or JOIN reader needs exact images, as capture gives a source.
   (I3) holds because the upstream writes a row only under its lock, in
   write-token order.
 - **Must:** a write that never reaches the seam (an upstream's own build or
-  rebuild, at a resume or by its own Re-derive build) parks a catch-up for
-  its readers. For a group-basis or JOIN reader that catch-up is a rebuild
-  of the reader. A `RESUME` build parks it even though it writes through the
+  rebuild, at a resume or by its own Re-derive build) rebuilds its readers,
+  which read `backfilling` until the rebuild is done, so `live` holds along a
+  chain. A `RESUME` build rebuilds them even though it writes through the
   seam: it starts from hidden state the resume emptied, while its target
   keeps the earlier rows, so the images a page or the build stages meanwhile
   can carry prior values that match no row the readers hold. The reader's
   rebuild overwrites whatever they did, and a rebuild in place of a `live`
-  definition parks nothing, because its hidden state matches its target. The
-  park is in the transaction that completes the whole build, once: on a
+  definition rebuilds nothing, because its hidden state matches its target. The
+  rebuild is started in the transaction that completes the whole build, once: on a
   partitioned source, the remainder's, after the last leaf's, and a
   `JOIN`'s, the final `T` step's. Further
   hops need nothing: a reader's visible rows always match its own partials.
-- **Must:** the transaction that completes any build of a target, parked
-  catch-up or not, asks for a retry of every key the target's direct readers
+- **Must:** the transaction that completes any build of a target, readers
+  rebuilt or not, asks for a retry of every key the target's direct readers
   hold, made by the staging worker after it commits, with the automatic
   retry's semantics: a key held for a failure the upstream caused while it
   was rebuilt applies, and one whose failure persists is held again on its
@@ -1111,7 +1108,7 @@ Each alternative below is recorded with the number that rejected it.
 | **Group rows as absolute writes ordered by position:** forced recomputes from a live `GROUP BY`, an existence probe and pre-lock before incrementing. | Not orderable without a horizon; the probe's scan is the 40k-group cliff where nothing drains; the pre-lock deadlocks on new groups. The group basis orders the same absolute writes by a snapshot per group, taken in the statement that reads, after a sorted lock. |
 | **A per-row ledger for aggregates**: one entry per source row holding its group, contribution and ordering state. | I measured 15.1–15.3 GB of ledger for a 100M-row source in 50k groups (151–153 B per entry, its basis 33–39 B), against 5 MB of group state; a 100M build at 370–380 s and 58–71 GB of WAL against 1.4–1.9 s; a page of 100k changes at 3.2–3.35 s against 0.18–0.31 s; and a partition `DROP` of 10M rows at 45–51 s and 6.2 GB of WAL against 10–30 ms. What the ledger gave in return was self-repair on a row's next write, and the `MIN`/`MAX`-style aggregates this ADR refuses. |
 | **One set-based `GROUP BY` build with changes withheld, then a go-live re-read and orphan sweep.** | The re-read is a full enumeration per build that scales with table size, not with what changed; I ran it at 100M, where it reaches `live` after 2,305 s and its drain then runs out of memory. Nothing can tell a table unchanged since the build from one changed and changed back, so the re-read could never be skipped. A 1-1 build is per-row work and its acceptance bar is linear time; an aggregate's build keeps the one-pass `GROUP BY` and drops the withholding, because its absolute write applies alongside pages from its first moment. |
-| **`catching_up` as a stored status with marker fences, generations and go-live catch-ups.** | Needed only by a build that skips changes. A definition on the Re-derive build applies from its first chunk, so there is nothing to catch up; builds not yet on it keep the status ([A build](#a-build-is-re-derive-over-chunks-and-applies-from-its-first-chunk)). |
+| **`catching_up` as a stored status with marker fences, generations and go-live catch-ups.** | Needed only by a build that skips changes. Every build applies from its first chunk, so there is nothing to catch up; `catching_up` is the reported state of a reader whose upstream isn't `live` ([A build](#a-build-is-re-derive-over-chunks-and-applies-from-its-first-chunk)). |
 | **A chunked aggregate build under a chunk gate:** primary-key-range chunks (a hybrid above a size threshold), or key-range chunks, each adding its region's partials under the group locks, with a gate in every page path (a page locks the chunk rows its sides fall in, before the page row; a chunk that hasn't run skips the side, a done chunk refuses what its snapshot saw, a retired one applies it), retirement once the drained prefix passes the chunk's stamp, a recompute that counts only done or retired chunks, a `NULL`-key chunk, and a truncate page that resets the chunks. | It is the only option that bounds a fresh build on a large unpartitioned source, but a chunk is paid per (chunk, cell) pair: about 5–6x the build time and 12x the WAL on many-cell shapes, against one `GROUP BY` per structure at 2–12x less in my `JOIN` model (84 s against 412–509 s; 213 s against 1,258 s), and it leaves in-place rebuilds unbounded. Key-range chunks bound locks and rows but reread the heap about 2x per chunk, so not I/O. The gate adds a lock to every page and machinery to every truncate and recompute. A build is one absolute write per structure instead, and a large source is partitioned ([#1276](https://github.com/salesforce-misc/trellis/issues/1276) keeps the bounded alternatives open). |
 | **Bounding drain memory by running fewer workers.** | Each worker then holds more buckets; I measured that it bounds nothing. |
 | **Fixing the build's cost by chunk size.** | I ran 10x larger chunks and they left 2.0x the time and 3.7x the WAL. |

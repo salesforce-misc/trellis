@@ -2783,7 +2783,7 @@ async fn a_join_target_feeds_its_readers_through_the_seam() {
     )
     .await
     .expect("define the reader");
-    trellis::intake::markers::settle_registrations(d.pool()).await;
+    trellis::intake::harness::settle_builds(d.pool()).await;
     for sql in [
         "insert into public.a values (1, 1, 0, 1, 10), (2, 2, 0, 2, 5); \
          insert into public.b values (1, 0, 1, 7, 100), (2, 0, 2, 7, 1)",
@@ -3755,23 +3755,7 @@ async fn rebuild_in_place(key: Key, kind: Kind) {
         lab.build().await;
         lab.assert_built(&context).await;
         lab.check(&context).await;
-        assert_eq!(
-            lab.d
-                .rows("select table_name from pending_backfill where last_error is not null")
-                .await,
-            Vec::<String>::new(),
-            "{context}: no catch-up marker is failing"
-        );
-        // The request's marker is discharged without a catch-up of the
-        // JOIN, which would fail in the orphan sweep for good.
-        trellis::intake::markers::settle_registrations(lab.d.pool()).await;
-        assert_eq!(
-            lab.d
-                .rows("select table_name from pending_backfill where last_error is not null")
-                .await,
-            Vec::<String>::new(),
-            "{context}: the discharge failed no marker"
-        );
+        trellis::intake::harness::settle_builds(lab.d.pool()).await;
         lab.assert_built(&context).await;
     }
 }
@@ -3916,7 +3900,7 @@ async fn resume(lab: &Lab, kind: Kind) {
     trellis::staging::quarantine::resume_transform(lab.d.pool(), kind.name)
         .await
         .expect("resume");
-    trellis::intake::markers::discharge_registrations(lab.d.pool())
+    trellis::intake::harness::start_registered_builds(lab.d.pool())
         .await
         .expect("start the build");
     assert_eq!(reader_status(lab, kind.name).await, ["(backfilling)"]);
@@ -4163,7 +4147,7 @@ async fn chained(deeper: bool) -> Lab {
     )
     .await
     .expect("define the reader");
-    trellis::intake::markers::settle_registrations(lab.d.pool()).await;
+    trellis::intake::harness::settle_builds(lab.d.pool()).await;
     lab.build().await;
     lab.d.settle().await;
     if deeper {
@@ -4176,7 +4160,7 @@ async fn chained(deeper: bool) -> Lab {
         )
         .await
         .expect("define the second reader");
-        trellis::intake::markers::settle_registrations(lab.d.pool()).await;
+        trellis::intake::harness::settle_builds(lab.d.pool()).await;
         lab.build().await;
         lab.d.settle().await;
     }
@@ -4422,7 +4406,7 @@ async fn build_a_pause_and_resume_wait_for_a_build_in_flight() {
     building.finish().await;
     operator.await.expect("the operator's task");
     assert_eq!(lab.d.deadlocks_logged(), Vec::<String>::new());
-    trellis::intake::markers::discharge_registrations(lab.d.pool())
+    trellis::intake::harness::start_registered_builds(lab.d.pool())
         .await
         .expect("start the build");
     lab.build().await;
@@ -5197,7 +5181,7 @@ async fn a_reader_of_a_join_resumed_per_leaf_is_rebuilt_once() {
     )
     .await
     .expect("define the reader");
-    trellis::intake::markers::settle_registrations(lab.d.pool()).await;
+    trellis::intake::harness::settle_builds(lab.d.pool()).await;
     lab.build().await;
     lab.d.settle().await;
     pause(&lab, I).await;

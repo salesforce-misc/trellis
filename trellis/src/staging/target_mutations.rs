@@ -29,8 +29,7 @@
 //!
 //! Every target writer (`apply::apply_target`, `group_basis::apply_group_target`,
 //! the truncate clears (`apply::clear_target`), the Re-derive build's chunks
-//! (`staging::build`), a rebuild's orphan delete,
-//! `intake::resume_orphans`) takes a
+//! (`staging::build`), a rebuild's sweep) takes a
 //! `&mut TargetMutations` and reports each physically-changed key into it. None of them returns the
 //! changed keys to its caller, so a caller cannot forget to propagate them:
 //! the only way a changed key leaves a writer is through [`TargetMutations::record`],
@@ -39,139 +38,30 @@
 //! calls it). A new writer has to take this parameter to compile against the
 //! shared helpers, which is the point.
 //!
-//! The only target writes that bypass the seam are a definition's own
-//! build's row writes (`defs::backfill::backfill_definition` and the chunk
-//! queue), which run while that definition is not yet applying
-//! (`TransformStatus::is_applying`). Nothing can read a target in that state:
-//! `defs::catalog::create_definition_inner` refuses a definition whose source
-//! is a target still being built (`CatalogError::TransformNotLive`), and a
-//! target whose build finishes with readers already attached (a resumed
-//! upstream) parks a catch-up marker for itself so those readers re-derive
-//! from its rebuilt state (and report `catching_up` until then,
-//! `intake::markers::park_target_catchup_if_read`). That catch-up re-reads
-//! the target's current keys, so it can't tell a reader about a row the
-//! rebuild deleted: such a delete goes through the seam (#815). A reader on
-//! the group basis (`super::group_basis`) can't apply an image-less
-//! catch-up as deltas, so the same park starts a rebuild of it instead
-//! (`staging::build::start_rebuilds`).
-//! A chunk a worker held across a resume can't write once the rebuild has
-//! made the target applying again: its claim fences every write it makes
+//! A group-basis build that starts from hidden state a `RESUME` emptied
+//! (`staging::group_basis`, `staging::join`) writes through the seam too, but
+//! the prior images it and the pages meanwhile send can match no row the
+//! readers hold, so when it finishes with readers already attached it
+//! rebuilds them (`intake::catch_up::park_target_catchup_if_read`). They read
+//! `backfilling` until then, so `live` holds along a chain. A chunk a worker
+//! held across a resume can't write once the rebuild has made the target
+//! applying again: its claim fences every write it makes
 //! (`defs::chunk_queue::ClaimFence`, #434).
 //!
 //! The seam only stages for readers that are already applying when the
-//! writer checks, so a *new* reader parks a catch-up on its source target
-//! once it starts applying, whichever way it was built (`defs::catalog::install_definition`,
-//! `create_definition_inner`, `complete_direct_backfill`, or
-//! `intake::markers`'s deferred-backfill flip). A write that raced the
-//! reader's build reaches it through that catch-up: its fence is captured
-//! after the reader is visibly applying, so it waits out every writer that
-//! checked before then.
+//! writer checks, so a *new* reader built over a target waits on a fence
+//! until the writers that checked before it applied have ended.
 //!
-//! A reader built by the Re-derive build parks no catch-up. Its build waits
-//! on a fence instead, a transaction id taken after the build's start
+//! A reader built by the Re-derive build waits
+//! on a fence, a transaction id taken after the build's start
 //! commits, until every transaction with a lower id has ended
 //! (`staging::build`'s "Seam-fed sources", #625 F6). That covers a writer
 //! that checked before the start only if the writer had its id when it
 //! checked, so the check takes the transaction's id first, in a statement
 //! of its own, so that the check's snapshot is taken after it. A writer that
-//! checks before its first write (the discharge's orphan sweep checks, then
-//! reads, then deletes) would otherwise take its id after the fence, and
-//! the build would read the target before the writer's write commits.
-//!
-//! # What gets staged
-//!
-//! One `StagedChange::Recompute` per changed key, for every target at least
-//! one applying definition reads (a target on the image feed gets a
-//! CDC-shaped row instead; see "The image feed"). The row is image-less, so a
-//! downstream
-//! aggregate re-derives the affected group from live state and a downstream
-//! 1-1 re-reads the row: both idempotent, whatever batch the signal lands in.
-//!
-//! Each row also carries the key's **prior image**: the target row as it
-//! stood before this transaction first touched it (`None` if the transaction
-//! created it). An image-fed target's row carries it as its old image (see
-//! "The image feed"). On a `Recompute` it names the group the row left: a
-//! downstream group-basis aggregate recomputes that group as well as the
-//! current row's (`super::group_basis`).
-//!
-//! Writers capture the prior image with the same statement that already
-//! row-locks the key before writing it (a `SELECT ... FOR UPDATE` pre-lock,
-//! extended to return each row's image), or, for a delete with no pre-lock (a
-//! truncate clear, a rebuild's orphan delete), with the delete's own
-//! `RETURNING`.
-//! Postgres 17's `RETURNING` cannot name the pre-update row, so the pre-lock
-//! is the only place an update's old image can come from.
-//!
-//! [`TargetMutations::image_sql`] only returns an image expression for a
-//! target that has a reader, so a terminal target (the common case) pays
-//! nothing for the capture.
-//!
-//! # The write token
-//!
-//! [`TargetMutations::into_staged`] also reads the transaction's **write
-//! token**, `pg_current_wal_insert_lsn()`, into [`Propagation::write_token`]
-//! (issue #401, step 1 of #375's direction 1). It orders one key's writes in
-//! the same WAL space as a capture trigger's `lsn`, which is what lets the seam
-//! stand in as a CDC-shaped feed for a target (steps 2 and 3, #402/#403): a
-//! target's CDC-shaped seam rows carry it as their `lsn` (see "The image
-//! feed").
-//!
-//! Where it is read is the whole point. Two writers of one key serialize on
-//! that key's row lock: the second acquires it only after the first commits,
-//! and then writes WAL of its own. A token read after every lock and write
-//! the transaction takes is therefore strictly above the previous holder's
-//! commit LSN, so one key's tokens increase in commit order. `into_staged`
-//! runs after every writer in the transaction has finished (it is the only
-//! way the accumulator leaves the transaction), so reading it there is after
-//! the last lock by construction. A token read *before* a lock is not
-//! ordered against the previous holder's commit at all.
-//!
-//! The token is **pre-commit**: it is below the writer's own commit LSN, so it
-//! is not a commit `end_lsn`. A consumer may rely on "token above a position
-//! read by another transaction means the writer committed after that read", and
-//! on per-key order, but never on "a token at or below X means the writer had
-//! committed by X": the gap to the commit can be long (a rebuild's orphan
-//! delete, `intake::resume_orphans`, commits only when its whole discharge
-//! does). It is never an `origin_lsn` either: a seam row's origin stays the
-//! conservative "unknown" `await_converged` already gates on (see
-//! `staging::converge::converged_through`).
-//! It is read only when this transaction stages something (some key of a
-//! target an applying definition reads, or that is on the image feed), so
-//! a terminal target pays no extra round trip.
-//!
-//! # Spilling a large write (issue #924)
-//!
-//! The accumulator keeps its touched set in memory, which is what a drain
-//! page needs: a page's keys are capped (ADR-0002 I8), and it stages them
-//! through [`TargetMutations::into_staged`] into one `Vec`. A rebuild's
-//! orphan sweep (`intake::resume_orphans`) is not capped: it can delete tens
-//! of millions of rows in one
-//! transaction, and holding each key with its
-//! prior image until the flush would hold them all in memory, and re-reading
-//! an image-fed target's new images would bind them all in one statement,
-//! past PostgreSQL's 1 GB message limit.
-//!
-//! So a writer that changes keys in batches calls
-//! [`TargetMutations::spill_over`] between them. Once the in-memory set
-//! holds a batch of keys, it moves them into a temporary table
-//! (`pg_temp.trellis_target_mutations`, one row per `(target, key)`) with an
-//! upsert that keeps [`TargetMutations::record`]'s merge rules across
-//! batches: the row already there keeps its prior image, even a missing one
-//! (the key was created here), and takes the highest `hop_gen`, the earliest
-//! `src_changed`, and the earliest `origin_lsn`, unknown if either is. A
-//! target nothing reads is dropped at the spill, not held. A transaction
-//! that never reaches a batch never creates the table.
-//!
-//! [`TargetMutations::flush`] then spills what is left, checks the hop bound
-//! over every key, reads the write token once (spilling takes no target lock,
-//! so it is still after the last one), and stages each target's keys a batch
-//! at a time, in key order, appending each batch's rows before it reads the
-//! next. Each batch is staged as `into_staged` stages its keys, new-image
-//! re-read included, so a spilled flush appends the same rows an in-memory
-//! one would. Only `flush` stages a spilled accumulator:
-//! [`TargetMutations::into_staged`] stages only the keys held in memory, so
-//! it refuses one (`ApplyError::SpilledMutationsNotFlushed`) rather than drop
-//! the keys in the table.
+//! checks before its first write would otherwise take its id after the
+//! fence, and the build would read the target before the writer's write
+//! commits.
 //!
 //! # The image feed (issues #402, #403, #1100)
 //!
@@ -227,7 +117,7 @@
 //! such writer has ended, so it reads their writes. The group basis' build
 //! (#1101) runs after that fence, in the plan job.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::time::SystemTime;
 
 use tokio_postgres::Transaction;
@@ -329,45 +219,12 @@ async fn resolve_image_feed(
 pub struct TargetMutations {
     targets: HashMap<String, TargetInfo>,
     touched: BTreeMap<String, BTreeMap<String, KeyMutation>>,
-    /// `Some(batch)` once [`Self::spill_over`] has moved the touched set
-    /// into [`SPILL_TABLE`]: the most keys one of the spill's statements
-    /// binds. See the module doc's "Spilling a large write".
-    spill_batch: Option<usize>,
-    /// The targets with a key in [`SPILL_TABLE`], so the table exists iff
-    /// this is non-empty.
-    spilled: BTreeSet<String>,
-    stats: SeamStats,
     /// Test-only: `Some(has_readers)` treats every target as read (or
     /// unread) without asking the catalog, for unit tests that drive a
     /// writer against a bare database with no Trellis schema in it.
     #[cfg(test)]
     assume_readers: Option<bool>,
 }
-
-/// How much of a transaction's changed keys one [`TargetMutations`] held,
-/// and bound, at once (issue #924).
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SeamStats {
-    /// The most changed keys held in memory at once, as
-    /// [`TargetMutations::spill_over`] and the flush found them.
-    pub most_held: usize,
-    /// The most keys one of the seam's own statements bound: a spill's
-    /// upsert or a re-read of new images.
-    pub largest_statement: usize,
-    /// Whether the touched set was spilled to [`SPILL_TABLE`].
-    pub spilled: bool,
-}
-
-impl SeamStats {
-    fn bound(&mut self, keys: usize) {
-        self.largest_statement = self.largest_statement.max(keys);
-    }
-}
-
-/// The temporary table a spilled [`TargetMutations`] keeps its touched set
-/// in, one row per `(target, key)`. See the module doc's "Spilling a large
-/// write".
-const SPILL_TABLE: &str = "pg_temp.trellis_target_mutations";
 
 /// [`TargetMutations::into_staged`]'s output: the downstream rows to append,
 /// every target whose propagation would exceed [`MAX_HOP_GEN`] with the worst
@@ -386,16 +243,6 @@ pub(crate) struct Propagation {
 impl TargetMutations {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// A [`TargetMutations`] that never consults the catalog and treats every
-    /// target as unread — see `assume_readers`.
-    #[cfg(test)]
-    pub(crate) fn assuming_unread() -> Self {
-        Self {
-            assume_readers: Some(false),
-            ..Self::default()
-        }
     }
 
     /// A [`TargetMutations`] that never consults the catalog and treats every
@@ -541,30 +388,11 @@ impl TargetMutations {
     /// Also reads [`Propagation::write_token`]. The caller must not take any
     /// further row lock on a target after this (see the module doc's "The
     /// write token"). Every caller calls it after its last target write: the
-    /// drain's Phase 3 and the Re-derive build's chunks just before commit,
-    /// and
-    /// `intake::resume_orphans` at the start of a discharge that then writes
-    /// the ring and catalog (no target) before it commits.
-    ///
-    /// An accumulator [`Self::spill_over`] has spilled is refused with
-    /// [`ApplyError::SpilledMutationsNotFlushed`]: the keys in its spill
-    /// table aren't held here, and only [`Self::flush`] stages them.
+    /// drain's Phase 3 and the Re-derive build's chunks just before commit.
     pub(crate) async fn into_staged(
         mut self,
         txn: &Transaction<'_>,
     ) -> Result<Propagation, ApplyError> {
-        self.stage_held(txn).await
-    }
-
-    /// [`Self::into_staged`]'s work, leaving the accumulator's stats behind.
-    async fn stage_held(&mut self, txn: &Transaction<'_>) -> Result<Propagation, ApplyError> {
-        // Only the batched writers spill, and they stage through `flush`: a
-        // drain page's touched set is capped (ADR-0002 I8), and it never
-        // calls `spill_over`. The keys already in the spill table never
-        // reach `touched`, so staging only what is held would drop them.
-        if self.spill_batch.is_some() {
-            return Err(ApplyError::SpilledMutationsNotFlushed);
-        }
         let mut propagation = Propagation {
             changes: Vec::new(),
             hop_bound_tables: Vec::new(),
@@ -590,16 +418,7 @@ impl TargetMutations {
                     token
                 }
             };
-            stage_target(
-                txn,
-                &target,
-                &info,
-                keys,
-                token,
-                &mut propagation,
-                &mut self.stats,
-            )
-            .await?;
+            stage_target(txn, &target, &info, keys, token, &mut propagation).await?;
         }
         Ok(propagation)
     }
@@ -607,23 +426,7 @@ impl TargetMutations {
     /// [`Self::into_staged`] plus the append, for a writer outside the drain
     /// path (which folds its own hop-bound check into a wider one).
     pub async fn flush(self, txn: &Transaction<'_>) -> Result<(), ApplyError> {
-        self.flush_counted(txn).await.map(|_| ())
-    }
-
-    /// [`Self::flush`], returning how much the accumulator held and bound
-    /// at once. A spilled accumulator stages from [`SPILL_TABLE`] a batch
-    /// at a time instead (see the module doc's "Spilling a large write").
-    pub(crate) async fn flush_counted(
-        mut self,
-        txn: &Transaction<'_>,
-    ) -> Result<SeamStats, ApplyError> {
-        if let Some(batch) = self.spill_batch {
-            self.spill(txn, batch).await?;
-            self.flush_spilled(txn, batch).await?;
-            return Ok(self.stats);
-        }
-        self.stats.most_held = self.stats.most_held.max(self.held());
-        let mut propagation = self.stage_held(txn).await?;
+        let mut propagation = self.into_staged(txn).await?;
         if !propagation.hop_bound_tables.is_empty() {
             propagation.hop_bound_tables.sort();
             propagation.hop_bound_tables.dedup();
@@ -633,199 +436,8 @@ impl TargetMutations {
             });
         }
         append::append(txn, &propagation.changes).await?;
-        Ok(self.stats)
-    }
-
-    /// How many keys the in-memory touched set holds.
-    fn held(&self) -> usize {
-        self.touched.values().map(BTreeMap::len).sum()
-    }
-
-    /// Moves the touched set into [`SPILL_TABLE`] once it holds `batch` keys
-    /// or more, so a writer that changes an unbounded number of keys in one
-    /// transaction holds at most about two batches of them in memory, and
-    /// binds at most `batch` per statement, however many it changes (issue
-    /// #924). The key's merge rules carry over to the table (see
-    /// [`Self::record`]), and [`Self::flush`] stages from it.
-    ///
-    /// A writer calls it between its own batches, with no statement of its
-    /// own in flight. It takes no target lock, so the write token
-    /// [`Self::flush`] reads is still after the transaction's last one.
-    /// Under `batch` keys it does nothing, so a transaction that never
-    /// reaches a batch never creates the table. The drain doesn't call it:
-    /// a page's keys are capped (ADR-0002 I8), and it stages through
-    /// [`Self::into_staged`], which refuses a spilled accumulator.
-    pub(crate) async fn spill_over(
-        &mut self,
-        txn: &Transaction<'_>,
-        batch: usize,
-    ) -> Result<(), ApplyError> {
-        let batch = batch.max(1);
-        if self.held() < batch {
-            return Ok(());
-        }
-        self.spill(txn, batch).await
-    }
-
-    /// Moves every key the touched set holds into [`SPILL_TABLE`], at most
-    /// `batch` per statement, and marks the accumulator spilled. A target
-    /// nothing reads is dropped instead: nothing would stage it.
-    async fn spill(&mut self, txn: &Transaction<'_>, batch: usize) -> Result<(), ApplyError> {
-        self.spill_batch = Some(batch);
-        self.stats.spilled = true;
-        self.stats.most_held = self.stats.most_held.max(self.held());
-        let touched = std::mem::take(&mut self.touched);
-        for (target, keys) in touched {
-            if !self.info(txn, &target).await?.has_readers || keys.is_empty() {
-                continue;
-            }
-            if self.spilled.is_empty() {
-                txn.batch_execute(&format!(
-                    "create temporary table {SPILL_TABLE} (\
-                         target text not null, \
-                         key text collate \"C\" not null, \
-                         prior_image text, \
-                         hop_gen integer not null, \
-                         src_changed timestamptz, \
-                         origin_lsn pg_lsn, \
-                         primary key (target, key)) \
-                     on commit drop"
-                ))
-                .await?;
-            }
-            self.spilled.insert(target.clone());
-            let keys: Vec<(String, KeyMutation)> = keys.into_iter().collect();
-            for chunk in keys.chunks(batch) {
-                self.stats.bound(chunk.len());
-                upsert_spilled(txn, &target, chunk).await?;
-            }
-        }
         Ok(())
     }
-
-    /// [`Self::flush`] for a spilled accumulator, once [`Self::spill`] has
-    /// moved the rest of its keys into [`SPILL_TABLE`]: the hop bound over
-    /// every key, the write token, and then each target's keys a batch at a
-    /// time, in key order, staged and appended as [`Self::into_staged`]
-    /// stages them.
-    async fn flush_spilled(
-        &mut self,
-        txn: &Transaction<'_>,
-        batch: usize,
-    ) -> Result<(), ApplyError> {
-        if self.spilled.is_empty() {
-            return Ok(());
-        }
-        let bounded = txn
-            .query(
-                &format!(
-                    "select target, max(hop_gen) from {SPILL_TABLE} \
-                     where hop_gen >= $1 group by target order by target"
-                ),
-                &[&MAX_HOP_GEN],
-            )
-            .await?;
-        if !bounded.is_empty() {
-            let worst: i32 = bounded
-                .iter()
-                .map(|row| row.get::<_, i32>(1))
-                .max()
-                .unwrap_or(0);
-            return Err(ApplyError::HopBoundExceeded {
-                hop_gen: worst + 1,
-                tables: bounded.into_iter().map(|row| row.get(0)).collect(),
-            });
-        }
-        // As in `into_staged`: every write is done, and spilling took no
-        // target lock.
-        let token = read_write_token(txn).await?;
-        let read = txn
-            .prepare(&format!(
-                "select key, prior_image, hop_gen, src_changed, origin_lsn \
-                 from {SPILL_TABLE} where target = $1 order by key"
-            ))
-            .await?;
-        let fetch = i32::try_from(batch).unwrap_or(i32::MAX);
-        for target in std::mem::take(&mut self.spilled) {
-            let info = self.info(txn, &target).await?.clone();
-            let portal = txn.bind(&read, &[&target]).await?;
-            loop {
-                let rows = txn.query_portal(&portal, fetch).await?;
-                if rows.is_empty() {
-                    break;
-                }
-                let keys: BTreeMap<String, KeyMutation> = rows
-                    .iter()
-                    .map(|row| {
-                        (
-                            row.get(0),
-                            KeyMutation {
-                                prior_image: row.get(1),
-                                hop_gen: row.get(2),
-                                src_changed: row.get(3),
-                                origin_lsn: row.get(4),
-                            },
-                        )
-                    })
-                    .collect();
-                let mut propagation = Propagation {
-                    changes: Vec::new(),
-                    hop_bound_tables: Vec::new(),
-                    worst_hop_gen: 0,
-                    write_token: Some(token),
-                };
-                stage_target(
-                    txn,
-                    &target,
-                    &info,
-                    keys,
-                    token,
-                    &mut propagation,
-                    &mut self.stats,
-                )
-                .await?;
-                append::append(txn, &propagation.changes).await?;
-            }
-        }
-        txn.batch_execute(&format!("drop table {SPILL_TABLE}"))
-            .await?;
-        Ok(())
-    }
-}
-
-/// Adds `keys` of `target` to [`SPILL_TABLE`], merging each with the row a
-/// previous spill left for it by [`TargetMutations::record`]'s rules: the
-/// first prior image wins (the row already there, even with no image), the
-/// highest `hop_gen`, the earliest `src_changed`, and the earliest
-/// `origin_lsn`, unknown if either is.
-async fn upsert_spilled(
-    txn: &Transaction<'_>,
-    target: &str,
-    keys: &[(String, KeyMutation)],
-) -> Result<(), ApplyError> {
-    let names: Vec<&str> = keys.iter().map(|(key, _)| key.as_str()).collect();
-    let priors: Vec<Option<&str>> = keys.iter().map(|(_, m)| m.prior_image.as_deref()).collect();
-    let hops: Vec<i32> = keys.iter().map(|(_, m)| m.hop_gen).collect();
-    let changed: Vec<Option<SystemTime>> = keys.iter().map(|(_, m)| m.src_changed).collect();
-    let origins: Vec<Option<PgLsn>> = keys.iter().map(|(_, m)| m.origin_lsn).collect();
-    txn.execute(
-        &format!(
-            "insert into {SPILL_TABLE} as m \
-                 (target, key, prior_image, hop_gen, src_changed, origin_lsn) \
-             select $1, k.key, k.prior, k.hop, k.changed, k.origin \
-             from unnest($2::text[], $3::text[], $4::integer[], $5::timestamptz[], \
-                         $6::pg_lsn[]) as k(key, prior, hop, changed, origin) \
-             on conflict (target, key) do update set \
-                 hop_gen = greatest(m.hop_gen, excluded.hop_gen), \
-                 src_changed = least(m.src_changed, excluded.src_changed), \
-                 origin_lsn = case when m.origin_lsn is null \
-                                     or excluded.origin_lsn is null then null \
-                                   else least(m.origin_lsn, excluded.origin_lsn) end"
-        ),
-        &[&target, &names, &priors, &hops, &changed, &origins],
-    )
-    .await?;
-    Ok(())
 }
 
 /// Stages one target's `keys` into `propagation`, as
@@ -840,13 +452,9 @@ async fn stage_target(
     keys: BTreeMap<String, KeyMutation>,
     token: PgLsn,
     propagation: &mut Propagation,
-    stats: &mut SeamStats,
 ) -> Result<(), ApplyError> {
     let mut new_images = match &info.image_feed {
-        Some(feed) => {
-            stats.bound(keys.len());
-            read_new_images(txn, target, &info.image_columns, feed, &keys).await?
-        }
+        Some(feed) => read_new_images(txn, target, &info.image_columns, feed, &keys).await?,
         None => HashMap::new(),
     };
     for (key, m) in keys {
@@ -964,8 +572,7 @@ impl NewImagesQuery<'_> {
 /// Matching a whole batch with `is not distinct from` on any column one of
 /// its keys binds a NULL for (the pre-#433 shape) is correct but not
 /// indexable: on a 500k-group aggregate target, a 500-key batch with one
-/// NULL group took 8.5s against 0.4ms without it. This is the same split
-/// `intake::resume_orphans` makes per NULL pattern.
+/// NULL group took 8.5s against 0.4ms without it.
 ///
 /// A single-column identity's non-`NULL` arm also restricts the column to
 /// its array (`t.<col> = any(<array>)`), which the match already implies,
@@ -1246,223 +853,6 @@ mod tests {
             token >= after_last_write,
             "the token ({token}) is at or after the last write ({after_last_write})"
         );
-    }
-
-    /// One [`SPILL_TABLE`] row: key, prior image, `hop_gen`, `src_changed`,
-    /// `origin_lsn`.
-    type SpilledRow = (
-        String,
-        Option<String>,
-        i32,
-        Option<SystemTime>,
-        Option<PgLsn>,
-    );
-
-    /// Issue #924: a key spilled by one batch and touched again by a later
-    /// one merges in the spill table by [`TargetMutations::record`]'s rules:
-    /// the first prior image (even a missing one, for a key created here),
-    /// the highest `hop_gen`, the earliest `src_changed`, and the earliest
-    /// `origin_lsn`, unknown if either side is. A target nothing reads is
-    /// dropped at the spill, not held. Under a batch of keys, nothing spills.
-    #[tokio::test]
-    async fn a_key_spilled_by_two_batches_merges_like_one_record() {
-        use std::time::Duration;
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let mut client = connect(db.dsn()).await;
-        let txn = client.transaction().await.expect("begin");
-        let at = |secs| SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
-        let lsn = |n: u64| Some(PgLsn::from(n));
-
-        let mut m = TargetMutations::assuming_read();
-        m.record(
-            "public.t",
-            "a".into(),
-            Some("first".into()),
-            1,
-            Some(at(20)),
-            lsn(200),
-        );
-        m.spill_over(&txn, 3).await.expect("under a batch");
-        assert!(!m.stats.spilled, "one key is under a batch of 3");
-        m.record("public.t", "b".into(), None, 2, None, lsn(50));
-        m.record(
-            "public.t",
-            "c".into(),
-            Some("c0".into()),
-            0,
-            Some(at(5)),
-            None,
-        );
-        m.spill_over(&txn, 3).await.expect("spill the first batch");
-        assert!(m.stats.spilled, "three keys are a batch");
-        assert_eq!(m.held(), 0, "a spill holds nothing in memory");
-
-        // The second batch touches every key again.
-        m.record(
-            "public.t",
-            "a".into(),
-            Some("second".into()),
-            4,
-            Some(at(10)),
-            None,
-        );
-        m.record(
-            "public.t",
-            "b".into(),
-            Some("b1".into()),
-            1,
-            Some(at(7)),
-            lsn(40),
-        );
-        m.record(
-            "public.t",
-            "c".into(),
-            Some("c1".into()),
-            3,
-            Some(at(1)),
-            lsn(1),
-        );
-        m.record("public.t", "d".into(), Some("d0".into()), 0, None, lsn(9));
-        m.spill_over(&txn, 3).await.expect("spill the second batch");
-        assert_eq!(m.stats.most_held, 4);
-        assert_eq!(
-            m.stats.largest_statement, 3,
-            "each upsert binds at most a batch"
-        );
-
-        let rows: Vec<SpilledRow> = txn
-            .query(
-                &format!(
-                    "select key, prior_image, hop_gen, src_changed, origin_lsn \
-                     from {SPILL_TABLE} where target = 'public.t' order by key"
-                ),
-                &[],
-            )
-            .await
-            .expect("read the spill")
-            .into_iter()
-            .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4)))
-            .collect();
-        assert_eq!(
-            rows,
-            vec![
-                ("a".into(), Some("first".into()), 4, Some(at(10)), None),
-                ("b".into(), None, 2, Some(at(7)), lsn(40)),
-                ("c".into(), Some("c0".into()), 3, Some(at(1)), None),
-                ("d".into(), Some("d0".into()), 0, None, lsn(9)),
-            ],
-            "first image, max hop_gen, earliest src_changed, earliest origin or unknown"
-        );
-
-        let mut unread = TargetMutations::assuming_unread();
-        unread.record("public.u", "1".into(), None, 0, None, None);
-        unread
-            .spill_over(&txn, 1)
-            .await
-            .expect("spill an unread target");
-        assert_eq!(unread.held(), 0, "an unread target's keys are dropped");
-        assert!(unread.spilled.is_empty(), "and never reach the table");
-    }
-
-    /// Issue #924: a spilled flush refuses a key past [`MAX_HOP_GEN`] with
-    /// the same error an in-memory flush gives: the worst next hop, and
-    /// each bounded target once, in name order. The bounded keys are spread
-    /// over two spills and the flush's own, and a target under the bound
-    /// sits between them.
-    #[tokio::test]
-    async fn a_spilled_flush_bounds_hops_like_an_in_memory_one() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let mut client = connect(db.dsn()).await;
-        let batches: [&[(&str, &str, i32)]; 3] = [
-            &[("public.z", "1", MAX_HOP_GEN), ("public.m", "1", 0)],
-            &[("public.a", "1", MAX_HOP_GEN - 1), ("public.m", "2", 1)],
-            &[("public.a", "1", MAX_HOP_GEN + 2), ("public.z", "2", 0)],
-        ];
-
-        let mut errors = Vec::new();
-        for spill in [None, Some(2)] {
-            let txn = client.transaction().await.expect("begin");
-            let mut m = TargetMutations::assuming_read();
-            for batch in batches {
-                for &(target, key, hop_gen) in batch {
-                    m.record(target, key.into(), None, hop_gen, None, None);
-                }
-                if let Some(batch) = spill {
-                    m.spill_over(&txn, batch).await.expect("spill");
-                }
-            }
-            assert_eq!(m.stats.spilled, spill.is_some());
-            match m.flush_counted(&txn).await {
-                Err(ApplyError::HopBoundExceeded { hop_gen, tables }) => {
-                    errors.push((hop_gen, tables));
-                }
-                other => panic!("expected the hop bound, got {other:?}"),
-            }
-            txn.rollback().await.expect("rollback");
-        }
-        assert_eq!(
-            errors[0],
-            (
-                MAX_HOP_GEN + 3,
-                vec!["public.a".to_string(), "public.z".to_string()]
-            ),
-            "the in-memory flush"
-        );
-        assert_eq!(errors[1], errors[0], "the spilled flush matches it");
-    }
-
-    /// A transaction that stages nothing pays no round trip for a token.
-    #[tokio::test]
-    async fn a_transaction_that_stages_nothing_reads_no_token() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let mut client = connect(db.dsn()).await;
-
-        let txn = client.transaction().await.expect("begin");
-        let mut unread = TargetMutations::assuming_unread();
-        unread.record("public.t", "1".into(), None, 0, None, None);
-        let propagation = unread.into_staged(&txn).await.expect("stage unread");
-        assert!(propagation.changes.is_empty());
-        assert_eq!(
-            propagation.write_token, None,
-            "a terminal target reads no token"
-        );
-
-        let untouched = TargetMutations::assuming_read();
-        let propagation = untouched.into_staged(&txn).await.expect("stage untouched");
-        assert_eq!(propagation.write_token, None, "no key changed, no token");
-    }
-
-    /// Issue #926: `into_staged` refuses an accumulator that has spilled,
-    /// rather than stage the keys it holds and drop the ones in the spill
-    /// table, whether or not the spill kept any (an unread target's keys
-    /// are dropped at the spill).
-    #[tokio::test]
-    async fn into_staged_refuses_a_spilled_accumulator() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let mut client = connect(db.dsn()).await;
-        let txn = client.transaction().await.expect("begin");
-        for mut m in [
-            TargetMutations::assuming_read(),
-            TargetMutations::assuming_unread(),
-        ] {
-            m.record("public.t", "1".into(), None, 0, None, None);
-            m.record("public.t", "2".into(), None, 0, None, None);
-            m.spill_over(&txn, 2).await.expect("spill a batch");
-            assert!(m.stats.spilled);
-            m.record("public.t", "3".into(), None, 0, None, None);
-            match m.into_staged(&txn).await {
-                Err(ApplyError::SpilledMutationsNotFlushed) => {}
-                Err(other) => panic!("expected the spilled refusal, got {other:?}"),
-                Ok(propagation) => panic!(
-                    "a spilled accumulator staged {} of its keys in memory",
-                    propagation.changes.len()
-                ),
-            }
-        }
     }
 
     /// `read_new_images` over a composite, mixed-type row identity (a text

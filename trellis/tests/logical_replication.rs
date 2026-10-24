@@ -24,7 +24,7 @@ use testkit::{StopMode, TestCluster};
 use tokio_postgres::{Client, NoTls};
 use trellis::defs::TransformStatus;
 use trellis::defs::subscription::{Subscribed, subscribed};
-use trellis::intake::markers;
+use trellis::intake::harness;
 use trellis::staging::self_check::CheckPageExt;
 use trellis::{CaptureFault, CatalogError, Divergence, SelfCheckOutcome, TrellisError};
 
@@ -446,7 +446,7 @@ async fn the_capture_pass_pauses_a_reader_once_a_subscription_replicates_into_it
         .await
         .expect("define");
     capture_pass(&mut it.raw, &it.pool).await;
-    markers::settle_registrations(&it.pool).await;
+    harness::settle_builds(&it.pool).await;
     assert_eq!(
         status(&it.trellis, "c_copy").await.status,
         TransformStatus::Live
@@ -500,7 +500,7 @@ async fn the_capture_pass_pauses_a_reader_once_a_subscription_replicates_into_it
         .await
         .expect("resume");
     capture_pass(&mut it.raw, &it.pool).await;
-    markers::settle_registrations(&it.pool).await;
+    harness::settle_builds(&it.pool).await;
     let reported = status(&it.trellis, "c_copy").await;
     assert_eq!(reported.status, TransformStatus::Live);
     assert_eq!(reported.capture_failure, None);
@@ -528,13 +528,13 @@ async fn the_capture_pass_pauses_a_reader_of_a_seam_fed_table() {
         .await
         .expect("define the upstream");
     capture_pass(&mut it.raw, &it.pool).await;
-    markers::settle_registrations(&it.pool).await;
+    harness::settle_builds(&it.pool).await;
     it.trellis
         .apply("TRANSFORM c_again FROM public.c_copy SELECT amount AS amount")
         .await
         .expect("define one sourced from its target");
     capture_pass(&mut it.raw, &it.pool).await;
-    markers::settle_registrations(&it.pool).await;
+    harness::settle_builds(&it.pool).await;
 
     it.admin
         .batch_execute("create publication pub_target for table public.c_copy")

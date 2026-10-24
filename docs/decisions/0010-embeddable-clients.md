@@ -62,7 +62,7 @@ own SQL. Every operation goes through the `trellis` crate.
 A pure-Ruby/pure-Elixir client issuing SQL needs no native extension, which is
 attractive for packaging — and still wrong. What a client must get right is not
 "run this query" but the instance-identity check, pinned `search_path`,
-grammar, backfill markers and their fences, backfill enumeration, and
+grammar, build starts and their capture gates, and
 quarantine addressing. Every one is a moving contract; three independent
 implementations means every engine change lands three times and stays correct
 in at most one. Divergence is silent and yields wrong derived data, not an error.

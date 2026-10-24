@@ -10,8 +10,6 @@
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
 
-use std::time::Duration;
-
 use drain_driver::Driver;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ValueType;
@@ -61,15 +59,9 @@ async fn a_swapped_joined_table_does_not_panic_the_pass() {
     // against the table now at the name, and the passes after it reinstall
     // capture on the recreated table, which is where the orphan sweep meets
     // a `JOIN` (#1177).
-    trellis::client::reconcile_pass(
-        &mut d.ctl,
-        &pool,
-        DEFAULT_SCHEMA,
-        "join_swapped_table_wake",
-        Duration::from_secs(2),
-    )
-    .await
-    .expect("reconcile pass");
+    trellis::client::reconcile_pass(&mut d.ctl, &pool, DEFAULT_SCHEMA)
+        .await
+        .expect("reconcile pass");
     let status = d
         .rows("select status from transform_definitions where target_table = 'public.j2'")
         .await;
@@ -91,22 +83,8 @@ async fn a_swapped_joined_table_does_not_panic_the_pass() {
 
     // Two passes: the second skips the backed-off marker, so it fails once.
     for _ in 0..2 {
-        trellis::client::reconcile_pass(
-            &mut d.ctl,
-            &pool,
-            DEFAULT_SCHEMA,
-            "join_swapped_table_wake",
-            Duration::from_secs(2),
-        )
-        .await
-        .expect("reconcile pass");
+        trellis::client::reconcile_pass(&mut d.ctl, &pool, DEFAULT_SCHEMA)
+            .await
+            .expect("reconcile pass");
     }
-
-    // The passes after the resume rebuild the `JOIN` rather than park a
-    // marker the orphan sweep would fail (#1177 is the guard if one is
-    // parked): nothing is left failing on the swapped table.
-    let rows = d
-        .rows("select attempts from pending_backfill where table_name = 'public.jb' and last_error is not null")
-        .await;
-    assert!(rows.is_empty(), "no failing marker is left: {rows:?}");
 }

@@ -16,7 +16,7 @@
 //! key), so such a side's truncate floor never rises. Its fresh build or
 //! `RESUME` waits for the seam fence first (`super::build`'s "Seam-fed
 //! sources"). An upstream build that writes its target outside the seam
-//! rebuilds the `JOIN` (`intake::markers::park_target_catchup_if_read`).
+//! rebuilds the `JOIN` (`intake::catch_up::park_target_catchup_if_read`).
 //!
 //! Either table may be a partitioned root (#1111, ADR-0019 "Either side may
 //! be partitioned"). A node operation (`DROP`, `DETACH`, `TRUNCATE`,

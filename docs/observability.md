@@ -17,8 +17,9 @@ where they're stuck, and what work is pending or blocked. The counterpart to
   whatever the operator already runs.
 * **Structured logs** — through a facade that can export OpenTelemetry.
 * **Transform status** — every transform carries an observable lifecycle status
-  (`waiting_to_backfill` → `backfilling` → `catching_up` → `live`, plus
-  `quarantined` and `paused`, which a halting failure also uses), so an
+  (`waiting_to_backfill` → `backfilling` → `live`, plus `quarantined` and
+  `paused`, which a halting failure also uses, and `catching_up`, which is
+  reported while an upstream isn't `live`), so an
   operator can tell a new transform is still populating rather than live — the
   right-sized answer to the silent-stall problem (#14).
 * **Fleet-level worker liveness** — `Trellis::has_live_drain_workers`
@@ -228,37 +229,44 @@ as `paused`; both resume by re-running the *same* backfill), so backfill, quaran
 pause are arcs of one lifecycle:
 
 ```
-(new transform)──► waiting_to_backfill ──► backfilling ──► catching_up ◄──► live
-                          ▲                                                   │
-                          │ RESUME (re-runs the backfill)                     │ PAUSE, auto-pause,
-                          └───────────── paused / quarantined ◄───────────────┘ or the fuse trips
+(new transform)──► waiting_to_backfill ──► backfilling ◄──► live
+                          ▲                                    │
+                          │ RESUME (re-runs the backfill)      │ PAUSE, auto-pause,
+                          └──── paused / quarantined ◄─────────┘ or the fuse trips
 ```
 
 * **`waiting_to_backfill`** — defined, but its source's existing rows haven't
   been read yet. Every new transform starts here, and registration returns
-  with it here. It stays until the staging worker has joined its source
-  (installed its capture triggers if needed and parked a `pending_backfill`
-  marker) and the marker's transaction fence has settled (see caveat below)
+  with it here. It stays until the staging worker's reconcile pass finds its
+  source (and a `JOIN`'s joined table) captured with the columns it reads, and
+  no change staged before the capture install or widen is still pending
+  ([stage 01](staging-and-claiming/01-capture-by-triggers.md#widening-and-the-capture-gate)),
+  then starts its build
   ([data-flow — Capturing a table's existing rows](data-flow.md#capturing-a-tables-existing-rows)).
-  A direct build that failed comes back here too, retried after a backoff;
-  `Trellis::status` reports its error meanwhile (`backfill_failure`).
-* **`backfilling`** — the backfill discharge has captured the source and
-  enqueued the transform's build, which is running: chunks, or one direct
-  set-based build job, on drain threads. The target is partial.
-  A plain 1-1 transform (on a captured source) is built by the Re-derive build
-  instead
+* **`backfilling`** —* **`backfilling`** — the staging worker has started the transform's build,
+  which is running on drain threads. The target is partial. A plain 1-1
+  transform is built by the Re-derive build
   ([data-flow — The Re-derive build](data-flow.md#the-re-derive-build)), and an
   aggregate or a `JOIN` by one absolute write per structure
   ([data-flow — An aggregate's or a `JOIN`'s build](data-flow.md#an-aggregates-or-a-joins-build)).
-  The staging worker starts it with no marker, and it is maintained from the start, so it goes
-  from `backfilling` straight to `live` once its last chunk (or, for an aggregate or
-  a `JOIN`, its write) has committed, with no `catching_up`. Its resume rebuilds it
+  It is maintained from the start, so it goes from `backfilling` straight to
+  `live` once its last chunk (or, for an aggregate or a `JOIN`, its write)
+  has committed. Its resume rebuilds it
   the same way, a 1-1 target's over the ledger the freeze left (an aggregate's
   or a `JOIN`'s partials are written afresh), and so does a re-read of its source
-  (`Trellis::request_backfill`). A ring enumeration (the fallback
-  for a shape neither build can render) never shows this status: it goes from
-  `waiting_to_backfill` straight to `live` in the discharge's own transaction (or
-  to `catching_up`, when its source is another transform's target).
+  (`Trellis::request_backfill`) and the rebuild of an upstream whose target
+  it reads. A `live` transform comes back here for a rebuild after:
+  * an `ALTER TRANSFORM` that added columns or a resumed column (only those
+    columns are rebuilt);
+  * a re-read of a table it reads (`Trellis::request_backfill`, the table's
+    capture triggers reinstalled after a restore brought them back disabled,
+    or an automatic rebuild counted in `capture_auto_rebuilds_total`), in the
+    call's own transaction (or the capture pass that starts the automatic
+    rebuild), returning to `live` when the rebuild is done. Its target keeps
+    its rows meanwhile: the rebuild rewrites them in place;
+  * a rebuild of the transform whose target it reads, written outside the
+    target-mutation seam.
+
   A `live` aggregate over a partitioned source, or a `live` `JOIN` with a
   partitioned table on either side, comes back here while it is corrected
   for a partition of that table that was attached, detached, dropped or
@@ -283,29 +291,14 @@ pause are arcs of one lifecycle:
   none; a correction that keeps failing is reported in `backfill_failure`. The
   CLI's `trellis status` prints one `correcting` line per entry under the
   transform.
-* **`catching_up`** — the build has finished and apply maintains the
-  transform exactly as a `live` one, but a go-live catch-up (a re-read of a
-  table it reads, parked as a `pending_backfill` marker) hasn't been
-  discharged yet, so the target may be missing changes that drained while it
-  was building. The staging worker discharges a fresh marker on its next
-  maintenance tick, and that discharge flips the transform `live`.
-  A catch-up that keeps failing keeps the transform here, with the error on
-  `Trellis::status` when the failing marker is on its source.
-  A `live` transform comes back here for its own catch-up after:
-  * an `ALTER TRANSFORM` that added columns;
-  * a resumed column;
-  * a rebuild of a transform whose target it reads;
-  * a re-read of a table it reads (`Trellis::request_backfill`, the table's
-    capture triggers reinstalled after a restore brought them back disabled,
-    or an automatic
-    rebuild counted in `capture_auto_rebuilds_total`), unless the Re-derive
-    build serves it: that definition goes `backfilling` instead, in the
-    call's own transaction (or the capture pass that starts the automatic
-    rebuild), and returns to `live` when the rebuild is done. Its target
-    keeps its rows meanwhile: the rebuild rewrites them in place.
+* **`catching_up`** — reported, never stored: a `live` transform that reads an
+  upstream which isn't `live` (paused, quarantined, rebuilding, or itself
+  reporting `catching_up`, down the whole chain) keeps applying, but its
+  target doesn't reflect the source yet, so a watermark token wouldn't wait
+  for what is missing. `live` holds along a chain
+  ([ADR-0002](decisions/0002-async-data-flow.md#what-live-promises)).
 
-  A `live` transform that reads an upstream which isn't `live` reports
-  `catching_up` too, and so does one that reads a paused column of an
+  So does a `live` transform that reads a paused column of an
   upstream 1-1 target (its fuse tripped, or `PAUSE TRANSFORM t.col`): an
   aggregate or `JOIN` keeps applying over the column's frozen values, exact
   against the target and stale against the source. `paused_upstream_columns`
@@ -374,8 +367,7 @@ pause are arcs of one lifecycle:
     `backfill_failure`;
   * the drain hit a failure that every key reproduces (a source with no usable
     primary key, a propagation cycle past the hop bound, a read or write refused
-    to the drain's role), or a backfill discharge or go-live catch-up was refused
-    a read: the definitions it reaches
+    to the drain's role): the definitions it reaches
     and everything downstream of them are paused, with the cause on `capture_failure`.
 
   `RESUME TRANSFORM` first re-runs define's validation against the live schema. While
@@ -520,70 +512,34 @@ contention on hot keys.
 `trellis status` prints a `join tables` line, a `join build` line while a build is
 under way, and one warning line per finding.
 
-### Backfill status and the `xmin` caveat
+### A build's fence on a seam-fed source
 
-Every backfill (a new transform's, a resumed one's, or a catch-up) reads its
-source only once a conservative transaction fence settles (the backfill discharge
-checks that the snapshot's `xmin` is past the fence), except the Re-derive build of a
-plain 1-1 transform: it starts with no fence, and each of its chunks reads
-under its own short snapshot after locking the ledger entries it rewrites, so
-a long transaction elsewhere doesn't hold it, and it holds no long snapshot of
-its own. The one exception is a build that reads another
+A Re-derive build starts with no transaction fence, and each of its chunks
+reads under its own short snapshot after locking the ledger entries it
+rewrites, so a long transaction elsewhere doesn't hold it, and it holds no long
+snapshot of its own. The one exception is a build that reads another
 transform's target (its source, or a `JOIN`'s joined table), which takes one
 fence, after it starts, before its first chunk or its one-transaction build: a
 transaction that held a transaction id then (one that had
 written or locked a row) holds it, and `status().build_wait` names the fence
 (`BuildWait::Fence { xid }`, a `backend_xid` at or below it in
 `pg_stat_activity`) until every such transaction has ended
-([data-flow — The Re-derive build](data-flow.md#the-re-derive-build)). Because `xmin` is
-**cluster-global**, any unrelated long-running transaction *anywhere in the
-cluster* pins it and holds every waiting backfill in `waiting_to_backfill`
-until that transaction ends. Since every new transform goes through this wait
-([ADR-0002](decisions/0002-async-data-flow.md#a-build-is-re-derive-over-chunks-and-applies-from-its-first-chunk)), a long
-transaction delays every registration from going live, not only the ones on a
-newly captured table.
+([data-flow — The Re-derive build](data-flow.md#the-re-derive-build)). Because
+the wait is on transactions older than the fence anywhere in the cluster, an
+unrelated long-running transaction holds such a build in `backfilling` until
+it ends.
 
 This wait is **safe, not a fault**: the apply loop and every `live` transform are
-unaffected, and even the new table's *new* changes are captured — only its
-*historical* rows are withheld until the fence settles. So we deliberately emit no
-stall metric, warning log, or timeout — the `waiting_to_backfill` status is the
-whole signal.
+unaffected, and the new definition applies from its start. So we deliberately
+emit no stall metric, warning log, or timeout; `build_wait` is the whole
+signal. The remedy is documentation, not a signal: an operator clears the wait
+by ending the pinning transaction (idle-in-transaction connections, long
+analytics queries, `pg_dump`, or workload on another database sharing the
+cluster).
 
-The remedy is documentation, not a signal: an operator clears the wait by ending
-the pinning transaction — idle-in-transaction connections, long analytics
-queries, `pg_dump`, or workload on another database sharing the cluster.
+### A build that keeps failing
 
-### A backfill that keeps failing
-
-A backfill can also fail outright, for example when a plain 1-1 transform's
-source has lost its primary key. That is a fault, so unlike the fence wait it
-is surfaced:
-
-* **It doesn't hold up other tables.** The staging worker logs the failure as a
-  warning and moves on to the next table's backfill in the same pass.
-* **It is retried with backoff.** The next attempt waits 10 seconds, doubling
-  after each further failure up to 5 minutes. It keeps retrying at that pace
-  forever; nothing is quarantined automatically. Once you fix the cause (or drop
-  the transform), the next attempt goes through. A new backfill request for the
-  same table (`Trellis::request_backfill`, a resume, or any other catch-up)
-  resets the backoff and runs at once.
-* **`Trellis::status` reports it.** The transform stays `waiting_to_backfill`,
-  and `DefinitionStatus::backfill_failure` carries the source table, the
-  attempt count, the last error and the next attempt time. The source table's
-  backfill also runs the catch-up of its `live` readers, so every transform
-  reading that table reports the failure, whatever its status. It clears once
-  an attempt goes through. `Trellis::definitions` reports the same value on
-  every `DefinitionSummary`, and the CLI's `trellis status` prints it on an
-  indented line under each affected definition, so one listing shows every
-  stuck backfill.
-* **A refusal pauses instead.** When Postgres refuses the staging worker's
-  role a read the backfill needs (row-level security or a missing privilege,
-  `42501`), retrying can't get past it, so the transforms the refusal reaches
-  are paused as a halt ([A halting failure](#a-halting-failure)) and the
-  backfill goes on without them. Only a refusal the catalog can't pin on a
-  table is retried with backoff as above.
-
-A build that has started fails differently. A plain 1-1 transform's build runs as
+A plain 1-1 transform's build runs as
 chunks of its source's primary-key range on the drain workers, and each failing chunk is
 logged as a warning with the definition, the chunk, the attempt and what happens next.
 A transient failure (a lost connection, a lock conflict) is retried with backoff and
@@ -597,8 +553,8 @@ fifth charged attempt pauses the transform (an aggregate's
 build, which can't be narrowed to a key, is paused the same way). Fix the
 cause and resume the transform, which rebuilds it. Meanwhile
 `DefinitionStatus::backfill_failure` carries the failing chunk's error, attempt count
-and next attempt time, ahead of any failure of the source table's marker; a transform
-paused this way keeps the error there until it is resumed.
+and next attempt time; a transform paused this way keeps the error there until it
+is resumed.
 
 ### A halting failure
 
@@ -643,20 +599,12 @@ without them:
   reports as `drain_failure` on the definitions reading its tables. The drain
   worker re-claims the page at its poll interval under a collapsed warning
   (#660).
-* **A refused backfill.** A backfill discharge or go-live catch-up that
-  Postgres refuses (`42501`, while it plans a build or re-reads the source)
-  halts the same way, as the staging worker's role (#813): it pauses what the
-  refusal reaches with `kind` `halt`, and the marker discharges without them,
-  so the definitions show as halted rather than stuck in
-  `waiting_to_backfill` or `catching_up`. A refusal the catalog can't pin on a
-  table pauses nothing: the marker backs off and retries like any failed
-  backfill, with the error on `backfill_failure`.
 * **A failing build start.** A Re-derive build's start that fails in a way
   that would repeat on every pass (its ledger table was dropped, say) halts the
   definition writing that target, and everything downstream of the target, the
   same way (#986), with `kind` `halt`, the target as the table and the error.
   It never stops the staging worker's pass: the other definitions' builds
-  start, and the other markers discharge. A start that fails transiently, or
+  start. A start that fails transiently, or
   by losing its connection, is retried on the next pass instead.
 * **Resuming.** Fix the cause, then `RESUME TRANSFORM` each halted definition,
   in any order; each resume rebuilds that definition as for any pause, and

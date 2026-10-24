@@ -171,13 +171,13 @@ async fn resuming_a_column_restores_a_null_keyed_upstream_group_without_panickin
     install_definition(&db.pool, SKU_TOTALS, &sales_columns(), "public")
         .await
         .expect("install the aggregate");
-    trellis::intake::markers::settle_registrations(&db.pool).await;
+    trellis::intake::harness::settle_builds(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     install_definition(&db.pool, SKU_TOTALS_ECHO, &sku_totals_columns(), "public")
         .await
         .expect("install the 1-1 chained onto the aggregate");
-    trellis::intake::markers::settle_registrations(&db.pool).await;
+    trellis::intake::harness::settle_builds(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     // Sanity checks: the upstream aggregate holds the NULL group, and so

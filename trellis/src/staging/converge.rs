@@ -288,10 +288,9 @@ pub async fn pending_count(client: &impl GenericClient) -> Result<i64, StagingEr
 /// Whether some change to `table` that carries an image and whose origin is
 /// at or below `gate` hasn't drained yet: it sits in a ring slot a batch
 /// still has to claim. The capture gate a
-/// trigger install or widen sets on its marker (`capture::install`, issue
-/// #622) holds the marker's discharge while this is true, so no row staged
-/// by the replaced capture function reaches a definition that starts
-/// applying from the discharge.
+/// trigger install or widen records (`capture::gate`, issue #622) holds a
+/// definition's build while this is true, so no row staged by the replaced
+/// capture function reaches a definition that starts applying with it.
 ///
 /// "Pending" is `converged_through`'s: a row is pending while its slot's
 /// segment isn't `drained`, or while it is a phase-gap straggler its
@@ -304,12 +303,12 @@ pub async fn pending_count(client: &impl GenericClient) -> Result<i64, StagingEr
 /// A row held in `poison_held` doesn't count (#799). Its release stages an
 /// image-less `Recompute` (`quarantine::release_key`), so its images never
 /// reach a reader, and it is held for the definitions whose key it is, never
-/// for one the discharge dispatches: a new definition holds no key, and a
-/// resume deletes the resumed definition's held keys. A gate that waited on
+/// for one whose build starts: a new definition holds no key, and a resume
+/// deletes the resumed definition's held keys. A gate that waited on
 /// one would hold a definition on another definition's quarantine.
 ///
 /// Scans each slot for `table`'s rows: no index serves `src_table`. It runs
-/// once per discharge pass, and only for a gated marker.
+/// once per reconcile pass, and only for a gated table.
 pub async fn table_changes_pending_through(
     client: &impl GenericClient,
     table: &str,

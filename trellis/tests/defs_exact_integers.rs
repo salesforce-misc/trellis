@@ -42,9 +42,7 @@ use trellis::IntWidth;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use trellis::defs::eval::{RegexCache, Row, Value, evaluate};
-use trellis::defs::{
-    CatalogError, ValidationError, chunk_queue, install_definition, parse, validate,
-};
+use trellis::defs::{CatalogError, ValidationError, install_definition, parse, validate};
 use trellis::{Config, Trellis, TrellisOptions};
 
 // ---------------------------------------------------------------------
@@ -115,36 +113,10 @@ async fn define_join_on(
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
     // ADR-0002 (#418): registration only records a definition; the backfill
     // discharge dispatches its chunks.
-    trellis::intake::markers::discharge_registrations(pool)
+    trellis::intake::harness::start_registered_builds(pool)
         .await
         .expect("dispatch registered definitions' builds");
-    const CLAIMED_BY: &str = "exact_integer_test_backfill_worker";
-    loop {
-        let client = pool.get().await.expect("acquire connection");
-        let claimed = chunk_queue::claim_chunks(&**client, CLAIMED_BY, 1000)
-            .await
-            .expect("claim_chunks");
-        drop(client);
-        if claimed.is_empty() {
-            // A plain aggregate is the Re-derive build's (#625 F3, F5).
-            trellis::staging::build::settle_builds(pool).await;
-            return;
-        }
-        for chunk in &claimed {
-            chunk_queue::run_claimed_chunk(
-                pool,
-                chunk,
-                CLAIMED_BY,
-                Duration::from_secs(5),
-                Duration::from_secs(60),
-            )
-            .await
-            .expect("run_claimed_chunk");
-            chunk_queue::finish_chunk(pool, chunk, CLAIMED_BY)
-                .await
-                .expect("finish_chunk");
-        }
-    }
+    trellis::staging::build::settle_builds(pool).await;
 }
 
 /// The declared Postgres type of `table`.`column`, straight from

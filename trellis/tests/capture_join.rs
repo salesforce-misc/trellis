@@ -59,17 +59,11 @@ async fn capture_pass(raw: &mut Client, pool: &trellis::Pool, budget: Duration) 
         .expect("capture pass")
 }
 
-/// One whole staging-worker pass: capture, markers, discharge.
+/// One whole staging-worker pass: capture, then the builds it readies.
 async fn full_pass(raw: &mut Client, pool: &trellis::Pool) {
-    trellis::client::reconcile_pass(
-        raw,
-        pool,
-        SCHEMA,
-        "capture_join_wake",
-        Duration::from_secs(2),
-    )
-    .await
-    .expect("reconcile pass");
+    trellis::client::reconcile_pass(raw, pool, SCHEMA)
+        .await
+        .expect("reconcile pass");
 }
 
 /// The columns `table`'s installed capture images, or `None` when nothing
@@ -110,30 +104,28 @@ async fn status(raw: &Client, target: &str) -> TransformStatus {
     TransformStatus::from_persisted(&text).expect("known status")
 }
 
-/// `(capture_gate_lsn is not null)` of `table`'s pending marker, or `None`
-/// when it has none.
-async fn marker_gated(raw: &Client, table: &str) -> Option<bool> {
+/// `Some(true)` when `table` has a capture gate, `None` when it has none.
+async fn gate_exists(raw: &Client, table: &str) -> Option<bool> {
     raw.query_opt(
-        "select capture_gate_lsn is not null from pending_backfill where table_name = $1",
+        "select true from capture_gates where table_name = $1",
         &[&table],
     )
     .await
-    .expect("read the marker")
+    .expect("read the gate")
     .map(|row| row.get(0))
 }
 
-/// Runs whole passes until `table` has no marker left: its join marker's
-/// discharge dispatches the build, and a build that finishes at once parks a
-/// go-live catch-up (#476), which the next pass discharges. Nothing drains
-/// here, so a pass only dispatches; a few passes always suffice.
+/// Runs whole passes until `table` has no gate left: the pass that starts the
+/// builds it held releases it. Nothing drains here, so a pass only starts
+/// them; a few passes always suffice.
 async fn settle(raw: &mut Client, pool: &trellis::Pool, table: &str) {
     for _ in 0..5 {
         full_pass(raw, pool).await;
-        if marker_gated(raw, table).await.is_none() {
+        if gate_exists(raw, table).await.is_none() {
             return;
         }
     }
-    panic!("{table}'s markers never discharged");
+    panic!("{table}'s gate never released");
 }
 
 /// A transaction left open holding `ROW EXCLUSIVE` on `table`, as a writer
@@ -157,10 +149,10 @@ async fn backend_pid(client: &Client) -> i32 {
 
 /// A registration installs nothing at `apply`; the next pass installs the
 /// table's triggers, imaging the key and the column the definition reads,
-/// and parks the join marker (with its capture gate) in the same
-/// transaction. The whole pass then dispatches the definition.
+/// and records its capture gate in the same transaction. The whole pass then
+/// starts the definition's build.
 #[tokio::test]
-async fn a_registration_makes_the_next_pass_install_capture_with_its_join_marker() {
+async fn a_registration_makes_the_next_pass_install_capture_with_its_gate() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
@@ -188,9 +180,9 @@ async fn a_registration_makes_the_next_pass_install_capture_with_its_join_marker
         Some(vec!["a".to_string(), "id".to_string()])
     );
     assert_eq!(
-        marker_gated(&raw, "public.u").await,
+        gate_exists(&raw, "public.u").await,
         Some(true),
-        "the install's join marker commits with the triggers, gated"
+        "the install's gate commits with the triggers"
     );
     assert_eq!(outcome.ready, vec![definition_id(&raw, "tu").await]);
 
@@ -198,7 +190,7 @@ async fn a_registration_makes_the_next_pass_install_capture_with_its_join_marker
     assert_ne!(
         status(&raw, "tu").await,
         TransformStatus::WaitingToBackfill,
-        "the pass dispatched the definition"
+        "the pass started the definition"
     );
 }
 
@@ -255,7 +247,7 @@ async fn dropping_readers_narrows_then_uninstalls_capture() {
 }
 
 /// A second definition that reads a column the triggers don't image yet
-/// widens them, and the widen parks a gated marker for it.
+/// widens them, and the widen records a capture gate for it.
 #[tokio::test]
 async fn a_second_definition_reading_a_new_column_widens_capture() {
     let cluster = TestCluster::start();
@@ -281,9 +273,9 @@ async fn a_second_definition_reading_a_new_column_widens_capture() {
         Some(vec!["a".to_string(), "b".to_string(), "id".to_string()])
     );
     assert_eq!(
-        marker_gated(&raw, "public.u").await,
+        gate_exists(&raw, "public.u").await,
         Some(true),
-        "the widen parks a marker gated on the rows the old function staged"
+        "the widen records a gate on the rows the old function staged"
     );
     assert_eq!(outcome.ready, vec![definition_id(&raw, "tb").await]);
 }
@@ -332,7 +324,7 @@ async fn a_table_whose_join_is_blocked_does_not_delay_another_tables_join() {
     );
     assert_eq!(captured_columns(&raw, "public.u").await, None);
     assert_eq!(
-        marker_gated(&raw, "public.u").await,
+        gate_exists(&raw, "public.u").await,
         None,
         "a waiting install changed nothing"
     );
@@ -1220,33 +1212,7 @@ async fn an_alter_adding_a_field_on_a_new_source_column_waits_for_the_widen() {
 /// since #625 F8a): the hand-driven stand-in for a drain worker's build half
 /// (as in `capture_schema_change.rs`).
 async fn run_backfill_chunks(pool: &trellis::Pool) {
-    use trellis::defs::chunk_queue;
-    const CLAIMED_BY: &str = "capture_join_backfill";
-    loop {
-        let client = pool.get().await.expect("acquire connection");
-        let claimed = chunk_queue::claim_chunks(&**client, CLAIMED_BY, 1000)
-            .await
-            .expect("claim_chunks");
-        drop(client);
-        if claimed.is_empty() {
-            trellis::staging::build::settle_builds(pool).await;
-            return;
-        }
-        for chunk in &claimed {
-            chunk_queue::run_claimed_chunk(
-                pool,
-                chunk,
-                CLAIMED_BY,
-                Duration::from_secs(5),
-                Duration::from_secs(60),
-            )
-            .await
-            .expect("run_claimed_chunk");
-            chunk_queue::finish_chunk(pool, chunk, CLAIMED_BY)
-                .await
-                .expect("finish_chunk");
-        }
-    }
+    trellis::staging::build::settle_builds(pool).await;
 }
 
 /// Alternates staging-worker passes, chunk runs and drains until `target`

@@ -15,7 +15,7 @@
 //! images, and the node's current rows', in one transaction, with the
 //! recompute's snapshot as each group's basis. It never zeroes a group. A
 //! capture install that only adds new nodes to the tree rebuilds no
-//! aggregate (`crate::intake::markers::park_table_catch_ups`): the nodes'
+//! aggregate (`crate::intake::catch_up::park_table_catch_ups`): the nodes'
 //! corrections cover them.
 //!
 //! A `JOIN` reading the source as either side (`super::join`, #1111) is
@@ -86,9 +86,8 @@
 //! ([`super::build::work_once`]), run up to [`CLAIM_PAGES`] pages, and give
 //! it back for the next claim, and [`super::build::try_complete`] moves it
 //! back to `live` once the row is done, as it does at the end of a build. A
-//! `catching_up` definition gets its row once its catch-up has moved it
-//! `live`: the catch-up's discharge owns its status until then. It holds the
-//! correction in the queue meanwhile.
+//! definition that is not applying yet gets its row once it is; the
+//! correction waits in the queue meanwhile.
 //!
 //! A correction that fails is given up through the chunk queue's
 //! `fail_chunk`: its row records the error, which `Trellis::status` reports,

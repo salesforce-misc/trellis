@@ -48,7 +48,7 @@
 //! Tier 3 is the engine — `defs` (parses, validates, and catalogs transform
 //! definitions), `capture` (the triggers that stage each source-table change
 //! into the durable staging ring in its writer's transaction), `intake` (the
-//! backfill markers and their discharge, until #625), and `staging`
+//! rebuild of a table's readers), and `staging`
 //! (the ring, sealing, claim-time fold, and the exactly-once apply path) —
 //! together with everything beneath them. They are `pub(crate)`: machinery
 //! the facade composes, not names an embedder can write. See

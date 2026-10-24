@@ -84,11 +84,11 @@ async fn start_chain(rows: &str, deeper: bool) -> Driver {
     let mut d = start(rows).await;
     install(&d, ROLL, &[("g", int4()), ("total", int8()), ("n", int8())]).await;
     if deeper {
-        trellis::intake::markers::settle_registrations(d.pool()).await;
+        trellis::intake::harness::settle_builds(d.pool()).await;
         d.settle().await;
         install(&d, TOP, &[("n", int8()), ("groups", int8()), ("t", int8())]).await;
     }
-    trellis::intake::markers::settle_registrations(d.pool()).await;
+    trellis::intake::harness::settle_builds(d.pool()).await;
     d.settle().await;
     build::settle_builds(d.pool()).await;
     d.settle().await;
@@ -179,23 +179,16 @@ async fn resume(d: &mut Driver) {
 async fn start_resumed_build(d: &mut Driver) {
     if d.rows(&status(TARGET)).await == ["(paused,)"] {
         let pool = d.pool().clone();
-        trellis::client::reconcile_pass(
-            &mut d.ctl,
-            &pool,
-            DEFAULT_SCHEMA,
-            "group_basis_resume_wake",
-            Duration::from_secs(2),
-        )
-        .await
-        .expect("reconcile pass");
+        trellis::client::reconcile_pass(&mut d.ctl, &pool, DEFAULT_SCHEMA)
+            .await
+            .expect("reconcile pass");
     }
     if d.rows(&status(TARGET)).await == ["(waiting_to_backfill,)"] {
         let id = agg_id(d).await;
         let pool = d.pool().clone();
-        let taken = build::start_ready_builds(&mut d.ctl, &pool, &[id])
+        build::start_ready_builds(&mut d.ctl, &pool, &[id])
             .await
             .expect("start the resumed build");
-        assert_eq!(taken, vec![id]);
     }
     assert_eq!(
         d.rows(&status(TARGET)).await,
@@ -491,8 +484,8 @@ async fn the_second_reader_converges_without_being_rebuilt() {
     assert_eq!(d.deadlocks_logged(), Vec::<String>::new());
 }
 
-/// A reader that isn't on the group basis (a 1-1 over the target) gets the
-/// image-less catch-up, which re-derives its rows from the target.
+/// A reader that isn't on the group basis (a 1-1 over the target) is rebuilt
+/// too, which re-derives its rows from the target.
 #[tokio::test]
 async fn a_one_to_one_reader_of_a_resumed_target_is_caught_up() {
     let mut d = start("(1, 1, 10), (2, 2, 7)").await;
@@ -502,7 +495,7 @@ async fn a_one_to_one_reader_of_a_resumed_target_is_caught_up() {
         &[("g", int4()), ("total", int8()), ("n", int8())],
     )
     .await;
-    trellis::intake::markers::settle_registrations(d.pool()).await;
+    trellis::intake::harness::settle_builds(d.pool()).await;
     d.settle().await;
     build::settle_builds(d.pool()).await;
     d.settle().await;
@@ -512,10 +505,10 @@ async fn a_one_to_one_reader_of_a_resumed_target_is_caught_up() {
     run_build(&d).await;
     assert_eq!(
         d.rows(&status("public.mirror")).await,
-        ["(catching_up,)"],
-        "the build's commit parks the reader's catch-up"
+        ["(backfilling,rederive)"],
+        "the build's commit rebuilds the reader"
     );
-    trellis::intake::markers::settle_registrations(d.pool()).await;
+    trellis::intake::harness::settle_builds(d.pool()).await;
     d.settle().await;
     assert_eq!(
         d.rows("select g, total, n from public.mirror order by g")
@@ -614,7 +607,7 @@ async fn reader_operations_and_pages_while_the_build_parks() {
             &[("g", int4()), ("total", int8()), ("n", int8())],
         )
         .await;
-        trellis::intake::markers::settle_registrations(d.pool()).await;
+        trellis::intake::harness::settle_builds(d.pool()).await;
         d.settle().await;
         build::settle_builds(d.pool()).await;
         d.settle().await;
@@ -657,7 +650,7 @@ async fn reader_operations_and_pages_while_the_build_parks() {
         assert_eq!(d.deadlocks_logged(), Vec::<String>::new(), "{what}");
         for _ in 0..2 {
             build::settle_builds(d.pool()).await;
-            trellis::intake::markers::settle_registrations(d.pool()).await;
+            trellis::intake::harness::settle_builds(d.pool()).await;
             d.settle().await;
         }
         assert_eq!(d.rows(ACTUAL).await, d.rows(EXPECTED).await, "{what}: agg");

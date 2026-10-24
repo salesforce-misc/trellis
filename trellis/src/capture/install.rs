@@ -5,18 +5,18 @@
 //! each captured table's [`CaptureSpec`] from the catalog
 //! ([`super::columns::capture_spec`]) and hands it to [`reconcile`], one
 //! table at a time, so a table whose lock is held doesn't hold back another
-//! table's join.
+//! table's install.
 //!
 //! # What each operation does
 //!
-//! | Operation | When ([`plan`]) | Table lock | Marker it parks |
+//! | Operation | When ([`plan`]) | Table lock | What it records |
 //! |---|---|---|---|
-//! | [`install`] | nothing, or a partial install, is there | `SHARE ROW EXCLUSIVE` | the join marker, with a rebuild or a catch-up for each of the table's applying readers ([`park_table_catch_ups`]) |
-//! | [`widen`] | the table must image a column, key or group-key column it doesn't yet, or a function body is stale | `SHARE ROW EXCLUSIVE` | a registration marker for the new reader |
-//! | [`narrow`] | the table images columns no reader needs any more | none | none |
-//! | [`uninstall`] | nothing reads the table any more | `ACCESS EXCLUSIVE` (`DROP TRIGGER`'s) | none |
+//! | [`install`] | nothing, or a partial install, is there | `SHARE ROW EXCLUSIVE` | the table's capture gate, and a rebuild of each of the table's applying readers ([`park_table_catch_ups`]) |
+//! | [`widen`] | the table must image a column, key or group-key column it doesn't yet, or a function body is stale | `SHARE ROW EXCLUSIVE` | the table's capture gate |
+//! | [`narrow`] | the table images columns no reader needs any more | none | nothing |
+//! | [`uninstall`] | nothing reads the table any more | `ACCESS EXCLUSIVE` (`DROP TRIGGER`'s) | nothing |
 //!
-//! [`park_table_catch_ups`]: crate::intake::markers::park_table_catch_ups
+//! [`park_table_catch_ups`]: crate::intake::catch_up::park_table_catch_ups
 //!
 //! # Never blocking a writer (ADR-0002 I6)
 //!
@@ -27,13 +27,13 @@
 //! at most [`USER_TABLE_DDL_LOCK_TIMEOUT`] (50 ms), and
 //! [`crate::locks::DdlRetry`] retries it until it lands or, with a deadline,
 //! until the next attempt couldn't end by it (see "Waiting, never
-//! cancelling" for what it returns then). The attempt parks its marker
-//! *before* it asks for the table lock, under the session's `lock_timeout`:
-//! the marker's row locks are Trellis's own, and waiting for one of them
-//! while holding the table lock would queue the application's writers behind
-//! a Trellis transaction. Once the attempt holds the table lock, nothing in
-//! it waits for anything else, and the whole stretch runs under the 50 ms
-//! timeout anyway.
+//! cancelling" for what it returns then). The attempt locks the definitions
+//! it rebuilds *before* it asks for the table lock, under the session's
+//! `lock_timeout`: waiting for a row lock of Trellis's own while holding the
+//! table lock would queue the application's writers behind a Trellis
+//! transaction. Once the attempt holds the table lock, nothing in it waits
+//! for anything else, and the whole stretch runs under the 50 ms timeout
+//! anyway.
 //!
 //! `DROP TRIGGER` takes `ACCESS EXCLUSIVE`, so an uninstall's attempt also
 //! queues readers of the table for up to 50 ms. A late drop only costs
@@ -68,16 +68,13 @@
 //! its query. Its pid, lock mode, and (for a queued request) how long it has
 //! waited still show.
 //!
-//! # The join fence
+//! # The install is the fence
 //!
-//! An install parks the table's join marker in the transaction that creates
-//! the triggers, so the marker commits exactly when capture starts. The
-//! discharge takes the marker's fence only after reading it committed (issue
-//! #431, [`crate::intake::markers::park_marker`]), so the fence postdates
-//! the install, and a writer still open then is behind it. A write committed
-//! before the install is in the enumeration; one after it runs the trigger.
-//! The table lock makes that split exact: no writer of the table is in
-//! flight when the triggers commit.
+//! An install creates the triggers in one transaction under the table lock,
+//! so the install commits exactly when capture starts. A write committed
+//! before the install is visible to the snapshot of any build that starts
+//! after it; one after it runs the trigger. The table lock makes that split
+//! exact: no writer of the table is in flight when the triggers commit.
 //!
 //! # Widening and the capture gate
 //!
@@ -93,7 +90,7 @@
 //!    writer of the table is in flight, every row the old body staged has
 //!    committed, and every later statement on the table runs the new body.
 //! 2. **Rows the old body staged that haven't drained yet.** A definition
-//!    applies every ring row drained after its discharge dispatches it, and a
+//!    applies every ring row drained after its build starts, and a
 //!    row staged before the widen lacks the new column: the reader fails it
 //!    with `EvalError::MissingColumn` and the key is quarantined. The rows
 //!    can be in the ring. A row held in `poison_held` never reaches
@@ -101,14 +98,13 @@
 //!    `Recompute` that re-derives the key from its live row.
 //!
 //! **The capture gate closes the second gap.** Holding the table lock, the
-//! install or widen reads `pg_current_wal_insert_lsn()` and records it on
-//! the marker it parks (`pending_backfill.capture_gate_lsn`, V55). A capture
+//! install or widen reads `pg_current_wal_insert_lsn()` and records it as the
+//! table's gate (`capture_gates`, [`super::gate`]). A capture
 //! function reads the insert position before it inserts and commits, so
 //! every row the old body staged has an `origin_lsn` below the gate, and
 //! every row the new body stages, which can only run after the widen
-//! commits, has one above it. The discharge doesn't dispatch the marker's
-//! waiting definitions while any change to the table at or below the gate is
-//! still pending ([`crate::staging::converge::table_changes_pending_through`]).
+//! commits, has one above it. No waiting definition's build starts while any
+//! change to the table at or below the gate is still pending ([`crate::staging::converge::table_changes_pending_through`]).
 //! Those rows drain through the definitions that were already applying,
 //! which read only columns the old body imaged. Once they have, nothing
 //! staged by the old body is left for the new reader to meet: a drained row
@@ -129,14 +125,13 @@
 //! old-body row while the attempt waits (the test
 //! `a_row_staged_while_the_widen_waits_for_its_lock_is_below_the_gate`).
 //!
-//! **The gate only holds definitions sourced from the gated table.** The
-//! discharge dispatches a marker's `waiting_to_backfill` definitions whose
-//! `source_table` is the marker's table. A widen of a `JOIN`'s joined table
-//! `T` for a new `JOIN` sourced from `U` (it reads a new column of `T`)
-//! gates `T`'s marker, but the new definition waits on `U`'s marker, which
-//! no gate holds. C5 closes this in the reconcile pass ([`super::reconcile`],
-//! rule 3): such a definition isn't dispatched while `T` has a gated marker
-//! pending.
+//! **The gate only holds definitions sourced from the gated table.** A build
+//! start checks the gate of its definition's `source_table`. A widen of a
+//! `JOIN`'s joined table `T` for a new `JOIN` sourced from `U` (it reads a new
+//! column of `T`) gates `T`, but the new definition is sourced from `U`,
+//! which no gate holds. C5 closes this in the reconcile pass
+//! ([`super::reconcile`], rule 3): such a definition isn't started while `T`
+//! has a gate a pending change holds.
 //!
 //! Why not the alternatives:
 //!
@@ -162,14 +157,14 @@
 //! follow an uninstall whose last rows haven't drained, and those were imaged
 //! for a column set that may not cover the new reader.
 //!
-//! **The reconcile runs before the discharge**, on the same connection: a definition registered on a
-//! captured table must not be dispatched by a discharge that runs before the
-//! widen its columns need. On one staging worker the two run in sequence.
+//! **The reconcile runs before the build starts**, on the same connection: a
+//! definition registered on a captured table must not start before the widen
+//! its columns need. On one staging worker the two run in sequence.
 //!
 //! # Narrowing
 //!
 //! A narrow replaces the functions with ones that image fewer columns, with
-//! no table lock and no marker. A writer still running the old body stages
+//! no table lock and no gate. A writer still running the old body stages
 //! rows with more columns than anyone reads, which harms nothing. The
 //! reconcile pass narrows only from a catalog read after the drop of the
 //! definition that read the dropped columns committed, since the next rows
@@ -191,8 +186,8 @@
 //! installs, and uninstalls, in one transaction under one `LOCK TABLE` of
 //! the root, which locks every table under it. A larger tree installs the
 //! root first and then one table per transaction, so no writer waits behind
-//! a long hold; the join marker parks in the last transaction, the one that
-//! completes capture. [`installed`] reports a root whose tree is missing any
+//! a long hold; the gate and the rebuilds are recorded in the last
+//! transaction, the one that completes capture. [`installed`] reports a root whose tree is missing any
 //! node's triggers as [`Installed::Partial`], so a restart mid-install runs
 //! the install again and it adds only the missing nodes. An uninstall of a
 //! large tree drops the nodes' triggers first and the root's last, so an
@@ -224,8 +219,9 @@
 //! also compares each function's source with what this build generates, so
 //! a function an older generator left behind is replaced.
 //!
-//! Nothing else this module writes is installed state. The capture gate
-//! belongs to a pending marker and goes with it. A [`LockWait`] is returned;
+//! Nothing else this module writes is installed state. The capture gate is
+//! a row of its own ([`super::gate`]) that goes when no pending change holds
+//! it. A [`LockWait`] is returned;
 //! the reconcile pass records the latest one per table in `capture_holdups`
 //! (#687), which describes other sessions, not what is installed.
 //!
@@ -630,13 +626,13 @@ async fn nodes_missing_capture(
 /// and the pass queues its correction
 /// (`crate::staging::partition_correction`), which a reader that engine
 /// serves takes instead of a rebuild and a whole-table catch-up
-/// (`crate::intake::markers::park_table_catch_ups`).
+/// (`crate::intake::catch_up::park_table_catch_ups`).
 ///
 /// A recorded node whose triggers were dropped by hand is not. Neither is an
 /// install that also changes the functions (a reader registered in the same
-/// pass needs a column they don't image): its marker carries the capture
-/// gate that holds that reader until every row the old functions staged has
-/// drained (see "Widening and the capture gate").
+/// pass needs a column they don't image): its capture gate holds that
+/// reader's build until every row the old functions staged has drained (see
+/// "Widening and the capture gate").
 async fn adds_only_new_nodes(
     client: &impl GenericClient,
     schema: &str,
@@ -749,11 +745,11 @@ pub async fn reconcile(
     Ok(progress.map(|()| action))
 }
 
-/// Installs `spec`'s capture, and parks the table's join marker, in one
+/// Installs `spec`'s capture, and records the table's capture gate, in one
 /// transaction under the table's `SHARE ROW EXCLUSIVE` lock, retried as the
 /// module doc describes. Lands `false`, having done nothing, when `spec` is
-/// already installed and current: a repeat install takes no lock and parks
-/// no marker.
+/// already installed and current: a repeat install takes no lock and records
+/// no gate.
 pub async fn install(
     client: &mut Client,
     schema: &str,
@@ -778,7 +774,7 @@ pub async fn install(
 pub const SINGLE_TRANSACTION_TABLES: usize = 100;
 
 /// Installs `spec`'s capture on its table and, for a partitioned root, on
-/// every table under it (see "Partitioned tables"). The join marker parks in
+/// every table under it (see "Partitioned tables"). The gate is recorded in
 /// the transaction that completes the install.
 async fn install_tree(
     client: &mut Client,
@@ -860,7 +856,7 @@ fn trigger_names(schema: &str) -> Vec<String> {
 }
 
 /// Replaces an installed table's capture functions with `spec`'s under the
-/// table's `SHARE ROW EXCLUSIVE` lock, and parks a marker gated on the widen
+/// table's `SHARE ROW EXCLUSIVE` lock, and records the table's capture gate
 /// (see "Widening and the capture gate"), retried as the module doc
 /// describes.
 pub async fn widen(
@@ -874,7 +870,7 @@ pub async fn widen(
 
 /// Replaces an installed table's capture functions with `spec`'s, which
 /// image a subset of the installed columns, in one transaction with no table
-/// lock and no marker (see "Narrowing").
+/// lock and no gate (see "Narrowing").
 pub async fn narrow(
     client: &mut Client,
     schema: &str,
@@ -971,8 +967,8 @@ enum Scope<'a> {
 /// One of the operations that lock the table, for [`run`].
 #[derive(Clone, Copy)]
 enum Op<'a> {
-    /// `last` is whether this attempt completes the install, and so parks
-    /// the join marker (see "Partitioned tables"). `new_nodes` is whether
+    /// `last` is whether this attempt completes the install, and so records
+    /// the gate (see "Partitioned tables"). `new_nodes` is whether
     /// the install only adds nodes new to the recorded tree to a captured
     /// root ([`adds_only_new_nodes`]).
     Install {
@@ -1099,7 +1095,7 @@ async fn run(
     }
 }
 
-/// One attempt at `op`: the marker (if any) under the session's
+/// One attempt at `op`: the readers it rebuilds (if any) under the session's
 /// `lock_timeout`, then the table lock under `lock_timeout` and the DDL.
 async fn attempt(
     client: &mut Client,
@@ -1127,7 +1123,16 @@ async fn attempt(
     // The definitions an install rebuilds (#625 F7), for the build segment
     // below.
     let mut rebuilt = Vec::new();
-    let parks_marker = matches!(op, Op::Install { last: true, .. } | Op::Widen(_));
+    // An install that only adds nodes new to a captured root's tree leaves the
+    // functions as they are, so no row staged by an older body is in flight.
+    let records_gate = matches!(
+        op,
+        Op::Install {
+            last: true,
+            new_nodes: false,
+            ..
+        } | Op::Widen(_)
+    );
     match op {
         Op::Install {
             last: true,
@@ -1135,11 +1140,10 @@ async fn attempt(
             ..
         } => {
             rebuilt =
-                crate::intake::markers::park_table_catch_ups(&txn, &[table.to_string()], new_nodes)
+                crate::intake::catch_up::park_table_catch_ups(&txn, &[table.to_string()], new_nodes)
                     .await?
         }
-        Op::Widen(_) => crate::intake::markers::park_widen_marker(&txn, table).await?,
-        Op::Install { .. } | Op::Uninstall { .. } => {}
+        Op::Install { .. } | Op::Widen(_) | Op::Uninstall { .. } => {}
     }
     // A node dropped since the tree was read has nothing to lock or change.
     let locks = match op.scope() {
@@ -1245,16 +1249,8 @@ async fn attempt(
             ..
         } => super::triggers::forget_node(&txn, table, node).await?,
     }
-    if parks_marker {
-        // The marker row is this transaction's own since the park above, so
-        // this takes no new lock.
-        txn.execute(
-            "update pending_backfill \
-             set capture_gate_lsn = greatest(capture_gate_lsn, $2) \
-             where table_name = $1",
-            &[&table, &gate],
-        )
-        .await?;
+    if records_gate {
+        super::gate::record(&txn, table, gate).await?;
     }
     // Last, so the share lock on the active segment is held only for the
     // commit, not for the table lock's wait.

@@ -57,7 +57,7 @@ pub const CLASSIFICATION: &[(&str, Class)] = &[
     (
         "transform_definitions",
         Class::Definition {
-            reset: r#"{"status":"waiting_to_backfill","fuse_rearmed_at":null,"build":null,"build_seg":null,"build_marker_generation":null}"#,
+            reset: r#"{"status":"waiting_to_backfill","fuse_rearmed_at":null,"build":null,"build_seg":null}"#,
         },
     ),
     ("definition_key_types", Class::Definition { reset: NONE }),
@@ -108,7 +108,7 @@ pub const CLASSIFICATION: &[(&str, Class)] = &[
     ("partition_correction_progress", Class::Runtime),
     ("partition_corrections", Class::Runtime),
     ("partition_sources", Class::Runtime),
-    ("pending_backfill", Class::Runtime),
+    ("capture_gates", Class::Runtime),
     ("poison", Class::Runtime),
     ("poison_held", Class::Runtime),
     ("resume_requests", Class::Runtime),

@@ -1,21 +1,18 @@
-//! Issue #522: a marker that re-reads a table because its applying readers
-//! may have missed changes to it is a go-live catch-up for every one of them
-//! (issue #476, ADR-0002's "What `live` promises"): an explicit
-//! `Trellis::request_backfill` and a table whose capture triggers are
-//! installed (issue #533)
-//! (`intake::markers::park_table_catch_ups`).
+//! Issue #522: a rebuild of the readers of a table that may have missed
+//! changes to it: an explicit `Trellis::request_backfill` and a table whose
+//! capture triggers are installed (issue #533)
+//! (`intake::catch_up::park_table_catch_ups`).
 //!
 //! Someone asks for a re-backfill because a target may have drifted from its
 //! source, a delete that never reached it being the case a re-read alone
-//! can't repair: the discharge enumerates the keys the source still has, so a
-//! target row whose source row is gone is only removed by the orphan sweep,
-//! and the sweep covers `catching_up` readers. So each applying reader moves
-//! to `catching_up` when the marker is parked, and the discharge re-reads the
-//! table, sweeps the reader's target and flips it back `live`.
+//! can't repair. Each applying reader the Re-derive build takes moves
+//! `live -> backfilling` in the call's own transaction with a plan and a sweep
+//! job: the plan re-derives the rows the table has, the sweep deletes the
+//! target rows no source row backs, and the reader is `live` again.
 //!
 //! Each test brings its definitions `live`, then changes the source with no
-//! CDC staged for it (the lost change the marker is there to repair), parks
-//! the marker, and drives the discharge and the drain directly.
+//! CDC staged for it (the lost change the rebuild is there to repair), asks
+//! for the rebuild, and drives the build and the drain directly.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -25,8 +22,8 @@ use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::{ValueType, install_definition};
-use trellis::intake::markers;
-use trellis::staging::{CdcOp, StagedChange, StagedWatermark, apply, seal};
+use trellis::intake::harness;
+use trellis::staging::{CdcOp, StagedChange, apply, seal};
 use trellis::staging::{has_pending, retire_drained_segments};
 use trellis::{Config, Trellis, TrellisOptions};
 
@@ -77,7 +74,7 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
 
 /// Builds every registered definition and discharges its go-live catch-up.
 async fn bring_live(pool: &trellis::Pool, client: &mut Client) {
-    markers::settle_registrations(pool).await;
+    harness::settle_builds(pool).await;
     drain_to_quiescence(pool, client).await;
     let not_live: i64 = client
         .query_one(
@@ -118,22 +115,6 @@ async fn uninstall(client: &mut Client, table: &str) {
         .expect("uninstall capture")
         .done()
         .expect("nothing holds the table");
-}
-
-/// One discharge pass over every settled marker, then a drain of what it
-/// staged. Asserts the pass discharged every marker, so a deferral shows up
-/// here rather than as a wrong target further on.
-async fn discharge_markers(pool: &trellis::Pool, client: &mut Client) {
-    markers::run_pending_backfills(client, WAKE, &StagedWatermark::saturated(), Duration::ZERO)
-        .await
-        .expect("run_pending_backfills");
-    let markers: i64 = client
-        .query_one("select count(*) from pending_backfill", &[])
-        .await
-        .expect("count markers")
-        .get(0);
-    assert_eq!(markers, 0, "the pass discharged every marker");
-    drain_to_quiescence(pool, client).await;
 }
 
 async fn status_of(client: &Client, target: &str) -> String {
@@ -196,68 +177,6 @@ async fn seed_sales(client: &Client) {
         )
         .await
         .expect("create and seed sales");
-}
-
-/// A 1-1 target row whose source row was deleted with no CDC reaching the
-/// target is gone once the re-backfill discharges. Before #522 the
-/// definition stayed `live`, the discharge swept nothing, and row 4 stayed.
-/// This is the catch-up flavour, for a source the Re-derive build leaves to
-/// the old build (`held_out`); [`a_requested_backfill_rebuilds_a_stale_one_to_one_row`]
-/// is the Re-derive flavour.
-#[tokio::test]
-async fn a_requested_backfill_sweeps_a_stale_one_to_one_row() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
-    seed_sales(&client).await;
-    markers::hold_out_of_the_rederive_build(&client, "public.sales")
-        .await
-        .expect("hold sales out of the Re-derive build");
-    install_definition(
-        &db.pool,
-        "TRANSFORM sales_copy FROM sales SELECT amount AS amt",
-        &sales_types(),
-        "public",
-    )
-    .await
-    .expect("install the 1-1");
-    bring_live(&db.pool, &mut client).await;
-
-    client
-        .batch_execute("delete from public.sales where id = 4")
-        .await
-        .expect("delete a source row, its CDC lost");
-    let trellis = connect_trellis(db.dsn()).await;
-    trellis
-        .request_backfill("sales")
-        .await
-        .expect("request a re-backfill");
-    assert_eq!(
-        status_of(&client, "public.sales_copy").await,
-        "catching_up",
-        "a definition whose re-backfill is pending isn't in its steady state"
-    );
-
-    // A change committed while the re-backfill is pending still applies.
-    commit_and_stage(
-        &mut client,
-        "insert into public.sales values (5, 'b', 50)",
-        |lsn| sales_insert(lsn, 5, "b", 50),
-    )
-    .await;
-    discharge_markers(&db.pool, &mut client).await;
-
-    assert_eq!(status_of(&client, "public.sales_copy").await, "live");
-    assert_eq!(
-        copy_rows(&client).await,
-        vec![
-            (1, "5".to_string()),
-            (2, "7".to_string()),
-            (3, "2".to_string()),
-            (5, "50".to_string()),
-        ],
-        "the row no source row backs is swept, and the rest match the source"
-    );
 }
 
 async fn copy_rows(client: &Client) -> Vec<(i32, String)> {
@@ -389,8 +308,8 @@ async fn a_requested_backfill_rebuilds_a_stale_one_to_one_row() {
         |lsn| sales_insert(lsn, 5, "b", 50),
     )
     .await;
-    markers::settle_builds(&db.pool).await;
-    discharge_markers(&db.pool, &mut client).await;
+    harness::settle_builds(&db.pool).await;
+    drain_to_quiescence(&db.pool, &mut client).await;
 
     assert_eq!(status_of(&client, "public.sales_copy").await, "live");
     assert_eq!(
@@ -503,8 +422,8 @@ async fn a_requested_backfill_rebuilds_a_stale_aggregate_group() {
         "the call itself repairs nothing; the background rebuild does"
     );
 
-    markers::settle_builds(&db.pool).await;
-    discharge_markers(&db.pool, &mut client).await;
+    harness::settle_builds(&db.pool).await;
+    drain_to_quiescence(&db.pool, &mut client).await;
 
     assert_eq!(status_of(&client, "public.sku_totals").await, "live");
     assert_eq!(
@@ -559,8 +478,8 @@ async fn a_requested_backfill_during_a_rebuild_enqueues_another() {
         "the second request enqueued a sweep of its own"
     );
 
-    markers::settle_builds(&db.pool).await;
-    discharge_markers(&db.pool, &mut client).await;
+    harness::settle_builds(&db.pool).await;
+    drain_to_quiescence(&db.pool, &mut client).await;
 
     assert_eq!(status_of(&client, "public.sku_totals").await, "live");
     assert_eq!(
@@ -569,93 +488,9 @@ async fn a_requested_backfill_during_a_rebuild_enqueues_another() {
     );
 }
 
-/// Only the readers the Re-derive build takes are rebuilt: a reader the
-/// build leaves to the old build keeps the marker's catch-up (#625 F7).
-#[tokio::test]
-async fn a_requested_backfill_rebuilds_only_the_readers_the_build_takes() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
-    seed_sales(&client).await;
-    markers::hold_target_out_of_the_rederive_build(&client, "public.sales", "public.sales_held")
-        .await
-        .expect("hold sales_held out of the Re-derive build");
-    for definition in [
-        "TRANSFORM sales_held FROM sales SELECT amount AS amt",
-        "TRANSFORM sales_copy FROM sales SELECT amount AS amt",
-    ] {
-        install_definition(&db.pool, definition, &sales_types(), "public")
-            .await
-            .expect(definition);
-    }
-    bring_live(&db.pool, &mut client).await;
-    let trellis = connect_trellis(db.dsn()).await;
-
-    trellis
-        .request_backfill("sales")
-        .await
-        .expect("request a re-backfill");
-
-    assert_eq!(
-        status_of(&client, "public.sales_copy").await,
-        "backfilling",
-        "the plain 1-1 the Re-derive build takes is rebuilt"
-    );
-    assert_eq!(
-        status_of(&client, "public.sales_held").await,
-        "catching_up",
-        "the held-out reader keeps the marker's catch-up"
-    );
-}
-
 /// A table whose capture an operator dropped while a definition applied from
 /// it is captured again at the next reconcile. Its readers missed everything
-/// written meanwhile, so the install's join marker is their catch-up. This is
-/// the catch-up flavour, for a source the Re-derive build leaves to the old
-/// build; the Re-derive flavour is [`a_table_whose_capture_is_reinstalled_rebuilds_its_readers`].
-#[tokio::test]
-async fn a_table_whose_capture_is_reinstalled_catches_up_its_readers() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
-    seed_sales(&client).await;
-    markers::hold_out_of_the_rederive_build(&client, "public.sales")
-        .await
-        .expect("hold sales out of the Re-derive build");
-    install_definition(
-        &db.pool,
-        "TRANSFORM sales_copy FROM sales SELECT amount AS amt",
-        &sales_types(),
-        "public",
-    )
-    .await
-    .expect("install the 1-1");
-    bring_live(&db.pool, &mut client).await;
-    capture(&mut client, &["public.sales"]).await;
-    discharge_markers(&db.pool, &mut client).await;
-
-    uninstall(&mut client, "public.sales").await;
-    client
-        .batch_execute("delete from public.sales where id = 4")
-        .await
-        .expect("delete a row while sales isn't captured");
-    capture(&mut client, &["public.sales"]).await;
-    assert_eq!(status_of(&client, "public.sales_copy").await, "catching_up");
-
-    discharge_markers(&db.pool, &mut client).await;
-
-    assert_eq!(status_of(&client, "public.sales_copy").await, "live");
-    let ids: Vec<i32> = client
-        .query("select id from sales_copy order by id", &[])
-        .await
-        .expect("read sales_copy")
-        .into_iter()
-        .map(|r| r.get(0))
-        .collect();
-    assert_eq!(ids, vec![1, 2, 3]);
-}
-
-/// The Re-derive flavour (#625 F7): the install's own transaction rebuilds
+/// written meanwhile, so the install's own transaction rebuilds
 /// the readers the Re-derive build takes, so they read `backfilling` from the
 /// install's commit, with a plan and a sweep job, and end `live` with the
 /// row deleted while the table wasn't captured gone.
@@ -675,8 +510,8 @@ async fn a_table_whose_capture_is_reinstalled_rebuilds_its_readers() {
     .expect("install the 1-1");
     bring_live(&db.pool, &mut client).await;
     capture(&mut client, &["public.sales"]).await;
-    markers::settle_builds(&db.pool).await;
-    discharge_markers(&db.pool, &mut client).await;
+    harness::settle_builds(&db.pool).await;
+    drain_to_quiescence(&db.pool, &mut client).await;
     assert_eq!(status_of(&client, "public.sales_copy").await, "live");
 
     uninstall(&mut client, "public.sales").await;
@@ -690,8 +525,8 @@ async fn a_table_whose_capture_is_reinstalled_rebuilds_its_readers() {
     assert_eq!((plans, sweeps), (1, 1), "one plan and one sweep, a rebuild");
     assert_eq!(build_seg, Some(active_seq(&client).await));
 
-    markers::settle_builds(&db.pool).await;
-    discharge_markers(&db.pool, &mut client).await;
+    harness::settle_builds(&db.pool).await;
+    drain_to_quiescence(&db.pool, &mut client).await;
 
     assert_eq!(status_of(&client, "public.sales_copy").await, "live");
     let ids: Vec<i32> = copy_rows(&client).await.into_iter().map(|r| r.0).collect();

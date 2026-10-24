@@ -12,8 +12,6 @@ mod drain_driver;
 #[path = "support/varchar_columns.rs"]
 mod varchar_columns;
 
-use std::time::Duration;
-
 use drain_driver::Driver;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ValueType;
@@ -75,15 +73,9 @@ async fn column_type(d: &Driver, table: &str, column: &str) -> String {
 
 async fn pass(d: &mut Driver) {
     let pool = d.pool().clone();
-    trellis::client::reconcile_pass(
-        &mut d.ctl,
-        &pool,
-        DEFAULT_SCHEMA,
-        "join_schema_changes_wake",
-        Duration::from_secs(2),
-    )
-    .await
-    .expect("reconcile pass");
+    trellis::client::reconcile_pass(&mut d.ctl, &pool, DEFAULT_SCHEMA)
+        .await
+        .expect("reconcile pass");
 }
 
 /// Both `GROUP BY` columns and the `ON` pair widen from `varchar(5)` to

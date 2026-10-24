@@ -242,7 +242,7 @@ pub(crate) fn ring_slot_applied_sql(slot: i16) -> String {
 /// has retired it, which needs it drained. That can happen while this slot's
 /// own retirement keeps being skipped (any reader of the slot fails its
 /// `nowait` lock), and counting such a row pending would keep its key out of
-/// a catch-up insert, or make a live write delete it, for a change that has
+/// a build's insert, or make a live write delete it, for a change that has
 /// already applied.
 pub(crate) fn ring_row_pending_sql(slot: i16, claim: Option<&ClaimScope<'_>>) -> String {
     let applied = |owner: &str| {

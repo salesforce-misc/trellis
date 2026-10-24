@@ -1,6 +1,5 @@
-//! Errors the backfill markers, their discharge and the orphan sweep can
-//! produce. The module and type keep the `intake` name until F (#625)
-//! deletes what is left of them (issue #622 plan, Q6).
+//! Errors the intake helpers can produce: the table-name helper and the
+//! rebuild of a table's readers.
 //!
 //! Same hand-rolled-enum convention as [`crate::staging::error::StagingError`]
 //! and [`crate::error::Error`], with `From` impls so the call sites can use
@@ -11,52 +10,38 @@ use std::fmt;
 use crate::error_code::{self, ErrorCode};
 use crate::staging::StagingError;
 
-/// Failure modes of the backfill markers and their discharge.
+/// Failure modes of the intake helpers.
 #[derive(Debug)]
 pub enum IntakeError {
-    /// The staging ring's blind append, or the transaction it runs in,
+    /// The staging ring's append, or the transaction it runs in,
     /// failed. Composes [`StagingError`] via `From` rather than
     /// duplicating its variants.
     Staging(StagingError),
     /// A raw `tokio_postgres` error that isn't already wrapped by
     /// [`IntakeError::Staging`].
     Db(tokio_postgres::Error),
-    /// A `src_table` string wasn't the `"schema.table"` shape backfill
-    /// enumeration needs to split and quote.
+    /// A `src_table` string wasn't the `"schema.table"` shape.
     InvalidTableName(String),
-    /// [`super::markers::qualify`] was asked to join a schema or table
+    /// [`super::qualify`] was asked to join a schema or table
     /// name that itself contains a literal `.` — legal as a quoted Postgres
     /// identifier, but this crate's `"schema.table"` joined-string
     /// representation has no way to tell that dot apart from the separator.
-    /// Rejected loudly at construction rather than silently mis-split later
-    /// by [`super::markers::split_qualified`].
+    /// Rejected loudly at construction rather than silently mis-split later.
     DottedIdentifierComponent { component: String },
-    /// A table a marker's discharge enumerates has no identity key to stage
-    /// its rows under: no primary key, and not an aggregate target with
+    /// A table the test harness enumerates has no identity key to stage its
+    /// rows under: no primary key, and not an aggregate target with
     /// grouping columns (issue #308).
     NoIdentityKey { table: String },
-    /// A `pg_snapshot` value read back from Postgres (the current snapshot a
-    /// backfill marker's fence is checked against) wasn't in the
-    /// `"xmin:xmax:xip..."` text form this decodes.
-    InvalidSnapshot(String),
     /// A `defs::catalog` lookup or build failed. Composed via `From` rather
     /// than flattened, matching
     /// [`IntakeError::Staging`]'s convention. `Box`ed: `CatalogError`
     /// itself carries a `Backfill(IntakeError)` variant, so an unboxed
     /// cycle between the two enums would make both infinite-sized.
     Catalog(Box<crate::defs::catalog::CatalogError>),
-    /// Issue #330: reporting the target rows a resume's discharge deleted
-    /// (`super::resume_orphans`) through the target-mutation seam failed.
+    /// Reporting a change through the target-mutation seam failed.
     /// `Box`ed for the same reason as [`IntakeError::Catalog`]:
     /// `ApplyError` carries an `Intake(IntakeError)` variant.
     Propagation(Box<crate::staging::ApplyError>),
-    /// Issue #518: a discharge's sweep (`super::resume_orphans`) found a
-    /// swept target inconsistent with its definition in the catalog: an
-    /// aggregate target whose key lacks one of its grouping columns (its
-    /// primary key altered by hand, say). Returned rather than panicked, so
-    /// the marker fails and backs off (issue #407) with this on status
-    /// instead of taking down the maintenance loop.
-    UnsweepableTarget { target: String, reason: String },
 }
 
 impl IntakeError {
@@ -74,9 +59,7 @@ impl IntakeError {
             IntakeError::Propagation(err) => err.code(),
             IntakeError::InvalidTableName(_)
             | IntakeError::DottedIdentifierComponent { .. }
-            | IntakeError::NoIdentityKey { .. }
-            | IntakeError::InvalidSnapshot(_)
-            | IntakeError::UnsweepableTarget { .. } => ErrorCode::Internal,
+            | IntakeError::NoIdentityKey { .. } => ErrorCode::Internal,
         }
     }
 }
@@ -105,12 +88,6 @@ impl fmt::Display for IntakeError {
                 "can't enumerate {table}: it has no primary key (or, for an aggregate target, \
                  grouping key) to stage its rows under"
             ),
-            IntakeError::InvalidSnapshot(text) => {
-                write!(f, "could not parse pg_snapshot text {text:?}")
-            }
-            IntakeError::UnsweepableTarget { target, reason } => {
-                write!(f, "can't sweep {target}'s unbacked rows: {reason}")
-            }
         }
     }
 }
@@ -127,9 +104,7 @@ impl std::error::Error for IntakeError {
             IntakeError::Propagation(err) => Some(err.as_ref()),
             IntakeError::InvalidTableName(_)
             | IntakeError::DottedIdentifierComponent { .. }
-            | IntakeError::NoIdentityKey { .. }
-            | IntakeError::InvalidSnapshot(_)
-            | IntakeError::UnsweepableTarget { .. } => None,
+            | IntakeError::NoIdentityKey { .. } => None,
         }
     }
 }

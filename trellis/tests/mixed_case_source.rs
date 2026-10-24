@@ -45,7 +45,7 @@ async fn install_over(db: &testkit::TestDatabase, text: &str, source_columns: &[
     install_definition(&db.pool, text, &numeric_columns(source_columns), "public")
         .await
         .unwrap_or_else(|e| panic!("install {text:?}: {e}"));
-    trellis::intake::markers::settle_registrations(&db.pool).await;
+    trellis::intake::harness::settle_builds(&db.pool).await;
 }
 
 /// A 1-1 transform from `"Shop"."OrderItems"` into a mixed-case target in
@@ -159,7 +159,7 @@ async fn recomputed_fields_over_mixed_case_columns_follow_cdc() {
     )
     .await
     .expect("install qty_span");
-    trellis::intake::markers::settle_registrations(&db.pool).await;
+    trellis::intake::harness::settle_builds(&db.pool).await;
 
     let mut pipeline = Pipeline::attach(cluster, db, raw, &["Shop.OrderItems"]).await;
     const SPANS: &str = "select \"OrderId\"::text, concat_ws(',', lo, hi1, ends) from qty_span";

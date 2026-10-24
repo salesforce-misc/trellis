@@ -37,15 +37,9 @@ pub async fn definer(dsn: &str) -> Trellis {
 
 /// One whole staging-worker pass: capture, markers, discharge.
 pub async fn full_pass(raw: &mut Client, pool: &trellis::Pool) {
-    trellis::client::reconcile_pass(
-        raw,
-        pool,
-        SCHEMA,
-        "resume_key_change_wake",
-        Duration::from_secs(2),
-    )
-    .await
-    .expect("reconcile pass");
+    trellis::client::reconcile_pass(raw, pool, SCHEMA)
+        .await
+        .expect("reconcile pass");
 }
 
 /// The capture half of one pass only.
@@ -93,33 +87,8 @@ pub async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
 }
 
 pub async fn run_backfill_chunks(pool: &trellis::Pool) {
-    use trellis::defs::chunk_queue;
     const CLAIMED_BY: &str = "resume_key_change_backfill";
-    loop {
-        let client = pool.get().await.expect("acquire connection");
-        let claimed = chunk_queue::claim_chunks(&**client, CLAIMED_BY, 1000)
-            .await
-            .expect("claim_chunks");
-        drop(client);
-        if claimed.is_empty() {
-            trellis::staging::build::settle_builds(pool).await;
-            return;
-        }
-        for chunk in &claimed {
-            chunk_queue::run_claimed_chunk(
-                pool,
-                chunk,
-                CLAIMED_BY,
-                Duration::from_secs(5),
-                Duration::from_secs(60),
-            )
-            .await
-            .expect("run_claimed_chunk");
-            chunk_queue::finish_chunk(pool, chunk, CLAIMED_BY)
-                .await
-                .expect("finish_chunk");
-        }
-    }
+    trellis::staging::build::settle_builds(pool).await;
 }
 
 pub async fn status(trellis: &Trellis, target: &str) -> trellis::DefinitionStatus {

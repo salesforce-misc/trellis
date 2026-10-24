@@ -519,26 +519,29 @@ impl VariantDb {
         out
     }
 
-    /// Waits until no backfill marker is pending and the ring has drained,
-    /// so work left over from the previous step (a marker's enumeration and
-    /// the pages applying it) isn't charged to the next timed step. Prints
-    /// how long that took as a `settle` line.
+    /// Waits until no build is running and the ring has drained, so work
+    /// left over from the previous step isn't charged to the next timed step.
+    /// Prints how long that took as a `settle` line.
     async fn settle(&self, cfg: &JoinBench, before: &str) {
         let started = Instant::now();
         let deadline = started + cfg.build_timeout;
         loop {
             let pending: bool = self
                 .raw
-                .query_one("select exists (select 1 from pending_backfill)", &[])
+                .query_one(
+                    "select exists (select 1 from transform_definitions \
+                                    where status in ('waiting_to_backfill', 'backfilling'))",
+                    &[],
+                )
                 .await
-                .expect("read pending markers")
+                .expect("read the running builds")
                 .get(0);
             if !pending {
                 break;
             }
             assert!(
                 Instant::now() < deadline,
-                "a marker stayed pending before {before}"
+                "a build stayed unfinished before {before}"
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }

@@ -101,15 +101,9 @@ impl Fixture {
     }
 
     async fn pass(&mut self) {
-        trellis::client::reconcile_pass(
-            &mut self.raw,
-            &self.db.pool,
-            DEFAULT_SCHEMA,
-            WAKE,
-            Duration::from_secs(5),
-        )
-        .await
-        .expect("reconcile pass");
+        trellis::client::reconcile_pass(&mut self.raw, &self.db.pool, DEFAULT_SCHEMA)
+            .await
+            .expect("reconcile pass");
     }
 
     /// Claims and runs one plan job or chunk by hand. Returns whether there

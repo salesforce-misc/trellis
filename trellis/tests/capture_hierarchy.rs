@@ -18,7 +18,7 @@ use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::TransformStatus;
 use trellis::defs::hierarchy::Hierarchy;
-use trellis::intake::markers;
+use trellis::intake::harness;
 use trellis::staging::apply::ApplyError;
 use trellis::{CatalogError, Config, Trellis, TrellisError, TrellisOptions};
 
@@ -62,7 +62,7 @@ async fn instance(cluster: &TestCluster, definitions: &[&str]) -> Instance {
         trellis.apply(definition).await.expect("define");
     }
     capture_pass(&mut raw, &db.pool).await;
-    markers::settle_registrations(&db.pool).await;
+    harness::settle_builds(&db.pool).await;
     Instance { db, raw, trellis }
 }
 
@@ -199,7 +199,7 @@ async fn attaching_a_source_as_a_partition_pauses_its_readers() {
             .expect("resume");
     }
     capture_pass(&mut it.raw, &it.db.pool).await;
-    markers::settle_registrations(&it.db.pool).await;
+    harness::settle_builds(&it.db.pool).await;
     for target in ["c_copy", "c_sums", "p_copy"] {
         assert_live(&it.trellis, target).await;
     }
@@ -357,7 +357,7 @@ async fn a_resume_onto_a_servable_partitioned_source_rebuilds_onto_the_tree() {
         .await
         .expect("a resume onto a servable partitioned source");
     capture_pass(&mut it.raw, &it.db.pool).await;
-    markers::settle_registrations(&it.db.pool).await;
+    harness::settle_builds(&it.db.pool).await;
     assert_live(&it.trellis, "c_sums").await;
     // The rebuild read the new tree, not the dropped table, and capture
     // covers the leaf as well as the root.
@@ -399,7 +399,7 @@ async fn a_partitioned_source_recreated_as_a_plain_table_pauses_its_readers() {
         .await
         .expect("define over the partitioned source");
     capture_pass(&mut it.raw, &it.db.pool).await;
-    markers::settle_registrations(&it.db.pool).await;
+    harness::settle_builds(&it.db.pool).await;
     assert_live(&it.trellis, "q_sums").await;
     it.raw
         .batch_execute(
@@ -507,7 +507,7 @@ async fn routine_maintenance_and_trellis_capture_ddl_pause_nothing() {
         .await
         .expect("define a reader of a new column");
     capture_pass(&mut it.raw, &it.db.pool).await;
-    markers::settle_registrations(&it.db.pool).await;
+    harness::settle_builds(&it.db.pool).await;
     assert_unpaused(&it, "widen").await;
     for statement in ["PAUSE TRANSFORM c_pids", "DROP TRANSFORM c_pids"] {
         it.trellis.apply(statement).await.expect(statement);

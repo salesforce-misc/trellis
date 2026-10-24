@@ -1404,7 +1404,7 @@ async fn j_and_t_divergences_are_reported_until_resume_repairs_them() {
     trellis::staging::quarantine::resume_transform(d.pool(), "i")
         .await
         .expect("resume");
-    trellis::intake::markers::discharge_registrations(d.pool())
+    trellis::intake::harness::start_registered_builds(d.pool())
         .await
         .expect("start the build");
     assert_eq!(

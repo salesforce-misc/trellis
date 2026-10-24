@@ -78,7 +78,7 @@ async fn upstreams() -> Driver {
 async fn start() -> Driver {
     let mut d = upstreams().await;
     define_join(&d).await;
-    trellis::intake::markers::settle_registrations(d.pool()).await;
+    trellis::intake::harness::settle_builds(d.pool()).await;
     d.settle().await;
     assert_eq!(statuses(&d).await, ["(a1,live)", "(b1,live)", "(j,live)"]);
     d
@@ -151,9 +151,9 @@ async fn run_plan(d: &Driver) -> bool {
 /// Runs every build to the end and the go-live catch-ups they park, then
 /// drains.
 async fn settle_all(d: &mut Driver) {
-    trellis::intake::markers::settle_registrations(d.pool()).await;
+    trellis::intake::harness::settle_builds(d.pool()).await;
     d.settle().await;
-    trellis::intake::markers::settle_registrations(d.pool()).await;
+    trellis::intake::harness::settle_builds(d.pool()).await;
     d.settle().await;
 }
 
@@ -259,7 +259,7 @@ async fn a_join_defined_over_seeded_upstreams_builds_from_their_rows() {
     let mut d = upstreams().await;
     step(&mut d, SEED).await;
     define_join(&d).await;
-    trellis::intake::markers::discharge_registrations(d.pool())
+    trellis::intake::harness::start_registered_builds(d.pool())
         .await
         .expect("start the JOIN's build");
     while run_plan(&d).await {
@@ -300,7 +300,7 @@ async fn a_join_defined_while_an_upstream_writer_is_in_flight_does_not_miss_its_
         page.reached(PausePoint::BeforeCommit).await;
 
         define_join(&d).await;
-        trellis::intake::markers::discharge_registrations(d.pool())
+        trellis::intake::harness::start_registered_builds(d.pool())
             .await
             .expect("start the JOIN's build");
         assert!(run_plan(&d).await, "{upstream}: a plan job to claim");
@@ -362,7 +362,7 @@ async fn a_join_whose_joined_table_alone_is_a_target_waits_for_an_upstream_write
     trellis::defs::install_definition(d.pool(), JC, &columns, "public")
         .await
         .expect("define the JOIN");
-    trellis::intake::markers::discharge_registrations(d.pool())
+    trellis::intake::harness::start_registered_builds(d.pool())
         .await
         .expect("start the JOIN's build");
     assert!(run_plan(&d).await, "a plan job to claim");
@@ -462,7 +462,7 @@ async fn an_upstream_resume_reaches_the_join() {
         trellis::staging::quarantine::resume_transform(d.pool(), upstream)
             .await
             .expect("resume the upstream");
-        trellis::intake::markers::discharge_registrations(d.pool())
+        trellis::intake::harness::start_registered_builds(d.pool())
             .await
             .expect("dispatch the upstream's rebuild");
         write(&d, "insert into public.fa values (10, 4, 20, 1)").await;

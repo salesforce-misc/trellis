@@ -19,7 +19,6 @@
 //! no Trellis-owned target is ever captured.
 
 use std::collections::{BTreeSet, HashMap};
-use std::time::Duration;
 
 use testkit::{TestCluster, TestDatabase};
 use tokio_postgres::{Client, NoTls};
@@ -125,29 +124,27 @@ impl Pipeline {
             desired, expected_captured,
             "only tables this instance does not own are captured (issues #315, #375)"
         );
-        let mut markers = -1;
+        let mut waiting = -1;
         for _ in 0..MAX_PASSES {
-            trellis::client::reconcile_pass(
-                &mut raw,
-                &db.pool,
-                DEFAULT_SCHEMA,
-                WAKE,
-                Duration::from_secs(5),
-            )
-            .await
-            .expect("reconcile pass");
-            markers = raw
-                .query_one("select count(*) from pending_backfill", &[])
+            trellis::client::reconcile_pass(&mut raw, &db.pool, DEFAULT_SCHEMA)
                 .await
-                .expect("count pending markers")
+                .expect("reconcile pass");
+            waiting = raw
+                .query_one(
+                    "select count(*) from transform_definitions \
+                     where status = 'waiting_to_backfill'",
+                    &[],
+                )
+                .await
+                .expect("count waiting definitions")
                 .get::<_, i64>(0);
-            if markers == 0 {
+            if waiting == 0 {
                 break;
             }
         }
         assert_eq!(
-            markers, 0,
-            "every join marker must discharge within {MAX_PASSES} reconcile passes"
+            waiting, 0,
+            "every build must start within {MAX_PASSES} reconcile passes"
         );
         let installed = trellis::capture::reconcile::installed_tables(&raw, DEFAULT_SCHEMA)
             .await

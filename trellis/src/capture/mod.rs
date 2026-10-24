@@ -17,8 +17,7 @@
 //!   `locks::DdlRetry`, and reads back what is installed from the catalog
 //!   (C3).
 //! - [`reconcile`] is the staging worker's pass that calls it for every
-//!   table, and decides which waiting definitions a discharge may dispatch
-//!   (C5).
+//!   table, and decides which waiting definitions' builds may start (C5).
 //!
 //! # What the images must equal
 //!
@@ -59,6 +58,7 @@
 pub(crate) mod baseline;
 pub mod columns;
 pub mod complement;
+pub(crate) mod gate;
 pub mod install;
 pub mod partitions;
 pub mod reconcile;
@@ -83,13 +83,13 @@ pub enum CaptureError {
     /// definition (C6, `staging::schema_change`).
     MissingColumn { table: String, column: String },
     /// A table name that isn't a `schema.table` identity with exactly one
-    /// separating `.` (see `intake::markers::qualify`).
+    /// separating `.` (see `intake::qualify`).
     InvalidTableName(String),
     /// Reading the catalog failed.
     Catalog(crate::defs::catalog::CatalogError),
-    /// Parking the backfill marker an install or widen commits with failed
-    /// ([`install`]).
-    Marker(crate::intake::IntakeError),
+    /// Rebuilding the readers an install commits with, or reading a capture
+    /// gate, failed ([`install`], [`gate`]).
+    Intake(crate::intake::IntakeError),
     /// A catalog read, or the capture DDL, failed. A lock timeout on the
     /// table doesn't land here: once [`install`]'s retries stop at their
     /// deadline, the operation returns [`install::Progress::Waiting`].
@@ -114,7 +114,9 @@ impl fmt::Display for CaptureError {
                 write!(f, "{name:?} is not a schema.table identity")
             }
             CaptureError::Catalog(e) => write!(f, "reading the catalog for capture: {e}"),
-            CaptureError::Marker(e) => write!(f, "parking the capture's backfill marker: {e}"),
+            CaptureError::Intake(e) => {
+                write!(f, "rebuilding or gating the readers of a capture: {e}")
+            }
             CaptureError::Db(e) => {
                 write!(f, "capture DDL or catalog read failed: ")?;
                 crate::error::write_pg_error(f, e)
@@ -127,7 +129,7 @@ impl std::error::Error for CaptureError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             CaptureError::Catalog(e) => Some(e),
-            CaptureError::Marker(e) => Some(e),
+            CaptureError::Intake(e) => Some(e),
             CaptureError::Db(e) => Some(e),
             _ => None,
         }
@@ -142,7 +144,7 @@ impl From<crate::defs::catalog::CatalogError> for CaptureError {
 
 impl From<crate::intake::IntakeError> for CaptureError {
     fn from(e: crate::intake::IntakeError) -> Self {
-        CaptureError::Marker(e)
+        CaptureError::Intake(e)
     }
 }
 

@@ -76,37 +76,6 @@ impl Fixture {
             .may_exist
     }
 
-    /// What the two probes the step used to make find, by running them.
-    async fn old_probes_find_work(&self) -> bool {
-        let client = self.db.pool.get().await.expect("pool");
-        let old = chunk_queue::claim_chunks(&**client, "old-probe", 1)
-            .await
-            .expect("claim old kinds");
-        if !old.is_empty() {
-            // Put it back, as if never claimed.
-            self.raw
-                .execute(
-                    "update backfill_chunks set claimed_by = null, claimed_at = null \
-                     where claimed_by = 'old-probe'",
-                    &[],
-                )
-                .await
-                .expect("release");
-            return true;
-        }
-        let count: i64 = self
-            .raw
-            .query_one(
-                "select count(*) from transform_definitions \
-                 where status in ('backfilling', 'catching_up')",
-                &[],
-            )
-            .await
-            .expect("count")
-            .get(0);
-        count > 0
-    }
-
     async fn drain(&mut self) {
         for _ in 0..16 {
             trellis::staging::seal_if_active_nonempty(&mut self.raw, WAKE)
@@ -139,23 +108,13 @@ async fn the_probe_never_hides_a_build_step() {
     let mut f = Fixture::new().await;
     assert!(!f.may_exist().await, "nothing is building before a pass");
 
-    trellis::client::reconcile_pass(
-        &mut f.raw,
-        &f.db.pool,
-        DEFAULT_SCHEMA,
-        WAKE,
-        Duration::from_secs(5),
-    )
-    .await
-    .expect("reconcile pass");
+    trellis::client::reconcile_pass(&mut f.raw, &f.db.pool, DEFAULT_SCHEMA)
+        .await
+        .expect("reconcile pass");
     let mut worked = 0;
     for _ in 0..500 {
         f.drain().await;
         let may = f.may_exist().await;
-        assert!(
-            may || !f.old_probes_find_work().await,
-            "the probe said no while a former probe finds work"
-        );
         let step = build::work_once(&f.db.pool, "worker", &OPTIONS)
             .await
             .expect("step");
@@ -182,15 +141,9 @@ async fn the_probe_never_hides_a_build_step() {
 #[tokio::test]
 async fn the_probe_ignores_claimed_backing_off_and_done_chunks() {
     let mut f = Fixture::new().await;
-    trellis::client::reconcile_pass(
-        &mut f.raw,
-        &f.db.pool,
-        DEFAULT_SCHEMA,
-        WAKE,
-        Duration::from_secs(5),
-    )
-    .await
-    .expect("reconcile pass");
+    trellis::client::reconcile_pass(&mut f.raw, &f.db.pool, DEFAULT_SCHEMA)
+        .await
+        .expect("reconcile pass");
     // A plain backfill (no Re-derive build) so only the chunk conditions matter.
     f.raw
         .batch_execute("update transform_definitions set status = 'backfilling', build = null")
@@ -218,30 +171,6 @@ async fn the_probe_ignores_claimed_backing_off_and_done_chunks() {
     assert!(!f.may_exist().await, "done");
 }
 
-/// An old build's chunk (a 1-1 `range` or a `direct` build job) is the one
-/// kind of work `building` does not list: its definition is `backfilling`
-/// with no Re-derive build. The probe's chunk clause alone must find it, or
-/// an idle worker would never claim it.
-#[tokio::test]
-async fn the_probe_finds_an_old_build_chunk_nothing_else_announces() {
-    let f = Fixture::new().await;
-    f.raw
-        .batch_execute(
-            "update transform_definitions set status = 'backfilling', build = null; \
-             insert into backfill_chunks (definition_id, kind, lo, hi, fuse_rearmed_at) \
-             select id, 'direct', null, null, fuse_rearmed_at from transform_definitions",
-        )
-        .await
-        .expect("enqueue a direct build job");
-    assert!(f.may_exist().await, "an old build's job is work");
-    let client = f.db.pool.get().await.expect("pool");
-    let claimed = chunk_queue::claim_chunks(&**client, "worker", 1)
-        .await
-        .expect("claim");
-    assert_eq!(claimed.len(), 1, "the old claim hands it out");
-    assert!(!f.may_exist().await, "held by a worker, nothing is left");
-}
-
 /// The probe gates a chunk on its definition's status with the claim's own
 /// allowlist (#1047): a frozen definition's undone, unclaimed, due chunk
 /// hands out nothing, so it must not keep an idle worker awake; every
@@ -250,15 +179,9 @@ async fn the_probe_finds_an_old_build_chunk_nothing_else_announces() {
 #[tokio::test]
 async fn the_probe_follows_the_claims_definition_status_gate() {
     let mut f = Fixture::new().await;
-    trellis::client::reconcile_pass(
-        &mut f.raw,
-        &f.db.pool,
-        DEFAULT_SCHEMA,
-        WAKE,
-        Duration::from_secs(5),
-    )
-    .await
-    .expect("reconcile pass");
+    trellis::client::reconcile_pass(&mut f.raw, &f.db.pool, DEFAULT_SCHEMA)
+        .await
+        .expect("reconcile pass");
     let dispatchable = trellis::defs::TransformStatus::dispatchable();
     for status in trellis::defs::TransformStatus::ALL {
         f.raw
@@ -271,7 +194,7 @@ async fn the_probe_follows_the_claims_definition_status_gate() {
         let claimable = dispatchable.contains(&status.as_str());
         let probe = build::work_probe(&f.db.pool).await.expect("probe");
         assert_eq!(probe.may_exist, claimable, "probe at {}", status.as_str());
-        let claimed = chunk_queue::claim_chunks_of(&f.raw, "w", 100, &["range", "direct", "plan"])
+        let claimed = chunk_queue::claim_chunks_of(&f.raw, "w", 100, &["plan"])
             .await
             .expect("claim");
         assert_eq!(
@@ -292,15 +215,9 @@ async fn the_probe_follows_the_claims_definition_status_gate() {
 #[tokio::test]
 async fn a_paused_definitions_backing_off_chunk_schedules_no_wake() {
     let mut f = Fixture::new().await;
-    trellis::client::reconcile_pass(
-        &mut f.raw,
-        &f.db.pool,
-        DEFAULT_SCHEMA,
-        WAKE,
-        Duration::from_secs(5),
-    )
-    .await
-    .expect("reconcile pass");
+    trellis::client::reconcile_pass(&mut f.raw, &f.db.pool, DEFAULT_SCHEMA)
+        .await
+        .expect("reconcile pass");
     f.raw
         .batch_execute(
             "update backfill_chunks set next_attempt_at = now() + interval '1 hour'; \

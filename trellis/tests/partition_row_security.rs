@@ -98,7 +98,7 @@ async fn instance(cluster: &TestCluster) -> Instance {
         trellis,
     };
     it.pass().await;
-    trellis::intake::markers::settle_registrations(&it.pool).await;
+    trellis::intake::harness::settle_builds(&it.pool).await;
     it.exec("insert into public.items select i, i % 16, i from generate_series(1, 160) i")
         .await;
     it.settle().await.expect("seed");

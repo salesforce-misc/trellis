@@ -17,8 +17,6 @@ mod drain_driver;
 #[path = "support/varchar_columns.rs"]
 mod varchar_columns;
 
-use std::time::Duration;
-
 use drain_driver::Driver;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ValueType;
@@ -45,15 +43,9 @@ async fn start() -> Driver {
 
 async fn pass(d: &mut Driver) {
     let pool = d.pool().clone();
-    trellis::client::reconcile_pass(
-        &mut d.ctl,
-        &pool,
-        DEFAULT_SCHEMA,
-        "unbounded_varchar_copies_wake",
-        Duration::from_secs(2),
-    )
-    .await
-    .expect("reconcile pass");
+    trellis::client::reconcile_pass(&mut d.ctl, &pool, DEFAULT_SCHEMA)
+        .await
+        .expect("reconcile pass");
 }
 
 /// The target's rows that differ from the source's, either way.

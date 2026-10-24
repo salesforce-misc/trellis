@@ -45,9 +45,9 @@ throttled to once per 10s. Fixing that dropped the fast-lane binaries'
 serial time from 385s to 174s (fifteen binaries, measured 2026-09-24), and
 trigger capture (#622) removed the wait altogether. The figures above
 predate both.
-What's left of a quiesce's floor is mostly the backfill discharge's
+What's left of a quiesce's floor is mostly the staging worker's
 `reconcile_interval` (5s), which a new registration waits out before its
-backfill starts.
+build starts.
 
 Because paying that cost for every property on every push/PR would be
 expensive — and because a contributor's (or agent's) first reflex is a plain

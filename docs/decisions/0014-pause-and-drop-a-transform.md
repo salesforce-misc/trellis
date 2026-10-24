@@ -123,16 +123,13 @@ together in one transaction and read on one snapshot:
 - Every target row that no current source row backs is deleted. That covers a 1-1 row
   whose source row was deleted, and an aggregate group whose rows were all deleted or
   moved to other groups.
-- Every current source row is re-derived, by whichever build the definition
-  qualifies for. A definition the Re-derive build serves restarts it over the
-  existing ledger entries, and its sweep re-derives each live entry no chunk
-  reached (a key deleted while frozen) and, for a 1-1 target, each target row
-  with no live entry (one added or re-keyed by hand). Any other definition parks a marker,
-  and its one-pass build ends in a go-live catch-up that enumerates the
-  source's current keys as image-less Recomputes, plus the orphan sweep
-  (`intake::resume_orphans`) above. An aggregate or a `JOIN` is rebuilt by one
-  absolute write that replaces every group, and removes the groups the source no
-  longer has. `RESUME` first bumps the source's
+- Every current source row is re-derived by a Re-derive build. A 1-1 definition
+  restarts it over the existing ledger entries, and its sweep re-derives each
+  live entry no chunk reached (a key deleted while frozen), tombstoning the
+  entry, and, for a 1-1 target, each target row
+  with no live entry (one added or re-keyed by hand). An aggregate or a `JOIN` is
+  rebuilt by one absolute write that replaces every group, and removes the groups
+  the source no longer has. `RESUME` first bumps the source's
   version fence and discards the definition's unclaimed backfill chunks.
 
 Deletions are visible the moment that transaction commits. Rows whose values changed

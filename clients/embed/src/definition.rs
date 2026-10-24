@@ -53,8 +53,8 @@ impl From<&DefinitionSummary> for PlainDefinitionSummary {
 pub struct PlainDefinitionStatus {
     /// The status's `as_str()` word; see [`crate::transform_status`].
     pub status: &'static str,
-    /// Set while the definition's source table's backfill keeps failing to
-    /// discharge; see [`DefinitionStatus::backfill_failure`].
+    /// Set while one of the definition's build chunks keeps failing; see
+    /// [`DefinitionStatus::backfill_failure`].
     pub backfill_failure: Option<PlainBackfillFailure>,
     /// Set while the definition's capture waits on a table lock; see
     /// [`DefinitionStatus::capture_wait`].
@@ -191,13 +191,13 @@ pub struct PlainDrainFailure {
 /// A [`BackfillFailure`] flattened to plain data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlainBackfillFailure {
-    /// The fully-qualified `schema.table` the backfill marker is parked on.
+    /// The fully-qualified `schema.table` the failing build reads.
     pub source_table: String,
-    /// How many discharges have failed since the marker was parked.
+    /// How many times the failing chunk has failed.
     pub attempts: u32,
     /// The latest failure's error message.
     pub last_error: String,
-    /// The earliest next discharge attempt, as [`crate::epoch_micros`].
+    /// The earliest next attempt, as [`crate::epoch_micros`].
     pub next_attempt_at_micros: i64,
 }
 

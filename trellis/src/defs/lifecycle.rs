@@ -2,10 +2,10 @@
 //! **pause** and **drop**.
 //!
 //! ```text
-//! [*] --define--> Backfilling --> CatchingUp --> Live --pause--> Paused --drop--> [*]
-//!                                                ^                 |
-//!                                                +---- resume -----+   (a fresh backfill,
-//!                                                                       not a catch-up)
+//! [*] --define--> Backfilling --> Live --pause--> Paused --drop--> [*]
+//!                                   ^                 |
+//!                                   +---- resume -----+   (a fresh backfill,
+//!                                                          not a catch-up)
 //! ```
 //!
 //! Three things this module deliberately does *not* do, each straight out of
@@ -123,7 +123,7 @@ pub(crate) enum DropOutcome {
 ///
 /// A definition still `backfilling` or `waiting_to_backfill` pauses fine —
 /// the pause is a freeze on *dispatch*, and both of those states dispatch
-/// (the chunk queue, and the pending-backfill discharge respectively). Not
+/// (the chunk queue, and the build start respectively). Not
 /// restricting the pause to `live` is what lets an operator stop a runaway
 /// initial build, which is exactly the situation a pause exists for.
 ///
@@ -691,15 +691,6 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
     // it.
     txn.execute(
         "delete from ledger_truncate_floor where target_table = $1",
-        &[&qualified],
-    )
-    .await?;
-
-    // This keys a *qualified table name* to pending backfill work, and an
-    // enumeration marker naming a table that no longer exists would fail
-    // the next `run_pending_backfills` discharge with a live `42P01`.
-    txn.execute(
-        "delete from pending_backfill where table_name = $1",
         &[&qualified],
     )
     .await?;

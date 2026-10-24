@@ -30,12 +30,11 @@
 //! [`KeySpace::OneToOne`]: trellis::defs::ast::KeySpace::OneToOne
 
 use std::collections::HashMap;
-use std::time::Duration;
 
 use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::defs::{ValueType, chunk_queue, install_definition};
+use trellis::defs::{ValueType, install_definition};
 use trellis::staging::apply;
 use trellis::staging::{has_pending, retire_drained_segments};
 
@@ -53,35 +52,10 @@ use trellis::staging::{has_pending, retire_drained_segments};
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
     // ADR-0002 (#418): registration only records a definition; the backfill
     // discharge dispatches its chunks.
-    trellis::intake::markers::discharge_registrations(pool)
+    trellis::intake::harness::start_registered_builds(pool)
         .await
         .expect("dispatch registered definitions' builds");
-    const CLAIMED_BY: &str = "oneone_deleted_target_test_backfill_worker";
-    loop {
-        let client = pool.get().await.expect("acquire connection");
-        let claimed = chunk_queue::claim_chunks(&**client, CLAIMED_BY, 1000)
-            .await
-            .expect("claim_chunks");
-        drop(client);
-        if claimed.is_empty() {
-            trellis::staging::build::settle_builds(pool).await;
-            return;
-        }
-        for chunk in &claimed {
-            chunk_queue::run_claimed_chunk(
-                pool,
-                chunk,
-                CLAIMED_BY,
-                Duration::from_secs(5),
-                Duration::from_secs(60),
-            )
-            .await
-            .expect("run_claimed_chunk");
-            chunk_queue::finish_chunk(pool, chunk, CLAIMED_BY)
-                .await
-                .expect("finish_chunk");
-        }
-    }
+    trellis::staging::build::settle_builds(pool).await;
 }
 
 async fn connect_raw(dsn: &str) -> Client {

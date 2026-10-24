@@ -18,7 +18,7 @@ use std::time::{Duration, Instant, SystemTime};
 use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
 use trellis::defs::TransformStatus;
-use trellis::intake::markers;
+use trellis::intake::harness;
 use trellis::staging::self_check::CheckPageExt;
 use trellis::staging::{apply, quarantine, seal};
 
@@ -81,7 +81,7 @@ async fn instance(cluster: &TestCluster, ddl: &[&str]) -> Instance {
         trellis.apply(statement).await.expect(statement);
     }
     capture_pass(&mut raw, &pool).await;
-    markers::settle_registrations(&pool).await;
+    harness::settle_builds(&pool).await;
     // Drain what going live staged, so each test's pages hold its own
     // changes alone.
     let seg = seal(&mut raw).await;

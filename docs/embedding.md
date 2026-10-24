@@ -173,7 +173,7 @@ So:
   widening a table's triggers needs a brief table lock, which the worker
   retries every pass while a long transaction or an autovacuum holds the
   table. Nothing cancels the lock holder. Meanwhile the transform stays
-  `waiting_to_backfill` (or `catching_up`, after an `ALTER TRANSFORM` that reads
+  `waiting_to_backfill` (or `backfilling`, after an `ALTER TRANSFORM` that reads
   a new source column), and `status()` reports what it waits on
   (`capture_wait`), or `capture_failure` when the install fails for another
   reason, such as a source that lost its primary key. Every process's
@@ -258,9 +258,9 @@ deployed, or gets scaled to zero, nothing errors.** Every `apply()` call
 still succeeds and every transform still gets registered. With no staging
 worker, a new transform sits in `waiting_to_backfill` forever. With a staging
 worker but no drain threads, it stops at `backfilling`. With drain threads but
-no staging worker, a build already dispatched still finishes, but only the
-staging worker runs the catch-up after it, so the transform stops at
-`catching_up`. A `live` transform stops being maintained. Either way the read
+no staging worker, a build already started still finishes, but nothing starts
+a new one, so a new transform stays `waiting_to_backfill`. A `live` transform
+stops being maintained. Either way the read
 paths quietly return nothing or stale data, with no exception, timeout, or log
 line pointing at the cause.
 
@@ -549,11 +549,12 @@ behaves in four ways you might not expect:
   connection, so `define` fails with `not_found`. A column added earlier
   isn't visible either, so a field that reads it fails with a `validation`
   error.
-* **It can't go live until the migration commits.** A backfill waits out
-  every transaction that had written anything when it was queued
-  ([the `xmin` caveat](observability.md#backfill-status-and-the-xmin-caveat)),
-  and that includes a migration that changed a table before its define. So
-  a migration that polls for `live` inside its own transaction can wait on
+* **It can't go live until the migration commits.** Installing the source's
+  capture triggers needs a brief table lock, which a migration that altered
+  the table holds until it commits, and a build over another transform's
+  target waits out every transaction that had written anything when it
+  started ([a build's fence](observability.md#a-builds-fence-on-a-seam-fed-source)).
+  So a migration that polls for `live` inside its own transaction can wait on
   itself until its deadline.
 * **Some statements wait on the migration's locks, then fail.** A define
   doesn't lock the source table, so a migration that altered it doesn't
@@ -839,7 +840,7 @@ Elixir atoms, Ruby symbols), or nothing if no transform writes that table:
 |---|---|---|
 | `waiting_to_backfill` | Defined; the source's existing rows haven't been read yet. | Keep polling. |
 | `backfilling` | The target is being built, or rebuilt after a repair. | Keep polling. |
-| `catching_up` | Built and maintained, but may still be missing changes made while it was building. A plain aggregate (grouped by plain columns of a table rather than of another transform's target) never reports it: its build goes from `backfilling` straight to `live`. | Keep polling. |
+| `catching_up` | Maintained, but reads an upstream transform that isn't `live`, or a paused column of one, so its target may be missing changes. Reported while that holds, never stored. | Keep polling. |
 | `live` | The steady state. | Done. |
 | `quarantined` | Too many source rows failed to apply, so the fuse froze it. | Stop and report it. |
 | `paused` | Frozen by a `PAUSE TRANSFORM`, or by Trellis because it can't keep the target correct: capture broke, its build kept failing, or the drain hit a failure every key reproduces ([all the causes](observability.md#transform-status-lifecycle)). | Stop and report it. |
@@ -850,14 +851,16 @@ The lifecycle behind these words is in
 Things a poll needs to handle:
 
 * **`waiting_to_backfill` has no deadline of its own.** A long-running
-  transaction anywhere in the cluster holds most backfills back until it ends
-  ([the `xmin` caveat](observability.md#backfill-status-and-the-xmin-caveat)),
-  and Trellis reports nothing but the status meanwhile. Poll with a deadline
+  transaction holding a table lock the capture install needs, or (for a build
+  over another transform's target) any transaction older than the build's
+  fence, holds a backfill back until it ends
+  ([a build's fence](observability.md#a-builds-fence-on-a-seam-fed-source)),
+  and Trellis reports little but the status meanwhile. Poll with a deadline
   of your own, from somewhere that can wait (a deploy check, a background job),
   not a web request.
 * **A failing build doesn't fail the poll.** The error is on the status's
   `backfill_failure`; log it, it's usually the whole answer
-  ([a backfill that keeps failing](observability.md#a-backfill-that-keeps-failing)).
+  ([a build that keeps failing](observability.md#a-build-that-keeps-failing)).
   A row that fails is quarantined and the transform still goes `live`
   (`status` counts it in `held_keys`, `sample_quarantined` lists it, and
   `release_key` releases it once its cause is fixed); a build that keeps
@@ -1000,8 +1003,9 @@ A repair is visible to the poll too. `request_backfill` (and a capture
 re-install) rebuilds each plain aggregate and plain 1-1 reader of the table
 in its own transaction: they read `backfilling` when the call returns, and
 `live` again once the rebuild is done. So polling for `live` after a repair,
-then taking a token, covers the repair. Any other reader of the table reports
-`catching_up` until its catch-up has run.
+then taking a token, covers the repair. A transform that reads one of those
+readers' targets reports `catching_up` until its upstream is `live`, and is
+rebuilt in its turn.
 
 `self_check` follows the same rule: it compares only a `live` transform. For
 any other its job ends with the outcome `not_live` (Rust's

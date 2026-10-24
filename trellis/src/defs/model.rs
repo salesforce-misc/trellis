@@ -77,22 +77,12 @@ pub fn applying_sql(alias: &str) -> String {
 /// `transform_definitions.status`: `docs/transforms.md`'s "Status" section
 /// documents the full state machine this mirrors. Registration
 /// ([`super::catalog::install_definition`]) persists
-/// [`TransformStatus::WaitingToBackfill`], and the backfill discharge
-/// (ADR-0002) moves it on: to [`TransformStatus::Backfilling`] together with
-/// the chunks or job that build it, then [`TransformStatus::CatchingUp`] when
-/// the last one finishes (or its direct-build job does, for an aggregate),
-/// and [`TransformStatus::Live`] once
-/// the go-live catch-up that build parked has been discharged (issue #476).
-/// A ring-built definition goes straight to `live`, or to `catching_up` when
-/// its source is another definition's target.
-///
-/// A plain aggregate (a target the group basis maintains, on a captured source)
-/// has no discharge, catch-up or `catching_up` (#625 F3, F5,
-/// `crate::staging::build`): the staging worker moves it to
-/// [`TransformStatus::Backfilling`] with its Re-derive build's plan job, it
-/// applies from that commit ([`APPLYING_SQL`]), and the transaction that
-/// finishes its build (the plan job's one absolute write) moves it to
-/// [`TransformStatus::Live`]. Its resume rebuilds it the same way.
+/// [`TransformStatus::WaitingToBackfill`]. The staging worker's capture pass
+/// moves it on, to [`TransformStatus::Backfilling`] with its Re-derive build's
+/// plan job (`crate::staging::build`); it applies from that commit
+/// ([`APPLYING_SQL`]), and the transaction that finishes its build (the last
+/// chunk, or the plan job's one absolute write for an aggregate or a `JOIN`)
+/// moves it to [`TransformStatus::Live`]. Its resume rebuilds it the same way.
 ///
 /// Apply maintains a definition that is [`TransformStatus::is_applying`]:
 /// `live` or `catching_up`. Only `live` tells an operator the target is in
@@ -108,20 +98,11 @@ pub fn applying_sql(alias: &str) -> String {
 pub enum TransformStatus {
     WaitingToBackfill,
     Backfilling,
-    /// Maintained by apply exactly as a `live` definition is, but a go-live
-    /// catch-up (a re-read of a table it reads, parked as a
-    /// `pending_backfill` marker) hasn't been discharged yet, so its target
-    /// may still be missing changes it didn't apply (issue #476). Reached
-    /// when a chunked or direct build finishes, when a ring enumeration reads
-    /// a source that is another definition's target, and when a `live`
-    /// definition gets a catch-up of its own: a column resume, an `ALTER
-    /// TRANSFORM` that added columns, or an upstream rebuild written outside
-    /// the target-mutation seam. The discharge that runs its last pending
-    /// catch-up flips it to `live`.
-    ///
-    /// Also *reported*, never stored, for a `live` definition reading an
-    /// upstream that isn't `live` (issue #497,
-    /// [`super::catalog::reported_statuses`]).
+    /// Reported, never stored: a `live` definition reading an upstream that
+    /// isn't `live` (issue #497, [`super::catalog::reported_statuses`]), or a
+    /// paused column of one (#1208). Apply maintains it exactly as a `live`
+    /// one, but its target doesn't reflect its source yet, so `live` holds
+    /// along a chain.
     CatchingUp,
     Live,
     Quarantined,
@@ -408,7 +389,7 @@ mod tests {
         assert_eq!(
             TransformStatus::applying(),
             vec!["catching_up", "live"],
-            "apply maintains a finished build whether or not its catch-up has run"
+            "apply maintains a `live` definition, and one reporting `catching_up`"
         );
         assert!(TransformStatus::Paused.is_frozen());
         assert!(TransformStatus::Quarantined.is_frozen());

@@ -1504,9 +1504,9 @@ async fn a_new_leaf_costs_no_rebuild_and_no_source_wide_enumeration() {
             fx.exec("insert into public.items_p4 select 9000 + i, 16 + i % 2, 3 + i from generate_series(1, 40) i")
                 .await;
         }
-        // The harness never discharges the install's own marker; what counts
-        // is whether the pass parks another.
-        let parked = "select generation::text from pending_backfill order by table_name";
+        // The harness never lets the install's own gate go; what counts is
+        // whether the pass records another.
+        let parked = "select gate_lsn::text from capture_gates order by table_name";
         let before = fx.d.rows(parked).await;
         fx.pass().await;
         assert_eq!(fx.kinds().await, ["new_leaf"], "loaded: {loaded}");
@@ -1517,10 +1517,11 @@ async fn a_new_leaf_costs_no_rebuild_and_no_source_wide_enumeration() {
             )
             .await;
         assert_eq!(state, ["(live/-)"], "loaded: {loaded}");
-        assert_eq!(
-            fx.d.rows(parked).await,
-            before,
-            "no marker parked, so no whole-source enumeration: loaded {loaded}"
+        let after = fx.d.rows(parked).await;
+        assert!(
+            after.iter().all(|gate| before.contains(gate)),
+            "no gate recorded, so no whole-source re-read: loaded {loaded}, \
+             before {before:?}, after {after:?}"
         );
         assert_eq!(
             fx.d.rows("select kind from backfill_chunks where kind <> 'correction'")
@@ -2294,7 +2295,7 @@ async fn a_fresh_build_over_a_partitioned_source_with_rows_goes_per_leaf() {
     )
     .await
     .expect("define a second aggregate");
-    trellis::intake::markers::discharge_registrations(fx.d.pool())
+    trellis::intake::harness::start_registered_builds(fx.d.pool())
         .await
         .expect("start its build");
     build::settle_builds(fx.d.pool()).await;
@@ -2333,7 +2334,7 @@ async fn a_reader_of_an_aggregate_resumed_per_leaf_is_rebuilt_once() {
     )
     .await
     .expect("define the reader");
-    trellis::intake::markers::settle_registrations(fx.d.pool()).await;
+    trellis::intake::harness::settle_builds(fx.d.pool()).await;
     fx.d.settle().await;
     build::settle_builds(fx.d.pool()).await;
     fx.d.settle().await;

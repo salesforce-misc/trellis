@@ -421,10 +421,10 @@ async fn a_tree_of_one_hundred_and_one_leaves_installs_root_first_then_node_by_n
             .expect("installed"),
         Installed::Partial { .. }
     ));
-    // No join marker until the install completes.
+    // No gate until the install completes.
     let markers: i64 = client
         .query_one(
-            "select count(*) from pending_backfill where table_name = 'public.r'",
+            "select count(*) from capture_gates where table_name = 'public.r'",
             &[],
         )
         .await
@@ -442,16 +442,13 @@ async fn a_tree_of_one_hundred_and_one_leaves_installs_root_first_then_node_by_n
     assert_every_node_carries_capture(&client, 102).await;
     let markers: i64 = client
         .query_one(
-            "select count(*) from pending_backfill where table_name = 'public.r'",
+            "select count(*) from capture_gates where table_name = 'public.r'",
             &[],
         )
         .await
         .expect("markers")
         .get(0);
-    assert_eq!(
-        markers, 1,
-        "one join marker, parked by the last transaction"
-    );
+    assert_eq!(markers, 1, "one gate, recorded by the last transaction");
 
     // Uninstalling removes the triggers from every node.
     assert!(landed(

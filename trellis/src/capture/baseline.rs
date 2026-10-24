@@ -59,7 +59,7 @@
 //! - **R3b, and R1 where every definition reading the column is still valid
 //!   as written:** only data was missed. The pass rebuilds every applying
 //!   reader of the table, exactly what `Trellis::request_backfill(table)`
-//!   does (`intake::markers::park_table_catch_ups`), and pauses nobody. It
+//!   does (`intake::catch_up::park_table_catch_ups`), and pauses nobody. It
 //!   logs a `WARN` naming the table, the cause and the readers it rebuilt,
 //!   and counts `capture_auto_rebuilds_total{source_table, cause}`
 //!   ([`CaptureRebuildCause`]).
@@ -769,7 +769,8 @@ pub(crate) async fn check(
             .map(|r| r.target.clone())
             .collect();
         let rebuilt =
-            crate::intake::markers::park_table_catch_ups(&txn, &[table.to_string()], false).await?;
+            crate::intake::catch_up::park_table_catch_ups(&txn, &[table.to_string()], false)
+                .await?;
         crate::staging::build::stamp_rebuild_seg(&txn, &rebuilt).await?;
     }
     write(&txn, table, &found.rewrite).await?;

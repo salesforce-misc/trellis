@@ -22,7 +22,7 @@ the ways a target can go wrong without a stop, and names the repair for each.
 | `quarantined` | Too many of its keys failed to apply, so the whole-definition fuse tripped | Fix the cause `sample_quarantined` shows, then `RESUME` |
 | `held_keys` | Keys that keep failing to apply are held, with their target rows frozen | Fix the cause, then [release them](#releasing-held-keys) |
 | `drain_failure` | A page that fails in a way no key can be charged for is held back, and every watermark taken since waits on it | Fix what the error names; the next pass commits the page ([A page that fails only for several definitions together](#a-page-that-fails-only-for-several-definitions-together)) |
-| `backfill_failure` | A build, catch-up or correction keeps failing | Fix what the error names; it retries |
+| `backfill_failure` | A build or correction chunk keeps failing | Fix what the error names; it retries |
 | `capture_wait` | Installing or widening capture is waiting for a table lock | Wait for the lock holder it names |
 | A `self_check` report with divergences | The target differs from a recompute of it | Find the gap in [known correctness gaps](known-correctness-gaps.md) and use its repair |
 
@@ -34,10 +34,9 @@ the ways a target can go wrong without a stop, and names the repair for each.
 ### `request_backfill`
 
 `request_backfill(source_table)` (Rust, Ruby and Elixir) queues a re-read of
-one source table for every definition that reads it, without pausing them. A
-reader the Re-derive build serves reports `backfilling` and is rebuilt in
-place; any other reports `catching_up`. Both return to `live` when the re-read
-is done. It's the cheapest repair when you know which table missed changes.
+one source table for every definition that reads it, without pausing them.
+Each reader reports `backfilling` and is rebuilt in place, and returns to
+`live` when the rebuild is done. It's the cheapest repair when you know which table missed changes.
 
 It takes the table's `schema.table` name, or a bare name when exactly one
 captured table carries it; a bare name two captured tables share is refused,
@@ -334,5 +333,4 @@ each one costs and what to expect around it
   ([known correctness gaps](known-correctness-gaps.md#a-columns-values-rewritten-in-place-by-alter-column-type)).
 * **After granting a missing privilege or `BYPASSRLS`:** `RESUME` the paused
   definitions. A drain holdup on a refusal commits on the next pass, which
-  clears its `drain_failure`, and a catch-up backing off on one succeeds on its
-  next attempt.
+  clears its `drain_failure`.

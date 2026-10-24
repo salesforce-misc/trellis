@@ -6,14 +6,13 @@
 //! field is refused at define.
 
 use std::collections::HashMap;
-use std::time::Duration;
 
 use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::validate::ValidationError;
-use trellis::defs::{CatalogError, ValueType, chunk_queue, install_definition};
-use trellis::intake::markers;
+use trellis::defs::{CatalogError, ValueType, install_definition};
+use trellis::intake::harness;
 use trellis::integer::IntWidth;
 use trellis::staging::{has_pending, retire_drained_segments};
 
@@ -44,33 +43,10 @@ async fn connect_raw(dsn: &str) -> Client {
 }
 
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
-    markers::discharge_registrations(pool)
+    harness::start_registered_builds(pool)
         .await
         .expect("dispatch registered definitions' builds");
-    loop {
-        let client = pool.get().await.expect("acquire connection");
-        let claimed = chunk_queue::claim_chunks(&**client, TEST_NAME, 1000)
-            .await
-            .expect("claim_chunks");
-        drop(client);
-        if claimed.is_empty() {
-            return;
-        }
-        for chunk in &claimed {
-            chunk_queue::run_claimed_chunk(
-                pool,
-                chunk,
-                TEST_NAME,
-                Duration::from_secs(5),
-                Duration::from_secs(60),
-            )
-            .await
-            .expect("the build must not fail");
-            chunk_queue::finish_chunk(pool, chunk, TEST_NAME)
-                .await
-                .expect("finish_chunk");
-        }
-    }
+    trellis::staging::build::settle_builds(pool).await;
 }
 
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
@@ -152,7 +128,7 @@ async fn an_aggregate_field_named_like_a_source_column_reads_the_source_column()
         .await
         .expect("define accepts the issue's definition");
     drain_backfill_chunks(&db.pool).await;
-    markers::settle_registrations(&db.pool).await;
+    harness::settle_builds(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     assert_eq!(

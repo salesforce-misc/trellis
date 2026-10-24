@@ -107,7 +107,7 @@ async fn backfill_across_a_composite_nullable_group_key_writes_the_null_group_wi
     )
     .await
     .expect("install the aggregate");
-    trellis::intake::markers::settle_builds(&db.pool).await;
+    trellis::intake::harness::settle_builds(&db.pool).await;
 
     let null_group_count: i64 = client
         .query_one("select count(*) from stock_totals where sku is null", &[])
@@ -139,7 +139,7 @@ async fn backfill_across_a_composite_nullable_group_key_writes_the_null_group_wi
     // source into the ring by design, and this checks the build itself.
     // (`settle_builds` does discharge `stock_totals`' catch-up on
     // `inventory`, which re-reads `inventory` into the ring, #468/#485.)
-    trellis::intake::markers::settle_builds(&db.pool).await;
+    trellis::intake::harness::settle_builds(&db.pool).await;
 
     let ring_slot: i16 = client
         .query_one("select ring_slot from segment_pointer", &[])

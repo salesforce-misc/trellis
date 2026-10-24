@@ -81,8 +81,6 @@ pub use validate::{JoinColumnInfo, validate_join};
 // Reached from `crate::dev` (ADR-0012's sanctioned exception) by `generative`
 // and `benchmark`.
 #[cfg(any(test, feature = "test-util"))]
-pub use backfill::backfill_definition;
-#[cfg(any(test, feature = "test-util"))]
 pub use catalog::create_definition_without_backfill;
 #[cfg(any(test, feature = "test-util"))]
 pub use ddl::{

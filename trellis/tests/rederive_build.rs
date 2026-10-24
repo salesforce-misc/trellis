@@ -18,7 +18,7 @@ use trellis::config::{Config, DEFAULT_SCHEMA};
 use trellis::defs::ValueType;
 use trellis::defs::chunk_queue;
 use trellis::staging::build::{self, Step, WorkerOptions};
-use trellis::staging::{StagedWatermark, apply, has_pending, retire_drained_segments};
+use trellis::staging::{apply, has_pending, retire_drained_segments};
 use trellis::{Trellis, TrellisOptions};
 
 const WAKE: &str = "rederive_wake";
@@ -113,15 +113,9 @@ impl Fixture {
     /// One staging-worker reconcile pass: installs the source's capture,
     /// starts every qualifying definition, and discharges the markers.
     async fn pass(&mut self) {
-        trellis::client::reconcile_pass(
-            &mut self.raw,
-            &self.db.pool,
-            DEFAULT_SCHEMA,
-            WAKE,
-            Duration::from_secs(5),
-        )
-        .await
-        .expect("reconcile pass");
+        trellis::client::reconcile_pass(&mut self.raw, &self.db.pool, DEFAULT_SCHEMA)
+            .await
+            .expect("reconcile pass");
     }
 
     /// One drain worker's build step.
@@ -584,15 +578,9 @@ async fn a_start_that_fails_transiently_is_retried_next_pass_and_not_paused() {
 
     // The holder's open transaction is one the discharge's fence wait waits
     // out, so this pass gives it only a moment.
-    trellis::client::reconcile_pass(
-        &mut f.raw,
-        &f.db.pool,
-        DEFAULT_SCHEMA,
-        WAKE,
-        Duration::from_millis(100),
-    )
-    .await
-    .expect("reconcile pass");
+    trellis::client::reconcile_pass(&mut f.raw, &f.db.pool, DEFAULT_SCHEMA)
+        .await
+        .expect("reconcile pass");
     assert_eq!(
         f.status("one").await.as_deref(),
         Some("waiting_to_backfill")
@@ -770,7 +758,6 @@ async fn a_quarantined_build_resumes_through_the_start() {
         .apply("RESUME TRANSFORM one")
         .await
         .expect("resume");
-    assert_eq!(f.count("select count(*) from pending_backfill").await, 0);
     f.pass().await;
     assert_eq!(f.build("one").await.as_deref(), Some("rederive"));
     assert_eq!(
@@ -781,53 +768,6 @@ async fn a_quarantined_build_resumes_through_the_start() {
     f.run("one").await;
     assert_eq!(f.status("one").await.as_deref(), Some("live"));
     f.assert_one_oracle().await;
-}
-
-/// The backfill discharge never dispatches a definition the Re-derive build
-/// takes (#625 F3, `plan_waiting_builds`' skip), even a discharge with no
-/// `ready` list over a marker on its source: it is left
-/// `waiting_to_backfill` for the staging worker's start.
-#[tokio::test]
-async fn the_discharge_leaves_a_rederive_shape_to_the_start() {
-    let mut f = Fixture::new(20, &[AGG]).await;
-    f.raw
-        .batch_execute("insert into pending_backfill (table_name) values ('public.src')")
-        .await
-        .expect("park a marker on the source");
-    for _ in 0..100 {
-        trellis::intake::markers::run_pending_backfills(
-            &mut f.raw,
-            WAKE,
-            &StagedWatermark::saturated(),
-            Duration::ZERO,
-        )
-        .await
-        .expect("discharge");
-        if f.count("select count(*) from pending_backfill").await == 0 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert_eq!(
-        f.count("select count(*) from pending_backfill").await,
-        0,
-        "the marker discharged"
-    );
-    assert_eq!(
-        f.status("agg").await.as_deref(),
-        Some("waiting_to_backfill")
-    );
-    assert_eq!(
-        f.count("select count(*) from backfill_chunks").await,
-        0,
-        "no old build was dispatched"
-    );
-
-    f.pass().await;
-    assert_eq!(f.build("agg").await.as_deref(), Some("rederive"));
-    f.run("agg").await;
-    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
-    f.assert_agg_oracle().await;
 }
 
 // ------------------------------------------------------- 1-1 targets (F8a)
@@ -916,7 +856,6 @@ async fn a_resumed_one_to_one_build_sweeps_the_keys_deleted_while_paused() {
         f.status("one").await.as_deref(),
         Some("waiting_to_backfill")
     );
-    assert_eq!(f.count("select count(*) from pending_backfill").await, 0);
     f.pass().await;
     assert_eq!(f.build("one").await.as_deref(), Some("rederive"));
     assert_eq!(
@@ -1794,7 +1733,6 @@ async fn a_one_to_one_build_goes_from_waiting_to_live_with_no_catch_up() {
     f.pass().await;
     assert_eq!(f.status("one").await.as_deref(), Some("backfilling"));
     assert_eq!(f.build("one").await.as_deref(), Some("rederive"));
-    assert_eq!(f.count("select count(*) from pending_backfill").await, 0);
 
     let (steps, seen) = f.run("one").await;
     assert_eq!(steps.first(), Some(&Step::Planned));

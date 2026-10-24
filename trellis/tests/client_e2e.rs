@@ -770,7 +770,7 @@ async fn a_plain_one_to_one_definition_backfills_via_running_drain_workers() {
     // retries a fence pinned by another transaction for only a few seconds
     // and then returns without dispatching, so check that it did: a missing
     // chunk would otherwise surface as the wait below timing out.
-    trellis::intake::markers::discharge_registrations(&db.pool)
+    trellis::intake::harness::start_registered_builds(&db.pool)
         .await
         .expect("dispatch the chunked build");
     let chunks: i64 = raw
@@ -881,7 +881,7 @@ async fn a_drain_only_client_reclaims_a_stale_chunk_claim_with_no_staging_worker
     assert_eq!(def.status, TransformStatus::WaitingToBackfill);
     // No staging worker here (`staging_worker: false`): stand in for its
     // discharge, which starts the Re-derive build (#625 F8a).
-    trellis::intake::markers::discharge_registrations(&db.pool)
+    trellis::intake::harness::start_registered_builds(&db.pool)
         .await
         .expect("start the re-derive build");
 
@@ -1022,7 +1022,7 @@ async fn a_running_client_backfills_a_reclaimed_composite_key_chunk() {
     assert_eq!(def.status, TransformStatus::WaitingToBackfill);
     // No staging worker here (`staging_worker: false`): stand in for its
     // discharge, which starts the Re-derive build (#625 F8a).
-    trellis::intake::markers::discharge_registrations(&db.pool)
+    trellis::intake::harness::start_registered_builds(&db.pool)
         .await
         .expect("start the re-derive build");
 

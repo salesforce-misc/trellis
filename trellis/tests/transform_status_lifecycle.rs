@@ -5,53 +5,33 @@
 //! lifecycle" and docs/decisions/0009-observability-decisions.md's decision
 //! 4.
 //!
-//! Two scenarios, each exercising a real fence/marker rather than a
-//! shortcut:
+//! A fresh transform is `waiting_to_backfill` until the staging worker's
+//! capture pass starts its Re-derive build, which applies from its start
+//! (`backfilling`) and reaches `live` when its last job completes.
+//! `quarantine::resume_transform` drops a `quarantined` definition back to
+//! `waiting_to_backfill`, and the same pass starts a build that carries it
+//! through to `live` again, repopulating the target from current source
+//! state.
 //!
-//! - A fresh transform whose source table's `pending_backfill` marker is
-//!   pinned by a concurrent straggler transaction sits in
-//!   `waiting_to_backfill` until that transaction commits and the marker's
-//!   `xmin` fence settles, then reaches `live`.
-//! - `quarantine::resume_transform` drops an (manually) `quarantined`
-//!   definition back to `waiting_to_backfill` and re-parks a catch-up
-//!   marker, which the same `run_pending_backfills` discharge carries
-//!   through to `live` again, repopulating the target from current source
-//!   state.
-//!
-//! Both backfill mechanisms (the chunked plain-1-1 path and the
-//! direct/set-based path) reaching `live` in the ordinary (no unsettled
-//! marker) case is already covered extensively by `defs_install_definition.rs`
-//! and `defs_backfill_chunk_queue.rs`; this file only adds the piece those
-//! didn't cover: a definition held in `waiting_to_backfill` while its
-//! marker's fence is unsettled, and whole-transform quarantine resume.
-//!
-//! A third scenario (issue #105) drives the whole-transform fuse's *trip*
+//! A further scenario (issue #105) drives the whole-transform fuse's *trip*
 //! half for real, rather than simulating it: five distinct keys on one
 //! source table each fail every real apply attempt until
 //! `staging::quarantine`'s whole-transform fuse quarantines the definition,
-//! then the same resume/re-backfill lifecycle as the scenario above carries
-//! it back to `live`.
+//! then the same resume/rebuild lifecycle carries it back to `live`.
 //!
-//! A fourth scenario (issue #160) carries that one further: once resumed and
-//! live again, the transform must have a *fresh* whole-transform fuse budget
+//! The last (issue #160) carries that one further: once resumed and live
+//! again, the transform must have a *fresh* whole-transform fuse budget
 //! — one new eviction must not immediately re-quarantine it just because the
 //! pre-resume `poison` rows are (deliberately) still there, while a full
 //! fresh threshold's worth of new evictions must.
-//!
-//! The last (issue #407) checks that a source whose backfill keeps failing
-//! shows its retry state through `Trellis::status` until the cause is fixed.
 
 use std::collections::HashMap;
-use std::time::Duration;
 
 use testkit::TestCluster;
 use testkit::crash::OpenTransaction;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
-use trellis::defs::{
-    TransformStatus, ValueType, chunk_queue, create_definition, install_definition,
-};
-use trellis::intake::markers;
+use trellis::defs::{TransformStatus, ValueType, create_definition, install_definition};
 use trellis::staging::apply;
 use trellis::staging::quarantine;
 use trellis::staging::{has_pending, retire_drained_segments};
@@ -203,47 +183,16 @@ async fn drain_until_live(pool: &trellis::Pool, client: &mut Client, target: &st
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
     // ADR-0002 (#418): registration only records a definition; the backfill
     // discharge dispatches its chunks.
-    trellis::intake::markers::discharge_registrations(pool)
+    trellis::intake::harness::start_registered_builds(pool)
         .await
         .expect("dispatch registered definitions' builds");
-    const CLAIMED_BY: &str = "status_lifecycle_test_backfill_worker";
-    loop {
-        let client = pool.get().await.expect("acquire connection");
-        let claimed = chunk_queue::claim_chunks(&**client, CLAIMED_BY, 1000)
-            .await
-            .expect("claim_chunks");
-        drop(client);
-        if claimed.is_empty() {
-            // A plain aggregate is the Re-derive build's (#625 F3, F5).
-            trellis::staging::build::settle_builds(pool).await;
-            // The staging worker's next pass: the builds' go-live catch-ups
-            // take them `live` (issue #476).
-            trellis::intake::markers::discharge_registrations(pool)
-                .await
-                .expect("discharge the go-live catch-ups");
-            return;
-        }
-        for chunk in &claimed {
-            chunk_queue::run_claimed_chunk(
-                pool,
-                chunk,
-                CLAIMED_BY,
-                Duration::from_secs(5),
-                Duration::from_secs(60),
-            )
-            .await
-            .expect("run_claimed_chunk");
-            chunk_queue::finish_chunk(pool, chunk, CLAIMED_BY)
-                .await
-                .expect("finish_chunk");
-        }
-    }
+    trellis::staging::build::settle_builds(pool).await;
 }
 
 /// One staging-worker reconcile pass (capture, markers, discharge), with no
 /// time to wait for an unsettled fence.
 async fn reconcile_pass(pool: &trellis::Pool, raw: &mut Client) {
-    trellis::client::reconcile_pass(raw, pool, DEFAULT_SCHEMA, "wake", Duration::ZERO)
+    trellis::client::reconcile_pass(raw, pool, DEFAULT_SCHEMA)
         .await
         .expect("reconcile pass");
 }
@@ -367,142 +316,6 @@ async fn evict_keys_for_real(
         .expect("retire drained segments");
 }
 
-/// A fresh transform whose registration marker's fence is pinned by a
-/// concurrent straggler transaction sits in `waiting_to_backfill` for as
-/// long as that straggler is open — never silently `live` or `backfilling`
-/// while its rows are genuinely unpopulated — then reaches
-/// `backfilling`/`live` once the straggler commits and the staging worker's
-/// reconcile pass discharges the marker, with the target correctly
-/// populated from every pre-existing source row.
-///
-/// #625 F8a: a plain 1-1 over a captured table is the Re-derive build's,
-/// which applies from its start and takes no fence
-/// ([`a_plain_one_to_one_is_not_held_by_the_xmin_fence`]). The fenced
-/// discharge is kept by a 1-1 whose source is held out of the Re-derive
-/// build ([`markers::hold_out_of_the_rederive_build`]), which takes the old
-/// chunked build and its go-live catch-up.
-#[tokio::test]
-async fn a_fresh_transform_waits_on_the_xmin_fence_then_reaches_live() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut raw = connect_raw(db.dsn()).await;
-
-    raw.batch_execute(
-        "create table s (id bigint primary key, a numeric); \
-         insert into s (id, a) select g, g from generate_series(1, 25) g",
-    )
-    .await
-    .expect("seed source table");
-    markers::hold_out_of_the_rederive_build(&raw, &qualify_fixture_table("s"))
-        .await
-        .expect("hold s out of the Re-derive build");
-
-    // A straggler holds an xid open before the table is captured, so the
-    // marker the reconcile pass parks must name it as in-flight.
-    let straggler = OpenTransaction::begin(db.dsn()).await;
-    straggler.execute("select txid_current()").await;
-
-    // Registration always leaves the definition `waiting_to_backfill`
-    // (ADR-0002); what this pins is that the discharge doesn't build it
-    // until the straggler has ended.
-    let cols = numeric(&["a"]);
-    let def = install_definition(
-        &db.pool,
-        "TRANSFORM t FROM s SELECT a + a AS x",
-        &cols,
-        "public",
-    )
-    .await
-    .expect("install_definition");
-
-    assert_eq!(
-        def.status,
-        TransformStatus::WaitingToBackfill,
-        "registration records the definition waiting_to_backfill, never backfilling/live"
-    );
-    assert_eq!(
-        status_of(&raw, "t").await,
-        TransformStatus::WaitingToBackfill,
-        "the persisted row must agree with the returned Definition"
-    );
-
-    // No chunk work was enqueued and no direct build ran — the target
-    // exists (DDL always runs) but is empty.
-    let target_rows: i64 = raw
-        .query_one("select count(*) from t", &[])
-        .await
-        .expect("count t")
-        .get(0);
-    assert_eq!(
-        target_rows, 0,
-        "a deferred definition's target must not be populated until the fence settles"
-    );
-    let chunk_count: i64 = raw
-        .query_one(
-            "select count(*) from backfill_chunks where definition_id = $1",
-            &[&def.id],
-        )
-        .await
-        .expect("count backfill_chunks")
-        .get(0);
-    assert_eq!(
-        chunk_count, 0,
-        "a deferred definition must not enqueue chunk work it can't safely run yet"
-    );
-
-    // A reconcile pass while the straggler is still open installs the
-    // capture and parks the marker, and must leave the definition exactly
-    // where it was — no flicker, no partial progress.
-    reconcile_pass(&db.pool, &mut raw).await;
-    let markers: i64 = raw
-        .query_one(
-            "select count(*) from pending_backfill where table_name = $1",
-            &[&qualify_fixture_table("s")],
-        )
-        .await
-        .expect("count markers")
-        .get(0);
-    assert_eq!(
-        markers, 1,
-        "the pass parked the marker and left it unsettled"
-    );
-    assert_eq!(
-        status_of(&raw, "t").await,
-        TransformStatus::WaitingToBackfill,
-        "an unsettled fence must not advance the deferred definition"
-    );
-
-    // The straggler settles.
-    straggler.commit().await;
-
-    reconcile_pass(&db.pool, &mut raw).await;
-
-    // The pass only *dispatches* the build (for this definition, its
-    // chunks); running the chunks is what actually populates the
-    // target, and its go-live catch-up takes the definition `live`.
-    drain_to_quiescence(&db.pool, &mut raw).await;
-
-    assert_eq!(
-        status_of(&raw, "t").await,
-        TransformStatus::Live,
-        "once the fence settles and the deferred backfill drains, the definition must be live"
-    );
-
-    let mismatches: i64 = raw
-        .query_one(
-            "select count(*) from s left join t on t.id = s.id \
-             where t.id is null or t.x is distinct from s.a + s.a",
-            &[],
-        )
-        .await
-        .expect("compare s and t")
-        .get(0);
-    assert_eq!(
-        mismatches, 0,
-        "the deferred backfill must populate every pre-existing source row correctly"
-    );
-}
-
 /// #625 F8a: a plain 1-1 over a captured table is the Re-derive build's,
 /// which applies from the commit that starts it and reads its chunks under
 /// the key's ledger entry, so it takes no fence: a straggler open from
@@ -608,14 +421,7 @@ async fn quarantine_resume_drops_to_waiting_to_backfill_and_re_backfills_to_live
     // call below discharges so it can't be mistaken for the marker
     // `resume_transform` parks later).
     drain_backfill_chunks(&db.pool).await;
-    markers::run_pending_backfills(
-        &mut raw,
-        "wake",
-        &trellis::staging::StagedWatermark::saturated(),
-        std::time::Duration::ZERO,
-    )
-    .await
-    .expect("discharge the post-build catch-up marker");
+    drain_backfill_chunks(&db.pool).await;
     assert_eq!(status_of(&raw, "t2").await, TransformStatus::Live);
 
     // Break it: mutate a source row so the target visibly diverges, then
@@ -646,14 +452,7 @@ async fn quarantine_resume_drops_to_waiting_to_backfill_and_re_backfills_to_live
 
     // No concurrent transaction pins the fence this time, so a single
     // discharge pass both settles and processes the re-parked marker.
-    markers::run_pending_backfills(
-        &mut raw,
-        "wake",
-        &trellis::staging::StagedWatermark::saturated(),
-        std::time::Duration::ZERO,
-    )
-    .await
-    .expect("run_pending_backfills discharges the resume's own marker");
+    drain_backfill_chunks(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut raw).await;
 
     assert_eq!(
@@ -720,14 +519,7 @@ async fn quarantine_trips_for_real_on_five_poisoned_keys_then_resumes_to_live() 
     .await
     .expect("install_definition");
     drain_backfill_chunks(&db.pool).await;
-    markers::run_pending_backfills(
-        &mut raw,
-        "wake",
-        &trellis::staging::StagedWatermark::saturated(),
-        std::time::Duration::ZERO,
-    )
-    .await
-    .expect("discharge the post-build catch-up marker");
+    drain_backfill_chunks(&db.pool).await;
     // The post-build catch-up marker only *stages* its recompute triggers
     // into the still-active (unsealed) ring segment — draining it to
     // quiescence here (rather than leaving those triggers pending) keeps
@@ -792,14 +584,7 @@ async fn quarantine_trips_for_real_on_five_poisoned_keys_then_resumes_to_live() 
         "resume must drop straight to waiting_to_backfill, never directly to backfilling/live"
     );
 
-    markers::run_pending_backfills(
-        &mut raw,
-        "wake",
-        &trellis::staging::StagedWatermark::saturated(),
-        std::time::Duration::ZERO,
-    )
-    .await
-    .expect("run_pending_backfills discharges the resume's own marker");
+    drain_backfill_chunks(&db.pool).await;
     // The resume deleted the five bad keys' `poison`/`poison_held` rows
     // (#799), which no release could ever have cleared: their key can never
     // cast to `s4.id`'s `bigint`.
@@ -872,14 +657,7 @@ async fn a_resumed_transform_gets_a_fresh_fuse_budget_rather_than_re_tripping_at
     .await
     .expect("install_definition");
     drain_backfill_chunks(&db.pool).await;
-    markers::run_pending_backfills(
-        &mut raw,
-        "wake",
-        &trellis::staging::StagedWatermark::saturated(),
-        std::time::Duration::ZERO,
-    )
-    .await
-    .expect("discharge the post-build catch-up marker");
+    drain_backfill_chunks(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut raw).await;
     assert_eq!(status_of(&raw, "t6").await, TransformStatus::Live);
 
@@ -906,14 +684,7 @@ async fn a_resumed_transform_gets_a_fresh_fuse_budget_rather_than_re_tripping_at
     quarantine::resume_transform(&db.pool, "t6")
         .await
         .expect("resume_transform");
-    markers::run_pending_backfills(
-        &mut raw,
-        "wake",
-        &trellis::staging::StagedWatermark::saturated(),
-        std::time::Duration::ZERO,
-    )
-    .await
-    .expect("run_pending_backfills discharges the resume's own marker");
+    drain_backfill_chunks(&db.pool).await;
     drain_until_live(&db.pool, &mut raw, "t6").await;
     // Flush whatever the re-backfill's own catch-up left staged, so the
     // eviction rounds below start from a segment holding only their own
@@ -1068,7 +839,7 @@ async fn every_backfill_mechanism_still_reaches_live_with_no_unsettled_marker() 
     .await
     .expect("install_definition (re-derive path)");
     assert_eq!(summed.status, TransformStatus::WaitingToBackfill);
-    trellis::intake::markers::discharge_registrations(&db.pool)
+    trellis::intake::harness::start_registered_builds(&db.pool)
         .await
         .expect("start the build");
     assert_eq!(
@@ -1076,12 +847,6 @@ async fn every_backfill_mechanism_still_reaches_live_with_no_unsettled_marker() 
         TransformStatus::Backfilling,
         "the start moves it straight to backfilling, applying from there"
     );
-    let markers: i64 = raw
-        .query_one("select count(*) from pending_backfill", &[])
-        .await
-        .expect("count markers")
-        .get(0);
-    assert_eq!(markers, 0, "a re-derive build parks no marker");
     trellis::staging::build::settle_builds(&db.pool).await;
     assert_eq!(
         status_of(&raw, "sum_t").await,
@@ -1098,147 +863,4 @@ async fn every_backfill_mechanism_still_reaches_live_with_no_unsettled_marker() 
         .expect("compare with the source")
         .get(0);
     assert_eq!(mismatches, 0);
-}
-
-/// Every definition's [`trellis::DefinitionSummary::backfill_failure`], in
-/// `Trellis::definitions`' order.
-async fn backfill_failures_listed(
-    trellis: &trellis::Trellis,
-) -> Vec<Option<trellis::BackfillFailure>> {
-    trellis
-        .definitions()
-        .await
-        .expect("definitions")
-        .into_iter()
-        .map(|summary| summary.backfill_failure)
-        .collect()
-}
-
-/// Issue #407 (ADR-0002): a definition whose source's backfill keeps failing
-/// stays `waiting_to_backfill`, and `Trellis::status` says why: the marker's
-/// attempt count, last error and next attempt. Once the cause is fixed, a
-/// fresh `request_backfill` resets the backoff, the next attempt goes through
-/// and the failure clears.
-///
-/// #625 F8a: a plain 1-1 over a captured table is the Re-derive build's,
-/// whose start reads no key (a failing plan job shows through status as a
-/// failing chunk, #616). The marker discharge that fails on the missing key
-/// is the old paths', which a 1-1 over a source held out of the Re-derive
-/// build ([`markers::hold_out_of_the_rederive_build`]) still takes, so both
-/// readers do.
-#[tokio::test]
-async fn a_failing_backfill_shows_through_status_until_it_goes_through() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
-    raw.batch_execute(
-        "create table public.widgets (id bigint primary key, price numeric); \
-         insert into public.widgets values (1, 2);",
-    )
-    .await
-    .expect("seed the source");
-    let trellis = trellis::Trellis::connect(
-        trellis::Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
-        trellis::TrellisOptions::default(),
-    )
-    .await
-    .expect("connect a define-only Trellis");
-    markers::hold_out_of_the_rederive_build(&raw, "public.widgets")
-        .await
-        .expect("hold widgets out of the Re-derive build");
-    trellis
-        .apply("TRANSFORM widget_totals FROM widgets SELECT price + price AS total")
-        .await
-        .expect("register a 1-1 transform");
-    // A second reader of the same source, so the listing shows the one
-    // marker's failure on both (issue #461).
-    trellis
-        .apply("TRANSFORM widget_prices FROM widgets SELECT price AS price")
-        .await
-        .expect("register a second transform on the same source");
-    // Their build enumerates the source by its primary key, so without one
-    // every discharge of the source's marker fails.
-    raw.batch_execute("alter table public.widgets drop constraint widgets_pkey")
-        .await
-        .expect("drop the source's primary key");
-
-    let error = markers::discharge_registrations(&db.pool)
-        .await
-        .expect_err("the discharge fails on the missing key");
-    let status = trellis
-        .status("widget_totals")
-        .await
-        .expect("status")
-        .expect("the transform is registered");
-    assert_eq!(status.status, TransformStatus::WaitingToBackfill);
-    let failure = status
-        .backfill_failure
-        .expect("status reports the failing backfill");
-    // Issue #461: the definitions listing reports the same failure, once
-    // per definition reading the source.
-    assert_eq!(
-        backfill_failures_listed(&trellis).await,
-        vec![Some(failure.clone()), Some(failure.clone())],
-        "definitions() reports the failure status does"
-    );
-    assert_eq!(failure.source_table, "public.widgets");
-    assert_eq!(failure.attempts, 1);
-    assert_eq!(failure.last_error, error.to_string());
-    assert!(
-        failure.last_error.contains("no primary key"),
-        "the error names the cause, got {:?}",
-        failure.last_error
-    );
-    assert!(
-        failure.next_attempt_at > std::time::SystemTime::now(),
-        "the retry is backed off"
-    );
-
-    // Fix the cause, then ask for a fresh backfill rather than waiting the
-    // backoff out: a new park resets the marker's retry state, so the table
-    // is due at once and `status` stops reporting the old failure while the
-    // marker is still there.
-    raw.batch_execute("alter table public.widgets add primary key (id)")
-        .await
-        .expect("restore the primary key");
-    trellis
-        .request_backfill("widgets")
-        .await
-        .expect("request a fresh backfill");
-    let markers: i64 = raw
-        .query_one(
-            "select count(*) from pending_backfill where table_name = 'public.widgets'",
-            &[],
-        )
-        .await
-        .expect("count markers")
-        .get(0);
-    assert_eq!(markers, 1, "the re-parked marker is still pending");
-    let status = trellis
-        .status("widget_totals")
-        .await
-        .expect("status")
-        .expect("the transform is registered");
-    assert_eq!(
-        status.backfill_failure, None,
-        "a marker with no recorded failure reports none"
-    );
-    assert_eq!(backfill_failures_listed(&trellis).await, vec![None, None]);
-    markers::discharge_registrations(&db.pool)
-        .await
-        .expect("the retry goes through");
-    // The discharge dispatched the chunked build; its chunks and go-live
-    // catch-up take it live.
-    drain_backfill_chunks(&db.pool).await;
-    let status = trellis
-        .status("widget_totals")
-        .await
-        .expect("status")
-        .expect("the transform is registered");
-    assert_eq!(status.backfill_failure, None);
-    assert_eq!(
-        status.status,
-        TransformStatus::Live,
-        "the retry's build takes it live"
-    );
 }

@@ -497,11 +497,10 @@ pub(crate) async fn source_primary_key_in_txn(
 /// with its nullability. Empty when `table` has no such index; no key-type
 /// gate. `table` is an unquoted `schema.table` identity ([`regclass_arg`]).
 ///
-/// Split out for `intake::markers::enumerate_and_append` (issue #308),
-/// which must enumerate every table a catch-up marker can name — aggregate
-/// targets included — under exactly the key [`pk_key_sql_expr`] renders for
-/// that table everywhere else. It has never type-gated the tables it
-/// enumerates, and a catch-up marker is not the place to start.
+/// Split out for `intake::harness::enumerate_and_append` (issue #308),
+/// which must enumerate every table a fixture can name — aggregate targets
+/// included — under exactly the key [`pk_key_sql_expr`] renders for that
+/// table everywhere else. It has never type-gated the tables it enumerates.
 pub(crate) async fn identity_key_columns(
     client: &impl GenericClient,
     table: &str,
@@ -1042,8 +1041,8 @@ pub(crate) fn pk_key_sql_expr(pk: &[PrimaryKeyColumn], alias: Option<&str>) -> S
 /// [`composite_key_escape_sql`]) for a captured row, and the SQL form for
 /// everything computed in the database (an aggregate group's
 /// downstream-propagated identity among them, issue #171) — including
-/// `intake::markers::enumerate_and_append`'s backfill enumeration, which
-/// selects its keys through [`pk_key_sql_expr`] (issue #308). Keeping them one
+/// `intake::harness::enumerate_and_append`'s enumeration, which selects its
+/// keys through [`pk_key_sql_expr`] (issue #308). Keeping them one
 /// function each — rather than a hand-rolled `join` per site — is what makes
 /// the "producers and consumers agree on one shape" claim in
 /// [`COMPOSITE_KEY_SEPARATOR`]'s doc comment checkable by grep.
@@ -1306,7 +1305,7 @@ pub(crate) async fn field_column_pg_types(
 /// [`qualified_target_table`] actually creates it under. Note this is *not*
 /// the same string `transform_definitions.target_table` persists as of issue
 /// #73: the catalog's own identity column holds the fully-qualified
-/// `schema.table` form (built via `intake::markers::qualify`, at
+/// `schema.table` form (built via `intake::qualify`, at
 /// definition-acceptance time — see `catalog::create_definition_inner`), not
 /// this bare name. Callers that need a live connection (whose `search_path`
 /// already resolves this bare name to the right physical table —
@@ -1324,7 +1323,7 @@ pub fn neighbor_table_name(def: &TransformDef) -> &str {
 /// interpolation into DDL text, not as a persisted-identity string: this
 /// quotes each component separately, whereas `transform_definitions.target_table`
 /// (issue #73) is the plain, unquoted `"schema.table"` form
-/// `intake::markers::qualify` builds — the two are never byte-for-byte
+/// `intake::qualify` builds — the two are never byte-for-byte
 /// equal, so don't compare or persist this function's output as if it were
 /// that identity.
 pub fn qualified_target_table(target_schema: &str, def: &TransformDef) -> String {
@@ -1351,7 +1350,7 @@ pub fn qualified_target_table(target_schema: &str, def: &TransformDef) -> String
 /// `Config::target_schema`/`"public"`) — exactly the bug class ADR-0011
 /// exists to close.
 ///
-/// Splits on the first `.`, matching `intake::markers::qualify`'s sole
+/// Splits on the first `.`, matching `intake::qualify`'s sole
 /// construction site for this shape (which rejects a `.` inside either
 /// component, so the first `.` here is always the real separator). Falls
 /// back to quoting `qualified` whole when it carries no `.` at all — not a
@@ -1389,7 +1388,7 @@ pub(crate) fn qualified_target_table_ident(qualified: &str) -> String {
 /// a table's unquoted `schema.table` identity (issue #561).
 ///
 /// That unquoted identity is the one name every catalog lookup in this crate
-/// takes: it is what [`crate::intake::markers::qualify`] builds, what
+/// takes: it is what [`crate::intake::qualify`] builds, what
 /// `StagedChange::src_table` and `transform_definitions.source_table`/
 /// `target_table` hold, and what `qualified_from_table()`/
 /// `qualified_to_table()` return. A quoted form exists only for splicing

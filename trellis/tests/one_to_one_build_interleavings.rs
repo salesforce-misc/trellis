@@ -586,7 +586,7 @@ async fn a_chunk_feeds_a_reader_of_its_target_through_the_seam() {
     )
     .await
     .expect("install the chained reader");
-    trellis::intake::markers::settle_registrations(d.pool()).await;
+    trellis::intake::harness::settle_builds(d.pool()).await;
     d.settle().await;
     let plan = OneToOnePlan::load(d.pool(), "one")
         .await
@@ -1539,7 +1539,7 @@ async fn a_build_in_flight_holds_no_column_pause_lock() {
     )
     .await
     .expect("define two");
-    trellis::intake::markers::discharge_registrations(d.pool())
+    trellis::intake::harness::start_registered_builds(d.pool())
         .await
         .expect("start two's build");
     assert_eq!(

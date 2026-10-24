@@ -4,26 +4,18 @@
 
 #![allow(dead_code)]
 
-use std::time::Duration;
-
 use crate::drain_driver::{self, Driver};
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::defs::{ValueType, chunk_queue};
+use trellis::defs::ValueType;
 use trellis::integer::IntWidth;
 use trellis::staging::apply;
 use trellis::{Config, Trellis, TrellisOptions};
 
 pub async fn pass(d: &mut Driver) {
     let pool = d.pool().clone();
-    trellis::client::reconcile_pass(
-        &mut d.ctl,
-        &pool,
-        DEFAULT_SCHEMA,
-        "upstream_release_wake",
-        Duration::from_secs(2),
-    )
-    .await
-    .expect("reconcile pass");
+    trellis::client::reconcile_pass(&mut d.ctl, &pool, DEFAULT_SCHEMA)
+        .await
+        .expect("reconcile pass");
 }
 
 pub async fn facade(dsn: &str) -> Trellis {
@@ -76,31 +68,7 @@ pub async fn settle_tolerant(d: &mut Driver) -> usize {
 /// builds.
 pub async fn run_backfill_chunks(pool: &trellis::Pool) {
     const CLAIMED_BY: &str = "upstream_release_backfill";
-    loop {
-        let client = pool.get().await.expect("acquire connection");
-        let claimed = chunk_queue::claim_chunks(&**client, CLAIMED_BY, 1000)
-            .await
-            .expect("claim_chunks");
-        drop(client);
-        if claimed.is_empty() {
-            trellis::staging::build::settle_builds(pool).await;
-            return;
-        }
-        for chunk in &claimed {
-            chunk_queue::run_claimed_chunk(
-                pool,
-                chunk,
-                CLAIMED_BY,
-                Duration::from_secs(5),
-                Duration::from_secs(60),
-            )
-            .await
-            .expect("run_claimed_chunk");
-            chunk_queue::finish_chunk(pool, chunk, CLAIMED_BY)
-                .await
-                .expect("finish_chunk");
-        }
-    }
+    trellis::staging::build::settle_builds(pool).await;
 }
 
 pub async fn write(d: &Driver, sql: &str) {

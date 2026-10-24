@@ -33,9 +33,6 @@
 //!   eviction, parked work as the source of truth for an excluded key's
 //!   later healthy changes, operator-driven release, and the one sanctioned
 //!   exception to immutability (a dropped source table's purge).
-//! - [`watermark`] is the in-process "staged-through" LSN a backfill
-//!   enumeration waits on (issue #312) — a small, injectable handle. Always
-//!   caught up under trigger capture.
 //! - [`worker_registry`] is issue #144's worker-level liveness registry:
 //!   one row per live drain worker, independent of whether it currently
 //!   holds a claim — the read behind `Trellis::has_live_drain_workers`.
@@ -92,7 +89,6 @@ pub mod session;
 pub mod state;
 pub(crate) mod target_mutations;
 pub(crate) mod unindexed_joins;
-pub mod watermark;
 pub mod worker_registry;
 
 // This module is tier 3 (`pub(crate)`, ADR-0012), so these flattened
@@ -144,7 +140,6 @@ pub use self_check_job::{SelfCheckJob, SelfCheckJobState, SelfCheckReport};
 pub use session::ProducerSession;
 pub use state::segment_state_counts;
 pub use unindexed_joins::UnindexedJoin;
-pub use watermark::StagedWatermark;
 pub use worker_registry::{deregister_worker, reclaim_stale_workers, register_worker};
 
 // Reached from `crate::dev` (ADR-0012's sanctioned exception) by

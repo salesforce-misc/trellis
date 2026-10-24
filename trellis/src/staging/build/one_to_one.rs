@@ -7,7 +7,7 @@
 //! backfilling` with `build = 'rederive'`, it applies from that commit, a
 //! plan job enqueues `(lo, hi]` chunks of its source's primary key, a
 //! rebuild also gets a sweep, and the transaction that finishes the last
-//! chunk moves it `live` (B7). Nothing parks a catch-up for it.
+//! chunk moves it `live` (B7). Nothing is left to catch up after it.
 //!
 //! The chunk: a 1-1 target's rows are absolute, a target row is the
 //! evaluation of one source row, so a chunk writes the target rows

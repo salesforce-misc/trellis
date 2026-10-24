@@ -14,7 +14,7 @@ use trellis::capture::partitions::{self, PendingCorrection};
 use trellis::capture::reconcile::PassOutcome;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::TransformStatus;
-use trellis::intake::markers;
+use trellis::intake::harness;
 use trellis::staging::apply::ApplyError;
 use trellis::{CatalogError, Config, Trellis, TrellisError, TrellisOptions};
 
@@ -85,7 +85,7 @@ async fn instance(cluster: &TestCluster, tree: &str) -> Instance {
         .expect("define an aggregate over the partitioned source");
     let outcome = pass(&mut raw, &db.pool).await;
     assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
-    markers::settle_registrations(&db.pool).await;
+    harness::settle_builds(&db.pool).await;
     Instance { db, raw, trellis }
 }
 
@@ -794,7 +794,7 @@ async fn a_sub_level_outside_the_group_key_pauses_the_reader() {
         .await
         .expect("resume");
     clean_pass(&mut it).await;
-    markers::settle_registrations(&it.db.pool).await;
+    harness::settle_builds(&it.db.pool).await;
     assert_eq!(status(&it.trellis).await.status, TransformStatus::Live);
     it.trellis.shutdown().await.expect("shutdown");
 }

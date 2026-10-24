@@ -38,7 +38,7 @@
 //!
 //! An upstream build or rebuild that writes the target outside the seam
 //! parks a catch-up for its readers, and a group-basis reader is rebuilt
-//! instead (`crate::intake::markers::park_target_catchup_if_read`): an
+//! instead (`crate::intake::catch_up::park_target_catchup_if_read`): an
 //! image-less catch-up names keys, not the deltas a group needs. A group-basis
 //! build that is a fresh build or a resume parks it too, though it writes
 //! through the seam: a resume empties the partials and keeps the target, so

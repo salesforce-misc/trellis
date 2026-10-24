@@ -614,8 +614,8 @@ pub(crate) const ROW_SECURITY_OFF: &str = "set row_security to off";
 ///   statement that runs in 40 ms.
 ///
 /// The statements that do read a whole table (a group-basis build's or
-/// rebuild's absolute write, the discharge's enumeration and the resume's
-/// orphan sweep) gain nothing
+/// rebuild's absolute write, a 1-1 build's chunk and the resume's sweep) gain
+/// nothing
 /// from JIT either: at 5M rows each takes the same time, within 2%, with it
 /// on or off, since its time goes to writing, sorting and hashing rows, not
 /// to evaluating expressions.

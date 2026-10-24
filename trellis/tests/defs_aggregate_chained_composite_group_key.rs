@@ -213,13 +213,13 @@ async fn install_the_chain(db: &testkit::TestDatabase, client: &mut Client) {
     install_definition(&db.pool, STOCK_TOTALS, &inventory_columns(), "public")
         .await
         .expect("install the multi-column GROUP BY aggregate");
-    trellis::intake::markers::settle_registrations(&db.pool).await;
+    trellis::intake::harness::settle_builds(&db.pool).await;
     drain_to_quiescence(&db.pool, client).await;
 
     install_definition(&db.pool, STOCK_TOTALS_V2, &stock_totals_columns(), "public")
         .await
         .expect("install the chained aggregate reading stock_totals");
-    trellis::intake::markers::settle_registrations(&db.pool).await;
+    trellis::intake::harness::settle_builds(&db.pool).await;
     drain_to_quiescence(&db.pool, client).await;
 
     // Both backfills: (w1,a)=12, (w1,b)=2, (w2,a)=11; w1=14, w2=11.

@@ -89,15 +89,9 @@ impl H {
     /// One whole staging-worker pass.
     pub async fn pass(&mut self) {
         let pool = self.db.pool.clone();
-        trellis::client::reconcile_pass(
-            &mut self.raw,
-            &pool,
-            SCHEMA,
-            "relabel_wake",
-            Duration::from_secs(2),
-        )
-        .await
-        .expect("reconcile pass");
+        trellis::client::reconcile_pass(&mut self.raw, &pool, SCHEMA)
+            .await
+            .expect("reconcile pass");
     }
 
     /// The capture half of one pass only. Asserts no table failed.
@@ -119,33 +113,8 @@ impl H {
     /// Claims, runs and finishes every pending build chunk, then settles the
     /// builds.
     pub async fn build(&self) {
-        use trellis::defs::chunk_queue;
         const CLAIMED_BY: &str = "relabel_backfill";
-        loop {
-            let client = self.db.pool.get().await.expect("acquire connection");
-            let claimed = chunk_queue::claim_chunks(&**client, CLAIMED_BY, 1000)
-                .await
-                .expect("claim_chunks");
-            drop(client);
-            if claimed.is_empty() {
-                trellis::staging::build::settle_builds(&self.db.pool).await;
-                return;
-            }
-            for chunk in &claimed {
-                chunk_queue::run_claimed_chunk(
-                    &self.db.pool,
-                    chunk,
-                    CLAIMED_BY,
-                    Duration::from_secs(5),
-                    Duration::from_secs(60),
-                )
-                .await
-                .expect("run_claimed_chunk");
-                chunk_queue::finish_chunk(&self.db.pool, chunk, CLAIMED_BY)
-                    .await
-                    .expect("finish_chunk");
-            }
-        }
+        trellis::staging::build::settle_builds(&self.db.pool).await;
     }
 
     /// Seals and drains until nothing is pending. A failing page fails the

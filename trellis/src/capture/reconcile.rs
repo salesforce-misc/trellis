@@ -1,8 +1,8 @@
 //! The staging worker's capture reconcile pass (#622 C5).
 //!
 //! Every reconcile pass of the maintenance loop brings each table's capture
-//! triggers to what the catalog needs, one table at a time, before the
-//! backfill discharge runs:
+//! triggers to what the catalog needs, one table at a time, before the builds
+//! it readies start:
 //!
 //! - a table some definition reads ([`crate::defs::tables_to_capture`]) is
 //!   installed, widened or narrowed to its [`super::columns::capture_spec`]
@@ -79,33 +79,31 @@
 //! rewrites that table: a table it brings current, or no longer captures,
 //! loses its row.
 //!
-//! # Which definitions a discharge may dispatch
+//! # Which definitions a build may start
 //!
-//! A `waiting_to_backfill` definition starts applying ring rows as soon as a
-//! discharge dispatches it, so it must not be dispatched while any table it
-//! reads lacks a column it needs in its images. The pass works out, from the
-//! same catalog snapshot it built the specs from, which waiting definitions
-//! are [`PassOutcome::ready`]:
+//! A `waiting_to_backfill` definition starts applying ring rows as soon as
+//! its build starts, so it must not start while any table it reads lacks a
+//! column it needs in its images. The pass works out, from the same catalog
+//! snapshot it built the specs from, which waiting definitions are
+//! [`PassOutcome::ready`]:
 //!
 //! 1. its source is captured and current after this pass, or is another
 //!    definition's target (the target-mutation seam feeds it, not a trigger);
 //! 2. so is a `JOIN`'s joined table;
-//! 3. and the joined table (other than the source itself) has no marker its
-//!    install or widen parked with a capture gate
-//!    (`pending_backfill.capture_gate_lsn`).
+//! 3. and the joined table (other than the source itself) has no capture gate
+//!    its install or widen recorded ([`super::gate`]) that a pending change
+//!    still holds.
 //!
 //! Rule 3 closes C3's documented gap, "the gate only holds definitions
 //! sourced from the gated table". A `JOIN` sourced from `U` that reads a
-//! new column of its joined table `T` waits on `U`'s marker, which no gate on
-//! `T` holds. So it waits until `T`'s own gated marker has discharged, which
-//! happens only once every change to `T` staged before the widen has drained
+//! new column of its joined table `T` waits on `T`'s own gate, which holds
+//! until every change to `T` staged before the widen has drained
 //! ([`crate::staging::converge::table_changes_pending_through`]).
 //!
-//! The staging worker only parks registration markers for ready definitions
-//! and the discharge only dispatches ready ones
-//! (`intake::markers::run_pending_backfills_for`). A definition that
-//! registered after the pass read the catalog is in neither list, so it
-//! waits for the next pass.
+//! The staging worker only starts the builds of ready definitions
+//! (`staging::build::start_ready_builds`). A definition that registered
+//! after the pass read the catalog is not in the list, so it waits for the
+//! next pass.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Mutex, PoisonError};
@@ -127,8 +125,8 @@ pub struct PassOutcome {
     /// Every table whose capture is installed and current for the catalog
     /// this pass read.
     pub captured: BTreeSet<String>,
-    /// The `waiting_to_backfill` definitions a discharge may dispatch (see
-    /// the module doc), in id order.
+    /// The `waiting_to_backfill` definitions whose build may start (see the
+    /// module doc), in id order.
     pub ready: Vec<i64>,
     /// Each table an install, widen or uninstall is still waiting on.
     pub waiting: Vec<LockWait>,
@@ -524,7 +522,7 @@ pub async fn reconcile(
     super::baseline::forget_except(&*client, &kept).await?;
     super::triggers::forget_except(&*client, &kept).await?;
 
-    let gated = gated_marker_tables(&*client).await?;
+    let gated = super::gate::held_tables(&*client).await?;
     outcome.ready = ready_definitions(&snapshot, desired, &outcome.captured, &gated, &seam_held);
     Ok(outcome)
 }
@@ -639,19 +637,6 @@ fn ready_definitions(
         })
         .map(|(id, _, _)| *id)
         .collect()
-}
-
-/// Every table with a marker an install or widen parked, still pending.
-async fn gated_marker_tables(client: &impl GenericClient) -> Result<HashSet<String>, CaptureError> {
-    Ok(client
-        .query_typed(
-            "select table_name from pending_backfill where capture_gate_lsn is not null",
-            &[],
-        )
-        .await?
-        .into_iter()
-        .map(|row| row.get(0))
-        .collect())
 }
 
 /// Every table instance `schema` has any capture piece on: a function whose

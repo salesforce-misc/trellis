@@ -17,11 +17,9 @@
 //!   (`a_schema_name_with_percent_and_quote_dumps`)
 
 use std::process::Command;
-use std::time::Duration;
 
 use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
-use trellis::defs::chunk_queue;
 use trellis::dump::{CLASSIFICATION, Class};
 use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
 use trellis::{Config, Trellis, TrellisOptions};
@@ -52,37 +50,10 @@ async fn facade(dsn: &str) -> Trellis {
 /// Runs every queued build to completion by hand: the stand-in for a drain
 /// worker (`pause_and_drop.rs`'s helper of the same name).
 async fn build_everything(pool: &trellis::Pool) {
-    trellis::intake::markers::discharge_registrations(pool)
+    trellis::intake::harness::start_registered_builds(pool)
         .await
         .expect("dispatch registered definitions' builds");
-    loop {
-        let client = pool.get().await.expect("acquire connection");
-        let claimed = chunk_queue::claim_chunks(&**client, "dump_test", 1000)
-            .await
-            .expect("claim_chunks");
-        drop(client);
-        if claimed.is_empty() {
-            trellis::staging::build::settle_builds(pool).await;
-            trellis::intake::markers::discharge_registrations(pool)
-                .await
-                .expect("discharge the go-live catch-ups");
-            return;
-        }
-        for chunk in &claimed {
-            chunk_queue::run_claimed_chunk(
-                pool,
-                chunk,
-                "dump_test",
-                Duration::from_secs(5),
-                Duration::from_secs(60),
-            )
-            .await
-            .expect("run_claimed_chunk");
-            chunk_queue::finish_chunk(pool, chunk, "dump_test")
-                .await
-                .expect("finish_chunk");
-        }
-    }
+    trellis::staging::build::settle_builds(pool).await;
 }
 
 /// Loads `schema_sql` plus the appendix into `dsn`'s empty database, the way
@@ -183,15 +154,9 @@ async fn define_and_build(t: &Trellis, raw: &mut Client) {
     .await
     .expect("oc");
     build_everything(t.pool()).await;
-    trellis::client::reconcile_pass(
-        raw,
-        t.pool(),
-        SCHEMA,
-        "dump_test_wake",
-        Duration::from_secs(2),
-    )
-    .await
-    .expect("capture pass");
+    trellis::client::reconcile_pass(raw, t.pool(), SCHEMA)
+        .await
+        .expect("capture pass");
     build_everything(t.pool()).await;
     drain_to_quiescence(t.pool(), raw).await;
     build_everything(t.pool()).await;
@@ -328,7 +293,7 @@ async fn a_dump_loads_as_defined_not_built() {
          order by transform_id, label",
         "select to_jsonb(t) from trellis_instance t",
         "select to_jsonb(t) - 'applied_on' from refinery_schema_history t order by version",
-        "select to_jsonb(t) - 'created_at' - 'status' - 'build' - 'build_seg' - 'build_marker_generation' - 'fuse_rearmed_at' from transform_definitions t order by id",
+        "select to_jsonb(t) - 'created_at' - 'status' - 'build' - 'build_seg' - 'fuse_rearmed_at' from transform_definitions t order by id",
     ] {
         let want = rows_json(&raw, sql).await;
         assert!(!want.is_empty(), "{sql} has rows to compare");
@@ -393,7 +358,7 @@ async fn a_dump_loads_as_defined_not_built() {
     // it: the source's builds left it set, so the reset is what clears it.
     let progress = "select count(*) from transform_definitions \
                     where build is not null or build_seg is not null \
-                       or build_marker_generation is not null or fuse_rearmed_at is not null";
+                       or fuse_rearmed_at is not null";
     assert!(
         count(&raw, progress).await > 0,
         "the source has build progress"
@@ -510,17 +475,11 @@ async fn a_loaded_database_builds_its_definitions() {
     let mut worker = connect_raw(loaded.dsn()).await;
     // The staging worker's own reconcile pass, not the test harness, finds
     // the loaded definitions and starts their builds: the loaded catalog
-    // has no `pending_backfill` markers, and the dump's capture triggers
+    // has no capture gates, and the dump's capture triggers
     // must count as current capture.
-    trellis::client::reconcile_pass(
-        &mut worker,
-        t2.pool(),
-        SCHEMA,
-        "dump_test_wake",
-        Duration::from_secs(2),
-    )
-    .await
-    .expect("reconcile pass on the loaded database");
+    trellis::client::reconcile_pass(&mut worker, t2.pool(), SCHEMA)
+        .await
+        .expect("reconcile pass on the loaded database");
     let started = rows_json(&after, STATUSES).await;
     assert!(
         started.iter().all(|s| !s.ends_with(" waiting_to_backfill")),

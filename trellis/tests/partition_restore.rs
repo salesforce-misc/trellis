@@ -63,7 +63,7 @@ impl Fx {
         // a partitioned source with rows needs, so the builds run after it.
         fx.pass().await;
         assert_eq!(fx.queued().await, 0);
-        trellis::intake::markers::settle_registrations(fx.d.pool()).await;
+        trellis::intake::harness::settle_builds(fx.d.pool()).await;
         fx.d.settle().await;
         assert_eq!(fx.status("agg").await, "live");
         assert_eq!(fx.status("plain_agg").await, "live");
@@ -89,15 +89,9 @@ impl Fx {
 
     async fn full_pass(&mut self) {
         let pool = self.d.pool().clone();
-        trellis::client::reconcile_pass(
-            &mut self.d.ctl,
-            &pool,
-            DEFAULT_SCHEMA,
-            drain_driver::WAKE,
-            Duration::from_secs(2),
-        )
-        .await
-        .expect("reconcile pass");
+        trellis::client::reconcile_pass(&mut self.d.ctl, &pool, DEFAULT_SCHEMA)
+            .await
+            .expect("reconcile pass");
     }
 
     async fn settle_builds(&mut self) {

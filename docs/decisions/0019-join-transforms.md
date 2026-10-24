@@ -346,8 +346,7 @@ until one commit holds only when both sides are unpartitioned.
 A `RESUME` keeps the visible target while the hidden tables restart empty, so
 the prior images that pages send the target's readers before the build commits
 don't match the rows those readers hold. The build that completes a `RESUME`
-therefore parks its readers' catch-up when it commits, once (#1287): a
-group-basis or `JOIN` reader is rebuilt, any other re-derives. Pages keep
+therefore rebuilds its readers when it commits, once (#1287). Pages keep
 computing prior images from the partials, and a rebuild in place of a `live`
 definition, whose partials match the target, rebuilds no reader.
 

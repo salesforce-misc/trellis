@@ -149,7 +149,7 @@ async fn await_converged_waits_for_a_sealed_write_until_it_is_applied() {
         .expect("define over an empty source");
     // Stand in for the staging worker's discharge (ADR-0002), which takes a
     // definition over an empty source straight to `live`.
-    trellis::intake::markers::discharge_registrations(&db.pool)
+    trellis::intake::harness::start_registered_builds(&db.pool)
         .await
         .expect("dispatch the build");
 

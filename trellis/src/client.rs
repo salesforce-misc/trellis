@@ -33,7 +33,7 @@
 //!
 //! **Wake channel**: [`ClientOptions::wake_channel`], by default
 //! [`default_wake_channel`] of the catalog schema, is the one Postgres
-//! `LISTEN/NOTIFY` channel the backfill discharge (`run_pending_backfills`),
+//! `LISTEN/NOTIFY` channel
 //! a seal actually completing
 //! (`staging::seal_if_active_nonempty`/`staging::recover_stuck_seals`, issue
 //! #271 — the transition that makes a batch claimable, as opposed to the
@@ -55,7 +55,7 @@ use crate::config::Config;
 use crate::defs::chunk_queue;
 use crate::defs::{self, CatalogError};
 use crate::error_code::{self, ErrorCode};
-use crate::intake::{self, IntakeError};
+use crate::intake::IntakeError;
 use crate::pool::{Pool, quote_ident};
 use crate::staging::quarantine::HeldKeyRetry;
 use crate::staging::{
@@ -81,7 +81,7 @@ pub struct ClientOptions {
     /// How many independent application-worker tasks this client runs.
     /// Zero is legal — a staging-only client.
     pub application_threads: usize,
-    /// The `LISTEN/NOTIFY` channel shared by the backfill discharge, seals,
+    /// The `LISTEN/NOTIFY` channel shared by seals,
     /// apply's downstream propagation, and every idle app-worker task's
     /// `LISTEN`. `None` (the default) uses [`default_wake_channel`] of the
     /// client's catalog schema, so each instance in a database wakes only
@@ -107,16 +107,14 @@ pub struct ClientOptions {
     /// under that interval reclaims claims out from under workers that are
     /// still running them.
     pub reclaim_ttl: Duration,
-    /// How often the maintenance loop ticks. Every tick seals and checks for
-    /// a backfill waiting to be discharged; the rest of its work runs every
-    /// [`Self::housekeeping_interval`].
+    /// How often the maintenance loop ticks. Every tick seals; the rest of
+    /// its work runs every [`Self::housekeeping_interval`].
     pub maintenance_interval: Duration,
     /// How often the maintenance loop runs its housekeeping (#273): stuck-seal
     /// recovery, the stale-claim, stale-worker and stale-drainer reclaims,
     /// segment retirement, tombstone collection and the segment-state gauge.
-    /// Sealing and the backfill discharge check stay on every
-    /// `maintenance_interval` tick, because a write waits on them; none of
-    /// these does. What the interval adds, at most: a stuck seal is recovered
+    /// Sealing stays on every `maintenance_interval` tick, because a write
+    /// waits on it; none of these does. What the interval adds, at most: a stuck seal is recovered
     /// `housekeeping_interval` later than its age gate, a dead worker's claim
     /// is reclaimed that much later than `reclaim_ttl`, and a tombstone, a
     /// drained segment's ring slot and the gauge lag by that much. A full ring
@@ -130,16 +128,13 @@ pub struct ClientOptions {
     pub housekeeping_interval: Duration,
     /// How often the maintenance loop re-derives the desired source-table
     /// set from the catalog (issue #14) and re-runs the capture reconcile
-    /// ([`capture::reconcile`]) and
-    /// [`intake::markers::run_pending_backfills`] against it — so a
-    /// transform registered while the client runs gets captured and
-    /// backfilled without a restart, and a table whose last reader was
-    /// dropped loses its capture triggers (issue #427). Coarser than
-    /// `maintenance_interval` by default: unlike seal/reclaim, this does a
-    /// catalog query and (when a table is newly read) a `CREATE TRIGGER`,
-    /// neither of which needs sub-second freshness. A freshly
-    /// parked backfill marker doesn't wait for it: the maintenance loop runs
-    /// the pass early when it sees one (issue #476).
+    /// ([`capture::reconcile`]) and the start of the builds it readies
+    /// against it — so a transform registered while the client runs gets
+    /// captured and backfilled without a restart, and a table whose last
+    /// reader was dropped loses its capture triggers (issue #427). Coarser
+    /// than `maintenance_interval` by default: unlike seal/reclaim, this does
+    /// a catalog query and (when a table is newly read) a `CREATE TRIGGER`,
+    /// neither of which needs sub-second freshness.
     pub reconcile_interval: Duration,
     /// The window [`staging::count_live_drainers`] uses to size a claim's
     /// share of a batch's buckets: a drain thread counts while its `drainers`
@@ -166,7 +161,7 @@ pub struct ClientOptions {
     /// The longest an idle app-worker task sits between looks at the queue
     /// (#273). A worker that finds nothing claimable, and nothing building,
     /// doubles its wait from [`Self::poll_interval`] up to this, because every
-    /// change that makes work claimable wakes it: a seal, a discharge and an
+    /// change that makes work claimable wakes it: a seal and an
     /// apply `NOTIFY` the wake channel, and the database announces build work
     /// (a chunk created, released, reclaimed or retried, a definition
     /// entering `backfilling`) on its own channel with triggers. The one edge
@@ -184,7 +179,7 @@ pub struct ClientOptions {
     /// ADR-0002): a segment share larger than this drains in pages of at most
     /// this many, each its own compute-and-apply transaction, so a worker's
     /// memory is bounded by this cap rather than by how large a segment grew
-    /// (a go-live re-read, or a backlog built while seal was refused).
+    /// (a backlog built while seal was refused).
     /// Several small sealed segments coalesce into one drain only while their
     /// ring rows sum to at most this. Defaults to
     /// [`staging::DEFAULT_DRAIN_BATCH_CAP`] (100,000); peak drain memory is
@@ -378,7 +373,7 @@ pub enum ClientError {
     Catalog(CatalogError),
     /// A failure from the staging ring (session guards, seal, liveness).
     Staging(StagingError),
-    /// A failure from a backfill marker's park or discharge.
+    /// A failure from rebuilding the readers of a table.
     Intake(IntakeError),
     /// A failure from apply (drain_once).
     Apply(ApplyError),
@@ -751,12 +746,6 @@ async fn run(
         }
     }
 
-    // The "staged-through" watermark a backfill enumeration waits on. Trigger
-    // capture (issue #622 C5) stages every change in its writer's own
-    // transaction, so every commit a snapshot can see is already in the ring:
-    // the watermark is always caught up, in every process of a fleet.
-    let watermark = staging::StagedWatermark::saturated();
-
     let mut maintenance_task = None;
     if let Some(session) = staging_session {
         let maintenance_config = MaintenanceConfig {
@@ -770,8 +759,6 @@ async fn run(
             reclaim_ttl: options.reclaim_ttl,
             drainer_window: options.drainer_window,
             reconcile_interval: options.reconcile_interval,
-            watermark,
-            backfill_catch_up_timeout: BACKFILL_CATCH_UP_TIMEOUT,
             held_key_retry: options.held_key_retry,
             drain_batch_cap: options.drain_batch_cap,
         };
@@ -1047,9 +1034,8 @@ mod worker_id_tests {
 // ---------------------------------------------------------------------
 
 /// Takes the staging-worker singleton and runs one capture reconcile pass
-/// ([`capture::reconcile::reconcile`], issue #622 C5), parking a marker for
-/// every definition the pass finds ready. The maintenance loop's first pass
-/// discharges them.
+/// ([`capture::reconcile::reconcile`], issue #622 C5) and starts the build
+/// of every definition the pass finds ready.
 ///
 /// Returns the [`ProducerSession`] that holds the singleton. The
 /// maintenance loop runs every step on it, and re-takes the singleton when it
@@ -1089,17 +1075,14 @@ async fn first_capture_pass(
 ) -> Result<(), ClientError> {
     let tables = defs::tables_to_capture(pool).await?;
     let deadline = Instant::now() + RECONCILE_DDL_BUDGET;
-    let mut outcome =
+    let outcome =
         capture::reconcile::reconcile(session.client_mut(), config.schema(), &tables, deadline)
             .await
             .map_err(capture_pass_error)?;
     release_retyped_keys(pool).await;
     release_upstream_rebuilt_keys(pool).await;
     complete_pause_cascades(pool).await;
-    let taken =
-        staging::build::start_ready_builds(session.client_mut(), pool, &outcome.ready).await?;
-    outcome.ready.retain(|id| !taken.contains(id));
-    intake::markers::park_ready_registration_markers(session.client(), &outcome.ready).await?;
+    staging::build::start_ready_builds(session.client_mut(), pool, &outcome.ready).await?;
     Ok(())
 }
 
@@ -1149,7 +1132,7 @@ pub(crate) fn capture_pass_error(err: CaptureError) -> ClientError {
     match err {
         CaptureError::Catalog(err) => ClientError::Catalog(err),
         CaptureError::Db(err) => ClientError::Db(err),
-        CaptureError::Marker(err) => ClientError::Intake(err),
+        CaptureError::Intake(err) => ClientError::Intake(err),
         // Not raised by a pass as a whole.
         other => ClientError::Config(crate::error::Error::Config(other.to_string())),
     }
@@ -1180,12 +1163,6 @@ struct MaintenanceConfig {
     /// least this long.
     drainer_window: Duration,
     reconcile_interval: Duration,
-    /// The staged-through watermark a backfill enumeration waits on before
-    /// staging (issue #312). Always caught up under trigger capture (issue
-    /// #622 C5), so the wait is a no-op; the discharge's fence wait stays.
-    watermark: staging::StagedWatermark,
-    /// [`BACKFILL_CATCH_UP_TIMEOUT`] outside tests.
-    backfill_catch_up_timeout: Duration,
     /// [`ClientOptions::held_key_retry`].
     held_key_retry: Option<HeldKeyRetry>,
     /// [`ClientOptions::drain_batch_cap`], the backlog bound the retry pass
@@ -1220,8 +1197,6 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
         reclaim_ttl,
         drainer_window,
         reconcile_interval,
-        watermark,
-        backfill_catch_up_timeout,
         held_key_retry,
         drain_batch_cap,
     } = config;
@@ -1255,9 +1230,6 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
     // reconciliation pass at that point, but this makes the loop's own
     // cadence not depend on when it happens to first observe `Instant::now()`.
     let mut next_reconcile = Instant::now();
-    // Issue #476: whether a fresh marker may pull the next reconcile pass
-    // forward. See [`early_pass_allowed`].
-    let mut early_pass = true;
 
     loop {
         if *shutdown_rx.borrow() {
@@ -1281,7 +1253,7 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
             // it here would keep the ring full for good.
             let ring_full = matches!(sealed, Err(StagingError::RingFull { .. }));
             let mut failed = failures.check("seal", sealed).is_err() && !ring_full;
-            // Issue #273: everything but the seal and the discharge check
+            // Issue #273: everything but the seal
             // runs on the housekeeping cadence, not every tick. See
             // [`HousekeepingSchedule`] for what each step's added latency is.
             let housekeeping_due = !failed && housekeeping.due(Instant::now());
@@ -1381,38 +1353,11 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                     Err(_) => failed = true,
                 }
             }
-            if !failed && early_pass && Instant::now() < next_reconcile {
-                // Issue #476: a marker nothing has fenced yet (a finished
-                // build's go-live catch-up, say) is discharged on this tick,
-                // not a whole `reconcile_interval` later.
-                let wanted = intake::markers::discharge_wanted(&*c).await;
-                match failures.check("discharge_wanted", wanted) {
-                    Ok(true) => next_reconcile = Instant::now(),
-                    Ok(false) => {}
-                    Err(_) => failed = true,
-                }
-            }
             if !failed && Instant::now() >= next_reconcile {
-                // A discharge can sit waiting for a fresh fence to settle
-                // (issue #431). The wait watches the shutdown signal itself
-                // and gives up by leaving the marker for the next start (see
-                // `run_pending_backfills_until`).
-                let shutting_down = || *shutdown_rx.borrow();
-                let started = Instant::now();
-                let reconciled = reconcile_source_tables(
-                    c,
-                    &pool,
-                    &schema,
-                    &wake_channel,
-                    &watermark,
-                    backfill_catch_up_timeout,
-                    &shutting_down,
-                )
-                .await;
+                let reconciled = reconcile_source_tables(c, &pool, &schema).await;
                 failed = failures
                     .check("reconcile_source_tables", reconciled)
                     .is_err();
-                early_pass = early_pass_allowed(started.elapsed(), backfill_catch_up_timeout);
                 next_reconcile = Instant::now() + reconcile_interval;
             }
             if failed {
@@ -1444,20 +1389,10 @@ pub async fn reconcile_pass(
     client: &mut tokio_postgres::Client,
     pool: &Pool,
     schema: &str,
-    wake_channel: &str,
-    catch_up_timeout: Duration,
 ) -> Result<(), String> {
-    reconcile_source_tables(
-        client,
-        pool,
-        schema,
-        wake_channel,
-        &staging::StagedWatermark::saturated(),
-        catch_up_timeout,
-        &|| false,
-    )
-    .await
-    .map_err(|err| err.to_string())
+    reconcile_source_tables(client, pool, schema)
+        .await
+        .map_err(|err| err.to_string())
 }
 
 /// Releases the staging-worker singleton on the server, if `session` holds
@@ -1481,23 +1416,6 @@ async fn release_singleton(session: Option<ProducerSession>) {
 /// maintenance loop is the only sealer, so this is also about the longest a
 /// pass holds up sealing on locks.
 const RECONCILE_DDL_BUDGET: Duration = Duration::from_secs(1);
-
-/// Whether [`maintenance_loop`] may run its next reconcile pass early, as
-/// soon as `intake::markers::discharge_wanted` finds a fresh marker
-/// (issue #476), given how long its last pass took.
-///
-/// A pass that took a whole `catch_up_timeout` spent it waiting on a fresh
-/// fence that a long transaction elsewhere in the cluster holds open. The
-/// loop is the only sealer, so it seals nothing meanwhile. Issue #431 bounds
-/// that stall to one timeout per pass, and passes used to come one
-/// `reconcile_interval` apart. Early passes don't, so markers
-/// parked one after another (a batch of builds finishing) behind such a
-/// transaction would each start a pass that waits it out, back to back, and
-/// sealing would all but stop. After a pass like that, the next one waits
-/// for the regular interval, as every pass did before #476.
-fn early_pass_allowed(last_pass: Duration, catch_up_timeout: Duration) -> bool {
-    last_pass < catch_up_timeout
-}
 
 /// The housekeeping interval [`maintenance_loop`] runs at: the configured
 /// one, but at most a sixth of `reclaim_ttl`, so a stale claim is reclaimed
@@ -1791,49 +1709,34 @@ impl From<IntakeError> for ReconcileError {
     }
 }
 
-/// How long one discharge pass waits for the fences it just took to settle
-/// (issue #431) before leaving their markers for a later pass. It runs this
-/// long only while a long transaction is open elsewhere in the cluster. The
-/// maintenance loop does no sealing meanwhile, so this is also the longest
-/// seal stall one pass can add. The value is a judgement call, not a
-/// measured bound.
-const BACKFILL_CATCH_UP_TIMEOUT: Duration = Duration::from_secs(5);
-
 /// Issue #14: re-derives the desired source-table set from the catalog
 /// ([`defs::tables_to_capture`]), brings every table's capture triggers to
-/// it ([`capture::reconcile::reconcile`], issue #622 C5), parks a marker for
-/// every newly registered definition whose capture is now current, and
-/// discharges the pending markers. Re-run periodically, so a transform
-/// registered while this client runs is picked up without a restart.
+/// it ([`capture::reconcile::reconcile`], issue #622 C5), and starts the
+/// build of every newly registered definition whose capture is now current
+/// ([`staging::build::start_ready_builds`]). Re-run periodically, so a
+/// transform registered while this client runs is picked up without a
+/// restart.
 ///
 /// Issue #427, ADR-0002: the catalog is the only input. A table's capture is
 /// uninstalled on the first pass after its last reader is dropped, and this
 /// is the only place that happens: a `DROP` removes catalog rows and nothing
 /// more.
 ///
-/// The capture pass runs before the discharge, on the same connection, so a
-/// definition is never dispatched before the install or widen its columns
-/// need (see `capture::install`'s "Widening and the capture gate"). The
-/// discharge dispatches only the definitions the pass found ready.
+/// The capture pass runs before the build starts, on the same connection, so
+/// a definition is never started before the install or widen its columns
+/// need (see `capture::install`'s "Widening and the capture gate"). Only the
+/// definitions the pass found ready are started.
 ///
 /// The pass gives locked tables [`RECONCILE_DDL_BUDGET`] in all, then leaves
-/// them for the next pass, which comes one `reconcile_interval` later. The
-/// discharge's watermark wait is a no-op (`watermark` is always caught up
-/// under trigger capture); its fence wait stays, because a marker on a
-/// seam-fed table still needs it (#622 plan finding 1).
-#[allow(clippy::too_many_arguments)]
+/// them for the next pass, which comes one `reconcile_interval` later.
 async fn reconcile_source_tables(
     client: &mut tokio_postgres::Client,
     pool: &Pool,
     schema: &str,
-    wake_channel: &str,
-    watermark: &staging::StagedWatermark,
-    catch_up_timeout: Duration,
-    stop: &(dyn Fn() -> bool + Sync),
 ) -> Result<(), ReconcileError> {
     let desired = defs::tables_to_capture(pool).await?;
     let deadline = Instant::now() + RECONCILE_DDL_BUDGET;
-    let mut outcome = capture::reconcile::reconcile(client, schema, &desired, deadline).await?;
+    let outcome = capture::reconcile::reconcile(client, schema, &desired, deadline).await?;
     release_retyped_keys(pool).await;
     release_upstream_rebuilt_keys(pool).await;
     complete_pause_cascades(pool).await;
@@ -1848,23 +1751,8 @@ async fn reconcile_source_tables(
             "couldn't schedule the queued partition corrections; trying again next pass"
         );
     }
-    // #625 F2/F3: a ready definition the Re-derive build takes gets no
-    // registration marker, and the discharge below doesn't dispatch it.
-    let taken = staging::build::start_ready_builds(client, pool, &outcome.ready).await?;
-    outcome.ready.retain(|id| !taken.contains(id));
-    intake::markers::park_ready_registration_markers(&*client, &outcome.ready).await?;
-    // The markers whose discharge failed are already logged and backed off on
-    // their own rows (issue #407). Only a failure of the pass itself errors,
-    // and costs this connection a reconnect.
-    intake::markers::run_pending_backfills_for(
-        client,
-        wake_channel,
-        watermark,
-        catch_up_timeout,
-        stop,
-        Some(&outcome.ready),
-    )
-    .await?;
+    // #625 F2/F3: a ready definition's Re-derive build starts here.
+    staging::build::start_ready_builds(client, pool, &outcome.ready).await?;
     Ok(())
 }
 
@@ -1997,10 +1885,7 @@ async fn wait_out_restore(
 /// releases the claim immediately (see [`staging::release_segments`]) rather
 /// than leaving it to the reclaim TTL, logs the error (see [`DrainFailures`]),
 /// then deregisters the heartbeat and continues: one bad batch never crashes
-/// the worker. A backfill chunk that
-/// fails to execute is released the same way (see [`drain_backfill_chunks`]),
-/// left for the reclaim-stale sweep or a retry by whichever worker claims it
-/// next.
+/// the worker.
 async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiver<bool>) {
     let AppWorkerConfig {
         pool,
@@ -2019,9 +1904,8 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
     } = config;
 
     // Captured before `heartbeat_config` is moved into `HeartbeatDaemon::spawn`
-    // below: `drain_backfill_chunks` needs this same cadence for its own
-    // per-chunk-claim heartbeat (see its doc comment) — a chunk write and a
-    // segment drain should heartbeat at the same margin under `reclaim_ttl`.
+    // below: a build chunk's claim heartbeats at the same margin under
+    // `reclaim_ttl` as a segment drain.
     let chunk_heartbeat_interval = heartbeat_config.interval;
     let build_options = staging::build::WorkerOptions {
         chunk_rows: build_chunk_rows,
@@ -2069,14 +1953,7 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
                 // failed): build work comes next (#625 B6). Only actually
                 // wait if it made no progress — otherwise loop straight
                 // back around without an idle wait.
-                let step = build_step(
-                    &pool,
-                    &claimed_by,
-                    chunk_heartbeat_interval,
-                    reclaim_ttl,
-                    &build_options,
-                )
-                .await;
+                let step = build_step(&pool, &claimed_by, &build_options).await;
                 // Only here is the worker idle: no segment to look at (a
                 // lookup that failed found nothing out, so it isn't "none")
                 // and, when the probe is answered, no build work either.
@@ -2157,14 +2034,7 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
         // there takes build work instead.
         let build_progress = !drained
             && matches!(
-                build_step(
-                    &pool,
-                    &claimed_by,
-                    chunk_heartbeat_interval,
-                    reclaim_ttl,
-                    &build_options,
-                )
-                .await,
+                build_step(&pool, &claimed_by, &build_options).await,
                 BuildStep::Progress
             );
         backoff.reset();
@@ -2192,19 +2062,16 @@ enum BuildStep {
 }
 
 /// A drain worker's build work for one pass of its loop, after its segments
-/// (#625 B6, global since F3): one old-build chunk (a plain 1-1 range or a
-/// direct-build job, [`drain_backfill_chunks`]), then one step of the
-/// Re-derive builds' work ([`rederive_build_step`]).
+/// (#625 B6, global since F3): one step of the Re-derive builds' work
+/// ([`rederive_build_step`]).
 async fn build_step(
     pool: &Pool,
     claimed_by: &str,
-    chunk_heartbeat_interval: Duration,
-    reclaim_ttl: Duration,
     build_options: &staging::build::WorkerOptions,
 ) -> BuildStep {
-    // One probe when there is nothing to do (#273): the two steps below
-    // would each look, on every idle wake. An error is not "nothing": run
-    // the steps, which report their own.
+    // One probe when there is nothing to do (#273): the step below would look
+    // on every idle wake. An error is not "nothing": run the step, which
+    // reports its own.
     if let Ok(probe) = staging::build::work_probe(pool).await
         && !probe.may_exist
     {
@@ -2212,9 +2079,7 @@ async fn build_step(
             next_due: probe.next_due,
         };
     }
-    let old = drain_backfill_chunks(pool, claimed_by, chunk_heartbeat_interval, reclaim_ttl).await;
-    let rederive = rederive_build_step(pool, claimed_by, build_options).await;
-    if old || rederive {
+    if rederive_build_step(pool, claimed_by, build_options).await {
         BuildStep::Progress
     } else {
         BuildStep::Waiting
@@ -2558,69 +2423,6 @@ async fn drainer_registration_pass(pool: &Pool, workers: &LiveWorkers) {
     }
 }
 
-/// Claims one pending direct-build backfill chunk (`defs::chunk_queue`,
-/// ADR-0002) and executes it, marking it done
-/// (flipping its definition `backfilling` -> `live` once every chunk is done
-/// — see `chunk_queue::finish_chunk`) or, on a write error, giving it up at
-/// once through `chunk_queue::fail_chunk`, which records and logs the
-/// failure and retries, narrows or pauses (#616) — the same "release on
-/// error rather than wait out the TTL" discipline [`app_worker_loop`]'s
-/// segment path uses.
-/// Returns whether it claimed anything, so the caller's own idle-wait
-/// decision treats a tick that only did backfill work as progress too.
-///
-/// `heartbeat_interval` is threaded straight through to
-/// [`chunk_queue::run_claimed_chunk`] — this app-worker's own
-/// [`HeartbeatDaemonConfig::interval`] (the same cadence its segment claims
-/// heartbeat at), so a chunk write outliving `reclaim_ttl` isn't falsely
-/// reclaimed mid-write (see `chunk_queue::run_claimed_chunk`'s doc comment).
-///
-/// Exactly one chunk per call, because that heartbeat only covers the chunk
-/// that is executing. This used to claim a batch of up to four and run them
-/// one after another, so every chunk queued behind the running one sat
-/// claimed with no refresh at all. Once the running chunk took longer than
-/// `reclaim_ttl`, a peer's sweep reclaimed the queued ones and ran them too,
-/// and this worker's own completion of them was discarded (`finish_chunk`
-/// is scoped to the current claimant). Claiming one at a time costs nothing:
-/// the caller loops straight back around after any backfill progress, and a
-/// peer can pick up the next chunk in the meantime.
-async fn drain_backfill_chunks(
-    pool: &Pool,
-    claimed_by: &str,
-    heartbeat_interval: Duration,
-    reclaim_ttl: Duration,
-) -> bool {
-    let claimed = match pool.get().await {
-        Ok(client) => chunk_queue::claim_chunks(&**client, claimed_by, 1).await,
-        Err(err) => Err(err.into()),
-    };
-    let Some(chunk) = claimed.ok().and_then(|chunks| chunks.into_iter().next()) else {
-        return false;
-    };
-
-    match chunk_queue::run_claimed_chunk(pool, &chunk, claimed_by, heartbeat_interval, reclaim_ttl)
-        .await
-    {
-        Ok(()) => {
-            let _ = chunk_queue::finish_chunk(pool, &chunk, claimed_by).await;
-        }
-        // `fail_chunk` logs the failure and what it did about it (#616).
-        Err(err) => {
-            if let Err(fail_err) = chunk_queue::fail_chunk(pool, &chunk, claimed_by, &err).await {
-                crate::instance_log::warn!(
-                    definition_id = chunk.definition_id,
-                    chunk_id = chunk.id,
-                    error = %err,
-                    record_error = %fail_err,
-                    "backfill chunk failed, and recording the failure failed too; the \
-                     stale-claim sweep frees the chunk for a retry"
-                );
-            }
-        }
-    }
-    true
-}
-
 /// Waits for a wake notification, the poll-interval floor, or shutdown —
 /// whichever comes first.
 ///
@@ -2699,14 +2501,14 @@ struct WakeListener {
 }
 
 impl WakeListener {
-    /// Hears the engine's `channel` (seals, discharges, applies) and the
+    /// Hears the engine's `channel` (seals, applies) and the
     /// database's work channel (migration V86).
     fn spawn(dsn: String, schema: String, channel: String) -> Self {
         Self::spawn_on(dsn, schema, Some(channel))
     }
 
     /// Hears the work channel alone: for a worker whose work no seal,
-    /// discharge or apply makes claimable, so a steady stream of those would
+    /// or apply makes claimable, so a steady stream of those would
     /// only wake it to find nothing (the `self_check` worker, #1075).
     fn spawn_work_only(dsn: String, schema: String) -> Self {
         Self::spawn_on(dsn, schema, None)
@@ -3177,18 +2979,6 @@ mod maintenance_failure_tests {
     use super::log_capture::{CapturedEvent, install_capture};
     use super::*;
 
-    /// Issue #476: a pass that ran out a whole catch-up timeout (a fence a
-    /// long transaction holds) sends the next one back to the regular
-    /// interval, so fresh markers can't start waiting passes back to back
-    /// while the loop seals nothing.
-    #[test]
-    fn a_pass_that_ran_out_its_timeout_suspends_early_passes() {
-        let timeout = Duration::from_secs(5);
-        assert!(early_pass_allowed(Duration::from_millis(40), timeout));
-        assert!(!early_pass_allowed(timeout, timeout));
-        assert!(!early_pass_allowed(Duration::from_secs(6), timeout));
-    }
-
     /// Issue #273: housekeeping runs on the first tick, then once per
     /// interval, and a failed pass is retried on the next tick.
     #[test]
@@ -3396,8 +3186,6 @@ mod maintenance_failure_tests {
             reclaim_ttl: Duration::from_secs(30),
             drainer_window: staging::DEFAULT_DRAINER_WINDOW,
             reconcile_interval: Duration::from_secs(3600),
-            watermark: staging::StagedWatermark::new(),
-            backfill_catch_up_timeout: Duration::from_secs(1),
             held_key_retry: None,
             drain_batch_cap: staging::DEFAULT_DRAIN_BATCH_CAP,
         };
@@ -3478,8 +3266,6 @@ mod maintenance_failure_tests {
             reclaim_ttl: Duration::from_secs(30),
             drainer_window: staging::DEFAULT_DRAINER_WINDOW,
             reconcile_interval: Duration::from_secs(3600),
-            watermark: staging::StagedWatermark::new(),
-            backfill_catch_up_timeout: Duration::from_secs(1),
             held_key_retry: None,
             drain_batch_cap: staging::DEFAULT_DRAIN_BATCH_CAP,
         };
@@ -3577,8 +3363,6 @@ mod maintenance_failure_tests {
             reclaim_ttl: Duration::from_secs(6 * 3600),
             drainer_window: staging::DEFAULT_DRAINER_WINDOW,
             reconcile_interval: Duration::from_secs(3600),
-            watermark: staging::StagedWatermark::new(),
-            backfill_catch_up_timeout: Duration::from_secs(1),
             held_key_retry: None,
             drain_batch_cap: staging::DEFAULT_DRAIN_BATCH_CAP,
         };
@@ -3925,797 +3709,6 @@ mod option_validation_tests {
 }
 
 #[cfg(test)]
-mod backfill_chunk_claim_tests {
-    use super::*;
-    use std::collections::HashMap;
-
-    use crate::defs::ast::ValueType;
-
-    /// A backfill chunk is heartbeated only while it runs, so a worker must
-    /// never hold a claim on a chunk it isn't running yet. The old code
-    /// claimed up to four at once and ran them in turn, and the queued ones
-    /// went stale and were reclaimed by a peer while the first was still
-    /// running (see [`drain_backfill_chunks`]'s doc comment).
-    ///
-    /// Checked deterministically with an advisory-lock gate rather than a
-    /// timing budget: a statement trigger on the target blocks the first
-    /// chunk's write on a lock this test holds. While the write is parked
-    /// there, exactly one chunk may be claimed.
-    #[tokio::test]
-    async fn a_worker_claims_only_the_chunk_it_is_running() {
-        const GATE: i64 = 0x7472_6c73;
-
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        // Same-crate pool; see apply.rs's metrics test for why testkit's own
-        // `db.pool` is a different type here.
-        let pool_config =
-            crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid schema");
-        let pool = Pool::new(&pool_config).expect("build a same-crate pool");
-        let (raw, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
-            .await
-            .expect("connect");
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
-        raw.batch_execute(&format!(
-            "set search_path to {}, public",
-            crate::config::DEFAULT_SCHEMA
-        ))
-        .await
-        .expect("set search_path");
-
-        // One row over the 50k-row chunk size: the smallest table that
-        // plans two chunks.
-        raw.batch_execute(
-            "create table public.gated (id bigint primary key, price numeric); \
-             insert into public.gated select g, g from generate_series(1, 50001) g",
-        )
-        .await
-        .expect("seed source");
-        // A seam-fed source keeps the old chunked build (#625 F8a).
-        crate::intake::markers::feed_from_a_test_definition(&raw, "public.gated")
-            .await
-            .expect("make gated another definition's target");
-        let columns = HashMap::from([
-            ("id".to_string(), ValueType::Numeric),
-            ("price".to_string(), ValueType::Numeric),
-        ]);
-        let def = defs::install_definition(
-            &pool,
-            "TRANSFORM gated_calc FROM gated SELECT price + price AS double_price",
-            &columns,
-            "public",
-        )
-        .await
-        .expect("install_definition");
-        // Registration only records it; the discharge plans the chunks.
-        crate::intake::markers::discharge_registrations(&pool)
-            .await
-            .expect("dispatch the build");
-        let chunk_count: i64 = raw
-            .query_one(
-                "select count(*) from backfill_chunks where definition_id = $1",
-                &[&def.id],
-            )
-            .await
-            .expect("count chunks")
-            .get(0);
-        assert_eq!(chunk_count, 2, "the gate test needs two planned chunks");
-
-        raw.batch_execute(&format!(
-            "create function public.gated_calc_gate() returns trigger language plpgsql as $$ \
-             begin perform pg_advisory_xact_lock({GATE}); return null; end $$; \
-             create trigger gated_calc_gate before insert on public.gated_calc \
-             for each statement execute function public.gated_calc_gate(); \
-             select pg_advisory_lock({GATE});"
-        ))
-        .await
-        .expect("install the write gate and close it");
-
-        let worker_pool = pool.clone();
-        let worker = tokio::spawn(async move {
-            drain_backfill_chunks(
-                &worker_pool,
-                "gated-worker",
-                Duration::from_secs(5),
-                Duration::from_secs(60),
-            )
-            .await
-        });
-
-        // Wait for the chunk write to park on the gate: an event, not a
-        // convergence budget. The bound only turns a hang into a failure.
-        let deadline = Instant::now() + Duration::from_secs(60);
-        loop {
-            let parked: bool = raw
-                .query_one(
-                    "select exists(select 1 from pg_locks \
-                     where locktype = 'advisory' and not granted)",
-                    &[],
-                )
-                .await
-                .expect("read pg_locks")
-                .get(0);
-            if parked {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the chunk write never reached the gate"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-
-        let claimed: Vec<Option<String>> = raw
-            .query(
-                "select claimed_by from backfill_chunks where definition_id = $1 order by id",
-                &[&def.id],
-            )
-            .await
-            .expect("read claims")
-            .into_iter()
-            .map(|row| row.get(0))
-            .collect();
-        assert_eq!(
-            claimed,
-            vec![Some("gated-worker".to_string()), None],
-            "while one chunk is running, the other must stay unclaimed for a peer to take"
-        );
-
-        raw.batch_execute(&format!("select pg_advisory_unlock({GATE})"))
-            .await
-            .expect("open the gate");
-        assert!(
-            worker.await.expect("worker task"),
-            "the call claimed and ran a chunk"
-        );
-
-        let states: Vec<(bool, Option<String>)> = raw
-            .query(
-                "select done, claimed_by from backfill_chunks where definition_id = $1 order by id",
-                &[&def.id],
-            )
-            .await
-            .expect("read chunk states")
-            .into_iter()
-            .map(|row| (row.get(0), row.get(1)))
-            .collect();
-        assert_eq!(
-            states,
-            vec![(true, None), (false, None)],
-            "one call finishes exactly the chunk it claimed"
-        );
-
-        assert!(
-            drain_backfill_chunks(
-                &pool,
-                "gated-worker",
-                Duration::from_secs(5),
-                Duration::from_secs(60)
-            )
-            .await
-        );
-        assert!(
-            !drain_backfill_chunks(
-                &pool,
-                "gated-worker",
-                Duration::from_secs(5),
-                Duration::from_secs(60)
-            )
-            .await,
-            "nothing is left to claim"
-        );
-        let status: String = raw
-            .query_one(
-                "select status from transform_definitions where id = $1",
-                &[&def.id],
-            )
-            .await
-            .expect("read status")
-            .get(0);
-        assert_eq!(status, "catching_up", "the build finished");
-    }
-}
-
-#[cfg(test)]
-mod backfill_chunk_failure_tests {
-    //! #616: a backfill chunk that fails says so, and stops retrying blindly.
-    //! Each test drives the chunks itself, one [`drain_backfill_chunks`] call
-    //! at a time, and makes a backed-off chunk due by hand rather than
-    //! waiting for it.
-
-    use super::log_capture::install_capture;
-    use super::*;
-    use std::collections::HashMap;
-    use std::time::SystemTime;
-
-    use crate::app::{Trellis, TrellisOptions};
-    use crate::defs::ast::ValueType;
-    use crate::defs::model::TransformStatus;
-    use crate::integer::IntWidth;
-
-    pub(super) const WORKER: &str = "issue-616-worker";
-
-    pub(super) struct Fixture {
-        _cluster: testkit::TestCluster,
-        _db: testkit::TestDatabase,
-        pub(super) pool: Pool,
-        pub(super) raw: tokio_postgres::Client,
-        trellis: Trellis,
-        pub(super) id: i64,
-    }
-
-    /// Seeds `public.nums` with `rows` rows (`x = id`, except `x = bad_x` at
-    /// `bad_id`) and registers `TRANSFORM doubles FROM nums SELECT x + x`
-    /// over it, its build dispatched onto the chunk queue.
-    pub(super) async fn seed(rows: i64, bad: Option<(i64, i32)>) -> Fixture {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let config = crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid schema");
-        let pool = Pool::new(&config).expect("build a same-crate pool");
-        let trellis = Trellis::connect(config, TrellisOptions::default())
-            .await
-            .expect("connect");
-        let (raw, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
-            .await
-            .expect("connect");
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
-        raw.batch_execute(&format!(
-            "set search_path to {}, public; \
-             create table public.nums (id bigint primary key, x integer); \
-             insert into public.nums select g, g from generate_series(1, {rows}) g",
-            crate::config::DEFAULT_SCHEMA
-        ))
-        .await
-        .expect("seed source");
-        if let Some((bad_id, bad_x)) = bad {
-            raw.execute(
-                "update public.nums set x = $2 where id = $1",
-                &[&bad_id, &bad_x],
-            )
-            .await
-            .expect("seed the bad row");
-        }
-        // The old chunked build these tests exercise is a seam-fed
-        // source's since #625 F8a (over a captured table, a plain 1-1 is
-        // the Re-derive build's, whose failures `staging::build`'s own
-        // tests cover).
-        crate::intake::markers::feed_from_a_test_definition(&raw, "public.nums")
-            .await
-            .expect("make nums another definition's target");
-        let columns = HashMap::from([
-            ("id".to_string(), ValueType::Integer(IntWidth::Int8)),
-            ("x".to_string(), ValueType::Integer(IntWidth::Int4)),
-        ]);
-        let def = defs::install_definition(
-            &pool,
-            "TRANSFORM doubles FROM nums SELECT x + x AS doubled",
-            &columns,
-            "public",
-        )
-        .await
-        .expect("install_definition");
-        crate::intake::markers::discharge_registrations(&pool)
-            .await
-            .expect("dispatch the build");
-        Fixture {
-            _cluster: cluster,
-            _db: db,
-            pool,
-            raw,
-            trellis,
-            id: def.id,
-        }
-    }
-
-    impl Fixture {
-        async fn drain_one(&self) -> bool {
-            drain_backfill_chunks(
-                &self.pool,
-                WORKER,
-                Duration::from_secs(5),
-                Duration::from_secs(60),
-            )
-            .await
-        }
-
-        /// Runs chunks until none is claimable, failing the test if that
-        /// takes more than `bound` calls.
-        async fn drain_all(&self, bound: usize) -> usize {
-            for calls in 0..bound {
-                if !self.drain_one().await {
-                    return calls;
-                }
-            }
-            panic!("the chunk queue still had claimable work after {bound} runs");
-        }
-
-        /// Makes every backed-off chunk due now.
-        async fn make_due(&self) {
-            self.raw
-                .execute(
-                    "update backfill_chunks set next_attempt_at = now() where definition_id = $1",
-                    &[&self.id],
-                )
-                .await
-                .expect("make the chunks due");
-        }
-
-        async fn status(&self) -> crate::app::DefinitionStatus {
-            self.trellis
-                .status("doubles")
-                .await
-                .expect("status")
-                .expect("the definition exists")
-        }
-
-        async fn chunk(&self) -> (i32, i32, bool, Option<String>) {
-            let row = self
-                .raw
-                .query_one(
-                    "select attempts, charged, next_attempt_at > now(), claimed_by \
-                     from backfill_chunks where definition_id = $1 and not done",
-                    &[&self.id],
-                )
-                .await
-                .expect("one undone chunk");
-            (row.get(0), row.get(1), row.get(2), row.get(3))
-        }
-    }
-
-    /// #616's repro: a plain 1-1 build over a source larger than one chunk,
-    /// whose `x + x` overflows on one row. It used to retry that chunk
-    /// forever, silently, with the definition stuck in `backfilling`. Now
-    /// the failure is on the definition's status and in a warn line while
-    /// the chunk narrows itself to the key, the key is quarantined, and the
-    /// build finishes without it.
-    #[tokio::test]
-    async fn a_chunk_that_fails_on_its_data_quarantines_the_key_and_the_build_finishes() {
-        let f = seed(50_001, Some((30_000, i32::MAX))).await;
-        let (_guard, captured) = install_capture();
-
-        assert!(f.drain_one().await, "the first chunk ran");
-        let status = f.status().await;
-        assert_eq!(status.status, TransformStatus::Backfilling);
-        let failure = status
-            .backfill_failure
-            .expect("the failing chunk is on the status");
-        assert!(
-            failure.last_error.contains("out of range"),
-            "{}",
-            failure.last_error
-        );
-        assert_eq!(failure.source_table, "public.nums");
-        assert_eq!(failure.attempts, 1);
-
-        let runs = f.drain_all(200).await;
-        assert!(runs > 0);
-
-        let status = f.status().await;
-        assert_eq!(
-            status.status,
-            TransformStatus::CatchingUp,
-            "the build finished without the key"
-        );
-        assert_eq!(status.backfill_failure, None, "no chunk is left failing");
-        crate::intake::markers::discharge_registrations(&f.pool)
-            .await
-            .expect("discharge the go-live catch-up");
-        assert_eq!(f.status().await.status, TransformStatus::Live);
-        let target = f
-            .raw
-            .query_one(
-                "select count(*), count(*) filter (where id = 30000), \
-                        count(*) filter (where doubled = 2 * id) \
-                 from public.doubles",
-                &[],
-            )
-            .await
-            .expect("read the target");
-        assert_eq!(target.get::<_, i64>(0), 50_000);
-        assert_eq!(target.get::<_, i64>(1), 0, "the failing key is left out");
-        assert_eq!(target.get::<_, i64>(2), 50_000);
-
-        let quarantined = f
-            .trellis
-            .sample_quarantined("doubles", None, 10)
-            .await
-            .expect("sample the quarantined keys");
-        assert_eq!(quarantined.len(), 1);
-        assert_eq!(quarantined[0].key, "30000");
-        assert!(quarantined[0].error_message.contains("out of range"));
-        let parked: Vec<(i64, Option<String>)> = f
-            .raw
-            .query(
-                "select seg_seq, old_image::text from poison_held where key = '30000'",
-                &[],
-            )
-            .await
-            .expect("read the parked re-derive")
-            .into_iter()
-            .map(|row| (row.get(0), row.get(1)))
-            .collect();
-        assert_eq!(
-            parked,
-            vec![(crate::staging::quarantine::BUILD_PARK_SEG_SEQ, None)],
-            "a release re-derives the key"
-        );
-
-        let events = captured.0.lock().unwrap().clone();
-        let warned = |message: &str| {
-            events.iter().any(|event| {
-                event.level == tracing::Level::WARN
-                    && event
-                        .fields
-                        .get("message")
-                        .is_some_and(|m| m.contains(message))
-                    && event.fields.get("definition_id") == Some(&f.id.to_string())
-            })
-        };
-        assert!(warned("split it in two"), "{events:#?}");
-        assert!(warned("quarantined the key"), "{events:#?}");
-    }
-
-    /// #616: a transient failure (here a serialization failure a trigger on
-    /// the target raises) is retried after a backoff and charged nothing.
-    #[tokio::test]
-    async fn a_transient_chunk_failure_is_retried_after_a_backoff_without_a_charge() {
-        let f = seed(3, None).await;
-        f.raw
-            .batch_execute(
-                "create function public.doubles_conflict() returns trigger language plpgsql as $$ \
-                 begin raise exception 'conflict' using errcode = 'serialization_failure'; end $$; \
-                 create trigger doubles_conflict before insert on public.doubles \
-                 for each statement execute function public.doubles_conflict()",
-            )
-            .await
-            .expect("make the write conflict");
-
-        assert!(f.drain_one().await);
-        assert_eq!(
-            f.chunk().await,
-            (1, 0, true, None),
-            "one failure, uncharged, backed off, unclaimed"
-        );
-        assert!(!f.drain_one().await, "the chunk isn't due yet");
-        let status = f.status().await;
-        assert_eq!(status.status, TransformStatus::Backfilling);
-        let failure = status.backfill_failure.expect("the failure is reported");
-        assert!(failure.last_error.contains("conflict"));
-        assert!(failure.next_attempt_at > SystemTime::now());
-
-        f.raw
-            .batch_execute("drop trigger doubles_conflict on public.doubles")
-            .await
-            .expect("end the conflict");
-        f.make_due().await;
-        assert_eq!(f.drain_all(5).await, 1);
-        let status = f.status().await;
-        assert_eq!(status.status, TransformStatus::CatchingUp);
-        assert_eq!(status.backfill_failure, None);
-    }
-
-    /// #616: a failure that says nothing about any row (here the target
-    /// lost the column the build writes) is retried and charged, and its
-    /// last charge pauses the definition with the error on its status. The
-    /// resume clears it and rebuilds.
-    #[tokio::test]
-    async fn a_chunk_failure_that_cannot_be_narrowed_pauses_the_definition() {
-        let f = seed(3, None).await;
-        f.raw
-            .batch_execute("alter table public.doubles drop column doubled")
-            .await
-            .expect("break the target");
-
-        for charge in 1..chunk_queue::MAX_CHARGED_ATTEMPTS {
-            f.make_due().await;
-            assert!(f.drain_one().await);
-            assert_eq!(f.chunk().await, (charge, charge, true, None));
-            assert_eq!(f.status().await.status, TransformStatus::Backfilling);
-        }
-        f.make_due().await;
-        assert!(f.drain_one().await);
-
-        let status = f.status().await;
-        assert_eq!(status.status, TransformStatus::Paused);
-        let failure = status
-            .backfill_failure
-            .expect("the pause carries the error");
-        assert!(
-            failure.last_error.contains("doubled"),
-            "{}",
-            failure.last_error
-        );
-        assert_eq!(
-            failure.attempts,
-            u32::try_from(chunk_queue::MAX_CHARGED_ATTEMPTS).unwrap()
-        );
-        f.make_due().await;
-        assert!(
-            !f.drain_one().await,
-            "a paused definition's chunk isn't claimed"
-        );
-
-        crate::staging::quarantine::resume_transform(&f.pool, "doubles")
-            .await
-            .expect("resume");
-        let status = f.status().await;
-        assert_eq!(status.status, TransformStatus::WaitingToBackfill);
-        assert_eq!(
-            status.backfill_failure, None,
-            "the resume clears the failure"
-        );
-    }
-
-    /// #616: a key the build quarantined and the operator released while
-    /// the definition is still `backfilling` reaches the target. The
-    /// release's re-derive drains before the definition applies anything,
-    /// so the drain skips it for this definition, and the chunk that held
-    /// the key has already finished without it. The go-live catch-up's
-    /// enumeration is what writes it.
-    #[tokio::test]
-    async fn a_key_released_while_its_build_runs_reaches_the_target() {
-        // The failing key is the lowest, so each split keeps it in the
-        // first chunk, which is also the next one claimed (by id).
-        let mut f = seed(20, Some((1, i32::MAX))).await;
-        let mut quarantined = false;
-        for _ in 0..20 {
-            let chunk = chunk_queue::claim_chunks(&f.raw, WORKER, 1)
-                .await
-                .expect("claim")
-                .pop()
-                .expect("a claimable chunk");
-            let err = chunk_queue::run_claimed_chunk(
-                &f.pool,
-                &chunk,
-                WORKER,
-                Duration::from_secs(5),
-                Duration::from_secs(60),
-            )
-            .await;
-            match err {
-                Ok(()) => chunk_queue::finish_chunk(&f.pool, &chunk, WORKER)
-                    .await
-                    .expect("finish"),
-                Err(err) => {
-                    let outcome = chunk_queue::fail_chunk(&f.pool, &chunk, WORKER, &err)
-                        .await
-                        .expect("fail the chunk");
-                    if matches!(outcome, chunk_queue::ChunkFailure::Quarantined { .. }) {
-                        quarantined = true;
-                        break;
-                    }
-                }
-            }
-        }
-        assert!(quarantined, "the build narrowed its failure to key 1");
-        // The chunk that held the key runs again without it and finishes,
-        // while the upper halves of its splits are still to run.
-        assert!(f.drain_one().await);
-        let held: i64 = f
-            .raw
-            .query_one(
-                "select count(*) from backfill_chunks where definition_id = $1 and not done",
-                &[&f.id],
-            )
-            .await
-            .expect("count the chunks left")
-            .get(0);
-        assert!(held > 0, "the build isn't finished");
-        assert_eq!(f.status().await.status, TransformStatus::Backfilling);
-
-        f.raw
-            .execute("update public.nums set x = 1 where id = 1", &[])
-            .await
-            .expect("fix the row");
-        crate::staging::quarantine::release_key(&f.pool, "doubles", "public.nums", "1")
-            .await
-            .expect("release the key");
-        drain_ring(&f.pool, &mut f.raw).await;
-        assert_eq!(f.status().await.status, TransformStatus::Backfilling);
-
-        f.drain_all(20).await;
-        assert_eq!(f.status().await.status, TransformStatus::CatchingUp);
-        let built: i64 = f
-            .raw
-            .query_one("select count(*) from public.doubles where id = 1", &[])
-            .await
-            .expect("read the target")
-            .get(0);
-        assert_eq!(built, 0, "neither the release nor the build wrote the key");
-        crate::intake::markers::discharge_registrations(&f.pool)
-            .await
-            .expect("discharge the go-live catch-up");
-        assert_eq!(f.status().await.status, TransformStatus::Live);
-        drain_ring(&f.pool, &mut f.raw).await;
-
-        let target = f
-            .raw
-            .query_one(
-                "select count(*), count(*) filter (where id = 1 and doubled = 2) \
-                 from public.doubles",
-                &[],
-            )
-            .await
-            .expect("read the target");
-        assert_eq!(target.get::<_, i64>(0), 20);
-        assert_eq!(target.get::<_, i64>(1), 1, "the released key is built");
-    }
-
-    /// Seals and drains the ring until nothing is pending: a bounded loop,
-    /// not a convergence wait.
-    async fn drain_ring(pool: &Pool, client: &mut tokio_postgres::Client) {
-        for _ in 0..16 {
-            let outcome = staging::seal::seal_phase1(client)
-                .await
-                .expect("seal phase 1");
-            staging::seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
-                .await
-                .expect("seal phase 2");
-            while staging::apply::drain_once(pool, outcome.sealed_seg_seq, WORKER, 1, "wake")
-                .await
-                .expect("drain_once")
-                .is_some()
-            {}
-            staging::retire_drained_segments(client)
-                .await
-                .expect("retire drained segments");
-            if !staging::has_pending(client).await.expect("has_pending") {
-                return;
-            }
-        }
-        panic!("the ring did not drain within 16 seal/drain rounds");
-    }
-}
-
-#[cfg(test)]
-mod backfill_shutdown_tests {
-    use super::*;
-    use crate::config::DEFAULT_SCHEMA;
-    use crate::defs::ast::ValueType;
-    use crate::defs::model::TransformStatus;
-
-    async fn status_of(client: &tokio_postgres::Client) -> TransformStatus {
-        let text: String = client
-            .query_one(
-                "select status from transform_definitions where target_table = 'public.t'",
-                &[],
-            )
-            .await
-            .expect("query status")
-            .get(0);
-        TransformStatus::from_persisted(&text).expect("known status")
-    }
-
-    /// Issue #312 review, restated for trigger capture (issue #622 C5):
-    /// shutting down while a discharge waits must leave its definition
-    /// `waiting_to_backfill` with its marker intact, since only
-    /// `waiting_to_backfill` definitions are ever dispatched again. The wait
-    /// is now the fresh fence's (issue #431), pinned by a transaction left
-    /// open; the catch-up timeout is far longer than the test waits for
-    /// shutdown, so only the shutdown signal can end it.
-    #[tokio::test]
-    async fn shutdown_during_a_backfill_wait_returns_the_definition_to_waiting() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let raw = connect_plain(db.dsn(), DEFAULT_SCHEMA)
-            .await
-            .expect("connect");
-        raw.batch_execute(
-            "create table public.s (id bigint primary key, a numeric); \
-             insert into public.s (id, a) select g, g from generate_series(1, 5) g;",
-        )
-        .await
-        .expect("seed source table");
-
-        // `testkit`'s pool is the published crate's `Pool`, a different type
-        // from this `--lib` build's own, so build one from the same DSN.
-        let pool = crate::pool::Pool::new(
-            &crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid config"),
-        )
-        .expect("build a same-crate pool");
-        let columns = std::collections::HashMap::from([
-            ("id".to_string(), ValueType::Numeric),
-            ("a".to_string(), ValueType::Numeric),
-        ]);
-        // The old build's 1-1 waits on the discharge's fence; a plain 1-1
-        // is the Re-derive build's, which takes no fence (#625 F8a), so the
-        // source is held out of it.
-        crate::intake::markers::hold_out_of_the_rederive_build(&raw, "public.s")
-            .await
-            .expect("hold s's definitions out of the Re-derive build");
-        crate::defs::install_definition(
-            &pool,
-            "TRANSFORM t FROM s SELECT a + 1 AS f",
-            &columns,
-            "public",
-        )
-        .await
-        .expect("register");
-        assert_eq!(status_of(&raw).await, TransformStatus::WaitingToBackfill);
-
-        // An open transaction pins the fence the first pass takes on the
-        // join marker its capture install parks.
-        let straggler = testkit::crash::OpenTransaction::begin(db.dsn()).await;
-        straggler.execute("select txid_current()").await;
-
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let config = MaintenanceConfig {
-            dsn: db.dsn().to_string(),
-            schema: DEFAULT_SCHEMA.to_string(),
-            pool,
-            session: ProducerSession::connect(db.dsn(), DEFAULT_SCHEMA)
-                .await
-                .expect("take the staging-worker singleton"),
-            wake_channel: "wake".to_string(),
-            interval: Duration::from_millis(50),
-            housekeeping_interval: Duration::from_secs(5),
-            reclaim_ttl: Duration::from_secs(30),
-            drainer_window: staging::DEFAULT_DRAINER_WINDOW,
-            reconcile_interval: Duration::from_secs(3600),
-            watermark: staging::StagedWatermark::saturated(),
-            backfill_catch_up_timeout: Duration::from_secs(600),
-            held_key_retry: None,
-            drain_batch_cap: staging::DEFAULT_DRAIN_BATCH_CAP,
-        };
-        let task = tokio::spawn(maintenance_loop(config, shutdown_rx));
-
-        // The first pass installs capture, parks the join marker and fences
-        // it, then waits on the fence: an event (the recorded fence), not a
-        // convergence budget. The bound only turns a hang into a failure.
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            let fenced: bool = raw
-                .query_one(
-                    "select exists(select 1 from pending_backfill \
-                     where table_name = 'public.s' and fence_xid is not null)",
-                    &[],
-                )
-                .await
-                .expect("read the marker")
-                .get(0);
-            if fenced {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the first maintenance pass never fenced the join marker"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert_eq!(status_of(&raw).await, TransformStatus::WaitingToBackfill);
-
-        shutdown_tx.send(true).expect("signal shutdown");
-        tokio::time::timeout(Duration::from_secs(30), task)
-            .await
-            .expect("the maintenance loop must stop promptly on shutdown")
-            .expect("maintenance task");
-        straggler.commit().await;
-
-        assert_eq!(
-            status_of(&raw).await,
-            TransformStatus::WaitingToBackfill,
-            "a shutdown mid-wait leaves the definition for the next pass"
-        );
-        let markers: i64 = raw
-            .query_one(
-                "select count(*) from pending_backfill where table_name = 'public.s'",
-                &[],
-            )
-            .await
-            .expect("count markers")
-            .get(0);
-        assert_eq!(
-            markers, 1,
-            "the deferred marker must survive for the next start"
-        );
-    }
-}
-
-#[cfg(test)]
 mod reconcile_tests {
     //! Issue #427, ADR-0002, restated for trigger capture (issue #622 C5):
     //! the staging worker's reconcile pass is the only thing that installs
@@ -4795,20 +3788,11 @@ mod reconcile_tests {
     }
 
     /// One pass of the staging worker's reconcile, as the maintenance loop
-    /// runs it. A freshly fenced marker settles at once here (nothing else
-    /// runs in the database), so the timeout only bounds a surprise.
+    /// runs it.
     async fn reconcile_pass(f: &mut Fixture) {
-        reconcile_source_tables(
-            &mut f.raw,
-            &f.pool,
-            DEFAULT_SCHEMA,
-            "wake",
-            &staging::StagedWatermark::saturated(),
-            Duration::from_millis(200),
-            &|| false,
-        )
-        .await
-        .expect("reconcile pass");
+        reconcile_source_tables(&mut f.raw, &f.pool, DEFAULT_SCHEMA)
+            .await
+            .expect("reconcile pass");
     }
 
     async fn is_captured(raw: &tokio_postgres::Client) -> bool {
@@ -4863,16 +3847,6 @@ mod reconcile_tests {
         assert_eq!(retaken, Ok(()), "the failed setup still held the singleton");
     }
 
-    async fn marker_count(raw: &tokio_postgres::Client) -> i64 {
-        raw.query_one(
-            "select count(*) from pending_backfill where table_name = 'public.s'",
-            &[],
-        )
-        .await
-        .expect("count markers")
-        .get(0)
-    }
-
     /// The table was registered (and captured) before the worker started.
     /// Dropping its last reader must uninstall its capture on the next pass
     /// and keep it uninstalled (issue #427's shape: a startup copy of the set
@@ -4893,11 +3867,6 @@ mod reconcile_tests {
             !is_captured(&f.raw).await,
             "a later pass must not install it again"
         );
-        assert_eq!(
-            marker_count(&f.raw).await,
-            0,
-            "no capture marker is parked for a table nothing reads"
-        );
     }
 
     #[tokio::test]
@@ -4914,9 +3883,8 @@ mod reconcile_tests {
 
     /// Issue #427: a staging worker may start with nothing registered, so it
     /// captures nothing. The pass after the first registration must install
-    /// the table's capture and leave the registration with a marker (or
-    /// already dispatched by the same pass's discharge), not stranded
-    /// `waiting_to_backfill` with nothing to discharge it.
+    /// the table's capture and start the registration's build in the same
+    /// pass, not strand it `waiting_to_backfill`.
     #[tokio::test]
     async fn a_first_registration_after_an_empty_start_installs_capture() {
         let mut f = fixture(&[]).await;
@@ -4943,10 +3911,9 @@ mod reconcile_tests {
             .await
             .expect("read status")
             .get(0);
-        assert!(
-            status != "waiting_to_backfill" || marker_count(&f.raw).await == 1,
-            "the registration is captured: dispatched, or its join marker is still parked \
-             (status {status})"
+        assert_ne!(
+            status, "waiting_to_backfill",
+            "the registration is captured, so the same pass starts its build"
         );
     }
 }
@@ -5229,7 +4196,6 @@ mod worker_upkeep_tests {
 
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::backfill_chunk_failure_tests::{WORKER, seed};
     use super::*;
 
     async fn stale_registry_row(raw: &tokio_postgres::Client, worker_id: &str) {
@@ -5318,45 +4284,6 @@ mod worker_upkeep_tests {
         assert!(live_workers.any(), "one worker loop is still running");
         drop(other);
         assert!(!live_workers.any());
-    }
-
-    /// A claim a dead worker holds is still reclaimed, by the sweep in the
-    /// per-process pass alone (no `maintenance_loop` and no worker loop runs
-    /// here).
-    #[tokio::test]
-    async fn a_stale_chunk_claim_is_reclaimed_by_the_upkeep_pass() {
-        let f = seed(10, None).await;
-        let claimed = chunk_queue::claim_chunks(&f.raw, "dead-worker", 1)
-            .await
-            .expect("claim");
-        assert_eq!(claimed.len(), 1);
-        assert!(
-            chunk_queue::claim_chunks(&f.raw, WORKER, 1)
-                .await
-                .expect("claim")
-                .is_empty(),
-            "the dead worker's claim holds the chunk"
-        );
-
-        // A TTL the claim has not outlived leaves it alone.
-        worker_upkeep_pass(&f.pool, "w", Duration::from_secs(3600)).await;
-        assert!(
-            chunk_queue::claim_chunks(&f.raw, WORKER, 1)
-                .await
-                .expect("claim")
-                .is_empty(),
-            "a live claim is not swept"
-        );
-
-        worker_upkeep_pass(&f.pool, "w", Duration::ZERO).await;
-        assert_eq!(
-            chunk_queue::claim_chunks(&f.raw, WORKER, 1)
-                .await
-                .expect("claim")
-                .len(),
-            1,
-            "the pass reclaimed the stale claim"
-        );
     }
 
     /// The pass interval is bounded by the TTL the health check reads, not by

@@ -101,7 +101,7 @@ async fn start(seed: Option<&str>) -> Driver {
         step(&mut d, seed).await;
     }
     install(&d, A2, &agg_columns()).await;
-    trellis::intake::markers::settle_registrations(d.pool()).await;
+    trellis::intake::harness::settle_builds(d.pool()).await;
     d.settle().await;
     assert_live(&d).await;
     d
@@ -238,7 +238,7 @@ async fn a_chunked_build_writes_every_null_keyed_group() {
     )
     .await;
     install(&d, A2, &agg_columns()).await;
-    trellis::intake::markers::discharge_registrations(d.pool())
+    trellis::intake::harness::start_registered_builds(d.pool())
         .await
         .expect("start the reader's build");
     let options = WorkerOptions {
@@ -335,7 +335,7 @@ async fn a_chain_of_aggregate_and_two_one_to_one_readers_keeps_the_null_group() 
         &[("g", int4()), ("total", int8())],
     )
     .await;
-    trellis::intake::markers::settle_registrations(d.pool()).await;
+    trellis::intake::harness::settle_builds(d.pool()).await;
     d.settle().await;
     install(
         &d,
@@ -343,7 +343,7 @@ async fn a_chain_of_aggregate_and_two_one_to_one_readers_keeps_the_null_group() 
         &[("g", int4()), ("dbl", int8())],
     )
     .await;
-    trellis::intake::markers::settle_registrations(d.pool()).await;
+    trellis::intake::harness::settle_builds(d.pool()).await;
     d.settle().await;
     assert_live(&d).await;
 
@@ -437,32 +437,6 @@ async fn a_rebuild_sweep_rederives_null_keyed_rows() {
     );
 }
 
-/// The direct build (`backfill_definition`, a build outside the chunk
-/// queue) writes the `NULL`-keyed rows too, in a pass of their own after its
-/// ranges, which never reach them.
-#[tokio::test]
-async fn the_direct_build_writes_the_null_keyed_rows() {
-    let mut d = Driver::start(SRC_DDL, &src_columns(), &[AGG], &[SRC]).await;
-    step(
-        &mut d,
-        "insert into public.src values (1, 1, null, 1), (2, null, null, 2), (3, 2, 2, 3), \
-                                       (4, null, 5, 4)",
-    )
-    .await;
-    // Registered and its target created; nothing builds it but the call
-    // below.
-    install(&d, A2, &agg_columns()).await;
-    let def = trellis::defs::parse(A2).expect("parse");
-    let columns: HashMap<String, ValueType> = agg_columns()
-        .into_iter()
-        .map(|(name, ty)| (name.to_string(), ty))
-        .collect();
-    trellis::defs::backfill_definition(d.pool(), &def, "public", "public.agg", &columns)
-        .await
-        .expect("the direct build");
-    assert_eq!(d.rows(A2_ACTUAL).await, d.rows(A2_ORACLE).await);
-}
-
 /// An aggregate over the reader, grouped by a field: a `NULL`-keyed row's
 /// moves between its groups (its count changes, or its group goes extinct
 /// upstream) reach the rollup as any other row's do.
@@ -475,7 +449,7 @@ async fn a_rollup_over_the_reader_follows_its_null_keyed_rows() {
         &[("g", int4()), ("h", int4()), ("n", int8()), ("t1", int8())],
     )
     .await;
-    trellis::intake::markers::settle_registrations(d.pool()).await;
+    trellis::intake::harness::settle_builds(d.pool()).await;
     d.settle().await;
     assert_live(&d).await;
     const ROLL: &str = "select n, groups from public.roll order by n";

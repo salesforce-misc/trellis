@@ -139,11 +139,6 @@ pub fn classify(err: &ApplyError) -> FailureClass {
         // A truncate the drain can't raise a floor for (#774) is no key's
         // fault: every page holding it reproduces it.
         ApplyError::TruncateWithoutLsn { .. } => FailureClass::Halting,
-        // A spilled accumulator staged in memory (#926) is a programming
-        // error, no key's fault either. It names no table, so the halt
-        // pauses nothing: the page retries once and surfaces it as a drain
-        // holdup, charging no key, where isolating it could evict one.
-        ApplyError::SpilledMutationsNotFlushed => FailureClass::Halting,
         // Both of these mean "this definition can never work against this
         // source's real schema" — a structural, schema-shape diagnosis
         // exactly like the hop bound, not a per-row data problem. By the
@@ -2391,15 +2386,9 @@ async fn attribute_column_failure(
 /// committed yet ([`pause_column`] writes the paused field's row before its
 /// cascade runs).
 ///
-/// `defs::backfill`'s durable chunk-queue write path
-/// (`write_one_to_one_range`) needs this
-/// same exclusion for the same reason (a (re-)executed backfill chunk must
-/// not overwrite a column live CDC has since paused) but runs its own copy
-/// of the identical query (`defs::backfill::paused_columns_for`) rather than
-/// calling this function — `defs` sits below `staging` in this crate's
-/// layering (`staging::apply` already depends on `defs::backfill`, so the
-/// reverse dependency would be circular) and that call site already holds a
-/// plain `&Client` rather than a `&Pool`.
+/// The Re-derive build's chunks need this same exclusion for the same reason
+/// (a (re-)executed chunk must not overwrite a column live CDC has since
+/// paused).
 pub(super) async fn paused_columns_for(
     pool: &Pool,
     def: &TransformDef,
@@ -3088,9 +3077,8 @@ pub async fn pause_column(pool: &Pool, transform: &str, column: &str) -> Result<
 /// Errors with [`ApplyError::DefinitionNotLive`] — with no side effects at
 /// all, checked before any of this function's deletes run — if `transform`
 /// doesn't apply (`super::build::takes_field_build`, a field build's
-/// precondition: `live`, `catching_up`, or under a Re-derive build). A
-/// definition still behind an old-path build is the concrete case: its rows
-/// are still being written by a build that skips the paused column. The same
+/// precondition: `live`, or under a Re-derive build). A paused definition
+/// is the concrete case. The same
 /// check applies per-pair inside the cascade queue below, and a downstream
 /// pair is not an abort of the whole call — by the time it is reached, any
 /// upstream pairs earlier in the queue have already been fully resumed and
@@ -3098,7 +3086,7 @@ pub async fn pause_column(pool: &Pool, transform: &str, column: &str) -> Result<
 /// has not started building (`waiting_to_backfill`) is released by deleting
 /// its row: its build reads the paused set when its chunks run, so it writes
 /// the column without a field build (issue #916). One whose definition is
-/// mid-build on the old path, or frozen, can't be released, and the walk has
+/// frozen can't be released, and the walk has
 /// deleted its edge: it is held as a pause of its own with a reason that says
 /// so ([`hold_orphaned_pause`]), for its `RESUME` once the definition
 /// applies, and logged.
@@ -3129,7 +3117,7 @@ pub async fn resume_column(
                     column: column.to_string(),
                 });
             }
-            // #687: only the widened capture's catch-up may unpause it.
+            // #687: only the field build's release may unpause it.
             Some(true) => {
                 return Err(ApplyError::ColumnAwaitingCapture {
                     transform: transform.to_string(),
@@ -3736,29 +3724,12 @@ async fn reads_paused_sibling(
 /// definition to [`TransformStatus::WaitingToBackfill`], unless a definition
 /// whose target it reads isn't `live` (#971): then it records a resume
 /// request and returns, and the staging worker resumes it once every such
-/// upstream is ([`resume_locked`]'s step 0). A definition the
-/// Re-derive build takes (`super::build::qualifies`, #625 F3) is then
-/// rebuilt by the staging worker's next pass, which starts a Re-derive build
-/// (`super::build::start_ready_builds`): a 1-1 build keeps the ledger (B4)
-/// and its sweep drops the keys deleted while it was frozen, and an
-/// aggregate's or a `JOIN`'s plan job rewrites its groups in one absolute
-/// write. Any other definition
-/// gets a fresh `pending_backfill` marker for its source table
-/// ([`crate::intake::markers::park_marker`], which every marker goes
-/// through). The target is left exactly as the freeze left it until that
-/// marker's discharge
-/// ([`crate::intake::markers::run_pending_backfills`]) runs, which in one
-/// transaction deletes every target row no current source row backs (issue
-/// #330, `intake::resume_orphans`) and dispatches the rebuild by shape
-/// (ADR-0002): chunks or a direct-build job that drain threads run, or, for
-/// a shape the direct build can't render, an enumeration of every current
-/// source row for the drain to re-derive. The discharge respects the marker's `xmin`
-/// fence, never re-deriving the target without waiting out a concurrent
-/// transaction that might still be pinning it (issue #55;
-/// docs/observability.md's "Backfill status and the `xmin` caveat" applies
-/// here exactly as it does to a fresh transform's own initial backfill:
-/// resuming can sit in `waiting_to_backfill` for as long as some unrelated
-/// transaction pins the cluster's `xmin`, and that is correct, not a fault).
+/// upstream is ([`resume_locked`]'s step 0). The staging worker's next pass
+/// then starts a Re-derive build for it (`super::build::start_ready_builds`,
+/// #625 F3): a 1-1 build keeps the ledger (B4) and its sweep drops the keys
+/// deleted while it was frozen, and an aggregate's or a `JOIN`'s plan job
+/// rewrites its groups in one absolute write. The target is left exactly as
+/// the freeze left it until then.
 ///
 /// Deletes the definition's unclaimed, undone `backfill_chunks` rows too
 /// (issue #332): the fresh backfill makes them redundant, and a pause only
@@ -4353,15 +4324,10 @@ async fn complete_resume(
     //
     // `build = null` too (#625 F2): a definition paused during a Re-derive
     // build is no longer under one. The staging worker's next pass starts a
-    // new one if it still qualifies (`staging::build::start_ready_builds`),
-    // and otherwise an old build takes it. Every old dispatch then sees
-    // `build` null, the ring enumeration's `go_live` included, so a resumed
-    // definition never ends `live` still marked as building, which
-    // `catalog::table_has_reader` would skip.
+    // new one (`staging::build::start_ready_builds`).
     txn.execute(
         "update transform_definitions \
-         set status = $1, fuse_rearmed_at = now(), build = null, \
-             build_marker_generation = null where id = $2",
+         set status = $1, fuse_rearmed_at = now(), build = null where id = $2",
         &[&TransformStatus::WaitingToBackfill.as_str(), &id],
     )
     .await?;
@@ -4454,25 +4420,14 @@ async fn complete_resume(
         catalog::recreate_group_table(txn, schema, id, &shape).await?;
     }
 
-    // A definition the Re-derive build takes (#625 F3) gets no marker: the
-    // staging worker's next pass starts its rebuild from `waiting_to_backfill`
-    // (`super::build::start_ready_builds`): a 1-1 build runs over the ledger
-    // the freeze left (B4), and its sweep drops the keys deleted meanwhile. A
-    // marker would have the discharge re-read the whole source
-    // for nothing.
-    //
-    // `transform_definitions.source_table` is already the fully-qualified
-    // `"schema.table"` form (issue #72) — re-resolving it via
-    // `resolve_source_schema_in_txn` (bare names only) or re-`qualify`-ing it
-    // would reject it outright (`DottedIdentifierComponent`).
-    // A JOIN gets none either: its plan job builds it
-    // (`super::build::start_ready_builds`).
-    if revalidated.join.is_none() && !super::build::qualifies(txn, definition).await? {
-        crate::intake::markers::park_marker(txn, source_table).await?;
-    }
+    // The staging worker's next pass starts the rebuild from
+    // `waiting_to_backfill` (`super::build::start_ready_builds`): a 1-1 build
+    // runs over the ledger the freeze left (B4), and its sweep drops the keys
+    // deleted meanwhile; a group-basis aggregate's or a `JOIN`'s plan job
+    // rewrites its groups.
     // #799: release every key this definition holds. The fresh build below
     // re-derives each from the source, so its parked work is superseded, not
-    // replayed, and the key is applied again from the build's go-live on.
+    // replayed, and the key is applied again from the build's start on.
     // Only this definition's rows: a sibling on the same source keeps its
     // own. Deleting them is also what gives the resumed definition a fresh
     // whole-transform fuse.
@@ -4486,7 +4441,7 @@ async fn complete_resume(
     // #622 C6: a transform paused by a schema change stops being reported as
     // such the moment it is resumed. Its columns count for capture again from
     // here, so the next reconcile widens the source's capture to them before
-    // the discharge may dispatch the rebuild, or, if a column is still
+    // the rebuild may start, or, if a column is still
     // missing, pauses it again with the reason
     // (`staging::schema_change::pause_readers_of_missing`). A key column
     // changed again since the re-validation above is the next pass's to
@@ -7203,17 +7158,6 @@ mod unit_tests {
             src_table: "public.src".to_string(),
         };
         assert_eq!(classify(&err), FailureClass::Halting);
-    }
-
-    /// Issue #926: a spilled accumulator staged in memory is a programming
-    /// error no key caused, so it halts (pausing nothing, as it names no
-    /// table) rather than isolate and charge a key for it.
-    #[test]
-    fn classify_maps_a_spilled_accumulator_staged_in_memory_to_halting() {
-        assert_eq!(
-            classify(&ApplyError::SpilledMutationsNotFlushed),
-            FailureClass::Halting
-        );
     }
 
     #[test]

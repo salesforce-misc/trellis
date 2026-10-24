@@ -63,7 +63,7 @@ async fn install_chain(
         install_definition(&db.pool, text, columns, "public")
             .await
             .unwrap_or_else(|e| panic!("install {text:?}: {e}"));
-        trellis::intake::markers::settle_registrations(&db.pool).await;
+        trellis::intake::harness::settle_builds(&db.pool).await;
     }
 }
 

@@ -247,12 +247,11 @@ attached beside a `DEFAULT` takes some of its groups, whose rows a read of the
 after the check locks the node, so it waits for the correction. The capture
 install that adds a new node to the tree rebuilds none of the readers a
 correction covers (an aggregate over the source): the node's own correction covers its rows, including those written into it
-directly before its capture existed. That install parks no marker on the root
-when no other reader needs a catch-up, so no discharge stages a recompute of
-every key of the source. An install that also changes the capture functions,
-for a reader registered in the same pass, parks the marker as any install
-does, since its capture gate holds that reader until the rows the old
-functions staged have drained. Measured on the engine (a debug build, one
+directly before its capture existed, so nothing re-reads every key of the
+source. An install that also changes the capture functions, for a reader
+registered in the same pass, records its capture gate as any install does,
+which holds that reader's build until the rows the old functions staged have
+drained. Measured on the engine (a debug build, one
 runner), the correction of a `DROP`, `DETACH` or `TRUNCATE` of a leaf of 1M or
 of 10M rows over 1,560 groups takes 27–34 ms and about 0.6 MB of WAL, whatever
 the leaf's rows; the correction of an `ATTACH` of such a leaf reads it twice, once for its groups and
@@ -269,8 +268,8 @@ held it across a pause and resume, from writing. A failing correction records
 its error on its row, which `status()` reports, and backs off. Charged
 failures pause its definition, whose resume rebuilds it from the source, and
 until that resume the row and the correction stay queued as the record of why.
-No other correction, definition or source waits on it. A `catching_up`
-definition gets its row once it is `live`, and the correction stays queued
+No other correction, definition or source waits on it. A definition that is
+not applying yet gets its row once it is, and the correction stays queued
 until then.
 
 A change staged before the DDL can still be in the ring when the correction

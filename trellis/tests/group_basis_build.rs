@@ -85,7 +85,7 @@ async fn define_as(d: &Driver, definition: &str) {
     trellis::defs::install_definition(d.pool(), definition, &columns, "public")
         .await
         .expect("define the aggregate");
-    trellis::intake::markers::discharge_registrations(d.pool())
+    trellis::intake::harness::start_registered_builds(d.pool())
         .await
         .expect("start the build");
 }
@@ -552,7 +552,7 @@ async fn a_build_writes_averages_numeric_sums_and_composed_fields() {
     )
     .await
     .expect("define");
-    trellis::intake::markers::discharge_registrations(d.pool())
+    trellis::intake::harness::start_registered_builds(d.pool())
         .await
         .expect("start the build");
     write(&d, "update public.src set m = 3.75 where id = 2").await;
@@ -676,10 +676,9 @@ async fn a_pause_and_resume_wait_for_a_build_in_flight() {
         .await
         .expect("resume");
     let pool = d.pool().clone();
-    let taken = build::start_ready_builds(&mut d.ctl, &pool, &[id])
+    build::start_ready_builds(&mut d.ctl, &pool, &[id])
         .await
         .expect("start the resumed build");
-    assert_eq!(taken, vec![id]);
 
     let mut building = build_frozen(&d, &[PausePoint::AfterRebuildEnumerate]).await;
     let reached = building.reached(PausePoint::AfterRebuildEnumerate).await;
@@ -787,7 +786,7 @@ async fn a_partitioned_source_with_rows_is_refused() {
     trellis::defs::install_definition(d.pool(), AGG, &columns, "public")
         .await
         .expect("define the aggregate");
-    trellis::intake::markers::settle_registrations(d.pool()).await;
+    trellis::intake::harness::settle_builds(d.pool()).await;
     assert_eq!(d.rows(STATUS).await, ["(paused)"], "the build fails");
     let error = d
         .rows("select string_agg(last_error, ' | ') from backfill_chunks")

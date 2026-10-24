@@ -9,7 +9,7 @@
 //! callers never have to stitch those together themselves — and, critically,
 //! never accidentally pick the wrong path: definition registration always
 //! goes through [`defs::install_definition`], which creates the target and
-//! leaves the build to the staging worker's backfill discharge (ADR-0002),
+//! leaves the build to the staging worker's capture pass (ADR-0002),
 //! rather than the lower-level primitives it's built from.
 //!
 //! The individual `defs::*`/`intake::*`/`staging::*` items remain public for
@@ -41,7 +41,7 @@
 //! a transform's initial backfill runs in the background:
 //! `apply()` returns once the definition is registered, with
 //! [`TransformStatus::WaitingToBackfill`], having read no source rows. The
-//! staging worker's backfill discharge then dispatches the build, and running
+//! staging worker's capture pass then starts the build, and running
 //! drain (`application_threads`) workers execute it — anywhere in the fleet, not necessarily on the connection that called
 //! `apply()`. Callers that need the target actually populated poll
 //! [`Trellis::status`] until it reports [`TransformStatus::Live`] — which
@@ -685,56 +685,51 @@ impl Trellis {
     /// an operator fixes the cause and resumes it.
     pub async fn definitions(&self) -> Result<Vec<DefinitionSummary>, TrellisError> {
         self.call(async {
-        let mut client = self.pool.get().await?;
-        // One repeatable-read transaction, so the reported statuses are
-        // derived from the same catalog state the rows come from.
-        let txn = client
-            .build_transaction()
-            .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
-            .read_only(true)
-            .start()
-            .await?;
-        // Issue #461: the same `pending_backfill` and failing-chunk joins
-        // `status` reads its `backfill_failure` from, in the one listing
-        // query (`table_name` is the table's primary key, and the chunk join
-        // takes one chunk, so each adds at most one row per definition), and
-        // the definition's halt (#663; `capture_failures` is keyed by it).
-        let rows = txn
-            .query(
-                &format!(
-                    "select d.id, d.target_table, d.created_at, d.source_table, \
-                            pb.table_name as backfill_table, pb.attempts as backfill_attempts, \
-                            pb.last_error as backfill_last_error, \
-                            pb.next_attempt_at as backfill_next_attempt_at, {CHUNK_FAILURE_COLUMNS}, \
+            let mut client = self.pool.get().await?;
+            // One repeatable-read transaction, so the reported statuses are
+            // derived from the same catalog state the rows come from.
+            let txn = client
+                .build_transaction()
+                .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
+                .read_only(true)
+                .start()
+                .await?;
+            // Issue #461: the same failing-chunk join `status` reads its
+            // `backfill_failure` from, in the one listing query (the chunk join
+            // takes one chunk, so it adds at most one row per definition), and
+            // the definition's halt (#663; `capture_failures` is keyed by it).
+            let rows = txn
+                .query(
+                    &format!(
+                        "select d.id, d.target_table, d.created_at, d.source_table, \
+                            {CHUNK_FAILURE_COLUMNS}, \
                             cf.source_table as capture_table, cf.columns as capture_columns, \
                             cf.error as capture_error, cf.detected_at as capture_detected_at, \
                             cf.kind as capture_kind \
                      from transform_definitions d \
-                     left join pending_backfill pb \
-                       on pb.table_name = d.source_table and pb.last_error is not null \
                      {CHUNK_FAILURE_JOIN} \
                      left join capture_failures cf \
                        on cf.transform_id = d.id and cf.kind = 'halt' \
                      order by d.id"
-                ),
-                &[],
-            )
-            .await?;
-        let reported = crate::defs::catalog::reported_statuses(&*txn).await?;
-        txn.commit().await?;
-        Ok(rows
-            .into_iter()
-            .map(|row| {
-                let id: i64 = row.get(0);
-                DefinitionSummary {
-                    target_table: row.get(1),
-                    status: reported[&id],
-                    created_at: row.get(2),
-                    backfill_failure: backfill_failure(&row),
-                    halt: capture_failure(&row),
-                }
-            })
-            .collect())
+                    ),
+                    &[],
+                )
+                .await?;
+            let reported = crate::defs::catalog::reported_statuses(&*txn).await?;
+            txn.commit().await?;
+            Ok(rows
+                .into_iter()
+                .map(|row| {
+                    let id: i64 = row.get(0);
+                    DefinitionSummary {
+                        target_table: row.get(1),
+                        status: reported[&id],
+                        created_at: row.get(2),
+                        backfill_failure: backfill_failure(&row),
+                        halt: capture_failure(&row),
+                    }
+                })
+                .collect())
         })
         .await
     }
@@ -766,24 +761,22 @@ impl Trellis {
     /// (ADR-0002, "What `live` promises"): from then on, a
     /// [`Trellis::watermark_token`] taken after a commit and awaited with
     /// [`Trellis::await_converged`] guarantees its target reflects that
-    /// commit. A transform whose build has finished but whose go-live
-    /// catch-up hasn't run yet reports [`TransformStatus::CatchingUp`]
-    /// instead: it is applying changes, but its target may still be missing
-    /// some (issue #476). A `live` 1-1 one rebuilding fields (an `ALTER
+    /// commit. A `live` 1-1 one rebuilding fields (an `ALTER
     /// TRANSFORM` that added or changed fields, a resumed column) reports
     /// [`TransformStatus::Backfilling`] until they are built (#625 F8b), and so
     /// does an aggregate over a partitioned source while it is corrected for a
     /// partition that was attached, detached, dropped or truncated (ADR-0017),
-    /// each listed in [`DefinitionStatus::correcting`]. So does
-    /// a `live` one reading an upstream (another definition's target, as its
-    /// source or as a `JOIN`'s joined table) that isn't `live` itself: paused,
-    /// quarantined, rebuilding or catching up, down the whole chain (issue
-    /// #497). That one is derived from the upstream's status when read.
+    /// each listed in [`DefinitionStatus::correcting`]. A `live`
+    /// one reading an upstream (another definition's target, as its source or
+    /// as a `JOIN`'s joined table) that isn't `live` itself (paused,
+    /// quarantined, rebuilding or catching up, down the whole chain) reports
+    /// [`TransformStatus::CatchingUp`] (issue #497): it keeps applying, but its
+    /// target doesn't reflect the source yet. That status is derived from the
+    /// upstream's status when read, never stored.
     ///
     /// Also reports why a definition isn't getting there, when the cause is a
-    /// failing build ([`DefinitionStatus::backfill_failure`], issues #407,
-    /// #616): a failing chunk of it, or a failing backfill of its source
-    /// table. Both are retried with backoff, so without this the only sign
+    /// failing build ([`DefinitionStatus::backfill_failure`], #616): a failing
+    /// chunk of it. It is retried with backoff, so without this the only sign
     /// would be a warning in a worker's log.
     ///
     /// `target_table` is the name `apply` returns (`schema.table`) or the bare table
@@ -807,9 +800,7 @@ impl Trellis {
                 .query_opt(
                     &format!(
                         "select d.status, d.id, d.source_table, d.definition_text, d.grammar_version, \
-                            d.join_table, pb.table_name as backfill_table, pb.attempts as backfill_attempts, \
-                            pb.last_error as backfill_last_error, \
-                            pb.next_attempt_at as backfill_next_attempt_at, \
+                            d.join_table, \
                             {CHUNK_FAILURE_COLUMNS}, \
                             cf.source_table as capture_table, cf.columns as capture_columns, \
                             cf.error as capture_error, cf.detected_at as capture_detected_at, \
@@ -832,8 +823,6 @@ impl Trellis {
                             (select min({due}) from poison p \
                              where p.transform_id = d.id) as held_retry_at \
                      from transform_definitions d \
-                     left join pending_backfill pb \
-                       on pb.table_name = d.source_table and pb.last_error is not null \
                      {CHUNK_FAILURE_JOIN} \
                      left join capture_failures cf on cf.transform_id = d.id \
                      where {matches}",
@@ -1027,26 +1016,14 @@ impl Trellis {
         Ok((wait, failure))
     }
 
-    /// Re-reads `source_table` for every applying definition that reads it, to
-    /// re-derive from. A newly
-    /// registered transform doesn't need this: the staging worker starts
-    /// its build itself.
-    ///
-    /// A reader the Re-derive build serves (a plain aggregate or a plain
-    /// 1-1 transform over this table, #625 F7) is rebuilt: this call's own
-    /// transaction moves it `live -> backfilling` and enqueues its plan and
-    /// sweep jobs, one row each, so the call returns quickly and the status
-    /// already reads `backfilling` when it does. The definition keeps
-    /// applying. Its plan re-derives every row the table has, and its sweep
-    /// deletes what the table no longer backs, and then it is `live` again.
-    ///
-    /// Every other reader gets a go-live catch-up (issue #522; ADR-0002's
-    /// "A build is Re-derive over chunks, and applies from its first chunk"
-    /// keeps it for the builds still on the one-pass path): it reports `catching_up` from this call
-    /// until the staging worker has discharged the marker. The discharge
-    /// re-derives every row the table still has, deletes each reader's
-    /// target rows the table no longer backs (a delete that never reached the
-    /// target, say), and flips the readers back `live`.
+    /// Rebuilds every applying definition that reads `source_table` (#522,
+    /// #625 F7): this call's own transaction moves each `live -> backfilling`
+    /// and enqueues its plan and sweep jobs, one row each, so the call returns
+    /// quickly and the status already reads `backfilling` when it does. The
+    /// definition keeps applying. Its plan re-derives every row the table has,
+    /// and its sweep deletes what the table no longer backs, and then it is
+    /// `live` again. A newly registered transform doesn't need this: the
+    /// staging worker starts its build itself.
     ///
     /// `source_table` is the captured table's `schema.table` name, matched
     /// exactly, or a bare name that exactly one captured table carries (any
@@ -1059,10 +1036,7 @@ impl Trellis {
     /// reconcile pass installs capture triggers on). Any other table is
     /// refused ([`TrellisError::TableNotCaptured`]): nothing reads it, and a
     /// table's first reader backfills it in full anyway. The check is the
-    /// catalog's, not the triggers': a marker parked before the staging
-    /// worker's install lands is harmless, since the table has no applying
-    /// reader yet and the discharge dispatches no definition whose capture
-    /// isn't current. The running staging worker discharges the marker.
+    /// catalog's, not the triggers'.
     pub async fn request_backfill(&self, source_table: &str) -> Result<(), TrellisError> {
         self.call(async {
             let mut client = self.pool.get().await?;
@@ -1103,7 +1077,7 @@ impl Trellis {
 
             // A failure to park is a plain `Db` error.
             let txn = client.transaction().await?;
-            let rebuilt = crate::intake::markers::park_table_catch_ups(
+            let rebuilt = crate::intake::catch_up::park_table_catch_ups(
                 &*txn,
                 std::slice::from_ref(&qualified),
                 false,
@@ -1618,7 +1592,7 @@ impl Trellis {
     ///
     /// This waits for captured changes only. It doesn't read definition
     /// status or backfill progress: a definition that isn't
-    /// [`TransformStatus::Live`] yet (including one still
+    /// [`TransformStatus::Live`] yet (including one reporting
     /// [`TransformStatus::CatchingUp`]) may still be missing rows after this
     /// returns. Check [`Trellis::status`] for that. Once it reports `live`,
     /// a token taken after a commit and awaited here covers that commit
@@ -1807,7 +1781,7 @@ impl Trellis {
                 let client = self.pool.get().await?;
                 defs::catalog::reject_inaccessible_table(&**client, Some(schema), source_table)
                     .await?;
-                crate::intake::markers::qualify(schema, source_table).map_err(CatalogError::from)?
+                crate::intake::qualify(schema, source_table).map_err(CatalogError::from)?
             }
             None => match defs::catalog::resolve_graph_identity(&self.pool, source_table).await {
                 Err(err @ CatalogError::SourceTableNotFound(_)) => {
@@ -1901,31 +1875,18 @@ const CHUNK_FAILURE_JOIN: &str = "left join lateral ( \
      ) bcf on true";
 
 /// The [`BackfillFailure`] in a row of [`Trellis::status`]'s or
-/// [`Trellis::definitions`]' query. The definition's own failing build chunk
-/// comes first ([`CHUNK_FAILURE_COLUMNS`], #616): its `attempts`,
-/// `last_error` and `next_attempt_at` on the definition's `source_table`.
-/// Otherwise `pending_backfill`'s `table_name`, `attempts`, `last_error` and
-/// `next_attempt_at`, selected as `backfill_table`, `backfill_attempts`,
-/// `backfill_last_error` and `backfill_next_attempt_at` from a left join on
-/// the definition's source table where `last_error` is set. `None` when
-/// neither found a failure. Read by name, so the two queries can order their
-/// columns freely.
+/// [`Trellis::definitions`]' query: the definition's own failing build chunk
+/// ([`CHUNK_FAILURE_COLUMNS`], #616), with its `attempts`, `last_error` and
+/// `next_attempt_at` on the definition's `source_table`. `None` when no chunk
+/// is failing.
 fn backfill_failure(row: &tokio_postgres::Row) -> Option<BackfillFailure> {
-    if let Some(last_error) = row.get::<_, Option<String>>("chunk_last_error") {
-        return Some(BackfillFailure {
-            source_table: row.get("source_table"),
-            attempts: u32::try_from(row.get::<_, i32>("chunk_attempts")).unwrap_or(0),
-            last_error,
-            next_attempt_at: row.get("chunk_next_attempt_at"),
-        });
-    }
-    row.get::<_, Option<String>>("backfill_table")
-        .map(|source_table| BackfillFailure {
-            source_table,
-            attempts: u32::try_from(row.get::<_, i32>("backfill_attempts")).unwrap_or(0),
-            last_error: row.get("backfill_last_error"),
-            next_attempt_at: row.get("backfill_next_attempt_at"),
-        })
+    let last_error = row.get::<_, Option<String>>("chunk_last_error")?;
+    Some(BackfillFailure {
+        source_table: row.get("source_table"),
+        attempts: u32::try_from(row.get::<_, i32>("chunk_attempts")).unwrap_or(0),
+        last_error,
+        next_attempt_at: row.get("chunk_next_attempt_at"),
+    })
 }
 
 /// What a Re-derive build waits on, as [`DefinitionStatus::build_wait`]
@@ -1972,29 +1933,14 @@ fn capture_failure(row: &tokio_postgres::Row) -> Option<CaptureFailure> {
 pub struct DefinitionStatus {
     /// Where the transform is in its lifecycle (issue #55).
     pub status: TransformStatus,
-    /// Set while the definition's build keeps failing. Either:
-    ///
-    /// - one of its build chunks failed (#616), and is waiting out a backoff
-    ///   before it is retried, or is being narrowed to the key it fails on.
-    ///   It clears once the chunk finishes. A key the narrowing quarantines
-    ///   is reported by [`Trellis::quarantined`] instead, and the build
-    ///   finishes without it. A definition `paused` with this set was paused
-    ///   by its build: a chunk kept failing in a way no retry or narrowing
-    ///   gets past (a missing table or column, say). Fix the cause and resume
-    ///   it, which rebuilds it and clears this;
-    /// - or the backfill marker parked on the definition's source table
-    ///   keeps failing to discharge (issue #407, ADR-0002), or carries the
-    ///   error of a direct build that failed and was handed back to it
-    ///   (issue #419). That discharge runs every build of a
-    ///   `waiting_to_backfill` definition on the table and the catch-up of
-    ///   every `catching_up` one, so its failure is reported on each
-    ///   definition that reads the table, whatever its status. A definition
-    ///   stuck in `waiting_to_backfill` with this set is waiting on the cause
-    ///   named in [`BackfillFailure::last_error`], not on the discharge's
-    ///   turn. It clears once the discharge succeeds or the table is parked
-    ///   again.
-    ///
-    /// The definition's own chunk is reported when both are set.
+    /// Set while one of the definition's build chunks keeps failing (#616):
+    /// it is waiting out a backoff before it is retried, or is being narrowed
+    /// to the key it fails on. It clears once the chunk finishes. A key the
+    /// narrowing quarantines is reported by [`Trellis::quarantined`] instead,
+    /// and the build finishes without it. A definition `paused` with this set
+    /// was paused by its build: a chunk kept failing in a way no retry or
+    /// narrowing gets past (a missing table or column, say). Fix the cause
+    /// and resume it, which rebuilds it and clears this.
     pub backfill_failure: Option<BackfillFailure>,
     /// Set while the definition waits on capture, because the staging worker
     /// can't yet take the lock it needs to install or widen the capture
@@ -2262,19 +2208,15 @@ pub struct CaptureWait {
 
 /// The retry state of a definition's failing build (see
 /// [`DefinitionStatus::backfill_failure`]): one of its build chunks (#616),
-/// or the backfill marker on its source table whose discharge has failed
-/// (issue #407). Both are retried with capped exponential backoff. A chunk
-/// that fails on its data is narrowed to the key that causes it, which is
-/// quarantined; one that fails otherwise pauses the definition after a few
-/// charged attempts. The marker's discharge never gives up on its own: fix
-/// the cause (or drop the definitions reading the table) and the next
-/// attempt goes through.
+/// retried with capped exponential backoff. A chunk that fails on its data is
+/// narrowed to the key that causes it, which is quarantined; one that fails
+/// otherwise pauses the definition after a few charged attempts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackfillFailure {
     /// The qualified source table the build reads.
     pub source_table: String,
-    /// How many times the chunk (counting the chunk it was split from), or
-    /// the marker's discharge since it was parked, has failed.
+    /// How many times the chunk (counting the chunk it was split from) has
+    /// failed.
     pub attempts: u32,
     /// The latest failure's error, as the worker's log reported it.
     pub last_error: String,
@@ -2453,8 +2395,8 @@ pub enum QuarantineState {
     Live,
     WaitingToBackfill,
     Backfilling,
-    /// Applied like a live transform, with a go-live catch-up still pending
-    /// (mirrors [`TransformStatus::CatchingUp`], issue #476).
+    /// Applied like a live transform, but reading an upstream that isn't
+    /// `live` (mirrors [`TransformStatus::CatchingUp`], issue #476).
     CatchingUp,
     /// A whole transform's keyspace fuse has tripped (mirrors
     /// [`TransformStatus::Quarantined`]).

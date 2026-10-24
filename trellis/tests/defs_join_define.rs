@@ -13,7 +13,6 @@
 //! for convergence (#297).
 
 use std::collections::HashMap;
-use std::time::Duration;
 
 use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
@@ -295,15 +294,9 @@ async fn hidden_tables(raw: &Client, id: i64) -> Vec<String> {
 
 /// One whole staging-worker pass: capture, markers, discharge.
 async fn pass(raw: &mut Client, pool: &trellis::Pool) {
-    trellis::client::reconcile_pass(
-        raw,
-        pool,
-        DEFAULT_SCHEMA,
-        "defs_join_define_wake",
-        Duration::from_secs(2),
-    )
-    .await
-    .expect("reconcile pass");
+    trellis::client::reconcile_pass(raw, pool, DEFAULT_SCHEMA)
+        .await
+        .expect("reconcile pass");
 }
 
 async fn count(raw: &Client, sql: &str) -> i64 {
@@ -476,11 +469,6 @@ async fn a_join_registers_both_tables_and_a_pass_starts_its_build() {
         status(&trellis, "by_region").await,
         Some(TransformStatus::Backfilling)
     );
-    assert_eq!(
-        count(&raw, "select count(*) from pending_backfill").await,
-        0,
-        "a JOIN is built by its plan job, never through a marker, so none is parked for it"
-    );
 }
 
 #[tokio::test]
@@ -535,11 +523,6 @@ async fn a_join_pauses_resumes_and_drops_with_its_hidden_tables() {
         0
     );
     assert_eq!(hidden_tables(&raw, id).await.len(), 5);
-    assert_eq!(
-        count(&raw, "select count(*) from pending_backfill").await,
-        0,
-        "a resumed JOIN waits too, with no marker"
-    );
 
     // DROP takes the target, the hidden tables, the row and its edges.
     trellis
@@ -720,7 +703,7 @@ async fn a_target_a_join_reads_cannot_be_dropped_under_it() {
         )
         .await
         .expect("define the upstream aggregate");
-    trellis::intake::markers::settle_registrations(&db.pool).await;
+    trellis::intake::harness::settle_builds(&db.pool).await;
     assert_eq!(
         status(&trellis, "line_totals").await,
         Some(TransformStatus::Live)

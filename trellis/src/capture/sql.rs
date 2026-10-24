@@ -118,7 +118,7 @@ const MAX_PAIRS_PER_BUILD: usize = 50;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CaptureSpec {
     /// The captured table's unquoted `schema.table` identity, the same
-    /// spelling `intake::markers::qualify` builds and the ring's
+    /// spelling `intake::qualify` builds and the ring's
     /// `src_table` holds.
     table: String,
     /// The primary key's columns, in the key's declared order
@@ -304,7 +304,7 @@ pub fn trigger_name(schema: &str, event: CaptureEvent) -> String {
 /// replica`).
 ///
 /// C3 runs these in one retried transaction under `locks::DdlRetry`, with the
-/// join marker. `CREATE OR REPLACE TRIGGER` needs PostgreSQL 14.
+/// install's gate. `CREATE OR REPLACE TRIGGER` needs PostgreSQL 14.
 pub fn install_statements(schema: &str, spec: &CaptureSpec) -> Result<Vec<String>, CaptureError> {
     let mut statements = Vec::with_capacity(CaptureEvent::ALL.len() * 5);
     for event in CaptureEvent::ALL {

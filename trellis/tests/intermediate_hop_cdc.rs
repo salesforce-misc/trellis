@@ -56,7 +56,7 @@ async fn start() -> Pipeline {
     )
     .await
     .expect("install h1");
-    trellis::intake::markers::settle_registrations(&db.pool).await;
+    trellis::intake::harness::settle_builds(&db.pool).await;
     // An aggregate over a target never reads its capture: the
     // target-mutation seam feeds it (#315).
     install_definition(
@@ -67,7 +67,7 @@ async fn start() -> Pipeline {
     )
     .await
     .expect("install h3");
-    trellis::intake::markers::settle_registrations(&db.pool).await;
+    trellis::intake::harness::settle_builds(&db.pool).await;
     Pipeline::attach(cluster, db, raw, &["public.src"]).await
 }
 

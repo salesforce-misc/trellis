@@ -69,9 +69,9 @@
 //! # Which definitions and tables
 //!
 //! Only a definition whose capture must already be installed is audited:
-//! one that is `backfilling`, `catching_up` or `live`. A discharge dispatches
-//! a waiting definition only once its tables are captured (see
-//! `capture::reconcile`, "Which definitions a discharge may dispatch"), so
+//! one that is `backfilling`, `catching_up` or `live`. A build starts for a
+//! waiting definition only once its tables are captured (see
+//! `capture::reconcile`, "Which definitions a build may start"), so
 //! before that a missing trigger is expected. A paused or quarantined
 //! definition is frozen and reads nothing until it resumes.
 //!

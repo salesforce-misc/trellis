@@ -210,21 +210,6 @@ pass:
    racing a delete has no row to lock. A key whose tombstone the GC collects
    between the two statements fails the page transiently and it is retried
    (#712).
-
-   The one writer of a 1-1 target row that doesn't hold the entry is the
-   orphan sweep (`intake::resume_orphans`), which a marker's discharge runs
-   for a resume or a one-pass build's go-live catch-up. It only deletes. It
-   judges a row unbacked on the snapshot of its own read, locks the rows it
-   judged in key order, and then deletes each one only if the source still
-   has no row of its key. A page writes a 1-1 row under the row's lock, from
-   a source read it made before the write, so once the sweep holds the rows
-   its delete's snapshot sees every source row such a page read. It keeps a
-   row a page re-derived from a source row inserted after the sweep's read
-   (#883): that row's entry has a basis that holds the insert, so the
-   insert's own Apply is refused, and deleting the row would lose it. The
-   sweep runs only for definitions the Re-derive build doesn't serve (a
-   resumed definition it does serve gets the build's own sweep instead),
-   until milestone F (#625) moves them.
 2. **The Re-derive read (I1).** The Re-derived keys' source rows and
    `pg_current_snapshot()`, in one statement, after the lock. A key with no
    row is a delete.
@@ -321,7 +306,7 @@ A page, per aggregate target:
 
 Each changed visible row reaches the seam with its prior image, computed from
 the partials before the page's change. A `Recompute` (a release of a key, or
-a marker's re-read) names groups instead of carrying images: the page
+a rebuild's) names groups instead of carrying images: the page
 rewrites each of them from a `GROUP BY` of the source in the statement's
 snapshot, which becomes the group's basis.
 
@@ -354,7 +339,7 @@ in order (the seal gate seals none past an unfenced predecessor), so no
 segment past a truncate's is claimable before the truncate's `has_truncate`
 is decided.
 
-**Release and the orphan sweep.** Releasing a quarantined key
+**Release.** Releasing a quarantined key
 (`staging::release_key`) stages one `Recompute` of it and discards the parked
 rows. A replayed row would carry the releaser's `row_txid`, not the source
 transaction's. On an aggregate the release also recomputes, in
@@ -362,9 +347,7 @@ its own transaction, every group the held row's `agg_groups` names (the
 groups of every parked change's images) and the key's current row's, locked
 in one sorted statement and rewritten from a `GROUP BY` of the source with
 that statement's snapshot as each group's basis; a page with a `Recompute`
-recomputes the groups it names the same way, under the page's group locks. A
-1-1 target's catch-up discharge runs an orphan sweep that deletes the rows
-the source no longer backs.
+recomputes the groups it names the same way, under the page's group locks.
 
 **Tombstone GC (I4).** Maintenance deletes each tombstone whose
 `__applied_seg` is at or below the **contiguous drained prefix**, the highest
@@ -655,16 +638,6 @@ surfaces the error and records the page as a drain holdup (#817, ADR-0003's
 retry policy), which `status` reports as `drain_failure` on the definitions
 reading its tables, and the worker re-claims the page at the poll interval
 under a collapsed warning (#660).
-
-A backfill marker's discharge that Postgres refuses the same way (`42501`),
-while it plans a build or while a go-live catch-up re-reads the source, halts
-through the same attribution (#813), read from the catalog as the discharge's
-own role. It pauses what the refusal reaches with `kind` `halt` and retries
-the marker at once without them. A frozen definition doesn't count as a reader
-of a table, so once every reader of the refused table is paused, the retry
-doesn't enumerate it, and the marker discharges.
-A refusal the catalog can't pin pauses nothing, and the marker backs off as
-for any failed discharge, with the error on `backfill_failure`.
 
 ## Invariants
 

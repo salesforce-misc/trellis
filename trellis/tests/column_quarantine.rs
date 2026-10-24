@@ -22,8 +22,8 @@ use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use trellis::defs::{
-    TransformStatus, chunk_queue, create_aggregate_target_table, create_definition,
-    create_target_table, install_definition, source_primary_key,
+    TransformStatus, create_aggregate_target_table, create_definition, create_target_table,
+    install_definition, source_primary_key,
 };
 use trellis::dev::interleave::{PausePoint, PauseScope, with_scope};
 use trellis::staging::apply::{self, ApplyError};
@@ -825,15 +825,9 @@ async fn a_fuse_trip_whose_cascade_failed_at_a_grandchild_is_completed_by_the_ca
     holder.rollback().await.expect("end the fence holder");
 
     // The staging worker's capture pass, as the maintenance loop runs it.
-    trellis::client::reconcile_pass(
-        &mut client,
-        &db.pool,
-        DEFAULT_SCHEMA,
-        "wake",
-        Duration::from_secs(5),
-    )
-    .await
-    .expect("reconcile pass");
+    trellis::client::reconcile_pass(&mut client, &db.pool, DEFAULT_SCHEMA)
+        .await
+        .expect("reconcile pass");
     assert!(
         column_status_row(&client, "order_reports", "report_total")
             .await
@@ -1125,15 +1119,6 @@ async fn resume_recomputes_and_does_not_un_pause_a_dependent_with_its_own_reason
             .get(0)
     };
     assert_eq!(status_of(&client).await, "backfilling");
-    let parked: i64 = client
-        .query_one(
-            "select count(*) from pending_backfill where table_name = $1",
-            &[&format!("{DEFAULT_SCHEMA}.orders")],
-        )
-        .await
-        .expect("count pending_backfill")
-        .get(0);
-    assert_eq!(parked, 0, "a column resume parks no catch-up");
     trellis::staging::build::settle_builds(&db.pool).await;
     assert_eq!(status_of(&client).await, "live");
 
@@ -1542,149 +1527,6 @@ async fn an_existing_row_level_fuse_scenario_is_unaffected() {
 // ---------------------------------------------------------------------
 // (g) Regression: a re-executed durable backfill chunk must leave a paused
 //     column untouched (must-fix 1).
-// ---------------------------------------------------------------------
-
-/// A durable backfill chunk (`defs::chunk_queue`, ADR-0002) is
-/// claimable and crash-recoverable: a chunk whose worker wrote it and died
-/// before finishing it is reclaimed and re-executed by another worker (see
-/// `trellis/tests/defs_backfill_chunk_queue.rs`'s own reclaim-and-redo
-/// tests), and `defs::backfill::write_one_to_one_range`/
-/// `execute_one_to_one_chunk` had zero awareness of `column_status`: a
-/// re-executed chunk's `ON CONFLICT DO UPDATE` blindly overwrote *every*
-/// field, including one live CDC had since paused, silently undoing the
-/// freeze. This drives the chunk-queue execution path directly (in lieu of
-/// orchestrating a real crash) to prove the fix: a
-/// paused column's value must survive a re-executed chunk write untouched,
-/// while a sibling, non-paused column in the very same row must still pick
-/// up the re-executed chunk's freshly computed value.
-///
-/// The source is made to read as another definition's target
-/// (`markers::feed_from_a_test_definition`; no staging worker runs here):
-/// #625 F8a gives a plain 1-1 over a captured table to the Re-derive build,
-/// whose chunk commits with its done mark and so never re-executes, and the
-/// chunked build this test exercises survives for a seam-fed source.
-#[tokio::test]
-async fn a_reexecuted_backfill_chunk_leaves_a_paused_column_untouched() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
-
-    client
-        .batch_execute(
-            "create table s (id bigint primary key, a numeric, b numeric); \
-             insert into s (id, a, b) values (1, 10, 100), (2, 20, 200)",
-        )
-        .await
-        .expect("seed source");
-    trellis::intake::markers::feed_from_a_test_definition(&client, &format!("{DEFAULT_SCHEMA}.s"))
-        .await
-        .expect("make s another definition's target");
-
-    let cols = numeric_columns(&["a", "b"]);
-    let def = install_definition(
-        &db.pool,
-        "TRANSFORM t FROM s SELECT a + a AS x, b + b AS y",
-        &cols,
-        "public",
-    )
-    .await
-    .expect("install_definition records the definition and returns");
-    assert_eq!(
-        def.status,
-        TransformStatus::WaitingToBackfill,
-        "registration only records the definition (ADR-0002)"
-    );
-    trellis::intake::markers::discharge_registrations(&db.pool)
-        .await
-        .expect("the discharge dispatches the chunked build");
-    assert_eq!(
-        status_named(&client, def.def.target.as_str()).await,
-        "backfilling",
-        "a plain 1-1 definition sits at backfilling until its chunk is claimed and finished"
-    );
-
-    let claimed = chunk_queue::claim_chunks(&client, "worker-1", 10)
-        .await
-        .expect("claim_chunks");
-    assert_eq!(claimed.len(), 1, "one chunk covers this small source table");
-
-    // The first worker writes the chunk and dies before finishing it.
-    chunk_queue::run_claimed_chunk(
-        &db.pool,
-        &claimed[0],
-        "worker-1",
-        Duration::from_secs(5),
-        Duration::from_secs(60),
-    )
-    .await
-    .expect("run_claimed_chunk (initial build)");
-
-    let initial = client
-        .query_one("select x::text, y::text from t where id = 1", &[])
-        .await
-        .expect("read t after initial build");
-    let (x_initial, y_initial): (String, String) = (initial.get(0), initial.get(1));
-    assert_eq!(x_initial, "20");
-    assert_eq!(y_initial, "200");
-
-    // Simulate live CDC having since paused column `x` — reached past the
-    // mechanism, inserted directly, the same convention the rest of this
-    // file uses for whichever half of a scenario isn't the mechanism under
-    // test (here, *how* the pause happened is irrelevant; only its effect
-    // on a re-executed chunk is).
-    client
-        .execute(
-            "insert into column_status (transform_table, column_name, last_error, local_fuse) \
-             values ('t', 'x', 'synthetic pause for backfill freeze test', true)",
-            &[],
-        )
-        .await
-        .expect("seed column_status directly");
-
-    // Mutate the source row so a naive re-execution would compute different
-    // values for *both* columns — `x` must stay frozen; `y` must not.
-    client
-        .execute("update s set a = 999, b = 500 where id = 1", &[])
-        .await
-        .expect("mutate source row 1");
-
-    // The dead worker's claim is reclaimed (a zero TTL makes it stale), and
-    // a different worker claims the chunk and re-executes it.
-    chunk_queue::reclaim_stale_chunks(&mut client, Duration::ZERO)
-        .await
-        .expect("reclaim the dead worker's claim");
-    let reclaimed = chunk_queue::claim_chunks(&client, "worker-2", 10)
-        .await
-        .expect("claim_chunks after the reclaim");
-    assert_eq!(reclaimed.len(), 1, "the reclaimed chunk is claimable again");
-    chunk_queue::run_claimed_chunk(
-        &db.pool,
-        &reclaimed[0],
-        "worker-2",
-        Duration::from_secs(5),
-        Duration::from_secs(60),
-    )
-    .await
-    .expect("run_claimed_chunk (re-executed after the reclaim)");
-
-    let after = client
-        .query_one("select x::text, y::text from t where id = 1", &[])
-        .await
-        .expect("read t after re-executed chunk");
-    let (x_after, y_after): (String, String) = (after.get(0), after.get(1));
-    assert_eq!(
-        x_after, x_initial,
-        "a paused column's value must be untouched by a re-executed backfill chunk"
-    );
-    assert_eq!(
-        y_after, "1000",
-        "a non-paused column in the very same row must still be updated by the re-executed chunk"
-    );
-}
-
-// ---------------------------------------------------------------------
-// (h) Regression: cascade must never reach a KeySpace::Aggregate transform
-//     (must-fix 2).
 // ---------------------------------------------------------------------
 
 /// `column_dependents` used to scan every `transform_definitions` row with
@@ -2409,11 +2251,6 @@ async fn resume_column_leaves_a_cascaded_not_yet_live_dependent_paused_without_e
     // `resume_column_refuses_a_column_on_a_not_yet_live_definition` (above)
     // and `trellis/tests/defs_backfill_chunk_queue.rs` rely on.
     let order_totals_columns = numeric_columns(&["id", "total"]);
-    // The old chunked build, which isn't applying, is what this test pins:
-    // a Re-derive build applies, and a resume resumes it (#625 F6).
-    trellis::intake::markers::hold_out_of_the_rederive_build(&client, "public.order_totals")
-        .await
-        .expect("hold order_totals' readers out of the Re-derive build");
     let summary_def = install_definition(
         &db.pool,
         "TRANSFORM order_summaries FROM order_totals SELECT total + total AS grand_total",
@@ -2423,15 +2260,16 @@ async fn resume_column_leaves_a_cascaded_not_yet_live_dependent_paused_without_e
     .await
     .expect("install_definition records the definition and returns");
     assert_eq!(summary_def.status, TransformStatus::WaitingToBackfill);
-    trellis::intake::markers::discharge_registrations(&db.pool)
+    // The definition is frozen, which doesn't apply and which a column
+    // release can't reach.
+    client
+        .execute(
+            "update transform_definitions set status = 'paused' \
+             where target_table = 'public.order_summaries'",
+            &[],
+        )
         .await
-        .expect("the discharge dispatches the chunked build");
-    assert_eq!(
-        status_named(&client, summary_def.def.target.as_str()).await,
-        "backfilling",
-        "nothing drains the chunk queue in this test, so order_summaries must still be \
-         backfilling"
-    );
+        .expect("freeze order_summaries");
 
     // Trip `order_totals.total`'s own fuse (distinct ids from the 3 seeded
     // above, so as not to disturb them) — the real cascade path,
@@ -2470,15 +2308,14 @@ async fn resume_column_leaves_a_cascaded_not_yet_live_dependent_paused_without_e
         None,
         "the resumed upstream column itself must no longer be paused"
     );
-    // Issue #916: the walk deleted its edge into the reader, and the reader's
-    // build has already run chunks with the column held out, so it can't be
-    // released. It stays paused as a pause of its own, with a reason that
+    // Issue #916: the walk deleted its edge into the reader, and the reader
+    // is frozen, so it can't be released. It stays paused as a pause of its own, with a reason that
     // is true and the way out, not as a row with no edge that says it waits
     // on an upstream that has resumed.
     let (local_fuse, last_error) = column_status_row(&client, "order_summaries", "grand_total")
         .await
         .expect(
-            "the cascaded-onto column must remain paused: its definition is mid-build, so \
+            "the cascaded-onto column must remain paused: its definition is frozen, so \
              resume_column must not release it",
         );
     assert!(
@@ -2487,7 +2324,7 @@ async fn resume_column_leaves_a_cascaded_not_yet_live_dependent_paused_without_e
     );
     let last_error = last_error.expect("the held column says why");
     assert!(
-        last_error.contains("backfilling")
+        last_error.contains("paused")
             && last_error.contains("RESUME it once the definition is live"),
         "the reason names the definition's state and the way out, got {last_error:?}"
     );
@@ -2692,20 +2529,9 @@ async fn pausing_a_column_by_statement_reaches_the_fuse_s_own_state_and_cascades
         None
     );
 
-    // #625 F8b: each resumed column is a field build. `order_totals` was
-    // `live`, so it reads `backfilling`; `order_summaries` reads a seam-fed
-    // source, so `create_definition` left it `catching_up`, and it stays so.
-    // Its catch-up's discharge, with its field chunks still to run, hands it
-    // to the build (`backfilling`) rather than flipping it `live`, and the
-    // build's last chunk does.
+    // #625 F8b: each resumed column is a field build, so both read
+    // `backfilling` until its chunks have run.
     assert_eq!(status_named(&client, "order_totals").await, "backfilling");
-    assert_eq!(
-        status_named(&client, "order_summaries").await,
-        "catching_up"
-    );
-    trellis::intake::markers::discharge_registrations(&db.pool)
-        .await
-        .expect("discharge order_summaries' catch-up");
     assert_eq!(
         status_named(&client, "order_summaries").await,
         "backfilling"
@@ -2793,12 +2619,6 @@ async fn a_row_changed_after_a_column_resume_needs_no_catch_up() {
     quarantine::resume_column(&db.pool, "order_totals", "total")
         .await
         .expect("resume the column");
-    let parked: i64 = client
-        .query_one("select count(*) from pending_backfill", &[])
-        .await
-        .expect("count pending_backfill")
-        .get(0);
-    assert_eq!(parked, 0, "a column resume parks no catch-up marker");
     trellis::staging::build::settle_builds(&db.pool).await;
     let total: String = client
         .query_one(
@@ -3453,7 +3273,7 @@ async fn a_definition_reading_a_paused_column_is_paused_at_birth_until_that_colu
         .expect("read the reader's status");
     assert_eq!(status.state, trellis::QuarantineState::Paused);
 
-    trellis::intake::markers::settle_registrations(&db.pool).await;
+    trellis::intake::harness::settle_builds(&db.pool).await;
     drain_staged(&mut client, &db.pool).await;
     assert_eq!(status_named(&client, "sib_sum").await, "live");
     assert_eq!(
@@ -3536,7 +3356,7 @@ async fn a_resume_before_the_readers_registration_settles_releases_its_born_paus
     }
     assert!(!cascade_edge_exists(&client, "sib_sum", "t1", "sib", "total").await);
 
-    trellis::intake::markers::settle_registrations(&db.pool).await;
+    trellis::intake::harness::settle_builds(&db.pool).await;
     trellis::staging::build::settle_builds(&db.pool).await;
     drain_staged(&mut client, &db.pool).await;
     trellis::staging::build::settle_builds(&db.pool).await;
@@ -3569,7 +3389,7 @@ async fn a_resume_holds_a_reader_whose_definition_no_longer_validates_until_its_
         .apply("TRANSFORM sib_sum FROM sib SELECT total + 1 AS t1, t1 + 1 AS t2, cost + 1 AS c1")
         .await
         .expect("define a reader of total");
-    trellis::intake::markers::settle_registrations(&db.pool).await;
+    trellis::intake::harness::settle_builds(&db.pool).await;
     drain_staged(&mut client, &db.pool).await;
     assert_eq!(status_named(&client, "sib_sum").await, "live");
     assert_eq!(
@@ -3670,7 +3490,7 @@ async fn an_alter_adding_a_reader_of_another_definitions_paused_column_pauses_it
         .apply("TRANSFORM sib_sum FROM sib SELECT cost + 1 AS c1")
         .await
         .expect("define the downstream definition");
-    trellis::intake::markers::settle_registrations(&db.pool).await;
+    trellis::intake::harness::settle_builds(&db.pool).await;
     drain_staged(&mut client, &db.pool).await;
     quarantine::pause_column(&db.pool, "sib", "total")
         .await
@@ -3827,7 +3647,7 @@ async fn a_cascade_pair_waits_for_a_define_reading_its_column_that_read_no_pause
         .apply("TRANSFORM sib_sum FROM sib SELECT total + 1 AS t1")
         .await
         .expect("define the middle definition");
-    trellis::intake::markers::settle_registrations(&db.pool).await;
+    trellis::intake::harness::settle_builds(&db.pool).await;
     drain_staged(&mut client, &db.pool).await;
 
     // The pause commits its own row, then its walk freezes at the pair.
@@ -3907,13 +3727,13 @@ async fn seed_reader_chain_with_total_paused(db: &TestDatabase) -> (Client, Trel
         .apply("TRANSFORM sib_sum FROM sib SELECT cost + 1 AS c1")
         .await
         .expect("define sib_sum");
-    trellis::intake::markers::settle_registrations(&db.pool).await;
+    trellis::intake::harness::settle_builds(&db.pool).await;
     drain_staged(&mut client, &db.pool).await;
     trellis
         .apply("TRANSFORM sib_down FROM sib_sum SELECT c1 + 1 AS d1")
         .await
         .expect("define sib_down");
-    trellis::intake::markers::settle_registrations(&db.pool).await;
+    trellis::intake::harness::settle_builds(&db.pool).await;
     drain_staged(&mut client, &db.pool).await;
     assert_eq!(status_named(&client, "sib_down").await, "live");
     quarantine::pause_column(&db.pool, "sib", "total")
@@ -3925,15 +3745,9 @@ async fn seed_reader_chain_with_total_paused(db: &TestDatabase) -> (Client, Trel
 /// The staging worker's capture pass, as the maintenance loop runs it: it
 /// finishes every column pause's cascade still owed.
 async fn run_capture_pass(client: &mut Client, db: &TestDatabase) {
-    trellis::client::reconcile_pass(
-        client,
-        &db.pool,
-        DEFAULT_SCHEMA,
-        "wake",
-        Duration::from_secs(5),
-    )
-    .await
-    .expect("reconcile pass");
+    trellis::client::reconcile_pass(client, &db.pool, DEFAULT_SCHEMA)
+        .await
+        .expect("reconcile pass");
 }
 
 /// The issue's reproduction: editing `sib_sum.c1` to read the paused
@@ -4046,7 +3860,7 @@ async fn an_alter_pausing_a_field_waits_for_a_define_reading_it_that_read_no_pau
         .apply("TRANSFORM sib_sum FROM sib SELECT cost + 1 AS c1")
         .await
         .expect("define sib_sum");
-    trellis::intake::markers::settle_registrations(&db.pool).await;
+    trellis::intake::harness::settle_builds(&db.pool).await;
     drain_staged(&mut client, &db.pool).await;
     quarantine::pause_column(&db.pool, "sib", "total")
         .await
@@ -4679,7 +4493,7 @@ async fn seed_alias_chain_with_total_paused(db: &TestDatabase) -> (Client, Trell
         .apply("TRANSFORM sib_sum FROM sib SELECT cost + 1 AS c1")
         .await
         .expect("define sib_sum");
-    trellis::intake::markers::settle_registrations(&db.pool).await;
+    trellis::intake::harness::settle_builds(&db.pool).await;
     drain_staged(&mut client, &db.pool).await;
     quarantine::pause_column(&db.pool, "sib", "total")
         .await
@@ -5055,7 +4869,7 @@ async fn an_alter_takes_the_fence_then_the_column_pause_lock_then_the_definition
     let db = cluster.create_isolated_database().await;
     let client = connect_raw(db.dsn()).await;
     seed_items_transform(&db, &client, "price + tax AS total").await;
-    trellis::intake::markers::settle_registrations(&db.pool).await;
+    trellis::intake::harness::settle_builds(&db.pool).await;
     let trellis = trellis_on(&db).await;
 
     let mut raw = connect_raw(db.dsn()).await;
@@ -5119,7 +4933,7 @@ async fn a_drop_serializes_with_a_resume_deleting_the_same_edges() {
         .apply("TRANSFORM sib_sum FROM sib SELECT total + 1 AS t1, cost + 1 AS t2")
         .await
         .expect("define the reader");
-    trellis::intake::markers::settle_registrations(&db.pool).await;
+    trellis::intake::harness::settle_builds(&db.pool).await;
     drain_staged(&mut client, &db.pool).await;
     quarantine::pause_column(&db.pool, "sib", "total")
         .await
@@ -5216,7 +5030,7 @@ async fn a_define_does_not_hold_the_column_pause_lock_across_its_build() {
     // Its build and backfill run after, in transactions of their own, and
     // take the lock only to release an edit's capture wait. Run to the end,
     // none leaves it held, and a second define takes it at once.
-    trellis::intake::markers::settle_registrations(&db.pool).await;
+    trellis::intake::harness::settle_builds(&db.pool).await;
     assert_eq!(status(&client).await, "live");
     assert!(!column_pause_lock_is_held(&client).await);
     create_definition(
@@ -5355,7 +5169,7 @@ async fn a_drop_only_alter_waits_for_a_resume_holding_the_column_pause_lock() {
         .apply("TRANSFORM sib_sum FROM sib SELECT total + 1 AS t1, total + 2 AS t2")
         .await
         .expect("define the reader");
-    trellis::intake::markers::settle_registrations(&db.pool).await;
+    trellis::intake::harness::settle_builds(&db.pool).await;
     drain_staged(&mut client, &db.pool).await;
     quarantine::pause_column(&db.pool, "sib", "total")
         .await
@@ -5463,20 +5277,18 @@ async fn a_build_start_behind_a_held_column_pause_lock_waits_for_the_next_pass()
 
     let impatient = impatient_pool(&db);
     let mut pass = impatient.get().await.expect("connect");
-    let taken = trellis::staging::build::start_ready_builds(&mut pass, &impatient, &[defined.id])
+    trellis::staging::build::start_ready_builds(&mut pass, &impatient, &[defined.id])
         .await
         .expect("the pass goes on past a start that waited out the lock");
-    assert_eq!(taken, vec![defined.id], "held back from the old build path");
     assert_eq!(
         definition_status(&client, defined.id).await,
         "waiting_to_backfill"
     );
 
     hold.commit().await.expect("release the lock");
-    let taken = trellis::staging::build::start_ready_builds(&mut pass, &impatient, &[defined.id])
+    trellis::staging::build::start_ready_builds(&mut pass, &impatient, &[defined.id])
         .await
         .expect("the next pass");
-    assert_eq!(taken, vec![defined.id]);
     assert_eq!(definition_status(&client, defined.id).await, "backfilling");
 }
 
@@ -5585,7 +5397,7 @@ async fn seed_two_column_reader(db: &TestDatabase) -> (Client, Trellis) {
         .apply("TRANSFORM sib_sum FROM sib SELECT cost + 1 AS c1, total + 1 AS c2")
         .await
         .expect("define sib_sum");
-    trellis::intake::markers::settle_registrations(&db.pool).await;
+    trellis::intake::harness::settle_builds(&db.pool).await;
     drain_staged(&mut client, &db.pool).await;
     (client, trellis)
 }
@@ -5854,7 +5666,7 @@ async fn seed_aggregate_readers(db: &TestDatabase) -> (Client, Trellis) {
         "TRANSFORM sib_costs FROM sib GROUP BY id WITHOUT SOURCE INDEX SELECT id AS id, SUM(cost) AS c",
     ] {
         trellis.apply(define).await.expect("define an aggregate");
-        trellis::intake::markers::settle_registrations(&db.pool).await;
+        trellis::intake::harness::settle_builds(&db.pool).await;
         trellis::staging::build::settle_builds(&db.pool).await;
         drain_staged(&mut client, &db.pool).await;
     }
@@ -5862,7 +5674,7 @@ async fn seed_aggregate_readers(db: &TestDatabase) -> (Client, Trellis) {
         .apply("TRANSFORM sib_chain FROM sib_stats SELECT s + 1 AS s1")
         .await
         .expect("define the chained reader");
-    trellis::intake::markers::settle_registrations(&db.pool).await;
+    trellis::intake::harness::settle_builds(&db.pool).await;
     trellis::staging::build::settle_builds(&db.pool).await;
     drain_staged(&mut client, &db.pool).await;
     for name in ["sib", "sib_stats", "sib_costs", "sib_chain"] {

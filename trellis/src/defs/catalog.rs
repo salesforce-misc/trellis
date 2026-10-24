@@ -25,7 +25,7 @@
 //! resolved to their `schema.table` identity exactly once, at
 //! definition-acceptance time (`create_definition_inner`'s
 //! [`resolve_source_schema_in_txn`] call for the source side,
-//! `Config::target_schema`/`intake::markers::qualify` for the target
+//! `Config::target_schema`/`intake::qualify` for the target
 //! side), never the bare spelling the grammar parsed. Every read of any of
 //! these columns downstream must treat the value as already-qualified and
 //! must not re-resolve it — see [`resolve_source_schema_in_txn`]'s own doc
@@ -129,8 +129,8 @@ pub enum CatalogError {
     /// `create_definition_inner`, the only writer, which only ever encodes
     /// [`ValueType`]'s variants.
     UnknownValueType { column: String, text: String },
-    /// A marker-side step failed: resolving a qualified table name, parking
-    /// a catch-up marker, or checking that a source is change-keyed.
+    /// An intake step failed: resolving a qualified table name, rebuilding
+    /// the readers of a table, or checking that a source is change-keyed.
     Backfill(crate::intake::IntakeError),
     /// `def.source` doesn't resolve to any schema on this connection's
     /// search path (see [`resolve_source_schema_in_txn`]) — the table was
@@ -317,11 +317,9 @@ pub enum CatalogError {
     Subscribed(super::subscription::Subscribed),
     /// [`install_definition`]'s target-table DDL failed.
     Ddl(DdlError),
-    /// A direct-build step failed with something other than
-    /// [`BackfillError::Unsupported`]: the backfill discharge's shape check
-    /// (`intake::markers`), or an `ALTER TRANSFORM`'s added-column build.
-    /// An `Unsupported` shape gets the ring enumeration instead of surfacing
-    /// here.
+    /// A build step failed with something other than
+    /// [`BackfillError::Unsupported`]: an `ALTER TRANSFORM`'s added-column
+    /// build.
     DirectBackfill(BackfillError),
     /// [`super::lifecycle::pause_transform`] was asked to pause a target with
     /// no corresponding `transform_definitions` row at all (issue #142). Its
@@ -788,16 +786,15 @@ impl From<crate::intake::IntakeError> for CatalogError {
 
 /// Test fixture: registers a definition exactly as [`install_definition`]
 /// registers every one (`waiting_to_backfill`, no source read), then stands
-/// in for the backfill discharge's ring fallback
-/// (`intake::markers::run_pending_backfills`, ADR-0002) in-call: it
-/// enumerates the source into the ring as image-less `Recompute` rows and
-/// flips the definition `live` in one transaction. `source_columns` maps the
+/// in for its build in-call: it enumerates the source into the ring as
+/// image-less `Recompute` rows and flips the definition `live` in one
+/// transaction. `source_columns` maps the
 /// source table's known columns to their [`ValueType`] (see
 /// [`super::validate::validate`]).
 ///
 /// No production path calls this: registration never reads the source (issue
-/// #418). It skips everything the discharge waits on (the marker's fence),
-/// so the caller must be the only writer of the source.
+/// #418). It waits for no writer, so the caller must be the only writer of
+/// the source.
 /// The target table must already exist (see this module's doc comment).
 ///
 /// `pool.target_schema()`, not a parameter of this function's own (issue
@@ -822,7 +819,7 @@ pub async fn create_definition(
     .await?;
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
-    crate::intake::markers::enumerate_and_append(&txn, &definition.source_table).await?;
+    crate::intake::harness::enumerate_and_append(&txn, &definition.source_table).await?;
     txn.execute(
         "update transform_definitions set status = $1 where id = $2",
         &[&TransformStatus::Live.as_str(), &definition.id],
@@ -830,29 +827,14 @@ pub async fn create_definition(
     .await?;
     txn.commit().await?;
     definition.status = TransformStatus::Live;
-    // Issue #315: a source that is another definition's target is never
-    // captured, and its writer's target-mutation seam only reached this
-    // definition once it was applying. The discharge fences the marker when
-    // it reads it (issue #431), after this commit, so the fence waits out
-    // every such writer, and flips the definition `live` (issue #476).
-    if is_definition_target(&**client, &definition.source_table).await? {
-        crate::intake::markers::park_catch_up(
-            &**client,
-            &[definition.id],
-            std::slice::from_ref(&definition.source_table),
-        )
-        .await?;
-        definition.status = TransformStatus::CatchingUp;
-    }
     Ok(definition)
 }
 
 /// Test fixture: like [`create_definition`], but reads nothing. The
 /// definition and its version bump are persisted `live` with no backfill of
-/// any kind, for a test or benchmark that builds the target itself (with
-/// `defs::backfill::backfill_definition`, issue #63 M3's set-based build) or
+/// any kind, for a test or benchmark that builds the target itself or
 /// needs none. No production path calls this: every real definition is
-/// built through the backfill discharge (ADR-0002).
+/// built by a Re-derive build (ADR-0002).
 #[cfg(any(test, feature = "test-util"))]
 pub async fn create_definition_without_backfill(
     pool: &Pool,
@@ -903,33 +885,19 @@ fn refuse_join_fixture(source_text: &str) {
 /// definition is persisted [`TransformStatus::WaitingToBackfill`] and this
 /// returns, so its latency doesn't depend on the size of any table the
 /// definition reads. Its build runs in the background: the staging worker's
-/// reconcile pass parks a `pending_backfill` marker on its source (installing
-/// or widening the source's capture first if it has to; see
-/// [`crate::capture::reconcile`]), and that marker's
-/// discharge dispatches the build by shape once the marker's fence has
-/// settled. A plain 1-1 definition gets `backfill_chunks`, an aggregate
-/// one direct-build job
-/// (`chunk_queue::dispatch_direct_build`); drain threads execute either, and
-/// the last one to finish moves it to `catching_up`
-/// ([`complete_direct_backfill`]), and the discharge of the go-live catch-up
-/// that parks flips it `live` (issue #476). A shape the direct build can't
-/// render ([`BackfillError::Unsupported`]) gets a ring enumeration flipped
-/// `live` in the discharge's own transaction. A caller polls
-/// [`crate::Trellis::status`] until it reads `live`.
+/// reconcile pass starts a Re-derive build once the source's capture is
+/// installed or widened (see [`crate::capture::reconcile`] and
+/// `staging::build::start_ready_builds`), and drain threads execute it. A
+/// caller polls [`crate::Trellis::status`] until it reads `live`.
 ///
 /// **Why nothing is folded into a target still being built.**
 /// [`dependents_of`]/[`transforms_for_source`] filter to applying
 /// definitions ([`TransformStatus::is_applying`]), so no build path can have
-/// a live CDC delta folded into it while it is still being built. A delta
-/// skipped during that window is recovered rather than lost by the catch-up
-/// marker parked when the build finishes: its discharge re-reads every
-/// table the build read, and deletes the target rows no source row backs
-/// any more, which the re-read can't reach (issue #485).
-/// The reverse, a delta for a commit the build already read that drains only
-/// after the flip, is harmless for a 1-1 target. For an aggregate, the
-/// ledger entry's `basis` already shows the commit, so the delta is skipped
-/// rather than counted a second time (I1, #623 D5), and that correction
-/// doesn't rest on the catch-up.
+/// a live CDC delta folded into it before its build has started. From the
+/// start the definition applies, and the build's chunks and the pages agree
+/// through the ledger entry's `basis`: a delta for a commit a chunk's
+/// snapshot already saw is skipped rather than counted a second time (I1,
+/// #623 D5).
 pub async fn install_definition(
     pool: &Pool,
     source_text: &str,
@@ -1078,8 +1046,7 @@ pub async fn install_definition(
     };
 
     // ADR-0002 (issues #418, #419): registration reads no source rows. The
-    // definition waits for the backfill discharge, which dispatches its build
-    // by shape.
+    // definition waits for the staging worker's pass, which starts its build.
     //
     // `target_schema` — the exact value the DDL above was rendered under — is
     // threaded straight through rather than re-derived from `pool` (issue
@@ -1096,241 +1063,10 @@ pub async fn install_definition(
     .await
 }
 
-/// What [`catch_up_if_backfilling`] did to a definition whose build finished.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BuildFinished {
-    /// It was still `backfilling`, and is now `catching_up`.
-    CatchingUp,
-    /// It had already left `backfilling` (paused, quarantined, or resumed back
-    /// to `waiting_to_backfill`), and was left in this status untouched.
-    LeftAs(TransformStatus),
-}
-
-impl BuildFinished {
-    /// The status the definition is in afterward.
-    fn status(self) -> TransformStatus {
-        match self {
-            BuildFinished::CatchingUp => TransformStatus::CatchingUp,
-            BuildFinished::LeftAs(status) => status,
-        }
-    }
-}
-
-/// Moves an already-persisted definition row `backfilling` -> `catching_up`
-/// once its build finishes (issues #55, #476) — but only if it is *still*
-/// `backfilling` (issue #331). A build runs unlocked against the definition
-/// row for as long as it takes, and an operator pause, the poison fuse, or a
-/// resume can move the row on meanwhile; an unconditional flip would
-/// silently undo that. A definition that moved on is left where it is:
-/// whatever moved it owns its way back to `live` (a frozen definition's
-/// resume rebuilds it by a fresh backfill; a `waiting_to_backfill` one
-/// already sits behind a marker).
-async fn catch_up_if_backfilling(
-    client: &impl GenericClient,
-    id: i64,
-) -> Result<BuildFinished, CatalogError> {
-    let moved = client
-        .execute(
-            "update transform_definitions set status = $1 where id = $2 and status = $3",
-            &[
-                &TransformStatus::CatchingUp.as_str(),
-                &id,
-                &TransformStatus::Backfilling.as_str(),
-            ],
-        )
-        .await?;
-    if moved == 1 {
-        crate::instance_log::info!(
-            definition_id = id,
-            from = %TransformStatus::Backfilling.as_str(),
-            to = %TransformStatus::CatchingUp.as_str(),
-            "transform status transition: backfill build finished"
-        );
-        return Ok(BuildFinished::CatchingUp);
-    }
-    let status_text: String = client
-        .query_one(
-            "select status from transform_definitions where id = $1",
-            &[&id],
-        )
-        .await?
-        .get(0);
-    let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
-        panic!("transform_definitions.status held unrecognized value '{status_text}'")
-    });
-    crate::instance_log::info!(
-        definition_id = id,
-        status = %status.as_str(),
-        "backfill finished, but the definition is no longer backfilling; \
-         leaving its status as it is"
-    );
-    Ok(BuildFinished::LeftAs(status))
-}
-
-/// Moves `definition_id` from [`TransformStatus::Backfilling`] to
-/// [`TransformStatus::CatchingUp`] and parks its go-live catch-up markers —
-/// the "every chunk done" completion event `chunk_queue::finish_chunk` calls
-/// once every `backfill_chunks` row for `definition_id` is done
-/// (ADR-0002). Runs inside the caller's transaction,
-/// which must already hold a `for update` lock on `definition_id`'s
-/// `transform_definitions` row (see `finish_chunk`) — that lock is what
-/// makes two workers finishing different chunks of the same definition
-/// near-simultaneously unable to race this completion in either direction
-/// (both completing it, or neither).
-///
-/// The parked marker (reusing the exact `pending_backfill` mechanism the
-/// ring-fallback path already relies on — see
-/// [`crate::intake::markers::park_catch_up`]) is what makes excluding a
-/// definition still being built from [`dependents_of`]/[`transforms_for_source`]
-/// safe rather than lossy: any CDC delta for this source table that arrived
-/// while this definition sat `backfilling` was never folded into its target
-/// (the exclusion), but this marker's later discharge re-derives the target
-/// from current source state, folding that delta in after all.
-///
-/// **Not `live` yet (issue #476).** Until that discharge has run, the target
-/// may be missing those deltas, and a watermark token wouldn't wait for
-/// them, so the definition reports `catching_up`: applied exactly as a
-/// `live` one is, flipped `live` by the discharge of its last catch-up
-/// (`intake::markers::go_live_caught_up`). ADR-0002, "What `live`
-/// promises".
-///
-/// Completes every build that runs through `backfill_chunks`: a plain 1-1
-/// definition's chunks, and an aggregate definition's direct-build job
-/// (issue #419). The catch-up is parked on every table the build read
-/// ([`tables_read_by`], issue #430).
-///
-/// **Only a still-`backfilling` definition completes (issue #331).** The
-/// pause gates new chunk claims, not a chunk a worker already holds, so the
-/// last chunk can finish after the definition has been paused or quarantined.
-/// [`catch_up_if_backfilling`] leaves a definition that has moved on exactly
-/// as it is; the chunk itself is still retired by the caller. A chunk held
-/// across a *resume* never reaches here: `finish_chunk` discards it instead,
-/// since the resumed definition's rebuild owns its way back to `live`
-/// (issues #360/#397).
-///
-/// The catch-up marker is parked unless the definition is **frozen**. A
-/// frozen one gets nothing from it: resume
-/// ([`crate::staging::quarantine::resume_transform`]) re-parks a marker of
-/// its own and rebuilds by a fresh backfill.
-///
-/// Returns the status the definition is left in:
-/// [`TransformStatus::CatchingUp`] when this call completed it or it was
-/// already applying, its unchanged current status otherwise.
-pub(crate) async fn complete_direct_backfill(
-    txn: &tokio_postgres::Transaction<'_>,
-    definition_id: i64,
-) -> Result<TransformStatus, CatalogError> {
-    // Issue #72 / ADR-0011: `transform_definitions.source_table` is already
-    // the fully-qualified `schema.table` identity persisted at
-    // definition-acceptance time (`create_definition_inner`) — read it back
-    // and use it as-is. It must *not* be re-resolved through
-    // [`resolve_source_schema_in_txn`] a second time here: that function
-    // matches `information_schema.tables.table_name` (a bare name) exactly,
-    // so handing it an already-qualified `"schema.table"` string would never
-    // match anything and this would fail every time with
-    // [`CatalogError::SourceTableNotFound`].
-    let status = catch_up_if_backfilling(txn, definition_id).await?.status();
-    let mut rebuilt = Vec::new();
-    if status == TransformStatus::CatchingUp {
-        // Issue #315: the chunks wrote this target outside the seam; a
-        // reader already attached to it (a resumed upstream's) re-derives,
-        // or, on the group basis, is rebuilt (#1100).
-        rebuilt = crate::intake::markers::park_target_catchup_if_read(txn, definition_id).await?;
-    }
-    if status.is_frozen() {
-        return Ok(status);
-    }
-    let tables = definition_tables_read(txn, definition_id).await?;
-    crate::intake::markers::park_catch_up(txn, &[definition_id], &tables).await?;
-    if status == TransformStatus::CatchingUp {
-        // #1306: the build repaired what its readers may have held keys
-        // for; the staging worker retries them once this commits. After the
-        // definition rows the parks above lock.
-        crate::staging::quarantine::request_upstream_releases(txn, definition_id).await?;
-    }
-    // Last here, so the active segment's share lock is held only for the
-    // rest of the caller's transaction.
-    crate::staging::build::stamp_rebuild_seg(txn, &rebuilt).await?;
-    // The park moves a `live` definition (one a leftover chunk wrote under)
-    // to `catching_up` too.
-    Ok(if status.is_applying() {
-        TransformStatus::CatchingUp
-    } else {
-        status
-    })
-}
-
-/// [`tables_read_by`] for the persisted definition `definition_id`.
-pub(crate) async fn definition_tables_read(
-    txn: &tokio_postgres::Transaction<'_>,
-    definition_id: i64,
-) -> Result<Vec<String>, CatalogError> {
-    let row = txn
-        .query_one(
-            "select source_table, join_table from transform_definitions where id = $1",
-            &[&definition_id],
-        )
-        .await?;
-    Ok(tables_read_by(row.get(0), row.get(1)))
-}
-
-/// Every `catching_up` definition that reads `table`, locked `for update`,
-/// with every table it reads ([`tables_read_by`]): the definitions whose
-/// go-live catch-up the discharge of `table`'s marker may be the last of
-/// (`intake::markers::go_live_caught_up`, issue #476). The definitions
-/// are read unlocked first ([`catching_up_readers_unlocked`]) and only the
-/// ones reading `table` are locked, in id order; one that left `catching_up`
-/// while this waited for its lock is dropped.
-pub(crate) async fn catching_up_readers(
-    txn: &tokio_postgres::Transaction<'_>,
-    table: &str,
-) -> Result<Vec<(i64, Vec<String>)>, CatalogError> {
-    let mut readers = catching_up_readers_unlocked(txn, table).await?;
-    if readers.is_empty() {
-        return Ok(readers);
-    }
-    let ids: Vec<i64> = readers.iter().map(|(id, _)| *id).collect();
-    let still: Vec<i64> = txn
-        .query(
-            "select id from transform_definitions where id = any($1) and status = $2 \
-             order by id for update",
-            &[&ids, &TransformStatus::CatchingUp.as_str()],
-        )
-        .await?
-        .into_iter()
-        .map(|row| row.get(0))
-        .collect();
-    readers.retain(|(id, _)| still.contains(id));
-    Ok(readers)
-}
-
-/// [`catching_up_readers`] without the locks: every definition `catching_up`
-/// as of this statement that reads `table`, with every table it reads.
-pub(crate) async fn catching_up_readers_unlocked(
-    txn: &tokio_postgres::Transaction<'_>,
-    table: &str,
-) -> Result<Vec<(i64, Vec<String>)>, CatalogError> {
-    let rows = txn
-        .query(
-            "select id, source_table, join_table \
-             from transform_definitions where status = $1 order by id",
-            &[&TransformStatus::CatchingUp.as_str()],
-        )
-        .await?;
-    let mut readers = Vec::new();
-    for row in rows {
-        let tables = tables_read_by(row.get(1), row.get(2));
-        if tables.iter().any(|t| t == table) {
-            readers.push((row.get::<_, i64>(0), tables));
-        }
-    }
-    Ok(readers)
-}
-
 /// Every applying definition (`live` or `catching_up`) that reads `table`
 /// ([`tables_read_by`]), in id order: the readers a rewrite of `table`
-/// outside the target-mutation seam has to catch up (issue #507,
-/// `intake::markers::park_target_catchup_if_read`).
+/// outside the target-mutation seam has to rebuild (issue #507,
+/// `intake::catch_up::park_target_catchup_if_read`).
 pub(crate) async fn applying_readers(
     client: &impl GenericClient,
     table: &str,
@@ -1416,8 +1152,8 @@ fn tables_read_by(qualified_source: String, joined: Option<String>) -> Vec<Strin
 ///
 /// Derived when read, not stored. A stored transition would have to follow
 /// every status change of every upstream (pause, resume, quarantine, drop,
-/// each go-live) down the chain, under locks, and a reader's own go-live
-/// would have to check its upstreams as well. The derivation needs only the
+/// each build's completion) down the chain, under locks, and a reader's own
+/// completion would have to check its upstreams as well. The derivation needs only the
 /// catalog: one read of the definitions. The
 /// reported status changes nothing else: the definition keeps applying, as
 /// `catching_up` always does.
@@ -1727,9 +1463,8 @@ pub(crate) async fn is_definition_target(
 /// The changed fields apply from the commit, as a new definition does under
 /// the Re-derive build (#625 B1): every page after it writes them, and each
 /// chunk rewrites them under the keys' entry lock, so no catch-up is needed.
-/// A `catching_up` definition keeps catching up, and its catch-up's
-/// discharge hands it to the field build rather than flipping it `live`
-/// (see `staging::build::takes_field_build`). An edit that only drops fields
+/// Only a definition that applies takes the edit
+/// (`staging::build::takes_field_build`). An edit that only drops fields
 /// builds nothing.
 ///
 /// **The version fence.** This call bumps both `transform_definitions
@@ -1942,7 +1677,7 @@ pub async fn alter_transform(
     // Taking the target's `ACCESS EXCLUSIVE` lock first deadlocks against
     // the drain itself, which row-locks the target; taking the definition
     // row first deadlocks against a drain queued on a transaction that
-    // wants that row, such as the catch-up discharge (issue #744). A drain
+    // wants that row, such as a build's completion (issue #744). A drain
     // that already holds the row finishes first, and one that arrives later
     // waits for this commit and then misses the fence. A refusal below
     // rolls the bump back with everything else.
@@ -1994,7 +1729,7 @@ pub async fn alter_transform(
         panic!("transform_definitions.status held unrecognized value '{status_text}'")
     });
     // A field build (#625 F8b) needs a definition that applies
-    // (`staging::build::takes_field_build`): `live`, `catching_up`, or
+    // (`staging::build::takes_field_build`): `live`, or
     // already under a Re-derive build, which it joins. An edit that only
     // drops fields builds nothing; it takes the same definitions.
     let build: Option<String> = row.get(2);
@@ -3130,9 +2865,8 @@ async fn create_definition_inner(
     // — is what gets persisted
     // (`source_table_versions`/`transform_definitions.source_table` below)
     // and threaded into every side effect that must agree with the
-    // persisted row (the discharge's ring entries and
-    // `complete_direct_backfill`'s catch-up marker elsewhere) *and* (issue
-    // #74) `schema_nodes`/`schema_edges` themselves.
+    // persisted row *and* (issue #74) `schema_nodes`/`schema_edges`
+    // themselves.
     //
     // This matters for the explicit-schema branch specifically: the test
     // fixtures [`create_definition`] and [`create_definition_without_backfill`]
@@ -3143,7 +2877,7 @@ async fn create_definition_inner(
     let qualified_source = match &def.explicit_source_schema {
         Some(schema) => {
             confirm_qualified_source(&*txn, schema, &def.source).await?;
-            crate::intake::markers::qualify(schema, &def.source)?
+            crate::intake::qualify(schema, &def.source)?
         }
         None => match resolve_graph_identity_in_txn(&txn, &def.source).await {
             // Issue #933: a source the role can't see doesn't resolve.
@@ -3165,7 +2899,7 @@ async fn create_definition_inner(
             let joined = match &join.explicit_right_schema {
                 Some(schema) => {
                     confirm_qualified_source(&*txn, schema, &join.right).await?;
-                    crate::intake::markers::qualify(schema, &join.right)?
+                    crate::intake::qualify(schema, &join.right)?
                 }
                 None => match resolve_graph_identity_in_txn(&txn, &join.right).await {
                     Err(err @ CatalogError::SourceTableNotFound(_)) => {
@@ -3267,7 +3001,7 @@ async fn create_definition_inner(
     // trusting the parameter alone, so the existence check runs regardless of
     // which entry point got here.
     //
-    // Built via the same `intake::markers::qualify` helper as
+    // Built via the same `intake::qualify` helper as
     // `qualified_source`, not `ddl::qualified_target_table` directly: the two
     // produce different shapes for different jobs — `qualify` returns the
     // plain, unquoted `"schema.table"` this whole module's qualified-identity
@@ -3284,7 +3018,7 @@ async fn create_definition_inner(
     // there was never an ordering hazard here to begin with; this always ran
     // (and still runs) ahead of the node/cycle checks below.
     let resolved_target_schema = effective_target_schema(&def, target_schema);
-    let qualified_target = crate::intake::markers::qualify(resolved_target_schema, &def.target)?;
+    let qualified_target = crate::intake::qualify(resolved_target_schema, &def.target)?;
     // #979: not in a catalog schema, this instance's or another's. Before
     // any DDL, so nothing is created there.
     reject_target_in_catalog_schema(&*txn, pool.schema(), &qualified_target).await?;
@@ -3884,7 +3618,7 @@ async fn resolve_graph_identity_in_txn(
     table: &str,
 ) -> Result<String, CatalogError> {
     match resolve_source_schema_in_txn(txn, table).await {
-        Ok(schema) => Ok(crate::intake::markers::qualify(&schema, table)?),
+        Ok(schema) => Ok(crate::intake::qualify(&schema, table)?),
         Err(CatalogError::SourceTableNotFound(_)) => {
             let row = txn
                 .query_opt(
@@ -3916,7 +3650,7 @@ pub(crate) async fn resolve_graph_identity(
     table: &str,
 ) -> Result<String, CatalogError> {
     match resolve_source_schema(pool, table).await {
-        Ok(schema) => Ok(crate::intake::markers::qualify(&schema, table)?),
+        Ok(schema) => Ok(crate::intake::qualify(&schema, table)?),
         Err(CatalogError::SourceTableNotFound(_)) => {
             let client = pool.get().await?;
             let row = client
@@ -4227,7 +3961,7 @@ impl JoinSides {
         let joined = match &join.explicit_right_schema {
             Some(schema) => {
                 confirm_qualified_source(&**pool.get().await?, schema, &join.right).await?;
-                crate::intake::markers::qualify(schema, &join.right)?
+                crate::intake::qualify(schema, &join.right)?
             }
             None => resolve_graph_identity(pool, &join.right).await?,
         };
@@ -4400,7 +4134,7 @@ pub(crate) async fn resolve_source_for_install(
     def: &TransformDef,
 ) -> Result<String, CatalogError> {
     match &def.explicit_source_schema {
-        Some(schema) => Ok(crate::intake::markers::qualify(schema, &def.source)?),
+        Some(schema) => Ok(crate::intake::qualify(schema, &def.source)?),
         None => resolve_graph_identity(pool, &def.source).await,
     }
 }
@@ -5658,25 +5392,16 @@ struct PendingDefinition {
 ///
 /// **Applying definitions only** ([`super::model::APPLYING_SQL`]:
 /// `live` or `catching_up`, or `backfilling` under a Re-derive build, which
-/// applies from its start, #625 F2; ADR-0002,
-/// closing the CDC race commit 1fa8570 reopened): a `waiting_to_backfill`/
-/// `backfilling`/`quarantined` definition's target may not yet reflect every
-/// pre-existing source row (the direct-build chunk queue, or a
-/// still-in-flight ring enumeration, hasn't necessarily finished), so a live
-/// CDC delta folded into it now — via [`transforms_for_source`], the apply
-/// path's read of this function — could permanently corrupt a value an
-/// incremental accumulator (e.g. `AVG`) computes against a baseline. Excluding
-/// those rows here means the apply path simply never attempts them, and the
-/// skipped delta itself is dropped. What it changed is recovered from state
-/// instead, by the discharge of the go-live catch-up
-/// ([`crate::intake::markers::run_pending_backfills`]; the same
-/// `pending_backfill` marker the ring-fallback path relies on, parked when a
-/// build finishes and the definition moves to [`TransformStatus::CatchingUp`]:
-/// by [`complete_direct_backfill`] for a chunked build or a direct-build job,
-/// on every table that build read, issue #430). Its re-read re-derives every
-/// key the source still has. That can't reach a key whose source row a
-/// skipped delete removed, so the same discharge also deletes every target
-/// row no source row backs any more (issue #485, `intake::resume_orphans`).
+/// applies from its start, #625 F2; ADR-0002): a `waiting_to_backfill`
+/// or `quarantined` definition's target may not reflect every pre-existing
+/// source row, so a live CDC delta folded into it now — via
+/// [`transforms_for_source`], the apply path's read of this function — could
+/// permanently corrupt a value an incremental accumulator (e.g. `AVG`)
+/// computes against a baseline. Excluding those rows here means the apply
+/// path simply never attempts them. What a skipped delta changed is
+/// recovered from state when the definition is built or resumed: its build
+/// re-derives every key the source has and sweeps the ones it no longer
+/// backs.
 ///
 /// `node_table` ($1) must already be fully-qualified (issue #74, ADR-0011)
 /// — matched exactly against `schema_nodes.table_name`, which is now always
@@ -5799,7 +5524,7 @@ pub async fn transforms_for_source(
 ///
 /// Issue #14: a running [`crate::Client`]'s maintenance loop polls this to
 /// notice a transform registered against a table it hasn't seen before, so it
-/// can install that table's capture and discharge its backfill without
+/// can install that table's capture and start its build without
 /// waiting for a restart.
 pub async fn all_source_tables(pool: &Pool) -> Result<Vec<String>, CatalogError> {
     let client = pool.get().await?;
@@ -5836,6 +5561,7 @@ pub(crate) async fn forget_unread_capture_records(
     for table in [
         "capture_triggers",
         "capture_baselines",
+        "capture_gates",
         "partition_corrections",
         "partition_sources",
     ] {
@@ -5866,86 +5592,6 @@ fn reachable_tables_cte(anchor_filter: &str) -> String {
             where join_table is not null and {anchor_filter}
          )"
     )
-}
-
-/// Whether `qualified_table` has a reader that needs the rows of an
-/// enumeration of it: a `catching_up` definition (a catch-up's reader) with
-/// no Re-derive build running, reading the table as its source or `JOIN`
-/// table ([`all_source_tables`]'s set). The backfill
-/// discharge ([`crate::intake::markers::run_pending_backfills`]) skips
-/// enumerating a table this says `false` for (issues #417, #732, #938, #1322).
-///
-/// Any other definition reading the table doesn't count: either the drain
-/// would drop its share of the rows, or a build already read them, and
-/// something else covers it:
-///
-/// - **A `live` definition** (#1322): its build read every row and capture has
-///   staged every change since. Every park that leaves a reader possibly
-///   missing changes goes through
-///   [`crate::intake::markers::park_catch_up`], which moves it to
-///   `catching_up`. The other parks (a registration, a widen, a failed direct
-///   build, a resume) dispatch a definition that isn't applying, and their
-///   discharge enumerates only for a ring-built one. Counting a `live` reader
-///   had a second definition's registration re-read the whole table for it,
-///   and a group-basis reader recomputes nearly every group per page of that.
-///
-/// - **A definition whose Re-derive build is running** (#625 F2) reads the
-///   table in its chunks, and applies the changes after its start.
-/// - **A `waiting_to_backfill` or `backfilling` definition** isn't applying,
-///   so a page drops its share of the rows. The marker that dispatches a
-///   waiting one enumerates for it if its build is ring-built; a chunked or
-///   direct build reads the table itself, and its go-live catch-up (a
-///   `catching_up` reader) enumerates for it after.
-/// - **A frozen definition** (issue #813): the drain drops its share of every
-///   page, and its resume rebuilds it from the source. Counting it would also
-///   have a discharge re-read a table Postgres refuses the role, for nothing,
-///   after the refusal paused every reader of it.
-/// - **A definition anchored on the table whose Re-derive build started after
-///   the marker's last park** (#938): `marker_generation` is the generation of
-///   the marker being discharged, and `transform_definitions.
-///   build_marker_generation` is the one its start read. They are equal only
-///   when the start read the marker as it is now, so it began after the
-///   capture install or widen that parked it committed. Its chunks read every
-///   row the capture didn't stage, and the capture stages every later change.
-///   A start that read no marker, or an older generation, still counts.
-pub(crate) async fn table_has_reader(
-    client: &impl GenericClient,
-    qualified_table: &str,
-    marker_generation: i64,
-) -> Result<bool, tokio_postgres::Error> {
-    readers_exist(
-        client,
-        qualified_table,
-        &[TransformStatus::CatchingUp.as_str()],
-        Some(marker_generation),
-    )
-    .await
-}
-
-/// Whether a registered definition in one of `statuses`, with no Re-derive
-/// build running, reads `qualified_table`, other than (with
-/// `skip_started_at`) an anchor reader of it whose Re-derive build started at
-/// that marker generation ([`table_has_reader`]).
-async fn readers_exist(
-    client: &impl GenericClient,
-    qualified_table: &str,
-    statuses: &[&str],
-    skip_started_at: Option<i64>,
-) -> Result<bool, tokio_postgres::Error> {
-    Ok(client
-        .query_one(
-            &format!(
-                "{} select exists (select 1 from reachable where table_name = $1)",
-                reachable_tables_cte(
-                    "build is null and status = any($2) \
-                     and not ((source_table = $1 or coalesce(join_table = $1, false)) \
-                              and coalesce(build_marker_generation = $3::bigint, false))"
-                )
-            ),
-            &[&qualified_table, &statuses, &skip_started_at],
-        )
-        .await?
-        .get(0))
 }
 
 /// The tables this instance's capture triggers should cover (issue #622):
@@ -6589,10 +6235,6 @@ fn expr_references_column(
     }
 }
 
-/// Issue #331: every build-finished flip (the chunk queue's completion of a
-/// definition's last chunk or its direct-build job) goes through
-/// [`catch_up_if_backfilling`], which must only ever move a definition that is
-/// still `backfilling` — never one paused, quarantined or resumed meanwhile.
 #[cfg(test)]
 mod go_live_tests {
     use super::*;
@@ -6608,205 +6250,6 @@ mod go_live_tests {
             "TRANSFORM t FROM orders JOIN items ON orders.id = items.order_id \
              GROUP BY orders.region SELECT COUNT(*) AS n",
         );
-    }
-
-    #[tokio::test]
-    async fn only_a_still_backfilling_definition_starts_catching_up() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let client = db.pool.get().await.expect("acquire connection");
-        client
-            .execute(
-                "insert into source_table_versions (source_table, version) \
-                 values ('public.orders', 1)",
-                &[],
-            )
-            .await
-            .expect("seed source_table_versions");
-
-        for status in TransformStatus::ALL {
-            let id: i64 = client
-                .query_one(
-                    "insert into transform_definitions \
-                     (target_table, source_table, source_version, definition_text, status) \
-                     values ($1, 'public.orders', 1, '', $2) returning id",
-                    &[&format!("public.t_{}", status.as_str()), &status.as_str()],
-                )
-                .await
-                .expect("seed a definition")
-                .get(0);
-
-            let outcome = catch_up_if_backfilling(&**client, id)
-                .await
-                .expect("catch_up_if_backfilling");
-            let persisted: String = client
-                .query_one(
-                    "select status from transform_definitions where id = $1",
-                    &[&id],
-                )
-                .await
-                .expect("read status")
-                .get(0);
-
-            if status == TransformStatus::Backfilling {
-                assert_eq!(outcome, BuildFinished::CatchingUp);
-                assert_eq!(persisted, "catching_up");
-            } else {
-                assert_eq!(outcome, BuildFinished::LeftAs(status));
-                assert_eq!(persisted, status.as_str(), "{status:?} is left untouched");
-            }
-        }
-    }
-
-    /// The chunk queue's completion parks its catch-up marker for every
-    /// definition it leaves unfrozen, not only one it flipped itself. That
-    /// includes a definition resume's rebuild already took `live` while a
-    /// leftover chunk (#332) was still writing. A frozen definition gets no
-    /// marker, since its resume parks its own.
-    #[tokio::test]
-    async fn chunk_completion_parks_a_catch_up_unless_the_definition_is_frozen() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let mut client = db.pool.get().await.expect("acquire connection");
-        client
-            .execute(
-                "insert into source_table_versions (source_table, version) \
-                 values ('public.orders', 1)",
-                &[],
-            )
-            .await
-            .expect("seed source_table_versions");
-
-        for status in TransformStatus::ALL {
-            client
-                .execute("delete from pending_backfill", &[])
-                .await
-                .expect("clear markers");
-            let id: i64 = client
-                .query_one(
-                    "insert into transform_definitions \
-                     (target_table, source_table, source_version, definition_text, status) \
-                     values ($1, 'public.orders', 1, $3, $2) returning id",
-                    &[
-                        &format!("public.t_{}", status.as_str()),
-                        &status.as_str(),
-                        &format!("TRANSFORM t_{} FROM orders SELECT a AS x", status.as_str()),
-                    ],
-                )
-                .await
-                .expect("seed a definition")
-                .get(0);
-
-            let txn = client.transaction().await.expect("begin");
-            let left = complete_direct_backfill(&txn, id)
-                .await
-                .expect("complete_direct_backfill");
-            txn.commit().await.expect("commit");
-
-            let parked: bool = client
-                .query_one(
-                    "select exists(select 1 from pending_backfill \
-                     where table_name = 'public.orders')",
-                    &[],
-                )
-                .await
-                .expect("read markers")
-                .get(0);
-            let expected = if status == TransformStatus::Backfilling || status.is_applying() {
-                TransformStatus::CatchingUp
-            } else {
-                status
-            };
-            assert_eq!(left, expected, "{status:?}: status left behind");
-            assert_eq!(
-                parked,
-                !status.is_frozen(),
-                "{status:?}: a catch-up marker is parked exactly when the definition is unfrozen"
-            );
-        }
-    }
-
-    /// #1306: a direct build's completion asks for the release of the keys
-    /// its target's direct readers hold (a source reader and a `JOIN` side
-    /// reader), in its own transaction, and a frozen upstream's completion
-    /// asks for nothing.
-    #[tokio::test]
-    async fn chunk_completion_asks_for_its_readers_releases() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let mut client = db.pool.get().await.expect("acquire connection");
-        client
-            .execute(
-                "insert into source_table_versions (source_table, version) \
-                 values ('public.orders', 1), ('public.up', 1)",
-                &[],
-            )
-            .await
-            .expect("seed source_table_versions");
-        let mut ids = Vec::new();
-        for (target, source, status) in [
-            ("public.up", "public.orders", TransformStatus::Backfilling),
-            ("public.frozen_up", "public.orders", TransformStatus::Paused),
-            ("public.r", "public.up", TransformStatus::Live),
-            ("public.other", "public.orders", TransformStatus::Live),
-            ("public.j", "public.orders", TransformStatus::Live),
-        ] {
-            let id: i64 = client
-                .query_one(
-                    "insert into transform_definitions \
-                     (target_table, source_table, source_version, definition_text, status) \
-                     values ($1, $2, 1, $3, $4) returning id",
-                    &[
-                        &target,
-                        &source,
-                        &format!("TRANSFORM x FROM {source} SELECT a AS x"),
-                        &status.as_str(),
-                    ],
-                )
-                .await
-                .expect("seed a definition")
-                .get(0);
-            ids.push(id);
-        }
-        // `j` reads `up` as its `JOIN` side.
-        client
-            .execute(
-                "update transform_definitions set join_table = 'public.up', join_columns = '{}' \
-                 where id = $1",
-                &[&ids[4]],
-            )
-            .await
-            .expect("make j a JOIN reader of up");
-        let txn = client.transaction().await.expect("begin");
-        complete_direct_backfill(&txn, ids[1])
-            .await
-            .expect("complete the frozen build");
-        txn.commit().await.expect("commit");
-        assert_eq!(requested(&client).await, Vec::<i64>::new());
-
-        let txn = client.transaction().await.expect("begin");
-        complete_direct_backfill(&txn, ids[0])
-            .await
-            .expect("complete up's build");
-        txn.commit().await.expect("commit");
-        assert_eq!(
-            requested(&client).await,
-            vec![ids[2], ids[4]],
-            "only r and j read up"
-        );
-    }
-
-    async fn requested(client: &tokio_postgres::Client) -> Vec<i64> {
-        client
-            .query(
-                "select transform_id from upstream_releases order by transform_id",
-                &[],
-            )
-            .await
-            .expect("read the requests")
-            .iter()
-            .map(|row| row.get::<_, i64>(0))
-            .collect()
     }
 }
 

@@ -8,19 +8,15 @@
 //! # The scheduled build (F2, F3)
 //!
 //! - **Start** ([`start_ready_builds`]). The staging worker's reconcile pass
-//!   starts each ready definition that [`qualifies`] instead of parking it a
-//!   registration marker: once its source's capture gate is clear, one
+//!   starts each ready definition: once its source's capture gate is clear, one
 //!   transaction moves it `waiting_to_backfill -> backfilling` with
 //!   `transform_definitions.build = 'rederive'` and enqueues its plan job.
 //!   From that commit it applies (`defs::model::APPLYING_SQL`, B1): Apply
 //!   folds its source's changes into its target, so nothing needs
-//!   a catch-up. The start also records `build_seg`, the segment active at
+//!   a catch-up afterwards. The start also records `build_seg`, the segment active at
 //!   its commit, and a page re-derives rather than applies the keys of any
-//!   batch at or below it (#733, see `start`). The backfill discharge never
-//!   dispatches a definition that qualifies (`intake::markers`), and a
-//!   resume leaves it to this start
-//!   (`super::quarantine::resume_transform`), so each definition is on
-//!   exactly one build path.
+//!   batch at or below it (#733, see `start`). A resume leaves the rebuild to
+//!   this start (`super::quarantine::resume_transform`).
 //! - **Rebuild** (F3). A resumed 1-1 definition keeps its ledger, so its
 //!   build is a Re-derive over its existing entries, with no truncate. Its
 //!   start also enqueues a **sweep** job ([`run_sweep`]): once the plan job
@@ -30,7 +26,7 @@
 //!   ledger is empty at its start, so it gets no sweep.
 //! - **Rebuild of an applying definition** (F7). `Trellis::request_backfill`
 //!   and a capture re-install repair a table's `live` readers by rebuilding
-//!   the ones this build serves ([`start_rebuilds`]): the call's own
+//!   them ([`start_rebuilds`]): the call's own
 //!   transaction moves each `live -> backfilling` and enqueues one plan job
 //!   and one sweep job, two rows per definition, so the call stays fast
 //!   whatever the table's size. The definition applies throughout, the plan
@@ -39,8 +35,7 @@
 //!   repaired too. The status is `backfilling` when the call returns, which
 //!   is what a caller polling for `live` waits on. A request while a build
 //!   runs enqueues another plan and sweep; the definition is `live` when
-//!   every one is done. Every other reader gets the marker's go-live
-//!   catch-up.
+//!   every one is done.
 //!
 //!   An aggregate (`super::group_basis`) has no entries to re-derive, so its
 //!   rebuild is its sweep job alone, which recomputes
@@ -68,7 +63,7 @@
 //!   entry lock gives up after [`CHUNK_LOCK_TIMEOUT`], and the chunk is
 //!   retried after a short backoff without a charge.
 //! - **Live** ([`try_complete`], B7). The flip is strict: the plan job is
-//!   done and every chunk is done, checked under the definition's row lock. No catch-up is parked. The same transaction
+//!   done and every chunk is done, checked under the definition's row lock. The same transaction
 //!   deletes the definition's done `backfill_chunks` rows, so the table holds
 //!   one build's rows at a time, not every build's.
 //!
@@ -102,7 +97,7 @@
 //! a group-basis aggregate's or a `JOIN`'s one-transaction build runs after
 //! the fence, in the plan job). The plan
 //! job's first act is to take a fence: the id of a transaction that began
-//! after the start commit (`intake::markers`' `confirm_fence`, #431's rule),
+//! after the start commit,
 //! recorded on the plan row (`backfill_chunks.fence_xid`). It enqueues no
 //! chunk until the oldest running transaction began after the fence
 //! ([`fence_settled`]), so every writer that could have missed the build has
@@ -110,10 +105,9 @@
 //! its claim back and tries again ([`FENCE_RETRY`]), and
 //! `Trellis::status` names the fence (`DefinitionStatus::build_wait`). Only a
 //! seam-fed build waits, and only on transactions older than its fence: a
-//! long transaction elsewhere delays seam-fed builds, as the `xmin` caveat
-//! (the marker fence's) does today. A build's writes to a Re-derive-built
-//! upstream go through the seam as any writer's do, so a rebuild of an
-//! upstream parks no catch-up for its readers.
+//! long transaction elsewhere delays seam-fed builds. A 1-1 build's writes to
+//! an upstream go through the seam as any writer's do, so a rebuild of a 1-1
+//! upstream needs no rebuild of its readers.
 //!
 //! **Plain 1-1 targets (F8a, [`one_to_one`]).** A 1-1 target takes the same
 //! scheduled build:
@@ -239,79 +233,26 @@ fn takes_group_basis(definition: &Definition) -> bool {
         || super::join::applies(&definition.def)
 }
 
-/// Whether a Re-derive build may take `definition` (#625 F2, F5, F6, F8a): an
-/// aggregate on the group basis, a `JOIN`, or a plain 1-1 target
-/// ([`one_to_one::buildable`]). Its source may be captured or another
-/// definition's target.
-///
-/// A source that is another definition's target is fed by the
-/// target-mutation seam, whose writer decides inside its own apply
-/// transaction whether this definition applies and can commit after a
-/// chunk's snapshot. The build is fenced for it (F6, see the module doc's
-/// "Seam-fed sources"), and takes the same start as any other.
-///
-/// Taking one also changes what a failing chunk's narrowing must count: see
-/// `defs::chunk_queue::fail_chunk`'s Re-derive arm.
-#[cfg_attr(
-    not(any(test, feature = "internals")),
-    allow(unused_variables, clippy::unused_async)
-)]
-pub async fn qualifies(
-    client: &impl GenericClient,
-    definition: &Definition,
-) -> Result<bool, catalog::CatalogError> {
-    if matches!(
-        definition.def.key_space,
-        crate::defs::ast::KeySpace::Join(_)
-    ) && !super::join::applies(&definition.def)
-    {
-        return Ok(false);
-    }
-    if !one_to_one::buildable(definition) && !takes_group_basis(definition) {
-        return Ok(false);
-    }
-    #[cfg(any(test, feature = "internals"))]
-    if crate::intake::markers::is_held_out_of_the_rederive_build(client, &definition.source_table)
-        .await?
-        || crate::intake::markers::is_target_held_out_of_the_rederive_build(
-            client,
-            &definition.source_table,
-            &definition.target_table,
-        )
-        .await?
-    {
-        return Ok(false);
-    }
-    Ok(true)
-}
-
-/// Starts a Re-derive build for every definition in `ready` that
-/// [`qualifies`] (#625 F2). `ready` is what the staging worker's capture pass
-/// found dispatchable (`capture::reconcile`): the definitions it would
-/// otherwise park a registration marker for. Returns the ones the old build
-/// path must leave alone: those started, those waiting on their source's
-/// capture gate, those whose start timed out waiting for the column-pause
-/// lock (#922) or failed transiently, which the next pass starts, and those
-/// whose start failed for good (#986): a failure that would reproduce on
-/// every pass, such as a dropped ledger table, pauses that definition and
-/// what is downstream of its target with the error as its `capture_failure`
-/// ([`super::halt::halt_failed_start`]), so it neither fails this call nor
-/// stops the other definitions' starts. Only a lost connection returns an
-/// error from a start.
-///
-/// The gate is the discharge's (`intake::markers`, Q2(a)): while any change
-/// to the source at or below the gate its capture install or widen recorded
-/// is still pending, a definition that started applying would meet rows
-/// imaged without a column it reads. Such a definition is left
-/// `waiting_to_backfill` for a later pass; nothing waits here.
+/// Starts a Re-derive build for every `waiting_to_backfill` definition in
+/// `ready` (#625 F2). `ready` is what the staging worker's capture pass found
+/// dispatchable (`capture::reconcile`). One whose source (or a `JOIN`'s
+/// joined table) has a capture gate a pending change still holds
+/// ([`crate::capture::gate`]) would meet rows imaged without a column it
+/// reads, so it is left `waiting_to_backfill` for a later pass, as is one
+/// whose start timed out waiting for the column-pause lock (#922) or failed
+/// transiently. A start that failed for good (#986), a failure that would
+/// reproduce on every pass such as a dropped ledger table, pauses that
+/// definition and what is downstream of its target with the error as its
+/// `capture_failure` ([`super::halt::halt_failed_start`]), so it neither
+/// fails this call nor stops the other definitions' starts. Only a lost
+/// connection returns an error from a start.
 ///
 /// A start is one transaction ([`start`]).
 pub async fn start_ready_builds(
     client: &mut tokio_postgres::Client,
     pool: &Pool,
     ready: &[i64],
-) -> Result<Vec<i64>, ApplyError> {
-    let mut taken = Vec::new();
+) -> Result<(), ApplyError> {
     for &id in ready {
         let Some(definition) = catalog::definition_by_id(pool, id).await? else {
             continue;
@@ -319,24 +260,15 @@ pub async fn start_ready_builds(
         if definition.status != TransformStatus::WaitingToBackfill {
             continue;
         }
-        // No build but the JOIN build may take a JOIN (#1107, #1109): the plan job
-        // builds both structures (`super::join`).
+        // A JOIN's plan job builds both structures (#1107, #1109,
+        // `super::join`), so both of its tables' gates hold it.
         let join = match &definition.def.key_space {
-            crate::defs::ast::KeySpace::Join(_) => {
-                if !super::join::applies(&definition.def) {
-                    taken.push(id);
-                    continue;
-                }
-                catalog::join_table_of(&*client, id).await?
-            }
+            crate::defs::ast::KeySpace::Join(_) => catalog::join_table_of(&*client, id).await?,
             _ => None,
         };
-        if !qualifies(&*client, &definition).await? {
-            continue;
-        }
-        let mut gated = capture_gate_holds(&*client, &definition.source_table).await?;
+        let mut gated = crate::capture::gate::holds(&*client, &definition.source_table).await?;
         if let Some(joined) = &join {
-            gated = gated || capture_gate_holds(&*client, joined).await?;
+            gated = gated || crate::capture::gate::holds(&*client, joined).await?;
         }
         if gated {
             crate::instance_log::debug!(
@@ -344,7 +276,6 @@ pub async fn start_ready_builds(
                 table = %definition.source_table,
                 "re-derive build held by its source's capture gate"
             );
-            taken.push(id);
             continue;
         }
         if awaits_capture(&*client, &definition).await? {
@@ -353,12 +284,10 @@ pub async fn start_ready_builds(
                 table = %definition.source_table,
                 "re-derive build held until its source's capture images an edited field's column"
             );
-            taken.push(id);
             continue;
         }
         match start(client, pool.schema(), &definition).await {
             Ok(Some(dependents)) => {
-                taken.push(id);
                 // The build has started; readers elsewhere that the release
                 // left paused are resumed after it (issue #918).
                 resume_released_dependents(pool, &definition.def.target, dependents).await;
@@ -366,16 +295,14 @@ pub async fn start_ready_builds(
             Ok(None) => {}
             // A start waits for the column-pause lock (#922). One that
             // times out wrote nothing; it stays `waiting_to_backfill` for
-            // the next pass, and gets no registration marker meanwhile,
-            // as one held by its capture gate does. The rest of the pass
-            // goes on.
+            // the next pass, as one held by its capture gate does. The rest
+            // of the pass goes on.
             Err(ApplyError::ColumnPauseLockTimeout(err)) => {
                 crate::instance_log::warn!(
                     definition_id = id,
                     error = %err,
                     "re-derive build start waited out the column-pause lock; retrying next pass"
                 );
-                taken.push(id);
             }
             // A lost connection fails the pass, which reconnects.
             Err(err) if client.is_closed() => return Err(err),
@@ -387,16 +314,14 @@ pub async fn start_ready_builds(
                     error = %err,
                     "re-derive build start failed transiently; retrying next pass"
                 );
-                taken.push(id);
             }
             // Anything else reproduces on every pass (a dropped ledger
             // table, #986), and returning it would stop the pass before it
-            // started the other definitions' builds, parked their markers
-            // or ran their backfills. Pause this definition, and what is
+            // started the other definitions' builds. Pause this definition, and what is
             // downstream of its target, with the error as its
             // `capture_failure`, as a build that keeps failing does
             // (`fail_chunk`); a resume rebuilds it, or refuses with the
-            // repair. It gets no registration marker: it is frozen now.
+            // repair.
             Err(err) => {
                 match super::halt::halt_failed_start(
                     pool,
@@ -419,11 +344,27 @@ pub async fn start_ready_builds(
                         "re-derive build start failed, and pausing on it failed; retrying next pass"
                     ),
                 }
-                taken.push(id);
             }
         }
     }
-    Ok(taken)
+    // The gates that held a build and are clear now have served.
+    crate::capture::gate::release_passed(&*client)
+        .await
+        .map_err(capture_error)?;
+    Ok(())
+}
+
+/// A capture error a build step met, as the [`ApplyError`] it fails with.
+fn capture_error(err: crate::capture::CaptureError) -> ApplyError {
+    use crate::capture::CaptureError;
+    match err {
+        CaptureError::Db(err) => ApplyError::from(err),
+        CaptureError::Catalog(err) => ApplyError::from(err),
+        CaptureError::Intake(err) => ApplyError::from(err),
+        other => ApplyError::from(crate::intake::IntakeError::InvalidTableName(
+            other.to_string(),
+        )),
+    }
 }
 
 /// Whether `definition` has a field `ALTER TRANSFORM` holds out of Apply
@@ -554,22 +495,6 @@ pub(crate) async fn resume_released_dependents(
     }
 }
 
-/// Whether `table` has a capture gate a pending change still holds
-/// (`pending_backfill.capture_gate_lsn`, as the discharge reads it).
-async fn capture_gate_holds(client: &impl GenericClient, table: &str) -> Result<bool, ApplyError> {
-    let gate: Option<crate::PgLsn> = client
-        .query_opt(
-            "select capture_gate_lsn from pending_backfill where table_name = $1",
-            &[&table],
-        )
-        .await?
-        .and_then(|row| row.get(0));
-    Ok(match gate {
-        Some(gate) => super::converge::table_changes_pending_through(client, table, gate).await?,
-        None => false,
-    })
-}
-
 /// Starts `definition`'s Re-derive build in one transaction (#625 F2, B1):
 /// under its row lock, moves it `waiting_to_backfill -> backfilling` with
 /// `build = 'rederive'` and enqueues its plan job. From that commit it
@@ -597,18 +522,6 @@ async fn capture_gate_holds(client: &impl GenericClient, table: &str) -> Result<
 /// ([`ledger::page_may_predate_build`]). Every batch above it holds only
 /// changes committed after the start, drained by pages that read the
 /// definition list after it, so none is dropped.
-///
-/// **The start's marker (#938).** The start also stores the generation of
-/// its source's `pending_backfill` marker that it read, as
-/// `build_marker_generation` (null if the source has none). Every park draws a
-/// fresh generation, and a capture install or widen parks in the transaction
-/// that changes the capture, so a start that read generation `g` began after
-/// the park that made `g` committed. The discharge of a marker still at
-/// generation `g` then has nothing to enumerate for this definition once it
-/// is applying again: its chunks read every row the capture didn't stage, and
-/// the capture stages every change after. A marker re-parked since has a
-/// newer generation, and the definition counts as a reader of it again
-/// (`defs::catalog::table_has_reader`).
 ///
 /// Returns `None`, writing nothing, when the definition left
 /// `waiting_to_backfill` meanwhile, and otherwise the readers in other
@@ -682,16 +595,6 @@ async fn start(
         )
         .await?;
     }
-    // The source marker's generation this start read (#938): see this
-    // function's doc, "The start's marker".
-    txn.execute(
-        "update transform_definitions d set build_marker_generation = \
-             (select pb.generation from pending_backfill pb \
-              where pb.table_name = d.source_table) \
-         where d.id = $1",
-        &[&definition.id],
-    )
-    .await?;
     // The start's segment (#733), last, so the share lock that keeps the
     // active segment from sealing until this commits is held only for the
     // commit. See this function's doc.
@@ -716,8 +619,7 @@ async fn start(
 /// The definitions reading one of `tables` as their source, or a `JOIN`
 /// reading one as its joined table, that a rebuild could take (#625 F7,
 /// #1109): applying ones (`live`, and `backfilling` under a
-/// Re-derive build; not `catching_up`, whose catch-up is parked), in id
-/// order. A candidate only: [`rebuildable`] decides, under the row locks.
+/// Re-derive build), in id order. A candidate only: [`rebuildable`] decides, under the row locks.
 pub(crate) async fn rebuild_candidates(
     client: &impl GenericClient,
     tables: &[String],
@@ -742,15 +644,14 @@ pub(crate) async fn rebuild_candidates(
 }
 
 /// The definitions among `ids` that a rebuild takes (#625 F7): the ones that
-/// still apply (`live`, or `backfilling` under a Re-derive build) and
-/// [`qualifies`] for the Re-derive build. The caller holds their rows `for
-/// update` (`intake::markers::park_table_catch_ups`), so what this reads
+/// still apply (`live`, or `backfilling` under a Re-derive build). The caller
+/// holds their rows `for update` (`intake::catch_up`), so what this reads
 /// holds until it commits.
 pub(crate) async fn rebuildable(
     client: &impl GenericClient,
     ids: &[i64],
-) -> Result<Vec<i64>, crate::intake::IntakeError> {
-    let still: Vec<i64> = client
+) -> Result<Vec<i64>, tokio_postgres::Error> {
+    Ok(client
         .query(
             "select id from transform_definitions \
              where id = any($1) and (status = $2 or (status = $3 and build = $4)) \
@@ -765,39 +666,7 @@ pub(crate) async fn rebuildable(
         .await?
         .into_iter()
         .map(|row| row.get(0))
-        .collect();
-    let mut taken = Vec::new();
-    for id in still {
-        if let Some(definition) = catalog::definition_by_id_in(client, id).await?
-            && qualifies(client, &definition).await?
-        {
-            taken.push(id);
-        }
-    }
-    Ok(taken)
-}
-
-/// The definitions among `ids` that [`rebuildable`] takes and that are on the
-/// group basis ([`takes_group_basis`]): the readers of a target an upstream
-/// build rewrote outside the seam that are rebuilt rather than caught up
-/// (`intake::markers::park_target_catchup_if_read`, #1100). The caller holds
-/// their rows `for update`.
-pub(crate) async fn rebuildable_on_group_basis(
-    client: &impl GenericClient,
-    ids: &[i64],
-) -> Result<Vec<i64>, crate::intake::IntakeError> {
-    let mut taken = Vec::new();
-    if ids.is_empty() {
-        return Ok(taken);
-    }
-    for id in rebuildable(client, ids).await? {
-        if let Some(definition) = catalog::definition_by_id_in(client, id).await?
-            && takes_group_basis(&definition)
-        {
-            taken.push(id);
-        }
-    }
-    Ok(taken)
+        .collect())
 }
 
 /// Rebuilds the definitions `ids` ([`rebuildable`]) in `txn`, the caller's
@@ -811,12 +680,9 @@ pub(crate) async fn rebuildable_on_group_basis(
 /// `super::group_basis`, or a `JOIN`'s hidden tables) gets the sweep job
 /// alone, which recomputes its groups in place ([`run_group_rebuild`]).
 ///
-/// The definition applies throughout (B1), as it did before the call, so
-/// nothing is parked for it: the caller leaves it out of its catch-up. Its
-/// source's marker, which the caller parks first, has nothing to enumerate
-/// for it (`build_marker_generation`, #938). The caller holds each
-/// definition's row `for update`, and calls [`stamp_rebuild_seg`] as the
-/// last statement before it commits.
+/// The definition applies throughout (B1), as it did before the call. The
+/// caller holds each definition's row `for update`, and calls
+/// [`stamp_rebuild_seg`] as the last statement before it commits.
 ///
 /// From the commit the definition reads `backfilling`, so a caller that
 /// waits for `live` waits for the rebuild (#625 comment 2).
@@ -862,15 +728,6 @@ pub(crate) async fn start_rebuilds(
         )
         .await?;
     }
-    // The source marker's generation this start read (#938), as `start`'s.
-    txn.execute(
-        "update transform_definitions d set build_marker_generation = \
-             (select pb.generation from pending_backfill pb \
-              where pb.table_name = d.source_table) \
-         where d.id = any($1)",
-        &[&ids],
-    )
-    .await?;
     if !moved.is_empty() {
         crate::instance_log::info!(
             ids = ?moved,
@@ -905,20 +762,17 @@ pub(crate) async fn stamp_rebuild_seg(
 
 /// Whether a definition read as `status` with `build` can take a field
 /// build ([`start_field_build`], #625 F8b): one that applies. That is a
-/// `live` one, a `catching_up` one (whose catch-up's discharge then hands it
-/// to this build rather than flipping it `live` while field chunks remain,
-/// `intake::markers`' `go_live_caught_up`), or a `backfilling` one under a
-/// Re-derive build, which the field build joins. A definition behind an
-/// old-path build, or frozen, doesn't apply.
+/// `live` one, or a `backfilling` one under a Re-derive build, which the field
+/// build joins. A frozen definition doesn't apply.
 pub(crate) fn takes_field_build(status: TransformStatus, build: Option<&str>) -> bool {
-    matches!(status, TransformStatus::Live | TransformStatus::CatchingUp)
+    status == TransformStatus::Live
         || (status == TransformStatus::Backfilling && build == Some(BUILD_REDERIVE))
 }
 
 /// Starts a field build of `fields` on definition `id` in `txn`, the
 /// caller's transaction (see the module doc's "Field builds"): moves a
 /// `live` definition to `backfilling` with `build = 'rederive'` (one already
-/// building, or `catching_up`, stays as it is) and enqueues a plan job
+/// building, stays as it is) and enqueues a plan job
 /// scoped to `fields`. The caller holds the definition's row `for update`
 /// and has checked
 /// [`takes_field_build`] against what it read under that lock (`status`),
@@ -978,11 +832,11 @@ const FIELD_CAPTURE_RETRY: Duration = Duration::from_millis(500);
 /// A field build's start (see the module doc's "Field builds"): releases
 /// the `awaiting_capture` pauses `ALTER TRANSFORM` put on `fields` once the
 /// definition's source is ready for them, in one transaction fenced by the
-/// plan job's claim. Ready means what the backfill discharge required of a
-/// registration (`intake::markers`): the installed capture images every
+/// plan job's claim. Ready means what a build start requires of a
+/// registration (`start_ready_builds`): the installed capture images every
 /// source column the definition reads ([`capture_images`]),
 /// and no change at or below the source's capture gate is still pending
-/// ([`capture_gate_holds`]), so no row staged without a column is left for a
+/// ([`crate::capture::gate::holds`]), so no row staged without a column is left for a
 /// page to meet.
 ///
 /// A pause the edit no longer owns (an operator pause or a fuse trip
@@ -1098,7 +952,7 @@ async fn capture_release(
         .await
         .map_err(build_error)?;
     if !images
-        || capture_gate_holds(txn, &definition.source_table)
+        || crate::capture::gate::holds(txn, &definition.source_table)
             .await
             .map_err(build_error)?
     {
@@ -1154,8 +1008,7 @@ async fn capture_images(
     table: &str,
     columns: &std::collections::BTreeSet<String>,
 ) -> Result<bool, ApplyError> {
-    use crate::capture::{CaptureError, install::Installed};
-    use crate::intake::IntakeError;
+    use crate::capture::install::Installed;
 
     if catalog::is_definition_target(client, table).await? {
         return Ok(true);
@@ -1166,12 +1019,7 @@ async fn capture_images(
         .get(0);
     let installed = crate::capture::install::installed(client, &schema, table)
         .await
-        .map_err(|err| match err {
-            CaptureError::Db(err) => ApplyError::from(err),
-            CaptureError::Catalog(err) => ApplyError::from(err),
-            CaptureError::Marker(err) => ApplyError::from(err),
-            other => ApplyError::from(IntakeError::InvalidTableName(other.to_string())),
-        })?;
+        .map_err(capture_error)?;
     Ok(match installed {
         Installed::Absent => true,
         Installed::Partial { .. } => false,
@@ -1308,10 +1156,7 @@ pub async fn work_once(
 }
 
 /// Every definition a Re-derive build is running for that isn't frozen, in
-/// id order: each `backfilling` one
-/// under a Re-derive build, and each `catching_up` one with a field build's
-/// chunk left (#625 F8b), which its catch-up hands to the Re-derive build
-/// once it discharges.
+/// id order: each `backfilling` one under a Re-derive build.
 async fn building(pool: &Pool) -> Result<Vec<i64>, ChunkQueueError> {
     let client = pool.get().await?;
     let params = building_params();
@@ -1321,7 +1166,7 @@ async fn building(pool: &Pool) -> Result<Vec<i64>, ChunkQueueError> {
                 "select d.id from transform_definitions d where {} order by d.id",
                 building_predicate(),
             ),
-            &[&params.0, &params.1, &params.2],
+            &[&params.0, &params.1],
         )
         .await?
         .into_iter()
@@ -1329,25 +1174,14 @@ async fn building(pool: &Pool) -> Result<Vec<i64>, ChunkQueueError> {
         .collect())
 }
 
-/// The `where` of [`building`], over `transform_definitions d`, with `$1..$3`
-/// bound by [`building_params`].
-fn building_predicate() -> String {
-    format!(
-        "(d.build = $1 and d.status = $2) \
-         or (d.status = $3 and exists ( \
-             select 1 from backfill_chunks bc \
-             where bc.definition_id = d.id and not bc.done \
-               and bc.fields is not null and not ({})))",
-        chunk_queue::STALE,
-    )
+/// The `where` of [`building`], over `transform_definitions d`, with `$1` and
+/// `$2` bound by [`building_params`].
+fn building_predicate() -> &'static str {
+    "d.build = $1 and d.status = $2"
 }
 
-fn building_params() -> (&'static str, &'static str, &'static str) {
-    (
-        BUILD_REDERIVE,
-        TransformStatus::Backfilling.as_str(),
-        TransformStatus::CatchingUp.as_str(),
-    )
+fn building_params() -> (&'static str, &'static str) {
+    (BUILD_REDERIVE, TransformStatus::Backfilling.as_str())
 }
 
 /// What [`work_probe`] found.
@@ -1369,9 +1203,9 @@ pub struct WorkProbe {
 /// ([`chunk_queue::claim_chunks_of`]'s candidates, minus its kind and sweep
 /// filters), or a definition a
 /// Re-derive build is running for ([`building`] is not empty). It is a
-/// superset of both probes the step used to make on every idle wake
-/// (`claim_chunks`, then `building`), so a `false` means each of them would
-/// have found nothing, and a `true` only means they are worth running (#273).
+/// superset of both probes the step makes on every idle wake (`claim_chunks_of`,
+/// then `building`), so a `false` means each of them would have found
+/// nothing, and a `true` only means they are worth running (#273).
 /// It also reports when the soonest backing-off chunk comes due, which no row
 /// change announces.
 pub async fn work_probe(pool: &Pool) -> Result<WorkProbe, ChunkQueueError> {
@@ -1392,17 +1226,14 @@ pub async fn work_probe(pool: &Pool) -> Result<WorkProbe, ChunkQueueError> {
                      and (bc.next_attempt_at is null or bc.next_attempt_at <= now()) \
                      and {gate} \
                ) or exists (select 1 from transform_definitions d where {building}) as may_exist) p",
-        gate = chunk_queue::dispatchable_gate_sql("$4"),
+        gate = chunk_queue::dispatchable_gate_sql("$3"),
         building = building_predicate(),
     );
     let statement = client.prepare_cached(&sql).await?;
     let params = building_params();
     let dispatchable = TransformStatus::dispatchable();
     let row = client
-        .query_one(
-            &statement,
-            &[&params.0, &params.1, &params.2, &dispatchable],
-        )
+        .query_one(&statement, &[&params.0, &params.1, &dispatchable])
         .await?;
     let next_due: Option<f64> = row.get(1);
     Ok(WorkProbe {
@@ -1474,9 +1305,6 @@ pub async fn run_claimed(
             )
             .await
         }
-        work => Err(ChunkQueueError::UnknownKind {
-            kind: work.kind().to_string(),
-        }),
     };
     let Err(err) = ran else {
         return;
@@ -1828,10 +1656,9 @@ const NULL_KEYS_PAGE: i64 = 10_000;
 /// entry lock, from the source's live row, so it needs no more than the
 /// chunk does. The keys are staged in the transaction that ends the plan,
 /// after the fence, so every writer that could have missed the build has
-/// ended. It does what a chunk can't for these keys, and what the old
-/// build's ring enumeration did: staged rows drain after the build has
-/// flipped `live` (their `origin_lsn` is unknown, so they hold every
-/// convergence token until they drain, as a catch-up's do).
+/// ended. It does what a chunk can't for these keys: staged rows drain after
+/// the build has flipped `live` (their `origin_lsn` is unknown, so they hold
+/// every convergence token until they drain).
 ///
 /// Streamed through a cursor, a page at a time, so a source with many such
 /// keys holds one page in memory.
@@ -1904,8 +1731,7 @@ enum FenceState {
 /// transaction of its own, begun after the start commit: every seam writer
 /// that checked for readers before the start committed already has an id
 /// (the check takes one first, `super::target_mutations`), ids are
-/// assigned in order, and so each is below the fence (`intake::markers`'
-/// `confirm_fence`). The snapshot's `xmin` is the oldest transaction id
+/// assigned in order, and so each is below the fence. The snapshot's `xmin` is the oldest transaction id
 /// still running, so it passes the fence exactly when they have all ended.
 /// A fence already on the row is kept: an earlier attempt took it after the
 /// start commit too, and a later one would only wait longer.
@@ -2255,13 +2081,13 @@ enum ReadersOnCommit {
     /// state that matches its target, so the seam rows it stages carry exact
     /// images.
     Keep,
-    /// The readers' catch-up is parked, and the group-basis ones rebuilt
-    /// (`intake::markers::park_target_catchup_if_read`, #1287): the plan job
+    /// The readers are rebuilt
+    /// (`intake::catch_up::park_target_catchup_if_read`, #1287): the plan job
     /// of a fresh build or a resume. A resume starts from partials that are
     /// empty while its target holds the rows of the earlier life, so the
     /// seam rows a page or the build stages meanwhile can carry prior images
     /// that match no row the readers hold. A fresh build has no reader, and
-    /// the park finds none.
+    /// the rebuild finds none.
     Park,
 }
 
@@ -2565,7 +2391,8 @@ struct SideTree {
 /// 2. Each partitioned side, `FROM` first: its leaves in oid order, then its
 ///    remainder, the cells that route to no recorded leaf.
 /// 3. The final `T` step, which marks the job done and parks the readers'
-///    catch-up ([`ReadersOnCommit::Park`]), once, in its transaction.
+///    rebuilds the readers ([`ReadersOnCommit::Park`]), once, in its
+///    transaction.
 ///
 /// An unrecorded tree, or a leaf without usable constraint text, fails the
 /// job: there is no statement over the whole root to fall back to.
@@ -2823,9 +2650,8 @@ async fn run_group_structure(
     // (`complete_resume`): without this lock the two would wait on each
     // other. A resume or drop in flight makes this transaction wait holding
     // nothing, and one that committed first shows in the claim's stale
-    // check. The readers' rows the commit's park locks `for update`
-    // (`ReadersOnCommit::Park`) come last, in id order, as
-    // `complete_direct_backfill`'s do.
+    // check. The readers' rows the commit's rebuild locks `for update`
+    // (`ReadersOnCommit::Park`) come last, in id order.
     fence.arm(&txn).await?;
     txn.execute(
         "select 1 from transform_definitions where id = $1 for key share",
@@ -2935,12 +2761,12 @@ async fn run_group_structure(
         &definition.target_table,
     )
     .await?;
-    // The transaction that completes the whole build parks its readers'
-    // catch-up (#1287), once, not per leaf; the segment stamp is the last
+    // The transaction that completes the whole build rebuilds its readers
+    // (#1287), once, not per leaf; the segment stamp is the last
     // statement before the commit.
     let finished = !advances;
     let rebuilt = if finished && readers == ReadersOnCommit::Park {
-        crate::intake::markers::park_target_catchup_if_read(&txn, chunk.definition_id)
+        crate::intake::catch_up::park_target_catchup_if_read(&txn, chunk.definition_id)
             .await
             .map_err(build_error)?
     } else {
@@ -3060,8 +2886,8 @@ async fn run_sweep(
 /// last) calls this after it commits, so the last of them sees
 /// all the others committed. It checks without a lock first, and only then
 /// takes the definition row `for update` and checks again, so only a
-/// possibly-last caller takes the lock. No catch-up is parked: the
-/// definition applied from its start. The flip deletes the definition's done
+/// possibly-last caller takes the lock. The definition applied from its
+/// start. The flip deletes the definition's done
 /// rows (#966).
 pub async fn try_complete(pool: &Pool, id: i64) -> Result<bool, ChunkQueueError> {
     let mut client = pool.get().await?;
@@ -3364,15 +3190,9 @@ mod tests {
         )
         .await
         .expect("install_definition");
-        crate::client::reconcile_pass(
-            &mut raw,
-            &pool,
-            crate::config::DEFAULT_SCHEMA,
-            "f8a_wake",
-            Duration::from_secs(5),
-        )
-        .await
-        .expect("start the build");
+        crate::client::reconcile_pass(&mut raw, &pool, crate::config::DEFAULT_SCHEMA)
+            .await
+            .expect("start the build");
         let status = || async {
             trellis
                 .status("doubles")

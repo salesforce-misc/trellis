@@ -319,8 +319,7 @@ module Trellis
     # resolved like one in a statement) for every definition that reads it,
     # and returns once that re-read is queued.
     #
-    # Each :live reader reports :backfilling (a plain aggregate or a plain
-    # 1-1 transform, rebuilt by the call itself) or :catching_up (any other)
+    # Each :live reader reports :backfilling (rebuilt by the call itself)
     # until the re-read has re-derived every row the table still has and
     # deleted any target row it no longer backs. A newly defined transform
     # doesn't need this: its backfill is queued for it. Only a table Trellis

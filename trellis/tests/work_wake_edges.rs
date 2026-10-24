@@ -124,7 +124,7 @@ impl Fixture {
         self.raw
             .query_one(
                 "insert into backfill_chunks (definition_id, kind, lo, hi, fuse_rearmed_at) \
-                 select id, 'direct', null, null, fuse_rearmed_at from transform_definitions \
+                 select id, 'plan', null, null, fuse_rearmed_at from transform_definitions \
                  returning id",
                 &[],
             )
@@ -156,7 +156,7 @@ async fn a_claim_released_or_reclaimed_announces_itself() {
     // Claiming it, and a worker refreshing its claim, are not edges.
     let claimed = {
         let client = f.db.pool.get().await.expect("pool");
-        chunk_queue::claim_chunks(&**client, "w1", 1)
+        chunk_queue::claim_chunks_of(&**client, "w1", 1, &[chunk_queue::KIND_PLAN])
             .await
             .expect("claim")
     };
@@ -175,7 +175,7 @@ async fn a_claim_released_or_reclaimed_announces_itself() {
     // A claim nobody refreshes is swept free.
     {
         let client = f.db.pool.get().await.expect("pool");
-        chunk_queue::claim_chunks(&**client, "w2", 1)
+        chunk_queue::claim_chunks_of(&**client, "w2", 1, &[chunk_queue::KIND_PLAN])
             .await
             .expect("claim");
     }

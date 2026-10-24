@@ -59,7 +59,7 @@ use std::time::Duration;
 use drain_driver::Driver;
 use testkit::TestCluster;
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::defs::{PgType, ValueType, chunk_queue};
+use trellis::defs::{PgType, ValueType};
 use trellis::integer::IntWidth;
 use trellis::staging::apply;
 use trellis::staging::self_check::CheckPageExt;
@@ -436,15 +436,9 @@ struct Outcome {
 
 async fn pass(d: &mut Driver) {
     let pool = d.pool().clone();
-    trellis::client::reconcile_pass(
-        &mut d.ctl,
-        &pool,
-        DEFAULT_SCHEMA,
-        "type_matrix_wake",
-        Duration::from_secs(2),
-    )
-    .await
-    .expect("reconcile pass");
+    trellis::client::reconcile_pass(&mut d.ctl, &pool, DEFAULT_SCHEMA)
+        .await
+        .expect("reconcile pass");
 }
 
 async fn facade(dsn: &str) -> Trellis {
@@ -520,32 +514,7 @@ async fn settle_tolerant(d: &mut Driver) -> usize {
 /// Claims, runs and finishes every pending backfill chunk, then settles the
 /// builds.
 async fn run_backfill_chunks(pool: &trellis::Pool) {
-    const CLAIMED_BY: &str = "type_matrix_backfill";
-    loop {
-        let client = pool.get().await.expect("acquire connection");
-        let claimed = chunk_queue::claim_chunks(&**client, CLAIMED_BY, 1000)
-            .await
-            .expect("claim_chunks");
-        drop(client);
-        if claimed.is_empty() {
-            trellis::staging::build::settle_builds(pool).await;
-            return;
-        }
-        for chunk in &claimed {
-            chunk_queue::run_claimed_chunk(
-                pool,
-                chunk,
-                CLAIMED_BY,
-                Duration::from_secs(5),
-                Duration::from_secs(60),
-            )
-            .await
-            .expect("run_claimed_chunk");
-            chunk_queue::finish_chunk(pool, chunk, CLAIMED_BY)
-                .await
-                .expect("finish_chunk");
-        }
-    }
+    trellis::staging::build::settle_builds(pool).await;
 }
 
 async fn write(d: &Driver, sql: &str) {
@@ -1262,7 +1231,7 @@ async fn a_trellis_copy_joins_a_modified_source_column_end_to_end() {
             )
             .await
             .expect("capture pass");
-            trellis::intake::markers::settle_registrations(d.pool()).await;
+            trellis::intake::harness::settle_builds(d.pool()).await;
             d.settle().await;
             assert_eq!(
                 d.rows("select status::text from transform_definitions order by id")

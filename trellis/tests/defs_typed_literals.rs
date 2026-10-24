@@ -29,7 +29,6 @@
 //! chunk-draining helper is copied from `defs_install_definition.rs`.
 
 use std::collections::HashMap;
-use std::time::Duration;
 
 use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
@@ -37,8 +36,8 @@ use trellis::Pool;
 use trellis::config::{Config, DEFAULT_SCHEMA};
 use trellis::defs::ast::{Expr, ValueType};
 use trellis::defs::{
-    PgType, chunk_queue, create_definition, create_target_table, install_definition, parse,
-    recompute, render_expr_sql, source_primary_key, validate,
+    PgType, create_definition, create_target_table, install_definition, parse, recompute,
+    render_expr_sql, source_primary_key, validate,
 };
 use trellis::staging::apply;
 
@@ -153,35 +152,10 @@ async fn insert_cdc_row(client: &Client, key: &str, new_image: &str) {
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
     // ADR-0002 (#418): registration only records a definition; the backfill
     // discharge dispatches its chunks.
-    trellis::intake::markers::discharge_registrations(pool)
+    trellis::intake::harness::start_registered_builds(pool)
         .await
         .expect("dispatch registered definitions' builds");
-    const CLAIMED_BY: &str = "typed_literal_test_backfill_worker";
-    loop {
-        let client = pool.get().await.expect("acquire connection");
-        let claimed = chunk_queue::claim_chunks(&**client, CLAIMED_BY, 1000)
-            .await
-            .expect("claim_chunks");
-        drop(client);
-        if claimed.is_empty() {
-            trellis::staging::build::settle_builds(pool).await;
-            return;
-        }
-        for chunk in &claimed {
-            chunk_queue::run_claimed_chunk(
-                pool,
-                chunk,
-                CLAIMED_BY,
-                Duration::from_secs(5),
-                Duration::from_secs(60),
-            )
-            .await
-            .expect("run_claimed_chunk");
-            chunk_queue::finish_chunk(pool, chunk, CLAIMED_BY)
-                .await
-                .expect("finish_chunk");
-        }
-    }
+    trellis::staging::build::settle_builds(pool).await;
 }
 
 /// The declared Postgres type of `table`.`column`, straight from

@@ -718,15 +718,9 @@ async fn altering_a_passthrough_into_a_wider_expression_changes_no_column_type()
     // Rule 5: the next capture pass finds the column current, so it pauses
     // nothing for a widening or a drift.
     for _ in 0..2 {
-        trellis::client::reconcile_pass(
-            &mut raw,
-            &db.pool,
-            DEFAULT_SCHEMA,
-            "alter_transform_997",
-            Duration::from_secs(2),
-        )
-        .await
-        .expect("capture pass");
+        trellis::client::reconcile_pass(&mut raw, &db.pool, DEFAULT_SCHEMA)
+            .await
+            .expect("capture pass");
     }
     assert_ne!(persisted_status(&raw, "t").await.as_deref(), Some("paused"));
     let failures: i64 = raw
@@ -907,42 +901,10 @@ async fn combined_add_drop_alter_in_one_statement() {
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
     // ADR-0002 (#418): registration only records a definition; the backfill
     // discharge dispatches its chunks.
-    trellis::intake::markers::discharge_registrations(pool)
+    trellis::intake::harness::start_registered_builds(pool)
         .await
         .expect("dispatch registered definitions' builds");
-    const CLAIMED_BY: &str = "alter_transform_test_backfill_worker";
-    loop {
-        let client = pool.get().await.expect("acquire connection");
-        let claimed = chunk_queue::claim_chunks(&**client, CLAIMED_BY, 1000)
-            .await
-            .expect("claim_chunks");
-        drop(client);
-        if claimed.is_empty() {
-            // #625 F8a: a plain 1-1 over a captured table is the Re-derive
-            // build's, which the drain workers run to `live` on their own.
-            trellis::staging::build::settle_builds(pool).await;
-            // The staging worker's next pass: the builds' go-live catch-ups
-            // take them `live` (issue #476).
-            trellis::intake::markers::discharge_registrations(pool)
-                .await
-                .expect("discharge the go-live catch-ups");
-            return;
-        }
-        for chunk in &claimed {
-            chunk_queue::run_claimed_chunk(
-                pool,
-                chunk,
-                CLAIMED_BY,
-                Duration::from_secs(5),
-                Duration::from_secs(60),
-            )
-            .await
-            .expect("run_claimed_chunk");
-            chunk_queue::finish_chunk(pool, chunk, CLAIMED_BY)
-                .await
-                .expect("finish_chunk");
-        }
-    }
+    trellis::staging::build::settle_builds(pool).await;
 }
 
 /// The target's rows as `(id, xmin)` text, in key order: a row any write
@@ -2688,7 +2650,7 @@ async fn altering_an_aggregate_transform_is_unsupported() {
         .apply("TRANSFORM order_rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total")
         .await
         .expect("define the aggregate");
-    trellis::intake::markers::settle_registrations(&db.pool).await;
+    trellis::intake::harness::settle_builds(&db.pool).await;
 
     let err = trellis
         .apply("ALTER TRANSFORM order_rollup ADD g AS g2")

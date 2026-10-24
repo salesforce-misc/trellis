@@ -2,38 +2,16 @@
 //! is Re-derive over chunks, and applies from its first chunk" and
 //! `docs/decisions/0008-public-api-design.md`'s decision 1).
 //!
-//! A 1-1 definition's PK-range chunks are not run
-//! back-to-back in one call: once the definition's capture point has passed,
-//! the backfill discharge (`intake::markers::run_pending_backfills`,
-//! ADR-0002) plans the same boundaries [`super::backfill::plan_one_to_one_chunks`]
-//! always computed and [`dispatch_one_to_one`] persists each as a row in the
-//! `backfill_chunks` table (`V20__backfill_chunks.sql`), in the discharge's own
-//! transaction. That applies to a fresh registration and to a resumed
-//! definition's rebuild alike. [`claim_chunks`]/[`reclaim_stale_chunks`]/
-//! [`fail_chunk`] mirror `staging::claim`/`staging::liveness`'s
-//! claim/reclaim-stale/release-on-error idiom for sealed ring segments,
-//! collapsed onto one table (a chunk, unlike a segment, is never bucket-split
-//! across several workers at once — see the migration's own doc comment).
-//! [`run_claimed_chunk`] executes one claimed chunk's write — heartbeating
-//! the claim out-of-band for the write's whole duration via the internal
-//! `ChunkHeartbeat`, the same "keep a claim alive against wall-clock time,
-//! not against how much work is left" idiom `staging::liveness::HeartbeatDaemon`
-//! uses for segment claims, so a chunk write that outlives `reclaim_ttl`
-//! isn't falsely reclaimed mid-write — and [`finish_chunk`] marks it done,
-//! flipping the owning definition `backfilling` -> `live` (via
-//! [`super::catalog::complete_direct_backfill`]) the moment every one of its
-//! chunks is done — race-free under concurrent finishers via a `for update`
-//! lock on the definition's own row (see that function's doc comment).
-//!
-//! An aggregate definition isn't split into
-//! ranges: its build materializes connection-scoped `TEMP TABLE` staging,
-//! which doesn't survive being read by independent drain workers on separate
-//! connections. The discharge
-//! enqueues its whole direct build as one job instead ([`dispatch_direct_build`],
-//! issue #419), a row with no bounds ([`ChunkWork::DirectBuild`]) that one
-//! drain worker runs start to finish. Everything above applies to it
-//! unchanged, except that a failed job hands its build back to the discharge
-//! rather than being released for a retry ([`fail_chunk`]).
+//! A Re-derive build (`staging::build`) is a plan job, chunks and a sweep job,
+//! each a row of the `backfill_chunks` table (`V20__backfill_chunks.sql`).
+//! [`claim_chunks_of`]/[`reclaim_stale_chunks`]/[`fail_chunk`] mirror
+//! `staging::claim`/`staging::liveness`'s claim/reclaim-stale/release-on-error
+//! idiom for sealed ring segments, collapsed onto one table (a chunk, unlike a
+//! segment, is never bucket-split across several workers at once). A running
+//! chunk keeps its claim alive out-of-band for its whole duration via the
+//! internal `ChunkHeartbeat`, the same "keep a claim alive against wall-clock
+//! time, not against how much work is left" idiom
+//! `staging::liveness::HeartbeatDaemon` uses for segment claims.
 //!
 //! A chunk that fails never retries silently (#616). [`fail_chunk`] records
 //! the failure on the chunk's row, where `Trellis::status` reports it, logs
@@ -52,7 +30,7 @@ use crate::error_code::{self, ErrorCode};
 use crate::pool::Pool;
 
 use super::backfill::{self, BackfillError};
-use super::catalog::{self, CatalogError};
+use super::catalog::CatalogError;
 use super::model::TransformStatus;
 
 /// Why claiming, executing, or completing a durable backfill chunk failed.
@@ -193,7 +171,7 @@ impl From<CatalogError> for ChunkQueueError {
     }
 }
 
-/// One durable `backfill_chunks` row, as claimed by [`claim_chunks`].
+/// One durable `backfill_chunks` row, as claimed by [`claim_chunks_of`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaimedChunk {
     pub id: i64,
@@ -214,14 +192,6 @@ pub struct ClaimedChunk {
 /// What one `backfill_chunks` row builds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChunkWork {
-    /// A plain 1-1 definition's primary-key range. `lo` is `None` for the
-    /// first chunk (`pk <= hi`, no lower bound) and `Some` for every later
-    /// one.
-    Range { lo: Option<String>, hi: String },
-    /// An aggregate definition's whole direct
-    /// set-based build (ADR-0002), run as one job (issue #419; the row's
-    /// `hi` is null). See [`dispatch_direct_build`].
-    DirectBuild,
     /// A Re-derive build's plan job (#625 F2, `staging::build`): walks the
     /// source's primary key from `cursor`, the last boundary it enqueued
     /// (`None` before the first), and enqueues [`ChunkWork::Rederive`] rows
@@ -244,10 +214,9 @@ pub enum ChunkWork {
 
 impl ChunkWork {
     /// The `backfill_chunks.kind` word of this work (V64).
+    #[cfg(any(test, feature = "internals"))]
     pub fn kind(&self) -> &'static str {
         match self {
-            ChunkWork::Range { .. } => KIND_RANGE,
-            ChunkWork::DirectBuild => KIND_DIRECT,
             ChunkWork::Plan { .. } => KIND_PLAN,
             ChunkWork::Rederive { .. } => KIND_REDERIVE,
             ChunkWork::Sweep { .. } => KIND_SWEEP,
@@ -256,10 +225,6 @@ impl ChunkWork {
     }
 }
 
-/// `backfill_chunks.kind` of a plain 1-1 definition's range chunk.
-pub const KIND_RANGE: &str = "range";
-/// `backfill_chunks.kind` of a direct-build job.
-pub const KIND_DIRECT: &str = "direct";
 /// `backfill_chunks.kind` of a Re-derive build's plan job.
 pub const KIND_PLAN: &str = "plan";
 /// `backfill_chunks.kind` of a Re-derive build's chunk.
@@ -269,171 +234,20 @@ pub const KIND_SWEEP: &str = "sweep";
 /// `backfill_chunks.kind` of a partition correction (ADR-0017 P4a).
 pub const KIND_CORRECTION: &str = "correction";
 
-/// The kinds the old builds' path claims ([`claim_chunks`]). A drain worker
-/// runs these after its segments, as it does the Re-derive build's kinds
-/// (`staging::build`, #625 B6).
-pub const OLD_BUILD_KINDS: [&str; 2] = [KIND_RANGE, KIND_DIRECT];
-
-/// Dispatches a 1-1 definition's build onto the
-/// durable queue, inside the backfill discharge's own transaction (ADR-0002):
-/// moves `definition_id` `waiting_to_backfill` -> `backfilling` and persists
-/// `planned`'s ranges (from [`backfill::plan_one_to_one_chunks`]) as its
-/// `backfill_chunks` rows, so the status and the work that drives it commit
-/// together (issue #404's rule) or not at all. Each row records the key
-/// collations the ranges were walked under (`key_collations`, issue #769).
-///
-/// Each chunk records the definition's `fuse_rearmed_at` as of this dispatch
-/// (see [`STALE`]), read under the row lock the status update takes, the same
-/// lock pause and resume take.
-///
-/// A source with zero rows plans zero chunks; since nothing would ever finish
-/// a "last chunk" to trigger the `backfilling` -> `live` flip, this completes
-/// the definition itself, through the same completion `finish_chunk` uses.
-///
-/// Returns the status the dispatch left the definition in, or `None` when it
-/// was no longer `waiting_to_backfill` (an operator paused it since the
-/// discharge read it): it is left as it is, and its resume parks a marker of
-/// its own.
-pub(crate) async fn dispatch_one_to_one(
-    txn: &tokio_postgres::Transaction<'_>,
-    definition_id: i64,
-    planned: &backfill::PlannedRanges,
-) -> Result<Option<TransformStatus>, CatalogError> {
-    let ranges = &planned.ranges;
-    if !start_backfilling(txn, definition_id).await? {
-        return Ok(None);
-    }
-
-    if ranges.is_empty() {
-        // Reports what the completion actually left the definition in,
-        // through the same lock-then-check-then-complete sequence
-        // `finish_chunk` uses (the status update above holds the lock),
-        // keeping there being exactly one way a direct-build definition ever
-        // completes.
-        return Ok(Some(
-            complete_if_no_chunks_remain_in_txn(txn, definition_id)
-                .await?
-                .unwrap_or(TransformStatus::Backfilling),
-        ));
-    }
-
-    let (los, his): (Vec<Option<&str>>, Vec<&str>) = ranges
-        .iter()
-        .map(|(lo, hi)| (lo.as_deref(), hi.as_str()))
-        .unzip();
-    txn.execute(
-        "insert into backfill_chunks \
-             (definition_id, kind, lo, hi, fuse_rearmed_at, key_collations) \
-         select d.id, 'range', r.lo, r.hi, d.fuse_rearmed_at, $4 \
-         from unnest($2::text[], $3::text[]) with ordinality as r(lo, hi, n) \
-         cross join transform_definitions d \
-         where d.id = $1 \
-         order by r.n",
-        &[&definition_id, &los, &his, &planned.key_collations],
-    )
-    .await?;
-    crate::instance_log::info!(
-        definition_id,
-        chunks = ranges.len(),
-        from = %TransformStatus::WaitingToBackfill.as_str(),
-        to = %TransformStatus::Backfilling.as_str(),
-        "transform status transition: backfill chunks enqueued"
-    );
-    Ok(Some(TransformStatus::Backfilling))
-}
-
-/// Moves `definition_id` `waiting_to_backfill` -> `backfilling`, taking its
-/// row lock. Returns `false`, touching nothing, when it had already left
-/// `waiting_to_backfill` (an operator paused it since the discharge read it).
-///
-/// Clears `build`: a definition paused during a Re-derive build and resumed
-/// onto this path is no longer under one, so it must not apply while this
-/// build runs (`defs::model::APPLYING_SQL`, #625 F2), and forgets the marker
-/// generation that build's start read (#938).
-async fn start_backfilling(
-    txn: &tokio_postgres::Transaction<'_>,
-    definition_id: i64,
-) -> Result<bool, CatalogError> {
-    let promoted = txn
-        .execute(
-            "update transform_definitions \
-             set status = $1, build = null, build_marker_generation = null \
-             where id = $2 and status = $3",
-            &[
-                &TransformStatus::Backfilling.as_str(),
-                &definition_id,
-                &TransformStatus::WaitingToBackfill.as_str(),
-            ],
-        )
-        .await?;
-    Ok(promoted == 1)
-}
-
-/// Dispatches an aggregate definition's direct
-/// set-based build (ADR-0002) as one background job, inside the backfill
-/// discharge's own transaction (ADR-0002, issue #419): moves `definition_id`
-/// `waiting_to_backfill` -> `backfilling` and persists the job as a
-/// [`ChunkWork::DirectBuild`] row, so the status and the work that drives it
-/// commit together (issue #404's rule) or not at all.
-///
-/// The job is a `backfill_chunks` row so it gets the queue's whole driver
-/// contract for free: a drain thread claims it ([`claim_chunks`]), heartbeats
-/// the claim for as long as the build runs ([`run_claimed_chunk`]), and flips
-/// the definition `live` with its go-live catch-ups when it's done
-/// ([`finish_chunk`]); a worker that dies holding it loses the claim to
-/// [`reclaim_stale_chunks`], and another worker reruns it (the build's
-/// writes are idempotent overwrites); a pause withholds it and a resume
-/// supersedes it ([`STALE`]) exactly as for a chunk. A build that fails hands
-/// itself back to the discharge ([`fail_chunk`]).
-///
-/// `prior_attempts` is the failure count of the marker this dispatch is
-/// discharging, carried so a failed build backs off from there.
-///
-/// Returns the status the dispatch left the definition in, or `None` when it
-/// was no longer `waiting_to_backfill`, as for [`dispatch_one_to_one`].
-///
-/// No discharge dispatches one: every aggregate is built by its plan job. It
-/// stays, with the rest of the old build path, for #625 to delete.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) async fn dispatch_direct_build(
-    txn: &tokio_postgres::Transaction<'_>,
-    definition_id: i64,
-    prior_attempts: i32,
-) -> Result<Option<TransformStatus>, CatalogError> {
-    if !start_backfilling(txn, definition_id).await? {
-        return Ok(None);
-    }
-    txn.execute(
-        "insert into backfill_chunks \
-             (definition_id, kind, lo, hi, fuse_rearmed_at, prior_attempts) \
-         select id, 'direct', null, null, fuse_rearmed_at, $2 \
-         from transform_definitions where id = $1",
-        &[&definition_id, &prior_attempts],
-    )
-    .await?;
-    crate::instance_log::info!(
-        definition_id,
-        from = %TransformStatus::WaitingToBackfill.as_str(),
-        to = %TransformStatus::Backfilling.as_str(),
-        "transform status transition: direct build job enqueued"
-    );
-    Ok(Some(TransformStatus::Backfilling))
-}
-
 /// SQL predicate over a `backfill_chunks` row aliased `bc` joined to its
 /// definition's `transform_definitions` row aliased `d`: whether the chunk was
 /// planned before the definition's latest resume (issues #360/#418). Every
 /// resume (`staging::quarantine::resume_transform`) stamps a new
 /// `fuse_rearmed_at`, and every chunk copies the value it saw when it was
-/// planned ([`dispatch_one_to_one`]), so a chunk from a build the resume
-/// superseded carries a different one.
+/// planned, so a chunk from a build the resume superseded carries a different
+/// one.
 ///
 /// Resume deletes a stale definition's unclaimed chunks outright. A stale
 /// chunk a worker still held across the resume is never claimable again and
-/// never completes the definition, whose rebuild (the resume's own discharge,
-/// which may enqueue fresh chunks) owns its way back to `live`:
-/// [`fail_chunk`]/[`reclaim_stale_chunks`]/[`finish_chunk`] discard it
-/// rather than freeing or completing it. It writes nothing after the resume
+/// never completes the definition, whose rebuild (started by the next
+/// capture pass, which enqueues fresh chunks) owns its way back to `live`:
+/// [`fail_chunk`]/[`reclaim_stale_chunks`]/[`discard_if_superseded`] discard
+/// it rather than freeing or completing it. It writes nothing after the resume
 /// either ([`ClaimFence`]).
 pub(crate) const STALE: &str = "bc.fuse_rearmed_at is distinct from d.fuse_rearmed_at";
 
@@ -445,8 +259,8 @@ pub(crate) const STALE: &str = "bc.fuse_rearmed_at is distinct from d.fuse_rearm
 /// target: while its definition is still being built. A chunk a worker holds
 /// across a pause and a resume ([`STALE`]) would break that if its write
 /// could land once the resumed definition's rebuild has finished, since
-/// readers can attach from then on (`catching_up` is applying). A
-/// definition reading the target would never hear of that write: when the source change it carries drains, apply
+/// readers can attach from then on. A definition reading the target would
+/// never hear of that write: when the source change it carries drains, apply
 /// finds the target already current, and changes and stages nothing.
 ///
 /// So every target write runs in a transaction that first [`hold`]s the
@@ -571,23 +385,6 @@ impl<'a> ClaimFence<'a> {
     }
 }
 
-/// Claims up to `limit` unclaimed, undone chunks for `claimed_by` in one
-/// statement — the backfill-chunk analogue of `staging::claim`/
-/// `staging::next_claimable_segments`, collapsed onto a single table+statement
-/// since a chunk is never bucket-split (see this module's doc comment). The
-/// `for update skip locked` candidate selection means two workers racing this
-/// call never claim the same row twice and never block on each other.
-///
-/// Claims only the old builds' kinds ([`OLD_BUILD_KINDS`]); a Re-derive
-/// build's work is claimed by [`claim_chunks_of`] (#625 F2).
-pub async fn claim_chunks(
-    client: &impl GenericClient,
-    claimed_by: &str,
-    limit: i64,
-) -> Result<Vec<ClaimedChunk>, ChunkQueueError> {
-    claim_chunks_of(client, claimed_by, limit, &OLD_BUILD_KINDS).await
-}
-
 /// SQL over a `backfill_chunks bc` row: its definition is in a status a
 /// chunk may be handed out in (`param` binds [`TransformStatus::dispatchable`]
 /// as a `text[]`). One predicate for the claim ([`claim_chunks_of`]) and for
@@ -600,7 +397,12 @@ pub(crate) fn dispatchable_gate_sql(param: &str) -> String {
     )
 }
 
-/// [`claim_chunks`] for the rows whose `kind` is one of `kinds`.
+/// Claims up to `limit` unclaimed, undone chunks of the given `kinds` for
+/// `claimed_by` in one statement — the backfill-chunk analogue of
+/// `staging::claim`/`staging::next_claimable_segments`, collapsed onto a
+/// single table+statement since a chunk is never bucket-split. The `for
+/// update skip locked` candidate selection means two workers racing this
+/// call never claim the same row twice and never block on each other.
 pub async fn claim_chunks_of(
     client: &impl GenericClient,
     claimed_by: &str,
@@ -688,8 +490,6 @@ pub async fn claim_chunks_of(
                 (KIND_CORRECTION, None) if let Some(correction_id) = correction => {
                     ChunkWork::Correction { correction_id }
                 }
-                (KIND_RANGE, Some(hi)) => ChunkWork::Range { lo, hi },
-                (KIND_DIRECT, None) => ChunkWork::DirectBuild,
                 (KIND_PLAN, None) => ChunkWork::Plan { cursor: lo },
                 (KIND_REDERIVE, Some(hi)) => ChunkWork::Rederive { lo, hi },
                 (KIND_SWEEP, None) => ChunkWork::Sweep { cursor: lo },
@@ -717,7 +517,7 @@ pub async fn claim_chunks_of(
 /// alongside the ring's own reclaim sweep. Freeing a claim (rather than
 /// deleting a row, since there's no separate claims table to delete from —
 /// see this module's doc comment) makes the chunk claimable again on the very
-/// next [`claim_chunks`] call.
+/// next [`claim_chunks_of`] call.
 ///
 /// A chunk held across its definition's resume ([`STALE`]) is deleted
 /// instead of freed (issue #360) — see [`free_or_discard_claims`].
@@ -806,9 +606,6 @@ pub(crate) const MAX_CHARGED_ATTEMPTS: i32 = 5;
 /// The backoff after a chunk's first failure, doubled per further failure.
 const RETRY_BASE: Duration = Duration::from_secs(1);
 
-/// The longest a failed chunk waits before it is claimed again.
-const RETRY_CAP: Duration = Duration::from_secs(300);
-
 /// The longest a failed Re-derive chunk or plan job waits before it is
 /// claimed again (#625 F2). Its usual failure is its entry lock's short
 /// timeout behind a drain page, which says nothing about the chunk.
@@ -889,17 +686,14 @@ pub enum ChunkFailure {
     /// definition was paused. The chunk stays, unclaimed, as the record
     /// `Trellis::status` reports until a resume replaces it.
     Paused,
-    /// A direct-build job handed its build back to the backfill discharge,
-    /// whose marker carries `attempts` failures.
-    HandedBack { attempts: i32 },
 }
 
 /// Gives up `chunk` after running it failed with `error` — what a drain
-/// worker calls instead of [`finish_chunk`] on a failure — and logs at warn
-/// what it did, with the definition, the chunk, its range or key, the
-/// attempt and when the next one is (#616).
+/// worker calls on a failure — and logs at warn what it did, with the
+/// definition, the chunk, its range or key, the attempt and when the next one
+/// is (#616).
 ///
-/// A [`ChunkWork::Range`] chunk records the failure on its row (`attempts`,
+/// A Re-derive chunk records the failure on its row (`attempts`,
 /// `last_error`, `next_attempt_at`, which `Trellis::status` reports) and,
 /// by the failure's [`FailureKind`]:
 ///
@@ -915,22 +709,8 @@ pub enum ChunkFailure {
 ///   is released after a backoff and charged, and its
 ///   [`MAX_CHARGED_ATTEMPTS`]th charge pauses the definition instead.
 ///
-/// A [`ChunkWork::DirectBuild`] job **hands its build back to the backfill
-/// discharge** (ADR-0002, issue #419), in one transaction: the job row is
-/// deleted, the definition moves `backfilling` -> `waiting_to_backfill`, and
-/// its source's marker is re-parked carrying the failure as its retry state
-/// (`intake::markers::park_failed_build`). The marker's backoff (issue
-/// #407) then paces the retry, rather than a drain worker re-running a
-/// whole-table build as fast as it can fail, and [`crate::Trellis::status`]
-/// reports the error through the marker like any failed discharge. The
-/// retry is a fresh dispatch, so it re-plans the build by shape: a build that
-/// failed [`BackfillError::Unsupported`] because the catalog changed under it
-/// goes to the ring fallback. A transient failure isn't charged an attempt.
-/// A build can't be narrowed, so its [`MAX_CHARGED_ATTEMPTS`]th charged
-/// failure pauses the definition instead, keeping the job row as the record.
-/// A definition that was paused or quarantined meanwhile only loses the job:
-/// its resume parks a marker and rebuilds. A job held across a resume
-/// ([`STALE`]) is discarded as usual.
+/// A plan job, a sweep job and a partition correction are not narrowed: their
+/// data failures are charged like any other.
 ///
 /// Scoped to `claimed_by`'s current claim: a claim already reclaimed out
 /// from under this caller is left to its new holder.
@@ -944,24 +724,6 @@ pub async fn fail_chunk(
     let message = error.to_string();
     let sqlstate = crate::staging::quarantine::sqlstate_of(error);
     let (outcome, attempts, location) = match &chunk.work {
-        ChunkWork::Range { lo, hi } => {
-            let (outcome, attempts) = fail_range_chunk(
-                pool,
-                chunk,
-                Some((lo.as_deref(), hi)),
-                claimed_by,
-                kind,
-                &message,
-                sqlstate.as_deref(),
-                RETRY_CAP,
-            )
-            .await?;
-            let location = match &outcome {
-                ChunkFailure::Quarantined { key, .. } => format!("key {key}"),
-                _ => format!("range ({}, {hi}]", lo.as_deref().unwrap_or("-infinity")),
-            };
-            (outcome, attempts, location)
-        }
         // A Re-derive chunk narrows a data failure to a key as a 1-1 range
         // chunk does (#625 F5, F-A5): its range holds the same keys, and
         // it leaves a quarantined key out the same way.
@@ -1053,11 +815,6 @@ pub async fn fail_chunk(
                 format!("the partition correction {correction_id}"),
             )
         }
-        ChunkWork::DirectBuild => {
-            let (outcome, attempts) =
-                fail_direct_build(pool, chunk, claimed_by, kind, &message).await?;
-            (outcome, attempts, "the whole source".to_string())
-        }
     };
     log_failure(chunk, kind, &outcome, attempts, &location, &message);
     Ok(outcome)
@@ -1107,12 +864,6 @@ fn log_failure(
             max_charged = MAX_CHARGED_ATTEMPTS, error = %error,
             "backfill chunk kept failing without narrowing to a key; paused the definition \
              (resume it once the cause is fixed)"
-        ),
-        ChunkFailure::HandedBack { attempts } => crate::instance_log::warn!(
-            definition_id, chunk_id, chunk = %location, failure = %kind, attempt = *attempts,
-            max_charged = MAX_CHARGED_ATTEMPTS, error = %error,
-            "direct build failed; handing it back to the backfill discharge, which retries it \
-             after a backoff"
         ),
     }
 }
@@ -1166,8 +917,8 @@ async fn pause_for_build_failure(
     Ok(())
 }
 
-/// [`fail_chunk`] for a [`ChunkWork::Range`] chunk, and for a Re-derive
-/// build's chunk or plan job. Returns what it did and the chunk's failure
+/// [`fail_chunk`] for a Re-derive build's chunk, plan job, sweep job or
+/// correction. Returns what it did and the chunk's failure
 /// count, this one included.
 ///
 /// `narrow` is the range a data failure is narrowed within, or `None` when
@@ -1187,7 +938,7 @@ async fn fail_range_chunk(
 ) -> Result<(ChunkFailure, i32), ChunkQueueError> {
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
-    // The definition row first, as `finish_chunk` locks it, then the chunk:
+    // The definition row first, as a resume locks it, then the chunk:
     // the order resume takes them in (issue #434).
     txn.execute(
         "select 1 from transform_definitions where id = $1 for update",
@@ -1321,88 +1072,6 @@ async fn fail_range_chunk(
     Ok((outcome, attempts))
 }
 
-/// [`fail_chunk`] for a [`ChunkWork::DirectBuild`] job. Returns what it did
-/// and the build's failure count.
-async fn fail_direct_build(
-    pool: &Pool,
-    chunk: &ClaimedChunk,
-    claimed_by: &str,
-    kind: FailureKind,
-    error: &str,
-) -> Result<(ChunkFailure, i32), ChunkQueueError> {
-    let mut client = pool.get().await?;
-    let txn = client.transaction().await?;
-    // The definition row first, as `finish_chunk` locks it, then the job.
-    txn.execute(
-        "select 1 from transform_definitions where id = $1 for update",
-        &[&chunk.definition_id],
-    )
-    .await?;
-    let Some(row) = txn
-        .query_opt(
-            &format!(
-                "select {STALE}, bc.prior_attempts, d.source_table, d.status \
-                 from backfill_chunks bc \
-                 join transform_definitions d on d.id = bc.definition_id \
-                 where bc.id = $1 and bc.claimed_by = $2 and not bc.done \
-                 for update of bc"
-            ),
-            &[&chunk.id, &claimed_by],
-        )
-        .await?
-    else {
-        return Ok((ChunkFailure::NotHeld, 0));
-    };
-    let prior_attempts: i32 = row.get(1);
-    // A transient failure isn't charged: the marker retries it with the
-    // backoff its earlier failures earned.
-    let attempts = match kind {
-        FailureKind::Transient => prior_attempts,
-        FailureKind::Data | FailureKind::Unnarrowable => prior_attempts.saturating_add(1),
-    };
-    if row.get::<_, bool>(0) {
-        discard_resumed_chunks(&txn, &[chunk.id]).await?;
-        txn.commit().await?;
-        return Ok((ChunkFailure::Discarded, attempts));
-    }
-    let status_text: String = row.get(3);
-    let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
-        panic!("transform_definitions.status held unrecognized value '{status_text}'")
-    });
-    if status != TransformStatus::Backfilling {
-        txn.execute("delete from backfill_chunks where id = $1", &[&chunk.id])
-            .await?;
-        txn.commit().await?;
-        return Ok((ChunkFailure::Discarded, attempts));
-    }
-    if kind != FailureKind::Transient && attempts >= MAX_CHARGED_ATTEMPTS {
-        record_failure(&txn, chunk.id, attempts, attempts, error, Duration::ZERO).await?;
-        pause_for_build_failure(&txn, chunk.definition_id).await?;
-        txn.commit().await?;
-        return Ok((ChunkFailure::Paused, attempts));
-    }
-    txn.execute("delete from backfill_chunks where id = $1", &[&chunk.id])
-        .await?;
-    txn.execute(
-        "update transform_definitions set status = $1 where id = $2",
-        &[
-            &TransformStatus::WaitingToBackfill.as_str(),
-            &chunk.definition_id,
-        ],
-    )
-    .await?;
-    let source_table: String = row.get(2);
-    crate::intake::markers::park_failed_build(&*txn, &source_table, attempts, error).await?;
-    crate::instance_log::info!(
-        definition_id = chunk.definition_id,
-        from = %TransformStatus::Backfilling.as_str(),
-        to = %TransformStatus::WaitingToBackfill.as_str(),
-        "transform status transition: direct build failed; handed back to the discharge"
-    );
-    txn.commit().await?;
-    Ok((ChunkFailure::HandedBack { attempts }, attempts))
-}
-
 /// Gives up the claims `rows` (each `(chunk id, stale)`, locked by the
 /// caller along with a share lock on each chunk's definition row) name.
 ///
@@ -1447,135 +1116,6 @@ async fn discard_resumed_chunks(
         txn.execute("delete from backfill_chunks where id = any($1)", &[&ids])
             .await?;
     }
-    Ok(())
-}
-
-/// Executes one claimed chunk's write against its target
-/// ([`super::backfill::execute_one_to_one_chunk`]). Looks up the owning
-/// definition fresh on every call (`super::catalog::definition_by_id`)
-/// rather than caching it across chunks, since chunks of the same definition
-/// may be claimed and run by entirely different processes with no shared
-/// in-memory state.
-///
-/// Runs a [`ChunkHeartbeat`] for the duration of the write so a chunk whose
-/// `INSERT … SELECT` takes longer than the fleet's `reclaim_ttl` (the whole
-/// reason [`super::backfill::BACKFILL_CHUNK_ROWS`] bounds a chunk rather than
-/// leaving it unbounded — a bound on *cost*, not on *wall-clock time*, which
-/// can still grow with row width, index maintenance, or a loaded server)
-/// isn't falsely reclaimed and concurrently re-executed by another worker
-/// while this one is still working it. `heartbeat_interval` should be well
-/// under whatever `reclaim_ttl` the caller's fleet uses — callers driven by
-/// [`crate::client::Client`] pass its `ClientOptions::heartbeat`'s own
-/// interval, matching the same margin the ring's own
-/// [`crate::staging::HeartbeatDaemon`] keeps against `reclaim_ttl` there.
-/// `reclaim_ttl` is that fleet TTL: a worker that stalls inside one of the
-/// chunk's fenced write transactions loses its session after that long idle
-/// ([`ClaimFence`]).
-///
-/// The target schema comes from the definition's own persisted, qualified
-/// `target_table` identity, never from the running worker's configuration
-/// (issue #370): `install_definition` resolved it once, honoring an explicit
-/// `TRANSFORM custom.t` spelling over `Config::target_schema`, and created
-/// the table there. A chunk re-deriving it from whatever schema the worker
-/// happens to be configured with would write into the wrong (usually
-/// nonexistent) table. Same derivation `catalog::alter_transform` uses.
-///
-/// Every target write is fenced by the claim ([`ClaimFence`], issue #434).
-/// A chunk whose claim no longer holds, because its definition was resumed
-/// or the claim was reclaimed, stops before its next write and returns
-/// `Ok`: the caller's [`finish_chunk`] then discards it, or leaves it to its
-/// new holder.
-pub async fn run_claimed_chunk(
-    pool: &Pool,
-    chunk: &ClaimedChunk,
-    claimed_by: &str,
-    heartbeat_interval: Duration,
-    reclaim_ttl: Duration,
-) -> Result<(), ChunkQueueError> {
-    let definition = catalog::definition_by_id(pool, chunk.definition_id)
-        .await?
-        .ok_or(ChunkQueueError::DefinitionNotFound {
-            definition_id: chunk.definition_id,
-        })?;
-    let (target_schema, _) = definition
-        .target_table
-        .split_once('.')
-        .expect("target_table is always schema-qualified (issue #73)");
-
-    // Dropped (aborting the background task) as soon as this function
-    // returns, one way or another — see [`ChunkHeartbeat`]'s doc comment.
-    let _heartbeat = ChunkHeartbeat::spawn(
-        pool.clone(),
-        chunk.id,
-        claimed_by.to_string(),
-        heartbeat_interval,
-    );
-
-    let fence = ClaimFence {
-        chunk_id: chunk.id,
-        claimed_by,
-        idle_timeout: reclaim_ttl,
-    };
-    let ran = match &chunk.work {
-        ChunkWork::Range { lo, hi } => backfill::execute_one_to_one_chunk(
-            pool,
-            &definition.def,
-            target_schema,
-            &definition.source_table,
-            lo.as_deref(),
-            hi,
-            chunk.key_collations.as_deref(),
-            fence,
-        )
-        .await
-        .map_err(ChunkQueueError::from),
-        ChunkWork::DirectBuild => run_direct_build(pool, &definition, target_schema, fence).await,
-        // A Re-derive build's work and a partition correction run through
-        // `staging::build`, which claims them itself; `claim_chunks` never
-        // hands them out.
-        work @ (ChunkWork::Plan { .. }
-        | ChunkWork::Rederive { .. }
-        | ChunkWork::Sweep { .. }
-        | ChunkWork::Correction { .. }) => Err(ChunkQueueError::UnknownKind {
-            kind: work.kind().to_string(),
-        }),
-    };
-    match ran {
-        // The fence stopped the write (issue #434). The caller's
-        // `finish_chunk` then discards a chunk held across a resume, and
-        // leaves one reclaimed from this worker to its new holder.
-        Err(ChunkQueueError::Backfill(BackfillError::Superseded)) => {
-            crate::instance_log::info!(
-                chunk_id = chunk.id,
-                definition_id = chunk.definition_id,
-                "backfill chunk superseded before its write; wrote nothing further"
-            );
-            Ok(())
-        }
-        ran => ran,
-    }
-}
-
-/// Runs a [`ChunkWork::DirectBuild`] job: the whole direct set-based build
-/// of `definition` (ADR-0002, [`backfill::backfill_definition`]).
-///
-/// Moving the definition on to `catching_up` is [`finish_chunk`]'s job, as
-/// for every chunk.
-async fn run_direct_build(
-    pool: &Pool,
-    definition: &super::model::Definition,
-    target_schema: &str,
-    fence: ClaimFence<'_>,
-) -> Result<(), ChunkQueueError> {
-    backfill::backfill_definition_fenced(
-        pool,
-        &definition.def,
-        target_schema,
-        &definition.source_table,
-        &definition.source_columns,
-        Some(fence),
-    )
-    .await?;
     Ok(())
 }
 
@@ -1640,87 +1180,9 @@ impl Drop for ChunkHeartbeat {
     }
 }
 
-/// Marks `chunk` done — scoped `claimed_by = $2 and not done` so a claim
-/// already reclaimed out from under this caller (the TTL sweep decided this
-/// worker died) is left untouched rather than double-completed — and, if
-/// every chunk for its definition is now done, flips that definition
-/// `backfilling` -> `live` (`super::catalog::complete_direct_backfill`).
-///
-/// Race-free under two workers finishing different chunks of the *same*
-/// definition near-simultaneously: this locks the definition's own
-/// `transform_definitions` row (`for update`) before checking "any chunks
-/// left?", so the second worker to reach that check always does so *after*
-/// the first's own completed-chunk update has committed (it had to wait for
-/// the lock), never against a stale snapshot that still shows the first
-/// worker's chunk as pending. Exactly one of the two ever observes "zero
-/// remaining" and performs the flip.
-///
-/// **A chunk held across its definition's resume completes nothing (issue
-/// #397).** The resumed definition goes live through its rebuild, which the
-/// resume's own discharge dispatches (fresh chunks, or a ring read). Completing
-/// it from a chunk of the superseded build would flip it `live` early. So a
-/// [`STALE`] chunk is discarded instead (see [`free_or_discard_claims`]),
-/// with nothing to repair ([`ClaimFence`]). [`STALE`] is read
-/// under this function's `for update` lock on the definition row, which
-/// resume and the discharge's dispatch take too.
-pub async fn finish_chunk(
-    pool: &Pool,
-    chunk: &ClaimedChunk,
-    claimed_by: &str,
-) -> Result<(), ChunkQueueError> {
-    let mut client = pool.get().await?;
-    let txn = client.transaction().await?;
-
-    txn.execute(
-        "select 1 from transform_definitions where id = $1 for update",
-        &[&chunk.definition_id],
-    )
-    .await?;
-    let stale = txn
-        .query_opt(
-            &format!(
-                "select {STALE} from backfill_chunks bc \
-                 join transform_definitions d on d.id = bc.definition_id \
-                 where bc.id = $1"
-            ),
-            &[&chunk.id],
-        )
-        .await?
-        .is_some_and(|row| row.get::<_, bool>(0));
-    if stale {
-        let held: Vec<i64> = txn
-            .query(
-                "select id from backfill_chunks \
-                 where id = $1 and claimed_by = $2 and not done for update",
-                &[&chunk.id, &claimed_by],
-            )
-            .await?
-            .iter()
-            .map(|row| row.get(0))
-            .collect();
-        discard_resumed_chunks(&txn, &held).await?;
-        txn.commit().await?;
-        return Ok(());
-    }
-
-    let done = txn
-        .execute(
-            "update backfill_chunks set done = true, claimed_by = null, claimed_at = null \
-             where id = $1 and claimed_by = $2 and not done",
-            &[&chunk.id, &claimed_by],
-        )
-        .await?;
-    if done == 1 {
-        complete_if_no_chunks_remain_in_txn(&txn, chunk.definition_id).await?;
-    }
-
-    txn.commit().await?;
-    Ok(())
-}
-
 /// Gives up `chunk` after its fence stopped a Re-derive build's write
 /// (`staging::build`, #625 F2): deletes it if it was held across its
-/// definition's resume ([`STALE`]), as [`finish_chunk`] does, and otherwise
+/// definition's resume ([`STALE`]), and otherwise
 /// leaves it alone (its claim was reclaimed, or it is done).
 pub(crate) async fn discard_if_superseded(
     pool: &Pool,
@@ -1754,1386 +1216,4 @@ pub(crate) async fn discard_if_superseded(
     discard_resumed_chunks(&txn, &stale).await?;
     txn.commit().await?;
     Ok(())
-}
-
-/// The shared "no chunks left? then flip to live" check both
-/// [`finish_chunk`] and [`dispatch_one_to_one`]'s zero-chunk case run once they
-/// already hold the definition row's `for update` lock. Returns the status
-/// the completion left the definition in, or `None` while chunks remain —
-/// "flip to live" only ever happens from `backfilling` (issue #331; see
-/// `complete_direct_backfill`).
-///
-/// Only the current build's chunks count: a [`STALE`] chunk a worker still
-/// holds from before a resume never completes, and is discarded however its
-/// worker gives it up, so waiting on it would strand the rebuild.
-async fn complete_if_no_chunks_remain_in_txn(
-    txn: &tokio_postgres::Transaction<'_>,
-    definition_id: i64,
-) -> Result<Option<TransformStatus>, CatalogError> {
-    let remaining: bool = txn
-        .query_one(
-            &format!(
-                "select exists( \
-                     select 1 from backfill_chunks bc \
-                     join transform_definitions d on d.id = bc.definition_id \
-                     where bc.definition_id = $1 and not bc.done and not ({STALE}) \
-                 )"
-            ),
-            &[&definition_id],
-        )
-        .await?
-        .get(0);
-    if remaining {
-        return Ok(None);
-    }
-    Ok(Some(
-        catalog::complete_direct_backfill(txn, definition_id).await?,
-    ))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::defs::ast::TransformDef;
-    use crate::defs::lifecycle::pause_transform;
-    use crate::defs::parser::parse;
-    use crate::staging::quarantine::resume_transform;
-    use tokio_postgres::NoTls;
-
-    const WORKER: &str = "issue-360-worker";
-
-    /// A same-crate pool plus a raw connection onto `db` (testkit's own
-    /// `db.pool` is the other crate instance's `Pool` type).
-    async fn connect(db: &testkit::TestDatabase) -> (Pool, tokio_postgres::Client) {
-        let config = crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid schema");
-        let pool = Pool::new(&config).expect("build a same-crate pool");
-        let (raw, connection) = tokio_postgres::connect(db.dsn(), NoTls)
-            .await
-            .expect("connect");
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
-        raw.batch_execute(&format!(
-            "set search_path to {}, public",
-            crate::config::DEFAULT_SCHEMA
-        ))
-        .await
-        .expect("set search_path");
-        (pool, raw)
-    }
-
-    /// Seeds `public.<source>` with `rows` rows and a `waiting_to_backfill`
-    /// definition `<target>` over it: the state registration leaves behind
-    /// for the discharge to dispatch.
-    async fn seed_waiting(
-        raw: &tokio_postgres::Client,
-        source: &str,
-        target: &str,
-        rows: i64,
-    ) -> (i64, TransformDef) {
-        let text = format!("TRANSFORM {target} FROM {source} SELECT a + a AS x");
-        // The target's ledger, which define creates with it and which a
-        // resume needs to exist (#986).
-        let ledger =
-            super::super::ledger::one_to_one_ledger_ddl(&format!("public.{target}__ledger"));
-        raw.batch_execute(&format!(
-            "create table public.{source} (id bigint primary key, a numeric); \
-             insert into public.{source} select g, g from generate_series(1, {rows}) g; \
-             create table public.{target} (id bigint primary key, x numeric){ledger}; \
-             insert into source_table_versions (source_table, version) \
-             values ('public.{source}', 1)"
-        ))
-        .await
-        .expect("seed source");
-        // The old chunked build is a seam-fed source's since #625 F8a: over
-        // a captured table, a plain 1-1 is the Re-derive build's, and a
-        // resume would park it no marker.
-        crate::intake::markers::feed_from_a_test_definition(raw, &format!("public.{source}"))
-            .await
-            .expect("make the source another definition's target");
-        let id: i64 = raw
-            .query_one(
-                "insert into transform_definitions \
-                 (target_table, source_table, source_version, definition_text, status) \
-                 values ($1, $2, 1, $3, 'waiting_to_backfill') returning id",
-                &[
-                    &format!("public.{target}"),
-                    &format!("public.{source}"),
-                    &text,
-                ],
-            )
-            .await
-            .expect("seed definition")
-            .get(0);
-        (id, parse(&text).expect("parse definition"))
-    }
-
-    /// Plans `def`'s chunks and dispatches them in one transaction, as the
-    /// backfill discharge does.
-    async fn dispatch(
-        pool: &Pool,
-        id: i64,
-        def: &TransformDef,
-        source: &str,
-    ) -> Option<TransformStatus> {
-        let mut client = pool.get().await.expect("connection");
-        let ranges = backfill::plan_one_to_one_chunks(&**client, def, source)
-            .await
-            .expect("plan chunks");
-        let txn = client.transaction().await.expect("begin");
-        let status = dispatch_one_to_one(&txn, id, &ranges)
-            .await
-            .expect("dispatch");
-        txn.commit().await.expect("commit");
-        status
-    }
-
-    async fn status_of(raw: &tokio_postgres::Client, id: i64) -> String {
-        raw.query_one(
-            "select status from transform_definitions where id = $1",
-            &[&id],
-        )
-        .await
-        .expect("read status")
-        .get(0)
-    }
-
-    async fn chunk_count(raw: &tokio_postgres::Client, id: i64) -> i64 {
-        raw.query_one(
-            "select count(*) from backfill_chunks where definition_id = $1 and not done",
-            &[&id],
-        )
-        .await
-        .expect("count chunks")
-        .get(0)
-    }
-
-    async fn marker_generation(raw: &tokio_postgres::Client, table: &str) -> Option<i64> {
-        raw.query_opt(
-            "select generation from pending_backfill where table_name = $1",
-            &[&table],
-        )
-        .await
-        .expect("read marker")
-        .map(|row| row.get(0))
-    }
-
-    /// Issue #418: the dispatch moves the definition to `backfilling` in the
-    /// same transaction as the chunks that drive it (#404).
-    #[tokio::test]
-    async fn dispatch_commits_backfilling_with_its_chunks() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (pool, raw) = connect(&db).await;
-        let (id, def) = seed_waiting(&raw, "orders", "order_doubles", 3).await;
-
-        let status = dispatch(&pool, id, &def, "public.orders").await;
-        assert_eq!(status, Some(TransformStatus::Backfilling));
-        assert_eq!(status_of(&raw, id).await, "backfilling");
-        assert_eq!(chunk_count(&raw, id).await, 1);
-    }
-
-    /// An empty source plans zero chunks, so nothing would ever finish a last
-    /// chunk: the dispatch completes the definition itself, parking its
-    /// go-live catch-up, whose discharge takes it `live` (issue #476).
-    #[tokio::test]
-    async fn dispatching_an_empty_source_completes_its_build() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (pool, raw) = connect(&db).await;
-        let (id, def) = seed_waiting(&raw, "orders", "order_doubles", 0).await;
-
-        let status = dispatch(&pool, id, &def, "public.orders").await;
-        assert_eq!(status, Some(TransformStatus::CatchingUp));
-        assert_eq!(status_of(&raw, id).await, "catching_up");
-        assert!(
-            marker_generation(&raw, "public.orders").await.is_some(),
-            "the go-live catch-up is parked"
-        );
-    }
-
-    /// Issue #331: an operator pause that lands after the discharge read the
-    /// definition stands. The dispatch enqueues nothing for it; its resume
-    /// parks a marker of its own.
-    #[tokio::test]
-    async fn a_definition_paused_before_its_dispatch_is_left_paused() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (pool, raw) = connect(&db).await;
-        let (id, def) = seed_waiting(&raw, "orders", "order_doubles", 3).await;
-        pause_transform(&pool, "order_doubles")
-            .await
-            .expect("pause");
-
-        let status = dispatch(&pool, id, &def, "public.orders").await;
-        assert_eq!(status, None);
-        assert_eq!(status_of(&raw, id).await, "paused");
-        assert_eq!(chunk_count(&raw, id).await, 0, "nothing is enqueued");
-    }
-
-    /// Dispatches `id`'s chunks, claims its one chunk for [`WORKER`], then
-    /// pauses and resumes the definition while that claim is held (#332
-    /// leaves a held chunk alone).
-    async fn hold_a_chunk_across_a_resume(
-        pool: &Pool,
-        raw: &tokio_postgres::Client,
-        id: i64,
-        def: &TransformDef,
-        target: &str,
-        source: &str,
-    ) -> ClaimedChunk {
-        dispatch(pool, id, def, source).await;
-        let mut held = claim_chunks(raw, WORKER, 1).await.expect("claim");
-        assert_eq!(held.len(), 1, "precondition: one chunk held");
-        let held = held.remove(0);
-        assert_eq!(held.definition_id, id);
-        pause_transform(pool, target).await.expect("pause");
-        resume_transform(pool, target).await.expect("resume");
-        assert_eq!(
-            chunk_count(raw, id).await,
-            1,
-            "precondition: resume leaves the held chunk to its worker"
-        );
-        held
-    }
-
-    /// Issue #360, race 1 (write failed): a chunk held across the resume and
-    /// then released is discarded, not handed out again. Nothing is parked
-    /// for it: any part of its range its failed write committed landed before
-    /// the resume (issue #434), and the resume's own marker rebuilds it.
-    #[tokio::test]
-    async fn releasing_a_chunk_held_across_a_resume_discards_it() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (pool, mut raw) = connect(&db).await;
-        let (id, def) = seed_waiting(&raw, "orders", "order_doubles", 3).await;
-        let held =
-            hold_a_chunk_across_a_resume(&pool, &raw, id, &def, "order_doubles", "public.orders")
-                .await;
-        let parked = marker_generation(&raw, "public.orders").await;
-        assert!(parked.is_some(), "precondition: resume parked a marker");
-
-        let released = release_chunk(&mut raw, held.id, WORKER)
-            .await
-            .expect("release");
-        assert_eq!(released, 1);
-
-        assert_eq!(chunk_count(&raw, id).await, 0, "the chunk was discarded");
-        assert!(
-            claim_chunks(&raw, WORKER, 100)
-                .await
-                .expect("claim")
-                .is_empty(),
-            "nothing is claimable again"
-        );
-        assert_eq!(
-            marker_generation(&raw, "public.orders").await,
-            parked,
-            "the discard parks nothing"
-        );
-    }
-
-    /// Issue #360, race 1 (worker died): the stale-claim sweep discards a
-    /// chunk held across its definition's resume, and still frees a current
-    /// sibling's stale claim for another worker.
-    #[tokio::test]
-    async fn reclaiming_a_chunk_held_across_a_resume_discards_it() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (pool, mut raw) = connect(&db).await;
-        let (id, def) = seed_waiting(&raw, "orders", "order_doubles", 3).await;
-        let held =
-            hold_a_chunk_across_a_resume(&pool, &raw, id, &def, "order_doubles", "public.orders")
-                .await;
-        let parked = marker_generation(&raw, "public.orders").await;
-
-        let (sibling, sibling_def) = seed_waiting(&raw, "items", "item_doubles", 3).await;
-        dispatch(&pool, sibling, &sibling_def, "public.items").await;
-        let sibling_held = claim_chunks(&raw, WORKER, 1).await.expect("claim sibling");
-        assert_eq!(sibling_held.len(), 1);
-        assert_eq!(sibling_held[0].definition_id, sibling);
-
-        // A zero TTL makes every claim taken in an earlier transaction stale.
-        let reclaimed = reclaim_stale_chunks(&mut raw, Duration::ZERO)
-            .await
-            .expect("reclaim");
-        assert_eq!(reclaimed, 2, "both stale claims are dealt with");
-
-        assert_eq!(chunk_count(&raw, id).await, 0, "the chunk was discarded");
-        assert_eq!(
-            marker_generation(&raw, "public.orders").await,
-            parked,
-            "the discard parks nothing"
-        );
-        let reclaimable = claim_chunks(&raw, WORKER, 100).await.expect("claim");
-        assert_eq!(
-            reclaimable
-                .iter()
-                .map(|c| (c.id, c.definition_id))
-                .collect::<Vec<_>>(),
-            [(sibling_held[0].id, sibling)],
-            "only the current sibling's chunk is claimable again, not {held:?}"
-        );
-    }
-
-    /// Issues #397/#418: a resumed plain 1-1 definition's rebuild is chunked
-    /// too. A chunk held across the resume that finishes while the rebuild's
-    /// own chunks are outstanding must not complete the definition, and must
-    /// not keep the rebuild from completing: the rebuild's last chunk
-    /// completes it (`catching_up`, issue #476). The held chunk is retired,
-    /// parking nothing.
-    #[tokio::test]
-    async fn a_chunk_held_across_a_resume_neither_completes_nor_blocks_the_rebuild() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (pool, raw) = connect(&db).await;
-        let (id, def) = seed_waiting(&raw, "orders", "order_doubles", 3).await;
-        let held =
-            hold_a_chunk_across_a_resume(&pool, &raw, id, &def, "order_doubles", "public.orders")
-                .await;
-
-        // The resume's discharge dispatches the rebuild's own chunks.
-        assert_eq!(
-            dispatch(&pool, id, &def, "public.orders").await,
-            Some(TransformStatus::Backfilling)
-        );
-        let rebuild = claim_chunks(&raw, WORKER, 100)
-            .await
-            .expect("claim rebuild");
-        assert_eq!(rebuild.len(), 1, "only the rebuild's chunk is claimable");
-        assert_ne!(rebuild[0].id, held.id);
-
-        let parked = marker_generation(&raw, "public.orders").await;
-        finish_chunk(&pool, &held, WORKER)
-            .await
-            .expect("finish held");
-        assert_eq!(
-            status_of(&raw, id).await,
-            "backfilling",
-            "the held chunk doesn't complete the rebuild"
-        );
-        assert_eq!(
-            marker_generation(&raw, "public.orders").await,
-            parked,
-            "the discard parks nothing"
-        );
-
-        run_claimed_chunk(
-            &pool,
-            &rebuild[0],
-            WORKER,
-            Duration::from_secs(5),
-            Duration::from_secs(60),
-        )
-        .await
-        .expect("run rebuild chunk");
-        finish_chunk(&pool, &rebuild[0], WORKER)
-            .await
-            .expect("finish rebuild chunk");
-        assert_eq!(status_of(&raw, id).await, "catching_up");
-    }
-
-    /// The rebuild's last chunk completes the definition even while a chunk
-    /// from before the resume is still held: the held chunk is stale, so it
-    /// doesn't count as outstanding work.
-    #[tokio::test]
-    async fn the_rebuild_completes_while_a_stale_chunk_is_still_held() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (pool, mut raw) = connect(&db).await;
-        let (id, def) = seed_waiting(&raw, "orders", "order_doubles", 3).await;
-        let held =
-            hold_a_chunk_across_a_resume(&pool, &raw, id, &def, "order_doubles", "public.orders")
-                .await;
-        dispatch(&pool, id, &def, "public.orders").await;
-        let rebuild = claim_chunks(&raw, WORKER, 100)
-            .await
-            .expect("claim rebuild");
-        assert_eq!(rebuild.len(), 1);
-
-        run_claimed_chunk(
-            &pool,
-            &rebuild[0],
-            WORKER,
-            Duration::from_secs(5),
-            Duration::from_secs(60),
-        )
-        .await
-        .expect("run rebuild chunk");
-        finish_chunk(&pool, &rebuild[0], WORKER)
-            .await
-            .expect("finish rebuild chunk");
-        assert_eq!(status_of(&raw, id).await, "catching_up");
-
-        release_chunk(&mut raw, held.id, WORKER)
-            .await
-            .expect("release held");
-        assert_eq!(status_of(&raw, id).await, "catching_up");
-        assert_eq!(
-            chunk_count(&raw, id).await,
-            0,
-            "the held chunk is discarded"
-        );
-    }
-
-    /// #616: a chunk of a composite-key source that fails on one row's data
-    /// splits by key count down to that row's key, quarantines it under the
-    /// key's ring encoding, and the build finishes without it. Driven one
-    /// claim at a time.
-    #[tokio::test]
-    async fn a_composite_key_chunk_narrows_to_its_failing_key() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (pool, raw) = connect(&db).await;
-        let text = "TRANSFORM pair_doubles FROM pairs SELECT x + x AS y";
-        raw.batch_execute(&format!(
-            "create table public.pairs (a int, b text, x int, primary key (a, b)); \
-             insert into public.pairs values \
-                 (1, 'a', 1), (1, 'b', {}), (2, 'a', 3), (2, 'b', 4), (3, 'a', 5); \
-             create table public.pair_doubles (a int, b text, y int, primary key (a, b)); \
-             insert into source_table_versions (source_table, version) \
-             values ('public.pairs', 1)",
-            i32::MAX
-        ))
-        .await
-        .expect("seed source");
-        let id: i64 = raw
-            .query_one(
-                "insert into transform_definitions \
-                 (target_table, source_table, source_version, definition_text, status) \
-                 values ('public.pair_doubles', 'public.pairs', 1, $1, 'waiting_to_backfill') \
-                 returning id",
-                &[&text],
-            )
-            .await
-            .expect("seed definition")
-            .get(0);
-        let def = parse(text).expect("parse definition");
-        assert_eq!(
-            dispatch(&pool, id, &def, "public.pairs").await,
-            Some(TransformStatus::Backfilling)
-        );
-
-        let mut outcomes = Vec::new();
-        for _ in 0..20 {
-            let Some(chunk) = claim_chunks(&raw, WORKER, 1).await.expect("claim").pop() else {
-                break;
-            };
-            match run_claimed_chunk(
-                &pool,
-                &chunk,
-                WORKER,
-                Duration::from_secs(5),
-                Duration::from_secs(60),
-            )
-            .await
-            {
-                Ok(()) => finish_chunk(&pool, &chunk, WORKER).await.expect("finish"),
-                Err(err) => outcomes.push(
-                    fail_chunk(&pool, &chunk, WORKER, &err)
-                        .await
-                        .expect("fail the chunk"),
-                ),
-            }
-        }
-
-        let key = ddl_key(&["1", "b"]);
-        assert!(
-            matches!(outcomes.first(), Some(ChunkFailure::Split { .. })),
-            "{outcomes:?}"
-        );
-        assert_eq!(
-            outcomes.last(),
-            Some(&ChunkFailure::Quarantined {
-                key: key.clone(),
-                fuse_tripped: false
-            }),
-            "{outcomes:?}"
-        );
-        assert_eq!(status_of(&raw, id).await, "catching_up");
-        let poisoned: Vec<String> = raw
-            .query(
-                "select key from poison where src_table = 'public.pairs'",
-                &[],
-            )
-            .await
-            .expect("read poison")
-            .into_iter()
-            .map(|row| row.get(0))
-            .collect();
-        assert_eq!(poisoned, vec![key]);
-        let built: Vec<(i32, String, i32)> = raw
-            .query("select a, b, y from public.pair_doubles order by a, b", &[])
-            .await
-            .expect("read the target")
-            .into_iter()
-            .map(|row| (row.get(0), row.get(1), row.get(2)))
-            .collect();
-        assert_eq!(
-            built,
-            vec![
-                (1, "a".to_string(), 2),
-                (2, "a".to_string(), 6),
-                (2, "b".to_string(), 8),
-                (3, "a".to_string(), 10)
-            ]
-        );
-    }
-
-    /// #824: a chunk narrowed to the key whose write fails quarantines it
-    /// with the failure's SQLSTATE, which a release after an in-place
-    /// re-type (`staging::quarantine::release_retyped_keys`) matches on:
-    /// here `22003`, a value out of range for the target's `smallint`.
-    #[tokio::test]
-    async fn a_chunk_quarantines_its_failing_key_with_the_failure_s_sqlstate() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (pool, raw) = connect(&db).await;
-        let text = "TRANSFORM small_copies FROM smalls SELECT x AS y";
-        raw.batch_execute(
-            "create table public.smalls (id int primary key, x int); \
-             insert into public.smalls values (1, 1), (2, 40000), (3, 3), (4, 4); \
-             create table public.small_copies (id int primary key, y smallint); \
-             insert into source_table_versions (source_table, version) \
-             values ('public.smalls', 1)",
-        )
-        .await
-        .expect("seed source");
-        let id: i64 = raw
-            .query_one(
-                "insert into transform_definitions \
-                 (target_table, source_table, source_version, definition_text, status) \
-                 values ('public.small_copies', 'public.smalls', 1, $1, 'waiting_to_backfill') \
-                 returning id",
-                &[&text],
-            )
-            .await
-            .expect("seed definition")
-            .get(0);
-        let def = parse(text).expect("parse definition");
-        assert_eq!(
-            dispatch(&pool, id, &def, "public.smalls").await,
-            Some(TransformStatus::Backfilling)
-        );
-
-        let mut outcomes = Vec::new();
-        for _ in 0..20 {
-            let Some(chunk) = claim_chunks(&raw, WORKER, 1).await.expect("claim").pop() else {
-                break;
-            };
-            match run_claimed_chunk(
-                &pool,
-                &chunk,
-                WORKER,
-                Duration::from_secs(5),
-                Duration::from_secs(60),
-            )
-            .await
-            {
-                Ok(()) => finish_chunk(&pool, &chunk, WORKER).await.expect("finish"),
-                Err(err) => outcomes.push(
-                    fail_chunk(&pool, &chunk, WORKER, &err)
-                        .await
-                        .expect("fail the chunk"),
-                ),
-            }
-        }
-        assert!(
-            matches!(outcomes.last(), Some(ChunkFailure::Quarantined { .. })),
-            "{outcomes:?}"
-        );
-        let poisoned: Vec<(String, Option<String>)> = raw
-            .query(
-                "select key, sqlstate from poison where transform_id = $1",
-                &[&id],
-            )
-            .await
-            .expect("read poison")
-            .into_iter()
-            .map(|row| (row.get(0), row.get(1)))
-            .collect();
-        assert_eq!(poisoned, vec![(ddl_key(&["2"]), Some("22003".to_string()))]);
-    }
-
-    /// Issue #766: a build worker logged in as a role the source's row-level
-    /// security applies to is refused the read (every Trellis session runs
-    /// with `row_security = off`), rather than building from the rows the
-    /// policies allow. The refusal is no row's fault, so the chunk is never
-    /// narrowed and no key is quarantined: it is retried and charged, and
-    /// its [`MAX_CHARGED_ATTEMPTS`]th charge pauses the definition, with
-    /// Postgres's error left on the chunk for `status`'s `backfill_failure`.
-    #[tokio::test]
-    async fn a_chunk_refused_for_row_security_pauses_its_definition_without_narrowing() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (pool, raw) = connect(&db).await;
-        let (id, def) = seed_waiting(&raw, "policed", "policed_doubles", 10).await;
-        // Planned while nothing is refused: a discharge planning as the
-        // refused role is refused too, and retries on its marker instead.
-        assert_eq!(
-            dispatch(&pool, id, &def, "public.policed").await,
-            Some(TransformStatus::Backfilling)
-        );
-        // A member of the owning role inherits its ownership but not its
-        // superuser status, so the forced policies apply to it.
-        raw.batch_execute(
-            "create role build_worker login in role postgres; \
-             alter table public.policed enable row level security, force row level security; \
-             create policy hide_odd on public.policed using (id % 2 = 0);",
-        )
-        .await
-        .expect("a login role the source's policies apply to");
-        let config =
-            crate::config::Config::from_dsn(db.dsn().replace("user=postgres", "user=build_worker"))
-                .expect("valid dsn");
-        let worker = Pool::new(&config).expect("the build worker's pool");
-
-        let mut outcomes = Vec::new();
-        for _ in 0..MAX_CHARGED_ATTEMPTS + 2 {
-            raw.execute(
-                "update backfill_chunks set next_attempt_at = now() where definition_id = $1",
-                &[&id],
-            )
-            .await
-            .expect("run the backoff out");
-            let Some(chunk) = claim_chunks(&raw, WORKER, 1).await.expect("claim").pop() else {
-                break;
-            };
-            let err = run_claimed_chunk(
-                &worker,
-                &chunk,
-                WORKER,
-                Duration::from_secs(5),
-                Duration::from_secs(60),
-            )
-            .await
-            .expect_err("the build's read is refused");
-            assert!(
-                err.to_string()
-                    .contains("query would be affected by row-level security policy"),
-                "{err}"
-            );
-            outcomes.push(
-                fail_chunk(&worker, &chunk, WORKER, &err)
-                    .await
-                    .expect("fail the chunk"),
-            );
-        }
-
-        let charged = usize::try_from(MAX_CHARGED_ATTEMPTS).expect("small") - 1;
-        assert_eq!(outcomes.len(), charged + 1, "{outcomes:?}");
-        assert!(
-            outcomes[..charged]
-                .iter()
-                .all(|o| matches!(o, ChunkFailure::Retrying { charged: true, .. })),
-            "{outcomes:?}"
-        );
-        assert_eq!(outcomes.last(), Some(&ChunkFailure::Paused), "{outcomes:?}");
-        assert_eq!(status_of(&raw, id).await, "paused");
-        let poisoned: i64 = raw
-            .query_one("select count(*) from poison", &[])
-            .await
-            .expect("count poison")
-            .get(0);
-        assert_eq!(poisoned, 0, "no key was quarantined");
-        let last_error: Option<String> = raw
-            .query_one(
-                "select last_error from backfill_chunks where definition_id = $1",
-                &[&id],
-            )
-            .await
-            .expect("the chunk stays as the record")
-            .get(0);
-        assert!(
-            last_error.is_some_and(|e| e.contains("row-level security")),
-            "the chunk records Postgres's refusal"
-        );
-        let built: i64 = raw
-            .query_one("select count(*) from public.policed_doubles", &[])
-            .await
-            .expect("read the target")
-            .get(0);
-        assert_eq!(built, 0, "nothing was built from the visible rows");
-    }
-
-    /// A source keyed by a nullable `UNIQUE NULLS NOT DISTINCT` index (an
-    /// aggregate target's grouping columns, issue #128) can hold a row with a
-    /// `NULL` key part that a range's row comparison still admits, because an
-    /// earlier part decides it: `(2, NULL) <= (3, 'a')`. No target row can
-    /// represent that key, so the build leaves it out, as the drain does. It
-    /// must not fail the chunk: the narrowing never counts such a row, so it
-    /// would quarantine the innocent key beside it and then pause the
-    /// definition.
-    #[tokio::test]
-    async fn a_chunk_leaves_out_a_row_with_a_null_key_part() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (pool, raw) = connect(&db).await;
-        let text = "TRANSFORM pair_doubles FROM pairs SELECT x + x AS y";
-        raw.batch_execute(
-            "create table public.pairs (a int, b text, x int, unique nulls not distinct (a, b)); \
-             insert into public.pairs values (1, 'a', 1), (2, null, 2), (3, 'a', 3); \
-             create table public.pair_doubles (a int, b text, y int, primary key (a, b)); \
-             insert into source_table_versions (source_table, version) \
-             values ('public.pairs', 1)",
-        )
-        .await
-        .expect("seed source");
-        let id: i64 = raw
-            .query_one(
-                "insert into transform_definitions \
-                 (target_table, source_table, source_version, definition_text, status) \
-                 values ('public.pair_doubles', 'public.pairs', 1, $1, 'waiting_to_backfill') \
-                 returning id",
-                &[&text],
-            )
-            .await
-            .expect("seed definition")
-            .get(0);
-        let def = parse(text).expect("parse definition");
-        assert_eq!(
-            dispatch(&pool, id, &def, "public.pairs").await,
-            Some(TransformStatus::Backfilling)
-        );
-
-        let mut outcomes = Vec::new();
-        for _ in 0..20 {
-            let Some(chunk) = claim_chunks(&raw, WORKER, 1).await.expect("claim").pop() else {
-                break;
-            };
-            match run_claimed_chunk(
-                &pool,
-                &chunk,
-                WORKER,
-                Duration::from_secs(5),
-                Duration::from_secs(60),
-            )
-            .await
-            {
-                Ok(()) => finish_chunk(&pool, &chunk, WORKER).await.expect("finish"),
-                Err(err) => outcomes.push(
-                    fail_chunk(&pool, &chunk, WORKER, &err)
-                        .await
-                        .expect("fail the chunk"),
-                ),
-            }
-        }
-
-        assert_eq!(outcomes, vec![], "no chunk failed");
-        assert_eq!(status_of(&raw, id).await, "catching_up");
-        let poisoned: i64 = raw
-            .query_one("select count(*) from poison", &[])
-            .await
-            .expect("read poison")
-            .get(0);
-        assert_eq!(poisoned, 0);
-        let built: Vec<(i32, String, i32)> = raw
-            .query("select a, b, y from public.pair_doubles order by a, b", &[])
-            .await
-            .expect("read the target")
-            .into_iter()
-            .map(|row| (row.get(0), row.get(1), row.get(2)))
-            .collect();
-        assert_eq!(
-            built,
-            vec![(1, "a".to_string(), 2), (3, "a".to_string(), 6)]
-        );
-    }
-
-    /// A composite key's ring encoding of `parts`.
-    fn ddl_key(parts: &[&str]) -> String {
-        super::super::ddl::join_pk_key(parts)
-    }
-
-    /// The table [`seed_waiting_aggregate`]'s definition builds into: its
-    /// target.
-    async fn create_rollup_target(pool: &Pool) {
-        let text = "TRANSFORM rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT g AS g, sum(a) AS total";
-        let columns: std::collections::HashMap<String, super::super::ast::ValueType> =
-            ["id", "g", "a"]
-                .into_iter()
-                .map(|c| (c.to_string(), super::super::ast::ValueType::Numeric))
-                .collect();
-        super::super::ddl::create_aggregate_target_table(
-            pool,
-            &parse(text).expect("parse"),
-            "public",
-            &columns,
-        )
-        .await
-        .expect("create the target");
-    }
-
-    /// Seeds `public.orders` (three rows over two groups) and a
-    /// `waiting_to_backfill` aggregate definition `rollup` over it, creating
-    /// its target table unless `with_target` is `false`.
-    async fn seed_waiting_aggregate(
-        pool: &Pool,
-        raw: &tokio_postgres::Client,
-        with_target: bool,
-    ) -> i64 {
-        let text = "TRANSFORM rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT g AS g, sum(a) AS total";
-        raw.batch_execute(
-            "create table public.orders (id bigint primary key, g numeric, a numeric); \
-             insert into public.orders values (1, 1, 10), (2, 1, 20), (3, 2, 5); \
-             insert into source_table_versions (source_table, version) \
-             values ('public.orders', 1)",
-        )
-        .await
-        .expect("seed source");
-        if with_target {
-            create_rollup_target(pool).await;
-        }
-        raw.query_one(
-            "insert into transform_definitions \
-             (target_table, source_table, source_version, definition_text, status, \
-              source_columns) \
-             values ('public.rollup', 'public.orders', 1, $1, 'waiting_to_backfill', \
-                     '{\"id\": \"numeric\", \"g\": \"numeric\", \"a\": \"numeric\"}') \
-             returning id",
-            &[&text],
-        )
-        .await
-        .expect("seed definition")
-        .get(0)
-    }
-
-    /// Dispatches `id`'s direct-build job as the backfill discharge does.
-    async fn dispatch_job(pool: &Pool, id: i64, prior_attempts: i32) {
-        let mut client = pool.get().await.expect("connection");
-        let txn = client.transaction().await.expect("begin");
-        let status = dispatch_direct_build(&txn, id, prior_attempts)
-            .await
-            .expect("dispatch");
-        txn.commit().await.expect("commit");
-        assert_eq!(status, Some(TransformStatus::Backfilling));
-    }
-
-    /// Issue #419: a direct build that fails hands its build back to the
-    /// discharge in one transaction: the job is gone, the definition is
-    /// `waiting_to_backfill` again, and its source's marker carries the error
-    /// and a backoff, one attempt past the marker that dispatched the job.
-    #[tokio::test]
-    async fn a_failed_direct_build_is_handed_back_to_the_discharge() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (pool, raw) = connect(&db).await;
-        // No target table, so the build's write fails.
-        let id = seed_waiting_aggregate(&pool, &raw, false).await;
-        dispatch_job(&pool, id, 2).await;
-
-        let job = claim_chunks(&raw, WORKER, 10).await.expect("claim");
-        let error = run_claimed_chunk(
-            &pool,
-            &job[0],
-            WORKER,
-            Duration::from_secs(5),
-            Duration::from_secs(60),
-        )
-        .await
-        .expect_err("the build has no target to write");
-        let given_up = fail_chunk(&pool, &job[0], WORKER, &error)
-            .await
-            .expect("fail the job");
-        assert_eq!(given_up, ChunkFailure::HandedBack { attempts: 3 });
-
-        assert_eq!(status_of(&raw, id).await, "waiting_to_backfill");
-        let jobs: i64 = raw
-            .query_one(
-                "select count(*) from backfill_chunks where definition_id = $1",
-                &[&id],
-            )
-            .await
-            .expect("count jobs")
-            .get(0);
-        assert_eq!(jobs, 0);
-        let marker = raw
-            .query_one(
-                "select attempts, last_error, next_attempt_at > now() \
-                 from pending_backfill where table_name = 'public.orders'",
-                &[],
-            )
-            .await
-            .expect("the marker is parked");
-        assert_eq!(marker.get::<_, i32>(0), 3);
-        assert_eq!(marker.get::<_, Option<String>>(1), Some(error.to_string()));
-        assert!(marker.get::<_, bool>(2), "the retry is backed off");
-    }
-
-    /// A job that fails after an operator paused its definition only loses
-    /// the job: the definition stays paused, with no marker, and its resume
-    /// parks one and rebuilds.
-    #[tokio::test]
-    async fn a_failed_direct_build_of_a_paused_definition_leaves_it_paused() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (pool, raw) = connect(&db).await;
-        let id = seed_waiting_aggregate(&pool, &raw, false).await;
-        dispatch_job(&pool, id, 0).await;
-        let job = claim_chunks(&raw, WORKER, 10).await.expect("claim");
-        pause_transform(&pool, "rollup").await.expect("pause");
-
-        let boom = ChunkQueueError::Backfill(BackfillError::Unsupported("boom".to_string()));
-        let given_up = fail_chunk(&pool, &job[0], WORKER, &boom)
-            .await
-            .expect("fail the job");
-
-        assert_eq!(given_up, ChunkFailure::Discarded);
-        assert_eq!(status_of(&raw, id).await, "paused");
-        assert_eq!(chunk_count(&raw, id).await, 0);
-        assert_eq!(marker_generation(&raw, "public.orders").await, None);
-    }
-
-    /// Issue #434: a chunk held across a pause and a completed resume must
-    /// not write the target once the rebuild has finished. By then the
-    /// target is applying (`catching_up`, then `live`), so readers can attach
-    /// to it (a definition chained on it), and they only learn of its changes
-    /// through the target-mutation seam, which a chunk's write bypasses.
-    ///
-    /// The source row changed after the rebuild read it, and its streamed
-    /// delta hasn't drained yet. Had the held chunk written the new value,
-    /// that delta's apply would find the target already current, write
-    /// nothing and stage nothing for its readers, and so would the discharge
-    /// of the source's catch-up: they would keep the old value for good.
-    #[tokio::test]
-    async fn a_chunk_held_across_a_completed_resume_writes_nothing() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (pool, raw) = connect(&db).await;
-        let (id, def) = seed_waiting(&raw, "orders", "order_doubles", 3).await;
-        let held =
-            hold_a_chunk_across_a_resume(&pool, &raw, id, &def, "order_doubles", "public.orders")
-                .await;
-
-        // The resume's rebuild runs to completion around the held chunk.
-        dispatch(&pool, id, &def, "public.orders").await;
-        let rebuild = claim_chunks(&raw, "rebuild-worker", 100)
-            .await
-            .expect("claim rebuild");
-        assert_eq!(rebuild.len(), 1);
-        run_claimed_chunk(
-            &pool,
-            &rebuild[0],
-            "rebuild-worker",
-            Duration::from_secs(5),
-            Duration::from_secs(60),
-        )
-        .await
-        .expect("run rebuild chunk");
-        finish_chunk(&pool, &rebuild[0], "rebuild-worker")
-            .await
-            .expect("finish rebuild chunk");
-        assert_eq!(status_of(&raw, id).await, "catching_up");
-
-        // A source change whose streamed delta hasn't drained yet.
-        raw.execute("update public.orders set a = 100 where id = 1", &[])
-            .await
-            .expect("update the source");
-
-        run_claimed_chunk(
-            &pool,
-            &held,
-            WORKER,
-            Duration::from_secs(5),
-            Duration::from_secs(60),
-        )
-        .await
-        .expect("run the held chunk");
-        finish_chunk(&pool, &held, WORKER)
-            .await
-            .expect("finish the held chunk");
-
-        let x: i64 = raw
-            .query_one(
-                "select x::bigint from public.order_doubles where id = 1",
-                &[],
-            )
-            .await
-            .expect("read the target")
-            .get(0);
-        assert_eq!(
-            x, 2,
-            "the held chunk wrote the applying target outside the seam; only the \
-             delta's apply may move it, so its readers hear of the change"
-        );
-        assert_eq!(
-            chunk_count(&raw, id).await,
-            0,
-            "the held chunk is discarded"
-        );
-    }
-
-    /// The fence also covers a claim reclaimed from a worker that is still
-    /// running (its heartbeat stalled): that worker's late write lands
-    /// nowhere, whoever holds the chunk now.
-    #[tokio::test]
-    async fn a_worker_whose_claim_was_reclaimed_writes_nothing() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (pool, mut raw) = connect(&db).await;
-        let (id, def) = seed_waiting(&raw, "orders", "order_doubles", 3).await;
-        dispatch(&pool, id, &def, "public.orders").await;
-        let stalled = claim_chunks(&raw, "stalled-worker", 1)
-            .await
-            .expect("claim");
-        assert_eq!(stalled.len(), 1);
-        reclaim_stale_chunks(&mut raw, Duration::ZERO)
-            .await
-            .expect("reclaim");
-        let reclaimed = claim_chunks(&raw, WORKER, 1).await.expect("reclaim claim");
-        assert_eq!(reclaimed.len(), 1);
-
-        run_claimed_chunk(
-            &pool,
-            &stalled[0],
-            "stalled-worker",
-            Duration::from_secs(5),
-            Duration::from_secs(60),
-        )
-        .await
-        .expect("a superseded chunk is not a failure");
-        let rows: i64 = raw
-            .query_one("select count(*) from public.order_doubles", &[])
-            .await
-            .expect("count target rows")
-            .get(0);
-        assert_eq!(rows, 0, "the stalled worker wrote nothing");
-    }
-
-    /// Issue #434: resume waits out a chunk write still in flight, so the
-    /// write commits before the resume does or not at all. The in-flight
-    /// write is stood in for by a transaction holding the chunk's fence, and
-    /// the resume runs under a short `lock_timeout` so its wait shows up as an
-    /// error instead of a hang.
-    #[tokio::test]
-    async fn a_resume_waits_out_a_chunk_write_in_flight() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (pool, mut raw) = connect(&db).await;
-        let (id, def) = seed_waiting(&raw, "orders", "order_doubles", 3).await;
-        dispatch(&pool, id, &def, "public.orders").await;
-        let held = claim_chunks(&raw, WORKER, 1).await.expect("claim");
-        assert_eq!(held.len(), 1);
-        pause_transform(&pool, "order_doubles")
-            .await
-            .expect("pause");
-        let fence = ClaimFence {
-            chunk_id: held[0].id,
-            claimed_by: WORKER,
-            idle_timeout: Duration::from_secs(60),
-        };
-
-        let impatient = Pool::new(
-            &crate::config::Config::from_dsn(format!("{} options='-c lock_timeout=100'", db.dsn()))
-                .expect("valid dsn"),
-        )
-        .expect("pool");
-        let writing = raw.transaction().await.expect("begin");
-        assert!(fence.hold(&writing).await.expect("hold"), "the claim holds");
-        let err = resume_transform(&impatient, "order_doubles")
-            .await
-            .expect_err("the resume waits for the write in flight");
-        assert!(
-            err.to_string().contains("lock timeout"),
-            "the resume timed out waiting for the chunk's lock, got: {err}"
-        );
-        writing.commit().await.expect("the write commits");
-        assert_eq!(status_of(&raw, id).await, "paused");
-
-        resume_transform(&impatient, "order_doubles")
-            .await
-            .expect("resume once the write is done");
-        let writing = raw.transaction().await.expect("begin");
-        assert!(
-            !fence.hold(&writing).await.expect("hold"),
-            "a write after the resume is fenced out"
-        );
-    }
-
-    /// Issue #434: a write that reaches its fence while a resume holds the
-    /// chunk's row waits for the resume to commit, and then sees it. The
-    /// staleness check is a statement of its own for exactly this: in the
-    /// locking statement, the lock wait would re-check only the chunk row,
-    /// against a definition row read before the resume committed.
-    ///
-    /// The real resume is held after it has locked the chunk (at its marker
-    /// park, behind a table lock the test holds), so the fence arrives while
-    /// the chunk's row is locked, not before or after.
-    #[tokio::test]
-    async fn a_fence_that_waited_out_a_resume_sees_it() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (pool, raw) = connect(&db).await;
-        let (id, def) = seed_waiting(&raw, "orders", "order_doubles", 3).await;
-        dispatch(&pool, id, &def, "public.orders").await;
-        let held = claim_chunks(&raw, WORKER, 1).await.expect("claim");
-        assert_eq!(held.len(), 1);
-        pause_transform(&pool, "order_doubles")
-            .await
-            .expect("pause");
-
-        let mut blocker = pool.get().await.expect("blocker connection");
-        let blocking = blocker.transaction().await.expect("begin");
-        blocking
-            .batch_execute("lock table pending_backfill in exclusive mode")
-            .await
-            .expect("hold the resume at its marker park");
-        let resuming = tokio::spawn({
-            let pool = pool.clone();
-            async move { resume_transform(&pool, "order_doubles").await }
-        });
-        let wait_for_lock_waiters = async |n: i64| {
-            for _ in 0..500 {
-                let waiting: i64 = raw
-                    .query_one(
-                        "select count(*) from pg_stat_activity \
-                         where datname = current_database() and wait_event_type = 'Lock'",
-                        &[],
-                    )
-                    .await
-                    .expect("read pg_stat_activity")
-                    .get(0);
-                if waiting == n {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            panic!("never saw {n} lock waiters");
-        };
-        wait_for_lock_waiters(1).await;
-        let fenced = tokio::spawn({
-            let pool = pool.clone();
-            let chunk_id = held[0].id;
-            async move {
-                let mut client = pool.get().await.expect("connection");
-                let txn = client.transaction().await.expect("begin");
-                let fence = ClaimFence {
-                    chunk_id,
-                    claimed_by: WORKER,
-                    idle_timeout: Duration::from_secs(60),
-                };
-                fence.hold(&*txn).await.expect("hold")
-            }
-        });
-        wait_for_lock_waiters(2).await;
-
-        blocking.commit().await.expect("release the resume");
-        resuming.await.expect("join").expect("resume");
-        assert!(
-            !fenced.await.expect("join"),
-            "a fence that waited for the resume's lock sees the resume"
-        );
-    }
-
-    /// A worker that stalls inside a fenced write transaction loses its
-    /// session once it has sat idle for the reclaim TTL, so its lock can't
-    /// keep a resume waiting or the chunk from being reclaimed past the point
-    /// the stale-claim sweep would have given up on it anyway. The stalled
-    /// worker is a transaction that holds the fence and then does nothing,
-    /// under a 200 ms TTL.
-    #[tokio::test]
-    async fn a_fenced_transaction_left_idle_past_the_reclaim_ttl_loses_its_lock() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (pool, mut raw) = connect(&db).await;
-        let (id, def) = seed_waiting(&raw, "orders", "order_doubles", 3).await;
-        dispatch(&pool, id, &def, "public.orders").await;
-        let held = claim_chunks(&raw, WORKER, 1).await.expect("claim");
-        assert_eq!(held.len(), 1);
-        let fence = ClaimFence {
-            chunk_id: held[0].id,
-            claimed_by: WORKER,
-            idle_timeout: Duration::from_millis(200),
-        };
-
-        let (_, mut stalled) = connect(&db).await;
-        let stalled_pid: i32 = stalled
-            .query_one("select pg_backend_pid()", &[])
-            .await
-            .expect("read the stalled session's pid")
-            .get(0);
-        let writing = stalled.transaction().await.expect("begin");
-        assert!(fence.hold(&writing).await.expect("hold"), "the claim holds");
-        assert_eq!(
-            reclaim_stale_chunks(&mut raw, Duration::ZERO)
-                .await
-                .expect("reclaim"),
-            0,
-            "the sweep passes over a chunk whose write holds its fence"
-        );
-
-        // Waits for the server to end the idle session, not for a duration.
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            let alive: bool = raw
-                .query_one(
-                    "select exists (select 1 from pg_stat_activity where pid = $1)",
-                    &[&stalled_pid],
-                )
-                .await
-                .expect("read pg_stat_activity")
-                .get(0);
-            if !alive {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the idle fenced transaction was never ended"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-
-        assert_eq!(
-            reclaim_stale_chunks(&mut raw, Duration::ZERO)
-                .await
-                .expect("reclaim"),
-            1,
-            "with the session gone, the claim is reclaimed"
-        );
-        assert_eq!(
-            claim_chunks(&raw, "next-worker", 1)
-                .await
-                .expect("claim again")
-                .len(),
-            1,
-            "and the chunk can be claimed again"
-        );
-        assert!(
-            writing.commit().await.is_err(),
-            "the stalled worker's transaction is gone with its session"
-        );
-    }
-
-    /// Issue #769: a range build's chunks read their ranges under the key
-    /// collations the ranges were walked under, so an `alter column … type
-    /// text collate …` between two chunks neither drops nor repeats a key.
-    /// The test database's default collation is ICU `en-US`, which orders
-    /// `k0001 < K0002 < k0003`; `"C"` orders every `K…` before every `k…`,
-    /// so after the `alter` the ranges planned before it, read under `"C"`,
-    /// would hold only the upper-case keys.
-    #[tokio::test]
-    async fn range_chunks_keep_the_key_order_they_were_planned_under() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (pool, raw) = connect(&db).await;
-        let text = "TRANSFORM words_copy FROM words SELECT a + a AS x";
-        raw.batch_execute(
-            "create table public.words (id text primary key, a numeric); \
-             insert into public.words \
-             select case when g % 2 = 0 then 'K' else 'k' end || lpad(g::text, 4, '0'), g \
-             from generate_series(1, 200) g; \
-             create table public.words_copy (id text primary key, x numeric); \
-             insert into source_table_versions (source_table, version) \
-             values ('public.words', 1)",
-        )
-        .await
-        .expect("seed source");
-        crate::intake::markers::feed_from_a_test_definition(&raw, "public.words")
-            .await
-            .expect("make the source another definition's target");
-        let id: i64 = raw
-            .query_one(
-                "insert into transform_definitions \
-                 (target_table, source_table, source_version, definition_text, status) \
-                 values ('public.words_copy', 'public.words', 1, $1, 'waiting_to_backfill') \
-                 returning id",
-                &[&text],
-            )
-            .await
-            .expect("seed definition")
-            .get(0);
-
-        // Ten-row ranges, walked under the key's collation now.
-        let pk = crate::defs::ddl::source_primary_key_in_txn(&raw, "public.words")
-            .await
-            .expect("source key");
-        assert_eq!(
-            crate::defs::ddl::key_collations(&pk),
-            vec![Some(r#"pg_catalog."default""#.to_string())]
-        );
-        let planned = backfill::PlannedRanges {
-            ranges: backfill::next_pk_ranges(&raw, "public.words", &pk, None, 10, usize::MAX)
-                .await
-                .expect("walk the key"),
-            key_collations: crate::defs::ddl::key_collations(&pk),
-        };
-        assert_eq!(planned.ranges.len(), 20);
-        {
-            let mut client = pool.get().await.expect("connection");
-            let txn = client.transaction().await.expect("begin");
-            dispatch_one_to_one(&txn, id, &planned)
-                .await
-                .expect("dispatch");
-            txn.commit().await.expect("commit");
-        }
-
-        let run_next = async || -> bool {
-            let mut held = claim_chunks(&raw, WORKER, 1).await.expect("claim");
-            let Some(chunk) = held.pop() else {
-                return false;
-            };
-            assert_eq!(
-                chunk.key_collations.as_deref(),
-                Some(planned.key_collations.as_slice()),
-                "every chunk records the collations its range was walked under"
-            );
-            run_claimed_chunk(
-                &pool,
-                &chunk,
-                WORKER,
-                Duration::from_secs(5),
-                Duration::from_secs(60),
-            )
-            .await
-            .expect("run chunk");
-            finish_chunk(&pool, &chunk, WORKER)
-                .await
-                .expect("finish chunk");
-            true
-        };
-        assert!(run_next().await, "the first chunk");
-        raw.batch_execute(r#"alter table public.words alter column id type text collate "C""#)
-            .await
-            .expect("re-collate the key");
-
-        // A failing chunk's narrowing splits its range in the planned order
-        // too: (K0010, K0020] holds k0011 … K0020, ten keys, of which the
-        // fifth is k0015. Under "C" it would hold K0012 … K0020, five keys.
-        let (lo, hi) = &planned.ranges[1];
-        assert_eq!(
-            backfill::narrow_one_to_one_chunk(
-                &raw,
-                "public.words",
-                "words_copy",
-                lo.as_deref(),
-                hi,
-                Some(&planned.key_collations),
-            )
-            .await
-            .expect("narrow"),
-            backfill::ChunkNarrowing::Split {
-                mid: "k0015".to_string()
-            }
-        );
-
-        while run_next().await {}
-        let missing: Vec<String> = raw
-            .query(
-                "select w.id from public.words w \
-                 where not exists (select 1 from public.words_copy c \
-                                   where c.id = w.id and c.x = w.a + w.a) \
-                 order by w.id",
-                &[],
-            )
-            .await
-            .expect("compare")
-            .into_iter()
-            .map(|row| row.get(0))
-            .collect();
-        assert_eq!(
-            missing,
-            Vec::<String>::new(),
-            "every source row was written"
-        );
-    }
 }

@@ -192,10 +192,8 @@ pub enum ApplyError {
     /// (`staging::build`'s "Field builds"); the definition's `capture_wait`
     /// or `capture_failure` status says what holds that up.
     ColumnAwaitingCapture { transform: String, column: String },
-    /// A failure from [`crate::intake::markers`]'s backfill-marker
-    /// machinery (issue #55: [`super::quarantine::resume_transform`]
-    /// re-parking a catch-up marker, or clearing/qualifying its source
-    /// table).
+    /// A failure from [`crate::intake`]'s helpers (rebuilding the readers
+    /// of a table, or qualifying a table name).
     Intake(crate::intake::IntakeError),
     /// [`super::quarantine::resume_transform`] was asked to resume a target
     /// with no corresponding `transform_definitions` row at all.
@@ -266,15 +264,6 @@ pub enum ApplyError {
     /// definitions reading `src_table` rather than clearing their targets
     /// without the floor.
     TruncateWithoutLsn { src_table: String },
-    /// A [`TargetMutations`](super::target_mutations::TargetMutations) that
-    /// spilled its touched set to a temporary table (issue #924) was staged
-    /// through `into_staged`, which stages only the keys it holds in memory.
-    /// Not reachable: only the writers that change keys in batches spill,
-    /// and each stages through `flush`, which reads the spill back. Refused
-    /// rather than staged, since the spilled keys would never reach the
-    /// ring. A programming error no key caused, so it classifies as
-    /// halting (`quarantine::classify`), never isolated against a key.
-    SpilledMutationsNotFlushed,
 }
 
 impl ApplyError {
@@ -303,8 +292,7 @@ impl ApplyError {
             | ApplyError::LedgerEntryCollected { .. }
             | ApplyError::HopBoundExceeded { .. }
             | ApplyError::GroupBasisUnsupported { .. }
-            | ApplyError::TruncateWithoutLsn { .. }
-            | ApplyError::SpilledMutationsNotFlushed => ErrorCode::Internal,
+            | ApplyError::TruncateWithoutLsn { .. } => ErrorCode::Internal,
             ApplyError::SourceTableDropped { .. } => ErrorCode::NotFound,
             ApplyError::ColumnNotPaused { .. } => ErrorCode::NotFound,
             // The definition's persisted status conflicts with what
@@ -399,7 +387,7 @@ impl fmt::Display for ApplyError {
                  what holds that up); RESUME it then only if it was also paused for another \
                  reason"
             ),
-            ApplyError::Intake(err) => write!(f, "backfill marker error: {err}"),
+            ApplyError::Intake(err) => write!(f, "intake error: {err}"),
             ApplyError::TransformNotFound { transform } => {
                 write!(f, "no transform named '{transform}' is registered")
             }
@@ -444,11 +432,6 @@ impl fmt::Display for ApplyError {
                  raise its targets' truncate floor; the capture trigger always stamps one, so \
                  the ring row was written by something else"
             ),
-            ApplyError::SpilledMutationsNotFlushed => write!(
-                f,
-                "a target write that spilled its changed keys was staged in memory, which \
-                 would drop the spilled keys; a writer that spills must stage through flush"
-            ),
         }
     }
 }
@@ -481,8 +464,7 @@ impl std::error::Error for ApplyError {
             | ApplyError::TransformNotPaused { .. }
             | ApplyError::KeyNotHeld { .. }
             | ApplyError::ReleaseLockTimeout { .. }
-            | ApplyError::TruncateWithoutLsn { .. }
-            | ApplyError::SpilledMutationsNotFlushed => None,
+            | ApplyError::TruncateWithoutLsn { .. } => None,
         }
     }
 }
@@ -3676,11 +3658,11 @@ pub(super) async fn compute_page(
         // propagated row's `src_table`. Reusing the identity this lookup
         // already computed is what makes the emitted spelling agree, by
         // construction, with the one a capture trigger independently stages
-        // for the same physical table (its spec's `markers::qualify`
+        // for the same physical table (its spec's `intake::qualify`
         // spelling) — `resolve_graph_identity`'s first step is a
         // `search_path` lookup of the real relation, which a target table
         // satisfies, and both sides then format the schema it finds through
-        // that same `markers::qualify`, so the two strings are equal by
+        // that same `intake::qualify`, so the two strings are equal by
         // construction rather than by coincidence. (Strictly, step 1 returns
         // the *first* `current_schemas(false)` match, so an unrelated relation
         // of the same bare name in an earlier schema on the pinned path would
@@ -3809,11 +3791,7 @@ pub(super) fn decode_target_pk_parts(
 }
 
 /// `c0`, `c1`, … — collision-free column aliases for a keyset `unnest(...)`
-/// relation, one per `pk` column, the same convention as
-/// `intake::resume_orphans`'s `keyset_col` for its `GROUP BY` keyset (kept
-/// as its own small copy here, not shared, since the two keysets differ in
-/// what types they cast to — [`PrimaryKeyColumn::data_type`] here, a
-/// [`ValueType`] there).
+/// relation, one per `pk` column.
 pub(super) fn pk_keyset_col(i: usize) -> String {
     format!("c{i}")
 }
@@ -4044,7 +4022,7 @@ pub(super) fn transpose_pk_parts<'a>(arity: usize, rows: &[Vec<&'a str>]) -> Vec
 /// Matched per pattern because `is not distinct from` (or an `or … is
 /// null` arm) can't probe the key's index: `col is null` can, so each
 /// pattern's statement reaches its rows through the index, as
-/// `staging::target_mutations` and `intake::resume_orphans` match theirs.
+/// `staging::target_mutations` matches its.
 #[derive(Default)]
 struct MatchKeys<'a> {
     plain: Vec<Vec<&'a str>>,
@@ -4624,9 +4602,7 @@ async fn apply_target(
     // The keys with a `NULL` part, a statement per pattern, after the
     // others, the patterns in `MatchKeys`' order and each one's keys in key
     // order. That isn't ascending key order over a composite key (`(1,
-    // NULL)` locks after `(2, 1)`), so the orphan sweep, which locks these
-    // rows without their entries, orders its lock the same way
-    // (`intake::resume_orphans`'s `lock_statement`).
+    // NULL)` locks after `(2, 1)`).
     for (pattern, columns) in &lock_keys.patterns {
         locked.extend(
             super::ledger::query_by_entry_key(

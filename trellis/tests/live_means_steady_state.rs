@@ -5,12 +5,12 @@
 //! every commit at or before the token. Each test here drives one build path
 //! and checks exactly that contract against a running engine: wait for
 //! `live` through `Trellis::status`, take a token, await it, compare the
-//! target with the source. Nothing discharges a marker by hand; the staging
+//! target with the source. Nothing starts a build by hand; the staging
 //! worker does.
 //!
 //! Each test makes a change commit while the definition is still being
-//! built. A Re-derive build applies it while `backfilling`; a ring build on
-//! another definition's target folds it in at its catch-up, before `live`.
+//! built. A Re-derive build applies it while `backfilling`, so it is in the
+//! target by `live`.
 //!
 //! The waits are on the contract's own signals (status, then the token). Each
 //! test holds its build at a fixed point with an advisory lock, so the
@@ -48,8 +48,8 @@ async fn define_only(dsn: &str) -> Trellis {
     .expect("connect a define-only Trellis")
 }
 
-/// The whole engine: capture, the maintenance loop (the only discharger of
-/// backfill markers) and drain threads.
+/// The whole engine: capture, the maintenance loop (the only starter of
+/// builds) and drain threads.
 async fn running(dsn: &str) -> Trellis {
     Trellis::connect(
         Config::from_dsn(dsn.to_string()).expect("valid dsn"),
@@ -248,15 +248,14 @@ async fn a_one_to_one_rederive_build_applies_while_backfilling_and_is_steady_at_
     engine.shutdown().await.expect("shut down");
 }
 
-/// A ring enumeration whose source is another definition's target (an
-/// aggregate's, which has no primary key to chunk by). That target is never
-/// captured: only the target-mutation seam carries its writes, and only to
-/// a reader that is already applying. So the chained definition applies from
-/// its enumeration on but reports `live` only once the catch-up on its
-/// source has run. At `live`, a change upstream is reflected downstream once
-/// its token is.
+/// A build whose source is another definition's target (an aggregate's). That
+/// target is never captured: only the target-mutation seam carries its
+/// writes, and only to a reader that is already applying. So the chained
+/// definition's build waits on a fence, applies from its start, and is `live`
+/// once built. At `live`, a change upstream is reflected downstream once its
+/// token is.
 #[tokio::test]
-async fn a_ring_build_on_another_definitions_target_is_live_only_once_caught_up() {
+async fn a_build_on_another_definitions_target_follows_a_change_upstream() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;

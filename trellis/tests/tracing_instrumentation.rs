@@ -595,34 +595,6 @@ async fn a_below_threshold_charge_is_logged_as_a_warning_naming_the_key() {
     );
 }
 
-/// Issue #56's backfill status transition events (#55's lifecycle):
-/// `waiting_to_backfill` -> `backfilling` from the staging worker's
-/// reconcile pass (`trellis::client::reconcile_pass`) dispatching the
-/// definition's build (ADR-0002), then `backfilling` -> `catching_up` from
-/// the build finishing and `catching_up` -> `live` from its go-live
-/// catch-up's discharge (issue #476) — mirrors `transform_status_lifecycle.rs`'s
-/// `a_fresh_transform_waits_on_the_xmin_fence_then_reaches_live`'s straggler
-/// setup, trimmed to just the settle-and-discharge half this test cares
-/// about (that file already covers the full status/data correctness story;
-/// this one only adds the tracing assertion).
-///
-/// #625 F8a: a plain 1-1 over a captured table is the Re-derive build's,
-/// which goes `backfilling` -> `live` with no catch-up
-/// ([`rederive_build_status_transitions_emit_info_events`]); one held out of
-/// the Re-derive build takes the old build and its go-live catch-up.
-#[tokio::test]
-async fn backfill_status_transitions_emit_info_events() {
-    assert_eq!(
-        backfill_status_transitions(true, "TRANSFORM t FROM s SELECT a + a AS x").await,
-        [
-            ("waiting_to_backfill", "backfilling"),
-            ("backfilling", "catching_up"),
-            ("catching_up", "live"),
-        ]
-        .map(|(from, to)| (from.to_string(), to.to_string())),
-    );
-}
-
 /// #625 F8a: the Re-derive build of a plain 1-1 over a captured table
 /// reports its start (`waiting_to_backfill` -> `backfilling`) and its
 /// finish (`backfilling` -> `live`), and nothing else: it parks no go-live
@@ -630,7 +602,7 @@ async fn backfill_status_transitions_emit_info_events() {
 #[tokio::test]
 async fn rederive_build_status_transitions_emit_info_events() {
     assert_eq!(
-        backfill_status_transitions(false, "TRANSFORM t FROM s SELECT a + a AS x").await,
+        backfill_status_transitions("TRANSFORM t FROM s SELECT a + a AS x").await,
         [
             ("waiting_to_backfill", "backfilling"),
             ("backfilling", "live")
@@ -639,12 +611,11 @@ async fn rederive_build_status_transitions_emit_info_events() {
     );
 }
 
-/// The body of the backfill transition tests: seeds `s`, holds it out of the
-/// Re-derive build if `old_build`, and registers `transform` under a
+/// The body of the backfill transition test: seeds `s` and registers `transform` under a
 /// straggler that commits before the settled pass, then returns the `(from,
 /// to)` of every INFO "transform status transition" event the settled
 /// reconcile pass and `settle_registrations` emitted, in order.
-async fn backfill_status_transitions(old_build: bool, transform: &str) -> Vec<(String, String)> {
+async fn backfill_status_transitions(transform: &str) -> Vec<(String, String)> {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect_raw(db.dsn()).await;
@@ -655,15 +626,6 @@ async fn backfill_status_transitions(old_build: bool, transform: &str) -> Vec<(S
     )
     .await
     .expect("seed source table");
-    if old_build {
-        trellis::intake::markers::hold_out_of_the_rederive_build(
-            &raw,
-            &format!("{DEFAULT_SCHEMA}.s"),
-        )
-        .await
-        .expect("hold s out of the Re-derive build");
-    }
-
     let straggler = OpenTransaction::begin(db.dsn()).await;
     straggler.execute("select txid_current()").await;
 
@@ -679,16 +641,10 @@ async fn backfill_status_transitions(old_build: bool, transform: &str) -> Vec<(S
     // `install_definition` above only registers, so there is nothing to
     // capture yet.
     let (_guard, captured) = install_capture();
-    trellis::client::reconcile_pass(
-        &mut raw,
-        &db.pool,
-        DEFAULT_SCHEMA,
-        "wake",
-        std::time::Duration::from_secs(5),
-    )
-    .await
-    .expect("reconcile pass (settled)");
-    trellis::intake::markers::settle_registrations(&db.pool).await;
+    trellis::client::reconcile_pass(&mut raw, &db.pool, DEFAULT_SCHEMA)
+        .await
+        .expect("reconcile pass (settled)");
+    trellis::intake::harness::settle_builds(&db.pool).await;
 
     let events = captured.events();
     let transitions: Vec<(String, String)> = events

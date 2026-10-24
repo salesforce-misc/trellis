@@ -186,7 +186,7 @@ async fn converged_fixture(
     // job finds no rows).
     let src_table = format!("{DEFAULT_SCHEMA}.{source}");
     capture(&mut raw, &src_table).await;
-    trellis::intake::markers::settle_registrations(&db.pool).await;
+    trellis::intake::harness::settle_builds(&db.pool).await;
     let status: String = raw
         .query_one(
             "select status from transform_definitions \
@@ -313,7 +313,7 @@ async fn self_check_reports_a_definition_under_a_rebuild_as_not_live() {
     assert_eq!(report.rows_compared, 0, "nothing was compared");
     assert_eq!(report.next_after, None);
 
-    trellis::intake::markers::settle_builds(&db.pool).await;
+    trellis::intake::harness::settle_builds(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut { raw }).await;
     let report = check().await;
     assert!(
@@ -559,7 +559,7 @@ async fn self_check_reports_not_caught_up_rather_than_a_false_divergence_for_a_l
     // definition that isn't `live` is not compared (#625 F7).
     let mut setup = connect_raw(db.dsn()).await;
     capture(&mut setup, &format!("{DEFAULT_SCHEMA}.widgets")).await;
-    trellis::intake::markers::settle_registrations(&db.pool).await;
+    trellis::intake::harness::settle_builds(&db.pool).await;
 
     // Staging only: capture + ring maintenance, but zero drain workers —
     // nothing will ever apply this row.
@@ -1275,7 +1275,7 @@ async fn a_seam_fed_source_and_a_paused_definition_are_not_audited() {
         .apply("TRANSFORM widget_totals_copy FROM widget_totals SELECT total AS total")
         .await
         .expect("define a reader of the target");
-    trellis::intake::markers::discharge_registrations(&db.pool)
+    trellis::intake::harness::start_registered_builds(&db.pool)
         .await
         .expect("dispatch the build");
     let (status, faults) = audit("widget_totals_copy").await;

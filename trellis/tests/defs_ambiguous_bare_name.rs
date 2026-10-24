@@ -4,14 +4,13 @@
 //! source column.
 
 use std::collections::HashMap;
-use std::time::Duration;
 
 use testkit::TestCluster;
 use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::defs::{ValueType, chunk_queue, install_definition};
-use trellis::intake::markers;
+use trellis::defs::{ValueType, install_definition};
+use trellis::intake::harness;
 use trellis::integer::IntWidth;
 use trellis::staging::{CdcOp, StagedChange, has_pending, retire_drained_segments};
 
@@ -38,33 +37,10 @@ async fn connect_raw(dsn: &str) -> Client {
 }
 
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
-    markers::discharge_registrations(pool)
+    harness::start_registered_builds(pool)
         .await
         .expect("dispatch registered definitions' builds");
-    loop {
-        let client = pool.get().await.expect("acquire connection");
-        let claimed = chunk_queue::claim_chunks(&**client, TEST_NAME, 1000)
-            .await
-            .expect("claim_chunks");
-        drop(client);
-        if claimed.is_empty() {
-            return;
-        }
-        for chunk in &claimed {
-            chunk_queue::run_claimed_chunk(
-                pool,
-                chunk,
-                TEST_NAME,
-                Duration::from_secs(5),
-                Duration::from_secs(60),
-            )
-            .await
-            .expect("the build must not fail");
-            chunk_queue::finish_chunk(pool, chunk, TEST_NAME)
-                .await
-                .expect("finish_chunk");
-        }
-    }
+    trellis::staging::build::settle_builds(pool).await;
 }
 
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
@@ -163,15 +139,7 @@ async fn a_qualified_name_aggregates_the_source_column() {
     .await
     .expect("the qualified names are not ambiguous");
     drain_backfill_chunks(&db.pool).await;
-    markers::settle_registrations(&db.pool).await;
-    markers::run_pending_backfills(
-        &mut client,
-        "wake",
-        &trellis::staging::StagedWatermark::saturated(),
-        Duration::ZERO,
-    )
-    .await
-    .expect("discharge the go-live catch-up");
+    harness::settle_builds(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     let row = |grp: i32, val: &str, total: &str, biggest: &str| {
@@ -289,7 +257,7 @@ async fn an_alter_reads_a_qualified_name_as_the_source_column() {
     )
     .await
     .expect("define");
-    markers::discharge_registrations(&db.pool)
+    harness::start_registered_builds(&db.pool)
         .await
         .expect("dispatch the build");
 

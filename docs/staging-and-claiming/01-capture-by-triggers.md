@@ -127,12 +127,12 @@ What is installed lives only in Postgres's catalog: the triggers in
 ## Installing, widening, narrowing and uninstalling
 
 The staging worker's maintenance loop brings every table's capture to what the
-catalog needs, on every reconcile pass, before it discharges backfill markers
+catalog needs, on every reconcile pass, before it starts builds
 (`capture::reconcile`):
 
 | Change | Operation | Table lock |
 |---|---|---|
-| A definition reads a table nothing captures | install, with the table's join marker in the same transaction | `SHARE ROW EXCLUSIVE` |
+| A definition reads a table nothing captures | install | `SHARE ROW EXCLUSIVE` |
 | A new reader needs a column the functions don't image | widen: replace the functions | `SHARE ROW EXCLUSIVE` |
 | The last reader of a column is dropped | narrow: replace the functions | none |
 | The last reader of the table is dropped | uninstall: drop the triggers and functions | `ACCESS EXCLUSIVE` |
@@ -140,7 +140,7 @@ catalog needs, on every reconcile pass, before it discharges backfill markers
 Every locking attempt waits at most 50 ms for the table, so an application
 writer never queues behind one for longer (ADR-0002 I6), and is retried. A
 pass spends at most one second on locked tables in all; the first attempt on
-each table always runs, so one blocked table doesn't delay another's join.
+each table always runs, so one blocked table doesn't delay another's install.
 Nothing cancels a lock holder, an autovacuum included: a table
 whose lock stays held is left for the next pass. While a definition waits on
 such a table, its status carries `capture_wait`, naming the sessions holding
@@ -149,44 +149,45 @@ the lock.
 Defining a transform never waits for any of this. `apply` validates and
 records the definition; the install happens in the background.
 
-## The join fence
+## The install is the fence
 
-An install parks the table's join marker in the transaction that creates the
-triggers, so the marker commits exactly when capture starts, and the table
-lock means no writer of the table is in flight at that moment. A write
-committed before the install is in the backfill's enumeration; one after it
-runs the trigger. The discharge fences the marker only after reading it
-committed.
+An install creates the triggers in one transaction under the table lock, so no
+writer of the table is in flight at that moment. A write committed before the
+install is visible to the snapshot of any build that starts after it, which
+reads the rows the triggers never saw; one after it runs the trigger. The
+install also rebuilds the table's applying readers, in the same transaction
+(`intake::catch_up::park_table_catch_ups`), since they missed whatever
+committed while the table was uncaptured.
 
-## Which definitions a discharge may dispatch
+## Which definitions may start a build
 
-A waiting definition starts applying ring rows as soon as a discharge
-dispatches it, so it must not meet a row whose image lacks a column it reads.
-Two things could put one in front of it, and the pass rules out both:
+A waiting definition starts applying ring rows as soon as its build starts, so
+it must not meet a row whose image lacks a column it reads. Two things could
+put one in front of it, and the pass rules out both:
 
-1. **Rows the replaced function staged.** A widen records a capture gate on
-   its marker, the insert position read while it holds the table lock. The
-   marker's discharge waits until no change to the table at or below the gate
-   is pending.
+1. **Rows the replaced function staged.** An install or widen records a
+   capture gate for the table (`capture_gates`), the insert position read
+   while it holds the table lock. A definition's build doesn't start while any
+   change to the table at or below the gate is pending
+   (`capture::gate`); a gate no change holds any more is deleted.
 2. **A `JOIN`'s joined table.** A `JOIN` sourced from `U` that reads a column
-   of its joined table `T` waits on `U`'s marker, which `T`'s gate doesn't
-   hold. So a definition is dispatched only once every table it reads is
-   captured and current, and its joined table has no gated marker pending.
+   of its joined table `T` would not be held by `U`'s gate, which `T`'s doesn't
+   cover. So a definition starts only once every table it reads is captured
+   and current, and its joined table has no gate a pending change holds.
 
-The pass hands the discharge the list of definitions it found ready, from the
+The pass hands the build start the list of definitions it found ready, from the
 same catalog snapshot it built the column sets from, so a definition
 registered after the pass read the catalog waits for the next pass.
 
 An `ALTER TRANSFORM` field is the same problem for a definition that is
 already applying. The edit pauses the fields it adds or changes while its
-backfill runs. When a field reads a source column the definition didn't read
-before, that pause stays when the backfill ends (`column_status
-.awaiting_capture`). The edit's catch-up marker then waits: its discharge
-unpauses the field only once the installed capture images the column, and
-only after the widen's gate, so every row the old function staged has drained
-past the paused field. The same discharge's enumeration re-derives every row
-with the field unpaused. A field that reads only columns the definition
-already read unpauses when the backfill ends.
+field build runs. When a field reads a source column the definition didn't
+read before, that pause stays until the installed capture images the column
+(`column_status.awaiting_capture`). The field build's plan then releases the
+field only once the capture images the column and the widen's gate is clear,
+so every row the old function staged has drained past the paused field, and
+its chunks write the field for every row. A field that reads only columns the
+definition already read is released when its build starts.
 
 ## Order
 
@@ -249,8 +250,7 @@ reconcile pass narrows the functions to what the other readers need and the
 markers stop. `RESUME TRANSFORM` re-validates the
 definition against the live schema as define would, and refuses while a
 column it reads is still missing; otherwise it deletes the record and
-rebuilds: the pass widens capture again under the join fence before the
-rebuild is dispatched.
+rebuilds: the pass widens capture again before the rebuild starts.
 
 The reconcile pass doesn't wait for a marker either. Before it regenerates a
 table's functions, it pauses the same way every definition not yet paused
@@ -418,9 +418,8 @@ The response follows whether the definitions are still valid as written:
 - **Rebuilt automatically, pausing nobody.** A same-type rewrite, and a
   changed column every definition reading it is still valid over. The pass
   re-reads the table for its applying readers, exactly as
-  `Trellis::request_backfill` does: a reader the Re-derive build takes
-  reports `backfilling`, every other `catching_up`, until the re-read is
-  done. It logs a `WARN` naming the table, the cause and the readers, and
+  `Trellis::request_backfill` does: each reader reports `backfilling` until
+  its rebuild is done. It logs a `WARN` naming the table, the cause and the readers, and
   counts `capture_auto_rebuilds_total{source_table, cause}`, `cause`
   `value_rewrite` or `column_changed`
   ([observability](../observability.md#metrics)).
@@ -608,7 +607,7 @@ Changes no capture trigger sees, and what the staging worker does about
 them:
 
 - **Repaired on its own, pausing nobody** (a re-read's readers report
-  `backfilling` or `catching_up` until it's done):
+  `backfilling` until it's done):
   - a same-type `USING` rewrite of a read column: re-read;
   - a read column dropped and re-added, or retyped other than by a pure
     widening, where every definition reading it is still valid: re-read;

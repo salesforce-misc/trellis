@@ -1,32 +1,22 @@
-//! Issue #330: `RESUME TRANSFORM` rebuilds a frozen target by re-enumerating
-//! the source's *current* keys (`pending_backfill`'s discharge,
-//! `markers::run_pending_backfills`). That enumeration never visits a
-//! target row whose source rows all went away while the transform was frozen,
-//! so the discharge also deletes every target row no source row backs any
-//! more (`intake::resume_orphans`), reporting each deletion through the
-//! target-mutation seam.
+//! Issue #330, #888: `RESUME TRANSFORM` rebuilds a frozen target with a
+//! Re-derive build (`staging::build`), whose sweep deletes every target row
+//! no source row backs any more and tombstones its ledger entry
+//! (`staging::build::one_to_one::sweep_batch`), reporting each deletion
+//! through the target-mutation seam. The build's chunks only reach keys the
+//! source still has, so the sweep is what removes the rest.
 //!
 //! The deletes here are written straight to the source with no capture
 //! installed, which is exactly the frozen-transform gap: a paused definition's
 //! share of the change stream is never folded into its target. Every test
-//! drives the discharge and the drain by hand, so they wait on nothing. The
-//! ordering of the delete against the enumeration's snapshot is pinned by
-//! `intake::markers`'s own unit tests, which can hold a discharge
-//! mid-flight.
-//!
-//! The issue as filed says a 1-1 transform already drops such rows. It does
-//! not: the 1-1 path has the same gap, for the same reason, so it is pinned
-//! here too.
+//! drives the build and the drain by hand, so they wait on nothing.
 
 use std::collections::HashMap;
-use std::time::Duration;
 
 use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
-use trellis::defs::{ValueType, chunk_queue, install_definition};
-use trellis::intake::markers;
-use trellis::staging::{StagedWatermark, apply, has_pending, retire_drained_segments, seal};
+use trellis::defs::{ValueType, install_definition};
+use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
 use trellis::{Config, Trellis, TrellisOptions};
 
 const TEST_NAME: &str = "resume_drops_deleted_keys_test";
@@ -59,40 +49,10 @@ async fn define_only(dsn: &str) -> Trellis {
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
     // ADR-0002 (#418): registration only records a definition; the backfill
     // discharge dispatches its chunks.
-    trellis::intake::markers::discharge_registrations(pool)
+    trellis::intake::harness::start_registered_builds(pool)
         .await
         .expect("dispatch registered definitions' builds");
-    loop {
-        let client = pool.get().await.expect("acquire connection");
-        let claimed = chunk_queue::claim_chunks(&**client, TEST_NAME, 1000)
-            .await
-            .expect("claim_chunks");
-        drop(client);
-        if claimed.is_empty() {
-            // A plain aggregate is the Re-derive build's (#625 F3, F5).
-            trellis::staging::build::settle_builds(pool).await;
-            // The staging worker's next pass: the builds' go-live catch-ups
-            // take them `live` (issue #476).
-            trellis::intake::markers::discharge_registrations(pool)
-                .await
-                .expect("discharge the go-live catch-ups");
-            return;
-        }
-        for chunk in &claimed {
-            chunk_queue::run_claimed_chunk(
-                pool,
-                chunk,
-                TEST_NAME,
-                Duration::from_secs(5),
-                Duration::from_secs(60),
-            )
-            .await
-            .expect("run_claimed_chunk");
-            chunk_queue::finish_chunk(pool, chunk, TEST_NAME)
-                .await
-                .expect("finish_chunk");
-        }
-    }
+    trellis::staging::build::settle_builds(pool).await;
 }
 
 /// Seals and drains until nothing is pending anywhere in the ring. A bounded
@@ -124,28 +84,8 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
     panic!("pipeline did not reach quiescence within 16 seal/drain rounds");
 }
 
-/// Discharges the marker `RESUME` parked, then drains what it staged.
+/// Builds what `RESUME` left `waiting_to_backfill`, then drains what it staged.
 async fn run_resume_rebuild(pool: &trellis::Pool, client: &mut Client) {
-    // Consume an xid so the marker's fence, captured inside the resume's own
-    // transaction, has settled.
-    client
-        .batch_execute("select txid_current()")
-        .await
-        .expect("consume an xid");
-    markers::run_pending_backfills(
-        client,
-        "wake",
-        &StagedWatermark::saturated(),
-        Duration::ZERO,
-    )
-    .await
-    .expect("discharge the resume's backfill marker");
-    let pending: i64 = client
-        .query_one("select count(*) from pending_backfill", &[])
-        .await
-        .expect("count markers")
-        .get(0);
-    assert_eq!(pending, 0, "precondition: the resume's marker discharged");
     drain_backfill_chunks(pool).await;
     drain_to_quiescence(pool, client).await;
 }
@@ -205,14 +145,6 @@ async fn resume_drops_an_aggregate_group_whose_rows_were_all_deleted_while_pause
     // job, then discharge the catch-up marker going live parks, so the only
     // marker the rebuild below sees is the resume's.
     drain_backfill_chunks(&db.pool).await;
-    markers::run_pending_backfills(
-        &mut client,
-        "wake",
-        &StagedWatermark::saturated(),
-        Duration::ZERO,
-    )
-    .await
-    .expect("discharge the build's catch-up marker");
     drain_to_quiescence(&db.pool, &mut client).await;
     assert_eq!(status(&client, "order_rollup").await, "live");
     let built: Vec<(i64, String)> = client
@@ -291,14 +223,6 @@ async fn resume_drops_a_one_to_one_row_whose_source_row_was_deleted_while_paused
     drain_backfill_chunks(&db.pool).await;
     // The chunked build's completion parks its own catch-up marker; discharge
     // it now so the only marker the rebuild below sees is the resume's.
-    markers::run_pending_backfills(
-        &mut client,
-        "wake",
-        &StagedWatermark::saturated(),
-        Duration::ZERO,
-    )
-    .await
-    .expect("discharge the build's catch-up marker");
     drain_to_quiescence(&db.pool, &mut client).await;
     assert_eq!(status(&client, "order_doubles").await, "live");
 
@@ -342,6 +266,33 @@ async fn resume_drops_a_one_to_one_row_whose_source_row_was_deleted_while_paused
         "the rebuild picked up id 7 and dropped ids 2, 4 and 6, whose source rows were \
          deleted while the transform was paused"
     );
+    // #888: the rebuild's sweep tombstones the ledger entries of the keys it
+    // deleted, so `retire::collect_tombstones` can collect them. A live entry
+    // with no row behind it would leak.
+    let entries: Vec<(String, bool)> = client
+        .query(
+            "select __from_key, __tombstone from public.order_doubles__ledger \
+             order by __from_key::bigint",
+            &[],
+        )
+        .await
+        .expect("read order_doubles' ledger")
+        .into_iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
+    assert_eq!(
+        entries,
+        vec![
+            ("1".to_string(), false),
+            ("2".to_string(), true),
+            ("3".to_string(), false),
+            ("4".to_string(), true),
+            ("5".to_string(), false),
+            ("6".to_string(), true),
+            ("7".to_string(), false),
+        ],
+        "a key deleted at the source while the definition was paused is tombstoned"
+    );
     operator.shutdown().await.expect("shut down");
 }
 
@@ -351,25 +302,9 @@ async fn resume_drops_a_one_to_one_row_whose_source_row_was_deleted_while_paused
 async fn settle(pool: &trellis::Pool, client: &mut Client) {
     for _ in 0..8 {
         drain_backfill_chunks(pool).await;
-        client
-            .batch_execute("select txid_current()")
-            .await
-            .expect("consume an xid");
-        markers::run_pending_backfills(
-            client,
-            "wake",
-            &StagedWatermark::saturated(),
-            Duration::ZERO,
-        )
-        .await
-        .expect("discharge settled markers");
         drain_to_quiescence(pool, client).await;
         let outstanding: i64 = client
-            .query_one(
-                "select (select count(*) from pending_backfill) \
-                      + (select count(*) from backfill_chunks where not done)",
-                &[],
-            )
+            .query_one("select count(*) from backfill_chunks where not done", &[])
             .await
             .expect("count outstanding work")
             .get(0);

@@ -49,8 +49,7 @@ module Trellis
   #
   # The other fields say what the definition is stuck on, and are nil when
   # nothing holds it up:
-  # - backfill_failure: its build keeps failing (one of its build chunks, or
-  #   its source table's backfill).
+  # - backfill_failure: its build keeps failing (one of its build chunks).
   # - capture_wait: installing or widening capture on a table it reads waits
   #   for a lock another session holds. It clears once that session lets go.
   # - capture_failure: capture of a table it reads is broken, or the drain

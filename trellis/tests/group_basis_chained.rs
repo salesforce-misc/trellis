@@ -59,7 +59,7 @@ async fn start(
 ) -> Driver {
     let mut d = Driver::start(SRC_DDL, &src_columns(), &[upstream], &[SRC]).await;
     install(&d, downstream, downstream_columns).await;
-    trellis::intake::markers::settle_registrations(d.pool()).await;
+    trellis::intake::harness::settle_builds(d.pool()).await;
     d.settle().await;
     assert_eq!(
         d.rows("select status from transform_definitions order by id")
@@ -297,7 +297,7 @@ async fn a_reader_defined_while_an_upstream_writer_is_in_flight_does_not_miss_it
     page.reached(PausePoint::BeforeCommit).await;
 
     install(&d, OVER_ONE, &one_columns()).await;
-    trellis::intake::markers::discharge_registrations(d.pool())
+    trellis::intake::harness::start_registered_builds(d.pool())
         .await
         .expect("start the reader's build");
     assert_eq!(
@@ -343,7 +343,7 @@ async fn a_reader_defined_over_a_seeded_upstream_builds_from_its_rows() {
     )
     .await;
     install(&d, OVER_ONE, &one_columns()).await;
-    trellis::intake::markers::discharge_registrations(d.pool())
+    trellis::intake::harness::start_registered_builds(d.pool())
         .await
         .expect("start the reader's build");
     while run_plan(&d).await {
@@ -382,123 +382,6 @@ async fn run_plan(d: &Driver) -> bool {
     };
     trellis::staging::build::run_claimed(d.pool(), chunk, "test", &options).await;
     true
-}
-
-/// An upstream rebuild that writes its target outside the seam (a resumed
-/// 1-1 whose source is held out of the Re-derive build, rebuilt by the old
-/// chunked build) rebuilds a group-basis reader rather than parking it a
-/// catch-up, whose image-less re-read the group basis can't apply (ADR-0002,
-/// "Multi-hop").
-#[tokio::test]
-async fn an_upstream_rebuild_outside_the_seam_rebuilds_the_reader() {
-    let mut d = start(
-        "TRANSFORM up FROM public.src SELECT g AS g, v AS v",
-        "TRANSFORM roll FROM public.up GROUP BY g WITHOUT SOURCE INDEX SELECT COUNT(*) AS n, SUM(v) AS total",
-        &[("id", int4()), ("g", int4()), ("v", int4())],
-        1,
-    )
-    .await;
-    let status = |table: &str| {
-        format!("select status, build from transform_definitions where target_table = '{table}'")
-    };
-    let roll = "select g, n, total from public.roll order by g";
-    let oracle = "select g, count(*), sum(v) from public.src group by g order by g";
-    step(
-        &mut d,
-        "insert into public.src values (1, 1, null, 5), (2, 1, null, 7), (3, 2, null, 2)",
-    )
-    .await;
-    assert_equal(&mut d, roll, oracle).await;
-
-    // Pause and resume the upstream, held out of the Re-derive build: its
-    // rebuild is the old chunked build, whose writes bypass the seam.
-    trellis::intake::markers::hold_out_of_the_rederive_build(&d.ctl, SRC)
-        .await
-        .expect("hold src out of the Re-derive build");
-    d.ctl
-        .batch_execute(
-            "update transform_definitions set status = 'paused' where target_table = 'public.up'",
-        )
-        .await
-        .expect("pause the upstream");
-    trellis::staging::quarantine::resume_transform(d.pool(), "up")
-        .await
-        .expect("resume the upstream");
-    trellis::intake::markers::discharge_registrations(d.pool())
-        .await
-        .expect("dispatch the upstream's rebuild");
-    assert_eq!(
-        d.rows("select kind from backfill_chunks where not done")
-            .await,
-        ["(range)"],
-        "the upstream is rebuilt by the old chunked build"
-    );
-    loop {
-        let claimed =
-            chunk_queue::claim_chunks(&**d.pool().get().await.expect("pool"), "test", 100)
-                .await
-                .expect("claim the upstream's build");
-        if claimed.is_empty() {
-            break;
-        }
-        for chunk in &claimed {
-            chunk_queue::run_claimed_chunk(
-                d.pool(),
-                chunk,
-                "test",
-                Duration::from_secs(5),
-                Duration::from_secs(60),
-            )
-            .await
-            .expect("run the upstream's build");
-            chunk_queue::finish_chunk(d.pool(), chunk, "test")
-                .await
-                .expect("finish the upstream's build");
-        }
-    }
-    assert_eq!(
-        d.rows(&status("public.up")).await[0].split(',').next(),
-        Some("(catching_up"),
-        "the upstream's build finished"
-    );
-    assert_eq!(
-        d.rows(&status("public.roll")).await,
-        ["(backfilling,rederive)"],
-        "the reader is rebuilt, not caught up"
-    );
-    assert_eq!(
-        d.rows(
-            "select build_seg is not null from transform_definitions \
-             where target_table = 'public.roll'"
-        )
-        .await,
-        ["(t)"],
-        "the rebuild records the segment active at its commit"
-    );
-    assert_eq!(
-        d.rows(
-            "select bc.kind from backfill_chunks bc join transform_definitions d \
-             on d.id = bc.definition_id where d.target_table = 'public.roll' and not bc.done \
-             order by bc.kind"
-        )
-        .await,
-        ["(sweep)"],
-        "a group-basis rebuild is its sweep job alone (#1101)"
-    );
-
-    // The rebuild replaces the reader's groups from the upstream's target
-    // as the upstream's build left it, and the reader stays exact as the
-    // upstream catches up and is written again.
-    trellis::staging::build::settle_builds(d.pool()).await;
-    assert_eq!(d.rows(&status("public.roll")).await, ["(live,)"]);
-    trellis::intake::markers::settle_registrations(d.pool()).await;
-    assert_equal(&mut d, roll, oracle).await;
-    step(
-        &mut d,
-        "insert into public.src values (4, 2, null, 1), (5, 3, null, 1)",
-    )
-    .await;
-    assert_equal(&mut d, roll, oracle).await;
 }
 
 /// A rebuild of a group-basis upstream reaches its group-basis reader
@@ -614,7 +497,7 @@ async fn a_one_to_one_reader_of_a_join_target_holds_the_null_group() {
         &[("ga", int4()), ("n", int8()), ("sy", int8())],
     )
     .await;
-    trellis::intake::markers::settle_registrations(d.pool()).await;
+    trellis::intake::harness::settle_builds(d.pool()).await;
     d.settle().await;
     assert_eq!(
         d.rows("select status from transform_definitions order by id")
@@ -663,7 +546,7 @@ async fn a_rollup_over_a_one_to_one_reader_follows_its_null_keyed_rows() {
         &[("g", int4()), ("h", int4()), ("n", int8())],
     )
     .await;
-    trellis::intake::markers::settle_registrations(d.pool()).await;
+    trellis::intake::harness::settle_builds(d.pool()).await;
     d.settle().await;
     assert_eq!(
         d.rows("select status from transform_definitions order by id")
@@ -877,7 +760,7 @@ async fn seeded_upstream() -> Driver {
 async fn define_roll(d: &Driver) {
     write(d, "create index on public.up (h)").await;
     install(d, ROLL_H, &up_columns()).await;
-    trellis::intake::markers::discharge_registrations(d.pool())
+    trellis::intake::harness::start_registered_builds(d.pool())
         .await
         .expect("start the reader's build");
     assert_eq!(

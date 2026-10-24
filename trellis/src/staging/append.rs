@@ -132,9 +132,8 @@ pub enum StagedChange {
     /// timestamp of the real source commit this recompute traces back to,
     /// when one is known — `Some` for forward propagation and quarantine
     /// replay (both of which inherit it from the triggering
-    /// change), `None` for backfill's cursor-enumerated pre-existing rows
-    /// (there is no meaningful origin for a row nothing ever "changed" —
-    /// see `intake::markers`'s backfill enumeration). Without this, an
+    /// change), `None` for a build's staged pre-existing rows (there is no
+    /// meaningful origin for a row nothing ever "changed"). Without this, an
     /// automatically-propagated hop-to-hop chain (transform A's output
     /// feeding transform B as B's input, entirely through `Recompute` rows)
     /// would carry no origin at all past the first hop, leaving both the

@@ -76,6 +76,10 @@ pub enum ValidationError {
     UnresolvedColumn { field: String, column: String },
     /// The calculated-column dependency graph contains a cycle.
     Cycle { cycle: Vec<String> },
+    /// Inlining the calculated fields each field reads into it, as every
+    /// build does, yields more expression nodes than a build can render: a
+    /// chain of fields that each read the previous one more than once.
+    FieldExpansionTooLarge,
     /// Adding a table-to-table dependency edge from a definition's source to
     /// its target would create a cycle in the two-level dependency graph
     /// (issue #22 follow-up: cycle detection generalized from column-only,
@@ -598,6 +602,11 @@ impl fmt::Display for ValidationError {
             ValidationError::Cycle { cycle } => {
                 write!(f, "cycle among calculated columns: {}", cycle.join(" -> "))
             }
+            ValidationError::FieldExpansionTooLarge => write!(
+                f,
+                "the calculated fields read each other so many times that inlining them into \
+                 one expression yields more than a build can render; make the chain shorter"
+            ),
             ValidationError::TableCycle { cycle } => {
                 write!(f, "cycle among tables: {}", cycle.join(" -> "))
             }
@@ -1098,6 +1107,15 @@ pub fn validate(
     detect_cycle(&deps)?;
 
     infer_field_types(def, source_columns)?;
+
+    // Every build reads each field as one self-contained expression, with the
+    // calculated fields it reads inlined. A chain that doubles at each level
+    // inlines to more than any build can render.
+    if let Err(super::backfill::BackfillError::Unsupported(_)) =
+        super::backfill::substitute_all_fields(def)
+    {
+        return Err(ValidationError::FieldExpansionTooLarge);
+    }
 
     Ok(())
 }

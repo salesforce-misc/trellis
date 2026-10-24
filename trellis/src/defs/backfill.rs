@@ -1,75 +1,28 @@
-//! Direct, set-based, key-range-chunked backfill of a definition's target
-//! straight from its source (issue #63 milestone 3).
+//! What the Re-derive build of a 1-1 definition (`staging::build`) shares
+//! with the rest of the engine: the inlining of a definition's calculated
+//! fields into self-contained expressions ([`substitute_all_fields`]), the
+//! primary-key range helpers a build chunk reads its keys with
+//! ([`range_keys`], [`next_pk_ranges`], [`pk_range_where`]), and the
+//! narrowing of a chunk that fails on its data to the key that causes it
+//! ([`narrow_one_to_one_chunk`]).
 //!
-//! # Why this exists
-//!
-//! A from-scratch backfill used to run entirely through the staging ring:
-//! [`super::catalog::create_definition`] enumerates every source row as a
-//! `Recompute` marker (`intake::markers::enumerate_and_append`), which the
-//! ring then folds and applies. That stages one marker per source row, folds
-//! the whole table in a single ring segment, and applies it as one giant
-//! transaction — the cost M0's benchmark measured and M1/M2 chipped at.
-//!
-//! This module bypasses the ring for the initial build: it computes the target
-//! directly with server-side `INSERT … SELECT` statements, chunked by key
-//! range so each statement is one bounded transaction. The ring is then left
-//! to carry only live CDC deltas that land *after* the build (see the fence
-//! discussion below). The backfill discharge (ADR-0002) dispatches it by
-//! shape instead of a ring enumeration: a plain 1-1 definition's primary-key
-//! ranges as durable chunks ([`plan_one_to_one_chunks`]). An aggregate is
-//! built by its plan job (`staging::group_basis::rebuild`), never here.
-//!
-//! # Correctness — the five concerns issue #63 M3 calls out
-//!
-//! 1. **Exhaustive, disjoint chunking.** The 1-1 build walks the source
-//!    primary key in half-open ranges `(lo, hi]` discovered by
-//!    `max()`-over-`LIMIT` (see [`backfill_one_to_one`]): every source row's PK
-//!    falls in exactly one range, with no gap or overlap regardless of gaps in
-//!    the key values.
-//!
-//! 2. **The build/CDC fence.** The build writes with `ON CONFLICT DO UPDATE
-//!    SET col = excluded.col` — an *overwrite* that recomputes each target row
-//!    from the current source, identical in effect to the
-//!    ring's own image-less `Recompute` path. Overwrite is idempotent and
-//!    order-independent, so the handoff to the ring is the same one the ring
-//!    already relies on: live CDC isn't applied to the definition until the
-//!    build has finished and flipped it `live`, and any genuine post-build
-//!    delta the ring later applies lands on a fully-built row. The build runs
-//!    as a background job after its source's capture was installed (ADR-0002,
-//!    issue #419), so a commit it read can also be captured and drain after
-//!    the flip, where it overwrites the row again from its own image.
-//!
-//! 3. **Per-field-kind aggregates.** An aggregate isn't built here: the group
-//!    basis builds it with one absolute write (`staging::group_basis`).
-//!
-//! 4. **Idempotent retry.** Every chunk is its own transaction and every write
-//!    is an overwrite, so a crash or error partway through is recovered by
-//!    simply re-running the whole build: already-built rows/groups are
-//!    recomputed to the same value, not doubled.
-//!
-//! 5. **1-1 bind-param safety.** The 1-1 build uses `INSERT … SELECT` over the
-//!    source (server-side), not a `VALUES` list of client-bound rows, so it
-//!    carries a fixed handful of bound parameters (the range bounds) regardless
-//!    of chunk size — it never approaches the `i16::MAX` bind-parameter cap the
-//!    ring's row-at-a-time apply path (`staging::apply::apply_target`) must
-//!    chunk around.
+//! The key ranges are half-open `(lo, hi]` on the source's full, possibly
+//! composite primary key, compared as a row value, which Postgres evaluates
+//! lexicographically (matching `ORDER BY c0, c1, ...`) and which degenerates
+//! to a bare scalar comparison at arity 1. Every source row's key falls in
+//! exactly one range, with no gap or overlap regardless of gaps in the key
+//! values. A key with a `NULL` part, which only a source keyed by a nullable
+//! unique index can have, falls in no range ([`key_not_null`]); the build's
+//! plan stages those keys into the ring instead.
 
 use std::collections::{HashMap, HashSet};
 
-use super::chunk_queue::ClaimFence;
 use crate::error_code::{self, ErrorCode};
-use crate::pool::{Pool, quote_ident};
+use crate::pool::quote_ident;
 use tokio_postgres::GenericClient;
 
-use super::ast::{Expr, KeySpace, TransformDef, ValueType};
-use super::ddl::{self, PrimaryKeyColumn, qualified_target_table, source_primary_key};
-use super::oracle::render_expr_sql;
-
-/// Rows per chunk for the 1-1 primary-key-range build. Each chunk is one
-/// bounded transaction; 50k keeps a chunk's write set well within a
-/// comfortable transaction size while keeping the number of round trips low
-/// for a million-row source.
-const BACKFILL_CHUNK_ROWS: i64 = 50_000;
+use super::ast::{Expr, TransformDef};
+use super::ddl::{self, PrimaryKeyColumn};
 
 /// Why a direct backfill could not run.
 #[derive(Debug)]
@@ -80,10 +33,10 @@ pub enum BackfillError {
     Pool(crate::error::Error),
     /// Introspecting the source primary key (1-1 build) failed.
     Ddl(ddl::DdlError),
-    /// The definition's shape isn't supported by the direct build — e.g. a
-    /// cyclic alias chain, or one whose expansion exceeds the size budget.
-    /// The backfill discharge builds such a definition by ring enumeration
-    /// instead (ADR-0002's dispatch by shape).
+    /// The definition's shape isn't supported by a build — e.g. a cyclic
+    /// alias chain, or one whose expansion exceeds the size budget. Define
+    /// refuses such a definition, so a build meets this only for a
+    /// definition edited since.
     Unsupported(String),
     /// Staging a changed row's downstream propagation through the
     /// target-mutation seam failed (issue #315), wrapped where a backfill
@@ -177,91 +130,6 @@ impl From<ddl::DdlError> for BackfillError {
     fn from(err: ddl::DdlError) -> Self {
         BackfillError::Ddl(err)
     }
-}
-
-/// Builds `def`'s target directly from its source, in bounded key-range
-/// chunks, dispatching on `def`'s key space (see the module docs). `def`'s
-/// target table must already exist (created by
-/// [`super::ddl::create_target_table`] /
-/// [`super::ddl::create_aggregate_target_table`]) — this only writes rows, it
-/// does not create the table. `target_schema` and `source_columns` are the
-/// same values those DDL calls were given. `source_table` is `def.source`'s
-/// fully-qualified `"schema.table"` identity (issue #76, ADR-0011) — the
-/// caller's own already-resolved value (`catalog::resolve_source_for_install`,
-/// or [`super::model::Definition::source_table`] for a durable chunk-queue
-/// caller) — threaded through every read of the live source below instead of
-/// a bare `def.source` left to the executing connection's own `search_path`.
-#[cfg(any(test, feature = "test-util", feature = "internals"))]
-pub async fn backfill_definition(
-    pool: &Pool,
-    def: &TransformDef,
-    target_schema: &str,
-    source_table: &str,
-    source_columns: &HashMap<String, ValueType>,
-) -> Result<(), BackfillError> {
-    backfill_definition_fenced(pool, def, target_schema, source_table, source_columns, None).await
-}
-
-/// [`backfill_definition`], with every target write fenced by `fence` when
-/// the build runs as a chunk-queue job (issue #434, see [`ClaimFence`]):
-/// each write runs in its own transaction that holds the claim first, and
-/// the build stops with [`BackfillError::Superseded`] at the first write
-/// whose claim no longer holds.
-pub(crate) async fn backfill_definition_fenced(
-    pool: &Pool,
-    def: &TransformDef,
-    target_schema: &str,
-    source_table: &str,
-    _source_columns: &HashMap<String, ValueType>,
-    fence: Option<ClaimFence<'_>>,
-) -> Result<(), BackfillError> {
-    match &def.key_space {
-        KeySpace::Join(_) => {
-            unreachable!("a JOIN is built by its plan job (staging::build), never by this dispatch")
-        }
-        KeySpace::OneToOne => {
-            // Issue #121: the 1-1 direct build's PK-range chunking
-            // (`discover_pk_ranges`/`write_one_to_one_range`) now orders and
-            // compares the source's full (possibly composite) primary key via
-            // row-value comparison (`(c0, c1, ...) > (v0, v1, ...)`), which
-            // Postgres evaluates lexicographically — matching a plain
-            // `ORDER BY c0, c1, ...` — and which degenerates to a bare scalar
-            // comparison at arity 1 (Postgres parses a single parenthesized
-            // expression as that expression, not a one-element row
-            // constructor), so this is no longer narrowed to a single column.
-            let pk = source_primary_key(pool, source_table).await?;
-            backfill_one_to_one(pool, def, target_schema, source_table, &pk, fence).await
-        }
-        // A group-basis aggregate is built by its plan job
-        // (`staging::group_basis::rebuild`), never by this dispatch.
-        KeySpace::Aggregate { .. } => Err(BackfillError::Unsupported(
-            "an aggregate is built by its plan job, never by the direct build".to_string(),
-        )),
-    }
-}
-
-/// Runs `write` in a transaction that first holds `fence`, and commits it
-/// (issue #434, see [`ClaimFence`]). Returns [`BackfillError::Superseded`],
-/// having written nothing, when the claim no longer holds. With no fence (a
-/// build outside the chunk queue) `write` runs on `client` directly.
-async fn write_fenced<F>(
-    client: &mut crate::pool::Client,
-    fence: Option<ClaimFence<'_>>,
-    write: F,
-) -> Result<(), BackfillError>
-where
-    F: AsyncFnOnce(&tokio_postgres::Client) -> Result<(), BackfillError>,
-{
-    let Some(fence) = fence else {
-        return write(client).await;
-    };
-    let txn = client.transaction().await?;
-    if !fence.hold(&*txn).await? {
-        return Err(BackfillError::Superseded);
-    }
-    write(txn.client()).await?;
-    txn.commit().await?;
-    Ok(())
 }
 
 /// Recursively substitutes every cross-field-alias reference in `expr` — a
@@ -519,76 +387,6 @@ pub(crate) fn substituted_field_exprs(
         .collect())
 }
 
-/// The 1-1 build: walk the source primary key in half-open `(lo, hi]` ranges,
-/// each `INSERT … SELECT … ON CONFLICT DO UPDATE`-ing one bounded chunk.
-///
-/// Range discovery reads the lexicographically-largest key of the next
-/// `BACKFILL_CHUNK_ROWS` source rows above `lo` (see [`discover_pk_ranges`]);
-/// that becomes `hi`, the chunk covers `pk > lo and pk <= hi` (row-value
-/// comparison, issue #121 — a composite key's own declared column order,
-/// matching Postgres's own `ORDER BY c0, c1, ...` and degenerating to a bare
-/// scalar comparison at arity 1), and the next `lo` is this `hi`. When
-/// discovery finds no rows left above `lo` the walk stops. Every source row's
-/// PK is `> lo` for exactly one range and `<= hi` for that same range, so the
-/// ranges partition the source exactly once with no gap or overlap — the
-/// off-by-one this structure guards against is exactly what
-/// `defs_backfill_direct`'s boundary test exercises.
-async fn backfill_one_to_one(
-    pool: &Pool,
-    def: &TransformDef,
-    target_schema: &str,
-    source_table: &str,
-    pk: &[PrimaryKeyColumn],
-    fence: Option<ClaimFence<'_>>,
-) -> Result<(), BackfillError> {
-    // Substitute any cross-field-alias reference (e.g. `total = double_price +
-    // tax` where `double_price` is itself a field) with a deep copy of the
-    // referenced field's expression tree, so every field's expression is
-    // self-contained before `render_expr_sql` sees it — it renders each
-    // `Column(name)` as a bare source-column reference, which Postgres rejects
-    // for a same-SELECT-list alias. A cyclic alias chain falls back to the ring
-    // (issue #83 follow-up).
-    let substituted = substitute_all_fields(def)?;
-
-    let source = ddl::qualified_source_table(source_table);
-    let mut client = pool.get().await?;
-    for (lo, hi) in discover_pk_ranges(&**client, &source, pk).await? {
-        write_fenced(&mut client, fence, async |client| {
-            write_one_to_one_range(
-                client,
-                def,
-                target_schema,
-                source_table,
-                pk,
-                &substituted,
-                Some((&lo, &hi)),
-            )
-            .await
-        })
-        .await?;
-    }
-    // The keys with a `NULL` part, which no range reaches: only a source
-    // keyed by a nullable unique index has them, and the target holds their
-    // rows (issue #1141).
-    if pk.iter().any(|c| c.nullable) {
-        write_fenced(&mut client, fence, async |client| {
-            write_one_to_one_range(
-                client,
-                def,
-                target_schema,
-                source_table,
-                pk,
-                &substituted,
-                None,
-            )
-            .await
-        })
-        .await?;
-    }
-
-    Ok(())
-}
-
 /// The encoded keys of `source_table`'s rows in `(lo, hi]` of its primary
 /// key `pk`, leaving out a quarantined key and a key with a `NULL` part
 /// (which the build's plan stages instead, [`key_not_null`]), as a first
@@ -640,250 +438,7 @@ pub(crate) fn range_params<'a>(
         .collect()
 }
 
-/// The same `column_status` lookup `staging::quarantine::paused_columns_for`
-/// runs from inside a batch's live-CDC apply, reused here (as a plain query
-/// against an already-open `&Client`, not a call to that function) for the
-/// exact same reason: a durable backfill chunk can be reclaimed and
-/// re-executed after a crash (`chunk_queue::reclaim_stale_chunks`), and if
-/// live CDC has paused one of this definition's columns in the meantime, a
-/// (re-)executed chunk must not silently overwrite that column's frozen
-/// value with a freshly (mis)computed one — that would undo the freeze that
-/// is the entire point of column-level quarantine (ADR-0003).
-/// Not a call to `staging::quarantine::paused_columns_for` itself: that
-/// function takes a `&Pool`, every call site here already holds a `&Client`,
-/// and `defs` sits below `staging` in this crate's layering
-/// (`staging::apply` already depends on `defs::backfill`, so the reverse
-/// dependency would be circular). Empty (the overwhelmingly common case) for
-/// a definition with nothing currently paused.
-///
-/// Closed over `def`'s alias readers, as the `staging::quarantine` original
-/// is (issue #748).
-async fn paused_columns_for(
-    client: &impl GenericClient,
-    def: &TransformDef,
-) -> Result<HashSet<String>, BackfillError> {
-    let rows = client
-        .query(
-            "select column_name from column_status where transform_table = $1",
-            &[&def.target],
-        )
-        .await?;
-    let mut paused: HashSet<String> = rows.into_iter().map(|row| row.get(0)).collect();
-    if !paused.is_empty() {
-        super::eval::AliasReaders::of(def).close(&mut paused);
-    }
-    Ok(paused)
-}
-
-/// One `(lo, hi]` PK-range chunk's write — the body [`backfill_one_to_one`]'s
-/// loop runs for every range in one call, and the durable chunk queue's
-/// [`execute_one_to_one_chunk`] runs for exactly one range claimed off
-/// `backfill_chunks` (ADR-0002's "A build is Re-derive over chunks, and
-/// applies from its first chunk"). `substituted` is the caller's already-computed
-/// [`substitute_all_fields`] output, so a queue-driven caller charged the
-/// `Unsupported`-detecting cost once at plan time doesn't pay it again per
-/// chunk beyond re-deriving the (cheap, pure) substitution itself. `range`
-/// is the chunk's `(lo, hi]`, or `None` for every key with a `NULL` part,
-/// which no range reaches ([`key_not_null`]).
-#[allow(clippy::too_many_arguments)]
-async fn write_one_to_one_range(
-    client: &impl GenericClient,
-    def: &TransformDef,
-    target_schema: &str,
-    source_table: &str,
-    pk: &[PrimaryKeyColumn],
-    substituted: &[Expr],
-    range: Option<(&Option<Vec<String>>, &[String])>,
-) -> Result<(), BackfillError> {
-    let source = ddl::qualified_source_table(source_table);
-    let target = qualified_target_table(target_schema, def);
-    let pk_idents: Vec<String> = pk.iter().map(|c| quote_ident(&c.name)).collect();
-    let pk_col_list = pk_idents.join(", ");
-
-    // ADR-0003 (column-level quarantine): exclude any column
-    // this definition currently has paused from both the computed column
-    // list and the `ON CONFLICT` update set — see `paused_columns_for`'s doc
-    // comment for why a durable, re-executable chunk write can't skip this.
-    let paused = paused_columns_for(client, def).await?;
-    let should_write = |name: &str| !paused.contains(name);
-
-    let field_idents: Vec<String> = def
-        .fields
-        .iter()
-        .filter(|f| should_write(&f.name))
-        .map(|f| quote_ident(&f.name))
-        .collect();
-    let field_exprs: Vec<String> = def
-        .fields
-        .iter()
-        .zip(substituted)
-        .filter(|(f, _)| should_write(&f.name))
-        .map(|(_, expr)| render_expr_sql(expr))
-        .collect();
-
-    let insert_cols = pk_idents
-        .iter()
-        .cloned()
-        .chain(field_idents.iter().cloned())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let select_exprs = pk_idents
-        .iter()
-        .cloned()
-        .chain(field_exprs.iter().cloned())
-        .collect::<Vec<_>>()
-        .join(", ");
-    // Every column of this definition can be paused at once (a single-field
-    // definition whose lone column's fuse has tripped is the simplest such
-    // case) — mirrors `staging::apply::apply_target`'s identical edge case:
-    // `do update set` with an empty set list is invalid SQL, and there is
-    // genuinely nothing to update on an existing row anyway; a brand-new key
-    // still gets its bare row inserted via the same statement's `insert`
-    // half.
-    let on_conflict = if field_idents.is_empty() {
-        format!("on conflict ({pk_col_list}) do nothing")
-    } else {
-        let update_sets = field_idents
-            .iter()
-            .map(|f| format!("{f} = excluded.{f}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!("on conflict ({pk_col_list}) do update set {update_sets}")
-    };
-
-    // A quarantined key is left out (#616): it stays out of the target until
-    // `release_key` re-derives it, exactly as the drain leaves it out of every
-    // batch. The build's own narrowing quarantines the key a chunk fails on
-    // (`chunk_queue::fail_chunk`), and the chunk then runs without it. A
-    // range leaves out a key with a `NULL` part ([`key_not_null`]), which
-    // the `None` range writes.
-    let (mut params, keys) = match range {
-        Some((lo, hi)) => (
-            range_params(lo, hi),
-            format!(
-                "{} and {}",
-                pk_range_where(&pk_idents, pk, lo),
-                key_not_null(&pk_idents)
-            ),
-        ),
-        None => (Vec::new(), format!("not ({})", key_not_null(&pk_idents))),
-    };
-    let where_clause = format!("{keys} and {}", not_quarantined(pk, params.len() + 1));
-    params.push(&source_table);
-    params.push(&def.target);
-    let insert_sql = format!(
-        "insert into {target} ({insert_cols}) \
-         select {select_exprs} from {source} as {SOURCE_ALIAS} where {where_clause} \
-         {on_conflict}"
-    );
-    client.execute(&insert_sql, &params).await?;
-    Ok(())
-}
-
-/// The read-only "planning" half of [`backfill_one_to_one`] (ADR-0002):
-/// fails fast with [`BackfillError::Unsupported`] exactly as
-/// `backfill_one_to_one` would (same [`substitute_all_fields`] call), then
-/// returns the same `(lo, hi]` PK-range boundaries its loop would have
-/// walked — without writing a single row of the target. The backfill
-/// discharge (`intake::markers::run_pending_backfills`, ADR-0002) calls
-/// this for a 1-1 definition once its capture point
-/// has passed, and persists the boundaries as durable `backfill_chunks` work
-/// items that drain threads execute.
-///
-/// Reads only the source's primary-key index, on `client` (the discharge's
-/// own connection, outside its transaction). A key committed above the last
-/// boundary after this reads is left to the go-live catch-up the last chunk
-/// parks (`catalog::complete_direct_backfill`).
-pub(crate) async fn plan_one_to_one_chunks(
-    client: &impl GenericClient,
-    def: &TransformDef,
-    source_table: &str,
-) -> Result<PlannedRanges, BackfillError> {
-    let _ = substitute_all_fields(def)?;
-    let pk = ddl::source_primary_key_in_txn(client, source_table).await?;
-    let source = ddl::qualified_source_table(source_table);
-    let ranges = discover_pk_ranges(client, &source, &pk).await?;
-    // `backfill_chunks.lo`/`.hi` (V20__backfill_chunks.sql) are each a single
-    // `text` column — issue #121 reuses this crate's existing composite-key
-    // identity text ([`ddl::join_pk_key`], the same encoding
-    // a capture trigger and `ddl::pk_key_sql_expr` already use
-    // everywhere else) to fold a multi-column bound into that one column
-    // rather than widening the schema, and degenerates to the bound's own
-    // single value, verbatim, at arity 1 (byte-identical to before this
-    // issue). [`execute_one_to_one_chunk`] decodes it back the same way.
-    Ok(PlannedRanges {
-        ranges: ranges
-            .into_iter()
-            .map(|(lo, hi)| (lo.map(ddl::join_pk_key), ddl::join_pk_key(hi)))
-            .collect(),
-        key_collations: ddl::key_collations(&pk),
-    })
-}
-
-/// A 1-1 range build's plan ([`plan_one_to_one_chunks`]): its encoded
-/// `(lo, hi]` ranges, and the collations of the source key's columns they
-/// were walked under, which every chunk reads its range under
-/// (`backfill_chunks.key_collations`, issue #769).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PlannedRanges {
-    pub(crate) ranges: Vec<(Option<String>, String)>,
-    pub(crate) key_collations: Vec<Option<String>>,
-}
-
-/// Executes exactly one previously-[`plan_one_to_one_chunks`]-enumerated
-/// chunk — the durable-queue counterpart of [`backfill_one_to_one`]'s loop
-/// body, claimed and run by a drain worker
-/// (`trellis::client`'s `app_worker_loop`) rather than an in-call loop.
-/// Idempotent overwrite, like every chunk write in this module (ADR-0002): a
-/// worker that reclaims this chunk after a peer died mid-write redoes it
-/// safely.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn execute_one_to_one_chunk(
-    pool: &Pool,
-    def: &TransformDef,
-    target_schema: &str,
-    source_table: &str,
-    lo: Option<&str>,
-    hi: &str,
-    key_collations: Option<&[Option<String>]>,
-    fence: ClaimFence<'_>,
-) -> Result<(), BackfillError> {
-    let mut pk = source_primary_key(pool, source_table).await?;
-    // Under the collations the range was planned under, not the key's own
-    // now (issue #769).
-    ddl::pin_key_collations(&mut pk, key_collations);
-    let substituted = substitute_all_fields(def)?;
-    let mut client = pool.get().await?;
-    // The exact inverse of [`plan_one_to_one_chunks`]'s encode: a genuine
-    // primary-key column (every real `PRIMARY KEY`, at any arity) is never
-    // `NULL`, so every part decodes to `Some` here in practice — propagated
-    // as a typed [`ddl::DdlError::MalformedCompositeKey`] via `From`, rather
-    // than assumed, should stale/corrupt `backfill_chunks` data ever say
-    // otherwise.
-    let decode = |text: &str| -> Result<Vec<String>, BackfillError> {
-        Ok(ddl::split_pk_key(&pk, source_table, text)?
-            .into_iter()
-            .map(|part| part.map(|c| c.into_owned()).unwrap_or_default())
-            .collect())
-    };
-    let lo = lo.map(decode).transpose()?;
-    let hi = decode(hi)?;
-    write_fenced(&mut client, Some(fence), async |client| {
-        write_one_to_one_range(
-            client,
-            def,
-            target_schema,
-            source_table,
-            &pk,
-            &substituted,
-            Some((&lo, &hi)),
-        )
-        .await
-    })
-    .await
-}
-
-/// The alias a 1-1 range write and [`narrow_one_to_one_chunk`] give the
+/// The alias [`narrow_one_to_one_chunk`] gives the
 /// source, so [`not_quarantined`]'s key expression names the source's columns
 /// even when one of them shares a name with a column of `poison`.
 const SOURCE_ALIAS: &str = "__trellis_src";
@@ -912,11 +467,9 @@ fn not_quarantined(pk: &[PrimaryKeyColumn], param: usize) -> String {
 /// whenever an earlier part decides it (`(2, NULL) <= (3, 'a')`), while it
 /// leaves out one whose `NULL` part decides it. A range therefore leaves out
 /// every such key, so that the ranges partition exactly the keys without
-/// one, as [`discover_pk_ranges`]' boundaries do. The target holds their
-/// rows all the same (issue #1141): [`backfill_one_to_one`] writes them in a
-/// pass of their own, the Re-derive build's plan stages them into the ring
-/// (`staging::build`), and the old chunked build's go-live catch-up
-/// enumerates them.
+/// one, as [`next_pk_ranges`]' boundaries do. The target holds their rows all
+/// the same (issue #1141): the Re-derive build's plan stages them into the
+/// ring (`staging::build`).
 pub(crate) fn key_not_null(pk_idents: &[String]) -> String {
     pk_idents
         .iter()
@@ -944,7 +497,7 @@ pub(crate) enum ChunkNarrowing {
 /// with a `NULL` part as the write does (a 1-1 range's, and a Re-derive
 /// chunk's since #625 F6, [`key_not_null`]), and either names the one key or
 /// the key that splits them in half. The split point is found the way
-/// [`discover_pk_ranges`] finds a chunk's upper bound: the largest key of the
+/// [`next_pk_ranges`] finds a chunk's upper bound: the largest key of the
 /// first half, in the primary key's own order. `key_collations` are the ones
 /// the chunk's build planned its ranges under (`backfill_chunks.key_collations`,
 /// issue #769), which the range is read and split under.
@@ -969,7 +522,7 @@ pub(crate) async fn narrow_one_to_one_chunk(
     let source = ddl::qualified_source_table(source_table);
     let pk_idents: Vec<String> = pk.iter().map(|c| quote_ident(&c.name)).collect();
     let mut params = range_params(&lo, &hi);
-    // The keys [`write_one_to_one_range`] writes, by the same predicate.
+    // The keys a chunk writes, by the same predicate.
     let where_clause = format!(
         "{} and {} and {}",
         pk_range_where(&pk_idents, &pk, &lo),
@@ -1040,37 +593,10 @@ pub(crate) async fn narrow_one_to_one_chunk(
     }
 }
 
-/// Walks the source primary key in half-open `(lo, hi]` ranges, returning them
-/// in order (the first range's `lo` is `None`, meaning "`pk <= hi`"). Each
-/// `hi` is the lexicographically-largest key (in the primary key's own
-/// declared column order — issue #163's convention, same as
-/// [`ddl::pk_key_sql_expr`]) of the next `BACKFILL_CHUNK_ROWS` rows above the
-/// previous `hi`: the inner query orders ascending and takes the page, the
-/// outer query re-sorts descending (`nulls last`, so a `NULL` component —
-/// only reachable when `source` is itself a nullable-`GROUP BY` aggregate
-/// target, never a real `PRIMARY KEY` — sorts as if absent, mirroring a
-/// single-column `max()`'s own null-skipping) and takes the first row —
-/// exactly [`max`](https://www.postgresql.org/docs/current/functions-aggregate.html)'s
-/// answer at arity 1 (Postgres has no `max()` over an anonymous row type, so
-/// this is the composite generalization, issue #121), and byte-identical SQL
-/// at arity 1 to a bare column reference (a one-element parenthesized
-/// expression is not a row constructor). The walk stops when no rows remain
-/// above the last boundary. The ranges partition the source exactly once with
-/// no gap or overlap regardless of gaps in the key values. See
-/// [`backfill_one_to_one`]'s doc comment for the off-by-one this guards
-/// against. `source` is the already-quoted source table identifier.
-async fn discover_pk_ranges(
-    client: &impl GenericClient,
-    source: &str,
-    pk: &[PrimaryKeyColumn],
-) -> Result<Vec<(Option<Vec<String>>, Vec<String>)>, BackfillError> {
-    walk_pk_ranges(client, source, pk, None, BACKFILL_CHUNK_ROWS, usize::MAX).await
-}
-
 /// Up to `max` consecutive `(lo, hi]` ranges of `source` (the encoded
 /// source table name) of about `rows` rows each, starting above `after` (an
 /// encoded key as `backfill_chunks` stores it; `None` from the first row):
-/// [`discover_pk_ranges`]' walk, a batch at a time, for the Re-derive build's
+/// The walk for a source's ranges, a batch at a time, for the Re-derive build's
 /// plan job (#625 F2, Q13). Fewer than `max` ranges means the walk reached
 /// the last row.
 pub(crate) async fn next_pk_ranges(
@@ -1097,7 +623,7 @@ pub(crate) async fn next_pk_ranges(
         .collect())
 }
 
-/// [`discover_pk_ranges`]' walk from `start`, `rows` rows per range, at most
+/// The walk from `start`, `rows` rows per range, at most
 /// `max` ranges.
 async fn walk_pk_ranges(
     client: &impl GenericClient,
@@ -1215,7 +741,7 @@ async fn walk_pk_ranges(
 /// One row-value comparison (`(c0, c1, ...) {op} ($n::text::t0, ...)`) against
 /// `pk`'s own columns, `param_offset` binds ahead of the first one this call
 /// renders — the shared building block [`pk_range_where`] composes into a
-/// full `(lo, hi]` predicate, and [`discover_pk_ranges`]'s lower-bound-only
+/// full `(lo, hi]` predicate, and the range walk's lower-bound-only
 /// probe uses directly. Degenerates to a bare scalar comparison at arity 1
 /// (Postgres parses a single parenthesized expression as that expression, not
 /// a one-element row constructor), so this is byte-identical SQL to the
@@ -1244,7 +770,7 @@ pub(crate) fn pk_row_cmp(
 /// The `where` predicate restricting a PK-range chunk to `(lo, hi]` (issue
 /// #121: row-value comparison over `pk`'s full column list, not a single
 /// scalar), binding the bounds as `$1..$n` (and `$n+1..$2n` when `lo` is
-/// present, `n = pk.len()`). Paired with [`discover_pk_ranges`]; the caller
+/// present, `n = pk.len()`). Paired with [`next_pk_ranges`]; the caller
 /// binds `hi` (first chunk) or `lo, hi`.
 pub(crate) fn pk_range_where(
     pk_idents: &[String],
@@ -1263,7 +789,8 @@ pub(crate) fn pk_range_where(
 
 #[cfg(test)]
 mod tests {
-    use super::super::ast::{FieldDef, Operator, Predicate};
+    use super::super::ast::{FieldDef, KeySpace, Operator, Predicate};
+    use super::super::oracle::render_expr_sql;
     use super::*;
 
     /// Issue #769: every column of a key range is compared under its

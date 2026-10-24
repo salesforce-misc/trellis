@@ -269,8 +269,8 @@ impl BlockingTrellis {
         self.start(Job::DumpDefinitionsSql)
     }
 
-    /// Re-reads `source_table` for every definition applying from it, as a
-    /// go-live catch-up. See [`Trellis::request_backfill`].
+    /// Rebuilds every definition applying from `source_table`. See
+    /// [`Trellis::request_backfill`].
     pub fn request_backfill(&self, source_table: &str) -> Result<(), TrellisError> {
         self.start_request_backfill(source_table).wait()
     }

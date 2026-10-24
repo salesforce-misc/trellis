@@ -95,10 +95,9 @@ uninstalls the triggers of a table nothing reads any more.
 ### The Re-derive build
 
 A plain 1-1 definition is built by the **Re-derive build** (`staging::build`),
-whether its source is a captured table or another definition's target. It
-needs no marker and no
-go-live catch-up, because the definition **applies from its first chunk**. A
-captured source needs no fence wait either; a source that is another
+whether its source is a captured table or another definition's target. The
+definition **applies from its first chunk**, so the build needs no catch-up
+after it. A captured source needs no fence wait; a source that is another
 definition's target takes one fence per build (see below):
 
 1. **Start.** Once the reconcile pass finds the definition ready (its source
@@ -177,36 +176,6 @@ rebuild of a `live` definition recomputes every group in place, in the same
 transactions, so its readers see the old values until each commits, then the
 new ones, never an empty or partial target.
 
-### Builds that still use a marker and a go-live catch-up
-
-A 1-1 definition whose alias chain is cyclic doesn't yet take the Re-derive build
-(milestone F, #625, moves it). Its build is dispatched by a **marker** on the source table
-(`intake::markers`):
-
-1. **Join.** The staging worker's reconcile pass installs the source's
-   triggers (or, if it is already captured, parks the marker once every
-   table the definition reads is captured with the columns it needs). The
-   install's commit is the join fence
-   ([stage 01](staging-and-claiming/01-capture-by-triggers.md#the-join-fence)).
-2. **Wait.** The discharge skips a marker until every transaction open at
-   the join has ended. `xmin` is cluster-wide, so an unrelated long
-   transaction can hold this step up; the definition's `waiting_to_backfill`
-   status is the signal
-   ([observability](observability.md#backfill-status-and-the-xmin-caveat)).
-3. **Build.** The discharge takes the capture snapshot and builds by shape:
-   a ring enumeration (an image-less `Recompute` per source row that drain
-   workers fold like any batch), plain 1-1 chunks, or one direct set-based
-   `INSERT … SELECT` job. Apply skips a definition that isn't `live`.
-4. **Go live.** A ring enumeration flips its definition to `live` in the
-   discharge transaction. A chunked or direct build moves to `catching_up`
-   (applying, not yet `live`) and parks a go-live catch-up on every table the
-   build read; the discharge of the last catch-up re-derives the definition
-   from the tables' current state, sweeps its target for rows the source no
-   longer backs (`intake::resume_orphans`), and flips it `live`. Every
-   catch-up re-reads its table even when it looks unchanged, since a row
-   inserted and deleted during the build leaves no trace in the table's
-   statistics.
-
 ### Re-reading a table for its applying readers
 
 When the staging worker reinstalls a table's triggers while definitions
@@ -220,8 +189,8 @@ Either one is repaired in the transaction that makes the call:
 - **An aggregate or a `JOIN`** reading the table is rebuilt in place
   ([its build](#an-aggregates-or-a-joins-build)). The transaction moves it
   `live -> backfilling` and enqueues one job, which recomputes every group.
-- **A reader the Re-derive build serves** (a plain 1-1 transform over the
-  captured table, [the Re-derive build](#the-re-derive-build)) is rebuilt.
+- **A plain 1-1 transform** over the captured table
+  ([the Re-derive build](#the-re-derive-build)) is rebuilt.
   The transaction moves it
   `live -> backfilling` and enqueues one plan job and one sweep job, two
   rows per definition, so the call returns quickly whatever the table's size.
@@ -230,10 +199,6 @@ Either one is repaired in the transaction that makes the call:
   `backfilling` when the call returns, so polling for `live` waits out the
   rebuild. A second request while a rebuild runs enqueues another plan and
   sweep.
-- **Any other reader** (a ring-enumerated shape)
-  gets a go-live catch-up. It reports `catching_up` until the discharge has
-  re-read the table and swept its target for rows the source no longer
-  backs.
 
 ### What it asks of a deployment
 
@@ -363,8 +328,7 @@ A rebuild of a `live` transform (`Trellis::request_backfill`, a capture
 re-install, or an automatic rebuild) never empties its target: it rewrites
 the target's rows in place while changes keep applying, so a reader sees
 each row's previous value until the rebuild rewrites it. The transform reads
-`backfilling` until the rebuild is done (`catching_up`, if the Re-derive build
-doesn't serve it)
+`backfilling` until the rebuild is done
 ([observability](observability.md#transform-status-lifecycle)).
 
 ## Correctness

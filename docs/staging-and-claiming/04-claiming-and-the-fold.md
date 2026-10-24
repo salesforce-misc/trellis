@@ -279,9 +279,8 @@ would fold it to NULL and lose the truncate.
 
 A drain holds at most `ClientOptions::drain_batch_cap` folded records at once
 (100,000 by default; ADR-0002's I8). Memory is then bounded by the cap, not by how
-large a segment grew: a go-live re-read stages every source key into one segment,
-and a sealer starved by a slow drain lets the active segment grow at the write
-rate. The cap counts **folded records**, not ring rows: that is what the worker
+large a segment grew: a sealer starved by a slow drain lets the active segment
+grow at the write rate. The cap counts **folded records**, not ring rows: that is what the worker
 holds, and capping rows would cut a 1000:1 fold into pages of 100 records.
 
 **Picking the path.** The seal stores the row count of the batch's fenced window,

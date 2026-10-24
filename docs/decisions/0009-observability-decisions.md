@@ -77,8 +77,8 @@ whole-transform fuse writes, and `Paused` is the operator-or-engine freeze of
 transform can carry paused columns without its `status` moving — so the two tiers don't
 conflict.
 
-The transitions are written where they happen: the `xmin`-fence wait and the backfill
-discharge move a transform through `waiting_to_backfill`/`backfilling`/`live`, the fuse
+The transitions are written where they happen: the staging worker's build start and the
+build's completion move a transform through `waiting_to_backfill`/`backfilling`/`live`, the fuse
 trip writes `quarantined`, and a resume returns a frozen transform to
 `waiting_to_backfill`. Per-key (`poison`) and per-column tiers have writers
 too.
