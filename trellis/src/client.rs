@@ -1924,6 +1924,53 @@ struct AppWorkerConfig {
     build_chunk_rows: i64,
 }
 
+/// Whether a drain worker must hold back: a logical restore was detected by
+/// the stored table oids and no staging pass has responded yet. A failed
+/// check holds too.
+async fn restore_pending(pool: &Pool) -> bool {
+    match pool.get().await {
+        Ok(client) => crate::capture::restore::stale(&**client)
+            .await
+            .unwrap_or(true),
+        Err(_) => true,
+    }
+}
+
+/// [`restore_pending`], exposed for tests of the gate.
+#[cfg(feature = "internals")]
+pub async fn restore_gate_closed(pool: &Pool) -> bool {
+    restore_pending(pool).await
+}
+
+/// A drain worker's one check before its first claim (#1249): waits, a poll
+/// interval at a time, while a logical restore is pending. It never responds
+/// to the restore itself; that is the staging pass's job. Returns `false`
+/// when shutdown arrived first.
+async fn wait_out_restore(
+    pool: &Pool,
+    poll_interval: Duration,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) -> bool {
+    let mut warned = false;
+    while restore_pending(pool).await {
+        if !warned {
+            warned = true;
+            crate::instance_log::warn!(
+                "a logical restore was detected; this drain worker claims nothing until the \
+                 staging worker's next pass responds to it"
+            );
+        }
+        tokio::select! {
+            _ = shutdown_rx.changed() => return false,
+            _ = tokio::time::sleep(poll_interval) => {}
+        }
+        if *shutdown_rx.borrow() {
+            return false;
+        }
+    }
+    true
+}
+
 /// One application-worker task (its `drainers` row is written by [`run`] and
 /// the drainer registration task, not by the loop itself): runs an
 /// out-of-band heartbeat daemon for its ring-segment claims, then loops
@@ -1978,6 +2025,10 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
     // The group-delta merges that failed on this worker, backing off (#901).
     let mut merge_failures = staging::build::MergeFailures::default();
     let mut backoff = IdleBackoff::new(poll_interval, idle_wake_cap);
+
+    if !wait_out_restore(&pool, poll_interval, &mut shutdown_rx).await {
+        return;
+    }
 
     loop {
         if *shutdown_rx.borrow() {

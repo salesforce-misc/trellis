@@ -723,3 +723,61 @@ async fn a_physical_copy_and_a_template_database_pause_nothing() {
         vec![vec![Some("-1".to_string())]]
     );
 }
+
+/// #1249: a drain worker's gate before its first claim. With the restore
+/// signal set and a sealed segment holding a ring row, the gate reports
+/// "wait" while a claim would still hand the segment out (without the gate a
+/// drain-only worker applies the pre-detection row); once the staging pass
+/// has responded, the gate reports "go". With no stale record it is open at
+/// once.
+#[tokio::test]
+async fn a_drain_worker_waits_for_the_restore_response_before_its_first_claim() {
+    let a = TestCluster::start();
+    let mut original = original(&a).await;
+    let pool = &original.db.pool;
+
+    assert!(
+        !trellis::client::restore_gate_closed(pool).await,
+        "no stale record: go at once"
+    );
+
+    // A sealed segment holding a ring row.
+    let outcome = trellis::staging::seal::seal_phase1(&mut original.raw)
+        .await
+        .expect("seal phase 1");
+    trellis::staging::seal::seal_phase2(&original.raw, outcome.sealed_seg_seq, "gate_test")
+        .await
+        .expect("seal phase 2");
+    assert!(ring_rows(&original.raw).await > 0, "the ring holds rows");
+
+    // The restore signal: a stored oid that isn't the live one.
+    original
+        .raw
+        .batch_execute(
+            "update capture_triggers set catalog_oid = (catalog_oid::bigint + 1000)::oid",
+        )
+        .await
+        .unwrap();
+    assert!(
+        trellis::client::restore_gate_closed(pool).await,
+        "the signal is set: wait"
+    );
+    let claimable = trellis::staging::next_claimable_segments(&**pool.get().await.unwrap(), 8)
+        .await
+        .expect("claimable");
+    assert!(
+        !claimable.is_empty(),
+        "without the gate the first claim hands out the pre-detection segment"
+    );
+
+    capture_pass(&mut original.raw, pool).await;
+    assert!(
+        !trellis::client::restore_gate_closed(pool).await,
+        "the staging pass responded: go"
+    );
+    assert_eq!(
+        ring_rows(&original.raw).await,
+        0,
+        "the response emptied the ring"
+    );
+}

@@ -333,6 +333,11 @@ each one costs and what to expect around it
     group move of a key that existed before the dump applies afterwards. A
     restore into the same cluster costs the same resumes, though its counters
     only move forward;
+  * after a logical restore, start a staging worker. A drain-only client
+    (`staging_worker: false`) that starts before it claims nothing until the
+    staging worker's first pass has responded. One already running when the
+    database is restored under it can apply rows staged before the detection,
+    until a staging pass runs; the `RESUME` rebuild overwrites them;
   * the sources restored alone pause their readers: `RESUME` them;
   * Trellis's schema or the targets restored without the rest need the
     affected transforms paused, dropped and defined again, or the whole

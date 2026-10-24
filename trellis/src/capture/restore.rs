@@ -33,7 +33,8 @@
 //! - every change in the ring is discarded. Rows restored from the dump carry
 //!   the original cluster's positions and transaction ids, and the restored
 //!   sources already contain their changes, which every definition rebuilds
-//!   from on `RESUME`. Nothing staged before the detection ever applies. The
+//!   from on `RESUME`. Nothing staged before the detection ever applies,
+//!   with one exception (see "The drain side"). The
 //!   segment registry starts again with it, because its fences and transaction
 //!   ids are the original cluster's and would hold the seal gate until this
 //!   cluster's counter passed them, and the slot writers append to is the
@@ -43,6 +44,16 @@
 //!   partition trees, queued corrections) and of the backfill bookkeeping
 //!   (markers, resume requests) is forgotten: the next pass
 //!   records what it finds, and a resume parks its own markers.
+//!
+//! # The drain side
+//!
+//! A drain worker never responds. Before its first claim it checks [`stale`]
+//! and claims nothing while the signal is set, so a fleet started on a
+//! restored database applies nothing until a staging worker's pass has
+//! responded. It checks once: a drain-only client already running when the
+//! database is restored under it can apply rows staged before the detection,
+//! until a staging pass runs. The `RESUME` the restore forces rebuilds those
+//! targets.
 //!
 //! Nothing rebuilds on its own. `RESUME` of a definition paused here resets
 //! its ordering state before the rebuild (`staging::quarantine`).
@@ -66,12 +77,19 @@ const STALE_RECORDS: &str = "select exists (select 1 from capture_triggers \
      or exists (select 1 from partition_sources \
          where catalog_oid is distinct from 'partition_sources'::pg_catalog.regclass::pg_catalog.oid)";
 
+/// Whether the signal is set: a read-only look that responds to nothing. A
+/// drain worker's gate before its first claim (`client::wait_out_restore`).
+pub(crate) async fn stale(
+    client: &impl tokio_postgres::GenericClient,
+) -> Result<bool, CaptureError> {
+    Ok(client.query_one(STALE_RECORDS, &[]).await?.get(0))
+}
+
 /// The capture pass's check, before it looks at any table: when a stored
 /// table oid differs from the live one, responds ([`respond`]) and returns
 /// `true`.
 pub(crate) async fn detect(client: &mut Client) -> Result<bool, CaptureError> {
-    let stale: bool = client.query_one(STALE_RECORDS, &[]).await?.get(0);
-    if !stale {
+    if !stale(client).await? {
         return Ok(false);
     }
     respond(client, true).await
