@@ -881,8 +881,12 @@ impl Trellis {
                 // holds back every definition still applying what it reads.
                 if !stored.is_frozen() {
                     drain_failure =
-                        crate::staging::holdup::for_definition(&*txn, row.get("source_table"))
-                            .await?;
+                        crate::staging::holdup::for_definition(
+                            &*txn,
+                            row.get("source_table"),
+                            row.get::<_, Option<&str>>("join_table"),
+                        )
+                        .await?;
                 }
                 // #973: a stored definition always parses.
                 if let Ok(def) = crate::defs::grammar::load(

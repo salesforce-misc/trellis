@@ -28,3 +28,8 @@ default-members = [
 [workspace.package]
 edition = "2024"
 rust-version = "1.98.0"
+
+# Dependencies build with light optimisation: a slightly faster test run for
+# a small clean-build cost. Workspace crates stay at opt-level 0.
+[profile.dev.package."*"]
+opt-level = 1
