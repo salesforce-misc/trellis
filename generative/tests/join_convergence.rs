@@ -356,7 +356,8 @@ proptest! {
 /// opposite sides (or one `T` group) to read each other's uncommitted state,
 /// which the tier's pages, each a burst's many keys, rarely line up; and
 /// `gb_early_zero_gc` fired in 1. The deterministic pins named in
-/// `trellis/src/plant.rs` gate them meanwhile.
+/// `trellis/src/plant.rs` gate them meanwhile; #1373 tracks the generator
+/// reach.
 fn join_sweep_tier() -> SweepTier {
     use generative::plant_sweep::{PlantPath, not_on_path};
     let mut not_gated: Vec<(&'static str, &'static str)> = vec![(

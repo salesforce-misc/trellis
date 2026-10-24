@@ -1652,7 +1652,8 @@ const NO_ABSOLUTE_WRITE_UNDER_LOAD: &[(&str, &str)] = &[
 /// of that change to land on the fresh row; the plant changed the GC's
 /// choice in 0 to 4 of 48 cases per tier and the tiers caught none. The
 /// deterministic pins (`group_basis_interleavings`'s `r4_…`,
-/// `join_interleavings`'s `family13_…`) gate it meanwhile.
+/// `join_interleavings`'s `family13_…`) gate it meanwhile; #1373 tracks
+/// the generator reach.
 const EARLY_ZERO_GC_MISS: &str = "gb_early_zero_gc";
 
 /// The steady-load tier's known misses.
