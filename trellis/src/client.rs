@@ -1925,40 +1925,52 @@ struct AppWorkerConfig {
 }
 
 /// Whether a drain worker must hold back: a logical restore was detected by
-/// the stored table oids and no staging pass has responded yet. A failed
-/// check holds too.
-async fn restore_pending(pool: &Pool) -> bool {
-    match pool.get().await {
-        Ok(client) => crate::capture::restore::stale(&**client)
-            .await
-            .unwrap_or(true),
-        Err(_) => true,
-    }
+/// the stored table oids and no staging pass has responded yet. `Err` is a
+/// check that failed, which holds too.
+async fn restore_pending(pool: &Pool) -> Result<bool, String> {
+    let client = pool.get().await.map_err(|err| err.to_string())?;
+    crate::capture::restore::stale(&**client)
+        .await
+        .map_err(|err| err.to_string())
 }
 
-/// [`restore_pending`], exposed for tests of the gate.
+/// [`restore_pending`], exposed for tests of the gate: a failed check reads
+/// as closed.
 #[cfg(feature = "internals")]
 pub async fn restore_gate_closed(pool: &Pool) -> bool {
-    restore_pending(pool).await
+    restore_pending(pool).await.unwrap_or(true)
 }
 
 /// A drain worker's one check before its first claim (#1249): waits, a poll
 /// interval at a time, while a logical restore is pending. It never responds
-/// to the restore itself; that is the staging pass's job. Returns `false`
-/// when shutdown arrived first.
+/// to the restore itself; that is the staging pass's job. A check that fails
+/// holds too and is retried the same way; each kind of hold is logged once.
+/// Returns `false` when shutdown arrived first.
 async fn wait_out_restore(
     pool: &Pool,
     poll_interval: Duration,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) -> bool {
-    let mut warned = false;
-    while restore_pending(pool).await {
-        if !warned {
-            warned = true;
-            crate::instance_log::warn!(
-                "a logical restore was detected; this drain worker claims nothing until the \
-                 staging worker's next pass responds to it"
-            );
+    let (mut warned_restore, mut warned_failure) = (false, false);
+    loop {
+        match restore_pending(pool).await {
+            Ok(false) => return true,
+            Ok(true) if !warned_restore => {
+                warned_restore = true;
+                crate::instance_log::warn!(
+                    "a logical restore was detected; this drain worker claims nothing until the \
+                     staging worker's next pass responds to it"
+                );
+            }
+            Err(error) if !warned_failure => {
+                warned_failure = true;
+                crate::instance_log::warn!(
+                    error = %error,
+                    "this drain worker could not check for a logical restore, and claims \
+                     nothing until the check succeeds"
+                );
+            }
+            Ok(true) | Err(_) => {}
         }
         tokio::select! {
             _ = shutdown_rx.changed() => return false,
@@ -1968,7 +1980,6 @@ async fn wait_out_restore(
             return false;
         }
     }
-    true
 }
 
 /// One application-worker task (its `drainers` row is written by [`run`] and
@@ -5793,5 +5804,113 @@ mod drainer_registration_tests {
         .expect("the task keeps refreshing the rows at the window's cadence");
 
         client.shutdown().await.expect("shutdown");
+    }
+}
+
+#[cfg(test)]
+mod restore_gate_tests {
+    //! #1249: a drain worker checks the logical-restore signal before its
+    //! first claim, through [`app_worker_loop`] itself (the gate's own
+    //! answers are tested in `tests/logical_restore.rs`).
+
+    use super::log_capture::install_capture;
+    use super::*;
+    use crate::config::DEFAULT_SCHEMA;
+
+    /// With the signal set and a sealed segment holding a ring row, a drain
+    /// worker logs that it waits, and the segment is still sealed and
+    /// unclaimed when it does: without the gate, its first claim takes the
+    /// segment. Shutdown ends the wait, though the poll interval is an hour.
+    #[tokio::test]
+    async fn a_drain_worker_claims_nothing_while_a_restore_is_pending() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (_guard, captured) = install_capture();
+        let mut raw = connect_plain(db.dsn(), DEFAULT_SCHEMA)
+            .await
+            .expect("connect");
+        raw.batch_execute(
+            "insert into seg_0 (src_table, key, op, hop_gen) values ('orders', 'k', 'recompute', 0); \
+             insert into capture_triggers (table_name, trigger_name, trigger_oid, trigger_xmin, \
+                 enabled, system_identifier, catalog_oid, node_oid) \
+             values ('public.orders', 'restored', 1, '1', 'A', 'other', 1, 1)",
+        )
+        .await
+        .expect("a ring row, and a record the dump brought from another database");
+        let sealed = staging::seal_phase1(&mut raw).await.expect("seal phase 1");
+        staging::seal_phase2(&raw, sealed.sealed_seg_seq, "wake")
+            .await
+            .expect("seal phase 2");
+        let seg_seq = sealed.sealed_seg_seq;
+
+        let pool = crate::pool::Pool::new(
+            &crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid config"),
+        )
+        .expect("build a same-crate pool");
+        assert!(
+            !staging::next_claimable_segments(&**pool.get().await.unwrap(), 8)
+                .await
+                .expect("claimable")
+                .is_empty(),
+            "the segment is claimable: only the gate holds the worker back"
+        );
+
+        let live = LiveWorkers::default();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let config = AppWorkerConfig {
+            pool: pool.clone(),
+            dsn: db.dsn().to_string(),
+            schema: DEFAULT_SCHEMA.to_string(),
+            claimed_by: "gate-test-app-0".to_string(),
+            wake_channel: "wake".to_string(),
+            drainer_window: staging::DEFAULT_DRAINER_WINDOW,
+            heartbeat_config: HeartbeatDaemonConfig::default(),
+            poll_interval: Duration::from_secs(3600),
+            idle_wake_cap: Duration::from_secs(3600),
+            reclaim_ttl: staging::DEFAULT_RECLAIM_TTL,
+            alive: live.enter("gate-test-app-0".to_string()),
+            drain_batch_cap: staging::DEFAULT_DRAIN_BATCH_CAP,
+            build_chunk_rows: staging::build::DEFAULT_CHUNK_ROWS,
+        };
+        let waiting = || {
+            captured.0.lock().unwrap().iter().any(|e| {
+                e.level == tracing::Level::WARN
+                    && e.fields
+                        .get("message")
+                        .is_some_and(|m| m.contains("a logical restore was detected"))
+            })
+        };
+        let segment = async |raw: &tokio_postgres::Client| -> (String, i64) {
+            let row = raw
+                .query_one(
+                    "select (select state::text from segments where seg_seq = $1), \
+                            (select count(*) from seg_claims where seg_seq = $1)",
+                    &[&seg_seq],
+                )
+                .await
+                .expect("read the segment");
+            (row.get(0), row.get(1))
+        };
+        let watcher = async {
+            // An event, not a convergence budget: the bound only turns a
+            // hang into a failure. A claim ends the wait early, as a failure.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !waiting() && segment(&raw).await == ("sealed".to_string(), 0) {
+                assert!(Instant::now() < deadline, "the worker never logged a wait");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                segment(&raw).await,
+                ("sealed".to_string(), 0),
+                "the worker claimed the pre-detection segment"
+            );
+            assert!(waiting(), "the wait was logged");
+            shutdown_tx.send(true).expect("signal shutdown");
+        };
+        let ((), ()) = tokio::time::timeout(Duration::from_secs(60), async {
+            tokio::join!(app_worker_loop(config, shutdown_rx), watcher)
+        })
+        .await
+        .expect("shutdown ends the wait");
     }
 }

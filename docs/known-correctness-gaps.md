@@ -472,5 +472,7 @@ fixes and what it costs:
   dump belongs to the original cluster's WAL and transaction counter, so the
   capture pass pauses every definition, discards the changes staged before it
   and waits for a `RESUME` of each, which resets that state and rebuilds the
-  target from the restored source. Nothing is skipped or applied wrongly in
-  between ([operations](operations.md#runbooks)).
+  target from the restored source. Nothing is skipped, and nothing applied
+  before the pass stays: a drain worker that starts after the restore waits
+  for the pass, and the rebuild overwrites what one already running applied
+  ([operations](operations.md#runbooks)).
