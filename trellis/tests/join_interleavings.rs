@@ -2416,8 +2416,9 @@ async fn a_zero_cell_with_no_basis_is_collected_and_revives() {
 /// The pass never waits on a page: a page frozen holding `I`'s cells (it
 /// applies its targets in target order) keeps its zero `P` cell through the
 /// pass (`skip locked`), while `L`'s zero cell, which the page has yet to
-/// lock, goes, and the page inserts it afresh. And a page whose lock statement meets a zero cell a collection
-/// is deleting queues behind it, then inserts the cell afresh.
+/// lock, goes, and the page inserts it afresh. And a page whose lock
+/// statement meets a zero cell a collection is deleting queues behind it,
+/// then inserts the cell afresh.
 #[tokio::test]
 async fn zero_cell_collection_against_pages_on_the_same_key() {
     let mut lab = lab(Key::Single, &[L, I]).await;
