@@ -9,8 +9,7 @@
 //! The original is a 1-1, a group-basis aggregate and a `JOIN`, all `live`,
 //! in a cluster whose WAL and transaction counter were advanced before the
 //! definitions applied anything, so their ledgers and groups hold positions
-//! ahead of a fresh cluster's. Its own test binary: the group-basis knob is
-//! process-wide. Nothing polls for convergence (#297); every step is an
+//! ahead of a fresh cluster's. Nothing polls for convergence (#297); every step is an
 //! explicit call.
 
 #![allow(dead_code)]
@@ -251,7 +250,6 @@ struct Original {
 /// The original database: three live definitions whose entries hold positions
 /// of an advanced cluster, a few changes pending in the ring, and a dump.
 async fn original(cluster: &TestCluster) -> Original {
-    trellis::dev::staging::set_group_basis(true);
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
     let trellis = definer(db.dsn()).await;

@@ -1,5 +1,5 @@
-//! The Re-derive build's profile columns for `build-under-load` (#625 F2,
-//! the plan's §4 "The profile").
+//! The build's profile columns for `build-under-load` (#625 F2, the plan's
+//! §4 "The profile").
 //!
 //! Most come from the engine's own metrics (`trellis::metrics`), diffed
 //! across the window like every other scrape here ([`super::scrape`]):
@@ -7,24 +7,22 @@
 //! - worker-seconds per build statement class
 //!   (`trellis_build_statement_seconds{class}`'s `_sum`): the chunk's setup
 //!   (its catalog reads, begin and claim fence), key read, entry lock (a
-//!   lock that times out included), read-and-write (its one statement, which
-//!   also inserts the deltas) and commit, and the merger's setup, upsert,
-//!   finish and commit, plus the plan job. Per 10k built rows, they are the
-//!   profile's cost split, and their total is the build's worker time except
-//!   for the drain worker's scheduling reads between steps (which targets
-//!   are building, whether one has deltas, the backlog bound, the claim);
+//!   lock that times out included), read-and-write and commit, plus the plan
+//!   job. Per 10k built rows, they are the profile's cost split, and their
+//!   total is the build's worker time except for the drain worker's
+//!   scheduling reads between steps (which targets are building, the
+//!   backlog bound, the claim);
 //! - chunk transactions (`trellis_build_chunk_seconds`): how many, and p50
 //!   and p99 read off the histogram's buckets (about 25% apart, so each is
 //!   the upper bound of the bucket it falls in), and the max
 //!   (`trellis_build_chunk_seconds_max`, the instance's, which is this run's:
 //!   the bench runs one scenario, with one instance, per process);
-//! - rows built, delta rows appended and merged, chunks that gave up on
-//!   their entry lock, and seals refused for a full ring.
+//! - rows built, chunks that gave up on their entry lock, and seals refused
+//!   for a full ring.
 //!
-//! The rest are sampled on their own connection every [`PEAK_POLL`] from the
-//! definition to the end of the window: the `pg_wal` directory's size
-//! (`pg_ls_waldir()`), and the target's `__deltas` table, its rows and its
-//! size.
+//! The `pg_wal` directory's size (`pg_ls_waldir()`) is sampled on its own
+//! connection every [`PEAK_POLL`] from the definition to the end of the
+//! window.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -36,7 +34,7 @@ use trellis::metrics::BuildStatement;
 
 use crate::streaming::disk_tier::json_ms;
 
-/// How often [`sample_peaks`] reads the WAL directory and the delta table.
+/// How often [`sample_peaks`] reads the WAL directory.
 pub const PEAK_POLL: Duration = Duration::from_millis(250);
 
 /// Every series of one scrape, by its name and labels other than
@@ -138,15 +136,11 @@ fn bucket_quantile_ms(buckets: &[(f64, f64)], count: f64, q: f64) -> Option<f64>
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Peaks {
     pub wal_dir_bytes: i64,
-    pub deltas_rows: i64,
-    pub deltas_bytes: i64,
 }
 
-/// Samples the `pg_wal` directory and `public.<target>__deltas` every
-/// [`PEAK_POLL`] until `stop`, returning the peaks. The delta table counts
-/// as empty before the definition creates it.
-pub async fn sample_peaks(raw: RawClient, target: String, stop: Arc<AtomicBool>) -> Peaks {
-    let deltas = format!("public.{target}__deltas");
+/// Samples the `pg_wal` directory every [`PEAK_POLL`] until `stop`,
+/// returning the peaks.
+pub async fn sample_peaks(raw: RawClient, stop: Arc<AtomicBool>) -> Peaks {
     let mut peaks = Peaks::default();
     while !stop.load(Ordering::Relaxed) {
         let wal: i64 = raw
@@ -158,25 +152,6 @@ pub async fn sample_peaks(raw: RawClient, target: String, stop: Arc<AtomicBool>)
             .expect("read the WAL directory's size")
             .get(0);
         peaks.wal_dir_bytes = peaks.wal_dir_bytes.max(wal);
-        let exists: bool = raw
-            .query_one("select to_regclass($1) is not null", &[&deltas])
-            .await
-            .expect("look up the delta table")
-            .get(0);
-        if exists {
-            // A drop between the two reads is the run's own business; a
-            // failed read here only skips a sample.
-            if let Ok(row) = raw
-                .query_one(
-                    &format!("select count(*), pg_total_relation_size('{deltas}') from {deltas}"),
-                    &[],
-                )
-                .await
-            {
-                peaks.deltas_rows = peaks.deltas_rows.max(row.get(0));
-                peaks.deltas_bytes = peaks.deltas_bytes.max(row.get(1));
-            }
-        }
         tokio::time::sleep(PEAK_POLL).await;
     }
     peaks
@@ -188,8 +163,6 @@ pub struct BuildProfile {
     /// Per [`BuildStatement::ALL`]: worker-seconds, and how many statements.
     pub statements: Vec<(&'static str, f64, u64)>,
     pub rows_built: u64,
-    pub delta_rows_appended: u64,
-    pub delta_rows_merged: u64,
     pub chunk_lock_timeouts: u64,
     pub seal_refusals: u64,
     pub chunks: u64,
@@ -242,12 +215,6 @@ impl BuildProfile {
         Self {
             statements,
             rows_built: after.since(before, "trellis_build_rows_total") as u64,
-            delta_rows_appended: after
-                .since(before, "trellis_build_delta_rows_total{step=\"appended\"}")
-                as u64,
-            delta_rows_merged: after
-                .since(before, "trellis_build_delta_rows_total{step=\"merged\"}")
-                as u64,
             chunk_lock_timeouts: after.since(before, "trellis_build_chunk_lock_timeouts_total")
                 as u64,
             seal_refusals: after.since(before, "trellis_seal_refused_total") as u64,
@@ -282,14 +249,11 @@ impl BuildProfile {
         format!(
             "\"build_rows\":{},\"build_worker_secs\":{total:.3},\
              \"build_worker_secs_per_10k_rows\":{},\"build_statements\":{{{classes}}},\
-             \"build_delta_rows_appended\":{},\"build_delta_rows_merged\":{},\
              \"build_chunk_lock_timeouts\":{},\"seal_refusals\":{},\"build_chunks\":{},\
              \"build_chunk_ms_p50\":{},\"build_chunk_ms_p99\":{},\"build_chunk_ms_max\":{},\
-             \"pg_wal_peak_bytes\":{},\"deltas_peak_rows\":{},\"deltas_peak_bytes\":{}",
+             \"pg_wal_peak_bytes\":{}",
             self.rows_built,
             json_ms(self.per_10k(total)),
-            self.delta_rows_appended,
-            self.delta_rows_merged,
             self.chunk_lock_timeouts,
             self.seal_refusals,
             self.chunks,
@@ -297,8 +261,6 @@ impl BuildProfile {
             json_ms(self.chunk_p99_ms),
             json_ms(self.chunk_max_ms),
             self.peaks.wal_dir_bytes,
-            self.peaks.deltas_rows,
-            self.peaks.deltas_bytes,
         )
     }
 
@@ -314,8 +276,7 @@ impl BuildProfile {
             .join(", ");
         format!(
             "build: {} rows, {:.1} worker-s ({} per 10k rows: {top}); {} chunks p50/p99/max \
-             {}/{}/{} ms, {} lock timeouts; deltas {} appended / {} merged, peak {} rows; \
-             seal refusals {}; pg_wal peak {:.0} MB",
+             {}/{}/{} ms, {} lock timeouts; seal refusals {}; pg_wal peak {:.0} MB",
             self.rows_built,
             total,
             json_ms(self.per_10k(total)),
@@ -324,9 +285,6 @@ impl BuildProfile {
             json_ms(self.chunk_p99_ms),
             json_ms(self.chunk_max_ms),
             self.chunk_lock_timeouts,
-            self.delta_rows_appended,
-            self.delta_rows_merged,
-            self.peaks.deltas_rows,
             self.seal_refusals,
             self.peaks.wal_dir_bytes as f64 / 1e6,
         )
@@ -359,7 +317,6 @@ trellis_build_chunk_seconds_max 2.5
 trellis_build_statement_seconds_sum{class=\"chunk_write\"} 10.5
 trellis_build_statement_seconds_count{class=\"chunk_write\"} 101
 trellis_build_rows_total 20100
-trellis_build_delta_rows_total{step=\"appended\"} 300
 trellis_seal_refused_total 2
 ";
 
@@ -369,13 +326,13 @@ trellis_seal_refused_total 2
     fn the_instance_label_is_not_part_of_a_series_key() {
         let snapshot = MetricsSnapshot::parse(
             "trellis_build_rows_total{trellis_instance=\"db/trellis\"} 7\n\
-             trellis_build_delta_rows_total{trellis_instance=\"db/trellis\",step=\"merged\"} 3\n\
+             trellis_build_statement_seconds_count{trellis_instance=\"db/trellis\",class=\"plan\"} 3\n\
              trellis_build_chunk_seconds_bucket{trellis_instance=\"db/trellis\",le=\"0.5\"} 2\n\
              trellis_instance_up{trellis_instance=\"db/trellis\"} 1\n",
         );
         assert_eq!(snapshot.get("trellis_build_rows_total"), 7.0);
         assert_eq!(
-            snapshot.get("trellis_build_delta_rows_total{step=\"merged\"}"),
+            snapshot.get("trellis_build_statement_seconds_count{class=\"plan\"}"),
             3.0
         );
         assert_eq!(
@@ -394,7 +351,6 @@ trellis_seal_refused_total 2
         );
         assert_eq!(p.rows_built, 20_000);
         assert_eq!(p.chunks, 100);
-        assert_eq!(p.delta_rows_appended, 300);
         assert_eq!(p.seal_refusals, 2);
         let write = p
             .statements

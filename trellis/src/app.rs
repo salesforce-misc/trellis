@@ -2049,17 +2049,15 @@ pub struct DefinitionStatus {
     /// - or the drain halted on it (issue #663), with
     ///   [`CaptureFailureKind::Halt`]: a failure no retry or quarantine gets
     ///   past (a key the drain can't use, a propagation wave past the hop
-    ///   bound, an aggregate off the ledger) reached it, so the drain paused
+    ///   bound, an aggregate the group basis can't apply) reached it, so the drain paused
     ///   it, everything else reading what it reads, and everything
     ///   downstream of them, and drained the rest. Fix the cause and resume
     ///   the definition, which rebuilds it and clears this;
-    /// - or its Re-derive build's group-delta merge halted on it (issue
-    ///   #901), also with [`CaptureFailureKind::Halt`]: the merge into its
-    ///   target was refused, or kept failing in a way no retry gets past (a
-    ///   check or deferred constraint on the target that a merged group
-    ///   breaks), so it paused, with everything downstream of its target.
-    ///   `source_table` names the target. Fix the cause and resume it, which
-    ///   rebuilds it and clears this.
+    /// - or its Re-derive build couldn't start (issue #986), also with
+    ///   [`CaptureFailureKind::Halt`]: a failure no retry gets past (its
+    ///   ledger table was dropped, say), so it paused, with everything
+    ///   downstream of its target. `source_table` names the target. Fix the
+    ///   cause and resume it, which rebuilds it and clears this.
     ///
     /// - or Trellis's capture of a table it reads was changed outside
     ///   Trellis, with [`CaptureFailureKind::Disruption`] (#707, #1181): a
@@ -2164,7 +2162,7 @@ pub struct CaptureFailure {
     pub kind: CaptureFailureKind,
     /// The qualified captured table. For a halt, the table (or tables,
     /// joined with `", "`) the halting failure named, or the target, for an
-    /// aggregate off the ledger or a build's merge that kept failing.
+    /// aggregate the group basis can't apply or a build that couldn't start.
     pub source_table: String,
     /// The columns the failure is about: the renamed or dropped ones the
     /// definition reads (every missing column of the table when a
@@ -2189,7 +2187,7 @@ pub enum CaptureFailureKind {
     /// was already frozen (an operator's `PAUSE`), which stays the
     /// operator's to resume.
     Capture,
-    /// The drain, or a Re-derive build's group-delta merge, halted on the
+    /// The drain, or a Re-derive build's start, halted on the
     /// definition: a failure no retry or quarantine gets past reached it, so
     /// it was paused with the rest of the failure's closure
     /// (`staging::halt`).

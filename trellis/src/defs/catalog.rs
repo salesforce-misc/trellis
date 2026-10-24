@@ -164,35 +164,6 @@ pub enum CatalogError {
         /// The source's key columns now.
         source_key: Vec<String>,
     },
-    /// An aggregate's group-delta table has columns other than the
-    /// `__dc`/`__ds`/`__out` ones define would create now. Define chose them
-    /// when it created the table, and a field's classification (incremental
-    /// or recompute-only) has since moved with its argument's type: a `SUM`
-    /// or `AVG` over `numeric` that became `double precision` (or back, or
-    /// over `integer`) did (#857). Its rebuild would write NULL into the sum
-    /// column the table keeps, or find none to fill, and poison every key it
-    /// touches. [`check_deltas_shape`] refuses any difference in those
-    /// columns, rather than decide which are safe; the repair is to drop
-    /// the definition and define it again. [`CatalogError::AggregateDeltasTableMissing`]
-    /// is the table's absence.
-    AggregateDeltasShapeChanged {
-        target: String,
-        /// The table's `__dc`/`__ds`/`__out` columns.
-        have: Vec<String>,
-        /// The ones define would create now.
-        want: Vec<String>,
-    },
-    /// An aggregate's group-delta table doesn't exist, though define creates
-    /// one for the definition (#967). Only Trellis writes its tables, so an
-    /// operator dropped it; a rebuild would write its chunks into a table
-    /// that isn't there. [`check_deltas_shape`] refuses it, and Trellis
-    /// doesn't re-create the table: the repair is to drop the definition and
-    /// define it again.
-    AggregateDeltasTableMissing {
-        target: String,
-        /// The table, schema-qualified.
-        deltas_table: String,
-    },
     /// A `GROUP BY` or `JOIN` target's source lacks the index its `self_check`
     /// walk pages by (#1167, `super::source_index`). Refused by define and by
     /// a whole-transform resume, unless the definition says `WITHOUT SOURCE
@@ -203,7 +174,7 @@ pub enum CatalogError {
         missing: Vec<super::source_index::SourceIndex>,
     },
     /// A definition's ledger table doesn't exist, though define creates one
-    /// for every definition, 1-1 or aggregate (#986). Only Trellis writes its
+    /// for every 1-1 definition (#986). Only Trellis writes its
     /// tables, so an operator dropped it; the build's `start` reads it and
     /// fails, and the apply writes into it. [`check_ledger_table`] refuses it,
     /// and Trellis doesn't re-create the table: the repair is to drop the
@@ -223,8 +194,8 @@ pub enum CatalogError {
     /// A definition's target schema is a Trellis catalog schema (#979): this
     /// instance's own (`own`), which target tables stay out of so they can't
     /// collide with Trellis's tables, or a schema holding another instance's
-    /// `trellis_instance` table. The target, its ledger and its group-delta
-    /// table would live there, so the other instance's uninstall (`drop
+    /// `trellis_instance` table. The target and a 1-1 target's ledger would
+    /// live there, so the other instance's uninstall (`drop
     /// schema ... cascade`) would drop them, and a dump of one instance's
     /// schema would carry the other's data. Refused by define, and by a
     /// resume ([`revalidate`]) of a definition whose target schema has since
@@ -459,8 +430,6 @@ impl CatalogError {
             // `RowSecurityApplies`: the fix is a grant.
             CatalogError::TableNotAccessible { .. } => ErrorCode::Validation,
             CatalogError::SourceKeyChanged { .. } => ErrorCode::Validation,
-            CatalogError::AggregateDeltasShapeChanged { .. } => ErrorCode::Validation,
-            CatalogError::AggregateDeltasTableMissing { .. } => ErrorCode::Validation,
             CatalogError::SourceIndexMissing { .. } => ErrorCode::Validation,
             CatalogError::LedgerTableMissing { .. } => ErrorCode::Validation,
             CatalogError::TargetTableMissing { .. } => ErrorCode::Validation,
@@ -502,8 +471,6 @@ impl CatalogError {
 impl CatalogError {
     /// Whether this is define's own refusal of the schema as it stands, as
     /// opposed to a refusal only a resume makes ([`CatalogError::SourceKeyChanged`],
-    /// [`CatalogError::AggregateDeltasShapeChanged`],
-    /// [`CatalogError::AggregateDeltasTableMissing`],
     /// [`CatalogError::LedgerTableMissing`],
     /// [`CatalogError::TargetTableMissing`]), where define would
     /// accept the definition and the repair is to drop it and define it again.
@@ -518,8 +485,6 @@ impl CatalogError {
         !matches!(
             self,
             CatalogError::SourceKeyChanged { .. }
-                | CatalogError::AggregateDeltasShapeChanged { .. }
-                | CatalogError::AggregateDeltasTableMissing { .. }
                 | CatalogError::LedgerTableMissing { .. }
                 | CatalogError::TargetTableMissing { .. }
                 | CatalogError::TargetInCatalogSchema { .. }
@@ -592,23 +557,6 @@ impl fmt::Display for CatalogError {
                 source_key.join(", "),
                 target_key.join(", ")
             ),
-            CatalogError::AggregateDeltasShapeChanged { target, have, want } => write!(
-                f,
-                "the group-delta table of {target} has columns ({}), but define would now \
-                 create ({}), because an aggregate field's argument changed type. Trellis \
-                 doesn't re-shape it: `DROP TRANSFORM` and define it again",
-                have.join(", "),
-                want.join(", ")
-            ),
-            CatalogError::AggregateDeltasTableMissing {
-                target,
-                deltas_table,
-            } => write!(
-                f,
-                "the group-delta table of {target}, {deltas_table}, doesn't exist, but define \
-                 would create one. Trellis doesn't re-create it: `DROP TRANSFORM` and define it \
-                 again"
-            ),
             CatalogError::SourceIndexMissing { target, missing } => {
                 write!(f, "{}", super::source_index::refusal_text(target, missing))
             }
@@ -642,8 +590,7 @@ impl fmt::Display for CatalogError {
                         f,
                         "target {target} is in schema \"{schema}\", which holds another Trellis \
                          instance's catalog (it has a `trellis_instance` table): that \
-                         instance's uninstall would drop the target, its ledger and its \
-                         group-delta table"
+                         instance's uninstall would drop the target and its ledger"
                     )?;
                 }
                 write!(
@@ -774,8 +721,6 @@ impl std::error::Error for CatalogError {
             CatalogError::SourceTableNotFound(_) => None,
             CatalogError::TableNotAccessible { .. } => None,
             CatalogError::SourceKeyChanged { .. } => None,
-            CatalogError::AggregateDeltasShapeChanged { .. } => None,
-            CatalogError::AggregateDeltasTableMissing { .. } => None,
             CatalogError::SourceIndexMissing { .. } => None,
             CatalogError::LedgerTableMissing { .. } => None,
             CatalogError::TargetTableMissing { .. } => None,
@@ -1123,8 +1068,11 @@ pub async fn install_definition(
                 .await
                 .map_err(CatalogError::Ddl)?;
             reject_unkeyed_source(&**pool.get().await?, &qualified_source, &def).await?;
-            ddl::aggregate_target_table_ddl(pool, &def, target_schema, source_columns)
-                .await
+            // #1096 decision 1: an aggregate outside the admitted set is
+            // refused by family, before the DDL (which only renders what the
+            // group basis keeps).
+            check_aggregate_admitted(&**pool.get().await?, &def, &qualified_source).await?;
+            ddl::aggregate_target_table_ddl(&def, target_schema, source_columns)
                 .map_err(CatalogError::Ddl)?
         }
     };
@@ -3654,11 +3602,9 @@ async fn create_definition_inner(
     // never an aggregate's, so it never routes here.
     let shape = crate::staging::group_basis::route(&def, source_columns);
     // Define's refusals and the routing agree: every aggregate define
-    // accepts is on the group basis, never silently on the ledger.
+    // accepts is on the group basis.
     debug_assert!(
-        shape.is_some()
-            || !crate::staging::group_basis::enabled()
-            || !matches!(def.key_space, KeySpace::Aggregate { .. }),
+        shape.is_some() || !matches!(def.key_space, KeySpace::Aggregate { .. }),
         "an admitted aggregate the group basis doesn't route: {}",
         def.target
     );
@@ -3731,22 +3677,16 @@ async fn create_target_in_txn(
             format!("{schema}.{taken}")
         },
     };
-    // `ddl` also creates the target's ledger (#623 D2) and, for a
-    // ledger-routed aggregate, its group-delta table (#625 F1), which Trellis
-    // owns just the same, so their names have to be free too.
+    // `ddl` also creates a 1-1 target's ledger (#623 D2), which Trellis owns
+    // just the same, so its name has to be free too.
     let ledger = super::ledger::ledger_table_name(table);
-    let deltas = super::ledger::deltas_table_name(table);
     let taken: Option<String> = txn
         .query_opt(
             "select c.relname::text from pg_catalog.pg_class c \
              join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
              where n.nspname = $1 and c.relname = any($2) \
              order by c.relname = $3 desc limit 1",
-            &[
-                &schema,
-                &[table, ledger.as_str(), deltas.as_str()].as_slice(),
-                &table,
-            ],
+            &[&schema, &[table, ledger.as_str()].as_slice(), &table],
         )
         .await?
         .map(|row| row.get(0));
@@ -4334,18 +4274,13 @@ impl JoinSides {
 /// ([`super::validate::validate_aggregate_admitted`]), against the source's
 /// live columns. Define makes it in its transaction, and a resume's
 /// [`revalidate`] again, so a summed column re-typed since (to an
-/// unconstrained `numeric`, or a float) refuses the resume. Nothing is
-/// refused while a test has forced the group-basis knob off.
+/// unconstrained `numeric`, or a float) refuses the resume.
 async fn check_aggregate_admitted(
     client: &impl GenericClient,
     def: &TransformDef,
     qualified_source: &str,
 ) -> Result<(), CatalogError> {
-    // A test that forced the group-basis knob off keeps every aggregate on
-    // the ledger, which takes them all (`staging::group_basis`, "The knob").
-    if !matches!(def.key_space, KeySpace::Aggregate { .. })
-        || !crate::staging::group_basis::enabled()
-    {
+    if !matches!(def.key_space, KeySpace::Aggregate { .. }) {
         return Ok(());
     }
     let columns = join_columns_of(client, qualified_source).await?;
@@ -4678,8 +4613,8 @@ async fn side_read_table(
 /// Refuses `target` (`schema.table`) with
 /// [`CatalogError::TargetInCatalogSchema`] when its schema is
 /// `catalog_schema`, this instance's catalog schema, or holds a
-/// `trellis_instance` table, another instance's (#979). The ledger and
-/// group-delta tables live in the target's schema, so this covers them too.
+/// `trellis_instance` table, another instance's (#979). A 1-1 target's
+/// ledger lives in the target's schema, so this covers it too.
 /// `pg_class`, not `information_schema`, which hides a table the role has no
 /// privilege on, as [`crate::identity`]'s scan does.
 async fn reject_target_in_catalog_schema(
@@ -4735,8 +4670,7 @@ pub(crate) struct Revalidated {
 /// One check is a resume's own: a 1-1 target is keyed by the source key
 /// define found, so a source whose key has since been redefined fails with
 /// [`CatalogError::SourceKeyChanged`], whose only repair is to drop and
-/// define again. [`check_deltas_shape`] is a second, which only a
-/// whole-transform resume makes.
+/// define again.
 pub(crate) async fn revalidate(
     txn: &tokio_postgres::Transaction<'_>,
     schema: &str,
@@ -4936,10 +4870,9 @@ pub(crate) async fn record_join_columns(
     Ok(())
 }
 
-/// Refuses a whole-transform resume of a definition, 1-1 or aggregate, whose
-/// ledger table doesn't exist (#986). Define creates one for every
-/// definition ([`ddl::target_table_ddl`], [`ddl::aggregate_target_table_ddl`]),
-/// and the build's `start` reads it, so a resume that passed would leave
+/// Refuses a whole-transform resume of a 1-1 definition whose ledger table
+/// doesn't exist (#986). Define creates one for every 1-1 definition
+/// ([`ddl::target_table_ddl`]), and the build's `start` reads it, so a resume that passed would leave
 /// every staging-worker pass failing on it until the definition was paused
 /// or dropped. Refusing before the resume changes anything leaves the
 /// definition paused with its target as it was
@@ -5030,11 +4963,9 @@ pub(crate) async fn check_target_table(
 /// A whole-transform resume's checks that the target exists
 /// ([`check_target_table`]), that the source indexes the definition needs
 /// exist ([`check_source_index`]), and that the tables Trellis keeps beside
-/// it are what define would create now: the ledger exists
-/// ([`check_ledger_table`]) and an aggregate's group-delta table exists with
-/// the columns define would give it ([`check_deltas_shape`]). An aggregate
-/// the group basis takes, like a `JOIN`, keeps only hidden tables that are
-/// fully derived: the resume drops and recreates them
+/// it are what define would create now: a 1-1 target's ledger exists
+/// ([`check_ledger_table`]). An aggregate or a `JOIN` keeps only hidden
+/// tables that are fully derived: the resume drops and recreates them
 /// ([`recreate_group_table`]), so there's nothing to check.
 pub(crate) async fn check_owned_tables(
     txn: &tokio_postgres::Transaction<'_>,
@@ -5043,108 +4974,10 @@ pub(crate) async fn check_owned_tables(
 ) -> Result<(), CatalogError> {
     check_target_table(txn, definition).await?;
     check_source_index(txn, definition, revalidated).await?;
-    // A JOIN keeps no ledger, and its hidden tables are fully derived: the
-    // resume drops and recreates them (#1107), so there's nothing to check.
-    if revalidated.join.is_some() {
+    if !matches!(definition.def.key_space, KeySpace::OneToOne) {
         return Ok(());
     }
-    // A group-basis aggregate keeps no ledger or group-delta table (#1222),
-    // only its hidden partials table, which the resume recreates (#1101).
-    // Routed on the live columns, as define would: a ledger aggregate whose
-    // summed column was re-typed into what the group basis takes gets one.
-    if crate::staging::group_basis::route(&definition.def, &revalidated.source_columns).is_some() {
-        return Ok(());
-    }
-    check_ledger_table(txn, definition).await?;
-    check_deltas_shape(txn, definition, revalidated).await
-}
-
-/// Refuses a whole-transform resume of an aggregate whose group-delta table
-/// isn't the one define would create now (#857, #967).
-///
-/// - **The table has other `__dc`, `__ds` or `__out` columns.** A field's
-///   classification follows its argument's type, so a `SUM` or `AVG`
-///   argument that moved between an exact type (`integer`, `numeric`) and
-///   floating point leaves the table with a running-sum column the rebuild
-///   can't fill, or without one it needs. Any difference, including the
-///   recompute columns, is refused
-///   ([`CatalogError::AggregateDeltasShapeChanged`]) rather than judged.
-/// - **The table doesn't exist** though [`route`](crate::staging::ledger::route)
-///   takes the definition, so define creates one
-///   ([`CatalogError::AggregateDeltasTableMissing`]). The rebuild writes its
-///   chunks into it.
-///
-/// The missing table is refused here, not by `self_check`: `self_check`
-/// audits 1-1 targets only (it compares no aggregate), and the table is
-/// only a problem to an operation that writes into it, which is this
-/// resume's rebuild. Refusing before the resume changes anything leaves the
-/// definition paused with its target as it was. A definition `route` doesn't
-/// take expects no table, so a missing one is nothing to compare.
-///
-/// `route` takes every aggregate [`revalidate`] accepts and define created.
-/// Its other refusals (a missing column, a type it can't infer) are
-/// [`validate`]'s too, and the one `validate`
-/// doesn't make, an alias expansion past the build's size budget
-/// ([`crate::defs::backfill::substituted_field_exprs`]), depends on the
-/// definition's text alone, and define's DDL refuses it
-/// ([`ddl::aggregate_target_table_ddl`] makes the same substitution). So
-/// `route` returning `None` here is only defensive: it wants no table, as
-/// define would, rather than panicking.
-///
-/// Only a whole-transform resume calls it ([`Revalidated`] is its input): a
-/// column resume of an aggregate field builds nothing and never reads the
-/// table.
-pub(crate) async fn check_deltas_shape(
-    txn: &tokio_postgres::Transaction<'_>,
-    definition: &Definition,
-    revalidated: &Revalidated,
-) -> Result<(), CatalogError> {
-    if !matches!(definition.def.key_space, KeySpace::Aggregate { .. }) {
-        return Ok(());
-    }
-    let want = crate::staging::ledger::route(&definition.def, &revalidated.source_columns)
-        .map(|shape| super::ledger::delta_shape_columns(&shape.summed(), shape.recomputes()));
-    let (target_schema, target_bare) = definition
-        .target_table
-        .split_once('.')
-        .unwrap_or(("", definition.target_table.as_str()));
-    let deltas = format!(
-        "{target_schema}.{}",
-        super::ledger::deltas_table_name(target_bare)
-    );
-    let columns: Vec<String> = txn
-        .query(
-            "select attname::text from pg_catalog.pg_attribute \
-             where attrelid = pg_catalog.to_regclass($1) \
-               and attnum > 0 and not attisdropped",
-            &[&ddl::regclass_arg(&deltas)],
-        )
-        .await?
-        .into_iter()
-        .map(|row| row.get(0))
-        .collect();
-    if columns.is_empty() {
-        return match want {
-            Some(_) => Err(CatalogError::AggregateDeltasTableMissing {
-                target: definition.target_table.clone(),
-                deltas_table: deltas,
-            }),
-            None => Ok(()),
-        };
-    }
-    let have: std::collections::BTreeSet<String> = columns
-        .into_iter()
-        .filter(|c| super::ledger::is_delta_shape_column(c))
-        .collect();
-    let want = want.unwrap_or_default();
-    if have == want {
-        return Ok(());
-    }
-    Err(CatalogError::AggregateDeltasShapeChanged {
-        target: definition.target_table.clone(),
-        have: have.into_iter().collect(),
-        want: want.into_iter().collect(),
-    })
+    check_ledger_table(txn, definition).await
 }
 
 /// The relationships `def` reads through: none, since no definition reads
@@ -6181,9 +6014,8 @@ pub async fn source_table_version(
     Ok(row.map(|row| row.get(0)))
 }
 
-/// Definition `id`'s persisted source column types, on `client` (#623 D3:
-/// the orphan sweep's ledger routing, `staging::ledger::route`, in the
-/// discharge's transaction). Empty for an id with none.
+/// Definition `id`'s persisted source column types, on `client` (an edit's
+/// and a re-type's reads of what was recorded). Empty for an id with none.
 pub(crate) async fn source_columns_in(
     client: &impl GenericClient,
     id: i64,
@@ -6421,7 +6253,7 @@ pub async fn definition_by_target(
 /// Filtered to [`KeySpace::OneToOne`] downstream definitions only — column-
 /// level pause/cascade/resume is explicitly scoped to the 1-1 tier (see this
 /// module's callers in `staging::quarantine` and that module's "Column-level
-/// fuse" section doc comment: the aggregate ledger path has no notion of
+/// fuse" section doc comment: the group basis has no notion of
 /// `column_status` at all). Without this filter, a
 /// downstream [`KeySpace::Aggregate`] transform whose field happens to read a
 /// just-paused upstream column would get a `column_status` row cascaded onto

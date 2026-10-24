@@ -96,10 +96,9 @@
 //! build it starts runs a chunk, and the drain keeps up with every seal, so
 //! races that need a page held mid-step never get a window: a build chunk
 //! reading an entry a page has locked but not yet written
-//! (`chunk_without_entry_lock`), a page reading an entry another holds
-//! (`skip_ledger_lock`), and a segment draining past an older one whose page
-//! hasn't taken its entry lock yet, so that a tombstone the older change
-//! needs can be collected (`early_tombstone_gc`).
+//! (`chunk_without_entry_lock`), and a segment draining past an older one
+//! whose page hasn't taken its entry lock yet, so that a tombstone the older
+//! change needs can be collected (`early_tombstone_gc`).
 //!
 //! The cooling-backfill tier (#734) draws `generate::cooling_backfill_case`: a
 //! cooling-key case whose cooling table a `GROUP BY` definition reads rather
@@ -108,9 +107,8 @@
 //! writes. It runs under the steady-load tier's stall, with the lanes paced
 //! from each burst's start (`SteadyLoad::pace_from_start`), so the
 //! backfill's catch-up lands among writes still coming in. It is a sweep tier
-//! only, like the steady-load one. It was built for `lsn_only_skip`, which it
-//! doesn't gate (see "Planted ordering bugs" below), and it gates the plants
-//! a backfill under load reaches.
+//! only, like the steady-load one, and it gates the plants a backfill under
+//! load reaches.
 //!
 //! The stall is process-wide, so neither of these two tiers has a property
 //! test: they run only in [`planted_bugs_are_caught`]'s sweep processes, one
@@ -131,14 +129,10 @@
 //! the plants whose shapes it runs, and says why it doesn't gate the others
 //! (`SweepTier::not_gated`): the group-basis plants that need an absolute
 //! write racing pages are the mid-burst, steady-load and cooling-backfill
-//! tiers'; the `JOIN` plants are the `JOIN` tier's; and with the group basis
-//! on (the default) the ledger's plants reach nothing, so a sweep gates them
-//! only with `TRELLIS_DEV_GROUP_BASIS=0`. `lsn_only_skip` is no tier's: the
-//! engine's own ordering (the discharge's xmin fence, the ring's seal gate,
-//! oldest-first claims) closes its window unless a drain order is forced by
-//! hand, so the deterministic pin
-//! `a_change_the_rederive_read_is_not_applied_again_aggregate`
-//! (`trellis/tests/ledger_interleavings.rs`) gates it (#734).
+//! tiers'; the `JOIN` plants are the `JOIN` tier's; and the 1-1 plants
+//! `early_tombstone_gc` and `chunk_without_entry_lock` are no tier's, since
+//! with every aggregate on the group basis no schedule opens their windows:
+//! deterministic pins gate them (`ONE_TO_ONE_PINNED`).
 //! `trellis/src/plant.rs`'s module doc says how to add a plant.
 //!
 //! # A disk-backed cluster
@@ -162,7 +156,7 @@
 //! the mid-burst actions nor concurrency. It is #494's shape (a key passing
 //! through a group inside one folded batch), which disk commit timing makes
 //! common. The old aggregate path diverged on it; [`group_moves_converge_on_disk`]
-//! is its regression pin, which #623 D5's ledger passes.
+//! is its regression pin.
 //!
 //! # Pinned cases
 //!
@@ -1014,10 +1008,9 @@ fn group_moves() -> generative::model::Program {
 /// above that commit. The key then left `z` above the horizon, and both
 /// moves folded into one later batch as `a -> b`, so nothing named `z` and
 /// its count was never taken back. On disk, the drain runs far enough behind
-/// the source that most group writes were such re-derives. The ledger has
-/// no horizons: the key's entry names `z`, so leaving it takes `z`'s count
-/// back. #623 D9 took the exit check on disk: the pre-ledger engine (#623
-/// D3's base) diverged in 17 of 20 attempts, the ledger in none of 60.
+/// the source that most group writes were such re-derives. The group basis
+/// has no horizons: a change carries its old and new images, so leaving `z`
+/// takes `z`'s count back.
 ///
 /// Runs [`group_moves`] `ATTEMPTS` times, each on a fresh database, in
 /// bursts of 500 ops sealed every 85ms, and fails if any attempt diverged,
@@ -1366,12 +1359,6 @@ fn hot_key_case_3_11_loads() {
 /// pre-locks (#326's group pre-lock). #623 D5 removed both the horizons and
 /// the pre-lock.
 ///
-/// #623 D9's exit check, four processes at once: the pre-ledger engine (D3's
-/// base) failed 1 of 360 attempts on tmpfs (a `ConvergenceTimeout`; 0 of the
-/// first 120), with 2,868 `deadlock detected` lines in the Postgres logs.
-/// The ledger failed none of 120 on tmpfs and none of 100 on disk, with no
-/// deadlocks.
-///
 /// Runs the case `GENERATIVE_PIN_ATTEMPTS` times, each on a fresh database
 /// with 8 drain workers and a 112ms seal, and fails if any attempt diverged
 /// or didn't converge. Unset, it returns at once:
@@ -1467,133 +1454,31 @@ const COOLING_KEY_MISSES: &[&str] = &[];
 /// [`STEADY_LOAD_MISSES`]).
 const HOT_KEY_BASED_MISSES: &[&str] = &[STALE_ONE_TO_ONE_MISS];
 
-/// `lsn_only_skip` (#623 D3, ADR-0002 I2), which no tier gates: a
-/// deterministic pin does (#734). Re-applying a change whose image the entry
-/// already holds is a no-op, so the plant diverges only when a key's last
-/// change is folded into a page's Re-derive, an older change to the key then
-/// drains after that page, and nothing rewrites the key. The engine closes
-/// that window on purpose: the discharge's xmin fence (#431) waits for every
-/// page in flight before it stages a catch-up, the ring's seal gate holds a
-/// catch-up's segment behind an older slow one, and claims go oldest-first
-/// and coalesce, folding an unclaimed older segment into the catch-up. Only a
-/// by-hand drain order breaks all three. The cooling-key, mid-burst and
-/// steady-load tiers caught it in 0, 1 and 0 of 44 to 48 cases each, and the
-/// cooling-backfill tier, built for it, in none of about 90 instrumented
-/// ones.
-const LSN_ONLY_SKIP_PIN: (&str, &str) = (
-    "lsn_only_skip",
-    "its window opens only when an ordering the engine enforces is broken by \
-     hand (the discharge's xmin fence, the ring's seal gate, oldest-first \
-     coalescing claims), which no random stall does; the deterministic pin \
-     `a_change_the_rederive_read_is_not_applied_again_aggregate` \
-     (trellis/tests/ledger_interleavings.rs) gates it (#734)",
-);
-
-/// The steady-load tier's plants, which a tier without its load doesn't
-/// gate (#720, #725). The counts are on main after #623 D5.
-const BUILD_UNDER_LOAD: (&str, &str) = (
-    "chunk_without_entry_lock",
-    "its race needs a page holding an existing entry between its entry lock and \
-     its write while a build chunk reads that entry, a window of about a \
-     millisecond that flat-out bursts written before the build starts never \
-     open (the mid-burst tier caught it in 0 of 48 cases, though it fired in \
-     42); the steady-load tier gates it",
-);
-const OUT_OF_ORDER_DRAIN: (&str, &str) = (
-    "early_tombstone_gc",
-    "it fires only when a segment drains past an older one, and flat-out \
-     bursts drain every segment before the next seals, so it fires in at most \
-     1 of 48 cases (#725); the steady-load tier's entry-lock stall gates it",
-);
-const HELD_ENTRY: (&str, &str) = (
-    "skip_ledger_lock",
-    "its race needs a page between its entry lock and its write while another \
-     page reads the same entry; flat out, that window is about a millisecond, \
-     and the hot-key and mid-burst tiers caught it in 0 and 2 of 48 cases \
-     though it fired in all of them; the steady-load tier's entry-lock stall \
-     gates it",
-);
-
-/// The cooling-key and hot-key tiers also run no mid-burst install or
-/// resume, so a build there runs only when an up-front definition's build
-/// starts after the first writes.
-const NO_MID_BURST_BUILD: (&str, &str) = (
-    "merge_without_delete",
-    "no mid-burst install or resume, so a build runs only when an up-front \
-     definition's build starts after the first writes (in 0 and 3 of 48 \
-     cases in the cooling-key and hot-key tiers); the mid-burst and \
-     steady-load tiers gate it",
-);
-
-const COOLING_KEY_NOT_GATED: &[(&str, &str)] = &[
-    BUILD_UNDER_LOAD,
-    NO_MID_BURST_BUILD,
-    OUT_OF_ORDER_DRAIN,
-    LSN_ONLY_SKIP_PIN,
-];
-const HOT_KEY_NOT_GATED: &[(&str, &str)] = &[
-    BUILD_UNDER_LOAD,
-    NO_MID_BURST_BUILD,
-    OUT_OF_ORDER_DRAIN,
-    HELD_ENTRY,
-    LSN_ONLY_SKIP_PIN,
-];
-const MID_BURST_NOT_GATED: &[(&str, &str)] = &[
-    BUILD_UNDER_LOAD,
-    OUT_OF_ORDER_DRAIN,
-    HELD_ENTRY,
-    LSN_ONLY_SKIP_PIN,
-];
+const COOLING_KEY_NOT_GATED: &[(&str, &str)] = &[];
+const HOT_KEY_NOT_GATED: &[(&str, &str)] = &[];
+const MID_BURST_NOT_GATED: &[(&str, &str)] = &[];
 
 /// The cooling-backfill tier's programs are the hot table and the cooling
 /// table, each read by a `GROUP BY` definition, and install or resume
 /// nothing mid-burst (#734). It gates the plants a `request_backfill` under
-/// load reaches, and not the 1-1 or build plants, nor `lsn_only_skip`.
-const COOLING_BACKFILL_NOT_GATED: &[(&str, &str)] = &[
-    (
-        "stale_one_to_one_write",
-        "it needs a 1-1 definition, and the tier's programs have none (0 of 48 \
-         cases fired it); the cooling-key tier gates it",
-    ),
-    (
-        "chunk_without_entry_lock",
-        "it needs a build chunk reading an entry while a page holds it, and the \
-         tier installs and resumes nothing mid-burst, so the only builds are the \
-         up-front definitions' at the start of the run (a `request_backfill`'s \
-         catch-up stages Recomputes for pages, not chunks); it fired in 1 of 48 \
-         cases and was caught in 0; the steady-load tier gates it",
-    ),
-    (
-        "merge_without_delete",
-        "it needs a build with group deltas to merge, and the tier installs and \
-         resumes nothing mid-burst, so the only builds are the up-front \
-         definitions' at the start of the run (a `request_backfill`'s catch-up \
-         is no build); it fired in 0 of 48 cases; the mid-burst and steady-load \
-         tiers gate it",
-    ),
-    LSN_ONLY_SKIP_PIN,
-];
-const STEADY_LOAD_NOT_GATED: &[(&str, &str)] = &[LSN_ONLY_SKIP_PIN];
+/// load reaches, and not the 1-1 or build plants.
+const COOLING_BACKFILL_NOT_GATED: &[(&str, &str)] = &[(
+    "stale_one_to_one_write",
+    "it needs a 1-1 definition, and the tier's programs have none (0 of 48 \
+     cases fired it); the cooling-key tier gates it",
+)];
+const STEADY_LOAD_NOT_GATED: &[(&str, &str)] = &[];
 
-/// Why no concurrent tier gates the ledger's plants while the group basis
-/// is on: with the knob on (the default since #1355) define routes every
-/// aggregate to the group basis, so the ledger keeps nothing they could
-/// break. With `TRELLIS_DEV_GROUP_BASIS=0` the tiers gate them as before, and
-/// the group basis's plants are the ones left out.
-const LEDGER_WITH_THE_GROUP_BASIS_ON: &str = "the ledger takes no aggregate while the group basis is on (the default, #1355); run \
-     the sweep with TRELLIS_DEV_GROUP_BASIS=0 to gate it until #1105 deletes the ledger";
-const GROUP_BASIS_WITH_THE_KNOB_OFF: &str =
-    "TRELLIS_DEV_GROUP_BASIS=0 puts every aggregate on the ledger, so nothing reaches it";
-/// The 1-1 plants no tier gates while the group basis is on: with the
-/// ledger taking no aggregate, neither has a window a random schedule
-/// opens, and each is pinned by deterministic tests instead.
-const ONE_TO_ONE_PINNED_WITH_THE_GROUP_BASIS_ON: &[(&str, &str)] = &[
+/// The 1-1 plants no tier gates: with every aggregate on the group basis,
+/// neither has a window a random schedule opens, and each is pinned by
+/// deterministic tests instead.
+const ONE_TO_ONE_PINNED: &[(&str, &str)] = &[
     (
         "early_tombstone_gc",
         "it fires only when a segment drains past an older one, and with the group \
-         basis on no tier's drain does: it fired in 0 of 48 cases in each of the \
+         basis no tier's drain does: it fired in 0 of 48 cases in each of the \
          steady-load and cooling-backfill tiers on 42545471 (2026-10-23); the \
-         ledger_interleavings pins exp2_9_gc_waits_for_the_older_update_one_to_one, \
+         one_to_one_ledger_interleavings pins exp2_9_gc_waits_for_the_older_update_one_to_one, \
          an_out_of_order_drain_holds_gc_back_one_to_one and \
          gc_under_a_concurrent_reinsert_one_to_one gate it",
     ),
@@ -1601,10 +1486,9 @@ const ONE_TO_ONE_PINNED_WITH_THE_GROUP_BASIS_ON: &[(&str, &str)] = &[
         "chunk_without_entry_lock",
         "on a 1-1 target the unlocked chunk still writes the row its read saw and its \
          entry rewrite still queues behind the page, so nothing diverges (it fired in \
-         21 of 48 steady-load cases and was caught in none on 42545471, 2026-10-23); it \
-         diverges only through the ledger's group deltas, and \
-         a_page_queues_behind_a_chunk_holding_its_key \
-         (one_to_one_build_interleavings) pins the lock",
+         21 of 48 steady-load cases and was caught in none on 42545471, 2026-10-23); \
+         a_page_queues_behind_a_chunk_holding_its_key (one_to_one_build_interleavings) \
+         pins the lock",
     ),
 ];
 const NO_JOIN: &str = "the concurrent tier draws no `JOIN`; the JOIN tier \
@@ -1693,28 +1577,13 @@ const COOLING_BACKFILL_GROUP_BASIS: &[(&str, &str)] = &[
     ),
 ];
 
-/// A tier's `not_gated`: `listed` for the plants on the paths the knob
-/// routes to, the knob's other path's plants and the `JOIN` plants with
-/// their reasons.
+/// A tier's `not_gated`: `listed`, the 1-1 plants no tier gates and the
+/// `JOIN` plants, with their reasons.
 fn not_gated(listed: &[(&'static str, &'static str)]) -> Vec<(&'static str, &'static str)> {
     use generative::plant_sweep::{PlantPath, not_on_path};
-    let (off_path, why) = if trellis::dev::staging::group_basis_enabled() {
-        (vec![PlantPath::Ledger], LEDGER_WITH_THE_GROUP_BASIS_ON)
-    } else {
-        (
-            vec![PlantPath::GroupBasis, PlantPath::GroupBasisWriter],
-            GROUP_BASIS_WITH_THE_KNOB_OFF,
-        )
-    };
     let mut out: Vec<(&'static str, &'static str)> = listed.to_vec();
-    let pinned = if trellis::dev::staging::group_basis_enabled() {
-        ONE_TO_ONE_PINNED_WITH_THE_GROUP_BASIS_ON
-    } else {
-        &[]
-    };
-    for (plant, why) in not_on_path(&off_path, why)
-        .chain(not_on_path(&[PlantPath::Join], NO_JOIN))
-        .chain(pinned.iter().copied())
+    for (plant, why) in
+        not_on_path(&[PlantPath::Join], NO_JOIN).chain(ONE_TO_ONE_PINNED.iter().copied())
     {
         if !out.iter().any(|(listed, _)| *listed == plant) {
             out.push((plant, why));
@@ -1773,13 +1642,7 @@ fn sweep_tier_named(name: &str) -> Option<(SweepTier, BoxedStrategy<ConcurrentCa
         "steady_load" => (
             SweepTier {
                 name: "steady_load",
-                // With the knob off, `gb_early_zero_gc` is off the path, so
-                // `not_gated` lists it instead.
-                known_misses: if trellis::dev::staging::group_basis_enabled() {
-                    STEADY_LOAD_MISSES
-                } else {
-                    HOT_KEY_BASED_MISSES
-                },
+                known_misses: STEADY_LOAD_MISSES,
                 not_gated: not_gated(STEADY_LOAD_NOT_GATED),
             },
             steady_load_case().boxed(),
@@ -1807,10 +1670,9 @@ fn every_concurrent_tier_the_quarantine_list_can_name_is_a_sweep_tier() {
 }
 
 /// Every tier's `known_misses` and `not_gated` name real plants, each at
-/// most once, and `lsn_only_skip` is in every tier's `not_gated`: its pin
-/// gates it, not a sweep (#734).
+/// most once.
 #[test]
-fn every_tier_lists_real_plants_and_leaves_lsn_only_skip_to_its_pin() {
+fn every_tier_lists_real_plants() {
     use trellis::dev::plant::Plant;
     for name in baseline_quarantine::CONCURRENT_TIERS {
         let (tier, _) = sweep_tier_named(name).expect("a sweep tier");
@@ -1831,12 +1693,6 @@ fn every_tier_lists_real_plants_and_leaves_lsn_only_skip_to_its_pin() {
                 "the {name} tier lists {plant} more than once"
             );
         }
-        assert!(
-            tier.not_gated
-                .iter()
-                .any(|(plant, _)| *plant == Plant::LsnOnlySkip.name()),
-            "the {name} tier must leave lsn_only_skip to its pin (#734)"
-        );
         assert!(
             Plant::ALL
                 .iter()

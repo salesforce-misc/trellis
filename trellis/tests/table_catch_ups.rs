@@ -460,51 +460,6 @@ async fn request_backfill_names_a_source_outside_the_search_path() {
     ));
 }
 
-/// The aggregate case: group `b` lost its only row and group `a` one of its
-/// rows, neither delete reaching the target. The re-read re-derives `a`
-/// from what it still has, and only the sweep can drop `b`. This is the
-/// catch-up flavour ([`a_requested_backfill_sweeps_a_stale_one_to_one_row`]'s
-/// held-out source).
-#[tokio::test]
-#[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
-async fn a_requested_backfill_sweeps_a_stale_aggregate_group() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
-    seed_sales(&client).await;
-    markers::hold_out_of_the_rederive_build(&client, "public.sales")
-        .await
-        .expect("hold sales out of the Re-derive build");
-    install_definition(
-        &db.pool,
-        "TRANSFORM sku_totals FROM sales GROUP BY sku WITHOUT SOURCE INDEX SELECT sum(amount) AS total",
-        &sales_types(),
-        "public",
-    )
-    .await
-    .expect("install the aggregate");
-    bring_live(&db.pool, &mut client).await;
-
-    client
-        .batch_execute("delete from public.sales where id in (3, 4)")
-        .await
-        .expect("delete source rows, their CDC lost");
-    let trellis = connect_trellis(db.dsn()).await;
-    trellis
-        .request_backfill("sales")
-        .await
-        .expect("request a re-backfill");
-    assert_eq!(status_of(&client, "public.sku_totals").await, "catching_up");
-
-    discharge_markers(&db.pool, &mut client).await;
-
-    assert_eq!(status_of(&client, "public.sku_totals").await, "live");
-    assert_eq!(
-        sku_totals_rows(&client).await,
-        vec![("a".to_string(), "12".to_string())]
-    );
-}
-
 /// The Re-derive flavour of the aggregate case (#625 F7): `request_backfill`
 /// on a `live` aggregate returns with the status already `backfilling`, so a
 /// caller that polls for `live` and then takes its token waits out the

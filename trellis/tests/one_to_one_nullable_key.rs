@@ -6,10 +6,9 @@
 //! the source, so a group whose key has a `NULL` part has its row in the
 //! reader as it has in the aggregate. Each test drives the pipeline by hand
 //! through `support/drain_driver.rs` (no sleeping or polling for
-//! convergence, #297) on the ledger path, and compares every target with a
-//! `GROUP BY` over the source: the oracle. The group-basis and `JOIN`
-//! sources are in `group_basis_chained.rs`, whose binary runs with the
-//! group-basis knob on.
+//! convergence, #297), and compares every target with a `GROUP BY` over the
+//! source: the oracle. The aggregate and `JOIN` sources are in
+//! `group_basis_chained.rs`.
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
@@ -251,14 +250,9 @@ async fn a_chunked_build_writes_every_null_keyed_group() {
     let mut chunks = 0;
     for _ in 0..500 {
         d.settle().await;
-        let step = build::work_once(
-            d.pool(),
-            "worker",
-            &options,
-            &mut build::MergeFailures::default(),
-        )
-        .await
-        .expect("build step");
+        let step = build::work_once(d.pool(), "worker", &options)
+            .await
+            .expect("build step");
         if step == build::Step::Chunk {
             chunks += 1;
         }

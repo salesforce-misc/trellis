@@ -31,10 +31,8 @@ async fn connect_raw(dsn: &str) -> Client {
     client
 }
 
-/// A database with `src (id, g, h, v)` and a define-only `Trellis`, the
-/// group-basis knob on.
+/// A database with `src (id, g, h, v)` and a define-only `Trellis`.
 async fn setup(extra: &str) -> (TestCluster, testkit::TestDatabase, Client, Trellis) {
-    trellis::dev::staging::set_group_basis(true);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;

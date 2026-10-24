@@ -6,7 +6,7 @@
 //! truncates part of the tree, drains the ring (whose seal queues the
 //! correction) and runs the correction engine. The oracle is a from-scratch
 //! `GROUP BY` over the source. Nothing waits for convergence (#297): the
-//! pass, the drain, the engine and the merger are called by hand.
+//! pass, the drain and the engine are called by hand.
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
@@ -50,12 +50,13 @@ struct Fx {
 
 impl Fx {
     async fn start(ddl: &str) -> Fx {
+        let (schema, seed) = drain_driver::split_seed(ddl);
         let d = Driver::start(
-            ddl,
+            &schema,
             &[
-                ("id", ValueType::Numeric),
-                ("g", ValueType::Numeric),
-                ("v", ValueType::Numeric),
+                ("id", ValueType::Integer(trellis::IntWidth::Int4)),
+                ("g", ValueType::Integer(trellis::IntWidth::Int4)),
+                ("v", ValueType::Integer(trellis::IntWidth::Int4)),
             ],
             &[DEFINITION],
             &[SOURCE],
@@ -65,6 +66,8 @@ impl Fx {
         // The first sight of the source records its tree and queues nothing.
         fx.pass().await;
         assert!(fx.queue().await.is_empty());
+        fx.exec(&seed).await;
+        fx.d.settle().await;
         assert_eq!(fx.wrong_groups().await, Vec::<i32>::new());
         fx
     }
@@ -138,16 +141,10 @@ impl Fx {
             .expect("run the pending corrections")
     }
 
-    async fn merge(&mut self) {
-        let plan = self.d.build_plan("agg").await;
-        self.d.merge_all(&plan).await;
-        self.d.settle().await;
-    }
-
-    /// Runs the queued corrections to their end and merges their deltas.
+    /// Runs the queued corrections to their end and drains the ring.
     async fn correct(&mut self) -> Outcome {
         let outcome = self.run(&Options::default()).await;
-        self.merge().await;
+        self.d.settle().await;
         outcome
     }
 
@@ -174,8 +171,6 @@ fn range(from: i32, to: i32) -> Vec<i32> {
 
 #[tokio::test]
 async fn a_leaf_truncate_corrects_only_the_leafs_groups() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
     let mut fx = Fx::start(FLAT).await;
     // Rows written into the leaf after the truncate, in its transaction,
     // count.
@@ -201,8 +196,6 @@ async fn a_leaf_truncate_corrects_only_the_leafs_groups() {
 
 #[tokio::test]
 async fn a_middle_truncate_corrects_the_middle_through_its_own_text() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
     let mut fx = Fx::start(NESTED).await;
     fx.exec("truncate public.items_m").await;
     fx.d.settle().await;
@@ -219,8 +212,6 @@ async fn a_middle_truncate_corrects_the_middle_through_its_own_text() {
 
 #[tokio::test]
 async fn a_root_truncate_clears_the_target_once_and_queues_nothing() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
     let mut fx = Fx::start(NESTED).await;
     fx.exec("truncate public.items").await;
     fx.d.settle().await;
@@ -231,8 +222,6 @@ async fn a_root_truncate_clears_the_target_once_and_queues_nothing() {
 
 #[tokio::test]
 async fn a_truncate_naming_several_nodes_queues_one_correction_per_node() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
     let mut fx = Fx::start(NESTED).await;
     fx.exec("truncate public.items_m0, public.items_p3").await;
     // `CASCADE` empties a leaf that references the table named.
@@ -262,53 +251,4 @@ async fn a_truncate_naming_several_nodes_queues_one_correction_per_node() {
     assert_eq!(outcome.completed, 3);
     assert_eq!(fx.wrong_groups().await, Vec::<i32>::new());
     assert_eq!(fx.target_rows().await, 4);
-}
-
-#[tokio::test]
-async fn a_truncate_after_the_nodes_correction_started_queues_another() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
-    let mut fx = Fx::start(FLAT).await;
-    fx.exec("truncate public.items_p1").await;
-    fx.d.settle().await;
-    // A second truncate before the correction starts adds nothing.
-    fx.exec("insert into public.items values (1000, 5, 7); truncate public.items_p1")
-        .await;
-    fx.d.settle().await;
-    assert_eq!(fx.queued().await, [truncated("public.items_p1")]);
-
-    // Start it: one page, past the fence.
-    let options = Options {
-        page_keys: 1,
-        max_pages: Some(1),
-    };
-    let id = fx.queue().await[0].id;
-    for _ in 0..10 {
-        fx.run(&options).await;
-        let walked: bool =
-            fx.d.ctl
-                .query_one(
-                    "select exists (select 1 from partition_correction_progress \
-                                where correction_id = $1 and keys_done > 0)",
-                    &[&id],
-                )
-                .await
-                .expect("progress")
-                .get(0);
-        if walked {
-            break;
-        }
-    }
-    fx.exec("insert into public.items values (1001, 6, 9); truncate public.items_p1")
-        .await;
-    fx.d.settle().await;
-    assert_eq!(
-        fx.queued().await,
-        [truncated("public.items_p1"), truncated("public.items_p1")]
-    );
-
-    let outcome = fx.correct().await;
-    assert_eq!(outcome.completed, 2);
-    assert_eq!(fx.wrong_groups().await, Vec::<i32>::new());
-    assert_eq!(fx.target_rows().await, 12);
 }

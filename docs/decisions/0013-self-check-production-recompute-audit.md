@@ -157,7 +157,7 @@ A sum or average kept from partials carries exactly the scale Postgres's own
 `sum()` and `avg()` show
 ([ADR-0002](0002-async-data-flow.md#numeric-arguments-declare-their-scale)). An
 aggregate whose `=` admits several textually distinct representatives of one value
-(`MIN`/`MAX` over `real` or `interval`) is refused at define.
+(`MIN`/`MAX`, or `SUM`/`AVG` over `real` or `interval`) is refused at define.
 
 ### The audit query is rendered independently of the write path
 

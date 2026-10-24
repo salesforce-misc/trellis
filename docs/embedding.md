@@ -367,15 +367,15 @@ this fleet may be silently stuck," not as a transient blip to retry past.
 
 The worker checks say the fleet is running; they can't say a definition has
 stopped. A halting failure (a source key the drain can't use, a propagation
-wave past the hop bound, an aggregate off the ledger, or Postgres refusing the
+wave past the hop bound, an aggregate the group basis can't apply, or Postgres refusing the
 drain's role a read or write) pauses the definitions it reaches, and every
 other definition keeps converging (#663,
 [observability — A halting failure](observability.md#a-halting-failure)). A
 halted definition reports `paused`, the same word as an operator pause, so
 check `DefinitionSummary::halt` rather than the status: it is set only on a
 halted definition, and carries the table the failure named, the error and when
-it was found. For an aggregate off the ledger, that table is the aggregate's
-target, not a source. One `definitions()` call answers for every definition:
+it was found. For an aggregate the group basis can't apply, that table is the
+aggregate's target, not a source. One `definitions()` call answers for every definition:
 
 ```rust
 let halted: Vec<_> = trellis
@@ -723,7 +723,7 @@ append the `schema_migrations` rows.
 `dump_definitions_sql` (Rust `Trellis` and `BlockingTrellis`, Ruby
 `Trellis::Instance#dump_definitions_sql`) returns them as SQL: Trellis's
 migration history, the instance marker, the transform
-definitions and the seed rows capture needs. Runtime state (the ledger, ring,
+definitions and the seed rows capture needs. Runtime state (the 1-1 ledgers, ring,
 build chunks, quarantine, claims and statuses) is never in it, because it
 describes source and target rows a schema-only dump doesn't carry. Loading
 the file needs no Trellis step: every definition loads as

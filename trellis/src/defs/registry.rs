@@ -250,26 +250,35 @@ pub const AGGREGATE_FUNCTIONS: &[&str] = &[
     "STRING_AGG",
 ];
 
-/// The aggregate functions an [`super::ast::KeySpace::Aggregate`] definition
-/// may call in a calculated field. This table is the list of supported names,
-/// and each entry's `arg_types` length is its arity, which [`super::parser`]
-/// enforces. The declared types are exact only for the single-type
-/// aggregates (`BOOL_AND`/`BOOL_OR`/`JSONB_AGG`); for `SUM`/`MIN`/`MAX`/`AVG`
-/// and `BIT_AND`/`BIT_OR` they are a representative placeholder. Which
-/// argument types an aggregate actually accepts, and what it returns for
-/// each, is [`aggregate_result_type`]'s job (for example `MIN`/`MAX` also
-/// take text, temporal, `inet` and enum arguments, and `SUM` takes
-/// `interval`).
+/// The aggregate functions the grammar parses, each entry's `arg_types`
+/// length its arity, which [`super::parser`] enforces. `COUNT`, `SUM` and
+/// `AVG` are the ones an [`super::ast::KeySpace::Aggregate`] or `JOIN`
+/// definition keeps (#1096 decision 1); every other name is parsed only so
+/// the validator can refuse it by family
+/// (`validate::check_aggregate_admitted`), and its declared types are a
+/// placeholder. Which argument types `SUM` and `AVG` accept, and what they
+/// return for each, is [`aggregate_result_type`]'s job.
 ///
 /// `COUNT` is the one entry whose arity isn't read from here. Its
 /// `arg_types` is empty, and [`super::parser`] special-cases both forms:
 /// `COUNT(*)` counts rows (issue #75) and `COUNT(<expr>)` counts non-null
-/// values of any argument type (issue #120).
+/// values of any argument type (issue #120). It is `bigint`, as Postgres
+/// types `count(*)`.
 pub const AGGREGATE_FUNCTION_SPECS: &[FunctionSpec] = &[
     FunctionSpec {
         name: "SUM",
         arg_types: &[ValueType::Numeric],
         return_type: ValueType::Numeric,
+    },
+    FunctionSpec {
+        name: "AVG",
+        arg_types: &[ValueType::Numeric],
+        return_type: ValueType::Numeric,
+    },
+    FunctionSpec {
+        name: "COUNT",
+        arg_types: &[],
+        return_type: ValueType::Integer(IntWidth::Int8),
     },
     FunctionSpec {
         name: "MIN",
@@ -282,37 +291,6 @@ pub const AGGREGATE_FUNCTION_SPECS: &[FunctionSpec] = &[
         return_type: ValueType::Numeric,
     },
     FunctionSpec {
-        name: "AVG",
-        arg_types: &[ValueType::Numeric],
-        return_type: ValueType::Numeric,
-    },
-    // Issue #120: `count(*)` and `count(<anything>)` are both `bigint` in
-    // Postgres (`pg_typeof(count(*))`/`pg_typeof(count(col))`), never
-    // `numeric` — this row used to declare `Numeric` only because, before
-    // issue #111, `ValueType` had no way to say "integer". `arg_types` stays
-    // `&[]`: the parser/validator special-case `COUNT`'s arity (0 for `*`,
-    // 0 or 1 for a real argument) rather than reading it from here — see
-    // `super::parser`'s and `super::validate::infer_expr`'s own `COUNT`
-    // branches.
-    FunctionSpec {
-        name: "COUNT",
-        arg_types: &[],
-        return_type: ValueType::Integer(IntWidth::Int8),
-    },
-    // Issue #119: `bool_and`/`bool_or` are Postgres's row-wise `AND`/`OR`
-    // folds — `true` iff every/any non-NULL value in the group is `true`,
-    // `NULL` over an all-NULL or empty group, exactly like `SUM`/`MIN`/
-    // `MAX`/`AVG`'s "aggregate of zero non-NULL values is NULL" rule.
-    // Unlike those four, `Boolean` is declared directly rather than
-    // `Numeric`: `boolean` is not in the numeric family
-    // (`ValueType::is_numeric_family`) and there is no widening/mixed-type
-    // story to model the way there is for integers/floats (Postgres has
-    // exactly one `boolean`, no widths), so admissibility is a plain exact
-    // match on the declared arg type (`validate`'s `is_aggregate &&
-    // *expected == ValueType::Numeric` widen-check never triggers), and
-    // [`aggregate_result_type`]'s own `Boolean` arm below is what supplies
-    // the result type the same way it does for every other aggregate.
-    FunctionSpec {
         name: "BOOL_AND",
         arg_types: &[ValueType::Boolean],
         return_type: ValueType::Boolean,
@@ -322,68 +300,21 @@ pub const AGGREGATE_FUNCTION_SPECS: &[FunctionSpec] = &[
         arg_types: &[ValueType::Boolean],
         return_type: ValueType::Boolean,
     },
-    // Issue #118: `bit_and`/`bit_or` are Postgres's per-bit-position `AND`/
-    // `OR` folds over a group's bit strings — `NULL` over an all-NULL or
-    // empty group, exactly like every other aggregate's "aggregate of zero
-    // non-NULL values is NULL" rule. Unlike `bool_and`/`bool_or`, whose
-    // argument is one fixed `ValueType::Boolean`, `bit_and`/`bit_or` accept
-    // *two* distinct `ValueType::Other` families — `PgType::Bit` (Postgres's
-    // own `bit_and(bit)`/`bit_or(bit)`) and `PgType::VarBit` (a `bit
-    // varying` argument implicitly widens to `bit` before the call —
-    // verified live: `pg_aggregate` has exactly one row per name,
-    // `aggfnoid = bit_and(bit)`, and `explain (verbose) select bit_and(v)
-    // from (values ('1010'::varbit)) t(v)` shows `bit_and('1010'::"bit")`).
-    // `arg_types` below names `Other(PgType::Bit)` as a representative
-    // placeholder only — `validate::infer_expr`'s admissibility check for
-    // this pair asks `aggregate_result_type` directly (the same widen-check
-    // shape a `Numeric`-declared aggregate argument already gets), rather
-    // than comparing against this one fixed slot, since neither
-    // `PgType::Bit` alone nor `PgType::VarBit` alone would be the whole
-    // truth.
-    //
-    // `return_type` is deliberately `Other(PgType::VarBit)`, **not**
-    // `Other(PgType::Bit)` even though `bit_and(bit)` is the function
-    // Postgres genuinely calls — see `aggregate_result_type`'s own `BIT_AND`/
-    // `BIT_OR` arm for why the result is always widened to the unconstrained
-    // family rather than mirrored back to the argument's own one, unlike
-    // every other aggregate in this table.
     FunctionSpec {
         name: "BIT_AND",
-        arg_types: &[ValueType::Other(PgType::Bit)],
+        arg_types: &[ValueType::Other(PgType::VarBit)],
         return_type: ValueType::Other(PgType::VarBit),
     },
     FunctionSpec {
         name: "BIT_OR",
-        arg_types: &[ValueType::Other(PgType::Bit)],
+        arg_types: &[ValueType::Other(PgType::VarBit)],
         return_type: ValueType::Other(PgType::VarBit),
     },
-    // Issue #115: `jsonb_agg` is `STABLE` in Postgres (`pg_proc.provolatile`),
-    // not because it is order-sensitive (`array_agg`/`string_agg` are
-    // equally order-sensitive and are `IMMUTABLE`) but because it is
-    // polymorphic and, for *some* argument types (`timestamptz`, `money`),
-    // its row-to-`jsonb` conversion reads a session GUC — see
-    // `crate::jsonb`'s module doc for the live `pg_proc`/`TimeZone`/
-    // `lc_monetary` evidence. Pinning the argument to `jsonb` itself (rather
-    // than accepting it polymorphically the way Postgres's own grammar
-    // does) excludes that hazard outright: converting an already-`jsonb`
-    // value is the identity, with no GUC read at all. This is the one
-    // aggregate spec in this table whose argument type is a passthrough
-    // `Other` family rather than `Numeric`/`Boolean` — the same shape
-    // `BIT_AND`/`BIT_OR` already established, just with an exact (not
-    // widened) argument/result pair, the same as `BOOL_AND`/`BOOL_OR`.
     FunctionSpec {
         name: "JSONB_AGG",
         arg_types: &[ValueType::Other(PgType::Jsonb)],
         return_type: ValueType::Other(PgType::Jsonb),
     },
-    // Issue #293: bare (no `ORDER BY`) `array_agg`/`string_agg`, recompute-only
-    // like `JSONB_AGG`, with the same element-order caveat (`docs/type-support.md`,
-    // `array_agg` and `string_agg`). Both are `IMMUTABLE` and take a `text` argument only: `text[]`
-    // is the one array family modelled (`PgType::TextArray`), and a `text`
-    // element has no GUC-dependent rendering. `STRING_AGG`'s second argument
-    // is the separator, which must be a string literal (the validator
-    // refuses anything else) so the ledger's contribution column stays the
-    // first argument alone.
     FunctionSpec {
         name: "ARRAY_AGG",
         arg_types: &[ValueType::Text],
@@ -420,7 +351,6 @@ pub fn lookup_aggregate_function(name: &str) -> Option<&'static FunctionSpec> {
 ///   one step further up, and it is why a `bigint` sum cannot overflow.
 /// * `avg(<any exact integer>)` returns `numeric`; the average of integers
 ///   is not an integer.
-/// * `min`/`max` return their argument's own type exactly.
 ///
 /// Issue #112 adds the float rows, and they are *not* the integer rows'
 /// shape — Postgres does not widen a float sum, because a binary float's
@@ -432,9 +362,8 @@ pub fn lookup_aggregate_function(name: &str) -> Option<&'static FunctionSpec> {
 /// * `avg(real)` returns **`double precision`**, not `real` — Postgres
 ///   accumulates a `real` average in `float8`. `avg(double precision)` is
 ///   `double precision`.
-/// * `min`/`max` keep their argument's type, same as every other family.
 ///
-/// All five verified with `select pg_typeof(<agg>(x)) from (values
+/// All verified with `select pg_typeof(<agg>(x)) from (values
 /// (1.5::real)) t(x)` against a live server, not read off the docs.
 ///
 /// `COUNT` is deliberately absent and keeps the constant `Numeric` return
@@ -446,180 +375,11 @@ pub fn lookup_aggregate_function(name: &str) -> Option<&'static FunctionSpec> {
 /// column's type for definitions that reference no integer at all) and is
 /// left to #120.
 pub fn aggregate_result_type(name: &str, arg: ValueType) -> Option<ValueType> {
-    // Issue #113: the temporal families are the first non-numeric arguments
-    // any aggregate accepts. They are `ValueType::Other` passthrough types
-    // rather than a first-class variant (see `crate::temporal`'s module doc
-    // for why they never needed one), so they are dispatched before the
-    // numeric family rather than inside it. Postgres's own `pg_aggregate`
-    // rows are the rule here as everywhere: `min`/`max` keep their
-    // argument's type, and `sum(interval)` is `interval`.
-    //
-    // The two refusals are the reason this routes through
-    // `crate::temporal`'s predicates rather than listing families inline.
-    // `min`/`max` over `interval` is refused because Postgres's own answer
-    // is not a function of its input — `max` over `{'1 day', '24 hours'}`
-    // returns different *text* for different scan orders, verified live, so
-    // ADR-0013's byte-exact recompute cross-check could never settle it.
-    // `sum` over the other five is refused because Postgres simply has no
-    // such aggregate: there is no `sum(timestamp)`.
-    //
-    // Issue #114: `bytea` reaches this same `Other` arm and falls all the
-    // way through to `None` for `MIN`/`MAX` too, but for a *third* reason
-    // distinct from both temporal refusals above — not a scan-order defect,
-    // not a missing-aggregate-for-this-name gap. `bytea` has a full btree
-    // opclass (`ORDER BY`/`<`/`>` all work, and are IMMUTABLE), but Postgres
-    // simply never wired a `min(bytea)`/`max(bytea)` aggregate to it: `select
-    // min(v) from (values ('\x00'::bytea)) t(v)` is `ERROR: function
-    // min(bytea) does not exist` on a live server, and `pg_proc` has no
-    // `min`/`max` row whose sole argument type is `bytea`. ADR-0004 admits
-    // only a subset of Postgres's own grammar, so a `MIN`/`MAX(bytea)`
-    // definition has nothing to be a subset *of* — there is no server-side
-    // aggregate this crate could even be asked to reproduce. `bytea`'s join,
-    // primary-key and `GROUP BY` key roles do not depend on this at all
-    // (`join_key_types::TEXT_STABLE_JOIN_KEY_TYPES`, `validate::
-    // reject_unsupported_group_by_key_type`) — they only need equality,
-    // which `bytea` has and which is a separate question from whether an
-    // aggregate exists.
-    if let ValueType::Other(pg_type) = arg {
-        return match name {
-            // Issue #116: `inet` joins the temporal `MIN`/`MAX` families —
-            // `min(inet)`/`max(inet)` are real Postgres aggregates that keep
-            // their argument's own type (`pg_typeof(min(v))` is `inet`,
-            // verified live). `cidr`/`macaddr`/`macaddr8` all fall through to
-            // `None` here, each for its own reason (see `crate::netaddr`'s
-            // module doc): `macaddr`/`macaddr8` have no `min`/`max`
-            // aggregate at all (the `bytea` finding, #114); `cidr`'s only
-            // reachable `min`/`max` is Postgres's own implicit upcast to
-            // `inet`, which would silently change the result's type away
-            // from `cidr` — a type-changing aggregate no other family in
-            // this epic has needed, and this issue declines to introduce
-            // speculatively.
-            // Issue #117: `min(enum)`/`max(enum)` are real Postgres
-            // aggregates — `anyenum` has a full btree opclass
-            // (`enum_cmp`/`enum_lt`/...), ordered by each value's creation
-            // position (`pg_enum.enumsortorder`), not alphabetically — and
-            // `pg_typeof(min(v))` keeps the argument's own concrete enum
-            // type, the same "own family, own terms" shape `inet`'s MIN/MAX
-            // landed under (#116). Mirroring `arg` back unchanged is
-            // therefore correct here exactly as it is for every other
-            // family in this match. See `defs::eval::reduce_enum_aggregate`
-            // for the one real wrinkle this family has that none of the
-            // others do: creation-order isn't a fixed, universal fact about
-            // the *family* the way date/inet ordering is, it's a per-type,
-            // schema-defined, live-mutable fact — so the pure evaluator
-            // fold this arm's admission enables cannot always answer it
-            // without a live connection, and refuses rather than guess (a
-            // naive lexicographic fallback here would be a silent,
-            // wrong-order bug this variant exists to rule out).
-            "MIN" | "MAX" if matches!(pg_type, PgType::Enum(_)) => Some(arg),
-            "MIN" | "MAX"
-                if crate::temporal::supports_min_max(pg_type)
-                    || crate::netaddr::supports_min_max(pg_type) =>
-            {
-                Some(arg)
-            }
-            "SUM" if pg_type == PgType::Interval => Some(arg),
-            // Issue #118: `bit_and`/`bit_or` accept either bit-string
-            // family (`PgType::Bit` or `PgType::VarBit` — see
-            // `AGGREGATE_FUNCTION_SPECS`'s own `BIT_AND`/`BIT_OR` doc
-            // comment for the live `pg_aggregate`/`pg_cast` evidence that
-            // Postgres only ever actually calls `bit_and(bit)`/`bit_or(bit)`
-            // regardless of which family the argument started as).
-            //
-            // The result is always declared `Other(PgType::VarBit)` here,
-            // deliberately **not** mirrored back to `arg`'s own family the
-            // way every other arm in this function (`MIN`/`MAX`,
-            // `SUM(interval)`) mirrors its argument type — this is the one
-            // place in the registry that widens rather than preserves.
-            // `ValueType`/`PgType` carry no length modifier, and
-            // Postgres's *default* typmod for a **fixed-length** `bit`
-            // column declared with no length is `bit(1)`, not
-            // "unconstrained": a bare `pg_type_name(Other(PgType::Bit))`
-            // target column (what `ddl::create_aggregate_target_table`
-            // would otherwise declare) would only ever be able to hold a *1-bit* result,
-            // failing on the very first apply for any wider group — verified
-            // live (`create table t(x bit); insert into t values ('101')`
-            // raises `bit string length 3 does not match type bit(1)`).
-            // `bit varying` has no such trap: its bare default is genuinely
-            // unconstrained, losslessly holding any width (verified live:
-            // `'10100101'::bit varying` keeps all 8 bits) and rendering
-            // identically to `bit`'s own `bit_out` (`bit_out`/`varbit_out`
-            // both emit the bare `'0'`/`'1'` characters, no type-identifying
-            // wrapper), so retargeting the *declared* result family costs
-            // nothing observable downstream while sidestepping the DDL trap
-            // entirely — the same reasoning
-            // `validate::reject_unsupported_group_by_key_type`'s `VarBit`
-            // arm documents for the `GROUP BY` key role. There is no
-            // equivalent per-column-concrete-type escape hatch for an
-            // aggregate's *result* column the way there is for a
-            // passthrough or a primary key (issue #45's mechanism narrows a
-            // bare source-column reference, not a computed aggregate's
-            // output) — extending one is real, deferred scope, not
-            // attempted here.
-            "BIT_AND" | "BIT_OR" if matches!(pg_type, PgType::Bit | PgType::VarBit) => {
-                Some(ValueType::Other(PgType::VarBit))
-            }
-            // Issue #115: unlike `BIT_AND`/`BIT_OR`'s deliberate widening,
-            // `JSONB_AGG` mirrors its argument's own family straight back —
-            // there is no DDL-typmod trap here the way fixed-length `bit`
-            // has (`PgType::Jsonb` carries no modifier at all), so nothing
-            // forces a different declared family the way it does there.
-            "JSONB_AGG" if pg_type == PgType::Jsonb => Some(ValueType::Other(PgType::Jsonb)),
-            _ => None,
-        };
-    }
-    // Issue #119: `bool_and`/`bool_or` are the only aggregates whose
-    // argument is `ValueType::Boolean`, which — like the `Other` temporal/
-    // bytea families above — is not in the numeric family, so it is routed
-    // before the numeric-family gate below rather than falling into it and
-    // returning `None` for every boolean argument.
-    if let ValueType::Boolean = arg {
-        return match name {
-            "BOOL_AND" | "BOOL_OR" => Some(ValueType::Boolean),
-            _ => None,
-        };
-    }
-    // Issue #120: `text`/`varchar` is a first-class (non-`Other`) `ValueType`
-    // with a real Postgres btree ordering that `MIN`/`MAX` hadn't yet been
-    // generalized to — `min(text)`/`max(text)` are real Postgres aggregates
-    // that keep the argument's own type (`pg_typeof(min(v))` is `text`,
-    // mirrored back exactly like every other family in this function).
-    // `SUM`/`AVG` still fall through to `None` below — Postgres has no
-    // `sum(text)` — and `text` is not in the numeric family, so this is
-    // routed here rather than into the numeric gate.
-    //
-    // `uuid` was checked live alongside `text` (per #111-#119's playbook —
-    // verify, don't assume from "has a full btree opclass") and turns out
-    // **not** to belong in this arm at all: `select min(v) from (values
-    // ('...'::uuid)) t(v)` is `ERROR: function min(uuid) does not exist` on
-    // a live Postgres 17, and no `pg_proc`/`pg_aggregate` row names `min`/
-    // `max` over a lone `uuid` argument — despite `uuid_ops` being a
-    // complete, `IMMUTABLE` btree opclass (`ORDER BY`/`<`/`>` all work).
-    // This is exactly `bytea`'s finding (#114) and `macaddr`/`macaddr8`'s
-    // (#116): an opclass with no aggregate wired to it is not a
-    // rendering/ordering hazard this crate could work around — there is no
-    // server-side construct for `MIN`/`MAX(uuid)` to be a subset *of*, so it
-    // falls through to `None` below (`uuid.is_numeric_family()` is `false`,
-    // same as `Text`, and `uuid` gets no early-return arm of its own the way
-    // `Boolean`/`Text` do — the `_ => None` path several lines down is what
-    // actually returns `None` for it).
-    //
-    // Whether the *pure evaluator* (`defs::eval::reduce_numeric_aggregate`)
-    // could honor `text`'s ordering with no live connection is a separate
-    // question this admission alone does not answer — see
-    // `reduce_text_aggregate`'s own doc comment. A `KeySpace::Aggregate`
-    // field's own `MIN`/`MAX` never depends on the evaluator's fold at all:
-    // `MIN`/`MAX` are unconditionally `Invertibility::RecomputeOnly`, so
-    // the ledger (`staging::ledger`) always asks Postgres directly.
-    if let ValueType::Text = arg {
-        return match name {
-            "MIN" | "MAX" => Some(arg),
-            // Issue #293: `array_agg(text)` is `text[]`, `string_agg(text,
-            // text)` is `text`.
-            "ARRAY_AGG" => Some(ValueType::Other(PgType::TextArray)),
-            "STRING_AGG" => Some(ValueType::Text),
-            _ => None,
-        };
+    // A float or `interval` sum is typed so a definition reaches its family
+    // refusal (`validate::check_aggregate_admitted`, #1119) rather than a
+    // type error; the group basis keeps neither.
+    if let ValueType::Other(PgType::Interval) = arg {
+        return (name == "SUM").then_some(arg);
     }
     if !arg.is_numeric_family() {
         return None;
@@ -629,11 +389,9 @@ pub fn aggregate_result_type(name: &str, arg: ValueType) -> Option<ValueType> {
             ValueType::Integer(IntWidth::Int8)
         }
         ("SUM", ValueType::Integer(IntWidth::Int8) | ValueType::Numeric) => ValueType::Numeric,
-        // Issue #112: a float sum keeps its argument's width.
         ("SUM", ValueType::Float(width)) => ValueType::Float(width),
         ("AVG", ValueType::Float(_)) => ValueType::Float(FloatWidth::Float8),
         ("AVG", _) => ValueType::Numeric,
-        ("MIN" | "MAX", arg) => arg,
         _ => return None,
     })
 }
@@ -668,15 +426,8 @@ mod tests {
     /// Every aggregate maps a float argument to a float result and an exact
     /// argument to an exact one.
     ///
-    /// This is the invariant `defs::backfill::classify_field` (and so
-    /// `staging::ledger::route`) relies on: it holds the
-    /// field's *result* type (what the validator inferred) but needs to ask
-    /// `invertibility::classify` a question about the *argument*. Since the
-    /// only distinction that gate draws inside the numeric family is
-    /// float-vs-exact, the two are interchangeable — as long as this holds.
-    /// Pinned here rather than commented, so a future aggregate that breaks
-    /// it (e.g. one returning `numeric` for a float argument) fails loudly
-    /// instead of silently putting a float `SUM` back on the delta path.
+    /// Pinned so a future aggregate that returns `numeric` for a float
+    /// argument fails loudly.
     #[test]
     fn aggregate_results_stay_in_their_arguments_family() {
         let args = IntWidth::ALL
@@ -685,7 +436,7 @@ mod tests {
             .chain(std::iter::once(ValueType::Numeric))
             .chain(FloatWidth::ALL.into_iter().map(ValueType::Float));
         for arg in args {
-            for name in ["SUM", "AVG", "MIN", "MAX"] {
+            for name in ["SUM", "AVG"] {
                 let result = aggregate_result_type(name, arg)
                     .unwrap_or_else(|| panic!("{name} over {arg} must resolve"));
                 assert_eq!(
@@ -712,14 +463,6 @@ mod tests {
         // ...but `avg(real)` *is* `double precision`.
         assert_eq!(
             aggregate_result_type("AVG", ValueType::Float(Float4)),
-            Some(ValueType::Float(Float8))
-        );
-        assert_eq!(
-            aggregate_result_type("MIN", ValueType::Float(Float4)),
-            Some(ValueType::Float(Float4))
-        );
-        assert_eq!(
-            aggregate_result_type("MAX", ValueType::Float(Float8)),
             Some(ValueType::Float(Float8))
         );
     }

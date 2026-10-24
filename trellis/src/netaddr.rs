@@ -7,22 +7,19 @@
 //!
 //! Same reasoning as [`crate::temporal`]'s module doc: every role this
 //! issue grants any of the four families is a function of the family alone,
-//! which [`PgType`] already carries, so they stay `ValueType::Other(PgType::X)`.
+//! which `PgType` already carries, so they stay `ValueType::Other(PgType::X)`.
 //!
 //! # The four families do *not* land the same way
 //!
-//! Issue #116's own scope note groups all four together and marks `MIN`/
-//! `MAX` `⚠️` across the board. Checked against a live server per each of
-//! #111–#119's playbooks (never assumed from the type's name), the four
-//! diverge in three different directions — the epic's most differentiated
-//! outcome yet:
+//! Checked against a live server per each of #111-#119's playbooks (never
+//! assumed from the type's name), the four diverge:
 //!
 //! ```text
-//!            join/PK/GROUP BY key   MIN/MAX
-//! inet       GROUP BY only          ✅ (returns inet)
-//! cidr       ✅ all three            ❌ (no such aggregate — see below)
-//! macaddr    ✅ all three            ❌ (no such aggregate at all)
-//! macaddr8   ✅ all three            ❌ (no such aggregate at all)
+//!            join/PK/GROUP BY key
+//! inet       GROUP BY only
+//! cidr       all three
+//! macaddr    all three
+//! macaddr8   all three
 //! ```
 //!
 //! ## `pg_cast`: `inet`/`cidr` share a second renderer; `macaddr`/`macaddr8` don't
@@ -82,9 +79,9 @@
 //!   the same way `bytea`/`oid` did.
 //!
 //! `inet`'s `GROUP BY` key role is nonetheless admitted — the same split
-//! `boolean` got in #119, for the same mechanical reason: the ledger
-//! (`staging::ledger`) never compares a group key's text, it casts it to the
-//! column's native type, and `inet_in` is permissive enough to parse both
+//! `boolean` got in #119, for the same mechanical reason: the group basis
+//! (`staging::group_basis`) never compares a group key's text, it parses it
+//! into the column's native type, and `inet_in` is permissive enough to parse both
 //! spellings (`'192.168.1.5'` and `'192.168.1.5/32'`) back to the identical
 //! stored value — verified live: `'192.168.1.5'::inet =
 //! '192.168.1.5/32'::inet` is `true`.
@@ -116,52 +113,9 @@
 //! engine itself renders, post-#248) are the two renderers actually in
 //! conflict, not `to_jsonb` and `<col>::text`.
 //!
-//! ## `MIN`/`MAX`
-//!
-//! Checked live, per family, against `pg_proc`/`pg_aggregate` rather than
-//! assumed:
-//!
-//! * **`inet` has a real `min(inet)`/`max(inet)` aggregate that keeps its
-//!   argument's type** (`select pg_typeof(min(v)) from (values
-//!   ('10.0.0.1'::inet)) t(v)` is `inet`). [`compare`] reproduces
-//!   `network_cmp`'s three-level tie-break (verified live across a grid
-//!   spanning cross-family pairs, same-family overlapping-prefix pairs at
-//!   different netmask lengths, and same-network/different-host-bits pairs)
-//!   so the Rust-side fold ([`crate::defs::eval`]'s `reduce_netaddr_aggregate`)
-//!   agrees with a server-side `min`/`max` byte-for-byte, the ADR-0013 bar.
-//! * **`cidr` has no `min(cidr)`/`max(cidr)` of its own — only Postgres's
-//!   own implicit upcast to `inet` reaches one, and that changes the
-//!   result's type.** `cidr` is implicitly castable to `inet`
-//!   (`castcontext = 'i'` in `pg_cast`), so `select pg_typeof(max(cidr_col))
-//!   from ...` type-checks and returns a value — but `pg_typeof` reports
-//!   **`inet`**, not `cidr`, because Postgres resolved the call by
-//!   implicitly widening every argument and calling `max(inet)`. Every other
-//!   family this epic has granted `MIN`/`MAX` keeps the *column's own*
-//!   declared type (`docs/type-support.md`'s "`min`/`max` keep their
-//!   argument's own type" rule, verified for integers/floats/temporal); a
-//!   `cidr` computed field silently coming back typed `inet` would be the
-//!   one exception, and would need `registry::aggregate_result_type` to
-//!   *change* a `ValueType::Other(PgType::Cidr)` argument into a
-//!   `ValueType::Other(PgType::Inet)` result — a type-changing aggregate no
-//!   other family in the epic needed and this issue declines to introduce
-//!   speculatively. Treated as `❌`, matching bytea's "no server-side
-//!   construct to be a subset of" reasoning applied one level up: the
-//!   construct that exists is for a *different* type than the one asked for.
-//! * **`macaddr`/`macaddr8` have no `min`/`max` at all, for either type** —
-//!   `select min(v) from (values ('08:00:2b:01:02:03'::macaddr)) t(v)` is
-//!   `ERROR: function min(macaddr) does not exist` on a live Postgres 17,
-//!   and `pg_proc` has no `min`/`max` row for either argument type. The
-//!   exact `bytea` finding (#114): both have a full, `IMMUTABLE` btree
-//!   opclass (`macaddr_ops`/`macaddr8_ops`; `<`/`>`/`=`/`ORDER BY` all work),
-//!   but Postgres never wired the aggregate to it. `registry::
-//!   aggregate_result_type` returns `None` for both, same as `bytea`.
 
-#[cfg(any(test, feature = "test-util"))]
-use std::cmp::Ordering;
 use std::fmt;
 use std::net::IpAddr;
-
-use crate::defs::pg_type::PgType;
 
 /// A failure to parse Postgres's canonical `inet` text (either renderer:
 /// `inet_out`'s host-elided form or `network_show`'s always-explicit one —
@@ -254,52 +208,6 @@ fn mask_prefix(bits: u128, prefix_len: u8) -> u128 {
     } else {
         bits & (u128::MAX << (128 - u32::from(prefix_len)))
     }
-}
-
-#[cfg(any(test, feature = "test-util"))]
-/// Reproduces `network_cmp`'s ordering exactly — verified live across:
-/// cross-family pairs (`family` alone decides, address-independent: `4 <
-/// 6`, checked with values at both extremes of each family's range so no
-/// pair could coincidentally tie), same-family pairs whose shared prefix
-/// (`min` of the two netmask lengths) differs (decided by that masked
-/// prefix, e.g. `10.2.0.0/16 > 10.1.2.0/24`), same-family pairs whose
-/// shared prefix agrees but whose netmask lengths differ (decided by
-/// netmask length, e.g. `10.1.0.0/16 < 10.1.2.0/24`), and same-network
-/// pairs whose netmask lengths also agree, differing only in host bits
-/// (decided by the full address, e.g. `10.1.2.3/24 < 10.1.2.99/24`) — the
-/// one case the first two comparisons alone cannot resolve, since both stop
-/// at the (equal, in this case) netmask length.
-fn compare_addr(a: Addr, b: Addr) -> Ordering {
-    if a.family != b.family {
-        return a.family.cmp(&b.family);
-    }
-    let min_bits = a.masklen.min(b.masklen);
-    match mask_prefix(a.bits, min_bits).cmp(&mask_prefix(b.bits, min_bits)) {
-        Ordering::Equal => {}
-        other => return other,
-    }
-    match a.masklen.cmp(&b.masklen) {
-        Ordering::Equal => {}
-        other => return other,
-    }
-    a.bits.cmp(&b.bits)
-}
-
-#[cfg(any(test, feature = "test-util"))]
-/// [`compare_addr`] over two renderings of `inet` text — `None` if either
-/// side doesn't parse, the same defensive posture
-/// [`crate::temporal::compare`] takes for its own family.
-pub fn compare(a: &str, b: &str) -> Option<Ordering> {
-    Some(compare_addr(parse(a).ok()?, parse(b).ok()?))
-}
-
-/// Whether `pg_type` has a real `MIN`/`MAX` Postgres aggregate that keeps
-/// its own argument's type — `inet` only. See this module's doc comment for
-/// why `cidr` (aggregate exists, but only via an implicit upcast that
-/// changes the result's type) and `macaddr`/`macaddr8` (no such aggregate at
-/// all, the exact `bytea` finding) are both `false`.
-pub const fn supports_min_max(pg_type: PgType) -> bool {
-    matches!(pg_type, PgType::Inet)
 }
 
 const INET_SHAPE: &str = "an address in Rust's canonical std::net form followed by a mandatory \
@@ -423,43 +331,6 @@ mod tests {
         assert!(parse("::192.168.1.1/128").is_err());
     }
 
-    #[test]
-    fn compare_orders_by_family_first_regardless_of_address_value() {
-        // Verified live: `'1.2.3.4'::inet < '::'::inet` and
-        // `'255.255.255.255'::inet < '::'::inet` are both `true`.
-        assert_eq!(compare("1.2.3.4", "::").unwrap(), Ordering::Less);
-        assert_eq!(compare("255.255.255.255", "::").unwrap(), Ordering::Less);
-    }
-
-    #[test]
-    fn compare_breaks_a_same_family_tie_by_shared_prefix_then_masklen_then_full_address() {
-        // Shared 16-bit prefix differs: `10.2.../16 > 10.1.../24`.
-        assert_eq!(
-            compare("10.2.0.0/16", "10.1.2.0/24").unwrap(),
-            Ordering::Greater
-        );
-        // Shared 16-bit prefix agrees, masklen decides: `10.1.0.0/16 <
-        // 10.1.2.0/24`.
-        assert_eq!(
-            compare("10.1.0.0/16", "10.1.2.0/24").unwrap(),
-            Ordering::Less
-        );
-        // Prefix and masklen both agree (same /24 network); only the host
-        // bits differ.
-        assert_eq!(
-            compare("10.1.2.3/24", "10.1.2.99/24").unwrap(),
-            Ordering::Less
-        );
-    }
-
-    #[test]
-    fn compare_is_reflexively_equal_for_one_value_under_either_rendering() {
-        assert_eq!(
-            compare("192.168.1.5", "192.168.1.5/32").unwrap(),
-            Ordering::Equal
-        );
-    }
-
     // ---------------------------------------------------------------
     // typed-literal canonical checkers
     // ---------------------------------------------------------------
@@ -491,13 +362,5 @@ mod tests {
     fn canonical_macaddr8_requires_eight_lowercase_colon_groups() {
         assert!(canonical_macaddr8("08:00:2b:01:02:03:04:05").is_ok());
         assert!(canonical_macaddr8("08:00:2b:01:02:03").is_err());
-    }
-
-    #[test]
-    fn supports_min_max_admits_only_inet() {
-        assert!(supports_min_max(PgType::Inet));
-        for pg_type in [PgType::Cidr, PgType::MacAddr, PgType::MacAddr8] {
-            assert!(!supports_min_max(pg_type), "{pg_type}");
-        }
     }
 }

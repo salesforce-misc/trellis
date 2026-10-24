@@ -353,7 +353,6 @@ async fn recorded_names(raw: &Client) -> Vec<String> {
 /// and the pass fails to cast by the old name and holds its keys; the pass
 /// re-records the name and releases them.
 async fn follows(alter: &str, tone_type: &str, recorded: &[&str]) {
-    trellis::dev::staging::set_group_basis(true);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
@@ -429,7 +428,6 @@ async fn a_type_moved_to_another_schema_is_followed_in_place_by_every_reader() {
 /// meanwhile: the pass records a baseline and re-records nothing.
 #[tokio::test]
 async fn an_unchanged_name_is_never_re_recorded() {
-    trellis::dev::staging::set_group_basis(true);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
@@ -465,7 +463,6 @@ async fn an_unchanged_name_is_never_re_recorded() {
 /// and `RESUME` rebuilds each (`capture_enum_relabel.rs` has each shape).
 #[tokio::test]
 async fn a_relabelled_value_pauses_every_reader_and_resume_rebuilds() {
-    trellis::dev::staging::set_group_basis(true);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
@@ -522,7 +519,6 @@ async fn source_column_token(raw: &Client, target: &str, column: &str) -> String
 /// new definition keeps casting by the name its own type has.
 #[tokio::test]
 async fn a_new_type_at_the_old_name_keeps_its_own_readers() {
-    trellis::dev::staging::set_group_basis(true);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
@@ -605,7 +601,6 @@ async fn a_new_type_at_the_old_name_keeps_its_own_readers() {
 /// readers as for a plain table's.
 #[tokio::test]
 async fn a_renamed_type_of_a_partitioned_source_is_followed_in_place() {
-    trellis::dev::staging::set_group_basis(true);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
@@ -823,7 +818,6 @@ const PASS_AND_COUNTS: [&str; 2] = [
 /// nothing is held, and the targets equal their oracles.
 #[tokio::test]
 async fn a_rename_before_the_first_pass_is_followed() {
-    trellis::dev::staging::set_group_basis(true);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
@@ -884,7 +878,6 @@ async fn a_rename_before_the_first_pass_is_followed() {
 /// rename is followed, with no misleading re-render pause.
 #[tokio::test]
 async fn a_rename_is_followed_for_a_chained_reader_of_a_paused_upstream() {
-    trellis::dev::staging::set_group_basis(true);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
@@ -979,7 +972,6 @@ fn run(command: &mut Command) {
 /// and a later rename is followed.
 #[tokio::test]
 async fn a_logical_restore_is_re_recorded_by_resume_and_a_later_rename_followed() {
-    trellis::dev::staging::set_group_basis(true);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
@@ -1100,7 +1092,6 @@ async fn a_logical_restore_is_re_recorded_by_resume_and_a_later_rename_followed(
 /// every OID and name stays. Nothing is re-recorded and nothing pauses.
 #[tokio::test]
 async fn a_simulated_pg_upgrade_re_records_nothing() {
-    trellis::dev::staging::set_group_basis(true);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
@@ -1133,7 +1124,6 @@ async fn a_simulated_pg_upgrade_re_records_nothing() {
 /// the next pass after the lock is released follows it.
 #[tokio::test]
 async fn a_rename_blocked_by_a_locked_definition_is_followed_by_a_later_pass() {
-    trellis::dev::staging::set_group_basis(true);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;

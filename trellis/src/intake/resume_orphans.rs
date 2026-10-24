@@ -14,26 +14,16 @@
 //!   meanwhile never reaches its target, and the build may have read the row
 //!   before it was deleted.
 //!
-//! Either way it is a 1-1 row whose source row was deleted, or an aggregate
-//! group every one of whose source rows went away. Nothing enumerates a key
-//! that isn't there.
+//! Either way it is a 1-1 row whose source row was deleted. Nothing
+//! enumerates a key that isn't there. (An aggregate or a `JOIN` is rebuilt by
+//! one absolute write that replaces every group, so it is never swept.)
 //!
 //! So the discharge also deletes those rows directly: every target row with
 //! no source row that maps to its key, found by one anti-join per swept
 //! target ([`Sweep`]). It is a target write like any other, so it goes
 //! through the target-mutation seam (`staging::target_mutations`, issue
 //! #315): each deleted key is recorded with its prior image and flushed as a
-//! downstream `Recompute` in the discharge's own transaction. A chained
-//! aggregate one hop down finds the group the deleted row belonged to from
-//! its own ledger entry.
-//!
-//! A target on the ledger is swept twice over. Each of its live entries the
-//! source no longer backs is re-derived, which leaves a tombstone, takes the
-//! entry's contribution out of its group and deletes a group it empties.
-//! A group row with no live entry and no source row behind it is deleted
-//! directly. An entry whose source row is back by the time the Re-derive
-//! reads it is left to the change that put it back (see "Batches in key
-//! order").
+//! downstream `Recompute` in the discharge's own transaction.
 //!
 //! # One snapshot for the anti-join and the read (issue #436)
 //!
@@ -51,30 +41,19 @@
 //! only after this discharge commits, when a swept definition is `live` or
 //! `catching_up` and applies it. For a key of a swept target:
 //!
-//! - **Unbacked at *S***: an aggregate group is deleted, whatever the source
-//!   holds by the time the delete runs. A change after *S* that refills it
-//!   drains after the commit and applies onto its row's ledger entry, which
-//!   builds the group again from its entries (see "Pending deltas on a
-//!   deleted group"). A 1-1 row is deleted only if the source still has no
+//! - **Unbacked at *S***: a 1-1 row is deleted only if the source still has no
 //!   row of its key when the delete runs (see "A 1-1 row backed again").
 //! - **Backed at *S***: kept, and the source row backing it at *S* is
-//!   enumerated, so its `Recompute` re-derives the 1-1 row, or the
-//!   aggregate row's ledger entry, from live state. A change after *S* that
-//!   empties the group applies to its rows' entries, and the group row is
-//!   deleted when its last member leaves.
+//!   enumerated, so its `Recompute` re-derives the 1-1 row from live state.
 //!
 //! Neither case depends on when, between *S* and the drain, the source
 //! changed, which is what closes the race #436 was filed for. Before it, the
 //! anti-join was a `DELETE` of its own, one per target, before the cursor's
 //! `DECLARE`. Its snapshot preceded *S*, by as much as every later target's
-//! anti-join (#485), so a group still backed when its anti-join ran, emptied
-//! before *S* and refilled after it, was neither deleted nor enumerated. It
-//! kept its stale value, and the CDC for the emptying and the refill folded
-//! onto it as deltas (#391 measured 103 where the source said 100). Moving
-//! that `DELETE` after the watermark wait instead (as #330's spike did) opens
-//! the mirror race: a group empty at *S* and refilled before the `DELETE`
-//! survives at its stale value, since nothing enumerates it. Judging on *S*
-//! and deleting later has neither.
+//! anti-join (#485), so a row still backed when its anti-join ran, deleted
+//! before *S* and re-inserted after it, was neither deleted nor enumerated.
+//! Moving that `DELETE` after the watermark wait instead (as #330's spike
+//! did) opens the mirror race. Judging on *S* and deleting later has neither.
 //!
 //! One kind of swept definition is outside that argument: one this discharge
 //! dispatches to a chunked or direct build is `backfilling` once it commits,
@@ -82,17 +61,6 @@
 //! target held from before the pause, so a reader doesn't see those rows for
 //! the length of the build. The build's go-live catch-up sweeps again, and
 //! that sweep is exact by the argument above.
-//!
-//! That argument needs a kept ledger target's group row to be the sum of its
-//! live entries, and a direct build breaks it for a group whose rows left
-//! between *S* and the build's read: the build empties the ledger, writes
-//! only the groups the source has, and would leave that group's row at its
-//! old value. A row that joins the group once the definition applies again
-//! is then added on top, and the go-live sweep keeps the group, since it has
-//! a live entry by then (issue #815). So the build itself deletes every
-//! group its ledger has no live entry for, before it finishes, through the
-//! target-mutation seam like this sweep's deletes (`defs::backfill`, "Groups
-//! the ledger no longer has").
 //!
 //! # Why the delete comes last (issues #503 and #716)
 //!
@@ -103,9 +71,8 @@
 //!
 //! Such a drain can still touch the rows the sweep deletes (a bulk delete's
 //! CDC for a `catching_up` definition, say), so the sweep takes its locks in
-//! a drain page's order (ADR-0002 I5): the 1-1 targets, then the
-//! aggregates, each by target name; within a ledger target its entries,
-//! then its groups; and each class of row in key order.
+//! a drain page's order (ADR-0002 I5): the targets by name, and each class of
+//! row in key order.
 //! The cursor returns rows in no useful order, and a page of it holds some
 //! of every target's, so the read only stages the keys ([`Sweep::push`],
 //! [`Sweep::stage`]) and [`Sweep::finish`] deletes them all at the end.
@@ -145,36 +112,6 @@
 //! neither the deleted keys nor their prior images pile up in memory, and no
 //! re-read of an endpoint target's new images binds more than a batch.
 //!
-//! A ledger target needs more than that, since its Re-derive locks groups
-//! as well as entries, and a later batch's groups can sort below an
-//! earlier one's. Re-deriving each batch as a page does, entries then
-//! groups, would hold an earlier batch's group while it waits on a later
-//! batch's entry, which a page holding that entry and wanting that group
-//! makes a cycle. So the sweep takes every lock before it writes:
-//!
-//! 1. every batch's entries, in key order, and nothing else;
-//! 2. every group those entries are live in, read from the ledger once
-//!    each batch of them is locked, together with every orphan group the
-//!    read found, in key order;
-//! 3. then, batch by batch, the Re-derives and the orphan groups' delete,
-//!    on rows it already holds.
-//!
-//! Step 2 also takes the Re-derives' groups and the orphan groups in one
-//! pass. Taking each set on its own would hold a Re-derive's group while
-//! waiting on a lower orphan group, and a page holding the orphan group
-//! and wanting the higher one would close a cycle.
-//!
-//! A Re-derive could still move an entry into a group step 2 didn't lock:
-//! one its source row is in once a re-insert since the read backs it again.
-//! So the sweep's Re-derive (`staging::ledger::rederive_unbacked`) reads
-//! the source first and re-derives only the keys it finds no row for, each
-//! of which only leaves its group. It leaves a key the source backs again
-//! live, as it found it. The insert's own change drains after the
-//! discharge commits, and applies to the entry, whose `basis` predates it
-//! (I2), moving it from its old group to its new one, as it would after any
-//! skipped delete. A page that re-derived the key first already did the
-//! same, under the entry lock the sweep then waited on.
-//!
 //! # A 1-1 row backed again (issue #883)
 //!
 //! A change after *S* drains after the commit, but a page can still
@@ -212,19 +149,6 @@
 //! Either way the entry's basis predates that change, so the next change to
 //! the key applies (I2), as it would to a tombstone.
 //!
-//! # Pending deltas on a deleted group
-//!
-//! A group the sweep deletes can still have deltas staged for it: CDC
-//! committed before *S* that hasn't drained yet, which the definition
-//! applies once it drains (it is `live` or `catching_up` by then). That is
-//! routine for a `catching_up` definition, which has been applying since
-//! its build finished. On the ledger (#623 D5) such a change applies to its
-//! row's entry, not to the group row: the entry's basis says whether the
-//! change is already counted, and the group is written from its live
-//! entries, so a group refilled by then comes out as the source has it.
-//! `a_group_swept_with_its_delete_still_staged_is_rederived_when_refilled`
-//! pins this.
-//!
 //! # Which definitions are swept
 //!
 //! The discharge sweeps two sets, each scoped to the status the discharge
@@ -260,12 +184,10 @@
 //! A key column compared with `IS NOT DISTINCT FROM` forces a nested-loop
 //! anti-join (each target row rescans the source), which took ~20 s for a
 //! 50k-row 1-1 target in #330's spike. `=` lets Postgres hash it. A 1-1
-//! target's key is its source's: a `PRIMARY KEY`, all `NOT NULL`, gets `=`,
-//! and over a source keyed by a nullable unique index its columns are as
-//! nullable as a grouping column (issue #1141). Every aggregate grouping
-//! column is nullable (`ddl::create_aggregate_target_table`, issue #128), so
-//! for these keys the anti-join is split by which key columns are
-//! `NULL` in the target row: within one such pattern a `NULL` column matches
+//! target's key is its source's: a `PRIMARY KEY`, all `NOT NULL`, gets `=`.
+//! Over a source keyed by a nullable unique index (issue #1141) the key's
+//! columns can be `NULL`, so for those keys the anti-join is split by which
+//! key columns are `NULL` in the target row: within one such pattern a `NULL` column matches
 //! a source row whose key is `IS NULL`, and every other column matches with
 //! `=`. That's the same rule [`keyset_match_cols`] applies per
 //! batch. There is one branch per pattern present in the target when the
@@ -281,10 +203,9 @@ use std::collections::BTreeSet;
 use tokio_postgres::Transaction;
 use tokio_postgres::types::ToSql;
 
-use crate::defs::ast::{Expr, KeySpace};
+use crate::defs::ast::KeySpace;
 use crate::defs::catalog::CatalogError;
 use crate::defs::ddl::{self, PrimaryKeyColumn};
-use crate::defs::oracle::render_qualified_expr_sql;
 use crate::defs::{TransformStatus, grammar};
 use crate::pool::quote_ident;
 use crate::staging::apply::bounds_keyset_by_array;
@@ -307,10 +228,6 @@ struct KeyPart {
 /// How one rebuilt target's rows are matched against its source.
 struct Match {
     parts: Vec<KeyPart>,
-    /// #623 D3: a ledger target's ledger (quoted). A group row with a live
-    /// entry left is not an orphan here: the entry sweep re-derives the
-    /// entry, which deletes the group once it is empty.
-    ledger: Option<String>,
 }
 
 /// What a discharge's sweep deleted ([`Sweep::finish`]).
@@ -346,10 +263,9 @@ struct SweptTarget {
     id: i64,
     status: TransformStatus,
     /// Where [`Sweep::finish`] takes this target's locks: a drain page's
-    /// target order (ADR-0002 I5). The 1-1 targets come before the
-    /// aggregates, each by the definition's bare target name, the key
-    /// `staging::apply` orders a page's targets by.
-    lock_order: (bool, String),
+    /// target order (ADR-0002 I5), by the definition's bare target name, the
+    /// key `staging::apply` orders a page's targets by.
+    lock_order: String,
     target: String,
     target_ident: String,
     key_cols: Vec<PrimaryKeyColumn>,
@@ -360,22 +276,11 @@ struct SweptTarget {
     /// one.
     returning: String,
     has_image: bool,
-    /// #623 D3: for a ledger target's group sweep, the ledger (quoted): a
-    /// group is deleted only if it still has no live entry when the delete
-    /// runs, since a Re-derive may have joined one since the read.
-    ledger_guard: Option<String>,
     /// Issue #883: for a 1-1 target, its source (quoted): a row is deleted
     /// only if the source still has no row of its key when the delete runs,
     /// since a page may have re-derived it from a row inserted since the
     /// read ([`delete_statement`]).
     source_guard: Option<String>,
-    /// #623 D3: `Some` for a ledger target's entry sweep. Its branch finds
-    /// the ledger's live entries the source no longer backs, and
-    /// [`Sweep::finish`] re-derives them through this plan instead of
-    /// deleting target rows: the Re-derive finds no source row and takes
-    /// each entry out of its group, which deleting the group here would
-    /// leave counted in the ledger.
-    ledger_rederive: Option<crate::staging::ledger::LedgerTargetPlan>,
     /// The unbacked keys the read has returned for this target in its
     /// current page, by column: `page[j]` holds each key's `j`th column, as
     /// text. [`Sweep::stage`] moves them into [`SweptTarget::staged`] once
@@ -481,67 +386,8 @@ impl Sweep {
                 crate::instance_log::debug!(target = %target, "swept target is gone; nothing to sweep");
                 continue;
             }
-            // #623 D3: a target on the ledger is swept twice over. Its live
-            // entries the source no longer backs are re-derived here (which
-            // takes each out of its group, and deletes a group it empties),
-            // and a group row with no live entry left and no source row is
-            // deleted directly: a row a rebuild's build (which empties the
-            // ledger) found no source rows for.
-            let source_columns = crate::defs::catalog::source_columns_in(txn, id).await?;
-            let lock_order = (
-                matches!(def.key_space, KeySpace::Aggregate { .. }),
-                def.target.clone(),
-            );
-            let ledger = match crate::staging::ledger::route(&def, &source_columns) {
-                Some(shape) => {
-                    let source_pk = ddl::identity_key_columns(txn, &source_table).await?;
-                    let tag =
-                        i32::try_from(self.targets.len()).expect("fewer than 2^31 swept targets");
-                    let ledger = ddl::qualified_target_table_ident(
-                        &crate::defs::ledger::ledger_table_name(&target),
-                    );
-                    // The entry branch selects the entry's one key column.
-                    let staged = StagedKeys::new(
-                        &tag.to_string(),
-                        format!(
-                            "select l.{} as {} from {ledger} l",
-                            quote_ident(crate::defs::ledger::KEY_COLUMN),
-                            keyset_col(0)
-                        ),
-                        vec!["text".to_string()],
-                    );
-                    self.targets.push(SweptTarget {
-                        id,
-                        status,
-                        lock_order: lock_order.clone(),
-                        target: target.clone(),
-                        target_ident: target_ident.clone(),
-                        key_cols: key_cols.clone(),
-                        branches: vec![ledger_orphan_branch_sql(
-                            tag,
-                            &target,
-                            &ddl::qualified_source_table(&source_table),
-                            &source_pk,
-                        )],
-                        returning: String::new(),
-                        has_image: false,
-                        ledger_guard: None,
-                        source_guard: None,
-                        ledger_rederive: Some(crate::staging::ledger::LedgerTargetPlan::new(
-                            &target,
-                            &source_table,
-                            source_pk,
-                            key_cols.clone(),
-                            shape,
-                        )),
-                        page: Vec::new(),
-                        staged,
-                    });
-                    Some(ledger)
-                }
-                None => None,
-            };
-            let mut matching = match &def.key_space {
+            let lock_order = def.target.clone();
+            let matching = match &def.key_space {
                 // A JOIN's rows come from its own build (#1109), not an orphan
                 // sweep, and a request or a reinstalled capture on either of
                 // its tables rebuilds it (`staging::build::rebuild_candidates`),
@@ -558,9 +404,17 @@ impl Sweep {
                     });
                 }
                 KeySpace::OneToOne => one_to_one_match(&key_cols),
-                KeySpace::Aggregate { group_by } => aggregate_match(&target, group_by, &key_cols)?,
+                // An aggregate is rebuilt by its plan job (`staging::build`),
+                // which replaces every group, so there is nothing to sweep.
+                KeySpace::Aggregate { .. } => {
+                    return Err(IntakeError::UnsweepableTarget {
+                        target,
+                        reason: "an aggregate target is rebuilt, not swept; resume the \
+                                 transform, or drop it, to clear this"
+                            .to_string(),
+                    });
+                }
             };
-            matching.ledger = ledger.clone();
             let tag = i32::try_from(self.targets.len()).expect("fewer than 2^31 swept targets");
             let branches = orphan_branches(
                 txn,
@@ -592,9 +446,7 @@ impl Sweep {
                 branches,
                 returning,
                 has_image: image_expr.is_some(),
-                ledger_guard: ledger,
                 source_guard,
-                ledger_rederive: None,
                 page: Vec::new(),
                 staged,
             });
@@ -660,18 +512,13 @@ impl Sweep {
     /// in, flushes each deleted row through the target-mutation seam, and
     /// returns what the sweep deleted.
     ///
-    /// The read judged these rows unbacked on its snapshot, so this deletes
-    /// an aggregate's by key, whatever the source holds by now: a group the
-    /// source has since backed again is re-derived by the change that backed
-    /// it, which drains after this discharge commits. A 1-1 row is deleted
+    /// The read judged these rows unbacked on its snapshot; a row is deleted
     /// only if the source still doesn't back it (issue #883). See the module
     /// doc.
     ///
     /// It runs once the whole read is fetched, and takes its locks in a
-    /// drain page's order (ADR-0002 I5, issues #716 and #884): the 1-1
-    /// targets, then the aggregates, each by target name; within a ledger
-    /// target its entries, then its groups; and each class of row in key
-    /// order, in batches of at most [`SWEEP_BATCH`] keys that Postgres sorts
+    /// drain page's order (ADR-0002 I5, issues #716 and #884): the targets
+    /// by target name, and each target's rows in key order, in batches of at most [`SWEEP_BATCH`] keys that Postgres sorts
     /// ([`StagedKeys`]). See the module doc's "Why the delete comes last".
     pub(super) async fn finish(mut self, txn: &Transaction<'_>) -> Result<Swept, IntakeError> {
         self.stage(txn).await?;
@@ -682,20 +529,8 @@ impl Sweep {
             batch,
             buffered: _,
         } = self;
-        // Stable, so a ledger target's entry sweep stays ahead of its group
-        // sweep, which `add` pushed right after it.
         targets.sort_by(|a, b| a.lock_order.cmp(&b.lock_order));
-        let mut targets = targets.into_iter();
-        while let Some(target) = targets.next() {
-            if target.ledger_rederive.is_some() {
-                let groups = targets
-                    .next()
-                    .expect("a ledger target's group sweep follows its entry sweep");
-                debug_assert_eq!(groups.id, target.id, "the entry sweep's own group sweep");
-                swept.deleted +=
-                    sweep_ledger(txn, target, groups, &mut mutations, batch, &mut swept).await?;
-                continue;
-            }
+        for target in targets {
             if target.staged.is_empty() {
                 continue;
             }
@@ -747,186 +582,11 @@ async fn sweep_rows(
     Ok(deleted)
 }
 
-/// [`Sweep::finish`]'s work on a ledger target: `entries` is its entry
-/// sweep and `groups` its group sweep (see [`Sweep::add`]). If the
-/// definition is still in the status the sweep read it in, it re-derives
-/// the unbacked entries and deletes the orphan groups, records each group
-/// written or deleted in `mutations`, and returns how many groups it
-/// deleted.
-///
-/// It takes every lock before it writes anything, in a drain page's order
-/// (ADR-0002 I5, issue #884):
-///
-/// 1. **The entries**, in key order, in batches of at most `batch`
-///    ([`StagedKeys`]), and no other lock
-///    (`staging::ledger::lock_unbacked_entries`). Once a batch is locked,
-///    the groups its entries are live in are read from the ledger into a
-///    table of group locks to take; no page can move a locked entry since.
-/// 2. **Their groups and the orphan groups together**, in key order, in
-///    batches the same way: the groups step 1 gathered, and every group the
-///    read found with no member and no source row.
-/// 3. **The writes**: the Re-derives, a batch of entries at a time, read
-///    back from the staged entries again (`staging::ledger::rederive_unbacked`),
-///    and then the orphan groups' delete, in batches. Every row they write
-///    is one step 1 or 2 locked.
-///
-/// A Re-derive only takes an entry out of its group: it re-derives only the
-/// keys its read finds no source row for, so it moves no entry into a group
-/// step 2 didn't lock. The keys a re-insert since the read backs again are
-/// left to the insert's own change (see `rederive_unbacked`).
-///
-/// Re-deriving each batch in a page's own call instead, entries and groups
-/// together, would lock a later batch's groups after an earlier batch's,
-/// and a later group can sort below an earlier one. A page that holds the
-/// lower group's entry and then wants the higher group closes a cycle, as
-/// does one that holds an orphan group and wants a Re-derive's.
-async fn sweep_ledger(
-    txn: &Transaction<'_>,
-    entries: SweptTarget,
-    groups: SweptTarget,
-    mutations: &mut TargetMutations,
-    batch: usize,
-    swept: &mut Swept,
-) -> Result<usize, IntakeError> {
-    if entries.staged.is_empty() && groups.staged.is_empty() {
-        return Ok(0);
-    }
-    let applying: bool = txn
-        .query_one(
-            "select exists (select 1 from transform_definitions \
-             where id = $1 and status = $2)",
-            &[&entries.id, &entries.status.as_str()],
-        )
-        .await?
-        .get(0);
-    if !applying {
-        entries.staged.drop_table(txn).await?;
-        groups.staged.drop_table(txn).await?;
-        return Ok(0);
-    }
-    let plan = entries
-        .ledger_rederive
-        .as_ref()
-        .expect("an entry sweep has its ledger plan");
-    let ledger = groups
-        .ledger_guard
-        .as_deref()
-        .expect("a ledger target's group sweep has its ledger");
-
-    // 1. The entries, in the ledger's key order, and the groups each batch
-    //    is live in, read once the batch is locked.
-    let mut locks = StagedKeys::new(
-        "locks",
-        key_relation(&groups.target_ident, &groups.key_cols),
-        key_types(&groups.key_cols),
-    );
-    locks.create(txn).await?;
-    if !entries.staged.is_empty() {
-        let insert_live = live_groups_statement(&locks, &groups, ledger);
-        entries.staged.open(txn).await?;
-        while let Some(keys) = next_entry_keys(txn, &entries.staged, batch).await? {
-            let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
-            swept.bound(refs.len());
-            crate::staging::ledger::lock_unbacked_entries(txn, plan, &refs).await?;
-            crate::staging::ledger::query_by_entry_key(txn, &insert_live, &[&keys]).await?;
-        }
-        entries.staged.close(txn).await?;
-    }
-
-    // 2. Their groups and the orphan groups, in the target's key order.
-    if !groups.staged.is_empty() {
-        txn.batch_execute(&format!(
-            "insert into {} select * from {}",
-            locks.table, groups.staged.table
-        ))
-        .await?;
-    }
-    locks.open(txn).await?;
-    while let Some(arrays) = locks.next(txn, batch).await? {
-        swept.bound(arrays[0].len());
-        lock_keys(txn, &groups, &arrays).await?;
-    }
-    locks.close(txn).await?;
-    locks.drop_table(txn).await?;
-
-    // 3. The writes, every lock held.
-    let mut deleted = 0;
-    if !entries.staged.is_empty() {
-        // A tombstone's `applied_seg`: the ring's latest segment, at or
-        // above any a change for these keys can still be pending in.
-        let seg_seq: Option<i64> = txn
-            .query_one("select max(seg_seq) from segments", &[])
-            .await?
-            .get(0);
-        let mut rederived = 0;
-        entries.staged.open(txn).await?;
-        while let Some(keys) = next_entry_keys(txn, &entries.staged, batch).await? {
-            let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
-            let (_, emptied) = crate::staging::ledger::rederive_unbacked(
-                txn,
-                plan,
-                &refs,
-                seg_seq.unwrap_or(0),
-                mutations,
-            )
-            .await?;
-            mutations.spill_over(txn, batch).await?;
-            rederived += refs.len();
-            deleted += emptied;
-        }
-        entries.staged.close(txn).await?;
-        crate::instance_log::info!(
-            target = %entries.target,
-            keys = rederived,
-            groups_deleted = deleted,
-            "re-derived ledger entries the source no longer backs"
-        );
-    }
-    entries.staged.drop_table(txn).await?;
-    let mut orphans_deleted = 0;
-    if !groups.staged.is_empty() {
-        groups.staged.open(txn).await?;
-        while let Some(arrays) = groups.staged.next(txn, batch).await? {
-            swept.bound(arrays[0].len());
-            for row in delete_locked(txn, &groups, &arrays).await? {
-                let prior = groups.has_image.then(|| row.get::<_, String>(1));
-                mutations.record(&groups.target, row.get(0), prior, 0, None, None);
-                orphans_deleted += 1;
-            }
-            mutations.spill_over(txn, batch).await?;
-        }
-        groups.staged.close(txn).await?;
-    }
-    groups.staged.drop_table(txn).await?;
-    if orphans_deleted > 0 {
-        crate::instance_log::info!(
-            target = %groups.target,
-            deleted = orphans_deleted,
-            "dropped target rows the source no longer backs"
-        );
-    }
-    Ok(deleted + orphans_deleted)
-}
-
-/// The next at most `batch` of a ledger target's staged entry keys, which
-/// are never `NULL`, from the open cursor of `staged`.
-async fn next_entry_keys(
-    txn: &Transaction<'_>,
-    staged: &StagedKeys,
-    batch: usize,
-) -> Result<Option<Vec<String>>, tokio_postgres::Error> {
-    Ok(staged
-        .next(txn, batch)
-        .await?
-        .map(|mut arrays| arrays.swap_remove(0).into_iter().flatten().collect()))
-}
-
 /// The cursor [`StagedKeys::open`] declares. Only one staged table is read
 /// at a time.
 const STAGED_CURSOR: &str = "trellis_sweep_keys";
 
-/// One class of a swept target's keys (a 1-1 target's rows, a ledger's
-/// entries, or an aggregate's groups), staged in a temporary table whose
+/// A swept 1-1 target's unbacked keys, staged in a temporary table whose
 /// columns (`c0`, `c1`, …, as [`keyset_col`] names them) have the type and
 /// collation of the rows' own key columns, so Postgres hands them back
 /// distinct and in its own key order, at most a batch at a time
@@ -963,7 +623,7 @@ impl StagedKeys {
     /// Keys staged as `pg_temp.trellis_sweep_<name>`, with the columns
     /// `relation` selects, cast from text as `types`. Nothing is created
     /// until the first key is added. A swept target's table is named by its
-    /// tag, and [`sweep_ledger`]'s group locks by `locks`.
+    /// tag.
     fn new(name: &str, relation: String, types: Vec<String>) -> Self {
         Self {
             table: format!("pg_temp.trellis_sweep_{name}"),
@@ -1097,28 +757,6 @@ fn key_types(key_cols: &[PrimaryKeyColumn]) -> Vec<String> {
     key_cols.iter().map(|c| c.data_type.clone()).collect()
 }
 
-/// The insert into `locks` of the groups a ledger target's entries of the
-/// keys `$1` (`text[]`) are live in, for `groups`, the target's group
-/// sweep, over `ledger` (quoted). The ledger names its `GROUP BY` columns as
-/// the target does.
-fn live_groups_statement(locks: &StagedKeys, groups: &SweptTarget, ledger: &str) -> String {
-    use crate::defs::ledger::{KEY_COLUMN, MEMBER_COLUMN, TOMBSTONE_COLUMN};
-    let cols: Vec<String> = groups
-        .key_cols
-        .iter()
-        .map(|c| format!("l.{}", quote_ident(&c.name)))
-        .collect();
-    format!(
-        "insert into {} select distinct {} from {ledger} as l \
-         where l.{} = any($1::text[]) and l.{} and not l.{}",
-        locks.table,
-        cols.join(", "),
-        quote_ident(KEY_COLUMN),
-        quote_ident(MEMBER_COLUMN),
-        quote_ident(TOMBSTONE_COLUMN),
-    )
-}
-
 /// A 1-1 target's key is the source's own key, column for column, by name
 /// (`ddl::create_target_table` mirrors the source's primary key onto it).
 fn one_to_one_match(key_cols: &[PrimaryKeyColumn]) -> Match {
@@ -1134,50 +772,15 @@ fn one_to_one_match(key_cols: &[PrimaryKeyColumn]) -> Match {
                 }
             })
             .collect(),
-        ledger: None,
     }
-}
-
-/// An aggregate target's key is its grouping columns, each read from the
-/// source column. Each value is cast to the target column's type (the build
-/// writes it through the same assignment), which also keeps both sides of
-/// the `=` one type, so it hashes.
-fn aggregate_match(
-    target: &str,
-    group_by: &[String],
-    key_cols: &[PrimaryKeyColumn],
-) -> Result<Match, IntakeError> {
-    let mut parts = Vec::with_capacity(group_by.len());
-    for key in group_by {
-        let name = key.as_str();
-        let col = key_cols.iter().find(|c| c.name == name).ok_or_else(|| {
-            IntakeError::UnsweepableTarget {
-                target: target.to_string(),
-                reason: format!("its primary key has no grouping column {name:?}"),
-            }
-        })?;
-        parts.push(KeyPart {
-            target_col: quote_ident(name),
-            source_sql: format!(
-                "({})::{}",
-                render_qualified_expr_sql(&Expr::Column(key.clone()), "s"),
-                col.data_type
-            ),
-            nullable: col.nullable,
-        });
-    }
-    Ok(Match {
-        parts,
-        ledger: None,
-    })
 }
 
 /// The read's `UNION ALL` branches that select `target_ident`'s unbacked
-/// rows under `tag`: one per pattern of `NULL` grouping columns present in
+/// rows under `tag`: one per pattern of `NULL` key columns present in
 /// the target now (see the module doc), and, for a target with a nullable
 /// key column, one more for any other pattern.
 ///
-/// The patterns are read here, before the read's snapshot, so a group with
+/// The patterns are read here, before the read's snapshot, so a row with
 /// a new pattern can reach the target in between. The last branch catches
 /// it with `IS NOT DISTINCT FROM`, which can't hash, but it only scans the
 /// target rows no earlier branch covers: normally none.
@@ -1275,8 +878,6 @@ fn orphan_branch_sql(
 ) -> String {
     let mut filter = Vec::new();
     let mut matches = Vec::new();
-    // The same match against a ledger entry's group columns (#623 D3).
-    let mut ledger_matches = Vec::new();
     match pattern {
         OrphanPattern::Exactly(pattern) => {
             let is_null = |i: usize| {
@@ -1290,13 +891,11 @@ fn orphan_branch_sql(
                 if is_null(i) {
                     filter.push(format!("t.{col} is null and "));
                     matches.push(format!("{} is null", part.source_sql));
-                    ledger_matches.push(format!("l.{col} is null"));
                 } else {
                     if part.nullable {
                         filter.push(format!("t.{col} is not null and "));
                     }
                     matches.push(format!("{} = t.{col}", part.source_sql));
-                    ledger_matches.push(format!("l.{col} = t.{col}"));
                 }
             }
         }
@@ -1312,7 +911,6 @@ fn orphan_branch_sql(
                     "{} is not distinct from t.{}",
                     part.source_sql, part.target_col
                 ));
-                ledger_matches.push(format!("l.{0} is not distinct from t.{0}", part.target_col));
             }
         }
     }
@@ -1321,25 +919,10 @@ fn orphan_branch_sql(
         .iter()
         .map(|p| format!("t.{}::text", p.target_col))
         .collect();
-    // A ledger target's group row is the sum of its live entries (#623 D3),
-    // so one with none is an orphan whatever the source holds: a source row
-    // the build didn't see joins its group through its own Re-derive, which
-    // starts the group again from zero.
-    let unbacked = match &matching.ledger {
-        Some(ledger) => {
-            use crate::defs::ledger::{MEMBER_COLUMN, TOMBSTONE_COLUMN};
-            format!(
-                "not exists (select 1 from {ledger} as l where l.{} and not l.{} and {})",
-                quote_ident(MEMBER_COLUMN),
-                quote_ident(TOMBSTONE_COLUMN),
-                ledger_matches.join(" and "),
-            )
-        }
-        None => format!(
-            "not exists (select 1 from {source_ident} as s where {})",
-            matches.join(" and "),
-        ),
-    };
+    let unbacked = format!(
+        "not exists (select 1 from {source_ident} as s where {})",
+        matches.join(" and "),
+    );
     format!(
         "select {tag}::int4, null::text, array[{}]::text[] from {target_ident} as t \
          where {}{unbacked}",
@@ -1348,35 +931,10 @@ fn orphan_branch_sql(
     )
 }
 
-/// A ledger target's branch of the read (#623 D3): `(tag, NULL, {key})` for
-/// every live ledger entry whose key no source row has. The key is the
-/// ring's encoding of the source key ([`ddl::pk_key_sql_expr`]), which the
-/// anti-join hashes on.
-fn ledger_orphan_branch_sql(
-    tag: i32,
-    target: &str,
-    source_ident: &str,
-    source_pk: &[PrimaryKeyColumn],
-) -> String {
-    use crate::defs::ledger::{KEY_COLUMN, MEMBER_COLUMN, TOMBSTONE_COLUMN, ledger_table_name};
-    let key = quote_ident(KEY_COLUMN);
-    format!(
-        "select {tag}::int4, null::text, array[l.{key}]::text[] from {} as l \
-         where l.{} and not l.{} \
-           and not exists (select 1 from {source_ident} as s where {} = l.{key})",
-        ddl::qualified_target_table_ident(&ledger_table_name(target)),
-        quote_ident(MEMBER_COLUMN),
-        quote_ident(TOMBSTONE_COLUMN),
-        ddl::pk_key_sql_expr(source_pk, Some("s")),
-    )
-}
-
 /// Runs [`lock_statement`] and then [`delete_statement`] for `arrays`, each
 /// under `ENTRY_PLAN_SETTINGS` (through `ledger::query_by_entry_key`), and
 /// returns the deleted rows: [`Sweep::finish`]'s statements for one batch
-/// of a 1-1 target's keys, as they run, which their plan tests run too. A
-/// ledger target's group sweep runs the two apart ([`lock_keys`], then
-/// [`delete_locked`]), with its Re-derives between.
+/// of a 1-1 target's keys, as they run, which their plan tests run too.
 ///
 /// The delete alone would lock the rows in its plan's order (the target's
 /// heap order, under a hash join), so the lock takes them first, in key
@@ -1489,9 +1047,7 @@ fn target_key_cols(target: &SweptTarget) -> Vec<String> {
 
 /// [`delete_keys`]'s lock: `target`'s rows of the keys in `arrays` (see
 /// [`keyset`]), `for update` in the order a drain page takes the same rows
-/// (ADR-0002 I5). A page locks an aggregate's groups in key order, ascending
-/// with `NULL`s last (the group upsert's `order by`). It locks a 1-1
-/// target's rows by `NULL` pattern (`staging::apply`'s pre-lock, issue
+/// (ADR-0002 I5). A page locks a 1-1 target's rows by `NULL` pattern (`staging::apply`'s pre-lock, issue
 /// #1141): the keys with no `NULL` part first, then each pattern's keys, the
 /// patterns ordered by which columns are `NULL` (a key whose first nullable
 /// column is `NULL` after one whose first nullable column isn't), each
@@ -1524,9 +1080,8 @@ fn lock_statement(target: &SweptTarget, arrays: &[Vec<Option<String>>]) -> Strin
 
 /// [`delete_keys`]'s delete: `target`'s rows of the keys in `arrays` (see
 /// [`keyset`]) that are still unbacked when it runs, returning each deleted
-/// row's key (and prior image). For a ledger target's group sweep, that is a
-/// group with no live ledger entry left; for a 1-1 target, a row whose source
-/// has no row of its key (issue #883). The 1-1 re-check relies on
+/// row's key (and prior image): a row whose source has no row of its key
+/// (issue #883). The 1-1 re-check relies on
 /// [`lock_statement`] having run first, in its own statement: see the module
 /// doc's "A 1-1 row backed again".
 fn delete_statement(target: &SweptTarget, arrays: &[Vec<Option<String>>]) -> String {
@@ -1535,13 +1090,6 @@ fn delete_statement(target: &SweptTarget, arrays: &[Vec<Option<String>>]) -> Str
         condition,
     } = keyset(target, arrays);
     let mut guard = String::new();
-    if let Some(ledger) = &target.ledger_guard {
-        guard.push_str(&ledger_guard(
-            ledger,
-            &target.key_cols,
-            &null_patterns(arrays),
-        ));
-    }
     if let Some(source) = &target.source_guard {
         // A 1-1 target's key is the source's own key, column for column
         // (`one_to_one_match`). The source's side is bounded by the keys as
@@ -1556,7 +1104,7 @@ fn delete_statement(target: &SweptTarget, arrays: &[Vec<Option<String>>]) -> Str
         let bound = keyset_bound(&source_cols, &target.key_cols, &patterns);
         if target.key_cols.iter().any(|c| c.nullable) {
             // A source keyed by a nullable unique index (issue #1141): a
-            // clause per `NULL` pattern, as [`ledger_guard`]'s.
+            // clause per `NULL` pattern, as [`source_guard`]'s.
             guard.push_str(&source_guard(source, &target.key_cols, &patterns, &bound));
         } else {
             let matches: Vec<String> = source_cols
@@ -1576,76 +1124,12 @@ fn delete_statement(target: &SweptTarget, arrays: &[Vec<Option<String>>]) -> Str
     )
 }
 
-/// [`delete_statement`]'s guard for a ledger target's group sweep: it keeps
-/// a group row (aliased `t`) that a live entry of `ledger` (quoted) has the
-/// group of. It is one clause per `NULL` pattern of the batch's keys
-/// (`patterns`, from [`null_patterns`]), each ` and (<the row has another
-/// pattern> or not exists (<a live entry of the row's group>))`. The entry
-/// matches with `=` on the pattern's non-`NULL` columns and `is null` on its
-/// `NULL` ones, which together are `NULL`-safe equality for a row of that
-/// pattern. Every row the delete reaches has one of the batch's patterns,
-/// since [`keyset_match_cols`] matches it to a key. A row of any other
-/// pattern would pass every clause unguarded, so `patterns` must be the
-/// ones the keyset matches by.
-///
-/// So each `not exists` constrains every column of the ledger's `GROUP BY`
-/// index (`defs::ledger::aggregate_ledger_index_ddl`). The planner either
-/// probes the index once per key, for that key's group alone, or hashes the
-/// ledger's live groups once. Whichever it picks, stale statistics included,
-/// no key is compared with another group's entries. The `or` in front
-/// runs the probe only for rows of its pattern. A row of another pattern
-/// never reaches it, so it isn't compared with every entry that shares its
-/// non-`NULL` columns.
-///
-/// The obvious alternatives are worse here:
-/// - **A per-column match**, `(l.g = t.g or (l.g is null and t.g is null))`,
-///   can't be an index condition, a hash key or a merge key. With the
-///   ledger's statistics from before a reload, the planner compares every
-///   key with every live entry. With current statistics, it probes the index
-///   on the first column alone. For a 2-column key with 4 values in its
-///   first column, a batch of 4,000 of 200k groups takes 11 s with current
-///   statistics and 23 s with stale ones, against 16 ms and 25 ms for this
-///   guard (issue #819).
-/// - **A record comparison** (`row(...)`), which the direct build's delete
-///   of the groups its ledger lost uses (`defs::backfill`), merges or hashes
-///   only against the whole ledger. It also needs nested loops off, which
-///   turns the keyset's own join into a merge over the target's index.
-///   That delete reads both tables whole anyway, but this one reads only its
-///   keys.
-fn ledger_guard(ledger: &str, key_cols: &[PrimaryKeyColumn], patterns: &[Vec<bool>]) -> String {
-    use crate::defs::ledger::{MEMBER_COLUMN, TOMBSTONE_COLUMN};
-    patterns
-        .iter()
-        .map(|pattern| {
-            let mut other = Vec::with_capacity(key_cols.len());
-            let mut matches = Vec::with_capacity(key_cols.len());
-            for (c, &null) in key_cols.iter().zip(pattern) {
-                let col = quote_ident(&c.name);
-                if null {
-                    other.push(format!("t.{col} is not null"));
-                    matches.push(format!("l.{col} is null"));
-                } else {
-                    other.push(format!("t.{col} is null"));
-                    matches.push(format!("l.{col} = t.{col}"));
-                }
-            }
-            format!(
-                " and ({} or not exists (select 1 from {ledger} as l where l.{} and not l.{} and {}))",
-                other.join(" or "),
-                quote_ident(MEMBER_COLUMN),
-                quote_ident(TOMBSTONE_COLUMN),
-                matches.join(" and "),
-            )
-        })
-        .collect()
-}
-
 /// [`delete_statement`]'s guard for a 1-1 target whose key has a nullable
 /// column (issue #1141): it keeps a row (aliased `t`) that `source` (quoted)
 /// still has a row of the key of. One clause per `NULL` pattern of the
 /// batch's keys, matching the source with `=` on the pattern's non-`NULL`
-/// columns and `is null` on its `NULL` ones, for the reasons
-/// [`ledger_guard`] gives. `bound` is [`keyset_bound`]'s over the source's
+/// columns and `is null` on its `NULL` ones, so each comparison is an `=`
+/// that hashes (`IS NOT DISTINCT FROM` would force a nested loop). `bound` is [`keyset_bound`]'s over the source's
 /// columns.
 fn source_guard(
     source: &str,
@@ -1677,16 +1161,16 @@ fn source_guard(
         .collect()
 }
 
-/// The `k`-alias column name for the `i`th `GROUP BY` column in a keyset
+/// The `k`-alias column name for the `i`th key column in a keyset
 /// `unnest(...)`. Named `c0`, `c1`, … so they never
-/// collide with the source/target's own (arbitrarily-named) grouping columns
+/// collide with the source/target's own (arbitrarily-named) key columns
 /// when both appear in one query's join condition.
 fn keyset_col(i: usize) -> String {
     format!("c{i}")
 }
 
-/// The distinct patterns of `NULL` `GROUP BY` columns among a keyset's groups
-/// (`arrays[j]` holding column `j`'s value for each group): `pattern[i]` is whether
+/// The distinct patterns of `NULL` key columns among a keyset's keys
+/// (`arrays[j]` holding column `j`'s value for each key): `pattern[i]` is whether
 /// column `i` is `NULL`. Sorted, so the SQL [`keyset_match_cols`] renders
 /// from them is deterministic. A batch with no `NULL` key has exactly one pattern,
 /// all `false`.
@@ -1703,7 +1187,7 @@ fn null_patterns(arrays: &[Vec<Option<String>>]) -> Vec<Vec<bool>> {
 /// [`null_patterns`] entry, `or`ed together (and parenthesized) when there
 /// is more than one. Within an arm, column `i` is `<col> = k.c<i>`, or
 /// `<col> is null and k.c<i> is null` where the pattern has it `NULL`. A
-/// group matches only its own pattern's arm, so this is exactly `is not
+/// key matches only its own pattern's arm, so this is exactly `is not
 /// distinct from` on every column, but indexable (issue #445).
 fn keyset_match_cols(cols: &[String], patterns: &[Vec<bool>]) -> String {
     let arms: Vec<String> = patterns
@@ -1781,11 +1265,6 @@ mod db_tests {
     //! at every build's go-live, so a target with nothing to delete must
     //! cost one hashed anti-join per target, not a probe of the source per
     //! target row.
-    //!
-    //! The aggregates here are held out of the Re-derive build
-    //! ([`hold_orders_out`]): every plain aggregate is built by the Re-derive
-    //! build since #625 F5, which never reaches this sweep, and a held-out one
-    //! keeps the old build until #625 F10.
 
     use super::*;
     use crate::defs::ValueType;
@@ -1812,39 +1291,6 @@ mod db_tests {
         (pool, raw)
     }
 
-    /// `orders_by_g`, held out of the Re-derive build by [`hold_orders_out`],
-    /// so it still takes the old build (and reaches this sweep) until #625
-    /// F10.
-    const BY_G: &str = "TRANSFORM orders_by_g FROM orders GROUP BY g \
-        WITHOUT SOURCE INDEX SELECT max(a) AS total";
-
-    /// Holds every definition over `public.orders` out of the Re-derive
-    /// build, so [`BY_G`] takes the old build.
-    async fn hold_orders_out(raw: &tokio_postgres::Client) {
-        crate::intake::markers::hold_out_of_the_rederive_build(raw, "public.orders")
-            .await
-            .expect("hold orders' definitions out of the Re-derive build");
-    }
-
-    /// Runs `ids`' sweep on its own: the discharge's read with nothing to
-    /// enumerate.
-    async fn sweep(txn: &Transaction<'_>, ids: &[i64]) -> Swept {
-        let mut sweep = Sweep::default();
-        sweep
-            .add(txn, ids, TransformStatus::CatchingUp)
-            .await
-            .expect("plan the sweep");
-        if super::super::markers::declare_read(txn, None, &sweep)
-            .await
-            .expect("declare the read")
-        {
-            super::super::markers::fetch_read(txn, "", &mut sweep)
-                .await
-                .expect("fetch the read");
-        }
-        sweep.finish(txn).await.expect("flush the sweep")
-    }
-
     /// The `catching_up` definitions, by id.
     async fn catching_up(raw: &tokio_postgres::Client) -> Vec<i64> {
         raw.query(
@@ -1857,203 +1303,6 @@ mod db_tests {
         .map(|row| row.get(0))
         .collect()
     }
-
-    /// A `catching_up` 1-1 and aggregate over a 20k-row source, with no
-    /// orphans: the sweep deletes nothing, and each target's branch of the
-    /// read plans as an anti-join, and each that reads the source plans as a
-    /// set-based one (hash or merge), never a nested loop that probes the
-    /// source once per target row. (The ledger guard probes the ledger's
-    /// group index once per target group.) The aggregate's
-    /// catch-all branch, for a `NULL` pattern that turned up after the sweep
-    /// read the patterns, is the exception: it only scans rows no other
-    /// branch covers. A planted orphan shows the sweep isn't vacuous.
-    #[tokio::test]
-    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
-    async fn a_sweep_with_no_orphans_deletes_nothing_through_an_anti_join() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (pool, mut raw) = connect(&db).await;
-        raw.batch_execute(
-            "create table public.orders (id bigint primary key, g text, a numeric); \
-             insert into public.orders \
-               select n, 'g' || (n % 100), n from generate_series(1, 20000) n",
-        )
-        .await
-        .expect("seed orders");
-        hold_orders_out(&raw).await;
-        let columns = HashMap::from([
-            ("id".to_string(), ValueType::Numeric),
-            ("g".to_string(), ValueType::Text),
-            ("a".to_string(), ValueType::Numeric),
-        ]);
-        // The copy's build is the old one, with a go-live catch-up to
-        // sweep, only while `orders` reads as another definition's target:
-        // over a captured table a plain 1-1 is the Re-derive build's
-        // (#625 F8a).
-        crate::intake::markers::feed_from_a_test_definition(&raw, "public.orders")
-            .await
-            .expect("make orders read as another definition's target");
-        for text in ["TRANSFORM orders_copy FROM orders SELECT a AS a", BY_G] {
-            crate::defs::catalog::install_definition(&pool, text, &columns, "public")
-                .await
-                .expect("register");
-        }
-        crate::intake::markers::settle_builds(&pool).await;
-        raw.batch_execute("analyze public.orders, public.orders_copy, public.orders_by_g")
-            .await
-            .expect("analyze");
-        let ids = catching_up(&raw).await;
-        assert_eq!(ids.len(), 2, "both builds finished");
-
-        let txn = raw.transaction().await.expect("begin");
-        let mut planned = Sweep::default();
-        planned
-            .add(&txn, &ids, TransformStatus::CatchingUp)
-            .await
-            .expect("plan the sweep");
-        let (catch_all, hashable): (Vec<&str>, Vec<&str>) = planned
-            .branches()
-            .partition(|sql| sql.contains("is not distinct from"));
-        // The copy's branch, and the aggregate's entry sweep and ledger
-        // guard: a held-out aggregate is on the ledger (#623 D5).
-        assert_eq!(
-            hashable.len(),
-            3,
-            "the copy's and the ledger's branches: {hashable:?}"
-        );
-        assert_eq!(catch_all.len(), 1, "the aggregate's catch-all");
-        for sql in hashable {
-            let plan: Vec<String> = txn
-                .query(&format!("explain {sql}"), &[])
-                .await
-                .expect("explain the sweep")
-                .into_iter()
-                .map(|row| row.get(0))
-                .collect();
-            let plan = plan.join("\n");
-            let reads_source = sql.contains(r#""public"."orders" as s"#);
-            assert!(
-                plan.contains("Anti Join") && !(reads_source && plan.contains("Nested Loop")),
-                "the sweep must plan as a set-based anti-join:\n{plan}"
-            );
-        }
-        // The catch-all's nested loop costs nothing while no target row has
-        // an unlisted pattern: its filter rejects every row, so the side it
-        // checks against, the ledger for a ledger-routed target, never runs.
-        let plan: Vec<String> = txn
-            .query(
-                &format!(
-                    "explain (analyze, costs off, timing off, summary off) {}",
-                    catch_all[0]
-                ),
-                &[],
-            )
-            .await
-            .expect("run the catch-all")
-            .into_iter()
-            .map(|row| row.get(0))
-            .collect();
-        let ledger_scans: Vec<&String> = plan
-            .iter()
-            .filter(|l| l.contains(" on orders_by_g__ledger "))
-            .collect();
-        assert!(
-            !ledger_scans.is_empty() && ledger_scans.iter().all(|l| l.contains("never executed")),
-            "the catch-all must not scan the ledger when no row has a new pattern:\n{}",
-            plan.join("\n")
-        );
-        let swept = sweep(&txn, &ids).await;
-        assert_eq!(swept.deleted, 0, "nothing to delete");
-
-        txn.batch_execute("insert into public.orders_copy (id, a) values (-1, 0)")
-            .await
-            .expect("plant an orphan");
-        let swept = sweep(&txn, &ids).await;
-        assert_eq!(
-            swept.deleted, 1,
-            "the planted orphan is the only row deleted"
-        );
-    }
-
-    /// Issue #436: the sweep judges a row on its read's snapshot, and deletes
-    /// what it judged whatever the source holds by the time it fetches. Group
-    /// `a` has no source rows when the read is declared and gets one before
-    /// the fetch: it is deleted (the refill's own change re-derives it once it
-    /// drains). Group `b` is backed when the read is declared and loses its
-    /// rows before the fetch: it is kept (the read's enumeration, or those
-    /// deletes' changes, re-derive it). A group with a `NULL` pattern that
-    /// appeared after the sweep read the patterns is still found.
-    #[tokio::test]
-    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
-    async fn a_sweep_judges_rows_on_its_reads_snapshot() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (pool, mut raw) = connect(&db).await;
-        raw.batch_execute(
-            "create table public.orders (id bigint primary key, g text, a numeric); \
-             insert into public.orders values (1, 'a', 1), (2, 'b', 2), (3, 'b', 3)",
-        )
-        .await
-        .expect("seed orders");
-        hold_orders_out(&raw).await;
-        let columns = HashMap::from([
-            ("id".to_string(), ValueType::Numeric),
-            ("g".to_string(), ValueType::Text),
-            ("a".to_string(), ValueType::Numeric),
-        ]);
-        crate::defs::catalog::install_definition(&pool, BY_G, &columns, "public")
-            .await
-            .expect("register");
-        crate::intake::markers::settle_builds(&pool).await;
-        let ids = catching_up(&raw).await;
-        raw.batch_execute("delete from public.orders where g = 'a'")
-            .await
-            .expect("empty group a");
-        let (_, other) = connect(&db).await;
-
-        let txn = raw.transaction().await.expect("begin");
-        let mut sweep = Sweep::default();
-        sweep
-            .add(&txn, &ids, TransformStatus::CatchingUp)
-            .await
-            .expect("plan the sweep");
-        // A group whose `NULL` pattern the sweep didn't see, unbacked.
-        other
-            .batch_execute("insert into public.orders_by_g (g, total) values (null, 7)")
-            .await
-            .expect("plant a NULL group");
-        assert!(
-            super::super::markers::declare_read(&txn, None, &sweep)
-                .await
-                .expect("declare the read")
-        );
-        other
-            .batch_execute(
-                "insert into public.orders values (4, 'a', 100); \
-                 delete from public.orders where g = 'b'",
-            )
-            .await
-            .expect("refill group a and empty group b");
-        super::super::markers::fetch_read(&txn, "", &mut sweep)
-            .await
-            .expect("fetch the read");
-        let swept = sweep.finish(&txn).await.expect("flush the sweep");
-        txn.commit().await.expect("commit");
-
-        assert_eq!(swept.deleted, 2, "group a and the NULL group");
-        let groups: Vec<Option<String>> = raw
-            .query("select g from public.orders_by_g order by g", &[])
-            .await
-            .expect("read the target")
-            .into_iter()
-            .map(|row| row.get(0))
-            .collect();
-        assert_eq!(groups, vec![Some("b".to_string())]);
-    }
-
-    /// The advisory lock key a test holds to freeze the sweep at a pause
-    /// point (`crate::staging::interleave`).
-    const SWEEP_PAUSE: i64 = 716;
 
     /// [`sweep`], committed, on a connection of its own and inside `scope`,
     /// so a test can freeze it at a pause point and drive another
@@ -2084,25 +1333,6 @@ mod db_tests {
             txn.commit().await?;
             Ok(swept)
         }))
-    }
-
-    /// Runs `statements` (each with one `text[]` parameter, or none) in one
-    /// transaction on a connection of its own, and commits: a drain page's
-    /// locks, taken in the order `staging::apply::apply_page` takes them.
-    fn spawn_page(
-        client: tokio_postgres::Client,
-        statements: Vec<(String, Option<Vec<String>>)>,
-    ) -> tokio::task::JoinHandle<Result<(), tokio_postgres::Error>> {
-        tokio::spawn(async move {
-            client.batch_execute("begin").await?;
-            for (sql, keys) in &statements {
-                match keys {
-                    Some(keys) => client.execute(sql.as_str(), &[keys]).await?,
-                    None => client.execute(sql.as_str(), &[]).await?,
-                };
-            }
-            client.batch_execute("commit").await
-        })
     }
 
     /// The first unbacked key the sweep of `ids` reads, declared as
@@ -2152,210 +1382,6 @@ mod db_tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-    }
-
-    /// The page's entry lock on [`BY_G`]'s ledger: `staging::ledger`'s
-    /// `lock_statement`, every entry of `$1` in key order.
-    fn by_g_entry_lock() -> String {
-        let key = quote_ident(crate::defs::ledger::KEY_COLUMN);
-        format!(
-            "select 1 from public.orders_by_g__ledger \
-             where {key} = any($1::text[]) order by {key} for update"
-        )
-    }
-
-    /// Issue #716: the sweep locks a ledger target's entries in key order
-    /// over every key its read found, as a drain page does (ADR-0002 I5),
-    /// not per page of the read. Every entry of [`BY_G`] is unbacked and its
-    /// ledger is laid out in descending key order, so the read's first page
-    /// holds the highest keys and its second the lowest. A page locks the
-    /// lowest and the highest while the sweep is frozen after an entry lock.
-    ///
-    /// Locking per read page, the sweep held the highest key there and the
-    /// page queued on it holding the lowest, which the sweep's second read
-    /// page then wanted: a deadlock, which Postgres broke by aborting one of
-    /// the two (40P01). Locking in key order, the sweep's first batch
-    /// (issue #884) holds the lowest, the page queues on it holding nothing,
-    /// the sweep's second batch takes the highest, and both commit.
-    #[tokio::test]
-    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
-    async fn a_sweep_locks_entries_in_key_order_across_the_reads_pages() {
-        use crate::staging::interleave::{PausePoint, PauseScope};
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (pool, raw) = connect(&db).await;
-        // One more row than a page of the read (`markers::BACKFILL_PAGE_ROWS`).
-        raw.batch_execute(
-            "create table public.orders (id bigint primary key, g text, a numeric); \
-             insert into public.orders select n, 'a', n from generate_series(1, 10001) n",
-        )
-        .await
-        .expect("seed orders");
-        hold_orders_out(&raw).await;
-        let columns = HashMap::from([
-            ("id".to_string(), ValueType::Numeric),
-            ("g".to_string(), ValueType::Text),
-            ("a".to_string(), ValueType::Numeric),
-        ]);
-        crate::defs::catalog::install_definition(&pool, BY_G, &columns, "public")
-            .await
-            .expect("register");
-        crate::intake::markers::settle_builds(&pool).await;
-        let ids = catching_up(&raw).await;
-        assert_eq!(ids.len(), 1, "the build finished");
-        let key = quote_ident(crate::defs::ledger::KEY_COLUMN);
-        raw.batch_execute(&format!(
-            "delete from public.orders; \
-             create temp table entries as select * from public.orders_by_g__ledger; \
-             delete from public.orders_by_g__ledger; \
-             insert into public.orders_by_g__ledger select * from entries order by {key} desc; \
-             analyze public.orders, public.orders_by_g__ledger"
-        ))
-        .await
-        .expect("unback every entry, laid out in descending key order");
-        let row = raw
-            .query_one(
-                &format!("select min({key}), max({key}) from public.orders_by_g__ledger"),
-                &[],
-            )
-            .await
-            .expect("the ledger's key range");
-        let (lowest, highest): (String, String) = (row.get(0), row.get(1));
-
-        // The precondition: the read returns the highest key first, so it
-        // lands on the first of the read's two pages and the lowest on the
-        // second.
-        assert_eq!(
-            first_unbacked(&db, &ids).await,
-            vec![Some(highest.clone())],
-            "the read must return the ledger in its heap order"
-        );
-
-        let (_, ctl) = connect(&db).await;
-        ctl.execute("select pg_advisory_lock($1)", &[&SWEEP_PAUSE])
-            .await
-            .expect("hold the pause lock");
-        let scope = PauseScope::new();
-        let reached = scope.arm(
-            PausePoint::AfterEntryLock,
-            "public.orders_by_g",
-            SWEEP_PAUSE,
-        );
-        let (_, sweeper) = connect(&db).await;
-        let sweep = spawn_sweep(sweeper, ids, scope);
-        let frozen = reached.await.expect("the sweep reaches its entry lock");
-
-        let (_, pager) = connect(&db).await;
-        let page = spawn_page(
-            pager,
-            vec![(by_g_entry_lock(), Some(vec![lowest, highest]))],
-        );
-        wait_blocked_behind(&ctl, frozen.backend_pid).await;
-        ctl.execute("select pg_advisory_unlock($1)", &[&SWEEP_PAUSE])
-            .await
-            .expect("release the sweep");
-
-        let swept = sweep.await.expect("the sweep task");
-        let paged = page.await.expect("the page task");
-        assert!(
-            swept.is_ok() && paged.is_ok(),
-            "the sweep and the page must not deadlock: sweep {:?}, page {:?}",
-            swept.as_ref().err(),
-            paged.as_ref().err()
-        );
-        assert_eq!(swept.expect("swept").deleted, 1, "the emptied group");
-    }
-
-    /// Issue #716's second shape: the sweep takes its targets in the order a
-    /// drain page does (ADR-0002 I5), a 1-1 target's rows before an
-    /// aggregate target's entries, whatever order it read them in. Order 1
-    /// is unbacked in both [`BY_G`] (installed first, so read first) and a
-    /// 1-1 copy. A page applying a change to order 1 locks the copy's row
-    /// and then [`BY_G`]'s entry, while the sweep is frozen after its entry
-    /// lock on [`BY_G`].
-    ///
-    /// Taking its targets in the order it read them, the sweep held the
-    /// entry there and the page queued on it holding the copy's row, which
-    /// the sweep then wanted: a deadlock (40P01). Taking the copy first, the
-    /// sweep holds the row there, the page waits for its commit, and both
-    /// commit.
-    #[tokio::test]
-    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
-    async fn a_sweep_takes_one_to_one_targets_before_ledger_entries() {
-        use crate::staging::interleave::{PausePoint, PauseScope};
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (pool, raw) = connect(&db).await;
-        raw.batch_execute(
-            "create table public.orders (id bigint primary key, g text, a numeric); \
-             insert into public.orders values (1, 'a', 1), (2, 'b', 2)",
-        )
-        .await
-        .expect("seed orders");
-        hold_orders_out(&raw).await;
-        let columns = HashMap::from([
-            ("id".to_string(), ValueType::Numeric),
-            ("g".to_string(), ValueType::Text),
-            ("a".to_string(), ValueType::Numeric),
-        ]);
-        crate::intake::markers::feed_from_a_test_definition(&raw, "public.orders")
-            .await
-            .expect("make orders read as another definition's target");
-        for text in [BY_G, "TRANSFORM orders_copy FROM orders SELECT a AS a"] {
-            crate::defs::catalog::install_definition(&pool, text, &columns, "public")
-                .await
-                .expect("register");
-        }
-        crate::intake::markers::settle_builds(&pool).await;
-        let ids = catching_up(&raw).await;
-        assert_eq!(ids.len(), 2, "both builds finished");
-        raw.batch_execute("delete from public.orders where id = 1")
-            .await
-            .expect("unback order 1");
-
-        let (_, ctl) = connect(&db).await;
-        ctl.execute("select pg_advisory_lock($1)", &[&SWEEP_PAUSE])
-            .await
-            .expect("hold the pause lock");
-        let scope = PauseScope::new();
-        let reached = scope.arm(
-            PausePoint::AfterEntryLock,
-            "public.orders_by_g",
-            SWEEP_PAUSE,
-        );
-        let (_, sweeper) = connect(&db).await;
-        let sweep = spawn_sweep(sweeper, ids, scope);
-        let frozen = reached.await.expect("the sweep reaches its entry lock");
-
-        let (_, pager) = connect(&db).await;
-        let page = spawn_page(
-            pager,
-            vec![
-                (
-                    "select 1 from public.orders_copy where id = 1 for update".to_string(),
-                    None,
-                ),
-                (by_g_entry_lock(), Some(vec!["1".to_string()])),
-            ],
-        );
-        wait_blocked_behind(&ctl, frozen.backend_pid).await;
-        ctl.execute("select pg_advisory_unlock($1)", &[&SWEEP_PAUSE])
-            .await
-            .expect("release the sweep");
-
-        let swept = sweep.await.expect("the sweep task");
-        let paged = page.await.expect("the page task");
-        assert!(
-            swept.is_ok() && paged.is_ok(),
-            "the sweep and the page must not deadlock: sweep {:?}, page {:?}",
-            swept.as_ref().err(),
-            paged.as_ref().err()
-        );
-        assert_eq!(
-            swept.expect("swept").deleted,
-            2,
-            "the copy's row and the emptied group"
-        );
     }
 
     /// Issue #716: the sweep locks a target's rows in key order before it
@@ -2452,418 +1478,6 @@ mod db_tests {
             paged.as_ref().err()
         );
         assert_eq!(swept.expect("swept").deleted, 10001, "every row");
-    }
-
-    /// [`BY_G`] and a 1-1 copy over `public.orders`, both `catching_up`,
-    /// with `rows` (`(id, g)`) in orders. Returns a same-crate pool, a raw connection and the
-    /// definitions.
-    async fn by_g_and_copy(
-        db: &testkit::TestDatabase,
-        rows: &[(i64, &str)],
-    ) -> (Pool, tokio_postgres::Client, Vec<i64>) {
-        let (pool, raw) = connect(db).await;
-        raw.batch_execute("create table public.orders (id bigint primary key, g text, a numeric)")
-            .await
-            .expect("create orders");
-        for (id, g) in rows {
-            raw.execute(
-                "insert into public.orders values ($1, $2, $1::bigint)",
-                &[id, g],
-            )
-            .await
-            .expect("seed orders");
-        }
-        hold_orders_out(&raw).await;
-        let columns = HashMap::from([
-            ("id".to_string(), ValueType::Numeric),
-            ("g".to_string(), ValueType::Text),
-            ("a".to_string(), ValueType::Numeric),
-        ]);
-        crate::intake::markers::feed_from_a_test_definition(&raw, "public.orders")
-            .await
-            .expect("make orders read as another definition's target");
-        for text in [BY_G, "TRANSFORM orders_copy FROM orders SELECT a AS a"] {
-            crate::defs::catalog::install_definition(&pool, text, &columns, "public")
-                .await
-                .expect("register");
-        }
-        crate::intake::markers::settle_builds(&pool).await;
-        let ids = catching_up(&raw).await;
-        assert_eq!(ids.len(), 2, "both builds finished");
-        (pool, raw, ids)
-    }
-
-    /// Issue #884: no statement of the sweep binds more than its batch of
-    /// keys, however many its read found. Every order is unbacked, so the
-    /// 1-1 copy loses all 7 rows and [`BY_G`] re-derives 5 entries out of
-    /// groups `a` and `b`, and deletes group `c`, whose 2 entries are gone
-    /// already, as an orphan. With a batch of 2, each class of row spans
-    /// several batches, and the sweep still deletes every row, as one
-    /// statement per class did.
-    #[tokio::test]
-    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
-    async fn a_sweep_binds_at_most_a_batch_of_keys_per_statement() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let rows = [
-            (1, "a"),
-            (2, "a"),
-            (3, "a"),
-            (4, "b"),
-            (5, "b"),
-            (6, "c"),
-            (7, "c"),
-        ];
-        let (_pool, raw, ids) = by_g_and_copy(&db, &rows).await;
-        let key = quote_ident(crate::defs::ledger::KEY_COLUMN);
-        raw.batch_execute(&format!(
-            "delete from public.orders_by_g__ledger where {key} in ('6', '7'); \
-             delete from public.orders"
-        ))
-        .await
-        .expect("unback every order, and orphan group c");
-
-        let (_, mut sweeper) = connect(&db).await;
-        let txn = sweeper.transaction().await.expect("begin");
-        let mut sweep = Sweep::with_batch(2);
-        sweep
-            .add(&txn, &ids, TransformStatus::CatchingUp)
-            .await
-            .expect("plan the sweep");
-        assert!(
-            super::super::markers::declare_read(&txn, None, &sweep)
-                .await
-                .expect("declare the read")
-        );
-        super::super::markers::fetch_read(&txn, "", &mut sweep)
-            .await
-            .expect("fetch the read");
-        let swept = sweep.finish(&txn).await.expect("flush the sweep");
-        txn.commit().await.expect("commit");
-
-        assert_eq!(
-            swept.largest_batch, 2,
-            "every statement binds at most a batch, and some a whole one"
-        );
-        assert_eq!(swept.deleted, 7 + 3, "every copy, and groups a, b and c");
-        let left: i64 = raw
-            .query_one(
-                "select (select count(*) from public.orders_copy) \
-                      + (select count(*) from public.orders_by_g) \
-                      + (select count(*) from public.orders_by_g__ledger \
-                         where __member and not __tombstone)",
-                &[],
-            )
-            .await
-            .expect("count what is left")
-            .get(0);
-        assert_eq!(left, 0, "no row, group or live entry is left");
-    }
-
-    /// Issue #904: the sweep stages each page of its read's keys as the page
-    /// arrives, so it holds at most one page of them in memory however many
-    /// the read finds. A 1-1 copy and a ledger aggregate (7 groups) over
-    /// 25,000 items lose every row, so the read returns 50,000 unbacked
-    /// keys over 5 pages of 10,000, and the sweep's batch of 1,000 is a
-    /// tenth of a page. Collecting the whole read before staging it held
-    /// all 50,000.
-    #[tokio::test]
-    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
-    async fn a_sweep_holds_at_most_a_page_of_keys_in_memory() {
-        const ITEMS: i64 = 25_000;
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (pool, raw) = connect(&db).await;
-        raw.batch_execute(&format!(
-            "create table public.items (k bigint primary key, g bigint, a numeric); \
-             insert into public.items select i, i % 7, i from generate_series(1, {ITEMS}) i"
-        ))
-        .await
-        .expect("seed items");
-        let columns = HashMap::from([
-            ("k".to_string(), ValueType::Numeric),
-            ("g".to_string(), ValueType::Numeric),
-            ("a".to_string(), ValueType::Numeric),
-        ]);
-        crate::intake::markers::feed_from_a_test_definition(&raw, "public.items")
-            .await
-            .expect("make items read as another definition's target");
-        for text in [
-            "TRANSFORM items_copy FROM items SELECT a AS a",
-            "TRANSFORM items_by_g FROM items GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total",
-        ] {
-            crate::defs::catalog::install_definition(&pool, text, &columns, "public")
-                .await
-                .expect("register");
-        }
-        crate::intake::markers::settle_builds(&pool).await;
-        let ids = catching_up(&raw).await;
-        assert_eq!(ids.len(), 2, "both builds finished");
-        raw.batch_execute("delete from public.items")
-            .await
-            .expect("unback every item");
-
-        let (_, mut sweeper) = connect(&db).await;
-        let txn = sweeper.transaction().await.expect("begin");
-        let mut sweep = Sweep::with_batch(1_000);
-        sweep
-            .add(&txn, &ids, TransformStatus::CatchingUp)
-            .await
-            .expect("plan the sweep");
-        assert!(
-            super::super::markers::declare_read(&txn, None, &sweep)
-                .await
-                .expect("declare the read")
-        );
-        super::super::markers::fetch_read(&txn, "", &mut sweep)
-            .await
-            .expect("fetch the read");
-        let swept = sweep.finish(&txn).await.expect("flush the sweep");
-        txn.commit().await.expect("commit");
-
-        let page = usize::try_from(super::super::markers::BACKFILL_PAGE_ROWS).expect("a page");
-        assert_eq!(
-            swept.most_buffered, page,
-            "the sweep holds one full page of keys at most"
-        );
-        assert_eq!(swept.largest_batch, 1_000, "every statement binds a batch");
-        assert_eq!(
-            swept.deleted,
-            usize::try_from(ITEMS).expect("items") + 7,
-            "every copy, and every group"
-        );
-        let left: i64 = raw
-            .query_one(
-                "select (select count(*) from public.items_copy) \
-                      + (select count(*) from public.items_by_g) \
-                      + (select count(*) from public.items_by_g__ledger \
-                         where __member and not __tombstone)",
-                &[],
-            )
-            .await
-            .expect("count what is left")
-            .get(0);
-        assert_eq!(left, 0, "no row, group or live entry is left");
-    }
-
-    /// Issue #924's setup: a 1-1 copy and a ledger aggregate (by `k % 3`)
-    /// over `items` rows `1..=count`, each read by a `live` definition, so
-    /// the seam stages a row with its prior image for every key the sweep
-    /// changes. Then every item is deleted. Returns a raw connection and the definitions.
-    async fn read_items_all_unbacked(
-        db: &testkit::TestDatabase,
-        count: i64,
-    ) -> (tokio_postgres::Client, Vec<i64>) {
-        let (pool, raw) = connect(db).await;
-        raw.batch_execute(&format!(
-            "create table public.items (k bigint primary key, g bigint, a numeric); \
-             insert into public.items select i, i % 3, i from generate_series(1, {count}) i"
-        ))
-        .await
-        .expect("seed items");
-        let columns = HashMap::from([
-            ("k".to_string(), ValueType::Numeric),
-            ("g".to_string(), ValueType::Numeric),
-            ("a".to_string(), ValueType::Numeric),
-        ]);
-        crate::intake::markers::feed_from_a_test_definition(&raw, "public.items")
-            .await
-            .expect("make items read as another definition's target");
-        for text in [
-            "TRANSFORM items_copy FROM items SELECT a AS a",
-            "TRANSFORM items_by_g FROM items GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total",
-        ] {
-            crate::defs::catalog::install_definition(&pool, text, &columns, "public")
-                .await
-                .expect("register");
-        }
-        crate::intake::markers::settle_builds(&pool).await;
-        let ids = catching_up(&raw).await;
-        assert_eq!(ids.len(), 2, "both builds finished");
-        raw.batch_execute(&format!(
-            "insert into source_table_versions (source_table, version) \
-                 values ('public.items_by_g', 1), ('public.items_copy', 1) \
-                 on conflict do nothing; \
-             insert into transform_definitions \
-                 (target_table, source_table, source_version, definition_text, status) \
-             values ('public.by_g_reader', 'public.items_by_g', 1, \
-                     'TRANSFORM by_g_reader FROM items_by_g SELECT total AS total', '{live}'), \
-                    ('public.copy_reader', 'public.items_copy', 1, \
-                     'TRANSFORM copy_reader FROM items_copy SELECT a AS a', '{live}'); \
-             delete from public.items",
-            live = TransformStatus::Live.as_str()
-        ))
-        .await
-        .expect("read the aggregate, and unback every item");
-        (raw, ids)
-    }
-
-    /// Sweeps `ids` with a batch of `batch` keys, and returns what it swept
-    /// and every ring row its transaction staged for the swept targets,
-    /// sorted, with the write token reduced to whether it is set.
-    async fn sweep_and_stage(
-        db: &testkit::TestDatabase,
-        ids: &[i64],
-        batch: usize,
-    ) -> (Swept, Vec<Vec<Option<String>>>) {
-        let (_, mut sweeper) = connect(db).await;
-        let txn = sweeper.transaction().await.expect("begin");
-        let mut sweep = Sweep::with_batch(batch);
-        sweep
-            .add(&txn, ids, TransformStatus::CatchingUp)
-            .await
-            .expect("plan the sweep");
-        assert!(
-            super::super::markers::declare_read(&txn, None, &sweep)
-                .await
-                .expect("declare the read")
-        );
-        super::super::markers::fetch_read(&txn, "", &mut sweep)
-            .await
-            .expect("fetch the read");
-        let swept = sweep.finish(&txn).await.expect("flush the sweep");
-        let ring = (0..4)
-            .map(|slot| format!("select xmin as x, * from seg_{slot}"))
-            .collect::<Vec<_>>()
-            .join(" union all ");
-        let staged = txn
-            .query(
-                &format!(
-                    "select src_table, key, op::text, (lsn is not null)::text, \
-                            old_image::text, new_image::text, origin_lsn::text, \
-                            src_changed::text, hop_gen::text \
-                     from ({ring}) r \
-                     where x::text::bigint = pg_current_xact_id()::text::bigint % 4294967296 \
-                     order by 1, 2"
-                ),
-                &[],
-            )
-            .await
-            .expect("read the staged rows")
-            .into_iter()
-            .map(|row| (0..9).map(|i| row.get(i)).collect())
-            .collect();
-        txn.commit().await.expect("commit");
-        (swept, staged)
-    }
-
-    /// Issue #924: a sweep whose seam spills to its temporary table stages
-    /// exactly the rows one in-memory flush stages, while holding and
-    /// binding at most about a batch of changed keys. Both runs sweep 12
-    /// unbacked items out of a read copy (a staged row per deleted key)
-    /// and a read aggregate over 3 groups (one
-    /// `Recompute` per group). With a batch of 2, the Re-derive writes each
-    /// group across several batches, and a spill lands between them, so a
-    /// group's first prior image (its sum before the sweep) has to survive
-    /// the merge in the table: a later batch's image is a smaller sum.
-    #[tokio::test]
-    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
-    async fn a_spilled_sweep_stages_what_an_in_memory_one_does() {
-        const ITEMS: i64 = 12;
-        let cluster = testkit::TestCluster::start();
-        let control_db = cluster.create_isolated_database().await;
-        let spilled_db = cluster.create_isolated_database().await;
-        let (_control_raw, control_ids) = read_items_all_unbacked(&control_db, ITEMS).await;
-        let (_spilled_raw, spilled_ids) = read_items_all_unbacked(&spilled_db, ITEMS).await;
-
-        let (control, control_rows) = sweep_and_stage(&control_db, &control_ids, SWEEP_BATCH).await;
-        let (spilled, spilled_rows) = sweep_and_stage(&spilled_db, &spilled_ids, 2).await;
-
-        assert_eq!(control.deleted, 12 + 3, "every copy, and every group");
-        assert_eq!(spilled.deleted, control.deleted);
-        assert!(
-            !control.seam.spilled,
-            "the control holds its keys in memory"
-        );
-        assert_eq!(control.seam.most_held, 12 + 3, "every changed key at once");
-        assert_eq!(control_rows.len(), 12 + 3, "a row per changed key");
-        assert!(
-            control_rows.iter().all(|row| row[4].is_some()),
-            "every staged row carries its prior image"
-        );
-        assert!(spilled.seam.spilled, "a batch of 2 spills");
-        assert!(
-            spilled.seam.most_held < 2 * 2,
-            "the spilled sweep holds under two batches of keys, not {}",
-            spilled.seam.most_held
-        );
-        assert_eq!(
-            spilled.seam.largest_statement, 2,
-            "every seam statement binds at most a batch"
-        );
-        assert_eq!(
-            spilled_rows, control_rows,
-            "the spilled sweep stages exactly what the in-memory one does"
-        );
-    }
-
-    /// Issue #884: the sweep's batches of a target's keys come in the
-    /// target's own key order, not the order of the keys' text. A 1-1 copy
-    /// keyed by `bigint` loses all 12 rows, in batches of 3: 1-3, 4-6, 7-9
-    /// and 10-12. A page locks row 2, the sweep's first batch queues on it,
-    /// and the page then locks row 10.
-    ///
-    /// Batching by the keys' text, the sweep's first batch was 1, 10 and 11,
-    /// so it held row 10 by the time its second batch (12, 2, 3) queued on
-    /// row 2, and the page then queued on row 10: a deadlock (40P01). In the
-    /// target's order, the sweep holds only row 1 while it waits, and both
-    /// commit.
-    #[tokio::test]
-    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
-    async fn a_sweep_batches_keys_in_the_targets_own_order() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let rows: Vec<(i64, &str)> = (1..=12).map(|id| (id, "a")).collect();
-        let (_pool, raw, ids) = by_g_and_copy(&db, &rows).await;
-        raw.batch_execute("delete from public.orders")
-            .await
-            .expect("unback every order");
-
-        let (_, mut pager) = connect(&db).await;
-        let page = pager.transaction().await.expect("begin the page");
-        page.execute(
-            "select 1 from public.orders_copy where id = 2 for update",
-            &[],
-        )
-        .await
-        .expect("the page locks row 2");
-        let page_pid: i32 = page
-            .query_one("select pg_backend_pid()", &[])
-            .await
-            .expect("the page's backend")
-            .get(0);
-        let (_, sweeper) = connect(&db).await;
-        let sweep = spawn_batched_sweep(
-            sweeper,
-            ids,
-            crate::staging::interleave::PauseScope::new(),
-            3,
-        );
-        let (_, ctl) = connect(&db).await;
-        wait_blocked_behind(&ctl, page_pid).await;
-        let tenth = page
-            .execute(
-                "select 1 from public.orders_copy where id = 10 for update",
-                &[],
-            )
-            .await;
-        let paged = match tenth {
-            Ok(_) => page.commit().await,
-            Err(e) => Err(e),
-        };
-
-        let swept = sweep.await.expect("the sweep task");
-        assert!(
-            swept.is_ok() && paged.is_ok(),
-            "the sweep and the page must not deadlock: sweep {:?}, page {:?}",
-            swept.as_ref().err(),
-            paged.as_ref().err()
-        );
-        assert_eq!(
-            swept.expect("swept").deleted,
-            12 + 1,
-            "every copy, and group a"
-        );
     }
 
     /// Issue #884: the sweep's batches follow the key column's collation,
@@ -2966,275 +1580,6 @@ mod db_tests {
             paged.as_ref().err()
         );
         assert_eq!(swept.expect("swept").deleted, 4, "every copy");
-    }
-
-    /// Issue #884: a sweep that re-derives a ledger target's entries in
-    /// several batches locks every entry before any group. [`BY_G`]'s
-    /// entries 1 and 2 are in group `b` and 3 to 5 in group `a`, all
-    /// unbacked, swept in batches of 2. The sweep is frozen after its first
-    /// batch's group upsert, and a page locks entry 3, from the second
-    /// batch, then group `b`, from the first, in a page's order: entries,
-    /// then groups.
-    ///
-    /// Re-deriving each batch as a page of its own, entries and groups
-    /// together, the sweep held group `b` and not yet entry 3, so the page
-    /// took entry 3 and queued on `b`, and the sweep's second batch then
-    /// queued on entry 3: a deadlock (40P01). Locking every entry first, the
-    /// sweep holds entry 3 by then, the page waits for its commit, and both
-    /// commit.
-    #[tokio::test]
-    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
-    async fn a_batched_sweep_locks_every_entry_before_a_group() {
-        use crate::staging::interleave::{PausePoint, PauseScope};
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let rows = [(1, "b"), (2, "b"), (3, "a"), (4, "a"), (5, "a")];
-        let (_pool, raw, ids) = by_g_and_copy(&db, &rows).await;
-        raw.batch_execute("delete from public.orders")
-            .await
-            .expect("unback every order");
-
-        let (_, ctl) = connect(&db).await;
-        ctl.execute("select pg_advisory_lock($1)", &[&SWEEP_PAUSE])
-            .await
-            .expect("hold the pause lock");
-        let scope = PauseScope::new();
-        let reached = scope.arm(
-            PausePoint::AfterGroupUpsert,
-            "public.orders_by_g",
-            SWEEP_PAUSE,
-        );
-        let (_, sweeper) = connect(&db).await;
-        let sweep = spawn_batched_sweep(sweeper, ids, scope, 2);
-        let frozen = reached
-            .await
-            .expect("the sweep reaches its first group upsert");
-
-        let (_, pager) = connect(&db).await;
-        let page = spawn_page(
-            pager,
-            vec![
-                (by_g_entry_lock(), Some(vec!["3".to_string()])),
-                (
-                    "select 1 from public.orders_by_g where g = 'b' for update".to_string(),
-                    None,
-                ),
-            ],
-        );
-        wait_blocked_behind(&ctl, frozen.backend_pid).await;
-        ctl.execute("select pg_advisory_unlock($1)", &[&SWEEP_PAUSE])
-            .await
-            .expect("release the sweep");
-
-        let swept = sweep.await.expect("the sweep task");
-        let paged = page.await.expect("the page task");
-        assert!(
-            swept.is_ok() && paged.is_ok(),
-            "the sweep and the page must not deadlock: sweep {:?}, page {:?}",
-            swept.as_ref().err(),
-            paged.as_ref().err()
-        );
-        assert_eq!(
-            swept.expect("swept").deleted,
-            5 + 2,
-            "every copy, and groups a and b"
-        );
-    }
-
-    /// Issue #884 (a): the sweep locks the groups its Re-derives take
-    /// entries out of together with the orphan groups it deletes, in one
-    /// pass in key order. [`BY_G`]'s unbacked entry 2 is in group `b`, and
-    /// group `a` is an orphan: its one entry is gone and its order deleted.
-    /// The sweep is frozen after its Re-derive's group upsert, and a page
-    /// locks group `a`, then group `b`, in a page's order.
-    ///
-    /// Locking its Re-derive's groups in the Re-derive and its orphan groups
-    /// after, the sweep held `b` and not `a`, so the page took `a` and
-    /// queued on `b`, and the sweep then queued on `a`: a deadlock (40P01).
-    /// Locking both first, the sweep holds `a` by then, the page waits for
-    /// its commit, and both commit.
-    #[tokio::test]
-    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
-    async fn a_sweep_locks_its_orphan_groups_with_its_rederived_ones() {
-        use crate::staging::interleave::{PausePoint, PauseScope};
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (_pool, raw, ids) = by_g_and_copy(&db, &[(1, "a"), (2, "b")]).await;
-        let key = quote_ident(crate::defs::ledger::KEY_COLUMN);
-        raw.batch_execute(&format!(
-            "delete from public.orders_by_g__ledger where {key} = '1'; \
-             delete from public.orders"
-        ))
-        .await
-        .expect("unback entry 2, and orphan group a");
-
-        let (_, ctl) = connect(&db).await;
-        ctl.execute("select pg_advisory_lock($1)", &[&SWEEP_PAUSE])
-            .await
-            .expect("hold the pause lock");
-        let scope = PauseScope::new();
-        let reached = scope.arm(
-            PausePoint::AfterGroupUpsert,
-            "public.orders_by_g",
-            SWEEP_PAUSE,
-        );
-        let (_, sweeper) = connect(&db).await;
-        let sweep = spawn_sweep(sweeper, ids, scope);
-        let frozen = reached.await.expect("the sweep reaches its group upsert");
-
-        let (_, pager) = connect(&db).await;
-        let page = spawn_page(
-            pager,
-            vec![
-                (
-                    "select 1 from public.orders_by_g where g = 'a' for update".to_string(),
-                    None,
-                ),
-                (
-                    "select 1 from public.orders_by_g where g = 'b' for update".to_string(),
-                    None,
-                ),
-            ],
-        );
-        wait_blocked_behind(&ctl, frozen.backend_pid).await;
-        ctl.execute("select pg_advisory_unlock($1)", &[&SWEEP_PAUSE])
-            .await
-            .expect("release the sweep");
-
-        let swept = sweep.await.expect("the sweep task");
-        let paged = page.await.expect("the page task");
-        assert!(
-            swept.is_ok() && paged.is_ok(),
-            "the sweep and the page must not deadlock: sweep {:?}, page {:?}",
-            swept.as_ref().err(),
-            paged.as_ref().err()
-        );
-        assert_eq!(
-            swept.expect("swept").deleted,
-            2 + 2,
-            "both copies, and groups a and b"
-        );
-    }
-
-    /// Issue #884: the sweep's Re-derive moves no entry into a group it
-    /// didn't lock before its first write. [`BY_G`]'s orders 2 (group `b`)
-    /// and 3 (group `c`) are deleted with no CDC, so the read finds both
-    /// entries unbacked, and the sweep locks them and then groups `b` and
-    /// `c`. It re-derives in batches of 1, and is frozen after its first
-    /// batch's read, of entry 2. Order 3 is then re-inserted into group `a`,
-    /// and a page locks group `a` and queues on `b`, in a page's order.
-    ///
-    /// Re-deriving every key it locked, the sweep's second batch read the
-    /// re-insert and moved entry 3 into group `a`, which the page held: the
-    /// page waited on the sweep for `b` and the sweep on the page for `a`, a
-    /// deadlock (40P01). Re-deriving only the keys its read finds no source
-    /// row for, it leaves entry 3 live in `c` and both commit. The
-    /// re-insert's own Apply then moves the entry to `a` and empties `c`.
-    #[tokio::test]
-    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
-    async fn a_sweep_leaves_an_entry_its_source_backs_again_to_the_insert() {
-        use crate::staging::interleave::{PausePoint, PauseScope};
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (pool, mut raw, ids) = by_g_and_copy(&db, &[(1, "a"), (2, "b"), (3, "c")]).await;
-        raw.batch_execute("delete from public.orders where id in (2, 3)")
-            .await
-            .expect("unback entries 2 and 3");
-
-        let (_, ctl) = connect(&db).await;
-        ctl.execute("select pg_advisory_lock($1)", &[&SWEEP_PAUSE])
-            .await
-            .expect("hold the pause lock");
-        let scope = PauseScope::new();
-        let reached = scope.arm(
-            PausePoint::AfterRederiveRead,
-            "public.orders_by_g",
-            SWEEP_PAUSE,
-        );
-        let (_, sweeper) = connect(&db).await;
-        let sweep = spawn_batched_sweep(sweeper, ids, scope, 1);
-        let frozen = reached
-            .await
-            .expect("the sweep reaches its first Re-derive read");
-
-        reinsert_order(&mut raw, 3).await;
-        let (_, pager) = connect(&db).await;
-        let page = spawn_page(
-            pager,
-            vec![
-                (
-                    "select 1 from public.orders_by_g where g = 'a' for update".to_string(),
-                    None,
-                ),
-                (
-                    "select 1 from public.orders_by_g where g = 'b' for update".to_string(),
-                    None,
-                ),
-            ],
-        );
-        wait_blocked_behind(&ctl, frozen.backend_pid).await;
-        ctl.execute("select pg_advisory_unlock($1)", &[&SWEEP_PAUSE])
-            .await
-            .expect("release the sweep");
-
-        let swept = sweep.await.expect("the sweep task");
-        let paged = page.await.expect("the page task");
-        assert!(
-            swept.is_ok() && paged.is_ok(),
-            "the sweep and the page must not deadlock: sweep {:?}, page {:?}",
-            swept.as_ref().err(),
-            paged.as_ref().err()
-        );
-        assert_eq!(
-            swept.expect("swept").deleted,
-            2 + 1,
-            "orders 2's and 3's copies, and group b"
-        );
-        let live: Vec<(String, String)> = raw
-            .query(
-                "select __from_key, g from public.orders_by_g__ledger \
-                 where __member and not __tombstone order by __from_key",
-                &[],
-            )
-            .await
-            .expect("read the live entries")
-            .into_iter()
-            .map(|row| (row.get(0), row.get(1)))
-            .collect();
-        assert_eq!(
-            live,
-            vec![
-                ("1".to_string(), "a".to_string()),
-                ("3".to_string(), "c".to_string()),
-            ],
-            "the sweep re-derived entry 2 and left entry 3 as it found it"
-        );
-
-        let active = seal(&mut raw).await;
-        drain(&pool, active).await.expect("drain the re-insert");
-        let groups: Vec<(String, String)> = raw
-            .query(
-                "select g, total::text from public.orders_by_g order by g",
-                &[],
-            )
-            .await
-            .expect("read orders_by_g")
-            .into_iter()
-            .map(|row| (row.get(0), row.get(1)))
-            .collect();
-        assert_eq!(
-            groups,
-            vec![("a".to_string(), "100".to_string())],
-            "the re-insert's Apply moved entry 3 to group a and emptied c"
-        );
-        assert_eq!(
-            copy_rows(&raw).await,
-            vec![
-                ("1".to_string(), "1".to_string()),
-                ("3".to_string(), "100".to_string()),
-            ],
-            "the copy matches the source"
-        );
     }
 
     /// Issue #883's setup: `orders_copy`, a `catching_up` 1-1 copy of
@@ -3594,56 +1939,6 @@ mod db_tests {
         );
     }
 
-    /// Issue #518: an aggregate target whose key no longer holds a grouping
-    /// column (its primary key altered by hand) is an error the discharge
-    /// backs off on, not a panic.
-    #[tokio::test]
-    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
-    async fn a_sweep_of_an_aggregate_missing_a_grouping_key_column_is_an_error() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (pool, mut raw) = connect(&db).await;
-        raw.batch_execute(
-            "create table public.orders (id bigint primary key, g text, a numeric); \
-             insert into public.orders values (1, 'a', 1)",
-        )
-        .await
-        .expect("seed orders");
-        hold_orders_out(&raw).await;
-        let columns = HashMap::from([
-            ("id".to_string(), ValueType::Numeric),
-            ("g".to_string(), ValueType::Text),
-            ("a".to_string(), ValueType::Numeric),
-        ]);
-        crate::defs::catalog::install_definition(&pool, BY_G, &columns, "public")
-            .await
-            .expect("register");
-        crate::intake::markers::settle_builds(&pool).await;
-        let ids = catching_up(&raw).await;
-        raw.batch_execute(
-            "do $$ declare c text; begin \
-               for c in select conname from pg_constraint \
-                        where conrelid = 'public.orders_by_g'::regclass and contype in ('p', 'u') \
-               loop execute format('alter table public.orders_by_g drop constraint %I', c); \
-               end loop; \
-             end $$; \
-             alter table public.orders_by_g add primary key (total)",
-        )
-        .await
-        .expect("rekey the target by hand");
-
-        let txn = raw.transaction().await.expect("begin");
-        let mut sweep = Sweep::default();
-        let err = sweep
-            .add(&txn, &ids, TransformStatus::CatchingUp)
-            .await
-            .expect_err("a target missing its grouping column fails the sweep");
-        assert!(
-            matches!(&err, IntakeError::UnsweepableTarget { target, .. } if target == "public.orders_by_g"),
-            "the mismatch is returned, got {err:?}"
-        );
-    }
-
     /// A 1-1 target over a source keyed by a nullable unique index has the
     /// same nullable key (issue #1141), and its delete's re-check of the
     /// source (issue #883) is `NULL`-safe: a `NULL`-keyed row the source
@@ -3682,16 +1977,14 @@ mod db_tests {
         let target = SweptTarget {
             id,
             status: TransformStatus::CatchingUp,
-            lock_order: (false, table.to_string()),
+            lock_order: table.to_string(),
             target: table.to_string(),
             target_ident: ddl::qualified_target_table_ident(table),
             returning: ddl::pk_key_sql_expr(&key_cols, Some("t")),
             key_cols,
             branches: Vec::new(),
             has_image: false,
-            ledger_guard: None,
             source_guard: Some(ddl::qualified_source_table("public.nk_src")),
-            ledger_rederive: None,
             page: Vec::new(),
             staged: StagedKeys::new("unused", String::new(), Vec::new()),
         };
@@ -3858,16 +2151,14 @@ mod db_tests {
             let target = SweptTarget {
                 id,
                 status: TransformStatus::CatchingUp,
-                lock_order: (false, table.to_string()),
+                lock_order: table.to_string(),
                 target: table.to_string(),
                 target_ident: ddl::qualified_target_table_ident(table),
                 returning: ddl::pk_key_sql_expr(&key_cols, Some("t")),
                 key_cols,
                 branches: Vec::new(),
                 has_image: false,
-                ledger_guard: None,
                 source_guard: source.map(ddl::qualified_source_table),
-                ledger_rederive: None,
                 page: Vec::new(),
                 staged: StagedKeys::new("unused", String::new(), Vec::new()),
             };
@@ -3994,381 +2285,6 @@ mod db_tests {
         }
     }
 
-    /// Issue #819: a ledger target's group delete ([`delete_statement`])
-    /// reads the ledger once or probes it by whole group, for the key that
-    /// made the per-column `OR` match quadratic (a 2-column key whose first
-    /// column has 4 values). With the ledger's statistics from before its
-    /// reload, when every entry was in one group, the old match planned as a
-    /// nested loop over the whole ledger, once per key. With current ones, it
-    /// probed the ledger per key on the first column alone. It covers a batch
-    /// with one `NULL` pattern and one with four under each, and deletes
-    /// exactly the batch's groups with no live entry, `NULL`s included.
-    #[tokio::test]
-    async fn the_sweep_group_delete_matches_the_ledger_by_whole_group_whatever_its_statistics() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (_pool, mut raw) = connect(&db).await;
-        raw.batch_execute(
-            "create table public.grouped (a int, b int, n bigint, \
-                                          unique nulls not distinct (a, b)) \
-                 with (autovacuum_enabled = false); \
-             create table public.grouped_ledger (k text primary key, a int, b int, \
-                     __member boolean not null default true, \
-                     __tombstone boolean not null default false) \
-                 with (autovacuum_enabled = false); \
-             create index on public.grouped_ledger (a, b) where __member and not __tombstone; \
-             insert into public.grouped_ledger (k, a, b) \
-                 select n::text, 0, 0 from generate_series(1, 1000) n; \
-             analyze public.grouped_ledger; \
-             truncate public.grouped_ledger; \
-             insert into public.grouped (a, b, n) \
-                 select n % 4, n / 4, n from generate_series(1, 20000) n \
-                 union all values (null, 1, -1), (1, null, -2), (null, null, -3), (2, null, -4); \
-             insert into public.grouped_ledger (k, a, b) \
-                 select n::text, n % 4, n / 4 from generate_series(1, 20000) n \
-                 where n % 100 <> 0 \
-                 union all values ('x', null, 1), ('y', 1, null), ('z', null, null); \
-             insert into public.grouped_ledger (k, a, b, __member, __tombstone) \
-                 values ('gone', 0, 25, false, false), ('dead', 2, null, true, true); \
-             analyze public.grouped; \
-             insert into source_table_versions (source_table, version) values ('public.t', 1)",
-        )
-        .await
-        .expect("seed a group target and a reloaded ledger");
-        let id: i64 = raw
-            .query_one(
-                "insert into transform_definitions \
-                 (target_table, source_table, source_version, definition_text, status) \
-                 values ('public.grouped', 'public.t', 1, 'unused', 'catching_up') \
-                 returning id",
-                &[],
-            )
-            .await
-            .expect("seed the definition")
-            .get(0);
-        let key_cols = ddl::identity_key_columns(&raw, "public.grouped")
-            .await
-            .expect("identity");
-        let key_sql = ddl::pk_key_sql_expr(&key_cols, Some("t"));
-        let target = SweptTarget {
-            id,
-            status: TransformStatus::CatchingUp,
-            lock_order: (true, "public.grouped".to_string()),
-            target: "public.grouped".to_string(),
-            target_ident: ddl::qualified_target_table_ident("public.grouped"),
-            returning: key_sql.clone(),
-            key_cols,
-            branches: Vec::new(),
-            has_image: false,
-            ledger_guard: Some("public.grouped_ledger".to_string()),
-            source_guard: None,
-            ledger_rederive: None,
-            page: Vec::new(),
-            staged: StagedKeys::new("unused", String::new(), Vec::new()),
-        };
-        // Every 50th group, half of which (every 100th) have no live entry;
-        // then those and every group with a `NULL`.
-        let plain = "t.n % 50 = 0";
-        let multi = format!("{plain} or t.n < 0");
-        for (stats, batch) in [
-            ("stale", plain),
-            ("stale", multi.as_str()),
-            ("current", plain),
-            ("current", multi.as_str()),
-        ] {
-            if stats == "current" {
-                raw.batch_execute("analyze public.grouped_ledger")
-                    .await
-                    .expect("analyze the reloaded ledger");
-            }
-            let keys: Vec<(String, Option<String>, Option<String>)> = raw
-                .query(
-                    &format!(
-                        "select {key_sql}, t.a::text, t.b::text from public.grouped t where {batch}"
-                    ),
-                    &[],
-                )
-                .await
-                .expect("keys")
-                .into_iter()
-                .map(|row| (row.get(0), row.get(1), row.get(2)))
-                .collect();
-            let arrays = vec![
-                keys.iter().map(|(_, a, _)| a.clone()).collect::<Vec<_>>(),
-                keys.iter().map(|(_, _, b)| b.clone()).collect::<Vec<_>>(),
-            ];
-            let expected: std::collections::HashSet<String> = raw
-                .query(
-                    &format!(
-                        "select {key_sql} from public.grouped t where ({batch}) \
-                           and not exists (select 1 from public.grouped_ledger l \
-                                           where l.__member and not l.__tombstone \
-                                             and l.a is not distinct from t.a \
-                                             and l.b is not distinct from t.b)"
-                    ),
-                    &[],
-                )
-                .await
-                .expect("the batch's groups with no live entry")
-                .into_iter()
-                .map(|row| row.get(0))
-                .collect();
-            assert!(
-                expected.len() >= 200 && expected.len() < keys.len(),
-                "{batch}: the batch keeps some groups and deletes others"
-            );
-            let sql = delete_statement(&target, &arrays);
-            let status = target.status.as_str();
-            let mut params: Vec<&(dyn ToSql + Sync)> =
-                arrays.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
-            params.push(&target.id);
-            params.push(&status);
-            let mut txn = raw.transaction().await.expect("begin");
-            let explain = txn.savepoint("explain").await.expect("savepoint");
-            let plan: String = crate::staging::ledger::query_by_entry_key(
-                &explain,
-                &format!("explain (analyze, timing off) {sql}"),
-                &params,
-            )
-            .await
-            .expect("explain")
-            .into_iter()
-            .map(|row| row.get::<_, String>(0))
-            .collect::<Vec<_>>()
-            .join("\n");
-            explain
-                .rollback()
-                .await
-                .expect("roll back the explain's delete");
-            let filtered: u64 = plan
-                .lines()
-                .filter_map(|line| line.split("Rows Removed by Join Filter: ").nth(1))
-                .map(|n| n.trim().parse::<u64>().expect("a row count"))
-                .sum();
-            assert!(
-                filtered < keys.len() as u64,
-                "{stats} statistics, {batch}: the delete must not compare every key with every \
-                 entry, got:\n{plan}"
-            );
-            // Each scan of the ledger reads it once (a hashed subplan or an
-            // init plan), or probes it per key on every grouping column: a
-            // probe on the first column alone reads a quarter of the ledger
-            // per key, whatever its rows per loop round to.
-            let lines: Vec<&str> = plan.lines().collect();
-            for (i, scan) in lines.iter().enumerate() {
-                if !scan.contains(" on grouped_ledger ") {
-                    continue;
-                }
-                let depth = scan.len() - scan.trim_start().len();
-                let loops: u64 = scan
-                    .split(" loops=")
-                    .nth(1)
-                    .and_then(|rest| rest.split(')').next())
-                    .and_then(|n| n.parse().ok())
-                    .unwrap_or_else(|| panic!("loops in {scan}"));
-                let cond = lines[i + 1..]
-                    .iter()
-                    .map(|line| (line.len() - line.trim_start().len(), line.trim_start()))
-                    .take_while(|(indent, line)| *indent > depth && !line.starts_with("->"))
-                    .find_map(|(_, line)| {
-                        line.strip_prefix("Index Cond: ")
-                            .or_else(|| line.strip_prefix("Recheck Cond: "))
-                    });
-                assert!(
-                    loops == 1 || cond.is_some_and(|c| c.contains("(a ") && c.contains("(b ")),
-                    "{stats} statistics, {batch}: each probe of the ledger must match its \
-                     whole group, got:\n{plan}"
-                );
-            }
-            let deleted: std::collections::HashSet<String> = delete_keys(&txn, &target, &arrays)
-                .await
-                .expect("delete")
-                .into_iter()
-                .map(|row| row.get(0))
-                .collect();
-            txn.rollback().await.expect("roll back");
-            assert_eq!(
-                deleted, expected,
-                "{batch}: the batch's groups with no live entry, and only those"
-            );
-        }
-    }
-
-    /// Issue #819: the per-pattern ledger guard deletes exactly what the
-    /// per-column `NULL`-safe match it replaced deleted, over random small
-    /// ledgers and batches: three grouping columns of different types, each
-    /// `NULL` or one of two values (all 27 groups in the target), with
-    /// non-member and tombstoned entries mixed in. Half the rounds turn index
-    /// scans off, so the guard's probes plan as hashed subplans rather than
-    /// per-key index probes, and both shapes are checked.
-    #[tokio::test]
-    async fn the_sweep_ledger_guard_deletes_what_the_per_column_match_did() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (_pool, mut raw) = connect(&db).await;
-        raw.batch_execute(
-            "create table public.g3 (a int, b text, c bigint, n bigint, \
-                                     unique nulls not distinct (a, b, c)); \
-             create table public.g3_ledger (k text primary key, a int, b text, c bigint, \
-                     __member boolean not null default true, \
-                     __tombstone boolean not null default false); \
-             create index on public.g3_ledger (a, b, c) where __member and not __tombstone; \
-             insert into public.g3 (a, b, c, n) \
-                 select a, b, c, 0 from (values (null), (1), (2)) as x(a), \
-                     (values (null), ('p'), ('q')) as y(b), (values (null::bigint), (10), (20)) as z(c); \
-             insert into public.g3_ledger (k, a, b, c) \
-                 select 'f' || n, 100 + n, 'p', 10 from generate_series(1, 5000) n; \
-             analyze public.g3; \
-             analyze public.g3_ledger; \
-             insert into source_table_versions (source_table, version) values ('public.t', 1)",
-        )
-        .await
-        .expect("seed every group of three nullable columns");
-        let id: i64 = raw
-            .query_one(
-                "insert into transform_definitions \
-                 (target_table, source_table, source_version, definition_text, status) \
-                 values ('public.g3', 'public.t', 1, 'unused', 'catching_up') \
-                 returning id",
-                &[],
-            )
-            .await
-            .expect("seed the definition")
-            .get(0);
-        let key_cols = ddl::identity_key_columns(&raw, "public.g3")
-            .await
-            .expect("identity");
-        let key_sql = ddl::pk_key_sql_expr(&key_cols, Some("t"));
-        let target = SweptTarget {
-            id,
-            status: TransformStatus::CatchingUp,
-            lock_order: (true, "public.g3".to_string()),
-            target: "public.g3".to_string(),
-            target_ident: ddl::qualified_target_table_ident("public.g3"),
-            returning: key_sql.clone(),
-            key_cols,
-            branches: Vec::new(),
-            has_image: false,
-            ledger_guard: Some("public.g3_ledger".to_string()),
-            source_guard: None,
-            ledger_rederive: None,
-            page: Vec::new(),
-            staged: StagedKeys::new("unused", String::new(), Vec::new()),
-        };
-        // Every group, with its key and its columns as text.
-        type Group = (String, [Option<String>; 3]);
-        let groups: Vec<Group> = raw
-            .query(
-                &format!("select {key_sql}, t.a::text, t.b, t.c::text from public.g3 t"),
-                &[],
-            )
-            .await
-            .expect("the groups")
-            .into_iter()
-            .map(|row| (row.get(0), [row.get(1), row.get(2), row.get(3)]))
-            .collect();
-        assert_eq!(groups.len(), 27);
-        // The guard this one replaced: a group is unbacked if no live entry
-        // matches it column by column, `NULL`-safely.
-        let old_guard = format!(
-            "select {key_sql} from public.g3 t \
-             where not exists (select 1 from public.g3_ledger l \
-                               where l.__member and not l.__tombstone \
-                                 and (l.a = t.a or (l.a is null and t.a is null)) \
-                                 and (l.b = t.b or (l.b is null and t.b is null)) \
-                                 and (l.c = t.c or (l.c is null and t.c is null)))"
-        );
-        // xorshift64*, seeded: the rounds are the same on every run.
-        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
-        let mut next = move |n: u64| {
-            state ^= state >> 12;
-            state ^= state << 25;
-            state ^= state >> 27;
-            state.wrapping_mul(0x2545_f491_4f6c_dd1d) % n
-        };
-        let mut shapes = std::collections::HashSet::new();
-        for round in 0..200 {
-            let txn = raw.transaction().await.expect("begin");
-            let hashed = round % 2 == 1;
-            if hashed {
-                txn.batch_execute(
-                    "set local enable_indexscan = off; set local enable_bitmapscan = off",
-                )
-                .await
-                .expect("turn index probes off");
-            }
-            for entry in 0..next(16) {
-                let (_, [a, b, c]) = &groups[next(27) as usize];
-                let (member, tombstone) = match next(6) {
-                    0 => (false, false),
-                    1 => (true, true),
-                    _ => (true, false),
-                };
-                txn.execute(
-                    "insert into public.g3_ledger (k, a, b, c, __member, __tombstone) \
-                     values ($1, $2::text::int, $3, $4::text::bigint, $5, $6)",
-                    &[&entry.to_string(), a, b, c, &member, &tombstone],
-                )
-                .await
-                .expect("an entry");
-            }
-            let batch: Vec<&Group> = groups.iter().filter(|_| next(3) == 0).collect();
-            if batch.is_empty() {
-                txn.rollback().await.expect("roll back");
-                continue;
-            }
-            let arrays: Vec<Vec<Option<String>>> = (0..3)
-                .map(|j| batch.iter().map(|(_, cols)| cols[j].clone()).collect())
-                .collect();
-            let unbacked: std::collections::HashSet<String> = txn
-                .query(&old_guard, &[])
-                .await
-                .expect("the old guard")
-                .into_iter()
-                .map(|row| row.get(0))
-                .collect();
-            let expected: std::collections::HashSet<String> = batch
-                .iter()
-                .map(|(key, _)| key.clone())
-                .filter(|key| unbacked.contains(key))
-                .collect();
-            let sql = delete_statement(&target, &arrays);
-            let status = target.status.as_str();
-            let mut params: Vec<&(dyn ToSql + Sync)> =
-                arrays.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
-            params.push(&target.id);
-            params.push(&status);
-            let plan: String = crate::staging::ledger::query_by_entry_key(
-                &txn,
-                &format!("explain (costs off) {sql}"),
-                &params,
-            )
-            .await
-            .expect("explain")
-            .into_iter()
-            .map(|row| row.get::<_, String>(0))
-            .collect::<Vec<_>>()
-            .join("\n");
-            shapes.insert((hashed, plan.contains("hashed SubPlan")));
-            let deleted: std::collections::HashSet<String> = delete_keys(&txn, &target, &arrays)
-                .await
-                .expect("delete")
-                .into_iter()
-                .map(|row| row.get(0))
-                .collect();
-            txn.rollback().await.expect("roll back");
-            assert_eq!(
-                deleted, expected,
-                "round {round}: the old guard's unbacked groups of the batch, plan:\n{plan}"
-            );
-        }
-        eprintln!("plan shapes (index probes off, hashed subplan): {shapes:?}");
-        assert!(
-            shapes.contains(&(false, false)) && shapes.contains(&(true, true)),
-            "some rounds probed the index per key and some hashed the ledger: {shapes:?}"
-        );
-    }
-
     /// How many sequential scans of `table` this transaction has started so
     /// far (`pg_stat_xact_user_tables` counts the open transaction's own).
     /// The plan above is explained through `query_by_entry_key`; this checks
@@ -4422,51 +2338,20 @@ mod tests {
         );
     }
 
-    /// Issue #819: the ledger guard has one clause per `NULL` pattern, each
-    /// matching the entry on every grouping column, with `=` or `is null`.
-    #[test]
-    fn the_ledger_guard_matches_every_column_per_null_pattern() {
-        let key_cols: Vec<PrimaryKeyColumn> = ["g", "h"]
-            .into_iter()
-            .map(|name| PrimaryKeyColumn {
-                name: name.to_string(),
-                data_type: "integer".to_string(),
-                nullable: true,
-                collation: None,
-            })
-            .collect();
-        let live = r#"select 1 from led as l where l."__member" and not l."__tombstone""#;
-        assert_eq!(
-            ledger_guard("led", &key_cols, &[vec![false, false]]),
-            format!(
-                r#" and (t."g" is null or t."h" is null or not exists ({live} and l."g" = t."g" and l."h" = t."h"))"#
-            )
-        );
-        assert_eq!(
-            ledger_guard("led", &key_cols, &[vec![false, true], vec![true, true]]),
-            format!(
-                r#" and (t."g" is null or t."h" is not null or not exists ({live} and l."g" = t."g" and l."h" is null))"#
-            ) + &format!(
-                r#" and (t."g" is not null or t."h" is not null or not exists ({live} and l."g" is null and l."h" is null))"#
-            )
-        );
-    }
-
-    fn part(col: &str, source_sql: &str, nullable: bool) -> KeyPart {
+    fn part(col: &str, nullable: bool) -> KeyPart {
         KeyPart {
             target_col: quote_ident(col),
-            source_sql: source_sql.to_string(),
+            source_sql: format!("s.{}", quote_ident(col)),
             nullable,
         }
     }
 
-    /// A 1-1 key is all `NOT NULL`, so every column compares with `=`.
-    /// `IS NOT DISTINCT FROM` anywhere would force a nested-loop anti-join.
+    /// A `NOT NULL` key compares every column with `=`. `IS NOT DISTINCT
+    /// FROM` anywhere would force a nested-loop anti-join.
     #[test]
     fn a_not_null_key_matches_with_plain_equality() {
         let matching = Match {
-            parts: vec![part("a", r#"s."a""#, false), part("b", r#"s."b""#, false)],
-            ledger: None,
+            parts: vec![part("a", false), part("b", false)],
         };
         assert_eq!(
             orphan_branch_sql(
@@ -4481,17 +2366,14 @@ mod tests {
         );
     }
 
-    /// A nullable grouping column gets one branch per `NULL` pattern: `=`
-    /// where the target row's value is present, `IS NULL` on the source side
-    /// where it is `NULL`, never `IS NOT DISTINCT FROM`.
+    /// A key over a nullable unique index (issue #1141) gets one branch per
+    /// `NULL` pattern: `=` where the target row's value is present, `IS
+    /// NULL` on the source side where it is `NULL`, never `IS NOT DISTINCT
+    /// FROM`.
     #[test]
     fn a_null_pattern_matches_null_columns_with_is_null() {
         let matching = Match {
-            parts: vec![
-                part("g", r#"(s."g")::numeric"#, true),
-                part("h", r#"(s."h")::text"#, true),
-            ],
-            ledger: None,
+            parts: vec![part("g", true), part("h", true)],
         };
         let nullable = [0, 1];
         assert_eq!(
@@ -4503,7 +2385,7 @@ mod tests {
                 &nullable,
                 OrphanPattern::Exactly(0b10)
             ),
-            r#"select 0::int4, null::text, array[t."g"::text, t."h"::text]::text[] from t as t where t."g" is not null and t."h" is null and not exists (select 1 from src as s where (s."g")::numeric = t."g" and (s."h")::text is null)"#
+            r#"select 0::int4, null::text, array[t."g"::text, t."h"::text]::text[] from t as t where t."g" is not null and t."h" is null and not exists (select 1 from src as s where s."g" = t."g" and s."h" is null)"#
         );
         let none_null = orphan_branch_sql(
             0,
@@ -4522,8 +2404,7 @@ mod tests {
     #[test]
     fn the_catch_all_covers_the_unlisted_patterns() {
         let matching = Match {
-            parts: vec![part("g", r#"(s."g")::numeric"#, true)],
-            ledger: None,
+            parts: vec![part("g", true)],
         };
         assert_eq!(
             orphan_branch_sql(
@@ -4534,7 +2415,7 @@ mod tests {
                 &[0],
                 OrphanPattern::NoneOf(&[0, 1])
             ),
-            r#"select 1::int4, null::text, array[t."g"::text]::text[] from t as t where ((case when t."g" is null then 1 else 0 end))::bigint <> all('{0,1}'::bigint[]) and not exists (select 1 from src as s where (s."g")::numeric is not distinct from t."g")"#
+            r#"select 1::int4, null::text, array[t."g"::text]::text[] from t as t where ((case when t."g" is null then 1 else 0 end))::bigint <> all('{0,1}'::bigint[]) and not exists (select 1 from src as s where s."g" is not distinct from t."g")"#
         );
     }
 }

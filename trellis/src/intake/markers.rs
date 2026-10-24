@@ -174,11 +174,10 @@ pub(crate) async fn park_target_catchup_if_read(
         .await?
         .get(0);
     let (mut readers, tables) = target_catchups(client, std::slice::from_ref(&target)).await?;
-    if !readers.is_empty() && crate::staging::group_basis::enabled() {
+    if !readers.is_empty() {
         // `park_catch_up`'s lock order: every definition this touches
         // first, in id order (`readers` is sorted), before
-        // `rebuildable_on_group_basis` reads their status. With the knob
-        // off nothing is rebuilt, and `park_catch_up` takes the same locks.
+        // `rebuildable_on_group_basis` reads their status.
         client
             .execute(
                 "select 1 from transform_definitions where id = any($1) order by id for update",
@@ -226,11 +225,10 @@ pub(crate) async fn park_target_catchup_if_read(
 /// `new_nodes` says the install that parks the marker only added nodes new
 /// to a captured partitioned root's recorded tree
 /// (`capture::install::adds_only_new_nodes`). A definition reading the
-/// root the partition correction engine serves (an aggregate on the ledger
-/// or the group basis, or a `JOIN` reading the root as either side) is then
-/// neither rebuilt nor caught up:
-/// the reconcile pass queues each new node's correction, which re-derives
-/// the keys (or the `JOIN` side's cells) of the node alone, the node's own
+/// root the partition correction engine serves (an aggregate, or a `JOIN`
+/// reading the root as either side) is then neither rebuilt nor caught up:
+/// the reconcile pass queues each new node's correction, which recomputes
+/// the groups (or the `JOIN` side's cells) of the node alone, the node's own
 /// rows' among them (#1103, #1111, #1147). With no other reader to catch up and no
 /// rebuild, no marker is parked, so nothing enumerates the whole table.
 pub(crate) async fn park_table_catch_ups(
@@ -902,14 +900,9 @@ pub(super) async fn fetch_read(
 ///   threads execute the chunks, and the last one moves it to `catching_up`
 ///   and parks its go-live catch-up, whose discharge flips it `live`
 ///   ([`go_live_caught_up`]).
-/// - **An aggregate**: the transaction enqueues one direct-build job as a `backfill_chunks` row and
-///   moves the definition to `backfilling` together
-///   (`defs::chunk_queue::dispatch_direct_build`), after a catalog-only check
-///   that the direct build can render it
-///   ([`crate::defs::backfill::check_direct_build`]). A drain thread runs the
-///   whole ADR-0002 build, and finishing it moves the definition to
-///   `catching_up` and parks its go-live catch-ups, as for the last chunk.
-/// - **The `Unsupported` fallback** goes through the ring enumeration below,
+/// - **An aggregate** reaches a discharge only when a test has held it out
+///   of the plan job (`staging::build::qualifies`), and **the `Unsupported`
+///   fallback**: both go through the ring enumeration below,
 ///   and flips `waiting_to_backfill` -> `live` as the last statement of the
 ///   transaction, together with its go-live catch-up parks. There is no
 ///   intermediate `backfilling` for it to be stranded in (issue #404).
@@ -1353,8 +1346,6 @@ enum Build {
     /// A plain 1-1 definition: these `(lo, hi]` primary-key chunk
     /// boundaries, enqueued as `backfill_chunks` rows.
     Chunks(crate::defs::backfill::PlannedRanges),
-    /// An aggregate: one direct-build job, enqueued as a `backfill_chunks` row (issue #419).
-    Direct,
     /// The ring enumeration of the marker's table, flipped `live` in the
     /// discharge's own transaction.
     Ring,
@@ -1398,12 +1389,17 @@ async fn plan_waiting_builds(
         if rederive.contains(&id) || matches!(def.key_space, KeySpace::Join(_)) {
             continue;
         }
+        // An aggregate is built by its plan job (`staging::build`); one held
+        // out of it is rebuilt by the ring enumeration, whose image-less
+        // recomputes the group basis applies.
         let planned = if matches!(def.key_space, KeySpace::OneToOne) {
             backfill::plan_one_to_one_chunks(client, &def, table)
                 .await
                 .map(Build::Chunks)
         } else {
-            backfill::check_direct_build(&def).map(|()| Build::Direct)
+            Err(BackfillError::Unsupported(
+                "an aggregate is built by its plan job".to_string(),
+            ))
         };
         let build = match planned {
             Ok(build) => build,
@@ -1560,9 +1556,6 @@ async fn discharge_marker(
         match build {
             Build::Chunks(ranges) => {
                 crate::defs::chunk_queue::dispatch_one_to_one(&txn, *id, ranges).await?;
-            }
-            Build::Direct => {
-                crate::defs::chunk_queue::dispatch_direct_build(&txn, *id, marker.attempts).await?;
             }
             Build::Ring => {}
         }
@@ -3807,759 +3800,6 @@ mod catch_up_tests {
         }
         panic!("pipeline did not reach quiescence within 16 seal/drain rounds");
     }
-
-    /// The rollup of `public.orders` these tests build, held out of the
-    /// Re-derive build so it takes the old direct build and its go-live
-    /// catch-up until #625 F10 (every plain aggregate is the Re-derive
-    /// build's since #625 F5). Its `SUM` shows a change counted twice.
-    const ROLLUP: &str = "TRANSFORM order_rollup FROM orders GROUP BY g \
-        WITHOUT SOURCE INDEX SELECT sum(a) AS total";
-
-    /// `public.orders` (group `g = 0` holds ids 2, 4, 6 and group 1 holds 1,
-    /// 3, 5, with `a = id`) summed by `order_rollup`, built, paused, changed
-    /// by `gap`, and resumed, with the resume's marker settled and ready to
-    /// discharge. Returns a same-crate pool and the discharging connection.
-    async fn resumed_rollup(
-        db: &testkit::TestDatabase,
-        gap: &str,
-    ) -> (crate::pool::Pool, tokio_postgres::Client) {
-        let config = crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
-        let pool = crate::pool::Pool::new(&config).expect("build a same-crate pool");
-        let mut client = connect(db).await;
-        client
-            .batch_execute(
-                "create table public.orders (id bigint primary key, g bigint, a numeric); \
-                 insert into public.orders select s, s % 2, s from generate_series(1, 6) s;",
-            )
-            .await
-            .expect("seed orders");
-        hold_out_of_the_rederive_build(&client, "public.orders")
-            .await
-            .expect("hold orders' definitions out of the Re-derive build");
-        // The live types: a resume re-validates against them and re-types
-        // a `GROUP BY` copy that doesn't match (#767).
-        let columns = [
-            (
-                "id",
-                crate::defs::ValueType::Integer(crate::integer::IntWidth::Int8),
-            ),
-            (
-                "g",
-                crate::defs::ValueType::Integer(crate::integer::IntWidth::Int8),
-            ),
-            ("a", crate::defs::ValueType::Numeric),
-        ]
-        .into_iter()
-        .map(|(name, ty)| (name.to_string(), ty))
-        .collect();
-        crate::defs::install_definition(&pool, ROLLUP, &columns, "public")
-            .await
-            .expect("install order_rollup");
-        settle_registrations(&pool).await;
-        drain_all(&pool, &mut client).await;
-        crate::defs::lifecycle::pause_transform(&pool, "order_rollup")
-            .await
-            .expect("pause");
-        client.batch_execute(gap).await.expect("write while paused");
-        crate::staging::quarantine::resume_transform(&pool, "order_rollup")
-            .await
-            .expect("resume");
-        (pool, client)
-    }
-
-    /// Stages one CDC change on `public.orders` the way a capture trigger would.
-    async fn stage_order_cdc(
-        client: &mut tokio_postgres::Client,
-        key: &str,
-        op: crate::staging::CdcOp,
-        old_image: Option<&str>,
-        new_image: Option<&str>,
-    ) {
-        let txn = client.transaction().await.expect("begin");
-        append::append(
-            &txn,
-            &[StagedChange::Cdc {
-                src_table: "public.orders".to_string(),
-                key: key.to_string(),
-                op,
-                lsn: Some(PgLsn::from(1)),
-                old_image: old_image.map(str::to_string),
-                new_image: new_image.map(str::to_string),
-                origin_lsn: None,
-                src_changed: None,
-                hop_gen: 0,
-            }],
-        )
-        .await
-        .expect("stage cdc");
-        txn.commit().await.expect("commit cdc");
-    }
-
-    async fn rollup_rows(client: &tokio_postgres::Client) -> Vec<(i64, String)> {
-        client
-            .query(
-                "select g::bigint, total::text from public.order_rollup order by g",
-                &[],
-            )
-            .await
-            .expect("read order_rollup")
-            .into_iter()
-            .map(|r| (r.get(0), r.get(1)))
-            .collect()
-    }
-
-    /// Issue #330's orphan delete, on a resumed aggregate's direct-build
-    /// rebuild (issue #419). The discharge deletes the target rows no source
-    /// row backs and dispatches the job; `race` then writes the source before
-    /// the job reads it, staging that write's CDC the way a capture trigger would. The
-    /// job runs and finishes, and the CDC drains once the definition is
-    /// `live`.
-    async fn rebuild_racing(
-        pool: &crate::pool::Pool,
-        discharger: &mut tokio_postgres::Client,
-        race: &str,
-        key: &str,
-        op: crate::staging::CdcOp,
-        old_image: Option<&str>,
-        new_image: Option<&str>,
-    ) {
-        run_pending_backfills(
-            discharger,
-            "wake",
-            &StagedWatermark::saturated(),
-            Duration::ZERO,
-        )
-        .await
-        .expect("discharge the resume's marker");
-        let status: String = discharger
-            .query_one(
-                "select status from transform_definitions \
-                 where target_table = 'public.order_rollup'",
-                &[],
-            )
-            .await
-            .expect("read status")
-            .get(0);
-        assert_eq!(status, "backfilling", "the rebuild is a direct-build job");
-        let direct: i64 = discharger
-            .query_one(
-                "select count(*) from backfill_chunks c \
-                 join transform_definitions d on d.id = c.definition_id \
-                 where d.target_table = 'public.order_rollup' and c.kind = 'direct' \
-                   and not c.done",
-                &[],
-            )
-            .await
-            .expect("count direct-build jobs")
-            .get(0);
-        assert_eq!(
-            direct, 1,
-            "the old direct build's job, not a Re-derive build"
-        );
-        discharger.batch_execute(race).await.expect("race the job");
-        stage_order_cdc(discharger, key, op, old_image, new_image).await;
-        settle_registrations(pool).await;
-        drain_all(pool, discharger).await;
-    }
-
-    /// Group 0 is empty when the discharge's orphan delete runs, so its
-    /// pre-pause row goes, and it is repopulated before the job reads the
-    /// source. The job builds it from the new row, and that row's CDC,
-    /// draining after the flip, must not count it again: the row's ledger
-    /// entry's basis already says the build's read counted it, so the insert
-    /// doesn't add 100 to the group (200).
-    #[tokio::test]
-    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
-    async fn a_group_repopulated_before_the_rebuild_reads_holds_only_its_new_rows() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (pool, mut discharger) =
-            resumed_rollup(&db, "delete from public.orders where g = 0").await;
-
-        rebuild_racing(
-            &pool,
-            &mut discharger,
-            "insert into public.orders values (10, 0, 100)",
-            "10",
-            crate::staging::CdcOp::Insert,
-            None,
-            Some(r#"{"id":"10","g":"0","a":"100"}"#),
-        )
-        .await;
-
-        assert_eq!(
-            rollup_rows(&discharger).await,
-            vec![(0, "100".to_string()), (1, "9".to_string())],
-            "group 0 is rebuilt from its new row alone, counted once"
-        );
-    }
-
-    /// Group 1's last row is deleted after the dispatch's sweep kept the
-    /// group and before the job reads the source, so the job writes nothing
-    /// for it and its pre-pause row survives the rebuild. The go-live
-    /// discharge's sweep finds the group unbacked and deletes it; the row's
-    /// CDC delete, applied once the definition is `live`, finds nothing.
-    #[tokio::test]
-    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
-    async fn a_group_emptied_after_the_dispatch_sweep_is_dropped_at_go_live() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (pool, mut discharger) =
-            resumed_rollup(&db, "delete from public.orders where id in (3, 5)").await;
-
-        rebuild_racing(
-            &pool,
-            &mut discharger,
-            "delete from public.orders where id = 1",
-            "1",
-            crate::staging::CdcOp::Delete,
-            Some(r#"{"id":"1","g":"1","a":"1"}"#),
-            None,
-        )
-        .await;
-
-        assert_eq!(
-            rollup_rows(&discharger).await,
-            vec![(0, "12".to_string())],
-            "group 1 went extinct after the dispatch sweep ran; the go-live sweep drops it"
-        );
-    }
-
-    /// Group 0 is emptied while the definition is paused, with those
-    /// deletes' CDC still staged when it goes live again, and the discharge's
-    /// orphan delete drops the group's row, so the job writes none. A new row
-    /// lands in the group after the job read, and its CDC drains in one batch
-    /// with the deletes, against a group with no row. The build never read
-    /// the deleted rows, so their ledger entries are non-members and the
-    /// deletes move nothing: the group is just the new row, 100, not 88.
-    #[tokio::test]
-    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
-    async fn a_group_emptied_before_the_rebuild_reads_holds_only_its_new_rows() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (pool, mut discharger) =
-            resumed_rollup(&db, "delete from public.orders where g = 0").await;
-        for id in [2, 4, 6] {
-            stage_order_cdc(
-                &mut discharger,
-                &id.to_string(),
-                crate::staging::CdcOp::Delete,
-                Some(&format!(r#"{{"id":"{id}","g":"0","a":"{id}"}}"#)),
-                None,
-            )
-            .await;
-        }
-
-        run_pending_backfills(
-            &mut discharger,
-            "wake",
-            &StagedWatermark::saturated(),
-            Duration::ZERO,
-        )
-        .await
-        .expect("discharge the resume's marker");
-        settle_registrations(&pool).await;
-        discharger
-            .batch_execute("insert into public.orders values (10, 0, 100)")
-            .await
-            .expect("repopulate group 0 after the build read");
-        stage_order_cdc(
-            &mut discharger,
-            "10",
-            crate::staging::CdcOp::Insert,
-            None,
-            Some(r#"{"id":"10","g":"0","a":"100"}"#),
-        )
-        .await;
-        drain_all(&pool, &mut discharger).await;
-
-        assert_eq!(
-            rollup_rows(&discharger).await,
-            vec![(0, "100".to_string()), (1, "9".to_string())],
-            "group 0 holds only its new row: the deletes the build already read don't reach it"
-        );
-    }
-
-    /// One change to `public.orders` to stage as a capture trigger would: its key, op,
-    /// and old and new images.
-    type OrderCdc<'a> = (
-        &'a str,
-        crate::staging::CdcOp,
-        Option<&'a str>,
-        Option<&'a str>,
-    );
-
-    /// Runs `sql` on `writer`, then stages `cdc` for it the way a capture trigger would,
-    /// at a real LSN past the write's commit: an apply that compares it with
-    /// a ledger entry's basis must see it as the later commit it is.
-    async fn write_orders(writer: &mut tokio_postgres::Client, sql: &str, cdc: &[OrderCdc<'_>]) {
-        writer.batch_execute(sql).await.expect("write orders");
-        let lsn: PgLsn = writer
-            .query_one("select pg_current_wal_insert_lsn()", &[])
-            .await
-            .expect("read the commit's LSN")
-            .get(0);
-        let changes: Vec<StagedChange> = cdc
-            .iter()
-            .map(|&(key, op, old, new)| StagedChange::Cdc {
-                src_table: "public.orders".to_string(),
-                key: key.to_string(),
-                op,
-                lsn: Some(lsn),
-                old_image: old.map(str::to_string),
-                new_image: new.map(str::to_string),
-                origin_lsn: None,
-                src_changed: None,
-                hop_gen: 0,
-            })
-            .collect();
-        let txn = writer.transaction().await.expect("begin");
-        append::append(&txn, &changes).await.expect("stage cdc");
-        txn.commit().await.expect("commit cdc");
-    }
-
-    /// Fences `public.orders`' pending marker and waits for the fence to
-    /// settle, so the discharge a test runs next takes no fence of its own.
-    /// A fresh fence would wait out the test's own lock-holding transaction.
-    async fn settle_orders_marker(client: &tokio_postgres::Client) {
-        let generation: i64 = client
-            .query_one(
-                "select generation from pending_backfill where table_name = 'public.orders'",
-                &[],
-            )
-            .await
-            .expect("a marker is pending on orders")
-            .get(0);
-        let fence = confirm_fence(client, "public.orders", generation)
-            .await
-            .expect("fence the marker")
-            .expect("the marker was unfenced");
-        let now = fresh_fences_settled(client, fence, Duration::from_secs(60), &|| false)
-            .await
-            .expect("wait for the fence");
-        assert!(now.settled_since(fence), "the fence settles");
-    }
-
-    /// Waits until backend `pid` is blocked on a lock. A precondition the
-    /// test sets up itself (it holds the lock), not a convergence wait.
-    async fn wait_for_lock_wait(client: &tokio_postgres::Client, pid: i32) {
-        for _ in 0..6000 {
-            let blocked: bool = client
-                .query_one(
-                    "select exists (select 1 from pg_stat_activity \
-                     where pid = $1 and wait_event_type = 'Lock')",
-                    &[&pid],
-                )
-                .await
-                .expect("read pg_stat_activity")
-                .get(0);
-            if blocked {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("the discharge never blocked on the held lock");
-    }
-
-    /// Issue #436, made deterministic. Runs one discharge of
-    /// `public.orders`' settled marker while `locker` holds
-    /// `public.order_copy` `ACCESS EXCLUSIVE`, a target the discharge reads
-    /// after `public.order_rollup`'s. Once the discharge blocks on that lock,
-    /// `gap` empties a group and the lock is released. Once the discharge
-    /// has fixed its read's snapshot and waits on the watermark, `refill` puts new
-    /// rows in the group, and the watermark is let through.
-    ///
-    /// Before #436 the orphan sweep ran one anti-join per target, each on its
-    /// own snapshot, ahead of the read's `DECLARE`. The rollup's ran before
-    /// the lock, found the group backed and kept it, the read found it empty,
-    /// and the group's CDC folded onto its stale value as deltas.
-    async fn discharge_across_the_gap(
-        discharger: &mut tokio_postgres::Client,
-        writer: &mut tokio_postgres::Client,
-        locker: &tokio_postgres::Client,
-        gap: (&str, &[OrderCdc<'_>]),
-        refill: (&str, &[OrderCdc<'_>]),
-    ) {
-        let pid: i32 = discharger
-            .query_one("select pg_backend_pid()", &[])
-            .await
-            .expect("read the discharger's pid")
-            .get(0);
-        let watermark = StagedWatermark::new();
-        let waiting = tokio::sync::Notify::new();
-        // `stop` is polled only while the enumeration waits on the watermark.
-        let stop = || {
-            waiting.notify_one();
-            false
-        };
-        let discharge = async {
-            let failures = run_pending_backfills_until(
-                discharger,
-                "wake",
-                &watermark,
-                Duration::from_secs(600),
-                &stop,
-            )
-            .await
-            .expect("run_pending_backfills_until");
-            assert!(failures.is_empty(), "the discharge failed: {failures:?}");
-        };
-        let drive = async {
-            wait_for_lock_wait(writer, pid).await;
-            write_orders(writer, gap.0, gap.1).await;
-            locker
-                .batch_execute("rollback")
-                .await
-                .expect("release the lock");
-            waiting.notified().await;
-            write_orders(writer, refill.0, refill.1).await;
-            watermark.advance(PgLsn::from(u64::MAX));
-        };
-        tokio::time::timeout(Duration::from_secs(120), async {
-            tokio::join!(discharge, drive);
-        })
-        .await
-        .expect("the discharge finishes once released");
-    }
-
-    /// `public.orders` (group 0 holds ids 2, 4, 6 and group 1 holds 1, 3, 5,
-    /// with `a = id`), summed by `order_rollup` and copied 1-1 by
-    /// `order_copy`, registered in that order. Returns a same-crate pool and
-    /// a connection.
-    async fn orders_with_rollup_and_copy(
-        db: &testkit::TestDatabase,
-        rollup: &str,
-    ) -> (crate::pool::Pool, tokio_postgres::Client) {
-        let config = crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
-        let pool = crate::pool::Pool::new(&config).expect("build a same-crate pool");
-        let client = connect(db).await;
-        client
-            .batch_execute(
-                "create table public.orders (id bigint primary key, g bigint, a numeric); \
-                 insert into public.orders select s, s % 2, s from generate_series(1, 6) s;",
-            )
-            .await
-            .expect("seed orders");
-        // The live types: a resume re-validates against them and re-types
-        // a `GROUP BY` copy that doesn't match (#767).
-        let columns: std::collections::HashMap<String, crate::defs::ValueType> = [
-            (
-                "id",
-                crate::defs::ValueType::Integer(crate::integer::IntWidth::Int8),
-            ),
-            (
-                "g",
-                crate::defs::ValueType::Integer(crate::integer::IntWidth::Int8),
-            ),
-            ("a", crate::defs::ValueType::Numeric),
-        ]
-        .into_iter()
-        .map(|(name, ty)| (name.to_string(), ty))
-        .collect();
-        // The copy's build is the old chunked one, with its go-live
-        // catch-up, only while `orders` reads as another definition's
-        // target: over a captured table a plain 1-1 is the Re-derive
-        // build's (#625 F8a), which has no catch-up.
-        feed_from_a_test_definition(&client, "public.orders")
-            .await
-            .expect("make orders read as another definition's target");
-        for text in [rollup, "TRANSFORM order_copy FROM orders SELECT a AS a"] {
-            crate::defs::install_definition(&pool, text, &columns, "public")
-                .await
-                .unwrap_or_else(|e| panic!("install {text:?}: {e}"));
-        }
-        (pool, client)
-    }
-
-    const CLAIMED_BY: &str = "catch_up_tests";
-
-    /// Claims and runs the rollup's direct-build job and the copy's chunk,
-    /// without finishing either: the definitions stay `backfilling`.
-    async fn run_claimed_builds(
-        pool: &crate::pool::Pool,
-        client: &tokio_postgres::Client,
-    ) -> Vec<crate::defs::chunk_queue::ClaimedChunk> {
-        let chunks = crate::defs::chunk_queue::claim_chunks(client, CLAIMED_BY, 1000)
-            .await
-            .expect("claim the builds");
-        assert_eq!(chunks.len(), 2, "one direct-build job and one chunk");
-        for chunk in &chunks {
-            crate::defs::chunk_queue::run_claimed_chunk(
-                pool,
-                chunk,
-                CLAIMED_BY,
-                Duration::from_secs(5),
-                Duration::from_secs(60),
-            )
-            .await
-            .expect("run the build");
-        }
-        chunks
-    }
-
-    /// Finishes `chunks`, which moves both definitions to `catching_up` and
-    /// parks their go-live catch-up on `public.orders`.
-    async fn finish_builds(
-        pool: &crate::pool::Pool,
-        chunks: &[crate::defs::chunk_queue::ClaimedChunk],
-    ) {
-        for chunk in chunks {
-            crate::defs::chunk_queue::finish_chunk(pool, chunk, CLAIMED_BY)
-                .await
-                .expect("finish the build");
-        }
-    }
-
-    async fn copy_ids(client: &tokio_postgres::Client) -> Vec<i64> {
-        client
-            .query("select id::bigint from public.order_copy order by id", &[])
-            .await
-            .expect("read order_copy")
-            .into_iter()
-            .map(|r| r.get(0))
-            .collect()
-    }
-
-    fn deleted(id: i64) -> String {
-        format!(r#"{{"id":"{id}","g":"{}","a":"{id}"}}"#, id % 2)
-    }
-
-    /// Issue #436 on a fresh build's go-live (#485). The direct build reads
-    /// group 1 as 9 (ids 1, 3, 5); id 3 is deleted before the build finishes,
-    /// and its CDC drains while the definition is `backfilling`, so it's
-    /// skipped. The go-live discharge must then leave group 1 exactly as the
-    /// source has it. Its last rows (1, 5) are deleted in the discharge's gap
-    /// and id 10 (100) lands after its read: the right answer is 100. Folding
-    /// the gap's deletes and the refill onto the stale 9 gives 103.
-    #[tokio::test]
-    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
-    async fn a_group_emptied_before_a_go_live_read_and_refilled_after_it_holds_only_its_new_rows() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (pool, mut discharger) = orders_with_rollup_and_copy(&db, ROLLUP).await;
-        park_registration_markers(&discharger, &["public.orders".to_string()])
-            .await
-            .expect("park the registrations' marker");
-        run_pending_backfills(
-            &mut discharger,
-            "wake",
-            &StagedWatermark::saturated(),
-            Duration::ZERO,
-        )
-        .await
-        .expect("dispatch both builds");
-
-        let chunks = run_claimed_builds(&pool, &discharger).await;
-        write_orders(
-            &mut discharger,
-            "delete from public.orders where id = 3",
-            &[("3", crate::staging::CdcOp::Delete, Some(&deleted(3)), None)],
-        )
-        .await;
-        drain_all(&pool, &mut discharger).await;
-        finish_builds(&pool, &chunks).await;
-        assert_eq!(
-            rollup_rows(&discharger).await,
-            vec![(0, "12".to_string()), (1, "9".to_string())],
-            "the build counted id 3, and its delete was skipped"
-        );
-
-        settle_orders_marker(&discharger).await;
-        let mut writer = connect(&db).await;
-        let locker = connect(&db).await;
-        locker
-            .batch_execute("begin; lock table public.order_copy in access exclusive mode")
-            .await
-            .expect("lock order_copy");
-        discharge_across_the_gap(
-            &mut discharger,
-            &mut writer,
-            &locker,
-            (
-                "delete from public.orders where id in (1, 5)",
-                &[
-                    ("1", crate::staging::CdcOp::Delete, Some(&deleted(1)), None),
-                    ("5", crate::staging::CdcOp::Delete, Some(&deleted(5)), None),
-                ],
-            ),
-            (
-                "insert into public.orders values (10, 1, 100)",
-                &[(
-                    "10",
-                    crate::staging::CdcOp::Insert,
-                    None,
-                    Some(r#"{"id":"10","g":"1","a":"100"}"#),
-                )],
-            ),
-        )
-        .await;
-        drain_all(&pool, &mut discharger).await;
-
-        assert_eq!(
-            rollup_rows(&discharger).await,
-            vec![(0, "12".to_string()), (1, "100".to_string())],
-            "group 1 holds only its new row"
-        );
-        assert_eq!(copy_ids(&discharger).await, vec![2, 4, 6, 10]);
-    }
-
-    /// Issue #436 on a resume, #391's reproduction made deterministic. The
-    /// rollup is paused at group 1 = 9 (ids 1, 3, 5), and id 3 is deleted
-    /// meanwhile. The resume's discharge keeps group 1 (ids 1 and 5 still
-    /// back it); they are deleted
-    /// before the rebuild reads, so its ledger has nothing in group 1 and it
-    /// deletes that stale row (issue #815); id 7 lands after
-    /// the read. Every one of those changes drains while the rollup is
-    /// `backfilling`, so none reaches it. The go-live discharge must then
-    /// leave group 1 exactly as the source has it. Its last row (7) is
-    /// deleted in the discharge's gap and id 10 (100) lands after its read:
-    /// the right answer is 100. Folding those onto a stale row gives more.
-    #[tokio::test]
-    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
-    async fn a_resumed_group_emptied_before_a_go_live_read_and_refilled_after_it_holds_only_its_new_rows()
-     {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (pool, mut discharger) = orders_with_rollup_and_copy(&db, ROLLUP).await;
-        settle_registrations(&pool).await;
-        drain_all(&pool, &mut discharger).await;
-        for name in ["order_rollup", "order_copy"] {
-            crate::defs::lifecycle::pause_transform(&pool, name)
-                .await
-                .expect("pause");
-        }
-        write_orders(
-            &mut discharger,
-            "delete from public.orders where id = 3",
-            &[("3", crate::staging::CdcOp::Delete, Some(&deleted(3)), None)],
-        )
-        .await;
-        drain_all(&pool, &mut discharger).await;
-        for name in ["order_rollup", "order_copy"] {
-            crate::staging::quarantine::resume_transform(&pool, name)
-                .await
-                .expect("resume");
-        }
-        run_pending_backfills(
-            &mut discharger,
-            "wake",
-            &StagedWatermark::saturated(),
-            Duration::ZERO,
-        )
-        .await
-        .expect("dispatch both rebuilds");
-
-        write_orders(
-            &mut discharger,
-            "delete from public.orders where id in (1, 5)",
-            &[
-                ("1", crate::staging::CdcOp::Delete, Some(&deleted(1)), None),
-                ("5", crate::staging::CdcOp::Delete, Some(&deleted(5)), None),
-            ],
-        )
-        .await;
-        drain_all(&pool, &mut discharger).await;
-        let chunks = run_claimed_builds(&pool, &discharger).await;
-        write_orders(
-            &mut discharger,
-            "insert into public.orders values (7, 1, 7)",
-            &[(
-                "7",
-                crate::staging::CdcOp::Insert,
-                None,
-                Some(r#"{"id":"7","g":"1","a":"7"}"#),
-            )],
-        )
-        .await;
-        drain_all(&pool, &mut discharger).await;
-        finish_builds(&pool, &chunks).await;
-        // The dispatch's sweep kept group 1 at ids 1 and 5 (6), and the
-        // rebuild's ledger has no entry in it, so the rebuild deleted it
-        // rather than leave that stale row for id 7 to be counted onto
-        // (issue #815).
-        assert_eq!(
-            rollup_rows(&discharger).await,
-            vec![(0, "12".to_string())],
-            "the rebuild dropped group 1, which its ledger has no entry for"
-        );
-
-        settle_orders_marker(&discharger).await;
-        let mut writer = connect(&db).await;
-        let locker = connect(&db).await;
-        locker
-            .batch_execute("begin; lock table public.order_copy in access exclusive mode")
-            .await
-            .expect("lock order_copy");
-        discharge_across_the_gap(
-            &mut discharger,
-            &mut writer,
-            &locker,
-            (
-                "delete from public.orders where id = 7",
-                &[(
-                    "7",
-                    crate::staging::CdcOp::Delete,
-                    Some(r#"{"id":"7","g":"1","a":"7"}"#),
-                    None,
-                )],
-            ),
-            (
-                "insert into public.orders values (10, 1, 100)",
-                &[(
-                    "10",
-                    crate::staging::CdcOp::Insert,
-                    None,
-                    Some(r#"{"id":"10","g":"1","a":"100"}"#),
-                )],
-            ),
-        )
-        .await;
-        drain_all(&pool, &mut discharger).await;
-
-        assert_eq!(
-            rollup_rows(&discharger).await,
-            vec![(0, "12".to_string()), (1, "100".to_string())],
-            "group 1 holds only its new row"
-        );
-        assert_eq!(copy_ids(&discharger).await, vec![2, 4, 6, 10]);
-    }
-
-    /// Issue #503: the sweep takes its target row locks only after the
-    /// watermark wait. While the go-live discharge waits on the watermark, a writer that
-    /// touches the row the sweep will delete (a drain applying an earlier
-    /// sealed segment, say) doesn't wait on the discharge.
-    #[tokio::test]
-    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
-    async fn the_sweep_holds_no_target_row_lock_across_the_intake_wait() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (pool, mut discharger) = orders_with_rollup_and_copy(
-            &db,
-            "TRANSFORM order_rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total",
-        )
-        .await;
-        settle_builds(&pool).await;
-        discharger
-            .batch_execute("insert into public.order_copy (id, a) values (-1, 0)")
-            .await
-            .expect("plant a row no source row backs");
-        settle_orders_marker(&discharger).await;
-        let writer = connect(&db).await;
-        writer
-            .batch_execute("set lock_timeout = '5s'")
-            .await
-            .expect("bound the writer's lock wait");
-        discharge_racing(&mut discharger, |go, done| async move {
-            writer
-                .batch_execute("update public.order_copy set a = 1 where id = -1")
-                .await
-                .expect("the row is not locked during the intake wait");
-            go.send(()).expect("release the discharge");
-            done.await.expect("the discharge commits");
-        })
-        .await;
-        assert_eq!(copy_ids(&discharger).await, vec![1, 2, 3, 4, 5, 6]);
-    }
 }
 
 /// Issue #418 (ADR-0002): registration's marker comes from the reconcile
@@ -4857,11 +4097,12 @@ mod dispatch_tests {
         assert!(markers(&client).await.is_empty());
     }
 
-    /// An aggregate waiting on the discharge gets one direct-build job
-    /// (issue #419), committed with its move to `backfilling`, and nothing is
-    /// enumerated into the ring: the job reads the source itself.
+    /// An aggregate waiting on the discharge (one held out of its plan job)
+    /// is rebuilt by the ring enumeration, flipped `live` in the discharge's
+    /// own transaction, with no build job: the group basis applies the
+    /// enumeration's image-less recomputes.
     #[tokio::test]
-    async fn an_aggregate_waiting_on_the_discharge_gets_a_direct_build_job() {
+    async fn an_aggregate_waiting_on_the_discharge_is_rebuilt_by_the_ring() {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
         let mut client = connect(&db).await;
@@ -4877,20 +4118,11 @@ mod dispatch_tests {
         reconcile(&mut client, &["public.orders"]).await;
 
         discharge(&mut client).await;
-        assert_eq!(status(&client, id).await, "backfilling");
-        assert_eq!(chunks(&client, id).await, 1);
-        let unbounded: bool = client
-            .query_one(
-                "select hi is null and lo is null from backfill_chunks where definition_id = $1",
-                &[&id],
-            )
-            .await
-            .expect("read the job")
-            .get(0);
-        assert!(unbounded, "the job builds the whole definition");
+        assert_eq!(status(&client, id).await, "live");
+        assert_eq!(chunks(&client, id).await, 0, "no build job");
         assert!(
-            !staged(&client).await,
-            "the source is not enumerated into the ring"
+            staged(&client).await,
+            "the source is enumerated into the ring"
         );
         assert!(markers(&client).await.is_empty());
     }

@@ -4,9 +4,7 @@
 //! keep and rebuilds from the tables now at the names; a change staged
 //! under the old key before the drop is never decoded against the new one.
 //!
-//! Its own test binary: the group-basis knob is process-wide. Every test
-//! turns it on before its client starts. Every pass, build and drain is
-//! stepped by hand. Nothing polls for convergence (#297).
+//! Every pass, build and drain is stepped by hand. Nothing polls for convergence (#297).
 
 #[path = "support/resume_passes.rs"]
 mod resume_passes;
@@ -28,7 +26,6 @@ const SUMS_ORACLE: &str =
 /// under the old key and not yet drained.
 #[tokio::test]
 async fn a_group_basis_aggregate_resumes_onto_a_source_recreated_with_a_wider_key() {
-    trellis::dev::staging::set_group_basis(true);
     let cluster = TestCluster::start();
     let (db, mut raw, trellis) = setup(&cluster, SOURCE, &[SUMS]).await;
     raw.batch_execute("insert into public.c values (100, 1, 5000)")
@@ -55,7 +52,6 @@ async fn a_group_basis_aggregate_resumes_onto_a_source_recreated_with_a_wider_ke
 /// partition key, on the group basis.
 #[tokio::test]
 async fn a_group_basis_aggregate_resumes_onto_its_source_converted_to_a_partitioned_table() {
-    trellis::dev::staging::set_group_basis(true);
     let cluster = TestCluster::start();
     let (db, mut raw, trellis) = setup(&cluster, SOURCE, &[SUMS]).await;
     raw.batch_execute("insert into public.c values (100, 1, 5000)")
@@ -97,7 +93,6 @@ const JOINED_ORACLE: &str = "select c.pid::text, count(*)::text, sum(p.w)::text 
 /// table the same way.
 #[tokio::test]
 async fn a_join_resumes_onto_tables_recreated_with_wider_keys() {
-    trellis::dev::staging::set_group_basis(true);
     let cluster = TestCluster::start();
     let source = format!(
         "{SOURCE}; \

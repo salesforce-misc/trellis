@@ -55,7 +55,6 @@ struct Instance {
 /// Trellis runs as, an aggregate over it live, and 160 rows seeded through
 /// capture.
 async fn instance(cluster: &TestCluster) -> Instance {
-    trellis::dev::staging::set_group_basis(true);
     let db = cluster.create_empty_database().await;
     let admin = connect(db.dsn()).await;
     admin

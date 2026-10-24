@@ -219,27 +219,7 @@ the node's keys or rows, so an operation an unstarted entry absorbs is one each 
 its readers reads. Two inserters that race past the test both queue, which
 costs work and never correctness.
 
-On an aggregate, a node's correction is a Re-derive of a key set through the
-normal page path. The set is the keys of the live ledger entries whose group
-routes to the node by its recorded text, found through the ledger's `GROUP BY`
-index, plus, for a node in the tree, the keys of its current rows, read from
-the node in keyset chunks as a build does. A gone node's rows all satisfied its
-recorded text, so the ledger walk finds their entries; only a gone node without
-a usable text has its detached table's rows read instead. Each key takes its entry lock, reads
-the source row live through the root, and rewrites or tombstones its entry, so
-its group moves by a delta. No target row and no ledger entry is ever deleted
-directly. A group is the sum of its entries, so deleting a group row would leave
-the entries live, and deleting entries would drop the tombstones that refuse a
-ring change staged before the DDL, which would then resurrect the row. A
-partitioned source's aggregate always has the ledger's `GROUP BY` index. The
-pending correction is durable, so a restart resumes it, and the pass records its
-fingerprints once the correction is queued, not once it has drained. A
-correction works in pages of one build chunk's size, each page one transaction
-that commits its keys' entries and its progress together, so a restart resumes
-after the last committed page: the ledger walk in `(group, key)` order, then the
-node's rows in primary-key order.
-
-On an aggregate kept on [ADR-0002](0002-async-data-flow.md)'s group basis, a
+On an aggregate ([ADR-0002](0002-async-data-flow.md)'s group basis), a
 node's correction recomputes the groups that route to the node, never zeroes
 them: a `TRUNCATE` and an `INSERT` into the leaf in one transaction leave a row
 that a zero would erase and whose change the zero's basis would then refuse.
@@ -253,7 +233,9 @@ statement, because a page that applies such a change and has its ring rows
 retired between two reads would be in neither. The correction then locks the
 set in one sorted statement and rewrites each group's partials from a
 `GROUP BY` of its rows, with that statement's snapshot as the group's basis,
-in one transaction that records the correction done. Every change the DDL
+in one transaction that records the correction done. The pending correction
+is durable, so a restart resumes it, and the pass records its fingerprints once
+the correction is queued, not once it has drained. Every change the DDL
 removed was committed before the reader recorded its start, so the basis sees
 it and its page refuses it: no `build_seg` and no fence. The rows are read through the
 root, or, while the whole tree is as recorded (every node under the same
@@ -264,8 +246,7 @@ attached beside a `DEFAULT` takes some of its groups, whose rows a read of the
 `DEFAULT` alone would zero. Every operation that narrows the node's region
 after the check locks the node, so it waits for the correction. The capture
 install that adds a new node to the tree rebuilds none of the readers a
-correction covers (an aggregate over the source, on the group basis or the
-ledger): the node's own correction covers its rows, including those written into it
+correction covers (an aggregate over the source): the node's own correction covers its rows, including those written into it
 directly before its capture existed. That install parks no marker on the root
 when no other reader needs a catch-up, so no discharge stages a recompute of
 every key of the source. An install that also changes the capture functions,
@@ -302,27 +283,18 @@ write a key the walk has no entry for. Waiting for the ring to fold through a
 position would never finish on a busy ring, whose active segment is never empty.
 
 My cleanup measurements deleted a leaf's routed rows from a model target, a
-virtual sum with no ledger and no real Apply, then re-aggregated the leaf. That
-closed the oracle diff in every lifecycle cell I measured on `HASH`, `RANGE` and
-`LIST`, including direct writes into a new leaf before its capture existed,
-which a "recompute the groups found in the leaf" rule never converged on, and
-every window closed within 5.2 s under load. Those figures show the routing is
-exact, not what a correction costs. On the real path the work scales with the
-node's rows. Measured on the ledger build in the 1,000-leaf sweep (a release
-build, PostgreSQL 17.11, the cluster on disk), the correction of a dropped leaf
-of 1,000,000 rows takes 13.0 s in the engine: 1,000,000 keys in 101 pages and
-489 MB of WAL, about 490 bytes a key. Each key costs an entry lock, the entry's
-rewrite as a tombstone (not HOT, so an insert into the key index and the
-tombstone index) and the full-page images those touch. The pass that detects
-the drop takes 256 ms, and folding the correction's group deltas takes the
-merger 0.35 s and 23 MB. At that rate a retention `DROP` of 100M rows takes
-about 22 minutes and about 49 GB of WAL, then the garbage collector's deletes of
-those tombstones; that figure is a linear extrapolation from a leaf whose
-ledger stays in cache, and it is a floor. Past the cache, finding each key
-through the ledger's `GROUP BY` index reads a random heap page and a random
-index page: a model of that walk (#1085) ran at 17.5–21.5k keys a second and
-9–12 KB of WAL a key, which projects to 78–95 minutes and 0.9–1.2 TB of WAL for
-a leaf of 100M rows. Rows an operation adds
+virtual sum with no real Apply, then re-aggregated the leaf. That closed the
+oracle diff in every lifecycle cell I measured on `HASH`, `RANGE` and `LIST`,
+including direct writes into a new leaf before its capture existed, which a
+"recompute the groups found in the leaf" rule never converged on, and every
+window closed within 5.2 s under load. Those figures show the routing is
+exact, not what a correction costs. On the real path a `DROP`, `DETACH` or
+`TRUNCATE` recomputes the groups that route to the node, so its work scales
+with those groups; an `ATTACH` also reads the node's rows. Measured in the
+1,000-leaf sweep (a release build, PostgreSQL 17, the cluster on disk), the
+correction of a dropped leaf of 1,000,000 rows over 50,000 groups takes 1.46 s
+in the engine, one transaction with 19 MB of WAL, and 0.05 s and 2 MB to settle
+the target; the pass that detects the drop takes 0.30 s. Rows an operation adds
 are undercounted until its correction drains, rows it removes are overcounted,
 and writes through the parent have no window at all.
 
@@ -358,9 +330,8 @@ backfill it is.
 For `HASH` the sweep finds target groups over the missing remainders; for
 `RANGE` and `LIST`, over the gaps between the current bounds, read from
 `pg_get_expr(relpartbound)` and ordered by the key column's collation. A
-`DEFAULT` under the root means no statement. On an aggregate, the keys of the
-live ledger entries in the groups it finds are corrected through the normal page
-path, as a node's are; on a JOIN side, the sweep searches the side's partial
+`DEFAULT` under the root means no statement. On an aggregate, the groups it finds are
+recomputed, as a node's are; on a JOIN side, the sweep searches the side's partial
 cells, whose key holds every partition-key column where the target's may not,
 and the cells it finds are recomputed under their join-key locks. The
 sweep runs in its own `READ COMMITTED` transaction: the pass reads the lifecycle
@@ -403,7 +374,7 @@ decision.
 ### A leaf or middle `TRUNCATE` queues that node's correction
 
 A node truncate's ring row names the truncated node. Without the name, the
-truncate trigger of a leaf would empty the whole ledger and target and raise the
+truncate trigger of a leaf would empty the whole hidden table and target and raise the
 truncate floor, losing every other leaf's rows until a rebuild. The row queues
 that node's correction under the same rule as any other operation (an
 unstarted entry of the node absorbs it), with no floor and no barrier, so the other nodes' entries
@@ -505,7 +476,7 @@ leaf stages once under `order_line_items`. When an operator runs
 pass sees the lifecycle fingerprint change, drops capture from the detached
 table, queues a correction of the `order_totals` groups whose `order_id`
 satisfies that leaf's recorded `satisfies_hash_partition(…, 32, 7, order_id)`
-text, and re-derives those orders' keys from the live ledger entries. The
+text, and recomputes those orders' groups. The
 definition reports `backfilling`, with a `correcting` entry for the leaf, until
 the keys drain. Until then those orders are overcounted. The same transform
 grouped `BY product_id` is refused at define, naming `order_id`.
@@ -515,11 +486,10 @@ grouped `BY product_id` is refused at define, naming `order_id`.
 - Large partitioned child tables can feed aggregates and JOIN transforms, with
   capture costing no more per write than on a plain table.
 - Partition maintenance needs no operator step, but counts can be wrong for
-  about one interval plus a correction that costs O(rows in the node), not
-  O(groups): on the ledger build, 13.0 s and 489 MB of WAL for a dropped leaf of
-  1M rows (measured), and for a retention `DROP` of 100M rows at least 22
-  minutes and 49 GB of WAL (extrapolated), and as much as 78–95 minutes and
-  0.9–1.2 TB once the ledger outgrows the cache (#1085's model). An operator who needs exact counts throughout moves rows with DML
+  about one interval plus a correction that costs O(groups the node routes), not
+  O(rows in the node), except an `ATTACH`, which also reads the node's rows:
+  1.46 s and 19 MB of WAL for a dropped leaf of 1M rows over 50,000 groups
+  (measured). An operator who needs exact counts throughout moves rows with DML
   through the parent instead, which I measured at about 4–5 s and 0.5–0.6 GB of
   WAL per 1M-row leaf; creating an empty leaf and writing through the parent
   costs nothing.

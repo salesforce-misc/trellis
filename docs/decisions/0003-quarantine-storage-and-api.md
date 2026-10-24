@@ -297,7 +297,7 @@ until one of these releases it:
   rather than replayed. Before it does, it re-validates the transform against
   the live schema and brings every column Trellis created for it with a
   type from the source (its key, passthrough and `GROUP BY` copies, its
-  calculated, aggregate and ledger contribution columns) to the type define
+  calculated and aggregate columns) to the type define
   would give it now
   ([ADR-0014](0014-pause-and-drop-a-transform.md#resume-reconciles-with-source-not-by-catch-up)),
   so a key quarantined because a widened source value didn't fit a copy
@@ -406,20 +406,13 @@ or constraint trigger an application puts on a target fails there, and a connect
 drop there. A connection that drops after the `COMMIT` lands retries a page that
 committed: a final page's retry finds the claim that commit released gone and rolls
 back as a lost claim, and a non-final page's retry applies again and writes nothing
-new, since each key's ledger entry already holds its change.
+new, since each 1-1 key's ledger entry or each group's basis already holds its change.
 Isolation's probes roll back rather than commit, so each runs
 `SET CONSTRAINTS ALL IMMEDIATE` before its rollback, and a deferred check fails in the
 probe of the key that breaks it. Trellis's own tables declare no deferrable constraint.
 A failure that is structural rather than one key's fault, so that every key reproduces
 it, is not charged to any key: it pauses the definitions it reaches
 ([ADR-0014](0014-pause-and-drop-a-transform.md)).
-A Re-derive build's group-delta merge applies whole groups, so it has no key to charge
-either. Its transient failures, `COMMIT` included, are retried and then backed off; a
-refused write halts like a page's; and any other failure backs the target off and is
-charged to the merge, whose fifth charge on a worker halts the definition and everything
-downstream of its target. A target backing off never holds up another target's merge or
-the build's chunks.
-
 A failure that is charged to no key and pauses nothing is a *drain holdup*: a refused
 read or write the catalog can't pin on a table (so the halt pauses nothing), isolation
 that charges nobody (records that fail only together, or a record that fails only in two

@@ -140,9 +140,8 @@ pub(super) fn render_definition(def: &TransformDef) -> String {
 
 /// The source indexes `def` needs (#1167), as `(table, leading columns)`: an
 /// aggregate's `GROUP BY` columns on its source, and a `JOIN` side's `ON`
-/// columns, in `ON` order, on each side. Asked of every definition whatever
-/// the group-basis knob says, which only decides whether the engine requires
-/// them: the index serves a `self_check` walk either way.
+/// columns, in `ON` order, on each side. Asked of every definition, whether or
+/// not the engine requires it: the index serves a `self_check` walk either way.
 pub(super) fn required_source_indexes(def: &TransformDef) -> Vec<(String, Vec<String>)> {
     match &def.key_space {
         KeySpace::OneToOne => Vec::new(),

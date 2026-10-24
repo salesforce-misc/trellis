@@ -28,8 +28,8 @@ async fn connect(cluster: &TestCluster) -> (testkit::TestDatabase, Client) {
 }
 
 /// One accepted key type: how to generate values of it, and a wider or
-/// narrower type to present the group's value in (a ledger's group column
-/// need not have the source key column's type).
+/// narrower type to present the group's value in (a group column need not
+/// have the source key column's type).
 struct Ty {
     /// The key column's type as written in `create table`.
     sql: &'static str,

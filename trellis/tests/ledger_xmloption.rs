@@ -1,8 +1,8 @@
-//! A database-level `xmloption = document` doesn't fail a ledger page over
-//! an `xml` fragment (found in #623 D3b's review).
+//! A database-level `xmloption = document` doesn't fail an aggregate's page
+//! over an `xml` fragment (found in #623 D3b's review).
 //!
-//! The ledger casts an image's text into its contribution columns through
-//! `jsonb_populate_record` (`staging::ledger`), so an `xml` contribution
+//! The group basis casts an image's text into the source's columns through
+//! `jsonb_populate_record` (`staging::group_basis`), so an `xml` argument
 //! (`COUNT(x)` over an `xml` column) goes through `xml_in`, which parses
 //! under the session's `xmloption`. Under `document`, content a writer
 //! stored under `content` (a fragment such as `a<b/>`) doesn't parse, and
@@ -142,7 +142,7 @@ async fn counts(raw: &Client, sql: &str) -> Vec<(i32, i64)> {
 }
 
 #[tokio::test]
-async fn an_xml_fragment_applies_through_the_ledger_under_a_document_xmloption() {
+async fn an_xml_fragment_applies_to_an_aggregate_under_a_document_xmloption() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     {

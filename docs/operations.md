@@ -55,25 +55,21 @@ live schema, and refuses while define would, leaving the definition paused;
 the error names the column and what to change. A whole-transform resume also
 refuses, as define does, while a source index the definition's `self_check`
 pages by is missing, unless it was defined `WITHOUT SOURCE INDEX`; create the
-index the message names, then resume. It also refuses in five cases
+index the message names, then resume. It also refuses in three cases
 define doesn't, where the only repair is to `DROP TRANSFORM` and define again:
 
 * a 1-1 definition's source key was redefined;
 * its target table is missing;
-* its ledger table is missing;
-* an aggregate's group-delta table is missing;
-* the group-delta table has other running-sum or recompute columns than
-  define would create now (a `SUM` or `AVG` argument moved between an exact
-  type and floating point).
+* its ledger table is missing.
 
-A `JOIN` has no ledger or group-delta table. Its resume drops and recreates
-its hidden tables instead, keeps the target, and rebuilds both sides and the
-target's groups from the sources, in one transaction, or per side and leaf
-when a side is a partitioned table with rows. Its build rebuilds the target's
-readers when it commits, so they need no pause. The resume of an aggregate on
-the group basis, which has neither table either, drops and recreates its
-hidden partials table and keeps the visible target, which its rebuild
-rewrites; its build rebuilds the target's readers likewise. A field resume
+A `JOIN` has no ledger. Its resume drops and recreates its hidden tables
+instead, keeps the target, and rebuilds both sides and the target's groups
+from the sources, in one transaction, or per side and leaf when a side is a
+partitioned table with rows. Its build rebuilds the target's readers when it
+commits, so they need no pause. The resume of an aggregate, which has no
+ledger either, drops and recreates its hidden partials table and keeps the
+visible target, which its rebuild rewrites; its build rebuilds the target's
+readers likewise. A field resume
 (`RESUME TRANSFORM <target>.<column>`) runs define's validation and the
 source-key check, and refuses a field whose capture is still being widened.
 
@@ -81,7 +77,7 @@ source-key check, and refuses a field whose capture is still being widened.
 
 * It brings every column Trellis created with a type from the source back to
   the type define would give it now: key, passthrough and `GROUP BY` copies,
-  calculated and aggregate columns and ledger contributions. The `RESUME`
+  calculated and aggregate columns. The `RESUME`
   returns at once; the definition stays `paused`,
   its `capture_failure` reading "resuming: …", until the staging worker has
   re-typed them and started the rebuild. A re-type that fails leaves its
@@ -110,15 +106,10 @@ source-key check, and refuses a field whose capture is still being widened.
 because a change was missed. On a 1-1 target it also deletes every row no
 source row backs, so it repairs rows edited, deleted, added or re-keyed by
 hand, and rows left under the old key of a `varchar` key column narrowed
-in place. It keeps:
+in place. It keeps a hand edit of a `JOIN`'s hidden tables, which a `PAUSE`
+and `RESUME` recreates.
 
-* an aggregate's group rows edited by hand, and a `MIN` or `MAX` over a
-  re-collated column: the rebuild keeps the per-row ledger, with its
-  collations, and adds only differences to the groups.
-* a hand edit of a `JOIN`'s hidden tables, which a `PAUSE` and `RESUME`
-  recreates.
-
-`PAUSE`, `DROP TRANSFORM` and define it again repairs each
+`PAUSE`, `DROP TRANSFORM` and define it again repairs it
 ([known correctness gaps](known-correctness-gaps.md): [Rows written into a target, a hidden table or Trellis's schema](known-correctness-gaps.md#rows-written-into-a-target-a-hidden-table-or-trelliss-schema),
 [A column's values rewritten in place by `ALTER COLUMN TYPE`](known-correctness-gaps.md#a-columns-values-rewritten-in-place-by-alter-column-type)).
 
@@ -238,27 +229,21 @@ partition operation does to the counts and how to avoid the window. This is what
 each one costs and what to expect around it
 ([ADR-0017](decisions/0017-partitioned-sources.md)).
 
-* **A correction costs the work of the partition's rows.** On the ledger build,
-  the correction of a dropped partition of 1,000,000 rows took 13.0 s in the
-  engine (1,000,000 keys in 101 pages, 489 MB of WAL), plus 0.35 s and 23 MB to
-  fold the result and a 0.26 s pass to detect the drop (release build,
-  PostgreSQL 17.11, a 1,000-leaf tree on disk). On the group basis, the
-  correction of a `DROP`, `DETACH` or
-  `TRUNCATE` took
-  27-34 ms and about 0.6 MB of WAL for a partition of 1M or 10M rows over 1,560
-  groups (a debug build), and the correction of an `ATTACH` took 0.5-0.6 s at 1M
-  rows and 3.9-4.7 s at 10M. Moving rows with DML through the parent instead
-  costs about 4-5 s and 0.5-0.6 GB of WAL per 1M-row partition and has no
-  window.
-* **A retention `DROP` of a large partition takes the definition out of `live`
-  for minutes.** On the ledger build, a linear extrapolation of the 1M-row
-  figure gives about 22 minutes and 49 GB of WAL for 100M rows, a floor that
-  assumes the ledger stays in cache, followed by the garbage collector's deletes
-  of the tombstones. A model of the walk once the ledger outgrows the cache gave
-  78-95 minutes and 0.9-1.2 TB of WAL for 100M rows. The definition reads
-  `backfilling` with the partition in `correcting` until it drains, and every
-  other partition's groups stay exact. Delete the partition's rows through the
-  parent first to avoid the window.
+* **A correction costs the work of the groups that route to the partition.**
+  The correction of a dropped partition of 1,000,000 rows over 50,000 groups
+  took 1.46 s in the engine, one transaction with 19 MB of WAL, plus 0.05 s and
+  2 MB to settle the target and a 0.30 s pass to detect the drop (release
+  build, PostgreSQL 17, a 1,000-leaf tree on disk). The correction of a
+  `DROP`, `DETACH` or `TRUNCATE` took 27-34 ms and about 0.6 MB of WAL for a
+  partition of 1M or 10M rows over 1,560 groups (a debug build), and the
+  correction of an `ATTACH`, which also reads the partition's rows, took
+  0.5-0.6 s at 1M rows and 3.9-4.7 s at 10M. Moving rows with DML through the
+  parent instead costs about 4-5 s and 0.5-0.6 GB of WAL per 1M-row partition
+  and has no window.
+* **A retention `DROP` of a large partition holds the definition out of `live`
+  only for the correction.** The definition reads `backfilling` with the
+  partition in `correcting` until it drains, and every other partition's
+  groups stay exact.
 * **A `DROP` or `DETACH` of a partition can deadlock against a rebuild or a
   page, and Postgres may abort your DDL with `40P01`.** The DDL takes the
   parent `ACCESS EXCLUSIVE`, then waits for the partition. A per-partition

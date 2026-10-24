@@ -9,8 +9,7 @@
 //! the side's partial cells (`P` or `M`) that route to the node, through the
 //! `J`-locked writer, which carries each cell's change into `T`.
 //!
-//! Every test turns the group-basis dev knob on before its driver starts (a
-//! `JOIN` applies only behind it) and starts from two empty tables: the
+//! Every test starts from two empty tables: the
 //! definition goes `live` with empty hidden tables and the seed arrives
 //! through capture (the per-leaf build of a partitioned side with rows is
 //! `join_interleavings.rs`'s). The pass,
@@ -182,7 +181,6 @@ impl Fx {
     /// `schema` with both `JOIN`s live over its empty tables, `seed` written
     /// through capture and applied, and the tree recorded.
     async fn start(part: Part, schema: &str, seed: &str) -> Fx {
-        trellis::dev::staging::set_group_basis(true);
         let d = Driver::start(
             schema,
             &[("id", int4()), ("ga", int4()), ("k", int4()), ("x", int4())],

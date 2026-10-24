@@ -245,15 +245,17 @@ pause are arcs of one lifecycle:
 * **`backfilling`** — the backfill discharge has captured the source and
   enqueued the transform's build, which is running: chunks, or one direct
   set-based build job, on drain threads. The target is partial.
-  A plain aggregate (grouped by plain source columns, on a captured source) and
-  a plain 1-1 transform (on a captured source) are built by the
-  Re-derive build instead
-  ([data-flow — The Re-derive build](data-flow.md#the-re-derive-build)).
+  A plain 1-1 transform (on a captured source) is built by the Re-derive build
+  instead
+  ([data-flow — The Re-derive build](data-flow.md#the-re-derive-build)), and an
+  aggregate or a `JOIN` by one absolute write per structure
+  ([data-flow — An aggregate's or a `JOIN`'s build](data-flow.md#an-aggregates-or-a-joins-build)).
   The staging worker starts it with no marker, and it is maintained from the start, so it goes
-  from `backfilling` straight to `live` once its last chunk (and, for an aggregate,
-  its last group merge) has committed, with no `catching_up`. Its resume rebuilds it
-  the same way, over the ledger the freeze left, and so does a re-read of its
-  source (`Trellis::request_backfill`). A ring enumeration (the fallback
+  from `backfilling` straight to `live` once its last chunk (or, for an aggregate or
+  a `JOIN`, its write) has committed, with no `catching_up`. Its resume rebuilds it
+  the same way, a 1-1 target's over the ledger the freeze left (an aggregate's
+  or a `JOIN`'s partials are written afresh), and so does a re-read of its source
+  (`Trellis::request_backfill`). A ring enumeration (the fallback
   for a shape neither build can render) never shows this status: it goes from
   `waiting_to_backfill` straight to `live` in the discharge's own transaction (or
   to `catching_up`, when its source is another transform's target).
@@ -381,14 +383,13 @@ pause are arcs of one lifecycle:
   something it can't use), the
   resume fails with `ApplyError::ResumeRefused`, whose message is define's own
   error naming the column and what to change, and the transform stays paused,
-  untouched. The resume also refuses in four cases define doesn't, where define
+  untouched. The resume also refuses in three cases define doesn't, where define
   would accept the transform and the message says to drop it and define it again:
-  its 1-1 source key was redefined, its ledger table is missing, or its
-  aggregate's group-delta table is missing or has different columns from the
-  ones define would create now
+  its target table is missing, its 1-1 source key was redefined, or its ledger
+  table is missing
   ([operations — `PAUSE` and `RESUME`](operations.md#pause-and-resume)). A field resume
-  (`RESUME TRANSFORM t.col`) runs the same validation, but not the ledger and
-  group-delta checks, since it rebuilds nothing. Otherwise the resume returns it to
+  (`RESUME TRANSFORM t.col`) runs the same validation, but not the ledger
+  check, since it rebuilds nothing. Otherwise the resume returns it to
   `waiting_to_backfill`. If columns
   Trellis created for it no longer have the types define would give them now (after
   `integer` to `bigint`, say), the resume returns at once but the transform stays `paused`, its
@@ -524,10 +525,10 @@ under way, and one warning line per finding.
 Every backfill (a new transform's, a resumed one's, or a catch-up) reads its
 source only once a conservative transaction fence settles (the backfill discharge
 checks that the snapshot's `xmin` is past the fence), except the Re-derive build of a
-plain aggregate or a plain 1-1 transform: it starts with no fence, and each
-of its chunks reads under its own short snapshot after locking the ledger
-entries it rewrites, so a long transaction elsewhere doesn't hold it, and it holds no
-long snapshot of its own. The one exception is a build that reads another
+plain 1-1 transform: it starts with no fence, and each of its chunks reads
+under its own short snapshot after locking the ledger entries it rewrites, so
+a long transaction elsewhere doesn't hold it, and it holds no long snapshot of
+its own. The one exception is a build that reads another
 transform's target (its source, or a `JOIN`'s joined table), which takes one
 fence, after it starts, before its first chunk or its one-transaction build: a
 transaction that held a transaction id then (one that had
@@ -604,7 +605,7 @@ paused this way keeps the error there until it is resumed.
 Some failures are no row's fault, so every key of the page reproduces them:
 a source key the drain can't use (the table lost its primary key, or the key
 changed to a type Trellis can't key by), a propagation wave past the hop bound,
-an aggregate target off the ledger, or Postgres refusing the drain's role a read
+an aggregate the group basis can't apply, or Postgres refusing the drain's role a read
 or write (row-level security, which Trellis's `row_security = off` turns into an
 error, or a missing privilege, #766). Retrying the page would fail it forever,
 and quarantining a key would blame one for nobody's fault. Instead the drain
@@ -614,8 +615,8 @@ without them:
 * **What it pauses.** For a key error, every definition that reads the table.
   For a hop bound outside a
   cycle, the readers of the table the wave ran away through, not the
-  definition that wrote it; inside a cycle, every member. For an aggregate off
-  the ledger, the definition that writes that target. For a refused read or
+  definition that wrote it; inside a cycle, every member. For an aggregate the
+  group basis can't apply, the definition that writes that target. For a refused read or
   write, the readers of each table the drain's role can't read and the writer
   of each target it can't write, as the catalog shows them for that role. In
   every case, also everything downstream of those, so no hop target goes
@@ -650,14 +651,6 @@ without them:
   `waiting_to_backfill` or `catching_up`. A refusal the catalog can't pin on a
   table pauses nothing: the marker backs off and retries like any failed
   backfill, with the error on `backfill_failure`.
-* **A failing build merge.** A Re-derive build's group-delta merge that
-  Postgres refuses halts the same way, as the drain worker's role (#901). One
-  that keeps failing otherwise (an application's check or deferred
-  constraint on the target that a merged group breaks) is retried with
-  backoff and charged, logging a warning each time, and its fifth charge on a
-  worker halts the definition and everything downstream of its target, with
-  `kind` `halt`, the target as the table, and the error. Transient failures
-  are retried and never charged.
 * **A failing build start.** A Re-derive build's start that fails in a way
   that would repeat on every pass (its ledger table was dropped, say) halts the
   definition writing that target, and everything downstream of the target, the

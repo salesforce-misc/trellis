@@ -24,7 +24,7 @@ use trellis::capture::install::{self, Progress};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::{ValueType, install_definition};
 use trellis::intake::markers;
-use trellis::staging::build::{self, BuildPlan, ChunkOutcome, MergeOutcome};
+
 use trellis::staging::interleave::{PausePoint, PauseScope, Reached, with_scope};
 use trellis::staging::{
     ApplyError, ApplyOutcome, StagedChange, append, apply, collect_tombstones, has_pending,
@@ -32,6 +32,23 @@ use trellis::staging::{
 };
 
 pub const WAKE: &str = "interleave_wake";
+
+/// Splits `ddl` into its schema statements and its `insert into …` seed rows.
+/// A group-basis aggregate over a partitioned source is defined while the
+/// source is empty, and seeded once capture has recorded the tree.
+pub fn split_seed(ddl: &str) -> (String, String) {
+    let (mut schema, mut seed) = (String::new(), String::new());
+    for statement in ddl.split(';').filter(|s| !s.trim().is_empty()) {
+        let target = if statement.trim_start().starts_with("insert into") {
+            &mut seed
+        } else {
+            &mut schema
+        };
+        target.push_str(statement);
+        target.push(';');
+    }
+    (schema, seed)
+}
 
 /// Opens a plain connection to `dsn` with the engine's schema on the path.
 pub async fn connect(dsn: &str) -> Client {
@@ -337,74 +354,6 @@ impl Driver {
         }
     }
 
-    /// The Re-derive build plan for bare target `target` (#625 F1).
-    pub async fn build_plan(&self, target: &str) -> BuildPlan {
-        BuildPlan::load(&self.db.pool, target)
-            .await
-            .expect("load the build plan")
-            .unwrap_or_else(|| panic!("{target} is not a Re-derive build shape"))
-    }
-
-    /// Runs and commits one build chunk, `(lo, hi]` of `plan`'s source.
-    pub async fn chunk(&self, plan: &BuildPlan, lo: Option<&str>, hi: &str) -> ChunkOutcome {
-        self.chunk_frozen(plan, lo, hi, &[]).await.finish().await
-    }
-
-    /// Starts one build chunk in its own task, frozen at each of `points`
-    /// once reached, as [`Self::drain_frozen`] does for a drain.
-    pub async fn chunk_frozen(
-        &self,
-        plan: &BuildPlan,
-        lo: Option<&str>,
-        hi: &str,
-        points: &[(PausePoint, &str)],
-    ) -> Running<ChunkOutcome> {
-        let (scope, frozen) = self.arm(points).await;
-        let pool = self.db.pool.clone();
-        let plan = plan.clone();
-        let (lo, hi) = (lo.map(str::to_string), hi.to_string());
-        let handle = tokio::spawn(with_scope(scope, async move {
-            let mut client = pool.get().await?;
-            let txn = client.transaction().await?;
-            let outcome = build::run_chunk(&txn, &plan, lo.as_deref(), &hi).await?;
-            txn.commit().await?;
-            Ok(outcome)
-        }));
-        Running {
-            handle: Some(handle),
-            frozen,
-        }
-    }
-
-    /// Runs and commits one merger pass of up to `limit` delta rows.
-    pub async fn merge(&self, plan: &BuildPlan, limit: i64) -> MergeOutcome {
-        self.merge_frozen(plan, limit, &[]).await.finish().await
-    }
-
-    /// Starts one merger pass in its own task, frozen at each of `points`
-    /// once reached.
-    pub async fn merge_frozen(
-        &self,
-        plan: &BuildPlan,
-        limit: i64,
-        points: &[(PausePoint, &str)],
-    ) -> Running<MergeOutcome> {
-        let (scope, frozen) = self.arm(points).await;
-        let pool = self.db.pool.clone();
-        let plan = plan.clone();
-        let handle = tokio::spawn(with_scope(scope, async move {
-            let mut client = pool.get().await?;
-            let txn = client.transaction().await?;
-            let outcome = build::merge_deltas(&txn, &plan, limit).await?;
-            txn.commit().await?;
-            Ok(outcome)
-        }));
-        Running {
-            handle: Some(handle),
-            frozen,
-        }
-    }
-
     /// Starts `work` (given the pool) in its own task, frozen at each of
     /// `points` once reached, as [`Self::drain_frozen`] does for a drain: for
     /// a writer outside the drain, a column resume or an `ALTER`'s backfill.
@@ -419,22 +368,6 @@ impl Driver {
         Running {
             handle: Some(handle),
             frozen,
-        }
-    }
-
-    /// Merges until no delta row is left, returning the rows merged. A pass
-    /// merges one partition (#717), so it stops at the first pass that
-    /// merges nothing.
-    pub async fn merge_all(&self, plan: &BuildPlan) -> i64 {
-        const LIMIT: i64 = 5_000;
-        let mut merged = 0;
-        loop {
-            let outcome = self.merge(plan, LIMIT).await;
-            assert!(!outcome.skipped, "no other merger runs: {outcome:?}");
-            if outcome.claimed == 0 {
-                return merged;
-            }
-            merged += outcome.claimed;
         }
     }
 

@@ -828,12 +828,11 @@ async fn install_definition_fast_path_builds_a_plain_cross_field_alias_chain() {
 // Fast-path success branch: an Aggregate (`GROUP BY`) definition whose
 // `GROUP BY` field references another calculated field's alias (the
 // Aggregate-key-space counterpart of the plain cross-field-alias test above
-// — `total + total AS double_total` where `total = SUM(amount)`). Before this
-// fix, `backfill_aggregate`'s `classify_field`/`render_expr_sql` rendered
-// `double_total`'s raw, un-substituted `Expr::Column("total")` as a bare SQL
-// identifier, which Postgres rejects (`total` names neither a source column
-// nor a same-SELECT-list-visible name) — the direct build now inlines the
-// alias first (`substituted_field_exprs`), same as the 1-1 path.
+// — `total + total AS double_total` where `total = SUM(amount)`). The build
+// inlines the alias first (`substituted_field_exprs`), same as the 1-1 path,
+// rather than rendering `double_total`'s raw `Expr::Column("total")` as a
+// bare SQL identifier, which Postgres rejects (`total` names neither a
+// source column nor a same-SELECT-list-visible name).
 // ---------------------------------------------------------------------
 
 #[tokio::test]
@@ -978,11 +977,8 @@ async fn install_definition_builds_a_bare_alias_of_a_sum_field_declared_before_i
 /// Several bare aliases of the same `SUM` field, declared out of order and
 /// on both sides of it (`grand_total`/`super_total` alias `total`, which
 /// itself is declared between them). Their *substituted* forms are all
-/// structurally identical (`SUM(amount)`), so `count_column_names_from`'s
-/// same-argument dedup (issue #48) must fold all three onto the one hidden
-/// running-count column `total` itself would get — exercising that the
-/// dedup, `ddl::create_aggregate_target_table`'s column creation, and
-/// `backfill_aggregate`'s writes all agree on *which* name that is,
+/// structurally identical (`SUM(amount)`), so the group basis keeps one
+/// partial for the argument in its hidden table and every alias reads it,
 /// regardless of which of the three fields is first in declaration order.
 /// A group with an all-`NULL` argument additionally pins that the shared
 /// count still distinguishes "sum of nothing" (`NULL`) from "sum that nets
@@ -1392,111 +1388,6 @@ async fn registration_reads_no_source_rows() {
         mismatches, 0,
         "both targets are built from every source row"
     );
-}
-
-/// ADR-0002 (#419): the direct set-based build of an aggregate runs as a
-/// background job the discharge dispatches, not inside registration.
-/// Registering succeeds while another session holds the source `ACCESS
-/// EXCLUSIVE`, so registration latency doesn't depend on the table's size.
-/// It goes live, built directly (nothing enumerated into the ring), once the
-/// lock is released and the discharge and a drain worker run.
-///
-/// Every plain aggregate is the Re-derive build's since #625 F5, so the
-/// source is held out of it (`hold_out_of_the_rederive_build`) to reach the
-/// old direct build, which survives until #625 F10. That build writes the
-/// per-row ledger, so the test runs only with the group-basis default off.
-#[tokio::test]
-#[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
-async fn registering_a_direct_build_shape_reads_no_source_rows() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
-    client
-        .batch_execute(
-            "create table s (id bigint primary key, g bigint, a bigint); \
-             insert into s (id, g, a) select i, i % 5, i from generate_series(1, 50) i",
-        )
-        .await
-        .expect("seed the source");
-    trellis::intake::markers::hold_out_of_the_rederive_build(
-        &client,
-        &format!("{DEFAULT_SCHEMA}.s"),
-    )
-    .await
-    .expect("hold the source out of the Re-derive build");
-
-    let locker = connect_raw(db.dsn()).await;
-    locker
-        .batch_execute("begin; lock table s in access exclusive mode")
-        .await
-        .expect("lock the source against reads");
-
-    let text = "TRANSFORM v FROM s GROUP BY g WITHOUT SOURCE INDEX SELECT g AS g, SUM(a) AS total";
-    let aggregate = tokio::time::timeout(
-        Duration::from_secs(20),
-        install_definition(&db.pool, text, &numeric(&["id", "g", "a"]), "public"),
-    )
-    .await
-    .unwrap_or_else(|_| panic!("registering {text:?} waited on the source's lock"))
-    .unwrap_or_else(|e| panic!("register {text:?}: {e}"));
-    assert_eq!(aggregate.status, TransformStatus::WaitingToBackfill);
-
-    locker
-        .batch_execute("commit")
-        .await
-        .expect("release the lock");
-    trellis::intake::markers::discharge_registrations(&db.pool)
-        .await
-        .expect("discharge the registration");
-    let statuses: Vec<String> = client
-        .query("select status from transform_definitions order by id", &[])
-        .await
-        .expect("read statuses")
-        .into_iter()
-        .map(|row| row.get(0))
-        .collect();
-    assert_eq!(
-        statuses,
-        ["backfilling"],
-        "the discharge hands the build to a background job"
-    );
-    let direct_jobs: i64 = client
-        .query_one(
-            "select count(*) from backfill_chunks c \
-             join transform_definitions d on d.id = c.definition_id \
-             where c.kind = 'direct' and d.build is null",
-            &[],
-        )
-        .await
-        .expect("count the direct-build jobs")
-        .get(0);
-    assert_eq!(direct_jobs, 1, "the build is an old direct-build job");
-    assert_eq!(
-        staged_count_for_source(&client, &format!("{DEFAULT_SCHEMA}.s")).await,
-        0,
-        "a direct build doesn't enumerate the source into the ring"
-    );
-    drain_backfill_chunks(&db.pool).await;
-    drain_to_quiescence(&db.pool, &mut client).await;
-
-    let statuses: Vec<String> = client
-        .query("select status from transform_definitions order by id", &[])
-        .await
-        .expect("read statuses")
-        .into_iter()
-        .map(|row| row.get(0))
-        .collect();
-    assert_eq!(statuses, ["live"]);
-    let mismatches: i64 = client
-        .query_one(
-            "select count(*) from (select g, sum(a) as total from s group by g) e \
-             full join v on v.g = e.g where v.total is distinct from e.total",
-            &[],
-        )
-        .await
-        .expect("compare the aggregate to the source")
-        .get(0);
-    assert_eq!(mismatches, 0, "every group is built");
 }
 
 // ---------------------------------------------------------------------

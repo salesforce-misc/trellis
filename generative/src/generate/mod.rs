@@ -115,8 +115,8 @@
 //! never touched by `Update`/`Delete`/`DuplicateInsert` (same B1 precedent —
 //! a group changing membership via delete/insert of whole rows is already
 //! the sharpest edge; *migrating* a live row from one group to another via
-//! `Update` is real, separate coverage `trellis/tests/apply_aggregate.rs`
-//! already exercises by hand, not drawn by `trivial_program`; issue #557's
+//! `Update` is real, separate coverage `trellis/tests/group_basis_interleavings.rs`
+//! exercises by hand, not drawn by `trivial_program`; issue #557's
 //! concurrent tier draws it as [`Mutate::MoveGroup`]). `KeySpace::Aggregate.group_by`
 //! is always exactly one column (never a composite/multi-column group-by,
 //! which the engine grammar supports but this generator does not draw).
@@ -3369,32 +3369,26 @@ mod strategy {
     /// reads instead of a 1-1 one, re-read by `request_backfill` while its
     /// keys go quiet, under a steady load paced from each burst's start.
     ///
-    /// It is the closest random shape to the `lsn_only_skip` plant's
-    /// (ADR-0002 I2's visibility term). Re-applying a change whose image an
-    /// entry already holds is a no-op, so a change applied twice only
-    /// diverges when:
+    /// The rebuild recomputes every group from the source with its snapshot
+    /// as the group's basis (`trellis::staging::group_basis`), and a page
+    /// refuses a change that basis already holds (ADR-0002 R2). A change
+    /// applied twice, or lost, only shows when:
     ///
-    /// 1. a key's last change is folded into a page's Re-derive, because the
-    ///    catch-up's `Recompute` for the key sealed into the same batch, so
-    ///    the change never applies on its own;
-    /// 2. an older change to the key sits in a batch that drains after that
-    ///    page; and
+    /// 1. a key's last change commits around the rebuild's snapshot;
+    /// 2. an older change to the key sits in a batch that drains after the
+    ///    rebuild; and
     /// 3. nothing writes the key again.
     ///
-    /// The engine's xmin fence, seal gate and oldest-first claims keep (2)
-    /// from happening under a random stall, so the plant is gated by the
-    /// deterministic `a_change_the_rederive_read_is_not_applied_again_aggregate`
-    /// pin (#734), not by this tier. The tier is random coverage of a
-    /// `request_backfill` during load over keys that cool, with the
-    /// aggregate ledger target the catch-up re-reads.
+    /// The deterministic pins of R2 are `group_basis_interleavings`'s
+    /// `r2_…` tests. The tier is random coverage of a `request_backfill`
+    /// during load over keys that cool.
     ///
     /// The cooling keys give (3). One `request_backfill` of the cooling
     /// table goes in every burst after the first, at
     /// [`COOLING_BACKFILL_AT`] thousandths of its ops, among the cooling
-    /// keys' last writes. Its catch-up starts at a reconcile pass on the
-    /// seal cadence, and the lanes keep to a [`LOAD_PACE_MICROS`] pace from
-    /// each burst's start, so the catch-up stages while those writes still
-    /// come in (1). The steady-load tier's entry-lock stall, up to
+    /// keys' last writes. Its rebuild is a job a worker picks up, and the
+    /// lanes keep to a [`LOAD_PACE_MICROS`] pace from each burst's start, so
+    /// the rebuild takes its snapshot while those writes still come in (1). The steady-load tier's entry-lock stall, up to
     /// [`LOAD_STALL_SEALS`] seal intervals, drains some batches after newer
     /// ones (2).
     ///

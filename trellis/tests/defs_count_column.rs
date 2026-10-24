@@ -4,10 +4,9 @@
 //!
 //! # The real gap, found by reading the code first
 //!
-//! `defs::invertibility` already modelled `CountArg::Column` (issue #75's
-//! own groundwork) as invertible with no hidden partials, identically to
-//! `CountArg::Star` — the delta model needed no new machinery. The real gap
-//! was three narrower things:
+//! `COUNT(<column>)` is maintained like `CountArg::Star`, as a running count
+//! of its argument's non-null rows, with no new machinery. The real gap was
+//! three narrower things:
 //!
 //! 1. **Grammar**: `super::parser`'s aggregate-`COUNT` branch accepted only
 //!    the literal `*`, rejecting any real argument with
@@ -29,7 +28,7 @@
 //!    written the group's *row count*, not the column's non-null count, any
 //!    time an image-less recompute trigger forced that field's group onto
 //!    the full-recompute path). `count_column_forced_full_recompute_...`
-//!    below now drives image-less recomputes through the ledger instead.
+//!    below drives image-less recomputes through the group basis.
 //!
 //! Bundled in, since `docs/type-support.md` (#111's own "exact integer
 //! semantics" note) explicitly earmarks it for this issue: `COUNT` is now
@@ -450,10 +449,9 @@ async fn count_column_forced_full_recompute_still_excludes_nulls() {
         .await
         .expect("seed source rows");
 
-    // A bare recompute trigger carries no image at all. Since #623 D3 this
-    // target is on the ledger, where each is a Re-derive of its own key's
-    // entry, so every key is staged. (Before, one key forced the whole
-    // group onto the old path's full recompute.)
+    // A bare recompute trigger carries no image at all. On the group basis
+    // each recomputes its key's group from the source, so every key is
+    // staged.
     for id in ["1", "2", "3", "4"] {
         stage_bare_recompute(&client, id, "events").await;
     }
@@ -490,7 +488,7 @@ async fn count_column_bulk_forced_full_recompute_still_excludes_nulls() {
         .await
         .expect("seed source rows");
 
-    // Every key: on the ledger (#623 D3) a Re-derive covers its own key.
+    // Every key: on the group basis each recomputes its key's group.
     for id in ["1", "2", "3", "4", "5", "6"] {
         stage_bare_recompute(&client, id, "events").await;
     }

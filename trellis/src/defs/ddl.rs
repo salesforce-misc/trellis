@@ -69,7 +69,7 @@ use tokio_postgres::types::Type;
 use crate::error_code::{self, ErrorCode};
 use crate::pool::{Pool, quote_ident};
 
-use super::ast::{Expr, FieldDef, KeySpace, TransformDef, ValueType, group_by_contains};
+use super::ast::{FieldDef, KeySpace, TransformDef, ValueType};
 use super::validate::ValidationError;
 
 /// The Postgres column type for a calculated field or grouping column of a
@@ -263,6 +263,10 @@ pub enum DdlError {
     /// [`super::backfill::BackfillError::Ddl`] variant holding a [`DdlError`]
     /// — an unboxed cycle here would make both types infinite-sized.
     AliasSubstitution(Box<super::backfill::BackfillError>),
+    /// An aggregate definition the group basis doesn't route reached target
+    /// DDL. Define refuses every such aggregate by family before it gets
+    /// here, so this is a definition that skipped validation.
+    UnroutedAggregate { target: String },
     /// A direct Postgres protocol/query error.
     Db(tokio_postgres::Error),
     /// Acquiring a connection from the pool failed.
@@ -285,7 +289,9 @@ impl DdlError {
             }
             // Staged-data corruption or a provenance bug, not a rejection of
             // the current call's input.
-            DdlError::MalformedCompositeKey { .. } => ErrorCode::Internal,
+            DdlError::MalformedCompositeKey { .. } | DdlError::UnroutedAggregate { .. } => {
+                ErrorCode::Internal
+            }
             DdlError::InvalidDefinition(err) => err.code(),
             DdlError::AliasSubstitution(err) => err.code(),
             DdlError::Db(err) => error_code::classify_pg_error(err),
@@ -323,6 +329,11 @@ impl fmt::Display for DdlError {
                  (see docs/type-support.md)",
                 super::join_key_types::supported_join_key_types()
             ),
+            DdlError::UnroutedAggregate { target } => write!(
+                f,
+                "cannot generate target-table DDL: aggregate '{target}' is not one the group \
+                 basis keeps"
+            ),
             DdlError::InvalidDefinition(err) => {
                 write!(f, "cannot generate target-table DDL: {err}")
             }
@@ -345,7 +356,8 @@ impl std::error::Error for DdlError {
         match self {
             DdlError::NoPrimaryKey { .. }
             | DdlError::UnsupportedPrimaryKeyType { .. }
-            | DdlError::MalformedCompositeKey { .. } => None,
+            | DdlError::MalformedCompositeKey { .. }
+            | DdlError::UnroutedAggregate { .. } => None,
             DdlError::InvalidDefinition(err) => Some(err),
             DdlError::AliasSubstitution(err) => Some(err),
             DdlError::Db(err) => Some(err),
@@ -1323,12 +1335,6 @@ pub fn qualified_target_table(target_schema: &str, def: &TransformDef) -> String
     )
 }
 
-/// The hidden member count on every aggregate group row (#623 D2): how many
-/// of the target's ledger entries are live members of the group
-/// ([`super::ledger`]). The build and Apply's group statements write it
-/// from the ledger, and a group whose count reaches 0 is deleted (#623 D3).
-pub(crate) const MEMBERS_COLUMN: &str = "__trellis_members";
-
 /// The read-side counterpart to [`qualified_target_table`] (issue #76,
 /// ADR-0011): quotes an already-qualified `"schema.table"` name — as read
 /// back from [`super::model::Definition::source_table`]
@@ -1625,148 +1631,6 @@ pub(crate) async fn target_table_ddl(
     Ok(sql)
 }
 
-/// Whether `field` is a direct `AVG(...)` call — the shape whose delta
-/// model (issue #11) needs hidden running-sum/running-count partials
-/// alongside its visible column, since `avg = sum / count` and neither half
-/// alone is invertible (see `defs::invertibility`'s doc comment on
-/// [`super::invertibility::PartialField`]). Checked structurally rather than
-/// via `invertibility::classify` here: the grammar only ever parses an `AVG`
-/// call over a `Numeric` argument (`registry::AGGREGATE_FUNCTION_SPECS`
-/// restricts every aggregate's argument type to `Numeric`), so there is no
-/// `Text`/`Boolean`-argument `AVG` this gate would need to route to the
-/// recompute path instead — the name alone determines the answer for every
-/// definition this grammar can actually produce.
-///
-/// Takes the field's expression directly (rather than a [`FieldDef`]) so a
-/// caller can classify a *substituted* expression — see
-/// [`create_aggregate_target_table`]'s doc comment on why a bare
-/// cross-field-alias reference (`total2 = total` where `total = SUM(amount)`)
-/// must be classified against its self-contained, alias-resolved form rather
-/// than the raw `Expr::Column("total")` a naive per-field read would see.
-fn is_avg_field(expr: &Expr) -> bool {
-    matches!(expr, Expr::FunctionCall { name, .. } if name == "AVG")
-}
-
-/// Whether `field` is a direct `SUM(...)` call — see [`is_avg_field`]'s doc
-/// comment for why this is checked structurally rather than via
-/// `invertibility::classify`. `SUM` needs its own hidden running-count
-/// partial (see [`count_column_names`]) for the same reason `AVG` needs
-/// one: Postgres's `sum()` is `NULL`, not `0`, over zero non-null values, and
-/// without a count the delta model can't distinguish "no contributions left"
-/// from "contributions that net to zero" once a group's row count is no
-/// longer directly observable from the running sum alone.
-fn is_sum_field(expr: &Expr) -> bool {
-    matches!(expr, Expr::FunctionCall { name, .. } if name == "SUM")
-}
-
-/// The hidden running-sum partial column name an `AVG` field maintains
-/// (issue #11's delta model): the numerator `AVG`'s visible column is derived
-/// from (`avg = sum / count`). Always one per `AVG` field — unlike the
-/// running-count partial (see [`count_column_names`]'s doc comment on issue
-/// #48), two `AVG` fields' running sums can never be shared: even when two
-/// fields aggregate the exact same argument, their *sums* are only equal by
-/// construction for `SUM`-vs-`AVG` pairs that also share a count (an `AVG`
-/// field always needs its own sum regardless, since `SUM`'s visible column
-/// already *is* that shared sum for the `SUM` half — there is no second
-/// consumer to fold onto). `pub(crate)` so the backfill and
-/// `staging::ledger` bind against the exact same name this module creates,
-/// rather than re-deriving it.
-pub(crate) fn avg_sum_column(field_name: &str) -> String {
-    format!("__{field_name}_sum")
-}
-
-/// The `Expr` a `SUM`/`AVG` field aggregates over — `None` for any other
-/// field shape. [`count_column_names`] uses this to decide which fields'
-/// hidden count partials can share a column.
-fn count_needing_arg(expr: &Expr) -> Option<&Expr> {
-    if !is_sum_field(expr) && !is_avg_field(expr) {
-        return None;
-    }
-    match expr {
-        Expr::FunctionCall { args, .. } => args.first(),
-        _ => None,
-    }
-}
-
-/// Assigns every `SUM`/`AVG` field in `fields` (in declaration order) the
-/// name of the hidden running-count partial column it maintains (issue #11's
-/// delta model: the count of non-null argument values contributing to the
-/// group, matching Postgres's own `count(<same argument>)` "skip NULLs"
-/// semantics) — `pub(crate)` so `staging::ledger` derives the exact same
-/// names this module's DDL creates, rather than re-deriving them
-/// independently (a divergence there
-/// would mean the apply path writes to a column the DDL never created, or
-/// vice versa).
-///
-/// **Issue #48**: naively, every count-needing field got its own
-/// `__{field}_count` column, even when two fields aggregate the exact
-/// identical argument expression (e.g. `SUM(amount) AS total, AVG(amount) AS
-/// average` both aggregating the same `amount` column) and are therefore
-/// provably counting the exact same set of non-null-contributing rows. This
-/// function detects that case — via [`Expr`]'s derived structural
-/// `PartialEq` on [`count_needing_arg`]'s result — and has the later field's
-/// entry point at the earlier field's column name instead of minting a
-/// second, redundant one.
-///
-/// It deliberately does **not** merge count columns across fields whose
-/// arguments differ (e.g. the issue's own motivating example, `SUM(word_count)
-/// AS total_words, SUM(byte_size) AS total_bytes`) into one target-wide
-/// `__group_count`, even though the issue asked for exactly that: two
-/// different source columns can have different `NULL`s on the very same row,
-/// so their "count of non-null contributing rows" can genuinely diverge (a
-/// row with a `NULL` `word_count` but a real `byte_size` contributes to one
-/// count and not the other). Forcing them onto one shared column would
-/// silently corrupt whichever field's count that column doesn't actually
-/// track the moment their arguments' `NULL` patterns diverge — the delta
-/// model would compute the wrong "does this group still have any non-null
-/// contributor" answer for one of the two fields, producing a stale `0`/wrong
-/// number where Postgres would show `NULL`, or vice versa (see
-/// `trellis/tests/apply_aggregate.rs`'s `sum_goes_null_not_zero_when_a_groups_remaining_rows_are_all_null`
-/// test for the exact failure shape this would reintroduce). Only fields
-/// that provably always agree — same argument expression — are ever merged.
-/// `substituted` maps each field name to its cross-field-alias-resolved
-/// expression (see [`super::backfill::substituted_field_exprs`]) — classifying
-/// off the substituted view rather than each field's raw, possibly-aliasing
-/// `Expr` is what lets a field that only resolves to a bare `SUM`/`AVG` call
-/// *after* substitution (`total2 = total` where `total = SUM(amount)`) still
-/// get a hidden count-column name here, consistent with
-/// [`create_aggregate_target_table`]'s own (also substituted) classification
-/// of the very same field.
-pub(crate) fn count_column_names(
-    fields: &[FieldDef],
-    substituted: &HashMap<String, Expr>,
-) -> HashMap<String, String> {
-    count_column_names_from(
-        fields.iter().filter_map(|f| {
-            count_needing_arg(&substituted[&f.name]).map(|arg| (f.name.as_str(), arg))
-        }),
-    )
-}
-
-/// The core of [`count_column_names`], generalized over any source of
-/// `(field_name, aggregated_arg)` pairs rather than a literal `&[FieldDef]`,
-/// so the backfill can build its own pairs and call straight into this
-/// rather than re-implementing the merge rule (see [`count_column_names`]'s
-/// doc comment on why that rule's correctness matters) a second time.
-pub(crate) fn count_column_names_from<'a>(
-    entries: impl Iterator<Item = (&'a str, &'a Expr)>,
-) -> HashMap<String, String> {
-    let mut by_arg: Vec<(&Expr, String)> = Vec::new();
-    let mut names = HashMap::new();
-    for (field_name, arg) in entries {
-        let name = match by_arg.iter().find(|(seen, _)| **seen == *arg) {
-            Some((_, existing)) => existing.clone(),
-            None => {
-                let fresh = format!("__{field_name}_count");
-                by_arg.push((arg, fresh.clone()));
-                fresh
-            }
-        };
-        names.insert(field_name.to_string(), name);
-    }
-    names
-}
-
 /// Creates an [`super::ast::KeySpace::Aggregate`] definition's neighbor
 /// target table (failing if the relation already exists, and rendered by
 /// [`aggregate_target_table_ddl`] — same convention as
@@ -1818,7 +1682,7 @@ pub async fn create_aggregate_target_table(
     target_schema: &str,
     source_columns: &HashMap<String, ValueType>,
 ) -> Result<(), DdlError> {
-    let sql = aggregate_target_table_ddl(pool, def, target_schema, source_columns).await?;
+    let sql = aggregate_target_table_ddl(def, target_schema, source_columns)?;
     pool.get().await?.batch_execute(&sql).await?;
     Ok(())
 }
@@ -1829,230 +1693,27 @@ pub async fn create_aggregate_target_table(
 /// # Panics
 ///
 /// If `def.key_space` is not [`KeySpace::Aggregate`].
-pub(crate) async fn aggregate_target_table_ddl(
-    pool: &Pool,
+pub(crate) fn aggregate_target_table_ddl(
     def: &TransformDef,
     target_schema: &str,
     source_columns: &HashMap<String, ValueType>,
 ) -> Result<String, DdlError> {
-    let KeySpace::Aggregate { group_by } = &def.key_space else {
-        panic!("aggregate_target_table_ddl called on a non-aggregate definition");
-    };
-    // #1100: a target on the group basis (behind its dev knob) is a plain
-    // table of its declared columns; its partials live in a hidden table
-    // define creates once the definition has an id.
-    if let Some(shape) = crate::staging::group_basis::route(def, source_columns) {
-        return Ok(crate::staging::group_basis::target_table_ddl(
-            &qualified_target_table(target_schema, def),
-            &shape,
-        ));
-    }
-
-    // Substitute cross-field-alias references (e.g. `total2 = total` where
-    // `total = SUM(amount)`) before classifying any field as `SUM`/`AVG`
-    // below — `is_avg_field`/`is_sum_field`/`count_column_names` must agree
-    // with `backfill_aggregate`'s and `staging::ledger`'s own
-    // (already substituted) classification of the same field, or the columns
-    // this DDL creates diverge from the columns those paths later write to.
-    let substituted = super::backfill::substituted_field_exprs(def)?;
-
-    let field_types = super::validate::infer_field_types(def, source_columns)?;
-
-    let mut sql = format!(
-        "create table {} (",
-        qualified_target_table(target_schema, def)
+    assert!(
+        matches!(def.key_space, KeySpace::Aggregate { .. }),
+        "aggregate_target_table_ddl called on a non-aggregate definition"
     );
-    let group_by_value_type = |key: &String| {
-        source_columns
-            .get(key.as_str())
-            .copied()
-            .unwrap_or(ValueType::Numeric)
-    };
-    for (i, key) in group_by.iter().enumerate() {
-        if i > 0 {
-            sql.push_str(", ");
+    // #1100: a target on the group basis is a plain table of its declared
+    // columns; its partials live in a hidden table define creates once the
+    // definition has an id.
+    let shape = crate::staging::group_basis::route(def, source_columns).ok_or_else(|| {
+        DdlError::UnroutedAggregate {
+            target: def.target.clone(),
         }
-        let pg_type = pg_type_name(group_by_value_type(key));
-        sql.push_str(&format!("{} {}", quote_ident(key.as_str()), pg_type));
-    }
-    // Issue #48: fields aggregating the exact same argument (e.g. `SUM(amount)
-    // AS total, AVG(amount) AS average`) share one hidden running-count
-    // partial column rather than each minting its own — see
-    // `count_column_names`'s doc comment for why this dedup is scoped to
-    // "same argument expression" rather than "any count-needing field on this
-    // target", which would silently corrupt the delta model once two fields'
-    // arguments have different `NULL` patterns.
-    let count_cols = count_column_names(&def.fields, &substituted);
-    let mut emitted_count_cols: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for field in &def.fields {
-        if group_by_contains(group_by, &field.name) {
-            continue;
-        }
-        let pg_type = pg_type_name(
-            field_types
-                .get(&field.name)
-                .copied()
-                .unwrap_or(ValueType::Numeric),
-        );
-        sql.push_str(&format!(", {} {}", quote_ident(&field.name), pg_type));
-
-        let expr = &substituted[&field.name];
-        // AVG's hidden partials (see `is_avg_field`'s doc comment): the
-        // visible column above holds the derived `sum / count`. The running
-        // sum is always this field's own; the running count may already have
-        // been declared by an earlier field sharing this exact argument.
-        if is_avg_field(expr) {
-            let sum_col = avg_sum_column(&field.name);
-            sql.push_str(&format!(", {} numeric", quote_ident(&sum_col)));
-            let count_col = &count_cols[&field.name];
-            if emitted_count_cols.insert(count_col.as_str()) {
-                sql.push_str(&format!(", {} bigint", quote_ident(count_col)));
-            }
-        } else if is_sum_field(expr) {
-            // SUM's hidden count partial (see `is_sum_field`'s doc comment):
-            // the visible column above holds the running sum directly, but
-            // this is needed to tell "sum of nothing" (NULL) from "sum that
-            // happens to net to zero" (0).
-            let count_col = &count_cols[&field.name];
-            if emitted_count_cols.insert(count_col.as_str()) {
-                sql.push_str(&format!(", {} bigint", quote_ident(count_col)));
-            }
-        }
-    }
-    sql.push_str(&format!(
-        ", {} bigint not null default 0",
-        quote_ident(MEMBERS_COLUMN)
-    ));
-    let pk_columns: Vec<String> = group_by.iter().map(|k| quote_ident(k.as_str())).collect();
-    sql.push_str(&format!(
-        ", unique nulls not distinct ({})",
-        pk_columns.join(", ")
-    ));
-    sql.push(')');
-
-    // #623 D2: the target's ledger, created with it. Its `GROUP BY` columns
-    // are typed as the target's, and each contribution column as its
-    // argument.
-    let group_columns: Vec<super::ledger::LedgerColumn> = group_by
-        .iter()
-        .map(|key| super::ledger::LedgerColumn {
-            name: key.clone(),
-            pg_type: pg_type_name(group_by_value_type(key)).into_owned(),
-            collation: None,
-        })
-        .collect();
-    let contributions = super::ledger::contributions(&def.fields, group_by, &substituted);
-    let contribution_types = contributions
-        .iter()
-        .map(|c| super::validate::infer_expr_type(&c.arg, source_columns))
-        .collect::<Result<Vec<_>, _>>()?;
-    let collations =
-        contribution_collations(pool, def, &contributions, &contribution_types).await?;
-    let contribution_columns: Vec<super::ledger::LedgerColumn> = contributions
-        .iter()
-        .zip(&contribution_types)
-        .zip(collations)
-        .map(|((c, value_type), collation)| super::ledger::LedgerColumn {
-            name: c.column.clone(),
-            pg_type: super::ledger::contribution_pg_type(*value_type),
-            collation,
-        })
-        .collect();
-    // #723: without its `GROUP BY` index when the Re-derive build takes it
-    // and nothing it reads needs one (`ledger_indexes_groups`). A partitioned
-    // source's ledger always has it: a partition correction finds the keys of
-    // the groups that route to a node through it (ADR-0017).
-    let partitioned = match super::catalog::resolve_source_for_install(pool, def).await {
-        Ok(qualified) => {
-            let client = pool.get().await?;
-            super::partition_tree::is_partitioned_root(&**client, &qualified).await?
-        }
-        // A source that doesn't resolve (a fixture rendering DDL before it
-        // creates its source) isn't partitioned.
-        Err(_) => false,
-    };
-    sql.push_str(&super::ledger::aggregate_ledger_ddl(
-        &super::ledger::qualified_ledger_table(target_schema, &def.target),
-        &group_columns,
-        &contribution_columns,
-        crate::staging::build::ledger_indexes_groups(def, source_columns, partitioned),
-    ));
-    // #625 F1: a target Apply maintains on the ledger also gets its group
-    // deltas, which a Re-derive build's chunks write instead of the groups.
-    if let Some(shape) = crate::staging::ledger::route(def, source_columns) {
-        sql.push_str(&super::ledger::aggregate_deltas_ddl(
-            &super::ledger::qualified_deltas_table(target_schema, &def.target),
-            &group_columns,
-            &shape.summed(),
-            shape.recomputes(),
-        ));
-    }
-    Ok(sql)
-}
-
-/// The collation each text-typed contribution's argument has over the
-/// source, for its ledger column (`None` for every other type, and for the
-/// database default). Without it a text column's `MIN`/`MAX` over the ledger
-/// would order by the database's default collation instead of the source
-/// column's. Read off the live expression with `pg_collation_for`, so an
-/// argument that derives its collation (`lower(label)`) gets it too.
-///
-/// Queries only when some contribution is text. A source that doesn't
-/// resolve (a test fixture rendering DDL before creating its source) gets
-/// the default everywhere.
-async fn contribution_collations(
-    pool: &Pool,
-    def: &TransformDef,
-    contributions: &[super::ledger::Contribution],
-    types: &[ValueType],
-) -> Result<Vec<Option<String>>, DdlError> {
-    let mut collations = vec![None; contributions.len()];
-    let text: Vec<usize> = (0..types.len())
-        .filter(|&i| types[i] == ValueType::Text)
-        .collect();
-    if text.is_empty() {
-        return Ok(collations);
-    }
-    let source_table = match super::catalog::resolve_source_for_install(pool, def).await {
-        Ok(source) => source,
-        Err(super::catalog::CatalogError::SourceTableNotFound(_)) => return Ok(collations),
-        Err(super::catalog::CatalogError::Db(e)) => return Err(DdlError::Db(e)),
-        Err(super::catalog::CatalogError::Pool(e)) => return Err(DdlError::Pool(e)),
-        Err(super::catalog::CatalogError::Validate(e)) => {
-            return Err(DdlError::InvalidDefinition(e));
-        }
-        Err(other) => unreachable!("resolving a source cannot produce {other:?}"),
-    };
-    let scan = super::backfill::SourceScan::new(&source_table);
-    let probes: Vec<String> = text
-        .iter()
-        .map(|&i| {
-            format!(
-                "pg_catalog.pg_collation_for({})::text",
-                scan.render(&contributions[i].arg)
-            )
-        })
-        .collect();
-    // One row whatever the source holds: every source column reads NULL,
-    // which `pg_collation_for` doesn't look at.
-    let row = pool
-        .get()
-        .await?
-        .query_one(
-            &format!(
-                "select {} from {} right join (select) as __trellis_one on false",
-                probes.join(", "),
-                scan.relation_sql()
-            ),
-            &[],
-        )
-        .await?;
-    for (probe, &i) in text.iter().enumerate() {
-        collations[i] = row
-            .get::<_, Option<String>>(probe)
-            .filter(|collation| collation != "\"default\"");
-    }
-    Ok(collations)
+    })?;
+    Ok(crate::staging::group_basis::target_table_ddl(
+        &qualified_target_table(target_schema, def),
+        &shape,
+    ))
 }
 
 #[cfg(test)]

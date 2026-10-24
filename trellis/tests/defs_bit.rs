@@ -1,6 +1,7 @@
-//! End-to-end tests for issue #118's `bit`/`bit varying` support — as
-//! join/primary-key and `GROUP BY` key roles, and the two new aggregates
-//! `bit_and`/`bit_or`. The typed-literal ("computed 1-1 target") role is
+//! End-to-end tests for issue #118's `bit`/`bit varying` support as
+//! join/primary-key and `GROUP BY` key roles. The `bit_and`/`bit_or`
+//! aggregates are refused at define (`ValidationError::DeferredAggregate`).
+//! The typed-literal ("computed 1-1 target") role is
 //! covered by `defs_typed_literals.rs`'s shared `CASES` table, which this
 //! issue added a `VARBIT` row to.
 //!
@@ -37,18 +38,10 @@
 //!    varying`'s bare default is genuinely unconstrained and has no such
 //!    trap.
 //!
-//! `bit_and`/`bit_or` land on the safe side of split 2 by construction:
-//! `registry::aggregate_result_type` always widens their result to
-//! `Other(PgType::VarBit)`, never mirroring a `bit`-typed argument's own
-//! family the way `MIN`/`MAX`/`SUM(interval)` mirror theirs elsewhere in the
-//! same function — see that arm's own doc comment. They are still
-//! **recompute-only**, on `bool_and`/`bool_or`'s reasoning generalized past
-//! two possible values per column to `2^n`.
-//!
 //! Per ADR-0013 every comparison is against independently-authored SQL —
-//! plain `pg_cast`, plain `bit_and`/`bit_or`, plain `to_jsonb`, plain `group
-//! by` — never against `defs::oracle::recompute`, which would be the
-//! engine's own renderer grading itself. Harness conventions follow
+//! plain `pg_cast`, plain `to_jsonb`, plain `group by` — never against
+//! `defs::oracle::recompute`, which would be the engine's own renderer
+//! grading itself. Harness conventions follow
 //! `defs_boolean.rs`/`defs_bytea.rs`.
 
 use std::collections::HashMap;
@@ -57,11 +50,9 @@ use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::ValueType;
-use trellis::defs::eval::{EvalError, RegexCache, Row, Value, evaluate_aggregate};
-use trellis::defs::invertibility::{AggregateArg, Invertibility, classify};
 use trellis::defs::pg_type::PgType;
 use trellis::defs::{
-    create_aggregate_target_table, create_definition, install_definition, parse, registry,
+    create_aggregate_target_table, create_definition, install_definition, parse,
     source_primary_key, validate,
 };
 use trellis::integer::IntWidth;
@@ -307,290 +298,7 @@ async fn fixed_length_bit_truncates_under_a_bare_cast_but_bit_varying_does_not()
 }
 
 // ---------------------------------------------------------------------
-// 3. MIN/MAX: no such Postgres aggregate, same shape as bytea
-// ---------------------------------------------------------------------
-
-/// Postgres has no `min(bit)`/`max(bit)`/`min(bit varying)`/
-/// `max(bit varying)` aggregate, despite both types having a full,
-/// `IMMUTABLE` btree opclass — the same shape #114 found for `bytea`, not a
-/// rendering hazard.
-#[tokio::test]
-async fn postgres_has_no_min_max_aggregate_for_bit_or_varbit() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
-
-    client
-        .batch_execute(
-            "create table t (b bit(3), vb bit varying); \
-             insert into t values ('101'::bit(3), '101'::varbit)",
-        )
-        .await
-        .expect("seed probe table");
-    for (agg, col) in [("min", "b"), ("max", "b"), ("min", "vb"), ("max", "vb")] {
-        let err = client
-            .query_one(&format!("select {agg}({col}) from t"), &[])
-            .await
-            .expect_err(&format!("{agg}({col}) must not exist in Postgres"));
-        let db_error = err
-            .as_db_error()
-            .unwrap_or_else(|| panic!("{agg}({col}) must fail as a DbError: {err}"));
-        assert!(
-            db_error.message().contains("does not exist"),
-            "{agg}({col}): {db_error}"
-        );
-    }
-
-    for name in ["MIN", "MAX"] {
-        for pg_type in [PgType::Bit, PgType::VarBit] {
-            assert!(
-                registry::aggregate_result_type(name, ValueType::Other(pg_type)).is_none(),
-                "{name}({pg_type}) must have no result type"
-            );
-        }
-    }
-}
-
-// ---------------------------------------------------------------------
-// 4. bit_and/bit_or: result types, folding, invertibility
-// ---------------------------------------------------------------------
-
-/// `bit_and`/`bit_or` both return `bit`, per `pg_typeof` — but Trellis's own
-/// registry deliberately widens the *declared* result to `bit varying`
-/// (checked against the registry, not `pg_typeof`, since that widening is a
-/// Trellis-side DDL-safety decision `pg_typeof` cannot see: Postgres itself
-/// only ever calls `bit_and(bit)`/`bit_or(bit)`, confirmed here too).
-#[tokio::test]
-async fn bit_and_or_result_types_match_pg_typeof_and_are_widened_to_varbit() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
-
-    for (agg, arg_sql) in [
-        ("bit_and", "'101'::bit(3)"),
-        ("bit_or", "'101'::bit(3)"),
-        ("bit_and", "'101'::varbit"),
-        ("bit_or", "'101'::varbit"),
-    ] {
-        let row = client
-            .query_one(
-                &format!(
-                    "select format_type(pg_typeof({agg}(v)), null) from (values ({arg_sql})) t(v)"
-                ),
-                &[],
-            )
-            .await
-            .unwrap_or_else(|e| panic!("{agg}({arg_sql}) pg_typeof probe: {e}"));
-        let ty: String = row.get(0);
-        assert_eq!(
-            ty, "bit",
-            "postgres's own {agg} always returns the fixed-length bit family"
-        );
-    }
-
-    for name in ["BIT_AND", "BIT_OR"] {
-        for pg_type in [PgType::Bit, PgType::VarBit] {
-            assert_eq!(
-                registry::aggregate_result_type(name, ValueType::Other(pg_type)),
-                Some(ValueType::Other(PgType::VarBit)),
-                "{name}({pg_type}) must resolve to Other(VarBit), widened away from bare bit's \
-                 bit(1) DDL trap"
-            );
-        }
-    }
-}
-
-/// The evaluator's fold must match a server-side `bit_and`/`bit_or` over
-/// every NULL-handling shape Postgres distinguishes: all-set, all-clear,
-/// mixed, a NULL mixed in (skipped), and an all-NULL group (`NULL` result).
-#[tokio::test]
-async fn bit_and_or_fold_matches_a_server_side_aggregate() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
-
-    let groups: &[&[Option<&str>]] = &[
-        &[Some("111"), Some("111"), Some("111")],
-        &[Some("000"), Some("000")],
-        &[Some("101"), Some("011"), Some("111")],
-        &[Some("101"), None, Some("011")],
-        &[None, None],
-    ];
-
-    for group in groups {
-        let values_sql = group
-            .iter()
-            .map(|v| match v {
-                Some(bits) => format!("('{bits}'::bit(3))"),
-                None => "(null::bit(3))".to_string(),
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-        let row = client
-            .query_one(
-                &format!(
-                    "select bit_and(v)::text, bit_or(v)::text from (values {values_sql}) t(v)"
-                ),
-                &[],
-            )
-            .await
-            .unwrap_or_else(|e| panic!("server bit_and/bit_or over {group:?}: {e}"));
-        let (server_and, server_or): (Option<String>, Option<String>) = (row.get(0), row.get(1));
-
-        let def = parse(
-            "TRANSFORM t FROM s GROUP BY id WITHOUT SOURCE INDEX SELECT id AS k, \
-             BIT_AND(b) AS all_bits, BIT_OR(b) AS any_bits",
-        )
-        .expect("parses");
-        let columns = HashMap::from([
-            ("id".to_string(), ValueType::Integer(IntWidth::Int8)),
-            ("b".to_string(), ValueType::Other(PgType::Bit)),
-        ]);
-        validate(&def, &columns).expect("validate");
-
-        let rows: Vec<Row> = group
-            .iter()
-            .map(|v| {
-                Row::from([
-                    ("id".to_string(), Some("1".to_string())),
-                    ("b".to_string(), v.map(|s| s.to_string())),
-                ])
-            })
-            .collect();
-        let result = evaluate_aggregate(&def, &rows, &columns, &mut RegexCache::default())
-            .unwrap_or_else(|e| panic!("bit_and/bit_or fold over {group:?}: {e}"));
-
-        assert_eq!(
-            result["all_bits"],
-            server_and.map(|s| Value::Other(PgType::VarBit, s)),
-            "BIT_AND over {group:?}"
-        );
-        assert_eq!(
-            result["any_bits"],
-            server_or.map(|s| Value::Other(PgType::VarBit, s)),
-            "BIT_OR over {group:?}"
-        );
-    }
-}
-
-/// Postgres itself refuses to combine two differently-sized bit strings
-/// (`cannot AND bit strings of different sizes`) rather than
-/// padding/truncating either one — a hazard only an unconstrained `bit
-/// varying` argument can trigger (every row of a fixed-length `bit(n)`
-/// column shares the column's one width). The evaluator must reproduce the
-/// same refusal, not silently pick a length — checked here by calling
-/// `evaluate_aggregate` directly over a two-row group, the same
-/// multi-row shape `defs::oracle::recompute_aggregate`'s test-only
-/// cross-check uses. `EvalError::BitStringLengthMismatch`'s own doc
-/// comment is the authoritative account of why this is *not* the shape a
-/// live apply ever calls the evaluator with: a real mismatched-length group
-/// surfaces there as Postgres's
-/// own native error (`ApplyError::Db`) instead, never this Rust variant.
-#[tokio::test]
-async fn bit_and_or_reject_mismatched_length_bit_varying_the_same_way_postgres_does() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
-
-    let err = client
-        .query_one(
-            "select bit_and(v) from (values ('1'::bit varying), ('01'::bit varying)) t(v)",
-            &[],
-        )
-        .await
-        .expect_err("postgres must refuse differently-sized bit varying arguments");
-    let db_error = err
-        .as_db_error()
-        .unwrap_or_else(|| panic!("must fail as a DbError: {err}"));
-    assert!(db_error.message().contains("different sizes"), "{db_error}");
-
-    let def = parse("TRANSFORM t FROM s GROUP BY id WITHOUT SOURCE INDEX SELECT id AS k, BIT_AND(vb) AS all_bits")
-        .expect("parses");
-    let columns = HashMap::from([
-        ("id".to_string(), ValueType::Integer(IntWidth::Int8)),
-        ("vb".to_string(), ValueType::Other(PgType::VarBit)),
-    ]);
-    validate(&def, &columns).expect("validate");
-    let rows: Vec<Row> = vec![
-        Row::from([
-            ("id".to_string(), Some("1".to_string())),
-            ("vb".to_string(), Some("1".to_string())),
-        ]),
-        Row::from([
-            ("id".to_string(), Some("1".to_string())),
-            ("vb".to_string(), Some("01".to_string())),
-        ]),
-    ];
-    let err = evaluate_aggregate(&def, &rows, &columns, &mut RegexCache::default())
-        .expect_err("the evaluator must refuse the mismatched lengths too");
-    assert!(matches!(err, EvalError::BitStringLengthMismatch { .. }));
-}
-
-/// `bit_and`/`bit_or` are classified `RecomputeOnly` — pinned here as a
-/// live-facing regression guard (the pure-code classification is already
-/// pinned in `defs::invertibility`'s own unit tests).
-#[test]
-fn bit_and_or_are_classified_recompute_only() {
-    for name in ["BIT_AND", "BIT_OR"] {
-        let verdict = classify(name, AggregateArg::Column(ValueType::Other(PgType::Bit)))
-            .unwrap_or_else(|| panic!("{name} must classify"));
-        assert_eq!(verdict.invertibility, Invertibility::RecomputeOnly);
-    }
-}
-
-/// The concrete reason `bit_and`/`bit_or` cannot be delta-maintained from
-/// their own visible value alone: two different deletions from the *same*
-/// starting group land at two different true answers, so "the old aggregate
-/// was X" is not enough information to invert — `bool_and`/`bool_or`'s
-/// `{false, true, true}` argument (#119), generalized from 2 possible
-/// per-column values to `2^n`.
-#[tokio::test]
-async fn bit_and_or_deletion_cannot_be_inverted_from_the_aggregate_alone() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
-
-    let row = client
-        .query_one(
-            "select bit_and(v)::text from \
-             (values ('01'::bit(2)), ('10'::bit(2)), ('11'::bit(2))) t(v)",
-            &[],
-        )
-        .await
-        .expect("starting bit_and");
-    let starting: String = row.get(0);
-    assert_eq!(starting, "00", "the starting group must fold to 00");
-
-    // Delete the `01` row: the remaining two fold to `10`.
-    let row = client
-        .query_one(
-            "select bit_and(v)::text from (values ('10'::bit(2)), ('11'::bit(2))) t(v)",
-            &[],
-        )
-        .await
-        .expect("bit_and after deleting the 01 row");
-    let after_deleting_01: String = row.get(0);
-
-    // Instead delete the `10` row from the same starting group: the
-    // remaining two fold to `01`.
-    let row = client
-        .query_one(
-            "select bit_and(v)::text from (values ('01'::bit(2)), ('11'::bit(2))) t(v)",
-            &[],
-        )
-        .await
-        .expect("bit_and after deleting the 10 row");
-    let after_deleting_10: String = row.get(0);
-
-    assert_ne!(
-        after_deleting_01, after_deleting_10,
-        "two different deletions from a bit_and = 00 group of 3 must not converge to the \
-         same post-delete answer — this is exactly why a running fold can't invert a delete"
-    );
-}
-
-// ---------------------------------------------------------------------
-// 5. Regression guard: a bit varying GROUP BY key seeded two ways
+// 3. Regression guard: a bit varying GROUP BY key seeded two ways
 // ---------------------------------------------------------------------
 
 /// A `bit varying` `GROUP BY` group touched once through an ordinary

@@ -483,19 +483,13 @@ Two structural notes for when faults enter the stream:
   (§6). A plant in the tier's `known_misses` is run and reported but doesn't fail
   the sweep when uncaught, and one in `not_gated` (with its reason) is left out
   of `GENERATIVE_PLANTS=all`. Each plant breaks one apply path (the group basis,
-  a `JOIN`, a 1-1 target, the ledger), and a tier leaves out the plants of paths
-  its programs never take: the concurrent tier draws no `JOIN`, the `JOIN` tier
-  nothing else, and with the group basis on (the default) the ledger takes no
-  aggregate, so the ledger's plants are gated only in a sweep run with
-  `TRELLIS_DEV_GROUP_BASIS=0` (which leaves out the group basis's instead). With
-  the group basis on, `early_tombstone_gc` and `chunk_without_entry_lock` are left
-  to their deterministic pins too: on a 1-1 target no tier's schedule makes
-  either diverge (each tier's `not_gated` says what was measured). Each group-basis
-  and `JOIN` plant is pinned by a deterministic interleaving test that fails with
-  it armed, named in its doc comment. `lsn_only_skip` is in every tier's
-  `not_gated`: its window needs a drain order the engine's xmin fence, seal gate
-  and oldest-first claims rule out, so the deterministic pin `a_change_the_rederive_read_is_not_applied_again_aggregate`
-  (`trellis/tests/ledger_interleavings.rs`) is its gate (#734).
+  a `JOIN`, a 1-1 target), and a tier leaves out the plants of paths its
+  programs never take: the concurrent tier draws no `JOIN`, and the `JOIN` tier
+  nothing else. `early_tombstone_gc` and `chunk_without_entry_lock` are left to
+  their deterministic pins too: on a 1-1 target no tier's schedule makes either
+  diverge (each tier's `not_gated` says what was measured). Each group-basis,
+  1-1 and `JOIN` plant is pinned by a deterministic interleaving test that fails
+  with it armed, named in its doc comment.
 - Document how to run one property alone on a clean database; every property
   bootstraps what it reads, so it never depends on run order.
 

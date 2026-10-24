@@ -48,7 +48,7 @@ use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::ValueType;
 use trellis::defs::pg_type::PgType;
 use trellis::defs::{
-    create_aggregate_target_table, create_definition, install_definition, parse, registry,
+    create_aggregate_target_table, create_definition, install_definition, parse,
     source_primary_key, validate,
 };
 use trellis::integer::IntWidth;
@@ -392,59 +392,6 @@ fn bytea_group_by_key_is_admitted() {
 // ---------------------------------------------------------------------
 // 5. The MIN/MAX verdict
 // ---------------------------------------------------------------------
-
-/// Postgres itself has no `min(bytea)`/`max(bytea)` aggregate, despite
-/// `bytea` having a full, `IMMUTABLE` btree opclass (`<`/`>`/`=`/`ORDER BY`
-/// all work — see `bytea_hex_text_order_matches_native_bytea_cmp` above).
-/// This is not a rendering hazard `#110`'s typed key index could fix; it is
-/// a server-side construct that does not exist for this type, so
-/// `MIN`/`MAX(bytea)` has nothing for ADR-0004's "immutable subset of
-/// Postgres" to be a subset *of*.
-#[tokio::test]
-async fn postgres_has_no_min_max_aggregate_for_bytea() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
-
-    client
-        .batch_execute("create table t (v bytea); insert into t values ('\\x00')")
-        .await
-        .expect("seed probe table");
-    for agg in ["min", "max"] {
-        let err = client
-            .query_one(&format!("select {agg}(v) from t"), &[])
-            .await
-            .expect_err(&format!("{agg}(bytea) must not exist in Postgres"));
-        // `tokio_postgres::Error`'s own `Display` is deliberately terse
-        // ("db error") — the server's actual message lives on the wrapped
-        // `DbError`.
-        let db_error = err
-            .as_db_error()
-            .unwrap_or_else(|| panic!("{agg}(bytea) must fail as a DbError: {err}"));
-        assert!(
-            db_error.message().contains("does not exist"),
-            "{agg}(bytea): {db_error}"
-        );
-    }
-
-    // Trellis's own gate agrees, at both the layer that decides an
-    // aggregate's result type and the layer that reports the error to a
-    // definition author.
-    for name in ["MIN", "MAX"] {
-        assert!(
-            registry::aggregate_result_type(name, ValueType::Other(PgType::Bytea)).is_none(),
-            "{name}(bytea) must have no result type"
-        );
-
-        let def = parse(&format!(
-            "TRANSFORM t FROM s GROUP BY id WITHOUT SOURCE INDEX SELECT id AS k, {name}(b) AS m"
-        ))
-        .expect("parses");
-        let err = validate(&def, &source_columns())
-            .expect_err(&format!("{name}(b) over a bytea column must be rejected"));
-        let _ = err; // the specific ValidationError variant isn't load-bearing here
-    }
-}
 
 // ---------------------------------------------------------------------
 // 6. The #113/#248 regression shape, reproduced for bytea

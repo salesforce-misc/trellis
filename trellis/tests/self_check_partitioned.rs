@@ -53,7 +53,6 @@ async fn check(d: &Driver, target: &str) -> Vec<Divergence> {
 /// A driver over `ddl` with `definitions` live, after one reconcile pass has
 /// recorded every partitioned source.
 async fn start(ddl: &str, definitions: &[&str], sources: &[&str]) -> Driver {
-    trellis::dev::staging::set_group_basis(true);
     let mut d = Driver::start(
         ddl,
         &[
@@ -237,7 +236,6 @@ async fn a_leaf_detached_or_attached_since_the_pass_is_no_fault() {
 /// for an aggregate.
 #[tokio::test]
 async fn a_join_reading_a_partitioned_side_audits_clean_and_names_a_leafs_disabled_trigger() {
-    trellis::dev::staging::set_group_basis(true);
     let cluster = testkit::TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = drain_driver::connect(db.dsn()).await;

@@ -11,8 +11,7 @@
 //!    entry, then every other entry `for update`, sorted by key. A new key's
 //!    Apply is settled by its insert, since with no entry I2 is only the
 //!    truncate floor; a Re-derive's is a placeholder. A key whose tombstone
-//!    the GC collects between the two fails the page transiently, as on an
-//!    aggregate ledger (`super::ledger::lock_entries`, #712).
+//!    the GC collects between the two fails the page transiently (#712).
 //! 2. **Re-derive read** ([`read_rows`], I1): the Re-derived keys' source
 //!    rows, `pg_current_snapshot()` and the newest segment in one statement,
 //!    after the lock. The rows are evaluated in Rust, as Phase 2 evaluates
@@ -315,7 +314,7 @@ fn update_statement(target: &str, predicate: bool) -> String {
         q(schema::TOMBSTONE_COLUMN),
     );
     let predicate = if predicate {
-        super::ledger::apply_predicate(true)
+        super::ledger::apply_predicate()
     } else {
         "true".to_string()
     };
@@ -447,8 +446,7 @@ pub async fn explain_page(
 }
 
 /// Empties a 1-1 target's ledger for a source `TRUNCATE` and raises its
-/// truncate floor to `lsn`, the truncate's ring `lsn` (the D split's Q6, as
-/// `super::ledger::truncate_ledger` does for an aggregate). The caller
+/// truncate floor to `lsn`, the truncate's ring `lsn` (the D split's Q6). The caller
 /// clears the target rows. `lsn` is required: a truncate that raised no
 /// floor would let a change from before it apply over it (#774).
 pub(crate) async fn truncate(

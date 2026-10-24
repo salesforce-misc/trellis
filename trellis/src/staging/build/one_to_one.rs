@@ -2,16 +2,16 @@
 //! Re-derive over chunks, and applies from its first chunk").
 //!
 //! A plain 1-1 target, on a captured source or another definition's
-//! target, is built by the same scheduled build as a ledger aggregate (see the parent
-//! module): the staging worker's start moves it `waiting_to_backfill ->
+//! target, is built by the scheduled build (see the parent module): the
+//! staging worker's start moves it `waiting_to_backfill ->
 //! backfilling` with `build = 'rederive'`, it applies from that commit, a
 //! plan job enqueues `(lo, hi]` chunks of its source's primary key, a
 //! rebuild also gets a sweep, and the transaction that finishes the last
 //! chunk moves it `live` (B7). Nothing parks a catch-up for it.
 //!
-//! What differs is the chunk. A 1-1 target's rows are absolute: a target row
-//! is the evaluation of one source row, so a chunk writes the target rows
-//! themselves, with no group deltas and so no merger. What orders a chunk
+//! The chunk: a 1-1 target's rows are absolute, a target row is the
+//! evaluation of one source row, so a chunk writes the target rows
+//! themselves. What orders a chunk
 //! against a page is the key's entry on the 1-1 slim ledger (#623 D6,
 //! `super::super::one_to_one_ledger`), as it orders a page against a page:
 //!
@@ -40,7 +40,7 @@
 //! after the chunk applies a change only if ADR-0002's I2 holds: one the
 //! snapshot saw is refused, and one it didn't is newer than the row the
 //! chunk wrote. A key a page inserted after step 1 isn't locked, and its own
-//! change applies it. As for a ledger target, a page whose batch is at or
+//! change applies it. A page whose batch is at or
 //! below the start's segment re-derives its keys instead of applying them
 //! (#733, `super::start`): an older change drained after the start, whose
 //! key's later delete drained before it, would otherwise write a target row
@@ -487,7 +487,6 @@ pub async fn sweep_batch(
     Ok(SweepOutcome {
         scanned,
         rederived,
-        delta_rows: 0,
         next,
         finished,
     })
@@ -638,8 +637,7 @@ fn sweep_pick(plan: &OneToOnePlan, pattern: &[bool]) -> Pick {
 
 /// A 1-1 chunk's or sweep batch's entry lock
 /// (`one_to_one_ledger::lock_entries`, every key a Re-derive), under
-/// [`CHUNK_LOCK_TIMEOUT`], which it sets for the lock alone, as
-/// [`super::lock_chunk_entries`] does for an aggregate's.
+/// [`CHUNK_LOCK_TIMEOUT`], which it sets for the lock alone.
 async fn lock_chunk_entries(
     txn: &Transaction<'_>,
     plan: &OneToOnePlan,

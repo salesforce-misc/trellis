@@ -239,8 +239,8 @@ pub(crate) const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
     //
     // The `GROUP BY` key role does *not* have this problem at the final SQL
     // layer — see `validate::reject_unsupported_group_by_key_type`'s own
-    // `Boolean` arm — because the ledger (`staging::ledger`) casts a group
-    // key's text to its native type, never a bare `col::text` comparison,
+    // `Boolean` arm — because the group basis (`staging::group_basis`) parses
+    // a group key's text into its native type, never a bare `col::text` comparison,
     // so it never touches `pg_catalog.text (boolean)` at all. Extending the SQL-layer
     // native-array-cast pattern to the remaining scalar lookup sites (or
     // #110's typed key index, which would subsume it) is what would let

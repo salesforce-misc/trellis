@@ -124,7 +124,7 @@ async fn a_group_by_column_with_a_nondeterministic_collation_is_refused() {
     batch(
         &db.pool,
         "create table sales (id bigint primary key, region text collate case_insensitive, \
-                             amount numeric)",
+                             amount numeric(12,2))",
     )
     .await;
     let err = install_definition(

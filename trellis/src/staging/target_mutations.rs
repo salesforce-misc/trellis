@@ -27,11 +27,10 @@
 //!
 //! # Why it is structural
 //!
-//! Every target writer (`apply::apply_target`, `ledger::apply_ledger_target`,
+//! Every target writer (`apply::apply_target`, `group_basis::apply_group_target`,
 //! the truncate clears (`apply::clear_target`), the Re-derive build's chunks
 //! (`staging::build`), a rebuild's orphan delete,
-//! `intake::resume_orphans`, and the direct aggregate build's delete of the
-//! groups its rebuilt ledger lost, `defs::backfill`, #815) takes a
+//! `intake::resume_orphans`) takes a
 //! `&mut TargetMutations` and reports each physically-changed key into it. None of them returns the
 //! changed keys to its caller, so a caller cannot forget to propagate them:
 //! the only way a changed key leaves a writer is through [`TargetMutations::record`],
@@ -93,9 +92,7 @@
 //! created it). An image-fed target's row carries it as its old image (see
 //! "The image feed"). On a `Recompute` it names the group the row left: a
 //! downstream group-basis aggregate recomputes that group as well as the
-//! current row's (`super::group_basis`). A ledger aggregate doesn't need it:
-//! when an upstream write moves a row from group A to group B, the key's
-//! ledger entry still names A (#623 D5).
+//! current row's (`super::group_basis`).
 //!
 //! Writers capture the prior image with the same statement that already
 //! row-locks the key before writing it (a `SELECT ... FOR UPDATE` pre-lock,
@@ -147,9 +144,8 @@
 //! The accumulator keeps its touched set in memory, which is what a drain
 //! page needs: a page's keys are capped (ADR-0002 I8), and it stages them
 //! through [`TargetMutations::into_staged`] into one `Vec`. A rebuild's
-//! orphan sweep (`intake::resume_orphans`) and a direct aggregate build's
-//! delete of the groups its rebuilt ledger lost (`defs::backfill`, #926) are
-//! not capped: either can delete tens of millions of rows in one
+//! orphan sweep (`intake::resume_orphans`) is not capped: it can delete tens
+//! of millions of rows in one
 //! transaction, and holding each key with its
 //! prior image until the flush would hold them all in memory, and re-reading
 //! an image-fed target's new images would bind them all in one statement,
@@ -187,9 +183,7 @@
 //!   row's new group but not the one it left (ADR-0002, "Multi-hop");
 //! - an applying `JOIN` transform with the target on either side.
 //!
-//! Both count only while the group-basis dev knob is on
-//! (`super::group_basis`'s "The knob"): with it off, no aggregate is on the
-//! group basis, and a `JOIN` never applies. A `JOIN`
+//! A `JOIN`
 //! side consumes the images as it consumes captured ones (`super::join`).
 //!
 //! A target with any of them ([`TargetInfo::image_feed`]) stages each
@@ -287,14 +281,7 @@ struct ImageFeed {
 /// either side, or an aggregate on the group basis, which is the one kind of
 /// definition with a hidden table named by its id in the catalog's schema
 /// (`super::group_basis::hidden_table_name`).
-///
-/// A constant `false` while a test has forced the group-basis knob off
-/// (`super::group_basis::enabled`): no aggregate is on the group basis then,
-/// and no `JOIN` applies.
 fn image_readers_sql() -> String {
-    if !super::group_basis::enabled() {
-        return "false".to_string();
-    }
     format!(
         "select exists (select 1 from transform_definitions d \
              where (d.source_table = $1 or d.join_table = $1) and {} \
@@ -496,8 +483,8 @@ impl TargetMutations {
 
     /// The columns [`Self::image_sql`] renders for `target`, or `None` when
     /// nothing reads it. For a writer that builds each prior image column by
-    /// column rather than from one row alias (#623 D3's ledger group upsert,
-    /// `super::ledger`).
+    /// column rather than from one row alias (`super::group_basis`'s group
+    /// writes).
     pub(crate) async fn image_columns(
         &mut self,
         txn: &Transaction<'_>,

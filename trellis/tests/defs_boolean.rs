@@ -1,5 +1,6 @@
-//! End-to-end tests for issue #119's `boolean` support — as a join/`GROUP
-//! BY` key, and the two new aggregates `bool_and`/`bool_or`.
+//! End-to-end tests for issue #119's `boolean` support as a join/`GROUP BY`
+//! key. The `bool_and`/`bool_or` aggregates are refused at define
+//! (`ValidationError::DeferredAggregate`).
 //!
 //! # Why these run against a live server
 //!
@@ -54,21 +55,10 @@
 //!    `a_boolean_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two`
 //!    below reproduces the corruption end-to-end and pins the fix.
 //!
-//! `bool_and`/`bool_or` themselves are total, commutative, associative
-//! folds over `{true, false}` with no overflow/rounding hazard — but they
-//! are still **recompute-only**, on `MIN`/`MAX`'s reasoning rather than
-//! `SUM`'s: the aggregate's only maintained state is its own current
-//! one-bit value, which is not enough to invert a delete (deleting *some*
-//! `false` row from a `bool_and = false` group might flip it to `true`, or
-//! might not, depending on which row). See
-//! `defs::invertibility::classify`'s `BOOL_AND`/`BOOL_OR` arm for the full
-//! reasoning; `bool_and_or_deletion_cannot_be_inverted_from_the_aggregate_alone`
-//! below demonstrates it live.
-//!
 //! Per ADR-0013 every comparison is against independently-authored SQL —
-//! plain `pg_cast`, plain `boolout`, plain `bool_and`/`bool_or`, plain
-//! `group by` — never against `defs::oracle::recompute`, which would be the
-//! engine's own renderer grading itself. Harness conventions follow
+//! plain `pg_cast`, plain `boolout`, plain `group by` — never against
+//! `defs::oracle::recompute`, which would be the engine's own renderer
+//! grading itself. Harness conventions follow
 //! `defs_bytea.rs`.
 
 use std::collections::HashMap;
@@ -77,11 +67,9 @@ use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::ValueType;
-use trellis::defs::eval::{RegexCache, Row, Value, evaluate_aggregate};
-use trellis::defs::invertibility::{AggregateArg, Invertibility, classify};
 use trellis::defs::{
     CatalogError, ValidationError, create_aggregate_target_table, create_definition,
-    install_definition, parse, registry, source_primary_key, validate,
+    install_definition, parse, source_primary_key, validate,
 };
 use trellis::integer::IntWidth;
 use trellis::staging::{apply, seal};
@@ -283,174 +271,7 @@ fn boolean_group_by_key_is_admitted() {
 }
 
 // ---------------------------------------------------------------------
-// 3. bool_and/bool_or: result types, folding, invertibility
-// ---------------------------------------------------------------------
-
-/// `bool_and`/`bool_or` both return `boolean` — checked against
-/// `pg_typeof`, not assumed, per ADR-0013.
-#[tokio::test]
-async fn bool_and_or_result_types_match_pg_typeof() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
-
-    for agg in ["bool_and", "bool_or"] {
-        let row = client
-            .query_one(
-                &format!("select pg_typeof({agg}(v))::text from (values (true), (false)) t(v)"),
-                &[],
-            )
-            .await
-            .unwrap_or_else(|e| panic!("{agg} pg_typeof probe: {e}"));
-        let ty: String = row.get(0);
-        assert_eq!(ty, "boolean");
-    }
-
-    for name in ["BOOL_AND", "BOOL_OR"] {
-        assert_eq!(
-            registry::aggregate_result_type(name, ValueType::Boolean),
-            Some(ValueType::Boolean),
-            "{name}(boolean) must resolve to Boolean"
-        );
-    }
-}
-
-/// The evaluator's fold must match a server-side `bool_and`/`bool_or` over
-/// every NULL-handling shape Postgres distinguishes: all-true, all-false,
-/// mixed, a NULL mixed in (skipped, matching every other aggregate's
-/// "aggregate of non-NULL values" rule), and an all-NULL group (`NULL`
-/// result, not `false`/`true`).
-#[tokio::test]
-async fn bool_and_or_fold_matches_a_server_side_aggregate() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
-
-    let groups: &[&[Option<bool>]] = &[
-        &[Some(true), Some(true), Some(true)],
-        &[Some(false), Some(false)],
-        &[Some(true), Some(false), Some(true)],
-        &[Some(true), None, Some(false)],
-        &[None, None],
-    ];
-
-    for group in groups {
-        let values_sql = group
-            .iter()
-            .map(|v| match v {
-                Some(true) => "(true)".to_string(),
-                Some(false) => "(false)".to_string(),
-                None => "(null::boolean)".to_string(),
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-        let row = client
-            .query_one(
-                &format!("select bool_and(v), bool_or(v) from (values {values_sql}) t(v)"),
-                &[],
-            )
-            .await
-            .unwrap_or_else(|e| panic!("server bool_and/bool_or over {group:?}: {e}"));
-        let (server_and, server_or): (Option<bool>, Option<bool>) = (row.get(0), row.get(1));
-
-        let def = parse(
-            "TRANSFORM t FROM s GROUP BY id WITHOUT SOURCE INDEX SELECT id AS k, \
-             BOOL_AND(flag) AS all_true, BOOL_OR(flag) AS any_true",
-        )
-        .expect("parses");
-        let columns = HashMap::from([
-            ("id".to_string(), ValueType::Integer(IntWidth::Int8)),
-            ("flag".to_string(), ValueType::Boolean),
-        ]);
-        validate(&def, &columns).expect("validate");
-
-        let rows: Vec<Row> = group
-            .iter()
-            .map(|v| {
-                Row::from([
-                    ("id".to_string(), Some("1".to_string())),
-                    ("flag".to_string(), v.map(|b| b.to_string())),
-                ])
-            })
-            .collect();
-        let result = evaluate_aggregate(&def, &rows, &columns, &mut RegexCache::default())
-            .unwrap_or_else(|e| panic!("bool_and/bool_or fold over {group:?}: {e}"));
-
-        assert_eq!(
-            result["all_true"],
-            server_and.map(Value::Boolean),
-            "BOOL_AND over {group:?}"
-        );
-        assert_eq!(
-            result["any_true"],
-            server_or.map(Value::Boolean),
-            "BOOL_OR over {group:?}"
-        );
-    }
-}
-
-/// `bool_and`/`bool_or` are classified `RecomputeOnly` — pinned here as a
-/// live-facing regression guard (the pure-code classification is already
-/// pinned in `defs::invertibility`'s own unit tests).
-#[test]
-fn bool_and_or_are_classified_recompute_only() {
-    for name in ["BOOL_AND", "BOOL_OR"] {
-        let verdict = classify(name, AggregateArg::Column(ValueType::Boolean))
-            .unwrap_or_else(|| panic!("{name} must classify"));
-        assert_eq!(verdict.invertibility, Invertibility::RecomputeOnly);
-    }
-}
-
-/// The concrete reason `bool_and`/`bool_or` cannot be delta-maintained from
-/// their own visible value alone (`defs::invertibility`'s classification):
-/// two different deletions from the *same* starting group, both leaving a
-/// `bool_and = false` state with two rows remaining, land at two different
-/// true answers after the delete — so "the old aggregate was `false`" is not
-/// enough information to invert. A one-bit delta model literally cannot
-/// distinguish the two cases; only a full recompute (or hidden per-value
-/// counts this engine does not currently maintain — see
-/// `defs::invertibility`'s doc comment) can.
-#[tokio::test]
-async fn bool_and_or_deletion_cannot_be_inverted_from_the_aggregate_alone() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
-
-    let row = client
-        .query_one(
-            "select bool_and(v) from (values (false), (true), (true)) t(v)",
-            &[],
-        )
-        .await
-        .expect("starting bool_and");
-    let starting: bool = row.get(0);
-    assert!(!starting, "the starting group must fold to false");
-
-    // Delete the `false` row: the remaining two are both `true`.
-    let row = client
-        .query_one("select bool_and(v) from (values (true), (true)) t(v)", &[])
-        .await
-        .expect("bool_and after deleting the false row");
-    let after_deleting_false: bool = row.get(0);
-
-    // Instead delete one of the *other* (`true`) rows from the same
-    // starting group: the `false` row survives, so the fold is still
-    // `false`.
-    let row = client
-        .query_one("select bool_and(v) from (values (false), (true)) t(v)", &[])
-        .await
-        .expect("bool_and after deleting a true row");
-    let after_deleting_true: bool = row.get(0);
-
-    assert_ne!(
-        after_deleting_false, after_deleting_true,
-        "two different deletions from a bool_and = false group of 3 must not converge to the \
-         same post-delete answer — this is exactly why a one-bit delta can't invert a delete"
-    );
-}
-
-// ---------------------------------------------------------------------
-// 4. The #113/#248 regression shape, reproduced for a boolean GROUP BY key
+// 3. The #113/#248 regression shape, reproduced for a boolean GROUP BY key
 // ---------------------------------------------------------------------
 
 /// A `boolean` `GROUP BY` group touched once through an ordinary

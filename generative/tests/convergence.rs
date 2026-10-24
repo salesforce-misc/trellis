@@ -944,12 +944,10 @@ async fn an_aggregate_group_emptied_by_deletes_converges_and_the_row_disappears(
     );
 }
 
-/// Improvement-plan task B4: `AVG`'s hidden sum/count partials
-/// (`trellis::dev::defs::invertibility::PartialField`), and — since this def's
-/// `SUM` and `AVG` both aggregate the exact same column — the shared hidden
-/// running-count column `defs::ddl::count_column_names` gives them
-/// (`trellis/tests/apply_aggregate.rs` covers the shared-count-column shape by
-/// hand; this drives the same shape through the generative harness). An
+/// Improvement-plan task B4: `AVG`'s hidden sum/count partials, and — since
+/// this def's `SUM` and `AVG` both aggregate the exact same column — the one
+/// partial the group basis keeps for them (`trellis::staging::group_basis`,
+/// one per distinct argument). An
 /// insert, an update that changes the aggregated value, and a delete all
 /// land in the same group, so every fold path (insert delta, update delta,
 /// delete delta) exercises both fields' partials in one run.
@@ -1004,8 +1002,7 @@ async fn avg_and_sum_over_the_same_column_share_a_partial_and_stay_correct_throu
     assert_eq!(row["sum_c1"], Some("50.00".to_string()), "final sum");
     // Postgres's numeric division picks its own display scale (e.g.
     // `50.0000000000000000`), which this grammar's `AVG` inherits rather
-    // than reformats — compare by parsed value, not exact text, matching
-    // `trellis/tests/apply_aggregate.rs`'s own `assert_count_and_avg` helper.
+    // than reformats — compare by parsed value, not exact text.
     let avg: f64 = row["avg_c1"]
         .as_deref()
         .expect("avg_c1 must not be NULL")

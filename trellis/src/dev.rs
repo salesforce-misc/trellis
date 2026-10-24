@@ -40,10 +40,6 @@ pub mod defs {
     /// and installs it through the public path (ADR-0012), but its oracle and
     /// coverage tracker still need to name the shapes it generated.
     pub use crate::defs::ast;
-    /// `SUM`/`COUNT`/`AVG`/`MIN`/`MAX`'s invertibility classification — the
-    /// suite asserts against the engine's own verdict rather than a second,
-    /// drifting copy of the table.
-    pub use crate::defs::invertibility;
     /// The evaluator-driven cross-check leg itself, plus the SQL renderers
     /// `benchmark`'s scenario oracle compares a persisted target against.
     pub use crate::defs::oracle;
@@ -69,7 +65,7 @@ pub mod staging {
     /// Read, never set: `benchmark`'s contention sampler tells a Re-derive
     /// build's statements from a drain page's by the `application_name`
     /// their transactions set (#625 F2's profile).
-    pub use crate::staging::build::{CHUNK_APPLICATION_NAME, MERGE_APPLICATION_NAME};
+    pub use crate::staging::build::CHUNK_APPLICATION_NAME;
     /// Read, never set: the concurrent tier's coverage report (issue #557)
     /// counts bursts large enough to seal into a split batch, and must follow
     /// the threshold if it moves.
@@ -97,13 +93,6 @@ pub mod staging {
     /// recompute and its rebuild), for plan-shape tests.
     #[cfg(any(test, feature = "internals"))]
     pub use crate::staging::group_basis::explain_whole_source_reads;
-    /// The group-basis dev knob (#1100): tests and `benchmark` turn the group
-    /// basis on for admitted aggregates, once, before a client starts. See
-    /// `staging::group_basis`'s module doc for what it supports until the
-    /// ledger is deleted (#1105), which deletes the knob too.
-    pub use crate::staging::group_basis::{
-        KNOB_ENV as GROUP_BASIS_ENV, enabled as group_basis_enabled, set_enabled as set_group_basis,
-    };
     /// One page of a `self_check` walk, for `benchmark`'s `self-check-walk`
     /// (#1198): it walks a JOIN target's `P` and `M` parts alone, from the
     /// cursor `p`, which the job (it walks `T` first) can't.
@@ -146,13 +135,10 @@ pub mod interleave {
     };
 }
 
-/// The Re-derive build's primitives (#625 F1): one build chunk and one
-/// merger pass, for a harness that drives a build by hand before #625 F2
-/// schedules it. See `crate::staging::build`'s module doc.
+/// The Re-derive build's lock timeout, for a harness that drives a build by
+/// hand. See `crate::staging::build`'s module doc.
 pub mod build {
-    pub use crate::staging::build::{
-        BuildPlan, CHUNK_LOCK_TIMEOUT, ChunkOutcome, MergeOutcome, merge_deltas, run_chunk,
-    };
+    pub use crate::staging::build::CHUNK_LOCK_TIMEOUT;
 }
 
 /// Planted ordering bugs (issue #557 part 3). A harness reads which plant

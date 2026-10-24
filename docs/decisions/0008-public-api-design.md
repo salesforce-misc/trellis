@@ -35,7 +35,7 @@ async-bridging strategies aren't worth it when neither host needs concurrent
 in-flight calls here.
 
 **Decision:** the FFI surface is synchronous and blocks only on *registration*,
-never backfill. `define` creates the target table, its ledger tables and its chunk
+never backfill. `define` creates the target table, a 1-1 target's ledger and its chunk
 plan, persists the definition, and returns. It captures no fence and reads no source
 row; drain workers build in the background
 ([ADR-0002](0002-async-data-flow.md#a-build-is-re-derive-over-chunks-and-applies-from-its-first-chunk)).
