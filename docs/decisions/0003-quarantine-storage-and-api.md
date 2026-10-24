@@ -80,9 +80,7 @@ transforms/columns at once, and a failure in one of them is that one's to hold.
   earliest parked change's batch and pre-image, the earliest origin position
   (unknown once any change's is, so the key keeps holding back every
   read-your-writes token), the earliest source-change time, the deepest hop,
-  the union of the group keys, the join values the changes' images held for
-  a relationship's `to_col` (each change's raw new images and its pre-image),
-  the greatest WAL position, and, for a group-basis aggregate
+  and, for a group-basis aggregate
   ([ADR-0002](0002-async-data-flow.md#aggregates-a-basis-per-group-kept-by-deltas)),
   the groups the changes' old and new images named (`agg_groups`), the
   evicting change's among them, but none of the images. A held key
@@ -324,13 +322,7 @@ until one of these releases it:
   them, the table in either spelling. In one transaction it deletes the
   transform's `poison`, `poison_held` and `key_deaths` rows for the key and
   stages one image-less `Recompute` of it, which re-derives the key from its
-  current row, including the rewrite of its to-one relationship projections.
-  Beside it, it
-  stages each join value the held row names (`join_values`), so the
-  `Recompute` also re-derives the relationship readers that may have read the
-  key under a value between its first parked pre-image and its current row,
-  which an out-of-order drain can leave behind. The parked
-  changes are discarded, not replayed. The `Recompute` reaches every reader of
+  current row. The parked changes are discarded, not replayed. The `Recompute` reaches every reader of
   the table: one that doesn't hold the key re-derives it, which is idempotent,
   and one that does parks it. If the cause is still there, the `Recompute`
   fails as the changes before it did, and the key is poisoned again once its

@@ -64,7 +64,7 @@ pub mod validate;
 pub use ast::{AlterTransform, DefinitionRef, Statement, StatementKind, TransformRef, ValueType};
 pub use catalog::{CatalogError, alter_transform, install_definition, tables_to_capture};
 pub use error::ParseError;
-pub use model::{RelationshipDefinition, TransformStatus};
+pub use model::TransformStatus;
 pub use parser::{parse_statement, statement_kind};
 // Stored text loads through `grammar::load`; the integration tests parse
 // fresh text directly.
@@ -109,9 +109,8 @@ pub use backfill::BackfillError;
 pub use catalog::all_source_tables;
 #[cfg(any(test, feature = "internals"))]
 pub use catalog::{
-    RelationshipProjection, create_definition, dependents_of, edges_from, node_for_table,
-    persist_edge, relationship_by_name, relationship_projection, relationships_to_table,
-    resolve_node, source_table_version, transforms_for_source,
+    create_definition, dependents_of, edges_from, node_for_table, persist_edge,
+    relationship_by_name, resolve_node, source_table_version, transforms_for_source,
 };
 #[cfg(any(test, feature = "internals"))]
 pub use ddl::{PrimaryKeyColumn, neighbor_table_name};

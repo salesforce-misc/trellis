@@ -27,8 +27,8 @@ use trellis::intake::markers;
 use trellis::staging::build::{self, BuildPlan, ChunkOutcome, MergeOutcome};
 use trellis::staging::interleave::{PausePoint, PauseScope, Reached, with_scope};
 use trellis::staging::{
-    ApplyError, ApplyOutcome, StagedChange, StagedWatermark, append, apply, collect_tombstones,
-    has_pending, retire_drained_segments, seal,
+    ApplyError, ApplyOutcome, StagedChange, append, apply, collect_tombstones, has_pending,
+    retire_drained_segments, seal,
 };
 
 pub const WAKE: &str = "interleave_wake";
@@ -257,7 +257,6 @@ impl Driver {
                 src_table: src_table.to_string(),
                 key: key.to_string(),
                 hop_gen: 0,
-                group_key: None,
                 src_changed: None,
                 prior_image: prior_image.clone(),
                 origin_lsn: None,
@@ -327,15 +326,8 @@ impl Driver {
         // finished first picks up any bucket left over.
         let handle = tokio::spawn(with_scope(scope, async move {
             let mut last = None;
-            while let Some(outcome) = apply::drain_once(
-                &pool,
-                batch,
-                &worker,
-                live_workers,
-                WAKE,
-                &StagedWatermark::saturated(),
-            )
-            .await?
+            while let Some(outcome) =
+                apply::drain_once(&pool, batch, &worker, live_workers, WAKE).await?
             {
                 last = Some(outcome);
             }

@@ -61,13 +61,12 @@ async fn connect_raw(dsn: &str) -> Client {
 }
 
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
-    let watermark = StagedWatermark::saturated();
     for _ in 0..16 {
         let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
         seal::seal_phase2(client, outcome.sealed_seg_seq, WAKE)
             .await
             .expect("seal phase 2");
-        while apply::drain_once(pool, outcome.sealed_seg_seq, TEST_NAME, 1, WAKE, &watermark)
+        while apply::drain_once(pool, outcome.sealed_seg_seq, TEST_NAME, 1, WAKE)
             .await
             .expect("drain_once")
             .is_some()
@@ -157,7 +156,6 @@ fn cdc(op: CdcOp, lsn: PgLsn, old: Option<&str>, new: Option<&str>) -> StagedCha
         origin_lsn: None,
         src_changed: None,
         hop_gen: 0,
-        group_key: None,
     }
 }
 

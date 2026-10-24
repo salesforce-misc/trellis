@@ -35,26 +35,21 @@ use tokio_postgres::{GenericClient, Transaction};
 
 use crate::defs::ast::{KeySpace, TransformDef, ValueType};
 use crate::defs::catalog::{self, CatalogError};
-use crate::defs::ddl::{self, DdlError, PrimaryKeyColumn, key_column_in};
-use crate::defs::eval::{
-    self, EvalError, RelationshipContext, Row, ToManyRelationship, ToOneRelationship,
-};
-use crate::defs::model::{RelationshipCardinality, RelationshipDefinition};
+use crate::defs::ddl::{self, DdlError, PrimaryKeyColumn};
+use crate::defs::eval::{self, EvalError, Row};
 use crate::defs::validate::{self, ValidationError};
 use crate::error_code::{self, ErrorCode};
 use crate::pool::{Pool, quote_ident, quote_literal};
 
-use super::append::{self, StagedChange};
+use super::append;
 use super::claim;
 use super::claim::{HeldShare, held_share};
-use super::converge;
 use super::error::StagingError;
 use super::fold::{self, FoldedChange, earliest_origin};
 use super::liveness::FenceMissBackoff;
 use super::one_to_one_ledger;
 use super::quarantine;
 use super::target_mutations::TargetMutations;
-use super::watermark::StagedWatermark;
 
 /// The absolute ceiling on [`FoldedChange::hop_gen`] propagation, a backstop
 /// over and above the schema-derived hop bound doc 05 describes ("one past
@@ -65,39 +60,6 @@ use super::watermark::StagedWatermark;
 /// creation time (`detect_cycle`), so this is defense-in-depth, not the
 /// primary guard.
 pub const MAX_HOP_GEN: i32 = 32;
-
-/// Issue #135 (epic #127): starvation-freedom threshold for a to-one
-/// relationship reverse's guard-gated retry loop (issue #134's
-/// `RelationshipReverseDeferred`/`retry_count`) — see the "Issue #135:
-/// fairness escalation" section below (right after [`check_reverse_guards`])
-/// for the full design and the alternatives it rejects. Once a single
-/// reverse *transition* (one parent's old-image/new-image pair — fixed
-/// across every retry, never re-derived; see [`RelationshipReverseRecord`]'s
-/// doc comment) has been rejected by guard (a), (b), or (c) this many times
-/// in a row, the *next* rejection escalates instead of deferring again: it
-/// advances the settled parent projection immediately (sound once an
-/// independent recheck of guard (d) — the projection's own LSN chain —
-/// holds; see [`reverse_ordering_still_holds`]) and resolves the aggregate
-/// correction via the pre-#131 image-less `Recompute` fallback, which needs
-/// none of #132's four guards for its own correctness.
-///
-/// **Why 5.** No production signal exists yet to tune this against — this
-/// issue's own stress model (see the module's test suite and its report) is
-/// what informs the choice, not a fleet metric. 5 is small enough to bound
-/// worst-case staleness to a handful of drain cycles (in practice usually
-/// far fewer — guard (d) is expected to hold on nearly every attempt once
-/// children are the only source of churn, since nothing else is racing to
-/// move *this* parent's own projection row; see the design section's
-/// reasoning) while large enough that an ordinary transient blip — the
-/// *common* case #134's own doc section measured — never escalates. (#623 D5
-/// deleted the fast path, so both outcomes re-derive the same rows now; the
-/// deferral still keeps the projection's advances in order.)
-/// A plain constant, not a runtime setting, following this module's own
-/// [`MAX_HOP_GEN`] precedent: promote it to something tunable only if a real
-/// deployment's `trellis_relationship_reverse_deferred_total` /
-/// `trellis_relationship_reverse_fairness_escalated_total` metrics ever show
-/// a need.
-pub const RELATIONSHIP_REVERSE_FAIRNESS_THRESHOLD: i32 = 5;
 
 // ---------------------------------------------------------------------
 // Errors
@@ -302,21 +264,6 @@ pub enum ApplyError {
         transform: String,
         reason: Box<crate::defs::catalog::CatalogError>,
     },
-    /// [`from_side_rows_for_trigger_txn`] was asked to resolve a
-    /// [`ReverseTrigger::WholeKeyspace`] against live, transactional full row
-    /// images. Not reachable today — both of that function's call sites
-    /// construct [`ReverseTrigger::Keys`] inline from a single join key they
-    /// already hold, and no function in this module takes a `ReverseTrigger`
-    /// and forwards one, so no dynamically-chosen variant can ever arrive
-    /// there. Kept as a typed error rather than a panic per this module's own
-    /// convention of not trusting invariants it cannot enforce itself (see
-    /// [`ApplyError::Validate`] and [`ApplyError::Backfill`], which document
-    /// the same reasoning) — and specifically because that function's own doc
-    /// comment already concedes it cannot enforce its preconditions against a
-    /// *new* caller added later. A future path that legitimately needs
-    /// whole-keyspace full row images must implement and test that arm; until
-    /// then this fails one drain visibly instead of aborting the worker.
-    ReverseTriggerNotResolvable { from_table: String },
     /// A folded truncate of `src_table` carries no ring `lsn` (#774). Not
     /// reachable: the capture trigger is the only writer of a truncate's
     /// ring row and stamps it with `pg_current_wal_insert_lsn()`, and
@@ -364,7 +311,6 @@ impl ApplyError {
             | ApplyError::HopBoundExceeded { .. }
             | ApplyError::AggregateOffLedger { .. }
             | ApplyError::GroupBasisUnsupported { .. }
-            | ApplyError::ReverseTriggerNotResolvable { .. }
             | ApplyError::TruncateWithoutLsn { .. }
             | ApplyError::SpilledMutationsNotFlushed => ErrorCode::Internal,
             ApplyError::SourceTableDropped { .. } => ErrorCode::NotFound,
@@ -504,14 +450,6 @@ impl fmt::Display for ApplyError {
             ApplyError::ResumeRefused { transform, reason } => {
                 write!(f, "'{transform}' can't resume: {reason}. It stays paused")
             }
-            ApplyError::ReverseTriggerNotResolvable { from_table } => write!(
-                f,
-                "cannot resolve a whole-keyspace reverse trigger against live full row images \
-                 for from-table '{from_table}': a TRUNCATE carries no image, so the reverse \
-                 delta/fallback path has no per-row old/new parent to diff against; this \
-                 combination is unreachable from any current call site and indicates a newly \
-                 added caller that must implement the whole-keyspace arm for real"
-            ),
             ApplyError::TruncateWithoutLsn { src_table } => write!(
                 f,
                 "a truncate of '{src_table}' reached the drain with no ring lsn, so it can't \
@@ -556,7 +494,6 @@ impl std::error::Error for ApplyError {
             | ApplyError::TransformNotPaused { .. }
             | ApplyError::KeyNotHeld { .. }
             | ApplyError::ReleaseLockTimeout { .. }
-            | ApplyError::ReverseTriggerNotResolvable { .. }
             | ApplyError::TruncateWithoutLsn { .. }
             | ApplyError::SpilledMutationsNotFlushed => None,
         }
@@ -646,17 +583,14 @@ impl From<crate::error::Error> for ApplyError {
 /// (terminal-target latency metrics) asks about. That resolves through
 /// [`catalog::resolve_graph_identity`]'s bare-target-suffix fallback (for a
 /// target that isn't on the `search_path`): the name can only be some other
-/// live definition's own target. A relationship's from-side used to be the
-/// other bare shape; since issue #288 it carries its own recorded schema
-/// ([`crate::defs::RelationshipDefinition::qualified_from_table`]) and never
-/// comes through here.
+/// live definition's own target.
 ///
 /// Issue #267 turned this from an after-the-fact repair of an already-staged
 /// bare `src_table` into the canonicalization applied *before* staging: this
 /// function's output is now what those rows carry into the ring in the first
 /// place, so a bare `src_table` reaching `compute` is no longer something
-/// this module itself produces. See [`accumulate_from_side_recomputes`] for
-/// the emission site. The reading side still tolerates a bare name anyway:
+/// this module itself produces. The reading side still tolerates a bare
+/// name anyway:
 /// ring rows are durable, and this crate's integration-test fixtures stage
 /// bare names by hand.
 async fn qualified_schema_node_key(pool: &Pool, src_table: &str) -> Result<String, ApplyError> {
@@ -796,10 +730,8 @@ impl DecodedImages {
 /// `pk` may be a composite (multi-column) primary key (issue #126): `keys`
 /// are each [`ddl::pk_key_sql_expr`]'s U+001F-joined text — the same shape
 /// every [`FoldedChange::key`] already carries for a composite-PK source,
-/// whether staged by a capture trigger or by this crate's own
-/// reverse-relationship path
-/// ([`from_side_rows_for_trigger_txn`]/`from_side_keys`'s callers) —
-/// so the two agree on one row identity regardless of which produced it.
+/// whether staged by a capture trigger or by this crate's own seam, so the
+/// two agree on one row identity regardless of which produced it.
 /// The batch match itself is a keyset join, one bind-parameter array per
 /// `pk` column, rather than a single `= any($1)` — `pk.len() == 1`
 /// degenerates to exactly that single-array-parameter shape, so the
@@ -1007,100 +939,11 @@ fn live_rows_join_cond(pk: &[PrimaryKeyColumn], pattern: &[bool]) -> String {
         .join(" and ")
 }
 
-/// The exact Postgres type of `column` on `table`, as rendered by
-/// `format_type` (e.g. `integer`, `bigint`, `uuid`) — the same `pg_catalog`
-/// introspection [`ddl::source_primary_key`]/[`to_column_types`] do, kept
-/// here as its own single-column helper so a relationship key-lookup can
-/// bind its key-array parameter to the column's own native type instead of
-/// casting the column itself to `::text` (issue #125): `where col::text =
-/// any($1::text[])` puts the cast on the *indexed* side, which defeats any
-/// btree index on `col` and degrades what should be an O(touched keys)
-/// lookup into an O(table size) sequential scan (measured 275x/794x slower
-/// on realistic data volumes). `where col = any($1::text[]::{ty}[])` casts
-/// the *bound array* instead — `col` is compared at its own type, so
-/// Postgres can still use a btree index on it. `None` if the column doesn't
-/// exist, mirroring [`to_column_types`]'s "missing is simply absent"
-/// convention; such a caller falls back to the old untyped `::text`
-/// comparison, which fails the same way this lookup always did if the
-/// column is genuinely gone.
-async fn key_column_pg_type(
-    pool: &Pool,
-    table: &str,
-    column: &str,
-) -> Result<Option<String>, ApplyError> {
-    let client = pool.get().await?;
-    key_column_pg_type_in(&**client, table, column).await
-}
-
-/// [`key_column_pg_type`] on an already-held connection (Phase 3's `txn`).
-async fn key_column_pg_type_in(
-    client: &impl GenericClient,
-    table: &str,
-    column: &str,
-) -> Result<Option<String>, ApplyError> {
-    Ok(key_column_in(client, table, column)
-        .await?
-        .map(|column| column.pg_type))
-}
-
-/// Renders a key-array equality filter against `col_ident` (an already
-/// `quote_ident`-quoted column reference — this function does no quoting of
-/// its own). Issue #125's fix, factored out as its own pure, directly
-/// testable function shared by every relationship/join-key lookup below:
-/// when `pg_type` (from [`key_column_pg_type`]) is known, casts the *bound
-/// `$1` array* to it (`col = any($1::text[]::{ty}[])`), leaving `col_ident`
-/// itself uncast so a btree index on it stays usable; when `pg_type` is
-/// `None` (the column couldn't be introspected), falls back to the old,
-/// unindexable `col_ident::text = any($1::text[])` form, which casts
-/// `col_ident` itself. Regression-pinned by this module's own
-/// `key_array_filter_*` unit tests below — a future edit that swaps these
-/// two arms, or that re-adds a bare `::text` cast on `col_ident` in the
-/// `Some` arm, would fail them immediately.
-fn key_array_filter(col_ident: &str, pg_type: Option<&str>) -> String {
-    match pg_type {
-        Some(ty) => format!("{col_ident} = any($1::text[]::{ty}[])"),
-        None => format!("{col_ident}::text = any($1::text[])"),
-    }
-}
-
-/// [`key_array_filter`] for one key: `col_ident` equal to the bound `$1`
-/// (`text`), cast to `pg_type` so an index on the column serves it (issue
-/// #835), or, when the type is unknown, the column cast to `text`. A `NULL`
-/// `$1` matches no row either way, and a join key's type is one whose text
-/// form is its identity (`catalog::is_text_stable_join_key_type`), so the
-/// two compare the same rows equal.
-fn single_key_filter(col_ident: &str, pg_type: Option<&str>) -> String {
-    match pg_type {
-        Some(ty) => format!("{col_ident} = $1::text::{ty}"),
-        None => format!("{col_ident}::text = $1"),
-    }
-}
-
-/// The type of `table`'s `column` ([`key_column_pg_type_in`]), read into
-/// `cell` the first time and kept.
-async fn cached_key_pg_type<'a>(
-    cell: &'a std::sync::OnceLock<Option<String>>,
-    client: &impl GenericClient,
-    table: &str,
-    column: &str,
-) -> Result<Option<&'a str>, ApplyError> {
-    let key_pg_type = match cell.get() {
-        Some(ty) => ty,
-        None => {
-            let ty = key_column_pg_type_in(client, table, column).await?;
-            cell.get_or_init(|| ty)
-        }
-    };
-    Ok(key_pg_type.as_deref())
-}
-
-/// The live, `attnum`-ordered column names of `table` — the same
-/// `to_regclass`-bound `pg_attribute` introspection [`to_column_types`]/
-/// [`key_column_pg_type`] already use, but the whole live column list rather
-/// than a caller-supplied subset. `table` is the unquoted `schema.table`
-/// identity, quoted for the lookup by [`ddl::regclass_arg`] (issue #561).
-/// An already-quoted name (e.g. a [`ddl::qualified_relationship_projection_table`]
-/// output) is quoted twice, finds nothing, and yields an empty column list.
+/// The live, `attnum`-ordered column names of `table`, from a
+/// `to_regclass`-bound `pg_attribute` introspection. `table` is the unquoted
+/// `schema.table` identity, quoted for the lookup by [`ddl::regclass_arg`]
+/// (issue #561). An already-quoted name is quoted twice, finds nothing, and
+/// yields an empty column list.
 ///
 /// Issue #248: every `to_jsonb(t.*)`-based row decode in this crate needs
 /// this to build an explicit per-column `jsonb_build_object` (see
@@ -1130,35 +973,6 @@ pub async fn live_row_columns(
     Ok(rows.into_iter().map(|row| row.get(0)).collect())
 }
 
-/// [`live_row_columns`], memoized per `table` in `cache` — the caching
-/// counterpart Phase 3's reverse-trigger loop needs
-/// (`apply_and_mark_drained_many`'s "3d" step, via
-/// [`stage_reverse_recompute_fallback`]).
-///
-/// That loop runs once per distinct touched parent key in the batch, and
-/// every record for one relationship shares the same `from_table` — a wide
-/// reverse-relationship batch can touch many parent keys in one drain, so an
-/// uncached [`live_row_columns`] call per record would be a real per-record
-/// `pg_catalog` round trip this fix did not add before issue #248
-/// introduced the `row_columns` parameter [`from_side_rows_for_trigger_txn`]
-/// now needs. `table`'s column list cannot change mid-transaction (DDL on it
-/// would take a lock this transaction already holds something incompatible
-/// with, for any table this crate reads), so caching it for the lifetime of
-/// one Phase 3 transaction is sound.
-async fn cached_row_columns<'c>(
-    txn: &Transaction<'_>,
-    cache: &'c mut HashMap<String, Vec<String>>,
-    table: &str,
-) -> Result<&'c [String], ApplyError> {
-    if !cache.contains_key(table) {
-        let columns = live_row_columns(txn, table).await?;
-        cache.insert(table.to_string(), columns);
-    }
-    Ok(cache
-        .get(table)
-        .expect("just inserted if it wasn't already present"))
-}
-
 /// `to_jsonb(<alias>.*)`'s replacement (issue #248): an explicit
 /// `jsonb_build_object('<col>', <alias>."<col>"::text, ...)` over `columns`,
 /// so every value lands the same way an ordinary `<col>::text` cast would —
@@ -1182,2758 +996,10 @@ pub fn row_as_text_jsonb_sql(alias: &str, columns: &[String]) -> String {
     format!("jsonb_build_object({})", pairs.join(", "))
 }
 
-/// Issue #173 phase 3: what a to-side (parent) event implies about the
-/// from-side rows a relationship-propagation path must reprocess — the one
-/// shared decision every path that enumerates from-side rows in reaction to
-/// a to-side change is built to make by constructing one of these and driving its own
-/// enumeration off a `match` over it, rather than deciding independently
-/// (which is exactly how TRUNCATE's key-less sentinel got forgotten three
-/// times — #98, regressed by epic #127 and re-filed as #165, re-filed again
-/// as #168).
-///
-/// Deliberately just two variants, both closed, with no path in this module
-/// matching on it via a wildcard `_` arm: adding a third variant later is a
-/// compile error at every one of those match sites, forcing whoever adds it
-/// to decide what the new case means for each existing path instead of
-/// leaving a silent gap the way the pre-#173 per-path ad hoc key lookups
-/// could.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum ReverseTrigger<'a> {
-    /// One or more specific to-side `to_col` values changed, and every
-    /// from-side row whose `from_col` currently equals one of them must be
-    /// reprocessed — an ordinary to-side insert/update/delete. A single
-    /// to-side row change contributes its own old and/or new key; the
-    /// to-many reverse path's batched sweep across every to-side change one
-    /// `compute()` call folded contributes the whole set in one lookup.
-    Keys(&'a [String]),
-    /// The to-side table was `TRUNCATE`d (issue #98): the staged change
-    /// carries no image and no key, so there is no specific set of join-key
-    /// *values* to match against — the to-side table is now completely
-    /// empty. Every from-side row that still points at *something* must
-    /// therefore re-derive to `NULL`: there's no way to tell, after the
-    /// fact, which of those rows previously matched a real to-side row (and
-    /// so must newly go stale) versus already pointed at nothing (and so
-    /// were already `NULL`) — both converge to the same `NULL` result once
-    /// the to-side is empty, so both are recomputed rather than trying to
-    /// distinguish them.
-    WholeKeyspace,
-}
-
-/// The from-side keys a [`ReverseTrigger`] implies, live, in one round trip —
-/// [`ReverseTrigger::Keys`] matches `from_col` against the native-typed key
-/// array (issue #125: compared at `from_col`'s own type via
-/// [`key_column_pg_type`], falling back to the old `::text` comparison if
-/// the column can't be introspected; the relationship join-key convention is
-/// otherwise shared with the evaluator — exact for the integer/uuid/text
-/// keys relationships allow, numeric keys being rejected at definition
-/// time), under `super::ledger::ENTRY_PLAN_SETTINGS` in a short transaction
-/// when `from_col` has an index to read by and as the planner would have it
-/// when it doesn't ([`from_side_keys_read`], issue #972), while
-/// [`ReverseTrigger::WholeKeyspace`] instead selects every
-/// currently non-`NULL` `from_col` row, matching nothing about a specific
-/// value at all (see that variant's own doc comment for why). Returns
-/// `(from_pk_text, matched_join_text)`: `matched_join_text` is `Some` for a
-/// `Keys` trigger (so the reverse-recompute caller can map each matched
-/// from-side row back to the join value — hence the triggering related-row
-/// change's `hop_gen` — that pulled it in) and always `None` for
-/// `WholeKeyspace` (there is no single value a match is "against"; every
-/// caller of that arm assigns one flat hop to the whole result instead). A
-/// `NULL` `from_col` never matches either arm (SQL `NULL`, or the explicit
-/// `is not null` filter), exactly like the evaluator's LEFT JOIN no-match.
-///
-/// `from_pk` may be composite (issue #126): the returned `from_pk_text` is
-/// [`ddl::pk_key_sql_expr`]'s row identity, in the same U+001F-joined shape
-/// [`read_live_rows_batch`] later decodes it back with — `from_col` itself
-/// (the relationship's own join column) is always a single column regardless
-/// of the from-table's primary key arity, so its matching is unaffected.
-async fn from_side_keys(
-    pool: &Pool,
-    from_table: &str,
-    from_pk: &[PrimaryKeyColumn],
-    from_col: &str,
-    trigger: &ReverseTrigger<'_>,
-) -> Result<Vec<(String, Option<String>)>, ApplyError> {
-    match trigger {
-        ReverseTrigger::Keys(join_keys) => {
-            if join_keys.is_empty() {
-                return Ok(Vec::new());
-            }
-            let client = pool.get().await?;
-            let read = from_side_keys_read(&**client, from_table, from_pk, from_col).await?;
-            let rows = read.run(ReadConn::Pool(&client), join_keys).await?;
-            Ok(rows
-                .into_iter()
-                .map(|r| (r.get::<_, String>(0), Some(r.get::<_, String>(1))))
-                .collect())
-        }
-        ReverseTrigger::WholeKeyspace => {
-            let client = pool.get().await?;
-            let sql = format!(
-                "select {pk} from {tbl} where {col} is not null",
-                pk = ddl::pk_key_sql_expr(from_pk, None),
-                col = quote_ident(from_col),
-                tbl = ddl::qualified_source_table(from_table),
-            );
-            let rows = client.query(&sql, &[]).await?;
-            Ok(rows
-                .into_iter()
-                .map(|r| (r.get::<_, String>(0), None))
-                .collect())
-        }
-    }
-}
-
-/// [`from_side_keys`]'s [`ReverseTrigger::Keys`] read of `from_table`, as
-/// `from_col` is introspected now ([`key_column_in`]): an indexed `from_col`
-/// is read through its index, under the entry plan settings (issue #972), an
-/// unindexed one as the planner would have it.
-async fn from_side_keys_read(
-    client: &impl GenericClient,
-    from_table: &str,
-    from_pk: &[PrimaryKeyColumn],
-    from_col: &str,
-) -> Result<KeyBatchRead, ApplyError> {
-    let col_ident = quote_ident(from_col);
-    let key_column = key_column_in(client, from_table, from_col).await?;
-    let filter = key_array_filter(&col_ident, key_column.as_ref().map(|c| c.pg_type.as_str()));
-    Ok(KeyBatchRead {
-        sql: format!(
-            "select {pk}, {col_ident}::text \
-             from {tbl} \
-             where {filter}",
-            pk = ddl::pk_key_sql_expr(from_pk, None),
-            tbl = ddl::qualified_source_table(from_table),
-        ),
-        indexed: key_column.is_some_and(|c| c.indexed),
-    })
-}
-
-/// Resolves a batch's touched to-side join keys (`key_hops`'s keys, each
-/// mapped to the max `hop_gen` that touched it, with `key_src_changed`
-/// carrying the matching earliest `src_changed`) into `rel`'s from-side
-/// rows, and merges each one into `compute`'s shared `reverse_recomputes`
-/// accumulator at `hop + 1`.
-///
-/// Extracted from the to-many reverse branch so issue #244's image-less
-/// to-one trigger handling can reuse it verbatim rather than open-code a
-/// second, drifting copy — the two differ only in *which* changes they
-/// collect keys from, never in how a collected key becomes a from-side
-/// recompute. The accumulator's own `(from_table, from_key)` keying (issue
-/// #79's cross-relationship dedupe) and its `max`/`earliest_src_changed`
-/// merge rules are the shared part, so both callers get them for free.
-async fn accumulate_from_side_recomputes(
-    pool: &Pool,
-    rel: &crate::defs::RelationshipDefinition,
-    key_hops: &HashMap<String, i32>,
-    key_src_changed: &HashMap<String, Provenance>,
-    reverse_recomputes: &mut HashMap<(String, String), (i32, Provenance)>,
-    skip_frozen: FromSideFence<'_>,
-) -> Result<(), ApplyError> {
-    // Issue #267: this accumulator's entries become staged `src_table`s
-    // verbatim ([`apply_and_mark_drained_many`]'s step 4), so they carry the
-    // from-table's qualified identity — the spelling capture stages for this
-    // same from-side table (which, being a genuine source table, is normally
-    // captured), and the spelling the Phase 3
-    // `relationship_reverse_fallback` twin of this path has always used
-    // (`ReverseRelationshipShape::from_table` is already qualified). Two
-    // spellings of one table fold as two unrelated `(src_table, key)` groups,
-    // and a batch that upserts both hands Postgres the same conflict key
-    // twice (issue #267's live-lock). Issue #288: taken from the
-    // relationship's own recorded `from_schema`, not by re-resolving the
-    // bare `from_table` through this session's `search_path`, which could
-    // land on a same-named table in another schema — and the from-side
-    // reads below use it for the same reason.
-    accumulate_from_side_recomputes_on(
-        pool,
-        &rel.qualified_from_table(),
-        &rel.def.from_col,
-        key_hops,
-        key_src_changed,
-        reverse_recomputes,
-        skip_frozen,
-    )
-    .await
-}
-
-/// [`accumulate_from_side_recomputes`] for a relationship given by its
-/// qualified from-table and `from_col`, as a deferred reverse's
-/// [`ReverseRelationshipShape`] holds them (#784). `skip_frozen` is
-/// [`from_side_key`]'s.
-async fn accumulate_from_side_recomputes_on(
-    pool: &Pool,
-    qualified_from_table: &str,
-    from_col: &str,
-    key_hops: &HashMap<String, i32>,
-    key_src_changed: &HashMap<String, Provenance>,
-    reverse_recomputes: &mut HashMap<(String, String), (i32, Provenance)>,
-    skip_frozen: FromSideFence<'_>,
-) -> Result<(), ApplyError> {
-    if key_hops.is_empty() {
-        return Ok(());
-    }
-    let join_keys: Vec<String> = key_hops.keys().cloned().collect();
-    let Some(from_pk) = from_side_key(pool, qualified_from_table, skip_frozen).await? else {
-        return Ok(());
-    };
-    let matches = from_side_keys(
-        pool,
-        qualified_from_table,
-        &from_pk,
-        from_col,
-        &ReverseTrigger::Keys(&join_keys),
-    )
-    .await?;
-    for (from_key, join_text) in matches {
-        // `Keys` always reports which key matched — see `from_side_keys`'s
-        // own doc comment.
-        let join_text =
-            join_text.expect("ReverseTrigger::Keys always reports the matched join value");
-        let hop = key_hops.get(&join_text).copied().unwrap_or(0) + 1;
-        let (src_changed, origin_lsn) = key_src_changed
-            .get(&join_text)
-            .copied()
-            .unwrap_or((None, None));
-        reverse_recomputes
-            .entry((qualified_from_table.to_string(), from_key))
-            .and_modify(|(h, (sc, origin))| {
-                *h = (*h).max(hop);
-                *sc = earliest_src_changed(*sc, src_changed);
-                *origin = earliest_origin(*origin, origin_lsn);
-            })
-            .or_insert((hop, (src_changed, origin_lsn)));
-    }
-    Ok(())
-}
-
-/// One to-one relationship's settled-parent projection keys a batch's
-/// relationship resolution touched (issue #130, epic #127; plan doc §2's
-/// guard (b) precondition — "the generation must be bumped... so a reverse
-/// can detect that a forward apply landed in between"). [`build_relationship_context`]
-/// resolves this in Phase 2 (the same catalog read that finds the projection
-/// table to query), so Phase 3 ([`apply_and_mark_drained_many`]'s gen-bump
-/// step) needs no catalog/pool access of its own to apply it — the same
-/// "decide in Phase 2, apply in Phase 3" split the rest of [`ApplyPlan`]
-/// already uses.
-///
-/// **Issue #133 (closed the gap this comment used to describe):**
-/// `touched_keys` used to be derived only from the *folded* change's own
-/// old- and new-image join-key values — both folded endpoints (a re-point
-/// bumps both the old and new parent), never the pre-fold history. A parent
-/// erased by the fold within one batch (`ins(post 3)` + `repoint(3 -> 2)`
-/// folding to `new={post: 2}`, with post 3 appearing in neither folded
-/// endpoint) was invisible there too, so it never got bumped even though a
-/// child briefly pointed at it mid-batch — a reverse holding an enumeration
-/// captured before the re-point would then wrongly pass guard (b)'s check
-/// against post 3's `gen`.
-///
-/// [`build_relationship_context`] now unions in each touched change's own
-/// [`FoldedChange::group_key`] — the ring's real, pre-fold "every join-key
-/// value this row's raw change history touched" signal (see that field's
-/// and `staging::fold`'s doc comments for the union merge rule) — on top of
-/// the folded-endpoint values it already collected. That union is a strict
-/// superset of the old signal (an extra touched key only ever costs an
-/// UPDATE that matches zero rows — see the Phase 3 gen-bump step's own doc
-/// comment), so keeping both sources rather than replacing one with the
-/// other can only add coverage, never regress it, if `group_key` is ever
-/// unpopulated for some row (e.g. a table with no cached outbound
-/// relationship yet — see `intake::Intake`'s own doc comment on that
-/// cache's refresh-on-miss strategy).
-#[derive(Debug, Clone)]
-pub(crate) struct RelationshipGenBump {
-    /// [`projection_lock_statement`]'s statement for the projection, which
-    /// the page's pre-lock ([`lock_page_projection_rows`]) runs to lock the
-    /// rows in key order before the bump writes them.
-    lock_sql: String,
-    /// [`generation_bump_statement`]'s statement for the projection.
-    sql: String,
-    touched_keys: std::collections::HashSet<String>,
-}
-
-/// Builds the [`RelationshipContext`] a relationship-enriched from-side target
-/// needs to re-evaluate (issue #30 wiring of the #28/#29 evaluator): for each
-/// relationship the definition references, the related to-side rows keyed by
-/// their `to_col` text, plus the referenced to-side columns' types. Join keys
-/// are the distinct `from_col` values of the from-side rows this batch will
-/// evaluate — so only the related rows those rows actually need are fetched.
-/// `qualified_source` is the definition's own qualified source table
-/// ([`crate::defs::model::Definition::source_table`]) — a relationship's from-table,
-/// and the key its name is unique under (issue #288).
-///
-/// **Issue #130, epic #127**: a to-one relationship (`RelationshipCardinality::ToOne`)
-/// resolves against the settled parent projection (#129's
-/// `catalog::relationship_projection`), never a live read of the to-side —
-/// see this module's doc comment / plan doc §2 for why a live read
-/// double-counts the `δA⋈δB` cross term on the forward path. A to-many
-/// relationship is untouched: Phase 1 of this epic is to-one relationship
-/// *values* only (#94's shape), so `ToManyRelationship` still resolves via
-/// [`fetch_to_side_rows`]'s live read, exactly as before. The reads are
-/// [`RelationshipReads`], run here on a pooled connection and returned as
-/// well, so the page's Re-derives run them again under their entry lock
-/// ([`RederiveRelationships::Both`], issue #838).
-///
-/// `old_rows` is the same-length, same-index decoded pre-image of each of
-/// `rows`' underlying changes — used to widen the gen-bump touched-key set
-/// (see [`RelationshipGenBump`]'s doc comment) with each change's *old*
-/// join-key value.
-///
-/// `changes` is the same-length, same-index slice of [`FoldedChange`]s
-/// `rows`/`old_rows` were decoded from — issue #133's signal, read for its
-/// `group_key` (the real, pre-fold union of touched join keys; see that
-/// field's doc comment) and unioned into the same gen-bump touched-key set
-/// `old_rows` widens.
-pub(crate) async fn build_relationship_context(
-    pool: &Pool,
-    qualified_source: &str,
-    def: &TransformDef,
-    rows: &[Option<Row>],
-    old_rows: &[Option<Row>],
-    changes: &[&FoldedChange],
-) -> Result<
-    (
-        RelationshipReads,
-        RelationshipContext,
-        HashMap<i64, RelationshipGenBump>,
-    ),
-    ApplyError,
-> {
-    let reads = RelationshipReads::resolve(pool, qualified_source, def).await?;
-    // The join keys: the distinct non-NULL `from_col` values of the
-    // from-side rows this batch evaluates, so only the related rows those
-    // rows need are fetched.
-    //
-    // Issue #136: also `old_rows`' own `from_col` values, not just `rows`'
-    // (new-side) — a `KeySpace::OneToOne` caller never needed this (it only
-    // ever evaluates the *new* row, so the old parent's value is never
-    // read), but the forward aggregate delta path does: it must resolve a
-    // row's contribution under *both* its old and new relationship value
-    // when the row's own `from_col` itself changes within one folded update
-    // (a re-point), to subtract the old contribution and add the new one
-    // rather than silently treating the old side as "no match". Folding in
-    // an extra key here only ever costs fetching one more (unused)
-    // projection row for a `KeySpace::OneToOne` caller — never a
-    // correctness problem, per this function's own "spurious extra touched
-    // key" rule below.
-    let evaluated: Vec<&Row> = rows.iter().chain(old_rows.iter()).flatten().collect();
-    let ctx = {
-        let client = pool.get().await?;
-        reads.fetch(&client, &evaluated).await?
-    };
-
-    let mut gen_bumps: HashMap<i64, RelationshipGenBump> = HashMap::new();
-    for read in &reads.reads {
-        let ReadKind::ToOne(Some(projection)) = &read.kind else {
-            continue;
-        };
-        // #130's gen-bump signal, widened by #133 — see
-        // [`RelationshipGenBump`]'s doc comment. Three sources, all unioned
-        // (a spurious extra touched key only ever costs a zero-row `UPDATE`,
-        // never a correctness problem — see the Phase 3 gen-bump step's own
-        // doc comment): the folded endpoints (both folded new-side join keys
-        // just resolved above, and every change's own folded old-image
-        // `from_col` value — a re-point's *previous* parent, which the
-        // new-side scan never sees), plus #133's real pre-fold signal: every
-        // touched change's own `group_key` union, which is what still names
-        // a parent (like the plan doc's "post 3") the fold erased from
-        // *both* folded endpoints within this same batch.
-        let mut touched: std::collections::HashSet<String> =
-            read.join_keys(&evaluated).into_iter().collect();
-        for old_row in old_rows.iter().flatten() {
-            // Issue #677: a to-one's from-side images `from_col` (it is in
-            // its capture set), so an old image missing it is
-            // `MissingColumn`, not a parent silently left un-bumped.
-            if let Some(text) = required_column(old_row, &read.from_col, &read.name)? {
-                touched.insert(text.clone());
-            }
-        }
-        for change in changes {
-            if let Some(group_key) = &change.group_key {
-                touched.extend(group_key.iter().cloned());
-            }
-        }
-        if !touched.is_empty() {
-            gen_bumps
-                .entry(read.id)
-                .or_insert_with(|| RelationshipGenBump {
-                    lock_sql: projection.lock_sql.clone(),
-                    sql: projection.bump_sql.clone(),
-                    touched_keys: std::collections::HashSet::new(),
-                })
-                .touched_keys
-                .extend(touched);
-        }
-    }
-    Ok((reads, ctx, gen_bumps))
-}
-
-/// A relationship-enriched definition's reads of its related rows: each
-/// relationship it reads, resolved from the catalog once, with the
-/// statement that fetches the related rows for a set of join keys.
-/// [`Self::fetch`] runs them on any client. A page's Phase 2 runs them on a
-/// pooled connection for its Applies ([`build_relationship_context`]). A
-/// 1-1 Re-derive, a page's (issue #838) or a direct writer's
-/// ([`DirectRederive`], issue #832), runs them in its transaction, after its
-/// entry lock and its read of the rows ([`Self::fetch_under_lock`]).
-pub(crate) struct RelationshipReads {
-    reads: Vec<RelationshipRead>,
-}
-
-/// One relationship a definition reads ([`RelationshipReads`]).
-struct RelationshipRead {
-    /// `relationship_definitions.id`, which the gen bump is keyed by.
-    id: i64,
-    /// The relationship's name, which heads a `<rel>.<column>` path.
-    name: String,
-    /// The from-side column whose value is the join key.
-    from_col: String,
-    /// The referenced to-side columns' types.
-    to_columns: HashMap<String, ValueType>,
-    kind: ReadKind,
-}
-
-/// Where a [`RelationshipRead`]'s related rows come from.
-enum ReadKind {
-    /// A to-one relationship's settled parent projection (issue #130,
-    /// epic #127), never a live read of the to-side — see this module's doc
-    /// comment / plan doc §2 for why a live read double-counts the `δA⋈δB`
-    /// cross term on the forward path. `None` when the relationship has no
-    /// projection, which should be unreachable.
-    ToOne(Option<ProjectionRead>),
-    /// A to-many relationship's live to-side ([`to_side_rows_sql`]'s
-    /// statement): Phase 1 of epic #127 is to-one relationship *values*
-    /// only (#94's shape).
-    ToMany(KeyBatchRead),
-}
-
-/// A read of the rows a batch of keys reaches through a relationship's
-/// join column, and whether that column has an index to read them by: a
-/// to-many to-side's ([`ReadKind::ToMany`]), or a from-side's
-/// ([`from_side_keys_read`]).
-struct KeyBatchRead {
-    /// The statement, taking the keys as `$1`.
-    sql: String,
-    /// Whether the join column has an index to read by
-    /// ([`KeyColumn::indexed`]), as of the introspection. If it does, the
-    /// read runs under `super::ledger::ENTRY_PLAN_SETTINGS`
-    /// ([`ReadConn::query`]).
-    indexed: bool,
-}
-
-impl KeyBatchRead {
-    /// Runs the read for `keys` on `conn`, under the entry plan settings if
-    /// the join column is indexed: the one way its callers run it, so none
-    /// can drop the flag.
-    async fn run(
-        &self,
-        conn: ReadConn<'_, '_>,
-        keys: &[String],
-    ) -> Result<Vec<tokio_postgres::Row>, ApplyError> {
-        conn.query(&self.sql, &[&keys], self.indexed).await
-    }
-}
-
-/// A to-one relationship's projection read ([`ReadKind::ToOne`]).
-struct ProjectionRead {
-    /// [`projection_rows_statement`]'s statement.
-    sql: String,
-    /// [`projection_lock_statement`]'s statement for the projection.
-    lock_sql: String,
-    /// [`generation_bump_statement`]'s statement for the projection.
-    bump_sql: String,
-}
-
-impl RelationshipReads {
-    /// The reads of every relationship `def` references, on its source
-    /// `qualified_source` ([`crate::defs::model::Definition::source_table`]) — a
-    /// relationship's from-table, and the key its name is unique under
-    /// (issue #288). An unknown relationship is left out, and the evaluator
-    /// surfaces `EvalError::UnknownRelationship`, as the pure path does.
-    async fn resolve(
-        pool: &Pool,
-        qualified_source: &str,
-        def: &TransformDef,
-    ) -> Result<Self, ApplyError> {
-        // Group the referenced columns by relationship name (a relationship
-        // may be read for more than one column across the definition's
-        // fields).
-        let mut cols_by_rel: HashMap<String, Vec<String>> = HashMap::new();
-        for (rel, column) in eval::relationship_references(def) {
-            let cols = cols_by_rel.entry(rel).or_default();
-            if !cols.contains(&column) {
-                cols.push(column);
-            }
-        }
-        let mut reads = Vec::with_capacity(cols_by_rel.len());
-        for (rel_name, columns) in cols_by_rel {
-            let Some(reldef) =
-                catalog::relationship_on_source(pool, qualified_source, &rel_name).await?
-            else {
-                continue;
-            };
-            // Issue #372: the to-side the relationship was declared against,
-            // never the bare `to_table` re-resolved through this session's
-            // `search_path`. Unquoted (issue #561): the lookups below quote
-            // it for `to_regclass`, and the statements for interpolation.
-            let to_table = reldef.qualified_to_table();
-            let to_col = &reldef.def.to_col;
-            let to_columns = to_column_types(pool, &to_table, &columns).await?;
-            let kind = match reldef.cardinality {
-                RelationshipCardinality::ToOne => {
-                    match catalog::relationship_projection(pool, reldef.id).await? {
-                        Some(projection) => {
-                            // The projection's key column has `to_col`'s
-                            // type (see `projection_rows_sql`).
-                            let key_pg_type = key_column_pg_type(pool, &to_table, to_col).await?;
-                            ReadKind::ToOne(Some(ProjectionRead {
-                                sql: projection_rows_sql(
-                                    pool,
-                                    &projection,
-                                    to_col,
-                                    key_pg_type.as_deref(),
-                                )
-                                .await?,
-                                lock_sql: projection_lock_statement(
-                                    &projection.qualified_table(),
-                                    to_col,
-                                    key_pg_type.as_deref(),
-                                ),
-                                bump_sql: generation_bump_statement(
-                                    &projection.qualified_table(),
-                                    to_col,
-                                    key_pg_type.as_deref(),
-                                ),
-                            }))
-                        }
-                        None => {
-                            // Every to-one relationship gets a projection
-                            // unconditionally at `create_relationship` time
-                            // (#129's `ensure_relationship_projection_in_txn`)
-                            // — this should be unreachable. The resolve holds
-                            // no locks and can't assume the catalog is
-                            // self-consistent on that promise alone, so this
-                            // degrades to "nothing resolves" (an empty
-                            // to-side, same as a genuinely dangling join key)
-                            // rather than panicking.
-                            crate::instance_log::error!(
-                                relationship = %rel_name,
-                                from_table = %qualified_source,
-                                "to-one relationship has no settled parent projection; \
-                                 resolving as empty (should be unreachable — #129 creates \
-                                 one unconditionally)"
-                            );
-                            ReadKind::ToOne(None)
-                        }
-                    }
-                }
-                RelationshipCardinality::ToMany => {
-                    ReadKind::ToMany(to_side_rows_sql(pool, &to_table, to_col).await?)
-                }
-            };
-            reads.push(RelationshipRead {
-                id: reldef.id,
-                name: rel_name,
-                from_col: reldef.def.from_col.clone(),
-                to_columns,
-                kind,
-            });
-        }
-        Ok(Self { reads })
-    }
-
-    /// The related rows of `rows`, read on the pool client `client` (outside
-    /// any transaction), as the evaluator's context: for each relationship,
-    /// the to-side rows keyed by their `to_col` text that `rows`' join keys
-    /// reach.
-    ///
-    /// A to-one relationship's projection is read by its primary key, and a
-    /// to-many relationship's to-side by `to_col` when that column has an
-    /// index ([`KeyColumn::indexed`]), each in a short transaction under
-    /// `super::ledger::ENTRY_PLAN_SETTINGS` (no sequential scan, issue
-    /// #972). Without a usable index the setting could only cost the read
-    /// its parallel sequential scan (and, on PostgreSQL 16 and 17, a JIT
-    /// compile), so a to-many read of such a column runs as the planner
-    /// would have it.
-    pub(crate) async fn fetch(
-        &self,
-        client: &tokio_postgres::Client,
-        rows: &[&Row],
-    ) -> Result<RelationshipContext, ApplyError> {
-        self.fetch_with(ReadConn::Pool(client), rows).await
-    }
-
-    /// [`Self::fetch`] in a 1-1 Re-derive's transaction `txn`, under its
-    /// entry lock (issues #832 and #838). The reads that run under the
-    /// entry plan settings in [`Self::fetch`] (the projection by its primary
-    /// key, issue #835, and an indexed to-many `to_col`, issue #972) run
-    /// under them in `txn`, so a table whose statistics lag its size isn't
-    /// read in full while the entries stay locked.
-    pub(crate) async fn fetch_under_lock(
-        &self,
-        txn: &Transaction<'_>,
-        rows: &[&Row],
-    ) -> Result<RelationshipContext, ApplyError> {
-        self.fetch_with(ReadConn::Txn(txn), rows).await
-    }
-
-    /// [`Self::fetch`] on `conn`.
-    async fn fetch_with(
-        &self,
-        conn: ReadConn<'_, '_>,
-        rows: &[&Row],
-    ) -> Result<RelationshipContext, ApplyError> {
-        let mut by_name: HashMap<String, ToOneRelationship> = HashMap::new();
-        let mut to_many_by_name: HashMap<String, ToManyRelationship> = HashMap::new();
-        for read in &self.reads {
-            let join_keys = read.join_keys(rows);
-            match &read.kind {
-                ReadKind::ToOne(projection) => {
-                    let to_rows_by_key = match projection {
-                        Some(projection) => {
-                            fetch_relationship_projection_rows(conn, &projection.sql, &join_keys)
-                                .await?
-                        }
-                        None => HashMap::new(),
-                    };
-                    by_name.insert(
-                        read.name.clone(),
-                        ToOneRelationship {
-                            from_col: read.from_col.clone(),
-                            cardinality: RelationshipCardinality::ToOne,
-                            to_columns: read.to_columns.clone(),
-                            to_rows_by_key,
-                        },
-                    );
-                }
-                ReadKind::ToMany(to_side) => {
-                    let to_rows_by_key = fetch_to_side_rows(conn, to_side, &join_keys).await?;
-                    to_many_by_name.insert(
-                        read.name.clone(),
-                        ToManyRelationship {
-                            from_col: read.from_col.clone(),
-                            to_columns: read.to_columns.clone(),
-                            to_rows_by_key,
-                        },
-                    );
-                }
-            }
-        }
-        Ok(RelationshipContext::new(by_name).with_to_many(to_many_by_name))
-    }
-}
-
-/// Where a relationship read runs ([`RelationshipReads::fetch_with`]).
-#[derive(Clone, Copy)]
-enum ReadConn<'a, 'b> {
-    /// A pool client, outside any transaction.
-    Pool(&'a tokio_postgres::Client),
-    /// A Re-derive's transaction, under its entry lock.
-    Txn(&'a Transaction<'b>),
-}
-
-impl ReadConn<'_, '_> {
-    /// Runs the key-batch read `sql`. With `by_index`, under
-    /// `super::ledger::ENTRY_PLAN_SETTINGS`: in a short transaction of its
-    /// own on a pool client, or inside the transaction it is already in.
-    /// Without, as the planner would have it, outside any transaction of its
-    /// own.
-    async fn query(
-        self,
-        sql: &str,
-        params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
-        by_index: bool,
-    ) -> Result<Vec<tokio_postgres::Row>, ApplyError> {
-        Ok(match (self, by_index) {
-            (Self::Pool(client), true) => {
-                super::ledger::query_on_pool_by_entry_key(client, sql, params).await?
-            }
-            (Self::Txn(txn), true) => super::ledger::query_by_entry_key(txn, sql, params).await?,
-            (Self::Pool(client), false) => client.query(sql, params).await?,
-            (Self::Txn(txn), false) => txn.query(sql, params).await?,
-        })
-    }
-}
-
-impl RelationshipRead {
-    /// The distinct non-`NULL` `from_col` values of `rows`, in first-seen
-    /// order.
-    fn join_keys(&self, rows: &[&Row]) -> Vec<String> {
-        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        let mut join_keys = Vec::new();
-        for row in rows {
-            if let Some(Some(text)) = row.get(&self.from_col)
-                && seen.insert(text.as_str())
-            {
-                join_keys.push(text.clone());
-            }
-        }
-        join_keys
-    }
-}
-
-// ---------------------------------------------------------------------
-// Issue #131, epic #127: the to-one reverse delta
-// ---------------------------------------------------------------------
-//
-// Design summary (see the plan doc's §2 "Reverse" and §7 Phase 1 steps 4-5,
-// and this function's own call site in `compute`'s `inbound_rels` loop):
-//
-// A parent (to-side) change to a to-one relationship no longer stages an
-// image-less from-side `Recompute` per touched from-side row (the pre-#131,
-// still-current behavior for to-*many* relationships — see the branch in
-// `compute` below). Instead it builds one [`RelationshipReverseRecord`] per
-// touched parent key, carrying the parent's own old/new image (already
-// folded — see this struct's doc comment for why no new ring plumbing is
-// needed to get that), a `prev_lsn`/`prev_gen` pair read live off the
-// settled parent projection at Phase 2 capture time, and (issue #132) `X`,
-// the source's write frontier captured in that same round trip. Phase 3
-// ([`apply_and_mark_drained_many`]'s "3d" step, [`check_reverse_guards`])
-// re-validates all four of #132's guards — (a) the watermark barrier, (b)
-// the generation check, (c) the in-flight check, and (d) #131's own
-// `prev_lsn` ordering check, re-read under the same `FOR UPDATE` lock as
-// (b) — then advances the projection. When some definition on the from-table
-// reads the relationship, it also stages an image-less `Recompute` for every
-// from-side row the parent reaches, the same one any of #132's four guards
-// stages when it rejects a record. A 1-1 target re-reads the row; an
-// aggregate re-derives the row's ledger entry, reading the parent live, and
-// the entry already names the group the row was in (#623 D5, which deleted
-// #131's true-delta fast path).
-
-/// One to-one relationship's reverse-delta shape (issue #131): everything
-/// Phase 3 needs to apply a [`RelationshipReverseRecord`] for this
-/// relationship, resolved once per relationship per `compute()` call (Phase
-/// 2, which has a `pool`) and shared, via `Arc`, by every parent key this
-/// batch's fold touched for it — Phase 3 holds no `pool`, only `txn` (see
-/// [`apply_and_mark_drained_many`]'s own doc comment), so nothing here can
-/// be re-derived once Phase 3 starts.
-#[derive(Debug)]
-pub(crate) struct ReverseRelationshipShape {
-    /// `relationship_definitions.id` — issue #134's deferred-reverse
-    /// persistence needs this to build
-    /// [`append::StagedChange::RelationshipReverseDeferred`]'s synthetic
-    /// fold identity (`relationship_reverse_deferred_src_table`) and its own
-    /// `relationship_id` column, and to look this shape back up
-    /// (`catalog::relationship_by_id`) on a later drain without re-deriving
-    /// it from anything else persisted.
-    id: i64,
-    /// The relationship's declared name — what a from-side definition's
-    /// `<rel>.<column>` path reads.
-    name: String,
-    /// Empty (`String::new()`) in the should-be-unreachable case where this
-    /// relationship has no projection row at all (#129 creates one
-    /// unconditionally at `create_relationship` time) — Phase 3 treats that
-    /// the same as an ordering-check miss for every record carrying this
-    /// shape, the same defensive posture [`build_relationship_context`]
-    /// takes for the identical gap on the forward path.
-    qualified_projection: String,
-    /// The projection's bare (unquoted) table name — `qualified_projection`
-    /// is already quoted/schema-qualified for direct SQL interpolation, so
-    /// the projection-advance step needs this separately to introspect
-    /// `information_schema.columns` (issue #131's own write path: which
-    /// data columns to copy off the parent's new image).
-    projection_table_bare: String,
-    /// The schema `projection_table_bare` lives in (the instance's catalog
-    /// schema, issue #435) — bare, for the same `information_schema.columns`
-    /// introspection.
-    projection_schema: String,
-    to_col: String,
-    from_table: String,
-    from_col: String,
-    /// `from_col`'s type ([`key_column_pg_type`]), so the from-side read by
-    /// key ([`from_side_rows_for_trigger_txn`]) can use an index on it.
-    /// Resolved in Phase 3 by the first read that needs it.
-    from_key_pg_type: std::sync::OnceLock<Option<String>>,
-    /// The from-table's primary key, possibly composite (issue #126) — see
-    /// [`from_side_rows_for_trigger_txn`]'s doc comment for how a
-    /// multi-column key's row identity is encoded/decoded. `None` when it
-    /// can't be used and every definition reading the from-table is frozen
-    /// ([`from_side_key`], issue #768), or for a key release's shape, which
-    /// is never asked (#831): no recompute of its rows is staged.
-    from_pk: Option<Vec<PrimaryKeyColumn>>,
-    /// Whether some definition on `from_table` reads this relationship. Each
-    /// then re-derives every from-side row a parent change reaches: a 1-1
-    /// target re-reads the row, and an aggregate on the ledger reads the
-    /// parent live (#623 D5).
-    needs_recompute_fallback: bool,
-    /// The relationship's to-side, read by key for the live-row check
-    /// ([`superseded_to_side`]).
-    to_side: ToSide,
-}
-
-impl ReverseRelationshipShape {
-    /// The `where` condition matching the projection row whose key is `$1`
-    /// (text), the projection unaliased ([`ToSide::projection_key_filter`]).
-    async fn projection_key_filter(
-        &self,
-        client: &impl GenericClient,
-    ) -> Result<String, ApplyError> {
-        self.to_side
-            .projection_key_filter(client, &self.to_col, &quote_ident(&self.to_col))
-            .await
-    }
-}
-
-/// A relationship's to-side as Phase 3 reads its live row by key (issues
-/// #507, #531).
-#[derive(Debug)]
-struct ToSide {
-    /// The to-side table, quoted and qualified for direct interpolation.
-    table: String,
-    /// The to-side's unquoted `schema.table` identity, for catalog lookups
-    /// ([`ddl::regclass_arg`], issue #561).
-    identity: String,
-    /// Whether the to-side is one of this instance's own targets, fed to
-    /// the reverse path by the target-mutation seam (issue #507), so every
-    /// record on it takes the live-row check. A source to-side's record
-    /// takes it only at or below the relationship's refresh stamp (issue
-    /// #531, [`overtaken_by_refresh`]).
-    seam_fed: bool,
-    /// `to_col`'s type ([`key_column_pg_type`]), so the lookup by key can
-    /// use the to-side's own unique index on it, and the projection's key
-    /// (the same type) its primary key index. Resolved in Phase 3 by the
-    /// first statement that needs it, so a batch where none does never reads
-    /// it.
-    key_pg_type: std::sync::OnceLock<Option<String>>,
-}
-
-impl ToSide {
-    /// `to_col`'s type, read once and kept.
-    async fn key_pg_type(
-        &self,
-        client: &impl GenericClient,
-        to_col: &str,
-    ) -> Result<Option<&str>, ApplyError> {
-        cached_key_pg_type(&self.key_pg_type, client, &self.identity, to_col).await
-    }
-
-    /// The `where` condition matching the to-side row whose `to_col` is
-    /// `$1` (text), aliased `t`.
-    async fn key_filter(&self, txn: &Transaction<'_>, to_col: &str) -> Result<String, ApplyError> {
-        let key_pg_type = self.key_pg_type(txn, to_col).await?;
-        Ok(single_key_filter(
-            &format!("t.{}", quote_ident(to_col)),
-            key_pg_type,
-        ))
-    }
-
-    /// The `where` condition matching the projection row whose key is `$1`
-    /// (text), the projection's key column referenced as `col_ref`: compared
-    /// at `to_col`'s type, which the projection's key column has, so the
-    /// projection's primary key index serves it (issue #835).
-    async fn projection_key_filter(
-        &self,
-        client: &impl GenericClient,
-        to_col: &str,
-        col_ref: &str,
-    ) -> Result<String, ApplyError> {
-        let key_pg_type = self.key_pg_type(client, to_col).await?;
-        Ok(single_key_filter(col_ref, key_pg_type))
-    }
-}
-
-/// One to-one relationship's parent-keyed reverse record (issue #131),
-/// built in `compute()` (Phase 2) from one already-folded [`FoldedChange`]
-/// on the relationship's own `to_table`, applied in Phase 3.
-///
-/// **No new ring/staging-kind plumbing was needed to get *this* far** — a
-/// deliberate, documented deviation from issue #131's own "what to actually
-/// do" checklist, which speculated a new [`StagedChange`] variant might be
-/// needed. It wasn't, for #131: the parent's own CDC rows are *already*
-/// folded, generically, by the existing [`fold::fold`]/
-/// [`fold::merge_folded_changes`] (any table's raw CDC rows for one key
-/// collapse to one [`FoldedChange`] — first old image, last new image,
-/// `lsn` the group's `GREATEST` — before `compute()` ever sees them), so "N
-/// parent changes for the same key in one batch fold to one record" falls
-/// out of machinery that already exists, for free, the same way it already
-/// does for every other table. The only genuinely new datum was `prev_lsn`,
-/// which #131's own derivation (confirmed against
-/// `ddl::PROJECTION_LSN_COLUMN`'s doc comment, written for #129/#130 ahead
-/// of #131 landing) is a **live read of the projection, taken once in
-/// Phase 2**, not something that needs to ride along a raw ring row.
-///
-/// Issue #134 *does* add a real persisted staging kind —
-/// [`StagedChange::RelationshipReverseDeferred`], its own `retry_count`
-/// field on this struct below, and `compute()`'s dedicated deferred-
-/// reconstruction loop (right after the by-source loop) — but only for the
-/// narrower case #131 deliberately deferred: a record that issue #132's
-/// guards *rejected* needs to be retried later without burning `hop_gen`,
-/// which does need to survive across a drain, unlike `prev_lsn`
-/// (re-derived live, same as #131 always did) or `prev_gen`/`watermark`
-/// (#132's additions, re-derived live the same way on a #134 retry —
-/// see [`StagedChange::RelationshipReverseDeferred`]'s own doc comment for
-/// why replaying either stale would be unsound). A record built fresh from
-/// raw CDC (this struct's other construction site) still needs no new ring
-/// plumbing at all, exactly as #131 established; only a *deferred* one
-/// does.
-///
-/// **Issue #132's additions** (guards (a)/(b), alongside #131's own
-/// `prev_lsn` for guard (d)): `prev_gen` and `watermark` are captured in the
-/// exact same Phase 2 round trip as `prev_lsn` (see
-/// [`capture_reverse_guard_state`]) rather than as separate reads — the
-/// issue's own "capture X in the same statement as the enumeration"
-/// requirement for guard (a), and the natural place to also capture guard
-/// (b)'s `gen` alongside guard (d)'s `lsn`, since both come off the exact
-/// same projection row.
-#[derive(Debug, Clone)]
-pub(crate) struct RelationshipReverseRecord {
-    shape: Arc<ReverseRelationshipShape>,
-    /// The parent's decoded pre-image row, or `None` for a parent INSERT.
-    old_row: Option<Row>,
-    /// The parent's decoded post-image row, or `None` for a parent DELETE.
-    new_row: Option<Row>,
-    /// The parent's raw pre-image JSON text (unparsed), mirroring
-    /// `new_image` below — `old_row`'s own decode source. Unlike
-    /// `new_image`, nothing in the pre-#134 apply path ever needed this
-    /// text form (the projection's delete half only needs `old_row`'s
-    /// *key*), so it went unstored until issue #134: a guard-rejected
-    /// record now needs to persist it verbatim into
-    /// [`append::StagedChange::RelationshipReverseDeferred::old_image`]
-    /// without re-serializing `old_row`.
-    old_image: Option<String>,
-    /// The parent's raw post-image JSON text (unparsed) — used by the
-    /// projection's own UPSERT, which leans on Postgres's
-    /// `jsonb_populate_record` to coerce JSON into the projection's real
-    /// column types rather than this crate re-deriving a per-column cast,
-    /// and (issue #134) by the guard-rejection deferral path for the same
-    /// reason `old_image` above is now stored.
-    new_image: Option<String>,
-    /// The folded change's own `GREATEST` `lsn` — this record's own
-    /// identity in the projection's LSN chain once it applies.
-    lsn: Option<PgLsn>,
-    /// The projection's `__trellis_lsn` as read live, in Phase 2, for
-    /// whichever of `old_row`/`new_row`'s key was available (preferring the
-    /// old key, the pre-this-batch identity) — see this struct's own doc
-    /// comment and [`ddl::PROJECTION_LSN_COLUMN`]'s for the chain this
-    /// forms. `None` when no projection row existed yet to read (a parent
-    /// INSERT, or the should-be-unreachable missing-projection case) —
-    /// Phase 3 treats that as "nothing to conflict with," not a miss.
-    ///
-    /// Guard (d) (#131's original stopgap, formalized as one of #132's four
-    /// guards): Phase 3 re-reads this same column under `FOR UPDATE` and
-    /// requires it still equal `prev_lsn` before applying.
-    prev_lsn: Option<PgLsn>,
-    /// Issue #132 guard (b): the projection row's [`ddl::PROJECTION_GEN_COLUMN`]
-    /// as read live, in Phase 2, alongside `prev_lsn` above (same query, same
-    /// row, same "taken once in Phase 2" shape) — `None` under the identical
-    /// conditions `prev_lsn` is `None` (no projection row yet). Phase 3
-    /// re-reads it under the same `FOR UPDATE` lock `prev_lsn`'s re-check
-    /// uses and requires it unchanged: a forward apply that resolved this
-    /// parent through the projection between Phase 2's capture and Phase 3's
-    /// apply bumps this column (`apply_and_mark_drained_many`'s "3c" step),
-    /// so a mismatch here means this reverse's enumeration may no longer
-    /// equal the parent's *applied* value.
-    prev_gen: Option<i64>,
-    /// Issue #132 guard (a): `X`, "the source's write frontier," captured in
-    /// the same Phase 2 statement as `prev_lsn`/`prev_gen` above (via
-    /// `pg_current_wal_insert_lsn()` against the same connection). Phase 3
-    /// must not apply this record until [`StagedWatermark::get`] reports
-    /// everything committed at or before this value is staged (always, under
-    /// trigger capture). Guard (c) also bounds its in-flight check by it, and
-    /// there a lower value is the unsafe direction: it would miss a committed
-    /// change's pending ring rows, which is why this is the insert position
-    /// and not the write position (issue #697).
-    watermark: PgLsn,
-    hop_gen: i32,
-    src_changed: Option<std::time::SystemTime>,
-    /// The parent change's origin (issue #469), carried to every row this
-    /// record stages, as `src_changed` is.
-    origin_lsn: Option<PgLsn>,
-    /// Issue #134: how many times this exact reverse (same relationship,
-    /// same parent key, same underlying transition) has already been
-    /// deferred by a guard rejection — `0` for a record built fresh from
-    /// raw parent CDC, or the persisted
-    /// [`append::StagedChange::RelationshipReverseDeferred::retry_count`]
-    /// for one reconstructed from a previously-deferred ring row. Never
-    /// derived from, or folded into, `hop_gen` above — see that field's own
-    /// migration/doc comment for why the two must stay independent.
-    retry_count: i32,
-}
-
-/// Issue #134: the synthetic `src_table` every
-/// [`append::StagedChange::RelationshipReverseDeferred`] for relationship
-/// `relationship_id` is staged under — see that variant's own doc comment
-/// for why it must be distinct from the relationship's real `to_table` (so
-/// this op's rows never fold, at the SQL fold's `(src_table, key)` grouping,
-/// with genuine CDC on the parent's real table, which would let them reach
-/// the ordinary per-source forward-evaluation loop and double-apply an
-/// already-forward-applied delta) and distinct *per relationship* (so two
-/// different relationships pointing at keys that happen to share text never
-/// fold together either). Prefixed with U+001F (INFORMATION SEPARATOR ONE),
-/// the same "no real qualified table name contains this" assumption
-/// [`append::TRUNCATE_SENTINEL_KEY`] already relies on — a real
-/// `information_schema`-qualified table name can't contain it.
-pub(crate) fn relationship_reverse_deferred_src_table(relationship_id: i64) -> String {
-    format!("\u{1f}trellis-rel-reverse-deferred:{relationship_id}")
-}
-
-/// Builds `rel`'s [`ReverseRelationshipShape`] (issue #131) — the one-time,
-/// per-relationship, per-`compute()`-call catalog resolution every parent
-/// key this batch's fold touches for `rel` shares (see
-/// [`RelationshipReverseRecord`]'s doc comment).
-///
-/// `needs_recompute_fallback` is set when any definition on the from-table
-/// reads the relationship; every such definition, 1-1 or aggregate, then
-/// re-derives each from-side row the parent reaches (#623 D5).
-///
-/// `from_side` is the page's fence, under which the from-side's key is
-/// resolved ([`from_side_key`]). A key release passes `None`: it writes only
-/// the projection and stages no recompute of the from-side's rows, so it
-/// resolves no key and leaves `from_pk` unset (#831).
-async fn build_reverse_relationship_shape(
-    pool: &Pool,
-    rel: &RelationshipDefinition,
-    from_side: Option<FromSideFence<'_>>,
-) -> Result<ReverseRelationshipShape, ApplyError> {
-    let projection = catalog::relationship_projection(pool, rel.id).await?;
-    let (qualified_projection, projection_schema, projection_table_bare) = match projection {
-        Some(p) => (p.qualified_table(), p.projection_schema, p.projection_table),
-        None => {
-            crate::instance_log::error!(
-                relationship = %rel.def.name,
-                to_table = %rel.qualified_to_table(),
-                "to-one relationship has no settled parent projection; every \
-                 reverse record for it will be treated as an ordering-check \
-                 miss (should be unreachable — #129 creates one unconditionally)"
-            );
-            (String::new(), String::new(), String::new())
-        }
-    };
-    // `transforms_for_source` matches `schema_nodes.table_name` exactly
-    // (ADR-0011's fully-qualified keying) and every SQL-emitting site below
-    // (`from_side_rows_for_trigger_txn`'s `ddl::qualified_source_table`) documents the same requirement, so this
-    // shape stores the qualified form of `from_table` throughout — the
-    // relationship's own recorded one (issue #288), never `rel.def.from_table`
-    // re-resolved through this session's `search_path`.
-    let qualified_from_table = rel.qualified_from_table();
-    let from_pk = match from_side {
-        Some(fence) => from_side_key(pool, &qualified_from_table, fence).await?,
-        None => None,
-    };
-    let defs = catalog::transforms_for_source(pool, &qualified_from_table).await?;
-
-    let needs_recompute_fallback = defs.iter().any(|def| {
-        eval::relationship_references(&def.def)
-            .iter()
-            .any(|(name, _)| name == &rel.def.name)
-    });
-    let qualified_to_table = rel.qualified_to_table();
-    let seam_fed = {
-        let client = pool.get().await?;
-        catalog::is_definition_target(&**client, &qualified_to_table).await?
-    };
-    let to_side = ToSide {
-        table: ddl::qualified_source_table(&qualified_to_table),
-        identity: qualified_to_table,
-        seam_fed,
-        key_pg_type: std::sync::OnceLock::new(),
-    };
-
-    Ok(ReverseRelationshipShape {
-        id: rel.id,
-        name: rel.def.name.clone(),
-        qualified_projection,
-        projection_table_bare,
-        projection_schema,
-        to_col: rel.def.to_col.clone(),
-        from_table: qualified_from_table,
-        from_col: rel.def.from_col.clone(),
-        from_key_pg_type: std::sync::OnceLock::new(),
-        from_pk,
-        needs_recompute_fallback,
-        to_side,
-    })
-}
-
-/// The `to_col` text value off `row`, or `None` if `row` is absent or its
-/// `to_col` is SQL `NULL` ("no key here" for join purposes). A present `row`
-/// missing `to_col` entirely is [`EvalError::MissingColumn`] against
-/// relationship `rel_name` (issue #677, see
-/// [`required_column`]): `row` is the to-side change's own
-/// image, and the join key is always part of it: `to_col` is in the
-/// to-side's capture set, and a capture trigger images the whole row, an
-/// unchanged TOASTed value included.
-fn relationship_key_text(
-    row: &Option<Row>,
-    to_col: &str,
-    rel_name: &str,
-) -> Result<Option<String>, EvalError> {
-    match row {
-        Some(row) => Ok(required_column(row, to_col, rel_name)?.cloned()),
-        None => Ok(None),
-    }
-}
-
-/// [`relationship_key_text`] off the old image, falling back to the new one
-/// when the old image is absent or its key is `NULL` — the key a to-one
-/// reverse record's guard state is captured under.
-fn relationship_read_key(
-    old_row: &Option<Row>,
-    new_row: &Option<Row>,
-    to_col: &str,
-    rel_name: &str,
-) -> Result<Option<String>, EvalError> {
-    match relationship_key_text(old_row, to_col, rel_name)? {
-        Some(key) => Ok(Some(key)),
-        None => relationship_key_text(new_row, to_col, rel_name),
-    }
-}
-
-/// The Phase 2 capture behind three of #132's four guards — [`prev_lsn`],
-/// [`prev_gen`], and [`watermark`] (guard (d)'s ordering check, guard (b)'s
-/// generation check, and guard (a)'s watermark barrier, respectively; see
-/// [`RelationshipReverseRecord`]'s doc comment for each field's role in
-/// Phase 3).
-///
-/// [`prev_lsn`]: ReverseCapture::prev_lsn
-/// [`prev_gen`]: ReverseCapture::prev_gen
-/// [`watermark`]: ReverseCapture::watermark
-struct ReverseCapture {
-    prev_lsn: Option<PgLsn>,
-    prev_gen: Option<i64>,
-    watermark: PgLsn,
-}
-
-/// Live-reads the settled parent projection's current
-/// [`ddl::PROJECTION_LSN_COLUMN`]/[`ddl::PROJECTION_GEN_COLUMN`] for `key`,
-/// **and** captures guard (a)'s `X` — `pg_current_wal_insert_lsn()`, "the
-/// source's write frontier" — in the very same statement, not as a separate
-/// round trip. The insert position, not `pg_current_wal_lsn()`'s write
-/// position (issue #697): a change committed with `synchronous_commit = off`
-/// is visible to the live reads guard (c) protects before its WAL is written,
-/// and its ring rows' `lsn` (an insert position) can be above the write
-/// position, so guard (c) would not see it pending. A plain, unlocked read taken once in
-/// Phase 2; Phase 3 (`apply_and_mark_drained_many`'s "3d" step,
-/// `check_reverse_guards`) re-validates `prev_lsn`/`prev_gen` under `FOR
-/// UPDATE` and re-checks the watermark against the live
-/// [`StagedWatermark`].
-///
-/// `prev_lsn`/`prev_gen` are both `None` when `qualified_projection` is
-/// empty (the should-be-unreachable no-projection case), `key` is `None`
-/// (defensive — every record reaching this point has at least one of
-/// old/new key, per `compute`'s own "both images absent" skip, but this
-/// function does not assume that), or no projection row exists yet for
-/// `key` (a parent that's about to be INSERTed) — in every such case this
-/// still issues a bare `select pg_current_wal_insert_lsn()` so `watermark` is
-/// always populated: guard (a) applies to every reverse record, including a
-/// parent insert, not only ones with an existing projection row.
-async fn capture_reverse_guard_state(
-    pool: &Pool,
-    shape: &ReverseRelationshipShape,
-    key: Option<&str>,
-) -> Result<ReverseCapture, ApplyError> {
-    let client = pool.get().await?;
-    if let (Some(key), false) = (key, shape.qualified_projection.is_empty()) {
-        let lsn_ident = quote_ident(ddl::PROJECTION_LSN_COLUMN);
-        let gen_ident = quote_ident(ddl::PROJECTION_GEN_COLUMN);
-        let filter = shape.projection_key_filter(&**client).await?;
-        let row = client
-            .query_opt(
-                &format!(
-                    "select {lsn_ident}, {gen_ident}, pg_current_wal_insert_lsn() \
-                     from {} where {filter}",
-                    shape.qualified_projection,
-                ),
-                &[&key],
-            )
-            .await?;
-        if let Some(row) = row {
-            return Ok(ReverseCapture {
-                prev_lsn: row.get(0),
-                prev_gen: row.get(1),
-                watermark: row.get(2),
-            });
-        }
-    }
-    let row = client
-        .query_one("select pg_current_wal_insert_lsn()", &[])
-        .await?;
-    Ok(ReverseCapture {
-        prev_lsn: None,
-        prev_gen: None,
-        watermark: row.get(0),
-    })
-}
-
-// ---------------------------------------------------------------------
-// Issue #131, epic #127: Phase 3 helpers for the reverse-delta apply
-// ---------------------------------------------------------------------
-
-/// Live-enumerates `from_table`'s rows a [`ReverseTrigger`] matches, full row
-/// images, inside the already-locked Phase 3 transaction —
-/// [`apply_and_mark_drained_many`]'s "3d" step's from-side enumeration, used
-/// by the reverse fallback ([`stage_reverse_recompute_fallback`]).
-///
-/// **This reads live state** — safe only because [`check_reverse_guards`]
-/// (issue #132) has already run, immediately before every call site below,
-/// and proven the live state *equals* the applied one for the specific
-/// join key(s) this call is about to read: guard (a) (the watermark
-/// barrier) plus guard (c) (the in-flight check) together prove nothing
-/// committed at or before this record's captured `X` is still mid-flight
-/// for these keys, and guards (b)/(d) prove no forward apply or
-/// out-of-order sibling reverse landed between Phase 2's enumeration and
-/// this transaction's lock. Before #132, this doc comment flagged that gap
-/// as open; it is now closed by every caller's own guard check, not by
-/// anything in this function itself — this function still does nothing on
-/// its own to enforce it, so a *new* caller added later must run the guard
-/// check first too.
-///
-/// [`ReverseTrigger::Keys`] is looped one join key at a time — the exact
-/// per-key round trip both callers below already made before issue #173
-/// phase 3 folded their own loops into this function; a caller passing both
-/// an old and new key that happen to be equal still issues one query per
-/// slice entry, unchanged from before (the caller's own `seen_keys` dedup is
-/// what collapses the resulting duplicate rows, exactly as it always has).
-///
-/// `row_columns` is `from_table`'s live column list (issue #248's
-/// `row_as_text_jsonb_sql` needs it in place of `to_jsonb(t.*)` — see that
-/// function's doc comment), **resolved by the caller, not here**: this
-/// function is called once per distinct touched parent key in Phase 3's own
-/// `for record in &plan.relationship_reverses` loop
-/// (`apply_and_mark_drained_many`'s "3d" step, via
-/// [`stage_reverse_recompute_fallback`]), and `from_table` is invariant across many
-/// records sharing one relationship — introspecting it fresh on every call
-/// would be a real per-record `pg_catalog` round trip on a path that already
-/// fans out with wide reverse-relationship batches (a regression this fix
-/// did not have before issue #248 introduced this parameter). The caller
-/// resolves it once per distinct `from_table`, cached across that whole
-/// loop, and passes the same slice into every call.
-/// [`ReverseTrigger::WholeKeyspace`] is unreachable here, for two independent
-/// reasons. Structurally: both call sites construct [`ReverseTrigger::Keys`]
-/// inline from a single join key they already hold, and no function in this
-/// module takes a `ReverseTrigger` and forwards one, so no dynamically-chosen
-/// variant can arrive here at all. Semantically: a `TRUNCATE`'s key-less
-/// sentinel never has an image to build a [`RelationshipReverseRecord`] from
-/// in the first place (see that struct's own construction site, and
-/// `ReverseTrigger`'s doc comment), so neither caller — both exclusively fed
-/// by `RelationshipReverseRecord`s — would have one to pass even if the
-/// plumbing allowed it.
-///
-/// It is nonetheless a typed [`ApplyError::ReverseTriggerNotResolvable`]
-/// rather than a panic, per this module's own convention of not trusting
-/// invariants it cannot enforce itself (the same reasoning
-/// [`ApplyError::Validate`] and [`ApplyError::Backfill`] document) — and
-/// pointedly because the paragraph above already concedes this function does
-/// nothing to enforce its own preconditions against a *new* caller added
-/// later. A future path that legitimately needs to resolve a `WholeKeyspace`
-/// trigger against live, transactional full row images must implement and
-/// test that arm for real; it must not be silently satisfied by a
-/// `Keys`-shaped read, and it must not abort the drain worker either.
-async fn from_side_rows_for_trigger_txn(
-    txn: &Transaction<'_>,
-    from_table: &str,
-    from_col: &str,
-    from_key_pg_type: Option<&str>,
-    from_pk: &[PrimaryKeyColumn],
-    trigger: &ReverseTrigger<'_>,
-    row_columns: &[String],
-) -> Result<Vec<(String, Row)>, ApplyError> {
-    let join_keys: &[String] = match trigger {
-        ReverseTrigger::Keys(join_keys) => join_keys,
-        ReverseTrigger::WholeKeyspace => {
-            return Err(ApplyError::ReverseTriggerNotResolvable {
-                from_table: from_table.to_string(),
-            });
-        }
-    };
-    if join_keys.is_empty() {
-        return Ok(Vec::new());
-    }
-    // Issue #248: an explicit per-column `jsonb_build_object`, not
-    // `to_jsonb(t.*)` — see `row_as_text_jsonb_sql`'s doc comment.
-    // `row_columns` arrives pre-resolved (see this function's own doc
-    // comment on why it isn't introspected here).
-    let doc_expr = row_as_text_jsonb_sql("t", row_columns);
-    let filter = single_key_filter(&format!("t.{}", quote_ident(from_col)), from_key_pg_type);
-    let mut rows: HashMap<String, Row> = HashMap::new();
-    for join_key in join_keys {
-        let sql = format!(
-            "select m.k, e.key, e.value \
-             from (select {pk} as k, {doc_expr} as doc from {tbl} t \
-                   where {filter}) m \
-             cross join lateral jsonb_each_text(m.doc) e",
-            pk = ddl::pk_key_sql_expr(from_pk, Some("t")),
-            tbl = ddl::qualified_source_table(from_table),
-        );
-        let db_rows = txn.query(&sql, &[join_key]).await?;
-        for db_row in db_rows {
-            let key: String = db_row.get(0);
-            let field: String = db_row.get(1);
-            let value: Option<String> = db_row.get(2);
-            rows.entry(key).or_default().insert(field, value);
-        }
-    }
-    Ok(rows.into_iter().collect())
-}
-
-// ---------------------------------------------------------------------
-// Issue #132, epic #127: the four guards
-// ---------------------------------------------------------------------
-//
-// See the plan doc's §2 guard table and this module's own "Issue #131,
-// epic #127" section above for the mechanism these formalize. All four are
-// checked together, in [`check_reverse_guards`], as one Phase 3 step per
-// [`RelationshipReverseRecord`] — a failure on any one of them gets the
-// exact same treatment: no target/projection write for this record, defer
-// and re-stage it as a [`StagedChange::RelationshipReverseDeferred`] for a
-// later drain to retry (issue #134) — see that variant's own doc comment,
-// and the guard-rejection branch of `apply_and_mark_drained_many`'s "3d"
-// step, for the mechanism. Before #134 landed, every rejection fell back to
-// re-staging its from-side rows as an image-less `Recompute` at
-// `hop_gen + 1` instead (the same stopgap #131 shipped for guard (d) alone,
-// then shared by all four for #132/#133) — replaced outright, not kept as
-// a fallback of its own.
-
-/// Which of #132's four guards rejected a [`RelationshipReverseRecord`] —
-/// carried only as far as the `tracing::warn!` in
-/// [`apply_and_mark_drained_many`]'s "3d" step; every rejection gets
-/// identical treatment downstream (the Recompute-fallback stopgap), so nothing
-/// else branches on which variant fired. A typed enum rather than a bare
-/// `&'static str` purely so a future metrics/observability pass (the plan
-/// doc's Phase 1 step 7 flags exactly this need — "the deferral counters
-/// should become engine metrics") has something to match on without
-/// re-parsing a log message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ReverseGuardFailure {
-    /// Guard (a): the ring does not yet hold everything committed at or
-    /// before this record's captured watermark `X`.
-    Watermark,
-    /// Guard (b): the projection row's `__trellis_gen` moved since Phase 2's
-    /// capture — a forward apply landed in between.
-    Generation,
-    /// Guard (c): a staged from-side change for this parent's old/new join
-    /// key, committed at or before `X`, is still undrained.
-    InFlight,
-    /// Guard (d): the projection row's `__trellis_lsn` no longer matches
-    /// this record's `prev_lsn` — an out-of-order sibling reverse (or this
-    /// same one, replayed) already advanced it, or moved it out from under
-    /// this one.
-    Ordering,
-}
-
-impl fmt::Display for ReverseGuardFailure {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = match self {
-            ReverseGuardFailure::Watermark => "watermark barrier (guard a)",
-            ReverseGuardFailure::Generation => "generation check (guard b)",
-            ReverseGuardFailure::InFlight => "in-flight check (guard c)",
-            ReverseGuardFailure::Ordering => "per-parent ordering (guard d)",
-        };
-        f.write_str(s)
-    }
-}
-
-impl ReverseGuardFailure {
-    /// The [`crate::metrics::increment_relationship_reverse_deferred`]
-    /// label this guard's rejection records under (issue #134/#135) — the
-    /// plan doc's own `d5_block_*` names (§7 step 7's "the deferral
-    /// counters (`d5_block_*`) should become engine metrics"), used
-    /// verbatim as label *values* on one counter rather than as four
-    /// separate metric names, matching this crate's existing
-    /// one-metric-plus-label convention (`transform`, `state`, ...).
-    pub(crate) fn metric_label(self) -> &'static str {
-        match self {
-            ReverseGuardFailure::Watermark => "d5_block_barrier",
-            ReverseGuardFailure::Generation => "d5_block_gen",
-            ReverseGuardFailure::InFlight => "d5_block_inflight",
-            ReverseGuardFailure::Ordering => "d5_block_order",
-        }
-    }
-}
-
-/// Guard (c) (plan doc §2; the guard measured to do most of the correctness
-/// work, 1174/3000 ablation runs corrupted without it): "is there a staged
-/// change on `from_table`, matching any of `keys` via `from_col` against
-/// either its `old_image` or `new_image`, staged (`lsn`) at or before
-/// `watermark_x`, that hasn't drained yet?"
-///
-/// "Hasn't drained yet" mirrors [`converge::converged_through`]'s own
-/// condition 3 (a row is pending if its owning segment's `state <>
-/// 'drained'`, or — the straggler case — the segment *is* `'drained'` but
-/// this particular row landed after that segment's own fence snapshot was
-/// captured, so the segment's completion never actually scanned it): scoped
-/// here to one `src_table`/join-key/`lsn` predicate instead of
-/// `converged_through`'s whole-token one, and, unlike that predicate, this
-/// one has no need to special-case the *active* slot for query-plan reasons
-/// — every physical ring row this predicate can even match already carries
-/// a concrete `lsn <= watermark_x`, so a plain per-table `exists` (rather
-/// than `converged_through`'s `min(origin_lsn)` optimization for the
-/// continuously-growing active slot) is cheap regardless of which slot is
-/// active. The active slot's own `segments` row always has `state =
-/// 'active'`, which is `<> 'drained'`, so it falls out of the same `exists`
-/// clause with no separate arm needed.
-///
-/// Only `op in ('insert', 'update', 'delete')` rows can match at all — a
-/// `Recompute` row carries no images (`old_image`/`new_image` both `NULL`,
-/// so `->> from_col` is `NULL` either way) and a `Truncate` row is
-/// key-less — so the explicit `op` filter is redundant with that but kept
-/// for readability. Deliberately does not special-case a `Truncate` on
-/// `from_table` itself (out of scope for this issue — see the module's own
-/// "what to actually do" list's to-many/`rel_joins` exclusion, and no
-/// existing test exercises a to-one relationship's from-side table being
-/// truncated mid-flight).
-///
-/// **Pre-commit positions (issues #402, #622).** No ring row's `lsn` is its
-/// writer's commit: the capture trigger stamps `pg_current_wal_insert_lsn()`
-/// inside the writer's transaction, and the target-mutation seam stamps a
-/// token its writer reads before committing. So guard (a)'s old premise,
-/// "once the ring holds everything through `X`, every change at or below `X`
-/// is in the ring", does not hold: a row at or below `X` can belong to a
-/// writer that has not committed, and this scan can't see it. The check is
-/// still no weaker than it was against intake's commit positions. A
-/// pre-commit position is below its writer's commit, so a write that
-/// committed at or below `X` has a row at or below `X` too, and a writer that
-/// committed before this scan committed its row with it. A row this scan
-/// can't see belongs to a writer that commits after the scan, so after `X`
-/// was captured: its commit position would have been above `X` and excluded
-/// as well. The argument only uses "position below commit", so it does not
-/// matter that `X` is a WAL *write* position while a row's `lsn` is an
-/// *insert* position. What does change is that a row can match here although
-/// its writer committed after `X`, which only defers more.
-async fn from_side_change_in_flight(
-    txn: &Transaction<'_>,
-    from_table: &str,
-    from_col: &str,
-    keys: &[&str],
-    watermark_x: PgLsn,
-) -> Result<bool, ApplyError> {
-    if keys.is_empty() {
-        return Ok(false);
-    }
-    let arms = converge::per_ring_table(" union all ", |slot, table| {
-        format!(
-            "select 1 from {table} r \
-             where r.src_table = $1 \
-               and r.op in ('insert', 'update', 'delete') \
-               and r.lsn <= $2 \
-               and (r.old_image ->> $3 = any($4::text[]) \
-                    or r.new_image ->> $3 = any($4::text[])) \
-               and exists ( \
-                   select 1 from segments s \
-                   where s.ring_slot = {slot} \
-                     and (s.state <> 'drained' \
-                          or (s.fence_snapshot is not null \
-                              and not pg_visible_in_snapshot(r.row_txid, s.fence_snapshot))) \
-               )"
-        )
-    });
-    let sql = format!("select exists ({arms})");
-    let row = txn
-        .query_one(&sql, &[&from_table, &watermark_x, &from_col, &keys])
-        .await?;
-    Ok(row.get(0))
-}
-
-/// Checks all four of #132's guards for one [`RelationshipReverseRecord`],
-/// inside the already-open Phase 3 `txn` — [`apply_and_mark_drained_many`]'s
-/// "3d" step's single "may this record's delta apply?" decision, replacing
-/// #131's own inline guard-(d)-only check. Cheapest/most-locking-averse
-/// first: guard (a) is a bare in-memory comparison (no SQL at all), so it
-/// short-circuits before this function ever touches the projection row;
-/// guards (b)/(d) share the one `FOR UPDATE` read #131 already took (adding
-/// `__trellis_gen` to its `SELECT` list, not a second query); guard (c) —
-/// the most expensive, a ring scan — runs last, only once the cheaper three
-/// have already passed.
-///
-/// **Locking discipline** (the issue's own "Locking" section): this
-/// function's `FOR UPDATE` on the projection row is the *reverse* side of
-/// "a forward apply touching a parent takes `FOR SHARE`... a reverse takes
-/// `FOR UPDATE`." The forward side is `apply_and_mark_drained_many`'s "3c"
-/// step's `UPDATE ... SET gen = gen + 1 WHERE key = ANY(...)` — an `UPDATE`
-/// already takes the same exclusive row lock `FOR UPDATE` would (Postgres's
-/// row-level locking has no weaker mode an `UPDATE` could take instead), so
-/// no separate explicit `SELECT ... FOR SHARE` is needed there: the
-/// `UPDATE` itself *is* the serializing lock. That is what makes this
-/// function's guard (b) re-check meaningful rather than racy — a
-/// concurrent forward apply's gen-bump `UPDATE` and this reverse's `FOR
-/// UPDATE` read can never interleave mid-row; whichever transaction gets
-/// there first blocks the other until it commits or rolls back, so by the
-/// time this `SELECT ... FOR UPDATE` returns, it has either (a) landed
-/// before any concurrent forward apply touched this row (nothing to
-/// detect — `prev_gen` still matches) or (b) waited for that forward
-/// apply's `UPDATE` to commit and then observed its bumped `gen` (guard (b)
-/// correctly fails). There is no third interleaving.
-///
-/// The page has already taken this lock, with every other projection row
-/// lock it needs, in key order before its first record
-/// ([`lock_page_projection_rows`], ADR-0002 I5, issue #848): taken here one
-/// record at a time, in fold order, two pages touching the same parents in
-/// different orders deadlocked. Re-locking a row this transaction holds is
-/// a no-op, so this read waits only on a row inserted since then.
-///
-/// Returns `Ok(None)` when every guard passes. Returns `Ok(Some(failure))`
-/// naming the *first* guard that didn't — never more than one, since guard
-/// evaluation stops at the first failure (there is nothing further to learn
-/// from checking the rest once this record is already going to the
-/// fallback path).
-async fn check_reverse_guards(
-    txn: &Transaction<'_>,
-    shape: &ReverseRelationshipShape,
-    record: &RelationshipReverseRecord,
-    old_key: &Option<String>,
-    new_key: &Option<String>,
-    watermark: &StagedWatermark,
-) -> Result<Option<ReverseGuardFailure>, ApplyError> {
-    // Guard (a): watermark barrier. A bare in-memory read — no SQL, no
-    // lock — so this always runs first.
-    if watermark.get() < record.watermark {
-        return Ok(Some(ReverseGuardFailure::Watermark));
-    }
-
-    // Guards (b)/(d): one row-locked read of the projection, shared between
-    // both — see this function's own doc comment on why the lock this takes
-    // is what makes guard (b) sound rather than racy.
-    let lock_key = old_key.as_deref().or(new_key.as_deref());
-    let (current_lsn, current_gen): (Option<Option<PgLsn>>, Option<Option<i64>>) = match lock_key {
-        Some(key) if !shape.qualified_projection.is_empty() => {
-            let lsn_ident = quote_ident(ddl::PROJECTION_LSN_COLUMN);
-            let gen_ident = quote_ident(ddl::PROJECTION_GEN_COLUMN);
-            let filter = shape.projection_key_filter(txn).await?;
-            let row = txn
-                .query_opt(
-                    &format!(
-                        "select {lsn_ident}, {gen_ident} from {} \
-                         where {filter} for update",
-                        shape.qualified_projection,
-                    ),
-                    &[&key],
-                )
-                .await?;
-            match row {
-                Some(row) => (Some(row.get(0)), Some(row.get(1))),
-                None => (None, None),
-            }
-        }
-        _ => (None, None),
-    };
-
-    // Guard (b): a missing projection row (a parent about to be INSERTed,
-    // or the should-be-unreachable no-projection case) has no `gen` to have
-    // moved — nothing to conflict with, always passes, same posture guard
-    // (d) already took for this case pre-#132.
-    let gen_ok = match current_gen {
-        None => true,
-        Some(current) => current == record.prev_gen,
-    };
-    if !gen_ok {
-        return Ok(Some(ReverseGuardFailure::Generation));
-    }
-
-    // Guard (d): #131's original stopgap, unchanged in substance, now one
-    // arm of this unified check.
-    let ordering_ok = match current_lsn {
-        None => true,
-        Some(current) => current == record.prev_lsn,
-    };
-    if !ordering_ok {
-        return Ok(Some(ReverseGuardFailure::Ordering));
-    }
-
-    // Guard (c): the in-flight check, last (most expensive) and only once
-    // (a) captured X, (b) the gen, and (d) the ordering have all already
-    // passed — the from-side child rows a from-side change touching either
-    // `old_key` or `new_key`, deduped so an ordinary same-key attribute
-    // update (`old_key == new_key`) doesn't scan the same key twice.
-    //
-    // **Resolved by #133, on the plan doc's §3.1 fold-erasure finding**
-    // ("post 3 appears in neither folded image" when a from-side row is
-    // inserted then re-pointed within the same batch): that finding was
-    // about guard (b) specifically — `RelationshipGenBump` used to be
-    // resolved purely from the *folded* view (`compute`'s per-def
-    // evaluation), so a parent key an intermediate, erased image touched
-    // never got its projection row's `gen` bumped at all, and guard (b)'s
-    // re-check couldn't detect a conflict that never bumped anything.
-    // `build_relationship_context` now also unions in each touched change's
-    // `FoldedChange::group_key` — the real, pre-fold union of touched
-    // join keys the ring carries precisely for this (see that field's and
-    // `staging::fold`'s doc comments for the merge rule) — so the erased
-    // parent's `gen` does bump, and guard (b) alone now catches the
-    // scenario. See `tests/apply_relationship_reverse.rs`'s
-    // `issue_133_a_within_batch_repoint_still_bumps_the_erased_intermediate_parents_gen`
-    // for the dedicated regression pin this comment used to ask for.
-    //
-    // `from_side_change_in_flight` below still independently scans the
-    // **raw** ring rows directly (`seg_N`'s physical rows, one per raw CDC
-    // change, never mutated by the fold — only `claim`/`fold`'s *read-time*
-    // collapsing ever loses the intermediate image) for the same erased
-    // touch, so it also catches it — but only as long as the erasing batch
-    // is still undrained when this check runs (see the doc comment history
-    // in git blame for the exact "once that batch fully drains, there is
-    // nothing left in the ring for this scan to find" reasoning this guard
-    // used to have to lean on alone). With #133 landed, guard (c) catching
-    // it too is redundant-but-harmless defense in depth, not the only
-    // safety net for this scenario anymore.
-    let mut keys: Vec<&str> = Vec::with_capacity(2);
-    if let Some(k) = old_key.as_deref() {
-        keys.push(k);
-    }
-    if let Some(k) = new_key.as_deref()
-        && Some(k) != old_key.as_deref()
-    {
-        keys.push(k);
-    }
-    if from_side_change_in_flight(
-        txn,
-        &shape.from_table,
-        &shape.from_col,
-        &keys,
-        record.watermark,
-    )
-    .await?
-    {
-        return Ok(Some(ReverseGuardFailure::InFlight));
-    }
-
-    Ok(None)
-}
-
-// ---------------------------------------------------------------------
-// Issue #135, epic #127: fairness escalation — starvation freedom for the
-// reverse retry loop
-// ---------------------------------------------------------------------
-//
-// **The problem.** Every guard-rejected [`RelationshipReverseRecord`] is
-// deferred and retried later (issue #134). Under sustained from-side churn
-// on one hot parent — children being inserted/updated/re-pointed onto it
-// continuously, faster than one drain cycle settles — that retry loop can
-// fail forever, for two independent, structural reasons, not merely bad
-// luck:
-//
-// * **Guard (c) (in-flight).** A batch's own from-side writes are staged
-//   into segments that are `state = 'draining'` (not yet `'drained'`) until
-//   *this same transaction*'s step 5, which runs *after* step 3d's guard
-//   check. So a reverse co-batched with any of its own parent's children
-//   sees them as "still undrained" on the very first attempt, by
-//   construction — not a race, a guarantee. Retrying buys nothing if the
-//   *next* batch also contains fresh children for the same hot parent, which
-//   sustained churn guarantees it will.
-// * **Guard (b) (generation).** Step 3c bumps a parent's projection `gen` on
-//   *every* batch whose forward evaluation resolves that parent for any
-//   child — regardless of whether the child's own value changed. Under
-//   sustained churn this fires on essentially every batch touching the
-//   parent's children, so the window between Phase 2's live capture and
-//   Phase 3's `FOR UPDATE` recheck is very likely to contain at least one
-//   bump whenever concurrent apply workers are active.
-//
-// Both are driven by the *children's* own ordinary traffic, not by the
-// parent itself changing repeatedly — the parent's own to-side row may have
-// changed exactly once. That rules out any fix that tries to catch a quiet
-// instant, since sustained churn need never produce one.
-//
-// **The issue's own sketch, and why it isn't the mechanism below.** The
-// issue proposed a persisted "hold" that blocks *new* forward applies for a
-// parent once its reverse has deferred N times, until the in-flight set
-// drains to empty. Worked through concretely, this does not hold up:
-//
-// 1. Guard (c)'s own query treats *any* non-`'drained'` segment — including
-//    the still-open *active* segment nothing has even claimed yet — as
-//    in-flight. "Blocking" a child's forward apply by simply not processing
-//    it leaves its row sitting in exactly such a segment, still in-flight,
-//    forever. That is the priority-inversion the issue itself named:
-//    holding children back to protect the parent's reverse would keep the
-//    in-flight set the reverse is waiting on non-empty *by the hold's own
-//    action* — a self-inflicted deadlock, not a fix.
-// 2. Even granting some other way to "pause" children, guard (b)'s
-//    projection `gen` bump cannot be safely suppressed for a held parent:
-//    that bump is what lets guard (b) catch a forward apply that resolved a
-//    stale relationship value *and already fully drained* before guard (c)
-//    could ever see it (the #133/#134-era race guard (b) exists for
-//    specifically). Suppressing it to protect the reverse would silently
-//    reopen that exact double-application hazard. A "hold" that is honest
-//    about this needs to stop children's forward evaluation from resolving
-//    the relationship at all, which is a much larger change (a new
-//    forward-defer capability, per the issue's own callout) with its own
-//    correctness surface this issue's scope does not budget for.
-//
-// **The mechanism actually shipped: escalate away from the fragile fast
-// path, not block the forward path.** (#623 D5 deleted the fast path, so
-// every record now takes the fallback; the guards stay because guard (d)
-// still orders the projection's advances.) Guards (a)/(b)/(c) exist to protect
-// exactly one thing: the *fast-path delta*'s assumption that the from-side
-// enumeration it reads is race-free against any other write touching the
-// same aggregate contributions. They are not needed for the *pre-#131*
-// image-less `Recompute` fallback (`ReverseRelationshipShape::needs_recompute_fallback`,
-// and the `!fast_path_safe` case below) — that path just re-evaluates each
-// row against current live state on its own next drain, with the same
-// per-row locking every other definition's ordinary forward evaluation
-// already relies on, and converges regardless of how much concurrent
-// activity raced it. It was every guard-rejected record's own treatment
-// before #134 introduced defer-and-retry as a cheaper common case.
-//
-// So: once a transition's `retry_count` reaches
-// [`RELATIONSHIP_REVERSE_FAIRNESS_THRESHOLD`], the *next* guard rejection
-// (for guard (a), (b), or (c) — never (d), see below) escalates instead of
-// deferring again — [`stage_reverse_recompute_fallback`] stages the
-// always-correct recompute for every touched from-side row, exactly as the
-// existing fallback branch does, and the settled parent projection is
-// advanced immediately via [`apply_projection_advance`], exactly as the
-// all-guards-passed path already does. This reuses two already-proven
-// mechanisms; nothing about how children are forward-applied changes, so
-// there is no new blocking, no new "hold" state, and no new deadlock
-// surface.
-//
-// **Why advancing the projection here is sound.** [`check_reverse_guards`]
-// short-circuits at the *first* failing guard, in order (a), (b), (d), (c) —
-// so a `Generation`/`Watermark`/`InFlight` failure it reports carries no
-// information about whether guard (d) (the projection's own LSN chain) also
-// holds; that check may never have run. Guard (d) is the one guard that
-// gates whether it is *safe to write* the projection at all (an
-// out-of-order or replayed transition must not stomp a fresher one); guards
-// (a)/(b)/(c) only ever gate the *fast-path delta's* correctness, never the
-// plain "does this transition's `prev_lsn` still match the projection"
-// question. [`reverse_ordering_still_holds`] answers that question
-// independently, under the same `FOR UPDATE` lock (re-acquiring a lock this
-// transaction already holds is a no-op, not a second wait), before
-// escalation is allowed to touch the projection. If guard (d) itself is
-// what's failing, escalation never happens — the record keeps deferring
-// (unchanged from #134) — see the residual limitation this leaves, below.
-//
-// **The liveness bound this gives, and what it does not cover.** Guard (d)
-// only fails when *another* reverse for the *same parent* raced this one —
-// i.e. the parent's own row being edited again, not its children churning —
-// and the ordinary SQL fold already collapses multiple same-batch edits to
-// one parent into a single transition, so this is expected to be rare under
-// the "hot parent, churning children" scenario this issue targets. Modulo
-// that, every reverse transition is guaranteed to fully resolve (both the
-// projection advance and the aggregate correction) within
-// [`RELATIONSHIP_REVERSE_FAIRNESS_THRESHOLD`] deferred-retry drain cycles,
-// unconditionally — the escalation branch performs its action outright, it
-// does not merely retry again. **What this does not guarantee**: a parent
-// whose own row is itself repeatedly, concurrently re-edited by more than
-// one racing writer fast enough to keep failing guard (d) on every
-// escalation attempt too is not covered by this mechanism and could still
-// defer indefinitely — a narrower and different failure mode than the one
-// this issue's own stress model exercises (sustained *child* churn against
-// a parent edited once). Flagged here, and in this issue's report, as a
-// known residual limitation rather than left implicit.
-
-/// Issue #135: an independent, guard-(d)-only recheck used *only* by the
-/// fairness-escalation path — never by [`check_reverse_guards`]'s own
-/// ordinary defer-or-apply decision, which already covers guard (d) as one
-/// arm of its short-circuiting evaluation (see that function's doc comment
-/// and this section's own "Why advancing the projection here is sound"
-/// above for why a `Generation`/`Watermark`/`InFlight` failure it reports
-/// carries no information about whether guard (d) also holds).
-///
-/// Takes the same `FOR UPDATE` lock [`check_reverse_guards`] already took
-/// on this row, as the page's pre-lock did before it
-/// ([`lock_page_projection_rows`]), inside the same transaction — Postgres
-/// re-locking a row this transaction already holds is a no-op, not a second
-/// wait.
-async fn reverse_ordering_still_holds(
-    txn: &Transaction<'_>,
-    shape: &ReverseRelationshipShape,
-    old_key: &Option<String>,
-    new_key: &Option<String>,
-    record: &RelationshipReverseRecord,
-) -> Result<bool, ApplyError> {
-    let lock_key = old_key.as_deref().or(new_key.as_deref());
-    let Some(key) = lock_key else {
-        // No key at all: `check_reverse_guards` never rejects such a record
-        // in the first place (its own "both keys `None`" short-circuit
-        // always passes), so this function is never actually called in that
-        // shape — defensive `true` matches that function's own posture.
-        return Ok(true);
-    };
-    if shape.qualified_projection.is_empty() {
-        return Ok(true);
-    }
-    let lsn_ident = quote_ident(ddl::PROJECTION_LSN_COLUMN);
-    let filter = shape.projection_key_filter(txn).await?;
-    let row = txn
-        .query_opt(
-            &format!(
-                "select {lsn_ident} from {} where {filter} for update",
-                shape.qualified_projection,
-            ),
-            &[&key],
-        )
-        .await?;
-    match row {
-        None => Ok(true),
-        Some(row) => {
-            let current_lsn: Option<PgLsn> = row.get(0);
-            Ok(current_lsn == record.prev_lsn)
-        }
-    }
-}
-
 /// Where a propagated change traces back to: its source commit's
 /// `src_changed` (issues #51/#52) and `origin_lsn` (issue #469), merged with
 /// [`earliest_src_changed`] and [`earliest_origin`] respectively.
 type Provenance = (Option<std::time::SystemTime>, Option<PgLsn>);
-
-/// One key a drain re-derives by recompute:
-/// `(src_table, key, hop_gen, src_changed, origin_lsn)`.
-type DerivedRecompute = (
-    String,
-    String,
-    i32,
-    Option<std::time::SystemTime>,
-    Option<PgLsn>,
-);
-
-/// Stages the pre-#131 `Recompute` fallback (issue #131's own stopgap,
-/// shared since by every guard rejection before #134, and since #623 D5 by
-/// every record whose relationship some definition reads) for every from-side row currently matching `old_key`/`new_key` via
-/// `shape.from_col` — live-enumerated inside the already-locked Phase 3
-/// `txn`, deduped against `seen_keys` (shared across every call this same
-/// record makes, so a same-key `old_key == new_key` update is not staged
-/// twice). Needs none of #132's four guards for its own correctness: each
-/// staged `Recompute` is picked up on a later drain and re-evaluated against
-/// whatever is live *then*, the same way any other definition's ordinary
-/// forward evaluation already is — which is exactly why issue #135's
-/// fairness escalation (see this module's own design section above) can
-/// lean on it as the always-safe exit from the guard-gated retry loop.
-///
-/// The `Recompute`s carry no image (#623 D5): a 1-1 target re-reads the
-/// row, and an aggregate's ledger entry already names the group the row
-/// leaves while its Re-derive reads the parent live.
-///
-/// `row_columns` is `shape.from_table`'s live column list, resolved once by
-/// the caller via [`cached_row_columns`] — not re-introspected per call here
-/// — since this function's own caller (the "3d" step's `for record in
-/// &plan.relationship_reverses` loop) runs once per distinct touched parent
-/// key in the batch, and many records touching one relationship all share
-/// this same `from_table`. See [`from_side_rows_for_trigger_txn`]'s doc
-/// comment for why that function takes the same parameter rather than
-/// introspecting it itself.
-async fn stage_reverse_recompute_fallback(
-    txn: &Transaction<'_>,
-    record: &RelationshipReverseRecord,
-    old_key: &Option<String>,
-    new_key: &Option<String>,
-    seen_keys: &mut std::collections::HashSet<String>,
-    fallback: &mut Vec<DerivedRecompute>,
-    row_columns: &[String],
-) -> Result<(), ApplyError> {
-    let shape = &record.shape;
-    let Some(from_pk) = &shape.from_pk else {
-        return Ok(());
-    };
-    let from_key_pg_type = cached_key_pg_type(
-        &shape.from_key_pg_type,
-        txn,
-        &shape.from_table,
-        &shape.from_col,
-    )
-    .await?;
-    for key in [old_key.clone(), new_key.clone()].into_iter().flatten() {
-        let trigger = ReverseTrigger::Keys(std::slice::from_ref(&key));
-        let from_rows = from_side_rows_for_trigger_txn(
-            txn,
-            &shape.from_table,
-            &shape.from_col,
-            from_key_pg_type,
-            from_pk,
-            &trigger,
-            row_columns,
-        )
-        .await?;
-        for (from_key, _) in from_rows {
-            if seen_keys.insert(from_key.clone()) {
-                fallback.push((
-                    shape.from_table.clone(),
-                    from_key,
-                    record.hop_gen + 1,
-                    record.src_changed,
-                    record.origin_lsn,
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// The settled parent projection's current data columns (excluding the key
-/// and the two bookkeeping columns) — the same `information_schema.columns`
-/// introspection [`catalog::ensure_relationship_projection_in_txn`] already
-/// uses, duplicated here since Phase 3 holds no `pool` (only `txn`) and that
-/// function is private to `defs::catalog`.
-async fn projection_data_columns(
-    txn: &Transaction<'_>,
-    projection_schema: &str,
-    projection_table_bare: &str,
-    to_col: &str,
-) -> Result<Vec<String>, ApplyError> {
-    let bookkeeping = [
-        to_col,
-        ddl::PROJECTION_GEN_COLUMN,
-        ddl::PROJECTION_LSN_COLUMN,
-    ];
-    let rows = txn
-        .query(
-            "select column_name from information_schema.columns \
-             where table_schema = $1 and table_name = $2 order by ordinal_position",
-            &[&projection_schema, &projection_table_bare],
-        )
-        .await?;
-    Ok(rows
-        .into_iter()
-        .map(|row| row.get::<_, String>(0))
-        .filter(|c| !bookkeeping.contains(&c.as_str()))
-        .collect())
-}
-
-/// Advances the settled parent projection for one applied
-/// [`RelationshipReverseRecord`] (issue #131) — a symmetric delete-then-upsert
-/// keyed independently by `old_key`/`new_key`, so a parent PK-changing
-/// update (a genuinely different projection row identity — rare, but
-/// Postgres imposes no immutability on `to_col` itself) is handled the same
-/// way as an ordinary same-key update, a parent insert (`old_key` absent),
-/// or a parent delete (`new_key` absent). Sets [`ddl::PROJECTION_LSN_COLUMN`]
-/// to `lsn`; **never touches [`ddl::PROJECTION_GEN_COLUMN`]** — that column
-/// is step 3c's forward bookkeeping (a *different* signal: "has a forward
-/// apply landed since some Phase-2 capture"), and this reverse advance is
-/// not one — see both columns' own doc comments for the distinction.
-///
-/// The upsert leans on Postgres's own `jsonb_populate_record` against the
-/// projection table's real composite row type, rather than this crate
-/// re-deriving a per-column cast from `information_schema`: every projected
-/// data column's name already appears as a key in the parent's raw new
-/// image (a full row dump), so Postgres's own JSON-to-record coercion does
-/// exactly the right thing for whichever subset of columns the projection
-/// actually carries.
-async fn apply_projection_advance(
-    txn: &Transaction<'_>,
-    shape: &ReverseRelationshipShape,
-    old_key: &Option<String>,
-    new_key: &Option<String>,
-    new_image: Option<&str>,
-    lsn: Option<PgLsn>,
-) -> Result<(), ApplyError> {
-    if shape.qualified_projection.is_empty() {
-        return Ok(());
-    }
-    let key_ident = quote_ident(&shape.to_col);
-
-    if let Some(old_key) = old_key
-        && new_key.as_deref() != Some(old_key.as_str())
-    {
-        let filter = shape.projection_key_filter(txn).await?;
-        txn.execute(
-            &format!("delete from {} where {filter}", shape.qualified_projection),
-            &[old_key],
-        )
-        .await?;
-    }
-
-    // A NULL `to_col` is no projection key (the key column is `not null`,
-    // and a NULL never joins a from-side row anyway), the same exclusion
-    // `catalog::ensure_relationship_projection_in_txn`'s seed makes. A
-    // nullable `UNIQUE` to-side column can hold one, and an aggregate
-    // target's NULL group routinely does (issue #403).
-    let (Some(_), Some(new_image)) = (new_key, new_image) else {
-        return Ok(());
-    };
-    let data_columns = projection_data_columns(
-        txn,
-        &shape.projection_schema,
-        &shape.projection_table_bare,
-        &shape.to_col,
-    )
-    .await?;
-    let gen_ident = quote_ident(ddl::PROJECTION_GEN_COLUMN);
-    let lsn_ident = quote_ident(ddl::PROJECTION_LSN_COLUMN);
-
-    let mut insert_cols = vec![key_ident.clone()];
-    let mut select_exprs = vec![format!("r.{key_ident}")];
-    let mut update_sets = Vec::new();
-    for col in &data_columns {
-        let ident = quote_ident(col);
-        insert_cols.push(ident.clone());
-        select_exprs.push(format!("r.{ident}"));
-        update_sets.push(format!("{ident} = excluded.{ident}"));
-    }
-    insert_cols.push(gen_ident.clone());
-    select_exprs.push("0".to_string());
-    insert_cols.push(lsn_ident.clone());
-    select_exprs.push("$2::pg_lsn".to_string());
-    update_sets.push(format!("{lsn_ident} = excluded.{lsn_ident}"));
-
-    let sql = format!(
-        "insert into {proj} ({insert_cols}) \
-         select {select_exprs} from jsonb_populate_record(null::{proj}, $1::text::jsonb) r \
-         on conflict ({key_ident}) do update set {update_sets}",
-        proj = shape.qualified_projection,
-        insert_cols = insert_cols.join(", "),
-        select_exprs = select_exprs.join(", "),
-        update_sets = update_sets.join(", "),
-    );
-    txn.execute(&sql, &[&new_image, &lsn]).await?;
-    Ok(())
-}
-
-/// Issue #531: whether a reverse record at `lsn` on a source to-side may
-/// carry images the relationship's last projection refresh overtook: the
-/// refresh stamped the relationship at `stamp`
-/// (`relationship_projections.refreshed_lsn`, read `for share` by Phase 3),
-/// and the record's change is at or below it. A record above the stamp, or
-/// on a relationship never refreshed, applies its images unchecked, so the
-/// steady state pays no live-row read. A record with no `lsn` (never staged
-/// by CDC for a source to-side) is checked whenever a stamp exists.
-fn overtaken_by_refresh(lsn: Option<PgLsn>, stamp: Option<PgLsn>) -> bool {
-    match (lsn, stamp) {
-        (_, None) => false,
-        (None, Some(_)) => true,
-        (Some(lsn), Some(stamp)) => lsn <= stamp,
-    }
-}
-
-/// Issue #531: whether a to-side `TRUNCATE` at `lsn` is one the
-/// relationship's last projection refresh (stamped at `stamp`) already read,
-/// so clearing the projection for it would drop what the refresh found
-/// written after it. The refresh holds `ACCESS SHARE` on the to-side from its
-/// first read until it commits, so a truncate either committed before that
-/// read (and its commit is at or below the stamp) or waits for the refresh
-/// to commit (and lands above it). Unlike [`overtaken_by_refresh`], a
-/// truncate with no `lsn` is never treated as read: skipping a clear is not
-/// the conservative choice.
-fn truncate_overtaken_by_refresh(lsn: Option<PgLsn>, stamp: Option<PgLsn>) -> bool {
-    matches!((lsn, stamp), (Some(lsn), Some(stamp)) if lsn <= stamp)
-}
-
-/// Issues #507/#531: whether a reverse record carries images its to-side has
-/// since moved past by a write that no later record will bring: the live row
-/// for its new key no longer equals its new image, or a row it deleted (or
-/// moved off `old_key`) is back.
-///
-/// A to-side's records carry every write the projection hears about, so the
-/// projection normally follows their images. Two kinds of write reach it only
-/// through a refresh from the to-side's rows
-/// (`catalog::refresh_relationship_projections_in_txn`), and a record
-/// staged before that refresh but drained after it would put an older image
-/// back with nothing after it to correct it. For a target to-side (fed by
-/// the target-mutation seam) that is a resumed definition's rebuild, which
-/// bypasses the seam. For a source to-side it is a change no ring row
-/// carries (one written while the table's capture was uninstalled), which
-/// the refresh read. So a record whose
-/// images the live row contradicts writes the projection from the live row
-/// ([`apply_projection_from_live`]) and re-derives its from-side rows with
-/// the image-less fallback, never a delta from images that no longer hold. A
-/// record that merely lags a newer write to the same key (both pending in
-/// different segments) lands here too. That is correct as well, since the
-/// newer record finds the projection already at its image.
-///
-/// Every record on a target to-side pays this keyed read. A source
-/// to-side's record pays it only at or below the relationship's refresh
-/// stamp ([`overtaken_by_refresh`]).
-async fn to_side_superseded(
-    txn: &Transaction<'_>,
-    shape: &ReverseRelationshipShape,
-    to_side_columns: &[String],
-    old_key: &Option<String>,
-    new_key: &Option<String>,
-    new_image: Option<&str>,
-) -> Result<bool, ApplyError> {
-    let filter = shape.to_side.key_filter(txn, &shape.to_col).await?;
-    let doc = row_as_text_jsonb_sql("t", to_side_columns);
-    let sql = format!(
-        "select ({doc}) is not distinct from $2::text::jsonb from {} t where {filter}",
-        shape.to_side.table
-    );
-    // The live row for `key` equals `image`, or is absent when `image` is.
-    let holds = async |key: &str, image: Option<&str>| -> Result<bool, ApplyError> {
-        let row = txn.query_opt(&sql, &[&key, &image]).await?;
-        Ok(match row {
-            Some(row) => image.is_some() && row.get::<_, bool>(0),
-            None => image.is_none(),
-        })
-    };
-    if let Some(key) = new_key.as_deref()
-        && !holds(key, new_image).await?
-    {
-        return Ok(true);
-    }
-    if let Some(key) = old_key.as_deref()
-        && new_key.as_deref() != Some(key)
-        && !holds(key, None).await?
-    {
-        return Ok(true);
-    }
-    Ok(false)
-}
-
-/// `column`'s value on `row` when the column is structurally required
-/// there, telling an absent column from a present `NULL` the way the
-/// evaluator does (issue #677): `Ok(None)` is a real SQL `NULL`, and a
-/// column missing from the image is [`eval::EvalError::MissingColumn`]
-/// against `field`. A `GROUP BY` key or a relationship join key read as
-/// `NULL` when absent would silently route the change to the wrong group
-/// or parent. Under trigger capture (#622) images carry only the capture
-/// column set, and an under-capture has to fail loudly instead.
-fn required_column<'r>(
-    row: &'r Row,
-    column: &str,
-    field: &str,
-) -> Result<Option<&'r String>, eval::EvalError> {
-    match row.get(column) {
-        Some(value) => Ok(value.as_ref()),
-        None => Err(eval::EvalError::MissingColumn {
-            field: field.to_string(),
-            column: column.to_string(),
-        }),
-    }
-}
-
-/// Whether [`to_side_superseded`] finds `record`'s images stale, checked
-/// only for a record that may be stale: every record on a seam-fed to-side,
-/// a deferred record's retry, and one on a source to-side at or below its
-/// relationship's refresh stamp in `refresh_stamps` ([`overtaken_by_refresh`]).
-///
-/// Issue #886: a retry is out of order with its parent's later changes. They
-/// drain while it waits, so by the time it applies the projection may hold a
-/// newer change's image, or none, after a later delete. Guard (d) can't tell:
-/// the retry captures `prev_lsn` afresh, from the projection as the newer
-/// change left it. Applied from its own images, the retry would put an older
-/// value back with nothing after it to correct it.
-async fn superseded_to_side(
-    txn: &Transaction<'_>,
-    row_columns_cache: &mut HashMap<String, Vec<String>>,
-    refresh_stamps: &HashMap<i64, PgLsn>,
-    record: &RelationshipReverseRecord,
-    old_key: &Option<String>,
-    new_key: &Option<String>,
-) -> Result<bool, ApplyError> {
-    let shape = &record.shape;
-    let must_check = shape.to_side.seam_fed
-        || overtaken_by_refresh(record.lsn, refresh_stamps.get(&shape.id).copied());
-    if !must_check && record.retry_count == 0 {
-        return Ok(false);
-    }
-    let columns = cached_row_columns(txn, row_columns_cache, &shape.to_side.identity)
-        .await?
-        .to_vec();
-    // A retry whose to-side no longer has `to_col` (renamed or dropped, which
-    // pauses the relationship's readers) has no live row to be checked
-    // against: the keyed read would fail its page on every attempt. It
-    // applies its images, as it did before the retry was checked.
-    if !must_check && !columns.contains(&shape.to_col) {
-        return Ok(false);
-    }
-    to_side_superseded(
-        txn,
-        shape,
-        &columns,
-        old_key,
-        new_key,
-        record.new_image.as_deref(),
-    )
-    .await
-}
-
-/// Issue #531: each of `relationship_ids`' refresh stamp
-/// (`relationship_projections.refreshed_lsn`), keyed by `relationship_id`,
-/// read under a `for share` lock taken in `relationship_id` order, or `for
-/// update` when `for_update` (the page stamps a truncate's clear, issue #886;
-/// taking the stronger lock at once, in the same order, rather than upgrading
-/// later, keeps two pages from deadlocking on it). A relationship never
-/// refreshed has no entry. No query at all when
-/// `relationship_ids` is empty.
-async fn relationship_refresh_stamps(
-    txn: &Transaction<'_>,
-    relationship_ids: impl Iterator<Item = i64>,
-    for_update: bool,
-) -> Result<HashMap<i64, PgLsn>, ApplyError> {
-    let mut ids: Vec<i64> = relationship_ids.collect();
-    if ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-    ids.sort_unstable();
-    ids.dedup();
-    let lock = if for_update { "update" } else { "share" };
-    let rows = txn
-        .query(
-            &format!(
-                "select relationship_id, refreshed_lsn from relationship_projections \
-                 where relationship_id = any($1) order by relationship_id for {lock}"
-            ),
-            &[&ids],
-        )
-        .await?;
-    Ok(rows
-        .into_iter()
-        .filter_map(|row| Some((row.get::<_, i64>(0), row.get::<_, Option<PgLsn>>(1)?)))
-        .collect())
-}
-
-/// [`apply_projection_advance`] for a record [`to_side_superseded`] found
-/// stale: writes the projection row of each of `old_key`/`new_key` from the
-/// live to-side row instead of the record's image, deleting it where the
-/// to-side has no row. Moves [`ddl::PROJECTION_LSN_COLUMN`] to `lsn` exactly
-/// as the image advance would, and never touches
-/// [`ddl::PROJECTION_GEN_COLUMN`].
-///
-/// Issue #754: a key whose latest pending change after `pending_after` (the
-/// record's own `lsn`, so none of the record's own ring rows count) names it
-/// in its new image is left to that change, the rule
-/// `catalog::pending_to_side_keys` applies to the catch-up inserts (#726):
-/// the projection row is deleted rather than written from the live row, and
-/// that change's record writes it. Written from the live row, it could
-/// outlive the to-side row. A re-insert pending when a delete drains,
-/// superseded by it, folds with a later delete into a record with no image,
-/// which names no key, so no record would ever remove the row the live
-/// write put there. Deleting the row is what the pending change's record
-/// expects, since the key was absent before it whenever that change is an
-/// insert; when the change keeps the key (an update), its record writes the
-/// row whole either way, and re-derives the from-side rows it reaches.
-///
-/// "Pending" is per change (issue #762,
-/// `staging::page::ring_row_pending_sql`): no committed drain has applied
-/// it, by its segment's `drained_mask` and its bucket's `drain_cursor`, and
-/// `claim`, the Phase 3 transaction this runs in, is not applying it. Both
-/// are monotonic, so once a change has applied, no later write to the
-/// projection row can make it look pending again. A change this transaction
-/// applies is its own: one it already applied wrote the row, and one it
-/// hasn't yet will (#761 read "already applied" off the row's `lsn`, which a
-/// superseded older record's live write lowers, so a second older record
-/// then took an applied re-insert for pending and deleted its key).
-///
-/// One statement per key, so the pending read, the projection read and the
-/// live read share one snapshot (ADR-0002 I1), and the delete and the upsert
-/// never both act on the row: the delete acts only where the to-side has no
-/// row, or where the upsert is withheld. A drain applying a pending change
-/// concurrently commits its row write with its drain state. A page locks
-/// both keys' rows `for update` before its first record
-/// ([`lock_page_projection_rows`]), and the release locks every key's, so on
-/// such a row that drain has committed
-/// before this snapshot or waits for this transaction. For any other row,
-/// the withheld-upsert delete requires the row's `lsn` to be the one this
-/// snapshot read: a to-side write committed while this statement waited on
-/// the row (that drain's, or any other) stamps a new `lsn`, so the row is
-/// left alone, and the changes still pending after that write apply after
-/// it. The test is on `lsn`, not the row version (`xmin`): a from-side
-/// apply's `__trellis_gen` bump (step 3c) also writes the row, holding its
-/// lock until it commits, without applying any to-side change, and the
-/// delete must still go ahead after it.
-async fn apply_projection_from_live(
-    txn: &Transaction<'_>,
-    shape: &ReverseRelationshipShape,
-    old_key: &Option<String>,
-    new_key: &Option<String>,
-    lsn: Option<PgLsn>,
-    pending_after: Option<PgLsn>,
-    claim: Option<&super::page::ClaimScope<'_>>,
-) -> Result<(), ApplyError> {
-    if shape.qualified_projection.is_empty() {
-        return Ok(());
-    }
-    let to_side = &shape.to_side;
-    let key_ident = quote_ident(&shape.to_col);
-    let filter = to_side.key_filter(txn, &shape.to_col).await?;
-    let seen_filter = to_side
-        .projection_key_filter(txn, &shape.to_col, &format!("q.{key_ident}"))
-        .await?;
-    let gone_filter = to_side
-        .projection_key_filter(txn, &shape.to_col, &format!("p.{key_ident}"))
-        .await?;
-    let data_columns = projection_data_columns(
-        txn,
-        &shape.projection_schema,
-        &shape.projection_table_bare,
-        &shape.to_col,
-    )
-    .await?;
-    // A projected column the to-side no longer has (renamed or dropped while
-    // the definition reading it is paused) is written `NULL`, as the image
-    // path's `jsonb_populate_record` writes a column the image lacks.
-    let live_columns = live_row_columns(txn, &to_side.identity).await?;
-    let gen_ident = quote_ident(ddl::PROJECTION_GEN_COLUMN);
-    let lsn_ident = quote_ident(ddl::PROJECTION_LSN_COLUMN);
-    let mut insert_cols = vec![key_ident.clone()];
-    let mut select_exprs = vec![format!("t.{key_ident}")];
-    let mut update_sets = Vec::new();
-    for col in &data_columns {
-        let ident = quote_ident(col);
-        insert_cols.push(ident.clone());
-        if live_columns.contains(col) {
-            select_exprs.push(format!("t.{ident}"));
-        } else {
-            select_exprs.push("null".to_string());
-        }
-        update_sets.push(format!("{ident} = excluded.{ident}"));
-    }
-    insert_cols.push(gen_ident);
-    select_exprs.push("0".to_string());
-    insert_cols.push(lsn_ident.clone());
-    select_exprs.push("$2::pg_lsn".to_string());
-    update_sets.push(format!("{lsn_ident} = excluded.{lsn_ident}"));
-    let col = quote_literal(&shape.to_col);
-    let pending = catalog::pending_to_side_changes(
-        &to_side.identity,
-        &shape.to_col,
-        shape.id,
-        &format!(
-            "and r.lsn > $3::pg_lsn \
-             and (r.old_image ->> {col} = $1::text or r.new_image ->> {col} = $1::text)"
-        ),
-        claim,
-    );
-    let sql = format!(
-        "with latest as materialized ( \
-             select c.new_key is not distinct from $1::text as present \
-             from ({pending}) c order by c.lsn desc, c.change_id desc limit 1), \
-         held as (select 1 from latest l where l.present), \
-         seen as materialized ( \
-             select q.{lsn_ident} as row_lsn from {proj} q where {seen_filter}), \
-         gone as ( \
-             delete from {proj} p where {gone_filter} \
-             and (not exists (select 1 from {to_table} t where {filter}) \
-                  or (exists (select 1 from held) \
-                      and exists (select 1 from seen v \
-                                  where v.row_lsn is not distinct from p.{lsn_ident})))) \
-         insert into {proj} ({insert_cols}) \
-         select {select_exprs} from {to_table} t \
-         where {filter} and not exists (select 1 from held) \
-         on conflict ({key_ident}) do update set {update_sets}",
-        proj = shape.qualified_projection,
-        to_table = to_side.table,
-        insert_cols = insert_cols.join(", "),
-        select_exprs = select_exprs.join(", "),
-        update_sets = update_sets.join(", "),
-    );
-    let pending_after = pending_after.unwrap_or(PgLsn::from(0));
-    let mut keys: Vec<&str> = old_key.iter().chain(new_key).map(String::as_str).collect();
-    keys.sort_unstable();
-    keys.dedup();
-    for key in keys {
-        txn.execute(&sql, &[&key, &lsn, &pending_after]).await?;
-    }
-    Ok(())
-}
-
-/// Issue #754: writes, from the live to-side row, the projection row of
-/// every key a released to-side key's parked changes named, for each to-one
-/// relationship whose to-side is `src_table` (the canonical name). `images`
-/// are JSON objects, as text, naming them: the held row's pre-image and its
-/// `join_values` (#803). The live row of `key` names one more, and so does
-/// `key` itself where the `to_col` is the table's whole row identity.
-///
-/// `quarantine::release_key` discards the parked changes and stages an
-/// image-less `Recompute`, which builds no reverse record, so without this
-/// nothing would carry what the parked changes did to the to-side into the
-/// projection. The write is [`apply_projection_from_live`]'s, counting the
-/// pending changes after `parked_through`, the greatest parked `lsn`: a key
-/// a later pending change will write is left to it. A parked change's ring
-/// row is applied once the page that parked it commits (issue #762), but an
-/// eviction parks a key in its own transaction, before the page retries
-/// without it, and the release discards the parked changes, so the key must
-/// never be left to them. Each relationship's
-/// refresh stamp is locked `for share` first and the projection rows `for
-/// update` in key order, the order a drain takes them (ADR-0002 I5), and the
-/// rows are stamped with the release's WAL position. A define's or resume's
-/// refresh of the projection (`catalog::relationships_to_refresh`) locks
-/// the stamp `for update`, so it reads what the release wrote, or the
-/// release waits for it and reads what it wrote (#831).
-///
-/// It resolves no from-side's key. It stages no recompute of a from-side's
-/// rows: the `Recompute` re-derives them on a later page, under that page's
-/// fence. So a from-side whose key can't be used doesn't refuse the release.
-pub(crate) async fn release_to_one_projections(
-    pool: &Pool,
-    txn: &Transaction<'_>,
-    src_table: &str,
-    key: &str,
-    images: &[String],
-    parked_through: Option<PgLsn>,
-) -> Result<(), ApplyError> {
-    let mut relationships: Vec<RelationshipDefinition> =
-        catalog::relationships_to_table(pool, src_table)
-            .await?
-            .into_iter()
-            .filter(|rel| rel.cardinality == RelationshipCardinality::ToOne)
-            .collect();
-    if relationships.is_empty() {
-        return Ok(());
-    }
-    relationships.sort_by_key(|rel| rel.id);
-    relationship_refresh_stamps(txn, relationships.iter().map(|rel| rel.id), false).await?;
-    let lsn: PgLsn = txn
-        .query_one("select pg_current_wal_insert_lsn()", &[])
-        .await?
-        .get(0);
-    let pk = ddl::source_primary_key(pool, src_table).await?;
-    let pk_expr = ddl::pk_key_sql_expr(&pk, Some("t"));
-    let sole_key = ddl::sole_key_column(&pk);
-    // No from-side's key or fence (#831, see the doc comment).
-    for rel in &relationships {
-        let shape = build_reverse_relationship_shape(pool, rel, None).await?;
-        if shape.qualified_projection.is_empty() {
-            continue;
-        }
-        let key_ident = quote_ident(&shape.to_col);
-        // A `to_col` that is the table's whole row identity has the ring key
-        // as its only value, which the parked changes' `join_values` leave
-        // out (`FoldedChange::to_col_values`), so it is named here.
-        let to_col_is_key = sole_key == Some(shape.to_col.as_str());
-        let keys: Vec<String> = txn
-            .query(
-                &format!(
-                    "select k from ( \
-                         select i::jsonb ->> $3 as k from unnest($1::text[]) i \
-                         union select $2 where $4 \
-                         union select t.{key_ident}::text from {to_table} t \
-                         where {pk_expr} = $2) keys \
-                     where k is not null order by k collate \"C\"",
-                    to_table = shape.to_side.table,
-                ),
-                &[&images, &key, &shape.to_col, &to_col_is_key],
-            )
-            .await?
-            .into_iter()
-            .map(|row| row.get(0))
-            .collect();
-        let key_pg_type = shape.to_side.key_pg_type(txn, &shape.to_col).await?;
-        lock_projection_rows(
-            txn,
-            &projection_lock_statement(&shape.qualified_projection, &shape.to_col, key_pg_type),
-            &keys,
-        )
-        .await?;
-        for k in keys {
-            apply_projection_from_live(
-                txn,
-                &shape,
-                &Some(k),
-                &None,
-                Some(lsn),
-                parked_through,
-                None,
-            )
-            .await?;
-        }
-    }
-    Ok(())
-}
-
-/// The statement that reads the to-side rows whose `to_col` matches any of
-/// the join keys it binds as `$1` ([`fetch_to_side_rows`] runs it; compared at
-/// `to_col`'s own native type via [`key_column_pg_type`] — issue #125,
-/// falling back to the old `::text` comparison if the column can't be
-/// introspected), grouped by that key's `::text` (the evaluator's key
-/// convention, shared with [`from_side_keys`]). A `NULL` `to_col` is
-/// absent (SQL `NULL` never joins) — matching the evaluator's requirement
-/// that such a to-side row carry no key. To-one relationships get exactly one
-/// row per key (`to_col` is UNIQUE); to-many get the full related set.
-/// Decodes each row's columns via the same in-SQL `jsonb_each_text` unnest
-/// [`read_live_rows_batch`] uses. `to_table` is the to-side's unquoted,
-/// qualified identity (issues #372, #561), quoted here for interpolation.
-async fn to_side_rows_sql(
-    pool: &Pool,
-    to_table: &str,
-    to_col: &str,
-) -> Result<KeyBatchRead, ApplyError> {
-    let client = pool.get().await?;
-    let col_ident = quote_ident(to_col);
-    let tbl_ident = ddl::qualified_source_table(to_table);
-    let key_column = key_column_in(&**client, to_table, to_col).await?;
-    let filter = key_array_filter(&col_ident, key_column.as_ref().map(|c| c.pg_type.as_str()));
-    // Issue #248: an explicit per-column `jsonb_build_object`, not
-    // `to_jsonb(t.*)` — see `row_as_text_jsonb_sql`'s doc comment.
-    let row_columns = live_row_columns(&**client, to_table).await?;
-    let doc_expr = row_as_text_jsonb_sql("t", &row_columns);
-    Ok(KeyBatchRead {
-        sql: format!(
-            "select m.jk, m.rn, e.key, e.value \
-             from (select {col_ident}::text as jk, \
-                          row_number() over () as rn, \
-                          {doc_expr} as doc \
-                   from {tbl_ident} t \
-                   where {filter}) m \
-             cross join lateral jsonb_each_text(m.doc) e",
-        ),
-        indexed: key_column.is_some_and(|c| c.indexed),
-    })
-}
-
-/// Runs [`to_side_rows_sql`]'s statement for `join_keys` on `conn`, under
-/// the entry plan settings if `to_col` is indexed ([`KeyBatchRead::run`]).
-async fn fetch_to_side_rows(
-    conn: ReadConn<'_, '_>,
-    read: &KeyBatchRead,
-    join_keys: &[String],
-) -> Result<HashMap<String, Vec<Row>>, ApplyError> {
-    if join_keys.is_empty() {
-        return Ok(HashMap::new());
-    }
-    let db_rows = read.run(conn, join_keys).await?;
-    // Assemble each row by its stable `rn`, carrying its join key, then group.
-    let mut assembled: HashMap<i64, (String, Row)> = HashMap::new();
-    for db_row in db_rows {
-        let jk: String = db_row.get(0);
-        let rn: i64 = db_row.get(1);
-        let field: String = db_row.get(2);
-        let value: Option<String> = db_row.get(3);
-        let entry = assembled.entry(rn).or_insert_with(|| (jk, Row::new()));
-        entry.1.insert(field, value);
-    }
-    let mut grouped: HashMap<String, Vec<Row>> = HashMap::new();
-    for (_, (jk, row)) in assembled {
-        grouped.entry(jk).or_default().push(row);
-    }
-    Ok(grouped)
-}
-
-/// The statement that reads the settled parent projection's rows whose key
-/// column matches any of the join keys it binds as `$1` (issue #130, epic
-/// #127; [`fetch_relationship_projection_rows`] runs it) — the to-one
-/// counterpart to [`to_side_rows_sql`], reading `projection`
-/// instead of the live to-side table. The projection's key column is a real
-/// `primary key` (`catalog::ensure_relationship_projection_in_txn`'s DDL), so
-/// unlike the to-side read there is at most one row per key — no
-/// `row_number()`/grouping dance needed, just a per-key `Row` assembled the
-/// same `jsonb_each_text` way every other decode in this module uses. This
-/// also happens to return every column the projection carries (bookkeeping
-/// columns `__trellis_gen`/`__trellis_lsn` included, plus any data column a
-/// *different* consumer widened in) — harmless, since the evaluator only ever
-/// reads the specific columns a definition's own fields reference
-/// ([`eval::eval_expr`]'s `Row::get`), and a `Row` carrying extra unread keys
-/// is exactly what every other decode in this module already produces.
-///
-/// Issue #125: the filter compares `key_col` at its own native type,
-/// `key_pg_type` ([`key_column_pg_type`]), not an untyped `::text` cast, so
-/// the projection's key index (always present — it's the table's own
-/// `primary key`) stays usable. The caller looks the type up on the
-/// relationship's live to-side table rather than the projection itself:
-/// `catalog::ensure_relationship_projection_in_txn` creates the projection's
-/// key column with exactly the to-side's `to_col` type, so the two always
-/// agree.
-async fn projection_rows_sql(
-    pool: &Pool,
-    projection: &catalog::RelationshipProjection,
-    key_col: &str,
-    key_pg_type: Option<&str>,
-) -> Result<String, ApplyError> {
-    let client = pool.get().await?;
-    // Issue #248: an explicit per-column `jsonb_build_object`, not
-    // `to_jsonb(p.*)` — see `row_as_text_jsonb_sql`'s doc comment.
-    let row_columns = live_row_columns(&**client, &projection.identity()).await?;
-    Ok(projection_rows_statement(
-        &projection.qualified_table(),
-        key_col,
-        key_pg_type,
-        &row_columns,
-    ))
-}
-
-/// [`projection_rows_sql`]'s statement on the projection
-/// `qualified_projection` (quoted, qualified), whose columns are
-/// `row_columns`.
-fn projection_rows_statement(
-    qualified_projection: &str,
-    key_col: &str,
-    key_pg_type: Option<&str>,
-    row_columns: &[String],
-) -> String {
-    let key_ident = quote_ident(key_col);
-    let filter = key_array_filter(&format!("p.{key_ident}"), key_pg_type);
-    let doc_expr = row_as_text_jsonb_sql("p", row_columns);
-    format!(
-        "select p.{key_ident}::text as jk, e.key, e.value \
-         from {qualified_projection} p \
-         cross join lateral jsonb_each_text({doc_expr}) e \
-         where {filter}"
-    )
-}
-
-/// Runs [`projection_rows_sql`]'s statement for `join_keys` on `conn`, under
-/// `super::ledger::ENTRY_PLAN_SETTINGS` (no sequential scan): the
-/// projection's key is its primary key, so the index is always there. In a
-/// 1-1 Re-derive's transaction under its entry lock
-/// ([`RelationshipReads::fetch_under_lock`], issue #835), or, on a pool
-/// client, in a short transaction of its own (issue #972).
-async fn fetch_relationship_projection_rows(
-    conn: ReadConn<'_, '_>,
-    sql: &str,
-    join_keys: &[String],
-) -> Result<HashMap<String, Row>, ApplyError> {
-    if join_keys.is_empty() {
-        return Ok(HashMap::new());
-    }
-    let db_rows = conn.query(sql, &[&join_keys], true).await?;
-    let mut rows: HashMap<String, Row> = HashMap::new();
-    for db_row in db_rows {
-        let jk: String = db_row.get(0);
-        let field: String = db_row.get(1);
-        let value: Option<String> = db_row.get(2);
-        rows.entry(jk).or_default().insert(field, value);
-    }
-    Ok(rows)
-}
-
-/// The statement that bumps the generation of the rows of the projection
-/// `qualified_projection` (quoted, qualified) whose key `key_col` is any of
-/// `$1` (`text[]`), compared at the key's own type `key_pg_type`
-/// ([`key_array_filter`]) so the projection's primary key index serves it
-/// (issue #835). [`bump_generations`] runs it.
-fn generation_bump_statement(
-    qualified_projection: &str,
-    key_col: &str,
-    key_pg_type: Option<&str>,
-) -> String {
-    let gen_ident = quote_ident(ddl::PROJECTION_GEN_COLUMN);
-    let filter = key_array_filter(&quote_ident(key_col), key_pg_type);
-    format!("update {qualified_projection} set {gen_ident} = {gen_ident} + 1 where {filter}")
-}
-
-/// Bumps the generation of `bump`'s touched keys' projection rows, under
-/// `super::ledger::ENTRY_PLAN_SETTINGS` (no sequential scan, issue #835), as
-/// the page's other statements keyed by entry run.
-///
-/// The caller has locked the rows in key order first
-/// ([`lock_page_projection_rows`]): the bump alone locks in whatever order
-/// its plan reads the rows. With the key compared at its type, the planner
-/// reads the key index into a bitmap and the rows in physical order
-/// whenever the keys' rows are scattered through the table, as rewriting a
-/// projection's rows scatters them: on a 100k-row projection it read even
-/// two keys that way, on PostgreSQL 16 and 17.
-async fn bump_generations(
-    txn: &Transaction<'_>,
-    bump: &RelationshipGenBump,
-) -> Result<(), ApplyError> {
-    let keys: Vec<&str> = bump.touched_keys.iter().map(String::as_str).collect();
-    txn.batch_execute(super::ledger::ENTRY_PLAN_SETTINGS)
-        .await?;
-    txn.execute(&bump.sql, &[&keys]).await?;
-    txn.batch_execute(super::ledger::ENTRY_PLAN_RESET).await?;
-    Ok(())
-}
-
-/// Locks, `for update`, every to-one relationship projection row a page
-/// writes: the rows of `gen_bumps`' touched keys, which its generation bump
-/// writes ([`bump_generations`]), and of each reverse record's old and new
-/// key, which its guards read and its projection advance writes
-/// (`reverses`, each record with its keys). One statement per relationship
-/// ([`projection_lock_statement`]), in `relationship_id` order, each in key
-/// order, under `super::ledger::ENTRY_PLAN_SETTINGS` (no sequential scan),
-/// so every page takes these rows in the order the reverse release does
-/// (ADR-0002 I5, issue #848).
-///
-/// Left to themselves, the bump would lock its rows in plan order and the
-/// reverse records theirs one record at a time, in fold order, so two pages,
-/// or a page and the release, touching an overlapping set of keys in
-/// different orders would deadlock. A key with no row yet has nothing to
-/// lock here: a row committed after this statement is locked by the record
-/// that reads it (its guards), and a record that inserts a row takes its
-/// lock when it writes it, both in record order. Two pages can still
-/// deadlock through such a row, but only while it is being created.
-async fn lock_page_projection_rows<'a>(
-    txn: &Transaction<'_>,
-    gen_bumps: &HashMap<i64, RelationshipGenBump>,
-    reverses: impl IntoIterator<
-        Item = (
-            &'a RelationshipReverseRecord,
-            &'a (Option<String>, Option<String>),
-        ),
-    >,
-) -> Result<(), ApplyError> {
-    let mut locks: BTreeMap<i64, (String, Vec<&str>)> = BTreeMap::new();
-    for (relationship_id, bump) in gen_bumps {
-        locks
-            .entry(*relationship_id)
-            .or_insert_with(|| (bump.lock_sql.clone(), Vec::new()))
-            .1
-            .extend(bump.touched_keys.iter().map(String::as_str));
-    }
-    for (record, (old_key, new_key)) in reverses {
-        let shape = &record.shape;
-        if shape.qualified_projection.is_empty() || (old_key.is_none() && new_key.is_none()) {
-            continue;
-        }
-        let keys = match locks.entry(shape.id) {
-            std::collections::btree_map::Entry::Occupied(entry) => &mut entry.into_mut().1,
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                let key_pg_type = shape.to_side.key_pg_type(txn, &shape.to_col).await?;
-                let sql = projection_lock_statement(
-                    &shape.qualified_projection,
-                    &shape.to_col,
-                    key_pg_type,
-                );
-                &mut entry.insert((sql, Vec::new())).1
-            }
-        };
-        keys.extend(old_key.iter().chain(new_key).map(String::as_str));
-    }
-    locks.retain(|_, (_, keys)| !keys.is_empty());
-    if locks.is_empty() {
-        return Ok(());
-    }
-    txn.batch_execute(super::ledger::ENTRY_PLAN_SETTINGS)
-        .await?;
-    for (sql, keys) in locks.values() {
-        txn.query(sql, &[keys]).await?;
-    }
-    txn.batch_execute(super::ledger::ENTRY_PLAN_RESET).await?;
-    Ok(())
-}
-
-/// The statement that locks the rows of the projection
-/// `qualified_projection` (quoted, qualified) whose key `key_col` is any of
-/// `$1` (`text[]`), `for update` in key order, compared at the key's own type
-/// `key_pg_type` ([`key_array_filter`]) so the projection's primary key index
-/// serves it (issue #835). One row per locked row.
-/// [`lock_projection_rows`] runs it.
-fn projection_lock_statement(
-    qualified_projection: &str,
-    key_col: &str,
-    key_pg_type: Option<&str>,
-) -> String {
-    let key_ident = quote_ident(key_col);
-    let filter = key_array_filter(&key_ident, key_pg_type);
-    format!("select 1 from {qualified_projection} where {filter} order by {key_ident} for update")
-}
-
-/// Runs [`projection_lock_statement`]'s statement `sql` for `keys` under
-/// `super::ledger::ENTRY_PLAN_SETTINGS` (no sequential scan, issue #835), and
-/// returns how many rows it locked.
-async fn lock_projection_rows(
-    txn: &Transaction<'_>,
-    sql: &str,
-    keys: &[String],
-) -> Result<usize, ApplyError> {
-    Ok(super::ledger::query_by_entry_key(txn, sql, &[&keys])
-        .await?
-        .len())
-}
-
-/// The [`ValueType`] of each named column on `table`, introspected live from
-/// `pg_catalog` via its raw `atttypid` OID and [`crate::defs::pg_type::value_type_for_oid`]
-/// (issue #108 — previously a second, independently-drifting copy of
-/// `catalog`'s own `format_type`-text matching lived here), so a to-side
-/// relationship column's text is typed the same way the from-side source
-/// columns are. A column not found is simply absent — the evaluator
-/// defaults an absent to-side column to `Numeric`.
-pub(crate) async fn to_column_types(
-    pool: &Pool,
-    table: &str,
-    columns: &[String],
-) -> Result<HashMap<String, ValueType>, ApplyError> {
-    if columns.is_empty() {
-        return Ok(HashMap::new());
-    }
-    let client = pool.get().await?;
-    let rows = client
-        .query(
-            "select a.attname::text, a.atttypid \
-             from pg_attribute a \
-             where a.attrelid = pg_catalog.to_regclass($1) \
-               and a.attname = any($2::text[]) \
-               and a.attnum > 0 \
-               and not a.attisdropped",
-            &[&ddl::regclass_arg(table), &columns],
-        )
-        .await?;
-    let mut types = HashMap::with_capacity(rows.len());
-    for row in rows {
-        let name: String = row.get(0);
-        let type_oid: u32 = row.get(1);
-        // Issue #117: also recognizes a user-defined enum type, reaching
-        // for `client` only when `type_oid` isn't a fixed builtin — see
-        // `pg_type::value_type_for_oid`'s own doc comment.
-        types.insert(
-            name,
-            crate::defs::pg_type::value_type_for_oid(&**client, type_oid).await?,
-        );
-    }
-    Ok(types)
-}
 
 // ---------------------------------------------------------------------
 // Phase 2: compute
@@ -4117,7 +1183,6 @@ struct Rederive {
     paused: std::collections::HashSet<String>,
     /// A direct writer's: a row that fails to evaluate is left as it is.
     skip_failing: bool,
-    relationships: RederiveRelationships,
 }
 
 impl std::fmt::Debug for Rederive {
@@ -4125,62 +1190,7 @@ impl std::fmt::Debug for Rederive {
         f.debug_struct("Rederive")
             .field("def", &self.def.target)
             .field("paused", &self.paused)
-            .field(
-                "relationships",
-                &!matches!(self.relationships, RederiveRelationships::None),
-            )
             .finish()
-    }
-}
-
-/// Where a 1-1 definition reads a relationship's related rows from.
-///
-/// A Re-derive always reads them in its own transaction, after the entry
-/// lock and its read of the rows, for exactly the rows it read (ADR-0002,
-/// "Relationships"; issues #832 and #838). A parent change that commits
-/// before that read is in it; one that commits after stages a recompute of
-/// the rows it reaches, whose page waits on the entry lock and writes after
-/// this one. A read made before the lock would let a parent change and the
-/// page of the recompute it stages both commit in between, and the
-/// Re-derive would then write the value they replaced, with nothing left
-/// to heal it.
-enum RederiveRelationships {
-    /// The definition reads no relationship.
-    None,
-    /// A page's: the context Phase 2 read for the page's Applies, and the
-    /// reads its Re-derives run under the entry lock. An Apply may evaluate
-    /// against Phase 2's context: a parent change that commits after that
-    /// read stages a recompute whose Re-derive reads the row after the
-    /// Apply's change, and I2 refuses the Apply if it comes later still.
-    /// Phase 2's read also named the parents the page bumps the generation
-    /// of (step 3c). A Re-derive whose row joins a parent outside that set
-    /// (the row was re-pointed after Phase 2) bumps nothing for it, which
-    /// is harmless: since #623 D5, guard (b) only defers a parent's reverse,
-    /// and the reverse's recomputes come from a live read of the from-side
-    /// rows under its own transaction, whether or not it deferred first.
-    Both(RelationshipContext, RelationshipReads),
-    /// A direct writer's ([`DirectRederive`], issue #832): it applies
-    /// nothing, so it only reads under the lock.
-    UnderLock(RelationshipReads),
-}
-
-impl RederiveRelationships {
-    /// The context Phase 2 read, for a page's Applies.
-    fn phase2(&self) -> Option<&RelationshipContext> {
-        match self {
-            RederiveRelationships::Both(ctx, _) => Some(ctx),
-            RederiveRelationships::None | RederiveRelationships::UnderLock(_) => None,
-        }
-    }
-
-    /// The reads a Re-derive runs under its entry lock.
-    fn under_lock(&self) -> Option<&RelationshipReads> {
-        match self {
-            RederiveRelationships::Both(_, reads) | RederiveRelationships::UnderLock(reads) => {
-                Some(reads)
-            }
-            RederiveRelationships::None => None,
-        }
     }
 }
 
@@ -4254,9 +1264,8 @@ enum AggregateState {
 }
 
 /// The fan-in tie-break for [`StagedChange::Recompute::src_changed`]
-/// (issues #51/#52's multi-hop gap): when more than one to-side change in a
-/// batch feeds the same propagated key (forward propagation's `changed` map,
-/// or reverse recompute's `(from_table, from_key)` accumulator), the
+/// (issues #51/#52's multi-hop gap): when more than one change in a batch
+/// feeds the same propagated key (forward propagation's `changed` map), the
 /// **earliest** (`min`) of their origins wins — the oldest/earliest
 /// source-commit timestamp captures the slowest straggler in the group,
 /// matching the p99/stall-visibility intent these latency histograms exist
@@ -4496,36 +1505,6 @@ mod tests {
         );
     }
 
-    /// Issue #677: a to-side image missing the relationship's `to_col` is
-    /// `MissingColumn`, not "no key" (which would silently skip the parent's
-    /// reverse propagation). An absent image, or a present `NULL` key, is
-    /// still no key.
-    #[test]
-    fn a_relationship_key_missing_from_a_present_image_raises_missing_column() {
-        let missing: Option<Row> =
-            Some(HashMap::from([("name".to_string(), Some("a".to_string()))]));
-        assert_eq!(
-            relationship_key_text(&missing, "id", "buyer"),
-            Err(EvalError::MissingColumn {
-                field: "buyer".to_string(),
-                column: "id".to_string(),
-            })
-        );
-        let null_key: Option<Row> = Some(HashMap::from([("id".to_string(), None)]));
-        assert_eq!(relationship_key_text(&null_key, "id", "buyer"), Ok(None));
-        assert_eq!(relationship_key_text(&None, "id", "buyer"), Ok(None));
-        let keyed: Option<Row> = Some(HashMap::from([("id".to_string(), Some("1".to_string()))]));
-        assert_eq!(
-            relationship_read_key(&null_key, &keyed, "id", "buyer"),
-            Ok(Some("1".to_string())),
-            "a NULL old key still falls back to the new image's key"
-        );
-        assert!(
-            relationship_read_key(&missing, &keyed, "id", "buyer").is_err(),
-            "an old image missing the key fails rather than falling back"
-        );
-    }
-
     /// Issue #344: a basis is compared to the source's current row as jsonb,
     /// so it must be valid JSON whatever text a column holds, keep SQL NULL
     /// distinct from the text `"null"`, and come out the same for the same
@@ -4573,38 +1552,6 @@ mod tests {
     #[test]
     fn earliest_src_changed_of_two_unknowns_stays_unknown() {
         assert_eq!(earliest_src_changed(None, None), None);
-    }
-
-    /// Issue #134/#135 review follow-up: `ReverseGuardFailure::metric_label`'s
-    /// per-variant mapping, as a pure in-memory unit test — no DB, no
-    /// shared process-wide metrics registry, so (unlike an integration test
-    /// that reads `trellis::metrics::Metrics::render_prometheus`, itself
-    /// shared with every other test in the same binary and run in
-    /// parallel by default) this can never be flaky. Deliberately narrow:
-    /// this is the "each guard maps to its own, correct label" proof;
-    /// `tests/apply_relationship_reverse.rs`'s own metrics test is what
-    /// proves the *end-to-end wiring* (Phase 3 discovery -> buffered
-    /// `ApplyOutcome::deferral_counts` -> post-commit flush -> registry)
-    /// actually works, which a pure unit test of this function alone
-    /// cannot.
-    #[test]
-    fn reverse_guard_failure_metric_labels_match_the_plan_docs_own_d5_block_names() {
-        assert_eq!(
-            ReverseGuardFailure::Watermark.metric_label(),
-            "d5_block_barrier"
-        );
-        assert_eq!(
-            ReverseGuardFailure::Generation.metric_label(),
-            "d5_block_gen"
-        );
-        assert_eq!(
-            ReverseGuardFailure::InFlight.metric_label(),
-            "d5_block_inflight"
-        );
-        assert_eq!(
-            ReverseGuardFailure::Ordering.metric_label(),
-            "d5_block_order"
-        );
     }
 
     /// The exact numeric value of a Prometheus exposition line whose metric
@@ -5537,707 +2484,6 @@ mod tests {
         assert_eq!(deleted, keys.into_iter().collect(), "every key is deleted");
     }
 
-    /// Issue #531: only a record at or below its relationship's refresh
-    /// stamp takes the live-row check. A relationship never refreshed, or a
-    /// record above the stamp (every change after the refresh), reads
-    /// nothing extra.
-    #[test]
-    fn only_a_record_at_or_below_the_refresh_stamp_is_overtaken() {
-        let stamp = PgLsn::from(0x2000);
-        assert!(!overtaken_by_refresh(Some(PgLsn::from(0x1000)), None));
-        assert!(!overtaken_by_refresh(None, None));
-        assert!(!overtaken_by_refresh(
-            Some(PgLsn::from(0x2001)),
-            Some(stamp)
-        ));
-        assert!(overtaken_by_refresh(Some(stamp), Some(stamp)));
-        assert!(overtaken_by_refresh(Some(PgLsn::from(0x1000)), Some(stamp)));
-        assert!(overtaken_by_refresh(None, Some(stamp)));
-    }
-
-    /// Issue #835's tests' relationship projection: `public.stale_projection`,
-    /// keyed by an `integer` primary key, analyzed at 100 rows and grown to
-    /// 400k with autovacuum off, so its statistics lag its size. Returns the
-    /// connection, the projection (quoted, qualified), its key's type as
-    /// [`key_column_pg_type`] reads it, and 5,000 of its keys, in key order.
-    async fn stale_projection(
-        db: &testkit::TestDatabase,
-    ) -> (tokio_postgres::Client, String, Option<String>, Vec<String>) {
-        let (client, connection) = tokio_postgres::connect(db.dsn(), NoTls)
-            .await
-            .expect("connect");
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
-        client
-            .batch_execute(
-                "create table stale_projection ( \
-                     id int primary key, name text, \
-                     __trellis_gen bigint not null default 0, __trellis_lsn pg_lsn) \
-                     with (autovacuum_enabled = false); \
-                 insert into stale_projection (id, name) \
-                     select i, 'n' || i from generate_series(1, 100) i; \
-                 analyze stale_projection; \
-                 insert into stale_projection (id, name) \
-                     select i, 'n' || i from generate_series(101, 400000) i;",
-            )
-            .await
-            .expect("seed the projection");
-        let key_pg_type = key_column_pg_type_in(&client, "public.stale_projection", "id")
-            .await
-            .expect("key type");
-        assert_eq!(key_pg_type.as_deref(), Some("integer"));
-        let keys: Vec<String> = client
-            .query(
-                "select id::text from stale_projection where id % 79 = 0 \
-                 order by stale_projection.id limit 5000",
-                &[],
-            )
-            .await
-            .expect("keys")
-            .into_iter()
-            .map(|row| row.get(0))
-            .collect();
-        assert_eq!(keys.len(), 5000);
-        (
-            client,
-            "\"public\".\"stale_projection\"".to_string(),
-            key_pg_type,
-            keys,
-        )
-    }
-
-    /// `sql`'s plan for `keys`, explained under the entry plan settings.
-    async fn plan_by_entry_key(txn: &Transaction<'_>, sql: &str, keys: &[&str]) -> String {
-        crate::staging::ledger::query_by_entry_key(txn, &format!("explain {sql}"), &[&keys])
-            .await
-            .expect("explain")
-            .into_iter()
-            .map(|row| row.get::<_, String>(0))
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    /// The sequential scans `txn` has started on `public.stale_projection`.
-    async fn projection_seq_scans(txn: &Transaction<'_>) -> i64 {
-        txn.query_one(
-            "select seq_scan from pg_stat_xact_user_tables \
-             where relid = 'public.stale_projection'::regclass",
-            &[],
-        )
-        .await
-        .expect("scans")
-        .get(0)
-    }
-
-    /// The rows `txn` has fetched from `public.stale_projection` through an
-    /// index.
-    async fn projection_index_fetches(txn: &Transaction<'_>) -> i64 {
-        txn.query_one(
-            "select idx_tup_fetch from pg_stat_xact_user_tables \
-             where relid = 'public.stale_projection'::regclass",
-            &[],
-        )
-        .await
-        .expect("fetches")
-        .get(0)
-    }
-
-    /// Asserts that `plan` reads the projection only through its primary key
-    /// index, by the keys: no sequential scan, and no filter, which a scan
-    /// of the whole index (the order the release's lock asks for) applies
-    /// when the key column is cast.
-    fn assert_probes_the_key(plan: &str, what: &str) {
-        assert!(
-            !plan.contains("Seq Scan") && !plan.contains("Filter:"),
-            "{what} must probe the projection's key index, got:\n{plan}"
-        );
-    }
-
-    /// Issue #835: the to-one generation bump ([`bump_generations`]) reads
-    /// the projection by its primary key while the projection's statistics
-    /// lag its size. It cast the key column to `text`, which no index serves,
-    /// so it read all 400k rows to bump 5,000; and PostgreSQL 16 still scans
-    /// for thousands of `= any` values compared at the key's type unless the
-    /// statement runs under the entry plan settings.
-    ///
-    /// It must still bump each key's row by exactly one, and no other, and
-    /// put the settings back.
-    #[tokio::test]
-    async fn the_generation_bump_never_scans_a_stale_projection() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (mut client, projection, key_pg_type, keys) = stale_projection(&db).await;
-        let bump = RelationshipGenBump {
-            lock_sql: projection_lock_statement(&projection, "id", key_pg_type.as_deref()),
-            sql: generation_bump_statement(&projection, "id", key_pg_type.as_deref()),
-            touched_keys: keys.iter().cloned().collect(),
-        };
-        let bound: Vec<&str> = keys.iter().map(String::as_str).collect();
-        let txn = client.transaction().await.expect("begin");
-        let plan = plan_by_entry_key(&txn, &bump.lock_sql, &bound).await;
-        assert_probes_the_key(&plan, "the generation bump's lock");
-        let plan = plan_by_entry_key(&txn, &bump.sql, &bound).await;
-        assert_probes_the_key(&plan, "the generation bump");
-        let before = projection_seq_scans(&txn).await;
-        bump_generations(&txn, &bump).await.expect("bump");
-        assert_eq!(
-            projection_seq_scans(&txn).await,
-            before,
-            "the bump must not scan the projection, as its plan above doesn't"
-        );
-        let setting: String = txn
-            .query_one("select current_setting('enable_seqscan')", &[])
-            .await
-            .expect("setting")
-            .get(0);
-        assert_eq!(setting, "on", "the settings are put back afterwards");
-        let bumped: Vec<String> = txn
-            .query(
-                "select id::text from stale_projection where __trellis_gen = 1 \
-                 order by stale_projection.id",
-                &[],
-            )
-            .await
-            .expect("bumped")
-            .into_iter()
-            .map(|row| row.get(0))
-            .collect();
-        let others: i64 = txn
-            .query_one(
-                "select count(*) from stale_projection where __trellis_gen not in (0, 1)",
-                &[],
-            )
-            .await
-            .expect("others")
-            .get(0);
-        txn.rollback().await.expect("rollback");
-        assert_eq!(
-            bumped, keys,
-            "every touched key's row is bumped, and no other"
-        );
-        assert_eq!(others, 0, "each row is bumped at most once");
-    }
-
-    /// Issues #835 and #848: a page locks the rows its generation bump
-    /// ([`bump_generations`]) writes in key order
-    /// ([`lock_page_projection_rows`]), the order the reverse release's lock
-    /// and every other page take them in (ADR-0002 I5). The bare `update`
-    /// reads the key index into a bitmap and locks the rows in physical
-    /// order, so on a projection whose keys are scattered through the table,
-    /// with key 2's row before key 1's, it locked 2 first.
-    ///
-    /// Another transaction holds key 2's row; the page's lock of keys 1 and 2
-    /// must then wait on key 2 holding key 1's lock, not hold nothing.
-    #[tokio::test]
-    async fn the_generation_bump_locks_its_rows_in_key_order() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let connect = || async {
-            let (client, connection) = tokio_postgres::connect(db.dsn(), NoTls)
-                .await
-                .expect("connect");
-            tokio::spawn(async move {
-                let _ = connection.await;
-            });
-            client
-        };
-        let mut holder = connect().await;
-        holder
-            .batch_execute(
-                "create table reversed_projection ( \
-                     id int primary key, __trellis_gen bigint not null default 0); \
-                 insert into reversed_projection (id) values (2), (1); \
-                 insert into reversed_projection (id) \
-                     select (i * 7919::bigint % 100003)::int \
-                     from generate_series(1, 100002) i \
-                     where i * 7919::bigint % 100003 > 2; \
-                 analyze reversed_projection;",
-            )
-            .await
-            .expect("seed the projection");
-        let projection = "\"public\".\"reversed_projection\"";
-        let bump = RelationshipGenBump {
-            lock_sql: projection_lock_statement(projection, "id", Some("integer")),
-            sql: generation_bump_statement(projection, "id", Some("integer")),
-            touched_keys: ["1", "2"].into_iter().map(String::from).collect(),
-        };
-        let bound = vec!["1", "2"];
-        {
-            let txn = holder.transaction().await.expect("begin");
-            let plan = plan_by_entry_key(&txn, &bump.sql, &bound).await;
-            txn.rollback().await.expect("rollback");
-            assert!(
-                plan.contains("Bitmap Heap Scan"),
-                "the bare bump reads the rows in physical order, which this test \
-                 relies on to tell the orders apart, got:\n{plan}"
-            );
-        }
-
-        let held = holder.transaction().await.expect("begin");
-        held.execute(
-            "select 1 from reversed_projection where id = 2 for update",
-            &[],
-        )
-        .await
-        .expect("hold key 2");
-        let mut bumper = connect().await;
-        let bumper_pid: i32 = bumper
-            .query_one("select pg_backend_pid()", &[])
-            .await
-            .expect("pid")
-            .get(0);
-        let bumping = tokio::spawn(async move {
-            let txn = bumper.transaction().await.expect("begin");
-            let bumps = HashMap::from([(1, bump)]);
-            lock_page_projection_rows(&txn, &bumps, std::iter::empty())
-                .await
-                .expect("lock");
-            bump_generations(&txn, &bumps[&1]).await.expect("bump");
-            txn.commit().await.expect("commit");
-        });
-        // The bump waits on the lock this test holds: a precondition the
-        // test sets up, not a convergence wait.
-        let observer = connect().await;
-        let mut blocked = false;
-        for _ in 0..6000 {
-            blocked = observer
-                .query_one(
-                    "select exists (select 1 from pg_stat_activity \
-                     where pid = $1 and wait_event_type = 'Lock')",
-                    &[&bumper_pid],
-                )
-                .await
-                .expect("read pg_stat_activity")
-                .get(0);
-            if blocked {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(blocked, "the lock never waited on key 2's held lock");
-        let free: Vec<i32> = observer
-            .query(
-                "select id from reversed_projection where id = 1 for update skip locked",
-                &[],
-            )
-            .await
-            .expect("try key 1")
-            .into_iter()
-            .map(|row| row.get(0))
-            .collect();
-        held.rollback().await.expect("release key 2");
-        bumping.await.expect("the bump finishes");
-        assert!(
-            free.is_empty(),
-            "the lock holds key 1 while it waits on key 2: it locks in key order"
-        );
-        let gens: Vec<(i32, i64)> = observer
-            .query(
-                "select id, __trellis_gen from reversed_projection \
-                 where id <= 2 or __trellis_gen <> 0 order by id",
-                &[],
-            )
-            .await
-            .expect("gens")
-            .into_iter()
-            .map(|row| (row.get(0), row.get(1)))
-            .collect();
-        assert_eq!(gens, vec![(1, 1), (2, 1)], "each key's row is bumped once");
-    }
-
-    /// Issue #848: a page's projection lock ([`lock_page_projection_rows`])
-    /// locks the rows of its generation bumps' keys and of each reverse
-    /// record's old and new key, and no other, reading a projection whose
-    /// statistics lag its size by its primary key, as the release's lock
-    /// does. The reverse records' statement is built from the shape's key
-    /// type, and the settings are put back afterwards. Under 4,900 keys
-    /// compared at the key's type, PostgreSQL 16 scans the projection unless
-    /// the statement runs under the entry plan settings; with the key cast to
-    /// `text`, it walks the whole key index.
-    #[tokio::test]
-    async fn a_page_locks_every_projection_row_it_writes_by_the_key() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (mut client, projection, key_pg_type, keys) = stale_projection(&db).await;
-        let bump = RelationshipGenBump {
-            lock_sql: projection_lock_statement(&projection, "id", key_pg_type.as_deref()),
-            sql: generation_bump_statement(&projection, "id", key_pg_type.as_deref()),
-            touched_keys: keys[..4900].iter().cloned().collect(),
-        };
-        let shape = Arc::new(ReverseRelationshipShape {
-            id: 2,
-            name: "parent".to_string(),
-            qualified_projection: projection.clone(),
-            projection_table_bare: "stale_projection".to_string(),
-            projection_schema: "public".to_string(),
-            to_col: "id".to_string(),
-            from_table: "public.src".to_string(),
-            from_col: "p".to_string(),
-            from_key_pg_type: std::sync::OnceLock::new(),
-            from_pk: None,
-            needs_recompute_fallback: false,
-            to_side: ToSide {
-                table: projection.clone(),
-                identity: "public.stale_projection".to_string(),
-                seam_fed: false,
-                key_pg_type: std::sync::OnceLock::new(),
-            },
-        });
-        let record = RelationshipReverseRecord {
-            shape,
-            old_row: None,
-            new_row: None,
-            old_image: None,
-            new_image: None,
-            lsn: None,
-            prev_lsn: None,
-            prev_gen: None,
-            watermark: PgLsn::from(0),
-            hop_gen: 0,
-            src_changed: None,
-            origin_lsn: None,
-            retry_count: 0,
-        };
-        // A key change, a key with no row yet, and a record with no key.
-        let reverse_keys = [
-            (Some(keys[4960].clone()), Some(keys[4950].clone())),
-            (None, Some("400001".to_string())),
-            (None, None),
-        ];
-        let bumps = HashMap::from([(1, bump)]);
-        let txn = client.transaction().await.expect("begin");
-        let before = projection_seq_scans(&txn).await;
-        let fetched_before = projection_index_fetches(&txn).await;
-        lock_page_projection_rows(
-            &txn,
-            &bumps,
-            reverse_keys.iter().map(|keys| (&record, keys)),
-        )
-        .await
-        .expect("lock");
-        assert_eq!(
-            projection_seq_scans(&txn).await,
-            before,
-            "the lock must not scan the projection"
-        );
-        let fetched = projection_index_fetches(&txn).await - fetched_before;
-        assert!(
-            fetched <= 4902,
-            "the lock fetches only the keys' rows, not the whole key index: {fetched}"
-        );
-        let setting: String = txn
-            .query_one("select current_setting('enable_seqscan')", &[])
-            .await
-            .expect("setting")
-            .get(0);
-        assert_eq!(setting, "on", "the settings are put back afterwards");
-        let (other, connection) = tokio_postgres::connect(db.dsn(), NoTls)
-            .await
-            .expect("connect");
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
-        let candidates: Vec<i32> = [0, 4899, 4900, 4950, 4960, 4999]
-            .iter()
-            .map(|&i| keys[i].parse().expect("an integer key"))
-            .collect();
-        let free: Vec<i32> = other
-            .query(
-                "select id from stale_projection where id = any($1) \
-                 order by stale_projection.id for update skip locked",
-                &[&candidates],
-            )
-            .await
-            .expect("free rows")
-            .into_iter()
-            .map(|row| row.get(0))
-            .collect();
-        txn.rollback().await.expect("rollback");
-        let expected_free: Vec<i32> = [4900, 4999]
-            .iter()
-            .map(|&i| keys[i].parse().expect("an integer key"))
-            .collect();
-        assert_eq!(
-            free, expected_free,
-            "the bump's keys and the reverse records' keys are locked, and no other"
-        );
-    }
-
-    /// Issue #835: Phase 3's single-key projection statements (the reverse
-    /// guards' locks, the projection advance's delete, the live-row write's
-    /// `seen` and `gone`, Phase 2's guard capture) find the row through
-    /// [`ToSide::projection_key_filter`], which compares the key at its type.
-    /// They cast the key column to `text` and read a 400k-row projection in
-    /// full for each key, whatever its statistics.
-    #[tokio::test]
-    async fn a_single_key_projection_statement_probes_the_key_index() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (mut client, projection, _, keys) = stale_projection(&db).await;
-        let to_side = ToSide {
-            table: projection.clone(),
-            identity: "public.stale_projection".to_string(),
-            seam_fed: false,
-            key_pg_type: std::sync::OnceLock::new(),
-        };
-        let txn = client.transaction().await.expect("begin");
-        let filter = to_side
-            .projection_key_filter(&txn, "id", "\"id\"")
-            .await
-            .expect("filter");
-        assert_eq!(filter, r#""id" = $1::text::integer"#);
-        let aliased = to_side
-            .projection_key_filter(&txn, "id", "q.\"id\"")
-            .await
-            .expect("filter");
-        let key = keys[1234].as_str();
-        let before = projection_seq_scans(&txn).await;
-        for sql in [
-            format!("select __trellis_gen from {projection} where {filter} for update"),
-            format!("select q.__trellis_gen from {projection} q where {aliased}"),
-            format!("delete from {projection} where {filter} returning __trellis_gen"),
-        ] {
-            let plan: Vec<String> = txn
-                .query(&format!("explain {sql}"), &[&key])
-                .await
-                .expect("explain")
-                .into_iter()
-                .map(|row| row.get(0))
-                .collect();
-            assert_probes_the_key(&plan.join("\n"), &sql);
-            let rows = txn.query(&sql, &[&key]).await.expect("run");
-            assert_eq!(rows.len(), 1, "{sql} finds the key's row");
-        }
-        let missing = txn
-            .query(
-                &format!("select 1 from {projection} where {filter}"),
-                &[&None::<&str>],
-            )
-            .await
-            .expect("a NULL key");
-        assert!(missing.is_empty(), "a NULL key matches no row");
-        assert_eq!(
-            projection_seq_scans(&txn).await,
-            before,
-            "no statement scans the projection"
-        );
-        txn.rollback().await.expect("rollback");
-    }
-
-    /// Issue #835: the reverse release's projection lock
-    /// ([`lock_projection_rows`]) reads the projection by its primary key
-    /// while the projection's statistics lag its size. It cast the key column
-    /// to `text`, so it walked the whole key index in key order and filtered
-    /// every row.
-    ///
-    /// It must still lock every key's row, and no other.
-    #[tokio::test]
-    async fn the_release_lock_never_scans_a_stale_projection() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (mut client, projection, key_pg_type, keys) = stale_projection(&db).await;
-        let sql = projection_lock_statement(&projection, "id", key_pg_type.as_deref());
-        let bound: Vec<&str> = keys.iter().map(String::as_str).collect();
-        let txn = client.transaction().await.expect("begin");
-        let plan = plan_by_entry_key(&txn, &sql, &bound).await;
-        assert_probes_the_key(&plan, "the release lock");
-        assert!(
-            plan.contains("LockRows"),
-            "the statement locks the rows, got:\n{plan}"
-        );
-        let before = projection_seq_scans(&txn).await;
-        let locked = lock_projection_rows(&txn, &sql, &keys).await.expect("lock");
-        assert_eq!(
-            projection_seq_scans(&txn).await,
-            before,
-            "the lock must not scan the projection, as its plan above doesn't"
-        );
-        assert_eq!(locked, keys.len(), "one row per locked row");
-        let (other, connection) = tokio_postgres::connect(db.dsn(), NoTls)
-            .await
-            .expect("connect");
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
-        let free: Vec<String> = other
-            .query(
-                "select id::text from stale_projection where id % 79 = 0 or id = 1 \
-                 order by stale_projection.id for update skip locked",
-                &[],
-            )
-            .await
-            .expect("free rows")
-            .into_iter()
-            .map(|row| row.get(0))
-            .collect();
-        txn.rollback().await.expect("rollback");
-        let last: i32 = keys.last().expect("keys").parse().expect("key");
-        let expected: Vec<String> = std::iter::once(1)
-            .chain((1..=400000 / 79).map(|i| i * 79).filter(|id| *id > last))
-            .map(|id| id.to_string())
-            .collect();
-        assert_eq!(free, expected, "every key's row is locked, and no other");
-    }
-
-    /// Issue #835: a build chunk reads a to-one relationship's projection
-    /// under its entry lock ([`RelationshipReads::fetch_under_lock`], issue
-    /// #832), so a sequential scan of a projection whose statistics lag its
-    /// size lengthens the lock hold. PostgreSQL 16 scanned it for thousands
-    /// of `= any` keys; the read runs under the entry plan settings.
-    ///
-    /// It must still read every reached row's columns, keyed by join key.
-    #[tokio::test]
-    async fn the_projection_read_under_the_entry_lock_never_scans_a_stale_projection() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (mut client, projection, key_pg_type, keys) = stale_projection(&db).await;
-        let row_columns = live_row_columns(&client, "public.stale_projection")
-            .await
-            .expect("columns");
-        let sql =
-            projection_rows_statement(&projection, "id", key_pg_type.as_deref(), &row_columns);
-        let reads = RelationshipReads {
-            reads: vec![RelationshipRead {
-                id: 1,
-                name: "parent".to_string(),
-                from_col: "parent_id".to_string(),
-                to_columns: HashMap::new(),
-                kind: ReadKind::ToOne(Some(ProjectionRead {
-                    sql: sql.clone(),
-                    lock_sql: projection_lock_statement(&projection, "id", key_pg_type.as_deref()),
-                    bump_sql: generation_bump_statement(&projection, "id", key_pg_type.as_deref()),
-                })),
-            }],
-        };
-        let from_rows: Vec<Row> = keys
-            .iter()
-            .map(|key| Row::from([("parent_id".to_string(), Some(key.clone()))]))
-            .collect();
-        let from_rows: Vec<&Row> = from_rows.iter().collect();
-        let bound: Vec<&str> = keys.iter().map(String::as_str).collect();
-        let txn = client.transaction().await.expect("begin");
-        let plan = plan_by_entry_key(&txn, &sql, &bound).await;
-        assert_probes_the_key(&plan, "the projection read");
-        let before = projection_seq_scans(&txn).await;
-        let ctx = reads
-            .fetch_under_lock(&txn, &from_rows)
-            .await
-            .expect("fetch");
-        assert_eq!(
-            projection_seq_scans(&txn).await,
-            before,
-            "the read must not scan the projection, as its plan above doesn't"
-        );
-        txn.rollback().await.expect("rollback");
-        let read = ctx.to_one_rows("parent").expect("the relationship is read");
-        assert_eq!(read.len(), keys.len(), "every reached row is read");
-        for key in &keys {
-            let row = read.get(key).expect("the key's row");
-            assert_eq!(row.get("name"), Some(&Some(format!("n{key}"))));
-        }
-    }
-
-    /// Issue #972's tables: `join_indexed` and `join_unindexed`, each a
-    /// 400k-row `(id integer primary key, k integer, name text)` with `k`
-    /// unique (so near-unique, the PostgreSQL 16 case that prices 5,000
-    /// `= any` probes above a parallel sequential scan), analyzed at 100
-    /// rows and then grown, with autovacuum off, so statistics lag the size.
-    /// `join_indexed` has a btree on `k`; `join_unindexed` has none. Returns
-    /// a connection, a same-crate pool, and 5,000 of the keys, in key order.
-    async fn stale_join_tables(
-        db: &testkit::TestDatabase,
-    ) -> (tokio_postgres::Client, Pool, Vec<String>) {
-        let (client, connection) = tokio_postgres::connect(db.dsn(), NoTls)
-            .await
-            .expect("connect");
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
-        for (table, index) in [
-            ("join_indexed", "create index on join_indexed (k);"),
-            ("join_unindexed", ""),
-        ] {
-            client
-                .batch_execute(&format!(
-                    "create table {table} (id int primary key, k int, name text) \
-                         with (autovacuum_enabled = false); \
-                     insert into {table} select i, i, 'n' || i from generate_series(1, 100) i; \
-                     analyze {table}; \
-                     {index} \
-                     insert into {table} \
-                         select i, i, 'n' || i from generate_series(101, 400000) i;"
-                ))
-                .await
-                .expect("seed the join table");
-        }
-        let keys: Vec<String> = client
-            .query(
-                "select k::text from join_indexed where k % 79 = 0 order by k limit 5000",
-                &[],
-            )
-            .await
-            .expect("keys")
-            .into_iter()
-            .map(|row| row.get(0))
-            .collect();
-        assert_eq!(keys.len(), 5000);
-        let pool = crate::pool::Pool::new(
-            &crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
-        )
-        .expect("build a same-crate pool");
-        (client, pool, keys)
-    }
-
-    /// `read`'s plan for `keys`, explained the way [`KeyBatchRead::run`]
-    /// runs the read itself, on the same connection.
-    async fn plan_of_read(conn: ReadConn<'_, '_>, read: &KeyBatchRead, keys: &[String]) -> String {
-        let explain = KeyBatchRead {
-            sql: format!("explain {}", read.sql),
-            indexed: read.indexed,
-        };
-        explain
-            .run(conn, keys)
-            .await
-            .expect("explain")
-            .into_iter()
-            .map(|row| row.get::<_, String>(0))
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    /// The plan of an index read: it uses an index or bitmap scan of the
-    /// table, never a sequential scan of it.
-    fn assert_read_through_index(plan: &str, what: &str) {
-        assert!(
-            (plan.contains("Index") || plan.contains("Bitmap")) && !plan.contains("Seq Scan"),
-            "{what} must read through the join column's index, got:\n{plan}"
-        );
-    }
-
-    /// The plan of a read the entry plan settings didn't touch: no
-    /// sequential scan was disabled (an added `disable_cost` on PostgreSQL
-    /// 16 and 17, a `Disabled` node on 18), so a table it can only scan
-    /// keeps its (parallel) sequential scan and isn't priced into JIT.
-    fn assert_read_planned_freely(plan: &str, what: &str) {
-        let costliest = plan
-            .split("cost=")
-            .skip(1)
-            .filter_map(|rest| {
-                rest.split_once("..")?
-                    .1
-                    .split_whitespace()
-                    .next()?
-                    .parse()
-                    .ok()
-            })
-            .fold(0.0_f64, f64::max);
-        assert!(
-            plan.contains("Seq Scan") && costliest < 1e9 && !plan.contains("Disabled"),
-            "{what} must keep its sequential scan, with none disabled, got:\n{plan}"
-        );
-    }
-
     /// Issue #972: which join columns count as indexed. Only the leading
     /// column of a plain, valid, ready, live btree index does; a lookup by a
     /// batch of keys can't use any other, so forcing the planner onto it
@@ -6274,7 +2520,7 @@ mod tests {
         let column = |name: &'static str| {
             let client = &client;
             async move {
-                key_column_in(client, "public.detect", name)
+                ddl::key_column_in(client, "public.detect", name)
                     .await
                     .expect("introspect")
                     .unwrap_or_else(|| panic!("{name} exists"))
@@ -6310,7 +2556,7 @@ mod tests {
             assert!(!column(name).await.indexed, "{name} is not indexed: {why}");
         }
         assert!(
-            key_column_in(&client, "public.detect", "missing")
+            ddl::key_column_in(&client, "public.detect", "missing")
                 .await
                 .expect("introspect")
                 .is_none(),
@@ -6342,773 +2588,6 @@ mod tests {
             column("invalid").await.indexed,
             "restored, it counts: the flags above were what decided it"
         );
-    }
-
-    /// Issue #972: a read resolves whether its join column is indexed when
-    /// it is built, so an index created or dropped afterwards is picked up
-    /// by the next resolve, and the flag it records is the one the read acts
-    /// on.
-    #[tokio::test]
-    async fn a_resolve_picks_up_an_index_created_after_the_last() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (client, pool, _) = stale_join_tables(&db).await;
-        let indexed = |table: &'static str| {
-            let pool = pool.clone();
-            async move {
-                to_side_rows_sql(&pool, &format!("public.{table}"), "k")
-                    .await
-                    .expect("resolve")
-                    .indexed
-            }
-        };
-        assert!(indexed("join_indexed").await);
-        assert!(!indexed("join_unindexed").await);
-        client
-            .batch_execute("create index on join_unindexed (k); drop index join_indexed_k_idx;")
-            .await
-            .expect("swap the indexes");
-        assert!(!indexed("join_indexed").await);
-        assert!(indexed("join_unindexed").await);
-    }
-
-    /// Issue #972: [`ReadConn::query`] runs a read under the entry plan
-    /// settings only when asked, on a pool client and inside a transaction
-    /// alike, and leaves a pool client outside any transaction and its
-    /// settings as they were.
-    #[tokio::test]
-    async fn a_key_batch_read_runs_under_the_entry_plan_settings_only_when_by_index() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (mut client, connection) = tokio_postgres::connect(db.dsn(), NoTls)
-            .await
-            .expect("connect");
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
-        let setting = "select current_setting('enable_seqscan')";
-        let value = |rows: Vec<tokio_postgres::Row>| rows[0].get::<_, String>(0);
-        assert_eq!(
-            value(
-                ReadConn::Pool(&client)
-                    .query(setting, &[], true)
-                    .await
-                    .expect("by index")
-            ),
-            "off"
-        );
-        assert_eq!(
-            value(
-                ReadConn::Pool(&client)
-                    .query(setting, &[], false)
-                    .await
-                    .expect("free")
-            ),
-            "on"
-        );
-        assert_not_in_a_transaction_with_settings_on(&client).await;
-        let txn = client.transaction().await.expect("begin");
-        assert_eq!(
-            value(
-                ReadConn::Txn(&txn)
-                    .query(setting, &[], true)
-                    .await
-                    .expect("by index")
-            ),
-            "off"
-        );
-        assert_eq!(
-            value(
-                ReadConn::Txn(&txn)
-                    .query(setting, &[], false)
-                    .await
-                    .expect("free")
-            ),
-            "on",
-            "the settings are put back after a read inside a transaction"
-        );
-        txn.rollback().await.expect("rollback");
-    }
-
-    /// The settings are `on`, and `client` is in no transaction: a
-    /// transaction already open would have started before the statement
-    /// that asks.
-    async fn assert_not_in_a_transaction_with_settings_on(client: &tokio_postgres::Client) {
-        // The simple protocol, whose one statement starts its transaction
-        // and its own timestamp together.
-        let messages = client
-            .simple_query(
-                "select current_setting('enable_seqscan'), \
-                        transaction_timestamp() = statement_timestamp()",
-            )
-            .await
-            .expect("state");
-        let row = messages
-            .iter()
-            .find_map(|message| match message {
-                tokio_postgres::SimpleQueryMessage::Row(row) => Some(row),
-                _ => None,
-            })
-            .expect("a row");
-        assert_eq!(row.get(0), Some("on"), "the settings are back");
-        assert_eq!(row.get(1), Some("t"), "the connection is in no transaction");
-    }
-
-    /// Issue #972: a read on a pool client that fails, or whose future is
-    /// dropped once it has queued its statements, still leaves the
-    /// connection outside its transaction with the settings gone, since
-    /// the pool hands the connection to its next borrower.
-    #[tokio::test]
-    async fn a_pool_read_under_the_settings_never_leaves_its_connection_in_a_transaction() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (client, connection) = tokio_postgres::connect(db.dsn(), NoTls)
-            .await
-            .expect("connect");
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
-        // Fails when it runs, after it has been prepared and begun.
-        let failed = crate::staging::ledger::query_on_pool_by_entry_key(
-            &client,
-            "select 1 / ($1::int - 1)",
-            &[&1_i32],
-        )
-        .await;
-        assert!(failed.is_err(), "division by zero");
-        assert_not_in_a_transaction_with_settings_on(&client).await;
-
-        // Dropped while its query runs, after the three statements are
-        // queued: the sleep outlasts the timeout, which outlasts the prepare.
-        let params: [&(dyn tokio_postgres::types::ToSql + Sync); 0] = [];
-        let dropped = tokio::time::timeout(
-            Duration::from_millis(250),
-            crate::staging::ledger::query_on_pool_by_entry_key(
-                &client,
-                "select pg_sleep(1)",
-                &params,
-            ),
-        )
-        .await;
-        assert!(dropped.is_err(), "the read was cut short");
-        // The next statement on the connection runs behind the queued ones.
-        assert_not_in_a_transaction_with_settings_on(&client).await;
-    }
-
-    /// The `RelationshipReads` of one to-many relationship `rel` of
-    /// `from_col`, over `to_table`'s `k`.
-    async fn to_many_reads(pool: &Pool, to_table: &str) -> RelationshipReads {
-        RelationshipReads {
-            reads: vec![RelationshipRead {
-                id: 1,
-                name: "rel".to_string(),
-                from_col: "from_k".to_string(),
-                to_columns: HashMap::new(),
-                kind: ReadKind::ToMany(
-                    to_side_rows_sql(pool, to_table, "k")
-                        .await
-                        .expect("resolve"),
-                ),
-            }],
-        }
-    }
-
-    /// `join_indexed` and `join_unindexed`'s `id` as the key a from-side
-    /// read decodes.
-    fn join_table_pk() -> Vec<PrimaryKeyColumn> {
-        vec![PrimaryKeyColumn {
-            name: "id".to_string(),
-            data_type: "integer".to_string(),
-            nullable: false,
-            collation: None,
-        }]
-    }
-
-    /// Issue #972: the key-batch reads of a relationship's join column run
-    /// under the entry plan settings where the column is indexed, and
-    /// as the planner would have them where it isn't. Each is read the way
-    /// production reads it (a to-many's to-side, on a pool client and inside
-    /// a transaction; a reverse lookup's from-side, on a pool client), at
-    /// 5,000 keys of 400k rows with statistics from when the table had 100,
-    /// and its plan is captured on the connection that reads.
-    ///
-    /// PostgreSQL 16 prices 5,000 `= any` probes of a near-unique index
-    /// above a parallel sequential scan, so left to itself it reads the
-    /// whole table: the indexed half of this test fails there without the
-    /// settings. An unindexed column has no index to force, so the settings
-    /// could only cost it its parallel scan (and a JIT compile): the other
-    /// half fails if they are applied.
-    #[tokio::test]
-    async fn a_key_batch_read_is_forced_onto_its_index_only_where_there_is_one() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (mut client, pool, keys) = stale_join_tables(&db).await;
-        let pk = join_table_pk();
-        for (table, indexed) in [("join_indexed", true), ("join_unindexed", false)] {
-            let qualified = format!("public.{table}");
-            let reads = [
-                (
-                    "the to-many read",
-                    to_side_rows_sql(&pool, &qualified, "k")
-                        .await
-                        .expect("resolve"),
-                ),
-                (
-                    "the reverse lookup",
-                    from_side_keys_read(&client, &qualified, &pk, "k")
-                        .await
-                        .expect("resolve"),
-                ),
-            ];
-            for (what, read) in &reads {
-                let what = format!("{what} of {table}");
-                assert_eq!(read.indexed, indexed, "{what} resolves its index");
-                let plan = plan_of_read(ReadConn::Pool(&client), read, &keys).await;
-                if indexed {
-                    assert_read_through_index(&plan, &format!("{what}, on a pool client"));
-                } else {
-                    assert_read_planned_freely(&plan, &format!("{what}, on a pool client"));
-                }
-            }
-            // Inside a transaction (the to-many read under the entry lock).
-            let read = &reads[0].1;
-            let txn = client.transaction().await.expect("begin");
-            let plan = plan_of_read(ReadConn::Txn(&txn), read, &keys).await;
-            txn.rollback().await.expect("rollback");
-            let what = format!("the to-many read of {table}, in a transaction");
-            if indexed {
-                assert_read_through_index(&plan, &what);
-            } else {
-                assert_read_planned_freely(&plan, &what);
-            }
-        }
-    }
-
-    /// Issue #972: the reads return the same rows indexed or not, on a pool
-    /// client and under the entry lock, and the indexed ones really read
-    /// the table through its index: the to-many read inside a transaction
-    /// starts no sequential scan of `join_indexed`.
-    #[tokio::test]
-    async fn the_key_batch_reads_return_the_same_rows_indexed_or_not() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (mut client, pool, keys) = stale_join_tables(&db).await;
-        let pk = join_table_pk();
-        // A key with no row, and a key the batch repeats.
-        let mut asked = keys.clone();
-        asked.push("-1".to_string());
-        let from_rows: Vec<Row> = asked
-            .iter()
-            .map(|key| Row::from([("from_k".to_string(), Some(key.clone()))]))
-            .collect();
-        let from_rows: Vec<&Row> = from_rows.iter().collect();
-        for table in ["join_indexed", "join_unindexed"] {
-            let qualified = format!("public.{table}");
-            let reads = to_many_reads(&pool, &qualified).await;
-            let on_pool = reads.fetch(&client, &from_rows).await.expect("fetch");
-            let txn = client.transaction().await.expect("begin");
-            let seq_scans = format!(
-                "select seq_scan from pg_stat_xact_user_tables where relid = 'public.{table}'::regclass"
-            );
-            let before: i64 = txn.query_one(&seq_scans, &[]).await.expect("scans").get(0);
-            let under_lock = reads
-                .fetch_under_lock(&txn, &from_rows)
-                .await
-                .expect("fetch under lock");
-            let scans: i64 = txn.query_one(&seq_scans, &[]).await.expect("scans").get(0);
-            txn.rollback().await.expect("rollback");
-            if table == "join_indexed" {
-                assert_eq!(scans, before, "the read under the lock scans no table");
-            } else {
-                assert!(scans > before, "an unindexed table has only a scan to read");
-            }
-            for (where_, ctx) in [
-                ("on a pool client", &on_pool),
-                ("under the lock", &under_lock),
-            ] {
-                let read = ctx.to_many_rows("rel").expect("the relationship is read");
-                assert_eq!(read.len(), keys.len(), "{table} {where_}: every key's rows");
-                for key in &keys {
-                    let rows = read.get(key).expect("the key's rows");
-                    assert_eq!(rows.len(), 1, "{table} {where_}: k is unique");
-                    assert_eq!(rows[0].get("name"), Some(&Some(format!("n{key}"))));
-                }
-            }
-            let from_side = ReverseTrigger::Keys(&keys[..3]);
-            let mut matched = from_side_keys(&pool, &qualified, &pk, "k", &from_side)
-                .await
-                .expect("from_side_keys");
-            matched.sort();
-            let mut expected: Vec<(String, Option<String>)> = keys[..3]
-                .iter()
-                .map(|key| (key.clone(), Some(key.clone())))
-                .collect();
-            expected.sort();
-            assert_eq!(matched, expected, "{table}: the reverse lookup");
-        }
-    }
-
-    /// Issue #531: a to-side truncate's projection clear is skipped only
-    /// when the truncate is at or below the refresh stamp. With no stamp, or
-    /// no `lsn` to compare, the clear runs.
-    #[test]
-    fn only_a_truncate_at_or_below_the_refresh_stamp_skips_its_clear() {
-        let stamp = PgLsn::from(0x2000);
-        assert!(!truncate_overtaken_by_refresh(
-            Some(PgLsn::from(0x1000)),
-            None
-        ));
-        assert!(!truncate_overtaken_by_refresh(None, None));
-        assert!(!truncate_overtaken_by_refresh(None, Some(stamp)));
-        assert!(!truncate_overtaken_by_refresh(
-            Some(PgLsn::from(0x2001)),
-            Some(stamp)
-        ));
-        assert!(truncate_overtaken_by_refresh(Some(stamp), Some(stamp)));
-        assert!(truncate_overtaken_by_refresh(
-            Some(PgLsn::from(0x1000)),
-            Some(stamp)
-        ));
-    }
-
-    /// Issue #125 regression pin, part 1: [`key_array_filter`] renders the
-    /// fixed, indexable shape — the bound `$1` array cast to the column's
-    /// own type, the column reference itself left uncast — when the
-    /// column's native type is known. A future edit that puts the `::text`
-    /// cast back on `col_ident` (rather than on the array) fails this
-    /// immediately, without needing a live Postgres connection at all.
-    #[test]
-    fn key_array_filter_casts_the_bound_array_not_the_column_when_type_is_known() {
-        let filter = key_array_filter(r#""join_key""#, Some("integer"));
-        assert_eq!(filter, r#""join_key" = any($1::text[]::integer[])"#);
-        assert!(
-            !filter.starts_with(r#""join_key"::text"#),
-            "the column reference itself must never be cast to ::text — that's exactly the \
-             cast that defeats a btree index on it (issue #125): {filter}"
-        );
-    }
-
-    /// Issue #835: [`single_key_filter`] casts the bound `$1`, not the
-    /// column, when the column's type is known, and falls back to the
-    /// column cast otherwise, as [`key_array_filter`] does for an array.
-    #[test]
-    fn single_key_filter_casts_the_bound_key_not_the_column_when_type_is_known() {
-        assert_eq!(
-            single_key_filter(r#"q."id""#, Some("integer")),
-            r#"q."id" = $1::text::integer"#
-        );
-        assert_eq!(single_key_filter(r#""id""#, None), r#""id"::text = $1"#);
-    }
-
-    /// Issue #125 regression pin, part 2: without a known native type (the
-    /// column couldn't be introspected), [`key_array_filter`] must still
-    /// fall back to the old, unindexable `::text` form rather than emitting
-    /// invalid SQL (an untyped `any($1::text[])` with no cast at all would
-    /// leave `col_ident`'s type to ordinary operator resolution, which is
-    /// not guaranteed to match `col_ident`'s real type for every allowed
-    /// join-key type).
-    #[test]
-    fn key_array_filter_falls_back_to_the_old_text_cast_when_type_is_unknown() {
-        let filter = key_array_filter(r#""join_key""#, None);
-        assert_eq!(filter, r#""join_key"::text = any($1::text[])"#);
-    }
-
-    /// Issue #125's actual regression: three relationship key-lookup sites
-    /// in this module (`from_side_keys`, `fetch_to_side_rows`,
-    /// `fetch_relationship_projection_rows`) used to render their join-key
-    /// filter as `col::text = any($1::text[])` — a cast on the *column*,
-    /// which Postgres can never satisfy with a plain btree index on that
-    /// column, regardless of table size or statistics. This proves the
-    /// fixed shape's real-world effect end to end against a live Postgres:
-    /// [`key_column_pg_type`] correctly discovers a real column's native
-    /// type from `pg_catalog`, and the resulting [`key_array_filter`]
-    /// clause lets the planner pick an index scan for a lookup of a handful
-    /// of keys out of a much larger indexed table — while the old,
-    /// pre-#125 filter shape, run against the very same table and index,
-    /// can only ever plan a sequential scan (proving the bug was real, not
-    /// just that the fixed form happens to also allow one).
-    #[tokio::test]
-    async fn key_array_filter_lets_postgres_use_the_index_the_old_text_cast_form_could_not() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (client, connection) = tokio_postgres::connect(db.dsn(), NoTls)
-            .await
-            .expect("connect");
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
-
-        // Large enough that an index scan over a handful of keys is
-        // unambiguously cheaper than a full scan, so the planner's own cost
-        // model — not just "an index technically exists" — picks the index
-        // for the fixed filter shape.
-        client
-            .batch_execute(
-                "create table big_from_side (id bigint primary key, join_key integer); \
-                 create index big_from_side_join_key_idx on big_from_side (join_key); \
-                 insert into big_from_side \
-                 select g, g % 5000 from generate_series(1, 200000) g; \
-                 analyze big_from_side;",
-            )
-            .await
-            .expect("seed a large indexed table");
-
-        let pool_config =
-            crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid schema");
-        let pool = crate::pool::Pool::new(&pool_config).expect("build a same-crate pool");
-
-        let pg_type = key_column_pg_type(&pool, "big_from_side", "join_key")
-            .await
-            .expect("introspect join_key's type");
-        assert_eq!(
-            pg_type.as_deref(),
-            Some("integer"),
-            "the join column's native pg_catalog type must be discovered correctly"
-        );
-
-        let keys = vec!["42".to_string()];
-
-        let fixed_filter = key_array_filter(r#""join_key""#, pg_type.as_deref());
-        let fixed_plan = explain_plan_lines(
-            &client,
-            &format!("select 1 from \"big_from_side\" where {fixed_filter}"),
-            &keys,
-        )
-        .await;
-        assert!(
-            fixed_plan.iter().any(|line| line.contains("Index")),
-            "issue #125's fix should let Postgres use the btree index on join_key, got:\n{}",
-            fixed_plan.join("\n")
-        );
-        assert!(
-            !fixed_plan.iter().any(|line| line.contains("Seq Scan")),
-            "issue #125's fix should not fall back to a sequential scan, got:\n{}",
-            fixed_plan.join("\n")
-        );
-
-        // Sanity check / regression pin: the pre-#125 shape casts the
-        // *column* to `::text`, which no btree index on the untransformed
-        // column can ever satisfy — this must remain a sequential scan on
-        // this same table and index, proving the bug this test guards
-        // against was real.
-        let old_filter = r#""join_key"::text = any($1::text[])"#;
-        let old_plan = explain_plan_lines(
-            &client,
-            &format!("select 1 from \"big_from_side\" where {old_filter}"),
-            &keys,
-        )
-        .await;
-        assert!(
-            old_plan.iter().any(|line| line.contains("Seq Scan")),
-            "sanity check: the old col::text cast form must force a sequential scan \
-             (if this fails, Postgres itself changed how it plans this — re-check the \
-             fixture), got:\n{}",
-            old_plan.join("\n")
-        );
-    }
-
-    /// `EXPLAIN`'s plan text, one line per returned row — used by
-    /// [`key_array_filter_lets_postgres_use_the_index_the_old_text_cast_form_could_not`]
-    /// to assert on the *shape* of the plan Postgres actually chooses
-    /// (`Index` vs. `Seq Scan`) rather than merely on row-level output,
-    /// which can't distinguish "fast, indexed lookup" from "slow, full
-    /// table scan that happens to return the same rows."
-    async fn explain_plan_lines(
-        client: &tokio_postgres::Client,
-        sql: &str,
-        keys: &[String],
-    ) -> Vec<String> {
-        client
-            .query(&format!("explain {sql}"), &[&keys])
-            .await
-            .expect("explain")
-            .into_iter()
-            .map(|row| row.get::<_, String>(0))
-            .collect()
-    }
-
-    // -----------------------------------------------------------------
-    // Issue #173 phase 3: ReverseTrigger — one test per variant, per
-    // shared enumeration function, pinning that each existing
-    // propagation path's own from-side determination (unchanged by this
-    // refactor — see the full trellis test suite, which exercises the
-    // to-many reverse, TRUNCATE-clear, reverse-delta, and reverse-fallback
-    // paths end to end through these same two functions) is driven by the
-    // exhaustive match this issue introduces, not by ad hoc per-path SQL.
-    // -----------------------------------------------------------------
-
-    /// A small from-side fixture shared by every `ReverseTrigger` test
-    /// below: two rows share `join_key = 'a'`, one carries `'b'`, and one
-    /// is `NULL` — enough to distinguish "matches a specific key,"
-    /// "matches nothing," and "excluded because NULL" in one table.
-    async fn seed_reverse_trigger_fixture(
-        client: &tokio_postgres::Client,
-    ) -> Vec<PrimaryKeyColumn> {
-        client
-            .batch_execute(
-                "create table from_side_fixture (id bigint primary key, join_key text); \
-                 insert into from_side_fixture (id, join_key) values \
-                 (1, 'a'), (2, 'a'), (3, 'b'), (4, null);",
-            )
-            .await
-            .expect("seed the from-side fixture");
-        vec![PrimaryKeyColumn {
-            name: "id".to_string(),
-            data_type: "bigint".to_string(),
-            nullable: false,
-            collation: None,
-        }]
-    }
-
-    /// [`ReverseTrigger::Keys`] via [`from_side_keys`] — the shape the
-    /// to-many reverse path (`compute`'s by-source loop) and the
-    /// keyed half of every other path construct. Matches exactly the rows
-    /// whose `join_key` is in the requested set, reporting back which key
-    /// each one matched (so a caller can attribute `hop_gen`/`src_changed`
-    /// per key, per this function's own doc comment) — a key present in
-    /// the trigger but matching no row (`"z"`) contributes nothing, and the
-    /// `NULL`-keyed row is never returned for any key.
-    #[tokio::test]
-    async fn reverse_trigger_keys_matches_from_side_keys_and_reports_the_matched_value() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (client, connection) = tokio_postgres::connect(db.dsn(), NoTls)
-            .await
-            .expect("connect");
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
-        let from_pk = seed_reverse_trigger_fixture(&client).await;
-
-        let pool_config =
-            crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid schema");
-        let pool = crate::pool::Pool::new(&pool_config).expect("build a same-crate pool");
-
-        let join_keys = vec!["a".to_string(), "z".to_string()];
-        let mut matches = from_side_keys(
-            &pool,
-            "from_side_fixture",
-            &from_pk,
-            "join_key",
-            &ReverseTrigger::Keys(&join_keys),
-        )
-        .await
-        .expect("from_side_keys(Keys)");
-        matches.sort();
-        assert_eq!(
-            matches,
-            vec![
-                ("1".to_string(), Some("a".to_string())),
-                ("2".to_string(), Some("a".to_string())),
-            ],
-            "only the rows matching a requested key come back, each reporting which \
-             key it matched; a requested key with no match (\"z\") and the NULL-keyed \
-             row must both be absent"
-        );
-    }
-
-    /// [`ReverseTrigger::WholeKeyspace`] via [`from_side_keys`] — the
-    /// TRUNCATE-clear path's shape (issue #98/#165/#168): every currently
-    /// non-`NULL` `join_key` row comes back, regardless of its specific
-    /// value (there is no value list to match against — see the variant's
-    /// own doc comment), and each is reported with `None` rather than a
-    /// specific matched key, since none was matched against.
-    #[tokio::test]
-    async fn reverse_trigger_whole_keyspace_matches_every_non_null_row_via_from_side_keys() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (client, connection) = tokio_postgres::connect(db.dsn(), NoTls)
-            .await
-            .expect("connect");
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
-        let from_pk = seed_reverse_trigger_fixture(&client).await;
-
-        let pool_config =
-            crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid schema");
-        let pool = crate::pool::Pool::new(&pool_config).expect("build a same-crate pool");
-
-        let mut matches = from_side_keys(
-            &pool,
-            "from_side_fixture",
-            &from_pk,
-            "join_key",
-            &ReverseTrigger::WholeKeyspace,
-        )
-        .await
-        .expect("from_side_keys(WholeKeyspace)");
-        matches.sort();
-        assert_eq!(
-            matches,
-            vec![
-                ("1".to_string(), None),
-                ("2".to_string(), None),
-                ("3".to_string(), None),
-            ],
-            "every non-NULL-keyed row must come back regardless of its specific value \
-             (rows 1-3), the NULL-keyed row (4) must not, and none of them report a \
-             specific matched key"
-        );
-    }
-
-    /// Issue #561: a [`ToSide`] types its key filter from the catalog entry
-    /// of its unquoted `identity`, and reads the row under its quoted
-    /// `table`. Handed the quoted name, the lookup would find nothing
-    /// (`to_regclass` of a twice-quoted name is `NULL`) and the filter would
-    /// silently fall back to casting the column, which no index serves
-    /// (#125) — correct rows, so nothing downstream notices. Pinned here on a
-    /// mixed-case to-side in a mixed-case schema.
-    #[tokio::test]
-    async fn to_side_key_filter_types_a_mixed_case_to_side_by_its_identity() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (mut client, connection) = tokio_postgres::connect(db.dsn(), NoTls)
-            .await
-            .expect("connect");
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
-        client
-            .batch_execute(
-                "create schema \"Shop\"; \
-                 create table \"Shop\".\"Catalog\" (id bigint primary key, price numeric); \
-                 insert into \"Shop\".\"Catalog\" (id, price) values (1, 10)",
-            )
-            .await
-            .expect("seed a mixed-case to-side");
-
-        let identity = "Shop.Catalog".to_string();
-        let to_side = ToSide {
-            table: ddl::qualified_source_table(&identity),
-            identity,
-            seam_fed: true,
-            key_pg_type: std::sync::OnceLock::new(),
-        };
-        let txn = client.transaction().await.expect("open txn");
-        let filter = to_side.key_filter(&txn, "id").await.expect("key filter");
-        assert_eq!(
-            filter, r#"t."id" = $1::text::bigint"#,
-            "the key filter compares the native column, typed from the catalog"
-        );
-        let price: String = txn
-            .query_one(
-                &format!("select price::text from {} t where {filter}", to_side.table),
-                &[&"1"],
-            )
-            .await
-            .expect("read the to-side row by key")
-            .get(0);
-        assert_eq!(price, "10");
-    }
-
-    /// [`ReverseTrigger::Keys`] via [`from_side_rows_for_trigger_txn`] — the
-    /// full-row, transactional shape [`stage_reverse_recompute_fallback`]
-    /// drives, inside
-    /// Phase 3's already-open transaction. Proves the enum-driven dispatch
-    /// still returns full row images (not just the primary key
-    /// [`from_side_keys`] returns), and still excludes a key with no match
-    /// and the NULL-keyed row.
-    #[tokio::test]
-    async fn reverse_trigger_keys_fetches_full_rows_via_from_side_rows_for_trigger_txn() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (mut client, connection) = tokio_postgres::connect(db.dsn(), NoTls)
-            .await
-            .expect("connect");
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
-        let from_pk = seed_reverse_trigger_fixture(&client).await;
-
-        let txn = client.transaction().await.expect("open txn");
-        let join_keys = vec!["a".to_string()];
-        let row_columns = live_row_columns(&txn, "from_side_fixture")
-            .await
-            .expect("introspect from_side_fixture's columns");
-        let mut rows = from_side_rows_for_trigger_txn(
-            &txn,
-            "from_side_fixture",
-            "join_key",
-            Some("text"),
-            &from_pk,
-            &ReverseTrigger::Keys(&join_keys),
-            &row_columns,
-        )
-        .await
-        .expect("from_side_rows_for_trigger_txn(Keys)");
-        txn.rollback().await.expect("rollback");
-
-        rows.sort_by(|a, b| a.0.cmp(&b.0));
-        let keys: Vec<&str> = rows.iter().map(|(k, _)| k.as_str()).collect();
-        assert_eq!(
-            keys,
-            vec!["1", "2"],
-            "both rows matching join_key = 'a' must come back, full row images"
-        );
-        for (_, row) in &rows {
-            assert_eq!(
-                row.get("join_key"),
-                Some(&Some("a".to_string())),
-                "the full row image must carry the matched column's real value, not \
-                 just its primary key"
-            );
-        }
-    }
-
-    /// [`ReverseTrigger::WholeKeyspace`] via
-    /// [`from_side_rows_for_trigger_txn`] — no current call site can reach
-    /// this (both construct [`ReverseTrigger::Keys`] inline, and nothing in
-    /// the module forwards a `ReverseTrigger`), but the arm is a typed
-    /// [`ApplyError::ReverseTriggerNotResolvable`] rather than a panic, per
-    /// this module's stated convention for invariants a function cannot
-    /// enforce itself. Pinned so a future caller that wires a whole-keyspace
-    /// trigger into the reverse delta/fallback path gets a visible failed
-    /// drain rather than an aborted worker — and so nobody "fixes" this by
-    /// quietly falling through to a `Keys`-shaped read, which would silently
-    /// enumerate nothing.
-    #[tokio::test]
-    async fn reverse_trigger_whole_keyspace_is_a_typed_error_not_a_panic_in_the_txn_lookup() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (mut client, connection) = tokio_postgres::connect(db.dsn(), NoTls)
-            .await
-            .expect("connect");
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
-        let from_pk = seed_reverse_trigger_fixture(&client).await;
-
-        let txn = client.transaction().await.expect("open txn");
-        // `WholeKeyspace` errors out before `row_columns` is ever read (see
-        // the function's own early `match trigger`), so an empty slice is
-        // fine here — this test is about the error arm, not the row decode.
-        let err = from_side_rows_for_trigger_txn(
-            &txn,
-            "from_side_fixture",
-            "join_key",
-            Some("text"),
-            &from_pk,
-            &ReverseTrigger::WholeKeyspace,
-            &[],
-        )
-        .await
-        .expect_err("a whole-keyspace trigger must not resolve against full row images");
-        txn.rollback().await.expect("rollback");
-
-        match err {
-            ApplyError::ReverseTriggerNotResolvable { from_table } => {
-                assert_eq!(
-                    from_table, "from_side_fixture",
-                    "the error must name the from-table whose enumeration was asked for, so an \
-                     operator can locate the offending relationship"
-                );
-            }
-            other => panic!(
-                "expected a typed ReverseTriggerNotResolvable, got {other:?} — the whole-keyspace \
-                 arm must stay a typed error, not a panic and not a silent empty result"
-            ),
-        }
     }
 
     /// Issue #670 review: `classify` decides by the innermost `ApplyError`,
@@ -7338,20 +2817,6 @@ pub struct ApplyPlan {
     /// [`flush_apply_metrics`] once the page commits. Shared, so a clone of
     /// the plan sees the same count.
     retries_succeeded: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    /// Issue #30's reverse recompute: when a *to-side* (related) row changed,
-    /// each `(from_table, from_key_text, hop_gen)` here is a from-side row
-    /// whose relationship enrichment depends on that changed related row and
-    /// so must be re-derived. Resolved in Phase 2 (a live join-key lookup on
-    /// `from_table` — see [`from_side_keys`]) and emitted as ordinary
-    /// image-less [`StagedChange::Recompute`]s by [`apply_and_mark_drained`],
-    /// reusing the same async staging/apply/fence pipeline forward propagation
-    /// uses rather than any bespoke persisted reverse index. `hop_gen` is the
-    /// triggering related-row change's own `hop_gen + 1`, hop-bounded at emit.
-    /// The trailing `Option<SystemTime>` is the triggering change's
-    /// `src_changed`, fan-in tie-broken by [`earliest_src_changed`] when more
-    /// than one to-side change resolves to the same `(from_table,
-    /// from_key)` (issues #51/#52's multi-hop gap).
-    reverse_recomputes: Vec<DerivedRecompute>,
     /// Epic #49 cross-cutting review fix (issues #51/#52): every
     /// [`TransformObservation`] [`buffer_transform_apply_metrics`]
     /// buffered during this `compute` call, in place of recording each one
@@ -7371,110 +2836,6 @@ pub struct ApplyPlan {
     /// [`crate::metrics::record_end_to_end_latency`] at the end of its
     /// per-target loop. Buffered for the same retry-safety reason.
     end_to_end_origins: HashMap<String, Vec<std::time::SystemTime>>,
-    /// Issue #130, epic #127: every to-one relationship this batch's
-    /// relationship resolution touched, keyed by `relationship_definitions.id`
-    /// — accumulated across every [`build_relationship_context`] call this
-    /// `compute` pass makes (several definitions, or several sources, can
-    /// share one relationship) and bumped, once per touched key, in Phase 3
-    /// by [`apply_and_mark_drained_many`]. See [`RelationshipGenBump`]'s doc
-    /// comment for exactly what "touched" means and the #133 gap it's a
-    /// documented approximation of.
-    relationship_gen_bumps: HashMap<i64, RelationshipGenBump>,
-    /// Issue #131, epic #127: every to-one relationship's parent-keyed
-    /// reverse record this batch's fold produced — see
-    /// [`RelationshipReverseRecord`]'s doc comment. Applied by
-    /// [`apply_and_mark_drained_many`]'s "3d" step, after the ordinary
-    /// aggregate-target writes (step 3b) and the forward gen-bump (step 3c).
-    relationship_reverses: Vec<RelationshipReverseRecord>,
-    /// Issue #168: every to-one relationship's settled parent projection
-    /// (qualified table name) a `TRUNCATE` on that relationship's to-side
-    /// emptied this batch — cleared in full by
-    /// [`apply_and_mark_drained_many`], alongside [`ApplyPlan::clears`]/
-    /// [`ApplyPlan::aggregate_clears`]. See the `compute` truncate loop's
-    /// own comment on why this can't reuse [`ApplyPlan::relationship_reverses`]
-    /// (a `TRUNCATE`'s sentinel carries no image to upsert or delete with).
-    /// Keyed by `relationship_id`.
-    relationship_projection_clears: std::collections::BTreeMap<i64, RelationshipProjectionClear>,
-}
-
-/// One entry of [`ApplyPlan::relationship_projection_clears`].
-#[derive(Debug, Clone)]
-struct RelationshipProjectionClear {
-    /// The settled projection, qualified.
-    qualified_projection: String,
-    /// The latest truncating commit this batch carries for the to-side
-    /// (the folded truncate's `lsn`). Issue #531: a truncate at or below
-    /// the relationship's refresh stamp is one the refresh already read, so
-    /// the clear is skipped ([`truncate_overtaken_by_refresh`]).
-    lsn: Option<PgLsn>,
-    /// The from-side rows to re-derive, found in Phase 3 after the clear
-    /// rather than here (issue #920), or `None` when the from-side's key
-    /// can't be read ([`from_side_key`]).
-    rederive: Option<TruncateRederive>,
-}
-
-/// The from-side recompute a to-side `TRUNCATE` stages for a to-one
-/// relationship with a projection: every from-side row whose `from_col` is
-/// not `NULL`, read in the page's own transaction just after the
-/// projection clear (issue #920).
-///
-/// Found in Phase 2, on the pool, the set missed a row that joined one of
-/// the truncated parents (inserted under it, or moved onto it) between
-/// Phase 2 and this page's commit. A Re-derive of that row in that gap, by
-/// a build chunk or by this page's own step 3, reads the projection as it
-/// was before the clear, and I2 then refuses the row's own changes, which
-/// that Re-derive's read saw, so nothing re-derived it after the clear
-/// (`steady_load` 7:1). Read after the clear and after step 3, the set
-/// holds every row that existed then. A row that joins after this read and
-/// is re-derived before the page commits is still missed: that is #892's
-/// window, as for a row-driven parent change's recompute (step 3d).
-#[derive(Debug, Clone)]
-struct TruncateRederive {
-    /// The from-side table, qualified.
-    from_table: String,
-    from_col: String,
-    from_pk: Vec<PrimaryKeyColumn>,
-    hop_gen: i32,
-    provenance: Provenance,
-}
-
-/// Every join value `change`'s raw ring rows gave a to-side's `to_col`,
-/// including any the fold erased from both folded images (#784): a parent
-/// born and deleted inside the batch, or one re-keyed through a value and
-/// on. A child may have read the parent live under such a value (an
-/// aggregate's ledger write does, #623 D5), and no reverse record names it.
-///
-/// When the `to_col` is the to-side's whole, non-nullable row identity
-/// (`key_col`), the ring key is its only value. Otherwise the fold read its
-/// values out of every raw row's new image, labelled by column
-/// ([`FoldedChange::to_col_values`], #785).
-fn touched_join_values<'a>(
-    change: &'a FoldedChange,
-    to_col: &'a str,
-    key_col: Option<&str>,
-) -> impl Iterator<Item = &'a String> + 'a {
-    let ring_key = (key_col == Some(to_col)).then_some(&change.key);
-    ring_key.into_iter().chain(
-        change
-            .to_col_values
-            .iter()
-            .filter(move |(column, _)| column == to_col)
-            .map(|(_, value)| value),
-    )
-}
-
-/// The image [`compute`] decodes as a change's *old side*: its folded
-/// `old_image` when it carries real images, or, for an image-less recompute,
-/// its prior-image hint (issue #315, `FoldedChange::prior_image`) — the row
-/// as it stood before an upstream target write. An image-less change is
-/// still re-read live for its new side; the old side only tells a
-/// relationship reader which parent the row moved away from.
-fn old_side_image(change: &FoldedChange) -> Option<&String> {
-    if change.old_image.is_none() && change.new_image.is_none() {
-        change.prior_image.as_ref()
-    } else {
-        change.old_image.as_ref()
-    }
 }
 
 /// The primary key [`compute`] keys `qualified_source`'s changes by
@@ -7490,21 +2851,15 @@ fn old_side_image(change: &FoldedChange) -> Option<&String> {
 /// Issue #768: a key that no longer passes the key gate (a type off the
 /// allowlist, or no key at all) halts the page while any definition that
 /// isn't frozen reads the table ([`catalog::has_unfrozen_reader`], under the
-/// canonical `source_key`), directly or through a relationship: one that
-/// applies would key its rows wrongly or not at all, and one still waiting
-/// for its build, or under a chunked or direct one, re-derives from the
-/// relationship's settled projection its rows keep current. A table whose
-/// readers are all frozen (paused, capture-failed or quarantined) is skipped
-/// instead. Its changes drain with the page, which marks its claim drained
-/// whatever the plan holds, exactly as a paused definition's share is
-/// dropped when `catalog::transforms_for_source` leaves it out, and a resume
-/// rebuilds from the source. A relationship's settled projection on it gets
-/// none of them either, so a resume refreshes the projections on every
-/// to-side the resumed definition reads (`quarantine::resume_transform`).
-/// Asked only on the error, so a drain over usable keys reads nothing more.
-/// The answer is fenced: the version of each relationship from-side reading
-/// the table is read into `versions` first, and a definition, its resume and
-/// its edit each bump their source's, so a page can't commit a skip after a
+/// canonical `source_key`): one that applies would key its rows wrongly or
+/// not at all. A table whose readers are all frozen (paused, capture-failed
+/// or quarantined) is skipped instead. Its changes drain with the page,
+/// which marks its claim drained whatever the plan holds, exactly as a
+/// paused definition's share is dropped when `catalog::transforms_for_source`
+/// leaves it out, and a resume rebuilds from the source. Asked only on the
+/// error, so a drain over usable keys reads nothing more. The answer is
+/// fenced: the caller holds `source_key`'s version, and a definition, its
+/// resume and its edit each bump it, so a page can't commit a skip after a
 /// reader it didn't see.
 ///
 /// The halt pauses every such reader and what is downstream of it
@@ -7514,7 +2869,6 @@ async fn source_key_for_apply(
     pool: &Pool,
     qualified_source: &str,
     source_key: &str,
-    versions: &mut BTreeMap<String, Option<i64>>,
 ) -> Result<Option<Vec<PrimaryKeyColumn>>, ApplyError> {
     let err = match ddl::source_primary_key(pool, qualified_source).await {
         Ok(pk) => return Ok(Some(pk)),
@@ -7533,7 +2887,7 @@ async fn source_key_for_apply(
     if !is_key_gate(&err) {
         return Err(err.into());
     }
-    if !no_unfrozen_reader(pool, source_key, versions).await? {
+    if has_unfrozen_reader(pool, source_key).await? {
         return Err(err.into());
     }
     crate::instance_log::warn!(
@@ -7545,33 +2899,6 @@ async fn source_key_for_apply(
     Ok(None)
 }
 
-/// Whether no definition that isn't frozen reads `source_key`, directly or
-/// through a relationship ([`has_unfrozen_reader`]), so a page may skip the
-/// table's changes ([`source_key_for_apply`], [`compute_page`]).
-///
-/// The answer is fenced. The fence the skip is judged under is read before
-/// the readers are: a reader of `source_key` through a relationship is a
-/// definition on the relationship's from-side, and a definition, its resume
-/// or its edit commits with a bump of its source's fence, so each such
-/// from-side's version goes into `versions`. `compute`'s caller already
-/// holds `source_key`'s own entry, for a direct reader. So a page that skips
-/// the table can't commit after a reader it didn't see.
-async fn no_unfrozen_reader(
-    pool: &Pool,
-    source_key: &str,
-    versions: &mut BTreeMap<String, Option<i64>>,
-) -> Result<bool, ApplyError> {
-    for rel in catalog::relationships_to_table(pool, source_key).await? {
-        if let std::collections::btree_map::Entry::Vacant(entry) =
-            versions.entry(rel.qualified_from_table())
-        {
-            let version = catalog::source_table_version(pool, entry.key()).await?;
-            entry.insert(version);
-        }
-    }
-    Ok(!has_unfrozen_reader(pool, source_key).await?)
-}
-
 /// Whether `err`, from [`ddl::source_primary_key`], is its key gate: the
 /// table has no usable key (none, or one of a type off the allowlist).
 fn is_key_gate(err: &DdlError) -> bool {
@@ -7581,148 +2908,32 @@ fn is_key_gate(err: &DdlError) -> bool {
     )
 }
 
-/// [`catalog::has_unfrozen_reader`] on a pooled connection.
+/// Whether some definition that isn't frozen reads `table`
+/// ([`catalog::has_unfrozen_reader`]), on a pooled connection. A page skips
+/// the table's changes when none does ([`source_key_for_apply`],
+/// [`compute_page`]), fenced by the caller's hold of `table`'s version.
 async fn has_unfrozen_reader(pool: &Pool, table: &str) -> Result<bool, ApplyError> {
     let client = pool.get().await?;
     Ok(catalog::has_unfrozen_reader(&**client, table).await?)
 }
 
-/// A relationship from-side's primary key, which a reverse recompute keys
-/// the from-side rows a to-side change reaches by, or `None` when the key
-/// can't be used and every definition reading the from-side is frozen.
-///
-/// Issue #768, the from-side's half of [`source_key_for_apply`]: the
-/// recomputes re-derive the from-side's rows for the definitions reading
-/// it, and a frozen one's resume rebuilds it from the source, so with no
-/// other reader the caller stages none, as `compute` skips the from-side's
-/// own changes. Without this a write to the to-side halted the drain on the
-/// from-side's key though no reader would apply what it staged. A reader
-/// that isn't frozen halts the page, which pauses it (`super::halt`, #663),
-/// and so does a from-side that is gone.
-///
-/// Both skips are fenced (#823). A resume's build reads the relationship's
-/// settled projection, so a page that skipped a recompute and commits after
-/// the resume would leave the resumed reader without that change. The
-/// from-side's own fence is read first, then its readers
-/// ([`no_unfrozen_reader`]), and a definition, its resume and its edit each
-/// bump their source's fence, so a page can't commit after a resume it
-/// didn't see. A key release ([`release_to_one_projections`]) never asks
-/// (#831).
-///
-/// `fence.skip_frozen` is [`compute_page`]'s (issue #766): on the retry after
-/// Postgres refused the drain a read, a from-side no unfrozen definition
-/// reads is skipped whatever its key, as `compute_page` skips that table's
-/// own changes. Its readers' halt may be what froze them, for that very
-/// refusal, and the from-side read would be refused again on every pass.
-async fn from_side_key(
-    pool: &Pool,
-    qualified_from_table: &str,
-    fence: FromSideFence<'_>,
-) -> Result<Option<Vec<PrimaryKeyColumn>>, ApplyError> {
-    let FromSideFence {
-        versions,
-        skip_frozen,
-    } = fence;
-    if skip_frozen {
-        read_fence(pool, qualified_from_table, versions).await?;
-        if no_unfrozen_reader(pool, qualified_from_table, versions).await? {
-            crate::instance_log::warn!(
-                from_table = %qualified_from_table,
-                "every definition reading this relationship from-side is frozen, and the drain \
-                 was refused a read or write; staging no recompute of its rows"
-            );
-            return Ok(None);
-        }
-    }
-    let err = match ddl::source_primary_key(pool, qualified_from_table).await {
-        Ok(pk) => return Ok(Some(pk)),
-        Err(err) => err,
-    };
-    if !is_key_gate(&err) || quarantine::source_table_missing(pool, qualified_from_table).await? {
-        return Err(err.into());
-    }
-    read_fence(pool, qualified_from_table, versions).await?;
-    if !no_unfrozen_reader(pool, qualified_from_table, versions).await? {
-        return Err(err.into());
-    }
-    crate::instance_log::warn!(
-        from_table = %qualified_from_table,
-        error = %err,
-        "every definition reading this relationship from-side is frozen and its key \
-         can't be used; staging no recompute of its rows"
-    );
-    Ok(None)
-}
-
-/// Reads `table`'s version fence into `versions` unless the page already
-/// holds it: the first read is the oldest, so the safest to commit under.
-async fn read_fence(
-    pool: &Pool,
-    table: &str,
-    versions: &mut BTreeMap<String, Option<i64>>,
-) -> Result<(), ApplyError> {
-    if let std::collections::btree_map::Entry::Vacant(entry) = versions.entry(table.to_string()) {
-        let version = catalog::source_table_version(pool, entry.key()).await?;
-        entry.insert(version);
-    }
-    Ok(())
-}
-
-/// The page's version fence (`versions`, the fence's read set) and whether the
-/// page is on its retry after Postgres refused the drain a read
-/// (`skip_frozen`, [`compute_page`]'s), which [`from_side_key`] judges its
-/// skips under.
-struct FromSideFence<'a> {
-    versions: &'a mut BTreeMap<String, Option<i64>>,
-    skip_frozen: bool,
-}
-
-impl<'a> FromSideFence<'a> {
-    fn new(versions: &'a mut BTreeMap<String, Option<i64>>, skip_frozen: bool) -> Self {
-        Self {
-            versions,
-            skip_frozen,
-        }
-    }
-}
-
 /// Each of `changes`' [`KeyExclusion`] (#799), or `None` when every one is
 /// empty, the common case, which costs no allocation: `changes` are the folded
 /// changes to `source_key` (canonical), `defs` the definitions that apply
-/// it directly, `inbound_rels` the relationships whose to-side it is, and
-/// `poisoned` the batch's poison ([`quarantine::poisoned_keys_among`]).
-///
-/// A relationship's reverse work leaves a poisoned key out only when every
-/// reader of the relationship that isn't frozen holds the key: it keeps the
-/// settled projection and the from-side's rows current for all of them at
-/// once. A relationship with no such reader serves nobody, so it leaves the
-/// key out too: a define or resume of its first reader refreshes its
-/// projection from the table (#768), and a failure in its work, which
-/// isolation can charge to no reader of it, would otherwise fail the page on
-/// every drain once every direct reader holds the key. Its readers are read
-/// only when one of `changes` is poisoned. `focus` overrides one key's direct
-/// readers for an isolation probe, and can leave it out of every
-/// relationship's reverse work but one ([`ProbeFocus::only_rel`]).
-async fn key_exclusions(
-    pool: &Pool,
+/// it, and `poisoned` the batch's poison ([`quarantine::poisoned_keys_among`]).
+/// `focus` overrides one key's readers for an isolation probe.
+fn key_exclusions(
     source_key: &str,
     changes: &[&FoldedChange],
     defs: &[crate::defs::model::Definition],
-    inbound_rels: &[RelationshipDefinition],
     poisoned: &HashMap<(String, String), HashSet<i64>>,
     focus: Option<&ProbeFocus<'_>>,
-) -> Result<Option<Vec<KeyExclusion>>, ApplyError> {
+) -> Option<Vec<KeyExclusion>> {
     let lookup = |key: &str| poisoned.get(&(source_key.to_string(), key.to_string()));
     let any_poisoned = !poisoned.is_empty() && changes.iter().any(|c| lookup(&c.key).is_some());
     if !any_poisoned && focus.is_none() {
-        return Ok(None);
+        return None;
     }
-    let rel_readers = if any_poisoned && !inbound_rels.is_empty() {
-        relationship_reader_map(pool).await?
-    } else {
-        HashMap::new()
-    };
-    let no_readers: Vec<(i64, String)> = Vec::new();
     let exclusions: Vec<KeyExclusion> = changes
         .iter()
         .map(|change| {
@@ -7734,68 +2945,28 @@ async fn key_exclusions(
                     .unwrap_or_else(|| poisoned_for.is_some_and(|ids| ids.contains(&def.id)));
                 if excluded {
                     exclusion.defs.insert(def.id);
-                    exclusion.park_for.insert(def.id);
-                }
-            }
-            if let Some(ids) = poisoned_for {
-                for rel in inbound_rels {
-                    let readers = rel_readers.get(&rel.id).unwrap_or(&no_readers);
-                    if readers.iter().all(|(id, _)| ids.contains(id)) {
-                        exclusion.rels.insert(rel.id);
-                    }
-                    for (id, _) in readers {
-                        if ids.contains(id) {
-                            exclusion.park_for.insert(*id);
-                        }
-                    }
-                }
-            }
-            if let Some(focus) = focus {
-                for rel in inbound_rels {
-                    if focus.excludes_rel(source_key, &change.key, rel.id) {
-                        exclusion.rels.insert(rel.id);
-                        exclusion.probe_rels.insert(rel.id);
-                    }
                 }
             }
             exclusion
         })
         .collect();
-    Ok((!exclusions.iter().all(KeyExclusion::is_empty)).then_some(exclusions))
-}
-
-/// Whether `exclusions` ([`key_exclusions`]) leave change `i` out of the
-/// reverse work of relationship `rel`.
-fn skips_relationship(exclusions: &Option<Vec<KeyExclusion>>, i: usize, rel: i64) -> bool {
-    exclusions
-        .as_ref()
-        .is_some_and(|exclusions| exclusions[i].rels.contains(&rel))
+    (!exclusions.iter().all(KeyExclusion::is_empty)).then_some(exclusions)
 }
 
 /// One definition's share of a source's `changes` and their decoded images
-/// (`rows`, `old_rows`): every change but those `exclusions` leave out of
+/// (`rows`): every change but those `exclusions` leave out of
 /// `transform_id` (#799). Borrowed when it leaves out none, the common case.
-#[allow(clippy::type_complexity)]
 fn definition_share<'c, 'f>(
     transform_id: i64,
     changes: &'c [&'f FoldedChange],
     rows: &'c [Option<Row>],
-    old_rows: &'c [Option<Row>],
     exclusions: &Option<Vec<KeyExclusion>>,
-) -> (
-    Cow<'c, [&'f FoldedChange]>,
-    Cow<'c, [Option<Row>]>,
-    Cow<'c, [Option<Row>]>,
-) {
+) -> (Cow<'c, [&'f FoldedChange]>, Cow<'c, [Option<Row>]>) {
     let Some(exclusions) = exclusions
         .as_ref()
         .filter(|exclusions| exclusions.iter().any(|e| e.defs.contains(&transform_id)))
     else {
-        return (
-            Cow::Borrowed(changes),
-            Cow::Borrowed(rows),
-            Cow::Borrowed(old_rows),
-        );
+        return (Cow::Borrowed(changes), Cow::Borrowed(rows));
     };
     let keep: Vec<usize> = (0..changes.len())
         .filter(|&i| !exclusions[i].defs.contains(&transform_id))
@@ -7803,58 +2974,7 @@ fn definition_share<'c, 'f>(
     (
         Cow::Owned(keep.iter().map(|&i| changes[i]).collect()),
         Cow::Owned(keep.iter().map(|&i| rows[i].clone()).collect()),
-        Cow::Owned(keep.iter().map(|&i| old_rows[i].clone()).collect()),
     )
-}
-
-/// The definitions that aren't frozen and read through each relationship,
-/// by relationship id, each with its bare target, in id order (#799).
-async fn relationship_reader_map(
-    pool: &Pool,
-) -> Result<HashMap<i64, Vec<(i64, String)>>, ApplyError> {
-    let client = pool.get().await?;
-    let catalog = crate::capture::columns::load_catalog(&**client, pool.schema()).await?;
-    let unfrozen: HashSet<i64> = client
-        .query(
-            "select id from transform_definitions where status = any($1)",
-            &[&crate::defs::model::TransformStatus::dispatchable()],
-        )
-        .await?
-        .iter()
-        .map(|row| row.get(0))
-        .collect();
-    Ok(catalog
-        .relationships
-        .iter()
-        .map(|rel| {
-            let readers = crate::capture::columns::relationship_readers(&catalog, rel)
-                .into_iter()
-                .filter(|reader| unfrozen.contains(&reader.id))
-                .map(|reader| (reader.id, reader.def.target.clone()))
-                .collect();
-            (rel.id, readers)
-        })
-        .collect())
-}
-
-/// Each relationship to `table` (canonical), by id, with the definitions that
-/// aren't frozen and read through it, each with its bare target, in id order
-/// (#799, #822): whose share of a to-side key's work isolation charges a
-/// failure in that relationship's work to (`quarantine::attribute`).
-pub(super) async fn relationship_readers_by_rel(
-    pool: &Pool,
-    table: &str,
-) -> Result<Vec<(i64, Vec<(i64, String)>)>, ApplyError> {
-    let mut rels = catalog::relationships_to_table(pool, table).await?;
-    if rels.is_empty() {
-        return Ok(Vec::new());
-    }
-    rels.sort_by_key(|rel| rel.id);
-    let mut by_rel = relationship_reader_map(pool).await?;
-    Ok(rels
-        .into_iter()
-        .map(|rel| (rel.id, by_rel.remove(&rel.id).unwrap_or_default()))
-        .collect())
 }
 
 /// Phase 2 (design doc: "no transaction, no locks"): evaluates every
@@ -7883,27 +3003,19 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
 }
 
 /// One key an isolation probe (`quarantine::attribute`, #799) applies with
-/// some of its work left out: the probe that tells which definition's apply,
-/// or which relationship's reverse work, a key fails in. `direct` picks the
-/// readers of its table that apply it; `only_rel`, when set, leaves it out
-/// of the reverse work of every relationship to its table but that one. The
-/// key's poison stands as it is wherever the focus doesn't override it.
+/// some of its work left out: the probe that tells which definition's apply
+/// a key fails in. `direct` picks the readers of its table that apply it.
+/// The key's poison stands as it is wherever the focus doesn't override it.
 pub(super) struct ProbeFocus<'a> {
     /// Canonical, as `poison` keys it.
     pub src_table: &'a str,
     pub key: &'a str,
     pub direct: DirectFocus,
-    /// The one relationship to the key's table whose reverse work the probe
-    /// keeps (#822), or `None` to keep every one its poison doesn't leave
-    /// out.
-    pub only_rel: Option<i64>,
 }
 
 /// Which readers of a [`ProbeFocus`]'s table apply its key.
 #[derive(Clone, Copy, Debug)]
 pub(super) enum DirectFocus {
-    /// None of them: the probe applies the relationship readers' share alone.
-    None,
     /// That one alone.
     Only(i64),
     /// Every one the key isn't poisoned for, but that one (#822's
@@ -7924,55 +3036,36 @@ impl ProbeFocus<'_> {
             return None;
         }
         match self.direct {
-            DirectFocus::None => Some(true),
             DirectFocus::Only(id) => Some(id != transform_id),
             DirectFocus::AllBut(id) => (id == transform_id).then_some(true),
         }
     }
-
-    /// Whether this focus leaves `key` of `src_table` out of relationship
-    /// `rel`'s reverse work.
-    fn excludes_rel(&self, src_table: &str, key: &str, rel: i64) -> bool {
-        self.names(src_table, key) && self.only_rel.is_some_and(|only| only != rel)
-    }
 }
 
-/// Which work a folded change's key is left out of (#799): the direct
-/// readers it's poisoned for, and the relationships whose every reader it's
-/// poisoned for.
+/// Which readers a folded change's key is left out of (#799): the readers
+/// of its table it's poisoned for, in id order, which it is parked for.
 #[derive(Default)]
 struct KeyExclusion {
     /// Readers of the change's own table (`defs` ids) that skip it.
-    defs: HashSet<i64>,
-    /// Relationships to the change's table (ids) whose reverse work skips it.
-    rels: HashSet<i64>,
-    /// Those of `rels` an isolation probe's focus leaves out
-    /// ([`ProbeFocus::only_rel`]): their work is skipped whole, with no
-    /// re-derive of the children of a value the fold erased.
-    probe_rels: HashSet<i64>,
-    /// Every definition the change is parked for: each one above, and each
-    /// relationship reader the key is poisoned for.
-    park_for: BTreeSet<i64>,
+    defs: BTreeSet<i64>,
 }
 
 impl KeyExclusion {
     /// Whether it leaves the change out of nothing.
     fn is_empty(&self) -> bool {
-        self.defs.is_empty() && self.rels.is_empty() && self.park_for.is_empty()
+        self.defs.is_empty()
     }
 }
 
 /// [`compute`], with `focus` overriding one key's direct readers for an
 /// isolation probe, and with `skip_frozen` (issue #766) also skipping every
 /// table no definition that isn't frozen reads, as [`source_key_for_apply`]
-/// skips one whose key can't be used ([`no_unfrozen_reader`], fenced the
+/// skips one whose key can't be used ([`has_unfrozen_reader`], fenced the
 /// same way). [`drain_batch`] asks for it on the retry after Postgres
 /// refused the drain a read or write (`42501`, see [`HaltRetry`]), and so do
 /// that call's isolation probes: the halt has paused the definitions reading
-/// the refused table, but the page still reads it for a relationship's
-/// settled projection, which is kept current whatever its readers' status,
-/// and would fail the same way forever. Asked only then, so a drain that was
-/// refused nothing reads nothing more.
+/// the refused table, so the page must not read it again. Asked only then,
+/// so a drain that was refused nothing reads nothing more.
 #[tracing::instrument(
     name = "staging.compute",
     skip(pool, folded, focus),
@@ -8011,9 +3104,6 @@ pub(super) async fn compute_page(
     // fence row.
     let mut canonical_srcs = quarantine::CanonicalSrcTables::default();
     for change in folded {
-        if change.relationship_reverse_deferred.is_some() {
-            continue;
-        }
         canonical_srcs.get(pool, &change.src_table).await?;
     }
     let canonical_of = |src_table: &str| -> String {
@@ -8024,7 +3114,7 @@ pub(super) async fn compute_page(
     };
     let canonical_candidates: Vec<(String, String)> = folded
         .iter()
-        .filter(|c| !c.is_truncate && c.relationship_reverse_deferred.is_none())
+        .filter(|c| !c.is_truncate)
         .map(|c| (canonical_of(&c.src_table), c.key.clone()))
         .collect();
     let candidates: Vec<(&str, &str)> = canonical_candidates
@@ -8040,28 +3130,11 @@ pub(super) async fn compute_page(
     // `append::TRUNCATE_SENTINEL_KEY`) and produce no write/delete;
     // they're handled separately, right after that loop.
     let mut truncated: Vec<&FoldedChange> = Vec::new();
-    // Issue #134: deferred relationship reverses (`op = 'rel_reverse_deferred'`)
-    // never enter the keyed by-source evaluation loop below either, and for a
-    // sharper reason than truncate's "carries no key" — they carry the
-    // parent's *real* key, on a *synthetic* `src_table`
-    // (`relationship_reverse_deferred_src_table`), specifically so they
-    // can't. Letting one reach `by_source` would run it through the
-    // ordinary per-source forward-evaluation loop and double-apply the
-    // delta its original CDC row already forward-applied when it first
-    // landed — only the reverse-relationship delta was ever deferred, never
-    // the parent's own forward apply. Reconstructed into a fresh
-    // `RelationshipReverseRecord` in its own loop, right after `by_source`'s
-    // — see that loop's comment.
-    let mut relationship_reverse_deferrals: Vec<&FoldedChange> = Vec::new();
     let mut poisoned_park: Vec<(i64, FoldedChange)> = Vec::new();
     let mut applied_keys: Vec<(String, String)> = Vec::new();
     for change in folded {
         if change.is_truncate {
             truncated.push(change);
-            continue;
-        }
-        if change.relationship_reverse_deferred.is_some() {
-            relationship_reverse_deferrals.push(change);
             continue;
         }
         // Canonical, per this function's `poisoned` comment above (issue
@@ -8100,48 +3173,6 @@ pub(super) async fn compute_page(
     // [`flush_apply_metrics`]. See `buffer_transform_apply_metrics`'s doc
     // comment for why eager recording here was the bug.
     let mut transform_observations: Vec<TransformObservation> = Vec::new();
-    // Issue #79: deduped across *every* relationship (and every source_key)
-    // this whole `compute` call processes, not just within one relationship's
-    // `key_hops` — two distinct inbound relationships sharing the same
-    // `from_table` (e.g. `posts` and `comments` both pointing at `authors`)
-    // otherwise each independently queue a full reverse-recompute pass over
-    // every touched from-side key, doubling (or worse, with N relationships)
-    // the backlog for no benefit: only one recompute per from-side row is
-    // ever needed, at the highest hop_gen any contributing relationship
-    // required. Keyed by `(from_table, from_key)`; drained into the
-    // `Vec` shape `ApplyPlan` expects right before it's constructed below.
-    // The `Option<SystemTime>` half is `src_changed` (issues #51/#52's
-    // multi-hop gap), fan-in tie-broken by `earliest_src_changed` (min) —
-    // deliberately the opposite merge direction from `hop_gen`'s `max`, see
-    // that function's doc comment.
-    let mut reverse_recomputes: HashMap<(String, String), (i32, Provenance)> = HashMap::new();
-    // Issue #130, epic #127: accumulated across every source/definition this
-    // `compute` pass evaluates a to-one relationship for — see
-    // [`ApplyPlan::relationship_gen_bumps`]'s doc comment.
-    let mut relationship_gen_bumps: HashMap<i64, RelationshipGenBump> = HashMap::new();
-    // Issue #131, epic #127: one `ReverseRelationshipShape` per to-one
-    // relationship this `compute()` call builds a reverse record for,
-    // resolved once (a handful of catalog reads) and shared by every
-    // touched parent key — see `RelationshipReverseRecord`'s doc comment.
-    let mut relationship_reverse_shapes: HashMap<i64, Arc<ReverseRelationshipShape>> =
-        HashMap::new();
-    // Issue #131: every to-one relationship's parent-keyed reverse record
-    // this batch's fold produced, applied by `apply_and_mark_drained_many`'s
-    // "3d" step.
-    let mut relationship_reverses: Vec<RelationshipReverseRecord> = Vec::new();
-    // Issue #168: settled parent projections to clear in full at Phase 3 —
-    // a `TRUNCATE` on a to-one relationship's to-side table. Unlike the
-    // row-driven path (`relationship_reverses`, just above), a `TRUNCATE`
-    // stages one key-less sentinel row, never a per-row image, so it can
-    // never build a `RelationshipReverseRecord` (that needs an old/new row
-    // to upsert or delete into the projection). Without this, the
-    // projection silently keeps serving every to-side row's last-known
-    // value forever after the physical table is emptied — see the
-    // `truncated` loop below, where this is populated, for the full story.
-    let mut relationship_projection_clears: std::collections::BTreeMap<
-        i64,
-        RelationshipProjectionClear,
-    > = std::collections::BTreeMap::new();
 
     for (source_key, mut changes) in by_source {
         crate::instance_log::debug!(
@@ -8150,9 +3181,6 @@ pub(super) async fn compute_page(
             "evaluating a source table's folded changes"
         );
         let version = catalog::source_table_version(pool, &source_key).await?;
-        // The first read of a table's fence is kept: a skipped table's may
-        // have read this source's already, to fence the readers it judged
-        // under (`source_key_for_apply`), and a bump since then must miss.
         versions.entry(source_key.clone()).or_insert(version);
 
         // The source identity this batch's own CDC producer staged (issue
@@ -8163,7 +3191,7 @@ pub(super) async fn compute_page(
         // of them names the right physical table for the reads below.
         let qualified_source = changes[0].src_table.as_str();
 
-        if skip_frozen && no_unfrozen_reader(pool, &source_key, &mut versions).await? {
+        if skip_frozen && !has_unfrozen_reader(pool, &source_key).await? {
             crate::instance_log::warn!(
                 src_table = %qualified_source,
                 "every definition reading this table is frozen, and the drain was refused a \
@@ -8181,9 +3209,7 @@ pub(super) async fn compute_page(
         // spelling); `None` is a key that can't be used on a table no
         // definition applies (issue #768), whose changes are dropped with
         // the page. See [`source_key_for_apply`].
-        let Some(pk) =
-            source_key_for_apply(pool, qualified_source, &source_key, &mut versions).await?
-        else {
+        let Some(pk) = source_key_for_apply(pool, qualified_source, &source_key).await? else {
             continue;
         };
 
@@ -8206,87 +3232,15 @@ pub(super) async fn compute_page(
         )
         .await?;
 
-        // Which of the image decodes below this source's readers need.
-        let needs_old_rows = defs.iter().any(|def| {
-            def.def.key_space == KeySpace::OneToOne
-                && !eval::relationship_references(&def.def).is_empty()
-        });
-        // Reverse recompute (issue #30): this source is some relationship's
-        // *to-side*. A change to a related row must re-derive every from-side
-        // row whose enrichment reads it. For each relationship pointing at
-        // this table, collect the join-key text of every to-side row this
-        // batch touched — the related row's `to_col`. A capture trigger
-        // images `to_col` in every image, a delete's pre-image included,
-        // since it is in the to-side's capture set (issue #622), whether it
-        // is the to-side's key (a to-one) or not (a to-many). An image with
-        // no `to_col` at all is `MissingColumn` below (issue #677).
-        // Then resolve, with one live lookup, the from-side keys whose
-        // `from_col` matches, and stage each as an image-less recompute at the
-        // triggering change's `hop_gen + 1`.
-        let inbound_rels = catalog::relationships_to_table(pool, &source_key).await?;
-        // Issue #784: a `to_col` that is this table's row identity has the
-        // ring key as its only value (`touched_join_values`).
-        let key_col = ddl::sole_key_column(&pk);
-
-        // #799: which work each change is left out of (see `KeyExclusion`).
-        // A change poisoned for a reader of this table is left out of that
-        // reader's apply only, and parked for it; one poisoned for every
-        // reader of a relationship to this table is left out of that
-        // relationship's reverse work. A change left out of everything is
-        // dropped here, before its images are decoded, so a failure that is
-        // really in the source (an image that won't decode) stops once every
-        // reader holds the key. A clean commit clears the death counters of
-        // every definition that applied the rest (`clear_key_deaths`).
-        let exclusions = key_exclusions(
-            pool,
-            &source_key,
-            &changes,
-            &defs,
-            &inbound_rels,
-            &poisoned,
-            focus,
-        )
-        .await?;
-        // #785 review: a change a relationship's reverse work leaves out (its
-        // key is poisoned for every reader of the relationship) waits for its
-        // release (`quarantine::release_key`). A non-key `to_col` value the
-        // fold erased between its images lives only in this change's
-        // `to_col_values`, and a child may have read the parent live under
-        // it. So its children are re-derived now, as for a change the
-        // relationship applies, rather than left stale for as long as the
-        // key is held. (The release re-derives them again: the park keeps
-        // every such value in the held row's `join_values`, and the release
-        // stages each beside its `Recompute`, #944.) A key `to_col`'s only
-        // value is the ring key, which the release's `Recompute` names
-        // itself. A relationship an isolation probe's focus leaves out does
-        // none of this: the probe leaves the key out of its work whole.
-        for (change, exclusion) in changes.iter().zip(exclusions.iter().flatten()) {
-            if exclusion.rels.is_empty() || change.to_col_values.is_empty() {
-                continue;
-            }
-            for rel in inbound_rels.iter().filter(|rel| {
-                exclusion.rels.contains(&rel.id) && !exclusion.probe_rels.contains(&rel.id)
-            }) {
-                let mut key_hops: HashMap<String, i32> = HashMap::new();
-                let mut key_src_changed: HashMap<String, Provenance> = HashMap::new();
-                for (column, value) in &change.to_col_values {
-                    if *column == rel.def.to_col {
-                        key_hops.insert(value.clone(), change.hop_gen);
-                        key_src_changed
-                            .insert(value.clone(), (change.src_changed, change.origin_lsn));
-                    }
-                }
-                accumulate_from_side_recomputes(
-                    pool,
-                    rel,
-                    &key_hops,
-                    &key_src_changed,
-                    &mut reverse_recomputes,
-                    FromSideFence::new(&mut versions, skip_frozen),
-                )
-                .await?;
-            }
-        }
+        // #799: which readers each change is left out of (see
+        // `KeyExclusion`). A change poisoned for a reader of this table is
+        // left out of that reader's apply only, and parked for it. A change
+        // left out of every reader is dropped here, before its image is
+        // decoded, so a failure that is really in the source (an image that
+        // won't decode) stops once every reader holds the key. A clean commit
+        // clears the death counters of every definition that applied the
+        // rest (`clear_key_deaths`).
+        let exclusions = key_exclusions(&source_key, &changes, &defs, &poisoned, focus);
         let exclusions = match exclusions {
             None => {
                 applied_keys.extend(changes.iter().map(|c| (source_key.clone(), c.key.clone())));
@@ -8296,16 +3250,12 @@ pub(super) async fn compute_page(
                 let mut kept: Vec<&FoldedChange> = Vec::with_capacity(changes.len());
                 let mut kept_exclusions: Vec<KeyExclusion> = Vec::with_capacity(changes.len());
                 for (change, exclusion) in changes.into_iter().zip(exclusions) {
-                    for &transform_id in &exclusion.park_for {
+                    for &transform_id in &exclusion.defs {
                         let mut parked = change.clone();
                         parked.src_table = source_key.clone();
                         poisoned_park.push((transform_id, parked));
                     }
-                    let readers = defs.len() + inbound_rels.len();
-                    if readers > 0
-                        && exclusion.defs.len() == defs.len()
-                        && exclusion.rels.len() == inbound_rels.len()
-                    {
+                    if !defs.is_empty() && exclusion.defs.len() == defs.len() {
                         continue;
                     }
                     applied_keys.push((source_key.clone(), change.key.clone()));
@@ -8329,23 +3279,13 @@ pub(super) async fn compute_page(
         // every backfill enumeration produces — is collected instead of
         // re-read immediately, so every such key in this batch is fetched
         // in one [`read_live_rows_batch`] round trip rather than one
-        // round trip per key (issue #13).
+        // round trip per key (issue #13). Every new image this source's
+        // changes need is decoded in one [`decode_images`] call (issue
+        // #327), not one round trip each.
         //
-        // Every image this source's changes need is decoded in one
-        // [`decode_images`] call (issue #327), not one round trip each:
-        // - `rows`: each change's new image.
-        // - `old_rows`: each change's old-side image ([`old_side_image`]),
-        //   decoded only when something reads it. A 1-1 definition reading a
-        //   to-one relationship needs the old join-key value, to bump `gen`
-        //   for the parent a re-point/delete moved *away* from (issue #130,
-        //   see `RelationshipGenBump`'s doc comment); and each relationship
-        //   pointing at this table as its to-side reads the join key off it
-        //   for a delete/re-parent. The overwhelmingly common 1-1-only,
-        //   relationship-free source decodes none.
         // #623 D3: a definition on the ledger reads its images and its
         // Re-derives in Phase 3 (`super::ledger`), so a source read only by
-        // such definitions, and by no relationship, decodes and re-reads
-        // nothing here.
+        // such definitions decodes and re-reads nothing here.
         let mut ledger_shapes: Vec<Option<super::ledger::LedgerShape>> =
             Vec::with_capacity(defs.len());
         // #1100: a definition the group basis takes (behind its dev knob)
@@ -8365,52 +3305,39 @@ pub(super) async fn compute_page(
             });
             group_shapes.push(super::group_basis::route(&def.def, &def.source_columns));
         }
-        let ledger_only = inbound_rels.is_empty()
-            && ledger_shapes
-                .iter()
-                .zip(&group_shapes)
-                .zip(&joins)
-                .all(|((ledger, group), join)| ledger.is_some() || group.is_some() || *join);
-        // #623 D6: so does a relationship-free 1-1 definition's Re-derive,
-        // so a source read only by those re-reads nothing here either.
-        let rederives_in_phase3 = inbound_rels.is_empty()
-            && defs
-                .iter()
-                .zip(ledger_shapes.iter().zip(&group_shapes))
-                .all(|(def, (shape, group))| {
-                    shape.is_some()
-                        || group.is_some()
-                        || matches!(def.def.key_space, KeySpace::Join(_))
-                        || (def.def.key_space == KeySpace::OneToOne
-                            && eval::relationship_references(&def.def).is_empty())
-                });
-        let decode_old_side = needs_old_rows || !inbound_rels.is_empty();
+        let ledger_only = ledger_shapes
+            .iter()
+            .zip(&group_shapes)
+            .zip(&joins)
+            .all(|((ledger, group), join)| ledger.is_some() || group.is_some() || *join);
+        // #623 D6: so does a 1-1 definition's Re-derive, so a source read
+        // only by those re-reads nothing here either.
+        let rederives_in_phase3 = defs
+            .iter()
+            .zip(ledger_shapes.iter().zip(&group_shapes))
+            .all(|(def, (shape, group))| {
+                shape.is_some()
+                    || group.is_some()
+                    || matches!(def.def.key_space, KeySpace::Join(_) | KeySpace::OneToOne)
+            });
         let mut batch = ImageBatch::default();
-        let mut slots: Vec<(Option<usize>, Option<usize>)> = Vec::with_capacity(changes.len());
+        let mut slots: Vec<Option<usize>> = Vec::with_capacity(changes.len());
         let mut live_refetch_indices: Vec<usize> = Vec::new();
         for (i, change) in changes.iter().enumerate() {
             if ledger_only {
-                slots.push((None, None));
+                slots.push(None);
                 continue;
             }
             if change.new_image.is_none() && change.old_image.is_none() && !rederives_in_phase3 {
                 live_refetch_indices.push(i);
             }
-            let new_slot = batch.push_opt(change.new_image.as_ref());
-            let old_slot = if decode_old_side {
-                batch.push_opt(old_side_image(change))
-            } else {
-                None
-            };
-            slots.push((new_slot, old_slot));
+            slots.push(batch.push_opt(change.new_image.as_ref()));
         }
         let mut decoded = batch.decode(pool).await?;
-        let mut rows: Vec<Option<Row>> = Vec::with_capacity(changes.len());
-        let mut old_rows: Vec<Option<Row>> = Vec::with_capacity(changes.len());
-        for (new_slot, old_slot) in slots {
-            rows.push(decoded.take_opt(new_slot));
-            old_rows.push(decoded.take_opt(old_slot));
-        }
+        let mut rows: Vec<Option<Row>> = slots
+            .into_iter()
+            .map(|slot| decoded.take_opt(slot))
+            .collect();
         if !live_refetch_indices.is_empty() {
             let live_keys: Vec<&str> = live_refetch_indices
                 .iter()
@@ -8423,253 +3350,10 @@ pub(super) async fn compute_page(
             }
         }
 
-        for rel in &inbound_rels {
-            // Issue #131, epic #127: to-one relationships get the new
-            // parent-keyed reverse record + delta mechanism below;
-            // to-many relationships keep exactly this pre-#131 image-less
-            // recompute path, unchanged — Phase 1 of this epic is to-one
-            // relationship *values* only (see the plan doc §7).
-            if rel.cardinality == RelationshipCardinality::ToMany {
-                // Join-key text -> the max `hop_gen` of the to-side changes
-                // that touched it (a re-parent update touches both its old
-                // and new key; a delete carries only its pre-image), and
-                // (issues #51/#52's multi-hop gap) the *earliest* (`min`)
-                // `src_changed` among those same changes — see
-                // `earliest_src_changed`'s doc comment for why the two use
-                // opposite merge directions.
-                let mut key_hops: HashMap<String, i32> = HashMap::new();
-                let mut key_src_changed: HashMap<String, Provenance> = HashMap::new();
-                for (i, change) in changes.iter().enumerate() {
-                    if skips_relationship(&exclusions, i, rel.id) {
-                        continue;
-                    }
-                    let mut note = |value: &Option<String>, hop: i32| {
-                        if let Some(text) = value {
-                            key_hops
-                                .entry(text.clone())
-                                .and_modify(|h| *h = (*h).max(hop))
-                                .or_insert(hop);
-                            key_src_changed
-                                .entry(text.clone())
-                                .and_modify(|(sc, origin)| {
-                                    *sc = earliest_src_changed(*sc, change.src_changed);
-                                    *origin = earliest_origin(*origin, change.origin_lsn);
-                                })
-                                .or_insert((change.src_changed, change.origin_lsn));
-                        }
-                    };
-                    // Issue #677: a present image missing `to_col` is
-                    // `MissingColumn`, not "no key" — see
-                    // `relationship_key_text`.
-                    for row in [&rows[i], &old_rows[i]] {
-                        let key = relationship_key_text(row, &rel.def.to_col, &rel.def.name)?;
-                        note(&key, change.hop_gen);
-                    }
-                    // Issue #784: every key the fold erased from both
-                    // images.
-                    for key in touched_join_values(change, &rel.def.to_col, key_col) {
-                        note(&Some(key.clone()), change.hop_gen);
-                    }
-                }
-                accumulate_from_side_recomputes(
-                    pool,
-                    rel,
-                    &key_hops,
-                    &key_src_changed,
-                    &mut reverse_recomputes,
-                    FromSideFence::new(&mut versions, skip_frozen),
-                )
-                .await?;
-                continue;
-            }
-
-            // Issue #244: an image-less change — a bare
-            // `StagedChange::Recompute` trigger — is *not* a parent state
-            // transition, and must never become a reverse **delta**.
-            //
-            // Such a trigger asserts only "this key exists as of now" (see
-            // `intake::markers::enumerate_and_append`'s doc comment); it
-            // carries no images at all, and it is staged in quantity by
-            // paths that have nothing to do with the parent changing: a
-            // definition's ring backfill enumeration of its own source
-            // table, forward propagation's chained-target hop, and every
-            // reverse/TRUNCATE-clear fallback (whose from-side table is very
-            // often *also* some other relationship's to-side).
-            //
-            // A reverse record can't represent that. It reads `rows[i]`,
-            // which for an image-less trigger is `compute`'s own *live
-            // re-read* of the row — so the record it would build is
-            // `old_row = None`, `new_row = Some(live row)`, byte-for-byte
-            // the shape of a genuine parent INSERT, and the delta fast path
-            // (deleted in #623 D5) would dutifully add the parent's
-            // contribution to every matching from-side row's group a
-            // second time, on top of the
-            // contribution already folded in when the parent was really
-            // inserted. That is a silent 2x `SUM` (issue #244's generative
-            // repro: `t4[1].rel_agg` 59 -> 118).
-            //
-            // The right treatment is the one the to-many branch just above
-            // already gives every trigger it sees, image-less included: an
-            // image-less `Recompute` of the matching from-side rows, which
-            // re-derives each affected group from live state and is
-            // therefore idempotent no matter how many times it runs — the
-            // same always-correct fallback `needs_recompute_fallback` and
-            // the guard-rejection paths route to. It costs a hop generation
-            // and a live pass instead of a delta, which is exactly the
-            // trade the fallback exists to make, and it keeps a *genuine*
-            // propagation (a chained to-side target this apply just
-            // rewrote, staged as an image-less hop) reaching its dependents
-            // rather than being dropped.
-            //
-            // Issue #392: a `recompute` that folded with the parent's own CDC
-            // change leaves a record with images, which becomes a delta
-            // record below as usual (it also advances the projection). The
-            // recompute still asked for the from-side rows to be re-derived,
-            // so they are, from both of the record's images.
-            //
-            // Issue #784: an aggregate's ledger write reads the parent live
-            // (#623 D5), so a child may have read the parent under a join
-            // key the fold erased from both of this record's images: a
-            // parent born and deleted inside the batch (no image on either
-            // side), or one re-keyed through a value and on. Those keys come
-            // from the ring key or the raw new images (`touched_join_values`), and
-            // their from-side rows are re-derived here like an image-less
-            // record's, since no reverse record names them.
-            let mut key_hops: HashMap<String, i32> = HashMap::new();
-            let mut key_src_changed: HashMap<String, Provenance> = HashMap::new();
-            let mut note_key = |key: String, change: &FoldedChange| {
-                key_hops
-                    .entry(key.clone())
-                    .and_modify(|h| *h = (*h).max(change.hop_gen))
-                    .or_insert(change.hop_gen);
-                key_src_changed
-                    .entry(key)
-                    .and_modify(|(sc, origin)| {
-                        *sc = earliest_src_changed(*sc, change.src_changed);
-                        *origin = earliest_origin(*origin, change.origin_lsn);
-                    })
-                    .or_insert((change.src_changed, change.origin_lsn));
-            };
-            for (i, change) in changes.iter().enumerate() {
-                if skips_relationship(&exclusions, i, rel.id) {
-                    continue;
-                }
-                let image_less = change.old_image.is_none() && change.new_image.is_none();
-                if image_less || change.has_recompute {
-                    // An image-less change carries no image of its own:
-                    // its new side is the live re-read, and its old side
-                    // (`old_side_image`) is its prior-image hint, the row as
-                    // readers last saw it, as the to-many branch above reads
-                    // it. A re-read that came back empty (the key no longer
-                    // exists) names no key, so only the hint reaches the
-                    // from-side rows of a parent that went away; issue #754:
-                    // a released parked delete is such a recompute.
-                    for row in [rows[i].as_ref(), old_rows[i].as_ref()]
-                        .into_iter()
-                        .flatten()
-                    {
-                        // Issue #677: absent `to_col` is `MissingColumn`,
-                        // only a `NULL` one is "no key".
-                        if let Some(join_text) =
-                            required_column(row, &rel.def.to_col, &rel.def.name)?
-                        {
-                            note_key(join_text.clone(), change);
-                        }
-                    }
-                    for key in touched_join_values(change, &rel.def.to_col, key_col) {
-                        note_key(key.clone(), change);
-                    }
-                } else {
-                    // The reverse record below re-derives the from-side rows
-                    // of its two images' keys; only the keys between them
-                    // are left.
-                    let old_key =
-                        relationship_key_text(&old_rows[i], &rel.def.to_col, &rel.def.name)?;
-                    let new_key = relationship_key_text(&rows[i], &rel.def.to_col, &rel.def.name)?;
-                    for key in touched_join_values(change, &rel.def.to_col, key_col) {
-                        if Some(key) != old_key.as_ref() && Some(key) != new_key.as_ref() {
-                            note_key(key.clone(), change);
-                        }
-                    }
-                }
-            }
-            accumulate_from_side_recomputes(
-                pool,
-                rel,
-                &key_hops,
-                &key_src_changed,
-                &mut reverse_recomputes,
-                FromSideFence::new(&mut versions, skip_frozen),
-            )
-            .await?;
-
-            // Issue #131: to-one. One `ReverseRelationshipShape` per
-            // relationship per `compute()` call, shared (via `Arc`) by every
-            // parent key this batch's fold touches for it.
-            let shape = match relationship_reverse_shapes.get(&rel.id) {
-                Some(shape) => Arc::clone(shape),
-                None => {
-                    let shape = Arc::new(
-                        build_reverse_relationship_shape(
-                            pool,
-                            rel,
-                            Some(FromSideFence::new(&mut versions, skip_frozen)),
-                        )
-                        .await?,
-                    );
-                    relationship_reverse_shapes.insert(rel.id, Arc::clone(&shape));
-                    shape
-                }
-            };
-            for (i, change) in changes.iter().enumerate() {
-                if skips_relationship(&exclusions, i, rel.id) {
-                    continue;
-                }
-                // Issue #244: an image-less change (both of the *change's
-                // own* images absent — a bare recompute trigger) is never a
-                // parent state transition, so it never becomes a delta
-                // record; the block just above has already routed it to the
-                // idempotent from-side recompute instead. Tested on
-                // `change.old_image`/`change.new_image`, **not** on the
-                // decoded `old_row`/`new_row` pair this used to test: an
-                // image-less trigger's `rows[i]` is `compute`'s own live
-                // re-read, so the old condition only ever fired for a key
-                // whose live re-read also came back empty — the delta path
-                // saw every still-existing row as a parent INSERT and
-                // double-counted its contribution (see the long comment on
-                // the image-less block above).
-                if change.old_image.is_none() && change.new_image.is_none() {
-                    continue;
-                }
-                let old_row = old_rows[i].clone();
-                let new_row = rows[i].clone();
-                let read_key =
-                    relationship_read_key(&old_row, &new_row, &rel.def.to_col, &rel.def.name)?;
-                let capture =
-                    capture_reverse_guard_state(pool, &shape, read_key.as_deref()).await?;
-                relationship_reverses.push(RelationshipReverseRecord {
-                    shape: Arc::clone(&shape),
-                    old_row,
-                    new_row,
-                    old_image: change.old_image.clone(),
-                    new_image: change.new_image.clone(),
-                    lsn: change.lsn,
-                    prev_lsn: capture.prev_lsn,
-                    prev_gen: capture.prev_gen,
-                    watermark: capture.watermark,
-                    hop_gen: change.hop_gen,
-                    src_changed: change.src_changed,
-                    origin_lsn: change.origin_lsn,
-                    retry_count: 0,
-                });
-            }
-        }
-
         for ((def, ledger_shape), group_shape) in defs.iter().zip(ledger_shapes).zip(group_shapes) {
             // #799: this definition's share, without the changes whose key
             // is poisoned for it (parked above).
-            let (changes, rows, old_rows) =
-                definition_share(def.id, &changes, &rows, &old_rows, &exclusions);
+            let (changes, rows) = definition_share(def.id, &changes, &rows, &exclusions);
             if changes.is_empty() {
                 continue;
             }
@@ -8770,14 +3454,7 @@ pub(super) async fn compute_page(
                 });
             }
             let field_names: Vec<String> = def.def.fields.iter().map(|f| f.name.clone()).collect();
-            let field_types = one_to_one_field_types(
-                pool,
-                &def.def,
-                &def.source_columns,
-                &def.target_table,
-                &field_names,
-            )
-            .await?;
+            let field_types = one_to_one_field_types(&def.def, &def.source_columns, &field_names)?;
 
             // ADR-0003 (column-level quarantine): a column
             // the fuse has paused is excluded from both this plan's
@@ -8823,51 +3500,11 @@ pub(super) async fn compute_page(
             // volumes.
             let mut regex_cache = eval::RegexCache::new();
 
-            // Relationship enrichment (issues #28/#29 eval, wired here by
-            // #30): a target reading a `<rel>.<column>` path (to-one) or an
-            // aggregate over one (to-many) needs the related to-side rows
-            // built into a `RelationshipContext`. Built once per definition
-            // over this source's from-side rows — the join keys are their
-            // `from_col` values — then threaded into every Apply's eval
-            // below. Phase 3's Re-derives (#623 D6) run the same reads again,
-            // under their entry lock (issue #838). A definition with no
-            // relationship references stays on the plain `eval::evaluate`
-            // path.
-            let relationships = if eval::relationship_references(&def.def).is_empty() {
-                RederiveRelationships::None
-            } else {
-                let (reads, ctx, gen_bumps) = build_relationship_context(
-                    pool,
-                    &def.source_table,
-                    &def.def,
-                    &rows,
-                    &old_rows,
-                    &changes,
-                )
-                .await?;
-                // Issue #130: merge this definition's touched-parent keys
-                // into the whole-batch accumulator — several definitions
-                // (or several sources, across loop iterations) can share
-                // one relationship, and every one of them needs to land
-                // in the same Phase 3 bump.
-                for (rel_id, bump) in gen_bumps {
-                    relationship_gen_bumps
-                        .entry(rel_id)
-                        .and_modify(|existing| {
-                            existing
-                                .touched_keys
-                                .extend(bump.touched_keys.iter().cloned());
-                        })
-                        .or_insert(bump);
-                }
-                RederiveRelationships::Both(ctx, reads)
-            };
             let rederive = Arc::new(Rederive {
                 def: def.def.clone(),
                 source_columns: def.source_columns.clone(),
                 paused: paused.clone(),
                 skip_failing: false,
-                relationships,
             });
             let plan = targets
                 .entry(def.def.target.clone())
@@ -8895,12 +3532,8 @@ pub(super) async fn compute_page(
                     Some(last) if !change.has_recompute => {
                         let values = match (&change.new_image, row) {
                             (Some(_), Some(row)) => {
-                                let mut evaluated = evaluate_one_to_one(
-                                    &rederive,
-                                    rederive.relationships.phase2(),
-                                    row,
-                                    &mut regex_cache,
-                                )?;
+                                let mut evaluated =
+                                    evaluate_one_to_one(&rederive, row, &mut regex_cache)?;
                                 Some(evaluated_values(&field_names, &mut evaluated))
                             }
                             _ => None,
@@ -8924,131 +3557,6 @@ pub(super) async fn compute_page(
                 );
             }
         }
-    }
-
-    // Issue #134: reconstruct a fresh `RelationshipReverseRecord` for every
-    // deferred reverse this batch's fold produced (see
-    // `relationship_reverse_deferrals`'s own comment above for why these
-    // never entered the by-source loop above). Guard state
-    // (`prev_lsn`/`prev_gen`/`watermark`) is re-derived live here, via the
-    // exact same `capture_reverse_guard_state` call the fresh-from-CDC path
-    // above uses — never replayed from anything persisted on the ring row
-    // (this op's own migration deliberately carries none of the three) —
-    // see that migration's doc comment for why: a stale replay could
-    // wrongly pass a guard that should now fail, or wrongly fail one that
-    // would now legitimately pass, silently reintroducing exactly the class
-    // of bug issues #132/#133 closed. `relationship_reverse_shapes` is the
-    // same cache the by-source loop above populates, so a relationship
-    // touched by both a genuine parent CDC row and a deferred retry in the
-    // same batch only ever builds its shape once.
-    // Every deferred reverse's images, decoded in one batch (issue #327).
-    let mut deferred_images = ImageBatch::default();
-    let deferred_slots: Vec<(Option<usize>, Option<usize>)> = relationship_reverse_deferrals
-        .iter()
-        .map(|change| {
-            (
-                deferred_images.push_opt(change.old_image.as_ref()),
-                deferred_images.push_opt(change.new_image.as_ref()),
-            )
-        })
-        .collect();
-    let mut deferred_decoded = deferred_images.decode(pool).await?;
-    for (change, (old_slot, new_slot)) in relationship_reverse_deferrals.iter().zip(deferred_slots)
-    {
-        let Some(rel_id) = change.relationship_reverse_deferred else {
-            unreachable!("filtered on relationship_reverse_deferred.is_some() above")
-        };
-        let shape = match relationship_reverse_shapes.get(&rel_id) {
-            Some(shape) => Arc::clone(shape),
-            None => {
-                let Some(rel) = catalog::relationship_by_id(pool, rel_id).await? else {
-                    // The relationship was dropped between the original
-                    // deferral and this retry — nothing left to retry
-                    // against. Drop the deferred row rather than erroring
-                    // the whole batch: a dropped relationship's own
-                    // catalog-side cleanup is responsible for anything else
-                    // that implies, not this drain.
-                    crate::instance_log::warn!(
-                        relationship_id = rel_id,
-                        "a deferred relationship reverse's relationship no longer exists; \
-                         dropping the retry"
-                    );
-                    continue;
-                };
-                let shape = Arc::new(
-                    build_reverse_relationship_shape(
-                        pool,
-                        &rel,
-                        Some(FromSideFence::new(&mut versions, skip_frozen)),
-                    )
-                    .await?,
-                );
-                relationship_reverse_shapes.insert(rel_id, Arc::clone(&shape));
-                shape
-            }
-        };
-        let old_row = deferred_decoded.take_opt(old_slot);
-        let new_row = deferred_decoded.take_opt(new_slot);
-        // Issue #784: the join keys the folded retries named that neither
-        // folded image does. A child may have read the parent live under
-        // one of them (an aggregate's ledger write does, #623 D5), and no
-        // reverse record is left to re-derive it, so its children are
-        // re-derived here, as `compute`'s by-source loop does for the
-        // parent's own rows (`touched_join_values`). A deferred row's
-        // `group_key` holds only this relationship's keys, since its
-        // `src_table` is the relationship's own.
-        if shape.needs_recompute_fallback {
-            let old_key = relationship_key_text(&old_row, &shape.to_col, &shape.name)?;
-            let new_key = relationship_key_text(&new_row, &shape.to_col, &shape.name)?;
-            let mut key_hops: HashMap<String, i32> = HashMap::new();
-            let mut key_src_changed: HashMap<String, Provenance> = HashMap::new();
-            for key in change.group_key.iter().flatten() {
-                if Some(key) != old_key.as_ref() && Some(key) != new_key.as_ref() {
-                    key_hops.insert(key.clone(), 0);
-                    key_src_changed.insert(key.clone(), (change.src_changed, change.origin_lsn));
-                }
-            }
-            accumulate_from_side_recomputes_on(
-                pool,
-                &shape.from_table,
-                &shape.from_col,
-                &key_hops,
-                &key_src_changed,
-                &mut reverse_recomputes,
-                FromSideFence::new(&mut versions, skip_frozen),
-            )
-            .await?;
-        }
-        if old_row.is_none() && new_row.is_none() {
-            // The retries folded to no image on either side: the parent was
-            // born and deleted across them (#784), and its children were
-            // re-derived above. A single deferred row always has an image
-            // (`check_reverse_guards` passes a record with neither key), so
-            // nothing else folds to this.
-            continue;
-        }
-        let read_key = relationship_read_key(&old_row, &new_row, &shape.to_col, &shape.name)?;
-        let capture = capture_reverse_guard_state(pool, &shape, read_key.as_deref()).await?;
-        relationship_reverses.push(RelationshipReverseRecord {
-            shape: Arc::clone(&shape),
-            old_row,
-            new_row,
-            old_image: change.old_image.clone(),
-            new_image: change.new_image.clone(),
-            lsn: change.lsn,
-            prev_lsn: capture.prev_lsn,
-            prev_gen: capture.prev_gen,
-            watermark: capture.watermark,
-            // Deliberately 0, not `change.hop_gen` (this op's ring row
-            // never meaningfully carries one — always staged as 0, see
-            // `append::ChangeRow`'s `RelationshipReverseDeferred` arm):
-            // retrying is not propagation, and must never contribute
-            // toward the hop bound.
-            hop_gen: 0,
-            src_changed: change.src_changed,
-            origin_lsn: change.origin_lsn,
-            retry_count: change.retry_count,
-        });
     }
 
     if !poisoned_park.is_empty() {
@@ -9075,9 +3583,7 @@ pub(super) async fn compute_page(
         versions.entry(source_key.clone()).or_insert(version);
 
         // The same key read, and skip, as the by-source loop's above.
-        let Some(pk) =
-            source_key_for_apply(pool, &change.src_table, &source_key, &mut versions).await?
-        else {
+        let Some(pk) = source_key_for_apply(pool, &change.src_table, &source_key).await? else {
             continue;
         };
         // `&change.src_table` (qualified), not `source_key` — see
@@ -9211,128 +3717,6 @@ pub(super) async fn compute_page(
                 &mut transform_observations,
             );
         }
-
-        // Issue #98: a TRUNCATE clears definitions reading this table
-        // directly (above), but definitions that read it only *through* a
-        // relationship — this table is some relationship's to-side — need
-        // clearing too, and the "truncate clears" mechanism above only
-        // resolves direct source readers via `transforms_for_source`. Reuse
-        // the reverse-recompute mechanism (issue #30) that the row-driven
-        // `by_source` loop above feeds for exactly this situation, staging
-        // every from-side row currently pointing at this (now-empty) table
-        // as a recompute — see `ReverseTrigger::WholeKeyspace`'s doc comment
-        // for why "every non-NULL join column", not a specific value list,
-        // is the right query for a TRUNCATE. Pushed into the same
-        // `reverse_recomputes` accumulator the row-driven path uses, so it's
-        // deduped the same way (issue #79) and drained through the same
-        // `Recompute` pipeline below — no separate emission path needed.
-        // A to-one relationship with a projection is the exception (issue
-        // #920): its from-side rows are read in Phase 3, after the clear
-        // (`TruncateRederive`).
-        // Image-less, unless an aggregate groups by the relationship (issue
-        // #520, below).
-        let inbound_rels = catalog::relationships_to_table(pool, &source_key).await?;
-        for rel in &inbound_rels {
-            // Issue #168: for a to-one relationship, the staged recompute
-            // above only re-derives the from-side row's enrichment — it
-            // says nothing about *what value* that recompute will read. For
-            // an ordinary row-driven change, that value comes from
-            // `catalog::relationship_projection`'s settled parent
-            // projection (`build_relationship_context`'s doc comment),
-            // which the row-driven `by_source` loop keeps in sync via
-            // `RelationshipReverseRecord`/`apply_projection_advance` (a
-            // delete-then-upsert keyed off each change's own old/new
-            // image). A `TRUNCATE` never reaches that loop at all (its one
-            // key-less sentinel carries no image to upsert or delete with),
-            // so without this, the projection would keep serving every
-            // to-side row's pre-truncate value forever — the from-side
-            // recompute would re-derive against stale data, not against
-            // the now-empty table. Cleared in full at Phase 3
-            // (`ApplyPlan::relationship_projection_clears`), same "whole
-            // table, not a key list" shape as the truncate-clear on a
-            // direct target above, since every row this projection held
-            // for this relationship just vanished with the truncate.
-            // To-many relationships have no projection at all (`ToMany`
-            // still resolves via a live `LEFT JOIN` every time —
-            // `build_relationship_context`'s own doc comment), so nothing
-            // to clear there.
-            let projection = if rel.cardinality == RelationshipCardinality::ToOne {
-                catalog::relationship_projection(pool, rel.id).await?
-            } else {
-                None
-            };
-            if let Some(projection) = &projection {
-                relationship_projection_clears
-                    .entry(rel.id)
-                    .and_modify(|clear| clear.lsn = clear.lsn.max(change.lsn))
-                    .or_insert(RelationshipProjectionClear {
-                        qualified_projection: projection.qualified_table(),
-                        lsn: change.lsn,
-                        rederive: None,
-                    });
-            }
-            // Issue #267: canonicalized to qualified identity for the same
-            // reason [`accumulate_from_side_recomputes`] does it — this shares
-            // that function's accumulator, and its entries are staged as
-            // `src_table` verbatim.
-            let qualified_from_table = rel.qualified_from_table();
-            let Some(from_pk) = from_side_key(
-                pool,
-                &qualified_from_table,
-                FromSideFence::new(&mut versions, skip_frozen),
-            )
-            .await?
-            else {
-                continue;
-            };
-            let hop = change.hop_gen + 1;
-            // Issue #920: a projection's readers are found in Phase 3, just
-            // after its clear. See `TruncateRederive`.
-            if projection.is_some()
-                && let Some(clear) = relationship_projection_clears.get_mut(&rel.id)
-            {
-                let provenance = (change.src_changed, change.origin_lsn);
-                match &mut clear.rederive {
-                    Some(rederive) => {
-                        rederive.hop_gen = rederive.hop_gen.max(hop);
-                        rederive.provenance = (
-                            earliest_src_changed(rederive.provenance.0, provenance.0),
-                            earliest_origin(rederive.provenance.1, provenance.1),
-                        );
-                    }
-                    None => {
-                        clear.rederive = Some(TruncateRederive {
-                            from_table: qualified_from_table,
-                            from_col: rel.def.from_col.clone(),
-                            from_pk,
-                            hop_gen: hop,
-                            provenance,
-                        });
-                    }
-                }
-                continue;
-            }
-            // #623 D5: an aggregate on the from-table keeps each row's group
-            // on its ledger entry, so the recompute needs no prior image.
-            let from_keys = from_side_keys(
-                pool,
-                &qualified_from_table,
-                &from_pk,
-                &rel.def.from_col,
-                &ReverseTrigger::WholeKeyspace,
-            )
-            .await?;
-            for (from_key, _) in from_keys {
-                reverse_recomputes
-                    .entry((qualified_from_table.clone(), from_key))
-                    .and_modify(|(h, (sc, origin))| {
-                        *h = (*h).max(hop);
-                        *sc = earliest_src_changed(*sc, change.src_changed);
-                        *origin = earliest_origin(*origin, change.origin_lsn);
-                    })
-                    .or_insert((hop, (change.src_changed, change.origin_lsn)));
-            }
-        }
     }
 
     let mut downstream_readers = HashMap::new();
@@ -9400,15 +3784,6 @@ pub(super) async fn compute_page(
         }
     }
 
-    let reverse_recomputes: Vec<DerivedRecompute> = reverse_recomputes
-        .into_iter()
-        .map(
-            |((from_table, from_key), (hop, (src_changed, origin_lsn)))| {
-                (from_table, from_key, hop, src_changed, origin_lsn)
-            },
-        )
-        .collect();
-
     Ok(ApplyPlan {
         versions,
         targets,
@@ -9420,12 +3795,8 @@ pub(super) async fn compute_page(
         poisoned_park,
         applied_keys,
         retries_succeeded: Default::default(),
-        reverse_recomputes,
         transform_observations,
         end_to_end_origins: terminal_end_to_end_origins,
-        relationship_gen_bumps,
-        relationship_reverses,
-        relationship_projection_clears,
     })
 }
 
@@ -9472,39 +3843,6 @@ fn flush_apply_metrics(plan: &ApplyPlan) {
                 .unwrap_or(std::time::Duration::ZERO);
             crate::metrics::record_end_to_end_latency(transform, latency);
         }
-    }
-}
-
-/// Issue #134/#135 review follow-up: flushes [`ApplyOutcome::deferral_counts`]/
-/// [`ManyApplyOutcome::deferral_counts`] into
-/// [`crate::metrics::increment_relationship_reverse_deferred`] — the
-/// deferral-metrics counterpart to [`flush_apply_metrics`], with the exact
-/// same "only after this attempt's transaction has actually committed"
-/// contract and for the same reason: `drain_once`/`drain_many`'s retry loop
-/// can call `apply_and_mark_drained`/`apply_and_mark_drained_many` more than
-/// once for the same folded input on a `VersionFenceMiss` or a transient
-/// Phase-3 failure (doc 06's `FenceMissBackoff`, an *ordinary*, routine
-/// occurrence, not a rare edge case) — recording eagerly, from inside that
-/// function itself, would inflate a guard's count once per losing attempt,
-/// exactly the kind of skew #135's fairness/starvation decisions can least
-/// afford under the high-contention conditions where they matter most.
-/// Not folded into `flush_apply_metrics` itself (which takes `&ApplyPlan`,
-/// a Phase-2-only artifact): these counts are discovered live during Phase
-/// 3, so they ride on the apply outcome instead.
-fn flush_relationship_reverse_deferral_metrics(deferral_counts: &HashMap<&'static str, u64>) {
-    for (guard, count) in deferral_counts {
-        for _ in 0..*count {
-            crate::metrics::increment_relationship_reverse_deferred(guard);
-        }
-    }
-}
-
-/// Issue #135: the fairness-escalation counterpart to
-/// [`flush_relationship_reverse_deferral_metrics`] — same post-commit-only
-/// contract and the same reason (see that function's doc comment).
-fn flush_relationship_reverse_fairness_escalation_metric(count: u64) {
-    for _ in 0..count {
-        crate::metrics::increment_relationship_reverse_fairness_escalated();
     }
 }
 
@@ -9614,8 +3952,7 @@ pub(super) fn pk_keyset_match(pk: &[PrimaryKeyColumn], alias: &str) -> String {
 /// [`lock_composite_keys`]) and the single-column delete
 /// ([`delete_single_keys`]) do. A composite key is always the full key of
 /// a primary key or unique index (`ddl::identity_key_columns`), so the
-/// settings always have an index to probe, and no detection is needed as for
-/// a relationship's join column (`key_column_in`). Each composite statement
+/// settings always have an index to probe. Each composite statement
 /// among them has a plan test on a two-column key analyzed at 100 rows and
 /// grown to 400k or 1M, which counts the rows its scans actually read rather
 /// than the planner's estimates, and holds them to the batch (#791).
@@ -9628,13 +3965,7 @@ pub(super) fn pk_keyset_match(pk: &[PrimaryKeyColumn], alias: &str) -> String {
 /// for thousands of `= any` values far above 17's estimate: it scanned a
 /// 400k-row table analyzed at 100 and filtered it by the bound, where 17
 /// read the index. So each statement that takes the bound also runs under
-/// those settings. So do the statements that read a to-one relationship's
-/// projection by a batch of its primary key's values, which compare the one
-/// key column by `= any` and need no bound: the generation bump
-/// ([`bump_generations`]), the reverse release's lock
-/// ([`lock_projection_rows`]) and a build chunk's read under its entry lock
-/// ([`RelationshipReads::fetch_under_lock`]). PostgreSQL 16 read a 400k-row
-/// projection analyzed at 100 in full for 5,000 of them.
+/// those settings.
 pub(crate) fn bounds_keyset_by_array(key: &[PrimaryKeyColumn]) -> bool {
     key.len() == 1
 }
@@ -9919,67 +4250,39 @@ fn evaluated_values(
 
 /// Evaluates a 1-1 definition over one source row, without its paused
 /// columns: an Apply's image in Phase 2, or a Re-derive's row in Phase 3.
-/// `relationships` is the context its relationship paths resolve against,
-/// `None` for a definition that reads no relationship.
 fn evaluate_one_to_one(
     rederive: &Rederive,
-    relationships: Option<&RelationshipContext>,
     row: &Row,
     regex_cache: &mut eval::RegexCache,
 ) -> Result<HashMap<String, Option<eval::Value>>, ApplyError> {
-    Ok(match relationships {
-        Some(ctx) => eval::evaluate_with_relationships_excluding(
-            &rederive.def,
-            row,
-            &rederive.source_columns,
-            ctx,
-            regex_cache,
-            &rederive.paused,
-        )?,
-        None => eval::evaluate_excluding(
-            &rederive.def,
-            row,
-            &rederive.source_columns,
-            regex_cache,
-            &rederive.paused,
-        )?,
-    })
+    Ok(eval::evaluate_excluding(
+        &rederive.def,
+        row,
+        &rederive.source_columns,
+        regex_cache,
+        &rederive.paused,
+    )?)
 }
 
-/// A 1-1 definition's `field_names`' types. A relationship-enriched field's
-/// type can't come from `infer_field_types` (it rejects a `<rel>.<column>`
-/// path, whose type is a *to-side* column's, unknown to the from-side type
-/// map). The field's inferred type *is* its target column's declared type,
-/// though (see `infer_field_types`' doc), and that column already exists —
-/// introspect it, at `target_table`, the persisted, fully-qualified identity
-/// (issue #73; `def.target` is always bare, issue #76). A definition with no
-/// relationship keeps the pure inference.
-async fn one_to_one_field_types(
-    pool: &Pool,
+/// A 1-1 definition's `field_names`' types, inferred from its source's
+/// column types.
+fn one_to_one_field_types(
     def: &TransformDef,
     source_columns: &HashMap<String, ValueType>,
-    target_table: &str,
     field_names: &[String],
 ) -> Result<Vec<ValueType>, ApplyError> {
-    let types = if eval::relationship_references(def).is_empty() {
-        // No relationship metadata needed: an empty map (issue #40).
-        validate::infer_field_types(def, source_columns, &HashMap::new())?
-    } else {
-        to_column_types(pool, target_table, field_names).await?
-    };
+    let types = validate::infer_field_types(def, source_columns, &HashMap::new())?;
     Ok(field_names
         .iter()
         .map(|name| types.get(name).copied().unwrap_or(ValueType::Numeric))
         .collect())
 }
 
-/// A direct writer's Re-derive of 1-1 keys, outside a page (#623 D6):
-/// a field build's chunk over a relationship-enriched 1-1 target (a column
-/// resume, #625 F8b, `staging::build`). Settled on the
-/// ledger as a page settles a Re-derive ([`settle_one_to_one_target`]),
-/// except that it applies nothing ([`RederiveRelationships::UnderLock`]).
-/// Built before the writer's transaction, since the catalog it resolves its
-/// relationship reads from is read through the pool.
+/// A direct writer's Re-derive of 1-1 keys, outside a page (#623 D6): a
+/// field build's chunk over a 1-1 target (a column resume, #625 F8b,
+/// `staging::build`). Settled on the ledger as a page settles a Re-derive
+/// ([`settle_one_to_one_target`]). Built before the writer's transaction,
+/// since the source's key and columns are read through the pool.
 pub(crate) struct DirectRederive {
     target: String,
     plan: TargetPlan,
@@ -10007,18 +4310,10 @@ impl DirectRederive {
             .map(|f| f.name.clone())
             .filter(|name| !excluded.contains(name))
             .collect();
-        let field_types =
-            one_to_one_field_types(pool, def, source_columns, target_table, &field_names).await?;
+        let field_types = one_to_one_field_types(def, source_columns, &field_names)?;
         let row_columns = {
             let client = pool.get().await?;
             live_row_columns(&**client, source_table).await?
-        };
-        let relationships = if eval::relationship_references(def).is_empty() {
-            RederiveRelationships::None
-        } else {
-            RederiveRelationships::UnderLock(
-                RelationshipReads::resolve(pool, source_table, def).await?,
-            )
         };
         let records = keys
             .iter()
@@ -10045,7 +4340,6 @@ impl DirectRederive {
                     source_columns: source_columns.clone(),
                     paused: excluded,
                     skip_failing,
-                    relationships,
                 }),
             },
         })
@@ -10078,9 +4372,7 @@ impl DirectRederive {
 ///
 /// A key carried by more than one record settles once, from the record that
 /// reflects the latest state: a Re-derive, which reads it, or else the
-/// latest Apply. A Re-derive of a relationship-enriched definition reads the
-/// related rows of the rows it read, under the same entry lock
-/// ([`RederiveRelationships`]).
+/// latest Apply.
 ///
 /// `first_seg` and `seg_seq` are the lowest and highest segments of the
 /// page's batches. A page whose first is at or below the target's
@@ -10189,31 +4481,18 @@ async fn settle_one_to_one_target(
         .await?;
         (read.rows, Some(read.snapshot), seg_seq.max(read.seg))
     };
-    // The related rows of the rows just read, under the same entry lock
-    // (issues #832 and #838; see `RederiveRelationships`).
-    let under_lock = match plan.rederive.relationships.under_lock() {
-        Some(reads) if !read.is_empty() => {
-            let rows: Vec<&Row> = read.values().collect();
-            Some(reads.fetch_under_lock(txn, &rows).await?)
-        }
-        _ => None,
-    };
     let mut regex_cache = eval::RegexCache::new();
     let mut rederived: HashMap<&str, Option<Vec<Option<String>>>> = HashMap::new();
     for key in rederive_keys {
         let values = match read.remove(key) {
             None => None,
             Some(row) => {
-                let mut evaluated = match evaluate_one_to_one(
-                    &plan.rederive,
-                    under_lock.as_ref(),
-                    &row,
-                    &mut regex_cache,
-                ) {
-                    Ok(evaluated) => evaluated,
-                    Err(_) if plan.rederive.skip_failing => continue,
-                    Err(err) => return Err(err),
-                };
+                let mut evaluated =
+                    match evaluate_one_to_one(&plan.rederive, &row, &mut regex_cache) {
+                        Ok(evaluated) => evaluated,
+                        Err(_) if plan.rederive.skip_failing => continue,
+                        Err(err) => return Err(err),
+                    };
                 Some(evaluated_values(&plan.field_names, &mut evaluated))
             }
         };
@@ -10296,8 +4575,7 @@ async fn settle_one_to_one_target(
 /// no-op-suppression `WHERE ... IS DISTINCT FROM ...` guard can mean a
 /// proposed write physically changes nothing) to `mutations`, with the
 /// key's prior image (issue #315, which subsumes #196's image-bearing
-/// delete; a relationship reader downstream takes a deleted row's old join
-/// value from it until #624). Returns only the counts.
+/// delete). Returns only the counts.
 ///
 /// The pre-lock takes every key this call touches (write or delete) `FOR
 /// UPDATE`, ordered ascending, in one round trip — the deadlock-avoidance
@@ -10732,15 +5010,7 @@ pub(super) async fn clear_target(
 /// 3. **The 1-1 targets on their ledgers** ([`settle_one_to_one_target`],
 ///    #623 D6): the sorted entry lock, the Re-derive read, the entries'
 ///    ADR-0002 I2 test, then the ordered pre-lock + upsert/delete of only
-///    the keys it changed ([`apply_target`]), followed by a key-ordered lock
-///    of every projection row the page writes ([`lock_page_projection_rows`],
-///    issue #848) and the **relationship
-///    settled-parent projection gen bump** (issue #130, epic #127): every
-///    to-one relationship parent this batch's relationship resolution
-///    touched (`plan.relationship_gen_bumps`) gets its projection's
-///    `__trellis_gen` bumped by 1, in this same transaction — see that
-///    step's own inline comment for the exact semantics and the #133 gap it
-///    documents.
+///    the keys it changed ([`apply_target`]).
 /// 4. **Downstream propagation**: every key a step above physically changed
 ///    (write or delete — no-op-suppressed writes don't count) was reported to
 ///    a [`TargetMutations`] (issue #315); for every such target some `live`
@@ -10770,17 +5040,13 @@ pub async fn apply_and_mark_drained(
     claimed_by: &str,
     plan: &ApplyPlan,
     wake_channel: &str,
-    watermark: &StagedWatermark,
 ) -> Result<ApplyOutcome, ApplyError> {
     let outcome =
-        apply_and_mark_drained_many(txn, &[seg_seq], claimed_by, plan, wake_channel, watermark)
-            .await?;
+        apply_and_mark_drained_many(txn, &[seg_seq], claimed_by, plan, wake_channel).await?;
     Ok(ApplyOutcome {
         keys_written: outcome.keys_written,
         keys_deleted: outcome.keys_deleted,
         batch_drained: outcome.segments_drained[0].1,
-        deferral_counts: outcome.deferral_counts,
-        fairness_escalations: outcome.fairness_escalations,
         pages: outcome.pages,
     })
 }
@@ -10817,7 +5083,6 @@ pub async fn apply_and_mark_drained_many(
     claimed_by: &str,
     plan: &ApplyPlan,
     wake_channel: &str,
-    watermark: &StagedWatermark,
 ) -> Result<ManyApplyOutcome, ApplyError> {
     let steps: Vec<SegmentStep> = seg_seqs
         .iter()
@@ -10826,7 +5091,7 @@ pub async fn apply_and_mark_drained_many(
             page: None,
         })
         .collect();
-    apply_page(txn, &steps, claimed_by, plan, wake_channel, watermark).await
+    apply_page(txn, &steps, claimed_by, plan, wake_channel).await
 }
 
 /// How one segment's claim ends a Phase 3 transaction (issue #620 A2a).
@@ -10903,7 +5168,7 @@ async fn hold_version_fences(
 /// before step 5 is the same either way.
 #[tracing::instrument(
     name = "staging.apply_and_mark_drained",
-    skip(txn, steps, plan, wake_channel, watermark),
+    skip(txn, steps, plan, wake_channel),
     fields(
         segments = steps.len(),
         targets = plan.targets.len(),
@@ -10918,7 +5183,6 @@ pub(crate) async fn apply_page(
     claimed_by: &str,
     plan: &ApplyPlan,
     wake_channel: &str,
-    watermark: &StagedWatermark,
 ) -> Result<ManyApplyOutcome, ApplyError> {
     // 1. Version fence.
     hold_version_fences(txn, &plan.versions).await?;
@@ -10938,19 +5202,6 @@ pub(crate) async fn apply_page(
 
     let mut keys_written = 0usize;
     let mut keys_deleted = 0usize;
-    // Issue #134/#135 review follow-up: per-guard deferral counts this
-    // Phase 3 pass discovers, buffered here rather than recorded eagerly —
-    // see [`ManyApplyOutcome::deferral_counts`]'s own doc comment for why
-    // (this function's own `VersionFenceMiss`/transient-failure retry loop,
-    // one layer up in `drain_once`/`drain_many`, can call it more than once
-    // for the same folded input; only the attempt whose transaction
-    // actually commits may ever reach the metrics registry).
-    let mut deferral_counts: HashMap<&'static str, u64> = HashMap::new();
-    // Issue #135: count of reverse transitions this pass resolved via
-    // fairness escalation (see [`ManyApplyOutcome::fairness_escalations`]'s
-    // doc comment) — buffered under the exact same post-commit-only
-    // contract as `deferral_counts` just above, for the same reason.
-    let mut fairness_escalations: u64 = 0;
     // Issue #315: every target write below reports its physically-changed
     // keys here, and step 4 turns them into downstream `Recompute` rows. See
     // `staging::target_mutations` — no writer hands its keys back to this
@@ -11063,427 +5314,18 @@ pub(crate) async fn apply_page(
         keys_deleted += deleted;
     }
 
-    // Before 2c and 3c, issue #531: the refresh stamp of every relationship
-    // this batch carries a reverse record or a projection clear for, locked
-    // `for share` before this transaction touches any projection row (2c,
-    // 3c and 3d below), in `relationship_id` order. A projection refresh
-    // locks the same rows `for update`, in the same order, before it touches
-    // a projection row (`catalog::refresh_relationship_projections_in_txn`),
-    // so either it commits first and a record at or below its stamp reads
-    // the stamp here (and takes the live-row check, `superseded_to_side`, or
-    // for a truncate skips the clear), or this transaction commits first and
-    // the refresh reads what it wrote. Taken after the target writes (steps
-    // 2 to 3b), the order the discharge takes the same kinds of row in (its
-    // orphan sweep, then the refresh). One keyed read per batch with reverse
-    // records or projection clears, none without.
-    let mut refresh_stamps = relationship_refresh_stamps(
-        txn,
-        plan.relationship_reverses
-            .iter()
-            .map(|r| r.shape.id)
-            .chain(plan.relationship_projection_clears.keys().copied()),
-        !plan.relationship_projection_clears.is_empty(),
-    )
-    .await?;
-
-    // 2c. Issue #168: settled parent projection clears — a `TRUNCATE` on a
-    // to-one relationship's to-side empties that relationship's
-    // projection too, as a whole-table delete: every row this projection held
-    // for this relationship just vanished along with the to-side's. No
-    // downstream propagation of its own — the projection is not a target
-    // table, and the from-side recompute this same truncate
-    // stages (just below, issue #920) is what actually reaches a
-    // definition; the projection is only ever read by
-    // `build_relationship_context`/the reverse-guard machinery, never a
-    // definition's own downstream consumer. Run after the target writes
-    // rather than beside the target clears (step 2) so the stamp lock above
-    // precedes it. Issue #531: a truncate at or below the relationship's
-    // refresh stamp is one the refresh already read, so emptying the
-    // projection would drop the rows the refresh found written after it.
-    //
-    // Issue #920: then, in this transaction, every from-side row that reads
-    // the projection, for a recompute staged at step 4 (see
-    // `TruncateRederive`), whether or not the clear was skipped, as Phase 2
-    // used to stage it.
-    let mut truncate_recomputes: Vec<DerivedRecompute> = Vec::new();
-    for (relationship_id, clear) in &plan.relationship_projection_clears {
-        if !truncate_overtaken_by_refresh(clear.lsn, refresh_stamps.get(relationship_id).copied()) {
-            txn.execute(&format!("delete from {}", clear.qualified_projection), &[])
-                .await?;
-            // Issue #886: the clear is a refresh of the projection from the
-            // to-side, which has no rows at `lsn`. Stamp it as one, so a reverse
-            // record staged before the truncate and draining after it (a
-            // deferral's retry, or a page that lost the race) is checked against
-            // the live row ([`superseded_to_side`]) instead of putting its older
-            // image back.
-            if let Some(lsn) = clear.lsn {
-                txn.execute(
-                    "update relationship_projections \
-                     set refreshed_lsn = greatest(refreshed_lsn, $2) where relationship_id = $1",
-                    &[relationship_id, &lsn],
-                )
-                .await?;
-                let stamp = refresh_stamps.entry(*relationship_id).or_insert(lsn);
-                *stamp = (*stamp).max(lsn);
-            }
-        }
-        if let Some(rederive) = &clear.rederive {
-            let sql = format!(
-                "select {pk} from {tbl} where {col} is not null",
-                pk = ddl::pk_key_sql_expr(&rederive.from_pk, None),
-                col = quote_ident(&rederive.from_col),
-                tbl = ddl::qualified_source_table(&rederive.from_table),
-            );
-            for row in txn.query(&sql, &[]).await? {
-                truncate_recomputes.push((
-                    rederive.from_table.clone(),
-                    row.get(0),
-                    rederive.hop_gen,
-                    rederive.provenance.0,
-                    rederive.provenance.1,
-                ));
-            }
-        }
-    }
-
-    // Before 3c and 3d, issue #848: every projection row the generation
-    // bumps (3c) and the reverse records (3d) write, locked `for update` in
-    // one statement per relationship, in `relationship_id` order and each in
-    // key order (ADR-0002 I5): see `lock_page_projection_rows`. The bump and
-    // the reverse records' guards and writes then take no lock on a row that
-    // existed here.
-    let reverse_keys: Vec<(Option<String>, Option<String>)> = plan
-        .relationship_reverses
-        .iter()
-        .map(|record| {
-            let shape = &record.shape;
-            Ok((
-                relationship_key_text(&record.old_row, &shape.to_col, &shape.name)?,
-                relationship_key_text(&record.new_row, &shape.to_col, &shape.name)?,
-            ))
-        })
-        .collect::<Result<_, ApplyError>>()?;
-    lock_page_projection_rows(
-        txn,
-        &plan.relationship_gen_bumps,
-        plan.relationship_reverses.iter().zip(&reverse_keys),
-    )
-    .await?;
-
-    // 3c. Relationship settled-parent projection gen bump (issue #130, epic
-    // #127; plan doc §2 guard (b)'s precondition): every to-one relationship
-    // parent this batch's relationship resolution touched
-    // (`ApplyPlan::relationship_gen_bumps`, resolved in Phase 2) gets its
-    // projection row's `__trellis_gen` bumped by exactly 1, in this same
-    // transaction — so guard (b) (#132) can detect, by re-reading under `FOR
-    // UPDATE` and comparing against a value it captured earlier, that a
-    // forward apply landed in between. One `UPDATE ... SET gen = gen + 1
-    // WHERE key = ANY(...)` per relationship, over the *deduped* set of
-    // touched keys (`RelationshipGenBump::touched_keys` is a `HashSet`) — so
-    // a parent touched by two different from-side rows in this same batch
-    // (e.g. two children re-pointing onto the same parent) still only
-    // advances its generation by 1 for the whole transaction, not once per
-    // touching row: guard (b) only needs "did anything land since I captured
-    // this," not a count of how many things did. A key with no projection
-    // row yet (see `ensure_relationship_projection_in_txn`'s own doc comment
-    // on the widen-only catch-up gap #131 closes) simply bumps nothing — no
-    // error, same as any `UPDATE ... WHERE` matching zero rows. The key is
-    // compared at its own type under the entry plan settings, so the
-    // projection's primary key index serves it ([`bump_generations`], issue
-    // #835). The rows are already locked in key order, just above: the bare
-    // `UPDATE` locks in whatever order its plan reads the rows (physical
-    // order under a bitmap scan), so two pages bumping an overlapping set of
-    // hot parents would otherwise deadlock (review follow-up to #132).
-    for bump in plan.relationship_gen_bumps.values() {
-        if bump.touched_keys.is_empty() {
-            continue;
-        }
-        bump_generations(txn, bump).await?;
-    }
-
-    // 3d. Issue #131, epic #127: to-one relationship reverse apply — see
-    // `RelationshipReverseRecord`'s doc comment for the mechanism. Each
-    // record's from-side Recomputes are staged for a later drain.
-    let mut relationship_reverse_fallback: Vec<DerivedRecompute> = Vec::new();
-    // Issue #134: guard-rejected records are re-staged as
-    // `StagedChange::RelationshipReverseDeferred` (never touching `hop_gen`)
-    // rather than folded into `recompute_changes` (which enforces
-    // `MAX_HOP_GEN` below) — appended separately, after this loop, via its
-    // own `append::append` call.
-    let mut relationship_reverse_deferrals: Vec<StagedChange> = Vec::new();
-    // Issue #248 review follow-up: `from_side_rows_for_trigger_txn` needs
-    // each touched `from_table`'s live column list (`row_as_text_jsonb_sql`,
-    // in place of `to_jsonb(t.*)`), and this loop runs once per distinct
-    // touched parent key in the batch — many records sharing one
-    // relationship all share one `from_table`. Caching per `from_table`
-    // across the *whole* loop (not just within one record) is what keeps
-    // that at one `pg_catalog` round trip per distinct `from_table`, not one
-    // per record, on a path that already fans out with wide
-    // reverse-relationship batches.
-    let mut row_columns_cache: HashMap<String, Vec<String>> = HashMap::new();
-    // Issue #762: the ring rows this transaction applies, which a live
-    // write's pending read counts as applied.
-    let claim = super::page::ClaimScope { steps, claimed_by };
-    for (record, (old_key, new_key)) in plan.relationship_reverses.iter().zip(reverse_keys) {
-        let shape = &record.shape;
-        // Resolved once per record from the batch-wide cache above — every
-        // `from_side_rows_for_trigger_txn` call this record makes (via
-        // `stage_reverse_recompute_fallback`) reuses this same slice.
-        let row_columns = cached_row_columns(txn, &mut row_columns_cache, &shape.from_table)
-            .await?
-            .to_vec();
-
-        // Issue #132: all four guards, checked together — see
-        // `check_reverse_guards`'s own doc comment for the mechanism, the
-        // locking discipline, and why they're combined into one Phase 3
-        // step instead of four independent ones.
-        let guards =
-            check_reverse_guards(txn, shape, record, &old_key, &new_key, watermark).await?;
-        // Test-only pause point (#848). See `super::interleave`.
-        #[cfg(any(test, feature = "test-util"))]
-        super::interleave::pause_at(
-            txn,
-            super::interleave::PausePoint::AfterReverseGuards,
-            &shape.qualified_projection,
-        )
-        .await?;
-        if let Some(failure) = guards {
-            // Issue #135: fairness escalation — see this module's own
-            // "Issue #135, epic #127: fairness escalation" design section
-            // (right after `check_reverse_guards`) for the full mechanism
-            // and why it is sound. Guard (d) failing itself is never
-            // eligible (see that section's "residual limitation"): the next
-            // check independently confirms guard (d) still holds before
-            // this branch is allowed to touch the projection at all.
-            if failure != ReverseGuardFailure::Ordering
-                && record.retry_count + 1 >= RELATIONSHIP_REVERSE_FAIRNESS_THRESHOLD
-                && reverse_ordering_still_holds(txn, shape, &old_key, &new_key, record).await?
-            {
-                *deferral_counts.entry(failure.metric_label()).or_insert(0) += 1;
-                fairness_escalations += 1;
-                crate::instance_log::warn!(
-                    relationship_projection = %shape.qualified_projection,
-                    guard = %failure,
-                    retry_count = record.retry_count + 1,
-                    threshold = RELATIONSHIP_REVERSE_FAIRNESS_THRESHOLD,
-                    "issue #135 fairness escalation: this reverse's guard-gated retry budget \
-                     is exhausted; advancing the projection and falling back to the \
-                     always-correct recompute instead of deferring again"
-                );
-                let mut seen_keys: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
-                stage_reverse_recompute_fallback(
-                    txn,
-                    record,
-                    &old_key,
-                    &new_key,
-                    &mut seen_keys,
-                    &mut relationship_reverse_fallback,
-                    &row_columns,
-                )
-                .await?;
-                let superseded = superseded_to_side(
-                    txn,
-                    &mut row_columns_cache,
-                    &refresh_stamps,
-                    record,
-                    &old_key,
-                    &new_key,
-                )
-                .await?;
-                if superseded {
-                    apply_projection_from_live(
-                        txn,
-                        shape,
-                        &old_key,
-                        &new_key,
-                        record.lsn,
-                        record.lsn,
-                        Some(&claim),
-                    )
-                    .await?
-                } else {
-                    apply_projection_advance(
-                        txn,
-                        shape,
-                        &old_key,
-                        &new_key,
-                        record.new_image.as_deref(),
-                        record.lsn,
-                    )
-                    .await?
-                }
-                continue;
-            }
-
-            // Issue #134: defer and re-stage, rather than #131/#132/#133's
-            // stopgap of falling back to an image-less `Recompute` of every
-            // touched from-side row at `hop_gen + 1`. Do NOT touch any
-            // target table or the projection for this record — exactly the
-            // same "nothing applied, nothing lost" posture the stopgap took
-            // — but re-stage the record itself (not its from-side rows) as
-            // a `RelationshipReverseDeferred`, so the next drain that picks
-            // it up re-derives fresh guard state and re-attempts the exact
-            // same delta this one just failed to apply, at no `hop_gen`
-            // cost: deferral is measured to be the *common* case for this
-            // mechanism (see this module's own doc section), and burning a
-            // hop generation per retry would trip `MAX_HOP_GEN` after 32
-            // routine deferrals.
-            //
-            // Buffered into `deferral_counts`, not recorded straight into
-            // the metrics registry here — see that variable's own comment.
-            *deferral_counts.entry(failure.metric_label()).or_insert(0) += 1;
-            crate::instance_log::warn!(
-                relationship_projection = %shape.qualified_projection,
-                guard = %failure,
-                retry_count = record.retry_count + 1,
-                "issue #132 reverse guard rejected this record's delta; \
-                 deferring and re-staging it for retry (issue #134)"
-            );
-            // Guaranteed `Some` here: `check_reverse_guards` can only reach
-            // this branch (rather than passing every guard) when at least
-            // one of `old_key`/`new_key` is `Some` — see
-            // `check_reverse_guards`'s own `lock_key` match, whose `_ =>
-            // (None, None)` arm (both keys absent) always passes every
-            // guard and never returns `Some(failure)` at all.
-            let key = old_key
-                .clone()
-                .or_else(|| new_key.clone())
-                .expect("check_reverse_guards only rejects a record with a known key");
-            relationship_reverse_deferrals.push(StagedChange::RelationshipReverseDeferred {
-                src_table: relationship_reverse_deferred_src_table(shape.id),
-                key,
-                old_image: record.old_image.clone(),
-                new_image: record.new_image.clone(),
-                lsn: record.lsn,
-                src_changed: record.src_changed,
-                origin_lsn: record.origin_lsn,
-                relationship_id: shape.id,
-                retry_count: record.retry_count + 1,
-                group_key: Some(
-                    old_key
-                        .iter()
-                        .chain(new_key.iter().filter(|k| Some(*k) != old_key.as_ref()))
-                        .cloned()
-                        .collect(),
-                ),
-            });
-            continue;
-        }
-
-        // Issues #507/#531: a record whose images its to-side has moved
-        // past (see `to_side_superseded`) advances the projection to the
-        // live row.
-        let superseded = superseded_to_side(
-            txn,
-            &mut row_columns_cache,
-            &refresh_stamps,
-            record,
-            &old_key,
-            &new_key,
-        )
-        .await?;
-        // #623 D5: every target reading this relationship re-derives each
-        // from-side row the parent change reaches; an aggregate on the
-        // ledger reads the parent live, so it needs no images.
-        if shape.needs_recompute_fallback {
-            let mut seen_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
-            stage_reverse_recompute_fallback(
-                txn,
-                record,
-                &old_key,
-                &new_key,
-                &mut seen_keys,
-                &mut relationship_reverse_fallback,
-                &row_columns,
-            )
-            .await?;
-        }
-
-        // Advance the projection — issue #131's own write, distinct from
-        // step 3c's forward `__trellis_gen` bump above (never touched
-        // here; see `apply_projection_advance`'s doc comment for the
-        // distinction).
-        if superseded {
-            apply_projection_from_live(
-                txn,
-                shape,
-                &old_key,
-                &new_key,
-                record.lsn,
-                record.lsn,
-                Some(&claim),
-            )
-            .await?
-        } else {
-            apply_projection_advance(
-                txn,
-                shape,
-                &old_key,
-                &new_key,
-                record.new_image.as_deref(),
-                record.lsn,
-            )
-            .await?
-        }
-    }
-
     // 4. Downstream propagation, with the hop bound checked before staging
     // anything. Issue #315: every key a write above physically changed, for
     // every target some `live` definition reads, becomes one image-less
     // `Recompute` at `hop_gen + 1` carrying the key's prior image — see
     // `staging::target_mutations`. `lsn: None`, like every other row this
     // step stages: a propagated hop has no source LSN of its own. (A target
-    // the seam feeds as a relationship endpoint gets a CDC-shaped row with
-    // the write token as its `lsn` instead, issue #402.)
+    // the seam feeds images for gets a CDC-shaped row with the write token
+    // as its `lsn` instead, issue #402.)
     let propagation = mutations.into_staged(txn).await?;
-    let mut recompute_changes = propagation.changes;
+    let recompute_changes = propagation.changes;
     let mut hop_bound_tables = propagation.hop_bound_tables;
-    let mut worst_hop_gen = propagation.worst_hop_gen;
-
-    // Reverse recompute (issue #30): from-side rows a changed related row must
-    // re-derive, resolved in Phase 2 and staged here as ordinary image-less
-    // recomputes — the same shape and same hop bound forward propagation uses,
-    // just keyed by the from-side table/PK rather than a touched target key.
-    for (from_table, key, hop_gen, src_changed, origin_lsn) in &plan.reverse_recomputes {
-        if *hop_gen > MAX_HOP_GEN {
-            hop_bound_tables.push(from_table.clone());
-            worst_hop_gen = worst_hop_gen.max(*hop_gen);
-            continue;
-        }
-        recompute_changes.push(StagedChange::Recompute {
-            src_table: from_table.clone(),
-            key: key.clone(),
-            hop_gen: *hop_gen,
-            group_key: None,
-            src_changed: *src_changed,
-            prior_image: None,
-            origin_lsn: *origin_lsn,
-        });
-    }
-
-    // Issue #131: the same recompute staging, for step 3d's own fallback:
-    // every from-side row a parent change reaches, image-less (#623 D5), and
-    // for step 2c's truncate clears (#920).
-    for (from_table, key, hop_gen, src_changed, origin_lsn) in relationship_reverse_fallback
-        .into_iter()
-        .chain(truncate_recomputes)
-    {
-        if hop_gen > MAX_HOP_GEN {
-            hop_bound_tables.push(from_table);
-            worst_hop_gen = worst_hop_gen.max(hop_gen);
-            continue;
-        }
-        recompute_changes.push(StagedChange::Recompute {
-            src_table: from_table,
-            key,
-            hop_gen,
-            group_key: None,
-            src_changed,
-            prior_image: None,
-            origin_lsn,
-        });
-    }
+    let worst_hop_gen = propagation.worst_hop_gen;
 
     if !hop_bound_tables.is_empty() {
         hop_bound_tables.sort();
@@ -11507,22 +5349,6 @@ pub(crate) async fn apply_page(
         );
     }
     append::append(txn, &recompute_changes).await?;
-
-    // Issue #134: guard-rejected reverses, re-staged as their own kind —
-    // deliberately a separate `append::append` call from `recompute_changes`
-    // above, never subject to the hop-bound check that ran just above it
-    // (this op has no `hop_gen` to bound in the first place). Landing in the
-    // *active* segment (`append::append` always resolves the pointer fresh,
-    // inside this same `txn`) rather than the one being drained is the same
-    // property every other Phase-3 producer already relies on (doc 05
-    // property 1) — this reuses that exact mechanism, not a new one.
-    if !relationship_reverse_deferrals.is_empty() {
-        crate::instance_log::debug!(
-            count = relationship_reverse_deferrals.len(),
-            "staged deferred relationship reverse retries (issue #134)"
-        );
-    }
-    append::append(txn, &relationship_reverse_deferrals).await?;
 
     // 4b. Issue #16: a clean drain clears the death counters for every key
     // it just applied (not the poisoned ones it parked above) — doc 06's
@@ -11584,8 +5410,6 @@ pub(crate) async fn apply_page(
         keys_written,
         keys_deleted,
         segments_drained,
-        deferral_counts,
-        fairness_escalations,
         pages: 1,
     })
 }
@@ -11830,39 +5654,11 @@ async fn pause_before_commit_for_tests() {
 /// rows it physically wrote/deleted (no-op-suppressed writes excluded), and
 /// whether this call's completion flipped the segment to `'drained'`
 /// (`false` if other buckets are still outstanding).
-///
-/// No longer `Copy` as of issue #134/#135's review follow-up
-/// (`deferral_counts` is a `HashMap`) — every existing call site only ever
-/// read this by field or by a single `let` binding, never relied on
-/// implicit copies, so this is additive in practice.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApplyOutcome {
     pub keys_written: usize,
     pub keys_deleted: usize,
     pub batch_drained: bool,
-    /// Issue #134/#135: per-guard deferral counts this call's Phase 3 pass
-    /// discovered, keyed by [`ReverseGuardFailure::metric_label`] — the
-    /// caller's own responsibility to flush into
-    /// [`crate::metrics::increment_relationship_reverse_deferred`] *after*
-    /// this call's transaction has actually committed (see
-    /// [`flush_apply_metrics`]'s doc comment for why: this whole call can
-    /// be retried in full — a losing attempt's counts must never reach the
-    /// registry). Empty whenever no reverse guard rejected anything this
-    /// pass, which — reused from [`ManyApplyOutcome::deferral_counts`] via
-    /// [`apply_and_mark_drained`]'s wrapper — is the overwhelming common
-    /// case.
-    pub deferral_counts: HashMap<&'static str, u64>,
-    /// Issue #135: count of to-one relationship reverse transitions this
-    /// call's Phase 3 pass resolved via fairness escalation (see
-    /// [`RELATIONSHIP_REVERSE_FAIRNESS_THRESHOLD`]'s doc comment and the
-    /// "Issue #135" design section right after [`check_reverse_guards`])
-    /// rather than deferring again — the caller's own responsibility to
-    /// flush into
-    /// [`crate::metrics::increment_relationship_reverse_fairness_escalated`]
-    /// under the same post-commit-only contract as `deferral_counts` above.
-    /// Reused from [`ManyApplyOutcome::fairness_escalations`] via
-    /// [`apply_and_mark_drained`]'s wrapper.
-    pub fairness_escalations: u64,
     /// Issue #620: see [`ManyApplyOutcome::pages`].
     pub pages: usize,
 }
@@ -11879,13 +5675,6 @@ pub struct ManyApplyOutcome {
     pub keys_written: usize,
     pub keys_deleted: usize,
     pub segments_drained: Vec<(i64, bool)>,
-    /// Issue #134/#135 review follow-up: buffered, not recorded eagerly —
-    /// see [`ApplyOutcome::deferral_counts`]'s doc comment (this field is
-    /// that one's source, for the coalesced-segment path).
-    pub deferral_counts: HashMap<&'static str, u64>,
-    /// Issue #135: see [`ApplyOutcome::fairness_escalations`]'s doc comment
-    /// (this field is that one's source, for the coalesced-segment path).
-    pub fairness_escalations: u64,
     /// Issue #620: how many compute-and-apply transactions (pages) the drain
     /// committed. 1 when the share fit `drain_batch_cap`; at most
     /// ⌈share / cap⌉ when it didn't (a page can come out short, never over).
@@ -11995,7 +5784,7 @@ pub struct DrainHooks {
 /// many attempts the last page took.
 #[tracing::instrument(
     name = "staging.drain_once",
-    skip(pool, wake_channel, watermark),
+    skip(pool, wake_channel),
     fields(claimed_by = %claimed_by, attempt = tracing::field::Empty)
 )]
 #[cfg(any(test, feature = "internals"))]
@@ -12005,7 +5794,6 @@ pub async fn drain_once(
     claimed_by: &str,
     live_workers: i64,
     wake_channel: &str,
-    watermark: &StagedWatermark,
 ) -> Result<Option<ApplyOutcome>, ApplyError> {
     let outcome = drain_segments(
         pool,
@@ -12013,7 +5801,6 @@ pub async fn drain_once(
         claimed_by,
         live_workers,
         wake_channel,
-        watermark,
         DEFAULT_DRAIN_BATCH_CAP,
         &mut DrainHooks::default(),
     )
@@ -12025,8 +5812,6 @@ pub async fn drain_once(
             .segments_drained
             .first()
             .is_some_and(|&(_, drained)| drained),
-        deferral_counts: outcome.deferral_counts,
-        fairness_escalations: outcome.fairness_escalations,
         pages: outcome.pages,
     }))
 }
@@ -12040,7 +5825,6 @@ pub async fn drain_many(
     claimed_by: &str,
     live_workers: i64,
     wake_channel: &str,
-    watermark: &StagedWatermark,
 ) -> Result<Option<ManyApplyOutcome>, ApplyError> {
     drain_many_with_cap(
         pool,
@@ -12048,7 +5832,6 @@ pub async fn drain_many(
         claimed_by,
         live_workers,
         wake_channel,
-        watermark,
         DEFAULT_DRAIN_BATCH_CAP,
     )
     .await
@@ -12092,7 +5875,7 @@ pub async fn drain_many(
 /// instead of a single segment's.
 #[tracing::instrument(
     name = "staging.drain_many",
-    skip(pool, wake_channel, watermark),
+    skip(pool, wake_channel),
     fields(
         claimed_by = %claimed_by,
         segments = seg_seqs.len(),
@@ -12105,7 +5888,6 @@ pub async fn drain_many_with_cap(
     claimed_by: &str,
     live_workers: i64,
     wake_channel: &str,
-    watermark: &StagedWatermark,
     drain_batch_cap: usize,
 ) -> Result<Option<ManyApplyOutcome>, ApplyError> {
     drain_segments(
@@ -12114,7 +5896,6 @@ pub async fn drain_many_with_cap(
         claimed_by,
         live_workers,
         wake_channel,
-        watermark,
         drain_batch_cap,
         &mut DrainHooks::default(),
     )
@@ -12123,14 +5904,12 @@ pub async fn drain_many_with_cap(
 
 /// [`drain_many_with_cap`] with [`DrainHooks`], for the exactly-once tests.
 #[cfg(any(test, feature = "internals"))]
-#[allow(clippy::too_many_arguments)]
 pub async fn drain_many_with_hooks(
     pool: &Pool,
     seg_seqs: &[i64],
     claimed_by: &str,
     live_workers: i64,
     wake_channel: &str,
-    watermark: &StagedWatermark,
     drain_batch_cap: usize,
     hooks: &mut DrainHooks,
 ) -> Result<Option<ManyApplyOutcome>, ApplyError> {
@@ -12140,7 +5919,6 @@ pub async fn drain_many_with_hooks(
         claimed_by,
         live_workers,
         wake_channel,
-        watermark,
         drain_batch_cap,
         hooks,
     )
@@ -12162,24 +5940,18 @@ impl ManyApplyOutcome {
                 None => self.segments_drained.push((seg_seq, drained)),
             }
         }
-        for (label, count) in page.deferral_counts {
-            *self.deferral_counts.entry(label).or_default() += count;
-        }
-        self.fairness_escalations += page.fairness_escalations;
         self.pages += page.pages;
     }
 }
 
 /// The body [`drain_once`], [`drain_many_with_cap`] and
 /// [`drain_many_with_hooks`] share; see [`drain_many_with_cap`].
-#[allow(clippy::too_many_arguments)]
 async fn drain_segments(
     pool: &Pool,
     seg_seqs: &[i64],
     claimed_by: &str,
     live_workers: i64,
     wake_channel: &str,
-    watermark: &StagedWatermark,
     drain_batch_cap: usize,
     hooks: &mut DrainHooks,
 ) -> Result<Option<ManyApplyOutcome>, ApplyError> {
@@ -12296,7 +6068,6 @@ async fn drain_segments(
                 &steps,
                 claimed_by,
                 wake_channel,
-                watermark,
                 lose_commit_reply(hooks, 1),
             )
             .await?;
@@ -12337,8 +6108,6 @@ async fn drain_segments(
         keys_written: 0,
         keys_deleted: 0,
         segments_drained: Vec::new(),
-        deferral_counts: HashMap::new(),
-        fairness_escalations: 0,
         pages: 0,
     };
     let mut records = 0u64;
@@ -12378,7 +6147,6 @@ async fn drain_segments(
                 std::slice::from_ref(&step),
                 claimed_by,
                 wake_channel,
-                watermark,
                 lose_commit_reply(hooks, total.pages + 1),
             )
             .await?;
@@ -12463,7 +6231,6 @@ async fn drain_batch(
     steps: &[SegmentStep],
     claimed_by: &str,
     wake_channel: &str,
-    watermark: &StagedWatermark,
     mut lose_commit_reply: bool,
 ) -> Result<ManyApplyOutcome, ApplyError> {
     // Every retry-classification helper below (`classify_and_retry`,
@@ -12538,35 +6305,34 @@ async fn drain_batch(
 
         let mut client = pool.get().await?;
         let txn = client.transaction().await?;
-        let applied =
-            match apply_page(&txn, steps, claimed_by, &plan, wake_channel, watermark).await {
-                // #856: COMMIT fails like any statement of the page does: a
-                // deferred constraint or constraint trigger an application put
-                // on a target fires here, and a connection can drop here. Either
-                // is classified like an `apply_page` failure, which isolation can
-                // charge because its probes check deferred constraints too
-                // (`quarantine::probe_records`).
-                //
-                // A connection can also drop after the COMMIT landed, so a
-                // transient retry may re-run a page that committed. A final
-                // page's retry finds the claim that commit released gone, and
-                // rolls back whole as `ClaimLost`. A non-final page's retry
-                // still holds its claim, finds its buckets' cursor already at
-                // its last key, and rolls back whole as
-                // `PageAlreadyCommitted`, which ends the page as done: a
-                // group-basis target would add the page's deltas again.
-                Ok(outcome) => match txn.commit().await {
-                    Ok(()) if std::mem::take(&mut lose_commit_reply) => {
-                        Err(end_session(&**client).await)
-                    }
-                    Ok(()) => Ok(outcome),
-                    Err(err) => Err(err.into()),
-                },
-                Err(err) => {
-                    let _ = txn.rollback().await;
-                    Err(err)
+        let applied = match apply_page(&txn, steps, claimed_by, &plan, wake_channel).await {
+            // #856: COMMIT fails like any statement of the page does: a
+            // deferred constraint or constraint trigger an application put
+            // on a target fires here, and a connection can drop here. Either
+            // is classified like an `apply_page` failure, which isolation can
+            // charge because its probes check deferred constraints too
+            // (`quarantine::probe_records`).
+            //
+            // A connection can also drop after the COMMIT landed, so a
+            // transient retry may re-run a page that committed. A final
+            // page's retry finds the claim that commit released gone, and
+            // rolls back whole as `ClaimLost`. A non-final page's retry
+            // still holds its claim, finds its buckets' cursor already at
+            // its last key, and rolls back whole as
+            // `PageAlreadyCommitted`, which ends the page as done: a
+            // group-basis target would add the page's deltas again.
+            Ok(outcome) => match txn.commit().await {
+                Ok(()) if std::mem::take(&mut lose_commit_reply) => {
+                    Err(end_session(&**client).await)
                 }
-            };
+                Ok(()) => Ok(outcome),
+                Err(err) => Err(err.into()),
+            },
+            Err(err) => {
+                let _ = txn.rollback().await;
+                Err(err)
+            }
+        };
         match applied {
             Err(ApplyError::PageAlreadyCommitted) => {
                 crate::instance_log::warn!(
@@ -12579,8 +6345,6 @@ async fn drain_batch(
                     keys_written: 0,
                     keys_deleted: 0,
                     segments_drained: steps.iter().map(|step| (step.seg_seq, false)).collect(),
-                    deferral_counts: HashMap::new(),
-                    fairness_escalations: 0,
                     pages: 1,
                 });
             }
@@ -12591,14 +6355,6 @@ async fn drain_batch(
                 // `compute` itself, which the loop above may have called
                 // more than once for this same `folded` input.
                 flush_apply_metrics(&plan);
-                // Issue #134/#135 review follow-up: same post-commit-only
-                // contract, for the deferral counters this attempt's own
-                // Phase 3 pass discovered.
-                flush_relationship_reverse_deferral_metrics(&outcome.deferral_counts);
-                // Issue #135: same post-commit-only contract, for the
-                // fairness-escalation count this attempt's own Phase 3 pass
-                // discovered.
-                flush_relationship_reverse_fairness_escalation_metric(outcome.fairness_escalations);
                 return Ok(outcome);
             }
             Err(err) => {
@@ -13025,11 +6781,8 @@ struct HaltRetry {
     /// Whether Postgres refused the drain a read or write (`42501`, issue
     /// #766), so every later attempt skips the tables no unfrozen
     /// definition reads ([`compute_page`]). The halt pauses the readers of
-    /// the refused table, but the page reads it for a relationship's
-    /// settled projection whatever its readers' status, so without the skip
-    /// the retry would be refused again. A resume, or a new definition,
-    /// refreshes the projections it reads, as for a table skipped for its
-    /// key (#768).
+    /// the refused table, and the skip keeps the retry from reading it
+    /// again.
     skip_frozen: bool,
 }
 

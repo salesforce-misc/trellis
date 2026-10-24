@@ -52,7 +52,7 @@ use trellis::defs::{
     source_primary_key, validate,
 };
 use trellis::integer::IntWidth;
-use trellis::staging::{StagedWatermark, apply, seal};
+use trellis::staging::{apply, seal};
 
 // ---------------------------------------------------------------------
 // Harness
@@ -549,7 +549,6 @@ async fn a_bytea_group_key_seeded_by_backfill_and_by_live_read_is_one_group_not_
             "bytea_worker",
             1,
             "trellis_defs_bytea_issue_114_regression",
-            &StagedWatermark::saturated(),
         )
         .await
         .expect("drain_once")

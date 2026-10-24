@@ -111,8 +111,6 @@ async fn stage_cdc(
 
 /// Seals and drains repeatedly until nothing is pending anywhere in the ring.
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
-    let watermark = trellis::staging::StagedWatermark::saturated();
-    let watermark = &watermark;
     for _ in 0..16 {
         let seg = seal_active_segment(client).await;
         while apply::drain_once(
@@ -121,7 +119,6 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
             "agg_chained_single_column_test",
             1,
             "trellis_agg_chained_single_column_test",
-            watermark,
         )
         .await
         .expect("drain_once")

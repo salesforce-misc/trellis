@@ -138,6 +138,10 @@ pub struct RelationshipContext {
 impl RelationshipContext {
     /// Builds a context from relationship-name to its resolved to-one data,
     /// with no to-many relationships.
+    #[cfg_attr(
+        not(any(test, feature = "internals")),
+        expect(dead_code, reason = "#1115 R4 removes relationship evaluation")
+    )]
     pub fn new(by_name: HashMap<String, ToOneRelationship>) -> Self {
         Self {
             by_name,
@@ -145,24 +149,12 @@ impl RelationshipContext {
         }
     }
 
-    /// The to-one relationship `name`'s to-side rows, keyed by their
-    /// `to_col` text.
-    #[cfg(test)]
-    pub(crate) fn to_one_rows(&self, name: &str) -> Option<&HashMap<String, Row>> {
-        self.by_name.get(name).map(|rel| &rel.to_rows_by_key)
-    }
-
-    /// The to-many relationship `name`'s to-side rows, keyed by their
-    /// `to_col` text.
-    #[cfg(test)]
-    pub(crate) fn to_many_rows(&self, name: &str) -> Option<&HashMap<String, Vec<Row>>> {
-        self.to_many_by_name
-            .get(name)
-            .map(|rel| &rel.to_rows_by_key)
-    }
-
     /// Adds the to-many relationship data (issue #29), for a context that has
     /// aggregate-wrapped relationship paths to resolve. Chains onto [`new`].
+    #[cfg_attr(
+        not(any(test, feature = "internals")),
+        expect(dead_code, reason = "#1115 R4 removes relationship evaluation")
+    )]
     #[must_use]
     pub fn with_to_many(mut self, to_many_by_name: HashMap<String, ToManyRelationship>) -> Self {
         self.to_many_by_name = to_many_by_name;

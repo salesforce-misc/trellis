@@ -3054,7 +3054,6 @@ async fn stage_null_keys(
                 src_table: source_table.to_string(),
                 key: row.get(0),
                 hop_gen: 0,
-                group_key: None,
                 src_changed: None,
                 prior_image: None,
                 origin_lsn: None,

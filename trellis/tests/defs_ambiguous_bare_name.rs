@@ -69,7 +69,6 @@ async fn drain_backfill_chunks(pool: &trellis::Pool) {
 
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
     use trellis::staging::{apply, seal};
-    let watermark = trellis::staging::StagedWatermark::saturated();
     for _ in 0..16 {
         let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
         seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
@@ -81,7 +80,6 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
             TEST_NAME,
             1,
             "trellis_defs_ambiguous_bare_name_test",
-            &watermark,
         )
         .await
         .expect("drain_once")
@@ -248,7 +246,6 @@ fn cdc(op: CdcOp, key: &str, lsn: PgLsn, old: Option<&str>, new: Option<&str>) -
         origin_lsn: None,
         src_changed: None,
         hop_gen: 0,
-        group_key: None,
     }
 }
 

@@ -158,8 +158,8 @@
 //!
 //! # Image-less changes, releases and truncates (#1102)
 //!
-//! An image-less change (a `Recompute`: a 1-1 reader's release of a key, a
-//! relationship's reverse re-derive of the source's rows) has no sides. The
+//! An image-less change (a `Recompute`: a release of a key, or a marker's
+//! re-read) has no sides. The
 //! page recomputes the groups it names instead: its key's current row's
 //! group and its prior-image hint's. The page's lock statement locks those
 //! groups with its sides' groups, and after the page's sides apply,

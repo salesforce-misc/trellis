@@ -1601,7 +1601,7 @@ async fn interval_in_reads_intervalstyle_which_is_why_there_is_no_interval_liter
 #[tokio::test]
 async fn a_timestamp_group_key_seeded_by_backfill_and_by_live_read_is_one_group_not_two() {
     use trellis::defs::{create_aggregate_target_table, create_definition};
-    use trellis::staging::{StagedWatermark, apply, seal};
+    use trellis::staging::{apply, seal};
 
     const DEF_SQL: &str = "TRANSFORM totals FROM events GROUP BY grp WITHOUT SOURCE INDEX SELECT grp AS grp, SUM(amount) AS total";
 
@@ -1688,7 +1688,6 @@ async fn a_timestamp_group_key_seeded_by_backfill_and_by_live_read_is_one_group_
             "temporal_worker",
             1,
             "trellis_defs_temporal_issue_113_regression",
-            &StagedWatermark::saturated(),
         )
         .await
         .expect("drain_once")

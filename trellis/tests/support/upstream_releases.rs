@@ -12,7 +12,7 @@ use crate::drain_driver::{self, Driver};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::{PgType, ValueType, chunk_queue};
 use trellis::integer::IntWidth;
-use trellis::staging::{StagedWatermark, apply};
+use trellis::staging::apply;
 use trellis::{Config, Trellis, TrellisOptions};
 
 pub async fn pass(d: &mut Driver) {
@@ -60,16 +60,7 @@ pub async fn settle_tolerant(d: &mut Driver) -> usize {
     for _ in 0..8 {
         let batch = d.seal().await;
         loop {
-            match apply::drain_once(
-                d.pool(),
-                batch,
-                "worker",
-                1,
-                drain_driver::WAKE,
-                &StagedWatermark::saturated(),
-            )
-            .await
-            {
+            match apply::drain_once(d.pool(), batch, "worker", 1, drain_driver::WAKE).await {
                 Ok(Some(_)) => continue,
                 Ok(None) => break,
                 Err(err) => {

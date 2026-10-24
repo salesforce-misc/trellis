@@ -4250,68 +4250,9 @@ pub(crate) async fn relationship_on_source(
     relationship_by_name(pool, schema, table, name).await
 }
 
-/// Reads back the relationship whose `relationship_definitions.id` is `id` —
-/// issue #134's deferred-reverse reconstruction path uses this: a
-/// `rel_reverse_deferred` ring row persists only the relationship's id (see
-/// `staging::append::StagedChange::RelationshipReverseDeferred`), so a later
-/// drain that finds one needs to look the relationship back up by id alone,
-/// not by `(from_schema, from_table, name)` ([`relationship_by_name`]) or
-/// `to_table` ([`relationships_to_table`]) — neither of which a bare id lets it
-/// derive without an extra round trip. `Ok(None)` when the relationship no
-/// longer exists (dropped between the deferral and this retry) — the caller's
-/// job to decide what "nothing to retry against anymore" means, not this
-/// function's.
-pub async fn relationship_by_id(
-    pool: &Pool,
-    id: i64,
-) -> Result<Option<RelationshipDefinition>, CatalogError> {
-    let client = pool.get().await?;
-    let row = client
-        .query_opt(
-            &format!(
-                "select {RELATIONSHIP_READ_COLUMNS} from relationship_definitions where id = $1"
-            ),
-            &[&id],
-        )
-        .await?;
-    row.as_ref().map(relationship_from_row).transpose()
-}
-
-/// Every relationship whose to-side is the qualified `"schema.table"`
-/// `qualified_to_table` — the reverse of [`relationship_by_name`]'s from-side
-/// lookup. The staging reverse recompute (issue #30) uses this to answer "a
-/// row in this table just changed; which relationships point *at* it, so which
-/// from-side targets must re-derive?".
-///
-/// Matched against each relationship's recorded `to_schema` (issue #372), so a
-/// same-named table in another schema never picks up this one's
-/// relationships. A bare `qualified_to_table` matches nothing.
-pub async fn relationships_to_table(
-    pool: &Pool,
-    qualified_to_table: &str,
-) -> Result<Vec<RelationshipDefinition>, CatalogError> {
-    let Some((to_schema, to_table)) = qualified_to_table.split_once('.') else {
-        return Ok(Vec::new());
-    };
-    let client = pool.get().await?;
-    let rows = client
-        .query(
-            &format!(
-                "select {RELATIONSHIP_READ_COLUMNS} from relationship_definitions \
-                 where to_schema = $1 and to_table = $2 order by id"
-            ),
-            &[&to_schema, &to_table],
-        )
-        .await?;
-    rows.iter().map(relationship_from_row).collect()
-}
-
 /// Every relationship declared on the qualified from-table
-/// `from_schema.from_table` — the outbound mirror of
-/// [`relationships_to_table`] — on a caller-supplied client, for a caller
-/// already inside a transaction (`staging::target_mutations`, which resolves
-/// a from-side endpoint target's join-key columns in the writing
-/// transaction). Schema-scoped (issue #288) so a same-named table in another
+/// `from_schema.from_table`, on a caller-supplied client, for a caller
+/// already inside a transaction. Schema-scoped (issue #288) so a same-named table in another
 /// schema doesn't contribute its own relationships.
 pub(crate) async fn relationships_from_table_in(
     client: &impl GenericClient,
@@ -6482,10 +6423,9 @@ const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
     // exactly when the stored netmask covers the whole address
     // (`'192.168.1.5'::inet::text` via `inet_out` is `192.168.1.5`; via the
     // cast, `192.168.1.5/32`), the identical "one value, two renderers, no
-    // arbiter" shape `boolean` has above — and `staging::apply::
-    // check_reverse_guards` and its scalar siblings still do raw
-    // `{col}::text = $1` matching, so `inet` would silently mismatch exactly
-    // the way `boolean` would. `inet` is refused here for that reason;
+    // arbiter" shape `boolean` has above — so a raw `{col}::text = $1`
+    // match would silently mismatch `inet` exactly the way `boolean`
+    // would. `inet` is refused here for that reason;
     // its `GROUP BY` key role is still admitted, the same split `boolean`
     // got — see `validate::reject_unsupported_group_by_key_type`'s `Inet`
     // arm.
@@ -6513,16 +6453,14 @@ const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
     //
     // That is live-load-bearing, not theoretical: a capture trigger images a
     // column with `format('%s', col)`, which calls `boolout`, and builds a
-    // relationship/primary-key's staged `key` text from that — `'t'`/`'f'`. Every *bulk* key lookup
-    // in `staging::apply` (`key_array_filter`, issue #125) casts the
-    // *bound parameter* to the column's native type
-    // (`col = any($1::text[]::boolean[])`), which calls `boolin` — an
+    // primary key's staged `key` text from that — `'t'`/`'f'`. A *bulk* key
+    // lookup that casts the *bound parameter* to the column's native type
+    // (`col = any($1::text[]::boolean[])`) calls `boolin` — an
     // input function far more permissive than `boolout` is strict, so it
     // parses `'t'`/`'f'` and `'true'`/`'false'` alike back to the same
-    // native value and the divergence never surfaces there. But several
-    // *scalar* single-key lookups (`staging::apply::check_reverse_guards`
-    // and its siblings) still render the older, unindexed
-    // `{key}::text = $1` form directly — comparing a live column's
+    // native value and the divergence never surfaces there. But a
+    // *scalar* single-key lookup in the older, unindexed
+    // `{key}::text = $1` form would compare a live column's
     // `pg_catalog.text(boolean)` rendering (`'true'`/`'false'`) against a
     // CDC-derived `key` built from `boolout` (`'t'`/`'f'`) — and those two
     // strings are simply not equal. Admitting `boolean` here today would
@@ -7067,68 +7005,6 @@ struct ToSide<'a> {
     cardinality: RelationshipCardinality,
 }
 
-/// A to-one relationship's settled parent projection (issue #129, epic
-/// #127), as stored in `relationship_projections` — the catalog record of
-/// which physical table backs a given relationship's projection, not the
-/// projection's live data. The projection's own bookkeeping columns
-/// (`__trellis_gen`/`__trellis_lsn`) and projected data columns live on the
-/// physical `projection_table` itself — see
-/// [`super::ddl::PROJECTION_GEN_COLUMN`]/[`super::ddl::PROJECTION_LSN_COLUMN`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RelationshipProjection {
-    pub id: i64,
-    pub relationship_id: i64,
-    /// The schema the projection table lives in: always the instance's own
-    /// catalog schema ([`crate::Config::schema`]), alongside the rest of
-    /// Trellis's internal state, never the target schema (issue #435). Not
-    /// stored in `relationship_projections`, which lives in that same schema.
-    pub projection_schema: String,
-    /// The physical table's bare name. [`Self::qualified_table`] gives the
-    /// form to interpolate into SQL.
-    pub projection_table: String,
-}
-
-impl RelationshipProjection {
-    /// `projection_schema.projection_table`, each part quoted for direct
-    /// interpolation into DDL/DML text.
-    pub fn qualified_table(&self) -> String {
-        ddl::qualified_relationship_projection_table(
-            &self.projection_schema,
-            &self.projection_table,
-        )
-    }
-
-    /// `projection_schema.projection_table` unquoted: the identity a catalog
-    /// lookup takes ([`ddl::regclass_arg`], issue #561).
-    pub(crate) fn identity(&self) -> String {
-        format!("{}.{}", self.projection_schema, self.projection_table)
-    }
-}
-
-/// Reads back the settled parent projection for the relationship
-/// `relationship_id` names, or `None` if it's a to-many relationship (which
-/// never gets one in Phase 1 of this epic — to-many relationship aggregates
-/// keep going through the existing `rel_joins`/ring path) or an unknown id.
-pub async fn relationship_projection(
-    pool: &Pool,
-    relationship_id: i64,
-) -> Result<Option<RelationshipProjection>, CatalogError> {
-    let client = pool.get().await?;
-    let row = client
-        .query_opt(
-            "select id, relationship_id, projection_table \
-             from relationship_projections where relationship_id = $1",
-            &[&relationship_id],
-        )
-        .await?;
-    Ok(row.map(|row| RelationshipProjection {
-        id: row.get(0),
-        relationship_id: row.get(1),
-        projection_schema: pool.schema().to_string(),
-        projection_table: row.get(2),
-    }))
-}
-
 /// Ensures the to-one relationship `relationship_id` names has a settled
 /// parent projection (issue #129, epic #127) that (a) carries at least every
 /// column in `needed_columns` and (b) has a row for every to-side key —
@@ -7352,8 +7228,8 @@ async fn ensure_relationship_projection_in_txn(
     let insert_cols = insert_col_idents.join(", ");
     let select_cols = select_col_exprs.join(", ");
     // Issue #726: a key a pending to-side change will write is left to that
-    // change, as in `refresh_relationship_projections_in_txn`.
-    let pending = pending_to_side_keys(qualified_to_table, to_col, relationship_id);
+    // change (see `pending_to_side_keys`).
+    let pending = pending_to_side_keys(qualified_to_table, to_col);
     let catch_up_sql = format!(
         "with seed as (select pg_current_wal_lsn() as lsn), {pending} \
          insert into {qualified_projection} ({insert_cols}) \
@@ -7379,13 +7255,12 @@ const PENDING_KEYS: &str = "trellis_pending_keys";
 /// column `key`) whose latest pending change to `qualified_to_table` leaves
 /// the key present: of the pending changes that name the key in either image,
 /// the one latest in `(lsn, change_id)` order, the fold's order, names it in
-/// its new image. A change is a captured or seam-fed change, or relationship
-/// `relationship_id`'s deferred reverse (#134). Pending is per change
+/// its new image. A change is a captured or seam-fed change. Pending is per change
 /// ([`pending_to_side_changes`]): no committed drain has applied it.
 ///
 /// Issue #726: a catch-up insert from the live to-side
-/// ([`ensure_relationship_projection_in_txn`],
-/// [`refresh_relationship_projections_in_txn`]) leaves out such a key. Its
+/// ([`ensure_relationship_projection_in_txn`], [`refresh_locked_projections`])
+/// leaves out such a key. Its
 /// projection row is written by that change's record, whose new image
 /// carries the key. Written from the live row instead, it could outlive the
 /// to-side row: a row inserted before the read and deleted after it folds,
@@ -7409,8 +7284,8 @@ const PENDING_KEYS: &str = "trellis_pending_keys";
 /// starts from a state that has the key, and its old image names it. The
 /// refresh's update and delete halves are unchanged: #531's stamp orders a
 /// pending record against them.
-fn pending_to_side_keys(qualified_to_table: &str, to_col: &str, relationship_id: i64) -> String {
-    let arms = pending_to_side_changes(qualified_to_table, to_col, relationship_id, "", None);
+fn pending_to_side_keys(qualified_to_table: &str, to_col: &str) -> String {
+    let arms = pending_to_side_changes(qualified_to_table, to_col, "", None);
     // A change that keeps the key names it in both images. Its new image's
     // mention is the later one.
     format!(
@@ -7434,114 +7309,29 @@ fn pending_to_side_keys(qualified_to_table: &str, to_col: &str, relationship_id:
 /// Pending is per change (issue #762, `staging::page::ring_row_pending_sql`):
 /// no committed drain has applied it, and `claim`, the Phase 3 transaction
 /// reading it, if any, is not applying it.
-///
-/// Issue #754: `staging::apply::apply_projection_from_live` reads the same
-/// set for one key, narrowed by `filter`.
-pub(crate) fn pending_to_side_changes(
+fn pending_to_side_changes(
     qualified_to_table: &str,
     to_col: &str,
-    relationship_id: i64,
     filter: &str,
     claim: Option<&crate::staging::page::ClaimScope<'_>>,
 ) -> String {
     let col = quote_literal(to_col);
-    let tables = format!(
-        "array[{}, {}]",
-        quote_literal(qualified_to_table),
-        quote_literal(
-            &crate::staging::apply::relationship_reverse_deferred_src_table(relationship_id)
-        )
-    );
+    let table_lit = quote_literal(qualified_to_table);
     crate::staging::converge::per_ring_table(" union all ", |slot, table| {
         format!(
             "select r.lsn, r.change_id, \
                     r.old_image ->> {col} as old_key, r.new_image ->> {col} as new_key \
              from {table} r \
-             where r.src_table = any({tables}) \
-               and r.op in ('insert', 'update', 'delete', 'rel_reverse_deferred') {filter} \
+             where r.src_table = {table_lit} \
+               and r.op in ('insert', 'update', 'delete') {filter} \
                and {pending}",
             pending = crate::staging::page::ring_row_pending_sql(slot, claim),
         )
     })
 }
 
-/// Re-syncs every settled parent projection whose to-side is
-/// `qualified_to_table` with that table's current rows (issue #507): deletes
-/// each projection row whose to-side row is gone, rewrites the data columns of
-/// each row whose to-side row now differs, and inserts a row for each to-side
-/// key it lacks and no pending change will write ([`pending_to_side_keys`],
-/// issue #726), seeded as [`ensure_relationship_projection_in_txn`] seeds one.
-/// Returns how many projection rows it changed.
-///
-/// The catch-up discharge runs this for a marker parked because a rebuild
-/// rewrote a definition's target (`pending_backfill.refresh_projections`,
-/// `intake::markers::discharge_marker`), or because a source to-side is
-/// re-read for changes whose CDC may never have reached its projection
-/// (issue #522, `intake::markers::park_table_catch_ups`). It diffs the
-/// whole table, about 0.7 s for a 1M-row target whose projection is already
-/// current, so no other marker asks for it. Every write to a target
-/// reaches its projection through the target-mutation seam's CDC-shaped rows,
-/// except a rebuild's (a resumed definition's chunks or direct build), which
-/// writes the target directly. Nothing else would ever carry what the rebuild
-/// changed into the projection, and a consumer reading through a to-one
-/// relationship reads the projection, never the target. The same discharge
-/// re-derives those consumers from the refreshed projection (its enumeration
-/// of the target reaches them by reverse propagation).
-///
-/// Neither bookkeeping column moves on a row it rewrites. A reverse record
-/// (a to-side change's CDC, or a target's seam row) staged before this read
-/// can still be pending, and its capture of the row's `__trellis_lsn`,
-/// before or after this, still matches. If its image is the key's latest it
-/// re-applies what this already wrote. If a later change overtook it, one
-/// this read saw but no pending record carries (a rebuild's write, which
-/// bypasses the seam, or a source change whose CDC was lost after the
-/// pending one's, issue #531), putting that image back would be wrong with
-/// nothing after it to correct it. So this stamps each relationship's
-/// `relationship_projections.refreshed_lsn` with the WAL position after its
-/// reads, and Phase 3 checks a record at or below the stamp (every record,
-/// for a seam-fed to-side) against the live to-side row, writing the
-/// projection from the live row when the images no longer hold
-/// (`staging::apply::superseded_to_side`). A record above the stamp is a
-/// change this read may not have seen, so its image is no older than what
-/// this wrote. A to-side `TRUNCATE` at or below the stamp is one this read
-/// saw (it holds `ACCESS SHARE` on the to-side until it commits), so Phase 3
-/// skips its projection clear. The stamp rows are locked `for update` before
-/// any projection row, and Phase 3 locks them `for share` before its own
-/// projection writes (steps 2c, 3c and 3d), so a drain either commits before
-/// this reads anything or reads the stamp this commits. A seam row staged after this read can't drain
-/// before the discharge commits: the discharge runs on the only sealer.
-///
-/// Its projection writes can deadlock with a drain's that holds a
-/// projection row while it writes an aggregate consumer's target row the
-/// same discharge's orphan sweep deleted, or with a drain that carries no
-/// reverse record for the relationship (so took no stamp lock) and locks
-/// projection rows in key order (its sorted lock for the step 3c
-/// `__trellis_gen` bump) while this locks them in scan order. Postgres
-/// aborts one side, the same bounded case
-/// as the sweep's own (`intake::resume_orphans`): an aborted apply is a
-/// transient error with no quarantine charge, and an aborted discharge rolls
-/// back whole and retries after the marker's backoff.
-pub(crate) async fn refresh_relationship_projections_in_txn(
-    client: &impl GenericClient,
-    qualified_to_table: &str,
-) -> Result<u64, CatalogError> {
-    let Some((to_schema, to_table)) = qualified_to_table.split_once('.') else {
-        return Ok(0);
-    };
-    let projections = client
-        .query(
-            &format!(
-                "{LOCK_PROJECTIONS_SELECT} where rd.to_schema = $1 and rd.to_table = $2 \
-                 {LOCK_PROJECTIONS_ORDER}"
-            ),
-            &[&to_schema, &to_table],
-        )
-        .await?;
-    refresh_locked_projections(client, projections).await
-}
-
-/// [`refresh_relationship_projections_in_txn`] for the relationships
-/// `relationship_ids` instead of every one on a to-side: each one's
+/// Refreshes the settled projections of the relationships
+/// `relationship_ids` from their to-sides: each one's
 /// `relationship_projections` row is locked `for update`, all of them in
 /// `relationship_id` order before any projection is touched, the order
 /// Phase 3 takes the same rows `for share` in. A relationship with no
@@ -7603,8 +7393,7 @@ const LOCK_PROJECTIONS_SELECT: &str = "select rp.projection_table, n.nspname::te
 /// order Phase 3 takes the same rows `for share` in.
 const LOCK_PROJECTIONS_ORDER: &str = "order by rp.relationship_id for update of rp";
 
-/// The body of [`refresh_relationship_projections_in_txn`], over
-/// `projections`, rows of [`LOCK_PROJECTIONS_SELECT`] its caller has locked.
+/// Refreshes `projections`, rows of [`LOCK_PROJECTIONS_SELECT`] its caller has locked.
 async fn refresh_locked_projections(
     client: &impl GenericClient,
     projections: Vec<tokio_postgres::Row>,
@@ -7680,8 +7469,7 @@ async fn refresh_locked_projections(
         }
         // Issue #726: a key a pending change will write is left to that
         // change (see `pending_to_side_keys`).
-        let relationship_id: i64 = row.get(3);
-        let pending = pending_to_side_keys(&qualified_to_table, &to_col, relationship_id);
+        let pending = pending_to_side_keys(&qualified_to_table, &to_col);
         changed += client
             .execute(
                 &format!(
@@ -8501,11 +8289,6 @@ fn reachable_tables_cte(anchor_filter: &str) -> String {
 ///   discharge enumerates only for a ring-built one. Counting a `live` reader
 ///   had a second definition's registration re-read the whole table for it,
 ///   and a group-basis reader recomputes nearly every group per page of that.
-///   Except on a marker that refreshes a relationship's projections
-///   (`refresh_projections`, a to-side's): the refresh corrects the
-///   projection, and the enumeration is what re-derives the consumers that
-///   read through it, `live` ones included, by reverse propagation
-///   ([`refresh_relationship_projections_in_txn`]).
 ///
 /// - **A definition whose Re-derive build is running** (#625 F2) reads the
 ///   table in its chunks, and applies the changes after its start.
@@ -8530,39 +8313,14 @@ pub(crate) async fn table_has_reader(
     client: &impl GenericClient,
     qualified_table: &str,
     marker_generation: i64,
-    refresh_projections: bool,
 ) -> Result<bool, tokio_postgres::Error> {
-    let statuses = if refresh_projections {
-        TransformStatus::applying()
-    } else {
-        vec![TransformStatus::CatchingUp.as_str()]
-    };
-    readers_exist(client, qualified_table, &statuses, Some(marker_generation)).await
-}
-
-/// Whether `qualified_table` has readers of any non-frozen status and every
-/// one is frozen (issue #813). A backfill discharge then skips its
-/// projection refresh: each frozen reader's resume refreshes the
-/// projections it reads (#768), and the refresh would re-read a to-side
-/// Postgres may refuse the role, after the refusal paused its readers. A
-/// table nothing reads is refreshed as before.
-pub(crate) async fn table_readers_all_frozen(
-    client: &impl GenericClient,
-    qualified_table: &str,
-) -> Result<bool, tokio_postgres::Error> {
-    let frozen: Vec<&str> = TransformStatus::ALL
-        .iter()
-        .filter(|status| status.is_frozen())
-        .map(|status| status.as_str())
-        .collect();
-    Ok(readers_exist(client, qualified_table, &frozen, None).await?
-        && !readers_exist(
-            client,
-            qualified_table,
-            &TransformStatus::dispatchable(),
-            None,
-        )
-        .await?)
+    readers_exist(
+        client,
+        qualified_table,
+        &[TransformStatus::CatchingUp.as_str()],
+        Some(marker_generation),
+    )
+    .await
 }
 
 /// Whether a registered definition in one of `statuses`, with no Re-derive
@@ -8602,14 +8360,10 @@ async fn readers_exist(
 /// change twice, and an aggregate target has no primary key to key its
 /// captured changes by.
 ///
-/// That includes a target that is a relationship endpoint (issue #375's
-/// direction 1, #403). A to-one relationship's settled parent projection and
-/// reverse deltas (issues #129-#136), and a from-side's `group_key` (#133),
-/// need image-bearing, ordered changes, and the seam stages exactly that
-/// shape for an endpoint target (`staging::target_mutations`, "Standing in
-/// for a relationship endpoint's CDC"), so the seam is the one change feed
-/// for every target this instance owns. Another instance's target is just a
-/// table here, and is captured like one.
+/// A reader that needs image-bearing, ordered changes gets them from the seam's
+/// image feed (`staging::target_mutations`, "The image feed"), so the seam is
+/// the one change feed for every target this instance owns. Another instance's
+/// target is just a table here, and is captured like one.
 pub async fn tables_to_capture(pool: &Pool) -> Result<Vec<String>, CatalogError> {
     let tables = all_source_tables(pool).await?;
     let client = pool.get().await?;
@@ -8634,27 +8388,6 @@ async fn own_targets(
         )
         .await?;
     Ok(rows.into_iter().map(|r| r.get(0)).collect())
-}
-
-/// Whether the qualified `table` is an endpoint, on either side, of any
-/// relationship. `staging::target_mutations` asks it of a target it wrote, to
-/// decide whether its seam rows must stand in for that target's CDC (issues
-/// #402, #403).
-pub(crate) async fn is_relationship_endpoint(
-    client: &impl GenericClient,
-    table: &str,
-) -> Result<bool, CatalogError> {
-    Ok(client
-        .query_one(
-            "select exists ( \
-                 select 1 from schema_edges se \
-                 join schema_nodes n on n.id in (se.from_node_id, se.to_node_id) \
-                 where se.kind = 'relationship' and n.table_name = $1 \
-             )",
-            &[&table],
-        )
-        .await?
-        .get(0))
 }
 
 /// The current version of `source_table`, or `None` if no definition has

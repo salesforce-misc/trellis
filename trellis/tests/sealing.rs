@@ -573,7 +573,6 @@ fn recompute(key: &str) -> StagedChange {
         src_table: "orders".to_string(),
         key: key.to_string(),
         hop_gen: 0,
-        group_key: None,
         src_changed: None,
         prior_image: None,
         origin_lsn: None,

@@ -17,7 +17,6 @@ fn recompute(src_table: &str, key: &str) -> StagedChange {
         src_table: src_table.to_string(),
         key: key.to_string(),
         hop_gen: 0,
-        group_key: None,
         src_changed: None,
         prior_image: None,
         origin_lsn: None,
@@ -228,7 +227,6 @@ async fn change_id_records_intra_transaction_append_order() {
         origin_lsn: None,
         src_changed: None,
         hop_gen: 0,
-        group_key: None,
     };
     let update = StagedChange::Cdc {
         src_table: "orders".to_string(),
@@ -240,7 +238,6 @@ async fn change_id_records_intra_transaction_append_order() {
         origin_lsn: None,
         src_changed: None,
         hop_gen: 0,
-        group_key: None,
     };
 
     let mut client = connect_raw(db.dsn()).await;

@@ -57,7 +57,7 @@ use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
 // pipeline (issue #301); see the module doc.
 use trellis::defs::chunk_queue;
 use trellis::intake::markers;
-use trellis::staging::{StagedWatermark, apply, has_pending, retire_drained_segments, seal};
+use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
 use trellis::{CatalogError, Config, TransformStatus, Trellis, TrellisError, TrellisOptions};
 
 /// Connects directly to `dsn` (bypassing `trellis::Pool`) with `search_path`
@@ -196,7 +196,6 @@ async fn stage_orders_insert(raw: &Client, id: i64, g: i64, a: i64) {
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
     // No live capture stages anything here, so there is no real staged
     // watermark to hold apply back. A saturated one never does.
-    let watermark = StagedWatermark::saturated();
     for _ in 0..16 {
         let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
         seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
@@ -208,7 +207,6 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
             "pause_and_drop_test",
             1,
             "trellis_pause_and_drop_test",
-            &watermark,
         )
         .await
         .expect("drain_once")

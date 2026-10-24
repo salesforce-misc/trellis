@@ -61,7 +61,7 @@ use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
 use trellis::defs::chunk_queue;
-use trellis::staging::{StagedWatermark, apply, has_pending, retire_drained_segments, seal};
+use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
 use trellis::{
     Applied, CatalogError, Config, TransformStatus, Trellis, TrellisError, TrellisOptions,
 };
@@ -1265,7 +1265,6 @@ async fn stage_orders_update(raw: &Client, id: i64, old_a: i64, new_a: i64) {
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
     // No live capture stages anything here, so there is no real staged
     // watermark to hold apply back. A saturated one never does.
-    let watermark = StagedWatermark::saturated();
     for _ in 0..16 {
         let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
         seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
@@ -1277,7 +1276,6 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
             "alter_transform_test",
             1,
             "trellis_alter_transform_test",
-            &watermark,
         )
         .await
         .expect("drain_once")

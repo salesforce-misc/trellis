@@ -23,7 +23,7 @@ use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
 use trellis::defs::chunk_queue;
 use trellis::dump::{CLASSIFICATION, Class};
-use trellis::staging::{StagedWatermark, apply, has_pending, retire_drained_segments, seal};
+use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
 use trellis::{Config, Trellis, TrellisOptions};
 
 const SCHEMA: &str = trellis::config::DEFAULT_SCHEMA;
@@ -108,7 +108,6 @@ fn load(dsn: &str, schema_sql: &str, appendix: &str) {
 /// Seals and drains the ring through the engine's own apply path until
 /// nothing is pending: the stand-in for the maintenance loop and drain workers.
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
-    let watermark = StagedWatermark::saturated();
     for _ in 0..16 {
         let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
         seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
@@ -120,7 +119,6 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
             "dump_test",
             1,
             "dump_test_wake",
-            &watermark,
         )
         .await
         .expect("drain_once")

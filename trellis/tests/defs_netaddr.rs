@@ -59,7 +59,7 @@ use trellis::defs::{
 };
 use trellis::integer::IntWidth;
 use trellis::netaddr;
-use trellis::staging::{StagedWatermark, apply, seal};
+use trellis::staging::{apply, seal};
 
 // ---------------------------------------------------------------------
 // Harness
@@ -669,7 +669,6 @@ async fn an_inet_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two()
             "inet_worker",
             1,
             "trellis_defs_netaddr_issue_116_regression",
-            &StagedWatermark::saturated(),
         )
         .await
         .expect("drain_once")

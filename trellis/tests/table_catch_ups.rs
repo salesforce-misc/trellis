@@ -55,13 +55,12 @@ async fn connect_trellis(dsn: &str) -> Trellis {
 }
 
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
-    let watermark = StagedWatermark::saturated();
     for _ in 0..16 {
         let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
         seal::seal_phase2(client, outcome.sealed_seg_seq, WAKE)
             .await
             .expect("seal phase 2");
-        while apply::drain_once(pool, outcome.sealed_seg_seq, TEST_NAME, 1, WAKE, &watermark)
+        while apply::drain_once(pool, outcome.sealed_seg_seq, TEST_NAME, 1, WAKE)
             .await
             .expect("drain_once")
             .is_some()
@@ -177,7 +176,6 @@ fn sales_insert(lsn: PgLsn, id: i32, sku: &str, amount: i32) -> StagedChange {
         origin_lsn: None,
         src_changed: None,
         hop_gen: 0,
-        group_key: None,
     }
 }
 

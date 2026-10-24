@@ -17,7 +17,7 @@ use trellis::defs::ValueType;
 use trellis::staging::build::one_to_one::{self, OneToOneOutcome, OneToOnePlan};
 use trellis::staging::interleave::PausePoint;
 use trellis::staging::quarantine::{FailureClass, classify};
-use trellis::staging::{StagedWatermark, apply, claim, fold};
+use trellis::staging::{apply, claim, fold};
 
 const TARGET: &str = "public.one";
 const ONE: &str = "TRANSFORM one FROM public.src SELECT g AS g, v + v AS dbl";
@@ -1146,15 +1146,7 @@ async fn a_page_computed_before_a_column_pause_does_not_apply_after_it() {
 
     let mut client = d.pool().get().await.expect("a connection");
     let txn = client.transaction().await.expect("begin phase 3");
-    let stale = apply::apply_and_mark_drained(
-        &txn,
-        batch,
-        "page",
-        &plan,
-        WAKE,
-        &StagedWatermark::saturated(),
-    )
-    .await;
+    let stale = apply::apply_and_mark_drained(&txn, batch, "page", &plan, WAKE).await;
     let missed = matches!(stale, Err(apply::ApplyError::VersionFenceMiss { .. }));
     if missed {
         txn.rollback().await.expect("roll back the stale page");
@@ -1520,16 +1512,9 @@ async fn fold_page(d: &Driver, batch: i64, worker: &str) -> Vec<fold::FoldedChan
 async fn apply_computed_page(d: &Driver, batch: i64, worker: &str, plan: &apply::ApplyPlan) {
     let mut client = d.pool().get().await.expect("a connection");
     let txn = client.transaction().await.expect("begin phase 3");
-    apply::apply_and_mark_drained(
-        &txn,
-        batch,
-        worker,
-        plan,
-        WAKE,
-        &StagedWatermark::saturated(),
-    )
-    .await
-    .expect("apply the page");
+    apply::apply_and_mark_drained(&txn, batch, worker, plan, WAKE)
+        .await
+        .expect("apply the page");
     txn.commit().await.expect("commit phase 3");
 }
 

@@ -69,7 +69,7 @@ makes slot reuse safe.
 
 ```sql
 INSERT INTO seg_<active> (src_table, key, op, lsn, old_image, new_image,
-                          origin_lsn, src_changed, hop_gen, group_key)
+                          origin_lsn, src_changed, hop_gen)
 VALUES (...), (...), ...;
 ```
 

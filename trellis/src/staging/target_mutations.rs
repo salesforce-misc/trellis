@@ -45,13 +45,10 @@
 //! queue), which run while that definition is not yet applying
 //! (`TransformStatus::is_applying`). Nothing can read a target in that state:
 //! `defs::catalog::create_definition_inner` refuses a definition whose source
-//! is a target still being built (`CatalogError::TransformNotLive`),
-//! `create_relationship` refuses such a target as an endpoint the same way
-//! (#403), and a target whose build finishes with readers already attached (a
-//! resumed upstream) parks a catch-up marker for itself so those readers
-//! re-derive from its rebuilt state (and report `catching_up` until then):
-//! every reader, including one reading it through a relationship, whose
-//! settled projection that catch-up's discharge also refreshes (#507,
+//! is a target still being built (`CatalogError::TransformNotLive`), and a
+//! target whose build finishes with readers already attached (a resumed
+//! upstream) parks a catch-up marker for itself so those readers re-derive
+//! from its rebuilt state (and report `catching_up` until then,
 //! `intake::markers::park_target_catchup_if_read`). That catch-up re-reads
 //! the target's current keys, so it can't tell a reader about a row the
 //! rebuild deleted: such a delete goes through the seam (#815). A reader on
@@ -93,11 +90,12 @@
 //!
 //! Each row also carries the key's **prior image**: the target row as it
 //! stood before this transaction first touched it (`None` if the transaction
-//! created it). Only relationship machinery reads it, until #624 drops it:
-//! when an upstream write changes a row's join value, the live re-read only
-//! names the new parent, and the prior image names the one the row left. A
-//! downstream aggregate doesn't need it. When an upstream write moves a row
-//! from group A to group B, the key's ledger entry still names A (#623 D5).
+//! created it). An image-fed target's row carries it as its old image (see
+//! "The image feed"). On a `Recompute` it names the group the row left: a
+//! downstream group-basis aggregate recomputes that group as well as the
+//! current row's (`super::group_basis`). A ledger aggregate doesn't need it:
+//! when an upstream write moves a row from group A to group B, the key's
+//! ledger entry still names A (#623 D5).
 //!
 //! Writers capture the prior image with the same statement that already
 //! row-locks the key before writing it (a `SELECT ... FOR UPDATE` pre-lock,
@@ -184,17 +182,14 @@
 //! Some readers of a target need exact, ordered images of its changes, as
 //! capture gives a source:
 //!
-//! - a relationship naming the target on either side: its settled parent
-//!   projection, its reverse deltas and a from-side's `group_key` (issues
-//!   #129-#136), whether or not an applying definition reads through it yet;
 //! - an applying aggregate on the group basis (`super::group_basis`), which
 //!   applies `f(new) - f(old)` per change: an image-less `Recompute` names a
 //!   row's new group but not the one it left (ADR-0002, "Multi-hop");
 //! - an applying `JOIN` transform with the target on either side.
 //!
-//! The last two count only while the group-basis dev knob is on
-//! (`super::group_basis`'s "The knob"): until it is the default, no
-//! aggregate is on the group basis, and a `JOIN` never applies. A `JOIN`
+//! Both count only while the group-basis dev knob is on
+//! (`super::group_basis`'s "The knob"): with it off, no aggregate is on the
+//! group basis, and a `JOIN` never applies. A `JOIN`
 //! side consumes the images as it consumes captured ones (`super::join`).
 //!
 //! A target with any of them ([`TargetInfo::image_feed`]) stages each
@@ -215,9 +210,6 @@
 //!   the previous row's new image.
 //! - **`row_txid`** is the writer's transaction, as for any ring row, which
 //!   orders the change against a group-basis reader's bases.
-//! - **`group_key`** is the union of the target's outbound relationships'
-//!   `from_col` values across both images, the same rule a capture trigger
-//!   applies to a changed row (`capture::sql`).
 //! - **`origin_lsn`** stays `None`, as for a `Recompute` (see "The write
 //!   token").
 //!
@@ -228,28 +220,18 @@
 //! **One feed per target.** Every reader of an image-fed target consumes the
 //! same rows: a 1-1 or ledger reader applies a delta from the images instead
 //! of re-reading. A seam row and a CDC row for the same write would be two
-//! deltas, applied twice when they land in different batches, which is why
-//! the seam only took this over once endpoint targets were no longer
-//! captured (#403). Targets are not trigger-captured (#807).
+//! deltas, applied twice when they land in different batches. Targets are
+//! not trigger-captured (#807).
 //!
 //! **A target gaining a reader that needs images.** [`TargetInfo`] is
 //! resolved once per transaction, so a writer that resolved it before the
 //! reader existed stages its `Recompute` (or nothing, with no reader), not a
 //! CDC-shaped row.
 //!
-//! - A group-basis reader is built by the Re-derive build, whose plan waits
-//!   on its fence (`staging::build`'s "Seam-fed sources") until every such
-//!   writer has ended, so it reads their writes. The group basis' build
-//!   (#1101) runs after that fence, in the plan job.
-//! - A relationship's own projection seed doesn't see such a write either, so
-//!   its projection misses it. The miss is bounded: no definition can read
-//!   through a relationship before the relationship commits, and the first
-//!   one to do so re-seeds the projection's missing rows, and every column it
-//!   reads, from the live table
-//!   (`catalog::ensure_relationship_projection_in_txn`). What that catch-up
-//!   can't undo (it only adds rows) is a projection row for a to-side row the
-//!   writer deleted or re-keyed. That is the drift a plain source to-side's
-//!   projection already accumulates before its capture is installed.
+//! A group-basis or `JOIN` reader is built by the Re-derive build, whose plan
+//! waits on its fence (`staging::build`'s "Seam-fed sources") until every
+//! such writer has ended, so it reads their writes. The group basis' build
+//! (#1101) runs after that fence, in the plan job.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::SystemTime;
@@ -263,9 +245,8 @@ use super::apply::{
     pk_keyset_col, row_as_text_jsonb_sql,
 };
 use super::fold::earliest_origin;
-use crate::defs::catalog;
 use crate::defs::ddl::{self, PrimaryKeyColumn};
-use crate::pool::{quote_ident, quote_literal};
+use crate::pool::quote_ident;
 
 /// One changed key's accumulated state — see [`TargetMutations::record`].
 #[derive(Debug, Clone)]
@@ -283,8 +264,7 @@ struct KeyMutation {
 #[derive(Debug, Clone)]
 struct TargetInfo {
     /// Whether anything consumes this target's changes: an applying definition
-    /// reads it as its source, or the seam feeds it images as a relationship
-    /// endpoint (`image_feed`).
+    /// reads it (as its source or a `JOIN`'s joined table).
     has_readers: bool,
     /// The target's live column list, only resolved when `has_readers`.
     image_columns: Vec<String>,
@@ -300,9 +280,6 @@ struct ImageFeed {
     /// recorded key encodes (`ddl::pk_key_sql_expr`), used to re-read each
     /// key's new image.
     key_columns: Vec<PrimaryKeyColumn>,
-    /// The `from_col` of every relationship whose from-side is this target,
-    /// sorted and deduplicated; empty when it is no relationship's from-side.
-    group_key_columns: Vec<String>,
 }
 
 /// Whether an applying definition that needs exact images reads `$1` (see
@@ -332,8 +309,8 @@ fn image_readers_sql() -> String {
 }
 
 /// Resolves the seam's [`ImageFeed`] for `target`, or `None` when its feed
-/// stays image-less: it is no relationship's endpoint, and no applying
-/// definition that needs images reads it (`image_readers`).
+/// stays image-less: no applying definition that needs images reads it
+/// (`image_readers`).
 ///
 /// An aggregate target qualifies like any other: its row identity is its
 /// `UNIQUE NULLS NOT DISTINCT` grouping columns, which [`read_new_images`]
@@ -343,7 +320,7 @@ async fn resolve_image_feed(
     target: &str,
     image_readers: bool,
 ) -> Result<Option<ImageFeed>, ApplyError> {
-    if !image_readers && !catalog::is_relationship_endpoint(txn, target).await? {
+    if !image_readers {
         return Ok(None);
     }
     let key_columns = ddl::identity_key_columns(txn, target).await?;
@@ -354,20 +331,7 @@ async fn resolve_image_feed(
         // so the target falls back to image-less recomputes.
         return Ok(None);
     }
-    let mut group_key_columns = match target.split_once('.') {
-        Some((schema, table)) => catalog::relationships_from_table_in(txn, schema, table)
-            .await?
-            .into_iter()
-            .map(|r| r.def.from_col)
-            .collect(),
-        None => Vec::new(),
-    };
-    group_key_columns.sort();
-    group_key_columns.dedup();
-    Ok(Some(ImageFeed {
-        key_columns,
-        group_key_columns,
-    }))
+    Ok(Some(ImageFeed { key_columns }))
 }
 
 /// Every key one transaction changed in every target table it wrote, keyed
@@ -494,10 +458,6 @@ impl TargetMutations {
                 )
                 .await?;
             let (direct_readers, image_readers): (bool, bool) = (readers.get(0), readers.get(1));
-            // Any relationship, not only one a live definition reads: a
-            // to-one relationship's settled parent projection is maintained
-            // from the moment the relationship exists, so a reader that goes
-            // live later finds it current.
             let image_feed = resolve_image_feed(txn, target, image_readers).await?;
             let has_readers = direct_readers || image_feed.is_some();
             let image_columns = if has_readers {
@@ -914,7 +874,6 @@ async fn stage_target(
                 src_table: target.to_string(),
                 key,
                 hop_gen: next_hop,
-                group_key: None,
                 src_changed: m.src_changed,
                 prior_image: m.prior_image,
                 origin_lsn: m.origin_lsn,
@@ -937,7 +896,6 @@ async fn stage_target(
             origin_lsn: m.origin_lsn,
             src_changed: m.src_changed,
             hop_gen: next_hop,
-            group_key: new.group_key,
         });
     }
     Ok(())
@@ -948,15 +906,10 @@ async fn stage_target(
 struct NewImage {
     /// The row as this transaction left it, `None` if it deleted the row.
     image: Option<String>,
-    /// The union of `ImageFeed::group_key_columns`' values across the
-    /// key's prior and new images, `None` when there are none.
-    group_key: Option<Vec<String>>,
 }
 
 /// Re-reads every key in `keys` from `target` by its row identity, in one
-/// statement, after every write this transaction made, and computes each
-/// key's `group_key` from its prior image and the re-read row (the same text
-/// both images render, `<col>::text`). A plain read that takes no row lock,
+/// statement, after every write this transaction made. A plain read that takes no row lock,
 /// so it leaves the write token's "no lock after the token" rule intact.
 ///
 /// Every key comes back: an absent row is a deleted one (this transaction
@@ -981,16 +934,7 @@ async fn read_new_images(
     let rows = super::ledger::query_by_entry_key(txn, &query.sql, &query.params()).await?;
     Ok(rows
         .into_iter()
-        .map(|row| {
-            let group_key: Option<Vec<String>> = row.get(2);
-            (
-                row.get(0),
-                NewImage {
-                    image: row.get(1),
-                    group_key: group_key.filter(|values| !values.is_empty()),
-                },
-            )
-        })
+        .map(|row| (row.get(0), NewImage { image: row.get(1) }))
         .collect())
 }
 
@@ -1005,7 +949,6 @@ struct NewImagesQuery<'a> {
 #[derive(Default)]
 struct NullPatternArm<'a> {
     keys: Vec<&'a str>,
-    priors: Vec<Option<&'a str>>,
     /// One array per identity column that is not `NULL` in this pattern, in
     /// column order. A `NULL` column binds nothing: the arm matches it with
     /// `is null`.
@@ -1018,7 +961,6 @@ impl NewImagesQuery<'_> {
         let mut params: Vec<&(dyn ToSql + Sync)> = Vec::new();
         for arm in &self.arms {
             params.push(&arm.keys);
-            params.push(&arm.priors);
             for part in &arm.parts {
                 params.push(part);
             }
@@ -1061,7 +1003,7 @@ fn new_images_query<'a>(
     let pk = &feed.key_columns;
     // `pattern[i]`: identity column `i` is NULL.
     let mut arms: BTreeMap<Vec<bool>, NullPatternArm<'a>> = BTreeMap::new();
-    for (key, m) in keys {
+    for key in keys.keys() {
         let decoded = ddl::split_pk_key(pk, target, key)?;
         let pattern: Vec<bool> = decoded.iter().map(Option::is_none).collect();
         let arm = arms
@@ -1071,32 +1013,12 @@ fn new_images_query<'a>(
                 ..NullPatternArm::default()
             });
         arm.keys.push(key);
-        arm.priors.push(m.prior_image.as_deref());
         for (column, part) in arm.parts.iter_mut().zip(decoded.into_iter().flatten()) {
             column.push(part.into_owned());
         }
     }
 
     let image = row_as_text_jsonb_sql("t", image_columns);
-    let group_key_sql = if feed.group_key_columns.is_empty() {
-        "null::text[]".to_string()
-    } else {
-        let values: Vec<String> = feed
-            .group_key_columns
-            .iter()
-            .flat_map(|col| {
-                [
-                    format!("k.prior::jsonb ->> {}", quote_literal(col)),
-                    format!("t.{}::text", quote_ident(col)),
-                ]
-            })
-            .collect();
-        format!(
-            "array(select distinct v from unnest(array[{}]::text[]) as g(v) \
-             where v is not null order by v)",
-            values.join(", ")
-        )
-    };
     let target_ident = ddl::qualified_target_table_ident(target);
     let mut next_param = 1;
     let mut param = || {
@@ -1107,11 +1029,8 @@ fn new_images_query<'a>(
     let selects: Vec<String> = arms
         .keys()
         .map(|pattern| {
-            let mut arrays = vec![
-                format!("{}::text[]", param()),
-                format!("{}::text[]", param()),
-            ];
-            let mut aliases = vec!["key".to_string(), "prior".to_string()];
+            let mut arrays = vec![format!("{}::text[]", param())];
+            let mut aliases = vec!["key".to_string()];
             let mut matched = Vec::with_capacity(pk.len());
             let mut bounds = Vec::new();
             for (i, (column, &null)) in pk.iter().zip(pattern).enumerate() {
@@ -1132,8 +1051,7 @@ fn new_images_query<'a>(
             format!(
                 "select k.key, \
                         case when t.ctid is null then null \
-                             else ({image})::text end, \
-                        {group_key_sql} \
+                             else ({image})::text end \
                  from unnest({}) as k({}) \
                  left join {target_ident} t on {}",
                 arrays.join(", "),
@@ -1562,9 +1480,8 @@ mod tests {
 
     /// `read_new_images` over a composite, mixed-type row identity (a text
     /// part carrying the composite separator, a `date` part) and a
-    /// mixed-case join-key column: an updated key comes back with its new
-    /// image, a deleted one with none, and each `group_key` is the union of
-    /// the prior and new images' join-key values.
+    /// mixed-case column: an updated key comes back with its new image, and
+    /// a deleted one with none.
     #[tokio::test]
     async fn read_new_images_matches_composite_mixed_type_keys() {
         let cluster = testkit::TestCluster::start();
@@ -1614,10 +1531,7 @@ mod tests {
                 },
             );
         }
-        let feed = ImageFeed {
-            key_columns,
-            group_key_columns: vec!["Grp".to_string()],
-        };
+        let feed = ImageFeed { key_columns };
         let mut got = read_new_images(&txn, "public.t", &columns, &feed, &keys)
             .await
             .expect("re-read");
@@ -1628,15 +1542,10 @@ mod tests {
             updated.image.as_deref(),
             Some(r#"{"a": "x\u001fy", "b": "2026-01-02", "Grp": "5"}"#)
         );
-        assert_eq!(
-            updated.group_key,
-            Some(vec!["1".to_string(), "5".to_string()])
-        );
         let deleted = got
             .remove(&before[1].0)
             .expect("the deleted key comes back");
         assert_eq!(deleted.image, None);
-        assert_eq!(deleted.group_key, Some(vec!["2".to_string()]));
         assert!(got.is_empty());
     }
 
@@ -1700,10 +1609,7 @@ mod tests {
                 )
             })
             .collect();
-        let feed = ImageFeed {
-            key_columns,
-            group_key_columns: Vec::new(),
-        };
+        let feed = ImageFeed { key_columns };
         let got = read_new_images(&txn, "public.t", &columns, &feed, &keys)
             .await
             .expect("re-read");
@@ -1786,10 +1692,7 @@ mod tests {
                     )
                 })
                 .collect();
-            let feed = ImageFeed {
-                key_columns,
-                group_key_columns: Vec::new(),
-            };
+            let feed = ImageFeed { key_columns };
             let query = new_images_query(table, &columns, &feed, &keys).expect("query");
             assert_eq!(keys.len(), 500);
             assert_eq!(
@@ -1920,10 +1823,7 @@ mod tests {
                 })
                 .collect();
             assert_eq!(keys.len(), 5000);
-            let feed = ImageFeed {
-                key_columns,
-                group_key_columns: Vec::new(),
-            };
+            let feed = ImageFeed { key_columns };
             let query = new_images_query(table, &columns, &feed, &keys).expect("query");
             assert_eq!(
                 query.arms.len(),

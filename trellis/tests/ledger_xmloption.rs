@@ -60,8 +60,7 @@ async fn full_pass(raw: &mut Client, pool: &trellis::Pool) {
 /// Seals and drains through the engine's own apply path until nothing is
 /// pending anywhere in the ring (as in `capture_schema_change.rs`).
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
-    use trellis::staging::{StagedWatermark, apply, has_pending, retire_drained_segments, seal};
-    let watermark = StagedWatermark::saturated();
+    use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
     for _ in 0..16 {
         let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
         seal::seal_phase2(client, outcome.sealed_seg_seq, "ledger_xmloption_wake")
@@ -73,7 +72,6 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
             "ledger_xmloption_test",
             1,
             "trellis_ledger_xmloption_test",
-            &watermark,
         )
         .await
         .expect("drain_once")

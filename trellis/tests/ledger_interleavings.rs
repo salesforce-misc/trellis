@@ -38,7 +38,7 @@ use tokio_postgres::types::PgLsn;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ValueType;
 use trellis::staging::interleave::PausePoint;
-use trellis::staging::{CdcOp, StagedChange, StagedWatermark, apply, claim};
+use trellis::staging::{CdcOp, StagedChange, apply, claim};
 
 const SRC: &str = "public.src";
 
@@ -708,7 +708,6 @@ async fn stage_pre_truncate_insert(d: &Driver, key: &str, image: &str) {
             origin_lsn: None,
             src_changed: None,
             hop_gen: 0,
-            group_key: None,
         }],
     )
     .await
@@ -858,16 +857,12 @@ async fn a_truncate_without_an_lsn_halts_instead_of_clearing_without_a_floor() {
         lsn: None,
         hop_gen: 0,
         first_seen: std::time::SystemTime::now(),
-        group_key: None,
         is_truncate: true,
-        relationship_reverse_deferred: None,
-        retry_count: 0,
         prior_image: None,
         row_count: 1,
         has_recompute: false,
         ends_in_delete: false,
         last_change: None,
-        to_col_values: Vec::new(),
         group_sides: Vec::new(),
     };
     let err = apply::compute(d.pool(), &[truncate])
@@ -2362,17 +2357,9 @@ async fn a_stalled_claim_does_not_reclaim_buckets_a_peer_drained_meanwhile() {
 
     let drain = |worker: &'static str| {
         let pool = d.pool().clone();
-        tokio::spawn(async move {
-            apply::drain_once(
-                &pool,
-                batch,
-                worker,
-                1,
-                drain_driver::WAKE,
-                &StagedWatermark::saturated(),
-            )
-            .await
-        })
+        tokio::spawn(
+            async move { apply::drain_once(&pool, batch, worker, 1, drain_driver::WAKE).await },
+        )
     };
     let b = drain("b");
     d.wait_blocked_behind(gate_pid).await;

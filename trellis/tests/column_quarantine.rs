@@ -26,7 +26,6 @@ use trellis::defs::{
     create_target_table, install_definition, source_primary_key,
 };
 use trellis::dev::interleave::{PausePoint, PauseScope, with_scope};
-use trellis::staging::StagedWatermark;
 use trellis::staging::apply::{self, ApplyError};
 use trellis::staging::quarantine::{self, DEFAULT_COLUMN_DEATH_THRESHOLD};
 use trellis::{BlockingTrellis, Config, Trellis, TrellisOptions};
@@ -228,15 +227,8 @@ async fn stage_bad_orders(client: &mut Client, pool: &trellis::Pool, ids: &[i64]
         .await;
     }
     let seg_seq = seal_active_segment(client).await;
-    let result = apply::drain_once(
-        pool,
-        seg_seq,
-        "worker",
-        1,
-        "trellis_column_quarantine_test",
-        &StagedWatermark::saturated(),
-    )
-    .await;
+    let result =
+        apply::drain_once(pool, seg_seq, "worker", 1, "trellis_column_quarantine_test").await;
     assert!(
         matches!(result, Err(ApplyError::Eval(_))),
         "a malformed numeric field must still surface as an evaluator failure, got {result:?}"
@@ -413,7 +405,6 @@ async fn a_column_fuse_trip_that_waits_out_the_lock_timeout_trips_on_the_next_fa
         "worker",
         1,
         "trellis_column_quarantine_test",
-        &StagedWatermark::saturated(),
     )
     .await;
     assert!(
@@ -440,7 +431,6 @@ async fn a_column_fuse_trip_that_waits_out_the_lock_timeout_trips_on_the_next_fa
         "worker",
         1,
         "trellis_column_quarantine_test",
-        &StagedWatermark::saturated(),
     )
     .await;
     assert!(
@@ -496,7 +486,6 @@ async fn paused_column_freezes_instead_of_going_null_or_being_overwritten() {
         "worker",
         1,
         "trellis_column_quarantine_test",
-        &StagedWatermark::saturated(),
     )
     .await
     .expect("drain_once")
@@ -546,7 +535,6 @@ async fn paused_column_freezes_instead_of_going_null_or_being_overwritten() {
         "worker",
         1,
         "trellis_column_quarantine_test",
-        &StagedWatermark::saturated(),
     )
     .await
     .expect("drain_once")
@@ -794,7 +782,6 @@ async fn a_fuse_trip_whose_cascade_failed_at_a_grandchild_is_completed_by_the_ca
         "worker",
         1,
         "trellis_column_quarantine_test",
-        &StagedWatermark::saturated(),
     )
     .await;
     assert!(result.is_err(), "the drain fails, got {result:?}");
@@ -1108,7 +1095,6 @@ async fn resume_recomputes_and_does_not_un_pause_a_dependent_with_its_own_reason
         "worker",
         1,
         "trellis_column_quarantine_test",
-        &StagedWatermark::saturated(),
     )
     .await
     .expect("drain_once")
@@ -1521,7 +1507,6 @@ async fn an_existing_row_level_fuse_scenario_is_unaffected() {
             "worker",
             1,
             "trellis_column_quarantine_test",
-            &StagedWatermark::saturated(),
         )
         .await
         {
@@ -1779,7 +1764,6 @@ async fn pausing_an_upstream_column_never_cascades_into_a_downstream_aggregate()
         "worker",
         1,
         "trellis_column_quarantine_test",
-        &StagedWatermark::saturated(),
     )
     .await
     .expect("drain_once")
@@ -1796,7 +1780,6 @@ async fn pausing_an_upstream_column_never_cascades_into_a_downstream_aggregate()
         "worker",
         1,
         "trellis_column_quarantine_test",
-        &StagedWatermark::saturated(),
     )
     .await
     .expect("drain_once")
@@ -2212,7 +2195,6 @@ async fn ambiguous_field_name_attribution_falls_back_to_no_column_level_attribut
         "worker",
         1,
         "trellis_column_quarantine_test",
-        &StagedWatermark::saturated(),
     )
     .await;
     assert!(
@@ -2417,7 +2399,6 @@ async fn resume_column_leaves_a_cascaded_not_yet_live_dependent_paused_without_e
         "worker",
         1,
         "trellis_column_quarantine_test",
-        &StagedWatermark::saturated(),
     )
     .await
     .expect("drain_once")
@@ -2555,15 +2536,8 @@ async fn stage_bad_orders_bare(client: &mut Client, pool: &trellis::Pool, ids: &
             .expect("stage bare-src_table cdc row");
     }
     let seg_seq = seal_active_segment(client).await;
-    let result = apply::drain_once(
-        pool,
-        seg_seq,
-        "worker",
-        1,
-        "trellis_column_quarantine_test",
-        &StagedWatermark::saturated(),
-    )
-    .await;
+    let result =
+        apply::drain_once(pool, seg_seq, "worker", 1, "trellis_column_quarantine_test").await;
     assert!(
         matches!(result, Err(ApplyError::Eval(_))),
         "a malformed numeric field must still surface as an evaluator failure for a bare \
@@ -2863,7 +2837,6 @@ async fn a_row_changed_after_a_column_resume_needs_no_catch_up() {
             "worker",
             1,
             "trellis_column_quarantine_test",
-            &StagedWatermark::saturated(),
         )
         .await
         .expect("drain_once")
@@ -2990,17 +2963,10 @@ async fn drain_staged(client: &mut Client, pool: &trellis::Pool) {
     use trellis::staging::{has_pending, retire_drained_segments};
     for _ in 0..16 {
         let seg_seq = seal_active_segment(client).await;
-        while apply::drain_once(
-            pool,
-            seg_seq,
-            "worker",
-            1,
-            "trellis_column_quarantine_test",
-            &StagedWatermark::saturated(),
-        )
-        .await
-        .expect("drain_once")
-        .is_some()
+        while apply::drain_once(pool, seg_seq, "worker", 1, "trellis_column_quarantine_test")
+            .await
+            .expect("drain_once")
+            .is_some()
         {}
         retire_drained_segments(client)
             .await

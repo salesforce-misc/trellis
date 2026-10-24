@@ -16,7 +16,7 @@ use drain_driver::Driver;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ValueType;
 use trellis::staging::quarantine::{self, HeldKeyRetry};
-use trellis::staging::{DEFAULT_DEATH_THRESHOLD, StagedWatermark, apply};
+use trellis::staging::{DEFAULT_DEATH_THRESHOLD, apply};
 use trellis::{Config, Trellis, TrellisOptions};
 
 const NUMS: &str = "public.nums";
@@ -51,16 +51,7 @@ async fn start() -> Driver {
 async fn drain_through_evictions(d: &Driver, batch: i64) -> usize {
     let mut failures = 0;
     loop {
-        match apply::drain_once(
-            d.pool(),
-            batch,
-            "worker",
-            1,
-            drain_driver::WAKE,
-            &StagedWatermark::saturated(),
-        )
-        .await
-        {
+        match apply::drain_once(d.pool(), batch, "worker", 1, drain_driver::WAKE).await {
             Ok(Some(_)) => continue,
             Ok(None) => return failures,
             Err(err) => {

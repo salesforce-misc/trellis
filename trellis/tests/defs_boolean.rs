@@ -84,7 +84,7 @@ use trellis::defs::{
     install_definition, parse, registry, source_primary_key, validate,
 };
 use trellis::integer::IntWidth;
-use trellis::staging::{StagedWatermark, apply, seal};
+use trellis::staging::{apply, seal};
 
 // ---------------------------------------------------------------------
 // Harness
@@ -551,7 +551,6 @@ async fn a_boolean_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two
             "boolean_worker",
             1,
             "trellis_defs_boolean_issue_119_regression",
-            &StagedWatermark::saturated(),
         )
         .await
         .expect("drain_once")
