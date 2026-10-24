@@ -79,6 +79,7 @@ use generative::generate::join::{
     join_case_strategy,
 };
 use generative::model::Op;
+use generative::plant_sweep::{self, SweepTier};
 use generative::run::{RunError, check_program, run_convergence_concurrent};
 use proptest::prelude::*;
 use proptest::test_runner::{Config as ProptestConfig, FileFailurePersistence, TestCaseError};
@@ -329,6 +330,81 @@ proptest! {
     #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
     fn property_join_targets_converge_under_concurrent_drains(case in join_case_strategy()) {
         run_case(&case).map_err(TestCaseError::fail)?;
+    }
+}
+
+/// The `JOIN` tier's sweep: the plants a `JOIN` page or build can reach are
+/// gated (the `JOIN` plants and the group-basis writer's, which `P` and `M`
+/// share); the others break paths the tier never takes.
+fn join_sweep_tier() -> SweepTier {
+    use generative::plant_sweep::{PlantPath, not_on_path};
+    SweepTier {
+        name: generative::baseline_quarantine::JOIN_TIER,
+        known_misses: &[],
+        not_gated: not_on_path(
+            &[
+                PlantPath::Ledger,
+                PlantPath::OneToOne,
+                PlantPath::OneToOneOrLedger,
+                PlantPath::GroupBasis,
+            ],
+            "it breaks a 1-1, ledger or plain group-basis aggregate path, and the JOIN tier \
+             draws only JOIN definitions",
+        )
+        .collect(),
+    }
+}
+
+/// #1114: shows the `JOIN` tier catches each planted bug a `JOIN` can reach
+/// (`trellis::dev::plant::Plant`), and how often: the concurrent tier's
+/// sweep (`generative::plant_sweep`, `concurrent_convergence.rs`'s
+/// `planted_bugs_are_caught`) over [`join_case_strategy`]'s seeded cases.
+/// Returns at once without `GENERATIVE_PLANTS`. Run it with:
+///
+/// ```text
+/// GENERATIVE_PLANTS=all cargo test -p generative --test join_convergence \
+///     join_planted_bugs_are_caught -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "planted-bug sweep: run with GENERATIVE_PLANTS=all and `--ignored`"]
+fn join_planted_bugs_are_caught() {
+    let strategy = join_case_strategy().boxed();
+    plant_sweep::sweep(
+        "join_planted_bugs_are_caught",
+        &join_sweep_tier(),
+        |seed, cases| plant_sweep::seeded_cases(&strategy, seed, cases),
+        |case: &JoinCase| {
+            run_case(case).map_err(|message| plant_sweep::CaseFailure {
+                // Every target is a `JOIN`.
+                key_spaces: case
+                    .program
+                    .defs
+                    .iter()
+                    .map(|def| Some(def.key_space.clone()))
+                    .collect(),
+                message,
+            })
+        },
+    );
+}
+
+#[test]
+fn the_join_tier_gates_every_join_plant() {
+    use trellis::dev::plant::Plant;
+    let tier = join_sweep_tier();
+    for plant in Plant::ALL {
+        let gated = !tier.not_gated.iter().any(|(name, _)| *name == plant.name());
+        let path = generative::plant_sweep::plant_path(*plant);
+        assert_eq!(
+            gated,
+            matches!(
+                path,
+                generative::plant_sweep::PlantPath::Join
+                    | generative::plant_sweep::PlantPath::GroupBasisWriter
+            ),
+            "{}",
+            plant.name()
+        );
     }
 }
 

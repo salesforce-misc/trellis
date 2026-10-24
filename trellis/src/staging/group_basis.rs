@@ -248,6 +248,39 @@ pub fn set_enabled(on: bool) {
     KNOB.store(if on { 2 } else { 1 }, Ordering::Relaxed);
 }
 
+/// Planted bug `gb_fold_sides_per_key` (`crate::plant`): a key's ring rows
+/// (`FoldedChange::group_sides`) folded into one, as the per-key fold folds
+/// them: the first row's old image and the last row's new image, under the
+/// last row's transaction and `lsn`. `None` when there is nothing to fold
+/// (one row), or a row is a `Recompute` or carries transition images.
+#[cfg(any(test, feature = "test-util"))]
+fn planted_fold(sides: &[String]) -> Option<String> {
+    if sides.len() < 2 {
+        return None;
+    }
+    let rows: Vec<serde_json::Value> = sides
+        .iter()
+        .map(|side| serde_json::from_str(side).ok())
+        .collect::<Option<_>>()?;
+    if rows.iter().any(|row| {
+        !matches!(row["op"].as_str(), Some("insert" | "update" | "delete")) || row["x"].is_object()
+    }) {
+        return None;
+    }
+    let (first, last) = (&rows[0], &rows[rows.len() - 1]);
+    Some(
+        serde_json::json!({
+            "t": last["t"],
+            "l": last["l"],
+            "op": "update",
+            "o": first["o"],
+            "n": last["n"],
+            "x": null,
+        })
+        .to_string(),
+    )
+}
+
 /// One aggregate call of a definition's fields, over the group's partials.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum Agg {
@@ -812,6 +845,16 @@ impl GroupTargetPlan {
                  while a definition exists",
             ));
         }
+        // Planted bug (#1114): fold the key's ring rows into one side. See
+        // `crate::plant`.
+        #[cfg(any(test, feature = "test-util"))]
+        if let Some(folded) = planted_fold(&change.group_sides)
+            && crate::plant::fires(crate::plant::Plant::GbFoldSidesPerKey, true)
+        {
+            self.sides.push(folded);
+            self.note(change);
+            return Ok(());
+        }
         self.sides.extend(change.group_sides.iter().cloned());
         self.note(change);
         Ok(())
@@ -1213,6 +1256,31 @@ impl GroupTargetPlan {
         )
     }
 
+    /// Planted bugs `gb_skip_group_lock` and `join_t_skip_lock`
+    /// (`crate::plant`): [`Self::lock_sql`]'s groups that have no hidden row
+    /// yet, inserted, and the rest left unlocked.
+    #[cfg(any(test, feature = "test-util"))]
+    pub(super) fn planted_insert_missing_sql(&self) -> String {
+        let cols = quoted(&self.shape.group_cols).join(", ");
+        let recomputed = if !matches!(self.writer, Writer::JoinTarget) {
+            format!(" union all select {cols} from {}", self.recomputed)
+        } else {
+            String::new()
+        };
+        format!(
+            "insert into {hidden} ({cols}) \
+             select distinct {cols} from ( \
+                 select {cols} from {staged}{recomputed} \
+             ) as g \
+             where not exists (select 1 from {hidden} x where {matched}) \
+             order by {cols} \
+             on conflict do nothing",
+            hidden = self.hidden_ident,
+            staged = self.staged,
+            matched = self.group_match("x", "g"),
+        )
+    }
+
     /// The SQL of aggregate `agg` over partials named by `n`, `count` and
     /// `sum` (each a function of the argument's 1-based index).
     fn agg_sql(
@@ -1299,7 +1367,6 @@ impl GroupTargetPlan {
 
     fn apply_sql_with(&self, tail: &str) -> String {
         let cols = quoted(&self.shape.group_cols);
-        let col_list = cols.join(", ");
         let args = &self.shape.args;
         // The per-(group, transaction) sums of each partial.
         let mut sums = vec!["sum(__n)::bigint as __n".to_string()];
@@ -1324,6 +1391,43 @@ impl GroupTargetPlan {
         }
         let up_groups: Vec<String> = cols.iter().map(|c| format!("u.{c}")).collect();
         let matched = self.group_match("sg", "b");
+        #[cfg_attr(not(any(test, feature = "test-util")), allow(unused_mut))]
+        let mut unseen = "not pg_visible_in_snapshot(sg.__txid, b.__basis)";
+        // Planted bug (#1114): order the change against the basis instead of
+        // asking whether the basis saw it. See `crate::plant`.
+        #[cfg(any(test, feature = "test-util"))]
+        if crate::plant::armed() == Some(crate::plant::Plant::GbLsnNotVisibility) {
+            unseen = "sg.__txid >= pg_snapshot_xmax(b.__basis)";
+        }
+        format!(
+            "{basis_ctes}, \
+             f as ( \
+                 select sg.*, b.__hc from sg join b on {matched} \
+                 where b.__basis is null or {unseen} \
+             ), \
+             t as (select __hc, {totals} from f group by __hc), \
+             up as ( \
+                 update {hidden} u set {sets} from t \
+                 where u.ctid = any(array(select t.__hc from t where {nonzero})) \
+                   and u.ctid = t.__hc \
+                 returning {up_groups}, {returning} \
+             ), \
+             {tail}",
+            basis_ctes = self.basis_ctes_sql(&sums),
+            totals = totals.join(", "),
+            hidden = self.hidden_ident,
+            sets = sets.join(", "),
+            nonzero = nonzero.join(" or "),
+            up_groups = up_groups.join(", "),
+            returning = returning.join(", "),
+        )
+    }
+
+    /// [`Self::apply_sql_with`]'s first CTEs: `sg`, the staged sides above
+    /// the truncate floor (`$1`'s) summed per (group, transaction) into
+    /// `sums`; `pg`, their groups; and `b`, each group's hidden row and basis.
+    fn basis_ctes_sql(&self, sums: &[String]) -> String {
+        let col_list = quoted(&self.shape.group_cols).join(", ");
         format!(
             "with sg as ( \
                  select {col_list}, __txid, {sums} from {staged} \
@@ -1334,19 +1438,7 @@ impl GroupTargetPlan {
              b as ( \
                  select pg.*, h.__hc, h.__basis from pg \
                  cross join lateral {lookup_hidden} as h(__hc, __basis) \
-             ), \
-             f as ( \
-                 select sg.*, b.__hc from sg join b on {matched} \
-                 where b.__basis is null or not pg_visible_in_snapshot(sg.__txid, b.__basis) \
-             ), \
-             t as (select __hc, {totals} from f group by __hc), \
-             up as ( \
-                 update {hidden} u set {sets} from t \
-                 where u.ctid = any(array(select t.__hc from t where {nonzero})) \
-                   and u.ctid = t.__hc \
-                 returning {up_groups}, {returning} \
-             ), \
-             {tail}",
+             )",
             staged = self.staged,
             sums = sums.join(", "),
             floor = if self.floor_key.is_some() {
@@ -1365,12 +1457,24 @@ impl GroupTargetPlan {
                     "x.ctid, x.__basis"
                 }
             ),
-            totals = totals.join(", "),
-            hidden = self.hidden_ident,
-            sets = sets.join(", "),
-            nonzero = nonzero.join(" or "),
-            up_groups = up_groups.join(", "),
-            returning = returning.join(", "),
+        )
+    }
+
+    /// Planted bug `gb_lsn_not_visibility` (`crate::plant`): how many of
+    /// the staged (group, transaction) sums the plant refuses that the
+    /// visibility test would apply: those whose transaction was in flight
+    /// when the group's basis was taken.
+    #[cfg(any(test, feature = "test-util"))]
+    fn planted_in_flight_sql(&self) -> String {
+        format!(
+            "{}, \
+             x as (select 1 from sg join b on {} \
+                   where b.__basis is not null \
+                     and not pg_visible_in_snapshot(sg.__txid, b.__basis) \
+                     and sg.__txid < pg_snapshot_xmax(b.__basis)) \
+             select count(*) from x",
+            self.basis_ctes_sql(&["sum(__n)::bigint as __n".to_string()]),
+            self.group_match("sg", "b"),
         )
     }
 
@@ -1680,6 +1784,16 @@ impl GroupTargetPlan {
         let up_groups: Vec<String> = cols.iter().map(|c| format!("u.{c}")).collect();
         let lookup_hidden = self.group_lookup(&self.hidden_ident, "rg", "x.ctid");
         let r = match read {
+            #[cfg(any(test, feature = "test-util"))]
+            RebuildRead::Early(early) => format!(
+                "a as (select * from {early} where __rn is not null), \
+                 r as ( \
+                     select h.__hc, {kept} from rg \
+                     cross join lateral {lookup_hidden} as h(__hc) \
+                     left join a on {matched} \
+                 )",
+                kept = kept.join(", "),
+            ),
             // One `GROUP BY` of the source or of a leaf, matched to the
             // locked groups.
             RebuildRead::Source | RebuildRead::Node(_) => {
@@ -1716,11 +1830,14 @@ impl GroupTargetPlan {
                 probe = self.probe_rows_sql(),
             ),
         };
+        #[cfg_attr(not(any(test, feature = "test-util")), allow(unused_mut))]
+        let mut snap = SNAPSHOT_AND_STAMP.to_string();
+        #[cfg(any(test, feature = "test-util"))]
+        if let RebuildRead::Early(early) = read {
+            snap = format!("select __snap, __seg from {early} limit 1");
+        }
         format!(
-            "with snap as materialized ( \
-                 select pg_catalog.pg_current_snapshot() as __snap, \
-                        coalesce((select max(seg_seq) from segments), 0) as __seg \
-             ), \
+            "with snap as materialized ({snap}), \
              rg as (select distinct {col_list} from {recomputed}), \
              {r}, \
              up as ( \
@@ -1736,6 +1853,42 @@ impl GroupTargetPlan {
             up_groups = up_groups.join(", "),
             returning = returning.join(", "),
             tail = self.held_tail_sql(image_columns),
+        )
+    }
+
+    /// Planted bug `gb_build_snapshot_before_locks` (`crate::plant`):
+    /// creates `early`, a temporary table holding [`Self::rebuild_sql`]'s
+    /// `GROUP BY` of the whole source and its snapshot and stamp, all from
+    /// this one statement's snapshot (one row of `NULL`s past the snapshot
+    /// when the source is empty).
+    #[cfg(any(test, feature = "test-util"))]
+    fn planted_early_read_sql(&self, early: &str) -> String {
+        let cols = quoted(&self.shape.group_cols);
+        let mut fresh = vec!["count(*)::bigint as __rn".to_string()];
+        for (i, arg) in self.shape.args.iter().enumerate() {
+            let i = i + 1;
+            fresh.push(format!(
+                "(count(*) filter (where ({}) is not null))::bigint as __rc{i}",
+                arg.sql
+            ));
+            if arg.summed {
+                fresh.push(format!(
+                    "coalesce(sum(({})::numeric), 0) as __rs{i}",
+                    arg.sql
+                ));
+            }
+        }
+        let positions: Vec<String> = (1..=cols.len()).map(|p| p.to_string()).collect();
+        format!(
+            "create temporary table {early} on commit drop as \
+             with snap as materialized ({SNAPSHOT_AND_STAMP}) \
+             select snap.*, a.* from snap left join ( \
+                 select {values}, {fresh} from {src} s group by {positions} \
+             ) as a on true",
+            values = self.group_values().join(", "),
+            fresh = fresh.join(", "),
+            positions = positions.join(", "),
+            src = self.source_row,
         )
     }
 
@@ -2095,6 +2248,16 @@ pub(crate) async fn lock_groups(
 ) -> Result<(), ApplyError> {
     stage_sides(txn, plan).await?;
     name_groups(txn, plan, &[], &plan.recompute_keys).await?;
+    // Planted bug (#1114): lock none of the groups that exist. See
+    // `crate::plant`.
+    #[cfg(any(test, feature = "test-util"))]
+    if crate::plant::fires(
+        crate::plant::Plant::GbSkipGroupLock,
+        matches!(plan.writer, Writer::Aggregate),
+    ) {
+        txn.execute(&plan.planted_insert_missing_sql(), &[]).await?;
+        return Ok(());
+    }
     txn.execute(&plan.lock_sql(), &[]).await?;
     Ok(())
 }
@@ -2163,6 +2326,20 @@ pub(crate) async fn apply_locked_groups(
     plan: &GroupTargetPlan,
     mutations: &mut TargetMutations,
 ) -> Result<(Vec<AppliedGroup>, usize, usize), ApplyError> {
+    // Planted bug (#1114): count the pages whose basis test the plant
+    // changes. See `crate::plant`.
+    #[cfg(any(test, feature = "test-util"))]
+    if crate::plant::armed() == Some(crate::plant::Plant::GbLsnNotVisibility) {
+        let sql = plan.planted_in_flight_sql();
+        let row = match &plan.floor_key {
+            Some(key) => txn.query_one(&sql, &[key]).await?,
+            None => txn.query_one(&sql, &[]).await?,
+        };
+        crate::plant::fires(
+            crate::plant::Plant::GbLsnNotVisibility,
+            row.get::<_, i64>(0) > 0,
+        );
+    }
     if let Writer::JoinPartials { .. } = plan.writer {
         let sql = plan.apply_sql(None);
         txn.batch_execute(PLAN_SETTINGS).await?;
@@ -2472,6 +2649,11 @@ pub(crate) struct RebuildScope {
     pub read_node: bool,
 }
 
+/// An absolute write's snapshot, its basis, and the newest segment there is,
+/// its stamp (R5), read in one statement.
+const SNAPSHOT_AND_STAMP: &str = "select pg_catalog.pg_current_snapshot() as __snap, \
+     coalesce((select max(seg_seq) from segments), 0) as __seg";
+
 /// Where a rebuild's replace reads the groups' rows from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RebuildRead {
@@ -2481,6 +2663,12 @@ enum RebuildRead {
     Node(String),
     /// One index probe of the source per group.
     Probe,
+    /// Planted bug `gb_build_snapshot_before_locks` (`crate::plant`): the
+    /// `GROUP BY` of the whole source and its snapshot, read into this
+    /// temporary table before the groups were locked
+    /// ([`GroupTargetPlan::planted_early_read_sql`]).
+    #[cfg(any(test, feature = "test-util"))]
+    Early(String),
 }
 
 /// A build or rebuild of a group-basis target (ADR-0002, "An aggregate's
@@ -2526,6 +2714,23 @@ pub(crate) async fn rebuild(
     } else {
         None
     };
+    // Planted bug (#1114): read the source and take the basis before the
+    // groups are locked. See `crate::plant`.
+    #[cfg(any(test, feature = "test-util"))]
+    let early = if crate::plant::fires(
+        crate::plant::Plant::GbBuildSnapshotBeforeLocks,
+        scope.is_none() && matches!(plan.writer, Writer::Aggregate),
+    ) {
+        let early = "pg_temp.trellis_planted_early_read".to_string();
+        txn.batch_execute(&format!(
+            "drop table if exists {early}; {}",
+            plan.planted_early_read_sql(&early)
+        ))
+        .await?;
+        Some(early)
+    } else {
+        None
+    };
     txn.execute(&plan.rebuild_groups_sql(scope), &[&plan.source])
         .await?;
     if let Some(saved) = session {
@@ -2560,6 +2765,8 @@ pub(crate) async fn rebuild(
         }) => RebuildRead::Node(node.clone()),
         Some(_) => RebuildRead::Probe,
     };
+    #[cfg(any(test, feature = "test-util"))]
+    let read = early.map_or(read, RebuildRead::Early);
     let rows = txn
         .query(&plan.rebuild_sql(image_columns.as_deref(), &read), &[])
         .await?;

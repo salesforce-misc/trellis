@@ -18,14 +18,27 @@ use std::collections::HashSet;
 /// The checked-in list.
 pub const CHECKED_IN: &str = include_str!("../baseline-quarantine.txt");
 
-/// The sweep tiers an entry can name (`concurrent_convergence.rs`'s
+/// The concurrent tier's sweep tiers (`concurrent_convergence.rs`'s
 /// `GENERATIVE_PLANT_TIER` values).
+pub const CONCURRENT_TIERS: &[&str] = &[
+    "cooling_key",
+    "cooling_backfill",
+    "hot_key",
+    "mid_burst",
+    "steady_load",
+];
+
+/// The `JOIN` tier's sweep tier (`join_convergence.rs`).
+pub const JOIN_TIER: &str = "join";
+
+/// The sweep tiers an entry can name.
 pub const TIERS: &[&str] = &[
     "cooling_key",
     "cooling_backfill",
     "hot_key",
     "mid_burst",
     "steady_load",
+    JOIN_TIER,
 ];
 
 /// The repository whose issues the entries name.

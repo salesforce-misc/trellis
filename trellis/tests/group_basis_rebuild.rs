@@ -248,6 +248,32 @@ async fn changes_before_during_and_after_a_rebuild() {
     assert_oracle(&mut d).await;
 }
 
+/// #1097 rule 4: the rebuild takes its snapshot after its lock statement. A
+/// page that applies a change to a group the rebuild has enumerated, and
+/// commits before the rebuild locks it, is in the snapshot, so the absolute
+/// write keeps the change. A snapshot taken before the locks (planted bug
+/// `gb_build_snapshot_before_locks`) doesn't see it, and the absolute write
+/// overwrites what the page applied.
+#[tokio::test]
+async fn a_page_that_commits_between_the_enumeration_and_the_locks() {
+    let mut d = start().await;
+    step(
+        &mut d,
+        "insert into public.src values (1, 1, 10), (2, 2, 5)",
+    )
+    .await;
+    request_rebuild(&d).await;
+    let mut rebuilding = rebuild_frozen(&d, &[PausePoint::AfterRebuildEnumerate]).await;
+    rebuilding.reached(PausePoint::AfterRebuildEnumerate).await;
+    step(&mut d, "update public.src set v = 100 where id = 2").await;
+    d.release(&mut rebuilding, PausePoint::AfterRebuildEnumerate)
+        .await;
+    rebuilding.finish().await;
+    assert_finished(&d).await;
+    assert_eq!(partials(&d, 2).await, ["(1,1,100,t)"]);
+    assert_oracle(&mut d).await;
+}
+
 /// A page that creates a new group while the rebuild runs: the group wasn't
 /// there when the rebuild locked its groups, so the rebuild leaves it to its
 /// pages, though its snapshot sees the group's rows. The page that created

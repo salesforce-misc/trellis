@@ -450,6 +450,25 @@ async fn collect_zero_groups(client: &mut Client, through: i64) -> Result<u64, S
                 }
                 return Err(err.into());
             }
+            // Planted bug (#1114): collect every zero group, whatever its
+            // basis and stamp. See `crate::plant`.
+            #[cfg(any(test, feature = "test-util"))]
+            if *basis && crate::plant::armed() == Some(crate::plant::Plant::GbEarlyZeroGc) {
+                let row = txn
+                    .query_one(
+                        &planted_collect_every_zero_group_sql(hidden, group_cols),
+                        &[&TOMBSTONE_BATCH, &through],
+                    )
+                    .await?;
+                let (deleted, early): (i64, i64) = (row.get(0), row.get(1));
+                crate::plant::fires(crate::plant::Plant::GbEarlyZeroGc, early > 0);
+                txn.commit().await?;
+                collected += deleted as u64;
+                if deleted < TOMBSTONE_BATCH {
+                    break;
+                }
+                continue;
+            }
             let deleted = if *basis {
                 txn.execute(&sql, &[&TOMBSTONE_BATCH, &through]).await?
             } else {
@@ -463,6 +482,23 @@ async fn collect_zero_groups(client: &mut Client, through: i64) -> Result<u64, S
         }
     }
     Ok(collected)
+}
+
+/// Planted bug `gb_early_zero_gc` (`crate::plant`): one zero-group GC
+/// batch on `hidden` that deletes up to `$1` zero groups whatever their basis
+/// and stamp, returning how many it deleted and how many of those the real
+/// rule keeps (a basis whose stamp is missing or above `$2`).
+#[cfg(any(test, feature = "test-util"))]
+fn planted_collect_every_zero_group_sql(hidden: &str, group_cols: &str) -> String {
+    format!(
+        "with d as ( \
+             delete from {hidden} where ctid = any(array( \
+                 select ctid from {hidden} where __zero \
+                 order by {group_cols} limit $1 for update skip locked)) \
+             returning __basis is not null and coalesce(__stamp > $2, true) as early \
+         ) \
+         select count(*), count(*) filter (where early) from d"
+    )
 }
 
 /// The plan of one zero-group GC batch's statement on the hidden table

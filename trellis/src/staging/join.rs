@@ -838,9 +838,17 @@ impl JoinTargetPlan {
                 .collect();
             let pj_not_null: Vec<String> = pj.iter().map(|c| format!("{c} is not null")).collect();
             let jk: Vec<String> = jc.iter().map(|c| format!("k.{c}")).collect();
+            #[cfg_attr(not(any(test, feature = "test-util")), allow(unused_mut))]
+            let mut matches_new = "j.__matches + coalesce(x.__d, 0)";
+            // Planted bug (#1114): a key's matches never cross zero. See
+            // `crate::plant`.
+            #[cfg(any(test, feature = "test-util"))]
+            if crate::plant::armed() == Some(crate::plant::Plant::JoinDropFlip) {
+                matches_new = "j.__matches";
+            }
             ctes.push(format!(
                 "jd as ( \
-                     select {jk}, (j.__matches + coalesce(x.__d, 0) = 0)::int as __new, \
+                     select {jk}, ({matches_new} = 0)::int as __new, \
                             (j.__matches = 0)::int as __old \
                      from (select {pj_as} from {dp} where {pj_nn} \
                            union select {mj_as} from {dm}) k \
@@ -904,6 +912,52 @@ impl JoinTargetPlan {
             j_x = key_eq("j", &jc, "x", &jc),
         ));
         format!("with {} select 1", ctes.join(", "))
+    }
+}
+
+impl JoinTargetPlan {
+    /// Planted bug `join_no_j_lock` (`crate::plant`): [`Self::j_insert_sql`]
+    /// for the keys with no `J` row only, so a key that has one is never
+    /// touched, and so never waited on.
+    #[cfg(any(test, feature = "test-util"))]
+    fn planted_j_insert_missing_sql(&self) -> String {
+        let cols = quoted(&self.j_cols);
+        let matched: Vec<String> = cols.iter().map(|c| format!("j.{c} = k.{c}")).collect();
+        format!(
+            "insert into {j} ({cols}) select {cols} from ({keys}) k \
+             where not exists (select 1 from {j} j where {matched}) \
+             order by {cols} on conflict do nothing",
+            j = self.j_ident,
+            cols = cols.join(", "),
+            keys = self.staged_keys_sql(),
+            matched = matched.join(" and "),
+        )
+    }
+
+    /// Planted bug `join_drop_flip` (`crate::plant`): how many keys the
+    /// page's joined-side changes move across zero matches, read before the
+    /// product adds them to `J.matches`.
+    #[cfg(any(test, feature = "test-util"))]
+    fn planted_flips_sql(&self) -> String {
+        let jc = quoted(&self.j_cols);
+        let mj = quoted(&self.joined.join_cols);
+        let mj_as: Vec<String> = mj
+            .iter()
+            .zip(&jc)
+            .map(|(c, j)| format!("{c} as {j}"))
+            .collect();
+        let j_x: Vec<String> = jc.iter().map(|c| format!("j.{c} = x.{c}")).collect();
+        format!(
+            "select count(*) from (select {mj_as}, sum(__dn) as __d from {deltas} \
+                                   group by {mj}) x \
+             join {j} j on {j_x} \
+             where x.__d <> 0 and (j.__matches = 0) <> (j.__matches + x.__d = 0)",
+            mj_as = mj_as.join(", "),
+            deltas = self.joined.deltas,
+            mj = mj.join(", "),
+            j = self.j_ident,
+            j_x = j_x.join(" and "),
+        )
     }
 }
 
@@ -974,7 +1028,6 @@ async fn write_locked(
     mutations: &mut TargetMutations,
     build: bool,
 ) -> Result<(usize, usize), ApplyError> {
-    let sides = [&plan.from, &plan.joined];
     // 2. The pair's lock row, a truncate's clear, `J`, then the cells.
     let mode = if plan.truncate.is_some() {
         "update"
@@ -990,16 +1043,55 @@ async fn write_locked(
     if let Some(truncate) = &plan.truncate {
         deleted += clear(txn, plan, truncate, mutations).await?;
     }
+    // Planted bug (#1114): read the other side's partials before the `J`
+    // locks, for a page that writes one side. See `crate::plant`.
+    #[cfg(any(test, feature = "test-util"))]
+    let stale_other = if crate::plant::fires(
+        crate::plant::Plant::JoinOtherSideBeforeJ,
+        !build && plan.from.writes() != plan.joined.writes(),
+    ) {
+        let other = if plan.from.writes() {
+            &plan.joined
+        } else {
+            &plan.from
+        };
+        let copy = "pg_temp.trellis_planted_other_side";
+        txn.batch_execute(&format!(
+            "drop table if exists {copy}; \
+             create temporary table {copy} on commit drop as select * from {}",
+            other.plan.hidden()
+        ))
+        .await?;
+        Some((other.plan.hidden().to_string(), copy))
+    } else {
+        None
+    };
     pause!(txn, BeforeJoinLock, &plan.target);
-    txn.execute(&plan.j_insert_sql(), &[]).await?;
+    // Planted bug (#1114): insert the missing `J` rows and lock none. See
+    // `crate::plant`.
+    #[cfg(any(test, feature = "test-util"))]
+    let skip_j_lock = crate::plant::fires(crate::plant::Plant::JoinNoJLock, !build);
+    #[cfg(not(any(test, feature = "test-util")))]
+    let skip_j_lock = false;
+    #[cfg(any(test, feature = "test-util"))]
+    if skip_j_lock {
+        txn.execute(&plan.planted_j_insert_missing_sql(), &[])
+            .await?;
+    }
+    if !skip_j_lock {
+        txn.execute(&plan.j_insert_sql(), &[]).await?;
+    }
     pause!(txn, AfterJoinKeyInsert, &plan.target);
     let waiting_since = std::time::Instant::now();
-    txn.execute(&plan.j_lock_sql(), &[]).await?;
+    if !skip_j_lock {
+        txn.execute(&plan.j_lock_sql(), &[]).await?;
+    }
     // A build's wait for the keys its pages hold is not a page's contention.
     if !build {
         crate::metrics::record_join_lock_wait(&plan.target, waiting_since.elapsed());
     }
     pause!(txn, AfterJoinLock, &plan.target);
+    let sides = [&plan.from, &plan.joined];
     for side in sides {
         if side.writes() {
             txn.execute(&side.plan.lock_sql(), &[]).await?;
@@ -1026,7 +1118,21 @@ async fn write_locked(
     // 4. The product into `T`'s staging, and `J.matches`. With nested
     // loops left on: its joins look up the other side's cells of a key
     // through the cell identity's index.
-    txn.execute(&plan.product_sql(), &[]).await?;
+    let product = plan.product_sql();
+    // The planted bug's copy of the other side, read in its place.
+    #[cfg(any(test, feature = "test-util"))]
+    let product = match &stale_other {
+        Some((hidden, copy)) => product.replace(hidden.as_str(), copy),
+        None => product,
+    };
+    // Planted bug (#1114): count the pages whose product the dropped flip
+    // changes. See `crate::plant`.
+    #[cfg(any(test, feature = "test-util"))]
+    if plan.left && crate::plant::armed() == Some(crate::plant::Plant::JoinDropFlip) {
+        let flips: i64 = txn.query_one(&plan.planted_flips_sql(), &[]).await?.get(0);
+        crate::plant::fires(crate::plant::Plant::JoinDropFlip, flips > 0);
+    }
+    txn.execute(&product, &[]).await?;
     // 5. `T`: lock the changed groups, sorted, then write them. A build
     // locks every group of the visible target and of `T` as well, and
     // compares each visible row with the one the target holds.
@@ -1034,7 +1140,17 @@ async fn write_locked(
         group_basis::enumerate_target_groups(txn, &plan.t).await?;
     }
     pause!(txn, BeforeJoinTargetLock, &plan.target);
-    txn.execute(&plan.t.lock_sql(), &[]).await?;
+    // Planted bug (#1114): insert the missing `T` groups and lock none. See
+    // `crate::plant`.
+    #[cfg(any(test, feature = "test-util"))]
+    let t_lock = if crate::plant::fires(crate::plant::Plant::JoinTSkipLock, !build) {
+        plan.t.planted_insert_missing_sql()
+    } else {
+        plan.t.lock_sql()
+    };
+    #[cfg(not(any(test, feature = "test-util")))]
+    let t_lock = plan.t.lock_sql();
+    txn.execute(&t_lock, &[]).await?;
     pause!(txn, AfterJoinTargetLock, &plan.target);
     let (written, removed) = if build {
         group_basis::apply_join_build_groups(txn, &plan.t, mutations).await?

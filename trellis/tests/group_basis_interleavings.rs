@@ -463,6 +463,59 @@ async fn r2_one_page_applies_only_the_transactions_its_groups_basis_missed() {
     assert_oracle(&mut d).await;
 }
 
+/// R2 by visibility, not position (#558 exp 2's scenario 10): a writer's
+/// change is in flight when a recompute of its group takes its snapshot, so
+/// the basis doesn't see it, though the writer's transaction id is below the
+/// snapshot's `xmax` (a later transaction completed first). The page applies it. A filter that orders the change
+/// against the basis (planted bug `gb_lsn_not_visibility`) refuses it, and
+/// the group loses it.
+#[tokio::test]
+async fn r2_a_change_in_flight_at_the_basis_applies() {
+    let mut d = start().await;
+    step(&mut d, "insert into public.src values (1, 1, 10)").await;
+    let writer = d.user().await;
+    writer
+        .batch_execute("begin; insert into public.src values (2, 1, 5)")
+        .await
+        .expect("the in-flight write");
+    // A later transaction completes first, so the snapshot's `xmax` is past
+    // the writer's and lists it as in flight.
+    write(&d, "insert into public.src values (3, 2, 1)").await;
+    recompute(&d, &[1]).await.commit().await;
+    assert_eq!(partials(&d, 1).await, ["(1,1,10,t)"], "the basis missed it");
+    writer.batch_execute("commit").await.expect("commit");
+    let batch = d.seal().await;
+    d.drain(batch, "a").await;
+    assert_eq!(partials(&d, 1).await, ["(2,2,15,t)"]);
+    assert_oracle(&mut d).await;
+}
+
+/// R1 between pages: a page on a group waits at its lock statement for a
+/// page that has applied to the group and not committed, then applies
+/// against the committed row. A page that didn't lock the group (planted bug
+/// `gb_skip_group_lock`) reads the row before the first commits, and its
+/// update by `ctid` then finds the row moved and adds nothing.
+#[tokio::test]
+async fn r1_a_page_waits_for_a_page_that_applied_to_its_group() {
+    let mut d = start().await;
+    step(&mut d, "insert into public.src values (1, 1, 10)").await;
+    write(&d, "insert into public.src values (2, 1, 5)").await;
+    let first = d.seal().await;
+    write(&d, "insert into public.src values (3, 1, 1)").await;
+    let second = d.seal().await;
+    let mut held = d
+        .drain_frozen(first, "a", &[(PausePoint::AfterGroupUpsert, "public.agg")])
+        .await;
+    let frozen = held.reached(PausePoint::AfterGroupUpsert).await;
+    let page = d.drain_frozen(second, "b", &[]).await;
+    d.wait_blocked_behind(frozen.backend_pid).await;
+    d.release(&mut held, PausePoint::AfterGroupUpsert).await;
+    held.finish().await;
+    page.finish().await;
+    assert_eq!(partials(&d, 1).await, ["(3,3,16,f)"]);
+    assert_oracle(&mut d).await;
+}
+
 // ----------------------------------------------------------------------- F2
 
 /// F2: a key's changes on one page are never folded. Row 1 moves from group

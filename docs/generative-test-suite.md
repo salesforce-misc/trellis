@@ -332,14 +332,16 @@ generator refactors. Three artifact kinds:
 
 ### The baseline bar: no unknown failures
 
-The concurrent runtime's planted-bug sweep (`planted_bugs_are_caught` in
-`generative/tests/concurrent_convergence.rs`) runs a tier's seeded cases once
-unplanted, as the baseline, then once per planted bug, and judges each plant
-only on cases the baseline passed. **No unknown failure is accepted in a
-generative case**: the baseline passes only with **zero failures outside
-the quarantine list**, `generative/baseline-quarantine.txt`. The rule is the same
-for every tier (`cooling_key`, `hot_key`, `mid_burst`, `steady_load`,
-`cooling_backfill`).
+The planted-bug sweep (`generative::plant_sweep`; `planted_bugs_are_caught` in
+`generative/tests/concurrent_convergence.rs` for the concurrent tier,
+`join_planted_bugs_are_caught` in `generative/tests/join_convergence.rs` for the
+`JOIN` tier) runs a tier's seeded cases once unplanted, as the baseline, then
+once per planted bug, and judges each plant only on cases the baseline passed.
+**No unknown failure is accepted in a generative case**: the baseline passes
+only with **zero failures outside the quarantine list**,
+`generative/baseline-quarantine.txt`. The rule is the same for every tier
+(`cooling_key`, `hot_key`, `mid_burst`, `steady_load`, `cooling_backfill`,
+`join`).
 
 - **Each list entry** is one line, `<tier> <seed>:<case> #<issue> <what fails>`.
   The case numbering is the sweep's, as `GENERATIVE_PLANT_ONLY=<seed>:<case>` takes
@@ -471,15 +473,23 @@ Two structural notes for when faults enter the stream:
   sweep's baseline. The sweep fails on an entry whose issue is closed and
   reports one whose case passed, but it can't tell that a generator change
   has redrawn a listed case, so that change redoes the tier's entries.)
-- **Planted-bug sweeps and their baseline.** The concurrent sweep
-  (`planted_bugs_are_caught` in `generative/tests/concurrent_convergence.rs`)
-  re-runs generated cases with a deliberate bug planted and checks the tier
-  catches it, against an unplanted baseline that must have zero failures outside
-  the quarantine list (§6). A plant in the tier's `known_misses` is run and
-  reported but doesn't fail the sweep when uncaught, and one in `not_gated` (with
-  its reason) is left out of `GENERATIVE_PLANTS=all`. `lsn_only_skip` is in every
-  tier's `not_gated`: its window needs a drain order the engine's xmin fence, seal
-  gate and oldest-first claims rule out, so the deterministic pin `a_change_the_rederive_read_is_not_applied_again_aggregate`
+- **Planted-bug sweeps and their baseline.** The sweeps (`generative::plant_sweep`:
+  the concurrent tier's `planted_bugs_are_caught`, the `JOIN` tier's
+  `join_planted_bugs_are_caught`) re-run generated cases with a deliberate bug
+  planted (`trellis/src/plant.rs`) and check the tier catches it, against an
+  unplanted baseline that must have zero failures outside the quarantine list
+  (§6). A plant in the tier's `known_misses` is run and reported but doesn't fail
+  the sweep when uncaught, and one in `not_gated` (with its reason) is left out
+  of `GENERATIVE_PLANTS=all`. Each plant breaks one apply path (the group basis,
+  a `JOIN`, a 1-1 target, the ledger), and a tier leaves out the plants of paths
+  its programs never take: the concurrent tier draws no `JOIN`, the `JOIN` tier
+  nothing else, and with the group basis on (the default) the ledger takes no
+  aggregate, so the ledger's plants are gated only in a sweep run with
+  `TRELLIS_DEV_GROUP_BASIS=0` (which leaves out the group basis's instead). Each
+  plant is also pinned by a deterministic interleaving test that fails with it
+  armed, named in its doc comment. `lsn_only_skip` is in every tier's
+  `not_gated`: its window needs a drain order the engine's xmin fence, seal gate
+  and oldest-first claims rule out, so the deterministic pin `a_change_the_rederive_read_is_not_applied_again_aggregate`
   (`trellis/tests/ledger_interleavings.rs`) is its gate (#734).
 - Document how to run one property alone on a clean database; every property
   bootstraps what it reads, so it never depends on run order.

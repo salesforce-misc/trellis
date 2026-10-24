@@ -45,9 +45,13 @@
 //!    changes what the engine does here, so [`fired`] counts real
 //!    misbehavior, not visits. Keep the hook to a few lines: the correct
 //!    path must read exactly as it did before.
-//! 3. Run the concurrent tier's sweep for it (`generative/tests/
-//!    concurrent_convergence.rs`, `planted_bugs_are_caught`), and record its
-//!    catch rate next to the others in #557 / #627.
+//! 3. Pin it: name the deterministic interleaving test that fails with it
+//!    armed (`TRELLIS_TEST_PLANT=<name> cargo test -p trellis --test <file>
+//!    <test>`) in its doc comment.
+//! 4. Run the sweep of a tier that reaches it (`generative::plant_sweep`:
+//!    the concurrent tier's `planted_bugs_are_caught`, the `JOIN` tier's
+//!    `join_planted_bugs_are_caught`), list it in the `not_gated` of the
+//!    tiers that don't, and record its catch rate in #627.
 //!
 //! A plant is never "fixed": it is the regression the tier exists to catch.
 //! If the engine code it hooks is rewritten (epic #556 rewrites several),
@@ -106,6 +110,94 @@ pub enum Plant {
     /// be merged forever and the build never end, which a test sees as a
     /// hang, not a catch.
     MergeWithoutDelete,
+    /// ADR-0002 R1 on the group basis (#1100): a page on a group-basis
+    /// aggregate takes no lock on the groups it already has hidden rows for
+    /// (`staging::group_basis::lock_groups` only inserts the missing ones),
+    /// so its apply statement can read a group's row while another page is
+    /// between its own apply and its commit. Its update by `ctid` then finds
+    /// the row moved and adds nothing: the page's change is lost.
+    ///
+    /// Pinned by `group_basis_interleavings`'s
+    /// `r1_a_page_waits_for_a_page_that_applied_to_its_group`.
+    GbSkipGroupLock,
+    /// ADR-0002 R2 on the group basis (#1100): a page refuses a change by
+    /// its position against the group's basis (its transaction id below the
+    /// basis snapshot's `xmax`), not by the basis's visibility test
+    /// (`staging::group_basis`'s apply statement). A change whose
+    /// transaction was in flight when the basis was taken, which the basis
+    /// didn't see, is refused, and its group loses it. The group basis's
+    /// counterpart of `lsn_only_skip`.
+    ///
+    /// Pinned by `group_basis_interleavings`'s
+    /// `r2_a_change_in_flight_at_the_basis_applies`.
+    GbLsnNotVisibility,
+    /// #1043 F2: a page folds a key's ring rows into one side (the first
+    /// old image and the last new image, under the last transaction) before
+    /// staging them (`staging::group_basis::GroupTargetPlan::push`). A group
+    /// whose basis falls between two of the key's changes then keeps a row
+    /// the basis saw arrive and no change takes away.
+    ///
+    /// Pinned by `group_basis_interleavings`'s
+    /// `f2_a_basis_between_two_changes_of_a_key`.
+    GbFoldSidesPerKey,
+    /// ADR-0002 R4 (#1100): the zero-group GC (`staging::retire`'s
+    /// `collect_zero_groups`) collects every zero group, ignoring its basis
+    /// and its stamp against the contiguous drained prefix. A change the
+    /// basis saw but no page has drained yet then lands on a fresh row with
+    /// no basis and applies a second time. It covers a `JOIN`'s `P` and `M`
+    /// cells too, which the same statement collects.
+    ///
+    /// Pinned by `group_basis_interleavings`'s
+    /// `r4_a_zero_group_with_a_basis_stays_until_the_prefix_passes_its_stamp`
+    /// and `join_interleavings`'s `family13_…`.
+    GbEarlyZeroGc,
+    /// #1097 rule 4 (ADR-0002, "A build or rebuild"): a group-basis
+    /// rebuild reads the source's `GROUP BY` and takes its basis from a
+    /// snapshot taken before it locks its groups
+    /// (`staging::group_basis::rebuild`). A page that applies a change the
+    /// snapshot didn't see and commits before the locks has its change
+    /// overwritten by the absolute write, which never had it.
+    ///
+    /// Pinned by `group_basis_rebuild`'s
+    /// `a_page_that_commits_between_the_enumeration_and_the_locks`.
+    GbBuildSnapshotBeforeLocks,
+    /// ADR-0019 JR1 (#1108): a `JOIN` page takes no `J` lock on its keys
+    /// (`staging::join`'s `write_locked` inserts only the missing `J` rows).
+    /// Two pages that change one key from opposite sides without sharing a
+    /// `P` or `M` cell then each compute their product against the other
+    /// side's partials without the other's change, and the cross term
+    /// `ΔP ⊗ ΔM` is lost.
+    ///
+    /// Pinned by `join_interleavings`'s
+    /// `jr1_the_j_lock_orders_two_sides_with_no_shared_cell`.
+    JoinNoJLock,
+    /// ADR-0019 JR2 (#1108): a `JOIN` page that changes one side reads the
+    /// other side's partials for its product as they were before it took
+    /// its `J` locks (`staging::join`'s `write_locked`), not after. A page
+    /// of the other side that commits in between is missing from the
+    /// product, and the cross term `ΔP ⊗ ΔM` is lost.
+    ///
+    /// Pinned by `join_interleavings`'s `family1_…` (a page frozen before
+    /// its `J` lock).
+    JoinOtherSideBeforeJ,
+    /// ADR-0019 JR3 (#1108): a `LEFT JOIN` page computes each key's
+    /// unmatched term as if its `J.matches` never crossed zero
+    /// (`staging::join`'s product), so a key's first matching row, or its
+    /// last one leaving, doesn't move its `P` cells out of or into the
+    /// `NULL` joined group.
+    ///
+    /// Pinned by `join_interleavings`'s `family2_flips_left`.
+    JoinDropFlip,
+    /// #1356 (`staging::group_basis`'s "Zero groups"): a `JOIN` page takes
+    /// no lock on the `T` groups it already has hidden rows for, only
+    /// inserting the missing ones. The zero-group GC then collects a zero
+    /// `T` group between the page's lock statement and its write, which
+    /// finds no row and drops the delta; and two pages adding to one `T`
+    /// group lose one's delta as `gb_skip_group_lock`'s pages do.
+    ///
+    /// Pinned by `join_interleavings`'s
+    /// `a_collection_never_takes_a_t_group_from_under_its_page`.
+    JoinTSkipLock,
 }
 
 impl Plant {
@@ -118,6 +210,15 @@ impl Plant {
         Plant::EarlyTombstoneGc,
         Plant::ChunkWithoutEntryLock,
         Plant::MergeWithoutDelete,
+        Plant::GbSkipGroupLock,
+        Plant::GbLsnNotVisibility,
+        Plant::GbFoldSidesPerKey,
+        Plant::GbEarlyZeroGc,
+        Plant::GbBuildSnapshotBeforeLocks,
+        Plant::JoinNoJLock,
+        Plant::JoinOtherSideBeforeJ,
+        Plant::JoinDropFlip,
+        Plant::JoinTSkipLock,
     ];
 
     /// The name [`PLANT_ENV`] takes.
@@ -130,6 +231,15 @@ impl Plant {
             Plant::EarlyTombstoneGc => "early_tombstone_gc",
             Plant::ChunkWithoutEntryLock => "chunk_without_entry_lock",
             Plant::MergeWithoutDelete => "merge_without_delete",
+            Plant::GbSkipGroupLock => "gb_skip_group_lock",
+            Plant::GbLsnNotVisibility => "gb_lsn_not_visibility",
+            Plant::GbFoldSidesPerKey => "gb_fold_sides_per_key",
+            Plant::GbEarlyZeroGc => "gb_early_zero_gc",
+            Plant::GbBuildSnapshotBeforeLocks => "gb_build_snapshot_before_locks",
+            Plant::JoinNoJLock => "join_no_j_lock",
+            Plant::JoinOtherSideBeforeJ => "join_other_side_before_j",
+            Plant::JoinDropFlip => "join_drop_flip",
+            Plant::JoinTSkipLock => "join_t_skip_lock",
         }
     }
 

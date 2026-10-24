@@ -40,4 +40,6 @@ pub mod model;
 #[cfg(feature = "engine-access")]
 pub mod oracle;
 #[cfg(feature = "engine-access")]
+pub mod plant_sweep;
+#[cfg(feature = "engine-access")]
 pub mod run;

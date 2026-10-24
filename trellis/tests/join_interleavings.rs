@@ -733,6 +733,56 @@ async fn family1_fact_vs_dimension_move_pair_key() {
     fact_vs_dimension_move(Key::Pair, L).await;
 }
 
+/// JR1 where no cell is shared: a fact row and a dimension row arrive on one
+/// key, each in a group of its own, so the two pages lock no common `P` or
+/// `M` cell (the generative tier's `wide` shape) and only the `J` lock
+/// orders them. The second page waits for the first's commit, and its
+/// product reads the first's change. Without the `J` lock (planted bug
+/// `join_no_j_lock`) each page's product misses the other's change, and the
+/// cross term `ΔP ⊗ ΔM` is lost. Judged by the targets alone: the second
+/// page may queue or not.
+#[tokio::test]
+async fn jr1_the_j_lock_orders_two_sides_with_no_shared_cell() {
+    for (key, kind) in [(Key::Single, L), (Key::Single, I), (Key::Pair, L)] {
+        let mut lab = lab(key, &[kind]).await;
+        lab.step(&fill(
+            &format!(
+                "insert into public.a values ({{id}} + 1, {{g1}}, {{k}}, 10); \
+                 insert into public.b values ({{id}} + 1, {{k}}, {{g1}}, 100); {DECOYS}"
+            ),
+            1,
+            key,
+        ))
+        .await;
+        for paused in [0, 1] {
+            lab.race(
+                &format!(
+                    "{key:?}/{}: page {paused} frozen after its write",
+                    kind.name
+                ),
+                &fill(
+                    &format!(
+                        "insert into public.a values ({{id}} + 2 + {paused}0, {{g2}}, {{k}}, 5)"
+                    ),
+                    1,
+                    key,
+                ),
+                &fill(
+                    &format!(
+                        "insert into public.b values ({{id}} + 2 + {paused}0, {{k}}, {{g3}}, 7)"
+                    ),
+                    1,
+                    key,
+                ),
+                paused,
+                Some(PausePoint::AfterGroupUpsert),
+                None,
+            )
+            .await;
+        }
+    }
+}
+
 // ------------------------------------------------------------- family 2
 
 /// J1 family 2: a key's matched/unmatched flips against fact writes on it
@@ -2597,6 +2647,37 @@ async fn zero_t_group_collection_against_pages() {
         page.finish().await;
         lab.check(context).await;
     }
+}
+
+/// The first race of [`zero_t_group_collection_against_pages`], judged by
+/// the targets alone: a collection while a page holds its zero `T` group
+/// leaves the page's delta in place. A page that doesn't lock the `T` groups
+/// it has rows for (planted bug `join_t_skip_lock`) loses the group to the
+/// collection between its lock statement and its write, and its delta with
+/// it.
+#[tokio::test]
+async fn a_collection_never_takes_a_t_group_from_under_its_page() {
+    let mut lab = lab(Key::Single, &[I]).await;
+    lab.step(&fill(SEED, 1, Key::Single)).await;
+    lab.step("delete from public.a where id = 101").await;
+    let revive = lab
+        .sealed("insert into public.a values (101, 11, 1, 1, 7)")
+        .await;
+    let mut frozen = lab
+        .d
+        .drain_frozen(
+            revive,
+            "x",
+            &[(PausePoint::AfterJoinTargetLock, "public.i")],
+        )
+        .await;
+    frozen.reached(PausePoint::AfterJoinTargetLock).await;
+    lab.collect().await;
+    lab.d
+        .release(&mut frozen, PausePoint::AfterJoinTargetLock)
+        .await;
+    frozen.finish().await;
+    lab.check("a page frozen through the pass").await;
 }
 
 /// A build's enumeration of `T`'s groups reads without a lock, so the pass
