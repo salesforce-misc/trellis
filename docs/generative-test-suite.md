@@ -237,7 +237,9 @@ unblocks it.
   builds wrote rows. About
   one op in a hundred is a `TRUNCATE` of either table. The tables are
   unpartitioned and no definition reads another's target. Run it with `cargo
-  test -p generative --test join_convergence -- --ignored`.
+  test -p generative --test join_convergence -- --ignored`. Its planted-bug
+  sweep, `join_planted_bugs_are_caught`, gates the `JOIN` plants and the
+  group-basis writer's plants that a `JOIN`'s `P` and `M` cells share (§6).
 - **Partitioned-source convergence** *(ADR-0017)*. The first table of a
   generated program is a partitioned source: `HASH` over one to four leaves,
   `LIST` with a leaf per grain value or fewer and a `DEFAULT`, or `RANGE` over

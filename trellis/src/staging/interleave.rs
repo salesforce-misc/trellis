@@ -171,6 +171,18 @@
 //! old-path page of the same burst, needs that page held as much as one on
 //! its own path does.
 //!
+//! A group-basis build or rebuild stalls the same way between its
+//! enumeration and its lock statement ([`PausePoint::AfterRebuildEnumerate`],
+//! a busy build worker), where a page that commits is seen by a snapshot
+//! taken after the locks and missed by one taken before them (the
+//! `gb_build_snapshot_before_locks` plant).
+//!
+//! A commit stall ([`set_commit_stall`]) does the same at
+//! [`PausePoint::BeforeCommit`], between a page's last write and its
+//! commit: the window in which another page that skipped a lock reads what
+//! the first wrote but hasn't committed (the `JOIN` tier's `join_no_j_lock`
+//! and `join_t_skip_lock` plants).
+//!
 //! A stall is process-wide, like a plant, and an armed [`PauseScope`] point
 //! ignores it. Every page of every engine in the process takes it, so a
 //! harness that sets one runs nothing else in that process meanwhile (the
@@ -418,16 +430,27 @@ pub fn set_stall(max: Option<Duration>) {
     STALL_MAX_MICROS.store(micros, Ordering::Relaxed);
 }
 
-/// Sleeps a random time up to the set stall, at the two points it applies
-/// to.
+/// The longest commit stall, in microseconds; 0 for none. See the module
+/// doc's "Stalls".
+static COMMIT_STALL_MAX_MICROS: AtomicU64 = AtomicU64::new(0);
+
+/// Sets the longest stall a page takes between its last write and its
+/// commit ([`PausePoint::BeforeCommit`]), or clears it with `None`. See the
+/// module doc's "Stalls".
+pub fn set_commit_stall(max: Option<Duration>) {
+    let micros = max.map_or(0, |max| u64::try_from(max.as_micros()).unwrap_or(u64::MAX));
+    COMMIT_STALL_MAX_MICROS.store(micros, Ordering::Relaxed);
+}
+
+/// Sleeps a random time up to the set stall, at the points it applies to.
 async fn stall(point: PausePoint) {
-    if !matches!(
-        point,
-        PausePoint::AfterPlaceholders | PausePoint::AfterEntryLock
-    ) {
-        return;
-    }
-    let max = STALL_MAX_MICROS.load(Ordering::Relaxed);
+    let max = match point {
+        PausePoint::AfterPlaceholders
+        | PausePoint::AfterEntryLock
+        | PausePoint::AfterRebuildEnumerate => STALL_MAX_MICROS.load(Ordering::Relaxed),
+        PausePoint::BeforeCommit => COMMIT_STALL_MAX_MICROS.load(Ordering::Relaxed),
+        _ => return,
+    };
     if max == 0 {
         return;
     }

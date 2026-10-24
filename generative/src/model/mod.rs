@@ -445,6 +445,11 @@ pub struct ConcurrentPlan {
     /// tables; the others race the first burst. Every other tier leaves it
     /// off.
     pub settle_after_install: bool,
+    /// The longest stall each page takes between its last write and its
+    /// commit, for the whole run (`trellis::dev::interleave::set_commit_stall`),
+    /// or `None`. The JOIN tier (#1114) draws it for some cases, so a page
+    /// that skipped a lock reads another's uncommitted write now and then.
+    pub commit_stall: Option<std::time::Duration>,
 }
 
 /// A steady load on the engine, for a whole [`ConcurrentPlan`] (#720,

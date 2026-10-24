@@ -1797,6 +1797,7 @@ pub fn concurrent_plan(program: &Program, burst_size: usize, lanes: usize) -> Co
         bursts,
         steady_load: None,
         settle_after_install: false,
+        commit_stall: None,
     };
     for (def, &at) in program.def_install_after_op.iter().enumerate() {
         if at == 0 {

@@ -126,17 +126,20 @@
 //! starts with `TRELLIS_TEST_PLANT=<name>`. The sweep runs the same seeded
 //! cases unplanted and then once per plant, each in its own process, and
 //! reports each plant's catch rate and each seed's cases-to-first-catch.
-//! It draws from the cooling-key tier by default. Each tier gates the
-//! plants whose shapes it runs, and says why it doesn't gate the others
-//! (`SweepTier::not_gated`): the build plants, `skip_ledger_lock` and
-//! `early_tombstone_gc` are the steady-load tier's. `lsn_only_skip` is no
-//! tier's: the engine's own ordering (the discharge's xmin fence, the ring's
-//! seal gate, oldest-first claims) closes its window unless a drain order is
-//! forced by hand, so the deterministic pin
+//! It draws from the cooling-key tier by default. The sweep itself is
+//! `generative::plant_sweep`, which the `JOIN` tier shares. Each tier gates
+//! the plants whose shapes it runs, and says why it doesn't gate the others
+//! (`SweepTier::not_gated`): the group-basis plants that need an absolute
+//! write racing pages are the mid-burst, steady-load and cooling-backfill
+//! tiers'; the `JOIN` plants are the `JOIN` tier's; and with the group basis
+//! on (the default) the ledger's plants reach nothing, so a sweep gates them
+//! only with `TRELLIS_DEV_GROUP_BASIS=0`. `lsn_only_skip` is no tier's: the
+//! engine's own ordering (the discharge's xmin fence, the ring's seal gate,
+//! oldest-first claims) closes its window unless a drain order is forced by
+//! hand, so the deterministic pin
 //! `a_change_the_rederive_read_is_not_applied_again_aggregate`
 //! (`trellis/tests/ledger_interleavings.rs`) gates it (#734).
-//! `trellis/src/plant.rs`'s module doc says how to add a plant. Epic #556's
-//! milestones add theirs there (#623, #625), and this sweep is their gate.
+//! `trellis/src/plant.rs`'s module doc says how to add a plant.
 //!
 //! # A disk-backed cluster
 //!
@@ -1580,6 +1583,29 @@ const LEDGER_WITH_THE_GROUP_BASIS_ON: &str = "the ledger takes no aggregate whil
      the sweep with TRELLIS_DEV_GROUP_BASIS=0 to gate it until #1105 deletes the ledger";
 const GROUP_BASIS_WITH_THE_KNOB_OFF: &str =
     "TRELLIS_DEV_GROUP_BASIS=0 puts every aggregate on the ledger, so nothing reaches it";
+/// The 1-1 plants no tier gates while the group basis is on: with the
+/// ledger taking no aggregate, neither has a window a random schedule
+/// opens, and each is pinned by deterministic tests instead.
+const ONE_TO_ONE_PINNED_WITH_THE_GROUP_BASIS_ON: &[(&str, &str)] = &[
+    (
+        "early_tombstone_gc",
+        "it fires only when a segment drains past an older one, and with the group \
+         basis on no tier's drain does: it fired in 0 of 48 cases in each of the \
+         steady-load and cooling-backfill tiers on 42545471 (2026-10-23); the \
+         ledger_interleavings pins exp2_9_gc_waits_for_the_older_update_one_to_one, \
+         an_out_of_order_drain_holds_gc_back_one_to_one and \
+         gc_under_a_concurrent_reinsert_one_to_one gate it",
+    ),
+    (
+        "chunk_without_entry_lock",
+        "on a 1-1 target the unlocked chunk still writes the row its read saw and its \
+         entry rewrite still queues behind the page, so nothing diverges (it fired in \
+         21 of 48 steady-load cases and was caught in none on 42545471, 2026-10-23); it \
+         diverges only through the ledger's group deltas, and \
+         a_page_queues_behind_a_chunk_holding_its_key \
+         (one_to_one_build_interleavings) pins the lock",
+    ),
+];
 const NO_JOIN: &str = "the concurrent tier draws no `JOIN`; the JOIN tier \
                        (join_convergence.rs, join_planted_bugs_are_caught) gates it";
 
@@ -1628,7 +1654,14 @@ fn not_gated(listed: &[(&'static str, &'static str)]) -> Vec<(&'static str, &'st
         )
     };
     let mut out: Vec<(&'static str, &'static str)> = listed.to_vec();
-    for (plant, why) in not_on_path(&off_path, why).chain(not_on_path(&[PlantPath::Join], NO_JOIN))
+    let pinned = if trellis::dev::staging::group_basis_enabled() {
+        ONE_TO_ONE_PINNED_WITH_THE_GROUP_BASIS_ON
+    } else {
+        &[]
+    };
+    for (plant, why) in not_on_path(&off_path, why)
+        .chain(not_on_path(&[PlantPath::Join], NO_JOIN))
+        .chain(pinned.iter().copied())
     {
         if !out.iter().any(|(listed, _)| *listed == plant) {
             out.push((plant, why));

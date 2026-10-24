@@ -171,11 +171,11 @@ pub enum Plant {
     /// Pinned by `join_interleavings`'s
     /// `jr1_the_j_lock_orders_two_sides_with_no_shared_cell`.
     JoinNoJLock,
-    /// ADR-0019 JR2 (#1108): a `JOIN` page that changes one side reads the
-    /// other side's partials for its product as they were before it took
-    /// its `J` locks (`staging::join`'s `write_locked`), not after. A page
-    /// of the other side that commits in between is missing from the
-    /// product, and the cross term `ΔP ⊗ ΔM` is lost.
+    /// ADR-0019 JR2 (#1108): a `JOIN` page computes its product from each
+    /// side's partials as they were before it took its `J` locks, plus its
+    /// own changes (`staging::join`'s `write_locked`), not as they are under
+    /// the locks. A page of the other side that commits in between is
+    /// missing from the product, and the cross term `ΔP ⊗ ΔM` is lost.
     ///
     /// Pinned by `join_interleavings`'s `family1_…` (a page frozen before
     /// its `J` lock).

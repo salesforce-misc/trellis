@@ -34,7 +34,10 @@
 //! 2 to 6 drain workers sealing every 20 to 200 ms. A burst past the
 //! engine's split threshold can seal into one batch whose parts several
 //! workers claim; the coverage report's `drain` line says how often that
-//! happened. Every burst is checked
+//! happened. About half the cases also stall every page for a random time
+//! of up to 5 to 40 ms between its last write and its commit
+//! (`ConcurrentPlan::commit_stall`), so two pages of one key's opposite
+//! sides overlap there, where only the `J` lock orders them. Every burst is checked
 //! once it settles, and at the end every definition must still be `live`
 //! (a `JOIN` that halted would otherwise only show as a stale target).
 //!
@@ -100,6 +103,8 @@ struct JoinCoverage {
     cases_building_over_rows: usize,
     /// Cases that settled their up-front definitions over empty tables.
     cases_settled: usize,
+    /// Cases whose pages stalled before their commits.
+    cases_commit_stalled: usize,
     /// Read back from the engine: cases whose run moved the build-rows
     /// counter, its total over the run, and the cases with a build over rows
     /// in the model whose run didn't move it.
@@ -150,6 +155,7 @@ impl JoinCoverage {
         let builds = build_coverage(&case.program, &case.plan);
         self.cases_building_over_rows += usize::from(builds.builds_over_rows() > 0);
         self.cases_settled += usize::from(case.plan.settle_after_install);
+        self.cases_commit_stalled += usize::from(case.plan.commit_stall.is_some());
         self.builds.add(&builds);
         self.coverage.record_program(&case.program);
         self.coverage
@@ -186,6 +192,11 @@ impl std::fmt::Display for JoinCoverage {
             f,
             "ops: {} on ja, {} on jb, {} of them truncates",
             self.from_ops, self.joined_ops, self.truncates
+        )?;
+        writeln!(
+            f,
+            "commit stalls: {} of {} cases",
+            self.cases_commit_stalled, self.cases
         )?;
         let b = &self.builds;
         writeln!(
