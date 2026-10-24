@@ -23,7 +23,7 @@ use trellis::defs::ast::ValueType;
 use trellis::defs::{create_aggregate_target_table, create_definition, parse};
 use trellis::staging::apply::{self, DrainHooks};
 use trellis::staging::{
-    HeartbeatDaemon, HeartbeatDaemonConfig, SegmentState, StagedWatermark, claim, liveness, seal,
+    HeartbeatDaemon, HeartbeatDaemonConfig, SegmentState, claim, liveness, seal,
 };
 
 /// Claims in a transaction of its own and commits it. `claim::claim` takes a
@@ -530,7 +530,6 @@ async fn a_long_page_leaves_its_claim_stamped_at_commit_time_not_transaction_sta
             "worker",
             1,
             "trellis_liveness_test",
-            &StagedWatermark::saturated(),
             40,
             &mut hooks,
         )

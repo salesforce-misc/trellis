@@ -36,9 +36,7 @@ use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use trellis::defs::{TransformStatus, create_definition, create_target_table, install_definition};
 use trellis::staging::apply;
-use trellis::staging::{
-    FoldedChange, IsolationOutcome, LastChange, StagedWatermark, isolate_and_evict,
-};
+use trellis::staging::{FoldedChange, IsolationOutcome, LastChange, isolate_and_evict};
 
 // ---------------------------------------------------------------------
 // A minimal capturing `tracing_subscriber::Layer`
@@ -309,7 +307,6 @@ async fn compute_and_apply_spans_fire_with_batch_and_transform_fields() {
         "span_test_worker",
         1,
         "trellis_span_test",
-        &StagedWatermark::saturated(),
     )
     .await
     .expect("drain_once")
@@ -561,7 +558,6 @@ async fn a_below_threshold_charge_is_logged_as_a_warning_naming_the_key() {
         "span_test_worker",
         1,
         "trellis_span_test",
-        &StagedWatermark::saturated(),
     )
     .await;
     assert!(

@@ -3339,6 +3339,68 @@ mod catch_up_tests {
             .get(0)
     }
 
+    /// A target catch-up's discharge enumerates for the readers it parked
+    /// (#1322, #1115): they are `catching_up`, which
+    /// [`crate::defs::catalog::table_has_reader`] counts, while a `live`
+    /// reader of a table whose marker no catch-up parked doesn't count.
+    #[tokio::test]
+    async fn a_target_catch_up_marker_counts_the_readers_it_parked() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let client = connect(&db).await;
+        client
+            .batch_execute(
+                "insert into source_table_versions (source_table, version) \
+                 values ('public.s', 1), ('public.u', 1)",
+            )
+            .await
+            .expect("seed source_table_versions");
+        let insert = async |target: &str, source: &str, status: &str| -> i64 {
+            client
+                .query_one(
+                    "insert into transform_definitions \
+                     (target_table, source_table, source_version, definition_text, status) \
+                     values ($1, $2, 1, 'TRANSFORM t FROM s SELECT id AS x', $3) returning id",
+                    &[&target, &source, &status],
+                )
+                .await
+                .expect("seed a definition")
+                .get(0)
+        };
+        let upstream = insert("public.u", "public.s", "live").await;
+        insert("public.r1", "public.u", "live").await;
+        let generation = async || -> i64 {
+            client
+                .query_one(
+                    "select generation from pending_backfill where table_name = 'public.u'",
+                    &[],
+                )
+                .await
+                .expect("read the marker's generation")
+                .get(0)
+        };
+
+        park_marker(&client, "public.u")
+            .await
+            .expect("park a plain marker");
+        assert!(
+            !crate::defs::catalog::table_has_reader(&client, "public.u", generation().await)
+                .await
+                .expect("ask for a reader"),
+            "a live reader alone needs no enumeration"
+        );
+
+        park_target_catchup_if_read(&client, upstream)
+            .await
+            .expect("park the target catch-up");
+        assert!(
+            crate::defs::catalog::table_has_reader(&client, "public.u", generation().await)
+                .await
+                .expect("ask for a reader"),
+            "the catch-up's discharge enumerates for the reader it parked"
+        );
+    }
+
     /// Issue #476: an upstream rebuild writes its target outside the seam,
     /// so finishing it parks a catch-up on that target and moves each
     /// applying reader that is `live` to `catching_up` until it has run. A
@@ -3726,7 +3788,6 @@ mod catch_up_tests {
     /// Seals and drains until nothing is pending: a bounded loop, not a
     /// convergence wait.
     async fn drain_all(pool: &crate::pool::Pool, client: &mut tokio_postgres::Client) {
-        let watermark = StagedWatermark::saturated();
         for _ in 0..16 {
             let outcome = crate::staging::seal::seal_phase1(client)
                 .await
@@ -3740,7 +3801,6 @@ mod catch_up_tests {
                 "catch_up_tests",
                 1,
                 "wake",
-                &watermark,
             )
             .await
             .expect("drain_once")

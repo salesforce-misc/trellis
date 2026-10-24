@@ -428,10 +428,11 @@ impl HeldKey {
     }
 
     /// Merges a later-parked change (`other`) into this held row: the earlier
-    /// segment's image and spelling, the earliest origin (unknown if either
-    /// is) and source-change time, and the deepest `hop_gen`. On a segment tie the row already held wins, as the
-    /// park's `on conflict` does. Every other field is order-free, so a key's
-    /// row is the same whatever order its parks commit in.
+    /// segment's image and spelling, the earliest origin (unknown if either is)
+    /// and source-change time, and the deepest `hop_gen`. On a segment tie the
+    /// row already held wins, as the park's `on conflict` does. Every other
+    /// field is order-free, so a key's row is the same whatever order its parks
+    /// commit in.
     pub(crate) fn merge(self, other: HeldKey) -> HeldKey {
         let (first, second) = if other.seg_seq < self.seg_seq {
             (other, self)

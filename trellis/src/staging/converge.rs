@@ -49,10 +49,9 @@ use super::error::StagingError;
 /// reason about "every ring table" shares this rather than each hand-rolling
 /// its own unroll of `RING_SIZE`.
 ///
-/// `pub(crate)` (issue #132, epic #127): `apply`'s guard (c) in-flight check
-/// needs the exact same "reason about every ring table" pattern, scoped to a
-/// specific `src_table`/join-key/`lsn` predicate instead of this module's
-/// own origin-lsn-threshold one — see `apply::from_side_change_in_flight`.
+/// `pub(crate)`: other modules' ring scans (`defs::catalog`,
+/// `staging::self_check_ring`) share the same "reason about every ring
+/// table" pattern.
 pub(crate) fn per_ring_table(sep: &str, f: impl Fn(i16, &str) -> String) -> String {
     (0..RING_SIZE)
         .map(|slot| {

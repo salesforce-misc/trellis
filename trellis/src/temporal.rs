@@ -85,10 +85,11 @@
 //! Everything above measures one renderer: `<col>::text`. That is necessary
 //! and it used not to be sufficient, because **Trellis used to turn columns
 //! into text in two different ways.** Most paths cast per column, but the
-//! live-row reads used to build a whole row body at once —
-//! `to_jsonb(t.*)` followed by `jsonb_each_text` — in `staging::apply`'s
-//! `read_live_rows_batch`, in `staging::quarantine`'s column sweep, and in the `RETURNING to_jsonb(t.*)::text` old-image
-//! captures `staging::apply` used for issue #196.
+//! live-row reads used to build a whole row body at once — `to_jsonb(t.*)`
+//! followed by `jsonb_each_text` — in `staging::apply`'s
+//! `read_live_rows_batch`, in `staging::quarantine`'s column sweep, and in the
+//! `RETURNING to_jsonb(t.*)::text` old-image captures `staging::apply` used for
+//! issue #196.
 //! `to_jsonb` does not call the type's output function for datetimes; it uses
 //! `jsonb`'s own ISO-8601 writer. Read off a live server, one row, one
 //! session, both renderings side by side:
@@ -113,9 +114,9 @@
 //! during #113's review: a `timestamp` group key seeded both ways yielded
 //! `total = 20` where the correct answer is `15`. It also used to reach
 //! `MIN`/`MAX`, because those return one of their inputs *verbatim*: a fold
-//! over rows read that way could return the `T`-spelled string where a server-side `min()` returns the space-spelled
-//! one, which ADR-0013's byte-exact cross-check would report as a
-//! divergence.
+//! over rows read that way could return the `T`-spelled string where a
+//! server-side `min()` returns the space-spelled one, which ADR-0013's
+//! byte-exact cross-check would report as a divergence.
 //!
 //! **Issue #248 fixed this** by replacing every `to_jsonb(t.*)` call site
 //! above with an explicit per-column `jsonb_build_object('<col>',

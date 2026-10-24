@@ -42,8 +42,7 @@ use trellis::locks::USER_TABLE_DDL_LOCK_TIMEOUT;
 use trellis::staging::converge::table_changes_pending_through;
 use trellis::staging::self_check::CheckPageExt;
 use trellis::staging::{
-    MIN_ROWS_TO_SPLIT, StagedWatermark, TRUNCATE_SENTINEL_KEY, apply, has_pending,
-    retire_drained_segments, seal,
+    MIN_ROWS_TO_SPLIT, TRUNCATE_SENTINEL_KEY, apply, has_pending, retire_drained_segments, seal,
 };
 
 const TEST_NAME: &str = "capture_install_test";
@@ -1382,8 +1381,7 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
 
 /// Drains every bucket of `batch`.
 async fn drain_batch(pool: &trellis::Pool, batch: i64) {
-    let watermark = StagedWatermark::saturated();
-    while apply::drain_once(pool, batch, TEST_NAME, 1, WAKE, &watermark)
+    while apply::drain_once(pool, batch, TEST_NAME, 1, WAKE)
         .await
         .expect("drain_once")
         .is_some()

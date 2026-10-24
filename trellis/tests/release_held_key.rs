@@ -22,7 +22,7 @@ use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ValueType;
 use trellis::staging::interleave::PausePoint;
 use trellis::staging::self_check::CheckPageExt;
-use trellis::staging::{ApplyError, DEFAULT_DEATH_THRESHOLD, StagedWatermark, apply};
+use trellis::staging::{ApplyError, DEFAULT_DEATH_THRESHOLD, apply};
 use trellis::{
     Config, ErrorCode, SelfCheckMode, SelfCheckOutcome, Trellis, TrellisError, TrellisOptions,
 };
@@ -64,16 +64,7 @@ async fn trellis(d: &Driver) -> Trellis {
 async fn drain_through_evictions(d: &Driver, batch: i64) -> usize {
     let mut failures = 0;
     loop {
-        match apply::drain_once(
-            d.pool(),
-            batch,
-            "worker",
-            1,
-            drain_driver::WAKE,
-            &StagedWatermark::saturated(),
-        )
-        .await
-        {
+        match apply::drain_once(d.pool(), batch, "worker", 1, drain_driver::WAKE).await {
             Ok(Some(_)) => continue,
             Ok(None) => return failures,
             Err(err) => {

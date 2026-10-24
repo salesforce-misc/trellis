@@ -3382,8 +3382,7 @@ mod db_tests {
 
     /// Drains sealed segment `seg` until no page is left: a bounded loop.
     async fn drain(pool: &Pool, seg: i64) -> Result<(), crate::staging::apply::ApplyError> {
-        let watermark = crate::staging::watermark::StagedWatermark::saturated();
-        while crate::staging::apply::drain_once(pool, seg, "issue_883", 1, "wake", &watermark)
+        while crate::staging::apply::drain_once(pool, seg, "issue_883", 1, "wake")
             .await?
             .is_some()
         {}

@@ -79,8 +79,7 @@ async fn capture_pass(raw: &mut Client, pool: &trellis::Pool) -> reconcile::Pass
 /// Seals and drains through the engine's own apply path until nothing is
 /// pending anywhere in the ring (as in `capture_join.rs`).
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
-    use trellis::staging::{StagedWatermark, apply, has_pending, retire_drained_segments, seal};
-    let watermark = StagedWatermark::saturated();
+    use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
     for _ in 0..16 {
         let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
         seal::seal_phase2(client, outcome.sealed_seg_seq, "capture_schema_change_wake")
@@ -92,7 +91,6 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
             "capture_schema_change_test",
             1,
             "trellis_capture_schema_change_test",
-            &watermark,
         )
         .await
         .expect("drain_once")
@@ -1370,7 +1368,7 @@ mod error_log {
 /// fixed, resuming each one rebuilds it to what a fresh build derives.
 #[tokio::test]
 async fn a_halting_key_pauses_its_closure_once_and_the_rest_of_the_page_drains() {
-    use trellis::staging::{StagedWatermark, apply, has_pending, seal};
+    use trellis::staging::{apply, has_pending, seal};
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
@@ -1396,7 +1394,6 @@ async fn a_halting_key_pauses_its_closure_once_and_the_rest_of_the_page_drains()
         "capture_schema_change_test",
         1,
         "trellis_capture_schema_change_test",
-        &StagedWatermark::saturated(),
     )
     .await
     .expect("the halt pauses its closure and the page commits");
@@ -1616,7 +1613,7 @@ async fn resuming_a_halted_closure_before_the_key_is_fixed_is_refused() {
 #[tokio::test]
 async fn peers_halting_on_one_closure_record_one_stop() {
     use trellis::staging::apply::{self, ApplyError};
-    use trellis::staging::{MIN_ROWS_TO_SPLIT, StagedWatermark, halt_closure, seal};
+    use trellis::staging::{MIN_ROWS_TO_SPLIT, halt_closure, seal};
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
@@ -1646,7 +1643,6 @@ async fn peers_halting_on_one_closure_record_one_stop() {
                 claimed_by,
                 2,
                 "trellis_capture_schema_change_test",
-                &StagedWatermark::saturated(),
             )
             .await?
             .is_some()

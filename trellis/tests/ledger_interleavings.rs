@@ -38,7 +38,7 @@ use tokio_postgres::types::PgLsn;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ValueType;
 use trellis::staging::interleave::PausePoint;
-use trellis::staging::{CdcOp, StagedChange, StagedWatermark, apply, claim};
+use trellis::staging::{CdcOp, StagedChange, apply, claim};
 
 const SRC: &str = "public.src";
 
@@ -2357,17 +2357,9 @@ async fn a_stalled_claim_does_not_reclaim_buckets_a_peer_drained_meanwhile() {
 
     let drain = |worker: &'static str| {
         let pool = d.pool().clone();
-        tokio::spawn(async move {
-            apply::drain_once(
-                &pool,
-                batch,
-                worker,
-                1,
-                drain_driver::WAKE,
-                &StagedWatermark::saturated(),
-            )
-            .await
-        })
+        tokio::spawn(
+            async move { apply::drain_once(&pool, batch, worker, 1, drain_driver::WAKE).await },
+        )
     };
     let b = drain("b");
     d.wait_blocked_behind(gate_pid).await;

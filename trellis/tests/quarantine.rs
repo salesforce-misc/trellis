@@ -27,9 +27,7 @@ use trellis::defs::{
 };
 use trellis::staging::apply::{self, ApplyError, MAX_HOP_GEN};
 use trellis::staging::converge;
-use trellis::staging::{
-    ChargedKey, FoldedChange, IsolationOutcome, LastChange, StagedWatermark, isolate_and_evict,
-};
+use trellis::staging::{ChargedKey, FoldedChange, IsolationOutcome, LastChange, isolate_and_evict};
 
 /// Connects directly to `dsn` (bypassing `trellis::Pool`), matching
 /// `apply.rs`/`converge.rs`'s convention.
@@ -258,17 +256,10 @@ async fn poison_marker_exists(client: &Client, src_table: &str, key: &str) -> bo
 async fn drain(pool: &trellis::Pool, seg_seq: i64, claimed_by: &str) -> apply::ApplyOutcome {
     // Issue #132: a throwaway, always-caught-up watermark — no live
     // capture runs in this test file, and it isn't exercising guard (a).
-    apply::drain_once(
-        pool,
-        seg_seq,
-        claimed_by,
-        1,
-        "trellis_quarantine_test",
-        &StagedWatermark::saturated(),
-    )
-    .await
-    .expect("drain_once")
-    .expect("drain_once must claim and drain something")
+    apply::drain_once(pool, seg_seq, claimed_by, 1, "trellis_quarantine_test")
+        .await
+        .expect("drain_once")
+        .expect("drain_once must claim and drain something")
 }
 
 /// Scenario: a poisoned key's parked contribution keeps its original
@@ -370,15 +361,7 @@ async fn an_innocent_batch_mate_is_not_charged_and_the_error_surfaces_unattribut
     .await;
 
     let seg_seq = seal_active_segment(&mut client).await;
-    let result = apply::drain_once(
-        &db.pool,
-        seg_seq,
-        "worker",
-        1,
-        "trellis_quarantine_test",
-        &StagedWatermark::saturated(),
-    )
-    .await;
+    let result = apply::drain_once(&db.pool, seg_seq, "worker", 1, "trellis_quarantine_test").await;
     match result {
         Err(ApplyError::Eval(_)) => {}
         other => panic!("expected an Eval error to surface, got {other:?}"),
@@ -618,15 +601,7 @@ async fn a_halting_schema_error_is_never_quarantined_and_pauses_what_it_reaches(
         .expect("halting_stop_stats before");
 
     let seg_seq = seal_active_segment(&mut client).await;
-    let result = apply::drain_once(
-        &db.pool,
-        seg_seq,
-        "worker",
-        1,
-        "trellis_quarantine_test",
-        &StagedWatermark::saturated(),
-    )
-    .await;
+    let result = apply::drain_once(&db.pool, seg_seq, "worker", 1, "trellis_quarantine_test").await;
     match result {
         Ok(Some(outcome)) => assert!(outcome.batch_drained, "the page drains"),
         other => panic!("expected the halt to pause what it reaches and drain, got {other:?}"),
@@ -737,16 +712,7 @@ async fn a_halting_failure_an_isolation_probe_meets_pauses_what_it_reaches() {
     loop {
         drains += 1;
         assert!(drains <= 10, "the page never drained");
-        match apply::drain_once(
-            &db.pool,
-            seg_seq,
-            "worker",
-            1,
-            "trellis_quarantine_test",
-            &StagedWatermark::saturated(),
-        )
-        .await
-        {
+        match apply::drain_once(&db.pool, seg_seq, "worker", 1, "trellis_quarantine_test").await {
             Ok(_) => break,
             Err(err) => assert!(
                 err.to_string().contains("small"),
@@ -1326,15 +1292,7 @@ async fn a_batch_failure_that_only_reproduces_combined_surfaces_unblamed() {
     .await;
     let seg1 = seal_active_segment(&mut client).await;
 
-    let result = apply::drain_once(
-        &db.pool,
-        seg1,
-        "worker",
-        1,
-        "trellis_quarantine_test",
-        &StagedWatermark::saturated(),
-    )
-    .await;
+    let result = apply::drain_once(&db.pool, seg1, "worker", 1, "trellis_quarantine_test").await;
     match &result {
         Err(ApplyError::Db(db_err)) => {
             assert_eq!(
@@ -1416,16 +1374,7 @@ async fn repeated_real_failures_cross_the_eviction_threshold_and_the_batch_still
 
     let mut real_failures = 0;
     let outcome = loop {
-        match apply::drain_once(
-            &db.pool,
-            seg_seq,
-            "worker",
-            1,
-            "trellis_quarantine_test",
-            &StagedWatermark::saturated(),
-        )
-        .await
-        {
+        match apply::drain_once(&db.pool, seg_seq, "worker", 1, "trellis_quarantine_test").await {
             Ok(Some(outcome)) => break outcome,
             Ok(None) => panic!("drain_once claimed nothing on a still-undrained segment"),
             Err(_) => {
@@ -2025,15 +1974,7 @@ async fn drain_result(
     pool: &trellis::Pool,
     seg_seq: i64,
 ) -> Result<Option<apply::ApplyOutcome>, ApplyError> {
-    apply::drain_once(
-        pool,
-        seg_seq,
-        "worker",
-        1,
-        "trellis_quarantine_test",
-        &StagedWatermark::saturated(),
-    )
-    .await
+    apply::drain_once(pool, seg_seq, "worker", 1, "trellis_quarantine_test").await
 }
 
 async fn charged_keys(client: &Client, src_table: &str) -> Vec<(String, i32)> {

@@ -50,7 +50,6 @@ use super::liveness::FenceMissBackoff;
 use super::one_to_one_ledger;
 use super::quarantine;
 use super::target_mutations::TargetMutations;
-use super::watermark::StagedWatermark;
 
 /// The absolute ceiling on [`FoldedChange::hop_gen`] propagation, a backstop
 /// over and above the schema-derived hop bound doc 05 describes ("one past
@@ -5785,7 +5784,7 @@ pub struct DrainHooks {
 /// many attempts the last page took.
 #[tracing::instrument(
     name = "staging.drain_once",
-    skip(pool, wake_channel, watermark),
+    skip(pool, wake_channel),
     fields(claimed_by = %claimed_by, attempt = tracing::field::Empty)
 )]
 #[cfg(any(test, feature = "internals"))]
@@ -5795,7 +5794,6 @@ pub async fn drain_once(
     claimed_by: &str,
     live_workers: i64,
     wake_channel: &str,
-    watermark: &StagedWatermark,
 ) -> Result<Option<ApplyOutcome>, ApplyError> {
     let outcome = drain_segments(
         pool,
@@ -5803,7 +5801,6 @@ pub async fn drain_once(
         claimed_by,
         live_workers,
         wake_channel,
-        watermark,
         DEFAULT_DRAIN_BATCH_CAP,
         &mut DrainHooks::default(),
     )
@@ -5828,7 +5825,6 @@ pub async fn drain_many(
     claimed_by: &str,
     live_workers: i64,
     wake_channel: &str,
-    watermark: &StagedWatermark,
 ) -> Result<Option<ManyApplyOutcome>, ApplyError> {
     drain_many_with_cap(
         pool,
@@ -5836,7 +5832,6 @@ pub async fn drain_many(
         claimed_by,
         live_workers,
         wake_channel,
-        watermark,
         DEFAULT_DRAIN_BATCH_CAP,
     )
     .await
@@ -5880,7 +5875,7 @@ pub async fn drain_many(
 /// instead of a single segment's.
 #[tracing::instrument(
     name = "staging.drain_many",
-    skip(pool, wake_channel, watermark),
+    skip(pool, wake_channel),
     fields(
         claimed_by = %claimed_by,
         segments = seg_seqs.len(),
@@ -5893,7 +5888,6 @@ pub async fn drain_many_with_cap(
     claimed_by: &str,
     live_workers: i64,
     wake_channel: &str,
-    watermark: &StagedWatermark,
     drain_batch_cap: usize,
 ) -> Result<Option<ManyApplyOutcome>, ApplyError> {
     drain_segments(
@@ -5902,7 +5896,6 @@ pub async fn drain_many_with_cap(
         claimed_by,
         live_workers,
         wake_channel,
-        watermark,
         drain_batch_cap,
         &mut DrainHooks::default(),
     )
@@ -5911,14 +5904,12 @@ pub async fn drain_many_with_cap(
 
 /// [`drain_many_with_cap`] with [`DrainHooks`], for the exactly-once tests.
 #[cfg(any(test, feature = "internals"))]
-#[allow(clippy::too_many_arguments)]
 pub async fn drain_many_with_hooks(
     pool: &Pool,
     seg_seqs: &[i64],
     claimed_by: &str,
     live_workers: i64,
     wake_channel: &str,
-    watermark: &StagedWatermark,
     drain_batch_cap: usize,
     hooks: &mut DrainHooks,
 ) -> Result<Option<ManyApplyOutcome>, ApplyError> {
@@ -5928,7 +5919,6 @@ pub async fn drain_many_with_hooks(
         claimed_by,
         live_workers,
         wake_channel,
-        watermark,
         drain_batch_cap,
         hooks,
     )
@@ -5956,14 +5946,12 @@ impl ManyApplyOutcome {
 
 /// The body [`drain_once`], [`drain_many_with_cap`] and
 /// [`drain_many_with_hooks`] share; see [`drain_many_with_cap`].
-#[allow(clippy::too_many_arguments)]
 async fn drain_segments(
     pool: &Pool,
     seg_seqs: &[i64],
     claimed_by: &str,
     live_workers: i64,
     wake_channel: &str,
-    watermark: &StagedWatermark,
     drain_batch_cap: usize,
     hooks: &mut DrainHooks,
 ) -> Result<Option<ManyApplyOutcome>, ApplyError> {
@@ -6080,7 +6068,6 @@ async fn drain_segments(
                 &steps,
                 claimed_by,
                 wake_channel,
-                watermark,
                 lose_commit_reply(hooks, 1),
             )
             .await?;
@@ -6160,7 +6147,6 @@ async fn drain_segments(
                 std::slice::from_ref(&step),
                 claimed_by,
                 wake_channel,
-                watermark,
                 lose_commit_reply(hooks, total.pages + 1),
             )
             .await?;
@@ -6245,8 +6231,6 @@ async fn drain_batch(
     steps: &[SegmentStep],
     claimed_by: &str,
     wake_channel: &str,
-    // Read by nothing: #1366 drops it from the drain API.
-    _watermark: &StagedWatermark,
     mut lose_commit_reply: bool,
 ) -> Result<ManyApplyOutcome, ApplyError> {
     // Every retry-classification helper below (`classify_and_retry`,

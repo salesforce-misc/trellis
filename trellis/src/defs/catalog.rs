@@ -6423,10 +6423,9 @@ const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
     // exactly when the stored netmask covers the whole address
     // (`'192.168.1.5'::inet::text` via `inet_out` is `192.168.1.5`; via the
     // cast, `192.168.1.5/32`), the identical "one value, two renderers, no
-    // arbiter" shape `boolean` has above — and `staging::apply::
-    // check_reverse_guards` and its scalar siblings still do raw
-    // `{col}::text = $1` matching, so `inet` would silently mismatch exactly
-    // the way `boolean` would. `inet` is refused here for that reason;
+    // arbiter" shape `boolean` has above — so a raw `{col}::text = $1`
+    // match would silently mismatch `inet` exactly the way `boolean`
+    // would. `inet` is refused here for that reason;
     // its `GROUP BY` key role is still admitted, the same split `boolean`
     // got — see `validate::reject_unsupported_group_by_key_type`'s `Inet`
     // arm.
@@ -6454,16 +6453,14 @@ const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
     //
     // That is live-load-bearing, not theoretical: a capture trigger images a
     // column with `format('%s', col)`, which calls `boolout`, and builds a
-    // relationship/primary-key's staged `key` text from that — `'t'`/`'f'`. Every *bulk* key lookup
-    // in `staging::apply` (`key_array_filter`, issue #125) casts the
-    // *bound parameter* to the column's native type
-    // (`col = any($1::text[]::boolean[])`), which calls `boolin` — an
+    // primary key's staged `key` text from that — `'t'`/`'f'`. A *bulk* key
+    // lookup that casts the *bound parameter* to the column's native type
+    // (`col = any($1::text[]::boolean[])`) calls `boolin` — an
     // input function far more permissive than `boolout` is strict, so it
     // parses `'t'`/`'f'` and `'true'`/`'false'` alike back to the same
-    // native value and the divergence never surfaces there. But several
-    // *scalar* single-key lookups (`staging::apply::check_reverse_guards`
-    // and its siblings) still render the older, unindexed
-    // `{key}::text = $1` form directly — comparing a live column's
+    // native value and the divergence never surfaces there. But a
+    // *scalar* single-key lookup in the older, unindexed
+    // `{key}::text = $1` form would compare a live column's
     // `pg_catalog.text(boolean)` rendering (`'true'`/`'false'`) against a
     // CDC-derived `key` built from `boolout` (`'t'`/`'f'`) — and those two
     // strings are simply not equal. Admitting `boolean` here today would
@@ -7231,7 +7228,7 @@ async fn ensure_relationship_projection_in_txn(
     let insert_cols = insert_col_idents.join(", ");
     let select_cols = select_col_exprs.join(", ");
     // Issue #726: a key a pending to-side change will write is left to that
-    // change, as in `refresh_relationship_projections_in_txn`.
+    // change (see `pending_to_side_keys`).
     let pending = pending_to_side_keys(qualified_to_table, to_col);
     let catch_up_sql = format!(
         "with seed as (select pg_current_wal_lsn() as lsn), {pending} \
@@ -7258,13 +7255,12 @@ const PENDING_KEYS: &str = "trellis_pending_keys";
 /// column `key`) whose latest pending change to `qualified_to_table` leaves
 /// the key present: of the pending changes that name the key in either image,
 /// the one latest in `(lsn, change_id)` order, the fold's order, names it in
-/// its new image. A change is a captured or seam-fed change, or relationship
-/// `relationship_id`'s deferred reverse (#134). Pending is per change
+/// its new image. A change is a captured or seam-fed change. Pending is per change
 /// ([`pending_to_side_changes`]): no committed drain has applied it.
 ///
 /// Issue #726: a catch-up insert from the live to-side
-/// ([`ensure_relationship_projection_in_txn`],
-/// [`refresh_relationship_projections_in_txn`]) leaves out such a key. Its
+/// ([`ensure_relationship_projection_in_txn`], [`refresh_locked_projections`])
+/// leaves out such a key. Its
 /// projection row is written by that change's record, whose new image
 /// carries the key. Written from the live row instead, it could outlive the
 /// to-side row: a row inserted before the read and deleted after it folds,
@@ -7334,8 +7330,8 @@ fn pending_to_side_changes(
     })
 }
 
-/// [`refresh_relationship_projections_in_txn`] for the relationships
-/// `relationship_ids` instead of every one on a to-side: each one's
+/// Refreshes the settled projections of the relationships
+/// `relationship_ids` from their to-sides: each one's
 /// `relationship_projections` row is locked `for update`, all of them in
 /// `relationship_id` order before any projection is touched, the order
 /// Phase 3 takes the same rows `for share` in. A relationship with no
@@ -7397,8 +7393,7 @@ const LOCK_PROJECTIONS_SELECT: &str = "select rp.projection_table, n.nspname::te
 /// order Phase 3 takes the same rows `for share` in.
 const LOCK_PROJECTIONS_ORDER: &str = "order by rp.relationship_id for update of rp";
 
-/// The body of [`refresh_relationship_projections_in_txn`], over
-/// `projections`, rows of [`LOCK_PROJECTIONS_SELECT`] its caller has locked.
+/// Refreshes `projections`, rows of [`LOCK_PROJECTIONS_SELECT`] its caller has locked.
 async fn refresh_locked_projections(
     client: &impl GenericClient,
     projections: Vec<tokio_postgres::Row>,
@@ -8365,14 +8360,10 @@ async fn readers_exist(
 /// change twice, and an aggregate target has no primary key to key its
 /// captured changes by.
 ///
-/// That includes a target that is a relationship endpoint (issue #375's
-/// direction 1, #403). A to-one relationship's settled parent projection and
-/// reverse deltas (issues #129-#136), and a from-side's `group_key` (#133),
-/// need image-bearing, ordered changes, and the seam stages exactly that
-/// shape for an endpoint target (`staging::target_mutations`, "Standing in
-/// for a relationship endpoint's CDC"), so the seam is the one change feed
-/// for every target this instance owns. Another instance's target is just a
-/// table here, and is captured like one.
+/// A reader that needs image-bearing, ordered changes gets them from the seam's
+/// image feed (`staging::target_mutations`, "The image feed"), so the seam is
+/// the one change feed for every target this instance owns. Another instance's
+/// target is just a table here, and is captured like one.
 pub async fn tables_to_capture(pool: &Pool) -> Result<Vec<String>, CatalogError> {
     let tables = all_source_tables(pool).await?;
     let client = pool.get().await?;

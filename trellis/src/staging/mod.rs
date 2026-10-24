@@ -33,10 +33,9 @@
 //!   eviction, parked work as the source of truth for an excluded key's
 //!   later healthy changes, operator-driven release, and the one sanctioned
 //!   exception to immutability (a dropped source table's purge).
-//! - [`watermark`] is issue #132's in-process "staged-through" LSN (guard
-//!   (a), "the watermark barrier") — a small, injectable handle the
-//!   reverse-delta apply path (`apply`) reads. Always caught up under
-//!   trigger capture.
+//! - [`watermark`] is the in-process "staged-through" LSN a backfill
+//!   enumeration waits on (issue #312) — a small, injectable handle. Always
+//!   caught up under trigger capture.
 //! - [`worker_registry`] is issue #144's worker-level liveness registry:
 //!   one row per live drain worker, independent of whether it currently
 //!   holds a claim — the read behind `Trellis::has_live_drain_workers`.

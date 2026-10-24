@@ -31,9 +31,7 @@ use tokio_postgres::{Client, NoTls};
 use trellis::capture::install;
 use trellis::capture::sql::CaptureSpec;
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::staging::{
-    StagedWatermark, StagingError, apply, has_pending, retire_drained_segments, seal,
-};
+use trellis::staging::{StagingError, apply, has_pending, retire_drained_segments, seal};
 use trellis::{BlockingTrellis, Config, ErrorCode, Trellis, TrellisError, TrellisOptions};
 
 /// Connects directly to `dsn` (bypassing `trellis::Pool`), matching
@@ -88,14 +86,12 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
 async fn drain_segment(pool: &trellis::Pool, seg_seq: i64) {
     // No live capture stages anything here, so there is no real staged
     // watermark to hold apply back. A saturated one never does.
-    let watermark = StagedWatermark::saturated();
     while apply::drain_once(
         pool,
         seg_seq,
         "app_converge_test",
         1,
         "trellis_app_converge_test",
-        &watermark,
     )
     .await
     .expect("drain_once")

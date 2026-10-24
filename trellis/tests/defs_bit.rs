@@ -65,7 +65,7 @@ use trellis::defs::{
     source_primary_key, validate,
 };
 use trellis::integer::IntWidth;
-use trellis::staging::{StagedWatermark, apply, seal};
+use trellis::staging::{apply, seal};
 
 // ---------------------------------------------------------------------
 // Harness
@@ -685,7 +685,6 @@ async fn a_varbit_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two(
             "bit_worker",
             1,
             "trellis_defs_bit_issue_118_regression",
-            &StagedWatermark::saturated(),
         )
         .await
         .expect("drain_once")

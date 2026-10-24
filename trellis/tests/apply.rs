@@ -19,7 +19,7 @@ use trellis::defs::{
     PgType, create_definition, create_target_table, recompute, source_primary_key,
 };
 use trellis::staging::apply::{self, ApplyError};
-use trellis::staging::{SegmentState, StagedWatermark, TRUNCATE_SENTINEL_KEY, claim, fold};
+use trellis::staging::{SegmentState, TRUNCATE_SENTINEL_KEY, claim, fold};
 
 fn numeric_columns(names: &[&str]) -> HashMap<String, ValueType> {
     names
@@ -169,17 +169,10 @@ fn order_totals_def() -> TransformDef {
 async fn drain(pool: &trellis::Pool, seg_seq: i64, claimed_by: &str) -> apply::ApplyOutcome {
     // Issue #132: a throwaway, always-caught-up watermark — no live
     // capture runs in this test file, and it isn't exercising guard (a).
-    apply::drain_once(
-        pool,
-        seg_seq,
-        claimed_by,
-        1,
-        "trellis_apply_test",
-        &StagedWatermark::saturated(),
-    )
-    .await
-    .expect("drain_once")
-    .expect("drain_once must claim and drain something")
+    apply::drain_once(pool, seg_seq, claimed_by, 1, "trellis_apply_test")
+        .await
+        .expect("drain_once")
+        .expect("drain_once must claim and drain something")
 }
 
 #[tokio::test]
@@ -2432,17 +2425,10 @@ async fn drain_many_coalesces_two_sealed_segments_into_one_apply_pass() {
     .await;
     let seg2 = seal_active_segment(&mut client).await;
 
-    let outcome = apply::drain_many(
-        &db.pool,
-        &[seg1, seg2],
-        "worker",
-        1,
-        "trellis_apply_test",
-        &StagedWatermark::saturated(),
-    )
-    .await
-    .expect("drain_many")
-    .expect("drain_many must claim and drain something");
+    let outcome = apply::drain_many(&db.pool, &[seg1, seg2], "worker", 1, "trellis_apply_test")
+        .await
+        .expect("drain_many")
+        .expect("drain_many must claim and drain something");
 
     assert_eq!(
         outcome.keys_written, 3,

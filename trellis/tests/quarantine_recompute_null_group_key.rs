@@ -62,8 +62,6 @@ async fn connect_raw(dsn: &str) -> Client {
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
     use trellis::staging::apply;
     use trellis::staging::seal;
-    let watermark = trellis::staging::StagedWatermark::saturated();
-    let watermark = &watermark;
     for _ in 0..16 {
         let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
         seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
@@ -75,7 +73,6 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
             "quarantine_recompute_null_group_key_test",
             1,
             "trellis_quarantine_recompute_null_group_key_test",
-            watermark,
         )
         .await
         .expect("drain_once")

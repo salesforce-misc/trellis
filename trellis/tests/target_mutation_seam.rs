@@ -57,7 +57,6 @@ fn numeric_columns(names: &[&str]) -> HashMap<String, ValueType> {
 
 /// Seals and drains until nothing is pending, one batch per round.
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
-    let watermark = StagedWatermark::saturated();
     for _ in 0..16 {
         trellis::staging::seal_if_active_nonempty(client, WAKE)
             .await
@@ -66,7 +65,7 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
             .await
             .expect("next claimable segment")
         {
-            apply::drain_once(pool, seg, "seam_test", 1, WAKE, &watermark)
+            apply::drain_once(pool, seg, "seam_test", 1, WAKE)
                 .await
                 .expect("drain_once");
         }
@@ -1005,7 +1004,6 @@ async fn a_chained_reader_reports_catching_up_while_its_upstream_builds_a_field(
 /// Seals the active segment and drains every sealed one, once: the seam
 /// rows the drain itself stages stay in the new active segment.
 async fn seal_and_drain_once(pool: &trellis::Pool, client: &mut Client) {
-    let watermark = StagedWatermark::saturated();
     trellis::staging::seal_if_active_nonempty(client, WAKE)
         .await
         .expect("seal");
@@ -1013,7 +1011,7 @@ async fn seal_and_drain_once(pool: &trellis::Pool, client: &mut Client) {
         .await
         .expect("next claimable segment")
     {
-        apply::drain_once(pool, seg, "seam_test", 1, WAKE, &watermark)
+        apply::drain_once(pool, seg, "seam_test", 1, WAKE)
             .await
             .expect("drain_once");
     }
@@ -1170,17 +1168,10 @@ async fn seal_only(raw: &mut Client) -> i64 {
 
 /// Drains sealed segment `seg_seq` alone, then retires what has drained.
 async fn drain_sealed(pool: &trellis::Pool, raw: &mut Client, seg_seq: i64) {
-    while apply::drain_once(
-        pool,
-        seg_seq,
-        "seam_test",
-        1,
-        WAKE,
-        &StagedWatermark::saturated(),
-    )
-    .await
-    .expect("drain_once")
-    .is_some()
+    while apply::drain_once(pool, seg_seq, "seam_test", 1, WAKE)
+        .await
+        .expect("drain_once")
+        .is_some()
     {}
     retire_drained_segments(raw)
         .await

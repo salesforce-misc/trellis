@@ -20,7 +20,7 @@ use tokio_postgres::{Client, NoTls};
 use trellis::defs::TransformStatus;
 use trellis::intake::markers;
 use trellis::staging::self_check::CheckPageExt;
-use trellis::staging::{StagedWatermark, apply, quarantine, seal};
+use trellis::staging::{apply, quarantine, seal};
 
 const SCHEMA: &str = trellis::config::DEFAULT_SCHEMA;
 
@@ -160,17 +160,10 @@ async fn seal(raw: &mut Client) -> i64 {
 /// One drain call over `seg_seq` as `pool`'s role: the drain's error, if it
 /// surfaced one.
 async fn drain(pool: &trellis::Pool, seg_seq: i64) -> Result<(), String> {
-    apply::drain_once(
-        pool,
-        seg_seq,
-        "holdup_test",
-        1,
-        "trellis_holdup_test",
-        &StagedWatermark::saturated(),
-    )
-    .await
-    .map(|_| ())
-    .map_err(|err| err.to_string())
+    apply::drain_once(pool, seg_seq, "holdup_test", 1, "trellis_holdup_test")
+        .await
+        .map(|_| ())
+        .map_err(|err| err.to_string())
 }
 
 async fn status(it: &Instance, target: &str) -> trellis::DefinitionStatus {

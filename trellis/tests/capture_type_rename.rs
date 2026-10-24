@@ -78,8 +78,7 @@ async fn capture_pass(raw: &mut Client, pool: &trellis::Pool) {
 }
 
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
-    use trellis::staging::{StagedWatermark, apply, has_pending, retire_drained_segments, seal};
-    let watermark = StagedWatermark::saturated();
+    use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
     for _ in 0..16 {
         let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
         seal::seal_phase2(client, outcome.sealed_seg_seq, "capture_type_rename_wake")
@@ -91,7 +90,6 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
             "capture_type_rename_test",
             1,
             "trellis_capture_type_rename_test",
-            &watermark,
         )
         .await
         .expect("drain_once")
@@ -111,8 +109,7 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
 /// each failed drain charges the key a death, until it is held and the
 /// drain goes past it. Bounded attempts, not a timed wait.
 async fn drain_past_failures(pool: &trellis::Pool, client: &mut Client) {
-    use trellis::staging::{StagedWatermark, apply, retire_drained_segments, seal};
-    let watermark = StagedWatermark::saturated();
+    use trellis::staging::{apply, retire_drained_segments, seal};
     let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
     seal::seal_phase2(client, outcome.sealed_seg_seq, "capture_type_rename_wake")
         .await
@@ -125,7 +122,6 @@ async fn drain_past_failures(pool: &trellis::Pool, client: &mut Client) {
             "capture_type_rename_test",
             1,
             "trellis_capture_type_rename_test",
-            &watermark,
         )
         .await
         {
