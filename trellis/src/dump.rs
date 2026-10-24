@@ -47,10 +47,6 @@ const NONE: &str = "{}";
 
 /// Every table in the Trellis schema, in the order the appendix inserts the
 /// definition rows (a table after the ones it references).
-///
-/// A table created at run time under `_trellis_rel_projection_` (a
-/// relationship's parent projection) is runtime state, so it is not listed;
-/// see [`is_projection_table`].
 pub const CLASSIFICATION: &[(&str, Class)] = &[
     // Definitions.
     ("refinery_schema_history", Class::Definition { reset: NONE }),
@@ -180,13 +176,6 @@ pub const RESOLVE_TYPE_OIDS: &[&str] = &[
     "drop table trellis_resolved_enum_values",
     "drop table trellis_resolved_types",
 ];
-
-/// Whether `table` is a relationship's parent projection, which Trellis
-/// creates per relationship and fills from the to-side table.
-#[cfg_attr(not(feature = "internals"), allow(dead_code))]
-pub fn is_projection_table(table: &str) -> bool {
-    table.starts_with("_trellis_rel_projection_")
-}
 
 fn quote_ident(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))

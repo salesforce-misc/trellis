@@ -22,7 +22,7 @@
 //! fixed alphabet rather than a fixed label set).
 //!
 //! **Key roles.** Both land cleanly: the `JOIN` key/primary-key role gains
-//! a *dynamic* counterpart to the static `catalog::TEXT_STABLE_JOIN_KEY_TYPES`
+//! a *dynamic* counterpart to the static `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES`
 //! allowlist (a live catalog probe of the column's type, since
 //! there is no way to enumerate "every enum type" ahead of time the way a
 //! fixed builtin family can be), and the `GROUP BY` key gate admits
@@ -98,7 +98,7 @@ async fn connect_raw(dsn: &str) -> Client {
 
 /// Defines a `JOIN` whose one `ON` term pairs `left.lcol` with
 /// `right.rcol`. `JOIN` key admission reads the same allowlist
-/// (`catalog::is_text_stable_join_key_type`) a 1-1 primary key does.
+/// (`join_key_types::is_text_stable_join_key_type`) a 1-1 primary key does.
 async fn define_join_on(
     pool: &trellis::pool::Pool,
     target: &str,
@@ -195,7 +195,7 @@ async fn to_jsonb_and_text_agree_for_enum() {
 
 /// An enum column is admitted as both a `JOIN` `ON` key and a 1-1
 /// primary key — the dynamic, catalog-probed counterpart to the static
-/// `catalog::TEXT_STABLE_JOIN_KEY_TYPES` allowlist every other admitted
+/// `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES` allowlist every other admitted
 /// family reaches through.
 #[tokio::test]
 async fn enum_join_key_and_primary_key_are_admitted() {
@@ -270,7 +270,7 @@ fn enum_group_by_key_is_admitted() {
     let def =
         parse("TRANSFORM t FROM s GROUP BY p WITHOUT SOURCE INDEX SELECT p AS k, SUM(n) AS total")
             .expect("parses");
-    validate(&def, &source_columns(), &HashMap::new())
+    validate(&def, &source_columns())
         .unwrap_or_else(|e| panic!("an enum column must be accepted as a GROUP BY key: {e}"));
 }
 
@@ -310,7 +310,7 @@ async fn an_enum_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two()
         ("amount".to_string(), ValueType::Numeric),
     ]);
     let def = parse(DEF_SQL).expect("parse");
-    validate(&def, &columns, &HashMap::new()).expect("validate");
+    validate(&def, &columns).expect("validate");
     create_definition(&db.pool, DEF_SQL, &columns)
         .await
         .expect("create definition");

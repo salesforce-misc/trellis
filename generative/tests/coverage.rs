@@ -126,18 +126,6 @@ fn collect_column_types(expr: &Expr, source: &Table, out: &mut Vec<ValueType>) {
         // A literal carries no *source column* type — including issue
         // #109's typed literal, whose type is its own, not a column's.
         Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::TypedLiteral { .. } => {}
-        // A `<table>.<column>` path reads another table (only a `JOIN`
-        // does), so there is no type to collect from `source`. The one
-        // caller feeds this a `build_program` program — a single table and
-        // one 1-1 definition — so no path can reach here. Refusing rather
-        // than returning nothing keeps that precondition enforced instead of
-        // assumed.
-        Expr::RelationshipPath { rel, column } => {
-            unreachable!(
-                "collect_column_types is only ever called on `build_program`'s single-table \
-                 program, which cannot contain the path '{rel}.{column}'"
-            )
-        }
     }
 }
 

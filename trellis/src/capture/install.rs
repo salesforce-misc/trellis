@@ -96,8 +96,7 @@
 //!    applies every ring row drained after its discharge dispatches it, and a
 //!    row staged before the widen lacks the new column: the reader fails it
 //!    with `EvalError::MissingColumn` and the key is quarantined. The rows
-//!    can be in the ring or re-staged by a drain (a deferred relationship
-//!    reverse keeps its images). A row held in `poison_held` never reaches
+//!    can be in the ring. A row held in `poison_held` never reaches
 //!    a reader with its images: its release re-stages an image-less
 //!    `Recompute` that re-derives the key from its live row.
 //!
@@ -132,20 +131,19 @@
 //!
 //! **The gate only holds definitions sourced from the gated table.** The
 //! discharge dispatches a marker's `waiting_to_backfill` definitions whose
-//! `source_table` is the marker's table. A widen of a relationship's to-side
-//! `T` for a new definition sourced from the from-side `U` (it reads a new
-//! column of `T` through the relationship) gates `T`'s marker, but the new
-//! definition waits on `U`'s marker, which no gate holds. A pre-widen `T` row
-//! then reaches it through the reverse path. C5 closes this in the reconcile
-//! pass ([`super::reconcile`], rule 3): such a definition isn't dispatched
-//! while `T` has a gated marker pending.
+//! `source_table` is the marker's table. A widen of a `JOIN`'s joined table
+//! `T` for a new `JOIN` sourced from `U` (it reads a new column of `T`)
+//! gates `T`'s marker, but the new definition waits on `U`'s marker, which
+//! no gate holds. C5 closes this in the reconcile pass ([`super::reconcile`],
+//! rule 3): such a definition isn't dispatched while `T` has a gated marker
+//! pending.
 //!
 //! Why not the alternatives:
 //!
 //! - **Re-deriving rows below the new reader's build horizon** instead of
 //!   evaluating them would be the cheaper wait, but apply had no
 //!   per-definition horizon, and every consumer path (1-1, aggregate,
-//!   relationship forward and reverse, settled projections) would need one.
+//!   `JOIN`) would need one.
 //!   That is D's ledger (#623), not C's.
 //! - **A seal after the widen** would bound the pre-widen rows to the
 //!   batches up to the widen's, but a batch drained doesn't mean every row in

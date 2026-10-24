@@ -5,9 +5,9 @@
 //! consume. Per ADR-0004, only constructs this crate can actually evaluate
 //! are accepted:
 //!
-//! - **Key-space**: 1-1 ([`ast::KeySpace::OneToOne`]) or aggregate
-//!   ([`ast::KeySpace::Aggregate`], a `GROUP BY <cols>` clause, issue #11's
-//!   groundwork) — no joins, no relationship paths.
+//! - **Key-space**: 1-1 ([`ast::KeySpace::OneToOne`]), aggregate
+//!   ([`ast::KeySpace::Aggregate`], a `GROUP BY <cols>` clause), or a `JOIN`
+//!   aggregate ([`ast::KeySpace::Join`], ADR-0019).
 //! - **Calculated fields**: column references, numeric and string literals,
 //!   the `+` operator (Numeric-only), the `>` comparison operator (issue
 //!   #65, `Numeric, Numeric -> Boolean`), and `name(args)` function calls,
@@ -40,6 +40,7 @@ pub mod grammar;
 pub mod hierarchy;
 pub mod invertibility;
 pub(crate) mod join;
+pub(crate) mod join_key_types;
 pub(crate) mod key_types;
 pub mod ledger;
 mod lexer;
@@ -91,9 +92,8 @@ pub use ddl::{
 };
 #[cfg(any(test, feature = "internals"))]
 pub use oracle::{
-    OracleError, Recomputed, recompute, recompute_aggregate,
-    render_aggregate_relationship_select_sql, render_aggregate_select_sql, render_expr_sql,
-    render_relationship_select_sql,
+    OracleError, Recomputed, recompute, recompute_aggregate, render_aggregate_select_sql,
+    render_expr_sql,
 };
 
 // Reached only by this crate's own `tests/*.rs`, through the `internals`
@@ -101,7 +101,7 @@ pub use oracle::{
 #[cfg(any(test, feature = "internals"))]
 pub use ast::{
     Expr, FieldDef, GroupByKey, JoinKind, JoinOn, JoinSpec, KeySpace, Operator, Predicate,
-    QualifiedColumn, RelationshipDef, TransformDef,
+    QualifiedColumn, TransformDef,
 };
 #[cfg(any(test, feature = "internals"))]
 pub use backfill::BackfillError;
@@ -109,8 +109,8 @@ pub use backfill::BackfillError;
 pub use catalog::all_source_tables;
 #[cfg(any(test, feature = "internals"))]
 pub use catalog::{
-    create_definition, dependents_of, edges_from, node_for_table, persist_edge,
-    relationship_by_name, resolve_node, source_table_version, transforms_for_source,
+    create_definition, dependents_of, edges_from, node_for_table, persist_edge, resolve_node,
+    source_table_version, transforms_for_source,
 };
 #[cfg(any(test, feature = "internals"))]
 pub use ddl::{PrimaryKeyColumn, neighbor_table_name};
@@ -123,7 +123,7 @@ pub use model::{EdgeKind, NodeKind, SchemaEdge, SchemaNode};
 #[cfg(any(test, feature = "internals"))]
 pub use validate::{
     KeyColumnRole, NondeterministicCollationTextFunction, NondeterministicKeyCollation,
-    RelationshipTypeMismatch, ValidationError,
+    ValidationError,
 };
 
 #[cfg(test)]
@@ -515,15 +515,14 @@ mod tests {
         }
     }
 
+    /// Every two-part name in an expression parses to a qualified column; the
+    /// validator decides whether its head names the FROM table.
     #[test]
-    fn parses_relationship_path() {
+    fn a_two_part_name_of_another_table_parses_as_a_qualified_column() {
         let def = parse("TRANSFORM t FROM s SELECT product.category_name AS x").unwrap();
         assert_eq!(
             def.fields[0].expr,
-            Expr::RelationshipPath {
-                rel: "product".to_string(),
-                column: "category_name".to_string(),
-            }
+            source_column(None, "product", "category_name")
         );
     }
 
@@ -702,7 +701,7 @@ mod tests {
         );
         let source_columns =
             std::collections::HashMap::from([("a".to_string(), ValueType::Numeric)]);
-        let err = validate(&def, &source_columns, &std::collections::HashMap::new()).unwrap_err();
+        let err = validate(&def, &source_columns).unwrap_err();
         assert_eq!(
             err,
             ValidationError::UnresolvedColumn {
@@ -761,7 +760,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        validate(&def, &source_columns, &std::collections::HashMap::new())
+        validate(&def, &source_columns)
             .expect("a > (b + c) type-checks cleanly under real precedence");
     }
 
@@ -796,8 +795,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        validate(&def, &source_columns, &std::collections::HashMap::new())
-            .expect("(a + b) > c type-checks cleanly");
+        validate(&def, &source_columns).expect("(a + b) > c type-checks cleanly");
     }
 
     /// Parenthesized grouping (issue #67's follow-up, needed once a caller
@@ -968,12 +966,11 @@ mod tests {
     }
 
     #[test]
-    fn qualified_table_reference_does_not_collide_with_relationship_path_syntax() {
-        // The `<rel>.<column>` relationship-path grammar (issue #25) reuses
-        // the same `ident '.' ident` token shape inside a field expression —
-        // confirms the two never compete for the same tokens, since the
-        // table-reference form is only ever parsed in `TRANSFORM`/`FROM`
-        // position, well before `SELECT`'s field list is reached.
+    fn qualified_table_reference_does_not_collide_with_qualified_column_syntax() {
+        // A qualified column reuses the same `ident '.' ident` token shape
+        // inside a field expression. The two never compete for the same
+        // tokens, since the table-reference form is only ever parsed in
+        // `TRANSFORM`/`FROM` position, well before `SELECT`'s field list.
         let def = parse("TRANSFORM t FROM custom.orders SELECT product.category_name AS category")
             .unwrap();
 
@@ -983,10 +980,7 @@ mod tests {
             def.fields,
             vec![FieldDef {
                 name: "category".to_string(),
-                expr: Expr::RelationshipPath {
-                    rel: "product".to_string(),
-                    column: "category_name".to_string(),
-                },
+                expr: source_column(None, "product", "category_name"),
             }]
         );
     }
@@ -999,8 +993,8 @@ mod tests {
         }
     }
 
-    /// Issue #830: `<FROM table>.<column>` is a qualified source column; any
-    /// other two-part head is a relationship.
+    /// Issue #830: `<FROM table>.<column>` is a qualified source column; so is
+    /// any other two-part name, which the validator then refuses.
     #[test]
     fn a_two_part_name_headed_by_the_from_table_is_a_source_column() {
         let def =
@@ -1010,10 +1004,7 @@ mod tests {
             Expr::BinaryOp {
                 op: Operator::Add,
                 lhs: Box::new(source_column(None, "orders", "price")),
-                rhs: Box::new(Expr::RelationshipPath {
-                    rel: "product".to_string(),
-                    column: "cost".to_string(),
-                }),
+                rhs: Box::new(source_column(None, "product", "cost")),
             }
         );
         // The FROM table's bare name heads it even when FROM names a schema.
@@ -1056,11 +1047,12 @@ mod tests {
         );
     }
 
-    /// A `GROUP BY` key qualified by the FROM table is the plain column.
+    /// A `GROUP BY` key qualified by the FROM table is the plain column; a key
+    /// qualified by any other head is refused, naming the FROM table.
     #[test]
     fn a_group_by_key_qualified_by_the_from_table_is_the_column() {
         let def = parse(
-            "TRANSFORM t FROM orders GROUP BY orders.region, product.kind \
+            "TRANSFORM t FROM app.orders GROUP BY orders.region, kind \
              SELECT region AS region, COUNT(*) AS n",
         )
         .unwrap();
@@ -1069,12 +1061,26 @@ mod tests {
             KeySpace::Aggregate {
                 group_by: vec![
                     GroupByKey::Column("region".to_string()),
-                    GroupByKey::RelationshipPath {
-                        rel: "product".to_string(),
-                        column: "kind".to_string(),
-                    },
+                    GroupByKey::Column("kind".to_string()),
                 ],
             }
+        );
+        let err = parse(
+            "TRANSFORM t FROM orders GROUP BY orders.region, product.kind \
+             SELECT region AS region, COUNT(*) AS n",
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            ParseError::GroupByKeyNotFromSource {
+                reference: "product.kind".to_string(),
+                source: "orders".to_string(),
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "GROUP BY key 'product.kind' does not name this transform's FROM table ('orders'); \
+             a qualified key must name the FROM table, and a second table is read with a JOIN"
         );
     }
 
@@ -1101,28 +1107,24 @@ mod tests {
         }
     }
 
-    /// An `ALTER TRANSFORM` clause is parsed without its source; the catalog
-    /// reads its two-part names against the stored definition's.
+    /// An `ALTER TRANSFORM` clause is parsed without its source, into the same
+    /// qualified columns a `TRANSFORM` statement's fields parse to.
     #[test]
-    fn qualify_source_columns_reads_a_from_table_head_as_the_source() {
+    fn an_alter_clause_parses_two_part_names_as_qualified_columns() {
         let Statement::AlterTransform(alter) =
             parse_statement("ALTER TRANSFORM t ADD orders.price + product.cost AS margin").unwrap()
         else {
             panic!("not an ALTER");
         };
-        let ast::AlterClause::Add(mut field) = alter.clauses[0].clone() else {
+        let ast::AlterClause::Add(field) = alter.clauses[0].clone() else {
             panic!("not an ADD");
         };
-        field.expr.qualify_source_columns("orders");
         assert_eq!(
             field.expr,
             Expr::BinaryOp {
                 op: Operator::Add,
                 lhs: Box::new(source_column(None, "orders", "price")),
-                rhs: Box::new(Expr::RelationshipPath {
-                    rel: "product".to_string(),
-                    column: "cost".to_string(),
-                }),
+                rhs: Box::new(source_column(None, "product", "cost")),
             }
         );
     }

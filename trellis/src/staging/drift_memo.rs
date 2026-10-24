@@ -13,13 +13,11 @@
 //!
 //! The comparison is a function of:
 //!
-//! 1. the definition, its source and target, and the relationships it can
-//!    read through, with the projection table each has (the *context*); and
+//! 1. the definition, its source and target (the *context*); and
 //! 2. the catalog state of every relation the comparison reads
-//!    ([`crate::defs::copies::inputs`]): the source, the to-side of each
-//!    relationship, the target and, for an aggregate, its ledger and
-//!    group-delta table, each relationship's projection table, and, for a
-//!    `JOIN`, its joined table and its hidden tables.
+//!    ([`crate::defs::copies::inputs`]): the source, the target and, for an
+//!    aggregate, its ledger and group-delta table, and, for a `JOIN`, its
+//!    joined table and its hidden tables.
 //!
 //! The *stamp* of a definition is its context and the [`fingerprint`] of each
 //! of those relations. A fingerprint covers the relation's oid (a dropped and
@@ -77,12 +75,10 @@ use tokio_postgres::types::Type;
 use crate::capture::columns::{CaptureCatalog, CaptureReader};
 use crate::defs::copies;
 
-/// One pass's view of the catalog, read before any check: each relationship's
-/// projection table and every fingerprint a stamp needs.
+/// One pass's view of the catalog, read before any check: every
+/// fingerprint a stamp needs.
 #[derive(Debug, Default)]
 pub(crate) struct Fingerprints {
-    /// Each relationship's projection table, by relationship id.
-    projections: HashMap<i64, String>,
     /// The [`fingerprint`] of each relation, by the name SQL resolves it with
     /// (`copies::inputs`). A relation that doesn't exist has one too.
     relations: HashMap<String, String>,
@@ -90,24 +86,15 @@ pub(crate) struct Fingerprints {
 
 impl Fingerprints {
     /// Reads the fingerprints of every relation the checks of `catalog`'s
-    /// unpaused definitions read: two queries, however many definitions.
+    /// unpaused definitions read: one query, however many definitions.
     pub(crate) async fn read(
         client: &impl GenericClient,
         schema: &str,
         catalog: &CaptureCatalog,
     ) -> Result<Fingerprints, tokio_postgres::Error> {
-        let projections: HashMap<i64, String> = client
-            .query_typed(
-                "select relationship_id, projection_table from relationship_projections",
-                &[],
-            )
-            .await?
-            .into_iter()
-            .map(|row| (row.get(0), row.get(1)))
-            .collect();
         let mut names: BTreeSet<String> = BTreeSet::new();
         for reader in catalog.definitions.iter().filter(|r| !r.capture_failed) {
-            names.extend(inputs_of(schema, catalog, &projections, reader));
+            names.extend(inputs_of(schema, reader));
         }
         let names: Vec<String> = names.into_iter().collect();
         let relations = if names.is_empty() {
@@ -120,21 +107,13 @@ impl Fingerprints {
                 .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
                 .collect()
         };
-        Ok(Fingerprints {
-            projections,
-            relations,
-        })
+        Ok(Fingerprints { relations })
     }
 
     /// The stamp of `reader`: its context and the fingerprint of each
     /// relation its check reads. `None` when a fingerprint is missing, which
     /// never lets the definition be skipped.
-    pub(crate) fn stamp(
-        &self,
-        schema: &str,
-        catalog: &CaptureCatalog,
-        reader: &CaptureReader,
-    ) -> Option<String> {
+    pub(crate) fn stamp(&self, schema: &str, reader: &CaptureReader) -> Option<String> {
         use std::fmt::Write;
         let mut stamp = String::new();
         let _ = write!(
@@ -142,25 +121,7 @@ impl Fingerprints {
             "{}|{}|{}|{:?}",
             reader.id, reader.source, reader.target, reader.def
         );
-        for rel in catalog
-            .relationships
-            .iter()
-            .filter(|r| r.qualified_from_table() == reader.source)
-        {
-            let _ = write!(
-                stamp,
-                "|rel {} {} {}.{} {} {} {:?} {:?}",
-                rel.id,
-                rel.def.name,
-                rel.qualified_from_table(),
-                rel.def.from_col,
-                rel.qualified_to_table(),
-                rel.def.to_col,
-                rel.cardinality,
-                self.projections.get(&rel.id),
-            );
-        }
-        for name in inputs_of(schema, catalog, &self.projections, reader) {
+        for name in inputs_of(schema, reader) {
             let _ = write!(stamp, "|{name}={}", self.relations.get(&name)?);
         }
         Some(stamp)
@@ -168,28 +129,12 @@ impl Fingerprints {
 }
 
 /// The relations `reader`'s check reads, as SQL resolves them.
-fn inputs_of(
-    schema: &str,
-    catalog: &CaptureCatalog,
-    projections: &HashMap<i64, String>,
-    reader: &CaptureReader,
-) -> Vec<String> {
-    let declared: Vec<_> = catalog
-        .relationships
-        .iter()
-        .filter(|r| r.qualified_from_table() == reader.source)
-        .collect();
-    let projection_tables: Vec<&str> = declared
-        .iter()
-        .filter_map(|r| projections.get(&r.id).map(String::as_str))
-        .collect();
+fn inputs_of(schema: &str, reader: &CaptureReader) -> Vec<String> {
     copies::inputs(
         schema,
         &reader.def,
         &reader.source,
         &reader.target,
-        &declared,
-        &projection_tables,
         reader.join.as_deref().map(|joined| (reader.id, joined)),
     )
 }
@@ -391,7 +336,7 @@ mod tests {
     }
 
     async fn catalog(raw: &Client) -> CaptureCatalog {
-        crate::capture::columns::load_catalog(raw, SCHEMA)
+        crate::capture::columns::load_catalog(raw)
             .await
             .expect("catalog")
     }
@@ -443,7 +388,7 @@ mod tests {
             .expect("widen between the read and the check");
         assert!(check(&mut raw, instance, &catalog, &before).await);
         let stamp = before
-            .stamp(SCHEMA, &catalog, &catalog.definitions[0])
+            .stamp(SCHEMA, &catalog.definitions[0])
             .expect("stamp");
         assert!(!skippable(instance, "public.posts", ids[0], &stamp));
 

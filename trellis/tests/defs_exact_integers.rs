@@ -94,7 +94,7 @@ async fn connect_raw(dsn: &str) -> Client {
 
 /// Defines a `JOIN` whose one `ON` term pairs `left.lcol` with
 /// `right.rcol`. `JOIN` key admission reads the same allowlist
-/// (`catalog::is_text_stable_join_key_type`) a 1-1 primary key does.
+/// (`join_key_types::is_text_stable_join_key_type`) a 1-1 primary key does.
 async fn define_join_on(
     pool: &trellis::pool::Pool,
     target: &str,
@@ -636,8 +636,7 @@ async fn oid_has_no_arithmetic_in_trellis_because_it_has_none_in_postgres() {
     );
 
     let def = parse("TRANSFORM t FROM s SELECT o + o AS x").expect("parses");
-    let err = validate(&def, &source_columns(), &HashMap::new())
-        .expect_err("Trellis must reject oid + oid too");
+    let err = validate(&def, &source_columns()).expect_err("Trellis must reject oid + oid too");
     assert!(err.to_string().contains('x'), "must name the field: {err}");
 }
 
@@ -648,13 +647,12 @@ fn an_oid_literal_must_be_in_canonical_form() {
     for good in ["OID '0'", "OID '12345'", "CAST('4294967295' AS oid)"] {
         let def = parse(&format!("TRANSFORM t FROM s SELECT {good} AS x"))
             .unwrap_or_else(|e| panic!("{good} should parse: {e}"));
-        validate(&def, &source_columns(), &HashMap::new())
-            .unwrap_or_else(|e| panic!("{good} should validate: {e}"));
+        validate(&def, &source_columns()).unwrap_or_else(|e| panic!("{good} should validate: {e}"));
     }
     for bad in ["OID '-1'", "OID '007'", "OID '4294967296'", "OID '1.0'"] {
         let def = parse(&format!("TRANSFORM t FROM s SELECT {bad} AS x"))
             .unwrap_or_else(|e| panic!("{bad} should parse (validate-time error): {e}"));
-        let err = validate(&def, &source_columns(), &HashMap::new())
+        let err = validate(&def, &source_columns())
             .expect_err("a non-canonical oid literal must be rejected");
         assert!(
             err.to_string().contains("not in canonical form"),
@@ -674,7 +672,7 @@ fn an_oid_literal_must_be_in_canonical_form() {
 /// worked before #111 by luck of sharing `Numeric`'s decimal rendering; now
 /// they work because `Value::Integer`'s `Display` *is* Postgres's
 /// `int4out`, which is what lets these types stay on
-/// `catalog::TEXT_STABLE_JOIN_KEY_TYPES`.
+/// `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES`.
 #[tokio::test]
 async fn integer_text_rendering_is_byte_identical_to_postgres() {
     let cluster = TestCluster::start();
@@ -857,7 +855,7 @@ async fn an_incremental_bigint_sum_stays_equal_to_a_hand_written_group_by() {
 
 /// An `oid` column is accepted as a **`JOIN` `ON` key**, and a
 /// `smallint`/`integer`/`bigint` one keeps being accepted — the
-/// `catalog::TEXT_STABLE_JOIN_KEY_TYPES` allowlist #111 widens.
+/// `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES` allowlist #111 widens.
 ///
 /// The `numeric` case is the control: it must still be *rejected*, because
 /// `1.0::text != 1.00::text` though the two are equal to Postgres. That

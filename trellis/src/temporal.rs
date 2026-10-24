@@ -20,7 +20,7 @@
 //! # Text stability, which is the whole ballgame for the key roles
 //!
 //! Trellis matches keys by raw `::text` rendering
-//! (`crate::defs::catalog::TEXT_STABLE_JOIN_KEY_TYPES`,
+//! (`crate::defs::join_key_types::TEXT_STABLE_JOIN_KEY_TYPES`,
 //! `crate::defs::eval`'s `to_rows_by_key`), so a family may hold a key role
 //! only if `a::text = b::text` agrees with that family's own `=` for every
 //! value. `docs/type-support.md` long marked the whole temporal block
@@ -196,24 +196,32 @@
 //! and the time field is omitted entirely when it is zero *and* some date
 //! field is not (`'1 mon 00:00:00'` is `1 mon`).
 
+#[cfg(any(test, feature = "test-util"))]
 use std::cmp::Ordering;
+#[cfg(any(test, feature = "test-util"))]
 use std::fmt;
 
 use crate::defs::pg_type::PgType;
 
+#[cfg(any(test, feature = "test-util"))]
 /// Microseconds in one second/minute/hour/day, as Postgres's own
 /// `USECS_PER_*` macros define them. The day constant is what
 /// `interval_cmp_value` uses to collapse an interval's three fields into one
 /// comparable span, and it is also why `'24 hours' = '1 day'`.
 const USECS_PER_SEC: i64 = 1_000_000;
+#[cfg(any(test, feature = "test-util"))]
 const USECS_PER_MINUTE: i64 = 60 * USECS_PER_SEC;
+#[cfg(any(test, feature = "test-util"))]
 const USECS_PER_HOUR: i64 = 60 * USECS_PER_MINUTE;
+#[cfg(any(test, feature = "test-util"))]
 const USECS_PER_DAY: i64 = 24 * USECS_PER_HOUR;
+#[cfg(any(test, feature = "test-util"))]
 /// Postgres's `DAYS_PER_MONTH` (`datetime.h`) — the fixed 30 days
 /// `interval_cmp_value` charges a month, *only* for ordering. No arithmetic
 /// in this module ever converts months into days.
 const DAYS_PER_MONTH: i64 = 30;
 
+#[cfg(any(test, feature = "test-util"))]
 /// A failure to parse Postgres's canonical output text for a temporal type.
 ///
 /// Carries no detail beyond the family, deliberately: every caller in this
@@ -226,6 +234,7 @@ pub struct TemporalParseError {
     pub pg_type: PgType,
 }
 
+#[cfg(any(test, feature = "test-util"))]
 impl fmt::Display for TemporalParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -236,21 +245,26 @@ impl fmt::Display for TemporalParseError {
     }
 }
 
+#[cfg(any(test, feature = "test-util"))]
 impl std::error::Error for TemporalParseError {}
 
+#[cfg(any(test, feature = "test-util"))]
 /// An `interval`'s arithmetic overflowed one of its three fields —
 /// Postgres's `interval out of range` (SQLSTATE `22008`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IntervalOutOfRange;
 
+#[cfg(any(test, feature = "test-util"))]
 impl fmt::Display for IntervalOutOfRange {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("interval out of range")
     }
 }
 
+#[cfg(any(test, feature = "test-util"))]
 impl std::error::Error for IntervalOutOfRange {}
 
+#[cfg(any(test, feature = "test-util"))]
 /// Whether `pg_type` is one of the six temporal families this module
 /// handles.
 pub const fn is_temporal(pg_type: PgType) -> bool {
@@ -393,6 +407,7 @@ pub const fn supports_min_max(pg_type: PgType) -> bool {
     )
 }
 
+#[cfg(any(test, feature = "test-util"))]
 /// A temporal value's position in its family's total order, as a pair so
 /// `timetz`'s two-level `timetz_cmp_internal` sort (GMT-equivalent time,
 /// then zone) fits without a second comparison function.
@@ -404,12 +419,15 @@ pub const fn supports_min_max(pg_type: PgType) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct OrderKey(i128, i128);
 
+#[cfg(any(test, feature = "test-util"))]
 /// The sentinel [`OrderKey`] primary component for `infinity`, above every
 /// finite value. `date`/`timestamp`/`timestamptz` all accept the two special
 /// values, and Postgres orders them at the extremes of their type.
 const INFINITY: i128 = i128::MAX;
+#[cfg(any(test, feature = "test-util"))]
 const NEG_INFINITY: i128 = i128::MIN;
 
+#[cfg(any(test, feature = "test-util"))]
 /// Orders two canonical Postgres renderings of the same temporal family,
 /// reproducing that family's own comparison operator.
 ///
@@ -432,6 +450,7 @@ pub fn compare(pg_type: PgType, a: &str, b: &str) -> Option<Ordering> {
     )
 }
 
+#[cfg(any(test, feature = "test-util"))]
 /// The [`OrderKey`] for one canonical rendering.
 pub fn order_key(pg_type: PgType, text: &str) -> Result<OrderKey, TemporalParseError> {
     let err = TemporalParseError { pg_type };
@@ -447,6 +466,7 @@ pub fn order_key(pg_type: PgType, text: &str) -> Result<OrderKey, TemporalParseE
     }
 }
 
+#[cfg(any(test, feature = "test-util"))]
 /// `date_out` under `DateStyle = 'ISO, …'`: `infinity`, `-infinity`, or
 /// `YYYY-MM-DD` with an optional ` BC` suffix and a year field that widens
 /// past four digits (`5874897-12-31`).
@@ -465,6 +485,7 @@ fn parse_date(text: &str) -> Option<OrderKey> {
     Some(OrderKey(julian_day(y, m, d) as i128, 0))
 }
 
+#[cfg(any(test, feature = "test-util"))]
 /// `timestamp_out`/`timestamptz_out` under ISO: a [`parse_date`] calendar
 /// part, a space, `HH:MM:SS` with an optional trailing-zero-trimmed
 /// fraction, then — for `timestamptz` only — a `±HH[:MM[:SS]]` zone, and
@@ -503,6 +524,7 @@ fn parse_timestamp(pg_type: PgType, text: &str) -> Option<OrderKey> {
     Some(OrderKey(total, 0))
 }
 
+#[cfg(any(test, feature = "test-util"))]
 /// `timetz_out`: a [`parse_time_of_day`] clock reading followed by a
 /// mandatory `±HH[:MM[:SS]]` zone.
 ///
@@ -519,6 +541,7 @@ fn parse_timetz(text: &str) -> Option<OrderKey> {
     Some(OrderKey(gmt, -(zone_secs as i128)))
 }
 
+#[cfg(any(test, feature = "test-util"))]
 /// Splits a trailing `±HH[:MM[:SS]]` zone off `text`, returning the
 /// remainder and the offset in seconds **east** of GMT (so `+05:30` is
 /// `19800`).
@@ -546,6 +569,7 @@ fn split_zone(text: &str) -> Option<(&str, i32)> {
     Some((head, if negative { -total } else { total }))
 }
 
+#[cfg(any(test, feature = "test-util"))]
 /// `time_out`'s `HH:MM:SS[.f…]`, in microseconds since midnight.
 ///
 /// `HH` may be `24` (Postgres's legal end-of-day `time` value, distinct from
@@ -571,6 +595,7 @@ fn parse_time_of_day(text: &str) -> Option<i64> {
     Some(micros)
 }
 
+#[cfg(any(test, feature = "test-util"))]
 /// A 1-6 digit fractional-second field, scaled to microseconds.
 fn parse_fraction_micros(fraction: &str) -> Option<i64> {
     if fraction.is_empty() || fraction.len() > 6 || !fraction.bytes().all(|b| b.is_ascii_digit()) {
@@ -580,6 +605,7 @@ fn parse_fraction_micros(fraction: &str) -> Option<i64> {
     Some(digits * 10i64.pow(6 - fraction.len() as u32))
 }
 
+#[cfg(any(test, feature = "test-util"))]
 /// `YYYY-MM-DD` with an optional ` BC`, returning a proleptic year (`1 BC`
 /// is `0`, `2 BC` is `-1`) so arithmetic on it needs no era branch.
 fn parse_ymd(text: &str) -> Option<(i64, i64, i64)> {
@@ -603,6 +629,7 @@ fn parse_ymd(text: &str) -> Option<(i64, i64, i64)> {
     Some((if is_bc { -(year - 1) } else { year }, month, day))
 }
 
+#[cfg(any(test, feature = "test-util"))]
 /// Postgres's own `date2j` (`src/backend/utils/adt/datetime.c`) — a
 /// proleptic Gregorian day number. Used only for *ordering*, so the epoch it
 /// counts from is irrelevant as long as it is monotone, but keeping
@@ -623,6 +650,7 @@ fn julian_day(year: i64, month: i64, day: i64) -> i64 {
     julian + 7834 * m / 256 + day
 }
 
+#[cfg(any(test, feature = "test-util"))]
 /// Parses an exactly-`width`-digit unsigned decimal field.
 fn parse_fixed_width<T: std::str::FromStr>(text: &str, width: usize) -> Option<T> {
     if text.len() != width || !text.bytes().all(|b| b.is_ascii_digit()) {
@@ -631,6 +659,7 @@ fn parse_fixed_width<T: std::str::FromStr>(text: &str, width: usize) -> Option<T
     text.parse().ok()
 }
 
+#[cfg(any(test, feature = "test-util"))]
 /// A Postgres `interval`, stored the way Postgres stores it: three
 /// independent signed integer fields that are *never* normalised into one
 /// another.
@@ -648,6 +677,7 @@ pub struct Interval {
     pub micros: i64,
 }
 
+#[cfg(any(test, feature = "test-util"))]
 impl Interval {
     /// Postgres 17's `INTERVAL_NOEND` — the reserved all-fields-at-`MAX`
     /// triple that `interval_out` prints as `infinity`.
@@ -880,6 +910,7 @@ impl Interval {
     }
 }
 
+#[cfg(any(test, feature = "test-util"))]
 /// `interval_out`'s time field: `[-|+]HH:MM:SS[.f…]`, where `HH` is
 /// unbounded (a `9223372036854775807 usecs` interval renders
 /// `2562047788:00:54.775807`) and the sign, when present, applies to the

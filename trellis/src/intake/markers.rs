@@ -894,7 +894,7 @@ pub(super) async fn fetch_read(
 /// `waiting_to_backfill` definition on the marker's table gets the build its
 /// shape has:
 ///
-/// - **A plain (non-relationship) 1-1 definition**: its primary-key chunk
+/// - **A 1-1 definition**: its primary-key chunk
 ///   boundaries are planned before the transaction opens
 ///   ([`crate::defs::backfill::plan_one_to_one_chunks`]), and the transaction
 ///   persists them as `backfill_chunks` rows and moves the definition to
@@ -902,8 +902,7 @@ pub(super) async fn fetch_read(
 ///   threads execute the chunks, and the last one moves it to `catching_up`
 ///   and parks its go-live catch-up, whose discharge flips it `live`
 ///   ([`go_live_caught_up`]).
-/// - **An aggregate or relationship-enriched 1-1 definition**: the
-///   transaction enqueues one direct-build job as a `backfill_chunks` row and
+/// - **An aggregate**: the transaction enqueues one direct-build job as a `backfill_chunks` row and
 ///   moves the definition to `backfilling` together
 ///   (`defs::chunk_queue::dispatch_direct_build`), after a catalog-only check
 ///   that the direct build can render it
@@ -928,15 +927,12 @@ pub(super) async fn fetch_read(
 /// marker on a table nothing of that kind reads is discharged without
 /// enumerating. A `live` reader doesn't count: its build read every row, and
 /// a park that leaves it possibly missing changes moves it to `catching_up`
-/// ([`park_catch_up`]). It does on a marker that refreshes a relationship's
-/// projections, whose enumeration re-derives the consumers reading through
-/// the refreshed projection. Nor do these kinds of definition that read the table,
+/// ([`park_catch_up`]). Nor do these kinds of definition that read the table,
 /// because a page would drop their share of the rows or the build already
 /// covers them:
 ///
 /// - **One that isn't applying yet**, `waiting_to_backfill` (including one
-///   this pass doesn't dispatch, such as a relationship reader whose to-side
-///   isn't ready) or `backfilling` under a chunked or direct build. The marker
+///   this pass doesn't dispatch) or `backfilling` under a chunked or direct build. The marker
 ///   that dispatches a waiting one enumerates for it if it is ring-built;
 ///   a chunked or direct build reads the table itself, and its go-live
 ///   catch-up enumerates after.
@@ -1359,8 +1355,7 @@ enum Build {
     /// A plain 1-1 definition: these `(lo, hi]` primary-key chunk
     /// boundaries, enqueued as `backfill_chunks` rows.
     Chunks(crate::defs::backfill::PlannedRanges),
-    /// An aggregate or relationship-enriched 1-1 definition: one direct-build
-    /// job, enqueued as a `backfill_chunks` row (issue #419).
+    /// An aggregate: one direct-build job, enqueued as a `backfill_chunks` row (issue #419).
     Direct,
     /// The ring enumeration of the marker's table, flipped `live` in the
     /// discharge's own transaction.
@@ -1405,16 +1400,12 @@ async fn plan_waiting_builds(
         if rederive.contains(&id) || matches!(def.key_space, KeySpace::Join(_)) {
             continue;
         }
-        let chunked =
-            matches!(def.key_space, KeySpace::OneToOne) && !backfill::uses_relationships(&def);
-        let planned = if chunked {
+        let planned = if matches!(def.key_space, KeySpace::OneToOne) {
             backfill::plan_one_to_one_chunks(client, &def, table)
                 .await
                 .map(Build::Chunks)
         } else {
-            backfill::check_direct_build(client, &def, table)
-                .await
-                .map(|()| Build::Direct)
+            backfill::check_direct_build(&def).map(|()| Build::Direct)
         };
         let build = match planned {
             Ok(build) => build,
@@ -1751,9 +1742,9 @@ async fn go_live(txn: &Transaction<'_>, ids: &[i64]) -> Result<(), IntakeError> 
 /// the candidates' orphaned target rows (issue #485, [`discharge_marker`]).
 /// Returns the ids it flipped.
 ///
-/// "Reads" is every table the definition's build reads: its source and each
-/// relationship to-side it references (`defs::catalog::tables_read_by`, the
-/// tables its catch-ups are parked on). A definition with a marker still
+/// "Reads" is every table the definition's build reads: its source and a
+/// `JOIN`'s joined table (`defs::catalog::tables_read_by`, the tables its
+/// catch-ups are parked on). A definition with a marker still
 /// pending on another of them waits for that one's discharge.
 ///
 /// **Why `live` is honest here.** A `catching_up` definition has been
@@ -2321,7 +2312,7 @@ mod tests {
 #[cfg(test)]
 mod catch_up_tests {
     //! The rollups that need the old build and its go-live catch-up are
-    //! [`ROLLUP`], relationship-fed: that keeps them there until #625 F9,
+    //! [`ROLLUP`], which keeps them there until #625 F9,
     //! where every plain aggregate is the Re-derive build's since F5, which
     //! parks no marker. The Re-derive build's own interleavings are in
     //! `tests/build_interleavings.rs` and `tests/rederive_build.rs`.

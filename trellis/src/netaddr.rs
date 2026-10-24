@@ -42,7 +42,7 @@
 //!
 //! `macaddr`/`macaddr8` have **no** `pg_cast` row for `text` at all — their
 //! `::text` *is* `macaddr_out`/`macaddr8_out`, exactly the property every
-//! type on `catalog::TEXT_STABLE_JOIN_KEY_TYPES` needs, and both output
+//! type on `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES` needs, and both output
 //! functions are already a bijection: every accepted input spelling
 //! (colon-, hyphen-, dot-grouped, or bare hex) normalizes to one canonical
 //! lowercase colon-separated form on output, verified live across all four
@@ -66,7 +66,7 @@
 //!   on a live server across a v4/v6 grid: the two renderers disagree on
 //!   every "bare host address" value and agree on every value with an
 //!   explicit sub-maximal netmask. One value, two renderers, no arbiter —
-//!   `catalog::TEXT_STABLE_JOIN_KEY_TYPES`'s doc comment has `boolean`'s
+//!   `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES`'s doc comment has `boolean`'s
 //!   account of why that is fatal for the join/primary-key role
 //!   specifically, and the same
 //!   reasoning applies here verbatim. `inet` is *not* added to that
@@ -78,7 +78,7 @@
 //!   host-bits-must-be-zero values `cidr_in` alone accepts):
 //!   `cidr_out(v)::text = v::text` for every value tried, no exceptions. So
 //!   unlike `inet`, `cidr`'s `::text` genuinely *is* (in effect) its own
-//!   output function, and it joins `catalog::TEXT_STABLE_JOIN_KEY_TYPES`
+//!   output function, and it joins `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES`
 //!   the same way `bytea`/`oid` did.
 //!
 //! `inet`'s `GROUP BY` key role is nonetheless admitted — the same split
@@ -156,6 +156,7 @@
 //!   but Postgres never wired the aggregate to it. `registry::
 //!   aggregate_result_type` returns `None` for both, same as `bytea`.
 
+#[cfg(any(test, feature = "test-util"))]
 use std::cmp::Ordering;
 use std::fmt;
 use std::net::IpAddr;
@@ -255,6 +256,7 @@ fn mask_prefix(bits: u128, prefix_len: u8) -> u128 {
     }
 }
 
+#[cfg(any(test, feature = "test-util"))]
 /// Reproduces `network_cmp`'s ordering exactly — verified live across:
 /// cross-family pairs (`family` alone decides, address-independent: `4 <
 /// 6`, checked with values at both extremes of each family's range so no
@@ -283,6 +285,7 @@ fn compare_addr(a: Addr, b: Addr) -> Ordering {
     a.bits.cmp(&b.bits)
 }
 
+#[cfg(any(test, feature = "test-util"))]
 /// [`compare_addr`] over two renderings of `inet` text — `None` if either
 /// side doesn't parse, the same defensive posture
 /// [`crate::temporal::compare`] takes for its own family.

@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use super::ast::{RelationshipDef, TransformDef, ValueType};
+use super::ast::{TransformDef, ValueType};
 
 /// A transform definition as stored in the catalog: the parsed AST — source
 /// table, target table name, and calculated fields are all on
@@ -80,8 +80,8 @@ pub fn applying_sql(alias: &str) -> String {
 /// [`TransformStatus::WaitingToBackfill`], and the backfill discharge
 /// (ADR-0002) moves it on: to [`TransformStatus::Backfilling`] together with
 /// the chunks or job that build it, then [`TransformStatus::CatchingUp`] when
-/// the last one finishes (or its direct-build job does, for an aggregate or
-/// relationship-enriched 1-1 definition), and [`TransformStatus::Live`] once
+/// the last one finishes (or its direct-build job does, for an aggregate),
+/// and [`TransformStatus::Live`] once
 /// the go-live catch-up that build parked has been discharged (issue #476).
 /// A ring-built definition goes straight to `live`, or to `catching_up` when
 /// its source is another definition's target.
@@ -228,10 +228,9 @@ impl TransformStatus {
     /// other text — meaning the row was written by something other than
     /// this module's own writers, since `transform_definitions.status`'s
     /// `check` constraint only allows these six values. Named
-    /// `from_persisted` for the same reason [`RelationshipCardinality::from_persisted`]
-    /// is: this isn't `std::str::FromStr` (no matching `Err` type worth
-    /// inventing for a value that should only ever come from this table's
-    /// own `check` constraint).
+    /// `from_persisted` because this isn't `std::str::FromStr` (no matching
+    /// `Err` type worth inventing for a value that should only ever come from
+    /// this table's own `check` constraint).
     pub fn from_persisted(text: &str) -> Option<Self> {
         match text {
             "waiting_to_backfill" => Some(TransformStatus::WaitingToBackfill),
@@ -245,127 +244,47 @@ impl TransformStatus {
     }
 }
 
-/// A relationship declaration as stored in the catalog (issue #26): the
-/// parsed [`RelationshipDef`] plus the catalog-assigned id. Unlike
-/// [`Definition`], there's no `source_version`/`source_columns` to carry —
-/// a relationship's endpoints aren't validated against a live column-type
-/// map the way a transform's source is (no source-schema DDL, ADR-0005), so
-/// nothing here depends on the from-side table's version. `cardinality` is
-/// [`super::catalog::create_relationship`]'s one piece of derived state
-/// (issue #27): computed once, live against `pg_catalog`, at creation time
-/// and persisted rather than re-introspected on every read, so a later
-/// reference-time check (validating a bare-path vs. aggregate-wrapped use of
-/// the relationship — deferred past issue #27, since no such reference
-/// syntax resolves yet) has a stable answer even if the underlying
-/// PK/`UNIQUE` index is later dropped.
+/// A relationship as `staging::unindexed_joins` reads it. No definition
+/// reads a relationship since #1115, so nothing constructs one; the type
+/// stays, with [`RelationshipDef`] and [`RelationshipCardinality`], only so
+/// that module compiles unchanged until #1347 decides its fate.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RelationshipDefinition {
-    pub id: i64,
-    /// The schema `def.from_table` resolved to when the relationship was
-    /// declared (`relationship_definitions.from_schema`, issues #285/#288).
-    /// `def.from_table` is the bare name as written; this is what makes it
-    /// one specific table. A relationship's identity is
-    /// `(from_schema, from_table, name)`, so `blog.posts.author` and
-    /// `shop.posts.author` are two different relationships.
+pub(crate) struct RelationshipDefinition {
     pub from_schema: String,
-    /// The schema `def.to_table` resolved to when the relationship was
-    /// declared (`relationship_definitions.to_schema`, issue #372). Like
-    /// `from_schema`, it pins the to-side to one specific table, so a reader
-    /// whose `search_path` finds a different `to_table` first still reads the
-    /// table the relationship was declared against.
     pub to_schema: String,
     pub def: RelationshipDef,
     pub cardinality: RelationshipCardinality,
 }
 
 impl RelationshipDefinition {
-    /// The from-table's fully-qualified `"schema.table"` identity, the same
-    /// spelling `transform_definitions.source_table`, `schema_nodes` and a
-    /// staged `src_table` all use. Anything that reads the from-side table,
-    /// or matches it against a transform's source, must use this rather than
-    /// the bare `def.from_table`: a bare name resolves through whatever
-    /// `search_path` the reading session has, which need not land on the
-    /// table this relationship was declared against.
+    /// The from-table's fully-qualified `"schema.table"` identity.
     pub fn qualified_from_table(&self) -> String {
         format!("{}.{}", self.from_schema, self.def.from_table)
     }
 
-    /// The to-table's fully-qualified `"schema.table"` identity, the to-side
-    /// mirror of [`Self::qualified_from_table`] (issue #372). Anything that
-    /// reads the to-side table, or matches it against a changed table, must
-    /// use this rather than the bare `def.to_table`.
+    /// The to-table's fully-qualified `"schema.table"` identity.
     pub fn qualified_to_table(&self) -> String {
         format!("{}.{}", self.to_schema, self.def.to_table)
     }
 }
 
-/// Whether a relationship's to-side is guaranteed at most one row per
-/// from-row (issue #27, ADR-0006): [`RelationshipCardinality::ToOne`] iff
-/// `to_col` is the sole column of a `PRIMARY KEY` or `UNIQUE` index on
-/// `to_table` at the moment the relationship is declared, `ToMany`
-/// otherwise. ADR-0006 requires a `ToMany` relationship's bare-path
-/// references to be rejected in favor of an aggregate-wrapped form — that
-/// rejection is reference-time (checked where a relationship is *used* in a
-/// calculated field), and deferred past issue #27 since no such reference
-/// resolves yet (see [`super::ast::Expr::RelationshipPath`]'s current
-/// unconditional rejection in [`super::validate`]); this type exists now so
-/// that check has something to read once it lands.
+/// A relationship's name and join columns; see [`RelationshipDefinition`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RelationshipDef {
+    pub name: String,
+    pub from_table: String,
+    pub from_col: String,
+    pub to_table: String,
+    pub to_col: String,
+}
+
+/// Whether a relationship's to-side has at most one row per from-row; see
+/// [`RelationshipDefinition`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RelationshipCardinality {
+#[expect(dead_code, reason = "staging::unindexed_joins' input until #1347")]
+pub(crate) enum RelationshipCardinality {
     ToOne,
     ToMany,
-}
-
-impl RelationshipCardinality {
-    /// The text this variant is persisted/queried as in
-    /// `relationship_definitions.cardinality`.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            RelationshipCardinality::ToOne => "one",
-            RelationshipCardinality::ToMany => "many",
-        }
-    }
-
-    /// Parses [`Self::as_str`]'s persisted form back, or `None` for any
-    /// other text — meaning the row was written by something other than
-    /// [`super::catalog::create_relationship`]. Named `from_persisted`
-    /// rather than `from_str` so it isn't confused with (and doesn't trip
-    /// clippy's `should_implement_trait` lint against) `std::str::FromStr`,
-    /// which this isn't — there's no matching `Err` type worth inventing
-    /// for a value that should only ever come from this table's own
-    /// `check` constraint.
-    pub fn from_persisted(text: &str) -> Option<Self> {
-        match text {
-            "one" => Some(RelationshipCardinality::ToOne),
-            "many" => Some(RelationshipCardinality::ToMany),
-            _ => None,
-        }
-    }
-}
-
-/// Which endpoint of a relationship a create-time rejection is about
-/// (issue #429): the `FROM` table, which holds the join column, or the `TO`
-/// table that column points at.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RelationshipSide {
-    From,
-    To,
-}
-
-impl RelationshipSide {
-    /// `"from-side"` or `"to-side"`, the wording rejection messages use.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            RelationshipSide::From => "from-side",
-            RelationshipSide::To => "to-side",
-        }
-    }
-}
-
-impl std::fmt::Display for RelationshipSide {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
 }
 
 /// Which role [`super::catalog::resolve_node`] is being asked to establish for
@@ -385,8 +304,8 @@ pub enum NodeKind {
 }
 
 /// A first-class identity for a table Trellis knows about — as a source, a
-/// target, or (via chained transforms) both — that transforms (and, as of
-/// issue #74, relationships too) resolve their endpoints against instead of
+/// target, or (via chained transforms) both — that transforms resolve their
+/// endpoints against instead of
 /// a bare table-name string. One row per physical table: `is_source`/
 /// `is_target` each start `false` and are only ever set to `true` by
 /// [`super::catalog::resolve_node`], never back to `false`. Only identity is

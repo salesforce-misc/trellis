@@ -77,7 +77,7 @@ async fn connect_raw(dsn: &str) -> Client {
 
 /// Defines a `JOIN` whose one `ON` term pairs `left.lcol` with
 /// `right.rcol`. `JOIN` key admission reads the same allowlist
-/// (`catalog::is_text_stable_join_key_type`) a 1-1 primary key does.
+/// (`join_key_types::is_text_stable_join_key_type`) a 1-1 primary key does.
 async fn define_join_on(
     pool: &trellis::pool::Pool,
     target: &str,
@@ -191,7 +191,7 @@ async fn to_jsonb_and_text_agree_for_jsonb() {
 /// but an embedded JSON number preserves its input scale, so two spellings
 /// of the *same number* remain `jsonb`-equal while diverging under
 /// `::text` — the reason `jsonb` is not on
-/// `catalog::TEXT_STABLE_JOIN_KEY_TYPES` despite clearing the key-order bar.
+/// `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES` despite clearing the key-order bar.
 #[tokio::test]
 async fn key_order_is_canonicalized_but_embedded_number_scale_is_not() {
     let cluster = TestCluster::start();
@@ -234,7 +234,7 @@ async fn key_order_is_canonicalized_but_embedded_number_scale_is_not() {
 
 /// A `jsonb` column is refused as a `JOIN` `ON` key and as a 1-1
 /// primary key — the live-facing regression pin for
-/// `catalog::TEXT_STABLE_JOIN_KEY_TYPES`'s deliberate `jsonb` absence.
+/// `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES`'s deliberate `jsonb` absence.
 #[tokio::test]
 async fn jsonb_is_refused_as_a_join_key_and_primary_key() {
     let cluster = TestCluster::start();
@@ -274,8 +274,7 @@ fn jsonb_group_by_key_is_refused() {
     let def =
         parse("TRANSFORM t FROM s GROUP BY j WITHOUT SOURCE INDEX SELECT j AS k, SUM(n) AS total")
             .expect("parses");
-    validate(&def, &source_columns(), &HashMap::new())
-        .expect_err("jsonb must still be refused as a GROUP BY key");
+    validate(&def, &source_columns()).expect_err("jsonb must still be refused as a GROUP BY key");
 }
 
 // ---------------------------------------------------------------------
@@ -433,7 +432,7 @@ async fn jsonb_agg_includes_null_rows_unlike_every_other_aggregate() {
         ("g".to_string(), ValueType::Integer(IntWidth::Int4)),
         ("v".to_string(), ValueType::Other(PgType::Jsonb)),
     ]);
-    validate(&def, &columns, &HashMap::new()).expect("validate");
+    validate(&def, &columns).expect("validate");
 
     let rows: Vec<Row> = vec![
         Row::from([
@@ -533,7 +532,7 @@ async fn jsonb_agg_fold_matches_a_server_side_aggregate() {
         let def = parse("TRANSFORM t FROM s GROUP BY id WITHOUT SOURCE INDEX SELECT id AS k, JSONB_AGG(j) AS items")
             .expect("parses");
         let columns = source_columns();
-        validate(&def, &columns, &HashMap::new()).expect("validate");
+        validate(&def, &columns).expect("validate");
 
         let rows: Vec<Row> = group
             .iter()

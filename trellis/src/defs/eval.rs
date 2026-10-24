@@ -29,8 +29,9 @@ use crate::float::{self, FloatError, FloatWidth};
 use crate::integer::{self, IntWidth, IntegerError};
 use crate::numeric::{Numeric, NumericParseError};
 
-use super::ast::{Expr, FieldDef, GroupByKey, KeySpace, Operator, TransformDef, ValueType};
-use super::model::RelationshipCardinality;
+#[cfg(any(test, feature = "test-util"))]
+use super::ast::KeySpace;
+use super::ast::{Expr, FieldDef, Operator, TransformDef, ValueType};
 use super::pg_type::PgType;
 use crate::error_code::ErrorCode;
 
@@ -49,118 +50,6 @@ pub type Row = HashMap<String, Option<String>>;
 /// compile); reusing one across `evaluate` calls for the same definition is
 /// what avoids the per-row recompilation.
 pub type RegexCache = HashMap<String, Regex>;
-
-/// One to-one relationship's read-side data, everything the evaluator needs
-/// to resolve a `<rel>.<column>` path (issue #28): the from-row column that
-/// holds the join key, the to-side rows to look that key up in, and the
-/// to-side column types so a referenced column's text parses the same way a
-/// source column's does.
-///
-/// `to_rows_by_key` is indexed by the *text* of the to-side join column
-/// (`to_col`), and the from-row's join key is matched against it by the same
-/// text. That's exact for the join-key types Trellis relationships actually
-/// use as a to-side `PRIMARY KEY`/`UNIQUE` column — integers, UUIDs, text —
-/// whose canonical text encoding is stable; it is *not* scale-insensitive for
-/// a fractional-numeric key (Postgres treats `1` and `1.0` as equal in a
-/// join, this index would not — issue #110's *type*-lossiness axis, still
-/// open, blocked on #108). A to-side row whose `to_col` is `NULL` must
-/// be omitted from the index by the builder: SQL `NULL` never joins, so it
-/// has no key.
-///
-/// This `NULL`-exclusion is deliberately **not** issue #110's NULL-lossiness
-/// bug: this is a real SQL join (a relationship's `from_col = to_col`), where
-/// ANSI `NULL <> NULL` is the *correct* semantics (a from-row with a `NULL`
-/// join value has no related row, same as `LEFT JOIN ON from_col = to_col`
-/// would compute) — unlike an aggregate group's downstream propagation
-/// identity (`staging::apply::read_live_rows_batch`), which is a *primary-key*
-/// round-trip ("is this the same group as before"), not a join, and where a
-/// `NULL` component legitimately needs to resolve to itself. Confirmed by
-/// reading this module during #110's investigation: no change needed here.
-pub struct ToOneRelationship {
-    /// The from-row column whose value is the join key (the relationship's
-    /// `from_col`).
-    pub from_col: String,
-    /// The relationship's cardinality, so a to-*many* relationship referenced
-    /// as a bare path can be rejected here rather than silently taking an
-    /// arbitrary matching row (aggregate-wrapped to-many is issue #29).
-    pub cardinality: RelationshipCardinality,
-    /// The to-side column value-types, used to parse a referenced column's
-    /// text. A column absent here defaults to `Numeric`, matching the
-    /// [`Row`]-column handling in [`eval_expr`].
-    pub to_columns: HashMap<String, ValueType>,
-    /// The to-side rows, keyed by their `to_col` text value. A from-row whose
-    /// join key is absent (or `NULL`) has no match — LEFT JOIN semantics, the
-    /// enrichment column evaluates to `NULL`.
-    pub to_rows_by_key: HashMap<String, Row>,
-}
-
-/// One to-many relationship's read-side data (issue #29): the aggregate
-/// counterpart to [`ToOneRelationship`]. Where a to-one path resolves a single
-/// related row, a to-many path is only legal wrapped in an aggregate
-/// (`SUM(comments.word_count)`, ADR-0006), which folds over the *set* of
-/// related to-side rows sharing the from-row's join value. That set is what
-/// `to_rows_by_key` holds — a `Vec<Row>` per join-key text, instead of the
-/// single `Row` a to-one carries.
-///
-/// The join value is keyed by the same raw *text* as [`ToOneRelationship`]
-/// (see that type's note on scale-insensitivity for fractional-numeric keys),
-/// for consistency; a from-row whose join key is absent from the map (or
-/// `NULL`) has an empty related set — the aggregate's empty result
-/// (`COUNT` → `0`, `SUM`/`MIN`/`MAX`/`AVG` → `NULL`).
-pub struct ToManyRelationship {
-    /// The from-row column whose value is the join key (the relationship's
-    /// `from_col`), matched against the to-side rows' key text.
-    pub from_col: String,
-    /// The to-side column value-types, used to parse a referenced column's
-    /// text, exactly as [`ToOneRelationship::to_columns`].
-    pub to_columns: HashMap<String, ValueType>,
-    /// The related to-side rows grouped by their join-value text. A key with
-    /// no entry (or a `NULL` from-side join key) is the empty set.
-    pub to_rows_by_key: HashMap<String, Vec<Row>>,
-}
-
-/// The relationships available to the evaluator, keyed by the relationship
-/// name that heads a `<rel>.<column>` path. The pure [`evaluate`] entry
-/// supplies an empty one (matching pre-#28 behavior: a path then errors with
-/// [`EvalError::UnknownRelationship`]); [`evaluate_with_relationships`] threads
-/// a populated one built by the caller (the staging integration is issue #30).
-///
-/// To-one relationships (a bare `<rel>.<column>` path, issue #28) live in
-/// `by_name`; to-many relationships (an aggregate-wrapped path, issue #29) in
-/// `to_many_by_name`. A given relationship name resolves as exactly one of the
-/// two — the two maps are disjoint.
-#[derive(Default)]
-pub struct RelationshipContext {
-    by_name: HashMap<String, ToOneRelationship>,
-    to_many_by_name: HashMap<String, ToManyRelationship>,
-}
-
-impl RelationshipContext {
-    /// Builds a context from relationship-name to its resolved to-one data,
-    /// with no to-many relationships.
-    #[cfg_attr(
-        not(any(test, feature = "internals")),
-        expect(dead_code, reason = "#1115 R4 removes relationship evaluation")
-    )]
-    pub fn new(by_name: HashMap<String, ToOneRelationship>) -> Self {
-        Self {
-            by_name,
-            to_many_by_name: HashMap::new(),
-        }
-    }
-
-    /// Adds the to-many relationship data (issue #29), for a context that has
-    /// aggregate-wrapped relationship paths to resolve. Chains onto [`new`].
-    #[cfg_attr(
-        not(any(test, feature = "internals")),
-        expect(dead_code, reason = "#1115 R4 removes relationship evaluation")
-    )]
-    #[must_use]
-    pub fn with_to_many(mut self, to_many_by_name: HashMap<String, ToManyRelationship>) -> Self {
-        self.to_many_by_name = to_many_by_name;
-        self
-    }
-}
 
 /// A calculated value the evaluator produces, per [`ValueType`]. `Uuid`
 /// (issue #79) carries its Postgres text rendering verbatim, the same way
@@ -225,10 +114,9 @@ impl PartialEq for Value {
 }
 
 impl Value {
-    /// This value's [`ValueType`]. Issue #111 promoted it out of
-    /// `#[cfg(test)]`: the aggregate folds now dispatch on whether a value
-    /// is in the exact-numeric family, so the mapping is production code,
-    /// not just a test convenience.
+    /// This value's [`ValueType`]: the aggregate folds dispatch on whether a
+    /// value is in the exact-numeric family.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn value_type(&self) -> ValueType {
         match self {
             Value::Numeric(_) => ValueType::Numeric,
@@ -251,7 +139,7 @@ impl fmt::Display for Value {
             // zeros and no separators. That agreement is what lets an
             // integer value round-trip through the still-text-keyed
             // join/primary-key/`GROUP BY` paths byte-for-byte — see
-            // `catalog::TEXT_STABLE_JOIN_KEY_TYPES`.
+            // `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES`.
             Value::Integer(_, n) => write!(f, "{n}"),
             // Issue #112: `crate::float::render` reproduces `float4out`/
             // `float8out` under `extra_float_digits >= 1` exactly, so a
@@ -383,34 +271,6 @@ pub enum EvalError {
     /// and gets exercised standalone in tests and by future callers (#25),
     /// so this is defense-in-depth against a stack overflow.
     Cycle(String),
-    /// A field's expression contains a `<rel>.<column>` relationship-path
-    /// reference (issue #25's grammar). The validator (#23) rejects this
-    /// outright via `ValidationError::UnsupportedRelationshipPath`, so this
-    /// arm is defense-in-depth for the same reason as [`EvalError::Cycle`]:
-    /// `evaluate`/`evaluate_aggregate` are `pub` and can be called directly,
-    /// bypassing `validate`. Resolving and evaluating a relationship path is
-    /// a separate, later issue.
-    UnsupportedRelationshipPath {
-        field: String,
-        rel: String,
-        column: String,
-    },
-    /// A field references a relationship name (the `<rel>` head of a path)
-    /// that the caller supplied no data for. The validator is supposed to
-    /// reject an unknown relationship before eval, so this is defense-in-depth
-    /// for the same reason as [`EvalError::Cycle`] — and it's also what the
-    /// pure [`evaluate`] entry (empty [`RelationshipContext`]) returns for any
-    /// relationship path.
-    UnknownRelationship { field: String, rel: String },
-    /// A field references a to-*many* relationship as a bare `<rel>.<column>`
-    /// path in a non-aggregate (row) context. A to-many relationship's
-    /// enrichment must be aggregate-wrapped (issue #29, ADR-0006); a bare path
-    /// has no single row to read.
-    AggregateRequiredForToMany {
-        field: String,
-        rel: String,
-        column: String,
-    },
     /// A `MIN`/`MAX(enum)` fold ([`reduce_enum_aggregate`]) was handed a
     /// group with more than one *distinct* value (issue #117).
     ///
@@ -438,15 +298,7 @@ pub enum EvalError {
     /// evaluator in production at all — the ledger (`staging::ledger`)
     /// always resolves its written value with a live server-side
     /// `min()`/`max()` instead, which answers the real creation-order
-    /// question this evaluator cannot. The one shape that *can*
-    /// genuinely reach this variant in production — a `KeySpace::OneToOne`
-    /// field's `MIN`/`MAX` wrapping a to-many relationship path
-    /// (`eval_to_many_aggregate`, issue #29), which has no live-SQL
-    /// fallback the way `KeySpace::Aggregate` does — is refused earlier, at
-    /// validation time
-    /// ([`super::validate::ValidationError::EnumAggregateOverToManyRelationshipUnsupported`]),
-    /// specifically so it can never reach here with a real multi-value
-    /// group either. In practice this variant is exercised only by this
+    /// question this evaluator cannot. In practice this variant is exercised only by this
     /// module's own unit tests and by the test-only
     /// `defs::oracle::recompute_aggregate` cross-check, the same as
     /// `BitStringLengthMismatch` — see that variant's own doc comment for
@@ -477,9 +329,7 @@ pub enum EvalError {
     ///
     /// **Reachability mirrors `EnumOrderingUnavailable` exactly** — see that
     /// variant's own doc comment; every word of its reachability argument
-    /// applies here with "text" in place of "enum" and
-    /// [`super::validate::ValidationError::TextAggregateOverToManyRelationshipUnsupported`]
-    /// in place of the enum validation guard.
+    /// applies here with "text" in place of "enum".
     TextOrderingUnavailable {
         field: String,
         function: &'static str,
@@ -513,7 +363,7 @@ impl EvalError {
     /// `(transform, column)` pair: `staging::quarantine`'s isolate-before-
     /// blaming probe knows which [`TransformDef`] it just evaluated, and
     /// pairs that with this field name rather than needing this error type
-    /// (or [`evaluate`]/[`evaluate_with_relationships`]'s signature) to carry
+    /// (or [`evaluate`]'s signature) to carry
     /// transform identity itself.
     pub fn field(&self) -> &str {
         match self {
@@ -524,9 +374,6 @@ impl EvalError {
             | EvalError::FloatOutOfRange { field, .. }
             | EvalError::IntervalOutOfRange { field }
             | EvalError::BitStringLengthMismatch { field, .. }
-            | EvalError::UnsupportedRelationshipPath { field, .. }
-            | EvalError::UnknownRelationship { field, .. }
-            | EvalError::AggregateRequiredForToMany { field, .. }
             | EvalError::EnumOrderingUnavailable { field, .. }
             | EvalError::TextOrderingUnavailable { field, .. } => field,
             EvalError::Cycle(field) => field,
@@ -577,22 +424,6 @@ impl fmt::Display for EvalError {
                 f,
                 "calculated field '{field}' is part of a cyclic reference"
             ),
-            EvalError::UnsupportedRelationshipPath { field, rel, column } => write!(
-                f,
-                "calculated field '{field}' references relationship path '{rel}.{column}', \
-                 which is not yet supported (grammar-only per issue #25)"
-            ),
-            EvalError::UnknownRelationship { field, rel } => write!(
-                f,
-                "calculated field '{field}' references relationship '{rel}', which is not \
-                 available to the evaluator"
-            ),
-            EvalError::AggregateRequiredForToMany { field, rel, column } => write!(
-                f,
-                "calculated field '{field}' references to-many relationship path \
-                 '{rel}.{column}' without an aggregate; a to-many relationship must be \
-                 aggregate-wrapped"
-            ),
             EvalError::EnumOrderingUnavailable {
                 field,
                 function,
@@ -624,9 +455,6 @@ impl std::error::Error for EvalError {
             | EvalError::IntervalOutOfRange { .. }
             | EvalError::BitStringLengthMismatch { .. }
             | EvalError::Cycle(_)
-            | EvalError::UnsupportedRelationshipPath { .. }
-            | EvalError::UnknownRelationship { .. }
-            | EvalError::AggregateRequiredForToMany { .. }
             | EvalError::EnumOrderingUnavailable { .. }
             | EvalError::TextOrderingUnavailable { .. } => None,
         }
@@ -654,64 +482,14 @@ pub fn evaluate(
     source_columns: &HashMap<String, ValueType>,
     regex_cache: &mut RegexCache,
 ) -> Result<HashMap<String, Option<Value>>, EvalError> {
-    evaluate_with_relationships(
-        def,
-        row,
-        source_columns,
-        &RelationshipContext::default(),
-        regex_cache,
-    )
+    evaluate_excluding(def, row, source_columns, regex_cache, &HashSet::new())
 }
 
 /// [`evaluate`], skipping every field named in `excluded` — ADR-0003's
-/// column-level quarantine: a paused column must not be
-/// re-evaluated (it would just reproduce the same failure that paused it
-/// forever), and its target value freezes at whatever it last held rather
-/// than being overwritten. See [`evaluate_with_relationships_excluding`] for
-/// the full contract; this is its no-relationships convenience form, mirroring
-/// [`evaluate`]'s own relationship to [`evaluate_with_relationships`].
-pub fn evaluate_excluding(
-    def: &TransformDef,
-    row: &Row,
-    source_columns: &HashMap<String, ValueType>,
-    regex_cache: &mut RegexCache,
-    excluded: &HashSet<String>,
-) -> Result<HashMap<String, Option<Value>>, EvalError> {
-    evaluate_with_relationships_excluding(
-        def,
-        row,
-        source_columns,
-        &RelationshipContext::default(),
-        regex_cache,
-        excluded,
-    )
-}
-
-/// Like [`evaluate`], but with [`RelationshipContext`] read-side data so a
-/// field's `<rel>.<column>` to-one relationship path (issue #28) resolves the
-/// single related row and reads the referenced column. A path whose `rel` has
-/// no entry in `relationships` errors ([`EvalError::UnknownRelationship`]);
-/// with the empty context [`evaluate`] passes, any path errors, matching the
-/// pure evaluator's pre-#28 behavior.
-#[cfg(any(test, feature = "test-util"))]
-pub fn evaluate_with_relationships(
-    def: &TransformDef,
-    row: &Row,
-    source_columns: &HashMap<String, ValueType>,
-    relationships: &RelationshipContext,
-    regex_cache: &mut RegexCache,
-) -> Result<HashMap<String, Option<Value>>, EvalError> {
-    evaluate_with_relationships_excluding(
-        def,
-        row,
-        source_columns,
-        relationships,
-        regex_cache,
-        &HashSet::new(),
-    )
-}
-
-/// [`evaluate_with_relationships`], skipping every field named in `excluded`.
+/// column-level quarantine: a paused column must not be re-evaluated (it
+/// would just reproduce the same failure that paused it forever), and its
+/// target value freezes at whatever it last held rather than being
+/// overwritten.
 ///
 /// A field in `excluded` is never handed to [`eval_field`] at all — its cache
 /// slot is pre-seeded `None` instead, so any *other* field that references it
@@ -720,20 +498,17 @@ pub fn evaluate_with_relationships(
 /// field itself is omitted from the returned map entirely (not present as
 /// `None`) so [`super::super::staging::apply::compute`]'s write plan can tell
 /// "paused, don't touch this column" apart from "genuinely evaluated to
-/// NULL." `excluded` is normally empty (every existing caller stays on this
-/// behavior via [`evaluate_with_relationships`]/[`evaluate`]); it's non-empty
-/// only when the caller has already looked up which of this definition's
-/// columns are currently paused (ADR-0003).
+/// NULL." `excluded` is non-empty only when the caller has already looked up
+/// which of this definition's columns are currently paused (ADR-0003).
 ///
 /// `excluded` must be closed over alias readers ([`AliasReaders::close`],
 /// issue #748): a field left in that reads an excluded one by alias would
 /// read the `None` seeded here and be written NULL, where ADR-0003 freezes
 /// it. Every caller's paused set is read through that closure.
-pub fn evaluate_with_relationships_excluding(
+pub fn evaluate_excluding(
     def: &TransformDef,
     row: &Row,
     source_columns: &HashMap<String, ValueType>,
-    relationships: &RelationshipContext,
     regex_cache: &mut RegexCache,
     excluded: &HashSet<String>,
 ) -> Result<HashMap<String, Option<Value>>, EvalError> {
@@ -762,7 +537,6 @@ pub fn evaluate_with_relationships_excluding(
                 field,
                 row,
                 source_columns,
-                relationships,
                 &fields_by_name,
                 &mut cache,
                 &mut in_progress,
@@ -789,7 +563,7 @@ pub fn evaluate_with_relationships_excluding(
 ///
 /// ADR-0003 freezes a paused field rather than nulling it, and a field that
 /// reads a paused one by alias is paused too: evaluating it would read the
-/// paused field as absent ([`evaluate_with_relationships_excluding`]) and
+/// paused field as absent ([`evaluate_excluding`]) and
 /// write NULL. [`Self::close`] is how every paused-field read
 /// (`staging::quarantine::paused_columns_for` and its copies) takes that in,
 /// and how a field build adds the fields that read the ones it rebuilds.
@@ -851,55 +625,6 @@ impl AliasReaders {
     }
 }
 
-/// Every `<rel>.<column>` relationship reference in `def`'s field expressions
-/// *and* (issue #137) its `GROUP BY` keys, as `(relationship_name, column)`
-/// pairs — bare to-one paths ([`Expr::RelationshipPath`]), aggregate-wrapped
-/// to-many paths (`SUM(<rel>.<column>)`, which parse to a
-/// [`Expr::FunctionCall`] whose sole argument is a path), and a to-one
-/// relationship path used as a [`super::ast::KeySpace::Aggregate`] `GROUP BY`
-/// key. The staging reverse-recompute path (issue #30) uses this to learn
-/// which relationships a target reads — and which of their to-side columns —
-/// so it can build a [`RelationshipContext`] for the from-side recompute
-/// without re-walking the AST itself; [`super::catalog::resolve_relationships`]
-/// uses it the same way to resolve every relationship the validator needs to
-/// check, regardless of whether a definition reads it via a field or a
-/// `GROUP BY` key. Pairs may repeat if the same reference appears more than
-/// once; the caller dedups.
-pub fn relationship_references(def: &TransformDef) -> Vec<(String, String)> {
-    let mut refs = Vec::new();
-    for field in &def.fields {
-        collect_relationship_refs(&field.expr, &mut refs);
-    }
-    if let KeySpace::Aggregate { group_by } = &def.key_space {
-        for key in group_by {
-            if let GroupByKey::RelationshipPath { rel, column } = key {
-                refs.push((rel.clone(), column.clone()));
-            }
-        }
-    }
-    refs
-}
-
-fn collect_relationship_refs(expr: &Expr, out: &mut Vec<(String, String)>) {
-    match expr {
-        Expr::RelationshipPath { rel, column } => out.push((rel.clone(), column.clone())),
-        Expr::BinaryOp { lhs, rhs, .. } => {
-            collect_relationship_refs(lhs, out);
-            collect_relationship_refs(rhs, out);
-        }
-        Expr::FunctionCall { args, .. } => {
-            for arg in args {
-                collect_relationship_refs(arg, out);
-            }
-        }
-        Expr::Column(_)
-        | Expr::SourceColumn { .. }
-        | Expr::NumberLiteral(_)
-        | Expr::StringLiteral(_)
-        | Expr::TypedLiteral { .. } => {}
-    }
-}
-
 /// Reads source column `name` from `row`, parsed as the column's type.
 fn read_source_column(
     field_name: &str,
@@ -935,7 +660,6 @@ fn eval_field(
     field: &FieldDef,
     row: &Row,
     source_columns: &HashMap<String, ValueType>,
-    relationships: &RelationshipContext,
     fields_by_name: &HashMap<&str, &FieldDef>,
     cache: &mut HashMap<String, Option<Value>>,
     in_progress: &mut HashSet<String>,
@@ -952,7 +676,6 @@ fn eval_field(
         &field.name,
         row,
         source_columns,
-        relationships,
         fields_by_name,
         cache,
         in_progress,
@@ -975,7 +698,6 @@ fn eval_expr(
     field_name: &str,
     row: &Row,
     source_columns: &HashMap<String, ValueType>,
-    relationships: &RelationshipContext,
     fields_by_name: &HashMap<&str, &FieldDef>,
     cache: &mut HashMap<String, Option<Value>>,
     in_progress: &mut HashSet<String>,
@@ -995,7 +717,6 @@ fn eval_expr(
                     calc_field,
                     row,
                     source_columns,
-                    relationships,
                     fields_by_name,
                     cache,
                     in_progress,
@@ -1019,68 +740,12 @@ fn eval_expr(
         Expr::TypedLiteral { value_type, text } => {
             typed_literal_value(*value_type, text, field_name).map(Some)
         }
-        Expr::RelationshipPath { rel, column } => {
-            // To-one resolution (issue #28): find the relationship, read the
-            // from-row's join key, look up the single to-side row by that key,
-            // and read the referenced column from it. A missing match (no
-            // to-side row, or a NULL join key) is NULL enrichment — LEFT JOIN
-            // semantics — leaving the from-row itself intact.
-            let Some(reldata) = relationships.by_name.get(rel) else {
-                return Err(EvalError::UnknownRelationship {
-                    field: field_name.to_string(),
-                    rel: rel.clone(),
-                });
-            };
-            if reldata.cardinality == RelationshipCardinality::ToMany {
-                // A bare to-many path has no single row to read; issue #29
-                // handles the aggregate-wrapped form.
-                return Err(EvalError::AggregateRequiredForToMany {
-                    field: field_name.to_string(),
-                    rel: rel.clone(),
-                    column: column.clone(),
-                });
-            }
-            // The join key comes from the from-row's `from_col`. A NULL key
-            // never joins (SQL `NULL != NULL`), so it's a no-match → NULL.
-            let key = match row.get(&reldata.from_col) {
-                Some(Some(text)) => text,
-                Some(None) => return Ok(None),
-                None => {
-                    return Err(EvalError::MissingColumn {
-                        field: field_name.to_string(),
-                        column: reldata.from_col.clone(),
-                    });
-                }
-            };
-            let Some(to_row) = reldata.to_rows_by_key.get(key) else {
-                return Ok(None);
-            };
-            // Read the enrichment column off the matched to-side row, parsing
-            // its text with the to-side column's type (defaulting to Numeric,
-            // matching the `Expr::Column` arm above).
-            match to_row.get(column) {
-                Some(Some(text)) => {
-                    let value_type = reldata
-                        .to_columns
-                        .get(column)
-                        .copied()
-                        .unwrap_or(ValueType::Numeric);
-                    parse_value(field_name, value_type, text).map(Some)
-                }
-                Some(None) => Ok(None),
-                None => Err(EvalError::MissingColumn {
-                    field: field_name.to_string(),
-                    column: column.clone(),
-                }),
-            }
-        }
         Expr::BinaryOp { op, lhs, rhs } => {
             let lhs = eval_expr(
                 lhs,
                 field_name,
                 row,
                 source_columns,
-                relationships,
                 fields_by_name,
                 cache,
                 in_progress,
@@ -1091,30 +756,12 @@ fn eval_expr(
                 field_name,
                 row,
                 source_columns,
-                relationships,
                 fields_by_name,
                 cache,
                 in_progress,
                 regex_cache,
             )?;
             apply_operator(*op, lhs, rhs, field_name)
-        }
-        // A to-many relationship enrichment (issue #29): an aggregate function
-        // whose sole argument is a `<rel>.<column>` path. Unlike a GROUP BY
-        // aggregate — which folds over a group of the target's own source rows
-        // (`eval_aggregate_expr`) — this folds over the *related* to-side rows
-        // sharing this from-row's join value, keyed by that value rather than a
-        // grouping tuple (ADR-0006). The field itself lives on the referencing
-        // (row-grain) target, so it is evaluated here in the row path, not the
-        // aggregate path.
-        Expr::FunctionCall { name, args }
-            if super::registry::lookup_aggregate_function(name).is_some()
-                && matches!(args.as_slice(), [Expr::RelationshipPath { .. }]) =>
-        {
-            let Expr::RelationshipPath { rel, column } = &args[0] else {
-                unreachable!("guarded by the matches! above");
-            };
-            eval_to_many_aggregate(name, rel, column, field_name, row, relationships)
         }
         Expr::FunctionCall { name, args } if name == "COALESCE" => {
             for arg in args {
@@ -1123,7 +770,6 @@ fn eval_expr(
                     field_name,
                     row,
                     source_columns,
-                    relationships,
                     fields_by_name,
                     cache,
                     in_progress,
@@ -1143,7 +789,6 @@ fn eval_expr(
                     field_name,
                     row,
                     source_columns,
-                    relationships,
                     fields_by_name,
                     cache,
                     in_progress,
@@ -1153,135 +798,6 @@ fn eval_expr(
             Ok(apply_function(name, arg_values, regex_cache))
         }
     }
-}
-
-/// Folds an aggregate (`SUM`/`MIN`/`MAX`/`AVG`/`COUNT`) over the to-side rows
-/// of a to-many relationship for one from-row (issue #29). The from-row's
-/// `from_col` value is the join key; the related rows are the set stored under
-/// that key, and `column` is read off each related row (typed by the
-/// relationship's `to_columns`, defaulting to `Numeric` like the [`Row`]-column
-/// handling in [`eval_expr`]).
-///
-/// Empty-set semantics match Postgres's correlated aggregate over zero rows:
-/// `COUNT` → `0`, `SUM`/`MIN`/`MAX`/`AVG` → `NULL`. An empty set arises from a
-/// `NULL` join key (SQL `NULL` never joins), a key with no related rows, or a
-/// relationship with no entry under this key. `COUNT(<rel>.<column>)` counts
-/// related rows whose `column` is non-`NULL` (Postgres `COUNT(<col>)`); the
-/// four numeric folds skip `NULL` rows and yield `NULL` if none remain, reusing
-/// [`reduce_numeric_aggregate`] — the same reducer as [`fold_aggregate`].
-fn eval_to_many_aggregate(
-    name: &str,
-    rel: &str,
-    column: &str,
-    field_name: &str,
-    from_row: &Row,
-    relationships: &RelationshipContext,
-) -> Result<Option<Value>, EvalError> {
-    // The relationship must be a known to-many. A name that isn't (unknown, or
-    // a to-one used with an aggregate wrapper — the validator's job to reject)
-    // errors as unknown, defense-in-depth like the to-one path arm.
-    let Some(reldata) = relationships.to_many_by_name.get(rel) else {
-        return Err(EvalError::UnknownRelationship {
-            field: field_name.to_string(),
-            rel: rel.to_string(),
-        });
-    };
-    // The join key comes from the from-row's `from_col`. A NULL key never joins
-    // (SQL `NULL != NULL`), and a key with no stored rows both mean the empty
-    // set — the aggregate's empty result below.
-    let related: &[Row] = match from_row.get(&reldata.from_col) {
-        Some(Some(key)) => reldata
-            .to_rows_by_key
-            .get(key)
-            .map_or(&[][..], Vec::as_slice),
-        Some(None) => &[],
-        None => {
-            return Err(EvalError::MissingColumn {
-                field: field_name.to_string(),
-                column: reldata.from_col.clone(),
-            });
-        }
-    };
-
-    if name == "COUNT" {
-        // `COUNT(<rel>.<column>)`: related rows whose `column` is non-NULL,
-        // matching Postgres `COUNT(<col>)`. The empty set counts to 0.
-        //
-        // Issue #120: `bigint` (`Integer(Int8)`), matching Postgres's own
-        // `pg_typeof(count(x))` — see `registry::AGGREGATE_FUNCTION_SPECS`'s
-        // `COUNT` row doc comment.
-        let mut count: i64 = 0;
-        for row in related {
-            match row.get(column) {
-                Some(Some(_)) => count += 1,
-                Some(None) => {}
-                None => {
-                    return Err(EvalError::MissingColumn {
-                        field: field_name.to_string(),
-                        column: column.to_string(),
-                    });
-                }
-            }
-        }
-        return Ok(Some(Value::Integer(IntWidth::Int8, count)));
-    }
-
-    let value_type = reldata
-        .to_columns
-        .get(column)
-        .copied()
-        .unwrap_or(ValueType::Numeric);
-
-    // Issue #115: `jsonb_agg(<rel>.<column>)` folds *rows*, not non-NULL
-    // values — unlike every aggregate below, a `NULL` related row still
-    // contributes a JSON `null` element (`jsonb_agg`'s transition function
-    // is not `STRICT`; see `crate::jsonb`'s module doc), and only a
-    // genuinely empty related set folds to SQL `NULL`. Handled as its own
-    // early return rather than folding into the shared NULL-skipping loop
-    // just below, since that loop's "skip a NULL row" behavior is exactly
-    // what this aggregate must not do.
-    if name == "JSONB_AGG" {
-        let mut row_values: Vec<Option<Value>> = Vec::with_capacity(related.len());
-        for row in related {
-            match row.get(column) {
-                Some(Some(text)) => {
-                    row_values.push(Some(parse_value(field_name, value_type, text)?));
-                }
-                Some(None) => row_values.push(None),
-                None => {
-                    return Err(EvalError::MissingColumn {
-                        field: field_name.to_string(),
-                        column: column.to_string(),
-                    });
-                }
-            }
-        }
-        return Ok(fold_jsonb_agg(row_values));
-    }
-
-    // SUM/MIN/MAX/AVG: read `column` off each related row, skipping NULLs (and,
-    // defense-in-depth, any non-Numeric value a hand-built AST slipped past the
-    // validator's Numeric-only check), then fold. All-NULL / empty => NULL.
-    let mut values: Vec<Value> = Vec::new();
-    for row in related {
-        match row.get(column) {
-            Some(Some(text)) => {
-                let value = parse_value(field_name, value_type, text)?;
-                // See `fold_aggregate`'s twin of this filter (issue #113).
-                if super::registry::aggregate_result_type(name, value.value_type()).is_some() {
-                    values.push(value);
-                }
-            }
-            Some(None) => {}
-            None => {
-                return Err(EvalError::MissingColumn {
-                    field: field_name.to_string(),
-                    column: column.to_string(),
-                });
-            }
-        }
-    }
-    reduce_numeric_aggregate(name, values, field_name)
 }
 
 #[cfg(any(test, feature = "test-util"))]
@@ -1310,14 +826,7 @@ pub fn evaluate_aggregate(
         panic!("evaluate_aggregate called on a non-aggregate definition");
     };
     assert!(!rows.is_empty(), "a group must have at least one row");
-    // A `GroupByKey::RelationshipPath` group key is never representable here
-    // (this pure evaluator carries no relationship data — see this
-    // function's module doc comment on `fold_aggregate`'s own
-    // relationship-free `RelationshipContext::default()`); a caller with one
-    // must first substitute it (and any field referencing it bare) for a
-    // synthetic `Column`. Keying this set by each entry's target
-    // column name keeps a plain-column `GROUP BY` (the overwhelmingly common
-    // case) byte-identical to before issue #137.
+    // Keyed by each key's target column name.
     let group_by: HashSet<&str> = group_by.iter().map(|k| k.target_column_name()).collect();
 
     let fields_by_name: HashMap<&str, &FieldDef> =
@@ -1436,11 +945,6 @@ fn eval_aggregate_expr(
         Expr::TypedLiteral { value_type, text } => {
             typed_literal_value(*value_type, text, field_name).map(Some)
         }
-        Expr::RelationshipPath { rel, column } => Err(EvalError::UnsupportedRelationshipPath {
-            field: field_name.to_string(),
-            rel: rel.clone(),
-            column: column.clone(),
-        }),
         Expr::BinaryOp { op, lhs, rhs } => {
             let lhs = eval_aggregate_expr(
                 lhs,
@@ -1491,7 +995,6 @@ fn eval_aggregate_expr(
         // group whose every `x` is `NULL`, or even over zero rows (unreachable
         // here: a `GROUP BY` group always has at least one row).
         Expr::FunctionCall { name, args } if name == "COUNT" && args.len() == 1 => {
-            let relationships = RelationshipContext::default();
             let fields_by_name = &aggregate_argument_scope(fields_by_name);
             let mut count: i64 = 0;
             for row in rows {
@@ -1502,7 +1005,6 @@ fn eval_aggregate_expr(
                     field_name,
                     row,
                     source_columns,
-                    &relationships,
                     fields_by_name,
                     &mut per_row_cache,
                     &mut per_row_in_progress,
@@ -1629,22 +1131,16 @@ fn fold_aggregate(
     fields_by_name: &HashMap<&str, &FieldDef>,
     regex_cache: &mut RegexCache,
 ) -> Result<Option<Value>, EvalError> {
-    // The aggregate path does not wire relationships (issue #29 handles a
-    // to-many relationship's aggregate-wrapped enrichment); a bare path in an
-    // aggregate argument therefore errors as unknown, defense-in-depth.
     let arg_expr = &args[0];
     let extra_args = &args[1..];
-    let relationships = RelationshipContext::default();
     let fields_by_name = &aggregate_argument_scope(fields_by_name);
 
     // Issue #115: `JSONB_AGG` folds *rows*, not non-NULL values — see
-    // `eval_to_many_aggregate`'s matching branch and `crate::jsonb`'s module
-    // doc for why `jsonb_agg`'s transition function is not `STRICT`. Handled
-    // as its own early return so the shared NULL-skipping loop below never
-    // sees it (`rows` here is a `GROUP BY` group, always non-empty — see
-    // `evaluate_aggregate`'s own assertion — so this never folds to `NULL`
-    // the way the to-many relationship path's genuinely-empty `related` set
-    // can).
+    // `crate::jsonb`'s module doc for why `jsonb_agg`'s transition function
+    // is not `STRICT`. Handled as its own early return so the shared
+    // NULL-skipping loop below never sees it (`rows` here is a `GROUP BY`
+    // group, always non-empty — see `evaluate_aggregate`'s own assertion —
+    // so this never folds to `NULL`).
     if matches!(name, "JSONB_AGG" | "ARRAY_AGG" | "STRING_AGG") {
         let mut row_values: Vec<Option<Value>> = Vec::with_capacity(rows.len());
         for row in rows {
@@ -1655,7 +1151,6 @@ fn fold_aggregate(
                 field_name,
                 row,
                 source_columns,
-                &relationships,
                 fields_by_name,
                 &mut per_row_cache,
                 &mut per_row_in_progress,
@@ -1689,7 +1184,6 @@ fn fold_aggregate(
             field_name,
             row,
             source_columns,
-            &relationships,
             fields_by_name,
             &mut per_row_cache,
             &mut per_row_in_progress,
@@ -1717,7 +1211,7 @@ fn fold_aggregate(
 
 /// Folds `JSONB_AGG` over a group's **per-row** values (`None` for a `NULL`
 /// row), building the `jsonb` array `jsonb_agg` itself would — see this
-/// module's two call sites ([`fold_aggregate`], [`eval_to_many_aggregate`])
+/// module's call site ([`fold_aggregate`])
 /// and `crate::jsonb`'s module doc for why a `NULL` row is folded in as a
 /// JSON `null` element rather than skipped, unlike every other aggregate in
 /// this crate.
@@ -1740,9 +1234,10 @@ fn fold_aggregate(
 /// two separate calls (`crate::jsonb`'s module doc's "`jsonb_agg`'s residual
 /// ordering caveat"). `JSONB_AGG` is always
 /// [`super::invertibility::Invertibility::RecomputeOnly`], so this function
-/// exists for the oracle/self-check cross-validation path and the to-many
-/// relationship path, not the production apply pipeline's own recompute
-/// (which asks Postgres directly — `staging::ledger`).
+/// exists for the oracle/self-check cross-validation path, not the
+/// production apply pipeline's own recompute (which asks Postgres directly —
+/// `staging::ledger`).
+#[cfg(any(test, feature = "test-util"))]
 fn fold_jsonb_agg(row_values: Vec<Option<Value>>) -> Option<Value> {
     if row_values.is_empty() {
         return None;
@@ -1840,12 +1335,11 @@ fn fold_string_agg(row_values: Vec<Option<Value>>, separator: &str) -> Option<Va
     Some(Value::Text(parts.join(separator)))
 }
 
+#[cfg(any(test, feature = "test-util"))]
 /// Reduces the collected non-`NULL` exact-numeric values of
 /// `SUM`/`MIN`/`MAX`/`AVG` to the aggregate's result, or `None` (SQL `NULL`)
 /// when `values` is empty — Postgres's "aggregate of zero non-NULL values is
-/// NULL" rule. Shared by [`fold_aggregate`] (a GROUP BY group's rows) and
-/// [`eval_to_many_aggregate`] (a to-many relationship's related rows) so
-/// both fold identically.
+/// NULL" rule, over a GROUP BY group's rows ([`fold_aggregate`]).
 ///
 /// # Integer arguments (issue #111)
 ///
@@ -2135,6 +1629,7 @@ fn reduce_numeric_aggregate(
     Ok(Some(Value::Numeric(result)))
 }
 
+#[cfg(any(test, feature = "test-util"))]
 /// Folds a group of one temporal family's values (issue #113) —
 /// [`reduce_numeric_aggregate`]'s early-return arm for
 /// [`ValueType::Other`](super::ast::ValueType::Other) temporal columns.
@@ -2254,6 +1749,7 @@ fn reduce_temporal_aggregate(
     }
 }
 
+#[cfg(any(test, feature = "test-util"))]
 /// Folds a group of `Value::Other(PgType::Inet, _)`s for `MIN`/`MAX` (issue
 /// #116) — [`reduce_numeric_aggregate`]'s early-return arm for `inet`, the
 /// same shape [`reduce_temporal_aggregate`] is for the temporal families.
@@ -2311,6 +1807,7 @@ fn reduce_netaddr_aggregate(name: &str, values: Vec<Value>) -> Result<Option<Val
     }
 }
 
+#[cfg(any(test, feature = "test-util"))]
 /// Folds a group of `Value::Other(PgType::Enum(_), _)`s for `MIN`/`MAX`
 /// (issue #117) — [`reduce_numeric_aggregate`]'s early-return arm for enum
 /// types, the same shape [`reduce_netaddr_aggregate`]/[`reduce_temporal_aggregate`]
@@ -2368,6 +1865,7 @@ fn reduce_enum_aggregate(
     }
 }
 
+#[cfg(any(test, feature = "test-util"))]
 /// (Issue #120) — [`reduce_numeric_aggregate`]'s early-return arm for
 /// [`ValueType::Text`](super::ast::ValueType::Text), the `text` twin of
 /// [`reduce_enum_aggregate`] just above, and for the identical structural
@@ -2431,6 +1929,7 @@ fn reduce_text_aggregate(
     }
 }
 
+#[cfg(any(test, feature = "test-util"))]
 /// Folds a group of `Value::Boolean`s for `bool_and`/`bool_or` (issue #119)
 /// — [`reduce_numeric_aggregate`]'s early-return arm for
 /// [`ValueType::Boolean`](super::ast::ValueType::Boolean), the same shape
@@ -2438,7 +1937,7 @@ fn reduce_text_aggregate(
 ///
 /// Matches Postgres's own `NULL` handling for these two: a `NULL` row is
 /// skipped (already true by the time `values` reaches here — the per-row
-/// `None` filter lives in [`fold_aggregate`]/[`eval_to_many_aggregate`],
+/// `None` filter lives in [`fold_aggregate`],
 /// same as every other aggregate), and an all-`NULL` or empty group folds to
 /// `NULL` — the empty-`values` check at the top of
 /// [`reduce_numeric_aggregate`] already covers that, since this function is
@@ -2454,7 +1953,7 @@ fn reduce_text_aggregate(
 /// result — so a production group's value comes from the ledger's
 /// recompute (`staging::ledger`, `bool_and(<col>)` run server-side) and
 /// `defs::backfill`'s plain recompute, never a delta; this function serves
-/// the oracle and the to-many relationship path.
+/// the oracle.
 fn reduce_boolean_aggregate(name: &str, values: Vec<Value>) -> Result<Option<Value>, EvalError> {
     // Defense-in-depth, as everywhere else in this module: a non-Boolean
     // value here would mean a hand-built AST bypassed the validator's own
@@ -2477,6 +1976,7 @@ fn reduce_boolean_aggregate(name: &str, values: Vec<Value>) -> Result<Option<Val
     Ok(Some(Value::Boolean(result)))
 }
 
+#[cfg(any(test, feature = "test-util"))]
 /// Folds a group of `Value::Other(PgType::Bit | PgType::VarBit, _)` bit
 /// strings for `bit_and`/`bit_or` (issue #118) — the bit-string sibling of
 /// [`reduce_boolean_aggregate`], reached the same early-return way.
@@ -2905,6 +2405,7 @@ fn parse_boolean(field_name: &str, text: &str) -> Result<bool, EvalError> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::ast::GroupByKey;
     use super::*;
     use crate::defs::ast::{KeySpace, Predicate};
 
@@ -3780,393 +3281,6 @@ mod tests {
         .unwrap();
         assert_eq!(result["all_true"], None);
         assert_eq!(result["any_true"], None);
-    }
-
-    // --- to-one relationship path resolution (issue #28) ---
-
-    fn rel_path(rel: &str, column: &str) -> Expr {
-        Expr::RelationshipPath {
-            rel: rel.to_string(),
-            column: column.to_string(),
-        }
-    }
-
-    /// A to-one relationship named `category` whose from-side FK column is
-    /// `category_id`, joining to a `categories` table keyed by `id`, with a
-    /// `name` (Text) and `rate` (Numeric) column on the to-side.
-    fn category_context() -> RelationshipContext {
-        let mut to_columns = HashMap::new();
-        to_columns.insert("name".to_string(), ValueType::Text);
-        to_columns.insert("rate".to_string(), ValueType::Numeric);
-
-        let mut to_rows_by_key = HashMap::new();
-        to_rows_by_key.insert(
-            "10".to_string(),
-            row(&[
-                ("id", Some("10")),
-                ("name", Some("Widgets")),
-                ("rate", Some("1.5")),
-            ]),
-        );
-        to_rows_by_key.insert(
-            "20".to_string(),
-            row(&[("id", Some("20")), ("name", None), ("rate", Some("2"))]),
-        );
-
-        let mut by_name = HashMap::new();
-        by_name.insert(
-            "category".to_string(),
-            ToOneRelationship {
-                from_col: "category_id".to_string(),
-                cardinality: RelationshipCardinality::ToOne,
-                to_columns,
-                to_rows_by_key,
-            },
-        );
-        RelationshipContext::new(by_name)
-    }
-
-    fn eval_rel(
-        d: &TransformDef,
-        r: &Row,
-        types: &HashMap<String, ValueType>,
-        rels: &RelationshipContext,
-    ) -> Result<HashMap<String, Option<Value>>, EvalError> {
-        evaluate_with_relationships(d, r, types, rels, &mut RegexCache::new())
-    }
-
-    #[test]
-    fn to_one_path_reads_the_matched_to_side_column() {
-        let d = def(vec![FieldDef {
-            name: "category_name".to_string(),
-            expr: rel_path("category", "name"),
-        }]);
-        let r = row(&[("category_id", Some("10"))]);
-        let result = eval_rel(
-            &d,
-            &r,
-            &numeric_types(&["category_id"]),
-            &category_context(),
-        )
-        .unwrap();
-        match result["category_name"].as_ref().unwrap() {
-            Value::Text(s) => assert_eq!(s, "Widgets"),
-            other => panic!("expected Text, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn to_one_path_numeric_column_parses_with_to_side_type() {
-        let d = def(vec![FieldDef {
-            name: "category_rate".to_string(),
-            expr: rel_path("category", "rate"),
-        }]);
-        let r = row(&[("category_id", Some("10"))]);
-        let result = eval_rel(
-            &d,
-            &r,
-            &numeric_types(&["category_id"]),
-            &category_context(),
-        )
-        .unwrap();
-        match result["category_rate"].as_ref().unwrap() {
-            Value::Numeric(n) => assert_eq!(n.to_string(), "1.5"),
-            other => panic!("expected Numeric, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn to_one_path_no_match_is_null() {
-        // FK 99 has no matching to-side row — LEFT JOIN leaves the enrichment
-        // NULL while the from-row still exists.
-        let d = def(vec![FieldDef {
-            name: "category_name".to_string(),
-            expr: rel_path("category", "name"),
-        }]);
-        let r = row(&[("category_id", Some("99"))]);
-        let result = eval_rel(
-            &d,
-            &r,
-            &numeric_types(&["category_id"]),
-            &category_context(),
-        )
-        .unwrap();
-        assert_eq!(result["category_name"], None);
-    }
-
-    #[test]
-    fn to_one_path_null_fk_is_null() {
-        // A NULL join key never matches (SQL NULL != NULL).
-        let d = def(vec![FieldDef {
-            name: "category_name".to_string(),
-            expr: rel_path("category", "name"),
-        }]);
-        let r = row(&[("category_id", None)]);
-        let result = eval_rel(
-            &d,
-            &r,
-            &numeric_types(&["category_id"]),
-            &category_context(),
-        )
-        .unwrap();
-        assert_eq!(result["category_name"], None);
-    }
-
-    #[test]
-    fn to_one_path_null_to_side_column_is_null() {
-        // FK 20 matches, but that to-side row's `name` is NULL.
-        let d = def(vec![FieldDef {
-            name: "category_name".to_string(),
-            expr: rel_path("category", "name"),
-        }]);
-        let r = row(&[("category_id", Some("20"))]);
-        let result = eval_rel(
-            &d,
-            &r,
-            &numeric_types(&["category_id"]),
-            &category_context(),
-        )
-        .unwrap();
-        assert_eq!(result["category_name"], None);
-    }
-
-    #[test]
-    fn to_one_path_composes_in_a_larger_expression() {
-        // A relationship path is an ordinary sub-expression: rate + 10.
-        let d = def(vec![FieldDef {
-            name: "adjusted".to_string(),
-            expr: add(
-                rel_path("category", "rate"),
-                Expr::NumberLiteral("10".to_string()),
-            ),
-        }]);
-        let r = row(&[("category_id", Some("10"))]);
-        let result = eval_rel(
-            &d,
-            &r,
-            &numeric_types(&["category_id"]),
-            &category_context(),
-        )
-        .unwrap();
-        match result["adjusted"].as_ref().unwrap() {
-            Value::Numeric(n) => assert_eq!(n.to_string(), "11.5"),
-            other => panic!("expected Numeric, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn unknown_relationship_errors() {
-        let d = def(vec![FieldDef {
-            name: "x".to_string(),
-            expr: rel_path("nonexistent", "name"),
-        }]);
-        let r = row(&[("category_id", Some("10"))]);
-        let err = eval_rel(
-            &d,
-            &r,
-            &numeric_types(&["category_id"]),
-            &category_context(),
-        )
-        .unwrap_err();
-        assert!(
-            matches!(err, EvalError::UnknownRelationship { .. }),
-            "got {err:?}"
-        );
-    }
-
-    #[test]
-    fn to_many_bare_path_requires_aggregate() {
-        let mut by_name = HashMap::new();
-        by_name.insert(
-            "orders".to_string(),
-            ToOneRelationship {
-                from_col: "id".to_string(),
-                cardinality: RelationshipCardinality::ToMany,
-                to_columns: HashMap::new(),
-                to_rows_by_key: HashMap::new(),
-            },
-        );
-        let rels = RelationshipContext::new(by_name);
-        let d = def(vec![FieldDef {
-            name: "x".to_string(),
-            expr: rel_path("orders", "total"),
-        }]);
-        let r = row(&[("id", Some("1"))]);
-        let err = eval_rel(&d, &r, &numeric_types(&["id"]), &rels).unwrap_err();
-        assert!(
-            matches!(err, EvalError::AggregateRequiredForToMany { .. }),
-            "got {err:?}"
-        );
-    }
-
-    #[test]
-    fn plain_evaluate_has_no_relationships_so_a_path_errors() {
-        // The pure entry supplies an empty context — matching pre-#28 behavior
-        // that any relationship path is unresolvable.
-        let d = def(vec![FieldDef {
-            name: "x".to_string(),
-            expr: rel_path("category", "name"),
-        }]);
-        let r = row(&[("category_id", Some("10"))]);
-        let err = eval(&d, &r, &numeric_types(&["category_id"])).unwrap_err();
-        assert!(
-            matches!(err, EvalError::UnknownRelationship { .. }),
-            "got {err:?}"
-        );
-    }
-
-    // --- to-many aggregate relationship enrichment (issue #29) ---
-
-    /// A to-many relationship `comments` whose from-side join column is `id`
-    /// (the post's PK), keyed by that value; each related comment row carries a
-    /// Numeric `word_count`. Post `1` has three comments (one with a NULL
-    /// word_count), post `2` has one, post `3` has none.
-    fn comments_context() -> RelationshipContext {
-        let mut to_columns = HashMap::new();
-        to_columns.insert("word_count".to_string(), ValueType::Numeric);
-
-        let mut to_rows_by_key: HashMap<String, Vec<Row>> = HashMap::new();
-        to_rows_by_key.insert(
-            "1".to_string(),
-            vec![
-                row(&[("word_count", Some("10"))]),
-                row(&[("word_count", Some("20"))]),
-                row(&[("word_count", None)]),
-            ],
-        );
-        to_rows_by_key.insert("2".to_string(), vec![row(&[("word_count", Some("5"))])]);
-
-        let mut to_many = HashMap::new();
-        to_many.insert(
-            "comments".to_string(),
-            ToManyRelationship {
-                from_col: "id".to_string(),
-                to_columns,
-                to_rows_by_key,
-            },
-        );
-        RelationshipContext::default().with_to_many(to_many)
-    }
-
-    fn agg_rel(func: &str) -> TransformDef {
-        def(vec![FieldDef {
-            name: "out".to_string(),
-            expr: call(func, vec![rel_path("comments", "word_count")]),
-        }])
-    }
-
-    #[test]
-    fn to_many_sum_folds_related_rows_skipping_null() {
-        // 10 + 20, the NULL word_count skipped (Postgres SUM skips NULLs).
-        let r = row(&[("id", Some("1"))]);
-        let result = eval_rel(
-            &agg_rel("SUM"),
-            &r,
-            &numeric_types(&["id"]),
-            &comments_context(),
-        )
-        .unwrap();
-        match result["out"].as_ref().unwrap() {
-            Value::Numeric(n) => assert_eq!(n.to_string(), "30"),
-            other => panic!("expected Numeric, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn to_many_min_max_avg_over_related_rows() {
-        let r = row(&[("id", Some("1"))]);
-        let types = numeric_types(&["id"]);
-        let ctx = comments_context();
-        let min = eval_rel(&agg_rel("MIN"), &r, &types, &ctx).unwrap();
-        let max = eval_rel(&agg_rel("MAX"), &r, &types, &ctx).unwrap();
-        let avg = eval_rel(&agg_rel("AVG"), &r, &types, &ctx).unwrap();
-        assert_eq!(
-            min["out"],
-            Some(Value::Numeric(Numeric::parse("10").unwrap()))
-        );
-        assert_eq!(
-            max["out"],
-            Some(Value::Numeric(Numeric::parse("20").unwrap()))
-        );
-        // (10 + 20) / 2 — the NULL row does not count toward AVG's divisor.
-        // AVG carries a fractional scale (like Postgres `numeric` avg), so
-        // compare by value rather than by exact scale/text.
-        match avg["out"].as_ref().unwrap() {
-            Value::Numeric(n) => {
-                assert_eq!(
-                    n.compare(&Numeric::parse("15").unwrap()),
-                    std::cmp::Ordering::Equal
-                )
-            }
-            other => panic!("expected Numeric, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn to_many_count_counts_non_null_related_values() {
-        // COUNT(comments.word_count): 3 comments, but the NULL word_count is
-        // not counted (Postgres COUNT(<col>) counts non-NULLs) => 2.
-        let r = row(&[("id", Some("1"))]);
-        let result = eval_rel(
-            &agg_rel("COUNT"),
-            &r,
-            &numeric_types(&["id"]),
-            &comments_context(),
-        )
-        .unwrap();
-        assert_eq!(
-            result["out"],
-            Some(Value::Integer(IntWidth::Int8, 2)),
-            "issue #120: COUNT is bigint, matching Postgres's own pg_typeof(count(x))"
-        );
-    }
-
-    #[test]
-    fn to_many_empty_set_count_is_zero_others_null() {
-        // Post 3 has no related comments — the empty set.
-        let r = row(&[("id", Some("3"))]);
-        let types = numeric_types(&["id"]);
-        let ctx = comments_context();
-        assert_eq!(
-            eval_rel(&agg_rel("COUNT"), &r, &types, &ctx).unwrap()["out"],
-            Some(Value::Integer(IntWidth::Int8, 0)),
-            "COUNT over empty set is 0"
-        );
-        for func in ["SUM", "MIN", "MAX", "AVG"] {
-            assert_eq!(
-                eval_rel(&agg_rel(func), &r, &types, &ctx).unwrap()["out"],
-                None,
-                "{func} over empty set is NULL"
-            );
-        }
-    }
-
-    #[test]
-    fn to_many_null_join_key_is_the_empty_set() {
-        // A NULL from-side join key never joins => empty set (COUNT 0).
-        let r = row(&[("id", None)]);
-        let result = eval_rel(
-            &agg_rel("COUNT"),
-            &r,
-            &numeric_types(&["id"]),
-            &comments_context(),
-        )
-        .unwrap();
-        assert_eq!(result["out"], Some(Value::Integer(IntWidth::Int8, 0)));
-    }
-
-    #[test]
-    fn to_many_unknown_relationship_errors() {
-        let r = row(&[("id", Some("1"))]);
-        let d = def(vec![FieldDef {
-            name: "out".to_string(),
-            expr: call("SUM", vec![rel_path("nope", "word_count")]),
-        }]);
-        let err = eval_rel(&d, &r, &numeric_types(&["id"]), &comments_context()).unwrap_err();
-        assert!(
-            matches!(err, EvalError::UnknownRelationship { .. }),
-            "got {err:?}"
-        );
     }
 
     // -------------------------------------------------------------

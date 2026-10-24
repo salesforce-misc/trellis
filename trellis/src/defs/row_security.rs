@@ -5,7 +5,7 @@
 //! tables ignore RLS, but every path that *reads* a table runs as the Trellis
 //! role, and the policies filter those reads: a build never sees a hidden
 //! row, a per-key Re-derive reads a hidden key as gone and deletes its target
-//! row, a relationship read finds a hidden parent absent, and `self_check`'s
+//! row, and `self_check`'s
 //! recompute agrees with the wrong answer. So does a capture function's
 //! re-read of the live row (#623 D8a), which runs as the function's owner,
 //! the role that owns the ring.
@@ -36,21 +36,14 @@
 //!
 //! # Where it is checked
 //!
-//! - **Defining** a transform refuses its source, and the to-side of every
-//!   relationship it reads through, when the policies apply to the ring's
-//!   owner ([`super::catalog::CatalogError::RowSecurityApplies`]). A to-one
-//!   relationship's to-side is checked for the session's role too:
-//!   registration seeds and widens the relationship's settled projection
-//!   from it as that role, and a build reads the projection. Otherwise not
-//!   the session's role: registration reads no source rows, and a process
-//!   that only defines transforms needn't run as a role that could.
-//!   Declaring a to-one relationship checks its to-side for the session's
-//!   role alone: it registers no reader, but it seeds the projection from
-//!   the to-side as that role, which `row_security = off` (below) would
-//!   otherwise fail with Postgres's bare error.
-//!   `ALTER TRANSFORM` adds no table to read: its `ADD`/`ALTER` refuse a
-//!   relationship path. A source or to-side that is another definition's
-//!   target is checked for the session's role alone ([`Readers::Session`]).
+//! - **Defining** a transform refuses its source, and a `JOIN`'s joined
+//!   table, when the policies apply to the ring's owner
+//!   ([`super::catalog::CatalogError::RowSecurityApplies`]). Not the
+//!   session's role: registration reads no source rows, and a process that
+//!   only defines transforms needn't run as a role that could.
+//!   `ALTER TRANSFORM` adds no table to read. A source that is another
+//!   definition's target is checked for the session's role alone
+//!   ([`Readers::Session`]).
 //!   No capture function reads it, so the ring's owner never does.
 //! - **The staging worker's capture pass** pauses every definition that
 //!   reads a table whose policies now apply to the ring's owner or to the
@@ -206,9 +199,9 @@ pub enum Readers {
     RingAndSession,
     /// The session's role alone, for a table the target-mutation seam feeds
     /// (another definition's target) that a definition reads, as its source
-    /// or a relationship's to-side. Only plain SQL on a worker connection
-    /// reads one (a build, a Re-derive, a relationship read, the seam's own
-    /// image reads), as its login role. No capture function is installed on
+    /// or its `JOIN` table. Only plain SQL on a worker connection reads one
+    /// (a build, a Re-derive, the seam's own image reads), as its login
+    /// role. No capture function is installed on
     /// it, so the ring's owner never reads it unless it is that role, and
     /// checking it would pause a reader in a deployment whose workers log in
     /// as a member of the ring's owner and define as that member: the member

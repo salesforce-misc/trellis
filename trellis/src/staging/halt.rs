@@ -13,8 +13,8 @@
 //! for nobody's fault. Instead [`halt_closure`] pauses the definitions the
 //! failure reaches, and the drain retries the page without them:
 //!
-//! - every definition that reads the halting table, as its source or as a
-//!   relationship's to-side (`capture::columns::readers_of`). For a hop
+//! - every definition that reads the halting table, as its source or its
+//!   `JOIN` table (`capture::columns::readers_of`). For a hop
 //!   bound, the halting tables are those the wave ran away through, so their
 //!   readers are the cycle's definitions. For a truncate with no `lsn`, it
 //!   is the truncated table. For an aggregate off the ledger, it's the
@@ -245,7 +245,7 @@ async fn pause_closure(
     halted: &str,
     err: &str,
 ) -> Result<Vec<String>, ApplyError> {
-    let catalog = load_catalog(txn, schema).await?;
+    let catalog = load_catalog(txn).await?;
     let unfrozen: HashSet<i64> = txn
         .query(
             "select id from transform_definitions where status = any($1)",
@@ -332,12 +332,9 @@ async fn refusals(
             .iter()
             .filter(|r| unfrozen.contains(&r.id))
     };
-    let mut read: BTreeSet<String> = live()
+    let read: BTreeSet<String> = live()
         .flat_map(|r| std::iter::once(r.source.clone()).chain(r.join.clone()))
         .collect();
-    for rel in &catalog.relationships {
-        read.insert(rel.qualified_to_table());
-    }
     let written: BTreeSet<String> = live().map(|r| r.target.clone()).collect();
 
     let mut refusals = Vec::new();
@@ -473,16 +470,11 @@ fn closure(catalog: &CaptureCatalog, seed: &Seed, unfrozen: &HashSet<i64>) -> BT
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use super::*;
     use crate::capture::columns::CaptureReader;
-    use crate::defs::ast::RelationshipDef;
-    use crate::defs::model::{RelationshipCardinality, RelationshipDefinition};
     use crate::defs::parse;
 
-    /// `(source, target, text)` per definition, ids from 1, with `author`
-    /// (`posts.author` to `users.handle`) declared.
+    /// `(source, target, text)` per definition, ids from 1.
     fn catalog(definitions: &[(&str, &str, &str)]) -> CaptureCatalog {
         CaptureCatalog {
             definitions: definitions
@@ -497,20 +489,6 @@ mod tests {
                     join: None,
                 })
                 .collect(),
-            relationships: vec![RelationshipDefinition {
-                id: 1,
-                from_schema: "public".to_string(),
-                to_schema: "public".to_string(),
-                def: RelationshipDef {
-                    name: "author".to_string(),
-                    from_table: "posts".to_string(),
-                    from_col: "author".to_string(),
-                    to_table: "users".to_string(),
-                    to_col: "handle".to_string(),
-                },
-                cardinality: RelationshipCardinality::ToOne,
-            }],
-            projection_columns: HashMap::new(),
         }
     }
 
@@ -535,11 +513,10 @@ mod tests {
         }
     }
 
-    /// A key seed reaches the table's direct reader, the definition reading
-    /// it as a relationship's to-side, and what reads either one's target,
-    /// to any depth, and nothing else.
+    /// A key seed reaches the table's direct reader and what reads its
+    /// target, to any depth, and nothing else.
     #[test]
-    fn a_key_seed_reaches_readers_relationship_readers_and_their_downstream() {
+    fn a_key_seed_reaches_readers_and_their_downstream() {
         let catalog = catalog(&[
             (
                 "public.users",
@@ -548,23 +525,18 @@ mod tests {
             ),
             (
                 "public.posts",
-                "public.posts_named",
-                "TRANSFORM posts_named FROM posts SELECT author.name AS name",
-            ),
-            (
-                "public.posts",
                 "public.posts_plain",
                 "TRANSFORM posts_plain FROM posts SELECT author AS author",
             ),
             (
-                "public.posts_named",
-                "public.named_copy",
-                "TRANSFORM named_copy FROM posts_named SELECT name AS name",
+                "public.users_copy",
+                "public.copy_2",
+                "TRANSFORM copy_2 FROM users_copy SELECT name AS name",
             ),
             (
-                "public.named_copy",
-                "public.named_copy_2",
-                "TRANSFORM named_copy_2 FROM named_copy SELECT name AS name",
+                "public.copy_2",
+                "public.copy_3",
+                "TRANSFORM copy_3 FROM copy_2 SELECT name AS name",
             ),
             (
                 "public.posts_plain",
@@ -574,7 +546,7 @@ mod tests {
         ]);
         assert_eq!(
             closure(&catalog, &tables(&["public.users"]), &all(&catalog)),
-            BTreeSet::from([1, 2, 4, 5])
+            BTreeSet::from([1, 3, 4])
         );
     }
 

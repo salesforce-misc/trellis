@@ -476,7 +476,7 @@ pub fn aggregate_result_type(name: &str, arg: ValueType) -> Option<ValueType> {
     // definition has nothing to be a subset *of* — there is no server-side
     // aggregate this crate could even be asked to reproduce. `bytea`'s join,
     // primary-key and `GROUP BY` key roles do not depend on this at all
-    // (`catalog::TEXT_STABLE_JOIN_KEY_TYPES`, `validate::
+    // (`join_key_types::TEXT_STABLE_JOIN_KEY_TYPES`, `validate::
     // reject_unsupported_group_by_key_type`) — they only need equality,
     // which `bytea` has and which is a separate question from whether an
     // aggregate exists.

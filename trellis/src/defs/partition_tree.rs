@@ -1,8 +1,8 @@
 //! The catalog reader for a declaratively partitioned table's tree, and the
 //! define-time checks of whether the tree can be a source (ADR-0017).
 //!
-//! A partitioned root is a source only when its `GROUP BY` (or a to-many
-//! relationship's to-side join key) holds every partition-key column at every
+//! A partitioned root is a source only when its `GROUP BY` (a `JOIN` side's
+//! `GROUP BY` and join key) holds every partition-key column at every
 //! level, so each group lives in exactly one leaf and a lifecycle change
 //! touches only the groups routing to one node. [`read_partition_tree`] walks
 //! the tree through `pg_inherits` and `pg_partitioned_table`;
@@ -157,12 +157,11 @@ impl PartitionTree {
     }
 
     /// The first reason this tree can't be read by a definition whose group
-    /// key (or to-many join key) is `group_key`, or `None` when it can. See
-    /// the module doc for the order of the checks.
+    /// key is `group_key`, or `None` when it can. See the module doc for the
+    /// order of the checks.
     pub fn refusal(
         &self,
         server_version_num: i32,
-        role: KeyRole,
         group_key: &[String],
     ) -> Option<PartitionRefusal> {
         if server_version_num < MIN_SERVER_VERSION_NUM {
@@ -209,22 +208,12 @@ impl PartitionTree {
                     return Some(PartitionRefusal::KeyNotInGroup {
                         table: self.nodes[level.node].name.clone(),
                         column: column.to_string(),
-                        role,
                     });
                 }
             }
         }
         None
     }
-}
-
-/// Which key the partition-key columns must all be in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KeyRole {
-    /// An aggregate's `GROUP BY`.
-    GroupBy,
-    /// A to-many relationship's to-side join key.
-    JoinKey,
 }
 
 /// Why a partitioned source can't be read. Every message names the column or
@@ -259,14 +248,9 @@ pub enum PartitionRefusal {
     KeyNotInGroup {
         table: String,
         column: String,
-        role: KeyRole,
     },
     /// A 1-1 transform's `FROM`.
     OneToOneFrom {
-        table: String,
-    },
-    /// The to-side of a to-one relationship.
-    ToOneToSide {
         table: String,
     },
 }
@@ -313,39 +297,17 @@ impl fmt::Display for PartitionRefusal {
                 "partitioned table {table} partitions column \"{column}\" with a \
                  nondeterministic collation; Trellis routes groups to partitions by exact value"
             ),
-            PartitionRefusal::KeyNotInGroup {
-                table,
-                column,
-                role: KeyRole::GroupBy,
-            } => write!(
+            PartitionRefusal::KeyNotInGroup { table, column } => write!(
                 f,
                 "partitioned table {table} is partitioned by \"{column}\", which the GROUP BY \
                  doesn't contain; a partitioned source's GROUP BY must contain every \
                  partition-key column at every level, so each group lives in one partition. \
                  Add \"{column}\" to the GROUP BY"
             ),
-            PartitionRefusal::KeyNotInGroup {
-                table,
-                column,
-                role: KeyRole::JoinKey,
-            } => write!(
-                f,
-                "partitioned table {table} is partitioned by \"{column}\", which isn't the \
-                 relationship's join column; a partitioned to-side's join column must be \
-                 every partition-key column at every level, so each parent's children live in \
-                 one partition"
-            ),
             PartitionRefusal::OneToOneFrom { table } => write!(
                 f,
                 "partitioned table {table} can't be the source of a 1-1 transform; Trellis \
-                 reads a partitioned table only as an aggregate's FROM or a to-many \
-                 relationship's to-side"
-            ),
-            PartitionRefusal::ToOneToSide { table } => write!(
-                f,
-                "partitioned table {table} can't be the to-side of a to-one relationship; \
-                 Trellis reads a partitioned table only as an aggregate's FROM or a to-many \
-                 relationship's to-side"
+                 reads a partitioned table only as an aggregate's FROM or a JOIN's table"
             ),
         }
     }
@@ -547,10 +509,7 @@ mod tests {
     #[test]
     fn a_group_key_holding_the_partition_key_passes() {
         let tree = flat(vec![key("order_id", "bigint")], 4);
-        assert_eq!(
-            tree.refusal(150_000, KeyRole::GroupBy, &group(&["order_id", "status"])),
-            None
-        );
+        assert_eq!(tree.refusal(150_000, &group(&["order_id", "status"])), None);
         assert_eq!(tree.leaf_count(), 4);
         assert_eq!(tree.depth(), 1);
         assert_eq!(tree.key_columns(), vec!["order_id"]);
@@ -559,9 +518,7 @@ mod tests {
     #[test]
     fn a_group_key_missing_the_partition_key_names_the_column() {
         let tree = flat(vec![key("order_id", "bigint")], 4);
-        let refusal = tree
-            .refusal(160_000, KeyRole::GroupBy, &group(&["product_id"]))
-            .unwrap();
+        let refusal = tree.refusal(160_000, &group(&["product_id"])).unwrap();
         assert!(refusal.to_string().contains("\"order_id\""), "{refusal}");
         assert!(refusal.to_string().contains("GROUP BY"), "{refusal}");
     }
@@ -576,16 +533,10 @@ mod tests {
             key: vec![key("order_id", "bigint")],
         });
         assert_eq!(
-            tree.refusal(
-                150_000,
-                KeyRole::GroupBy,
-                &group(&["created_on", "order_id"])
-            ),
+            tree.refusal(150_000, &group(&["created_on", "order_id"])),
             None
         );
-        let refusal = tree
-            .refusal(150_000, KeyRole::GroupBy, &group(&["created_on"]))
-            .unwrap();
+        let refusal = tree.refusal(150_000, &group(&["created_on"])).unwrap();
         assert!(refusal.to_string().contains("\"order_id\""), "{refusal}");
         assert!(refusal.to_string().contains("public.t_0"), "{refusal}");
         assert_eq!(tree.key_columns(), vec!["created_on", "order_id"]);
@@ -594,11 +545,8 @@ mod tests {
     #[test]
     fn a_composite_key_needs_every_column() {
         let tree = flat(vec![key("a", "integer"), key("b", "integer")], 2);
-        let refusal = tree
-            .refusal(150_000, KeyRole::JoinKey, &group(&["a"]))
-            .unwrap();
+        let refusal = tree.refusal(150_000, &group(&["a"])).unwrap();
         assert!(refusal.to_string().contains("\"b\""), "{refusal}");
-        assert!(refusal.to_string().contains("join column"), "{refusal}");
     }
 
     #[test]
@@ -606,9 +554,7 @@ mod tests {
         let mut expr = key("x", "integer");
         expr.column = None;
         let tree = flat(vec![key("a", "integer"), expr], 2);
-        let refusal = tree
-            .refusal(150_000, KeyRole::GroupBy, &group(&["a"]))
-            .unwrap();
+        let refusal = tree.refusal(150_000, &group(&["a"])).unwrap();
         assert_eq!(
             refusal,
             PartitionRefusal::ExpressionKey {
@@ -622,9 +568,7 @@ mod tests {
     #[test]
     fn an_unsupported_key_type_names_the_column_and_type() {
         let tree = flat(vec![key("code", "character")], 2);
-        let refusal = tree
-            .refusal(150_000, KeyRole::GroupBy, &group(&["code"]))
-            .unwrap();
+        let refusal = tree.refusal(150_000, &group(&["code"])).unwrap();
         let text = refusal.to_string();
         assert!(
             text.contains("\"code\"") && text.contains("character,"),
@@ -632,11 +576,7 @@ mod tests {
         );
         for supported in SUPPORTED_KEY_TYPES {
             let tree = flat(vec![key("k", supported)], 2);
-            assert_eq!(
-                tree.refusal(150_000, KeyRole::GroupBy, &group(&["k"])),
-                None,
-                "{supported}"
-            );
+            assert_eq!(tree.refusal(150_000, &group(&["k"])), None, "{supported}");
         }
     }
 
@@ -645,7 +585,7 @@ mod tests {
         let mut opclass = key("k", "text");
         opclass.default_opclass = false;
         let refusal = flat(vec![opclass], 2)
-            .refusal(150_000, KeyRole::GroupBy, &group(&["k"]))
+            .refusal(150_000, &group(&["k"]))
             .unwrap();
         assert!(refusal.to_string().contains("\"k\""), "{refusal}");
         assert!(refusal.to_string().contains("operator class"), "{refusal}");
@@ -653,7 +593,7 @@ mod tests {
         let mut collation = key("k", "text");
         collation.nondeterministic_collation = true;
         let refusal = flat(vec![collation], 2)
-            .refusal(150_000, KeyRole::GroupBy, &group(&["k"]))
+            .refusal(150_000, &group(&["k"]))
             .unwrap();
         assert!(refusal.to_string().contains("\"k\""), "{refusal}");
         assert!(
@@ -665,11 +605,9 @@ mod tests {
     #[test]
     fn the_leaf_limit_is_inclusive_and_the_message_states_it() {
         let at = flat(vec![key("k", "integer")], MAX_LEAVES);
-        assert_eq!(at.refusal(150_000, KeyRole::GroupBy, &group(&["k"])), None);
+        assert_eq!(at.refusal(150_000, &group(&["k"])), None);
         let over = flat(vec![key("k", "integer")], MAX_LEAVES + 1);
-        let refusal = over
-            .refusal(150_000, KeyRole::GroupBy, &group(&["k"]))
-            .unwrap();
+        let refusal = over.refusal(150_000, &group(&["k"])).unwrap();
         let text = refusal.to_string();
         assert!(text.contains("1001") && text.contains("1000"), "{text}");
     }
@@ -677,9 +615,7 @@ mod tests {
     #[test]
     fn a_server_before_15_is_refused_first() {
         let tree = flat(vec![key("k", "text")], MAX_LEAVES + 1);
-        let refusal = tree
-            .refusal(140_011, KeyRole::GroupBy, &group(&["x"]))
-            .unwrap();
+        let refusal = tree.refusal(140_011, &group(&["x"])).unwrap();
         assert!(refusal.to_string().contains("PostgreSQL 15"), "{refusal}");
     }
 }

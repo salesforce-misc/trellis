@@ -61,7 +61,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use tokio_postgres::types::PgLsn;
 
-use crate::defs::ast::{Expr, Predicate};
+use crate::defs::ast::Predicate;
 use crate::defs::ddl::{self, PrimaryKeyColumn};
 use crate::defs::model::Definition;
 use crate::pool::{Pool, quote_ident};
@@ -70,23 +70,6 @@ use super::group_basis::{self, Agg, GroupShape};
 use super::self_check::{ComparePass, Divergence, SelfCheckError, SelfCheckScope, render_leaf};
 use super::self_check_keyset::{BYTE_ORDER, Keyset};
 use super::self_check_ring::{Lands, Ring, WEIGHT};
-
-/// Refuses a definition with an argument or field [`render_leaf`] can't
-/// render.
-pub(super) fn check_renders(def: &Definition, shape: &GroupShape) -> Result<(), SelfCheckError> {
-    let exprs = shape
-        .args
-        .iter()
-        .map(|a| &a.expr)
-        .chain(shape.fields.iter().map(|(_, _, e)| e));
-    for expr in exprs {
-        render_leaf(expr).map_err(|detail| SelfCheckError::UnsupportedExpr {
-            target: def.def.target.clone(),
-            detail,
-        })?;
-    }
-    Ok(())
-}
 
 /// The partials' columns in the order every side lists them: the row count,
 /// then per argument its count and, if summed, its sum. Names are the
@@ -163,12 +146,6 @@ fn page_sql(
     floor_key: &str,
     bounded: bool,
 ) -> Result<String, SelfCheckError> {
-    let render = |expr: &Expr| {
-        render_leaf(expr).map_err(|detail| SelfCheckError::UnsupportedExpr {
-            target: target.to_string(),
-            detail,
-        })
-    };
     let identity = keyset.columns();
     let key = ddl::pk_key_sql_expr(identity, None);
     let refs = keyset.refs(None);
@@ -192,7 +169,7 @@ fn page_sql(
     // them: over the weighted rows (`super::self_check_ring`).
     let mut args = Vec::with_capacity(shape.args.len());
     for arg in &shape.args {
-        args.push((render(&arg.expr)?, arg.summed));
+        args.push((render_leaf(&arg.expr), arg.summed));
     }
     let (src_parts, nonzero) = weighted_partials(&args);
     let lands = Lands {
@@ -236,7 +213,7 @@ fn page_sql(
         .collect();
     let mut implied = Vec::with_capacity(shape.fields.len());
     for (_, pg_type, expr) in &shape.fields {
-        implied.push(format!("(({})::{pg_type})::text", render(expr)?));
+        implied.push(format!("(({})::{pg_type})::text", render_leaf(expr)));
     }
     let lateral = if aggs.is_empty() {
         String::new()

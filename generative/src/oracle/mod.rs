@@ -384,10 +384,6 @@ fn render_expr(expr: &Expr) -> String {
             let rendered_args: Vec<String> = args.iter().map(render_expr).collect();
             format!("{}({})", name.to_lowercase(), rendered_args.join(", "))
         }
-        Expr::RelationshipPath { rel, column } => panic!(
-            "oracle: a path into another table ('{rel}.{column}') outside a JOIN — a generator \
-             bug; a JOIN definition renders through `render_join_select`"
-        ),
     }
 }
 
@@ -813,10 +809,6 @@ fn field_value_type(expr: &Expr, source_columns: &HashMap<String, ValueType>) ->
                      that set ever widens"
                 )
             }),
-        Expr::RelationshipPath { rel, column } => panic!(
-            "oracle: a path into another table ('{rel}.{column}') outside a JOIN — a generator \
-             bug; field_value_type types a definition over its own source only"
-        ),
     }
 }
 
@@ -900,11 +892,10 @@ pub fn render_join_select(def: &TransformDef) -> String {
 }
 
 /// One `JOIN` field expression as SQL: every column is read through the
-/// table it names (`a.x`, or a joined `b.y`, which parses as a path).
+/// table it names (`a.x`, or a joined `b.y`).
 fn render_join_expr(expr: &Expr) -> String {
     match expr {
-        Expr::SourceColumn { table, column, .. }
-        | Expr::RelationshipPath { rel: table, column } => {
+        Expr::SourceColumn { table, column, .. } => {
             format!("{}.{}", quote_ident(table), quote_ident(column))
         }
         Expr::BinaryOp { op, lhs, rhs } => format!(

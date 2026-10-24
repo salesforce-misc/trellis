@@ -90,7 +90,7 @@ async fn connect_raw(dsn: &str) -> Client {
 
 /// Defines a `JOIN` whose one `ON` term pairs `left.lcol` with
 /// `right.rcol`. `JOIN` key admission reads the same allowlist
-/// (`catalog::is_text_stable_join_key_type`) a 1-1 primary key does.
+/// (`join_key_types::is_text_stable_join_key_type`) a 1-1 primary key does.
 async fn define_join_on(
     pool: &trellis::pool::Pool,
     target: &str,
@@ -241,7 +241,7 @@ async fn cidr_out_and_the_text_cast_always_agree() {
 // ---------------------------------------------------------------------
 
 /// `cidr`/`macaddr`/`macaddr8` are accepted as `JOIN` `ON` keys and,
-/// because both roles gate on the same `catalog::TEXT_STABLE_JOIN_KEY_TYPES`
+/// because both roles gate on the same `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES`
 /// allowlist, as 1-1 primary keys too.
 #[tokio::test]
 async fn cidr_macaddr_macaddr8_join_keys_and_primary_keys_are_admitted() {
@@ -318,7 +318,7 @@ fn all_four_families_are_admitted_as_group_by_keys() {
             "TRANSFORM t FROM s GROUP BY {column} WITHOUT SOURCE INDEX SELECT {column} AS {target}, SUM(n) AS total"
         ))
         .expect("parses");
-        validate(&def, &source_columns(), &HashMap::new())
+        validate(&def, &source_columns())
             .unwrap_or_else(|e| panic!("{column} must be accepted as a GROUP BY key: {e}"));
     }
 }
@@ -402,7 +402,7 @@ async fn inet_min_max_keeps_its_type_and_the_fold_matches_a_server_side_aggregat
                 ("id".to_string(), ValueType::Integer(IntWidth::Int8)),
                 ("i".to_string(), ValueType::Other(PgType::Inet)),
             ]);
-            validate(&def, &columns, &HashMap::new())
+            validate(&def, &columns)
                 .unwrap_or_else(|e| panic!("{aggregate}(inet) must validate: {e}"));
 
             let rows: Vec<Row> = canonical
@@ -606,7 +606,7 @@ async fn an_inet_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two()
         ("amount".to_string(), ValueType::Numeric),
     ]);
     let def = parse(DEF_SQL).expect("parse");
-    validate(&def, &columns, &HashMap::new()).expect("validate");
+    validate(&def, &columns).expect("validate");
     create_definition(&db.pool, DEF_SQL, &columns)
         .await
         .expect("create definition");

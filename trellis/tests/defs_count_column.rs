@@ -244,7 +244,7 @@ async fn create_schema_and_definition(pool: &trellis::Pool, client: &Client) {
         .expect("create source table");
 
     let def = parse(DEF_SQL).expect("parse");
-    validate(&def, &columns(), &HashMap::new()).expect("validate");
+    validate(&def, &columns()).expect("validate");
     create_definition(pool, DEF_SQL, &columns())
         .await
         .expect("create definition");
@@ -260,8 +260,7 @@ async fn create_schema_and_definition(pool: &trellis::Pool, client: &Client) {
 #[test]
 fn count_of_a_column_parses_and_validates() {
     let def = parse(DEF_SQL).expect("COUNT(<column>) must parse in a GROUP BY definition");
-    validate(&def, &columns(), &HashMap::new())
-        .expect("COUNT(<column>) must validate as a GROUP BY field");
+    validate(&def, &columns()).expect("COUNT(<column>) must validate as a GROUP BY field");
     // The declared type itself (must be `bigint`, matching Postgres's own
     // `pg_typeof(count(x))`) is pinned by the crate-internal unit test
     // `defs::validate::tests::count_of_a_column_in_a_group_by_is_accepted_and_typed_bigint`

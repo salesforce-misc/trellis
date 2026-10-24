@@ -57,10 +57,10 @@
 //!
 //! `-0` and `0` are *equal* but render as different text (`'-0'` vs `'0'`;
 //! verified on a live server), and Trellis matches join/primary/`GROUP BY`
-//! keys by raw `::text` today (`catalog::is_text_stable_join_key_type`).
+//! keys by raw `::text` today (`join_key_types::is_text_stable_join_key_type`).
 //! That is precisely the text-instability bar `numeric` already fails on
 //! (`1.0` vs `1.00`), so `real`/`double precision` stay off
-//! `catalog::TEXT_STABLE_JOIN_KEY_TYPES` and are rejected as `GROUP BY`
+//! `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES` and are rejected as `GROUP BY`
 //! keys. The unlock is #110's typed key index — comparing decoded values
 //! through [`compare`] — not a new encoding here. See
 //! `docs/type-support.md`.

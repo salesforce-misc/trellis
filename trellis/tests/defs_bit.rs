@@ -95,7 +95,7 @@ async fn connect_raw(dsn: &str) -> Client {
 
 /// Defines a `JOIN` whose one `ON` term pairs `left.lcol` with
 /// `right.rcol`. `JOIN` key admission reads the same allowlist
-/// (`catalog::is_text_stable_join_key_type`) a 1-1 primary key does.
+/// (`join_key_types::is_text_stable_join_key_type`) a 1-1 primary key does.
 async fn define_join_on(
     pool: &trellis::pool::Pool,
     target: &str,
@@ -206,7 +206,7 @@ async fn to_jsonb_and_text_agree_for_bit_and_varbit() {
 
 /// Both `bit(n)` and `bit varying` are accepted as a `JOIN` `ON` key
 /// and, because both roles gate on the same
-/// `catalog::TEXT_STABLE_JOIN_KEY_TYPES` allowlist, as a 1-1 primary key
+/// `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES` allowlist, as a 1-1 primary key
 /// too — neither role ever asks a bare `ValueType` to declare a new column
 /// (a join-key lookup casts the bound array to the column's own concrete
 /// introspected type; a 1-1 primary key copies that concrete type
@@ -251,7 +251,7 @@ fn varbit_group_by_key_is_admitted() {
         "TRANSFORM t FROM s GROUP BY vb WITHOUT SOURCE INDEX SELECT vb AS k, SUM(n) AS total",
     )
     .expect("parses");
-    validate(&def, &source_columns(), &HashMap::new())
+    validate(&def, &source_columns())
         .unwrap_or_else(|e| panic!("bit varying must be accepted as a GROUP BY key: {e}"));
 }
 
@@ -265,7 +265,7 @@ fn fixed_length_bit_group_by_key_is_refused() {
     let def =
         parse("TRANSFORM t FROM s GROUP BY b WITHOUT SOURCE INDEX SELECT b AS k, SUM(n) AS total")
             .expect("parses");
-    let err = validate(&def, &source_columns(), &HashMap::new())
+    let err = validate(&def, &source_columns())
         .expect_err("fixed-length bit must still be refused as a GROUP BY key");
     let _ = err; // the specific ValidationError variant isn't load-bearing here
 }
@@ -446,7 +446,7 @@ async fn bit_and_or_fold_matches_a_server_side_aggregate() {
             ("id".to_string(), ValueType::Integer(IntWidth::Int8)),
             ("b".to_string(), ValueType::Other(PgType::Bit)),
         ]);
-        validate(&def, &columns, &HashMap::new()).expect("validate");
+        validate(&def, &columns).expect("validate");
 
         let rows: Vec<Row> = group
             .iter()
@@ -510,7 +510,7 @@ async fn bit_and_or_reject_mismatched_length_bit_varying_the_same_way_postgres_d
         ("id".to_string(), ValueType::Integer(IntWidth::Int8)),
         ("vb".to_string(), ValueType::Other(PgType::VarBit)),
     ]);
-    validate(&def, &columns, &HashMap::new()).expect("validate");
+    validate(&def, &columns).expect("validate");
     let rows: Vec<Row> = vec![
         Row::from([
             ("id".to_string(), Some("1".to_string())),
@@ -622,7 +622,7 @@ async fn a_varbit_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two(
         ("amount".to_string(), ValueType::Numeric),
     ]);
     let def = parse(DEF_SQL).expect("parse");
-    validate(&def, &columns, &HashMap::new()).expect("validate");
+    validate(&def, &columns).expect("validate");
     create_definition(&db.pool, DEF_SQL, &columns)
         .await
         .expect("create definition");

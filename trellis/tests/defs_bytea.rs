@@ -86,7 +86,7 @@ async fn connect_raw(dsn: &str) -> Client {
 
 /// Defines a `JOIN` whose one `ON` term pairs `left.lcol` with
 /// `right.rcol`. `JOIN` key admission reads the same allowlist
-/// (`catalog::is_text_stable_join_key_type`) a 1-1 primary key does.
+/// (`join_key_types::is_text_stable_join_key_type`) a 1-1 primary key does.
 async fn define_join_on(
     pool: &trellis::pool::Pool,
     target: &str,
@@ -134,12 +134,12 @@ const GRID: &[&str] = &[
 /// the structural-edge-case grid (the empty value, embedded `NUL` bytes, a
 /// prefix/extension pair) **and** for every single byte value from `0x00` to
 /// `0xff` — the full range, generated rather than hand-listed, so the claim
-/// in `catalog::TEXT_STABLE_JOIN_KEY_TYPES`'s doc comment ("every byte value
+/// in `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES`'s doc comment ("every byte value
 /// from `0x00` to `0xff`") is checked exactly as stated rather than
 /// approximated by a handful of representatives.
 ///
 /// This is the load-bearing fact behind admitting `bytea` straight onto
-/// `catalog::TEXT_STABLE_JOIN_KEY_TYPES` with no typed key index — the
+/// `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES` with no typed key index — the
 /// same measurement `defs_temporal.rs`'s
 /// `the_text_stability_verdict_is_the_server_s_not_this_crate_s` makes for
 /// the temporal families.
@@ -350,7 +350,7 @@ async fn the_engine_s_own_row_renderer_agrees_with_text_for_bytea() {
 // ---------------------------------------------------------------------
 
 /// `bytea` is accepted as a `JOIN` `ON` key and, because both roles
-/// gate on the same `catalog::TEXT_STABLE_JOIN_KEY_TYPES` allowlist, as a
+/// gate on the same `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES` allowlist, as a
 /// 1-1 primary key too.
 #[tokio::test]
 async fn bytea_join_keys_and_primary_keys_are_admitted() {
@@ -385,7 +385,7 @@ fn bytea_group_by_key_is_admitted() {
     let def =
         parse("TRANSFORM t FROM s GROUP BY b WITHOUT SOURCE INDEX SELECT b AS k, SUM(n) AS total")
             .expect("parses");
-    validate(&def, &source_columns(), &HashMap::new())
+    validate(&def, &source_columns())
         .unwrap_or_else(|e| panic!("bytea must be accepted as a GROUP BY key: {e}"));
 }
 
@@ -440,7 +440,7 @@ async fn postgres_has_no_min_max_aggregate_for_bytea() {
             "TRANSFORM t FROM s GROUP BY id WITHOUT SOURCE INDEX SELECT id AS k, {name}(b) AS m"
         ))
         .expect("parses");
-        let err = validate(&def, &source_columns(), &HashMap::new())
+        let err = validate(&def, &source_columns())
             .expect_err(&format!("{name}(b) over a bytea column must be rejected"));
         let _ = err; // the specific ValidationError variant isn't load-bearing here
     }
@@ -486,7 +486,7 @@ async fn a_bytea_group_key_seeded_by_backfill_and_by_live_read_is_one_group_not_
         ("amount".to_string(), ValueType::Numeric),
     ]);
     let def = parse(DEF_SQL).expect("parse");
-    validate(&def, &columns, &HashMap::new()).expect("validate");
+    validate(&def, &columns).expect("validate");
     create_definition(&db.pool, DEF_SQL, &columns)
         .await
         .expect("create definition");

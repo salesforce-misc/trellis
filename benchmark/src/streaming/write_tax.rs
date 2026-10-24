@@ -1106,7 +1106,7 @@ pub async fn set_up_variant(variant: Variant, table: &str, raw: &mut RawClient) 
         }
         Variant::Trigger => {
             let table = format!("public.{table}");
-            let catalog = trellis::dev::capture::load_catalog(&*raw, DEFAULT_SCHEMA)
+            let catalog = trellis::dev::capture::load_catalog(&*raw)
                 .await
                 .expect("load the capture catalog");
             let spec: CaptureSpec = trellis::dev::capture::capture_spec(&*raw, &catalog, &table)

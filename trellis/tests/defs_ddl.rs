@@ -1180,7 +1180,7 @@ async fn create_target_table_mirrors_a_composite_primary_key_in_full() {
 /// session-`TimeZone`-dependent, and until issue #246 pinned `TimeZone`
 /// identically on every connection Trellis opens
 /// that made it exactly as unsafe as `numeric`. It is a *safe* primary-key
-/// type now (`catalog::TEXT_STABLE_JOIN_KEY_TYPES`), which is what
+/// type now (`join_key_types::TEXT_STABLE_JOIN_KEY_TYPES`), which is what
 /// [`a_source_table_with_a_timestamptz_primary_key_is_accepted`] below
 /// proves — `numeric` (this test) takes over as the "still genuinely
 /// unsafe" example.

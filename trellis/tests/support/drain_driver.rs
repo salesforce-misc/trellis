@@ -152,9 +152,7 @@ impl Driver {
         }
         phases.push(("define", started.elapsed()));
         let started = Instant::now();
-        let catalog = load_catalog(&ctl, DEFAULT_SCHEMA)
-            .await
-            .expect("load the catalog");
+        let catalog = load_catalog(&ctl).await.expect("load the catalog");
         for table in captured {
             let spec = capture_spec(&ctl, &catalog, table)
                 .await

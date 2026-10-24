@@ -726,7 +726,7 @@ pub(crate) async fn check(
                 .iter()
                 .filter(|r| !r.capture_failed && read_by.contains(&r.id))
             {
-                match respond(&txn, schema, catalog, reader, table, &key, column, change).await? {
+                match respond(&txn, schema, reader, table, &key, column, change).await? {
                     Some(Response::Rebuild) => {
                         causes.insert(CaptureRebuildCause::ColumnChanged);
                     }
@@ -801,7 +801,6 @@ pub(crate) async fn check(
 async fn respond(
     txn: &tokio_postgres::Transaction<'_>,
     schema: &str,
-    catalog: &CaptureCatalog,
     reader: &super::columns::CaptureReader,
     table: &str,
     key: &[String],
@@ -816,23 +815,7 @@ async fn respond(
     if !change.retyped() {
         return Ok(Some(Response::Rebuild));
     }
-    let declared: Vec<&crate::defs::model::RelationshipDefinition> = catalog
-        .relationships
-        .iter()
-        .filter(|r| r.qualified_from_table() == reader.source)
-        .collect();
-    let to_tables: Vec<String> = declared.iter().map(|r| r.qualified_to_table()).collect();
-    let rels: Vec<key_types::RelRef<'_>> = declared
-        .iter()
-        .zip(&to_tables)
-        .map(|(r, to_table)| key_types::RelRef {
-            name: &r.def.name,
-            from_col: &r.def.from_col,
-            to_col: &r.def.to_col,
-            to_table,
-        })
-        .collect();
-    let key_use = key_types::key_uses(&reader.def, &reader.source, &rels, table, key)
+    let key_use = key_types::key_uses(&reader.def, &reader.source, table, key)
         .into_iter()
         .any(|(c, _)| c == column);
     if key_use {
@@ -891,18 +874,12 @@ async fn respond(
             "{what}, which changes the type this definition evaluates it as"
         ))));
     }
-    let copies: Vec<crate::defs::copies::TypedCopy> = crate::defs::copies::typed_copies(
-        txn,
-        schema,
-        &reader.def,
-        &reader.source,
-        &reader.target,
-        &declared,
-    )
-    .await?
-    .into_iter()
-    .filter(|c| c.columns_of(table).any(|c| c == column))
-    .collect();
+    let copies: Vec<crate::defs::copies::TypedCopy> =
+        crate::defs::copies::typed_copies(txn, schema, &reader.def, &reader.source, &reader.target)
+            .await?
+            .into_iter()
+            .filter(|c| c.columns_of(table).any(|c| c == column))
+            .collect();
     // A copy has no type modifier (ADR-0020), so it holds every value of
     // the source column's type whatever its modifier; one an integer or
     // float width outgrew is `pause_readers_of_retyped`'s, which ran first.

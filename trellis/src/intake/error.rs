@@ -53,8 +53,7 @@ pub enum IntakeError {
     /// Issue #518: a discharge's sweep (`super::resume_orphans`) found a
     /// swept target inconsistent with its definition in the catalog: an
     /// aggregate target whose key lacks one of its grouping columns (its
-    /// primary key altered by hand, say), or a `GROUP BY` relationship its
-    /// source no longer declares as to-one. Returned rather than panicked, so
+    /// primary key altered by hand, say). Returned rather than panicked, so
     /// the marker fails and backs off (issue #407) with this on status
     /// instead of taking down the maintenance loop.
     UnsweepableTarget { target: String, reason: String },

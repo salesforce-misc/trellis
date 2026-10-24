@@ -1412,9 +1412,7 @@ fn sales_columns() -> HashMap<String, ValueType> {
 
 /// The table's spec as the catalog asks for it now.
 async fn catalog_spec(client: &Client, table: &str) -> CaptureSpec {
-    let catalog = load_catalog(client, DEFAULT_SCHEMA)
-        .await
-        .expect("load the catalog");
+    let catalog = load_catalog(client).await.expect("load the catalog");
     capture_spec(client, &catalog, table)
         .await
         .expect("capture spec")

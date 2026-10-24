@@ -442,7 +442,7 @@ async fn measure_a_thousand_leaf_source() {
         fingerprints[0], fingerprints[10], fingerprints[19]
     );
     // The pass's other per-table catalog reads, each timed alone.
-    let catalog = trellis::capture::columns::load_catalog(&fx.d.ctl, DEFAULT_SCHEMA)
+    let catalog = trellis::capture::columns::load_catalog(&fx.d.ctl)
         .await
         .expect("catalog");
     for _ in 0..3 {

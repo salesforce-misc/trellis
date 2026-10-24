@@ -104,7 +104,7 @@ otlp = [
 # must do the same; check with
 # `cargo build --workspace && strings target/debug/trellis | grep TRELLIS_TEST_PAUSE`
 # (must print nothing). The same check applies to `dev`'s own contents:
-# `strings target/debug/trellis | grep render_aggregate_relationship_select_sql`
+# `strings target/debug/trellis | grep render_aggregate_select_sql`
 # must print nothing too.
 test-util = []
 # ADR-0012, and *not* its sanctioned exception. `defs`/`staging`/`intake` are

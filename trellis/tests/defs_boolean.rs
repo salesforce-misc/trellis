@@ -19,7 +19,7 @@
 //!    `'t'`/`'f'`. `<col>::text` does **not** call `boolout` — Postgres ships
 //!    a second, dedicated `pg_cast` row (`pg_catalog.text(boolean)`) that
 //!    overrides the cast to spell it `'true'`/`'false'` instead. Every other
-//!    type `catalog::TEXT_STABLE_JOIN_KEY_TYPES` admits has *no* such
+//!    type `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES` admits has *no* such
 //!    override — its `::text` cast just calls its own output function — so
 //!    `boolean` is the only type on the epic's board with a second renderer
 //!    at all.
@@ -28,7 +28,7 @@
 //!    spelling verbatim, and several of `staging::apply`'s scalar key
 //!    lookups compare it against a live column's `{col}::text` rendering —
 //!    two different strings for one value, silently never matching. This is
-//!    why `boolean` is *not* added to `catalog::TEXT_STABLE_JOIN_KEY_TYPES`
+//!    why `boolean` is *not* added to `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES`
 //!    here — seeing this test file, this is a deliberate, documented
 //!    non-change, not an oversight. See `catalog.rs`'s own doc comment on
 //!    that constant for the full account, including which call sites are
@@ -113,7 +113,7 @@ async fn connect_raw(dsn: &str) -> Client {
 
 /// Defines a `JOIN` whose one `ON` term pairs `left.lcol` with
 /// `right.rcol`. `JOIN` key admission reads the same allowlist
-/// (`catalog::is_text_stable_join_key_type`) a 1-1 primary key does.
+/// (`join_key_types::is_text_stable_join_key_type`) a 1-1 primary key does.
 async fn define_join_on(
     pool: &trellis::pool::Pool,
     target: &str,
@@ -136,7 +136,7 @@ async fn define_join_on(
 /// `boolean` is the only type this epic has admitted anywhere whose
 /// `::text` cast is not its own output function — verified directly off
 /// `pg_cast` rather than inferred, and contrasted with a spread of types
-/// already on `catalog::TEXT_STABLE_JOIN_KEY_TYPES` to confirm none of them
+/// already on `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES` to confirm none of them
 /// share the hazard.
 #[tokio::test]
 async fn boolean_is_the_only_admitted_family_with_a_dedicated_text_cast() {
@@ -228,7 +228,7 @@ async fn boolout_and_the_text_cast_disagree_on_a_live_column() {
 
 /// `boolean` must be refused as a `JOIN` `ON` key and as a 1-1
 /// primary key — the join/PK-key roles gate on the same
-/// `catalog::TEXT_STABLE_JOIN_KEY_TYPES` allowlist, and `boolean` is not on
+/// `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES` allowlist, and `boolean` is not on
 /// it (see `catalog.rs`'s doc comment and this file's module doc for why).
 /// A regression pin: if a future edit adds `"boolean"` to that list without
 /// also fixing the scalar key-lookup call sites in `staging::apply` that
@@ -278,7 +278,7 @@ fn boolean_group_by_key_is_admitted() {
         "TRANSFORM t FROM s GROUP BY flag WITHOUT SOURCE INDEX SELECT flag AS k, SUM(n) AS total",
     )
     .expect("parses");
-    validate(&def, &source_columns(), &HashMap::new())
+    validate(&def, &source_columns())
         .unwrap_or_else(|e| panic!("boolean must be accepted as a GROUP BY key: {e}"));
 }
 
@@ -362,7 +362,7 @@ async fn bool_and_or_fold_matches_a_server_side_aggregate() {
             ("id".to_string(), ValueType::Integer(IntWidth::Int8)),
             ("flag".to_string(), ValueType::Boolean),
         ]);
-        validate(&def, &columns, &HashMap::new()).expect("validate");
+        validate(&def, &columns).expect("validate");
 
         let rows: Vec<Row> = group
             .iter()
@@ -488,7 +488,7 @@ async fn a_boolean_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two
         ("amount".to_string(), ValueType::Numeric),
     ]);
     let def = parse(DEF_SQL).expect("parse");
-    validate(&def, &columns, &HashMap::new()).expect("validate");
+    validate(&def, &columns).expect("validate");
     create_definition(&db.pool, DEF_SQL, &columns)
         .await
         .expect("create definition");

@@ -99,16 +99,12 @@ use std::time::SystemTime;
 use tokio_postgres::Transaction;
 use tokio_postgres::types::PgLsn;
 
-use crate::defs::ast::{
-    Expr, FieldDef, GroupByKey, KeySpace, TransformDef, ValueType, group_by_contains,
-};
+use crate::defs::ast::{Expr, FieldDef, KeySpace, TransformDef, ValueType, group_by_contains};
 use crate::defs::backfill::{FieldKind, classify_field};
 use crate::defs::ddl::{self, PrimaryKeyColumn};
-use crate::defs::eval;
 use crate::defs::ledger as schema;
 use crate::defs::oracle::render_expr_sql;
 use crate::defs::pg_type::PgType;
-use crate::defs::validate::ResolvedRelationship;
 use crate::pool::{quote_ident, quote_literal};
 
 use super::apply::ApplyError;
@@ -271,45 +267,34 @@ impl LedgerShape {
 
 /// Whether `def` is a target the ledger path maintains (see the module doc),
 /// and its shape if so. An aggregate the group basis takes
-/// ([`super::group_basis::route`], behind its dev knob, #1100) is not, nor is
-/// one that reads a relationship. `relationships` are `def`'s, resolved
-/// (`catalog::resolve_relationships`), for its field types.
+/// ([`super::group_basis::route`], behind its dev knob, #1100) is not.
 pub(crate) fn route(
     def: &TransformDef,
     source_columns: &HashMap<String, ValueType>,
-    relationships: &HashMap<String, ResolvedRelationship>,
 ) -> Option<LedgerShape> {
     if super::group_basis::route(def, source_columns).is_some() {
         return None;
     }
-    shape_of(def, source_columns, relationships)
+    shape_of(def, source_columns)
 }
 
 /// [`route`]'s ledger shape of `def`, whatever the group basis takes.
 fn shape_of(
     def: &TransformDef,
     source_columns: &HashMap<String, ValueType>,
-    relationships: &HashMap<String, ResolvedRelationship>,
 ) -> Option<LedgerShape> {
     let KeySpace::Aggregate { group_by } = &def.key_space else {
         return None;
     };
-    if !eval::relationship_references(def).is_empty() {
-        return None;
-    }
     let mut group_cols = Vec::with_capacity(group_by.len());
     for key in group_by {
-        let GroupByKey::Column(column) = key else {
-            return None;
-        };
-        if !source_columns.contains_key(column) {
+        if !source_columns.contains_key(key.target_column_name()) {
             return None;
         }
         group_cols.push(key.target_column_name().to_string());
     }
     let substituted = crate::defs::backfill::substituted_field_exprs(def).ok()?;
-    let field_types =
-        crate::defs::validate::infer_field_types(def, source_columns, relationships).ok()?;
+    let field_types = crate::defs::validate::infer_field_types(def, source_columns).ok()?;
     let value_fields: Vec<&FieldDef> = def
         .fields
         .iter()
@@ -405,20 +390,14 @@ fn shape_of(
     })
 }
 
-/// [`route`] for the stored definition `def`, its relationships resolved
-/// first (a catalog read only for a definition that reads one).
-pub(crate) async fn route_definition(
-    pool: &crate::pool::Pool,
-    def: &crate::defs::model::Definition,
-) -> Result<Option<LedgerShape>, crate::defs::catalog::CatalogError> {
-    let relationships =
-        crate::defs::catalog::resolve_relationships(pool, &def.def, &def.source_table).await?;
-    Ok(route(&def.def, &def.source_columns, &relationships))
+/// [`route`] for the stored definition `def`.
+pub(crate) fn route_definition(def: &crate::defs::model::Definition) -> Option<LedgerShape> {
+    route(&def.def, &def.source_columns)
 }
 
 /// `expr` as SQL over the source row `s`: a source column as `s.<column>`.
 fn render_over_source(expr: &Expr) -> String {
-    crate::defs::oracle::render_to_one_rel_expr_sql(expr, "s")
+    crate::defs::oracle::render_qualified_expr_sql(expr, "s")
 }
 
 /// The aggregate a recomputed field `expr` folds by ([`LedgerField::Recompute`]),
@@ -455,10 +434,7 @@ fn source_reads(expr: &Expr, out: &mut Vec<String>) {
             source_reads(lhs, out);
             source_reads(rhs, out);
         }
-        Expr::NumberLiteral(_)
-        | Expr::StringLiteral(_)
-        | Expr::TypedLiteral { .. }
-        | Expr::RelationshipPath { .. } => {}
+        Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::TypedLiteral { .. } => {}
     }
 }
 
@@ -526,8 +502,7 @@ impl LedgerTargetPlan {
     }
 
     /// The `GROUP BY` columns read from the source row under their own
-    /// names (the ledger's column of that name), in `GROUP BY` order: every
-    /// one but a relationship path.
+    /// names (the ledger's column of that name), in `GROUP BY` order.
     pub(super) fn plain_group_cols(&self) -> Vec<&str> {
         self.shape.plain_group_cols().map(String::as_str).collect()
     }
@@ -2226,8 +2201,7 @@ pub(super) enum NewEntries<'a> {
     /// ([`chunk_insert_statement`], #723).
     None,
     /// A non-member placeholder each: a rebuild's sweep batch's, which
-    /// re-derives every key it locks, and a page's on a target that reads a
-    /// relationship.
+    /// re-derives every key it locks.
     Placeholders,
     /// A page's: [`fresh_entries_statement`]'s parameters, in `keys`' order:
     /// the Re-derive flags, `lsn`s, `row_txid`s and Apply images (null for a
@@ -2729,7 +2703,7 @@ pub async fn explain_page(
             transform: target.to_string(),
         });
     };
-    let Some(shape) = route_definition(pool, &definition).await? else {
+    let Some(shape) = route_definition(&definition) else {
         return Err(ApplyError::AggregateOffLedger {
             target: definition.target_table,
         });
@@ -2830,7 +2804,7 @@ mod tests {
             .iter()
             .map(|(c, t)| ((*c).to_string(), *t))
             .collect();
-        shape_of(&def, &source_columns, &HashMap::new())
+        shape_of(&def, &source_columns)
     }
 
     const INT: ValueType = ValueType::Integer(crate::integer::IntWidth::Int4);
@@ -2858,9 +2832,8 @@ mod tests {
             ("v".to_string(), ValueType::Numeric),
         ]
         .into();
-        crate::defs::validate::validate(&def, &source_columns, &HashMap::new())
-            .expect("validate accepts it");
-        assert!(route(&def, &source_columns, &HashMap::new()).is_none());
+        crate::defs::validate::validate(&def, &source_columns).expect("validate accepts it");
+        assert!(route(&def, &source_columns).is_none());
         assert!(
             crate::defs::backfill::substituted_field_exprs(&def).is_err(),
             "define's DDL makes the same substitution, and refuses it"

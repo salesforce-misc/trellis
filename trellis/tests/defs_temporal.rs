@@ -132,7 +132,7 @@ async fn connect_raw(dsn: &str) -> Client {
 
 /// Defines a `JOIN` whose one `ON` term pairs `left.lcol` with
 /// `right.rcol`. `JOIN` key admission reads the same allowlist
-/// (`catalog::is_text_stable_join_key_type`) a 1-1 primary key does.
+/// (`join_key_types::is_text_stable_join_key_type`) a 1-1 primary key does.
 async fn define_join_on(
     pool: &trellis::pool::Pool,
     target: &str,
@@ -874,7 +874,7 @@ async fn the_min_max_fold_matches_a_server_side_aggregate() {
                 ("id".to_string(), ValueType::Integer(IntWidth::Int8)),
                 ("col".to_string(), ValueType::Other(*pg_type)),
             ]);
-            validate(&def, &columns, &HashMap::new())
+            validate(&def, &columns)
                 .unwrap_or_else(|e| panic!("{aggregate}({sql_name}) must validate: {e}"));
 
             let group: Vec<Row> = canonical
@@ -941,7 +941,7 @@ async fn the_sum_interval_fold_matches_a_server_side_sum() {
             ("id".to_string(), ValueType::Integer(IntWidth::Int8)),
             ("col".to_string(), ValueType::Other(PgType::Interval)),
         ]);
-        validate(&def, &columns, &HashMap::new()).expect("SUM(interval) must validate");
+        validate(&def, &columns).expect("SUM(interval) must validate");
 
         let mut rows_in = Vec::new();
         for value in *group {
@@ -1271,7 +1271,7 @@ async fn the_engine_s_own_row_renderer_agrees_with_text_for_every_temporal_famil
 
 /// `date`/`timestamp`/`time`/`timetz`/`timestamptz` are **accepted** as
 /// `JOIN` `ON` keys (and therefore as 1-1 primary keys — one
-/// allowlist, `catalog::TEXT_STABLE_JOIN_KEY_TYPES`, gates both), while
+/// allowlist, `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES`, gates both), while
 /// `interval` alone is refused.
 ///
 /// This is the headline change of #113 (`date`/`time`/`timetz`) plus #248
@@ -1343,7 +1343,7 @@ async fn temporal_join_keys_are_admitted_per_family() {
 /// A `timestamp(3)` column must be recognized as `timestamp without time
 /// zone` despite `format_type` rendering its modifier *inside* the name.
 ///
-/// This is the concrete reason `catalog::base_type_name` replaced
+/// This is the concrete reason `join_key_types::base_type_name` replaced
 /// `split('(')`: `timestamp(3) without time zone` truncates to `timestamp`,
 /// which is on no list, so a perfectly good sub-second-precision key would
 /// have been silently refused.
@@ -1400,7 +1400,7 @@ fn the_group_by_key_gate_follows_the_same_split() {
             "TRANSFORM t FROM s GROUP BY {column} WITHOUT SOURCE INDEX SELECT {column} AS k, SUM(n) AS total"
         ))
         .expect("parses");
-        validate(&def, &source_columns(), &HashMap::new())
+        validate(&def, &source_columns())
             .unwrap_or_else(|e| panic!("{column} must be accepted as a GROUP BY key: {e}"));
     }
 
@@ -1410,7 +1410,7 @@ fn the_group_by_key_gate_follows_the_same_split() {
             "TRANSFORM t FROM s GROUP BY {column} WITHOUT SOURCE INDEX SELECT {column} AS k, SUM(n) AS total"
         ))
         .expect("parses");
-        let err = validate(&def, &source_columns(), &HashMap::new())
+        let err = validate(&def, &source_columns())
             .expect_err("an interval GROUP BY key must be refused");
         assert!(
             err.to_string().contains(column),
@@ -1455,8 +1455,7 @@ async fn time_and_timetz_literals_are_canonical_only() {
     ] {
         let def = parse(&format!("TRANSFORM t FROM s SELECT {good} AS x"))
             .unwrap_or_else(|e| panic!("{good} should parse: {e}"));
-        validate(&def, &source_columns(), &HashMap::new())
-            .unwrap_or_else(|e| panic!("{good} should validate: {e}"));
+        validate(&def, &source_columns()).unwrap_or_else(|e| panic!("{good} should validate: {e}"));
 
         let pg = postgres_type_of(&client, good).await;
         assert!(
@@ -1508,7 +1507,7 @@ async fn time_and_timetz_literals_are_canonical_only() {
         let parsed = parse(&format!("TRANSFORM t FROM s SELECT {bad} AS x"));
         let rejected = match parsed {
             Err(_) => true,
-            Ok(def) => validate(&def, &source_columns(), &HashMap::new()).is_err(),
+            Ok(def) => validate(&def, &source_columns()).is_err(),
         };
         assert!(rejected, "{bad} must be rejected");
     }
@@ -1518,7 +1517,7 @@ async fn time_and_timetz_literals_are_canonical_only() {
         let parsed = parse(&format!("TRANSFORM t FROM s SELECT {absent} AS x"));
         let rejected = match parsed {
             Err(_) => true,
-            Ok(def) => validate(&def, &source_columns(), &HashMap::new()).is_err(),
+            Ok(def) => validate(&def, &source_columns()).is_err(),
         };
         assert!(rejected, "{absent} must not be spellable (yet)");
     }
@@ -1623,7 +1622,7 @@ async fn a_timestamp_group_key_seeded_by_backfill_and_by_live_read_is_one_group_
         ("amount".to_string(), ValueType::Numeric),
     ]);
     let def = parse(DEF_SQL).expect("parse");
-    validate(&def, &columns, &HashMap::new()).expect("validate");
+    validate(&def, &columns).expect("validate");
     create_definition(&db.pool, DEF_SQL, &columns)
         .await
         .expect("create definition");

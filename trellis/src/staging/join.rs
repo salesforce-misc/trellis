@@ -163,7 +163,7 @@ use crate::defs::ast::{Expr, KeySpace, TransformDef, ValueType};
 use crate::defs::ddl::{self, PrimaryKeyColumn};
 use crate::defs::join::{self as spec, HiddenTable, Side};
 use crate::defs::model::Definition;
-use crate::defs::oracle::render_to_one_rel_expr_sql;
+use crate::defs::oracle::render_qualified_expr_sql;
 use crate::pool::quote_ident;
 
 use super::apply::ApplyError;
@@ -347,7 +347,7 @@ impl JoinTargetPlan {
             .iter()
             .chain(&joined_args)
             .map(|arg| Arg {
-                sql: render_to_one_rel_expr_sql(arg, "s"),
+                sql: render_qualified_expr_sql(arg, "s"),
                 expr: arg.clone(),
                 summed: false,
             })
@@ -375,7 +375,7 @@ impl JoinTargetPlan {
         };
         let type_of = |arg: &Expr| {
             let side = side_of(arg)?;
-            crate::defs::validate::infer_expr_type(arg, types_of(side), &HashMap::new()).ok()
+            crate::defs::validate::infer_expr_type(arg, types_of(side)).ok()
         };
         let arg_of = |arg: &Expr| match side_of(arg)? {
             Side::From => from_args.iter().position(|a| a == arg),

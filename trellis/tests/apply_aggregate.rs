@@ -2765,7 +2765,7 @@ async fn drain_computes_an_aggregate_cross_field_alias_through_insert_and_update
 /// issue reports.
 ///
 /// `order_id` is `uuid` here, not the issue's own `numeric` example:
-/// `defs::catalog::is_text_stable_join_key_type` (issue #107, landed after
+/// `defs::join_key_types::is_text_stable_join_key_type` (issue #107, landed after
 /// #103 was filed, unrelated to it) now makes `ddl::source_primary_key`
 /// reject a `numeric`-typed 1-1 source primary key outright — and
 /// `create_aggregate_target_table` only ever renders a `GROUP BY` column

@@ -2139,8 +2139,7 @@ pub async fn trip_transform_fuse_if_crossed(
 
 /// A SQL predicate over a definition's row `t`: it isn't frozen. The states
 /// a drain's eviction may quarantine a definition from: an applying one,
-/// and one building (a relationship reader can be charged for the reverse
-/// work of a to-side key before it goes live, #799).
+/// and one building (#799).
 fn not_frozen_sql() -> String {
     let frozen = [TransformStatus::Paused, TransformStatus::Quarantined]
         .map(|status| format!("'{}'", status.as_str()))
@@ -2297,8 +2296,8 @@ async fn quarantine_if_crossed(
 // batch (`paused_columns_for`, called from [`super::apply::compute`]).
 //
 // **Scope, stated up front**: this tier only ever activates for
-// [`crate::defs::ast::KeySpace::OneToOne`] definitions (plain or
-// relationship-enriched). [`crate::defs::ast::KeySpace::Aggregate`] fields
+// [`crate::defs::ast::KeySpace::OneToOne`] definitions.
+// [`crate::defs::ast::KeySpace::Aggregate`] fields
 // are never attributed here and can never be paused by the automatic fuse —
 // the aggregate ledger (`staging::ledger`) has no notion of "skip this one
 // column and keep accumulating the others," and inventing one is a materially bigger
@@ -2393,7 +2392,7 @@ async fn attribute_column_failure(
 /// cascade runs).
 ///
 /// `defs::backfill`'s durable chunk-queue write path
-/// (`write_one_to_one_range`/`backfill_relationship_one_to_one`) needs this
+/// (`write_one_to_one_range`) needs this
 /// same exclusion for the same reason (a (re-)executed backfill chunk must
 /// not overwrite a column live CDC has since paused) but runs its own copy
 /// of the identical query (`defs::backfill::paused_columns_for`) rather than
@@ -3745,11 +3744,7 @@ async fn reads_paused_sibling(
 /// sweep drops the keys deleted while it was frozen. Any other definition
 /// gets a fresh `pending_backfill` marker for its source table
 /// ([`crate::intake::markers::park_marker`], which every marker goes
-/// through). The settled projections of the to-one relationships the
-/// definition reads are refreshed from their to-sides in the same
-/// transaction, unless another reader that isn't frozen reads them (issue
-/// #768: the drain may have skipped changes to a to-side while every reader
-/// was frozen). The target is left exactly as the freeze left it until that
+/// through). The target is left exactly as the freeze left it until that
 /// marker's discharge
 /// ([`crate::intake::markers::run_pending_backfills`]) runs, which in one
 /// transaction deletes every target row no current source row backs (issue
@@ -3959,8 +3954,7 @@ enum ResumeStep {
 }
 
 /// A definition in this instance whose target another definition reads
-/// (#971): as its source, a `JOIN`'s joined table, or a relationship's
-/// to-side.
+/// (#971): as its source or a `JOIN`'s joined table.
 #[derive(Debug)]
 struct Upstream {
     /// Its bare target, the name `RESUME TRANSFORM` takes.
@@ -3969,7 +3963,7 @@ struct Upstream {
     table: String,
 }
 
-/// The first upstream (by id) of definition `id`, `def` on `source_table`,
+/// The first upstream (by id) of definition `id` on `source_table`,
 /// that isn't `live`, if any (#971). A resume waits for every upstream to
 /// be `live`, so its rebuild reads whole upstream targets and each
 /// downstream rebuild starts only after its upstream's has finished.
@@ -3978,7 +3972,6 @@ struct Upstream {
 async fn upstream_not_live(
     client: &impl GenericClient,
     id: i64,
-    def: &TransformDef,
     source_table: &str,
 ) -> Result<Option<Upstream>, ApplyError> {
     let join_table: Option<String> = client
@@ -3990,12 +3983,6 @@ async fn upstream_not_live(
         .get(0);
     let mut tables: Vec<String> = vec![source_table.to_string()];
     tables.extend(join_table);
-    tables.extend(
-        catalog::relationships_read_by(client, def, source_table)
-            .await?
-            .iter()
-            .map(crate::defs::model::RelationshipDefinition::qualified_to_table),
-    );
     let upstreams = client
         .query(
             "select id, split_part(target_table, '.', 2), target_table, status \
@@ -4150,8 +4137,8 @@ async fn request_drain(
 ///    ([`catalog::revalidate`], #708, #760), before it changes anything, and
 ///    refuses with [`ApplyError::ResumeRefused`] while define would refuse
 ///    it: a key, join or `GROUP BY` column of a type or collation define
-///    refuses, a relationship whose join columns no longer match (#590), a
-///    redefined source key. A whole-transform resume also refuses a
+///    refuses, a `JOIN` whose `ON` columns no longer match, a redefined
+///    source key. A whole-transform resume also refuses a
 ///    definition whose ledger table doesn't exist
 ///    ([`catalog::check_ledger_table`], #986) and an aggregate whose
 ///    group-delta table has different running-sum or recompute columns from
@@ -4185,7 +4172,7 @@ async fn resume_locked(
             transform: target.to_string(),
         });
     };
-    if let Some(upstream) = upstream_not_live(txn, id, &definition.def, source_table).await? {
+    if let Some(upstream) = upstream_not_live(txn, id, source_table).await? {
         if !from_pass {
             request_wait(txn, id, &upstream).await?;
         }
@@ -4221,15 +4208,12 @@ async fn resume_locked(
             });
         }
     }
-    let rels = catalog::relationships_read_by(txn, &definition.def, source_table).await?;
-    let rel_refs: Vec<&crate::defs::model::RelationshipDefinition> = rels.iter().collect();
     let copies = crate::defs::copies::typed_copies(
         txn,
         schema,
         &definition.def,
         source_table,
         &definition.target_table,
-        &rel_refs,
     )
     .await?;
     let drifted: Vec<crate::defs::copies::CopyState> = crate::defs::copies::inspect(txn, copies)
@@ -4396,16 +4380,8 @@ async fn complete_resume(
     }
     // #1242: after both, whose enum tokens it records the type OIDs of.
     let joined = revalidated.join.as_ref().map(|sides| sides.joined.as_str());
-    crate::defs::key_types::record_definition(
-        txn,
-        id,
-        &definition.def,
-        source_table,
-        joined,
-        &catalog::rel_refs(&revalidated.relationships),
-        true,
-    )
-    .await?;
+    crate::defs::key_types::record_definition(txn, id, &definition.def, source_table, joined, true)
+        .await?;
     // #1205: a definition paused by a logical restore starts over on this
     // database's own positions. The rebuild below keeps the ledger's
     // `__applied_lsn` (B4), which is right for an ordinary one and would skip
@@ -4514,22 +4490,6 @@ async fn complete_resume(
     if revalidated.join.is_none() && !super::build::qualifies(txn, definition).await? {
         crate::intake::markers::park_marker(txn, source_table).await?;
     }
-    // Issue #768: the drain skips a to-side whose key can't be used while
-    // every definition reading it is frozen
-    // (`staging::apply::source_key_for_apply`), so changes to a to-side this
-    // definition reads may never have reached the relationship's settled
-    // projection, which its rebuild's go-live catch-up and every later apply
-    // read. Refreshed from the table here, in the resume, so the rebuild
-    // never reads it stale. The bump in [`lock_frozen`] holds the fence the
-    // skip is judged under: a page that skipped while this definition was
-    // frozen has committed, its changes no longer pending to be left to it,
-    // and a later one misses the fence and halts. Only the to-one
-    // relationships no other reader that isn't frozen reads
-    // ([`catalog::relationships_to_refresh`]), all their rows locked in one
-    // statement, in `relationship_id` order, the order a page takes them in.
-    let refresh =
-        catalog::relationships_to_refresh(txn, &definition.def, source_table, Some(id)).await?;
-    catalog::refresh_relationship_projections_by_id_in_txn(txn, &refresh).await?;
     // #799: release every key this definition holds. The fresh build below
     // re-derives each from the source, so its parked work is superseded, not
     // replayed, and the key is applied again from the build's go-live on.
@@ -4777,8 +4737,7 @@ pub(crate) const RETYPE_LOCK_TIMEOUT: std::time::Duration = std::time::Duration:
 /// in one transaction:
 ///
 /// - **No copy drifted:** the definition is resumed, `waiting_to_backfill`.
-/// - **Another upstream isn't `live`** (a `JOIN`'s joined table, a
-///   relationship's to-side, #971): a resume request is recorded and the
+/// - **Another upstream isn't `live`** (a `JOIN`'s joined table, #971): a resume request is recorded and the
 ///   cause cleared ([`request_wait`]), and [`finish_requested_resumes`]
 ///   completes it once every upstream is.
 /// - **Copies to re-type:** a resume request is recorded and the cause
@@ -5056,7 +5015,7 @@ async fn finish_requested_resume(
         // #971: nothing is re-validated or re-typed until every upstream is
         // live: its re-type may change the types this definition's copies
         // take from it.
-        if let Some(upstream) = upstream_not_live(&txn, id, &definition.def, &source_table).await? {
+        if let Some(upstream) = upstream_not_live(&txn, id, &source_table).await? {
             let error = waiting_failure(&upstream);
             let current: Option<String> = txn
                 .query_opt(
@@ -5097,15 +5056,12 @@ async fn finish_requested_resume(
                 return Ok(());
             }
         }
-        let rels = catalog::relationships_read_by(&txn, &definition.def, &source_table).await?;
-        let rel_refs: Vec<&crate::defs::model::RelationshipDefinition> = rels.iter().collect();
         let copies = crate::defs::copies::typed_copies(
             &txn,
             schema,
             &definition.def,
             &source_table,
             &definition.target_table,
-            &rel_refs,
         )
         .await?;
         let states: Vec<crate::defs::copies::CopyState> =
@@ -6070,8 +6026,7 @@ pub(crate) const RETYPE_RELEASE_WINDOW: std::time::Duration =
 /// the next capture pass). A reader can hold a key for a failure the
 /// upstream caused while it was rebuilt (its copy held values of two widths
 /// at once, say); the build has repaired it, and a key that still fails is
-/// held again on its first failure. A reader through a relationship is not
-/// asked for.
+/// held again on its first failure.
 ///
 /// Takes no lock on any definition row: the request rows are locked in
 /// reader id order, and nothing else locks them while holding a definition

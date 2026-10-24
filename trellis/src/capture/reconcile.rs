@@ -37,11 +37,9 @@
 //! the writes (#765).
 //!
 //! It also pauses every definition one of whose key columns on the table
-//! (its source key, a `GROUP BY` key, a join column or to-side key of a
-//! relationship it reads through) now has a type or collation define would
-//! refuse, or changed type in a way that renders the keys already stored
-//! differently, whose relationship's join columns no longer match, or that
-//! created a column, typed from one the table widened, that can't hold
+//! (its source key, a `GROUP BY` key, a `JOIN`'s join column) now has a type
+//! or collation define would refuse, or changed type in a way that renders
+//! the keys already stored differently, or that created a column, typed from one the table widened, that can't hold
 //! the type define would give it now (#760, #767, #824,
 //! [`crate::staging::schema_change::pause_readers_of_retyped`]). Only an
 //! integer or float width outgrows such a column: Trellis creates it with
@@ -91,21 +89,17 @@
 //!
 //! 1. its source is captured and current after this pass, or is another
 //!    definition's target (the target-mutation seam feeds it, not a trigger);
-//! 2. so is the to-side of every relationship it reads a column through;
-//! 3. and no such to-side (other than the source itself) still has a marker
-//!    its install or widen parked with a capture gate
+//! 2. so is a `JOIN`'s joined table;
+//! 3. and the joined table (other than the source itself) has no marker its
+//!    install or widen parked with a capture gate
 //!    (`pending_backfill.capture_gate_lsn`).
 //!
 //! Rule 3 closes C3's documented gap, "the gate only holds definitions
-//! sourced from the gated table". A definition sourced from `U` that reads a
-//! new column of `T` through a relationship waits on `U`'s marker, which no
-//! gate on `T` holds. So it waits until `T`'s own gated marker has
-//! discharged, which happens only once every change to `T` staged before the
-//! widen has drained, deferred reverses included
-//! ([`crate::staging::converge::table_changes_pending_through`]). That
-//! marker also refreshes `T`'s settled projections when `T` is a to-side
-//! (`intake::markers::park_widen_marker`), which repairs the projection
-//! columns the old images wrote as `NULL`.
+//! sourced from the gated table". A `JOIN` sourced from `U` that reads a
+//! new column of its joined table `T` waits on `U`'s marker, which no gate on
+//! `T` holds. So it waits until `T`'s own gated marker has discharged, which
+//! happens only once every change to `T` staged before the widen has drained
+//! ([`crate::staging::converge::table_changes_pending_through`]).
 //!
 //! The staging worker only parks registration markers for ready definitions
 //! and the discharge only dispatches ready ones
@@ -198,7 +192,7 @@ pub async fn reconcile(
     }
     crate::staging::quarantine::resume_caused_definitions(client, schema).await?;
     crate::staging::quarantine::finish_requested_resumes(client, schema).await?;
-    let snapshot = read_snapshot(client, schema).await?;
+    let snapshot = read_snapshot(client).await?;
     let installed = installed_tables(&*client, schema).await?;
     let database: String = client
         .query_typed_one("select pg_catalog.current_database()::text", &[])
@@ -540,8 +534,7 @@ pub async fn reconcile(
 struct Snapshot {
     catalog: CaptureCatalog,
     /// Every `waiting_to_backfill` definition: id, qualified source, and the
-    /// to-sides of the relationships it reads a column through (a `JOIN`'s
-    /// joined table among them).
+    /// other tables it reads (a `JOIN`'s joined table).
     waiting: Vec<(i64, String, BTreeSet<String>)>,
     /// Every definition's target: the tables the target-mutation seam feeds.
     targets: HashSet<String>,
@@ -563,7 +556,7 @@ pub async fn detect_disruptions(
     schema: &str,
     desired: &[String],
 ) -> Result<Vec<String>, CaptureError> {
-    let snapshot = read_snapshot(client, schema).await?;
+    let snapshot = read_snapshot(client).await?;
     let mut found = Vec::new();
     // #1205: a logical restore pauses every definition.
     if super::restore::detect(client).await? {
@@ -580,17 +573,17 @@ pub async fn detect_disruptions(
     Ok(found)
 }
 
-async fn read_snapshot(client: &mut Client, schema: &str) -> Result<Snapshot, CaptureError> {
+async fn read_snapshot(client: &mut Client) -> Result<Snapshot, CaptureError> {
     let txn = client
         .build_transaction()
         .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
         .read_only(true)
         .start()
         .await?;
-    let catalog = load_catalog(&txn, schema).await?;
+    let catalog = load_catalog(&txn).await?;
     let rows = txn
         .query(
-            "select id, source_table, definition_text, grammar_version, join_table \
+            "select id, source_table, join_table \
              from transform_definitions where status = $1 order by id",
             &[&TransformStatus::WaitingToBackfill.as_str()],
         )
@@ -604,38 +597,15 @@ async fn read_snapshot(client: &mut Client, schema: &str) -> Result<Snapshot, Ca
     txn.commit().await?;
     let mut waiting = Vec::with_capacity(rows.len());
     for row in rows {
-        let source: String = row.get(1);
-        let def = crate::defs::grammar::load(row.get::<_, &str>(2), row.get(3))
-            .map_err(|e| CaptureError::Catalog(e.into()))?;
-        let mut to_sides = to_sides_read(&catalog, &source, &def);
         // #1107: a JOIN's joined table is read like its source.
-        to_sides.extend(row.get::<_, Option<String>>(4));
-        waiting.push((row.get(0), source, to_sides));
+        let others: BTreeSet<String> = row.get::<_, Option<String>>(2).into_iter().collect();
+        waiting.push((row.get(0), row.get(1), others));
     }
     Ok(Snapshot {
         catalog,
         waiting,
         targets,
     })
-}
-
-/// The to-side of every relationship declared on `source` that `def` reads
-/// a column through.
-fn to_sides_read(
-    catalog: &CaptureCatalog,
-    source: &str,
-    def: &crate::defs::ast::TransformDef,
-) -> BTreeSet<String> {
-    let names: HashSet<String> = crate::defs::eval::relationship_references(def)
-        .into_iter()
-        .map(|(name, _)| name)
-        .collect();
-    catalog
-        .relationships
-        .iter()
-        .filter(|rel| rel.qualified_from_table() == source && names.contains(&rel.def.name))
-        .map(|rel| rel.qualified_to_table())
-        .collect()
 }
 
 /// The module doc's three rules.
@@ -661,9 +631,9 @@ fn ready_definitions(
     snapshot
         .waiting
         .iter()
-        .filter(|(_, source, to_sides)| {
+        .filter(|(_, source, others)| {
             current(source)
-                && to_sides
+                && others
                     .iter()
                     .all(|t| current(t) && (t == source || !gated.contains(t)))
         })
@@ -898,11 +868,11 @@ mod tests {
             catalog: CaptureCatalog::default(),
             waiting: waiting
                 .iter()
-                .map(|(id, source, to_sides)| {
+                .map(|(id, source, others)| {
                     (
                         *id,
                         source.to_string(),
-                        to_sides.iter().map(|t| t.to_string()).collect(),
+                        others.iter().map(|t| t.to_string()).collect(),
                     )
                 })
                 .collect(),
@@ -949,7 +919,7 @@ mod tests {
     #[test]
     fn a_seam_fed_table_the_pass_held_back_holds_its_readers() {
         // #745: row-level security applies to the target another definition
-        // reads, as its source or a to-side.
+        // reads, as its source or its JOIN table.
         let mut snap = snapshot(&[
             (1, "public.target", &[]),
             (2, "public.u", &["public.target"]),
@@ -978,7 +948,7 @@ mod tests {
     }
 
     #[test]
-    fn a_to_side_whose_widen_waits_holds_the_reader() {
+    fn a_joined_table_whose_widen_waits_holds_the_reader() {
         let snap = snapshot(&[(1, "public.u", &["public.t"])]);
         let desired = strings(&["public.u", "public.t"]);
         let ready = ready_definitions(
@@ -992,18 +962,15 @@ mod tests {
     }
 
     #[test]
-    fn a_to_side_with_a_gated_marker_holds_the_reader_but_the_source_s_own_gate_does_not() {
+    fn a_joined_table_with_a_gated_marker_holds_the_reader_but_the_source_s_own_gate_does_not() {
         let desired = strings(&["public.u", "public.t"]);
         let captured = set(&["public.u", "public.t"]);
         let gated: HashSet<String> = ["public.t".to_string()].into();
-        let snap = snapshot(&[
-            (1, "public.u", &["public.t"]),
-            (2, "public.t", &["public.t"]),
-        ]);
+        let snap = snapshot(&[(1, "public.u", &["public.t"]), (2, "public.t", &[])]);
         assert_eq!(
             ready_definitions(&snap, &desired, &captured, &gated, &HashSet::new()),
             vec![2],
-            "a self-relationship is held by its own marker's gate, not by rule 3"
+            "a definition is held by its own source's gate, not by rule 3"
         );
         assert_eq!(
             ready_definitions(&snap, &desired, &captured, &HashSet::new(), &HashSet::new()),

@@ -37,14 +37,13 @@
 //! `staging::quarantine`'s recompute, `staging::self_check`'s divergence
 //! detector) renders and compares it through the shared, arity-generic
 //! key-contract text ([`pk_key_sql_expr`]/[`join_pk_key`]/[`split_pk_key`]),
-//! the same encoding a relationship's from-side row identity and an
-//! aggregate's `GROUP BY` key already used before this issue (issue #126
+//! the same encoding an aggregate's `GROUP BY` key already used before this issue (issue #126
 //! first lifted [`source_primary_key`]'s own blanket single-column
 //! rejection; this issue finishes the job by removing the single-column
 //! narrowing every 1-1-specific consumer still layered on top of it).
 //! Every key column's Postgres type must be
-//! [text-stable](super::catalog::is_text_stable_join_key_type) — the same
-//! allowlist a relationship join key is held to (issue #28) — since every
+//! [text-stable](super::join_key_types::is_text_stable_join_key_type) — the same
+//! allowlist a `JOIN` key is held to — since every
 //! consumer of this key compares it via `::text` casts just like a join key;
 //! an unsafe type (e.g. `numeric`, `interval`) is rejected at
 //! definition time rather than risking a silent missed/duplicated target row
@@ -233,18 +232,17 @@ pub enum DdlError {
         actual_arity: usize,
     },
     /// The source table's (single-column) primary key resolved to a Postgres
-    /// type outside [`super::catalog::is_text_stable_join_key_type`]'s
+    /// type outside [`super::join_key_types::is_text_stable_join_key_type`]'s
     /// allowlist (issue #107). Every 1-1 apply/backfill path
     /// (`staging::apply`, `staging::backfill`) compares this primary key via
-    /// `::text` casts, exactly like a relationship join key — so a
+    /// `::text` casts, exactly like a `JOIN` key — so a
     /// non-text-stable type (`numeric`/`real`/`double precision`: `1.0` vs
     /// `1.00`; `interval`: `'1 day'` vs `'24 hours'`; `boolean`,
     /// `json`/`jsonb`; or any unknown type) would let logically-identical
     /// keys rendered two different ways silently fail to match, missing or
     /// duplicating target rows with no error. Rejected at definition time
-    /// instead, mirroring
-    /// [`ValidationError::RelationshipUnsupportedJoinKeyType`]'s treatment of
-    /// the same class of type for relationship join keys.
+    /// instead, mirroring [`ValidationError::JoinUnsupportedKeyType`]'s
+    /// treatment of the same class of type for `JOIN` keys.
     UnsupportedPrimaryKeyType {
         source_table: String,
         column: String,
@@ -255,11 +253,6 @@ pub enum DdlError {
     /// against this same `source_columns`, since a validated definition's
     /// fields always type-check.
     InvalidDefinition(ValidationError),
-    /// A persisted relationship's stored `definition_text` failed to re-parse
-    /// while resolving relationships referenced by `def` (issue #40). Only
-    /// arises on stored-data corruption or cross-version parser drift, but the
-    /// catalog layer surfaces it rather than panicking.
-    RelationshipReparse(super::error::ParseError),
     /// Substituting an [`super::ast::KeySpace::Aggregate`] definition's
     /// cross-field-alias references (see
     /// [`super::backfill::substituted_field_exprs`]) failed — a cyclic alias
@@ -293,13 +286,9 @@ impl DdlError {
                 ErrorCode::Validation
             }
             // Staged-data corruption or a provenance bug, not a rejection of
-            // the current call's input — same category as
-            // `RelationshipReparse` below.
+            // the current call's input.
             DdlError::MalformedCompositeKey { .. } => ErrorCode::Internal,
             DdlError::InvalidDefinition(err) => err.code(),
-            // Stored-data corruption or cross-version parser drift, not a
-            // rejection of the current call's input.
-            DdlError::RelationshipReparse(_) => ErrorCode::Internal,
             DdlError::AliasSubstitution(err) => err.code(),
             DdlError::Db(err) => error_code::classify_pg_error(err),
             DdlError::Pool(err) => err.code(),
@@ -334,16 +323,11 @@ impl fmt::Display for DdlError {
                  compare primary keys as text) would silently diverge from the Postgres \
                  oracle's typed equality; supported primary key types are {} and enum types \
                  (see docs/type-support.md)",
-                super::catalog::supported_join_key_types()
+                super::join_key_types::supported_join_key_types()
             ),
             DdlError::InvalidDefinition(err) => {
                 write!(f, "cannot generate target-table DDL: {err}")
             }
-            DdlError::RelationshipReparse(err) => write!(
-                f,
-                "cannot generate target-table DDL: a referenced relationship's stored \
-                 definition failed to re-parse: {err}"
-            ),
             DdlError::AliasSubstitution(err) => write!(
                 f,
                 "cannot generate target-table DDL: calculated-field alias substitution \
@@ -365,7 +349,6 @@ impl std::error::Error for DdlError {
             | DdlError::UnsupportedPrimaryKeyType { .. }
             | DdlError::MalformedCompositeKey { .. } => None,
             DdlError::InvalidDefinition(err) => Some(err),
-            DdlError::RelationshipReparse(err) => Some(err),
             DdlError::AliasSubstitution(err) => Some(err),
             DdlError::Db(err) => Some(err),
             DdlError::Pool(err) => Some(err),
@@ -397,26 +380,6 @@ impl From<super::backfill::BackfillError> for DdlError {
     }
 }
 
-/// Collapses a [`super::catalog::CatalogError`] from relationship resolution
-/// (issue #40) into a [`DdlError`]. Relationship resolution does catalog reads
-/// (DB/pool errors), a `pg_catalog` column-type lookup that raises
-/// `Validate(UnknownRelationshipColumn)` for a missing to-side column, and —
-/// via `relationship_by_name` — a re-parse of each referenced relationship's
-/// stored `definition_text`, which can raise `Parse` on stored-data
-/// corruption or parser drift. The backfill/unknown-value-type variants come
-/// from paths `resolve_relationships` never exercises, so those remain
-/// unreachable here.
-fn map_resolve_error(err: super::catalog::CatalogError) -> DdlError {
-    use super::catalog::CatalogError;
-    match err {
-        CatalogError::Db(e) => DdlError::Db(e),
-        CatalogError::Pool(e) => DdlError::Pool(e),
-        CatalogError::Validate(e) => DdlError::InvalidDefinition(e),
-        CatalogError::Parse(e) => DdlError::RelationshipReparse(e),
-        other => unreachable!("resolve_relationships cannot produce {other:?}"),
-    }
-}
-
 /// Introspects `source_table`'s primary key from `pg_catalog`, via a bound
 /// `::regclass` cast (`to_regclass($1)`) rather than string-interpolating the
 /// table name into the query. `source_table` is the unquoted `schema.table`
@@ -438,11 +401,11 @@ fn map_resolve_error(err: super::catalog::CatalogError) -> DdlError {
 /// caller (the 1-1 target-DDL slice) that still narrowed it back down to one
 /// column, so every consumer now takes the key at whatever arity it has.
 /// Also gates every resolved column's *type*: only
-/// [`super::catalog::is_text_stable_join_key_type`]'s allowlist is accepted,
+/// [`super::join_key_types::is_text_stable_join_key_type`]'s allowlist is accepted,
 /// returning [`DdlError::UnsupportedPrimaryKeyType`] otherwise (issue #107)
 /// — every caller of this function ultimately compares the returned key via
 /// `::text` casts, so an unsafe type here would risk the same silent
-/// divergence a relationship join key is already guarded against.
+/// divergence a `JOIN` key is already guarded against.
 /// Falls back to `source_table`'s own unique constraint when it has no
 /// `PRIMARY KEY` (issue #128). [`create_aggregate_target_table`] keys its
 /// grouping columns with a `UNIQUE NULLS NOT DISTINCT` constraint rather than
@@ -489,12 +452,11 @@ pub(crate) async fn source_primary_key_in_txn(
     }
     for column in &columns {
         // Issue #117: a live enum type joins the static allowlist above via
-        // the same dynamic `to_regtype`-based check `assert_join_key_type_supported`
-        // uses for the relationship join-key role — see
-        // `catalog::is_enum_type_name`'s own doc comment for why admitting
+        // the same dynamic `to_regtype`-based check a `JOIN` key's gets — see
+        // `join_key_types::is_enum_type_name`'s own doc comment for why admitting
         // it is safe.
-        if !super::catalog::is_text_stable_join_key_type(&column.data_type)
-            && !super::catalog::is_enum_type_name(client, &column.data_type).await?
+        if !super::join_key_types::is_text_stable_join_key_type(&column.data_type)
+            && !super::join_key_types::is_enum_type_name(client, &column.data_type).await?
         {
             // The message names the type as the source declares it, with its
             // modifier; a copy of it has none.
@@ -613,8 +575,8 @@ pub(crate) async fn identity_key_columns(
 /// #110's silent-NULL-collision counterpart ([`NULL_KEY_SENTINEL`]). Reusing
 /// the identical separator here (not a second one) is what lets a from-side
 /// row's composite key, however it entered the ring — a capture trigger, or a
-/// synthetic [`crate::staging::append::StagedChange::Recompute`] this crate's
-/// own reverse-relationship path stages — decode identically wherever it's
+/// synthetic [`crate::staging::append::StagedChange::Recompute`] — decode
+/// identically wherever it's
 /// later read back (`staging::apply::read_live_rows_batch`'s live re-fetch,
 /// most notably): both producers, and every consumer, agree on one shape.
 ///
@@ -1248,7 +1210,7 @@ pub(crate) fn split_pk_key<'a>(
 /// [`create_target_table`] to give a bare source-column passthrough field its
 /// source column's exact type rather than collapsing it through [`ValueType`]
 /// (issue #45): a passthrough of an `integer` FK must stay `integer` on the
-/// target so it remains eligible as a relationship join key, instead of
+/// target so it remains eligible as a `JOIN` key, instead of
 /// widening to `numeric` (which the join-key allowlist excludes). The rendered
 /// type is safe to interpolate into DDL for the same reason
 /// [`PrimaryKeyColumn::data_type`] is — it comes from the catalog, not user
@@ -1363,111 +1325,6 @@ pub fn qualified_target_table(target_schema: &str, def: &TransformDef) -> String
     )
 }
 
-/// The physical, Trellis-owned table a to-one relationship's settled parent
-/// projection lives in (issue #129, epic #127's "settled parent projection"
-/// — see `trellis/tests/spikes/issue-102-PLAN-DRAFT.md` §2) —
-/// `_trellis_rel_projection_<id>`, named after the relationship's own
-/// catalog id rather than its declared name. A relationship name is unique
-/// only *per from-table* (`V38__relationship_definitions_schema_qualified_key.sql`'s
-/// `unique (from_schema, from_table, name)`), so two different from-tables can declare a
-/// same-named relationship; the id is the one thing already guaranteed
-/// unique within this catalog by the time this is called
-/// (`catalog::create_relationship` names the projection right after
-/// inserting the relationship's own row, in the same transaction — see
-/// `catalog::ensure_relationship_projection_in_txn`), so it's the natural
-/// disambiguator. Matches this crate's existing `_trellis_backfill_*` naming
-/// for its own other generated tables
-/// ([`super::backfill::REL_STAGE_TABLE_PREFIX`]).
-///
-/// Unique only within one catalog: every instance numbers its relationships
-/// from 1, so another instance in the same database has its own
-/// `_trellis_rel_projection_1`. That's why the table lives in the instance's
-/// catalog schema, never the target schema two instances may share (issue
-/// #435; see [`qualified_relationship_projection_table`]).
-pub(crate) fn relationship_projection_table_name(relationship_id: i64) -> String {
-    format!("_trellis_rel_projection_{relationship_id}")
-}
-
-/// The schema-qualified, DDL-ready form of
-/// [`relationship_projection_table_name`]'s output — same component-independent
-/// quoting as [`qualified_target_table`], for direct interpolation into DDL/DML
-/// text. `catalog_schema` is the instance's own schema
-/// ([`crate::Config::schema`]), where every projection lives (issue #435).
-pub(crate) fn qualified_relationship_projection_table(
-    catalog_schema: &str,
-    projection_table: &str,
-) -> String {
-    format!(
-        "{}.{}",
-        quote_ident(catalog_schema),
-        quote_ident(projection_table)
-    )
-}
-
-/// The settled parent projection's per-row generation counter (issue #129,
-/// epic #127; the plan doc's §2 guard (b), "optimistic generation check"):
-/// bumped by any forward apply that touches this parent row, so a reverse
-/// (#131/#132) can detect — by re-reading this column under `FOR UPDATE` in
-/// its own apply transaction and comparing against the value it captured
-/// when it enumerated — that a forward apply landed in between, and
-/// abort/defer rather than overwrite a fresher forward-applied value. Every
-/// row starts at `0` at backfill time (see
-/// [`super::catalog::ensure_relationship_projection_in_txn`]); #131 is the
-/// intended first writer of any advance past that seed, and the plan doc's
-/// §3.1 finding (the generation must be bumped from the *raw* change images,
-/// not the folded ones) is guidance for that implementation, not something
-/// this column's shape enforces on its own.
-///
-/// `__trellis_`-prefixed rather than a bare `gen`, matching this module's
-/// existing `__{field}_sum`/`__{field}_count` hidden-partial-column
-/// convention (see [`avg_sum_column`]/[`count_needing_arg`]): this makes a
-/// collision with a to-side column a consumer legitimately reads through the
-/// relationship *unlikely*, not impossible — a to-side column literally
-/// named `__trellis_gen` (equally: [`PROJECTION_LSN_COLUMN`] and a to-side
-/// `__trellis_lsn`) would still silently collide with this bookkeeping
-/// column, the same residual risk every `__`-prefixed hidden column in this
-/// module already accepts. Review follow-up to issue #129: flagged
-/// explicitly here, for #130/#131 to keep in mind, rather than solved now —
-/// detecting/rejecting it would need its own validation pass over the
-/// to-side schema, out of this issue's foundation-only scope, and no
-/// generated or hand-written schema in this codebase's own test/fixture
-/// corpus exercises it today.
-pub(crate) const PROJECTION_GEN_COLUMN: &str = "__trellis_gen";
-
-/// The settled parent projection's per-row LSN chain (issue #129, epic #127;
-/// the plan doc's §2 guard (d), "per-parent ordering"): advanced only when a
-/// *justified* reverse — one whose own `prev_lsn` matched this column's
-/// current value, read under lock — applies, to the LSN of the parent-row
-/// change that reverse represents. Two parent changes staged from different
-/// ring segments can drain out of order (plan doc §3: "a later segment's
-/// bucket can commit before an earlier segment's"), which is what makes this
-/// chain necessary rather than a plain "last write wins" advance.
-///
-/// **Seeding, and what #131/#132 should confirm about it.** At backfill time
-/// every row is seeded with the same single value: the current WAL position
-/// as of backfill completion (`pg_current_wal_lsn()`, captured once in
-/// [`super::catalog::ensure_relationship_projection_in_txn`] and shared by
-/// every row that one backfill statement writes) — not any individual
-/// row's own "true" last-modified LSN, which a plain `SELECT` against the
-/// to-side table has no way to recover (Postgres doesn't expose a per-row
-/// last-commit LSN). This is sound *as long as* guard (d) is implemented as
-/// a self-referential, optimistic version stamp — a reverse's own `prev_lsn`
-/// is populated by reading this same column at enumeration time, and guard
-/// (d) simply re-checks it hasn't moved since, the same shape guard (b)'s
-/// `gen` check already uses — because then the seed only has to be
-/// internally consistent with itself, never externally correct against real
-/// WAL history. **Flagged for #131/#132 to double check**: if guard (d)
-/// instead needs this to equal some independently-verifiable "last change to
-/// this exact row" LSN, this seeding strategy does not provide that, and
-/// needs revisiting before guard (d) is implemented against it.
-///
-/// `not null`, not nullable: every row is written by a backfill that always
-/// has a real captured LSN in hand (there is no code path yet — forward
-/// apply of a brand-new to-side row is #130/#131 — that inserts a projection
-/// row any other way), so there is no seedless state this column needs to
-/// represent.
-pub(crate) const PROJECTION_LSN_COLUMN: &str = "__trellis_lsn";
-
 /// The hidden member count on every aggregate group row (#623 D2): how many
 /// of the target's ledger entries are live members of the group
 /// ([`super::ledger`]). The build and Apply's group statements write it
@@ -1539,13 +1396,13 @@ pub(crate) fn qualified_target_table_ident(qualified: &str) -> String {
 /// argument here, and no caller may pass one already quoted: that would be
 /// quoted twice and find nothing.
 ///
-/// A bare name with no `.` (tests, and a relationship endpoint that resolved
-/// to nothing) is quoted whole and resolves through `search_path`.
+/// A bare name with no `.` (tests) is quoted whole and resolves through
+/// `search_path`.
 pub(crate) fn regclass_arg(table: &str) -> String {
     quote_qualified_ident(table)
 }
 
-/// A relationship join column, as [`key_column_in`] introspects it.
+/// A key column, as [`key_column_in`] introspects it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct KeyColumn {
     /// The column's copy type, with no modifier
@@ -1577,10 +1434,8 @@ pub(crate) struct KeyColumn {
 /// `create index concurrently` that failed leaves one that isn't),
 /// `indisready` and `indislive` (one being dropped isn't), and no predicate
 /// (a partial index serves only the rows its predicate admits, which an
-/// `= any(…)` filter doesn't imply). Read when a relationship resolves, or
-/// on each call where nothing resolves (the reverse path), so an index
-/// created or dropped later is picked up by the next one; the warnings read
-/// it live on each call. That affects speed only.
+/// `= any(…)` filter doesn't imply). Read on each call, so an index created
+/// or dropped later is picked up by the next one. That affects speed only.
 pub(crate) async fn key_column_in(
     client: &impl GenericClient,
     table: &str,
@@ -1671,8 +1526,8 @@ pub async fn create_target_table(
 }
 
 /// Renders [`create_target_table`]'s `create table` statement without
-/// running it. Reads the catalog and `pg_catalog` (relationship metadata, a
-/// passthrough field's concrete source column type) through `pool`.
+/// running it. Reads `pg_catalog` (a passthrough field's concrete source
+/// column type) through `pool`.
 pub(crate) async fn target_table_ddl(
     pool: &Pool,
     def: &TransformDef,
@@ -1681,20 +1536,12 @@ pub(crate) async fn target_table_ddl(
     source_columns: &HashMap<String, ValueType>,
     source_table: &str,
 ) -> Result<String, DdlError> {
-    // Issue #40: a relationship-enriched field's type is the referenced
-    // to-side column's type, which `infer_field_types` reads from resolved
-    // relationship metadata. Resolve it the same way `create_definition` does
-    // (catalog + `pg_catalog` lookups); a relationship-free definition
-    // resolves to an empty map and behaves exactly as before.
-    let relationships = super::catalog::resolve_relationships(pool, def, source_table)
-        .await
-        .map_err(map_resolve_error)?;
-    let field_types = super::validate::infer_field_types(def, source_columns, &relationships)?;
+    let field_types = super::validate::infer_field_types(def, source_columns)?;
 
     // Issue #45: a bare source-column passthrough keeps the source column's
     // *concrete* Postgres type instead of collapsing through `ValueType` (so a
     // passthrough of an `integer` FK stays `integer`, not `numeric`, and can
-    // still serve as a relationship join key). Only introspect the source
+    // still serve as a `JOIN` key). Only introspect the source
     // table's column types when at least one such field exists — a definition
     // with none behaves exactly as before, no extra query.
     //
@@ -1952,10 +1799,7 @@ pub(crate) fn count_column_names_from<'a>(
 /// Each grouping column's type comes from `source_columns` (the same
 /// [`ValueType`]-only map every other column type in this grammar is
 /// derived from — there's no separate exact-Postgres-type introspection for
-/// grouping columns, unlike the 1-1 primary key's [`source_primary_key`]) —
-/// except a [`GroupByKey::RelationshipPath`] key (issue #137), whose type
-/// comes from the to-side column `relationships` (resolved the same way
-/// issue #94's relationship-field typing already is) reports instead.
+/// grouping columns, unlike the 1-1 primary key's [`source_primary_key`]).
 ///
 /// A calculated field whose name matches a grouping column (the
 /// `SELECT order_id AS order_id, SUM(amount) AS total` passthrough idiom)
@@ -2014,40 +1858,17 @@ pub(crate) async fn aggregate_target_table_ddl(
     // this DDL creates diverge from the columns those paths later write to.
     let substituted = super::backfill::substituted_field_exprs(def)?;
 
-    // Issue #94: a GROUP BY aggregate field may aggregate a *to-one*
-    // relationship path (`SUM(post.word_count)`), whose type is the to-side
-    // column's, not any column of `source_columns`. Resolve the relationship
-    // metadata the same way [`create_target_table`] does so type inference can
-    // reach it; a relationship-free aggregate resolves to an empty map and
-    // behaves exactly as before.
-    //
-    // No qualified source is threaded in here, unlike `create_target_table`:
-    // this runs during install, before anything has recorded one, so it is
-    // resolved the same way `install_definition` resolves it (issue #288 —
-    // relationships are looked up on the qualified source).
-    let relationships = super::catalog::resolve_relationships_for_new_definition(pool, def)
-        .await
-        .map_err(map_resolve_error)?;
-    let field_types = super::validate::infer_field_types(def, source_columns, &relationships)?;
+    let field_types = super::validate::infer_field_types(def, source_columns)?;
 
     let mut sql = format!(
         "create table {} (",
         qualified_target_table(target_schema, def)
     );
-    // Issue #137: a `GroupByKey::RelationshipPath` key's type is its
-    // to-side column's, resolved via the same `relationships` map issue
-    // #94's field typing already reuses above — a plain column keeps
-    // reading straight from `source_columns`, unchanged.
-    let group_by_value_type = |key: &GroupByKey| match key {
-        GroupByKey::Column(column) => source_columns
-            .get(column)
+    let group_by_value_type = |key: &GroupByKey| {
+        source_columns
+            .get(key.target_column_name())
             .copied()
-            .unwrap_or(ValueType::Numeric),
-        GroupByKey::RelationshipPath { rel, column } => relationships
-            .get(rel)
-            .and_then(|r| r.column_types.get(column))
-            .copied()
-            .unwrap_or(ValueType::Numeric),
+            .unwrap_or(ValueType::Numeric)
     };
     for (i, key) in group_by.iter().enumerate() {
         if i > 0 {
@@ -2132,7 +1953,7 @@ pub(crate) async fn aggregate_target_table_ddl(
     let contributions = super::ledger::contributions(&def.fields, group_by, &substituted);
     let contribution_types = contributions
         .iter()
-        .map(|c| super::validate::infer_expr_type(&c.arg, source_columns, &relationships))
+        .map(|c| super::validate::infer_expr_type(&c.arg, source_columns))
         .collect::<Result<Vec<_>, _>>()?;
     let collations =
         contribution_collations(pool, def, &contributions, &contribution_types).await?;
@@ -2167,7 +1988,7 @@ pub(crate) async fn aggregate_target_table_ddl(
     ));
     // #625 F1: a target Apply maintains on the ledger also gets its group
     // deltas, which a Re-derive build's chunks write instead of the groups.
-    if let Some(shape) = crate::staging::ledger::route(def, source_columns, &relationships) {
+    if let Some(shape) = crate::staging::ledger::route(def, source_columns) {
         sql.push_str(&super::ledger::aggregate_deltas_ddl(
             &super::ledger::qualified_deltas_table(target_schema, &def.target),
             &group_columns,
@@ -2204,9 +2025,14 @@ async fn contribution_collations(
     let source_table = match super::catalog::resolve_source_for_install(pool, def).await {
         Ok(source) => source,
         Err(super::catalog::CatalogError::SourceTableNotFound(_)) => return Ok(collations),
-        Err(err) => return Err(map_resolve_error(err)),
+        Err(super::catalog::CatalogError::Db(e)) => return Err(DdlError::Db(e)),
+        Err(super::catalog::CatalogError::Pool(e)) => return Err(DdlError::Pool(e)),
+        Err(super::catalog::CatalogError::Validate(e)) => {
+            return Err(DdlError::InvalidDefinition(e));
+        }
+        Err(other) => unreachable!("resolving a source cannot produce {other:?}"),
     };
-    let scan = super::backfill::SourceScan::resolve(pool, def, &source_table).await?;
+    let scan = super::backfill::SourceScan::new(&source_table);
     let probes: Vec<String> = text
         .iter()
         .map(|&i| {
@@ -2274,7 +2100,7 @@ mod tests {
             pg_type: "numeric".to_string(),
         }
         .to_string();
-        let allowlist = super::super::catalog::supported_join_key_types();
+        let allowlist = super::super::join_key_types::supported_join_key_types();
         assert!(message.contains(&allowlist), "{message}");
         for type_name in ["oid", "date", "bytea", "enum types"] {
             assert!(

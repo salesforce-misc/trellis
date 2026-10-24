@@ -317,8 +317,7 @@ impl ApplyError {
             ApplyError::ColumnNotPaused { .. } => ErrorCode::NotFound,
             // The definition's persisted status conflicts with what
             // `resume_column` was asked to do, the same category
-            // `ValidationError::DuplicateRelationshipName` and
-            // `StagingError::ProducerAlreadyRunning` use for "existing state
+            // `StagingError::ProducerAlreadyRunning` uses for "existing state
             // blocks this request" rather than "the request itself is
             // malformed" (-> Validation) or "nothing by that name exists"
             // (-> NotFound).
@@ -3301,7 +3300,7 @@ pub(super) async fn compute_page(
             ledger_shapes.push(if join {
                 None
             } else {
-                super::ledger::route_definition(pool, def).await?
+                super::ledger::route_definition(def)
             });
             group_shapes.push(super::group_basis::route(&def.def, &def.source_columns));
         }
@@ -3662,7 +3661,7 @@ pub(super) async fn compute_page(
                                         def.id,
                                     ),
                                 }
-                            } else if super::ledger::route_definition(pool, def).await?.is_some() {
+                            } else if super::ledger::route_definition(def).is_some() {
                                 AggregateState::Ledger
                             } else {
                                 AggregateState::Neither
@@ -4271,7 +4270,7 @@ fn one_to_one_field_types(
     source_columns: &HashMap<String, ValueType>,
     field_names: &[String],
 ) -> Result<Vec<ValueType>, ApplyError> {
-    let types = validate::infer_field_types(def, source_columns, &HashMap::new())?;
+    let types = validate::infer_field_types(def, source_columns)?;
     Ok(field_names
         .iter()
         .map(|name| types.get(name).copied().unwrap_or(ValueType::Numeric))

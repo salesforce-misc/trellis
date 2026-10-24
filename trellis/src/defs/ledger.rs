@@ -8,8 +8,8 @@
 //!
 //! - **Aggregate targets**: the key, the row's `GROUP BY` values (typed as the
 //!   target's), whether the row is a member of its group, one typed column
-//!   per distinct aggregate argument ([`contributions`]), the relationship
-//!   join key, and the ordering state. The group row is a pure function of
+//!   per distinct aggregate argument ([`contributions`]), and the ordering
+//!   state. The group row is a pure function of
 //!   its members' entries: `SUM(x)` is `sum(<x's column>)` over them, and so
 //!   on for every field, which is how the one-pass build writes the groups
 //!   ([`super::backfill`]).
@@ -336,8 +336,7 @@ pub(crate) fn contributions(
             | Expr::SourceColumn { .. }
             | Expr::NumberLiteral(_)
             | Expr::StringLiteral(_)
-            | Expr::TypedLiteral { .. }
-            | Expr::RelationshipPath { .. } => {}
+            | Expr::TypedLiteral { .. } => {}
         }
     }
     let mut out = Vec::new();
@@ -757,40 +756,6 @@ mod tests {
                 &group_by
             )),
             r#"min("__arg0")"#
-        );
-    }
-
-    #[test]
-    fn a_relationship_group_key_outside_an_aggregate_reads_its_ledger_column() {
-        let (contribs, substituted, group_by) = plan(
-            "TRANSFORM t FROM s GROUP BY post.author SELECT post.author AS author, \
-             SUM(post.words) AS words",
-        );
-        assert_eq!(
-            contribs[0].arg,
-            Expr::RelationshipPath {
-                rel: "post".to_string(),
-                column: "words".to_string()
-            }
-        );
-        assert_eq!(
-            over_ledger(
-                &Expr::RelationshipPath {
-                    rel: "post".to_string(),
-                    column: "author".to_string()
-                },
-                &contribs,
-                &group_by
-            ),
-            col("author")
-        );
-        assert_eq!(
-            super::super::oracle::render_expr_sql(&over_ledger(
-                &substituted["words"],
-                &contribs,
-                &group_by
-            )),
-            r#"sum("__arg0")"#
         );
     }
 

@@ -103,9 +103,9 @@ mod tests {
         ),
         (
             "defs/catalog.rs",
-            2,
-            "a JOIN or relationship column's declared type, for the key \
-             allowlist and messages; its copy is `copy_type`",
+            1,
+            "a JOIN column's declared type, for the key allowlist and \
+             messages; its copy is `copy_type`",
         ),
         (
             "defs/copies.rs",

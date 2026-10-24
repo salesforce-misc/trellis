@@ -3,12 +3,11 @@
 //!
 //! # The knob
 //!
-//! The group basis keeps every aggregate definition that has no
-//! relationship path: define refuses an aggregate outside #1096 decision 1's
-//! admitted set by family (`defs::validate::validate_aggregate_admitted`),
-//! so [`route`] takes every aggregate define accepts. The per-row ledger
-//! (`super::ledger`) keeps only aggregates over relationship paths until
-//! relationships are removed (#1115), and is deleted with them (#1105).
+//! The group basis keeps every aggregate definition: define refuses an
+//! aggregate outside #1096 decision 1's admitted set by family
+//! (`defs::validate::validate_aggregate_admitted`), so [`route`] takes every
+//! aggregate define accepts. The per-row ledger (`super::ledger`) keeps
+//! none, and is deleted with #1105.
 //!
 //! Until then a dev/test knob can force every aggregate back onto the
 //! ledger, with the ledger's whole surface (define refuses nothing by family
@@ -57,14 +56,12 @@
 //!
 //! # Which definitions
 //!
-//! A plain aggregate (no relationship, every `GROUP BY` key a source
-//! column) whose every value field composes the admitted aggregates of #1096
+//! A plain aggregate (every `GROUP BY` key a source column) whose every value field composes the admitted aggregates of #1096
 //! decision 1 (`COUNT(*)`, `COUNT(x)`, and `SUM`/`AVG` over an integer
 //! argument or a `numeric` column) with literals, operators, functions and
 //! its `GROUP BY` keys. An argument may be an expression over the row
 //! (`SUM(a + b)`); a `numeric` one must be a column, whose declared scale
-//! define checks. Define refuses any other aggregate by family; one over a
-//! relationship path stays on the ledger.
+//! define checks. Define refuses any other aggregate by family.
 //!
 //! # Where its state lives
 //!
@@ -209,10 +206,10 @@ use std::time::SystemTime;
 use tokio_postgres::Transaction;
 use tokio_postgres::types::PgLsn;
 
-use crate::defs::ast::{Expr, GroupByKey, KeySpace, TransformDef, ValueType, group_by_contains};
+use crate::defs::ast::{Expr, KeySpace, TransformDef, ValueType, group_by_contains};
 use crate::defs::ddl::{self, PrimaryKeyColumn};
 use crate::defs::ledger as schema;
-use crate::defs::oracle::{render_expr_sql, render_to_one_rel_expr_sql};
+use crate::defs::oracle::{render_expr_sql, render_qualified_expr_sql};
 use crate::integer::IntWidth;
 use crate::pool::{quote_ident, quote_literal};
 
@@ -335,22 +332,15 @@ fn shape_of(def: &TransformDef, source_columns: &HashMap<String, ValueType>) -> 
     let KeySpace::Aggregate { group_by } = &def.key_space else {
         return None;
     };
-    if !crate::defs::eval::relationship_references(def).is_empty() {
-        return None;
-    }
     let mut group_cols = Vec::with_capacity(group_by.len());
     let mut group_types = Vec::with_capacity(group_by.len());
     for key in group_by {
-        let GroupByKey::Column(column) = key else {
-            return None;
-        };
-        let value_type = source_columns.get(column)?;
+        let value_type = source_columns.get(key.target_column_name())?;
         group_cols.push(key.target_column_name().to_string());
         group_types.push(ddl::pg_type_name(*value_type).into_owned());
     }
     let substituted = crate::defs::backfill::substituted_field_exprs(def).ok()?;
-    let field_types =
-        crate::defs::validate::infer_field_types(def, source_columns, &HashMap::new()).ok()?;
+    let field_types = crate::defs::validate::infer_field_types(def, source_columns).ok()?;
     let contributions = schema::contributions(&def.fields, group_by, &substituted);
     let mut shape = GroupShape {
         group_cols,
@@ -358,7 +348,7 @@ fn shape_of(def: &TransformDef, source_columns: &HashMap<String, ValueType>) -> 
         args: contributions
             .iter()
             .map(|c| Arg {
-                sql: render_to_one_rel_expr_sql(&c.arg, "s"),
+                sql: render_qualified_expr_sql(&c.arg, "s"),
                 expr: c.arg.clone(),
                 summed: false,
             })
@@ -372,9 +362,7 @@ fn shape_of(def: &TransformDef, source_columns: &HashMap<String, ValueType>) -> 
         if group_by_contains(group_by, &field.name) {
             continue;
         }
-        let type_of = |arg: &Expr| {
-            crate::defs::validate::infer_expr_type(arg, source_columns, &HashMap::new()).ok()
-        };
+        let type_of = |arg: &Expr| crate::defs::validate::infer_expr_type(arg, source_columns).ok();
         let expr = rewrite(&substituted[&field.name], &type_of, &arg_of, &mut shape)?;
         let pg_type = ddl::pg_type_name(*field_types.get(&field.name)?).into_owned();
         shape.fields.push((field.name.clone(), pg_type, expr));
@@ -447,7 +435,6 @@ pub(super) fn rewrite(
             lhs: Box::new(rewrite(lhs, type_of, arg_of, shape)?),
             rhs: Box::new(rewrite(rhs, type_of, arg_of, shape)?),
         }),
-        Expr::RelationshipPath { .. } => None,
         other => Some(other.clone()),
     }
 }

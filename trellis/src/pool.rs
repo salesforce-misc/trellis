@@ -369,8 +369,8 @@ impl Pool {
     /// The [`Config::schema`] this pool was built with: the instance's own
     /// catalog schema, first on every connection's `search_path`. Trellis's
     /// internal tables that DDL creates at runtime rather than a migration
-    /// (a to-one relationship's settled parent projection, issue #435) are
-    /// qualified with it explicitly.
+    /// (an aggregate's or a `JOIN`'s hidden tables) are qualified with it
+    /// explicitly.
     pub(crate) fn schema(&self) -> &str {
         &self.schema
     }

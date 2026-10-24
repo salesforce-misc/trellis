@@ -50,9 +50,7 @@
 //!
 //! The groups of every aggregate that reads the source and applies, and the
 //! cells of every `JOIN` side it is (`P` or `M`, whose key holds every
-//! partition-key column, where the `JOIN`'s target may not). A to-many
-//! relationship's target is corrected by recomputing its parents, which is
-//! the to-many correction engine's (#1063).
+//! partition-key column, where the `JOIN`'s target may not).
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};

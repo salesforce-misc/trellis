@@ -20,26 +20,6 @@
 //!    Aggregate apply evaluates every field over both images, and a missing
 //!    `GROUP BY` value would silently put the row in the `NULL` group.
 //!    `WHERE` accepts only `TRUE` today, so no filter reads a column.
-//! 3. **`from_col` of every relationship declared on `T`**, whether or not a
-//!    definition uses it. A reader's relationship path looks its related row
-//!    up by it.
-//! 4. **For every relationship whose to-side is `T`:**
-//!    - its `to_col`. A to-side row's reverse path re-derives the children
-//!      of every join value its batch's rows touched, including ones the
-//!      fold erased from both folded images: a parent born and deleted
-//!      inside one batch, or re-keyed through a value and on (#784). A child
-//!      may have read the parent live under that value in between. When the
-//!      `to_col` is `T`'s whole primary key, the ring key is that value.
-//!      When it isn't, the images must carry it;
-//!    - every to-side column a definition reads through it
-//!      ([`crate::defs::eval::relationship_references`], fields and `GROUP
-//!      BY`);
-//!    - every data column of its settled parent projection. Apply upserts
-//!      the projection from the to-side's new image
-//!      (`jsonb_populate_record`), so a column missing from the image would
-//!      be written as `NULL`. A projection only widens, so it can carry a
-//!      column no current definition reads. A definition registered later
-//!      would then read that stale `NULL`.
 //!
 //! A chained definition's source is another definition's target. That table
 //! isn't captured by triggers in C (the target-mutation seam feeds it), so
@@ -50,8 +30,7 @@ use std::collections::{BTreeSet, HashMap};
 use tokio_postgres::GenericClient;
 use tokio_postgres::types::Type;
 
-use crate::defs::ast::{GroupByKey, KeySpace, TransformDef};
-use crate::defs::model::{RelationshipCardinality, RelationshipDefinition};
+use crate::defs::ast::{KeySpace, TransformDef};
 
 use super::CaptureError;
 use super::sql::CaptureSpec;
@@ -61,11 +40,6 @@ use super::sql::CaptureSpec;
 pub struct CaptureCatalog {
     /// Every registered definition, in any status.
     pub definitions: Vec<CaptureReader>,
-    /// Every relationship.
-    pub relationships: Vec<RelationshipDefinition>,
-    /// Each existing settled parent projection's data columns (bookkeeping
-    /// columns excluded), keyed by relationship id.
-    pub projection_columns: HashMap<i64, Vec<String>>,
 }
 
 /// One registered definition, as capture sees it.
@@ -86,10 +60,9 @@ pub struct CaptureReader {
 }
 
 impl CaptureReader {
-    /// The columns of `table` this definition reads directly, as its source
-    /// or as either table of a `JOIN`; `None` if it reads `table` only
-    /// through a relationship, or not at all.
-    fn reads_directly(&self, table: &str) -> Option<BTreeSet<String>> {
+    /// The columns of `table` this definition reads, as its source or as
+    /// either table of a `JOIN`; `None` if it doesn't read `table`.
+    pub(crate) fn reads(&self, table: &str) -> Option<BTreeSet<String>> {
         if self.join.is_some() {
             if self.source != table && self.join.as_deref() != Some(table) {
                 return None;
@@ -110,34 +83,14 @@ pub struct ReadColumns {
 }
 
 /// The columns [`CaptureCatalog`]'s readers need from `table`'s images
-/// (this module's rules 2–4). `table` is the unquoted `schema.table`
+/// (this module's rule 2). `table` is the unquoted `schema.table`
 /// identity. A [`CaptureReader::capture_failed`] definition doesn't count.
 pub fn read_columns(catalog: &CaptureCatalog, table: &str) -> ReadColumns {
     let mut read = ReadColumns::default();
 
     for reader in catalog.definitions.iter().filter(|r| !r.capture_failed) {
-        if let Some(columns) = reader.reads_directly(table) {
+        if let Some(columns) = reader.reads(table) {
             read.columns.extend(columns);
-        }
-    }
-
-    for rel in &catalog.relationships {
-        if rel.qualified_from_table() == table {
-            read.columns.insert(rel.def.from_col.clone());
-        }
-        if rel.qualified_to_table() == table {
-            read.columns.insert(rel.def.to_col.clone());
-            let from = rel.qualified_from_table();
-            for reader in catalog.definitions.iter().filter(|r| !r.capture_failed) {
-                if reader.source == from {
-                    read.columns.extend(columns_through(&reader.def, rel));
-                }
-            }
-            if rel.cardinality == RelationshipCardinality::ToOne
-                && let Some(columns) = catalog.projection_columns.get(&rel.id)
-            {
-                read.columns.extend(columns.iter().cloned());
-            }
         }
     }
     read
@@ -146,13 +99,6 @@ pub fn read_columns(catalog: &CaptureCatalog, table: &str) -> ReadColumns {
 /// Every definition that reads one of `missing` from `table`'s images, or,
 /// with `key_missing`, every definition that reads `table` at all (#622 C6:
 /// the definitions a `schema_changed` marker pauses). In id order.
-///
-/// A definition reads a column of its own source through its fields, its
-/// `GROUP BY` and the `from_col` of each relationship it reads through; and
-/// a column of a relationship's to-side through that relationship: its
-/// `to_col` and the columns its paths name. The rest of [`read_columns`]'s
-/// set, the `from_col`/`to_col` of a relationship nothing reads through and
-/// the projection columns no definition reads, belongs to no definition.
 pub fn readers_of(
     catalog: &CaptureCatalog,
     table: &str,
@@ -163,26 +109,9 @@ pub fn readers_of(
         .definitions
         .iter()
         .filter(|reader| {
-            let mut reads_table = false;
-            let mut reads: BTreeSet<String> = BTreeSet::new();
-            if let Some(columns) = reader.reads_directly(table) {
-                reads_table = true;
-                reads.extend(columns);
-            }
-            for rel in &catalog.relationships {
-                if rel.qualified_from_table() != reader.source || !reads_through(&reader.def, rel) {
-                    continue;
-                }
-                if rel.qualified_from_table() == table {
-                    reads.insert(rel.def.from_col.clone());
-                }
-                if rel.qualified_to_table() == table {
-                    reads_table = true;
-                    reads.insert(rel.def.to_col.clone());
-                    reads.extend(columns_through(&reader.def, rel));
-                }
-            }
-            (key_missing && reads_table) || !reads.is_disjoint(missing)
+            reader
+                .reads(table)
+                .is_some_and(|reads| key_missing || !reads.is_disjoint(missing))
         })
         .map(|reader| reader.id)
         .collect();
@@ -190,66 +119,30 @@ pub fn readers_of(
     ids
 }
 
-/// The definitions that read through `rel`, in any status: every one on its
-/// from-side whose fields name it. In id order.
-pub fn relationship_readers<'c>(
-    catalog: &'c CaptureCatalog,
-    rel: &RelationshipDefinition,
-) -> Vec<&'c CaptureReader> {
-    let from = rel.qualified_from_table();
-    let mut readers: Vec<&CaptureReader> = catalog
-        .definitions
-        .iter()
-        .filter(|reader| reader.source == from && reads_through(&reader.def, rel))
-        .collect();
-    readers.sort_unstable_by_key(|reader| reader.id);
-    readers
-}
-
 /// The columns of its own source `def` reads directly: every source column
 /// its fields reference ([`crate::defs::oracle::referenced_source_columns`])
-/// and its plain `GROUP BY` columns.
+/// and its `GROUP BY` columns.
 fn own_columns(def: &TransformDef) -> BTreeSet<String> {
     let mut columns: BTreeSet<String> = crate::defs::oracle::referenced_source_columns(def)
         .into_iter()
         .collect();
     if let KeySpace::Aggregate { group_by } = &def.key_space {
-        for key in group_by {
-            if let GroupByKey::Column(column) = key {
-                columns.insert(column.clone());
-            }
-        }
+        columns.extend(
+            group_by
+                .iter()
+                .map(|key| key.target_column_name().to_string()),
+        );
     }
     columns
 }
 
-/// Whether `def` reads a column through `rel` (a definition names a
-/// relationship of its own source).
-pub(super) fn reads_through(def: &TransformDef, rel: &RelationshipDefinition) -> bool {
-    crate::defs::eval::relationship_references(def)
-        .iter()
-        .any(|(name, _)| *name == rel.def.name)
-}
-
-/// The to-side columns `def` reads through `rel`, by the relationship's
-/// name. The caller checks that `def`'s source is `rel`'s from-side.
-fn columns_through(def: &TransformDef, rel: &RelationshipDefinition) -> BTreeSet<String> {
-    crate::defs::eval::relationship_references(def)
-        .into_iter()
-        .filter(|(name, _)| *name == rel.def.name)
-        .map(|(_, column)| column)
-        .collect()
-}
-
-/// Reads [`CaptureCatalog`] from the instance's catalog. `schema` is the
-/// instance schema, where the settled parent projections live; the rest is
-/// read through `client`'s `search_path`, like every catalog query.
+/// Reads [`CaptureCatalog`] from the instance's catalog, through `client`'s
+/// `search_path`, like every catalog query.
 pub async fn load_catalog(
     client: &impl GenericClient,
-    schema: &str,
 ) -> Result<CaptureCatalog, crate::defs::catalog::CatalogError> {
-    let (definitions, relationships) = crate::defs::catalog::capture_readers(client).await?;
-    let definitions = definitions
+    let definitions = crate::defs::catalog::capture_readers(client)
+        .await?
         .into_iter()
         .map(|row| CaptureReader {
             id: row.id,
@@ -260,33 +153,7 @@ pub async fn load_catalog(
             join: row.join,
         })
         .collect();
-    let bookkeeping = [
-        crate::defs::ddl::PROJECTION_GEN_COLUMN,
-        crate::defs::ddl::PROJECTION_LSN_COLUMN,
-    ];
-    let mut projection_columns: HashMap<i64, Vec<String>> = HashMap::new();
-    for row in client
-        .query_typed(
-            "select rp.relationship_id, a.attname::text \
-             from relationship_projections rp \
-             join pg_catalog.pg_attribute a \
-               on a.attrelid = pg_catalog.to_regclass(pg_catalog.format('%I.%I', $1::text, rp.projection_table)) \
-             where a.attnum > 0 and not a.attisdropped and a.attname::text <> all($2::text[]) \
-             order by rp.relationship_id, a.attnum",
-            &[(&schema, Type::TEXT), (&bookkeeping.as_slice(), Type::TEXT_ARRAY)],
-        )
-        .await?
-    {
-        projection_columns
-            .entry(row.get(0))
-            .or_default()
-            .push(row.get(1));
-    }
-    Ok(CaptureCatalog {
-        definitions,
-        relationships,
-        projection_columns,
-    })
+    Ok(CaptureCatalog { definitions })
 }
 
 /// `table`'s live columns by name, with their attribute numbers, and its
@@ -395,8 +262,8 @@ pub async fn capture_spec(
                 column: column.clone(),
             });
         }
-        // Only a relationship nothing reads through, or a projection column
-        // no definition reads, still names it: image what's left.
+        // Only a capture-failed definition still names it: image what's
+        // left.
         read.columns.retain(|c| !missing.contains(c));
     }
     Ok(CaptureSpec::new(table, key, read.columns)?.with_partitioned(partitioned))
@@ -405,43 +272,17 @@ pub async fn capture_spec(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::defs::ast::RelationshipDef;
     use crate::defs::parse;
 
     fn def(text: &str) -> TransformDef {
         parse(text).unwrap_or_else(|e| panic!("{text}: {e:?}"))
     }
 
-    fn rel(
-        id: i64,
-        name: &str,
-        from: (&str, &str, &str),
-        to: (&str, &str, &str),
-        cardinality: RelationshipCardinality,
-    ) -> RelationshipDefinition {
-        RelationshipDefinition {
-            id,
-            from_schema: from.0.to_string(),
-            to_schema: to.0.to_string(),
-            def: RelationshipDef {
-                name: name.to_string(),
-                from_table: from.1.to_string(),
-                from_col: from.2.to_string(),
-                to_table: to.1.to_string(),
-                to_col: to.2.to_string(),
-            },
-            cardinality,
-        }
-    }
-
     fn set(names: &[&str]) -> BTreeSet<String> {
         names.iter().map(|s| s.to_string()).collect()
     }
 
-    fn catalog(
-        definitions: &[(&str, &str)],
-        relationships: Vec<RelationshipDefinition>,
-    ) -> CaptureCatalog {
+    fn catalog(definitions: &[(&str, &str)]) -> CaptureCatalog {
         CaptureCatalog {
             definitions: definitions
                 .iter()
@@ -455,20 +296,15 @@ mod tests {
                     join: None,
                 })
                 .collect(),
-            relationships,
-            projection_columns: HashMap::new(),
         }
     }
 
     #[test]
     fn a_plain_definition_reads_its_referenced_columns_only() {
-        let catalog = catalog(
-            &[(
-                "public.orders",
-                "TRANSFORM out FROM orders SELECT amount + 2 AS doubled, doubled + tax AS total",
-            )],
-            vec![],
-        );
+        let catalog = catalog(&[(
+            "public.orders",
+            "TRANSFORM out FROM orders SELECT amount + 2 AS doubled, doubled + tax AS total",
+        )]);
         let read = read_columns(&catalog, "public.orders");
         assert_eq!(read.columns, set(&["amount", "tax"]));
         assert_eq!(
@@ -479,15 +315,12 @@ mod tests {
 
     #[test]
     fn a_join_reads_each_side_and_is_a_reader_of_both() {
-        let mut catalog = catalog(
-            &[(
-                "public.orders",
-                "TRANSFORM by_sku FROM orders LEFT JOIN items ON orders.id = items.order_id \
+        let mut catalog = catalog(&[(
+            "public.orders",
+            "TRANSFORM by_sku FROM orders LEFT JOIN items ON orders.id = items.order_id \
                  GROUP BY items.sku SELECT items.sku AS sku, SUM(orders.total) AS total, \
                  COUNT(items.qty) AS n",
-            )],
-            vec![],
-        );
+        )]);
         catalog.definitions[0].join = Some("public.items".to_string());
         assert_eq!(
             read_columns(&catalog, "public.orders").columns,
@@ -520,13 +353,10 @@ mod tests {
 
     #[test]
     fn a_self_named_passthrough_reads_its_own_column() {
-        let catalog = catalog(
-            &[(
-                "public.orders",
-                "TRANSFORM out FROM orders SELECT amount AS amount",
-            )],
-            vec![],
-        );
+        let catalog = catalog(&[(
+            "public.orders",
+            "TRANSFORM out FROM orders SELECT amount AS amount",
+        )]);
         assert_eq!(
             read_columns(&catalog, "public.orders").columns,
             set(&["amount"])
@@ -535,14 +365,11 @@ mod tests {
 
     #[test]
     fn an_aggregate_reads_its_group_by_and_argument_columns() {
-        let catalog = catalog(
-            &[(
-                "public.sales",
-                "TRANSFORM by_store FROM sales GROUP BY store, region \
+        let catalog = catalog(&[(
+            "public.sales",
+            "TRANSFORM by_store FROM sales GROUP BY store, region \
                  SELECT store AS store, region AS region, SUM(amount) AS total, COUNT(*) AS n",
-            )],
-            vec![],
-        );
+        )]);
         assert_eq!(
             read_columns(&catalog, "public.sales").columns,
             set(&["amount", "region", "store"])
@@ -551,165 +378,48 @@ mod tests {
 
     #[test]
     fn where_true_reads_nothing() {
-        let catalog = catalog(
-            &[(
-                "public.orders",
-                "TRANSFORM out FROM orders SELECT amount AS a WHERE TRUE",
-            )],
-            vec![],
-        );
+        let catalog = catalog(&[(
+            "public.orders",
+            "TRANSFORM out FROM orders SELECT amount AS a WHERE TRUE",
+        )]);
         assert_eq!(
             read_columns(&catalog, "public.orders").columns,
             set(&["amount"])
         );
     }
 
-    #[test]
-    fn a_from_side_images_every_relationships_from_col() {
-        let catalog = catalog(
-            &[(
-                "public.posts",
-                "TRANSFORM enriched FROM posts SELECT title AS title, author.name AS author_name",
-            )],
-            vec![
-                rel(
-                    1,
-                    "author",
-                    ("public", "posts", "author_id"),
-                    ("public", "users", "id"),
-                    RelationshipCardinality::ToOne,
-                ),
-                // Declared but unused: its from_col is still imaged.
-                rel(
-                    2,
-                    "editor",
-                    ("public", "posts", "editor_id"),
-                    ("public", "users", "id"),
-                    RelationshipCardinality::ToOne,
-                ),
-            ],
-        );
-        let read = read_columns(&catalog, "public.posts");
-        assert_eq!(read.columns, set(&["author_id", "editor_id", "title"]));
-    }
-
-    #[test]
-    fn a_to_side_images_its_to_col_and_every_column_read_through_it() {
-        let mut catalog = catalog(
-            &[
-                (
-                    "public.posts",
-                    "TRANSFORM enriched FROM posts SELECT author.name AS author_name",
-                ),
-                (
-                    "public.posts",
-                    "TRANSFORM by_country FROM posts GROUP BY author.country \
-                     SELECT author.country AS country, COUNT(*) AS n",
-                ),
-                // Same relationship name on another table: not this one.
-                (
-                    "other.posts",
-                    "TRANSFORM elsewhere FROM other.posts SELECT author.email AS email",
-                ),
-            ],
-            vec![
-                rel(
-                    1,
-                    "author",
-                    ("public", "posts", "author_id"),
-                    ("public", "users", "user_id"),
-                    RelationshipCardinality::ToOne,
-                ),
-                rel(
-                    2,
-                    "author",
-                    ("other", "posts", "author_id"),
-                    ("other", "users", "id"),
-                    RelationshipCardinality::ToOne,
-                ),
-            ],
-        );
-        catalog
-            .projection_columns
-            .insert(1, vec!["user_id".to_string(), "retired_col".to_string()]);
-        catalog
-            .projection_columns
-            .insert(2, vec!["not_this_table".to_string()]);
-        let read = read_columns(&catalog, "public.users");
-        assert_eq!(
-            read.columns,
-            set(&["country", "name", "retired_col", "user_id"])
-        );
-    }
-
-    /// `a_to_side_images_its_to_col_and_every_column_read_through_it`'s
-    /// catalog: `enriched` (1) reads `author.name`, `by_country` (2) groups
-    /// by `author.country`, and `elsewhere` (3) reads another `author`.
-    fn author_catalog() -> CaptureCatalog {
-        let mut catalog = catalog(
-            &[
-                (
-                    "public.posts",
-                    "TRANSFORM enriched FROM posts SELECT author.name AS author_name",
-                ),
-                (
-                    "public.posts",
-                    "TRANSFORM by_country FROM posts GROUP BY author.country \
-                     SELECT author.country AS country, COUNT(*) AS n",
-                ),
-                (
-                    "other.posts",
-                    "TRANSFORM elsewhere FROM other.posts SELECT author.email AS email",
-                ),
-            ],
-            vec![
-                rel(
-                    1,
-                    "author",
-                    ("public", "posts", "author_id"),
-                    ("public", "users", "user_id"),
-                    RelationshipCardinality::ToOne,
-                ),
-                rel(
-                    2,
-                    "author",
-                    ("other", "posts", "author_id"),
-                    ("other", "users", "id"),
-                    RelationshipCardinality::ToOne,
-                ),
-            ],
-        );
-        catalog
-            .projection_columns
-            .insert(1, vec!["user_id".to_string(), "retired_col".to_string()]);
-        catalog
+    /// `names` (1) reads `name` and `by_country` (2) groups by `country`, both
+    /// on `public.users`; `elsewhere` (3) reads a table of the same name in
+    /// another schema.
+    fn users_catalog() -> CaptureCatalog {
+        catalog(&[
+            (
+                "public.users",
+                "TRANSFORM names FROM users SELECT name AS user_name",
+            ),
+            (
+                "public.users",
+                "TRANSFORM by_country FROM users GROUP BY country \
+                 SELECT country AS country, COUNT(*) AS n",
+            ),
+            (
+                "other.users",
+                "TRANSFORM elsewhere FROM other.users SELECT email AS user_email",
+            ),
+        ])
     }
 
     #[test]
     fn a_schema_change_pauses_only_the_definitions_that_read_a_missing_column() {
-        let catalog = author_catalog();
+        let catalog = users_catalog();
         let users = "public.users";
         assert_eq!(readers_of(&catalog, users, &set(&["name"]), false), [1]);
         assert_eq!(readers_of(&catalog, users, &set(&["country"]), false), [2]);
-        assert_eq!(
-            readers_of(&catalog, users, &set(&["user_id"]), false),
-            [1, 2],
-            "every definition reading through a relationship reads its to_col"
-        );
         assert!(
-            readers_of(&catalog, users, &set(&["retired_col", "email"]), false).is_empty(),
-            "a projection column no definition reads belongs to none"
+            readers_of(&catalog, users, &set(&["email"]), false).is_empty(),
+            "only the other schema's table's reader reads `email`"
         );
         assert_eq!(readers_of(&catalog, users, &set(&[]), true), [1, 2]);
-        assert_eq!(
-            readers_of(&catalog, "public.posts", &set(&["author_id"]), false),
-            [1, 2],
-            "the from_col of a relationship a definition reads through"
-        );
-        assert_eq!(
-            readers_of(&catalog, "public.posts", &set(&[]), true),
-            [1, 2]
-        );
         assert_eq!(
             readers_of(&catalog, "other.users", &set(&["email"]), false),
             [3]
@@ -718,11 +428,11 @@ mod tests {
 
     #[test]
     fn a_capture_failed_definition_reads_nothing() {
-        let mut catalog = author_catalog();
+        let mut catalog = users_catalog();
         catalog.definitions[0].capture_failed = true;
         assert_eq!(
             read_columns(&catalog, "public.users").columns,
-            set(&["country", "retired_col", "user_id"]),
+            set(&["country"]),
             "`name` was read only by the paused definition"
         );
         assert_eq!(
@@ -730,59 +440,5 @@ mod tests {
             [1],
             "it is still the reader a marker names"
         );
-    }
-
-    #[test]
-    fn a_to_many_to_side_images_its_to_col_and_the_columns_read_through_it() {
-        let catalog = catalog(
-            &[(
-                "public.users",
-                "TRANSFORM spend FROM users SELECT SUM(orders.amount) AS spent",
-            )],
-            vec![rel(
-                1,
-                "orders",
-                ("public", "users", "id"),
-                ("public", "orders", "user_id"),
-                RelationshipCardinality::ToMany,
-            )],
-        );
-        let read = read_columns(&catalog, "public.orders");
-        assert_eq!(read.columns, set(&["amount", "user_id"]));
-        let from = read_columns(&catalog, "public.users");
-        assert_eq!(from.columns, set(&["id"]));
-    }
-
-    #[test]
-    fn a_chained_relationship_table_is_both_a_to_side_and_a_from_side() {
-        // comments.post -> posts.id, posts.author -> users.id
-        let catalog = catalog(
-            &[(
-                "public.comments",
-                "TRANSFORM c FROM comments SELECT post.title AS title",
-            )],
-            vec![
-                rel(
-                    1,
-                    "post",
-                    ("public", "comments", "post_id"),
-                    ("public", "posts", "id"),
-                    RelationshipCardinality::ToOne,
-                ),
-                rel(
-                    2,
-                    "author",
-                    ("public", "posts", "author_id"),
-                    ("public", "users", "id"),
-                    RelationshipCardinality::ToOne,
-                ),
-            ],
-        );
-        let posts = read_columns(&catalog, "public.posts");
-        assert_eq!(posts.columns, set(&["author_id", "id", "title"]));
-        let users = read_columns(&catalog, "public.users");
-        assert_eq!(users.columns, set(&["id"]));
-        let comments = read_columns(&catalog, "public.comments");
-        assert_eq!(comments.columns, set(&["post_id"]));
     }
 }

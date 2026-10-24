@@ -95,7 +95,7 @@ async fn connect_raw(dsn: &str) -> Client {
 
 /// Defines a `JOIN` whose one `ON` term pairs `left.lcol` with
 /// `right.rcol`. `JOIN` key admission reads the same allowlist
-/// (`catalog::is_text_stable_join_key_type`) a 1-1 primary key does.
+/// (`join_key_types::is_text_stable_join_key_type`) a 1-1 primary key does.
 async fn define_join_on(
     pool: &trellis::pool::Pool,
     target: &str,
@@ -810,7 +810,7 @@ async fn signed_zero_is_why_float_text_keys_are_unsafe() {
 }
 
 /// `real`/`double precision` are refused as `JOIN` `ON` keys, through
-/// the same `catalog::TEXT_STABLE_JOIN_KEY_TYPES` allowlist that gates a 1-1
+/// the same `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES` allowlist that gates a 1-1
 /// transform's **primary key** (issue #107's "close the gap" fix) — so this
 /// is one assertion about both roles.
 ///
@@ -878,8 +878,8 @@ fn a_float_group_by_key_is_rejected() {
             "TRANSFORM t FROM s GROUP BY {column} WITHOUT SOURCE INDEX SELECT {column} AS k, SUM(n) AS total"
         ))
         .expect("parses");
-        let err = validate(&def, &source_columns(), &HashMap::new())
-            .expect_err("a float GROUP BY key must be rejected");
+        let err =
+            validate(&def, &source_columns()).expect_err("a float GROUP BY key must be rejected");
         assert!(
             err.to_string().contains(column),
             "the rejection must name the column: {err}"
@@ -891,7 +891,7 @@ fn a_float_group_by_key_is_rejected() {
     let def =
         parse("TRANSFORM t FROM s GROUP BY n WITHOUT SOURCE INDEX SELECT n AS k, SUM(n) AS total")
             .expect("parses");
-    validate(&def, &source_columns(), &HashMap::new()).expect("a numeric GROUP BY key still works");
+    validate(&def, &source_columns()).expect("a numeric GROUP BY key still works");
 }
 
 // ---------------------------------------------------------------------
@@ -934,8 +934,7 @@ async fn a_float_literal_needs_the_typed_literal_grammar_and_must_be_canonical()
     ] {
         let def = parse(&format!("TRANSFORM t FROM s SELECT {good} AS x"))
             .unwrap_or_else(|e| panic!("{good} should parse: {e}"));
-        validate(&def, &source_columns(), &HashMap::new())
-            .unwrap_or_else(|e| panic!("{good} should validate: {e}"));
+        validate(&def, &source_columns()).unwrap_or_else(|e| panic!("{good} should validate: {e}"));
 
         // Postgres parses the same spelling to the same type.
         let pg: String = client
@@ -964,7 +963,7 @@ async fn a_float_literal_needs_the_typed_literal_grammar_and_must_be_canonical()
     ] {
         let def = parse(&format!("TRANSFORM t FROM s SELECT {bad} AS x"))
             .unwrap_or_else(|e| panic!("{bad} should parse (validate-time error): {e}"));
-        let err = validate(&def, &source_columns(), &HashMap::new())
+        let err = validate(&def, &source_columns())
             .expect_err("a non-canonical float literal must be rejected");
         assert!(
             err.to_string().contains("not in canonical form"),

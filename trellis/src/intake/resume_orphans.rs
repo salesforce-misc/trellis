@@ -15,9 +15,8 @@
 //!   before it was deleted.
 //!
 //! Either way it is a 1-1 row whose source row was deleted, or an aggregate
-//! group every one of whose source rows went away (or, for a
-//! relationship-path `GROUP BY` key, moved to another group when the to-side
-//! row changed). Nothing enumerates a key that isn't there.
+//! group every one of whose source rows went away. Nothing enumerates a key
+//! that isn't there.
 //!
 //! So the discharge also deletes those rows directly: every target row with
 //! no source row that maps to its key, found by one anti-join per swept
@@ -26,8 +25,7 @@
 //! #315): each deleted key is recorded with its prior image and flushed as a
 //! downstream `Recompute` in the discharge's own transaction. A chained
 //! aggregate one hop down finds the group the deleted row belonged to from
-//! its own ledger entry; the prior image is for relationship readers, which
-//! take the row's old join value from it until #624.
+//! its own ledger entry.
 //!
 //! A target on the ledger is swept twice over. Each of its live entries the
 //! source no longer backs is re-derived, which leaves a tombstone, takes the
@@ -257,12 +255,6 @@
 //! and the catch-up's re-read only enumerates keys that still exist. So the
 //! sweep runs again in the discharge of each go-live catch-up, in its read.
 //!
-//! A catch-up on a relationship's to-side table enumerates that table, not
-//! the definition's source, so a group its sweep keeps isn't re-derived by
-//! it. Its source's own catch-up does that: the definition goes `live` only
-//! once every table its build read has been re-read, and it applies every
-//! change after each re-read.
-//!
 //! # Keeping the anti-join hashable
 //!
 //! A key column compared with `IS NOT DISTINCT FROM` forces a nested-loop
@@ -290,10 +282,9 @@ use tokio_postgres::Transaction;
 use tokio_postgres::types::ToSql;
 
 use crate::defs::ast::{GroupByKey, KeySpace};
-use crate::defs::catalog::{CatalogError, relationship_by_name_in};
+use crate::defs::catalog::CatalogError;
 use crate::defs::ddl::{self, PrimaryKeyColumn};
-use crate::defs::model::RelationshipCardinality;
-use crate::defs::oracle::{render_to_one_rel_expr_sql, to_one_join_clauses};
+use crate::defs::oracle::render_qualified_expr_sql;
 use crate::defs::{TransformStatus, grammar};
 use crate::pool::quote_ident;
 use crate::staging::apply::bounds_keyset_by_array;
@@ -316,9 +307,6 @@ struct KeyPart {
 /// How one rebuilt target's rows are matched against its source.
 struct Match {
     parts: Vec<KeyPart>,
-    /// The ` left join ...` clauses a relationship-path `GROUP BY` key reads
-    /// through; empty otherwise.
-    joins: String,
     /// #623 D3: a ledger target's ledger (quoted). A group row with a live
     /// entry left is not an orphan here: the entry sweep re-derives the
     /// entry, which deletes the group once it is empty.
@@ -500,14 +488,11 @@ impl Sweep {
             // deleted directly: a row a rebuild's build (which empties the
             // ledger) found no source rows for.
             let source_columns = crate::defs::catalog::source_columns_in(txn, id).await?;
-            let relationships =
-                crate::defs::catalog::resolve_relationships_in(txn, &def, &source_table).await?;
             let lock_order = (
                 matches!(def.key_space, KeySpace::Aggregate { .. }),
                 def.target.clone(),
             );
-            let ledger = match crate::staging::ledger::route(&def, &source_columns, &relationships)
-            {
+            let ledger = match crate::staging::ledger::route(&def, &source_columns) {
                 Some(shape) => {
                     let source_pk = ddl::identity_key_columns(txn, &source_table).await?;
                     let tag =
@@ -573,9 +558,7 @@ impl Sweep {
                     });
                 }
                 KeySpace::OneToOne => one_to_one_match(&key_cols),
-                KeySpace::Aggregate { group_by } => {
-                    aggregate_match(txn, &source_table, &target, group_by, &key_cols).await?
-                }
+                KeySpace::Aggregate { group_by } => aggregate_match(&target, group_by, &key_cols)?,
             };
             matching.ledger = ledger.clone();
             let tag = i32::try_from(self.targets.len()).expect("fewer than 2^31 swept targets");
@@ -1151,28 +1134,20 @@ fn one_to_one_match(key_cols: &[PrimaryKeyColumn]) -> Match {
                 }
             })
             .collect(),
-        joins: String::new(),
         ledger: None,
     }
 }
 
-/// An aggregate target's key is its grouping columns. A plain-column key
-/// reads the source column; a relationship-path key (issue #137) reads the
-/// to-side column through a `LEFT JOIN`, as the ledger's reads do, so a
-/// source row
-/// with no matching to-side row backs the `NULL` group, exactly as the build
-/// and the live apply group it. Each value is cast to the target column's type
-/// (the build writes it through the same assignment), which also keeps both
-/// sides of the `=` one type, so it hashes.
-async fn aggregate_match(
-    txn: &Transaction<'_>,
-    source_table: &str,
+/// An aggregate target's key is its grouping columns, each read from the
+/// source column. Each value is cast to the target column's type (the build
+/// writes it through the same assignment), which also keeps both sides of
+/// the `=` one type, so it hashes.
+fn aggregate_match(
     target: &str,
     group_by: &[GroupByKey],
     key_cols: &[PrimaryKeyColumn],
 ) -> Result<Match, IntakeError> {
     let mut parts = Vec::with_capacity(group_by.len());
-    let mut rels = BTreeSet::new();
     for key in group_by {
         let name = key.target_column_name();
         let col = key_cols.iter().find(|c| c.name == name).ok_or_else(|| {
@@ -1181,65 +1156,18 @@ async fn aggregate_match(
                 reason: format!("its primary key has no grouping column {name:?}"),
             }
         })?;
-        if let GroupByKey::RelationshipPath { rel, .. } = key {
-            rels.insert(rel.as_str());
-        }
         parts.push(KeyPart {
             target_col: quote_ident(name),
             source_sql: format!(
                 "({})::{}",
-                render_to_one_rel_expr_sql(&key.as_expr(), "s"),
+                render_qualified_expr_sql(&key.as_expr(), "s"),
                 col.data_type
             ),
             nullable: col.nullable,
         });
     }
-
-    let mut joins = Vec::with_capacity(rels.len());
-    if !rels.is_empty() {
-        let (from_schema, from_table) = source_table
-            .split_once('.')
-            .ok_or_else(|| IntakeError::InvalidTableName(source_table.to_string()))?;
-        for rel in rels {
-            // The catalog refuses to drop a relationship a definition still
-            // reads, and the validator only admits a to-one path as a GROUP
-            // BY key (a to-many join would fan out and match groups no row
-            // backs), so either of these is a catalog edited by hand: an
-            // error the marker backs off on (issue #518), not a panic.
-            let unsweepable = |reason: String| IntakeError::UnsweepableTarget {
-                target: target.to_string(),
-                reason,
-            };
-            let reldef = relationship_by_name_in(txn, from_schema, from_table, rel)
-                .await?
-                .ok_or_else(|| {
-                    unsweepable(format!(
-                        "its GROUP BY reads relationship {rel:?}, which {source_table} doesn't declare"
-                    ))
-                })?;
-            if reldef.cardinality != RelationshipCardinality::ToOne {
-                return Err(unsweepable(format!(
-                    "its GROUP BY reads relationship {rel:?}, which is not to-one"
-                )));
-            }
-            // Joined by its recorded to-side (issue #372), not the bare
-            // `to_table` re-resolved through this session's `search_path`.
-            joins.push((rel.to_string(), reldef.qualified_to_table(), reldef.def));
-        }
-    }
     Ok(Match {
         parts,
-        joins: to_one_join_clauses(
-            joins.iter().map(|(rel, to_table, d)| {
-                (
-                    rel.as_str(),
-                    to_table.as_str(),
-                    d.to_col.as_str(),
-                    d.from_col.as_str(),
-                )
-            }),
-            "s",
-        ),
         ledger: None,
     })
 }
@@ -1408,8 +1336,7 @@ fn orphan_branch_sql(
             )
         }
         None => format!(
-            "not exists (select 1 from {source_ident} as s{} where {})",
-            matching.joins,
+            "not exists (select 1 from {source_ident} as s where {})",
             matches.join(" and "),
         ),
     };
@@ -4539,7 +4466,6 @@ mod tests {
     fn a_not_null_key_matches_with_plain_equality() {
         let matching = Match {
             parts: vec![part("a", r#"s."a""#, false), part("b", r#"s."b""#, false)],
-            joins: String::new(),
             ledger: None,
         };
         assert_eq!(
@@ -4565,7 +4491,6 @@ mod tests {
                 part("g", r#"(s."g")::numeric"#, true),
                 part("h", r#"(s."h")::text"#, true),
             ],
-            joins: r#" left join "c" as "c" on "c"."id" = s."cid""#.to_string(),
             ledger: None,
         };
         let nullable = [0, 1];
@@ -4578,7 +4503,7 @@ mod tests {
                 &nullable,
                 OrphanPattern::Exactly(0b10)
             ),
-            r#"select 0::int4, null::text, array[t."g"::text, t."h"::text]::text[] from t as t where t."g" is not null and t."h" is null and not exists (select 1 from src as s left join "c" as "c" on "c"."id" = s."cid" where (s."g")::numeric = t."g" and (s."h")::text is null)"#
+            r#"select 0::int4, null::text, array[t."g"::text, t."h"::text]::text[] from t as t where t."g" is not null and t."h" is null and not exists (select 1 from src as s where (s."g")::numeric = t."g" and (s."h")::text is null)"#
         );
         let none_null = orphan_branch_sql(
             0,
@@ -4598,7 +4523,6 @@ mod tests {
     fn the_catch_all_covers_the_unlisted_patterns() {
         let matching = Match {
             parts: vec![part("g", r#"(s."g")::numeric"#, true)],
-            joins: String::new(),
             ledger: None,
         };
         assert_eq!(

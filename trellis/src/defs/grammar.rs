@@ -1,6 +1,6 @@
 //! The grammar version of a stored definition (ADR-0018).
 //!
-//! Every stored transform and relationship definition carries the
+//! Every stored transform definition carries the
 //! `grammar_version` its text was written under, stamped when the text is
 //! written. Every read of stored transform text goes through [`load`], which
 //! takes the text and its version and returns the definition in the current
@@ -89,9 +89,6 @@ pub(crate) async fn check_stored_versions_in(
         .query(
             "select 'transform ' || target_table, grammar_version from transform_definitions \
                where grammar_version > $1 \
-             union all \
-             select 'relationship ' || from_schema || '.' || from_table || '.' || name, \
-                    grammar_version from relationship_definitions where grammar_version > $1 \
              order by 1",
             &[&current],
         )

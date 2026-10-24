@@ -307,9 +307,7 @@ async fn trigger_capture_stages_the_golden_images_under_a_foreign_session() {
     sorted.sort();
     assert_eq!(sorted, ["public.comp", "public.ctl", "public.fam"]);
     let client = db.pool.get().await.expect("pool client");
-    let catalog = load_catalog(&**client, DEFAULT_SCHEMA)
-        .await
-        .expect("load capture catalog");
+    let catalog = load_catalog(&**client).await.expect("load capture catalog");
     let mut specs: BTreeMap<String, CaptureSpec> = BTreeMap::new();
     for table in &sorted {
         let spec = capture_spec(&**client, &catalog, table)

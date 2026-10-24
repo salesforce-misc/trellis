@@ -977,9 +977,8 @@ impl Trellis {
     /// What holds up the capture a definition sourced from `source_table`
     /// waits on (issue #622 C5, #687): the lock wait, then the other
     /// failure, that the staging worker's latest pass recorded in
-    /// `capture_holdups` for the source, for a `JOIN`'s joined table (#1107),
-    /// or for the to-side of a relationship declared on the source. The
-    /// staging worker may run in any process.
+    /// `capture_holdups` for the source, or for a `JOIN`'s joined table
+    /// (#1107). The staging worker may run in any process.
     async fn capture_holdup(
         &self,
         client: &impl tokio_postgres::GenericClient,
@@ -994,10 +993,7 @@ impl Trellis {
                  join (select $1::text as t, 0::bigint as ord \
                        union all \
                        select join_table, 0 from transform_definitions \
-                       where id = $2 and join_table is not null \
-                       union all \
-                       select to_schema || '.' || to_table, id from relationship_definitions \
-                       where from_schema || '.' || from_table = $1) read \
+                       where id = $2 and join_table is not null) read \
                    on read.t = h.table_name \
                  order by read.ord, read.t",
                 &[&source_table, &definition_id],
@@ -2106,7 +2102,8 @@ pub struct DefinitionStatus {
     /// entry names the relationship, table and column, and [`UnindexedJoin::fix`]
     /// says what to do: create an index on the column, which Trellis doesn't
     /// do. Read live on each call, so an index created since shows. Empty
-    /// when there is none; see `docs/recommendations.md`.
+    /// when there is none, which is always since no definition reads a
+    /// relationship (#1115); #1347 decides the field's fate.
     pub unindexed_joins: Vec<UnindexedJoin>,
     /// The source indexes a `GROUP BY` or `JOIN` target needs and lacks now
     /// (#1167): one entry per table and columns. Define and a resume refuse

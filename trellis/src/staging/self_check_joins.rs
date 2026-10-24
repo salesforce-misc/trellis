@@ -202,11 +202,6 @@ fn render(def: &TransformDef, expr: &Expr, from: &str, joined: &str) -> Result<S
                 "reads the unqualified column '{name}', which a JOIN definition can't hold"
             ));
         }
-        Expr::RelationshipPath { rel, column } => {
-            return Err(format!(
-                "reads the relationship path '{rel}.{column}', which a JOIN definition can't hold"
-            ));
-        }
         Expr::BinaryOp { op, lhs, rhs } => {
             let symbol = match op {
                 Operator::Add => "+",
@@ -229,7 +224,7 @@ fn render(def: &TransformDef, expr: &Expr, from: &str, joined: &str) -> Result<S
             format!("{}({})", name.to_lowercase(), rendered.join(", "))
         }
         Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::TypedLiteral { .. } => {
-            render_leaf(expr)?
+            render_leaf(expr)
         }
     })
 }
@@ -910,7 +905,7 @@ fn render_signed(def: &TransformDef, expr: &Expr, args: &[Expr]) -> Result<Strin
             format!("__g.{}", quote_ident(column))
         }
         Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::TypedLiteral { .. } => {
-            render_leaf(expr)?
+            render_leaf(expr)
         }
         _ => {
             return Err(format!(

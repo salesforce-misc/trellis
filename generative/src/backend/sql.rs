@@ -22,8 +22,8 @@ use std::time::{Duration, Instant};
 
 use trellis::dev::defs::TransformStatus;
 use trellis::dev::defs::ast::{
-    Expr, FieldDef, GroupByKey, JoinKind, KeySpace, Operator, Predicate, QualifiedColumn,
-    TransformDef, ValueType,
+    Expr, FieldDef, JoinKind, KeySpace, Operator, Predicate, QualifiedColumn, TransformDef,
+    ValueType,
 };
 use trellis::dev::staging::{StagingError, await_converged, converged_through, watermark_token};
 
@@ -149,10 +149,7 @@ pub(super) fn required_source_indexes(def: &TransformDef) -> Vec<(String, Vec<St
         KeySpace::Aggregate { group_by } => {
             let columns: Vec<String> = group_by
                 .iter()
-                .filter_map(|key| match key {
-                    GroupByKey::Column(column) => Some(column.clone()),
-                    GroupByKey::RelationshipPath { .. } => None,
-                })
+                .map(|key| key.target_column_name().to_string())
                 .collect();
             if columns.len() == group_by.len() {
                 vec![(def.source.clone(), columns)]
@@ -249,7 +246,6 @@ pub(super) fn render_expr(expr: &Expr) -> String {
             let args: Vec<String> = args.iter().map(render_expr).collect();
             format!("{name}({})", args.join(", "))
         }
-        Expr::RelationshipPath { rel, column } => format!("{rel}.{column}"),
     }
 }
 
