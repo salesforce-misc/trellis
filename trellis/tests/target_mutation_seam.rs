@@ -247,6 +247,43 @@ async fn a_chained_target_is_never_captured() {
         vec!["public.src".to_string()],
         "agg is hist's source, but a seam-only target is never captured"
     );
+
+    // A `JOIN`'s joined table is no exception. `t` is a plain 1-1 target.
+    raw.batch_execute(
+        "create table public.reports (id integer primary key, oid integer); \
+         create index on public.reports (oid); \
+         create table public.t (id integer primary key, doubled numeric)",
+    )
+    .await
+    .expect("create reports and t");
+    one_to_one_ledgers(&raw, &["t"]).await;
+    create_definition(
+        &db.pool,
+        "TRANSFORM public.t FROM public.src SELECT v + v AS doubled",
+        &columns,
+    )
+    .await
+    .expect("define t");
+    trellis::intake::markers::settle_registrations(&db.pool).await;
+    install_definition(
+        &db.pool,
+        "TRANSFORM public.report_view FROM public.reports JOIN public.t \
+         ON reports.oid = t.id GROUP BY reports.id WITHOUT SOURCE INDEX \
+         SELECT reports.id AS id, COUNT(t.doubled) AS n",
+        &numeric_columns(&["id", "oid"]),
+        "public",
+    )
+    .await
+    .expect("define a JOIN whose joined table is t");
+    let mut captured = tables_to_capture(&db.pool)
+        .await
+        .expect("tables_to_capture");
+    captured.sort();
+    assert_eq!(
+        captured,
+        vec!["public.reports".to_string(), "public.src".to_string()],
+        "only true sources are captured, not the joined target t"
+    );
 }
 
 /// A target's initial build writes it outside the seam, so a definition may

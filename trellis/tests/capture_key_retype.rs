@@ -2383,18 +2383,24 @@ async fn a_definition_refused_at_its_automatic_resume_stays_paused_with_the_refu
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
     let trellis = items(db.dsn(), &mut raw, &db.pool).await;
-    // A column of `item_names` its own definition doesn't write, so it can
-    // change while `item_names` rebuilds.
-    raw.batch_execute("alter table public.item_names add column note text")
-        .await
-        .expect("add a column to item_names");
+    raw.batch_execute(
+        "create table public.owners (code varchar primary key, label text); \
+         insert into public.owners values ('one', 'First'), ('two', 'Second');",
+    )
+    .await
+    .expect("seed owners");
     trellis
-        .apply("TRANSFORM b_owners FROM public.item_names SELECT CHAR_LENGTH(note) AS note_length")
+        .apply(
+            "TRANSFORM b_owners FROM public.item_names JOIN public.owners \
+             ON item_names.name = owners.code GROUP BY item_names.id, owners.label \
+             WITHOUT SOURCE INDEX SELECT item_names.id AS id, owners.label AS label, \
+             COUNT(*) AS n",
+        )
         .await
         .expect("define b_owners");
     bring_live(&mut raw, &db.pool, &["item_names", "b_owners"]).await;
     trellis
-        .apply("TRANSFORM c_owners FROM public.b_owners SELECT note_length AS note_length")
+        .apply("TRANSFORM c_owners FROM public.b_owners SELECT label AS owner_label")
         .await
         .expect("define c_owners");
     bring_live(&mut raw, &db.pool, &["item_names", "b_owners", "c_owners"]).await;
@@ -2407,17 +2413,17 @@ async fn a_definition_refused_at_its_automatic_resume_stays_paused_with_the_refu
     capture_pass(&mut raw, &db.pool).await;
     assert_waiting_on(&trellis, &raw, "b_owners", "item_names").await;
 
-    // The schema changes after the pause: define refuses `CHAR_LENGTH` over an
-    // integer.
-    raw.batch_execute("alter table public.item_names alter column note type integer using 0")
+    // The schema changes after the pause: define refuses a join column of
+    // type character(n).
+    raw.batch_execute("alter table public.owners alter column code type character(10)")
         .await
-        .expect("re-type the column B computes over");
+        .expect("re-type the joined table's ON column");
     step_until_live(&trellis, &mut raw, &db.pool, "item_names", &["b_owners"]).await;
 
     capture_pass(&mut raw, &db.pool).await;
     let error = paused_for(&trellis, "b_owners", "public.item_names", &[]).await;
     assert!(
-        error.starts_with("the resume was refused: ") && error.contains("found integer"),
+        error.starts_with("the resume was refused: ") && error.contains("character(10)"),
         "{error}"
     );
     assert_eq!(caused_by(&raw, "b_owners").await, None);
@@ -2804,13 +2810,19 @@ async fn a_waiting_resume_refused_once_its_upstream_is_live_is_not_retried() {
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
     let trellis = items(db.dsn(), &mut raw, &db.pool).await;
-    // A column of `item_names` its own definition doesn't write, so it can
-    // change while `item_names` rebuilds.
-    raw.batch_execute("alter table public.item_names add column note text")
-        .await
-        .expect("add a column to item_names");
+    raw.batch_execute(
+        "create table public.owners (code varchar primary key, label text); \
+         insert into public.owners values ('one', 'First'), ('two', 'Second');",
+    )
+    .await
+    .expect("seed owners");
     trellis
-        .apply("TRANSFORM b_owners FROM public.item_names SELECT CHAR_LENGTH(note) AS note_length")
+        .apply(
+            "TRANSFORM b_owners FROM public.item_names JOIN public.owners \
+             ON item_names.name = owners.code GROUP BY item_names.id, owners.label \
+             WITHOUT SOURCE INDEX SELECT item_names.id AS id, owners.label AS label, \
+             COUNT(*) AS n",
+        )
         .await
         .expect("define b_owners");
     bring_live(&mut raw, &db.pool, &["item_names", "b_owners"]).await;
@@ -2819,11 +2831,11 @@ async fn a_waiting_resume_refused_once_its_upstream_is_live_is_not_retried() {
     resume(&trellis, "b_owners").await;
     assert_requested_wait(&trellis, &raw, "b_owners", "item_names").await;
 
-    // The schema changes while it waits: define refuses `CHAR_LENGTH` over an
-    // integer.
-    raw.batch_execute("alter table public.item_names alter column note type integer using 0")
+    // The schema changes while it waits: define refuses a join column of
+    // type character(n).
+    raw.batch_execute("alter table public.owners alter column code type character(10)")
         .await
-        .expect("re-type the column B computes over");
+        .expect("re-type the joined table's ON column");
     resume(&trellis, "item_names").await;
     step_until_live_requested(
         &trellis,
@@ -2837,7 +2849,7 @@ async fn a_waiting_resume_refused_once_its_upstream_is_live_is_not_retried() {
     capture_pass(&mut raw, &db.pool).await;
     let error = paused_for(&trellis, "b_owners", "public.item_names", &[]).await;
     assert!(
-        error.starts_with("the resume was refused: ") && error.contains("found integer"),
+        error.starts_with("the resume was refused: ") && error.contains("character(10)"),
         "{error}"
     );
     assert!(!requested(&raw, "b_owners").await);
