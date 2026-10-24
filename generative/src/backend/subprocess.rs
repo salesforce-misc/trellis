@@ -1,7 +1,7 @@
 //! The subprocess-supervised backend (issue #166): [`ManualBackend`]'s
 //! sibling `Backend` impl, differing *only* in how the engine that drains
 //! the ring is started, stopped, and restarted. Every DDL/DML/read-back
-//! concern (installing tables/relationships/definitions, applying raw
+//! concern (installing tables/definitions, applying raw
 //! source DML, polling watermarks, reading back a [`Snapshot`]) is shared
 //! with `ManualBackend` via [`super::sql`] — see that module's doc comment.
 //!
@@ -44,7 +44,7 @@ use std::time::{Duration, Instant};
 use testkit::crash::CrashGuard;
 use tokio_postgres::NoTls;
 use trellis::dev::defs::ast::TransformDef;
-use trellis::dev::defs::{CatalogError, DdlError, create_relationship, install_definition};
+use trellis::dev::defs::{CatalogError, DdlError, install_definition};
 use trellis::dev::staging::StagingError;
 use trellis::{Config, Pool};
 
@@ -528,12 +528,6 @@ impl super::Backend for SubprocessBackend {
         for table in &program.tables {
             sql::create_source_table(&self.raw, None, table).await?;
             self.tables.insert(table.name.clone(), table.clone());
-        }
-        // Issue #34: relationships before definitions — see
-        // `ManualBackend::install`'s identical comment for why this
-        // ordering is always safe.
-        for rel in &program.relationships {
-            create_relationship(&self.pool, &sql::render_relationship(rel)).await?;
         }
         for def in &program.defs {
             self.install_definition(def).await?;

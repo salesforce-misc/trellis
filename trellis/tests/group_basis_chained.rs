@@ -17,9 +17,7 @@
 //! basis. The rest are decision 5's: a row that moves group upstream (#1043
 //! F8), a rollup whose upstream group is emptied and refilled in one page, a
 //! reader defined while an upstream writer is in flight, and an upstream
-//! rebuild that rebuilds the reader. The last covers a ledger upstream fed
-//! through a relationship, whose writes reach the reader through the seam
-//! like any other writer's. The last group is a reader's build over an
+//! rebuild that rebuilds the reader. The last group is a reader's build over an
 //! upstream target whose keys have `NULL` parts, with writes and source
 //! `TRUNCATE`s around it (#1102).
 
@@ -393,57 +391,36 @@ async fn run_plan(d: &Driver) -> bool {
 }
 
 /// An upstream rebuild that writes its target outside the seam (a resumed
-/// relationship-fed aggregate, which only the direct build builds) rebuilds
-/// a group-basis reader rather than parking it a catch-up, whose image-less
-/// re-read the group basis can't apply (ADR-0002, "Multi-hop").
+/// 1-1 whose source is held out of the Re-derive build, rebuilt by the old
+/// chunked build) rebuilds a group-basis reader rather than parking it a
+/// catch-up, whose image-less re-read the group basis can't apply (ADR-0002,
+/// "Multi-hop").
 #[tokio::test]
 async fn an_upstream_rebuild_outside_the_seam_rebuilds_the_reader() {
-    trellis::dev::staging::set_group_basis(true);
-    let mut columns = src_columns();
-    columns.push(("x", int4()));
-    let mut d = Driver::start_with_relationships(
-        "create table public.par (id integer primary key, x integer); \
-         create table public.src (id integer primary key, g integer, h integer, v integer); \
-         create index on public.src (g, h)",
-        &columns,
-        &["RELATIONSHIP parent FROM src.h TO par.id"],
-        &["TRANSFORM up FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(parent.x) AS total, COUNT(*) AS n"],
-        &["public.par", SRC],
+    let mut d = start(
+        "TRANSFORM up FROM public.src SELECT g AS g, v AS v",
+        "TRANSFORM roll FROM public.up GROUP BY g WITHOUT SOURCE INDEX SELECT COUNT(*) AS n, SUM(v) AS total",
+        &[("id", int4()), ("g", int4()), ("v", int4())],
+        1,
     )
     .await;
-    install(
-        &d,
-        "TRANSFORM roll FROM public.up GROUP BY n WITHOUT SOURCE INDEX SELECT COUNT(*) AS groups",
-        &[("g", int4()), ("total", int8()), ("n", int8())],
-    )
-    .await;
-    trellis::intake::markers::settle_registrations(d.pool()).await;
-    d.settle().await;
     let status = |table: &str| {
         format!("select status, build from transform_definitions where target_table = '{table}'")
     };
-    assert_eq!(d.rows(&status("public.roll")).await, ["(live,)"]);
-    assert_eq!(
-        hidden_tables(&d).await,
-        1,
-        "only the reader is on the group basis"
-    );
+    let roll = "select g, n, total from public.roll order by g";
+    let oracle = "select g, count(*), sum(v) from public.src group by g order by g";
     step(
         &mut d,
-        "insert into public.par values (1, 100); \
-         insert into public.src values (1, 1, 1, 5), (2, 1, 1, 7), (3, 2, null, 2)",
+        "insert into public.src values (1, 1, null, 5), (2, 1, null, 7), (3, 2, null, 2)",
     )
     .await;
-    assert_equal(
-        &mut d,
-        "select n, groups from public.roll order by n",
-        "select n, count(*) from (select count(*) as n from public.src group by g) s \
-         group by n order by n",
-    )
-    .await;
+    assert_equal(&mut d, roll, oracle).await;
 
-    // Pause and resume the upstream: its rebuild is a direct build, whose
-    // writes bypass the seam.
+    // Pause and resume the upstream, held out of the Re-derive build: its
+    // rebuild is the old chunked build, whose writes bypass the seam.
+    trellis::intake::markers::hold_out_of_the_rederive_build(&d.ctl, SRC)
+        .await
+        .expect("hold src out of the Re-derive build");
     d.ctl
         .batch_execute(
             "update transform_definitions set status = 'paused' where target_table = 'public.up'",
@@ -459,8 +436,8 @@ async fn an_upstream_rebuild_outside_the_seam_rebuilds_the_reader() {
     assert_eq!(
         d.rows("select kind from backfill_chunks where not done")
             .await,
-        ["(direct)"],
-        "the upstream is rebuilt by the direct build"
+        ["(range)"],
+        "the upstream is rebuilt by the old chunked build"
     );
     loop {
         let claimed =
@@ -521,9 +498,6 @@ async fn an_upstream_rebuild_outside_the_seam_rebuilds_the_reader() {
     trellis::staging::build::settle_builds(d.pool()).await;
     assert_eq!(d.rows(&status("public.roll")).await, ["(live,)"]);
     trellis::intake::markers::settle_registrations(d.pool()).await;
-    let roll = "select n, groups from public.roll order by n";
-    let oracle = "select n, count(*) from (select count(*) as n from public.src group by g) s \
-                  group by n order by n";
     assert_equal(&mut d, roll, oracle).await;
     step(
         &mut d,
@@ -583,51 +557,6 @@ async fn an_upstream_rebuild_reaches_its_reader_through_the_seam() {
     d.drain(undrained, "undrained").await;
     assert_equal(&mut d, ROLL, ORACLE).await;
     step(&mut d, "insert into public.src values (6, 3, 0, 4)").await;
-    assert_equal(&mut d, ROLL, ORACLE).await;
-}
-
-/// A relationship-fed upstream (its totals follow a parent's value, which
-/// reaches it through the relationship rather than its own source's capture)
-/// still writes its target through the seam, so a group-basis rollup grouped
-/// by those totals moves each upstream group between its groups.
-#[tokio::test]
-async fn a_rollup_over_a_relationship_fed_upstream_follows_parent_changes() {
-    trellis::dev::staging::set_group_basis(true);
-    let mut columns = src_columns();
-    columns.push(("x", int4()));
-    let mut d = Driver::start_with_relationships(
-        "create table public.par (id integer primary key, x integer); \
-         create table public.src (id integer primary key, g integer, h integer, v integer); \
-         create index on public.src (g, h)",
-        &columns,
-        &["RELATIONSHIP parent FROM src.h TO par.id"],
-        &["TRANSFORM up FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(parent.x) AS total, COUNT(*) AS n"],
-        &["public.par", SRC],
-    )
-    .await;
-    install(
-        &d,
-        "TRANSFORM roll FROM public.up GROUP BY total WITHOUT SOURCE INDEX SELECT SUM(n) AS rows, COUNT(*) AS groups",
-        &[("g", int4()), ("total", int8()), ("n", int8())],
-    )
-    .await;
-    trellis::intake::markers::settle_registrations(d.pool()).await;
-    d.settle().await;
-    const ROLL: &str = "select total, rows, groups from public.roll order by total";
-    const ORACLE: &str = "select total, sum(n), count(*) from \
-                          (select s.g, sum(p.x) as total, count(*) as n from public.src s \
-                           left join public.par p on p.id = s.h group by s.g) t \
-                          group by total order by total";
-    step(
-        &mut d,
-        "insert into public.par values (1, 100), (2, 10); \
-         insert into public.src values (1, 1, 1, 0), (2, 2, 2, 0), (3, 3, 2, 0)",
-    )
-    .await;
-    assert_equal(&mut d, ROLL, ORACLE).await;
-    step(&mut d, "update public.par set x = 50 where id = 2").await;
-    assert_equal(&mut d, ROLL, ORACLE).await;
-    step(&mut d, "update public.par set x = 100 where id = 2").await;
     assert_equal(&mut d, ROLL, ORACLE).await;
 }
 

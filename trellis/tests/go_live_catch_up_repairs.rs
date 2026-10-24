@@ -21,11 +21,14 @@
 //! Each test ends with the definition `live` after the discharge, and the
 //! target equal to the source.
 //!
-//! The aggregate is relationship-fed (an extra field reads a to-one
-//! relationship's column), so it still takes the direct build and its
-//! go-live catch-up until #625 F9. Every plain aggregate is the Re-derive
-//! build's since #625 F5: it applies from its start and has no catch-up to
-//! repair anything (`tests/rederive_build.rs`, `tests/build_interleavings.rs`).
+//! The aggregate's source is held out of the Re-derive build
+//! ([`markers::hold_out_of_the_rederive_build`]), so it takes the direct build
+//! and its go-live catch-up, which survive until #625 F10. That direct build
+//! loads the per-row ledger, which the group-basis default no longer creates,
+//! so the aggregate tests run only with the knob off. Every other
+//! aggregate is the Re-derive build's since #625 F5: it applies from its
+//! start and has no catch-up to repair anything (`tests/rederive_build.rs`,
+//! `tests/build_interleavings.rs`).
 //!
 //! The aggregate build is held with event triggers on advisory locks the
 //! test holds, at the two `ALTER TABLE`s around its ledger load (#623 D2),
@@ -45,7 +48,7 @@ use testkit::TestCluster;
 use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::defs::{ValueType, create_relationship, install_definition};
+use trellis::defs::{ValueType, install_definition};
 use trellis::intake::markers;
 use trellis::staging::{CdcOp, StagedChange, StagedWatermark, apply, seal};
 use trellis::staging::{has_pending, retire_drained_segments};
@@ -182,15 +185,13 @@ async fn start_held_build(pool: &trellis::Pool, client: &Client) -> tokio::task:
     client
         .batch_execute(
             "create table public.sales (id integer primary key, sku text, amount integer); \
-             insert into public.sales values (1, 'a', 5), (2, 'a', 7), (3, 'b', 2); \
-             create table public.skus (sku text primary key, weight integer); \
-             insert into public.skus values ('a', 1), ('b', 2)",
+             insert into public.sales values (1, 'a', 5), (2, 'a', 7), (3, 'b', 2)",
         )
         .await
-        .expect("create + seed sales and skus");
-    create_relationship(pool, "RELATIONSHIP item FROM sales.sku TO skus.sku")
+        .expect("create + seed sales");
+    markers::hold_out_of_the_rederive_build(client, "public.sales")
         .await
-        .expect("create the to-one relationship");
+        .expect("hold sales out of the Re-derive build");
     install_build_holds(client).await;
     for lock in [BEFORE_READ, AFTER_READ] {
         client
@@ -201,7 +202,7 @@ async fn start_held_build(pool: &trellis::Pool, client: &Client) -> tokio::task:
     install_definition(
         pool,
         "TRANSFORM sku_totals FROM sales GROUP BY sku \
-        WITHOUT SOURCE INDEX SELECT sum(amount) AS total, max(item.weight) AS weight",
+        WITHOUT SOURCE INDEX SELECT sum(amount) AS total",
         &HashMap::from([
             ("id".to_string(), ValueType::Numeric),
             ("sku".to_string(), ValueType::Text),
@@ -234,7 +235,7 @@ async fn assert_old_build(client: &Client) {
         .expect("read the definition's build");
     assert!(
         row.get::<_, bool>(0),
-        "a relationship-fed aggregate takes the old build"
+        "an aggregate held out of the Re-derive build takes the old build"
     );
     assert_eq!(row.get::<_, i64>(1), 1, "its build is a direct-build job");
 }
@@ -289,6 +290,7 @@ fn row_4(sku: &str) -> String {
 /// The source then has the row count and `xmin`s it had before the build,
 /// which the coverage skip took for "unchanged".
 #[tokio::test]
+#[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
 async fn a_row_inserted_during_the_build_and_deleted_after_it_is_not_left_counted() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -329,6 +331,7 @@ async fn a_row_inserted_during_the_build_and_deleted_after_it_is_not_left_counte
 /// and both changes drain while the definition is still `backfilling`, so
 /// apply skips them.
 #[tokio::test]
+#[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
 async fn a_row_inserted_and_deleted_during_the_build_is_not_left_counted() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -364,6 +367,7 @@ async fn a_row_inserted_and_deleted_during_the_build_is_not_left_counted() {
 /// re-read has no key left in group `z` to re-derive it from, so only the
 /// orphan sweep at the flip removes it.
 #[tokio::test]
+#[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
 async fn a_group_emptied_during_the_build_is_gone_at_live() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -492,6 +496,7 @@ async fn a_one_to_one_row_deleted_during_the_build_is_gone_at_live() {
 /// longer counts: `b` would be left at a count of 0 and a `NULL` total, with
 /// row 5 in the source.
 #[tokio::test]
+#[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
 async fn a_group_swept_with_its_delete_still_staged_is_rederived_when_refilled() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;

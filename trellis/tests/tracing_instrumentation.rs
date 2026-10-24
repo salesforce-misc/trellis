@@ -616,19 +616,12 @@ async fn a_below_threshold_charge_is_logged_as_a_warning_naming_the_key() {
 ///
 /// #625 F8a: a plain 1-1 over a captured table is the Re-derive build's,
 /// which goes `backfilling` -> `live` with no catch-up
-/// ([`rederive_build_status_transitions_emit_info_events`]); a 1-1 that also
-/// counts over a to-many relationship keeps the old direct build and its
-/// go-live catch-up.
+/// ([`rederive_build_status_transitions_emit_info_events`]); one held out of
+/// the Re-derive build takes the old build and its go-live catch-up.
 #[tokio::test]
 async fn backfill_status_transitions_emit_info_events() {
     assert_eq!(
-        backfill_status_transitions(
-            "create table kids (id bigint primary key, s_id bigint); \
-             insert into kids (id, s_id) values (1, 1), (2, 1), (3, 2)",
-            Some("RELATIONSHIP kids FROM s.id TO kids.s_id"),
-            "TRANSFORM t FROM s SELECT a + a AS x, COUNT(kids.id) AS n",
-        )
-        .await,
+        backfill_status_transitions(true, "TRANSFORM t FROM s SELECT a + a AS x").await,
         [
             ("waiting_to_backfill", "backfilling"),
             ("backfilling", "catching_up"),
@@ -645,7 +638,7 @@ async fn backfill_status_transitions_emit_info_events() {
 #[tokio::test]
 async fn rederive_build_status_transitions_emit_info_events() {
     assert_eq!(
-        backfill_status_transitions("", None, "TRANSFORM t FROM s SELECT a + a AS x").await,
+        backfill_status_transitions(false, "TRANSFORM t FROM s SELECT a + a AS x").await,
         [
             ("waiting_to_backfill", "backfilling"),
             ("backfilling", "live")
@@ -654,30 +647,29 @@ async fn rederive_build_status_transitions_emit_info_events() {
     );
 }
 
-/// The body of the backfill transition tests: seeds `s`, runs `extra_ddl`,
-/// defines `relationship` (if any) and registers `transform` under a
+/// The body of the backfill transition tests: seeds `s`, holds it out of the
+/// Re-derive build if `old_build`, and registers `transform` under a
 /// straggler that commits before the settled pass, then returns the `(from,
 /// to)` of every INFO "transform status transition" event the settled
 /// reconcile pass and `settle_registrations` emitted, in order.
-async fn backfill_status_transitions(
-    extra_ddl: &str,
-    relationship: Option<&str>,
-    transform: &str,
-) -> Vec<(String, String)> {
+async fn backfill_status_transitions(old_build: bool, transform: &str) -> Vec<(String, String)> {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect_raw(db.dsn()).await;
 
-    raw.batch_execute(&format!(
+    raw.batch_execute(
         "create table s (id bigint primary key, a numeric); \
-         insert into s (id, a) select g, g from generate_series(1, 5) g; {extra_ddl}"
-    ))
+         insert into s (id, a) select g, g from generate_series(1, 5) g",
+    )
     .await
     .expect("seed source table");
-    if let Some(relationship) = relationship {
-        trellis::defs::create_relationship(&db.pool, relationship)
-            .await
-            .expect("create the relationship");
+    if old_build {
+        trellis::intake::markers::hold_out_of_the_rederive_build(
+            &raw,
+            &format!("{DEFAULT_SCHEMA}.s"),
+        )
+        .await
+        .expect("hold s out of the Re-derive build");
     }
 
     let straggler = OpenTransaction::begin(db.dsn()).await;

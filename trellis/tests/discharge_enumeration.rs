@@ -1,7 +1,7 @@
 //! Which marker discharges enumerate the table into the ring: every one on a
 //! table a catch-up's reader (a `catching_up` definition) reads (issues #417,
 //! #1322), except for one whose Re-derive build will read it, is reading it,
-//! or started after the marker was parked (issues #732, #938). A direct
+//! or started after the marker was parked (issues #732, #938). The old
 //! build's go-live catch-up always does, even for a table that hasn't changed
 //! since the build read it (issues #468, #485). A `live` reader alone never
 //! makes a discharge enumerate (`second_definition_enumeration.rs`).
@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::defs::{ValueType, create_relationship, install_definition};
+use trellis::defs::{ValueType, install_definition};
 use trellis::intake::markers;
 
 async fn connect_raw(dsn: &str) -> Client {
@@ -125,44 +125,44 @@ async fn a_table_with_a_reader_is_enumerated() {
     );
 }
 
-/// Issues #468, #485: a direct build's go-live catch-up re-reads every table
-/// the build read, even one nothing has written since. (A coverage record
+/// Issues #468, #485: the old build's go-live catch-up (here a held-out 1-1's
+/// chunked build) re-reads the table the build read, even when nothing has
+/// written to it since. (A coverage record
 /// used to let it skip such a table, but "unchanged" can't be told apart
 /// from a row inserted and deleted again during the build.)
 #[tokio::test]
-async fn a_direct_builds_catch_up_re_reads_an_unchanged_table() {
+async fn an_old_builds_go_live_catch_up_re_reads_an_unchanged_table() {
     let cluster = testkit::TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
 
     client
         .batch_execute(
-            "create table public.authors (id integer primary key, name text); \
-             create table public.posts (id integer primary key, author_id integer, words integer); \
-             insert into public.authors (id, name) values (1, 'a'), (2, 'b'), (3, 'c'); \
+            "create table public.posts (id integer primary key, author_id integer, words integer); \
              insert into public.posts (id, author_id, words) values (100, 1, 10), (101, 1, 20), (102, 2, 5);",
         )
         .await
-        .expect("seed authors + posts");
-    create_relationship(
-        &db.pool,
-        "RELATIONSHIP posts FROM authors.id TO posts.author_id",
-    )
-    .await
-    .expect("create posts relationship");
+        .expect("seed posts");
+    markers::hold_out_of_the_rederive_build(&client, "public.posts")
+        .await
+        .expect("hold posts' definitions out of the Re-derive build");
     install_definition(
         &db.pool,
-        "TRANSFORM author_words FROM authors SELECT SUM(posts.words) AS word_sum",
-        &HashMap::from([("id".to_string(), ValueType::Numeric)]),
+        "TRANSFORM post_words FROM posts SELECT words AS words",
+        &HashMap::from([
+            ("id".to_string(), ValueType::Numeric),
+            ("author_id".to_string(), ValueType::Numeric),
+            ("words".to_string(), ValueType::Numeric),
+        ]),
         "public",
     )
     .await
-    .expect("install_definition via the direct relationship path");
+    .expect("install_definition via the old build");
     markers::settle_builds(&db.pool).await;
     assert_eq!(
         pending_marker_count(&client).await,
-        2,
-        "one catch-up per table read"
+        1,
+        "one catch-up for the table read"
     );
 
     markers::run_pending_backfills(
@@ -174,67 +174,7 @@ async fn a_direct_builds_catch_up_re_reads_an_unchanged_table() {
     .await
     .expect("run_pending_backfills");
 
-    assert_eq!(recompute_count(&client, "public.authors").await, 3);
     assert_eq!(recompute_count(&client, "public.posts").await, 3);
-    assert_eq!(pending_marker_count(&client).await, 0);
-}
-
-/// Issue #417: the discharge skips a table no definition reads, but a table a
-/// definition reads only through a relationship still has a reader. Its marker
-/// must be enumerated, or a to-side row the definition never saw (#393's gap
-/// on a fresh install, say) would never re-derive the rows that depend on it.
-#[tokio::test]
-async fn a_table_read_only_through_a_relationship_is_still_enumerated() {
-    let cluster = testkit::TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
-
-    client
-        .batch_execute(
-            "create table public.authors (id integer primary key, name text); \
-             create table public.posts (id integer primary key, author_id integer, words integer); \
-             insert into public.authors (id, name) values (1, 'a'), (2, 'b'); \
-             insert into public.posts (id, author_id, words) values (100, 1, 10), (101, 2, 5)",
-        )
-        .await
-        .expect("seed authors + posts");
-    create_relationship(
-        &db.pool,
-        "RELATIONSHIP posts FROM authors.id TO posts.author_id",
-    )
-    .await
-    .expect("create posts relationship");
-    install_definition(
-        &db.pool,
-        "TRANSFORM author_words FROM authors SELECT SUM(posts.words) AS word_sum",
-        &HashMap::from([("id".to_string(), ValueType::Numeric)]),
-        "public",
-    )
-    .await
-    .expect("install_definition via the direct relationship path");
-    markers::settle_registrations(&db.pool).await;
-    // The build's own go-live catch-ups already enumerated both tables.
-    let before = recompute_count(&client, "public.posts").await;
-    client
-        .batch_execute("insert into public.posts (id, author_id, words) values (102, 1, 7)")
-        .await
-        .expect("write posts after the build");
-
-    capture(&mut client, &["public.posts".to_string()]).await;
-    markers::run_pending_backfills(
-        &mut client,
-        "wake",
-        &trellis::staging::StagedWatermark::saturated(),
-        std::time::Duration::ZERO,
-    )
-    .await
-    .expect("run_pending_backfills");
-
-    assert_eq!(
-        recompute_count(&client, "public.posts").await - before,
-        3,
-        "a table read through a relationship has a reader, so it is enumerated"
-    );
     assert_eq!(pending_marker_count(&client).await, 0);
 }
 
@@ -391,53 +331,6 @@ async fn a_waiting_rederive_build_beside_a_live_reader_still_enumerates() {
     assert_eq!(pending_marker_count(&client).await, 0);
     assert_eq!(
         status_of(&client, "widget_totals").await,
-        "waiting_to_backfill"
-    );
-}
-
-/// Issue #732: a waiting Re-derive build doesn't read a table its source
-/// merely has a relationship to (a definition reading through one isn't
-/// Re-derive-built yet), so a marker on that table has no reader either.
-#[tokio::test]
-async fn a_waiting_rederive_builds_related_table_is_not_enumerated() {
-    let cluster = testkit::TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
-
-    client
-        .batch_execute(
-            "create table public.authors (id integer primary key, grp text); \
-             create table public.posts (id integer primary key, author_id integer, words integer); \
-             insert into public.authors (id, grp) values (1, 'a'), (2, 'b'); \
-             insert into public.posts (id, author_id, words) values (100, 1, 10), (101, 2, 5)",
-        )
-        .await
-        .expect("seed authors + posts");
-    create_relationship(
-        &db.pool,
-        "RELATIONSHIP posts FROM authors.id TO posts.author_id",
-    )
-    .await
-    .expect("create posts relationship");
-    install_definition(
-        &db.pool,
-        "TRANSFORM authors_per_grp FROM authors GROUP BY grp WITHOUT SOURCE INDEX SELECT grp AS grp, COUNT(id) AS n",
-        &HashMap::from([
-            ("id".to_string(), ValueType::Numeric),
-            ("grp".to_string(), ValueType::Text),
-        ]),
-        "public",
-    )
-    .await
-    .expect("register a plain aggregate on authors");
-
-    capture(&mut client, &["public.posts".to_string()]).await;
-    discharge(&mut client).await;
-
-    assert_eq!(recompute_count(&client, "public.posts").await, 0);
-    assert_eq!(pending_marker_count(&client).await, 0);
-    assert_eq!(
-        status_of(&client, "authors_per_grp").await,
         "waiting_to_backfill"
     );
 }

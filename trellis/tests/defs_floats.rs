@@ -25,8 +25,8 @@
 //! 4. **Text rendering.** `trellis::float::render` must be byte-identical to
 //!    `float4out`/`float8out`, over a grid spanning both notations, both
 //!    signs, the subnormal floor and the finite ceiling.
-//! 5. **Key roles.** `real`/`double precision` are rejected as relationship
-//!    join keys, primary keys and `GROUP BY` keys — and the reason is
+//! 5. **Key roles.** `real`/`double precision` are rejected as `JOIN` `ON`
+//!    keys, primary keys and `GROUP BY` keys — and the reason is
 //!    demonstrated from the server, not asserted: `-0` and `0` are `=` but
 //!    render differently, so the engine's `::text` key matching would split
 //!    one Postgres group in two.
@@ -51,7 +51,9 @@ use trellis::defs::ast::{
     Expr, FieldDef, GroupByKey, KeySpace, Operator, Predicate, TransformDef, ValueType,
 };
 use trellis::defs::eval::{RegexCache, Row, Value, evaluate, evaluate_aggregate};
-use trellis::defs::{chunk_queue, create_relationship, install_definition, parse, validate};
+use trellis::defs::{
+    CatalogError, ValidationError, chunk_queue, install_definition, parse, validate,
+};
 use trellis::integer::IntWidth;
 
 // ---------------------------------------------------------------------
@@ -89,6 +91,24 @@ async fn connect_raw(dsn: &str) -> Client {
         .await
         .expect("set search_path");
     client
+}
+
+/// Defines a `JOIN` whose one `ON` term pairs `left.lcol` with
+/// `right.rcol`. `JOIN` key admission reads the same allowlist
+/// (`catalog::is_text_stable_join_key_type`) a 1-1 primary key does.
+async fn define_join_on(
+    pool: &trellis::pool::Pool,
+    target: &str,
+    (left, lcol): (&str, &str),
+    (right, rcol): (&str, &str),
+) -> Result<(), trellis::defs::CatalogError> {
+    let text = format!(
+        "TRANSFORM {target} FROM {left} JOIN {right} ON {left}.{lcol} = {right}.{rcol} \
+         GROUP BY {left}.id WITHOUT SOURCE INDEX SELECT COUNT(*) AS n"
+    );
+    install_definition(pool, &text, &HashMap::new(), "public")
+        .await
+        .map(|_| ())
 }
 
 /// Drives the durable backfill chunk queue to completion, standing in for a
@@ -656,7 +676,7 @@ async fn float_text_rendering_is_byte_identical_to_postgres_through_the_evaluato
 /// could not catch it: a float aggregate is `RecomputeOnly`, so the apply
 /// path probes a server-side `sum(...)` and never folds in Rust. This test
 /// drives the fold directly, which is what `defs::oracle::recompute_aggregate`
-/// (the ADR-0013 cross-check oracle) and the to-many relationship path do.
+/// (the ADR-0013 cross-check oracle) does.
 ///
 /// The `-0`-only group is the second half of the regression: Postgres's
 /// `sum(float8)` has a `NULL` initial condition, so `sum` over a group of
@@ -789,7 +809,7 @@ async fn signed_zero_is_why_float_text_keys_are_unsafe() {
     );
 }
 
-/// `real`/`double precision` are refused as relationship join keys, through
+/// `real`/`double precision` are refused as `JOIN` `ON` keys, through
 /// the same `catalog::TEXT_STABLE_JOIN_KEY_TYPES` allowlist that gates a 1-1
 /// transform's **primary key** (issue #107's "close the gap" fix) — so this
 /// is one assertion about both roles.
@@ -806,7 +826,7 @@ async fn signed_zero_is_why_float_text_keys_are_unsafe() {
 /// floats as keys is #110's typed key index to grant, by comparing decoded
 /// values through `float::compare`.
 #[tokio::test]
-async fn a_float_relationship_join_key_is_rejected_by_name() {
+async fn a_float_join_key_is_rejected_by_name() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let client = connect_raw(db.dsn()).await;
@@ -819,26 +839,27 @@ async fn a_float_relationship_join_key_is_rejected_by_name() {
              create table child (id bigint primary key, f4 real, f8 double precision, ok bigint)",
         )
         .await
-        .expect("create relationship tables");
+        .expect("create join tables");
 
     for (name, from_col, to_table, pg_name) in [
-        ("r4", "f4", "parent4", "real"),
-        ("r8", "f8", "parent8", "double precision"),
+        ("j4", "f4", "parent4", "real"),
+        ("j8", "f8", "parent8", "double precision"),
     ] {
-        let err = create_relationship(
-            &db.pool,
-            &format!("RELATIONSHIP {name} FROM child.{from_col} TO {to_table}.k"),
-        )
-        .await
-        .expect_err("a float join key must be rejected");
+        let err = define_join_on(&db.pool, name, ("child", from_col), (to_table, "k"))
+            .await
+            .expect_err("a float join key must be rejected");
         assert!(
-            err.to_string().contains(pg_name),
-            "the rejection must name the offending type ({pg_name}): {err}"
+            matches!(
+                &err,
+                CatalogError::Validate(ValidationError::JoinUnsupportedKeyType { pg_type, .. })
+                    if pg_type == pg_name
+            ),
+            "the rejection must name the offending type ({pg_name}): {err:?}"
         );
     }
 
     // The control: the gate isn't simply rejecting everything.
-    create_relationship(&db.pool, "RELATIONSHIP r_ok FROM child.ok TO parent_ok.k")
+    define_join_on(&db.pool, "j_ok", ("child", "ok"), ("parent_ok", "k"))
         .await
         .expect("a bigint join key must still be accepted");
 }

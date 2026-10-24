@@ -450,83 +450,6 @@ async fn a_pass_respects_its_budget_on_locked_tables() {
     );
 }
 
-/// A definition that reads a new column of a relationship's to-side is not
-/// dispatched until the to-side's widen has landed and its gated marker has
-/// discharged, even though its own source's capture is current: C3's
-/// documented gap ("the gate only holds definitions sourced from the gated
-/// table"), closed by the pass's readiness rules.
-#[tokio::test]
-async fn a_reader_of_a_widened_to_side_waits_for_the_to_sides_gate() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut raw = connect(db.dsn()).await;
-    raw.batch_execute(
-        "create table public.p (id int primary key, name text, tier text); \
-         create table public.c (id int primary key, pid int, amount int)",
-    )
-    .await
-    .expect("seed");
-    let trellis = definer(db.dsn()).await;
-    trellis::dev::defs::create_relationship(
-        trellis.pool(),
-        "RELATIONSHIP parent FROM c.pid TO p.id",
-    )
-    .await
-    .expect("relationship");
-    trellis
-        .apply("TRANSFORM c_named FROM public.c SELECT amount AS amount, parent.name AS name")
-        .await
-        .expect("define c_named");
-    let outcome = capture_pass(&mut raw, &db.pool, Duration::from_secs(1)).await;
-    assert!(outcome.waiting.is_empty(), "{outcome:?}");
-    let p_columns = captured_columns(&raw, "public.p")
-        .await
-        .expect("p captured");
-    assert!(!p_columns.contains(&"tier".to_string()), "{p_columns:?}");
-    // Discharge both join markers (nothing is written, so no gate holds).
-    settle(&mut raw, &db.pool, "public.p").await;
-
-    trellis
-        .apply("TRANSFORM c_tiered FROM public.c SELECT amount AS amount, parent.tier AS tier")
-        .await
-        .expect("define c_tiered");
-    let tiered = definition_id(&raw, "c_tiered").await;
-
-    // p's widen can't take its lock: c's capture is current, but the reader
-    // of p.tier isn't ready.
-    let holder = hold_table(db.dsn(), "public.p").await;
-    let outcome = capture_pass(&mut raw, &db.pool, Duration::from_millis(200)).await;
-    assert!(outcome.captured.contains("public.c"));
-    assert_eq!(outcome.waiting.len(), 1, "{outcome:?}");
-    assert!(!outcome.ready.contains(&tiered), "{outcome:?}");
-    holder.batch_execute("commit").await.expect("release p");
-
-    // The widen lands with a gated marker on p: still not ready.
-    let outcome = capture_pass(&mut raw, &db.pool, Duration::from_secs(1)).await;
-    assert!(
-        captured_columns(&raw, "public.p")
-            .await
-            .expect("p captured")
-            .contains(&"tier".to_string())
-    );
-    assert_eq!(marker_gated(&raw, "public.p").await, Some(true));
-    assert!(
-        !outcome.ready.contains(&tiered),
-        "held while p's gated marker is pending: {outcome:?}"
-    );
-    assert_eq!(
-        status(&raw, "c_tiered").await,
-        TransformStatus::WaitingToBackfill
-    );
-
-    // A whole pass discharges p's marker (nothing old is pending), and only
-    // the pass after that finds the reader ready.
-    full_pass(&mut raw, &db.pool).await;
-    assert_eq!(marker_gated(&raw, "public.p").await, None);
-    let outcome = capture_pass(&mut raw, &db.pool, Duration::from_secs(1)).await;
-    assert!(outcome.ready.contains(&tiered), "{outcome:?}");
-}
-
 /// A pass reads the tables to capture (`desired`) before it reads its
 /// catalog snapshot, so a definition registered in between is in the
 /// snapshot's waiting list while its source isn't in `desired` (#622 C5
@@ -895,7 +818,7 @@ async fn a3_join_and_drop_wait_out_an_open_writer_without_stalling_other_writers
 /// An `ON DELETE CASCADE` child's capture runs before its parent's statement
 /// trigger, whereas the WAL put the parent's delete first (#622 plan Risks).
 /// Per-key order is unaffected, and a parent/child pair read through a
-/// relationship still converges.
+/// `JOIN` still converges.
 #[tokio::test]
 async fn an_on_delete_cascade_parent_child_pair_converges() {
     let cluster = TestCluster::start();
@@ -906,19 +829,17 @@ async fn an_on_delete_cascade_parent_child_pair_converges() {
          create table public.c (id int primary key, \
              pid int references public.p (id) on delete cascade, amount int); \
          insert into public.p select g, 'p' || g from generate_series(1, 10) g; \
-         insert into public.c select g, 1 + g % 10, g from generate_series(1, 100) g;",
+         insert into public.c select g, 1 + g % 10, g from generate_series(1, 100) g; \
+         create index on public.c (pid);",
     )
     .await
     .expect("seed");
     let trellis = definer(db.dsn()).await;
-    trellis::dev::defs::create_relationship(
-        trellis.pool(),
-        "RELATIONSHIP parent FROM c.pid TO p.id",
-    )
-    .await
-    .expect("relationship");
     trellis
-        .apply("TRANSFORM c_named FROM public.c SELECT amount AS amount, parent.name AS name")
+        .apply(
+            "TRANSFORM c_named FROM public.c JOIN public.p ON c.pid = p.id GROUP BY p.name \
+             WITHOUT SOURCE INDEX SELECT p.name AS name, COUNT(*) AS n, SUM(c.amount) AS total",
+        )
         .await
         .expect("define c_named");
     trellis
@@ -950,16 +871,20 @@ async fn an_on_delete_cascade_parent_child_pair_converges() {
         .await
         .expect("converge");
 
-    let named: BTreeMap<i32, (Option<i32>, Option<String>)> = raw
-        .query("select id, amount, name from public.c_named", &[])
+    let named: BTreeMap<Option<String>, (i64, Option<i64>)> = raw
+        .query(
+            "select name, n::bigint, total::bigint from public.c_named",
+            &[],
+        )
         .await
         .expect("read c_named")
         .into_iter()
         .map(|row| (row.get(0), (row.get(1), row.get(2))))
         .collect();
-    let expected: BTreeMap<i32, (Option<i32>, Option<String>)> = raw
+    let expected: BTreeMap<Option<String>, (i64, Option<i64>)> = raw
         .query(
-            "select c.id, c.amount, p.name from public.c left join public.p on p.id = c.pid",
+            "select p.name, count(*)::bigint, sum(c.amount)::bigint \
+             from public.c join public.p on p.id = c.pid group by p.name",
             &[],
         )
         .await

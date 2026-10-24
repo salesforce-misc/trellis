@@ -2895,16 +2895,14 @@ mod tests {
         (pool, raw)
     }
 
-    /// The aggregates [`lose_groups`] builds: one a relationship endpoint,
-    /// one a `live` definition reads.
+    /// The aggregates [`lose_groups`] builds, each one a `live` definition
+    /// reads.
     const LOST_GROUP_TARGETS: [&str; 2] = ["items_by_g", "items_sum_by_g"];
 
     /// Builds [`LOST_GROUP_TARGETS`] over 24 items in 12 groups and a `NULL`
-    /// one, makes the first a relationship's from-side (so the seam feeds
-    /// it CDC-shaped rows, re-reading new images) and has a `live`
-    /// definition read the second (so it stages `Recompute`s), and then
-    /// takes every live ledger entry out of groups 2 to 11 and the `NULL`
-    /// group, as a rebuilt ledger that lost them would.
+    /// one, has a `live` definition read each (so each stages `Recompute`s),
+    /// and then takes every live ledger entry out of groups 2 to 11 and the
+    /// `NULL` group, as a rebuilt ledger that lost them would.
     async fn lose_groups(db: &testkit::TestDatabase) -> tokio_postgres::Client {
         let (pool, raw) = connect_pool(db).await;
         raw.batch_execute(
@@ -2931,22 +2929,18 @@ mod tests {
             .expect("register");
         }
         crate::intake::markers::settle_builds(&pool).await;
-        crate::defs::catalog::create_relationship(
-            &pool,
-            "RELATIONSHIP lost FROM items_by_g.g TO gs.g",
-        )
-        .await
-        .expect("make items_by_g a relationship endpoint");
-        raw.batch_execute(
-            "insert into source_table_versions (source_table, version) \
-                 values ('public.items_sum_by_g', 1) on conflict do nothing; \
-             insert into transform_definitions \
-                 (target_table, source_table, source_version, definition_text, status) \
-             values ('public.sum_reader', 'public.items_sum_by_g', 1, \
-                     'TRANSFORM sum_reader FROM items_sum_by_g SELECT total AS total', 'live')",
-        )
-        .await
-        .expect("read items_sum_by_g");
+        for target in LOST_GROUP_TARGETS {
+            raw.batch_execute(&format!(
+                "insert into source_table_versions (source_table, version) \
+                     values ('public.{target}', 1) on conflict do nothing; \
+                 insert into transform_definitions \
+                     (target_table, source_table, source_version, definition_text, status) \
+                 values ('public.{target}_reader', 'public.{target}', 1, \
+                         'TRANSFORM {target}_reader FROM {target} SELECT total AS total', 'live')"
+            ))
+            .await
+            .expect("read the target");
+        }
         for target in LOST_GROUP_TARGETS {
             let ledger = super::super::ledger::qualified_ledger_table("public", target);
             let lost = raw
@@ -3064,13 +3058,6 @@ mod tests {
         assert!(
             control_rows.iter().all(|row| row[4].is_some()),
             "every staged row carries its prior image"
-        );
-        assert!(
-            control_rows
-                .iter()
-                .any(|row| row[0].as_deref() == Some("public.items_by_g")
-                    && row[2].as_deref() == Some("delete")),
-            "the endpoint target stages CDC-shaped deletes: {control_rows:?}"
         );
         assert_eq!(
             batched_rows, control_rows,

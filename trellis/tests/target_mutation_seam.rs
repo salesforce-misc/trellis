@@ -21,7 +21,7 @@ use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::ValueType;
 use trellis::defs::{
     CatalogError, Statement, TransformStatus, alter_transform, create_definition,
-    create_relationship, install_definition, parse_statement, tables_to_capture,
+    install_definition, parse_statement, tables_to_capture,
 };
 use trellis::intake::markers;
 use trellis::integer::IntWidth;
@@ -113,9 +113,7 @@ async fn rows(raw: &Client, sql: &str) -> BTreeMap<String, String> {
 
 /// Stages one CDC change as capture would, at the current WAL insert
 /// position: a real commit LSN, after everything the test set up before it
-/// (issue #512), rather than a fake one before them all. `group_key` is
-/// what capture stamps on a relationship from-side's change: the `from_col`
-/// values its images carry.
+/// (issue #512), rather than a fake one before them all.
 async fn stage_cdc(
     raw: &mut Client,
     src_table: &str,
@@ -123,7 +121,6 @@ async fn stage_cdc(
     op: trellis::staging::CdcOp,
     old_image: Option<&str>,
     new_image: Option<&str>,
-    group_key: Option<Vec<String>>,
 ) {
     let lsn: tokio_postgres::types::PgLsn = raw
         .query_one("select pg_current_wal_insert_lsn()", &[])
@@ -143,7 +140,7 @@ async fn stage_cdc(
             origin_lsn: Some(lsn),
             src_changed: None,
             hop_gen: 0,
-            group_key,
+            group_key: None,
         }],
     )
     .await
@@ -160,7 +157,6 @@ async fn stage_order_update(raw: &mut Client, key: &str, old_image: &str, new_im
         trellis::staging::CdcOp::Update,
         Some(old_image),
         Some(new_image),
-        None,
     )
     .await;
 }
@@ -208,18 +204,14 @@ async fn setup() -> (TestCluster, TestDatabase, Client) {
     (cluster, db, raw)
 }
 
-/// A target is never captured, even while another definition reads it: its readers hear about it through the seam. Since #403 that
-/// includes a target that is a relationship endpoint, whose settled parent
-/// projection the seam's CDC-shaped rows drive.
+/// A target is never captured, even while another definition reads it: its
+/// readers hear about it through the seam.
 #[tokio::test]
-async fn a_chained_target_is_never_captured_even_as_a_relationship_endpoint() {
+async fn a_chained_target_is_never_captured() {
     let (_cluster, db, raw) = setup().await;
-    raw.batch_execute(
-        "create table public.src (id integer primary key, k integer, v numeric); \
-         create table public.reports (id integer primary key, oid integer)",
-    )
-    .await
-    .expect("create sources");
+    raw.batch_execute("create table public.src (id integer primary key, k integer, v numeric)")
+        .await
+        .expect("create the source");
     let mut columns = numeric_columns(&["id", "k", "v"]);
     // `k` is `agg`'s identity, which `hist` keys on: it must be a text-stable
     // key type, so not `numeric` (issue #371).
@@ -256,10 +248,14 @@ async fn a_chained_target_is_never_captured_even_as_a_relationship_endpoint() {
         "agg is hist's source, but a seam-only target is never captured"
     );
 
-    // A relationship endpoint is no exception. `t` is a plain 1-1 target.
-    raw.batch_execute("create table public.t (id integer primary key, doubled numeric)")
-        .await
-        .expect("create t");
+    // A `JOIN`'s joined table is no exception. `t` is a plain 1-1 target.
+    raw.batch_execute(
+        "create table public.reports (id integer primary key, oid integer); \
+         create index on public.reports (oid); \
+         create table public.t (id integer primary key, doubled numeric)",
+    )
+    .await
+    .expect("create reports and t");
     one_to_one_ledgers(&raw, &["t"]).await;
     create_definition(
         &db.pool,
@@ -268,20 +264,17 @@ async fn a_chained_target_is_never_captured_even_as_a_relationship_endpoint() {
     )
     .await
     .expect("define t");
-    create_relationship(&db.pool, "RELATIONSHIP rollup FROM reports.oid TO t.id")
-        .await
-        .expect("a relationship whose to-side is a target");
-    raw.batch_execute("create table public.report_view (id integer primary key, doubled numeric)")
-        .await
-        .expect("create report_view");
-    one_to_one_ledgers(&raw, &["report_view"]).await;
-    create_definition(
+    trellis::intake::markers::settle_registrations(&db.pool).await;
+    install_definition(
         &db.pool,
-        "TRANSFORM public.report_view FROM public.reports SELECT rollup.doubled AS doubled",
+        "TRANSFORM public.report_view FROM public.reports JOIN public.t \
+         ON reports.oid = t.id GROUP BY reports.id WITHOUT SOURCE INDEX \
+         SELECT reports.id AS id, COUNT(t.doubled) AS n",
         &numeric_columns(&["id", "oid"]),
+        "public",
     )
     .await
-    .expect("define a reader through the relationship");
+    .expect("define a JOIN whose joined table is t");
     let mut captured = tables_to_capture(&db.pool)
         .await
         .expect("tables_to_capture");
@@ -289,7 +282,7 @@ async fn a_chained_target_is_never_captured_even_as_a_relationship_endpoint() {
     assert_eq!(
         captured,
         vec!["public.reports".to_string(), "public.src".to_string()],
-        "only true sources are captured, not the endpoint target t"
+        "only true sources are captured, not the joined target t"
     );
 }
 
@@ -637,98 +630,6 @@ async fn an_altered_column_propagates_to_a_chained_reader() {
     );
 }
 
-/// A to-side change re-derives a relationship-reading aggregate, writing the
-/// aggregate target itself. Those writes have to reach a transform chained
-/// off that target like any other: before the seam, the old reverse fast
-/// path's bookkeeping was keyed differently
-/// from the reader lookup, so its writes were never propagated in the
-/// applying transaction.
-#[tokio::test]
-async fn a_reverse_relationship_write_to_an_aggregate_target_reaches_a_chained_reader() {
-    let (_cluster, db, mut raw) = setup().await;
-    raw.batch_execute(
-        "create table public.posts (id integer primary key, word_count integer); \
-         create table public.post_tags (id integer primary key, post integer, tag text); \
-         create index on public.post_tags (post); \
-         insert into public.posts values (1, 100), (2, 250); \
-         insert into public.post_tags values (10, 1, 'rust'), (11, 2, 'rust'), (12, 1, 'db')",
-    )
-    .await
-    .expect("create tables");
-    create_relationship(
-        &db.pool,
-        "RELATIONSHIP post FROM post_tags.post TO posts.id",
-    )
-    .await
-    .expect("create the relationship");
-    install_definition(
-        &db.pool,
-        "TRANSFORM public.tag_totals FROM public.post_tags GROUP BY tag \
-        WITHOUT SOURCE INDEX SELECT SUM(post.word_count) AS total_words",
-        &HashMap::from([
-            ("id".to_string(), ValueType::Numeric),
-            ("post".to_string(), ValueType::Numeric),
-            ("tag".to_string(), ValueType::Text),
-        ]),
-        "public",
-    )
-    .await
-    .expect("install tag_totals");
-    trellis::intake::markers::settle_registrations(&db.pool).await;
-    install_definition(
-        &db.pool,
-        "TRANSFORM public.tag_view FROM public.tag_totals GROUP BY tag \
-        WITHOUT SOURCE INDEX SELECT SUM(total_words) AS total_words",
-        &HashMap::from([
-            ("tag".to_string(), ValueType::Text),
-            ("total_words".to_string(), ValueType::Numeric),
-        ]),
-        "public",
-    )
-    .await
-    .expect("install tag_view");
-    trellis::intake::markers::settle_registrations(&db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
-
-    raw.execute("update public.posts set word_count = 400 where id = 1", &[])
-        .await
-        .expect("update the related post");
-    let txn = raw.transaction().await.expect("begin");
-    append(
-        &txn,
-        &[StagedChange::Cdc {
-            src_table: "public.posts".to_string(),
-            key: "1".to_string(),
-            op: trellis::staging::CdcOp::Update,
-            lsn: Some(testkit::wal_insert_lsn(&txn).await),
-            old_image: Some(r#"{"id":"1","word_count":"100"}"#.to_string()),
-            new_image: Some(r#"{"id":"1","word_count":"400"}"#.to_string()),
-            origin_lsn: None,
-            src_changed: None,
-            hop_gen: 0,
-            group_key: None,
-        }],
-    )
-    .await
-    .expect("stage the to-side update");
-    txn.commit().await.expect("commit");
-    drain_to_quiescence(&db.pool, &mut raw).await;
-
-    let expected = BTreeMap::from([
-        ("db".to_string(), "400".to_string()),
-        ("rust".to_string(), "650".to_string()),
-    ]);
-    assert_eq!(
-        rows(&raw, "select tag, total_words::text from public.tag_totals").await,
-        expected,
-    );
-    assert_eq!(
-        rows(&raw, "select tag, total_words::text from public.tag_view").await,
-        expected,
-        "tag_view must follow the reverse fast path's write to tag_totals"
-    );
-}
-
 /// A definition created through the ring path enumerates its source inside
 /// its creating transaction. When that source is another definition's
 /// target, a write to it that commits after the enumeration's read, by a
@@ -867,298 +768,6 @@ async fn resuming_a_column_across_several_chunks_propagates_every_changed_row() 
     assert_eq!(wrong, 0, "d follows every resumed row");
 }
 
-/// Issue #507: a resumed definition's rebuild writes its target outside the
-/// seam, and the target's readers have to hear of what it changed. A
-/// relationship declared on the target while it was `live` survives a
-/// pause, and a consumer reading through it doesn't read the target's table
-/// as its source. The rebuild's catch-up (`park_target_catchup_if_read`)
-/// covers it all the same, and its discharge refreshes the to-one
-/// relationship's projection the consumer reads. The consumer reports
-/// `catching_up` while the target is paused (#497).
-#[tokio::test]
-async fn a_resumed_targets_rebuild_reaches_a_relationship_consumer() {
-    let (_cluster, db, mut raw) = setup().await;
-    raw.batch_execute(
-        "create table public.orders (id integer primary key, a numeric); \
-         insert into public.orders values (1, 1), (2, 2); \
-         create table public.order_doubles (id integer primary key, x numeric); \
-         create table public.reports (id integer primary key, oid integer); \
-         insert into public.reports values (1, 1); \
-         create table public.report_view (id integer primary key, x numeric)",
-    )
-    .await
-    .expect("create tables");
-    one_to_one_ledgers(&raw, &["order_doubles", "report_view"]).await;
-    create_definition(
-        &db.pool,
-        "TRANSFORM public.order_doubles FROM public.orders SELECT a + a AS x",
-        &numeric_columns(&["id", "a"]),
-    )
-    .await
-    .expect("define order_doubles");
-    drain_to_quiescence(&db.pool, &mut raw).await;
-    markers::settle_registrations(&db.pool).await;
-    create_relationship(
-        &db.pool,
-        "RELATIONSHIP rollup FROM reports.oid TO order_doubles.id",
-    )
-    .await
-    .expect("a relationship on the live target");
-    create_definition(
-        &db.pool,
-        "TRANSFORM public.report_view FROM public.reports SELECT rollup.x AS x",
-        &numeric_columns(&["id", "oid"]),
-    )
-    .await
-    .expect("define a consumer through the relationship");
-    drain_to_quiescence(&db.pool, &mut raw).await;
-    markers::settle_registrations(&db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
-    assert_eq!(
-        rows(&raw, "select id::text, x::text from public.report_view").await,
-        BTreeMap::from([("1".to_string(), "2".to_string())]),
-        "precondition: the consumer reads the target through the relationship"
-    );
-
-    let trellis = trellis::Trellis::connect(
-        trellis::Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
-        trellis::TrellisOptions::default(),
-    )
-    .await
-    .expect("connect a define-only Trellis");
-    trellis
-        .apply("PAUSE TRANSFORM order_doubles")
-        .await
-        .expect("pause the target");
-    assert_eq!(
-        reported(&trellis, "report_view").await,
-        TransformStatus::CatchingUp,
-        "#497: a consumer reading a paused target through a relationship isn't live"
-    );
-    assert_eq!(
-        stored(&raw, "report_view").await,
-        "live",
-        "it keeps applying"
-    );
-
-    // A source change while the target is paused, staged as capture would. Its
-    // apply skips the frozen target, and the rebuild picks it up.
-    raw.execute("update public.orders set a = 100 where id = 1", &[])
-        .await
-        .expect("update the source");
-    stage_order_update(
-        &mut raw,
-        "1",
-        r#"{"id":"1","a":"1"}"#,
-        r#"{"id":"1","a":"100"}"#,
-    )
-    .await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
-
-    trellis
-        .apply("RESUME TRANSFORM order_doubles")
-        .await
-        .expect("resume the target");
-    markers::settle_registrations(&db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
-    markers::settle_registrations(&db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
-
-    let status: String = raw
-        .query_one(
-            "select status from transform_definitions where target_table = 'public.order_doubles'",
-            &[],
-        )
-        .await
-        .expect("read status")
-        .get(0);
-    assert_eq!(status, "live", "precondition: the rebuild went live");
-    assert_eq!(
-        rows(
-            &raw,
-            "select id::text, x::text from public.order_doubles order by id"
-        )
-        .await,
-        BTreeMap::from([
-            ("1".to_string(), "200".to_string()),
-            ("2".to_string(), "4".to_string()),
-        ]),
-        "precondition: the rebuild read the change"
-    );
-    assert_eq!(
-        rows(&raw, "select id::text, x::text from public.report_view").await,
-        BTreeMap::from([("1".to_string(), "200".to_string())]),
-        "the rebuild's change to the target must reach the relationship consumer"
-    );
-    assert_eq!(
-        reported(&trellis, "report_view").await,
-        TransformStatus::Live,
-        "live again once its upstream is and its catch-up has run"
-    );
-}
-
-/// Issue #507's to-one half: a consumer reading through a to-one
-/// relationship reads the relationship's settled projection, never the
-/// target, and a rebuild writes the target outside the seam that keeps the
-/// projection in step. The rebuild's catch-up refreshes it: an updated row,
-/// a row the rebuild added, and one it dropped all reach the projection, and
-/// a from-side row inserted afterwards resolves through the refreshed
-/// projection rather than the pre-pause one.
-#[tokio::test]
-async fn a_resumed_targets_rebuild_refreshes_a_to_one_projection() {
-    let (_cluster, db, mut raw) = setup().await;
-    raw.batch_execute(
-        "create table public.orders (id integer primary key, a numeric); \
-         insert into public.orders values (1, 1), (2, 2); \
-         create table public.order_doubles (id integer primary key, x numeric); \
-         create table public.reports (id integer primary key, oid integer); \
-         insert into public.reports values (1, 1), (2, 2); \
-         create table public.report_view (id integer primary key, x numeric)",
-    )
-    .await
-    .expect("create tables");
-    one_to_one_ledgers(&raw, &["order_doubles", "report_view"]).await;
-    create_definition(
-        &db.pool,
-        "TRANSFORM public.order_doubles FROM public.orders SELECT a + a AS x",
-        &numeric_columns(&["id", "a"]),
-    )
-    .await
-    .expect("define order_doubles");
-    drain_to_quiescence(&db.pool, &mut raw).await;
-    markers::settle_registrations(&db.pool).await;
-    create_relationship(
-        &db.pool,
-        "RELATIONSHIP rollup FROM reports.oid TO order_doubles.id",
-    )
-    .await
-    .expect("a to-one relationship on the live target");
-    create_definition(
-        &db.pool,
-        "TRANSFORM public.report_view FROM public.reports SELECT rollup.x AS x",
-        &numeric_columns(&["id", "oid"]),
-    )
-    .await
-    .expect("define a consumer through the relationship");
-    drain_to_quiescence(&db.pool, &mut raw).await;
-    markers::settle_registrations(&db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
-    let projection: String = raw
-        .query_one("select projection_table from relationship_projections", &[])
-        .await
-        .expect("the relationship's projection")
-        .get(0);
-    let projection_rows =
-        format!("select id::text, x::text from {DEFAULT_SCHEMA}.\"{projection}\" order by id");
-    assert_eq!(
-        rows(&raw, &projection_rows).await,
-        BTreeMap::from([
-            ("1".to_string(), "2".to_string()),
-            ("2".to_string(), "4".to_string()),
-        ]),
-        "precondition: the projection carries the target's column"
-    );
-
-    let trellis = trellis::Trellis::connect(
-        trellis::Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
-        trellis::TrellisOptions::default(),
-    )
-    .await
-    .expect("connect a define-only Trellis");
-    trellis
-        .apply("PAUSE TRANSFORM order_doubles")
-        .await
-        .expect("pause the target");
-
-    // While the target is paused: one order changes, one goes, one arrives.
-    raw.batch_execute(
-        "update public.orders set a = 100 where id = 1; \
-         delete from public.orders where id = 2; \
-         insert into public.orders values (3, 3)",
-    )
-    .await
-    .expect("change the source");
-    use trellis::staging::CdcOp;
-    stage_order_update(
-        &mut raw,
-        "1",
-        r#"{"id":"1","a":"1"}"#,
-        r#"{"id":"1","a":"100"}"#,
-    )
-    .await;
-    stage_cdc(
-        &mut raw,
-        "public.orders",
-        "2",
-        CdcOp::Delete,
-        Some(r#"{"id":"2","a":"2"}"#),
-        None,
-        None,
-    )
-    .await;
-    stage_cdc(
-        &mut raw,
-        "public.orders",
-        "3",
-        CdcOp::Insert,
-        None,
-        Some(r#"{"id":"3","a":"3"}"#),
-        None,
-    )
-    .await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
-
-    trellis
-        .apply("RESUME TRANSFORM order_doubles")
-        .await
-        .expect("resume the target");
-    markers::settle_registrations(&db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
-    markers::settle_registrations(&db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
-
-    assert_eq!(
-        rows(&raw, &projection_rows).await,
-        BTreeMap::from([
-            ("1".to_string(), "200".to_string()),
-            ("3".to_string(), "6".to_string()),
-        ]),
-        "the projection follows the rebuilt target"
-    );
-
-    // New from-side rows resolve through the projection.
-    raw.batch_execute("insert into public.reports values (3, 3), (4, 1)")
-        .await
-        .expect("insert reports");
-    for (id, oid) in [("3", "3"), ("4", "1")] {
-        stage_cdc(
-            &mut raw,
-            "public.reports",
-            id,
-            CdcOp::Insert,
-            None,
-            Some(&format!(r#"{{"id":"{id}","oid":"{oid}"}}"#)),
-            Some(vec![oid.to_string()]),
-        )
-        .await;
-    }
-    drain_to_quiescence(&db.pool, &mut raw).await;
-    assert_eq!(
-        rows(
-            &raw,
-            "select id::text, coalesce(x::text, 'null') from public.report_view"
-        )
-        .await,
-        BTreeMap::from([
-            ("1".to_string(), "200".to_string()),
-            ("2".to_string(), "null".to_string()),
-            ("3".to_string(), "6".to_string()),
-            ("4".to_string(), "200".to_string()),
-        ]),
-        "every consumer row reads the rebuilt target"
-    );
-}
-
 /// `src -> t -> d`, `d` reading `t`'s target as its source, both `live`.
 /// With `seam_fed_src`, `src` reads as another definition's target
 /// (`feed_from_a_test_definition`), so `t` takes the old chunked build and
@@ -1254,7 +863,6 @@ async fn a_chained_reader_reports_catching_up_until_its_resumed_upstream_is_live
         trellis::staging::CdcOp::Update,
         Some(r#"{"id":"1","v":"1"}"#),
         Some(r#"{"id":"1","v":"100"}"#),
-        None,
     )
     .await;
     drain_to_quiescence(&db.pool, &mut raw).await;
@@ -1415,113 +1023,63 @@ async fn seal_and_drain_once(pool: &trellis::Pool, client: &mut Client) {
         .expect("retire drained segments");
 }
 
-/// The consumer [`stale_seam_rows_drain_after_a_rebuilds_refresh`] puts on
-/// the relationship.
-enum Consumer {
-    /// `report_view`, one row per report: the image-less recompute path.
-    OneToOne,
-    /// `report_totals`, a `SUM` over it: a ledger Re-derive.
-    Aggregate,
-}
-
 /// Issue #507: seam rows for a target staged before its pause (an update and
-/// a delete) are still undrained when the rebuild's go-live catch-up
-/// refreshes the relationship's projection, and drain after it. Their images
-/// predate the rebuild, so neither may put its value back: the projection
-/// and the consumer end at the rebuilt target.
-///
-/// With `stale_last`, the stale rows drain only after everything the
-/// catch-up staged has (its enumeration, and the recomputes that fans out
-/// to), as they can when a drain worker finishes a later segment first or
-/// the rows were deferred and re-staged: they land on a consumer already
-/// re-derived from the refreshed projection. The test stages them again at
-/// their original write token once the rest is quiescent.
+/// a delete) are still undrained when the rebuild's go-live catch-up re-reads
+/// the target for its readers, and drain after it. Their images predate the
+/// rebuild, so neither may put its value back: `double_totals`, an aggregate
+/// chained off the target, ends at the rebuilt target.
 ///
 /// #625 F8a: a plain 1-1 over a captured table is the Re-derive build's,
 /// whose rebuild writes the target through the seam and parks no catch-up.
-/// The go-live catch-up's refresh this pins is the old chunked build's,
-/// which a plain 1-1 over a seam-fed source still takes, so `orders` is made
-/// to read as another definition's target (`feed_from_a_test_definition`)
-/// unless `rederive`. With `rederive` (only with `stale_last`: the rebuild's
-/// own seam rows land after the sealed stale ones, so only a replay can
-/// drain a stale row after them), the rebuild's seam rows are what refresh
-/// the projection, and the replayed stale rows must not undo them either.
-async fn stale_seam_rows_drain_after_a_rebuilds_refresh(
-    consumer: Consumer,
-    stale_last: bool,
-    rederive: bool,
-) {
-    assert!(stale_last || !rederive, "see the doc comment");
+/// The go-live catch-up this pins is the old chunked build's, which a plain
+/// 1-1 over a seam-fed source still takes, so `orders` is made to read as
+/// another definition's target (`feed_from_a_test_definition`).
+#[tokio::test]
+async fn stale_seam_rows_after_a_rebuilds_refresh_leave_an_aggregate_consumer_correct() {
     let (_cluster, db, mut raw) = setup().await;
     raw.batch_execute(
-        "create table public.orders (id integer primary key, a numeric); \
-         insert into public.orders values (1, 1), (2, 2); \
-         create table public.order_doubles (id integer primary key, x numeric); \
-         create table public.reports (id integer primary key, oid integer, grp integer); \
-         insert into public.reports values (1, 1, 1), (2, 2, 1)",
+        "create table public.orders (id integer primary key, a integer, g integer); \
+         insert into public.orders values (1, 1, 1), (2, 2, 1); \
+         create table public.order_doubles (id integer primary key, x integer, g integer)",
     )
     .await
     .expect("create tables");
     one_to_one_ledgers(&raw, &["order_doubles"]).await;
-    if !rederive {
-        markers::feed_from_a_test_definition(&raw, "public.orders")
-            .await
-            .expect("make orders read as a seam-fed source");
+    markers::feed_from_a_test_definition(&raw, "public.orders")
+        .await
+        .expect("make orders read as a seam-fed source");
+    let mut columns = numeric_columns(&["id"]);
+    for column in ["a", "g"] {
+        columns.insert(column.to_string(), ValueType::Integer(IntWidth::Int4));
     }
     create_definition(
         &db.pool,
-        "TRANSFORM public.order_doubles FROM public.orders SELECT a + a AS x",
-        &numeric_columns(&["id", "a"]),
+        "TRANSFORM public.order_doubles FROM public.orders SELECT a + a AS x, g AS g",
+        &columns,
     )
     .await
     .expect("define order_doubles");
     drain_to_quiescence(&db.pool, &mut raw).await;
     markers::settle_registrations(&db.pool).await;
-    create_relationship(
-        &db.pool,
-        "RELATIONSHIP rollup FROM reports.oid TO order_doubles.id",
-    )
-    .await
-    .expect("a to-one relationship on the live target");
-    let (text, consumer_rows) = match consumer {
-        Consumer::OneToOne => (
-            "TRANSFORM report_view FROM reports SELECT rollup.x AS x",
-            "select id::text, coalesce(x::text, 'null') from public.report_view",
-        ),
-        Consumer::Aggregate => (
-            "TRANSFORM report_totals FROM reports GROUP BY grp WITHOUT SOURCE INDEX SELECT SUM(rollup.x) AS total",
-            "select grp::text, total::text from public.report_totals",
-        ),
-    };
+    columns.insert("x".to_string(), ValueType::Integer(IntWidth::Int4));
     install_definition(
         &db.pool,
-        text,
-        &numeric_columns(&["id", "oid", "grp"]),
+        "TRANSFORM double_totals FROM order_doubles GROUP BY g WITHOUT SOURCE INDEX \
+         SELECT g AS g, SUM(x) AS total",
+        &columns,
         "public",
     )
     .await
-    .expect("define a consumer through the relationship");
+    .expect("define an aggregate chained off the target");
     drain_to_quiescence(&db.pool, &mut raw).await;
     markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut raw).await;
-    let projection: String = raw
-        .query_one("select projection_table from relationship_projections", &[])
-        .await
-        .expect("the relationship's projection")
-        .get(0);
-    let projection_rows =
-        format!("select id::text, x::text from {DEFAULT_SCHEMA}.\"{projection}\" order by id");
-    let expected_consumer = |one: &str, two: &str, total: &str| match consumer {
-        Consumer::OneToOne => BTreeMap::from([
-            ("1".to_string(), one.to_string()),
-            ("2".to_string(), two.to_string()),
-        ]),
-        Consumer::Aggregate => BTreeMap::from([("1".to_string(), total.to_string())]),
-    };
+    let double_totals = "select g::text, total::text from public.double_totals";
+    let total = |total: &str| BTreeMap::from([("1".to_string(), total.to_string())]);
     assert_eq!(
-        rows(&raw, consumer_rows).await,
-        expected_consumer("2", "4", "6"),
-        "precondition: the consumer reads the target through the relationship"
+        rows(&raw, double_totals).await,
+        total("6"),
+        "precondition: the reader reads the target"
     );
 
     // Two live writes to the target, whose seam rows then sit in a sealed
@@ -1531,21 +1089,19 @@ async fn stale_seam_rows_drain_after_a_rebuilds_refresh(
     )
     .await
     .expect("change the source");
-    use trellis::staging::CdcOp;
     stage_order_update(
         &mut raw,
         "1",
-        r#"{"id":"1","a":"1"}"#,
-        r#"{"id":"1","a":"5"}"#,
+        r#"{"id":"1","a":"1","g":"1"}"#,
+        r#"{"id":"1","a":"5","g":"1"}"#,
     )
     .await;
     stage_cdc(
         &mut raw,
         "public.orders",
         "2",
-        CdcOp::Delete,
-        Some(r#"{"id":"2","a":"2"}"#),
-        None,
+        trellis::staging::CdcOp::Delete,
+        Some(r#"{"id":"2","a":"2","g":"1"}"#),
         None,
     )
     .await;
@@ -1555,55 +1111,12 @@ async fn stale_seam_rows_drain_after_a_rebuilds_refresh(
         BTreeMap::from([("1".to_string(), "10".to_string())]),
         "precondition: the target took both writes"
     );
-    // What the seam staged for the two writes, to replay for `stale_last`.
-    let stale_rows: Vec<StagedChange> = if stale_last {
-        let slot: i16 = raw
-            .query_one("select ring_slot from segment_pointer", &[])
-            .await
-            .expect("read segment_pointer")
-            .get(0);
-        let rows = raw
-            .query(
-                &format!(
-                    "select key, op::text, lsn, old_image::text, new_image::text from seg_{slot} \
-                     where src_table = 'public.order_doubles' order by key"
-                ),
-                &[],
-            )
-            .await
-            .expect("read the seam rows");
-        assert_eq!(rows.len(), 2, "precondition: one seam row per write");
-        rows.into_iter()
-            .map(|row| StagedChange::Cdc {
-                src_table: "public.order_doubles".to_string(),
-                key: row.get(0),
-                op: match row.get::<_, String>(1).as_str() {
-                    "update" => CdcOp::Update,
-                    "delete" => CdcOp::Delete,
-                    other => panic!("unexpected seam op {other}"),
-                },
-                lsn: row.get(2),
-                old_image: row.get(3),
-                new_image: row.get(4),
-                origin_lsn: None,
-                src_changed: None,
-                hop_gen: 0,
-                group_key: None,
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-    if stale_last {
-        drain_to_quiescence(&db.pool, &mut raw).await;
-    } else {
-        trellis::staging::seal_if_active_nonempty(&mut raw, WAKE)
-            .await
-            .expect("seal the seam rows, undrained");
-    }
+    trellis::staging::seal_if_active_nonempty(&mut raw, WAKE)
+        .await
+        .expect("seal the seam rows, undrained");
 
     // Paused, the source moves on; the rebuild writes the target outside the
-    // seam, and its catch-up refreshes the projection.
+    // seam, and its catch-up re-reads it for the reader.
     let trellis = trellis::Trellis::connect(
         trellis::Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
         trellis::TrellisOptions::default(),
@@ -1615,7 +1128,7 @@ async fn stale_seam_rows_drain_after_a_rebuilds_refresh(
         .await
         .expect("pause the target");
     raw.batch_execute(
-        "update public.orders set a = 7 where id = 1; insert into public.orders values (2, 8)",
+        "update public.orders set a = 7 where id = 1; insert into public.orders values (2, 8, 1)",
     )
     .await
     .expect("change the source while paused");
@@ -1624,165 +1137,25 @@ async fn stale_seam_rows_drain_after_a_rebuilds_refresh(
         .await
         .expect("resume the target");
     markers::settle_registrations(&db.pool).await;
-    let rebuilt = BTreeMap::from([
-        ("1".to_string(), "14".to_string()),
-        ("2".to_string(), "16".to_string()),
-    ]);
     assert_eq!(
         rows(&raw, "select id::text, x::text from public.order_doubles").await,
-        rebuilt,
+        BTreeMap::from([
+            ("1".to_string(), "14".to_string()),
+            ("2".to_string(), "16".to_string()),
+        ]),
         "precondition: the rebuild read the paused changes"
     );
-    if rederive {
-        // No catch-up refreshed the projection: the rebuild's seam rows are
-        // still in the ring, and they refresh it.
-        assert_ne!(
-            rows(&raw, &projection_rows).await,
-            rebuilt,
-            "precondition: the Re-derive build ran the rebuild, parking no catch-up"
-        );
-        drain_to_quiescence(&db.pool, &mut raw).await;
-    }
-    assert_eq!(
-        rows(&raw, &projection_rows).await,
-        rebuilt,
-        "precondition: the catch-up (or, Re-derive built, the rebuild's seam rows) \
-         refreshed the projection"
-    );
 
-    // The pre-pause seam rows drain now, after the refresh.
-    if stale_last {
-        drain_to_quiescence(&db.pool, &mut raw).await;
-        markers::settle_registrations(&db.pool).await;
-        drain_to_quiescence(&db.pool, &mut raw).await;
-        assert_eq!(
-            rows(&raw, consumer_rows).await,
-            expected_consumer("14", "16", "30"),
-            "precondition: the consumer was re-derived from the refreshed projection"
-        );
-        let txn = raw.transaction().await.expect("begin");
-        append(&txn, &stale_rows)
-            .await
-            .expect("stage the stale seam rows again");
-        txn.commit().await.expect("commit");
-    }
+    // The pre-pause seam rows drain now, after the catch-up.
     drain_to_quiescence(&db.pool, &mut raw).await;
     markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut raw).await;
     assert_eq!(
-        rows(&raw, &projection_rows).await,
-        rebuilt,
-        "a seam row older than the rebuild must not put its image back"
+        rows(&raw, double_totals).await,
+        total("30"),
+        "a seam row older than the rebuild must not put its image back: the reader follows \
+         the rebuilt target"
     );
-    assert_eq!(
-        rows(&raw, consumer_rows).await,
-        expected_consumer("14", "16", "30"),
-        "the consumer follows the rebuilt target"
-    );
-}
-
-#[tokio::test]
-async fn stale_seam_rows_after_a_rebuilds_refresh_leave_a_to_one_consumer_correct() {
-    stale_seam_rows_drain_after_a_rebuilds_refresh(Consumer::OneToOne, false, false).await;
-}
-
-#[tokio::test]
-async fn stale_seam_rows_after_a_rebuilds_refresh_leave_an_aggregate_consumer_correct() {
-    stale_seam_rows_drain_after_a_rebuilds_refresh(Consumer::Aggregate, false, false).await;
-}
-
-#[tokio::test]
-async fn stale_seam_rows_drained_last_leave_a_to_one_consumer_correct() {
-    stale_seam_rows_drain_after_a_rebuilds_refresh(Consumer::OneToOne, true, false).await;
-}
-
-#[tokio::test]
-async fn stale_seam_rows_drained_last_leave_an_aggregate_consumer_correct() {
-    stale_seam_rows_drain_after_a_rebuilds_refresh(Consumer::Aggregate, true, false).await;
-}
-
-#[tokio::test]
-async fn stale_seam_rows_drained_after_a_rederive_rebuild_leave_a_to_one_consumer_correct() {
-    stale_seam_rows_drain_after_a_rebuilds_refresh(Consumer::OneToOne, true, true).await;
-}
-
-#[tokio::test]
-async fn stale_seam_rows_drained_after_a_rederive_rebuild_leave_an_aggregate_consumer_correct() {
-    stale_seam_rows_drain_after_a_rebuilds_refresh(Consumer::Aggregate, true, true).await;
-}
-
-/// Issue #507: the projection refresh diffs the whole target, so only a
-/// catch-up parked for a rewrite outside the seam asks for it
-/// (`pending_backfill.refresh_projections`). Any other marker on the target
-/// leaves the projection alone: here one the refresh would visibly repair.
-#[tokio::test]
-async fn only_a_rewrites_catch_up_refreshes_the_projection() {
-    let (_cluster, db, mut raw) = setup().await;
-    raw.batch_execute(
-        "create table public.orders (id integer primary key, a numeric); \
-         insert into public.orders values (1, 1); \
-         create table public.order_doubles (id integer primary key, x numeric); \
-         create table public.reports (id integer primary key, oid integer)",
-    )
-    .await
-    .expect("create tables");
-    one_to_one_ledgers(&raw, &["order_doubles"]).await;
-    create_definition(
-        &db.pool,
-        "TRANSFORM public.order_doubles FROM public.orders SELECT a + a AS x",
-        &numeric_columns(&["id", "a"]),
-    )
-    .await
-    .expect("define order_doubles");
-    drain_to_quiescence(&db.pool, &mut raw).await;
-    markers::settle_registrations(&db.pool).await;
-    create_relationship(
-        &db.pool,
-        "RELATIONSHIP rollup FROM reports.oid TO order_doubles.id",
-    )
-    .await
-    .expect("a to-one relationship on the live target");
-    let projection: String = raw
-        .query_one("select projection_table from relationship_projections", &[])
-        .await
-        .expect("the relationship's projection")
-        .get(0);
-    raw.batch_execute(&format!(
-        "alter table {DEFAULT_SCHEMA}.\"{projection}\" add column x numeric; \
-         update {DEFAULT_SCHEMA}.\"{projection}\" set x = 999"
-    ))
-    .await
-    .expect("put a value in the projection only a refresh would repair");
-    let projection_rows =
-        format!("select id::text, x::text from {DEFAULT_SCHEMA}.\"{projection}\" order by id");
-
-    for (refresh, expected) in [(false, "999"), (true, "2")] {
-        raw.execute(
-            "insert into pending_backfill (table_name, refresh_projections) \
-             values ('public.order_doubles', $1)",
-            &[&refresh],
-        )
-        .await
-        .expect("park a marker on the target");
-        markers::run_pending_backfills(
-            &mut raw,
-            WAKE,
-            &StagedWatermark::saturated(),
-            Duration::ZERO,
-        )
-        .await
-        .expect("discharge it");
-        assert_eq!(
-            rows(&raw, "select count(*)::text, '' from pending_backfill").await,
-            BTreeMap::from([("0".to_string(), String::new())]),
-            "precondition: the marker discharged"
-        );
-        assert_eq!(
-            rows(&raw, &projection_rows).await,
-            BTreeMap::from([("1".to_string(), expected.to_string())]),
-            "refresh_projections = {refresh}"
-        );
-    }
 }
 
 /// Seals the active segment and returns its `seg_seq`, leaving it undrained.
@@ -1815,69 +1188,58 @@ async fn drain_sealed(pool: &trellis::Pool, raw: &mut Client, seg_seq: i64) {
         .expect("retire drained segments");
 }
 
-/// Issue #754 on a seam-fed to-side, where every record takes the live-row
+/// Issue #754 on a seam-fed source, where every record takes the live-row
 /// check: a target row's delete drains after the row's re-insert reached the
 /// target, while the re-insert's seam row is still in the ring. The delete
 /// is superseded, and written from the live row it put the re-insert's
-/// values in the projection. The re-insert's seam row then folded with a
-/// later delete's into a record with no image, so that projection row
-/// outlived the target row. The live write leaves the key to the pending
-/// re-insert instead, and removes the projection row the delete would have.
+/// values in the reader. The re-insert's seam row then folded with a later
+/// delete's into a record with no image, so the reader kept a row the target
+/// no longer has. The live write leaves the key to the pending re-insert
+/// instead: `double_totals`, an aggregate chained off the target, ends
+/// without the deleted row.
 #[tokio::test]
 async fn a_superseded_seam_delete_leaves_a_key_with_a_pending_reinsert_to_that_reinsert() {
     use trellis::staging::CdcOp;
     let (_cluster, db, mut raw) = setup().await;
     raw.batch_execute(
-        "create table public.orders (id integer primary key, a numeric); \
-         insert into public.orders values (1, 1), (2, 2); \
-         create table public.order_doubles (id integer primary key, x numeric); \
-         create table public.reports (id integer primary key, oid integer); \
-         insert into public.reports values (1, 1), (2, 2); \
-         create table public.report_view (id integer primary key, x numeric)",
+        "create table public.orders (id integer primary key, a integer, g integer); \
+         insert into public.orders values (1, 1, 1), (2, 2, 1); \
+         create table public.order_doubles (id integer primary key, x integer, g integer)",
     )
     .await
     .expect("create tables");
-    one_to_one_ledgers(&raw, &["order_doubles", "report_view"]).await;
+    one_to_one_ledgers(&raw, &["order_doubles"]).await;
+    let mut columns = numeric_columns(&["id"]);
+    for column in ["a", "g"] {
+        columns.insert(column.to_string(), ValueType::Integer(IntWidth::Int4));
+    }
     create_definition(
         &db.pool,
-        "TRANSFORM public.order_doubles FROM public.orders SELECT a + a AS x",
-        &numeric_columns(&["id", "a"]),
+        "TRANSFORM public.order_doubles FROM public.orders SELECT a + a AS x, g AS g",
+        &columns,
     )
     .await
     .expect("define order_doubles");
     drain_to_quiescence(&db.pool, &mut raw).await;
     markers::settle_registrations(&db.pool).await;
-    create_relationship(
+    columns.insert("x".to_string(), ValueType::Integer(IntWidth::Int4));
+    install_definition(
         &db.pool,
-        "RELATIONSHIP rollup FROM reports.oid TO order_doubles.id",
+        "TRANSFORM double_totals FROM order_doubles GROUP BY g WITHOUT SOURCE INDEX \
+         SELECT g AS g, COUNT(*) AS n, SUM(x) AS total",
+        &columns,
+        "public",
     )
     .await
-    .expect("a to-one relationship on the live target");
-    create_definition(
-        &db.pool,
-        "TRANSFORM public.report_view FROM public.reports SELECT rollup.x AS x",
-        &numeric_columns(&["id", "oid"]),
-    )
-    .await
-    .expect("define a consumer through the relationship");
+    .expect("define an aggregate chained off the target");
     drain_to_quiescence(&db.pool, &mut raw).await;
     markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut raw).await;
-    let projection: String = raw
-        .query_one("select projection_table from relationship_projections", &[])
-        .await
-        .expect("the relationship's projection")
-        .get(0);
-    let projection_rows =
-        format!("select id::text, x::text from {DEFAULT_SCHEMA}.\"{projection}\" order by id");
-    let report_view = "select id::text, coalesce(x::text, 'null') from public.report_view";
+    let double_totals = "select g::text, n::text || ' ' || total::text from public.double_totals";
     assert_eq!(
-        rows(&raw, report_view).await,
-        BTreeMap::from([
-            ("1".to_string(), "2".to_string()),
-            ("2".to_string(), "4".to_string()),
-        ]),
-        "precondition: the consumer reads the target through the projection"
+        rows(&raw, double_totals).await,
+        BTreeMap::from([("1".to_string(), "2 6".to_string())]),
+        "precondition: the reader reads the target"
     );
 
     // Order 1's delete reaches the target, and its seam row is sealed.
@@ -1889,8 +1251,7 @@ async fn a_superseded_seam_delete_leaves_a_key_with_a_pending_reinsert_to_that_r
         "public.orders",
         "1",
         CdcOp::Delete,
-        Some(r#"{"id":"1","a":"1"}"#),
-        None,
+        Some(r#"{"id":"1","a":"1","g":"1"}"#),
         None,
     )
     .await;
@@ -1899,7 +1260,7 @@ async fn a_superseded_seam_delete_leaves_a_key_with_a_pending_reinsert_to_that_r
     let seam_delete = seal_only(&mut raw).await;
 
     // Its re-insert reaches the target, and its seam row stays in the ring.
-    raw.batch_execute("insert into public.orders values (1, 5)")
+    raw.batch_execute("insert into public.orders values (1, 5, 1)")
         .await
         .expect("re-insert order 1");
     stage_cdc(
@@ -1908,8 +1269,7 @@ async fn a_superseded_seam_delete_leaves_a_key_with_a_pending_reinsert_to_that_r
         "1",
         CdcOp::Insert,
         None,
-        Some(r#"{"id":"1","a":"5"}"#),
-        None,
+        Some(r#"{"id":"1","a":"5","g":"1"}"#),
     )
     .await;
     let source_insert = seal_only(&mut raw).await;
@@ -1939,7 +1299,7 @@ async fn a_superseded_seam_delete_leaves_a_key_with_a_pending_reinsert_to_that_r
             key: "1".to_string(),
             op: CdcOp::Delete,
             lsn: Some(lsn),
-            old_image: Some(r#"{"id":"1","x":"10"}"#.to_string()),
+            old_image: Some(r#"{"id":"1","x":"10","g":"1"}"#.to_string()),
             new_image: None,
             origin_lsn: Some(lsn),
             src_changed: None,
@@ -1953,17 +1313,9 @@ async fn a_superseded_seam_delete_leaves_a_key_with_a_pending_reinsert_to_that_r
     drain_to_quiescence(&db.pool, &mut raw).await;
 
     assert_eq!(
-        rows(&raw, &projection_rows).await,
-        BTreeMap::from([("2".to_string(), "4".to_string())]),
-        "the projection follows the target"
-    );
-    assert_eq!(
-        rows(&raw, report_view).await,
-        BTreeMap::from([
-            ("1".to_string(), "null".to_string()),
-            ("2".to_string(), "4".to_string()),
-        ]),
-        "the consumer no longer reads the deleted target row"
+        rows(&raw, double_totals).await,
+        BTreeMap::from([("1".to_string(), "1 4".to_string())]),
+        "the reader no longer counts the deleted target row"
     );
 }
 

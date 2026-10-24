@@ -1,6 +1,6 @@
 //! A deterministic stand-in for a live pipeline, shared by the chained-hop
 //! tests (`intermediate_hop_cdc.rs`, `chained_live_hops.rs`) and the
-//! mixed-case and relationship-endpoint tests.
+//! mixed-case tests.
 //!
 //! [`Pipeline::attach`] runs the staging worker's reconcile pass by hand
 //! (`trellis::client::reconcile_pass`), which installs the real capture
@@ -16,8 +16,7 @@
 //!
 //! The captured set is exactly what [`trellis::defs::tables_to_capture`]
 //! asks for, and [`Pipeline::attach`] asserts it up front: since issue #315
-//! no Trellis-owned target is ever captured, and since #375 not even one
-//! that is a relationship endpoint.
+//! no Trellis-owned target is ever captured.
 
 use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;

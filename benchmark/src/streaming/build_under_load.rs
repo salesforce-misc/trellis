@@ -164,9 +164,6 @@ pub struct BuildUnderLoad {
     /// time every statement `apply` accepts with the writers running
     /// ([`apply_latency`](super::apply_latency), #666, #625 F8b).
     pub apply_latency: bool,
-    /// `--apply-latency-big-to-side`: the audit also declares a
-    /// relationship whose to-side is the loaded source.
-    pub apply_big_to_side: bool,
 }
 
 impl BuildUnderLoad {
@@ -1077,18 +1074,7 @@ pub async fn run(cfg: BuildUnderLoad, tuning: &EngineTuning) -> BuildUnderLoadRe
 
     let apply = if cfg.apply_latency {
         assert!(cfg.one_to_one, "--apply-latency needs --one-to-one");
-        Some(
-            super::apply_latency::run(
-                db.dsn(),
-                &raw,
-                SOURCE,
-                TARGET,
-                cfg.groups,
-                cfg.apply_big_to_side,
-                cfg.build_timeout,
-            )
-            .await,
-        )
+        Some(super::apply_latency::run(db.dsn(), &raw, SOURCE, TARGET, cfg.build_timeout).await)
     } else {
         None
     };

@@ -52,7 +52,8 @@
 //! - 12, mixed pages: `family12_…`.
 //! - 13, tombstone collection before stale pages drain: `family13_…`; the
 //!   zero-cell collection's other cases follow it (a cell with no basis,
-//!   pages on the same key, partitioned sides, the batch's plan).
+//!   pages on the same key, partitioned sides, the batch's plan), then the
+//!   zero `T` groups' against pages and a build.
 //! - 14, `T` in the page's own transaction: `family14_…`.
 
 #[path = "support/drain_driver.rs"]
@@ -253,7 +254,6 @@ async fn lab_with_defaults(key: Key, kinds: &[Kind], defaults: &[(&str, &str)]) 
             ("k", int4()),
             ("x", int4()),
         ],
-        &[],
         &definitions,
         &["public.a", "public.b"],
     )
@@ -2275,7 +2275,8 @@ async fn family13_zero_cells_outlive_collection_until_their_stale_pages_drain() 
 }
 
 impl Lab {
-    /// How many zero cells (`__zero`) `kind`'s hidden table `part` holds.
+    /// How many zero cells or groups (`__zero`) `kind`'s hidden table
+    /// `part` holds.
     async fn zero_cells(&self, kind: Kind, part: &str) -> i64 {
         let hidden = self.hidden(kind, part).await;
         self.scalar(&format!("select count(*) from {hidden} where __zero"))
@@ -2285,7 +2286,7 @@ impl Lab {
     }
 
     /// Retires the drained segments and runs the tombstone pass, which
-    /// collects zero `P` and `M` cells.
+    /// collects zero `P` and `M` cells and zero `T` groups.
     async fn collect(&mut self) {
         self.d.retire().await;
         self.d.collect_tombstones().await;
@@ -2294,7 +2295,9 @@ impl Lab {
 
 /// Family 13's scenario carried on: once the stale pages have drained, the
 /// drained prefix passes the zero cells' stamp and the pass collects them
-/// (ADR-0019, as ADR-0002 R4's zero groups). The key's `J` row stays.
+/// (ADR-0019, as ADR-0002 R4's zero groups). The key's `J` row stays. The
+/// zero `T` groups the recompute left go on the first pass: `T` has no
+/// basis.
 #[tokio::test]
 async fn family13_zero_cells_go_once_the_drained_prefix_passes_their_stamp() {
     let mut lab = lab(Key::Single, &[L, I]).await;
@@ -2331,10 +2334,15 @@ async fn family13_zero_cells_go_once_the_drained_prefix_passes_their_stamp() {
     }
     let recompute = lab.d.seal().await;
     lab.d.drain(recompute, "r").await;
+    for kind in [L, I] {
+        assert_eq!(lab.zero_cells(kind, "t").await, 2, "{}", kind.name);
+    }
     lab.collect().await;
     for kind in [L, I] {
         assert_eq!(lab.zero_cells(kind, "p").await, 2, "{}: kept", kind.name);
         assert_eq!(lab.zero_cells(kind, "m").await, 1, "{}: kept", kind.name);
+        // `T` has no basis: its zero groups go whatever the prefix.
+        assert_eq!(lab.zero_cells(kind, "t").await, 0, "{}: T's go", kind.name);
     }
     lab.d.drain(stale, "stale").await;
     lab.check("the stale pages drained").await;
@@ -2466,13 +2474,13 @@ async fn zero_cell_collection_against_pages_on_the_same_key() {
     lab.check("a page behind a collection").await;
 }
 
-/// A zero-cell GC batch on `P` or `M` walks the partial `where __zero`
-/// index in the cell identity's order: its cost is the zero cells, not the
-/// cells.
+/// A zero-cell GC batch on `P` or `M`, or a zero-group batch on `T`, walks
+/// the partial `where __zero` index in the identity's order: its cost is the
+/// zero rows, not the rows.
 #[tokio::test]
 async fn the_zero_cell_gc_walks_its_index() {
     let mut lab = lab(Key::Single, &[L]).await;
-    for (part, group) in [("p", "ga"), ("m", "gb")] {
+    for (part, index) in [("p", "k_ga"), ("m", "k_gb"), ("t", "ga_gb")] {
         let hidden = lab.hidden(L, part).await;
         let (_, table) = hidden.split_once('.').expect("qualified");
         let plan =
@@ -2480,7 +2488,7 @@ async fn the_zero_cell_gc_walks_its_index() {
                 .await
                 .expect("explain");
         assert!(
-            plan.contains(&format!("Index Scan using {table}_k_{group}_idx")),
+            plan.contains(&format!("Index Scan using {table}_{index}_idx")),
             "{plan}"
         );
         assert!(!plan.contains("Seq Scan"), "{plan}");
@@ -2519,6 +2527,116 @@ async fn zero_cells_of_partitioned_sides_are_collected() {
     assert_eq!(lab.zero_cells(L, "p").await, 0);
     assert_eq!(lab.zero_cells(L, "m").await, 0);
     lab.check("partitioned sides' zero cells collected").await;
+}
+
+/// A zero `T` group is collected while no writer holds it, and a page that
+/// needs it again inserts it afresh: a page frozen holding `I`'s `T` groups
+/// (it applies its targets in target order) keeps its zero group through the
+/// pass (`skip locked`), while `L`'s, which the page has yet to lock, goes
+/// and the page's delta lands on a fresh one. A page whose `T` lock meets a
+/// zero group a collection is deleting queues behind it, then inserts the
+/// group afresh, and so does a `TRUNCATE` page's clear of `T`.
+#[tokio::test]
+async fn zero_t_group_collection_against_pages() {
+    let mut lab = lab(Key::Single, &[L, I]).await;
+    lab.step(&fill(SEED, 1, Key::Single)).await;
+    lab.step("delete from public.a where id = 101").await;
+    for kind in [L, I] {
+        assert_eq!(lab.zero_cells(kind, "t").await, 1, "{}", kind.name);
+    }
+    let revive = lab
+        .sealed("insert into public.a values (101, 11, 1, 1, 7)")
+        .await;
+    let mut frozen = lab
+        .d
+        .drain_frozen(
+            revive,
+            "x",
+            &[(PausePoint::AfterJoinTargetLock, "public.i")],
+        )
+        .await;
+    frozen.reached(PausePoint::AfterJoinTargetLock).await;
+    lab.collect().await;
+    assert_eq!(lab.zero_cells(I, "t").await, 1, "the locked group stays");
+    assert_eq!(lab.zero_cells(L, "t").await, 0, "the unlocked group goes");
+    lab.d
+        .release(&mut frozen, PausePoint::AfterJoinTargetLock)
+        .await;
+    frozen.finish().await;
+    lab.check("a page frozen through the pass").await;
+
+    // The pass's statement on `L`'s `T`, by hand, held open, first against a
+    // page, then against a `TRUNCATE` page.
+    for (context, revive) in [
+        (
+            "a page behind a collection",
+            "insert into public.a values (101, 11, 1, 1, 8)",
+        ),
+        ("a truncate page behind a collection", "truncate public.b"),
+    ] {
+        lab.step("delete from public.a where id = 101").await;
+        let t = lab.hidden(L, "t").await;
+        let collector = lab.d.user().await;
+        let collector_pid: i32 = collector
+            .query_one("select pg_backend_pid()", &[])
+            .await
+            .expect("pid")
+            .get(0);
+        collector
+            .batch_execute(&format!(
+                "begin; delete from {t} where ctid = any(array( \
+                     select ctid from {t} where __zero \
+                     order by ga, gb for update skip locked))"
+            ))
+            .await
+            .expect("claim and delete the zero group");
+        let revive = lab.sealed(revive).await;
+        let page = lab.d.drain_frozen(revive, "y", &[]).await;
+        lab.d.wait_blocked_behind(collector_pid).await;
+        collector.batch_execute("commit").await.expect("commit");
+        page.finish().await;
+        lab.check(context).await;
+    }
+}
+
+/// A build's enumeration of `T`'s groups reads without a lock, so the pass
+/// can collect a zero group between it and the build's `T` lock; the lock
+/// statement inserts the group afresh and the build's delta to it lands.
+/// Once the build holds the group, the pass skips it. Here the build repairs
+/// a fact row capture missed, whose unmatched `T` group had gone to zero.
+#[tokio::test]
+async fn zero_t_group_collection_against_a_build() {
+    for (point, kept) in [
+        (PausePoint::BeforeJoinTargetLock, 0),
+        (PausePoint::AfterJoinTargetLock, 1),
+    ] {
+        let context = format!("a build frozen at {point:?}");
+        let mut lab = seeded(Key::Single, &[L], BUILD_SEED).await;
+        lab.build().await;
+        lab.assert_built(&context).await;
+        lab.step("delete from public.a where id = 8").await;
+        assert_eq!(lab.zero_cells(L, "t").await, 1, "{context}");
+        uncaptured(
+            &lab,
+            "public.a",
+            "insert into public.a values (8, 4, 0, 8, 2)",
+        )
+        .await;
+        request_rebuild(&lab, "a").await;
+        let mut building = lab.build_frozen("sweep", &[point]).await;
+        building.reached(point).await;
+        lab.d.collect_tombstones().await;
+        assert_eq!(lab.zero_cells(L, "t").await, kept, "{context}");
+        lab.d.release(&mut building, point).await;
+        building.finish().await;
+        lab.assert_built(&context).await;
+        assert_eq!(
+            hidden_rows(&lab, L, "t", "ga, gb, __n", "where ga = 4").await,
+            ["(4,,1)"],
+            "{context}: the build's delta landed"
+        );
+        lab.check(&context).await;
+    }
 }
 
 /// A `JOIN` whose side is a partitioned root with no rows builds like any

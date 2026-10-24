@@ -8,7 +8,7 @@ use testkit::TestCluster;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::{
     CatalogError, ValidationError, ValueType, all_source_tables, chunk_queue, create_definition,
-    create_relationship, install_definition, transforms_for_source,
+    install_definition, transforms_for_source,
 };
 
 /// Runs every queued `backfill_chunks` build to completion by hand, so a
@@ -79,21 +79,6 @@ async fn create_bare_source_table(pool: &trellis::pool::Pool, name: &str) {
         .batch_execute(&format!("create table {name} (id serial primary key)"))
         .await
         .expect("create bare source table");
-}
-
-/// A table usable as either endpoint of a relationship declared by
-/// [`create_relationship`] (issue #65's `all_source_tables` tests): `id` is
-/// a serial primary key, suitable as a relationship's unique `to_col`
-/// (cardinality `ToOne`); `fk_col` is a plain, non-unique integer column of
-/// the same type family, suitable as a relationship's `from_col`.
-async fn create_bare_relationship_table(pool: &trellis::pool::Pool, name: &str) {
-    let client = pool.get().await.expect("get connection");
-    client
-        .batch_execute(&format!(
-            "create table {name} (id serial primary key, fk_col integer)"
-        ))
-        .await
-        .expect("create bare relationship table");
 }
 
 #[tokio::test]
@@ -773,44 +758,7 @@ async fn cross_join_and_partial_data_definitions_are_rejected_cleanly() {
     assert!(subscribers.is_empty());
 }
 
-/// A `<rel>.<column>` relationship path is real grammar (issue #25) that
-/// parses successfully and is now validated against catalog-resolved
-/// relationship metadata (issue #40). With no relationship named `product`
-/// declared, the head is unknown, so validation rejects it with
-/// `UnknownRelationship` — naming the offending field — rather than the
-/// old blanket "relationship paths are unsupported" rejection. This exercises
-/// that the catalog's parse-then-validate pipeline resolves relationships and
-/// routes an unknown one through validation, not a parse-time short-circuit
-/// the way `JOIN` still does.
-#[tokio::test]
-async fn a_relationship_path_to_an_unknown_relationship_is_rejected_at_validation() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-
-    let err = create_definition(
-        &db.pool,
-        "TRANSFORM t FROM s SELECT product.category_name AS x",
-        &HashMap::new(),
-    )
-    .await
-    .unwrap_err();
-
-    match err {
-        CatalogError::Validate(ValidationError::UnknownRelationship { field, rel }) => {
-            assert_eq!(field, "x");
-            assert_eq!(rel, "product");
-        }
-        other => panic!("expected an UnknownRelationship validation error, got {other:?}"),
-    }
-
-    // The rejected attempt should not have left a row behind.
-    let subscribers = transforms_for_source(&db.pool, "s")
-        .await
-        .expect("query mapping");
-    assert!(subscribers.is_empty());
-}
-
-/// Unlike `JOIN`/relationship paths, `GROUP BY` is a real, now-supported
+/// Unlike the constructs refused above, `GROUP BY` is a real, supported
 /// construct, so an aggregate definition parses successfully and instead
 /// fails at validation if its grouping column isn't a real source column —
 /// exercising that the catalog's parse-then-validate pipeline routes an
@@ -1186,12 +1134,10 @@ async fn a_concurrent_insert_racing_the_target_suffix_index_is_translated_to_a_c
     );
 }
 
-/// Issue #65, case 1: with no relationships declared at all, `all_source_tables`
-/// must still behave exactly as it did pre-#65 — just the anchor
-/// `source_table` of each registered transform. Issue #75, ADR-0011:
-/// fully-qualified, not the bare suffix this returned before.
+/// `all_source_tables` returns the anchor `source_table` of each registered
+/// transform. Issue #75, ADR-0011: fully-qualified, not a bare suffix.
 #[tokio::test]
-async fn all_source_tables_with_no_relationships_returns_only_anchor_tables() {
+async fn all_source_tables_returns_each_transforms_anchor_table() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     create_bare_source_table(&db.pool, "orders").await;
@@ -1207,97 +1153,6 @@ async fn all_source_tables_with_no_relationships_returns_only_anchor_tables() {
     let mut tables = all_source_tables(&db.pool).await.expect("query mapping");
     tables.sort();
     assert_eq!(tables, vec![qualified("orders")]);
-}
-
-/// Issue #65, case 2: a transform anchored on `a`, plus a relationship
-/// `a -> b` (`a` is `from_table`, `b` is `to_table`), must pull `b` into the
-/// result too — the CDC gap the issue reports, where a calculated field on
-/// `a` reading a relationship path into `b` needs `b`'s writes captured.
-#[tokio::test]
-async fn all_source_tables_follows_a_single_relationship_hop() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    create_bare_relationship_table(&db.pool, "a").await;
-    create_bare_relationship_table(&db.pool, "b").await;
-
-    create_definition(
-        &db.pool,
-        "TRANSFORM a_calc FROM a SELECT 1 AS x",
-        &HashMap::new(),
-    )
-    .await
-    .expect("valid definition should be stored");
-
-    create_relationship(&db.pool, "RELATIONSHIP r1 FROM a.fk_col TO b.id")
-        .await
-        .expect("valid relationship should be stored");
-
-    let mut tables = all_source_tables(&db.pool).await.expect("query mapping");
-    tables.sort();
-    assert_eq!(tables, vec![qualified("a"), qualified("b")]);
-}
-
-/// Issue #65, case 3: a multi-hop chain — relationship `a -> b` and
-/// `b -> c` — with the transform anchored only on `a`, must resolve the
-/// transitive closure, pulling in both `b` and `c`, not just the direct
-/// hop.
-#[tokio::test]
-async fn all_source_tables_follows_a_multi_hop_relationship_chain() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    create_bare_relationship_table(&db.pool, "a").await;
-    create_bare_relationship_table(&db.pool, "b").await;
-    create_bare_relationship_table(&db.pool, "c").await;
-
-    create_definition(
-        &db.pool,
-        "TRANSFORM a_calc FROM a SELECT 1 AS x",
-        &HashMap::new(),
-    )
-    .await
-    .expect("valid definition should be stored");
-
-    create_relationship(&db.pool, "RELATIONSHIP r1 FROM a.fk_col TO b.id")
-        .await
-        .expect("a -> b relationship should be stored");
-    create_relationship(&db.pool, "RELATIONSHIP r2 FROM b.fk_col TO c.id")
-        .await
-        .expect("b -> c relationship should be stored");
-
-    let mut tables = all_source_tables(&db.pool).await.expect("query mapping");
-    tables.sort();
-    assert_eq!(tables, vec![qualified("a"), qualified("b"), qualified("c")]);
-}
-
-/// Issue #65, case 4: a relationship declared on a table that is not any
-/// transform's `source_table` must not leak its `to_table` into the
-/// result — only tables reachable from an actual registered transform's
-/// anchor should appear. `x -> y` here is never seeded (neither `x` nor `y`
-/// anchors a transform), so both must be absent even though the
-/// relationship itself is validly stored; only `z`, the real transform's
-/// anchor, should come back.
-#[tokio::test]
-async fn all_source_tables_does_not_leak_relationships_unreachable_from_any_transform() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    create_bare_relationship_table(&db.pool, "x").await;
-    create_bare_relationship_table(&db.pool, "y").await;
-    create_bare_source_table(&db.pool, "z").await;
-
-    create_relationship(&db.pool, "RELATIONSHIP r1 FROM x.fk_col TO y.id")
-        .await
-        .expect("valid relationship should be stored");
-
-    create_definition(
-        &db.pool,
-        "TRANSFORM z_calc FROM z SELECT 1 AS x",
-        &HashMap::new(),
-    )
-    .await
-    .expect("valid definition should be stored");
-
-    let tables = all_source_tables(&db.pool).await.expect("query mapping");
-    assert_eq!(tables, vec![qualified("z")]);
 }
 
 /// Issue #75, ADR-0011: `all_source_tables` must return each source's own

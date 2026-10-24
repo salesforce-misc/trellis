@@ -86,7 +86,8 @@ the reclaim TTL), whether or not the drain is busy. The pass:
    group-basis aggregates and the zero `P` and `M` cells of `JOIN`s: those
    with no basis, or whose stamp the drained prefix has passed
    ([ADR-0002](../decisions/0002-async-data-flow.md) R4,
-   [ADR-0019](../decisions/0019-join-transforms.md)).
+   [ADR-0019](../decisions/0019-join-transforms.md)). A `JOIN`'s zero `T`
+   groups have no basis, so each goes once no writer holds it.
 
 So a crashed seal is recovered within its 10 s age gate plus about 5 s, and a dead
 claimant's buckets are freed within the reclaim TTL plus about 5 s. A full ring

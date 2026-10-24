@@ -23,7 +23,7 @@
 //! 3. **Render consistency.** `to_jsonb` and `::text` must agree on
 //!    `bytea`, both as bare Postgres functions and as the actual SQL
 //!    `staging::apply::row_as_text_jsonb_sql` builds (issue #248's fix).
-//! 4. **Key roles.** Relationship join keys, 1-1 primary keys and `GROUP BY`
+//! 4. **Key roles.** `JOIN` `ON` keys, 1-1 primary keys and `GROUP BY`
 //!    keys must all accept a `bytea` column.
 //! 5. **The `MIN`/`MAX` verdict.** Demonstrated, not asserted: Postgres
 //!    itself has no `min(bytea)`/`max(bytea)` aggregate despite `bytea`
@@ -48,7 +48,7 @@ use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::ValueType;
 use trellis::defs::pg_type::PgType;
 use trellis::defs::{
-    create_aggregate_target_table, create_definition, create_relationship, parse, registry,
+    create_aggregate_target_table, create_definition, install_definition, parse, registry,
     source_primary_key, validate,
 };
 use trellis::integer::IntWidth;
@@ -82,6 +82,24 @@ async fn connect_raw(dsn: &str) -> Client {
         .await
         .expect("session bootstrap");
     client
+}
+
+/// Defines a `JOIN` whose one `ON` term pairs `left.lcol` with
+/// `right.rcol`. `JOIN` key admission reads the same allowlist
+/// (`catalog::is_text_stable_join_key_type`) a 1-1 primary key does.
+async fn define_join_on(
+    pool: &trellis::pool::Pool,
+    target: &str,
+    (left, lcol): (&str, &str),
+    (right, rcol): (&str, &str),
+) -> Result<(), trellis::defs::CatalogError> {
+    let text = format!(
+        "TRANSFORM {target} FROM {left} JOIN {right} ON {left}.{lcol} = {right}.{rcol} \
+         GROUP BY {left}.id WITHOUT SOURCE INDEX SELECT COUNT(*) AS n"
+    );
+    install_definition(pool, &text, &HashMap::new(), "public")
+        .await
+        .map(|_| ())
 }
 
 /// A spread of `bytea` values chosen to hit the structural edges: the empty
@@ -331,7 +349,7 @@ async fn the_engine_s_own_row_renderer_agrees_with_text_for_bytea() {
 // 4. Key roles
 // ---------------------------------------------------------------------
 
-/// `bytea` is accepted as a relationship join key and, because both roles
+/// `bytea` is accepted as a `JOIN` `ON` key and, because both roles
 /// gate on the same `catalog::TEXT_STABLE_JOIN_KEY_TYPES` allowlist, as a
 /// 1-1 primary key too.
 #[tokio::test]
@@ -346,9 +364,9 @@ async fn bytea_join_keys_and_primary_keys_are_admitted() {
              create table child (id bigint primary key, k bytea)",
         )
         .await
-        .expect("create relationship tables");
+        .expect("create join tables");
 
-    create_relationship(&db.pool, "RELATIONSHIP r FROM child.k TO parent.k")
+    define_join_on(&db.pool, "j", ("child", "k"), ("parent", "k"))
         .await
         .unwrap_or_else(|e| panic!("a bytea column must be accepted as a join key: {e}"));
 

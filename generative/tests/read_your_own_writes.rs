@@ -44,11 +44,12 @@
 //! astronomically lower than any one attempt doing so.
 
 use generative::backend::{Backend, ManualBackend};
-use generative::generate::{
-    DefShape, RelFieldKind, RelFieldSpec, TableSpec, build_program,
-    build_program_multi_with_relationships,
+use generative::generate::build_program;
+use generative::generate::join::{
+    FROM_TABLE, JOINED_TABLE, JoinDefSpec, JoinField, JoinGroups, JoinKey, join_definition,
+    join_tables,
 };
-use generative::model::{Op, OpOutcome};
+use generative::model::{Op, OpOutcome, Program, group_key};
 use generative::run::check_program;
 use testkit::TestCluster;
 use trellis::{Config, Pool};
@@ -163,63 +164,60 @@ async fn reading_without_quiesce_can_observe_state_that_has_not_caught_up_yet() 
     );
 }
 
-/// Read-your-own-writes across a **relationship** (issue #34, ADR-0006).
+/// Read-your-own-writes across a `JOIN` (#1113).
 ///
 /// The positive half of the property, on the shape that makes it hardest:
-/// the write lands on the *related* row, not on the row whose derived value
-/// changes. Trellis has to resolve — from the dependency graph — which
-/// definitions read the changed table, find the referencing rows by join
-/// key, and re-derive them (ADR-0006's reverse propagation), all
-/// asynchronously. So `quiesce()`'s promise here covers a write the client
-/// never made against the target's own source table at all.
-///
-/// Both cardinalities are exercised in one program: `d0` reads `t1` through
-/// a to-one enrichment, `d1` reads `t1` through a to-many aggregate. One
-/// update to a single `t1` row must, after one `quiesce()`, be visible in
-/// both.
+/// the write lands on the *joined* table, not on the definition's `FROM`
+/// table. Trellis has to find the `FROM` rows that join the changed row and
+/// re-derive their groups, all asynchronously. So `quiesce()`'s promise here
+/// covers a write the client never made against the definition's `FROM`
+/// table at all.
 #[tokio::test(flavor = "multi_thread")]
-async fn awaiting_after_a_write_to_a_related_row_makes_the_enrichment_visible() {
+async fn awaiting_after_a_write_to_a_joined_row_makes_it_visible() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
 
-    let spec = |seeds: Vec<(Option<i64>, Option<i64>)>, fks: Vec<Option<String>>| {
-        let n = seeds.len();
-        TableSpec {
-            seed_values: seeds,
-            text_values: vec![None; n],
-            bool_values: vec![None; n],
-            uuid_values: vec![None; n],
-            grain_values: vec![None; n],
-            rel_fk_values: fks,
-            mutates: Vec::new(),
-        }
+    let insert = |table: &str, row: &[(&str, &str)]| Op::Insert {
+        table: table.to_string(),
+        row: row
+            .iter()
+            .map(|(column, value)| (column.to_string(), Some(value.to_string())))
+            .collect(),
+        expect: OpOutcome::Succeeds,
     };
-
-    let program = build_program_multi_with_relationships(
-        // `t1`'s key column is `k1` (derived from its pk), so `t0`'s first
-        // row joins to it both ways: `t0.fk = "k1"` for the to-one
-        // direction, and `t1.fk = "k1"` (matching `t0`'s own key) for the
-        // to-many one.
-        &[
-            spec(vec![(Some(1), Some(2))], vec![Some("k1".to_string())]),
-            spec(vec![(Some(10), Some(0))], vec![Some("k1".to_string())]),
-        ],
-        &[(0, DefShape::OneToOne), (0, DefShape::OneToOne)],
-        &[None, None],
-        &[
-            Some(RelFieldSpec {
-                to_table: 1,
-                kind: RelFieldKind::ToOneBare,
-            }),
-            Some(RelFieldSpec {
-                to_table: 1,
-                kind: RelFieldKind::ToManyAggregate(generative::generate::RelAggregateFn::Sum),
-            }),
-        ],
+    // One `ja` row in group `ga = 0` joining one `jb` row on `k = 1`.
+    let def = join_definition(
+        "j0",
+        &JoinDefSpec {
+            left: true,
+            key: JoinKey::Single,
+            groups: JoinGroups::From,
+            fields: vec![JoinField::SumY],
+        },
     );
-
-    let related_table = program.tables[1].name.clone();
-    let related_c1 = program.tables[1].columns[1].name.clone();
+    let program = Program {
+        tables: join_tables(),
+        defs: vec![def],
+        def_install_after_op: vec![0],
+        ops: vec![
+            insert(
+                FROM_TABLE,
+                &[("id", "1"), ("ga", "0"), ("t", "0"), ("k", "1"), ("x", "1")],
+            ),
+            insert(
+                JOINED_TABLE,
+                &[
+                    ("id", "1"),
+                    ("t", "0"),
+                    ("k", "1"),
+                    ("gb", "0"),
+                    ("y", "10"),
+                ],
+            ),
+        ],
+        restart_after_ops: Vec::new(),
+        scale_out_after_ops: Vec::new(),
+    };
 
     let mut backend = ManualBackend::connect(db.dsn())
         .await
@@ -232,43 +230,37 @@ async fn awaiting_after_a_write_to_a_related_row_makes_the_enrichment_visible() 
     }
     backend.quiesce().await.expect("quiesce after seeding");
 
-    // The write: a *related* row changes. Nothing touches `t0`, yet both of
-    // `t0`'s targets must move.
+    // The write: the *joined* row changes. Nothing touches `ja`, yet the
+    // group it feeds must move.
     let update = Op::Update {
-        table: related_table,
+        table: JOINED_TABLE.to_string(),
         pk: "1".to_string(),
-        changes: vec![(related_c1, Some("777".to_string()))],
+        changes: vec![("y".to_string(), Some("777".to_string()))],
         expect: OpOutcome::Succeeds,
     };
     backend
         .apply(&update)
         .await
-        .expect("update to the related row must succeed");
+        .expect("update to the joined row must succeed");
     backend
         .quiesce()
         .await
-        .expect("quiesce must cover reverse propagation, not just forward");
+        .expect("quiesce must cover a write to the joined table, not just the FROM table");
 
     let snapshot = backend.snapshot().await.expect("snapshot after quiesce");
     assert_eq!(
-        snapshot[&program.defs[0].target]["1"]["rel_enrich"],
-        Some("777.00".to_string()),
-        "the to-one enrichment must reflect the related row's new value after quiesce: \
-         {snapshot:#?}"
-    );
-    assert_eq!(
-        snapshot[&program.defs[1].target]["1"]["rel_agg"],
-        Some("777.00".to_string()),
-        "the to-many aggregate must reflect the related row's new value after quiesce: \
+        snapshot["j0"][&group_key(&[Some("0".to_string())])]["sy"],
+        Some("777".to_string()),
+        "the JOIN's aggregate must reflect the joined row's new value after quiesce: \
          {snapshot:#?}"
     );
 
-    // And the full oracle agrees, not just the two cells spelled out above.
+    // And the full oracle agrees, not just the cell spelled out above.
     let divergence = check_program(&pool, &program, &snapshot)
         .await
         .expect("oracle check must run");
     assert!(
         divergence.is_empty(),
-        "after quiesce, every relationship-enriched target must match the oracle: {divergence:?}"
+        "after quiesce, the JOIN target must match the oracle: {divergence:?}"
     );
 }

@@ -108,7 +108,6 @@ pub async fn run_convergence_concurrent<B: ConcurrentBackend>(
     backend
         .install(&Program {
             tables: program.tables.clone(),
-            relationships: program.relationships.clone(),
             defs: installed.clone(),
             def_install_after_op: vec![0; installed.len()],
             ops: Vec::new(),

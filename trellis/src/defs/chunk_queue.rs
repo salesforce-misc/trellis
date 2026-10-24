@@ -2799,16 +2799,14 @@ mod tests {
     /// Issue #434: a chunk held across a pause and a completed resume must
     /// not write the target once the rebuild has finished. By then the
     /// target is applying (`catching_up`, then `live`), so readers can attach
-    /// to it, here a relationship declared on it in that gap, and they only
-    /// learn of its changes through the target-mutation seam, which a
-    /// chunk's write bypasses.
+    /// to it (a definition chained on it), and they only learn of its changes
+    /// through the target-mutation seam, which a chunk's write bypasses.
     ///
     /// The source row changed after the rebuild read it, and its streamed
     /// delta hasn't drained yet. Had the held chunk written the new value,
     /// that delta's apply would find the target already current, write
-    /// nothing and stage nothing for the relationship's consumers, and so
-    /// would the discharge of the source's catch-up: they would keep the old
-    /// value for good.
+    /// nothing and stage nothing for its readers, and so would the discharge
+    /// of the source's catch-up: they would keep the old value for good.
     #[tokio::test]
     async fn a_chunk_held_across_a_completed_resume_writes_nothing() {
         let cluster = testkit::TestCluster::start();
@@ -2838,21 +2836,6 @@ mod tests {
             .await
             .expect("finish rebuild chunk");
         assert_eq!(status_of(&raw, id).await, "catching_up");
-
-        // A relationship on the rebuilt target, declared in the gap: the
-        // target is applying, so `create_relationship` accepts it.
-        raw.batch_execute(
-            "create table public.reports (id bigint primary key, oid bigint); \
-             insert into public.reports values (1, 1)",
-        )
-        .await
-        .expect("seed the relationship's from-side");
-        catalog::create_relationship(
-            &pool,
-            "RELATIONSHIP rollup FROM reports.oid TO order_doubles.id",
-        )
-        .await
-        .expect("declare a relationship on the rebuilt target");
 
         // A source change whose streamed delta hasn't drained yet.
         raw.execute("update public.orders set a = 100 where id = 1", &[])

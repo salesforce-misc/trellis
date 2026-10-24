@@ -24,7 +24,7 @@ mod restore;
 mod two_instance;
 
 pub use concurrent::{ConcurrentRun, run_convergence_concurrent};
-pub use coverage::{ConcurrentShape, Coverage, HOT_WRITES, RelPath};
+pub use coverage::{ConcurrentShape, Coverage, HOT_WRITES};
 pub use db_admin::run_convergence_with_db_admin;
 pub use noise::run_convergence_with_noise;
 pub use restore::{check_no_pause_after_restore, run_convergence_with_restore};
@@ -275,12 +275,6 @@ pub async fn run_convergence<B: Backend>(
     let install_result = backend
         .install(&Program {
             tables: program.tables.clone(),
-            // Issue #34: every relationship installs once, up front,
-            // alongside the tables — ahead of *any* definition, including
-            // one deferred to mid-stream (task E2), since a definition
-            // naming an undeclared relationship is rejected at validation
-            // time and an install rejection is a hard failure, never a skip.
-            relationships: program.relationships.clone(),
             defs: initial_defs.clone(),
             def_install_after_op: vec![0; initial_defs.len()],
             ops: Vec::new(),
@@ -308,8 +302,6 @@ pub async fn run_convergence<B: Backend>(
                 backend
                     .install(&Program {
                         tables: Vec::new(),
-                        // Already installed with the tables above.
-                        relationships: Vec::new(),
                         defs: due.clone(),
                         def_install_after_op: vec![0; due.len()],
                         ops: Vec::new(),

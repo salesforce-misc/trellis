@@ -37,8 +37,7 @@ struct Instance {
 }
 
 /// A database with `public.p` (3 rows) and `public.c` (6 rows, `pid`
-/// referencing `p`), a relationship `parent FROM c.pid TO p.id`, and the
-/// given definitions, live.
+/// referencing `p`) and the given definitions, live.
 async fn instance(cluster: &TestCluster, definitions: &[&str]) -> Instance {
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
@@ -59,12 +58,6 @@ async fn instance(cluster: &TestCluster, definitions: &[&str]) -> Instance {
     )
     .await
     .expect("connect");
-    trellis::dev::defs::create_relationship(
-        trellis.pool(),
-        "RELATIONSHIP parent FROM c.pid TO p.id",
-    )
-    .await
-    .expect("declare a relationship");
     for definition in definitions {
         trellis.apply(definition).await.expect("define");
     }
@@ -220,16 +213,17 @@ async fn attaching_a_source_as_a_partition_pauses_its_readers() {
     it.trellis.shutdown().await.expect("shutdown");
 }
 
-/// A relationship's to-side that becomes an inheritance child pauses the
-/// definition that reads through the relationship, and one that becomes an
-/// inheritance parent pauses its own reader.
+/// A `JOIN`'s joined table that becomes an inheritance child pauses the
+/// definition that joins it, and a source that becomes an inheritance parent
+/// pauses its own reader.
 #[tokio::test]
 async fn an_inheritance_child_or_parent_pauses_its_readers() {
     let cluster = TestCluster::start();
     let mut it = instance(
         &cluster,
         &[
-            "TRANSFORM c_named FROM public.c SELECT amount AS amount, parent.name AS name",
+            "TRANSFORM c_named FROM public.c JOIN public.p ON c.pid = p.id GROUP BY p.name \
+             WITHOUT SOURCE INDEX SELECT p.name AS name, SUM(c.amount) AS total",
             "TRANSFORM c_copy FROM public.c SELECT amount AS amount",
         ],
     )
@@ -240,7 +234,7 @@ async fn an_inheritance_child_or_parent_pauses_its_readers() {
              alter table public.p inherit public.p_base",
         )
         .await
-        .expect("make the to-side an inheritance child");
+        .expect("make the joined table an inheritance child");
     capture_pass(&mut it.raw, &it.db.pool).await;
     assert_paused(
         &it.trellis,

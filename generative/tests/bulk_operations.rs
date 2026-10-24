@@ -123,7 +123,6 @@ async fn truncating_a_nonempty_table_classifies_as_succeeds_not_affects_no_rows(
     let table = Table::new(&mut pool, &[ValueType::Numeric]);
     let program = Program {
         tables: vec![table.clone()],
-        relationships: Vec::new(),
         defs: Vec::new(),
         def_install_after_op: Vec::new(),
         ops: Vec::new(),

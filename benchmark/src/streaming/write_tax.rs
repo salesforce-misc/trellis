@@ -24,14 +24,6 @@
 //!   `trigger+column-check-guard`. C4's benchmark-only Q2 variants
 //!   (`trigger+exception`, `trigger+column-check`, `-guard`, `-txn`) went
 //!   with the decision.
-//! - `trigger+to-side`: `trigger` on a table that is also a relationship's
-//!   to-side, joined on a non-key column: `wt_src` gains `grp bigint
-//!   generated always as (id % 1024) stored`, and `RELATIONSHIP wt_rel FROM
-//!   wt_kid.ref TO wt_src.grp` (a to-many) points at it. This is the capture
-//!   a to-side whose `to_col` isn't its primary key gets (#784, #785). Its
-//!   images carry `grp` beside `trigger`'s columns, and the generated column
-//!   costs the writer a little too, so compare it with itself across
-//!   commits rather than with `trigger`.
 //!
 //! Shapes ([`Shape::parse`]):
 //!
@@ -136,25 +128,14 @@ pub enum Variant {
     Btree,
     RegexIndex,
     Trigger,
-    TriggerToSide,
 }
 
-/// Every variant but `trigger+to-side`, which only relationship work asks
-/// for.
-pub const DEFAULT_VARIANTS: [Variant; 4] = [
-    Variant::None,
-    Variant::Btree,
-    Variant::RegexIndex,
-    Variant::Trigger,
-];
-
 impl Variant {
-    pub const ALL: [Variant; 5] = [
+    pub const ALL: [Variant; 4] = [
         Variant::None,
         Variant::Btree,
         Variant::RegexIndex,
         Variant::Trigger,
-        Variant::TriggerToSide,
     ];
 
     pub fn name(self) -> &'static str {
@@ -163,7 +144,6 @@ impl Variant {
             Variant::Btree => "btree",
             Variant::RegexIndex => "regex-index",
             Variant::Trigger => "trigger",
-            Variant::TriggerToSide => "trigger+to-side",
         }
     }
 
@@ -181,7 +161,7 @@ impl Variant {
     /// Captures, writing ring rows inside the writer's transaction, so the
     /// ring must end up holding every row.
     fn captures(self) -> bool {
-        matches!(self, Variant::Trigger | Variant::TriggerToSide)
+        self == Variant::Trigger
     }
 }
 
@@ -1124,7 +1104,7 @@ pub async fn set_up_variant(variant: Variant, table: &str, raw: &mut RawClient) 
             .await
             .expect("create the expression index");
         }
-        Variant::Trigger | Variant::TriggerToSide => {
+        Variant::Trigger => {
             let table = format!("public.{table}");
             let catalog = trellis::dev::capture::load_catalog(&*raw, DEFAULT_SCHEMA)
                 .await
@@ -1163,21 +1143,6 @@ pub async fn run_cell(
     .expect("create the source table");
     // The same catalog for every variant: one transform reading `val`.
     install_chain_hops(&db.pool, SOURCE_TABLE, 1).await;
-    if variant == Variant::TriggerToSide {
-        raw.batch_execute(&format!(
-            "alter table public.{SOURCE_TABLE} \
-                 add column grp bigint generated always as (id % 1024) stored; \
-             create table public.wt_kid (id bigint primary key, ref bigint)"
-        ))
-        .await
-        .expect("create the to_col and the from-side table");
-        trellis::dev::defs::create_relationship(
-            &db.pool,
-            &format!("RELATIONSHIP wt_rel FROM wt_kid.ref TO {SOURCE_TABLE}.grp"),
-        )
-        .await
-        .expect("declare the relationship onto the source table");
-    }
     match shape.kind {
         Kind::Batch {
             write: Write::Update,

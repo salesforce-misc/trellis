@@ -36,7 +36,7 @@
 //! table name resolves the same way `recompute` relies on.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
 use trellis::IntWidth;
@@ -47,7 +47,7 @@ use trellis::dev::defs::registry;
 use trellis::dev::defs::typed_literal;
 use trellis::numeric::Numeric;
 
-use crate::model::{Cardinality, Program, Relationship, Table, group_key};
+use crate::model::{Program, group_key};
 
 /// One logical target's rows: `pk (rendered text) -> column -> value
 /// (rendered text, `None` is SQL `NULL`)`. Matches the inner shape of
@@ -258,10 +258,9 @@ pub struct ThreeWayReport {
     /// `evaluator ≠ SQL oracle` — an eval-layer drift bug (ADR-0004's
     /// "immutable subset of Postgres's" semantics, tested directly).
     pub evaluator_vs_sql: Vec<Divergence>,
-    /// Whether the evaluator leg ran at all (issue #34). `false` for a
-    /// relationship-reading definition and for a `JOIN` (#1113), where the
-    /// engine's evaluator-driven recompute has nothing to compare against —
-    /// see [`check`] for the full reasoning. An empty `evaluator_vs_sql` means
+    /// Whether the evaluator leg ran at all. `false` for a `JOIN` (#1113),
+    /// where the engine's evaluator-driven recompute has nothing to compare
+    /// against — see [`check`]. An empty `evaluator_vs_sql` means
     /// "agreed" when this is `true` and "never asked" when it is `false`,
     /// and the two must never be confused for each other.
     pub evaluator_checked: bool,
@@ -281,11 +280,7 @@ impl fmt::Display for ThreeWayReport {
             return if self.evaluator_checked {
                 write!(f, "no divergence")
             } else {
-                write!(
-                    f,
-                    "no divergence (evaluator leg not run: relationship-reading or JOIN \
-                     definition)"
-                )
+                write!(f, "no divergence (evaluator leg not run: JOIN definition)")
             };
         }
         if !self.target_vs_sql.is_empty() {
@@ -309,9 +304,8 @@ impl fmt::Display for ThreeWayReport {
         if !self.evaluator_checked {
             writeln!(
                 f,
-                "(evaluator leg not run: this definition reads a relationship or is a JOIN, \
-                 which the engine's evaluator-driven recompute does not support — see \
-                 oracle::check)"
+                "(evaluator leg not run: this definition is a JOIN, which the engine's \
+                 evaluator-driven recompute does not support — see oracle::check)"
             )?;
         }
         write!(f, "program:\n{}", self.program)
@@ -343,8 +337,9 @@ fn quote_ident(ident: &str) -> String {
 /// syntax (the fallthrough `FunctionCall` arm below) except `COUNT`'s
 /// argument-less `COUNT(*)`, which the grammar's AST carries with an empty
 /// `args` list — special-cased so it doesn't fall through to the generic arm
-/// and emit the invalid `count()`. Anything still beyond that (a relationship
-/// path) panics naming the missing work rather than guessing (design doc §2
+/// and emit the invalid `count()`. Anything still beyond that (a path into
+/// another table, which only a `JOIN` reads, rendered by
+/// [`render_join_select`] instead) panics naming the missing work rather than guessing (design doc §2
 /// "refuse to guess"), so a future widening fails loudly instead of emitting
 /// a false differential.
 ///
@@ -390,309 +385,9 @@ fn render_expr(expr: &Expr) -> String {
             format!("{}({})", name.to_lowercase(), rendered_args.join(", "))
         }
         Expr::RelationshipPath { rel, column } => panic!(
-            "oracle: relationship-path rendering ('{rel}.{column}') is out of scope for this \
-             generator (issue #25 is grammar + AST only; no generator support yet); extend \
-             `render_expr` when the generator emits it"
+            "oracle: a path into another table ('{rel}.{column}') outside a JOIN — a generator \
+             bug; a JOIN definition renders through `render_join_select`"
         ),
-    }
-}
-
-/// Every relationship a [`Program`] declares, indexed by name, alongside the
-/// tables needed to type a to-side column (issue #34).
-///
-/// Built from the [`Program`]'s own plain data — this oracle never asks the
-/// engine's catalog what a relationship resolves to, exactly as it never asks
-/// the engine's renderer what a definition's SQL is (design doc §2: the
-/// oracle's whole value is sharing no code with the thing it checks). If the
-/// generator's recorded [`Cardinality`] and the engine's live `pg_catalog`
-/// introspection ever disagreed, the resulting divergence is a real finding,
-/// not a harness artifact.
-struct RelIndex<'a> {
-    by_name: HashMap<&'a str, &'a Relationship>,
-    tables: &'a [Table],
-}
-
-impl<'a> RelIndex<'a> {
-    fn new(program: &'a Program) -> Self {
-        RelIndex {
-            by_name: program
-                .relationships
-                .iter()
-                .map(|r| (r.name.as_str(), r))
-                .collect(),
-            tables: &program.tables,
-        }
-    }
-
-    /// The relationship `name` denotes. A referenced-but-undeclared
-    /// relationship is a generator bug (the engine would have rejected the
-    /// definition at validation time), so this panics rather than guessing —
-    /// design doc §2's "refuse to guess on unmodeled shapes".
-    fn get(&self, name: &str) -> &'a Relationship {
-        self.by_name.get(name).copied().unwrap_or_else(|| {
-            panic!(
-                "oracle: calculated field references relationship {name:?}, which the program \
-                 does not declare — a generator bug (the engine rejects an unknown relationship \
-                 at validation time, so this program could never have installed)"
-            )
-        })
-    }
-
-    /// The [`ValueType`] of `column` on `rel`'s to-side table.
-    fn to_column_type(&self, rel: &str, column: &str) -> ValueType {
-        let relationship = self.get(rel);
-        self.tables
-            .iter()
-            .find(|t| t.name == relationship.to_table)
-            .and_then(|t| t.column_type(column))
-            .unwrap_or_else(|| {
-                panic!(
-                    "oracle: relationship path '{rel}.{column}' names a column the to-side table \
-                     {:?} does not declare — a generator bug",
-                    relationship.to_table
-                )
-            })
-    }
-}
-
-/// Whether any of `def`'s calculated fields reads a relationship path at all
-/// (issue #34). Drives two decisions: which `SELECT` renderer to use, and
-/// whether the evaluator leg of the three-way comparison can run at all (see
-/// [`check`]).
-fn uses_relationships(def: &TransformDef) -> bool {
-    def.fields.iter().any(|f| expr_reads_relationship(&f.expr))
-}
-
-fn expr_reads_relationship(expr: &Expr) -> bool {
-    match expr {
-        Expr::RelationshipPath { .. } => true,
-        Expr::Column(_)
-        | Expr::SourceColumn { .. }
-        | Expr::NumberLiteral(_)
-        | Expr::StringLiteral(_)
-        | Expr::TypedLiteral { .. } => false,
-        Expr::BinaryOp { lhs, rhs, .. } => {
-            expr_reads_relationship(lhs) || expr_reads_relationship(rhs)
-        }
-        Expr::FunctionCall { args, .. } => args.iter().any(expr_reads_relationship),
-    }
-}
-
-/// Collects every **to-one** relationship name `expr` reads, in sorted order
-/// (issue #34) — each one needs its own `LEFT JOIN` in the rendered `SELECT`.
-///
-/// A *to-many* path contributes no join: it renders as a correlated
-/// subquery, which brings its own `FROM`. Note this walks *into* an aggregate
-/// call rather than stopping at one, because a to-one path wrapped in an
-/// aggregate (`SUM(<rel>.<col>)` inside a `GROUP BY` definition) is still an
-/// ordinary aggregate over the joined column and still needs the join —
-/// cardinality, not syntactic position, is what decides.
-fn collect_join_rels<'a>(expr: &'a Expr, rels: &RelIndex<'_>, out: &mut BTreeSet<&'a str>) {
-    match expr {
-        Expr::RelationshipPath { rel, .. } => {
-            if rels.get(rel).cardinality == Cardinality::ToOne {
-                out.insert(rel.as_str());
-            }
-        }
-        Expr::Column(_)
-        | Expr::SourceColumn { .. }
-        | Expr::NumberLiteral(_)
-        | Expr::StringLiteral(_)
-        | Expr::TypedLiteral { .. } => {}
-        Expr::BinaryOp { lhs, rhs, .. } => {
-            collect_join_rels(lhs, rels, out);
-            collect_join_rels(rhs, rels, out);
-        }
-        Expr::FunctionCall { args, .. } => {
-            for arg in args {
-                collect_join_rels(arg, rels, out);
-            }
-        }
-    }
-}
-
-/// Renders one calculated-field expression of a relationship-reading
-/// definition (issue #34). Like [`render_expr`], but:
-///
-/// * every **source** column is qualified with the source table, so it can't
-///   be ambiguous against a `LEFT JOIN`ed to-side column of the same name
-///   (every generated table uses the same `c0`, `c1`, ... name pool, so this
-///   is the common case, not a corner one);
-/// * a **to-one** path reads off the join alias — the relationship's own
-///   name, which can never collide with a table name (`r0` vs `t0`);
-/// * a **to-many** path, always wrapped in exactly one aggregate, becomes a
-///   correlated aggregate subquery over the to-side table filtered by the
-///   join key.
-///
-/// The nullability contract falls out of plain Postgres semantics rather than
-/// being special-cased, which is exactly why the oracle is a `SELECT`: an
-/// unmatched or `NULL` foreign key leaves a `LEFT JOIN`'s to-side columns
-/// `NULL` (so a to-one enrichment is `NULL` and the source row survives), and
-/// an empty correlated set gives `count → 0` with `sum`/`min`/`max`/`avg →
-/// NULL`. This oracle agrees with ADR-0006 because Postgres does, not because
-/// it copied the engine's answer.
-///
-/// # Panics
-///
-/// On a bare to-many path or an aggregate wrapping something other than a
-/// single path — shapes `defs::validate` rejects, which the generator
-/// therefore never emits. Refusing to guess (design doc §2) keeps a future
-/// widening a loud failure rather than a silent false differential.
-fn render_rel_expr(expr: &Expr, source: &str, rels: &RelIndex<'_>) -> String {
-    match expr {
-        Expr::Column(name) | Expr::SourceColumn { column: name, .. } => {
-            format!("{}.{}", quote_ident(source), quote_ident(name))
-        }
-        Expr::NumberLiteral(text) => text.clone(),
-        Expr::StringLiteral(text) => format!("'{}'::text", text.replace('\'', "''")),
-        Expr::TypedLiteral { value_type, text } => typed_literal::render_sql(*value_type, text),
-        Expr::BinaryOp { op, lhs, rhs } => {
-            let symbol = match op {
-                Operator::Add => "+",
-                Operator::GreaterThan => ">",
-            };
-            format!(
-                "({} {symbol} {})",
-                render_rel_expr(lhs, source, rels),
-                render_rel_expr(rhs, source, rels)
-            )
-        }
-        Expr::RelationshipPath { rel, column } => {
-            let relationship = rels.get(rel);
-            assert_eq!(
-                relationship.cardinality,
-                Cardinality::ToOne,
-                "oracle: bare reference to to-many relationship path '{rel}.{column}' — \
-                 ADR-0006 requires a to-many path to be wrapped in exactly one aggregate, and \
-                 the generator never emits this; there is no correct value to guess here"
-            );
-            format!("{}.{}", quote_ident(rel), quote_ident(column))
-        }
-        Expr::FunctionCall { name, args } if name == "COUNT" && args.is_empty() => {
-            "count(*)".to_string()
-        }
-        Expr::FunctionCall { name, args }
-            if matches!(args.as_slice(), [Expr::RelationshipPath { .. }]) =>
-        {
-            let Expr::RelationshipPath { rel, column } = &args[0] else {
-                unreachable!("guarded by the matches! above");
-            };
-            let relationship = rels.get(rel);
-            match relationship.cardinality {
-                // A to-one path under an aggregate is just an aggregate over
-                // the joined column — the join is emitted by
-                // `collect_join_rels`, so nothing extra is needed here.
-                Cardinality::ToOne => {
-                    format!(
-                        "{}({}.{})",
-                        name.to_lowercase(),
-                        quote_ident(rel),
-                        quote_ident(column)
-                    )
-                }
-                Cardinality::ToMany => format!(
-                    "(select {func}({alias}.{col}) from {to_table} as {alias} \
-                     where {alias}.{to_col} = {source}.{from_col})",
-                    func = name.to_lowercase(),
-                    alias = quote_ident(rel),
-                    col = quote_ident(column),
-                    to_table = quote_ident(&relationship.to_table),
-                    to_col = quote_ident(&relationship.to_col),
-                    source = quote_ident(source),
-                    from_col = quote_ident(&relationship.from_col),
-                ),
-            }
-        }
-        Expr::FunctionCall { name, args } => {
-            let rendered_args: Vec<String> = args
-                .iter()
-                .map(|arg| render_rel_expr(arg, source, rels))
-                .collect();
-            format!("{}({})", name.to_lowercase(), rendered_args.join(", "))
-        }
-    }
-}
-
-/// The `left join <to_table> as <rel> on <rel>.<to_col> = <source>.<from_col>`
-/// clauses a relationship-reading `SELECT` needs — one per to-one
-/// relationship any field reads, deduplicated and in sorted order so the
-/// rendered SQL is deterministic.
-///
-/// `LEFT`, not inner: a source row whose foreign key resolves to nothing must
-/// still appear in the result (with `NULL` enrichment). An inner join would
-/// silently *drop* that row, which is the single most consequential way this
-/// oracle could be quietly wrong — it would agree with a buggy engine that
-/// also dropped it.
-fn render_joins(def: &TransformDef, rels: &RelIndex<'_>) -> String {
-    let mut names: BTreeSet<&str> = BTreeSet::new();
-    for field in &def.fields {
-        collect_join_rels(&field.expr, rels, &mut names);
-    }
-    names
-        .into_iter()
-        .map(|name| {
-            let rel = rels.get(name);
-            format!(
-                " left join {} as {alias} on {alias}.{} = {}.{}",
-                quote_ident(&rel.to_table),
-                quote_ident(&rel.to_col),
-                quote_ident(&def.source),
-                quote_ident(&rel.from_col),
-                alias = quote_ident(name),
-            )
-        })
-        .collect()
-}
-
-/// [`render_select`]'s relationship-reading counterpart (issue #34). Split
-/// out rather than folded in so a relationship-free definition renders
-/// byte-for-byte as it always did — the existing rendering pins stay honest,
-/// and a program that declares no relationship pays nothing for this.
-fn render_rel_select(def: &TransformDef, pk_column: &str, rels: &RelIndex<'_>) -> String {
-    match def.predicate {
-        Predicate::True => {}
-    }
-    let source = quote_ident(&def.source);
-    let joins = render_joins(def, rels);
-
-    match &def.key_space {
-        KeySpace::Join(_) => unreachable!("the generator never produces a JOIN definition"),
-        KeySpace::OneToOne => {
-            let mut select_list = vec![format!("{source}.{}::text", quote_ident(pk_column))];
-            for field in &def.fields {
-                select_list.push(format!(
-                    "({})::text as {}",
-                    render_rel_expr(&field.expr, &def.source, rels),
-                    quote_ident(&field.name)
-                ));
-            }
-            format!("select {} from {source}{joins}", select_list.join(", "))
-        }
-        KeySpace::Aggregate { group_by } => {
-            let select_list: Vec<String> = def
-                .fields
-                .iter()
-                .map(|field| {
-                    format!(
-                        "({})::text as {}",
-                        render_rel_expr(&field.expr, &def.source, rels),
-                        quote_ident(&field.name)
-                    )
-                })
-                .collect();
-            // The generative suite never constructs a relationship-path
-            // `GROUP BY` key (issue #137 scopes that support out of this
-            // crate), so every key is a plain column here.
-            let group_cols: Vec<String> = group_by
-                .iter()
-                .map(|k| format!("{source}.{}", quote_ident(k.target_column_name())))
-                .collect();
-            format!(
-                "select {} from {source}{joins} group by {}",
-                select_list.join(", "),
-                group_cols.join(", ")
-            )
-        }
     }
 }
 
@@ -713,15 +408,7 @@ fn render_rel_select(def: &TransformDef, pk_column: &str, rels: &RelIndex<'_>) -
 /// On any shape beyond the numeric-`+`/aggregate slice this oracle models
 /// (a non-trivial predicate is a later slice), naming the follow-up that
 /// widens it.
-fn render_select(def: &TransformDef, pk_column: &str, rels: &RelIndex<'_>) -> String {
-    // Issue #34: a definition that reads a relationship path renders through
-    // the join-aware printer instead. Dispatching here (rather than teaching
-    // one printer both jobs) keeps a relationship-free definition's SQL
-    // byte-identical to what it has always been.
-    if uses_relationships(def) {
-        return render_rel_select(def, pk_column, rels);
-    }
-
+fn render_select(def: &TransformDef, pk_column: &str) -> String {
     match def.predicate {
         Predicate::True => {}
     }
@@ -784,11 +471,10 @@ fn render_select(def: &TransformDef, pk_column: &str, rels: &RelIndex<'_>) -> St
 /// pk column.
 pub async fn sql_oracle(
     pool: &Pool,
-    program: &Program,
     def: &TransformDef,
     pk_column: &str,
 ) -> Result<Rows, OracleError> {
-    let sql = render_select(def, pk_column, &RelIndex::new(program));
+    let sql = render_select(def, pk_column);
     let client = pool.get().await?;
     let db_rows = client.query(sql.as_str(), &[]).await?;
 
@@ -1002,16 +688,10 @@ pub fn three_way(
     evaluator: &Rows,
     sql: &Rows,
 ) -> ThreeWayReport {
-    let rels = RelIndex::new(program);
     let field_types: HashMap<&str, ValueType> = def
         .fields
         .iter()
-        .map(|f| {
-            (
-                f.name.as_str(),
-                field_value_type(&f.expr, source_columns, &rels),
-            )
-        })
+        .map(|f| (f.name.as_str(), field_value_type(&f.expr, source_columns)))
         .collect();
     let comparison_for = |column: &str| {
         field_types
@@ -1058,11 +738,7 @@ pub fn three_way(
 /// entries happen to return `Numeric` today, but this looks each one up
 /// rather than hardcoding that, for the same "don't keep a second, driftable
 /// copy of the registry's answer" reason as the scalar-function case above.
-fn field_value_type(
-    expr: &Expr,
-    source_columns: &HashMap<String, ValueType>,
-    rels: &RelIndex<'_>,
-) -> ValueType {
+fn field_value_type(expr: &Expr, source_columns: &HashMap<String, ValueType>) -> ValueType {
     match expr {
         Expr::Column(name) | Expr::SourceColumn { column: name, .. } => {
             *source_columns.get(name).unwrap_or_else(|| {
@@ -1089,8 +765,8 @@ fn field_value_type(
         // int4` is `integer`, `int4 + numeric` is `numeric`), so it has to
         // be resolved rather than read off a constant.
         Expr::BinaryOp { op, lhs, rhs } => {
-            let lhs_t = field_value_type(lhs, source_columns, rels);
-            let rhs_t = field_value_type(rhs, source_columns, rels);
+            let lhs_t = field_value_type(lhs, source_columns);
+            let rhs_t = field_value_type(rhs, source_columns);
             registry::operator_result_type(*op, lhs_t, rhs_t).unwrap_or_else(|| {
                 panic!(
                     "oracle: operator {op:?} has no result type for operands \
@@ -1100,7 +776,7 @@ fn field_value_type(
             })
         }
         Expr::FunctionCall { name, args } if name == "COALESCE" => {
-            field_value_type(&args[0], source_columns, rels)
+            field_value_type(&args[0], source_columns)
         }
         // Issue #111: likewise for the aggregates — `sum(int4)` is `bigint`,
         // `sum(numeric)` is `numeric`. `COUNT` is excluded on purpose:
@@ -1110,15 +786,14 @@ fn field_value_type(
         // constant `FunctionSpec` return type (below, `Integer(Int8)` as of
         // issue #120's registry alignment — `numeric` before it) is the
         // right answer regardless of which shape reaches here. Its
-        // one-argument form (`COUNT(<rel>.<col>)` over a to-many
-        // relationship) is why this needs naming rather than falling out of
-        // the `args.is_empty()` guard.
+        // one-argument form (`COUNT(<col>)`) is why this needs naming rather
+        // than falling out of the `args.is_empty()` guard.
         Expr::FunctionCall { name, args }
             if name != "COUNT"
                 && registry::lookup_aggregate_function(name).is_some()
                 && !args.is_empty() =>
         {
-            let arg_t = field_value_type(&args[0], source_columns, rels);
+            let arg_t = field_value_type(&args[0], source_columns);
             registry::aggregate_result_type(name, arg_t).unwrap_or_else(|| {
                 panic!(
                     "oracle: aggregate {name:?} has no result type for argument \
@@ -1138,12 +813,10 @@ fn field_value_type(
                      that set ever widens"
                 )
             }),
-        // Issue #34: a `<rel>.<column>` enrichment's type is the *to-side*
-        // table's column type, not anything on this definition's own source
-        // — resolved through the program's declared relationships rather
-        // than assumed, so it stays right if the generator ever references a
-        // non-Numeric to-side column.
-        Expr::RelationshipPath { rel, column } => rels.to_column_type(rel, column),
+        Expr::RelationshipPath { rel, column } => panic!(
+            "oracle: a path into another table ('{rel}.{column}') outside a JOIN — a generator \
+             bug; field_value_type types a definition over its own source only"
+        ),
     }
 }
 
@@ -1154,17 +827,15 @@ fn field_value_type(
 ///
 /// `source_columns` lists every column of the definition's source table.
 pub fn field_types(
-    program: &Program,
     def: &TransformDef,
     source_columns: &HashMap<String, ValueType>,
 ) -> Vec<(String, ValueType)> {
-    let rels = RelIndex::new(program);
     def.fields
         .iter()
         .map(|field| {
             (
                 field.name.clone(),
-                field_value_type(&field.expr, source_columns, &rels),
+                field_value_type(&field.expr, source_columns),
             )
         })
         .collect()
@@ -1314,33 +985,8 @@ pub async fn check(
             program: format!("{program:#?}"),
         });
     }
-    let sql = sql_oracle(pool, program, def, pk_column).await?;
+    let sql = sql_oracle(pool, def, pk_column).await?;
     let target = target_fields(target, pk_column);
-
-    // Issue #34: the evaluator leg does not exist for a relationship-reading
-    // definition. `trellis::dev::defs::oracle::recompute`/`recompute_aggregate`
-    // select only *source* columns and run each row through `evaluate`,
-    // whose empty `RelationshipContext` makes any path an
-    // `EvalError::UnsupportedRelationshipPath` — the engine documents this
-    // limitation on its own `collect_columns` ("those two evaluator-driven
-    // recomputes therefore only handle relationship-free definitions; the
-    // SQL oracles are what cross-check a relationship-reading one").
-    //
-    // So the comparison narrows to two ways (persisted target vs. the
-    // Postgres SQL oracle) for exactly these definitions. That is a real
-    // reduction in evidence and is reported as such rather than hidden:
-    // `ThreeWayReport::evaluator_checked` is `false`, and the report says so
-    // when printed. The *authority* leg — the one that catches a pipeline /
-    // fold / apply / ordering bug — is unaffected; what's lost is the
-    // secondary ADR-0004 parity cross-check, which would need a
-    // `recompute_with_relationships` entry point in `trellis/` to restore
-    // (out of scope for this issue, which is generative-crate-only).
-    if uses_relationships(def) {
-        let mut report = three_way(program, def, source_columns, &target, &sql, &sql);
-        report.evaluator_vs_sql.clear();
-        report.evaluator_checked = false;
-        return Ok(report);
-    }
 
     let evaluator = evaluator_oracle(pool, def, pk_column, source_columns).await?;
     Ok(three_way(
@@ -1356,7 +1002,6 @@ pub async fn check(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Column;
 
     /// Issue #830: the SQL oracle reads a qualified name inside an aggregate
     /// as the source column it names.
@@ -1391,21 +1036,6 @@ mod tests {
 
     fn numeric_kind(_: &str) -> Comparison {
         Comparison::DecimalByValue
-    }
-
-    /// An empty [`Program`], for the rendering/typing tests below that
-    /// exercise relationship-free definitions and so never consult the
-    /// relationship index at all.
-    fn empty_program() -> Program {
-        Program {
-            tables: Vec::new(),
-            relationships: Vec::new(),
-            defs: Vec::new(),
-            def_install_after_op: Vec::new(),
-            ops: Vec::new(),
-            restart_after_ops: Vec::new(),
-            scale_out_after_ops: Vec::new(),
-        }
     }
 
     #[test]
@@ -1477,7 +1107,6 @@ mod tests {
     fn report_display_includes_the_program_and_the_diverging_comparison() {
         let program = Program {
             tables: Vec::new(),
-            relationships: Vec::new(),
             defs: Vec::new(),
             def_install_after_op: Vec::new(),
             ops: Vec::new(),
@@ -1524,7 +1153,7 @@ mod tests {
             explicit_target_schema: None,
         };
         assert_eq!(
-            render_select(&def, "c0", &RelIndex::new(&empty_program())),
+            render_select(&def, "c0"),
             "select \"c0\"::text, ((\"c1\" + \"c2\"))::text as \"total\" from \"t0\""
         );
     }
@@ -1569,7 +1198,7 @@ mod tests {
             explicit_target_schema: None,
         };
         assert_eq!(
-            render_select(&def, "c0", &RelIndex::new(&empty_program())),
+            render_select(&def, "c0"),
             "select (\"grain\")::text as \"grain\", (sum(\"c1\"))::text as \"total\", \
              (count(*))::text as \"cnt\" from \"t0\" group by \"grain\""
         );
@@ -1616,7 +1245,7 @@ mod tests {
             args: vec![Expr::Column("c1".into())],
         };
         let source_columns = HashMap::from([("c1".to_string(), ValueType::Numeric)]);
-        let _ = field_value_type(&expr, &source_columns, &RelIndex::new(&empty_program()));
+        let _ = field_value_type(&expr, &source_columns);
     }
 
     /// Task B4's invertibility-split coverage claim only means something if
@@ -1639,11 +1268,7 @@ mod tests {
             args: Vec::new(),
         };
         assert_eq!(
-            field_value_type(
-                &count_expr,
-                &source_columns,
-                &RelIndex::new(&empty_program())
-            ),
+            field_value_type(&count_expr, &source_columns),
             ValueType::Integer(IntWidth::Int8)
         );
         for name in ["SUM", "AVG", "MIN", "MAX"] {
@@ -1652,250 +1277,11 @@ mod tests {
                 args: vec![Expr::Column("c1".into())],
             };
             assert_eq!(
-                field_value_type(&expr, &source_columns, &RelIndex::new(&empty_program())),
+                field_value_type(&expr, &source_columns),
                 ValueType::Numeric,
                 "{name} must classify as Numeric"
             );
         }
-    }
-
-    // -----------------------------------------------------------------
-    // Issue #34: relationship rendering pins.
-    // -----------------------------------------------------------------
-
-    /// A two-table program whose `t1` has a UNIQUE key column `k` and a
-    /// plain FK column `f`, plus one relationship of `cardinality` joining
-    /// `t0` to `t1`. The endpoints mirror `crate::generate`'s own choice:
-    /// to-one joins `t0.f` to `t1.k`, to-many joins `t0.k` to `t1.f`.
-    fn rel_program(cardinality: Cardinality) -> Program {
-        let table = |name: &str| Table {
-            name: name.to_string(),
-            pk_col: "pk".to_string(),
-            columns: vec![
-                Column {
-                    name: "pk".to_string(),
-                    value_type: ValueType::Numeric,
-                },
-                Column {
-                    name: "c1".to_string(),
-                    value_type: ValueType::Numeric,
-                },
-                Column {
-                    name: "k".to_string(),
-                    value_type: ValueType::Text,
-                },
-                Column {
-                    name: "f".to_string(),
-                    value_type: ValueType::Text,
-                },
-            ],
-            unique_cols: vec!["k".to_string()],
-            partitioning: None,
-        };
-        let (from_col, to_col) = match cardinality {
-            Cardinality::ToOne => ("f", "k"),
-            Cardinality::ToMany => ("k", "f"),
-        };
-        Program {
-            tables: vec![table("t0"), table("t1")],
-            relationships: vec![Relationship {
-                name: "r0".to_string(),
-                from_table: "t0".to_string(),
-                from_col: from_col.to_string(),
-                to_table: "t1".to_string(),
-                to_col: to_col.to_string(),
-                cardinality,
-            }],
-            defs: Vec::new(),
-            def_install_after_op: Vec::new(),
-            ops: Vec::new(),
-            restart_after_ops: Vec::new(),
-            scale_out_after_ops: Vec::new(),
-        }
-    }
-
-    fn path() -> Expr {
-        Expr::RelationshipPath {
-            rel: "r0".to_string(),
-            column: "c1".to_string(),
-        }
-    }
-
-    /// A bare to-one enrichment renders as a `LEFT JOIN` aliased by the
-    /// *relationship* name, with the source's own columns qualified so they
-    /// can't be ambiguous against the joined table's identically-named ones.
-    /// `LEFT`, not inner, is the load-bearing word: an inner join would drop
-    /// a source row whose FK resolves to nothing, which is precisely the
-    /// ADR-0006 rule this oracle exists to check.
-    #[test]
-    fn render_select_renders_a_to_one_enrichment_as_a_left_join() {
-        let program = rel_program(Cardinality::ToOne);
-        let def = TransformDef {
-            target: "d0".into(),
-            source: "t0".into(),
-            key_space: KeySpace::OneToOne,
-            fields: vec![trellis::dev::defs::ast::FieldDef {
-                name: "rel_enrich".into(),
-                expr: path(),
-            }],
-            predicate: Predicate::True,
-            without_source_index: false,
-            explicit_source_schema: None,
-            explicit_target_schema: None,
-        };
-        assert_eq!(
-            render_select(&def, "pk", &RelIndex::new(&program)),
-            "select \"t0\".\"pk\"::text, (\"r0\".\"c1\")::text as \"rel_enrich\" \
-             from \"t0\" left join \"t1\" as \"r0\" on \"r0\".\"k\" = \"t0\".\"f\""
-        );
-    }
-
-    /// A to-many aggregate renders as a correlated subquery — no JOIN at
-    /// all, since the related rows are folded rather than multiplied into
-    /// the result. Postgres's empty-set semantics then give the ADR-0006
-    /// answer for free (`COUNT` → `0`, the rest → `NULL`).
-    #[test]
-    fn render_select_renders_a_to_many_aggregate_as_a_correlated_subquery() {
-        let program = rel_program(Cardinality::ToMany);
-        let def = TransformDef {
-            target: "d0".into(),
-            source: "t0".into(),
-            key_space: KeySpace::OneToOne,
-            fields: vec![trellis::dev::defs::ast::FieldDef {
-                name: "rel_agg".into(),
-                expr: Expr::FunctionCall {
-                    name: "SUM".into(),
-                    args: vec![path()],
-                },
-            }],
-            predicate: Predicate::True,
-            without_source_index: false,
-            explicit_source_schema: None,
-            explicit_target_schema: None,
-        };
-        let sql = render_select(&def, "pk", &RelIndex::new(&program));
-        assert_eq!(
-            sql,
-            "select \"t0\".\"pk\"::text, ((select sum(\"r0\".\"c1\") from \"t1\" as \"r0\" \
-             where \"r0\".\"f\" = \"t0\".\"k\"))::text as \"rel_agg\" from \"t0\""
-        );
-        assert!(
-            !sql.contains("join"),
-            "a to-many path folds related rows in a subquery; joining would multiply the \
-             source rows instead: {sql}"
-        );
-    }
-
-    /// A to-one path *aggregated inside a `GROUP BY`* still needs its
-    /// `LEFT JOIN` — cardinality decides whether a join is needed, not
-    /// whether the path happens to sit under an aggregate call. Getting this
-    /// backwards (stopping the join walk at any aggregate, as the to-many
-    /// case requires) would silently render `sum(r0.c1)` against nothing.
-    #[test]
-    fn render_select_joins_a_to_one_path_even_when_it_is_aggregated() {
-        let program = rel_program(Cardinality::ToOne);
-        let def = TransformDef {
-            target: "d0".into(),
-            source: "t0".into(),
-            key_space: KeySpace::Aggregate {
-                group_by: vec![trellis::dev::defs::ast::GroupByKey::Column("k".into())],
-            },
-            fields: vec![
-                trellis::dev::defs::ast::FieldDef {
-                    name: "k".into(),
-                    expr: Expr::Column("k".into()),
-                },
-                trellis::dev::defs::ast::FieldDef {
-                    name: "rel_agg".into(),
-                    expr: Expr::FunctionCall {
-                        name: "SUM".into(),
-                        args: vec![path()],
-                    },
-                },
-            ],
-            predicate: Predicate::True,
-            without_source_index: false,
-            explicit_source_schema: None,
-            explicit_target_schema: None,
-        };
-        assert_eq!(
-            render_select(&def, "pk", &RelIndex::new(&program)),
-            "select (\"t0\".\"k\")::text as \"k\", (sum(\"r0\".\"c1\"))::text as \"rel_agg\" \
-             from \"t0\" left join \"t1\" as \"r0\" on \"r0\".\"k\" = \"t0\".\"f\" \
-             group by \"t0\".\"k\""
-        );
-    }
-
-    /// Design doc §2's "refuse to guess": a bare reference to a to-many path
-    /// is a shape ADR-0006 forbids and the generator never emits, so the
-    /// renderer refuses rather than picking one of the related rows.
-    #[test]
-    #[should_panic(expected = "bare reference to to-many relationship path 'r0.c1'")]
-    fn render_select_refuses_a_bare_to_many_path() {
-        let program = rel_program(Cardinality::ToMany);
-        let def = TransformDef {
-            target: "d0".into(),
-            source: "t0".into(),
-            key_space: KeySpace::OneToOne,
-            fields: vec![trellis::dev::defs::ast::FieldDef {
-                name: "rel_enrich".into(),
-                expr: path(),
-            }],
-            predicate: Predicate::True,
-            without_source_index: false,
-            explicit_source_schema: None,
-            explicit_target_schema: None,
-        };
-        let _ = render_select(&def, "pk", &RelIndex::new(&program));
-    }
-
-    /// An undeclared relationship is a generator bug, not something to
-    /// render around: the engine rejects such a definition at validation
-    /// time, so a program containing one could never have installed.
-    #[test]
-    #[should_panic(expected = "relationship \"nope\", which the program does not declare")]
-    fn render_select_refuses_an_undeclared_relationship() {
-        let program = rel_program(Cardinality::ToOne);
-        let def = TransformDef {
-            target: "d0".into(),
-            source: "t0".into(),
-            key_space: KeySpace::OneToOne,
-            fields: vec![trellis::dev::defs::ast::FieldDef {
-                name: "rel_enrich".into(),
-                expr: Expr::RelationshipPath {
-                    rel: "nope".into(),
-                    column: "c1".into(),
-                },
-            }],
-            predicate: Predicate::True,
-            without_source_index: false,
-            explicit_source_schema: None,
-            explicit_target_schema: None,
-        };
-        let _ = render_select(&def, "pk", &RelIndex::new(&program));
-    }
-
-    /// A relationship path types as the *to-side* column's type, not
-    /// anything on the definition's own source — which is what selects the
-    /// right per-cell comparison (decimal-by-value vs. byte-exact) for the
-    /// enrichment field.
-    #[test]
-    fn field_value_type_of_a_relationship_path_comes_from_the_to_side_table() {
-        let program = rel_program(Cardinality::ToOne);
-        let rels = RelIndex::new(&program);
-        let source_columns = HashMap::new();
-        assert_eq!(
-            field_value_type(&path(), &source_columns, &rels),
-            ValueType::Numeric
-        );
-        let text_path = Expr::RelationshipPath {
-            rel: "r0".into(),
-            column: "k".into(),
-        };
-        assert_eq!(
-            field_value_type(&text_path, &source_columns, &rels),
-            ValueType::Text
-        );
     }
 
     /// #1113: a `JOIN`'s oracle is its own query: group columns first, read
@@ -2009,10 +1395,7 @@ mod tests {
             ("c1".to_string(), ValueType::Numeric),
             ("c2".to_string(), ValueType::Numeric),
         ]);
-        assert_eq!(
-            field_value_type(&expr, &source_columns, &RelIndex::new(&empty_program())),
-            ValueType::Boolean
-        );
+        assert_eq!(field_value_type(&expr, &source_columns), ValueType::Boolean);
     }
 
     /// Every one of the four scalar functions type-checks to its registered
@@ -2037,7 +1420,7 @@ mod tests {
                 args,
             };
             assert_eq!(
-                field_value_type(&expr, &source_columns, &RelIndex::new(&empty_program())),
+                field_value_type(&expr, &source_columns),
                 ValueType::Integer(IntWidth::Int4),
                 "{name} must type-check as integer"
             );
@@ -2051,7 +1434,7 @@ mod tests {
             ],
         };
         assert_eq!(
-            field_value_type(&coalesce, &source_columns, &RelIndex::new(&empty_program())),
+            field_value_type(&coalesce, &source_columns),
             ValueType::Text
         );
     }

@@ -42,7 +42,9 @@ use trellis::IntWidth;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use trellis::defs::eval::{RegexCache, Row, Value, evaluate};
-use trellis::defs::{chunk_queue, create_relationship, install_definition, parse, validate};
+use trellis::defs::{
+    CatalogError, ValidationError, chunk_queue, install_definition, parse, validate,
+};
 use trellis::{Config, Trellis, TrellisOptions};
 
 // ---------------------------------------------------------------------
@@ -88,6 +90,24 @@ async fn connect_raw(dsn: &str) -> Client {
         .await
         .expect("set search_path");
     client
+}
+
+/// Defines a `JOIN` whose one `ON` term pairs `left.lcol` with
+/// `right.rcol`. `JOIN` key admission reads the same allowlist
+/// (`catalog::is_text_stable_join_key_type`) a 1-1 primary key does.
+async fn define_join_on(
+    pool: &trellis::pool::Pool,
+    target: &str,
+    (left, lcol): (&str, &str),
+    (right, rcol): (&str, &str),
+) -> Result<(), trellis::defs::CatalogError> {
+    let text = format!(
+        "TRANSFORM {target} FROM {left} JOIN {right} ON {left}.{lcol} = {right}.{rcol} \
+         GROUP BY {left}.id WITHOUT SOURCE INDEX SELECT COUNT(*) AS n"
+    );
+    install_definition(pool, &text, &HashMap::new(), "public")
+        .await
+        .map(|_| ())
 }
 
 /// Drives the durable backfill chunk queue to completion, standing in for a
@@ -835,7 +855,7 @@ async fn an_incremental_bigint_sum_stays_equal_to_a_hand_written_group_by() {
     trellis.shutdown().await.expect("shutdown");
 }
 
-/// An `oid` column is accepted as a **relationship join key**, and a
+/// An `oid` column is accepted as a **`JOIN` `ON` key**, and a
 /// `smallint`/`integer`/`bigint` one keeps being accepted — the
 /// `catalog::TEXT_STABLE_JOIN_KEY_TYPES` allowlist #111 widens.
 ///
@@ -845,7 +865,7 @@ async fn an_incremental_bigint_sum_stays_equal_to_a_hand_written_group_by() {
 /// rather than "anything numeric-ish", and it is what makes admitting `oid`
 /// a claim about `oid_out`'s canonical rendering rather than a guess.
 #[tokio::test]
-async fn oid_and_the_integer_widths_are_accepted_as_relationship_join_keys() {
+async fn oid_and_the_integer_widths_are_accepted_as_join_keys() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let client = connect_raw(db.dsn()).await;
@@ -863,30 +883,28 @@ async fn oid_and_the_integer_widths_are_accepted_as_relationship_join_keys() {
              )",
         )
         .await
-        .expect("create relationship tables");
+        .expect("create join tables");
 
     for (name, from_col, to_table) in [
-        ("r2", "f2", "parent2"),
-        ("r4", "f4", "parent4"),
-        ("r8", "f8", "parent8"),
-        ("r_oid", "f_oid", "parent_oid"),
+        ("j2", "f2", "parent2"),
+        ("j4", "f4", "parent4"),
+        ("j8", "f8", "parent8"),
+        ("j_oid", "f_oid", "parent_oid"),
     ] {
-        create_relationship(
-            &db.pool,
-            &format!("RELATIONSHIP {name} FROM child.{from_col} TO {to_table}.k"),
-        )
-        .await
-        .unwrap_or_else(|e| panic!("{name} ({to_table}.k) must be a valid join key: {e}"));
+        define_join_on(&db.pool, name, ("child", from_col), (to_table, "k"))
+            .await
+            .unwrap_or_else(|e| panic!("{name} ({to_table}.k) must be a valid join key: {e}"));
     }
 
-    let err = create_relationship(
-        &db.pool,
-        "RELATIONSHIP r_num FROM child.f_num TO parent_num.k",
-    )
-    .await
-    .expect_err("a numeric join key must still be rejected");
+    let err = define_join_on(&db.pool, "j_num", ("child", "f_num"), ("parent_num", "k"))
+        .await
+        .expect_err("a numeric join key must still be rejected");
     assert!(
-        err.to_string().contains("numeric"),
-        "the rejection must name the offending type: {err}"
+        matches!(
+            &err,
+            CatalogError::Validate(ValidationError::JoinUnsupportedKeyType { pg_type, .. })
+                if pg_type == "numeric"
+        ),
+        "the rejection must name the offending type: {err:?}"
     );
 }

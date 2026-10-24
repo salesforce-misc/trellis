@@ -117,12 +117,12 @@ use super::model::{
     Definition, EdgeKind, NodeKind, RelationshipCardinality, RelationshipDefinition,
     RelationshipSide, SchemaNode, TransformStatus,
 };
-use super::parser::{parse, parse_relationship};
+use super::parser::parse;
 use super::pg_type::PgType;
 use super::validate::{
     KeyColumnRole, NondeterministicCollationTextFunction, NondeterministicKeyCollation,
-    RelationshipTypeMismatch, RelationshipWarning, ResolvedRelationship, ValidationError,
-    infer_field_types, reject_primary_key_named_fields, validate, validate_qualified_columns,
+    RelationshipTypeMismatch, ResolvedRelationship, ValidationError, infer_field_types,
+    reject_primary_key_named_fields, validate, validate_qualified_columns,
 };
 
 /// Why creating or reading a definition failed. [`CatalogError::code`]
@@ -485,17 +485,6 @@ pub enum CatalogError {
     /// column-pause lock ([`crate::locks::lock_column_pauses`]) past its
     /// transaction's `lock_timeout` (#922). Nothing changed: retry the call.
     ColumnPauseLockTimeout(crate::locks::ColumnPauseLockTimeout),
-    /// A bare `DROP RELATIONSHIP <from_table>.<name>` address matched a
-    /// relationship on more than one same-named from-table — one per entry of
-    /// `schemas` (issue #288: `blog.posts.author` and `shop.posts.author` may
-    /// both exist). Refused rather than resolved through `search_path`; the
-    /// caller qualifies the address to say which one it means. See
-    /// [`relationship_at_address`].
-    AmbiguousRelationshipAddress {
-        from_table: String,
-        name: String,
-        schemas: Vec<String>,
-    },
 }
 
 impl CatalogError {
@@ -559,7 +548,6 @@ impl CatalogError {
             CatalogError::UnsupportedAlter(_) => ErrorCode::Validation,
             // The statement itself is under-specified — the fix is to
             // rewrite it with a schema qualifier, not to change any state.
-            CatalogError::AmbiguousRelationshipAddress { .. } => ErrorCode::Validation,
             // A wait that ran out, not a fault: the call changed nothing.
             CatalogError::ColumnPauseLockTimeout(_) => ErrorCode::Timeout,
         }
@@ -846,17 +834,6 @@ impl fmt::Display for CatalogError {
                 write!(f, "unsupported ALTER TRANSFORM: {detail}")
             }
             CatalogError::ColumnPauseLockTimeout(err) => write!(f, "{err}"),
-            CatalogError::AmbiguousRelationshipAddress {
-                from_table,
-                name,
-                schemas,
-            } => write!(
-                f,
-                "relationship address '{from_table}.{name}' is ambiguous: a table named \
-                 '{from_table}' declares '{name}' in each of these schemas: {}; qualify it as \
-                 <schema>.{from_table}.{name}",
-                schemas.join(", ")
-            ),
         }
     }
 }
@@ -896,7 +873,6 @@ impl std::error::Error for CatalogError {
             CatalogError::AlterFieldNotFound { .. } => None,
             CatalogError::AlterFieldAlreadyExists { .. } => None,
             CatalogError::UnsupportedAlter(_) => None,
-            CatalogError::AmbiguousRelationshipAddress { .. } => None,
             CatalogError::ColumnPauseLockTimeout(err) => Some(err),
         }
     }
@@ -1865,9 +1841,7 @@ fn derive_reported(
 /// Refuses (with [`CatalogError::TransformNotLive`]) a new definition whose
 /// source, `qualified_source`, is the target of another definition whose
 /// build hasn't finished yet (issue #315): one that isn't
-/// [`TransformStatus::is_applying`]. And likewise a
-/// relationship endpoint that is such a target ([`create_relationship`],
-/// issue #403). A target's initial build
+/// [`TransformStatus::is_applying`]. A target's initial build
 /// (`defs::backfill`, the chunk queue) writes it directly, outside the
 /// target-mutation seam that tells a chained reader about every other target
 /// write, so a reader attached mid-build would silently miss whatever the
@@ -4110,369 +4084,6 @@ fn is_target_suffix_index_violation(err: &tokio_postgres::Error) -> bool {
         && db_err.constraint() == Some("transform_definitions_target_suffix_idx")
 }
 
-/// Refuses a relationship named after its own from-table (issue #830): a
-/// transform over that table reads `<table>.<column>` as its own source
-/// column, so the relationship's paths would mean two things.
-fn reject_relationship_named_after_from_table(
-    def: &RelationshipDef,
-) -> Result<(), ValidationError> {
-    if def.name == def.from_table {
-        return Err(ValidationError::RelationshipNamedAfterFromTable {
-            name: def.name.clone(),
-        });
-    }
-    Ok(())
-}
-
-/// Parses, validates, and stores a new relationship declaration (issue #26
-/// storage, issue #27 validation, ADR-0006): resolves/creates `schema_nodes`
-/// for both endpoints, persists a `schema_edges` row from `from_table` to
-/// `to_table` tagged [`EdgeKind::Relationship`], and inserts the immutable
-/// `relationship_definitions` row — all in one transaction, mirroring
-/// [`create_definition`]'s pattern.
-///
-/// Every requirement on the endpoints and join columns is checked first, in
-/// one place, before any catalog write: see [`validate_relationship`]
-/// (issue #429). Cardinality ([`RelationshipCardinality`]) is derived there
-/// and persisted, not rejected on: ADR-0006's rule that a to-many path is
-/// referenceable only wrapped in an aggregate is checked where a
-/// relationship is *used*.
-///
-/// Node-kind resolution: a relationship's endpoints may each be "a source
-/// table or a transform target, in any combination" (ADR-0006), and nothing
-/// here can tell which without cross-referencing `transform_definitions`.
-/// Both endpoints resolve as [`NodeKind::Source`] — directionally accurate
-/// either way, since computing the join reads both tables' columns
-/// regardless of whether one side later turns out to also be a transform
-/// target — and [`resolve_node_in_txn`]'s flags are additive (OR'd in, never
-/// cleared), so a later `create_definition` call that resolves the same
-/// table as [`NodeKind::Target`] merges into the same node rather than
-/// conflicting with this choice.
-#[cfg_attr(
-    not(any(test, feature = "test-util")),
-    expect(dead_code, reason = "test-only until #1115 R2 deletes it")
-)]
-pub async fn create_relationship(
-    pool: &Pool,
-    source_text: &str,
-) -> Result<RelationshipDefinition, CatalogError> {
-    let def: RelationshipDef = parse_relationship(source_text)?;
-    reject_relationship_named_after_from_table(&def)?;
-
-    let mut client = pool.get().await?;
-    let txn = client.transaction().await?;
-
-    // Issue #74, ADR-0011: resolve both endpoints to their fully-qualified
-    // identity via the same [`resolve_graph_identity_in_txn`]
-    // [`create_definition_inner`] uses for a transform's source/target,
-    // *before* touching `schema_nodes`/`schema_edges` — or, per the reviewer
-    // follow-up below, this function's own pg_catalog introspection either —
-    // at all. Required now that graph keys on qualified identity, so a table
-    // that's both a relationship endpoint and a transform source/target (the
-    // common case ADR-0006's own examples all chain off) resolves to one
-    // node either way, not two. The schema half of each resolution is
-    // persisted too (`from_schema`/`to_schema`, below).
-    //
-    // Reviewer follow-up to issue #74 (epic #78's own whole-branch review):
-    // this resolution used to run *after* this function's own pg_catalog
-    // introspection (`column_type_in_txn`/`to_col_cardinality_in_txn`/
-    // `ddl::column_is_indexed_in`, below), which resolve
-    // `def.from_table`/`def.to_table` bare via `pg_catalog.to_regclass` — a
-    // plain `search_path` walk with no fallback, unlike this call. So a
-    // relationship endpoint that bare-names another definition's target
-    // explicitly qualified into a non-default schema (issue #76) never reached
-    // this resolution at all: it failed first, in one of those three checks, as
-    // a false "does not exist" (e.g. `to_col_cardinality_in_txn`'s
-    // `to_regclass($1)` resolving to `NULL` reads as "no such index", not
-    // "wrong schema"). Moved up here, before any of them, and threaded through
-    // via [`resolve_relationship_endpoint_in_txn`] — a thin wrapper around this
-    // exact function, not a second fallback implementation — so every
-    // pg_catalog lookup below gets the same two-step resolution
-    // `create_definition_inner` already relies on.
-    let qualified_from = resolve_relationship_endpoint_in_txn(&txn, &def.from_table).await?;
-    let qualified_to = resolve_relationship_endpoint_in_txn(&txn, &def.to_table).await?;
-
-    let ValidatedRelationship {
-        from_schema,
-        to_schema,
-        to_type,
-        cardinality,
-        warnings,
-    } = validate_relationship(&txn, &def, &qualified_from, &qualified_to).await?;
-
-    let from_node = resolve_node_in_txn(&txn, &qualified_from, NodeKind::Source).await?;
-    // `to_table` is marked `is_source` here too, even though a relationship's
-    // to-side is often really a transform target: the flag is additive/OR'd
-    // (a later `create_definition` call can still set `is_target` on the
-    // same node), and no consumer reads `schema_nodes.is_source` directly —
-    // [`all_source_tables`] (what capture covers) walks `schema_edges`
-    // `Relationship` edges from `transform_definitions.source_table` anchors
-    // instead (issue #75), never the `is_source` flag itself: that flag is
-    // set on *every* relationship endpoint regardless of whether it's
-    // actually reachable from a registered transform, so reading it directly
-    // would leak an orphaned relationship's tables into capture (issue #65's
-    // test case 4). If a future `is_source` consumer reads
-    // `schema_nodes` directly, re-check this call.
-    let to_node = resolve_node_in_txn(&txn, &qualified_to, NodeKind::Source).await?;
-
-    // Persisted `to_table -> from_table` (parent -> child): see
-    // [`validate_relationship`]'s cycle check for why.
-    persist_edge_in_txn(&txn, to_node.id, from_node.id, EdgeKind::Relationship).await?;
-
-    let id: i64 = txn
-        .query_one(
-            "insert into relationship_definitions
-                (name, from_schema, from_table, from_col, to_schema, to_table, to_col,
-                 definition_text, cardinality, grammar_version)
-             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-             returning id",
-            &[
-                &def.name,
-                &from_schema,
-                &def.from_table,
-                &def.from_col,
-                &to_schema,
-                &def.to_table,
-                &def.to_col,
-                &source_text,
-                &cardinality.as_str(),
-                &CURRENT_GRAMMAR_VERSION,
-            ],
-        )
-        .await?
-        .get(0);
-
-    // Issue #129, epic #127: every to-one relationship gets a settled parent
-    // projection from the moment it's declared, not just once a consumer
-    // shows up — see [`ensure_relationship_projection_in_txn`]'s own doc
-    // comment for why (a relationship must exist before anything can
-    // reference it, so there is never a consumer yet at this point) and for
-    // why `needed_columns` is empty here (this call only creates the
-    // projection and seeds its bookkeeping columns for every existing
-    // to-side row; [`create_definition_inner`]'s own call is what widens it
-    // once a consumer's read columns are known). Runs inside this same
-    // transaction so a relationship declaration and its projection's
-    // creation commit or roll back together.
-    //
-    // The seed reads the to-side as the session's role, and every Trellis
-    // session runs with `row_security = off` (issue #766), so policies that
-    // apply to that role fail the read outright. Refuse first, naming the
-    // table, the role and the fix, rather than surface Postgres's bare
-    // "query would be affected by row-level security policy".
-    if cardinality == RelationshipCardinality::ToOne {
-        reject_row_security(
-            &*txn,
-            pool.schema(),
-            &[(qualified_to.clone(), super::row_security::Readers::Session)],
-        )
-        .await?;
-        ensure_relationship_projection_in_txn(
-            &txn,
-            id,
-            &qualified_to,
-            &def.to_table,
-            &def.to_col,
-            &to_type,
-            pool.schema(),
-            &[],
-        )
-        .await?;
-    }
-
-    txn.commit().await?;
-
-    Ok(RelationshipDefinition {
-        id,
-        from_schema,
-        to_schema,
-        def,
-        cardinality,
-        warnings,
-    })
-}
-
-/// What [`validate_relationship`] learns that [`create_relationship`]'s
-/// catalog writes need.
-struct ValidatedRelationship {
-    from_schema: String,
-    to_schema: String,
-    /// The to-side join column's type, which a to-one relationship's
-    /// projection keys on.
-    to_type: String,
-    cardinality: RelationshipCardinality,
-    warnings: Vec<RelationshipWarning>,
-}
-
-/// Every requirement Trellis has of a relationship's endpoint tables and
-/// join columns, checked before [`create_relationship`] writes anything
-/// (issue #429). A relationship this accepts must never halt its definitions
-/// later over something that was knowable when it was declared. Each check
-/// calls the same function, or reads the same allowlist, as the runtime path
-/// it protects, so the two can't drift apart.
-///
-/// In order, returning the first failure:
-///
-/// 1. **Join columns.** Both `table.column`s exist ([`join_column_in_txn`]),
-///    each one's type is on the join-key allowlist
-///    ([`assert_join_key_type_supported`]; the engine matches join keys as
-///    text), they have the same type, type modifier and collation
-///    ([`assert_joinable_as_is`], ADR-0006's join-endpoint rules, made
-///    exact by #590), and that collation, if any, is deterministic
-///    ([`assert_deterministic_join_collation`]). The allowlist runs first so
-///    a type that can never be a join key is named as such, rather than
-///    reported as a mismatch whose advice ("alter one column to match the
-///    other") could steer the user onto it.
-/// 2. **Each endpoint**, from-side then to-side
-///    ([`validate_relationship_endpoint`]): capture can key it, its key's
-///    types are on the key allowlist and its key's collations are
-///    deterministic, and it is `live` if it is one of this instance's
-///    targets.
-/// 3. **Name.** Not already declared on the qualified from-table
-///    ([`ValidationError::DuplicateRelationshipName`], a friendlier surfacing
-///    of the rule `relationship_definitions_from_schema_from_table_name_key`
-///    backstops).
-/// 4. **No table cycle** ([`reject_if_table_cycle`]).
-/// 5. **Cardinality** ([`to_col_cardinality_in_txn`]): to-one when `to_col`
-///    has a unique index, to-many otherwise. Neither asks anything more of
-///    the endpoints: capture triggers image the whole old row (issue #622).
-///
-/// A from-side join column with no usable index is a performance warning
-/// ([`RelationshipWarning::MissingFkIndex`]), not a requirement.
-///
-/// The source schema is the user's to change after this runs (ADR-0005).
-/// Rule 1 and rule 2's key checks run again for every definition that reads
-/// through the relationship, at its define and at each resume
-/// ([`validate_live_schema`]), and the staging worker's capture pass pauses
-/// those definitions when a join column or endpoint key changes into what
-/// rule 1 would refuse, a mismatched pair included
-/// (`staging::schema_change::pause_readers_of_retyped`, #760).
-async fn validate_relationship(
-    txn: &tokio_postgres::Transaction<'_>,
-    def: &RelationshipDef,
-    qualified_from: &str,
-    qualified_to: &str,
-) -> Result<ValidatedRelationship, CatalogError> {
-    let to_type = validate_join_pair(txn, def, qualified_from, qualified_to, true).await?;
-    let cardinality = to_col_cardinality_in_txn(txn, qualified_to, &def.to_col).await?;
-
-    validate_relationship_endpoint(txn, &def.name, RelationshipSide::From, qualified_from, None)
-        .await?;
-    validate_relationship_endpoint(
-        txn,
-        &def.name,
-        RelationshipSide::To,
-        qualified_to,
-        Some(ToSide {
-            join_col: &def.to_col,
-            cardinality,
-        }),
-    )
-    .await?;
-
-    // Issues #285/#288/#372: each endpoint's resolved schema is persisted
-    // alongside its bare name, and `(from_schema, from_table, name)` is the
-    // relationship's identity, so no later reader re-resolves a bare name
-    // through its own `search_path` and lands on another schema's table.
-    // Read off the resolutions every check above used. The `None` arm is
-    // unreachable: [`resolve_relationship_endpoint_in_txn`] returns an
-    // unqualified name only for a table that doesn't exist, which
-    // `column_type_in_txn` has already rejected.
-    let from_schema = qualified_from
-        .split_once('.')
-        .map(|(schema, _)| schema.to_string())
-        .ok_or_else(|| CatalogError::SourceTableNotFound(def.from_table.clone()))?;
-    let to_schema = qualified_to
-        .split_once('.')
-        .map(|(schema, _)| schema.to_string())
-        .ok_or_else(|| CatalogError::SourceTableNotFound(def.to_table.clone()))?;
-
-    let already_declared: bool = txn
-        .query_one(
-            "select exists (
-                select 1 from relationship_definitions
-                where from_schema = $1 and from_table = $2 and name = $3
-             )",
-            &[&from_schema, &def.from_table, &def.name],
-        )
-        .await?
-        .get(0);
-    if already_declared {
-        return Err(ValidationError::DuplicateRelationshipName {
-            from_table: qualified_from.to_string(),
-            name: def.name.clone(),
-        }
-        .into());
-    }
-
-    // The `Relationship` edge is persisted `to_table -> from_table` (parent
-    // -> child), matching `Source`'s "to_node depends on from_node"
-    // convention (see `SchemaEdge`'s doc comment): the FK-holding
-    // `from_table` is the dependent side — a bare-path reference like
-    // `product.x` in a calculated field over `from_table` pulls from
-    // `to_table`. Checking it the naive `from -> to` way would wrongly reject
-    // a target-table-references-its-own-source relationship as a false
-    // 2-cycle, and make dependents-of-a-changed-table traversals miss
-    // relationship dependents.
-    reject_if_table_cycle(txn, qualified_to, qualified_from).await?;
-
-    let mut warnings = Vec::new();
-    // The same definition of "indexed" the planner setting reads
-    // ([`ddl::key_column_in`], #972, #973). It only informs the warning:
-    // Trellis never modifies the source schema (ADR-0005). `qualified_from`
-    // is the endpoint's resolved identity, so a from-side qualified into a
-    // non-default schema resolves too.
-    if !ddl::column_is_indexed_in(txn, qualified_from, &def.from_col).await? {
-        warnings.push(RelationshipWarning::MissingFkIndex {
-            from_table: def.from_table.clone(),
-            from_col: def.from_col.clone(),
-        });
-    }
-
-    Ok(ValidatedRelationship {
-        from_schema,
-        to_schema,
-        to_type,
-        cardinality,
-        warnings,
-    })
-}
-
-/// [`validate_relationship`]'s per-endpoint requirements, run once for each
-/// side. Each names `side` in its rejection.
-///
-/// - **Keyable by capture** ([`reject_unkeyed_relationship_endpoint`], #375):
-///   an endpoint this instance doesn't own is captured, so its changes must
-///   carry a key.
-/// - **Key types on the allowlist** ([`ddl::source_primary_key_in_txn`],
-///   #429): every change the relationship propagates is keyed by the
-///   endpoint's own key at apply time. The to-side's staged changes go
-///   through `staging::apply::compute`'s per-source key lookup (and its
-///   `TRUNCATE` loop), and the from-side rows a to-side change re-derives go
-///   through `accumulate_from_side_recomputes`,
-///   `build_reverse_relationship_shape` and the `TRUNCATE` loop's from-side
-///   walk. All of them call [`ddl::source_primary_key`], which rejects a key
-///   type off the allowlist, and that rejection halts the table's readers. This is
-///   that same function, so the gate here is exactly the runtime one. Own
-///   targets are not exempt: a 1-1 target mirrors its source's (already
-///   gated) key, but an aggregate target's key is its `GROUP BY` columns.
-/// - **Key collations deterministic**
-///   ([`assert_deterministic_key_collation_in_txn`], #638): that same key is
-///   matched by its exact text, which a nondeterministic collation's `=`
-///   disagrees with.
-/// - **Live, if one of this instance's targets** ([`reject_non_live_upstream`],
-///   #403): the seam is such an endpoint's only change feed, and a build's
-///   writes land outside it.
-async fn validate_relationship_endpoint(
-    txn: &tokio_postgres::Transaction<'_>,
-    name: &str,
-    side: RelationshipSide,
-    qualified_endpoint: &str,
-    to_side: Option<ToSide<'_>>,
-) -> Result<(), CatalogError> {
-    validate_relationship_endpoint_keys(txn, name, side, qualified_endpoint, to_side).await?;
-    reject_non_live_upstream(txn, qualified_endpoint).await
-}
-
 /// [`validate_relationship_endpoint`]'s checks of the endpoint's key, which
 /// read the live schema: all but the last. [`validate_live_schema`] runs
 /// them again for each relationship a definition reads through.
@@ -4535,18 +4146,17 @@ async fn validate_relationship_endpoint_keys(
 
 /// The columns every relationship read-back below selects, in the order
 /// [`relationship_from_row`] expects them.
-const RELATIONSHIP_READ_COLUMNS: &str = "id, from_schema, to_schema, definition_text, cardinality";
+const RELATIONSHIP_READ_COLUMNS: &str =
+    "id, from_schema, to_schema, cardinality, name, from_table, from_col, to_table, to_col";
 
 /// Rebuilds a [`RelationshipDefinition`] from a row selected with
-/// [`RELATIONSHIP_READ_COLUMNS`]. Re-parses the persisted `definition_text`
-/// rather than reconstructing [`RelationshipDef`] from the denormalized
-/// columns, matching [`dependents_of`]'s "reuse the grammar's own parser"
-/// convention; `cardinality` is read back from its own column instead, since
-/// it isn't part of the source text (issue #27: it's derived, not declared).
+/// [`RELATIONSHIP_READ_COLUMNS`], from the row's own columns: nothing writes
+/// `relationship_definitions` any more, so this only reads what a catalog
+/// already holds.
 fn relationship_from_row(
     row: &tokio_postgres::Row,
 ) -> Result<RelationshipDefinition, CatalogError> {
-    let cardinality_text: String = row.get(4);
+    let cardinality_text: String = row.get(3);
     let cardinality =
         RelationshipCardinality::from_persisted(&cardinality_text).unwrap_or_else(|| {
             panic!(
@@ -4557,11 +4167,14 @@ fn relationship_from_row(
         id: row.get(0),
         from_schema: row.get(1),
         to_schema: row.get(2),
-        def: parse_relationship(row.get(3))?,
+        def: RelationshipDef {
+            name: row.get(4),
+            from_table: row.get(5),
+            from_col: row.get(6),
+            to_table: row.get(7),
+            to_col: row.get(8),
+        },
         cardinality,
-        // Creation-time guidance, not a fact about the persisted row — see
-        // the field's doc comment on [`RelationshipDefinition`].
-        warnings: Vec::new(),
     })
 }
 
@@ -4635,53 +4248,6 @@ pub(crate) async fn relationship_on_source(
         return Ok(None);
     };
     relationship_by_name(pool, schema, table, name).await
-}
-
-/// Resolves a `DROP RELATIONSHIP [<schema>.]<from_table>.<name>` address to
-/// the one relationship it names, or `Ok(None)` when it names none (a drop's
-/// idempotent no-op).
-///
-/// A qualified address is an exact `(from_schema, from_table, name)` lookup
-/// ([`relationship_by_name`]). A qualifier naming a schema whose `from_table`
-/// declared no such relationship names nothing, even if a same-named table
-/// elsewhere did — the case #285 fixed, where `DROP RELATIONSHIP
-/// shop.posts.author` used to drop `blog.posts`' `author`.
-///
-/// A bare address names the relationship if exactly one from-table called
-/// `from_table` declares `name`, in whichever schema. Since issue #288 two
-/// can (`blog.posts.author` and `shop.posts.author`), and then the bare
-/// address is refused as [`CatalogError::AmbiguousRelationshipAddress`]
-/// rather than resolved through `search_path`: `DROP` is destructive, and
-/// which schema a session's `search_path` happens to reach first is not
-/// something the caller can see in the statement they wrote.
-pub(crate) async fn relationship_at_address(
-    pool: &Pool,
-    schema: Option<&str>,
-    from_table: &str,
-    name: &str,
-) -> Result<Option<RelationshipDefinition>, CatalogError> {
-    if let Some(schema) = schema {
-        return relationship_by_name(pool, schema, from_table, name).await;
-    }
-    let client = pool.get().await?;
-    let rows = client
-        .query(
-            &format!(
-                "select {RELATIONSHIP_READ_COLUMNS} from relationship_definitions \
-                 where from_table = $1 and name = $2 order by from_schema"
-            ),
-            &[&from_table, &name],
-        )
-        .await?;
-    match rows.as_slice() {
-        [] => Ok(None),
-        [row] => relationship_from_row(row).map(Some),
-        rows => Err(CatalogError::AmbiguousRelationshipAddress {
-            from_table: from_table.to_string(),
-            name: name.to_string(),
-            schemas: rows.iter().map(|row| row.get(1)).collect(),
-        }),
-    }
 }
 
 /// Reads back the relationship whose `relationship_definitions.id` is `id` —
@@ -4989,9 +4555,8 @@ async fn resolve_source_schema_in_txn(
 
 /// Resolves a *bare* table name to its fully-qualified `schema.table`
 /// identity for the `schema_nodes`/`schema_edges` graph (issue #74,
-/// ADR-0011) — the single resolution [`create_definition_inner`] and
-/// [`create_relationship`] now both call, early, before touching the graph
-/// at all: its two `resolve_node_in_txn` calls, [`reject_if_table_cycle`],
+/// ADR-0011) — the single resolution [`create_definition_inner`] calls,
+/// early, before touching the graph at all: its two `resolve_node_in_txn` calls, [`reject_if_table_cycle`],
 /// and (for [`create_definition_inner`] specifically) the row persisted to
 /// `source_table_versions`/`transform_definitions.source_table` all share
 /// this one qualified value rather than each re-deriving their own.
@@ -5058,59 +4623,6 @@ async fn resolve_graph_identity_in_txn(
                 Some(row) => Ok(row.get(0)),
                 None => Err(CatalogError::SourceTableNotFound(table.to_string())),
             }
-        }
-        Err(err) => Err(err),
-    }
-}
-
-/// Best-effort counterpart to [`resolve_graph_identity_in_txn`], for
-/// [`create_relationship`]'s own pg_catalog introspection
-/// (`column_type_in_txn`/`to_col_cardinality_in_txn`/
-/// `ddl::column_is_indexed_in`) — reviewer follow-up to issue #74 (epic #78's
-/// own whole-branch review). Those three resolve
-/// `def.from_table`/`def.to_table` via `pg_catalog.to_regclass`, which — like
-/// [`resolve_source_schema_in_txn`]'s own walk — only ever considers *this
-/// connection's* `search_path`, so a relationship endpoint that bare-names
-/// another definition's target explicitly qualified into a non-default schema
-/// (issue #76) needs the exact same bare-target-suffix fallback
-/// `create_definition_inner`'s `qualified_source` already gets.
-///
-/// Unlike [`resolve_graph_identity_in_txn`] itself, a *total* miss (neither a
-/// physical table nor a live definition's target) is not an error here — it
-/// falls back to returning `table` unchanged. That matters for a genuinely
-/// nonexistent endpoint: `column_type_in_txn` et al. below still run their
-/// own `to_regclass`-based lookup against the same bare name Postgres itself
-/// would have tried, so they still report their own precise
-/// [`ValidationError::UnknownRelationshipColumn`]
-/// — naming the actual missing column/table exactly as before this fix —
-/// rather than this function's own less specific
-/// [`CatalogError::SourceTableNotFound`], which existing callers (e.g.
-/// `an_unknown_from_column_is_rejected`) don't expect and which wouldn't say
-/// anything about *which* endpoint or column is the problem. The two-step
-/// fallback only ever swaps in a qualified identity when doing so can
-/// actually resolve something; it never turns one "not found" into a worse
-/// one.
-///
-/// Also doubles as this function's *only* graph-identity resolution for
-/// [`create_relationship`] (see that function's own call site): once
-/// `column_type_in_txn` has confirmed the qualified/bare identity this
-/// returns is real, the same value is reused for
-/// [`resolve_node_in_txn`]/[`reject_if_table_cycle`] rather than re-resolving
-/// a second time — safe because the bare-fallback case above can only be
-/// reached when `table` doesn't resolve at all, which always fails one of
-/// those pg_catalog checks first and returns before either graph call is
-/// ever reached.
-async fn resolve_relationship_endpoint_in_txn(
-    txn: &tokio_postgres::Transaction<'_>,
-    table: &str,
-) -> Result<String, CatalogError> {
-    match resolve_graph_identity_in_txn(txn, table).await {
-        Ok(qualified) => Ok(qualified),
-        // Issue #933: an endpoint the role can't see doesn't resolve either,
-        // and the checks below would blame its shape or its columns.
-        Err(CatalogError::SourceTableNotFound(_)) => {
-            reject_inaccessible_table(txn, None, table).await?;
-            Ok(table.to_string())
         }
         Err(err) => Err(err),
     }
@@ -7304,51 +6816,6 @@ fn assert_deterministic_join_collation(
     Ok(())
 }
 
-/// [`RelationshipCardinality::ToOne`] iff `to_col` is the sole column of a
-/// `PRIMARY KEY` or `UNIQUE` index on `to_table`, introspected live against
-/// `pg_catalog` (`pg_index.indisunique` covers both index kinds; `indkey`'s
-/// length excludes any multi-column index `to_col` merely participates in,
-/// since that doesn't make `to_col` alone unique) — ADR-0006's cardinality
-/// rule. `indisvalid`/`indpred is null` exclude indexes that don't actually
-/// guarantee global uniqueness of `to_col`: a not-yet-validated index (e.g.
-/// left behind by a failed `CREATE UNIQUE INDEX CONCURRENTLY`) or a partial
-/// unique index (`... where active`), which only constrains the rows it
-/// covers. Assumes `to_table`/`to_col` already resolved (callers run this
-/// after [`column_type_in_txn`] has confirmed both exist) — [`create_relationship`]
-/// passes its own [`resolve_relationship_endpoint_in_txn`] result, not
-/// `def.to_table` directly (reviewer follow-up to issue #74), so a to-side
-/// explicitly qualified into a non-default schema resolves here too.
-async fn to_col_cardinality_in_txn(
-    txn: &tokio_postgres::Transaction<'_>,
-    to_table: &str,
-    to_col: &str,
-) -> Result<RelationshipCardinality, CatalogError> {
-    let is_unique: bool = txn
-        .query_one(
-            "select exists (
-                select 1
-                from pg_index i
-                join pg_attribute a
-                  on a.attrelid = i.indrelid and a.attname = $2
-                where i.indrelid = pg_catalog.to_regclass($1)
-                  and i.indisunique
-                  and i.indisvalid
-                  and i.indpred is null
-                  and array_length(i.indkey::int2[], 1) = 1
-                  and i.indkey[0] = a.attnum
-             )",
-            &[&ddl::regclass_arg(to_table), &to_col],
-        )
-        .await?
-        .get(0);
-
-    Ok(if is_unique {
-        RelationshipCardinality::ToOne
-    } else {
-        RelationshipCardinality::ToMany
-    })
-}
-
 /// Whether `qualified` (an unquoted `schema.table`) has a primary key, the
 /// part of [`change_keyed`]'s rule a partitioned root is held to as well.
 async fn has_primary_key(
@@ -8621,10 +8088,7 @@ pub async fn node_for_table(
 
 /// The [`SchemaEdge`]s of `kind` directed away from `node_table` — a
 /// generalized, `transform_definitions`-agnostic sibling of
-/// [`dependents_of`] for edge kinds whose dependents don't join back into
-/// `transform_definitions` (e.g. [`EdgeKind::Relationship`], whose
-/// dependents are `relationship_definitions` rows, read separately via
-/// [`relationship_by_name`]). Returns raw edges rather than joining onto any
+/// [`dependents_of`] that returns raw edges rather than joining onto any
 /// definition table, so it works for any [`EdgeKind`] without needing a
 /// kind-specific query. `node_table` must already be fully-qualified (issue
 /// #74, ADR-0011) — matched exactly against `schema_nodes.table_name`.
@@ -11092,44 +10556,6 @@ mod join_column_tests {
                     &resolved
                 )
                 .is_ok()
-            );
-        }
-    }
-}
-
-#[cfg(test)]
-mod relationship_name_tests {
-    use super::*;
-
-    /// Issue #830: a transform over `posts` reads `posts.<column>` as its
-    /// own source column, so a relationship on `posts` can't be named
-    /// `posts`. Any other name, or `posts` on another from-table, is fine.
-    #[test]
-    fn a_relationship_named_after_its_from_table_is_refused() {
-        let def = parse_relationship("RELATIONSHIP posts FROM posts.author_id TO users.id")
-            .expect("parse");
-        let err = reject_relationship_named_after_from_table(&def).unwrap_err();
-        assert_eq!(
-            err,
-            ValidationError::RelationshipNamedAfterFromTable {
-                name: "posts".to_string(),
-            }
-        );
-        assert_eq!(
-            err.to_string(),
-            "relationship 'posts' has the same name as its from-table; a transform over \
-             'posts' reads `posts.<column>` as its own source column, so give the \
-             relationship a different name"
-        );
-        for text in [
-            "RELATIONSHIP author FROM posts.author_id TO users.id",
-            "RELATIONSHIP posts FROM comments.post_id TO posts.id",
-        ] {
-            let def = parse_relationship(text).expect("parse");
-            assert_eq!(
-                reject_relationship_named_after_from_table(&def),
-                Ok(()),
-                "{text}"
             );
         }
     }

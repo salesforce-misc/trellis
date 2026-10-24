@@ -27,9 +27,7 @@ use trellis::dev::defs::ast::{
 };
 use trellis::dev::staging::{StagingError, await_converged, converged_through, watermark_token};
 
-use crate::model::{
-    Column, Op, PartitionAction, PartitionStrategy, Partitioning, Relationship, Table,
-};
+use crate::model::{Column, Op, PartitionAction, PartitionStrategy, Partitioning, Table};
 
 /// Quotes a Postgres identifier for safe interpolation into SQL text,
 /// mirroring `trellis::pool`'s own (crate-private) helper of the same name.
@@ -253,17 +251,6 @@ pub(super) fn render_expr(expr: &Expr) -> String {
         }
         Expr::RelationshipPath { rel, column } => format!("{rel}.{column}"),
     }
-}
-
-/// Renders a [`Relationship`] back to the concrete
-/// `RELATIONSHIP <name> FROM <table>.<col> TO <table>.<col>` syntax
-/// `create_relationship` parses (ADR-0006). Cardinality is deliberately not
-/// rendered — see `ManualBackend`'s former doc comment (git history) for why.
-pub(super) fn render_relationship(rel: &Relationship) -> String {
-    format!(
-        "RELATIONSHIP {} FROM {}.{} TO {}.{}",
-        rel.name, rel.from_table, rel.from_col, rel.to_table, rel.to_col
-    )
 }
 
 pub(super) fn render_operator(op: Operator) -> &'static str {

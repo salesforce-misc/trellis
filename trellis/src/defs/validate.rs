@@ -1315,44 +1315,6 @@ impl fmt::Display for ValidationError {
 
 impl std::error::Error for ValidationError {}
 
-/// A non-fatal caveat surfaced alongside an otherwise-successful definition —
-/// distinct from [`ValidationError`], which rejects the definition outright.
-/// Per ADR-0005's split between a missing correctness prerequisite (rejected) and a missing performance one (warned): a missing correctness
-/// prerequisite is a hard rejection, but a missing *performance* prerequisite
-/// (this type's only variant so far) still leaves the definition correct, so
-/// it's surfaced as guidance instead of an error.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RelationshipWarning {
-    /// The from-side join column (issue #31) has no usable btree index —
-    /// reverse propagation (ADR-0006: "finding rows to re-derive when a
-    /// related row changes") is still correct, since it's a plain
-    /// `from_col = $1` lookup, but a full scan of `from_table` on every
-    /// update to `to_table` is slow. Per ADR-0005, Trellis never creates the
-    /// index itself; it only names the exact DDL the user may run.
-    MissingFkIndex {
-        from_table: String,
-        from_col: String,
-    },
-}
-
-impl fmt::Display for RelationshipWarning {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            RelationshipWarning::MissingFkIndex {
-                from_table,
-                from_col,
-            } => write!(
-                f,
-                "no index on '{from_table}.{from_col}'; finding rows to re-derive when a \
-                 related row changes will require a full scan of '{from_table}' — consider \
-                 `CREATE INDEX ON {from_table} ({from_col});`"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for RelationshipWarning {}
-
 /// Validates `def` against the 1-1 subset. `source_columns` maps each
 /// column name known to exist on `def.source` to its [`ValueType`];
 /// resolving it against a real Postgres schema is out of scope here (see

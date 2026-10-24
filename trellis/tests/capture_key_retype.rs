@@ -4,7 +4,7 @@
 //!
 //! Define refuses a key, join or `GROUP BY` column whose type or collation
 //! Trellis can't match by. An `ALTER COLUMN ... TYPE` or `COLLATE` after
-//! define can give one such a type, break a relationship's same-type
+//! define can give one such a type, break a `JOIN`'s same-type `ON`
 //! pairing, render the keys Trellis already stored differently, or outgrow
 //! a copy Trellis keeps of the column. The staging worker's capture pass
 //! pauses the definitions concerned, with the reason on `Trellis::status`.
@@ -300,10 +300,11 @@ async fn assert_retyping(trellis: &Trellis, raw: &Client, target: &str) -> Strin
     error
 }
 
-/// `public.users` and `public.posts`, related by `posts.author` to
+/// `public.users` and `public.posts`, joined on `posts.author` =
 /// `users.handle`, with three definitions, all live:
 ///
-/// - `post_authors` reads `author.name` through the relationship;
+/// - `post_authors` joins `users` to each post, grouped by the post, the
+///   handle and its name;
 /// - `post_titles` reads only `posts`;
 /// - `per_kind` counts `posts` per `kind`.
 async fn setup(dsn: &str, raw: &mut Client, pool: &trellis::Pool) -> Trellis {
@@ -313,92 +314,24 @@ async fn setup(dsn: &str, raw: &mut Client, pool: &trellis::Pool) -> Trellis {
                                     kind int, price numeric(10,2)); \
          insert into public.users values ('ann', 'Ann'), ('bob', 'Bob'); \
          insert into public.posts values (1, 'ann', 'a', 1, 1.50), (2, 'bob', 'b', 2, 2.50), \
-                                         (3, 'ann', 'c', 1, 1.50);",
+                                         (3, 'ann', 'c', 1, 1.50); \
+         create index on public.posts (author);",
     )
     .await
     .expect("seed");
     let trellis = definer(dsn).await;
     for text in [
-        "RELATIONSHIP author FROM posts.author TO users.handle",
-        "TRANSFORM post_authors FROM public.posts SELECT author.name AS author_name",
+        "TRANSFORM post_authors FROM public.posts JOIN public.users \
+         ON posts.author = users.handle GROUP BY posts.id, users.handle, users.name \
+         WITHOUT SOURCE INDEX SELECT posts.id AS id, users.handle AS handle, \
+         users.name AS name, COUNT(*) AS n",
         "TRANSFORM post_titles FROM public.posts SELECT title AS title",
         "TRANSFORM per_kind FROM public.posts GROUP BY kind WITHOUT SOURCE INDEX SELECT kind AS kind, COUNT(*) AS n",
     ] {
-        if text.starts_with("RELATIONSHIP") {
-            trellis::dev::defs::create_relationship(trellis.pool(), text)
-                .await
-                .expect(text);
-        } else {
-            trellis.apply(text).await.expect(text);
-        }
+        trellis.apply(text).await.expect(text);
     }
     bring_live(raw, pool, &["post_authors", "post_titles", "per_kind"]).await;
     trellis
-}
-
-/// The issue's example: a join column altered to `character(n)` after the
-/// relationship exists. `character(n)`'s `::text` drops the padding its
-/// captured rendering keeps, so its keys would never match, and define
-/// refuses it. The capture pass pauses only the definition that reads
-/// through the relationship. A resume re-validates it as define would and
-/// refuses, leaving it paused, while the column is `character(n)`; once the
-/// column is back, a resume rebuilds it.
-#[tokio::test]
-async fn a_join_column_altered_to_character_n_pauses_its_readers_and_resume_refuses_until_it_is_changed_back()
- {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut raw = connect(db.dsn()).await;
-    let trellis = setup(db.dsn(), &mut raw, &db.pool).await;
-
-    raw.batch_execute("alter table public.users alter column handle type character(8)")
-        .await
-        .expect("re-type the to-side join column");
-    capture_pass(&mut raw, &db.pool).await;
-
-    let error = paused_for(&trellis, "post_authors", "public.users", &["handle"]).await;
-    assert!(
-        error.contains("character(8)")
-            && error.contains("relationship 'author'")
-            && error.contains("refuses until that is fixed"),
-        "{error}"
-    );
-    assert_eq!(status(&raw, "post_titles").await, TransformStatus::Live);
-    assert_eq!(status(&raw, "per_kind").await, TransformStatus::Live);
-
-    let refused = resume_refused(&trellis, "post_authors").await;
-    assert!(
-        refused.contains("users.handle") && refused.contains("character(8)"),
-        "{refused}"
-    );
-    paused_for(&trellis, "post_authors", "public.users", &["handle"]).await;
-
-    raw.batch_execute("alter table public.users alter column handle type varchar(8)")
-        .await
-        .expect("change the column back");
-    resume(&trellis, "post_authors").await;
-    assert_eq!(
-        status(&raw, "post_authors").await,
-        TransformStatus::WaitingToBackfill
-    );
-    bring_live(&mut raw, &db.pool, &["post_authors"]).await;
-    raw.batch_execute("update public.users set name = 'Annie' where handle = 'ann'")
-        .await
-        .expect("a write");
-    drain_to_quiescence(&db.pool, &mut raw).await;
-    assert_eq!(
-        rows(
-            &raw,
-            "select id::text, author_name from public.post_authors order by id"
-        )
-        .await,
-        rows(
-            &raw,
-            "select p.id::text, u.name from public.posts p \
-             join public.users u on u.handle = p.author order by p.id"
-        )
-        .await,
-    );
 }
 
 /// The changes no key rendering, typed copy or join pairing depends on
@@ -711,114 +644,6 @@ async fn widening_a_group_by_key_pauses_and_resume_widens_its_copies() {
     );
 }
 
-/// `public.users` and `public.posts`, related to-one by `posts.author_id`
-/// to `users.id`, both `integer`, with a 1-1 definition reading
-/// `author.name` through it, live.
-async fn post_authors(dsn: &str, raw: &mut Client, pool: &trellis::Pool) -> Trellis {
-    raw.batch_execute(
-        "create table public.users (id int primary key, name text); \
-         create table public.posts (id int primary key, author_id int, title text); \
-         insert into public.users values (1, 'Ann'), (2, 'Bob'); \
-         insert into public.posts values (1, 1, 'a'), (2, 2, 'b'), (3, 1, 'c');",
-    )
-    .await
-    .expect("seed");
-    let trellis = definer(dsn).await;
-    for text in [
-        "RELATIONSHIP author FROM posts.author_id TO users.id",
-        "TRANSFORM post_authors FROM public.posts SELECT author.name AS author_name",
-    ] {
-        if text.starts_with("RELATIONSHIP") {
-            trellis::dev::defs::create_relationship(trellis.pool(), text)
-                .await
-                .expect(text);
-        } else {
-            trellis.apply(text).await.expect(text);
-        }
-    }
-    bring_live(raw, pool, &["post_authors"]).await;
-    trellis
-}
-
-/// Widening one side of a join (`users.id` to `bigint` while
-/// `posts.author_id` stays `integer`) breaks #590's same-type pairing and
-/// outgrows the relationship projection's key, a copy of `users.id`: the
-/// pass pauses the reader for both. A resume refuses while the pair
-/// differs, naming both columns and both types. Once the other side is
-/// widened too, a resume re-types the projection's key and rebuilds.
-#[tokio::test]
-async fn a_one_sided_join_widening_pauses_and_resume_refuses_until_the_other_side_matches() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut raw = connect(db.dsn()).await;
-    let trellis = post_authors(db.dsn(), &mut raw, &db.pool).await;
-
-    raw.batch_execute("alter table public.users alter column id type bigint")
-        .await
-        .expect("widen the to-side join column");
-    capture_pass(&mut raw, &db.pool).await;
-    // The pass reaches `posts` first, where the pairing breaks.
-    let error = paused_for(&trellis, "post_authors", "public.posts", &["author_id"]).await;
-    assert!(
-        error.contains("posts.author_id (integer)")
-            && error.contains("users.id (bigint)")
-            && error.contains("Alter one column to match the other")
-            && error.contains("refuses until that is fixed"),
-        "{error}"
-    );
-
-    let refused = resume_refused(&trellis, "post_authors").await;
-    assert!(
-        refused.contains("posts.author_id (integer)") && refused.contains("users.id (bigint)"),
-        "{refused}"
-    );
-    paused_for(&trellis, "post_authors", "public.posts", &["author_id"]).await;
-
-    raw.batch_execute("alter table public.posts alter column author_id type bigint")
-        .await
-        .expect("widen the from-side to match");
-    capture_pass(&mut raw, &db.pool).await;
-    resume(&trellis, "post_authors").await;
-    let error = assert_retyping(&trellis, &raw, "post_authors").await;
-    let projection: String = raw
-        .query_one("select projection_table from relationship_projections", &[])
-        .await
-        .expect("the relationship's projection")
-        .get(0);
-    assert!(
-        error.contains(&format!("trellis.{projection}.id from integer to bigint")),
-        "{error}"
-    );
-    capture_pass(&mut raw, &db.pool).await;
-    assert_eq!(
-        column_type(&raw, &format!("trellis.{projection}"), "id").await,
-        "bigint"
-    );
-    bring_live(&mut raw, &db.pool, &["post_authors"]).await;
-    raw.batch_execute(
-        "insert into public.users values (3000000000, 'Big'); \
-         insert into public.posts values (4, 3000000000, 'd');",
-    )
-    .await
-    .expect("a join key above 2^31");
-    full_pass(&mut raw, &db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
-    assert_eq!(status(&raw, "post_authors").await, TransformStatus::Live);
-    assert_eq!(
-        rows(
-            &raw,
-            "select id::text, author_name from public.post_authors order by id"
-        )
-        .await,
-        rows(
-            &raw,
-            "select p.id::text, u.name from public.posts p \
-             left join public.users u on u.id = p.author_id order by p.id"
-        )
-        .await,
-    );
-}
-
 /// A key widened before the capture pass sees it, and a value above 2^31
 /// drained meanwhile: the target's copy can't hold it, so the key is
 /// quarantined. The pass then pauses the definition. The resume re-types
@@ -1077,8 +902,8 @@ async fn a_type_change_that_re_renders_the_keys_pauses_and_resume_rebuilds_it() 
     );
 }
 /// A nondeterministic collation given to a `GROUP BY` column after define,
-/// which define refuses (#638), pauses the aggregate. The relationship's
-/// reader, which doesn't key by the column, keeps applying.
+/// which define refuses (#638), pauses the aggregate. The `JOIN`, which
+/// doesn't key by the column, keeps applying.
 ///
 /// Only ICU provides nondeterministic collations; every test cluster's
 /// default collation is ICU (#665).
@@ -1309,79 +1134,6 @@ async fn a_field_resume_refuses_a_definition_define_would_refuse_now() {
         .expect("read column_status")
         .get(0);
     assert_eq!(still_paused, 1);
-}
-
-/// An aggregate's `GROUP BY` key read through a to-one relationship
-/// (`GROUP BY author.country`) is read from the relationship's projection,
-/// whose column for it copies the to-side column's type. Widening the
-/// to-side column (`varchar(2)` to `varchar(20)`) changes no copy (it is an
-/// unbounded `varchar`, #1207), and the aggregate stays live, so a longer
-/// value groups.
-#[tokio::test]
-async fn widening_a_group_by_key_read_through_a_relationship_re_types_no_projection_column() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut raw = connect(db.dsn()).await;
-    raw.batch_execute(
-        "create table public.users (id int primary key, country varchar(2)); \
-         create table public.posts (id int primary key, author_id int); \
-         insert into public.users values (1, 'US'), (2, 'FR'); \
-         insert into public.posts values (1, 1), (2, 2), (3, 1);",
-    )
-    .await
-    .expect("seed");
-    let trellis = definer(db.dsn()).await;
-    for text in [
-        "RELATIONSHIP author FROM posts.author_id TO users.id",
-        "TRANSFORM per_country FROM public.posts GROUP BY author.country \
-        WITHOUT SOURCE INDEX SELECT author.country AS country, COUNT(*) AS n",
-    ] {
-        if text.starts_with("RELATIONSHIP") {
-            trellis::dev::defs::create_relationship(trellis.pool(), text)
-                .await
-                .expect(text);
-        } else {
-            trellis.apply(text).await.expect(text);
-        }
-    }
-    bring_live(&mut raw, &db.pool, &["per_country"]).await;
-    let projection: String = raw
-        .query_one("select projection_table from relationship_projections", &[])
-        .await
-        .expect("the relationship's projection")
-        .get(0);
-    let projection = format!("trellis.{projection}");
-
-    let before = relfilenode(&raw, &projection).await;
-    raw.batch_execute("alter table public.users alter column country type varchar(20)")
-        .await
-        .expect("widen the GROUP BY key's to-side column");
-    capture_pass(&mut raw, &db.pool).await;
-    assert_eq!(status(&raw, "per_country").await, TransformStatus::Live);
-    assert_eq!(
-        column_type(&raw, &projection, "country").await,
-        "character varying"
-    );
-    assert_eq!(relfilenode(&raw, &projection).await, before, "no rewrite");
-    raw.batch_execute("update public.users set country = 'United States' where id = 1")
-        .await
-        .expect("a longer value");
-    full_pass(&mut raw, &db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
-    assert_eq!(status(&raw, "per_country").await, TransformStatus::Live);
-    assert_eq!(
-        rows(
-            &raw,
-            "select country::text, n::text from public.per_country where n <> 0 order by 1"
-        )
-        .await,
-        rows(
-            &raw,
-            "select u.country::text, count(*)::text from public.posts p \
-             join public.users u on u.id = p.author_id group by 1 order by 1"
-        )
-        .await,
-    );
 }
 
 /// #760 rule 8: re-typing a copy in place can fail. A 1-1 key re-typed
@@ -2637,21 +2389,18 @@ async fn a_definition_refused_at_its_automatic_resume_stays_paused_with_the_refu
     )
     .await
     .expect("seed owners");
-    for text in [
-        "RELATIONSHIP owner FROM item_names.name TO owners.code",
-        "TRANSFORM b_owners FROM public.item_names SELECT owner.label AS owner_label",
-    ] {
-        if text.starts_with("RELATIONSHIP") {
-            trellis::dev::defs::create_relationship(trellis.pool(), text)
-                .await
-                .expect(text);
-        } else {
-            trellis.apply(text).await.expect(text);
-        }
-    }
+    trellis
+        .apply(
+            "TRANSFORM b_owners FROM public.item_names JOIN public.owners \
+             ON item_names.name = owners.code GROUP BY item_names.id, owners.label \
+             WITHOUT SOURCE INDEX SELECT item_names.id AS id, owners.label AS label, \
+             COUNT(*) AS n",
+        )
+        .await
+        .expect("define b_owners");
     bring_live(&mut raw, &db.pool, &["item_names", "b_owners"]).await;
     trellis
-        .apply("TRANSFORM c_owners FROM public.b_owners SELECT owner_label AS owner_label")
+        .apply("TRANSFORM c_owners FROM public.b_owners SELECT label AS owner_label")
         .await
         .expect("define c_owners");
     bring_live(&mut raw, &db.pool, &["item_names", "b_owners", "c_owners"]).await;
@@ -2668,7 +2417,7 @@ async fn a_definition_refused_at_its_automatic_resume_stays_paused_with_the_refu
     // type character(n).
     raw.batch_execute("alter table public.owners alter column code type character(10)")
         .await
-        .expect("re-type the to-side join column");
+        .expect("re-type the joined table's ON column");
     step_until_live(&trellis, &mut raw, &db.pool, "item_names", &["b_owners"]).await;
 
     capture_pass(&mut raw, &db.pool).await;
@@ -2971,10 +2720,9 @@ async fn a_resume_waits_for_an_upstream_that_reports_catching_up() {
 }
 
 /// #971 rule 7: a resume waits on every definition whose target it reads,
-/// through its source, a `JOIN`'s joined table and a relationship's to-side,
-/// so those waits end only if no definition can come to read its own target
-/// through them. Define refuses each such loop: one closed by a `JOIN`'s
-/// joined table, and one closed through a relationship's to-side.
+/// through its source or a `JOIN`'s joined table, so those waits end only if
+/// no definition can come to read its own target through them. Define
+/// refuses such a loop: here one closed by a `JOIN`'s joined table.
 #[tokio::test]
 async fn no_chain_of_upstreams_a_resume_waits_on_can_loop() {
     let cluster = TestCluster::start();
@@ -3003,15 +2751,6 @@ async fn no_chain_of_upstreams_a_resume_waits_on_can_loop() {
          ON others.id = item_names.id GROUP BY others.region WITHOUT SOURCE INDEX SELECT COUNT(*) AS n",
     )
     .await;
-    // items -> item_names, item_names the to-side others reads, and others
-    // into items.
-    trellis::dev::defs::create_relationship(
-        trellis.pool(),
-        "RELATIONSHIP named FROM others.id TO item_names.id",
-    )
-    .await
-    .expect("define the relationship");
-    refused("TRANSFORM items FROM public.others SELECT named.name AS name").await;
 }
 
 /// #971: a downstream whose upstream nobody resumes keeps waiting across
@@ -3077,18 +2816,15 @@ async fn a_waiting_resume_refused_once_its_upstream_is_live_is_not_retried() {
     )
     .await
     .expect("seed owners");
-    for text in [
-        "RELATIONSHIP owner FROM item_names.name TO owners.code",
-        "TRANSFORM b_owners FROM public.item_names SELECT owner.label AS owner_label",
-    ] {
-        if text.starts_with("RELATIONSHIP") {
-            trellis::dev::defs::create_relationship(trellis.pool(), text)
-                .await
-                .expect(text);
-        } else {
-            trellis.apply(text).await.expect(text);
-        }
-    }
+    trellis
+        .apply(
+            "TRANSFORM b_owners FROM public.item_names JOIN public.owners \
+             ON item_names.name = owners.code GROUP BY item_names.id, owners.label \
+             WITHOUT SOURCE INDEX SELECT item_names.id AS id, owners.label AS label, \
+             COUNT(*) AS n",
+        )
+        .await
+        .expect("define b_owners");
     bring_live(&mut raw, &db.pool, &["item_names", "b_owners"]).await;
     pause(&trellis, "item_names").await;
     pause(&trellis, "b_owners").await;
@@ -3099,7 +2835,7 @@ async fn a_waiting_resume_refused_once_its_upstream_is_live_is_not_retried() {
     // type character(n).
     raw.batch_execute("alter table public.owners alter column code type character(10)")
         .await
-        .expect("re-type the to-side join column");
+        .expect("re-type the joined table's ON column");
     resume(&trellis, "item_names").await;
     step_until_live_requested(
         &trellis,
@@ -3272,105 +3008,71 @@ async fn a_definition_paused_before_the_upstream_resume_records_no_cause() {
 }
 
 /// #828: a definition the upstream's re-type pauses that also fails its own
-/// re-validation keeps its own error, with no cause: here the re-typed key
-/// is a relationship's to-side, whose join columns no longer match, which a
-/// resume refuses until the other side matches.
+/// re-validation keeps its own error, with no cause: here the re-type moves
+/// the column a `SUM` reads (`next`, `qty + 1` over a `qty` now
+/// `numeric(10,2)`) to an unconstrained `numeric`, which define refuses
+/// under a `SUM`, so a resume refuses until the column is changed back.
 #[tokio::test]
 async fn a_definition_the_re_type_leaves_refused_keeps_its_own_error() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
     let trellis = items(db.dsn(), &mut raw, &db.pool).await;
-    raw.batch_execute(
-        "create table public.notes (id int primary key, item int, body text); \
-         insert into public.notes values (1, 1, 'x'), (2, 2, 'y');",
-    )
-    .await
-    .expect("seed notes");
-    for text in [
-        "RELATIONSHIP item FROM notes.item TO item_names.id",
-        "TRANSFORM note_items FROM public.notes SELECT item.name AS item_name",
-    ] {
-        if text.starts_with("RELATIONSHIP") {
-            trellis::dev::defs::create_relationship(trellis.pool(), text)
-                .await
-                .expect(text);
-        } else {
-            trellis.apply(text).await.expect(text);
-        }
-    }
-    bring_live(&mut raw, &db.pool, &["item_names", "note_items"]).await;
-
-    raw.batch_execute("alter table public.items alter column id type bigint")
+    trellis
+        .apply(
+            "TRANSFORM name_totals FROM public.item_names GROUP BY name \
+             WITHOUT SOURCE INDEX SELECT name AS name, SUM(next) AS total",
+        )
         .await
-        .expect("widen the key");
+        .expect("define name_totals");
+    bring_live(&mut raw, &db.pool, &["item_names", "name_totals"]).await;
+
+    raw.batch_execute("alter table public.items alter column qty type numeric(10,2)")
+        .await
+        .expect("move qty to numeric(10,2)");
     capture_pass(&mut raw, &db.pool).await;
     resume(&trellis, "item_names").await;
     capture_pass(&mut raw, &db.pool).await;
-    assert_eq!(column_type(&raw, "public.item_names", "id").await, "bigint");
+    assert_eq!(
+        column_type(&raw, "public.item_names", "next").await,
+        "numeric"
+    );
 
-    // The pass checks the relationship's from-side first, and pauses it
-    // there.
-    let error = paused_for(&trellis, "note_items", "public.notes", &["item"]).await;
+    let error = paused_for(&trellis, "name_totals", "public.item_names", &["next"]).await;
     assert!(
-        !error.contains("the resume of") && error.contains("refuses until that is fixed"),
+        !error.contains("the resume of")
+            && error.contains("SUM(next)")
+            && error.contains("refuses until that is fixed"),
         "{error}"
     );
-    assert_eq!(caused_by(&raw, "note_items").await, None);
+    assert_eq!(caused_by(&raw, "name_totals").await, None);
     // A resume waits for item_names to be live (#971), then refuses.
     bring_live(&mut raw, &db.pool, &["item_names"]).await;
-    resume_refused(&trellis, "note_items").await;
+    resume_refused(&trellis, "name_totals").await;
 }
 
 /// #828: [`a_definition_the_re_type_leaves_refused_keeps_its_own_error`]
-/// with the refusal found on the re-typed target itself. The relationship's
-/// from-side is another definition's target (`z_notes`), which the pass
-/// checks after `item_names`, so the pairing that no longer matches is
-/// found while checking the table the upstream resume re-typed, alongside
-/// a projection column (`next`) that outgrew only because that resume
-/// re-typed it. The refusal still stands, with no cause, while a sibling
-/// the same check pauses for the re-type alone records it.
+/// alongside a copy (`id`, a `GROUP BY` key) that outgrew only because that
+/// resume re-typed it. The refusal still stands, with no cause, while a
+/// sibling the same check pauses for the re-type alone records it.
 #[tokio::test]
 async fn a_definition_refused_on_the_re_typed_target_keeps_its_own_error() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
     let trellis = items(db.dsn(), &mut raw, &db.pool).await;
-    raw.batch_execute(
-        "create table public.notes (id int primary key, item int, body text); \
-         insert into public.notes values (1, 1, 'x'), (2, 2, 'y');",
-    )
-    .await
-    .expect("seed notes");
     for text in [
-        "TRANSFORM z_notes FROM public.notes SELECT item AS item",
         "TRANSFORM b_names FROM public.item_names SELECT name AS name",
+        "TRANSFORM id_totals FROM public.item_names GROUP BY id \
+         WITHOUT SOURCE INDEX SELECT id AS id, SUM(next) AS total",
     ] {
         trellis.apply(text).await.expect(text);
     }
-    bring_live(&mut raw, &db.pool, &["item_names", "z_notes", "b_names"]).await;
-    for text in [
-        "RELATIONSHIP item FROM z_notes.item TO item_names.id",
-        "TRANSFORM note_items FROM public.z_notes \
-         SELECT item.name AS item_name, item.next AS item_next",
-    ] {
-        if text.starts_with("RELATIONSHIP") {
-            trellis::dev::defs::create_relationship(trellis.pool(), text)
-                .await
-                .expect(text);
-        } else {
-            trellis.apply(text).await.expect(text);
-        }
-    }
-    bring_live(
-        &mut raw,
-        &db.pool,
-        &["item_names", "z_notes", "b_names", "note_items"],
-    )
-    .await;
+    bring_live(&mut raw, &db.pool, &["item_names", "b_names", "id_totals"]).await;
 
     raw.batch_execute(
-        "alter table public.items alter column id type bigint, alter column qty type bigint",
+        "alter table public.items alter column id type bigint, \
+                                  alter column qty type numeric(10,2)",
     )
     .await
     .expect("widen the key and qty");
@@ -3379,12 +3081,14 @@ async fn a_definition_refused_on_the_re_typed_target_keeps_its_own_error() {
     capture_pass(&mut raw, &db.pool).await;
     assert_eq!(column_type(&raw, "public.item_names", "id").await, "bigint");
 
-    let error = paused_for(&trellis, "note_items", "public.item_names", &["id", "next"]).await;
+    let error = paused_for(&trellis, "id_totals", "public.item_names", &["id", "next"]).await;
     assert!(
-        !error.contains("the resume of") && error.contains("refuses until that is fixed"),
+        !error.contains("the resume of")
+            && error.contains("SUM(next)")
+            && error.contains("refuses until that is fixed"),
         "{error}"
     );
-    assert_eq!(caused_by(&raw, "note_items").await, None);
+    assert_eq!(caused_by(&raw, "id_totals").await, None);
     // The sibling the same check pauses for the re-type alone records it.
     paused_for(&trellis, "b_names", "public.item_names", &["id"]).await;
     assert_eq!(
@@ -3393,7 +3097,7 @@ async fn a_definition_refused_on_the_re_typed_target_keeps_its_own_error() {
     );
     // A resume waits for item_names to be live (#971), then refuses.
     bring_live(&mut raw, &db.pool, &["item_names"]).await;
-    resume_refused(&trellis, "note_items").await;
+    resume_refused(&trellis, "id_totals").await;
 }
 
 /// #824: a source change whose columns Trellis created from it hold every
@@ -3508,56 +3212,47 @@ async fn changes_no_created_column_outgrows_pause_nothing() {
 }
 
 /// The columns #824's in-place re-type reaches, over `public.users` and
-/// `public.posts` (`posts.author` related to `users.handle`):
+/// `public.posts` (`posts.author` joined to `users.handle`):
 ///
 /// - `user_labels`, a 1-1 definition: its target's key copies
 ///   `users.handle`, and its passthrough `users.label`;
-/// - `post_labels` reads `author.label`: the relationship's projection
-///   copies `users.handle` as its key and `users.label` as a data column;
+/// - `post_labels`, a `JOIN` grouped by the post, `users.handle` and
+///   `users.label`: its target copies both joined columns;
 /// - `per_author` takes `COUNT(amount)` per `author`: its target and its
 ///   group basis copy `posts.author` as the group key.
 ///
 /// `key` is the type of `users.handle` and `posts.author`, `value` of
-/// `users.label` and `posts.amount`. Returns the projection, qualified.
+/// `users.label` and `posts.amount`.
 async fn widening_fixture(
     dsn: &str,
     raw: &mut Client,
     pool: &trellis::Pool,
     key: &str,
     value: &str,
-) -> String {
+) {
     raw.batch_execute(&format!(
         "create table public.users (handle {key} primary key, label {value}); \
          create table public.posts (id int primary key, author {key}, amount {value}); \
          insert into public.users values ('ann', '1.50'), ('bob', '2.25'); \
          insert into public.posts values (1, 'ann', '1.50'), (2, 'bob', '2.25'), \
-                                         (3, 'ann', '3.75');"
+                                         (3, 'ann', '3.75'); \
+         create index on public.posts (author);"
     ))
     .await
     .expect("seed");
     let trellis = definer(dsn).await;
     for text in [
-        "RELATIONSHIP author FROM posts.author TO users.handle",
         "TRANSFORM user_labels FROM public.users SELECT label AS label",
-        "TRANSFORM post_labels FROM public.posts SELECT author.label AS author_label",
+        "TRANSFORM post_labels FROM public.posts LEFT JOIN public.users \
+         ON posts.author = users.handle GROUP BY posts.id, users.handle, users.label \
+         WITHOUT SOURCE INDEX SELECT posts.id AS id, users.handle AS handle, \
+         users.label AS label, COUNT(*) AS n",
         "TRANSFORM per_author FROM public.posts GROUP BY author \
         WITHOUT SOURCE INDEX SELECT author AS author, COUNT(amount) AS top",
     ] {
-        if text.starts_with("RELATIONSHIP") {
-            trellis::dev::defs::create_relationship(trellis.pool(), text)
-                .await
-                .expect(text);
-        } else {
-            trellis.apply(text).await.expect(text);
-        }
+        trellis.apply(text).await.expect(text);
     }
     bring_live(raw, pool, &WIDENING_TARGETS).await;
-    let projection: String = raw
-        .query_one("select projection_table from relationship_projections", &[])
-        .await
-        .expect("the relationship's projection")
-        .get(0);
-    format!("trellis.{projection}")
 }
 
 const WIDENING_TARGETS: [&str; 3] = ["user_labels", "post_labels", "per_author"];
@@ -3570,9 +3265,11 @@ async fn assert_widening_targets_match(raw: &Client) {
             "select handle::text, label::text from public.users order by 1",
         ),
         (
-            "select id::text, author_label::text from public.post_labels order by 1",
-            "select p.id::text, u.label::text from public.posts p \
-             left join public.users u on u.handle = p.author order by 1",
+            "select id::text, handle::text, label::text, n::text from public.post_labels \
+             where n <> 0 order by 1",
+            "select p.id::text, u.handle::text, u.label::text, count(*)::text \
+             from public.posts p left join public.users u on u.handle = p.author \
+             group by p.id, u.handle, u.label order by 1",
         ),
         (
             "select author::text, top::text from public.per_author order by 1",
@@ -3602,9 +3299,9 @@ async fn a_modifier_widening_re_types_no_copy(
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
-    let projection = widening_fixture(db.dsn(), &mut raw, &db.pool, key, value).await;
+    widening_fixture(db.dsn(), &mut raw, &db.pool, key, value).await;
     let target_file = relfilenode(&raw, "public.user_labels").await;
-    let projection_file = relfilenode(&raw, &projection).await;
+    let joined_file = relfilenode(&raw, "public.post_labels").await;
 
     let mut alter = format!(
         "alter table public.users alter column label type {value_to}; \
@@ -3651,13 +3348,19 @@ async fn a_modifier_widening_re_types_no_copy(
         column_type(&raw, "public.user_labels", "label").await,
         value_display
     );
-    assert_eq!(column_type(&raw, &projection, "label").await, value_display);
+    assert_eq!(
+        column_type(&raw, "public.post_labels", "label").await,
+        value_display
+    );
     if let Some((_, key_display)) = key_to {
         assert_eq!(
             column_type(&raw, "public.user_labels", "handle").await,
             key_display
         );
-        assert_eq!(column_type(&raw, &projection, "handle").await, key_display);
+        assert_eq!(
+            column_type(&raw, "public.post_labels", "handle").await,
+            key_display
+        );
     }
     assert_eq!(
         relfilenode(&raw, "public.user_labels").await,
@@ -3665,8 +3368,8 @@ async fn a_modifier_widening_re_types_no_copy(
         "no rewrite"
     );
     assert_eq!(
-        relfilenode(&raw, &projection).await,
-        projection_file,
+        relfilenode(&raw, "public.post_labels").await,
+        joined_file,
         "no rewrite"
     );
 
@@ -3765,7 +3468,7 @@ async fn more_numeric_precision_at_the_same_scale_re_types_no_copy() {
 
 /// ADR-0020: a value past a widened `numeric(p,s)` or `varchar(n)` applies
 /// with no pass between the `ALTER` and the drain, to a 1-1 passthrough and
-/// to a to-one projection's data column. Nothing is held, nothing pauses
+/// to a `JOIN`'s copy of a joined table's column. Nothing is held, nothing pauses
 /// and no column changes. A key held for another reason (a check
 /// constraint on the target, `23514`) stays held, and the pass releases
 /// nothing.
@@ -3781,23 +3484,19 @@ async fn a_value_the_old_modifier_couldnt_hold_applies_with_no_pass_and_no_hold(
          create table public.users (id int primary key, score numeric(5,2)); \
          create table public.posts (id int primary key, author_id int); \
          insert into public.users values (1, 1.50), (2, 2.50); \
-         insert into public.posts values (1, 1), (2, 2), (3, 1);",
+         insert into public.posts values (1, 1), (2, 2), (3, 1); \
+         create index on public.posts (author_id);",
     )
     .await
     .expect("seed");
     let trellis = definer(db.dsn()).await;
     for text in [
         "TRANSFORM good_names FROM public.goods SELECT name AS name, price AS price, qty AS qty",
-        "RELATIONSHIP author FROM posts.author_id TO users.id",
-        "TRANSFORM post_authors FROM public.posts SELECT author.score AS author_score",
+        "TRANSFORM post_authors FROM public.posts JOIN public.users \
+         ON posts.author_id = users.id GROUP BY posts.id, users.score WITHOUT SOURCE INDEX \
+         SELECT posts.id AS id, users.score AS score, COUNT(*) AS n",
     ] {
-        if text.starts_with("RELATIONSHIP") {
-            trellis::dev::defs::create_relationship(trellis.pool(), text)
-                .await
-                .expect(text);
-        } else {
-            trellis.apply(text).await.expect(text);
-        }
+        trellis.apply(text).await.expect(text);
     }
     let targets = ["good_names", "post_authors"];
     bring_live(&mut raw, &db.pool, &targets).await;
@@ -3873,7 +3572,8 @@ async fn a_value_the_old_modifier_couldnt_hold_applies_with_no_pass_and_no_hold(
     assert_eq!(
         rows(
             &raw,
-            "select id::text, author_score::text from public.post_authors order by id"
+            "select id::text, score::text from public.post_authors where n <> 0 \
+             order by id"
         )
         .await,
         rows(
@@ -4442,9 +4142,9 @@ async fn a_widening_after_clean_passes_is_caught_on_the_next_pass() {
     assert!(after["per_kind"] > settled["per_kind"], "{after:?}");
 }
 
-/// A widening of a `varchar` column read through a relationship, after clean
-/// passes, is compared again by the next pass, both sides alike, and finds
-/// the unbounded copies current (#1207).
+/// A widening of a `varchar` `ON` pair of a `JOIN`, after clean passes, is
+/// compared again by the next pass, both sides alike, and finds the
+/// unbounded copies current (#1207).
 #[tokio::test]
 async fn a_varchar_widening_after_clean_passes_is_compared_again_and_re_types_nothing() {
     let cluster = TestCluster::start();
@@ -4469,13 +4169,8 @@ async fn a_varchar_widening_after_clean_passes_is_compared_again_and_re_types_no
             "{target}"
         );
     }
-    let projection: String = raw
-        .query_one("select projection_table from relationship_projections", &[])
-        .await
-        .expect("projection")
-        .get(0);
     assert_eq!(
-        column_type(&raw, &format!("trellis.{projection}"), "handle").await,
+        column_type(&raw, "public.post_authors", "handle").await,
         "character varying"
     );
     let after = copy_checks(&raw).await;
@@ -4559,42 +4254,39 @@ async fn a_resumed_definition_is_compared_again_and_then_skipped() {
     assert_eq!(status(&raw, "per_kind").await, TransformStatus::Live);
 }
 
-/// The aggregate's ledger and the relationship's projection are read by the
-/// comparison, so a change to either alone, with the source untouched,
-/// brings it back.
+/// The aggregate's ledger is read by the comparison, so a change to it
+/// alone, with the source untouched, brings it back.
 #[tokio::test]
 #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
-async fn a_change_to_a_ledger_or_projection_column_alone_is_compared_again() {
+async fn a_change_to_a_ledger_column_alone_is_compared_again() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
-    let (_trellis, mut last) = settled(&db, &mut raw).await;
-    let projection: String = raw
-        .query_one("select projection_table from relationship_projections", &[])
+    raw.batch_execute(
+        "create table public.posts (id int primary key, kind int); \
+         insert into public.posts values (1, 1), (2, 2), (3, 1);",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    trellis
+        .apply(
+            "TRANSFORM per_kind FROM public.posts GROUP BY kind WITHOUT SOURCE INDEX \
+             SELECT kind AS kind, COUNT(*) AS n",
+        )
         .await
-        .expect("projection")
-        .get(0);
+        .expect("define per_kind");
+    bring_live(&mut raw, &db.pool, &["per_kind"]).await;
+    capture_pass(&mut raw, &db.pool).await;
+    let settled = copy_checks(&raw).await;
+    assert!(settled["per_kind"] > 0, "{settled:?}");
 
-    for (table, alter, target) in [
-        (
-            "public.per_kind__ledger".to_string(),
-            "alter column kind type bigint",
-            "per_kind",
-        ),
-        (
-            format!("trellis.{projection}"),
-            "alter column name type varchar(5)",
-            "post_authors",
-        ),
-    ] {
-        raw.batch_execute(&format!("alter table {table} {alter}"))
-            .await
-            .unwrap_or_else(|err| panic!("{table}: {err}"));
-        capture_pass(&mut raw, &db.pool).await;
-        let after = copy_checks(&raw).await;
-        assert!(after[target] > last[target], "{table}: {after:?}");
-        last = after;
-    }
+    raw.batch_execute("alter table public.per_kind__ledger alter column kind type bigint")
+        .await
+        .expect("re-type the ledger's column");
+    capture_pass(&mut raw, &db.pool).await;
+    let after = copy_checks(&raw).await;
+    assert!(after["per_kind"] > settled["per_kind"], "{after:?}");
 }
 
 /// A copy found different from what define would give it, though the source

@@ -1,10 +1,9 @@
 //! Integration tests for `defs::catalog::install_definition` (issue #63 C1):
 //! the front door that creates a definition's target table once, then
 //! records it for the backfill discharge (ADR-0002, #418, #419), which builds
-//! it by shape: a plain 1-1 definition's chunks, an aggregate's or
-//! relationship-enriched 1-1 definition's direct-build job
-//! (`backfill::backfill_definition`), or the ring enumeration for a shape the
-//! direct build can't render.
+//! it by shape: a plain 1-1 definition's chunks, an aggregate's direct-build
+//! job (`backfill::backfill_definition`), or the ring enumeration for a shape
+//! the direct build can't render.
 //!
 //! Each branch leaves a distinct, checkable signature in the ring: a direct or
 //! chunked build stages no enumeration `Recompute` rows, while the ring
@@ -15,8 +14,7 @@
 //! worker's discharge.
 //!
 //! The staging harness (connect, stage a CDC row, seal/drain to quiescence)
-//! mirrors `apply_relationships.rs`/`defs_relationship_frontdoor.rs`; see
-//! those files for the ring/seal mechanics.
+//! is this file's own.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -25,11 +23,7 @@ use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
 use trellis::CatalogError;
 use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
-use trellis::defs::ast::{Expr, FieldDef, KeySpace, Predicate, RelationshipDef, TransformDef};
-use trellis::defs::{
-    TransformStatus, ValueType, chunk_queue, create_relationship, install_definition,
-    render_relationship_select_sql,
-};
+use trellis::defs::{TransformStatus, ValueType, chunk_queue, install_definition};
 use trellis::staging::apply;
 use trellis::staging::{has_pending, retire_drained_segments};
 
@@ -37,7 +31,7 @@ use trellis::staging::{has_pending, retire_drained_segments};
 /// (`trellis::defs::chunk_queue`, ADR-0002) until none
 /// remain — the test-harness stand-in for a running `application_threads`
 /// drain worker, since `install_definition` no longer runs a plain
-/// (non-relationship) 1-1 definition's backfill in-call: it now returns as
+/// 1-1 definition's backfill in-call: it now returns as
 /// soon as the chunk work is enumerated and persisted, `Backfilling` until a
 /// drain worker actually claims and finishes each chunk. Then runs the
 /// staging worker's discharge of the go-live catch-ups those builds parked,
@@ -170,11 +164,19 @@ async fn stage_cdc(
         .unwrap_or_else(|e| panic!("stage cdc {key:?} into {table} failed: {e}"));
 }
 
+/// A composite primary-key identity string, U+001F-joined in the key's own
+/// declared column order: the encoding the capture trigger and
+/// `intake::markers::enumerate_and_append` both produce, and the one
+/// `ddl::pk_key_sql_expr`/`ddl::split_pk_key` on the apply side agree with
+/// (issue #126).
+fn composite_key(parts: &[&str]) -> String {
+    parts.join("\u{1f}")
+}
+
 /// Seals and drains repeatedly until nothing is pending anywhere in the ring.
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
     // Issue #132: a throwaway, always-caught-up watermark — this helper
-    // has no live capture running (these tests stage CDC rows by hand),
-    // and none of this file's tests exercise guard (a) specifically, so a
+    // has no live capture running, and none of this file's tests exercise guard (a) specifically, so a
     // real watermark would only ever make guard (a) reject spuriously.
     let watermark = trellis::staging::StagedWatermark::saturated();
     let watermark = &watermark;
@@ -217,7 +219,7 @@ fn columns(pairs: &[(&str, ValueType)]) -> HashMap<String, ValueType> {
 }
 
 // ---------------------------------------------------------------------
-// Fast-path success branch: a plain (non-relationship) 1-1 definition.
+// Fast-path success branch: a plain 1-1 definition.
 // ---------------------------------------------------------------------
 
 #[tokio::test]
@@ -415,7 +417,7 @@ async fn install_definition_chunks_a_composite_key_boundary_inside_a_group_into_
 /// source, and the two hold different row counts/values so a wrong-table read
 /// is unmistakable in the target's contents, not just in a persisted string.
 ///
-/// Drives the definition all the way through the fast (non-relationship 1-1)
+/// Drives the definition all the way through the fast (plain 1-1)
 /// path's durable chunk queue (the backfill discharge ->
 /// `backfill::plan_one_to_one_chunks` -> `chunk_queue::dispatch_one_to_one`,
 /// claimed and executed by [`drain_backfill_chunks`] via
@@ -701,6 +703,10 @@ async fn install_definition_fast_path_ends_up_live() {
     );
 }
 
+/// A doubling alias chain (`f<k> = f<k-1> + f<k-1>`) whose inlined form
+/// outgrows the direct build's substitution budget is `Unsupported`, so the
+/// discharge enumerates its source into the ring instead, and flips it live
+/// in its own transaction.
 #[tokio::test]
 async fn install_definition_ring_fallback_ends_up_live() {
     let cluster = TestCluster::start();
@@ -709,34 +715,19 @@ async fn install_definition_ring_fallback_ends_up_live() {
 
     client
         .batch_execute(
-            "create table categories (id integer primary key, name text); \
-             create table articles (id integer primary key, category_id integer, title text); \
-             insert into categories (id, name) values (10, 'Tech'); \
-             insert into articles (id, category_id, title) values (1, 10, 'a1')",
+            "create table s (id bigint primary key, a numeric); \
+             insert into s (id, a) values (1, 1)",
         )
         .await
-        .expect("create + seed tables");
+        .expect("create + seed the source");
 
-    create_relationship(
-        &db.pool,
-        "RELATIONSHIP category FROM articles.category_id TO categories.id",
-    )
-    .await
-    .expect("create to-one relationship");
-
-    let source_columns = columns(&[
-        ("id", ValueType::Numeric),
-        ("category_id", ValueType::Numeric),
-        ("title", ValueType::Text),
-    ]);
-
-    // Same `Unsupported` shape as the fallback test below: routes through
-    // the speculative-insert-then-delete-then-ring-recreate path in
-    // `install_definition`.
+    let chain: Vec<String> = std::iter::once("a + a AS f0".to_string())
+        .chain((1..=17).map(|k| format!("f{} + f{} AS f{k}", k - 1, k - 1)))
+        .collect();
     let def = install_definition(
         &db.pool,
-        "TRANSFORM article_cat FROM articles SELECT category.name AS category_name",
-        &source_columns,
+        &format!("TRANSFORM chain FROM s SELECT {}", chain.join(", ")),
+        &numeric(&["a"]),
         "public",
     )
     .await
@@ -754,7 +745,7 @@ async fn install_definition_ring_fallback_ends_up_live() {
     let rows = client
         .query(
             &format!(
-                "select status from transform_definitions where target_table = '{DEFAULT_TARGET_SCHEMA}.article_cat'"
+                "select status from transform_definitions where target_table = '{DEFAULT_TARGET_SCHEMA}.chain'"
             ),
             &[],
         )
@@ -1072,288 +1063,9 @@ async fn install_definition_shares_one_count_column_across_several_aliases_of_a_
 }
 
 // ---------------------------------------------------------------------
-// Unsupported/ring-fallback branch: a bare to-one relationship lookup
-// (no aggregate wrapper) — a shape `backfill_relationship_one_to_one`
-// explicitly rejects, since it only renders to-many aggregates.
-// ---------------------------------------------------------------------
-
-fn to_one_def() -> TransformDef {
-    TransformDef {
-        target: "article_cat".to_string(),
-        source: "articles".to_string(),
-        key_space: KeySpace::OneToOne,
-        fields: vec![FieldDef {
-            name: "category_name".to_string(),
-            expr: Expr::RelationshipPath {
-                rel: "category".to_string(),
-                column: "name".to_string(),
-            },
-        }],
-        predicate: Predicate::True,
-        without_source_index: false,
-        explicit_source_schema: None,
-        explicit_target_schema: None,
-    }
-}
-
-fn category_rel() -> HashMap<String, RelationshipDef> {
-    HashMap::from([(
-        "category".to_string(),
-        RelationshipDef {
-            name: "category".to_string(),
-            from_table: "articles".to_string(),
-            from_col: "category_id".to_string(),
-            to_table: "categories".to_string(),
-            to_col: "id".to_string(),
-        },
-    )])
-}
-
-/// Oracle counterpart of [`to_one_def`], projecting the source PK `id` too so
-/// the outer wrapper can key on it — the target table carries `id` as its own
-/// PK column, added by `install_definition`'s DDL step.
-fn to_one_oracle_def() -> TransformDef {
-    let mut def = to_one_def();
-    def.fields.insert(
-        0,
-        FieldDef {
-            name: "id".to_string(),
-            expr: Expr::Column("id".to_string()),
-        },
-    );
-    def
-}
-
-async fn oracle_to_one(client: &Client) -> HashMap<String, Option<String>> {
-    let base = render_relationship_select_sql(&to_one_oracle_def(), &category_rel());
-    let sql = format!("select id::text, category_name::text from ({base}) t");
-    client
-        .query(sql.as_str(), &[])
-        .await
-        .expect("query to-one oracle")
-        .into_iter()
-        .map(|r| (r.get(0), r.get(1)))
-        .collect()
-}
-
-async fn target_to_one(client: &Client) -> HashMap<String, Option<String>> {
-    client
-        .query("select id::text, category_name::text from article_cat", &[])
-        .await
-        .expect("read article_cat")
-        .into_iter()
-        .map(|r| (r.get(0), r.get(1)))
-        .collect()
-}
-
-#[tokio::test]
-async fn install_definition_falls_back_to_ring_for_relationship_enriched_definition() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
-
-    client
-        .batch_execute(
-            "create table categories (id integer primary key, name text); \
-             create table articles (id integer primary key, category_id integer, title text); \
-             insert into categories (id, name) values (10, 'Tech'), (20, 'News'); \
-             insert into articles (id, category_id, title) values \
-             (1, 10, 'a1'), (2, 20, 'a2'), (3, 99, 'a3')",
-        )
-        .await
-        .expect("create + seed tables");
-
-    create_relationship(
-        &db.pool,
-        "RELATIONSHIP category FROM articles.category_id TO categories.id",
-    )
-    .await
-    .expect("create to-one relationship");
-
-    let source_columns = columns(&[
-        ("id", ValueType::Numeric),
-        ("category_id", ValueType::Numeric),
-        ("title", ValueType::Text),
-    ]);
-
-    // `uses_relationships` routes this to `backfill_relationship_one_to_one`,
-    // but a bare to-one lookup (`category.name`, no aggregate) is a shape
-    // `collect_agg_leaves` still rejects. `install_definition` must catch the
-    // resulting `BackfillError::Unsupported` and fall back to the ring-based
-    // `create_definition`, having already created the target table itself
-    // (a second `create_target_table` call in the fallback would have errored
-    // on the already-existing relation, which never happens here).
-    install_definition(
-        &db.pool,
-        "TRANSFORM article_cat FROM articles SELECT category.name AS category_name",
-        &source_columns,
-        "public",
-    )
-    .await
-    .expect("install_definition falls back to the ring path for a relationship-enriched shape");
-    trellis::intake::markers::discharge_registrations(&db.pool)
-        .await
-        .expect("the discharge enumerates the source");
-
-    // The ring fallback enumerates every existing source row into the active
-    // segment — the opposite signal from the fast-path sibling test above —
-    // and the target starts empty, since the ring build only stages
-    // `Recompute` rows.
-    assert_eq!(
-        staged_count_for_source(&client, &format!("{DEFAULT_SCHEMA}.articles")).await,
-        3,
-        "ring fallback enumerated every existing source row"
-    );
-    let empty: i64 = client
-        .query_one("select count(*) from article_cat", &[])
-        .await
-        .unwrap()
-        .get(0);
-    assert_eq!(empty, 0, "ring fallback does not build rows synchronously");
-
-    // Draining the ring builds the target from the enumerated backfill,
-    // converging to the LEFT JOIN oracle (article 3 -> NULL: category 99
-    // doesn't exist) — proof the fallback left the definition and target in a
-    // valid, usable state.
-    drain_to_quiescence(&db.pool, &mut client).await;
-    assert_eq!(
-        target_to_one(&client).await,
-        oracle_to_one(&client).await,
-        "after draining the ring-fallback backfill"
-    );
-
-    // The ring path is live going forward: a fresh CDC insert on the source
-    // drains through to a correct row too.
-    client
-        .execute(
-            "insert into articles (id, category_id, title) values (4, 10, 'a4')",
-            &[],
-        )
-        .await
-        .expect("insert article 4");
-    stage_cdc(
-        &client,
-        "articles",
-        "4",
-        "insert",
-        None,
-        Some("{\"id\":4,\"category_id\":10,\"title\":\"a4\"}"),
-    )
-    .await;
-    drain_to_quiescence(&db.pool, &mut client).await;
-    assert_eq!(
-        target_to_one(&client).await,
-        oracle_to_one(&client).await,
-        "after a live CDC insert following the fallback"
-    );
-}
-
-// ---------------------------------------------------------------------
-// Fast-path success branch: a relationship-enriched 1-1 field that references
-// other (to-many-aggregate) fields' aliases (issue #83 — the original
-// report: `count(posts.id), count(comments.id), post_count + comment_count
-// AS total`, which used to HARD-CRASH). Substitution inlines `total` to
-// `count(posts.id) + count(comments.id)`; the two shared `count` leaves are
-// deduped into one staged column each, and the whole tree renders against
-// them — so the definition builds directly, no ring enumeration.
-// (Supersedes WI1's ring-fallback assertion for this shape.)
-// ---------------------------------------------------------------------
-
-#[tokio::test]
-async fn install_definition_fast_path_builds_a_relationship_cross_field_alias_chain() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
-
-    client
-        .batch_execute(
-            "create table authors (id integer primary key, name text); \
-             create table posts (id integer primary key, author_id integer); \
-             create table comments (id integer primary key, author_id integer); \
-             insert into authors (id, name) values (1, 'a'), (2, 'b'); \
-             insert into posts (id, author_id) values (100, 1), (101, 1); \
-             insert into comments (id, author_id) values (200, 1), (201, 1), (202, 1)",
-        )
-        .await
-        .expect("create + seed tables");
-
-    create_relationship(
-        &db.pool,
-        "RELATIONSHIP posts FROM authors.id TO posts.author_id",
-    )
-    .await
-    .expect("create posts relationship");
-    create_relationship(
-        &db.pool,
-        "RELATIONSHIP comments FROM authors.id TO comments.author_id",
-    )
-    .await
-    .expect("create comments relationship");
-
-    let source_columns: HashMap<String, ValueType> =
-        columns(&[("id", ValueType::Numeric), ("name", ValueType::Text)]);
-
-    install_definition(
-        &db.pool,
-        "TRANSFORM author_totals FROM authors SELECT \
-         COUNT(posts.id) AS post_count, \
-         COUNT(comments.id) AS comment_count, \
-         post_count + comment_count AS total",
-        &source_columns,
-        "public",
-    )
-    .await
-    .expect("install_definition builds the relationship alias chain directly");
-    // ADR-0002 (#419): the direct build runs as a background job the
-    // discharge dispatches; run it before reading the target. Only the
-    // build: its go-live catch-up re-reads the source into the ring by
-    // design (#468, #485).
-    trellis::intake::markers::settle_builds(&db.pool).await;
-
-    // Direct build: target populated synchronously, nothing staged in the ring.
-    let mut rows: Vec<(String, String, String, String)> = client
-        .query(
-            "select id::text, post_count::text, comment_count::text, total::text \
-             from author_totals order by id",
-            &[],
-        )
-        .await
-        .expect("read author_totals")
-        .into_iter()
-        .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)))
-        .collect();
-    rows.sort();
-    assert_eq!(
-        rows,
-        vec![
-            (
-                "1".to_string(),
-                "2".to_string(),
-                "3".to_string(),
-                "5".to_string()
-            ),
-            (
-                "2".to_string(),
-                "0".to_string(),
-                "0".to_string(),
-                "0".to_string()
-            ),
-        ],
-        "direct build computes the relationship alias chain correctly"
-    );
-    assert_eq!(
-        staged_count_for_source(&client, &format!("{DEFAULT_SCHEMA}.authors")).await,
-        0,
-        "fast path must not enumerate the source into the ring"
-    );
-}
-
-// ---------------------------------------------------------------------
-// Fast-path success branch: a coalesce-wrapped to-many aggregate
-// (`coalesce(sum(posts.word_count), 0)`, issue #83) — the normal way to write
-// a nullable aggregate. The aggregate leaf nested inside `coalesce` is now
-// recognized, staged, and rendered as `coalesce(<staged-ref>, 0)`, so the
-// definition builds directly instead of falling back to the ring.
+// A coalesce-wrapped aggregate (`coalesce(sum(word_count), 0)`, issue #83),
+// the normal way to write a nullable aggregate: the aggregate nested inside
+// `coalesce` builds with an all-`NULL` group coalesced to 0.
 // ---------------------------------------------------------------------
 
 #[tokio::test]
@@ -1364,43 +1076,33 @@ async fn install_definition_fast_path_builds_a_coalesce_wrapped_aggregate() {
 
     client
         .batch_execute(
-            "create table authors (id integer primary key, name text); \
-             create table posts (id integer primary key, author_id integer, word_count integer); \
-             insert into authors (id, name) values (1, 'a'), (2, 'b'); \
+            "create table posts \
+             (id bigint primary key, author_id bigint, word_count numeric(12,0)); \
              insert into posts (id, author_id, word_count) values \
-             (100, 1, 10), (101, 1, 20)",
+             (100, 1, 10), (101, 1, 20), (102, 2, null)",
         )
         .await
         .expect("create + seed tables");
 
-    create_relationship(
-        &db.pool,
-        "RELATIONSHIP posts FROM authors.id TO posts.author_id",
-    )
-    .await
-    .expect("create posts relationship");
-
-    let source_columns: HashMap<String, ValueType> =
-        columns(&[("id", ValueType::Numeric), ("name", ValueType::Text)]);
+    let source_columns = columns(&[
+        ("author_id", ValueType::Numeric),
+        ("word_count", ValueType::Numeric),
+    ]);
 
     install_definition(
         &db.pool,
-        "TRANSFORM author_totals FROM authors SELECT \
-         coalesce(sum(posts.word_count), 0) AS total_words",
+        "TRANSFORM author_totals FROM posts GROUP BY author_id WITHOUT SOURCE INDEX \
+         SELECT author_id AS author_id, coalesce(sum(word_count), 0) AS total_words",
         &source_columns,
         "public",
     )
     .await
-    .expect("install_definition builds a coalesce-wrapped aggregate directly");
-    // ADR-0002 (#419): the direct build runs as a background job the
-    // discharge dispatches; run it before reading the target. Only the
-    // build: its go-live catch-up re-reads the source into the ring by
-    // design (#468, #485).
+    .expect("install_definition builds a coalesce-wrapped aggregate");
     trellis::intake::markers::settle_builds(&db.pool).await;
 
     let mut rows: Vec<(String, String)> = client
         .query(
-            "select id::text, total_words::text from author_totals order by id",
+            "select author_id::text, total_words::text from author_totals order by author_id",
             &[],
         )
         .await
@@ -1413,26 +1115,24 @@ async fn install_definition_fast_path_builds_a_coalesce_wrapped_aggregate() {
         rows,
         vec![
             ("1".to_string(), "30".to_string()),
-            // No posts -> coalesce(NULL, 0) = 0, not NULL.
+            // Only NULL word counts -> coalesce(NULL, 0) = 0, not NULL.
             ("2".to_string(), "0".to_string()),
         ],
-        "coalesce(sum(...), 0) builds directly with the empty set coalesced to 0"
+        "coalesce(sum(...), 0) builds with the all-NULL group coalesced to 0"
     );
     assert_eq!(
-        staged_count_for_source(&client, &format!("{DEFAULT_SCHEMA}.authors")).await,
+        staged_count_for_source(&client, &format!("{DEFAULT_SCHEMA}.posts")).await,
         0,
-        "fast path must not enumerate the source into the ring"
+        "the build must not enumerate the source into the ring"
     );
 }
 
 // ---------------------------------------------------------------------
-// Fast-path success branch: the deepest nesting issue #83's repro implies —
-// an alias-derived field summing two coalesce-wrapped aggregates over
-// *different* relationships (`total_words = total_posted_words +
-// total_commented_words`, each itself `coalesce(sum(...), 0)`). Substitution
-// inlines both, giving `coalesce(sum(posts.word_count), 0) +
-// coalesce(sum(comments.word_count), 0)`; the two distinct SUM leaves are
-// staged (one per relationship) and the tree renders against them.
+// The deepest nesting issue #83's repro implies: an alias-derived field
+// summing two coalesce-wrapped aggregates (`total_words = total_posted_words
+// + total_commented_words`, each itself `coalesce(sum(...), 0)`).
+// Substitution inlines both, giving `coalesce(sum(posted), 0) +
+// coalesce(sum(commented), 0)`.
 // ---------------------------------------------------------------------
 
 #[tokio::test]
@@ -1443,53 +1143,39 @@ async fn install_definition_fast_path_builds_nested_coalesce_alias_chain() {
 
     client
         .batch_execute(
-            "create table authors (id integer primary key, name text); \
-             create table posts (id integer primary key, author_id integer, word_count integer); \
-             create table comments (id integer primary key, author_id integer, word_count integer); \
-             insert into authors (id, name) values (1, 'a'), (2, 'b'); \
-             insert into posts (id, author_id, word_count) values (100, 1, 10), (101, 1, 20); \
-             insert into comments (id, author_id, word_count) values (200, 1, 3), (201, 1, 4)",
+            "create table posts (id bigint primary key, author_id bigint, \
+             posted numeric(12,0), commented numeric(12,0)); \
+             insert into posts (id, author_id, posted, commented) values \
+             (100, 1, 10, 3), (101, 1, 20, 4), (102, 2, null, null)",
         )
         .await
         .expect("create + seed tables");
 
-    create_relationship(
-        &db.pool,
-        "RELATIONSHIP posts FROM authors.id TO posts.author_id",
-    )
-    .await
-    .expect("create posts relationship");
-    create_relationship(
-        &db.pool,
-        "RELATIONSHIP comments FROM authors.id TO comments.author_id",
-    )
-    .await
-    .expect("create comments relationship");
-
-    let source_columns: HashMap<String, ValueType> =
-        columns(&[("id", ValueType::Numeric), ("name", ValueType::Text)]);
+    let source_columns = columns(&[
+        ("author_id", ValueType::Numeric),
+        ("posted", ValueType::Numeric),
+        ("commented", ValueType::Numeric),
+    ]);
 
     install_definition(
         &db.pool,
-        "TRANSFORM author_totals FROM authors SELECT \
-         coalesce(sum(posts.word_count), 0) AS total_posted_words, \
-         coalesce(sum(comments.word_count), 0) AS total_commented_words, \
+        "TRANSFORM author_totals FROM posts GROUP BY author_id WITHOUT SOURCE INDEX SELECT \
+         author_id AS author_id, \
+         coalesce(sum(posted), 0) AS total_posted_words, \
+         coalesce(sum(commented), 0) AS total_commented_words, \
          total_posted_words + total_commented_words AS total_words",
         &source_columns,
         "public",
     )
     .await
-    .expect("install_definition builds the nested coalesce alias chain directly");
-    // ADR-0002 (#419): the direct build runs as a background job the
-    // discharge dispatches; run it before reading the target. Only the
-    // build: its go-live catch-up re-reads the source into the ring by
-    // design (#468, #485).
+    .expect("install_definition builds the nested coalesce alias chain");
     trellis::intake::markers::settle_builds(&db.pool).await;
 
     let mut rows: Vec<(String, String, String, String)> = client
         .query(
-            "select id::text, total_posted_words::text, total_commented_words::text, \
-             total_words::text from author_totals order by id",
+            "select author_id::text, total_posted_words::text, \
+             total_commented_words::text, total_words::text \
+             from author_totals order by author_id",
             &[],
         )
         .await
@@ -1501,14 +1187,14 @@ async fn install_definition_fast_path_builds_nested_coalesce_alias_chain() {
     assert_eq!(
         rows,
         vec![
-            // posts 10+20=30, comments 3+4=7, total 37.
+            // posted 10+20=30, commented 3+4=7, total 37.
             (
                 "1".to_string(),
                 "30".to_string(),
                 "7".to_string(),
                 "37".to_string()
             ),
-            // No related rows -> every coalesce(NULL, 0) = 0.
+            // Only NULLs -> every coalesce(NULL, 0) = 0.
             (
                 "2".to_string(),
                 "0".to_string(),
@@ -1516,12 +1202,12 @@ async fn install_definition_fast_path_builds_nested_coalesce_alias_chain() {
                 "0".to_string()
             ),
         ],
-        "nested coalesce+alias chain builds directly with correct sums"
+        "nested coalesce+alias chain builds with correct sums"
     );
     assert_eq!(
-        staged_count_for_source(&client, &format!("{DEFAULT_SCHEMA}.authors")).await,
+        staged_count_for_source(&client, &format!("{DEFAULT_SCHEMA}.posts")).await,
         0,
-        "fast path must not enumerate the source into the ring"
+        "the build must not enumerate the source into the ring"
     );
 }
 
@@ -1543,7 +1229,7 @@ async fn install_definition_fast_path_builds_nested_coalesce_alias_chain() {
 // chain correctly.
 // ---------------------------------------------------------------------
 
-/// Plain (non-relationship) 1-1 repro: exercises `resolve_source_for_install`
+/// Plain 1-1 repro: exercises `resolve_source_for_install`
 /// specifically, since a plain 1-1 definition's DDL step
 /// (`ddl::source_primary_key(pool, &qualified_source)`, run directly inside
 /// `install_definition` before it registers the definition for the discharge)
@@ -1619,94 +1305,6 @@ async fn install_definition_fast_path_resolves_a_bare_from_chained_off_a_non_def
     assert_eq!(
         mismatches, 0,
         "u must be built from custom.t's rows, not fail before ever reaching them"
-    );
-}
-
-/// Relationship-enriched-1-1 repro: the same resolution for a shape
-/// `backfill::uses_relationships` keeps off the plain-1-1 chunked build, as
-/// an Aggregate would be. `def C`'s own source
-/// is the chained, non-default-schema target — `tagrel`'s to-side
-/// (`tags`) is an ordinary, already-on-`search_path` table, so only the
-/// `bare_table == def.source` branch this fix touches is under test here.
-///
-/// Registration resolves the source before the discharge ever classifies
-/// this shape (a bare to-one passthrough enrichment, `tagrel.label` with no
-/// aggregate) as `BackfillError::Unsupported` and falls back to the ring,
-/// mirroring
-/// `install_definition_falls_back_to_ring_for_relationship_enriched_definition`
-/// above. Before the fix, resolution failed inside registration, before the
-/// fallback was ever reached. (The coverage-fence planning this test first
-/// pinned, `plan_direct_backfill_coverage`, is retired, issues #468/#485.)
-#[tokio::test]
-async fn install_definition_relationship_enriched_path_resolves_a_bare_from_chained_off_a_non_default_schema_target()
- {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
-
-    client
-        .batch_execute(
-            "create schema custom; \
-             create table s (id bigint primary key, a numeric); \
-             insert into s (id, a) select g, g from generate_series(1, 50) g; \
-             create table tags (id bigserial primary key, label text); \
-             insert into tags (id, label) select g, 'tagged' from generate_series(1, 50) g",
-        )
-        .await
-        .expect("seed source, tags, and create the custom schema");
-
-    install_definition(
-        &db.pool,
-        "TRANSFORM custom.t FROM s SELECT a + a AS x",
-        &numeric(&["a"]),
-        "public",
-    )
-    .await
-    .expect("def A installs with an explicit non-default target schema");
-    drain_backfill_chunks(&db.pool).await;
-
-    // `t.id` (def A's target's own PK) is a real, integer-family column —
-    // this relationship's `from_table` is itself the chained, non-default-
-    // schema target under test, so declaring it also exercises this same
-    // fix's `create_relationship`-side gap (see `defs_relationship_catalog.rs`'s
-    // own regression test).
-    create_relationship(&db.pool, "RELATIONSHIP tagrel FROM t.id TO tags.id")
-        .await
-        .expect("relationship's bare FROM must resolve to custom.t");
-
-    // Def C: a relationship-enriched 1-1 whose bare `FROM t` must resolve to
-    // def A's `custom.t` at registration, not fail before the build ever
-    // runs.
-    install_definition(
-        &db.pool,
-        "TRANSFORM u FROM t SELECT x AS y, tagrel.label AS tag_label",
-        &numeric(&["x"]),
-        "public",
-    )
-    .await
-    .expect(
-        "def C's bare FROM must resolve to def A's explicitly-qualified custom.t \
-         target, not fail as 'not found on the search path'",
-    );
-
-    // This shape is `Unsupported` by the direct build (see this test's own
-    // doc comment), so the discharge falls back to the ring — the
-    // target starts empty and only converges once the discharge has
-    // enumerated the source and the ring is drained, exactly like
-    // `install_definition_falls_back_to_ring_for_relationship_enriched_definition`.
-    trellis::intake::markers::discharge_registrations(&db.pool)
-        .await
-        .expect("the discharge enumerates the source");
-    drain_to_quiescence(&db.pool, &mut client).await;
-
-    let row_count: i64 = client
-        .query_one("select count(*) from u where tag_label = 'tagged'", &[])
-        .await
-        .expect("count u rows")
-        .get(0);
-    assert_eq!(
-        row_count, 50,
-        "u must be built from custom.t's 50 rows, each enriched via tagrel"
     );
 }
 
@@ -1805,69 +1403,52 @@ async fn registration_reads_no_source_rows() {
     );
 }
 
-/// ADR-0002 (#419): the direct set-based build of an aggregate and of a
-/// relationship-enriched 1-1 definition runs as a background job the
-/// discharge dispatches, not inside registration. Registering each succeeds
-/// while another session holds the source and the to-many relationship's
-/// to-side `ACCESS EXCLUSIVE`, so registration latency doesn't depend on
-/// either table's size. Both go live, built directly (nothing enumerated into
-/// the ring), once the lock is released and the discharge and a drain worker
-/// run.
+/// ADR-0002 (#419): the direct set-based build of an aggregate runs as a
+/// background job the discharge dispatches, not inside registration.
+/// Registering succeeds while another session holds the source `ACCESS
+/// EXCLUSIVE`, so registration latency doesn't depend on the table's size.
+/// It goes live, built directly (nothing enumerated into the ring), once the
+/// lock is released and the discharge and a drain worker run.
 ///
-/// The aggregate is relationship-fed (an extra field reads a to-one
-/// relationship's column), so it still takes the old direct build until
-/// #625 F9: every plain aggregate is the Re-derive build's since #625 F5.
-/// That to-one's to-side (`q`) stays unlocked: registration seeds its
-/// settled parent projection from it (#129), which is no part of the build.
+/// Every plain aggregate is the Re-derive build's since #625 F5, so the
+/// source is held out of it (`hold_out_of_the_rederive_build`) to reach the
+/// old direct build, which survives until #625 F10. That build writes the
+/// per-row ledger, so the test runs only with the group-basis default off.
 #[tokio::test]
+#[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
 async fn registering_a_direct_build_shape_reads_no_source_rows() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
     client
         .batch_execute(
-            "create table s (id bigint primary key, g bigint, a numeric); \
-             create table p (id bigint primary key, s_id bigint); \
-             create table q (id bigint primary key, w numeric); \
-             insert into s (id, g, a) select i, i % 5, i from generate_series(1, 50) i; \
-             insert into p (id, s_id) select i, i % 10 + 1 from generate_series(1, 30) i; \
-             insert into q (id, w) select i, i * 10 from generate_series(0, 4) i",
+            "create table s (id bigint primary key, g bigint, a bigint); \
+             insert into s (id, g, a) select i, i % 5, i from generate_series(1, 50) i",
         )
         .await
-        .expect("seed source and to-sides");
-    create_relationship(&db.pool, "RELATIONSHIP kids FROM s.id TO p.s_id")
-        .await
-        .expect("create the to-many relationship");
-    create_relationship(&db.pool, "RELATIONSHIP grp FROM s.g TO q.id")
-        .await
-        .expect("create the to-one relationship");
+        .expect("seed the source");
+    trellis::intake::markers::hold_out_of_the_rederive_build(
+        &client,
+        &format!("{DEFAULT_SCHEMA}.s"),
+    )
+    .await
+    .expect("hold the source out of the Re-derive build");
 
     let locker = connect_raw(db.dsn()).await;
     locker
-        .batch_execute("begin; lock table s, p in access exclusive mode")
+        .batch_execute("begin; lock table s in access exclusive mode")
         .await
-        .expect("lock the source and the to-many's to-side against reads");
+        .expect("lock the source against reads");
 
-    let columns: HashMap<String, ValueType> = numeric(&["id", "g", "a"]);
-    let register = |text: &'static str| {
-        let pool = db.pool.clone();
-        let columns = columns.clone();
-        async move {
-            tokio::time::timeout(
-                Duration::from_secs(20),
-                install_definition(&pool, text, &columns, "public"),
-            )
-            .await
-            .unwrap_or_else(|_| panic!("registering {text:?} waited on the source's lock"))
-            .unwrap_or_else(|e| panic!("register {text:?}: {e}"))
-        }
-    };
-    let aggregate =
-        register("TRANSFORM v FROM s GROUP BY g WITHOUT SOURCE INDEX SELECT g AS g, SUM(a) AS total, MAX(grp.w) AS w")
-            .await;
+    let text = "TRANSFORM v FROM s GROUP BY g WITHOUT SOURCE INDEX SELECT g AS g, SUM(a) AS total";
+    let aggregate = tokio::time::timeout(
+        Duration::from_secs(20),
+        install_definition(&db.pool, text, &numeric(&["id", "g", "a"]), "public"),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("registering {text:?} waited on the source's lock"))
+    .unwrap_or_else(|e| panic!("register {text:?}: {e}"));
     assert_eq!(aggregate.status, TransformStatus::WaitingToBackfill);
-    let enriched = register("TRANSFORM w FROM s SELECT COUNT(kids.id) AS n").await;
-    assert_eq!(enriched.status, TransformStatus::WaitingToBackfill);
 
     locker
         .batch_execute("commit")
@@ -1875,7 +1456,7 @@ async fn registering_a_direct_build_shape_reads_no_source_rows() {
         .expect("release the lock");
     trellis::intake::markers::discharge_registrations(&db.pool)
         .await
-        .expect("discharge the registrations");
+        .expect("discharge the registration");
     let statuses: Vec<String> = client
         .query("select status from transform_definitions order by id", &[])
         .await
@@ -1885,8 +1466,8 @@ async fn registering_a_direct_build_shape_reads_no_source_rows() {
         .collect();
     assert_eq!(
         statuses,
-        ["backfilling", "backfilling"],
-        "the discharge hands each build to a background job"
+        ["backfilling"],
+        "the discharge hands the build to a background job"
     );
     let direct_jobs: i64 = client
         .query_one(
@@ -1898,7 +1479,7 @@ async fn registering_a_direct_build_shape_reads_no_source_rows() {
         .await
         .expect("count the direct-build jobs")
         .get(0);
-    assert_eq!(direct_jobs, 2, "each build is an old direct-build job");
+    assert_eq!(direct_jobs, 1, "the build is an old direct-build job");
     assert_eq!(
         staged_count_for_source(&client, &format!("{DEFAULT_SCHEMA}.s")).await,
         0,
@@ -1914,30 +1495,17 @@ async fn registering_a_direct_build_shape_reads_no_source_rows() {
         .into_iter()
         .map(|row| row.get(0))
         .collect();
-    assert_eq!(statuses, ["live", "live"]);
-    let aggregate_mismatches: i64 = client
+    assert_eq!(statuses, ["live"]);
+    let mismatches: i64 = client
         .query_one(
-            "select count(*) from ( \
-                 select s.g, sum(s.a) as total, max(q.w) as w \
-                 from s left join q on q.id = s.g group by s.g \
-             ) e full join v on v.g = e.g \
-             where v.total is distinct from e.total or v.w is distinct from e.w",
+            "select count(*) from (select g, sum(a) as total from s group by g) e \
+             full join v on v.g = e.g where v.total is distinct from e.total",
             &[],
         )
         .await
         .expect("compare the aggregate to the source")
         .get(0);
-    assert_eq!(aggregate_mismatches, 0, "every group is built");
-    let enriched_mismatches: i64 = client
-        .query_one(
-            "select count(*) from s left join w on w.id = s.id \
-             where w.n is distinct from (select count(*) from p where p.s_id = s.id)",
-            &[],
-        )
-        .await
-        .expect("compare the enriched target to the source")
-        .get(0);
-    assert_eq!(enriched_mismatches, 0, "every source row is enriched");
+    assert_eq!(mismatches, 0, "every group is built");
 }
 
 // ---------------------------------------------------------------------
@@ -2389,5 +1957,188 @@ async fn an_explicit_source_without_its_table_is_reported_missing_before_the_key
             ) if schema == "custom" && table == "s"
         ),
         "{err:?}"
+    );
+}
+
+/// Regression for the DDL-before-validate ordering bug #94 turned up:
+/// `install_definition` used to emit the target table's DDL *before* running
+/// `validate()`, so a definition rejected for any reason still left an orphan
+/// table behind. The failure here is plain `UngroupedColumnReference`,
+/// because the fix is about ordering for *every* key-space.
+#[tokio::test]
+async fn an_invalid_aggregate_definition_leaves_no_target_table() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+    client
+        .batch_execute("create table post_tags (id integer primary key, post integer, tag text)")
+        .await
+        .expect("create the source");
+
+    let err = install_definition(
+        &db.pool,
+        "TRANSFORM tag_totals FROM post_tags GROUP BY tag WITHOUT SOURCE INDEX SELECT post AS p",
+        &columns(&[
+            ("id", ValueType::Numeric),
+            ("post", ValueType::Numeric),
+            ("tag", ValueType::Text),
+        ]),
+        "public",
+    )
+    .await
+    .unwrap_err();
+    match err {
+        CatalogError::Validate(trellis::defs::ValidationError::UngroupedColumnReference {
+            field,
+            column,
+        }) => {
+            assert_eq!(field, "p");
+            assert_eq!(column, "post");
+        }
+        other => panic!("expected UngroupedColumnReference, got {other:?}"),
+    }
+    assert!(
+        !table_exists(&client, "public.tag_totals").await,
+        "validation must run before any DDL is issued"
+    );
+}
+
+/// Issue #126: `staging::apply::compute` calls `ddl::source_primary_key` for
+/// every source table a drain batch touches, so a composite-PK source
+/// feeding an ordinary `GROUP BY` definition must build and then drain a
+/// forward insert, a group-migrating update and a delete, each keyed by the
+/// composite identity. `order_lines (order_id, line_no)` is composite.
+#[tokio::test]
+async fn an_aggregate_over_a_composite_pk_source_builds_and_drains() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table order_lines ( \
+                 order_id integer, line_no integer, category text, amount numeric(12,0), \
+                 primary key (order_id, line_no) \
+             ); \
+             insert into order_lines (order_id, line_no, category, amount) values \
+               (1, 1, 'books', 10), (1, 2, 'books', 5), (2, 1, 'toys', 20)",
+        )
+        .await
+        .expect("create + seed a composite-pk source");
+
+    let source_columns = columns(&[
+        ("order_id", ValueType::Numeric),
+        ("line_no", ValueType::Numeric),
+        ("category", ValueType::Text),
+        ("amount", ValueType::Numeric),
+    ]);
+    install_definition(
+        &db.pool,
+        "TRANSFORM category_totals FROM order_lines GROUP BY category WITHOUT SOURCE INDEX \
+         SELECT SUM(amount) AS total",
+        &source_columns,
+        "public",
+    )
+    .await
+    .expect("install an aggregate over a composite-pk source");
+    trellis::intake::markers::settle_registrations(&db.pool).await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    let read_totals = async |client: &Client| -> HashMap<String, Option<String>> {
+        client
+            .query("select category, total::text from category_totals", &[])
+            .await
+            .expect("read category_totals")
+            .into_iter()
+            .map(|r| (r.get(0), r.get(1)))
+            .collect()
+    };
+
+    let totals = read_totals(&client).await;
+    assert_eq!(
+        totals.get("books"),
+        Some(&Some("15".to_string())),
+        "the build over pre-existing composite-pk rows"
+    );
+    assert_eq!(totals.get("toys"), Some(&Some("20".to_string())));
+
+    // A forward insert (a genuinely new composite key, `(2, 2)`).
+    client
+        .execute(
+            "insert into order_lines (order_id, line_no, category, amount) values (2, 2, 'toys', 7)",
+            &[],
+        )
+        .await
+        .expect("insert a new order line");
+    stage_cdc(
+        &client,
+        "order_lines",
+        &composite_key(&["2", "2"]),
+        "insert",
+        None,
+        Some("{\"order_id\":2,\"line_no\":2,\"category\":\"toys\",\"amount\":7}"),
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+    assert_eq!(
+        read_totals(&client).await.get("toys"),
+        Some(&Some("27".to_string())),
+        "after a forward insert"
+    );
+
+    // An update that migrates a row from one group to another (`(1, 2)`
+    // re-categorized from `books` to `toys`): the old/new-image decode path,
+    // keyed by the same composite identity throughout.
+    client
+        .execute(
+            "update order_lines set category = 'toys' where order_id = 1 and line_no = 2",
+            &[],
+        )
+        .await
+        .expect("re-categorize an order line");
+    stage_cdc(
+        &client,
+        "order_lines",
+        &composite_key(&["1", "2"]),
+        "update",
+        Some("{\"order_id\":1,\"line_no\":2,\"category\":\"books\",\"amount\":5}"),
+        Some("{\"order_id\":1,\"line_no\":2,\"category\":\"toys\",\"amount\":5}"),
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+    let totals = read_totals(&client).await;
+    assert_eq!(
+        totals.get("books"),
+        Some(&Some("10".to_string())),
+        "after migrating a row out of books"
+    );
+    assert_eq!(
+        totals.get("toys"),
+        Some(&Some("32".to_string())),
+        "after migrating a row into toys (20 + 7 + 5)"
+    );
+
+    // A delete (the composite-pk delete/old-image path).
+    client
+        .execute(
+            "delete from order_lines where order_id = 2 and line_no = 1",
+            &[],
+        )
+        .await
+        .expect("delete an order line");
+    stage_cdc(
+        &client,
+        "order_lines",
+        &composite_key(&["2", "1"]),
+        "delete",
+        Some("{\"order_id\":2,\"line_no\":1,\"category\":\"toys\",\"amount\":20}"),
+        None,
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+    assert_eq!(
+        read_totals(&client).await.get("toys"),
+        Some(&Some("12".to_string())),
+        "after deleting a row (32 - 20)"
     );
 }

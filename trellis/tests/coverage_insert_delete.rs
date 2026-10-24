@@ -14,9 +14,12 @@
 //! `apply_aggregate.rs` covers the same fold deterministically, without a
 //! build.
 //!
-//! The aggregate is relationship-fed (an extra field reads a to-one
-//! relationship's column), so it still takes the direct build until #625 F9:
-//! every plain aggregate is the Re-derive build's since #625 F5.
+//! The aggregate's source is held out of the Re-derive build
+//! ([`markers::hold_out_of_the_rederive_build`]), so it takes the direct
+//! build, which survives until #625 F10: every other aggregate is the
+//! Re-derive build's since #625 F5. That direct build loads the per-row
+//! ledger, which the group-basis default no longer creates, so the test runs
+//! only with the knob off.
 //!
 //! The build is held with event triggers on advisory locks the test holds, at
 //! the two `ALTER TABLE`s around the aggregate build's ledger load (#623 D2),
@@ -33,7 +36,7 @@ use testkit::TestCluster;
 use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::defs::{ValueType, create_relationship, install_definition};
+use trellis::defs::{ValueType, install_definition};
 use trellis::intake::markers;
 use trellis::staging::{CdcOp, StagedChange, StagedWatermark, apply, seal};
 use trellis::staging::{has_pending, retire_drained_segments};
@@ -158,22 +161,20 @@ fn cdc(op: CdcOp, lsn: PgLsn, old: Option<&str>, new: Option<&str>) -> StagedCha
     }
 }
 
-/// Registers `sku_totals` over `public.sales` (`sku = 'a'` peaking at `7`)
+/// Registers `sku_totals` over `public.sales` (`sku = 'a'` totalling `12`)
 /// and starts its build, returning once the build is parked between its
 /// coverage fence and its read.
 async fn start_held_build(pool: &trellis::Pool, client: &Client) -> tokio::task::JoinHandle<()> {
     client
         .batch_execute(
             "create table public.sales (id integer primary key, sku text, amount integer); \
-             insert into public.sales values (1, 'a', 5), (2, 'a', 7), (3, 'b', 2); \
-             create table public.skus (sku text primary key, weight integer); \
-             insert into public.skus values ('a', 1), ('b', 2)",
+             insert into public.sales values (1, 'a', 5), (2, 'a', 7), (3, 'b', 2)",
         )
         .await
-        .expect("create + seed sales and skus");
-    create_relationship(pool, "RELATIONSHIP item FROM sales.sku TO skus.sku")
+        .expect("create + seed sales");
+    markers::hold_out_of_the_rederive_build(client, "public.sales")
         .await
-        .expect("create the to-one relationship");
+        .expect("hold sales out of the Re-derive build");
     install_build_holds(client).await;
     for lock in [BEFORE_READ, AFTER_READ] {
         client
@@ -184,7 +185,7 @@ async fn start_held_build(pool: &trellis::Pool, client: &Client) -> tokio::task:
     install_definition(
         pool,
         "TRANSFORM sku_totals FROM sales GROUP BY sku \
-        WITHOUT SOURCE INDEX SELECT max(amount) AS total, max(item.weight) AS weight",
+        WITHOUT SOURCE INDEX SELECT sum(amount) AS total",
         &HashMap::from([
             ("id".to_string(), ValueType::Numeric),
             ("sku".to_string(), ValueType::Text),
@@ -217,7 +218,7 @@ async fn assert_old_build(client: &Client) {
         .expect("read the definition's build");
     assert!(
         row.get::<_, bool>(0),
-        "a relationship-fed aggregate takes the old build"
+        "an aggregate held out of the Re-derive build takes the old build"
     );
     assert_eq!(row.get::<_, i64>(1), 1, "its build is a direct-build job");
 }
@@ -257,6 +258,7 @@ fn row_4(sku: &str) -> String {
 /// live in one batch and fold to a change with neither image. Row 4's ledger
 /// entry still names group `z`, so the delete removes the build's `1000`.
 #[tokio::test]
+#[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
 async fn a_group_emptied_across_the_build_is_removed_even_by_an_enumerating_catch_up() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -282,5 +284,5 @@ async fn a_group_emptied_across_the_build_is_removed_even_by_an_enumerating_catc
     .await;
     drain_to_quiescence(&db.pool, &mut client).await;
     discharge_markers(&db.pool, &mut client).await;
-    assert_eq!(totals(&client).await, expected(&[("a", "7"), ("b", "2")]));
+    assert_eq!(totals(&client).await, expected(&[("a", "12"), ("b", "2")]));
 }

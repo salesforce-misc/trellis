@@ -7,15 +7,12 @@
 //! projection advance together"), deliberately deferred out of #138 rather
 //! than faked, and filed as its own issue for exactly this reason.
 //!
-//! Uses `generative::backend::SubprocessBackend` (issue #166) against the
-//! relationship-interleaving scenario `generative::generate::
-//! build_relationship_interleaving_scenario` builds for #138 — a to-one
-//! relationship whose parent-side change and a from-side re-point land
-//! back-to-back, no intervening `quiesce()`, so whichever Phase 3 pass
-//! drains them exercises both the ordinary target write *and* the
-//! settled-parent projection gen bump/relationship reverse-delta machinery
-//! (epic #127) in the same batch — the "moves and the projection advance
-//! together" #138 called out. `SubprocessBackend::arm_pause_before_commit`
+//! Uses `generative::backend::SubprocessBackend` (issue #166) against a
+//! small 1-1 program ([`critical_pair_program`]) whose last two ops, updates
+//! to two different rows, land back-to-back with no intervening
+//! `quiesce()`, so whichever Phase 3 pass drains them writes both target
+//! rows and advances the drain in the same batch.
+//! `SubprocessBackend::arm_pause_before_commit`
 //! (driving `staging::apply`'s test-only pre-commit pause hook)
 //! lands the `SIGKILL` deterministically inside that batch's still-open,
 //! uncommitted Phase 3 transaction, rather than hoping timing luck hits the
@@ -25,7 +22,8 @@
 use std::time::{Duration, Instant};
 
 use generative::backend::{Backend, SubprocessBackend};
-use generative::generate::{RelInterleavingVariant, build_relationship_interleaving_scenario};
+use generative::generate::{Mutate, build_program};
+use generative::model::Program;
 use generative::run::check_program;
 use testkit::TestCluster;
 use tokio_postgres::NoTls;
@@ -39,30 +37,47 @@ use trellis::{Config, Pool};
 /// `ManualBackend`'s `QUIESCE_TIMEOUT`.
 const PAUSE_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// A 1-1 program over one table seeded with two rows, whose last two ops
+/// (the critical pair) update each row's `c1`, and so its `total = c1 + c2`.
+/// Every op before the pair is ordinary seeding.
+fn critical_pair_program() -> Program {
+    build_program(
+        &[(Some(10), Some(1)), (Some(20), Some(2))],
+        &[
+            Mutate::Update {
+                pk: 1,
+                c1: Some(99),
+                c2: Some(1),
+            },
+            Mutate::Update {
+                pk: 2,
+                c1: Some(77),
+                c2: Some(2),
+            },
+        ],
+    )
+}
+
 /// The regression test issue #166 exists for: `SIGKILL` a real engine
 /// subprocess while it is sitting inside Phase 3's still-open transaction —
 /// every write already issued against it, nothing yet committed — then
 /// confirm a freshly spawned subprocess redrives the same batch and the
 /// system converges exactly as if the crash had never happened. Proves
 /// Phase 3 is atomic across a genuine crash (not just this suite's
-/// in-process `ManualBackend::restart` simulation): either both the target
-/// write and the relationship projection advance land, or (as here, since
-/// the kill always lands pre-commit) neither does and the redrive redoes
-/// both together.
+/// in-process `ManualBackend::restart` simulation): either both target
+/// writes and the drain's advance land, or (as here, since the kill always
+/// lands pre-commit) neither does and the redrive redoes them together.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_sigkill_mid_phase_3_drain_still_converges_on_redrive() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
 
-    // The #138 relationship-interleaving scenario (epic #127's to-one
-    // relationship delta path — see this file's own doc comment): a parent
-    // row's own field changes while, in the very next op, a from-side row
-    // re-points onto it. `parent_op`/`from_side_op` mark the two ops meant
-    // to be applied back-to-back with no intervening `quiesce()`; every op
-    // before `parent_op` is ordinary seeding.
-    let scenario =
-        build_relationship_interleaving_scenario(RelInterleavingVariant::ParentFieldUpdate);
-    let program = scenario.program;
+    // The critical pair is the program's last two ops, meant to be applied
+    // back-to-back with no intervening `quiesce()`; every op before it is
+    // ordinary seeding.
+    let program = critical_pair_program();
+    let second_op = program.ops.len() - 1;
+    let first_op = second_op - 1;
 
     let engine_bin = env!("CARGO_BIN_EXE_engine_subprocess");
     let mut backend = SubprocessBackend::connect(db.dsn(), engine_bin)
@@ -75,9 +90,9 @@ async fn a_sigkill_mid_phase_3_drain_still_converges_on_redrive() {
         .expect("install program (spawns the primary engine subprocess)");
 
     // Seed every op strictly before the critical pair, quiescing after each
-    // — safe, ordinary traffic establishing the parent/from-side rows the
-    // critical pair then interleaves on.
-    for op in &program.ops[..scenario.parent_op] {
+    // — safe, ordinary traffic establishing the rows the critical pair then
+    // updates.
+    for op in &program.ops[..first_op] {
         backend.apply(op).await.expect("apply seed op");
         backend.quiesce().await.expect("quiesce after seed op");
     }
@@ -90,13 +105,13 @@ async fn a_sigkill_mid_phase_3_drain_still_converges_on_redrive() {
         .arm_pause_before_commit()
         .expect("arm the Phase 3 pre-commit pause hook");
     backend
-        .apply(&program.ops[scenario.parent_op])
+        .apply(&program.ops[first_op])
         .await
-        .expect("apply the parent-side op");
+        .expect("apply the first critical op");
     backend
-        .apply(&program.ops[scenario.from_side_op])
+        .apply(&program.ops[second_op])
         .await
-        .expect("apply the from-side op");
+        .expect("apply the second critical op");
 
     let paused = backend.wait_for_pause(PAUSE_TIMEOUT).await;
     assert!(
@@ -203,8 +218,7 @@ async fn a_sigkill_mid_phase_3_drain_still_converges_on_redrive() {
         .await
         .expect("age the killed process's claims");
 
-    // The scenario's critical pair is always its program's last two ops
-    // (`RelInterleavingScenario`'s own doc comment), so there is nothing
+    // The critical pair is the program's last two ops, so there is nothing
     // left to apply — just wait for the fresh subprocess to finish
     // redraining what the killed one left mid-flight.
     backend.quiesce().await.expect(
@@ -219,8 +233,8 @@ async fn a_sigkill_mid_phase_3_drain_still_converges_on_redrive() {
     assert!(
         diverged.is_empty(),
         "post-SIGKILL redrive must converge onto exactly the same state an uninterrupted drain \
-         would have reached — both the target write and the relationship projection advance \
-         redone together, or the batch wasn't atomic: {diverged:?}"
+         would have reached — both target writes and the drain's advance redone together, or \
+         the batch wasn't atomic: {diverged:?}"
     );
 }
 
@@ -239,8 +253,7 @@ async fn a_sigkill_mid_phase_3_drain_still_converges_on_redrive() {
 async fn restart_waits_for_the_killed_engines_singleton_to_free() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let program =
-        build_relationship_interleaving_scenario(RelInterleavingVariant::ParentFieldUpdate).program;
+    let program = critical_pair_program();
 
     let engine_bin = env!("CARGO_BIN_EXE_engine_subprocess");
     let mut backend = SubprocessBackend::connect(db.dsn(), engine_bin)

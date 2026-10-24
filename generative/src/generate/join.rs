@@ -389,7 +389,6 @@ pub fn build_join_program(
         .collect();
     Program {
         tables,
-        relationships: Vec::new(),
         def_install_after_op: (0..defs.len())
             .map(|i| {
                 let thousandths = usize::from(installs.get(i).copied().unwrap_or(0).min(999));

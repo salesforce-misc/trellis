@@ -5,10 +5,10 @@
 //! edge values and an all-`NULL` row, goes through insert, update and delete.
 //! Alongside it: a primary-key move, a composite primary key declared out of
 //! physical order whose parts contain the separator bytes, control-character
-//! primary keys, truncate, two relationship `from_col`s feeding `group_key`,
-//! and a to-side table whose image the catalog narrows. `public.ctl` also has
-//! unread columns named `l` and `ts`, the capture function's own variable
-//! names, which must not clash with them.
+//! primary keys, truncate, and tables whose image the catalog narrows to the
+//! columns definitions read. `public.ctl` also has unread columns named `l`
+//! and `ts`, the capture function's own variable names, which must not clash
+//! with them.
 //!
 //! Every write runs in an application session whose `DateStyle`, `TimeZone`,
 //! `bytea_output`, `IntervalStyle`, `extra_float_digits` and `xmloption` all
@@ -40,7 +40,7 @@ use trellis::capture::columns::{capture_spec, load_catalog};
 use trellis::capture::sql::{CaptureSpec, install_statements};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::ValueType;
-use trellis::defs::{create_relationship, install_definition, tables_to_capture};
+use trellis::defs::{install_definition, tables_to_capture};
 
 const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -265,7 +265,6 @@ async fn trigger_capture_stages_the_golden_images_under_a_foreign_session() {
         "create extension if not exists citext; \
          create type public.mood as enum ('sad', 'happy'); \
          create type public.pair as (a int, b text); \
-         create table public.parent (id integer primary key, name text, unread text); \
          create table public.fam (id integer primary key, fk2 integer, fk integer, {}); \
          create table public.comp (tag text, post integer, weight numeric, note text, \
                                    primary key (post, tag)); \
@@ -275,23 +274,10 @@ async fn trigger_capture_stages_the_golden_images_under_a_foreign_session() {
     .await
     .expect("create sources");
 
-    create_relationship(&db.pool, "RELATIONSHIP fam_parent FROM fam.fk TO parent.id")
-        .await
-        .expect("relationship fk");
-    create_relationship(
-        &db.pool,
-        "RELATIONSHIP fam_parent2 FROM fam.fk2 TO parent.id",
-    )
-    .await
-    .expect("relationship fk2");
     for (text, columns) in [
         (
             "TRANSFORM fam_out FROM public.fam SELECT c_int4 AS c_int4",
             value_types(&[("id", ValueType::Numeric), ("c_int4", ValueType::Numeric)]),
-        ),
-        (
-            "TRANSFORM fam_named FROM public.fam SELECT fam_parent.name AS parent_name",
-            value_types(&[("id", ValueType::Numeric), ("fk", ValueType::Numeric)]),
         ),
         (
             "TRANSFORM comp_out FROM public.comp GROUP BY tag \
@@ -319,10 +305,7 @@ async fn trigger_capture_stages_the_golden_images_under_a_foreign_session() {
         .expect("tables_to_capture");
     let mut sorted = captured.clone();
     sorted.sort();
-    assert_eq!(
-        sorted,
-        ["public.comp", "public.ctl", "public.fam", "public.parent"]
-    );
+    assert_eq!(sorted, ["public.comp", "public.ctl", "public.fam"]);
     let client = db.pool.get().await.expect("pool client");
     let catalog = load_catalog(&**client, DEFAULT_SCHEMA)
         .await
@@ -339,19 +322,8 @@ async fn trigger_capture_stages_the_golden_images_under_a_foreign_session() {
     // What the catalog asks each table to image.
     let fam = &specs["public.fam"];
     assert_eq!(fam.key(), strings(&["id"]));
-    assert_eq!(fam.columns(), strings(&["c_int4", "fk", "fk2", "id"]));
-    assert_eq!(
-        fam.group_key(),
-        strings(&["fk2", "fk"]),
-        "group-key columns in physical order"
-    );
-    let parent = &specs["public.parent"];
-    assert_eq!(
-        parent.columns(),
-        strings(&["id", "name"]),
-        "unread is not imaged"
-    );
-    assert!(parent.group_key().is_empty());
+    assert_eq!(fam.columns(), strings(&["c_int4", "id"]));
+    assert!(fam.group_key().is_empty());
     let comp = &specs["public.comp"];
     assert_eq!(comp.key(), strings(&["post", "tag"]), "declared key order");
     assert_eq!(comp.columns(), strings(&["post", "tag", "weight"]));
@@ -438,15 +410,9 @@ async fn trigger_capture_stages_the_golden_images_under_a_foreign_session() {
         .chain([format!("insert into public.fam (id) values ({})", rows + 1)])
         .collect();
     let steps: Vec<(&str, Vec<String>)> = vec![
-        (
-            "parents",
-            strings(&[
-                "insert into public.parent values (1, 'p1', 'x'), (2, 'p2', 'y'), (3, 'p3', 'z')",
-            ]),
-        ),
         ("every family, then an all-NULL row", fam_inserts),
         (
-            "a multi-row update moving group keys",
+            "a multi-row update",
             strings(&["update public.fam set c_vchar = coalesce(c_vchar, '') || 'u', fk = fk + 1"]),
         ),
         (
@@ -460,10 +426,6 @@ async fn trigger_capture_stages_the_golden_images_under_a_foreign_session() {
         (
             "an update that matches nothing",
             strings(&["update public.fam set c_int4 = 1 where false"]),
-        ),
-        (
-            "a to-side update, including a column no reader reads",
-            strings(&["update public.parent set name = name || '!', unread = 'w' where id <= 2"]),
         ),
         (
             "composite keys containing the separator bytes",

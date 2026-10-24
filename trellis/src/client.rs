@@ -4568,10 +4568,8 @@ mod backfill_shutdown_tests {
             .await
             .expect("connect");
         raw.batch_execute(
-            "create table public.s (id bigint primary key, a numeric, r bigint); \
-             insert into public.s (id, a, r) select g, g, 1 from generate_series(1, 5) g; \
-             create table public.r (id bigint primary key, w numeric); \
-             insert into public.r values (1, 10);",
+            "create table public.s (id bigint primary key, a numeric); \
+             insert into public.s (id, a) select g, g from generate_series(1, 5) g;",
         )
         .await
         .expect("seed source table");
@@ -4585,17 +4583,16 @@ mod backfill_shutdown_tests {
         let columns = std::collections::HashMap::from([
             ("id".to_string(), ValueType::Numeric),
             ("a".to_string(), ValueType::Numeric),
-            ("r".to_string(), ValueType::Numeric),
         ]);
-        // A relationship-enriched 1-1 still waits on the discharge's fence
-        // (until milestone E); a plain 1-1 is the Re-derive build's, which
-        // takes no fence (#625 F8a).
-        crate::defs::create_relationship(&pool, "RELATIONSHIP rel FROM s.r TO r.id")
+        // The old build's 1-1 waits on the discharge's fence; a plain 1-1
+        // is the Re-derive build's, which takes no fence (#625 F8a), so the
+        // source is held out of it.
+        crate::intake::markers::hold_out_of_the_rederive_build(&raw, "public.s")
             .await
-            .expect("create the to-one relationship");
+            .expect("hold s's definitions out of the Re-derive build");
         crate::defs::install_definition(
             &pool,
-            "TRANSFORM t FROM s SELECT a + 1 AS f, rel.w AS w",
+            "TRANSFORM t FROM s SELECT a + 1 AS f",
             &columns,
             "public",
         )

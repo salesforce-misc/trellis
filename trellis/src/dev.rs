@@ -59,28 +59,9 @@ pub mod defs {
 
     pub use crate::defs::{
         CatalogError, DdlError, PgType, TransformStatus, ValueType, backfill_definition,
-        create_aggregate_target_table, create_definition_without_backfill, create_relationship,
-        create_target_table, install_definition, parse, qualified_target_table, source_primary_key,
+        create_aggregate_target_table, create_definition_without_backfill, create_target_table,
+        install_definition, parse, qualified_target_table, source_primary_key,
     };
-
-    /// Drops the relationship at `address`, `[<schema>.]<from_table>.<name>`,
-    /// as the `DROP RELATIONSHIP` statement did before it stopped parsing:
-    /// idempotent, refused while a definition reads it. No statement reaches
-    /// relationships; tests and `benchmark` still declare and drop them here
-    /// until #1115 removes them.
-    pub async fn drop_relationship(
-        pool: &crate::Pool,
-        address: &str,
-    ) -> Result<(), crate::defs::CatalogError> {
-        let parts: Vec<&str> = address.split('.').collect();
-        let (schema, from_table, name) = match parts.as_slice() {
-            [from_table, name] => (None, *from_table, *name),
-            [schema, from_table, name] => (Some(*schema), *from_table, *name),
-            _ => panic!("a relationship address is [<schema>.]<from_table>.<name>: {address}"),
-        };
-        crate::defs::lifecycle::drop_relationship(pool, schema, from_table, name).await?;
-        Ok(())
-    }
 }
 
 /// The engine items `generative`'s backend drivers reach for under `staging`.

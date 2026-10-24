@@ -64,7 +64,6 @@ async fn start(definitions: &[&str]) -> Driver {
             ("k", int4()),
             ("x", int4()),
         ],
-        &[],
         definitions,
         &["public.a", "public.b"],
     )
@@ -187,6 +186,33 @@ async fn a_converged_join_target_reports_no_divergence_at_every_page_size() {
             counts.iter().all(|c| *c == counts[0]),
             "{target}: every key is reached at every page size: {counts:?}"
         );
+    }
+}
+
+/// The tombstone pass collects `T`'s zero groups (the seed leaves some on
+/// both kinds), and the check reads a group `T` lacks as zeros: the target
+/// still reports nothing at every page size.
+#[tokio::test]
+async fn a_join_target_whose_zero_t_groups_were_collected_reports_no_divergence() {
+    let mut d = start(&[LEFT_PAIR, INNER]).await;
+    seed(&mut d).await;
+    let zero = |t: &str| format!("select count(*) > 0 from {t} where __zero");
+    for target in ["l", "i"] {
+        let (t, _) = hidden(&d, target, "t").await;
+        assert_eq!(d.rows(&zero(&t)).await, ["(t)"], "{target}: zero T groups");
+    }
+    d.retire().await;
+    d.collect_tombstones().await;
+    for target in ["l", "i"] {
+        let (t, _) = hidden(&d, target, "t").await;
+        assert_eq!(d.rows(&zero(&t)).await, ["(f)"], "{target}: collected");
+        for limit in [1, 2, 100] {
+            assert_eq!(
+                walk(&d, target, limit).await.0,
+                [],
+                "{target}, limit {limit}"
+            );
+        }
     }
 }
 
@@ -527,7 +553,6 @@ async fn each_join_page_records_its_j_lock_wait() {
          create table public.b (id integer primary key, k integer, y integer); \
          create index on public.a (k); create index on public.b (k)",
         &[("id", int4()), ("ga", int4()), ("k", int4())],
-        &[],
         &[
             "TRANSFORM lock_wait_join FROM public.a JOIN public.b ON a.k = b.k GROUP BY a.ga \
           WITHOUT SOURCE INDEX SELECT a.ga AS ga, COUNT(*) AS n, SUM(b.y) AS sy",
@@ -865,7 +890,6 @@ async fn a_group_column_re_collated_mid_walk_skips_and_repeats_no_cell() {
             ("k", int4()),
             ("y", int4()),
         ],
-        &[],
         &[
             "TRANSFORM tc FROM public.a JOIN public.b ON a.k = b.k GROUP BY a.ga \
           WITHOUT SOURCE INDEX SELECT a.ga AS ga, COUNT(*) AS n, SUM(b.y) AS sy",

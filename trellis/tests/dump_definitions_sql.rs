@@ -22,7 +22,7 @@ use std::time::Duration;
 use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
 use trellis::defs::chunk_queue;
-use trellis::dump::{CLASSIFICATION, Class, is_projection_table};
+use trellis::dump::{CLASSIFICATION, Class};
 use trellis::staging::{StagedWatermark, apply, has_pending, retire_drained_segments, seal};
 use trellis::{Config, Trellis, TrellisOptions};
 
@@ -167,16 +167,10 @@ const SOURCE_DDL: &str = "\
     insert into public.cats values (1, 'tom'), (2, 'kit'); \
     insert into public.orders values (1, 1, 10, 1, 'calm'), (2, 1, 20, 2, 'loud'), (3, 2, 30, 1, 'calm')";
 
-/// A 1-1 transform, an aggregate chained off it, and a 1-1 reading through a
-/// relationship, all built, with the capture triggers installed.
+/// A 1-1 transform, an aggregate chained off it, and a `JOIN` of `orders` to
+/// `cats`, all built, with the capture triggers installed.
 async fn define_and_build(t: &Trellis, raw: &mut Client) {
     raw.batch_execute(SOURCE_DDL).await.expect("source ddl");
-    trellis::dev::defs::create_relationship(
-        t.pool(),
-        "RELATIONSHIP cat FROM orders.cat_id TO cats.id",
-    )
-    .await
-    .expect("relationship");
     t.apply("TRANSFORM o1 FROM orders SELECT g AS g, a + 1 AS b, m AS m")
         .await
         .expect("o1");
@@ -184,9 +178,12 @@ async fn define_and_build(t: &Trellis, raw: &mut Client) {
     t.apply("TRANSFORM tot FROM o1 GROUP BY g, m WITHOUT SOURCE INDEX SELECT g AS g, m AS m, SUM(b) AS total")
         .await
         .expect("tot");
-    t.apply("TRANSFORM oc FROM orders SELECT cat.name AS cat_name")
-        .await
-        .expect("oc");
+    t.apply(
+        "TRANSFORM oc FROM orders JOIN cats ON orders.cat_id = cats.id GROUP BY cats.name \
+         WITHOUT SOURCE INDEX SELECT cats.name AS name, COUNT(*) AS n",
+    )
+    .await
+    .expect("oc");
     build_everything(t.pool()).await;
     trellis::client::reconcile_pass(
         raw,
@@ -217,6 +214,33 @@ async fn tot_partials_table(raw: &Client) -> String {
 async fn tot_partial_rows(raw: &Client) -> i64 {
     let table = tot_partials_table(raw).await;
     count(raw, &format!("select count(*) from {table}")).await
+}
+
+/// The rows in `oc`'s hidden tables (`join_<id>_*` in the Trellis schema),
+/// the `JOIN`'s runtime state.
+async fn oc_hidden_rows(raw: &Client) -> i64 {
+    let id = count(
+        raw,
+        "select id from transform_definitions where target_table = 'public.oc'",
+    )
+    .await;
+    let tables: Vec<String> = raw
+        .query(
+            "select c.relname::text from pg_class c join pg_namespace n on n.oid = c.relnamespace \
+             where n.nspname = $1 and c.relname like $2 and c.relkind = 'r'",
+            &[&SCHEMA, &format!("join\\_{id}\\_%")],
+        )
+        .await
+        .expect("list oc's hidden tables")
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert!(!tables.is_empty(), "oc has hidden tables");
+    let mut rows = 0;
+    for table in tables {
+        rows += count(raw, &format!("select count(*) from {SCHEMA}.{table}")).await;
+    }
+    rows
 }
 
 /// The Elixir client replaces an earlier appendix in a structure file only
@@ -261,6 +285,10 @@ async fn a_dump_loads_as_defined_not_built() {
         "the source has runtime state"
     );
     assert!(
+        oc_hidden_rows(&raw).await > 0,
+        "the source has the JOIN's runtime state"
+    );
+    assert!(
         rows_json(&raw, STATUSES)
             .await
             .iter()
@@ -291,8 +319,6 @@ async fn a_dump_loads_as_defined_not_built() {
 
     // The catalog rows match, apart from the build progress a define resets.
     for sql in [
-        "select to_jsonb(t) - 'created_at' from relationship_definitions t order by id",
-        "select to_jsonb(t) - 'created_at' - 'refreshed_lsn' from relationship_projections t order by id",
         "select to_jsonb(t) - 'created_at' from schema_nodes t order by id",
         "select to_jsonb(t) - 'created_at' from schema_edges t order by id",
         "select to_jsonb(t) from source_table_versions t order by source_table",
@@ -379,16 +405,6 @@ async fn a_dump_loads_as_defined_not_built() {
         0,
         "build progress loads cleared"
     );
-    let refreshed = "select count(*) from relationship_projections where refreshed_lsn is not null";
-    assert!(
-        count(&raw, refreshed).await > 0,
-        "the source refreshed its projection"
-    );
-    assert_eq!(
-        count(&after, refreshed).await,
-        0,
-        "projections load unrefreshed"
-    );
 
     // Every runtime table is empty, and the seed rows match a migrated database.
     for (table, class) in CLASSIFICATION {
@@ -400,37 +416,25 @@ async fn a_dump_loads_as_defined_not_built() {
             );
         }
     }
-    let projections = rows_json(
-        &after,
-        &format!(
-            "select relname::text from pg_class c join pg_namespace n on n.oid = c.relnamespace \
-             where n.nspname = '{SCHEMA}' and c.relkind = 'r' and relname like '_trellis_rel_projection_%'"
-        ),
-    )
-    .await;
-    assert_eq!(projections.len(), 1);
-    for p in projections {
-        assert_eq!(
-            count(&after, &format!("select count(*) from {SCHEMA}.{p}")).await,
-            0
-        );
-    }
     for t in ["o1", "tot", "oc"] {
         assert_eq!(
             count(&after, &format!("select count(*) from public.{t}")).await,
             0
         );
     }
-    for t in ["o1", "oc"] {
-        assert_eq!(
-            count(&after, &format!("select count(*) from public.{t}__ledger")).await,
-            0
-        );
-    }
+    assert_eq!(
+        count(&after, "select count(*) from public.o1__ledger").await,
+        0
+    );
     assert_eq!(
         tot_partial_rows(&after).await,
         0,
         "tot's partials load empty"
+    );
+    assert_eq!(
+        oc_hidden_rows(&after).await,
+        0,
+        "oc's hidden tables load empty"
     );
     let fresh = cluster.create_isolated_database().await;
     let fresh = connect_raw(fresh.dsn()).await;
@@ -619,10 +623,7 @@ async fn every_trellis_table_is_classified() {
              where n.nspname = '{SCHEMA}' and c.relkind in ('r', 'p') order by 1"
         ),
     )
-    .await
-    .into_iter()
-    .filter(|t| !is_projection_table(t))
-    .collect();
+    .await;
     actual.sort();
     let mut classified: Vec<String> = CLASSIFICATION.iter().map(|(t, _)| t.to_string()).collect();
     classified.sort();

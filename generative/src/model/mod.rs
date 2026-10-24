@@ -27,17 +27,8 @@ pub struct Table {
     /// Names of columns that carry a single-column `UNIQUE` constraint
     /// (issue #34). Every entry must also appear in `columns`; the primary
     /// key is *not* listed here (it's already unique by virtue of being the
-    /// primary key — see `pk_col`).
-    ///
-    /// This exists for relationships: ADR-0006 derives a relationship's
-    /// cardinality from whether its **to-side** column is provably unique
-    /// (primary key or `UNIQUE`), and `defs::catalog` introspects
-    /// that live against `pg_catalog` at `create_relationship` time. A
-    /// generated to-one relationship therefore needs a real `UNIQUE`
-    /// constraint on the to-side column, which the backend can only emit if
-    /// the model says it exists. A to-many relationship is the same
-    /// declaration with a *non*-unique to-side column, so this one list
-    /// decides both cardinalities.
+    /// primary key — see `pk_col`). The generator's tables leave it empty;
+    /// a hand-built pin sets it to give a source a unique column.
     pub unique_cols: Vec<String>,
     /// How the table is partitioned (ADR-0017), or `None` for a plain table.
     /// A partitioned table's primary key is `(pk_col, column)`, the
@@ -122,65 +113,13 @@ impl Table {
     }
 
     /// The type of `column` on this table, or `None` if it has no such
-    /// column. Used by [`crate::oracle`] to type a `<rel>.<column>`
-    /// enrichment field, whose type lives on the *to-side* table rather than
-    /// the definition's own source.
+    /// column.
     pub fn column_type(&self, column: &str) -> Option<ValueType> {
         self.columns
             .iter()
             .find(|c| c.name == column)
             .map(|c| c.value_type)
     }
-}
-
-/// How many related rows a [`Relationship`] resolves to (ADR-0006), derived
-/// — not declared — from whether the **to-side** column is provably unique:
-/// the concrete-syntax declaration
-/// (`RELATIONSHIP <name> FROM <t>.<c> TO <t>.<c>`) carries no cardinality
-/// keyword at all, and `defs::catalog` introspects `pg_catalog` for a
-/// primary-key/`UNIQUE` index on the to-side column to decide.
-///
-/// This enum records the cardinality the *generator* built the relationship
-/// to have, so [`crate::oracle`] can render the right SQL (a `LEFT JOIN`
-/// versus a correlated aggregate subquery) without a catalog round trip. It
-/// is a claim the generator is responsible for keeping true — every
-/// generated [`Relationship`] whose cardinality is [`Cardinality::ToOne`]
-/// must name a to-side column listed in that table's
-/// [`Table::unique_cols`], and every [`Cardinality::ToMany`] one must name a
-/// column that is *not*. [`crate::generate`] is the one place that
-/// invariant is established (see its `relationship_for`), and a violation is
-/// a generator bug the engine would catch as an install rejection — a hard
-/// failure, never a skip (design doc §3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Cardinality {
-    ToOne,
-    ToMany,
-}
-
-/// A standalone named relationship declaration (ADR-0006, issue #34):
-/// `RELATIONSHIP <name> FROM <from_table>.<from_col> TO <to_table>.<to_col>`.
-///
-/// Plain data, like every other part of a [`Program`] — the concrete syntax
-/// the backend hands `trellis::dev::defs::create_relationship` is rendered from
-/// these fields (see `crate::backend::ManualBackend`), and the oracle renders
-/// its own independent `SELECT` from them too.
-///
-/// A relationship is installed *before* any definition that references it
-/// (`Program::relationships` is installed alongside the tables, ahead of
-/// every definition — see `crate::run::run_convergence`), since a definition
-/// naming an undeclared relationship is rejected at validation time.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Relationship {
-    /// Unique per from-table (ADR-0006's naming scope). The generator draws
-    /// globally-unique `r0`, `r1`, ... names, which satisfies that trivially.
-    pub name: String,
-    pub from_table: String,
-    pub from_col: String,
-    pub to_table: String,
-    pub to_col: String,
-    /// What the generator built this relationship to be — see
-    /// [`Cardinality`] for why this is recorded rather than re-derived.
-    pub cardinality: Cardinality,
 }
 
 /// What a generator expects an op's `apply()` to actually do at the backend
@@ -364,16 +303,6 @@ impl Op {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
     pub tables: Vec<Table>,
-    /// Named relationship declarations (issue #34, ADR-0006) installed once,
-    /// alongside `tables` and ahead of every definition — a definition that
-    /// names an undeclared relationship is rejected at validation time, and
-    /// an install rejection is a hard failure, never a skip (design doc §3).
-    ///
-    /// Empty for every program that predates issue #34, which is why it sits
-    /// here rather than being folded into `defs`: a relationship is a
-    /// standalone declaration reusable across many definitions (ADR-0006),
-    /// not a clause inside one.
-    pub relationships: Vec<Relationship>,
     pub defs: Vec<TransformDef>,
     /// `def_install_after_op[i]` is how many of `ops` must already have been
     /// applied before `defs[i]` is installed (improvement-plan task E2):
@@ -874,7 +803,6 @@ mod tests {
         let table = Table::new(&mut pool, &[ValueType::Numeric]);
         let program = Program {
             tables: vec![table.clone()],
-            relationships: Vec::new(),
             defs: Vec::new(),
             def_install_after_op: Vec::new(),
             ops: vec![Op::Insert {

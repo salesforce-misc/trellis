@@ -90,9 +90,9 @@ column **unconditionally**, so no shrink step can strand a definition referencin
 it.
 
 `defs` reuses `trellis::defs::ast::TransformDef` directly — 1-1 definitions
-(including numeric `+`), `GROUP BY` aggregates, and named relationship
-declarations with the three relationship-reading field shapes of ADR-0006. The
-model is shaped so cross-join definitions and non-DML actions slot in later.
+(including numeric `+`), `GROUP BY` aggregates, and two-table `JOIN … GROUP BY`
+definitions (the JOIN tier). The model is shaped so non-DML actions slot in
+later.
 
 ### The backend seam
 

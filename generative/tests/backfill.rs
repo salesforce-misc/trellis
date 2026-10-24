@@ -71,7 +71,6 @@ async fn direct_backfill_builds_the_target_from_preexisting_source_rows() {
     // into the target.
     let source_only = Program {
         tables: vec![source.clone()],
-        relationships: Vec::new(),
         defs: vec![],
         def_install_after_op: vec![],
         ops: vec![],
@@ -111,7 +110,6 @@ async fn direct_backfill_builds_the_target_from_preexisting_source_rows() {
     // direct backfill.
     let def_only = Program {
         tables: vec![],
-        relationships: Vec::new(),
         defs: vec![def],
         def_install_after_op: vec![0],
         ops: vec![],
@@ -258,7 +256,6 @@ async fn quiesce_blocks_until_a_slow_backfill_actually_reaches_live() {
     // applier to (mis)use in place of the build.
     let source_only = Program {
         tables: vec![source.clone()],
-        relationships: Vec::new(),
         defs: vec![],
         def_install_after_op: vec![],
         ops: vec![],
@@ -354,7 +351,6 @@ async fn quiesce_blocks_until_a_slow_backfill_actually_reaches_live() {
     // the gate.
     let def_only = Program {
         tables: vec![],
-        relationships: Vec::new(),
         defs: vec![def],
         def_install_after_op: vec![0],
         ops: vec![],

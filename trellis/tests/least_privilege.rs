@@ -6,13 +6,13 @@
 //! lifecycle through the real staging and drain workers as one such role,
 //! so the list is shown sufficient: migrate, define, build, drain,
 //! `self_check`, `ALTER TRANSFORM`, `PAUSE`/`RESUME`, a widened key's pause
-//! and resume (#767), `DROP TRANSFORM` and defining again, `DROP
-//! RELATIONSHIP`, and the staging worker removing capture.
+//! and resume (#767), `DROP TRANSFORM` and defining again, and the staging
+//! worker removing capture. A `JOIN` transform covers a read of two tables.
 //!
 //! The roles, as the doc's example sets them up:
 //!
-//! - `app_owner`, `NOLOGIN`, owns the source tables, the relationship's
-//!   to-side included;
+//! - `app_owner`, `NOLOGIN`, owns the source tables, both sides of the
+//!   `JOIN` included;
 //! - `trellis`, `LOGIN`, a member of `app_owner` (inherited), holding
 //!   [`trellis_grants`] and nothing else;
 //! - `app`, `LOGIN`, the application: it writes the sources, reads the
@@ -21,9 +21,7 @@
 //!
 //! The database revokes what `PUBLIC` holds by default (`CONNECT` and
 //! `TEMPORARY` on the database, `USAGE` on `public`), so each of those is a
-//! grant of its own. Relationship endpoints resolve through the connection's
-//! `search_path`, which Trellis pins to the instance schema, the target
-//! schema and `public`, so the sources stay in `public`. Dropping any one of
+//! grant of its own. Dropping any one of
 //! [`trellis_grants`] makes a step fail; that was checked by hand for #833.
 //!
 //! It runs the real background pipeline, so it polls `status` the way an
@@ -182,15 +180,7 @@ async fn set_up(admin: &Client, database: &str) {
     }
 }
 
-/// Applies `statement`; a `RELATIONSHIP`, which `apply` no longer takes, is
-/// declared through the dev door instead.
 async fn apply(trellis: &Trellis, statement: &str) {
-    if statement.starts_with("RELATIONSHIP") {
-        trellis::dev::defs::create_relationship(trellis.pool(), statement)
-            .await
-            .unwrap_or_else(|err| panic!("{statement}: {err}"));
-        return;
-    }
     trellis
         .apply(statement)
         .await
@@ -285,13 +275,14 @@ async fn assert_targets_match(app: &Client, admin: &Client, with_double: bool) {
     assert_eq!(
         rows(
             app,
-            &format!("select id, customer_name from {TARGETS}.order_customers")
+            &format!("select name, n from {TARGETS}.order_customers")
         )
         .await,
         rows(
             admin,
-            "select o.id, c.name as customer_name \
-             from public.orders o left join public.customers c on c.id = o.customer_id"
+            "select c.name, count(*) as n \
+             from public.orders o left join public.customers c on c.id = o.customer_id \
+             group by c.name"
         )
         .await,
         "order_customers"
@@ -355,12 +346,7 @@ async fn the_documented_privileges_run_the_whole_lifecycle() {
     .expect("start the staging and drain workers as the Trellis role");
     let app = connect(&as_role(db.dsn(), "app")).await;
 
-    // Define a 1-1, an aggregate and a to-one relationship transform.
-    apply(
-        &trellis,
-        "RELATIONSHIP customer FROM orders.customer_id TO customers.id",
-    )
-    .await;
+    // Define a 1-1, an aggregate and a two-table JOIN transform.
     apply(
         &trellis,
         "TRANSFORM order_copy FROM public.orders SELECT amount AS amount",
@@ -374,7 +360,9 @@ async fn the_documented_privileges_run_the_whole_lifecycle() {
     .await;
     apply(
         &trellis,
-        "TRANSFORM order_customers FROM public.orders SELECT customer.name AS customer_name",
+        "TRANSFORM order_customers FROM public.orders LEFT JOIN public.customers \
+         ON orders.customer_id = customers.id GROUP BY customers.name WITHOUT SOURCE INDEX \
+         SELECT customers.name AS name, COUNT(*) AS n",
     )
     .await;
     for target in ["order_copy", "order_totals", "order_customers"] {
@@ -399,8 +387,7 @@ async fn the_documented_privileges_run_the_whole_lifecycle() {
     .expect("the application writes its sources");
     converge(&trellis).await;
     assert_targets_match(&app, &admin, false).await;
-    // `self_check` audits plain 1-1 targets only, and runs its capture
-    // audit with them.
+    // `self_check` of the 1-1 target runs its capture audit too.
     self_check_converges(&trellis, "order_copy").await;
     let refused = app
         .batch_execute(&format!(
@@ -444,19 +431,15 @@ async fn the_documented_privileges_run_the_whole_lifecycle() {
     assert_targets_match(&app, &admin, true).await;
     assert_no_privilege_refusal("PAUSE and RESUME");
 
-    // A widened key (#767) pauses the definitions keyed by it; a resume
-    // re-types Trellis's copies and rebuilds.
+    // A widened key (#767) pauses the 1-1 keyed by it; a resume re-types
+    // Trellis's copies and rebuilds.
     admin
         .batch_execute("alter table public.orders alter column id type bigint")
         .await
         .expect("the owner widens the key");
-    for target in ["order_copy", "order_customers"] {
-        let reported = wait_for(&trellis, target, TransformStatus::Paused).await;
-        assert!(reported.capture_failure.is_some(), "{target}: {reported:?}");
-    }
-    for target in ["order_copy", "order_customers"] {
-        apply(&trellis, &format!("RESUME TRANSFORM {target}")).await;
-    }
+    let reported = wait_for(&trellis, "order_copy", TransformStatus::Paused).await;
+    assert!(reported.capture_failure.is_some(), "{reported:?}");
+    apply(&trellis, "RESUME TRANSFORM order_copy").await;
     for target in ["order_copy", "order_totals", "order_customers"] {
         wait_for(&trellis, target, TransformStatus::Live).await;
     }
@@ -482,9 +465,6 @@ async fn the_documented_privileges_run_the_whole_lifecycle() {
     for target in ["order_customers", "order_totals", "order_copy"] {
         drop_transform(&trellis, target).await;
     }
-    trellis::dev::defs::drop_relationship(trellis.pool(), "orders.customer")
-        .await
-        .expect("drop the relationship");
     assert!(trellis.definitions().await.expect("definitions").is_empty());
     let targets: i64 = admin
         .query_one(

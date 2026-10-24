@@ -12,11 +12,10 @@
 //!
 //! - every statement form dispatches, and reports itself
 //!   (`every_statement_form_dispatches_through_the_one_entrypoint`)
-//! - `RELATIONSHIP` and `DROP RELATIONSHIP` are not statements: each is a
-//!   parse error that registers nothing
+//! - `RELATIONSHIP`, `DROP RELATIONSHIP` and `PAUSE`/`RESUME RELATIONSHIP` are
+//!   not statements: each is a parse error that registers nothing
 //!   (`relationship_statements_are_parse_errors_that_register_nothing`)
-//! - `PAUSE`/`RESUME RELATIONSHIP` is not a statement of this grammar, and a
-//!   statement outside the grammar changes nothing
+//! - a statement outside the grammar changes nothing
 //!   (`statements_outside_the_grammar_are_parse_errors_that_change_nothing`)
 
 use testkit::TestCluster;
@@ -47,17 +46,10 @@ async fn define_only(dsn: &str) -> Trellis {
     .expect("connect a define-only Trellis")
 }
 
-/// `authors`/`posts`, the from/to pair a relationship needs, plus an
-/// aggregate-shaped source. Aggregates build synchronously, so a test that
-/// needs a definition to actually be `live` doesn't have to stand up drain
-/// workers to get there.
+/// An aggregate-shaped source.
 async fn seed(raw: &Client) {
     raw.batch_execute(
-        "create table authors (id bigint primary key, name text); \
-         create table posts (id bigint primary key, author bigint); \
-         create table orders (id bigint primary key, g bigint, a numeric(20,0)); \
-         insert into authors (id, name) values (1, 'a'), (2, 'b'); \
-         insert into posts (id, author) values (1, 1), (2, 1), (3, 2); \
+        "create table orders (id bigint primary key, g bigint, a numeric(20,0)); \
          insert into orders (id, g, a) select s, s % 2, s from generate_series(1, 6) s;",
     )
     .await
@@ -169,17 +161,11 @@ async fn every_statement_form_dispatches_through_the_one_entrypoint() {
     );
 }
 
-/// `PAUSE`/`RESUME` are transform-only: a relationship is a reusable component
-/// of a transform, not something that does work of its own, so there is nothing
-/// for a pause to suspend and `PAUSE RELATIONSHIP` is not a form of this
-/// grammar at all. Through the facade, that has to look like any other invalid
-/// statement — a parse error, raised before any connection is used, leaving the
-/// catalog untouched — with no half-run operation and no dispatch arm that has
-/// nothing to call.
-///
-/// `DROP TRANSFORM <target>.<column>` is checked alongside it for the same
-/// reason: also not a form (dropping one field is `ALTER TRANSFORM`), also an
-/// ordinary parse error.
+/// `DROP TRANSFORM <target>.<column>` is not a form of this grammar (dropping
+/// one field is `ALTER TRANSFORM`). Through the facade, that has to look like
+/// any other invalid statement — a parse error, raised before any connection
+/// is used, leaving the catalog untouched — with no half-run operation and no
+/// dispatch arm that has nothing to call.
 #[tokio::test]
 async fn statements_outside_the_grammar_are_parse_errors_that_change_nothing() {
     let cluster = TestCluster::start();
@@ -188,20 +174,12 @@ async fn statements_outside_the_grammar_are_parse_errors_that_change_nothing() {
     seed(&raw).await;
 
     let trellis = define_only(db.dsn()).await;
-    trellis::dev::defs::create_relationship(
-        trellis.pool(),
-        "RELATIONSHIP posts FROM authors.id TO posts.author",
-    )
-    .await
-    .expect("declare a relationship to aim the invalid statements at");
     trellis
         .apply("TRANSFORM order_rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total")
         .await
         .expect("define a transform to aim the invalid statements at");
 
     for statement in [
-        "PAUSE RELATIONSHIP authors.posts",
-        "RESUME RELATIONSHIP authors.posts",
         "DROP TRANSFORM public.order_rollup.total",
         // A transform's `<transform>.<column>`: DROP takes no column.
         "DROP TRANSFORM order_rollup.total",
@@ -217,12 +195,7 @@ async fn statements_outside_the_grammar_are_parse_errors_that_change_nothing() {
         );
     }
 
-    // Nothing ran: both definitions stand, and the transform is untouched by
-    // the pause/resume that never happened.
-    assert_eq!(
-        count(&raw, "select count(*) from relationship_definitions").await,
-        1
-    );
+    // Nothing ran: the transform stands, untouched.
     assert_eq!(
         trellis
             .status("order_rollup")
@@ -234,7 +207,8 @@ async fn statements_outside_the_grammar_are_parse_errors_that_change_nothing() {
     );
 }
 
-/// `RELATIONSHIP` and `DROP RELATIONSHIP` are no longer statements (#1115):
+/// `RELATIONSHIP`, `DROP RELATIONSHIP` and `PAUSE`/`RESUME RELATIONSHIP` are
+/// not statements (#1115):
 /// `apply` refuses each as text it can't parse, before registering anything,
 /// and `statement_kind` gives the same answer without a database.
 #[tokio::test]
@@ -253,6 +227,8 @@ async fn relationship_statements_are_parse_errors_that_register_nothing() {
     for statement in [
         "RELATIONSHIP owner FROM widgets.owner_id TO users.id",
         "DROP RELATIONSHIP widgets.owner",
+        "PAUSE RELATIONSHIP widgets.owner",
+        "RESUME RELATIONSHIP widgets.owner",
     ] {
         let err = trellis
             .apply(statement)

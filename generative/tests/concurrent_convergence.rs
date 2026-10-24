@@ -60,16 +60,15 @@
 //!   recovers a column after its poison fuse trips);
 //! - installing a `GROUP BY` definition over the hot table mid-burst, so its
 //!   build overlaps CDC on its source (#625's build-under-load shape);
-//! - a `TRUNCATE` of a relationship's to-side table, and to-side row updates,
-//!   while the from-side hot table churns.
+//! - a `TRUNCATE` of the case's second table while the hot table churns.
 //!
 //! The actions are named after the public API an operator calls, not the
 //! mechanism behind it, because the mechanism is what epic #556 rewrites:
 //! today each stages a catch-up re-read, and under ADR-0002 milestone F
 //! (#625) each becomes a Re-derive. The coverage report adds per-shape
 //! counts (`mid_burst_backfill`, `mid_burst_resume`,
-//! `mid_burst_column_resume`, `mid_burst_install`, `to_side_truncate`,
-//! `parent_update`) and per-action counts (`concurrent_actions`).
+//! `mid_burst_column_resume`, `mid_burst_install`) and per-action counts
+//! (`concurrent_actions`).
 //!
 //! [`property_cooling_keys_converge_under_concurrent_drains`] is the
 //! cooling-key tier (issue #557 part 3b). It draws
@@ -86,7 +85,7 @@
 //! The coverage report counts it as `cooling_key`.
 //!
 //! The steady-load tier (#720, #725) draws `generate::steady_load_case`: a
-//! mid-burst case, relationships included, run under a steady load
+//! mid-burst case run under a steady load
 //! (`model::SteadyLoad`). Once an action starts a build, each lane waits a
 //! drawn 0.5 to 2ms after every op for the rest of the burst, so its writes
 //! trickle in while the build runs; and the engine's pages and build chunks
@@ -169,7 +168,7 @@
 //! strategy changes shape. [`hot_key_case_3_11_converges`] is the first, the
 //! hot-key case that fails on tmpfs with no plant armed. Its ops and plan
 //! live in `tests/pins/hot_key_3_11.ops`. It was #623's exit check, and it
-//! stays a regression pin; #624 re-runs it for the factored relationships.
+//! stays a regression pin.
 //!
 //! # The burst-batching knob
 //!
@@ -1238,18 +1237,14 @@ fn pin_ops_rejects_malformed_lines() {
 /// by hand and written out op for op in `tests/pins/hot_key_3_11.ops`, so no
 /// generator change can move it.
 ///
-/// `t2`, `t3` and `t4` all group `t0` by `c6`: `t2` with SUM, COUNT, AVG,
-/// MIN, MAX, BOOL_AND, BOOL_OR and `MIN(r0.c10)` through the to-one
-/// relationship `r0` (`t0.c8 -> t1.c16`), `t3` with AVG, `COUNT(c1)` and
-/// `SUM(c2)`, `t4` with SUM, AVG, MIN, MAX, BOOL_OR and `SUM(r0.c10)`. `t2`
-/// and `t4` read a relationship, so they stay on the ledger; `t3` is a plain
-/// aggregate and runs on the group basis, which admits only `COUNT`/`SUM`/
-/// `AVG` (#1100), so its drawn `MIN(c1)`/`MAX(c2)` are now `COUNT(c1)`/
-/// `SUM(c2)`. The ops are three
-/// bursts over two lanes, 1,270 in all: 4 `t1` inserts and, on `t0`, 117
-/// inserts, 101 deletes, 601 updates to `c1` and `c2`, 273 that move a row
-/// between `c6` groups, and 174 to `c1` or `c4` alone. None changes the join
-/// column `c8`.
+/// `t2`, `t3` and `t4` all group `t0` by `c6`, on the group basis, which
+/// admits only `COUNT`/`SUM`/`AVG` (#1100): each drawn `MIN(x)` is now
+/// `COUNT(x)`, each `MAX(x)` `SUM(x)`, and each `BOOL_AND(c4)`/`BOOL_OR(c4)`
+/// `COUNT(c4)`. `t2` has two SUMs, `COUNT(*)`, AVG and two COUNTs, `t3`
+/// AVG, `COUNT(c1)` and `SUM(c2)`, `t4` two SUMs, AVG and two COUNTs. The ops
+/// are three bursts over two lanes, 1,270 in all: 4 `t1` inserts and, on
+/// `t0`, 117 inserts, 101 deletes, 601 updates to `c1` and `c2`, 273 that move
+/// a row between `c6` groups, and 174 to `c1` or `c4` alone.
 ///
 /// Cut from the drawn case: its 9 `t1` updates and its 741 ops that fail or
 /// touch no row. Both cuts made it fail more often, not less (see
@@ -1292,23 +1287,14 @@ fn hot_key_case_3_11() -> (
             &["c16"],
         ),
     ];
-    let relationships = vec![generative::model::Relationship {
-        name: "r0".to_string(),
-        from_table: "t0".to_string(),
-        from_col: "c8".to_string(),
-        to_table: "t1".to_string(),
-        to_col: "c16".to_string(),
-        cardinality: generative::model::Cardinality::ToOne,
-    }];
     let defs: Vec<_> = [
         "TRANSFORM t2 FROM t0 GROUP BY c6 SELECT c6 AS c6, SUM(c2) AS sum_c2, \
-         COUNT(*) AS cnt, AVG(c1) AS avg_c1, MIN(c2) AS min_c2, MAX(c1) AS max_c1, \
-         BOOL_AND(c4) AS bool_and_c4, BOOL_OR(c4) AS bool_or_c4, MIN(r0.c10) AS rel_agg",
+         COUNT(*) AS cnt, AVG(c1) AS avg_c1, COUNT(c2) AS count_c2, SUM(c1) AS sum_c1, \
+         COUNT(c4) AS count_c4",
         "TRANSFORM t3 FROM t0 GROUP BY c6 SELECT c6 AS c6, AVG(c1) AS avg_c1, \
          COUNT(c1) AS count_c1, SUM(c2) AS sum_c2",
         "TRANSFORM t4 FROM t0 GROUP BY c6 SELECT c6 AS c6, SUM(c2) AS sum_c2, \
-         AVG(c1) AS avg_c1, MIN(c2) AS min_c2, MAX(c1) AS max_c1, \
-         BOOL_OR(c4) AS bool_or_c4, SUM(r0.c10) AS rel_agg",
+         AVG(c1) AS avg_c1, COUNT(c2) AS count_c2, SUM(c1) AS sum_c1, COUNT(c4) AS count_c4",
     ]
     .iter()
     .map(|text| trellis::dev::defs::parse(text).expect("a pinned definition parses"))
@@ -1316,7 +1302,6 @@ fn hot_key_case_3_11() -> (
     let (ops, plan) = pin_ops(include_str!("pins/hot_key_3_11.ops"));
     let program = generative::model::Program {
         tables,
-        relationships,
         def_install_after_op: vec![0; defs.len()],
         defs,
         ops,
@@ -1343,8 +1328,8 @@ fn hot_key_case_3_11_loads() {
 /// with four processes at once when it was written, but 0 of 70 alone and 3
 /// of 80 with four processes at once in review, while other work shared the
 /// box. Usually a `GROUP BY` `SUM` is wrong once a burst quiesces
-/// (`t2[1:0].sum_c2: expected=68`, with `got` anywhere from 4 to 148, or
-/// `t4[1:2].rel_agg: expected=69 got=4`), or the run never converges
+/// (`t2[1:0].sum_c2: expected=68`, with `got` anywhere from 4 to 148), or
+/// the run never converges
 /// (`ConvergenceTimeout`). The input is identical every time; only the drain
 /// workers' timing differs. It was the exit check of #556's milestone D
 /// (#623) and is a regression pin since; milestone E (#624) re-runs it as
@@ -1358,8 +1343,8 @@ fn hot_key_case_3_11_loads() {
 /// | the drawn case 3:11 ... | failed |
 /// |---|---|
 /// | as drawn | 6/160 (2 diverged, 4 never converged) |
-/// | without the relationship fields | 3/200 |
-/// | without the relationship fields and any `t1` op | 2/160 |
+/// | without the fields that read `t1` | 3/200 |
+/// | without the fields that read `t1` and any `t1` op | 2/160 |
 /// | without the `t1` updates | 17/200 |
 /// | without the `t1` updates or the ops that change nothing (this pin) | 18/160 |
 /// | without the `t1` updates, `t2` alone | 0/160 |
@@ -1367,16 +1352,15 @@ fn hot_key_case_3_11_loads() {
 ///
 /// So it needs group moves, and it needs more than one `GROUP BY` definition
 /// over the hot table, or at least the apply load a second one adds: the
-/// table can't tell those apart. It doesn't need the relationship (it still
-/// diverges without it) or the parent updates (without them it fails more
-/// often, not less), so it isn't #582's reverse-path lost update. Both
+/// table can't tell those apart. It doesn't need the fields that read `t1`
+/// (it still diverges without them) or the `t1` updates (without them it
+/// fails more often, not less). Both
 /// remaining suspects are #623's scope. Group moves under `MIN`/`MAX`
 /// recomputes are #494's shape: a key passing through a group inside one
 /// folded batch, under a recompute horizon. And #649's review saw up to 22
 /// `deadlock detected` per run between the three definitions' aggregate
 /// pre-locks (#326's group pre-lock). #623 D5 removed both the horizons and
-/// the pre-lock. The pin keeps the relationship fields, and `t4`'s `rel_agg` has
-/// diverged too, so it re-checks #624's factored relationships as well.
+/// the pre-lock.
 ///
 /// #623 D9's exit check, four processes at once: the pre-ledger engine (D3's
 /// base) failed 1 of 360 attempts on tmpfs (a `ConvergenceTimeout`; 0 of the

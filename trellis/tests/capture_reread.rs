@@ -14,8 +14,7 @@
 //!   later one) carrying the live state.
 //! - **Skip-no-op.** An update of only unimaged columns, or one that sets
 //!   imaged columns to the values they had (types with no equality operator
-//!   included), stages nothing. A move of a relationship join column alone
-//!   still stages, on both sides of the relationship.
+//!   included), stages nothing.
 //!
 //! The re-read runs only when another write to the table ran in the
 //! statement's span (`capture_ssi.rs` checks that gate). The tests that check
@@ -27,17 +26,13 @@
 //! Capture is installed by hand and the ring is read directly; nothing waits
 //! for convergence (#297).
 
-use std::collections::HashMap;
 use std::time::Duration;
 
 use testkit::TestCluster;
 use tokio_postgres::{Client, IsolationLevel, NoTls};
-use trellis::capture::columns::{capture_spec, load_catalog};
 use trellis::capture::install::{self, Progress};
 use trellis::capture::sql::{CaptureEvent, CaptureSpec, trigger_name};
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::defs::ast::ValueType;
-use trellis::defs::{create_relationship, install_definition};
 
 /// The advisory lock the application trigger in the no-leak tests waits on.
 const HOLD_LOCK: i64 = 623_008;
@@ -814,111 +809,6 @@ async fn an_update_to_the_same_values_stages_nothing() {
             .as_deref()
             .unwrap()
             .contains(r#""j": "{\"k\": 1}""#)
-    );
-}
-
-/// A relationship's join columns are imaged even when no definition reads
-/// them as a field, so a move of one alone still stages: the from-side's
-/// `from_col` (with the old and new parent in `group_key`) and the to-side's
-/// `to_col` (a unique column, not its key). A to-side column nothing reads
-/// stages nothing.
-#[tokio::test]
-async fn a_move_of_a_join_column_alone_still_stages() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut raw = connect(db.dsn()).await;
-    raw.batch_execute(
-        "create table public.parent (id int primary key, code text unique, name text, \
-             unread text); \
-         insert into public.parent values (1, 'p1', 'one', 'u'), (2, 'p2', 'two', 'u'); \
-         create table public.child (id int primary key, pcode text, amount int, note text); \
-         insert into public.child values (10, 'p1', 5, 'n')",
-    )
-    .await
-    .expect("create parent and child");
-    create_relationship(
-        &db.pool,
-        "RELATIONSHIP child_parent FROM child.pcode TO parent.code",
-    )
-    .await
-    .expect("relationship");
-    let columns: HashMap<String, ValueType> = [
-        ("id".to_string(), ValueType::Numeric),
-        ("pcode".to_string(), ValueType::Text),
-    ]
-    .into();
-    install_definition(
-        &db.pool,
-        "TRANSFORM named FROM public.child SELECT child_parent.name AS parent_name",
-        &columns,
-        "public",
-    )
-    .await
-    .expect("install the definition");
-    trellis::intake::markers::settle_registrations(&db.pool).await;
-
-    let client = db.pool.get().await.expect("pool client");
-    let catalog = load_catalog(&**client, DEFAULT_SCHEMA)
-        .await
-        .expect("load the capture catalog");
-    let child = capture_spec(&**client, &catalog, "public.child")
-        .await
-        .expect("child spec");
-    let parent = capture_spec(&**client, &catalog, "public.parent")
-        .await
-        .expect("parent spec");
-    drop(client);
-    assert_eq!(child.columns(), ["id", "pcode"]);
-    assert_eq!(child.group_key(), ["pcode"]);
-    assert_eq!(parent.columns(), ["code", "id", "name"]);
-    install_spec(&mut raw, &child).await;
-    install_spec(&mut raw, &parent).await;
-    // The registration stages its own `recompute` rows; only what capture
-    // stages for the writes below counts.
-    let captured = |rows: Vec<Ring>| -> Vec<Ring> {
-        rows.into_iter()
-            .filter(|r| ["insert", "update", "delete"].contains(&r.2.as_str()))
-            .collect()
-    };
-
-    raw.batch_execute(
-        "update public.child set note = 'm', amount = 6; \
-         update public.parent set unread = 'w'",
-    )
-    .await
-    .expect("updates of unimaged columns");
-    assert!(captured(ring(&raw, "public.child").await).is_empty());
-    assert!(captured(ring(&raw, "public.parent").await).is_empty());
-
-    raw.batch_execute(
-        "update public.child set pcode = 'p2'; \
-         update public.parent set code = 'p1b' where id = 1",
-    )
-    .await
-    .expect("join-column moves");
-    let child_rows: Vec<(String, Option<Vec<String>>)> = captured(ring(&raw, "public.child").await)
-        .into_iter()
-        .map(|r| (r.2, r.5))
-        .collect();
-    assert_eq!(
-        child_rows,
-        vec![(
-            "update".to_string(),
-            Some(vec!["p1".to_string(), "p2".to_string()])
-        )]
-    );
-    let parent_rows: Vec<(String, String, Option<String>)> =
-        captured(ring(&raw, "public.parent").await)
-            .into_iter()
-            .map(|r| (r.1, r.2, r.4))
-            .collect();
-    assert_eq!(
-        parent_rows,
-        vec![(
-            "1".to_string(),
-            "update".to_string(),
-            Some(r#"{"id": "1", "code": "p1b", "name": "one"}"#.to_string())
-        )]
     );
 }
 

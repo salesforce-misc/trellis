@@ -3909,28 +3909,12 @@ mod catch_up_tests {
         panic!("pipeline did not reach quiescence within 16 seal/drain rounds");
     }
 
-    /// The rollup of `public.orders` these tests build: `w` reads
-    /// [`relate_orders`]'s to-one relationship, so it still takes the old
-    /// direct build and its go-live catch-up until #625 F9 (every plain
-    /// aggregate is the Re-derive build's since #625 F5). Its `SUM` shows a
-    /// change counted twice.
+    /// The rollup of `public.orders` these tests build, held out of the
+    /// Re-derive build so it takes the old direct build and its go-live
+    /// catch-up until #625 F10 (every plain aggregate is the Re-derive
+    /// build's since #625 F5). Its `SUM` shows a change counted twice.
     const ROLLUP: &str = "TRANSFORM order_rollup FROM orders GROUP BY g \
-        WITHOUT SOURCE INDEX SELECT sum(a) AS total, max(grp.w) AS w";
-
-    /// Creates `public.grps` and the to-one relationship `grp` from
-    /// `orders.g` to it, which [`ROLLUP`]'s `w` reads.
-    async fn relate_orders(pool: &crate::pool::Pool, client: &tokio_postgres::Client) {
-        client
-            .batch_execute(
-                "create table public.grps (id bigint primary key, w numeric); \
-                 insert into public.grps values (0, 10), (1, 11)",
-            )
-            .await
-            .expect("seed grps");
-        crate::defs::create_relationship(pool, "RELATIONSHIP grp FROM orders.g TO grps.id")
-            .await
-            .expect("create the to-one relationship");
-    }
+        WITHOUT SOURCE INDEX SELECT sum(a) AS total";
 
     /// `public.orders` (group `g = 0` holds ids 2, 4, 6 and group 1 holds 1,
     /// 3, 5, with `a = id`) summed by `order_rollup`, built, paused, changed
@@ -3950,7 +3934,9 @@ mod catch_up_tests {
             )
             .await
             .expect("seed orders");
-        relate_orders(&pool, &client).await;
+        hold_out_of_the_rederive_build(&client, "public.orders")
+            .await
+            .expect("hold orders' definitions out of the Re-derive build");
         // The live types: a resume re-validates against them and re-types
         // a `GROUP BY` copy that doesn't match (#767).
         let columns = [
@@ -4085,6 +4071,7 @@ mod catch_up_tests {
     /// entry's basis already says the build's read counted it, so the insert
     /// doesn't add 100 to the group (200).
     #[tokio::test]
+    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
     async fn a_group_repopulated_before_the_rebuild_reads_holds_only_its_new_rows() {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
@@ -4115,6 +4102,7 @@ mod catch_up_tests {
     /// discharge's sweep finds the group unbacked and deletes it; the row's
     /// CDC delete, applied once the definition is `live`, finds nothing.
     #[tokio::test]
+    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
     async fn a_group_emptied_after_the_dispatch_sweep_is_dropped_at_go_live() {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
@@ -4147,6 +4135,7 @@ mod catch_up_tests {
     /// the deleted rows, so their ledger entries are non-members and the
     /// deletes move nothing: the group is just the new row, 100, not 88.
     #[tokio::test]
+    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
     async fn a_group_emptied_before_the_rebuild_reads_holds_only_its_new_rows() {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
@@ -4230,24 +4219,6 @@ mod catch_up_tests {
         let txn = writer.transaction().await.expect("begin");
         append::append(&txn, &changes).await.expect("stage cdc");
         txn.commit().await.expect("commit cdc");
-    }
-
-    /// Holds back [`ROLLUP`]'s go-live catch-up on its relationship's to-side
-    /// (`public.grps`), so the discharge a test drives next is
-    /// `public.orders`' alone. That discharge sweeps the rollup as a
-    /// `catching_up` reader of the table either way; it just doesn't flip it
-    /// `live`. Discharging `public.grps` first instead would re-derive every
-    /// group it reaches, the stale ones included.
-    async fn defer_grps_catch_up(client: &tokio_postgres::Client) {
-        let deferred = client
-            .execute(
-                "update pending_backfill set next_attempt_at = now() + interval '1 hour' \
-                 where table_name = 'public.grps'",
-                &[],
-            )
-            .await
-            .expect("defer the to-side's catch-up");
-        assert_eq!(deferred, 1, "the rollup's build parked a catch-up on grps");
     }
 
     /// Fences `public.orders`' pending marker and waits for the fence to
@@ -4372,7 +4343,6 @@ mod catch_up_tests {
             )
             .await
             .expect("seed orders");
-        relate_orders(&pool, &client).await;
         // The live types: a resume re-validates against them and re-types
         // a `GROUP BY` copy that doesn't match (#767).
         let columns: std::collections::HashMap<String, crate::defs::ValueType> = [
@@ -4465,6 +4435,7 @@ mod catch_up_tests {
     /// and id 10 (100) lands after its read: the right answer is 100. Folding
     /// the gap's deletes and the refill onto the stale 9 gives 103.
     #[tokio::test]
+    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
     async fn a_group_emptied_before_a_go_live_read_and_refilled_after_it_holds_only_its_new_rows() {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
@@ -4496,7 +4467,6 @@ mod catch_up_tests {
             "the build counted id 3, and its delete was skipped"
         );
 
-        defer_grps_catch_up(&discharger).await;
         settle_orders_marker(&discharger).await;
         let mut writer = connect(&db).await;
         let locker = connect(&db).await;
@@ -4548,6 +4518,7 @@ mod catch_up_tests {
     /// deleted in the discharge's gap and id 10 (100) lands after its read:
     /// the right answer is 100. Folding those onto a stale row gives more.
     #[tokio::test]
+    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
     async fn a_resumed_group_emptied_before_a_go_live_read_and_refilled_after_it_holds_only_its_new_rows()
      {
         let cluster = testkit::TestCluster::start();
@@ -4615,7 +4586,6 @@ mod catch_up_tests {
             "the rebuild dropped group 1, which its ledger has no entry for"
         );
 
-        defer_grps_catch_up(&discharger).await;
         settle_orders_marker(&discharger).await;
         let mut writer = connect(&db).await;
         let locker = connect(&db).await;
@@ -5146,8 +5116,8 @@ mod dispatch_tests {
     }
 
     /// Runs one discharge pass that dispatches none of the waiting
-    /// definitions (`ready` empty), as one whose relationship's to-side isn't
-    /// ready yet isn't dispatched.
+    /// definitions (`ready` empty), as one whose capture isn't ready yet
+    /// isn't dispatched.
     async fn discharge_dispatching_nothing(client: &mut tokio_postgres::Client) {
         run_pending_backfills_for(
             client,

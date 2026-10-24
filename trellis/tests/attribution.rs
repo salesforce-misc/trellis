@@ -1,10 +1,10 @@
 //! Whole-key attribution's width (#822): which definitions isolation charges
-//! a record that fails alone to, when the failure is in shared relationship
-//! work or appears only when several definitions apply the record together.
+//! a record that fails alone to, when the failure appears only when several
+//! definitions apply the record together.
 //!
 //! Each test stages one change, claims and folds its page, and calls
 //! `isolate_and_evict` (or one `drain_once`) once. Faults are injected into
-//! one definition's or one relationship's writes: a check constraint, or a
+//! one definition's writes: a check constraint, or a
 //! trigger pair that refuses two tables written in one transaction. Nothing
 //! polls for convergence (#297).
 
@@ -16,7 +16,6 @@ use std::sync::{Arc, LazyLock, Mutex};
 use drain_driver::{Driver, WAKE};
 use tracing::field::{Field, Visit};
 use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
-use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ValueType;
 use trellis::staging::quarantine::{DEFAULT_DEATH_THRESHOLD, IsolationOutcome, isolate_and_evict};
 use trellis::staging::{BucketFilter, StagedWatermark, apply, claim, fold};
@@ -49,20 +48,6 @@ async fn guard_pair(d: &Driver, a: &str, b: &str) {
             .await
             .expect("guard a pair of tables");
     }
-}
-
-/// The settled projection table of relationship `name`.
-async fn projection(d: &Driver, name: &str) -> String {
-    let id: i64 = d
-        .ctl
-        .query_one(
-            "select id from relationship_definitions where name = $1",
-            &[&name],
-        )
-        .await
-        .expect("read the relationship's id")
-        .get(0);
-    format!("{DEFAULT_SCHEMA}._trellis_rel_projection_{id}")
 }
 
 /// Seals what the test wrote, claims the whole segment as [`WORKER`] and folds
@@ -128,154 +113,6 @@ async fn deaths_for(d: &Driver) -> Vec<String> {
         .iter()
         .map(|row| row.get(0))
         .collect()
-}
-
-// ---------------------------------------------------------------------
-// A failure in a relationship's reverse work (#822 question 1)
-// ---------------------------------------------------------------------
-
-/// `public.par`, read directly by `par_w`, and through two relationships to
-/// it: `ra` from `public.sa` (read by `sa_w`) and `rb` from `public.sb` (read
-/// by `sb_w`). Row 1 of each, `sa` and `sb` naming `par` 1.
-async fn two_relationships() -> Driver {
-    Driver::start_with_relationships(
-        "create table public.par (id integer primary key, w numeric); \
-         create table public.sa (id integer primary key, p integer); \
-         create table public.sb (id integer primary key, p integer); \
-         insert into public.par values (1, 10); \
-         insert into public.sa values (1, 1); \
-         insert into public.sb values (1, 1);",
-        &[
-            ("id", ValueType::Numeric),
-            ("w", ValueType::Numeric),
-            ("p", ValueType::Numeric),
-        ],
-        &[
-            "RELATIONSHIP ra FROM sa.p TO par.id",
-            "RELATIONSHIP rb FROM sb.p TO par.id",
-        ],
-        &[
-            "TRANSFORM sa_w FROM public.sa SELECT ra.w AS pw",
-            "TRANSFORM sb_w FROM public.sb SELECT rb.w AS pw",
-            "TRANSFORM par_w FROM public.par SELECT w AS w",
-        ],
-        &["public.par", "public.sa", "public.sb"],
-    )
-    .await
-}
-
-/// `ra`'s settled projection refuses a `w` of 100 or more, so a change to
-/// `par` 1's `w` fails in `ra`'s reverse work alone. Only `ra`'s reader is
-/// charged: `rb`'s work applies the change, so `sb_w` isn't, and neither is
-/// `par_w`, which reads `par` directly.
-#[tokio::test]
-async fn a_failure_in_one_relationships_work_charges_that_relationships_readers_only() {
-    let mut d = two_relationships().await;
-    let ra = projection(&d, "ra").await;
-    d.ctl
-        .batch_execute(&format!(
-            "alter table {ra} add constraint cheap check (w < 100); \
-             update public.par set w = 500 where id = 1"
-        ))
-        .await
-        .expect("constrain ra's projection and change par 1");
-
-    let (outcome, probes) = isolate(&mut d).await;
-    assert_eq!(charged(&outcome), vec!["sa_w".to_string()], "{outcome:?}");
-    assert_eq!(deaths_for(&d).await, vec!["sa_w".to_string()]);
-    // The record alone, the relationships' share, then `ra`'s and `rb`'s.
-    assert_eq!(probes, 4);
-}
-
-/// A failure only `ra`'s and `rb`'s work reproduce together (a trigger pair
-/// on their projections): neither relationship fails alone, so every reader
-/// of both is charged, as before relationships were probed one at a time.
-/// `par_w` isn't.
-#[tokio::test]
-async fn a_failure_only_two_relationships_work_reproduces_together_charges_every_reader() {
-    let mut d = two_relationships().await;
-    let (ra, rb) = (projection(&d, "ra").await, projection(&d, "rb").await);
-    d.ctl.batch_execute(PAIR_GUARD).await.expect("pair_guard");
-    guard_pair(&d, &ra, &rb).await;
-    d.ctl
-        .batch_execute("update public.par set w = 500 where id = 1")
-        .await
-        .expect("change par 1");
-
-    let (outcome, probes) = isolate(&mut d).await;
-    assert_eq!(
-        charged(&outcome),
-        vec!["sa_w".to_string(), "sb_w".to_string()],
-        "{outcome:?}"
-    );
-    assert_eq!(probes, 4);
-}
-
-/// A failure in the re-derive of the children of a `to_col` value the fold
-/// erased, which is `ra`'s work alone. `ra` joins `par.code`, which isn't
-/// `par`'s key, so the fold carries `code`'s values (`to_col_values`); `rb`
-/// joins `par.id`. `par` 1's `code` goes 101 → 102 → 103 in one page, erasing
-/// 102, and the ring refuses the recompute staged for `sa` 3, the child of
-/// 102. Probing `rb` alone leaves the key out of `ra`'s work whole, the erased
-/// value's re-derive with it, so `rb`'s reader isn't charged.
-#[tokio::test]
-async fn a_failure_in_an_erased_values_rederive_charges_only_that_relationships_readers() {
-    let mut d = Driver::start_with_relationships(
-        "create table public.par (id integer primary key, code integer unique, w numeric); \
-         create table public.sa (id integer primary key, p integer); \
-         create table public.sb (id integer primary key, p integer); \
-         insert into public.par values (1, 101, 10); \
-         insert into public.sa values (1, 101), (3, 102); \
-         insert into public.sb values (1, 1);",
-        &[
-            ("id", ValueType::Numeric),
-            ("w", ValueType::Numeric),
-            ("p", ValueType::Numeric),
-        ],
-        &[
-            "RELATIONSHIP ra FROM sa.p TO par.code",
-            "RELATIONSHIP rb FROM sb.p TO par.id",
-        ],
-        &[
-            "TRANSFORM sa_w FROM public.sa SELECT ra.w AS pw",
-            "TRANSFORM sb_w FROM public.sb SELECT rb.w AS pw",
-        ],
-        &["public.par", "public.sa", "public.sb"],
-    )
-    .await;
-    d.ctl
-        .batch_execute(
-            "update public.par set code = 102 where id = 1; \
-             update public.par set code = 103 where id = 1;",
-        )
-        .await
-        .expect("move par 1's code through 102");
-    d.ctl
-        .batch_execute(
-            "create function public.refuse_sa_3() returns trigger language plpgsql as $$ \
-             begin \
-               if new.src_table = 'public.sa' and new.key = '3' then \
-                 raise exception 'sa 3 refused' using errcode = 'check_violation'; \
-               end if; \
-               return new; \
-             end $$;",
-        )
-        .await
-        .expect("refuse_sa_3");
-    for seg in 0..4 {
-        d.ctl
-            .batch_execute(&format!(
-                "create trigger refuse_sa_3 before insert on {DEFAULT_SCHEMA}.seg_{seg} \
-                 for each row execute function public.refuse_sa_3()"
-            ))
-            .await
-            .expect("make the ring refuse a recompute of sa 3");
-    }
-
-    let (outcome, probes) = isolate(&mut d).await;
-    assert_eq!(charged(&outcome), vec!["sa_w".to_string()], "{outcome:?}");
-    // The record alone, the relationships' share, then `ra`'s and `rb`'s.
-    assert_eq!(probes, 4);
 }
 
 // ---------------------------------------------------------------------

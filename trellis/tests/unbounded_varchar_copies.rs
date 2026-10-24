@@ -225,50 +225,39 @@ async fn a_varchar_text_change_of_the_source_reports_no_drift() {
 }
 
 /// Rule 1 of #1207's decision, over the tables Trellis creates for these
-/// shapes: a 1-1 target keyed by a `varchar(n)` with a passthrough and a
-/// field read through a relationship, the 1-1 side ledger, the
-/// relationship's projection, a group-basis aggregate grouped by `varchar(n)`
-/// columns (target and partials), and a ledger aggregate grouped by a
-/// relationship path (target, ledger, group-delta table). None of their
-/// columns has a length. `join_schema_changes.rs` covers the `JOIN` tables.
+/// shapes: a 1-1 target keyed by a `varchar(n)` with a passthrough, and a
+/// group-basis aggregate grouped by `varchar(n)` columns (target and
+/// partials). None of their columns has a length. `join_schema_changes.rs`
+/// covers the `JOIN` tables.
 #[tokio::test]
 async fn no_table_trellis_creates_holds_a_bounded_varchar() {
-    let mut d = Driver::start_with_relationships(
-        "create table public.o (code varchar(5) primary key, label varchar(5)); \
-         create table public.s (id varchar(5) primary key, g varchar(5), k varchar(5), \
+    let mut d = Driver::start(
+        "create table public.s (id varchar(5) primary key, g varchar(5), k varchar(5), \
                                 n integer)",
         &[
             ("id", ValueType::Text),
             ("g", ValueType::Text),
             ("k", ValueType::Text),
             ("n", ValueType::Integer(IntWidth::Int4)),
-            ("code", ValueType::Text),
-            ("label", ValueType::Text),
         ],
-        &["RELATIONSHIP owner FROM s.k TO o.code"],
         &[
-            "TRANSFORM one FROM public.s SELECT g AS g, owner.label AS ol, n AS n",
+            "TRANSFORM one FROM public.s SELECT g AS g, n AS n",
             "TRANSFORM per_gk FROM public.s GROUP BY g, k \
             WITHOUT SOURCE INDEX SELECT g AS g, k AS k, COUNT(*) AS c, COUNT(k) AS mk, SUM(n) AS sn",
-            "TRANSFORM per_label FROM public.s GROUP BY owner.label \
-            WITHOUT SOURCE INDEX SELECT owner.label AS l, COUNT(*) AS c",
         ],
-        &["public.o", "public.s"],
+        &["public.s"],
     )
     .await;
     d.user()
         .await
-        .batch_execute(
-            "insert into public.o values ('a', 'la'); \
-             insert into public.s values ('x', 'g', 'a', 1), ('y', 'g', 'b', 2)",
-        )
+        .batch_execute("insert into public.s values ('x', 'g', 'a', 1), ('y', 'g', 'b', 2)")
         .await
         .expect("write");
     d.settle().await;
     pass(&mut d).await;
     d.settle().await;
 
-    let columns = varchar_columns::read(&d.ctl, &["public.o", "public.s"]).await;
+    let columns = varchar_columns::read(&d.ctl, &["public.s"]).await;
     let bounded: Vec<&String> = columns.iter().filter(|c| c.contains('(')).collect();
     assert_eq!(bounded, Vec::<&String>::new(), "{columns:?}");
     for copy in ["public.one.id ", "public.one.g "] {
@@ -277,10 +266,4 @@ async fn no_table_trellis_creates_holds_a_bounded_varchar() {
             "{copy}is a copy: {columns:?}"
         );
     }
-    assert!(
-        columns
-            .iter()
-            .any(|c| c.starts_with("trellis._trellis_rel_projection_")),
-        "the projection's columns are copies: {columns:?}"
-    );
 }

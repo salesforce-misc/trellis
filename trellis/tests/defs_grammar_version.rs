@@ -7,7 +7,7 @@ use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::{Config, DEFAULT_SCHEMA};
 use trellis::defs::grammar::CURRENT_GRAMMAR_VERSION;
-use trellis::defs::{CatalogError, ParseError, ValueType, create_relationship, install_definition};
+use trellis::defs::{CatalogError, ParseError, ValueType, install_definition};
 
 async fn connect_raw(dsn: &str) -> Client {
     let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
@@ -29,16 +29,13 @@ fn cols(names: &[&str]) -> HashMap<String, ValueType> {
 }
 
 #[tokio::test]
-async fn definitions_and_relationships_are_stamped_with_the_current_grammar() {
+async fn definitions_are_stamped_with_the_current_grammar() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
-    raw.batch_execute(
-        "create table s (id bigint primary key, a numeric, k bigint); \
-         create table p (id bigint primary key)",
-    )
-    .await
-    .unwrap();
+    raw.batch_execute("create table s (id bigint primary key, a numeric)")
+        .await
+        .unwrap();
     install_definition(
         &db.pool,
         "TRANSFORM t FROM s SELECT a + a AS x",
@@ -47,18 +44,13 @@ async fn definitions_and_relationships_are_stamped_with_the_current_grammar() {
     )
     .await
     .expect("define");
-    create_relationship(&db.pool, "RELATIONSHIP parent FROM s.k TO p.id")
-        .await
-        .expect("declare");
 
-    for table in ["transform_definitions", "relationship_definitions"] {
-        let v: i32 = raw
-            .query_one(&format!("select grammar_version from {table}"), &[])
-            .await
-            .unwrap()
-            .get(0);
-        assert_eq!(v, CURRENT_GRAMMAR_VERSION, "{table}");
-    }
+    let v: i32 = raw
+        .query_one("select grammar_version from transform_definitions", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(v, CURRENT_GRAMMAR_VERSION);
 }
 
 #[tokio::test]

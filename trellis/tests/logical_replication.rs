@@ -345,6 +345,10 @@ impl Instance {
     }
 }
 
+/// A `JOIN` from `c` to `p`.
+const C_JOIN_P: &str = "TRANSFORM c_named FROM public.c JOIN public.p ON c.pid = p.id \
+     GROUP BY p.name WITHOUT SOURCE INDEX SELECT p.name AS name, SUM(c.amount) AS amount";
+
 fn refused_for_subscription(result: Result<trellis::Applied, TrellisError>) -> Subscribed {
     match result {
         Err(TrellisError::Catalog(CatalogError::Subscribed(sub))) => sub,
@@ -352,19 +356,13 @@ fn refused_for_subscription(result: Result<trellis::Applied, TrellisError>) -> S
     }
 }
 
-/// Defining refuses a source, or a relationship's to-side the definition
-/// reads through, that a subscription replicates into, even a disabled one.
-/// A definition that reads neither is accepted.
+/// Defining refuses a source, or the joined side of a `JOIN`, that a
+/// subscription replicates into, even a disabled one. A definition that
+/// reads neither is accepted.
 #[tokio::test]
 async fn defining_refuses_a_table_a_subscription_replicates_into() {
     let cluster = TestCluster::start();
     let it = instance(&cluster).await;
-    trellis::dev::defs::create_relationship(
-        it.trellis.pool(),
-        "RELATIONSHIP parent FROM c.pid TO p.id",
-    )
-    .await
-    .expect("declare a relationship");
     it.subscribe("s_p", "pub_p").await;
 
     let sub = refused_for_subscription(
@@ -375,9 +373,9 @@ async fn defining_refuses_a_table_a_subscription_replicates_into() {
     assert_eq!(sub, found("public.p", "s_p", false).unwrap());
     let err = it
         .trellis
-        .apply("TRANSFORM c_named FROM public.c SELECT amount AS amount, parent.name AS name")
+        .apply(C_JOIN_P)
         .await
-        .expect_err("a to-side it replicates into");
+        .expect_err("a joined side it replicates into");
     assert_eq!(err.code(), trellis::ErrorCode::Validation);
     assert!(
         err.to_string()
@@ -391,9 +389,9 @@ async fn defining_refuses_a_table_a_subscription_replicates_into() {
 
     it.unsubscribe("s_p").await;
     it.trellis
-        .apply("TRANSFORM c_named FROM public.c SELECT amount AS amount, parent.name AS name")
+        .apply(C_JOIN_P)
         .await
-        .expect("accepted once nothing replicates into the to-side");
+        .expect("accepted once nothing replicates into the joined side");
     it.trellis.shutdown().await.expect("shutdown");
 }
 

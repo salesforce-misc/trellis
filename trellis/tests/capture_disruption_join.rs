@@ -1,9 +1,7 @@
-//! The table-gone check of #707/#999 for a `JOIN`'s joined table and a
-//! relationship's to-side. Its own test binary: a `JOIN` needs the
+//! The table-gone check of #707/#999 for a `JOIN`'s joined table. Its own
+//! test binary: a `JOIN` needs the
 //! group-basis knob, which is process-wide and would change every aggregate
 //! build in `capture_disruption.rs`.
-
-#![allow(dead_code)]
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -159,20 +157,11 @@ async fn bring_live(raw: &mut Client, pool: &trellis::Pool) {
     panic!("not every definition went live: {:?}", statuses(raw).await);
 }
 
-async fn rows(raw: &Client, sql: &str) -> Vec<Vec<Option<String>>> {
-    raw.query(sql, &[])
-        .await
-        .unwrap_or_else(|e| panic!("{sql}: {e}"))
-        .into_iter()
-        .map(|row| (0..row.len()).map(|i| row.get(i)).collect())
-        .collect()
-}
-
-/// The table-gone case per reader kind: a `JOIN`'s joined table and a
-/// relationship's to-side pause their readers (the 1-1 and aggregate sources
-/// are the matrix's). A `JOIN`'s joined table once panicked the pass (#1177).
+/// The table-gone case for a `JOIN`'s joined table: it pauses its reader (the
+/// 1-1 and aggregate sources are the matrix's). A `JOIN`'s joined table once
+/// panicked the pass (#1177).
 #[tokio::test]
-async fn a_gone_joined_table_or_to_side_pauses_its_readers() {
+async fn a_gone_joined_table_pauses_its_readers() {
     trellis::dev::staging::set_group_basis(true);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -180,42 +169,29 @@ async fn a_gone_joined_table_or_to_side_pauses_its_readers() {
     raw.batch_execute(
         "create table public.ja (id int primary key, k varchar(5), x int); \
          create table public.jb (id int primary key, k varchar(5), y int); \
-         create index on public.ja (k); create index on public.jb (k); \
-         create table public.rc (id int primary key, pid int, amount int); \
-         create table public.rp (id int primary key, name text); \
-         insert into public.rp select i, 'p' || i from generate_series(1, 3) i; \
-         insert into public.rc select i, 1 + i % 3, i from generate_series(1, 9) i;",
+         create index on public.ja (k); create index on public.jb (k);",
     )
     .await
     .expect("seed");
     let trellis = definer(db.dsn()).await;
-    for text in [
-        "TRANSFORM jl FROM public.ja LEFT JOIN public.jb ON ja.k = jb.k \
-         GROUP BY ja.k WITHOUT SOURCE INDEX SELECT ja.k AS k, COUNT(*) AS n, SUM(jb.y) AS sy",
-        "RELATIONSHIP parent FROM rc.pid TO rp.id",
-        "TRANSFORM rc_named FROM public.rc SELECT amount AS amount, parent.name AS name",
-    ] {
-        if text.starts_with("RELATIONSHIP") {
-            trellis::dev::defs::create_relationship(trellis.pool(), text)
-                .await
-                .expect(text);
-        } else {
-            trellis.apply(text).await.expect(text);
-        }
-    }
+    trellis
+        .apply(
+            "TRANSFORM jl FROM public.ja LEFT JOIN public.jb ON ja.k = jb.k \
+             GROUP BY ja.k WITHOUT SOURCE INDEX SELECT ja.k AS k, COUNT(*) AS n, SUM(jb.y) AS sy",
+        )
+        .await
+        .expect("define jl");
     bring_live(&mut raw, &db.pool).await;
     let app = connect(db.dsn()).await;
-    app.batch_execute("drop table public.jb; drop table public.rp")
+    app.batch_execute("drop table public.jb")
         .await
-        .expect("drop the joined table and the to-side");
+        .expect("drop the joined table");
     capture_pass(&mut raw, &db.pool).await;
     capture_pass(&mut raw, &db.pool).await;
-    for target in ["jl", "rc_named"] {
-        let status = trellis.status(target).await.unwrap().unwrap();
-        assert_eq!(status.status, TransformStatus::Paused, "{target}");
-        let error = status.capture_failure.expect("a reason").error;
-        assert!(error.contains("no longer exists"), "{target}: {error}");
-    }
+    let status = trellis.status("jl").await.unwrap().unwrap();
+    assert_eq!(status.status, TransformStatus::Paused);
+    let error = status.capture_failure.expect("a reason").error;
+    assert!(error.contains("no longer exists"), "{error}");
 }
 
 /// How many `capture_triggers`, `capture_baselines` and `partition_sources`
@@ -235,11 +211,10 @@ async fn record_counts(raw: &Client, table: &str) -> (i64, i64, i64) {
 }
 
 // #1217
-/// Dropping the last reader of a `JOIN`'s joined table, or of a
-/// relationship's to-side, forgets that table's records; a table another
-/// definition still reads keeps them.
+/// Dropping the last reader of a `JOIN`'s joined table forgets that table's
+/// records; a table another definition still reads keeps them.
 #[tokio::test]
-async fn dropping_the_last_reader_of_a_joined_table_or_to_side_forgets_its_records() {
+async fn dropping_the_last_reader_of_a_joined_table_forgets_its_records() {
     trellis::dev::staging::set_group_basis(true);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -247,11 +222,7 @@ async fn dropping_the_last_reader_of_a_joined_table_or_to_side_forgets_its_recor
     raw.batch_execute(
         "create table public.fa (id int primary key, k varchar(5), x int); \
          create table public.fb (id int primary key, k varchar(5), y int); \
-         create index on public.fa (k); create index on public.fb (k); \
-         create table public.fc (id int primary key, pid int, amount int); \
-         create table public.fp (id int primary key, name text); \
-         insert into public.fp select i, 'p' || i from generate_series(1, 3) i; \
-         insert into public.fc select i, 1 + i % 3, i from generate_series(1, 9) i;",
+         create index on public.fa (k); create index on public.fb (k);",
     )
     .await
     .unwrap();
@@ -259,39 +230,20 @@ async fn dropping_the_last_reader_of_a_joined_table_or_to_side_forgets_its_recor
     for text in [
         "TRANSFORM fj FROM public.fa LEFT JOIN public.fb ON fa.k = fb.k \
          GROUP BY fa.k WITHOUT SOURCE INDEX SELECT fa.k AS k, COUNT(*) AS n, SUM(fb.y) AS sy",
-        "RELATIONSHIP parent FROM fc.pid TO fp.id",
-        "TRANSFORM fc_named FROM public.fc SELECT amount AS amount, parent.name AS name",
-        "TRANSFORM fc_plain FROM public.fc SELECT amount AS amount",
+        "TRANSFORM fa_plain FROM public.fa SELECT x AS x",
     ] {
-        if text.starts_with("RELATIONSHIP") {
-            trellis::dev::defs::create_relationship(trellis.pool(), text)
-                .await
-                .expect(text);
-        } else {
-            trellis.apply(text).await.expect(text);
-        }
+        trellis.apply(text).await.expect(text);
     }
     capture_pass(&mut raw, &db.pool).await;
-    for t in ["public.fa", "public.fb", "public.fc", "public.fp"] {
+    for t in ["public.fa", "public.fb"] {
         assert!(record_counts(&raw, t).await.0 > 0, "{t} is recorded");
     }
 
     trellis.apply("PAUSE TRANSFORM fj").await.unwrap();
     trellis.apply("DROP TRANSFORM fj").await.unwrap();
-    for t in ["public.fa", "public.fb"] {
-        assert_eq!(record_counts(&raw, t).await, (0, 0, 0), "{t}");
-    }
-    trellis.apply("PAUSE TRANSFORM fc_named").await.unwrap();
-    trellis.apply("DROP TRANSFORM fc_named").await.unwrap();
-    // A reader of `fc` still reaches `fp` through the relationship.
-    assert!(record_counts(&raw, "public.fc").await.0 > 0);
-    assert!(record_counts(&raw, "public.fp").await.0 > 0);
-    trellis::dev::defs::drop_relationship(trellis.pool(), "fc.parent")
-        .await
-        .unwrap();
+    assert_eq!(record_counts(&raw, "public.fb").await, (0, 0, 0));
     assert!(
-        record_counts(&raw, "public.fc").await.0 > 0,
-        "fc_plain reads it"
+        record_counts(&raw, "public.fa").await.0 > 0,
+        "fa_plain reads it"
     );
-    assert_eq!(record_counts(&raw, "public.fp").await, (0, 0, 0));
 }

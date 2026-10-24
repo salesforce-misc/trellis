@@ -16,7 +16,6 @@
 //! cargo run -p benchmark --features engine-access --release -- low-cardinality
 //! cargo run -p benchmark --features engine-access --release -- both
 //! cargo run -p benchmark --features engine-access --release -- custom --n 200000 --g 500 --ceiling-secs 60
-//! cargo run -p benchmark --features engine-access --release -- relationship-aggregate
 //! ```
 //!
 //! ## Streaming scenarios
@@ -49,7 +48,7 @@
 //! cargo run -p benchmark --features engine-access --release -- join --datasets d1 --facts 1000000 --hot-pages 0
 //! # the write-path tax and the capture ceiling (#622 C4; #565 E1/E2), and V-IDLE
 //! cargo run -p benchmark --features engine-access --release -- write-tax --shapes 1x1,1000x16,orm100x1 --reps 3
-//! cargo run -p benchmark --features engine-access --release -- write-tax --variants none,trigger,trigger+exception --shapes orm100x16+hold
+//! cargo run -p benchmark --features engine-access --release -- write-tax --variants none,trigger --shapes orm100x16+hold
 //! cargo run -p benchmark --features engine-access --release -- capture-ceiling --writers 1,4,8,16,32
 //! cargo run -p benchmark --features engine-access --release -- idle-cost --application-threads 8 --duration-secs 60
 //! # per-statement attribution (issue #350): the cluster must preload pg_stat_statements
@@ -136,7 +135,6 @@
 
 mod generate;
 mod scenario;
-mod scenario_relationship;
 mod streaming;
 
 use std::time::Duration;
@@ -182,24 +180,6 @@ const LOW_CARDINALITY: Scenario = Scenario {
     ceiling: LOW_CARDINALITY_CEILING,
 };
 
-/// Row counts for the relationship-aggregate scenario (issue #63, C3),
-/// matching the real-world ratios reported in the poc that motivated
-/// `backfill_relationship_one_to_one`: 100k authors, 1M posts, 4.5M comments.
-const RELATIONSHIP_AUTHORS: i64 = 100_000;
-const RELATIONSHIP_POSTS: i64 = 1_000_000;
-const RELATIONSHIP_COMMENTS: i64 = 4_500_000;
-
-/// Measured ~660-670ms for target-table creation + the direct
-/// relationship-aware build (`backfill_relationship_one_to_one`, then run
-/// inside `install_definition`) on this harness/box across repeated
-/// runs against the full 100k/1M/4.5M row counts above — down from the ~1
-/// minute the ring path took on the real-world shape that motivated this
-/// benchmark (issue #63 C2's handoff doc). 10s keeps >10x headroom for
-/// CI/dev-machine jitter and cold caches while still firing long before any
-/// regression back toward the ring's tens-of-seconds mechanism. Revisit once
-/// a CI-hardware baseline exists.
-const RELATIONSHIP_AGGREGATE_CEILING: Duration = Duration::from_secs(10);
-
 fn main() {
     // Opt-in engine logs for debugging a probe: TRELLIS_BENCH_LOG=warn (or a
     // full EnvFilter directive) writes tracing output to stderr. The engine
@@ -222,37 +202,6 @@ fn main() {
 
     if let Some(ok) = streaming::cli::run(name, &args) {
         if !ok {
-            std::process::exit(1);
-        }
-        return;
-    }
-
-    if name == "relationship-aggregate" {
-        let runtime = tokio::runtime::Runtime::new().expect("build tokio runtime");
-        let result = runtime.block_on(scenario_relationship::run(
-            "relationship-aggregate",
-            RELATIONSHIP_AUTHORS,
-            RELATIONSHIP_POSTS,
-            RELATIONSHIP_COMMENTS,
-            RELATIONSHIP_AGGREGATE_CEILING,
-        ));
-        println!("{}", result.to_json());
-        let mut failed = false;
-        if !result.within_ceiling {
-            failed = true;
-            eprintln!(
-                "REGRESSION: {} install_definition took {}ms, over its {}ms ceiling",
-                result.scenario, result.backfill_ms, result.ceiling_ms
-            );
-        }
-        if !result.correctness_ok {
-            failed = true;
-            eprintln!(
-                "CORRECTNESS FAILURE: {}'s backfilled author_totals did not match the oracle",
-                result.scenario
-            );
-        }
-        if failed {
             std::process::exit(1);
         }
         return;
@@ -306,8 +255,6 @@ fn main() {
 /// Parses argv into the list of scenarios to run. `custom` reads
 /// `--n`/`--g`/`--ceiling-secs` (all required); every other name is one of
 /// the two fixed scenarios above, or `both` for both of them in sequence.
-/// (`relationship-aggregate` is handled separately in `main` — it doesn't fit
-/// this `n`/`g` shape.)
 fn parse_args(args: &[String], name: &str) -> Result<Vec<Scenario>, String> {
     match name {
         "high-cardinality" => Ok(vec![HIGH_CARDINALITY]),
@@ -326,7 +273,7 @@ fn parse_args(args: &[String], name: &str) -> Result<Vec<Scenario>, String> {
         }
         other => Err(format!(
             "unknown scenario {other:?} — expected one of: high-cardinality, low-cardinality, \
-             both, relationship-aggregate, custom, {}",
+             both, custom, {}",
             streaming::cli::SCENARIOS.join(", ")
         )),
     }

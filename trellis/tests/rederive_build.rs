@@ -1033,26 +1033,23 @@ async fn a_drop_during_the_build_takes_its_work_with_it() {
 }
 
 /// Two definitions on one source: the one a Re-derive build serves takes
-/// it, the other (relationship-fed, which the Re-derive build doesn't take
-/// until #625 F9) the old direct build with its go-live catch-up, and both
-/// end equal to their oracles.
+/// it, the other (held out of the Re-derive build,
+/// `markers::hold_target_out_of_the_rederive_build`) the old direct build
+/// with its go-live catch-up, and both end equal to their oracles.
 #[tokio::test]
 async fn two_definitions_on_one_source_take_one_build_path_each() {
     // The per-row ledger, which this file pins, until #1105 deletes it.
     trellis::dev::staging::set_group_basis(false);
     const MAXES: &str = "TRANSFORM agg_max FROM public.src GROUP BY g \
-        WITHOUT SOURCE INDEX SELECT MAX(v) AS top, MAX(grp.w) AS w";
+        WITHOUT SOURCE INDEX SELECT MAX(v) AS top";
     let mut f = Fixture::new(150, &[AGG]).await;
-    f.raw
-        .batch_execute(
-            "create table public.grps (id integer primary key, w integer); \
-             insert into public.grps select i, i * 10 from generate_series(0, 6) i",
-        )
-        .await
-        .expect("seed the relationship's to-side");
-    trellis::defs::create_relationship(&f.db.pool, "RELATIONSHIP grp FROM src.g TO grps.id")
-        .await
-        .expect("create the to-one relationship");
+    trellis::intake::markers::hold_target_out_of_the_rederive_build(
+        &f.raw,
+        "public.src",
+        "public.agg_max",
+    )
+    .await
+    .expect("hold agg_max out of the Re-derive build");
     let columns = [
         (
             "id".to_string(),
@@ -1071,11 +1068,7 @@ async fn two_definitions_on_one_source_take_one_build_path_each() {
     .collect();
     trellis::defs::install_definition(&f.db.pool, MAXES, &columns, "public")
         .await
-        .expect("register the relationship-fed definition");
-    // The first pass installs `grps`'s capture, whose gated marker keeps a
-    // definition reading it waiting (`capture::reconcile`'s rule 3) until
-    // that pass's own discharge; the second dispatches it.
-    f.pass().await;
+        .expect("register the held-out definition");
     f.pass().await;
     assert_eq!(f.build("agg").await.as_deref(), Some("rederive"));
     assert_eq!(f.build("agg_max").await, None);
@@ -1135,13 +1128,10 @@ async fn two_definitions_on_one_source_take_one_build_path_each() {
     assert_eq!(f.status("agg_max").await.as_deref(), Some("live"));
     f.assert_agg_oracle().await;
     assert_eq!(
-        f.rows("select (g, top, w)::text from public.agg_max order by g")
+        f.rows("select (g, top)::text from public.agg_max order by g")
             .await,
-        f.rows(
-            "select (s.g, max(s.v), max(p.w))::text from public.src s \
-             left join public.grps p on p.id = s.g group by s.g order by s.g"
-        )
-        .await,
+        f.rows("select (g, max(v))::text from public.src group by g order by g")
+            .await,
         "the old build's target equals its oracle"
     );
 }
@@ -1205,25 +1195,23 @@ async fn a_start_that_fails_pauses_its_definition_and_the_pass_starts_the_others
 
 /// #986: the rest of the pass runs after a start fails, not only the other
 /// starts: the registration marker of a definition the Re-derive build
-/// doesn't take (it reads a relationship) is parked and discharged, so that
-/// definition's build is dispatched in the same pass.
+/// doesn't take (held out of it,
+/// `markers::hold_target_out_of_the_rederive_build`) is parked and
+/// discharged, so that definition's build is dispatched in the same pass.
 #[tokio::test]
 async fn a_start_that_fails_doesn_t_stop_the_pass_discharging_other_markers() {
     // The per-row ledger, which this file pins, until #1105 deletes it.
     trellis::dev::staging::set_group_basis(false);
     const MAXES: &str = "TRANSFORM agg_max FROM public.src GROUP BY g \
-        WITHOUT SOURCE INDEX SELECT MAX(v) AS top, MAX(grp.w) AS w";
+        WITHOUT SOURCE INDEX SELECT MAX(v) AS top";
     let mut f = Fixture::new(150, &[ONE]).await;
-    f.raw
-        .batch_execute(
-            "create table public.grps (id integer primary key, w integer); \
-             insert into public.grps select i, i * 10 from generate_series(0, 6) i",
-        )
-        .await
-        .expect("seed the relationship's to-side");
-    trellis::defs::create_relationship(&f.db.pool, "RELATIONSHIP grp FROM src.g TO grps.id")
-        .await
-        .expect("create the to-one relationship");
+    trellis::intake::markers::hold_target_out_of_the_rederive_build(
+        &f.raw,
+        "public.src",
+        "public.agg_max",
+    )
+    .await
+    .expect("hold agg_max out of the Re-derive build");
     let columns = [
         (
             "id".to_string(),
@@ -1242,15 +1230,12 @@ async fn a_start_that_fails_doesn_t_stop_the_pass_discharging_other_markers() {
     .collect();
     trellis::defs::install_definition(&f.db.pool, MAXES, &columns, "public")
         .await
-        .expect("register the relationship-fed definition");
+        .expect("register the held-out definition");
     f.raw
         .batch_execute("drop table public.one__ledger")
         .await
         .expect("drop the ledger of the first definition");
 
-    // The first pass installs `grps`'s capture, which keeps `agg_max`
-    // waiting until its own discharge; the second dispatches it.
-    f.pass().await;
     f.pass().await;
     assert_eq!(f.status("one").await.as_deref(), Some("paused"));
     assert_eq!(
