@@ -466,9 +466,9 @@ async fn r2_one_page_applies_only_the_transactions_its_groups_basis_missed() {
 /// R2 by visibility, not position (#558 exp 2's scenario 10): a writer's
 /// change is in flight when a recompute of its group takes its snapshot, so
 /// the basis doesn't see it, though the writer's transaction id is below the
-/// snapshot's `xmax` (a later transaction completed first). The page applies it. A filter that orders the change
-/// against the basis (planted bug `gb_lsn_not_visibility`) refuses it, and
-/// the group loses it.
+/// snapshot's `xmax` (a later transaction completed first). The page applies
+/// it. A filter that orders the change against the basis (planted bug
+/// `gb_lsn_not_visibility`) refuses it, and the group loses it.
 #[tokio::test]
 async fn r2_a_change_in_flight_at_the_basis_applies() {
     let mut d = start().await;

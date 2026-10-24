@@ -1462,8 +1462,9 @@ const STALE_ONE_TO_ONE_MISS: &str = "stale_one_to_one_write";
 
 /// The cooling-key tier's known misses.
 const COOLING_KEY_MISSES: &[&str] = &[];
-/// The known misses of the tiers built on the hot-key case: hot-key and
-/// mid-burst (and steady-load's, [`STEADY_LOAD_MISSES`]).
+/// The known misses of the tiers built on the hot-key case: hot-key,
+/// mid-burst, and steady-load with the group basis off (with it on,
+/// [`STEADY_LOAD_MISSES`]).
 const HOT_KEY_BASED_MISSES: &[&str] = &[STALE_ONE_TO_ONE_MISS];
 
 /// `lsn_only_skip` (#623 D3, ADR-0002 I2), which no tier gates: a
@@ -1656,7 +1657,7 @@ const NO_ABSOLUTE_WRITE_UNDER_LOAD: &[(&str, &str)] = &[
 /// the generator reach.
 const EARLY_ZERO_GC_MISS: &str = "gb_early_zero_gc";
 
-/// The steady-load tier's known misses.
+/// The steady-load tier's known misses with the group basis on.
 const STEADY_LOAD_MISSES: &[&str] = &[STALE_ONE_TO_ONE_MISS, EARLY_ZERO_GC_MISS];
 
 /// The mid-burst tier's group-basis plants it doesn't gate.
@@ -1772,7 +1773,13 @@ fn sweep_tier_named(name: &str) -> Option<(SweepTier, BoxedStrategy<ConcurrentCa
         "steady_load" => (
             SweepTier {
                 name: "steady_load",
-                known_misses: STEADY_LOAD_MISSES,
+                // With the knob off, `gb_early_zero_gc` is off the path, so
+                // `not_gated` lists it instead.
+                known_misses: if trellis::dev::staging::group_basis_enabled() {
+                    STEADY_LOAD_MISSES
+                } else {
+                    HOT_KEY_BASED_MISSES
+                },
                 not_gated: not_gated(STEADY_LOAD_NOT_GATED),
             },
             steady_load_case().boxed(),

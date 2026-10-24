@@ -792,6 +792,12 @@ mod strategy {
             })
     }
 
+    /// The longest commit stall a case draws, in milliseconds, for about
+    /// half the cases (`ConcurrentPlan::commit_stall`): long enough that two
+    /// pages of one key's opposite sides overlap between their writes and
+    /// their commits, where the `J` lock orders them.
+    pub const COMMIT_STALL_MS: std::ops::RangeInclusive<u64> = 5..=40;
+
     /// A JOIN-tier case: one to three definitions, each installed up front
     /// or part way through the stream, with pauses, resumes and re-reads
     /// in the later bursts ([`JoinBuildDraws`]), a [`KeyShape`], 120 to
@@ -804,13 +810,8 @@ mod strategy {
     /// its burst size past that threshold, as its race needs two workers on
     /// one batch. A case that truncates a table issues all of that table's
     /// ops from one lane (`super::concurrent_plan`), so the other half keeps
-    /// several lanes writing each table.
-    /// The longest commit stall a case draws, in milliseconds, for about
-    /// half the cases (`ConcurrentPlan::commit_stall`): long enough that two
-    /// pages of one key's opposite sides overlap between their writes and
-    /// their commits, where the `J` lock orders them.
-    pub const COMMIT_STALL_MS: std::ops::RangeInclusive<u64> = 5..=40;
-
+    /// several lanes writing each table. About half the cases stall each
+    /// page before its commit ([`COMMIT_STALL_MS`]).
     pub fn join_case_strategy() -> impl Strategy<Value = JoinCase> {
         prop_oneof![
             Just(KeyShape::Spread),
