@@ -121,13 +121,9 @@ surfaced, not blamed. Bisection finds a failing key in about `2·log2(n)` probes
 rather than `n`, and a per-call probe cap bounds the rest.
 
 Blame also names the **transform**: a key that fails alone is probed again
-with the transforms reading its table directly left out but one, to find the
-one(s) whose apply it fails in. One that still fails with every direct reader left
-out fails in the work done for the transforms reading the table through a
-relationship: each relationship to the table is probed alone, and the readers of
-each one that fails alone are charged, or every relationship's readers when none
-does. One that fails with no direct reader alone fails only when several apply it
-together: with two, both are charged; with more, each is left out in turn, and
+with the transforms reading its table left out but one, to find the one(s)
+whose apply it fails in. One that fails with no reader alone fails only when
+several apply it together: with two, both are charged; with more, each is left out in turn, and
 every one whose absence lets it apply is charged. When no one is (two separate
 failing pairs), nobody is, and the page is a drain holdup
 ([operations](../operations.md#a-page-that-fails-only-for-several-definitions-together)).
@@ -176,11 +172,8 @@ release or resume that deleted the key's rows after the batch was computed has
 the key re-derived from its live row, and a row parked after it would be held
 for a key nothing holds, blocking every later read.
 
-The fold itself runs once per key per batch. A relationship's reverse work
-for a to-side key skips it only once every transform reading through the
-relationship that isn't frozen holds the key, or none is left that isn't frozen
-(a define or resume of its first reader refreshes its projection). A change
-every reader holds is dropped from the batch before its images are decoded.
+The fold itself runs once per key per batch. A change every reader holds is
+dropped from the batch.
 
 It is deliberately **not** bucket-scoped: it parks the whole batch's contribution,
 and a merge of the same contribution again changes nothing, so a co-worker on

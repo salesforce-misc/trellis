@@ -62,7 +62,7 @@ flowchart TB
     SEALED --> D2
     SEALED --> DN
     D1 -->|"⑤ apply ∪ mark-drained\nIN ONE TXN"| TGT
-    D1 -->|"reverse propagation\nappends to ACTIVE, never to the claimed segment"| ACT
+    D1 -->|"downstream propagation\nappends to ACTIVE, never to the claimed segment"| ACT
     SEALED -->|"⑥ TRUNCATE once provably retired"| REG
 ```
 

@@ -116,16 +116,9 @@ source. Pause loudly when correctness can't be guaranteed, but pause only what
 needs pausing, as the per-column tier does.
 
 * **Isolation names the transform.** A record that fails alone is probed again
-  with the transforms reading its table directly left out but one, to find the
-  one(s) whose apply it fails in. Every probe runs on the failure path only.
-  * A record that fails with every direct reader left out fails in the work
-    done for the transforms reading its table through a relationship (the
-    to-side's reverse recomputes and settled projection). With several
-    relationships to the table, each is probed alone, the record left out of
-    every other one's reverse work, and the readers of each relationship that
-    fails alone are charged. If none fails alone, the failure is in their work
-    together, and every reader of every relationship is charged.
-  * A record that fails with no direct reader alone fails only when several
+  with the transforms reading its table left out but one, to find the one(s)
+  whose apply it fails in. Every probe runs on the failure path only.
+  * A record that fails with no reader alone fails only when several
     apply it together. With two, both are charged. With three or more, each
     is left out in turn, and every one whose absence lets the record apply is
     charged: it is in every failing combination. When no one is (two separate
@@ -133,15 +126,12 @@ needs pausing, as the per-column tier does.
     records reproduce together is, and the page is a drain holdup
     ([operations — A page that fails only for several definitions together](../operations.md#a-page-that-fails-only-for-several-definitions-together)).
   * Each probe counts toward the isolation's probe limit. At the limit, a
-    record is charged to the transforms its probes had pinned, and to every
-    relationship's readers it hadn't probed yet; a probe that hits a transient
-    error or a version fence miss charges nothing for what it probed.
+    record is charged to the transforms its probes had pinned; a probe that
+    hits a transient error or a version fence miss charges nothing for what it
+    probed.
 * **The fold runs once per key per page.** Only the poisoned transform's
-  apply skips the key, and parks the change in `poison_held` for it. A
-  relationship's reverse work skips the key only once every reader of the
-  relationship that isn't frozen holds it, or none is left that isn't frozen,
-  and a change every reader holds is dropped from the page before its images
-  are decoded. A page parks a change for a transform only while the
+  apply skips the key, and parks the change in `poison_held` for it. A change
+  every reader holds is dropped from the page. A page parks a change for a transform only while the
   transform still holds the key, so a release or resume between the page's
   compute and its apply leaves no held row behind.
 * **A failure that is really in the source** (one every reader hits, such as an
@@ -307,8 +297,8 @@ until one of these releases it:
   rather than replayed. Before it does, it re-validates the transform against
   the live schema and brings every column Trellis created for it with a
   type from the source (its key, passthrough and `GROUP BY` copies, its
-  calculated, aggregate and ledger contribution columns, and its
-  relationship projections' columns) to the type define would give it now
+  calculated, aggregate and ledger contribution columns) to the type define
+  would give it now
   ([ADR-0014](0014-pause-and-drop-a-transform.md#resume-reconciles-with-source-not-by-catch-up)),
   so a key quarantined because a widened source value didn't fit a copy
   (`22003`) is rebuilt into the widened copy. A key whose cause is
@@ -440,8 +430,8 @@ own after the page's transaction rolls back: the latest error and SQLSTATE, the 
 tables on the page, the buckets the failing pages covered, when it first and last failed,
 and how many passes have. It charges and pauses nothing; every
 drain pass retries the page as before. `Trellis::status` reports the holdup as
-`drain_failure` on every unfrozen definition that reads a table on the page, directly or
-through a relationship, and `self_check` reports every open one as an instance-level
+`drain_failure` on every unfrozen definition that reads a table on the page, and
+`self_check` reports every open one as an instance-level
 finding. The transaction that commits a page clears its buckets from the row, deleting it
 once none is left, and deleting the segment (its retirement, or any other discard)
 cascades to it, so a holdup never outlives its page. Recording writes only the buckets

@@ -21,8 +21,8 @@ supported operation has a documented path that avoids the window altogether.
 
 This ADR extends [ADR-0002](0002-async-data-flow.md)'s capture and truncate
 decisions to partitioned sources. It settles which partition trees an
-aggregate, a side of a JOIN transform
-([ADR-0019](0019-join-transforms.md)) or a to-many relationship can read, how
+aggregate or a side of a JOIN transform
+([ADR-0019](0019-join-transforms.md)) can read, how
 capture covers them, and how the
 reconcile pass detects and corrects partition maintenance. Partitioned targets,
 inheritance hierarchies, a partition named as a source, and trees of more than
@@ -33,11 +33,10 @@ inheritance hierarchies, a partition named as a source, and trees of more than
 ### A partitioned root is a source when its group key holds every partition-key column
 
 A declaratively partitioned root (`RANGE`, `LIST` or `HASH`, any depth, with or
-without a `DEFAULT`) may be an aggregate's `FROM`, either side of a JOIN
-transform, or a to-many relationship's to-side, on PostgreSQL 15+, when its
-group key contains every partition-key column at every level. The group key is
-an aggregate's `GROUP BY`; for a JOIN side, it is that side's partial key, the
-side's own group columns plus the join key; for a relationship, its to-side join
+without a `DEFAULT`) may be an aggregate's `FROM` or either side of a JOIN
+transform, on PostgreSQL 15+, when its group key contains every partition-key
+column at every level. The group key is an aggregate's `GROUP BY`; for a JOIN
+side, it is that side's partial key, the side's own group columns plus the join
 key. Targets stay plain tables.
 
 With every partition-key column in the group key, each group lives in exactly
@@ -66,8 +65,8 @@ over `created_at` partitions) are refused until then.
 I tested every decision here against real clusters with Trellis's generated
 capture and an oracle diff after each step: the trigger and lifecycle behaviour
 on PostgreSQL 14 through 18, routing and bound evaluation on 15 through 18, and
-the detach check, the cheap cleanup forms, to-many targets and the cleanup race
-on 16 through 18. No result differed by version, except one that differs by
+the detach check, the cheap cleanup forms and the cleanup race on 16 through
+18. No result differed by version, except one that differs by
 minor release: PostgreSQL 16.8 refuses to `ATTACH` a table that still carries
 capture triggers (`trigger "trellis_capture_delete" prevents table … from
 becoming a partition`), taking the statement triggers' transition tables for a
@@ -266,8 +265,7 @@ attached beside a `DEFAULT` takes some of its groups, whose rows a read of the
 after the check locks the node, so it waits for the correction. The capture
 install that adds a new node to the tree rebuilds none of the readers a
 correction covers (an aggregate over the source, on the group basis or the
-ledger, and a definition reading it through a to-many relationship): the
-node's own correction covers its rows, including those written into it
+ledger): the node's own correction covers its rows, including those written into it
 directly before its capture existed. That install parks no marker on the root
 when no other reader needs a catch-up, so no discharge stages a recompute of
 every key of the source. An install that also changes the capture functions,
@@ -280,8 +278,7 @@ the leaf's rows; the correction of an `ATTACH` of such a leaf reads it twice, on
 once for their partials, 0.5–0.6 s at 1M rows and 3.9–4.7 s at 10M.
 
 A correction runs for each definition that reads the source, an aggregate over
-it, a JOIN transform reading it as either side or a definition reading it
-through a to-many relationship, as a row of the
+it or a JOIN transform reading it as either side, as a row of the
 build-chunk queue, which the pass that queues the correction enqueues. The drain workers claim it as
 they claim a build chunk, behind the ring's backlog, and give it back after
 about a second of pages. The claim makes one runner per correction and
@@ -303,32 +300,6 @@ leaf becomes a tombstone rather than a row. It then waits for the transactions
 open at the stamp to end, so no page that read the old `build_seg` can still
 write a key the walk has no entry for. Waiting for the ring to fold through a
 position would never finish on a busy ring, whose active segment is never empty.
-
-For a to-many target, the correction is "recompute the routed parents" through
-the normal Recompute path: no target row is ever deleted. A parent routes to
-the node when the node's recorded text holds over its join value, presented as
-the to-side's join column and cast to its recorded type and collation. Every
-row of a node holds the text, so the routed parents are every parent of a row
-the node holds or held, and a node in the tree needs no read of its own rows.
-The correction walks the from-side in primary-key order, in pages that each
-stage a recompute of their parents (the one a child's change stages) and
-commit the progress with it. The drain reads each parent's children live, so
-a parent whose last child went away reads 0, and a child's change staged
-before the DDL and drained after recomputes from the live rows too: the
-correction stamps no `build_seg` and waits on no fence. A gone node without a
-usable text has its detached table's rows read instead, and their parents
-recomputed. Staging a recompute does not write the target, and a to-many target
-has no group deltas for the build's completion to wait on, so the last page
-records the segment active at its commit, read under the share lock that keeps
-the seal from moving it, and the correction's row is done only once every
-segment through that one has drained. Until then the definition reports
-`backfilling`, and a `keys_remaining` of 0 means every recompute is staged, not
-yet applied. The wait is for a fixed segment, which seals and drains as the ring
-rotates, not for an empty ring. When that segment is still the active one and
-holds nothing, with no straggler of the one before it, the last page staged
-nothing after the earlier pages' segment sealed, and only the segments before
-it are waited for: an idle ring seals an empty segment only while the one
-before it still holds rows, so it might never seal this one.
 
 My cleanup measurements deleted a leaf's routed rows from a model target, a
 virtual sum with no ledger and no real Apply, then re-aggregated the leaf. That
@@ -353,10 +324,7 @@ index page: a model of that walk (#1085) ran at 17.5–21.5k keys a second and
 9–12 KB of WAL a key, which projects to 78–95 minutes and 0.9–1.2 TB of WAL for
 a leaf of 100M rows. Rows an operation adds
 are undercounted until its correction drains, rows it removes are overcounted,
-and writes through the parent have no window at all. For a to-many target,
-deleting rows lost them for good in 180 of 189 trials; recomputing the routed
-parents reached zero diff in every cell, kept parents with no children left at a
-count of 0, and closed within 2.4–3.6 s.
+and writes through the parent have no window at all.
 
 Why not tombstone the routed entries without reading the source when the gone
 bound is uncovered? It saves only the primary-key lookups, since the writes are
@@ -394,8 +362,7 @@ For `HASH` the sweep finds target groups over the missing remainders; for
 live ledger entries in the groups it finds are corrected through the normal page
 path, as a node's are; on a JOIN side, the sweep searches the side's partial
 cells, whose key holds every partition-key column where the target's may not,
-and the cells it finds are recomputed under their join-key locks; on a to-many
-target, those parents are recomputed. The
+and the cells it finds are recomputed under their join-key locks. The
 sweep runs in its own `READ COMMITTED` transaction: the pass reads the lifecycle
 catalog before the constraint texts, re-reads it in a new statement after
 queuing the hits' correction, and rolls back and retries if the leaf set
@@ -498,15 +465,14 @@ full rebuild away from the operator.
 
 ### Define refuses a shape routing can't serve, and the pass pauses one that appears later
 
-Define refuses, naming the column: a group key, a JOIN side's partial key or a
-to-many join key missing a partition-key column at some level; a key level that resolves to no columns (an
+Define refuses, naming the column: a group key or a JOIN side's partial key
+missing a partition-key column at some level; a key level that resolves to no columns (an
 expression or whole-row key); a partition-key column whose type is not
 `smallint`, `integer`, `bigint`, `numeric`, `text`, `varchar`, `uuid`, `date`,
 `timestamp`, `timestamptz` or `boolean`, that uses a non-default partition
 opclass, or whose collation is nondeterministic. A partition (leaf or middle)
 named as a source, an inheritance hierarchy, a partitioned target and a root
-that is itself a partition stay refused, and so do a 1-1 transform's `FROM` and a
-to-one relationship's to-side.
+that is itself a partition stay refused, and so does a 1-1 transform's `FROM`.
 
 After define, the pass pauses a definition whose source stops complying (a new
 sub-level whose key isn't in the group key, or the root attached under another
@@ -517,7 +483,7 @@ The accepted key types are the ones I tested. `char(n)` is the one shape where
 the text misroutes without the cast (25,410 of 40,006 comparisons), so it waits
 with the other types until an experiment shows they route exactly.
 
-A 1-1 `FROM` and a to-one to-side stay refused until partitioned targets exist,
+A 1-1 `FROM` stays refused until partitioned targets exist,
 because a 1-1 target over a partitioned source would likely need its own
 partitioning.
 
@@ -546,7 +512,7 @@ grouped `BY product_id` is refused at define, naming `order_id`.
 
 ## Consequences
 
-- Large partitioned child tables can feed aggregates and to-many counts, with
+- Large partitioned child tables can feed aggregates and JOIN transforms, with
   capture costing no more per write than on a plain table.
 - Partition maintenance needs no operator step, but counts can be wrong for
   about one interval plus a correction that costs O(rows in the node), not

@@ -198,7 +198,7 @@ so both arg-extremes must distinguish **"there is genuinely no image here"** fro
   would win whichever ordering its `lsn` topped and hand the drain a NULL image,
   which the delta path reads as "no side to apply". It fails both ways: a
   re-derive restaged at `pg_current_wal_lsn()` would kill the `+f(new)` and
-  **under**-count, up to deleting a live group; reverse propagation and backfill
+  **under**-count, up to deleting a live group; downstream propagation and backfill
   restaged below would kill the `−f(old)`, **over**-counting with a phantom
   member.
 
@@ -232,10 +232,11 @@ trigger and defer to the earlier segment's post-image.
 The corollary binds *producers*, not just the fold: within one window, for one
 `(src_table, key)`, an image-bearing row always beats an image-less
 non-`delete` one — **even when the image-less one is newer**. A producer that can stage both shapes for the
-same key must therefore pick one. The target-mutation seam does: it stages a
-relationship-endpoint target's changed keys as image-bearing CDC-shaped rows
-and every other target's as image-less `Recompute`s, never both for one
-target (`staging::target_mutations`, #402/#403).
+same key must therefore pick one. The target-mutation seam does: it stages
+the changed keys of a target on its image feed (one a group-basis aggregate
+or a `JOIN` reads) as image-bearing CDC-shaped rows and every other target's
+as image-less `Recompute`s, never both for one target
+(`staging::target_mutations`, #402/#403).
 
 One fact the arg-extremes erase is kept on the side: **a recompute folded with
 a change.** A `recompute` never wins an image, so when it folds with the same
@@ -243,9 +244,7 @@ key's CDC change the record carries that change's images and looks like a plain
 change. The recompute was staged to re-derive the key from live state, and
 applying the change's image instead would skip that (issue #392). The fold
 carries `has_recompute = bool_or(op = 'recompute')`, and a ledger target
-re-derives such a key rather than applying its last change. A to-one
-relationship's reverse path also re-derives the from-side rows, as it does for
-a bare trigger.
+re-derives such a key rather than applying its last change.
 
 A group-basis aggregate (ADR-0002, "Aggregates: a basis per group, kept by
 deltas") needs what the fold erases altogether: every change row of a key,

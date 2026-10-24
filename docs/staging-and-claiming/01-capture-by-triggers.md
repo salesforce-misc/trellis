@@ -34,15 +34,6 @@ segment with one `INSERT … SELECT`:
   refuses until the table is plain again. A table that joins and leaves a
   hierarchy between two passes is never seen
   ([known correctness gaps — Capture disrupted and restored between two passes](../known-correctness-gaps.md#capture-disrupted-and-restored-between-two-passes)).
-  A relationship's to-side is captured while some definition reads the
-  relationship's from-side, whether or not one reads through the
-  relationship, so the pass can find a to-side in a hierarchy with nobody to
-  pause. Its settled projection then misses the writes routed through the
-  hierarchy. Every definition that reads through the relationship is paused
-  or refused while the table is in the hierarchy, and the first one to read
-  through it again, by a define or a resume, refreshes the projection from
-  the to-side in its own transaction (`catalog::relationships_to_refresh`,
-  #768). Pinned by `unread_to_side_hierarchy.rs`.
 - **Images.** `old_image` and `new_image` hold the primary key plus every
   column some reader of the table needs (`capture::columns`), rendered with
   `format('%s', col)` under the same five pinned output settings as every
@@ -67,8 +58,7 @@ segment with one `INSERT … SELECT`:
   value. A binary comparison works for every type, including those with no
   equality operator (`json`, `point`, `xml`), and is never looser than the
   images: an equal value that renders differently (`numeric` `1.5` to `1.50`)
-  still stages. Every relationship join column (`from_col`, `to_col`) is
-  imaged, so a join move alone always stages. A statement trigger can't take
+  still stages. A statement trigger can't take
   a `WHEN` clause when it has transition tables, so the filter is in the
   function.
 - **`row_txid`** is the ring's default, `pg_current_xact_id()`: the source
@@ -178,12 +168,10 @@ Two things could put one in front of it, and the pass rules out both:
    its marker, the insert position read while it holds the table lock. The
    marker's discharge waits until no change to the table at or below the gate
    is pending.
-2. **A table it reads through a relationship.** A definition sourced from `U`
-   that reads a column of `T` waits on `U`'s marker, which `T`'s gate doesn't
+2. **A `JOIN`'s joined table.** A `JOIN` sourced from `U` that reads a column
+   of its joined table `T` waits on `U`'s marker, which `T`'s gate doesn't
    hold. So a definition is dispatched only once every table it reads is
-   captured and current, and no relationship to-side it reads still has a
-   gated marker pending. That marker also refreshes `T`'s settled projections,
-   repairing any column the old images wrote as `NULL`.
+   captured and current, and its joined table has no gated marker pending.
 
 The pass hands the discharge the list of definitions it found ready, from the
 same catalog snapshot it built the column sets from, so a definition
@@ -258,8 +246,7 @@ its marker. The fold leaves markers out.
 (the table, the columns, a message, and when it was found). While the
 record exists, capture doesn't count the definition's columns, so the next
 reconcile pass narrows the functions to what the other readers need and the
-markers stop; a column only an unused relationship or a projection still
-names is left out the same way. `RESUME TRANSFORM` re-validates the
+markers stop. `RESUME TRANSFORM` re-validates the
 definition against the live schema as define would, and refuses while a
 column it reads is still missing; otherwise it deletes the record and
 rebuilds: the pass widens capture again under the join fence before the
@@ -298,16 +285,14 @@ over the new type: nothing marks the change. The rows the rewrite changes
 fire no trigger at all.
 
 So the same pass also checks, for every definition that reads the table,
-the columns it keys by there (its source key, its `GROUP BY` keys, a
-`JOIN`'s `ON` columns, and each relationship it reads through's join
-columns and to-side key) and the
+the columns it keys by there (its source key, its `GROUP BY` keys, and a
+`JOIN`'s `ON` columns) and the
 columns Trellis created from them with a type that comes from the source
 (`defs::copies`: a 1-1 target's key, passthrough and calculated columns, an
 aggregate's `GROUP BY` columns in its target, ledger and group-delta table,
 its field columns and its ledger's contribution columns, a `JOIN`'s
 `GROUP BY` and `ON` columns in its target and hidden tables and its field
-columns, and a to-one relationship projection's key and its column for each to-side column read
-through the relationship). A column typed by an expression is compared
+columns). A column typed by an expression is compared
 with the type define's inference gives the expression over the live
 schema. Before
 it regenerates anything, it pauses the definition, with its
@@ -316,9 +301,8 @@ it regenerates anything, it pauses the definition, with its
 1. a key column now has a type or collation define would refuse for that use
    (a join column made `character(n)`, a nondeterministic `COLLATE` on a
    `GROUP BY` column);
-2. a relationship it reads through no longer joins two columns of the same
-   type and modifier (one join column widened to `bigint`, the other not
-   yet);
+2. a `JOIN`'s `ON` pair no longer has one type and collation (one join
+   column re-typed to `bigint`, the other not yet);
 3. a key column's type changed in a way that renders the values already
    stored differently: `timestamp` to `timestamptz`, `date` to `timestamp`,
    `text` to `uuid`, a narrower `numeric` scale or temporal precision (the
@@ -549,8 +533,8 @@ on any of:
 
 - the table is gone from its name: dropped, renamed away or moved to another
   schema, or a view, materialized view or foreign table put there in its
-  place. This covers a captured source, a `JOIN`'s joined table, a
-  relationship's to-side, and another instance's target read as a source;
+  place. This covers a captured source, a `JOIN`'s joined table, and
+  another instance's target read as a source;
 - a recorded trigger is gone from the table at that name: a swap of the
   table, a drop and recreate, the triggers dropped;
 - a trigger's oid changed: recreated by hand or by a schema tool;
@@ -566,8 +550,7 @@ on any of:
   records: it was replaced by hand.
 
 A table's records live only while some definition reads it. The transaction
-that drops the last reader (`DROP TRANSFORM`, or `DROP RELATIONSHIP` for a
-relationship's to-side) deletes the table's trigger, column and partition-tree
+that drops the last reader (`DROP TRANSFORM`) deletes the table's trigger, column and partition-tree
 records, so a definition made afterwards, on a table dropped and created again
 before the next pass, is judged against nothing: it never read the old table.
 A paused or quarantined definition still reads its tables, so while one is
@@ -641,7 +624,7 @@ them:
   - a read column renamed or dropped, or the primary key redefined, by a
     marker, the pass or a drain page;
   - a key column retyped or re-collated so define would refuse it, or so the
-    stored keys render differently; a relationship's join columns no longer
+    stored keys render differently; a `JOIN`'s `ON` columns no longer
     matching; a column Trellis created outgrown by a widening;
   - a read column changed so define would refuse a definition reading it, so
     it would evaluate the column as another type, or so a `numeric` column
@@ -763,12 +746,9 @@ failed application write instead. A target that reads the table directly
 doesn't show the wrong delete: a 1-1 or ledger apply re-reads a delete's row
 live as the drain's role, which is either exempt from the policy and reads
 the row, or refused, which halts the definition, and the group basis sums
-the statement's own transition rows. A to-one relationship's projection
-applies the delete, though, so until the next pass a 1-1 field read through
-the relationship reads the parent as gone.
+the statement's own transition rows.
 The next reconcile pass pauses the table's readers
-([transforms — Supported sources and targets](../transforms.md#supported-sources-and-targets)),
-and their `RESUME` refreshes the projection.
+([transforms — Supported sources and targets](../transforms.md#supported-sources-and-targets)).
 
 One write isn't a statement of its own: the update a foreign key's action
 makes (`ON UPDATE CASCADE`, `SET NULL` or `SET DEFAULT`, or `ON DELETE SET

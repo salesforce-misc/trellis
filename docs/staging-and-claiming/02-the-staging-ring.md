@@ -103,7 +103,7 @@ All four append into the active segment:
 | Producer | What it appends | Carries images? |
 |---|---|---|
 | Capture triggers | the source change, in the writer's transaction | yes — `old_image` and/or `new_image`, and `transition_images` where a re-read's images aren't the statement's own ([01](01-capture-by-triggers.md#every-transition-row-counts-once)) |
-| Reverse propagation (a worker staging its dependents) | a bare recompute trigger | **no** |
+| Downstream propagation (a worker staging its dependents through the target-mutation seam) | a bare recompute trigger, or the change itself for a target on the seam's image feed | **no**, except on the image feed ([04](04-claiming-and-the-fold.md)) |
 | Definition re-derive (a formula changed) | a bare recompute trigger | **no** |
 | Backfill / snapshot enumeration | a bare recompute trigger, server-side | **no** |
 
@@ -112,7 +112,7 @@ about the row's state, only "recompute this key." The fold treats the two kinds
 differently; the bug from conflating them is in
 [04](04-claiming-and-the-fold.md).
 
-Note the second row: **a worker doing reverse propagation appends into the
+Note the second row: **a worker doing downstream propagation appends into the
 *active* segment — never the batch it is draining.** That makes a claimed batch
 immutable, the foundation of [05](05-apply-and-exactly-once-deltas.md).
 
