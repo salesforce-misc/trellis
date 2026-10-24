@@ -852,9 +852,21 @@ impl JoinTargetPlan {
                     })
                     .collect();
                 zero_b(&mut counts, &mut sums);
+                // With `matches_new > 0` the term is `-P_old`, which adds
+                // nothing when every partial of `P_old` is 0: a cell a build
+                // inserted, on a key its `M` matched.
+                let mut p_old: Vec<String> = vec![p_old_n.clone()];
+                for i in 1..=fa {
+                    p_old.push(p_old_c(i));
+                    if p_args[i - 1].summed {
+                        p_old.push(p_old_s(i));
+                    }
+                }
+                let p_old_nonzero: Vec<String> =
+                    p_old.iter().map(|v| format!("{v} <> 0")).collect();
                 terms.push(format!(
                     "select {} from jd join {p} p on {} left join {dp} d on {cell_eq} \
-                     where jd.__new <> 0 or jd.__old <> 0",
+                     where jd.__new <> 0 or (jd.__old <> 0 and ({}))",
                     term(
                         "p",
                         None,
@@ -863,6 +875,7 @@ impl JoinTargetPlan {
                         sums
                     ),
                     key_eq("p", &pj, "jd", &jc),
+                    p_old_nonzero.join(" or "),
                 ));
             }
             let pj_as: Vec<String> = pj
