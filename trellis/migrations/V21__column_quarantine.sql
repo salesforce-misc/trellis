@@ -91,8 +91,8 @@ create table if not exists column_failures (
 
 -- Cascade edges (decision #5): when `(upstream_transform, upstream_column)`
 -- pauses, every `(downstream_transform, downstream_column)` whose formula
--- reads it (a chained 1-1 transform, or a relationship-enriched field —
--- see `defs::catalog::column_dependents`) must pause too, rather than
+-- reads it (a chained transform — see `defs::catalog::column_dependents`)
+-- must pause too, rather than
 -- silently consume a frozen/stale value with no signal. Recorded so resume
 -- can tell "this downstream column is paused *only* because of this upstream
 -- pause" from "it also has its own independent reason" (`column_status.local_fuse`,

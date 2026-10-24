@@ -15,19 +15,10 @@
 --     is, which `converge`'s condition 4 reads as older than any token;
 --   * `src_changed`: the earliest known; a key held for any source change
 --     has one, so it also says whether the release is a source change;
---   * `hop_gen`: the deepest;
---   * `group_key`: the sorted, deduplicated union;
---   * `join_values`: one `{to_col: value}` object per value the parked
---     changes held in some relationship's `to_col`, deduplicated: every raw
---     row's new image (`FoldedChange::to_col_values`, #785) and every
---     park's pre-image (batches drain out of order, so a later park's
---     pre-image can name a value no parked new image did), which the
---     release's to-one projection rewrite (#754) reads;
---   * `lsn`: the greatest, the release's `parked_through` (#754).
+--   * `hop_gen`: the deepest.
 --
--- `op`, `new_image` and `held_seq` are gone: nothing reads `op`, the release
--- no longer needs an order among one key's rows, and `join_values` names
--- every to-side key the parked images did.
+-- `op`, `new_image` and `held_seq` are gone: nothing reads `op`, and the
+-- release no longer needs an order among one key's rows.
 --
 -- Trellis is unreleased, so the table is recreated empty rather than folded.
 
@@ -41,8 +32,5 @@ create table poison_held (
     origin_lsn pg_lsn,
     src_changed timestamptz,
     hop_gen integer not null default 0,
-    group_key text[],
-    join_values jsonb[] not null default '{}',
-    lsn pg_lsn,
     primary key (transform_id, src_table, key)
 );

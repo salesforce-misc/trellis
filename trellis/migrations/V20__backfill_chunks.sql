@@ -29,9 +29,8 @@
 -- Postgres type (`int`, `bigint`, `uuid`, ...) — the claiming worker casts
 -- them back the same way `defs::backfill::pk_range_where` already does.
 -- `lo is null` means "the first chunk" (`pk <= hi`, no lower bound). Only a
--- plain (non-relationship) 1-1 definition is chunked this way today — a
--- relationship-enriched 1-1 or aggregate definition still builds fully
--- synchronously inside `install_definition`, unchanged (see
+-- 1-1 definition is chunked this way — an aggregate definition still builds
+-- fully synchronously inside `install_definition`, unchanged (see
 -- `trellis::defs::chunk_queue`'s module doc for why: their staging tables are
 -- connection-scoped, which doesn't survive independent drain workers
 -- claiming separate chunks on separate connections).

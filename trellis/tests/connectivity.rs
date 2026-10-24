@@ -29,11 +29,11 @@ async fn migrate_up_is_idempotent() {
     assert_eq!(
         first_run,
         vec![
-            1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 26,
-            27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 42, 43, 44, 45, 46, 47, 48, 49,
-            50, 51, 53, 54, 55, 56, 57, 58, 59, 60, 63, 64, 65, 67, 68, 69, 70, 71, 72, 74, 75, 76,
-            77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98,
-            99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111,
+            1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 18, 19, 20, 21, 22, 23, 24, 29, 30, 31,
+            32, 33, 35, 36, 37, 39, 40, 42, 43, 44, 45, 47, 48, 50, 53, 54, 55, 56, 57, 58, 59, 60,
+            63, 64, 65, 67, 68, 69, 70, 71, 72, 74, 75, 76, 77, 78, 80, 81, 82, 83, 84, 85, 86, 87,
+            88, 89, 90, 91, 92, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107,
+            108, 109, 110, 111,
         ],
         // Issue #73 added V22 (drops `column_status`'s now-unenforceable
         // `target_table` foreign key). Its reviewer follow-up added V23
@@ -47,13 +47,10 @@ async fn migrate_up_is_idempotent() {
         // (epic #49) added V25 (`metric_rollup`); later removed (metric
         // history/aggregation is left to an operator's own Prometheus
         // stack — see docs/observability.md's "Retention" section), so V25
-        // is not reissued to anything else. Issue #129 (epic #127) added
-        // V26 (`relationship_projections`). Issue #133 (epic #127) added
-        // V27 (`group_key_array`, widening the ring's `group_key` column
-        // from `text` to `text[]`). Issue #134 (epic #127) added V28
-        // (`relationship_reverse_deferred`, the new `rel_reverse_deferred`
-        // ring op plus `retry_count`/`relationship_id` columns). Issue #160
-        // added V29 (`transform_definitions.fuse_rearmed_at`, the point a
+        // is not reissued to anything else.
+        // Issue #1115 removed V16, V17, V26, V27, V28, V34, V38, V46, V49, V51,
+        // V79 and V93 with the feature they served; none is reissued.
+        // Issue #160 added V29 (`transform_definitions.fuse_rearmed_at`, the point a
         // resume re-arms the whole-transform fuse from, so a resumed
         // transform gets a fresh eviction budget instead of re-tripping on
         // the very next eviction). Issue #159 added V30
@@ -78,41 +75,27 @@ async fn migrate_up_is_idempotent() {
         // qualified counterpart, now that all five key on one canonical
         // identity per logical source table instead of on whatever spelling
         // the ring row being diagnosed happened to carry — summing
-        // `key_deaths.deaths`, deduplicating the markers). Issue #285 added
-        // V34 (`relationship_definitions.from_schema` — the schema a
-        // relationship's from-table actually resolved to when it was declared,
-        // so a scoped `DROP RELATIONSHIP <schema>.<from_table>.<name>` checks
-        // its qualifier against the relationship's own from-table rather than
-        // against mere `schema_nodes` existence, which any registered
-        // same-named table in any schema satisfied; clears pre-existing rows
-        // rather than guessing their schema, per V24's own precedent). Issues
-        // #241/#242 (ADR-0015) added V35 (`transform_definitions
+        // `key_deaths.deaths`, deduplicating the markers). Issues #241/#242 (ADR-0015) added V35 (`transform_definitions
         // .definition_version` — the monotonic per-definition edit counter
         // `ALTER TRANSFORM` bumps; `source_table_versions.version` remains
         // the value the version fence itself reads). Issue #310 added V36
         // (`slot_loss_pauses`, which transforms a lost slot paused).
         // Issue #315 added V37 (a `recompute` ring row may carry a prior-image
-        // hint in `old_image`). Issue #288 added V38 (`relationship_definitions`'
-        // uniqueness key widened to the schema-qualified `(from_schema,
-        // from_table, name)`). Issues #311/#367 added V39
+        // hint in `old_image`). Issues #311/#367 added V39
         // (`pending_backfill.generation`, so a discharge deletes only the
         // marker generation it read).
         // Issue #321 added V40 (`aggregate_extinct_horizon`, the per-target
         // extinct horizon for aggregate recompute basis checks). Issue #379
-        // added V41 (`relationship_projections.projection_schema`); later
-        // removed when issue #435 moved every projection into the catalog
-        // schema, so V41 is not reissued to anything else. Issue
+        // added V41; issue #435 removed it, so V41 is not reissued to anything
+        // else. Issue
         // #418 added V42 (`backfill_chunks.fuse_rearmed_at`). Issue #407
         // added V43 (`pending_backfill`'s retry state). Issue #419 added V44
         // (`backfill_chunks`' unbounded direct-build job rows). Issue #431
         // added V45 (`pending_backfill.fence_xid`, null until the discharge
-        // fences the marker). Issue #372 added V46 (`relationship_definitions
-        // .to_schema`, the to-side's resolved schema). Issue #476 added V47
+        // fences the marker). Issue #476 added V47
         // (the `catching_up` transform status). Issues #468/#485 added V48
-        // (drops V18's `backfill_coverage`). Issue #507 added V49
-        // (`pending_backfill.refresh_projections`). Issue #420 added V50
-        // (drops `pending_backfill.added_at`, which nothing read). Issue #531
-        // added V51 (`relationship_projections.refreshed_lsn`). Issue #595
+        // (drops V18's `backfill_coverage`). Issue #420 added V50
+        // (drops `pending_backfill.added_at`, which nothing read). Issue #595
         // added V53 (`ring_slot_mirror`, the snapshot-independent copy of
         // `segment_pointer.ring_slot` ring writers read); V52 was left free
         // because an experiment branch already uses it. Issue #620 added V54
@@ -139,13 +122,12 @@ async fn migrate_up_is_idempotent() {
         // (`poison.sqlstate`, `retype_releases`), #817 V75 (`drain_holdups`),
         // #828 V76 (`retype_causes`, `capture_failures.caused_by`), #912 V77
         // (`column_status.cascade_pending`), #803 V78 (one `poison_held` row
-        // per held key), #944 V79 (a `recompute` row's released join value),
-        // #938 V80 (`transform_definitions.build_marker_generation`), #625
+        // per held key), #938 V80 (`transform_definitions.build_marker_generation`), #625
         // F6 V81 (`backfill_chunks.fence_xid`, a seam-fed build's fence),
         // #894 V82 (`resume_requests.timeout_cancels`), and #877 V83
-        // (`trellis_instance.target_schema`), #1023 V84 (`self_check_jobs`), #864 V85 (`grammar_version`), #273 V86 (the work-wake triggers), #1047 V87 (they also announce a definition entering `waiting_to_backfill` or `live`), #1061 V88 (`partition_sources`, `partition_corrections`), #861 V89 (`retry_attempts` on `poison` and `key_deaths`), #1075 V90 (a queued `self_check` job announces itself), #1062 V91 (`partition_correction_progress`, `partition_corrections.node_default` and `parent_oid`), #1062 V92 (`backfill_chunks.correction_id`, the `correction` chunk kind), #1063 V93 (the progress's `parents` phase), #1064 V94 (the `truncated` correction kind), #1066 V95 (the `complement` correction kind), #1067 V96 (`partition_sources.system_identifier`), #1099 V97 (the ring's `transition_images`), #1107 V98 (`transform_definitions.join_table` and `join_columns`), #703 V99 (`capture_baselines`), #1102 V100 (`poison_held.agg_groups`), #1151 V101 (`partition_corrections_once` becomes a non-unique lookup index), #1067 V102 (`partition_sources.catalog_oid`), #707 V103 (`capture_triggers`), #1181 V104 (the `disruption` failure kind), #1200 V105 (`capture_triggers.node_oid`), #1205 V106 (`capture_failures.restored`), #1219 V107 (`segments.late_rows`), #1242 V108 (`definition_types`), #1241 V109 (`definition_enum_values`, `capture_failures.relabel_lsn`), #1306 V110 (`upstream_releases`), and #1324 V111 (`transform_definitions.source_key`).
+        // (`trellis_instance.target_schema`), #1023 V84 (`self_check_jobs`), #864 V85 (`grammar_version`), #273 V86 (the work-wake triggers), #1047 V87 (they also announce a definition entering `waiting_to_backfill` or `live`), #1061 V88 (`partition_sources`, `partition_corrections`), #861 V89 (`retry_attempts` on `poison` and `key_deaths`), #1075 V90 (a queued `self_check` job announces itself), #1062 V91 (`partition_correction_progress`, `partition_corrections.node_default` and `parent_oid`), #1062 V92 (`backfill_chunks.correction_id`, the `correction` chunk kind), #1064 V94 (the `truncated` correction kind), #1066 V95 (the `complement` correction kind), #1067 V96 (`partition_sources.system_identifier`), #1099 V97 (the ring's `transition_images`), #1107 V98 (`transform_definitions.join_table` and `join_columns`), #703 V99 (`capture_baselines`), #1102 V100 (`poison_held.agg_groups`), #1151 V101 (`partition_corrections_once` becomes a non-unique lookup index), #1067 V102 (`partition_sources.catalog_oid`), #707 V103 (`capture_triggers`), #1181 V104 (the `disruption` failure kind), #1200 V105 (`capture_triggers.node_oid`), #1205 V106 (`capture_failures.restored`), #1219 V107 (`segments.late_rows`), #1242 V108 (`definition_types`), #1241 V109 (`definition_enum_values`, `capture_failures.relabel_lsn`), #1306 V110 (`upstream_releases`), and #1324 V111 (`transform_definitions.source_key`).
         // V73 is unused.
-        "expected exactly V1 through V7, V9 through V24, V26 through V40, V42 through V51, V53 through V60, V63 through V65, V67 through V72, V74 through V111 to be applied"
+        "expected exactly V1 through V7, V9 through V15, V18 through V24, V29 through V33, V35 through V37, V39, V40, V42 through V45, V47, V48, V50, V53 through V60, V63 through V65, V67 through V72, V74 through V78, V80 through V92, V94 through V111 to be applied"
     );
 
     // Running again should be a no-op: same ledger, no error.

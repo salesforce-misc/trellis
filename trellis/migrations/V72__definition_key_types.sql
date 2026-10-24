@@ -5,10 +5,9 @@
 -- `definition_key_types` holds the type each of a definition's key columns
 -- had when Trellis last built the definition's state from it
 -- (`defs::key_types`). A key column is one Trellis matches rows by: the
--- source's row-identity key, a `GROUP BY` key, and the join column and
--- to-side key of each relationship the definition reads through. Its target,
--- ledger and relationship projection hold that column's values, rendered as
--- they were then. An `ALTER COLUMN ... TYPE` rewrites the source table
+-- source's row-identity key, a `GROUP BY` key, and a `JOIN`'s join columns.
+-- Its target and ledger hold that column's values, rendered as they were
+-- then. An `ALTER COLUMN ... TYPE` rewrites the source table
 -- without firing a capture trigger, so if the new type renders the existing
 -- values differently, what Trellis stored no longer matches. The capture
 -- pass compares the live type with this row and pauses the definition when
@@ -18,8 +17,8 @@
 -- rebuilds from the live types), and written by the capture pass for a key
 -- column it finds unrecorded: one that joined a table's row-identity key
 -- after define (a redefined primary key, which pauses the readers first,
--- #687). `ALTER TRANSFORM` adds no key column: it edits only 1-1,
--- relationship-free definitions' fields.
+-- #687). `ALTER TRANSFORM` adds no key column: it edits only 1-1
+-- definitions' fields.
 --
 -- `type_oid` is the type's identity (ADR-0020), what the capture pass
 -- compares; `type_name` is its `schema.typname`, kept as the rendering and

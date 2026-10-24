@@ -63,11 +63,10 @@
 --     leaving it, and an ambiguous bare suffix means the code's own answer is
 --     already session-dependent.
 
---   * Nothing resolves it at all (a since-dropped source, or the U+001F
---     `RelationshipReverseDeferred` sentinel, which names no table at all):
---     left alone too, which matches the code side exactly — those are the same
---     spellings `qualified_src_table` deliberately hands back unchanged, so raw
---     *is* their canonical key and the two halves stay consistent.
+--   * Nothing resolves it at all (a since-dropped source): left alone too,
+--     which matches the code side exactly — that is the same spelling
+--     `qualified_src_table` deliberately hands back unchanged, so raw *is*
+--     its canonical key and the two halves stay consistent.
 --
 -- Unlike V24 this migration deletes nothing it has not first folded, so it does
 -- not lean on "there is no production deployment yet" for its safety the way
@@ -140,9 +139,9 @@ where p.src_table = c.bare;
 -- `release_key`'s replay order, which is load-bearing for aggregate deltas.
 insert into poison_held
     (src_table, key, seg_seq, op, lsn, old_image, new_image, origin_lsn,
-     src_changed, hop_gen, group_key)
+     src_changed, hop_gen)
 select c.qualified, h.key, h.seg_seq, h.op, h.lsn, h.old_image, h.new_image,
-       h.origin_lsn, h.src_changed, h.hop_gen, h.group_key
+       h.origin_lsn, h.src_changed, h.hop_gen
 from poison_held h
 join trellis_v33_canonical_src_table c on h.src_table = c.bare
 on conflict (src_table, key, seg_seq) do nothing;

@@ -245,11 +245,6 @@ async fn relationship_statements_are_parse_errors_that_register_nothing() {
         );
     }
 
-    assert_eq!(
-        count(&raw, "select count(*) from relationship_definitions").await,
-        0,
-        "a refused RELATIONSHIP registers nothing"
-    );
     assert!(
         trellis.definitions().await.expect("definitions").is_empty(),
         "a refused statement registers nothing"

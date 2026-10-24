@@ -13,28 +13,28 @@
 alter table seg_0 drop constraint seg_0_op_check;
 alter table seg_0 add constraint seg_0_op_check
     check (op in ('insert', 'update', 'delete', 'recompute', 'truncate',
-                  'rel_reverse_deferred', 'schema_changed', 'node_truncate'));
+                  'schema_changed', 'node_truncate'));
 alter table seg_0 add constraint seg_0_node_truncate_shape
     check (op <> 'node_truncate' or (old_image is null and new_image is not null));
 
 alter table seg_1 drop constraint seg_1_op_check;
 alter table seg_1 add constraint seg_1_op_check
     check (op in ('insert', 'update', 'delete', 'recompute', 'truncate',
-                  'rel_reverse_deferred', 'schema_changed', 'node_truncate'));
+                  'schema_changed', 'node_truncate'));
 alter table seg_1 add constraint seg_1_node_truncate_shape
     check (op <> 'node_truncate' or (old_image is null and new_image is not null));
 
 alter table seg_2 drop constraint seg_2_op_check;
 alter table seg_2 add constraint seg_2_op_check
     check (op in ('insert', 'update', 'delete', 'recompute', 'truncate',
-                  'rel_reverse_deferred', 'schema_changed', 'node_truncate'));
+                  'schema_changed', 'node_truncate'));
 alter table seg_2 add constraint seg_2_node_truncate_shape
     check (op <> 'node_truncate' or (old_image is null and new_image is not null));
 
 alter table seg_3 drop constraint seg_3_op_check;
 alter table seg_3 add constraint seg_3_op_check
     check (op in ('insert', 'update', 'delete', 'recompute', 'truncate',
-                  'rel_reverse_deferred', 'schema_changed', 'node_truncate'));
+                  'schema_changed', 'node_truncate'));
 alter table seg_3 add constraint seg_3_node_truncate_shape
     check (op <> 'node_truncate' or (old_image is null and new_image is not null));
 

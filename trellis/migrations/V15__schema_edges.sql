@@ -1,10 +1,7 @@
 -- Cross-table dependency graph (issue #21): persists the edges
--- `docs/transforms.md`'s logical model describes — today only the `source`
--- edge a transform's `FROM` produces; `join`/`relationship` edges are later
--- issues' scope (join-edge persistence needs multi-source `FROM` support
--- the AST doesn't have yet, and relationship edges land with the
--- relationship-storage issue) but the `kind` column is typed to hold them
--- without a schema change when that lands.
+-- `docs/transforms.md`'s logical model describes: a `source` edge from a
+-- transform's `FROM` table to its target, and a `join` edge from a `JOIN`
+-- transform's joined table.
 --
 -- Both endpoints reference `schema_nodes` (issue #20) rather than a bare
 -- table-name string, so the graph is walkable by node id — see
@@ -17,7 +14,7 @@ create table if not exists schema_edges (
     id bigint primary key generated always as identity,
     from_node_id bigint not null references schema_nodes (id),
     to_node_id bigint not null references schema_nodes (id),
-    kind text not null check (kind in ('source', 'join', 'relationship')),
+    kind text not null check (kind in ('source', 'join')),
     created_at timestamptz not null default now(),
     unique (from_node_id, to_node_id, kind)
 );

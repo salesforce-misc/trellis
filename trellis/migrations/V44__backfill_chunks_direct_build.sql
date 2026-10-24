@@ -1,6 +1,6 @@
--- Issue #419 (ADR-0016): an aggregate or relationship-enriched 1-1
--- definition's direct set-based build (ADR-0007) runs as one background job
--- that the backfill discharge dispatches and a drain thread executes. The job
+-- Issue #419 (ADR-0016): an aggregate definition's direct set-based build
+-- (ADR-0007) runs as one background job that the backfill discharge
+-- dispatches and a drain thread executes. The job
 -- is a `backfill_chunks` row, so it reuses the queue's claim, heartbeat,
 -- reclaim-stale and resume-staleness machinery unchanged.
 --

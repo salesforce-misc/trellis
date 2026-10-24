@@ -63,16 +63,6 @@ pub const CLASSIFICATION: &[(&str, Class)] = &[
     ("definition_key_types", Class::Definition { reset: NONE }),
     ("definition_types", Class::Definition { reset: NONE }),
     ("definition_enum_values", Class::Definition { reset: NONE }),
-    (
-        "relationship_definitions",
-        Class::Definition { reset: NONE },
-    ),
-    (
-        "relationship_projections",
-        Class::Definition {
-            reset: r#"{"refreshed_lsn":null}"#,
-        },
-    ),
     // A migration inserts one row; every later row is runtime.
     (
         "halting_stops",

@@ -3,7 +3,7 @@
 -- A drain whose page fails with a halting error (a key the drain can't use,
 -- a runaway propagation wave, an aggregate off the ledger) used to retry the
 -- same page every poll, forever. Now it pauses every definition that reads
--- the halting source, through a relationship too, and everything downstream
+-- the halting source, and everything downstream
 -- of them (`staging::halt`), recording the reason here like a capture
 -- failure does, so the rest of the page commits and its segments retire.
 -- Resuming the definition is the same rebuild, and deletes the row.

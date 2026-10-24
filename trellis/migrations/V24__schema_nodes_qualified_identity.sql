@@ -31,10 +31,9 @@
 -- keying — cleared outright rather than half-canonicalized. This is safe
 -- *only* because there is no production deployment to lose state from:
 -- `resolve_node_in_txn`/`persist_edge_in_txn` are called exclusively from
--- `create_definition_inner`/`create_relationship`, i.e. only when a
--- *new* definition/relationship is accepted — there is no startup/repair
--- pass anywhere in this crate that walks already-installed
--- `transform_definitions`/`relationship_definitions` rows to rebuild
+-- `create_definition_inner`, i.e. only when a *new* definition is
+-- accepted — there is no startup/repair pass anywhere in this crate that
+-- walks already-installed `transform_definitions` rows to rebuild
 -- `schema_nodes`/`schema_edges` for them. A database with live,
 -- already-installed definitions would have those definitions' edges
 -- truncated here and never regenerated — `transforms_for_source`/

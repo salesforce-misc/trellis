@@ -45,7 +45,6 @@ create table poison_held (
     origin_lsn pg_lsn,
     src_changed timestamptz,
     hop_gen integer not null default 0,
-    group_key text[],
     held_seq bigserial,
     primary key (transform_id, src_table, key, seg_seq)
 );

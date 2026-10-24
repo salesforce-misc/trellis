@@ -4,8 +4,7 @@
 -- `backfill_chunks.kind` says what a row builds:
 --
 -- * `range`: a plain 1-1 definition's primary-key range (V20);
--- * `direct`: an aggregate or relationship-enriched 1-1 definition's whole
---   direct build, one job (V44);
+-- * `direct`: an aggregate definition's whole direct build, one job (V44);
 -- * `plan`: a Re-derive build's plan job. It walks the source's primary key
 --   and enqueues `rederive` rows in batches as it goes. `lo` is its cursor:
 --   the last boundary it has enqueued, `null` before the first. It is done

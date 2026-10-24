@@ -7,5 +7,3 @@
 -- written under grammar 1.
 alter table transform_definitions
     add column grammar_version integer not null default 1;
-alter table relationship_definitions
-    add column grammar_version integer not null default 1;

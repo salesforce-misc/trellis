@@ -1,8 +1,7 @@
 -- First-class schema-node model (issue #20): every table Trellis knows
 -- about — source tables and transform targets — gets an identity row here,
--- so later work (issue #21's dependency graph, and relationships) can
--- resolve an endpoint against a stable node id rather than a bare
--- table-name string.
+-- so later work (issue #21's dependency graph) can resolve an endpoint
+-- against a stable node id rather than a bare table-name string.
 --
 -- Only identity is persisted: which table, and whether it's a source, a
 -- target, or (via chained/multi-hop transforms) both. Column names/types

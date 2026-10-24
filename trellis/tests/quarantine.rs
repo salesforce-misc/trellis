@@ -215,13 +215,12 @@ async fn insert_poison_held(
     client
         .execute(
             "insert into poison_held \
-                 (transform_id, src_table, key, seg_seq, lsn, old_image, origin_lsn, hop_gen) \
-             values ($7, $1, $2, $3, $4, $5::text::jsonb, $6, 0)",
+                 (transform_id, src_table, key, seg_seq, old_image, origin_lsn, hop_gen) \
+             values ($6, $1, $2, $3, $4::text::jsonb, $5, 0)",
             &[
                 &src_table,
                 &key,
                 &seg_seq,
-                &Some(testkit::wal_insert_lsn(client).await),
                 &old_image,
                 &origin_lsn.map(PgLsn::from),
                 &id,
