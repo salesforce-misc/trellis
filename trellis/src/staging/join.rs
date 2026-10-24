@@ -103,14 +103,20 @@
 //!
 //! 1. The lock row `FOR SHARE`.
 //! 2. **Enumerate** each side's cells (ADR-0002's R8): its hidden table's,
-//!    its table's, and those of the old images in the ring.
+//!    its table's, and those of the old images in the ring, by a `create
+//!    temp table … as select`, which Postgres can run in parallel.
 //! 3. `J` `FOR UPDATE` on the union of both sides' keys, in one sorted
-//!    statement, then the cells of both sides. Pages of keys the build holds
-//!    wait for its commit; the other keys' pages run through.
-//! 4. Each side's snapshot and absolute write of the cells it enumerated, as
-//!    a recompute does (the statement's snapshot is each cell's basis, taken
-//!    after every lock statement; a cell first seen after the enumeration is
-//!    left to its pages), then the product of both sides' changes into `T`.
+//!    statement, then the `P` cells with a `NULL` key part, which take no `J`
+//!    row (#1097's rule 6: `J` holds every other cell). Pages of keys the
+//!    build holds wait for its commit; the other keys' pages run through.
+//! 4. Each side's snapshot statement, one `GROUP BY` of its table into a
+//!    temp table (parallel where Postgres can), whose snapshot is each cell's
+//!    basis, taken after every lock statement; then its write of the cells it
+//!    enumerated, each written once: an update of a cell the hidden table
+//!    holds, an insert of one it doesn't. A cell first seen after the
+//!    enumeration is left to its pages. Then the product of both sides'
+//!    changes into `T`. The working tables are analyzed as they fill, so
+//!    these statements are planned for millions of cells.
 //! 5. `T`: its groups are locked **after** the product, so the set is exactly
 //!    the groups the product reads under `J`, with every group of the visible
 //!    target and of `T`'s hidden table added (R8 one level up). `T` changes
@@ -193,6 +199,11 @@ struct SidePlan {
     /// one `GROUP BY` of the node (quoted and qualified), instead of through
     /// the root ([`recompute_routed`]).
     node: Option<String>,
+    /// A build's per-transaction tables, quoted and `pg_temp.`-qualified:
+    /// its enumerated cells ([`group_basis::enumerate_cells`]) and its
+    /// snapshot's `GROUP BY` ([`group_basis::write_join_build_cells`]).
+    cells: String,
+    grouped: String,
 }
 
 impl SidePlan {
@@ -200,6 +211,28 @@ impl SidePlan {
     /// to recompute.
     fn writes(&self) -> bool {
         !self.plan.sides.is_empty() || self.recompute
+    }
+
+    /// The table or leaf a build (`bulk`) reads this side's cells from in
+    /// one `GROUP BY`, when it does: then it writes each cell once
+    /// ([`group_basis::write_join_build_cells`]). A build step that probes
+    /// each cell's rows through the root recomputes them as a page does.
+    fn bulk_node(&self, bulk: bool) -> Option<&str> {
+        if bulk && self.recompute && self.plan.sides.is_empty() {
+            self.node.as_deref()
+        } else {
+            None
+        }
+    }
+
+    /// ` where …`: the cell has a `NULL` part in its join key, so it takes no
+    /// `J` row and no `J` lock. A joined-side cell never has one.
+    fn null_key_filter(&self) -> String {
+        let null: Vec<String> = quoted(&self.join_cols)
+            .iter()
+            .map(|c| format!("{c} is null"))
+            .collect();
+        format!(" where {}", null.join(" or "))
     }
 }
 
@@ -445,6 +478,14 @@ impl JoinTargetPlan {
                     deltas,
                     recompute: false,
                     node: None,
+                    cells: format!(
+                        "pg_temp.{}",
+                        quote_ident(&working(&format!("e{tag}"), table))
+                    ),
+                    grouped: format!(
+                        "pg_temp.{}",
+                        quote_ident(&working(&format!("g{tag}"), table))
+                    ),
                 }
             };
         let from = side_plan(
@@ -813,9 +854,21 @@ impl JoinTargetPlan {
                     })
                     .collect();
                 zero_b(&mut counts, &mut sums);
+                // With `matches_new > 0` the term is `-P_old`, which adds
+                // nothing when every partial of `P_old` is 0: a cell a build
+                // inserted, on a key its `M` matched.
+                let mut p_old: Vec<String> = vec![p_old_n.clone()];
+                for i in 1..=fa {
+                    p_old.push(p_old_c(i));
+                    if p_args[i - 1].summed {
+                        p_old.push(p_old_s(i));
+                    }
+                }
+                let p_old_nonzero: Vec<String> =
+                    p_old.iter().map(|v| format!("{v} <> 0")).collect();
                 terms.push(format!(
                     "select {} from jd join {p} p on {} left join {dp} d on {cell_eq} \
-                     where jd.__new <> 0 or jd.__old <> 0",
+                     where jd.__new <> 0 or (jd.__old <> 0 and ({}))",
                     term(
                         "p",
                         None,
@@ -824,6 +877,7 @@ impl JoinTargetPlan {
                         sums
                     ),
                     key_eq("p", &pj, "jd", &jc),
+                    p_old_nonzero.join(" or "),
                 ));
             }
             let pj_as: Vec<String> = pj
@@ -943,7 +997,7 @@ pub(crate) async fn apply_join_target(
             group_basis::name_groups(txn, &side.plan, &[], side.plan.recompute_keys()).await?;
         }
     }
-    write_locked(txn, plan, mutations, false).await
+    write_locked(txn, plan, mutations, false, false).await
 }
 
 /// Creates every working table of `plan`'s writers, once a session.
@@ -968,11 +1022,16 @@ async fn create_working_tables(
 /// With `build`, this is the transaction of [`build`]: `T`'s write is the
 /// build's (every group of the visible target and of `T`'s hidden table is
 /// locked, and every visible row compared with the row the target holds).
+/// With `bulk`, a transaction of [`build`] whatever its work: a side that
+/// reads its cells from one `GROUP BY` of its table or leaf locks only its
+/// `NULL`-key cells and writes each cell once, and the working tables are
+/// analyzed after each statement that fills them.
 async fn write_locked(
     txn: &Transaction<'_>,
     plan: &JoinTargetPlan,
     mutations: &mut TargetMutations,
     build: bool,
+    bulk: bool,
 ) -> Result<(usize, usize), ApplyError> {
     let sides = [&plan.from, &plan.joined];
     // 2. The pair's lock row, a truncate's clear, `J`, then the cells.
@@ -1002,36 +1061,63 @@ async fn write_locked(
     pause!(txn, AfterJoinLock, &plan.target);
     for side in sides {
         if side.writes() {
-            txn.execute(&side.plan.lock_sql(), &[]).await?;
+            let lock = match side.bulk_node(bulk) {
+                // A build's keyed cells are held by `J`; only those with a
+                // `NULL` key part, which take no `J` row, are locked as
+                // cells (#1097's rule 6).
+                Some(_) => side.plan.lock_sql_where(&side.null_key_filter()),
+                None => side.plan.lock_sql(),
+            };
+            txn.execute(&lock, &[]).await?;
         }
     }
     pause!(txn, AfterEntryLock, &plan.target);
     // 3. Each side's cells, recording the change applied per cell, then
-    // the cells it recomputes.
+    // the cells it recomputes: a build's in one write per cell.
     for side in sides {
         if !side.plan.sides.is_empty() {
             group_basis::apply_locked_groups(txn, &side.plan, mutations).await?;
         }
         if side.recompute {
-            group_basis::recompute_locked_groups_from(
-                txn,
-                &side.plan,
-                side.node.as_deref(),
-                mutations,
-            )
-            .await?;
+            match side.bulk_node(bulk) {
+                Some(node) => {
+                    group_basis::write_join_build_cells(txn, &side.plan, node, &side.grouped)
+                        .await?;
+                }
+                None => {
+                    group_basis::recompute_locked_groups_from(
+                        txn,
+                        &side.plan,
+                        side.node.as_deref(),
+                        mutations,
+                    )
+                    .await?;
+                }
+            }
         }
         pause!(txn, BetweenJoinSideWrites, &plan.target);
+    }
+    if bulk {
+        group_basis::analyze(txn, &[&plan.from.deltas, &plan.joined.deltas]).await?;
     }
     // 4. The product into `T`'s staging, and `J.matches`. With nested
     // loops left on: its joins look up the other side's cells of a key
     // through the cell identity's index.
+    if bulk {
+        txn.batch_execute(group_basis::BULK_PLAN_SETTINGS).await?;
+    }
     txn.execute(&plan.product_sql(), &[]).await?;
+    if bulk {
+        txn.batch_execute(group_basis::BULK_PLAN_RESET).await?;
+    }
     // 5. `T`: lock the changed groups, sorted, then write them. A build
     // locks every group of the visible target and of `T` as well, and
     // compares each visible row with the one the target holds.
     if build {
         group_basis::enumerate_target_groups(txn, &plan.t).await?;
+    }
+    if bulk {
+        group_basis::analyze(txn, &[plan.t.staged()]).await?;
     }
     pause!(txn, BeforeJoinTargetLock, &plan.target);
     txn.execute(&plan.t.lock_sql(), &[]).await?;
@@ -1153,7 +1239,7 @@ pub(crate) async fn release(
     };
     group_basis::name_groups(txn, &side_plan.plan, cells, &[key.to_string()]).await?;
     let mut mutations = TargetMutations::new();
-    write_locked(txn, &plan, &mut mutations, false).await?;
+    write_locked(txn, &plan, &mut mutations, false, false).await?;
     let propagation = mutations.into_staged(txn).await?;
     super::append::append(txn, &propagation.changes).await?;
     Ok(true)
@@ -1191,7 +1277,7 @@ pub(crate) async fn recompute_routed(
     };
     group_basis::name_groups(txn, &side_plan.plan, cells, &[]).await?;
     let mut mutations = TargetMutations::new();
-    write_locked(txn, &plan, &mut mutations, false).await?;
+    write_locked(txn, &plan, &mut mutations, false, false).await?;
     let propagation = mutations.into_staged(txn).await?;
     super::append::append(txn, &propagation.changes).await?;
     Ok(())
@@ -1213,10 +1299,11 @@ pub(crate) async fn recompute_routed(
 ///    its hidden table's, its table's, and those of the ring's old images.
 /// 3. Steps 2 to 5 of a page ([`write_locked`]) with every enumerated cell
 ///    of both sides recomputed by one `GROUP BY` of its whole table: `J` on
-///    the union of both sides' keys in one sorted statement, the cells of
-///    both sides, `M`'s and `P`'s snapshots and absolute writes (the
-///    statement's snapshot is each cell's basis, taken after every lock
-///    statement), then the product of the cells' changes into `T`.
+///    the union of both sides' keys in one sorted statement, the `NULL`-key
+///    cells, `P`'s and `M`'s snapshot statements and absolute writes (each
+///    side's `GROUP BY`, after every lock statement, holds the snapshot that
+///    is its cells' basis; each cell is written once), then the product of
+///    the cells' changes into `T`.
 ///    A cell first seen after the enumeration is not locked, so it is not
 ///    written: its pages apply it.
 /// 4. `T`: its groups are locked after the product, so the set is the
@@ -1255,10 +1342,10 @@ pub(crate) async fn build(
             }
             txn.execute(&format!("select 1 from {} for share", plan.lock_ident), &[])
                 .await?;
-            for side in [&plan.from, &plan.joined] {
-                group_basis::enumerate_cells(txn, &side.plan, None).await?;
+            for side in [&mut plan.from, &mut plan.joined] {
+                group_basis::enumerate_cells(txn, &mut side.plan, None, &side.cells).await?;
             }
-            write_locked(txn, &plan, &mut mutations, true).await?
+            write_locked(txn, &plan, &mut mutations, true, true).await?
         }
         BuildWork::Side { side, scope } => {
             let side_plan = plan.side_mut(*side);
@@ -1273,12 +1360,10 @@ pub(crate) async fn build(
             };
             txn.execute(&format!("select 1 from {} for share", plan.lock_ident), &[])
                 .await?;
-            let side_plan = match side {
-                Side::From => &plan.from,
-                Side::Joined => &plan.joined,
-            };
-            group_basis::enumerate_cells(txn, &side_plan.plan, *scope).await?;
-            write_locked(txn, &plan, &mut mutations, false).await?
+            let side_plan = plan.side_mut(*side);
+            group_basis::enumerate_cells(txn, &mut side_plan.plan, *scope, &side_plan.cells)
+                .await?;
+            write_locked(txn, &plan, &mut mutations, false, true).await?
         }
         BuildWork::Final => {
             txn.execute(&format!("select 1 from {} for share", plan.lock_ident), &[])

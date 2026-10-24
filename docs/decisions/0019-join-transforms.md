@@ -295,10 +295,18 @@ When neither side is partitioned, a build, a `RESUME` and a rebuild in place
 are one transaction over both structures. It takes the lock row `FOR SHARE`,
 enumerates each side's cells (its hidden table's, its table's and those of the
 ring's old images), locks `J` on the union of both sides' keys in one sorted
-statement, locks the cells, and writes each side's enumerated cells from one
-`GROUP BY` of its table under a snapshot taken after the lock statements. A cell first seen after the
-enumeration belongs to its pages. It then carries both sides' changes into `T`
-as the product, as a page does. `T`'s groups are locked after the product,
+statement, then locks the `P` cells with a `NULL` key part (they take no `J`
+row; `J` holds every other cell). Each side's snapshot statement, after every
+lock statement, is one `GROUP BY` of its table into a temporary table, so
+Postgres can run it in parallel; the write that follows reads it and writes
+each enumerated cell once, an update of a held cell or an insert of a new one,
+with that snapshot as its basis. `J` doesn't hold a zero cell against the
+zero-cell collection, which takes no `J` lock: a cell it deletes under the
+write is inserted instead, and its change is the same, since its held partials
+were zero. The enumeration is a `create table as` too, for the same reason as
+the snapshot statement. A cell first seen after the enumeration belongs to its
+pages. It then carries both sides' changes into `T` as the product, as a page
+does. `T`'s groups are locked after the product,
 together with every group of the visible target and of `T`'s hidden table; `T`
 changes only as a delta, and each locked group's visible row is compared with
 the row the target holds. Pages apply from the build's first moment, and a page
