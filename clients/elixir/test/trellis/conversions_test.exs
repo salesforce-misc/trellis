@@ -8,8 +8,6 @@ defmodule Trellis.ConversionsTest do
     DefinitionSummary,
     PoisonEntry,
     QuarantineEntry,
-    Relationship,
-    RelationshipSummary,
     SamplePage,
     SelfCheckJob,
     SelfCheckReport
@@ -33,13 +31,10 @@ defmodule Trellis.ConversionsTest do
                :paused
              ])
 
-    assert Trellis.Native.cardinality_names() == {:ok, [:one, :many]}
-
     assert Trellis.Native.applied_kinds() ==
              {:ok,
               [
                 :transform_defined,
-                :relationship_defined,
                 :paused,
                 :resumed,
                 :dropped,
@@ -281,27 +276,11 @@ defmodule Trellis.ConversionsTest do
     }
   end
 
-  defp native_relationship do
-    %{
-      id: 2,
-      name: "owner",
-      from_schema: "public",
-      from_table: "widgets",
-      from_col: "owner_id",
-      to_schema: "public",
-      to_table: "users",
-      to_col: "id",
-      cardinality: :one,
-      warnings: []
-    }
-  end
-
   defp native_applied(kind, fields \\ %{}) do
     Map.merge(
       %{
         kind: kind,
         target_table: nil,
-        relationship: nil,
         columns: nil,
         added: nil,
         dropped: nil,
@@ -315,11 +294,6 @@ defmodule Trellis.ConversionsTest do
     assert {:transform_defined, "public.widget_prices"} =
              Applied.from_native(
                native_applied(:transform_defined, %{target_table: "public.widget_prices"})
-             )
-
-    assert {:relationship_defined, %Relationship{name: "owner", cardinality: :one}} =
-             Applied.from_native(
-               native_applied(:relationship_defined, %{relationship: native_relationship()})
              )
 
     assert Applied.from_native(native_applied(:paused)) == :paused
@@ -354,13 +328,6 @@ defmodule Trellis.ConversionsTest do
   test "creation times become DateTimes" do
     assert %DefinitionSummary{created_at: @time, backfill_failure: nil, halt: nil} =
              DefinitionSummary.from_native(native_summary())
-
-    assert %RelationshipSummary{created_at: @time, cardinality: :many} =
-             RelationshipSummary.from_native(
-               native_relationship()
-               |> Map.delete(:warnings)
-               |> Map.merge(%{cardinality: :many, created_at_micros: @micros})
-             )
   end
 
   test "a summary's backfill failure becomes a BackfillFailure" do

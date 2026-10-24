@@ -467,10 +467,12 @@ async fn a_reader_of_a_widened_to_side_waits_for_the_to_sides_gate() {
     .await
     .expect("seed");
     let trellis = definer(db.dsn()).await;
-    trellis
-        .apply("RELATIONSHIP parent FROM c.pid TO p.id")
-        .await
-        .expect("relationship");
+    trellis::dev::defs::create_relationship(
+        trellis.pool(),
+        "RELATIONSHIP parent FROM c.pid TO p.id",
+    )
+    .await
+    .expect("relationship");
     trellis
         .apply("TRANSFORM c_named FROM public.c SELECT amount AS amount, parent.name AS name")
         .await
@@ -909,16 +911,18 @@ async fn an_on_delete_cascade_parent_child_pair_converges() {
     .await
     .expect("seed");
     let trellis = definer(db.dsn()).await;
-    trellis
-        .apply("RELATIONSHIP parent FROM c.pid TO p.id")
-        .await
-        .expect("relationship");
+    trellis::dev::defs::create_relationship(
+        trellis.pool(),
+        "RELATIONSHIP parent FROM c.pid TO p.id",
+    )
+    .await
+    .expect("relationship");
     trellis
         .apply("TRANSFORM c_named FROM public.c SELECT amount AS amount, parent.name AS name")
         .await
         .expect("define c_named");
     trellis
-        .apply("TRANSFORM c_totals FROM public.c GROUP BY pid SELECT SUM(amount) AS total")
+        .apply("TRANSFORM c_totals FROM public.c GROUP BY pid WITHOUT SOURCE INDEX SELECT SUM(amount) AS total")
         .await
         .expect("define c_totals");
     let client = trellis::Client::start(db.dsn(), quick_options()).expect("start the client");
@@ -1015,7 +1019,9 @@ async fn a_nested_rewrite_of_the_same_key_lands_in_the_right_group() {
     .expect("seed");
     let trellis = definer(db.dsn()).await;
     trellis
-        .apply("TRANSFORM by_grp FROM public.s GROUP BY grp SELECT COUNT(*) AS n")
+        .apply(
+            "TRANSFORM by_grp FROM public.s GROUP BY grp WITHOUT SOURCE INDEX SELECT COUNT(*) AS n",
+        )
         .await
         .expect("define");
     let client = trellis::Client::start(db.dsn(), quick_options()).expect("start the client");

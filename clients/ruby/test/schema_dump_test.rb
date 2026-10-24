@@ -302,7 +302,7 @@ class SchemaDumpTest < Minitest::Test
     pg.close
     Trellis::Railtie.with_handle do |trellis|
       trellis.define("TRANSFORM sd_totals_#{@id} FROM sd_orders_#{@id} SELECT price AS price")
-      trellis.define("TRANSFORM sd_grand_#{@id} FROM sd_orders_#{@id} GROUP BY price SELECT COUNT(*) AS n")
+      trellis.define("TRANSFORM sd_grand_#{@id} FROM sd_orders_#{@id} GROUP BY price WITHOUT SOURCE INDEX SELECT COUNT(*) AS n")
     end
   end
 end

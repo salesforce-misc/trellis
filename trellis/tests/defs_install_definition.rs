@@ -863,7 +863,7 @@ async fn install_definition_fast_path_builds_an_aggregate_cross_field_alias_chai
     client
         .batch_execute(
             "create table order_items \
-             (id bigint primary key, order_id bigint, amount numeric); \
+             (id bigint primary key, order_id bigint, amount numeric(12,0)); \
              insert into order_items (id, order_id, amount) values \
              (1, 10, 5), (2, 10, 7), (3, 20, 3)",
         )
@@ -880,7 +880,7 @@ async fn install_definition_fast_path_builds_an_aggregate_cross_field_alias_chai
     install_definition(
         &db.pool,
         "TRANSFORM order_summary FROM order_items GROUP BY order_id \
-         SELECT order_id AS order_id, SUM(amount) AS total, \
+        WITHOUT SOURCE INDEX SELECT order_id AS order_id, SUM(amount) AS total, \
          total + total AS double_total",
         &cols,
         "public",
@@ -945,7 +945,7 @@ async fn install_definition_builds_a_bare_alias_of_a_sum_field_declared_before_i
     client
         .batch_execute(
             "create table order_items \
-             (id bigint primary key, order_id bigint, amount numeric); \
+             (id bigint primary key, order_id bigint, amount numeric(12,0)); \
              insert into order_items (id, order_id, amount) values \
              (1, 10, 5), (2, 10, 7), (3, 20, 3)",
         )
@@ -959,7 +959,7 @@ async fn install_definition_builds_a_bare_alias_of_a_sum_field_declared_before_i
     install_definition(
         &db.pool,
         "TRANSFORM order_summary FROM order_items GROUP BY order_id \
-         SELECT order_id AS order_id, total AS grand_total, SUM(amount) AS total",
+        WITHOUT SOURCE INDEX SELECT order_id AS order_id, total AS grand_total, SUM(amount) AS total",
         &cols,
         "public",
     )
@@ -1014,7 +1014,7 @@ async fn install_definition_shares_one_count_column_across_several_aliases_of_a_
     client
         .batch_execute(
             "create table order_items \
-             (id bigint primary key, order_id bigint, amount numeric); \
+             (id bigint primary key, order_id bigint, amount numeric(12,0)); \
              insert into order_items (id, order_id, amount) values \
              (1, 10, 5), (2, 10, 7), (3, 20, null)",
         )
@@ -1028,7 +1028,7 @@ async fn install_definition_shares_one_count_column_across_several_aliases_of_a_
     install_definition(
         &db.pool,
         "TRANSFORM order_summary FROM order_items GROUP BY order_id \
-         SELECT order_id AS order_id, grand_total AS super_total, \
+        WITHOUT SOURCE INDEX SELECT order_id AS order_id, grand_total AS super_total, \
          total AS grand_total, SUM(amount) AS total",
         &cols,
         "public",
@@ -1863,7 +1863,7 @@ async fn registering_a_direct_build_shape_reads_no_source_rows() {
         }
     };
     let aggregate =
-        register("TRANSFORM v FROM s GROUP BY g SELECT g AS g, SUM(a) AS total, MAX(grp.w) AS w")
+        register("TRANSFORM v FROM s GROUP BY g WITHOUT SOURCE INDEX SELECT g AS g, SUM(a) AS total, MAX(grp.w) AS w")
             .await;
     assert_eq!(aggregate.status, TransformStatus::WaitingToBackfill);
     let enriched = register("TRANSFORM w FROM s SELECT COUNT(kids.id) AS n").await;

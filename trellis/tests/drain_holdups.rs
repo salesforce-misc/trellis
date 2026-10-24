@@ -80,7 +80,9 @@ async fn instance(cluster: &TestCluster, ddl: &[&str]) -> Instance {
         "RELATIONSHIP parent FROM c.pid TO p.id",
         "RELATIONSHIP twin FROM c.id TO q.id",
     ] {
-        trellis.apply(relationship).await.expect(relationship);
+        trellis::dev::defs::create_relationship(trellis.pool(), relationship)
+            .await
+            .expect(relationship);
     }
     for statement in ddl {
         trellis.apply(statement).await.expect(statement);

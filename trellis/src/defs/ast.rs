@@ -67,14 +67,11 @@ pub struct TransformDef {
     pub without_source_index: bool,
 }
 
-/// A parsed standalone relationship declaration (ADR-0006):
+/// A parsed relationship declaration:
 /// `RELATIONSHIP <name> FROM <from_table>.<fk_col> TO <to_table>.<pk_col>`.
-///
-/// This slice (issue #24) is grammar + AST only. Catalog storage
-/// ([`super::catalog::create_relationship`]) and endpoint/cardinality
-/// validation (issue #27) build on top of it; referencing a relationship
-/// from a calculated field's expression is still deferred — see
-/// [`super::ast::Expr::RelationshipPath`]'s doc comment.
+/// No public statement parses to one; only the test-only
+/// [`super::catalog::create_relationship`] reads it, until #1115 removes
+/// relationships.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelationshipDef {
     pub name: String,
@@ -91,24 +88,10 @@ pub struct RelationshipDef {
 /// not change as operations are added").
 ///
 /// Every variant's leading keyword is what distinguishes it, so the parser
-/// needs no lookahead past the first token to choose: `TRANSFORM` /
-/// `RELATIONSHIP` define, `PAUSE` / `RESUME` / `DROP` act on something
-/// already defined. The kind keyword is repeated on the imperative forms
-/// (`PAUSE TRANSFORM x`, not `PAUSE x`) because transforms and relationships
-/// do *not* share a namespace (issue #228, decision 1).
-///
-/// **Pause and resume are transform-only**, which is why they carry a
-/// [`TransformRef`] while `DROP` carries a [`DefinitionRef`] that can name
-/// either kind. A relationship is a reusable *component* of a transform, not
-/// something that does anything on its own — there is no work of its own to
-/// suspend, so there is nothing a pause could mean. (It matches ADR-0014's own
-/// reasoning for having no `pause_relationship`: a relationship carries no
-/// lifecycle status and nothing in the fold gates on one.) Dropping one is a
-/// different matter — a relationship is a definition, and definitions can be
-/// retired — so `DROP RELATIONSHIP` exists. Spelling the distinction in the
-/// types rather than in a runtime check is what keeps the grammar and the
-/// available operations the same set, per ADR-0004's "the accepted language
-/// *is* the spec".
+/// needs no lookahead past the first token to choose: `TRANSFORM` defines,
+/// `PAUSE` / `RESUME` / `DROP` act on something already defined, `ALTER`
+/// edits one. The kind keyword is repeated on the imperative forms
+/// (`PAUSE TRANSFORM x`, not `PAUSE x`) (issue #228, decision 1).
 ///
 /// `AMEND` is deliberately absent: it needs its own semantics ADR before it
 /// can be a grammar addition (issue #228, decision 3).
@@ -116,17 +99,13 @@ pub struct RelationshipDef {
 pub enum Statement {
     /// `TRANSFORM <target> FROM <source> ... SELECT ...`
     DefineTransform(TransformDef),
-    /// `RELATIONSHIP <name> FROM <table>.<col> TO <table>.<col>`
-    DefineRelationship(RelationshipDef),
     /// `PAUSE TRANSFORM <target>[.<column>]` — ADR-0014's operator-driven
     /// freeze. Idempotent.
     Pause(TransformRef),
     /// `RESUME TRANSFORM <target>[.<column>]` — ADR-0014's
     /// rebuild-by-backfill recovery (*not* a catch-up).
     Resume(TransformRef),
-    /// `DROP TRANSFORM <target>` /
-    /// `DROP RELATIONSHIP [<schema>.]<from_table>.<name>` — ADR-0014's
-    /// terminal reap. Idempotent; refused if a still-registered dependent
+    /// `DROP TRANSFORM <target>` — ADR-0014's terminal reap. Idempotent; refused if a still-registered dependent
     /// chains off the subject.
     Drop(DefinitionRef),
     /// `ALTER TRANSFORM <target> <clause>[, <clause> ...]` (ADR-0015, issues
@@ -145,17 +124,13 @@ pub enum Statement {
 impl Statement {
     /// Which form this statement is — the same decision
     /// [`crate::Trellis::apply`] dispatches on, with the parsed payload
-    /// dropped. A `DROP` is split by the kind of definition it names, since
-    /// transforms and relationships are separate namespaces (issue #228,
-    /// decision 1) and dropping one is not dropping the other.
+    /// dropped.
     pub fn kind(&self) -> StatementKind {
         match self {
             Statement::DefineTransform(_) => StatementKind::DefineTransform,
-            Statement::DefineRelationship(_) => StatementKind::DefineRelationship,
             Statement::Pause(_) => StatementKind::PauseTransform,
             Statement::Resume(_) => StatementKind::ResumeTransform,
             Statement::Drop(DefinitionRef::Transform(_)) => StatementKind::DropTransform,
-            Statement::Drop(DefinitionRef::Relationship { .. }) => StatementKind::DropRelationship,
             Statement::AlterTransform(_) => StatementKind::AlterTransform,
         }
     }
@@ -165,13 +140,9 @@ impl Statement {
 /// what [`crate::statement_kind`] returns (issue #580).
 ///
 /// One variant per statement head: the verb *and* the kind of definition it
-/// acts on, as the grammar spells them ([`StatementKind::keywords`]). The
-/// grammar repeats the kind on every imperative form (`DROP TRANSFORM x`, not
-/// `DROP x`) because transforms and relationships don't share a namespace
-/// (issue #228, decision 1), so `DROP TRANSFORM` and `DROP RELATIONSHIP` are
-/// two kinds here, just as `TRANSFORM` and `RELATIONSHIP` are. A binding that
-/// accepts only one of them (a `drop_relationship` that must not drop a
-/// transform) can check for exactly that.
+/// acts on, as the grammar spells them ([`StatementKind::keywords`]). A
+/// binding that accepts only one of them (a `drop_transform` that must not
+/// pause one) can check for exactly that.
 ///
 /// `#[non_exhaustive]` for the reason [`crate::Applied`] is: the grammar
 /// grows a form at a time (`AMEND` is next once it has its own ADR), and a
@@ -183,17 +154,12 @@ impl Statement {
 pub enum StatementKind {
     /// `TRANSFORM <target> FROM <source> ...` — defines a transform.
     DefineTransform,
-    /// `RELATIONSHIP <name> FROM <table>.<col> TO <table>.<col>` — defines a
-    /// relationship.
-    DefineRelationship,
     /// `PAUSE TRANSFORM <target>[.<column>]`.
     PauseTransform,
     /// `RESUME TRANSFORM <target>[.<column>]`.
     ResumeTransform,
     /// `DROP TRANSFORM <target>`.
     DropTransform,
-    /// `DROP RELATIONSHIP [<schema>.]<from_table>.<name>`.
-    DropRelationship,
     /// `ALTER TRANSFORM <target> <clause>[, <clause> ...]`.
     AlterTransform,
 }
@@ -203,43 +169,37 @@ impl StatementKind {
     /// against, since `#[non_exhaustive]` stops any crate but this one from
     /// matching the enum exhaustively. `every_statement_kind_is_listed_in_all`
     /// fails until a new variant is added here.
-    pub const ALL: [StatementKind; 7] = [
+    pub const ALL: [StatementKind; 5] = [
         StatementKind::DefineTransform,
-        StatementKind::DefineRelationship,
         StatementKind::PauseTransform,
         StatementKind::ResumeTransform,
         StatementKind::DropTransform,
-        StatementKind::DropRelationship,
         StatementKind::AlterTransform,
     ];
 
-    /// A stable `snake_case` name for this kind (`"drop_relationship"`) —
+    /// A stable `snake_case` name for this kind (`"drop_transform"`) —
     /// the identifier a host language keys off of, in the style of
     /// [`crate::TransformStatus::as_str`].
     pub fn as_str(self) -> &'static str {
         match self {
             StatementKind::DefineTransform => "define_transform",
-            StatementKind::DefineRelationship => "define_relationship",
             StatementKind::PauseTransform => "pause_transform",
             StatementKind::ResumeTransform => "resume_transform",
             StatementKind::DropTransform => "drop_transform",
-            StatementKind::DropRelationship => "drop_relationship",
             StatementKind::AlterTransform => "alter_transform",
         }
     }
 
     /// The keywords a statement of this kind opens with, as the grammar
-    /// spells them (`"DROP RELATIONSHIP"`, `"TRANSFORM"`) — for a message
+    /// spells them (`"DROP TRANSFORM"`, `"TRANSFORM"`) — for a message
     /// that names the form a user wrote, so a binding needn't spell the
     /// grammar out a second time.
     pub fn keywords(self) -> &'static str {
         match self {
             StatementKind::DefineTransform => "TRANSFORM",
-            StatementKind::DefineRelationship => "RELATIONSHIP",
             StatementKind::PauseTransform => "PAUSE TRANSFORM",
             StatementKind::ResumeTransform => "RESUME TRANSFORM",
             StatementKind::DropTransform => "DROP TRANSFORM",
-            StatementKind::DropRelationship => "DROP RELATIONSHIP",
             StatementKind::AlterTransform => "ALTER TRANSFORM",
         }
     }
@@ -278,17 +238,7 @@ impl fmt::Display for TransformRef {
     }
 }
 
-/// What a [`Statement::Drop`] addresses — the one statement that can name
-/// either kind of definition.
-///
-/// **The two kinds address differently, on purpose** (issue #228,
-/// decision 1). A transform's identity is its target table, which is unique on
-/// its own, so it is addressed bare. A relationship's name is unique only *per
-/// from-table* (`relationship_definitions`' own unique constraint), so a bare
-/// relationship name doesn't identify anything — the address is always scoped
-/// to the from-table, and a bare one is a parse error
-/// ([`super::error::ParseError::UnscopedRelationshipAddress`]) rather than a
-/// lookup that guesses.
+/// What a [`Statement::Drop`] addresses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DefinitionRef {
     /// `TRANSFORM <target>` — the target table, bare or `<schema>.<table>`.
@@ -300,22 +250,6 @@ pub enum DefinitionRef {
     /// names no transform while its first half does, as the column address it
     /// reads as.
     Transform(String),
-    /// `[<schema>.]<from_table>.<relationship_name>`.
-    ///
-    /// `schema` is the optional leading qualifier of the *from-table*. A
-    /// relationship's identity is `(from_schema, from_table, name)` (issues
-    /// #285/#288), where `from_schema` is the schema the bare `from_table`
-    /// resolved to when the relationship was declared — the `RELATIONSHIP`
-    /// grammar has no schema-qualified endpoint spelling of its own. A
-    /// qualified address names exactly that relationship; a bare one names
-    /// whichever single schema declares `from_table.name`, and is refused as
-    /// ambiguous when more than one does. See
-    /// `defs::catalog::relationship_at_address`.
-    Relationship {
-        schema: Option<String>,
-        from_table: String,
-        name: String,
-    },
 }
 
 impl fmt::Display for DefinitionRef {
@@ -324,16 +258,6 @@ impl fmt::Display for DefinitionRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             DefinitionRef::Transform(target) => write!(f, "{target}"),
-            DefinitionRef::Relationship {
-                schema: None,
-                from_table,
-                name,
-            } => write!(f, "{from_table}.{name}"),
-            DefinitionRef::Relationship {
-                schema: Some(schema),
-                from_table,
-                name,
-            } => write!(f, "{schema}.{from_table}.{name}"),
         }
     }
 }

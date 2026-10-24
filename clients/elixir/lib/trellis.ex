@@ -9,12 +9,11 @@ defmodule Trellis do
   - **Lifecycle:** `connect/1`, `migrate/1`, `config/1`, `shutdown/1`, and
     `start_link/1` for a handle a supervisor owns.
   - **Every statement form:** `apply/2` runs one statement of Trellis's
-    grammar (`TRANSFORM`, `RELATIONSHIP`, `PAUSE TRANSFORM`,
-    `RESUME TRANSFORM`, `DROP TRANSFORM`, `DROP RELATIONSHIP`,
-    `ALTER TRANSFORM`) and reports what it did as a `t:Trellis.Applied.t/0`.
+    grammar (`TRANSFORM`, `PAUSE TRANSFORM`, `RESUME TRANSFORM`,
+    `DROP TRANSFORM`, `ALTER TRANSFORM`) and reports what it did as a `t:Trellis.Applied.t/0`.
     `define/2` is the one guarded convenience: an `apply/2` that refuses
     anything but a `TRANSFORM` statement before applying it.
-  - **Reads:** `status/2`, `definitions/1`, `relationships/1`, and
+  - **Reads:** `status/2`, `definitions/1`, and
     `dump_definitions_sql/1`, the definitions as SQL to append to a schema dump.
   - **Quarantine:** `quarantined/1`, `quarantine_status/2`,
     `sample_quarantined/3`, `poisoned_since/2`. Pausing and resuming are
@@ -145,7 +144,6 @@ defmodule Trellis do
     Native,
     PoisonEntry,
     QuarantineEntry,
-    RelationshipSummary,
     SamplePage,
     SelfCheckJob,
     Status
@@ -317,7 +315,7 @@ defmodule Trellis do
   `:waiting_to_backfill`; poll `status/2` with the returned name for `:live`.
 
   Only `TRANSFORM` statements belong here. Any other statement form (`DROP`,
-  `PAUSE`, `RELATIONSHIP`, ...) is refused with a `:validation` error before
+  `PAUSE`, `ALTER`, ...) is refused with a `:validation` error before
   anything is applied, and a statement that doesn't parse is a `:parse` error.
   `apply/2` takes every form.
 
@@ -368,8 +366,8 @@ defmodule Trellis do
 
   `{:ok, :unknown}` is a success like any other `{:ok, _}`: the statement
   took effect, and only its outcome is newer than this binding can describe.
-  Don't retry it; read the result back with `status/2`, `definitions/1` or
-  `relationships/1` if you need it.
+  Don't retry it; read the result back with `status/2` or `definitions/1` if
+  you need it.
   """
   @spec apply(trellis(), String.t()) :: {:ok, Applied.t()} | {:error, Error.t()}
   def apply(trellis, text) when is_trellis(trellis) and is_binary(text) do
@@ -392,24 +390,13 @@ defmodule Trellis do
   @spec definitions!(trellis()) :: [DefinitionSummary.t()]
   def definitions!(trellis), do: bang(definitions(trellis))
 
-  @doc "Every registered relationship, oldest first."
-  @spec relationships(trellis()) :: {:ok, [RelationshipSummary.t()]} | {:error, Error.t()}
-  def relationships(trellis) when is_trellis(trellis) do
-    list(run(trellis, :relationships, []), &RelationshipSummary.from_native/1)
-  end
-
-  @doc "Like `relationships/1`, but raises `Trellis.Error`."
-  @spec relationships!(trellis()) :: [RelationshipSummary.t()]
-  def relationships!(trellis), do: bang(relationships(trellis))
-
   @doc """
   The SQL that loads this instance's definitions into a database built from
   a schema-only dump (`pg_dump --schema-only`, `mix ecto.dump`). Append it
   to the dump; `mix trellis.dump` does.
 
   It holds `INSERT`s for the rows that say what is defined (Trellis's
-  migration history, its instance marker, the transform and relationship
-  definitions and the catalog rows they need), and nothing else: the ledger,
+  migration history, its instance marker, the transform definitions and the catalog rows they need), and nothing else: the ledger,
   the ring, backfill progress, quarantine and claims describe rows a
   schema-only dump doesn't carry. Every definition loads as "defined, not
   built" (`:waiting_to_backfill`), the state a `define/2` commits, including
@@ -677,8 +664,8 @@ defmodule Trellis do
   A target whose job is still `:queued` or `:running` gets that job back,
   whatever options this call passed; a finished job stays until the next
   `self_check/3` of its target replaces it. Only a one-row-per-source-key
-  transform that reads no relationship can be audited; an aggregate or
-  relationship-reading target is a `:validation` error, and an unknown one
+  transform can be audited; an aggregate target is a `:validation` error,
+  and an unknown one
   `:not_found`. A column that is paused is left out of the comparison.
 
   The call reads nothing of the target, so it returns well inside the

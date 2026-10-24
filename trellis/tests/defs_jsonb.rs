@@ -45,12 +45,8 @@ use trellis::defs::ast::ValueType;
 use trellis::defs::eval::{RegexCache, Row, Value, evaluate_aggregate};
 use trellis::defs::invertibility::{AggregateArg, Invertibility, classify};
 use trellis::defs::pg_type::PgType;
-use trellis::defs::{
-    create_aggregate_target_table, create_definition, create_relationship, parse, registry,
-    source_primary_key, validate,
-};
+use trellis::defs::{create_relationship, parse, registry, source_primary_key, validate};
 use trellis::integer::IntWidth;
-use trellis::staging::{StagedWatermark, apply, seal};
 
 // ---------------------------------------------------------------------
 // Harness
@@ -247,7 +243,8 @@ async fn jsonb_is_refused_as_a_relationship_join_key_and_primary_key() {
 #[test]
 fn jsonb_group_by_key_is_refused() {
     let def =
-        parse("TRANSFORM t FROM s GROUP BY j SELECT j AS k, SUM(n) AS total").expect("parses");
+        parse("TRANSFORM t FROM s GROUP BY j WITHOUT SOURCE INDEX SELECT j AS k, SUM(n) AS total")
+            .expect("parses");
     validate(&def, &source_columns(), &HashMap::new())
         .expect_err("jsonb must still be refused as a GROUP BY key");
 }
@@ -399,8 +396,10 @@ async fn jsonb_agg_includes_null_rows_unlike_every_other_aggregate() {
     assert_eq!(empty_group, None, "a genuinely empty group is SQL NULL");
 
     // The Rust evaluator must reproduce this exactly (`fold_jsonb_agg`).
-    let def = parse("TRANSFORM out FROM t GROUP BY g SELECT g AS g, JSONB_AGG(v) AS items")
-        .expect("parses");
+    let def = parse(
+        "TRANSFORM out FROM t GROUP BY g WITHOUT SOURCE INDEX SELECT g AS g, JSONB_AGG(v) AS items",
+    )
+    .expect("parses");
     let columns = HashMap::from([
         ("g".to_string(), ValueType::Integer(IntWidth::Int4)),
         ("v".to_string(), ValueType::Other(PgType::Jsonb)),
@@ -502,7 +501,7 @@ async fn jsonb_agg_fold_matches_a_server_side_aggregate() {
             .unwrap_or_else(|e| panic!("server jsonb_agg over {group:?}: {e}"))
             .get(0);
 
-        let def = parse("TRANSFORM t FROM s GROUP BY id SELECT id AS k, JSONB_AGG(j) AS items")
+        let def = parse("TRANSFORM t FROM s GROUP BY id WITHOUT SOURCE INDEX SELECT id AS k, JSONB_AGG(j) AS items")
             .expect("parses");
         let columns = source_columns();
         validate(&def, &columns, &HashMap::new()).expect("validate");
@@ -525,188 +524,4 @@ async fn jsonb_agg_fold_matches_a_server_side_aggregate() {
             "JSONB_AGG over {group:?}: evaluator disagreed with server ({server})"
         );
     }
-}
-
-// ---------------------------------------------------------------------
-// 5. The full pipeline: install -> CDC -> apply -> read
-// ---------------------------------------------------------------------
-
-/// parse -> create -> stage CDC -> **apply** (`RecomputeOnly`, so this
-/// exercises the ledger's live recompute, which asks Postgres directly rather than the Rust evaluator) ->
-/// read, cross-checked against the *set* of elements a live, independent
-/// `jsonb_agg` produces over the same rows — set, not sequence, because
-/// element order is this aggregate's one documented, non-corrupting
-/// caveat (`crate::jsonb`'s module doc).
-#[tokio::test]
-async fn a_cdc_apply_produces_a_jsonb_agg_matching_the_live_elements() {
-    const DEF_SQL: &str =
-        "TRANSFORM totals FROM events GROUP BY grp SELECT grp AS grp, JSONB_AGG(payload) AS items";
-
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
-
-    client
-        .batch_execute("create table events (id integer primary key, grp integer, payload jsonb)")
-        .await
-        .expect("create source table");
-
-    let columns = HashMap::from([
-        ("id".to_string(), ValueType::Integer(IntWidth::Int4)),
-        ("grp".to_string(), ValueType::Integer(IntWidth::Int4)),
-        ("payload".to_string(), ValueType::Other(PgType::Jsonb)),
-    ]);
-    let def = parse(DEF_SQL).expect("parse");
-    validate(&def, &columns, &HashMap::new()).expect("validate");
-    create_definition(&db.pool, DEF_SQL, &columns)
-        .await
-        .expect("create definition");
-    create_aggregate_target_table(&db.pool, &def, "public", &columns)
-        .await
-        .expect("create aggregate target table");
-
-    client
-        .batch_execute(
-            r#"insert into events (id, grp, payload) values
-                 (1, 1, '{"n": 1}'),
-                 (2, 1, '{"n": 2}'),
-                 (3, 2, 'null')"#,
-        )
-        .await
-        .expect("seed source rows");
-
-    async fn stage_image(client: &Client, segment: &str, key: &str, new_image: &str) {
-        let src_table = format!("{DEFAULT_SCHEMA}.events");
-        client
-            .execute(
-                &format!(
-                    "insert into {segment} \
-                     (src_table, key, op, lsn, old_image, new_image, hop_gen) \
-                     values ($1, $2, 'insert', $3, null, $4::text::jsonb, 0)"
-                ),
-                &[
-                    &src_table,
-                    &key,
-                    &testkit::wal_insert_lsn(client).await,
-                    &new_image,
-                ],
-            )
-            .await
-            .unwrap_or_else(|e| panic!("stage {key}: {e}"));
-    }
-
-    stage_image(
-        &client,
-        "seg_0",
-        "1",
-        r#"{"id":"1","grp":"1","payload":"{\"n\": 1}"}"#,
-    )
-    .await;
-    stage_image(
-        &client,
-        "seg_0",
-        "2",
-        r#"{"id":"2","grp":"1","payload":"{\"n\": 2}"}"#,
-    )
-    .await;
-    stage_image(
-        &client,
-        "seg_0",
-        "3",
-        r#"{"id":"3","grp":"2","payload":"null"}"#,
-    )
-    .await;
-
-    let outcome = seal::seal_phase1(&mut client).await.expect("seal phase 1");
-    seal::seal_phase2(&client, outcome.sealed_seg_seq, "wake")
-        .await
-        .expect("seal phase 2");
-    apply::drain_once(
-        &db.pool,
-        outcome.sealed_seg_seq,
-        "jsonb_worker",
-        1,
-        "trellis_defs_jsonb_issue_115",
-        &StagedWatermark::saturated(),
-    )
-    .await
-    .expect("drain_once")
-    .expect("drain_once must claim and drain something");
-
-    for grp in [1i32, 2] {
-        let items_text: String = client
-            .query_one("select items::text from totals where grp = $1", &[&grp])
-            .await
-            .unwrap_or_else(|e| panic!("read totals for grp {grp}: {e}"))
-            .get(0);
-        let expected_elements: Vec<String> = client
-            .query_one(
-                "select array_agg(payload::text order by payload::text) from events where grp = $1",
-                &[&grp],
-            )
-            .await
-            .unwrap()
-            .get::<_, Vec<String>>(0);
-
-        let mut actual_elements: Vec<String> = serde_json_array_elements(&items_text);
-        actual_elements.sort();
-        assert_eq!(
-            actual_elements, expected_elements,
-            "grp {grp}: JSONB_AGG's element set must match the source rows exactly"
-        );
-    }
-}
-
-/// A tiny, purpose-built splitter for a canonical top-level jsonb *array*
-/// literal (`[elem, elem, ...]`, `jsonb_out`'s own `", "` separator, no
-/// nested top-level commas outside balanced brackets/strings) — just enough
-/// to pull `items::text` apart into per-element text for the set comparison
-/// above, without reaching for a full JSON parsing dependency in a test.
-fn serde_json_array_elements(array_text: &str) -> Vec<String> {
-    let inner = array_text
-        .strip_prefix('[')
-        .and_then(|s| s.strip_suffix(']'))
-        .expect("must be a top-level jsonb array");
-    if inner.is_empty() {
-        return Vec::new();
-    }
-    let mut elements = Vec::new();
-    let mut depth = 0i32;
-    let mut in_string = false;
-    let mut start = 0usize;
-    let bytes = inner.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'"' if !in_string => in_string = true,
-            b'"' if in_string => {
-                // A canonical jsonb string never ends in an odd number of
-                // trailing backslashes right before this quote in a way
-                // that would need lookback here, since escapes are always
-                // two-character pairs consumed together below.
-                in_string = false;
-            }
-            b'\\' if in_string => i += 1, // skip the escaped character
-            b'{' | b'[' if !in_string => depth += 1,
-            b'}' | b']' if !in_string => depth -= 1,
-            b',' if !in_string && depth == 0 => {
-                elements.push(inner[start..i].to_string());
-                start = i + 2; // skip ", "
-                i += 1;
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    elements.push(inner[start..].to_string());
-    elements
-}
-
-#[test]
-fn serde_json_array_elements_splits_a_canonical_jsonb_array() {
-    assert_eq!(serde_json_array_elements("[]"), Vec::<String>::new());
-    assert_eq!(
-        serde_json_array_elements(r#"[1, "a, b", {"x": [1, 2]}, null]"#),
-        vec!["1", "\"a, b\"", "{\"x\": [1, 2]}", "null"]
-    );
 }

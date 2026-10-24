@@ -182,7 +182,15 @@ async fn set_up(admin: &Client, database: &str) {
     }
 }
 
+/// Applies `statement`; a `RELATIONSHIP`, which `apply` no longer takes, is
+/// declared through the dev door instead.
 async fn apply(trellis: &Trellis, statement: &str) {
+    if statement.starts_with("RELATIONSHIP") {
+        trellis::dev::defs::create_relationship(trellis.pool(), statement)
+            .await
+            .unwrap_or_else(|err| panic!("{statement}: {err}"));
+        return;
+    }
     trellis
         .apply(statement)
         .await
@@ -361,7 +369,7 @@ async fn the_documented_privileges_run_the_whole_lifecycle() {
     apply(
         &trellis,
         "TRANSFORM order_totals FROM public.orders GROUP BY customer_id \
-         SELECT customer_id AS customer_id, COUNT(*) AS n, SUM(amount) AS total",
+        WITHOUT SOURCE INDEX SELECT customer_id AS customer_id, COUNT(*) AS n, SUM(amount) AS total",
     )
     .await;
     apply(
@@ -474,7 +482,9 @@ async fn the_documented_privileges_run_the_whole_lifecycle() {
     for target in ["order_customers", "order_totals", "order_copy"] {
         drop_transform(&trellis, target).await;
     }
-    apply(&trellis, "DROP RELATIONSHIP orders.customer").await;
+    trellis::dev::defs::drop_relationship(trellis.pool(), "orders.customer")
+        .await
+        .expect("drop the relationship");
     assert!(trellis.definitions().await.expect("definitions").is_empty());
     let targets: i64 = admin
         .query_one(

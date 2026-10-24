@@ -312,12 +312,21 @@ pub(crate) fn route(
     source_columns: &HashMap<String, ValueType>,
     relationships: &HashMap<String, ResolvedRelationship>,
 ) -> Option<LedgerShape> {
-    let KeySpace::Aggregate { group_by } = &def.key_space else {
-        return None;
-    };
     if super::group_basis::route(def, source_columns).is_some() {
         return None;
     }
+    shape_of(def, source_columns, relationships)
+}
+
+/// [`route`]'s ledger shape of `def`, whatever the group basis takes.
+fn shape_of(
+    def: &TransformDef,
+    source_columns: &HashMap<String, ValueType>,
+    relationships: &HashMap<String, ResolvedRelationship>,
+) -> Option<LedgerShape> {
+    let KeySpace::Aggregate { group_by } = &def.key_space else {
+        return None;
+    };
     let mut joined: Vec<&str> = Vec::new();
     for (rel, column) in eval::relationship_references(def) {
         let resolved = relationships.get(&rel)?;
@@ -2983,7 +2992,7 @@ mod tests {
             .iter()
             .map(|(c, t)| ((*c).to_string(), *t))
             .collect();
-        route(&def, &source_columns, &HashMap::new())
+        shape_of(&def, &source_columns, &HashMap::new())
     }
 
     const INT: ValueType = ValueType::Integer(crate::integer::IntWidth::Int4);

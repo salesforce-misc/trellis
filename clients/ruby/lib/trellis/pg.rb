@@ -42,7 +42,7 @@ require_relative "instance"
 #
 # - Lifecycle: connect, connected?, migrate, config, shutdown.
 # - Every statement form: apply, and define for a TRANSFORM statement alone.
-# - Reads: status, definitions, relationships, dump_definitions_sql.
+# - Reads: status, definitions, dump_definitions_sql.
 # - Quarantine: quarantined, quarantine_status, sample_quarantined,
 #   poisoned_since, release_key.
 # - Operations: request_backfill, detect_capture_disruptions, has_live_drain_workers?,

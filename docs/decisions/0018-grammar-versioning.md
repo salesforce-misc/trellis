@@ -6,7 +6,7 @@ deciders: Michael Ries
 
 # Grammar Versions on Stored Definitions
 
-Trellis stores each transform and relationship definition as text in its
+Trellis stores each transform definition as text in its
 catalog and parses it again on every read,
 with the parser new statements go through
 ([ADR-0004](0004-transform-definition-grammar.md)). An `ALTER TRANSFORM` stores
@@ -30,12 +30,12 @@ the catalog's own schema; both are out of scope.
 
 ### Every stored definition carries a grammar version, stamped when its text is written
 
-Each transform and relationship definition stores an integer `grammar_version`
-beside its text, written whenever the text is: at define, declare,
+Each transform definition stores an integer `grammar_version`
+beside its text, written whenever the text is: at define,
 `ALTER TRANSFORM` and rewrite. A pause, resume or rebuild writes neither. The
 binary has a current version, and grammar 1 is the grammar when the marker is
-introduced. One counter covers the whole grammar, since one parser reads both
-kinds of statement.
+introduced. One counter covers the whole grammar, since one parser reads every
+statement.
 
 Because only a write stamps it, reading a definition can never move it to rules
 it wasn't written under.
@@ -91,13 +91,6 @@ attach.
 Too old pauses and too new refuses because the fixes differ: the operator can
 fix a too-old definition here by redefining it, while a too-new one means the
 wrong binary is running.
-
-### Relationships load from their catalog columns, not their text
-
-A relationship's name, endpoints and join columns each have a catalog column,
-set at declare and never changed. Loading reads those columns, so a grammar
-change can't alter what a stored relationship means, and none is ever outside
-the window. Its text and version are kept as written.
 
 ### Rewriting moves a definition to the current grammar without a rebuild
 

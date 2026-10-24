@@ -290,16 +290,15 @@ async fn an_out_of_range_active_slot_fails_the_idle_seal_check() {
 }
 
 /// The companion negative control: an empty active segment whose
-/// predecessor has nothing unfenced left in its slot (the ordinary idle-tail
-/// case — every real system reaches this state at the end of any burst of
-/// traffic) must *not* seal. Without this, [`an_empty_active_segment_still_seals_to_catch_a_stranded_straggler`]'s
-/// fix could regress into resealing empty segments forever on a genuinely
-/// idle ring — the exact busy-loop
+/// predecessor is sealed but not yet drained, and has nothing unfenced in its
+/// slot, must *not* seal. Without this, [`an_empty_active_segment_still_seals_to_catch_a_stranded_straggler`]'s
+/// fix could regress into sealing empty segments while the predecessor's
+/// batch is still being applied — the busy-loop
 /// docs/staging-and-claiming/03-sealing-and-the-fence.md's "Who seals, and
 /// when" section calls out as the reason seal-on-demand only fires for a
 /// non-empty active segment in the first place.
 #[tokio::test]
-async fn an_empty_active_segment_with_a_fully_fenced_predecessor_does_not_seal() {
+async fn an_empty_active_segment_with_an_undrained_fully_fenced_predecessor_does_not_seal() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut sealer = connect_raw(db.dsn()).await;
@@ -311,24 +310,200 @@ async fn an_empty_active_segment_with_a_fully_fenced_predecessor_does_not_seal()
     seal::seal_phase2(&sealer, outcome.sealed_seg_seq, "wake")
         .await
         .expect("seal phase 2");
-    sealer
-        .execute(
-            "update segments set state = 'drained' where seg_seq = $1",
-            &[&outcome.sealed_seg_seq],
-        )
-        .await
-        .expect("mark segment 1 drained");
 
-    // The active segment (2) is empty, and segment 1 has nothing unfenced
-    // left to catch — sealing now would be pure, unbounded busy-work.
+    // The active segment (2) is empty, segment 1 is still sealed (not
+    // drained), and it has nothing unfenced left to catch.
     let sealed = seal::seal_if_active_nonempty(&mut sealer, "wake")
         .await
         .expect("seal_if_active_nonempty");
     assert!(
         sealed.is_none(),
-        "an empty active segment with a fully-fenced predecessor must not seal — nothing to \
-         catch, and sealing anyway would busy-loop an idle ring forever"
+        "an empty active segment with an undrained, fully-fenced predecessor must not seal"
     );
+}
+
+/// The straggler seal for a predecessor that isn't drained yet: an empty
+/// active segment seals when its sealed (not drained) predecessor's slot
+/// holds a row its own fence doesn't show, and the successor read claims it.
+/// The idle seal never sees this case (it needs a drained predecessor), so
+/// this is the test of `predecessor_has_unfenced_row`'s own scan.
+#[tokio::test]
+async fn an_empty_active_segment_seals_for_a_straggler_of_an_undrained_predecessor() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut sealer = connect_raw(db.dsn()).await;
+    insert_recompute(&sealer, "seg_0", "ordinary").await;
+    let outcome = seal::seal_phase1(&mut sealer).await.expect("seal phase 1");
+    seal::seal_phase2(&sealer, outcome.sealed_seg_seq, "wake")
+        .await
+        .expect("seal phase 2");
+
+    // Commits into segment 1's slot after S_1 was captured: invisible in S_1.
+    // Segment 1 stays `sealed`.
+    let straggler = connect_raw(db.dsn()).await;
+    insert_recompute(&straggler, "seg_0", "straggler").await;
+
+    let sealed = seal::seal_if_active_nonempty(&mut sealer, "wake")
+        .await
+        .expect("straggler seal")
+        .expect("an empty active segment seals for an undrained predecessor's straggler");
+    assert_eq!(sealed.sealed_seg_seq, 2);
+    assert_claimed_exactly_once(&sealer, &[1, 2], "ordinary").await;
+    assert_claimed_exactly_once(&sealer, &[1, 2], "straggler").await;
+}
+
+/// Marks `seg_seq` drained, standing in for the real apply-and-mark the way
+/// the tests above do.
+async fn mark_drained(client: &Client, seg_seq: i64) {
+    client
+        .execute(
+            "update segments set state = 'drained' where seg_seq = $1",
+            &[&seg_seq],
+        )
+        .await
+        .expect("mark segment drained");
+}
+
+async fn slot_row_count(client: &Client, table: &str) -> i64 {
+    client
+        .query_one(&format!("select count(*) from {table}"), &[])
+        .await
+        .expect("count slot rows")
+        .get(0)
+}
+
+async fn segment_exists(client: &Client, seg_seq: i64) -> bool {
+    client
+        .query_one(
+            "select exists (select 1 from segments where seg_seq = $1)",
+            &[&seg_seq],
+        )
+        .await
+        .expect("read segments")
+        .get(0)
+}
+
+/// Writes a burst into segment 1's slot (`seg_0`), seals it with the
+/// maintenance tick's own seal step, and marks it drained: the state an idle
+/// ring is left in at the end of any burst of traffic.
+async fn burst_sealed_and_drained(sealer: &mut Client, keys: &[&str]) {
+    for key in keys {
+        insert_recompute(sealer, "seg_0", key).await;
+    }
+    let outcome = seal::seal_if_active_nonempty(sealer, "wake")
+        .await
+        .expect("seal the burst")
+        .expect("a non-empty active segment seals");
+    assert_eq!(outcome.sealed_seg_seq, 1);
+    mark_drained(sealer, 1).await;
+}
+
+/// The idle seal (#1253): once a burst's segment drains and no more writes
+/// arrive, one seal step seals the empty active segment, so the drained
+/// batch can retire and its slot is freed instead of staying resident (and
+/// read whole by every check that asks the slot) for as long as the ring is
+/// idle. A second call seals nothing: the new active segment's predecessor is
+/// the empty segment just sealed.
+#[tokio::test]
+async fn an_idle_ring_seals_one_empty_segment_and_retires_its_drained_tail() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut sealer = connect_raw(db.dsn()).await;
+    burst_sealed_and_drained(&mut sealer, &["a", "b", "c"]).await;
+    assert_eq!(active_pointer(&sealer).await, (2, 1));
+
+    let sealed = seal::seal_if_active_nonempty(&mut sealer, "wake")
+        .await
+        .expect("idle seal")
+        .expect("an empty active segment whose drained predecessor's slot holds rows seals");
+    assert_eq!(sealed.sealed_seg_seq, 2);
+    assert_eq!(active_pointer(&sealer).await, (3, 2));
+
+    let again = seal::seal_if_active_nonempty(&mut sealer, "wake")
+        .await
+        .expect("second idle tick");
+    assert!(
+        again.is_none(),
+        "the idle seal is self-limiting: the empty segment just sealed is the new predecessor, \
+         so a quiet ring must not seal again (got {again:?})"
+    );
+
+    // The empty segment drains; the retire pass frees the old tail's slot.
+    mark_drained(&sealer, 2).await;
+    let retired = trellis::staging::retire_drained_segments(&mut sealer)
+        .await
+        .expect("retire pass");
+    assert!(
+        retired.contains(&1),
+        "segment 1 retires once its idle-sealed successor drains (retired {retired:?})"
+    );
+    assert!(!segment_exists(&sealer, 1).await);
+    assert_eq!(slot_row_count(&sealer, "seg_0").await, 0);
+
+    // Still quiet: segment 2 drained with an empty slot, so nothing seals.
+    let third = seal::seal_if_active_nonempty(&mut sealer, "wake")
+        .await
+        .expect("third idle tick");
+    assert!(
+        third.is_none(),
+        "a quiet ring keeps not sealing (got {third:?})"
+    );
+    assert_eq!(active_pointer(&sealer).await, (3, 2));
+}
+
+/// A straggler that commits into the drained tail's slot after its fence is
+/// folded by the idle seal's successor read, exactly as the straggler seal
+/// folds it, and every ordinary row stays claimed by its own batch only.
+#[tokio::test]
+async fn the_idle_seal_folds_a_straggler_in_the_drained_tail() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut sealer = connect_raw(db.dsn()).await;
+    burst_sealed_and_drained(&mut sealer, &["ordinary"]).await;
+
+    // Commits into segment 1's slot after S_1 was captured: invisible in S_1.
+    let straggler = connect_raw(db.dsn()).await;
+    insert_recompute(&straggler, "seg_0", "straggler").await;
+
+    let sealed = seal::seal_if_active_nonempty(&mut sealer, "wake")
+        .await
+        .expect("idle seal")
+        .expect("the idle seal fires");
+    assert_eq!(sealed.sealed_seg_seq, 2);
+    assert_claimed_exactly_once(&sealer, &[1, 2], "ordinary").await;
+    assert_claimed_exactly_once(&sealer, &[1, 2], "straggler").await;
+}
+
+/// A write arriving after the idle period seals as before: its own segment,
+/// claimed by that batch alone.
+#[tokio::test]
+async fn a_write_after_the_idle_seal_seals_as_before() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut sealer = connect_raw(db.dsn()).await;
+    burst_sealed_and_drained(&mut sealer, &["first"]).await;
+    seal::seal_if_active_nonempty(&mut sealer, "wake")
+        .await
+        .expect("idle seal")
+        .expect("the idle seal fires");
+    mark_drained(&sealer, 2).await;
+    trellis::staging::retire_drained_segments(&mut sealer)
+        .await
+        .expect("retire pass");
+
+    let (active_seq, ring_slot) = active_pointer(&sealer).await;
+    assert_eq!((active_seq, ring_slot), (3, 2));
+    insert_recompute(&sealer, "seg_2", "later").await;
+    let sealed = seal::seal_if_active_nonempty(&mut sealer, "wake")
+        .await
+        .expect("seal the later write")
+        .expect("a non-empty active segment seals");
+    assert_eq!(sealed.sealed_seg_seq, 3);
+    assert_claimed_exactly_once(&sealer, &[2, 3], "later").await;
+
+    // Its predecessor (2) is drained with an empty slot, so sealing it
+    // retires nothing new and the ring behaves as it always did.
+    assert_eq!(active_pointer(&sealer).await, (4, 3));
 }
 
 #[tokio::test]

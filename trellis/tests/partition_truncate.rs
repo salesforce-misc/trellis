@@ -20,8 +20,7 @@ use trellis::defs::ValueType;
 use trellis::staging::partition_correction::{self, Options, Outcome};
 
 const SOURCE: &str = "public.items";
-const DEFINITION: &str =
-    "TRANSFORM agg FROM public.items GROUP BY g SELECT SUM(v) AS total, COUNT(*) AS n";
+const DEFINITION: &str = "TRANSFORM agg FROM public.items GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n";
 
 /// `items` range-partitioned on `g`: leaves `items_p0`..`items_p3` hold the
 /// groups 0-3, 4-7, 8-11 and 12-15. 160 rows, ten per group, `v` the id.
@@ -175,6 +174,8 @@ fn range(from: i32, to: i32) -> Vec<i32> {
 
 #[tokio::test]
 async fn a_leaf_truncate_corrects_only_the_leafs_groups() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut fx = Fx::start(FLAT).await;
     // Rows written into the leaf after the truncate, in its transaction,
     // count.
@@ -200,6 +201,8 @@ async fn a_leaf_truncate_corrects_only_the_leafs_groups() {
 
 #[tokio::test]
 async fn a_middle_truncate_corrects_the_middle_through_its_own_text() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut fx = Fx::start(NESTED).await;
     fx.exec("truncate public.items_m").await;
     fx.d.settle().await;
@@ -216,6 +219,8 @@ async fn a_middle_truncate_corrects_the_middle_through_its_own_text() {
 
 #[tokio::test]
 async fn a_root_truncate_clears_the_target_once_and_queues_nothing() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut fx = Fx::start(NESTED).await;
     fx.exec("truncate public.items").await;
     fx.d.settle().await;
@@ -226,6 +231,8 @@ async fn a_root_truncate_clears_the_target_once_and_queues_nothing() {
 
 #[tokio::test]
 async fn a_truncate_naming_several_nodes_queues_one_correction_per_node() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut fx = Fx::start(NESTED).await;
     fx.exec("truncate public.items_m0, public.items_p3").await;
     // `CASCADE` empties a leaf that references the table named.
@@ -259,6 +266,8 @@ async fn a_truncate_naming_several_nodes_queues_one_correction_per_node() {
 
 #[tokio::test]
 async fn a_truncate_after_the_nodes_correction_started_queues_another() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut fx = Fx::start(FLAT).await;
     fx.exec("truncate public.items_p1").await;
     fx.d.settle().await;

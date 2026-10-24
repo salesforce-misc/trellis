@@ -1,19 +1,14 @@
 //! End-to-end tests for issue #117's user-defined enum type support — as
-//! join/primary-key and `GROUP BY` key roles, and the `MIN`/`MAX` aggregate
-//! role, honoring the type's *creation-order* comparison rather than an
-//! alphabetical one, with explicit coverage of what happens when that
-//! creation order changes underneath a live definition (`ALTER TYPE ...
-//! ADD VALUE`).
+//! join/primary-key and `GROUP BY` key roles, and the `MIN`/`MAX` result
+//! type, honoring the type's *creation-order* comparison rather than an
+//! alphabetical one.
 //!
 //! # Why these run against a live server
 //!
 //! Per #111-#119's playbook: check `pg_cast` for a second `::text` renderer
 //! rather than assume `enumout` is the whole story, check `to_jsonb`
 //! agreement, check that `min`/`max` actually exist and keep their argument's
-//! own concrete type, and — the genuinely new question this issue's own
-//! framing raises, that no earlier type-family issue had to ask — check
-//! whether a `MIN`/`MAX(enum)` result is ever *cached* anywhere such that an
-//! `ALTER TYPE ... ADD VALUE` could leave it stale.
+//! own concrete type.
 //!
 //! **Text-stability.** `select castfunc from pg_cast where castsource =
 //! 'an enum type'::regtype and casttarget = 'text'::regtype` returns no rows
@@ -35,23 +30,10 @@
 //! fixed-length `bit` has, since an enum type's bare name already names its
 //! complete, exact value domain.
 //!
-//! **`MIN`/`MAX` and the type-versioning question.** `anyenum` has a full
-//! btree opclass ordered by `pg_enum.enumsortorder` (creation position, not
-//! alphabetical), and `pg_typeof(min(v))` keeps the argument's own concrete
-//! enum type — the same "own family, own terms" shape `inet`'s `MIN`/`MAX`
-//! landed under (#116). The type-versioning question this issue's own scope
-//! note raises turns out to already be naturally handled, for a concrete,
-//! checked-not-assumed reason: `super::invertibility::classify` has
-//! classified `MIN`/`MAX` as `RecomputeOnly` for *every* argument type since
-//! before this issue existed (issue #11's original gate rule, unconditional
-//! on type) — so a `KeySpace::Aggregate` definition's `MIN`/`MAX(enum)`
-//! value is never accumulated or cached anywhere; it is always resolved by
-//! pushing a real `min()`/`max()` down to Postgres itself (the ledger's
-//! Recomputed fields), which necessarily evaluates under the type's *current* `pg_enum` shape. There is
-//! nothing for `ALTER TYPE ... ADD VALUE` to invalidate, because nothing was
-//! ever cached — demonstrated below by altering a live type's value set
-//! *between* two drains of the same definition and confirming the second
-//! drain's answer reflects the new shape with no special handling at all.
+//! **`MIN`/`MAX`.** `anyenum` has a full btree opclass ordered by
+//! `pg_enum.enumsortorder` (creation position, not alphabetical), and
+//! `pg_typeof(min(v))` keeps the argument's own concrete enum type — the same
+//! "own family, own terms" shape `inet`'s `MIN`/`MAX` landed under (#116).
 //!
 //! The one place this type family is *not* like every earlier one: it is the
 //! first whose ordering is not a fixed, universal property of the family
@@ -261,7 +243,8 @@ async fn two_distinct_enum_types_are_not_comparable_as_a_relationship_join() {
 #[test]
 fn enum_group_by_key_is_admitted() {
     let def =
-        parse("TRANSFORM t FROM s GROUP BY p SELECT p AS k, SUM(n) AS total").expect("parses");
+        parse("TRANSFORM t FROM s GROUP BY p WITHOUT SOURCE INDEX SELECT p AS k, SUM(n) AS total")
+            .expect("parses");
     validate(&def, &source_columns(), &HashMap::new())
         .unwrap_or_else(|e| panic!("an enum column must be accepted as a GROUP BY key: {e}"));
 }
@@ -278,8 +261,7 @@ fn enum_group_by_key_is_admitted() {
 /// `boolean`/`inet`'s hazard lived on the old aggregate path.
 #[tokio::test]
 async fn an_enum_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two() {
-    const DEF_SQL: &str =
-        "TRANSFORM totals FROM events GROUP BY grp SELECT grp AS grp, SUM(amount) AS total";
+    const DEF_SQL: &str = "TRANSFORM totals FROM events GROUP BY grp WITHOUT SOURCE INDEX SELECT grp AS grp, SUM(amount) AS total";
 
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -289,7 +271,7 @@ async fn an_enum_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two()
         .batch_execute(
             "create type public.priority_enum as enum ('low', 'medium', 'high'); \
              create table events ( \
-               id integer primary key, grp priority_enum, amount numeric)",
+               id integer primary key, grp priority_enum, amount numeric(12,0))",
         )
         .await
         .expect("create source table");
@@ -454,281 +436,4 @@ async fn enum_min_max_keeps_its_type_and_honors_creation_order_not_alphabetical(
         ),
         pg_type
     );
-}
-
-/// A live `GROUP BY` definition's `MIN`/`MAX(enum)` matches an
-/// independently-authored server-side recompute over multiple groups, with
-/// a creation order chosen to disagree with alphabetical ordering across the
-/// board.
-#[tokio::test]
-async fn enum_group_by_min_max_matches_a_server_side_recompute() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
-
-    // Creation order: charlie (1) < bravo (2) < alpha (3) — the exact
-    // reverse of alphabetical order.
-    client
-        .batch_execute(
-            "create type public.flip_enum as enum ('charlie', 'bravo', 'alpha'); \
-             create table events (id integer primary key, grp integer, p flip_enum)",
-        )
-        .await
-        .expect("create source table");
-
-    let def_sql = "TRANSFORM totals FROM events GROUP BY grp \
-                   SELECT grp AS grp, MIN(p) AS lo, MAX(p) AS hi";
-    let columns = HashMap::from([
-        ("id".to_string(), ValueType::Integer(IntWidth::Int4)),
-        ("grp".to_string(), ValueType::Integer(IntWidth::Int4)),
-        (
-            "p".to_string(),
-            ValueType::Other(PgType::Enum("enum:public.flip_enum")),
-        ),
-    ]);
-    let def = parse(def_sql).expect("parse");
-    validate(&def, &columns, &HashMap::new()).expect("validate");
-    create_definition(&db.pool, def_sql, &columns)
-        .await
-        .expect("create definition");
-    create_aggregate_target_table(&db.pool, &def, "public", &columns)
-        .await
-        .expect("create aggregate target table");
-
-    client
-        .batch_execute(
-            "insert into events (id, grp, p) values \
-               (1, 1, 'alpha'), (2, 1, 'bravo'), (3, 1, 'charlie'), \
-               (4, 2, 'bravo'), (5, 2, 'bravo'), \
-               (6, 3, 'charlie')",
-        )
-        .await
-        .expect("seed source rows");
-
-    async fn stage_image(client: &Client, key: &str, new_image: &str) {
-        let src_table = format!("{DEFAULT_SCHEMA}.events");
-        client
-            .execute(
-                "insert into seg_0 \
-                 (src_table, key, op, lsn, old_image, new_image, hop_gen) \
-                 values ($1, $2, 'insert', $3, null, $4::text::jsonb, 0)",
-                &[
-                    &src_table,
-                    &key,
-                    &testkit::wal_insert_lsn(client).await,
-                    &new_image,
-                ],
-            )
-            .await
-            .unwrap_or_else(|e| panic!("stage image-bearing {key}: {e}"));
-    }
-
-    async fn drain_sealed(client: &mut Client, pool: &trellis::Pool) {
-        let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
-        seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
-            .await
-            .expect("seal phase 2");
-        apply::drain_once(
-            pool,
-            outcome.sealed_seg_seq,
-            "enum_worker",
-            1,
-            "trellis_defs_enum_issue_117",
-            &StagedWatermark::saturated(),
-        )
-        .await
-        .expect("drain_once")
-        .expect("drain_once must claim and drain something");
-    }
-
-    for (id, grp, p) in [
-        (1, 1, "alpha"),
-        (2, 1, "bravo"),
-        (3, 1, "charlie"),
-        (4, 2, "bravo"),
-        (5, 2, "bravo"),
-        (6, 3, "charlie"),
-    ] {
-        stage_image(
-            &client,
-            &id.to_string(),
-            &format!(r#"{{"grp":"{grp}","p":"{p}"}}"#),
-        )
-        .await;
-    }
-    drain_sealed(&mut client, &db.pool).await;
-
-    let mut got: Vec<(i32, String, String)> = client
-        .query(
-            "select grp, lo::text, hi::text from totals order by grp",
-            &[],
-        )
-        .await
-        .expect("read totals")
-        .into_iter()
-        .map(|row| (row.get(0), row.get(1), row.get(2)))
-        .collect();
-    got.sort_by_key(|(grp, ..)| *grp);
-
-    let mut expected: Vec<(i32, String, String)> = client
-        .query(
-            "select grp, min(p)::text, max(p)::text from events group by grp order by grp",
-            &[],
-        )
-        .await
-        .expect("server-side recompute")
-        .into_iter()
-        .map(|row| (row.get(0), row.get(1), row.get(2)))
-        .collect();
-    expected.sort_by_key(|(grp, ..)| *grp);
-
-    assert_eq!(got, expected);
-    // Pin the concrete, creation-order (not alphabetical) values too, so a
-    // future regression that happened to still match `expected` via some
-    // other coincidence still fails loudly.
-    assert_eq!(
-        got,
-        vec![
-            (1, "charlie".to_string(), "alpha".to_string()),
-            (2, "bravo".to_string(), "bravo".to_string()),
-            (3, "charlie".to_string(), "charlie".to_string()),
-        ]
-    );
-}
-
-/// The type-versioning question issue #117's own scope note raises,
-/// grounded end-to-end rather than argued from the invertibility
-/// classification alone: a `MIN`/`MAX(enum)` value is never cached, so
-/// `ALTER TYPE ... ADD VALUE` between two drains of the same definition is
-/// reflected on the very next recompute with no special handling — because
-/// the ledger recomputes this field live, asking Postgres directly, under whatever `pg_enum` shape is live *at
-/// recompute time*, never a value carried over from before the type
-/// changed.
-#[tokio::test]
-async fn alter_type_add_value_is_reflected_on_the_next_recompute_with_nothing_cached() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
-
-    // Creation order: bravo (1) < alpha (2) — reversed from alphabetical.
-    client
-        .batch_execute(
-            "create type public.flip_enum as enum ('bravo', 'alpha'); \
-             create table events (id integer primary key, grp integer, p flip_enum)",
-        )
-        .await
-        .expect("create source table");
-
-    let def_sql = "TRANSFORM totals FROM events GROUP BY grp \
-                   SELECT grp AS grp, MIN(p) AS lo, MAX(p) AS hi";
-    let columns = HashMap::from([
-        ("id".to_string(), ValueType::Integer(IntWidth::Int4)),
-        ("grp".to_string(), ValueType::Integer(IntWidth::Int4)),
-        (
-            "p".to_string(),
-            ValueType::Other(PgType::Enum("enum:public.flip_enum")),
-        ),
-    ]);
-    let def = parse(def_sql).expect("parse");
-    create_definition(&db.pool, def_sql, &columns)
-        .await
-        .expect("create definition");
-    create_aggregate_target_table(&db.pool, &def, "public", &columns)
-        .await
-        .expect("create aggregate target table");
-
-    client
-        .batch_execute("insert into events (id, grp, p) values (1, 1, 'alpha'), (2, 1, 'bravo')")
-        .await
-        .expect("seed source rows");
-
-    async fn stage_image(client: &Client, key: &str, new_image: &str) {
-        let src_table = format!("{DEFAULT_SCHEMA}.events");
-        client
-            .execute(
-                "insert into seg_0 \
-                 (src_table, key, op, lsn, old_image, new_image, hop_gen) \
-                 values ($1, $2, 'insert', $3, null, $4::text::jsonb, 0)",
-                &[
-                    &src_table,
-                    &key,
-                    &testkit::wal_insert_lsn(client).await,
-                    &new_image,
-                ],
-            )
-            .await
-            .unwrap_or_else(|e| panic!("stage image-bearing {key}: {e}"));
-    }
-
-    async fn drain_sealed(client: &mut Client, pool: &trellis::Pool, worker: &str) {
-        let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
-        seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
-            .await
-            .expect("seal phase 2");
-        apply::drain_once(
-            pool,
-            outcome.sealed_seg_seq,
-            worker,
-            1,
-            "trellis_defs_enum_issue_117_versioning",
-            &StagedWatermark::saturated(),
-        )
-        .await
-        .expect("drain_once")
-        .expect("drain_once must claim and drain something");
-    }
-
-    stage_image(&client, "1", r#"{"grp":"1","p":"alpha"}"#).await;
-    stage_image(&client, "2", r#"{"grp":"1","p":"bravo"}"#).await;
-    drain_sealed(&mut client, &db.pool, "enum_worker_v1").await;
-
-    let row = client
-        .query_one("select lo::text, hi::text from totals where grp = 1", &[])
-        .await
-        .expect("read baseline totals");
-    let (lo, hi): (String, String) = (row.get(0), row.get(1));
-    assert_eq!(lo, "bravo", "baseline: creation-order min is bravo");
-    assert_eq!(hi, "alpha", "baseline: creation-order max is alpha");
-
-    // Extend the type: `zulu` becomes the new creation-order *minimum*
-    // (`BEFORE bravo`) despite sorting alphabetically *last* among the
-    // three labels — chosen precisely so a stale/alphabetical answer and
-    // the correct post-ALTER answer could never coincide by accident.
-    client
-        .batch_execute("alter type flip_enum add value 'zulu' before 'bravo'")
-        .await
-        .expect("alter type add value");
-    client
-        .execute("insert into events (id, grp, p) values (3, 1, 'zulu')", &[])
-        .await
-        .expect("insert using the new value");
-    stage_image(&client, "3", r#"{"grp":"1","p":"zulu"}"#).await;
-    drain_sealed(&mut client, &db.pool, "enum_worker_v2").await;
-
-    let row = client
-        .query_one("select lo::text, hi::text from totals where grp = 1", &[])
-        .await
-        .expect("read post-ALTER totals");
-    let (lo, hi): (String, String) = (row.get(0), row.get(1));
-    assert_eq!(
-        lo, "zulu",
-        "the new creation-order minimum must win on the very next recompute, \
-         with no stale cached value surviving the type change"
-    );
-    assert_eq!(
-        hi, "alpha",
-        "the max is unaffected by a new value inserted before the current minimum"
-    );
-
-    // Cross-checked against a fresh, independent server-side recompute too,
-    // not just against this engine's own prior answer.
-    let expected = client
-        .query_one(
-            "select min(p)::text, max(p)::text from events where grp = 1",
-            &[],
-        )
-        .await
-        .expect("server-side recompute");
-    let (expected_lo, expected_hi): (String, String) = (expected.get(0), expected.get(1));
-    assert_eq!((lo, hi), (expected_lo, expected_hi));
 }

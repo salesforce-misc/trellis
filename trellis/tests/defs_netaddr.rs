@@ -293,7 +293,7 @@ async fn inet_is_refused_as_a_relationship_join_key_and_primary_key() {
 fn all_four_families_are_admitted_as_group_by_keys() {
     for (column, target) in [("i", "gi"), ("c", "gc"), ("m", "gm"), ("m8", "gm8")] {
         let def = parse(&format!(
-            "TRANSFORM t FROM s GROUP BY {column} SELECT {column} AS {target}, SUM(n) AS total"
+            "TRANSFORM t FROM s GROUP BY {column} WITHOUT SOURCE INDEX SELECT {column} AS {target}, SUM(n) AS total"
         ))
         .expect("parses");
         validate(&def, &source_columns(), &HashMap::new())
@@ -373,7 +373,7 @@ async fn inet_min_max_keeps_its_type_and_the_fold_matches_a_server_side_aggregat
 
         for (aggregate, expected) in [("MIN", &server_min), ("MAX", &server_max)] {
             let def = parse(&format!(
-                "TRANSFORM t FROM s GROUP BY id SELECT id AS k, {aggregate}(i) AS out"
+                "TRANSFORM t FROM s GROUP BY id WITHOUT SOURCE INDEX SELECT id AS k, {aggregate}(i) AS out"
             ))
             .expect("parses");
             let columns = HashMap::from([
@@ -564,8 +564,7 @@ async fn to_jsonb_agrees_with_text_except_for_inet() {
 /// pins, here for the family issue #116 found the analogous divergence in.
 #[tokio::test]
 async fn an_inet_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two() {
-    const DEF_SQL: &str =
-        "TRANSFORM totals FROM events GROUP BY grp SELECT grp AS grp, SUM(amount) AS total";
+    const DEF_SQL: &str = "TRANSFORM totals FROM events GROUP BY grp WITHOUT SOURCE INDEX SELECT grp AS grp, SUM(amount) AS total";
 
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -574,7 +573,7 @@ async fn an_inet_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two()
     client
         .batch_execute(
             "create table events ( \
-               id integer primary key, grp inet, amount numeric)",
+               id integer primary key, grp inet, amount numeric(12,0))",
         )
         .await
         .expect("create source table");

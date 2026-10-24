@@ -19,7 +19,8 @@ use trellis::staging::self_check::{
 };
 
 const SOURCE: &str = "public.items";
-const AGG: &str = "TRANSFORM agg FROM public.items GROUP BY g SELECT SUM(v) AS total";
+const AGG: &str =
+    "TRANSFORM agg FROM public.items GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total";
 const TREE: &str = "create table public.items (id integer not null, g integer not null, \
         v integer not null, primary key (g, id)) partition by list (g); \
      create table public.items_a partition of public.items for values in (1, 2); \
@@ -255,7 +256,7 @@ async fn a_join_reading_a_partitioned_side_audits_clean_and_names_a_leafs_disabl
     trellis
         .apply(
             "TRANSFORM j FROM public.facts JOIN public.items ON facts.k = items.g \
-             GROUP BY items.g SELECT items.g AS g, COUNT(*) AS n, SUM(facts.w) AS sw",
+             GROUP BY items.g WITHOUT SOURCE INDEX SELECT items.g AS g, COUNT(*) AS n, SUM(facts.w) AS sw",
         )
         .await
         .expect("define a JOIN over the partitioned side");

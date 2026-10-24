@@ -12,16 +12,15 @@ ordered floor to ceiling:
 1. **Passthrough** — captured as text and copied into a derived table
    unchanged. Nearly every type clears it (see
    [Unreferenceable types](#unreferenceable-types) for the exceptions).
-2. **Join / `GROUP BY` key** — matched by equality. A relationship join column
+2. **Join / `GROUP BY` key** — matched by equality. A `JOIN`'s `ON` column
    must be on the join-key allowlist (`TEXT_STABLE_JOIN_KEY_TYPES` in
    `trellis/src/defs/catalog.rs`, by Postgres type name, plus any enum). A
    `GROUP BY` key is gated on its `ValueType` instead
    (`validate::reject_unsupported_group_by_key_type`).
 3. **Primary key** — identifies a row. A source's key must be on the same
    allowlist as join columns (`DdlError::UnsupportedPrimaryKeyType`). The role
-   covers every table whose rows Trellis keys: both endpoints of a
-   relationship too, including an aggregate target whose `GROUP BY` key is
-   off the allowlist.
+   covers every table whose rows Trellis keys, both tables of a `JOIN`
+   included.
 4. **Computed 1-1 target** — a scalar calculated field produces this type.
    Needs an immutable evaluator arm and, for a constant, a typed literal.
 5. **Aggregate target** — an aggregate calculated field folds to this type.
@@ -40,37 +39,34 @@ filter role.
 
 | Postgres type(s) | Passthrough | Join key | `GROUP BY` key | Primary key | Computed 1-1 | Aggregates |
 |---|---|---|---|---|---|---|
-| `smallint` `integer` `bigint` | yes | yes | yes | yes | yes | `SUM` `AVG` `MIN` `MAX` |
+| `smallint` `integer` `bigint` | yes | yes | yes | yes | yes | `SUM` `AVG` |
 | `oid` | yes | yes | yes | yes | typed literal only | no (no arithmetic in Postgres) |
-| `numeric` `decimal` | yes | no | yes | no | yes | `SUM` `AVG` `MIN` `MAX` |
-| `real` `double precision` | yes | no | no | no | yes | `SUM` `AVG` `MIN` `MAX` (recompute) |
-| `boolean` | yes | no | yes | no | yes | `bool_and` `bool_or` (recompute) |
-| `uuid` | yes | yes | yes | yes | yes | no `MIN`/`MAX` |
-| `text` `varchar` `char(n)` | yes | `text` `varchar` only | yes | `text` `varchar` only | yes | `MIN` `MAX` `array_agg` `string_agg` (recompute) |
-| `bytea` | yes | yes | yes | yes | typed literal | no `MIN`/`MAX` |
-| `date` `time` `timetz` `timestamp` `timestamptz` | yes | yes | yes | yes | yes; typed literal for all but `timestamptz` | `MIN` `MAX` |
-| `interval` | yes | no | no | no | yes | `SUM` (recompute); no `MIN`/`MAX` |
-| `jsonb` | yes | no | no | no | typed literal | `jsonb_agg` of a `jsonb` argument (recompute) |
-| `inet` | yes | no | yes | no | typed literal | `MIN` `MAX` (recompute) |
-| `cidr` | yes | yes | yes | yes | typed literal | no `MIN`/`MAX` |
-| `macaddr` `macaddr8` | yes | yes | yes | yes | typed literal | no `MIN`/`MAX` |
-| `bit` | yes | yes | no | yes | no | `bit_and` `bit_or` (recompute, result `bit varying`) |
-| `bit varying` | yes | yes | yes | yes | typed literal | `bit_and` `bit_or` (recompute) |
-| enum types | yes | yes | yes | yes | no | `MIN` `MAX` (recompute) |
+| `numeric` `decimal` | yes | no | yes | no | yes | `SUM` `AVG` over `numeric(p,s)` only |
+| `real` `double precision` | yes | no | no | no | yes | no |
+| `boolean` | yes | no | yes | no | yes | no |
+| `uuid` | yes | yes | yes | yes | yes | no |
+| `text` `varchar` `char(n)` | yes | `text` `varchar` only | yes | `text` `varchar` only | yes | no |
+| `bytea` | yes | yes | yes | yes | typed literal | no |
+| `date` `time` `timetz` `timestamp` `timestamptz` | yes | yes | yes | yes | yes; typed literal for all but `timestamptz` | no |
+| `interval` | yes | no | no | no | yes | no |
+| `jsonb` | yes | no | no | no | typed literal | no |
+| `inet` | yes | no | yes | no | typed literal | no |
+| `cidr` | yes | yes | yes | yes | typed literal | no |
+| `macaddr` `macaddr8` | yes | yes | yes | yes | typed literal | no |
+| `bit` | yes | yes | no | yes | no | no |
+| `bit varying` | yes | yes | yes | yes | typed literal | no |
+| enum types | yes | yes | yes | yes | no | no |
 | `json` `money` `xml` `tsvector` `tsquery` | yes | no | no | no | passthrough only | no |
 | array, range, composite, domain, geometric, extension types (`citext`) | no | no | no | no | no | no |
 
 `COUNT(*)` and `COUNT(<expr>)` are type-agnostic and typed `bigint`, as in
-Postgres; they are omitted from the aggregate column. `MIN`/`MAX` over `text`
-and enum are refused when wrapped around a to-many relationship path in a 1-1
-target (every other aggregate, including the boolean, bit and network-address
-reducers, folds there;
-`TextAggregateOverToManyRelationshipUnsupported`,
-`EnumAggregateOverToManyRelationshipUnsupported`): the DB-less evaluator that
-folds those has no collation or enum order to consult. "Recompute" means the
-aggregate has no exact inverse, so a group is recomputed by Postgres itself
-(a server-side `min()`, `sum()` and so on) rather than updated by a delta
-(`defs::invertibility`).
+Postgres; they are omitted from the aggregate column. An aggregate or `JOIN`
+transform admits only `COUNT`, and `SUM` and `AVG` over the types above, the
+aggregates Trellis keeps exact from each change alone. Every other aggregate
+is refused at define, named by its family: `MIN`/`MAX`, `bool_and`/`bool_or`/
+`bit_and`/`bit_or`, `SUM`/`AVG` over a float, an `interval` or another type,
+and `array_agg`/`string_agg`/`jsonb_agg`
+([Aggregates that are not supported](#aggregates-that-are-not-supported)).
 
 ### The types of the columns Trellis creates
 
@@ -92,11 +88,8 @@ every column Trellis creates and every cast to one goes through
 modifiers. A 1-1 copy holds the source's exact rendering: a `numeric` rewritten from
 `1.25` to `1.2500`, an `interval` from `'1 day'` to `'24 hours'` and a float
 from `-0` to `0` reach the copy, though each pair is equal as a value
-([ADR-0020](decisions/0020-type-identity.md)). A `GROUP BY` key's column (in the target, its ledger and its
-group-delta table) takes its value family's type: `integer` or `bigint` by width, `text` for any
-string, unconstrained `numeric`, a temporal type at full precision. A to-one
-relationship's projection keys by the to-side column's exact type, and holds
-each to-side column read through it in that column's type. A `JOIN`
+([ADR-0020](decisions/0020-type-identity.md)). A `GROUP BY` key's column (in the target and its hidden table) takes its value family's type: `integer` or `bigint` by width, `text` for any
+string, unconstrained `numeric`, a temporal type at full precision. A `JOIN`
 holds its `GROUP BY` and `ON` columns in each column's type and collation, in
 its target and its hidden tables, with no modifier.
 
@@ -111,11 +104,9 @@ re-renders the stored keys pauses as any key column's does. `integer` against
 `bigint` doesn't pair, because Trellis never casts a join key
 ([ADR-0020](decisions/0020-type-identity.md)).
 
-A calculated field's column, an aggregate's or a `JOIN`'s field column and
-an aggregate ledger's contribution column (typed as the aggregate's
-argument) take the type
-define's inference gives their expression: `SUM` over an `integer` is
-`bigint`, `MIN` over one is `integer`.
+A calculated field's column and an aggregate's or a `JOIN`'s field column
+take the type define's inference gives their expression: `SUM` over an
+`integer` is `bigint`, `AVG` over one is `numeric`.
 
 None of them changes type when the source column does, with one exception:
 an integer or float *width* (`integer` to `bigint`, `real` to `double
@@ -166,9 +157,9 @@ types with a `pg_cast` row to `text`:
   omits the prefix, so `cidr` has one spelling; `inet` has two.
 
 Those two types have two spellings of one value, so they are refused as join
-and primary keys. They are allowed as `GROUP BY` keys because the ledger never
-matches a group by its text: it casts the key text into a typed column through
-the type's input function, which accepts both spellings
+and primary keys. They are allowed as `GROUP BY` keys because an aggregate never
+matches a group by its text: it compares typed group columns, and the type's
+input function accepts both spellings
 (`'192.168.1.5'::inet = '192.168.1.5/32'::inet`).
 
 Each of the following is a per-type consequence of those two rules.
@@ -181,23 +172,16 @@ per value. So:
 - **Key columns need a deterministic collation.** Trellis matches keys by exact
   text, but a nondeterministic collation's `=` (an ICU collation with
   `deterministic = false`) treats strings that differ as equal. The rule covers
-  a source's primary key, each `GROUP BY` key, each relationship join column
-  and each endpoint's primary key, and is refused at define time with an error
+  a source's primary key, each `GROUP BY` key and each `JOIN` `ON` column,
+  and is refused at define time with an error
   naming the column and collation. A deterministic non-default collation such
   as `"C"` is fine. A 1-1 target's key columns take the source key's
   collation; an aggregate target's take the database default, which is always
   deterministic.
 - **`STRPOS` and `REGEXP_COUNT` need a deterministic collation** on the column
-  they read, directly or through `COALESCE`, another field or a relationship
-  path, because Postgres refuses them under a nondeterministic one while
+  they read, directly or through `COALESCE` or another field, because Postgres refuses them under a nondeterministic one while
   Trellis would compute them from the exact text. `CHAR_LENGTH` and
   `OCTET_LENGTH` accept any column.
-- **`MIN`/`MAX` of text** is pushed down to Postgres (which orders by the
-  column's collation), so it is supported wherever a group is recomputed
-  server-side. It is refused around a to-many relationship path in a 1-1
-  target, where only a Rust evaluator is available: that evaluator answers a
-  single-distinct-value group and raises rather than assume byte order for a
-  real tie.
 - **`char(n)`** is treated as `text` but is not on the key allowlist: its
   blank-padding is a hazard, not a volatility one.
 
@@ -239,7 +223,8 @@ overflow raises `22003`, `sum(real)` is `real`, `avg(real)` is
 `double precision`. `COALESCE` resolves a `real`/`numeric` pair to `real`,
 unlike the operators, and is modelled separately. Floats are refused as every
 key role: `-0` and `0` are equal but render as `'-0'` and `'0'`, which would
-split one group into two target rows. `SUM` and `AVG` are recompute-only:
+split one group into two target rows. `SUM` and `AVG` over a float are refused
+at define ([#1119](https://github.com/salesforce-misc/trellis/issues/1119)):
 float addition is not associative, and `NaN`/`Infinity` are absorbing, so
 there is no exact inverse. `extra_float_digits >= 1` is pinned for the
 shortest-round-trip rendering `trellis::float::render` reproduces. Checked in
@@ -259,12 +244,9 @@ role, `GROUP BY` and primary key included (`temporal::is_text_stable`).
 - `timestamp` and `timestamptz` are the two types where bare `to_jsonb`
   disagrees with `::text` (a `T` separator), which is why no engine read uses
   it. `defs_temporal.rs` sweeps the whole key allowlist for render agreement.
-- `MIN`/`MAX` work for the five families above.
 - **`interval`** is refused as a key: `'24 hours' = '1 day'` is true but they
-  render differently, and no renderer fix helps. It has no `MIN`/`MAX`:
-  `max` over `{'1 day', '24 hours', '2 hours'}` returns different answers
-  depending on scan order even inside Postgres, so a byte-exact recompute
-  could never settle it. `SUM(interval)` is supported and recompute-only:
+  render differently, and no renderer fix helps. `SUM`/`AVG(interval)` is
+  refused ([#1119](https://github.com/salesforce-misc/trellis/issues/1119)):
   `interval` addition is exact but partial (`infinity + -infinity` raises, and
   overflow depends on scan order), which a delta cannot represent.
 - Typed literals exist for `DATE`, `TIMESTAMP`, `TIME` and `TIMETZ`, not
@@ -277,9 +259,7 @@ role, `GROUP BY` and primary key included (`temporal::is_text_stable`).
 ## `bytea`
 
 `byteaout` under the pinned `bytea_output = 'hex'` is a bijection (`\x` plus
-lowercase hex), with no second renderer, so `bytea` is a key in every role.
-There is no `min(bytea)`/`max(bytea)` in Postgres despite the btree opclass,
-so `MIN`/`MAX` is refused as an ordinary argument-type mismatch. The typed
+lowercase hex), with no second renderer, so `bytea` is a key in every role. The typed
 literal must be canonical lowercase hex. Checked in
 `trellis/tests/defs_bytea.rs`.
 
@@ -287,10 +267,11 @@ literal must be canonical lowercase hex. Checked in
 
 `ValueType::Boolean`. Two spellings (see [Text rendering](#text-rendering)):
 refused as join and primary key, admitted as a `GROUP BY` key.
-`bool_and`/`bool_or` are supported and recompute-only: the aggregate's current
-one-bit value cannot tell which of two different deletions happened (deleting
-the `false` of `{false, true, true}` makes `bool_and` true; deleting a `true`
-leaves it false). Checked in `trellis/tests/defs_boolean.rs`.
+`bool_and`/`bool_or` are refused at define
+([#1118](https://github.com/salesforce-misc/trellis/issues/1118)): the
+aggregate's current one-bit value cannot tell which of two different deletions
+happened (deleting the `false` of `{false, true, true}` makes `bool_and` true;
+deleting a `true` leaves it false). Checked in `trellis/tests/defs_boolean.rs`.
 
 ## Network addresses
 
@@ -298,10 +279,6 @@ leaves it false). Checked in `trellis/tests/defs_boolean.rs`.
   normalize every input form to lowercase colon-grouped) and are full keys.
 - `inet` has two spellings: refused as join/primary key, admitted as a
   `GROUP BY` key.
-- `MIN`/`MAX` exist for `inet` only, keep its type, and follow `network_cmp`'s
-  ordering (`crate::netaddr::compare`). `min(cidr)` only exists through an
-  implicit upcast to `inet`, which would change the result's type, so it is
-  refused; `macaddr`/`macaddr8` have no `min`/`max`.
 - Typed literals exist for `INET`, `CIDR`, `MACADDR` and `MACADDR8` in
   `network_show`'s always-explicit-prefix spelling. The IPv4-compatible IPv6
   form (`::192.168.1.1`) is rejected rather than risk mis-canonicalizing it.
@@ -311,17 +288,15 @@ Checked in `trellis/tests/defs_netaddr.rs`.
 ## Bit strings
 
 Neither `bit` nor `bit varying` has a second renderer, and both are join and
-primary keys. Neither has `MIN`/`MAX` in Postgres. They differ on DDL: a bare
+primary keys. They differ on DDL: a bare
 `bit` declares `bit(1)`, which truncates, while a bare `bit varying` is
 unconstrained. So a role that must declare a new column or cast from the bare
 type is `bit varying` only: `GROUP BY` key and typed literal (`VARBIT`). Join
 and primary keys reuse the existing column's own concrete type, so both work.
-`bit_and`/`bit_or` accept either type but always return `bit varying`, for
-the same reason, and are recompute-only (deleting different rows from the same
-group yields different results from one starting value). Postgres raises on
-`bit_and` over differently sized `bit varying` values (`cannot AND bit
-strings of different sizes`); the live pipeline gets that native error from
-the server-side recompute. Checked in `trellis/tests/defs_bit.rs`.
+`bit_and`/`bit_or` are refused at define
+([#1118](https://github.com/salesforce-misc/trellis/issues/1118)): deleting
+different rows from the same group yields different results from one starting
+value. Checked in `trellis/tests/defs_bit.rs`.
 
 ## `jsonb`
 
@@ -331,14 +306,9 @@ differently. So `jsonb` is refused as every key role. The typed literal
 `JSONB` must be in canonical spelling (sorted keys, no exponent notation,
 canonical string escapes); it is rejected rather than normalized.
 
-`JSONB_AGG` accepts a `jsonb` argument only. Postgres marks it `STABLE`
-because for some argument types (`timestamptz`, `money`) its row-to-`jsonb`
-conversion reads a session setting; converting an already-`jsonb` value reads
-none. It is recompute-only, folds a `NULL` row in as a JSON `null` element,
-and, with no `ORDER BY` in the grammar, does not guarantee element order
-across recomputes (the set of elements is always correct). `json` has no `=`
-and is never a key. `MIN`/`MAX(jsonb)` is not supported. Checked in
-`trellis/tests/defs_jsonb.rs`.
+`JSONB_AGG` is refused at define
+([#1040](https://github.com/salesforce-misc/trellis/issues/1040)). `json` has
+no `=` and is never a key. Checked in `trellis/tests/defs_jsonb.rs`.
 
 ## Enums
 
@@ -351,14 +321,8 @@ never joinable.
 - `enumout` is a bijection with no second renderer. Enums are join, `GROUP BY`
   and primary keys; the join/primary-key check is a live `to_regtype` probe
   (`catalog::is_enum_type_name`) rather than a static list.
-- `MIN`/`MAX` keep the argument's enum type and follow creation order
-  (`pg_enum.enumsortorder`), not alphabetical order. They are recompute-only
-  and pushed to Postgres, which reads the type's current shape, so
-  `ALTER TYPE … ADD VALUE` needs no special handling.
 - There is no typed-literal syntax: a literal's keyword would be a per-schema
   identifier.
-- The evaluator has no connection, so it cannot order a multi-value tie; a
-  1-1 target's `MIN`/`MAX` over a to-many relationship path is refused.
 
 Postgres refuses a `DROP TYPE` of an enum while a column Trellis created
 uses it, and the retype or drop of the source column that has to come first
@@ -399,28 +363,12 @@ and rebuilds from the source, so the target reads `backfilling` until it
 converges. A re-type from an enum to `text` keeps each label as a value and
 is handled as any other re-type.
 
-## `array_agg` and `string_agg`
-
-`ARRAY_AGG(<text>)` and `STRING_AGG(<text>, '<separator>')` take a `text`,
-`varchar` or `char(n)` argument (a `char(n)` value loses its trailing spaces,
-as in a cast to `text`) and are recompute-only: a delta would need the
-group's whole input, not a summary of it.
-`ARRAY_AGG` produces `text[]` and keeps a `NULL` row as a `NULL` element.
-`STRING_AGG` skips `NULL` rows and is `NULL` when none remain. The separator
-must be a string literal, and neither aggregate is accepted over a to-many
-relationship path. The grammar has no `ORDER BY` inside the call, so, as in
-Postgres without one, element order isn't guaranteed across recomputes: the
-set of elements is always right, so compare the elements as a set, or sort
-them when you read them.
-A later transform that reads a `text[]` target column sees an unrecognized
-type. Checked in `trellis/tests/defs_list_aggregates.rs`.
-
 ## Aggregates that are not supported
 
-`jsonb_agg` over a non-`jsonb` argument, `array_agg` and `string_agg` over a
-non-text argument, and `MIN`/`MAX` of `jsonb`, `uuid`, `bytea`, `cidr`,
-`macaddr` and `bit` are absent (the last five because Postgres has no such
-aggregate).
+An aggregate or `JOIN` transform admits `COUNT(*)`, `COUNT(col)`, and `SUM` or `AVG`
+over `smallint`, `integer`, `bigint` and `numeric(p,s)`. Every other aggregate is
+refused at define, by name, with the issue that tracks it: see
+[transforms — Supported sources and targets](transforms.md#supported-sources-and-targets).
 
 ## Typed literals and casts
 
@@ -449,8 +397,7 @@ general `CAST(<expr> AS <type>)` over a non-literal is refused by name. See
 - `text`/`varchar` comparisons are `IMMUTABLE` in Postgres despite collation
   sensitivity; Trellis's own bar is a deterministic collation (see
   [Collation](#collation)).
-- `jsonb_in`/`jsonb_out` are immutable; `array_agg` and `string_agg` are
-  immutable; only `jsonb_agg` is `STABLE`, for the reason above.
+- `jsonb_in`/`jsonb_out` are immutable.
 - `xml`, `tsvector` and `tsquery` have no useful immutable equality or
   ordering.
 

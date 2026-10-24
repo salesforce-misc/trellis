@@ -61,11 +61,11 @@ module Trellis
   #
   # - Lifecycle: connect, connected?, migrate, config, shutdown.
   # - Every statement form: apply runs one statement of Trellis's grammar
-  #   (TRANSFORM, RELATIONSHIP, PAUSE TRANSFORM, RESUME TRANSFORM, DROP
-  #   TRANSFORM, DROP RELATIONSHIP, ALTER TRANSFORM) and reports what it did
+  #   (TRANSFORM, PAUSE TRANSFORM, RESUME TRANSFORM, DROP TRANSFORM, ALTER
+  #   TRANSFORM) and reports what it did
   #   as an Applied. define is the one guarded convenience: an apply that
   #   refuses anything but a TRANSFORM statement before applying it.
-  # - Reads: status, definitions, relationships, dump_definitions_sql.
+  # - Reads: status, definitions, dump_definitions_sql.
   # - Quarantine: quarantined, quarantine_status, sample_quarantined,
   #   poisoned_since, release_key. Pausing and resuming are statements:
   #   instance.apply("RESUME TRANSFORM order_totals.total").
@@ -275,8 +275,8 @@ module Trellis
     #
     # An Applied of kind :unknown is a success like any other: the statement
     # took effect, and only its outcome is newer than this binding can
-    # describe. Don't retry it; read the result back with #status,
-    # #definitions or #relationships if you need it.
+    # describe. Don't retry it; read the result back with #status or
+    # #definitions if you need it.
     def apply(statement)
       string!("the statement", statement)
       Applied.from_native(handle.apply(statement))
@@ -298,15 +298,9 @@ module Trellis
       handle.definitions.map { |hash| DefinitionSummary.from_native(hash) }
     end
 
-    # Every registered relationship, oldest first, as RelationshipSummary
-    # values.
-    def relationships
-      handle.relationships.map { |hash| RelationshipSummary.from_native(hash) }
-    end
-
     # The SQL that carries this instance's definitions in a schema-only dump
     # of its database: Trellis's migration history, instance marker,
-    # transform and relationship definitions, and the seed rows capture
+    # transform definitions, and the seed rows capture
     # needs. Append it to the output of `pg_dump --schema-only` (with the
     # instance's schema and target schema in scope) and a database loaded
     # from the file has every definition, each at :waiting_to_backfill, as
@@ -473,9 +467,8 @@ module Trellis
     # A target whose job is still :queued or :running gets that job back,
     # whatever mode and timeout_ms this call passed; a finished job stays
     # until the next self_check of its target replaces it. Only a
-    # one-row-per-source-key transform that reads no relationship can be
-    # audited: an aggregate or relationship-reading target raises
-    # ValidationError, and an unknown one NotFoundError. A column that is
+    # one-row-per-source-key transform can be audited: an aggregate target
+    # raises ValidationError, and an unknown one NotFoundError. A column that is
     # paused is left out of the comparison.
     #
     #   job = trellis.self_check("order_totals", timeout_ms: 30_000)

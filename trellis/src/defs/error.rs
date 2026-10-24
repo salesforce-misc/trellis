@@ -62,14 +62,6 @@ pub enum ParseError {
     /// accept (issue #109) — rejected by name so the message can point at
     /// `CAST(...)`/`<type> '...'` instead of reporting an unexpected `:`.
     UnsupportedCastOperator,
-    /// A `DROP RELATIONSHIP` naming a relationship without the from-table that
-    /// scopes it (issue #227/#228, decision 1) — e.g.
-    /// `DROP RELATIONSHIP author` instead of `DROP RELATIONSHIP posts.author`.
-    /// `DROP` is the only verb that can reach this: `PAUSE`/`RESUME` are
-    /// transform-only, so they never parse a relationship address at all.
-    /// A relationship name is unique only per from-table, so a bare one
-    /// doesn't identify anything to act on.
-    UnscopedRelationshipAddress { address: String },
     /// A `PAUSE`/`RESUME`/`DROP` address whose shape doesn't fit the statement
     /// it was written in (issue #227/#228): too many `.`-separated parts, or a
     /// `<transform>.<column>` address under `DROP TRANSFORM`, which is
@@ -158,8 +150,7 @@ impl fmt::Display for ParseError {
             ParseError::TooManyColumnNameParts { reference } => write!(
                 f,
                 "'{reference}' is not a valid column reference: a column is written \
-                 <column>, <table>.<column> or <schema>.<table>.<column> (the FROM table's), \
-                 or <relationship>.<column>"
+                 <column>, <table>.<column> or <schema>.<table>.<column> (the FROM table's)"
             ),
             ParseError::TooManyQualifiedNameParts { reference } => write!(
                 f,
@@ -189,12 +180,6 @@ impl fmt::Display for ParseError {
                 f,
                 "the '::' cast operator is not supported: write a typed literal as \
                  <type> '<literal>' (e.g. DATE '2024-01-01') or CAST('<literal>' AS <type>)"
-            ),
-            ParseError::UnscopedRelationshipAddress { address } => write!(
-                f,
-                "'{address}' is not a valid relationship address: a relationship name is unique \
-                 only within its from-table, so it must be scoped as \
-                 [<schema>.]<from_table>.<relationship_name> (e.g. posts.author)"
             ),
             ParseError::MalformedDefinitionAddress {
                 statement,

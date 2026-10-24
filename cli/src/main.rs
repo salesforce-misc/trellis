@@ -21,10 +21,10 @@ const USAGE: &str = "\
 Usage: trellis <COMMAND> [OPTIONS]
 
 Commands:
-  apply <GRAMMAR>     Run one Trellis statement: TRANSFORM, RELATIONSHIP,
-                       PAUSE, RESUME or DROP. (`define` is a deprecated alias.)
+  apply <GRAMMAR>     Run one Trellis statement: TRANSFORM, PAUSE, RESUME,
+                       DROP or ALTER. (`define` is a deprecated alias.)
   run                 Run the live CDC/apply pipeline until interrupted.
-  status              Print registered definitions/relationships and exit.
+  status              Print registered definitions and exit.
   release <TRANSFORM> <SOURCE_TABLE> <KEY>
                       Release one key a transform holds in quarantine.
 

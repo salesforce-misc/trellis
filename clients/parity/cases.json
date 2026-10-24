@@ -71,34 +71,9 @@
       "last_error": "string",
       "next_attempt_at": "time"
     },
-    "Relationship": {
-      "id": "integer",
-      "name": "string",
-      "from_schema": "string",
-      "from_table": "string",
-      "from_col": "string",
-      "to_schema": "string",
-      "to_table": "string",
-      "to_col": "string",
-      "cardinality": {"word_in": "cardinality"},
-      "warnings": {"list_of": "string"}
-    },
-    "RelationshipSummary": {
-      "id": "integer",
-      "name": "string",
-      "from_schema": "string",
-      "from_table": "string",
-      "from_col": "string",
-      "to_schema": "string",
-      "to_table": "string",
-      "to_col": "string",
-      "cardinality": {"word_in": "cardinality"},
-      "created_at": "time"
-    },
     "Applied": {
       "kind": {"word_in": "applied_kind"},
       "target_table": {"nullable": "string"},
-      "relationship": {"nullable": {"record": "Relationship"}},
       "columns": {"nullable": {"list_of": "string"}},
       "added": {"nullable": {"list_of": "string"}},
       "dropped": {"nullable": {"list_of": "string"}},
@@ -167,7 +142,6 @@
       "about": "Source tables, and a role that can log in but not create a schema (for the internal error below). parity_scratch shares parity_items with parity_prices: its ALTER and RESUME rebuild it alone, visible in its status, so they don't rewrite the other target under a later step (#625). parity_doubled and parity_gizmo_prices have sources of their own because their steps poison keys.",
       "op": "sql",
       "args": [
-        "create table parity_owners (id integer primary key, name text)",
         "create table parity_items (id integer primary key, owner_id integer, price integer)",
         "insert into parity_items (id, owner_id, price) values (1, 1, 10), (2, 1, 20), (3, 2, 30), (4, 2, 40), (5, 3, 50)",
         "create table parity_ledger (id integer primary key, n integer)",
@@ -183,7 +157,6 @@
     {"op": "config", "expect": {"record": "Config", "fields": {"schema": {"eq": "trellis"}, "target_schema": {"eq": "public"}}}},
 
     {"about": "Every list read on an empty catalog is an empty list, not nil or an error.", "op": "definitions", "expect": {"list": []}},
-    {"op": "relationships", "expect": {"list": []}},
     {"op": "quarantined", "expect": {"list": []}},
     {"op": "poisoned_since", "args": [{"$time_micros": 0}], "expect": {"list": []}},
     {"about": "An unknown target's status is nil (Rust's None), not an error.", "op": "status", "args": ["parity_prices"], "expect": null},
@@ -198,32 +171,10 @@
     {"about": "A schema-qualified name resolves as exactly that table, so an unknown one is not_found too.", "op": "request_backfill", "args": ["public.parity_nowhere"], "expect": {"error": "not_found"}},
     {"op": "release_key", "args": ["parity_nowhere", "parity_items", "1"], "expect": {"error": "not_found"}},
     {"op": "apply", "args": ["TRANSFORM parity_oops"], "expect": {"error": "parse"}},
+    {"about": "RELATIONSHIP is no statement of the grammar.", "op": "apply", "args": ["RELATIONSHIP parity_owner FROM parity_items.owner_id TO parity_owners.id"], "expect": {"error": "parse"}},
+    {"op": "apply", "args": ["DROP RELATIONSHIP parity_items.parity_owner"], "expect": {"error": "parse"}},
     {"about": "define refuses any other statement form before applying it.", "op": "define", "args": ["DROP TRANSFORM parity_prices"], "expect": {"error": "validation"}},
     {"about": "A limit the host itself refuses.", "op": "sample_quarantined", "args": ["parity_prices.price"], "opts": {"limit": 0}, "expect": {"error": "validation"}},
-
-    {
-      "about": "No index on parity_items.owner_id comes back as a warning; parity_owners.id is a primary key, so the cardinality is one.",
-      "op": "apply",
-      "args": ["RELATIONSHIP parity_owner FROM parity_items.owner_id TO parity_owners.id"],
-      "covers": {"statement_kind": "define_relationship"},
-      "expect": {"record": "Applied", "fields": {
-        "kind": {"word": "relationship_defined"},
-        "target_table": null,
-        "relationship": {"record": "Relationship", "fields": {
-          "name": {"eq": "parity_owner"},
-          "from_schema": {"eq": "public"},
-          "from_table": {"eq": "parity_items"},
-          "from_col": {"eq": "owner_id"},
-          "to_schema": {"eq": "public"},
-          "to_table": {"eq": "parity_owners"},
-          "to_col": {"eq": "id"},
-          "cardinality": {"word": "one"},
-          "warnings": {"list": ["string"]}
-        }},
-        "columns": null, "added": null, "dropped": null, "altered": null
-      }}
-    },
-    {"op": "relationships", "expect": {"list": [{"record": "RelationshipSummary", "fields": {"name": {"eq": "parity_owner"}, "cardinality": {"word": "one"}}}]}},
 
     {
       "about": "define returns the fully qualified target table, not yet live.",
@@ -239,7 +190,7 @@
       "expect": {"record": "Applied", "fields": {
         "kind": {"word": "transform_defined"},
         "target_table": {"eq": "public.parity_scratch"},
-        "relationship": null, "columns": null, "added": null, "dropped": null, "altered": null
+        "columns": null, "added": null, "dropped": null, "altered": null
       }}
     },
     {"op": "apply", "args": ["TRANSFORM parity_doubled FROM parity_ledger SELECT n + n AS doubled"], "expect": {"record": "Applied", "fields": {"kind": {"word": "transform_defined"}}}},
@@ -253,32 +204,6 @@
     {"about": "The quarantine reads take the qualified name too; it names the whole transform, reported by its bare name.", "op": "quarantine_status", "args": ["public.parity_prices"], "expect": {"record": "QuarantineEntry", "fields": {"target": {"eq": "parity_prices"}, "state": {"word_in": "transform_status"}, "paused_at": null, "last_error": null}}},
     {"op": "quarantine_status", "args": ["no_such_schema.parity_prices"], "expect": {"error": "not_found"}},
     {"about": "An empty first page has no cursor.", "op": "sample_quarantined", "args": ["parity_prices.price"], "expect": {"record": "SamplePage", "fields": {"samples": {"list": []}, "next_cursor": null}}},
-
-    {
-      "op": "apply",
-      "args": ["DROP RELATIONSHIP parity_items.parity_owner"],
-      "covers": {"statement_kind": "drop_relationship"},
-      "expect": {"record": "Applied", "fields": {"kind": {"word": "dropped"}, "target_table": null, "relationship": null, "columns": null, "added": null, "dropped": null, "altered": null}}
-    },
-    {"op": "relationships", "expect": {"list": []}},
-
-    {
-      "about": "An unindexed join column (#973): a transform reads a relationship whose from_col has no index, and status names it with the fix. Nothing converges here (status and the index are catalog reads), so these are plain expects. The block drops what it defined, so no later phase builds it.",
-      "op": "sql",
-      "args": [
-        "create table parity_accounts (id integer primary key, name text)",
-        "create table parity_invoices (id integer primary key, account_id integer)"
-      ]
-    },
-    {"op": "apply", "args": ["RELATIONSHIP parity_account FROM parity_invoices.account_id TO parity_accounts.id"], "expect": {"record": "Applied", "fields": {"kind": {"word": "relationship_defined"}}}},
-    {"op": "apply", "args": ["TRANSFORM parity_invoice_view FROM parity_invoices SELECT parity_account.name AS account_name"], "expect": {"record": "Applied", "fields": {"kind": {"word": "transform_defined"}}}},
-    {"op": "status", "args": ["parity_invoice_view"], "expect": {"record": "Status", "fields": {"unindexed_joins": {"list": [{"record": "UnindexedJoin", "fields": {"relationship": {"eq": "parity_account"}, "table": {"eq": "public.parity_invoices"}, "column": {"eq": "account_id"}, "fix": {"eq": "create an index on public.parity_invoices (account_id)"}}}]}}}},
-    {"about": "A target that reads a relationship can't be compared, so the job isn't started for it. (status is where its unindexed join columns are read; see known-correctness-gaps.md.)", "op": "self_check", "args": ["parity_invoice_view"], "opts": {"timeout_ms": 0}, "expect": {"error": "validation"}},
-    {"about": "Creating the index clears the entry on the next call, with no restart.", "op": "sql", "args": ["create index on parity_invoices (account_id)"]},
-    {"op": "status", "args": ["parity_invoice_view"], "expect": {"record": "Status", "fields": {"unindexed_joins": {"list": []}}}},
-    {"op": "apply", "args": ["PAUSE TRANSFORM parity_invoice_view"], "expect": {"record": "Applied", "fields": {"kind": {"word": "paused"}}}},
-    {"op": "apply", "args": ["DROP TRANSFORM parity_invoice_view"], "expect": {"record": "Applied", "fields": {"kind": {"word": "dropped"}}}},
-    {"op": "apply", "args": ["DROP RELATIONSHIP parity_invoices.parity_account"], "expect": {"record": "Applied", "fields": {"kind": {"word": "dropped"}}}},
 
     {
       "about": "A JOIN's source index (#1167): define is refused without an index leading with each side's ON columns, status reports an index dropped later, and WITHOUT SOURCE INDEX opts out. Nothing converges (all catalog reads), so these are plain expects.",
@@ -336,7 +261,7 @@
       "expect": {"record": "Applied", "fields": {
         "kind": {"word": "altered"},
         "target_table": {"eq": "public.parity_scratch"},
-        "relationship": null, "columns": null,
+        "columns": null,
         "added": {"list": [{"eq": "doubled"}]}, "dropped": {"list": []}, "altered": {"list": []}
       }}
     },
@@ -344,21 +269,21 @@
       "op": "apply",
       "args": ["PAUSE TRANSFORM parity_scratch"],
       "covers": {"statement_kind": "pause_transform"},
-      "expect": {"record": "Applied", "fields": {"kind": {"word": "paused"}, "target_table": null, "relationship": null, "columns": null, "added": null, "dropped": null, "altered": null}}
+      "expect": {"record": "Applied", "fields": {"kind": {"word": "paused"}, "target_table": null, "columns": null, "added": null, "dropped": null, "altered": null}}
     },
     {
       "about": "A whole-transform resume has no columns to report: an empty list, not nil.",
       "op": "apply",
       "args": ["RESUME TRANSFORM parity_scratch"],
       "covers": {"statement_kind": "resume_transform"},
-      "expect": {"record": "Applied", "fields": {"kind": {"word": "resumed"}, "target_table": null, "relationship": null, "columns": {"list": []}, "added": null, "dropped": null, "altered": null}}
+      "expect": {"record": "Applied", "fields": {"kind": {"word": "resumed"}, "target_table": null, "columns": {"list": []}, "added": null, "dropped": null, "altered": null}}
     },
     {"op": "apply", "args": ["PAUSE TRANSFORM parity_scratch"], "expect": {"record": "Applied", "fields": {"kind": {"word": "paused"}}}},
     {
       "op": "apply",
       "args": ["DROP TRANSFORM parity_scratch"],
       "covers": {"statement_kind": "drop_transform"},
-      "expect": {"record": "Applied", "fields": {"kind": {"word": "dropped"}, "target_table": null, "relationship": null, "columns": null, "added": null, "dropped": null, "altered": null}}
+      "expect": {"record": "Applied", "fields": {"kind": {"word": "dropped"}, "target_table": null, "columns": null, "added": null, "dropped": null, "altered": null}}
     },
     {"op": "status", "args": ["parity_scratch"], "expect": null},
 
@@ -505,8 +430,8 @@
     {
       "about": "An outcome newer than the binding is still a success, with no detail.",
       "type": "Applied",
-      "native": {"kind": {"$word": "unknown"}, "target_table": null, "relationship": null, "columns": null, "added": null, "dropped": null, "altered": null},
-      "expect": {"record": "Applied", "fields": {"kind": {"word": "unknown"}, "target_table": null, "relationship": null, "columns": null, "added": null, "dropped": null, "altered": null}}
+      "native": {"kind": {"$word": "unknown"}, "target_table": null, "columns": null, "added": null, "dropped": null, "altered": null},
+      "expect": {"record": "Applied", "fields": {"kind": {"word": "unknown"}, "target_table": null, "columns": null, "added": null, "dropped": null, "altered": null}}
     },
     {
       "about": "An error code newer than the binding falls back to unknown rather than crashing.",

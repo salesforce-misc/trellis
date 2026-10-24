@@ -50,14 +50,9 @@ mod tests {
     #[test]
     fn every_other_form_is_refused_as_validation_naming_its_form() {
         for (text, keyword) in [
-            (
-                "RELATIONSHIP owner FROM widgets.owner_id TO users.id",
-                "RELATIONSHIP",
-            ),
             ("PAUSE TRANSFORM widget_prices", "PAUSE TRANSFORM"),
             ("RESUME TRANSFORM widget_prices", "RESUME TRANSFORM"),
             ("  drop TRANSFORM widget_prices", "DROP TRANSFORM"),
-            ("DROP RELATIONSHIP widgets.owner", "DROP RELATIONSHIP"),
             (
                 "ALTER TRANSFORM widget_prices DROP doubled",
                 "ALTER TRANSFORM",

@@ -53,12 +53,12 @@ The surface mirrors the Rust crate's `BlockingTrellis` (issues #146, #147,
 
 - `connect/1`, `migrate/1`, `config/1`, `shutdown/1`: the handle's lifecycle.
 - `apply/2`: any statement of Trellis's grammar (`TRANSFORM`,
-  `RELATIONSHIP`, `PAUSE TRANSFORM`, `RESUME TRANSFORM`, `DROP TRANSFORM`,
-  `DROP RELATIONSHIP`, `ALTER TRANSFORM`), returning what it did as a tagged
+  `PAUSE TRANSFORM`, `RESUME TRANSFORM`, `DROP TRANSFORM`,
+  `ALTER TRANSFORM`), returning what it did as a tagged
   value (`{:transform_defined, target_table}`, `:paused`,
   `{:resumed, addresses}`, ...). `define/2` is an `apply/2` that refuses
   anything but a `TRANSFORM`.
-- `status/2`, `definitions/1`, `relationships/1`: the catalog reads.
+- `status/2`, `definitions/1`: the catalog reads.
 - `quarantined/1`, `quarantine_status/2`, `sample_quarantined/3`,
   `poisoned_since/2`: the quarantine reads. Resuming is a statement.
   `release_key/4` releases one key a transform holds, once its cause is

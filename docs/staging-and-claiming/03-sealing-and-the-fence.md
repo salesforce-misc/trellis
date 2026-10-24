@@ -260,8 +260,24 @@ already-taken `seg_seq`.
 The client's maintenance loop seals the active segment on its tick (300 ms by
 default, `maintenance_interval`) through `seal_if_active_nonempty`. The
 busy-loop guard is structural: it seals only a *non-empty* active segment — **or**
-an empty one whose predecessor still strands a phase-gap straggler (below) — at
-most one seal per tick.
+an empty one whose predecessor's slot still needs a successor read — at most one
+seal per tick. An empty active segment seals in two cases, both decided by asking
+the predecessor's slot:
+
+- **The idle seal.** The predecessor is `drained` and its slot still holds any row
+  (`exists (select 1 from seg_N)`, which stops at the first row). A drained batch
+  retires only once its successor has sealed and drained
+  ([06](06-cleanup-and-reclaim.md#retiring-a-batch)), so without this seal the
+  last batch of a burst stays resident for as long as the ring is idle, and every
+  check that asks the slot reads it whole on every tick. Sealing the empty active
+  segment lets it drain and the old batch retire, freeing its slot.
+- **The straggler seal.** The predecessor isn't drained yet and its slot holds a
+  phase-gap straggler (below).
+
+Both are self-limiting: after the seal, the new active segment's predecessor is the
+empty segment just sealed, whose slot holds a row only if a write landed in it. A
+quiet ring seals one empty segment when it goes idle and then stops. The cost is
+that one seal, with its xid bump, each time the ring goes idle.
 
 ### The phase-gap straggler
 
@@ -275,11 +291,12 @@ itself gets sealed.
 
 If the ring goes quiet right after the straggler lands, the plain "non-empty"
 guard never fires, `slot_k` reaches `drained` with the straggler still in it, and
-nothing revisits the slot. The second seal condition above covers it: an empty
-active segment still seals when its predecessor holds a row not visible in that
-predecessor's own fence. This is self-limiting — it fires only while the current
-predecessor genuinely has such a row, so once folded in, the next predecessor no
-longer qualifies.
+nothing revisits the slot. The empty-segment seals above cover it. While the
+predecessor isn't drained, the straggler seal fires when its slot holds a row not
+visible in its own fence. Once it is drained, the straggler is a row in its slot,
+so the idle seal fires; its successor read folds the straggler exactly as the
+straggler seal's does. Either way, once the straggler is folded in, the next
+predecessor no longer qualifies.
 [07](07-convergence-and-await.md)'s condition 3 is the matching half: a
 `'drained'` slot owner does not, on its own, stop gating a row that was never
 visible in its own fence.

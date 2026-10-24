@@ -2545,7 +2545,7 @@ mod tests {
     /// The tables [`seed_waiting_aggregate`]'s definition builds into: its
     /// target, ledger and group deltas.
     async fn create_rollup_target(pool: &Pool) {
-        let text = "TRANSFORM rollup FROM orders GROUP BY g SELECT g AS g, sum(a) AS total";
+        let text = "TRANSFORM rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT g AS g, sum(a) AS total";
         let columns: std::collections::HashMap<String, super::super::ast::ValueType> =
             ["id", "g", "a"]
                 .into_iter()
@@ -2569,7 +2569,7 @@ mod tests {
         raw: &tokio_postgres::Client,
         with_target: bool,
     ) -> i64 {
-        let text = "TRANSFORM rollup FROM orders GROUP BY g SELECT g AS g, sum(a) AS total";
+        let text = "TRANSFORM rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT g AS g, sum(a) AS total";
         raw.batch_execute(
             "create table public.orders (id bigint primary key, g numeric, a numeric); \
              insert into public.orders values (1, 1, 10), (2, 1, 20), (3, 2, 5); \
@@ -2610,6 +2610,7 @@ mod tests {
     /// rerun by another worker, and finishing it moves the definition to
     /// `catching_up` with its go-live catch-up parked.
     #[tokio::test]
+    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
     async fn a_direct_build_job_held_by_a_dead_worker_is_rerun_by_another() {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
@@ -2746,6 +2747,7 @@ mod tests {
     /// rather than handing it back again. The job stays as the record of the
     /// failure, and no marker is parked: the resume parks one and rebuilds.
     #[tokio::test]
+    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
     async fn a_direct_build_that_keeps_failing_pauses_its_definition() {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
@@ -2893,6 +2895,7 @@ mod tests {
     /// Issue #434, for a direct-build job: a job held across a pause and a
     /// resume writes nothing when it runs, and is discarded.
     #[tokio::test]
+    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
     async fn a_direct_build_job_held_across_a_resume_writes_nothing() {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;

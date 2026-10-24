@@ -1,7 +1,7 @@
 # Embedding Trellis
 
 How to run Trellis in-process inside a host app — a Rails or Phoenix
-application that wants its `TRANSFORM`/`RELATIONSHIP` declarations to live
+application that wants its `TRANSFORM` declarations to live
 alongside its own migrations, rather than deploying Trellis as a separate
 service. The design commitments behind this shape are recorded in
 [ADR-0010](decisions/0010-embeddable-clients.md); this doc is the operator/
@@ -196,11 +196,7 @@ on the source, reads its existing rows, builds the target, catches it up with
 whatever changed while it was building, and flips the transform to `live`
 ([data-flow — Capturing a table's existing rows](data-flow.md#capturing-a-tables-existing-rows)).
 So a web process needs no ownership of the source tables; only the worker
-does. It does need to create tables: each target table in the target
-schema, and, for a to-one relationship, the relationship's projection in the
-instance schema, where Trellis keeps its own state. A transform that reads
-a parent column the projection doesn't carry yet adds it there, so the process
-that applies it must own the projection too
+does. It does need to create each target table in the target schema
 ([data-flow — What it asks of a deployment](data-flow.md#what-it-asks-of-a-deployment)).
 The role that applies a transform owns the target table it creates, along
 with the tables Trellis keeps beside it, and Trellis grants nothing on them.
@@ -420,7 +416,7 @@ short of it, so every watermark token taken since waits on it (#817,
 [observability — Transform status lifecycle](observability.md#transform-status-lifecycle)).
 The drain records each as a *drain holdup*, which `status(target)` reports as
 `drain_failure` on every definition that isn't paused or quarantined and reads
-a table on the page, directly or through a relationship: the segment, the
+a table on the page: the segment, the
 tables, the latest error and its SQLSTATE, when it started and last failed, and
 how many passes have. The definition's status stays what it was (`live`, say),
 so check the field, not the word. `self_check` reports every open holdup with
@@ -477,8 +473,7 @@ definition it holds back.
 relationship the definition reads that has no usable index: a relationship's
 `from_col`, and a to-many relationship's `to_col`. An entry names the
 relationship, the table (`schema.table`) and the column; the fix is an index on
-that table and column, which Trellis doesn't create on your tables
-([recommendations — Index relationship join columns](recommendations.md#index-relationship-join-columns)).
+that table and column, which Trellis doesn't create on your tables.
 The list is empty for a definition whose join columns are all indexed, and it
 never changes the definition's status, so a health check that wants it reads
 the field:
@@ -493,12 +488,9 @@ for summary in trellis.definitions().await? {
 }
 ```
 
-`self_check` refuses a target that reads a relationship
-([observability](observability.md#transform-status-lifecycle)), so the warning
-is read from `status`. In `trellis-embed`, `PlainDefinitionStatus` carries it
-as `unindexed_joins`, each entry with `relationship`, `table`, `column` and the
-`fix` sentence. The CLI's
-`trellis status` prints each entry as a warning line under its definition.
+In `trellis-embed`, `PlainDefinitionStatus` carries it as `unindexed_joins`,
+each entry with `relationship`, `table`, `column` and the `fix` sentence. The
+CLI's `trellis status` prints each entry as a warning line under its definition.
 
 ### Source indexes
 
@@ -730,7 +722,7 @@ a dump appends the rows after the `pg_dump` output, the way Rails and Ecto
 append the `schema_migrations` rows.
 `dump_definitions_sql` (Rust `Trellis` and `BlockingTrellis`, Ruby
 `Trellis::Instance#dump_definitions_sql`) returns them as SQL: Trellis's
-migration history, the instance marker, the transform and relationship
+migration history, the instance marker, the transform
 definitions and the seed rows capture needs. Runtime state (the ledger, ring,
 build chunks, quarantine, claims and statuses) is never in it, because it
 describes source and target rows a schema-only dump doesn't carry. Loading
@@ -802,11 +794,7 @@ Heavy work isn't done inside a call. `apply` registers a definition and
 returns, and the build runs in the background, so a caller that needs the
 result polls `status` ([below](#poll-to-live-dont-wait)). `self_check` is the
 same: it starts a background job and returns, and the caller polls the job
-([below](#self_check-is-a-background-job)). One statement
-still reads table rows inside the call: a to-one relationship's declaration
-(or a transform reading through one) seeds the relationship's projection from
-its to-side table, and on a large enough table it runs out of time and
-registers nothing.
+([below](#self_check-is-a-background-job)).
 
 An `await_converged` timeout longer than the deadline is cut to what is left
 of it. To wait longer, call again: each call is one bounded wait.
@@ -851,7 +839,7 @@ Elixir atoms, Ruby symbols), or nothing if no transform writes that table:
 |---|---|---|
 | `waiting_to_backfill` | Defined; the source's existing rows haven't been read yet. | Keep polling. |
 | `backfilling` | The target is being built, or rebuilt after a repair. | Keep polling. |
-| `catching_up` | Built and maintained, but may still be missing changes made while it was building. A plain aggregate (grouped by plain columns of a table rather than of another transform's target, with no relationship and no `MIN`/`MAX` of text) never reports it: its build goes from `backfilling` straight to `live`. | Keep polling. |
+| `catching_up` | Built and maintained, but may still be missing changes made while it was building. A plain aggregate (grouped by plain columns of a table rather than of another transform's target) never reports it: its build goes from `backfilling` straight to `live`. | Keep polling. |
 | `live` | The steady state. | Done. |
 | `quarantined` | Too many source rows failed to apply, so the fuse froze it. | Stop and report it. |
 | `paused` | Frozen by a `PAUSE TRANSFORM`, or by Trellis because it can't keep the target correct: capture broke, its build kept failing, or the drain hit a failure every key reproduces ([all the causes](observability.md#transform-status-lifecycle)). | Stop and report it. |
@@ -1081,8 +1069,8 @@ polling) and its report a `Trellis::SelfCheckReport`; in Elixir a
 
 A transform reads one source table (which needs a primary key) or another
 transform's target, is 1-1 or a `GROUP BY` aggregate, and computes its fields
-from the source row, from other fields, and from related tables through a
-declared `RELATIONSHIP`. What the grammar accepts, what `define` refuses, and
+from the source row and from other fields; a `JOIN` transform aggregates the
+join of two tables. What the grammar accepts, what `define` refuses, and
 which column types play which role are in
 [transforms](transforms.md) and the [type-support matrix](type-support.md).
 Whatever the shape, what you can rely on is the status lifecycle and the `live`

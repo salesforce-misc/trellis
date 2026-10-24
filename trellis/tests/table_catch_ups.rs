@@ -470,6 +470,7 @@ async fn request_backfill_names_a_source_outside_the_search_path() {
 /// catch-up flavour ([`a_requested_backfill_sweeps_a_stale_one_to_one_row`]'s
 /// held-out source).
 #[tokio::test]
+#[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
 async fn a_requested_backfill_sweeps_a_stale_aggregate_group() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -480,7 +481,7 @@ async fn a_requested_backfill_sweeps_a_stale_aggregate_group() {
         .expect("hold sales out of the Re-derive build");
     install_definition(
         &db.pool,
-        "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT sum(amount) AS total",
+        "TRANSFORM sku_totals FROM sales GROUP BY sku WITHOUT SOURCE INDEX SELECT sum(amount) AS total",
         &sales_types(),
         "public",
     )
@@ -511,7 +512,8 @@ async fn a_requested_backfill_sweeps_a_stale_aggregate_group() {
 /// The Re-derive flavour of the aggregate case (#625 F7): `request_backfill`
 /// on a `live` aggregate returns with the status already `backfilling`, so a
 /// caller that polls for `live` and then takes its token waits out the
-/// rebuild. The plan re-derives `a` and the sweep drops `b`.
+/// rebuild. A group-basis aggregate's rebuild is its sweep job alone, which
+/// recomputes `a` and drops `b`.
 #[tokio::test]
 async fn a_requested_backfill_rebuilds_a_stale_aggregate_group() {
     let cluster = TestCluster::start();
@@ -520,7 +522,7 @@ async fn a_requested_backfill_rebuilds_a_stale_aggregate_group() {
     seed_sales(&client).await;
     install_definition(
         &db.pool,
-        "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT sum(amount) AS total",
+        "TRANSFORM sku_totals FROM sales GROUP BY sku WITHOUT SOURCE INDEX SELECT sum(amount) AS total",
         &sales_types(),
         "public",
     )
@@ -539,7 +541,7 @@ async fn a_requested_backfill_rebuilds_a_stale_aggregate_group() {
         .expect("request a re-backfill");
     assert_eq!(status_of(&client, "public.sku_totals").await, "backfilling");
     let (plans, sweeps, build_seg, _) = rebuild_rows(&client, "public.sku_totals").await;
-    assert_eq!((plans, sweeps), (1, 1), "one plan and one sweep, a rebuild");
+    assert_eq!((plans, sweeps), (0, 1), "one sweep, a group-basis rebuild");
     assert_eq!(build_seg, Some(active_seq(&client).await));
     assert_eq!(
         sku_totals_rows(&client).await,
@@ -561,13 +563,10 @@ async fn a_requested_backfill_rebuilds_a_stale_aggregate_group() {
 }
 
 /// A request while a rebuild runs rebuilds again (#625 F7): the first
-/// plan's chunks may have read rows before whatever the second request
-/// repairs, so the call enqueues a plan and a sweep of its own, and the
-/// definition goes `live` when both rebuilds are done.
-///
-/// Here the first rebuild's plan and chunks have run when the rows are
-/// deleted, so their entries' bases postdate the first sweep's start and it
-/// leaves them: only the second request's sweep drops group `b`.
+/// rebuild may have read rows before whatever the second request repairs,
+/// so the call enqueues a rebuild of its own (for a group-basis aggregate,
+/// a sweep job alone), and the definition goes `live` when both rebuilds
+/// are done.
 #[tokio::test]
 async fn a_requested_backfill_during_a_rebuild_enqueues_another() {
     let cluster = TestCluster::start();
@@ -576,7 +575,7 @@ async fn a_requested_backfill_during_a_rebuild_enqueues_another() {
     seed_sales(&client).await;
     install_definition(
         &db.pool,
-        "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT sum(amount) AS total",
+        "TRANSFORM sku_totals FROM sales GROUP BY sku WITHOUT SOURCE INDEX SELECT sum(amount) AS total",
         &sales_types(),
         "public",
     )
@@ -605,8 +604,8 @@ async fn a_requested_backfill_during_a_rebuild_enqueues_another() {
     let (plans, sweeps, ..) = rebuild_rows(&client, "public.sku_totals").await;
     assert_eq!(
         (plans, sweeps),
-        (1, 2),
-        "the second request enqueued a plan and a sweep of its own"
+        (0, 2),
+        "the second request enqueued a sweep of its own"
     );
 
     markers::settle_builds(&db.pool).await;

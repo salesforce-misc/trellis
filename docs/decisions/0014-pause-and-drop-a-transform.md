@@ -6,10 +6,9 @@ deciders: Michael Ries
 
 # Pausing and Dropping a Definition
 
-Defining derived state is only half a lifecycle. A definition — a transform or a
-relationship — can also need to stop: frozen while an operator investigates or stages
-a schema change, or removed entirely. This ADR settles that other half. Drop applies to
-any definition uniformly; pause applies to transforms, the only definitions with a status.
+Defining derived state is only half a lifecycle. A transform can also need to stop:
+frozen while an operator investigates or stages a schema change, or removed entirely.
+This ADR settles that other half.
 
 ## The lifecycle
 
@@ -50,8 +49,7 @@ definition and its data. Every freeze stays until an operator acts.
 
 Drop acts only on a frozen definition (`paused` or `quarantined`). There is no direct
 live-to-gone edge: quiescing first is a precondition, so the removal never has to reason
-about a fold still dispatching to the target. Only a transform can be paused; a
-relationship has no status to freeze, and is dropped outright once nothing reads it.
+about a fold still dispatching to the target.
 
 ## Decisions
 
@@ -123,8 +121,8 @@ Readers keep seeing its rows throughout, and the reconciliation has two halves, 
 together in one transaction and read on one snapshot:
 
 - Every target row that no current source row backs is deleted. That covers a 1-1 row
-  whose source row was deleted, and an aggregate group whose rows were all deleted or,
-  through a relationship-path `GROUP BY` key, all moved to other groups.
+  whose source row was deleted, and an aggregate group whose rows were all deleted or
+  moved to other groups.
 - Every current source row is re-derived, by whichever build the definition
   qualifies for. A definition the Re-derive build serves restarts it over the
   existing ledger entries, and its sweep re-derives each live entry no chunk
@@ -145,9 +143,8 @@ seam like any other target write, so a live definition reading this target drops
 
 Before any of that, resume re-validates the definition against the live schema, with
 the same checks define runs: its fields over the source's
-live columns, the source key's type and collations, each relationship it reads
-through (both join columns still on the allowlist and still the same type, modifier
-and collation), row-level security and subscriptions, and, for a 1-1 definition, a
+live columns, the source key's type and collations, a `JOIN`'s `ON` columns (still on
+the allowlist, with matching types and collations), row-level security and subscriptions, and, for a 1-1 definition, a
 source key that is still the one its target is keyed by. While define would refuse
 it, the resume refuses with define's error, names the column and what to change, and
 changes nothing: the definition stays paused. Every definition also needs its ledger
@@ -172,9 +169,8 @@ accepts a change to it without a pause. And the resume brings every column Trell
 created for the definition with a type that comes from the source to the type define
 would give it now. Some are copies of one source column: a 1-1 target's key and
 passthrough columns, an aggregate's `GROUP BY` columns in its target, ledger and
-group-delta table, a `JOIN`'s `GROUP BY` and `ON` columns in its target and hidden
-tables, and a to-one relationship projection's key and its column for each
-to-side column read through the relationship. Others are typed by an expression, and
+group-delta table, and a `JOIN`'s `GROUP BY` and `ON` columns in its target and hidden
+tables. Others are typed by an expression, and
 take the type define's inference gives it over the live schema: a 1-1 target's
 calculated fields, an aggregate's or a `JOIN`'s field columns (`SUM(qty)` is `bigint` over an
 `integer` `qty` and `numeric` over a `bigint` one), and its ledger's contribution
@@ -238,8 +234,8 @@ request are the two states a definition passes through, each move is one transac
 and a crash leaves one of them for the next pass to go on from. A chained re-type that
 fails ends the request like any other: the definition stays paused with the error and no
 cause, its target keeps its types, and nothing below it is paused. A chained definition the
-re-type leaves refused, failing its own re-validation (a relationship's join columns no
-longer match), keeps its own error and records no cause. So does one already paused for
+re-type leaves refused, failing its own re-validation (a `SUM` over a column re-typed
+to a float), keeps its own error and records no cause. So does one already paused for
 another reason, by the operator or by quarantine, and the pass leaves it alone.
 
 A resume that re-types a column of a definition's target also re-validates, in the
@@ -258,8 +254,8 @@ is never deadlocked by the re-type, and a wait for a row holds nothing on the ta
 wait that reaches the re-type's lock timeout is retried by the next pass.
 
 A resume never starts a rebuild ahead of its upstream. A definition's upstreams are the
-definitions in the instance whose targets it reads: its source, a `JOIN`'s joined table, or
-a relationship's to-side. An upstream is `live` as the operator reads it: one that is
+definitions in the instance whose targets it reads: its source or a `JOIN`'s joined
+table. An upstream is `live` as the operator reads it: one that is
 itself running but reads a definition that isn't `live` reports `catching_up`, since its
 target may still change under a rebuild above it. One that reports `catching_up` only
 because it reads a paused column of an upstream 1-1 target (ADR-0003, "Propagation") keeps
@@ -378,8 +374,8 @@ land?", "is it already gone?" — resolve to success, not error.
 
 They are not separate typed methods and not staging internals reached around with SQL.
 Each is a statement in Trellis's grammar, submitted through the single definition
-entrypoint the facade exposes — the same entrypoint and grammar that define a transform
-or a relationship, the same text the CLI speaks. The engine parses the statement to
+entrypoint the facade exposes — the same entrypoint and grammar that define a transform,
+the same text the CLI speaks. The engine parses the statement to
 decide the operation and composes it behind the facade, returning plain data.
 
 ## Consequences

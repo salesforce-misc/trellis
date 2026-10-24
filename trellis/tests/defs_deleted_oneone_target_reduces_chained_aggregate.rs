@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! TRANSFORM order_view      FROM orders      SELECT customer AS customer, amount AS amt
-//! TRANSFORM customer_totals FROM order_view  GROUP BY customer SELECT sum(amt) AS total
+//! TRANSFORM customer_totals FROM order_view  GROUP BY customer WITHOUT SOURCE INDEX SELECT sum(amt) AS total
 //! ```
 //!
 //! `order_view` is a plain [`KeySpace::OneToOne`] mirror of `orders` (no
@@ -197,8 +197,7 @@ fn order_view_columns() -> HashMap<String, ValueType> {
 
 const ORDER_VIEW: &str =
     "TRANSFORM order_view FROM orders SELECT customer AS customer, amount AS amt";
-const CUSTOMER_TOTALS: &str =
-    "TRANSFORM customer_totals FROM order_view GROUP BY customer SELECT sum(amt) AS total";
+const CUSTOMER_TOTALS: &str = "TRANSFORM customer_totals FROM order_view GROUP BY customer WITHOUT SOURCE INDEX SELECT sum(amt) AS total";
 
 /// `order_view` is a plain mirror of `orders`, and this harness stages
 /// hand-built CDC rows carrying old images directly; `customer_totals`

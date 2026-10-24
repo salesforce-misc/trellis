@@ -12,8 +12,7 @@ derives target tables from them. As features grow, it's tempting to *improve* th
 source schema on the user's behalf — add an index, add a `UNIQUE` constraint a
 transform relies on. This ADR rejects that. It is project-wide, not
 feature-specific: it governs how every definition type validates against source
-tables — transforms, relationships (see
-[0006-relationships](0006-relationships.md)), and transform redefinition (see
+tables — transforms and transform redefinition (see
 [0015-transform-redefinition](0015-transform-redefinition.md)).
 
 ## Trellis never modifies the source schema
@@ -28,19 +27,17 @@ Instead:
    Trellis never silently produces wrong answers, and never reshapes the source
    to make a definition work.
 2. **Guide the user to a fix.** Every rejection or warning names the exact change
-   to make — e.g. "`products.id` must be a primary key or `UNIQUE` to be a to-one
-   target; add one, or go through an aggregate," or "no index on
-   `order_line_items.product_id`; related-row updates will be slow — consider
-   `CREATE INDEX ... ON order_line_items (product_id)`."
+   to make — e.g. a source index dropped after define is reported in `status()`
+   with the statement that restores it, `create index on public.orders (region)`.
 
 ## A missing correctness prerequisite rejects; a missing performance one warns
 
 Correctness vs. performance sets the severity:
 
-* A missing correctness prerequisite (a required type, a uniqueness guarantee a
-  bare to-one relationship needs) is a **hard rejection**.
-* A missing performance prerequisite (an index for cheap reverse propagation) is
-  a **warning**: the definition succeeds and is correct without it.
+* A missing correctness prerequisite (a required type, a source's primary key)
+  is a **hard rejection**.
+* A missing performance prerequisite (a source index dropped after define) is
+  a **warning**: the definition stays correct without it.
 
 ## Consequences
 

@@ -81,8 +81,8 @@ source-key check, and refuses a field whose capture is still being widened.
 
 * It brings every column Trellis created with a type from the source back to
   the type define would give it now: key, passthrough and `GROUP BY` copies,
-  calculated and aggregate columns, ledger contributions and relationship
-  projections. The `RESUME` returns at once; the definition stays `paused`,
+  calculated and aggregate columns and ledger contributions. The `RESUME`
+  returns at once; the definition stays `paused`,
   its `capture_failure` reading "resuming: …", until the staging worker has
   re-typed them and started the rebuild. A re-type that fails leaves its
   error on `capture_failure` and the target's rows in place. When values
@@ -115,6 +115,8 @@ in place. It keeps:
 * an aggregate's group rows edited by hand, and a `MIN` or `MAX` over a
   re-collated column: the rebuild keeps the per-row ledger, with its
   collations, and adds only differences to the groups.
+* a hand edit of a `JOIN`'s hidden tables, which a `PAUSE` and `RESUME`
+  recreates.
 
 `PAUSE`, `DROP TRANSFORM` and define it again repairs each
 ([known correctness gaps](known-correctness-gaps.md): [Rows written into a target, a hidden table or Trellis's schema](known-correctness-gaps.md#rows-written-into-a-target-a-hidden-table-or-trelliss-schema),
@@ -201,8 +203,8 @@ which targets it compares is in
 ## What a repair costs
 
 * **A resume that re-types copies holds `ACCESS EXCLUSIVE` on them.** After a
-  widening, the resume's `ALTER … TYPE` on the target (and its ledger, or a
-  relationship's projection) waits for every reader of the table, and readers
+  widening, the resume's `ALTER … TYPE` on the target (and its ledger) waits
+  for every reader of the table, and readers
   queue behind it.
 * **A re-type changes the table's row type**, so a client that prepared a
   statement returning one of its columns gets `cached plan must not change
@@ -240,10 +242,9 @@ each one costs and what to expect around it
   the correction of a dropped partition of 1,000,000 rows took 13.0 s in the
   engine (1,000,000 keys in 101 pages, 489 MB of WAL), plus 0.35 s and 23 MB to
   fold the result and a 0.26 s pass to detect the drop (release build,
-  PostgreSQL 17.11, a 1,000-leaf tree on disk). On the group basis, which
-  aggregates run on today only behind a development switch
-  ([#1105](https://github.com/salesforce-misc/trellis/issues/1105)), the
-  correction of a `DROP`, `DETACH` or `TRUNCATE` took
+  PostgreSQL 17.11, a 1,000-leaf tree on disk). On the group basis, the
+  correction of a `DROP`, `DETACH` or
+  `TRUNCATE` took
   27-34 ms and about 0.6 MB of WAL for a partition of 1M or 10M rows over 1,560
   groups (a debug build), and the correction of an `ATTACH` took 0.5-0.6 s at 1M
   rows and 3.9-4.7 s at 10M. Moving rows with DML through the parent instead

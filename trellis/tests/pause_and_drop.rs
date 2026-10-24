@@ -234,7 +234,7 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
 /// direct-build job in place of the staging worker and a drain thread.
 async fn seed_source(raw: &Client, table: &str, rows: i64) {
     raw.batch_execute(&format!(
-        "create table {table} (id bigint primary key, g bigint, a numeric); \
+        "create table {table} (id bigint primary key, g bigint, a numeric(20,0)); \
          insert into {table} (id, g, a) select s, s % 2, s from generate_series(1, {rows}) s;"
     ))
     .await
@@ -263,7 +263,7 @@ async fn pausing_twice_is_a_no_op_success() {
 
     let trellis = define_only(db.dsn()).await;
     trellis
-        .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
+        .apply("TRANSFORM order_rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total")
         .await
         .expect("an aggregate definition registers")
         .into_transform()
@@ -374,11 +374,11 @@ async fn resume_rebuilds_by_backfill_and_a_paused_definition_never_pins_the_ring
     // precondition holds instead of polled for under a wall-clock budget.
     let trellis = define_only(db.dsn()).await;
     trellis
-        .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
+        .apply("TRANSFORM order_rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total")
         .await
         .expect("define the transform under test");
     trellis
-        .apply("TRANSFORM order_echo FROM orders GROUP BY g SELECT sum(a) AS total")
+        .apply("TRANSFORM order_echo FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total")
         .await
         .expect("define a sibling over the same source");
     // Registration only records the two aggregates (#419); their direct-build
@@ -479,8 +479,8 @@ async fn resume_rebuilds_by_backfill_and_a_paused_definition_never_pins_the_ring
 
     // Claim 2, mechanism continued: a plain `SUM` is the Re-derive build's
     // (#625 F3). Its resume parks no marker; the staging worker's next pass
-    // starts the same build a freshly registered one gets, over the ledger
-    // the pause left: a plan job and, the ledger not being empty, a sweep.
+    // starts the same build a freshly registered one gets: on the group basis
+    // that is one plan job, with no ledger to sweep (#1100).
     assert_eq!(
         count(&raw, "select count(*) from pending_backfill").await,
         0,
@@ -503,8 +503,8 @@ async fn resume_rebuilds_by_backfill_and_a_paused_definition_never_pins_the_ring
                and c.kind in ('plan', 'sweep') and not c.done"
         )
         .await,
-        2,
-        "the rebuild is a plan job and a sweep, not a replay of buffered changes"
+        1,
+        "the rebuild is a plan job, not a replay of buffered changes"
     );
 
     // Claim 2, outcome: the target comes back reconciled against the *current*
@@ -561,14 +561,16 @@ async fn dropping_takes_the_target_table_and_its_data_with_it() {
     let trellis = define_only(db.dsn()).await;
     // Relationship-fed, so the direct build (not the Re-derive build, #625
     // F5) writes the ledger the drop must take, until #625 F9.
-    trellis
-        .apply("RELATIONSHIP grp FROM orders.g TO grps.id")
-        .await
-        .expect("relate");
+    trellis::dev::defs::create_relationship(
+        trellis.pool(),
+        "RELATIONSHIP grp FROM orders.g TO grps.id",
+    )
+    .await
+    .expect("relate");
     trellis
         .apply(
             "TRANSFORM order_rollup FROM orders GROUP BY g \
-             SELECT sum(a) AS total, max(grp.w) AS w",
+            WITHOUT SOURCE INDEX SELECT sum(a) AS total, max(grp.w) AS w",
         )
         .await
         .expect("define");
@@ -731,7 +733,7 @@ async fn dropping_reaps_the_targets_schema_nodes_row() {
 
     let trellis = define_only(db.dsn()).await;
     trellis
-        .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
+        .apply("TRANSFORM order_rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total")
         .await
         .expect("define");
     assert_eq!(
@@ -787,14 +789,14 @@ async fn dropping_is_refused_and_names_the_live_dependents() {
 
     let trellis = define_only(db.dsn()).await;
     trellis
-        .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
+        .apply("TRANSFORM order_rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total")
         .await
         .expect("define the upstream");
     // A transform chains only off a live target; the upstream's direct-build
     // job takes it there (#419).
     markers::settle_registrations(&db.pool).await;
     trellis
-        .apply("TRANSFORM grand_total FROM order_rollup GROUP BY g SELECT sum(total) AS t")
+        .apply("TRANSFORM grand_total FROM order_rollup GROUP BY g WITHOUT SOURCE INDEX SELECT count(*) AS t")
         .await
         .expect("define a transform chained off the first one's target");
     markers::settle_registrations(&db.pool).await;
@@ -880,14 +882,14 @@ async fn dropping_is_refused_by_a_dependent_in_any_status_not_only_live() {
 
     let trellis = define_only(db.dsn()).await;
     trellis
-        .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
+        .apply("TRANSFORM order_rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total")
         .await
         .expect("define the upstream");
     // A transform chains only off a live target; the upstream's direct-build
     // job takes it there (#419).
     markers::settle_registrations(&db.pool).await;
     trellis
-        .apply("TRANSFORM grand_total FROM order_rollup GROUP BY g SELECT sum(total) AS t")
+        .apply("TRANSFORM grand_total FROM order_rollup GROUP BY g WITHOUT SOURCE INDEX SELECT count(*) AS t")
         .await
         .expect("define a transform chained off the first one's target");
     trellis
@@ -971,7 +973,7 @@ async fn dropping_an_unregistered_definition_is_a_no_op_success() {
         .expect("dropping something that was never defined is a success");
 
     trellis
-        .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
+        .apply("TRANSFORM order_rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total")
         .await
         .expect("define");
     trellis
@@ -1005,7 +1007,7 @@ async fn dropping_a_live_definition_is_refused_until_it_is_paused() {
 
     let trellis = define_only(db.dsn()).await;
     trellis
-        .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
+        .apply("TRANSFORM order_rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total")
         .await
         .expect("define");
     markers::settle_registrations(&db.pool).await;
@@ -1054,11 +1056,11 @@ async fn dropping_takes_target_owned_quarantine_rows_and_leaves_a_siblings_poiso
 
     let trellis = define_only(db.dsn()).await;
     trellis
-        .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
+        .apply("TRANSFORM order_rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total")
         .await
         .expect("define the definition under test");
     trellis
-        .apply("TRANSFORM order_echo FROM orders GROUP BY g SELECT sum(a) AS total")
+        .apply("TRANSFORM order_echo FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total")
         .await
         .expect("a sibling over the same source, which co-owns the poison band");
 
@@ -1504,7 +1506,7 @@ async fn dropping_leaves_capture_to_the_staging_worker() {
 
     let trellis = define_only(db.dsn()).await;
     trellis
-        .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
+        .apply("TRANSFORM order_rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total")
         .await
         .expect("define");
     let desired = trellis::defs::tables_to_capture(&db.pool)
@@ -1581,10 +1583,12 @@ async fn dropping_is_refused_by_a_live_dependent_that_reads_through_a_relationsh
         "the chunked 1-1 target must have finished its backfill"
     );
 
-    trellis
-        .apply("RELATIONSHIP rollup FROM reports.oid TO order_doubles.id")
-        .await
-        .expect("a relationship whose to-side is a Trellis-owned target table");
+    trellis::dev::defs::create_relationship(
+        trellis.pool(),
+        "RELATIONSHIP rollup FROM reports.oid TO order_doubles.id",
+    )
+    .await
+    .expect("a relationship whose to-side is a Trellis-owned target table");
     trellis
         .apply("TRANSFORM report_view FROM reports SELECT rollup.total AS t")
         .await
@@ -1673,10 +1677,12 @@ async fn dropping_is_refused_by_a_relationship_pointing_at_the_target_with_no_re
     // Declared, and then deliberately left unread: nothing anywhere selects
     // `rollup.<column>`. This is the whole point — the old guard only looked
     // for readers.
-    trellis
-        .apply("RELATIONSHIP rollup FROM reports.oid TO order_doubles.id")
-        .await
-        .expect("a relationship whose to-side is a Trellis-owned target table");
+    trellis::dev::defs::create_relationship(
+        trellis.pool(),
+        "RELATIONSHIP rollup FROM reports.oid TO order_doubles.id",
+    )
+    .await
+    .expect("a relationship whose to-side is a Trellis-owned target table");
 
     trellis
         .apply("PAUSE TRANSFORM order_doubles")
@@ -1708,8 +1714,7 @@ async fn dropping_is_refused_by_a_relationship_pointing_at_the_target_with_no_re
 
     // Reverse dependency order: retire the relationship, and the target it
     // pointed at drops cleanly.
-    trellis
-        .apply("DROP RELATIONSHIP reports.rollup")
+    trellis::dev::defs::drop_relationship(trellis.pool(), "reports.rollup")
         .await
         .expect("nothing reads it, so it drops");
     trellis
@@ -1767,10 +1772,12 @@ async fn dropping_is_refused_by_a_relationship_declared_from_the_target() {
         .await
         .expect("define the upstream target");
     drain_backfill_chunks(&db.pool).await;
-    trellis
-        .apply("RELATIONSHIP cats FROM order_doubles.id TO categories.oid")
-        .await
-        .expect("a relationship whose from-side is a Trellis-owned target table");
+    trellis::dev::defs::create_relationship(
+        trellis.pool(),
+        "RELATIONSHIP cats FROM order_doubles.id TO categories.oid",
+    )
+    .await
+    .expect("a relationship whose from-side is a Trellis-owned target table");
 
     trellis
         .apply("PAUSE TRANSFORM order_doubles")
@@ -1795,12 +1802,12 @@ async fn dropping_is_refused_by_a_relationship_declared_from_the_target() {
         "the refused drop wrote nothing"
     );
 
-    trellis
-        .apply(&format!(
-            "DROP RELATIONSHIP {DEFAULT_TARGET_SCHEMA}.order_doubles.cats"
-        ))
-        .await
-        .expect("nothing reads it, so it drops");
+    trellis::dev::defs::drop_relationship(
+        trellis.pool(),
+        &format!("{DEFAULT_TARGET_SCHEMA}.order_doubles.cats"),
+    )
+    .await
+    .expect("nothing reads it, so it drops");
     trellis
         .apply("DROP TRANSFORM order_doubles")
         .await
@@ -1829,10 +1836,12 @@ async fn dropping_a_relationship_is_refused_while_a_live_transform_reads_it() {
     .expect("seed a from/to pair");
 
     let trellis = define_only(db.dsn()).await;
-    trellis
-        .apply("RELATIONSHIP posts FROM authors.id TO posts.author")
-        .await
-        .expect("declare the relationship");
+    trellis::dev::defs::create_relationship(
+        trellis.pool(),
+        "RELATIONSHIP posts FROM authors.id TO posts.author",
+    )
+    .await
+    .expect("declare the relationship");
     trellis
         .apply("TRANSFORM author_stats FROM authors SELECT count(posts.id) AS post_count")
         .await
@@ -1845,16 +1854,15 @@ async fn dropping_a_relationship_is_refused_while_a_live_transform_reads_it() {
         "precondition: the reader is live"
     );
 
-    let err = trellis
-        .apply("DROP RELATIONSHIP authors.posts")
+    let err = trellis::dev::defs::drop_relationship(trellis.pool(), "authors.posts")
         .await
         .expect_err("a live transform still reads this relationship");
     match err {
-        TrellisError::Catalog(CatalogError::DependentsBlockDrop {
+        CatalogError::DependentsBlockDrop {
             subject,
             dependents,
             ..
-        }) => {
+        } => {
             assert_eq!(subject, format!("{DEFAULT_SCHEMA}.authors.posts"));
             assert_eq!(dependents, vec!["author_stats".to_string()]);
         }
@@ -1869,8 +1877,7 @@ async fn dropping_a_relationship_is_refused_while_a_live_transform_reads_it() {
         .apply("DROP TRANSFORM author_stats")
         .await
         .expect("retire the reader first");
-    trellis
-        .apply("DROP RELATIONSHIP authors.posts")
+    trellis::dev::defs::drop_relationship(trellis.pool(), "authors.posts")
         .await
         .expect("with nothing live reading it, the relationship drops");
 
@@ -1890,8 +1897,7 @@ async fn dropping_a_relationship_is_refused_while_a_live_transform_reads_it() {
         "both endpoint tables are the user's and are untouched"
     );
 
-    trellis
-        .apply("DROP RELATIONSHIP authors.posts")
+    trellis::dev::defs::drop_relationship(trellis.pool(), "authors.posts")
         .await
         .expect("a replayed relationship drop is a no-op success");
 }
@@ -1936,11 +1942,13 @@ async fn a_target_paused_mid_build_is_refused_as_a_relationship_endpoint() {
         .await
         .expect("pause mid-build");
 
-    match trellis
-        .apply("RELATIONSHIP rollup FROM reports.oid TO order_doubles.id")
-        .await
+    match trellis::dev::defs::create_relationship(
+        trellis.pool(),
+        "RELATIONSHIP rollup FROM reports.oid TO order_doubles.id",
+    )
+    .await
     {
-        Err(TrellisError::Catalog(CatalogError::TransformNotLive { transform, status })) => {
+        Err(CatalogError::TransformNotLive { transform, status }) => {
             assert_eq!(transform, "order_doubles");
             assert_eq!(status, TransformStatus::Paused);
         }
@@ -1976,10 +1984,12 @@ async fn dropping_a_relationship_drops_its_projection_from_the_catalog_schema() 
     )
     .await
     .expect("connect a define-only Trellis targeting `elsewhere`");
-    declaring
-        .apply("RELATIONSHIP author FROM posts.author TO authors.id")
-        .await
-        .expect("declare a to-one relationship");
+    trellis::dev::defs::create_relationship(
+        declaring.pool(),
+        "RELATIONSHIP author FROM posts.author TO authors.id",
+    )
+    .await
+    .expect("declare a to-one relationship");
     let relationship_id: i64 = raw
         .query_one("select id from relationship_definitions", &[])
         .await
@@ -1996,8 +2006,7 @@ async fn dropping_a_relationship_drops_its_projection_from_the_catalog_schema() 
     );
 
     let dropping = define_only(db.dsn()).await;
-    dropping
-        .apply("DROP RELATIONSHIP posts.author")
+    trellis::dev::defs::drop_relationship(dropping.pool(), "posts.author")
         .await
         .expect("nothing reads it, so it drops");
     assert!(

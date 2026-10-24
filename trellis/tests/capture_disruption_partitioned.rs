@@ -238,9 +238,11 @@ async fn create_case_tables(raw: &Client, trellis: &Trellis, ids: &[String]) {
             .expect("create the case's tree");
         for text in [
             format!(
-                "TRANSFORM r_{id} FROM public.{t} GROUP BY g, a SELECT g AS g, a AS a, COUNT(*) AS n"
+                "TRANSFORM r_{id} FROM public.{t} GROUP BY g, a WITHOUT SOURCE INDEX SELECT g AS g, a AS a, COUNT(*) AS n"
             ),
-            format!("TRANSFORM s_{id} FROM public.{t} GROUP BY g SELECT g AS g, SUM(b) AS total"),
+            format!(
+                "TRANSFORM s_{id} FROM public.{t} GROUP BY g WITHOUT SOURCE INDEX SELECT g AS g, SUM(b) AS total"
+            ),
         ] {
             trellis.apply(&text).await.expect(&text);
         }
@@ -755,7 +757,7 @@ async fn an_install_that_stops_between_transactions_pauses_nothing() {
     ddl.push_str("insert into public.big select i, i % 100 + 1, i from generate_series(1, 500) i");
     raw.batch_execute(&ddl).await.unwrap();
     trellis
-        .apply("TRANSFORM s_big FROM public.big GROUP BY g SELECT g AS g, SUM(v) AS total")
+        .apply("TRANSFORM s_big FROM public.big GROUP BY g WITHOUT SOURCE INDEX SELECT g AS g, SUM(v) AS total")
         .await
         .unwrap();
 

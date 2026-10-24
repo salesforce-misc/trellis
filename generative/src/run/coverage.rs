@@ -110,7 +110,7 @@ pub struct Coverage {
     /// How many recorded programs (cases, not fields) contain each aggregate
     /// call shape, keyed `(key_space, function, argument)` — e.g.
     /// `("Aggregate", "COUNT", "rel")` for `COUNT(<rel>.<col>)` inside a
-    /// `GROUP BY` def (issue #294), or `("Aggregate", "BOOL_AND", "column")`
+    /// `GROUP BY` def (issue #294), or `("Aggregate", "SUM", "column")`
     /// (issue #255). `functions` above only says a name appeared somewhere;
     /// this says how often each *shape* was actually driven, which is what a
     /// deep run needs to report to show a newly-drawn shape got real

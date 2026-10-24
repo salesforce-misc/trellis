@@ -3,10 +3,9 @@
 //! definition's own `JOIN … GROUP BY`, and the hidden `P`, `M`, `J` and `T`
 //! against what the two tables say they hold. A planted divergence in each is
 //! reported on that table alone, and gone once the planted damage is undone
-//! by hand (the repair for real damage is `request_backfill`, whose rebuild
-//! `join_interleavings.rs` tests; the last tests here run the loop, check,
-//! repair, check, for `P`/`M` by `request_backfill` and for `J`/`T` by
-//! `PAUSE`/`RESUME`). One test here checks the `J` lock-wait
+//! by hand. The last tests here run the loop, check, repair, check: writes
+//! capture missed repaired by `request_backfill`, hand edits of `J`/`T` by
+//! `PAUSE`/`RESUME`. One test here checks the `J` lock-wait
 //! histogram a page records (#1112 J7b), since it needs the same knob-on
 //! driver.
 //!
@@ -40,14 +39,14 @@ const DDL: &str = "create table public.a (id integer primary key, ga integer, t 
 /// argument only counted (whose hidden sum isn't kept).
 const LEFT_PAIR: &str = "TRANSFORM l FROM public.a LEFT JOIN public.b \
      ON a.t = b.t AND a.k = b.k GROUP BY a.ga, b.gb \
-     SELECT a.ga AS ga, b.gb AS gb, COUNT(*) AS n, COUNT(a.x) AS cx, SUM(a.x) AS sx, \
+    WITHOUT SOURCE INDEX SELECT a.ga AS ga, b.gb AS gb, COUNT(*) AS n, COUNT(a.x) AS cx, SUM(a.x) AS sx, \
             AVG(b.y) AS ay, COALESCE(SUM(b.y), 0) + COUNT(*) AS mixed, COUNT(b.y) AS cy, \
             COUNT(a.t) AS ct";
 
 /// An inner `JOIN` on `k`, grouped by the `FROM` side only: its target's
 /// key is `ga`'s text.
 const INNER: &str = "TRANSFORM i FROM public.a JOIN public.b ON a.k = b.k GROUP BY a.ga \
-     SELECT a.ga AS ga, COUNT(*) AS n, SUM(a.x) AS sx, SUM(b.y) AS sy";
+    WITHOUT SOURCE INDEX SELECT a.ga AS ga, COUNT(*) AS n, SUM(a.x) AS sx, SUM(b.y) AS sy";
 
 fn int4() -> ValueType {
     ValueType::Integer(IntWidth::Int4)
@@ -531,7 +530,7 @@ async fn each_join_page_records_its_j_lock_wait() {
         &[],
         &[
             "TRANSFORM lock_wait_join FROM public.a JOIN public.b ON a.k = b.k GROUP BY a.ga \
-           SELECT a.ga AS ga, COUNT(*) AS n, SUM(b.y) AS sy",
+          WITHOUT SOURCE INDEX SELECT a.ga AS ga, COUNT(*) AS n, SUM(b.y) AS sy",
         ],
         &["public.a", "public.b"],
     )
@@ -869,7 +868,7 @@ async fn a_group_column_re_collated_mid_walk_skips_and_repeats_no_cell() {
         &[],
         &[
             "TRANSFORM tc FROM public.a JOIN public.b ON a.k = b.k GROUP BY a.ga \
-           SELECT a.ga AS ga, COUNT(*) AS n, SUM(b.y) AS sy",
+          WITHOUT SOURCE INDEX SELECT a.ga AS ga, COUNT(*) AS n, SUM(b.y) AS sy",
         ],
         &["public.a", "public.b"],
     )
@@ -925,10 +924,10 @@ async fn a_group_column_re_collated_mid_walk_skips_and_repeats_no_cell() {
 /// Group columns that are also the join key, and a joined side with no group
 /// columns.
 const GROUP_IS_KEY: &str = "TRANSFORM gk FROM public.a JOIN public.b ON a.k = b.k \
-     GROUP BY a.k, b.gb SELECT a.k AS k, b.gb AS gb, COUNT(*) AS n, SUM(a.x) AS sx";
+     GROUP BY a.k, b.gb WITHOUT SOURCE INDEX SELECT a.k AS k, b.gb AS gb, COUNT(*) AS n, SUM(a.x) AS sx";
 
 /// A `P` or `M` page orders by the hidden cell identity, the join key first
-/// (#1198): the hidden side is a range scan of the hidden table's one index
+/// (#1198): the hidden side is a range scan of the hidden table's identity index
 /// and the source side a range scan of an index on the source's join columns.
 #[tokio::test]
 async fn a_p_or_m_page_is_a_range_scan_of_the_hidden_index_and_the_source_join_index() {
@@ -943,15 +942,16 @@ async fn a_p_or_m_page_is_a_range_scan_of_the_hidden_index_and_the_source_join_i
         ("m", "b", "b_join_idx", "gb"),
     ] {
         let (hidden, name) = hidden(&d, "l", part).await;
-        // The hidden table's one index, whatever define named it.
+        // The hidden table's identity index, whatever define named it (its
+        // other index is the partial zero-cell one).
         let hidden_index = d
             .rows(&format!(
                 "select c.relname from pg_index i join pg_class c on c.oid = i.indexrelid \
-                 where i.indrelid = '{hidden}'::regclass"
+                 where i.indrelid = '{hidden}'::regclass and i.indpred is null"
             ))
             .await;
         let [hidden_index] = hidden_index.as_slice() else {
-            panic!("{part}: one index on {hidden}: {hidden_index:?}");
+            panic!("{part}: one identity index on {hidden}: {hidden_index:?}");
         };
         let hidden_index = hidden_index.trim_matches(|c| c == '(' || c == ')');
         // Statistics, so the plan does not depend on whether autovacuum has

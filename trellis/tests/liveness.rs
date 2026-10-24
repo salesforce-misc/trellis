@@ -458,13 +458,15 @@ async fn daemon_closes_its_connection_after_idle_timeout_with_no_registered_clai
 #[tokio::test]
 async fn a_long_page_leaves_its_claim_stamped_at_commit_time_not_transaction_start() {
     const GROUP_TOTALS: &str = "TRANSFORM grp_totals FROM items GROUP BY grp \
-         SELECT grp AS grp, SUM(amount) AS total, COUNT(*) AS n";
+        WITHOUT SOURCE INDEX SELECT grp AS grp, SUM(amount) AS total, COUNT(*) AS n";
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
 
     client
-        .batch_execute("create table items (id integer primary key, grp integer, amount numeric)")
+        .batch_execute(
+            "create table items (id integer primary key, grp integer, amount numeric(12,0))",
+        )
         .await
         .expect("create items");
     let columns: HashMap<String, ValueType> = ["id", "grp", "amount"]

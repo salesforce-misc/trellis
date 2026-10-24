@@ -13,8 +13,7 @@ one that accepted the definition, produces errors such as
 different table.
 
 This ADR settles how table references are spelled and persisted across every
-definition type — transforms, relationships ([ADR-0006](0006-relationships.md)),
-and redefinition. It does not relax
+definition type — transforms and redefinition. It does not relax
 [ADR-0005](0005-source-schema-is-user-owned.md): Trellis still issues no DDL
 against source tables, only resolves, records, and reads their qualified names.
 It introduces no identity concept beyond the `schema.table` string PostgreSQL
@@ -45,7 +44,7 @@ reference's identity. It never persists or re-resolves the bare spelling.**
    qualified spelling resolves to that exact relation; a bare one is resolved as
    in (1).
 
-This applies to source tables, transform targets, and relationship endpoints.
+This applies to source tables, a `JOIN`'s joined table, and transform targets.
 
 ## Identity is the name, not an OID
 

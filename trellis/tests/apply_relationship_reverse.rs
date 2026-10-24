@@ -189,7 +189,7 @@ fn post_tags_columns() -> HashMap<String, ValueType> {
 }
 
 const TAG_TOTALS: &str = "TRANSFORM tag_totals FROM post_tags GROUP BY tag \
-     SELECT COUNT(*) AS post_count, SUM(post.word_count) AS total_words";
+    WITHOUT SOURCE INDEX SELECT COUNT(*) AS post_count, SUM(post.word_count) AS total_words";
 
 /// Issue #94's exact schema (see `defs_aggregate_relationship.rs`), reused
 /// verbatim: `post_tags` row 13 (`post = 999`, tag `rust`) is a dangling

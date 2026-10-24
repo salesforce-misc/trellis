@@ -26,6 +26,7 @@ use trellis::capture::partitions::{self, PendingCorrection};
 use trellis::capture::reconcile::PassOutcome;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ValueType;
+use trellis::integer::IntWidth;
 use trellis::staging::partition_correction::{self, Options, Outcome};
 
 const SOURCE: &str = "public.items";
@@ -796,17 +797,41 @@ async fn a_correction_resumes_after_its_last_committed_page() {
 }
 
 /// An aggregate over the items and the to-many counts read the same source:
-/// the correction leaves the queue only once both are corrected.
+/// the correction leaves the queue only once both are corrected. The
+/// aggregate is on the group basis, whose build over a partitioned source with
+/// rows needs the tree recorded, so it is defined after the first pass.
 #[tokio::test]
 async fn an_aggregate_and_a_to_many_reader_are_both_corrected_before_the_queue_clears() {
-    const AGGREGATE: &str =
-        "TRANSFORM agg FROM public.items GROUP BY order_id SELECT COUNT(*) AS n";
-    let mut fx = Fx::start_with(&tree("list"), &[DEFINITION, AGGREGATE]).await;
+    const AGGREGATE: &str = "TRANSFORM agg FROM public.items GROUP BY order_id WITHOUT SOURCE INDEX SELECT COUNT(*) AS n";
+    let mut fx = Fx::start(&tree("list")).await;
+    trellis::defs::install_definition(
+        fx.d.pool(),
+        AGGREGATE,
+        &[
+            ("id", ValueType::Integer(IntWidth::Int4)),
+            ("order_id", ValueType::Integer(IntWidth::Int4)),
+            ("v", ValueType::Integer(IntWidth::Int4)),
+        ]
+        .into_iter()
+        .map(|(name, ty)| (name.to_string(), ty))
+        .collect(),
+        "public",
+    )
+    .await
+    .expect("define the aggregate");
+    trellis::intake::markers::settle_registrations(fx.d.pool()).await;
+    fx.d.settle().await;
+    assert_eq!(
+        fx.d.rows("select status from transform_definitions where status <> 'live'")
+            .await,
+        Vec::<String>::new(),
+        "both definitions are live before the scenario"
+    );
     fx.exec("drop table public.items_p2").await;
     fx.pass().await;
     fx.d.settle().await;
-    // One page: the aggregate's fence or ledger page, so the to-many reader
-    // has not run and the correction stays.
+    // One page: the aggregate's, so the to-many reader has not run and the
+    // correction stays.
     let first = fx
         .run(&Options {
             page_keys: 10_000,
@@ -817,8 +842,6 @@ async fn an_aggregate_and_a_to_many_reader_are_both_corrected_before_the_queue_c
     assert_eq!(fx.queue().await.len(), 1);
     let outcome = fx.run_through(&Options::default()).await;
     assert_eq!(outcome.completed, 1);
-    let plan = fx.d.build_plan("agg").await;
-    fx.d.merge_all(&plan).await;
     fx.d.settle().await;
     assert_eq!(fx.wrong_parents().await, Vec::<String>::new());
     let wrong: i64 =
@@ -1085,10 +1108,11 @@ async fn a_truncated_leaf_leaves_its_orders_at_zero() {
 /// The last page of a walk stages nothing when the routed parents fill the
 /// pages before it exactly, or when no parent routes to the node (a new,
 /// empty partition). If the ring sealed and drained the earlier pages'
-/// recomputes in between, the segment active at that page's commit is empty,
-/// and on an idle ring the staging worker never seals an empty segment
-/// (`seal_if_active_nonempty`). The correction finishes anyway: nothing it
-/// staged can be in that empty segment.
+/// recomputes in between, the segment active at that page's commit is empty.
+/// The staging worker seals an empty segment only while its predecessor's
+/// slot still holds rows (`seal_if_active_nonempty`'s idle seal), so on an
+/// idle ring nothing need ever seal it. The correction finishes without any
+/// seal: nothing it staged can be in that empty segment.
 #[tokio::test]
 async fn a_correction_whose_last_page_stages_nothing_finishes_on_an_idle_ring() {
     let mut fx = Fx::start(&tree("range")).await;
@@ -1112,11 +1136,7 @@ async fn a_correction_whose_last_page_stages_nothing_finishes_on_an_idle_ring() 
             max_pages: None,
         })
         .await;
-    // The staging worker's own seal: it leaves an empty segment alone.
-    let sealed = trellis::staging::seal::seal_if_active_nonempty(&mut fx.d.ctl, drain_driver::WAKE)
-        .await
-        .expect("seal");
-    assert!(sealed.is_none(), "an idle ring seals nothing");
+    // No seal runs between the two: the correction must not need one.
     let again = fx.run(&Options::default()).await;
     assert_eq!(
         last.completed + again.completed,

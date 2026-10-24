@@ -295,7 +295,7 @@ async fn trigger_capture_stages_the_golden_images_under_a_foreign_session() {
         ),
         (
             "TRANSFORM comp_out FROM public.comp GROUP BY tag \
-             SELECT tag AS tag, SUM(weight) AS w",
+            WITHOUT SOURCE INDEX SELECT tag AS tag, COUNT(weight) AS w",
             value_types(&[
                 ("tag", ValueType::Text),
                 ("post", ValueType::Numeric),

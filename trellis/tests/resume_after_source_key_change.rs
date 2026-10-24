@@ -18,7 +18,8 @@ use resume_passes::{
 use testkit::TestCluster;
 use trellis::defs::TransformStatus;
 
-const SUMS: &str = "TRANSFORM c_sums FROM public.c GROUP BY pid SELECT SUM(amount) AS total";
+const SUMS: &str =
+    "TRANSFORM c_sums FROM public.c GROUP BY pid WITHOUT SOURCE INDEX SELECT SUM(amount) AS total";
 const SUMS_ACTUAL: &str = "select pid::text, total::text from public.c_sums order by 1";
 const SUMS_ORACLE: &str =
     "select pid::text, sum(amount)::text from public.c group by pid order by 1";

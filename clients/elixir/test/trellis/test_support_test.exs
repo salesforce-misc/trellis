@@ -36,7 +36,7 @@ defmodule Trellis.TestSupportTest do
 
     Trellis.apply!(
       trellis,
-      "TRANSFORM load_sums FROM loads GROUP BY g SELECT g AS g, SUM(n) AS total"
+      "TRANSFORM load_sums FROM loads GROUP BY g WITHOUT SOURCE INDEX SELECT g AS g, SUM(n) AS total"
     )
 
     Trellis.apply!(trellis, "TRANSFORM load_operator FROM loads SELECT n AS n")

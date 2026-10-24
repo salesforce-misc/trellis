@@ -276,7 +276,7 @@ async fn setup(dsn: &str, raw: &mut Client, pool: &trellis::Pool) -> Trellis {
         "TRANSFORM ta FROM public.u SELECT a AS a",
         "TRANSFORM tb FROM public.u SELECT b AS b",
         "TRANSFORM tc FROM public.u SELECT c AS c",
-        "TRANSFORM tsum FROM public.u GROUP BY g SELECT g AS g, SUM(b) AS total",
+        "TRANSFORM tsum FROM public.u GROUP BY g WITHOUT SOURCE INDEX SELECT g AS g, SUM(b) AS total",
     ] {
         trellis.apply(text).await.expect(text);
     }
@@ -761,9 +761,15 @@ async fn renaming_a_to_side_column_pauses_only_its_readers_through_the_relations
         "TRANSFORM c_named FROM public.c SELECT amount AS amount, parent.name AS name",
         "TRANSFORM c_tiered FROM public.c SELECT amount AS amount, parent.tier AS tier",
         "TRANSFORM by_tier FROM public.c GROUP BY parent.tier \
-         SELECT parent.tier AS tier, COUNT(*) AS n",
+        WITHOUT SOURCE INDEX SELECT parent.tier AS tier, COUNT(*) AS n",
     ] {
-        trellis.apply(text).await.expect(text);
+        if text.starts_with("RELATIONSHIP") {
+            trellis::dev::defs::create_relationship(trellis.pool(), text)
+                .await
+                .expect(text);
+        } else {
+            trellis.apply(text).await.expect(text);
+        }
     }
     let targets = ["c_named", "c_tiered", "by_tier"];
     bring_live(&mut raw, &db.pool, &targets).await;
@@ -1372,7 +1378,13 @@ async fn retyped_to_side_setup(dsn: &str, raw: &mut Client, pool: &trellis::Pool
         "TRANSFORM posts_plain FROM public.posts SELECT author AS author",
         "TRANSFORM o_copy FROM public.o SELECT v AS v",
     ] {
-        trellis.apply(text).await.expect(text);
+        if text.starts_with("RELATIONSHIP") {
+            trellis::dev::defs::create_relationship(trellis.pool(), text)
+                .await
+                .expect(text);
+        } else {
+            trellis.apply(text).await.expect(text);
+        }
     }
     bring_live(raw, pool, &["posts_named", "posts_plain", "o_copy"]).await;
     trellis
@@ -2160,7 +2172,13 @@ async fn a_from_side_key_retyped_off_the_allowlist_does_not_halt_the_drain_once_
         "RELATIONSHIP notes FROM posts.id TO notes.post_id",
         "TRANSFORM posts_noted FROM public.posts SELECT count(notes.id) AS notes",
     ] {
-        trellis.apply(text).await.expect(text);
+        if text.starts_with("RELATIONSHIP") {
+            trellis::dev::defs::create_relationship(trellis.pool(), text)
+                .await
+                .expect(text);
+        } else {
+            trellis.apply(text).await.expect(text);
+        }
     }
     bring_live(
         &mut raw,

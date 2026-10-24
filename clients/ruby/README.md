@@ -56,14 +56,13 @@ Nothing in the binding uses it.
   instance, which has every call below as a method (see
   [Several instances](#several-instances)).
 - `Trellis.apply(statement)`: any statement of Trellis's grammar
-  (`TRANSFORM`, `RELATIONSHIP`, `PAUSE TRANSFORM`, `RESUME TRANSFORM`,
-  `DROP TRANSFORM`, `DROP RELATIONSHIP`, `ALTER TRANSFORM`), returning what
+  (`TRANSFORM`, `PAUSE TRANSFORM`, `RESUME TRANSFORM`, `DROP TRANSFORM`,
+  `ALTER TRANSFORM`), returning what
   it did as a `Trellis::Applied` whose `kind` names the outcome
   (`:transform_defined`, `:paused`, `:resumed`, ...).
   `Trellis.define(statement)` is an `apply` that refuses anything but a
   `TRANSFORM`, and returns its fully qualified target table.
-- `Trellis.status(target_table)`, `Trellis.definitions`,
-  `Trellis.relationships`: the catalog reads.
+- `Trellis.status(target_table)`, `Trellis.definitions`: the catalog reads.
 - `Trellis.quarantined`, `Trellis.quarantine_status(target)`,
   `Trellis.sample_quarantined(target, limit:, after:)`,
   `Trellis.poisoned_since(time)`: the quarantine reads. Resuming is a
@@ -458,7 +457,7 @@ config.trellis.connect = { url: ENV.fetch("DATABASE_URL") }
 Nothing else is set up. After `pg_dump`, `db:migrate`'s dump and
 `db:schema:dump` append `Trellis::Instance#dump_definitions_sql` for
 `config.trellis.connect` and each of `config.trellis.instances`: Trellis's
-migration history, the instance marker, the transform and relationship
+migration history, the instance marker, the transform
 definitions and the seed rows capture needs. The Railtie also adds each
 instance's `schema` and `target_schema` to the `--schema` flags Rails passes
 `pg_dump` (nothing is added when Rails dumps every schema), so the Trellis

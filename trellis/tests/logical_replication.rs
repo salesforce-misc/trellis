@@ -359,10 +359,12 @@ fn refused_for_subscription(result: Result<trellis::Applied, TrellisError>) -> S
 async fn defining_refuses_a_table_a_subscription_replicates_into() {
     let cluster = TestCluster::start();
     let it = instance(&cluster).await;
-    it.trellis
-        .apply("RELATIONSHIP parent FROM c.pid TO p.id")
-        .await
-        .expect("declare a relationship");
+    trellis::dev::defs::create_relationship(
+        it.trellis.pool(),
+        "RELATIONSHIP parent FROM c.pid TO p.id",
+    )
+    .await
+    .expect("declare a relationship");
     it.subscribe("s_p", "pub_p").await;
 
     let sub = refused_for_subscription(

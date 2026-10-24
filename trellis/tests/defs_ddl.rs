@@ -710,8 +710,6 @@ async fn uuid_column_works_as_an_aggregate_group_by_key() {
         vec![
             ("author".to_string(), "uuid".to_string()),
             ("total_words".to_string(), "numeric".to_string()),
-            ("__total_words_count".to_string(), "bigint".to_string()),
-            ("__trellis_members".to_string(), "bigint".to_string()),
         ]
     );
 
@@ -798,12 +796,9 @@ async fn aggregate_target_table_gets_a_nulls_not_distinct_unique_key_from_the_gr
         vec![
             ("order_id".to_string(), "numeric".to_string()),
             ("total_amount".to_string(), "numeric".to_string()),
-            ("__total_amount_count".to_string(), "bigint".to_string()),
-            ("__trellis_members".to_string(), "bigint".to_string()),
         ],
-        "a SUM field gets a hidden running-count partial alongside its visible column \
-         (issue #11 review fix: SUM needs to distinguish \"sum of nothing\" from \"sum \
-         that nets to zero\", the same way AVG already does)"
+        "a group-basis aggregate target holds only its visible columns: its partials \
+         live in the catalog schema's group basis"
     );
 
     // Issue #128: the grouping columns are keyed by a `UNIQUE NULLS NOT
@@ -872,6 +867,7 @@ async fn aggregate_target_table_gets_a_nulls_not_distinct_unique_key_from_the_gr
 /// two counts would always be identical since they count non-null values of
 /// the same expression over the same rows.
 #[tokio::test]
+#[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
 async fn aggregate_columns_sharing_an_argument_share_one_count_column() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -964,6 +960,7 @@ async fn aggregate_columns_sharing_an_argument_share_one_count_column() {
 /// legitimately diverge. Merging them would silently corrupt SUM's
 /// NULL-vs-zero disambiguation for whichever field's count "wins".
 #[tokio::test]
+#[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
 async fn aggregate_columns_over_different_arguments_keep_separate_count_columns() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;

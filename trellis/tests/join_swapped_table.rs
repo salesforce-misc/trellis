@@ -19,7 +19,7 @@ use trellis::defs::ValueType;
 use trellis::integer::IntWidth;
 
 const J: &str = "TRANSFORM j2 FROM public.ja LEFT JOIN public.jb ON ja.k = jb.k \
-     GROUP BY ja.g SELECT ja.g AS g, COUNT(*) AS n, SUM(jb.y) AS sy";
+     GROUP BY ja.g WITHOUT SOURCE INDEX SELECT ja.g AS g, COUNT(*) AS n, SUM(jb.y) AS sy";
 
 #[tokio::test]
 async fn a_swapped_joined_table_does_not_panic_the_pass() {

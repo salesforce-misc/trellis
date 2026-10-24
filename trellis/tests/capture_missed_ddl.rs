@@ -240,7 +240,9 @@ async fn run_cases(cases: &[Case]) {
                 "TRANSFORM r_{id} FROM public.{t} \
                  SELECT a AS a, b AS b, v AS v, n AS n, x AS x"
             ),
-            format!("TRANSFORM s_{id} FROM public.{t} GROUP BY g SELECT g AS g, SUM(b) AS total"),
+            format!(
+                "TRANSFORM s_{id} FROM public.{t} GROUP BY g WITHOUT SOURCE INDEX SELECT g AS g, SUM(b) AS total"
+            ),
         ] {
             trellis.apply(&text).await.expect(&text);
         }
@@ -825,7 +827,7 @@ async fn a_same_type_rewrite_rebuilds_its_readers_to_the_new_values() {
     let trellis = definer(db.dsn()).await;
     for text in [
         "TRANSFORM wb FROM public.w SELECT b AS b",
-        "TRANSFORM wsum FROM public.w GROUP BY g SELECT g AS g, SUM(b) AS total",
+        "TRANSFORM wsum FROM public.w GROUP BY g WITHOUT SOURCE INDEX SELECT g AS g, SUM(b) AS total",
     ] {
         trellis.apply(text).await.expect(text);
     }
@@ -890,9 +892,9 @@ async fn a_retyped_field_rebuilds_while_valid_and_pauses_otherwise() {
     .expect("seed");
     let trellis = definer(db.dsn()).await;
     for text in [
-        "TRANSFORM fsum FROM public.f GROUP BY g SELECT g AS g, SUM(n) AS total",
-        "TRANSFORM fk FROM public.f GROUP BY g SELECT g AS g, COUNT(k) AS ks",
-        "TRANSFORM fq FROM public.f GROUP BY g SELECT g AS g, COUNT(q) AS qs",
+        "TRANSFORM fsum FROM public.f GROUP BY g WITHOUT SOURCE INDEX SELECT g AS g, SUM(n) AS total",
+        "TRANSFORM fk FROM public.f GROUP BY g WITHOUT SOURCE INDEX SELECT g AS g, COUNT(k) AS ks",
+        "TRANSFORM fq FROM public.f GROUP BY g WITHOUT SOURCE INDEX SELECT g AS g, COUNT(q) AS qs",
     ] {
         trellis.apply(text).await.expect(text);
     }
@@ -1011,7 +1013,7 @@ async fn a_same_type_rewrite_of_a_partitioned_source_rebuilds_its_readers() {
     .await
     .expect("seed");
     let trellis = definer(db.dsn()).await;
-    let text = "TRANSFORM psum FROM public.p GROUP BY g SELECT g AS g, SUM(b) AS total";
+    let text = "TRANSFORM psum FROM public.p GROUP BY g WITHOUT SOURCE INDEX SELECT g AS g, SUM(b) AS total";
     trellis.apply(text).await.expect(text);
     bring_live(&mut raw, &db.pool).await;
     let leaves = "select string_agg(distinct node::regclass::text, ',' order by node::regclass::text) \

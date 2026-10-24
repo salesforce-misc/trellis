@@ -30,7 +30,7 @@ const ONE: &str = "TRANSFORM one FROM public.src SELECT g AS g, v + v AS dbl";
 const ONE_ACTUAL: &str = "select (id, g, dbl)::text from public.one order by id collate \"C\"";
 const ONE_EXPECTED: &str = "select (id, g, v + v)::text from public.src order by id collate \"C\"";
 
-const AGG: &str = "TRANSFORM agg FROM public.src GROUP BY g SELECT SUM(v) AS total, COUNT(*) AS n";
+const AGG: &str = "TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n";
 const AGG_ACTUAL: &str = "select (g, total, n)::text from public.agg order by g";
 const AGG_EXPECTED: &str =
     "select (g, sum(v), count(*))::text from public.src group by g order by g";
@@ -259,6 +259,7 @@ async fn a_one_to_one_build_survives_its_key_being_recollated() {
 /// An aggregate Re-derive build whose remaining chunks run after the key is
 /// re-collated still counts every source row once.
 #[tokio::test]
+#[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
 async fn an_aggregate_build_survives_its_key_being_recollated() {
     let mut f = Fixture::new(AGG).await;
     f.build_across_a_recollation("agg").await;
@@ -369,6 +370,7 @@ async fn a_chunk_over_a_c_collated_key_reads_by_index() {
 /// finishes. An aggregate, because a 1-1 target's key keeps the source key's
 /// collation, which the `drop collation` then refuses to drop.
 #[tokio::test]
+#[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
 async fn a_build_whose_recorded_collation_is_dropped_pauses_and_resumes() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;

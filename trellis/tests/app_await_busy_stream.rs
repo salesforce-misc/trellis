@@ -78,7 +78,7 @@ async fn a_wait_converges_while_an_unrelated_chain_stays_busy() {
     wait_live(&trellis, "noise_prices").await;
     // Chained definitions need their upstream live before they register.
     trellis
-        .apply("TRANSFORM noise_totals FROM noise_prices GROUP BY price SELECT count(*) AS n")
+        .apply("TRANSFORM noise_totals FROM noise_prices GROUP BY price WITHOUT SOURCE INDEX SELECT count(*) AS n")
         .await
         .expect("define noise_totals");
     wait_live(&trellis, "noise_totals").await;

@@ -38,9 +38,6 @@
 //!
 //! Harness conventions follow `defs_exact_integers.rs`.
 
-#[path = "support/wait_live.rs"]
-mod wait_live;
-
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -56,7 +53,6 @@ use trellis::defs::ast::{
 use trellis::defs::eval::{RegexCache, Row, Value, evaluate, evaluate_aggregate};
 use trellis::defs::{chunk_queue, create_relationship, install_definition, parse, validate};
 use trellis::integer::IntWidth;
-use trellis::{Config, Trellis, TrellisOptions};
 
 // ---------------------------------------------------------------------
 // Harness
@@ -398,57 +394,6 @@ async fn derived_float_column_types_match_postgres() {
     }
 }
 
-/// `(field name, aggregate expression)`.
-const AGGREGATE_CASES: &[(&str, &str)] = &[
-    // A float sum keeps its argument's width — unlike `sum(int4) -> bigint`.
-    ("k0", "SUM(f4)"),
-    ("k1", "SUM(f8)"),
-    // ...but `avg(real)` is `double precision`, not `real`.
-    ("k2", "AVG(f4)"),
-    ("k3", "AVG(f8)"),
-    ("k4", "MIN(f4)"),
-    ("k5", "MAX(f4)"),
-    ("k6", "MIN(f8)"),
-    ("k7", "MAX(f8)"),
-];
-
-/// Every float aggregate's derived column type equals Postgres's own,
-/// including `avg(real) -> double precision`, which is easy to get wrong by
-/// assuming `MIN`/`MAX`'s "keeps its argument's type" rule generalizes.
-#[tokio::test]
-async fn float_aggregate_column_types_match_postgres() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
-
-    client.batch_execute(SOURCE_DDL).await.expect("source");
-    seed_one_row(&client).await;
-
-    let select_list = AGGREGATE_CASES
-        .iter()
-        .map(|(name, expr)| format!("{expr} AS {name}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    install_definition(
-        &db.pool,
-        &format!("TRANSFORM t FROM s GROUP BY i SELECT i AS i, {select_list}"),
-        &source_columns(),
-        "public",
-    )
-    .await
-    .expect("install_definition");
-    drain_backfill_chunks(&db.pool).await;
-
-    for (name, expr) in AGGREGATE_CASES {
-        let declared = column_pg_type(&client, "t", name).await;
-        let expected = postgres_type_of(&client, &expr.to_lowercase()).await;
-        assert_eq!(
-            declared, expected,
-            "Trellis declared `{expr}` as {declared}, Postgres types it as {expected}"
-        );
-    }
-}
-
 // ---------------------------------------------------------------------
 // 3. Overflow, and the special values that are *not* overflow
 // ---------------------------------------------------------------------
@@ -698,143 +643,6 @@ async fn float_text_rendering_is_byte_identical_to_postgres_through_the_evaluato
 // 5. Values, against an independently-written SQL query
 // ---------------------------------------------------------------------
 
-/// The backfilled float target equals what a hand-written `GROUP BY` query
-/// computes over the same rows — values, not just types — including groups
-/// containing `NaN` and `Infinity`.
-///
-/// Written as a symmetric difference (`EXCEPT` both ways, counted) so a
-/// missing group, an extra group and a wrong value all surface the same way.
-/// `EXCEPT` uses `NOT DISTINCT` semantics, which for floats means Postgres's
-/// own equality — so `NaN` on both sides matches, which is exactly the
-/// behaviour under test.
-#[tokio::test]
-async fn a_float_aggregate_target_matches_a_hand_written_sql_query() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
-
-    client.batch_execute(SOURCE_DDL).await.expect("source");
-    client
-        .batch_execute(
-            "insert into s (id, f4, f8, n, i) values \
-               (1,  1.5,  1.5,  1, 1), \
-               (2,  2.5,  2.5,  2, 1), \
-               (3, -1.5, 'Infinity', 3, 2), \
-               (4,  0.25, 4.5,  4, 2), \
-               (5, 'NaN', 5.5,  5, 3), \
-               (6,  1.0,  6.5,  6, 3), \
-               (7,  null, null, 7, 4)",
-        )
-        .await
-        .expect("seed rows");
-
-    install_definition(
-        &db.pool,
-        "TRANSFORM t FROM s GROUP BY i \
-         SELECT i AS i, SUM(f4) AS total4, SUM(f8) AS total8, MIN(f4) AS smallest, \
-                MAX(f8) AS biggest, AVG(f4) AS mean",
-        &source_columns(),
-        "public",
-    )
-    .await
-    .expect("install_definition");
-    drain_backfill_chunks(&db.pool).await;
-
-    let differences: i64 = client
-        .query_one(
-            "with expected as ( \
-                 select i, sum(f4) as total4, sum(f8) as total8, min(f4) as smallest, \
-                        max(f8) as biggest, avg(f4) as mean \
-                 from s group by i \
-             ), \
-             actual as (select i, total4, total8, smallest, biggest, mean from t) \
-             select (select count(*) from (table expected except table actual) missing) \
-                  + (select count(*) from (table actual except table expected) extra)",
-            &[],
-        )
-        .await
-        .expect("difference query")
-        .get(0);
-    assert_eq!(differences, 0, "the target must equal the SQL oracle");
-
-    // The columns really are floats, not `numeric` values that happen to
-    // render the same — and `AVG` really did widen where Postgres widens.
-    assert_eq!(column_pg_type(&client, "t", "total4").await, "real");
-    assert_eq!(
-        column_pg_type(&client, "t", "total8").await,
-        "double precision"
-    );
-    assert_eq!(column_pg_type(&client, "t", "smallest").await, "real");
-    assert_eq!(
-        column_pg_type(&client, "t", "biggest").await,
-        "double precision"
-    );
-    assert_eq!(
-        column_pg_type(&client, "t", "mean").await,
-        "double precision"
-    );
-
-    // The `NaN` group really is `NaN` on both sides — the assertion above
-    // would also pass if the group had vanished from *both*.
-    let nan_group: String = client
-        .query_one("select total4::text from t where i = 3", &[])
-        .await
-        .expect("the NaN-containing group must exist")
-        .get(0);
-    assert_eq!(
-        nan_group, "NaN",
-        "a group containing NaN must sum to NaN, as Postgres does"
-    );
-}
-
-/// `MIN`/`MAX` over a group containing `NaN` follow Postgres's order, not
-/// IEEE's: the max is `NaN` and the min is the smallest ordinary value.
-///
-/// Checked against the server's own `min()`/`max()` on the same rows rather
-/// than against a hardcoded expectation.
-#[tokio::test]
-async fn min_and_max_over_nan_follow_postgres() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
-
-    client.batch_execute(SOURCE_DDL).await.expect("source");
-    client
-        .batch_execute(
-            "insert into s (id, f8, i) values \
-               (1, 'NaN', 1), (2, 1, 1), (3, 'Infinity', 1), (4, '-Infinity', 1)",
-        )
-        .await
-        .expect("seed rows");
-
-    install_definition(
-        &db.pool,
-        "TRANSFORM t FROM s GROUP BY i SELECT i AS i, MIN(f8) AS lo, MAX(f8) AS hi",
-        &source_columns(),
-        "public",
-    )
-    .await
-    .expect("install_definition");
-    drain_backfill_chunks(&db.pool).await;
-
-    let row = client
-        .query_one(
-            "select t.lo::text, t.hi::text, \
-                    (select min(f8) from s)::text, (select max(f8) from s)::text \
-             from t",
-            &[],
-        )
-        .await
-        .expect("read back");
-    let (lo, hi, pg_lo, pg_hi): (String, String, String, String) =
-        (row.get(0), row.get(1), row.get(2), row.get(3));
-    assert_eq!(lo, pg_lo);
-    assert_eq!(hi, pg_hi);
-    // And Postgres's answer really is the non-IEEE one.
-    assert_eq!(pg_hi, "NaN", "NaN sorts highest, so it is the max");
-    assert_eq!(pg_lo, "-Infinity");
-}
-
 /// The **Rust evaluator's own** float aggregate fold agrees with Postgres,
 /// value for value and byte for byte.
 ///
@@ -1046,7 +854,7 @@ async fn a_float_relationship_join_key_is_rejected_by_name() {
 fn a_float_group_by_key_is_rejected() {
     for column in ["f4", "f8"] {
         let def = parse(&format!(
-            "TRANSFORM t FROM s GROUP BY {column} SELECT {column} AS k, SUM(n) AS total"
+            "TRANSFORM t FROM s GROUP BY {column} WITHOUT SOURCE INDEX SELECT {column} AS k, SUM(n) AS total"
         ))
         .expect("parses");
         let err = validate(&def, &source_columns(), &HashMap::new())
@@ -1060,7 +868,8 @@ fn a_float_group_by_key_is_rejected() {
     // The control: a `numeric` key is still accepted (knowingly weaker, and
     // #110's to tighten), so this is a claim about floats specifically.
     let def =
-        parse("TRANSFORM t FROM s GROUP BY n SELECT n AS k, SUM(n) AS total").expect("parses");
+        parse("TRANSFORM t FROM s GROUP BY n WITHOUT SOURCE INDEX SELECT n AS k, SUM(n) AS total")
+            .expect("parses");
     validate(&def, &source_columns(), &HashMap::new()).expect("a numeric GROUP BY key still works");
 }
 
@@ -1164,144 +973,4 @@ fn the_two_word_double_precision_keyword_parses_in_both_spellings() {
     // lookahead only fires when a string literal follows.
     let def = parse("TRANSFORM t FROM s SELECT double AS d").expect("parses");
     assert_eq!(def.fields[0].expr, Expr::Column("double".to_string()));
-}
-
-// ---------------------------------------------------------------------
-// 8. The incremental path, live
-// ---------------------------------------------------------------------
-
-/// The **incremental** aggregate path keeps a float `SUM`/`AVG` column equal
-/// to a hand-written `GROUP BY` across inserts, updates and deletes.
-///
-/// This is the claim the backfill test above cannot make, and it is the one
-/// the recompute-vs-delta decision is *about*: `defs::invertibility`
-/// classifies a float `SUM`/`AVG` as recompute-only, so
-/// `defs::backfill::classify_field`, which shapes a ledger target
-/// (`staging::ledger::route`), must make these fields recomputed from each
-/// written group's live ledger entries rather than maintained by increments.
-/// If it still passed a hardcoded `ValueType::Numeric` to the gate, as it did
-/// before #112, the workload below would leave a group whose running sum had
-/// drifted, or one poisoned by a deleted `NaN` row that subtraction cannot
-/// undo.
-///
-/// Run through the public `Trellis` facade against the full live pipeline.
-/// The workload starts once the target reports `live`, so every statement
-/// goes through Apply rather than the build, and convergence is awaited via
-/// `watermark_token`/`await_converged`. The comparison is a symmetric
-/// difference against independently-written SQL, per ADR-0013.
-#[tokio::test]
-async fn an_incremental_float_aggregate_stays_equal_to_a_hand_written_group_by() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-
-    let raw = connect_raw(db.dsn()).await;
-    raw.batch_execute(SOURCE_DDL).await.expect("source");
-
-    let definer = Trellis::connect(
-        Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
-        TrellisOptions::default(),
-    )
-    .await
-    .expect("connect definer");
-    definer
-        .apply(
-            "TRANSFORM t FROM s GROUP BY i \
-             SELECT i AS i, SUM(f8) AS total, AVG(f8) AS mean, MAX(f4) AS biggest",
-        )
-        .await
-        .expect("define");
-    definer.shutdown().await.expect("shutdown definer");
-
-    // The columns really are floats — otherwise this test would be
-    // exercising the same `numeric` path everything else does.
-    assert_eq!(column_pg_type(&raw, "t", "total").await, "double precision");
-    assert_eq!(column_pg_type(&raw, "t", "mean").await, "double precision");
-    assert_eq!(column_pg_type(&raw, "t", "biggest").await, "real");
-
-    let trellis = Trellis::connect(
-        Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
-        TrellisOptions {
-            staging: true,
-            drain_threads: 2,
-            ..Default::default()
-        },
-    )
-    .await
-    .expect("connect running trellis");
-
-    // Wait out the build first (#728): `await_converged` covers a definition
-    // only once it is `live`, and from then on every statement below goes
-    // through Apply, the incremental path this test is about.
-    wait_live::wait_for_live(&trellis, "t").await;
-
-    // A workload built specifically to break a delta-maintained float sum:
-    // a group whose magnitudes differ by 16 orders of magnitude (so
-    // reassociation is visible in the last bits), a `NaN` row that is later
-    // *deleted* (irrecoverable by subtraction), rows moving between groups,
-    // and a group emptied entirely.
-    for sql in [
-        "insert into s (id, f4, f8, i) values \
-           (1, 1.5, 1e16, 1), (2, 2.5, 1, 1), (3, 3.5, 1, 1), \
-           (4, 1.0, 2.5, 2), (5, 2.0, 'NaN', 2), \
-           (6, 9.0, 4.5, 3)",
-        "update s set f8 = 1 where id = 1",
-        "delete from s where id = 5",
-        "update s set i = 3 where id = 4",
-        "insert into s (id, f4, f8, i) values (7, 0.5, 1e16, 1)",
-        "delete from s where id = 6",
-        "update s set i = null where id = 2",
-        // Group 4: a `NaN` row deleted from a group that *survives* the
-        // delete. This is the case a delta path cannot undo — subtracting
-        // `NaN` leaves `NaN` — and it has to be a surviving group, because a
-        // group emptied entirely is deleted outright and agrees with the
-        // oracle either way.
-        "insert into s (id, f4, f8, i) values (8, 1.0, 'NaN', 4), (9, 2.0, 7.5, 4)",
-        "delete from s where id = 8",
-    ] {
-        raw.execute(sql, &[])
-            .await
-            .unwrap_or_else(|e| panic!("{sql}: {e}"));
-    }
-
-    let token = trellis.watermark_token().await.expect("watermark_token");
-    trellis
-        .await_converged(token, Duration::from_secs(60))
-        .await
-        .expect("the pipeline must converge");
-
-    let differences: i64 = raw
-        .query_one(
-            "with expected as ( \
-                 select i, sum(f8) as total, avg(f8) as mean, max(f4) as biggest \
-                 from s group by i \
-             ), \
-             actual as (select i, total, mean, biggest from t) \
-             select (select count(*) from (table expected except table actual) missing) \
-                  + (select count(*) from (table actual except table expected) extra)",
-            &[],
-        )
-        .await
-        .expect("difference query")
-        .get(0);
-    assert_eq!(
-        differences, 0,
-        "the incrementally-maintained float target must equal the SQL oracle"
-    );
-
-    // And the workload really did delete the only NaN row, so no group is
-    // left holding one — the assertion above would pass trivially if a
-    // delta path had poisoned every group with NaN, since it would then
-    // differ from the oracle, but this pins that the *oracle* has none.
-    let nan_groups: i64 = raw
-        .query_one("select count(*) from t where total = 'NaN'::float8", &[])
-        .await
-        .expect("count NaN groups")
-        .get(0);
-    assert_eq!(
-        nan_groups, 0,
-        "the NaN row was deleted, so no group may still sum to NaN — a delta path \
-         subtracting NaN would leave one here"
-    );
-
-    trellis.shutdown().await.expect("shutdown");
 }

@@ -398,9 +398,9 @@ pub enum SelfCheckError {
     /// No transform is registered under this target table name.
     TargetNotFound(String),
     /// The target is neither 1-1, an aggregate on the group basis nor a
-    /// `JOIN` that applies (a ledger aggregate, or a `JOIN` with the
-    /// group-basis knob off) — see the module doc comment's "Scope"
-    /// section.
+    /// `JOIN` that applies: an aggregate that reads a relationship path, on
+    /// the ledger until #1115, or, with the group-basis knob forced off, any
+    /// aggregate or `JOIN` — see the module doc comment's "Scope" section.
     UnsupportedKeySpace {
         target: String,
     },
@@ -461,8 +461,9 @@ impl fmt::Display for SelfCheckError {
             }
             SelfCheckError::UnsupportedKeySpace { target } => write!(
                 f,
-                "self_check audits a 1-1 target, an aggregate on the group basis or a JOIN \
-                 on it; \"{target}\" is a target of another kind"
+                "self_check audits a 1-1 target, an aggregate or a JOIN; \"{target}\" is an \
+                 aggregate on the per-row ledger (one that reads a relationship path), which it \
+                 can't audit"
             ),
             SelfCheckError::UnsupportedExpr { target, detail } => {
                 write!(f, "self_check can't audit \"{target}\": {detail}")

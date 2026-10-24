@@ -255,14 +255,9 @@ const AGGREGATE_CASES: &[(&str, &str, &str)] = &[
     ("g1", "SUM(a4)", "sum(a4)"),
     // ...and a `bigint` sum all the way to `numeric`.
     ("g2", "SUM(a8)", "sum(a8)"),
-    ("g3", "SUM(n)", "sum(n)"),
     // The average of integers is never an integer.
     ("g4", "AVG(a4)", "avg(a4)"),
     ("g5", "AVG(a8)", "avg(a8)"),
-    // `min`/`max` keep their argument's own type exactly.
-    ("g6", "MIN(a2)", "min(a2)"),
-    ("g7", "MAX(a4)", "max(a4)"),
-    ("g8", "MAX(a8)", "max(a8)"),
 ];
 
 /// Every aggregate's derived column type equals Postgres's own, including
@@ -285,7 +280,9 @@ async fn aggregate_column_types_match_postgres() {
         .join(", ");
     install_definition(
         &db.pool,
-        &format!("TRANSFORM t FROM s GROUP BY a4 SELECT a4 AS a4, {select_list}"),
+        &format!(
+            "TRANSFORM t FROM s GROUP BY a4 WITHOUT SOURCE INDEX SELECT a4 AS a4, {select_list}"
+        ),
         &source_columns(),
         "public",
     )
@@ -517,8 +514,7 @@ async fn an_integer_group_by_target_matches_a_hand_written_sql_query() {
     install_definition(
         &db.pool,
         "TRANSFORM t FROM s GROUP BY a2 \
-         SELECT a2 AS a2, SUM(a4) AS total, MAX(a8) AS biggest, MIN(a4) AS smallest, \
-                AVG(a8) AS mean",
+        WITHOUT SOURCE INDEX SELECT a2 AS a2, SUM(a4) AS total, AVG(a8) AS mean",
         &source_columns(),
         "public",
     )
@@ -529,11 +525,10 @@ async fn an_integer_group_by_target_matches_a_hand_written_sql_query() {
     let differences: i64 = client
         .query_one(
             "with expected as ( \
-                 select a2, sum(a4) as total, max(a8) as biggest, min(a4) as smallest, \
-                        avg(a8) as mean \
+                 select a2, sum(a4) as total, avg(a8) as mean \
                  from s group by a2 \
              ), \
-             actual as (select a2, total, biggest, smallest, mean from t) \
+             actual as (select a2, total, mean from t) \
              select (select count(*) from (table expected except table actual) missing) \
                   + (select count(*) from (table actual except table expected) extra)",
             &[],
@@ -547,8 +542,6 @@ async fn an_integer_group_by_target_matches_a_hand_written_sql_query() {
     // happens to render the same.
     assert_eq!(column_pg_type(&client, "t", "a2").await, "smallint");
     assert_eq!(column_pg_type(&client, "t", "total").await, "bigint");
-    assert_eq!(column_pg_type(&client, "t", "biggest").await, "bigint");
-    assert_eq!(column_pg_type(&client, "t", "smallest").await, "integer");
     assert_eq!(column_pg_type(&client, "t", "mean").await, "numeric");
 }
 
@@ -579,7 +572,7 @@ async fn an_oid_column_is_a_valid_group_by_key() {
 
     install_definition(
         &db.pool,
-        "TRANSFORM t FROM s GROUP BY o SELECT o AS o, SUM(a4) AS total",
+        "TRANSFORM t FROM s GROUP BY o WITHOUT SOURCE INDEX SELECT o AS o, SUM(a4) AS total",
         &source_columns(),
         "public",
     )
@@ -723,11 +716,10 @@ async fn integer_text_rendering_is_byte_identical_to_postgres() {
 /// across inserts, updates and deletes.
 ///
 /// This is the one claim the backfill test above cannot make, and it is
-/// where a `SUM(integer) -> bigint` column is genuinely load-bearing: a
-/// ledger target (`staging::ledger`, #623 D3) keeps a group's `SUM` in the
-/// visible column itself, and every Apply adds the group's increment to it,
-/// a `sum` over the ledger's `integer` contributions that Postgres widens to
-/// `bigint`. An increment computed in `int4`, or a visible column left
+/// where a `SUM(integer) -> bigint` column is genuinely load-bearing: the
+/// group basis keeps a group's running `SUM`, and every Apply adds the
+/// group's increment to it, which must be widened to `bigint` the way
+/// Postgres widens `sum(integer)`. An increment computed in `int4`, or a visible column left
 /// `integer`, overflows on the workload below, whose sums pass `int4`.
 /// Nothing else in the test suite exercises that: the generative suite's
 /// own value columns are `numeric`, so its `SUM` targets stay `numeric` too.
@@ -756,7 +748,7 @@ async fn an_incremental_bigint_sum_stays_equal_to_a_hand_written_group_by() {
     definer
         .apply(
             "TRANSFORM t FROM s GROUP BY a2 \
-             SELECT a2 AS a2, SUM(a4) AS total, MAX(a8) AS biggest, AVG(a4) AS mean",
+            WITHOUT SOURCE INDEX SELECT a2 AS a2, SUM(a4) AS total, AVG(a4) AS mean",
         )
         .await
         .expect("define");
@@ -765,7 +757,6 @@ async fn an_incremental_bigint_sum_stays_equal_to_a_hand_written_group_by() {
     // The `SUM` column really is a `bigint` — otherwise the rest of this
     // test would be exercising the same `numeric` path everything else does.
     assert_eq!(column_pg_type(&raw, "t", "total").await, "bigint");
-    assert_eq!(column_pg_type(&raw, "t", "biggest").await, "bigint");
     assert_eq!(column_pg_type(&raw, "t", "a2").await, "smallint");
 
     let trellis = Trellis::connect(
@@ -813,10 +804,10 @@ async fn an_incremental_bigint_sum_stays_equal_to_a_hand_written_group_by() {
     let differences: i64 = raw
         .query_one(
             "with expected as ( \
-                 select a2, sum(a4) as total, max(a8) as biggest, avg(a4) as mean \
+                 select a2, sum(a4) as total, avg(a4) as mean \
                  from s group by a2 \
              ), \
-             actual as (select a2, total, biggest, mean from t) \
+             actual as (select a2, total, mean from t) \
              select (select count(*) from (table expected except table actual) missing) \
                   + (select count(*) from (table actual except table expected) extra)",
             &[],

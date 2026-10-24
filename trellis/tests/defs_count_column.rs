@@ -38,7 +38,7 @@
 //! every aggregate used to collapse into before issue #111 had anywhere to
 //! put an integer.
 //!
-//! Harness conventions follow `defs_enum.rs`/`defs_min_max_text_and_uuid.rs`.
+//! Harness conventions follow `defs_enum.rs`.
 
 use std::collections::HashMap;
 
@@ -228,7 +228,7 @@ async fn read_expected(client: &Client) -> Vec<(i32, i64, i64)> {
 }
 
 const DEF_SQL: &str = "TRANSFORM totals FROM events GROUP BY grp \
-     SELECT grp AS grp, COUNT(*) AS total_rows, COUNT(amount) AS non_null_amounts";
+    WITHOUT SOURCE INDEX SELECT grp AS grp, COUNT(*) AS total_rows, COUNT(amount) AS non_null_amounts";
 
 fn columns() -> HashMap<String, ValueType> {
     HashMap::from([

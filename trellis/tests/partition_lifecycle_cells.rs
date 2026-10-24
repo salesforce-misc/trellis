@@ -22,8 +22,7 @@ use trellis::integer::IntWidth;
 use trellis::staging::partition_correction::{self, Options, Outcome};
 
 const SOURCE: &str = "public.items";
-const DEFINITION: &str =
-    "TRANSFORM agg FROM public.items GROUP BY g SELECT SUM(v) AS total, COUNT(*) AS n";
+const DEFINITION: &str = "TRANSFORM agg FROM public.items GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n";
 
 /// `items (id, g, v)` partitioned `kind` on `g`, empty.
 fn head(kind: &str) -> String {

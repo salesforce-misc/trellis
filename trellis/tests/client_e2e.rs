@@ -1179,7 +1179,7 @@ async fn drain_workers_waiting_an_hour_still_build_and_drain_on_notifications_al
     .collect();
     install_definition(
         &db.pool,
-        "TRANSFORM agg FROM public.src GROUP BY g SELECT SUM(v) AS total",
+        "TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total",
         &columns,
         "public",
     )

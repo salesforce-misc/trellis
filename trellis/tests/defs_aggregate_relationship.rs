@@ -156,7 +156,7 @@ fn post_tags_columns() -> HashMap<String, ValueType> {
 }
 
 const TAG_TOTALS: &str = "TRANSFORM tag_totals FROM post_tags GROUP BY tag \
-     SELECT COUNT(*) AS post_count, SUM(post.word_count) AS total_words";
+    WITHOUT SOURCE INDEX SELECT COUNT(*) AS post_count, SUM(post.word_count) AS total_words";
 
 /// Issue #94's exact schema. `post_tags` is an *aggregate* source, and
 /// `posts` is the to-side of a to-one relationship.
@@ -763,7 +763,7 @@ async fn avg_over_a_relationship_read_column_maintains_through_backfill_and_forw
     .expect("create to-one relationship");
     install_definition(
         &db.pool,
-        "TRANSFORM tag_avg FROM post_tags GROUP BY tag SELECT AVG(post.word_count) AS avg_words",
+        "TRANSFORM tag_avg FROM post_tags GROUP BY tag WITHOUT SOURCE INDEX SELECT AVG(post.word_count) AS avg_words",
         &post_tags_columns(),
         "public",
     )
@@ -870,7 +870,7 @@ async fn two_relationships_sharing_a_to_side_column_name_resolve_independently()
     install_definition(
         &db.pool,
         "TRANSFORM review_totals FROM reviews GROUP BY article_id \
-         SELECT COUNT(*) AS review_count, SUM(author.score) AS author_total, \
+        WITHOUT SOURCE INDEX SELECT COUNT(*) AS review_count, SUM(author.score) AS author_total, \
          SUM(editor.score) AS editor_total",
         &source_columns,
         "public",
@@ -969,7 +969,7 @@ async fn two_relationships_sharing_a_to_side_column_name_resolve_independently()
 // `RecomputeOnly`, so it's the one that must probe live and correctly).
 
 const MIXED_TOTALS: &str = "TRANSFORM tag_mixed FROM post_tags GROUP BY tag \
-     SELECT SUM(id) AS id_sum, MIN(post.word_count) AS min_word_count";
+    WITHOUT SOURCE INDEX SELECT SUM(id) AS id_sum, MIN(post.word_count) AS min_word_count";
 
 fn mixed_oracle_def() -> TransformDef {
     TransformDef {
@@ -1210,7 +1210,7 @@ async fn a_bare_to_one_path_in_an_aggregate_is_rejected() {
 
     let err = install_definition(
         &db.pool,
-        "TRANSFORM tag_totals FROM post_tags GROUP BY tag SELECT post.word_count AS wc",
+        "TRANSFORM tag_totals FROM post_tags GROUP BY tag WITHOUT SOURCE INDEX SELECT post.word_count AS wc",
         &post_tags_columns(),
         "public",
     )
@@ -1258,7 +1258,7 @@ async fn a_to_many_path_in_an_aggregate_is_still_rejected() {
 
     let err = install_definition(
         &db.pool,
-        "TRANSFORM tag_lengths FROM posts GROUP BY tag SELECT sum(comments.length) AS total",
+        "TRANSFORM tag_lengths FROM posts GROUP BY tag WITHOUT SOURCE INDEX SELECT sum(comments.length) AS total",
         &columns(&[
             ("id", ValueType::Numeric),
             ("word_count", ValueType::Numeric),
@@ -1303,7 +1303,7 @@ async fn an_invalid_aggregate_definition_leaves_no_target_table() {
 
     let err = install_definition(
         &db.pool,
-        "TRANSFORM tag_totals FROM post_tags GROUP BY tag SELECT post AS p",
+        "TRANSFORM tag_totals FROM post_tags GROUP BY tag WITHOUT SOURCE INDEX SELECT post AS p",
         &post_tags_columns(),
         "public",
     )
@@ -1335,7 +1335,7 @@ async fn an_invalid_aggregate_definition_leaves_no_target_table() {
 // ---------------------------------------------------------------------
 
 const TAG_WORD_COUNTS: &str = "TRANSFORM tag_word_counts FROM post_tags GROUP BY tag \
-     SELECT COUNT(*) AS post_count, COUNT(post.word_count) AS non_null_word_counts, \
+    WITHOUT SOURCE INDEX SELECT COUNT(*) AS post_count, COUNT(post.word_count) AS non_null_word_counts, \
      SUM(post.word_count) AS total_words";
 
 /// [`oracle_def`]'s twin, with an added `COUNT(post.word_count)` field —

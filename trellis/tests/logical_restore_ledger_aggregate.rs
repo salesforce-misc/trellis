@@ -208,7 +208,7 @@ async fn a_ledger_aggregate_restored_behind_the_original_resumes_and_applies_lat
     definer(db.dsn())
         .await
         .apply(
-            "TRANSFORM tot FROM public.g GROUP BY grp SELECT grp AS grp, SUM(amt) AS s, \
+            "TRANSFORM tot FROM public.g GROUP BY grp WITHOUT SOURCE INDEX SELECT grp AS grp, SUM(amt) AS s, \
              COUNT(*) AS n",
         )
         .await

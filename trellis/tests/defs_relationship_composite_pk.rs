@@ -179,7 +179,7 @@ fn post_tags_columns() -> HashMap<String, ValueType> {
 }
 
 const TAG_TOTALS: &str = "TRANSFORM tag_totals FROM post_tags GROUP BY tag \
-     SELECT COUNT(*) AS post_count, SUM(post.word_count) AS total_words";
+    WITHOUT SOURCE INDEX SELECT COUNT(*) AS post_count, SUM(post.word_count) AS total_words";
 
 /// Issue #94's schema, minus its surrogate `id` column: `post_tags`' own
 /// primary key is the composite `(post, tag)` pair — the shape issue #126's
@@ -398,7 +398,7 @@ async fn plain_aggregate_over_a_composite_pk_source_drains_with_no_relationship_
     client
         .batch_execute(
             "create table order_lines ( \
-                 order_id integer, line_no integer, category text, amount numeric, \
+                 order_id integer, line_no integer, category text, amount numeric(12,0), \
                  primary key (order_id, line_no) \
              ); \
              insert into order_lines (order_id, line_no, category, amount) values \
@@ -415,7 +415,7 @@ async fn plain_aggregate_over_a_composite_pk_source_drains_with_no_relationship_
     ]);
     install_definition(
         &db.pool,
-        "TRANSFORM category_totals FROM order_lines GROUP BY category SELECT SUM(amount) AS total",
+        "TRANSFORM category_totals FROM order_lines GROUP BY category WITHOUT SOURCE INDEX SELECT SUM(amount) AS total",
         &source_columns,
         "public",
     )

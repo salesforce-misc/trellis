@@ -365,7 +365,8 @@ async fn bytea_join_keys_and_primary_keys_are_admitted() {
 #[test]
 fn bytea_group_by_key_is_admitted() {
     let def =
-        parse("TRANSFORM t FROM s GROUP BY b SELECT b AS k, SUM(n) AS total").expect("parses");
+        parse("TRANSFORM t FROM s GROUP BY b WITHOUT SOURCE INDEX SELECT b AS k, SUM(n) AS total")
+            .expect("parses");
     validate(&def, &source_columns(), &HashMap::new())
         .unwrap_or_else(|e| panic!("bytea must be accepted as a GROUP BY key: {e}"));
 }
@@ -418,7 +419,7 @@ async fn postgres_has_no_min_max_aggregate_for_bytea() {
         );
 
         let def = parse(&format!(
-            "TRANSFORM t FROM s GROUP BY id SELECT id AS k, {name}(b) AS m"
+            "TRANSFORM t FROM s GROUP BY id WITHOUT SOURCE INDEX SELECT id AS k, {name}(b) AS m"
         ))
         .expect("parses");
         let err = validate(&def, &source_columns(), &HashMap::new())
@@ -447,8 +448,7 @@ async fn postgres_has_no_min_max_aggregate_for_bytea() {
 /// pipeline, not just an isolated SQL probe.
 #[tokio::test]
 async fn a_bytea_group_key_seeded_by_backfill_and_by_live_read_is_one_group_not_two() {
-    const DEF_SQL: &str =
-        "TRANSFORM totals FROM events GROUP BY grp SELECT grp AS grp, SUM(amount) AS total";
+    const DEF_SQL: &str = "TRANSFORM totals FROM events GROUP BY grp WITHOUT SOURCE INDEX SELECT grp AS grp, SUM(amount) AS total";
 
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -457,7 +457,7 @@ async fn a_bytea_group_key_seeded_by_backfill_and_by_live_read_is_one_group_not_
     client
         .batch_execute(
             "create table events ( \
-               id integer primary key, grp bytea, amount numeric)",
+               id integer primary key, grp bytea, amount numeric(12,0))",
         )
         .await
         .expect("create source table");

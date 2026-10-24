@@ -9,7 +9,7 @@
 
 use trellis::{Applied, QuarantineTarget};
 
-use crate::{PlainRelationship, quarantine_address};
+use crate::quarantine_address;
 
 /// An [`Applied`] flattened to plain data.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,8 +17,6 @@ pub enum PlainApplied {
     /// A `TRANSFORM` statement registered the transform writing this
     /// fully-qualified target table.
     TransformDefined(String),
-    /// A `RELATIONSHIP` statement registered this relationship.
-    RelationshipDefined(PlainRelationship),
     /// A `PAUSE TRANSFORM` statement froze its subject, or found it frozen.
     Paused,
     /// A `RESUME TRANSFORM` statement unfroze its subject. `columns` is every
@@ -44,9 +42,8 @@ pub enum PlainApplied {
 impl PlainApplied {
     /// Every word [`PlainApplied::kind`] can return: the set a host allocates
     /// its names from at load time.
-    pub const KINDS: [&'static str; 7] = [
+    pub const KINDS: [&'static str; 6] = [
         "transform_defined",
-        "relationship_defined",
         "paused",
         "resumed",
         "dropped",
@@ -55,12 +52,11 @@ impl PlainApplied {
     ];
 
     /// The variant's stable name, the word a host keys its result off:
-    /// `transform_defined`, `relationship_defined`, `paused`, `resumed`,
+    /// `transform_defined`, `paused`, `resumed`,
     /// `dropped`, `altered` or `unknown`.
     pub fn kind(&self) -> &'static str {
         match self {
             PlainApplied::TransformDefined(_) => "transform_defined",
-            PlainApplied::RelationshipDefined(_) => "relationship_defined",
             PlainApplied::Paused => "paused",
             PlainApplied::Resumed { .. } => "resumed",
             PlainApplied::Dropped => "dropped",
@@ -75,9 +71,6 @@ impl From<&Applied> for PlainApplied {
         match applied {
             Applied::TransformDefined(target_table) => {
                 PlainApplied::TransformDefined(target_table.clone())
-            }
-            Applied::RelationshipDefined(relationship) => {
-                PlainApplied::RelationshipDefined(PlainRelationship::from(relationship))
             }
             Applied::Paused => PlainApplied::Paused,
             Applied::Resumed { columns } => PlainApplied::Resumed {
@@ -110,9 +103,6 @@ impl From<&Applied> for PlainApplied {
 
 #[cfg(test)]
 mod tests {
-    use trellis::dev::defs::ast::RelationshipDef;
-    use trellis::{RelationshipCardinality, RelationshipDefinition};
-
     use super::*;
 
     #[test]
@@ -126,33 +116,6 @@ mod tests {
             PlainApplied::TransformDefined("public.widget_prices".to_string())
         );
         assert_eq!(plain.kind(), "transform_defined");
-    }
-
-    #[test]
-    fn a_defined_relationship_crosses_as_its_plain_relationship() {
-        let applied = Applied::RelationshipDefined(RelationshipDefinition {
-            id: 2,
-            from_schema: "public".to_string(),
-            to_schema: "public".to_string(),
-            def: RelationshipDef {
-                name: "owner".to_string(),
-                from_table: "widgets".to_string(),
-                from_col: "owner_id".to_string(),
-                to_table: "users".to_string(),
-                to_col: "id".to_string(),
-            },
-            cardinality: RelationshipCardinality::ToMany,
-            warnings: Vec::new(),
-        });
-
-        let plain = PlainApplied::from(&applied);
-
-        let PlainApplied::RelationshipDefined(relationship) = &plain else {
-            panic!("expected a relationship, got {plain:?}");
-        };
-        assert_eq!(relationship.name, "owner");
-        assert_eq!(relationship.cardinality, "many");
-        assert_eq!(plain.kind(), "relationship_defined");
     }
 
     #[test]
@@ -214,18 +177,6 @@ mod tests {
     fn every_kind_is_in_the_load_time_set() {
         for plain in [
             PlainApplied::TransformDefined("public.widget_prices".to_string()),
-            PlainApplied::RelationshipDefined(PlainRelationship {
-                id: 1,
-                name: "owner".to_string(),
-                from_schema: "public".to_string(),
-                from_table: "widgets".to_string(),
-                from_col: "owner_id".to_string(),
-                to_schema: "public".to_string(),
-                to_table: "users".to_string(),
-                to_col: "id".to_string(),
-                cardinality: "one",
-                warnings: Vec::new(),
-            }),
             PlainApplied::Paused,
             PlainApplied::Resumed {
                 columns: Vec::new(),

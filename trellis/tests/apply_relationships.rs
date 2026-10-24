@@ -1418,7 +1418,7 @@ async fn an_aggregate_joins_the_to_one_side_it_was_declared_against() {
     install_definition(
         &other_pool,
         "TRANSFORM spend_by_name FROM shop.orders GROUP BY buyer.name \
-         SELECT SUM(amount) AS total",
+        WITHOUT SOURCE INDEX SELECT SUM(amount) AS total",
         &columns(&[
             ("id", ValueType::Numeric),
             ("user_id", ValueType::Numeric),
@@ -1522,7 +1522,7 @@ async fn a_to_side_rename_after_a_drained_sibling_leaves_no_stale_old_group() {
     .expect("declare buyer");
     install_definition(
         &db.pool,
-        "TRANSFORM spend_by_name FROM orders GROUP BY buyer.name SELECT SUM(amount) AS total",
+        "TRANSFORM spend_by_name FROM orders GROUP BY buyer.name WITHOUT SOURCE INDEX SELECT SUM(amount) AS total",
         &columns(&[
             ("id", ValueType::Numeric),
             ("user_id", ValueType::Numeric),
@@ -1751,7 +1751,7 @@ async fn to_side_change_scenario(case: &AggregateCase, change: ToSideChange, pat
     install_definition(
         &db.pool,
         &format!(
-            "TRANSFORM agg_516 FROM orders GROUP BY {} SELECT {}",
+            "TRANSFORM agg_516 FROM orders GROUP BY {} WITHOUT SOURCE INDEX SELECT {}",
             case.group_by, case.select
         ),
         &columns(&[
@@ -1959,7 +1959,7 @@ async fn a_to_side_rename_regroups_an_aggregate_chained_off_a_relationship_targe
     drain_to_quiescence(&db.pool, &mut client).await;
     install_definition(
         &db.pool,
-        "TRANSFORM spend_by_bname FROM order_buyer GROUP BY bname SELECT SUM(spent) AS total",
+        "TRANSFORM spend_by_bname FROM order_buyer GROUP BY bname WITHOUT SOURCE INDEX SELECT SUM(spent) AS total",
         &columns(&[
             ("id", ValueType::Numeric),
             ("bname", ValueType::Text),
@@ -2035,7 +2035,7 @@ async fn a_to_side_rename_regroups_an_aggregate_grouped_by_two_relationships() {
     install_definition(
         &db.pool,
         "TRANSFORM spend_by_pair FROM orders GROUP BY buyer.name, seller.title \
-         SELECT SUM(amount) AS total",
+        WITHOUT SOURCE INDEX SELECT SUM(amount) AS total",
         &columns(&[
             ("id", ValueType::Numeric),
             ("user_id", ValueType::Numeric),
@@ -2187,7 +2187,7 @@ async fn both_relationships_of_a_two_relationship_group_by_changing_in_one_batch
  {
     both_relationships_change_in_one_batch(&[TwoRelationshipAggregate {
         definition: "TRANSFORM spend_by_pair FROM orders GROUP BY buyer.name, seller.title \
-                     SELECT SUM(amount) AS total",
+                    WITHOUT SOURCE INDEX SELECT SUM(amount) AS total",
         target: "select concat_ws('|', name, title), total::text from spend_by_pair",
         oracle: "select concat_ws('|', u.name, s.title), sum(o.amount)::text from orders o \
                  left join users u on u.id = o.user_id left join shops s on s.id = o.shop_id \
@@ -2206,14 +2206,14 @@ async fn two_single_relationship_aggregates_whose_relationships_change_in_one_ba
     both_relationships_change_in_one_batch(&[
         TwoRelationshipAggregate {
             definition: "TRANSFORM min_by_buyer FROM orders GROUP BY buyer.name \
-                         SELECT MIN(amount) AS least",
+                        WITHOUT SOURCE INDEX SELECT MIN(amount) AS least",
             target: "select name, least::text from min_by_buyer",
             oracle: "select u.name, min(o.amount)::text from orders o \
                      left join users u on u.id = o.user_id group by u.name",
         },
         TwoRelationshipAggregate {
             definition: "TRANSFORM min_by_seller FROM orders GROUP BY seller.title \
-                         SELECT MIN(amount) AS least",
+                        WITHOUT SOURCE INDEX SELECT MIN(amount) AS least",
             target: "select title, least::text from min_by_seller",
             oracle: "select s.title, min(o.amount)::text from orders o \
                      left join shops s on s.id = o.shop_id group by s.title",
@@ -2248,14 +2248,14 @@ const TRUNCATE_AGGREGATES: &[TruncateAggregate] = &[
         oracle: "select o.id::text, coalesce(u.name, '<null>') || '|' || o.amount::text from orders o                  left join users u on u.id = o.user_id",
     },
     TruncateAggregate {
-        definition: "TRANSFORM by_buyer FROM orders GROUP BY buyer.name SELECT SUM(amount) AS v",
+        definition: "TRANSFORM by_buyer FROM orders GROUP BY buyer.name WITHOUT SOURCE INDEX SELECT SUM(amount) AS v",
         target: "select coalesce(name, '<null>'), v::text from by_buyer",
         oracle: "select coalesce(u.name, '<null>'), sum(o.amount)::text from orders o \
                  left join users u on u.id = o.user_id group by u.name",
     },
     TruncateAggregate {
         definition: "TRANSFORM by_pair FROM orders GROUP BY buyer.name, seller.title \
-                     SELECT COUNT(*) AS v",
+                    WITHOUT SOURCE INDEX SELECT COUNT(*) AS v",
         target: "select coalesce(name, '<null>') || '|' || coalesce(title, '<null>'), v::text \
                  from by_pair",
         oracle: "select coalesce(u.name, '<null>') || '|' || coalesce(s.title, '<null>'), \
@@ -2265,14 +2265,14 @@ const TRUNCATE_AGGREGATES: &[TruncateAggregate] = &[
     },
     TruncateAggregate {
         definition: "TRANSFORM by_region_buyer FROM orders GROUP BY region, buyer.name \
-                     SELECT MAX(amount) AS v",
+                    WITHOUT SOURCE INDEX SELECT MAX(amount) AS v",
         target: "select region || '|' || coalesce(name, '<null>'), v::text from by_region_buyer",
         oracle: "select o.region || '|' || coalesce(u.name, '<null>'), max(o.amount)::text \
                  from orders o left join users u on u.id = o.user_id group by o.region, u.name",
     },
     TruncateAggregate {
         definition: "TRANSFORM by_seller FROM orders GROUP BY seller.title \
-                     SELECT MIN(amount) AS v",
+                    WITHOUT SOURCE INDEX SELECT MIN(amount) AS v",
         target: "select coalesce(title, '<null>'), v::text from by_seller",
         oracle: "select coalesce(s.title, '<null>'), min(o.amount)::text from orders o \
                  left join shops s on s.id = o.shop_id group by s.title",
@@ -2704,7 +2704,7 @@ async fn two_relationship_columns_with_the_same_joined_name_group_apart() {
     }
     install_definition(
         &db.pool,
-        "TRANSFORM by_pair FROM orders GROUP BY x_y.z, x.y_z SELECT SUM(amount) AS v",
+        "TRANSFORM by_pair FROM orders GROUP BY x_y.z, x.y_z WITHOUT SOURCE INDEX SELECT SUM(amount) AS v",
         &columns(&[
             ("id", ValueType::Numeric),
             ("user_id", ValueType::Numeric),
@@ -2777,7 +2777,7 @@ async fn a_source_column_named_like_a_reverse_synthetic_column_is_read_as_itself
     install_definition(
         &db.pool,
         "TRANSFORM by_buyer FROM orders GROUP BY buyer.name \
-         SELECT SUM(__trellis_rev_name) AS v",
+        WITHOUT SOURCE INDEX SELECT SUM(__trellis_rev_name) AS v",
         &columns(&[
             ("id", ValueType::Numeric),
             ("user_id", ValueType::Numeric),

@@ -115,7 +115,7 @@ that is not implemented.
 
 ### Column edits validate against the dependency graph like any definition change
 
-Adding or altering a column that references another table, a relationship, or a sibling
+Adding or altering a column that references another table or a sibling
 column is a graph-edge change, validated by the same whole-graph cycle detection a define
 runs. An edit that would introduce a cycle, directly or transitively, is rejected before
 it runs.

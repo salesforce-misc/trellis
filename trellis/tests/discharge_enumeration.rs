@@ -286,7 +286,7 @@ async fn a_table_only_waiting_rederive_builds_read_is_not_enumerated() {
     ]);
     install_definition(
         &db.pool,
-        "TRANSFORM widget_totals FROM widgets GROUP BY grp SELECT grp AS grp, SUM(n) AS total",
+        "TRANSFORM widget_totals FROM widgets GROUP BY grp WITHOUT SOURCE INDEX SELECT grp AS grp, SUM(n) AS total",
         &columns,
         "public",
     )
@@ -371,7 +371,7 @@ async fn a_waiting_rederive_build_beside_a_live_reader_still_enumerates() {
         .expect("seed source");
     install_definition(
         &db.pool,
-        "TRANSFORM widget_totals FROM widgets GROUP BY grp SELECT grp AS grp, SUM(n) AS total",
+        "TRANSFORM widget_totals FROM widgets GROUP BY grp WITHOUT SOURCE INDEX SELECT grp AS grp, SUM(n) AS total",
         &columns,
         "public",
     )
@@ -421,7 +421,7 @@ async fn a_waiting_rederive_builds_related_table_is_not_enumerated() {
     .expect("create posts relationship");
     install_definition(
         &db.pool,
-        "TRANSFORM authors_per_grp FROM authors GROUP BY grp SELECT grp AS grp, COUNT(id) AS n",
+        "TRANSFORM authors_per_grp FROM authors GROUP BY grp WITHOUT SOURCE INDEX SELECT grp AS grp, COUNT(id) AS n",
         &HashMap::from([
             ("id".to_string(), ValueType::Numeric),
             ("grp".to_string(), ValueType::Text),

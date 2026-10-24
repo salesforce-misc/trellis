@@ -119,8 +119,7 @@ async fn assert_equal(d: &mut Driver, actual: &str, expected: &str) {
 
 // ---------------------------------------------- ported chained aggregates
 
-const AGG_G: &str =
-    "TRANSFORM agg FROM public.src GROUP BY g SELECT SUM(v) AS total, COUNT(*) AS n";
+const AGG_G: &str = "TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n";
 
 fn agg_g_columns() -> Vec<(&'static str, ValueType)> {
     vec![("g", int4()), ("total", int8()), ("n", int8())]
@@ -133,7 +132,7 @@ fn agg_g_columns() -> Vec<(&'static str, ValueType)> {
 async fn an_extinct_upstream_group_removes_its_rollup_group() {
     let mut d = start(
         AGG_G,
-        "TRANSFORM roll FROM public.agg GROUP BY g SELECT SUM(total) AS total2",
+        "TRANSFORM roll FROM public.agg GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(total) AS total2",
         &agg_g_columns(),
         2,
     )
@@ -161,9 +160,9 @@ async fn an_extinct_upstream_group_removes_its_rollup_group() {
 #[tokio::test]
 async fn an_extinct_composite_upstream_group_reduces_its_coarser_rollup() {
     let mut d = start(
-        "TRANSFORM agg FROM public.src GROUP BY g, h SELECT SUM(v) AS total, COUNT(*) AS n",
+        "TRANSFORM agg FROM public.src GROUP BY g, h WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n",
         "TRANSFORM roll FROM public.agg GROUP BY g \
-         SELECT SUM(total) AS total2, COUNT(*) AS groups",
+        WITHOUT SOURCE INDEX SELECT SUM(total) AS total2, COUNT(*) AS groups",
         &[
             ("g", int4()),
             ("h", int4()),
@@ -408,7 +407,7 @@ async fn an_upstream_rebuild_outside_the_seam_rebuilds_the_reader() {
          create index on public.src (g, h)",
         &columns,
         &["RELATIONSHIP parent FROM src.h TO par.id"],
-        &["TRANSFORM up FROM public.src GROUP BY g SELECT SUM(parent.x) AS total, COUNT(*) AS n"],
+        &["TRANSFORM up FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(parent.x) AS total, COUNT(*) AS n"],
         &["public.par", SRC],
     )
     .await;
@@ -602,7 +601,7 @@ async fn a_rollup_over_a_relationship_fed_upstream_follows_parent_changes() {
          create index on public.src (g, h)",
         &columns,
         &["RELATIONSHIP parent FROM src.h TO par.id"],
-        &["TRANSFORM up FROM public.src GROUP BY g SELECT SUM(parent.x) AS total, COUNT(*) AS n"],
+        &["TRANSFORM up FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(parent.x) AS total, COUNT(*) AS n"],
         &["public.par", SRC],
     )
     .await;
@@ -641,7 +640,7 @@ async fn a_rollup_over_a_relationship_fed_upstream_follows_parent_changes() {
 #[tokio::test]
 async fn a_one_to_one_reader_holds_the_null_keyed_groups() {
     let mut d = start(
-        "TRANSFORM agg FROM public.src GROUP BY g, h SELECT COUNT(*) AS n, SUM(v) AS t",
+        "TRANSFORM agg FROM public.src GROUP BY g, h WITHOUT SOURCE INDEX SELECT COUNT(*) AS n, SUM(v) AS t",
         "TRANSFORM a2 FROM public.agg SELECT n AS n, t + 1 AS t1",
         &[("g", int4()), ("h", int4()), ("n", int8()), ("t", int8())],
         1,
@@ -682,7 +681,7 @@ async fn a_one_to_one_reader_of_a_join_target_holds_the_null_group() {
         &[("id", int4()), ("ga", int4()), ("k", int4()), ("x", int4())],
         &[
             "TRANSFORM j FROM public.a JOIN public.b ON a.k = b.k GROUP BY a.ga \
-           SELECT a.ga AS ga, COUNT(*) AS n, SUM(b.y) AS sy",
+          WITHOUT SOURCE INDEX SELECT a.ga AS ga, COUNT(*) AS n, SUM(b.y) AS sy",
         ],
         &["public.a", "public.b"],
     )
@@ -730,7 +729,7 @@ async fn a_one_to_one_reader_of_a_join_target_holds_the_null_group() {
 #[tokio::test]
 async fn a_rollup_over_a_one_to_one_reader_follows_its_null_keyed_rows() {
     let mut d = start(
-        "TRANSFORM agg FROM public.src GROUP BY g, h SELECT COUNT(*) AS n",
+        "TRANSFORM agg FROM public.src GROUP BY g, h WITHOUT SOURCE INDEX SELECT COUNT(*) AS n",
         "TRANSFORM a2 FROM public.agg SELECT n AS n",
         &[("g", int4()), ("h", int4()), ("n", int8())],
         1,
@@ -773,7 +772,7 @@ async fn a_rollup_over_a_one_to_one_reader_follows_its_null_keyed_rows() {
 async fn a_pause_and_drop_of_a_reader_wait_for_a_page_that_planned_it() {
     let mut d = start(
         AGG_G,
-        "TRANSFORM roll FROM public.agg GROUP BY g SELECT SUM(total) AS total2",
+        "TRANSFORM roll FROM public.agg GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(total) AS total2",
         &agg_g_columns(),
         2,
     )
@@ -920,9 +919,8 @@ async fn a_pause_and_drop_of_a_one_to_one_wait_for_a_page_that_planned_it() {
 
 // ------------------------------------------ a build over NULL-part keys
 
-const UP_HG: &str =
-    "TRANSFORM up FROM public.src GROUP BY g, h SELECT SUM(v) AS total, COUNT(*) AS n";
-const ROLL_H: &str = "TRANSFORM roll FROM public.up GROUP BY h SELECT SUM(total) AS t2, \
+const UP_HG: &str = "TRANSFORM up FROM public.src GROUP BY g, h WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n";
+const ROLL_H: &str = "TRANSFORM roll FROM public.up GROUP BY h WITHOUT SOURCE INDEX SELECT SUM(total) AS t2, \
                       SUM(n) AS n2";
 const ROLL: &str = "public.roll";
 const ROLL_ACTUAL: &str = "select h, t2, n2 from public.roll order by h";

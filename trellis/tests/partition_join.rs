@@ -72,10 +72,10 @@ const BOTH: [Part; 2] = [Part::Fact, Part::Dim];
 /// Both partial keys hold `k`, the partition key.
 const DEFINITIONS: [&str; 2] = [
     "TRANSFORM l FROM public.a LEFT JOIN public.b ON a.k = b.k GROUP BY b.gb \
-     SELECT b.gb AS gb, COUNT(*) AS n, COUNT(a.x) AS cx, SUM(a.x) AS sx, \
+    WITHOUT SOURCE INDEX SELECT b.gb AS gb, COUNT(*) AS n, COUNT(a.x) AS cx, SUM(a.x) AS sx, \
             COUNT(b.y) AS cy, SUM(b.y) AS sy",
     "TRANSFORM i FROM public.a JOIN public.b ON a.k = b.k GROUP BY a.ga, b.gb \
-     SELECT a.ga AS ga, b.gb AS gb, COUNT(*) AS n, SUM(a.x) AS sx, SUM(b.y) AS sy",
+    WITHOUT SOURCE INDEX SELECT a.ga AS ga, b.gb AS gb, COUNT(*) AS n, SUM(a.x) AS sx, SUM(b.y) AS sy",
 ];
 
 /// Each target and its oracle, both ordered by its group columns.

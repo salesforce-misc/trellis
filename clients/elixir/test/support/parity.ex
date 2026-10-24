@@ -23,7 +23,6 @@ defmodule Trellis.Parity do
   """
   def word_set("transform_status"), do: words(Trellis.Native.status_names())
   def word_set("quarantine_state"), do: words(Trellis.Native.quarantine_state_names())
-  def word_set("cardinality"), do: words(Trellis.Native.cardinality_names())
   def word_set("applied_kind"), do: words(Trellis.Native.applied_kinds())
   def word_set("self_check_mode"), do: words(Trellis.Native.self_check_modes())
   def word_set("self_check_state"), do: words(Trellis.Native.self_check_states())
@@ -52,7 +51,6 @@ defmodule Trellis.Parity do
       "apply" => plain,
       "status" => plain,
       "definitions" => plain,
-      "relationships" => plain,
       "request_backfill" => plain,
       "release_key" => plain,
       "poisoned_since" => plain,
@@ -195,7 +193,7 @@ defmodule Trellis.Parity do
   defp map_key(key) when is_binary(key), do: key
   defp map_key(key), do: mismatch("map key #{inspect(key)} isn't a string")
 
-  @applied_fields [:target_table, :relationship, :columns, :added, :dropped, :altered]
+  @applied_fields [:target_table, :columns, :added, :dropped, :altered]
 
   @doc """
   A `Trellis.Applied.t()` tagged tuple in canonical form, as the fixture's
@@ -207,9 +205,6 @@ defmodule Trellis.Parity do
 
   def canonical_applied({:transform_defined, target_table}),
     do: applied_record(:transform_defined, %{target_table: target_table})
-
-  def canonical_applied({:relationship_defined, relationship}),
-    do: applied_record(:relationship_defined, %{relationship: relationship})
 
   def canonical_applied({:resumed, columns}), do: applied_record(:resumed, %{columns: columns})
   def canonical_applied({:altered, alteration}), do: applied_record(:altered, alteration)

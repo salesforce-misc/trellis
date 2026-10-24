@@ -195,8 +195,7 @@ class ValuesTest < Minitest::Test
   end
 
   def test_an_applied_carries_only_its_kinds_fields
-    empty = { target_table: nil, relationship: nil, columns: nil, added: nil, dropped: nil,
-              altered: nil }
+    empty = { target_table: nil, columns: nil, added: nil, dropped: nil, altered: nil }
 
     applied = Trellis::Applied.from_native(empty.merge(kind: :transform_defined, target_table: "public.t"))
     assert_equal "public.t", applied.target_table
@@ -235,9 +234,7 @@ class ValuesTest < Minitest::Test
                  Trellis::Native.status_names
     assert_equal %i[live waiting_to_backfill backfilling catching_up quarantined paused].sort,
                  Trellis::Native.quarantine_states.sort
-    assert_equal %i[one many], Trellis::Native.cardinality_names
-    assert_equal %i[transform_defined relationship_defined paused resumed dropped altered
-                    unknown],
+    assert_equal %i[transform_defined paused resumed dropped altered unknown],
                  Trellis::Native.applied_kinds
     assert_equal %i[converged not_caught_up not_live diverged], Trellis::Native.self_check_outcomes
     assert_equal %i[cell missing_row extra_row missing_column extra_column capture],

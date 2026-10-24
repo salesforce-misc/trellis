@@ -7,14 +7,14 @@ deciders: Michael Ries
 # Public API Design
 
 The public API is a "deep interface": one connection, one minimal set of entrypoints,
-the same grammar for defining a transform as a relationship — mirroring how Postgres
+one grammar for defining, altering, pausing and dropping a transform — mirroring how Postgres
 exposes only SQL, not a protocol per feature. It is what lets Trellis be embedded in
 Rails/Elixir over an FFI boundary ([ADR-0010](0010-embeddable-clients.md)).
 
 The `Trellis` facade is that interface: `connect(config, options)`,
 one grammar-driven `apply(text)` for every definition change (see
 [ADR-0012](0012-curate-public-api-demote-engine-modules.md)), typed reads such as
-`definitions()`, `relationships()`, `status()`, `request_backfill(table)` and
+`definitions()`, `status()`, `request_backfill(table)` and
 `poisoned_since(watermark)`, and `shutdown()`. This ADR records the choices behind it:
 crossing FFI, the grammar-vs-typed-method split, the error shape, resource caps,
 quarantine/status observability and the per-call deadline. The handle model is
@@ -64,14 +64,14 @@ from a thread that already has a runtime entered.
 ### 2. Grammar scope: definitional statements only
 
 **Decision:** the grammar carries declarative, write-shaped statements (`TRANSFORM`,
-`RELATIONSHIP`, `ALTER`, `PAUSE`, `RESUME`, `DROP`; see
+`ALTER`, `PAUSE`, `RESUME`, `DROP`; see
 [ADR-0014](0014-pause-and-drop-a-transform.md)), and status/listing reads stay typed
 methods.
 
 A status read isn't a declaration — it's a filtered, paginated query
 ("everything paused," "page 2 of poisoned rows"), and the highest-frequency
-call in the API (the status poller from decision 1 hits it repeatedly). `TRANSFORM`/
-`RELATIONSHIP` earn a grammar because they need declarative structure (source
+call in the API (the status poller from decision 1 hits it repeatedly). `TRANSFORM`
+earns a grammar because it needs declarative structure (source
 table, joins, field expressions); a status query's structure is
 filters/sort/pagination. Expressing that as text means growing the grammar into
 a `WHERE`-clause sublanguage — a far bigger parsing surface, paid on the

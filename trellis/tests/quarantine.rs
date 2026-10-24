@@ -1015,7 +1015,7 @@ async fn an_aggregate_over_an_unsupported_primary_key_type_source_is_rejected_at
     .map(|(n, t)| (n.to_string(), t))
     .collect();
     let account_totals = "TRANSFORM account_totals FROM ledger GROUP BY account \
-                          SELECT account AS account, SUM(cents) AS total";
+                         WITHOUT SOURCE INDEX SELECT account AS account, SUM(cents) AS total";
     assert_unsupported_key(
         "install_definition, aggregate over a numeric-keyed table",
         install_definition(&db.pool, account_totals, &ledger_columns, "public").await,
@@ -1043,7 +1043,7 @@ async fn an_aggregate_over_an_unsupported_primary_key_type_source_is_rejected_at
     install_definition(
         &db.pool,
         "TRANSFORM price_totals FROM sales GROUP BY price \
-         SELECT price AS price, SUM(qty) AS units",
+        WITHOUT SOURCE INDEX SELECT price AS price, SUM(qty) AS units",
         &sales_columns,
         "public",
     )
@@ -1056,7 +1056,7 @@ async fn an_aggregate_over_an_unsupported_primary_key_type_source_is_rejected_at
             .map(|(n, t)| (n.to_string(), t))
             .collect();
     let units_rollup = "TRANSFORM units_rollup FROM price_totals GROUP BY units \
-                        SELECT units AS units, COUNT(*) AS prices";
+                       WITHOUT SOURCE INDEX SELECT units AS units, COUNT(*) AS prices";
     assert_unsupported_key(
         "install_definition, aggregate chained off a numeric-grouped aggregate",
         install_definition(&db.pool, units_rollup, &price_totals_columns, "public").await,
@@ -1271,13 +1271,13 @@ async fn a_batch_failure_that_only_reproduces_combined_surfaces_unblamed() {
 
     client
         .batch_execute(
-            "create table order_items (id integer primary key, order_id integer, amount numeric)",
+            "create table order_items (id integer primary key, order_id integer, amount numeric(12,2))",
         )
         .await
         .expect("create source table");
 
     let source = "TRANSFORM order_summary FROM order_items GROUP BY order_id \
-                   SELECT order_id AS order_id, SUM(amount) AS total";
+                  WITHOUT SOURCE INDEX SELECT order_id AS order_id, SUM(amount) AS total";
     let source_columns = numeric_columns(&["id", "order_id", "amount"]);
     create_definition(&db.pool, source, &source_columns)
         .await
@@ -2263,12 +2263,12 @@ async fn isolation_pins_a_key_masked_by_a_batch_mate_in_its_half() {
 
     client
         .batch_execute(
-            "create table order_items (id integer primary key, order_id integer, amount numeric)",
+            "create table order_items (id integer primary key, order_id integer, amount numeric(12,2))",
         )
         .await
         .expect("create source table");
     let source = "TRANSFORM order_summary FROM order_items GROUP BY order_id \
-                   SELECT order_id AS order_id, SUM(amount) AS total";
+                  WITHOUT SOURCE INDEX SELECT order_id AS order_id, SUM(amount) AS total";
     let source_columns = numeric_columns(&["id", "order_id", "amount"]);
     create_definition(&db.pool, source, &source_columns)
         .await

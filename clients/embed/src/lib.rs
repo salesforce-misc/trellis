@@ -26,8 +26,6 @@
 //! | [`trellis::QuarantineTarget`] | `transform` / `transform.column` | [`quarantine_address`] |
 //! | `sample_quarantined`'s `(src_table, key)` cursor | an opaque string | [`next_cursor`] / [`decode_cursor`] |
 //! | [`trellis::Applied`] | its kind + that kind's plain fields, or `unknown` | [`PlainApplied`] |
-//! | [`trellis::RelationshipDefinition`] | fields + cardinality word + warning messages | [`PlainRelationship`] |
-//! | [`trellis::RelationshipSummary`] | fields + cardinality word + creation time | [`PlainRelationshipSummary`] |
 //! | [`trellis::QuarantineEntry`] | address + state word + pause time/error | [`PlainQuarantineEntry`] |
 //! | [`trellis::PoisonEntry`] | fields + poison time | [`PlainPoisonEntry`] |
 //! | a page of [`trellis::PoisonSample`] | the rows + the next page's cursor | [`PlainSamplePage`] |
@@ -57,7 +55,6 @@ mod definition;
 mod error;
 mod log;
 mod quarantine;
-mod relationship;
 mod self_check;
 mod statement;
 mod status;
@@ -81,9 +78,6 @@ pub use log::{
 pub use quarantine::{
     PlainHeldKeys, PlainPoisonEntry, PlainPoisonSample, PlainQuarantineEntry, PlainSamplePage,
     quarantine_address,
-};
-pub use relationship::{
-    PlainRelationship, PlainRelationshipSummary, relationship_cardinality_names,
 };
 pub use self_check::{
     DIVERGENCE_KINDS, PlainDivergence, PlainSelfCheckJob, PlainSelfCheckReport, SELF_CHECK_MODES,

@@ -249,8 +249,10 @@ async fn boolean_is_refused_as_a_relationship_join_key_and_primary_key() {
 /// `the_group_by_key_gate_follows_the_same_split` follow.
 #[test]
 fn boolean_group_by_key_is_admitted() {
-    let def = parse("TRANSFORM t FROM s GROUP BY flag SELECT flag AS k, SUM(n) AS total")
-        .expect("parses");
+    let def = parse(
+        "TRANSFORM t FROM s GROUP BY flag WITHOUT SOURCE INDEX SELECT flag AS k, SUM(n) AS total",
+    )
+    .expect("parses");
     validate(&def, &source_columns(), &HashMap::new())
         .unwrap_or_else(|e| panic!("boolean must be accepted as a GROUP BY key: {e}"));
 }
@@ -327,7 +329,7 @@ async fn bool_and_or_fold_matches_a_server_side_aggregate() {
         let (server_and, server_or): (Option<bool>, Option<bool>) = (row.get(0), row.get(1));
 
         let def = parse(
-            "TRANSFORM t FROM s GROUP BY id SELECT id AS k, \
+            "TRANSFORM t FROM s GROUP BY id WITHOUT SOURCE INDEX SELECT id AS k, \
              BOOL_AND(flag) AS all_true, BOOL_OR(flag) AS any_true",
         )
         .expect("parses");
@@ -441,8 +443,7 @@ async fn bool_and_or_deletion_cannot_be_inverted_from_the_aggregate_alone() {
 /// mechanical reason pinned by both tests together.
 #[tokio::test]
 async fn a_boolean_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two() {
-    const DEF_SQL: &str =
-        "TRANSFORM totals FROM events GROUP BY grp SELECT grp AS grp, SUM(amount) AS total";
+    const DEF_SQL: &str = "TRANSFORM totals FROM events GROUP BY grp WITHOUT SOURCE INDEX SELECT grp AS grp, SUM(amount) AS total";
 
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -451,7 +452,7 @@ async fn a_boolean_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two
     client
         .batch_execute(
             "create table events ( \
-               id integer primary key, grp boolean, amount numeric)",
+               id integer primary key, grp boolean, amount numeric(12,0))",
         )
         .await
         .expect("create source table");

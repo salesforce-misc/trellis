@@ -30,7 +30,7 @@ const SRC_DDL: &str = "create table public.src (id integer primary key, g intege
                        v integer)";
 
 /// A composite `GROUP BY`, either part of which can be `NULL`.
-const AGG: &str = "TRANSFORM agg FROM public.src GROUP BY g, h SELECT COUNT(*) AS n, SUM(v) AS t";
+const AGG: &str = "TRANSFORM agg FROM public.src GROUP BY g, h WITHOUT SOURCE INDEX SELECT COUNT(*) AS n, SUM(v) AS t";
 /// The 1-1 reader of `agg`.
 const A2: &str = "TRANSFORM a2 FROM public.agg SELECT n AS n, t + 1 AS t1";
 
@@ -331,7 +331,7 @@ async fn a_chain_of_aggregate_and_two_one_to_one_readers_keeps_the_null_group() 
     let mut d = Driver::start(
         SRC_DDL,
         &src_columns(),
-        &["TRANSFORM agg FROM public.src GROUP BY g SELECT SUM(v) AS total"],
+        &["TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total"],
         &[SRC],
     )
     .await;
@@ -477,7 +477,7 @@ async fn a_rollup_over_the_reader_follows_its_null_keyed_rows() {
     let mut d = start(None).await;
     install(
         &d,
-        "TRANSFORM roll FROM public.a2 GROUP BY n SELECT COUNT(*) AS groups",
+        "TRANSFORM roll FROM public.a2 GROUP BY n WITHOUT SOURCE INDEX SELECT COUNT(*) AS groups",
         &[("g", int4()), ("h", int4()), ("n", int8()), ("t1", int8())],
     )
     .await;

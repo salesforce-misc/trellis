@@ -202,7 +202,7 @@ same after `pg_dump`), and Trellis does the same:
 
 * **The engine generates the rows.** `dump_definitions_sql` (on `Trellis` and
   `BlockingTrellis`, so on every binding) returns `INSERT`s for Trellis's
-  migration history, the instance marker, the transform and relationship
+  migration history, the instance marker, the transform
   definitions and the seed rows capture needs. A binding never lists
   Trellis's tables. The engine classifies each table in its schema as
   definition, seed or runtime state, and a test fails on a table nobody

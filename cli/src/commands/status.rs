@@ -21,8 +21,7 @@
 //! back (`drain_failure` from [`Trellis::status`], issue #817), and one per
 //! join column of a relationship it reads that has no usable index
 //! (`unindexed_joins`, issue #973), and one per node of its partitioned
-//! source it is being corrected for (`correcting`, ADR-0017) — and every
-//! relationship ([`Trellis::relationships`]). Finer-grained per-`(transform,
+//! source it is being corrected for (`correcting`, ADR-0017). Finer-grained per-`(transform,
 //! column)` pause state (docs/decisions/0008-public-api-design.md's
 //! decision 5 and
 //! docs/decisions/0003-quarantine-storage-and-api.md) is implemented on the
@@ -43,8 +42,8 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 use trellis::{
-    Config, CorrectingNode, DefinitionSummary, DrainFailure, JoinStatus, RelationshipSummary,
-    SourceIndexGap, Trellis, TrellisOptions, UnindexedJoin,
+    Config, CorrectingNode, DefinitionSummary, DrainFailure, JoinBuildStep, JoinSide, JoinSidePart,
+    JoinStatus, SourceIndexGap, Trellis, TrellisOptions, UnindexedJoin,
 };
 
 use super::release::shell_quote;
@@ -54,7 +53,7 @@ use super::release::shell_quote;
 pub const USAGE: &str = "\
 Usage: trellis status [--database-url <URL>]
 
-Prints every registered TRANSFORM definition and RELATIONSHIP, and a note on
+Prints every registered TRANSFORM definition, and a note on
 what lifecycle/quarantine status isn't tracked yet (issue #55). Read-only:
 unlike `define`/`run`, this does not apply pending migrations, so it fails
 plainly against a database with no Trellis schema yet.
@@ -91,7 +90,7 @@ pub fn parse(args: &[String]) -> Result<Args, String> {
 }
 
 /// Connects (without migrating — see the module doc comment for why),
-/// prints the definition/relationship listing plus the "status not
+/// prints the definition listing plus the "status not
 /// implemented yet" note, then disconnects.
 ///
 /// `shutdown` is called even if the listing failed, per [`Trellis::shutdown`]'s
@@ -120,7 +119,7 @@ Note: the status shown per definition above is whole-transform (issue #55). \
 Finer-grained per-column pause state is not yet surfaced by this command, \
 even though the engine tracks it.";
 
-/// Builds the full human-readable status report: definitions, relationships,
+/// Builds the full human-readable status report: definitions, poisoned keys,
 /// then [`STATUS_NOTE`].
 async fn report(trellis: &Trellis) -> Result<String, String> {
     let definitions = trellis.definitions().await.map_err(|err| err.to_string())?;
@@ -143,10 +142,6 @@ async fn report(trellis: &Trellis) -> Result<String, String> {
         });
         listed.push((def, warnings));
     }
-    let relationships = trellis
-        .relationships()
-        .await
-        .map_err(|err| err.to_string())?;
     let poisoned = trellis
         .poisoned_since(UNIX_EPOCH)
         .await
@@ -155,9 +150,6 @@ async fn report(trellis: &Trellis) -> Result<String, String> {
     let mut out = String::new();
     out.push_str("Transform definitions:\n");
     out.push_str(&format_definitions(&listed));
-    out.push('\n');
-    out.push_str("Relationships:\n");
-    out.push_str(&format_relationships(&relationships));
     out.push('\n');
     out.push_str(&format_poisoned(&poisoned));
     out.push('\n');
@@ -336,6 +328,9 @@ fn format_join(join: &JoinStatus) -> String {
             .collect();
         out.push_str(&format!("    join tables {}\n", tables.join(" ")));
     }
+    if let Some(step) = &join.building {
+        out.push_str(&format!("    join build {}\n", format_join_step(step)));
+    }
     if let Some(w) = &join.partials_warning {
         out.push_str(&format!(
             "    warning: P holds ~{} rows against ~{} in the fact table; \
@@ -344,6 +339,28 @@ fn format_join(join: &JoinStatus) -> String {
         ));
     }
     out
+}
+
+/// The step a `JOIN` build runs now or next ([`JoinStatus::building`]).
+fn format_join_step(step: &JoinBuildStep) -> String {
+    match step {
+        JoinBuildStep::Whole => "both sides in one transaction".to_string(),
+        JoinBuildStep::Final => "final step (T and the target)".to_string(),
+        JoinBuildStep::Side { side, part } => {
+            let side = match side {
+                JoinSide::From => "FROM side",
+                JoinSide::Joined => "JOIN side",
+            };
+            match part {
+                JoinSidePart::Whole => format!("{side} whole"),
+                JoinSidePart::Leaf(name) => format!("{side} leaf {name}"),
+                JoinSidePart::Remainder => format!("{side} remainder"),
+                JoinSidePart::Unroutable => {
+                    format!("{side}: its partition tree can't be routed (see the backfill failure)")
+                }
+            }
+        }
+    }
 }
 
 fn format_drain_failure(failure: &DrainFailure) -> String {
@@ -361,30 +378,6 @@ fn format_drain_failure(failure: &DrainFailure) -> String {
         sqlstate,
         failure.error
     )
-}
-
-fn format_relationships(relationships: &[RelationshipSummary]) -> String {
-    if relationships.is_empty() {
-        return "  no relationships registered\n".to_string();
-    }
-    relationships
-        .iter()
-        .map(|rel| {
-            format!(
-                "  id={} name={:?} {}.{}.{} -> {}.{}.{} cardinality={} created_at={}\n",
-                rel.id,
-                rel.name,
-                rel.from_schema,
-                rel.from_table,
-                rel.from_col,
-                rel.to_schema,
-                rel.to_table,
-                rel.to_col,
-                rel.cardinality,
-                format_timestamp(rel.created_at)
-            )
-        })
-        .collect()
 }
 
 /// Formats a `created_at`/`poisoned_at`-style timestamp as `YYYY-MM-DD
@@ -452,6 +445,29 @@ mod tests {
     }
 
     #[test]
+    fn a_join_build_step_is_printed_only_while_building() {
+        let mut join = JoinStatus {
+            hidden_tables: Vec::new(),
+            partials_warning: None,
+            building: None,
+        };
+        assert_eq!(format_join(&join), "");
+        join.building = Some(JoinBuildStep::Side {
+            side: JoinSide::From,
+            part: JoinSidePart::Leaf("public.a1".to_string()),
+        });
+        assert_eq!(
+            format_join(&join),
+            "    join build FROM side leaf public.a1\n"
+        );
+        join.building = Some(JoinBuildStep::Final);
+        assert_eq!(
+            format_join(&join),
+            "    join build final step (T and the target)\n"
+        );
+    }
+
+    #[test]
     fn timestamp_at_unix_epoch() {
         assert_eq!(format_timestamp(UNIX_EPOCH), "1970-01-01 00:00:00 UTC");
     }
@@ -482,11 +498,6 @@ mod tests {
             format_definitions(&[]),
             "  no transform definitions registered\n"
         );
-    }
-
-    #[test]
-    fn empty_relationships_say_so_clearly() {
-        assert_eq!(format_relationships(&[]), "  no relationships registered\n");
     }
 
     #[test]
@@ -768,27 +779,6 @@ mod tests {
             formatted.contains(r"orders\nDETAIL: role lacks SELECT\nHINT: grant it"),
             "got {formatted:?}"
         );
-    }
-
-    #[test]
-    fn a_relationship_is_formatted_with_its_fields() {
-        let rel = RelationshipSummary {
-            id: 3,
-            name: "posts_by_author".to_string(),
-            from_schema: "shop".to_string(),
-            from_table: "authors".to_string(),
-            from_col: "id".to_string(),
-            to_schema: "blog".to_string(),
-            to_table: "posts".to_string(),
-            to_col: "author_id".to_string(),
-            cardinality: "to_many".to_string(),
-            created_at: UNIX_EPOCH,
-        };
-        let formatted = format_relationships(std::slice::from_ref(&rel));
-        assert!(formatted.contains("id=3"));
-        assert!(formatted.contains("name=\"posts_by_author\""));
-        assert!(formatted.contains("shop.authors.id -> blog.posts.author_id"));
-        assert!(formatted.contains("cardinality=to_many"));
     }
 
     #[test]

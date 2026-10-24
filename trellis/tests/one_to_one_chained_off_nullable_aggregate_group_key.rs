@@ -150,7 +150,8 @@ fn sku_totals_columns() -> HashMap<String, ValueType> {
     columns(&[("sku", ValueType::Text), ("total", ValueType::Numeric)])
 }
 
-const SKU_TOTALS: &str = "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT sum(amount) AS total";
+const SKU_TOTALS: &str =
+    "TRANSFORM sku_totals FROM sales GROUP BY sku WITHOUT SOURCE INDEX SELECT sum(amount) AS total";
 const SKU_TOTALS_ECHO: &str =
     "TRANSFORM sku_totals_echo FROM sku_totals SELECT total AS echo_total";
 

@@ -96,7 +96,7 @@ async fn an_aggregate_over_a_mixed_case_table_backfills_and_applies_cdc() {
         .expect("seed the source");
     install(
         &db,
-        "TRANSFORM qty_by_order FROM Shop.OrderItems GROUP BY order_id SELECT SUM(qty) AS total",
+        "TRANSFORM qty_by_order FROM Shop.OrderItems GROUP BY order_id WITHOUT SOURCE INDEX SELECT SUM(qty) AS total",
     )
     .await;
 
@@ -126,10 +126,9 @@ async fn an_aggregate_over_a_mixed_case_table_backfills_and_applies_cdc() {
     );
 }
 
-/// #623 D4: recompute-only fields (MIN/MAX, a composed field, an
-/// expression argument) over mixed-case columns of a mixed-case table
-/// recompute from ledger entries whose contribution and group columns carry
-/// those names quoted.
+/// #623 D4: a composed field and an expression argument over mixed-case
+/// columns of a mixed-case table follow CDC, with the group and argument
+/// columns carrying those names quoted.
 #[tokio::test]
 async fn recomputed_fields_over_mixed_case_columns_follow_cdc() {
     let (cluster, db, raw) = trigger_pipeline::database().await;
@@ -140,19 +139,33 @@ async fn recomputed_fields_over_mixed_case_columns_follow_cdc() {
     )
     .await
     .expect("seed the source");
-    install_over(
-        &db,
+    // The columns' real types: `SUM(Qty + 1)` over a `numeric` would be an
+    // expression with no declared scale, which the group basis doesn't take.
+    let int = |w| ValueType::Integer(w);
+    let columns: HashMap<String, ValueType> = [
+        ("id", int(trellis::IntWidth::Int8)),
+        ("OrderId", int(trellis::IntWidth::Int8)),
+        ("Qty", int(trellis::IntWidth::Int4)),
+    ]
+    .into_iter()
+    .map(|(n, t)| (n.to_string(), t))
+    .collect();
+    install_definition(
+        &db.pool,
         "TRANSFORM qty_span FROM Shop.OrderItems GROUP BY OrderId \
-         SELECT MIN(Qty) AS lo, MAX(Qty + 1) AS hi1, MAX(Qty) + MIN(Qty) AS ends",
-        &["id", "OrderId", "Qty"],
+        WITHOUT SOURCE INDEX SELECT COUNT(Qty) AS lo, SUM(Qty + 1) AS hi1, SUM(Qty) + COUNT(Qty) AS ends",
+        &columns,
+        "public",
     )
-    .await;
+    .await
+    .expect("install qty_span");
+    trellis::intake::markers::settle_registrations(&db.pool).await;
 
     let mut pipeline = Pipeline::attach(cluster, db, raw, &["Shop.OrderItems"]).await;
     const SPANS: &str = "select \"OrderId\"::text, concat_ws(',', lo, hi1, ends) from qty_span";
     assert_eq!(
         pipeline.rows(SPANS).await,
-        rows(&[("10", "2,4,5"), ("20", "5,6,10")]),
+        rows(&[("10", "2,7,7"), ("20", "1,6,6")]),
         "the backfill folded every pre-existing row"
     );
 
@@ -169,8 +182,8 @@ async fn recomputed_fields_over_mixed_case_columns_follow_cdc() {
     pipeline.drain().await;
     assert_eq!(
         pipeline.rows(SPANS).await,
-        rows(&[("10", "30,31,60"), ("20", "7,8,14")]),
-        "CDC retracted the old extremes and recomputed each group"
+        rows(&[("10", "1,31,31"), ("20", "1,8,8")]),
+        "CDC retracted the old rows and recomputed each group"
     );
 }
 

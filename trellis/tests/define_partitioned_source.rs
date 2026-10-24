@@ -54,11 +54,27 @@ const ORDER_LINES: &str = "create table public.order_line_items ( \
         for values with (modulus 4, remainder 3);";
 
 fn aggregate(source: &str, group_by: &str) -> String {
-    format!("TRANSFORM totals FROM {source} GROUP BY {group_by} SELECT COUNT(*) AS n")
+    format!(
+        "TRANSFORM totals FROM {source} GROUP BY {group_by} WITHOUT SOURCE INDEX SELECT COUNT(*) AS n"
+    )
 }
 
-/// The catalog error `apply` refused with.
+fn is_relationship(statement: &str) -> bool {
+    statement
+        .trim_start()
+        .to_ascii_uppercase()
+        .starts_with("RELATIONSHIP")
+}
+
+/// The catalog error `apply` (or, for a relationship, the dev door's
+/// `create_relationship`) refused with.
 async fn refusal(it: &Instance, statement: &str) -> CatalogError {
+    if is_relationship(statement) {
+        return match trellis::dev::defs::create_relationship(it.trellis.pool(), statement).await {
+            Err(err) => err,
+            Ok(_) => panic!("{statement} was accepted"),
+        };
+    }
     match it.trellis.apply(statement).await {
         Err(TrellisError::Catalog(err)) => err,
         Err(other) => panic!("expected a catalog refusal of {statement}, got {other:?}"),
@@ -68,7 +84,13 @@ async fn refusal(it: &Instance, statement: &str) -> CatalogError {
 
 /// Defines `statement`, which must be accepted, then drops what it defined.
 async fn assert_accepted(it: &Instance, statement: &str) {
-    if let Err(err) = it.trellis.apply(statement).await {
+    if is_relationship(statement) {
+        if let Err(err) =
+            trellis::dev::defs::create_relationship(it.trellis.pool(), statement).await
+        {
+            panic!("{statement} was refused: {err:?}");
+        }
+    } else if let Err(err) = it.trellis.apply(statement).await {
         panic!("{statement} was refused: {err:?}");
     }
     let mut words = statement.split_whitespace();
@@ -81,7 +103,11 @@ async fn assert_accepted(it: &Instance, statement: &str) {
         }
         (Some("RELATIONSHIP"), Some(name), Some("FROM"), Some(from)) => {
             let table = from.split_once('.').map_or(from, |(t, _)| t);
-            vec![format!("DROP RELATIONSHIP {table}.{name}")]
+            let address = format!("{table}.{name}");
+            trellis::dev::defs::drop_relationship(it.trellis.pool(), &address)
+                .await
+                .unwrap_or_else(|err| panic!("drop relationship {address}: {err:?}"));
+            return;
         }
         _ => panic!("no drop for {statement}"),
     };
@@ -533,7 +559,7 @@ async fn a_join_side_is_held_to_the_rule_over_its_partial_key() {
             .map(|c| format!("{c} AS {}", c.split_once('.').map_or(c, |(_, b)| b)))
             .collect();
         format!(
-            "TRANSFORM j FROM {from} ON {on} GROUP BY {group_by} SELECT {}, COUNT(*) AS n",
+            "TRANSFORM j FROM {from} ON {on} GROUP BY {group_by} WITHOUT SOURCE INDEX SELECT {}, COUNT(*) AS n",
             fields.join(", ")
         )
     };

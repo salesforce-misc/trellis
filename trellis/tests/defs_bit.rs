@@ -229,8 +229,10 @@ async fn bit_and_varbit_join_keys_and_primary_keys_are_admitted() {
 /// declaring the key column from bare `ValueType` alone is safe.
 #[test]
 fn varbit_group_by_key_is_admitted() {
-    let def =
-        parse("TRANSFORM t FROM s GROUP BY vb SELECT vb AS k, SUM(n) AS total").expect("parses");
+    let def = parse(
+        "TRANSFORM t FROM s GROUP BY vb WITHOUT SOURCE INDEX SELECT vb AS k, SUM(n) AS total",
+    )
+    .expect("parses");
     validate(&def, &source_columns(), &HashMap::new())
         .unwrap_or_else(|e| panic!("bit varying must be accepted as a GROUP BY key: {e}"));
 }
@@ -243,7 +245,8 @@ fn varbit_group_by_key_is_admitted() {
 #[test]
 fn fixed_length_bit_group_by_key_is_refused() {
     let def =
-        parse("TRANSFORM t FROM s GROUP BY b SELECT b AS k, SUM(n) AS total").expect("parses");
+        parse("TRANSFORM t FROM s GROUP BY b WITHOUT SOURCE INDEX SELECT b AS k, SUM(n) AS total")
+            .expect("parses");
     let err = validate(&def, &source_columns(), &HashMap::new())
         .expect_err("fixed-length bit must still be refused as a GROUP BY key");
     let _ = err; // the specific ValidationError variant isn't load-bearing here
@@ -417,7 +420,7 @@ async fn bit_and_or_fold_matches_a_server_side_aggregate() {
         let (server_and, server_or): (Option<String>, Option<String>) = (row.get(0), row.get(1));
 
         let def = parse(
-            "TRANSFORM t FROM s GROUP BY id SELECT id AS k, \
+            "TRANSFORM t FROM s GROUP BY id WITHOUT SOURCE INDEX SELECT id AS k, \
              BIT_AND(b) AS all_bits, BIT_OR(b) AS any_bits",
         )
         .expect("parses");
@@ -483,7 +486,7 @@ async fn bit_and_or_reject_mismatched_length_bit_varying_the_same_way_postgres_d
         .unwrap_or_else(|| panic!("must fail as a DbError: {err}"));
     assert!(db_error.message().contains("different sizes"), "{db_error}");
 
-    let def = parse("TRANSFORM t FROM s GROUP BY id SELECT id AS k, BIT_AND(vb) AS all_bits")
+    let def = parse("TRANSFORM t FROM s GROUP BY id WITHOUT SOURCE INDEX SELECT id AS k, BIT_AND(vb) AS all_bits")
         .expect("parses");
     let columns = HashMap::from([
         ("id".to_string(), ValueType::Integer(IntWidth::Int8)),
@@ -581,8 +584,7 @@ async fn bit_and_or_deletion_cannot_be_inverted_from_the_aggregate_alone() {
 /// framing `defs_bytea.rs`'s equivalent test uses.
 #[tokio::test]
 async fn a_varbit_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two() {
-    const DEF_SQL: &str =
-        "TRANSFORM totals FROM events GROUP BY grp SELECT grp AS grp, SUM(amount) AS total";
+    const DEF_SQL: &str = "TRANSFORM totals FROM events GROUP BY grp WITHOUT SOURCE INDEX SELECT grp AS grp, SUM(amount) AS total";
 
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -591,7 +593,7 @@ async fn a_varbit_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two(
     client
         .batch_execute(
             "create table events ( \
-               id integer primary key, grp bit varying, amount numeric)",
+               id integer primary key, grp bit varying, amount numeric(12,0))",
         )
         .await
         .expect("create source table");

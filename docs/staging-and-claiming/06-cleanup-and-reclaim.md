@@ -51,6 +51,15 @@ Demanding a present-and-drained successor would strand a batch forever whenever
 its successor retired first — a lock skip can retire *s+1* and leave *s*
 ineligible, leaking a ring slot into a permanent `RingFull` wedge.
 
+**An idle ring retires its tail.** Condition 1 needs the successor to have
+sealed, which ordinary traffic does only on the next write. So when the active
+segment is empty and its predecessor is drained with rows still in its slot, the
+seal step seals the empty active segment anyway (the idle seal,
+[03](03-sealing-and-the-fence.md#who-seals-and-when)). Once that empty batch
+drains, the old batch meets all four conditions and the next pass frees its slot.
+An idle ring holds no drained rows: only the empty segment sealed when it went
+idle, and the empty active one.
+
 **Condition 4 is why an undrainable batch would be an instance-wide stop**, not a
 per-table one: one batch stuck below the boundary makes *every* candidate
 ineligible, so the ring fills and seals fail. That is why no failure class must
@@ -73,7 +82,11 @@ the reclaim TTL), whether or not the drain is busy. The pass:
    show, which its successor takes, [03](03-sealing-and-the-fence.md)), so a
    `self_check` page can skip a drained slot that holds none, then retires
    eligible drained batches;
-4. collects the tombstones no change can still need.
+4. collects the tombstones no change can still need, and the zero groups of
+   group-basis aggregates and the zero `P` and `M` cells of `JOIN`s: those
+   with no basis, or whose stamp the drained prefix has passed
+   ([ADR-0002](../decisions/0002-async-data-flow.md) R4,
+   [ADR-0019](../decisions/0019-join-transforms.md)).
 
 So a crashed seal is recovered within its 10 s age gate plus about 5 s, and a dead
 claimant's buckets are freed within the reclaim TTL plus about 5 s. A full ring

@@ -43,6 +43,8 @@ async fn rows(client: &trellis::pool::Client, sql: &str) -> Vec<Vec<Option<Strin
 #[tokio::test]
 async fn the_aggregate_build_writes_one_ledger_entry_per_source_row_and_the_groups_are_their_sums()
 {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = db.pool.get().await.expect("get connection");
@@ -71,7 +73,7 @@ async fn the_aggregate_build_writes_one_ledger_entry_per_source_row_and_the_grou
     ]);
     build(
         &db,
-        "TRANSFORM t FROM s GROUP BY g SELECT g AS g, SUM(a) AS total, AVG(a) AS mean, \
+        "TRANSFORM t FROM s GROUP BY g WITHOUT SOURCE INDEX SELECT g AS g, SUM(a) AS total, AVG(a) AS mean, \
          COUNT(*) AS n, COUNT(label) AS labelled, MIN(label) AS lo",
         &cols,
     )
@@ -186,6 +188,8 @@ async fn the_aggregate_build_writes_one_ledger_entry_per_source_row_and_the_grou
 /// whose source row is gone doesn't survive it.
 #[tokio::test]
 async fn a_rebuild_replaces_the_ledger() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let client = db.pool.get().await.expect("get connection");
@@ -196,7 +200,7 @@ async fn a_rebuild_replaces_the_ledger() {
         )
         .await
         .expect("seed source");
-    let src = "TRANSFORM t FROM s GROUP BY g SELECT SUM(a) AS total";
+    let src = "TRANSFORM t FROM s GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(a) AS total";
     let cols = HashMap::from([
         ("g".to_string(), ValueType::Numeric),
         ("a".to_string(), ValueType::Numeric),
@@ -249,14 +253,16 @@ async fn a_rebuild_replaces_the_ledger() {
 /// build takes, has none (#723), and the rebuild adds none either.
 #[tokio::test]
 async fn a_rebuild_after_a_build_that_stopped_between_its_transactions_restores_the_keys() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let cluster = TestCluster::start();
     for (src, expected) in [
         (
-            "TRANSFORM t FROM s GROUP BY g SELECT SUM(a) AS total, MAX(a) AS hi",
+            "TRANSFORM t FROM s GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(a) AS total, MAX(a) AS hi",
             "pkey | (__member AND (NOT __tombstone)) | __tombstone",
         ),
         (
-            "TRANSFORM t FROM s GROUP BY g SELECT SUM(a) AS total",
+            "TRANSFORM t FROM s GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(a) AS total",
             "pkey | __tombstone",
         ),
     ] {
@@ -325,6 +331,8 @@ async fn a_rebuild_after_a_build_that_stopped_between_its_transactions_restores_
 /// `B`; `"C"` sorts `B` first.
 #[tokio::test]
 async fn a_text_contribution_keeps_its_arguments_collation() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let client = db.pool.get().await.expect("get connection");
@@ -337,7 +345,7 @@ async fn a_text_contribution_keeps_its_arguments_collation() {
         .expect("seed source");
     build(
         &db,
-        "TRANSFORM t FROM s GROUP BY g SELECT MIN(label) AS lo, MAX(label) AS hi",
+        "TRANSFORM t FROM s GROUP BY g WITHOUT SOURCE INDEX SELECT MIN(label) AS lo, MAX(label) AS hi",
         &HashMap::from([
             ("g".to_string(), ValueType::Numeric),
             ("label".to_string(), ValueType::Text),
@@ -370,6 +378,8 @@ async fn a_text_contribution_keeps_its_arguments_collation() {
 /// `bit` column is `bit(1)`, which rejects the load's first wider value.
 #[tokio::test]
 async fn a_fixed_length_bit_contribution_holds_its_full_width() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let client = db.pool.get().await.expect("get connection");
@@ -382,7 +392,7 @@ async fn a_fixed_length_bit_contribution_holds_its_full_width() {
         .expect("seed source");
     build(
         &db,
-        "TRANSFORM t FROM s GROUP BY g SELECT BIT_AND(b) AS all_bits, BIT_OR(b) AS any_bits, \
+        "TRANSFORM t FROM s GROUP BY g WITHOUT SOURCE INDEX SELECT BIT_AND(b) AS all_bits, BIT_OR(b) AS any_bits, \
          COUNT(b) AS n",
         &HashMap::from([
             ("g".to_string(), ValueType::Numeric),

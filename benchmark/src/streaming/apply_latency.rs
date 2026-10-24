@@ -28,6 +28,9 @@
 //!   these two statements go through a second handle whose deadline is the
 //!   build timeout ([`long_call_options`]); every other statement keeps the
 //!   stock deadline, so one that outlasts it still shows as a failure.
+//!   Relationships are declared and dropped through the dev door now
+//!   (`trellis::dev::defs`), which no call deadline bounds, until #1115
+//!   removes them.
 //!
 //! The added field is dropped again, so the scenario's oracle still compares
 //! the target's own columns.
@@ -152,12 +155,30 @@ fn long_call_options(build_timeout: Duration) -> trellis::TrellisOptions {
     }
 }
 
-/// Times `statement` through `trellis.apply`.
+/// Times `statement` through `trellis.apply`. `RELATIONSHIP` and
+/// `DROP RELATIONSHIP` are no longer statements `apply` takes (#1115): they go
+/// through the dev door's `create_relationship`/`drop_relationship` on the
+/// handle's pool, which no call deadline bounds.
 async fn timed(trellis: &trellis::Trellis, name: &'static str, statement: &str) -> Timed {
     let started = Instant::now();
-    let result = trellis.apply(statement).await;
+    let result = if let Some(address) = statement.strip_prefix("DROP RELATIONSHIP ") {
+        trellis::dev::defs::drop_relationship(trellis.pool(), address)
+            .await
+            .map_err(|e| e.to_string())
+    } else if statement.starts_with("RELATIONSHIP") {
+        trellis::dev::defs::create_relationship(trellis.pool(), statement)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    } else {
+        trellis
+            .apply(statement)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    };
     let secs = started.elapsed().as_secs_f64();
-    let error = result.err().map(|e| e.to_string());
+    let error = result.err();
     match &error {
         None => eprintln!("apply-latency: {name} returned in {secs:.3}s"),
         Some(e) => eprintln!("apply-latency: {name} FAILED after {secs:.3}s: {e}"),

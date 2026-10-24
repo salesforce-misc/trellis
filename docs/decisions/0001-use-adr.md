@@ -14,7 +14,7 @@ optimize for.
 ## Writing an ADR
 
 Each ADR is `NNNN-short-title.md` in this directory, taking the next unused
-number. A deleted ADR's number is never reused: 0007 and 0016 are retired. The
+number. A deleted ADR's number is never reused: 0006, 0007 and 0016 are retired. The
 frontmatter carries `status`, `date` (the day the decision was made or last
 changed) and `deciders`. The status is `draft` while any point is undecided, and
 `accepted` once none is; the code then follows the ADR or is being changed to.

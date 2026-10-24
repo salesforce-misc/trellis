@@ -61,23 +61,23 @@ impl Flavour {
     fn definition(self) -> &'static str {
         match self {
             Flavour::Sum => {
-                "TRANSFORM agg FROM public.src GROUP BY g SELECT SUM(v) AS total, COUNT(*) AS n"
+                "TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n"
             }
             Flavour::Avg => {
                 "TRANSFORM agg FROM public.src GROUP BY g \
-                 SELECT SUM(v) AS total, AVG(v) AS mean, COUNT(v) AS nv, COUNT(*) AS n"
+                WITHOUT SOURCE INDEX SELECT SUM(v) AS total, AVG(v) AS mean, COUNT(v) AS nv, COUNT(*) AS n"
             }
             Flavour::MinMax => {
                 "TRANSFORM agg FROM public.src GROUP BY g \
-                 SELECT MIN(v) AS lo, MAX(v) AS hi, COUNT(*) AS n"
+                WITHOUT SOURCE INDEX SELECT MIN(v) AS lo, MAX(v) AS hi, COUNT(*) AS n"
             }
             Flavour::Bool => {
                 "TRANSFORM agg FROM public.src GROUP BY g \
-                 SELECT BOOL_AND(b) AS all_b, BOOL_OR(b) AS any_b, MAX(v) AS hi, COUNT(*) AS n"
+                WITHOUT SOURCE INDEX SELECT BOOL_AND(b) AS all_b, BOOL_OR(b) AS any_b, MAX(v) AS hi, COUNT(*) AS n"
             }
             Flavour::Composed => {
                 "TRANSFORM agg FROM public.src GROUP BY g \
-                 SELECT MAX(v) + MIN(v) AS ends, MAX(v + v + 1) AS top, \
+                WITHOUT SOURCE INDEX SELECT MAX(v) + MIN(v) AS ends, MAX(v + v + 1) AS top, \
                         SUM(v + 3) AS plus3, COUNT(*) AS n"
             }
         }
@@ -312,21 +312,29 @@ async fn chunk_against_apply(op: Op) {
 
 #[tokio::test]
 async fn a_chunk_and_an_apply_agree_on_an_insert() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     chunk_against_apply(Op::Insert).await;
 }
 
 #[tokio::test]
 async fn a_chunk_and_an_apply_agree_on_an_update() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     chunk_against_apply(Op::Update).await;
 }
 
 #[tokio::test]
 async fn a_chunk_and_an_apply_agree_on_a_group_move() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     chunk_against_apply(Op::Move).await;
 }
 
 #[tokio::test]
 async fn a_chunk_and_an_apply_agree_on_a_delete() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     chunk_against_apply(Op::Delete).await;
 }
 
@@ -336,6 +344,8 @@ async fn a_chunk_and_an_apply_agree_on_a_delete() {
 /// row, before or after the first run's deltas are merged.
 #[tokio::test]
 async fn a_chunk_run_again_writes_no_deltas() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     for flavour in Flavour::EVERY {
         let rows = [
             (1, 1, 1),
@@ -389,6 +399,8 @@ async fn a_chunk_run_again_writes_no_deltas() {
 /// entry locks (I1), and then applies exactly the changes chunk 2 didn't see.
 #[tokio::test]
 async fn chunked_read_exact_point_over_build_chunks() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let flavour = Flavour::Sum;
     let rows = [
         (1, 1, 1),
@@ -500,6 +512,8 @@ async fn xact_id(client: &tokio_postgres::Client) -> String {
 /// counted and merged, which the page deletes (its update arm).
 #[tokio::test]
 async fn a_group_at_zero_members_keeps_the_sum_it_is_owed() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     for flavour in Flavour::ALL {
         for existing in [false, true] {
             let (mut d, plan) = start_build(flavour, &[(2, 1, 3), (3, 1, 1)]).await;
@@ -544,6 +558,8 @@ async fn a_group_at_zero_members_keeps_the_sum_it_is_owed() {
 /// is transiently negative. The merge brings it to all zeros, and it goes.
 #[tokio::test]
 async fn a_transiently_negative_group_goes_once_merged() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     for flavour in Flavour::ALL {
         let (mut d, plan) = start_build(flavour, &[(2, 1, 3)]).await;
         d.chunk(&plan, None, "2").await;
@@ -595,6 +611,8 @@ fn mm(lo: i32, hi: i32, n: i64) -> Option<(Option<String>, Option<String>, i64)>
 /// with both keys.
 #[tokio::test]
 async fn exp2_5_min_max_during_a_build() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let flavour = Flavour::MinMax;
     let (mut d, plan) = start_build(flavour, &[(1, 1, 10), (5, 2, 50), (6, 3, 60)]).await;
     d.chunk(&plan, None, "1").await;
@@ -658,6 +676,8 @@ async fn exp2_5_min_max_during_a_build() {
 ///   group, so the merge recomputes it rather than fold.
 #[tokio::test]
 async fn deleting_a_groups_current_min_and_max_recomputes_it_during_a_build() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let flavour = Flavour::MinMax;
     let rows = [(1, 0, 5), (2, 0, 20), (3, 0, 1), (4, 0, 10)];
 
@@ -719,6 +739,8 @@ async fn deleting_a_groups_current_min_and_max_recomputes_it_during_a_build() {
 /// 3, and key 2's entry stays as it was until `release_key` re-derives it.
 #[tokio::test]
 async fn a_sweep_leaves_a_quarantined_key_alone() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let flavour = Flavour::Sum;
     let (d, plan) = start_build(flavour, &[(1, 1, 1), (2, 1, 2), (3, 1, 3)]).await;
     d.chunk(&plan, None, "3").await;
@@ -762,6 +784,8 @@ async fn a_sweep_leaves_a_quarantined_key_alone() {
 /// a fold of the chunk's 100 would leave the group's `MAX` at 100 for good.
 #[tokio::test]
 async fn a_fold_reads_the_entry_a_page_changed_after_its_chunk() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let flavour = Flavour::MinMax;
     let (mut d, plan) = start_build(flavour, &[(1, 1, 5), (2, 1, 100)]).await;
     d.chunk(&plan, None, "1").await;
@@ -796,6 +820,8 @@ async fn a_fold_reads_the_entry_a_page_changed_after_its_chunk() {
 /// page's own (a tie) or the merge of the chunk's `__out`.
 #[tokio::test]
 async fn a_page_folds_into_an_extreme_a_pending_chunk_delta_will_reread() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let flavour = Flavour::MinMax;
     let (mut d, plan) = start_build(flavour, &[(1, 1, 10), (2, 1, 5), (3, 1, 4)]).await;
     d.chunk(&plan, None, "3").await;
@@ -832,6 +858,8 @@ async fn a_page_folds_into_an_extreme_a_pending_chunk_delta_will_reread() {
 /// with key 1 live in it. The merge's delta for group 1 names K′ only.
 #[tokio::test]
 async fn a_group_deleted_with_live_entries_is_recomputed_by_the_merge() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     // Not `Flavour::Composed`: its `SUM(v + 3)` keeps the row at a sum of 2,
     // and it recomputes every group anyway.
     for flavour in [Flavour::MinMax, Flavour::Bool] {
@@ -875,6 +903,8 @@ async fn a_group_deleted_with_live_entries_is_recomputed_by_the_merge() {
 /// recomputes it.
 #[tokio::test]
 async fn a_group_the_merger_empties_with_live_entries_is_recomputed_when_recreated() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let flavour = Flavour::MinMax;
     let (mut d, plan) = start_build(flavour, &[(2, 1, 3), (3, 1, 9)]).await;
     d.chunk(&plan, None, "2").await;
@@ -904,6 +934,8 @@ async fn a_group_the_merger_empties_with_live_entries_is_recomputed_when_recreat
 /// `SUM` or a composed field doesn't fold, so every merge recomputes.
 #[tokio::test]
 async fn a_fresh_builds_later_merges_fold() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     for (flavour, folds) in [
         (Flavour::MinMax, true),
         (Flavour::Bool, true),
@@ -940,8 +972,10 @@ async fn a_fresh_builds_later_merges_fold() {
 /// fold would skip the group as unchanged.
 #[tokio::test]
 async fn a_fold_takes_float_extremes_and_the_null_group() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     const DEFINITION: &str = "TRANSFORM agg FROM public.src GROUP BY g \
-         SELECT MIN(f) AS lo, MAX(f) AS hi, COUNT(*) AS n";
+        WITHOUT SOURCE INDEX SELECT MIN(f) AS lo, MAX(f) AS hi, COUNT(*) AS n";
     let mut d = Driver::start(
         "create table public.src (id integer primary key, g integer, f float8); \
          insert into public.src values \
@@ -997,8 +1031,10 @@ async fn a_fold_takes_float_extremes_and_the_null_group() {
 /// result is written back with the value a full recompute would write.
 #[tokio::test]
 async fn a_fold_takes_expression_arguments() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     const DEFINITION: &str = "TRANSFORM agg FROM public.src GROUP BY g \
-         SELECT MAX(v + w) AS hi, MIN(w + w) AS lo, BOOL_OR(v > 1) AS any_big, \
+        WITHOUT SOURCE INDEX SELECT MAX(v + w) AS hi, MIN(w + w) AS lo, BOOL_OR(v > 1) AS any_big, \
                 MIN(i + 1) AS small, COUNT(*) AS n";
     let mut d = Driver::start(
         "create table public.src (id integer primary key, g integer, v numeric, w bigint, \
@@ -1050,8 +1086,10 @@ async fn a_fold_takes_expression_arguments() {
 /// scales that differ (`1.50`), a large `bigint` sum and a boolean argument.
 #[tokio::test]
 async fn a_chunk_and_a_page_compute_expression_arguments_alike() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     const DEFINITION: &str = "TRANSFORM agg FROM public.src GROUP BY g \
-         SELECT SUM(v + v + 1) AS a, MAX(v + w) AS b, MIN(w + w) AS c, \
+        WITHOUT SOURCE INDEX SELECT SUM(v + v + 1) AS a, MAX(v + w) AS b, MIN(w + w) AS c, \
                 BOOL_OR(v > 1) AS d, AVG(v + 0.5) AS e, COUNT(w + 1) AS f";
     let mut d = Driver::start(
         "create table public.src (id integer primary key, g integer, v numeric, w bigint); \
@@ -1165,6 +1203,8 @@ async fn a_chunk_and_a_page_compute_expression_arguments_alike() {
 /// can lag (#297).
 #[tokio::test]
 async fn mergers_and_pages_on_the_same_groups_never_deadlock() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let flavour = Flavour::Sum;
     let (mut d, plan) = start_build_with(
         flavour,
@@ -1256,6 +1296,8 @@ async fn partitions(d: &Driver) -> Vec<i16> {
 /// and the target equals the oracle.
 #[tokio::test]
 async fn mergers_of_different_partitions_merge_side_by_side() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let flavour = Flavour::Sum;
     let (mut d, plan) = start_build_with(
         flavour,
@@ -1315,6 +1357,8 @@ async fn mergers_of_different_partitions_merge_side_by_side() {
 /// what is left.
 #[tokio::test]
 async fn a_second_merger_skips_a_partition_being_merged() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let flavour = Flavour::Sum;
     let (mut d, plan) = start_build_with(
         flavour,
@@ -1364,6 +1408,8 @@ async fn a_second_merger_skips_a_partition_being_merged() {
 /// settings the join is hashed and the claim reads the claim key's index.
 #[tokio::test]
 async fn the_merge_plan_survives_empty_statistics() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let (d, plan) = start_build_with(
         Flavour::Sum,
         "insert into public.src select i, i, i from generate_series(1, 300) i;",
@@ -1424,6 +1470,8 @@ async fn the_merge_plan_survives_empty_statistics() {
 /// `jit` is on and its total cost is above `jit_above_cost`.
 #[tokio::test]
 async fn the_merge_is_never_jit_compiled() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let (d, plan) = start_build_with(
         Flavour::Sum,
         "insert into public.src select i, i % 40, i from generate_series(1, 300) i;",
@@ -1468,6 +1516,8 @@ async fn the_merge_is_never_jit_compiled() {
 /// chunk's did before `CHUNK_PLAN_SETTINGS` (#625 F8a).
 #[tokio::test]
 async fn the_rederive_statements_read_the_ledger_by_key() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut unbounded = Vec::new();
     for stats in ["empty", "stale"] {
         let (d, plan) = start_build_with(
@@ -1530,6 +1580,8 @@ async fn the_rederive_statements_read_the_ledger_by_key() {
 /// the range finds its entries, so it takes their lock as well.
 #[tokio::test]
 async fn the_entry_plan_settings_end_with_each_statement() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let (d, plan) = start_build_with(
         Flavour::Sum,
         "insert into public.src select i, i % 20, i from generate_series(1, 200) i;",
@@ -1579,6 +1631,8 @@ fn estimated_rows(line: &str) -> usize {
 /// seam's statements, plans as usual.
 #[tokio::test]
 async fn the_merge_plan_settings_end_with_the_merge_statement() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let (d, plan) = start_build_with(
         Flavour::Sum,
         "insert into public.src select i, i % 20, i from generate_series(1, 200) i;",
@@ -1624,6 +1678,8 @@ async fn seqs(d: &Driver) -> Vec<i64> {
 /// newer rows first. One group, so every row is in one partition.
 #[tokio::test]
 async fn the_merger_claims_the_oldest_delta_rows_first() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let flavour = Flavour::Sum;
     let (mut d, plan) = start_build(flavour, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]).await;
     d.chunk(&plan, None, "1").await;
@@ -1659,6 +1715,8 @@ async fn the_merger_claims_the_oldest_delta_rows_first() {
 /// (B4): they record moves between entries the truncate discarded.
 #[tokio::test]
 async fn a_source_truncate_discards_the_pending_deltas() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let flavour = Flavour::Sum;
     let (mut d, plan) = start_build(flavour, &[(1, 1, 1), (2, 1, 2), (3, 2, 3)]).await;
     d.chunk(&plan, None, "3").await;
@@ -1681,6 +1739,8 @@ async fn a_source_truncate_discards_the_pending_deltas() {
 /// source, so it discards the pending delta rows with the old entries (B4).
 #[tokio::test]
 async fn the_one_pass_build_discards_the_pending_deltas() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let flavour = Flavour::Sum;
     let (mut d, plan) = start_build(flavour, &[(1, 1, 1), (2, 1, 2), (3, 2, 3)]).await;
     d.chunk(&plan, None, "3").await;
@@ -1713,6 +1773,8 @@ async fn the_one_pass_build_discards_the_pending_deltas() {
 /// its entry is the sweep's (#625 F3), so this leaves deletes out.
 #[tokio::test]
 async fn a_rebuild_over_stale_entries_converges_through_deltas_alone() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     for flavour in Flavour::EVERY {
         let rows = [(1, 1, 1), (2, 1, 2), (3, 2, 3), (4, 2, 4), (5, 1, 5)];
         let d = Driver::start(
@@ -1752,6 +1814,8 @@ async fn a_rebuild_over_stale_entries_converges_through_deltas_alone() {
 /// the page queues, and proceeds once the chunk commits.
 #[tokio::test]
 async fn a_page_queues_behind_a_chunk_holding_its_key() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let flavour = Flavour::Sum;
     let (mut d, plan) = start_build(flavour, &[(1, 1, 1), (2, 1, 2), (3, 2, 3)]).await;
     let mut chunk = d
@@ -1777,6 +1841,8 @@ async fn a_page_queues_behind_a_chunk_holding_its_key() {
 /// the page commits, the chunk runs again and the build converges.
 #[tokio::test]
 async fn a_chunk_gives_up_on_a_key_a_page_holds() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let flavour = Flavour::Sum;
     let (mut d, plan) = start_build(flavour, &[(1, 1, 1), (2, 1, 2), (3, 2, 3)]).await;
     let user = d.user().await;
@@ -1818,6 +1884,8 @@ async fn a_chunk_gives_up_on_a_key_a_page_holds() {
 /// that gives up at its short lock timeout runs again.
 #[tokio::test]
 async fn a_chunk_reads_an_entry_only_once_the_page_holding_it_commits() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let flavour = Flavour::Sum;
     let (mut d, plan) = start_build(flavour, &[(1, 1, 1), (2, 1, 2), (3, 2, 3)]).await;
     let user = d.user().await;
@@ -1859,6 +1927,8 @@ async fn a_chunk_reads_an_entry_only_once_the_page_holding_it_commits() {
 /// gives up at its short lock timeout runs again.
 #[tokio::test]
 async fn a_chunk_queues_on_an_entry_a_page_inserted_with_its_change() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     for flavour in Flavour::EVERY {
         let (mut d, plan) = start_build(flavour, &[(1, 1, 1), (2, 1, 2), (3, 2, 3)]).await;
         let user = d.user().await;
@@ -1901,6 +1971,8 @@ async fn a_chunk_queues_on_an_entry_a_page_inserted_with_its_change() {
 /// over the range).
 #[tokio::test]
 async fn a_chunk_tombstone_is_collected_once_its_segment_drains() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let flavour = Flavour::Sum;
     for (point, rechunk) in [
         (PausePoint::BeforeChunkInsert, false),
@@ -1966,6 +2038,8 @@ async fn a_chunk_tombstone_is_collected_once_its_segment_drains() {
 /// target would count it for good.
 #[tokio::test]
 async fn the_gc_keeps_a_tombstone_a_chunk_has_yet_to_insert_over() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     for flavour in [Flavour::Sum, Flavour::MinMax] {
         let (mut d, plan) = start_build(flavour, &[(1, 1, 1), (2, 1, 2), (3, 2, 3)]).await;
         d.ctl
@@ -2089,6 +2163,8 @@ async fn start_retake(flavour: Flavour) -> (Driver, BuildPlan, i64) {
 /// up at its lock timeout.
 #[tokio::test]
 async fn a_page_losing_an_entry_to_the_gc_never_deadlocks_with_a_chunk() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let flavour = Flavour::Sum;
     let (mut d, plan, batch) = start_retake(flavour).await;
     let mut page = d
@@ -2118,6 +2194,8 @@ async fn a_page_losing_an_entry_to_the_gc_never_deadlocks_with_a_chunk() {
 /// insert, which found key 2's tombstone, and the GC collects it.
 #[tokio::test]
 async fn a_chunk_losing_an_entry_to_the_gc_gives_up_transiently() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let flavour = Flavour::Sum;
     let (mut d, plan, batch) = start_retake(flavour).await;
     let mut chunk = d
@@ -2149,6 +2227,8 @@ type Range = (Option<String>, String);
 /// that gives up on a key a page holds goes back on the queue.
 #[tokio::test]
 async fn a_build_by_eight_chunk_runners_under_writers_equals_the_oracle() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     eight_chunk_runners_under_writers(Flavour::Avg).await;
 }
 
@@ -2157,6 +2237,8 @@ async fn a_build_by_eight_chunk_runners_under_writers_equals_the_oracle() {
 /// pages recompute theirs.
 #[tokio::test]
 async fn a_min_max_build_by_eight_chunk_runners_under_writers_equals_the_oracle() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     eight_chunk_runners_under_writers(Flavour::MinMax).await;
 }
 

@@ -567,22 +567,26 @@ async fn a_chunk_feeds_a_reader_of_its_target_through_the_seam() {
     const READER_ACTUAL: &str = "select g, n, s from public.byg order by g";
     const READER_EXPECTED: &str =
         "select g, count(*), sum(dbl) from public.one group by g order by g";
-    // Integer columns: a numeric group key can't key a chained reader.
+    // Integer columns: a numeric group key can't key a chained reader, and
+    // a chained SUM over a target's numeric column is refused (#1120).
     let int4 = ValueType::Integer(trellis::integer::IntWidth::Int4);
     let mut d = Driver::start(
-        &format!("{CREATE} {}", seed(&[(1, 1, 1), (2, 1, 2), (3, 2, 3)])),
-        &[("id", int4), ("g", int4), ("v", ValueType::Numeric)],
+        &format!(
+            "create table public.src (id integer primary key, g integer, v integer); {}",
+            seed(&[(1, 1, 1), (2, 1, 2), (3, 2, 3)])
+        ),
+        &[("id", int4), ("g", int4), ("v", int4)],
         &[ONE],
         &["public.src"],
     )
     .await;
     trellis::defs::install_definition(
         d.pool(),
-        "TRANSFORM byg FROM public.one GROUP BY g SELECT COUNT(*) AS n, SUM(dbl) AS s",
+        "TRANSFORM byg FROM public.one GROUP BY g WITHOUT SOURCE INDEX SELECT COUNT(*) AS n, SUM(dbl) AS s",
         &std::collections::HashMap::from([
             ("id".to_string(), int4),
             ("g".to_string(), int4),
-            ("dbl".to_string(), ValueType::Numeric),
+            ("dbl".to_string(), int4),
         ]),
         "public",
     )

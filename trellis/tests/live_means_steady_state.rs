@@ -170,7 +170,7 @@ async fn seed_sales(raw: &Client) {
 /// until #625 F9 (every plain aggregate is the Re-derive build's since #625
 /// F5).
 const SKU_TOTALS_RELATED: &str = "TRANSFORM sku_totals FROM sales GROUP BY sku \
-     SELECT sum(amount) AS total, max(item.weight) AS weight";
+    WITHOUT SOURCE INDEX SELECT sum(amount) AS total, max(item.weight) AS weight";
 
 /// Creates `public.skus`, relates `sales.sku` to it, and registers
 /// [`SKU_TOTALS_RELATED`].
@@ -184,10 +184,12 @@ async fn register_related_sku_totals(dsn: &str) {
         )
         .await
         .expect("create and seed skus");
-    trellis
-        .apply("RELATIONSHIP item FROM sales.sku TO skus.sku")
-        .await
-        .expect("register the relationship");
+    trellis::dev::defs::create_relationship(
+        trellis.pool(),
+        "RELATIONSHIP item FROM sales.sku TO skus.sku",
+    )
+    .await
+    .expect("register the relationship");
     trellis
         .apply(SKU_TOTALS_RELATED)
         .await
@@ -284,10 +286,12 @@ async fn register_related_order_view(raw: &Client, dsn: &str, rows: &str) {
     .await
     .expect("create and seed orders and lines");
     let trellis = define_only(dsn).await;
-    trellis
-        .apply("RELATIONSHIP lines FROM orders.id TO lines.order_id")
-        .await
-        .expect("register the relationship");
+    trellis::dev::defs::create_relationship(
+        trellis.pool(),
+        "RELATIONSHIP lines FROM orders.id TO lines.order_id",
+    )
+    .await
+    .expect("register the relationship");
     trellis
         .apply("TRANSFORM order_view FROM orders SELECT a AS a, COUNT(lines.id) AS n")
         .await
@@ -494,7 +498,7 @@ async fn a_ring_build_on_another_definitions_target_is_live_only_once_caught_up(
 
     define_only(db.dsn())
         .await
-        .apply("TRANSFORM sku_totals FROM sales GROUP BY sku SELECT sum(amount) AS total")
+        .apply("TRANSFORM sku_totals FROM sales GROUP BY sku WITHOUT SOURCE INDEX SELECT sum(amount) AS total")
         .await
         .expect("register the upstream aggregate");
     let engine = running(db.dsn()).await;
@@ -650,6 +654,7 @@ async fn a_one_to_one_direct_build_row_deleted_during_its_build_is_gone_at_live(
 /// The chunk is held by a row trigger on the target's group-delta table,
 /// after its entry lock and its read.
 #[tokio::test]
+#[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
 async fn a_rederive_build_applies_while_backfilling_and_is_steady_at_live() {
     const HOLD: i64 = 6253;
     let cluster = TestCluster::start();
@@ -659,7 +664,7 @@ async fn a_rederive_build_applies_while_backfilling_and_is_steady_at_live() {
 
     define_only(db.dsn())
         .await
-        .apply("TRANSFORM sku_totals FROM sales GROUP BY sku SELECT sum(amount) AS total")
+        .apply("TRANSFORM sku_totals FROM sales GROUP BY sku WITHOUT SOURCE INDEX SELECT sum(amount) AS total")
         .await
         .expect("register the aggregate");
     raw.batch_execute(&format!(

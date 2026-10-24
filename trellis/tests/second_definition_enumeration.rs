@@ -155,7 +155,7 @@ async fn second_definition(first: &str, second: &str) -> i64 {
 async fn a_second_aggregate_reading_a_new_column_enumerates_nothing_for_a_live_aggregate() {
     let staged = second_definition(
         "TRANSFORM agg1 FROM src GROUP BY g WITHOUT SOURCE INDEX SELECT sum(v) AS total",
-        "TRANSFORM agg2 FROM src GROUP BY g, h SELECT sum(v) AS total",
+        "TRANSFORM agg2 FROM src GROUP BY g, h WITHOUT SOURCE INDEX SELECT sum(v) AS total",
     )
     .await;
     assert_eq!(
@@ -181,7 +181,7 @@ async fn a_second_aggregate_over_the_same_columns_enumerates_nothing_for_a_live_
 async fn a_second_definition_enumerates_nothing_for_a_live_one_to_one_reader() {
     let staged = second_definition(
         "TRANSFORM copy1 FROM src SELECT g AS g, v AS v",
-        "TRANSFORM agg2 FROM src GROUP BY g, h SELECT sum(v) AS total",
+        "TRANSFORM agg2 FROM src GROUP BY g, h WITHOUT SOURCE INDEX SELECT sum(v) AS total",
     )
     .await;
     assert_eq!(
