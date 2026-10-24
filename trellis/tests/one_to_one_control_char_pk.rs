@@ -19,7 +19,7 @@ use trellis::Pool;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use trellis::defs::{create_definition, create_target_table};
-use trellis::staging::{StagedWatermark, apply, has_pending, retire_drained_segments, seal};
+use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
 
 async fn connect_raw(dsn: &str) -> Client {
     let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
@@ -71,7 +71,6 @@ async fn stage_cdc(
 async fn drain_to_quiescence(pool: &Pool, client: &mut Client) {
     // No live capture stages anything here, so there is no real staged
     // watermark to hold apply back. A saturated one never does.
-    let watermark = StagedWatermark::saturated();
     for _ in 0..16 {
         let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
         seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
@@ -83,7 +82,6 @@ async fn drain_to_quiescence(pool: &Pool, client: &mut Client) {
             "control_char_pk_test",
             1,
             "trellis_control_char_pk_test",
-            &watermark,
         )
         .await
         .expect("drain_once")

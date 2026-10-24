@@ -170,7 +170,6 @@ impl Fixture {
 
     /// Seals and drains the ring until nothing is pending.
     async fn drain(&mut self) {
-        let watermark = StagedWatermark::saturated();
         for _ in 0..16 {
             trellis::staging::seal_if_active_nonempty(&mut self.raw, WAKE)
                 .await
@@ -179,7 +178,7 @@ impl Fixture {
                 .await
                 .expect("next claimable segment")
             {
-                apply::drain_once(&self.db.pool, seg, "drainer", 1, WAKE, &watermark)
+                apply::drain_once(&self.db.pool, seg, "drainer", 1, WAKE)
                     .await
                     .expect("drain_once");
             }
@@ -1325,7 +1324,6 @@ async fn a_live_definition_whose_ledger_is_dropped_is_quarantined_alone() {
 
     // Each page fails until its keys' retries run out: a bounded number of
     // explicit drains, not a timed wait.
-    let watermark = StagedWatermark::saturated();
     for _ in 0..16 {
         trellis::staging::seal_if_active_nonempty(&mut f.raw, WAKE)
             .await
@@ -1334,7 +1332,7 @@ async fn a_live_definition_whose_ledger_is_dropped_is_quarantined_alone() {
             .await
             .expect("next claimable segment")
         {
-            if apply::drain_once(&f.db.pool, seg, "drainer", 1, WAKE, &watermark)
+            if apply::drain_once(&f.db.pool, seg, "drainer", 1, WAKE)
                 .await
                 .is_err()
             {
@@ -2285,7 +2283,6 @@ async fn a_batch_older_than_the_start_drained_after_it_does_not_revive_a_deleted
     f.pass().await;
     f.run("agg").await;
     assert_eq!(f.status("agg").await.as_deref(), Some("live"));
-    let watermark = StagedWatermark::saturated();
     let seal = async |f: &mut Fixture, sql: &str| -> i64 {
         f.raw.batch_execute(sql).await.expect("write");
         trellis::staging::seal_if_active_nonempty(&mut f.raw, WAKE)
@@ -2299,7 +2296,7 @@ async fn a_batch_older_than_the_start_drained_after_it_does_not_revive_a_deleted
     let older = seal(&mut f, "insert into public.src values (100, 50, 7)").await;
     let newer = seal(&mut f, "delete from public.src where id = 100").await;
     // The newer batch drains before `agg2` exists, let alone applies.
-    apply::drain_once(&f.db.pool, newer, "drainer", 1, WAKE, &watermark)
+    apply::drain_once(&f.db.pool, newer, "drainer", 1, WAKE)
         .await
         .expect("drain the newer batch");
 
@@ -2326,7 +2323,7 @@ async fn a_batch_older_than_the_start_drained_after_it_does_not_revive_a_deleted
     assert_eq!(f.status("agg2").await.as_deref(), Some("backfilling"));
 
     // The older batch drains after the start: its insert reaches `agg2`.
-    apply::drain_once(&f.db.pool, older, "drainer", 1, WAKE, &watermark)
+    apply::drain_once(&f.db.pool, older, "drainer", 1, WAKE)
         .await
         .expect("drain the older batch");
     f.run("agg2").await;
@@ -2359,7 +2356,6 @@ async fn a_batch_older_than_a_one_to_one_start_drained_after_it_does_not_revive_
     f.pass().await;
     f.run("one").await;
     assert_eq!(f.status("one").await.as_deref(), Some("live"));
-    let watermark = StagedWatermark::saturated();
     let seal = async |f: &mut Fixture, sql: &str| -> i64 {
         f.raw.batch_execute(sql).await.expect("write");
         trellis::staging::seal_if_active_nonempty(&mut f.raw, WAKE)
@@ -2370,7 +2366,7 @@ async fn a_batch_older_than_a_one_to_one_start_drained_after_it_does_not_revive_
     };
     let older = seal(&mut f, "insert into public.src values (100, 5, 7)").await;
     let newer = seal(&mut f, "delete from public.src where id = 100").await;
-    apply::drain_once(&f.db.pool, newer, "drainer", 1, WAKE, &watermark)
+    apply::drain_once(&f.db.pool, newer, "drainer", 1, WAKE)
         .await
         .expect("drain the newer batch");
 
@@ -2397,7 +2393,7 @@ async fn a_batch_older_than_a_one_to_one_start_drained_after_it_does_not_revive_
     assert_eq!(f.status("one2").await.as_deref(), Some("backfilling"));
     assert_eq!(f.build("one2").await.as_deref(), Some("rederive"));
 
-    apply::drain_once(&f.db.pool, older, "drainer", 1, WAKE, &watermark)
+    apply::drain_once(&f.db.pool, older, "drainer", 1, WAKE)
         .await
         .expect("drain the older batch");
     f.run("one2").await;
@@ -2440,19 +2436,18 @@ async fn rederive_tombstone_outlives_a_batch_its_read_saw(
     let mut f = Fixture::new(20, &[definition]).await;
     f.pass().await;
     assert_eq!(f.status(target).await.as_deref(), Some("backfilling"));
-    let watermark = StagedWatermark::saturated();
     let at_start = write_and_seal(&mut f, "update public.src set v = 101 where id = 5").await;
     let middle = write_and_seal(&mut f, "update public.src set v = 102 where id = 5").await;
     let newest = write_and_seal(&mut f, "delete from public.src where id = 5").await;
     for seg in [at_start, newest] {
-        apply::drain_once(&f.db.pool, seg, "drainer", 1, WAKE, &watermark)
+        apply::drain_once(&f.db.pool, seg, "drainer", 1, WAKE)
             .await
             .expect("drain");
     }
     trellis::staging::collect_tombstones(&mut f.raw)
         .await
         .expect("collect tombstones");
-    apply::drain_once(&f.db.pool, middle, "drainer", 1, WAKE, &watermark)
+    apply::drain_once(&f.db.pool, middle, "drainer", 1, WAKE)
         .await
         .expect("drain the middle batch");
     f.run(target).await;

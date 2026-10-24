@@ -132,27 +132,12 @@ pub async fn park_ready_registration_markers(
 }
 
 /// Parks the marker a capture widen of `table` commits with (issue #622,
-/// `capture::install`'s "Widening and the capture gate"), and, when `table`
-/// is a relationship's to-side, asks its discharge to refresh the settled
-/// projections on it ([`request_projection_refresh`]).
-///
-/// The refresh is what makes a to-side widen safe for a projection. A
-/// definition that reads a new to-side column through a to-one relationship
-/// widens the projection and back-fills the column from the live table when
-/// it registers, but until the widen lands the capture function images rows
-/// without that column, and applying such a row's image writes the column as
-/// `NULL` into the projection. The widen's marker holds its discharge until
-/// every row staged before the widen has drained (its capture gate), so the
-/// refresh runs after the last of them and re-reads the column from the
-/// table.
+/// `capture::install`'s "Widening and the capture gate").
 pub(crate) async fn park_widen_marker(
     client: &impl GenericClient,
     table: &str,
 ) -> Result<(), IntakeError> {
     park_marker(client, table).await?;
-    if is_relationship_to_side(client, table).await? {
-        request_projection_refresh(client, &[table.to_string()]).await?;
-    }
     Ok(())
 }
 
@@ -166,18 +151,9 @@ pub(crate) async fn park_widen_marker(
 /// re-derives from the rebuilt state once the marker discharges, and until
 /// then it may be missing what the rebuild wrote.
 ///
-/// A reader is every applying definition that reads the target, directly as
-/// its source or through a relationship whose to-side it is (issue #507,
-/// [`crate::defs::catalog::applying_readers`]). The discharge reaches a
-/// relationship consumer by reverse propagation: its enumeration stages an
-/// image-less `Recompute` per target key, and apply re-derives every
-/// from-side row joined to one. A target that is a relationship's to-side
-/// gets the marker even with no reader yet, because its discharge also
-/// refreshes the relationship's settled projection
-/// ([`crate::defs::catalog::refresh_relationship_projections_in_txn`], asked
-/// for by [`request_projection_refresh`]), which a later consumer would
-/// otherwise read stale. A no-op for a target that is neither read nor a
-/// to-side.
+/// A reader is every applying definition that reads the target
+/// ([`crate::defs::catalog::applying_readers`]). A no-op for a target nothing
+/// reads.
 ///
 /// A reader on the group basis (`staging::group_basis`) is rebuilt instead
 /// (ADR-0002, "Multi-hop"): the catch-up's image-less re-read names keys,
@@ -216,7 +192,6 @@ pub(crate) async fn park_target_catchup_if_read(
     // After the marker, so the generation each rebuild records is the one
     // just parked, which then has nothing to enumerate for it.
     crate::staging::build::start_rebuilds(client, &rebuilt).await?;
-    request_projection_refresh(client, &tables).await?;
     Ok(rebuilt)
 }
 
@@ -238,19 +213,12 @@ pub(crate) async fn park_target_catchup_if_read(
 /// is held only for the commit.
 ///
 /// Each other marker is a go-live catch-up ([`park_catch_up`]) for every
-/// applying definition that reads its table, directly or through a
-/// relationship ([`crate::defs::catalog::applying_readers`]). Such a reader
-/// reports `catching_up` until the discharge has re-read the table, which
-/// re-derives the rows it still has, and swept the reader's target of rows
-/// the table no longer backs, which no re-read reaches.
-///
-/// A table that is a relationship's to-side also has its settled projections
-/// refreshed by the discharge ([`request_projection_refresh`]): a to-one
-/// consumer reads the projection, never the table, and a re-read's
-/// image-less `Recompute` re-derives the consumer from the projection
-/// without correcting it. With no reader the marker is a plain one, and the
-/// refresh still runs, so a consumer registered later doesn't read a stale
-/// projection.
+/// applying definition that reads its table
+/// ([`crate::defs::catalog::applying_readers`]). Such a reader reports
+/// `catching_up` until the discharge has re-read the table, which re-derives
+/// the rows it still has, and swept the reader's target of rows the table
+/// no longer backs, which no re-read reaches. With no reader the marker is a
+/// plain one.
 ///
 /// Locks follow [`park_catch_up`]'s order: every definition this touches
 /// first (in id order), then the markers.
@@ -259,8 +227,8 @@ pub(crate) async fn park_target_catchup_if_read(
 /// to a captured partitioned root's recorded tree
 /// (`capture::install::adds_only_new_nodes`). A definition reading the
 /// root the partition correction engine serves (an aggregate on the ledger
-/// or the group basis, a `JOIN` reading the root as either side, or a reader
-/// through a to-many relationship) is then neither rebuilt nor caught up:
+/// or the group basis, or a `JOIN` reading the root as either side) is then
+/// neither rebuilt nor caught up:
 /// the reconcile pass queues each new node's correction, which re-derives
 /// the keys (or the `JOIN` side's cells) of the node alone, the node's own
 /// rows' among them (#1103, #1111, #1147). With no other reader to catch up and no
@@ -271,19 +239,11 @@ pub(crate) async fn park_table_catch_ups(
     new_nodes: bool,
 ) -> Result<Vec<i64>, IntakeError> {
     let mut readers = Vec::new();
-    let mut to_sides = Vec::new();
     for table in tables {
         readers.extend(crate::defs::catalog::applying_readers(client, table).await?);
-        if is_relationship_to_side(client, table).await? {
-            to_sides.push(table.clone());
-        }
     }
     let mut candidates = crate::staging::build::rebuild_candidates(client, tables).await?;
     if new_nodes {
-        // A partitioned root is never the to-side of a to-one relationship
-        // (refused at define), and only a to-one relationship has a
-        // projection for the discharge to refresh.
-        to_sides.clear();
         let mut corrected = Vec::new();
         for &id in readers.iter().chain(&candidates) {
             if let Some(definition) = crate::defs::catalog::definition_by_id_in(client, id).await?
@@ -312,13 +272,12 @@ pub(crate) async fn park_table_catch_ups(
     readers.dedup();
     // Nothing left to re-read: the readers a new node's correction covers
     // need no enumeration of the whole table, so no marker is parked for them.
-    if !(new_nodes && readers.is_empty() && rebuilt.is_empty() && to_sides.is_empty()) {
+    if !(new_nodes && readers.is_empty() && rebuilt.is_empty()) {
         park_catch_up(client, &readers, tables).await?;
     }
     // After the markers, so the generation each rebuild records is the one
     // just parked.
     crate::staging::build::start_rebuilds(client, &rebuilt).await?;
-    request_projection_refresh(client, &to_sides).await?;
     Ok(rebuilt)
 }
 
@@ -326,10 +285,8 @@ pub(crate) async fn park_table_catch_ups(
 /// new to one of `tables`' recorded trees (`park_table_catch_ups`'s
 /// `new_nodes`): a `JOIN` reading the table as either side, whose node
 /// correction recomputes the side's cells that route to the node (#1111);
-/// an aggregate over the table that the engine re-derives
-/// ([`crate::staging::build::corrected_on_partitioned_source`]); or a
-/// definition reading the table through a to-many relationship
-/// (`staging::partition_correction::schedule`'s readers).
+/// or an aggregate over the table that the engine re-derives
+/// ([`crate::staging::build::corrected_on_partitioned_source`]).
 async fn corrected_by_new_node(
     client: &impl GenericClient,
     definition: &crate::defs::model::Definition,
@@ -341,53 +298,13 @@ async fn corrected_by_new_node(
                 .await?
                 .is_some_and(|joined| tables.contains(&joined)));
     }
-    if tables.contains(&definition.source_table) {
-        return Ok(crate::staging::build::corrected_on_partitioned_source(
-            definition,
-        ));
-    }
-    let Some((schema, table)) = definition.source_table.split_once('.') else {
-        return Ok(false);
-    };
-    let read = crate::defs::eval::relationship_references(&definition.def);
-    Ok(
-        crate::defs::catalog::relationships_from_table_in(client, schema, table)
-            .await?
-            .iter()
-            .any(|r| {
-                r.cardinality == crate::defs::model::RelationshipCardinality::ToMany
-                    && tables.contains(&r.qualified_to_table())
-                    && read.iter().any(|(name, _)| *name == r.def.name)
-            }),
-    )
-}
-
-/// Asks the discharge of each of `tables`' markers, just parked by this
-/// transaction, to refresh the relationship projections on it
-/// (`pending_backfill.refresh_projections`, issue #507): each is a target a
-/// rebuild rewrote outside the seam, or a to-side a catch-up re-reads
-/// because some of its changes may never have reached the projection
-/// ([`park_table_catch_ups`]). The markers are already locked by the park,
-/// so this takes no new lock.
-async fn request_projection_refresh(
-    client: &impl GenericClient,
-    tables: &[String],
-) -> Result<(), IntakeError> {
-    if tables.is_empty() {
-        return Ok(());
-    }
-    client
-        .execute(
-            "update pending_backfill set refresh_projections = true where table_name = any($1)",
-            &[&tables],
-        )
-        .await?;
-    Ok(())
+    Ok(tables.contains(&definition.source_table)
+        && crate::staging::build::corrected_on_partitioned_source(definition))
 }
 
 /// The catch-ups [`park_target_catchup_if_read`] parks for `targets`: every
-/// one of them something reads or that is a relationship's to-side, with the
-/// readers of those, sorted and deduplicated.
+/// one of them something reads, with the readers of those, sorted and
+/// deduplicated.
 async fn target_catchups(
     client: &impl GenericClient,
     targets: &[String],
@@ -396,7 +313,7 @@ async fn target_catchups(
     let mut tables = Vec::new();
     for target in targets {
         let read_by = crate::defs::catalog::applying_readers(client, target).await?;
-        if read_by.is_empty() && !is_relationship_to_side(client, target).await? {
+        if read_by.is_empty() {
             continue;
         }
         readers.extend(read_by);
@@ -405,24 +322,6 @@ async fn target_catchups(
     readers.sort_unstable();
     readers.dedup();
     Ok((readers, tables))
-}
-
-/// Whether `table` is the to-side of some relationship.
-async fn is_relationship_to_side(
-    client: &impl GenericClient,
-    table: &str,
-) -> Result<bool, IntakeError> {
-    let Some((schema, name)) = table.split_once('.') else {
-        return Ok(false);
-    };
-    Ok(client
-        .query_one(
-            "select exists (select 1 from relationship_definitions \
-             where to_schema = $1 and to_table = $2)",
-            &[&schema, &name],
-        )
-        .await?
-        .get(0))
 }
 
 /// Parks a go-live catch-up marker on each of `tables` for the definitions
@@ -675,9 +574,6 @@ struct PendingBackfill {
     /// Whether the backoff after the last failure has run out
     /// (`next_attempt_at`, read against the database's clock).
     due: bool,
-    /// Whether the discharge refreshes the relationship projections on
-    /// `table` ([`request_projection_refresh`], issue #507).
-    refresh_projections: bool,
     /// The capture gate a trigger install or widen set
     /// (`capture::install`, issue #622): the discharge waits until no change
     /// to `table` at or below it is still pending
@@ -694,8 +590,7 @@ async fn fetch_pending_backfills(
     let rows = client
         .query_typed(
             "select table_name, fence_xid::text::bigint, generation, attempts, \
-                    coalesce(next_attempt_at <= now(), true), refresh_projections, \
-                    capture_gate_lsn \
+                    coalesce(next_attempt_at <= now(), true), capture_gate_lsn \
              from pending_backfill order by generation",
             &[],
         )
@@ -708,8 +603,7 @@ async fn fetch_pending_backfills(
             generation: r.get(2),
             attempts: r.get(3),
             due: r.get(4),
-            refresh_projections: r.get(5),
-            capture_gate: r.get(6),
+            capture_gate: r.get(5),
         })
         .collect())
 }
@@ -950,18 +844,6 @@ pub(super) async fn fetch_read(
                 src_table: src_table.to_string(),
                 key,
                 hop_gen: 0,
-                // Issue #133: intentionally `None`, not merely unpopulated
-                // — a `Recompute` carries no `old_image`/`new_image` (see
-                // `StagedChange::Recompute`'s own doc comment), and
-                // `group_key`'s value is specifically "which join-key
-                // values this row's own image-bearing history touched," so
-                // there is no image here to read one from. This is the
-                // "backfill-enumeration producer" the issue's own text
-                // flags as needing "the equivalent treatment" — the
-                // equivalent treatment for an image-less producer is
-                // leaving this `None`, matching every other `Recompute`
-                // producer (reverse propagation, definition re-derive).
-                group_key: None,
                 // No meaningful origin for a backfill's cursor-enumerated
                 // pre-existing row — nothing "changed" it; see
                 // `StagedChange::Recompute`'s doc comment.
@@ -1665,13 +1547,7 @@ async fn discharge_marker(
         .add(&txn, &catching_up_now, TransformStatus::CatchingUp)
         .await?;
     let enumerate = !ring.is_empty()
-        || crate::defs::catalog::table_has_reader(
-            &txn,
-            &marker.table,
-            marker.generation,
-            marker.refresh_projections,
-        )
-        .await?;
+        || crate::defs::catalog::table_has_reader(&txn, &marker.table, marker.generation).await?;
     let declared = declare_read(&txn, enumerate.then_some(marker.table.as_str()), &sweep).await?;
     if enumerate {
         let horizon: PgLsn = txn
@@ -1691,31 +1567,6 @@ async fn discharge_marker(
         fetch_read(&txn, &marker.table, &mut sweep).await?;
     }
     sweep.finish(&txn).await?;
-    // Issue #507: a target's rebuild wrote it outside the seam, so no seam
-    // row carried its changes into a relationship's settled projection.
-    // Issue #522: a source to-side re-read by a catch-up may have had changes
-    // whose CDC never reached its projection either. Only those catch-ups
-    // ask for the refresh (`request_projection_refresh`): it diffs the whole
-    // table, and every other write reaches the projection through the seam
-    // or CDC.
-    // Issue #813: not when every reader of the table is frozen, since the
-    // resume of each refreshes the projections it reads (issue #768). So a
-    // to-side Postgres refuses the role doesn't fail the marker again once
-    // the refusal has paused its readers.
-    if marker.refresh_projections
-        && !crate::defs::catalog::table_readers_all_frozen(&txn, &marker.table).await?
-    {
-        let refreshed =
-            crate::defs::catalog::refresh_relationship_projections_in_txn(&txn, &marker.table)
-                .await?;
-        if refreshed > 0 {
-            crate::instance_log::info!(
-                table = %marker.table,
-                rows = refreshed,
-                "refreshed relationship projections from a target's catch-up"
-            );
-        }
-    }
     for (id, build) in &builds {
         match build {
             Build::Chunks(ranges) => {
@@ -1888,8 +1739,7 @@ async fn go_live(txn: &Transaction<'_>, ids: &[i64]) -> Result<(), IntakeError> 
         .collect();
     let mut tables = rewritten.clone();
     tables.extend(chained_sources);
-    park_catch_up(txn, &readers, &tables).await?;
-    request_projection_refresh(txn, &rewritten).await
+    park_catch_up(txn, &readers, &tables).await
 }
 
 /// Flips each of `candidates` (every `catching_up` definition that reads
@@ -3489,6 +3339,68 @@ mod catch_up_tests {
             .get(0)
     }
 
+    /// A target catch-up's discharge enumerates for the readers it parked
+    /// (#1322, #1115): they are `catching_up`, which
+    /// [`crate::defs::catalog::table_has_reader`] counts, while a `live`
+    /// reader of a table whose marker no catch-up parked doesn't count.
+    #[tokio::test]
+    async fn a_target_catch_up_marker_counts_the_readers_it_parked() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let client = connect(&db).await;
+        client
+            .batch_execute(
+                "insert into source_table_versions (source_table, version) \
+                 values ('public.s', 1), ('public.u', 1)",
+            )
+            .await
+            .expect("seed source_table_versions");
+        let insert = async |target: &str, source: &str, status: &str| -> i64 {
+            client
+                .query_one(
+                    "insert into transform_definitions \
+                     (target_table, source_table, source_version, definition_text, status) \
+                     values ($1, $2, 1, 'TRANSFORM t FROM s SELECT id AS x', $3) returning id",
+                    &[&target, &source, &status],
+                )
+                .await
+                .expect("seed a definition")
+                .get(0)
+        };
+        let upstream = insert("public.u", "public.s", "live").await;
+        insert("public.r1", "public.u", "live").await;
+        let generation = async || -> i64 {
+            client
+                .query_one(
+                    "select generation from pending_backfill where table_name = 'public.u'",
+                    &[],
+                )
+                .await
+                .expect("read the marker's generation")
+                .get(0)
+        };
+
+        park_marker(&client, "public.u")
+            .await
+            .expect("park a plain marker");
+        assert!(
+            !crate::defs::catalog::table_has_reader(&client, "public.u", generation().await)
+                .await
+                .expect("ask for a reader"),
+            "a live reader alone needs no enumeration"
+        );
+
+        park_target_catchup_if_read(&client, upstream)
+            .await
+            .expect("park the target catch-up");
+        assert!(
+            crate::defs::catalog::table_has_reader(&client, "public.u", generation().await)
+                .await
+                .expect("ask for a reader"),
+            "the catch-up's discharge enumerates for the reader it parked"
+        );
+    }
+
     /// Issue #476: an upstream rebuild writes its target outside the seam,
     /// so finishing it parks a catch-up on that target and moves each
     /// applying reader that is `live` to `catching_up` until it has run. A
@@ -3876,7 +3788,6 @@ mod catch_up_tests {
     /// Seals and drains until nothing is pending: a bounded loop, not a
     /// convergence wait.
     async fn drain_all(pool: &crate::pool::Pool, client: &mut tokio_postgres::Client) {
-        let watermark = StagedWatermark::saturated();
         for _ in 0..16 {
             let outcome = crate::staging::seal::seal_phase1(client)
                 .await
@@ -3890,7 +3801,6 @@ mod catch_up_tests {
                 "catch_up_tests",
                 1,
                 "wake",
-                &watermark,
             )
             .await
             .expect("drain_once")
@@ -3989,7 +3899,6 @@ mod catch_up_tests {
                 origin_lsn: None,
                 src_changed: None,
                 hop_gen: 0,
-                group_key: None,
             }],
         )
         .await
@@ -4213,7 +4122,6 @@ mod catch_up_tests {
                 origin_lsn: None,
                 src_changed: None,
                 hop_gen: 0,
-                group_key: None,
             })
             .collect();
         let txn = writer.transaction().await.expect("begin");

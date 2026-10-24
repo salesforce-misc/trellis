@@ -15,7 +15,7 @@ use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::ValueType;
 use trellis::defs::{create_definition, create_target_table, source_primary_key};
-use trellis::staging::{StagedWatermark, apply, seal};
+use trellis::staging::{apply, seal};
 
 fn numeric_columns(names: &[&str]) -> HashMap<String, ValueType> {
     names
@@ -47,8 +47,7 @@ async fn seal_active_segment(client: &mut Client) -> i64 {
 }
 
 async fn drain(pool: &trellis::Pool, seg_seq: i64) {
-    let watermark = StagedWatermark::saturated();
-    while apply::drain_once(pool, seg_seq, "origin_test", 1, "wake", &watermark)
+    while apply::drain_once(pool, seg_seq, "origin_test", 1, "wake")
         .await
         .expect("drain_once")
         .is_some()

@@ -72,8 +72,7 @@ async fn capture_pass(raw: &mut Client, pool: &trellis::Pool) {
 }
 
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
-    use trellis::staging::{StagedWatermark, apply, has_pending, retire_drained_segments, seal};
-    let watermark = StagedWatermark::saturated();
+    use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
     for _ in 0..16 {
         let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
         seal::seal_phase2(client, outcome.sealed_seg_seq, "capture_missed_ddl_wake")
@@ -85,7 +84,6 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
             "capture_missed_ddl_test",
             1,
             "trellis_capture_missed_ddl_test",
-            &watermark,
         )
         .await
         .expect("drain_once")

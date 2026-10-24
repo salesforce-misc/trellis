@@ -2804,7 +2804,7 @@ mod db_tests {
                 &format!(
                     "select src_table, key, op::text, (lsn is not null)::text, \
                             old_image::text, new_image::text, origin_lsn::text, \
-                            src_changed::text, hop_gen::text, group_key::text \
+                            src_changed::text, hop_gen::text \
                      from ({ring}) r \
                      where x::text::bigint = pg_current_xact_id()::text::bigint % 4294967296 \
                      order by 1, 2"
@@ -2814,7 +2814,7 @@ mod db_tests {
             .await
             .expect("read the staged rows")
             .into_iter()
-            .map(|row| (0..10).map(|i| row.get(i)).collect())
+            .map(|row| (0..9).map(|i| row.get(i)).collect())
             .collect();
         txn.commit().await.expect("commit");
         (swept, staged)
@@ -3357,7 +3357,6 @@ mod db_tests {
                 src_table: "public.orders".to_string(),
                 key: id.to_string(),
                 hop_gen: 0,
-                group_key: None,
                 src_changed: None,
                 prior_image: None,
                 origin_lsn: None,
@@ -3383,8 +3382,7 @@ mod db_tests {
 
     /// Drains sealed segment `seg` until no page is left: a bounded loop.
     async fn drain(pool: &Pool, seg: i64) -> Result<(), crate::staging::apply::ApplyError> {
-        let watermark = crate::staging::watermark::StagedWatermark::saturated();
-        while crate::staging::apply::drain_once(pool, seg, "issue_883", 1, "wake", &watermark)
+        while crate::staging::apply::drain_once(pool, seg, "issue_883", 1, "wake")
             .await?
             .is_some()
         {}
@@ -3416,7 +3414,6 @@ mod db_tests {
                 origin_lsn: None,
                 src_changed: None,
                 hop_gen: 0,
-                group_key: None,
             }],
         )
         .await

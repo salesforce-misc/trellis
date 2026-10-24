@@ -77,35 +77,27 @@ fn spec(table: &str, columns: &[&str]) -> CaptureSpec {
         table,
         vec!["id".to_string()],
         columns.iter().map(|c| c.to_string()),
-        Vec::new(),
     )
     .expect("valid spec")
 }
 
-/// One ring row: `(row_txid, key, op, old_image, new_image, group_key)`.
-type Ring = (
-    String,
-    String,
-    String,
-    Option<String>,
-    Option<String>,
-    Option<Vec<String>>,
-);
+/// One ring row: `(row_txid, key, op, old_image, new_image)`.
+type Ring = (String, String, String, Option<String>, Option<String>);
 
 /// Every ring row for `table`, in `(lsn, change_id)` order.
 async fn ring(client: &Client, table: &str) -> Vec<Ring> {
     let arms: Vec<String> = (0..4)
         .map(|n| {
             format!(
-                "select src_table, row_txid, key, op, old_image, new_image, group_key, lsn, \
-                 change_id from seg_{n}"
+                "select src_table, row_txid, key, op, old_image, new_image, lsn, change_id \
+                 from seg_{n}"
             )
         })
         .collect();
     client
         .query(
             &format!(
-                "select row_txid::text, key, op, old_image::text, new_image::text, group_key \
+                "select row_txid::text, key, op, old_image::text, new_image::text \
                  from ({}) r where src_table = $1 order by lsn, change_id",
                 arms.join(" union all ")
             ),
@@ -114,16 +106,7 @@ async fn ring(client: &Client, table: &str) -> Vec<Ring> {
         .await
         .expect("read the ring")
         .into_iter()
-        .map(|row| {
-            (
-                row.get(0),
-                row.get(1),
-                row.get(2),
-                row.get(3),
-                row.get(4),
-                row.get(5),
-            )
-        })
+        .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4)))
         .collect()
 }
 

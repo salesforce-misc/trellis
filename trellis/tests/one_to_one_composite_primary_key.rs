@@ -34,7 +34,7 @@ use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use trellis::defs::{create_definition, create_target_table, source_primary_key};
-use trellis::staging::{StagedWatermark, apply, has_pending, retire_drained_segments, seal};
+use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
 
 /// Connects directly to `dsn` (bypassing `trellis::Pool`) and pins
 /// `search_path`, matching `client_e2e.rs`'s helper of the same name.
@@ -89,7 +89,6 @@ async fn stage_cdc(
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
     // No live capture stages anything here, so there is no real staged
     // watermark to hold apply back. A saturated one never does.
-    let watermark = StagedWatermark::saturated();
     for _ in 0..16 {
         let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
         seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
@@ -101,7 +100,6 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
             "composite_pk_test",
             1,
             "trellis_composite_pk_test",
-            &watermark,
         )
         .await
         .expect("drain_once")

@@ -40,7 +40,6 @@ use trellis::defs::{
     PgType, chunk_queue, create_definition, create_target_table, install_definition, parse,
     recompute, render_expr_sql, source_primary_key, validate,
 };
-use trellis::staging::StagedWatermark;
 use trellis::staging::apply;
 
 // ---------------------------------------------------------------------
@@ -520,7 +519,6 @@ async fn a_cdc_apply_writes_typed_literal_values_matching_the_evaluator() {
         "typed_literal_worker",
         1,
         "trellis_typed_literal_test",
-        &StagedWatermark::saturated(),
     )
     .await
     .expect("drain_once")

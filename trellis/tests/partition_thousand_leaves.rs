@@ -575,14 +575,9 @@ async fn measure_a_thousand_leaf_source() {
 
 /// A capture spec for `public.r (id, v)`.
 fn spec(partitioned: bool) -> CaptureSpec {
-    CaptureSpec::new(
-        "public.r",
-        vec!["id".to_string()],
-        ["v".to_string()],
-        Vec::new(),
-    )
-    .expect("valid spec")
-    .with_partitioned(partitioned)
+    CaptureSpec::new("public.r", vec!["id".to_string()], ["v".to_string()])
+        .expect("valid spec")
+        .with_partitioned(partitioned)
 }
 
 /// `public.r (id int primary key, v text)`: plain when `leaves` is 0,

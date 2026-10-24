@@ -151,10 +151,7 @@ impl H {
     /// Seals and drains until nothing is pending. A failing page fails the
     /// test.
     pub async fn drain(&mut self) {
-        use trellis::staging::{
-            StagedWatermark, apply, has_pending, retire_drained_segments, seal,
-        };
-        let watermark = StagedWatermark::saturated();
+        use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
         for _ in 0..16 {
             let outcome = seal::seal_phase1(&mut self.raw)
                 .await
@@ -168,7 +165,6 @@ impl H {
                 "relabel_test",
                 1,
                 "trellis_relabel_test",
-                &watermark,
             )
             .await
             .expect("drain_once")
@@ -188,8 +184,7 @@ impl H {
     /// each failed drain charges the key a death, until it is held and the
     /// drain goes past it. Bounded attempts, not a timed wait.
     pub async fn drain_past_failures(&mut self) {
-        use trellis::staging::{StagedWatermark, apply, retire_drained_segments, seal};
-        let watermark = StagedWatermark::saturated();
+        use trellis::staging::{apply, retire_drained_segments, seal};
         let outcome = seal::seal_phase1(&mut self.raw)
             .await
             .expect("seal phase 1");
@@ -204,7 +199,6 @@ impl H {
                 "relabel_test",
                 1,
                 "trellis_relabel_test",
-                &watermark,
             )
             .await
             {

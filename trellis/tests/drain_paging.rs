@@ -21,7 +21,7 @@ use trellis::defs::{
     source_primary_key,
 };
 use trellis::staging::apply::{self, ApplyError, DrainHooks, ManyApplyOutcome};
-use trellis::staging::{StagedWatermark, TRUNCATE_SENTINEL_KEY, claim, liveness};
+use trellis::staging::{TRUNCATE_SENTINEL_KEY, claim, liveness};
 
 const WAKE: &str = "trellis_drain_paging_test";
 
@@ -175,17 +175,7 @@ async fn drain(
     cap: usize,
     hooks: &mut DrainHooks,
 ) -> Result<Option<ManyApplyOutcome>, ApplyError> {
-    apply::drain_many_with_hooks(
-        pool,
-        &[seg_seq],
-        claimed_by,
-        1,
-        WAKE,
-        &StagedWatermark::saturated(),
-        cap,
-        hooks,
-    )
-    .await
+    apply::drain_many_with_hooks(pool, &[seg_seq], claimed_by, 1, WAKE, cap, hooks).await
 }
 
 async fn drain_all(pool: &trellis::Pool, seg_seq: i64, cap: usize) -> ManyApplyOutcome {
@@ -796,7 +786,6 @@ async fn an_oversized_segment_drains_alone_and_small_ones_coalesce_after_it() {
         "worker",
         1,
         WAKE,
-        &StagedWatermark::saturated(),
         100,
         &mut DrainHooks::default(),
     )
@@ -828,7 +817,6 @@ async fn an_oversized_segment_drains_alone_and_small_ones_coalesce_after_it() {
         "worker",
         1,
         WAKE,
-        &StagedWatermark::saturated(),
         100,
         &mut DrainHooks::default(),
     )
@@ -1058,19 +1046,10 @@ async fn a_claimant_resuming_buckets_at_two_cursors_finishes_each_to_the_oracle(
         stop_after_pages: Some(1),
         ..DrainHooks::default()
     };
-    let b = apply::drain_many_with_hooks(
-        &db.pool,
-        &[seg],
-        "worker-b",
-        2,
-        WAKE,
-        &StagedWatermark::saturated(),
-        25,
-        &mut stop,
-    )
-    .await
-    .expect("worker B's page")
-    .expect("worker B claims half");
+    let b = apply::drain_many_with_hooks(&db.pool, &[seg], "worker-b", 2, WAKE, 25, &mut stop)
+        .await
+        .expect("worker B's page")
+        .expect("worker B claims half");
     assert_eq!(b.pages, 1);
     assert!(reclaim(&client, seg).await > 0);
 

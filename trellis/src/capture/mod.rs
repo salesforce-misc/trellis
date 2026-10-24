@@ -22,7 +22,7 @@
 //!
 //! # What the images must equal
 //!
-//! Every key, op, image and `group_key` a trigger writes must equal the
+//! Every key, op and image a trigger writes must equal the
 //! golden fixture `tests/capture_parity.rs` checks. Of note:
 //!
 //! - **Narrow images.** A trigger images only the primary key and the

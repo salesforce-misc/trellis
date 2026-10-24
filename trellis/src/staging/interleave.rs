@@ -44,7 +44,6 @@
 //! | [`PausePoint::AfterEntryLock`] | after the sorted entry lock | after the sorted entry lock |
 //! | [`PausePoint::AfterRederiveRead`] | directly after the one read-and-snapshot statement, when the page re-derives any key | directly after the one read-and-snapshot statement, when the page re-derives any key |
 //! | [`PausePoint::AfterGroupUpsert`] | never reached | after the entries-and-groups statement |
-//! | [`PausePoint::AfterReverseGuards`] | after a relationship reverse record's guards, named by the projection | the same |
 //! | [`PausePoint::BeforeCommit`] | after the page's last write | after the page's last write |
 //!
 //! An aggregate on the group basis (`super::group_basis`, behind its dev
@@ -235,16 +234,11 @@ pub enum PausePoint {
     AfterChunkSnapshot,
     /// After the page's group increments (aggregate targets only).
     AfterGroupUpsert,
-    /// After a page's guards for a relationship reverse record, for the
-    /// relationship's projection (its quoted, qualified name), with the
-    /// projection rows the page locks for its reverses held (#848).
-    AfterReverseGuards,
     /// After every write the page makes, just before it commits.
     BeforeCommit,
     /// After every write a key release makes (`super::quarantine::release_key`),
     /// just before it commits, for the key's table (its canonical name): the
-    /// release holds the table's fence, the definition's row, and each to-one
-    /// relationship's refresh stamp and projection rows it wrote (#831).
+    /// release holds the table's fence and the definition's row.
     BeforeReleaseCommit,
     /// After a column pause cascade's pair bumps its reader's fence, before
     /// it takes the column-pause lock and reads its upstream column's

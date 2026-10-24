@@ -111,8 +111,6 @@ async fn stage_cdc(
 /// from-scratch backfills, not for the hops this test actually inspects
 /// metrics around (those drain one segment at a time, below).
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
-    let watermark = trellis::staging::StagedWatermark::saturated();
-    let watermark = &watermark;
     for _ in 0..16 {
         let seg = seal_active_segment(client).await;
         while apply::drain_once(
@@ -121,7 +119,6 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
             "e2e_latency_aggregate_test",
             1,
             "trellis_e2e_latency_aggregate_test",
-            watermark,
         )
         .await
         .expect("drain_once")
@@ -141,14 +138,12 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
 /// inspects metrics between — mirrors `end_to_end_latency.rs`'s own `drain`
 /// helper.
 async fn drain(pool: &trellis::Pool, seg_seq: i64) -> apply::ApplyOutcome {
-    let watermark = trellis::staging::StagedWatermark::saturated();
     apply::drain_once(
         pool,
         seg_seq,
         "e2e_latency_aggregate_test",
         1,
         "trellis_e2e_latency_aggregate_test",
-        &watermark,
     )
     .await
     .expect("drain_once")

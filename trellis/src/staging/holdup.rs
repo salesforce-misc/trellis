@@ -18,8 +18,8 @@
 //! Each records a *holdup* for the page's segments ([`record`]), in a short
 //! transaction of its own after the page's transaction rolled back.
 //! `Trellis::status` reports it as `drain_failure` on every unfrozen
-//! definition that reads a table on the page, directly or through a
-//! relationship ([`for_definition`]), and `self_check` reports every open
+//! definition whose source is a table on the page ([`for_definition`]), and
+//! `self_check` reports every open
 //! one ([`open`]). Recording charges and pauses nothing. A transient failure
 //! (a lock timeout, a serialization failure, a storm of them during
 //! isolation) isn't recorded: retrying it is the expected behaviour.
@@ -149,15 +149,11 @@ async fn try_record(
     Ok(())
 }
 
-/// The canonical source tables `folded` holds changes to, sorted. A deferred
-/// relationship reverse's synthetic table names no table, so it is left out.
+/// The canonical source tables `folded` holds changes to, sorted.
 async fn page_tables(pool: &Pool, folded: &[FoldedChange]) -> Result<Vec<String>, ApplyError> {
     let mut canonical = CanonicalSrcTables::default();
     let mut tables = BTreeSet::new();
     for change in folded {
-        if change.relationship_reverse_deferred.is_some() {
-            continue;
-        }
         tables.insert(canonical.get(pool, &change.src_table).await?);
     }
     Ok(tables.into_iter().collect())
@@ -262,67 +258,25 @@ pub(crate) async fn open(
         .collect())
 }
 
-/// The oldest open holdup on a page holding a table the definition sourced
-/// from `source_table` reads: the source itself, or the to-side of a
-/// relationship its fields read through. `definition_text` is the
-/// definition's, to tell which of its source's relationships it reads
-/// through, and `grammar_version` the grammar it was written under. The
-/// caller decides whether the definition is unfrozen.
+/// The oldest open holdup on a page holding `source_table`, a definition's
+/// source. The caller decides whether the definition is unfrozen.
 pub(crate) async fn for_definition(
     client: &impl GenericClient,
     source_table: &str,
-    definition_text: &str,
-    grammar_version: i32,
 ) -> Result<Option<DrainFailure>, tokio_postgres::Error> {
     // `drain_holdups` holds a row per failing segment, so it's empty, or
-    // nearly so, and read whole. `through` names the source's relationships
-    // whose to-side is on the page.
-    let rows = client
-        .query(
+    // nearly so, and read whole.
+    let row = client
+        .query_opt(
             &format!(
-                "select {COLUMNS}, $1 = any(h.tables) as direct, \
-                        array(select r.name from relationship_definitions r \
-                              where r.from_schema || '.' || r.from_table = $1 \
-                                and r.to_schema || '.' || r.to_table = any(h.tables)) \
-                          as through \
-                 from drain_holdups h \
-                 order by h.since, h.seg_seq"
+                "select {COLUMNS} from drain_holdups h \
+                 where $1 = any(h.tables) \
+                 order by h.since, h.seg_seq limit 1"
             ),
             &[&source_table],
         )
         .await?;
-    // The relationships the definition reads through, parsed only once a
-    // held page holds a relationship's to-side. A stored definition always
-    // parses; if it somehow didn't (`None`), every relationship of its
-    // source counts as read.
-    let mut read_through: Option<Option<BTreeSet<String>>> = None;
-    for row in &rows {
-        if row.get::<_, bool>("direct") {
-            return Ok(Some(from_row(row)));
-        }
-        let through: Vec<String> = row.get("through");
-        if through.is_empty() {
-            continue;
-        }
-        let names = read_through.get_or_insert_with(|| {
-            crate::defs::grammar::load(definition_text, grammar_version)
-                .ok()
-                .map(|def| {
-                    crate::defs::eval::relationship_references(&def)
-                        .into_iter()
-                        .map(|(name, _)| name)
-                        .collect()
-                })
-        });
-        let reads = match names {
-            Some(names) => through.iter().any(|name| names.contains(name)),
-            None => true,
-        };
-        if reads {
-            return Ok(Some(from_row(row)));
-        }
-    }
-    Ok(None)
+    Ok(row.as_ref().map(from_row))
 }
 
 #[cfg(test)]

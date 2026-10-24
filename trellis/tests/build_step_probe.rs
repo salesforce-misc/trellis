@@ -13,7 +13,7 @@ use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::{ValueType, chunk_queue};
 use trellis::staging::build::{self, WorkerOptions};
-use trellis::staging::{StagedWatermark, apply, has_pending, retire_drained_segments};
+use trellis::staging::{apply, has_pending, retire_drained_segments};
 
 const WAKE: &str = "build_step_probe_wake";
 const AGG: &str =
@@ -108,7 +108,6 @@ impl Fixture {
     }
 
     async fn drain(&mut self) {
-        let watermark = StagedWatermark::saturated();
         for _ in 0..16 {
             trellis::staging::seal_if_active_nonempty(&mut self.raw, WAKE)
                 .await
@@ -117,7 +116,7 @@ impl Fixture {
                 .await
                 .expect("next")
             {
-                apply::drain_once(&self.db.pool, seg, "drainer", 1, WAKE, &watermark)
+                apply::drain_once(&self.db.pool, seg, "drainer", 1, WAKE)
                     .await
                     .expect("drain_once");
             }

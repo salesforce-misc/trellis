@@ -19,7 +19,7 @@
 //! what reach the ring.
 //!
 //! Per step, table and key, the rows in `(lsn, change_id)` order (key, op,
-//! both images restricted to the spec's columns, `group_key` and `hop_gen`)
+//! both images restricted to the spec's columns, and `hop_gen`)
 //! must equal the golden fixture `tests/fixtures/capture_parity.txt`.
 //! `lsn`/`src_changed` are not compared (statement position and time).
 //!
@@ -197,7 +197,7 @@ struct RingRow {
     key: String,
     /// `to_jsonb(key)::text`, for the fixture.
     key_json: String,
-    /// `[op, old_image, new_image, group_key, hop_gen]` with both images
+    /// `[op, old_image, new_image, hop_gen]` with both images
     /// restricted to the spec's columns.
     doc: String,
     /// The same with the images unrestricted.
@@ -220,8 +220,8 @@ async fn ring_rows(raw: &Client, after: i64, table: &str, spec: &CaptureSpec) ->
     };
     let sql = format!(
         "select r.row_txid::text, r.key, to_jsonb(r.key)::text, \
-                jsonb_build_array(r.op, {ro}, {rn}, r.group_key, r.hop_gen)::text, \
-                jsonb_build_array(r.op, r.old_image, r.new_image, r.group_key, r.hop_gen)::text, \
+                jsonb_build_array(r.op, {ro}, {rn}, r.hop_gen)::text, \
+                jsonb_build_array(r.op, r.old_image, r.new_image, r.hop_gen)::text, \
                 r.lsn is not distinct from r.origin_lsn, \
                 r.lsn is not null and r.src_changed is not null \
          from ({ring}) r \
@@ -323,7 +323,6 @@ async fn trigger_capture_stages_the_golden_images_under_a_foreign_session() {
     let fam = &specs["public.fam"];
     assert_eq!(fam.key(), strings(&["id"]));
     assert_eq!(fam.columns(), strings(&["c_int4", "id"]));
-    assert!(fam.group_key().is_empty());
     let comp = &specs["public.comp"];
     assert_eq!(comp.key(), strings(&["post", "tag"]), "declared key order");
     assert_eq!(comp.columns(), strings(&["post", "tag", "weight"]));
@@ -338,7 +337,6 @@ async fn trigger_capture_stages_the_golden_images_under_a_foreign_session() {
             .iter()
             .map(|(name, _, _)| name.to_string())
             .chain(strings(&["fk", "fk2"])),
-        fam.group_key().to_vec(),
     )
     .expect("every-family spec");
     specs.insert("public.fam".to_string(), every_family);

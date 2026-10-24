@@ -647,7 +647,6 @@ async fn seal_and_drain(raw: &mut Client, pool: &trellis::Pool) -> Result<(), St
     seal::seal_phase2(raw, sealed.sealed_seg_seq, "wake")
         .await
         .expect("seal phase 2");
-    let watermark = StagedWatermark::saturated();
     for _ in 0..16 {
         match apply::drain_once(
             pool,
@@ -655,7 +654,6 @@ async fn seal_and_drain(raw: &mut Client, pool: &trellis::Pool) -> Result<(), St
             "row_security_test",
             1,
             "trellis_row_security_test",
-            &watermark,
         )
         .await
         {
@@ -859,7 +857,6 @@ async fn a_refused_read_halts_while_a_key_failure_beside_it_is_held_for_its_defi
             "row_security_test",
             1,
             "trellis_row_security_test",
-            &StagedWatermark::saturated(),
         )
         .await
         {

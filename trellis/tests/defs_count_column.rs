@@ -48,7 +48,7 @@ use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::ValueType;
 use trellis::defs::{create_aggregate_target_table, create_definition, parse, validate};
 use trellis::integer::IntWidth;
-use trellis::staging::{StagedWatermark, apply, retire_drained_segments, seal};
+use trellis::staging::{apply, retire_drained_segments, seal};
 
 // ---------------------------------------------------------------------
 // Harness
@@ -184,7 +184,6 @@ async fn drain_sealed(client: &mut Client, pool: &trellis::Pool, worker: &str) {
         worker,
         1,
         "trellis_defs_count_column",
-        &StagedWatermark::saturated(),
     )
     .await
     .expect("drain_once")

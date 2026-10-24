@@ -136,15 +136,9 @@
 //! `T` for a new definition sourced from the from-side `U` (it reads a new
 //! column of `T` through the relationship) gates `T`'s marker, but the new
 //! definition waits on `U`'s marker, which no gate holds. A pre-widen `T` row
-//! then reaches it through the reverse path, as could a deferred reverse
-//! (`rel_reverse_deferred`, staged under a synthetic `src_table`) carrying
-//! `T`'s old images. C5 closes this in the reconcile pass
-//! ([`super::reconcile`], rule 3): such a definition isn't dispatched while
-//! `T` has a gated marker pending, and
-//! [`crate::staging::converge::table_changes_pending_through`] counts the
-//! deferred reverses whose relationship's to-side is `T`. A to-side widen's
-//! marker also refreshes `T`'s settled projections
-//! (`intake::markers::park_widen_marker`).
+//! then reaches it through the reverse path. C5 closes this in the reconcile
+//! pass ([`super::reconcile`], rule 3): such a definition isn't dispatched
+//! while `T` has a gated marker pending.
 //!
 //! Why not the alternatives:
 //!
@@ -330,7 +324,7 @@ pub fn plan(installed: &Installed, desired: &CaptureSpec) -> CaptureAction {
 }
 
 /// Whether `desired` images nothing `installed` doesn't: the same table and
-/// key, and a subset of its image and group-key columns.
+/// key, and a subset of its image columns.
 fn narrows(installed: &CaptureSpec, desired: &CaptureSpec) -> bool {
     installed.table() == desired.table()
         && installed.key() == desired.key()
@@ -338,10 +332,6 @@ fn narrows(installed: &CaptureSpec, desired: &CaptureSpec) -> bool {
             .columns()
             .iter()
             .all(|c| installed.columns().contains(c))
-        && desired
-            .group_key()
-            .iter()
-            .all(|c| installed.group_key().contains(c))
 }
 
 /// Reads what instance `schema` has installed for `table` (an unquoted
@@ -375,8 +365,6 @@ pub async fn installed(
                         select pg_catalog.jsonb_array_elements_text(c.j -> 'key')) end, \
                     case when c.j is not null then array( \
                         select pg_catalog.jsonb_array_elements_text(c.j -> 'columns')) end, \
-                    case when c.j is not null then array( \
-                        select pg_catalog.jsonb_array_elements_text(c.j -> 'group_key')) end, \
                     t.oid is not null, t.tgenabled::text, t.tgfoid = p.oid, \
                     case when e.ord = 1 and exists ( \
                         select 1 from pg_catalog.pg_class r \
@@ -409,7 +397,7 @@ pub async fn installed(
             ],
         )
         .await?;
-    let partitioned: bool = rows.first().is_some_and(|row| row.get(11));
+    let partitioned: bool = rows.first().is_some_and(|row| row.get(10));
     let mut present = false;
     let mut current = true;
     let mut faults = Vec::new();
@@ -421,7 +409,7 @@ pub async fn installed(
         .zip(&rows)
     {
         let has_function: bool = row.get(0);
-        let has_trigger: bool = row.get(7);
+        let has_trigger: bool = row.get(6);
         present |= has_function || has_trigger;
         let what = event.as_str();
         if !has_function {
@@ -429,16 +417,9 @@ pub async fn installed(
                 "the {what} function {schema}.{function} is missing"
             ));
         } else {
-            let recorded = recorded_spec(
-                table,
-                what,
-                row.get(2),
-                row.get(3),
-                row.get(4),
-                row.get(5),
-                row.get(6),
-            )
-            .map(|spec| spec.with_partitioned(partitioned));
+            let recorded =
+                recorded_spec(table, what, row.get(2), row.get(3), row.get(4), row.get(5))
+                    .map(|spec| spec.with_partitioned(partitioned));
             match recorded {
                 Some(spec) => {
                     let source: String = row.get(1);
@@ -455,14 +436,14 @@ pub async fn installed(
                 "the {what} trigger {trigger} on {table} is missing"
             ));
         } else {
-            let enabled: String = row.get(8);
+            let enabled: String = row.get(7);
             if enabled != "A" {
                 faults.push(format!(
                     "the {what} trigger {trigger} on {table} is not ENABLE ALWAYS \
                      (tgenabled = {enabled})"
                 ));
             }
-            if row.get::<_, Option<bool>>(9) != Some(true) {
+            if row.get::<_, Option<bool>>(8) != Some(true) {
                 faults.push(format!(
                     "the {what} trigger {trigger} on {table} doesn't call {schema}.{function}"
                 ));
@@ -476,7 +457,7 @@ pub async fn installed(
     // show the root whole and a node bare.
     let missing = rows
         .first()
-        .and_then(|row| row.get::<_, Option<Vec<String>>>(10))
+        .and_then(|row| row.get::<_, Option<Vec<String>>>(9))
         .unwrap_or_default();
     if !missing.is_empty() {
         faults.push(format!(
@@ -709,12 +690,11 @@ fn recorded_spec(
     recorded_event: Option<String>,
     key: Option<Vec<String>>,
     columns: Option<Vec<String>>,
-    group_key: Option<Vec<String>>,
 ) -> Option<CaptureSpec> {
     if recorded_table.as_deref() != Some(table) || recorded_event.as_deref() != Some(event) {
         return None;
     }
-    CaptureSpec::new(table, key?, columns?, group_key?).ok()
+    CaptureSpec::new(table, key?, columns?).ok()
 }
 
 /// How far one pass of a locking operation got: it landed, or it ran out of
@@ -1701,12 +1681,11 @@ impl BlockerLog {
 mod tests {
     use super::*;
 
-    fn spec(columns: &[&str], group_key: &[&str]) -> CaptureSpec {
+    fn spec(columns: &[&str]) -> CaptureSpec {
         CaptureSpec::new(
             "public.orders",
             vec!["id".to_string()],
             columns.iter().map(|c| c.to_string()),
-            group_key.iter().map(|c| c.to_string()).collect(),
         )
         .expect("valid spec")
     }
@@ -1720,7 +1699,7 @@ mod tests {
 
     #[test]
     fn nothing_or_a_partial_install_installs() {
-        let desired = spec(&["a"], &[]);
+        let desired = spec(&["a"]);
         assert_eq!(plan(&Installed::Absent, &desired), CaptureAction::Install);
         let partial = Installed::Partial {
             faults: vec!["the insert trigger is missing".to_string()],
@@ -1730,7 +1709,7 @@ mod tests {
 
     #[test]
     fn the_same_spec_from_current_functions_is_unchanged() {
-        let desired = spec(&["a", "b"], &["a"]);
+        let desired = spec(&["a", "b"]);
         assert_eq!(
             plan(&complete(desired.clone()), &desired),
             CaptureAction::Unchanged
@@ -1738,28 +1717,20 @@ mod tests {
     }
 
     #[test]
-    fn a_new_column_or_group_key_column_widens() {
-        let installed = complete(spec(&["a"], &[]));
-        assert_eq!(
-            plan(&installed, &spec(&["a", "b"], &[])),
-            CaptureAction::Widen
-        );
-        assert_eq!(
-            plan(&installed, &spec(&["a"], &["a"])),
-            CaptureAction::Widen
-        );
+    fn a_new_column_widens() {
+        let installed = complete(spec(&["a"]));
+        assert_eq!(plan(&installed, &spec(&["a", "b"])), CaptureAction::Widen);
         // One column added and another removed still needs the lock.
-        assert_eq!(plan(&installed, &spec(&["b"], &[])), CaptureAction::Widen);
+        assert_eq!(plan(&installed, &spec(&["b"])), CaptureAction::Widen);
     }
 
     #[test]
     fn a_changed_key_widens() {
-        let installed = complete(spec(&["a"], &[]));
+        let installed = complete(spec(&["a"]));
         let rekeyed = CaptureSpec::new(
             "public.orders",
             vec!["a".to_string()],
             ["id".to_string(), "a".to_string()],
-            vec![],
         )
         .expect("valid spec");
         assert_eq!(plan(&installed, &rekeyed), CaptureAction::Widen);
@@ -1767,17 +1738,14 @@ mod tests {
 
     #[test]
     fn fewer_columns_narrow() {
-        let installed = complete(spec(&["a", "b", "c"], &["a", "b"]));
-        assert_eq!(
-            plan(&installed, &spec(&["a"], &["a"])),
-            CaptureAction::Narrow
-        );
-        assert_eq!(plan(&installed, &spec(&[], &[])), CaptureAction::Narrow);
+        let installed = complete(spec(&["a", "b", "c"]));
+        assert_eq!(plan(&installed, &spec(&["a"])), CaptureAction::Narrow);
+        assert_eq!(plan(&installed, &spec(&[])), CaptureAction::Narrow);
     }
 
     #[test]
     fn a_stale_function_is_replaced_under_the_lock() {
-        let desired = spec(&["a"], &[]);
+        let desired = spec(&["a"]);
         let stale = Installed::Complete {
             spec: desired.clone(),
             current: false,
@@ -1786,7 +1754,7 @@ mod tests {
         // Even for a narrower spec: a stale body's images aren't known to
         // cover anything.
         let stale_wide = Installed::Complete {
-            spec: spec(&["a", "b"], &[]),
+            spec: spec(&["a", "b"]),
             current: false,
         };
         assert_eq!(plan(&stale_wide, &desired), CaptureAction::Widen);

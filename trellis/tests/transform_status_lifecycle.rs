@@ -144,21 +144,12 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
     // has no live capture running (these tests stage CDC rows by hand),
     // and none of this file's tests exercise guard (a) specifically, so a
     // real watermark would only ever make guard (a) reject spuriously.
-    let watermark = trellis::staging::StagedWatermark::saturated();
-    let watermark = &watermark;
     for _ in 0..16 {
         let seg = seal_active_segment(client).await;
-        while apply::drain_once(
-            pool,
-            seg,
-            "status_lifecycle_test",
-            1,
-            "trellis_status_test",
-            watermark,
-        )
-        .await
-        .expect("drain_once")
-        .is_some()
+        while apply::drain_once(pool, seg, "status_lifecycle_test", 1, "trellis_status_test")
+            .await
+            .expect("drain_once")
+            .is_some()
         {}
         retire_drained_segments(client)
             .await
@@ -189,21 +180,12 @@ async fn drain_until_live(pool: &trellis::Pool, client: &mut Client, target: &st
     // Issue #132: see `drain_to_quiescence`'s own comment — no live capture
     // is running here either, so a throwaway, always-caught-up watermark is
     // correct.
-    let watermark = trellis::staging::StagedWatermark::saturated();
-    let watermark = &watermark;
     for _ in 0..16 {
         let seg = seal_active_segment(client).await;
-        while apply::drain_once(
-            pool,
-            seg,
-            "status_lifecycle_test",
-            1,
-            "trellis_status_test",
-            watermark,
-        )
-        .await
-        .expect("drain_once")
-        .is_some()
+        while apply::drain_once(pool, seg, "status_lifecycle_test", 1, "trellis_status_test")
+            .await
+            .expect("drain_once")
+            .is_some()
         {}
         retire_drained_segments(client)
             .await
@@ -289,19 +271,11 @@ async fn status_of(client: &Client, target_table: &str) -> TransformStatus {
 /// `poison_held` row (see [`drain_until_live`]'s own comment on why
 /// `has_pending` never clears then).
 async fn drain_one_round(pool: &trellis::Pool, client: &mut Client) {
-    let watermark = trellis::staging::StagedWatermark::saturated();
     let seg = seal_active_segment(client).await;
-    while apply::drain_once(
-        pool,
-        seg,
-        "status_lifecycle_test",
-        1,
-        "trellis_status_test",
-        &watermark,
-    )
-    .await
-    .expect("drain_once")
-    .is_some()
+    while apply::drain_once(pool, seg, "status_lifecycle_test", 1, "trellis_status_test")
+        .await
+        .expect("drain_once")
+        .is_some()
     {}
     retire_drained_segments(client)
         .await
@@ -348,7 +322,6 @@ async fn evict_keys_for_real(
     // Issue #132: see `drain_to_quiescence`'s own comment — no live capture
     // is running here either, so a throwaway, always-caught-up watermark is
     // correct.
-    let watermark = trellis::staging::StagedWatermark::saturated();
     let mut real_failures = 0;
     loop {
         match apply::drain_once(
@@ -357,7 +330,6 @@ async fn evict_keys_for_real(
             "status_lifecycle_test",
             1,
             "trellis_status_test",
-            &watermark,
         )
         .await
         {

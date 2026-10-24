@@ -98,7 +98,6 @@ async fn drain_backfill_chunks(pool: &trellis::Pool) {
 /// Seals and drains until nothing is pending anywhere in the ring. A bounded
 /// deterministic loop, not a wait-for-convergence poll.
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
-    let watermark = StagedWatermark::saturated();
     for _ in 0..16 {
         let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
         seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
@@ -110,7 +109,6 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
             TEST_NAME,
             1,
             "trellis_resume_drops_deleted_keys_test",
-            &watermark,
         )
         .await
         .expect("drain_once")

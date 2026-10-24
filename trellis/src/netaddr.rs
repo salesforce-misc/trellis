@@ -68,8 +68,7 @@
 //!   explicit sub-maximal netmask. One value, two renderers, no arbiter —
 //!   `catalog::TEXT_STABLE_JOIN_KEY_TYPES`'s doc comment has `boolean`'s
 //!   account of why that is fatal for the join/primary-key role
-//!   specifically (`staging::apply::check_reverse_guards` and its scalar
-//!   siblings still do raw `{col}::text = $1` matching), and the same
+//!   specifically, and the same
 //!   reasoning applies here verbatim. `inet` is *not* added to that
 //!   allowlist.
 //! * **`cidr` does not diverge, anywhere.** `cidr_out` never omits the
