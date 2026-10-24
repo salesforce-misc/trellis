@@ -67,20 +67,6 @@ pub struct TransformDef {
     pub without_source_index: bool,
 }
 
-/// A parsed relationship declaration:
-/// `RELATIONSHIP <name> FROM <from_table>.<fk_col> TO <to_table>.<pk_col>`.
-/// No public statement parses to one; only the test-only
-/// [`super::catalog::create_relationship`] reads it, until #1115 removes
-/// relationships.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RelationshipDef {
-    pub name: String,
-    pub from_table: String,
-    pub from_col: String,
-    pub to_table: String,
-    pub to_col: String,
-}
-
 /// One whole statement in Trellis's grammar, as
 /// [`super::parser::parse_statement`] returns it — the single shape
 /// [`crate::Trellis::apply`] dispatches on (issue #227, ADR-0012: "parsing
@@ -297,13 +283,13 @@ pub enum AlterClause {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeySpace {
     OneToOne,
-    /// `group_by` holds the keys named after `GROUP BY`, in the order they
-    /// were written — that order becomes the target table's composite
-    /// primary key column order. Issue #137 widened each key from a bare
-    /// source column name to [`GroupByKey`], which also admits a to-one
-    /// relationship path (`rel.column`).
+    /// `group_by` holds the source columns named after `GROUP BY`, in the
+    /// order they were written — that order becomes the target table's
+    /// composite primary key column order. A key's target column is named
+    /// after it (a key has no aliasing syntax), and a two-part
+    /// `<source>.<column>` key parses to its bare column.
     Aggregate {
-        group_by: Vec<GroupByKey>,
+        group_by: Vec<String>,
     },
     /// `FROM a [LEFT|INNER] JOIN b ON <equi-join> GROUP BY <keys>` (ADR-0019,
     /// epic #1091): an aggregate over the join of two tables.
@@ -356,64 +342,13 @@ pub struct JoinSpec {
     pub group_by: Vec<QualifiedColumn>,
 }
 
-/// One `GROUP BY` key (issue #137): either a plain source column, or a
-/// to-one relationship path (`rel.column`) — grouping by a linked row's
-/// column without that column ever appearing on the source table itself
-/// (e.g. `GROUP BY tag, post.author` on `post_tags`, where `author` lives on
-/// `posts` via the `post` relationship). A **to-many** relationship path is
-/// rejected by the validator, not represented here — grouping by "the many
-/// child rows on the other end of a to-many relationship" has no defined
-/// semantics.
-///
-/// There is no separate aliasing syntax for a `GROUP BY` key (unlike a
-/// `SELECT <expr> AS <name>` field): a plain column's target column name is
-/// its own name, and a relationship path's target column name is its tail
-/// `column` — see [`Self::target_column_name`]. Every call site that used to
-/// treat a `group_by` entry as a bare `String` (target column name,
-/// dedup/lookup key, DDL column name, …) should use that method instead of
-/// assuming the entry itself is the name.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GroupByKey {
-    Column(String),
-    RelationshipPath { rel: String, column: String },
-}
-
-impl GroupByKey {
-    /// The target table's column name this key becomes — the plain column's
-    /// own name, or a relationship path's tail `column` (there is no
-    /// separate aliasing syntax for a `GROUP BY` key, so `post.author`
-    /// becomes target column `author`, exactly like `tag` becomes target
-    /// column `tag`).
-    pub fn target_column_name(&self) -> &str {
-        match self {
-            GroupByKey::Column(name) => name,
-            GroupByKey::RelationshipPath { column, .. } => column,
-        }
-    }
-
-    /// This key, as the [`Expr`] it's semantically equivalent to — a plain
-    /// [`Expr::Column`] or [`Expr::RelationshipPath`] — so a renderer that
-    /// already knows how to qualify/join an arbitrary expression (e.g.
-    /// [`super::oracle::render_to_one_rel_expr_sql`]) can render a `GROUP BY`
-    /// key without a second, key-specific rendering path.
-    pub fn as_expr(&self) -> Expr {
-        match self {
-            GroupByKey::Column(name) => Expr::Column(name.clone()),
-            GroupByKey::RelationshipPath { rel, column } => Expr::RelationshipPath {
-                rel: rel.clone(),
-                column: column.clone(),
-            },
-        }
-    }
-}
-
 /// Whether `name` is one of `group_by`'s keys' target column names — the
 /// common "is this field a `GROUP BY` passthrough" check every layer that
 /// touches an [`super::ast::KeySpace::Aggregate`] definition's fields needs
 /// (DDL's column dedup, `staging::ledger`'s field shape, …), pulled out once here
 /// rather than re-implemented at each call site.
-pub fn group_by_contains(group_by: &[GroupByKey], name: &str) -> bool {
-    group_by.iter().any(|key| key.target_column_name() == name)
+pub fn group_by_contains(group_by: &[String], name: &str) -> bool {
+    group_by.iter().any(|key| key == name)
 }
 
 /// One `<expr> AS <name>` calculated-field entry.
@@ -460,12 +395,6 @@ pub enum Expr {
     /// because Postgres gives them no bare literal syntax at all
     /// (`pg_typeof(1.5)` is `numeric`).
     TypedLiteral { value_type: ValueType, text: String },
-    /// A `<rel>.<column>` relationship-path reference (issue #25, ADR-0006).
-    /// `rel` is the head's **relationship name**, not a table/alias —
-    /// resolving whether it's an actually-declared relationship, and its
-    /// cardinality, is deferred to later validation/eval issues; this
-    /// variant is grammar + AST only.
-    RelationshipPath { rel: String, column: String },
     /// A source column named through the `FROM` table (issue #830):
     /// `<table>.<column>` or `<schema>.<table>.<column>`. It always reads the
     /// source column, never a calculated field of the same name, which is how
@@ -474,11 +403,13 @@ pub enum Expr {
     /// [`super::validate::ValidationError::AmbiguousColumnReference`]).
     ///
     /// `table` and `schema` are kept as written. The parser builds this node
-    /// for any three-part name, and for a two-part one whose head is the
-    /// `FROM` table's bare name (any other head is a relationship). The
-    /// validator checks that `table` is the `FROM` table and, when the `FROM`
-    /// clause names its schema, that `schema` matches; the catalog checks
-    /// `schema` against the schema a bare `FROM` resolved to.
+    /// for every two- and three-part name outside a `JOIN` definition (in a
+    /// `JOIN`, a head naming the joined table builds it too). The validator
+    /// checks that `table` is the `FROM` table
+    /// ([`super::validate::ValidationError::QualifiedColumnNotFromSource`]
+    /// names any other head) and, when the `FROM` clause names its schema,
+    /// that `schema` matches; the catalog checks `schema` against the schema
+    /// a bare `FROM` resolved to.
     SourceColumn {
         schema: Option<String>,
         table: String,
@@ -653,14 +584,7 @@ pub(crate) fn render_definition_text(def: &TransformDef) -> String {
         KeySpace::OneToOne => {}
         KeySpace::Aggregate { group_by } => {
             out.push_str(" GROUP BY ");
-            let keys: Vec<String> = group_by
-                .iter()
-                .map(|key| match key {
-                    GroupByKey::Column(column) => column.clone(),
-                    GroupByKey::RelationshipPath { rel, column } => format!("{rel}.{column}"),
-                })
-                .collect();
-            out.push_str(&keys.join(", "));
+            out.push_str(&group_by.join(", "));
         }
         KeySpace::Join(join) => {
             let qualified = |column: &QualifiedColumn| match &column.schema {
@@ -724,7 +648,6 @@ pub(crate) fn render_field_expr(expr: &Expr) -> String {
             text.replace('\'', "''"),
             typed_literal_keyword(*value_type)
         ),
-        Expr::RelationshipPath { rel, column } => format!("{rel}.{column}"),
         Expr::SourceColumn {
             schema,
             table,
@@ -747,42 +670,6 @@ pub(crate) fn render_field_expr(expr: &Expr) -> String {
         Expr::FunctionCall { name, args } => {
             let rendered_args: Vec<String> = args.iter().map(render_field_expr).collect();
             format!("{name}({})", rendered_args.join(", "))
-        }
-    }
-}
-
-impl Expr {
-    /// Reads every two-part `<source>.<column>` in this expression as the
-    /// qualified source column it is when `source` is the `FROM` table's bare
-    /// name (issue #830), as [`super::parser::parse`] does for a whole
-    /// `TRANSFORM` statement. An `ALTER TRANSFORM` clause is parsed without
-    /// knowing its source, so its two-part names come out as relationship
-    /// paths; the catalog runs this over them against the stored
-    /// definition's source.
-    pub(crate) fn qualify_source_columns(&mut self, source: &str) {
-        match self {
-            Expr::RelationshipPath { rel, column } if rel == source => {
-                *self = Expr::SourceColumn {
-                    schema: None,
-                    table: std::mem::take(rel),
-                    column: std::mem::take(column),
-                };
-            }
-            Expr::BinaryOp { lhs, rhs, .. } => {
-                lhs.qualify_source_columns(source);
-                rhs.qualify_source_columns(source);
-            }
-            Expr::FunctionCall { args, .. } => {
-                for arg in args {
-                    arg.qualify_source_columns(source);
-                }
-            }
-            Expr::Column(_)
-            | Expr::SourceColumn { .. }
-            | Expr::RelationshipPath { .. }
-            | Expr::NumberLiteral(_)
-            | Expr::StringLiteral(_)
-            | Expr::TypedLiteral { .. } => {}
         }
     }
 }

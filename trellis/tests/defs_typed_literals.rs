@@ -40,7 +40,6 @@ use trellis::defs::{
     PgType, chunk_queue, create_definition, create_target_table, install_definition, parse,
     recompute, render_expr_sql, source_primary_key, validate,
 };
-use trellis::staging::StagedWatermark;
 use trellis::staging::apply;
 
 // ---------------------------------------------------------------------
@@ -252,7 +251,7 @@ fn a_typed_literal_field_validates_and_is_not_text() {
         select_list_typed_literal_spelling()
     ))
     .expect("parses");
-    validate(&def, &source_columns(), &HashMap::new()).expect("validates");
+    validate(&def, &source_columns()).expect("validates");
 }
 
 /// The type keyword is case-insensitive like every other keyword in this
@@ -296,8 +295,7 @@ fn non_canonical_literals_are_rejected_by_the_validator() {
     ] {
         let def = parse(&format!("TRANSFORM t FROM s SELECT {bad} AS x"))
             .unwrap_or_else(|e| panic!("{bad} should parse (it's a validate-time error): {e}"));
-        let err = validate(&def, &source_columns(), &HashMap::new())
-            .expect_err(&format!("{bad} must be rejected"));
+        let err = validate(&def, &source_columns()).expect_err(&format!("{bad} must be rejected"));
         assert!(
             err.to_string().contains('x'),
             "{bad}: error must name the field: {err}"
@@ -386,7 +384,7 @@ async fn evaluator_and_sql_oracle_agree_on_every_literal() {
             "TRANSFORM t FROM s SELECT {keyword} '{text}' AS x"
         ))
         .expect("parses");
-        validate(&def, &source_columns(), &HashMap::new()).expect("validates");
+        validate(&def, &source_columns()).expect("validates");
 
         let sql = render_expr_sql(&def.fields[0].expr);
         let rendered: String = client
@@ -520,7 +518,6 @@ async fn a_cdc_apply_writes_typed_literal_values_matching_the_evaluator() {
         "typed_literal_worker",
         1,
         "trellis_typed_literal_test",
-        &StagedWatermark::saturated(),
     )
     .await
     .expect("drain_once")

@@ -442,7 +442,7 @@ async fn measure_a_thousand_leaf_source() {
         fingerprints[0], fingerprints[10], fingerprints[19]
     );
     // The pass's other per-table catalog reads, each timed alone.
-    let catalog = trellis::capture::columns::load_catalog(&fx.d.ctl, DEFAULT_SCHEMA)
+    let catalog = trellis::capture::columns::load_catalog(&fx.d.ctl)
         .await
         .expect("catalog");
     for _ in 0..3 {
@@ -575,14 +575,9 @@ async fn measure_a_thousand_leaf_source() {
 
 /// A capture spec for `public.r (id, v)`.
 fn spec(partitioned: bool) -> CaptureSpec {
-    CaptureSpec::new(
-        "public.r",
-        vec!["id".to_string()],
-        ["v".to_string()],
-        Vec::new(),
-    )
-    .expect("valid spec")
-    .with_partitioned(partitioned)
+    CaptureSpec::new("public.r", vec!["id".to_string()], ["v".to_string()])
+        .expect("valid spec")
+        .with_partitioned(partitioned)
 }
 
 /// `public.r (id int primary key, v text)`: plain when `leaves` is 0,

@@ -58,8 +58,8 @@ pub enum PgType {
     /// It stays a passthrough [`PgType`] and gains only the roles it can
     /// honestly hold. Its text rendering *is* canonical (unsigned decimal,
     /// no sign, no leading zeros), so unlike every other family here it is
-    /// genuinely text-stable: #111 admits it as a relationship/join key, a
-    /// primary key (`catalog::TEXT_STABLE_JOIN_KEY_TYPES`), a `GROUP BY` key
+    /// genuinely text-stable: #111 admits it as a `JOIN` key, a
+    /// primary key (`join_key_types::TEXT_STABLE_JOIN_KEY_TYPES`), a `GROUP BY` key
     /// (`validate`'s key gate) and a typed literal
     /// (`typed_literal::TYPED_LITERALS`).
     Oid,

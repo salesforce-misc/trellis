@@ -88,18 +88,10 @@ async fn insert_cdc_row(
 async fn drain(pool: &trellis::Pool, seg_seq: i64, claimed_by: &str) -> apply::ApplyOutcome {
     // Issue #132: a throwaway, always-caught-up watermark — no live
     // capture runs in this test, and this file isn't exercising guard (a).
-    let watermark = trellis::staging::StagedWatermark::saturated();
-    apply::drain_once(
-        pool,
-        seg_seq,
-        claimed_by,
-        1,
-        "trellis_e2e_latency_test",
-        &watermark,
-    )
-    .await
-    .expect("drain_once")
-    .expect("drain_once must claim and drain something")
+    apply::drain_once(pool, seg_seq, claimed_by, 1, "trellis_e2e_latency_test")
+        .await
+        .expect("drain_once")
+        .expect("drain_once must claim and drain something")
 }
 
 /// A one-histogram-family text scrape of `rendered` for `metric{transform="target"}`

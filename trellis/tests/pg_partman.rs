@@ -226,8 +226,7 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
 /// Up to `rounds` seal/drain rounds; with `strict`, panics unless the ring
 /// ends quiet (a writer running alongside never lets it).
 async fn drain(pool: &trellis::Pool, client: &mut Client, rounds: usize, strict: bool) {
-    use trellis::staging::{StagedWatermark, apply, has_pending, retire_drained_segments, seal};
-    let watermark = StagedWatermark::saturated();
+    use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
     for _ in 0..rounds {
         let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
         seal::seal_phase2(client, outcome.sealed_seg_seq, "pg_partman_wake")
@@ -239,7 +238,6 @@ async fn drain(pool: &trellis::Pool, client: &mut Client, rounds: usize, strict:
             "pg_partman_test",
             1,
             "trellis_capture_missed_ddl_test",
-            &watermark,
         )
         .await
         .expect("drain_once")

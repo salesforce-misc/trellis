@@ -1236,10 +1236,7 @@ impl super::Backend for ManualBackend {
                 KeySpace::Aggregate { group_by } => {
                     // Every key's target column name is read straight off
                     // the target table.
-                    let group_by_names: Vec<String> = group_by
-                        .iter()
-                        .map(|k| k.target_column_name().to_string())
-                        .collect();
+                    let group_by_names: Vec<String> = group_by.to_vec();
                     sql::read_aggregate_table(&self.raw, &qualified, &group_by_names, &def.fields)
                         .await?
                 }

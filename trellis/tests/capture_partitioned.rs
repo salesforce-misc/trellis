@@ -28,7 +28,7 @@ async fn connect(dsn: &str) -> Client {
 }
 
 fn spec(table: &str) -> CaptureSpec {
-    CaptureSpec::new(table, vec!["id".to_string()], ["v".to_string()], Vec::new())
+    CaptureSpec::new(table, vec!["id".to_string()], ["v".to_string()])
         .expect("valid spec")
         .with_partitioned(true)
 }

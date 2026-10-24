@@ -9,10 +9,6 @@
 //! - an aggregate target's `GROUP BY` columns, and the same columns of its
 //!   ledger and its group-delta table, typed as the key's value family
 //!   ([`super::ddl::pg_type_name`]: `integer`, `bigint`, `text`, `numeric`);
-//! - a to-one relationship's settled projection's key, typed as the
-//!   to-side's join column, and the projection's column for each to-side
-//!   column a definition reads through the relationship (`author.name`,
-//!   `GROUP BY author.country`), typed as that to-side column.
 //! - a `JOIN` target's `GROUP BY` columns, and the same columns of its
 //!   hidden `T` table, typed as the column of the side each comes from, and
 //!   each side's hidden partials table's `GROUP BY` and join-key columns and
@@ -65,9 +61,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use tokio_postgres::GenericClient;
 
-use super::ast::{Expr, GroupByKey, KeySpace, TransformDef, ValueType, group_by_contains};
+use super::ast::{Expr, KeySpace, TransformDef, ValueType, group_by_contains};
 use super::key_types::ColumnType;
-use super::model::{RelationshipCardinality, RelationshipDefinition};
 use crate::pool::quote_ident;
 
 /// What a [`TypedCopy`] is a copy of, and where it is.
@@ -83,14 +78,6 @@ pub(crate) enum CopyKind {
     LedgerGroup,
     /// The same column of the aggregate's group-delta table.
     DeltasGroup,
-    /// A to-one relationship projection's key.
-    ProjectionKey,
-    /// A to-one relationship projection's column for a `GROUP BY` key read
-    /// through the relationship: the aggregate's groups are read from it.
-    ProjectionGroupBy,
-    /// A to-one relationship projection's column for any other to-side
-    /// column read through the relationship (`author.name`).
-    ProjectionData,
     /// A 1-1 target's calculated field, typed by its expression.
     Field,
     /// An aggregate target's field column, typed by its expression.
@@ -114,8 +101,8 @@ impl CopyKind {
     }
 
     /// Whether the copy is a key of its table's rows: a target's, a
-    /// ledger's or a group-delta table's `GROUP BY` column, a 1-1 target's
-    /// key, a projection's key or group column. Such a column can't be
+    /// ledger's or a group-delta table's `GROUP BY` column, or a 1-1
+    /// target's key. Such a column can't be
     /// nulled in place ([`retype_statements`]).
     fn is_key(self) -> bool {
         matches!(
@@ -124,8 +111,6 @@ impl CopyKind {
                 | CopyKind::GroupBy
                 | CopyKind::LedgerGroup
                 | CopyKind::DeltasGroup
-                | CopyKind::ProjectionKey
-                | CopyKind::ProjectionGroupBy
                 | CopyKind::JoinGroupBy
         )
     }
@@ -179,17 +164,15 @@ impl TypedCopy {
 /// Every column definition `def` created with a type that comes from the
 /// source, reading `source` (qualified) into `target` (qualified): its
 /// typed copies, and the columns typed by an expression
-/// ([`inferred_copies`]). `rels` are the relationships declared on
-/// `source`; the to-one ones `def` reads through have a projection, in
-/// `schema`, the catalog schema. A copy of a source column that no longer
-/// exists is left out (the missing-column check owns that case).
+/// ([`inferred_copies`]). `schema` is the catalog schema, where a `JOIN`'s
+/// hidden tables are. A copy of a source column that no longer exists is
+/// left out (the missing-column check owns that case).
 pub(crate) async fn typed_copies(
     client: &impl GenericClient,
     schema: &str,
     def: &TransformDef,
     source: &str,
     target: &str,
-    rels: &[&RelationshipDefinition],
 ) -> Result<Vec<TypedCopy>, tokio_postgres::Error> {
     let (target_schema, target_bare) = target.split_once('.').unwrap_or(("", target));
     let quoted_target = super::ddl::qualified_target_table_ident(target);
@@ -265,93 +248,14 @@ pub(crate) async fn typed_copies(
                 ),
             ];
             for key in group_by {
-                let (from, from_col) = match key {
-                    GroupByKey::Column(column) => (source.to_string(), column.as_str()),
-                    GroupByKey::RelationshipPath { rel, column } => {
-                        match rels.iter().find(|r| &r.def.name == rel) {
-                            Some(r) => (r.qualified_to_table(), column.as_str()),
-                            None => continue,
-                        }
-                    }
-                };
+                let column = key.as_str();
                 for (kind, table, table_name) in &tables {
-                    copies.push(copy(
-                        *kind,
-                        table,
-                        table_name,
-                        key.target_column_name(),
-                        &from,
-                        from_col,
-                    ));
+                    copies.push(copy(*kind, table, table_name, column, source, column));
                 }
             }
         }
     }
-    let references = super::eval::relationship_references(def);
-    let read: HashSet<&str> = references.iter().map(|(rel, _)| rel.as_str()).collect();
-    for rel in rels.iter().filter(|r| {
-        r.cardinality == RelationshipCardinality::ToOne && read.contains(r.def.name.as_str())
-    }) {
-        let Some(row) = client
-            .query_opt(
-                "select projection_table from relationship_projections \
-                 where relationship_id = $1",
-                &[&rel.id],
-            )
-            .await?
-        else {
-            continue;
-        };
-        let projection: String = row.get(0);
-        let table = super::ddl::qualified_relationship_projection_table(schema, &projection);
-        let table_name = format!("{schema}.{projection}");
-        let to_table = rel.qualified_to_table();
-        copies.push(copy(
-            CopyKind::ProjectionKey,
-            &table,
-            &table_name,
-            &rel.def.to_col,
-            &to_table,
-            &rel.def.to_col,
-        ));
-        if let KeySpace::Aggregate { group_by } = &def.key_space {
-            for key in group_by {
-                if let GroupByKey::RelationshipPath { rel: name, column } = key
-                    && name == &rel.def.name
-                    && column != &rel.def.to_col
-                {
-                    copies.push(copy(
-                        CopyKind::ProjectionGroupBy,
-                        &table,
-                        &table_name,
-                        column,
-                        &to_table,
-                        column,
-                    ));
-                }
-            }
-        }
-        // Every other to-side column it reads through the relationship.
-        for (name, column) in &references {
-            if name != &rel.def.name
-                || column == &rel.def.to_col
-                || copies
-                    .iter()
-                    .any(|c| c.table == table && &c.column == column)
-            {
-                continue;
-            }
-            copies.push(copy(
-                CopyKind::ProjectionData,
-                &table,
-                &table_name,
-                column,
-                &to_table,
-                column,
-            ));
-        }
-    }
-    copies.extend(inferred_copies(client, def, source, target, rels).await?);
+    copies.extend(inferred_copies(client, def, source, target).await?);
     Ok(copies)
 }
 
@@ -483,10 +387,8 @@ async fn join_copies(
 
 /// Every relation [`typed_copies`] and [`inspect`] read for `def`, which
 /// reads `source` (qualified) into `target` (qualified), as SQL resolves
-/// them (`to_regclass` text): the source, the to-side of each of `rels`, the
-/// target and, for an aggregate, its ledger and group-delta table, and
-/// `projections`, the projection tables (bare names, in `schema`) of `rels`.
-/// For a `JOIN`, `join` is its definition id and its joined table
+/// them (`to_regclass` text): the source, the target and, for an aggregate,
+/// its ledger and group-delta table. For a `JOIN`, `join` is its definition id and its joined table
 /// (qualified), which adds that table and the hidden tables.
 /// A superset of the tables the copies are in and read from: the capture
 /// pass fingerprints these to skip the comparison while none changed
@@ -497,8 +399,6 @@ pub(crate) fn inputs(
     def: &TransformDef,
     source: &str,
     target: &str,
-    rels: &[&RelationshipDefinition],
-    projections: &[&str],
     join: Option<(i64, &str)>,
 ) -> Vec<String> {
     let mut names = vec![
@@ -513,10 +413,6 @@ pub(crate) fn inputs(
                 .map(|table| format!("{}.{}", quote_ident(schema), quote_ident(&table.name(id)))),
         );
     }
-    names.extend(
-        rels.iter()
-            .map(|r| super::ddl::regclass_arg(&r.qualified_to_table())),
-    );
     if matches!(def.key_space, KeySpace::Aggregate { .. }) {
         let (target_schema, target_bare) = target.split_once('.').unwrap_or(("", target));
         names.push(super::ledger::qualified_ledger_table(
@@ -528,11 +424,6 @@ pub(crate) fn inputs(
             target_bare,
         ));
     }
-    names.extend(
-        projections
-            .iter()
-            .map(|p| super::ddl::qualified_relationship_projection_table(schema, p)),
-    );
     names.sort();
     names.dedup();
     names
@@ -542,7 +433,7 @@ pub(crate) fn inputs(
 /// ([`CopyKind::Field`], [`CopyKind::AggregateField`],
 /// [`CopyKind::Contribution`]), each with the type define's inference gives
 /// it from the live schema: the same inference, over the same source column
-/// and relationship types, that define created it with
+/// types, that define created it with
 /// ([`super::ddl::target_table_ddl`], [`super::ddl::aggregate_target_table_ddl`]).
 /// A column whose expression reads no source column (`COUNT(*)`) has no
 /// source to drift from and is left out. Empty while the definition doesn't
@@ -552,7 +443,6 @@ async fn inferred_copies(
     def: &TransformDef,
     source: &str,
     target: &str,
-    rels: &[&RelationshipDefinition],
 ) -> Result<Vec<TypedCopy>, tokio_postgres::Error> {
     use super::catalog::CatalogError;
     let source_columns = match super::catalog::live_source_columns(client, source).await {
@@ -560,13 +450,7 @@ async fn inferred_copies(
         Err(CatalogError::Db(err)) => return Err(err),
         Err(_) => return Ok(Vec::new()),
     };
-    let relationships = match super::catalog::resolve_relationships_in(client, def, source).await {
-        Ok(relationships) => relationships,
-        Err(CatalogError::Db(err)) => return Err(err),
-        Err(_) => return Ok(Vec::new()),
-    };
-    let Ok(field_types) = super::validate::infer_field_types(def, &source_columns, &relationships)
-    else {
+    let Ok(field_types) = super::validate::infer_field_types(def, &source_columns) else {
         return Ok(Vec::new());
     };
     let Ok(substituted) = super::backfill::substituted_field_exprs(def) else {
@@ -576,7 +460,7 @@ async fn inferred_copies(
     let quoted_target = super::ddl::qualified_target_table_ident(target);
     let reads = |expr: &Expr| {
         let mut out = Vec::new();
-        expr_reads(expr, source, &source_columns, rels, &mut out);
+        expr_reads(expr, source, &source_columns, &mut out);
         out
     };
     let field_type = |name: &str| {
@@ -646,11 +530,9 @@ async fn inferred_copies(
                 super::ledger::ledger_table_name(target_bare)
             );
             for contribution in super::ledger::contributions(&def.fields, group_by, &substituted) {
-                let Ok(value_type) = super::validate::infer_expr_type(
-                    &contribution.arg,
-                    &source_columns,
-                    &relationships,
-                ) else {
+                let Ok(value_type) =
+                    super::validate::infer_expr_type(&contribution.arg, &source_columns)
+                else {
                     continue;
                 };
                 push(
@@ -668,13 +550,11 @@ async fn inferred_copies(
 }
 
 /// The source columns `expr` (substituted: it names no other field) reads,
-/// appended to `out` once each: a column of `source` (qualified), or a
-/// to-side column read through one of `rels`.
+/// appended to `out` once each, each a column of `source` (qualified).
 fn expr_reads(
     expr: &Expr,
     source: &str,
     source_columns: &HashMap<String, ValueType>,
-    rels: &[&RelationshipDefinition],
     out: &mut Vec<(String, String)>,
 ) {
     let read = match expr {
@@ -683,19 +563,15 @@ fn expr_reads(
         {
             Some((source.to_string(), name.clone()))
         }
-        Expr::RelationshipPath { rel, column } => rels
-            .iter()
-            .find(|r| &r.def.name == rel)
-            .map(|r| (r.qualified_to_table(), column.clone())),
         Expr::FunctionCall { args, .. } => {
             for arg in args {
-                expr_reads(arg, source, source_columns, rels, out);
+                expr_reads(arg, source, source_columns, out);
             }
             None
         }
         Expr::BinaryOp { lhs, rhs, .. } => {
-            expr_reads(lhs, source, source_columns, rels, out);
-            expr_reads(rhs, source, source_columns, rels, out);
+            expr_reads(lhs, source, source_columns, out);
+            expr_reads(rhs, source, source_columns, out);
             None
         }
         Expr::Column(_)
@@ -1217,7 +1093,7 @@ mod tests {
             .collect();
         let reads = |field: &str| {
             let mut out = Vec::new();
-            expr_reads(&substituted[field], "public.s", &columns, &[], &mut out);
+            expr_reads(&substituted[field], "public.s", &columns, &mut out);
             out
         };
         let read = |c: &str| ("public.s".to_string(), c.to_string());

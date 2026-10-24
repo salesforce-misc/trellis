@@ -42,8 +42,7 @@ use trellis::locks::USER_TABLE_DDL_LOCK_TIMEOUT;
 use trellis::staging::converge::table_changes_pending_through;
 use trellis::staging::self_check::CheckPageExt;
 use trellis::staging::{
-    MIN_ROWS_TO_SPLIT, StagedWatermark, TRUNCATE_SENTINEL_KEY, apply, has_pending,
-    retire_drained_segments, seal,
+    MIN_ROWS_TO_SPLIT, TRUNCATE_SENTINEL_KEY, apply, has_pending, retire_drained_segments, seal,
 };
 
 const TEST_NAME: &str = "capture_install_test";
@@ -86,7 +85,6 @@ fn spec_of_t(columns: &[&str]) -> CaptureSpec {
         "public.t",
         vec!["id".to_string()],
         columns.iter().map(|c| c.to_string()),
-        Vec::new(),
     )
     .expect("valid spec")
 }
@@ -455,8 +453,7 @@ async fn install_t_named(client: &mut Client, table: &str) -> CaptureSpec {
         .batch_execute(&format!("create table {table} (id text primary key)"))
         .await
         .expect("create table");
-    let spec = CaptureSpec::new(table, vec!["id".to_string()], Vec::new(), Vec::new())
-        .expect("valid spec");
+    let spec = CaptureSpec::new(table, vec!["id".to_string()], Vec::new()).expect("valid spec");
     landed(
         install::install(client, DEFAULT_SCHEMA, &spec, None)
             .await
@@ -1384,8 +1381,7 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
 
 /// Drains every bucket of `batch`.
 async fn drain_batch(pool: &trellis::Pool, batch: i64) {
-    let watermark = StagedWatermark::saturated();
-    while apply::drain_once(pool, batch, TEST_NAME, 1, WAKE, &watermark)
+    while apply::drain_once(pool, batch, TEST_NAME, 1, WAKE)
         .await
         .expect("drain_once")
         .is_some()
@@ -1416,9 +1412,7 @@ fn sales_columns() -> HashMap<String, ValueType> {
 
 /// The table's spec as the catalog asks for it now.
 async fn catalog_spec(client: &Client, table: &str) -> CaptureSpec {
-    let catalog = load_catalog(client, DEFAULT_SCHEMA)
-        .await
-        .expect("load the catalog");
+    let catalog = load_catalog(client).await.expect("load the catalog");
     capture_spec(client, &catalog, table)
         .await
         .expect("capture spec")

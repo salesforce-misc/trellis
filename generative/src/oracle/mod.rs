@@ -384,10 +384,6 @@ fn render_expr(expr: &Expr) -> String {
             let rendered_args: Vec<String> = args.iter().map(render_expr).collect();
             format!("{}({})", name.to_lowercase(), rendered_args.join(", "))
         }
-        Expr::RelationshipPath { rel, column } => panic!(
-            "oracle: a path into another table ('{rel}.{column}') outside a JOIN — a generator \
-             bug; a JOIN definition renders through `render_join_select`"
-        ),
     }
 }
 
@@ -442,10 +438,8 @@ fn render_select(def: &TransformDef, pk_column: &str) -> String {
                     )
                 })
                 .collect();
-            let group_cols: Vec<String> = group_by
-                .iter()
-                .map(|k| quote_ident(k.target_column_name()))
-                .collect();
+            let group_cols: Vec<String> =
+                group_by.iter().map(|k| quote_ident(k.as_str())).collect();
             format!(
                 "select {} from {} group by {}",
                 select_list.join(", "),
@@ -502,7 +496,7 @@ pub async fn sql_oracle(
                 let group_values: Vec<Option<String>> = group_by
                     .iter()
                     .map(|key| {
-                        let column = key.target_column_name();
+                        let column = key.as_str();
                         let index = def
                             .fields
                             .iter()
@@ -521,10 +515,7 @@ pub async fn sql_oracle(
                 let key = group_key(&group_values);
                 let mut by_column = BTreeMap::new();
                 for (field, value) in def.fields.iter().zip(values) {
-                    if group_by
-                        .iter()
-                        .any(|k| k.target_column_name() == field.name)
-                    {
+                    if group_by.iter().any(|k| k.as_str() == field.name) {
                         continue;
                     }
                     by_column.insert(field.name.clone(), value);
@@ -577,9 +568,7 @@ pub async fn evaluator_oracle(
             for (key, fields) in recomputed {
                 let by_column = fields
                     .into_iter()
-                    .filter(|(column, _)| {
-                        !group_by.iter().any(|k| k.target_column_name() == column)
-                    })
+                    .filter(|(column, _)| !group_by.iter().any(|k| k.as_str() == column))
                     .map(|(column, value)| (column, value.map(|v| v.to_string())))
                     .collect();
                 rows.insert(key, by_column);
@@ -813,10 +802,6 @@ fn field_value_type(expr: &Expr, source_columns: &HashMap<String, ValueType>) ->
                      that set ever widens"
                 )
             }),
-        Expr::RelationshipPath { rel, column } => panic!(
-            "oracle: a path into another table ('{rel}.{column}') outside a JOIN — a generator \
-             bug; field_value_type types a definition over its own source only"
-        ),
     }
 }
 
@@ -900,11 +885,10 @@ pub fn render_join_select(def: &TransformDef) -> String {
 }
 
 /// One `JOIN` field expression as SQL: every column is read through the
-/// table it names (`a.x`, or a joined `b.y`, which parses as a path).
+/// table it names (`a.x`, or a joined `b.y`).
 fn render_join_expr(expr: &Expr) -> String {
     match expr {
-        Expr::SourceColumn { table, column, .. }
-        | Expr::RelationshipPath { rel: table, column } => {
+        Expr::SourceColumn { table, column, .. } => {
             format!("{}.{}", quote_ident(table), quote_ident(column))
         }
         Expr::BinaryOp { op, lhs, rhs } => format!(
@@ -1170,7 +1154,7 @@ mod tests {
             target: "d0".into(),
             source: "t0".into(),
             key_space: KeySpace::Aggregate {
-                group_by: vec![trellis::dev::defs::ast::GroupByKey::Column("grain".into())],
+                group_by: vec!["grain".into()],
             },
             fields: vec![
                 trellis::dev::defs::ast::FieldDef {

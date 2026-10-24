@@ -36,9 +36,7 @@ use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use trellis::defs::{TransformStatus, create_definition, create_target_table, install_definition};
 use trellis::staging::apply;
-use trellis::staging::{
-    FoldedChange, IsolationOutcome, LastChange, StagedWatermark, isolate_and_evict,
-};
+use trellis::staging::{FoldedChange, IsolationOutcome, LastChange, isolate_and_evict};
 
 // ---------------------------------------------------------------------
 // A minimal capturing `tracing_subscriber::Layer`
@@ -309,7 +307,6 @@ async fn compute_and_apply_spans_fire_with_batch_and_transform_fields() {
         "span_test_worker",
         1,
         "trellis_span_test",
-        &StagedWatermark::saturated(),
     )
     .await
     .expect("drain_once")
@@ -449,10 +446,7 @@ async fn isolating_and_evicting_a_poisoned_key_emits_a_warning_event() {
         lsn: None,
         hop_gen: 0,
         first_seen: SystemTime::now(),
-        group_key: None,
         is_truncate: false,
-        relationship_reverse_deferred: None,
-        retry_count: 0,
         prior_image: None,
         row_count: 1,
         has_recompute: false,
@@ -462,7 +456,6 @@ async fn isolating_and_evicting_a_poisoned_key_emits_a_warning_event() {
             lsn: PgLsn::from(1),
             row_txid: "1".to_string(),
         }),
-        to_col_values: Vec::new(),
         group_sides: Vec::new(),
     }];
 
@@ -565,7 +558,6 @@ async fn a_below_threshold_charge_is_logged_as_a_warning_naming_the_key() {
         "span_test_worker",
         1,
         "trellis_span_test",
-        &StagedWatermark::saturated(),
     )
     .await;
     assert!(

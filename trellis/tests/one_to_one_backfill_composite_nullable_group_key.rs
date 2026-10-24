@@ -190,7 +190,6 @@ async fn backfill_across_a_composite_nullable_group_key_writes_the_null_group_wi
 /// Seals and drains until nothing is pending anywhere in the ring.
 async fn drain_to_quiescence(pool: &trellis::Pool, dsn: &str) {
     let mut client = connect_raw(dsn).await;
-    let watermark = trellis::staging::StagedWatermark::saturated();
     for _ in 0..16 {
         trellis::staging::seal_if_active_nonempty(&mut client, "nullable_group_key_wake")
             .await
@@ -199,16 +198,9 @@ async fn drain_to_quiescence(pool: &trellis::Pool, dsn: &str) {
             .await
             .expect("next claimable segment")
         {
-            trellis::staging::apply::drain_once(
-                pool,
-                seg,
-                "drainer",
-                1,
-                "nullable_group_key_wake",
-                &watermark,
-            )
-            .await
-            .expect("drain_once");
+            trellis::staging::apply::drain_once(pool, seg, "drainer", 1, "nullable_group_key_wake")
+                .await
+                .expect("drain_once");
         }
         trellis::staging::retire_drained_segments(&mut client)
             .await

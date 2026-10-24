@@ -101,9 +101,8 @@
 //! [`super::join`]) is compared by [`super::self_check_joins`]: its visible
 //! rows and `T`'s partials against the definition's `JOIN … GROUP BY`, and
 //! `P`, `M` and `J` against their tables. Both detect and never repair
-//! (ADR-0013). Any other aggregate (a ledger one) and a relationship-enriched
-//! target are refused ([`SelfCheckError::UnsupportedKeySpace`] /
-//! [`SelfCheckError::UnsupportedExpr`]).
+//! (ADR-0013). Any other aggregate (a ledger one, with the group-basis knob
+//! forced off) is refused ([`SelfCheckError::UnsupportedKeySpace`]).
 //!
 //! # How a page finds its keys
 //!
@@ -312,14 +311,9 @@ pub struct SelfCheckPage {
     /// one scans its table. A warning only: it never changes `outcome`. The
     /// fix for each is an index on its table and column, which Trellis
     /// doesn't create. Read live when the audit ends, so an index created
-    /// since shows. Empty when there is none.
-    ///
-    /// A target that reads a relationship is refused with
-    /// [`SelfCheckError::UnsupportedExpr`] once the audit reaches the
-    /// comparison, so it gets a report, and this list, only when the audit
-    /// stops before then: a capture fault, a definition that isn't live, or
-    /// [`SelfCheckOutcome::NotCaughtUp`]. `Trellis::status` reports the same
-    /// list for any definition.
+    /// since shows. Empty when there is none, which is always since no
+    /// definition reads a relationship (#1115); #1347 decides the field's
+    /// fate.
     pub unindexed_joins: Vec<UnindexedJoin>,
 }
 
@@ -398,8 +392,7 @@ pub enum SelfCheckError {
     /// No transform is registered under this target table name.
     TargetNotFound(String),
     /// The target is neither 1-1, an aggregate on the group basis nor a
-    /// `JOIN` that applies: an aggregate that reads a relationship path, on
-    /// the ledger until #1115, or, with the group-basis knob forced off, any
+    /// `JOIN` that applies: with the group-basis knob forced off, any
     /// aggregate or `JOIN` — see the module doc comment's "Scope" section.
     UnsupportedKeySpace {
         target: String,
@@ -411,9 +404,10 @@ pub enum SelfCheckError {
     InvalidScope {
         limit: i64,
     },
-    /// The audited definition's fields reference a construct [`render_leaf`]
-    /// doesn't render yet (a relationship path) — see the module doc
-    /// comment's "Scope" section.
+    /// The audited definition reads something the comparison can't render
+    /// (a `JOIN` field outside the shapes it holds), or its recorded state
+    /// is missing (a `JOIN` with no joined table, a keyset over a key that's
+    /// gone).
     UnsupportedExpr {
         target: String,
         detail: String,
@@ -462,8 +456,7 @@ impl fmt::Display for SelfCheckError {
             SelfCheckError::UnsupportedKeySpace { target } => write!(
                 f,
                 "self_check audits a 1-1 target, an aggregate or a JOIN; \"{target}\" is an \
-                 aggregate on the per-row ledger (one that reads a relationship path), which it \
-                 can't audit"
+                 aggregate on the per-row ledger, which it can't audit"
             ),
             SelfCheckError::UnsupportedExpr { target, detail } => {
                 write!(f, "self_check can't audit \"{target}\": {detail}")
@@ -677,21 +670,12 @@ fn joined(def: &Definition) -> bool {
     super::join::applies(&def.def)
 }
 
-/// Refuses a definition with a field [`render_leaf`] can't render (a
-/// relationship path), which the comparison would otherwise refuse only once
-/// it got that far.
+/// Refuses a `JOIN` definition with a field the comparison can't render,
+/// which the comparison would otherwise refuse only once it got that far.
+/// Every other definition renders.
 pub(crate) fn check_renders(def: &Definition) -> Result<(), SelfCheckError> {
-    if let Some(shape) = group_shape(def) {
-        return super::self_check_groups::check_renders(def, &shape);
-    }
-    if joined(def) {
+    if group_shape(def).is_none() && joined(def) {
         return super::self_check_joins::check_renders(def);
-    }
-    for field in &def.def.fields {
-        render_leaf(&field.expr).map_err(|detail| SelfCheckError::UnsupportedExpr {
-            target: def.def.target.clone(),
-            detail,
-        })?;
     }
     Ok(())
 }
@@ -1229,10 +1213,7 @@ fn page_sql(
     let mut recomputed = Vec::with_capacity(comparable.len());
     let mut persisted = Vec::with_capacity(comparable.len());
     for (i, field) in comparable.iter().enumerate() {
-        let leaf = render_leaf(&field.expr).map_err(|detail| SelfCheckError::UnsupportedExpr {
-            target: def.def.target.clone(),
-            detail,
-        })?;
+        let leaf = render_leaf(&field.expr);
         recomputed.push(format!("({leaf})::text"));
         persisted.push(format!("{}::text", quote_ident(&field.name)));
         let _ = i;
@@ -1546,44 +1527,27 @@ async fn check_schema(
 /// so many reasonable ways to walk it), but written fresh, here, and
 /// genuinely independent of both: neither of those functions is called from
 /// anywhere in this module, and this function is called from nowhere else.
-///
-/// Unlike `defs::oracle::render_expr_sql` (which panics on a relationship
-/// path — a test/benchmark-only oracle whose caller has already validated
-/// the definition is relationship-free), this returns `Err` instead: a
-/// production audit path must not panic on a shape it doesn't support yet,
-/// it must fail the one audit call cleanly
-/// ([`SelfCheckError::UnsupportedExpr`]).
-pub(super) fn render_leaf(expr: &Expr) -> Result<String, String> {
-    Ok(match expr {
+pub(super) fn render_leaf(expr: &Expr) -> String {
+    match expr {
         Expr::Column(name) | Expr::SourceColumn { column: name, .. } => quote_ident(name),
         Expr::NumberLiteral(text) => format!("{text}::numeric"),
         Expr::StringLiteral(text) => format!("'{}'::text", text.replace('\'', "''")),
         Expr::TypedLiteral { value_type, text } => typed_literal::render_sql(*value_type, text),
-        Expr::RelationshipPath { rel, column } => {
-            return Err(format!(
-                "references relationship path '{rel}.{column}' — self_check doesn't audit a \
-                 relationship-enriched target yet (ADR-0013's aggregate/relationship scope is \
-                 deferred past this issue)"
-            ));
-        }
         Expr::BinaryOp { op, lhs, rhs } => {
             let symbol = match op {
                 Operator::Add => "+",
                 Operator::GreaterThan => ">",
             };
-            format!("({} {symbol} {})", render_leaf(lhs)?, render_leaf(rhs)?)
+            format!("({} {symbol} {})", render_leaf(lhs), render_leaf(rhs))
         }
         Expr::FunctionCall { name, args } if name == "COUNT" && args.is_empty() => {
             "count(*)".to_string()
         }
         Expr::FunctionCall { name, args } => {
-            let mut rendered = Vec::with_capacity(args.len());
-            for arg in args {
-                rendered.push(render_leaf(arg)?);
-            }
+            let rendered: Vec<String> = args.iter().map(render_leaf).collect();
             format!("{}({})", name.to_lowercase(), rendered.join(", "))
         }
-    })
+    }
 }
 
 #[cfg(test)]
@@ -1592,16 +1556,13 @@ mod tests {
 
     #[test]
     fn render_leaf_renders_a_column_reference() {
-        assert_eq!(
-            render_leaf(&Expr::Column("price".to_string())).unwrap(),
-            "\"price\""
-        );
+        assert_eq!(render_leaf(&Expr::Column("price".to_string())), "\"price\"");
     }
 
     #[test]
     fn render_leaf_renders_a_number_literal_with_a_numeric_cast() {
         assert_eq!(
-            render_leaf(&Expr::NumberLiteral("1.50".to_string())).unwrap(),
+            render_leaf(&Expr::NumberLiteral("1.50".to_string())),
             "1.50::numeric"
         );
     }
@@ -1609,7 +1570,7 @@ mod tests {
     #[test]
     fn render_leaf_renders_a_string_literal_escaping_embedded_quotes() {
         assert_eq!(
-            render_leaf(&Expr::StringLiteral("o'clock".to_string())).unwrap(),
+            render_leaf(&Expr::StringLiteral("o'clock".to_string())),
             "'o''clock'::text"
         );
     }
@@ -1621,7 +1582,7 @@ mod tests {
             lhs: Box::new(Expr::Column("a".to_string())),
             rhs: Box::new(Expr::Column("b".to_string())),
         };
-        assert_eq!(render_leaf(&expr).unwrap(), "(\"a\" + \"b\")");
+        assert_eq!(render_leaf(&expr), "(\"a\" + \"b\")");
     }
 
     #[test]
@@ -1631,7 +1592,7 @@ mod tests {
             lhs: Box::new(Expr::Column("a".to_string())),
             rhs: Box::new(Expr::NumberLiteral("0".to_string())),
         };
-        assert_eq!(render_leaf(&expr).unwrap(), "(\"a\" > 0::numeric)");
+        assert_eq!(render_leaf(&expr), "(\"a\" > 0::numeric)");
     }
 
     #[test]
@@ -1640,7 +1601,7 @@ mod tests {
             name: "COUNT".to_string(),
             args: Vec::new(),
         };
-        assert_eq!(render_leaf(&expr).unwrap(), "count(*)");
+        assert_eq!(render_leaf(&expr), "count(*)");
     }
 
     #[test]
@@ -1652,17 +1613,7 @@ mod tests {
                 Expr::StringLiteral("x".to_string()),
             ],
         };
-        assert_eq!(render_leaf(&expr).unwrap(), "strpos(\"name\", 'x'::text)");
-    }
-
-    #[test]
-    fn render_leaf_refuses_a_relationship_path_instead_of_panicking() {
-        let expr = Expr::RelationshipPath {
-            rel: "author".to_string(),
-            column: "name".to_string(),
-        };
-        let err = render_leaf(&expr).unwrap_err();
-        assert!(err.contains("author.name"));
+        assert_eq!(render_leaf(&expr), "strpos(\"name\", 'x'::text)");
     }
 
     #[test]

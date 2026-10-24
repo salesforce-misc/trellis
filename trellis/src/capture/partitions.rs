@@ -128,12 +128,11 @@ use tokio_postgres::error::SqlState;
 use tokio_postgres::{Client, GenericClient};
 
 use super::CaptureError;
-use super::columns::{CaptureCatalog, CaptureReader, reads_through};
-use crate::defs::ast::{GroupByKey, KeySpace};
+use super::columns::{CaptureCatalog, CaptureReader};
+use crate::defs::ast::KeySpace;
 use crate::defs::ddl::regclass_arg;
-use crate::defs::model::RelationshipCardinality;
 use crate::defs::partition_tree::{
-    KeyRole, PartitionRefusal, PartitionTree, read_partition_tree, server_version_num,
+    PartitionRefusal, PartitionTree, read_partition_tree, server_version_num,
 };
 
 /// Constraint texts fetched in one transaction. A transaction holds one lock
@@ -536,10 +535,10 @@ pub fn live_from(
 
 /// The readers of `table` the tree no longer complies for, each with the
 /// first reason (the P1 checks, [`PartitionTree::refusal`]): an aggregate
-/// whose `GROUP BY` lacks a partition-key column, a to-many relationship's
-/// to-side whose join column isn't the key, a 1-1 transform's `FROM` or a
-/// to-one to-side. A definition already paused counts too: one the pass
-/// paused for this tree keeps the source held until the tree complies.
+/// whose `GROUP BY` lacks a partition-key column, a `JOIN` side whose
+/// `GROUP BY` and join key lack one, or a 1-1 transform's `FROM`. A
+/// definition already paused counts too: one the pass paused for this tree
+/// keeps the source held until the tree complies.
 pub fn reader_refusals(
     catalog: &CaptureCatalog,
     table: &str,
@@ -548,7 +547,7 @@ pub fn reader_refusals(
 ) -> Vec<(i64, PartitionRefusal)> {
     let mut out = Vec::new();
     for reader in &catalog.definitions {
-        if let Some(refusal) = refusal_for(catalog, reader, table, tree, server_version_num) {
+        if let Some(refusal) = refusal_for(reader, table, tree, server_version_num) {
             out.push((reader.id, refusal));
         }
     }
@@ -556,66 +555,34 @@ pub fn reader_refusals(
 }
 
 fn refusal_for(
-    catalog: &CaptureCatalog,
     reader: &CaptureReader,
     table: &str,
     tree: &PartitionTree,
     server_version_num: i32,
 ) -> Option<PartitionRefusal> {
-    if reader.source == table || reader.join.as_deref() == Some(table) {
-        let refusal = match &reader.def.key_space {
-            // ADR-0019: a side's partials are keyed by its `GROUP BY`
-            // columns and join key, the key ADR-0017's group-key rule
-            // applies to (define makes the same check).
-            KeySpace::Join(_) => {
-                crate::defs::join::side_of_table(&reader.def, table).and_then(|side| {
-                    tree.refusal(
-                        server_version_num,
-                        KeyRole::GroupBy,
-                        &crate::defs::join::side_key_columns(&reader.def, side),
-                    )
-                })
-            }
-            KeySpace::OneToOne => Some(PartitionRefusal::OneToOneFrom {
-                table: table.to_string(),
-            }),
-            KeySpace::Aggregate { group_by } => {
-                let columns: Vec<String> = group_by
-                    .iter()
-                    .filter_map(|key| match key {
-                        GroupByKey::Column(column) => Some(column.clone()),
-                        GroupByKey::RelationshipPath { .. } => None,
-                    })
-                    .collect();
-                tree.refusal(server_version_num, KeyRole::GroupBy, &columns)
-            }
-        };
-        if refusal.is_some() {
-            return refusal;
+    if reader.source != table && reader.join.as_deref() != Some(table) {
+        return None;
+    }
+    match &reader.def.key_space {
+        // ADR-0019: a side's partials are keyed by its `GROUP BY` columns and
+        // join key, the key ADR-0017's group-key rule applies to (define
+        // makes the same check).
+        KeySpace::Join(_) => {
+            crate::defs::join::side_of_table(&reader.def, table).and_then(|side| {
+                tree.refusal(
+                    server_version_num,
+                    &crate::defs::join::side_key_columns(&reader.def, side),
+                )
+            })
+        }
+        KeySpace::OneToOne => Some(PartitionRefusal::OneToOneFrom {
+            table: table.to_string(),
+        }),
+        KeySpace::Aggregate { group_by } => {
+            let columns: Vec<String> = group_by.to_vec();
+            tree.refusal(server_version_num, &columns)
         }
     }
-    for rel in &catalog.relationships {
-        if rel.qualified_to_table() != table
-            || rel.qualified_from_table() != reader.source
-            || !reads_through(&reader.def, rel)
-        {
-            continue;
-        }
-        let refusal = match rel.cardinality {
-            RelationshipCardinality::ToOne => Some(PartitionRefusal::ToOneToSide {
-                table: table.to_string(),
-            }),
-            RelationshipCardinality::ToMany => tree.refusal(
-                server_version_num,
-                KeyRole::JoinKey,
-                std::slice::from_ref(&rel.def.to_col),
-            ),
-        };
-        if refusal.is_some() {
-            return refusal;
-        }
-    }
-    None
 }
 
 /// What the fingerprint statement reads of a source.

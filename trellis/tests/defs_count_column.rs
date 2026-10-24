@@ -48,7 +48,7 @@ use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::ValueType;
 use trellis::defs::{create_aggregate_target_table, create_definition, parse, validate};
 use trellis::integer::IntWidth;
-use trellis::staging::{StagedWatermark, apply, retire_drained_segments, seal};
+use trellis::staging::{apply, retire_drained_segments, seal};
 
 // ---------------------------------------------------------------------
 // Harness
@@ -74,8 +74,7 @@ async fn connect_raw(dsn: &str) -> Client {
 /// mechanism (`seal::fenced_window`'s predecessor-half `UNION ALL`, `docs/
 /// staging-and-claiming/04-claiming-and-the-fold.md`) only ever looks back
 /// *one* generation, so a stale-slot write survives exactly one round past
-/// sealing and then is silently never read by anything — matches
-/// `defs_aggregate_relationship.rs`'s own `active_seg_table` helper.
+/// sealing and then is silently never read by anything.
 async fn active_seg_table(client: &Client) -> String {
     let ring_slot: i16 = client
         .query_one("select ring_slot from segment_pointer", &[])
@@ -184,7 +183,6 @@ async fn drain_sealed(client: &mut Client, pool: &trellis::Pool, worker: &str) {
         worker,
         1,
         "trellis_defs_count_column",
-        &StagedWatermark::saturated(),
     )
     .await
     .expect("drain_once")
@@ -245,7 +243,7 @@ async fn create_schema_and_definition(pool: &trellis::Pool, client: &Client) {
         .expect("create source table");
 
     let def = parse(DEF_SQL).expect("parse");
-    validate(&def, &columns(), &HashMap::new()).expect("validate");
+    validate(&def, &columns()).expect("validate");
     create_definition(pool, DEF_SQL, &columns())
         .await
         .expect("create definition");
@@ -261,8 +259,7 @@ async fn create_schema_and_definition(pool: &trellis::Pool, client: &Client) {
 #[test]
 fn count_of_a_column_parses_and_validates() {
     let def = parse(DEF_SQL).expect("COUNT(<column>) must parse in a GROUP BY definition");
-    validate(&def, &columns(), &HashMap::new())
-        .expect("COUNT(<column>) must validate as a GROUP BY field");
+    validate(&def, &columns()).expect("COUNT(<column>) must validate as a GROUP BY field");
     // The declared type itself (must be `bigint`, matching Postgres's own
     // `pg_typeof(count(x))`) is pinned by the crate-internal unit test
     // `defs::validate::tests::count_of_a_column_in_a_group_by_is_accepted_and_typed_bigint`

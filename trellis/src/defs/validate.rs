@@ -18,56 +18,24 @@ use std::fmt;
 use regex::Regex;
 
 use super::ast::{
-    Expr, FieldDef, GroupByKey, KeySpace, Predicate, QualifiedColumn, TransformDef, ValueType,
+    Expr, FieldDef, KeySpace, Predicate, QualifiedColumn, TransformDef, ValueType,
     render_field_expr,
 };
-use super::model::{RelationshipCardinality, RelationshipSide};
 use super::pg_type::PgType;
 use crate::error_code::ErrorCode;
 use crate::integer::IntWidth;
 
-/// A relationship referenced by a definition, resolved by the caller
-/// ([`super::catalog`]) against the persisted relationship catalog and live
-/// `pg_catalog` so this (sync, DB-less) validator can enforce ADR-0006's
-/// reference-time rules. Mirrors how `source_columns` is resolved by the
-/// caller and passed in: the validator itself never touches the database.
-///
-/// `column_types` maps each to-side column this relationship's paths
-/// reference to its [`ValueType`], so a `<rel>.<column>` enrichment field's
-/// type can be inferred from the *to-side* column it reads (the from-side
-/// `source_columns` map has no entry for it).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResolvedRelationship {
-    pub cardinality: RelationshipCardinality,
-    pub to_table: String,
-    pub to_col: String,
-    pub column_types: HashMap<String, ValueType>,
-    /// The from-side column the relationship joins on.
-    pub from_col: String,
-    /// The to-side as the relationship recorded it, `"schema.table"`, for
-    /// a live join to it (#623 D5).
-    pub qualified_to_table: String,
-}
-
 /// Which key a [`ValidationError::NondeterministicKeyCollation`] column
 /// belongs to (issue #638). Every one of them is matched by the engine as
-/// exact text: apply keys changes and target rows by the source's and each
-/// relationship endpoint's row-identity key, and an aggregate's group key is
-/// its `GROUP BY` values.
+/// exact text: apply keys changes and target rows by the source's
+/// row-identity key, and an aggregate's group key is its `GROUP BY` values.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyColumnRole {
     /// Part of the definition's source's row-identity key (its primary key,
     /// or the unique index `ddl::source_primary_key` falls back to).
     SourceKey,
-    /// A `GROUP BY` key: a source column, or a to-one relationship path's
-    /// to-side column.
+    /// A `GROUP BY` key.
     GroupBy,
-    /// Part of a relationship endpoint's row-identity key.
-    RelationshipEndpointKey {
-        /// The relationship's name.
-        name: String,
-        side: RelationshipSide,
-    },
 }
 
 impl fmt::Display for KeyColumnRole {
@@ -75,9 +43,6 @@ impl fmt::Display for KeyColumnRole {
         match self {
             KeyColumnRole::SourceKey => write!(f, "part of the source's row-identity key"),
             KeyColumnRole::GroupBy => write!(f, "a GROUP BY key"),
-            KeyColumnRole::RelationshipEndpointKey { name, side } => {
-                write!(f, "part of relationship '{name}''s {side} row-identity key")
-            }
         }
     }
 }
@@ -116,8 +81,7 @@ pub enum ValidationError {
     /// (issue #22 follow-up: cycle detection generalized from column-only,
     /// within one [`TransformDef`], to the whole graph of tables connected
     /// by [`super::model::SchemaEdge`]s — currently just `Source` edges, but
-    /// checked generically over whatever edge kinds exist so `Join`/
-    /// `Relationship` edges need no rework here once persisted). Distinct
+    /// checked generically over whatever edge kinds exist). Distinct
     /// from [`ValidationError::Cycle`], which names calculated *columns*
     /// within a single definition, since this names *tables* across
     /// definitions and is only ever detected once the persisted graph is
@@ -161,11 +125,11 @@ pub enum ValidationError {
         rhs: String,
         rhs_type: String,
     },
-    /// A join column has a type that isn't text-stable (the relationship
-    /// join-key rule, [`super::catalog::TEXT_STABLE_JOIN_KEY_TYPES`]).
+    /// A join column has a type that isn't text-stable (the join-key rule,
+    /// [`super::join_key_types::TEXT_STABLE_JOIN_KEY_TYPES`]).
     JoinUnsupportedKeyType { reference: String, pg_type: String },
     /// A join column has a nondeterministic collation, whose `=` Trellis
-    /// can't reproduce (the relationship join-key rule).
+    /// can't reproduce.
     JoinNondeterministicCollation {
         reference: String,
         collation: String,
@@ -276,8 +240,8 @@ pub enum ValidationError {
     ///
     /// This is the `GROUP BY` twin of the check the two *other* key roles
     /// already make on the raw pg type name
-    /// (`super::catalog::is_text_stable_join_key_type`, gating relationship
-    /// join keys in #28 and 1-1 primary keys in #107). A `GROUP BY` key is
+    /// (`super::join_key_types::is_text_stable_join_key_type`, gating `JOIN`
+    /// keys and 1-1 primary keys, #107). A `GROUP BY` key is
     /// matched by its `::text` rendering exactly like those are, so the same
     /// hazards apply and then some: `interval`'s native `=` holds
     /// `'1 day' = '24 hours'` while their renderings differ (two groups
@@ -301,29 +265,12 @@ pub enum ValidationError {
         column: String,
         value_type: ValueType,
     },
-    /// An [`super::ast::KeySpace::Aggregate`] definition's `GROUP BY` names a
-    /// `<rel>.<column>` path whose `<rel>` is not a relationship declared on
-    /// this definition's source table (ADR-0006: relationship names are
-    /// scoped per from-table) — the `GROUP BY` twin of
-    /// [`ValidationError::UnknownRelationship`], which blames a specific
-    /// field; a `GROUP BY` key has no field to blame, so this variant names
-    /// the relationship alone (issue #137).
-    UnknownGroupByRelationship { rel: String },
-    /// An [`super::ast::KeySpace::Aggregate`] definition's `GROUP BY` names a
-    /// **to-many** `<rel>.<column>` relationship path (issue #137).
-    /// Grouping by "the many child rows on the other end of a to-many
-    /// relationship" has no defined semantics — a `GROUP BY` key must
-    /// resolve to exactly one value per source row, which only a to-one
-    /// relationship path guarantees.
-    GroupByRelationshipMustBeToOne { rel: String, column: String },
-    /// Two of an [`super::ast::KeySpace::Aggregate`] definition's `GROUP BY`
-    /// keys map to the same target column name (issue #519) — e.g.
-    /// `GROUP BY buyer.name, seller.name`, a plain `name` alongside
-    /// `buyer.name`, or one key listed twice. A key's target column is named
-    /// after its bare column ([`GroupByKey::target_column_name`]), and the
-    /// grammar has no `GROUP BY ... AS` alias yet, so the target DDL would
-    /// declare that column twice. `first`/`second` are the clashing keys as
-    /// written (`rel.column` or `column`), in `GROUP BY` order.
+    /// Two `GROUP BY` keys map to the same target column name (issue #519):
+    /// one key listed twice, or a `JOIN`'s `a.name` and `b.name`. A key's
+    /// target column is named after its bare column, and the grammar has no
+    /// `GROUP BY ... AS` alias yet, so the target DDL would declare that
+    /// column twice. `first`/`second` are the clashing keys as written, in
+    /// `GROUP BY` order.
     GroupByKeysShareTargetColumn {
         first: String,
         second: String,
@@ -379,122 +326,14 @@ pub enum ValidationError {
     /// [`ValidationError::GroupingColumnFieldMustBePassthrough`]'s guard for
     /// the `Aggregate` arm.
     CalculatedFieldShadowsSourceColumn { field: String },
-    /// A field's expression references a `<rel>.<column>` path whose `<rel>`
-    /// is not a relationship declared on this definition's source table
-    /// (ADR-0006: relationship names are scoped per from-table). Resolved by
-    /// the caller against the relationship catalog and reported here rather
-    /// than reaching [`super::eval`] as an `UnknownRelationship` at apply
-    /// time.
-    UnknownRelationship { field: String, rel: String },
-    /// A field wraps a *to-one* relationship path in an aggregate
-    /// (`SUM(<rel>.<column>)`), which ADR-0006 forbids: a to-one path already
-    /// resolves to a single related value, so aggregating it is meaningless.
-    /// Use the bare `<rel>.<column>` enrichment instead.
-    RelationshipToOneWrappedInAggregate {
-        field: String,
-        rel: String,
-        column: String,
-    },
-    /// A field references a *to-many* relationship path bare
-    /// (`<rel>.<column>` with no aggregate), which ADR-0006 forbids: a
-    /// to-many path denotes a *set* of related values, so a bare reference is
-    /// ambiguous. Wrap it in an aggregate (`SUM`/`COUNT`/`MIN`/`MAX`/`AVG`)
-    /// that folds the set to a single value.
-    RelationshipToManyRequiresAggregate {
-        field: String,
-        rel: String,
-        column: String,
-    },
-    /// An [`super::ast::KeySpace::Aggregate`] (GROUP BY) definition's field
-    /// references a **to-many** `<rel>.<column>` relationship path inside an
-    /// aggregate call. That is a nested aggregation — folding an aggregate
-    /// over *related* rows into an aggregate over *source* rows — and has no
-    /// settled semantics (which fold runs first? does a source row with no
-    /// related rows contribute `NULL` or the inner aggregate's empty result?),
-    /// so it stays rejected until one is chosen. A **to-one** path inside an
-    /// aggregate is *not* this case: it resolves to exactly one related value
-    /// per source row, so `SUM(post.word_count)` is simply a `LEFT JOIN`
-    /// followed by `GROUP BY`, and is accepted (issue #94).
-    RelationshipPathInAggregate {
-        field: String,
-        rel: String,
-        column: String,
-    },
-    /// An [`super::ast::KeySpace::Aggregate`] (GROUP BY) definition's field
-    /// references a to-one `<rel>.<column>` relationship path **bare**, not
-    /// wrapped in an aggregate call. A to-one path resolves per *source* row,
-    /// exactly like a source column does, so within a GROUP BY it names one
-    /// value per row of the group rather than one value for the group —
-    /// there's nothing to write into the group's single target row. Wrap it in
-    /// `SUM`/`MIN`/`MAX`/`AVG`/`COUNT` to fold it down. The relationship-path
-    /// twin of [`ValidationError::UngroupedColumnReference`], kept separate so
-    /// the message can name `<rel>.<column>` rather than pretend the path is a
-    /// source column name (issue #94).
-    UngroupedRelationshipReference {
-        field: String,
-        rel: String,
-        column: String,
-    },
-    /// A relationship endpoint (issue #27, ADR-0006) names a `table.column`
-    /// pair that doesn't exist, as introspected live against `pg_catalog` —
-    /// ADR-0005 forbids Trellis from assuming a column exists rather than
-    /// checking, even though it never issues DDL against the table itself.
-    UnknownRelationshipColumn { table: String, column: String },
-    /// A relationship's `from_col`/`to_col` (issue #27, ADR-0006's endpoint
-    /// requirements) differ in type, type modifier or collation (issue #590):
-    /// `integer` against `bigint`, `text` against `character varying`,
-    /// `varchar(50)` against `varchar(255)`, or two collations. Trellis joins
-    /// only columns Postgres can compare as-is and never casts a join key.
-    RelationshipTypeMismatch(Box<RelationshipTypeMismatch>),
-    /// A relationship name was already declared on the same `from_table`
-    /// (issue #27, surfacing ADR-0006's "Naming and scope": unique
-    /// per-from-table, not global) with an actionable message, ahead of the
-    /// `relationship_definitions` unique constraint that backstops this
-    /// check against a same-name race between concurrent callers.
-    /// `from_table` is the qualified `"schema.table"` it collided on — the
-    /// name is unique per qualified from-table (issue #288), so a same-named
-    /// table in another schema is no collision.
-    DuplicateRelationshipName { from_table: String, name: String },
-    /// A relationship is declared with the same name as its from-table
-    /// (issue #830). A transform over that table reads `<table>.<column>` as
-    /// its own source column, so a relationship of that name could never be
-    /// read, and the two-part name would mean two things.
-    RelationshipNamedAfterFromTable { name: String },
-    /// A relationship's join key resolved to a Postgres type that isn't
-    /// text-stable — one where `a::text = b::text` disagrees with the type's
-    /// native typed `=` (see
-    /// [`super::catalog::TEXT_STABLE_JOIN_KEY_TYPES`]). Trellis's evaluator,
-    /// staging reverse-lookup, and oracle all join by raw `::text` equality,
-    /// but the oracle SELECT joins by native `=`, so a non-text-stable key
-    /// (`numeric`/`real`/`double precision` — `1.0` vs `1.00`; `character(n)`
-    /// — blank-padding; `citext` — case; `interval` — `'1 day'` vs
-    /// `'24 hours'`) would render a real LEFT JOIN match as a false-miss NULL
-    /// in the engine. Rejected at definition time rather than silently
-    /// diverging from the Postgres oracle.
-    RelationshipUnsupportedJoinKeyType {
-        name: String,
-        table: String,
-        column: String,
-        pg_type: String,
-    },
-    /// A relationship's join column has a nondeterministic collation (issue
-    /// #590), whose `=` treats distinct strings as equal (e.g. case-
-    /// insensitively). The engine matches join keys by their exact text, so
-    /// it would disagree with Postgres about which rows join.
-    RelationshipNondeterministicCollation {
-        name: String,
-        table: String,
-        column: String,
-        collation: String,
-    },
     /// A column the engine matches as a key by its exact text has a
-    /// nondeterministic collation (issue #638): the source's row-identity key,
-    /// a `GROUP BY` key, or a relationship endpoint's row-identity key. Such a
-    /// collation's `=` (and so `GROUP BY` and a unique index) treats distinct
-    /// strings as equal (`'A'` and `'a'` under a case-insensitive one), so
-    /// Postgres would fold rows the engine keeps apart. The key-column twin of
-    /// [`ValidationError::RelationshipNondeterministicCollation`], refused at
-    /// define time for the same reason (#590's decision: reject, never
+    /// nondeterministic collation (issue #638): the source's row-identity key
+    /// or a `GROUP BY` key. Such a collation's `=` (and so `GROUP BY` and a
+    /// unique index) treats distinct strings as equal (`'A'` and `'a'` under a
+    /// case-insensitive one), so Postgres would fold rows the engine keeps
+    /// apart. The key-column twin of
+    /// [`ValidationError::JoinNondeterministicCollation`], refused at define
+    /// time for the same reason (#590's decision: reject, never
     /// reinterpret).
     NondeterministicKeyCollation(Box<NondeterministicKeyCollation>),
     /// A calculated field passes a column with a nondeterministic collation
@@ -528,78 +367,6 @@ pub enum ValidationError {
     /// their caller already created the physical target table, this is the
     /// only check that a bogus explicit schema ever gets.
     QualifiedTargetTableNotFound { schema: String, table: String },
-    /// A `KeySpace::OneToOne` field's `MIN`/`MAX` wraps a **to-many**
-    /// relationship path over an enum-typed column (issue #117,
-    /// `super::eval`'s to-many relationship enrichment, issue #29). Refused,
-    /// unlike every other admitted `MIN`/`MAX(enum)` shape: this specific
-    /// combination folds through the pure, synchronous, DB-less evaluator
-    /// (`eval::eval_to_many_aggregate` -> `eval::reduce_numeric_aggregate`)
-    /// with no live-Postgres fallback the way a `KeySpace::Aggregate`
-    /// field's own `MIN`/`MAX` always has (it is
-    /// `Invertibility::RecomputeOnly`, so `staging::ledger` always
-    /// resolves its written value with a real server-side `min()`/`max()`
-    /// over the group's ledger entries, never by folding a multi-row group through this
-    /// evaluator — see `defs::invertibility`'s own doc comment). An enum's
-    /// creation-order comparison is a live, per-type, schema-defined fact
-    /// (`pg_enum.enumsortorder`), not a universal property of the family
-    /// the way `date`/`inet` ordering is, so the evaluator has no way to
-    /// answer it correctly without a connection it structurally never has
-    /// here — refusing at validation time is what keeps a naive
-    /// lexicographic fallback from ever silently computing the wrong
-    /// answer (see `eval::reduce_enum_aggregate`'s own doc comment for the
-    /// runtime-side twin of this guard). Every other `MIN`/`MAX(enum)`
-    /// shape — a `KeySpace::Aggregate` field, or a to-*one* relationship
-    /// path (which resolves to one value per row, never a multi-row fold)
-    /// — is unaffected.
-    EnumAggregateOverToManyRelationshipUnsupported {
-        field: String,
-        function: String,
-        rel: String,
-    },
-    /// A `KeySpace::OneToOne` field's `MIN`/`MAX` wraps a **to-many**
-    /// relationship path over a `text`/`varchar`-typed column (issue #120) —
-    /// `EnumAggregateOverToManyRelationshipUnsupported`'s exact structural
-    /// twin, for the same reason: this one shape folds a real multi-row
-    /// group through the pure, synchronous, DB-less evaluator
-    /// (`eval::eval_to_many_aggregate` -> `eval::reduce_numeric_aggregate` ->
-    /// `eval::reduce_text_aggregate`) with no live-Postgres fallback, unlike
-    /// a `KeySpace::Aggregate` field's own `MIN`/`MAX(text)` (always
-    /// `Invertibility::RecomputeOnly`, always resolved by a real server-side
-    /// `min()`/`max()` push-down instead). Postgres's `text` ordering is a
-    /// per-*column* **collation**, not a fixed, universal property of the
-    /// `text` family the way `date`/`inet` ordering is — and this crate
-    /// tracks no column collation metadata at all — so the evaluator has no
-    /// way to answer "which of these two distinct strings sorts first"
-    /// correctly without a live lookup it structurally never has here.
-    /// Refusing at validation time is what keeps an assumed byte-order
-    /// (`C`/`POSIX`) fallback from silently computing the wrong answer under
-    /// any other collation — see `eval::reduce_text_aggregate`'s own doc
-    /// comment for the runtime-side twin of this guard. (`uuid` — this
-    /// issue's other candidate `MIN`/`MAX` family — turned out, checked live
-    /// rather than assumed, not to need an equivalent guard: Postgres has no
-    /// `min(uuid)`/`max(uuid)` aggregate *at all*, the same "opclass but no
-    /// aggregate" finding #114/#116 made for `bytea`/`macaddr`, so `uuid`
-    /// never reaches this arm in the first place — `registry::aggregate_result_type`
-    /// refuses it outright as an ordinary `FunctionArgTypeMismatch`,
-    /// independent of relationship shape.) Every other `MIN`/`MAX(text)`
-    /// shape — a `KeySpace::Aggregate` field, or a to-*one* relationship
-    /// path — is unaffected.
-    TextAggregateOverToManyRelationshipUnsupported {
-        field: String,
-        function: String,
-        rel: String,
-    },
-    /// `ARRAY_AGG`/`STRING_AGG` over a to-many relationship path (issue
-    /// #293). A to-many enrichment is folded by the Rust evaluator
-    /// (`eval::eval_to_many_aggregate`) and built by its SQL twin
-    /// (`backfill`), and neither has an arm for these two; without this
-    /// refusal the evaluator would fall through to the numeric fold. A
-    /// `GROUP BY` definition's own call is unaffected.
-    ListAggregateOverToManyRelationshipUnsupported {
-        field: String,
-        function: String,
-        rel: String,
-    },
     /// `STRING_AGG`'s separator is not a string literal (issue #293). The
     /// separator is fixed per definition so the ledger's contribution column
     /// is the value argument alone.
@@ -607,7 +374,8 @@ pub enum ValidationError {
 }
 
 /// Payload of [`ValidationError::NondeterministicKeyCollation`], boxed out of
-/// the enum for the same reason as [`RelationshipTypeMismatch`].
+/// the enum so its fields don't inflate every error type that wraps
+/// [`ValidationError`] (clippy::result_large_err).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NondeterministicKeyCollation {
     pub key: KeyColumnRole,
@@ -618,15 +386,15 @@ pub struct NondeterministicKeyCollation {
 }
 
 /// Payload of [`ValidationError::NondeterministicCollationTextFunction`],
-/// boxed out of the enum for the same reason as [`RelationshipTypeMismatch`].
+/// boxed out of the enum for the same reason as
+/// [`NondeterministicKeyCollation`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NondeterministicCollationTextFunction {
     /// The calculated field whose own expression makes the call.
     pub field: String,
     /// `STRPOS` or `REGEXP_COUNT`.
     pub function: String,
-    /// The column's table as the check resolved it (`schema.table`): the
-    /// source, or a relationship path's to-side.
+    /// The column's table as the check resolved it (`schema.table`).
     pub table: String,
     pub column: String,
     pub collation: String,
@@ -641,23 +409,15 @@ pub struct NondeterministicCollationTextFunction {
 pub(crate) const NONDETERMINISTIC_COLLATION_REFUSING_FUNCTIONS: &[&str] =
     &["STRPOS", "REGEXP_COUNT"];
 
-/// A column an argument of a [`NONDETERMINISTIC_COLLATION_REFUSING_FUNCTIONS`]
-/// call reads, directly or through `COALESCE` or another calculated field.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) enum TextColumnRef {
-    /// A column of the definition's source.
-    Source(String),
-    /// A `<rel>.<column>` relationship path: a column of `rel`'s to-side.
-    Relationship { rel: String, column: String },
-}
-
 /// One read [`collation_refusing_function_reads`] found.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct CollationRefusingRead {
     /// The field whose own expression makes the call.
     pub field: String,
     pub function: String,
-    pub column: TextColumnRef,
+    /// The source column read, directly or through `COALESCE` or another
+    /// calculated field.
+    pub column: String,
 }
 
 /// Every column an argument of a `STRPOS`/`REGEXP_COUNT` call in `def`'s
@@ -722,7 +482,6 @@ fn collect_refusing_calls(
         }
         Expr::Column(_)
         | Expr::SourceColumn { .. }
-        | Expr::RelationshipPath { .. }
         | Expr::NumberLiteral(_)
         | Expr::StringLiteral(_)
         | Expr::TypedLiteral { .. } => {}
@@ -737,7 +496,7 @@ fn collect_text_columns<'a>(
     field: &str,
     fields_by_name: &HashMap<&str, &'a FieldDef>,
     visited: &mut HashSet<&'a str>,
-    out: &mut Vec<TextColumnRef>,
+    out: &mut Vec<String>,
 ) {
     match expr {
         Expr::Column(name) => match fields_by_name.get(name.as_str()) {
@@ -746,13 +505,9 @@ fn collect_text_columns<'a>(
                     collect_text_columns(&other.expr, &other.name, fields_by_name, visited, out);
                 }
             }
-            _ => out.push(TextColumnRef::Source(name.clone())),
+            _ => out.push(name.clone()),
         },
-        Expr::SourceColumn { column, .. } => out.push(TextColumnRef::Source(column.clone())),
-        Expr::RelationshipPath { rel, column } => out.push(TextColumnRef::Relationship {
-            rel: rel.clone(),
-            column: column.clone(),
-        }),
+        Expr::SourceColumn { column, .. } => out.push(column.clone()),
         Expr::FunctionCall { args, .. } => {
             for arg in args {
                 collect_text_columns(arg, field, fields_by_name, visited, out);
@@ -767,7 +522,7 @@ fn collect_text_columns<'a>(
 }
 
 /// Payload of [`ValidationError::AmbiguousColumnReference`], boxed out of
-/// the enum like [`RelationshipTypeMismatch`].
+/// the enum like [`NondeterministicKeyCollation`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AmbiguousColumnReference {
     /// The field whose expression reads the name.
@@ -784,33 +539,11 @@ pub struct AmbiguousColumnReference {
     pub source_schema: Option<String>,
 }
 
-/// Payload of [`ValidationError::RelationshipTypeMismatch`], boxed out of the
-/// enum so this variant's seven `String` fields don't inflate every error
-/// type that wraps [`ValidationError`] (clippy::result_large_err).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RelationshipTypeMismatch {
-    pub name: String,
-    pub from_table: String,
-    pub from_col: String,
-    pub from_type: String,
-    pub to_table: String,
-    pub to_col: String,
-    pub to_type: String,
-}
-
 impl ValidationError {
     /// This error's stable, coarse [`ErrorCode`] category (`docs/decisions/0008-public-api-design.md`,
-    /// decision 3). Almost every variant here is a rejected definition —
-    /// [`ErrorCode::Validation`] — with one exception:
-    /// [`ValidationError::DuplicateRelationshipName`] is a naming collision
-    /// with an already-declared relationship, so it reports
-    /// [`ErrorCode::Conflict`] instead, the same category a uniqueness
-    /// violation from Postgres itself would report.
+    /// decision 3). Every variant here is a rejected definition.
     pub fn code(&self) -> ErrorCode {
-        match self {
-            ValidationError::DuplicateRelationshipName { .. } => ErrorCode::Conflict,
-            _ => ErrorCode::Validation,
-        }
+        ErrorCode::Validation
     }
 
     /// Fills in the `FROM` table's schema for an
@@ -928,7 +661,7 @@ impl fmt::Display for ValidationError {
                 "ON joins on {reference} ({pg_type}), a type whose equality isn't text-stable, \
                  so the engine (which compares join keys as text) would silently diverge from \
                  Postgres's typed join; supported join key types: {}",
-                super::catalog::supported_join_key_types()
+                super::join_key_types::supported_join_key_types()
             ),
             ValidationError::JoinNondeterministicCollation {
                 reference,
@@ -1051,17 +784,6 @@ impl fmt::Display for ValidationError {
                  BY key types are {}",
                 supported_group_by_key_types()
             ),
-            ValidationError::UnknownGroupByRelationship { rel } => write!(
-                f,
-                "GROUP BY references '{rel}.<column>', but '{rel}' is not this definition's \
-                 FROM table; write a source column bare or as <table>.<column>"
-            ),
-            ValidationError::GroupByRelationshipMustBeToOne { rel, column } => write!(
-                f,
-                "GROUP BY references to-many relationship path '{rel}.{column}'; grouping by \
-                 the many related rows on the other end of a to-many relationship has no \
-                 defined semantics, so a GROUP BY relationship path must be to-one"
-            ),
             ValidationError::GroupByKeysShareTargetColumn {
                 first,
                 second,
@@ -1137,96 +859,6 @@ impl fmt::Display for ValidationError {
                  a different name avoids shadowing the real column for other fields that \
                  reference it"
             ),
-            ValidationError::UnknownRelationship { field, rel } => write!(
-                f,
-                "calculated field '{field}' references '{rel}.<column>', but '{rel}' is not \
-                 this definition's FROM table; write a source column bare or as \
-                 <table>.<column>"
-            ),
-            ValidationError::RelationshipToOneWrappedInAggregate { field, rel, column } => write!(
-                f,
-                "calculated field '{field}' wraps to-one relationship path '{rel}.{column}' in \
-                 an aggregate; a to-one relationship already resolves to a single related value, \
-                 so drop the aggregate and reference '{rel}.{column}' directly"
-            ),
-            ValidationError::RelationshipToManyRequiresAggregate { field, rel, column } => write!(
-                f,
-                "calculated field '{field}' references to-many relationship path '{rel}.{column}' \
-                 bare; a to-many relationship denotes a set of related values, so wrap it in an \
-                 aggregate such as SUM({rel}.{column}) or COUNT({rel}.{column})"
-            ),
-            ValidationError::RelationshipPathInAggregate { field, rel, column } => write!(
-                f,
-                "calculated field '{field}' aggregates to-many relationship path \
-                 '{rel}.{column}' inside a GROUP BY (aggregate) definition; aggregating an \
-                 aggregate is not supported — a to-one relationship path may be aggregated \
-                 here, but a to-many one may not"
-            ),
-            ValidationError::UngroupedRelationshipReference { field, rel, column } => write!(
-                f,
-                "calculated field '{field}' references relationship path '{rel}.{column}' \
-                 outside of SUM/COUNT/MIN/MAX/AVG; in a GROUP BY definition a to-one \
-                 relationship path resolves once per source row, so it must be aggregated \
-                 (e.g. SUM({rel}.{column})), not referenced bare"
-            ),
-            ValidationError::UnknownRelationshipColumn { table, column } => write!(
-                f,
-                "relationship references '{table}.{column}', which does not exist"
-            ),
-            ValidationError::RelationshipTypeMismatch(mismatch) => {
-                let RelationshipTypeMismatch {
-                    name,
-                    from_table,
-                    from_col,
-                    from_type,
-                    to_table,
-                    to_col,
-                    to_type,
-                } = &**mismatch;
-                write!(
-                    f,
-                    "relationship '{name}' joins {from_table}.{from_col} ({from_type}) to \
-                     {to_table}.{to_col} ({to_type}), which don't match: join columns must \
-                     have the same type, type modifier and collation, because Trellis never \
-                     casts a join key. Alter one column to match the other"
-                )
-            }
-            ValidationError::RelationshipNamedAfterFromTable { name } => write!(
-                f,
-                "relationship '{name}' has the same name as its from-table; a transform over \
-                 '{name}' reads `{name}.<column>` as its own source column, so give the \
-                 relationship a different name"
-            ),
-            ValidationError::DuplicateRelationshipName { from_table, name } => write!(
-                f,
-                "relationship '{name}' is already declared on '{from_table}'; relationship \
-                 names must be unique per from-table, so pick a different name"
-            ),
-            ValidationError::RelationshipUnsupportedJoinKeyType {
-                name,
-                table,
-                column,
-                pg_type,
-            } => write!(
-                f,
-                "relationship '{name}' joins on {table}.{column} ({pg_type}), a type whose \
-                 equality isn't text-stable, so the engine (which compares join keys as text) \
-                 would silently diverge from the Postgres oracle's typed join; supported join \
-                 key types are {}",
-                super::catalog::supported_join_key_types()
-            ),
-            ValidationError::RelationshipNondeterministicCollation {
-                name,
-                table,
-                column,
-                collation,
-            } => write!(
-                f,
-                "relationship '{name}' joins on {table}.{column}, whose collation \
-                 \"{collation}\" is nondeterministic; its `=` matches strings that differ \
-                 (e.g. by case), but Trellis matches join keys by their exact text, so join \
-                 columns need a deterministic collation"
-            ),
             ValidationError::NondeterministicKeyCollation(refused) => {
                 let NondeterministicKeyCollation {
                     key,
@@ -1271,40 +903,6 @@ impl fmt::Display for ValidationError {
                  relation, not the configured target schema (ADR-0011), so this is checked as \
                  written"
             ),
-            ValidationError::EnumAggregateOverToManyRelationshipUnsupported {
-                field,
-                function,
-                rel,
-            } => write!(
-                f,
-                "calculated field '{field}': {function}('{rel}.<column>') over a to-many \
-                 relationship is not supported for an enum-typed column — its creation-order \
-                 comparison cannot be resolved without a live connection this fold has no way \
-                 to reach (issue #117); a GROUP BY definition's own {function}(<enum column>) \
-                 is unaffected"
-            ),
-            ValidationError::TextAggregateOverToManyRelationshipUnsupported {
-                field,
-                function,
-                rel,
-            } => write!(
-                f,
-                "calculated field '{field}': {function}('{rel}.<column>') over a to-many \
-                 relationship is not supported for a text-typed column — its ordering depends on \
-                 a column collation this crate does not track, which cannot be resolved without \
-                 a live connection this fold has no way to reach (issue #120); a GROUP BY \
-                 definition's own {function}(<text column>) is unaffected"
-            ),
-            ValidationError::ListAggregateOverToManyRelationshipUnsupported {
-                field,
-                function,
-                rel,
-            } => write!(
-                f,
-                "calculated field '{field}': {function}('{rel}.<column>') over a to-many \
-                 relationship is not supported (issue #293); a GROUP BY definition's own \
-                 {function}(<text column>) is supported"
-            ),
             ValidationError::StringAggSeparatorNotLiteral { field } => write!(
                 f,
                 "calculated field '{field}': STRING_AGG's separator must be a string literal"
@@ -1322,7 +920,6 @@ impl std::error::Error for ValidationError {}
 pub fn validate(
     def: &TransformDef,
     source_columns: &HashMap<String, ValueType>,
-    relationships: &HashMap<String, ResolvedRelationship>,
 ) -> Result<(), ValidationError> {
     validate_target_names(def)?;
 
@@ -1364,64 +961,34 @@ pub fn validate(
             reject_ambiguous_names(def, source_columns)?;
         }
         KeySpace::Aggregate { group_by } => {
-            // Issue #137: a `GROUP BY` key is either a plain source column
-            // (checked exactly as before) or a to-one relationship path,
-            // resolved against the same catalog-supplied `relationships` map
-            // a field's own `<rel>.<column>` reference uses. An unknown
-            // relationship name or a to-many cardinality is rejected here,
-            // ahead of the per-field checks below, so a bad `GROUP BY`
-            // clause is never masked by a field error instead.
-            let mut keys_by_target_column: HashMap<&str, &GroupByKey> =
-                HashMap::with_capacity(group_by.len());
+            // Checked ahead of the per-field checks below, so a bad
+            // `GROUP BY` clause is never masked by a field error instead.
+            let mut seen: HashSet<&str> = HashSet::with_capacity(group_by.len());
             for key in group_by {
-                match key {
-                    GroupByKey::Column(column) => {
-                        let Some(value_type) = source_columns.get(column) else {
-                            return Err(ValidationError::UnresolvedGroupByColumn {
-                                column: column.clone(),
-                            });
-                        };
-                        reject_unsupported_group_by_key_type(column, *value_type)?;
-                    }
-                    GroupByKey::RelationshipPath { rel, column } => {
-                        let resolved = relationships.get(rel).ok_or_else(|| {
-                            ValidationError::UnknownGroupByRelationship { rel: rel.clone() }
-                        })?;
-                        if resolved.cardinality != RelationshipCardinality::ToOne {
-                            return Err(ValidationError::GroupByRelationshipMustBeToOne {
-                                rel: rel.clone(),
-                                column: column.clone(),
-                            });
-                        }
-                        let Some(value_type) = resolved.column_types.get(column) else {
-                            return Err(ValidationError::UnknownRelationshipColumn {
-                                table: resolved.to_table.clone(),
-                                column: column.clone(),
-                            });
-                        };
-                        reject_unsupported_group_by_key_type(column, *value_type)?;
-                    }
-                }
+                let Some(value_type) = source_columns.get(key) else {
+                    return Err(ValidationError::UnresolvedGroupByColumn {
+                        column: key.clone(),
+                    });
+                };
+                reject_unsupported_group_by_key_type(key, *value_type)?;
                 // Issue #519: each key becomes a target column named after
-                // its bare column, so two keys sharing that name (two
-                // relationships onto the same table, a relationship column
-                // named like a from-side one, or a repeated key) would reach
-                // the target DDL as a duplicate column. Checked after the key
-                // itself resolves, so an unknown relationship or column is
-                // reported as such rather than as a clash.
-                if let Some(earlier) = keys_by_target_column.insert(key.target_column_name(), key) {
+                // it, so a repeated key would reach the target DDL as a
+                // duplicate column. Checked after the key itself resolves,
+                // so an unknown column is reported as such rather than as a
+                // clash.
+                if !seen.insert(key) {
                     return Err(ValidationError::GroupByKeysShareTargetColumn {
-                        first: group_by_key_as_written(earlier),
-                        second: group_by_key_as_written(key),
-                        column: key.target_column_name().to_string(),
+                        first: key.clone(),
+                        second: key.clone(),
+                        column: key.clone(),
                     });
                 }
                 // Issue #566: a key's column sits beside the target's hidden
                 // `__`-prefixed columns, so it may not use their prefix.
-                if key.target_column_name().starts_with(RESERVED_COLUMN_PREFIX) {
+                if key.starts_with(RESERVED_COLUMN_PREFIX) {
                     return Err(ValidationError::ReservedGroupByColumnName {
-                        key: group_by_key_as_written(key),
-                        column: key.target_column_name().to_string(),
+                        key: key.clone(),
+                        column: key.clone(),
                     });
                 }
             }
@@ -1432,13 +999,8 @@ pub fn validate(
                 // target column of its own. Any other expression under that
                 // name would compute a value with nowhere to go — enforce
                 // the passthrough shape here rather than let DDL silently
-                // drop it. For a relationship-path key the passthrough shape
-                // is the same bare path, not the column's own name (there is
-                // no source column named e.g. `author` on this definition's
-                // source at all).
-                if let Some(key) = group_by
-                    .iter()
-                    .find(|k| k.target_column_name() == field.name)
+                // drop it.
+                if let Some(key) = group_by.iter().find(|k| k.as_str() == field.name)
                     && !expr_is_group_by_key_passthrough(&field.expr, key)
                 {
                     return Err(ValidationError::GroupingColumnFieldMustBePassthrough {
@@ -1456,7 +1018,6 @@ pub fn validate(
                     &field.name,
                     group_by,
                     source_columns,
-                    relationships,
                     false,
                 )?;
             }
@@ -1536,16 +1097,7 @@ pub fn validate(
 
     detect_cycle(&deps)?;
 
-    // ADR-0006 reference-time cardinality rules: a to-one relationship is
-    // enriched by a bare `<rel>.<column>`; a to-many by an aggregate over the
-    // path. Checked here (with catalog-resolved cardinalities) before type
-    // inference, which relies on the relationship being resolvable.
-    let is_aggregate = matches!(def.key_space, KeySpace::Aggregate { .. });
-    for field in &def.fields {
-        validate_relationship_refs(&field.expr, &field.name, relationships, is_aggregate, false)?;
-    }
-
-    infer_field_types(def, source_columns, relationships)?;
+    infer_field_types(def, source_columns)?;
 
     Ok(())
 }
@@ -1593,7 +1145,7 @@ fn validate_target_names(def: &TransformDef) -> Result<(), ValidationError> {
 
 /// One column of a `JOIN` definition's two tables, as the catalog reads it:
 /// everything [`validate_join`] needs without touching the database. The
-/// fields mirror what the relationship join-key checks compare
+/// fields mirror what the join-key checks compare
 /// (`catalog::JoinColumn`), plus the [`ValueType`] and whether the type is a
 /// live enum.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1724,29 +1276,21 @@ pub(crate) fn check_aggregate_admitted(
     }
 }
 
-/// Refuses a plain aggregate (`GROUP BY`, no relationship path) that calls
+/// Refuses a plain aggregate (`GROUP BY`) that calls
 /// an aggregate outside #1096 decision 1's admitted set, by family
 /// ([`check_aggregate_admitted`]): the group basis keeps every aggregate
 /// definition, and has nothing for the rest. `columns` are the source's live
 /// columns, whose declared modifier tells a `numeric(p,s)` argument from an
 /// unconstrained one; an expression's `numeric` result has no declared scale.
 ///
-/// Any other key space, and an aggregate with a relationship path (which
-/// stays on the ledger until relationships are removed, #1115), passes.
+/// Any other key space passes.
 pub(crate) fn validate_aggregate_admitted(
     def: &TransformDef,
     columns: &HashMap<String, JoinColumnInfo>,
 ) -> Result<(), ValidationError> {
-    let KeySpace::Aggregate { group_by } = &def.key_space else {
+    let KeySpace::Aggregate { .. } = &def.key_space else {
         return Ok(());
     };
-    if group_by
-        .iter()
-        .any(|key| matches!(key, GroupByKey::RelationshipPath { .. }))
-        || def.fields.iter().any(|f| reads_relationship(&f.expr))
-    {
-        return Ok(());
-    }
     let value_types: HashMap<String, ValueType> = columns
         .iter()
         .map(|(name, info)| (name.clone(), info.value_type))
@@ -1764,15 +1308,6 @@ pub(crate) fn validate_aggregate_admitted(
         check_aggregate_calls(expr, columns, &value_types)?;
     }
     Ok(())
-}
-
-fn reads_relationship(expr: &Expr) -> bool {
-    match expr {
-        Expr::RelationshipPath { .. } => true,
-        Expr::FunctionCall { args, .. } => args.iter().any(reads_relationship),
-        Expr::BinaryOp { lhs, rhs, .. } => reads_relationship(lhs) || reads_relationship(rhs),
-        _ => false,
-    }
 }
 
 /// [`validate_aggregate_admitted`]'s walk of one field's expression.
@@ -1802,7 +1337,7 @@ fn check_aggregate_calls(
             };
             // `validate` has typed the definition already; an argument it
             // can't type here is left to it.
-            let Ok(value_type) = infer_expr_type(arg, value_types, &HashMap::new()) else {
+            let Ok(value_type) = infer_expr_type(arg, value_types) else {
                 return Ok(());
             };
             let column = match arg {
@@ -1840,8 +1375,7 @@ fn written(column: &QualifiedColumn) -> String {
 ///
 /// The join is admitted when: the tables differ; every column is qualified
 /// and exists; each `ON` term is an equality between one column of each
-/// table, of one type, modifier and collation (the relationship join-key
-/// rules); every `GROUP BY` key, from either table, is an admitted key type;
+/// table, of one type, modifier and collation (the join-key rules); every `GROUP BY` key, from either table, is an admitted key type;
 /// and each field is a key passthrough or composes admitted aggregates
 /// (`COUNT(*)`, and `COUNT`/`SUM`/`AVG` of a column or an expression over
 /// one table's columns, per [`check_aggregate_admitted`]) with literals,
@@ -1904,7 +1438,7 @@ pub fn validate_join(
         };
 
     let check_key_type = |column: &QualifiedColumn, info: &JoinColumnInfo| {
-        if !super::catalog::is_text_stable_join_key_type(&info.pg_type) && !info.is_enum {
+        if !super::join_key_types::is_text_stable_join_key_type(&info.pg_type) && !info.is_enum {
             return Err(ValidationError::JoinUnsupportedKeyType {
                 reference: written(column),
                 pg_type: info.pg_type.clone(),
@@ -2084,11 +1618,6 @@ fn check_join_field_expr<'a>(
             field: field.to_string(),
             column: column.clone(),
         }),
-        // A dotted name whose head is neither table: a JOIN transform has no
-        // relationship paths.
-        Expr::RelationshipPath { rel, column } => Err(ValidationError::JoinUnknownTable {
-            reference: format!("{rel}.{column}"),
-        }),
         Expr::SourceColumn {
             schema,
             table,
@@ -2186,7 +1715,7 @@ fn check_join_field_expr<'a>(
                 .iter()
                 .map(|(name, info)| (name.clone(), info.value_type))
                 .collect();
-            let value_type = infer_expr_type(arg, &value_types, &HashMap::new())?;
+            let value_type = infer_expr_type(arg, &value_types)?;
             let (pg_type, typmod, trellis_target) = match arg {
                 Expr::SourceColumn { column, .. } => columns
                     .get(column)
@@ -2269,7 +1798,6 @@ pub(crate) fn join_field_value_type(
             ..def.clone()
         },
         &types,
-        &HashMap::new(),
     )?;
     Ok(types_by_field
         .get(&field.name)
@@ -2329,7 +1857,6 @@ pub(crate) fn validate_qualified_columns(
                 .iter()
                 .try_for_each(|arg| walk(arg, field, def, source_columns, source_schema)),
             Expr::Column(_)
-            | Expr::RelationshipPath { .. }
             | Expr::NumberLiteral(_)
             | Expr::StringLiteral(_)
             | Expr::TypedLiteral { .. } => Ok(()),
@@ -2396,7 +1923,6 @@ fn reject_ambiguous_names(
                     .find_map(|arg| first_ambiguous(arg, reader, in_arg, shadowing, aggregates))
             }
             Expr::SourceColumn { .. }
-            | Expr::RelationshipPath { .. }
             | Expr::NumberLiteral(_)
             | Expr::StringLiteral(_)
             | Expr::TypedLiteral { .. } => None,
@@ -2454,100 +1980,6 @@ pub fn reject_primary_key_named_fields(
     }
 }
 
-/// A `GROUP BY` key spelled the way the definition wrote it: `column` or
-/// `rel.column`.
-fn group_by_key_as_written(key: &GroupByKey) -> String {
-    match key {
-        GroupByKey::Column(column) => column.clone(),
-        GroupByKey::RelationshipPath { rel, column } => format!("{rel}.{column}"),
-    }
-}
-
-/// Walks a field's expression enforcing ADR-0006's cardinality rules on every
-/// `<rel>.<column>` relationship path it contains. `in_aggregate` tracks
-/// whether the current position is the sole argument of an aggregate function
-/// (the only shape the parser admits for a path under an aggregate — see the
-/// parser's OneToOne to-many handling and [`super::eval`]'s to-many arm).
-///
-/// - unknown relationship name → [`ValidationError::UnknownRelationship`];
-/// - to-one path under an aggregate →
-///   [`ValidationError::RelationshipToOneWrappedInAggregate`];
-/// - bare to-many path (not under an aggregate) →
-///   [`ValidationError::RelationshipToManyRequiresAggregate`].
-///
-/// `in_group_by_def` is whether this definition is a
-/// [`KeySpace::Aggregate`] one. In that key-space the first rule above is
-/// *inverted*, so it is skipped here: a to-one path must be aggregate-wrapped
-/// (folded over the group's source rows — see
-/// [`ValidationError::UngroupedRelationshipReference`]) rather than referenced
-/// bare, and [`validate_aggregate_field_expr`] enforces that instead. The
-/// to-many rule is unchanged either way, though in an aggregate definition
-/// [`validate_aggregate_field_expr`] rejects a to-many path first, wrapped or
-/// not.
-///
-/// The referenced column's existence and type are checked separately by
-/// [`infer_expr`], which resolves the path against `column_types`.
-fn validate_relationship_refs(
-    expr: &Expr,
-    field_name: &str,
-    relationships: &HashMap<String, ResolvedRelationship>,
-    in_group_by_def: bool,
-    in_aggregate: bool,
-) -> Result<(), ValidationError> {
-    match expr {
-        Expr::Column(_)
-        | Expr::SourceColumn { .. }
-        | Expr::NumberLiteral(_)
-        | Expr::StringLiteral(_)
-        | Expr::TypedLiteral { .. } => Ok(()),
-        Expr::RelationshipPath { rel, column } => {
-            let Some(resolved) = relationships.get(rel) else {
-                return Err(ValidationError::UnknownRelationship {
-                    field: field_name.to_string(),
-                    rel: rel.clone(),
-                });
-            };
-            match resolved.cardinality {
-                RelationshipCardinality::ToOne if in_aggregate && !in_group_by_def => {
-                    Err(ValidationError::RelationshipToOneWrappedInAggregate {
-                        field: field_name.to_string(),
-                        rel: rel.clone(),
-                        column: column.clone(),
-                    })
-                }
-                RelationshipCardinality::ToMany if !in_aggregate => {
-                    Err(ValidationError::RelationshipToManyRequiresAggregate {
-                        field: field_name.to_string(),
-                        rel: rel.clone(),
-                        column: column.clone(),
-                    })
-                }
-                _ => Ok(()),
-            }
-        }
-        Expr::BinaryOp { lhs, rhs, .. } => {
-            // A relationship path never appears directly under a binary
-            // operator as an aggregate argument, so the aggregate context does
-            // not propagate across an operator.
-            validate_relationship_refs(lhs, field_name, relationships, in_group_by_def, false)?;
-            validate_relationship_refs(rhs, field_name, relationships, in_group_by_def, false)
-        }
-        Expr::FunctionCall { name, args } => {
-            let is_aggregate = super::registry::lookup_aggregate_function(name).is_some();
-            for arg in args {
-                validate_relationship_refs(
-                    arg,
-                    field_name,
-                    relationships,
-                    in_group_by_def,
-                    is_aggregate,
-                )?;
-            }
-            Ok(())
-        }
-    }
-}
-
 /// Walks a [`KeySpace::Aggregate`] field's expression, rejecting a bare
 /// (not wrapped in `SUM`/`MIN`/`MAX`/`AVG`) reference to a source column
 /// that isn't a grouping key. `in_aggregate_call` tracks whether the current
@@ -2555,36 +1987,16 @@ fn validate_relationship_refs(
 /// reference is checked — a reference to another calculated field (already
 /// a single value per group by the time it's used) is unaffected, the same
 /// as inter-field composition in a 1-1 definition.
-///
-/// A `<rel>.<column>` relationship path (issue #94) is held to the same rule,
-/// for the same reason: a **to-one** path resolves to exactly one related
-/// value per *source* row (a `LEFT JOIN`, evaluated before the group folds),
-/// so it is accepted when — and only when — it is wrapped in an aggregate
-/// call, *or* (issue #137) it names exactly the same relationship path as one
-/// of this definition's own `GROUP BY` keys (the relationship-path twin of a
-/// bare grouping-column reference, e.g. `GROUP BY tag, post.author SELECT
-/// post.author AS author_alias, COUNT(*) AS c` — `post.author` resolves once
-/// per group, exactly like a bare `tag` reference does, so it needs no
-/// aggregate wrapper either) — and otherwise rejected as
-/// [`ValidationError::UngroupedRelationshipReference`]. A **to-many** path is
-/// rejected outright ([`ValidationError::RelationshipPathInAggregate`]):
-/// aggregating it inside a GROUP BY aggregate is a nested aggregation with no
-/// settled semantics. An *unresolvable* relationship name is passed over here
-/// so [`validate_relationship_refs`] can report the more specific
-/// [`ValidationError::UnknownRelationship`] against the same field.
 fn validate_aggregate_field_expr(
     expr: &Expr,
     field_name: &str,
-    group_by: &[GroupByKey],
+    group_by: &[String],
     source_columns: &HashMap<String, ValueType>,
-    relationships: &HashMap<String, ResolvedRelationship>,
     in_aggregate_call: bool,
 ) -> Result<(), ValidationError> {
     match expr {
         Expr::Column(name) => {
-            let is_group_key = group_by
-                .iter()
-                .any(|k| matches!(k, GroupByKey::Column(c) if c == name));
+            let is_group_key = group_by.contains(name);
             if source_columns.contains_key(name) && !is_group_key && !in_aggregate_call {
                 return Err(ValidationError::UngroupedColumnReference {
                     field: field_name.to_string(),
@@ -2596,9 +2008,7 @@ fn validate_aggregate_field_expr(
         // Issue #830: a qualified name is a source column even when a field
         // has its name, so the same rule applies without the field lookup.
         Expr::SourceColumn { column, .. } => {
-            let is_group_key = group_by
-                .iter()
-                .any(|k| matches!(k, GroupByKey::Column(c) if c == column));
+            let is_group_key = group_by.contains(column);
             if !is_group_key && !in_aggregate_call {
                 return Err(ValidationError::UngroupedColumnReference {
                     field: field_name.to_string(),
@@ -2608,39 +2018,12 @@ fn validate_aggregate_field_expr(
             Ok(())
         }
         Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::TypedLiteral { .. } => Ok(()),
-        Expr::RelationshipPath { rel, column } => {
-            let Some(resolved) = relationships.get(rel) else {
-                // Unknown name: `validate_relationship_refs` reports it.
-                return Ok(());
-            };
-            let is_group_key = group_by.iter().any(|k| {
-                matches!(k, GroupByKey::RelationshipPath { rel: r, column: c } if r == rel && c == column)
-            });
-            match resolved.cardinality {
-                RelationshipCardinality::ToMany => {
-                    Err(ValidationError::RelationshipPathInAggregate {
-                        field: field_name.to_string(),
-                        rel: rel.clone(),
-                        column: column.clone(),
-                    })
-                }
-                RelationshipCardinality::ToOne if !in_aggregate_call && !is_group_key => {
-                    Err(ValidationError::UngroupedRelationshipReference {
-                        field: field_name.to_string(),
-                        rel: rel.clone(),
-                        column: column.clone(),
-                    })
-                }
-                RelationshipCardinality::ToOne => Ok(()),
-            }
-        }
         Expr::BinaryOp { lhs, rhs, .. } => {
             validate_aggregate_field_expr(
                 lhs,
                 field_name,
                 group_by,
                 source_columns,
-                relationships,
                 in_aggregate_call,
             )?;
             validate_aggregate_field_expr(
@@ -2648,7 +2031,6 @@ fn validate_aggregate_field_expr(
                 field_name,
                 group_by,
                 source_columns,
-                relationships,
                 in_aggregate_call,
             )
         }
@@ -2660,7 +2042,6 @@ fn validate_aggregate_field_expr(
                     field_name,
                     group_by,
                     source_columns,
-                    relationships,
                     in_aggregate_call || is_aggregate_call,
                 )?;
             }
@@ -2669,21 +2050,14 @@ fn validate_aggregate_field_expr(
     }
 }
 
-/// Whether `expr` is exactly the passthrough shape [`GroupByKey`] `key`
-/// requires of a field named after its target column name (see
+/// Whether `expr` is exactly the passthrough shape `GROUP BY` key `key`
+/// requires of a field named after it (see
 /// [`ValidationError::GroupingColumnFieldMustBePassthrough`]): a bare
-/// [`Expr::Column`] of the same name for a plain grouping column, or a bare
-/// [`Expr::RelationshipPath`] naming the exact same relationship and column
-/// for a relationship-path grouping key — there is no other expression shape
+/// [`Expr::Column`] of the same name — there is no other expression shape
 /// DDL generation gives a target column of its own for that name, so
 /// anything else is rejected rather than silently dropped.
-fn expr_is_group_by_key_passthrough(expr: &Expr, key: &GroupByKey) -> bool {
-    match key {
-        GroupByKey::Column(name) => matches!(expr, Expr::Column(n) if n == name),
-        GroupByKey::RelationshipPath { rel, column } => {
-            matches!(expr, Expr::RelationshipPath { rel: r, column: c } if r == rel && c == column)
-        }
-    }
+fn expr_is_group_by_key_passthrough(expr: &Expr, key: &str) -> bool {
+    matches!(expr, Expr::Column(n) if n == key)
 }
 
 pub(super) fn collect_columns(expr: &Expr, out: &mut Vec<String>) {
@@ -2692,10 +2066,6 @@ pub(super) fn collect_columns(expr: &Expr, out: &mut Vec<String>) {
         // Always a source column, never a read of a field (issue #830).
         Expr::SourceColumn { .. } => {}
         Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::TypedLiteral { .. } => {}
-        // Not a source-column reference by name — its type is resolved from
-        // relationship metadata by `infer_expr`, and its cardinality rules by
-        // `validate_relationship_refs`, when they walk the same expression.
-        Expr::RelationshipPath { .. } => {}
         Expr::BinaryOp { lhs, rhs, .. } => {
             collect_columns(lhs, out);
             collect_columns(rhs, out);
@@ -2720,8 +2090,7 @@ fn has_aggregate_call(expr: &Expr) -> bool {
         | Expr::SourceColumn { .. }
         | Expr::NumberLiteral(_)
         | Expr::StringLiteral(_)
-        | Expr::TypedLiteral { .. }
-        | Expr::RelationshipPath { .. } => false,
+        | Expr::TypedLiteral { .. } => false,
     }
 }
 
@@ -2801,8 +2170,7 @@ pub(crate) fn collect_reads(
         Expr::SourceColumn { .. }
         | Expr::NumberLiteral(_)
         | Expr::StringLiteral(_)
-        | Expr::TypedLiteral { .. }
-        | Expr::RelationshipPath { .. } => {}
+        | Expr::TypedLiteral { .. } => {}
         Expr::BinaryOp { lhs, rhs, .. } => {
             collect_reads(lhs, aggregates, in_aggregate_arg, fields, aggregate_args);
             collect_reads(rhs, aggregates, in_aggregate_arg, fields, aggregate_args);
@@ -2841,12 +2209,12 @@ pub(crate) fn reject_unsupported_group_by_key_type(
         // leading zeros, no `+`, no whitespace), so it round-trips through
         // the still-text-keyed group-key path byte-for-byte — the same
         // property that already puts `smallint`/`integer`/`bigint` on
-        // `catalog::TEXT_STABLE_JOIN_KEY_TYPES`.
+        // `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES`.
         //
         // `Numeric` is admitted here as it always has been, and that is
         // knowingly weaker: `1.0` and `1.00` are equal to Postgres but
         // distinct under `::text` matching, which is exactly why `numeric`
-        // is *rejected* as a relationship join key and as a primary key
+        // is *rejected* as a `JOIN` key and as a primary key
         // (#107). Tightening the `GROUP BY` gate to match belongs with the
         // typed key index (#110), not here — see the note on issue #111.
         ValueType::Integer(_) | ValueType::Numeric | ValueType::Text | ValueType::Uuid => Ok(()),
@@ -2863,7 +2231,7 @@ pub(crate) fn reject_unsupported_group_by_key_type(
         // trigger's `format('%s', col)` writes into the ring — renders
         // `'t'`/`'f'`), so a `GROUP BY` key genuinely does have two
         // possible spellings depending on which code path produced it. See
-        // `catalog::TEXT_STABLE_JOIN_KEY_TYPES`'s doc comment for the live
+        // `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES`'s doc comment for the live
         // `pg_cast` evidence and why that divergence is exactly why
         // `boolean` is *not* on that allowlist (the join/primary-key role
         // really does raw-text `{col}::text = $1` matching in places).
@@ -2893,7 +2261,7 @@ pub(crate) fn reject_unsupported_group_by_key_type(
         // Admitting floats here is #110's typed key index to grant, by
         // comparing decoded values through `crate::float::compare`; until
         // then, rejecting is the honest answer and `numeric` is the
-        // steer-to. See `catalog::TEXT_STABLE_JOIN_KEY_TYPES`.
+        // steer-to. See `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES`.
         ValueType::Float(_) => Err(ValidationError::UnsupportedGroupByKeyType {
             column: column.to_string(),
             value_type,
@@ -2908,7 +2276,7 @@ pub(crate) fn reject_unsupported_group_by_key_type(
         // a property of the rendering, not the operator set" reasoning:
         // `byteaout` under the pinned `bytea_output = 'hex'` is a bijection
         // on every byte string, with no session-GUC dependence at all (see
-        // `catalog::TEXT_STABLE_JOIN_KEY_TYPES`'s doc comment for the live
+        // `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES`'s doc comment for the live
         // evidence). Unlike the temporal families it needs no per-value
         // predicate here — every `bytea` value clears the bar, not just a
         // subset — so it is a plain admit rather than a call into a sibling
@@ -2918,8 +2286,8 @@ pub(crate) fn reject_unsupported_group_by_key_type(
         // `timestamptz` join `oid` on the same grounds, gated by
         // `crate::temporal`'s own per-family verdict rather than by a list
         // repeated here — see that module's doc comment for the live
-        // evidence, and `catalog::TEXT_STABLE_JOIN_KEY_TYPES` for the
-        // relationship/PK half of the same decision. `timestamp` joined this
+        // evidence, and `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES` for the
+        // join-key/PK half of the same decision. `timestamp` joined this
         // arm for real once issue #248 fixed its render-consistency defect
         // (it used to fall through to the reject arm below despite being
         // named here); `timestamptz` needed both #248's fix *and* #246's —
@@ -2934,13 +2302,13 @@ pub(crate) fn reject_unsupported_group_by_key_type(
         // one Postgres group in two, exactly as a float `-0`/`0` key would.
         ValueType::Other(pg_type) if crate::temporal::is_text_stable(pg_type) => Ok(()),
         // Issue #116: `cidr`/`macaddr`/`macaddr8` join `oid`/`bytea` above —
-        // each is on `catalog::TEXT_STABLE_JOIN_KEY_TYPES` (see that
+        // each is on `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES` (see that
         // constant's doc comment for the live `pg_cast`/renderer evidence),
         // and unlike the temporal families every value of each clears the
         // bar, not just a subset, so a plain admit is enough here too.
         ValueType::Other(PgType::Cidr | PgType::MacAddr | PgType::MacAddr8) => Ok(()),
         // `inet` is admitted here despite being deliberately *absent* from
-        // `catalog::TEXT_STABLE_JOIN_KEY_TYPES` — the same split issue #119
+        // `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES` — the same split issue #119
         // gave `boolean`, for the same mechanical reason.
         //
         // `inet_out` (what a capture trigger's `format('%s', col)` writes
@@ -2960,7 +2328,7 @@ pub(crate) fn reject_unsupported_group_by_key_type(
         // than every arm above it — it isn't about `::text`-vs-native-`=`
         // rendering agreement at all. `bit`/`varbit` have no `pg_cast`
         // override the way `boolean` does (verified live; see
-        // `catalog::TEXT_STABLE_JOIN_KEY_TYPES`'s doc comment), so raw-text
+        // `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES`'s doc comment), so raw-text
         // matching was never the concern.
         //
         // The hazard here is purely a DDL one:
@@ -2988,8 +2356,8 @@ pub(crate) fn reject_unsupported_group_by_key_type(
         // bits), so `pg_type_name(Other(VarBit))` is exactly as safe a
         // brand-new-column type here as bare `numeric`/`text` already are.
         // Fixed-length `bit` is *not* refused for any text-rendering
-        // reason — it is perfectly safe as a relationship join key or a 1-1
-        // primary key (`catalog::TEXT_STABLE_JOIN_KEY_TYPES`), neither of
+        // reason — it is perfectly safe as a `JOIN` key or a 1-1
+        // primary key (`join_key_types::TEXT_STABLE_JOIN_KEY_TYPES`), neither of
         // which ever asks a bare `ValueType` to conjure a new column: a
         // join key only ever compares against an already-existing column,
         // and a 1-1 primary key copies the source's own *concrete*
@@ -3022,9 +2390,9 @@ pub(crate) fn reject_unsupported_group_by_key_type(
         // `defs_enum.rs`) renders each value as its own label text
         // verbatim; an enum value's identity *is* that label (a `pg_enum`
         // row keyed by OID), so there is no deeper representation for two
-        // distinct values to collide under — see `catalog::is_enum_type_name`'s
+        // distinct values to collide under — see `join_key_types::is_enum_type_name`'s
         // own doc comment for the fuller version of this same reasoning
-        // (the relationship/PK key roles' dynamic counterpart of this
+        // (the join-key/PK key roles' dynamic counterpart of this
         // static gate).
         //
         // DDL typmod: unlike fixed-length `bit`'s `bit(1)` narrowing
@@ -3048,8 +2416,8 @@ pub(crate) fn reject_unsupported_group_by_key_type(
 /// [`ValidationError::UnsupportedGroupByKeyType`]'s `Display` cannot drift
 /// out of step with the allowlist it describes the way it did before issue
 /// #264 — the exact hand-maintained-second-copy failure mode issue #111
-/// already fixed for [`ValidationError::RelationshipUnsupportedJoinKeyType`]
-/// via [`super::catalog::supported_join_key_types`].
+/// already fixed for the join-key allowlist via
+/// [`super::join_key_types::supported_join_key_types`].
 ///
 /// It had drifted: the message was missing `timestamp` (admitted since
 /// #248) and, after this week's #246/#254/#256/#258/#260/#261/#262 merges,
@@ -3064,11 +2432,11 @@ pub(crate) fn supported_group_by_key_types() -> String {
 /// hand-written string.
 ///
 /// This is **not** the same set as
-/// [`super::catalog::TEXT_STABLE_JOIN_KEY_TYPES`] — the two gates are
+/// [`super::join_key_types::TEXT_STABLE_JOIN_KEY_TYPES`] — the two gates are
 /// checked against each other, deliberately, not assumed identical:
 ///
 /// * `numeric` and `boolean` are admitted *here* but refused as a
-///   relationship/primary-key join key (`numeric`: #107, its own text
+///   `JOIN`/primary key (`numeric`: #107, its own text
 ///   rendering isn't a `1.0`/`1.00` bijection; `boolean`: #119, a second
 ///   `pg_cast`-registered `::text` renderer disagrees with `boolout`). Both
 ///   are safe for this role for reasons specific to it — `boolean`'s
@@ -3112,7 +2480,6 @@ const GROUP_BY_KEY_TYPE_NAMES: &[&str] = &[
 pub(crate) fn infer_field_types(
     def: &TransformDef,
     source_columns: &HashMap<String, ValueType>,
-    relationships: &HashMap<String, ResolvedRelationship>,
 ) -> Result<HashMap<String, ValueType>, ValidationError> {
     let fields_by_name: HashMap<&str, &super::ast::FieldDef> =
         def.fields.iter().map(|f| (f.name.as_str(), f)).collect();
@@ -3124,7 +2491,6 @@ pub(crate) fn infer_field_types(
             let t = infer_field(
                 field,
                 source_columns,
-                relationships,
                 &fields_by_name,
                 &mut types,
                 &mut in_progress,
@@ -3142,13 +2508,11 @@ pub(crate) fn infer_field_types(
 pub(crate) fn infer_expr_type(
     expr: &Expr,
     source_columns: &HashMap<String, ValueType>,
-    relationships: &HashMap<String, ResolvedRelationship>,
 ) -> Result<ValueType, ValidationError> {
     infer_expr(
         expr,
         "",
         source_columns,
-        relationships,
         &HashMap::new(),
         &mut HashMap::new(),
         &mut HashSet::new(),
@@ -3158,7 +2522,6 @@ pub(crate) fn infer_expr_type(
 fn infer_field(
     field: &super::ast::FieldDef,
     source_columns: &HashMap<String, ValueType>,
-    relationships: &HashMap<String, ResolvedRelationship>,
     fields_by_name: &HashMap<&str, &super::ast::FieldDef>,
     types: &mut HashMap<String, ValueType>,
     in_progress: &mut HashSet<String>,
@@ -3175,7 +2538,6 @@ fn infer_field(
         &field.expr,
         &field.name,
         source_columns,
-        relationships,
         fields_by_name,
         types,
         in_progress,
@@ -3190,7 +2552,6 @@ fn infer_expr(
     expr: &Expr,
     field_name: &str,
     source_columns: &HashMap<String, ValueType>,
-    relationships: &HashMap<String, ResolvedRelationship>,
     fields_by_name: &HashMap<&str, &super::ast::FieldDef>,
     types: &mut HashMap<String, ValueType>,
     in_progress: &mut HashSet<String>,
@@ -3206,7 +2567,6 @@ fn infer_expr(
                 return infer_field(
                     calc_field,
                     source_columns,
-                    relationships,
                     fields_by_name,
                     types,
                     in_progress,
@@ -3255,32 +2615,11 @@ fn infer_expr(
             })?;
             Ok(spec.value_type)
         }
-        Expr::RelationshipPath { rel, column } => {
-            // A `<rel>.<column>` enrichment's type is the *to-side* column's
-            // type, resolved by the caller into `relationships`. The
-            // relationship's existence and this path's cardinality were
-            // already checked by `validate_relationship_refs`; here only the
-            // referenced column's existence (hence its type) remains.
-            let resolved =
-                relationships
-                    .get(rel)
-                    .ok_or_else(|| ValidationError::UnknownRelationship {
-                        field: field_name.to_string(),
-                        rel: rel.clone(),
-                    })?;
-            resolved.column_types.get(column).copied().ok_or_else(|| {
-                ValidationError::UnknownRelationshipColumn {
-                    table: resolved.to_table.clone(),
-                    column: column.clone(),
-                }
-            })
-        }
         Expr::BinaryOp { op, lhs, rhs } => {
             let lhs_t = infer_expr(
                 lhs,
                 field_name,
                 source_columns,
-                relationships,
                 fields_by_name,
                 types,
                 in_progress,
@@ -3289,7 +2628,6 @@ fn infer_expr(
                 rhs,
                 field_name,
                 source_columns,
-                relationships,
                 fields_by_name,
                 types,
                 in_progress,
@@ -3327,7 +2665,6 @@ fn infer_expr(
                     arg,
                     field_name,
                     source_columns,
-                    relationships,
                     fields_by_name,
                     types,
                     in_progress,
@@ -3388,7 +2725,6 @@ fn infer_expr(
                         arg,
                         field_name,
                         source_columns,
-                        relationships,
                         fields_by_name,
                         types,
                         in_progress,
@@ -3406,8 +2742,8 @@ fn infer_expr(
             // would `zip` a real one-element `args` against an empty
             // `arg_types` and silently produce *zero* iterations — meaning
             // `COUNT(<expr>)`'s argument would never be recursively
-            // validated at all (an unresolved column, unknown relationship,
-            // etc. would sail through unchecked). Postgres's own `count(x)`
+            // validated at all (an unresolved column etc. would sail
+            // through unchecked). Postgres's own `count(x)`
             // accepts any argument type with no restriction, so there is
             // nothing to admit here beyond "the argument itself resolves" —
             // unlike `SUM`/`MIN`/`MAX`/`AVG`, whose argument type gates
@@ -3418,7 +2754,6 @@ fn infer_expr(
                         arg,
                         field_name,
                         source_columns,
-                        relationships,
                         fields_by_name,
                         types,
                         in_progress,
@@ -3432,7 +2767,6 @@ fn infer_expr(
                     arg,
                     field_name,
                     source_columns,
-                    relationships,
                     fields_by_name,
                     types,
                     in_progress,
@@ -3495,20 +2829,6 @@ fn infer_expr(
                     field: field_name.to_string(),
                 });
             }
-            if matches!(name.as_str(), "ARRAY_AGG" | "STRING_AGG")
-                && let Some(Expr::RelationshipPath { rel, .. }) = args.first()
-                && relationships
-                    .get(rel)
-                    .is_some_and(|r| r.cardinality == RelationshipCardinality::ToMany)
-            {
-                return Err(
-                    ValidationError::ListAggregateOverToManyRelationshipUnsupported {
-                        field: field_name.to_string(),
-                        function: name.clone(),
-                        rel: rel.clone(),
-                    },
-                );
-            }
             if name == "REGEXP_COUNT"
                 && let Some(pattern_arg) = args.get(1)
             {
@@ -3518,49 +2838,6 @@ fn infer_expr(
                 && let Some(&arg_t) = arg_types.first()
                 && let Some(result) = super::registry::aggregate_result_type(name, arg_t)
             {
-                // Issue #117: `MIN`/`MAX(enum)` is refused specifically when
-                // it wraps a *to-many* relationship path — see
-                // `ValidationError::EnumAggregateOverToManyRelationshipUnsupported`'s
-                // own doc comment for the full reasoning (no live-SQL
-                // fallback exists for this one shape, unlike a
-                // `KeySpace::Aggregate` field's own `MIN`/`MAX`). A to-*one*
-                // path resolves to a single value per row — never a
-                // multi-row fold — so it is unaffected, matched by
-                // `RelationshipCardinality::ToMany` specifically rather than
-                // "any `RelationshipPath` argument".
-                //
-                // Issue #120: `MIN`/`MAX(text)` wrapping a to-many path hits
-                // the identical structural gap, for the identical reason —
-                // see `ValidationError::TextAggregateOverToManyRelationshipUnsupported`'s
-                // own doc comment. `uuid` never reaches this match arm at
-                // all (checked live, not assumed): Postgres has no
-                // `min(uuid)`/`max(uuid)` aggregate whatsoever, so
-                // `registry::aggregate_result_type` already returned `None`
-                // for it above, well before this block — the same "opclass
-                // but no aggregate" shape #114/#116 found for
-                // `bytea`/`macaddr`.
-                if matches!(name.as_str(), "MIN" | "MAX")
-                    && matches!(result, ValueType::Other(PgType::Enum(_)) | ValueType::Text)
-                    && let Expr::RelationshipPath { rel, .. } = &args[0]
-                    && relationships
-                        .get(rel)
-                        .is_some_and(|r| r.cardinality == RelationshipCardinality::ToMany)
-                {
-                    return Err(match result {
-                        ValueType::Text => {
-                            ValidationError::TextAggregateOverToManyRelationshipUnsupported {
-                                field: field_name.to_string(),
-                                function: name.clone(),
-                                rel: rel.clone(),
-                            }
-                        }
-                        _ => ValidationError::EnumAggregateOverToManyRelationshipUnsupported {
-                            field: field_name.to_string(),
-                            function: name.clone(),
-                            rel: rel.clone(),
-                        },
-                    });
-                }
                 return Ok(result);
             }
             Ok(spec.return_type)
@@ -3738,7 +3015,7 @@ mod tests {
             },
         ]);
         let source_columns = numeric_columns(&["price"]);
-        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
+        assert_eq!(validate(&d, &source_columns), Ok(()));
     }
 
     #[test]
@@ -3747,7 +3024,7 @@ mod tests {
             name: "x".to_string(),
             expr: col("mystery"),
         }]);
-        let err = validate(&d, &HashMap::new(), &HashMap::new()).unwrap_err();
+        let err = validate(&d, &HashMap::new()).unwrap_err();
         assert_eq!(
             err,
             ValidationError::UnresolvedColumn {
@@ -3771,7 +3048,7 @@ mod tests {
                 expr: col("x"),
             },
         ]);
-        let err = validate(&d, &HashMap::new(), &HashMap::new()).unwrap_err();
+        let err = validate(&d, &HashMap::new()).unwrap_err();
         match err {
             ValidationError::Cycle { .. } => {}
             other => panic!("expected Cycle, got {other:?}"),
@@ -3790,7 +3067,7 @@ mod tests {
             name: "x".to_string(),
             expr: col("x"),
         }]);
-        let err = validate(&d, &HashMap::new(), &HashMap::new()).unwrap_err();
+        let err = validate(&d, &HashMap::new()).unwrap_err();
         assert_eq!(
             err,
             ValidationError::UnresolvedColumn {
@@ -3825,7 +3102,7 @@ mod tests {
             },
         ]);
         let source_columns = numeric_columns(&["c"]);
-        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
+        assert_eq!(validate(&d, &source_columns), Ok(()));
     }
 
     #[test]
@@ -3844,7 +3121,7 @@ mod tests {
             },
         }]);
         let source_columns = numeric_columns(&["word_count", "total_posted_words"]);
-        let err = validate(&d, &source_columns, &HashMap::new()).unwrap_err();
+        let err = validate(&d, &source_columns).unwrap_err();
         assert_eq!(
             err,
             ValidationError::CalculatedFieldShadowsSourceColumn {
@@ -3863,7 +3140,7 @@ mod tests {
             expr: col("price"),
         }]);
         let source_columns = numeric_columns(&["price"]);
-        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
+        assert_eq!(validate(&d, &source_columns), Ok(()));
     }
 
     #[test]
@@ -3874,7 +3151,7 @@ mod tests {
         }]);
         d.target = "s".to_string();
         d.source = "s".to_string();
-        let err = validate(&d, &HashMap::new(), &HashMap::new()).unwrap_err();
+        let err = validate(&d, &HashMap::new()).unwrap_err();
         assert_eq!(
             err,
             ValidationError::TargetEqualsSource {
@@ -3895,7 +3172,7 @@ mod tests {
                 expr: Expr::NumberLiteral("2".to_string()),
             },
         ]);
-        let err = validate(&d, &HashMap::new(), &HashMap::new()).unwrap_err();
+        let err = validate(&d, &HashMap::new()).unwrap_err();
         assert_eq!(
             err,
             ValidationError::DuplicateFieldName {
@@ -3911,7 +3188,7 @@ mod tests {
             expr: col("text_col"),
         }]);
         let source_columns = HashMap::from([("text_col".to_string(), ValueType::Text)]);
-        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
+        assert_eq!(validate(&d, &source_columns), Ok(()));
     }
 
     #[test]
@@ -3921,7 +3198,7 @@ mod tests {
             expr: col("author"),
         }]);
         let source_columns = HashMap::from([("author".to_string(), ValueType::Uuid)]);
-        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
+        assert_eq!(validate(&d, &source_columns), Ok(()));
     }
 
     #[test]
@@ -3946,7 +3223,7 @@ mod tests {
             ("author".to_string(), ValueType::Uuid),
             ("word_count".to_string(), ValueType::Numeric),
         ]);
-        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
+        assert_eq!(validate(&d, &source_columns), Ok(()));
     }
 
     /// Issue #108 review: a `GROUP BY` key is matched by its `::text`
@@ -3960,7 +3237,7 @@ mod tests {
     /// Nothing could reach this before #108 (an `Other`-typed column never
     /// made it into `source_columns` at all), so this only narrows that
     /// issue's newly opened surface — the two other key roles already gate
-    /// on `catalog::is_text_stable_join_key_type`.
+    /// on `join_key_types::is_text_stable_join_key_type`.
     #[test]
     fn an_other_typed_column_is_rejected_as_an_aggregate_group_by_key() {
         // Issue #118: `PgType::Bit` (fixed-length) is deliberately in this
@@ -4002,7 +3279,7 @@ mod tests {
                 ("word_count".to_string(), ValueType::Numeric),
             ]);
             assert_eq!(
-                validate(&d, &source_columns, &HashMap::new()),
+                validate(&d, &source_columns),
                 Err(ValidationError::UnsupportedGroupByKeyType {
                     column: "k".to_string(),
                     value_type: ValueType::Other(pg_type),
@@ -4136,7 +3413,7 @@ mod tests {
         }]);
         let source_columns =
             HashMap::from([("payload".to_string(), ValueType::Other(PgType::Jsonb))]);
-        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
+        assert_eq!(validate(&d, &source_columns), Ok(()));
     }
 
     #[test]
@@ -4146,7 +3423,7 @@ mod tests {
             expr: col("flag"),
         }]);
         let source_columns = HashMap::from([("flag".to_string(), ValueType::Boolean)]);
-        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
+        assert_eq!(validate(&d, &source_columns), Ok(()));
     }
 
     #[test]
@@ -4160,7 +3437,7 @@ mod tests {
             },
         }]);
         let source_columns = HashMap::from([("text_col".to_string(), ValueType::Text)]);
-        let err = validate(&d, &source_columns, &HashMap::new()).unwrap_err();
+        let err = validate(&d, &source_columns).unwrap_err();
         assert_eq!(
             err,
             ValidationError::TypeMismatch {
@@ -4177,7 +3454,7 @@ mod tests {
             name: "out".to_string(),
             expr: Expr::StringLiteral("hi".to_string()),
         }]);
-        assert_eq!(validate(&d, &HashMap::new(), &HashMap::new()), Ok(()));
+        assert_eq!(validate(&d, &HashMap::new()), Ok(()));
     }
 
     #[test]
@@ -4190,7 +3467,7 @@ mod tests {
             },
         }]);
         let source_columns = HashMap::from([("text_col".to_string(), ValueType::Text)]);
-        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
+        assert_eq!(validate(&d, &source_columns), Ok(()));
     }
 
     #[test]
@@ -4203,7 +3480,7 @@ mod tests {
             },
         }]);
         let source_columns = HashMap::from([("number_col".to_string(), ValueType::Numeric)]);
-        let err = validate(&d, &source_columns, &HashMap::new()).unwrap_err();
+        let err = validate(&d, &source_columns).unwrap_err();
         assert_eq!(
             err,
             ValidationError::FunctionArgTypeMismatch {
@@ -4228,8 +3505,8 @@ mod tests {
             },
         }]);
         let source_columns = HashMap::from([("text_col".to_string(), ValueType::Text)]);
-        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
-        let types = infer_field_types(&d, &source_columns, &HashMap::new()).unwrap();
+        assert_eq!(validate(&d, &source_columns), Ok(()));
+        let types = infer_field_types(&d, &source_columns).unwrap();
         assert_eq!(types["out"], ValueType::Text);
     }
 
@@ -4250,7 +3527,7 @@ mod tests {
             ("number_col".to_string(), ValueType::Numeric),
             ("text_col".to_string(), ValueType::Text),
         ]);
-        let err = validate(&d, &source_columns, &HashMap::new()).unwrap_err();
+        let err = validate(&d, &source_columns).unwrap_err();
         assert_eq!(
             err,
             ValidationError::FunctionArgTypeMismatch {
@@ -4280,7 +3557,7 @@ mod tests {
             },
         }]);
         let source_columns = numeric_columns(&["number_col"]);
-        let err = validate(&d, &source_columns, &HashMap::new()).unwrap_err();
+        let err = validate(&d, &source_columns).unwrap_err();
         assert_eq!(
             err,
             ValidationError::FunctionArgTypeMismatch {
@@ -4300,7 +3577,7 @@ mod tests {
                 args: vec![col("number_col"), Expr::NumberLiteral("0".to_string())],
             },
         }]);
-        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
+        assert_eq!(validate(&d, &source_columns), Ok(()));
     }
 
     #[test]
@@ -4314,7 +3591,7 @@ mod tests {
             },
         }]);
         let source_columns = numeric_columns(&["number_col"]);
-        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
+        assert_eq!(validate(&d, &source_columns), Ok(()));
     }
 
     #[test]
@@ -4328,7 +3605,7 @@ mod tests {
             },
         }]);
         let source_columns = HashMap::from([("text_col".to_string(), ValueType::Text)]);
-        let err = validate(&d, &source_columns, &HashMap::new()).unwrap_err();
+        let err = validate(&d, &source_columns).unwrap_err();
         assert_eq!(
             err,
             ValidationError::TypeMismatch {
@@ -4353,8 +3630,8 @@ mod tests {
             },
         }]);
         let source_columns = HashMap::from([("name".to_string(), ValueType::Text)]);
-        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
-        let types = infer_field_types(&d, &source_columns, &HashMap::new()).unwrap();
+        assert_eq!(validate(&d, &source_columns), Ok(()));
+        let types = infer_field_types(&d, &source_columns).unwrap();
         assert_eq!(types["has_foo"], ValueType::Boolean);
     }
 
@@ -4372,7 +3649,7 @@ mod tests {
             },
         }]);
         let source_columns = numeric_columns(&["number_col"]);
-        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
+        assert_eq!(validate(&d, &source_columns), Ok(()));
     }
 
     #[test]
@@ -4385,7 +3662,7 @@ mod tests {
             },
         }]);
         let source_columns = HashMap::from([("text_col".to_string(), ValueType::Text)]);
-        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
+        assert_eq!(validate(&d, &source_columns), Ok(()));
     }
 
     #[test]
@@ -4401,7 +3678,7 @@ mod tests {
             ("text_col".to_string(), ValueType::Text),
             ("pattern_col".to_string(), ValueType::Text),
         ]);
-        let err = validate(&d, &source_columns, &HashMap::new()).unwrap_err();
+        let err = validate(&d, &source_columns).unwrap_err();
         assert_eq!(
             err,
             ValidationError::NonLiteralRegexPattern {
@@ -4411,16 +3688,10 @@ mod tests {
     }
 
     fn aggregate_def(group_by: &[&str], fields: Vec<FieldDef>) -> TransformDef {
-        aggregate_def_with_keys(
-            group_by
-                .iter()
-                .map(|s| GroupByKey::Column(s.to_string()))
-                .collect(),
-            fields,
-        )
+        aggregate_def_with_keys(group_by.iter().map(|s| s.to_string()).collect(), fields)
     }
 
-    fn aggregate_def_with_keys(group_by: Vec<GroupByKey>, fields: Vec<FieldDef>) -> TransformDef {
+    fn aggregate_def_with_keys(group_by: Vec<String>, fields: Vec<FieldDef>) -> TransformDef {
         TransformDef {
             target: "t".to_string(),
             source: "s".to_string(),
@@ -4459,163 +3730,13 @@ mod tests {
             ],
         );
         let source_columns = numeric_columns(&["order_id", "amount"]);
-        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
-    }
-
-    #[test]
-    fn a_to_many_relationship_path_in_an_aggregate_definition_is_rejected() {
-        // A *to-many* path inside a GROUP BY (aggregate) definition is a
-        // nested aggregation — an aggregate over related rows, itself folded
-        // over the group's source rows — with no settled semantics, so it is
-        // rejected even though the path is aggregate-wrapped (which is what
-        // ADR-0006's per-field cardinality rule asks of a to-many path). Only
-        // the *to-one* case was opened up by issue #94; see
-        // `a_to_one_relationship_path_aggregated_in_a_group_by_is_accepted`.
-        let d = aggregate_def(
-            &["order_id"],
-            vec![
-                FieldDef {
-                    name: "order_id".to_string(),
-                    expr: col("order_id"),
-                },
-                FieldDef {
-                    name: "total_words".to_string(),
-                    expr: Expr::FunctionCall {
-                        name: "SUM".to_string(),
-                        args: vec![Expr::RelationshipPath {
-                            rel: "comments".to_string(),
-                            column: "word_count".to_string(),
-                        }],
-                    },
-                },
-            ],
-        );
-        let source_columns = numeric_columns(&["order_id"]);
-        let relationships = HashMap::from([(
-            "comments".to_string(),
-            ResolvedRelationship {
-                cardinality: RelationshipCardinality::ToMany,
-                to_table: "comments".to_string(),
-                to_col: "order_id".to_string(),
-                from_col: String::new(),
-                qualified_to_table: "comments".to_string(),
-                column_types: HashMap::from([("word_count".to_string(), ValueType::Numeric)]),
-            },
-        )]);
-        let err = validate(&d, &source_columns, &relationships).unwrap_err();
-        assert_eq!(
-            err,
-            ValidationError::RelationshipPathInAggregate {
-                field: "total_words".to_string(),
-                rel: "comments".to_string(),
-                column: "word_count".to_string(),
-            }
-        );
-    }
-
-    /// Issue #117: a `KeySpace::OneToOne` field's `MIN`/`MAX` over an
-    /// enum-typed column reached through a **to-many** relationship path is
-    /// refused, even though the identical shape over a `Numeric` column
-    /// (`a_to_many_relationship_path_in_an_aggregate_definition_is_rejected`'s
-    /// sibling case, minus the `KeySpace::Aggregate`-only
-    /// `RelationshipPathInAggregate` rule that doesn't apply to a plain 1-1
-    /// definition at all) is perfectly valid issue #29 grammar. See
-    /// `ValidationError::EnumAggregateOverToManyRelationshipUnsupported`'s
-    /// own doc comment for why: this specific combination folds through the
-    /// pure, DB-less evaluator with no live-Postgres fallback, and an
-    /// enum's creation-order comparison cannot be answered without one.
-    #[test]
-    fn min_max_enum_over_a_to_many_relationship_is_refused() {
-        let priority = ValueType::Other(PgType::Enum("enum:public.priority_enum"));
-        let d = def(vec![FieldDef {
-            name: "worst".to_string(),
-            expr: Expr::FunctionCall {
-                name: "MAX".to_string(),
-                args: vec![Expr::RelationshipPath {
-                    rel: "items".to_string(),
-                    column: "priority".to_string(),
-                }],
-            },
-        }]);
-        let source_columns = HashMap::new();
-        let relationships = HashMap::from([(
-            "items".to_string(),
-            ResolvedRelationship {
-                cardinality: RelationshipCardinality::ToMany,
-                to_table: "items".to_string(),
-                to_col: "order_id".to_string(),
-                from_col: String::new(),
-                qualified_to_table: "items".to_string(),
-                column_types: HashMap::from([("priority".to_string(), priority)]),
-            },
-        )]);
-        let err = validate(&d, &source_columns, &relationships).unwrap_err();
-        assert_eq!(
-            err,
-            ValidationError::EnumAggregateOverToManyRelationshipUnsupported {
-                field: "worst".to_string(),
-                function: "MAX".to_string(),
-                rel: "items".to_string(),
-            }
-        );
-    }
-
-    /// The identical shape over a to-*one* relationship, inside a
-    /// `KeySpace::Aggregate` (GROUP BY) definition — issue #94's headline
-    /// shape (`a_to_one_relationship_path_aggregated_in_a_group_by_is_accepted`),
-    /// now with an enum-typed column — is unaffected by this issue's new
-    /// guard: it resolves to exactly one related value per source row,
-    /// never a multi-row fold, so there is no ordering question the
-    /// evaluator needs to answer at all. (A `KeySpace::OneToOne` definition
-    /// has no equivalent shape to test here: ADR-0006 never allows a to-one
-    /// path to be aggregate-wrapped there at all —
-    /// `ValidationError::RelationshipToOneWrappedInAggregate` — regardless
-    /// of this issue.)
-    #[test]
-    fn min_max_enum_over_a_to_one_relationship_in_a_group_by_is_accepted() {
-        let priority = ValueType::Other(PgType::Enum("enum:public.priority_enum"));
-        let d = aggregate_def(
-            &["tag"],
-            vec![
-                FieldDef {
-                    name: "tag".to_string(),
-                    expr: col("tag"),
-                },
-                FieldDef {
-                    name: "worst".to_string(),
-                    expr: Expr::FunctionCall {
-                        name: "MAX".to_string(),
-                        args: vec![Expr::RelationshipPath {
-                            rel: "assignee".to_string(),
-                            column: "priority".to_string(),
-                        }],
-                    },
-                },
-            ],
-        );
-        let source_columns = numeric_columns(&["tag", "assignee"]);
-        let relationships = HashMap::from([(
-            "assignee".to_string(),
-            ResolvedRelationship {
-                cardinality: RelationshipCardinality::ToOne,
-                to_table: "assignees".to_string(),
-                to_col: "id".to_string(),
-                from_col: String::new(),
-                qualified_to_table: "assignees".to_string(),
-                column_types: HashMap::from([("priority".to_string(), priority)]),
-            },
-        )]);
-        assert_eq!(validate(&d, &source_columns, &relationships), Ok(()));
+        assert_eq!(validate(&d, &source_columns), Ok(()));
     }
 
     /// A plain `KeySpace::Aggregate` field's own `MIN`/`MAX(<enum column>)`
-    /// — no relationship at all — is unaffected by this issue's new guard,
-    /// which only ever fires for a *to-many relationship path* argument.
-    /// This is the shape that is always
+    /// validates. This is the shape that is always
     /// [`super::invertibility::Invertibility::RecomputeOnly`] and therefore
-    /// always resolved by a live server-side `min()`/`max()` push-down, per
-    /// `ValidationError::EnumAggregateOverToManyRelationshipUnsupported`'s
-    /// own doc comment.
+    /// always resolved by a live server-side `min()`/`max()` push-down.
     #[test]
     fn min_max_enum_over_a_plain_group_by_column_is_accepted() {
         let d = aggregate_def(
@@ -4641,97 +3762,11 @@ mod tests {
                 ValueType::Other(PgType::Enum("enum:public.priority_enum")),
             ),
         ]);
-        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
+        assert_eq!(validate(&d, &source_columns), Ok(()));
     }
 
-    /// Issue #120's `text` twin of `min_max_enum_over_a_to_many_relationship_is_refused`
-    /// — see `ValidationError::TextAggregateOverToManyRelationshipUnsupported`'s
-    /// own doc comment for why `text`'s collation-dependent ordering hits the
-    /// identical structural gap enum's schema-dependent ordering does.
-    #[test]
-    fn min_max_text_over_a_to_many_relationship_is_refused() {
-        let d = def(vec![FieldDef {
-            name: "worst".to_string(),
-            expr: Expr::FunctionCall {
-                name: "MAX".to_string(),
-                args: vec![Expr::RelationshipPath {
-                    rel: "items".to_string(),
-                    column: "label".to_string(),
-                }],
-            },
-        }]);
-        let source_columns = HashMap::new();
-        let relationships = HashMap::from([(
-            "items".to_string(),
-            ResolvedRelationship {
-                cardinality: RelationshipCardinality::ToMany,
-                to_table: "items".to_string(),
-                to_col: "order_id".to_string(),
-                from_col: String::new(),
-                qualified_to_table: "items".to_string(),
-                column_types: HashMap::from([("label".to_string(), ValueType::Text)]),
-            },
-        )]);
-        let err = validate(&d, &source_columns, &relationships).unwrap_err();
-        assert_eq!(
-            err,
-            ValidationError::TextAggregateOverToManyRelationshipUnsupported {
-                field: "worst".to_string(),
-                function: "MAX".to_string(),
-                rel: "items".to_string(),
-            }
-        );
-    }
-
-    /// Issue #293: `ARRAY_AGG`/`STRING_AGG` over a to-many relationship path
-    /// are refused; the to-many fold has no arm for them.
-    #[test]
-    fn list_aggregates_over_a_to_many_relationship_are_refused() {
-        let path = Expr::RelationshipPath {
-            rel: "items".to_string(),
-            column: "label".to_string(),
-        };
-        let relationships = HashMap::from([(
-            "items".to_string(),
-            ResolvedRelationship {
-                cardinality: RelationshipCardinality::ToMany,
-                to_table: "items".to_string(),
-                to_col: "order_id".to_string(),
-                from_col: String::new(),
-                qualified_to_table: "items".to_string(),
-                column_types: HashMap::from([("label".to_string(), ValueType::Text)]),
-            },
-        )]);
-        for (function, args) in [
-            ("ARRAY_AGG", vec![path.clone()]),
-            (
-                "STRING_AGG",
-                vec![path.clone(), Expr::StringLiteral(",".to_string())],
-            ),
-        ] {
-            let d = def(vec![FieldDef {
-                name: "labels".to_string(),
-                expr: Expr::FunctionCall {
-                    name: function.to_string(),
-                    args,
-                },
-            }]);
-            assert_eq!(
-                validate(&d, &HashMap::new(), &relationships),
-                Err(
-                    ValidationError::ListAggregateOverToManyRelationshipUnsupported {
-                        field: "labels".to_string(),
-                        function: function.to_string(),
-                        rel: "items".to_string(),
-                    }
-                ),
-                "{function}"
-            );
-        }
-    }
-
-    /// A plain `KeySpace::Aggregate` field's own `MIN`/`MAX(<text column>)` —
-    /// no relationship at all — is unaffected: always
+    /// A plain `KeySpace::Aggregate` field's own `MIN`/`MAX(<text column>)`
+    /// validates: always
     /// [`super::invertibility::Invertibility::RecomputeOnly`], always
     /// resolved by a live server-side `min()`/`max()` push-down.
     #[test]
@@ -4756,7 +3791,7 @@ mod tests {
             ("tag".to_string(), ValueType::Numeric),
             ("label".to_string(), ValueType::Text),
         ]);
-        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
+        assert_eq!(validate(&d, &source_columns), Ok(()));
     }
 
     /// Issue #120: `MIN`/`MAX(<uuid column>)` is refused *unconditionally* —
@@ -4764,11 +3799,7 @@ mod tests {
     /// `max(uuid)` aggregate at all (the same "opclass but no aggregate"
     /// shape #114/#116 found for `bytea`/`macaddr`), so
     /// `registry::aggregate_result_type("MIN"/"MAX", ValueType::Uuid)` is
-    /// `None` and this is an ordinary `FunctionArgTypeMismatch`, independent
-    /// of relationship shape — a plain `GROUP BY` field's own
-    /// `MIN`/`MAX(<uuid column>)` is refused identically (no special
-    /// to-many-only guard needed the way `text`/`enum` need, since there is
-    /// no shape of this call this crate could ever admit).
+    /// `None` and this is an ordinary `FunctionArgTypeMismatch`.
     #[test]
     fn min_max_uuid_is_refused_unconditionally() {
         let d = aggregate_def(
@@ -4791,7 +3822,7 @@ mod tests {
             ("tag".to_string(), ValueType::Numeric),
             ("token".to_string(), ValueType::Uuid),
         ]);
-        let err = validate(&d, &source_columns, &HashMap::new()).unwrap_err();
+        let err = validate(&d, &source_columns).unwrap_err();
         assert_eq!(
             err,
             ValidationError::FunctionArgTypeMismatch {
@@ -4830,95 +3861,11 @@ mod tests {
             ("tag".to_string(), ValueType::Numeric),
             ("amount".to_string(), ValueType::Numeric),
         ]);
-        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
-        let types = infer_field_types(&d, &source_columns, &HashMap::new()).unwrap();
+        assert_eq!(validate(&d, &source_columns), Ok(()));
+        let types = infer_field_types(&d, &source_columns).unwrap();
         assert_eq!(
             types["n"],
             ValueType::Integer(crate::integer::IntWidth::Int8)
-        );
-    }
-
-    /// A resolved *to-one* relationship whose column is read by `rel.column`.
-    fn to_one_rel(
-        name: &str,
-        to_table: &str,
-        column: &str,
-    ) -> HashMap<String, ResolvedRelationship> {
-        HashMap::from([(
-            name.to_string(),
-            ResolvedRelationship {
-                cardinality: RelationshipCardinality::ToOne,
-                to_table: to_table.to_string(),
-                to_col: "id".to_string(),
-                from_col: String::new(),
-                qualified_to_table: to_table.to_string(),
-                column_types: HashMap::from([(column.to_string(), ValueType::Numeric)]),
-            },
-        )])
-    }
-
-    #[test]
-    fn a_to_one_relationship_path_aggregated_in_a_group_by_is_accepted() {
-        // Issue #94's headline shape: `SUM(post.word_count)` over a to-one
-        // relationship is a LEFT JOIN followed by a GROUP BY — one related
-        // value per source row, folded over the group — so it validates,
-        // exactly like `SUM(<source column>)` does.
-        let d = aggregate_def(
-            &["tag"],
-            vec![
-                FieldDef {
-                    name: "tag".to_string(),
-                    expr: col("tag"),
-                },
-                FieldDef {
-                    name: "total_words".to_string(),
-                    expr: Expr::FunctionCall {
-                        name: "SUM".to_string(),
-                        args: vec![Expr::RelationshipPath {
-                            rel: "post".to_string(),
-                            column: "word_count".to_string(),
-                        }],
-                    },
-                },
-            ],
-        );
-        let source_columns = numeric_columns(&["tag", "post"]);
-        let relationships = to_one_rel("post", "posts", "word_count");
-        assert_eq!(validate(&d, &source_columns, &relationships), Ok(()));
-    }
-
-    #[test]
-    fn a_bare_to_one_relationship_path_in_a_group_by_is_rejected() {
-        // Unwrapped, the path names one value per *row* of the group, with
-        // nowhere to go in the group's single target row — the same objection
-        // `UngroupedColumnReference` raises for a bare non-grouping-key source
-        // column, reported against the path rather than a column name.
-        let d = aggregate_def(
-            &["tag"],
-            vec![
-                FieldDef {
-                    name: "tag".to_string(),
-                    expr: col("tag"),
-                },
-                FieldDef {
-                    name: "wc".to_string(),
-                    expr: Expr::RelationshipPath {
-                        rel: "post".to_string(),
-                        column: "word_count".to_string(),
-                    },
-                },
-            ],
-        );
-        let source_columns = numeric_columns(&["tag", "post"]);
-        let relationships = to_one_rel("post", "posts", "word_count");
-        let err = validate(&d, &source_columns, &relationships).unwrap_err();
-        assert_eq!(
-            err,
-            ValidationError::UngroupedRelationshipReference {
-                field: "wc".to_string(),
-                rel: "post".to_string(),
-                column: "word_count".to_string(),
-            }
         );
     }
 
@@ -4931,7 +3878,7 @@ mod tests {
                 expr: col("missing"),
             }],
         );
-        let err = validate(&d, &HashMap::new(), &HashMap::new()).unwrap_err();
+        let err = validate(&d, &HashMap::new()).unwrap_err();
         assert_eq!(
             err,
             ValidationError::UnresolvedGroupByColumn {
@@ -4950,7 +3897,7 @@ mod tests {
             }],
         );
         let source_columns = numeric_columns(&["order_id", "amount"]);
-        let err = validate(&d, &source_columns, &HashMap::new()).unwrap_err();
+        let err = validate(&d, &source_columns).unwrap_err();
         assert_eq!(
             err,
             ValidationError::UngroupedColumnReference {
@@ -4973,7 +3920,7 @@ mod tests {
             }],
         );
         let source_columns = numeric_columns(&["order_id"]);
-        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
+        assert_eq!(validate(&d, &source_columns), Ok(()));
     }
 
     #[test]
@@ -4989,7 +3936,7 @@ mod tests {
             }],
         );
         let source_columns = numeric_columns(&["order_id"]);
-        let err = validate(&d, &source_columns, &HashMap::new()).unwrap_err();
+        let err = validate(&d, &source_columns).unwrap_err();
         assert_eq!(
             err,
             ValidationError::GroupingColumnFieldMustBePassthrough {
@@ -5008,166 +3955,7 @@ mod tests {
             }],
         );
         let source_columns = numeric_columns(&["order_id"]);
-        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
-    }
-
-    #[test]
-    fn a_to_one_relationship_path_group_by_key_is_accepted() {
-        // Issue #137's headline shape: `GROUP BY tag, post.author` groups
-        // `post_tags` rows partly by their linked post's `author` — no field
-        // needs to mention `post.author` at all, exactly like a plain
-        // grouping column needs no corresponding field.
-        let d = aggregate_def_with_keys(
-            vec![
-                GroupByKey::Column("tag".to_string()),
-                GroupByKey::RelationshipPath {
-                    rel: "post".to_string(),
-                    column: "author".to_string(),
-                },
-            ],
-            vec![FieldDef {
-                name: "post_count".to_string(),
-                expr: Expr::FunctionCall {
-                    name: "COUNT".to_string(),
-                    args: Vec::new(),
-                },
-            }],
-        );
-        let source_columns = numeric_columns(&["tag", "post"]);
-        let mut relationships = to_one_rel("post", "posts", "author");
-        relationships
-            .get_mut("post")
-            .unwrap()
-            .column_types
-            .insert("author".to_string(), ValueType::Text);
-        assert_eq!(validate(&d, &source_columns, &relationships), Ok(()));
-    }
-
-    #[test]
-    fn a_group_by_relationship_path_bare_passthrough_field_is_allowed() {
-        // Mirrors `a_field_named_after_the_grouping_column_as_a_bare_passthrough_is_allowed`
-        // for a relationship-path grouping key: a field explicitly named
-        // after the key's target column, whose expression is the exact same
-        // bare path, is a legal passthrough — DDL gives it no separate
-        // target column of its own.
-        let d = aggregate_def_with_keys(
-            vec![GroupByKey::RelationshipPath {
-                rel: "post".to_string(),
-                column: "author".to_string(),
-            }],
-            vec![FieldDef {
-                name: "author".to_string(),
-                expr: Expr::RelationshipPath {
-                    rel: "post".to_string(),
-                    column: "author".to_string(),
-                },
-            }],
-        );
-        let source_columns = numeric_columns(&["post"]);
-        let mut relationships = to_one_rel("post", "posts", "author");
-        relationships
-            .get_mut("post")
-            .unwrap()
-            .column_types
-            .insert("author".to_string(), ValueType::Text);
-        assert_eq!(validate(&d, &source_columns, &relationships), Ok(()));
-    }
-
-    #[test]
-    fn a_group_by_relationship_path_field_must_be_a_bare_passthrough() {
-        let d = aggregate_def_with_keys(
-            vec![GroupByKey::RelationshipPath {
-                rel: "post".to_string(),
-                column: "author".to_string(),
-            }],
-            vec![FieldDef {
-                name: "author".to_string(),
-                expr: Expr::FunctionCall {
-                    name: "COUNT".to_string(),
-                    args: Vec::new(),
-                },
-            }],
-        );
-        let source_columns = numeric_columns(&["post"]);
-        let mut relationships = to_one_rel("post", "posts", "author");
-        relationships
-            .get_mut("post")
-            .unwrap()
-            .column_types
-            .insert("author".to_string(), ValueType::Text);
-        let err = validate(&d, &source_columns, &relationships).unwrap_err();
-        assert_eq!(
-            err,
-            ValidationError::GroupingColumnFieldMustBePassthrough {
-                field: "author".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn an_unknown_relationship_in_group_by_is_rejected() {
-        let d = aggregate_def_with_keys(
-            vec![GroupByKey::RelationshipPath {
-                rel: "nope".to_string(),
-                column: "author".to_string(),
-            }],
-            vec![FieldDef {
-                name: "c".to_string(),
-                expr: Expr::FunctionCall {
-                    name: "COUNT".to_string(),
-                    args: Vec::new(),
-                },
-            }],
-        );
-        let source_columns = numeric_columns(&["post"]);
-        let err = validate(&d, &source_columns, &HashMap::new()).unwrap_err();
-        assert_eq!(
-            err,
-            ValidationError::UnknownGroupByRelationship {
-                rel: "nope".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn a_to_many_relationship_path_in_group_by_is_rejected() {
-        // Grouping by "the many child rows on the other end of a to-many
-        // relationship" has no defined semantics (issue #137's own scoping)
-        // — rejected with a clear, GROUP-BY-specific error rather than the
-        // field-position `RelationshipPathInAggregate`.
-        let d = aggregate_def_with_keys(
-            vec![GroupByKey::RelationshipPath {
-                rel: "comments".to_string(),
-                column: "author".to_string(),
-            }],
-            vec![FieldDef {
-                name: "c".to_string(),
-                expr: Expr::FunctionCall {
-                    name: "COUNT".to_string(),
-                    args: Vec::new(),
-                },
-            }],
-        );
-        let source_columns = numeric_columns(&["id"]);
-        let relationships = HashMap::from([(
-            "comments".to_string(),
-            ResolvedRelationship {
-                cardinality: RelationshipCardinality::ToMany,
-                to_table: "comments".to_string(),
-                to_col: "post_id".to_string(),
-                from_col: String::new(),
-                qualified_to_table: "comments".to_string(),
-                column_types: HashMap::from([("author".to_string(), ValueType::Text)]),
-            },
-        )]);
-        let err = validate(&d, &source_columns, &relationships).unwrap_err();
-        assert_eq!(
-            err,
-            ValidationError::GroupByRelationshipMustBeToOne {
-                rel: "comments".to_string(),
-                column: "author".to_string(),
-            }
-        );
+        assert_eq!(validate(&d, &source_columns), Ok(()));
     }
 
     fn count_star_field() -> FieldDef {
@@ -5180,79 +3968,14 @@ mod tests {
         }
     }
 
-    fn rel_key(rel: &str, column: &str) -> GroupByKey {
-        GroupByKey::RelationshipPath {
-            rel: rel.to_string(),
-            column: column.to_string(),
-        }
-    }
-
-    /// `buyer` and `seller` both to-one onto `users`, each exposing `name`.
-    fn buyer_and_seller_rels() -> HashMap<String, ResolvedRelationship> {
-        let mut rels = to_one_rel("buyer", "users", "name");
-        rels.extend(to_one_rel("seller", "users", "name"));
-        rels
-    }
-
-    #[test]
-    fn two_group_by_relationship_paths_sharing_a_column_name_are_rejected() {
-        // Issue #519: `GROUP BY buyer.name, seller.name` maps both keys to a
-        // target column named `name`, which used to reach Postgres as a raw
-        // "column \"name\" appears twice in unique constraint" from the target DDL.
-        let d = aggregate_def_with_keys(
-            vec![rel_key("buyer", "name"), rel_key("seller", "name")],
-            vec![count_star_field()],
-        );
-        let source_columns = numeric_columns(&["buyer_id", "seller_id"]);
-        let err = validate(&d, &source_columns, &buyer_and_seller_rels()).unwrap_err();
-        assert_eq!(
-            err,
-            ValidationError::GroupByKeysShareTargetColumn {
-                first: "buyer.name".to_string(),
-                second: "seller.name".to_string(),
-                column: "name".to_string(),
-            }
-        );
-        let message = err.to_string();
-        assert!(message.contains("'buyer.name'"), "{message}");
-        assert!(message.contains("'seller.name'"), "{message}");
-        assert_eq!(err.code(), ErrorCode::Validation);
-    }
-
-    #[test]
-    fn a_group_by_relationship_path_sharing_a_plain_group_by_columns_name_is_rejected() {
-        // The from-side twin the issue calls out: a plain `name` source
-        // column and `buyer.name` would both become target column `name`.
-        let d = aggregate_def_with_keys(
-            vec![
-                GroupByKey::Column("name".to_string()),
-                rel_key("buyer", "name"),
-            ],
-            vec![count_star_field()],
-        );
-        let source_columns = numeric_columns(&["name", "buyer_id"]);
-        let err = validate(&d, &source_columns, &buyer_and_seller_rels()).unwrap_err();
-        assert_eq!(
-            err,
-            ValidationError::GroupByKeysShareTargetColumn {
-                first: "name".to_string(),
-                second: "buyer.name".to_string(),
-                column: "name".to_string(),
-            }
-        );
-    }
-
     #[test]
     fn a_group_by_key_listed_twice_is_rejected() {
         let d = aggregate_def_with_keys(
-            vec![
-                GroupByKey::Column("region".to_string()),
-                GroupByKey::Column("region".to_string()),
-            ],
+            vec!["region".to_string(), "region".to_string()],
             vec![count_star_field()],
         );
         let source_columns = numeric_columns(&["region"]);
-        let err = validate(&d, &source_columns, &HashMap::new()).unwrap_err();
+        let err = validate(&d, &source_columns).unwrap_err();
         assert_eq!(
             err,
             ValidationError::GroupByKeysShareTargetColumn {
@@ -5263,48 +3986,6 @@ mod tests {
         );
         let message = err.to_string();
         assert!(message.contains("lists 'region' twice"), "{message}");
-    }
-
-    #[test]
-    fn group_by_relationship_paths_with_distinct_column_names_still_pass() {
-        let mut rels = buyer_and_seller_rels();
-        rels.get_mut("seller")
-            .unwrap()
-            .column_types
-            .insert("email".to_string(), ValueType::Numeric);
-        let d = aggregate_def_with_keys(
-            vec![rel_key("buyer", "name"), rel_key("seller", "email")],
-            vec![count_star_field()],
-        );
-        let source_columns = numeric_columns(&["buyer_id", "seller_id"]);
-        validate(&d, &source_columns, &rels).unwrap();
-    }
-
-    #[test]
-    fn a_group_by_relationship_path_referencing_an_unknown_to_side_column_is_rejected() {
-        let d = aggregate_def_with_keys(
-            vec![GroupByKey::RelationshipPath {
-                rel: "post".to_string(),
-                column: "missing".to_string(),
-            }],
-            vec![FieldDef {
-                name: "c".to_string(),
-                expr: Expr::FunctionCall {
-                    name: "COUNT".to_string(),
-                    args: Vec::new(),
-                },
-            }],
-        );
-        let source_columns = numeric_columns(&["post"]);
-        let relationships = to_one_rel("post", "posts", "word_count");
-        let err = validate(&d, &source_columns, &relationships).unwrap_err();
-        assert_eq!(
-            err,
-            ValidationError::UnknownRelationshipColumn {
-                table: "posts".to_string(),
-                column: "missing".to_string(),
-            }
-        );
     }
 
     #[test]
@@ -5323,7 +4004,7 @@ mod tests {
             ("id".to_string(), ValueType::Numeric),
             ("label".to_string(), ValueType::Text),
         ]);
-        let err = validate(&d, &source_columns, &HashMap::new()).unwrap_err();
+        let err = validate(&d, &source_columns).unwrap_err();
         assert_eq!(
             err,
             ValidationError::FunctionArgTypeMismatch {
@@ -5346,7 +4027,7 @@ mod tests {
             },
         }]);
         let source_columns = HashMap::from([("text_col".to_string(), ValueType::Text)]);
-        let err = validate(&d, &source_columns, &HashMap::new()).unwrap_err();
+        let err = validate(&d, &source_columns).unwrap_err();
         match err {
             ValidationError::InvalidRegexPattern { field, pattern, .. } => {
                 assert_eq!(field, "out");
@@ -5381,7 +4062,7 @@ mod tests {
                 "__trellis_members",
             ),
         ] {
-            let err = validate(&parsed(text), &source_columns, &HashMap::new()).unwrap_err();
+            let err = validate(&parsed(text), &source_columns).unwrap_err();
             assert_eq!(
                 err,
                 ValidationError::ReservedFieldName {
@@ -5401,7 +4082,6 @@ mod tests {
         let err = validate(
             &parsed("TRANSFORM t__ledger FROM s GROUP BY g SELECT COUNT(*) AS n"),
             &columns,
-            &HashMap::new(),
         )
         .unwrap_err();
         assert_eq!(
@@ -5416,7 +4096,6 @@ mod tests {
         let err = validate(
             &parsed("TRANSFORM t__deltas FROM s GROUP BY g SELECT COUNT(*) AS n"),
             &columns,
-            &HashMap::new(),
         )
         .unwrap_err();
         assert_eq!(
@@ -5433,7 +4112,6 @@ mod tests {
             validate(
                 &parsed(&format!("TRANSFORM {longest} FROM s SELECT x AS y")),
                 &columns,
-                &HashMap::new(),
             ),
             Ok(())
         );
@@ -5442,7 +4120,6 @@ mod tests {
             validate(
                 &parsed(&format!("TRANSFORM {too_long} FROM s SELECT x AS y")),
                 &columns,
-                &HashMap::new(),
             ),
             Err(ValidationError::TargetNameTooLong {
                 target: too_long,
@@ -5458,7 +4135,6 @@ mod tests {
         let err = validate(
             &parsed("TRANSFORM t FROM s SELECT x AS __x"),
             &numeric_columns(&["x"]),
-            &HashMap::new(),
         )
         .unwrap_err();
         assert_eq!(
@@ -5475,7 +4151,6 @@ mod tests {
             validate(
                 &parsed("TRANSFORM t FROM s GROUP BY g SELECT SUM(x) AS _total"),
                 &numeric_columns(&["g", "x"]),
-                &HashMap::new(),
             ),
             Ok(())
         );
@@ -5488,7 +4163,6 @@ mod tests {
         let err = validate(
             &parsed("TRANSFORM t FROM s GROUP BY __a_sum SELECT AVG(x) AS a"),
             &numeric_columns(&["__a_sum", "x"]),
-            &HashMap::new(),
         )
         .unwrap_err();
         assert_eq!(
@@ -5539,11 +4213,11 @@ mod tests {
         assert_eq!(reject_primary_key_named_fields(&d.fields, &["id"]), Ok(()));
     }
 
-    fn source(column: &str) -> TextColumnRef {
-        TextColumnRef::Source(column.to_string())
+    fn source(column: &str) -> String {
+        column.to_string()
     }
 
-    fn read(field: &str, function: &str, column: TextColumnRef) -> CollationRefusingRead {
+    fn read(field: &str, function: &str, column: String) -> CollationRefusingRead {
         CollationRefusingRead {
             field: field.to_string(),
             function: function.to_string(),
@@ -5552,18 +4226,17 @@ mod tests {
     }
 
     /// Issue #638's follow-up: every column under a `STRPOS`/`REGEXP_COUNT`
-    /// argument is reported, directly, through `COALESCE`, through another
-    /// field and through a relationship path, each once and attributed to the
-    /// field that makes the call. `CHAR_LENGTH`/`OCTET_LENGTH` don't depend
+    /// argument is reported, directly, through `COALESCE` and through another
+    /// field, each once and attributed to the field that makes the call. `CHAR_LENGTH`/`OCTET_LENGTH` don't depend
     /// on collation and report nothing.
     #[test]
-    fn collation_refusing_reads_follow_coalesce_fields_and_relationship_paths() {
+    fn collation_refusing_reads_follow_coalesce_and_fields() {
         let d = parsed(
             "TRANSFORM t FROM s SELECT \
              strpos(title, 'x') AS direct, \
              coalesce(title, body) AS merged, \
              regexp_count(merged, 'a') AS via_field, \
-             strpos(post.author, lower_title) AS via_rel, \
+             strpos(s.author, lower_title) AS via_qualified, \
              title AS lower_title, \
              char_length(body) + octet_length(body) AS lengths, \
              strpos(title, title) AS twice",
@@ -5574,15 +4247,8 @@ mod tests {
                 read("direct", "STRPOS", source("title")),
                 read("via_field", "REGEXP_COUNT", source("title")),
                 read("via_field", "REGEXP_COUNT", source("body")),
-                read(
-                    "via_rel",
-                    "STRPOS",
-                    TextColumnRef::Relationship {
-                        rel: "post".to_string(),
-                        column: "author".to_string(),
-                    }
-                ),
-                read("via_rel", "STRPOS", source("title")),
+                read("via_qualified", "STRPOS", source("author")),
+                read("via_qualified", "STRPOS", source("title")),
                 read("twice", "STRPOS", source("title")),
             ]
         );
@@ -5635,8 +4301,8 @@ mod tests {
             ("grp".to_string(), ValueType::Text),
             ("val".to_string(), int4),
         ]);
-        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
-        let types = infer_field_types(&d, &source_columns, &HashMap::new()).unwrap();
+        assert_eq!(validate(&d, &source_columns), Ok(()));
+        let types = infer_field_types(&d, &source_columns).unwrap();
         assert_eq!(types["lo"], int4, "MIN of the int4 source column");
         assert_eq!(
             types["val"],
@@ -5655,7 +4321,7 @@ mod tests {
         );
         let source_columns = numeric_columns(&["grp", "val"]);
         assert_eq!(
-            validate(&d, &source_columns, &HashMap::new()),
+            validate(&d, &source_columns),
             Err(ValidationError::AggregateOfAggregateField {
                 field: "biggest".to_string(),
                 reference: "total".to_string(),
@@ -5667,7 +4333,7 @@ mod tests {
              total + total AS double, MAX(double) AS biggest",
         );
         assert!(matches!(
-            validate(&d, &source_columns, &HashMap::new()),
+            validate(&d, &source_columns),
             Err(ValidationError::AggregateOfAggregateField { .. })
         ));
     }
@@ -5693,7 +4359,7 @@ mod tests {
             },
         ]);
         let source_columns = numeric_columns(&["id"]);
-        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
+        assert_eq!(validate(&d, &source_columns), Ok(()));
     }
 
     // Issue #830: a bare name that is both a source column and a field whose
@@ -5721,7 +4387,7 @@ mod tests {
         );
         let source_columns = numeric_columns(&["grp", "val"]);
         assert_eq!(
-            validate(&d, &source_columns, &HashMap::new()),
+            validate(&d, &source_columns),
             Err(ambiguity("total", "val", "(grp + 1)"))
         );
     }
@@ -5749,7 +4415,7 @@ mod tests {
             "TRANSFORM t FROM app.s GROUP BY grp SELECT grp AS grp, (grp + 1) AS val, \
              SUM(val) AS total",
         );
-        let err = validate(&d, &numeric_columns(&["grp", "val"]), &HashMap::new()).unwrap_err();
+        let err = validate(&d, &numeric_columns(&["grp", "val"])).unwrap_err();
         assert!(err.to_string().contains("`s.val` or `app.s.val`"), "{err}");
         // ... and the catalog's resolved schema doesn't override it.
         assert_eq!(err.clone().with_source_schema("public"), err);
@@ -5764,7 +4430,7 @@ mod tests {
              val + 1 AS bumped",
         );
         assert_eq!(
-            validate(&d, &numeric_columns(&["grp", "val"]), &HashMap::new()),
+            validate(&d, &numeric_columns(&["grp", "val"])),
             Err(ambiguity("bumped", "val", "SUM(val)"))
         );
     }
@@ -5777,15 +4443,9 @@ mod tests {
             "TRANSFORM t FROM s GROUP BY grp SELECT grp AS grp, grp + 1 AS next_grp, \
              SUM(grp) AS grp_sum",
         );
-        assert_eq!(
-            validate(&d, &numeric_columns(&["grp", "val"]), &HashMap::new()),
-            Ok(())
-        );
+        assert_eq!(validate(&d, &numeric_columns(&["grp", "val"])), Ok(()));
         let d = parsed("TRANSFORM t FROM s SELECT val AS val, val + 1 AS bumped");
-        assert_eq!(
-            validate(&d, &numeric_columns(&["id", "val"]), &HashMap::new()),
-            Ok(())
-        );
+        assert_eq!(validate(&d, &numeric_columns(&["id", "val"])), Ok(()));
     }
 
     /// #695: an aggregate field's name inside another aggregate's argument is
@@ -5797,10 +4457,7 @@ mod tests {
             "TRANSFORM t FROM s GROUP BY grp SELECT grp AS grp, SUM(val) AS val, \
              MIN(val) AS lo, MAX(val) AS hi",
         );
-        assert_eq!(
-            validate(&d, &numeric_columns(&["grp", "val"]), &HashMap::new()),
-            Ok(())
-        );
+        assert_eq!(validate(&d, &numeric_columns(&["grp", "val"])), Ok(()));
     }
 
     /// A bare name still reads the field when no source column has that name.
@@ -5810,10 +4467,7 @@ mod tests {
             "TRANSFORM t FROM s GROUP BY grp SELECT grp AS grp, (grp + 1) AS adj, \
              SUM(adj) AS total",
         );
-        assert_eq!(
-            validate(&d, &numeric_columns(&["grp", "val"]), &HashMap::new()),
-            Ok(())
-        );
+        assert_eq!(validate(&d, &numeric_columns(&["grp", "val"])), Ok(()));
     }
 
     /// `s.val` and `app.s.val` read the source column the field `val`
@@ -5832,15 +4486,58 @@ mod tests {
              MIN(app.s.val) AS lo",
         ] {
             let d = parsed(text);
-            assert_eq!(
-                validate(&d, &source_columns, &HashMap::new()),
-                Ok(()),
-                "{text}"
-            );
-            let types = infer_field_types(&d, &source_columns, &HashMap::new()).unwrap();
+            assert_eq!(validate(&d, &source_columns), Ok(()), "{text}");
+            let types = infer_field_types(&d, &source_columns).unwrap();
             assert_eq!(types["val"], ValueType::Text, "{text}");
             assert_eq!(types["lo"], int4, "MIN of the int4 source column: {text}");
         }
+    }
+
+    /// A two-part name whose head isn't the FROM table is refused, naming the
+    /// reference and the FROM table: in a field, inside an aggregate's
+    /// argument, and in an `ALTER TRANSFORM` clause, which parses to the same
+    /// qualified column.
+    #[test]
+    fn a_two_part_name_of_another_table_is_refused() {
+        let source_columns = numeric_columns(&["grp", "val"]);
+        let refused = |field: &str| ValidationError::QualifiedColumnNotFromSource {
+            field: field.to_string(),
+            reference: "product.cost".to_string(),
+            source: "s".to_string(),
+        };
+        let err = validate(
+            &parsed("TRANSFORM t FROM s SELECT val + product.cost AS c"),
+            &source_columns,
+        )
+        .unwrap_err();
+        assert_eq!(err, refused("c"));
+        assert_eq!(
+            err.to_string(),
+            "calculated field 'c' reads 'product.cost', but a qualified column must name this \
+             transform's FROM table ('s'); a second table is read with a JOIN"
+        );
+        assert_eq!(
+            validate(
+                &parsed(
+                    "TRANSFORM t FROM s GROUP BY grp SELECT grp AS grp, \
+                     SUM(product.cost) AS total"
+                ),
+                &source_columns,
+            ),
+            Err(refused("total"))
+        );
+        let crate::defs::ast::Statement::AlterTransform(alter) =
+            crate::defs::parser::parse_statement("ALTER TRANSFORM t ADD product.cost AS c")
+                .expect("parse")
+        else {
+            panic!("not an ALTER");
+        };
+        let crate::defs::ast::AlterClause::Add(field) = &alter.clauses[0] else {
+            panic!("not an ADD");
+        };
+        let mut def = parsed("TRANSFORM t FROM s SELECT val AS v");
+        def.fields.push(field.clone());
+        assert_eq!(validate(&def, &source_columns), Err(refused("c")));
     }
 
     /// A qualified name must name the FROM table and, when known, its schema.
@@ -5851,7 +4548,7 @@ mod tests {
             "TRANSFORM t FROM s GROUP BY grp SELECT grp AS grp, SUM(app.other.val) AS total",
         );
         assert_eq!(
-            validate(&d, &source_columns, &HashMap::new()),
+            validate(&d, &source_columns),
             Err(ValidationError::QualifiedColumnNotFromSource {
                 field: "total".to_string(),
                 reference: "app.other.val".to_string(),
@@ -5863,7 +4560,7 @@ mod tests {
             "TRANSFORM t FROM app.s GROUP BY grp SELECT grp AS grp, SUM(other.s.val) AS total",
         );
         assert_eq!(
-            validate(&d, &source_columns, &HashMap::new()),
+            validate(&d, &source_columns),
             Err(ValidationError::QualifiedColumnNotFromSource {
                 field: "total".to_string(),
                 reference: "other.s.val".to_string(),
@@ -5873,7 +4570,7 @@ mod tests {
         // A bare FROM: the catalog checks the schema once it has resolved it.
         let d =
             parsed("TRANSFORM t FROM s GROUP BY grp SELECT grp AS grp, SUM(other.s.val) AS total");
-        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
+        assert_eq!(validate(&d, &source_columns), Ok(()));
         assert_eq!(
             validate_qualified_columns(&d, &source_columns, Some("public")),
             Err(ValidationError::QualifiedColumnNotFromSource {
@@ -5892,7 +4589,7 @@ mod tests {
     fn a_qualified_name_of_a_missing_column_is_unresolved() {
         let d = parsed("TRANSFORM t FROM s SELECT s.nope + 1 AS x");
         assert_eq!(
-            validate(&d, &numeric_columns(&["id", "val"]), &HashMap::new()),
+            validate(&d, &numeric_columns(&["id", "val"])),
             Err(ValidationError::UnresolvedColumn {
                 field: "x".to_string(),
                 column: "s.nope".to_string(),
@@ -5906,7 +4603,7 @@ mod tests {
         let source_columns = numeric_columns(&["grp", "val"]);
         let d = parsed("TRANSFORM t FROM s GROUP BY grp SELECT grp AS grp, s.val AS v");
         assert_eq!(
-            validate(&d, &source_columns, &HashMap::new()),
+            validate(&d, &source_columns),
             Err(ValidationError::UngroupedColumnReference {
                 field: "v".to_string(),
                 column: "s.val".to_string(),
@@ -5916,7 +4613,7 @@ mod tests {
             "TRANSFORM t FROM s GROUP BY s.grp SELECT grp AS grp, s.grp + 1 AS next_grp, \
              COUNT(*) AS n",
         );
-        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
+        assert_eq!(validate(&d, &source_columns), Ok(()));
     }
 
     /// A 1-1 field can't shadow a source column at all (issue #80), so a 1-1
@@ -5927,13 +4624,13 @@ mod tests {
         let source_columns = numeric_columns(&["id", "val"]);
         let d = parsed("TRANSFORM t FROM s SELECT (val + 1) AS val, val + 2 AS other");
         assert_eq!(
-            validate(&d, &source_columns, &HashMap::new()),
+            validate(&d, &source_columns),
             Err(ValidationError::CalculatedFieldShadowsSourceColumn {
                 field: "val".to_string(),
             })
         );
         let d = parsed("TRANSFORM t FROM s SELECT s.val + 2 AS other");
-        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
+        assert_eq!(validate(&d, &source_columns), Ok(()));
     }
 
     // ---- JOIN validation (#1106) ----
@@ -6570,7 +5267,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            validate(&def, &HashMap::new(), &HashMap::new()),
+            validate(&def, &HashMap::new()),
             Err(ValidationError::JoinNeedsBothTables)
         );
     }

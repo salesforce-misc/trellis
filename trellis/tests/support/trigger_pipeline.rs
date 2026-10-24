@@ -24,7 +24,7 @@ use std::time::Duration;
 use testkit::{TestCluster, TestDatabase};
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::staging::{StagedWatermark, apply, has_pending, retire_drained_segments};
+use trellis::staging::{apply, has_pending, retire_drained_segments};
 
 const WAKE: &str = "hop_wake";
 /// How many seal/drain rounds [`Pipeline::drain`] allows before declaring
@@ -170,7 +170,6 @@ impl Pipeline {
     /// with its error rather than being retried forever (issue #267's
     /// live-lock).
     pub async fn drain(&mut self) {
-        let watermark = StagedWatermark::saturated();
         for _ in 0..MAX_ROUNDS {
             trellis::staging::seal_if_active_nonempty(&mut self.raw, WAKE)
                 .await
@@ -179,7 +178,7 @@ impl Pipeline {
                 .await
                 .expect("next claimable segment")
             {
-                apply::drain_once(&self.db.pool, seg, "hop_test", 1, WAKE, &watermark)
+                apply::drain_once(&self.db.pool, seg, "hop_test", 1, WAKE)
                     .await
                     .expect("drain_once");
             }

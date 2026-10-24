@@ -75,9 +75,8 @@
 //! before that a missing trigger is expected. A paused or quarantined
 //! definition is frozen and reads nothing until it resumes.
 //!
-//! The tables are the definition's source, a `JOIN`'s joined table, and
-//! the to-side of every relationship it reads a column through, less any that is some
-//! definition's target in this instance: the target-mutation seam feeds
+//! The tables are the definition's source and a `JOIN`'s joined table,
+//! less any that is some definition's target in this instance: the target-mutation seam feeds
 //! those, not a trigger (`defs::tables_to_capture`).
 //!
 //! # What it doesn't check
@@ -375,9 +374,9 @@ pub async fn audit(
     Ok(faults)
 }
 
-/// The tables `def` reads: its source, a `JOIN`'s joined table, and the
-/// to-side of each relationship it reads through, sorted, each with whether capture feeds it, which is
-/// every table but a definition's target here (the seam feeds those).
+/// The tables `def` reads: its source and a `JOIN`'s joined table, sorted,
+/// each with whether capture feeds it, which is every table but a
+/// definition's target here (the seam feeds those).
 async fn read_tables(
     client: &impl GenericClient,
     def: &Definition,
@@ -385,19 +384,6 @@ async fn read_tables(
     let mut tables = BTreeSet::from([def.source_table.clone()]);
     // #1110: a `JOIN` reads its joined table as it reads its `FROM`.
     tables.extend(catalog::join_table_of(client, def.id).await?);
-    let names: BTreeSet<String> = crate::defs::eval::relationship_references(&def.def)
-        .into_iter()
-        .map(|(name, _)| name)
-        .collect();
-    if !names.is_empty()
-        && let Some((from_schema, from_table)) = def.source_table.split_once('.')
-    {
-        for rel in catalog::relationships_from_table_in(client, from_schema, from_table).await? {
-            if names.contains(&rel.def.name) {
-                tables.insert(rel.qualified_to_table());
-            }
-        }
-    }
     let tables: Vec<String> = tables.into_iter().collect();
     let seam_fed: BTreeSet<String> = client
         .query(

@@ -103,9 +103,9 @@ mod tests {
         ),
         (
             "defs/catalog.rs",
-            2,
-            "a JOIN or relationship column's declared type, for the key \
-             allowlist and messages; its copy is `copy_type`",
+            1,
+            "a JOIN column's declared type, for the key allowlist and \
+             messages; its copy is `copy_type`",
         ),
         (
             "defs/copies.rs",
@@ -131,12 +131,6 @@ mod tests {
             "defs/partition_tree.rs",
             1,
             "a partition key's type name for the partition key allowlist",
-        ),
-        (
-            "staging/partition_correction/to_many.rs",
-            1,
-            "a relationship's join column, compared with a partition key's \
-             type; relationships are removed by #1115",
         ),
         (
             "staging/schema_change.rs",

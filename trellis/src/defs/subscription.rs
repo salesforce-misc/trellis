@@ -43,8 +43,8 @@
 //! # Where it is checked
 //!
 //! Wherever row-level security is ([`super::row_security`]), on the same
-//! tables: the definition's source and the to-side of every relationship it
-//! reads through, captured or fed by the target-mutation seam.
+//! tables: the definition's source and a `JOIN`'s joined table, captured or
+//! fed by the target-mutation seam.
 //!
 //! - **Defining** a transform refuses such a table
 //!   ([`super::catalog::CatalogError::Subscribed`]).

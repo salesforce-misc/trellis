@@ -8,7 +8,7 @@
 use testkit::{TestCluster, TestDatabase};
 use tokio_postgres::{Client, NoTls};
 use trellis::defs::partition_tree::{
-    KeyRole, PartitionRefusal, PartitionTree, Strategy, read_partition_tree, server_version_num,
+    PartitionRefusal, PartitionTree, Strategy, read_partition_tree, server_version_num,
 };
 use trellis::{CatalogError, Config, Trellis, TrellisError, TrellisOptions};
 
@@ -122,13 +122,7 @@ async fn the_adr_example_defines_and_grouping_by_another_column_names_the_key() 
     .await;
     let err = refusal(&it, &aggregate("public.order_line_items", "product_id")).await;
     let refused = assert_refused_naming(&err, "\"order_id\"");
-    assert!(matches!(
-        refused,
-        PartitionRefusal::KeyNotInGroup {
-            role: KeyRole::GroupBy,
-            ..
-        }
-    ));
+    assert!(matches!(refused, PartitionRefusal::KeyNotInGroup { .. }));
 }
 
 #[tokio::test]
@@ -518,13 +512,7 @@ async fn a_join_side_is_held_to_the_rule_over_its_partial_key() {
     )
     .await;
     let refused = assert_refused_naming(&err, "\"order_id\"");
-    assert!(matches!(
-        refused,
-        PartitionRefusal::KeyNotInGroup {
-            role: KeyRole::GroupBy,
-            ..
-        }
-    ));
+    assert!(matches!(refused, PartitionRefusal::KeyNotInGroup { .. }));
     assert_accepted(
         &it,
         &join(

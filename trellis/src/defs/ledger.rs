@@ -8,8 +8,8 @@
 //!
 //! - **Aggregate targets**: the key, the row's `GROUP BY` values (typed as the
 //!   target's), whether the row is a member of its group, one typed column
-//!   per distinct aggregate argument ([`contributions`]), the relationship
-//!   join key, and the ordering state. The group row is a pure function of
+//!   per distinct aggregate argument ([`contributions`]), and the ordering
+//!   state. The group row is a pure function of
 //!   its members' entries: `SUM(x)` is `sum(<x's column>)` over them, and so
 //!   on for every field, which is how the one-pass build writes the groups
 //!   ([`super::backfill`]).
@@ -31,7 +31,7 @@
 
 use std::collections::HashMap;
 
-use super::ast::{Expr, FieldDef, GroupByKey, ValueType, group_by_contains};
+use super::ast::{Expr, FieldDef, ValueType, group_by_contains};
 use super::pg_type::PgType;
 use super::registry::lookup_aggregate_function;
 use crate::pool::quote_ident;
@@ -314,7 +314,7 @@ pub(crate) struct Contribution {
 /// (`t2 = t` where `t = SUM(x)`) resolves to the same column as its source.
 pub(crate) fn contributions(
     fields: &[FieldDef],
-    group_by: &[GroupByKey],
+    group_by: &[String],
     substituted: &HashMap<String, Expr>,
 ) -> Vec<Contribution> {
     fn walk(expr: &Expr, out: &mut Vec<Contribution>) {
@@ -336,8 +336,7 @@ pub(crate) fn contributions(
             | Expr::SourceColumn { .. }
             | Expr::NumberLiteral(_)
             | Expr::StringLiteral(_)
-            | Expr::TypedLiteral { .. }
-            | Expr::RelationshipPath { .. } => {}
+            | Expr::TypedLiteral { .. } => {}
         }
     }
     let mut out = Vec::new();
@@ -383,7 +382,7 @@ fn is_aggregate_leaf(name: &str, args: &[Expr]) -> bool {
 pub(crate) fn over_ledger(
     expr: &Expr,
     contributions: &[Contribution],
-    group_by: &[GroupByKey],
+    group_by: &[String],
 ) -> Expr {
     match expr {
         Expr::FunctionCall { name, args } if is_aggregate_leaf(name, args) => {
@@ -401,10 +400,7 @@ pub(crate) fn over_ledger(
                 args: rewritten,
             }
         }
-        _ if group_by.iter().any(|k| k.as_expr() == *expr) => {
-            let key = group_by.iter().find(|k| k.as_expr() == *expr).unwrap();
-            Expr::Column(key.target_column_name().to_string())
-        }
+        Expr::Column(name) if group_by.contains(name) => expr.clone(),
         Expr::FunctionCall { name, args } => Expr::FunctionCall {
             name: name.clone(),
             args: args
@@ -660,7 +656,7 @@ mod tests {
         }
     }
 
-    fn plan(text: &str) -> (Vec<Contribution>, HashMap<String, Expr>, Vec<GroupByKey>) {
+    fn plan(text: &str) -> (Vec<Contribution>, HashMap<String, Expr>, Vec<String>) {
         let def = parse(text).expect("parse");
         let super::super::ast::KeySpace::Aggregate { group_by } = &def.key_space else {
             panic!("not an aggregate");
@@ -757,40 +753,6 @@ mod tests {
                 &group_by
             )),
             r#"min("__arg0")"#
-        );
-    }
-
-    #[test]
-    fn a_relationship_group_key_outside_an_aggregate_reads_its_ledger_column() {
-        let (contribs, substituted, group_by) = plan(
-            "TRANSFORM t FROM s GROUP BY post.author SELECT post.author AS author, \
-             SUM(post.words) AS words",
-        );
-        assert_eq!(
-            contribs[0].arg,
-            Expr::RelationshipPath {
-                rel: "post".to_string(),
-                column: "words".to_string()
-            }
-        );
-        assert_eq!(
-            over_ledger(
-                &Expr::RelationshipPath {
-                    rel: "post".to_string(),
-                    column: "author".to_string()
-                },
-                &contribs,
-                &group_by
-            ),
-            col("author")
-        );
-        assert_eq!(
-            super::super::oracle::render_expr_sql(&over_ledger(
-                &substituted["words"],
-                &contribs,
-                &group_by
-            )),
-            r#"sum("__arg0")"#
         );
     }
 

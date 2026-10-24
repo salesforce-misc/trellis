@@ -62,7 +62,6 @@ async fn captured_table(dsn: &str) -> Client {
         "public.t",
         vec!["id".to_string()],
         ["g".to_string(), "a".to_string()],
-        Vec::new(),
     )
     .expect("valid spec");
     match install::install(&mut raw, DEFAULT_SCHEMA, &spec, None)
@@ -423,13 +422,8 @@ async fn an_fk_actions_update_merged_into_one_capture_is_reread() {
         ("public.c", ["a", "b", "v"]),
         ("public.s", ["parent", "v", "id"]),
     ] {
-        let spec = CaptureSpec::new(
-            table,
-            vec!["id".to_string()],
-            columns.map(str::to_string),
-            Vec::new(),
-        )
-        .expect("valid spec");
+        let spec = CaptureSpec::new(table, vec!["id".to_string()], columns.map(str::to_string))
+            .expect("valid spec");
         match install::install(&mut raw, DEFAULT_SCHEMA, &spec, None)
             .await
             .expect("install")
@@ -514,13 +508,8 @@ async fn an_equal_valued_key_move_without_a_reread_deletes_the_old_key() {
     )
     .await
     .expect("create public.n");
-    let spec = CaptureSpec::new(
-        "public.n",
-        vec!["id".to_string()],
-        ["a".to_string()],
-        Vec::new(),
-    )
-    .expect("valid spec");
+    let spec = CaptureSpec::new("public.n", vec!["id".to_string()], ["a".to_string()])
+        .expect("valid spec");
     match install::install(&mut raw, DEFAULT_SCHEMA, &spec, None)
         .await
         .expect("install")

@@ -2,7 +2,7 @@
 //! is Re-derive over chunks, and applies from its first chunk" and
 //! `docs/decisions/0008-public-api-design.md`'s decision 1).
 //!
-//! A plain (non-relationship) 1-1 definition's PK-range chunks are not run
+//! A 1-1 definition's PK-range chunks are not run
 //! back-to-back in one call: once the definition's capture point has passed,
 //! the backfill discharge (`intake::markers::run_pending_backfills`,
 //! ADR-0002) plans the same boundaries [`super::backfill::plan_one_to_one_chunks`]
@@ -25,7 +25,7 @@
 //! chunks is done — race-free under concurrent finishers via a `for update`
 //! lock on the definition's own row (see that function's doc comment).
 //!
-//! An aggregate or relationship-enriched 1-1 definition isn't split into
+//! An aggregate definition isn't split into
 //! ranges: its build materializes connection-scoped `TEMP TABLE` staging,
 //! which doesn't survive being read by independent drain workers on separate
 //! connections. The discharge
@@ -218,7 +218,7 @@ pub enum ChunkWork {
     /// first chunk (`pk <= hi`, no lower bound) and `Some` for every later
     /// one.
     Range { lo: Option<String>, hi: String },
-    /// An aggregate or relationship-enriched 1-1 definition's whole direct
+    /// An aggregate definition's whole direct
     /// set-based build (ADR-0002), run as one job (issue #419; the row's
     /// `hi` is null). See [`dispatch_direct_build`].
     DirectBuild,
@@ -274,7 +274,7 @@ pub const KIND_CORRECTION: &str = "correction";
 /// (`staging::build`, #625 B6).
 pub const OLD_BUILD_KINDS: [&str; 2] = [KIND_RANGE, KIND_DIRECT];
 
-/// Dispatches a plain (non-relationship) 1-1 definition's build onto the
+/// Dispatches a 1-1 definition's build onto the
 /// durable queue, inside the backfill discharge's own transaction (ADR-0002):
 /// moves `definition_id` `waiting_to_backfill` -> `backfilling` and persists
 /// `planned`'s ranges (from [`backfill::plan_one_to_one_chunks`]) as its
@@ -369,7 +369,7 @@ async fn start_backfilling(
     Ok(promoted == 1)
 }
 
-/// Dispatches an aggregate or relationship-enriched 1-1 definition's direct
+/// Dispatches an aggregate definition's direct
 /// set-based build (ADR-0002) as one background job, inside the backfill
 /// discharge's own transaction (ADR-0002, issue #419): moves `definition_id`
 /// `waiting_to_backfill` -> `backfilling` and persists the job as a
@@ -442,8 +442,7 @@ pub(crate) const STALE: &str = "bc.fuse_rearmed_at is distinct from d.fuse_rearm
 /// across a pause and a resume ([`STALE`]) would break that if its write
 /// could land once the resumed definition's rebuild has finished, since
 /// readers can attach from then on (`catching_up` is applying). A
-/// relationship declared on the target, or a definition reading it, would
-/// never hear of that write: when the source change it carries drains, apply
+/// definition reading the target would never hear of that write: when the source change it carries drains, apply
 /// finds the target already current, and changes and stages nothing.
 ///
 /// So every target write runs in a transaction that first [`hold`]s the

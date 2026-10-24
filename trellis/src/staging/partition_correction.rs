@@ -5,9 +5,8 @@
 //! directly) changes a partitioned root's rows without a write any capture
 //! trigger sees. The reconcile pass records each such change as a durable
 //! correction request ([`crate::capture::partitions`], P3). This module
-//! consumes the requests of an **aggregate** that reads the source, and
-//! (the `to_many` module, P4b) of a definition that reads it through a **to-many
-//! relationship**.
+//! consumes the requests of an **aggregate** that reads the source, or of a
+//! `JOIN` that reads it as either side.
 //!
 //! # What a correction does
 //!
@@ -47,7 +46,7 @@
 //! `build_seg` and has no fence, ledger or node phase. A capture install
 //! that only adds new nodes to the tree rebuilds no such aggregate
 //! (`crate::intake::markers::park_table_catch_ups`): the nodes' corrections
-//! cover them, as they do a ledger aggregate and a to-many reader.
+//! cover them, as they do a ledger aggregate.
 //!
 //! A `JOIN` reading the source as either side (`super::join`, #1111) is
 //! corrected the same way, over that side's partial cells (`P` or `M`)
@@ -105,11 +104,10 @@
 //! # Scheduling
 //!
 //! A correction runs for each definition that reads the source (an aggregate
-//! over it, a `JOIN` reading it as either side, or one reading it through a
-//! to-many relationship) as a
-//! `backfill_chunks` row of kind `correction` (V92), one per correction and
-//! definition, which the staging worker's pass enqueues ([`schedule`]) right
-//! after the capture pass that queued the correction. The row gives it what a
+//! over it, or a `JOIN` reading it as either side) as a `backfill_chunks` row
+//! of kind `correction` (V92), one per correction and definition, which the
+//! staging worker's pass enqueues ([`schedule`]) right after the capture pass
+//! that queued the correction. The row gives it what a
 //! build chunk has: one runner at a time (the claim), a heartbeat, the
 //! stale-claim sweep for a runner that died, and a fence on every write
 //! (`ClaimFence`), so a runner whose claim was reclaimed, or that held it
@@ -140,13 +138,6 @@
 //! correction, definition or source. A correction leaves the queue once every
 //! definition that reads its source and applies has corrected it
 //! ([`schedule`], and the runner that finishes the last).
-//!
-//! A to-many reader's correction stages recomputes into the ring rather than
-//! writing its target, and its target has no group deltas for
-//! [`super::build::try_complete`] to wait on. So its row is done only once
-//! the ring has drained through the segment that was active when its last
-//! page committed (the `drain` phase): the definition reads `backfilling`
-//! until every recompute the correction staged is applied.
 
 use std::fmt;
 use std::time::{Duration, SystemTime};
@@ -166,7 +157,6 @@ use super::ledger::LedgerTargetPlan;
 
 mod group;
 pub(crate) use group::lock_recorded_node;
-mod to_many;
 
 /// Keys per page by default, the size of a build chunk
 /// ([`build::DEFAULT_CHUNK_ROWS`]): one page is one transaction and one entry
@@ -556,12 +546,7 @@ fn route_columns_named(
 enum Phase {
     Fence,
     Ledger,
-    /// A to-many reader's walk of the routed from-side rows (`to_many`).
-    Parents,
     Node,
-    /// A to-many reader's recomputes are staged; it waits for the ring to
-    /// drain through `drain_seg` (`to_many`).
-    Drain,
     Done,
 }
 
@@ -570,9 +555,7 @@ impl Phase {
         match self {
             Phase::Fence => "fence",
             Phase::Ledger => "ledger",
-            Phase::Parents => "parents",
             Phase::Node => "node",
-            Phase::Drain => "drain",
             Phase::Done => "done",
         }
     }
@@ -581,9 +564,7 @@ impl Phase {
         match text {
             "fence" => Phase::Fence,
             "ledger" => Phase::Ledger,
-            "parents" => Phase::Parents,
             "node" => Phase::Node,
-            "drain" => Phase::Drain,
             _ => Phase::Done,
         }
     }
@@ -604,17 +585,12 @@ pub struct Progress {
 }
 
 impl Progress {
-    /// The phase: `fence`, `ledger`, `parents`, `node`, `drain` or `done`.
+    /// The phase: `fence`, `ledger`, `node` or `done`.
     pub fn phase(&self) -> &str {
         self.phase
     }
 
     /// Keys still to re-derive by the estimate.
-    ///
-    /// A to-many reader counts a parent done once its recompute is staged,
-    /// so 0 here does not yet mean its target is right: the recomputes apply
-    /// as the ring drains, which the `drain` phase waits for before the
-    /// definition can read `live`.
     #[cfg_attr(
         not(any(test, feature = "internals")),
         allow(dead_code, reason = "read by tests and embedders through `internals`")
@@ -643,8 +619,7 @@ pub struct CorrectingNode {
     pub since: SystemTime,
     /// The keys still to re-derive for this definition, from its persisted
     /// progress. `None` until the correction's first page has counted them.
-    /// An estimate while it walks the node's own rows. A to-many count's
-    /// entry stays at 0 until the recomputes it staged are applied.
+    /// An estimate while it walks the node's own rows.
     pub keys_remaining: Option<u64>,
 }
 
@@ -720,8 +695,8 @@ pub struct Scheduled {
 
 /// The staging worker pass's step for the queued corrections (see the module
 /// doc's "Scheduling"): for each correction and each definition that reads
-/// its source (an aggregate over it, or one reading it through a to-many
-/// relationship) and applies (`live`, `catching_up`, or `backfilling` under a
+/// its source (an aggregate over it, or a `JOIN` reading it as either side)
+/// and applies (`live`, `catching_up`, or `backfilling` under a
 /// Re-derive build: `defs::model::APPLYING_SQL`) and has not re-derived it,
 /// enqueues the correction's row unless one is there, moving a `live`
 /// definition to `backfilling`. A `catching_up` one gets its row once it is
@@ -956,8 +931,8 @@ pub(crate) async fn run_chunk(
         })?;
     let correction = {
         let client = pool.get().await?;
-        // The correction's source: a to-many reader's own source is the
-        // relationship's from-side, not the partitioned root.
+        // The correction's source: a `JOIN`'s joined table is not its
+        // definition's source.
         let table: Option<String> = client
             .query_opt(
                 "select table_name from partition_corrections where id = $1",
@@ -1015,8 +990,6 @@ pub(crate) async fn run_chunk(
         .await?
     } else if definition.source_table == correction.table {
         correct(pool, &definition, &correction, options, outcome, &fence).await?
-    } else if let Some(reader) = to_many::reader(pool, &definition, &correction.table).await? {
-        to_many::correct(pool, &reader, &correction, options, outcome, &fence).await?
     } else if mark_done(pool, &fence, &correction, &definition).await? {
         // It no longer reads the source: nothing of it to correct.
         Step::Done
@@ -1151,19 +1124,12 @@ async fn readers(
 }
 
 /// The ids of every definition reading `source_table` that applies (the
-/// aggregates over it and the definitions reading it through a to-many
-/// relationship), and whether one of them is under an old-path build, which
-/// holds the corrections in the queue.
+/// aggregates over it and the `JOIN`s reading it as either side), and
+/// whether one of them is under an old-path build, which holds the
+/// corrections in the queue.
 async fn all_readers(pool: &Pool, source_table: &str) -> Result<(Vec<i64>, bool), CorrectionError> {
-    let (mut ids, held) = {
-        let client = pool.get().await?;
-        readers(&**client, source_table).await?
-    };
-    let (to_many, to_many_held) = to_many::reader_ids(pool, source_table).await?;
-    ids.extend(to_many);
-    ids.sort_unstable();
-    ids.dedup();
-    Ok((ids, held || to_many_held))
+    let client = pool.get().await?;
+    readers(&**client, source_table).await
 }
 
 /// What one call of [`correct`] left.
@@ -1190,9 +1156,8 @@ async fn correct(
     fence: &ClaimFence<'_>,
 ) -> Result<Step, CorrectionError> {
     let Some(plan) = BuildPlan::for_definition(pool, definition).await? else {
-        // A shape the Re-derive build does not serve yet (an aggregate that
-        // reads a relationship): this engine cannot re-derive its keys. The
-        // failure is the row's to report, rather than a correction that
+        // A shape the Re-derive build does not serve: this engine cannot
+        // re-derive its keys. The failure is the row's to report, rather than a correction that
         // completes uncorrected.
         return Err(CorrectionError::Unserved {
             target: definition.target_table.clone(),
@@ -1244,12 +1209,6 @@ async fn correct(
         };
         let page = match Phase::parse(current.phase) {
             Phase::Done => return Ok(Step::Done),
-            Phase::Parents | Phase::Drain => {
-                return Err(CorrectionError::Unroutable(format!(
-                    "an aggregate's correction {} is in a to-many phase",
-                    correction.id
-                )));
-            }
             Phase::Fence => {
                 if !settle_fence(pool, definition, correction).await? {
                     return Ok(Step::Waiting);

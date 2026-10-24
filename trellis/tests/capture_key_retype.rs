@@ -75,8 +75,7 @@ async fn capture_pass(raw: &mut Client, pool: &trellis::Pool) {
 }
 
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
-    use trellis::staging::{StagedWatermark, apply, has_pending, retire_drained_segments, seal};
-    let watermark = StagedWatermark::saturated();
+    use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
     for _ in 0..16 {
         let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
         seal::seal_phase2(client, outcome.sealed_seg_seq, "capture_key_retype_wake")
@@ -88,7 +87,6 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
             "capture_key_retype_test",
             1,
             "trellis_capture_key_retype_test",
-            &watermark,
         )
         .await
         .expect("drain_once")
@@ -109,8 +107,7 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
 /// the drain goes past it. Bounded attempts, not a timed wait. The
 /// quarantined key's held rows keep the ring from quiescence.
 async fn drain_past_failures(pool: &trellis::Pool, client: &mut Client) {
-    use trellis::staging::{StagedWatermark, apply, retire_drained_segments, seal};
-    let watermark = StagedWatermark::saturated();
+    use trellis::staging::{apply, retire_drained_segments, seal};
     let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
     seal::seal_phase2(client, outcome.sealed_seg_seq, "capture_key_retype_wake")
         .await
@@ -123,7 +120,6 @@ async fn drain_past_failures(pool: &trellis::Pool, client: &mut Client) {
             "capture_key_retype_test",
             1,
             "trellis_capture_key_retype_test",
-            &watermark,
         )
         .await
         {

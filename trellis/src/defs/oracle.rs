@@ -10,8 +10,6 @@
 //! ensures the engine mirrors Postgres semantics exactly.
 
 #[cfg(any(test, feature = "test-util"))]
-use std::collections::BTreeSet;
-#[cfg(any(test, feature = "test-util"))]
 use std::collections::HashMap;
 use std::collections::HashSet;
 #[cfg(any(test, feature = "test-util"))]
@@ -23,11 +21,9 @@ use crate::pool::quote_ident;
 
 use super::ast::{Expr, Operator, TransformDef};
 #[cfg(any(test, feature = "test-util"))]
-use super::ast::{GroupByKey, KeySpace, RelationshipDef, ValueType};
+use super::ast::{KeySpace, ValueType};
 #[cfg(any(test, feature = "test-util"))]
 use super::eval::{EvalError, RegexCache, Row, Value, evaluate, evaluate_aggregate};
-#[cfg(any(test, feature = "test-util"))]
-use super::registry::lookup_aggregate_function;
 use super::typed_literal;
 
 /// Why a from-scratch recompute failed.
@@ -204,18 +200,9 @@ pub async fn recompute_aggregate(
         panic!("recompute_aggregate called on a non-aggregate definition");
     };
 
-    // Issue #137: a `GroupByKey::RelationshipPath` key has no source column
-    // to select at all — this pure-Rust, evaluator-driven cross-check is
-    // documented as not wiring relationships (see `eval::evaluate_aggregate`'s
-    // own doc comment), so a definition with one is expected to skip this
-    // function entirely and compare only against the real Postgres oracle
-    // (`render_aggregate_relationship_select_sql`), exactly as issue #94's
-    // relationship-*field* tests already do. Keying by `target_column_name`
-    // keeps a plain-column `GROUP BY` (the overwhelmingly common case)
-    // byte-identical to before this issue.
     let mut columns = referenced_source_columns(def);
     for key in group_by {
-        columns.insert(key.target_column_name().to_string());
+        columns.insert(key.clone());
     }
     let columns: Vec<String> = columns.into_iter().collect();
 
@@ -260,7 +247,7 @@ pub async fn recompute_aggregate(
 /// typical case for a real foreign/primary key); this doesn't attempt to
 /// match Postgres's "`NULL` groups with `NULL`" `GROUP BY` semantics.
 #[cfg(any(test, feature = "test-util"))]
-fn group_key(image: &Row, group_by: &[GroupByKey]) -> String {
+fn group_key(image: &Row, group_by: &[String]) -> String {
     // Length-prefix each component (`"{len}:{value}"`) rather than joining
     // on a bare separator: a Text grouping column's value can itself
     // contain any separator character (including a comma), which would
@@ -271,13 +258,7 @@ fn group_key(image: &Row, group_by: &[GroupByKey]) -> String {
     // number, not searched for as a delimiter.
     group_by
         .iter()
-        .map(|k| {
-            image
-                .get(k.target_column_name())
-                .cloned()
-                .flatten()
-                .unwrap_or_default()
-        })
+        .map(|k| image.get(k.as_str()).cloned().flatten().unwrap_or_default())
         .map(|v| format!("{}:{v}", v.len()))
         .collect::<String>()
 }
@@ -324,15 +305,9 @@ pub fn render_aggregate_select_sql(def: &TransformDef) -> String {
             )
         })
         .collect();
-    // A `GroupByKey::RelationshipPath` key has no plain-column rendering
-    // this relationship-unaware oracle can produce — `render_expr_sql`'s own
-    // `RelationshipPath` arm panics with a clear message, matching how this
-    // whole function is documented as relationship-free; a definition with
-    // one must use `render_aggregate_relationship_select_sql` instead
-    // (issue #94's own split, unchanged by issue #137).
     let group_cols: Vec<String> = group_by
         .iter()
-        .map(|k| render_expr_sql(&k.as_expr()))
+        .map(|k| render_expr_sql(&Expr::Column(k.clone())))
         .collect();
 
     format!(
@@ -380,8 +355,8 @@ pub fn render_aggregate_select_sql(def: &TransformDef) -> String {
 /// Issue #622 (C2): `crate::capture::columns` also calls this, to decide which
 /// columns a table's capture trigger images. It runs against persisted
 /// definitions only, which `validate()` has already accepted, so the same
-/// invariant covers it. It leaves out `GROUP BY` keys and relationship
-/// columns; that caller adds them.
+/// invariant covers it. It leaves out `GROUP BY` keys; that caller adds
+/// them.
 pub(crate) fn referenced_source_columns(def: &TransformDef) -> HashSet<String> {
     let field_names: HashSet<&str> = def.fields.iter().map(|f| f.name.as_str()).collect();
 
@@ -425,14 +400,6 @@ fn collect_columns(
             out.insert(column.clone());
         }
         Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::TypedLiteral { .. } => {}
-        // Not a source-column reference by name — a path's columns live on
-        // the *to-side* table, which [`recompute`]/[`recompute_aggregate`]'s
-        // source SELECT doesn't read. Those two evaluator-driven recomputes
-        // therefore only handle relationship-free definitions; the SQL oracles
-        // ([`render_relationship_select_sql`],
-        // [`render_aggregate_relationship_select_sql`]) are what cross-check a
-        // relationship-reading one.
-        Expr::RelationshipPath { .. } => {}
         Expr::BinaryOp { lhs, rhs, .. } => {
             collect_columns(lhs, field_name, field_names, out);
             collect_columns(rhs, field_name, field_names, out);
@@ -460,11 +427,6 @@ pub fn render_expr_sql(expr: &Expr) -> String {
         Expr::NumberLiteral(text) => format!("{text}::numeric"),
         Expr::StringLiteral(text) => format!("'{}'::text", text.replace('\'', "''")),
         Expr::TypedLiteral { value_type, text } => typed_literal::render_sql(*value_type, text),
-        Expr::RelationshipPath { rel, column } => panic!(
-            "render_expr_sql called on an unresolved relationship path '{rel}.{column}' \
-             — the validator (#23) should have rejected this before reaching the oracle \
-             (issue #25 is grammar + AST only)"
-        ),
         Expr::BinaryOp { op, lhs, rhs } => {
             let symbol = match op {
                 Operator::Add => "+",
@@ -491,24 +453,12 @@ pub fn render_expr_sql(expr: &Expr) -> String {
     }
 }
 
-/// Renders an expression that may read **to-one** relationship paths, against
-/// a source aliased as `source_sql` (already-quoted SQL text — a quoted table
-/// name, or a query alias such as `s`) `LEFT JOIN`ed to each referenced
-/// relationship's to-side table under an alias equal to the relationship's
-/// quoted name.
-///
-/// This is the shared renderer for every place a to-one path has to become SQL
-/// over a real `LEFT JOIN` rather than a correlated subquery: the aggregate
-/// direct build (`super::backfill::backfill_aggregate`), the ledger Re-derive
-/// (`staging::ledger`), and this module's own [`render_aggregate_relationship_select_sql`] oracle.
-/// Unlike [`render_rel_expr_sql`], an aggregate call whose sole argument is a
-/// relationship path is *not* special-cased into a correlated subquery — under
-/// a to-one join `sum(rel.col)` is an ordinary aggregate over the joined
-/// column, which is exactly issue #94's semantics.
-///
-/// Source columns are qualified with `source_sql` so they can't collide with a
-/// joined to-side column of the same name.
-pub(crate) fn render_to_one_rel_expr_sql(expr: &Expr, source_sql: &str) -> String {
+/// [`render_expr_sql`] with every source column qualified by `source_sql`
+/// (already-quoted SQL text — a quoted table name, or a query alias such as
+/// `s`), for SQL that reads the source under an alias: the aggregate build
+/// (`super::backfill::backfill_aggregate`), the ledger Re-derive
+/// (`staging::ledger`) and the group-basis and `JOIN` partial reads.
+pub(crate) fn render_qualified_expr_sql(expr: &Expr, source_sql: &str) -> String {
     match expr {
         Expr::Column(name) | Expr::SourceColumn { column: name, .. } => {
             format!("{source_sql}.{}", quote_ident(name))
@@ -516,9 +466,6 @@ pub(crate) fn render_to_one_rel_expr_sql(expr: &Expr, source_sql: &str) -> Strin
         Expr::NumberLiteral(text) => format!("{text}::numeric"),
         Expr::StringLiteral(text) => format!("'{}'::text", text.replace('\'', "''")),
         Expr::TypedLiteral { value_type, text } => typed_literal::render_sql(*value_type, text),
-        Expr::RelationshipPath { rel, column } => {
-            format!("{}.{}", quote_ident(rel), quote_ident(column))
-        }
         Expr::BinaryOp { op, lhs, rhs } => {
             let symbol = match op {
                 Operator::Add => "+",
@@ -526,8 +473,8 @@ pub(crate) fn render_to_one_rel_expr_sql(expr: &Expr, source_sql: &str) -> Strin
             };
             format!(
                 "({} {symbol} {})",
-                render_to_one_rel_expr_sql(lhs, source_sql),
-                render_to_one_rel_expr_sql(rhs, source_sql)
+                render_qualified_expr_sql(lhs, source_sql),
+                render_qualified_expr_sql(rhs, source_sql)
             )
         }
         Expr::FunctionCall { name, args } if name == "COUNT" && args.is_empty() => {
@@ -536,348 +483,9 @@ pub(crate) fn render_to_one_rel_expr_sql(expr: &Expr, source_sql: &str) -> Strin
         Expr::FunctionCall { name, args } => {
             let rendered: Vec<String> = args
                 .iter()
-                .map(|arg| render_to_one_rel_expr_sql(arg, source_sql))
+                .map(|arg| render_qualified_expr_sql(arg, source_sql))
                 .collect();
             format!("{}({})", name.to_lowercase(), rendered.join(", "))
-        }
-    }
-}
-
-/// The ` left join <to_table> as <rel> on <rel>.<to_col> = <source_sql>.<from_col>`
-/// clauses a [`render_to_one_rel_expr_sql`]-rendered expression needs, one per
-/// entry of `joins` (relationship name → `(to_table, to_col, from_col)`), in
-/// the iterator's order. Every production caller passes the relationship's
-/// qualified `"schema.table"` to-side
-/// ([`super::RelationshipDefinition::qualified_to_table`], issue #372), so the
-/// join never resolves through the session's `search_path`; the test oracles
-/// pass a bare name, which is quoted as one identifier. Left (not inner) join so a source row whose FK doesn't
-/// resolve still reaches the `GROUP BY` and contributes `NULL` — ADR-0006's
-/// to-one nullability rule, and the same shape
-/// [`render_relationship_select_sql`] already uses for a 1-1 target.
-pub(crate) fn to_one_join_clauses<'a>(
-    joins: impl Iterator<Item = (&'a str, &'a str, &'a str, &'a str)>,
-    source_sql: &str,
-) -> String {
-    joins
-        .map(|(rel, to_table, to_col, from_col)| {
-            format!(
-                " left join {} as {alias} on {alias}.{} = {source_sql}.{}",
-                super::ddl::qualified_source_table(to_table),
-                quote_ident(to_col),
-                quote_ident(from_col),
-                alias = quote_ident(rel),
-            )
-        })
-        .collect()
-}
-
-/// Renders an [`KeySpace::Aggregate`] `def` whose fields aggregate over to-one
-/// relationship paths (issue #94) back to the equivalent Postgres `SELECT …
-/// LEFT JOIN … GROUP BY …`, the relationship-aware counterpart of
-/// [`render_aggregate_select_sql`] — a test/benchmark oracle only, like that
-/// one.
-///
-/// `relationships` is keyed by relationship name, exactly as
-/// [`render_relationship_select_sql`] takes it.
-///
-/// # Panics
-///
-/// If `def.key_space` is not [`KeySpace::Aggregate`], if substitution fails
-/// (see [`render_aggregate_select_sql`]), or if a referenced relationship is
-/// missing from `relationships`.
-#[cfg(any(test, feature = "test-util"))]
-pub fn render_aggregate_relationship_select_sql(
-    def: &TransformDef,
-    relationships: &HashMap<String, RelationshipDef>,
-) -> String {
-    let KeySpace::Aggregate { group_by } = &def.key_space else {
-        panic!("render_aggregate_relationship_select_sql called on a non-aggregate definition");
-    };
-    let substituted = super::backfill::substituted_field_exprs(def)
-        .expect("aggregate oracle rendering requires a substitutable definition");
-
-    let source_sql = quoted_source_from(def);
-    let select_list: Vec<String> = def
-        .fields
-        .iter()
-        .map(|field| {
-            format!(
-                "{} as {}",
-                render_to_one_rel_expr_sql(&substituted[&field.name], &source_sql),
-                quote_ident(&field.name)
-            )
-        })
-        .collect();
-    // Issue #137: a `GROUP BY` key may itself be a to-one relationship path
-    // (`post.author`), rendered exactly like a field's own relationship-path
-    // reference — qualified against `source_sql` for a plain column, or
-    // against its own join alias for a relationship path.
-    let group_cols: Vec<String> = group_by
-        .iter()
-        .map(|k| render_to_one_rel_expr_sql(&k.as_expr(), &source_sql))
-        .collect();
-
-    // Deterministic JOIN order, deduped: a relationship read by several
-    // fields (or a field and a `GROUP BY` key alike) is joined once. Issue
-    // #137: a `GROUP BY`-only relationship reference (no field reads it at
-    // all — e.g. `GROUP BY tag, post.author SELECT COUNT(*) AS post_count`)
-    // still needs its join, or `group_cols`' own alias reference above
-    // resolves to nothing.
-    let mut rel_names: BTreeSet<&str> = BTreeSet::new();
-    for expr in substituted.values() {
-        collect_rel_names(expr, &mut rel_names);
-    }
-    for key in group_by {
-        if let GroupByKey::RelationshipPath { rel, .. } = key {
-            rel_names.insert(rel.as_str());
-        }
-    }
-    let joins = to_one_join_clauses(
-        rel_names.iter().map(|rel| {
-            let r = relationships.get(*rel).unwrap_or_else(|| {
-                panic!("render_aggregate_relationship_select_sql: unknown relationship '{rel}'")
-            });
-            (
-                *rel,
-                r.to_table.as_str(),
-                r.to_col.as_str(),
-                r.from_col.as_str(),
-            )
-        }),
-        &source_sql,
-    );
-
-    format!(
-        "select {} from {source_sql}{joins} group by {}",
-        select_list.join(", "),
-        group_cols.join(", ")
-    )
-}
-
-/// Every relationship name a (substituted) expression reads, regardless of
-/// where in the tree the path sits — unlike [`collect_to_one_rels`], which
-/// stops at an aggregate-wrapped path because that shape means *to-many* in a
-/// 1-1 definition. In an aggregate definition every path is to-one (the
-/// validator rejects to-many there), so every one of them needs a `LEFT JOIN`.
-#[cfg(any(test, feature = "test-util"))]
-fn collect_rel_names<'a>(expr: &'a Expr, out: &mut BTreeSet<&'a str>) {
-    match expr {
-        Expr::RelationshipPath { rel, .. } => {
-            out.insert(rel.as_str());
-        }
-        Expr::Column(_)
-        | Expr::SourceColumn { .. }
-        | Expr::NumberLiteral(_)
-        | Expr::StringLiteral(_)
-        | Expr::TypedLiteral { .. } => {}
-        Expr::BinaryOp { lhs, rhs, .. } => {
-            collect_rel_names(lhs, out);
-            collect_rel_names(rhs, out);
-        }
-        Expr::FunctionCall { args, .. } => {
-            for arg in args {
-                collect_rel_names(arg, out);
-            }
-        }
-    }
-}
-
-/// Renders a relationship-enriched 1-1 [`TransformDef`] back to the equivalent
-/// Postgres `SELECT` (issue #32), so the generative correctness oracle can
-/// assert the engine's incrementally-maintained target is byte-equal to what
-/// Postgres itself computes over the same source + related data (ADR-0004).
-///
-/// `relationships` is keyed by relationship name — the head of a
-/// `<rel>.<column>` path — mirroring how the evaluator's
-/// [`super::eval::RelationshipContext`] is caller-provided (issue #28/#29): the
-/// oracle needs the same relationship endpoints (`from_col`, `to_table`,
-/// `to_col`) the eval-side context was built from, so both sides describe the
-/// same join. A referenced relationship absent from the map is a caller bug
-/// (the validator resolves paths before eval/oracle) and panics, like
-/// [`render_expr_sql`]'s unresolved-path guard.
-///
-/// The two relationship shapes render exactly as the evaluator resolves them,
-/// so the SQL and the engine agree row-for-row:
-///
-/// * A **to-one** enrichment (a bare `<rel>.<column>` path, issue #28) becomes
-///   a `LEFT JOIN` from the source to the to-side table on
-///   `source.from_col = rel.to_col`, projecting `rel.column`. `LEFT JOIN` keeps
-///   a from-row with no match (or a `NULL` join key) alive with a `NULL`
-///   enrichment — matching #28's "no-match / NULL fk => NULL, from-row
-///   survives".
-/// * A **to-many** aggregate (`sum(<rel>.<column>)`, issue #29) becomes a
-///   correlated aggregate subquery over the to-side table filtered by the join
-///   key. Postgres's aggregate over the empty correlated set gives `count → 0`
-///   and `sum`/`min`/`max`/`avg → NULL`, and `count(rel.column)` counts only
-///   non-`NULL` values — exactly [`super::eval::eval_to_many_aggregate`] /
-///   `reduce_numeric_aggregate`.
-///
-/// The relationship name doubles as the SQL alias for both the `LEFT JOIN`
-/// target and the correlated subquery's table, so a to-side table that shares
-/// the source table's name (or is referenced twice) stays unambiguous.
-///
-/// # Panics
-///
-/// If `def.key_space` is not [`KeySpace::OneToOne`], or a referenced
-/// relationship is missing from `relationships`.
-#[cfg(any(test, feature = "test-util"))]
-pub fn render_relationship_select_sql(
-    def: &TransformDef,
-    relationships: &HashMap<String, RelationshipDef>,
-) -> String {
-    assert!(
-        matches!(def.key_space, KeySpace::OneToOne),
-        "render_relationship_select_sql called on a non-1-1 definition"
-    );
-
-    // Every to-one path (a bare `<rel>.<column>`, anywhere in an expression
-    // tree) needs a LEFT JOIN. A path that is the sole argument of an aggregate
-    // is a to-many enrichment — rendered as a correlated subquery below — and
-    // contributes no JOIN. A `BTreeSet` dedups a relationship referenced by
-    // several columns and orders the JOINs deterministically for stable output.
-    let mut to_one_rels: BTreeSet<&str> = BTreeSet::new();
-    for field in &def.fields {
-        collect_to_one_rels(&field.expr, &mut to_one_rels);
-    }
-
-    let select_list: Vec<String> = def
-        .fields
-        .iter()
-        .map(|field| {
-            format!(
-                "{} as {}",
-                render_rel_expr_sql(&field.expr, &def.source, relationships),
-                quote_ident(&field.name)
-            )
-        })
-        .collect();
-
-    let mut sql = format!(
-        "select {} from {}",
-        select_list.join(", "),
-        quoted_source_from(def)
-    );
-    for rel_name in to_one_rels {
-        let rel = relationships.get(rel_name).unwrap_or_else(|| {
-            panic!("render_relationship_select_sql: unknown relationship '{rel_name}'")
-        });
-        sql.push_str(&format!(
-            " left join {to_table} as {alias} on {source}.{from_col} = {alias}.{to_col}",
-            to_table = quote_ident(&rel.to_table),
-            alias = quote_ident(rel_name),
-            source = quote_ident(&def.source),
-            from_col = quote_ident(&rel.from_col),
-            to_col = quote_ident(&rel.to_col),
-        ));
-    }
-    sql
-}
-
-/// Collects the names of to-one relationships referenced by a bare path (so
-/// [`render_relationship_select_sql`] can emit their `LEFT JOIN`s). Mirrors the
-/// evaluator's structural test in #29: a `<rel>.<column>` path that is the sole
-/// argument of an aggregate call is a to-many enrichment (a correlated
-/// subquery, no JOIN), so recursion stops there; every other path is to-one.
-#[cfg(any(test, feature = "test-util"))]
-fn collect_to_one_rels<'a>(expr: &'a Expr, out: &mut BTreeSet<&'a str>) {
-    match expr {
-        Expr::RelationshipPath { rel, .. } => {
-            out.insert(rel.as_str());
-        }
-        Expr::FunctionCall { name, args }
-            if lookup_aggregate_function(name).is_some()
-                && matches!(args.as_slice(), [Expr::RelationshipPath { .. }]) =>
-        {
-            // To-many enrichment: rendered as a correlated subquery, no JOIN.
-        }
-        Expr::FunctionCall { args, .. } => {
-            for arg in args {
-                collect_to_one_rels(arg, out);
-            }
-        }
-        Expr::BinaryOp { lhs, rhs, .. } => {
-            collect_to_one_rels(lhs, out);
-            collect_to_one_rels(rhs, out);
-        }
-        Expr::Column(_)
-        | Expr::SourceColumn { .. }
-        | Expr::NumberLiteral(_)
-        | Expr::StringLiteral(_)
-        | Expr::TypedLiteral { .. } => {}
-    }
-}
-
-/// Renders one calculated-field expression of a relationship-enriched 1-1
-/// definition. Like [`render_expr_sql`] but relationship-aware: source columns
-/// are qualified with the source table (so they don't collide with a JOINed
-/// to-side column of the same name), a bare to-one path reads off its JOIN
-/// alias, and an aggregate-wrapped to-many path becomes a correlated subquery.
-#[cfg(any(test, feature = "test-util"))]
-pub(crate) fn render_rel_expr_sql(
-    expr: &Expr,
-    source: &str,
-    relationships: &HashMap<String, RelationshipDef>,
-) -> String {
-    match expr {
-        Expr::Column(name) | Expr::SourceColumn { column: name, .. } => {
-            format!("{}.{}", quote_ident(source), quote_ident(name))
-        }
-        Expr::NumberLiteral(text) => format!("{text}::numeric"),
-        Expr::StringLiteral(text) => format!("'{}'::text", text.replace('\'', "''")),
-        Expr::TypedLiteral { value_type, text } => typed_literal::render_sql(*value_type, text),
-        // A to-one enrichment reads the referenced column off the to-side table
-        // the LEFT JOIN brought in, aliased by the relationship name.
-        Expr::RelationshipPath { rel, column } => {
-            format!("{}.{}", quote_ident(rel), quote_ident(column))
-        }
-        Expr::BinaryOp { op, lhs, rhs } => {
-            let symbol = match op {
-                Operator::Add => "+",
-                Operator::GreaterThan => ">",
-            };
-            format!(
-                "({} {symbol} {})",
-                render_rel_expr_sql(lhs, source, relationships),
-                render_rel_expr_sql(rhs, source, relationships)
-            )
-        }
-        // A to-many aggregate (issue #29): an aggregate whose sole argument is a
-        // relationship path — the same structural shape the evaluator matches —
-        // renders as a correlated aggregate subquery over the to-side table,
-        // filtered by the join key. Postgres's empty-set semantics (`count → 0`,
-        // the rest → `NULL`, `count(col)` counting non-`NULL`) are exactly what
-        // `eval_to_many_aggregate` reproduces, so the two converge.
-        Expr::FunctionCall { name, args }
-            if lookup_aggregate_function(name).is_some()
-                && matches!(args.as_slice(), [Expr::RelationshipPath { .. }]) =>
-        {
-            let Expr::RelationshipPath { rel, column } = &args[0] else {
-                unreachable!("guarded by the matches! above");
-            };
-            let reldef = relationships.get(rel.as_str()).unwrap_or_else(|| {
-                panic!("render_relationship_select_sql: unknown relationship '{rel}'")
-            });
-            format!(
-                "(select {func}({alias}.{col}) from {to_table} as {alias} \
-                 where {alias}.{to_col} = {source}.{from_col})",
-                func = name.to_lowercase(),
-                alias = quote_ident(rel),
-                col = quote_ident(column),
-                to_table = quote_ident(&reldef.to_table),
-                to_col = quote_ident(&reldef.to_col),
-                source = quote_ident(source),
-                from_col = quote_ident(&reldef.from_col),
-            )
-        }
-        Expr::FunctionCall { name, args } if name == "COUNT" && args.is_empty() => {
-            "count(*)".to_string()
-        }
-        Expr::FunctionCall { name, args } => {
-            let rendered_args: Vec<String> = args
-                .iter()
-                .map(|arg| render_rel_expr_sql(arg, source, relationships))
-                .collect();
-            format!("{}({})", name.to_lowercase(), rendered_args.join(", "))
         }
     }
 }
@@ -1023,96 +631,6 @@ mod tests {
             ],
         };
         assert_eq!(render_expr_sql(&expr), "coalesce(\"amount\", 0::numeric)");
-    }
-
-    fn category_rel() -> HashMap<String, RelationshipDef> {
-        HashMap::from([(
-            "category".to_string(),
-            RelationshipDef {
-                name: "category".to_string(),
-                from_table: "products".to_string(),
-                from_col: "category_id".to_string(),
-                to_table: "categories".to_string(),
-                to_col: "id".to_string(),
-            },
-        )])
-    }
-
-    fn comments_rel() -> HashMap<String, RelationshipDef> {
-        HashMap::from([(
-            "comments".to_string(),
-            RelationshipDef {
-                name: "comments".to_string(),
-                from_table: "posts".to_string(),
-                from_col: "id".to_string(),
-                to_table: "comments".to_string(),
-                to_col: "post_id".to_string(),
-            },
-        )])
-    }
-
-    #[test]
-    fn render_relationship_select_sql_renders_a_to_one_left_join() {
-        let def = TransformDef {
-            target: "product_view".to_string(),
-            source: "products".to_string(),
-            key_space: KeySpace::OneToOne,
-            fields: vec![
-                FieldDef {
-                    name: "id".to_string(),
-                    expr: Expr::Column("id".to_string()),
-                },
-                FieldDef {
-                    name: "category_name".to_string(),
-                    expr: Expr::RelationshipPath {
-                        rel: "category".to_string(),
-                        column: "name".to_string(),
-                    },
-                },
-            ],
-            predicate: Predicate::True,
-            without_source_index: false,
-            explicit_source_schema: None,
-            explicit_target_schema: None,
-        };
-        assert_eq!(
-            render_relationship_select_sql(&def, &category_rel()),
-            "select \"products\".\"id\" as \"id\", \
-             \"category\".\"name\" as \"category_name\" \
-             from \"products\" \
-             left join \"categories\" as \"category\" \
-             on \"products\".\"category_id\" = \"category\".\"id\""
-        );
-    }
-
-    #[test]
-    fn render_relationship_select_sql_renders_a_to_many_correlated_aggregate() {
-        let def = TransformDef {
-            target: "post_stats".to_string(),
-            source: "posts".to_string(),
-            key_space: KeySpace::OneToOne,
-            fields: vec![FieldDef {
-                name: "total_words".to_string(),
-                expr: Expr::FunctionCall {
-                    name: "SUM".to_string(),
-                    args: vec![Expr::RelationshipPath {
-                        rel: "comments".to_string(),
-                        column: "word_count".to_string(),
-                    }],
-                },
-            }],
-            predicate: Predicate::True,
-            without_source_index: false,
-            explicit_source_schema: None,
-            explicit_target_schema: None,
-        };
-        assert_eq!(
-            render_relationship_select_sql(&def, &comments_rel()),
-            "select (select sum(\"comments\".\"word_count\") \
-             from \"comments\" as \"comments\" \
-             where \"comments\".\"post_id\" = \"posts\".\"id\") as \"total_words\" \
-             from \"posts\""
-        );
     }
 
     #[test]

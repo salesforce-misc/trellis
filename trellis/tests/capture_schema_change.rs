@@ -79,8 +79,7 @@ async fn capture_pass(raw: &mut Client, pool: &trellis::Pool) -> reconcile::Pass
 /// Seals and drains through the engine's own apply path until nothing is
 /// pending anywhere in the ring (as in `capture_join.rs`).
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
-    use trellis::staging::{StagedWatermark, apply, has_pending, retire_drained_segments, seal};
-    let watermark = StagedWatermark::saturated();
+    use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
     for _ in 0..16 {
         let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
         seal::seal_phase2(client, outcome.sealed_seg_seq, "capture_schema_change_wake")
@@ -92,7 +91,6 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
             "capture_schema_change_test",
             1,
             "trellis_capture_schema_change_test",
-            &watermark,
         )
         .await
         .expect("drain_once")
@@ -615,14 +613,8 @@ async fn renaming_a_key_column_pauses_every_reader_and_never_fails_a_write() {
     assert_eq!(imaged_keys(&raw, since).await, vec!["2".to_string()]);
 }
 
-/// A ring row's key, op, images and group key, as text.
-type ImageRow = (
-    String,
-    String,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-);
+/// A ring row's key, op and images, as text.
+type ImageRow = (String, String, Option<String>, Option<String>);
 
 /// The images a function writes on its schema-changed branch, built at run
 /// time and run with `EXECUTE`, are byte-identical to the static inserts'
@@ -650,8 +642,6 @@ async fn the_partial_images_match_the_static_ones_for_the_columns_left() {
         "public.p",
         vec!["id".to_string()],
         columns.iter().map(|c| c.to_string()),
-        // Group-key values in physical column order, one of them dropped.
-        vec!["t".to_string(), "n".to_string(), "gone".to_string()],
     )
     .expect("a valid spec");
     trellis::capture::install::install(&mut raw, SCHEMA, &spec, None)
@@ -682,17 +672,14 @@ async fn the_partial_images_match_the_static_ones_for_the_columns_left() {
     .await
     .expect("no write fails after the drop");
 
-    // The static rows' `gone` is 7, a value no other column holds, so
-    // dropping it from their group keys leaves what the partial rows hold.
     let images: Vec<ImageRow> = raw
         .query(
             &format!(
                 "select key, op, (old_image - 'gone' - 'id')::text, \
-                        (new_image - 'gone' - 'id')::text, \
-                        array_remove(group_key, '7')::text \
+                        (new_image - 'gone' - 'id')::text \
                  from ({}) r where change_id > $1 order by change_id",
                 ring(
-                    "key, op, old_image, new_image, group_key, change_id",
+                    "key, op, old_image, new_image, change_id",
                     "op <> 'schema_changed'"
                 )
             ),
@@ -701,20 +688,15 @@ async fn the_partial_images_match_the_static_ones_for_the_columns_left() {
         .await
         .expect("read images")
         .into_iter()
-        .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4)))
+        .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
         .collect();
     assert_eq!(images.len(), 4, "{images:?}");
     let (before, after) = images.split_at(2);
-    for ((k1, op1, old1, new1, gk1), (k2, op2, old2, new2, gk2)) in before.iter().zip(after) {
+    for ((k1, op1, old1, new1), (k2, op2, old2, new2)) in before.iter().zip(after) {
         assert_eq!((k1.as_str(), k2.as_str()), ("1", "2"));
         assert_eq!(op1, op2);
         assert_eq!(old1, old2, "old images match");
         assert_eq!(new1, new2, "new images match");
-        assert_eq!(gk1, gk2, "group keys match");
-        assert!(
-            gk2.as_deref().is_some_and(|g| g.contains("12345")),
-            "{gk2:?}"
-        );
     }
     let static_new = before[0].3.as_deref().expect("an insert has a new image");
     assert!(
@@ -1031,7 +1013,6 @@ async fn the_partial_images_keep_odd_identifiers() {
         ["Mixed", "a%s", "q\"uote", "%1$s", "gone"]
             .iter()
             .map(|c| c.to_string()),
-        vec!["Mixed".to_string(), "a%s".to_string(), "gone".to_string()],
     )
     .expect("a valid spec");
     trellis::capture::install::install(&mut raw, SCHEMA, &spec, None)
@@ -1061,11 +1042,10 @@ async fn the_partial_images_keep_odd_identifiers() {
     let images: Vec<ImageRow> = raw
         .query(
             &format!(
-                "select key, op, (old_image - 'gone')::text, (new_image - 'gone')::text, \
-                        array_remove(group_key, '7')::text \
+                "select key, op, (old_image - 'gone')::text, (new_image - 'gone')::text \
                  from ({}) r where change_id > $1 order by change_id",
                 ring(
-                    "key, op, old_image, new_image, group_key, change_id",
+                    "key, op, old_image, new_image, change_id",
                     "op <> 'schema_changed'"
                 )
             ),
@@ -1074,7 +1054,7 @@ async fn the_partial_images_keep_odd_identifiers() {
         .await
         .expect("read images")
         .into_iter()
-        .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4)))
+        .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
         .collect();
     assert_eq!(images.len(), 8, "{images:#?}");
     let (before, after) = images.split_at(4);
@@ -1388,7 +1368,7 @@ mod error_log {
 /// fixed, resuming each one rebuilds it to what a fresh build derives.
 #[tokio::test]
 async fn a_halting_key_pauses_its_closure_once_and_the_rest_of_the_page_drains() {
-    use trellis::staging::{StagedWatermark, apply, has_pending, seal};
+    use trellis::staging::{apply, has_pending, seal};
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
@@ -1414,7 +1394,6 @@ async fn a_halting_key_pauses_its_closure_once_and_the_rest_of_the_page_drains()
         "capture_schema_change_test",
         1,
         "trellis_capture_schema_change_test",
-        &StagedWatermark::saturated(),
     )
     .await
     .expect("the halt pauses its closure and the page commits");
@@ -1634,7 +1613,7 @@ async fn resuming_a_halted_closure_before_the_key_is_fixed_is_refused() {
 #[tokio::test]
 async fn peers_halting_on_one_closure_record_one_stop() {
     use trellis::staging::apply::{self, ApplyError};
-    use trellis::staging::{MIN_ROWS_TO_SPLIT, StagedWatermark, halt_closure, seal};
+    use trellis::staging::{MIN_ROWS_TO_SPLIT, halt_closure, seal};
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
@@ -1664,7 +1643,6 @@ async fn peers_halting_on_one_closure_record_one_stop() {
                 claimed_by,
                 2,
                 "trellis_capture_schema_change_test",
-                &StagedWatermark::saturated(),
             )
             .await?
             .is_some()

@@ -147,7 +147,7 @@ Four rules are load-bearing:
 | Field | Rule | Why |
 |---|---|---|
 | `new_image` | **last** — post-image of the highest-`lsn` change (`change_id` breaks ties); a latest `delete` wins with a NULL post-image even when it carries no image | an Apply writes the key's latest image, and a deleted key has none |
-| `old_image` | **first** — pre-image of the lowest-`lsn` change | the key's state before the window; no ledger target reads it, the relationship paths do ([below](#who-reads-the-old-image)) |
+| `old_image` | **first** — pre-image of the lowest-`lsn` change | the key's state before the window; no ledger target reads it ([below](#who-reads-the-old-image)) |
 | `src_changed` | **OR** | any source contribution makes the record a source change, so downstream propagation fires; dropping the OR reintroduces a mutual-derivation livelock |
 | `origin_lsn` | **LEAST**, unknown (`NULL`) wins | the oldest-origin marker read-your-writes soundness depends on ([07](07-convergence-and-await.md)); an unknown origin gates every token, so it must survive the merge |
 
@@ -176,14 +176,10 @@ No ledger target does. An aggregate's entry holds the group and contribution
 its key last applied, and a 1-1 target overwrites its row, so an Apply needs
 only the new image and `last_change`
 ([05](05-apply-and-exactly-once-deltas.md#the-ledger)). Besides the fold's
-own image-bearing test (below) and quarantine, which parks it in
+own image-bearing test (below), only quarantine reads it: it parks it in
 `poison_held.old_image` and hands it back as the release `Recompute`'s
-prior image, the old image is read only by relationship machinery, as the
-one place a key's old join value still exists: a to-side row's reverse path
-(the from-side rows that joined its old key, and its projection record), a
-from-side row's re-point or delete, which bumps the parent it left, and the
-reverse guard's in-flight check, which scans the ring's `old_image` directly.
-The ring carries both images for them ([ADR-0002](../decisions/0002-async-data-flow.md)).
+prior image. A group-basis aggregate and a `JOIN` read every ring row's
+images unfolded (`group_sides`), not the folded old image.
 
 ### The two kinds of missing image
 
@@ -194,15 +190,15 @@ so both arg-extremes must distinguish **"there is genuinely no image here"** fro
 - A key **born inside the batch** (insert-then-update) folds to `old_image =
   NULL`, because its lowest-`lsn` change is the insert, which has no pre-image (a
   delete symmetrically has no post-image). That NULL is a *fact about the change*:
-  the key had no state before the window, so a relationship reader has no old
-  join value to refresh. It must survive the fold. **Do not reintroduce a
+  the key had no state before the window, so a release has no prior image to
+  hand back for it. It must survive the fold. **Do not reintroduce a
   blanket `COALESCE` here.**
 - An **image-less row** — both images NULL — is not a change at all. Aggregates
   like `array_agg` don't skip NULLs, so without the discriminator such a row
   would win whichever ordering its `lsn` topped and hand the drain a NULL image,
   which the delta path reads as "no side to apply". It fails both ways: a
   re-derive restaged at `pg_current_wal_lsn()` would kill the `+f(new)` and
-  **under**-count, up to deleting a live group; reverse propagation and backfill
+  **under**-count, up to deleting a live group; downstream propagation and backfill
   restaged below would kill the `−f(old)`, **over**-counting with a phantom
   member.
 
@@ -219,10 +215,8 @@ primary-key move-out via its `old_image` — so each still contributes its hones
 NULL on the other side, while a bare trigger is excluded from both. A
 `recompute` is excluded whatever it carries, because neither of its columns is
 the key's state. Its `old_image`, when set, is a prior-image hint (the row as
-readers last saw it), which the fold returns as the record's prior image. Its
-`new_image`, when set, is one `{to_col: value}` join value that a quarantine
-release names (#944), which only the record's join values
-(`to_col_values`) read. A key whose
+readers last saw it), which the fold returns as the record's prior image. A
+key whose
 rows are all image-less folds to both images NULL and no `last_change`, which
 is correct: a ledger target re-derives it from live source.
 
@@ -238,10 +232,11 @@ trigger and defer to the earlier segment's post-image.
 The corollary binds *producers*, not just the fold: within one window, for one
 `(src_table, key)`, an image-bearing row always beats an image-less
 non-`delete` one — **even when the image-less one is newer**. A producer that can stage both shapes for the
-same key must therefore pick one. The target-mutation seam does: it stages a
-relationship-endpoint target's changed keys as image-bearing CDC-shaped rows
-and every other target's as image-less `Recompute`s, never both for one
-target (`staging::target_mutations`, #402/#403).
+same key must therefore pick one. The target-mutation seam does: it stages
+the changed keys of a target on its image feed (one a group-basis aggregate
+or a `JOIN` reads) as image-bearing CDC-shaped rows and every other target's
+as image-less `Recompute`s, never both for one target
+(`staging::target_mutations`, #402/#403).
 
 One fact the arg-extremes erase is kept on the side: **a recompute folded with
 a change.** A `recompute` never wins an image, so when it folds with the same
@@ -249,9 +244,7 @@ key's CDC change the record carries that change's images and looks like a plain
 change. The recompute was staged to re-derive the key from live state, and
 applying the change's image instead would skip that (issue #392). The fold
 carries `has_recompute = bool_or(op = 'recompute')`, and a ledger target
-re-derives such a key rather than applying its last change. A to-one
-relationship's reverse path also re-derives the from-side rows, as it does for
-a bare trigger.
+re-derives such a key rather than applying its last change.
 
 A group-basis aggregate (ADR-0002, "Aggregates: a basis per group, kept by
 deltas") needs what the fold erases altogether: every change row of a key,

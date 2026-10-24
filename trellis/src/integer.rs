@@ -100,7 +100,7 @@ impl IntWidth {
     /// message. Deliberately the *standard* spelling rather than the
     /// `int2`/`int4`/`int8` alias, because it has to double as a
     /// `format_type` rendering for
-    /// [`crate::defs::catalog::is_text_stable_join_key_type`]'s allowlist,
+    /// [`crate::defs::join_key_types::is_text_stable_join_key_type`]'s allowlist,
     /// which matches what `format_type` actually emits.
     pub const fn pg_name(self) -> &'static str {
         match self {
@@ -179,7 +179,7 @@ impl fmt::Display for IntWidth {
 /// Postgres's integer output is canonical — an optional `-`, then digits,
 /// with no `+`, no leading zeros, no thousands separator and no surrounding
 /// whitespace — which is precisely why these types are already on
-/// [`crate::defs::catalog::is_text_stable_join_key_type`]'s allowlist. This
+/// [`crate::defs::join_key_types::is_text_stable_join_key_type`]'s allowlist. This
 /// parser is correspondingly strict rather than lenient: accepting `007` or
 /// `" 7 "` here would mean two spellings of one value could reach a key
 /// comparison, which is the exact hazard that allowlist exists to rule out.

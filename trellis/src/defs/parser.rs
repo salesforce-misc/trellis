@@ -13,9 +13,9 @@
 //! accept either a bare `<table>` (resolved once, later, via `search_path` —
 //! issues #72/#73) or an explicit `<schema>.<table>` spelling that names its
 //! schema directly and skips that resolution — see [`Self::parse_table_ref`]
-//! for the shared parsing logic and why it doesn't collide with
-//! `<rel>.<column>` relationship-path syntax elsewhere in this grammar despite
-//! reusing the same `ident '.' ident` token shape.
+//! for the shared parsing logic and why it doesn't collide with qualified
+//! column references elsewhere in this grammar despite reusing the same
+//! `ident '.' ident` token shape.
 //!
 //! `FROM <source>` is where the key-space clause slots in: absent for 1-1,
 //! `GROUP BY <cols>` for an aggregate, `[LEFT|INNER] JOIN <other> ON <cond>
@@ -24,21 +24,16 @@
 //! grouping (`(<expr>)`, issue #67 — needed once a caller composes `+` and
 //! `>` and must override the precedence table's own grouping), `name(args)`
 //! function calls against [`super::registry::FUNCTIONS`] (issue #64), and
-//! `<rel>.<column>` relationship-path references (issue #25, ADR-0006) —
-//! whose head is a relationship name, resolved and cardinality-checked by
-//! later issues, not this parser — and qualified source columns,
-//! `<table>.<column>` with the `FROM` table's bare name as the head, or any
-//! `<schema>.<table>.<column>` (issue #830, see
-//! [`Parser::parse_dotted_reference`]). Issue #109 adds **typed literals**, spelled
+//! qualified columns, `<table>.<column>` or `<schema>.<table>.<column>`
+//! (issue #830, see [`Parser::parse_dotted_reference`]). Issue #109 adds **typed literals**, spelled
 //! either `<type> '<text>'` or `CAST('<text>' AS <type>)` — see
 //! [`super::typed_literal`] for the allowlisted types, why both spellings
 //! build one AST node, and why `<expr>::<type>` and general casts are
 //! rejected. `<predicate>` accepts only the literal `TRUE`.
 
 use super::ast::{
-    AlterClause, AlterTransform, DefinitionRef, Expr, FieldDef, GroupByKey, JoinKind, JoinOn,
-    JoinSpec, KeySpace, Predicate, QualifiedColumn, Statement, StatementKind, TransformDef,
-    TransformRef,
+    AlterClause, AlterTransform, DefinitionRef, Expr, FieldDef, JoinKind, JoinOn, JoinSpec,
+    KeySpace, Predicate, QualifiedColumn, Statement, StatementKind, TransformDef, TransformRef,
 };
 use super::error::ParseError;
 use super::lexer::{Token, lex};
@@ -169,17 +164,11 @@ struct Parser {
     /// for the whole statement by the time fields are parsed.
     is_aggregate: bool,
     /// The `FROM` table's bare name, once [`Self::parse_transform_def`] has
-    /// parsed it: a two-part `<head>.<column>` whose head is this table is a
-    /// qualified source column, any other head a relationship (issue #830).
-    /// `None` for an `ALTER TRANSFORM` clause, whose statement doesn't name
-    /// the source; [`super::catalog::alter_transform`] resolves its
-    /// two-part names against the stored definition's instead
-    /// ([`super::ast::Expr::qualify_source_columns`]).
+    /// parsed it: a two-part `GROUP BY` key must name this table. `None` for
+    /// an `ALTER TRANSFORM` clause, whose statement doesn't name the source.
     source: Option<String>,
     /// The `JOIN` table's bare name, once [`Self::parse_join_clause`] has
-    /// parsed it: a two-part `<head>.<column>` whose head is this table is a
-    /// qualified column of the joined side, as `source` does for the `FROM`
-    /// side.
+    /// parsed it.
     joined: Option<String>,
 }
 
@@ -280,16 +269,12 @@ impl Parser {
     /// dangling for a later parse step to trip over with a confusing
     /// "expected end of input".
     ///
-    /// **Not ambiguous with [`Expr::RelationshipPath`]'s own `a.b` handling**
-    /// in [`Self::parse_primary`], even though both recognize the same
+    /// **Not ambiguous with a qualified column's `a.b`** in
+    /// [`Self::parse_primary`], even though both recognize the same
     /// `ident '.' ident` token shape: this method only ever runs immediately
-    /// after the `TRANSFORM`/`FROM` keyword, before `SELECT`'s field-expression
-    /// list is even reached, so the two never compete for the same tokens.
-    /// They *mean* different things by design too — a table reference's `.`
-    /// qualifies a table with its schema, while a relationship-path's `.`
-    /// addresses a column through a named relationship — but callers of this
-    /// method never need to care, since the grammar positions alone already
-    /// keep them apart.
+    /// after the `TRANSFORM`/`FROM`/`JOIN` keyword, before `SELECT`'s
+    /// field-expression list is reached, so the two never compete for the
+    /// same tokens.
     fn parse_table_ref(&mut self) -> Result<(String, Option<String>), ParseError> {
         let first = self.expect_ident()?;
         if !self.peek_is_symbol('.') {
@@ -519,10 +504,7 @@ impl Parser {
     /// under), regardless of the target's actual key-space: this grammar slot
     /// doesn't repeat `GROUP BY`, so the parser has no way to know the
     /// target's key-space at parse time. That still accepts every shape a
-    /// 1-1 definition's own field list does, including an aggregate-function
-    /// call over a to-many relationship path (the one aggregate shape a
-    /// row-grain definition already allows) — only a *plain* `SUM`/`COUNT(*)`
-    /// grouping aggregate is unavailable here, matching the current release's
+    /// 1-1 definition's own field list does, and no aggregate call, matching the current release's
     /// scope of `ALTER TRANSFORM` to 1-1 targets (see
     /// [`super::catalog::alter_transform`]'s own doc comment).
     fn parse_alter_clause(&mut self) -> Result<AlterClause, ParseError> {
@@ -741,31 +723,26 @@ impl Parser {
         })
     }
 
-    /// Parses one `GROUP BY` key (issue #137): a plain `<column>`, or a
-    /// to-one relationship path `<rel>.<column>` — the same `ident '.'
-    /// ident` shape [`Self::parse_primary`]'s `Expr::RelationshipPath`
-    /// handling recognizes, reused here rather than duplicated since a
-    /// `GROUP BY` key sits in its own reserved grammar slot (ahead of
-    /// `SELECT`) and can never compete with an expression's own tokens.
-    /// Whether the head names an actually-declared relationship, and its
-    /// cardinality (a to-many path is rejected — grouping by "the many child
-    /// rows on the other end of a to-many relationship" has no defined
-    /// semantics), is resolved later by the validator, not this parser.
-    fn parse_group_by_key(&mut self) -> Result<GroupByKey, ParseError> {
+    /// Parses one `GROUP BY` key of a non-`JOIN` aggregate: a plain
+    /// `<column>`, or `<source>.<column>` naming the `FROM` table (issue
+    /// #830). A key is always a source column, never a field, so the
+    /// qualifier changes nothing and isn't kept. Any other head is refused
+    /// ([`ParseError::GroupByKeyNotFromSource`]).
+    fn parse_group_by_key(&mut self) -> Result<String, ParseError> {
         let first = self.expect_ident()?;
         if self.peek_is_symbol('.') {
             self.advance();
             let column = self.expect_ident()?;
-            // Issue #830: `<source>.<column>` is the source column, as in a
-            // field's expression. A key is always a source column or a
-            // relationship path, never a field, so the qualifier changes
-            // nothing and isn't kept.
-            if self.source.as_deref() == Some(first.as_str()) {
-                return Ok(GroupByKey::Column(column));
+            let source = self.source.clone().unwrap_or_default();
+            if source != first {
+                return Err(ParseError::GroupByKeyNotFromSource {
+                    reference: format!("{first}.{column}"),
+                    source,
+                });
             }
-            return Ok(GroupByKey::RelationshipPath { rel: first, column });
+            return Ok(column);
         }
-        Ok(GroupByKey::Column(first))
+        Ok(first)
     }
 
     /// Rejects a `JOIN`/`GROUP BY` key-space clause with a construct-specific
@@ -895,7 +872,7 @@ impl Parser {
                 // Checked before the `.`/`(` branches below and gated on the
                 // *next* token being a string literal, which makes it
                 // unambiguous against every other use of an identifier here:
-                // a column reference, a relationship-path head and a
+                // a column reference, a qualified column's head and a
                 // function name are each followed by end-of-expression, `.`
                 // or `(` respectively, never by a string. So a source column
                 // genuinely named `date` still parses as a column in
@@ -912,7 +889,7 @@ impl Parser {
                     // a typed-literal attempt and nothing else: everywhere
                     // else an identifier appears in this grammar it's
                     // followed by an identifier (`x AS y`), a `.`
-                    // (relationship path), a `(` (function call), an
+                    // (qualified column), a `(` (function call), an
                     // operator symbol, or end-of-expression — never a
                     // string. So an unallowlisted type keyword here gets the
                     // same purpose-built error the `CAST` spelling gives,
@@ -959,29 +936,12 @@ impl Parser {
 
                     if AGGREGATE_FUNCTIONS.contains(&upper.as_str()) {
                         if !self.is_aggregate {
-                            // A to-many relationship enrichment (ADR-0006, #29):
-                            // an aggregate whose sole argument is a `<rel>.<col>`
-                            // path folds over *related* rows, not a GROUP BY
-                            // group, so it is valid in a row-grain (OneToOne)
-                            // target even though ordinary aggregates are not.
-                            // Any other aggregate shape here — including
-                            // `COUNT(*)`, whose `*` is not a `parse_call_args`
-                            // expression — is a genuine wrong-key-space error.
-                            let unsupported = || ParseError::UnsupportedKeySpace {
+                            return Err(ParseError::UnsupportedKeySpace {
                                 construct: format!("{name}(...)"),
                                 detail: "aggregate functions require an aggregate key-space \
-                                    (GROUP BY) or a to-many relationship path argument, \
-                                    neither of which applies here"
+                                    (GROUP BY)"
                                     .to_string(),
-                            };
-                            if self.peek_is_symbol('*') {
-                                return Err(unsupported());
-                            }
-                            let args = self.parse_call_args()?;
-                            if matches!(args.as_slice(), [Expr::RelationshipPath { .. }]) {
-                                return Ok(Expr::FunctionCall { name: upper, args });
-                            }
-                            return Err(unsupported());
+                            });
                         }
 
                         if upper == "COUNT" {
@@ -1017,7 +977,7 @@ impl Parser {
                             // sharing its name because Postgres's own grammar
                             // does too. Any single expression this grammar can
                             // parse is accepted here (a bare column, a
-                            // relationship path, a composed expression); the
+                            // qualified column, a composed expression); the
                             // validator (`super::validate::infer_expr`) is
                             // what actually resolves and types it —
                             // `count(x)` accepts any argument type in
@@ -1088,38 +1048,18 @@ impl Parser {
     }
 
     /// Parses the rest of a dotted name whose head `first` (and its `.`) is
-    /// at the cursor (issue #830):
-    /// * `<schema>.<table>.<column>` is a qualified source column, always;
-    /// * `<table>.<column>`, where `table` is the `FROM` table's bare name, is
-    ///   a qualified source column;
-    /// * any other `<rel>.<column>` is a relationship path (ADR-0006), whose
-    ///   head is a relationship name, resolved by the validator.
-    ///
-    /// A relationship can't be named after its from-table
-    /// ([`super::validate::ValidationError::RelationshipNamedAfterFromTable`]),
-    /// so the two-part reading never hides a relationship. Whether a
-    /// qualified column names the right table and a real column is the
-    /// validator's to check.
+    /// at the cursor (issue #830): `<table>.<column>` or
+    /// `<schema>.<table>.<column>`, a qualified column either way. Whether it
+    /// names the `FROM` (or `JOIN`) table and a real column is the
+    /// validator's to check, so an `ALTER TRANSFORM` clause, parsed without
+    /// knowing its source, builds the same node a `TRANSFORM` does.
     fn parse_dotted_reference(&mut self, first: String) -> Result<Expr, ParseError> {
         self.expect_symbol('.')?;
         let second = self.expect_ident()?;
         if !self.peek_is_symbol('.') {
-            if self.source.as_deref() == Some(first.as_str()) {
-                return Ok(Expr::SourceColumn {
-                    schema: None,
-                    table: first,
-                    column: second,
-                });
-            }
-            if self.joined.as_deref() == Some(first.as_str()) {
-                return Ok(Expr::SourceColumn {
-                    schema: None,
-                    table: first,
-                    column: second,
-                });
-            }
-            return Ok(Expr::RelationshipPath {
-                rel: first,
+            return Ok(Expr::SourceColumn {
+                schema: None,
+                table: first,
                 column: second,
             });
         }

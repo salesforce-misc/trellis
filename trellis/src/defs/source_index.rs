@@ -36,7 +36,7 @@ use std::fmt::Write as _;
 use tokio_postgres::GenericClient;
 
 use super::ast::ValueType;
-use super::ast::{GroupByKey, KeySpace, TransformDef};
+use super::ast::{KeySpace, TransformDef};
 use super::ddl::regclass_arg;
 use super::join::{self, Side};
 use crate::pool::quote_ident;
@@ -138,13 +138,7 @@ pub(crate) fn required(
             if crate::staging::group_basis::route(def, source_columns).is_none() {
                 return Vec::new();
             }
-            let columns: Vec<String> = group_by
-                .iter()
-                .filter_map(|key| match key {
-                    GroupByKey::Column(column) => Some(column.clone()),
-                    GroupByKey::RelationshipPath { .. } => None,
-                })
-                .collect();
+            let columns: Vec<String> = group_by.to_vec();
             vec![SourceIndex {
                 table: source_table.to_string(),
                 columns,

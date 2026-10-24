@@ -40,7 +40,7 @@ sequenceDiagram
     W->>DB: BEGIN
     W->>DB: 1. version fence (FOR SHARE on each computed source)
     W->>DB: 2. derived writes, gone-key deletes, truncate handling<br/>(1-1: sorted entry lock + I2 test)
-    W->>DB: 3. aggregate ledgers (sorted entry lock, I2 test, group increments),<br/>relationship projections
+    W->>DB: 3. aggregate ledgers (sorted entry lock, I2 test, group increments)
     W->>DB: 4. downstream staging — into the ACTIVE batch
     W->>DB: 5. last page: mark this claim's buckets drained<br/>earlier page: check the claim, advance the cursor
     W->>DB: 6. pg_notify (the instance's wake channel)
@@ -173,7 +173,6 @@ table:
 | Aggregate group increments (`+new − old`, per entry) | yes | **no** | exactly-once (the three properties above), and the entry's I2 test |
 | Aggregate entry writes, from an image or a Re-derive read | **no** | yes | the ledger's entry lock and I2 test, below |
 | 1-1 field writes and deletes, from an image or a Re-derive read | **no** | yes | the 1-1 ledger's entry lock and I2 test, below |
-| Relationship projection writes | no | yes | the per-row `prev_lsn` ordering guard |
 | Truncate | no | yes | the drain barrier (full serialization) |
 
 I2 is one test, shared by both ledgers: an Apply changes its entry only if its
@@ -251,37 +250,10 @@ Nothing has to be re-read for a hot key: an Apply is judged by its own
 position, so a key whose source changes faster than a batch drains still
 gets each batch's newest image.
 
-A relationship-enriched 1-1 target evaluates an Apply against the
-relationship projection Phase 2 read. It evaluates a Re-derive against the
-projection read in Phase 3, after the entry lock and the Re-derive read, for
-exactly the rows read (ADR-0002, "Relationships"). A page can sit between
-its Phase 2 and its lock for a long time, and a parent change whose
-recompute drained in that window would otherwise have its value written
-over by the page's older read (#838). A parent change whose reverse
-commits after the Re-derive's read stages a recompute whose page waits on
-the entry lock and writes after this one. The Apply's earlier read doesn't
-need the lock. While the Apply's change is in flight, guard (c) defers the
-reverse of a to-one parent change that commits after the read, until the
-reverse's fairness escalation advances the projection anyway, and either
-way the reverse stages a recompute of the row; a to-many relationship's
-to-side change stages one at once. That recompute's Re-derive reads the
-row after the Apply's change, so I2 refuses the Apply if it lands later
-still. Both reads miss a parent change for a row that joins the parent
-while the parent's reverse page is uncommitted, after that page found the
-parent's children: the reverse's recompute doesn't reach it (#892). The
-Re-derive reads the projection by its primary key with sequential scans
-off, as the entry lock reads the ledger, so a projection whose statistics
-lag its size isn't read in full while the entries stay locked. A to-many
-relationship's to-side is read by its join column as Phase 2 reads it,
-since that column may have no index.
-
 `ALTER TRANSFORM`'s field rebuild and a column resume are field builds
 (`staging::build`, #625 F8b): background chunks that lock a range of keys'
 entries as a page does and rewrite just the changed columns of their target
-rows from one snapshot, leaving the entries as they are. A relationship-
-enriched 1-1 target's field build re-derives each key's whole row instead,
-settled the same way as a page's Re-derive, the projection read after the
-entry lock included (#832).
+rows from one snapshot, leaving the entries as they are.
 
 ### The ledger
 
@@ -331,17 +303,14 @@ cost of maintaining it, which on a ledger far larger than `shared_buffers`
 is most of a build's WAL, as full-page images of the index's leaves.
 
 A target is built one of two ways. The Re-derive build (`staging::build`,
-#625) serves an aggregate target with no relationship path and a 1-1 target
-with none, on a captured source (not another definition's target): it
+#625) serves an aggregate target and a 1-1 target, on a captured source or
+another definition's target: it
 applies from its start and re-derives the source in chunks, each inserting
 the entries its keys don't have yet and locking the others as a page does,
 and stamping them as a Re-derive does (below).
 Every other target keeps the one-pass build. For an aggregate it empties the
 ledger, reads the source into it in one statement whose snapshot becomes
 every entry's basis, and then writes the group rows as a `GROUP BY` over it.
-A relationship-enriched 1-1 target's one-pass build writes no entries: a
-key's first change after it inserts the key's entry, and the go-live
-catch-up's Re-derives stamp every key's basis.
 
 ### Aggregate groups: the ledger
 
@@ -357,13 +326,7 @@ of two kinds (#623 D3, D4):
   field such as `SUM(a) + COUNT(b)`).
 
 An argument may be an expression (`SUM(v + 1)`), evaluated per change over
-the image as the source's row type. A target that reads a value, or groups by
-one, through a to-one relationship is no different (#623 D5): its statements
-left-join each relationship's to-side and read the parent live, after the
-entry lock and in the same statement as the child's read. A parent change
-re-derives every child it reaches; a child that has since moved off the
-parent has a change of its own pending, whose write reads its new parent.
-Each page applies its records for an aggregate target in one transaction, in
+the image as the source's row type. Each page applies its records for an aggregate target in one transaction, in
 five steps:
 
 1. **Lock (I1, I5).** Insert an entry for every key the page has no entry
@@ -371,10 +334,8 @@ five steps:
    statement. As on a 1-1 target, a new key's Apply is written into the entry
    its insert creates, since with no entry I2 is only the truncate floor
    (#775); step 3 leaves that entry alone and counts it as a move into its
-   group from no entry. A Re-derive's new key, an Apply at or below the
-   floor, and every new key of a target that reads a relationship (whose
-   parents must be read after the lock) get a non-member placeholder that
-   step 3 writes. A key whose tombstone the GC collects between the two
+   group from no entry. A Re-derive's new key and an Apply at or below the
+   floor get a non-member placeholder that step 3 writes. A key whose tombstone the GC collects between the two
    statements fails the page transiently and it is retried (#712).
 2. **Re-derive read.** A record staged as a `recompute`, or folded with one, is a
    Re-derive. So is a record with no change to apply, and every record of a
@@ -640,21 +601,7 @@ statement**. The entry lock is ordered by key
 ([the 1-1 ledger](#absolute-writes-do-not-commute-the-1-1-ledger),
 [the aggregate ledger](#aggregate-groups-the-ledger)); a 1-1 target's rows are
 then pre-locked in key order, and an aggregate's group upsert writes its
-groups in group order. After its targets, a page locks every to-one
-relationship projection row it writes, in one sorted statement per
-relationship, in relationship order. Those are the rows whose generation it
-bumps and the rows its reverse records guard and advance, and the order is
-the one the reverse release uses. Left to themselves, the bump would write
-its rows in whatever order its plan reads them (physical order under a
-bitmap scan), and the reverse records would lock theirs one at a time in
-fold order. Either one deadlocks against a page or a release that reaches
-the same parents in another order. The sorted lock finds only the rows
-that exist when it runs. A row it didn't find, because it doesn't exist yet
-or was committed after the lock, is locked when a reverse record reads or
-writes it, in record order, and a record inserting a key another page is
-inserting waits on that page's insert. Two pages can still deadlock through
-such a row, but only while a projection row both of them reach is being
-created; Postgres aborts one of them, which retries.
+groups in group order.
 
 A consistent total lock order has no cycle, so overlapping workers serialize on a
 shared hot group instead of deadlocking. That plus a bounded, idempotent retry on
@@ -733,14 +680,9 @@ autovacuum waits the vacuum out (#622 plan Q1).
 ## Downstream propagation, and why it terminates
 
 Step 4 stages the keys whose derived values depend on what just changed: every
-key a step above physically wrote in a target another definition reads, and,
-for a relationship whose to-side changed, the from-side rows that join it. An
+key a step above physically wrote in a target another definition reads. An
 aggregate needs no old image for this: its ledger entry names the group a key
-was in. The relationship paths still read the old image a capture trigger
-stages ([01](01-capture-by-triggers.md)), the only place a key's old join
-value still exists: a to-side **delete** or **join-key change** must refresh
-the from-side rows that joined the old key, not only those that join the new
-one ([04](04-claiming-and-the-fold.md#who-reads-the-old-image)). 
+was in.
 Two termination mechanisms:
 
 - **Filtered staging.** Dependents are staged only for tables that actually have a
@@ -792,8 +734,8 @@ the failure reaches, not the instance** (#663). Every key reproduces it, so the
 page can never drain as it stands; instead the drain pauses a closure and retries
 the page without it:
 
-- for a key error, every definition that reads the table (as its source or as a
-  relationship's to-side);
+- for a key error, every definition that reads the table (as its source or as
+  a `JOIN`'s joined table);
 - for a hop bound outside a cycle, the readers of the table the wave ran away
   through — not the definition that wrote it; inside a cycle, every member;
 - for an aggregate off the ledger, the definition that writes that target;
@@ -802,13 +744,7 @@ the page without it:
   readers of each table they read that the role can't (`SELECT`, or policies
   that apply to it), and the writer of each target it can't write. The
   page's retries, and the isolation probes they run, then skip every table no
-  unfrozen definition reads, as for a table whose key can't be used (#768):
-  its own changes, and the lookup of a relationship's from-side rows a
-  to-side change would recompute. The drain keeps a relationship's settled
-  projection current from its to-side whatever its readers' status, and
-  recomputes the from-side for the to-side's other readers' changes, so
-  either read would be refused again. A resume refreshes the projections it
-  reads;
+  unfrozen definition reads, as for a table whose key can't be used (#768);
 - and, in every case, everything downstream of those, so no hop target goes
   quietly stale.
 
@@ -835,7 +771,7 @@ through the same attribution (#813), read from the catalog as the discharge's
 own role. It pauses what the refusal reaches with `kind` `halt` and retries
 the marker at once without them. A frozen definition doesn't count as a reader
 of a table, so once every reader of the refused table is paused, the retry
-neither enumerates it nor refreshes its projections, and the marker discharges.
+doesn't enumerate it, and the marker discharges.
 A refusal the catalog can't pin pauses nothing, and the marker backs off as
 for any failed discharge, with the error on `backfill_failure`.
 

@@ -421,8 +421,8 @@ pub(crate) async fn pause_for_grammar_version(
 
 /// [`pause_for_capture_failure`] for a drain's halt (#663,
 /// `staging::halt`): pauses definition `id` because a page failed with a
-/// halting error on `source_table` that it reads, directly, through a
-/// relationship, or downstream of a definition that does. The record's
+/// halting error on `source_table` that it reads, directly or downstream of
+/// a definition that does. The record's
 /// `kind` is `halt`. Returns whether this call paused it.
 pub(crate) async fn pause_for_halt(
     txn: &Transaction<'_>,
@@ -496,13 +496,6 @@ async fn pause_with_record(
 /// source — take that source away and the dependent can never be resumed at
 /// all. The operator retires a chain from the leaves inward, which is exactly
 /// reverse dependency order.
-///
-/// "Dependent" covers relationships as well as transforms: a `RELATIONSHIP`
-/// whose **to**-side is this target blocks the drop on its own, with no
-/// transform reading through it, because it is a registered definition naming
-/// the target — and because the surviving `relationship` edge would otherwise
-/// strand the target's `schema_nodes` row (see [`dependency_blockers`] for
-/// what that wedges). `drop_relationship` it first.
 ///
 /// **Everything — the status precondition, the dependency refusal, and every
 /// write — happens in one transaction, under the target's own `for update`
@@ -644,9 +637,7 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
     // Edges *into* the target node are the ones this definition owns: its
     // `source` edge from its own source table, plus a `JOIN`'s `join` edge
     // from its joined table (#1107). Edges *out of* the target node
-    // belong to whatever chains off it and are left alone — as is a
-    // `relationship` edge, which a `RELATIONSHIP` declaration owns and
-    // `drop_relationship` reaps.
+    // belong to whatever chains off it and are left alone.
     if let Some(node_id) = node_id_for(&txn, &qualified).await? {
         txn.execute(
             "delete from schema_edges where to_node_id = $1 and kind in ('source', 'join')",
@@ -737,11 +728,7 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
 /// drop — previously impossible to hit only because the check was live-only
 /// and a drop's subject is always frozen.
 ///
-/// Returns blocker names sorted and deduplicated, in the same two spellings
-/// [`CatalogError::DependentsBlockDrop`]'s `subject` uses: a bare transform
-/// name, or `schema.from_table.relationship_name` for a relationship. A definition
-/// reachable both by a `source` edge and through a relationship is one
-/// blocker, named once.
+/// Returns blocker names, bare transform names, sorted and deduplicated.
 async fn dependency_blockers(
     txn: &Transaction<'_>,
     target: &str,
@@ -749,47 +736,6 @@ async fn dependency_blockers(
     definition_id: i64,
 ) -> Result<(Vec<String>, Vec<String>), CatalogError> {
     let mut blockers = source_edge_dependents(txn, qualified_target, definition_id).await?;
-
-    // ADR-0014's "chains off the target" is not only the `FROM <target>`
-    // spelling. A `RELATIONSHIP <name> FROM <t>.<col> TO <target>.<col>`
-    // names this target in its own declaration, and there are *two* distinct
-    // dependents hiding behind that one edge.
-    //
-    // 1. **The relationship itself**, whether or not anything reads through
-    //    it. It is a registered definition naming the target, so the same
-    //    rule the rest of this function applies — any dependent still
-    //    defined, in any status, blocks — makes it a blocker in its own
-    //    right. This is not a nicety: the drop deliberately leaves
-    //    `relationship` edges alone (they belong to the declaration, and
-    //    `drop_relationship` reaps them), so a relationship surviving its
-    //    to-side keeps the target's `schema_nodes` row alive with nothing
-    //    left to explain it. [`super::all_source_tables`] then keeps naming
-    //    a table that no longer exists, and every later capture reconcile
-    //    pass would keep trying to capture it. Refusing
-    //    is what keeps that unreachable; the reader check below never did,
-    //    because the damage is edge-scoped and that check is reader-scoped.
-    //
-    // 2. **Every transform reading `<name>.<column>`**, which is a reader of
-    //    this target's rows by a path that leaves no `source` or `join` edge
-    //    behind, so `source_edge_dependents` above cannot see it. Named in
-    //    addition to the relationship rather
-    //    than instead of it, so the refusal shows the operator the whole
-    //    subgraph still standing on this target rather than one layer of it
-    //    at a time.
-    //
-    // A relationship declared `FROM <target>.<col>` blocks too (issue #375),
-    // for the reason [`relationships_naming`] gives. Its readers are
-    // transforms over the target itself, which `source_edge_dependents`
-    // already names; the dedup below folds them.
-    for (qualified_from, name) in relationships_naming(txn, qualified_target).await? {
-        // The qualified address (issue #288): `blog.posts.author` and
-        // `shop.posts.author` are two blockers, and a bare `posts.author`
-        // would both collapse them into one below and name a `DROP
-        // RELATIONSHIP` address that is refused as ambiguous.
-        blockers.push(format!("{qualified_from}.{name}"));
-        blockers.extend(relationship_readers(txn, &qualified_from, &name, Some(target)).await?);
-    }
-
     blockers.sort();
     blockers.dedup();
 
@@ -873,85 +819,6 @@ async fn source_edge_dependents(
         )
         .await?;
     Ok(rows.into_iter().map(|row| row.get(0)).collect())
-}
-
-/// Every relationship that names the target as either endpoint, as
-/// `(qualified from-table, name)`, the pair that identifies one (issue #288).
-///
-/// A relationship whose **to**-side is `qualified_target` is one through
-/// which a transform over some other source can be reading the target's rows.
-/// Matched on the to-side's recorded schema (issue #372), so a same-named
-/// table in another schema is not a blocker.
-///
-/// A relationship whose **from**-side is `qualified_target` (issue #375)
-/// has no reader to strand, but surviving the drop would leave the name a
-/// relationship endpoint with no definition behind it. A later definition
-/// re-creating that target would inherit the endpoint, and with it a place
-/// in capture, without passing `create_relationship`'s endpoint guards: an
-/// aggregate target endpoint, which has no primary key to capture by.
-async fn relationships_naming(
-    txn: &Transaction<'_>,
-    qualified_target: &str,
-) -> Result<Vec<(String, String)>, CatalogError> {
-    let rows = txn
-        .query(
-            "select from_schema || '.' || from_table, name from relationship_definitions \
-             where to_schema || '.' || to_table = $1 \
-                or from_schema || '.' || from_table = $1 \
-             order by id",
-            &[&qualified_target],
-        )
-        .await?;
-    Ok(rows.into_iter().map(|r| (r.get(0), r.get(1))).collect())
-}
-
-/// The bare target names of every registered transform that still reads the
-/// relationship `name` declared on the qualified `qualified_from` — every
-/// status, not only applying ones (issue #231: a frozen reader still needs the
-/// relationship the day it resumes, and resuming rebuilds from source).
-///
-/// Scoped to definitions whose own qualified source *is* `qualified_from`: a
-/// relationship name is only resolvable from a definition over its from-table
-/// (that is what makes the name per-from-table unique in the first place), so
-/// a same-named relationship on a different from-table — including a
-/// same-named table in another schema (issue #288) — is a different
-/// relationship and must not be counted as a dependent here.
-///
-/// `exclude` drops one bare target name from the result — the definition
-/// being dropped itself, when [`drop_transform`] asks this about a
-/// relationship pointing at its own target. Without it a definition that
-/// reads a relationship whose to-side is its own target would block its own
-/// drop, which the previous live-only filter hid (a drop's subject is always
-/// frozen, so it never matched).
-async fn relationship_readers(
-    txn: &Transaction<'_>,
-    qualified_from: &str,
-    name: &str,
-    exclude: Option<&str>,
-) -> Result<Vec<String>, CatalogError> {
-    let rows = txn
-        .query(
-            "select definition_text, grammar_version from transform_definitions \
-             where source_table = $1 order by id",
-            &[&qualified_from],
-        )
-        .await?;
-
-    let mut readers = Vec::new();
-    for row in rows {
-        let text: String = row.get(0);
-        let def = super::grammar::load(&text, row.get(1))?;
-        if exclude == Some(def.target.as_str()) {
-            continue;
-        }
-        if super::eval::relationship_references(&def)
-            .iter()
-            .any(|(rel, _)| rel == name)
-        {
-            readers.push(def.target);
-        }
-    }
-    Ok(readers)
 }
 
 /// The row-locked identity of the bare-named `target`: its id, its status,

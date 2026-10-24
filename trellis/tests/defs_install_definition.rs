@@ -178,21 +178,12 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
     // Issue #132: a throwaway, always-caught-up watermark — this helper
     // has no live capture running, and none of this file's tests exercise guard (a) specifically, so a
     // real watermark would only ever make guard (a) reject spuriously.
-    let watermark = trellis::staging::StagedWatermark::saturated();
-    let watermark = &watermark;
     for _ in 0..16 {
         let seg = seal_active_segment(client).await;
-        while apply::drain_once(
-            pool,
-            seg,
-            "install_def_test",
-            1,
-            "trellis_install_def_test",
-            watermark,
-        )
-        .await
-        .expect("drain_once")
-        .is_some()
+        while apply::drain_once(pool, seg, "install_def_test", 1, "trellis_install_def_test")
+            .await
+            .expect("drain_once")
+            .is_some()
         {}
         retire_drained_segments(client)
             .await

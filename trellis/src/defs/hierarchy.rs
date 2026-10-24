@@ -19,8 +19,8 @@
 //! [`hierarchy`] is the one check for it, read from `pg_class` and
 //! `pg_inherits`:
 //!
-//! - **Defining** a transform refuses such a source, or a relationship
-//!   endpoint it would capture: `catalog::change_keyed` is a plain table
+//! - **Defining** a transform refuses such a source:
+//!   `catalog::change_keyed` is a plain table
 //!   with a primary key that [`hierarchy`] finds nothing for. Every resume
 //!   re-runs it.
 //! - **The staging worker's capture pass** pauses every definition that

@@ -4,9 +4,7 @@
 use std::collections::HashMap;
 
 use testkit::TestCluster;
-use trellis::defs::ast::{
-    Expr, FieldDef, GroupByKey, KeySpace, Operator, Predicate, TransformDef, ValueType,
-};
+use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use trellis::defs::{
     DdlError, PgType, PrimaryKeyColumn, create_aggregate_target_table, create_target_table, parse,
     source_primary_key,
@@ -464,7 +462,7 @@ async fn other_typed_passthrough_columns_get_their_real_native_target_type() {
 /// source column's *concrete* Postgres type on the target (`integer` stays
 /// `integer`, `bigint` stays `bigint`, `smallint` stays `smallint`), instead
 /// of collapsing through `ValueType::Numeric` to `numeric` — so the target
-/// column stays eligible as a relationship join key. A non-passthrough field
+/// column stays eligible as a `JOIN` key. A non-passthrough field
 /// (arithmetic over the same columns) still widens to `numeric`, since its
 /// result genuinely can't be narrower.
 #[tokio::test]
@@ -662,7 +660,7 @@ async fn uuid_column_works_as_an_aggregate_group_by_key() {
         target: "comments_by_author".to_string(),
         source: "comments".to_string(),
         key_space: KeySpace::Aggregate {
-            group_by: vec![GroupByKey::Column("author".to_string())],
+            group_by: vec!["author".to_string()],
         },
         fields: vec![
             FieldDef {
@@ -748,7 +746,7 @@ async fn aggregate_target_table_gets_a_nulls_not_distinct_unique_key_from_the_gr
         target: "order_totals".to_string(),
         source: "order_line_items".to_string(),
         key_space: KeySpace::Aggregate {
-            group_by: vec![GroupByKey::Column("order_id".to_string())],
+            group_by: vec!["order_id".to_string()],
         },
         fields: vec![
             FieldDef {
@@ -886,7 +884,7 @@ async fn aggregate_columns_sharing_an_argument_share_one_count_column() {
         target: "order_totals".to_string(),
         source: "order_line_items".to_string(),
         key_space: KeySpace::Aggregate {
-            group_by: vec![GroupByKey::Column("order_id".to_string())],
+            group_by: vec!["order_id".to_string()],
         },
         fields: vec![
             FieldDef {
@@ -979,7 +977,7 @@ async fn aggregate_columns_over_different_arguments_keep_separate_count_columns(
         target: "posts_totals".to_string(),
         source: "posts_calc".to_string(),
         key_space: KeySpace::Aggregate {
-            group_by: vec![GroupByKey::Column("author".to_string())],
+            group_by: vec!["author".to_string()],
         },
         fields: vec![
             FieldDef {
@@ -1169,8 +1167,8 @@ async fn create_target_table_mirrors_a_composite_primary_key_in_full() {
 }
 
 /// Issue #107: a single-column primary key of an unsafe (non-text-stable)
-/// type must be rejected exactly like a relationship join key of the same
-/// type already is (`assert_join_key_type_supported`) — 1-1 apply/backfill
+/// type must be rejected exactly like a `JOIN` key of the same type
+/// already is — 1-1 apply/backfill
 /// compare the primary key via `::text` casts throughout, so e.g. a
 /// `numeric` PK's `::text` rendering could disagree with another `::text`
 /// rendering of the numerically equal value, missing or duplicating target
@@ -1180,7 +1178,7 @@ async fn create_target_table_mirrors_a_composite_primary_key_in_full() {
 /// session-`TimeZone`-dependent, and until issue #246 pinned `TimeZone`
 /// identically on every connection Trellis opens
 /// that made it exactly as unsafe as `numeric`. It is a *safe* primary-key
-/// type now (`catalog::TEXT_STABLE_JOIN_KEY_TYPES`), which is what
+/// type now (`join_key_types::TEXT_STABLE_JOIN_KEY_TYPES`), which is what
 /// [`a_source_table_with_a_timestamptz_primary_key_is_accepted`] below
 /// proves — `numeric` (this test) takes over as the "still genuinely
 /// unsafe" example.

@@ -250,8 +250,9 @@ fn millis(timeout: Duration) -> i64 {
 
 /// Registers a job to check `target_table` and returns it, or returns the
 /// unfinished job the target already has (see the module doc). Refuses what
-/// the check could never run on: no such transform, an aggregate target, a
-/// field that reads a relationship. `timeout` bounds each convergence wait
+/// the check could never run on: no such transform, an aggregate target the
+/// group basis doesn't keep, a `JOIN` field the comparison can't render.
+/// `timeout` bounds each convergence wait
 /// the job's pages make, up to [`MAX_AWAIT_TIMEOUT`]; see
 /// [`crate::Trellis::await_converged`] for how to size it.
 pub async fn start(

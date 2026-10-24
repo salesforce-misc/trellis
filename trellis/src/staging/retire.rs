@@ -423,7 +423,10 @@ fn hidden_tables_sql() -> String {
 /// its cost is the zero groups it walks, not the groups there are. Unlike a
 /// ledger's tombstones, it doesn't skip a definition under a build: a build
 /// or recompute locks its groups before its snapshot (R1), so one that
-/// loses a group to the GC inserts it afresh and writes its own basis.
+/// loses a group to the GC inserts it afresh and writes its own basis. A
+/// `JOIN` build holds its keyed cells by `J` alone, so the GC may delete one
+/// under its write, which then inserts the cell afresh with its basis
+/// (`super::group_basis`'s `join_build_sql`).
 async fn collect_zero_groups(client: &mut Client, through: i64) -> Result<u64, StagingError> {
     let tables: Vec<(String, Option<String>, bool)> = client
         .query(&hidden_tables_sql(), &[])

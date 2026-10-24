@@ -47,7 +47,7 @@ use crate::capture::CaptureError;
 use crate::capture::columns::{CaptureCatalog, load_catalog, read_columns, readers_of};
 use crate::capture::install::{Installed, installed};
 use crate::defs::catalog::CatalogError;
-use crate::defs::model::{RelationshipDefinition, TransformStatus};
+use crate::defs::model::TransformStatus;
 use crate::defs::validate::ValidationError;
 use crate::defs::{copies, key_types};
 use crate::pool::Pool;
@@ -115,7 +115,7 @@ pub(crate) async fn pause_readers(pool: &Pool, seg_seqs: &[i64]) -> Result<(), A
         }
     }
 
-    let catalog = load_catalog(&**client, pool.schema()).await?;
+    let catalog = load_catalog(&**client).await?;
     let txn = client.transaction().await?;
     for (table, missing) in &by_table {
         let readers = readers_of(&catalog, table, &missing.columns, missing.whole_table());
@@ -214,7 +214,7 @@ pub(crate) async fn pause_readers_of_redefined_keys(
     if changed.is_empty() {
         return Ok(());
     }
-    let catalog = load_catalog(&**client, schema).await?;
+    let catalog = load_catalog(&**client).await?;
     for table in changed {
         match pause_readers_of_missing(&mut client, schema, &catalog, &table).await {
             Ok(_) => {}
@@ -527,10 +527,8 @@ pub(crate) async fn pause_readers_in_hierarchy(
 ///    for that use now ([`key_types::refusal`]): an `ALTER COLUMN ... TYPE
 ///    character(n)` on a join column, a nondeterministic `COLLATE` on a
 ///    `GROUP BY` column;
-/// 2. a relationship it reads through no longer joins two columns of the
-///    same type, modifier and collation (#590,
-///    [`crate::defs::catalog::validate_join_pair`]): one join column widened
-///    and the other not (yet);
+/// 2. a `JOIN`'s `ON` pair no longer has one type and collation (#1107):
+///    one join column re-typed and the other not (yet);
 /// 3. one of its key columns changed type, since the definition was
 ///    accepted or last resumed, in a way that renders the values Trellis
 ///    already stored differently ([`key_types::renders_differently`]):
@@ -631,22 +629,6 @@ pub(crate) async fn pause_readers_of_retyped(
         .iter()
         .filter(|r| readers.contains(&r.id))
     {
-        let declared: Vec<&RelationshipDefinition> = catalog
-            .relationships
-            .iter()
-            .filter(|r| r.qualified_from_table() == reader.source)
-            .collect();
-        let to_tables: Vec<String> = declared.iter().map(|r| r.qualified_to_table()).collect();
-        let rels: Vec<key_types::RelRef<'_>> = declared
-            .iter()
-            .zip(&to_tables)
-            .map(|(r, to_table)| key_types::RelRef {
-                name: &r.def.name,
-                from_col: &r.def.from_col,
-                to_col: &r.def.to_col,
-                to_table,
-            })
-            .collect();
         let mut columns: Vec<String> = Vec::new();
         let mut reasons: Vec<String> = Vec::new();
         // Whether a resume would refuse: define refuses what it found.
@@ -659,9 +641,7 @@ pub(crate) async fn pause_readers_of_retyped(
         };
 
         let mut seen: Vec<String> = Vec::new();
-        for (column, key_use) in
-            key_types::key_uses(&reader.def, &reader.source, &rels, table, &key)
-        {
+        for (column, key_use) in key_types::key_uses(&reader.def, &reader.source, table, &key) {
             if seen.contains(&column) {
                 continue;
             }
@@ -691,50 +671,6 @@ pub(crate) async fn pause_readers_of_retyped(
                         unrecorded.push((reader.id, column.clone()));
                     }
                 }
-            }
-        }
-
-        // #590's pairing, for each relationship it reads through with a
-        // join column on this table. A join column refused on its own is
-        // reported above; only the pairing is this check's.
-        let read: BTreeSet<String> = crate::defs::eval::relationship_references(&reader.def)
-            .into_iter()
-            .map(|(rel, _)| rel)
-            .collect();
-        for (rel, to_table) in declared.iter().zip(&to_tables) {
-            if !read.contains(&rel.def.name) {
-                continue;
-            }
-            let column = if rel.qualified_from_table() == table {
-                &rel.def.from_col
-            } else if to_table == table {
-                &rel.def.to_col
-            } else {
-                continue;
-            };
-            if columns.contains(column) || !live.contains_key(column) {
-                continue;
-            }
-            match crate::defs::catalog::validate_join_pair(
-                &*client,
-                &rel.def,
-                &rel.qualified_from_table(),
-                to_table,
-                false,
-            )
-            .await
-            {
-                Ok(_) => {}
-                Err(CatalogError::Db(err)) => return Err(err.into()),
-                Err(CatalogError::Pool(err)) => return Err(CatalogError::Pool(err).into()),
-                Err(err @ CatalogError::Validate(ValidationError::RelationshipTypeMismatch(_))) => {
-                    refused = true;
-                    flag(column, err.to_string(), &mut columns);
-                }
-                // A refused type or collation on the other side is that
-                // table's check's; a missing column is the missing-column
-                // check's.
-                Err(_) => {}
             }
         }
 
@@ -784,7 +720,7 @@ pub(crate) async fn pause_readers_of_retyped(
         // #858: skipped while every relation it reads is as it was when its
         // last comparison found every column current
         // ([`drift_memo`]).
-        let stamp = drift.stamp(schema, catalog, reader);
+        let stamp = drift.stamp(schema, reader);
         if stamp
             .as_deref()
             .is_some_and(|stamp| drift_memo::skippable(instance, table, reader.id, stamp))
@@ -804,7 +740,6 @@ pub(crate) async fn pause_readers_of_retyped(
             &reader.def,
             &reader.source,
             &reader.target,
-            &declared,
         )
         .await?
         .into_iter()
@@ -1670,8 +1605,8 @@ fn unpaused_writers(catalog: &CaptureCatalog, table: &str) -> Vec<i64> {
         .collect()
 }
 
-/// Every definition that reads `table` at all, as its source or a
-/// relationship's to-side, and isn't paused for a capture failure yet.
+/// Every definition that reads `table` at all, as its source or its `JOIN`
+/// table, and isn't paused for a capture failure yet.
 pub(crate) fn unpaused_readers(catalog: &CaptureCatalog, table: &str) -> Vec<i64> {
     readers_of(catalog, table, &BTreeSet::new(), true)
         .into_iter()

@@ -194,7 +194,6 @@ fn walk_columns(expr: &Expr, visit: &mut impl FnMut(&QualifiedColumn)) {
             }
         }
         Expr::Column(_)
-        | Expr::RelationshipPath { .. }
         | Expr::NumberLiteral(_)
         | Expr::StringLiteral(_)
         | Expr::TypedLiteral { .. } => {}
@@ -483,7 +482,7 @@ fn argument_type(
         .iter()
         .map(|(name, info)| (name.clone(), info.value_type))
         .collect();
-    super::validate::infer_expr_type(arg, &types, &HashMap::new())
+    super::validate::infer_expr_type(arg, &types)
 }
 
 /// The Postgres type of a `JOIN` field that isn't a `GROUP BY` key: an

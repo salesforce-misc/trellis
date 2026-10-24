@@ -49,6 +49,10 @@ pub enum ParseError {
     /// `<schema>.<table>.<column>` components a qualified source column takes
     /// (issue #830) — e.g. `a.b.c.d`.
     TooManyColumnNameParts { reference: String },
+    /// A two-part `GROUP BY` key `<head>.<column>` of a non-`JOIN` aggregate
+    /// whose head is not the `FROM` table. `source` is the `FROM` table's bare
+    /// name. A key of another table is grouped by with a `JOIN`.
+    GroupByKeyNotFromSource { reference: String, source: String },
     /// A `CAST(<expr> AS <type>)` whose operand is not a single-quoted
     /// string literal (issue #109) — i.e. a request for a **general** cast
     /// rather than a typed literal. See [`super::typed_literal`] for why the
@@ -151,6 +155,12 @@ impl fmt::Display for ParseError {
                 f,
                 "'{reference}' is not a valid column reference: a column is written \
                  <column>, <table>.<column> or <schema>.<table>.<column> (the FROM table's)"
+            ),
+            ParseError::GroupByKeyNotFromSource { reference, source } => write!(
+                f,
+                "GROUP BY key '{reference}' does not name this transform's FROM table \
+                 ('{source}'); a qualified key must name the FROM table, and a second table is \
+                 read with a JOIN"
             ),
             ParseError::TooManyQualifiedNameParts { reference } => write!(
                 f,

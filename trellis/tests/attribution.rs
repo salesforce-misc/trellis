@@ -18,7 +18,7 @@ use tracing::field::{Field, Visit};
 use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 use trellis::defs::ValueType;
 use trellis::staging::quarantine::{DEFAULT_DEATH_THRESHOLD, IsolationOutcome, isolate_and_evict};
-use trellis::staging::{BucketFilter, StagedWatermark, apply, claim, fold};
+use trellis::staging::{BucketFilter, apply, claim, fold};
 
 const WORKER: &str = "attribution_test";
 
@@ -246,16 +246,9 @@ async fn two_separate_failing_pairs_charge_nobody_and_record_a_drain_holdup() {
     change_t_1(&d).await;
     let seg = d.seal().await;
 
-    let err = apply::drain_once(
-        d.pool(),
-        seg,
-        WORKER,
-        1,
-        WAKE,
-        &StagedWatermark::saturated(),
-    )
-    .await
-    .expect_err("the page fails while both pairs apply it");
+    let err = apply::drain_once(d.pool(), seg, WORKER, 1, WAKE)
+        .await
+        .expect_err("the page fails while both pairs apply it");
     assert!(err.to_string().contains("written together"), "{err}");
 
     assert_eq!(deaths_for(&d).await, Vec::<String>::new(), "nobody charged");

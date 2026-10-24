@@ -4,9 +4,7 @@
 use std::collections::HashMap;
 
 use testkit::TestCluster;
-use trellis::defs::ast::{
-    Expr, FieldDef, GroupByKey, KeySpace, Operator, Predicate, TransformDef, ValueType,
-};
+use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use trellis::defs::eval::{RegexCache, Row, Value, evaluate, evaluate_aggregate};
 use trellis::defs::{
     create_target_table, recompute, recompute_aggregate, render_aggregate_select_sql,
@@ -328,7 +326,7 @@ fn order_totals_aggregate_def() -> TransformDef {
         target: "order_totals".to_string(),
         source: "order_line_items".to_string(),
         key_space: KeySpace::Aggregate {
-            group_by: vec![GroupByKey::Column("order_id".to_string())],
+            group_by: vec!["order_id".to_string()],
         },
         fields: vec![
             FieldDef {
@@ -561,7 +559,7 @@ async fn aggregate_recompute_matches_postgres_group_by_for_a_cross_field_alias()
         target: "order_alias_totals".to_string(),
         source: "order_line_items".to_string(),
         key_space: KeySpace::Aggregate {
-            group_by: vec![GroupByKey::Column("order_id".to_string())],
+            group_by: vec!["order_id".to_string()],
         },
         fields: vec![
             FieldDef {

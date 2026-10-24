@@ -1,7 +1,7 @@
 //! Re-validating a definition's key columns after define (issue #760).
 //!
 //! Define refuses a key column whose type or collation Trellis can't match
-//! by: a type off the key allowlist ([`super::catalog::is_text_stable_join_key_type`],
+//! by: a type off the key allowlist ([`super::join_key_types::is_text_stable_join_key_type`],
 //! [`super::ddl::source_primary_key`]), a `GROUP BY` type
 //! [`super::validate::reject_unsupported_group_by_key_type`] refuses, or a
 //! nondeterministic collation (#590, #638). An `ALTER COLUMN ... TYPE` or
@@ -10,8 +10,8 @@
 //! capture trigger.
 //!
 //! A key column is one Trellis matches rows by ([`KeyUse`]): the source's
-//! row-identity key, a `GROUP BY` key, and, for each relationship the
-//! definition reads through, its join columns and its to-side's key.
+//! row-identity key, a `GROUP BY` key, and a `JOIN`'s `ON` columns and each
+//! of its tables' row-identity key.
 //!
 //! The staging worker's capture pass checks each one
 //! (`staging::schema_change::pause_readers_of_retyped`) and pauses the
@@ -22,7 +22,7 @@
 //!    ([`renders_differently`]), against the type recorded when the
 //!    definition was accepted or last resumed, or when a pass last accepted
 //!    a change to the column without a pause (`definition_key_types`,
-//!    [`record`], [`rerecord`]). The target, ledger and projection rows built from the old
+//!    [`record`], [`rerecord`]). The target and ledger rows built from the old
 //!    rendering would never match the new one: a `timestamp` key becomes
 //!    `timestamptz` (`'… 10:00:00'` reads back as `'… 15:00:00+00'` after an
 //!    `ALTER` in a New York session), `date` becomes `timestamp`, `text`
@@ -31,15 +31,13 @@
 //!    precision narrows (the rewrite rounds), or a `varchar(n)` narrows (the
 //!    rewrite strips trailing spaces past the new length).
 //!
-//! The same pass also pauses on a relationship whose two join columns no
-//! longer have the same type, modifier and collation (#590, through
-//! `catalog::validate_join_pair`), and on a widening of a column Trellis
-//! keeps a typed copy of ([`super::copies`], [`widens`]). Only an integer or
+//! The same pass also pauses on a widening of a column Trellis keeps a typed
+//! copy of ([`super::copies`], [`widens`]). Only an integer or
 //! float width change is one: a copy has no type modifier (ADR-0020), so a
 //! catalog-only widening of a modifier needs no re-type.
 //!
 //! Routine changes that need neither: widening an integer key that no copy
-//! holds (an aggregate's source key, a to-many join's to-side), a wider
+//! holds (an aggregate's source key), a wider
 //! modifier of any kind (a `numeric` precision or scale, a temporal or
 //! `interval` precision, a `bit varying` length, a string bound, `varchar`
 //! to `text`: every copy has no modifier, ADR-0020), and a change between
@@ -55,26 +53,21 @@
 //! narrowed back to `numeric(10,2)` rounds the keys stored in between, and
 //! pauses.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::fmt;
 
 use tokio_postgres::GenericClient;
 use tokio_postgres::types::Type;
 
-use super::ast::{GroupByKey, KeySpace, TransformDef};
+use super::ast::{KeySpace, TransformDef};
 
 /// How a definition uses one of its key columns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum KeyUse {
     /// Part of the definition's source's row-identity key.
     SourceKey,
-    /// A `GROUP BY` key: a source column, or a to-side column read through
-    /// a relationship.
+    /// A `GROUP BY` key.
     GroupBy,
-    /// A join column of relationship `rel`.
-    JoinColumn { rel: String },
-    /// Part of relationship `rel`'s to-side's row-identity key.
-    EndpointKey { rel: String },
     /// A column of a `JOIN` transform's `ON` clause (#1107).
     JoinOn,
 }
@@ -84,38 +77,22 @@ impl fmt::Display for KeyUse {
         match self {
             KeyUse::SourceKey => write!(f, "part of this definition's source key"),
             KeyUse::GroupBy => write!(f, "one of its GROUP BY keys"),
-            KeyUse::JoinColumn { rel, .. } => write!(f, "a join column of relationship '{rel}'"),
-            KeyUse::EndpointKey { rel } => {
-                write!(f, "part of the key of relationship '{rel}''s to-side")
-            }
             KeyUse::JoinOn => write!(f, "a join column of its JOIN"),
         }
     }
 }
 
-/// A relationship a definition reads through, as [`key_uses`] needs it.
-#[derive(Debug, Clone)]
-pub(crate) struct RelRef<'a> {
-    pub name: &'a str,
-    pub from_col: &'a str,
-    pub to_col: &'a str,
-    /// The qualified to-side.
-    pub to_table: &'a str,
-}
-
 /// The key columns `def` (sourced from the qualified `source`) uses on
-/// `table`, and how. `table_key` is `table`'s row-identity key columns and
-/// `rels` the relationships on `source` that `def` reads through (others are
-/// ignored). A column can appear once per use.
+/// `table`, and how. `table_key` is `table`'s row-identity key columns. A
+/// column can appear once per use.
 pub(crate) fn key_uses(
     def: &TransformDef,
     source: &str,
-    rels: &[RelRef<'_>],
     table: &str,
     table_key: &[String],
 ) -> Vec<(String, KeyUse)> {
     // #1107: each table of a JOIN is keyed by its own row-identity key, and
-    // matched by its join and `GROUP BY` columns. It reads no relationship.
+    // matched by its join and `GROUP BY` columns.
     if let Some(side) = super::join::side_of_table(def, table) {
         let mut uses: Vec<(String, KeyUse)> = table_key
             .iter()
@@ -133,56 +110,14 @@ pub(crate) fn key_uses(
         );
         return uses;
     }
-    let read: BTreeSet<String> = super::eval::relationship_references(def)
-        .into_iter()
-        .map(|(rel, _)| rel)
-        .collect();
-    let group_by: &[GroupByKey] = match &def.key_space {
+    let group_by: &[String] = match &def.key_space {
         KeySpace::Aggregate { group_by } => group_by,
         _ => &[],
     };
     let mut uses = Vec::new();
     if source == table {
         uses.extend(table_key.iter().map(|c| (c.clone(), KeyUse::SourceKey)));
-        for key in group_by {
-            if let GroupByKey::Column(column) = key {
-                uses.push((column.clone(), KeyUse::GroupBy));
-            }
-        }
-        for rel in rels.iter().filter(|r| read.contains(r.name)) {
-            uses.push((
-                rel.from_col.to_string(),
-                KeyUse::JoinColumn {
-                    rel: rel.name.to_string(),
-                },
-            ));
-        }
-    }
-    for rel in rels
-        .iter()
-        .filter(|r| r.to_table == table && read.contains(r.name))
-    {
-        uses.push((
-            rel.to_col.to_string(),
-            KeyUse::JoinColumn {
-                rel: rel.name.to_string(),
-            },
-        ));
-        uses.extend(table_key.iter().map(|c| {
-            (
-                c.clone(),
-                KeyUse::EndpointKey {
-                    rel: rel.name.to_string(),
-                },
-            )
-        }));
-        for key in group_by {
-            if let GroupByKey::RelationshipPath { rel: name, column } = key
-                && name == rel.name
-            {
-                uses.push((column.clone(), KeyUse::GroupBy));
-            }
-        }
+        uses.extend(group_by.iter().map(|key| (key.clone(), KeyUse::GroupBy)));
     }
     uses
 }
@@ -563,7 +498,7 @@ pub(crate) async fn refusal(
             let value_type = super::pg_type::value_type_for_oid(client, live.type_oid).await?;
             super::validate::reject_unsupported_group_by_key_type(column, value_type).is_ok()
         }
-        _ => super::catalog::is_text_stable_join_key_type(&live.display) || live.is_enum,
+        _ => super::join_key_types::is_text_stable_join_key_type(&live.display) || live.is_enum,
     };
     if !supported {
         return Ok(Some(format!(
@@ -791,9 +726,8 @@ pub(crate) async fn record_enum_values(
 /// Records the live type of every key column definition `id` uses
 /// ([`key_uses`]): on its qualified `source`, keyed by the source's
 /// row-identity key (whose columns, in key order, it records as the
-/// definition's `source_key`, #1324), on a JOIN's qualified `joined` table, keyed by its own,
-/// and on the to-side of each relationship in `rels`, keyed by that table's;
-/// then the OID of every type the definition names ([`record_types`]), so
+/// definition's `source_key`, #1324), and on a JOIN's qualified `joined`
+/// table, keyed by its own; then the OID of every type the definition names ([`record_types`]), so
 /// its `source_columns` and `join_columns` must already be written.
 /// Define calls it with nothing recorded yet; a
 /// resume with `replace`, which deletes what was recorded first, so the
@@ -805,16 +739,10 @@ pub(crate) async fn record_definition(
     def: &TransformDef,
     source: &str,
     joined: Option<&str>,
-    rels: &[RelRef<'_>],
     replace: bool,
 ) -> Result<(), tokio_postgres::Error> {
     let mut tables: Vec<&str> = vec![source];
     tables.extend(joined);
-    for rel in rels {
-        if !tables.contains(&rel.to_table) {
-            tables.push(rel.to_table);
-        }
-    }
     let mut columns: Vec<(String, String)> = Vec::new();
     for table in tables {
         let key: Vec<String> = super::ddl::identity_key_columns(client, table)
@@ -833,7 +761,7 @@ pub(crate) async fn record_definition(
                 )
                 .await?;
         }
-        for (column, _) in key_uses(def, source, rels, table, &key) {
+        for (column, _) in key_uses(def, source, table, &key) {
             let entry = (table.to_string(), column);
             if !columns.contains(&entry) {
                 columns.push(entry);
@@ -903,7 +831,7 @@ mod tests {
         .unwrap();
         let key = ["id".to_string()];
         assert_eq!(
-            key_uses(&def, "public.orders", &[], "public.orders", &key),
+            key_uses(&def, "public.orders", "public.orders", &key),
             [
                 ("id".to_string(), KeyUse::SourceKey),
                 ("region".to_string(), KeyUse::GroupBy),
@@ -911,7 +839,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            key_uses(&def, "public.orders", &[], "public.items", &key),
+            key_uses(&def, "public.orders", "public.items", &key),
             [
                 ("id".to_string(), KeyUse::SourceKey),
                 ("order_id".to_string(), KeyUse::JoinOn),
@@ -1144,76 +1072,30 @@ mod tests {
         }
     }
 
-    fn rel<'a>(name: &'a str, from_col: &'a str, to_col: &'a str, to: &'a str) -> RelRef<'a> {
-        RelRef {
-            name,
-            from_col,
-            to_col,
-            to_table: to,
-        }
+    #[test]
+    fn a_one_to_one_definition_uses_its_source_key() {
+        let def = crate::defs::parse("TRANSFORM t FROM public.posts SELECT title AS title")
+            .expect("parse");
+        let key = vec!["id".to_string()];
+        assert_eq!(
+            key_uses(&def, "public.posts", "public.posts", &key),
+            vec![("id".to_string(), KeyUse::SourceKey)]
+        );
+        assert!(key_uses(&def, "public.posts", "public.other", &key).is_empty());
     }
 
     #[test]
-    fn a_one_to_one_definition_uses_its_source_key_and_join_columns() {
-        let def = crate::defs::parse(
-            "TRANSFORM t FROM public.posts SELECT author.name AS author_name, title AS title",
-        )
-        .expect("parse");
-        let rels = [
-            rel("author", "author_id", "id", "public.users"),
-            rel("unread", "editor_id", "id", "public.users"),
-        ];
+    fn an_aggregate_uses_its_source_key_and_group_by_keys() {
+        let def =
+            crate::defs::parse("TRANSFORM t FROM public.posts GROUP BY kind SELECT COUNT(*) AS n")
+                .expect("parse");
         let key = vec!["id".to_string()];
         assert_eq!(
-            key_uses(&def, "public.posts", &rels, "public.posts", &key),
+            key_uses(&def, "public.posts", "public.posts", &key),
             vec![
                 ("id".to_string(), KeyUse::SourceKey),
-                (
-                    "author_id".to_string(),
-                    KeyUse::JoinColumn {
-                        rel: "author".to_string(),
-                    }
-                ),
+                ("kind".to_string(), KeyUse::GroupBy),
             ]
         );
-        assert_eq!(
-            key_uses(&def, "public.posts", &rels, "public.users", &key),
-            vec![
-                (
-                    "id".to_string(),
-                    KeyUse::JoinColumn {
-                        rel: "author".to_string(),
-                    }
-                ),
-                (
-                    "id".to_string(),
-                    KeyUse::EndpointKey {
-                        rel: "author".to_string()
-                    }
-                ),
-            ]
-        );
-        assert!(key_uses(&def, "public.posts", &rels, "public.other", &key).is_empty());
-    }
-
-    #[test]
-    fn an_aggregate_uses_its_group_by_keys_on_either_side() {
-        let def = crate::defs::parse(
-            "TRANSFORM t FROM public.posts GROUP BY kind, author.country SELECT COUNT(*) AS n",
-        )
-        .expect("parse");
-        let rels = [rel("author", "author_id", "id", "public.users")];
-        let key = vec!["id".to_string()];
-        let on_source = key_uses(&def, "public.posts", &rels, "public.posts", &key);
-        assert!(on_source.contains(&("id".to_string(), KeyUse::SourceKey)));
-        assert!(on_source.contains(&("kind".to_string(), KeyUse::GroupBy)));
-        let on_to_side = key_uses(&def, "public.posts", &rels, "public.users", &key);
-        assert!(on_to_side.contains(&("country".to_string(), KeyUse::GroupBy)));
-        assert!(on_to_side.contains(&(
-            "id".to_string(),
-            KeyUse::EndpointKey {
-                rel: "author".to_string()
-            }
-        )));
     }
 }

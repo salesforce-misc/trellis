@@ -70,7 +70,7 @@
 //! *container's own* key-order canonicalization might paper over it. It
 //! does not: sorting keys and renormalizing numbers are independent axes,
 //! and `jsonb_out` only does the first. This is why `jsonb` is **not**
-//! added to `catalog::TEXT_STABLE_JOIN_KEY_TYPES` or admitted by
+//! added to `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES` or admitted by
 //! `validate::reject_unsupported_group_by_key_type` — the unlock is the
 //! same #110 typed key index every other numeric-bearing family
 //! (`numeric`/`real`/`double precision`/`timestamptz`) is waiting on, not a

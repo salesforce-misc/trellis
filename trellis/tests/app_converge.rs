@@ -31,9 +31,7 @@ use tokio_postgres::{Client, NoTls};
 use trellis::capture::install;
 use trellis::capture::sql::CaptureSpec;
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::staging::{
-    StagedWatermark, StagingError, apply, has_pending, retire_drained_segments, seal,
-};
+use trellis::staging::{StagingError, apply, has_pending, retire_drained_segments, seal};
 use trellis::{BlockingTrellis, Config, ErrorCode, Trellis, TrellisError, TrellisOptions};
 
 /// Connects directly to `dsn` (bypassing `trellis::Pool`), matching
@@ -88,14 +86,12 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
 async fn drain_segment(pool: &trellis::Pool, seg_seq: i64) {
     // No live capture stages anything here, so there is no real staged
     // watermark to hold apply back. A saturated one never does.
-    let watermark = StagedWatermark::saturated();
     while apply::drain_once(
         pool,
         seg_seq,
         "app_converge_test",
         1,
         "trellis_app_converge_test",
-        &watermark,
     )
     .await
     .expect("drain_once")
@@ -416,13 +412,8 @@ async fn a_token_after_an_asynchronous_commit_waits_for_the_write() {
     raw.batch_execute("create table public.t (id text primary key, a int)")
         .await
         .expect("create public.t");
-    let spec = CaptureSpec::new(
-        "public.t",
-        vec!["id".to_string()],
-        ["a".to_string()],
-        Vec::new(),
-    )
-    .expect("valid spec");
+    let spec = CaptureSpec::new("public.t", vec!["id".to_string()], ["a".to_string()])
+        .expect("valid spec");
     let mut installer = connect_raw(db.dsn()).await;
     assert!(matches!(
         install::install(&mut installer, DEFAULT_SCHEMA, &spec, None)

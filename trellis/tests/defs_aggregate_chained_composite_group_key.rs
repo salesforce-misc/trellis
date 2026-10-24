@@ -116,8 +116,6 @@ async fn stage_cdc(
 /// `Recompute`'s key), so a regression panics right here rather than merely
 /// producing a wrong number further down.
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
-    let watermark = trellis::staging::StagedWatermark::saturated();
-    let watermark = &watermark;
     for _ in 0..16 {
         let seg = seal_active_segment(client).await;
         while apply::drain_once(
@@ -126,7 +124,6 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
             "agg_chained_composite_test",
             1,
             "trellis_agg_chained_composite_test",
-            watermark,
         )
         .await
         .expect("drain_once")

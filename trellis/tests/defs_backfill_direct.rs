@@ -549,7 +549,7 @@ async fn assert_aggregate_matches_oracle(
 
     let key_expr = group_by
         .iter()
-        .map(|k| format!("coalesce({}::text, '')", k.target_column_name()))
+        .map(|k| format!("coalesce({}::text, '')", k.as_str()))
         .collect::<Vec<_>>()
         .join(" || '|' || ");
     let val_expr = def

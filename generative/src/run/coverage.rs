@@ -87,8 +87,8 @@ pub struct Coverage {
     /// deep run needs to report to show a newly-drawn shape got real
     /// exercise. Only calls to `registry::AGGREGATE_FUNCTIONS` names are
     /// tallied; the argument is `"*"` (no argument), `"column"`,
-    /// `"qualified_column"`, `"path"` (a `JOIN`'s `<table>.<column>` read of
-    /// its joined side), or `"expr"` (anything else).
+    /// `"qualified_column"` (a `<table>.<column>` read, a `JOIN`'s of either
+    /// side), or `"expr"` (anything else).
     pub aggregate_call_cases: HashMap<(&'static str, &'static str, &'static str), usize>,
     /// The largest [`Op::BulkInsert`] row count seen across every recorded
     /// program (improvement-plan task E6) — a floor test asserts this
@@ -265,10 +265,6 @@ impl Coverage {
                 self.expr_shapes.insert("TypedLiteral");
                 1
             }
-            Expr::RelationshipPath { .. } => {
-                self.expr_shapes.insert("RelationshipPath");
-                1
-            }
             Expr::BinaryOp { op, lhs, rhs } => {
                 self.expr_shapes.insert("BinaryOp");
                 self.operators.insert(operator_name(*op));
@@ -306,7 +302,6 @@ fn collect_aggregate_calls(
                     [] => "*",
                     [Expr::Column(_)] => "column",
                     [Expr::SourceColumn { .. }] => "qualified_column",
-                    [Expr::RelationshipPath { .. }] => "path",
                     _ => "expr",
                 };
                 out.insert((key_space, function_name(name), argument));
@@ -323,8 +318,7 @@ fn collect_aggregate_calls(
         | Expr::SourceColumn { .. }
         | Expr::NumberLiteral(_)
         | Expr::StringLiteral(_)
-        | Expr::TypedLiteral { .. }
-        | Expr::RelationshipPath { .. } => {}
+        | Expr::TypedLiteral { .. } => {}
     }
 }
 
@@ -500,7 +494,7 @@ fn concurrent_shapes(program: &Program, plan: &ConcurrentPlan) -> HashSet<Concur
     for def in &program.defs {
         if let KeySpace::Aggregate { group_by } = &def.key_space {
             for key in group_by {
-                let grouping = (def.source.as_str(), key.target_column_name());
+                let grouping = (def.source.as_str(), key.as_str());
                 if !groupings.contains(&grouping) {
                     groupings.push(grouping);
                 }

@@ -751,7 +751,7 @@ async fn run(
         }
     }
 
-    // Issue #132's guard (a) reads this "staged-through" watermark. Trigger
+    // The "staged-through" watermark a backfill enumeration waits on. Trigger
     // capture (issue #622 C5) stages every change in its writer's own
     // transaction, so every commit a snapshot can see is already in the ring:
     // the watermark is always caught up, in every process of a fleet.
@@ -770,7 +770,7 @@ async fn run(
             reclaim_ttl: options.reclaim_ttl,
             drainer_window: options.drainer_window,
             reconcile_interval: options.reconcile_interval,
-            watermark: watermark.clone(),
+            watermark,
             backfill_catch_up_timeout: BACKFILL_CATCH_UP_TIMEOUT,
             held_key_retry: options.held_key_retry,
             drain_batch_cap: options.drain_batch_cap,
@@ -825,7 +825,6 @@ async fn run(
             idle_wake_cap: options.idle_wake_cap,
             reclaim_ttl: options.reclaim_ttl,
             alive,
-            watermark: watermark.clone(),
             drain_batch_cap: options.drain_batch_cap,
             build_chunk_rows: options.build_chunk_rows.max(1),
         };
@@ -1918,12 +1917,6 @@ struct AppWorkerConfig {
     /// refreshing its registry row, and this worker's `drainers` row stops
     /// being refreshed once it is gone.
     alive: WorkerAlive,
-    /// Issue #132, epic #127, guard (a): this fleet's shared in-process
-    /// "staged-through" watermark — the one `run()` constructs, always
-    /// caught up under trigger capture — threaded here so
-    /// [`staging::drain_many`]'s own Phase 3 apply can check guard (a) for
-    /// any relationship reverse record it drains.
-    watermark: staging::StagedWatermark,
     /// [`ClientOptions::drain_batch_cap`]: bounds both how many segments one
     /// drain coalesces and how many folded records one page holds.
     drain_batch_cap: usize,
@@ -1963,7 +1956,6 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
         idle_wake_cap,
         reclaim_ttl,
         alive: _alive,
-        watermark,
         drain_batch_cap,
         build_chunk_rows,
     } = config;
@@ -2062,7 +2054,6 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
             &claimed_by,
             live_workers,
             &wake_channel,
-            &watermark,
             drain_batch_cap,
         )
         .await;
@@ -4503,7 +4494,6 @@ mod backfill_chunk_failure_tests {
     /// Seals and drains the ring until nothing is pending: a bounded loop,
     /// not a convergence wait.
     async fn drain_ring(pool: &Pool, client: &mut tokio_postgres::Client) {
-        let watermark = staging::StagedWatermark::saturated();
         for _ in 0..16 {
             let outcome = staging::seal::seal_phase1(client)
                 .await
@@ -4511,17 +4501,10 @@ mod backfill_chunk_failure_tests {
             staging::seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
                 .await
                 .expect("seal phase 2");
-            while staging::apply::drain_once(
-                pool,
-                outcome.sealed_seg_seq,
-                WORKER,
-                1,
-                "wake",
-                &watermark,
-            )
-            .await
-            .expect("drain_once")
-            .is_some()
+            while staging::apply::drain_once(pool, outcome.sealed_seg_seq, WORKER, 1, "wake")
+                .await
+                .expect("drain_once")
+                .is_some()
             {}
             staging::retire_drained_segments(client)
                 .await

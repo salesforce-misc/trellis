@@ -49,10 +49,9 @@ use super::error::StagingError;
 /// reason about "every ring table" shares this rather than each hand-rolling
 /// its own unroll of `RING_SIZE`.
 ///
-/// `pub(crate)` (issue #132, epic #127): `apply`'s guard (c) in-flight check
-/// needs the exact same "reason about every ring table" pattern, scoped to a
-/// specific `src_table`/join-key/`lsn` predicate instead of this module's
-/// own origin-lsn-threshold one — see `apply::from_side_change_in_flight`.
+/// `pub(crate)`: other modules' ring scans (`defs::catalog`,
+/// `staging::self_check_ring`) share the same "reason about every ring
+/// table" pattern.
 pub(crate) fn per_ring_table(sep: &str, f: impl Fn(i16, &str) -> String) -> String {
     (0..RING_SIZE)
         .map(|slot| {
@@ -302,12 +301,6 @@ pub async fn pending_count(client: &impl GenericClient) -> Result<i64, StagingEr
 /// `schema_changed` rows carry no image a reader could miss a column of, so
 /// they don't hold the gate.
 ///
-/// A deferred relationship reverse (`rel_reverse_deferred`) carries its
-/// to-side's images under a synthetic `src_table`, so one whose relationship's
-/// to-side is `table` counts as a change to `table` too (issue #622 C5: a
-/// widen of a to-side must not let a deferred reverse carrying the old
-/// images through). Such rows never reach `poison_held`.
-///
 /// A row held in `poison_held` doesn't count (#799). Its release stages an
 /// image-less `Recompute` (`quarantine::release_key`), so its images never
 /// reach a reader, and it is held for the definitions whose key it is, never
@@ -355,10 +348,7 @@ async fn pending_through(
     let arms = per_ring_table(" union all ", |slot, ring| {
         format!(
             "select 1 from {ring} r \
-             where (r.src_table = $1{ops} \
-                    or r.op = 'rel_reverse_deferred' and r.relationship_id in ( \
-                        select rd.id from relationship_definitions rd \
-                        where rd.to_schema || '.' || rd.to_table = $1)) \
+             where r.src_table = $1{ops} \
                and (r.origin_lsn is null or r.origin_lsn <= $2) \
                and exists ( \
                    select 1 from segments s \

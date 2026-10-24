@@ -56,7 +56,7 @@ use trellis::defs::hierarchy::Hierarchy;
 use trellis::staging::interleave::{PausePoint, PauseScope, with_scope};
 use trellis::staging::self_check::{CheckPageExt, SelfCheckScope};
 use trellis::staging::self_check_job::{WorkerOptions, run_to_end, work_once};
-use trellis::staging::{StagedWatermark, apply, has_pending, retire_drained_segments, seal};
+use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
 use trellis::{
     CaptureFault, Config, Divergence, SelfCheckError, SelfCheckJobState, SelfCheckMode,
     SelfCheckOutcome, TransformStatus, Trellis, TrellisError, TrellisOptions,
@@ -96,7 +96,6 @@ const LOCKED_WAIT_TIMEOUT: Duration = Duration::from_secs(600);
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
     // Capture triggers stage in the writer's own transaction, so there is
     // no staged watermark to hold apply back. A saturated one never does.
-    let watermark = StagedWatermark::saturated();
     for _ in 0..16 {
         let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
         seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
@@ -108,7 +107,6 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
             "self_check_test",
             1,
             "trellis_self_check_test",
-            &watermark,
         )
         .await
         .expect("drain_once")

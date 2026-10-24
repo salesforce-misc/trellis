@@ -29,7 +29,7 @@ use trellis::defs::chunk_queue;
 use trellis::staging::build::{self, WorkerOptions};
 use trellis::staging::partition_correction;
 use trellis::staging::self_check::CheckPageExt;
-use trellis::staging::{StagedWatermark, apply, seal};
+use trellis::staging::{apply, seal};
 use trellis::{SelfCheckOutcome, Trellis};
 
 const SCHEMA: &str = trellis::config::DEFAULT_SCHEMA;
@@ -225,7 +225,6 @@ impl Instance {
         seal::seal_phase2(&self.raw, sealed.sealed_seg_seq, "wake")
             .await
             .map_err(|e| e.to_string())?;
-        let watermark = StagedWatermark::saturated();
         for _ in 0..16 {
             match apply::drain_once(
                 &self.pool,
@@ -233,7 +232,6 @@ impl Instance {
                 "partition_row_security",
                 1,
                 "trellis_partition_row_security",
-                &watermark,
             )
             .await
             {

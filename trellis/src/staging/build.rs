@@ -200,8 +200,7 @@
 //! arguments plain columns or expressions (#625 F5). An expression argument
 //! is the SQL `defs::oracle` renders, which a chunk computes over the source
 //! table and a page over its change's image cast to the source's row type.
-//! A relationship-fed aggregate waits for F9. [`BuildPlan::load`] returns
-//! `None` for anything else.
+//! [`BuildPlan::load`] returns `None` for anything else.
 //!
 //! # Seam-fed sources (F6)
 //!
@@ -234,13 +233,12 @@
 //! upstream go through the seam as any writer's do, so a rebuild of an
 //! upstream parks no catch-up for its readers.
 //!
-//! **Plain 1-1 targets (F8a, [`one_to_one`]).** A 1-1 target with no
-//! relationship path, on a captured source, takes the same scheduled build:
+//! **Plain 1-1 targets (F8a, [`one_to_one`]).** A 1-1 target takes the same
+//! scheduled build:
 //! the start, the plan job, the sweep on a rebuild and the strict flip. Its
 //! chunk writes the target rows themselves, ordered against pages by the
 //! keys' entries on the 1-1 slim ledger (#623 D6), so it appends no group
-//! deltas, its target has no delta table, and nothing merges for it. A
-//! relationship-enriched 1-1 target waits for milestone E.
+//! deltas, its target has no delta table, and nothing merges for it.
 //!
 //! **Field builds (F8b).** `ALTER TRANSFORM ... ADD`/`ALTER` and a column
 //! resume rebuild only the fields they change, in the background
@@ -265,12 +263,9 @@
 //! - **The chunk** of a plain 1-1 target ([`one_to_one::run_field_chunk`])
 //!   takes the keys' entry lock and then rewrites just the fields of their
 //!   existing target rows from one snapshot, leaving the entries alone. A
-//!   relationship-enriched 1-1 target, which only a column resume reaches
-//!   (`ALTER` refuses a relationship path), takes a page's whole-row
-//!   Re-derive of the range's keys instead (`apply::DirectRederive`), and
-//!   reads their related rows after the entry lock, as it reads the rows
-//!   (#832): a parent change that commits after that read stages a
-//!   recompute whose page waits on the lock and writes after the chunk. An
+//!   1-1 target whose fields the Re-derive build's SQL can't render takes a
+//!   page's whole-row Re-derive of the range's keys instead
+//!   (`apply::DirectRederive`). An
 //!   aggregate's fields are never held out of Apply, so neither call builds
 //!   one.
 //! - **The capture gate.** A field that reads a source column the source's
@@ -1174,10 +1169,6 @@ pub(crate) const BUILD_REDERIVE: &str = "rederive";
 
 /// The shape a Re-derive build serves, if `definition` has one (see the
 /// module doc's "Shapes").
-///
-/// A relationship-fed target has none: with no relationships resolved,
-/// [`ledger::route`] refuses one, so it keeps the one-pass build until #625
-/// F9.
 fn buildable_shape(definition: &Definition) -> Option<ledger::LedgerShape> {
     shape_of(&definition.def, &definition.source_columns)
 }
@@ -1276,7 +1267,7 @@ fn shape_of(
     def: &TransformDef,
     source_columns: &HashMap<String, ValueType>,
 ) -> Option<ledger::LedgerShape> {
-    ledger::route(def, source_columns, &HashMap::new())
+    ledger::route(def, source_columns)
 }
 
 /// Whether the ledger of aggregate `def` carries its partial `GROUP BY`
@@ -2776,7 +2767,7 @@ impl ChunkPlan {
 /// which a chunk or a sweep batch of a 1-1 target reads before it plans,
 /// and takes `for share` as its transaction's first lock
 /// ([`hold_plan_epoch`]) (#625 F8b). A chunk plans before its transaction
-/// (its fields, and for a relationship-enriched target its paused columns),
+/// (its fields, and for a [`FieldPlan::Direct`] its paused columns),
 /// so an edit can commit in between: `ALTER TRANSFORM`, a column pause or
 /// resume, or a field build's capture release, each of which bumps the
 /// fence. If the chunk then went on, the edit's own field build could
@@ -2840,12 +2831,9 @@ enum FieldPlan {
     /// A plain 1-1 target's: [`one_to_one::run_field_chunk`] over the
     /// fields.
     OneToOne(one_to_one::OneToOnePlan, Vec<String>),
-    /// A 1-1 target the Re-derive build's SQL can't render (a
-    /// relationship-enriched one): a page's whole-row Re-derive of the
-    /// range's keys, built before the chunk's transaction (it resolves its
-    /// relationship reads from the catalog through the pool, and runs them
-    /// in the transaction, after the entry lock), and how many keys it
-    /// re-derives.
+    /// A 1-1 target the Re-derive build's SQL can't render: a page's
+    /// whole-row Re-derive of the range's keys, built before the chunk's
+    /// transaction, and how many keys it re-derives.
     Direct(Box<super::apply::DirectRederive>, usize),
     /// A range with no key to re-derive.
     Empty,
@@ -3054,7 +3042,6 @@ async fn stage_null_keys(
                 src_table: source_table.to_string(),
                 key: row.get(0),
                 hop_gen: 0,
-                group_key: None,
                 src_changed: None,
                 prior_image: None,
                 origin_lsn: None,
