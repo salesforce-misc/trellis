@@ -1603,16 +1603,31 @@ impl GroupTargetPlan {
     /// `deltas`. A cell the snapshot sees in the table but the enumeration
     /// didn't name is left to its pages.
     ///
+    /// Two statements: the first fills `cells` (a temp table, quoted and
+    /// `pg_temp.`-qualified) with each cell, the `ctid` of its hidden row
+    /// (`NULL` if none), its held partials and its new ones; the caller
+    /// analyzes it; the second writes from it. The cells are matched to the
+    /// hidden rows and to the `GROUP BY` by hash joins on
+    /// [`Self::group_match`], not by a lookup per cell: a build's cells are
+    /// every cell of the side. Postgres has no statistics for that match's
+    /// arrays, so it guesses its rows at orders of magnitude too many; the
+    /// write is planned from `cells`' own statistics instead. Planned from
+    /// the guess, its anti-join's hash table split into as many batches as
+    /// the guessed rows called for, and a build over a hidden table that
+    /// already holds its cells (a rebuild, a resume) ran for minutes, or
+    /// hours at 100M rows, on the batches alone (#1346).
+    ///
     /// A keyed cell is held by `J`, not by a row lock, so the zero-cell
     /// collection (`super::retire`), which takes no `J` lock, may delete one
-    /// the statement read: the update then finds no row, and the cell is
-    /// inserted instead. Its held partials were zero, as the collection
-    /// deletes only zero cells, so its change is the same either way.
-    ///
-    /// The cells are matched to the hidden rows and to the `GROUP BY` by
-    /// hash or merge joins on [`Self::group_match`], not by a lookup per
-    /// cell: a build's cells are every cell of the side.
-    fn join_build_sql(&self, grouped: &str, deltas: &str) -> String {
+    /// the first statement read: the update then finds no row, and the cell
+    /// is inserted instead. Its held partials were zero, as the collection
+    /// deletes only zero cells, so its change is the same either way. The
+    /// cells to insert are those the update didn't write, an anti-join of the
+    /// cells against the update's rows (a cell with no hidden row has a
+    /// `NULL` `__hc`, which matches none). It is the bare `not exists`: an
+    /// `or` beside it keeps it a subplan, which rescans the update's rows
+    /// once per cell when they outgrow memory.
+    fn join_build_sql(&self, grouped: &str, cells: &str, deltas: &str) -> [String; 2] {
         let cols = quoted(&self.shape.group_cols);
         let col_list = cols.join(", ");
         let args = &self.shape.args;
@@ -1655,29 +1670,14 @@ impl GroupTargetPlan {
         insert_values.extend(["snap.__snap", "snap.__seg"].map(String::from));
         let rg_cols: Vec<String> = cols.iter().map(|c| format!("rg.{c}")).collect();
         let x_cols: Vec<String> = cols.iter().map(|c| format!("x.{c}")).collect();
-        format!(
-            "with snap as materialized (select __snap, __seg from {grouped} where __meta), \
-             rg as (select distinct {col_list} from {recomputed}), \
-             h as (select x.ctid as __hc, {x_cols}, {held} from {hidden} x), \
-             n as (select * from {grouped} where not __meta), \
-             r as materialized ( \
-                 select {rg_cols}, h.__hc, {cell} from rg \
-                 left join h on {h_match} \
-                 left join n on {n_match} \
-             ), \
-             up as ( \
-                 update {hidden} u set {sets}, __basis = snap.__snap, __stamp = snap.__seg \
-                 from r, snap where u.ctid = r.__hc \
-                 returning r.__hc \
-             ), \
-             ins as ( \
-                 insert into {hidden} ({insert_cols}) \
-                 select {insert_values} from r, snap \
-                 where r.__hc is null \
-                    or not exists (select from up where up.__hc = r.__hc) \
-             ), \
-             d as (insert into {deltas} ({delta_cols}) select {delta_values} from r) \
-             select count(*) from r",
+        let fill = format!(
+            "create temp table {table} on commit drop as \
+             select {rg_cols}, h.__hc, {cell} \
+             from (select distinct {col_list} from {recomputed}) rg \
+             left join (select x.ctid as __hc, {x_cols}, {held} from {hidden} x) h \
+                 on {h_match} \
+             left join (select * from {grouped} where not __meta) n on {n_match}",
+            table = cells.trim_start_matches("pg_temp."),
             recomputed = self.recomputed,
             hidden = self.hidden_ident,
             x_cols = x_cols.join(", "),
@@ -1686,12 +1686,29 @@ impl GroupTargetPlan {
             cell = cell.join(", "),
             h_match = self.group_match("h", "rg"),
             n_match = self.group_match("n", "rg"),
+        );
+        let write = format!(
+            "with snap as materialized (select __snap, __seg from {grouped} where __meta), \
+             up as ( \
+                 update {hidden} u set {sets}, __basis = snap.__snap, __stamp = snap.__seg \
+                 from {cells} r, snap where u.ctid = r.__hc \
+                 returning r.__hc \
+             ), \
+             ins as ( \
+                 insert into {hidden} ({insert_cols}) \
+                 select {insert_values} from {cells} r, snap \
+                 where not exists (select from up where up.__hc = r.__hc) \
+             ), \
+             d as (insert into {deltas} ({delta_cols}) select {delta_values} from {cells} r) \
+             select count(*) from {cells}",
+            hidden = self.hidden_ident,
             sets = sets.join(", "),
             insert_cols = insert_cols.join(", "),
             insert_values = insert_values.join(", "),
             delta_cols = delta_cols.join(", "),
             delta_values = delta_values.join(", "),
-        )
+        );
+        [fill, write]
     }
 
     /// A rebuild's enumeration ([`rebuild`], R8): adds to
@@ -2517,7 +2534,8 @@ pub(super) async fn recompute_locked_groups_from(
 /// A `JOIN` build's write of one side's cells, `plan` a
 /// [`Writer::JoinPartials`] (`super::join::build`): the snapshot statement,
 /// one `GROUP BY` of `node` into `grouped` ([`GroupTargetPlan::join_group_sql`]),
-/// then every cell of [`GroupTargetPlan::recomputed`] written once from it
+/// then every cell of [`GroupTargetPlan::recomputed`] matched to its hidden
+/// row and to `grouped` into `cells`, and written once from there
 /// ([`GroupTargetPlan::join_build_sql`]). The caller holds `J` on every key
 /// the cells name and has locked the cells with a `NULL` key part, so the
 /// snapshot follows every lock statement.
@@ -2526,6 +2544,7 @@ pub(super) async fn write_join_build_cells(
     plan: &GroupTargetPlan,
     node: &str,
     grouped: &str,
+    cells: &str,
 ) -> Result<(), ApplyError> {
     let Writer::JoinPartials { deltas } = &plan.writer else {
         return Err(plan.unsupported("a JOIN build's cell write on a structure with no cells"));
@@ -2533,9 +2552,11 @@ pub(super) async fn write_join_build_cells(
     txn.batch_execute(&plan.join_group_sql(node, grouped))
         .await?;
     analyze(txn, &[grouped]).await?;
+    let [fill, write] = plan.join_build_sql(grouped, cells, deltas);
     txn.batch_execute(BULK_PLAN_SETTINGS).await?;
-    txn.query_one(&plan.join_build_sql(grouped, deltas), &[])
-        .await?;
+    txn.batch_execute(&fill).await?;
+    analyze(txn, &[cells]).await?;
+    txn.query_one(&write, &[]).await?;
     txn.batch_execute(BULK_PLAN_RESET).await?;
     Ok(())
 }
@@ -3320,6 +3341,106 @@ mod tests {
         let mut int8 = columns();
         int8.insert("g".to_string(), ValueType::Integer(IntWidth::Int8));
         name_one_group(&mut client, &int8, 5_000_000_000).await;
+    }
+
+    /// The `explain` text of `sql` on `txn`.
+    async fn explain(txn: &Transaction<'_>, sql: &str) -> String {
+        txn.query(&format!("explain {sql}"), &[])
+            .await
+            .expect("explain")
+            .iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// A `JOIN` build's cell write over a hidden table that already holds
+    /// its cells (a rebuild, a resume) matches every set by hash joins: the
+    /// cells to the hidden rows and to the `GROUP BY`, then the cells to
+    /// insert by an anti-join against the update's rows, planned for the
+    /// cells there are. A correlated subplan there rescans the update's rows
+    /// once per cell, and a hash table sized for the match's guessed rows
+    /// (Postgres has no statistics for its arrays) loops over its batches:
+    /// either way a 100M-row rebuild ran for hours (#1346).
+    #[tokio::test]
+    async fn a_join_build_write_over_held_cells_hashes_every_match() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (mut client, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let def =
+            crate::defs::parse("TRANSFORM t FROM s GROUP BY g SELECT SUM(a) AS s").expect("parses");
+        let shape = shape_of(&def, &columns()).expect("admitted");
+        let hidden = hidden_table_ident("trellis", 7);
+        let deltas = "pg_temp.\"trellis_test_deltas\"".to_string();
+        let plan = GroupTargetPlan::for_join(
+            "public.t",
+            hidden.clone(),
+            "trellis_test_staged",
+            Some(("public.s", "trellis_test_cells", Vec::new())),
+            Vec::new(),
+            shape.clone(),
+            Writer::JoinPartials {
+                deltas: deltas.clone(),
+            },
+            None,
+            String::new(),
+        );
+        client
+            .batch_execute(&format!(
+                "create schema if not exists trellis; {}; \
+                 create table public.segments (seg_seq bigint); \
+                 create table public.s (id integer primary key, g integer, b bigint, a integer); \
+                 insert into public.s select i, i, i % 100, i from generate_series(1, 20000) i; \
+                 insert into {hidden} (g, __n, __count_1, __sum_1) \
+                     select g, 1, 1, 1 from public.s; \
+                 analyze public.s, {hidden}",
+                hidden_table_ddl("trellis", 7, &shape)
+            ))
+            .await
+            .expect("source and held cells");
+        let grouped = "pg_temp.\"trellis_test_grouped\"";
+        let txn = client.transaction().await.expect("begin");
+        txn.batch_execute(&format!(
+            "{}; {}; insert into {} (g) select g from {hidden}",
+            plan.working_ddl(),
+            plan.deltas_ddl().expect("a side's deltas"),
+            plan.recomputed,
+        ))
+        .await
+        .expect("working tables");
+        txn.batch_execute(&plan.join_group_sql("public.s", grouped))
+            .await
+            .expect("group");
+        analyze(&txn, &[&plan.recomputed, grouped])
+            .await
+            .expect("analyze");
+        txn.batch_execute(BULK_PLAN_SETTINGS)
+            .await
+            .expect("settings");
+        let matched = "pg_temp.\"trellis_test_matched\"";
+        let [fill, write] = plan.join_build_sql(grouped, matched, &deltas);
+        let fill_plan = explain(&txn, &fill).await;
+        assert!(!fill_plan.contains("Nested Loop"), "{fill_plan}");
+        txn.batch_execute(&fill).await.expect("fill");
+        analyze(&txn, &[matched]).await.expect("analyze");
+        let write_plan = explain(&txn, &write).await;
+        assert!(!write_plan.contains("SubPlan"), "{write_plan}");
+        let anti = write_plan
+            .lines()
+            .find(|line| line.contains("Hash Anti Join"))
+            .unwrap_or_else(|| panic!("no hash anti-join: {write_plan}"));
+        let rows: f64 = anti
+            .split("rows=")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|rows| rows.parse().ok())
+            .expect("estimated rows");
+        assert!(rows <= 40_000.0, "planned for 20000 cells: {write_plan}");
     }
 
     #[test]

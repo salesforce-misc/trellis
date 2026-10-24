@@ -298,9 +298,12 @@ ring's old images), locks `J` on the union of both sides' keys in one sorted
 statement, then locks the `P` cells with a `NULL` key part (they take no `J`
 row; `J` holds every other cell). Each side's snapshot statement, after every
 lock statement, is one `GROUP BY` of its table into a temporary table, so
-Postgres can run it in parallel; the write that follows reads it and writes
-each enumerated cell once, an update of a held cell or an insert of a new one,
-with that snapshot as its basis. `J` doesn't hold a zero cell against the
+Postgres can run it in parallel. The write that follows first matches each
+enumerated cell to its held row and to that `GROUP BY` into another temporary
+table, analyzed so the write is planned for the cells there are (Postgres has
+no statistics for the null-matching key comparison), then writes each cell
+once from it, an update of a held cell or an insert of a new one, with that
+snapshot as its basis. `J` doesn't hold a zero cell against the
 zero-cell collection, which takes no `J` lock: a cell it deletes under the
 write is inserted instead, and its change is the same, since its held partials
 were zero. The enumeration is a `create table as` too, for the same reason as

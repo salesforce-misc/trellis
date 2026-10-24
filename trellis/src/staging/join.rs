@@ -201,9 +201,11 @@ struct SidePlan {
     node: Option<String>,
     /// A build's per-transaction tables, quoted and `pg_temp.`-qualified:
     /// its enumerated cells ([`group_basis::enumerate_cells`]) and its
-    /// snapshot's `GROUP BY` ([`group_basis::write_join_build_cells`]).
+    /// snapshot's `GROUP BY` and each cell's match to its hidden row and to
+    /// that `GROUP BY` ([`group_basis::write_join_build_cells`]).
     cells: String,
     grouped: String,
+    matched: String,
 }
 
 impl SidePlan {
@@ -485,6 +487,10 @@ impl JoinTargetPlan {
                     grouped: format!(
                         "pg_temp.{}",
                         quote_ident(&working(&format!("g{tag}"), table))
+                    ),
+                    matched: format!(
+                        "pg_temp.{}",
+                        quote_ident(&working(&format!("w{tag}"), table))
                     ),
                 }
             };
@@ -1081,8 +1087,14 @@ async fn write_locked(
         if side.recompute {
             match side.bulk_node(bulk) {
                 Some(node) => {
-                    group_basis::write_join_build_cells(txn, &side.plan, node, &side.grouped)
-                        .await?;
+                    group_basis::write_join_build_cells(
+                        txn,
+                        &side.plan,
+                        node,
+                        &side.grouped,
+                        &side.matched,
+                    )
+                    .await?;
                 }
                 None => {
                     group_basis::recompute_locked_groups_from(
