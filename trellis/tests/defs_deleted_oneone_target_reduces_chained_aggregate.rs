@@ -41,8 +41,8 @@ use trellis::staging::{has_pending, retire_drained_segments};
 
 /// Claims and executes every pending direct-build backfill chunk until none
 /// remain — the test-harness stand-in for a running drain worker, since
-/// `install_definition` no longer runs a plain (non-relationship) 1-1
-/// definition's backfill in-call (ADR-0002): it
+/// `install_definition` no longer runs a 1-1 definition's backfill in-call
+/// (ADR-0002): it
 /// returns as soon as the chunk work is enumerated and persisted,
 /// `Backfilling` until a drain worker actually claims and finishes each
 /// chunk. Both `order_view` (this file's 1-1 mirror) and `customer_totals`
@@ -114,8 +114,7 @@ async fn active_seg_table(client: &Client) -> String {
     format!("seg_{ring_slot}")
 }
 
-/// Bare (no `.`) `name` qualified under [`DEFAULT_SCHEMA`] — see
-/// `defs_aggregate_group_by_relationship.rs`'s helper of the same name.
+/// Bare (no `.`) `name` qualified under [`DEFAULT_SCHEMA`].
 fn qualify_fixture_table(name: &str) -> String {
     if name.contains('.') {
         name.to_string()

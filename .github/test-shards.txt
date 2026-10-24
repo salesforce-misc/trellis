@@ -33,7 +33,6 @@ test:backup_restore 11.4
 test:capture_disruption 10.9
 test:self_check 10.2
 test:target_mutation_seam 9.4
-test:spike_102_settled_state 9.3
 test:coverage 8.9
 test:quarantine 8.8
 test:row_security 8.3

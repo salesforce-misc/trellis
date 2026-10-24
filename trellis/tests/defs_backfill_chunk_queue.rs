@@ -1,15 +1,15 @@
 //! Integration tests for the durable backfill-chunk work queue
 //! (`trellis::defs::chunk_queue`, ADR-0002's "A build is
 //! Re-derive over chunks, and applies from its first chunk"): the claim/reclaim-stale idiom a drain worker
-//! uses to finish a plain (non-relationship) 1-1 direct-build definition's
+//! uses to finish a 1-1 definition's
 //! backfill in the background (over a seam-fed source since #625 F8a: see
 //! `install_and_dispatch`), and the CDC-race closure that makes excluding
 //! a non-`live` definition from the apply path ([`transforms_for_source`])
 //! safe rather than lossy.
 //!
 //! The staging harness (connect, stage a CDC row, seal/drain to quiescence)
-//! mirrors `defs_install_definition.rs`/`apply_relationships.rs`; see those
-//! files for the ring/seal mechanics.
+//! mirrors `defs_install_definition.rs`; see that file for the ring/seal
+//! mechanics.
 
 use std::time::Duration;
 

@@ -5538,8 +5538,8 @@ async fn resolve_node_in_txn(
     })
 }
 
-/// Pool-level wrapper over [`persist_edge_in_txn`], mirroring
-/// [`resolve_node`]'s relationship to [`resolve_node_in_txn`]. Exists so the
+/// Pool-level wrapper over [`persist_edge_in_txn`], as [`resolve_node`]
+/// wraps [`resolve_node_in_txn`]. Exists so the
 /// `on conflict do nothing` dedup path on `schema_edges`'s
 /// `(from_node_id, to_node_id, kind)` uniqueness constraint has direct test
 /// coverage — [`create_definition`] can never hit it itself, since

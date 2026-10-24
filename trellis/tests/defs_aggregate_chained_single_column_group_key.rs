@@ -27,8 +27,8 @@
 //! `sku_totals` does (an identity re-aggregation, not a coarser fan-in): a
 //! single-column upstream `GROUP BY` key is, by construction, already a
 //! distinct-per-group identity, so a *coarser* downstream regrouping needs a
-//! second raw column riding along, which only a composite (or
-//! relationship-path) upstream key can expose — see
+//! second raw column riding along, which only a composite upstream key can
+//! expose — see
 //! `defs_aggregate_chained_composite_group_key.rs` for that shape. Here, an
 //! extinct upstream group's downstream counterpart must itself go fully
 //! extinct (its `SUM` of one vanished contributor drops to nothing), which
@@ -75,8 +75,7 @@ async fn active_seg_table(client: &Client) -> String {
     format!("seg_{ring_slot}")
 }
 
-/// Bare (no `.`) `name` qualified under [`DEFAULT_SCHEMA`] — see
-/// `defs_aggregate_group_by_relationship.rs`'s helper of the same name.
+/// Bare (no `.`) `name` qualified under [`DEFAULT_SCHEMA`].
 fn qualify_fixture_table(name: &str) -> String {
     if name.contains('.') {
         name.to_string()

@@ -69,8 +69,7 @@ async fn active_seg_table(client: &Client) -> String {
     format!("seg_{ring_slot}")
 }
 
-/// Bare (no `.`) `name` qualified under [`DEFAULT_SCHEMA`] — see
-/// `defs_aggregate_group_by_relationship.rs`'s helper of the same name.
+/// Bare (no `.`) `name` qualified under [`DEFAULT_SCHEMA`].
 fn qualify_fixture_table(name: &str) -> String {
     if name.contains('.') {
         name.to_string()

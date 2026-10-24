@@ -2,15 +2,6 @@ name: Nightly
 
 # The deep half of the fast/deep split ci.yml's PR-time job can't afford:
 #
-# - issue #138 part 1's settled-state validation model
-#   (trellis/tests/spike_102_settled_state.rs): the full 8-design, 3000-run
-#   campaign. 3000 runs is not "more is better" -- per that model's own
-#   header and trellis/tests/spikes/README.md, one of the shipped design's
-#   four guards (the per-parent reverse-ordering check) only shows corruption
-#   from being disabled at 3000 runs; it showed zero extra corruption at
-#   200-1500 runs in the original hand-run campaign. Running it on every PR
-#   was measured at several minutes for the full campaign -- too slow to pay
-#   on every push, but this deep lane can afford it.
 # - the generative crate's own expensive property
 #   (`property_convergence_holds_for_trivial_programs`), at a much higher case count
 #   than its 16-case default. Every property is `#[ignore]`d, so PR-time CI
@@ -59,11 +50,6 @@ jobs:
           fi
           echo "using PostgreSQL server binaries from: $pg_bin"
           echo "$pg_bin" >> "$GITHUB_PATH"
-
-      - name: Issue #138 settled-state validation -- full 3000-run x 8-design campaign
-        run: cargo test -p trellis --test spike_102_settled_state -- --ignored --nocapture
-        env:
-          SPIKE_102_CAMPAIGN_RUNS: "3000"
 
       - name: Generative deep property -- property_convergence_holds_for_trivial_programs at PROPTEST_CASES=200
         # generative/README.md's own recommended deep-lane invocation. The

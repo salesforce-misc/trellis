@@ -7,9 +7,8 @@
 //! TRANSFORM stock_totals_v2 FROM stock_totals  GROUP BY warehouse     WITHOUT SOURCE INDEX SELECT sum(total_qty) AS total_qty
 //! ```
 //!
-//! No relationship is involved — this is the plainest possible two-column
-//! `GROUP BY` chained onto by a second aggregate, exactly the issue's own
-//! repro shape.
+//! This is the plainest possible two-column `GROUP BY` chained onto by a
+//! second aggregate, exactly the issue's own repro shape.
 //!
 //! `stock_totals`' composite `(warehouse, sku)` identity is what makes this
 //! interesting: when a group's row changes, `apply_and_mark_drained_many`'s
@@ -29,10 +28,8 @@
 //! Backfilling both definitions from scratch was never broken (a direct
 //! table scan builds no per-row key text at all), so every test here
 //! deliberately drives a *live* change after both definitions are already
-//! installed and converged. The harness (hand-staged CDC rows + seal/drain
-//! to quiescence) mirrors `defs_aggregate_group_by_relationship.rs`, whose
-//! own chaining test documented this bug but deliberately stayed off the
-//! broken path.
+//! installed and converged. The harness stages CDC rows by hand and
+//! seals/drains to quiescence.
 
 use std::collections::HashMap;
 
@@ -74,8 +71,7 @@ async fn active_seg_table(client: &Client) -> String {
     format!("seg_{ring_slot}")
 }
 
-/// Bare (no `.`) `name` qualified under [`DEFAULT_SCHEMA`] — see
-/// `defs_aggregate_group_by_relationship.rs`'s helper of the same name.
+/// Bare (no `.`) `name` qualified under [`DEFAULT_SCHEMA`].
 fn qualify_fixture_table(name: &str) -> String {
     if name.contains('.') {
         name.to_string()

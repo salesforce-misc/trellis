@@ -2507,7 +2507,7 @@ async fn dropping_a_field_still_read_by_a_dependent_is_refused() {
         .expect("no dependent reads column b specifically");
 
     // Dropping `a` — which `order_calc_reader` reads — is refused, naming
-    // the specific column-level relationship.
+    // the specific column it reads.
     let err = trellis
         .apply("ALTER TRANSFORM order_calc DROP a")
         .await

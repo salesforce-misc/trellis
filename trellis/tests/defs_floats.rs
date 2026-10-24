@@ -664,9 +664,8 @@ async fn float_text_rendering_is_byte_identical_to_postgres_through_the_evaluato
 /// The **Rust evaluator's own** float aggregate fold agrees with Postgres,
 /// value for value and byte for byte.
 ///
-/// Found in review of #112: `eval::fold_aggregate` and
-/// `eval::eval_to_many_aggregate` both filtered their collected values with
-/// `ValueType::is_exact_numeric_family()`, which by construction excludes
+/// Found in review of #112: `eval::fold_aggregate` filtered its collected
+/// values with `ValueType::is_exact_numeric_family()`, which by construction excludes
 /// `ValueType::Float`. Every float row was therefore silently dropped, the
 /// fold saw an empty group, and `SUM`/`MIN`/`MAX`/`AVG` over a float column
 /// returned `NULL` — with the entire float branch of

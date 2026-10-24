@@ -1808,7 +1808,7 @@ async fn pausing_an_upstream_column_never_cascades_into_a_downstream_aggregate()
 // ---------------------------------------------------------------------
 
 /// `resume_column`'s `recompute_column` used to call the un-excluding
-/// `eval::evaluate_with_relationships`, so a still-paused sibling column
+/// evaluator, so a still-paused sibling column
 /// (`busted` below, whose formula throws for every row given the malformed —
 /// but genuinely persisted — source data) made the *whole* per-row
 /// evaluation fail, and the resumed column (`doubled`) silently never got

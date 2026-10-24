@@ -709,8 +709,8 @@ async fn staging_and_application_threads_are_independent_knobs() {
 /// ADR-0002's "A build is Re-derive over chunks, and applies from its first chunk", proven
 /// end-to-end through the real `Client` runtime rather than by manually
 /// calling `defs::chunk_queue`'s primitives (see `defs_backfill_chunk_queue.rs`
-/// for that lower-level coverage): `install_definition` on a plain
-/// (non-relationship) 1-1 transform returns immediately, its discharge
+/// for that lower-level coverage): `install_definition` on a 1-1 transform
+/// returns immediately, its discharge
 /// enqueues the chunks, and it's the running client's own `application_threads`
 /// drain workers — with no ring/CDC involved at all here (`staging_worker:
 /// false`) — that claim and finish its backfill chunk, completing its build

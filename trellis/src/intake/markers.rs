@@ -992,10 +992,8 @@ pub(super) async fn fetch_read(
 /// (`staging::halt`): it reads the catalog as its own role, pauses each
 /// definition the refusal reaches with kind `halt` and the reason, and
 /// retries the marker at once without them. A frozen definition doesn't
-/// count as a reader of the table, and a table whose readers are all frozen
-/// gets no projection refresh, so once every reader of a refused table is
-/// paused, the retry neither enumerates it nor refreshes its projections,
-/// and the marker discharges; resuming a definition parks it a fresh one. A
+/// count as a reader of the table, so once every reader of a refused table
+/// is paused, the retry doesn't enumerate it, and the marker discharges; resuming a definition parks it a fresh one. A
 /// refusal the catalog pins on no table pauses nothing, and the marker backs
 /// off like any other failure.
 ///
