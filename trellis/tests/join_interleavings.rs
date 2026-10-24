@@ -3341,6 +3341,61 @@ async fn build_writes_each_cell_once_on_a_fresh_build() {
     lab.check("a fresh build").await;
 }
 
+/// A build holds its keyed cells by `J` alone, not by a row lock, so the
+/// zero-cell collection, which takes no `J` lock, may delete one while the
+/// build writes it: here the pass has claimed and deleted the zero `P` cell
+/// (`k = 1, ga = 5`, no basis) and not committed when the build's write
+/// reads it. The write still writes the cell, with the build's basis, so
+/// the undrained insert that refilled it is refused, not applied a second
+/// time on top of the build's count.
+#[tokio::test]
+async fn a_build_writes_a_cell_the_collection_deletes_under_it() {
+    let mut lab = seeded(Key::Single, &[L], BUILD_SEED).await;
+    lab.build().await;
+    lab.assert_built("built").await;
+    lab.step("insert into public.a values (100, 5, 0, 1, 3)")
+        .await;
+    lab.step("delete from public.a where id = 100").await;
+    let p = lab.hidden(L, "p").await;
+    assert_eq!(
+        lab.scalar(&format!(
+            "select count(*) from {p} where __zero and __basis is null"
+        ))
+        .await,
+        "1",
+        "one zero cell with no basis"
+    );
+    let refill = lab
+        .sealed("insert into public.a values (100, 5, 0, 1, 3)")
+        .await;
+    request_rebuild(&lab, "a").await;
+    let point = PausePoint::AfterEntryLock;
+    let mut building = lab.build_frozen("sweep", &[point]).await;
+    building.reached(point).await;
+    let collector = lab.d.user().await;
+    let collector_pid: i32 = collector
+        .query_one("select pg_backend_pid()", &[])
+        .await
+        .expect("pid")
+        .get(0);
+    // The pass's statement, by hand, held open across the build's write.
+    collector
+        .batch_execute(&format!(
+            "begin; delete from {p} where ctid = any(array( \
+                 select ctid from {p} where __zero and __basis is null \
+                 order by k, ga for update skip locked))"
+        ))
+        .await
+        .expect("claim and delete the zero cell");
+    lab.d.release(&mut building, point).await;
+    lab.d.wait_blocked_behind(collector_pid).await;
+    collector.batch_execute("commit").await.expect("commit");
+    building.finish().await;
+    lab.d.drain(refill, "refill").await;
+    lab.assert_built("rebuilt around a collection").await;
+    lab.check("a cell collected under the build's write").await;
+}
+
 /// Test 6 (R8): a cell whose only row moved out, undrained, before the build
 /// is a zero cell with a basis, so the later `-1` of the move is refused.
 #[tokio::test]

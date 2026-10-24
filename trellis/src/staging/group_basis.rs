@@ -1584,6 +1584,12 @@ impl GroupTargetPlan {
     /// `deltas`. A cell the snapshot sees in the table but the enumeration
     /// didn't name is left to its pages.
     ///
+    /// A keyed cell is held by `J`, not by a row lock, so the zero-cell
+    /// collection (`super::retire`), which takes no `J` lock, may delete one
+    /// the statement read: the update then finds no row, and the cell is
+    /// inserted instead. Its held partials were zero, as the collection
+    /// deletes only zero cells, so its change is the same either way.
+    ///
     /// The cells are matched to the hidden rows and to the `GROUP BY` by
     /// hash or merge joins on [`Self::group_match`], not by a lookup per
     /// cell: a build's cells are every cell of the side.
@@ -1643,10 +1649,13 @@ impl GroupTargetPlan {
              up as ( \
                  update {hidden} u set {sets}, __basis = snap.__snap, __stamp = snap.__seg \
                  from r, snap where u.ctid = r.__hc \
+                 returning r.__hc \
              ), \
              ins as ( \
                  insert into {hidden} ({insert_cols}) \
-                 select {insert_values} from r, snap where r.__hc is null \
+                 select {insert_values} from r, snap \
+                 where r.__hc is null \
+                    or not exists (select from up where up.__hc = r.__hc) \
              ), \
              d as (insert into {deltas} ({delta_cols}) select {delta_values} from r) \
              select count(*) from r",
