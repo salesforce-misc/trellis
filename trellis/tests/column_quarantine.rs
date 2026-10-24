@@ -1183,9 +1183,7 @@ async fn resume_recomputes_and_does_not_un_pause_a_dependent_with_its_own_reason
 
 /// Reviewer follow-up to issue #74 (epic #78's own whole-branch review): the
 /// quarantine-recompute counterpart to `apply.rs`'s
-/// `explicitly_qualified_target_receives_a_live_cdc_write` and
-/// `apply_aggregate.rs`'s
-/// `explicitly_qualified_aggregate_target_receives_a_live_cdc_write` — a
+/// `explicitly_qualified_target_receives_a_live_cdc_write` — a
 /// definition installed with an explicit non-default *target* schema (issue
 /// #76's grammar) used to fail `resume_column`'s recompute outright:
 /// `recompute_column`'s own `UPDATE` (`staging::quarantine`) bound

@@ -1,8 +1,9 @@
 //! End-to-end tests for issue #115's `jsonb` support: the passthrough gap
 //! check, the join/primary/`GROUP BY` key refusal, the typed-literal
 //! ("computed 1-1 target") role (covered by `defs_typed_literals.rs`'s
-//! shared `CASES` table, which this issue added a `JSONB` row to), and the
-//! `jsonb_agg` aggregate.
+//! shared `CASES` table, which this issue added a `JSONB` row to). The
+//! `jsonb_agg` aggregate is refused at define
+//! (`ValidationError::DeferredAggregate`).
 //!
 //! # Why these run against a live server
 //!
@@ -31,7 +32,7 @@
 //!    element rather than being skipped, unlike every other aggregate here.
 //!
 //! Per ADR-0013 every comparison is against independently-authored SQL —
-//! plain `pg_cast`, plain `pg_proc`, plain `jsonb_agg`, plain `=` — never
+//! plain `pg_cast`, plain `pg_proc`, plain `=` — never
 //! against `defs::oracle::recompute`, which would be the engine's own
 //! renderer grading itself. Harness conventions follow
 //! `defs_bit.rs`/`defs_boolean.rs`.
@@ -289,7 +290,3 @@ async fn jsonb_min_max_is_not_wired_up() {
         );
     }
 }
-
-// ---------------------------------------------------------------------
-// 4. `jsonb_agg`'s STABLE marking: root-caused live
-// ---------------------------------------------------------------------

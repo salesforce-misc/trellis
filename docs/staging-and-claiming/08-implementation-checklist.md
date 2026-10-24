@@ -107,8 +107,8 @@ These fail only if you write them deliberately; ordinary end-to-end tests pass a
       only at or below the contiguous drained prefix.
       (`one_to_one_ledger_interleavings.rs`: `an_out_of_order_drain_holds_gc_back_*`)
 - [ ] **A Re-derive build interleaved with live Apply pages** converges to a
-      from-scratch oracle after the last chunk, drain and merge.
-      (`build_interleavings.rs`, `rederive_build.rs`)
+      from-scratch oracle after the last chunk and drain.
+      (`rederive_build.rs`, `one_to_one_build_interleavings.rs`)
 - [ ] **A schema change never fails the application's write**: a renamed or
       dropped captured column writes a `schema_changed` marker, the drain
       pauses the definitions that read it, and the others keep applying.

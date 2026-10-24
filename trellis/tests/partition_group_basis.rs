@@ -2461,3 +2461,57 @@ async fn a_leaf_read_matches_a_varchar_group_column_at_its_held_type() {
     fx.d.settle().await;
     fx.assert_right("attached").await;
 }
+
+/// `Trellis::status` reports a definition under correction as `backfilling`,
+/// with a `correcting` entry for the node: its schema-qualified name and when
+/// the pass queued the correction, with no count before it commits. Once it
+/// commits the definition is `live` with nothing listed.
+#[tokio::test]
+async fn status_lists_the_node_under_correction_until_it_commits() {
+    let mut fx = Fx::start(&tree("range"), SEED).await;
+    let handle = Trellis::connect(
+        Config::from_dsn(fx.d.db.dsn().to_string()).expect("valid dsn"),
+        TrellisOptions::default(),
+    )
+    .await
+    .expect("connect");
+    let status = handle.status("agg").await.expect("status").expect("agg");
+    assert_eq!(
+        (status.status, status.correcting),
+        (trellis::TransformStatus::Live, Vec::new())
+    );
+
+    fx.exec("drop table public.items_p1").await;
+    fx.pass().await;
+    assert_eq!(fx.kinds().await, ["gone_node"]);
+    // The staging worker's step that enqueues the correction's row.
+    partition_correction::schedule(fx.d.pool())
+        .await
+        .expect("schedule");
+    let queued_at: std::time::SystemTime =
+        fx.d.ctl
+            .query_one("select queued_at from partition_corrections", &[])
+            .await
+            .expect("the correction")
+            .get(0);
+    let status = handle.status("agg").await.expect("status").expect("agg");
+    assert_eq!(status.status, trellis::TransformStatus::Backfilling);
+    assert_eq!(
+        status.correcting,
+        vec![trellis::CorrectingNode {
+            node: "public.items_p1".to_string(),
+            since: queued_at,
+            keys_remaining: None,
+        }],
+        "listed from the pass that queued it"
+    );
+
+    fx.run().await;
+    fx.d.settle().await;
+    let status = handle.status("agg").await.expect("status").expect("agg");
+    assert_eq!(
+        (status.status, status.correcting),
+        (trellis::TransformStatus::Live, Vec::new())
+    );
+    fx.assert_right("dropped").await;
+}

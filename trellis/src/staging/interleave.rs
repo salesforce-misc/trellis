@@ -155,11 +155,10 @@
 //! never what any step does, so a correct engine converges under it.
 //!
 //! It applies wherever the table above puts those two points, on purpose: a
-//! 1-1 page, a ledger page, another aggregate target's page (at its group
-//! pre-lock) and a build chunk alike. A busy worker is slow at whatever page
-//! it is running, and a chunk racing a 1-1 page, or a ledger page racing an
-//! old-path page of the same burst, needs that page held as much as one on
-//! its own path does.
+//! 1-1 page, an aggregate target's page (at its group lock) and a build
+//! chunk alike. A busy worker is slow at whatever page it is running, and a
+//! chunk racing a 1-1 page needs that page held as much as one on its own
+//! path does.
 //!
 //! A group-basis build or rebuild stalls the same way between its
 //! enumeration and its lock statement ([`PausePoint::AfterRebuildEnumerate`],
@@ -191,10 +190,10 @@ use tokio_postgres::GenericClient;
 /// See the module doc for where each sits today.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PausePoint {
-    /// After a ledger target's placeholder insert, before its entry lock
+    /// After a 1-1 target's placeholder insert, before its entry lock
     /// (#623 D7): where a tombstone the insert found can be collected.
     AfterPlaceholders,
-    /// After the page has locked the entries (off the ledger, the group
+    /// After the page has locked the entries (on an aggregate, the group
     /// rows; on a `JOIN`, its `P` and `M` cells) it will write.
     AfterEntryLock,
     /// On a `JOIN` target (`super::join`), at the start of a build's write

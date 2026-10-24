@@ -345,7 +345,7 @@ pub struct JoinSpec {
 /// Whether `name` is one of `group_by`'s keys' target column names — the
 /// common "is this field a `GROUP BY` passthrough" check every layer that
 /// touches an [`super::ast::KeySpace::Aggregate`] definition's fields needs
-/// (DDL's column dedup, `staging::ledger`'s field shape, …), pulled out once here
+/// (DDL's column dedup, `staging::group_basis`'s field shape, …), pulled out once here
 /// rather than re-implemented at each call site.
 pub fn group_by_contains(group_by: &[String], name: &str) -> bool {
     group_by.iter().any(|key| key == name)

@@ -163,8 +163,8 @@ pub enum ValidationError {
     },
     /// The target's name ends with `suffix`, one of
     /// [`super::ledger::RESERVED_TARGET_SUFFIXES`], which name the tables
-    /// Trellis keeps beside a target (its ledger, #623 D2, and its group
-    /// deltas, #625 F1): this target would be one of another target's.
+    /// Trellis keeps beside a target (a 1-1 target's ledger, #623 D2): this
+    /// target would be one of another target's.
     ReservedTargetSuffix {
         target: String,
         suffix: &'static str,
@@ -1110,8 +1110,7 @@ fn validate_target_names(def: &TransformDef) -> Result<(), ValidationError> {
         });
     }
 
-    // #623 D2, #625 F1: a target has a ledger named `<target>__ledger` beside
-    // it, and a ledger-routed aggregate also `<target>__deltas`.
+    // #623 D2: a 1-1 target has a ledger named `<target>__ledger` beside it.
     if let Some(suffix) = super::ledger::RESERVED_TARGET_SUFFIXES
         .into_iter()
         .find(|suffix| def.target.ends_with(suffix))
@@ -1178,8 +1177,8 @@ enum JoinSide {
     Right,
 }
 
-/// The aggregate families a `JOIN` (and, once #1105 lands, a plain
-/// aggregate) refuses, by name: `(functions, family, follow-up issue)`.
+/// The aggregate families a `JOIN` and a plain aggregate refuse, by name:
+/// `(functions, family, follow-up issue)`.
 const DEFERRED_AGGREGATES: &[(&[&str], &str, u32)] = &[
     (&["MIN", "MAX"], "MIN/MAX", 1117),
     (
@@ -1221,8 +1220,8 @@ pub(crate) struct AggregateArg<'a> {
 /// `numeric(p,s)`, or else a named refusal. `arg` is `None` for `COUNT(*)`
 /// and for a call whose argument isn't a resolved column.
 ///
-/// Shared so every key-space refuses the same way. A `JOIN` uses it today;
-/// the plain aggregate adopts it when #1105 removes the ledger.
+/// Shared so every key-space refuses the same way: a `JOIN` and a plain
+/// aggregate both use it.
 pub(crate) fn check_aggregate_admitted(
     function: &str,
     arg: Option<&AggregateArg<'_>>,
@@ -2236,10 +2235,10 @@ pub(crate) fn reject_unsupported_group_by_key_type(
         // `boolean` is *not* on that allowlist (the join/primary-key role
         // really does raw-text `{col}::text = $1` matching in places).
         //
-        // What saves the `GROUP BY` role is that the ledger
-        // (`staging::ledger`) never matches a group by its text: an entry's
-        // group is cast from the image's text into the ledger's own typed
-        // column, through `boolin` — a permissive *input* function that
+        // What saves the `GROUP BY` role is that the group basis
+        // (`staging::group_basis`) never matches a group by its text: a
+        // change's group is parsed from the image's text into the source's
+        // typed column (`jsonb_populate_record`), through `boolin` — a permissive *input* function that
         // accepts both `'t'`/`'f'` and `'true'`/`'false'` — and groups are
         // then matched natively, in SQL. Two renderings of one value always
         // resolve to the same group. `trellis/tests/defs_boolean.rs`'s
@@ -2318,8 +2317,8 @@ pub(crate) fn reject_unsupported_group_by_key_type(
         // `crate::netaddr`'s module doc for the live grid), the identical
         // "one value, two renderers" shape that keeps `inet` off the
         // join/primary-key allowlist. That divergence does not reach the
-        // `GROUP BY` role, because the ledger (`staging::ledger`) never
-        // compares a group key's text — it casts it to the column's native
+        // `GROUP BY` role, because the group basis (`staging::group_basis`)
+        // never compares a group key's text — it casts it to the column's native
         // type, and `inet_in` is permissive enough to parse both spellings
         // back to the identical stored value (`'192.168.1.5'::inet =
         // '192.168.1.5/32'::inet` is `true`, verified live).
@@ -2440,7 +2439,7 @@ pub(crate) fn supported_group_by_key_types() -> String {
 ///   rendering isn't a `1.0`/`1.00` bijection; `boolean`: #119, a second
 ///   `pg_cast`-registered `::text` renderer disagrees with `boolout`). Both
 ///   are safe for this role for reasons specific to it — `boolean`'s
-///   because the ledger (`staging::ledger`) never does the raw-text
+///   because the group basis (`staging::group_basis`) never does the raw-text
 ///   comparison that trips it up elsewhere (issue #119).
 /// * `inet` is admitted here for the identical reason `boolean` is (its own
 ///   `network_show`-vs-`inet_out` split, closed the same way), but stays off

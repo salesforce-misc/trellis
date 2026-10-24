@@ -810,18 +810,12 @@ mod tests {
     /// Rule 8 of #922: one function takes the column-pause lock, so a new
     /// call site can't skip the order or the timeout handling. Any
     /// `pg_advisory_xact_lock` in `src` outside that function's file fails
-    /// this, except the test-only gates (`staging::interleave`, the `__pause`
-    /// column `staging::ledger` adds for it, and a gate function in
-    /// `client.rs`'s tests), which hold a lock key of the test's choosing and
-    /// never the pause lock's.
+    /// this, except the test-only gates (`staging::interleave` and a gate
+    /// function in `client.rs`'s tests), which hold a lock key of the test's
+    /// choosing and never the pause lock's.
     #[test]
     fn only_the_helper_takes_the_column_pause_lock() {
-        const ALLOWED: [&str; 4] = [
-            "locks.rs",
-            "client.rs",
-            "staging/interleave.rs",
-            "staging/ledger.rs",
-        ];
+        const ALLOWED: [&str; 3] = ["locks.rs", "client.rs", "staging/interleave.rs"];
         fn visit(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
             for entry in std::fs::read_dir(dir).expect("read src") {
                 let path = entry.expect("dir entry").path();

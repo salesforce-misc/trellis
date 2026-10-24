@@ -187,11 +187,12 @@ async fn an_aggregate_resumes_onto_its_source_converted_to_a_partitioned_table()
     assert_eq!(rows(&raw, SUMS_ACTUAL).await, rows(&raw, SUMS_ORACLE).await);
 }
 
-/// A ledger holding more live entries than one retire statement takes
-/// (`build::retire_ledger`'s batches of 10,000): every batch is retired, so
-/// no old group survives into the rebuilt target.
+/// An aggregate whose target holds 500 groups over 25,001 source rows when
+/// its source is dropped and created again with two groups: the resume's
+/// rebuild removes every group the new table lacks, so no old group survives
+/// into the rebuilt target.
 #[tokio::test]
-async fn an_aggregate_resumes_onto_a_wider_key_over_a_ledger_of_several_retire_batches() {
+async fn an_aggregate_of_many_groups_resumes_onto_a_wider_key() {
     let cluster = TestCluster::start();
     let (db, mut raw, trellis) = setup(
         &cluster,

@@ -1,4 +1,3 @@
-⚠️Needs Human Review 👀 👓
 ---
 status: accepted
 date: 2026-08-20
@@ -407,7 +406,7 @@ or constraint trigger an application puts on a target fails there, and a connect
 drop there. A connection that drops after the `COMMIT` lands retries a page that
 committed: a final page's retry finds the claim that commit released gone and rolls
 back as a lost claim, and a non-final page's retry applies again and writes nothing
-new, since each group's basis already counts its change.
+new, since each 1-1 key's ledger entry or each group's basis already holds its change.
 Isolation's probes roll back rather than commit, so each runs
 `SET CONSTRAINTS ALL IMMEDIATE` before its rollback, and a deferred check fails in the
 probe of the key that breaks it. Trellis's own tables declare no deferrable constraint.

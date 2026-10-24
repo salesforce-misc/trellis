@@ -828,12 +828,11 @@ async fn install_definition_fast_path_builds_a_plain_cross_field_alias_chain() {
 // Fast-path success branch: an Aggregate (`GROUP BY`) definition whose
 // `GROUP BY` field references another calculated field's alias (the
 // Aggregate-key-space counterpart of the plain cross-field-alias test above
-// — `total + total AS double_total` where `total = SUM(amount)`). Before this
-// fix, `backfill_aggregate`'s `classify_field`/`render_expr_sql` rendered
-// `double_total`'s raw, un-substituted `Expr::Column("total")` as a bare SQL
-// identifier, which Postgres rejects (`total` names neither a source column
-// nor a same-SELECT-list-visible name) — the direct build now inlines the
-// alias first (`substituted_field_exprs`), same as the 1-1 path.
+// — `total + total AS double_total` where `total = SUM(amount)`). The build
+// inlines the alias first (`substituted_field_exprs`), same as the 1-1 path,
+// rather than rendering `double_total`'s raw `Expr::Column("total")` as a
+// bare SQL identifier, which Postgres rejects (`total` names neither a
+// source column nor a same-SELECT-list-visible name).
 // ---------------------------------------------------------------------
 
 #[tokio::test]
@@ -978,11 +977,8 @@ async fn install_definition_builds_a_bare_alias_of_a_sum_field_declared_before_i
 /// Several bare aliases of the same `SUM` field, declared out of order and
 /// on both sides of it (`grand_total`/`super_total` alias `total`, which
 /// itself is declared between them). Their *substituted* forms are all
-/// structurally identical (`SUM(amount)`), so `count_column_names_from`'s
-/// same-argument dedup (issue #48) must fold all three onto the one hidden
-/// running-count column `total` itself would get — exercising that the
-/// dedup, `ddl::create_aggregate_target_table`'s column creation, and
-/// `backfill_aggregate`'s writes all agree on *which* name that is,
+/// structurally identical (`SUM(amount)`), so the group basis keeps one
+/// partial for the argument in its hidden table and every alias reads it,
 /// regardless of which of the three fields is first in declaration order.
 /// A group with an all-`NULL` argument additionally pins that the shared
 /// count still distinguishes "sum of nothing" (`NULL`) from "sum that nets

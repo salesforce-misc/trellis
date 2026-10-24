@@ -253,8 +253,8 @@ pause are arcs of one lifecycle:
   The staging worker starts it with no marker, and it is maintained from the start, so it goes
   from `backfilling` straight to `live` once its last chunk (or, for an aggregate or
   a `JOIN`, its write) has committed, with no `catching_up`. Its resume rebuilds it
-  the same way, over the ledger the freeze left (an aggregate's partials are
-  written afresh), and so does a re-read of its source
+  the same way, a 1-1 target's over the ledger the freeze left (an aggregate's
+  or a `JOIN`'s partials are written afresh), and so does a re-read of its source
   (`Trellis::request_backfill`). A ring enumeration (the fallback
   for a shape neither build can render) never shows this status: it goes from
   `waiting_to_backfill` straight to `live` in the discharge's own transaction (or

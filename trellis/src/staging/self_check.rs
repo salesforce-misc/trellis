@@ -23,7 +23,7 @@
 //! [`crate::defs::oracle::render_expr_sql`] or any of its siblings in
 //! `defs::oracle` — those are used by the *production write path*
 //! (`defs::backfill`'s direct-build backfill, and
-//! `staging::ledger`'s incremental aggregate apply), not just by
+//! `staging::group_basis`'s aggregate apply), not just by
 //! tests. Auditing backfilled rows with a renderer the backfill path itself
 //! uses would check the write path against itself: a rendering bug would
 //! agree with itself, and the audit would pass on a wrong answer. This
@@ -454,7 +454,7 @@ impl fmt::Display for SelfCheckError {
             SelfCheckError::UnsupportedKeySpace { target } => write!(
                 f,
                 "self_check audits a 1-1 target, an aggregate or a JOIN; \"{target}\" is an \
-                 aggregate on the per-row ledger, which it can't audit"
+                 aggregate the group basis doesn't take, which it can't audit"
             ),
             SelfCheckError::UnsupportedExpr { target, detail } => {
                 write!(f, "self_check can't audit \"{target}\": {detail}")

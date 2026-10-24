@@ -187,15 +187,12 @@
 //! `MIN`/`MAX(interval)`'s (`docs/type-support.md`): the *set* of
 //! elements a Trellis-computed `jsonb_agg` produces is always correct — no
 //! row is fabricated, dropped, or corrupted — only the *array's element
-//! order* is not contractually stable across a recompute. `defs::
-//! invertibility::classify` marks `JSONB_AGG` `RecomputeOnly`, on
-//! `MIN`/`MAX`'s reasoning (a deleted row's contribution cannot be
-//! subtracted from a folded array the way a running sum can), the same
-//! resting place #120 ("non-numeric & order-sensitive aggregates") is
-//! already tracking `array_agg`/`string_agg` toward — this issue does not
-//! attempt that broader design, only wires `JSONB_AGG` up to the existing
-//! `RecomputeOnly` fallback every other non-invertible aggregate in the
-//! registry already gets for free.
+//! order* is not contractually stable across a recompute. A deleted row's
+//! contribution can't be subtracted from a folded array the way a running
+//! sum can, so the group basis keeps no partial for it: a definition calling
+//! `JSONB_AGG` is refused at define
+//! (`ValidationError::DeferredAggregate`, #1040), with
+//! `array_agg`/`string_agg`.
 //!
 //! # `jsonb_agg` is the one aggregate in the registry that does not skip `NULL`
 //!

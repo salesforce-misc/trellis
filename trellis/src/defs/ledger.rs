@@ -129,7 +129,7 @@ fn ordering_state_columns() -> String {
 /// the target's own. Created empty: the 1-1 build's writes are absolute, and
 /// the Re-derives that follow it stamp the entries (#623 D6). The partial
 /// index is the tombstone GC's (`staging::retire::collect_tombstones`), keyed
-/// on `applied_seg` as an aggregate ledger's is, so that a GC batch seeks the
+/// on `applied_seg`, so that a GC batch seeks the
 /// collectable tombstones rather than walking every one above the drained
 /// prefix. An Apply to a live entry leaves `applied_seg` alone
 /// ([`tombstone_seg_sql`]), so it changes no indexed column and can be a HOT

@@ -984,7 +984,6 @@ pub async fn run(cfg: BuildUnderLoad, tuning: &EngineTuning) -> BuildUnderLoadRe
     let peaks_stop = Arc::new(AtomicBool::new(false));
     let peaks_task = tokio::spawn(build_profile::sample_peaks(
         connect_raw(db.dsn()).await,
-        TARGET.to_string(),
         peaks_stop.clone(),
     ));
     let server_start = server_cost::start(&cluster);

@@ -92,9 +92,7 @@
 //! created it). An image-fed target's row carries it as its old image (see
 //! "The image feed"). On a `Recompute` it names the group the row left: a
 //! downstream group-basis aggregate recomputes that group as well as the
-//! current row's (`super::group_basis`). A ledger aggregate doesn't need it:
-//! when an upstream write moves a row from group A to group B, the key's
-//! ledger entry still names A (#623 D5).
+//! current row's (`super::group_basis`).
 //!
 //! Writers capture the prior image with the same statement that already
 //! row-locks the key before writing it (a `SELECT ... FOR UPDATE` pre-lock,
@@ -146,9 +144,8 @@
 //! The accumulator keeps its touched set in memory, which is what a drain
 //! page needs: a page's keys are capped (ADR-0002 I8), and it stages them
 //! through [`TargetMutations::into_staged`] into one `Vec`. A rebuild's
-//! orphan sweep (`intake::resume_orphans`) and a direct aggregate build's
-//! delete of the groups its rebuilt ledger lost (`defs::backfill`, #926) are
-//! not capped: either can delete tens of millions of rows in one
+//! orphan sweep (`intake::resume_orphans`) is not capped: it can delete tens
+//! of millions of rows in one
 //! transaction, and holding each key with its
 //! prior image until the flush would hold them all in memory, and re-reading
 //! an image-fed target's new images would bind them all in one statement,
@@ -486,8 +483,8 @@ impl TargetMutations {
 
     /// The columns [`Self::image_sql`] renders for `target`, or `None` when
     /// nothing reads it. For a writer that builds each prior image column by
-    /// column rather than from one row alias (#623 D3's ledger group upsert,
-    /// `super::ledger`).
+    /// column rather than from one row alias (`super::group_basis`'s group
+    /// writes).
     pub(crate) async fn image_columns(
         &mut self,
         txn: &Transaction<'_>,

@@ -125,7 +125,7 @@ pub enum ApplyError {
     /// [`super::liveness::release`]'s doc comment on why a fence miss is
     /// not parked behind the reclaim TTL.
     VersionFenceMiss { src_table: String },
-    /// The entry lock of a ledger target (`super::ledger::lock_entries`)
+    /// The entry lock of a 1-1 target (`super::one_to_one_ledger::lock_entries`)
     /// found a key with no entry: the tombstone GC
     /// (`super::retire::collect_tombstones`, #623 D7) collected it between
     /// the placeholder insert and the sorted `for update` (#712). Transient,
@@ -3585,7 +3585,7 @@ pub(super) async fn compute_page(
                             .into());
                         }
                         // #1102: a group-basis target empties its hidden
-                        // table, as a ledger target empties its ledger.
+                        // table.
                         let state =
                             if super::group_basis::route(&def.def, &def.source_columns).is_some() {
                                 AggregateState::GroupBasis {
@@ -5157,9 +5157,9 @@ pub(crate) async fn apply_page(
     // target's `GROUP BY` key (issue #315: each cleared group reaches the
     // seam, where it used to go unpropagated).
     for clear in plan.aggregate_clears.values() {
-        // #623 D3: a ledger target's truncate empties its ledger and raises
-        // its truncate floor (the D split's Q6), then clears its groups.
-        // #1102: a group-basis target empties its hidden table the same way.
+        // #1102: a group-basis target's truncate empties its hidden table and
+        // raises its truncate floor (the D split's Q6), then clears its
+        // groups.
         match &clear.state {
             AggregateState::GroupBasis { hidden } => {
                 super::group_basis::truncate_groups(

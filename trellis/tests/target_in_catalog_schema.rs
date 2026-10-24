@@ -101,7 +101,8 @@ async fn a_target_qualified_into_another_instances_catalog_schema_is_refused() {
         .expect("attach the other instance");
     let trellis = connect(&db).await;
 
-    // Both an aggregate and a 1-1 target create a ledger beside the target.
+    // A 1-1 target creates a ledger beside the target; an aggregate creates
+    // only the target there.
     for (name, body) in [
         ("cat_one", "SELECT v AS v"),
         (
@@ -124,7 +125,6 @@ async fn a_target_qualified_into_another_instances_catalog_schema_is_refused() {
         for relation in [
             format!("instance_b.{name}"),
             format!("instance_b.{name}__ledger"),
-            format!("instance_b.{name}__deltas"),
         ] {
             assert!(
                 !relation_exists(&db, &relation).await,
@@ -368,11 +368,7 @@ async fn a_refused_define_beside_an_existing_transform_changes_nothing() {
     }
 
     assert_eq!(definition_count(&db, config::DEFAULT_SCHEMA).await, 1);
-    for relation in [
-        "late.cat_agg",
-        "late.cat_agg__ledger",
-        "late.cat_agg__deltas",
-    ] {
+    for relation in ["late.cat_agg", "late.cat_agg__ledger"] {
         assert!(!relation_exists(&db, relation).await, "{relation}");
     }
     assert!(relation_exists(&db, "late.cat_out").await);

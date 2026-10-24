@@ -16,9 +16,8 @@
 //! to carry only live CDC deltas that land *after* the build (see the fence
 //! discussion below). The backfill discharge (ADR-0002) dispatches it by
 //! shape instead of a ring enumeration: a plain 1-1 definition's primary-key
-//! ranges as durable chunks ([`plan_one_to_one_chunks`]), and an aggregate's
-//! whole build ([`backfill_definition`]) as one direct-build job (`defs::chunk_queue`,
-//! issue #419), once [`check_direct_build`] confirms it can render the shape.
+//! ranges as durable chunks ([`plan_one_to_one_chunks`]). An aggregate is
+//! built by its plan job (`staging::group_basis::rebuild`), never here.
 //!
 //! # Correctness — the five concerns issue #63 M3 calls out
 //!
@@ -26,14 +25,11 @@
 //!    primary key in half-open ranges `(lo, hi]` discovered by
 //!    `max()`-over-`LIMIT` (see [`backfill_one_to_one`]): every source row's PK
 //!    falls in exactly one range, with no gap or overlap regardless of gaps in
-//!    the key values. The aggregate build chunks by *group key* range instead
-//!    (see [`backfill_aggregate`]): every group's key is a single point in the
-//!    group-key space, so a group lands wholly in exactly one range and is
-//!    therefore computed in exactly one chunk.
+//!    the key values.
 //!
-//! 2. **The build/CDC fence.** Both builds write with `ON CONFLICT DO UPDATE
+//! 2. **The build/CDC fence.** The build writes with `ON CONFLICT DO UPDATE
 //!    SET col = excluded.col` — an *overwrite* that recomputes each target row
-//!    (or whole group) from the current source, identical in effect to the
+//!    from the current source, identical in effect to the
 //!    ring's own image-less `Recompute` path. Overwrite is idempotent and
 //!    order-independent, so the handoff to the ring is the same one the ring
 //!    already relies on: live CDC isn't applied to the definition until the
@@ -41,22 +37,10 @@
 //!    delta the ring later applies lands on a fully-built row. The build runs
 //!    as a background job after its source's capture was installed (ADR-0002,
 //!    issue #419), so a commit it read can also be captured and drain after
-//!    the flip; for an aggregate, each ledger entry's basis (the snapshot that
-//!    read its row) makes such a delta skip a commit the build already
-//!    counted (see [`backfill_aggregate`]). This is deliberately *not* the
-//!    additive (`col = target.col + excluded.col`) merge the issue sketches as
-//!    the aggregate default: additive merge is not idempotent (a re-run or an
-//!    overlapping CDC delta double-counts) and cannot express a
-//!    `RecomputeOnly` field (`MIN`/`MAX`/composed) that spans chunks at all.
-//!    Chunking by group key lets every field kind use the safe overwrite form.
+//!    the flip, where it overwrites the row again from its own image.
 //!
-//! 3. **Per-field-kind aggregates.** Each field is built with the same SQL the
-//!    ledger's group statements (`staging::ledger`) maintain — `SUM` keeps its hidden `__{f}_count` partial, `AVG` its
-//!    `__{f}_sum`/`__{f}_count` partials with the visible column derived as
-//!    `sum/count`, `COUNT(*)` a bare `count(*)`, and everything else
-//!    (`MIN`/`MAX`/composed) its rendered expression — so a target built here
-//!    is byte-identical to one the ring would have produced, and a later CDC
-//!    delta folds onto consistent partials.
+//! 3. **Per-field-kind aggregates.** An aggregate isn't built here: the group
+//!    basis builds it with one absolute write (`staging::group_basis`).
 //!
 //! 4. **Idempotent retry.** Every chunk is its own transaction and every write
 //!    is an overwrite, so a crash or error partway through is recovered by
@@ -512,8 +496,8 @@ pub(crate) fn substitute_all_fields(def: &TransformDef) -> Result<Vec<Expr>, Bac
 }
 
 /// [`substitute_all_fields`], reshaped into a by-field-name map. The Aggregate
-/// key-space's SQL-rendering call sites (`backfill_aggregate`,
-/// `staging::ledger`'s routing, and the test oracle's `oracle::render_aggregate_select_sql`) all
+/// key-space's SQL-rendering call sites (`staging::group_basis`'s routing,
+/// and the test oracle's `oracle::render_aggregate_select_sql`) all
 /// need to look a field's self-contained expression up by name rather than
 /// walk `def.fields` positionally — this is the one substitution pass each of
 /// them shares (issue: a `GROUP BY` field like `total + total AS
@@ -1275,28 +1259,6 @@ pub(crate) fn pk_range_where(
             pk_row_cmp(pk_idents, pk, "<=", pk.len()),
         ),
     }
-}
-
-/// Whether the direct build ([`backfill_definition`]) can render `def`, an
-/// aggregate: `Err(`[`BackfillError::Unsupported`]`)` exactly when the build
-/// itself would decline it before writing anything (an alias chain
-/// [`substituted_field_exprs`] can't expand), and `Ok` otherwise. Reads no
-/// source row.
-///
-/// The backfill discharge asks this before it dispatches a direct-build job
-/// (ADR-0002, issue #419), so a shape the build can't render goes to the ring
-/// enumeration inside the discharge instead.
-pub(crate) fn check_direct_build(def: &TransformDef) -> Result<(), BackfillError> {
-    match &def.key_space {
-        KeySpace::Join(_) => {
-            unreachable!("a JOIN is built by its plan job (staging::build), never by this dispatch")
-        }
-        KeySpace::Aggregate { .. } => {
-            substituted_field_exprs(def)?;
-        }
-        KeySpace::OneToOne => {}
-    }
-    Ok(())
 }
 
 #[cfg(test)]

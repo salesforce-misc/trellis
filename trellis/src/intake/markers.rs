@@ -225,11 +225,10 @@ pub(crate) async fn park_target_catchup_if_read(
 /// `new_nodes` says the install that parks the marker only added nodes new
 /// to a captured partitioned root's recorded tree
 /// (`capture::install::adds_only_new_nodes`). A definition reading the
-/// root the partition correction engine serves (an aggregate on the ledger
-/// or the group basis, or a `JOIN` reading the root as either side) is then
-/// neither rebuilt nor caught up:
-/// the reconcile pass queues each new node's correction, which re-derives
-/// the keys (or the `JOIN` side's cells) of the node alone, the node's own
+/// root the partition correction engine serves (an aggregate, or a `JOIN`
+/// reading the root as either side) is then neither rebuilt nor caught up:
+/// the reconcile pass queues each new node's correction, which recomputes
+/// the groups (or the `JOIN` side's cells) of the node alone, the node's own
 /// rows' among them (#1103, #1111, #1147). With no other reader to catch up and no
 /// rebuild, no marker is parked, so nothing enumerates the whole table.
 pub(crate) async fn park_table_catch_ups(
@@ -901,14 +900,9 @@ pub(super) async fn fetch_read(
 ///   threads execute the chunks, and the last one moves it to `catching_up`
 ///   and parks its go-live catch-up, whose discharge flips it `live`
 ///   ([`go_live_caught_up`]).
-/// - **An aggregate**: the transaction enqueues one direct-build job as a `backfill_chunks` row and
-///   moves the definition to `backfilling` together
-///   (`defs::chunk_queue::dispatch_direct_build`), after a catalog-only check
-///   that the direct build can render it
-///   ([`crate::defs::backfill::check_direct_build`]). A drain thread runs the
-///   whole ADR-0002 build, and finishing it moves the definition to
-///   `catching_up` and parks its go-live catch-ups, as for the last chunk.
-/// - **The `Unsupported` fallback** goes through the ring enumeration below,
+/// - **An aggregate** reaches a discharge only when a test has held it out
+///   of the plan job (`staging::build::qualifies`), and **the `Unsupported`
+///   fallback**: both go through the ring enumeration below,
 ///   and flips `waiting_to_backfill` -> `live` as the last statement of the
 ///   transaction, together with its go-live catch-up parks. There is no
 ///   intermediate `backfilling` for it to be stranded in (issue #404).
@@ -1352,8 +1346,6 @@ enum Build {
     /// A plain 1-1 definition: these `(lo, hi]` primary-key chunk
     /// boundaries, enqueued as `backfill_chunks` rows.
     Chunks(crate::defs::backfill::PlannedRanges),
-    /// An aggregate: one direct-build job, enqueued as a `backfill_chunks` row (issue #419).
-    Direct,
     /// The ring enumeration of the marker's table, flipped `live` in the
     /// discharge's own transaction.
     Ring,
@@ -1397,12 +1389,17 @@ async fn plan_waiting_builds(
         if rederive.contains(&id) || matches!(def.key_space, KeySpace::Join(_)) {
             continue;
         }
+        // An aggregate is built by its plan job (`staging::build`); one held
+        // out of it is rebuilt by the ring enumeration, whose image-less
+        // recomputes the group basis applies.
         let planned = if matches!(def.key_space, KeySpace::OneToOne) {
             backfill::plan_one_to_one_chunks(client, &def, table)
                 .await
                 .map(Build::Chunks)
         } else {
-            backfill::check_direct_build(&def).map(|()| Build::Direct)
+            Err(BackfillError::Unsupported(
+                "an aggregate is built by its plan job".to_string(),
+            ))
         };
         let build = match planned {
             Ok(build) => build,
@@ -1559,9 +1556,6 @@ async fn discharge_marker(
         match build {
             Build::Chunks(ranges) => {
                 crate::defs::chunk_queue::dispatch_one_to_one(&txn, *id, ranges).await?;
-            }
-            Build::Direct => {
-                crate::defs::chunk_queue::dispatch_direct_build(&txn, *id, marker.attempts).await?;
             }
             Build::Ring => {}
         }

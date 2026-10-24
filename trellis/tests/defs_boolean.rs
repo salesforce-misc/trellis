@@ -1,5 +1,6 @@
-//! End-to-end tests for issue #119's `boolean` support — as a join/`GROUP
-//! BY` key, and the two new aggregates `bool_and`/`bool_or`.
+//! End-to-end tests for issue #119's `boolean` support as a join/`GROUP BY`
+//! key. The `bool_and`/`bool_or` aggregates are refused at define
+//! (`ValidationError::DeferredAggregate`).
 //!
 //! # Why these run against a live server
 //!
@@ -54,21 +55,10 @@
 //!    `a_boolean_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two`
 //!    below reproduces the corruption end-to-end and pins the fix.
 //!
-//! `bool_and`/`bool_or` themselves are total, commutative, associative
-//! folds over `{true, false}` with no overflow/rounding hazard — but they
-//! are still **recompute-only**, on `MIN`/`MAX`'s reasoning rather than
-//! `SUM`'s: the aggregate's only maintained state is its own current
-//! one-bit value, which is not enough to invert a delete (deleting *some*
-//! `false` row from a `bool_and = false` group might flip it to `true`, or
-//! might not, depending on which row). See
-//! `defs::invertibility::classify`'s `BOOL_AND`/`BOOL_OR` arm for the full
-//! reasoning; `bool_and_or_deletion_cannot_be_inverted_from_the_aggregate_alone`
-//! below demonstrates it live.
-//!
 //! Per ADR-0013 every comparison is against independently-authored SQL —
-//! plain `pg_cast`, plain `boolout`, plain `bool_and`/`bool_or`, plain
-//! `group by` — never against `defs::oracle::recompute`, which would be the
-//! engine's own renderer grading itself. Harness conventions follow
+//! plain `pg_cast`, plain `boolout`, plain `group by` — never against
+//! `defs::oracle::recompute`, which would be the engine's own renderer
+//! grading itself. Harness conventions follow
 //! `defs_bytea.rs`.
 
 use std::collections::HashMap;
@@ -281,11 +271,7 @@ fn boolean_group_by_key_is_admitted() {
 }
 
 // ---------------------------------------------------------------------
-// 3. bool_and/bool_or: result types, folding, invertibility
-// ---------------------------------------------------------------------
-
-// ---------------------------------------------------------------------
-// 4. The #113/#248 regression shape, reproduced for a boolean GROUP BY key
+// 3. The #113/#248 regression shape, reproduced for a boolean GROUP BY key
 // ---------------------------------------------------------------------
 
 /// A `boolean` `GROUP BY` group touched once through an ordinary

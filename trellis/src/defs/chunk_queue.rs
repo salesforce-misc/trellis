@@ -391,6 +391,10 @@ async fn start_backfilling(
 ///
 /// Returns the status the dispatch left the definition in, or `None` when it
 /// was no longer `waiting_to_backfill`, as for [`dispatch_one_to_one`].
+///
+/// No discharge dispatches one: every aggregate is built by its plan job. It
+/// stays, with the rest of the old build path, for #625 to delete.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn dispatch_direct_build(
     txn: &tokio_postgres::Transaction<'_>,
     definition_id: i64,
@@ -2541,8 +2545,8 @@ mod tests {
         super::super::ddl::join_pk_key(parts)
     }
 
-    /// The tables [`seed_waiting_aggregate`]'s definition builds into: its
-    /// target, ledger and group deltas.
+    /// The table [`seed_waiting_aggregate`]'s definition builds into: its
+    /// target.
     async fn create_rollup_target(pool: &Pool) {
         let text = "TRANSFORM rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT g AS g, sum(a) AS total";
         let columns: std::collections::HashMap<String, super::super::ast::ValueType> =

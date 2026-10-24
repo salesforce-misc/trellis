@@ -1461,7 +1461,7 @@ const MID_BURST_NOT_GATED: &[(&str, &str)] = &[];
 /// The cooling-backfill tier's programs are the hot table and the cooling
 /// table, each read by a `GROUP BY` definition, and install or resume
 /// nothing mid-burst (#734). It gates the plants a `request_backfill` under
-/// load reaches, and not the 1-1 or build plants, nor `lsn_only_skip`.
+/// load reaches, and not the 1-1 or build plants.
 const COOLING_BACKFILL_NOT_GATED: &[(&str, &str)] = &[(
     "stale_one_to_one_write",
     "it needs a 1-1 definition, and the tier's programs have none (0 of 48 \

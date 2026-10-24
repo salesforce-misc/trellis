@@ -194,8 +194,8 @@ pub enum CatalogError {
     /// A definition's target schema is a Trellis catalog schema (#979): this
     /// instance's own (`own`), which target tables stay out of so they can't
     /// collide with Trellis's tables, or a schema holding another instance's
-    /// `trellis_instance` table. The target, its ledger and its group-delta
-    /// table would live there, so the other instance's uninstall (`drop
+    /// `trellis_instance` table. The target and a 1-1 target's ledger would
+    /// live there, so the other instance's uninstall (`drop
     /// schema ... cascade`) would drop them, and a dump of one instance's
     /// schema would carry the other's data. Refused by define, and by a
     /// resume ([`revalidate`]) of a definition whose target schema has since
@@ -590,8 +590,7 @@ impl fmt::Display for CatalogError {
                         f,
                         "target {target} is in schema \"{schema}\", which holds another Trellis \
                          instance's catalog (it has a `trellis_instance` table): that \
-                         instance's uninstall would drop the target, its ledger and its \
-                         group-delta table"
+                         instance's uninstall would drop the target and its ledger"
                     )?;
                 }
                 write!(
@@ -3603,7 +3602,7 @@ async fn create_definition_inner(
     // never an aggregate's, so it never routes here.
     let shape = crate::staging::group_basis::route(&def, source_columns);
     // Define's refusals and the routing agree: every aggregate define
-    // accepts is on the group basis, never silently on the ledger.
+    // accepts is on the group basis.
     debug_assert!(
         shape.is_some() || !matches!(def.key_space, KeySpace::Aggregate { .. }),
         "an admitted aggregate the group basis doesn't route: {}",
@@ -4614,8 +4613,8 @@ async fn side_read_table(
 /// Refuses `target` (`schema.table`) with
 /// [`CatalogError::TargetInCatalogSchema`] when its schema is
 /// `catalog_schema`, this instance's catalog schema, or holds a
-/// `trellis_instance` table, another instance's (#979). The ledger and
-/// group-delta tables live in the target's schema, so this covers them too.
+/// `trellis_instance` table, another instance's (#979). A 1-1 target's
+/// ledger lives in the target's schema, so this covers it too.
 /// `pg_class`, not `information_schema`, which hides a table the role has no
 /// privilege on, as [`crate::identity`]'s scan does.
 async fn reject_target_in_catalog_schema(
@@ -4964,11 +4963,9 @@ pub(crate) async fn check_target_table(
 /// A whole-transform resume's checks that the target exists
 /// ([`check_target_table`]), that the source indexes the definition needs
 /// exist ([`check_source_index`]), and that the tables Trellis keeps beside
-/// it are what define would create now: the ledger exists
-/// ([`check_ledger_table`]) and an aggregate's group-delta table exists with
-/// the columns define would give it ([`check_deltas_shape`]). An aggregate
-/// the group basis takes, like a `JOIN`, keeps only hidden tables that are
-/// fully derived: the resume drops and recreates them
+/// it are what define would create now: a 1-1 target's ledger exists
+/// ([`check_ledger_table`]). An aggregate or a `JOIN` keeps only hidden
+/// tables that are fully derived: the resume drops and recreates them
 /// ([`recreate_group_table`]), so there's nothing to check.
 pub(crate) async fn check_owned_tables(
     txn: &tokio_postgres::Transaction<'_>,
@@ -6017,9 +6014,8 @@ pub async fn source_table_version(
     Ok(row.map(|row| row.get(0)))
 }
 
-/// Definition `id`'s persisted source column types, on `client` (#623 D3:
-/// the orphan sweep's ledger routing, `staging::ledger::route`, in the
-/// discharge's transaction). Empty for an id with none.
+/// Definition `id`'s persisted source column types, on `client` (an edit's
+/// and a re-type's reads of what was recorded). Empty for an id with none.
 pub(crate) async fn source_columns_in(
     client: &impl GenericClient,
     id: i64,
@@ -6257,7 +6253,7 @@ pub async fn definition_by_target(
 /// Filtered to [`KeySpace::OneToOne`] downstream definitions only — column-
 /// level pause/cascade/resume is explicitly scoped to the 1-1 tier (see this
 /// module's callers in `staging::quarantine` and that module's "Column-level
-/// fuse" section doc comment: the aggregate ledger path has no notion of
+/// fuse" section doc comment: the group basis has no notion of
 /// `column_status` at all). Without this filter, a
 /// downstream [`KeySpace::Aggregate`] transform whose field happens to read a
 /// just-paused upstream column would get a `column_status` row cascaded onto

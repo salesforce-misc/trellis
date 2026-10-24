@@ -477,9 +477,9 @@ async fn pause(d: &Driver) {
 }
 
 /// A whole-transform `RESUME` of a group-basis aggregate is accepted (#1222):
-/// it keeps no ledger and no group-delta table, so the owned-table checks
-/// that a ledger aggregate's resume runs have nothing to find missing. Its
-/// hidden partials table is recreated (`group_basis_resume.rs`).
+/// it keeps no ledger, so the owned-table check a 1-1 resume runs has
+/// nothing to find missing. Its hidden partials table is recreated
+/// (`group_basis_resume.rs`).
 #[tokio::test]
 async fn resume_of_a_paused_group_basis_aggregate_is_accepted() {
     let d = start().await;

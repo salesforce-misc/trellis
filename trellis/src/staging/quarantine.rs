@@ -2299,7 +2299,7 @@ async fn quarantine_if_crossed(
 // [`crate::defs::ast::KeySpace::OneToOne`] definitions.
 // [`crate::defs::ast::KeySpace::Aggregate`] fields
 // are never attributed here and can never be paused by the automatic fuse —
-// the aggregate ledger (`staging::ledger`) has no notion of "skip this one
+// the group basis (`staging::group_basis`) has no notion of "skip this one
 // column and keep accumulating the others," and inventing one is a materially bigger
 // project than the column fuse. An aggregate transform's overall lifecycle
 // status (the existing whole-transform fuse) is completely unaffected by
@@ -3739,9 +3739,10 @@ async fn reads_paused_sibling(
 /// upstream is ([`resume_locked`]'s step 0). A definition the
 /// Re-derive build takes (`super::build::qualifies`, #625 F3) is then
 /// rebuilt by the staging worker's next pass, which starts a Re-derive build
-/// over its ledger (`super::build::start_ready_builds`): it keeps the
-/// ledger, the groups and any group deltas still owed to them (B4), and its
-/// sweep drops the keys deleted while it was frozen. Any other definition
+/// (`super::build::start_ready_builds`): a 1-1 build keeps the ledger (B4)
+/// and its sweep drops the keys deleted while it was frozen, and an
+/// aggregate's or a `JOIN`'s plan job rewrites its groups in one absolute
+/// write. Any other definition
 /// gets a fresh `pending_backfill` marker for its source table
 /// ([`crate::intake::markers::park_marker`], which every marker goes
 /// through). The target is left exactly as the freeze left it until that
@@ -4139,12 +4140,9 @@ async fn request_drain(
 ///    it: a key, join or `GROUP BY` column of a type or collation define
 ///    refuses, a `JOIN` whose `ON` columns no longer match, a redefined
 ///    source key. A whole-transform resume also refuses a
-///    definition whose ledger table doesn't exist
-///    ([`catalog::check_ledger_table`], #986) and an aggregate whose
-///    group-delta table has different running-sum or recompute columns from
-///    the ones define would create now, or doesn't exist
-///    ([`catalog::check_deltas_shape`], #857, #967); a column resume doesn't
-///    make those checks.
+///    1-1 definition whose ledger table doesn't exist
+///    ([`catalog::check_ledger_table`], #986); a column resume doesn't make
+///    that check.
 /// 2. **It compares each column Trellis created with a type from the
 ///    source (typed copies, and calculated, aggregate and contribution
 ///    columns) with the type define would give it now**
@@ -4458,9 +4456,9 @@ async fn complete_resume(
 
     // A definition the Re-derive build takes (#625 F3) gets no marker: the
     // staging worker's next pass starts its rebuild from `waiting_to_backfill`
-    // (`super::build::start_ready_builds`), over the ledger, groups and group
-    // deltas the freeze left (B4), and its sweep drops the keys deleted
-    // meanwhile. A marker would have the discharge re-read the whole source
+    // (`super::build::start_ready_builds`): a 1-1 build runs over the ledger
+    // the freeze left (B4), and its sweep drops the keys deleted meanwhile. A
+    // marker would have the discharge re-read the whole source
     // for nothing.
     //
     // `transform_definitions.source_table` is already the fully-qualified
@@ -4992,7 +4990,7 @@ async fn finish_requested_resume(
         if relabel_changes_pending(&txn, id, &source_table).await? {
             return Ok(());
         }
-        // The ledger and the group-delta table are checked here too, before anything is
+        // A 1-1 target's ledger is checked here too, before anything is
         // re-typed under `ACCESS EXCLUSIVE` that `resume_locked` would then
         // refuse.
         let checked = match catalog::revalidate(&txn, schema, &definition).await {

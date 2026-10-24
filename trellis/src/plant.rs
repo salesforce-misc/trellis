@@ -100,8 +100,7 @@ pub enum Plant {
     /// basis snapshot's `xmax`), not by the basis's visibility test
     /// (`staging::group_basis`'s apply statement). A change whose
     /// transaction was in flight when the basis was taken, which the basis
-    /// didn't see, is refused, and its group loses it. The group basis's
-    /// counterpart of `lsn_only_skip`.
+    /// didn't see, is refused, and its group loses it.
     ///
     /// Pinned by `group_basis_interleavings`'s
     /// `r2_a_change_in_flight_at_the_basis_applies`.

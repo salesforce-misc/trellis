@@ -10,42 +10,13 @@
 //!
 //! # What a correction does
 //!
-//! A correction **re-derives a key set** through the ledger's normal paths
-//! ([`super::build::rederive_keys`], the rebuild sweep's primitive): each key
-//! takes its entry lock, the source row is read live through the root, and
-//! the entry is rewritten (or tombstoned when the row is gone), so its group
-//! moves by a delta, which the merger folds like any other. The code here
-//! never deletes a target row, a ledger entry or a delta: deleting a group
-//! row would leave its entries live, and deleting entries would drop the
-//! tombstones that refuse a ring change staged before the DDL, which would
-//! then resurrect the row.
-//!
-//! The key set of a node is two walks, each in bounded pages (one page, one
-//! transaction), with the progress committed in the page's own transaction:
-//!
-//! 1. **The ledger phase.** The keys of the live ledger entries whose group
-//!    routes to the node ([`Route`]), found through the ledger's `GROUP BY`
-//!    index (a partitioned source's aggregate always has it) in
-//!    `(group, key)` order, so a restart resumes after the last page.
-//! 2. **The node phase**, for a node in the tree: the keys of its current
-//!    rows, read from the node in primary-key order, as a build reads the
-//!    source. It finds the rows a new, attached or re-attached leaf holds
-//!    that no entry knows, including rows written into it directly before
-//!    its capture existed. A gone node needs it only without a usable text
-//!    (a detached table is then read the same way): every row of a gone node
-//!    routed by its text has its live entry found by the ledger phase.
-//!
-//! # On the group basis
-//!
-//! An aggregate (`super::group_basis`) has no ledger: its correction (the `group` module, #1103)
-//! recomputes, in one transaction, the groups that route to the node (the
-//! target's, those of the ring's undrained images, and the node's current
-//! rows'), with the recompute's snapshot as each group's basis. It routes
-//! as below, and is scheduled, reported and failed as below, but stamps no
-//! `build_seg` and has no fence, ledger or node phase. A capture install
-//! that only adds new nodes to the tree rebuilds no such aggregate
-//! (`crate::intake::markers::park_table_catch_ups`): the nodes' corrections
-//! cover them, as they do a ledger aggregate.
+//! A correction **recomputes the groups that route to the node** (the
+//! `group` module, #1103): the target's, those of the ring's undrained
+//! images, and the node's current rows', in one transaction, with the
+//! recompute's snapshot as each group's basis. It never zeroes a group. A
+//! capture install that only adds new nodes to the tree rebuilds no
+//! aggregate (`crate::intake::markers::park_table_catch_ups`): the nodes'
+//! corrections cover them.
 //!
 //! A `JOIN` reading the source as either side (`super::join`, #1111) is
 //! corrected the same way, over that side's partial cells (`P` or `M`)
@@ -87,18 +58,14 @@
 //!
 //! # Ordering against the ring
 //!
-//! A change staged before the DDL and applied after the correction must not
-//! resurrect a row the correction retracted. A correction therefore starts
-//! by stamping the definition's `build_seg` (the segment active when it
-//! starts), as a rebuild does (`super::build::stamp_rebuild_seg`, #733): a
-//! page with a batch at or below it re-derives its keys rather than applying
-//! their changes. Then it waits for the transactions open at the stamp to end
-//! (the `fence` phase, as a seam-fed build's plan job does), so no page that
-//! read the old `build_seg` can still apply a stale change to a key with no
-//! entry yet. A `gone_node` whose `pg_inherits` row is still there
-//! (a detach pending) waits for `DETACH ... FINALIZE`, which waits out the
-//! writers with older snapshots, before it starts: only then is the ring
-//! complete for the node.
+//! A change staged before the operation and applied after the correction
+//! must not resurrect a member the correction removed. The recompute's
+//! snapshot is each group's basis, so a page that later carries such a
+//! change finds it visible in the basis and skips it (the `group` module's
+//! doc). A `gone_node` whose `pg_inherits` row is still there (a detach
+//! pending) waits for `DETACH ... FINALIZE`, which waits out the writers
+//! with older snapshots, before it starts: only then is the ring complete
+//! for the node.
 //!
 //! # Scheduling
 //!
@@ -117,15 +84,11 @@
 //! so from the pass that detects the operation the definition reports
 //! `backfilling`. The drain workers claim the row like a build chunk
 //! ([`super::build::work_once`]), run up to [`CLAIM_PAGES`] pages, and give
-//! it back for the next claim; the merger folds the correction's group
-//! deltas while the definition is `backfilling`, and
-//! [`super::build::try_complete`] moves it back to `live` once the row is
-//! done and its deltas are folded, as it does at the end of a build. A
-//! definition already under a Re-derive build stays `backfilling` until both
-//! are done. A `catching_up` definition gets its row once its catch-up has
-//! moved it `live`: the merger folds only a `backfilling` definition's
-//! deltas, and the catch-up's discharge owns its status until then. It holds
-//! the correction in the queue meanwhile.
+//! it back for the next claim, and [`super::build::try_complete`] moves it
+//! back to `live` once the row is done, as it does at the end of a build. A
+//! `catching_up` definition gets its row once its catch-up has moved it
+//! `live`: the catch-up's discharge owns its status until then. It holds the
+//! correction in the queue meanwhile.
 //!
 //! A correction that fails is given up through the chunk queue's
 //! `fail_chunk`: its row records the error, which `Trellis::status` reports,
@@ -176,8 +139,8 @@ pub enum CorrectionError {
     Staging(super::StagingError),
     /// The node's group cannot be presented to its constraint text.
     Unroutable(String),
-    /// The Re-derive build does not serve the definition's shape, so its keys
-    /// cannot be re-derived.
+    /// Neither the group basis nor a `JOIN` serves the definition's shape,
+    /// so its groups cannot be recomputed.
     Unserved {
         target: String,
     },
@@ -224,8 +187,8 @@ impl fmt::Display for CorrectionError {
             CorrectionError::Unroutable(why) => write!(f, "partition correction: {why}"),
             CorrectionError::Unserved { target } => write!(
                 f,
-                "partition correction: the Re-derive build does not serve {target}'s shape, \
-                 so its keys cannot be re-derived"
+                "partition correction: the group basis does not serve {target}'s shape, \
+                 so its groups cannot be recomputed"
             ),
         }
     }
@@ -517,8 +480,6 @@ fn route_columns_named(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Fence,
-    Ledger,
-    Node,
     Done,
 }
 
@@ -526,8 +487,6 @@ impl Phase {
     fn as_str(self) -> &'static str {
         match self {
             Phase::Fence => "fence",
-            Phase::Ledger => "ledger",
-            Phase::Node => "node",
             Phase::Done => "done",
         }
     }
@@ -535,8 +494,6 @@ impl Phase {
     fn parse(text: &str) -> Phase {
         match text {
             "fence" => Phase::Fence,
-            "ledger" => Phase::Ledger,
-            "node" => Phase::Node,
             _ => Phase::Done,
         }
     }
@@ -547,17 +504,18 @@ impl Phase {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Progress {
     phase: &'static str,
-    /// The last key of the phase's walk.
+    /// The column's cursor; a correction commits in one transaction, so it
+    /// is always `None`.
     pub cursor: Option<String>,
-    /// Keys re-derived so far.
+    /// Groups (or cells) recomputed, written when the correction commits.
     pub keys_done: i64,
-    /// The keys the correction expects to re-derive, an estimate for the
-    /// node phase. `None` before the ledger phase counted them.
+    /// The groups (or cells) the correction recomputes. `None` until it
+    /// commits.
     pub keys_total: Option<i64>,
 }
 
 impl Progress {
-    /// The phase: `fence`, `ledger`, `node` or `done`.
+    /// The phase: `fence` or `done`.
     pub fn phase(&self) -> &str {
         self.phase
     }
@@ -1336,13 +1294,12 @@ async fn pause_before_commit(
     Ok(())
 }
 
-/// Whether the correction walks the node's rows after the ledger: a node in
-/// the tree (new, attached, or a `DEFAULT` whose siblings changed), whose
-/// rows may have no entry yet, and a gone node without a usable text, which
-/// routes no entry. A gone node routed by its text needs no node phase: every
-/// row it held satisfied that text while it was in the tree, so the ledger
-/// phase found every live entry of its rows, and reading a detached table's
-/// rows would only rewrite those tombstones again. A complement has no node.
+/// Whether the correction reads the node's own rows for its groups: a node
+/// in the tree (new, attached, or a `DEFAULT` whose siblings changed), whose
+/// rows may be in groups the target doesn't have yet, and a gone node
+/// without a usable text, which routes no group. A gone node routed by its
+/// text needs no read of its table: every group of its rows routes to it by
+/// that text. A complement has no node.
 fn reads_node(correction: &PendingCorrection, route: &Route) -> bool {
     if correction.kind == partitions::Kind::Complement.as_str() {
         return false;

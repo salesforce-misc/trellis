@@ -1,6 +1,7 @@
-//! End-to-end tests for issue #118's `bit`/`bit varying` support — as
-//! join/primary-key and `GROUP BY` key roles, and the two new aggregates
-//! `bit_and`/`bit_or`. The typed-literal ("computed 1-1 target") role is
+//! End-to-end tests for issue #118's `bit`/`bit varying` support as
+//! join/primary-key and `GROUP BY` key roles. The `bit_and`/`bit_or`
+//! aggregates are refused at define (`ValidationError::DeferredAggregate`).
+//! The typed-literal ("computed 1-1 target") role is
 //! covered by `defs_typed_literals.rs`'s shared `CASES` table, which this
 //! issue added a `VARBIT` row to.
 //!
@@ -37,18 +38,10 @@
 //!    varying`'s bare default is genuinely unconstrained and has no such
 //!    trap.
 //!
-//! `bit_and`/`bit_or` land on the safe side of split 2 by construction:
-//! `registry::aggregate_result_type` always widens their result to
-//! `Other(PgType::VarBit)`, never mirroring a `bit`-typed argument's own
-//! family the way `MIN`/`MAX`/`SUM(interval)` mirror theirs elsewhere in the
-//! same function — see that arm's own doc comment. They are still
-//! **recompute-only**, on `bool_and`/`bool_or`'s reasoning generalized past
-//! two possible values per column to `2^n`.
-//!
 //! Per ADR-0013 every comparison is against independently-authored SQL —
-//! plain `pg_cast`, plain `bit_and`/`bit_or`, plain `to_jsonb`, plain `group
-//! by` — never against `defs::oracle::recompute`, which would be the
-//! engine's own renderer grading itself. Harness conventions follow
+//! plain `pg_cast`, plain `to_jsonb`, plain `group by` — never against
+//! `defs::oracle::recompute`, which would be the engine's own renderer
+//! grading itself. Harness conventions follow
 //! `defs_boolean.rs`/`defs_bytea.rs`.
 
 use std::collections::HashMap;
@@ -305,15 +298,7 @@ async fn fixed_length_bit_truncates_under_a_bare_cast_but_bit_varying_does_not()
 }
 
 // ---------------------------------------------------------------------
-// 3. MIN/MAX: no such Postgres aggregate, same shape as bytea
-// ---------------------------------------------------------------------
-
-// ---------------------------------------------------------------------
-// 4. bit_and/bit_or: result types, folding, invertibility
-// ---------------------------------------------------------------------
-
-// ---------------------------------------------------------------------
-// 5. Regression guard: a bit varying GROUP BY key seeded two ways
+// 3. Regression guard: a bit varying GROUP BY key seeded two ways
 // ---------------------------------------------------------------------
 
 /// A `bit varying` `GROUP BY` group touched once through an ordinary

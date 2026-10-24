@@ -455,9 +455,8 @@ pub fn render_expr_sql(expr: &Expr) -> String {
 
 /// [`render_expr_sql`] with every source column qualified by `source_sql`
 /// (already-quoted SQL text — a quoted table name, or a query alias such as
-/// `s`), for SQL that reads the source under an alias: the aggregate build
-/// (`super::backfill::backfill_aggregate`), the ledger Re-derive
-/// (`staging::ledger`) and the group-basis and `JOIN` partial reads.
+/// `s`), for SQL that reads the source under an alias: the group-basis and
+/// `JOIN` partial reads.
 pub(crate) fn render_qualified_expr_sql(expr: &Expr, source_sql: &str) -> String {
     match expr {
         Expr::Column(name) | Expr::SourceColumn { column: name, .. } => {

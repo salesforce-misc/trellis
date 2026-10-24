@@ -776,34 +776,11 @@ async fn chunked_read_exact_point_one_to_one() {
     chunked_read_exact_point(Flavour::OneToOne).await;
 }
 
-// ------------------------------------------- chained prior images (#623 D3)
-
-// -------------------------------------------- I2's visibility term (#623 D3)
-
-// --------------------------------------- group keys and increments (#623 D3)
-
-// ------------------------------------------------- the AVG flavour (#623 D3b)
-
-// The scenarios above with `AVG` beside the `SUM` whose hidden count it
-// shares, and a `COUNT(v)`: on the ledger since #623 D3b. Before it the
-// target was on the old path, where exp2_5, exp2_5b and issue_550 fail as
-// their aggregate flavours' doc comments describe.
-
-// --------------------------------------------- the MIN/MAX flavour (#623 D4)
-
-// The scenarios above over `MIN`/`MAX` beside a `COUNT(*)`: on the ledger
-// since #623 D4, which recomputes each written group's `MIN`/`MAX` from its
-// live entries. Before it the target was on the old path, where exp2_5
-// failed (see `exp2_5_aggregate_min_max`).
-
-// ------------------------------------------------------------ issue #690
-
 // ------------------------------------------------------ tombstone GC (D7)
 //
-// `trellis::staging::collect_tombstones` deletes the tombstones at or below
-// the contiguous drained prefix, on an aggregate ledger and (since D6) a 1-1
-// one alike. Each scenario also fails under the
-// `early_tombstone_gc` plant, which collects through the highest drained
+// `trellis::staging::collect_tombstones` deletes a 1-1 ledger's tombstones
+// at or below the contiguous drained prefix. Each scenario also fails under
+// the `early_tombstone_gc` plant, which collects through the highest drained
 // segment instead.
 
 /// The keys of `flavour`'s ledger tombstones, as `(key)` rows.

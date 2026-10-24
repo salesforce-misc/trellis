@@ -3327,7 +3327,7 @@ mod tests {
     }
 
     #[test]
-    fn leaves_every_other_aggregate_on_the_ledger() {
+    fn takes_no_refused_aggregate_and_no_one_to_one() {
         for text in [
             "TRANSFORM t FROM s GROUP BY g SELECT MIN(a) AS n",
             "TRANSFORM t FROM s GROUP BY g SELECT MAX(a) + COUNT(*) AS n",

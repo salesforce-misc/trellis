@@ -636,9 +636,7 @@ them:
   rewrite has touched since (the rewrite clears the default the column's row
   keeps for older rows, as `VACUUM FULL` does); one on a column with a
   compression method, a storage mode or a non-default collation set (the
-  `ALTER` resets each); a pure widening no copy outgrows; and a column read
-  by `MIN` or `MAX` re-collated, since a field column's collation isn't part
-  of what the pass compares. Between two passes
+  `ALTER` resets each); and a pure widening no copy outgrows. Between two passes
   ([known correctness gaps](../known-correctness-gaps.md#capture-disrupted-and-restored-between-two-passes)):
   a table attached to a hierarchy, or given an inheritance child, and
   detached or the child dropped; a capture function replaced and restored by

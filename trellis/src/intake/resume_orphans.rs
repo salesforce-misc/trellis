@@ -184,12 +184,10 @@
 //! A key column compared with `IS NOT DISTINCT FROM` forces a nested-loop
 //! anti-join (each target row rescans the source), which took ~20 s for a
 //! 50k-row 1-1 target in #330's spike. `=` lets Postgres hash it. A 1-1
-//! target's key is its source's: a `PRIMARY KEY`, all `NOT NULL`, gets `=`,
-//! and over a source keyed by a nullable unique index its columns are as
-//! nullable as a grouping column (issue #1141). Every aggregate grouping
-//! column is nullable (`ddl::create_aggregate_target_table`, issue #128), so
-//! for these keys the anti-join is split by which key columns are
-//! `NULL` in the target row: within one such pattern a `NULL` column matches
+//! target's key is its source's: a `PRIMARY KEY`, all `NOT NULL`, gets `=`.
+//! Over a source keyed by a nullable unique index (issue #1141) the key's
+//! columns can be `NULL`, so for those keys the anti-join is split by which
+//! key columns are `NULL` in the target row: within one such pattern a `NULL` column matches
 //! a source row whose key is `IS NULL`, and every other column matches with
 //! `=`. That's the same rule [`keyset_match_cols`] applies per
 //! batch. There is one branch per pattern present in the target when the
@@ -514,18 +512,13 @@ impl Sweep {
     /// in, flushes each deleted row through the target-mutation seam, and
     /// returns what the sweep deleted.
     ///
-    /// The read judged these rows unbacked on its snapshot, so this deletes
-    /// an aggregate's by key, whatever the source holds by now: a group the
-    /// source has since backed again is re-derived by the change that backed
-    /// it, which drains after this discharge commits. A 1-1 row is deleted
+    /// The read judged these rows unbacked on its snapshot; a row is deleted
     /// only if the source still doesn't back it (issue #883). See the module
     /// doc.
     ///
     /// It runs once the whole read is fetched, and takes its locks in a
-    /// drain page's order (ADR-0002 I5, issues #716 and #884): the 1-1
-    /// targets, then the aggregates, each by target name; within a ledger
-    /// target its entries, then its groups; and each class of row in key
-    /// order, in batches of at most [`SWEEP_BATCH`] keys that Postgres sorts
+    /// drain page's order (ADR-0002 I5, issues #716 and #884): the targets
+    /// by target name, and each target's rows in key order, in batches of at most [`SWEEP_BATCH`] keys that Postgres sorts
     /// ([`StagedKeys`]). See the module doc's "Why the delete comes last".
     pub(super) async fn finish(mut self, txn: &Transaction<'_>) -> Result<Swept, IntakeError> {
         self.stage(txn).await?;
@@ -593,8 +586,7 @@ async fn sweep_rows(
 /// at a time.
 const STAGED_CURSOR: &str = "trellis_sweep_keys";
 
-/// One class of a swept target's keys (a 1-1 target's rows, a ledger's
-/// entries, or an aggregate's groups), staged in a temporary table whose
+/// A swept 1-1 target's unbacked keys, staged in a temporary table whose
 /// columns (`c0`, `c1`, …, as [`keyset_col`] names them) have the type and
 /// collation of the rows' own key columns, so Postgres hands them back
 /// distinct and in its own key order, at most a batch at a time
@@ -631,7 +623,7 @@ impl StagedKeys {
     /// Keys staged as `pg_temp.trellis_sweep_<name>`, with the columns
     /// `relation` selects, cast from text as `types`. Nothing is created
     /// until the first key is added. A swept target's table is named by its
-    /// tag, and [`sweep_ledger`]'s group locks by `locks`.
+    /// tag.
     fn new(name: &str, relation: String, types: Vec<String>) -> Self {
         Self {
             table: format!("pg_temp.trellis_sweep_{name}"),
@@ -784,11 +776,11 @@ fn one_to_one_match(key_cols: &[PrimaryKeyColumn]) -> Match {
 }
 
 /// The read's `UNION ALL` branches that select `target_ident`'s unbacked
-/// rows under `tag`: one per pattern of `NULL` grouping columns present in
+/// rows under `tag`: one per pattern of `NULL` key columns present in
 /// the target now (see the module doc), and, for a target with a nullable
 /// key column, one more for any other pattern.
 ///
-/// The patterns are read here, before the read's snapshot, so a group with
+/// The patterns are read here, before the read's snapshot, so a row with
 /// a new pattern can reach the target in between. The last branch catches
 /// it with `IS NOT DISTINCT FROM`, which can't hash, but it only scans the
 /// target rows no earlier branch covers: normally none.
@@ -1055,9 +1047,7 @@ fn target_key_cols(target: &SweptTarget) -> Vec<String> {
 
 /// [`delete_keys`]'s lock: `target`'s rows of the keys in `arrays` (see
 /// [`keyset`]), `for update` in the order a drain page takes the same rows
-/// (ADR-0002 I5). A page locks an aggregate's groups in key order, ascending
-/// with `NULL`s last (the group upsert's `order by`). It locks a 1-1
-/// target's rows by `NULL` pattern (`staging::apply`'s pre-lock, issue
+/// (ADR-0002 I5). A page locks a 1-1 target's rows by `NULL` pattern (`staging::apply`'s pre-lock, issue
 /// #1141): the keys with no `NULL` part first, then each pattern's keys, the
 /// patterns ordered by which columns are `NULL` (a key whose first nullable
 /// column is `NULL` after one whose first nullable column isn't), each
@@ -1171,16 +1161,16 @@ fn source_guard(
         .collect()
 }
 
-/// The `k`-alias column name for the `i`th `GROUP BY` column in a keyset
+/// The `k`-alias column name for the `i`th key column in a keyset
 /// `unnest(...)`. Named `c0`, `c1`, … so they never
-/// collide with the source/target's own (arbitrarily-named) grouping columns
+/// collide with the source/target's own (arbitrarily-named) key columns
 /// when both appear in one query's join condition.
 fn keyset_col(i: usize) -> String {
     format!("c{i}")
 }
 
-/// The distinct patterns of `NULL` `GROUP BY` columns among a keyset's groups
-/// (`arrays[j]` holding column `j`'s value for each group): `pattern[i]` is whether
+/// The distinct patterns of `NULL` key columns among a keyset's keys
+/// (`arrays[j]` holding column `j`'s value for each key): `pattern[i]` is whether
 /// column `i` is `NULL`. Sorted, so the SQL [`keyset_match_cols`] renders
 /// from them is deterministic. A batch with no `NULL` key has exactly one pattern,
 /// all `false`.
@@ -1197,7 +1187,7 @@ fn null_patterns(arrays: &[Vec<Option<String>>]) -> Vec<Vec<bool>> {
 /// [`null_patterns`] entry, `or`ed together (and parenthesized) when there
 /// is more than one. Within an arm, column `i` is `<col> = k.c<i>`, or
 /// `<col> is null and k.c<i> is null` where the pattern has it `NULL`. A
-/// group matches only its own pattern's arm, so this is exactly `is not
+/// key matches only its own pattern's arm, so this is exactly `is not
 /// distinct from` on every column, but indexable (issue #445).
 fn keyset_match_cols(cols: &[String], patterns: &[Vec<bool>]) -> String {
     let arms: Vec<String> = patterns
@@ -1275,11 +1265,6 @@ mod db_tests {
     //! at every build's go-live, so a target with nothing to delete must
     //! cost one hashed anti-join per target, not a probe of the source per
     //! target row.
-    //!
-    //! The aggregates here are held out of the Re-derive build
-    //! ([`hold_orders_out`]): every plain aggregate is built by the Re-derive
-    //! build since #625 F5, which never reaches this sweep, and a held-out one
-    //! keeps the old build until #625 F10.
 
     use super::*;
     use crate::defs::ValueType;
@@ -2350,6 +2335,87 @@ mod tests {
             r#"((t."g" = k.c0 and t."h" = k.c1) or "#.to_string()
                 + r#"(t."g" = k.c0 and t."h" is null and k.c1 is null) or "#
                 + r#"(t."g" is null and k.c0 is null and t."h" = k.c1))"#
+        );
+    }
+
+    fn part(col: &str, nullable: bool) -> KeyPart {
+        KeyPart {
+            target_col: quote_ident(col),
+            source_sql: format!("s.{}", quote_ident(col)),
+            nullable,
+        }
+    }
+
+    /// A `NOT NULL` key compares every column with `=`. `IS NOT DISTINCT
+    /// FROM` anywhere would force a nested-loop anti-join.
+    #[test]
+    fn a_not_null_key_matches_with_plain_equality() {
+        let matching = Match {
+            parts: vec![part("a", false), part("b", false)],
+        };
+        assert_eq!(
+            orphan_branch_sql(
+                3,
+                r#""public"."t""#,
+                r#""public"."src""#,
+                &matching,
+                &[],
+                OrphanPattern::Exactly(0),
+            ),
+            r#"select 3::int4, null::text, array[t."a"::text, t."b"::text]::text[] from "public"."t" as t where not exists (select 1 from "public"."src" as s where s."a" = t."a" and s."b" = t."b")"#
+        );
+    }
+
+    /// A key over a nullable unique index (issue #1141) gets one branch per
+    /// `NULL` pattern: `=` where the target row's value is present, `IS
+    /// NULL` on the source side where it is `NULL`, never `IS NOT DISTINCT
+    /// FROM`.
+    #[test]
+    fn a_null_pattern_matches_null_columns_with_is_null() {
+        let matching = Match {
+            parts: vec![part("g", true), part("h", true)],
+        };
+        let nullable = [0, 1];
+        assert_eq!(
+            orphan_branch_sql(
+                0,
+                "t",
+                "src",
+                &matching,
+                &nullable,
+                OrphanPattern::Exactly(0b10)
+            ),
+            r#"select 0::int4, null::text, array[t."g"::text, t."h"::text]::text[] from t as t where t."g" is not null and t."h" is null and not exists (select 1 from src as s where s."g" = t."g" and s."h" is null)"#
+        );
+        let none_null = orphan_branch_sql(
+            0,
+            "t",
+            "src",
+            &matching,
+            &nullable,
+            OrphanPattern::Exactly(0),
+        );
+        assert!(none_null.contains(r#"t."g" is not null and t."h" is not null and "#));
+        assert!(!none_null.contains("distinct"), "{none_null}");
+    }
+
+    /// The catch-all branch covers every pattern the others don't, matching
+    /// with `IS NOT DISTINCT FROM`.
+    #[test]
+    fn the_catch_all_covers_the_unlisted_patterns() {
+        let matching = Match {
+            parts: vec![part("g", true)],
+        };
+        assert_eq!(
+            orphan_branch_sql(
+                1,
+                "t",
+                "src",
+                &matching,
+                &[0],
+                OrphanPattern::NoneOf(&[0, 1])
+            ),
+            r#"select 1::int4, null::text, array[t."g"::text]::text[] from t as t where ((case when t."g" is null then 1 else 0 end))::bigint <> all('{0,1}'::bigint[]) and not exists (select 1 from src as s where s."g" is not distinct from t."g")"#
         );
     }
 }

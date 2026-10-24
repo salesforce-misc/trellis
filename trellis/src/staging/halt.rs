@@ -17,8 +17,8 @@
 //!   `JOIN` table (`capture::columns::readers_of`). For a hop
 //!   bound, the halting tables are those the wave ran away through, so their
 //!   readers are the cycle's definitions. For a truncate with no `lsn`, it
-//!   is the truncated table. For an aggregate off the ledger, it's the
-//!   definition that writes that target;
+//!   is the truncated table. For an aggregate the group basis can't apply,
+//!   it's the definition that writes that target;
 //! - and everything downstream of them, so no hop target goes quietly stale.
 //!
 //! Each is paused like a capture failure (`capture_failures`, with `kind`
@@ -52,11 +52,9 @@
 //! surfaces the error, charging no key either way, as a drain holdup
 //! ([`super::holdup`]).
 //!
-//! A Re-derive build's group-delta merge (issue #901) halts the same way
-//! ([`halt_failed_merge`]): a refused one through the same attribution, and
-//! one that keeps failing otherwise (its charged attempts ran out) from the
-//! definition writing its target, as for an aggregate off the ledger. A
-//! merge applies whole groups, so neither has a key to charge.
+//! A Re-derive build's start that fails in a way no retry gets past halts
+//! from the definition writing its target ([`halt_failed_start`]), as for
+//! an aggregate the group basis can't apply.
 //!
 //! A backfill marker's discharge that Postgres refuses the same way (a
 //! build's planning, or a go-live catch-up's re-read, issue #813) halts
@@ -643,8 +641,8 @@ mod tests {
         assert!(found[2].2.contains("docs/transforms.md"), "{}", found[2].2);
     }
 
-    /// An aggregate off the ledger names its target bare: the seed is the
-    /// definition writing it, and what is downstream of it.
+    /// An aggregate the group basis can't apply names its target bare: the
+    /// seed is the definition writing it, and what is downstream of it.
     #[test]
     fn a_target_seed_reaches_its_writer_and_its_downstream() {
         let catalog = catalog(&[

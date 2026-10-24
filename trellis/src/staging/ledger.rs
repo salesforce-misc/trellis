@@ -10,17 +10,13 @@ use crate::pool::quote_ident;
 
 /// ADR-0002 I2 as SQL over the ledger entry `l`, the batch row `v` (its
 /// `lsn` and `txid`) and the target's truncate floor `fl`: whether an Apply
-/// changes the entry. `visibility` false renders the `lsn_only_skip` plant.
-pub(super) fn apply_predicate(visibility: bool) -> String {
+/// changes the entry.
+pub(super) fn apply_predicate() -> String {
     let basis = quote_ident(schema::BASIS_COLUMN);
     let applied = quote_ident(schema::APPLIED_LSN_COLUMN);
-    let seen = if visibility {
-        format!("(l.{basis} is null or not pg_visible_in_snapshot(v.__txid, l.{basis})) and ")
-    } else {
-        String::new()
-    };
     format!(
-        "{seen}(l.{applied} is null or v.__lsn > l.{applied}) \
+        "(l.{basis} is null or not pg_visible_in_snapshot(v.__txid, l.{basis})) \
+         and (l.{applied} is null or v.__lsn > l.{applied}) \
          and not exists (select 1 from fl where v.__lsn <= fl.floor)"
     )
 }
@@ -103,4 +99,75 @@ pub(crate) async fn page_may_predate_build(
         )
         .await?
         .get(0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ADR-0002 I2 evaluated by Postgres: whether an Apply of a change
+    /// (`txid`, `lsn`) changes an entry (`basis`, `applied_lsn`) under the
+    /// truncate `floor`.
+    async fn applies(
+        client: &tokio_postgres::Client,
+        basis: Option<&str>,
+        applied_lsn: Option<&str>,
+        (txid, lsn): (&str, &str),
+        floor: Option<&str>,
+    ) -> bool {
+        client
+            .query_one(
+                &format!(
+                    "with l as (select $1::text::pg_snapshot as \"__basis\", \
+                                       $2::text::pg_lsn as \"__applied_lsn\"), \
+                          v as (select $3::text::xid8 as __txid, $4::text::pg_lsn as __lsn), \
+                          fl as (select $5::text::pg_lsn as floor where $5::text is not null) \
+                     select {} from l, v",
+                    apply_predicate()
+                ),
+                &[&basis, &applied_lsn, &txid, &lsn, &floor],
+            )
+            .await
+            .expect("evaluate the apply predicate")
+            .get(0)
+    }
+
+    #[tokio::test]
+    async fn the_apply_predicate_skips_what_the_basis_saw_older_lsns_and_the_truncated() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (client, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(connection);
+        let c = &client;
+        // A basis taken with 102 in flight: 99 and 103 had committed, 106
+        // hadn't started.
+        let basis = Some("100:105:102");
+        let change = |txid| (txid, "0/200");
+
+        // A never-applied entry (a placeholder) takes any change.
+        assert!(applies(c, None, None, change("99"), None).await);
+        // Visible in the basis: the read already counted it.
+        assert!(!applies(c, basis, None, change("99"), None).await);
+        assert!(!applies(c, basis, None, change("103"), None).await);
+        // In flight when the basis was taken (`xip`), or after it: applied.
+        assert!(applies(c, basis, None, change("102"), None).await);
+        assert!(applies(c, basis, None, change("106"), None).await);
+        // `applied_lsn`: only a strictly newer change applies.
+        assert!(!applies(c, None, Some("0/200"), change("106"), None).await);
+        assert!(!applies(c, None, Some("0/300"), change("106"), None).await);
+        assert!(applies(c, None, Some("0/100"), change("106"), None).await);
+        // The truncate floor: a change at or below it predates the truncate.
+        assert!(!applies(c, None, None, change("106"), Some("0/200")).await);
+        assert!(applies(c, None, None, change("106"), Some("0/1FF")).await);
+    }
+
+    #[test]
+    fn the_apply_predicate_is_visibility_then_lsn_then_the_floor() {
+        assert_eq!(
+            apply_predicate(),
+            r#"(l."__basis" is null or not pg_visible_in_snapshot(v.__txid, l."__basis")) and (l."__applied_lsn" is null or v.__lsn > l."__applied_lsn") and not exists (select 1 from fl where v.__lsn <= fl.floor)"#
+        );
+    }
 }

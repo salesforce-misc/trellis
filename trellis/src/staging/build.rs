@@ -214,7 +214,7 @@ pub const PLAN_BATCH: usize = 100;
 
 /// The `application_name` a build chunk's transaction runs under, so
 /// `pg_stat_activity` tells its statements from a drain page's, which share
-/// their text (`ledger::lock_entries`).
+/// their text (`one_to_one_ledger::lock_entries`).
 pub const CHUNK_APPLICATION_NAME: &str = "trellis build chunk";
 
 /// The `transform_definitions.build` word of a running Re-derive build.
@@ -594,8 +594,7 @@ async fn capture_gate_holds(client: &impl GenericClient, table: &str) -> Result<
 /// start commits, so every change committed before the start is in a batch
 /// at or below `build_seg`, and a page that drains one re-derives its keys
 /// for the definition rather than applying their changes
-/// ([`ledger::page_may_predate_build`]), on a ledger target and a 1-1
-/// target alike. Every batch above it holds only
+/// ([`ledger::page_may_predate_build`]). Every batch above it holds only
 /// changes committed after the start, drained by pages that read the
 /// definition list after it, so none is dropped.
 ///
@@ -1816,11 +1815,11 @@ const NULL_KEYS_CURSOR: &str = "trellis_null_keys_cursor";
 const NULL_KEYS_PAGE: i64 = 10_000;
 
 /// Stages an image-less `Recompute` for every key of `source_table` with a
-/// `NULL` part, for a ledger or 1-1 target's build (F6). Only a source keyed
-/// by a nullable unique index has such keys: another aggregate's or `JOIN`'s
-/// target, whose `GROUP BY` columns may be `NULL`. A ledger target counts
-/// its `NULL` groups like any other, and a 1-1 target over such a source is
-/// keyed `unique nulls not distinct` so it holds their rows (issue #1141).
+/// `NULL` part, for a 1-1 target's build (F6). Only a source keyed by a
+/// nullable unique index has such keys: another aggregate's or `JOIN`'s
+/// target, whose `GROUP BY` columns may be `NULL`. A 1-1 target over such a
+/// source is keyed `unique nulls not distinct` so it holds their rows (issue
+/// #1141).
 /// No chunk reaches them. A chunk's range is a row comparison, which is
 /// `NULL` (so the row is out) wherever a `NULL` part decides it, and a
 /// plan's boundaries are keys without one.

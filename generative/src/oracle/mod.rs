@@ -76,9 +76,8 @@ enum Comparison {
     /// engine-side fold and a server-side `sum()` over the same rows in a
     /// different order really do produce different doubles
     /// (`1e16::float8+1+1+1+1` is `1e+16`, `1+1+1+1+1e16` is
-    /// `1.0000000000000004e+16`). That is not a bug to report — it is the
-    /// reason `defs::invertibility` routes float `SUM`/`AVG` to the
-    /// recompute path.
+    /// `1.0000000000000004e+16`). That is not a bug to report — it is why
+    /// a float `SUM`/`AVG` is refused at define.
     ///
     /// `NaN`/`±Infinity` are compared by Postgres's own float equality
     /// ([`trellis::float::equal`]: `NaN = NaN` is true), not IEEE's, so a
@@ -1145,9 +1144,8 @@ mod tests {
     /// Task B4: `render_select` now renders a real `GROUP BY` instead of
     /// panicking (the old pin here, `render_select_panics_on_an_aggregate_key_space`,
     /// asserted the pre-B4 refuse-to-guess behavior; this is its
-    /// replacement now that the real thing works). Mirrors the
-    /// `order_summary` shape `trellis/tests/apply_aggregate.rs` uses as its
-    /// own model aggregate definition.
+    /// replacement now that the real thing works), over an `order_summary`
+    /// model aggregate definition.
     #[test]
     fn render_select_renders_a_group_by_aggregate() {
         let def = TransformDef {

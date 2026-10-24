@@ -79,9 +79,9 @@
 //!   the same way `bytea`/`oid` did.
 //!
 //! `inet`'s `GROUP BY` key role is nonetheless admitted — the same split
-//! `boolean` got in #119, for the same mechanical reason: the ledger
-//! (`staging::ledger`) never compares a group key's text, it casts it to the
-//! column's native type, and `inet_in` is permissive enough to parse both
+//! `boolean` got in #119, for the same mechanical reason: the group basis
+//! (`staging::group_basis`) never compares a group key's text, it parses it
+//! into the column's native type, and `inet_in` is permissive enough to parse both
 //! spellings (`'192.168.1.5'` and `'192.168.1.5/32'`) back to the identical
 //! stored value — verified live: `'192.168.1.5'::inet =
 //! '192.168.1.5/32'::inet` is `true`.

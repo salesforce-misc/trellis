@@ -8,8 +8,7 @@
 //! the tree's bounds. Every pass therefore looks for target groups there and,
 //! when it finds any, queues a correction of the whole complement, which the
 //! correction engine ([`crate::staging::partition_correction`]) runs like a
-//! gone node's: it re-derives the keys of the live ledger entries whose group
-//! is in it, through the normal page path.
+//! gone node's: it recomputes the groups that route to it.
 //!
 //! # The complement forms
 //!

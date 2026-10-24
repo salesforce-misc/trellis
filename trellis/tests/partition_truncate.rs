@@ -6,7 +6,7 @@
 //! truncates part of the tree, drains the ring (whose seal queues the
 //! correction) and runs the correction engine. The oracle is a from-scratch
 //! `GROUP BY` over the source. Nothing waits for convergence (#297): the
-//! pass, the drain, the engine and the merger are called by hand.
+//! pass, the drain and the engine are called by hand.
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
@@ -141,14 +141,10 @@ impl Fx {
             .expect("run the pending corrections")
     }
 
-    async fn merge(&mut self) {
-        self.d.settle().await;
-    }
-
-    /// Runs the queued corrections to their end and merges their deltas.
+    /// Runs the queued corrections to their end and drains the ring.
     async fn correct(&mut self) -> Outcome {
         let outcome = self.run(&Options::default()).await;
-        self.merge().await;
+        self.d.settle().await;
         outcome
     }
 

@@ -433,8 +433,8 @@ async fn chunks_wait_while_the_ring_has_a_backlog() {
     f.assert_one_oracle().await;
 }
 
-/// A source `TRUNCATE` while the build runs: its deltas and entries go with
-/// the ledger, and the rest of the build and Apply rebuild the target from
+/// A source `TRUNCATE` while the build runs: its entries go with the
+/// ledger, and the rest of the build and Apply rebuild the target from
 /// the rows inserted after it.
 #[tokio::test]
 async fn a_truncate_during_the_build_is_absorbed() {
@@ -1782,12 +1782,10 @@ async fn a_rebuild_sweeps_many_hand_added_rows_and_keeps_a_row_the_source_backs(
 }
 
 /// A plain 1-1 target's build (#625 F8a) is `waiting_to_backfill ->
-/// backfilling -> live`, with no `catching_up`, no marker, and no group
-/// deltas: its chunks write the target rows, so no step merges, and it has
-/// no delta table.
+/// backfilling -> live`, with no `catching_up` and no marker: its chunks
+/// write the target rows.
 #[tokio::test]
 async fn a_one_to_one_build_goes_from_waiting_to_live_with_no_catch_up() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
     let mut f = Fixture::new(200, &[ONE]).await;
     assert_eq!(
         f.status("one").await.as_deref(),

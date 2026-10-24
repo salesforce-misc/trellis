@@ -525,8 +525,8 @@ impl Pool {
 /// `xml_in` parses under `xmloption`: `document` accepts only a
 /// well-formed document, `content` also accepts a fragment (`a<b/>`, plain
 /// text). An application can store a fragment under its own `content`
-/// session, and the ledger casts that value's text back into an `xml`
-/// contribution through `jsonb_populate_record` ([`crate::staging::ledger`]),
+/// session, and the group basis casts that value's text back into an `xml`
+/// value through `jsonb_populate_record` ([`crate::staging::group_basis`]),
 /// so an operator's `ALTER DATABASE ... SET xmloption = document` used to
 /// fail every page carrying one. `content` accepts everything `document`
 /// does, so it is pinned (found in #623 D3b's review). A capture function
@@ -613,9 +613,9 @@ pub(crate) const ROW_SECURITY_OFF: &str = "set row_security to off";
 ///   10,000 keys it expects 21.7M rows, and spends 168 ms compiling a
 ///   statement that runs in 40 ms.
 ///
-/// The statements that do read a whole table (the direct build's ledger
-/// load and group writes, its delete of groups the ledger no longer has,
-/// the discharge's enumeration and the resume's orphan sweep) gain nothing
+/// The statements that do read a whole table (a group-basis build's or
+/// rebuild's absolute write, the discharge's enumeration and the resume's
+/// orphan sweep) gain nothing
 /// from JIT either: at 5M rows each takes the same time, within 2%, with it
 /// on or off, since its time goes to writing, sorting and hashing rows, not
 /// to evaluating expressions.

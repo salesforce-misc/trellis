@@ -4,7 +4,7 @@
 //!
 //! Each test builds a partitioned `public.items`, an aggregate over it kept
 //! live by the hand-driven pipeline (`support/drain_driver.rs`), and drives
-//! the pass, the ring, the correction engine and the merger by hand. The
+//! the pass, the ring and the correction engine by hand. The
 //! oracle is a from-scratch `GROUP BY` over the source. Nothing waits for
 //! convergence (#297): the race test freezes the pass at a pause point.
 
@@ -111,7 +111,7 @@ impl Fx {
             .await
     }
 
-    /// Drains the ring, runs the engine to its end and merges its deltas.
+    /// Drains the ring, runs the engine to its end and drains again.
     async fn correct(&mut self) {
         self.d.settle().await;
         partition_correction::run_pending(self.d.pool(), &Options::default())

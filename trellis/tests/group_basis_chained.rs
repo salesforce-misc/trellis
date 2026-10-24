@@ -9,11 +9,9 @@
 //! capture once every definition is live, except where a test says it builds
 //! over rows.
 //!
-//! The first tests port the ledger's chained-aggregate tests
-//! (`defs_aggregate_chained_single_column_group_key.rs`,
-//! `defs_aggregate_chained_composite_group_key.rs`,
-//! `defs_deleted_oneone_target_reduces_chained_aggregate.rs`) to the group
-//! basis. The rest are decision 5's: a row that moves group upstream (#1043
+//! The first tests cover a chained aggregate over a single-column and a
+//! composite group key, and one whose upstream 1-1 target loses a row. The
+//! rest are decision 5's: a row that moves group upstream (#1043
 //! F8), a rollup whose upstream group is emptied and refilled in one page, a
 //! reader defined while an upstream writer is in flight, and an upstream
 //! rebuild that rebuilds the reader. The last group is a reader's build over an
