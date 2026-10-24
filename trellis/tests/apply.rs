@@ -760,16 +760,9 @@ async fn a_claim_lost_mid_drain_rolls_back_and_applies_nothing() {
     let plan = apply::compute(&db.pool, &folded).await.expect("compute");
     let mut phase3_client = db.pool.get().await.expect("connection");
     let txn = phase3_client.transaction().await.expect("begin phase 3");
-    let err = apply::apply_and_mark_drained(
-        &txn,
-        seg_seq,
-        "worker",
-        &plan,
-        "trellis_apply_test",
-        &StagedWatermark::saturated(),
-    )
-    .await
-    .expect_err("the claim is gone; completion must fail");
+    let err = apply::apply_and_mark_drained(&txn, seg_seq, "worker", &plan, "trellis_apply_test")
+        .await
+        .expect_err("the claim is gone; completion must fail");
     assert!(matches!(err, ApplyError::ClaimLost), "got {err:?}");
     txn.rollback().await.expect("rollback phase 3");
 
@@ -868,16 +861,9 @@ async fn a_definition_change_on_a_touched_source_trips_the_version_fence() {
 
     let mut phase3_client = db.pool.get().await.expect("connection");
     let txn = phase3_client.transaction().await.expect("begin phase 3");
-    let err = apply::apply_and_mark_drained(
-        &txn,
-        seg_seq,
-        "worker",
-        &plan,
-        "trellis_apply_test",
-        &StagedWatermark::saturated(),
-    )
-    .await
-    .expect_err("orders' version moved since compute; the fence must trip");
+    let err = apply::apply_and_mark_drained(&txn, seg_seq, "worker", &plan, "trellis_apply_test")
+        .await
+        .expect_err("orders' version moved since compute; the fence must trip");
     match &err {
         ApplyError::VersionFenceMiss { src_table } => {
             assert_eq!(src_table, &format!("{DEFAULT_SCHEMA}.orders"))
@@ -986,16 +972,10 @@ async fn a_definition_change_on_an_unrelated_source_does_not_trip_the_fence() {
 
     let mut phase3_client = db.pool.get().await.expect("connection");
     let txn = phase3_client.transaction().await.expect("begin phase 3");
-    let outcome = apply::apply_and_mark_drained(
-        &txn,
-        seg_seq,
-        "worker",
-        &plan,
-        "trellis_apply_test",
-        &StagedWatermark::saturated(),
-    )
-    .await
-    .expect("an unrelated source's version change must not trip this batch's fence");
+    let outcome =
+        apply::apply_and_mark_drained(&txn, seg_seq, "worker", &plan, "trellis_apply_test")
+            .await
+            .expect("an unrelated source's version change must not trip this batch's fence");
     txn.commit().await.expect("commit phase 3");
     assert_eq!(outcome.keys_written, 1);
 }
@@ -2671,16 +2651,9 @@ async fn apply_computed(
 ) -> apply::ApplyOutcome {
     let mut phase3_client = pool.get().await.expect("connection");
     let txn = phase3_client.transaction().await.expect("begin phase 3");
-    let outcome = apply::apply_and_mark_drained(
-        &txn,
-        seg_seq,
-        worker,
-        plan,
-        "trellis_apply_test",
-        &StagedWatermark::saturated(),
-    )
-    .await
-    .expect("apply");
+    let outcome = apply::apply_and_mark_drained(&txn, seg_seq, worker, plan, "trellis_apply_test")
+        .await
+        .expect("apply");
     txn.commit().await.expect("commit phase 3");
     outcome
 }

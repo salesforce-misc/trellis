@@ -302,12 +302,6 @@ pub async fn pending_count(client: &impl GenericClient) -> Result<i64, StagingEr
 /// `schema_changed` rows carry no image a reader could miss a column of, so
 /// they don't hold the gate.
 ///
-/// A deferred relationship reverse (`rel_reverse_deferred`) carries its
-/// to-side's images under a synthetic `src_table`, so one whose relationship's
-/// to-side is `table` counts as a change to `table` too (issue #622 C5: a
-/// widen of a to-side must not let a deferred reverse carrying the old
-/// images through). Such rows never reach `poison_held`.
-///
 /// A row held in `poison_held` doesn't count (#799). Its release stages an
 /// image-less `Recompute` (`quarantine::release_key`), so its images never
 /// reach a reader, and it is held for the definitions whose key it is, never
@@ -355,10 +349,7 @@ async fn pending_through(
     let arms = per_ring_table(" union all ", |slot, ring| {
         format!(
             "select 1 from {ring} r \
-             where (r.src_table = $1{ops} \
-                    or r.op = 'rel_reverse_deferred' and r.relationship_id in ( \
-                        select rd.id from relationship_definitions rd \
-                        where rd.to_schema || '.' || rd.to_table = $1)) \
+             where r.src_table = $1{ops} \
                and (r.origin_lsn is null or r.origin_lsn <= $2) \
                and exists ( \
                    select 1 from segments s \

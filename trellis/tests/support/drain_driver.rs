@@ -257,7 +257,6 @@ impl Driver {
                 src_table: src_table.to_string(),
                 key: key.to_string(),
                 hop_gen: 0,
-                group_key: None,
                 src_changed: None,
                 prior_image: prior_image.clone(),
                 origin_lsn: None,

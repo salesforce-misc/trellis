@@ -708,7 +708,6 @@ async fn stage_pre_truncate_insert(d: &Driver, key: &str, image: &str) {
             origin_lsn: None,
             src_changed: None,
             hop_gen: 0,
-            group_key: None,
         }],
     )
     .await
@@ -858,16 +857,12 @@ async fn a_truncate_without_an_lsn_halts_instead_of_clearing_without_a_floor() {
         lsn: None,
         hop_gen: 0,
         first_seen: std::time::SystemTime::now(),
-        group_key: None,
         is_truncate: true,
-        relationship_reverse_deferred: None,
-        retry_count: 0,
         prior_image: None,
         row_count: 1,
         has_recompute: false,
         ends_in_delete: false,
         last_change: None,
-        to_col_values: Vec::new(),
         group_sides: Vec::new(),
     };
     let err = apply::compute(d.pool(), &[truncate])

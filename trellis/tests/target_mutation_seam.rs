@@ -140,7 +140,6 @@ async fn stage_cdc(
             origin_lsn: Some(lsn),
             src_changed: None,
             hop_gen: 0,
-            group_key: None,
         }],
     )
     .await
@@ -1304,7 +1303,6 @@ async fn a_superseded_seam_delete_leaves_a_key_with_a_pending_reinsert_to_that_r
             origin_lsn: Some(lsn),
             src_changed: None,
             hop_gen: 1,
-            group_key: None,
         }],
     )
     .await

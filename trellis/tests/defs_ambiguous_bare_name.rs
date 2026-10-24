@@ -248,7 +248,6 @@ fn cdc(op: CdcOp, key: &str, lsn: PgLsn, old: Option<&str>, new: Option<&str>) -
         origin_lsn: None,
         src_changed: None,
         hop_gen: 0,
-        group_key: None,
     }
 }
 

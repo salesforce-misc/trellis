@@ -2993,7 +2993,7 @@ mod tests {
                 &format!(
                     "select src_table, key, op::text, (lsn is not null)::text, \
                             old_image::text, new_image::text, origin_lsn::text, \
-                            src_changed::text, hop_gen::text, group_key::text \
+                            src_changed::text, hop_gen::text \
                      from ({ring}) r \
                      where x::text::bigint = pg_current_xact_id()::text::bigint % 4294967296 \
                      order by 1, 2"
@@ -3003,7 +3003,7 @@ mod tests {
             .await
             .expect("read the staged rows")
             .into_iter()
-            .map(|row| (0..10).map(|i| row.get(i)).collect())
+            .map(|row| (0..9).map(|i| row.get(i)).collect())
             .collect();
         txn.commit().await.expect("commit");
         (deleted, staged)

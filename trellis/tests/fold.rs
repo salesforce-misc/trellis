@@ -46,7 +46,6 @@ struct RawRow<'a> {
     origin_lsn: Option<u64>,
     src_changed: bool,
     hop_gen: i32,
-    group_key: Option<Vec<&'a str>>,
 }
 
 impl<'a> RawRow<'a> {
@@ -60,7 +59,6 @@ impl<'a> RawRow<'a> {
             origin_lsn: None,
             src_changed: false,
             hop_gen,
-            group_key: None,
         }
     }
 }
@@ -74,8 +72,8 @@ async fn insert_row(client: &Client, table: &str, row: &RawRow<'_>) {
             &format!(
                 "insert into {table} \
                  (src_table, key, op, lsn, old_image, new_image, origin_lsn, src_changed, \
-                  hop_gen, group_key) \
-                 values ('orders', $1, $2, $3, $4::text::jsonb, $5::text::jsonb, $6, $7, $8, $9)"
+                  hop_gen) \
+                 values ('orders', $1, $2, $3, $4::text::jsonb, $5::text::jsonb, $6, $7, $8)"
             ),
             &[
                 &row.key,
@@ -86,7 +84,6 @@ async fn insert_row(client: &Client, table: &str, row: &RawRow<'_>) {
                 &origin_lsn,
                 &src_changed,
                 &row.hop_gen,
-                &row.group_key,
             ],
         )
         .await
@@ -129,7 +126,6 @@ async fn fold_matches_a_from_scratch_oracle_across_mixed_ops() {
             origin_lsn: Some(100),
             src_changed: true,
             hop_gen: 0,
-            group_key: Some(vec!["g1"]),
         },
     )
     .await;
@@ -148,7 +144,6 @@ async fn fold_matches_a_from_scratch_oracle_across_mixed_ops() {
             origin_lsn: Some(10),
             src_changed: true,
             hop_gen: 0,
-            group_key: None,
         },
     )
     .await;
@@ -164,7 +159,6 @@ async fn fold_matches_a_from_scratch_oracle_across_mixed_ops() {
             origin_lsn: Some(20),
             src_changed: true,
             hop_gen: 0,
-            group_key: None,
         },
     )
     .await;
@@ -182,7 +176,6 @@ async fn fold_matches_a_from_scratch_oracle_across_mixed_ops() {
             origin_lsn: Some(30),
             src_changed: true,
             hop_gen: 0,
-            group_key: None,
         },
     )
     .await;
@@ -203,7 +196,6 @@ async fn fold_matches_a_from_scratch_oracle_across_mixed_ops() {
     assert_eq!(inserted.origin_lsn, Some(PgLsn::from(100)));
     assert!(inserted.src_changed.is_some());
     assert_eq!(inserted.hop_gen, 0);
-    assert_eq!(inserted.group_key, Some(vec!["g1".to_string()]));
 
     let updated = find(&folded, "updated-twice");
     assert_eq!(updated.new_image, Some(r#"{"v": "c"}"#.to_string()));
@@ -228,118 +220,6 @@ async fn fold_matches_a_from_scratch_oracle_across_mixed_ops() {
     assert_eq!(recomputed.hop_gen, 1);
 
     assert_eq!(folded.len(), 4, "exactly one record per key: {folded:?}");
-}
-
-/// Issue #133: `group_key`'s real merge rule is a per-key **union** of every
-/// raw row's own touched-join-key array — not "pick one row's value" the
-/// way `new_image`/`old_image`'s arg-extremes work. Three raw rows touching
-/// three distinct join values (with some overlap between consecutive rows,
-/// and a fourth, group_key-less row thrown in) must fold to the full
-/// deduplicated union of all of them, not just one arbitrary row's array —
-/// and, in particular, the union must still carry "3", even though it's
-/// long gone from the folded `new_image` by the time this key's history
-/// ends at lsn 40 (the exact "fold erases the join key" shape this issue
-/// fixes: `staging::apply::RelationshipGenBump` reads this field, not
-/// `new_image`, for precisely this reason).
-#[tokio::test]
-async fn group_key_folds_to_the_real_union_of_every_raw_rows_touched_values() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
-
-    insert_row(
-        &client,
-        "seg_0",
-        &RawRow {
-            key: "repointed",
-            op: "insert",
-            lsn: Some(10),
-            old_image: None,
-            new_image: Some(r#"{"post":"3"}"#),
-            origin_lsn: Some(10),
-            src_changed: true,
-            hop_gen: 0,
-            group_key: Some(vec!["3"]),
-        },
-    )
-    .await;
-    insert_row(
-        &client,
-        "seg_0",
-        &RawRow {
-            key: "repointed",
-            op: "update",
-            lsn: Some(20),
-            old_image: Some(r#"{"post":"3"}"#),
-            new_image: Some(r#"{"post":"2"}"#),
-            origin_lsn: Some(20),
-            src_changed: true,
-            hop_gen: 0,
-            group_key: Some(vec!["3", "2"]),
-        },
-    )
-    .await;
-    insert_row(
-        &client,
-        "seg_0",
-        &RawRow {
-            key: "repointed",
-            op: "update",
-            lsn: Some(30),
-            old_image: Some(r#"{"post":"2"}"#),
-            new_image: Some(r#"{"post":"5"}"#),
-            origin_lsn: Some(30),
-            src_changed: true,
-            hop_gen: 0,
-            group_key: Some(vec!["2", "5"]),
-        },
-    )
-    .await;
-    // A fourth row for the same key with no group_key at all (e.g. a
-    // no-op-shaped change on some other column) — must not poison the
-    // union with a NULL element or otherwise disturb it.
-    insert_row(
-        &client,
-        "seg_0",
-        &RawRow {
-            key: "repointed",
-            op: "update",
-            lsn: Some(40),
-            old_image: Some(r#"{"post":"5"}"#),
-            new_image: Some(r#"{"post":"5"}"#),
-            origin_lsn: Some(40),
-            src_changed: true,
-            hop_gen: 0,
-            group_key: None,
-        },
-    )
-    .await;
-
-    let seg_seq = seal_active_segment(&mut client).await;
-    let txn = client.transaction().await.expect("begin fold txn");
-    let folded = fold::fold(&txn, seg_seq, BucketFilter::all())
-        .await
-        .expect("fold");
-
-    let record = find(&folded, "repointed");
-    let mut group_key = record
-        .group_key
-        .clone()
-        .expect("group_key must be populated when any raw row carried one");
-    group_key.sort();
-    assert_eq!(
-        group_key,
-        vec!["2".to_string(), "3".to_string(), "5".to_string()],
-        "must be the full deduplicated union of every raw row's touched values, \
-         not just one row's (arbitrary) value: {folded:?}"
-    );
-    // The folded image only ever names the last endpoint (5) — exactly the
-    // erasure this issue fixes: "3" (and, transiently, "2") are invisible
-    // in new_image/old_image but must still survive via group_key.
-    assert_eq!(record.new_image, Some(r#"{"post": "5"}"#.to_string()));
-    // Issue #409: unioning the join values must not multiply the group's
-    // rows — one per staged row, however many join values each carried.
-    assert_eq!(record.row_count, 4);
 }
 
 /// A key born inside the batch: an insert immediately followed by an update
@@ -367,7 +247,6 @@ async fn a_key_born_in_the_batch_folds_old_image_to_null_via_the_change_id_tie_b
             origin_lsn: Some(50),
             src_changed: true,
             hop_gen: 0,
-            group_key: None,
         },
     )
     .await;
@@ -383,7 +262,6 @@ async fn a_key_born_in_the_batch_folds_old_image_to_null_via_the_change_id_tie_b
             origin_lsn: Some(50),
             src_changed: true,
             hop_gen: 0,
-            group_key: None,
         },
     )
     .await;
@@ -429,7 +307,6 @@ async fn image_less_rows_never_win_an_arg_extreme_but_still_produce_a_record() {
             origin_lsn: Some(10),
             src_changed: true,
             hop_gen: 0,
-            group_key: None,
         },
     )
     .await;
@@ -445,7 +322,6 @@ async fn image_less_rows_never_win_an_arg_extreme_but_still_produce_a_record() {
             origin_lsn: None,
             src_changed: false,
             hop_gen: 0,
-            group_key: None,
         },
     )
     .await;
@@ -504,7 +380,6 @@ async fn an_image_less_load_bearing_row_survives_the_fold_unfiltered_by_op() {
             origin_lsn: None,
             src_changed: true,
             hop_gen: 0,
-            group_key: None,
         },
     )
     .await;
@@ -543,7 +418,6 @@ async fn origin_lsn_least_merges_while_lsn_greatest_advances() {
             origin_lsn: Some(50),
             src_changed: true,
             hop_gen: 0,
-            group_key: None,
         },
     )
     .await;
@@ -561,7 +435,6 @@ async fn origin_lsn_least_merges_while_lsn_greatest_advances() {
             origin_lsn: Some(10),
             src_changed: true,
             hop_gen: 0,
-            group_key: None,
         },
     )
     .await;
@@ -702,7 +575,6 @@ async fn a_truncate_voids_stale_rows_but_not_post_truncate_writes_or_recomputes(
             origin_lsn: Some(10),
             src_changed: true,
             hop_gen: 0,
-            group_key: None,
         },
     )
     .await;
@@ -721,7 +593,6 @@ async fn a_truncate_voids_stale_rows_but_not_post_truncate_writes_or_recomputes(
             origin_lsn: None,
             src_changed: true,
             hop_gen: 0,
-            group_key: None,
         },
     )
     .await;
@@ -739,7 +610,6 @@ async fn a_truncate_voids_stale_rows_but_not_post_truncate_writes_or_recomputes(
             origin_lsn: Some(30),
             src_changed: true,
             hop_gen: 0,
-            group_key: None,
         },
     )
     .await;
@@ -760,7 +630,6 @@ async fn a_truncate_voids_stale_rows_but_not_post_truncate_writes_or_recomputes(
                 origin_lsn: Some(lsn),
                 src_changed: true,
                 hop_gen: 0,
-                group_key: None,
             },
         )
         .await;
@@ -843,7 +712,6 @@ async fn a_same_transaction_truncate_is_ordered_by_change_id_not_lsn() {
             origin_lsn: Some(50),
             src_changed: true,
             hop_gen: 0,
-            group_key: None,
         },
     )
     .await;
@@ -859,7 +727,6 @@ async fn a_same_transaction_truncate_is_ordered_by_change_id_not_lsn() {
             origin_lsn: None,
             src_changed: true,
             hop_gen: 0,
-            group_key: None,
         },
     )
     .await;
@@ -875,7 +742,6 @@ async fn a_same_transaction_truncate_is_ordered_by_change_id_not_lsn() {
             origin_lsn: Some(50),
             src_changed: true,
             hop_gen: 0,
-            group_key: None,
         },
     )
     .await;
@@ -974,7 +840,6 @@ async fn has_recompute_survives_a_fold_with_the_keys_cdc_change() {
         origin_lsn: None,
         src_changed: true,
         hop_gen: 0,
-        group_key: None,
     };
     insert_row(&client, "seg_0", &RawRow::recompute("mixed", 0)).await;
     insert_row(&client, "seg_0", &update("mixed")).await;
@@ -1017,7 +882,6 @@ async fn an_image_less_delete_after_an_image_is_the_keys_final_state() {
             origin_lsn: Some(lsn),
             src_changed: true,
             hop_gen: 0,
-            group_key: None,
         };
     // Updated, then deleted with no image: the delete wins the post-image.
     insert_row(
@@ -1136,78 +1000,4 @@ async fn an_image_less_delete_after_an_image_is_the_keys_final_state() {
     let only = find(&folded, "only-deleted");
     assert_eq!((&only.old_image, &only.new_image), (&None, &None));
     assert!(only.ends_in_delete);
-}
-
-/// Issue #581: the group-key union goes through `jsonb` (`jsonb_agg`, then a
-/// jsonpath flatten, then `#>> '{}'` back to text), so it must hand back
-/// exactly the texts capture staged, not whatever jsonb makes of them. Values
-/// that look like JSON literals, numbers that jsonb would normalize, quotes,
-/// backslashes, control characters, non-ASCII and a long string all survive
-/// byte for byte, the empty string and the string `null` are real values,
-/// and a key whose rows carry no values (no array, or an empty one) folds to
-/// no group key at all.
-#[tokio::test]
-async fn the_group_key_union_returns_every_staged_text_unchanged() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
-
-    let long = "x".repeat(10_000);
-    let first = vec![
-        "null",
-        "",
-        "1.0",
-        "1",
-        "1e3",
-        "true",
-        r#"{"a": 1}"#,
-        "[1, 2]",
-        r#""quoted""#,
-    ];
-    let second = vec![
-        "1.00",
-        r"back\slash",
-        "tab\there",
-        "line\nbreak",
-        "ünïcödé 🎉",
-        long.as_str(),
-        "1.0", // again: the union dedups it
-    ];
-    let row = |key, lsn, group_key| RawRow {
-        key,
-        op: "update",
-        lsn: Some(lsn),
-        old_image: Some(r#"{"v":1}"#),
-        new_image: Some(r#"{"v":2}"#),
-        origin_lsn: Some(lsn),
-        src_changed: true,
-        hop_gen: 0,
-        group_key,
-    };
-    insert_row(&client, "seg_0", &row("edgy", 10, Some(first.clone()))).await;
-    insert_row(&client, "seg_0", &row("edgy", 20, Some(second.clone()))).await;
-    insert_row(&client, "seg_0", &row("edgy", 30, None)).await;
-    insert_row(&client, "seg_0", &row("empty", 10, Some(Vec::new()))).await;
-    insert_row(&client, "seg_0", &row("empty", 20, None)).await;
-
-    let seg_seq = seal_active_segment(&mut client).await;
-    let txn = client.transaction().await.expect("begin fold txn");
-    let folded = fold::fold(&txn, seg_seq, BucketFilter::all())
-        .await
-        .expect("fold");
-
-    let mut expected: Vec<String> = first
-        .iter()
-        .chain(second.iter())
-        .map(|v| v.to_string())
-        .collect();
-    expected.sort();
-    expected.dedup();
-    let mut got = find(&folded, "edgy")
-        .group_key
-        .clone()
-        .expect("the key's rows carried values");
-    got.sort();
-    assert_eq!(got, expected);
-    assert_eq!(find(&folded, "empty").group_key, None);
 }

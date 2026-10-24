@@ -699,7 +699,6 @@ async fn an_aggregate_claim_lost_mid_drain_rolls_back_and_applies_nothing() {
         "worker",
         &plan,
         "trellis_apply_aggregate_test",
-        &StagedWatermark::saturated(),
     )
     .await
     .expect_err("the claim is gone; completion must fail");
@@ -729,7 +728,6 @@ async fn an_aggregate_claim_lost_mid_drain_rolls_back_and_applies_nothing() {
         "worker",
         &plan,
         "trellis_apply_aggregate_test",
-        &StagedWatermark::saturated(),
     )
     .await
     .expect("a fresh claim's apply must commit");
@@ -808,7 +806,6 @@ async fn a_definition_change_on_an_aggregate_only_source_trips_the_version_fence
         "worker",
         &plan,
         "trellis_apply_aggregate_test",
-        &StagedWatermark::saturated(),
     )
     .await
     .expect_err("order_items' version moved since compute; the fence must trip");
@@ -901,7 +898,6 @@ async fn a_definition_change_on_an_unrelated_source_does_not_trip_the_aggregate_
         "worker",
         &plan,
         "trellis_apply_aggregate_test",
-        &StagedWatermark::saturated(),
     )
     .await
     .expect("an unrelated source's version change must not trip this batch's fence");

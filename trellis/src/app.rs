@@ -880,13 +880,9 @@ impl Trellis {
                 // #817: a page the drain keeps failing on, charged to no one,
                 // holds back every definition still applying what it reads.
                 if !stored.is_frozen() {
-                    drain_failure = crate::staging::holdup::for_definition(
-                        &*txn,
-                        row.get("source_table"),
-                        row.get("definition_text"),
-                        row.get("grammar_version"),
-                    )
-                    .await?;
+                    drain_failure =
+                        crate::staging::holdup::for_definition(&*txn, row.get("source_table"))
+                            .await?;
                 }
                 // #973: a stored definition always parses.
                 if let Ok(def) = crate::defs::grammar::load(

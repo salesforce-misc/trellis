@@ -449,10 +449,7 @@ async fn isolating_and_evicting_a_poisoned_key_emits_a_warning_event() {
         lsn: None,
         hop_gen: 0,
         first_seen: SystemTime::now(),
-        group_key: None,
         is_truncate: false,
-        relationship_reverse_deferred: None,
-        retry_count: 0,
         prior_image: None,
         row_count: 1,
         has_recompute: false,
@@ -462,7 +459,6 @@ async fn isolating_and_evicting_a_poisoned_key_emits_a_warning_event() {
             lsn: PgLsn::from(1),
             row_txid: "1".to_string(),
         }),
-        to_col_values: Vec::new(),
         group_sides: Vec::new(),
     }];
 

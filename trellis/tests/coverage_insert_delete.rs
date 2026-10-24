@@ -157,7 +157,6 @@ fn cdc(op: CdcOp, lsn: PgLsn, old: Option<&str>, new: Option<&str>) -> StagedCha
         origin_lsn: None,
         src_changed: None,
         hop_gen: 0,
-        group_key: None,
     }
 }
 

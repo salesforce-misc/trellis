@@ -177,7 +177,6 @@ fn sales_insert(lsn: PgLsn, id: i32, sku: &str, amount: i32) -> StagedChange {
         origin_lsn: None,
         src_changed: None,
         hop_gen: 0,
-        group_key: None,
     }
 }
 
