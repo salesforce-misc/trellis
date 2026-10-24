@@ -416,13 +416,8 @@ async fn a_token_after_an_asynchronous_commit_waits_for_the_write() {
     raw.batch_execute("create table public.t (id text primary key, a int)")
         .await
         .expect("create public.t");
-    let spec = CaptureSpec::new(
-        "public.t",
-        vec!["id".to_string()],
-        ["a".to_string()],
-        Vec::new(),
-    )
-    .expect("valid spec");
+    let spec = CaptureSpec::new("public.t", vec!["id".to_string()], ["a".to_string()])
+        .expect("valid spec");
     let mut installer = connect_raw(db.dsn()).await;
     assert!(matches!(
         install::install(&mut installer, DEFAULT_SCHEMA, &spec, None)

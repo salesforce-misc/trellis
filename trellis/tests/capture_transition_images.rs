@@ -42,7 +42,6 @@ async fn capture(client: &mut Client, table: &str, columns: &[&str]) {
         table,
         vec!["id".to_string()],
         columns.iter().map(|c| c.to_string()),
-        Vec::new(),
     )
     .expect("valid spec");
     match install::install(client, DEFAULT_SCHEMA, &spec, None)
@@ -800,7 +799,6 @@ async fn a_composite_key_cascade_sums_once() {
         "public.ck",
         vec!["a".to_string(), "id".to_string()],
         ["pa", "pid", "v"].iter().map(|c| c.to_string()),
-        Vec::new(),
     )
     .expect("valid spec");
     match install::install(&mut client, DEFAULT_SCHEMA, &spec, None)

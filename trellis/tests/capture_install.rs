@@ -86,7 +86,6 @@ fn spec_of_t(columns: &[&str]) -> CaptureSpec {
         "public.t",
         vec!["id".to_string()],
         columns.iter().map(|c| c.to_string()),
-        Vec::new(),
     )
     .expect("valid spec")
 }
@@ -455,8 +454,7 @@ async fn install_t_named(client: &mut Client, table: &str) -> CaptureSpec {
         .batch_execute(&format!("create table {table} (id text primary key)"))
         .await
         .expect("create table");
-    let spec = CaptureSpec::new(table, vec!["id".to_string()], Vec::new(), Vec::new())
-        .expect("valid spec");
+    let spec = CaptureSpec::new(table, vec!["id".to_string()], Vec::new()).expect("valid spec");
     landed(
         install::install(client, DEFAULT_SCHEMA, &spec, None)
             .await

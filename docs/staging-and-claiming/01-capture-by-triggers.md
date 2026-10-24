@@ -71,8 +71,6 @@ segment with one `INSERT … SELECT`:
   imaged, so a join move alone always stages. A statement trigger can't take
   a `WHEN` clause when it has transition tables, so the filter is in the
   function.
-- **`group_key`** is the union of every outbound relationship's `from_col`
-  across OLD, NEW and the live row.
 - **`row_txid`** is the ring's default, `pg_current_xact_id()`: the source
   commit's own `xid8` (exact identity, invariant I0).
 - **`lsn` and `origin_lsn`** are `pg_current_wal_insert_lsn()` when the
@@ -101,7 +99,7 @@ names, then the partitions under that table, a parent before its children.
   does: the target is cleared once.
 - **A leaf's or middle's truncate** stages a `node_truncate` marker instead
   (key `\x1ftrellis-node-truncate`, `new_image` `{"node":
-  "<schema>.<table>", "oid": <oid>}`, no `old_image` or `group_key`). It
+  "<schema>.<table>", "oid": <oid>}`, no `old_image`). It
   raises no truncate floor, is no barrier, and the fold leaves it out. The
   seal queues a `truncated` correction of the node for each marker in the
   segment's fenced window, in the statement that publishes the fence
@@ -179,7 +177,7 @@ Two things could put one in front of it, and the pass rules out both:
 1. **Rows the replaced function staged.** A widen records a capture gate on
    its marker, the insert position read while it holds the table lock. The
    marker's discharge waits until no change to the table at or below the gate
-   is pending (deferred relationship reverses included).
+   is pending.
 2. **A table it reads through a relationship.** A definition sourced from `U`
    that reads a column of `T` waits on `U`'s marker, which `T`'s gate doesn't
    hold. So a definition is dispatched only once every table it reads is

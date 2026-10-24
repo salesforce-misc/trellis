@@ -50,7 +50,6 @@ fn spec() -> CaptureSpec {
         "public.r",
         vec!["id".to_string(), "region".to_string()],
         ["v".to_string()],
-        Vec::new(),
     )
     .expect("valid spec")
     .with_partitioned(true)
@@ -405,8 +404,7 @@ async fn markers_since(client: &Client, skip: i64) -> Vec<String> {
             &format!(
                 "select new_image ->> 'node', \
                         (new_image ->> 'oid')::bigint = to_regclass(new_image ->> 'node')::oid::bigint, \
-                        key = chr(31) || 'trellis-node-truncate', old_image is null, \
-                        group_key is null \
+                        key = chr(31) || 'trellis-node-truncate', old_image is null \
                  from {RING} s where op = 'node_truncate' \
                  order by lsn, change_id offset $1"
             ),
@@ -419,7 +417,7 @@ async fn markers_since(client: &Client, skip: i64) -> Vec<String> {
             let node: String = row.get(0);
             assert!(row.get::<_, bool>(1), "{node}: the oid is the node's");
             assert!(row.get::<_, bool>(2), "{node}: the marker's key");
-            assert!(row.get::<_, bool>(3) && row.get::<_, bool>(4), "{node}");
+            assert!(row.get::<_, bool>(3), "{node}");
             node
         })
         .collect()
@@ -667,14 +665,9 @@ async fn measure_per_write_capture_cost_against_a_plain_table() {
             ddl
         };
         client.batch_execute(&ddl).await.expect("table");
-        let spec = CaptureSpec::new(
-            "public.r",
-            vec!["id".to_string()],
-            ["v".to_string()],
-            Vec::new(),
-        )
-        .expect("spec")
-        .with_partitioned(leaves > 0);
+        let spec = CaptureSpec::new("public.r", vec!["id".to_string()], ["v".to_string()])
+            .expect("spec")
+            .with_partitioned(leaves > 0);
         if captured {
             match install::install(&mut client, DEFAULT_SCHEMA, &spec, None)
                 .await

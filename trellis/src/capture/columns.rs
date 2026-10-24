@@ -22,10 +22,7 @@
 //!    `WHERE` accepts only `TRUE` today, so no filter reads a column.
 //! 3. **`from_col` of every relationship declared on `T`**, whether or not a
 //!    definition uses it. A reader's relationship path looks its related row
-//!    up by it. The ring's `group_key` (#133) is built from it. Apply's
-//!    reverse guard also scans ring images for it
-//!    (`staging::apply::from_side_change_in_flight`), and a missing value
-//!    there silently passes the guard.
+//!    up by it.
 //! 4. **For every relationship whose to-side is `T`:**
 //!    - its `to_col`. A to-side row's reverse path re-derives the children
 //!      of every join value its batch's rows touched, including ones the
@@ -33,9 +30,7 @@
 //!      inside one batch, or re-keyed through a value and on (#784). A child
 //!      may have read the parent live under that value in between. When the
 //!      `to_col` is `T`'s whole primary key, the ring key is that value.
-//!      When it isn't, the fold unions its values out of every raw row's new
-//!      image (`staging::fold`'s `to_col_values`, #785), so the images must
-//!      carry it;
+//!      When it isn't, the images must carry it;
 //!    - every to-side column a definition reads through it
 //!      ([`crate::defs::eval::relationship_references`], fields and `GROUP
 //!      BY`);
@@ -112,9 +107,6 @@ impl CaptureReader {
 pub struct ReadColumns {
     /// Every column an image must carry.
     pub columns: BTreeSet<String>,
-    /// The subset whose values make up the ring's `group_key`: every
-    /// outbound relationship's `from_col`.
-    pub group_key: BTreeSet<String>,
 }
 
 /// The columns [`CaptureCatalog`]'s readers need from `table`'s images
@@ -132,7 +124,6 @@ pub fn read_columns(catalog: &CaptureCatalog, table: &str) -> ReadColumns {
     for rel in &catalog.relationships {
         if rel.qualified_from_table() == table {
             read.columns.insert(rel.def.from_col.clone());
-            read.group_key.insert(rel.def.from_col.clone());
         }
         if rel.qualified_to_table() == table {
             read.columns.insert(rel.def.to_col.clone());
@@ -407,11 +398,8 @@ pub async fn capture_spec(
         // Only a relationship nothing reads through, or a projection column
         // no definition reads, still names it: image what's left.
         read.columns.retain(|c| !missing.contains(c));
-        read.group_key.retain(|c| !missing.contains(c));
     }
-    let mut group_key: Vec<String> = read.group_key.into_iter().collect();
-    group_key.sort_by_key(|c| attnums[c]);
-    Ok(CaptureSpec::new(table, key, read.columns, group_key)?.with_partitioned(partitioned))
+    Ok(CaptureSpec::new(table, key, read.columns)?.with_partitioned(partitioned))
 }
 
 #[cfg(test)]
@@ -483,7 +471,6 @@ mod tests {
         );
         let read = read_columns(&catalog, "public.orders");
         assert_eq!(read.columns, set(&["amount", "tax"]));
-        assert!(read.group_key.is_empty());
         assert_eq!(
             read_columns(&catalog, "public.other"),
             ReadColumns::default()
@@ -578,7 +565,7 @@ mod tests {
     }
 
     #[test]
-    fn a_from_side_images_every_relationships_from_col_as_a_group_key() {
+    fn a_from_side_images_every_relationships_from_col() {
         let catalog = catalog(
             &[(
                 "public.posts",
@@ -592,7 +579,7 @@ mod tests {
                     ("public", "users", "id"),
                     RelationshipCardinality::ToOne,
                 ),
-                // Declared but unused: its from_col is still a group key.
+                // Declared but unused: its from_col is still imaged.
                 rel(
                     2,
                     "editor",
@@ -604,7 +591,6 @@ mod tests {
         );
         let read = read_columns(&catalog, "public.posts");
         assert_eq!(read.columns, set(&["author_id", "editor_id", "title"]));
-        assert_eq!(read.group_key, set(&["author_id", "editor_id"]));
     }
 
     #[test]
@@ -654,7 +640,6 @@ mod tests {
             read.columns,
             set(&["country", "name", "retired_col", "user_id"])
         );
-        assert!(read.group_key.is_empty(), "a to-side has no group key");
     }
 
     /// `a_to_side_images_its_to_col_and_every_column_read_through_it`'s
@@ -766,7 +751,6 @@ mod tests {
         assert_eq!(read.columns, set(&["amount", "user_id"]));
         let from = read_columns(&catalog, "public.users");
         assert_eq!(from.columns, set(&["id"]));
-        assert_eq!(from.group_key, set(&["id"]));
     }
 
     #[test]
@@ -796,11 +780,9 @@ mod tests {
         );
         let posts = read_columns(&catalog, "public.posts");
         assert_eq!(posts.columns, set(&["author_id", "id", "title"]));
-        assert_eq!(posts.group_key, set(&["author_id"]));
         let users = read_columns(&catalog, "public.users");
         assert_eq!(users.columns, set(&["id"]));
         let comments = read_columns(&catalog, "public.comments");
         assert_eq!(comments.columns, set(&["post_id"]));
-        assert_eq!(comments.group_key, set(&["post_id"]));
     }
 }
