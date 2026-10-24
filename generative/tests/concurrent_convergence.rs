@@ -1462,8 +1462,8 @@ const STALE_ONE_TO_ONE_MISS: &str = "stale_one_to_one_write";
 
 /// The cooling-key tier's known misses.
 const COOLING_KEY_MISSES: &[&str] = &[];
-/// The known misses of the tiers built on the hot-key case: hot-key,
-/// mid-burst and steady-load.
+/// The known misses of the tiers built on the hot-key case: hot-key and
+/// mid-burst (and steady-load's, [`STEADY_LOAD_MISSES`]).
 const HOT_KEY_BASED_MISSES: &[&str] = &[STALE_ONE_TO_ONE_MISS];
 
 /// `lsn_only_skip` (#623 D3, ADR-0002 I2), which no tier gates: a
@@ -1609,34 +1609,85 @@ const ONE_TO_ONE_PINNED_WITH_THE_GROUP_BASIS_ON: &[(&str, &str)] = &[
 const NO_JOIN: &str = "the concurrent tier draws no `JOIN`; the JOIN tier \
                        (join_convergence.rs, join_planted_bugs_are_caught) gates it";
 
-/// The group-basis plants a tier without builds or rebuilds under load
-/// doesn't gate: each needs an absolute write (a build, a resume, a
-/// `request_backfill`) racing the tier's pages.
+/// Measured catch rates of the group-basis plants (#1114, 4 seeds x 12
+/// cases per tier, logbook `20261024T051124-a-sweep`): `gb_skip_group_lock`
+/// 24 to 44 of 48 in every tier; `gb_fold_sides_per_key` 48 of 48 in the
+/// steady-load, mid-burst and cooling-backfill tiers; `gb_lsn_not_visibility`
+/// 12 and 10 of 48 in the steady-load and mid-burst tiers;
+/// `gb_build_snapshot_before_locks` 5 of 48 in the steady-load tier, whose
+/// stall holds a build between its enumeration and its locks; and
+/// `gb_early_zero_gc` in none (see [`EARLY_ZERO_GC_MISS`]).
+///
+/// The cooling-key and hot-key tiers run no absolute write after the first
+/// writes, so they gate only `gb_skip_group_lock`.
 const NO_ABSOLUTE_WRITE_UNDER_LOAD: &[(&str, &str)] = &[
     (
         "gb_build_snapshot_before_locks",
         "it needs a build or rebuild whose groups a page changes between its \
          enumeration and its locks, and the tier installs and resumes nothing \
-         mid-burst; the mid-burst, steady-load and cooling-backfill tiers gate it",
+         mid-burst; the steady-load tier gates it",
     ),
     (
         "gb_lsn_not_visibility",
         "it needs a basis taken while a writer to its group is in flight, and \
          only an absolute write takes one, which this tier runs only before the \
-         first writes; the mid-burst, steady-load and cooling-backfill tiers gate it",
+         first writes; the steady-load and mid-burst tiers gate it",
     ),
     (
         "gb_fold_sides_per_key",
-        "a fold only goes wrong across a basis taken between two of a key's \
-         changes, and only an absolute write takes one, which this tier runs only \
-         before the first writes; the mid-burst, steady-load and cooling-backfill \
-         tiers gate it",
+        "not measured here; the steady-load, mid-burst and cooling-backfill tiers \
+         gate it (48 of 48 cases each)",
     ),
     (
         "gb_early_zero_gc",
         "it needs a zero group whose basis saw a change not yet drained, and only \
          an absolute write takes one, which this tier runs only before the first \
-         writes; the mid-burst, steady-load and cooling-backfill tiers gate it",
+         writes; the steady-load tier runs it as a known miss",
+    ),
+];
+
+/// Why no tier catches `gb_early_zero_gc` yet (#1114): it needs the GC pass
+/// to meet a zero group whose stamp is past the drained prefix (an absolute
+/// write's zero group with a change it saw still undrained) and then a page
+/// of that change to land on the fresh row; the plant changed the GC's
+/// choice in 0 to 4 of 48 cases per tier and the tiers caught none. The
+/// deterministic pins (`group_basis_interleavings`'s `r4_…`,
+/// `join_interleavings`'s `family13_…`) gate it meanwhile.
+const EARLY_ZERO_GC_MISS: &str = "gb_early_zero_gc";
+
+/// The steady-load tier's known misses.
+const STEADY_LOAD_MISSES: &[&str] = &[STALE_ONE_TO_ONE_MISS, EARLY_ZERO_GC_MISS];
+
+/// The mid-burst tier's group-basis plants it doesn't gate.
+const MID_BURST_GROUP_BASIS: &[(&str, &str)] = &[
+    (
+        "gb_build_snapshot_before_locks",
+        "it fired in 48 of 48 cases and was caught in none: a page has to commit \
+         between a build's enumeration and its locks, and only the steady-load \
+         tier's stall holds a build there; the steady-load tier gates it",
+    ),
+    (
+        "gb_early_zero_gc",
+        "it fired in 0 of 48 cases; the steady-load tier runs it as a known miss",
+    ),
+];
+
+/// The cooling-backfill tier's group-basis plants it doesn't gate.
+const COOLING_BACKFILL_GROUP_BASIS: &[(&str, &str)] = &[
+    (
+        "gb_build_snapshot_before_locks",
+        "it fired in 48 of 48 cases and was caught in none: a page has to commit \
+         between a rebuild's enumeration and its locks, and only the steady-load \
+         tier's stall holds a build there; the steady-load tier gates it",
+    ),
+    (
+        "gb_lsn_not_visibility",
+        "it fired in 0 of 48 cases: no rebuild's basis caught a writer of its \
+         groups in flight; the steady-load and mid-burst tiers gate it",
+    ),
+    (
+        "gb_early_zero_gc",
+        "it fired in 0 of 48 cases; the steady-load tier runs it as a known miss",
     ),
 ];
 
@@ -1713,14 +1764,14 @@ fn sweep_tier_named(name: &str) -> Option<(SweepTier, BoxedStrategy<ConcurrentCa
             SweepTier {
                 name: "mid_burst",
                 known_misses: HOT_KEY_BASED_MISSES,
-                not_gated: not_gated(MID_BURST_NOT_GATED),
+                not_gated: not_gated(&[MID_BURST_NOT_GATED, MID_BURST_GROUP_BASIS].concat()),
             },
             mid_burst_case().boxed(),
         ),
         "steady_load" => (
             SweepTier {
                 name: "steady_load",
-                known_misses: HOT_KEY_BASED_MISSES,
+                known_misses: STEADY_LOAD_MISSES,
                 not_gated: not_gated(STEADY_LOAD_NOT_GATED),
             },
             steady_load_case().boxed(),
@@ -1729,7 +1780,9 @@ fn sweep_tier_named(name: &str) -> Option<(SweepTier, BoxedStrategy<ConcurrentCa
             SweepTier {
                 name: "cooling_backfill",
                 known_misses: &[],
-                not_gated: not_gated(COOLING_BACKFILL_NOT_GATED),
+                not_gated: not_gated(
+                    &[COOLING_BACKFILL_NOT_GATED, COOLING_BACKFILL_GROUP_BASIS].concat(),
+                ),
             },
             cooling_backfill_case().boxed(),
         ),

@@ -347,22 +347,38 @@ proptest! {
 /// The `JOIN` tier's sweep: the plants a `JOIN` page or build can reach are
 /// gated (the `JOIN` plants and the group-basis writer's, which `P` and `M`
 /// share); the others break paths the tier never takes.
+///
+/// Measured (#1114, 4 seeds x 12 cases, logbook `20261024T051124-a-sweep`):
+/// `join_drop_flip` caught in 33 of 48, `gb_fold_sides_per_key` 27,
+/// `join_other_side_before_j` 6. Known misses: `join_no_j_lock` and
+/// `join_t_skip_lock` fired in 27 to 31 of 48 cases and were caught in none,
+/// with or without the commit stall: their race needs two pages of one key's
+/// opposite sides (or one `T` group) to read each other's uncommitted state,
+/// which the tier's pages, each a burst's many keys, rarely line up; and
+/// `gb_early_zero_gc` fired in 1. The deterministic pins named in
+/// `trellis/src/plant.rs` gate them meanwhile.
 fn join_sweep_tier() -> SweepTier {
     use generative::plant_sweep::{PlantPath, not_on_path};
+    let mut not_gated: Vec<(&'static str, &'static str)> = vec![(
+        "gb_lsn_not_visibility",
+        "it fired in 0 of 48 cases: no build's basis caught a writer of its cells in \
+         flight (the tier's writes are single statements); the concurrent tier's \
+         steady-load and mid-burst tiers gate it",
+    )];
+    not_gated.extend(not_on_path(
+        &[
+            PlantPath::Ledger,
+            PlantPath::OneToOne,
+            PlantPath::OneToOneOrLedger,
+            PlantPath::GroupBasis,
+        ],
+        "it breaks a 1-1, ledger or plain group-basis aggregate path, and the JOIN tier \
+             draws only JOIN definitions",
+    ));
     SweepTier {
         name: generative::baseline_quarantine::JOIN_TIER,
-        known_misses: &[],
-        not_gated: not_on_path(
-            &[
-                PlantPath::Ledger,
-                PlantPath::OneToOne,
-                PlantPath::OneToOneOrLedger,
-                PlantPath::GroupBasis,
-            ],
-            "it breaks a 1-1, ledger or plain group-basis aggregate path, and the JOIN tier \
-             draws only JOIN definitions",
-        )
-        .collect(),
+        known_misses: &["join_no_j_lock", "join_t_skip_lock", "gb_early_zero_gc"],
+        not_gated,
     }
 }
 
@@ -399,12 +415,16 @@ fn join_planted_bugs_are_caught() {
     );
 }
 
+/// Every `JOIN` plant and every group-basis writer plant is run by the tier
+/// (gated or a known miss), except `gb_lsn_not_visibility`, which the tier
+/// never reaches; nothing else is.
 #[test]
-fn the_join_tier_gates_every_join_plant() {
+fn the_join_tier_runs_every_join_plant() {
     use trellis::dev::plant::Plant;
     let tier = join_sweep_tier();
     for plant in Plant::ALL {
-        let gated = !tier.not_gated.iter().any(|(name, _)| *name == plant.name());
+        let gated = !tier.not_gated.iter().any(|(name, _)| *name == plant.name())
+            || plant.name() == "gb_lsn_not_visibility";
         let path = generative::plant_sweep::plant_path(*plant);
         assert_eq!(
             gated,
