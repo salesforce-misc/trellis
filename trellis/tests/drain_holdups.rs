@@ -40,7 +40,8 @@ struct Instance {
     trellis: trellis::Trellis,
 }
 
-/// `public.p` (3 rows), `public.c` (6 rows, `pid` naming a `p`) and
+/// `public.p` (3 rows), `public.c` (6 rows, `pid` naming a `p`, indexed so a
+/// `JOIN` on it defines) and
 /// `public.q` (6 rows), owned by `holdup_trellis`, which runs Trellis; and
 /// `ddl`'s definitions, live, with nothing left to drain.
 async fn instance(cluster: &TestCluster, ddl: &[&str]) -> Instance {
