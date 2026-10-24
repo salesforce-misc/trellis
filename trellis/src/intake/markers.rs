@@ -4097,11 +4097,12 @@ mod dispatch_tests {
         assert!(markers(&client).await.is_empty());
     }
 
-    /// An aggregate waiting on the discharge gets one direct-build job
-    /// (issue #419), committed with its move to `backfilling`, and nothing is
-    /// enumerated into the ring: the job reads the source itself.
+    /// An aggregate waiting on the discharge (one held out of its plan job)
+    /// is rebuilt by the ring enumeration, flipped `live` in the discharge's
+    /// own transaction, with no build job: the group basis applies the
+    /// enumeration's image-less recomputes.
     #[tokio::test]
-    async fn an_aggregate_waiting_on_the_discharge_gets_a_direct_build_job() {
+    async fn an_aggregate_waiting_on_the_discharge_is_rebuilt_by_the_ring() {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
         let mut client = connect(&db).await;
@@ -4117,20 +4118,11 @@ mod dispatch_tests {
         reconcile(&mut client, &["public.orders"]).await;
 
         discharge(&mut client).await;
-        assert_eq!(status(&client, id).await, "backfilling");
-        assert_eq!(chunks(&client, id).await, 1);
-        let unbounded: bool = client
-            .query_one(
-                "select hi is null and lo is null from backfill_chunks where definition_id = $1",
-                &[&id],
-            )
-            .await
-            .expect("read the job")
-            .get(0);
-        assert!(unbounded, "the job builds the whole definition");
+        assert_eq!(status(&client, id).await, "live");
+        assert_eq!(chunks(&client, id).await, 0, "no build job");
         assert!(
-            !staged(&client).await,
-            "the source is not enumerated into the ring"
+            staged(&client).await,
+            "the source is enumerated into the ring"
         );
         assert!(markers(&client).await.is_empty());
     }
