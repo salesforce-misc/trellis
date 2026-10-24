@@ -58,15 +58,15 @@ impl Flavour {
     fn definition(self) -> &'static str {
         match self {
             Flavour::Aggregate => {
-                "TRANSFORM agg FROM public.src GROUP BY g SELECT SUM(v) AS total, COUNT(*) AS n"
+                "TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n"
             }
             Flavour::AggregateAvg => {
                 "TRANSFORM agg FROM public.src GROUP BY g \
-                 SELECT SUM(v) AS total, AVG(v) AS mean, COUNT(v) AS nv, COUNT(*) AS n"
+                WITHOUT SOURCE INDEX SELECT SUM(v) AS total, AVG(v) AS mean, COUNT(v) AS nv, COUNT(*) AS n"
             }
             Flavour::AggregateMinMax => {
                 "TRANSFORM agg FROM public.src GROUP BY g \
-                 SELECT MIN(v) AS lo, MAX(v) AS hi, COUNT(*) AS n"
+                WITHOUT SOURCE INDEX SELECT MIN(v) AS lo, MAX(v) AS hi, COUNT(*) AS n"
             }
             Flavour::OneToOne => "TRANSFORM one FROM public.src SELECT g AS g, v AS v",
         }
@@ -194,11 +194,15 @@ async fn pause_points_fire_in_page_order(flavour: Flavour) {
 
 #[tokio::test]
 async fn pause_points_fire_in_page_order_aggregate() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     pause_points_fire_in_page_order(Flavour::Aggregate).await;
 }
 
 #[tokio::test]
 async fn pause_points_fire_in_page_order_one_to_one() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     pause_points_fire_in_page_order(Flavour::OneToOne).await;
 }
 
@@ -257,21 +261,29 @@ async fn exp2_2b(flavour: Flavour) {
 
 #[tokio::test]
 async fn exp2_2_aggregate() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     exp2_2(Flavour::Aggregate).await;
 }
 
 #[tokio::test]
 async fn exp2_2_one_to_one() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     exp2_2(Flavour::OneToOne).await;
 }
 
 #[tokio::test]
 async fn exp2_2b_aggregate() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     exp2_2b(Flavour::Aggregate).await;
 }
 
 #[tokio::test]
 async fn exp2_2b_one_to_one() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     exp2_2b(Flavour::OneToOne).await;
 }
 
@@ -294,16 +306,22 @@ async fn exp2_3(flavour: Flavour) {
 
 #[tokio::test]
 async fn exp2_3_aggregate() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     exp2_3(Flavour::Aggregate).await;
 }
 
 #[tokio::test]
 async fn exp2_3_aggregate_avg() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     exp2_3(Flavour::AggregateAvg).await;
 }
 
 #[tokio::test]
 async fn exp2_3_aggregate_min_max() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     exp2_3(Flavour::AggregateMinMax).await;
 }
 
@@ -381,16 +399,22 @@ async fn exp2_4(flavour: Flavour) {
 
 #[tokio::test]
 async fn exp2_4_aggregate() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     exp2_4(Flavour::Aggregate).await;
 }
 
 #[tokio::test]
 async fn exp2_4_aggregate_avg() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     exp2_4(Flavour::AggregateAvg).await;
 }
 
 #[tokio::test]
 async fn exp2_4_aggregate_min_max() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     exp2_4(Flavour::AggregateMinMax).await;
 }
 
@@ -434,6 +458,8 @@ async fn exp2_5(flavour: Flavour) {
 /// On the ledger a Re-derive of key 5 writes only key 5's entry.
 #[tokio::test]
 async fn exp2_5_aggregate() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     exp2_5(Flavour::Aggregate).await;
 }
 
@@ -441,6 +467,8 @@ async fn exp2_5_aggregate() {
 /// `(2,50,50,1)`, for the same reason as [`exp2_5_aggregate`].
 #[tokio::test]
 async fn exp2_5_aggregate_min_max() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     exp2_5(Flavour::AggregateMinMax).await;
 }
 
@@ -465,11 +493,15 @@ async fn exp2_5b(flavour: Flavour) {
 /// older than the entry's `applied_lsn`, is skipped.
 #[tokio::test]
 async fn exp2_5b_aggregate() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     exp2_5b(Flavour::Aggregate).await;
 }
 
 #[tokio::test]
 async fn exp2_5b_one_to_one() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     exp2_5b(Flavour::OneToOne).await;
 }
 
@@ -540,41 +572,57 @@ async fn exp2_9d(flavour: Flavour) {
 
 #[tokio::test]
 async fn exp2_9_aggregate() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     exp2_9(Flavour::Aggregate).await;
 }
 
 #[tokio::test]
 async fn exp2_9_one_to_one() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     exp2_9(Flavour::OneToOne).await;
 }
 
 #[tokio::test]
 async fn exp2_9b_aggregate() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     exp2_9b(Flavour::Aggregate).await;
 }
 
 #[tokio::test]
 async fn exp2_9b_one_to_one() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     exp2_9b(Flavour::OneToOne).await;
 }
 
 #[tokio::test]
 async fn exp2_9c_aggregate() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     exp2_9c(Flavour::Aggregate).await;
 }
 
 #[tokio::test]
 async fn exp2_9c_one_to_one() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     exp2_9c(Flavour::OneToOne).await;
 }
 
 #[tokio::test]
 async fn exp2_9d_aggregate() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     exp2_9d(Flavour::Aggregate).await;
 }
 
 #[tokio::test]
 async fn exp2_9d_one_to_one() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     exp2_9d(Flavour::OneToOne).await;
 }
 
@@ -592,6 +640,8 @@ async fn exp2_9d_one_to_one() {
 /// half, is load-bearing for a 1-1 target.
 #[tokio::test]
 async fn a_rederive_absorbed_update_leaves_an_older_capture_skippable_only_by_visibility() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let flavour = Flavour::OneToOne;
     let mut d = start(flavour, &[(1, 1, 10), (2, 1, 20)]).await;
     write(&d, "update public.src set v = 15 where id = 1").await;
@@ -669,16 +719,22 @@ async fn stage_pre_truncate_insert(d: &Driver, key: &str, image: &str) {
 
 #[tokio::test]
 async fn a_change_from_before_a_truncate_does_not_bring_back_a_one_to_one_row() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     a_change_from_before_a_truncate_does_not_come_back(Flavour::OneToOne).await;
 }
 
 #[tokio::test]
 async fn a_change_from_before_a_truncate_does_not_bring_back_an_aggregate_entry() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     a_change_from_before_a_truncate_does_not_come_back(Flavour::Aggregate).await;
 }
 
 #[tokio::test]
 async fn a_change_from_before_a_truncate_does_not_bring_back_a_min_max_entry() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     a_change_from_before_a_truncate_does_not_come_back(Flavour::AggregateMinMax).await;
 }
 
@@ -727,11 +783,15 @@ async fn a_dropped_placeholder_lets_a_queued_insert_write_the_entry(flavour: Fla
 
 #[tokio::test]
 async fn a_dropped_placeholder_lets_a_queued_insert_write_the_entry_aggregate() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     a_dropped_placeholder_lets_a_queued_insert_write_the_entry(Flavour::Aggregate).await;
 }
 
 #[tokio::test]
 async fn a_dropped_placeholder_lets_a_queued_insert_write_the_entry_one_to_one() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     a_dropped_placeholder_lets_a_queued_insert_write_the_entry(Flavour::OneToOne).await;
 }
 
@@ -766,11 +826,15 @@ async fn a_truncate_then_an_insert_in_one_transaction_keeps_the_insert(flavour: 
 
 #[tokio::test]
 async fn a_truncate_then_an_insert_in_one_transaction_keeps_the_one_to_one_row() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     a_truncate_then_an_insert_in_one_transaction_keeps_the_insert(Flavour::OneToOne).await;
 }
 
 #[tokio::test]
 async fn a_truncate_then_an_insert_in_one_transaction_keeps_the_aggregate_entry() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     a_truncate_then_an_insert_in_one_transaction_keeps_the_insert(Flavour::Aggregate).await;
 }
 
@@ -782,6 +846,8 @@ async fn a_truncate_then_an_insert_in_one_transaction_keeps_the_aggregate_entry(
 /// with no floor.
 #[tokio::test]
 async fn a_truncate_without_an_lsn_halts_instead_of_clearing_without_a_floor() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let d = start(Flavour::OneToOne, &[(1, 1, 10)]).await;
     let truncate = trellis::staging::FoldedChange {
         src_table: SRC.to_string(),
@@ -843,11 +909,15 @@ async fn exp2_10(flavour: Flavour) {
 
 #[tokio::test]
 async fn exp2_10_aggregate() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     exp2_10(Flavour::Aggregate).await;
 }
 
 #[tokio::test]
 async fn exp2_10_one_to_one() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     exp2_10(Flavour::OneToOne).await;
 }
 
@@ -880,16 +950,22 @@ async fn issue_389(flavour: Flavour) {
 
 #[tokio::test]
 async fn issue_389_aggregate() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     issue_389(Flavour::Aggregate).await;
 }
 
 #[tokio::test]
 async fn issue_389_aggregate_avg() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     issue_389(Flavour::AggregateAvg).await;
 }
 
 #[tokio::test]
 async fn issue_389_aggregate_min_max() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     issue_389(Flavour::AggregateMinMax).await;
 }
 
@@ -925,11 +1001,15 @@ async fn issue_392(flavour: Flavour) {
 
 #[tokio::test]
 async fn issue_392_aggregate() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     issue_392(Flavour::Aggregate).await;
 }
 
 #[tokio::test]
 async fn issue_392_one_to_one() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     issue_392(Flavour::OneToOne).await;
 }
 
@@ -953,16 +1033,22 @@ async fn issue_494(flavour: Flavour) {
 /// oracle's `(2,50,1)`.
 #[tokio::test]
 async fn issue_494_aggregate() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     issue_494(Flavour::Aggregate).await;
 }
 
 #[tokio::test]
 async fn issue_494_aggregate_avg() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     issue_494(Flavour::AggregateAvg).await;
 }
 
 #[tokio::test]
 async fn issue_494_aggregate_min_max() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     issue_494(Flavour::AggregateMinMax).await;
 }
 
@@ -988,16 +1074,22 @@ async fn issue_539(flavour: Flavour) {
 
 #[tokio::test]
 async fn issue_539_aggregate() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     issue_539(Flavour::Aggregate).await;
 }
 
 #[tokio::test]
 async fn issue_539_aggregate_avg() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     issue_539(Flavour::AggregateAvg).await;
 }
 
 #[tokio::test]
 async fn issue_539_aggregate_min_max() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     issue_539(Flavour::AggregateMinMax).await;
 }
 
@@ -1038,11 +1130,15 @@ async fn issue_550(flavour: Flavour) {
 /// the release stages a Re-derive of key 1 and discards the parked rows.
 #[tokio::test]
 async fn issue_550_aggregate() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     issue_550(Flavour::Aggregate).await;
 }
 
 #[tokio::test]
 async fn issue_550_one_to_one() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     issue_550(Flavour::OneToOne).await;
 }
 
@@ -1077,6 +1173,8 @@ async fn nested_same_key(flavour: Flavour) {
 /// the live row, so the outer statement's row carries group 2.
 #[tokio::test]
 async fn nested_same_key_aggregate() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     nested_same_key(Flavour::Aggregate).await;
 }
 
@@ -1085,6 +1183,8 @@ async fn nested_same_key_aggregate() {
 /// was key 1 in group 1. Capture now images the live row.
 #[tokio::test]
 async fn nested_same_key_one_to_one() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     nested_same_key(Flavour::OneToOne).await;
 }
 
@@ -1268,11 +1368,15 @@ async fn assert_chunk_bases(d: &Driver, flavour: Flavour, w_in: &str, w_between:
 
 #[tokio::test]
 async fn chunked_read_exact_point_aggregate() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     chunked_read_exact_point(Flavour::Aggregate).await;
 }
 
 #[tokio::test]
 async fn chunked_read_exact_point_one_to_one() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     chunked_read_exact_point(Flavour::OneToOne).await;
 }
 
@@ -1286,6 +1390,8 @@ async fn chunked_read_exact_point_one_to_one() {
 /// and grows group 2, so the chained groups by `n` see each kind of prior.
 #[tokio::test]
 async fn a_chained_reader_follows_groups_emptied_and_refilled_in_one_page() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     // An integer `g`: a numeric group key can't key a chained reader.
     let int4 = ValueType::Integer(trellis::integer::IntWidth::Int4);
     let mut d = Driver::start(
@@ -1298,7 +1404,7 @@ async fn a_chained_reader_follows_groups_emptied_and_refilled_in_one_page() {
     .await;
     trellis::defs::install_definition(
         d.pool(),
-        "TRANSFORM hi FROM public.agg GROUP BY n SELECT MAX(total) AS top",
+        "TRANSFORM hi FROM public.agg GROUP BY n WITHOUT SOURCE INDEX SELECT MAX(total) AS top",
         &std::collections::HashMap::from([
             ("g".to_string(), int4),
             ("total".to_string(), ValueType::Numeric),
@@ -1350,6 +1456,8 @@ async fn a_chained_reader_follows_groups_emptied_and_refilled_in_one_page() {
 /// plant as `not_gated` and points here (#734).
 #[tokio::test]
 async fn a_change_the_rederive_read_is_not_applied_again_aggregate() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let flavour = Flavour::Aggregate;
     let mut d = start(flavour, &[(1, 1, 10), (2, 1, 20)]).await;
     write(&d, "update public.src set v = 15 where id = 1").await;
@@ -1371,6 +1479,8 @@ async fn a_change_the_rederive_read_is_not_applied_again_aggregate() {
 /// `(1.5, NULL, 0)`.
 #[tokio::test]
 async fn a_group_emptied_through_another_spelling_of_its_key_is_deleted() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let int4 = ValueType::Integer(trellis::integer::IntWidth::Int4);
     let mut d = Driver::start(
         "create table public.src (id integer primary key, g numeric, v numeric); \
@@ -1401,6 +1511,8 @@ async fn a_group_emptied_through_another_spelling_of_its_key_is_deleted() {
 /// range`.
 #[tokio::test]
 async fn the_minimum_integer_contribution_leaves_its_group() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let int4 = ValueType::Integer(trellis::integer::IntWidth::Int4);
     let mut d = Driver::start(
         "create table public.src (id integer primary key, g integer, v integer); \
@@ -1425,66 +1537,92 @@ async fn the_minimum_integer_contribution_leaves_its_group() {
 
 #[tokio::test]
 async fn pause_points_fire_in_page_order_aggregate_avg() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     pause_points_fire_in_page_order(Flavour::AggregateAvg).await;
 }
 
 #[tokio::test]
 async fn exp2_2_aggregate_avg() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     exp2_2(Flavour::AggregateAvg).await;
 }
 
 #[tokio::test]
 async fn exp2_2b_aggregate_avg() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     exp2_2b(Flavour::AggregateAvg).await;
 }
 
 #[tokio::test]
 async fn exp2_5_aggregate_avg() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     exp2_5(Flavour::AggregateAvg).await;
 }
 
 #[tokio::test]
 async fn exp2_5b_aggregate_avg() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     exp2_5b(Flavour::AggregateAvg).await;
 }
 
 #[tokio::test]
 async fn exp2_9_aggregate_avg() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     exp2_9(Flavour::AggregateAvg).await;
 }
 
 #[tokio::test]
 async fn exp2_9b_aggregate_avg() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     exp2_9b(Flavour::AggregateAvg).await;
 }
 
 #[tokio::test]
 async fn exp2_9c_aggregate_avg() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     exp2_9c(Flavour::AggregateAvg).await;
 }
 
 #[tokio::test]
 async fn exp2_9d_aggregate_avg() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     exp2_9d(Flavour::AggregateAvg).await;
 }
 
 #[tokio::test]
 async fn exp2_10_aggregate_avg() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     exp2_10(Flavour::AggregateAvg).await;
 }
 
 #[tokio::test]
 async fn issue_392_aggregate_avg() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     issue_392(Flavour::AggregateAvg).await;
 }
 
 #[tokio::test]
 async fn issue_550_aggregate_avg() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     issue_550(Flavour::AggregateAvg).await;
 }
 
 #[tokio::test]
 async fn chunked_read_exact_point_aggregate_avg() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     chunked_read_exact_point(Flavour::AggregateAvg).await;
 }
 
@@ -1497,6 +1635,8 @@ async fn chunked_read_exact_point_aggregate_avg() {
 /// `numeric`s of three scales, including removing the widest.
 #[tokio::test]
 async fn avg_equals_postgres_avg_over_integer_bigint_and_numeric() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let int4 = ValueType::Integer(trellis::integer::IntWidth::Int4);
     let int8 = ValueType::Integer(trellis::integer::IntWidth::Int8);
     let mut d = Driver::start(
@@ -1516,7 +1656,7 @@ async fn avg_equals_postgres_avg_over_integer_bigint_and_numeric() {
             ("name", ValueType::Text),
         ],
         &["TRANSFORM agg FROM public.src GROUP BY g \
-           SELECT AVG(a) AS avg_a, AVG(b) AS avg_b, AVG(c) AS avg_c, COUNT(name) AS named, \
+          WITHOUT SOURCE INDEX SELECT AVG(a) AS avg_a, AVG(b) AS avg_b, AVG(c) AS avg_c, COUNT(name) AS named, \
                   COUNT(*) AS n"],
         &[SRC],
     )
@@ -1581,61 +1721,85 @@ async fn avg_equals_postgres_avg_over_integer_bigint_and_numeric() {
 
 #[tokio::test]
 async fn pause_points_fire_in_page_order_aggregate_min_max() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     pause_points_fire_in_page_order(Flavour::AggregateMinMax).await;
 }
 
 #[tokio::test]
 async fn exp2_2_aggregate_min_max() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     exp2_2(Flavour::AggregateMinMax).await;
 }
 
 #[tokio::test]
 async fn exp2_2b_aggregate_min_max() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     exp2_2b(Flavour::AggregateMinMax).await;
 }
 
 #[tokio::test]
 async fn exp2_5b_aggregate_min_max() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     exp2_5b(Flavour::AggregateMinMax).await;
 }
 
 #[tokio::test]
 async fn exp2_9_aggregate_min_max() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     exp2_9(Flavour::AggregateMinMax).await;
 }
 
 #[tokio::test]
 async fn exp2_9b_aggregate_min_max() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     exp2_9b(Flavour::AggregateMinMax).await;
 }
 
 #[tokio::test]
 async fn exp2_9c_aggregate_min_max() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     exp2_9c(Flavour::AggregateMinMax).await;
 }
 
 #[tokio::test]
 async fn exp2_9d_aggregate_min_max() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     exp2_9d(Flavour::AggregateMinMax).await;
 }
 
 #[tokio::test]
 async fn exp2_10_aggregate_min_max() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     exp2_10(Flavour::AggregateMinMax).await;
 }
 
 #[tokio::test]
 async fn issue_392_aggregate_min_max() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     issue_392(Flavour::AggregateMinMax).await;
 }
 
 #[tokio::test]
 async fn issue_550_aggregate_min_max() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     issue_550(Flavour::AggregateMinMax).await;
 }
 
 #[tokio::test]
 async fn chunked_read_exact_point_aggregate_min_max() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     chunked_read_exact_point(Flavour::AggregateMinMax).await;
 }
 
@@ -1683,6 +1847,8 @@ async fn assert_steps_match(
 /// that leaves it.
 #[tokio::test]
 async fn bool_and_and_bool_or_equal_postgres_over_nulls_and_all_null_groups() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let int4 = ValueType::Integer(trellis::integer::IntWidth::Int4);
     let mut d = Driver::start(
         "create table public.src (id integer primary key, g integer, b boolean); \
@@ -1690,7 +1856,7 @@ async fn bool_and_and_bool_or_equal_postgres_over_nulls_and_all_null_groups() {
                                        (5, 3, false), (6, 3, true)",
         &[("id", int4), ("g", int4), ("b", ValueType::Boolean)],
         &["TRANSFORM agg FROM public.src GROUP BY g \
-           SELECT BOOL_AND(b) AS all_b, BOOL_OR(b) AS any_b, COUNT(*) AS n"],
+          WITHOUT SOURCE INDEX SELECT BOOL_AND(b) AS all_b, BOOL_OR(b) AS any_b, COUNT(*) AS n"],
         &[SRC],
     )
     .await;
@@ -1717,6 +1883,8 @@ async fn bool_and_and_bool_or_equal_postgres_over_nulls_and_all_null_groups() {
 /// exact, so summation order can't differ.
 #[tokio::test]
 async fn float_min_max_and_sum_equal_postgres_through_nan_and_infinities() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let int4 = ValueType::Integer(trellis::integer::IntWidth::Int4);
     let mut d = Driver::start(
         "create table public.src (id integer primary key, g integer, f double precision, \
@@ -1731,7 +1899,7 @@ async fn float_min_max_and_sum_equal_postgres_through_nan_and_infinities() {
             ("r", ValueType::Float(trellis::FloatWidth::Float4)),
         ],
         &["TRANSFORM agg FROM public.src GROUP BY g \
-           SELECT MIN(f) AS lo, MAX(f) AS hi, SUM(f) AS total, MIN(r) AS rlo, MAX(r) AS rhi, \
+          WITHOUT SOURCE INDEX SELECT MIN(f) AS lo, MAX(f) AS hi, SUM(f) AS total, MIN(r) AS rlo, MAX(r) AS rhi, \
                   SUM(r) AS rtotal, COUNT(*) AS n"],
         &[SRC],
     )
@@ -1761,6 +1929,8 @@ async fn float_min_max_and_sum_equal_postgres_through_nan_and_infinities() {
 /// extremes move between values of different scales.
 #[tokio::test]
 async fn numeric_min_max_keep_each_extremes_own_scale() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let int4 = ValueType::Integer(trellis::integer::IntWidth::Int4);
     let mut d = Driver::start(
         "create table public.src (id integer primary key, g integer, c numeric); \
@@ -1768,7 +1938,7 @@ async fn numeric_min_max_keep_each_extremes_own_scale() {
                                        (4, 2, -0.001), (5, 2, 100.10)",
         &[("id", int4), ("g", int4), ("c", ValueType::Numeric)],
         &["TRANSFORM agg FROM public.src GROUP BY g \
-           SELECT MIN(c) AS lo, MAX(c) AS hi, COUNT(*) AS n"],
+          WITHOUT SOURCE INDEX SELECT MIN(c) AS lo, MAX(c) AS hi, COUNT(*) AS n"],
         &[SRC],
     )
     .await;
@@ -1795,6 +1965,8 @@ async fn numeric_min_max_keep_each_extremes_own_scale() {
 /// `>` only, so there is no `SUM(a) / COUNT(b)`.)
 #[tokio::test]
 async fn composed_fields_and_expression_arguments_equal_postgres() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let int4 = ValueType::Integer(trellis::integer::IntWidth::Int4);
     let mut d = Driver::start(
         "create table public.src (id integer primary key, g integer, a integer, b integer); \
@@ -1802,7 +1974,7 @@ async fn composed_fields_and_expression_arguments_equal_postgres() {
                                        (4, 2, 2, 3)",
         &[("id", int4), ("g", int4), ("a", int4), ("b", int4)],
         &["TRANSFORM agg FROM public.src GROUP BY g \
-           SELECT SUM(a) + COUNT(b) AS mixed, MAX(a + 1) AS top, SUM(a + b) AS ab, \
+          WITHOUT SOURCE INDEX SELECT SUM(a) + COUNT(b) AS mixed, MAX(a + 1) AS top, SUM(a + b) AS ab, \
                   MIN(b) > MAX(a) AS apart, COALESCE(MIN(b), 0) AS low_b, COUNT(*) AS n"],
         &[SRC],
     )
@@ -1836,6 +2008,8 @@ async fn composed_fields_and_expression_arguments_equal_postgres() {
 /// group that loses its last non-`NULL` value.
 #[tokio::test]
 async fn a_page_folds_or_rereads_a_groups_min_max_by_what_left_it() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let int4 = ValueType::Integer(trellis::integer::IntWidth::Int4);
     let mut d = Driver::start(
         "create table public.src (id integer primary key, g integer, v integer, b boolean); \
@@ -1848,7 +2022,7 @@ async fn a_page_folds_or_rereads_a_groups_min_max_by_what_left_it() {
             ("b", ValueType::Boolean),
         ],
         &["TRANSFORM agg FROM public.src GROUP BY g \
-           SELECT MIN(v) AS lo, MAX(v) AS hi, BOOL_AND(b) AS allb, BOOL_OR(b) AS anyb, \
+          WITHOUT SOURCE INDEX SELECT MIN(v) AS lo, MAX(v) AS hi, BOOL_AND(b) AS allb, BOOL_OR(b) AS anyb, \
                   COUNT(*) AS n"],
         &[SRC],
     )
@@ -1902,12 +2076,14 @@ async fn step(d: &mut Driver, sql: &str, w: &str) {
 /// the entries never held, and each page shows which path it took.
 #[tokio::test]
 async fn a_pages_fold_keeps_the_stored_extreme_and_a_leaving_extreme_rereads() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let int4 = ValueType::Integer(trellis::integer::IntWidth::Int4);
     let mut d = Driver::start(
         "create table public.src (id integer primary key, g integer, v integer); \
          insert into public.src values (1, 1, 10), (2, 1, 5), (3, 1, 4)",
         &[("id", int4), ("g", int4), ("v", int4)],
-        &["TRANSFORM agg FROM public.src GROUP BY g SELECT MAX(v) AS hi, COUNT(*) AS n"],
+        &["TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT MAX(v) AS hi, COUNT(*) AS n"],
         &[SRC],
     )
     .await;
@@ -1955,12 +2131,14 @@ async fn a_pages_fold_keeps_the_stored_extreme_and_a_leaving_extreme_rereads() {
 /// into a's 5, and the group would show 5, which no entry holds.
 #[tokio::test]
 async fn a_page_decides_its_fold_against_the_extreme_a_concurrent_page_committed() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let int4 = ValueType::Integer(trellis::integer::IntWidth::Int4);
     let mut d = Driver::start(
         "create table public.src (id integer primary key, g integer, v integer); \
          insert into public.src values (1, 1, 10), (2, 1, 5), (3, 1, 4)",
         &[("id", int4), ("g", int4), ("v", int4)],
-        &["TRANSFORM agg FROM public.src GROUP BY g SELECT MAX(v) AS hi, COUNT(*) AS n"],
+        &["TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT MAX(v) AS hi, COUNT(*) AS n"],
         &[SRC],
     )
     .await;
@@ -1991,13 +2169,15 @@ async fn a_page_decides_its_fold_against_the_extreme_a_concurrent_page_committed
 /// the page, and the fold or re-read decides on that.
 #[tokio::test]
 async fn a_pages_net_moves_fold_or_reread_a_groups_min_max() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let int4 = ValueType::Integer(trellis::integer::IntWidth::Int4);
     let mut d = Driver::start(
         "create table public.src (id integer primary key, g integer, v integer); \
          insert into public.src values (1, 1, 10), (2, 1, 5), (3, 1, 4), (4, 2, 1)",
         &[("id", int4), ("g", int4), ("v", int4)],
         &["TRANSFORM agg FROM public.src GROUP BY g \
-           SELECT MIN(v) AS lo, MAX(v) AS hi, COUNT(*) AS n"],
+          WITHOUT SOURCE INDEX SELECT MIN(v) AS lo, MAX(v) AS hi, COUNT(*) AS n"],
         &[SRC],
     )
     .await;
@@ -2031,13 +2211,15 @@ async fn a_pages_net_moves_fold_or_reread_a_groups_min_max() {
 /// over the default) and is the order the field's own aggregate uses.
 #[tokio::test]
 async fn a_page_folds_a_text_min_max_under_the_sources_collation() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let int4 = ValueType::Integer(trellis::integer::IntWidth::Int4);
     let mut d = Driver::start(
         "create table public.src (id integer primary key, g integer, v text collate \"C\"); \
          insert into public.src values (1, 1, 'a'), (2, 1, 'B'), (3, 1, 'b')",
         &[("id", int4), ("g", int4), ("v", ValueType::Text)],
         &["TRANSFORM agg FROM public.src GROUP BY g \
-           SELECT MIN(v) AS lo, MAX(v) AS hi, COUNT(*) AS n"],
+          WITHOUT SOURCE INDEX SELECT MIN(v) AS lo, MAX(v) AS hi, COUNT(*) AS n"],
         &[SRC],
     )
     .await;
@@ -2063,6 +2245,8 @@ async fn a_page_folds_a_text_min_max_under_the_sources_collation() {
 /// `NULL`-matching branch must not leak one group's entries into another's).
 #[tokio::test]
 async fn min_max_over_null_group_keys_recompute_each_group_from_its_own_entries() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let int4 = ValueType::Integer(trellis::integer::IntWidth::Int4);
     let mut d = Driver::start(
         "create table public.src (id integer primary key, g integer, h text, v integer); \
@@ -2075,7 +2259,7 @@ async fn min_max_over_null_group_keys_recompute_each_group_from_its_own_entries(
             ("v", int4),
         ],
         &["TRANSFORM agg FROM public.src GROUP BY g, h \
-           SELECT MIN(v) AS lo, MAX(v) AS hi, COUNT(*) AS n"],
+          WITHOUT SOURCE INDEX SELECT MIN(v) AS lo, MAX(v) AS hi, COUNT(*) AS n"],
         &[SRC],
     )
     .await;
@@ -2113,6 +2297,8 @@ async fn min_max_over_null_group_keys_recompute_each_group_from_its_own_entries(
 /// buckets, then b claimed all 7 again and re-drained them.
 #[tokio::test]
 async fn a_stalled_claim_does_not_reclaim_buckets_a_peer_drained_meanwhile() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let flavour = Flavour::Aggregate;
     let mut d = start(flavour, &[]).await;
     let deadlocks_before = d.deadlocks_logged().len();
@@ -2298,16 +2484,22 @@ async fn exp2_9_gc_waits_for_the_older_update(flavour: Flavour) {
 
 #[tokio::test]
 async fn exp2_9_gc_waits_for_the_older_update_aggregate() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     exp2_9_gc_waits_for_the_older_update(Flavour::Aggregate).await;
 }
 
 #[tokio::test]
 async fn exp2_9_gc_waits_for_the_older_update_aggregate_min_max() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     exp2_9_gc_waits_for_the_older_update(Flavour::AggregateMinMax).await;
 }
 
 #[tokio::test]
 async fn exp2_9_gc_waits_for_the_older_update_one_to_one() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     exp2_9_gc_waits_for_the_older_update(Flavour::OneToOne).await;
 }
 
@@ -2333,16 +2525,22 @@ async fn a_new_keys_tombstone_waits_for_its_older_insert(flavour: Flavour) {
 
 #[tokio::test]
 async fn a_new_keys_tombstone_waits_for_its_older_insert_aggregate() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     a_new_keys_tombstone_waits_for_its_older_insert(Flavour::Aggregate).await;
 }
 
 #[tokio::test]
 async fn a_new_keys_tombstone_waits_for_its_older_insert_min_max() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     a_new_keys_tombstone_waits_for_its_older_insert(Flavour::AggregateMinMax).await;
 }
 
 #[tokio::test]
 async fn a_new_keys_tombstone_waits_for_its_older_insert_one_to_one() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     a_new_keys_tombstone_waits_for_its_older_insert(Flavour::OneToOne).await;
 }
 
@@ -2405,16 +2603,22 @@ async fn a_revived_keys_tombstone_is_stamped_afresh(flavour: Flavour) {
 
 #[tokio::test]
 async fn a_revived_keys_tombstone_is_stamped_afresh_aggregate() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     a_revived_keys_tombstone_is_stamped_afresh(Flavour::Aggregate).await;
 }
 
 #[tokio::test]
 async fn a_revived_keys_tombstone_is_stamped_afresh_min_max() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     a_revived_keys_tombstone_is_stamped_afresh(Flavour::AggregateMinMax).await;
 }
 
 #[tokio::test]
 async fn a_revived_keys_tombstone_is_stamped_afresh_one_to_one() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     a_revived_keys_tombstone_is_stamped_afresh(Flavour::OneToOne).await;
 }
 
@@ -2453,16 +2657,22 @@ async fn a_live_rederive_then_a_delete_stamps_the_deletes_batch(flavour: Flavour
 
 #[tokio::test]
 async fn a_live_rederive_then_a_delete_stamps_the_deletes_batch_aggregate() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     a_live_rederive_then_a_delete_stamps_the_deletes_batch(Flavour::Aggregate).await;
 }
 
 #[tokio::test]
 async fn a_live_rederive_then_a_delete_stamps_the_deletes_batch_min_max() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     a_live_rederive_then_a_delete_stamps_the_deletes_batch(Flavour::AggregateMinMax).await;
 }
 
 #[tokio::test]
 async fn a_live_rederive_then_a_delete_stamps_the_deletes_batch_one_to_one() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     a_live_rederive_then_a_delete_stamps_the_deletes_batch(Flavour::OneToOne).await;
 }
 
@@ -2497,16 +2707,22 @@ async fn a_rederives_tombstone_outlives_the_changes_its_read_saw(flavour: Flavou
 
 #[tokio::test]
 async fn a_rederives_tombstone_outlives_the_changes_its_read_saw_aggregate() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     a_rederives_tombstone_outlives_the_changes_its_read_saw(Flavour::Aggregate).await;
 }
 
 #[tokio::test]
 async fn a_rederives_tombstone_outlives_the_changes_its_read_saw_min_max() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     a_rederives_tombstone_outlives_the_changes_its_read_saw(Flavour::AggregateMinMax).await;
 }
 
 #[tokio::test]
 async fn a_rederives_tombstone_outlives_the_changes_its_read_saw_one_to_one() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     a_rederives_tombstone_outlives_the_changes_its_read_saw(Flavour::OneToOne).await;
 }
 
@@ -2537,16 +2753,22 @@ async fn an_out_of_order_drain_holds_gc_back(flavour: Flavour) {
 
 #[tokio::test]
 async fn an_out_of_order_drain_holds_gc_back_aggregate() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     an_out_of_order_drain_holds_gc_back(Flavour::Aggregate).await;
 }
 
 #[tokio::test]
 async fn an_out_of_order_drain_holds_gc_back_aggregate_min_max() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     an_out_of_order_drain_holds_gc_back(Flavour::AggregateMinMax).await;
 }
 
 #[tokio::test]
 async fn an_out_of_order_drain_holds_gc_back_one_to_one() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     an_out_of_order_drain_holds_gc_back(Flavour::OneToOne).await;
 }
 
@@ -2595,16 +2817,22 @@ async fn gc_under_a_concurrent_reinsert(flavour: Flavour) {
 
 #[tokio::test]
 async fn gc_under_a_concurrent_reinsert_aggregate() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     gc_under_a_concurrent_reinsert(Flavour::Aggregate).await;
 }
 
 #[tokio::test]
 async fn gc_under_a_concurrent_reinsert_aggregate_min_max() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     gc_under_a_concurrent_reinsert(Flavour::AggregateMinMax).await;
 }
 
 #[tokio::test]
 async fn gc_under_a_concurrent_reinsert_one_to_one() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     gc_under_a_concurrent_reinsert(Flavour::OneToOne).await;
 }
 
@@ -2666,11 +2894,15 @@ async fn an_entry_lost_to_the_gc_never_deadlocks(flavour: Flavour) {
 
 #[tokio::test]
 async fn an_entry_lost_to_the_gc_never_deadlocks_aggregate() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     an_entry_lost_to_the_gc_never_deadlocks(Flavour::Aggregate).await;
 }
 
 #[tokio::test]
 async fn an_entry_lost_to_the_gc_never_deadlocks_one_to_one() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     an_entry_lost_to_the_gc_never_deadlocks(Flavour::OneToOne).await;
 }
 
@@ -2754,11 +2986,15 @@ async fn the_gc_statement_reads_the_ledger_by_its_tombstone_index(flavour: Flavo
 
 #[tokio::test]
 async fn the_gc_statement_reads_the_ledger_by_its_tombstone_index_aggregate() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     the_gc_statement_reads_the_ledger_by_its_tombstone_index(Flavour::Aggregate).await;
 }
 
 #[tokio::test]
 async fn the_gc_statement_reads_the_ledger_by_its_tombstone_index_one_to_one() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     the_gc_statement_reads_the_ledger_by_its_tombstone_index(Flavour::OneToOne).await;
 }
 
@@ -2847,11 +3083,15 @@ fn estimated_rows(line: &str) -> usize {
 
 #[tokio::test]
 async fn the_page_statements_read_the_ledger_by_key_aggregate() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     the_page_statements_read_the_ledger_by_key(Flavour::Aggregate).await;
 }
 
 #[tokio::test]
 async fn the_page_statements_read_the_ledger_by_key_one_to_one() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     the_page_statements_read_the_ledger_by_key(Flavour::OneToOne).await;
 }
 
@@ -2911,16 +3151,22 @@ async fn a_live_entrys_apply_and_rederive_are_hot(flavour: Flavour) {
 
 #[tokio::test]
 async fn a_live_entrys_apply_and_rederive_are_hot_aggregate() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     a_live_entrys_apply_and_rederive_are_hot(Flavour::Aggregate).await;
 }
 
 #[tokio::test]
 async fn a_live_entrys_apply_and_rederive_are_hot_min_max() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     a_live_entrys_apply_and_rederive_are_hot(Flavour::AggregateMinMax).await;
 }
 
 #[tokio::test]
 async fn a_live_entrys_apply_and_rederive_are_hot_one_to_one() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     a_live_entrys_apply_and_rederive_are_hot(Flavour::OneToOne).await;
 }
 
@@ -2968,11 +3214,15 @@ async fn a_new_keys_apply_writes_its_entry_once(flavour: Flavour) {
 
 #[tokio::test]
 async fn a_new_keys_apply_writes_its_entry_once_aggregate() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     a_new_keys_apply_writes_its_entry_once(Flavour::Aggregate).await;
 }
 
 #[tokio::test]
 async fn a_new_keys_apply_writes_its_entry_once_min_max() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     a_new_keys_apply_writes_its_entry_once(Flavour::AggregateMinMax).await;
 }
 
@@ -3009,16 +3259,22 @@ async fn a_rederive_queues_on_a_new_keys_applied_entry(flavour: Flavour) {
 
 #[tokio::test]
 async fn a_rederive_queues_on_a_new_keys_applied_entry_aggregate() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     a_rederive_queues_on_a_new_keys_applied_entry(Flavour::Aggregate).await;
 }
 
 #[tokio::test]
 async fn a_rederive_queues_on_a_new_keys_applied_entry_min_max() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     a_rederive_queues_on_a_new_keys_applied_entry(Flavour::AggregateMinMax).await;
 }
 
 #[tokio::test]
 async fn a_rederive_queues_on_a_new_keys_applied_entry_one_to_one() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     a_rederive_queues_on_a_new_keys_applied_entry(Flavour::OneToOne).await;
 }
 
@@ -3056,16 +3312,22 @@ async fn a_new_keys_apply_queues_on_a_rederives_placeholder(flavour: Flavour) {
 
 #[tokio::test]
 async fn a_new_keys_apply_queues_on_a_rederives_placeholder_aggregate() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     a_new_keys_apply_queues_on_a_rederives_placeholder(Flavour::Aggregate).await;
 }
 
 #[tokio::test]
 async fn a_new_keys_apply_queues_on_a_rederives_placeholder_min_max() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     a_new_keys_apply_queues_on_a_rederives_placeholder(Flavour::AggregateMinMax).await;
 }
 
 #[tokio::test]
 async fn a_new_keys_apply_queues_on_a_rederives_placeholder_one_to_one() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     a_new_keys_apply_queues_on_a_rederives_placeholder(Flavour::OneToOne).await;
 }
 
@@ -3079,6 +3341,8 @@ async fn a_new_keys_apply_queues_on_a_rederives_placeholder_one_to_one() {
 /// targets match their oracles.
 #[tokio::test]
 async fn a_one_to_one_and_an_aggregate_in_one_page_never_deadlock() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut d = Driver::start(
         "create table public.src (id integer primary key, g integer, v numeric); \
          insert into public.src values (1, 1, 10), (2, 1, 20), (3, 2, 5)",
@@ -3157,15 +3421,15 @@ impl RelFlavour {
         match self {
             RelFlavour::Field => {
                 "TRANSFORM agg FROM public.src GROUP BY g \
-                 SELECT SUM(parent.w) AS total, COUNT(*) AS n"
+                WITHOUT SOURCE INDEX SELECT SUM(parent.w) AS total, COUNT(*) AS n"
             }
             RelFlavour::GroupKey => {
                 "TRANSFORM agg FROM public.src GROUP BY parent.w \
-                 SELECT SUM(g) AS total, COUNT(*) AS n"
+                WITHOUT SOURCE INDEX SELECT SUM(g) AS total, COUNT(*) AS n"
             }
             RelFlavour::Count => {
                 "TRANSFORM agg FROM public.src GROUP BY g \
-                 SELECT COUNT(parent.w) AS total, COUNT(*) AS n"
+                WITHOUT SOURCE INDEX SELECT COUNT(parent.w) AS total, COUNT(*) AS n"
             }
         }
     }
@@ -3263,11 +3527,15 @@ async fn a_child_apply_racing_its_parents_change(flavour: RelFlavour) {
 
 #[tokio::test]
 async fn a_child_apply_racing_its_parents_change_field() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     a_child_apply_racing_its_parents_change(RelFlavour::Field).await;
 }
 
 #[tokio::test]
 async fn a_child_apply_racing_its_parents_change_group_key() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     a_child_apply_racing_its_parents_change(RelFlavour::GroupKey).await;
 }
 
@@ -3296,11 +3564,15 @@ async fn a_child_rederive_racing_its_parents_change(flavour: RelFlavour) {
 
 #[tokio::test]
 async fn a_child_rederive_racing_its_parents_change_field() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     a_child_rederive_racing_its_parents_change(RelFlavour::Field).await;
 }
 
 #[tokio::test]
 async fn a_child_rederive_racing_its_parents_change_group_key() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     a_child_rederive_racing_its_parents_change(RelFlavour::GroupKey).await;
 }
 
@@ -3325,11 +3597,15 @@ async fn a_child_moving_off_a_changing_parent(flavour: RelFlavour) {
 
 #[tokio::test]
 async fn a_child_moving_off_a_changing_parent_field() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     a_child_moving_off_a_changing_parent(RelFlavour::Field).await;
 }
 
 #[tokio::test]
 async fn a_child_moving_off_a_changing_parent_group_key() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     a_child_moving_off_a_changing_parent(RelFlavour::GroupKey).await;
 }
 
@@ -3354,11 +3630,15 @@ async fn a_to_side_truncate_racing_a_child(flavour: RelFlavour) {
 
 #[tokio::test]
 async fn a_to_side_truncate_racing_a_child_field() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     a_to_side_truncate_racing_a_child(RelFlavour::Field).await;
 }
 
 #[tokio::test]
 async fn a_to_side_truncate_racing_a_child_group_key() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     a_to_side_truncate_racing_a_child(RelFlavour::GroupKey).await;
 }
 
@@ -3368,6 +3648,8 @@ async fn a_to_side_truncate_racing_a_child_group_key() {
 /// placeholder doesn't outlive the page (#774).
 #[tokio::test]
 async fn a_change_from_before_a_truncate_leaves_no_entry_on_a_relationship_target() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let flavour = RelFlavour::Field;
     let mut d = start_rel(flavour).await;
     write(&d, "truncate public.src").await;
@@ -3405,16 +3687,22 @@ async fn a_parent_born_and_deleted_in_one_batch_after_a_child_read_it(flavour: R
 
 #[tokio::test]
 async fn a_parent_born_and_deleted_in_one_batch_after_a_child_read_it_field() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     a_parent_born_and_deleted_in_one_batch_after_a_child_read_it(RelFlavour::Field).await;
 }
 
 #[tokio::test]
 async fn a_parent_born_and_deleted_in_one_batch_after_a_child_read_it_group_key() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     a_parent_born_and_deleted_in_one_batch_after_a_child_read_it(RelFlavour::GroupKey).await;
 }
 
 #[tokio::test]
 async fn a_parent_born_and_deleted_in_one_batch_after_a_child_read_it_count() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     a_parent_born_and_deleted_in_one_batch_after_a_child_read_it(RelFlavour::Count).await;
 }
 
@@ -3450,16 +3738,22 @@ async fn a_parent_born_and_deleted_across_deferred_reverses(flavour: RelFlavour)
 
 #[tokio::test]
 async fn a_parent_born_and_deleted_across_deferred_reverses_field() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     a_parent_born_and_deleted_across_deferred_reverses(RelFlavour::Field).await;
 }
 
 #[tokio::test]
 async fn a_parent_born_and_deleted_across_deferred_reverses_group_key() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     a_parent_born_and_deleted_across_deferred_reverses(RelFlavour::GroupKey).await;
 }
 
 #[tokio::test]
 async fn a_parent_born_and_deleted_across_deferred_reverses_count() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     a_parent_born_and_deleted_across_deferred_reverses(RelFlavour::Count).await;
 }
 
@@ -3474,6 +3768,8 @@ async fn a_parent_born_and_deleted_across_deferred_reverses_count() {
 /// leaves child 1 counting parent 1's value under a code no parent has.
 #[tokio::test]
 async fn a_parent_rekeyed_through_a_childs_key_inside_one_batch() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let actual = "select g, total, n from public.agg order by g";
     let expected = "select s.g, sum(p.w), count(*) from public.src s \
                     left join public.par p on p.code = s.p group by s.g order by s.g";
@@ -3488,7 +3784,7 @@ async fn a_parent_rekeyed_through_a_childs_key_inside_one_batch() {
             ("p", ValueType::Numeric),
         ],
         &["RELATIONSHIP parent FROM src.p TO par.code"],
-        &["TRANSFORM agg FROM public.src GROUP BY g SELECT SUM(parent.w) AS total, COUNT(*) AS n"],
+        &["TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(parent.w) AS total, COUNT(*) AS n"],
         &[PAR, SRC],
     )
     .await;
@@ -3575,16 +3871,22 @@ async fn a_page_mixing_fresh_and_read_entries_equals_the_oracle(flavour: Flavour
 
 #[tokio::test]
 async fn a_page_mixing_fresh_and_read_entries_equals_the_oracle_aggregate() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     a_page_mixing_fresh_and_read_entries_equals_the_oracle(Flavour::Aggregate).await;
 }
 
 #[tokio::test]
 async fn a_page_mixing_fresh_and_read_entries_equals_the_oracle_avg() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     a_page_mixing_fresh_and_read_entries_equals_the_oracle(Flavour::AggregateAvg).await;
 }
 
 #[tokio::test]
 async fn a_page_mixing_fresh_and_read_entries_equals_the_oracle_min_max() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     a_page_mixing_fresh_and_read_entries_equals_the_oracle(Flavour::AggregateMinMax).await;
 }
 
@@ -3596,6 +3898,8 @@ async fn a_page_mixing_fresh_and_read_entries_equals_the_oracle_min_max() {
 /// every drain.
 #[tokio::test]
 async fn a_parent_that_is_also_a_from_side_of_another_type_drains_a_plain_update() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let actual = "select g, total, n from public.agg order by g";
     let expected = "select s.g, sum(p.w), count(*) from public.src s \
                     left join public.par p on p.id = s.p group by s.g order by s.g";
@@ -3615,7 +3919,7 @@ async fn a_parent_that_is_also_a_from_side_of_another_type_drains_a_plain_update
             "RELATIONSHIP owner FROM par.owner TO usr.handle",
             "RELATIONSHIP parent FROM src.p TO par.id",
         ],
-        &["TRANSFORM agg FROM public.src GROUP BY g SELECT SUM(parent.w) AS total, COUNT(*) AS n"],
+        &["TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(parent.w) AS total, COUNT(*) AS n"],
         &["public.usr", PAR, SRC],
     )
     .await;
@@ -3634,6 +3938,8 @@ async fn a_parent_that_is_also_a_from_side_of_another_type_drains_a_plain_update
 /// read it, which the ring key still catches with `group_key` out of play.
 #[tokio::test]
 async fn a_parent_that_is_also_a_from_side_re_derives_only_its_own_children() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let actual = "select g, total, n from public.agg order by g";
     let expected = "select s.g, count(p.w), count(*) from public.src s \
                     left join public.par p on p.id = s.p group by s.g order by s.g";
@@ -3653,7 +3959,7 @@ async fn a_parent_that_is_also_a_from_side_re_derives_only_its_own_children() {
             "RELATIONSHIP owner FROM par.owner TO usr.id",
             "RELATIONSHIP parent FROM src.p TO par.id",
         ],
-        &["TRANSFORM agg FROM public.src GROUP BY g SELECT COUNT(parent.w) AS total, COUNT(*) AS n"],
+        &["TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT COUNT(parent.w) AS total, COUNT(*) AS n"],
         &["public.usr", PAR, SRC],
     )
     .await;
@@ -3696,6 +4002,8 @@ async fn a_parent_that_is_also_a_from_side_re_derives_only_its_own_children() {
 /// values only from the images, labelled by column, so this drains.
 #[tokio::test]
 async fn a_to_sides_stale_group_key_of_another_type_still_drains() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let actual = "select g, total, n from public.agg order by g";
     let expected = "select s.g, sum(p.w), count(*) from public.src s \
                     left join public.par p on p.code = s.p group by s.g order by s.g";
@@ -3716,7 +4024,7 @@ async fn a_to_sides_stale_group_key_of_another_type_still_drains() {
             "RELATIONSHIP owner FROM par.owner TO usr.handle",
             "RELATIONSHIP parent FROM src.p TO par.code",
         ],
-        &["TRANSFORM agg FROM public.src GROUP BY g SELECT SUM(parent.w) AS total, COUNT(*) AS n"],
+        &["TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(parent.w) AS total, COUNT(*) AS n"],
         &["public.usr", PAR, SRC],
     )
     .await;
@@ -3741,6 +4049,8 @@ async fn a_to_sides_stale_group_key_of_another_type_still_drains() {
 /// since `par` is no from-side.
 #[tokio::test]
 async fn a_relationship_onto_a_captured_to_side_widens_its_images() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut d = Driver::start_with_relationships(
         "create table public.par (id integer primary key, code integer unique, w numeric); \
          create table public.src (id integer primary key, g integer, p integer, q integer); \
@@ -3752,7 +4062,7 @@ async fn a_relationship_onto_a_captured_to_side_widens_its_images() {
             ("p", ValueType::Numeric),
         ],
         &["RELATIONSHIP parent FROM src.p TO par.id"],
-        &["TRANSFORM agg FROM public.src GROUP BY g SELECT SUM(parent.w) AS total, COUNT(*) AS n"],
+        &["TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(parent.w) AS total, COUNT(*) AS n"],
         &[PAR, SRC],
     )
     .await;
@@ -3807,6 +4117,8 @@ async fn a_relationship_onto_a_captured_to_side_widens_its_images() {
 /// has 0.
 #[tokio::test]
 async fn a_parent_born_and_deleted_on_a_to_side_joined_by_two_non_key_columns() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let actual = "select g, total, n from public.agg order by g";
     let expected = "select s.g, count(p.w), count(*) from public.src s \
                     left join public.par p on p.code = s.p group by s.g order by s.g";
@@ -3820,7 +4132,7 @@ async fn a_parent_born_and_deleted_on_a_to_side_joined_by_two_non_key_columns() 
             "RELATIONSHIP parent FROM src.p TO par.code",
             "RELATIONSHIP kids FROM src.k TO par.fk",
         ],
-        &["TRANSFORM agg FROM public.src GROUP BY g SELECT COUNT(parent.w) AS total, COUNT(*) AS n"],
+        &["TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT COUNT(parent.w) AS total, COUNT(*) AS n"],
         &[PAR, SRC],
     )
     .await;
@@ -3852,6 +4164,8 @@ async fn a_parent_born_and_deleted_on_a_to_side_joined_by_two_non_key_columns() 
 /// `'e'` out of the insert's new image.
 #[tokio::test]
 async fn a_parent_born_and_deleted_on_a_to_side_that_is_also_a_from_side() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let actual = "select g, total, n from public.agg order by g";
     let expected = "select s.g, count(p.w), count(*) from public.src s \
                     left join public.par p on p.code = s.p group by s.g order by s.g";
@@ -3868,7 +4182,7 @@ async fn a_parent_born_and_deleted_on_a_to_side_that_is_also_a_from_side() {
             "RELATIONSHIP owner FROM par.owner TO usr.handle",
             "RELATIONSHIP parent FROM src.p TO par.code",
         ],
-        &["TRANSFORM agg FROM public.src GROUP BY g SELECT COUNT(parent.w) AS total, COUNT(*) AS n"],
+        &["TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT COUNT(parent.w) AS total, COUNT(*) AS n"],
         &["public.usr", PAR, SRC],
     )
     .await;
@@ -3900,6 +4214,8 @@ async fn a_parent_born_and_deleted_on_a_to_side_that_is_also_a_from_side() {
 /// `code`. Its `fk` values (`'x'`, unchanged) re-derive nothing extra.
 #[tokio::test]
 async fn a_parent_rekeyed_through_a_childs_key_on_a_to_side_joined_by_two_non_key_columns() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let actual = "select g, total, n from public.agg order by g";
     let expected = "select s.g, sum(p.w), count(*) from public.src s \
                     left join public.par p on p.code = s.p group by s.g order by s.g";
@@ -3913,7 +4229,7 @@ async fn a_parent_rekeyed_through_a_childs_key_on_a_to_side_joined_by_two_non_ke
             "RELATIONSHIP parent FROM src.p TO par.code",
             "RELATIONSHIP kids FROM src.k TO par.fk",
         ],
-        &["TRANSFORM agg FROM public.src GROUP BY g SELECT SUM(parent.w) AS total, COUNT(*) AS n"],
+        &["TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(parent.w) AS total, COUNT(*) AS n"],
         &[PAR, SRC],
     )
     .await;
@@ -3948,6 +4264,8 @@ async fn a_parent_rekeyed_through_a_childs_key_on_a_to_side_joined_by_two_non_ke
 /// parked rows' `group_key`.
 #[tokio::test]
 async fn a_parked_parent_born_and_deleted_on_a_non_key_to_col() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let actual = "select g, total, n from public.agg order by g";
     let expected = "select s.g, count(p.w), count(*) from public.src s \
                     left join public.par p on p.code = s.p group by s.g order by s.g";
@@ -3958,7 +4276,7 @@ async fn a_parked_parent_born_and_deleted_on_a_non_key_to_col() {
          insert into public.src values (1, 1, 'a'), (2, 1, 'b');",
         &[("id", ValueType::Numeric), ("g", ValueType::Numeric)],
         &["RELATIONSHIP parent FROM src.p TO par.code"],
-        &["TRANSFORM agg FROM public.src GROUP BY g SELECT COUNT(parent.w) AS total, COUNT(*) AS n"],
+        &["TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT COUNT(parent.w) AS total, COUNT(*) AS n"],
         &[PAR, SRC],
     )
     .await;
@@ -4011,6 +4329,8 @@ async fn a_parked_parent_born_and_deleted_on_a_non_key_to_col() {
 #[tokio::test]
 #[ignore = "#785 review: the fold's earliest old image can be a nested statement's intermediate"]
 async fn a_nested_rekey_of_a_non_key_to_col_re_derives_the_committed_value() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let actual = "select g, total, n from public.agg order by g";
     let expected = "select s.g, count(p.w), count(*) from public.src s \
                     left join public.par p on p.code = s.p group by s.g order by s.g";
@@ -4028,7 +4348,7 @@ async fn a_nested_rekey_of_a_non_key_to_col_re_derives_the_committed_value() {
            for each row execute function public.par_bounce();",
         &[("id", ValueType::Numeric), ("g", ValueType::Numeric)],
         &["RELATIONSHIP parent FROM src.p TO par.code"],
-        &["TRANSFORM agg FROM public.src GROUP BY g SELECT COUNT(parent.w) AS total, COUNT(*) AS n"],
+        &["TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT COUNT(parent.w) AS total, COUNT(*) AS n"],
         &[PAR, SRC],
     )
     .await;
@@ -4055,6 +4375,8 @@ async fn a_nested_rekey_of_a_non_key_to_col_re_derives_the_committed_value() {
 #[tokio::test]
 #[ignore = "#785 review: the fold's earliest old image can be a nested statement's intermediate"]
 async fn a_nested_rekey_of_a_non_key_to_col_clears_the_committed_projection() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let actual = "select id::text, pw::text from public.one order by id";
     let expected = "select s.id::text, p.w::text from public.src s \
                     left join public.par p on p.code = s.p order by s.id";

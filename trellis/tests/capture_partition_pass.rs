@@ -80,7 +80,7 @@ async fn instance(cluster: &TestCluster, tree: &str) -> Instance {
     .await
     .expect("connect");
     trellis
-        .apply("TRANSFORM totals FROM public.items GROUP BY order_id SELECT COUNT(*) AS n")
+        .apply("TRANSFORM totals FROM public.items GROUP BY order_id WITHOUT SOURCE INDEX SELECT COUNT(*) AS n")
         .await
         .expect("define an aggregate over the partitioned source");
     let outcome = pass(&mut raw, &db.pool).await;
@@ -1001,7 +1001,7 @@ async fn a_definition_made_after_the_root_was_replaced_is_not_paused() {
         .await
         .expect("replace the root");
     it.trellis
-        .apply("TRANSFORM totals FROM public.items GROUP BY order_id SELECT COUNT(*) AS n")
+        .apply("TRANSFORM totals FROM public.items GROUP BY order_id WITHOUT SOURCE INDEX SELECT COUNT(*) AS n")
         .await
         .expect("define again");
     clean_pass(&mut it).await;
@@ -1061,7 +1061,7 @@ async fn a_definition_made_again_on_the_same_root_before_a_pass_is_not_paused() 
         it.trellis.apply(text).await.expect(text);
     }
     it.trellis
-        .apply("TRANSFORM totals FROM public.items GROUP BY order_id SELECT COUNT(*) AS n")
+        .apply("TRANSFORM totals FROM public.items GROUP BY order_id WITHOUT SOURCE INDEX SELECT COUNT(*) AS n")
         .await
         .expect("define again");
     clean_pass(&mut it).await;

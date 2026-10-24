@@ -912,13 +912,15 @@ async fn self_check_refuses_a_non_positive_limit_rather_than_vacuously_convergin
     trellis.shutdown().await.expect("shutdown");
 }
 
-/// ADR-0013's "Scope: 1-1 targets": an aggregate
-/// target is out of scope for this slice, and `self_check` must *refuse* it
-/// rather than silently run a plain keyset comparison that would mis-audit
-/// the group-key space (every group would read as a divergence). A tool that
-/// silently mis-audits an unsupported shape is worse than one that declines.
+/// ADR-0013's "Scope": an aggregate off the group basis (a ledger aggregate,
+/// here one grouping by a relationship path) is out of scope, and
+/// `self_check` must *refuse* it rather than silently run a plain keyset
+/// comparison that would mis-audit the group-key space (every group would
+/// read as a divergence). A tool that silently mis-audits an unsupported
+/// shape is worse than one that declines. A group-basis aggregate is audited
+/// (`group_basis_self_check.rs`).
 #[tokio::test]
-async fn self_check_refuses_an_aggregate_target_rather_than_mis_auditing_it() {
+async fn self_check_refuses_a_ledger_aggregate_target_rather_than_mis_auditing_it() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
 
@@ -926,9 +928,12 @@ async fn self_check_refuses_an_aggregate_target_rather_than_mis_auditing_it() {
         .get()
         .await
         .expect("connection")
-        .batch_execute("create table orders (id integer primary key, region text)")
+        .batch_execute(
+            "create table regions (id integer primary key, name text); \
+             create table orders (id integer primary key, region_id integer)",
+        )
         .await
-        .expect("create source table");
+        .expect("create source tables");
 
     let trellis = Trellis::connect(
         Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
@@ -937,14 +942,18 @@ async fn self_check_refuses_an_aggregate_target_rather_than_mis_auditing_it() {
     .await
     .expect("connect");
     trellis
-        .apply("TRANSFORM region_counts FROM orders GROUP BY region SELECT region AS region, COUNT(*) AS n")
+        .apply("RELATIONSHIP reg FROM orders.region_id TO regions.id")
+        .await
+        .expect("declare the relationship");
+    trellis
+        .apply("TRANSFORM region_counts FROM orders GROUP BY reg.name WITHOUT SOURCE INDEX SELECT COUNT(*) AS n")
         .await
         .expect("define aggregate transform");
 
     let err = trellis
         .self_check("region_counts", SelfCheckMode::Standard, GENEROUS_TIMEOUT)
         .await
-        .expect_err("an aggregate target must be refused, not audited");
+        .expect_err("a ledger aggregate target must be refused, not audited");
     assert_eq!(err.code(), trellis::ErrorCode::Validation);
     assert!(
         err.to_string().contains("aggregate"),

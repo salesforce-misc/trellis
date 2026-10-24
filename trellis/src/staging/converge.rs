@@ -200,7 +200,7 @@ fn converged_sql(token: &str, held_by: Option<i64>) -> String {
     // there, folded by nobody. Only the immediate successor's own fenced
     // read (`fenced_window`'s predecessor-half union clause) can ever claim
     // it, and that only runs once the successor itself seals
-    // (`seal::seal_if_active_nonempty`'s straggler-catching case). Until
+    // (`seal::seal_if_active_nonempty`'s empty-segment seals). Until
     // then this row is still genuinely pending, so a `'drained'` owner only
     // clears `r` when `r` itself was actually visible in that owner's own
     // fence — never unconditionally. Without this, a straggler landing right

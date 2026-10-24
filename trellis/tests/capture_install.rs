@@ -1481,7 +1481,7 @@ async fn a_new_reader_waits_for_the_rows_staged_before_its_widen_to_drain() {
 
     let definition = install_definition(
         &db.pool,
-        "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT sum(amount) AS total",
+        "TRANSFORM sku_totals FROM sales GROUP BY sku WITHOUT SOURCE INDEX SELECT sum(amount) AS total",
         &sales_columns(),
         "public",
     )

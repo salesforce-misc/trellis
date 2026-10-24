@@ -62,7 +62,7 @@ async fn seed(raw: &Client) {
     raw.batch_execute(
         "create table authors (id bigint primary key, name text); \
          create table posts (id bigint primary key, author bigint); \
-         create table orders (id bigint primary key, g bigint, a numeric); \
+         create table orders (id bigint primary key, g bigint, a numeric(20,0)); \
          insert into authors (id, name) values (1, 'a'), (2, 'b'); \
          insert into posts (id, author) values (1, 1), (2, 1), (3, 2); \
          insert into orders (id, g, a) select s, s % 2, s from generate_series(1, 6) s;",
@@ -103,7 +103,7 @@ async fn every_statement_form_dispatches_through_the_one_entrypoint() {
 
     // TRANSFORM — reports the target table it registered.
     let applied = trellis
-        .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
+        .apply("TRANSFORM order_rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total")
         .await
         .expect("define an aggregate transform");
     let target_table = applied
@@ -376,7 +376,7 @@ async fn statements_outside_the_grammar_are_parse_errors_that_change_nothing() {
         .await
         .expect("declare a relationship to aim the invalid statements at");
     trellis
-        .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
+        .apply("TRANSFORM order_rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total")
         .await
         .expect("define a transform to aim the invalid statements at");
 

@@ -3915,7 +3915,7 @@ mod catch_up_tests {
     /// aggregate is the Re-derive build's since #625 F5). Its `SUM` shows a
     /// change counted twice.
     const ROLLUP: &str = "TRANSFORM order_rollup FROM orders GROUP BY g \
-         SELECT sum(a) AS total, max(grp.w) AS w";
+        WITHOUT SOURCE INDEX SELECT sum(a) AS total, max(grp.w) AS w";
 
     /// Creates `public.grps` and the to-one relationship `grp` from
     /// `orders.g` to it, which [`ROLLUP`]'s `w` reads.
@@ -4662,12 +4662,13 @@ mod catch_up_tests {
     /// touches the row the sweep will delete (a drain applying an earlier
     /// sealed segment, say) doesn't wait on the discharge.
     #[tokio::test]
+    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
     async fn the_sweep_holds_no_target_row_lock_across_the_intake_wait() {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
         let (pool, mut discharger) = orders_with_rollup_and_copy(
             &db,
-            "TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total",
+            "TRANSFORM order_rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total",
         )
         .await;
         settle_builds(&pool).await;
@@ -5002,7 +5003,7 @@ mod dispatch_tests {
             &client,
             "public.orders",
             "public.rollup",
-            "TRANSFORM rollup FROM orders GROUP BY g SELECT sum(a) AS total",
+            "TRANSFORM rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total",
             "waiting_to_backfill",
         )
         .await;

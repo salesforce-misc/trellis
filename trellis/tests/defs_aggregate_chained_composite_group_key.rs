@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! TRANSFORM stock_totals    FROM inventory     GROUP BY warehouse, sku SELECT sum(qty)       AS total_qty
-//! TRANSFORM stock_totals_v2 FROM stock_totals  GROUP BY warehouse      SELECT sum(total_qty) AS total_qty
+//! TRANSFORM stock_totals_v2 FROM stock_totals  GROUP BY warehouse     WITHOUT SOURCE INDEX SELECT sum(total_qty) AS total_qty
 //! ```
 //!
 //! No relationship is involved — this is the plainest possible two-column
@@ -40,6 +40,7 @@ use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::{ValueType, install_definition};
+use trellis::integer::IntWidth;
 use trellis::staging::apply;
 use trellis::staging::{has_pending, retire_drained_segments};
 
@@ -150,10 +151,10 @@ fn columns(pairs: &[(&str, ValueType)]) -> HashMap<String, ValueType> {
 
 fn inventory_columns() -> HashMap<String, ValueType> {
     columns(&[
-        ("id", ValueType::Numeric),
+        ("id", ValueType::Integer(IntWidth::Int4)),
         ("warehouse", ValueType::Text),
         ("sku", ValueType::Text),
-        ("qty", ValueType::Numeric),
+        ("qty", ValueType::Integer(IntWidth::Int4)),
     ])
 }
 
@@ -161,14 +162,14 @@ fn stock_totals_columns() -> HashMap<String, ValueType> {
     columns(&[
         ("warehouse", ValueType::Text),
         ("sku", ValueType::Text),
-        ("total_qty", ValueType::Numeric),
+        ("total_qty", ValueType::Integer(IntWidth::Int8)),
     ])
 }
 
 const STOCK_TOTALS: &str = "TRANSFORM stock_totals FROM inventory GROUP BY warehouse, sku \
-     SELECT sum(qty) AS total_qty";
+    WITHOUT SOURCE INDEX SELECT sum(qty) AS total_qty";
 const STOCK_TOTALS_V2: &str = "TRANSFORM stock_totals_v2 FROM stock_totals GROUP BY warehouse \
-     SELECT sum(total_qty) AS total_qty";
+    WITHOUT SOURCE INDEX SELECT sum(total_qty) AS total_qty";
 
 /// The issue's own schema.
 async fn create_schema(client: &Client) {

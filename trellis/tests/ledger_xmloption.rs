@@ -174,7 +174,7 @@ async fn an_xml_fragment_applies_through_the_ledger_under_a_document_xmloption()
         .await
         .expect("connect a definer");
     trellis
-        .apply("TRANSFORM tx FROM public.x GROUP BY g SELECT g AS g, COUNT(doc) AS n")
+        .apply("TRANSFORM tx FROM public.x GROUP BY g WITHOUT SOURCE INDEX SELECT g AS g, COUNT(doc) AS n")
         .await
         .expect("define");
     let mut raw = connect_pinned(db.dsn()).await;

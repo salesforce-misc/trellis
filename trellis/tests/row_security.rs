@@ -2313,7 +2313,7 @@ async fn deletes_staged_for_rows_the_policy_hides(cluster: &TestCluster) -> Inst
     for ddl in [
         "TRANSFORM c_copy FROM public.c SELECT amount AS amount",
         "TRANSFORM c_totals FROM public.c GROUP BY pid \
-         SELECT pid AS pid, SUM(amount) AS total, COUNT(*) AS n",
+        WITHOUT SOURCE INDEX SELECT pid AS pid, SUM(amount) AS total, COUNT(*) AS n",
     ] {
         it.trellis.apply(ddl).await.expect(ddl);
     }

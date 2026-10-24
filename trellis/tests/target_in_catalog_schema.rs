@@ -104,7 +104,10 @@ async fn a_target_qualified_into_another_instances_catalog_schema_is_refused() {
     // Both an aggregate and a 1-1 target create a ledger beside the target.
     for (name, body) in [
         ("cat_one", "SELECT v AS v"),
-        ("cat_agg", "GROUP BY v SELECT v AS v, COUNT(*) AS n"),
+        (
+            "cat_agg",
+            "GROUP BY v WITHOUT SOURCE INDEX SELECT v AS v, COUNT(*) AS n",
+        ),
     ] {
         let (_, schema, own, message) = refusal(
             trellis
@@ -359,7 +362,7 @@ async fn a_refused_define_beside_an_existing_transform_changes_nothing() {
 
     for statement in [
         "TRANSFORM late.cat_out FROM cat_src SELECT v AS v",
-        "TRANSFORM late.cat_agg FROM cat_src GROUP BY v SELECT v AS v, COUNT(*) AS n",
+        "TRANSFORM late.cat_agg FROM cat_src GROUP BY v WITHOUT SOURCE INDEX SELECT v AS v, COUNT(*) AS n",
     ] {
         refusal(trellis.apply(statement).await);
     }

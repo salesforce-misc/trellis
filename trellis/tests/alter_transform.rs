@@ -2600,7 +2600,7 @@ async fn dropping_a_field_read_by_a_downstream_aggregates_group_by_key_is_refuse
     // `SELECT` field of its own — so the only edge from `order_group` back
     // to `order_calc.a` is its `GROUP BY` key.
     trellis
-        .apply("TRANSFORM order_group FROM order_calc GROUP BY a SELECT count(*) AS n")
+        .apply("TRANSFORM order_group FROM order_calc GROUP BY a WITHOUT SOURCE INDEX SELECT count(*) AS n")
         .await
         .expect("an aggregate grouping directly on the upstream's column");
 
@@ -2652,7 +2652,7 @@ async fn altering_an_aggregate_transform_is_unsupported() {
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
     raw.batch_execute(
-        "create table orders (id bigint primary key, g bigint, a numeric); \
+        "create table orders (id bigint primary key, g bigint, a numeric(20,0)); \
          insert into orders (id, g, a) select s, s % 2, s from generate_series(1, 6) s;",
     )
     .await
@@ -2662,7 +2662,7 @@ async fn altering_an_aggregate_transform_is_unsupported() {
     // brings the definition live without a running pipeline.
     let trellis = define_only(db.dsn()).await;
     trellis
-        .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
+        .apply("TRANSFORM order_rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total")
         .await
         .expect("define the aggregate");
     trellis::intake::markers::settle_registrations(&db.pool).await;

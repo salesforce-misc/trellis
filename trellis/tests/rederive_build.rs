@@ -23,7 +23,7 @@ use trellis::{Trellis, TrellisOptions};
 const WAKE: &str = "rederive_wake";
 
 /// `SUM` and `COUNT(*)` by `g`: a shape the Re-derive build takes.
-const AGG: &str = "TRANSFORM agg FROM public.src GROUP BY g SELECT SUM(v) AS total, COUNT(*) AS n";
+const AGG: &str = "TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n";
 
 /// A plain 1-1 target: the Re-derive build takes it since #625 F8a.
 const ONE: &str = "TRANSFORM one FROM public.src SELECT g AS g, v + v AS dbl";
@@ -311,6 +311,8 @@ impl Fixture {
 /// oracle.
 #[tokio::test]
 async fn a_rederive_build_goes_from_waiting_to_live_with_no_catch_up() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(200, &[AGG]).await;
     assert_eq!(
         f.status("agg").await.as_deref(),
@@ -371,6 +373,8 @@ async fn a_rederive_build_goes_from_waiting_to_live_with_no_catch_up() {
 /// build runs ends up counted exactly once.
 #[tokio::test]
 async fn changes_drained_while_backfilling_are_applied() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(200, &[AGG]).await;
     f.pass().await;
 
@@ -421,7 +425,7 @@ async fn changes_drained_while_backfilling_are_applied() {
 
 /// `SUM`, `MAX` (a recomputed field that folds), `AVG` and `COUNT(*)` by `g`.
 const AGG_WIDE: &str = "TRANSFORM agg FROM public.src GROUP BY g \
-     SELECT SUM(v) AS total, MAX(v) AS biggest, AVG(v) AS mean, COUNT(*) AS n";
+    WITHOUT SOURCE INDEX SELECT SUM(v) AS total, MAX(v) AS biggest, AVG(v) AS mean, COUNT(*) AS n";
 
 /// The read-your-writes contract over a build (#728; ADR-0002, "What `live`
 /// promises"): a workload runs while the target builds, and the moment the
@@ -444,6 +448,8 @@ const AGG_WIDE: &str = "TRANSFORM agg FROM public.src GROUP BY g \
 /// fold, and no later page writes it to cover for a fold.
 #[tokio::test]
 async fn a_target_reporting_live_meets_a_token_and_the_oracle_after_a_build_under_writes() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(200, &[AGG_WIDE]).await;
     f.pass().await;
     assert_eq!(f.status("agg").await.as_deref(), Some("backfilling"));
@@ -604,6 +610,8 @@ async fn a_target_reporting_live_meets_a_token_and_the_oracle_after_a_build_unde
 /// empties the delta table moves it to `live`.
 #[tokio::test]
 async fn the_flip_happens_only_after_the_last_merge() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(60, &[AGG]).await;
     f.pass().await;
     let pool = &f.db.pool;
@@ -657,6 +665,8 @@ async fn the_flip_happens_only_after_the_last_merge() {
 /// flip comes only once both committed.
 #[tokio::test]
 async fn the_flip_waits_for_every_merge_in_flight() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(60, &[AGG]).await;
     f.pass().await;
     let pool = &f.db.pool;
@@ -722,6 +732,8 @@ async fn the_flip_waits_for_every_merge_in_flight() {
 /// merger per partition, and the rest of the workers build.
 #[tokio::test]
 async fn a_worker_takes_a_chunk_while_others_merge() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(60, &[AGG]).await;
     f.pass().await;
     let pool = &f.db.pool;
@@ -779,6 +791,8 @@ async fn a_worker_takes_a_chunk_while_others_merge() {
 /// definition to `live`.
 #[tokio::test]
 async fn a_zero_row_source_goes_live_from_the_plan_job() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(0, &[AGG]).await;
     f.pass().await;
     assert_eq!(f.status("agg").await.as_deref(), Some("backfilling"));
@@ -797,6 +811,8 @@ async fn a_zero_row_source_goes_live_from_the_plan_job() {
 /// build still equals the oracle.
 #[tokio::test]
 async fn a_chunk_killed_mid_write_is_reclaimed_and_rerun() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(100, &[AGG]).await;
     f.pass().await;
     assert_eq!(f.step(&OPTIONS).await, Step::Planned);
@@ -851,6 +867,8 @@ async fn a_chunk_killed_mid_write_is_reclaimed_and_rerun() {
 /// finishes.
 #[tokio::test]
 async fn a_chunk_behind_a_held_entry_gives_up_and_is_retried_uncharged() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(40, &[AGG]).await;
     f.pass().await;
     // An entry for key 5, which the first chunk (ids 1..=10) covers.
@@ -900,6 +918,8 @@ async fn a_chunk_behind_a_held_entry_gives_up_and_is_retried_uncharged() {
 /// under twice the drain batch cap (B6); the plan job runs regardless.
 #[tokio::test]
 async fn chunks_wait_while_the_ring_has_a_backlog() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(40, &[AGG]).await;
     f.pass().await;
     f.drain().await;
@@ -936,6 +956,8 @@ async fn chunks_wait_while_the_ring_has_a_backlog() {
 /// the rows inserted after it.
 #[tokio::test]
 async fn a_truncate_during_the_build_is_absorbed() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(100, &[AGG]).await;
     f.pass().await;
     for _ in 0..4 {
@@ -966,6 +988,8 @@ async fn a_truncate_during_the_build_is_absorbed() {
 /// do.
 #[tokio::test]
 async fn a_drop_during_the_build_takes_its_work_with_it() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(100, &[AGG]).await;
     f.pass().await;
     for _ in 0..3 {
@@ -1014,8 +1038,10 @@ async fn a_drop_during_the_build_takes_its_work_with_it() {
 /// end equal to their oracles.
 #[tokio::test]
 async fn two_definitions_on_one_source_take_one_build_path_each() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     const MAXES: &str = "TRANSFORM agg_max FROM public.src GROUP BY g \
-         SELECT MAX(v) AS top, MAX(grp.w) AS w";
+        WITHOUT SOURCE INDEX SELECT MAX(v) AS top, MAX(grp.w) AS w";
     let mut f = Fixture::new(150, &[AGG]).await;
     f.raw
         .batch_execute(
@@ -1128,6 +1154,8 @@ async fn two_definitions_on_one_source_take_one_build_path_each() {
 /// Resuming the paused definition refuses and names the repair.
 #[tokio::test]
 async fn a_start_that_fails_pauses_its_definition_and_the_pass_starts_the_others() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(150, &[ONE, AGG]).await;
     f.raw
         .batch_execute("drop table public.one__ledger")
@@ -1181,8 +1209,10 @@ async fn a_start_that_fails_pauses_its_definition_and_the_pass_starts_the_others
 /// definition's build is dispatched in the same pass.
 #[tokio::test]
 async fn a_start_that_fails_doesn_t_stop_the_pass_discharging_other_markers() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     const MAXES: &str = "TRANSFORM agg_max FROM public.src GROUP BY g \
-         SELECT MAX(v) AS top, MAX(grp.w) AS w";
+        WITHOUT SOURCE INDEX SELECT MAX(v) AS top, MAX(grp.w) AS w";
     let mut f = Fixture::new(150, &[ONE]).await;
     f.raw
         .batch_execute(
@@ -1236,6 +1266,8 @@ async fn a_start_that_fails_doesn_t_stop_the_pass_discharging_other_markers() {
 /// definitions' builds.
 #[tokio::test]
 async fn a_start_that_fails_transiently_is_retried_next_pass_and_not_paused() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(150, &[ONE, AGG]).await;
     let holder = connect(f.db.dsn()).await;
     holder
@@ -1290,6 +1322,8 @@ async fn a_start_that_fails_transiently_is_retried_next_pass_and_not_paused() {
 /// repair.
 #[tokio::test]
 async fn a_live_definition_whose_ledger_is_dropped_is_quarantined_alone() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(50, &[ONE, AGG]).await;
     f.pass().await;
     f.run("one").await;
@@ -1348,6 +1382,8 @@ async fn a_live_definition_whose_ledger_is_dropped_is_quarantined_alone() {
 /// that finds nothing to claim makes the flip (`work_once`'s idle check).
 #[tokio::test]
 async fn a_flip_missed_by_a_dead_worker_is_made_by_the_next_idle_step() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(30, &[AGG]).await;
     f.pass().await;
     assert_eq!(f.step(&OPTIONS).await, Step::Planned);
@@ -1405,7 +1441,10 @@ async fn a_flip_missed_by_a_dead_worker_is_made_by_the_next_idle_step() {
 /// and the pass after that change drains starts it.
 #[tokio::test]
 async fn the_start_waits_for_the_widens_capture_gate() {
-    const COUNTS: &str = "TRANSFORM cnt FROM public.src GROUP BY g SELECT COUNT(*) AS n";
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
+    const COUNTS: &str =
+        "TRANSFORM cnt FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT COUNT(*) AS n";
     let mut f = Fixture::new(50, &[COUNTS]).await;
     f.pass().await;
     f.run("cnt").await;
@@ -1472,6 +1511,8 @@ async fn the_start_waits_for_the_widens_capture_gate() {
 /// the entries of the keys deleted meanwhile, which no chunk reaches.
 #[tokio::test]
 async fn a_resumed_build_rebuilds_over_its_entries_and_sweeps_the_deleted_keys() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(100, &[AGG]).await;
     f.pass().await;
     // The plan job and three chunks (ids 1..=30), and no merge.
@@ -1564,6 +1605,8 @@ async fn a_resumed_build_rebuilds_over_its_entries_and_sweeps_the_deleted_keys()
 /// start, with a sweep, and no marker.
 #[tokio::test]
 async fn a_quarantined_build_resumes_through_the_start() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(60, &[AGG]).await;
     f.pass().await;
     f.run("agg").await;
@@ -1606,6 +1649,8 @@ async fn a_quarantined_build_resumes_through_the_start() {
 /// entries it already re-derived finds nothing to do.
 #[tokio::test]
 async fn a_sweep_batch_rederives_stale_live_entries_in_bounded_windows() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(50, &[AGG]).await;
     f.pass().await;
     f.run("agg").await;
@@ -1691,6 +1736,8 @@ async fn a_sweep_batch_rederives_stale_live_entries_in_bounded_windows() {
 /// it.
 #[tokio::test]
 async fn a_rebuild_sweeps_a_deleted_key_only_apply_had_counted() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(30, &[AGG]).await;
     f.pass().await;
     f.run("agg").await;
@@ -1743,6 +1790,8 @@ async fn a_rebuild_sweeps_a_deleted_key_only_apply_had_counted() {
 /// is retired.
 #[tokio::test]
 async fn a_rebuild_sweeps_a_composite_typed_key() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(0, &[]).await;
     f.raw
         .batch_execute(
@@ -1772,7 +1821,7 @@ async fn a_rebuild_sweeps_a_composite_typed_key() {
     .collect();
     trellis::defs::install_definition(
         &f.db.pool,
-        "TRANSFORM cagg FROM public.csrc GROUP BY g SELECT SUM(v) AS total, COUNT(*) AS n",
+        "TRANSFORM cagg FROM public.csrc GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n",
         &columns,
         "public",
     )
@@ -1859,6 +1908,8 @@ async fn a_rebuild_sweeps_a_composite_typed_key() {
 /// `waiting_to_backfill` for the staging worker's start.
 #[tokio::test]
 async fn the_discharge_leaves_a_rederive_shape_to_the_start() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(20, &[AGG]).await;
     f.raw
         .batch_execute("insert into pending_backfill (table_name) values ('public.src')")
@@ -1908,6 +1959,8 @@ async fn the_discharge_leaves_a_rederive_shape_to_the_start() {
 /// no delta table.
 #[tokio::test]
 async fn a_one_to_one_build_goes_from_waiting_to_live_with_no_catch_up() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(200, &[ONE]).await;
     assert_eq!(
         f.status("one").await.as_deref(),
@@ -1958,6 +2011,8 @@ async fn a_one_to_one_build_goes_from_waiting_to_live_with_no_catch_up() {
 /// ends up in the target exactly as the source has it.
 #[tokio::test]
 async fn changes_drained_while_a_one_to_one_builds_are_applied() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(200, &[ONE]).await;
     f.pass().await;
     f.raw
@@ -2006,6 +2061,8 @@ async fn changes_drained_while_a_one_to_one_builds_are_applied() {
 /// rows of the keys deleted meanwhile, which no chunk reaches.
 #[tokio::test]
 async fn a_resumed_one_to_one_build_sweeps_the_keys_deleted_while_paused() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(100, &[ONE]).await;
     f.pass().await;
     // The plan job and three chunks (ids 1..=30).
@@ -2074,6 +2131,8 @@ async fn a_resumed_one_to_one_build_sweeps_the_keys_deleted_while_paused() {
 /// test above isn't passing for a reason other than the sweep.)
 #[tokio::test]
 async fn without_its_sweep_a_one_to_one_rebuild_keeps_a_deleted_key() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(30, &[ONE]).await;
     f.pass().await;
     f.run("one").await;
@@ -2105,6 +2164,8 @@ async fn without_its_sweep_a_one_to_one_rebuild_keeps_a_deleted_key() {
 /// `live` without its row, and its entry is never taken.
 #[tokio::test]
 async fn a_one_to_one_build_leaves_a_quarantined_key_out() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(50, &[ONE]).await;
     f.raw
         .batch_execute(
@@ -2137,6 +2198,8 @@ async fn a_one_to_one_build_leaves_a_quarantined_key_out() {
 /// and nothing is written to the target.
 #[tokio::test]
 async fn a_one_to_one_whose_source_lost_its_key_fails_through_its_plan_job() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     // `chunk_queue::MAX_CHARGED_ATTEMPTS`, which is crate-private.
     const MAX_CHARGED_ATTEMPTS: u32 = 5;
     let mut f = Fixture::new(50, &[ONE]).await;
@@ -2215,8 +2278,7 @@ async fn a_one_to_one_whose_source_lost_its_key_fails_through_its_plan_job() {
 
 /// A second `SUM` and `COUNT(*)` by `g` over the same source, registered
 /// once the first is live.
-const AGG2: &str =
-    "TRANSFORM agg2 FROM public.src GROUP BY g SELECT SUM(v) AS total, COUNT(*) AS n";
+const AGG2: &str = "TRANSFORM agg2 FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n";
 
 /// #733: a change committed before a build starts, in a batch drained only
 /// after the start, while a later change to its key was drained before the
@@ -2232,6 +2294,8 @@ const AGG2: &str =
 /// tier's stall).
 #[tokio::test]
 async fn a_batch_older_than_the_start_drained_after_it_does_not_revive_a_deleted_key() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(20, &[AGG]).await;
     f.pass().await;
     f.run("agg").await;
@@ -2304,6 +2368,8 @@ const ONE2: &str = "TRANSFORM one2 FROM public.src SELECT g AS g, v + v AS dbl";
 /// back for good.
 #[tokio::test]
 async fn a_batch_older_than_a_one_to_one_start_drained_after_it_does_not_revive_a_deleted_key() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(20, &[ONE]).await;
     f.pass().await;
     f.run("one").await;
@@ -2411,6 +2477,8 @@ async fn rederive_tombstone_outlives_a_batch_its_read_saw(
 
 #[tokio::test]
 async fn a_one_to_one_rederive_tombstone_outlives_a_batch_its_read_saw() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let f = rederive_tombstone_outlives_a_batch_its_read_saw(ONE, "one").await;
     assert_eq!(
         f.rows(ONE_ACTUAL).await,
@@ -2422,6 +2490,8 @@ async fn a_one_to_one_rederive_tombstone_outlives_a_batch_its_read_saw() {
 
 #[tokio::test]
 async fn an_aggregate_rederive_tombstone_outlives_a_batch_its_read_saw() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let f = rederive_tombstone_outlives_a_batch_its_read_saw(AGG, "agg").await;
     assert_eq!(
         f.rows(AGG_ACTUAL).await,
@@ -2481,11 +2551,15 @@ async fn rebuilds_leave_no_rows(definition: &str, target: &str) {
 
 #[tokio::test]
 async fn an_aggregate_s_done_build_rows_do_not_pile_up_over_rebuilds() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     rebuilds_leave_no_rows(AGG, "agg").await;
 }
 
 #[tokio::test]
 async fn a_one_to_one_s_done_build_rows_do_not_pile_up_over_rebuilds() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     rebuilds_leave_no_rows(ONE, "one").await;
 }
 
@@ -2496,6 +2570,8 @@ async fn a_one_to_one_s_done_build_rows_do_not_pile_up_over_rebuilds() {
 /// takes the rows with it.
 #[tokio::test]
 async fn done_rows_stay_until_the_flip() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(60, &[AGG]).await;
     f.pass().await;
     f.run_chunks_by_hand(usize::MAX).await;
@@ -2521,6 +2597,8 @@ async fn done_rows_stay_until_the_flip() {
 /// (#966). Completion still waits for every row of the resumed build.
 #[tokio::test]
 async fn a_resumed_build_s_flip_takes_the_superseded_builds_done_rows() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(100, &[AGG]).await;
     f.pass().await;
     assert_eq!(f.run_chunks_by_hand(4).await, 4);
@@ -2570,6 +2648,8 @@ async fn rows_of(f: &Fixture, target: &str) -> (i64, i64) {
 /// until the aggregate's own flip.
 #[tokio::test]
 async fn a_flip_leaves_another_definition_s_done_rows() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(60, &[ONE, AGG]).await;
     f.pass().await;
     f.run_chunks_by_hand(usize::MAX).await;
@@ -2599,6 +2679,8 @@ async fn a_flip_leaves_another_definition_s_done_rows() {
 /// when it runs it after the flip; giving it up discards the row.
 #[tokio::test]
 async fn a_chunk_held_across_a_resume_outlives_the_flip_and_is_discarded() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(60, &[AGG]).await;
     f.pass().await;
     assert_eq!(f.run_chunks_by_hand(1).await, 1, "the plan job");
@@ -2728,6 +2810,8 @@ async fn action_against_a_frozen_plan_batch(
 /// `backfill_chunks`). The resumed build then runs to live.
 #[tokio::test]
 async fn a_resume_arriving_mid_plan_batch_does_not_deadlock_with_it() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(60, &[AGG]).await;
     action_against_a_frozen_plan_batch(&mut f, "RESUME TRANSFORM agg")
         .await
@@ -2742,6 +2826,8 @@ async fn a_resume_arriving_mid_plan_batch_does_not_deadlock_with_it() {
 /// the plan row the batch holds.
 #[tokio::test]
 async fn a_drop_arriving_mid_plan_batch_does_not_deadlock_with_it() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(60, &[AGG]).await;
     action_against_a_frozen_plan_batch(&mut f, "DROP TRANSFORM agg")
         .await
@@ -2832,6 +2918,8 @@ async fn plan_batch_behind(f: &mut Fixture, action: &'static str) -> (i64, Resul
 /// stale: it stops as superseded and writes nothing.
 #[tokio::test]
 async fn a_plan_batch_behind_a_resume_stops_as_superseded() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(60, &[AGG]).await;
     let (plan_id, resumed) = plan_batch_behind(&mut f, "RESUME TRANSFORM agg").await;
     resumed.expect("the resume is not a deadlock victim");
@@ -2861,6 +2949,8 @@ async fn a_plan_batch_behind_a_resume_stops_as_superseded() {
 /// quietly having written nothing.
 #[tokio::test]
 async fn a_plan_batch_behind_a_drop_writes_nothing() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(60, &[AGG]).await;
     let (_, dropped) = plan_batch_behind(&mut f, "DROP TRANSFORM agg").await;
     dropped.expect("the drop is not a deadlock victim");
@@ -2877,6 +2967,8 @@ async fn a_plan_batch_behind_a_drop_writes_nothing() {
 /// re-derives from the source.
 #[tokio::test]
 async fn a_rebuild_deletes_target_rows_added_or_rekeyed_by_hand() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(150, &[ONE]).await;
     f.pass().await;
     f.run("one").await;
@@ -2907,6 +2999,8 @@ async fn a_rebuild_deletes_target_rows_added_or_rekeyed_by_hand() {
 /// leaving a build that fails.
 #[tokio::test]
 async fn a_resume_refuses_when_the_target_table_is_gone() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(150, &[ONE]).await;
     f.pass().await;
     f.run("one").await;
@@ -2935,6 +3029,8 @@ async fn a_resume_refuses_when_the_target_table_is_gone() {
 /// source, not deleted as unbacked.
 #[tokio::test]
 async fn a_rebuild_sweeps_many_hand_added_rows_and_keeps_a_row_the_source_backs() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(150, &[ONE]).await;
     f.pass().await;
     f.run("one").await;

@@ -106,7 +106,7 @@ fn composite_key(parts: &[&str]) -> String {
 /// #102's target shape (same relationship join, same aggregate, grouping key
 /// still a bare source column).
 const TAG_TOTALS: &str = "TRANSFORM tag_totals FROM post_tags GROUP BY tag \
-     SELECT COUNT(*) AS post_count, SUM(post.word_count) AS total_words";
+    WITHOUT SOURCE INDEX SELECT COUNT(*) AS post_count, SUM(post.word_count) AS total_words";
 
 /// Same shape as [`TAG_TOTALS`], plus a `MIN` field. Epic #127's fast reverse-
 /// delta path (`build_reverse_relationship_shape`) handles a fully invertible
@@ -121,7 +121,7 @@ const TAG_TOTALS: &str = "TRANSFORM tag_totals FROM post_tags GROUP BY tag \
 /// simplest way to force it, without changing what the transform otherwise
 /// computes.
 const TAG_TOTALS_RECOMPUTE_FALLBACK: &str = "TRANSFORM tag_totals FROM post_tags GROUP BY tag \
-     SELECT COUNT(*) AS post_count, SUM(post.word_count) AS total_words, \
+    WITHOUT SOURCE INDEX SELECT COUNT(*) AS post_count, SUM(post.word_count) AS total_words, \
             MIN(post.word_count) AS min_words";
 
 async fn install(pool: &trellis::Pool, columns: &HashMap<String, ValueType>) {

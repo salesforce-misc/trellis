@@ -405,11 +405,11 @@ impl Harness {
             .join(", ");
         for text in [
             format!(
-                "TRANSFORM r FROM public.ev GROUP BY {g}, a SELECT {aliased}, a AS a, COUNT(*) AS n",
+                "TRANSFORM r FROM public.ev GROUP BY {g}, a WITHOUT SOURCE INDEX SELECT {aliased}, a AS a, COUNT(*) AS n",
                 g = mode.group
             ),
             format!(
-                "TRANSFORM s FROM public.ev GROUP BY {g} SELECT {aliased}, SUM(b) AS total",
+                "TRANSFORM s FROM public.ev GROUP BY {g} WITHOUT SOURCE INDEX SELECT {aliased}, SUM(b) AS total",
                 g = mode.group
             ),
         ] {

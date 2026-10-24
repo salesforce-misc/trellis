@@ -27,8 +27,7 @@ use trellis::staging::partition_correction::{self, Options, Outcome};
 use trellis::{Config, CorrectingNode, TransformStatus, Trellis, TrellisOptions};
 
 const SOURCE: &str = "public.items";
-const DEFINITION: &str =
-    "TRANSFORM agg FROM public.items GROUP BY g SELECT SUM(v) AS total, COUNT(*) AS n";
+const DEFINITION: &str = "TRANSFORM agg FROM public.items GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n";
 
 /// `items` partitioned `by` on `g`, with the primary key a partitioned table
 /// needs. Leaves hold the groups 0-3, 4-7, 8-11 and 12-15.
@@ -285,6 +284,8 @@ fn entry(kind: &str, node: &str) -> (String, String) {
 /// Seeded: the aggregate starts equal to the source.
 #[tokio::test]
 async fn the_aggregate_starts_right_and_its_ledger_has_the_group_index() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let fx = Fx::start(&tree("hash")).await;
     assert!(fx.wrong_groups().await.is_empty());
     let indexed: i64 =
@@ -305,6 +306,8 @@ async fn the_aggregate_starts_right_and_its_ledger_has_the_group_index() {
 
 #[tokio::test]
 async fn a_detached_or_dropped_leaf_is_overcounted_until_its_correction_drains() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     for kind in ["hash", "range", "list"] {
         for op in ["detach", "drop"] {
             let mut fx = Fx::start(&tree(kind)).await;
@@ -349,6 +352,8 @@ async fn a_detached_or_dropped_leaf_is_overcounted_until_its_correction_drains()
 
 #[tokio::test]
 async fn an_attached_leaf_with_rows_is_undercounted_until_its_correction_drains() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     for kind in ["hash", "range", "list"] {
         let mut fx = Fx::start(&tree(kind)).await;
         // Take a leaf out, correct, and put a modified copy back.
@@ -388,6 +393,8 @@ async fn an_attached_leaf_with_rows_is_undercounted_until_its_correction_drains(
 /// which no ring row records.
 #[tokio::test]
 async fn a_new_leaf_with_direct_writes_before_its_capture_is_counted_by_its_correction() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     for kind in ["hash", "range", "list"] {
         let mut fx = Fx::start(&tree(kind)).await;
         // The replacement of a dropped leaf, so a hash tree has the remainder
@@ -439,6 +446,8 @@ async fn a_new_leaf_with_direct_writes_before_its_capture_is_counted_by_its_corr
 
 #[tokio::test]
 async fn a_dropped_middle_is_corrected_through_its_own_text() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut fx = Fx::start(
         "create table public.items (id integer not null, g integer not null, \
              v integer not null, primary key (g, id)) partition by range (g); \
@@ -471,6 +480,8 @@ async fn a_dropped_middle_is_corrected_through_its_own_text() {
 /// correction leaves them right.
 #[tokio::test]
 async fn a_default_whose_siblings_changed_and_a_dropped_sibling_leave_the_groups_right() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut fx = Fx::start(
         "create table public.items (id integer not null, g integer not null, \
              v integer not null, primary key (g, id)) partition by list (g); \
@@ -506,6 +517,8 @@ async fn a_default_whose_siblings_changed_and_a_dropped_sibling_leave_the_groups
 /// it, and dropping it retracts all of them.
 #[tokio::test]
 async fn a_lone_default_has_no_text_and_every_group_routes_to_it() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut fx = Fx::start(
         "create table public.items (id integer not null, g integer not null, \
              v integer not null, primary key (g, id)) partition by list (g); \
@@ -535,6 +548,8 @@ async fn a_lone_default_has_no_text_and_every_group_routes_to_it() {
 /// right as soon as the ring drains, with the correction still queued.
 #[tokio::test]
 async fn writes_through_the_parent_have_no_window() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut fx = Fx::start(&tree("range")).await;
     fx.exec("alter table public.items detach partition public.items_p0")
         .await;
@@ -559,6 +574,8 @@ async fn writes_through_the_parent_have_no_window() {
 /// not bring the removed rows back.
 #[tokio::test]
 async fn a_change_staged_before_the_ddl_does_not_resurrect_the_dropped_rows() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut fx = Fx::start(&tree("range")).await;
     // Staged, not drained: updates to the groups of the leaf about to go.
     fx.exec(
@@ -579,6 +596,8 @@ async fn a_change_staged_before_the_ddl_does_not_resurrect_the_dropped_rows() {
 /// deltas raises on any `DELETE`, and is in place while the engine runs.
 #[tokio::test]
 async fn the_correction_issues_no_delete_against_the_target_or_the_ledger() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut fx = Fx::start(&tree("hash")).await;
     fx.exec("drop table public.items_p0").await;
     fx.pass().await;
@@ -620,6 +639,8 @@ async fn the_correction_issues_no_delete_against_the_target_or_the_ledger() {
 /// first page's cursor, and the keys re-derived across both are the key set.
 #[tokio::test]
 async fn a_correction_resumes_after_its_last_committed_page() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut fx = Fx::start(&tree("range")).await;
     fx.exec("drop table public.items_p1").await;
     fx.pass().await;
@@ -675,6 +696,8 @@ async fn a_correction_resumes_after_its_last_committed_page() {
 /// `pg_inherits` row to go.
 #[tokio::test]
 async fn a_detach_pending_leaf_waits_for_the_detach_to_finalize() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut fx = Fx::start(&tree("range")).await;
     let holder = drain_driver::connect(fx.d.db.dsn()).await;
     holder
@@ -727,8 +750,9 @@ async fn a_detach_pending_leaf_waits_for_the_detach_to_finalize() {
 /// each, and leaves the queue only when both have.
 #[tokio::test]
 async fn every_aggregate_reading_the_source_is_corrected_before_the_queue_clears() {
-    const SECOND: &str =
-        "TRANSFORM agg2 FROM public.items GROUP BY g SELECT MAX(v) AS top, COUNT(*) AS n";
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
+    const SECOND: &str = "TRANSFORM agg2 FROM public.items GROUP BY g WITHOUT SOURCE INDEX SELECT MAX(v) AS top, COUNT(*) AS n";
     let mut fx = Fx::start_with(&tree("range"), &[DEFINITION, SECOND]).await;
     fx.exec("drop table public.items_p2").await;
     fx.pass().await;
@@ -760,8 +784,10 @@ async fn every_aggregate_reading_the_source_is_corrected_before_the_queue_clears
 /// `NULL` last, in pages smaller than a group.
 #[tokio::test]
 async fn a_nullable_second_group_column_pages_in_order_and_corrects_every_group() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     const GROUPED: &str = "TRANSFORM agg FROM public.items GROUP BY g, h \
-         SELECT SUM(v) AS total, COUNT(*) AS n";
+        WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n";
     let mut fx = Fx::start_with(
         "create table public.items (id integer not null, g integer not null, h integer, \
              v integer not null, primary key (g, id)) partition by range (g); \
@@ -803,6 +829,8 @@ async fn a_nullable_second_group_column_pages_in_order_and_corrects_every_group(
 /// page per call, finishes with the same counts as one call.
 #[tokio::test]
 async fn the_node_phase_resumes_from_its_cursor() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut fx = Fx::start(&tree("list")).await;
     fx.exec("alter table public.items detach partition public.items_p3")
         .await;
@@ -860,6 +888,8 @@ async fn the_node_phase_resumes_from_its_cursor() {
 #[tokio::test]
 #[ignore = "a measurement: run with logbook reserve and a memory cap"]
 async fn measure_a_correction_of_a_million_row_leaf() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut fx = Fx::start(
         "create table public.items (id integer not null, g integer not null, \
              v integer not null, primary key (g, id)) partition by range (g); \
@@ -933,6 +963,8 @@ async fn measure_a_correction_of_a_million_row_leaf() {
 /// twice the page.
 #[tokio::test]
 async fn a_rederive_page_reads_each_key_once_whether_or_not_its_row_is_there() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     const PAGE: usize = 2_000;
     let mut over = Vec::new();
     for op in ["present", "dropped"] {
@@ -1007,8 +1039,10 @@ fn handled_rows(line: &str) -> usize {
 /// correction routes every group of its bound, the leaf's among them.
 #[tokio::test]
 async fn a_gone_hash_leaf_whose_middle_was_dropped_after_it_is_covered_by_the_middles_correction() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     const GROUPED: &str = "TRANSFORM agg FROM public.items GROUP BY g, h \
-         SELECT SUM(v) AS total, COUNT(*) AS n";
+        WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n";
     let mut fx = Fx::start_with(
         "create table public.items (id integer not null, g integer not null, \
              h smallint not null, v integer not null, primary key (g, h, id)) \
@@ -1064,8 +1098,10 @@ async fn a_gone_hash_leaf_whose_middle_was_dropped_after_it_is_covered_by_the_mi
 /// corrects the region.
 #[tokio::test]
 async fn a_new_hash_leaf_whose_middle_was_dropped_completes_without_error() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     const GROUPED: &str = "TRANSFORM agg FROM public.items GROUP BY g, h \
-         SELECT SUM(v) AS total, COUNT(*) AS n";
+        WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n";
     let mut fx = Fx::start_with(
         "create table public.items (id integer not null, g integer not null, \
              h smallint not null, v integer not null, primary key (g, h, id)) \
@@ -1130,6 +1166,8 @@ async fn a_new_hash_leaf_whose_middle_was_dropped_completes_without_error() {
 /// nothing else would count the leaf's rows for this aggregate.
 #[tokio::test]
 async fn a_new_hash_leaf_moved_from_under_its_dropped_middle_is_still_counted() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     for reattach in [true, false] {
         a_new_hash_leaf_moved_from_under_its_dropped_middle(reattach).await;
     }
@@ -1139,9 +1177,9 @@ async fn a_new_hash_leaf_moved_from_under_its_dropped_middle_is_still_counted() 
 /// the leaf is attached to the root again, or left out of the tree.
 async fn a_new_hash_leaf_moved_from_under_its_dropped_middle(reattach: bool) {
     const GROUPED: &str = "TRANSFORM agg FROM public.items GROUP BY g, h \
-         SELECT SUM(v) AS total, COUNT(*) AS n";
+        WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n";
     const SECOND: &str = "TRANSFORM agg2 FROM public.items GROUP BY g, h \
-         SELECT MAX(v) AS top, COUNT(*) AS n";
+        WITHOUT SOURCE INDEX SELECT MAX(v) AS top, COUNT(*) AS n";
     let mut fx = Fx::start_with(
         "create table public.items (id integer not null, g integer not null, \
              h smallint not null, v integer not null, primary key (g, h, id)) \
@@ -1234,6 +1272,8 @@ async fn a_new_hash_leaf_moved_from_under_its_dropped_middle(reattach: bool) {
 /// until then rather than completing without it.
 #[tokio::test]
 async fn a_catching_up_aggregate_holds_the_correction_until_it_is_live() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut fx = Fx::start(&tree("range")).await;
     fx.exec("update transform_definitions set status = 'catching_up'")
         .await;
@@ -1262,6 +1302,8 @@ async fn a_catching_up_aggregate_holds_the_correction_until_it_is_live() {
 /// for a detach that is not happening.
 #[tokio::test]
 async fn a_leaf_attached_again_before_its_correction_ran_does_not_hold_the_queue() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     for kind in ["hash", "range", "list"] {
         let mut fx = Fx::start(&tree(kind)).await;
         fx.exec("alter table public.items detach partition public.items_p2")
@@ -1295,8 +1337,7 @@ async fn a_leaf_attached_again_before_its_correction_ran_does_not_hold_the_queue
     }
 }
 
-const SECOND_AGG: &str =
-    "TRANSFORM agg2 FROM public.items GROUP BY g SELECT MAX(v) AS top, COUNT(*) AS n";
+const SECOND_AGG: &str = "TRANSFORM agg2 FROM public.items GROUP BY g WITHOUT SOURCE INDEX SELECT MAX(v) AS top, COUNT(*) AS n";
 
 const RANGE_P2: &str = "alter table public.items attach partition public.items_p2 \
      for values from (8) to (12)";
@@ -1306,6 +1347,8 @@ const RANGE_P2: &str = "alter table public.items attach partition public.items_p
 /// one corrects the later operation too (#1151).
 #[tokio::test]
 async fn a_new_leaf_detected_while_an_older_one_is_held_by_a_paused_reader_is_queued_again() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut fx = Fx::start_with(&tree("range"), &[DEFINITION, SECOND_AGG]).await;
     fx.exec("alter table public.items detach partition public.items_p2")
         .await;
@@ -1337,6 +1380,8 @@ async fn a_new_leaf_detected_while_an_older_one_is_held_by_a_paused_reader_is_qu
 /// the first corrects the second.
 #[tokio::test]
 async fn a_gone_node_detected_while_an_older_one_is_held_by_a_paused_reader_is_queued_again() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut fx = Fx::start_with(&tree("range"), &[DEFINITION, SECOND_AGG]).await;
     fx.exec("alter table public.items detach partition public.items_p2")
         .await;
@@ -1361,6 +1406,8 @@ async fn a_gone_node_detected_while_an_older_one_is_held_by_a_paused_reader_is_q
 /// operation changed, so the later operation queues a fresh entry.
 #[tokio::test]
 async fn an_operation_on_a_node_whose_correction_is_part_way_queues_a_fresh_entry() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut fx = Fx::start(&tree("range")).await;
     fx.exec("alter table public.items detach partition public.items_p2")
         .await;
@@ -1397,6 +1444,8 @@ async fn an_operation_on_a_node_whose_correction_is_part_way_queues_a_fresh_entr
 /// queued entry add nothing.
 #[tokio::test]
 async fn repeated_detections_while_no_reader_has_started_queue_one_entry() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut fx = Fx::start(&tree("range")).await;
     fx.exec("alter table public.items detach partition public.items_p2")
         .await;
@@ -1471,6 +1520,8 @@ fn nested(kind: &str) -> String {
 /// in the queue.
 #[tokio::test]
 async fn every_lifecycle_operation_reports_backfilling_until_its_correction_drains() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     for kind in ["hash", "range", "list"] {
         for op in ["attach", "detach", "drop", "new leaf", "middle drop"] {
             let ddl = if op == "middle drop" {
@@ -1554,6 +1605,8 @@ async fn every_lifecycle_operation_reports_backfilling_until_its_correction_drai
 /// throughout, and `live` once the correction has drained.
 #[tokio::test]
 async fn a_worker_that_dies_before_the_last_page_commits_is_resumed_from_its_progress() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     const KEY: i64 = 1_062_002;
     let mut fx = Fx::start(&tree("range")).await;
     fx.exec("drop table public.items_p1").await;
@@ -1670,6 +1723,8 @@ async fn a_worker_that_dies_before_the_last_page_commits_is_resumed_from_its_pro
 /// `live` with nothing listed.
 #[tokio::test]
 async fn status_lists_the_node_under_correction_until_its_keys_drain() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     const KEY: i64 = 1_065_001;
     let mut fx = Fx::start(&tree("range")).await;
     let handle = Trellis::connect(
@@ -1789,8 +1844,9 @@ async fn status_lists_the_node_under_correction_until_its_keys_drain() {
 /// stays queued with the row, the record of why, until a resume.
 #[tokio::test]
 async fn a_failing_correction_holds_up_no_other_definition_and_pauses_its_own() {
-    const SECOND: &str =
-        "TRANSFORM agg2 FROM public.items GROUP BY g SELECT MAX(v) AS top, COUNT(*) AS n";
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
+    const SECOND: &str = "TRANSFORM agg2 FROM public.items GROUP BY g WITHOUT SOURCE INDEX SELECT MAX(v) AS top, COUNT(*) AS n";
     let mut fx = Fx::start_with(&tree("range"), &[DEFINITION, SECOND]).await;
     let ledger: String =
         fx.d.ctl

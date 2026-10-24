@@ -2923,7 +2923,7 @@ mod tests {
         for target in LOST_GROUP_TARGETS {
             crate::defs::catalog::install_definition(
                 &pool,
-                &format!("TRANSFORM {target} FROM items GROUP BY g SELECT sum(a) AS total"),
+                &format!("TRANSFORM {target} FROM items GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total"),
                 &columns,
                 "public",
             )
@@ -3021,6 +3021,7 @@ mod tests {
     /// exactly the rows one unbatched delete does. Each target loses 11
     /// groups: with a batch of 2, that's six deletes.
     #[tokio::test]
+    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
     async fn a_batched_delete_of_lost_groups_stages_what_one_delete_does() {
         let cluster = testkit::TestCluster::start();
         let control_db = cluster.create_isolated_database().await;
@@ -3085,6 +3086,7 @@ mod tests {
     /// and a batch of 1 makes each delete one group, so a row trigger logs
     /// the order the batches took.
     #[tokio::test]
+    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
     async fn a_batched_delete_of_lost_groups_takes_them_in_key_order() {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
@@ -3255,7 +3257,7 @@ mod tests {
     #[test]
     fn substitute_reads_a_source_column_in_an_aggregate_argument() {
         let def = crate::defs::parse(
-            "TRANSFORM t FROM s GROUP BY grp SELECT grp AS grp, SUM(val) AS val, \
+            "TRANSFORM t FROM s GROUP BY grp WITHOUT SOURCE INDEX SELECT grp AS grp, SUM(val) AS val, \
              MIN(val) AS lo, MAX(val) + 1 AS hi, val + COUNT(*) AS mean",
         )
         .expect("parse");
@@ -3274,7 +3276,7 @@ mod tests {
     #[test]
     fn substitute_reads_the_source_column_for_a_qualified_name() {
         let def = crate::defs::parse(
-            "TRANSFORM t FROM s GROUP BY grp SELECT grp AS grp, (grp + 1) AS val, \
+            "TRANSFORM t FROM s GROUP BY grp WITHOUT SOURCE INDEX SELECT grp AS grp, (grp + 1) AS val, \
              SUM(s.val) AS total, s.grp + val AS mixed",
         )
         .expect("parse");

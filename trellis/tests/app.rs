@@ -196,7 +196,7 @@ async fn a_column_of_an_unrecognized_type_is_not_admitted_to_the_validators_view
     );
 
     let grouped = trellis
-        .apply("TRANSFORM mood_totals FROM people GROUP BY m SELECT SUM(n) AS total")
+        .apply("TRANSFORM mood_totals FROM people GROUP BY m WITHOUT SOURCE INDEX SELECT SUM(n) AS total")
         .await
         .expect_err("an array GROUP BY key must be rejected at define time");
     let rendered = grouped.to_string();

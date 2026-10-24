@@ -18,7 +18,8 @@ use resume_passes::{
 use testkit::TestCluster;
 use trellis::defs::TransformStatus;
 
-const SUMS: &str = "TRANSFORM c_sums FROM public.c GROUP BY pid SELECT SUM(amount) AS total";
+const SUMS: &str =
+    "TRANSFORM c_sums FROM public.c GROUP BY pid WITHOUT SOURCE INDEX SELECT SUM(amount) AS total";
 const SUMS_ACTUAL: &str = "select pid::text, total::text from public.c_sums order by 1";
 const SUMS_ORACLE: &str =
     "select pid::text, sum(amount)::text from public.c group by pid order by 1";
@@ -86,7 +87,7 @@ async fn a_group_basis_aggregate_resumes_onto_its_source_converted_to_a_partitio
 }
 
 const JOINED: &str = "TRANSFORM jl FROM public.c LEFT JOIN public.p ON c.pid = p.pid \
-     GROUP BY c.pid SELECT c.pid AS pid, COUNT(*) AS n, SUM(p.w) AS sw";
+     GROUP BY c.pid WITHOUT SOURCE INDEX SELECT c.pid AS pid, COUNT(*) AS n, SUM(p.w) AS sw";
 const JOINED_ACTUAL: &str = "select pid::text, n::text, sw::text from public.jl order by 1";
 const JOINED_ORACLE: &str = "select c.pid::text, count(*)::text, sum(p.w)::text \
      from public.c left join public.p on c.pid = p.pid group by c.pid order by 1";

@@ -17,16 +17,12 @@ The first change to a page after a checkpoint logs the whole page (a full-page
 image); later changes before the next checkpoint log only the change. The
 more often checkpoints run, the more of the WAL is full-page images.
 
-The share depends on the target's shape. An aggregate's ledger keeps a
-`GROUP BY` index when the aggregate has a recomputed field (`MIN`, `MAX`, a
-float `SUM`, a composed field), a relationship feeds it, or its source is a
-partitioned table (a partition correction finds the entries of a node's groups
-through the index). A build inserts
-into that index at random positions, so once the index outgrows what a
-checkpoint interval leaves clean, almost every insert logs a full page. An
-invertible aggregate built by the Re-derive build keeps no such index, and
-writes few full-page images (0.18 million over 100M rows, against 25 million
-with the index) (#723).
+The share depends on the target's shape. An aggregate that reads a
+relationship path keeps a per-row ledger with a `GROUP BY` index; every other
+aggregate keeps no ledger. A build inserts into that index at random
+positions, so once the index outgrows what a checkpoint interval leaves
+clean, almost every insert logs a full page: 25 million full-page images over
+100M rows, against 0.18 million for a ledger without the index (#723).
 
 The #723 benchmark runs set `checkpoint_timeout=1min` and `max_wal_size=4GB`
 to stress a build, giving a requested checkpoint about every 10 seconds. There,
@@ -179,11 +175,9 @@ with the index to create
 
 ## Index an aggregate's group key when groups are large
 
-This applies to an aggregate kept on the group basis
-([ADR-0002](decisions/0002-async-data-flow.md#aggregates-a-basis-per-group-kept-by-deltas)),
-which today runs only behind a development switch; by default an aggregate
-is kept on its per-row ledger, which never reads a group's rows from the
-source.
+This applies to every aggregate that reads no relationship path, which Trellis
+keeps on the group basis
+([ADR-0002](decisions/0002-async-data-flow.md#aggregates-a-basis-per-group-kept-by-deltas)).
 
 On the group basis, some writes recompute an aggregate's groups from the
 source instead of adding a change to them: releasing a held key, its
@@ -207,9 +201,8 @@ create or drop changes speed only, never results.
 
 ## Partition large sources
 
-This applies to an aggregate kept on the group basis and to a `JOIN`, which
-today run only behind a development switch (see the previous section). Their
-targets are built, resumed and rebuilt in place from the source, and the size
+This applies to an aggregate kept on the group basis and to a `JOIN` (see the
+previous section). Their targets are built, resumed and rebuilt in place from the source, and the size
 of the source decides how long that takes.
 
 A fresh build, a `RESUME` and a rebuild in place of an **unpartitioned** source
@@ -217,10 +210,12 @@ run as one absolute write per structure, in one transaction. A `JOIN` whose
 sides are both unpartitioned writes both of its structures in one transaction.
 The transaction locks the groups it writes and holds its snapshot until it
 commits, so its lock window, its hold on `xmin` and the stall in retiring ring
-segments grow with the source. Extrapolated linearly from measurements at 100
-million rows to a billion, that is about 80 seconds for a plain aggregate,
-whose build statement runs serially, and about 1 to 36 minutes per structure
-for a `JOIN`, depending on its shape, which holds the sum of both. For that
+segments grow with the source. On a `JOIN` over an unpartitioned
+100-million-row fact table, a fresh build held `xmin` for 23 seconds grouped by
+a dimension attribute, and for 932 seconds, writing 15.9 GB of WAL, grouped by
+day and attribute
+([#1346](https://github.com/salesforce-misc/trellis/issues/1346) tracks the
+second). For that
 whole window the source's drain waits on the groups the build holds, and on a
 `JOIN` so do the other side's pages on the same keys. No ring segment retires
 until the build commits, so once the ring's slots fill, every source's drain

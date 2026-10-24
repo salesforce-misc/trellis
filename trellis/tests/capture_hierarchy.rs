@@ -143,7 +143,7 @@ async fn attaching_a_source_as_a_partition_pauses_its_readers() {
         &cluster,
         &[
             "TRANSFORM c_copy FROM public.c SELECT amount AS amount",
-            "TRANSFORM c_sums FROM public.c GROUP BY pid SELECT SUM(amount) AS total",
+            "TRANSFORM c_sums FROM public.c GROUP BY pid WITHOUT SOURCE INDEX SELECT SUM(amount) AS total",
             "TRANSFORM p_copy FROM public.p SELECT name AS name",
         ],
     )
@@ -296,7 +296,7 @@ async fn a_source_recreated_in_a_hierarchy_pauses_its_readers_and_gets_no_captur
     for (ddl, reason) in recreated {
         let mut it = instance(
             &cluster,
-            &["TRANSFORM c_sums FROM public.c GROUP BY pid SELECT SUM(amount) AS total"],
+            &["TRANSFORM c_sums FROM public.c GROUP BY pid WITHOUT SOURCE INDEX SELECT SUM(amount) AS total"],
         )
         .await;
         assert_live(&it.trellis, "c_sums").await;
@@ -324,7 +324,7 @@ async fn a_resume_onto_a_servable_partitioned_source_rebuilds_onto_the_tree() {
     let cluster = TestCluster::start();
     let mut it = instance(
         &cluster,
-        &["TRANSFORM c_sums FROM public.c GROUP BY pid SELECT SUM(amount) AS total"],
+        &["TRANSFORM c_sums FROM public.c GROUP BY pid WITHOUT SOURCE INDEX SELECT SUM(amount) AS total"],
     )
     .await;
     assert_live(&it.trellis, "c_sums").await;
@@ -399,7 +399,7 @@ async fn a_partitioned_source_recreated_as_a_plain_table_pauses_its_readers() {
         .await
         .expect("a partitioned source");
     it.trellis
-        .apply("TRANSFORM q_sums FROM public.q GROUP BY pid SELECT SUM(amount) AS total")
+        .apply("TRANSFORM q_sums FROM public.q GROUP BY pid WITHOUT SOURCE INDEX SELECT SUM(amount) AS total")
         .await
         .expect("define over the partitioned source");
     capture_pass(&mut it.raw, &it.db.pool).await;
@@ -435,7 +435,7 @@ async fn another_clusters_records_for_the_other_kind_of_table_are_forgotten() {
     let cluster = TestCluster::start();
     let mut it = instance(
         &cluster,
-        &["TRANSFORM c_sums FROM public.c GROUP BY pid SELECT SUM(amount) AS total"],
+        &["TRANSFORM c_sums FROM public.c GROUP BY pid WITHOUT SOURCE INDEX SELECT SUM(amount) AS total"],
     )
     .await;
     assert_live(&it.trellis, "c_sums").await;
@@ -482,7 +482,7 @@ async fn routine_maintenance_and_trellis_capture_ddl_pause_nothing() {
         &cluster,
         &[
             "TRANSFORM c_copy FROM public.c SELECT amount AS amount",
-            "TRANSFORM c_sums FROM public.c GROUP BY pid SELECT SUM(amount) AS total",
+            "TRANSFORM c_sums FROM public.c GROUP BY pid WITHOUT SOURCE INDEX SELECT SUM(amount) AS total",
         ],
     )
     .await;

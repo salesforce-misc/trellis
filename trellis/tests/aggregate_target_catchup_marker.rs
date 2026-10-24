@@ -30,6 +30,7 @@ use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::{ValueType, chunk_queue, install_definition};
 use trellis::intake::markers;
+use trellis::integer::IntWidth;
 use trellis::staging::{has_pending, retire_drained_segments};
 
 const TEST_NAME: &str = "aggregate_target_catchup_marker_test";
@@ -121,17 +122,21 @@ fn columns(pairs: &[(&str, ValueType)]) -> HashMap<String, ValueType> {
 
 fn sales_columns() -> HashMap<String, ValueType> {
     columns(&[
-        ("id", ValueType::Numeric),
+        ("id", ValueType::Integer(IntWidth::Int4)),
         ("sku", ValueType::Text),
-        ("amount", ValueType::Numeric),
+        ("amount", ValueType::Integer(IntWidth::Int4)),
     ])
 }
 
 fn sku_totals_columns() -> HashMap<String, ValueType> {
-    columns(&[("sku", ValueType::Text), ("total", ValueType::Numeric)])
+    columns(&[
+        ("sku", ValueType::Text),
+        ("total", ValueType::Integer(IntWidth::Int8)),
+    ])
 }
 
-const SKU_TOTALS: &str = "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT sum(amount) AS total";
+const SKU_TOTALS: &str =
+    "TRANSFORM sku_totals FROM sales GROUP BY sku WITHOUT SOURCE INDEX SELECT sum(amount) AS total";
 
 /// Installs [`SKU_TOTALS`], settles its background build (#419), and
 /// discharges the catch-up marker its build parks on `sales` when it goes
@@ -279,6 +284,7 @@ async fn catchup_marker_on_an_aggregate_target_feeding_a_one_to_one_discharges()
 /// NULL-keyed group must be enumerated under its NULL-encoded key and decode
 /// back to the `sku is null` row downstream.
 #[tokio::test]
+#[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
 async fn catchup_marker_on_an_aggregate_target_feeding_an_aggregate_discharges() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -294,7 +300,7 @@ async fn catchup_marker_on_an_aggregate_target_feeding_an_aggregate_discharges()
         .expect("hold sku_totals' readers out of the Re-derive build");
     install_definition(
         &db.pool,
-        "TRANSFORM sku_totals_v2 FROM sku_totals GROUP BY sku SELECT sum(total) AS total2",
+        "TRANSFORM sku_totals_v2 FROM sku_totals GROUP BY sku WITHOUT SOURCE INDEX SELECT sum(total) AS total2",
         &sku_totals_columns(),
         "public",
     )

@@ -28,7 +28,7 @@ const DDL: &str = "create table public.a (id integer primary key, g varchar(5), 
 
 const LEFT: &str = "TRANSFORM l FROM public.a LEFT JOIN public.b ON a.k = b.k \
      GROUP BY a.g, b.h \
-     SELECT a.g AS g, b.h AS h, COUNT(*) AS n, SUM(a.x) AS sx, SUM(b.y) AS sy";
+    WITHOUT SOURCE INDEX SELECT a.g AS g, b.h AS h, COUNT(*) AS n, SUM(a.x) AS sx, SUM(b.y) AS sy";
 
 const ORACLE: &str = "select a.g, b.h, count(*)::bigint as n, sum(a.x)::bigint as sx, \
                              sum(b.y)::bigint as sy \
@@ -212,9 +212,9 @@ async fn no_table_a_join_or_group_basis_creates_holds_a_bounded_varchar() {
         &[
             LEFT,
             "TRANSFORM by_id FROM public.a JOIN public.b ON a.k = b.k \
-             GROUP BY a.id SELECT a.id AS id, COUNT(*) AS n",
+             GROUP BY a.id WITHOUT SOURCE INDEX SELECT a.id AS id, COUNT(*) AS n",
             "TRANSFORM per_gk FROM public.a GROUP BY g, k \
-             SELECT g AS g, k AS k, COUNT(*) AS n, SUM(x) AS sx",
+            WITHOUT SOURCE INDEX SELECT g AS g, k AS k, COUNT(*) AS n, SUM(x) AS sx",
         ],
         &["public.a", "public.b"],
     )

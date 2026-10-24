@@ -18,8 +18,7 @@ use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ValueType;
 
 const SOURCE: &str = "public.items";
-const DEFINITION: &str =
-    "TRANSFORM agg FROM public.items GROUP BY g SELECT SUM(v) AS total, COUNT(*) AS n";
+const DEFINITION: &str = "TRANSFORM agg FROM public.items GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n";
 
 const TREE: &str = "create table public.items (id integer not null, g integer not null, \
          v integer not null, primary key (g, id)) partition by range (g); \
@@ -67,6 +66,8 @@ async fn wrong_groups(d: &Driver) -> Vec<String> {
 
 #[tokio::test]
 async fn a_renamed_partition_key_column_pauses_the_reader_and_resume_rebuilds() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut d = Driver::start(
         TREE,
         &[

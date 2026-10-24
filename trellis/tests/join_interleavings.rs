@@ -23,6 +23,35 @@
 //! (`a.t = b.t AND a.k = b.k`), where decoy rows share a scenario's `k` but
 //! not its `t`; on the single-column key the decoys sit on a key of their
 //! own, so they never keep a scenario's key matched.
+//!
+//! A test is named for the J1 family it ports:
+//!
+//! - 1, a fact write against a dimension row moving groups: `family1_…`.
+//! - 2, matched/unmatched flips and a key's first sight: `family2_…`.
+//! - 3, two dimension pages on one key: `family3_…`.
+//! - 4 and 5, duplicate dimension rows and `NULL` keys and values:
+//!   `families4_5_…` and `a_null_key_takes_no_j_row_or_lock`.
+//! - 6, key changes, sorted `J` locks and deadlock probes: `family6_…`.
+//! - 7, out-of-order pages: `family7_out_of_order_pages`.
+//! - 8, a `P` or `M` cell's recompute against a page of the other side:
+//!   `family8_…`. The recompute is an image-less change's page; a held
+//!   key's release is the same recompute in a transaction of its own
+//!   (`a_release_takes_the_j_lock_against_the_other_sides_pages`).
+//! - 9, chunked builds of `P` and `M` under writes: `family9_…`. The engine
+//!   builds both sides in one transaction, in a fixed order, or per side and
+//!   leaf when a side is partitioned, so J1's permuted chunk orders and its
+//!   chunk-against-chunk races have no counterpart. `family9_…` races pages
+//!   of both sides against a build frozen at each point, a build against a
+//!   page frozen at each point, and recomputes between two steps of a
+//!   build; the tests from "the build" on cover one side's writes
+//!   (`build_pages_around_a_build_…`), the lock statements and the steps of
+//!   a build with a partitioned side.
+//! - 10, `TRUNCATE` of either side: `family10_…`.
+//! - 11, savepoints, rolled-back sources and two-phase commit:
+//!   `family11_…` and `a_j_row_inserted_by_a_rolled_back_page_leaves_nothing`.
+//! - 12, mixed pages: `family12_…`.
+//! - 13, tombstone collection before stale pages drain: `family13_…`.
+//! - 14, `T` in the page's own transaction: `family14_…`.
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
@@ -34,6 +63,7 @@ use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ValueType;
 use trellis::integer::IntWidth;
 use trellis::staging::interleave::PausePoint;
+use trellis::{JoinBuildStep, JoinSide, JoinSidePart};
 
 const DDL: &str = "create table public.a (id integer primary key, ga integer, t integer, \
                        k integer, x integer); \
@@ -163,7 +193,7 @@ impl Kind {
             .collect();
         format!(
             "TRANSFORM {} FROM public.a {} public.b ON {} GROUP BY {} \
-             SELECT {}, COUNT(*) AS n, COUNT(a.x) AS cx, SUM(a.x) AS sx, \
+            WITHOUT SOURCE INDEX SELECT {}, COUNT(*) AS n, COUNT(a.x) AS cx, SUM(a.x) AS sx, \
              COUNT(b.y) AS cy, SUM(b.y) AS sy",
             self.name,
             if self.left { "LEFT JOIN" } else { "JOIN" },
@@ -438,8 +468,8 @@ impl Lab {
 
     /// Whether `other` queued behind backend `pid` (`true`) or ran to its
     /// end (`false`). Both are states the scenario forced; this only waits
-    /// for the second drain to reach one of them.
-    async fn queued_or_done(&self, other: &RunningDrain, pid: i32) -> bool {
+    /// for the second drain (or build) to reach one of them.
+    async fn queued_or_done<T>(&self, other: &drain_driver::Running<T>, pid: i32) -> bool {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             if other.is_finished() {
@@ -1100,6 +1130,51 @@ async fn family11_savepoints_and_rolled_back_sources() {
     );
 }
 
+/// J1 family 11's two-phase commit: a source transaction that changes both
+/// sides of a key is prepared, then committed or rolled back, with or
+/// without a recompute of the key's cells (image-less changes, drained)
+/// while it is prepared. The prepared transaction is in progress in the
+/// recompute's snapshot, so the recompute's basis doesn't count it, and its
+/// pages apply once it commits; rolled back, it leaves nothing.
+#[tokio::test]
+async fn family11_two_phase_commit() {
+    const PREPARED: &str = "insert into public.a values ({id} + 5, {g3}, {k}, 5); \
+                            update public.b set gb = {g2} where id = {id} + 1; \
+                            insert into public.b values ({id} + 5, {k}, {g3}, 5)";
+    let mut lab = lab(Key::Pair, &[L, I]).await;
+    let mut n = 0;
+    for commit in [true, false] {
+        for recompute in [false, true] {
+            n += 1;
+            let context = format!("commit: {commit}, a recompute while prepared: {recompute}");
+            lab.step(&fill(SEED, n, lab.key)).await;
+            let gid = format!("family11_{n}");
+            lab.write(&format!(
+                "begin; {}; prepare transaction '{gid}'",
+                fill(PREPARED, n, lab.key)
+            ))
+            .await;
+            if recompute {
+                let row = (100 * n + 1).to_string();
+                lab.d
+                    .stage_recomputes_with_prior("public.a", &[(row.as_str(), None)])
+                    .await;
+                lab.d
+                    .stage_recomputes_with_prior("public.b", &[(row.as_str(), None)])
+                    .await;
+                let recomputed = lab.d.seal().await;
+                lab.d.drain(recomputed, "recompute").await;
+                lab.check_applied(&context).await;
+            }
+            let end = if commit { "commit" } else { "rollback" };
+            lab.write(&format!("{end} prepared '{gid}'")).await;
+            let batch = lab.d.seal().await;
+            lab.d.drain(batch, "prepared").await;
+            lab.check(&context).await;
+        }
+    }
+}
+
 /// The decision on #1108: a `J` row a page inserts for a key no row had,
 /// in a page that rolls back, leaves nothing behind; the page's retry
 /// creates it.
@@ -1365,7 +1440,7 @@ async fn composed_fields_expression_arguments_and_numeric_scale() {
         ],
         &[
             "TRANSFORM r FROM public.o LEFT JOIN public.c ON o.cid = c.id GROUP BY c.region \
-           SELECT c.region AS region, COUNT(*) AS n, SUM(o.amount) AS revenue, \
+          WITHOUT SOURCE INDEX SELECT c.region AS region, COUNT(*) AS n, SUM(o.amount) AS revenue, \
                   AVG(o.amount) AS mean, SUM(o.qty + 1) AS q1, COUNT(c.weight) AS w, \
                   COALESCE(SUM(c.weight), 0) + COUNT(o.qty) AS mixed, \
                   SUM(o.qty) > COUNT(*) AS many",
@@ -1896,6 +1971,307 @@ async fn a_release_takes_the_j_lock_against_the_other_sides_pages() {
     }
 }
 
+// ------------------------------------------------------------- family 8
+
+/// When J1 family 8's late change to the recomputed row commits, relative
+/// to the recompute: before either page starts (`Pre`); while one of the two
+/// pages is frozen (`Mid`); after both committed (`Post`); or in a
+/// transaction opened before either page starts and committed after both,
+/// so it is in progress at the recompute's snapshot (`Xip`). Its own page
+/// drains after both, whichever it is.
+#[derive(Debug, Clone, Copy)]
+enum Late {
+    Pre,
+    Mid,
+    Post,
+    Xip,
+}
+
+/// One side's recompute in a J1 family 8 scenario (templates for [`fill`]):
+/// the change capture never sees, which the recompute repairs; whether the
+/// recompute carries the row's prior image (the row is gone, so only the
+/// hint names its cell); the late change of the recomputed cell; and a page
+/// of the other side on the same key.
+struct Recompute {
+    name: &'static str,
+    table: &'static str,
+    drift: &'static str,
+    prior: bool,
+    late: &'static str,
+    other: &'static str,
+}
+
+const OTHER_A: &str = "update public.a set ga = {g3}, x = x + 1 where id = {id} + 2; \
+                       insert into public.a values ({id} + 3, {g4}, {k}, 2)";
+
+const RECOMPUTES: [Recompute; 3] = [
+    Recompute {
+        name: "a P cell's recompute against a b page",
+        table: "public.a",
+        drift: "update public.a set x = x + 5 where id = {id} + 1",
+        prior: false,
+        late: "update public.a set x = x + 100 where id = {id} + 1",
+        other: "update public.b set gb = {g2}, y = y + 1 where id = {id} + 1",
+    },
+    Recompute {
+        name: "an M cell's recompute against an a page",
+        table: "public.b",
+        drift: "update public.b set y = y + 5 where id = {id} + 1",
+        prior: false,
+        late: "update public.b set y = y + 100 where id = {id} + 1",
+        other: OTHER_A,
+    },
+    Recompute {
+        name: "an M recompute that crosses matches to 0, against an a page",
+        table: "public.b",
+        drift: "delete from public.b where id = {id} + 1",
+        prior: true,
+        late: "insert into public.b values ({id} + 4, {k}, {g1}, 7)",
+        other: OTHER_A,
+    },
+];
+
+impl Recompute {
+    /// Stages the recompute of scenario `n`'s row `{id} + 1` and seals it
+    /// into a batch of its own.
+    async fn sealed(&self, lab: &mut Lab, n: i32) -> i64 {
+        let row = (100 * n + 1).to_string();
+        // SEED's row `{id} + 1` of `b`, the only one of its key.
+        let prior = self.prior.then(|| {
+            format!(
+                r#"{{"id": {row}, "t": {n}, "k": {n}, "gb": {}, "y": 100}}"#,
+                10 * n + 1
+            )
+        });
+        lab.d
+            .stage_recomputes_with_prior(self.table, &[(row.as_str(), prior)])
+            .await;
+        lab.d.seal().await
+    }
+}
+
+/// One J1 family 8 scenario on key `n`: `r`'s recompute and a page of the
+/// other side on the same key, one frozen at `point` while the other
+/// drains (queued behind it once it holds the key's `J` row), with the late
+/// change committed at `late`.
+async fn recompute_race(
+    lab: &mut Lab,
+    n: i32,
+    r: &Recompute,
+    late: Late,
+    recompute_frozen: bool,
+    point: PausePoint,
+) {
+    let context = format!(
+        "{:?}/{}: {}, late change {late:?}, {} frozen at {point:?}",
+        lab.key,
+        lab.kinds[0].name,
+        r.name,
+        if recompute_frozen {
+            "the recompute"
+        } else {
+            "the other side's page"
+        }
+    );
+    let key = lab.key;
+    lab.step(&fill(SEED, n, key)).await;
+    uncaptured(lab, r.table, &fill(r.drift, n, key)).await;
+    let recompute = r.sealed(lab, n).await;
+    let other = lab.sealed(&fill(r.other, n, key)).await;
+    let xip = match late {
+        Late::Pre => {
+            lab.write(&fill(r.late, n, key)).await;
+            None
+        }
+        Late::Xip => {
+            let client = lab.d.user().await;
+            client
+                .batch_execute(&format!("begin; {}", fill(r.late, n, key)))
+                .await
+                .expect("open the late transaction");
+            Some(client)
+        }
+        _ => None,
+    };
+    let (first, second) = if recompute_frozen {
+        (recompute, other)
+    } else {
+        (other, recompute)
+    };
+    let target = lab.kinds[0].target();
+    let mut frozen = lab
+        .d
+        .drain_frozen(first, "x", &[(point, target.as_str())])
+        .await;
+    let reached = frozen.reached(point).await;
+    let page = lab.d.drain_frozen(second, "y", &[]).await;
+    let queued = lab.queued_or_done(&page, reached.backend_pid).await;
+    assert_eq!(
+        queued,
+        holds_j(point, false),
+        "{context}: does the second page queue behind the frozen one?"
+    );
+    if let Late::Mid = late {
+        lab.write(&fill(r.late, n, key)).await;
+    }
+    lab.d.release(&mut frozen, point).await;
+    frozen.finish().await;
+    page.finish().await;
+    lab.check_applied(&context).await;
+    match late {
+        Late::Post => lab.write(&fill(r.late, n, key)).await,
+        Late::Xip => xip
+            .expect("the late transaction")
+            .batch_execute("commit")
+            .await
+            .expect("commit the late transaction"),
+        Late::Pre | Late::Mid => {}
+    }
+    // The late change's page: refused where the recompute's basis covers
+    // it, applied as a delta where it doesn't.
+    lab.check(&context).await;
+}
+
+/// J1 family 8: a `P` cell's recompute against a page of `b` on the same
+/// key, and an `M` cell's (one of them crossing `J.matches` to 0) against a
+/// page of `a`, either one frozen at each point before its commit, with a
+/// late change of the recomputed cell committed before, during, after or
+/// across the recompute. The recompute is an image-less change's (a
+/// `Recompute` ring row), which repairs a change capture never saw.
+/// [`a_release_takes_the_j_lock_against_the_other_sides_pages`] pins the
+/// same lock order for a held key's release.
+async fn recomputes_vs_the_other_side(key: Key, kind: Kind) {
+    let mut lab = lab(key, &[kind]).await;
+    let mut n = 0;
+    for r in &RECOMPUTES {
+        for late in [Late::Pre, Late::Mid, Late::Post, Late::Xip] {
+            for recompute_frozen in [true, false] {
+                for point in &POINTS[..6] {
+                    n += 1;
+                    recompute_race(&mut lab, n, r, late, recompute_frozen, *point).await;
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn family8_recomputes_vs_the_other_side_left() {
+    recomputes_vs_the_other_side(Key::Single, L).await;
+}
+
+#[tokio::test]
+async fn family8_recomputes_vs_the_other_side_inner_pair_key() {
+    recomputes_vs_the_other_side(Key::Pair, I).await;
+}
+
+/// J1 family 8: a cell recomputed twice around a captured change of it,
+/// with capture missing a change before each recompute. The change commits
+/// after the first recompute and before the second; its page drains between
+/// the two recomputes' pages (applied as a delta, then rewritten by the
+/// second) or after both (refused by the second's basis), and the end is
+/// the oracle either way.
+#[tokio::test]
+async fn family8_a_cell_recomputed_twice_around_a_change() {
+    let mut lab = lab(Key::Single, &[L, I]).await;
+    let mut n = 0;
+    for r in &RECOMPUTES[..2] {
+        for change_between in [true, false] {
+            n += 1;
+            let context = format!("{}, the change drained between: {change_between}", r.name);
+            lab.step(&fill(SEED, n, lab.key)).await;
+            uncaptured(&lab, r.table, &fill(r.drift, n, lab.key)).await;
+            let first = r.sealed(&mut lab, n).await;
+            lab.d.drain(first, "x").await;
+            lab.check_applied(&context).await;
+            let change = lab.sealed(&fill(r.late, n, lab.key)).await;
+            uncaptured(&lab, r.table, &fill(r.drift, n, lab.key)).await;
+            let second = r.sealed(&mut lab, n).await;
+            if change_between {
+                lab.d.drain(change, "x").await;
+                lab.check_applied(&context).await;
+                lab.d.drain(second, "x").await;
+            } else {
+                lab.d.drain(second, "x").await;
+                lab.check_applied(&context).await;
+                lab.d.drain(change, "x").await;
+            }
+            lab.check(&context).await;
+        }
+    }
+}
+
+// ------------------------------------------------------------ family 13
+
+/// J1 family 13: a recompute takes cells of both sides to zero while the
+/// captured deletes that emptied them are still undrained, and tombstone
+/// collection runs before those pages drain. A zero cell's basis is what
+/// refuses its stale pages, so no collection may remove a zero cell before
+/// the drained prefix passes them: the cells and their basis outlive the
+/// collection, and the stale pages are refused rather than applied a second
+/// time. A collection that ignored the drained prefix (J1's `S13.gc-early`
+/// control) fails both checks.
+#[tokio::test]
+async fn family13_zero_cells_outlive_collection_until_their_stale_pages_drain() {
+    for key in [Key::Single, Key::Pair] {
+        let mut lab = lab(key, &[L, I]).await;
+        lab.step(&fill(SEED, 1, key)).await;
+        let stale = lab
+            .sealed(
+                "delete from public.a where id in (101, 102); \
+                 delete from public.b where id = 101",
+            )
+            .await;
+        lab.d
+            .stage_recomputes_with_prior(
+                "public.a",
+                &[
+                    (
+                        "101",
+                        Some(r#"{"id": 101, "ga": 11, "t": 1, "k": 1, "x": 10}"#.to_string()),
+                    ),
+                    (
+                        "102",
+                        Some(r#"{"id": 102, "ga": 12, "t": 1, "k": 1, "x": null}"#.to_string()),
+                    ),
+                ],
+            )
+            .await;
+        lab.d
+            .stage_recomputes_with_prior(
+                "public.b",
+                &[(
+                    "101",
+                    Some(r#"{"id": 101, "t": 1, "k": 1, "gb": 11, "y": 100}"#.to_string()),
+                )],
+            )
+            .await;
+        let recompute = lab.d.seal().await;
+        lab.d.drain(recompute, "r").await;
+        lab.check_applied("after the recompute").await;
+        lab.d.retire().await;
+        lab.d.collect_tombstones().await;
+        for kind in [L, I] {
+            for (part, cells) in [("p", 2), ("m", 1)] {
+                let hidden = lab.hidden(kind, part).await;
+                assert_eq!(
+                    lab.scalar(&format!(
+                        "select count(*) from {hidden} \
+                         where k = 1 and __n = 0 and __basis is not null"
+                    ))
+                    .await,
+                    cells.to_string(),
+                    "{key:?}/{}: {part}'s zero cells stay through the collection",
+                    kind.name
+                );
+            }
+        }
+        lab.d.drain(stale, "stale").await;
+        lab.check(&format!("{key:?}: the stale pages drained"))
+            .await;
+    }
+}
+
 /// A `JOIN` whose side is a partitioned root with no rows builds like any
 /// other (there is nothing to bound); with rows it builds per leaf
 /// ("Partitioned sides" below).
@@ -1920,7 +2296,7 @@ async fn a_partitioned_side_with_no_rows_builds_whole() {
         ],
         &[
             "TRANSFORM l FROM public.a LEFT JOIN public.b ON a.k = b.k GROUP BY a.ga \
-           SELECT a.ga AS ga, COUNT(*) AS n",
+          WITHOUT SOURCE INDEX SELECT a.ga AS ga, COUNT(*) AS n",
         ],
         &["public.a", "public.b"],
     )
@@ -1932,49 +2308,6 @@ async fn a_partitioned_side_with_no_rows_builds_whole() {
     };
     lab.build().await;
     lab.assert_built("a partitioned side with no rows").await;
-}
-
-/// A side that is another transform's target (whose feed is #1100's) fails
-/// the build and pauses the definition.
-#[tokio::test]
-async fn the_knob_refuses_a_join_over_a_target() {
-    trellis::dev::staging::set_group_basis(true);
-    let d = Driver::start(
-        DDL,
-        &[
-            ("id", int4()),
-            ("t", int4()),
-            ("k", int4()),
-            ("gb", int4()),
-            ("y", int4()),
-        ],
-        &["TRANSFORM c FROM public.b SELECT t AS t, k AS k, gb AS gb, y AS y"],
-        &["public.a", "public.b"],
-    )
-    .await;
-    trellis::defs::install_definition(
-        d.pool(),
-        "TRANSFORM l FROM public.a LEFT JOIN public.c ON a.k = c.k GROUP BY c.gb WITHOUT SOURCE INDEX \
-         SELECT c.gb AS gb, COUNT(*) AS n",
-        &[("id".to_string(), int4()), ("k".to_string(), int4())].into(),
-        "public",
-    )
-    .await
-    .expect("define");
-    trellis::intake::markers::settle_registrations(d.pool()).await;
-    assert_eq!(
-        d.rows("select status::text from transform_definitions where target_table = 'public.l'")
-            .await,
-        ["(paused)"],
-        "the build fails on a side that is a target"
-    );
-    let error = d
-        .rows("select string_agg(last_error, ' | ') from backfill_chunks")
-        .await;
-    assert!(
-        error.len() == 1 && error[0].contains("another definition's target"),
-        "{error:?}"
-    );
 }
 
 /// Each changed `T` group reaches the target-mutation seam with its prior
@@ -2049,7 +2382,7 @@ async fn a_truncate_of_the_joined_side_refills_typed_unmatched_groups() {
         &[
             "TRANSFORM r FROM public.o LEFT JOIN public.c ON o.cid = c.cid AND o.rid = c.rid \
              GROUP BY o.region, c.at, c.price \
-             SELECT o.region AS region, c.at AS at, c.price AS price, COUNT(*) AS n, \
+            WITHOUT SOURCE INDEX SELECT o.region AS region, c.at AS at, c.price AS price, COUNT(*) AS n, \
                     SUM(o.amount) AS revenue, SUM(c.w) AS w",
         ],
         &["public.o", "public.c"],
@@ -2426,6 +2759,207 @@ async fn build_pages_around_a_build_left() {
 #[tokio::test]
 async fn build_pages_around_a_build_inner_pair_key() {
     pages_around_a_build(Key::Pair, I).await;
+}
+
+/// J1 family 9's writes on both sides of one build, on [`BUILD_SEED`]'s
+/// keys (all enumerated): before it starts, while it is frozen (one
+/// statement per side), and after its commit.
+const BOTH_BEFORE: &str = "update public.a set ga = 2 where id = 2; \
+                           insert into public.b values (40, 0, 3, 10, 9)";
+const BOTH_DURING_A: &str = "update public.a set x = x + 1 where id = 3; \
+                             insert into public.a values (41, 4, 0, 8, 6)";
+const BOTH_DURING_B: &str = "update public.b set y = y + 1 where id = 2; \
+                             delete from public.b where id = 5";
+const BOTH_AFTER: &str = "delete from public.a where id = 1; \
+                          update public.b set k = 2 where id = 1";
+
+/// J1 family 9: a build with writes landing on both sides, before it
+/// starts, while it is frozen at each step and after its commit. While it
+/// is frozen, either a page of each side drains (on keys of their own, so
+/// each queues on the build, not on the other) or one mixed page carrying
+/// both; each queues behind the build once it holds its `J` rows, and runs
+/// through before that. The build's commit and the pages leave the
+/// oracle's rows. A fresh build, whose `J` inserts hold the keys, and a
+/// rebuild in place, where every `J` row exists and its `J` lock holds them.
+async fn writes_on_both_sides_around_a_build(key: Key, kind: Kind, mixed: bool, in_place: bool) {
+    for point in BUILD_POINTS {
+        let context = format!(
+            "{key:?} {} at {point:?}, mixed: {mixed}, in place: {in_place}",
+            kind.name
+        );
+        let held = at_or_after(point, Some(PausePoint::AfterJoinLock));
+        let mut lab = seeded(key, &[kind], BUILD_SEED).await;
+        let job = if in_place {
+            lab.build().await;
+            request_rebuild(&lab, "a").await;
+            "sweep"
+        } else {
+            "plan"
+        };
+        // The ring holds two undrained batches here, and the frozen build
+        // lets only one seal through (it is open across the predecessor
+        // segment's fence). So with one mixed page during the build, both
+        // sides' changes committed before it drain after its commit; with
+        // a page per side, the `a` page commits before the build starts
+        // and drains while it is frozen, and the `b` page commits during.
+        let (before, a) = if mixed {
+            (Some(lab.sealed(BOTH_BEFORE).await), None)
+        } else {
+            (None, Some(lab.sealed(BOTH_DURING_A).await))
+        };
+        let mut building = lab.build_frozen(job, &[point]).await;
+        let reached = building.reached(point).await;
+        let pages = if let Some(a) = a {
+            let b = lab.sealed(BOTH_DURING_B).await;
+            let pages = vec![
+                lab.d.drain_frozen(a, "during a", &[]).await,
+                lab.d.drain_frozen(b, "during b", &[]).await,
+            ];
+            lab.both_queued_or_done(&pages, reached.backend_pid, held, &context)
+                .await;
+            pages
+        } else {
+            let batch = lab
+                .sealed(&format!("{BOTH_DURING_A}; {BOTH_DURING_B}"))
+                .await;
+            let page = lab.d.drain_frozen(batch, "during", &[]).await;
+            assert_eq!(
+                lab.queued_or_done(&page, reached.backend_pid).await,
+                held,
+                "{context}: does the mixed page queue behind the build?"
+            );
+            vec![page]
+        };
+        lab.d.release(&mut building, point).await;
+        building.finish().await;
+        for page in pages {
+            page.finish().await;
+        }
+        let after = lab.sealed(BOTH_AFTER).await;
+        lab.d.drain(after, "after").await;
+        if let Some(before) = before {
+            lab.d.drain(before, "before").await;
+        }
+        lab.assert_built(&context).await;
+        lab.check(&context).await;
+    }
+}
+
+impl Lab {
+    /// Waits until every one of `pages` queued behind backend `pid` (`held`)
+    /// or ran to its end (`!held`).
+    async fn both_queued_or_done(
+        &self,
+        pages: &[RunningDrain],
+        pid: i32,
+        held: bool,
+        context: &str,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let queued: i64 = self
+                .d
+                .ctl
+                .query_one(
+                    "select count(*) from pg_stat_activity \
+                     where $1 = any(pg_blocking_pids(pid))",
+                    &[&pid],
+                )
+                .await
+                .expect("read pg_stat_activity")
+                .get(0);
+            let finished = pages.iter().filter(|p| p.is_finished()).count();
+            if held {
+                assert_eq!(finished, 0, "{context}: a page ran through the build");
+                if queued == pages.len() as i64 {
+                    return;
+                }
+            } else {
+                assert_eq!(queued, 0, "{context}: a page queued behind the build");
+                if finished == pages.len() {
+                    return;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{context}: the pages neither queued nor finished within 60 s"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn family9_writes_on_both_sides_around_a_build_left() {
+    for (mixed, in_place) in [(false, false), (true, false), (false, true), (true, true)] {
+        writes_on_both_sides_around_a_build(Key::Single, L, mixed, in_place).await;
+    }
+}
+
+#[tokio::test]
+async fn family9_writes_on_both_sides_around_a_build_inner_pair_key() {
+    for (mixed, in_place) in [(false, false), (true, false), (false, true), (true, true)] {
+        writes_on_both_sides_around_a_build(Key::Pair, I, mixed, in_place).await;
+    }
+}
+
+/// J1 family 9's other role: a page of either side, on an enumerated key,
+/// frozen at each point of its apply while a fresh build or a rebuild in
+/// place starts. The build queues behind the page once the page holds the
+/// key's `J` row (from its `J` insert where the build has yet to create the
+/// row, from its `J` lock where the row exists) and builds through before
+/// that, so the page then meets cells whose basis already counts its change.
+/// The end is the oracle either way.
+async fn a_build_against_a_frozen_page(key: Key, kind: Kind) {
+    for in_place in [false, true] {
+        for (side, sql) in [
+            ("a", "update public.a set x = x + 1 where id = 1"),
+            ("b", "update public.b set y = y + 1 where id = 1"),
+        ] {
+            for point in POINTS {
+                let context = format!(
+                    "{key:?} {}: the {side} page frozen at {point:?}, in place: {in_place}",
+                    kind.name
+                );
+                let mut lab = seeded(key, &[kind], BUILD_SEED).await;
+                let job = if in_place {
+                    lab.build().await;
+                    request_rebuild(&lab, "a").await;
+                    "sweep"
+                } else {
+                    "plan"
+                };
+                let batch = lab.sealed(sql).await;
+                let target = kind.target();
+                let mut page = lab
+                    .d
+                    .drain_frozen(batch, "page", &[(point, target.as_str())])
+                    .await;
+                let reached = page.reached(point).await;
+                let building = lab.build_frozen(job, &[]).await;
+                assert_eq!(
+                    lab.queued_or_done(&building, reached.backend_pid).await,
+                    holds_j(point, !in_place),
+                    "{context}: does the build queue behind the page?"
+                );
+                lab.d.release(&mut page, point).await;
+                page.finish().await;
+                building.finish().await;
+                lab.assert_built(&context).await;
+                lab.check(&context).await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn family9_a_build_against_a_frozen_page_left() {
+    a_build_against_a_frozen_page(Key::Single, L).await;
+}
+
+#[tokio::test]
+async fn family9_a_build_against_a_frozen_page_inner_pair_key() {
+    a_build_against_a_frozen_page(Key::Pair, I).await;
 }
 
 /// Runs `sql` on `lab`'s connection to `part` of `kind`'s hidden tables.
@@ -2988,7 +3522,7 @@ async fn build_refuses_a_field_build() {
 const I2_EXPECTED: &str = "select ga, sum(n), sum(sx) from ( \
         select a.ga as ga, count(*) as n, sum(a.x) as sx from public.a \
         join public.b on a.k = b.k group by a.ga, b.gb) s group by ga order by ga";
-const I3_EXPECTED: &str = "select n, count(*), sum(sx) from ( \
+const I3_EXPECTED: &str = "select n, count(*), count(sx) from ( \
         select ga, sum(n) as n, sum(sx) as sx from ( \
             select a.ga as ga, count(*) as n, sum(a.x) as sx from public.a \
             join public.b on a.k = b.k group by a.ga, b.gb) s group by ga) r \
@@ -3020,7 +3554,7 @@ async fn chained(deeper: bool) -> Lab {
         trellis::defs::install_definition(
             lab.d.pool(),
             "TRANSFORM i3 FROM public.i2 GROUP BY n WITHOUT SOURCE INDEX \
-             SELECT COUNT(*) AS groups, SUM(sx) AS t",
+             SELECT COUNT(*) AS groups, COUNT(sx) AS t",
             &columns(&[("ga", int4()), ("n", int8), ("sx", int8)]),
             "public",
         )
@@ -3625,6 +4159,94 @@ async fn a_page_between_two_steps_of_a_join_build_is_exact() {
     }
 }
 
+/// J1 family 9's recomputes during a chunked build: between two steps of a
+/// fresh build or a rebuild in place with a partitioned side, rows of every
+/// leaf of both sides change behind capture's back (a value, and a
+/// dimension row moving to another `gb`, named by its prior image), and
+/// their recomputes drain, while a captured change of the same rows waits
+/// undrained. A recompute reads its cells from the whole table, so it
+/// counts leaves no step has built yet, and the steps that build them later
+/// write the same cells absolutely; the captured change's page, drained
+/// last, is refused by the basis that counts it. The end is the oracle.
+#[tokio::test]
+async fn family9_a_recompute_between_two_steps_of_a_join_build_is_exact() {
+    // A row's primary-key text: `(t, id)` on a partitioned side.
+    fn row_key(partitioned: bool, t: i32, id: i32) -> String {
+        if partitioned {
+            format!("{t}\u{1f}{id}")
+        } else {
+            id.to_string()
+        }
+    }
+    for in_place in [false, true] {
+        for (a, b) in [(true, false), (false, true), (true, true)] {
+            let context = format!("in place: {in_place}, a {a}, b {b}");
+            let mut lab =
+                seeded_in(&partitioned_ddl(a, b), Key::Pair, &[L], PARTITIONED_SEED).await;
+            let job = if in_place {
+                lab.build().await;
+                request_rebuild(&lab, "a").await;
+                "sweep"
+            } else {
+                "plan"
+            };
+            lab.run_steps(job, 1).await;
+            let mut building = lab.next_step(job).await;
+            // Captured and undrained until the build ends: the recompute's
+            // basis counts it, so its page is refused then.
+            let stale = lab
+                .sealed("update public.a set x = x + 1 where id in (1, 7, 20)")
+                .await;
+            uncaptured(
+                &lab,
+                "public.a",
+                "update public.a set x = x + 7 where id in (1, 7, 20)",
+            )
+            .await;
+            uncaptured(
+                &lab,
+                "public.b",
+                "update public.b set y = y + 7, gb = gb + 100 where id in (1, 6, 20)",
+            )
+            .await;
+            let a_keys: Vec<String> = [(0, 1), (1, 7), (2, 20)]
+                .iter()
+                .map(|(t, id)| row_key(a, *t, *id))
+                .collect();
+            let a_keys: Vec<(&str, Option<String>)> =
+                a_keys.iter().map(|k| (k.as_str(), None)).collect();
+            let b_rows = [
+                (0, 1, r#"{"id": 1, "t": 0, "k": 1, "gb": 10, "y": 3}"#),
+                (1, 6, r#"{"id": 6, "t": 1, "k": 1, "gb": 14, "y": 50}"#),
+                (2, 20, r#"{"id": 20, "t": 2, "k": 1, "gb": 30, "y": 2}"#),
+            ];
+            let b_keys: Vec<String> = b_rows
+                .iter()
+                .map(|(t, id, _)| row_key(b, *t, *id))
+                .collect();
+            let b_keys: Vec<(&str, Option<String>)> = b_keys
+                .iter()
+                .zip(b_rows)
+                .map(|(k, (_, _, prior))| (k.as_str(), Some(prior.to_string())))
+                .collect();
+            lab.d.stage_recomputes_with_prior("public.a", &a_keys).await;
+            lab.d.stage_recomputes_with_prior("public.b", &b_keys).await;
+            let recomputed = lab.d.seal().await;
+            lab.d.drain(recomputed, "recompute").await;
+            lab.check_applied(&format!("{context}: after the recompute"))
+                .await;
+            lab.d
+                .release(&mut building, PausePoint::BetweenRebuildStructures)
+                .await;
+            building.finish().await;
+            lab.build().await;
+            lab.d.drain(stale, "stale").await;
+            lab.assert_built(&context).await;
+            lab.check(&context).await;
+        }
+    }
+}
+
 /// `T`-level R8 is the final step's: a visible group no contribution backs
 /// any more (a group of the earlier life that the source lost while paused)
 /// stays through every side and leaf step and is removed by the final one.
@@ -3747,11 +4369,190 @@ async fn a_leaf_without_a_constraint_text_halts_a_join_build() {
              'null'::jsonb)",
     )
     .await;
+    assert_eq!(
+        lab.building().await,
+        side_step(JoinSide::From, JoinSidePart::Unroutable),
+        "status() names the side the build can't route"
+    );
     lab.build().await;
     let error = lab.d.rows("select last_error from backfill_chunks").await;
     assert!(
         error.len() == 1 && error[0].contains("no usable constraint text"),
         "{error:?}"
+    );
+}
+
+// ------------------------------------------- the side under build (#1112)
+
+impl Lab {
+    /// What `status()` reports of the definition's build
+    /// (`JoinStatus::building`). Bounded: the read must not wait on a build
+    /// that is frozen with a step's transaction open.
+    async fn building(&self) -> Option<JoinBuildStep> {
+        let trellis = trellis::Trellis::connect(
+            trellis::Config::from_dsn(self.d.db.dsn().to_string()).expect("valid dsn"),
+            trellis::TrellisOptions::default(),
+        )
+        .await
+        .expect("connect a Trellis");
+        tokio::time::timeout(Duration::from_secs(30), trellis.status(self.kinds[0].name))
+            .await
+            .expect("status() never waits on the build")
+            .expect("status")
+            .expect("the definition exists")
+            .join
+            .expect("a JOIN reports its join status")
+            .building
+    }
+}
+
+fn side_step(side: JoinSide, part: JoinSidePart) -> Option<JoinBuildStep> {
+    Some(JoinBuildStep::Side { side, part })
+}
+
+fn leaf(name: &str) -> JoinSidePart {
+    JoinSidePart::Leaf(format!("public.{name}"))
+}
+
+/// The steps a build with these partitioned sides runs, in order, as
+/// `status()` names them: unpartitioned sides whole, each partitioned side's
+/// leaves in oid order (`*0`, `*1`, `*2` were created in that order) and its
+/// remainder, then the final `T` step.
+fn expected_steps(a: bool, b: bool) -> Vec<Option<JoinBuildStep>> {
+    use JoinSide::{From, Joined};
+    let mut steps = Vec::new();
+    if !a {
+        steps.push(side_step(From, JoinSidePart::Whole));
+    }
+    if !b {
+        steps.push(side_step(Joined, JoinSidePart::Whole));
+    }
+    for (partitioned, side, table) in [(a, From, "a"), (b, Joined, "b")] {
+        if partitioned {
+            for n in 0..3 {
+                steps.push(side_step(side, leaf(&format!("{table}{n}"))));
+            }
+            steps.push(side_step(side, JoinSidePart::Remainder));
+        }
+    }
+    steps.push(Some(JoinBuildStep::Final));
+    steps
+}
+
+/// `status()` reports the step a partitioned `JOIN`'s build runs next, read
+/// while the job is frozen between two steps: each side and leaf in turn,
+/// then the final step, read again while that step's transaction is open;
+/// `None` once the build is done. For a fresh build, a `RESUME` and a rebuild
+/// in place.
+async fn side_under_build_case(a: bool, b: bool, mode: Mode) {
+    let context = format!("a partitioned {a}, b partitioned {b}, {mode:?}");
+    let mut lab = seeded_in(&partitioned_ddl(a, b), Key::Pair, &[L], PARTITIONED_SEED).await;
+    let job = prepare(&mut lab, mode).await;
+    let steps = expected_steps(a, b);
+    assert_eq!(lab.building().await, steps[0], "{context}: queued");
+    for (done, next) in steps.iter().skip(1).enumerate() {
+        let building = lab.next_step(job).await;
+        assert_eq!(
+            lab.building().await,
+            *next,
+            "{context}: after step {done}, cursor {}",
+            lab.cursor().await
+        );
+        lab.abandon(building).await;
+    }
+    let mut building = lab
+        .build_frozen(job, &[PausePoint::BeforeRebuildCommit])
+        .await;
+    building.reached(PausePoint::BeforeRebuildCommit).await;
+    assert_eq!(
+        lab.building().await,
+        Some(JoinBuildStep::Final),
+        "{context}: the final step's transaction is open"
+    );
+    lab.d
+        .release(&mut building, PausePoint::BeforeRebuildCommit)
+        .await;
+    building.finish().await;
+    lab.assert_built(&context).await;
+    assert_eq!(lab.building().await, None, "{context}: built");
+    lab.check(&context).await;
+}
+
+#[tokio::test]
+async fn status_reports_the_side_under_build_of_a_partitioned_from_side() {
+    for mode in [Mode::Fresh, Mode::Resume, Mode::InPlace] {
+        side_under_build_case(true, false, mode).await;
+    }
+}
+
+#[tokio::test]
+async fn status_reports_the_side_under_build_of_a_partitioned_joined_side() {
+    side_under_build_case(false, true, Mode::Fresh).await;
+    side_under_build_case(false, true, Mode::InPlace).await;
+}
+
+#[tokio::test]
+async fn status_reports_the_side_under_build_of_two_partitioned_sides() {
+    side_under_build_case(true, true, Mode::Resume).await;
+}
+
+/// A `JOIN` with no partitioned side builds in one transaction: `status()`
+/// reports `Whole` while the job is queued and while its transaction is
+/// open, and `None` once it committed. A fresh build and a rebuild in place.
+#[tokio::test]
+async fn status_reports_an_unpartitioned_join_build_as_whole() {
+    for job in ["plan", "sweep"] {
+        let lab = seeded(Key::Single, &[L], BUILD_SEED).await;
+        if job == "sweep" {
+            lab.build().await;
+            assert_eq!(lab.building().await, None, "built");
+            request_rebuild(&lab, "a").await;
+        }
+        assert_eq!(lab.building().await, Some(JoinBuildStep::Whole), "{job}");
+        let mut building = lab
+            .build_frozen(job, &[PausePoint::BeforeRebuildCommit])
+            .await;
+        building.reached(PausePoint::BeforeRebuildCommit).await;
+        assert_eq!(
+            lab.building().await,
+            Some(JoinBuildStep::Whole),
+            "{job}: its transaction is open"
+        );
+        lab.d
+            .release(&mut building, PausePoint::BeforeRebuildCommit)
+            .await;
+        building.finish().await;
+        lab.assert_built(job).await;
+        assert_eq!(lab.building().await, None, "{job}: built");
+    }
+}
+
+/// A paused `JOIN` reports no build, though its build's job is still queued
+/// with its cursor: no worker is handed the job while it is paused, and its
+/// `RESUME` discards it and reports the new build from its first step.
+#[tokio::test]
+async fn status_reports_no_build_while_a_join_is_paused() {
+    let mut lab = seeded_in(
+        &partitioned_ddl(true, false),
+        Key::Pair,
+        &[L],
+        PARTITIONED_SEED,
+    )
+    .await;
+    let job = prepare(&mut lab, Mode::Fresh).await;
+    lab.run_steps(job, 2).await;
+    assert_eq!(lab.building().await, side_step(JoinSide::From, leaf("a1")));
+    pause(&lab, L).await;
+    assert!(
+        lab.cursor().await.starts_with("from:"),
+        "the paused job keeps its cursor"
+    );
+    assert_eq!(lab.building().await, None, "paused");
+    resume(&lab, L).await;
+    assert_eq!(
+        lab.building().await,
+        side_step(JoinSide::Joined, JoinSidePart::Whole),
+        "the resume's build starts over"
     );
 }
 

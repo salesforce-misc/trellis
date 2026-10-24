@@ -178,7 +178,7 @@ async fn define_and_build(t: &Trellis, raw: &mut Client) {
         .await
         .expect("o1");
     build_everything(t.pool()).await;
-    t.apply("TRANSFORM tot FROM o1 GROUP BY g, m SELECT g AS g, m AS m, SUM(b) AS total")
+    t.apply("TRANSFORM tot FROM o1 GROUP BY g, m WITHOUT SOURCE INDEX SELECT g AS g, m AS m, SUM(b) AS total")
         .await
         .expect("tot");
     t.apply("TRANSFORM oc FROM orders SELECT cat.name AS cat_name")
@@ -199,10 +199,21 @@ async fn define_and_build(t: &Trellis, raw: &mut Client) {
     build_everything(t.pool()).await;
 }
 
-/// The ledger is the runtime state the issue names; it must exist in the
+/// `tot`'s group partials (the group basis's hidden table, `agg_<id>` in the
+/// Trellis schema) are the aggregate's runtime state; they must exist in the
 /// source for the "never dumped" assertions to mean anything.
-async fn ledger_rows(raw: &Client) -> i64 {
-    count(raw, "select count(*) from public.tot__ledger").await
+async fn tot_partials_table(raw: &Client) -> String {
+    let id = count(
+        raw,
+        "select id from transform_definitions where target_table = 'public.tot'",
+    )
+    .await;
+    format!("{SCHEMA}.agg_{id}")
+}
+
+async fn tot_partial_rows(raw: &Client) -> i64 {
+    let table = tot_partials_table(raw).await;
+    count(raw, &format!("select count(*) from {table}")).await
 }
 
 /// The Elixir client replaces an earlier appendix in a structure file only
@@ -242,7 +253,10 @@ async fn a_dump_loads_as_defined_not_built() {
     let mut raw = connect_raw(source.dsn()).await;
     let t = facade(source.dsn()).await;
     define_and_build(&t, &mut raw).await;
-    assert!(ledger_rows(&raw).await > 0, "the source has runtime state");
+    assert!(
+        tot_partial_rows(&raw).await > 0,
+        "the source has runtime state"
+    );
     assert!(
         rows_json(&raw, STATUSES)
             .await
@@ -403,11 +417,18 @@ async fn a_dump_loads_as_defined_not_built() {
             count(&after, &format!("select count(*) from public.{t}")).await,
             0
         );
+    }
+    for t in ["o1", "oc"] {
         assert_eq!(
             count(&after, &format!("select count(*) from public.{t}__ledger")).await,
             0
         );
     }
+    assert_eq!(
+        tot_partial_rows(&after).await,
+        0,
+        "tot's partials load empty"
+    );
     let fresh = cluster.create_isolated_database().await;
     let fresh = connect_raw(fresh.dsn()).await;
     for (table, class) in CLASSIFICATION {

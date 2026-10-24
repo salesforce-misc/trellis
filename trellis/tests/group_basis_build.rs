@@ -30,7 +30,7 @@ use trellis::{Trellis, TrellisOptions};
 const SRC: &str = "public.src";
 const TARGET: &str = "public.agg";
 const ONE: &str = "TRANSFORM one FROM public.src SELECT g AS g, v AS w";
-const AGG: &str = "TRANSFORM agg FROM public.src GROUP BY g SELECT SUM(v) AS total, COUNT(*) AS n";
+const AGG: &str = "TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n";
 const ACTUAL: &str = "select g, total, n from public.agg order by g";
 const EXPECTED: &str = "select g, sum(v), count(*) from public.src group by g order by g";
 const STATUS: &str = "select status from transform_definitions where target_table = 'public.agg'";
@@ -549,7 +549,7 @@ async fn a_build_writes_averages_numeric_sums_and_composed_fields() {
     trellis::defs::install_definition(
         d.pool(),
         "TRANSFORM agg FROM public.src GROUP BY g \
-         SELECT AVG(v) AS a, SUM(m) AS sm, SUM(v) + COUNT(m) AS c",
+        WITHOUT SOURCE INDEX SELECT AVG(v) AS a, SUM(m) AS sm, SUM(v) + COUNT(m) AS c",
         &columns,
         "public",
     )
@@ -629,7 +629,7 @@ async fn a_build_killed_before_its_commit_runs_again_whole() {
         "nothing of the first attempt committed"
     );
     d.ctl
-        .batch_execute("update backfill_chunks set claimed_by = null, claimed_at = null")
+        .batch_execute("update backfill_chunks set claimed_by = null, claimed_at = null, next_attempt_at = null")
         .await
         .expect("release the dead claim");
     run_build(&d).await;
@@ -818,7 +818,7 @@ async fn the_whole_source_reads_match_groups_by_hash_or_merge() {
     write(&d, "create index on public.src (g, v)").await;
     define_as(
         &d,
-        "TRANSFORM agg FROM public.src GROUP BY g, v SELECT COUNT(*) AS n",
+        "TRANSFORM agg FROM public.src GROUP BY g, v WITHOUT SOURCE INDEX SELECT COUNT(*) AS n",
     )
     .await;
     run_build(&d).await;
@@ -845,4 +845,44 @@ async fn the_whole_source_reads_match_groups_by_hash_or_merge() {
             "the groups are matched by a hash or merge join:\n{plan}"
         );
     }
+}
+
+/// A build that fails on its data (`SUM(v + v)` overflows `integer` on one
+/// row) has no chunk to narrow to the key, as the ledger's Re-derive build
+/// had: its one plan job fails whole, is charged and retried, and its
+/// `MAX_CHARGED_ATTEMPTS`th charge pauses the definition, keeping the job row
+/// with the error as the record. It never goes `live` with a partial target.
+#[tokio::test]
+async fn a_build_that_keeps_failing_on_its_data_pauses_its_definition() {
+    let d = seeded("(1, 1, 2000000000), (2, 2, 1)").await;
+    define_as(
+        &d,
+        "TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX \
+         SELECT SUM(v + v) AS total, COUNT(*) AS n",
+    )
+    .await;
+    for _ in 0..5 {
+        assert_eq!(d.rows(STATUS).await, ["(backfilling)"]);
+        // Each failure backs the job off; run the next attempt now.
+        write(
+            &d,
+            "update backfill_chunks set next_attempt_at = null where kind = 'plan'",
+        )
+        .await;
+        build_frozen(&d, &[]).await.finish().await;
+    }
+    assert_eq!(
+        d.rows(STATUS).await,
+        ["(paused)"],
+        "the fifth charge pauses"
+    );
+    let job = d
+        .rows("select done, charged, last_error like '%integer out of range%' from backfill_chunks")
+        .await;
+    assert_eq!(job, ["(f,5,t)"], "the job row is kept with the error");
+    assert_eq!(
+        d.rows(ACTUAL).await,
+        Vec::<String>::new(),
+        "no group was written"
+    );
 }

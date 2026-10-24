@@ -30,8 +30,7 @@ use trellis::staging::build;
 use trellis::staging::partition_correction::{self, Options};
 
 const SOURCE: &str = "public.items";
-const DEFINITION: &str =
-    "TRANSFORM agg FROM public.items GROUP BY g SELECT SUM(v) AS total, COUNT(*) AS n";
+const DEFINITION: &str = "TRANSFORM agg FROM public.items GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n";
 
 fn columns() -> Vec<(&'static str, ValueType)> {
     vec![
@@ -149,6 +148,8 @@ async fn triggers_per_node(client: &Client) -> Vec<i64> {
 /// exact under writes named on the root and on a leaf.
 #[tokio::test]
 async fn a_hundred_and_one_leaf_source_installs_node_by_node_and_stays_exact() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     const LEAVES: usize = 101;
     const { assert!(LEAVES + 1 > SINGLE_TRANSACTION_TABLES) };
     let mut fx = Fx::start(&range_tree(LEAVES, 2)).await;
@@ -189,6 +190,8 @@ async fn a_hundred_and_one_leaf_source_installs_node_by_node_and_stays_exact() {
 #[tokio::test]
 #[ignore = "a measurement: run with logbook reserve and a memory cap"]
 async fn measure_the_lock_table_limit_of_one_statement() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let client = connect(db.dsn()).await;
@@ -307,6 +310,8 @@ fn ms(d: Duration) -> f64 {
 #[tokio::test]
 #[ignore = "a measurement: run with logbook reserve and a memory cap"]
 async fn measure_a_thousand_leaf_source() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let started = Instant::now();
     let mut fx = Fx::start(&thousand_leaves()).await;
     let phases: Vec<String> =
@@ -558,7 +563,7 @@ async fn measure_a_thousand_leaf_source() {
         .collect();
     let refused = install_definition(
         fx.d.pool(),
-        "TRANSFORM agg2 FROM public.items GROUP BY g SELECT COUNT(*) AS n",
+        "TRANSFORM agg2 FROM public.items GROUP BY g WITHOUT SOURCE INDEX SELECT COUNT(*) AS n",
         &columns,
         "public",
     )
@@ -612,6 +617,8 @@ fn landed<T>(progress: Progress<T>) -> T {
 #[tokio::test]
 #[ignore = "a measurement: run with logbook reserve and a memory cap"]
 async fn measure_a_thousand_leaf_install_node_by_node_and_in_one_transaction() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect(db.dsn()).await;
@@ -694,6 +701,8 @@ async fn measure_a_thousand_leaf_install_node_by_node_and_in_one_transaction() {
 #[tokio::test]
 #[ignore = "a measurement: run with logbook reserve and a memory cap"]
 async fn measure_per_write_capture_cost_at_a_thousand_leaves() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     const WRITES: i32 = 3000;
     let cluster = TestCluster::start();
     let mut cases = Vec::new();

@@ -20,7 +20,7 @@ const TEST_NAME: &str = "defs_aggregate_field_named_like_source_column_test";
 
 /// The definition from the issue.
 const AGG_TOTALS: &str = "TRANSFORM agg_totals FROM public.agg_src GROUP BY grp \
-    SELECT grp AS grp, SUM(val) AS val, COUNT(*) AS row_count, MIN(val) AS lo, MAX(val) AS hi";
+   WITHOUT SOURCE INDEX SELECT grp AS grp, SUM(val) AS val, COUNT(*) AS row_count, COUNT(val) AS lo, SUM(val + 1) AS hi";
 
 fn source_columns() -> HashMap<String, ValueType> {
     HashMap::from([
@@ -133,7 +133,8 @@ fn row(
     )
 }
 
-/// The issue's example builds the values SQL gives.
+/// The issue's example (its MIN and MAX, deferred past 0.1.0 by #1117, as a
+/// COUNT and a SUM over the same column) builds the values SQL gives.
 #[tokio::test]
 async fn an_aggregate_field_named_like_a_source_column_reads_the_source_column() {
     let cluster = TestCluster::start();
@@ -157,8 +158,11 @@ async fn an_aggregate_field_named_like_a_source_column_reads_the_source_column()
 
     assert_eq!(
         target_rows(&client).await,
-        vec![row("a", "14", "3", "2", "7"), row("b", "9", "1", "9", "9"),],
-        "val is SUM(val), lo and hi are the MIN and MAX of the source column"
+        vec![
+            row("a", "14", "3", "3", "17"),
+            row("b", "9", "1", "1", "10"),
+        ],
+        "val is SUM(val), lo and hi are COUNT(val) and SUM(val + 1) of the source column"
     );
 }
 
@@ -180,7 +184,7 @@ async fn an_aggregate_of_another_aggregate_field_is_refused_at_define() {
     let err = install_definition(
         &db.pool,
         "TRANSFORM nested FROM public.agg_src GROUP BY grp \
-         SELECT grp AS grp, SUM(val) AS total, MAX(total) AS biggest",
+        WITHOUT SOURCE INDEX SELECT grp AS grp, SUM(val) AS total, MAX(total) AS biggest",
         &source_columns(),
         "public",
     )

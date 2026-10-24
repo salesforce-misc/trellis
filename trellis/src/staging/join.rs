@@ -2,12 +2,21 @@
 //!
 //! # When it runs
 //!
-//! Only behind the group-basis dev knob (`super::group_basis::enabled`):
-//! with the knob off a `JOIN` stays `waiting_to_backfill` and never applies.
-//! With the knob on, a `JOIN` definition ([`applies`]) is built by its plan
+//! A `JOIN` definition ([`applies`]) is built by its plan
 //! job (a fresh build or a `RESUME`) or its sweep job (a rebuild in place) in
 //! one transaction ([`build`], "A build" below), and applies every captured
 //! change from the build's start on.
+//!
+//! Either table may be another definition's target (#1096 decision 5,
+//! ADR-0019). A target is never captured: its writers stage each changed key
+//! through the target-mutation seam as exact old and new images ordered by
+//! the write token (`super::target_mutations`, "The image feed"), and the side
+//! consumes them as it consumes captured images. A target is never truncated
+//! as a ring operation (a source `TRUNCATE` upstream clears the target key by
+//! key), so such a side's truncate floor never rises. Its fresh build or
+//! `RESUME` waits for the seam fence first (`super::build`'s "Seam-fed
+//! sources"). An upstream build that writes its target outside the seam
+//! rebuilds the `JOIN` (`intake::markers::park_target_catchup_if_read`).
 //!
 //! Either table may be a partitioned root (#1111, ADR-0019 "Either side may
 //! be partitioned"). A node operation (`DROP`, `DETACH`, `TRUNCATE`,
@@ -114,9 +123,9 @@
 //! structures, the xmin horizon and the ring's retirement lasts the whole
 //! transaction (`docs/recommendations.md`).
 //!
-//! What a rebuild in place repairs: `P` and `M` that disagree with their
-//! tables, and visible rows that disagree with `T`. Not a hand edit of `T` or
-//! of `J.matches`, which change only by delta; a `RESUME` recreates them.
+//! A rebuild in place repairs what capture missed and visible rows that
+//! disagree with `T`, not a hand edit of a hidden table, which a `RESUME`
+//! recreates.
 //!
 //! # A build with a partitioned side
 //!
@@ -160,8 +169,9 @@ use super::fold::{FoldedChange, earliest_origin};
 use super::group_basis::{self, Arg, GroupShape, GroupTargetPlan, Writer};
 use super::target_mutations::TargetMutations;
 
-/// Whether `def` is a `JOIN` that applies: only behind the group-basis knob
-/// (see the module doc).
+/// Whether `def` is a `JOIN` that applies: always, unless a test forced the
+/// group-basis knob off (`super::group_basis::enabled`), when it stays
+/// `waiting_to_backfill`.
 pub(crate) fn applies(def: &TransformDef) -> bool {
     matches!(def.key_space, KeySpace::Join(_)) && group_basis::enabled()
 }

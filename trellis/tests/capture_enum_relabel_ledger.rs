@@ -18,7 +18,7 @@ async fn a_ledger_group_by_the_enum_with_a_change_pending_resumes_exactly() {
          create index on public.s (tone); \
          insert into public.s values (1, 'brisk', 1), (2, 'calm', 2), (3, 'brisk', 3);",
         &["TRANSFORM per_tone FROM public.s GROUP BY tone \
-           SELECT tone AS tone, COUNT(*) AS c, SUM(n) AS sn"],
+          WITHOUT SOURCE INDEX SELECT tone AS tone, COUNT(*) AS c, SUM(n) AS sn"],
     )
     .await;
     h.write(

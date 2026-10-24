@@ -65,6 +65,24 @@ pub(super) fn pg_type_name(value_type: ValueType) -> std::borrow::Cow<'static, s
     }
 }
 
+/// The declared scale of every generated [`ValueType::Numeric`] source column.
+pub(super) const NUMERIC_COLUMN_TYPE: &str = "numeric(14,2)";
+
+/// The type a generated source column is declared with: [`pg_type_name`],
+/// except that a [`ValueType::Numeric`] column is declared
+/// [`NUMERIC_COLUMN_TYPE`]. The group basis admits `SUM`/`AVG` only over a
+/// `numeric` with a declared scale (issue #1100), and every aggregate this
+/// generator draws reads such a column. The drawn values are small integers
+/// (`generate::VALUE_MAX`, `GRAIN_MAX`), which `numeric(14,2)` stores
+/// exactly; casts and typed literals keep the bare `numeric` of
+/// [`pg_type_name`], which the column's assignment coerces.
+pub(super) fn column_ddl_type(value_type: ValueType) -> std::borrow::Cow<'static, str> {
+    match value_type {
+        ValueType::Numeric => NUMERIC_COLUMN_TYPE.into(),
+        other => pg_type_name(other),
+    }
+}
+
 /// Renders `def` back to the concrete `TRANSFORM ... FROM ... SELECT ...`
 /// syntax `create_definition`/`install_definition` parses — see
 /// `ManualBackend`'s former doc comment on this function (preserved in git
@@ -345,10 +363,10 @@ pub(super) async fn create_source_table(
         sql.push_str(&quote_ident(&column.name));
         sql.push(' ');
         if column.name == table.pk_col {
-            sql.push_str(&pg_type_name(column.value_type));
+            sql.push_str(&column_ddl_type(column.value_type));
             sql.push_str(" primary key");
         } else {
-            sql.push_str(&pg_type_name(column.value_type));
+            sql.push_str(&column_ddl_type(column.value_type));
             if table.unique_cols.iter().any(|c| c == &column.name) {
                 sql.push_str(" unique");
             }
@@ -376,7 +394,7 @@ fn partitioned_source_ddl(name: &str, table: &Table, partitioning: &Partitioning
             let mut sql = format!(
                 "{} {}",
                 quote_ident(&column.name),
-                pg_type_name(column.value_type)
+                column_ddl_type(column.value_type)
             );
             if column.name == table.pk_col || column.name == partitioning.column {
                 sql.push_str(" not null");

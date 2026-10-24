@@ -23,8 +23,7 @@ use trellis::staging::interleave::PausePoint;
 use trellis::staging::partition_correction::{self, Options};
 
 const SOURCE: &str = "public.items";
-const DEFINITION: &str =
-    "TRANSFORM agg FROM public.items GROUP BY g SELECT SUM(v) AS total, COUNT(*) AS n";
+const DEFINITION: &str = "TRANSFORM agg FROM public.items GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n";
 
 struct Fx {
     d: Driver,
@@ -203,6 +202,8 @@ const WRITE_MISSING: &str = "insert into public.items select 1000 + i, i % 16, 7
 
 #[tokio::test]
 async fn a_leaf_created_written_and_dropped_between_two_passes_converges() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     for kind in ["hash", "range", "list"] {
         let (ddl, missing) = tree(kind);
         let mut fx = Fx::start(&ddl, ValueType::Numeric).await;
@@ -257,6 +258,8 @@ async fn a_leaf_created_written_and_dropped_between_two_passes_converges() {
 /// reader has started the first, and none while no reader has (#1151).
 #[tokio::test]
 async fn a_complement_found_again_is_queued_only_once_a_reader_has_started_the_first() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let (ddl, missing) = tree("range");
     let mut fx = Fx::start(&ddl, ValueType::Numeric).await;
     let create = format!("create table public.items_new partition of public.items {missing}");
@@ -289,6 +292,8 @@ async fn a_complement_found_again_is_queued_only_once_a_reader_has_started_the_f
 
 #[tokio::test]
 async fn no_sweep_statement_runs_beside_a_default_or_with_every_hash_remainder() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     for ddl in [
         "create table public.items (id integer not null, g integer not null, \
              v integer not null, primary key (g, id)) partition by range (g); \
@@ -328,6 +333,8 @@ async fn no_sweep_statement_runs_beside_a_default_or_with_every_hash_remainder()
 /// queue them again, and the queue drains to a converged target.
 #[tokio::test]
 async fn a_dropped_recorded_leaf_is_left_to_its_own_correction() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     for kind in ["hash", "range", "list"] {
         let (ddl, _) = tree(kind);
         let mut fx = Fx::start(&ddl, ValueType::Numeric).await;
@@ -347,6 +354,8 @@ async fn a_dropped_recorded_leaf_is_left_to_its_own_correction() {
 /// correction.
 #[tokio::test]
 async fn a_gone_node_without_a_usable_text_converges() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     for replacement in [
         "",
         "create table public.items_d partition of public.items default;",
@@ -391,6 +400,8 @@ async fn a_gone_node_without_a_usable_text_converges() {
 /// second fingerprint read, and the attempt that found them rolls back.
 #[tokio::test]
 async fn a_leaf_created_between_the_catalog_read_and_the_search_is_not_corrected() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let (ddl, missing) = tree("range");
     let mut fx = Fx::start(&ddl, ValueType::Numeric).await;
     let dsn = fx.d.db.dsn().to_string();
@@ -458,6 +469,8 @@ async fn a_leaf_created_between_the_catalog_read_and_the_search_is_not_corrected
 /// case one, under the database's ICU `en-US` they interleave.
 #[tokio::test]
 async fn range_gaps_are_ordered_by_the_key_columns_collation() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut fx = Fx::start(
         "create table public.items (id integer not null, g text collate \"C\" not null, \
              v integer not null, primary key (g, id)) partition by range (g); \
@@ -606,6 +619,8 @@ fn thousand_leaves(kind: &str) -> String {
 #[tokio::test]
 #[ignore = "a measurement: run with logbook reserve and a memory cap"]
 async fn measure_the_sweep_at_a_thousand_hash_leaves() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut fx = measure("hash_two_missing", &thousand_leaves("hash")).await;
     measure_full_routing_form(&fx, "hash").await;
     fx.exec(
@@ -630,6 +645,8 @@ async fn measure_the_sweep_at_a_thousand_hash_leaves() {
 #[tokio::test]
 #[ignore = "a measurement: run with logbook reserve and a memory cap"]
 async fn measure_the_sweep_at_a_thousand_range_leaves() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let fx = measure("range", &thousand_leaves("range")).await;
     measure_full_routing_form(&fx, "range").await;
 }
@@ -637,6 +654,8 @@ async fn measure_the_sweep_at_a_thousand_range_leaves() {
 #[tokio::test]
 #[ignore = "a measurement: run with logbook reserve and a memory cap"]
 async fn measure_the_sweep_at_a_thousand_list_leaves() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let fx = measure("list", &thousand_leaves("list")).await;
     measure_full_routing_form(&fx, "list").await;
 }
@@ -678,6 +697,8 @@ async fn converge_twice(fx: &mut Fx, what: &str) {
 /// and dropped in the same interval, so its remainder routes nowhere.
 #[tokio::test]
 async fn a_hash_modulus_change_around_a_gone_node_without_a_usable_text_converges() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut fx = Fx::start(
         "create table public.items (id integer not null, g integer not null, \
              v integer not null, primary key (g, id)) partition by hash (g); \
@@ -709,6 +730,8 @@ async fn a_hash_modulus_change_around_a_gone_node_without_a_usable_text_converge
 /// dropped, and a sibling leaf created, written and dropped.
 #[tokio::test]
 async fn a_middle_whose_children_are_partly_gone_converges() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut fx = Fx::start(
         "create table public.items (id integer not null, g integer not null, \
              v integer not null, primary key (g, id)) partition by range (g); \
@@ -739,6 +762,8 @@ async fn a_middle_whose_children_are_partly_gone_converges() {
 /// the whole range.
 #[tokio::test]
 async fn two_operations_in_one_pass_beside_a_default_converge() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let (ddl, _) = tree("range");
     let mut fx = Fx::start(
         &format!("{ddl} create table public.items_d partition of public.items default;"),
@@ -761,6 +786,8 @@ async fn two_operations_in_one_pass_beside_a_default_converge() {
 /// dropped: the new `DEFAULT`'s own correction walks its range.
 #[tokio::test]
 async fn a_default_created_as_a_short_lived_leaf_is_dropped_converges() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let (ddl, missing) = tree("range");
     let mut fx = Fx::start(&ddl, ValueType::Numeric).await;
     fx.exec(&format!(
@@ -781,6 +808,8 @@ async fn a_default_created_as_a_short_lived_leaf_is_dropped_converges() {
 /// the complement.
 #[tokio::test]
 async fn a_default_created_written_and_dropped_between_two_passes_converges() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let (ddl, _) = tree("list");
     let mut fx = Fx::start(&ddl, ValueType::Numeric).await;
     fx.exec(
@@ -797,6 +826,8 @@ async fn a_default_created_written_and_dropped_between_two_passes_converges() {
 /// dropped between two passes.
 #[tokio::test]
 async fn a_leaf_attached_written_and_dropped_between_two_passes_converges() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let (ddl, _) = tree("range");
     let mut fx = Fx::start(&ddl, ValueType::Numeric).await;
     fx.exec(
@@ -822,6 +853,8 @@ async fn a_leaf_attached_written_and_dropped_between_two_passes_converges() {
 /// next pass, covers its groups.
 #[tokio::test]
 async fn a_complement_whose_hash_middle_is_dropped_completes_and_converges() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut fx = Fx::start(
         "create table public.items (id integer not null, g integer not null, \
              v integer not null, primary key (g, id)) partition by range (g); \
@@ -985,6 +1018,8 @@ const REPLACEMENTS: [(&str, &str); 4] = [
 /// running between.
 #[tokio::test]
 async fn a_leaf_detached_between_the_tree_read_and_the_text_fetch_converges() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     for timing in ["in the window", "before the next pass", "engine between"] {
         for (state, replacement) in REPLACEMENTS {
             let what = format!("{state}, {timing}");
@@ -1148,6 +1183,8 @@ impl Fx {
 /// correction waits for.
 #[tokio::test]
 async fn a_concurrent_detach_around_the_text_fetch_converges() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     for case in [
         "left pending",
         "finalized in the window",
@@ -1273,6 +1310,8 @@ impl Window<'_> {
 /// refuses a bound that overlaps, so neither unchanged leaf can take it.
 #[tokio::test]
 async fn mixed_hash_moduli_around_a_node_without_a_usable_text_converge() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let tree = "create table public.items (id integer not null, g integer not null, \
              v integer not null, primary key (g, id)) partition by hash (g); \
          create table public.items_a partition of public.items \
@@ -1324,6 +1363,8 @@ async fn mixed_hash_moduli_around_a_node_without_a_usable_text_converge() {
 /// leaving the rest in the `DEFAULT`'s own gap.
 #[tokio::test]
 async fn a_partitioned_default_taking_a_node_without_a_usable_text_converges() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let (base, missing) = tree("range");
     for (state, children) in [
         (
@@ -1362,6 +1403,8 @@ async fn a_partitioned_default_taking_a_node_without_a_usable_text_converges() {
 /// left in the middle's own gap, which the root's `DEFAULT` doesn't take.
 #[tokio::test]
 async fn a_default_on_a_two_level_tree_around_a_node_without_a_usable_text_converges() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let head = "create table public.items (id integer not null, g integer not null, \
              v integer not null, primary key (g, id)) partition by range (g); \
          create table public.items_lo partition of public.items for values from (0) to (4); \
@@ -1403,6 +1446,8 @@ async fn a_default_on_a_two_level_tree_around_a_node_without_a_usable_text_conve
 /// transaction; or attached again under the same bound in the window itself.
 #[tokio::test]
 async fn a_node_without_a_usable_text_attached_again_under_its_bound_converges() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let (base, missing) = tree("range");
     let reattach = format!(
         "begin; \
@@ -1449,6 +1494,8 @@ async fn a_node_without_a_usable_text_attached_again_under_its_bound_converges()
 /// it reads as re-attached.
 #[tokio::test]
 async fn a_leaf_detached_and_attached_again_in_one_transaction_converges() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let (ddl, _) = tree("list");
     let mut fx = Fx::start(&ddl, ValueType::Numeric).await;
     fx.exec(
@@ -1471,6 +1518,8 @@ async fn a_leaf_detached_and_attached_again_in_one_transaction_converges() {
 /// parent and the half leaf is dropped too.
 #[tokio::test]
 async fn several_operations_around_a_node_without_a_usable_text_converge() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let (base, missing) = tree("range");
     Window {
         what: "several operations",
@@ -1497,6 +1546,8 @@ async fn several_operations_around_a_node_without_a_usable_text_converge() {
 /// detached in the window (no usable text).
 #[tokio::test]
 async fn a_hash_middle_dropped_under_a_queued_correction_converges() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let tree = "create table public.items (id integer not null, g integer not null, \
              v integer not null, primary key (g, id)) partition by range (g); \
          create table public.items_lo partition of public.items for values from (0) to (4); \
@@ -1570,6 +1621,8 @@ async fn a_hash_middle_dropped_under_a_queued_correction_converges() {
 /// dropped and created again under the same name.
 #[tokio::test]
 async fn a_middle_dropped_and_created_again_under_its_name_converges() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let head = "create table public.items (id integer not null, g integer not null, \
              v integer not null, primary key (g, id)) partition by range (g); \
          create table public.items_lo partition of public.items for values from (0) to (4);";
@@ -1618,6 +1671,8 @@ async fn a_middle_dropped_and_created_again_under_its_name_converges() {
 /// partition once it has the lock.
 #[tokio::test]
 async fn a_detach_committed_during_the_text_fetch_converges() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     for ddl in [
         "alter table public.items detach partition public.items_x",
         "drop table public.items_x",
@@ -1696,6 +1751,8 @@ const INTO_THE_MIDDLES_REGION: &str =
 #[tokio::test]
 async fn a_hash_middle_dropped_and_a_default_created_around_a_node_without_a_usable_text_converge()
 {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut fx = Fx::start(HASH_MIDDLE_TREE, ValueType::Numeric).await;
     fx.exec(HASH_MIDDLE_M3).await;
     fx.d.settle().await;
@@ -1732,6 +1789,8 @@ async fn a_hash_middle_dropped_and_a_default_created_around_a_node_without_a_usa
 /// later.
 #[tokio::test]
 async fn a_hash_middle_detached_under_a_queued_new_leaf_converges() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut fx = Fx::start(HASH_MIDDLE_TREE, ValueType::Numeric).await;
     fx.exec(HASH_MIDDLE_M3).await;
     fx.d.settle().await;
@@ -1752,6 +1811,8 @@ async fn a_hash_middle_detached_under_a_queued_new_leaf_converges() {
 /// middle is dropped before the next pass, with rows for the new one.
 #[tokio::test]
 async fn a_hash_middle_replaced_by_another_modulus_around_the_fetch_converges() {
+    // The per-row ledger, which this file pins, until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let mut fx = Fx::start(HASH_MIDDLE_TREE, ValueType::Numeric).await;
     fx.exec(HASH_MIDDLE_M3).await;
     fx.d.settle().await;

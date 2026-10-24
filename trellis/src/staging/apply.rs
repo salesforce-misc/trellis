@@ -150,6 +150,14 @@ pub enum ApplyError {
     /// its work as done; the buckets it thought it owned need reclaiming by
     /// whoever holds them now.
     ClaimLost,
+    /// A non-final page found its buckets' `drain_cursor` already at its own
+    /// last key once it held their claims: the same page committed before,
+    /// and only the reply to its `COMMIT` was lost (#856). Its transaction
+    /// rolls back, so nothing applies twice, and the drain carries on from
+    /// the next page ([`drain_batch`]). The group basis needs this: a page
+    /// adds its deltas to the groups' partials, with nothing per key that
+    /// would make a second application move nothing.
+    PageAlreadyCommitted,
     /// Phase 3's version fence found `source_table_versions.version` had
     /// moved since Phase 2 loaded it: a definition change landed on
     /// `src_table` mid-drain. Routine and immediately retryable — see
@@ -181,9 +189,8 @@ pub enum ApplyError {
     /// resume over a partitioned source that has rows before its tree is
     /// recorded, or a build or rebuild over one whose tree is not recorded or
     /// has a leaf with no usable constraint text (#1101); or, on a `JOIN`
-    /// (`super::join`, #1108), a build over a side that is another
-    /// definition's target, a field build, or a partitioned side whose tree is not
-    /// recorded or has a leaf with no usable constraint text (#1286).
+    /// (`super::join`, #1108), a field build, or a partitioned side whose tree
+    /// is not recorded or has a leaf with no usable constraint text (#1286).
     /// Like
     /// [`ApplyError::AggregateOffLedger`], every page of the target would
     /// reproduce it, so it halts the target.
@@ -351,6 +358,7 @@ impl ApplyError {
             ApplyError::Db(err) => error_code::classify_pg_error(err),
             ApplyError::Pool(err) => err.code(),
             ApplyError::ClaimLost
+            | ApplyError::PageAlreadyCommitted
             | ApplyError::VersionFenceMiss { .. }
             | ApplyError::LedgerEntryCollected { .. }
             | ApplyError::HopBoundExceeded { .. }
@@ -408,6 +416,11 @@ impl fmt::Display for ApplyError {
                 f,
                 "this worker's claim was gone by completion time; nothing was applied twice, \
                  but the buckets it thought it owned must be reclaimed by whoever holds them now"
+            ),
+            ApplyError::PageAlreadyCommitted => write!(
+                f,
+                "this page committed before and only its commit's reply was lost; nothing was \
+                 applied twice"
             ),
             ApplyError::VersionFenceMiss { src_table } => write!(
                 f,
@@ -529,6 +542,7 @@ impl std::error::Error for ApplyError {
             ApplyError::ColumnPauseLockTimeout(err) => Some(err),
             ApplyError::ResumeRefused { reason, .. } => Some(reason.as_ref()),
             ApplyError::ClaimLost
+            | ApplyError::PageAlreadyCommitted
             | ApplyError::VersionFenceMiss { .. }
             | ApplyError::LedgerEntryCollected { .. }
             | ApplyError::HopBoundExceeded { .. }
@@ -11639,6 +11653,27 @@ async fn end_segment_step(
             return Err(claim_lost("a held bucket's claim is gone"));
         }
         if let Some(after) = &page.next {
+            // #856: a retry of a page whose `COMMIT` landed but whose reply
+            // was lost. The claim update above waited for that commit, so
+            // this statement sees its cursor.
+            let at_this_page: i64 = txn
+                .query_one(
+                    "select count(*) from drain_cursor \
+                     where seg_seq = $1 and bucket = any($2::smallint[]) \
+                       and after_route = $3 and after_src_table = $4 and after_key = $5",
+                    &[
+                        &seg_seq,
+                        &page.buckets,
+                        &after.route,
+                        &after.src_table,
+                        &after.key,
+                    ],
+                )
+                .await?
+                .get(0);
+            if at_this_page == page.buckets.len() as i64 {
+                return Err(ApplyError::PageAlreadyCommitted);
+            }
             txn.execute(
                 "insert into drain_cursor \
                      (seg_seq, bucket, after_route, after_src_table, after_key) \
@@ -12517,10 +12552,10 @@ async fn drain_batch(
                 // transient retry may re-run a page that committed. A final
                 // page's retry finds the claim that commit released gone, and
                 // rolls back whole as `ClaimLost`. A non-final page's retry
-                // still holds its claim and applies again, which writes
-                // nothing new: every key's ledger entry already holds its
-                // change (ADR-0002 I2), a Re-derive reads its source again,
-                // and the cursor moves to where it already is.
+                // still holds its claim, finds its buckets' cursor already at
+                // its last key, and rolls back whole as
+                // `PageAlreadyCommitted`, which ends the page as done: a
+                // group-basis target would add the page's deltas again.
                 Ok(outcome) => match txn.commit().await {
                     Ok(()) if std::mem::take(&mut lose_commit_reply) => {
                         Err(end_session(&**client).await)
@@ -12534,6 +12569,22 @@ async fn drain_batch(
                 }
             };
         match applied {
+            Err(ApplyError::PageAlreadyCommitted) => {
+                crate::instance_log::warn!(
+                    seg_seq = representative_seg_seq,
+                    claimed_by = %claimed_by,
+                    "a page's retry found it committed before; its commit's reply was lost, \
+                     and nothing was applied twice"
+                );
+                return Ok(ManyApplyOutcome {
+                    keys_written: 0,
+                    keys_deleted: 0,
+                    segments_drained: steps.iter().map(|step| (step.seg_seq, false)).collect(),
+                    deferral_counts: HashMap::new(),
+                    fairness_escalations: 0,
+                    pages: 1,
+                });
+            }
             Ok(outcome) => {
                 // Epic #49 cross-cutting review fix (issues #51/#52): only
                 // flush `plan`'s buffered metrics now, once this attempt's

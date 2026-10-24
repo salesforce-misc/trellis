@@ -31,11 +31,11 @@ const SRC: &str = "public.src";
 const TARGET: &str = "public.agg";
 const SRC_DDL: &str = "create table public.src (id integer primary key, g integer, v integer); \
                        create index on public.src (g)";
-const AGG: &str = "TRANSFORM agg FROM public.src GROUP BY g SELECT SUM(v) AS total, COUNT(*) AS n";
+const AGG: &str = "TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n";
 const ROLL: &str = "TRANSFORM roll FROM public.agg GROUP BY n WITHOUT SOURCE INDEX \
                     SELECT COUNT(*) AS groups, SUM(total) AS t";
 const TOP: &str = "TRANSFORM top FROM public.roll GROUP BY groups WITHOUT SOURCE INDEX \
-                   SELECT COUNT(*) AS k, SUM(t) AS tt";
+                   SELECT COUNT(*) AS k, COUNT(t) AS tt";
 const MIRROR: &str = "TRANSFORM mirror FROM public.agg SELECT total AS total, n AS n";
 const MIRROR_ACTUAL: &str = "select g, total, n from public.mirror order by g";
 const ACTUAL: &str = "select g, total, n from public.agg order by g";
@@ -45,7 +45,7 @@ const ROLL_EXPECTED: &str = "select n, count(*), sum(total) from ( \
                                  select count(*) as n, sum(v) as total \
                                  from public.src group by g) s group by n order by n";
 const TOP_ACTUAL: &str = "select groups, k, tt from public.top order by groups";
-const TOP_EXPECTED: &str = "select groups, count(*), sum(t) from ( \
+const TOP_EXPECTED: &str = "select groups, count(*), count(t) from ( \
                                 select n, count(*) as groups, sum(total) as t from ( \
                                     select count(*) as n, sum(v) as total \
                                     from public.src group by g) s group by n) r \
@@ -423,50 +423,6 @@ async fn a_retyped_group_column_resumes_over_correctly_typed_partials() {
         .await,
         ["(1)"]
     );
-}
-
-/// An aggregate defined on the ledger, because the group basis doesn't take
-/// a `SUM` over `double precision`, whose argument is re-typed to `integer`
-/// while it is paused, is on the group basis from its resume on: the resume
-/// creates its partials table (it used to refuse, #1222) and its build
-/// replaces the groups of the ledger-shaped target.
-#[tokio::test]
-async fn a_ledger_aggregate_the_group_basis_takes_now_resumes_onto_the_group_basis() {
-    trellis::dev::staging::set_group_basis(true);
-    let mut d = Driver::start(
-        "create table public.src (id integer primary key, g integer, v double precision); \
-         create index on public.src (g)",
-        &[
-            ("id", int4()),
-            ("g", int4()),
-            ("v", ValueType::Float(trellis::float::FloatWidth::Float8)),
-        ],
-        &[AGG],
-        &[SRC],
-    )
-    .await;
-    step(
-        &mut d,
-        "insert into public.src values (1, 1, 10), (2, 2, 7)",
-    )
-    .await;
-    assert_eq!(
-        d.rows("select to_regclass('public.agg__ledger') is not null")
-            .await,
-        ["(t)"],
-        "defined on the ledger"
-    );
-    pause(&d).await;
-    write(&d, "alter table public.src alter column v type integer").await;
-    resume(&mut d).await;
-    run_build(&d).await;
-    assert_oracle(&mut d).await;
-    step(
-        &mut d,
-        "insert into public.src values (3, 1, 1); delete from public.src where id = 2",
-    )
-    .await;
-    assert_oracle(&mut d).await;
 }
 
 // -------------------------------------------------------- the readers (#1287)

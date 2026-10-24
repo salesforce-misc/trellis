@@ -28,7 +28,7 @@ use trellis::{Trellis, TrellisOptions};
 
 const SRC: &str = "public.src";
 const TARGET: &str = "public.agg";
-const AGG: &str = "TRANSFORM agg FROM public.src GROUP BY g SELECT SUM(v) AS total, COUNT(*) AS n";
+const AGG: &str = "TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n";
 const ACTUAL: &str = "select g, total, n from public.agg order by g";
 const EXPECTED: &str = "select g, sum(v), count(*) from public.src group by g order by g";
 const STATUS: &str = "select status from transform_definitions where target_table = 'public.agg'";
@@ -413,7 +413,7 @@ async fn a_rebuild_writes_averages_numeric_sums_and_composed_fields() {
             ("m", ValueType::Numeric),
         ],
         &["TRANSFORM agg FROM public.src GROUP BY g \
-           SELECT AVG(v) AS a, SUM(m) AS sm, SUM(v) + COUNT(m) AS c"],
+          WITHOUT SOURCE INDEX SELECT AVG(v) AS a, SUM(m) AS sm, SUM(v) + COUNT(m) AS c"],
         &[SRC],
     )
     .await;

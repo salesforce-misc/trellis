@@ -26,7 +26,7 @@ use trellis::staging::{StagedWatermark, TRUNCATE_SENTINEL_KEY, claim, liveness};
 const WAKE: &str = "trellis_drain_paging_test";
 
 const GROUP_TOTALS: &str = "TRANSFORM grp_totals FROM items GROUP BY grp \
-     SELECT grp AS grp, SUM(amount) AS total, COUNT(*) AS n";
+    WITHOUT SOURCE INDEX SELECT grp AS grp, SUM(amount) AS total, COUNT(*) AS n";
 
 const ITEM_COPY: &str = "TRANSFORM item_copy FROM items SELECT amount AS amount";
 
@@ -66,7 +66,9 @@ async fn claim_committed(
 /// `items` plus the SUM/COUNT aggregate over it.
 async fn setup_aggregate(db: &testkit::TestDatabase, client: &Client) {
     client
-        .batch_execute("create table items (id integer primary key, grp integer, amount numeric)")
+        .batch_execute(
+            "create table items (id integer primary key, grp integer, amount numeric(12,0))",
+        )
         .await
         .expect("create items");
     let def = parse(GROUP_TOTALS).expect("parse");
@@ -1842,10 +1844,10 @@ async fn charges_and_holdups(client: &Client) -> (i64, i64) {
 /// A connection that drops after page 1's COMMIT landed (#856): the drain
 /// sees only the dropped connection, a transient failure, and retries the
 /// page with the same records and claim ending. A non-final page still holds
-/// its claim, so the retry applies the page again. That moves nothing: each
-/// key's ledger entry already holds its change, so the change is no newer
-/// than the entry's `applied_lsn` (ADR-0002 I2) and moves its group by
-/// nothing. Doubling page 1's SUM/COUNT deltas would show up against the
+/// its claim, so the retry finds its buckets' cursor already at its last key
+/// and rolls back as `PageAlreadyCommitted`; the drain carries on from the
+/// next page. A group-basis aggregate adds a page's deltas to its groups, so
+/// applying page 1 again would double its SUM/COUNT deltas against the
 /// oracle.
 #[tokio::test]
 async fn a_non_final_page_retried_after_its_commit_landed_applies_nothing_twice() {

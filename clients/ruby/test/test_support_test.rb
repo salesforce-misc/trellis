@@ -26,7 +26,7 @@ class TestSupportTest < Minitest::Test
       pg.exec("create table loads (id integer primary key, g integer not null, n integer not null)")
       pg.exec("insert into loads select i, i % 3, i from generate_series(1, 10) i")
       Trellis.apply("TRANSFORM load_copy FROM loads SELECT n AS n")
-      Trellis.apply("TRANSFORM load_sums FROM loads GROUP BY g SELECT g AS g, SUM(n) AS total")
+      Trellis.apply("TRANSFORM load_sums FROM loads GROUP BY g WITHOUT SOURCE INDEX SELECT g AS g, SUM(n) AS total")
       Trellis.apply("TRANSFORM load_operator FROM loads SELECT n AS n")
       await_status("load_copy")
       await_status("load_sums")

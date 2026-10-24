@@ -3,18 +3,20 @@
 //!
 //! # The knob
 //!
-//! The group basis is built in steps (#1091). Until it replaces the ledger,
-//! the ledger (`super::ledger`) keeps every aggregate by default, and this
-//! path runs only behind a dev/bench knob: [`enabled`], read from
-//! [`KNOB_ENV`] or set with [`set_enabled`] (`trellis::dev::set_group_basis`).
-//! [`route`] is the one routing decision: with the knob on, it takes every
-//! aggregate it admits, and `super::ledger::route` declines those. Deleting
-//! the ledger (#1105) deletes the knob and makes [`route`] unconditional.
+//! The group basis keeps every aggregate definition that has no
+//! relationship path: define refuses an aggregate outside #1096 decision 1's
+//! admitted set by family (`defs::validate::validate_aggregate_admitted`),
+//! so [`route`] takes every aggregate define accepts. The per-row ledger
+//! (`super::ledger`) keeps only aggregates over relationship paths until
+//! relationships are removed (#1115), and is deleted with them (#1105).
 //!
-//! The knob is process-wide and read whenever a definition is routed, so it
-//! must not change while a definition exists: a test binary or a benchmark
-//! probe sets it once, before its client starts. With it on, a definition
-//! [`route`] takes:
+//! Until then a dev/test knob can force every aggregate back onto the
+//! ledger, with the ledger's whole surface (define refuses nothing by family
+//! then): [`enabled`] is on unless [`KNOB_ENV`] is `0`, `false` or `off`,
+//! or [`set_enabled`] (`trellis::dev::set_group_basis`) turned it off. It is
+//! process-wide and read whenever a definition is routed, so it must not
+//! change while a definition exists: a test binary or a benchmark probe sets
+//! it once, before its client starts. A definition [`route`] takes:
 //!
 //! - is built, fresh or on a resume, by the plan job's one absolute write of
 //!   every group ([`rebuild`]), over a partitioned source one transaction per
@@ -25,9 +27,7 @@
 //!   capture re-install, an automatic rebuild, or an upstream's rebuild),
 //!   over a partitioned source one transaction per leaf of its recorded tree
 //!   and one for the groups that route to no leaf (`super::build`'s
-//!   `run_group_rebuild`);
-//! - is refused at define for `SUM`/`AVG` over a `numeric` column with no
-//!   declared scale (#1096 decision 2).
+//!   `run_group_rebuild`).
 //!
 //! Over a partitioned source, its partition maintenance is corrected by
 //! recomputing the groups that route to the node (#1103,
@@ -63,7 +63,8 @@
 //! argument or a `numeric` column) with literals, operators, functions and
 //! its `GROUP BY` keys. An argument may be an expression over the row
 //! (`SUM(a + b)`); a `numeric` one must be a column, whose declared scale
-//! define checks. Anything else stays on the ledger.
+//! define checks. Define refuses any other aggregate by family; one over a
+//! relationship path stays on the ledger.
 //!
 //! # Where its state lives
 //!
@@ -200,8 +201,8 @@ use super::apply::ApplyError;
 use super::fold::{FoldedChange, earliest_origin};
 use super::target_mutations::TargetMutations;
 
-/// The environment variable that turns the knob on (`1`, `true` or `on`)
-/// when nothing has set it: see the module doc.
+/// The environment variable that turns the knob off (`0`, `false` or
+/// `off`) when nothing has set it: see the module doc.
 pub const KNOB_ENV: &str = "TRELLIS_DEV_GROUP_BASIS";
 
 /// 0: not read yet; 1: off; 2: on.
@@ -213,8 +214,8 @@ pub fn enabled() -> bool {
         1 => false,
         2 => true,
         _ => {
-            let on = std::env::var(KNOB_ENV)
-                .is_ok_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "on"));
+            let on = !std::env::var(KNOB_ENV)
+                .is_ok_and(|v| matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "off"));
             KNOB.store(if on { 2 } else { 1 }, Ordering::Relaxed);
             on
         }
@@ -538,53 +539,6 @@ pub(crate) fn target_table_ddl(target: &str, shape: &GroupShape) -> String {
         quoted(&shape.group_cols).join(", ")
     ));
     format!("create table {target} ({})", columns.join(", "))
-}
-
-/// Define's checks of a definition [`route`] takes, in its transaction:
-/// the module doc's refusals that need the catalog. `Err` names the reason.
-pub(crate) async fn check_define(
-    txn: &Transaction<'_>,
-    shape: &GroupShape,
-    qualified_source: &str,
-) -> Result<(), crate::defs::catalog::CatalogError> {
-    let refuse =
-        |reason: String| Err(crate::defs::catalog::CatalogError::GroupBasisUnsupported { reason });
-    for column in &shape.numeric_args {
-        let typmod: Option<i32> = txn
-            .query_opt(
-                "select atttypmod from pg_catalog.pg_attribute \
-                 where attrelid = pg_catalog.to_regclass($1) and attname = $2 \
-                   and not attisdropped",
-                &[&ddl::regclass_arg(qualified_source), column],
-            )
-            .await?
-            .map(|row| row.get(0));
-        if typmod == Some(-1) {
-            // A column of a table Trellis creates has no declared scale
-            // whatever the scale of the column it copies: Trellis creates
-            // its columns with no type modifier (ADR-0020), and no rule
-            // reads a copy's modifier.
-            let chained: bool = txn
-                .query_one(
-                    "select exists (select 1 from transform_definitions \
-                                    where target_table = $1)",
-                    &[&qualified_source],
-                )
-                .await?
-                .get(0);
-            if chained {
-                return refuse(format!(
-                    "SUM/AVG({column}) is over a column of {qualified_source}, a table Trellis \
-                     creates, whose numeric columns have no declared scale: a chained \
-                     SUM/AVG over one is not supported yet (tracked in #1120)"
-                ));
-            }
-            return refuse(format!(
-                "SUM/AVG({column}) is over a numeric with no declared scale (#1096 decision 2)"
-            ));
-        }
-    }
-    Ok(())
 }
 
 fn quoted(columns: &[String]) -> Vec<String> {

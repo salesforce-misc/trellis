@@ -1,8 +1,9 @@
 //! Issues #1106 and #1107: define checks a `JOIN` definition against both
 //! tables' live columns, then registers it `waiting_to_backfill` with its
 //! catalog state: both tables in its row, a `source` and a `join` edge, both
-//! version fences bumped, the visible target and its hidden tables. Nothing
-//! builds it yet. The pure rules are covered by `defs::validate`'s `join_*`
+//! version fences bumped, the visible target and its hidden tables. A
+//! staging-worker pass starts its build (`join_interleavings.rs` covers the
+//! build itself). The pure rules are covered by `defs::validate`'s `join_*`
 //! tests; these pin that define reads each side's real types, modifiers,
 //! collations and enums, that nothing is left behind by a refusal, and the
 //! lifecycle a two-table definition goes through: status, pause, resume
@@ -87,20 +88,20 @@ async fn define_validates_a_join_against_both_tables_then_refuses_it() {
             "by_region_sku",
             "TRANSFORM by_region_sku FROM orders LEFT JOIN items ON orders.id = items.order_id \
              GROUP BY orders.region, items.sku \
-             SELECT orders.region AS region, items.sku AS sku, COUNT(*) AS n, \
+            WITHOUT SOURCE INDEX SELECT orders.region AS region, items.sku AS sku, COUNT(*) AS n, \
                     SUM(items.qty) AS qty, AVG(orders.total) AS avg_total",
         ),
         // An enum join key is text-stable.
         (
             "by_tier",
             "TRANSFORM by_tier FROM orders JOIN items ON orders.tier = items.tier \
-             GROUP BY orders.region SELECT COUNT(*) AS n",
+             GROUP BY orders.region WITHOUT SOURCE INDEX SELECT COUNT(*) AS n",
         ),
         // An explicitly qualified joined table.
         (
             "by_line",
             "TRANSFORM by_line FROM orders JOIN other.lines ON orders.id = lines.order_id \
-             GROUP BY orders.region SELECT SUM(lines.qty) AS qty",
+             GROUP BY orders.region WITHOUT SOURCE INDEX SELECT SUM(lines.qty) AS qty",
         ),
     ] {
         let definition = install_definition(&db.pool, text, &HashMap::new(), "public")
@@ -131,7 +132,7 @@ async fn define_validates_a_join_against_both_tables_then_refuses_it() {
     let on = |on: &str, select: &str| {
         format!(
             "TRANSFORM by_region FROM orders JOIN items ON {on} \
-             GROUP BY orders.region SELECT {select}"
+             GROUP BY orders.region WITHOUT SOURCE INDEX SELECT {select}"
         )
     };
     let err = define_err(
@@ -183,7 +184,7 @@ async fn define_validates_a_join_against_both_tables_then_refuses_it() {
     let err = define_err(
         &db.pool,
         "TRANSFORM by_region FROM orders JOIN missing ON orders.id = missing.order_id \
-         GROUP BY orders.region SELECT COUNT(*) AS n",
+         GROUP BY orders.region WITHOUT SOURCE INDEX SELECT COUNT(*) AS n",
     )
     .await;
     assert!(
@@ -211,7 +212,7 @@ async fn define_refuses_a_join_key_with_a_nondeterministic_collation() {
     let err = define_err(
         &db.pool,
         "TRANSFORM visits_by_region FROM customers JOIN visits \
-         ON customers.code = visits.code GROUP BY customers.region SELECT COUNT(*) AS n",
+         ON customers.code = visits.code GROUP BY customers.region WITHOUT SOURCE INDEX SELECT COUNT(*) AS n",
     )
     .await;
     assert!(
@@ -256,7 +257,7 @@ const ORDERS_ITEMS: &str = "set search_path to public;
 
 const BY_REGION: &str = "TRANSFORM by_region FROM orders LEFT JOIN items \
      ON orders.id = items.order_id GROUP BY orders.region, items.sku \
-     SELECT orders.region AS region, items.sku AS sku, COUNT(*) AS n, \
+    WITHOUT SOURCE INDEX SELECT orders.region AS region, items.sku AS sku, COUNT(*) AS n, \
             SUM(items.qty) AS qty, AVG(orders.total) AS avg_total";
 
 async fn status(trellis: &Trellis, target: &str) -> Option<TransformStatus> {
@@ -310,7 +311,7 @@ async fn count(raw: &Client, sql: &str) -> i64 {
 }
 
 #[tokio::test]
-async fn a_join_registers_both_tables_and_waits_to_be_built() {
+async fn a_join_registers_both_tables_and_a_pass_starts_its_build() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect_raw(db.dsn()).await;
@@ -445,11 +446,10 @@ async fn a_join_registers_both_tables_and_waits_to_be_built() {
     );
 
     // A staging-worker pass captures both tables, each imaged with the
-    // columns the definition reads from it, and builds nothing: the JOIN
-    // stays waiting, with no backfill marker parked for it.
+    // columns the definition reads from it, and starts the JOIN's build,
+    // with no backfill marker parked for it.
     // The first pass installs both captures, and the joined table's install
-    // gate holds the JOIN back; the second finds it ready, so it is the one
-    // that would start or dispatch a build if anything took a JOIN.
+    // gate holds the JOIN back; the second finds it ready and starts it.
     pass(&mut raw, &db.pool).await;
     pass(&mut raw, &db.pool).await;
     for (table, columns) in [
@@ -474,7 +474,7 @@ async fn a_join_registers_both_tables_and_waits_to_be_built() {
     }
     assert_eq!(
         status(&trellis, "by_region").await,
-        Some(TransformStatus::WaitingToBackfill)
+        Some(TransformStatus::Backfilling)
     );
     assert_eq!(
         count(&raw, "select count(*) from pending_backfill").await,
@@ -697,8 +697,8 @@ async fn a_column_lost_or_retyped_on_either_table_pauses_the_whole_join() {
                 .await
                 .expect("status")
                 .map(|s| s.status),
-            Some(TransformStatus::WaitingToBackfill),
-            "{break_it}"
+            Some(TransformStatus::Backfilling),
+            "{break_it}: the pass after the resume starts the rebuild"
         );
     }
 }
@@ -716,7 +716,7 @@ async fn a_target_a_join_reads_cannot_be_dropped_under_it() {
     trellis
         .apply(
             "TRANSFORM line_totals FROM items GROUP BY order_id \
-             SELECT order_id AS order_id, SUM(qty) AS qty",
+            WITHOUT SOURCE INDEX SELECT order_id AS order_id, SUM(qty) AS qty",
         )
         .await
         .expect("define the upstream aggregate");
@@ -729,7 +729,7 @@ async fn a_target_a_join_reads_cannot_be_dropped_under_it() {
         .apply(
             "TRANSFORM by_region FROM orders JOIN line_totals \
              ON orders.id = line_totals.order_id GROUP BY orders.region \
-             SELECT orders.region AS region, SUM(line_totals.qty) AS qty",
+            WITHOUT SOURCE INDEX SELECT orders.region AS region, SUM(line_totals.qty) AS qty",
         )
         .await
         .expect("define a JOIN over the upstream's target");
@@ -771,17 +771,21 @@ async fn column_type(raw: &Client, table: &str, column: &str) -> String {
     .get(0)
 }
 
-/// `target`'s definition is still waiting to be built, not paused.
+/// `target`'s definition is waiting to be built or building (no build job
+/// runs here), not paused.
 async fn assert_unpaused(trellis: &Trellis, target: &str) {
     let status = trellis
         .status(target)
         .await
         .expect("status")
         .expect("defined");
-    assert_eq!(
+    assert!(
+        matches!(
+            status.status,
+            TransformStatus::WaitingToBackfill | TransformStatus::Backfilling
+        ),
+        "{:?}: {:?}",
         status.status,
-        TransformStatus::WaitingToBackfill,
-        "{:?}",
         status.capture_failure
     );
 }
@@ -815,7 +819,7 @@ async fn a_widened_string_changes_no_copy_and_an_outgrown_column_pauses_the_join
         .apply(
             "TRANSFORM by_code FROM orders LEFT JOIN items \
              ON orders.code = items.order_code GROUP BY orders.region, items.sku \
-             SELECT orders.region AS region, items.sku AS sku, COUNT(*) AS n, \
+            WITHOUT SOURCE INDEX SELECT orders.region AS region, items.sku AS sku, COUNT(*) AS n, \
                     SUM(items.qty) AS qty",
         )
         .await
@@ -925,7 +929,7 @@ async fn a_joined_column_retyped_to_another_value_type_pauses_the_join() {
         .apply(
             "TRANSFORM shipped FROM orders LEFT JOIN items \
              ON orders.id = items.order_id GROUP BY orders.region \
-             SELECT orders.region AS region, COUNT(items.shipped) AS shipped, \
+            WITHOUT SOURCE INDEX SELECT orders.region AS region, COUNT(items.shipped) AS shipped, \
                     COUNT(orders.placed) AS placed",
         )
         .await
@@ -994,7 +998,7 @@ async fn a_join_resume_recreates_its_hidden_tables_without_re_typing_them() {
         .apply(
             "TRANSFORM by_code FROM orders LEFT JOIN items \
              ON orders.code = items.order_code GROUP BY orders.region \
-             SELECT orders.region AS region, SUM(items.qty) AS qty",
+            WITHOUT SOURCE INDEX SELECT orders.region AS region, SUM(items.qty) AS qty",
         )
         .await
         .expect("define the JOIN");

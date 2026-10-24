@@ -168,7 +168,7 @@ fn orders_columns() -> HashMap<String, ValueType> {
     [
         ("id", ValueType::Numeric),
         ("g", ValueType::Integer(trellis::integer::IntWidth::Int8)),
-        ("a", ValueType::Numeric),
+        ("a", ValueType::Integer(trellis::integer::IntWidth::Int4)),
     ]
     .into_iter()
     .map(|(name, ty)| (name.to_string(), ty))
@@ -179,7 +179,7 @@ fn orders_columns() -> HashMap<String, ValueType> {
 async fn create_orders(client: &Client) {
     client
         .batch_execute(
-            "create table orders (id bigint primary key, g bigint, a numeric); \
+            "create table orders (id bigint primary key, g bigint, a integer); \
              insert into orders (id, g, a) select s, s % 2, s from generate_series(1, 6) s;",
         )
         .await
@@ -197,7 +197,7 @@ async fn resume_drops_an_aggregate_group_whose_rows_were_all_deleted_while_pause
 
     install_definition(
         &db.pool,
-        "TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total",
+        "TRANSFORM order_rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total",
         &orders_columns(),
         "public",
     )
@@ -489,7 +489,7 @@ async fn resume_rebuilds_an_aggregate_through_whole_partial_and_reinserted_delet
     let operator = define_only(db.dsn()).await;
     apply_all(
         &operator,
-        &["TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total"],
+        &["TRANSFORM order_rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total"],
     )
     .await;
     settle(&db.pool, &mut client).await;
@@ -531,7 +531,7 @@ async fn resume_drops_extinct_composite_and_null_groups() {
     let mut client = connect_raw(db.dsn()).await;
     client
         .batch_execute(
-            "create table lines (id bigint primary key, g bigint, h text, a numeric); \
+            "create table lines (id bigint primary key, g bigint, h text, a integer); \
              insert into lines values \
                  (1, 0, null, 1), (2, 0, null, 2), (3, 1, null, 3), \
                  (4, 1, 'x', 4), (5, 2, 'y', 5), (6, 2, 'y', 6);",
@@ -541,7 +541,7 @@ async fn resume_drops_extinct_composite_and_null_groups() {
     let operator = define_only(db.dsn()).await;
     apply_all(
         &operator,
-        &["TRANSFORM line_rollup FROM lines GROUP BY g, h SELECT sum(a) AS total"],
+        &["TRANSFORM line_rollup FROM lines GROUP BY g, h WITHOUT SOURCE INDEX SELECT sum(a) AS total"],
     )
     .await;
     settle(&db.pool, &mut client).await;
@@ -594,7 +594,7 @@ async fn resume_drops_groups_a_relationship_key_no_longer_reaches() {
         &operator,
         &[
             "RELATIONSHIP customer FROM orders.customer_id TO customers.id",
-            "TRANSFORM region_totals FROM orders GROUP BY customer.region SELECT sum(a) AS total",
+            "TRANSFORM region_totals FROM orders GROUP BY customer.region WITHOUT SOURCE INDEX SELECT sum(a) AS total",
         ],
     )
     .await;
@@ -695,8 +695,8 @@ async fn a_resumed_direct_build_drops_the_groups_its_ledger_has_no_entry_for() {
         &[
             "RELATIONSHIP customer FROM orders.customer_id TO customers.id",
             "TRANSFORM by_g FROM orders GROUP BY g \
-             SELECT count(*) AS n, max(customer.region) AS region",
-            "TRANSFORM g_count FROM orders GROUP BY g SELECT count(*) AS n",
+            WITHOUT SOURCE INDEX SELECT count(*) AS n, max(customer.region) AS region",
+            "TRANSFORM g_count FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT count(*) AS n",
         ],
     )
     .await;
@@ -800,7 +800,7 @@ async fn a_resumed_direct_build_matches_composite_groups_with_nulls() {
         &[
             "RELATIONSHIP customer FROM orders.customer_id TO customers.id",
             "TRANSFORM by_gh FROM orders GROUP BY g, h \
-             SELECT count(*) AS n, max(customer.region) AS region",
+            WITHOUT SOURCE INDEX SELECT count(*) AS n, max(customer.region) AS region",
         ],
     )
     .await;
@@ -880,7 +880,7 @@ async fn a_group_a_resumed_direct_build_deletes_reaches_a_to_one_consumer() {
         &[
             "RELATIONSHIP customer FROM orders.customer_id TO customers.id",
             "TRANSFORM by_g FROM orders GROUP BY g \
-             SELECT count(*) AS n, max(customer.region) AS region",
+            WITHOUT SOURCE INDEX SELECT count(*) AS n, max(customer.region) AS region",
         ],
     )
     .await;
@@ -956,7 +956,7 @@ async fn resume_drops_an_extinct_group_one_hop_down_a_chain() {
     let operator = define_only(db.dsn()).await;
     apply_all(
         &operator,
-        &["TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total"],
+        &["TRANSFORM order_rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total"],
     )
     .await;
     settle(&db.pool, &mut client).await;
@@ -964,7 +964,7 @@ async fn resume_drops_an_extinct_group_one_hop_down_a_chain() {
         &operator,
         &[&format!(
             "TRANSFORM rollup_echo FROM {DEFAULT_TARGET_SCHEMA}.order_rollup \
-             GROUP BY g SELECT sum(total) AS total"
+             GROUP BY g WITHOUT SOURCE INDEX SELECT sum(total) AS total"
         )],
     )
     .await;
@@ -1010,7 +1010,7 @@ async fn resume_leaves_a_live_sibling_on_the_same_source_alone() {
         &operator,
         &[
             "TRANSFORM order_doubles FROM orders SELECT a + a AS x",
-            "TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total",
+            "TRANSFORM order_rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total",
             "TRANSFORM order_copies FROM orders SELECT a AS a",
         ],
     )
@@ -1069,7 +1069,7 @@ async fn resume_drops_orphans_from_mixed_case_targets() {
         &operator,
         &[
             "TRANSFORM OrderDoubles FROM orders SELECT a + a AS x",
-            "TRANSFORM OrderRollup FROM orders GROUP BY g SELECT sum(a) AS total",
+            "TRANSFORM OrderRollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total",
         ],
     )
     .await;
@@ -1137,7 +1137,7 @@ async fn a_discharge_that_fails_after_its_sweep_leaves_the_target_as_it_was() {
         &[
             "RELATIONSHIP grp FROM orders.g TO grps.id",
             "TRANSFORM order_rollup FROM orders GROUP BY g \
-             SELECT sum(a) AS total, max(grp.w) AS w",
+            WITHOUT SOURCE INDEX SELECT sum(a) AS total, max(grp.w) AS w",
             "TRANSFORM order_doubles FROM orders SELECT a + a AS x",
         ],
     )
@@ -1147,7 +1147,7 @@ async fn a_discharge_that_fails_after_its_sweep_leaves_the_target_as_it_was() {
         &operator,
         &[&format!(
             "TRANSFORM rollup_echo FROM {DEFAULT_TARGET_SCHEMA}.order_rollup \
-             GROUP BY g SELECT sum(total) AS total"
+             GROUP BY g WITHOUT SOURCE INDEX SELECT sum(total) AS total"
         )],
     )
     .await;

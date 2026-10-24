@@ -1,6 +1,6 @@
 ---
-status: draft
-date: 2026-10-17
+status: accepted
+date: 2026-10-23
 deciders: Michael Ries
 ---
 
@@ -253,21 +253,30 @@ type, so a `sum` that overflows `bigint` fails where Postgres's would.
 `P`, `M`, `J` and `T`'s partials are hidden from readers. The target shows a
 group only while its row count is above 0, with the aggregates computed from its
 partials. Pages apply in parallel and can commit out of order, so before
-`await_converged` a visible group can hold a combination no source state
-produces: `count(x) > count(*)`, a negative sum, a far-off `AVG`. In the model,
-about half of mid-run reads under fast writers showed such a row, and every read
-taken once all committed changes were applied was exact (6,765 of 6,765). After
-`await_converged`, values are exact. That contract, shared with plain
-aggregates, is stated in [data flow](../data-flow.md#reading-derived-data).
+`await_converged` a small or hot group can hold a combination no source state
+produces: `count(x) > count(*)`, a negative `COUNT(x)`, a far-off `AVG`, or be
+missing for a moment; a group of many rows reads as slightly behind or ahead.
+In the model, about half of mid-run reads under fast writers showed such a row,
+and every read taken once all committed changes were applied was exact (6,765
+of 6,765). After `await_converged`, values are exact. That contract, shared with
+plain aggregates, is stated in
+[data flow](../data-flow.md#reading-derived-data), and
+[ADR-0002](0002-async-data-flow.md#readers-see-a-group-only-while-its-row-count-is-above-0)
+records why the visible row isn't gated on sane partials.
 
 ### A side may be another transform's target, through the target change feed
 
 A side that is a transform's target is read from that target's change feed:
 the exact old and new images per changed key, in write-token order, which
 ADR-0002's mutation seam stages for any target with an aggregate or JOIN
-reader. The side consumes them as it consumes captured images. An upstream build
-or rebuild bypasses the seam, so it rebuilds the JOIN transform. A JOIN
-transform's own target feeds its readers the same way as any aggregate target.
+reader. The side consumes them as it consumes captured images. A target is
+never truncated as a change of its own: a `TRUNCATE` upstream clears it key by
+key through the seam. A build or `RESUME` of the JOIN transform first waits out
+every transaction that began before its start (the seam fence), so an upstream
+writer that decided it had no JOIN reader before the build started has
+committed before the build reads the target. An upstream build or rebuild that
+bypasses the seam rebuilds the JOIN transform. A JOIN transform's own target
+feeds its readers the same way as any aggregate target.
 
 ### Either side may be partitioned when its partial key holds every partition-key column
 

@@ -66,15 +66,17 @@
 //! `converged` while the write was still missing. **Fixed** in two places
 //! that close both halves of the gap — see each function's own updated doc
 //! comment for the exact mechanism: `seal_if_active_nonempty` now also
-//! seals an empty active segment when its immediate predecessor is
-//! genuinely stranding an unfenced row (self-limiting — it only ever fires
-//! for a real straggler, never on an ordinary idle ring, so it cannot
-//! regress into the busy loop the emptiness guard exists to prevent); and
+//! seals an empty active segment when its immediate predecessor's slot
+//! still needs a successor read: a drained predecessor whose slot holds any
+//! row (the idle seal, which folds such a straggler) or an undrained one
+//! stranding an unfenced row (self-limiting — after one seal the
+//! predecessor is the empty segment just sealed, so it cannot regress into
+//! the busy loop the emptiness guard exists to prevent); and
 //! `converged_through`'s condition 3 no longer treats a `'drained'` owner as
 //! sufficient on its own — a row must actually have been visible in that
 //! segment's own published fence to stop gating. `trellis/tests/sealing.rs`'s
 //! `an_empty_active_segment_still_seals_to_catch_a_stranded_straggler`/
-//! `an_empty_active_segment_with_a_fully_fenced_predecessor_does_not_seal`
+//! `an_empty_active_segment_with_an_undrained_fully_fenced_predecessor_does_not_seal`
 //! and `trellis/tests/converge.rs`'s
 //! `a_drained_slots_unfenced_straggler_still_gates_convergence` cover both
 //! sides directly, deterministically, at the unit level — no timing race

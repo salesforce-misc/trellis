@@ -224,13 +224,13 @@ async fn a_varchar_text_change_of_the_source_reports_no_drift() {
     assert_eq!(after, before, "the target was not rewritten");
 }
 
-/// Rule 1 of #1207's decision, over every kind of table Trellis creates
-/// without the group-basis knob: a 1-1 target keyed by a `varchar(n)` with a
-/// passthrough and a field read through a relationship, the 1-1 side ledger,
-/// the relationship's projection, and ledger aggregates grouped by
-/// `varchar(n)` columns and by a relationship path, with a `MIN` over one
-/// (target, ledger, group-delta table). None of their columns has a length.
-/// `join_schema_changes.rs` covers the `JOIN` and group-basis tables.
+/// Rule 1 of #1207's decision, over the tables Trellis creates for these
+/// shapes: a 1-1 target keyed by a `varchar(n)` with a passthrough and a
+/// field read through a relationship, the 1-1 side ledger, the
+/// relationship's projection, a group-basis aggregate grouped by `varchar(n)`
+/// columns (target and partials), and a ledger aggregate grouped by a
+/// relationship path (target, ledger, group-delta table). None of their
+/// columns has a length. `join_schema_changes.rs` covers the `JOIN` tables.
 #[tokio::test]
 async fn no_table_trellis_creates_holds_a_bounded_varchar() {
     let mut d = Driver::start_with_relationships(
@@ -249,9 +249,9 @@ async fn no_table_trellis_creates_holds_a_bounded_varchar() {
         &[
             "TRANSFORM one FROM public.s SELECT g AS g, owner.label AS ol, n AS n",
             "TRANSFORM per_gk FROM public.s GROUP BY g, k \
-             SELECT g AS g, k AS k, COUNT(*) AS c, MIN(k) AS mk, SUM(n) AS sn",
+            WITHOUT SOURCE INDEX SELECT g AS g, k AS k, COUNT(*) AS c, COUNT(k) AS mk, SUM(n) AS sn",
             "TRANSFORM per_label FROM public.s GROUP BY owner.label \
-             SELECT owner.label AS l, COUNT(*) AS c",
+            WITHOUT SOURCE INDEX SELECT owner.label AS l, COUNT(*) AS c",
         ],
         &["public.o", "public.s"],
     )

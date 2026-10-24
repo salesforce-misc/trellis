@@ -16,7 +16,8 @@ use trellis::staging::build::{self, WorkerOptions};
 use trellis::staging::{StagedWatermark, apply, has_pending, retire_drained_segments};
 
 const WAKE: &str = "build_step_probe_wake";
-const AGG: &str = "TRANSFORM agg FROM public.src GROUP BY g SELECT SUM(v) AS total";
+const AGG: &str =
+    "TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total";
 
 const OPTIONS: WorkerOptions = WorkerOptions {
     chunk_rows: 10,

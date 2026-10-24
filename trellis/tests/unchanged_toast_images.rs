@@ -92,8 +92,8 @@ async fn an_unchanged_toasted_column_is_read_from_the_old_image() {
     .expect("connect running trellis");
     for statement in [
         "RELATIONSHIP post FROM post_tags.post_id TO posts.id",
-        "TRANSFORM by_author FROM post_tags GROUP BY post.author SELECT COUNT(*) AS n, SUM(weight) AS w",
-        "TRANSFORM by_tag FROM post_tags GROUP BY tag SELECT tag AS tag, SUM(post.word_count) AS words",
+        "TRANSFORM by_author FROM post_tags GROUP BY post.author WITHOUT SOURCE INDEX SELECT COUNT(*) AS n, SUM(weight) AS w",
+        "TRANSFORM by_tag FROM post_tags GROUP BY tag WITHOUT SOURCE INDEX SELECT tag AS tag, SUM(post.word_count) AS words",
         "TRANSFORM tag_view FROM post_tags SELECT post.author AS author, post.word_count AS wc",
         "RELATIONSHIP comments FROM articles.ref TO comments.article_ref",
         "TRANSFORM article_words FROM articles SELECT sum(comments.word_count) AS total_words",

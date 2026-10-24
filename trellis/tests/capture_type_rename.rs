@@ -279,10 +279,10 @@ async fn setup(dsn: &str, raw: &mut Client, pool: &trellis::Pool) -> Trellis {
     let trellis = definer(dsn).await;
     for text in [
         "TRANSFORM tone_pass FROM public.items SELECT tone AS tone",
-        "TRANSFORM per_tone FROM public.items GROUP BY tone SELECT tone AS tone, COUNT(*) AS n",
+        "TRANSFORM per_tone FROM public.items GROUP BY tone WITHOUT SOURCE INDEX SELECT tone AS tone, COUNT(*) AS n",
         "TRANSFORM kind_v FROM public.kinds SELECT v AS v",
         "TRANSFORM by_tone_join FROM public.items JOIN public.notes ON items.id = notes.item_id \
-         GROUP BY items.tone SELECT items.tone AS tone, COUNT(*) AS n",
+         GROUP BY items.tone WITHOUT SOURCE INDEX SELECT items.tone AS tone, COUNT(*) AS n",
     ] {
         trellis.apply(text).await.expect(text);
     }
@@ -291,7 +291,7 @@ async fn setup(dsn: &str, raw: &mut Client, pool: &trellis::Pool) -> Trellis {
         .await
         .expect("index the pass target");
     let chained = "TRANSFORM chained FROM public.tone_pass GROUP BY tone \
-                   SELECT tone AS tone, COUNT(*) AS n";
+                  WITHOUT SOURCE INDEX SELECT tone AS tone, COUNT(*) AS n";
     trellis.apply(chained).await.expect(chained);
     bring_live(raw, pool, &TARGETS).await;
     // The sources start empty: the rows arrive through capture.
@@ -625,7 +625,7 @@ async fn a_renamed_type_of_a_partitioned_source_is_followed_in_place() {
     .expect("seed");
     let trellis = definer(db.dsn()).await;
     let text = "TRANSFORM per_tone FROM public.items GROUP BY g, tone \
-                SELECT g AS g, tone AS tone, COUNT(*) AS n";
+               WITHOUT SOURCE INDEX SELECT g AS g, tone AS tone, COUNT(*) AS n";
     trellis.apply(text).await.expect(text);
     bring_live(&mut raw, &db.pool, &["per_tone"]).await;
     raw.batch_execute("insert into public.items values (1, 1, 'calm'), (9, 2, 'loud')")
@@ -817,7 +817,7 @@ async fn assert_pass_and_counts(raw: &Client) {
 
 const PASS_AND_COUNTS: [&str; 2] = [
     "TRANSFORM tone_pass FROM public.items SELECT tone AS tone",
-    "TRANSFORM per_tone FROM public.items GROUP BY tone SELECT tone AS tone, COUNT(*) AS n",
+    "TRANSFORM per_tone FROM public.items GROUP BY tone WITHOUT SOURCE INDEX SELECT tone AS tone, COUNT(*) AS n",
 ];
 
 /// #1242 window 1: the type is renamed between define and the pass that
@@ -906,7 +906,7 @@ async fn a_rename_is_followed_for_a_chained_reader_of_a_paused_upstream() {
         .await
         .expect("index the upstream's target");
     let chained = "TRANSFORM chained FROM public.tone_pass GROUP BY tone \
-                   SELECT tone AS tone, COUNT(*) AS n";
+                  WITHOUT SOURCE INDEX SELECT tone AS tone, COUNT(*) AS n";
     trellis.apply(chained).await.expect(chained);
     bring_live(&mut raw, &db.pool, &["tone_pass", "chained"]).await;
     raw.batch_execute(

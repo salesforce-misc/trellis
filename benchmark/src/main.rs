@@ -39,10 +39,10 @@
 //! # issue #277: fold rate and lock-wait attribution by group count x drain workers
 //! cargo run -p benchmark --features engine-access --release -- group-contention --groups 10,100,400,4000,40000
 //! cargo run -p benchmark --features engine-access --release -- group-contention --groups 400 --threads 1,2,4,8,16
-//! cargo run -p benchmark --features engine-access --release -- group-contention --groups 10,400 --aggregate max
-//! # #1100: any streaming scenario on the group basis instead of the ledger (the dev knob);
-//! # the same command without the flag is its same-session ledger control
-//! cargo run -p benchmark --features engine-access --release -- group-contention --groups 10,400 --group-basis
+//! cargo run -p benchmark --features engine-access --release -- group-contention --groups 10,400 --aggregate max --ledger
+//! # #1100: every aggregate runs on the group basis; `--ledger` forces the per-row ledger
+//! # (the dev knob) for a same-session control until #1105 deletes it
+//! cargo run -p benchmark --features engine-access --release -- group-contention --groups 10,400 --ledger
 //! # #1113: #1091 J2's JOIN scenario (D1/D2 x S1/S2, a-side and b-side pages, hot keys)
 //! # against its same-session per-fact control (B0); turns the group-basis knob on itself
 //! cargo run -p benchmark --features engine-access --release -- join
@@ -266,6 +266,10 @@ fn main() {
         }
     };
 
+    // These scenarios time the per-row ledger's direct aggregate build
+    // (`backfill_definition`), which the group basis doesn't have: they run on
+    // the ledger until #1105 deletes it.
+    trellis::dev::staging::set_group_basis(false);
     let runtime = tokio::runtime::Runtime::new().expect("build tokio runtime");
     let mut any_over_ceiling = false;
     let mut any_incorrect = false;

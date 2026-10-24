@@ -1889,7 +1889,7 @@ mod db_tests {
     /// relationship, so it still takes the old build (and reaches this sweep)
     /// until #625 F9.
     const BY_G: &str = "TRANSFORM orders_by_g FROM orders GROUP BY g \
-         SELECT max(a) AS total, max(gs.w) AS w";
+        WITHOUT SOURCE INDEX SELECT max(a) AS total, max(gs.w) AS w";
 
     /// Creates `public.gs` (keyed by `orders.g`'s text values) and the to-one
     /// relationship `gs` from `orders.g` to it, which [`BY_G`] reads.
@@ -2649,6 +2649,7 @@ mod db_tests {
     /// tenth of a page. Collecting the whole read before staging it held
     /// all 50,000.
     #[tokio::test]
+    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
     async fn a_sweep_holds_at_most_a_page_of_keys_in_memory() {
         const ITEMS: i64 = 25_000;
         let cluster = testkit::TestCluster::start();
@@ -2670,7 +2671,7 @@ mod db_tests {
             .expect("make items read as another definition's target");
         for text in [
             "TRANSFORM items_copy FROM items SELECT a AS a",
-            "TRANSFORM items_by_g FROM items GROUP BY g SELECT sum(a) AS total",
+            "TRANSFORM items_by_g FROM items GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total",
         ] {
             crate::defs::catalog::install_definition(&pool, text, &columns, "public")
                 .await
@@ -2754,7 +2755,7 @@ mod db_tests {
             .expect("make items read as another definition's target");
         for text in [
             "TRANSFORM items_copy FROM items SELECT a AS a",
-            "TRANSFORM items_by_g FROM items GROUP BY g SELECT sum(a) AS total",
+            "TRANSFORM items_by_g FROM items GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total",
         ] {
             crate::defs::catalog::install_definition(&pool, text, &columns, "public")
                 .await
@@ -2843,6 +2844,7 @@ mod db_tests {
     /// group's first prior image (its sum before the sweep) has to survive
     /// the merge in the table: a later batch's image is a smaller sum.
     #[tokio::test]
+    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
     async fn a_spilled_sweep_stages_what_an_in_memory_one_does() {
         const ITEMS: i64 = 12;
         let cluster = testkit::TestCluster::start();
@@ -3758,7 +3760,7 @@ mod db_tests {
         crate::defs::catalog::install_definition(
             &pool,
             "TRANSFORM author_tags FROM post_tags GROUP BY tag, post.author \
-             SELECT count(*) AS n",
+            WITHOUT SOURCE INDEX SELECT count(*) AS n",
             &columns,
             "public",
         )

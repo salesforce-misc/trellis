@@ -713,6 +713,23 @@ impl ManualBackend {
         Ok(row.get(0))
     }
 
+    /// How many group-basis hidden tables (`<instance schema>.agg_<id>`, one
+    /// per definition maintained on the group basis, issue #1100) the
+    /// instance has. A coverage floor compares this with the aggregate
+    /// definitions it installed, so "every aggregate runs on the group basis"
+    /// is checked against the catalog rather than assumed.
+    pub async fn group_basis_table_count(&self) -> Result<i64, ManualBackendError> {
+        let row = self
+            .raw
+            .query_one(
+                "select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace \
+                 where n.nspname = $1 and c.relkind in ('r', 'p') and c.relname ~ '^agg_[0-9]+$'",
+                &[&self.config.schema()],
+            )
+            .await?;
+        Ok(row.get(0))
+    }
+
     /// Whether anything committed so far is still sitting in the ring,
     /// un-drained (issue #138, epic #127 phase 2): a thin wrapper around
     /// `trellis::dev::staging::has_pending`, exposed so a caller stressing the

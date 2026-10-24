@@ -17,7 +17,8 @@ use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::{ValueType, chunk_queue};
 use trellis::staging::build;
 
-const AGG: &str = "TRANSFORM agg FROM public.src GROUP BY g SELECT SUM(v) AS total";
+const AGG: &str =
+    "TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total";
 
 /// A session `LISTEN`ing on the work channel.
 struct Listener {

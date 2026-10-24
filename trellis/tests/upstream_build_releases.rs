@@ -9,9 +9,10 @@
 //! retry's semantics. Every step is an explicit pass, build or drain;
 //! nothing polls for convergence (#297).
 //!
-//! On the group basis; `upstream_build_releases_ledger.rs` runs the
-//! aggregate scenarios with it off, in its own process, since the knob is
-//! process-wide.
+//! On the group basis, which refuses `BIT_AND`: the chained `BIT_AND`
+//! scenario runs in `upstream_build_releases_ledger.rs` alone, with the
+//! basis off, in its own process, since the knob is process-wide; that file
+//! also runs the aggregate-upstream scenario with it off.
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
@@ -22,41 +23,42 @@ use upstream_releases::*;
 
 const GROUP_BASIS: bool = true;
 
-#[tokio::test]
-async fn chained_bit_aggregates_converge_after_the_upstream_rebuild() {
-    chained_bit_aggregates_converge_after_upstream_rebuild(GROUP_BASIS).await;
-}
-
 /// The release is asked for in the build's own transaction and made by the
 /// pass after it: a worker that stops in between (here, a pass on a fresh
 /// session after the build completed with no pass of its own) still makes
 /// it.
 #[tokio::test]
 async fn a_release_the_build_asked_for_survives_a_worker_stop() {
-    let (mut d, trellis) = chained_bit_aggregates(GROUP_BASIS).await;
-    rewrite_then_settle(&mut d, &trellis).await;
-    // The pass that sees the rewrite starts `up`'s rebuild; the chunks
-    // complete it, and no pass runs after that commit.
-    pass(&mut d).await;
+    let (mut d, trellis) = persistently_held(GROUP_BASIS).await;
+    trellis
+        .request_backfill("public.t")
+        .await
+        .expect("request a backfill of up's source");
+    // The chunks complete `up`'s rebuild, and no pass runs after that
+    // commit.
     run_backfill_chunks(d.pool()).await;
     settle_tolerant(&mut d).await;
     assert_eq!(status_of(&trellis, "up").await, "Live");
-    assert_eq!(status_of(&trellis, "agg").await, "Live (held keys: 1)");
     assert_eq!(
         d.rows(
             "select split_part(d.target_table, '.', 2) from upstream_releases r \
              join transform_definitions d on d.id = r.transform_id"
         )
         .await,
-        vec!["(agg)".to_string()],
+        vec!["(r)".to_string()],
         "the completing build asked for its reader's release"
     );
+    assert_eq!(r_retry_attempts(&d).await, vec!["(0)".to_string()]);
 
     d.ctl = drain_driver::connect(d.db.dsn()).await;
     pass(&mut d).await;
     settle_tolerant(&mut d).await;
-    assert_eq!(status_of(&trellis, "agg").await, "Live");
-    assert_eq!(diverged(&d).await, Vec::<String>::new());
+    assert_eq!(status_of(&trellis, "r").await, "Live (held keys: 1)");
+    assert_eq!(
+        r_retry_attempts(&d).await,
+        vec!["(1)".to_string()],
+        "the pass on the fresh session released r's key, retried once"
+    );
     trellis.shutdown().await.expect("shutdown");
 }
 

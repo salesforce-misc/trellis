@@ -115,6 +115,8 @@ in place. It keeps:
 * an aggregate's group rows edited by hand, and a `MIN` or `MAX` over a
   re-collated column: the rebuild keeps the per-row ledger, with its
   collations, and adds only differences to the groups.
+* a hand edit of a `JOIN`'s hidden tables, which a `PAUSE` and `RESUME`
+  recreates.
 
 `PAUSE`, `DROP TRANSFORM` and define it again repairs each
 ([known correctness gaps](known-correctness-gaps.md): [Rows written into a target, a hidden table or Trellis's schema](known-correctness-gaps.md#rows-written-into-a-target-a-hidden-table-or-trelliss-schema),
@@ -240,10 +242,10 @@ each one costs and what to expect around it
   the correction of a dropped partition of 1,000,000 rows took 13.0 s in the
   engine (1,000,000 keys in 101 pages, 489 MB of WAL), plus 0.35 s and 23 MB to
   fold the result and a 0.26 s pass to detect the drop (release build,
-  PostgreSQL 17.11, a 1,000-leaf tree on disk). On the group basis, which
-  aggregates run on today only behind a development switch
-  ([#1105](https://github.com/salesforce-misc/trellis/issues/1105)), the
-  correction of a `DROP`, `DETACH` or `TRUNCATE` took
+  PostgreSQL 17.11, a 1,000-leaf tree on disk); only an aggregate that reads
+  a relationship path is still on the ledger. On the group basis, which
+  keeps every other aggregate, the correction of a `DROP`, `DETACH` or
+  `TRUNCATE` took
   27-34 ms and about 0.6 MB of WAL for a partition of 1M or 10M rows over 1,560
   groups (a debug build), and the correction of an `ATTACH` took 0.5-0.6 s at 1M
   rows and 3.9-4.7 s at 10M. Moving rows with DML through the parent instead

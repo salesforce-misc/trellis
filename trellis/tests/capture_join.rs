@@ -918,7 +918,7 @@ async fn an_on_delete_cascade_parent_child_pair_converges() {
         .await
         .expect("define c_named");
     trellis
-        .apply("TRANSFORM c_totals FROM public.c GROUP BY pid SELECT SUM(amount) AS total")
+        .apply("TRANSFORM c_totals FROM public.c GROUP BY pid WITHOUT SOURCE INDEX SELECT SUM(amount) AS total")
         .await
         .expect("define c_totals");
     let client = trellis::Client::start(db.dsn(), quick_options()).expect("start the client");
@@ -1015,7 +1015,9 @@ async fn a_nested_rewrite_of_the_same_key_lands_in_the_right_group() {
     .expect("seed");
     let trellis = definer(db.dsn()).await;
     trellis
-        .apply("TRANSFORM by_grp FROM public.s GROUP BY grp SELECT COUNT(*) AS n")
+        .apply(
+            "TRANSFORM by_grp FROM public.s GROUP BY grp WITHOUT SOURCE INDEX SELECT COUNT(*) AS n",
+        )
         .await
         .expect("define");
     let client = trellis::Client::start(db.dsn(), quick_options()).expect("start the client");

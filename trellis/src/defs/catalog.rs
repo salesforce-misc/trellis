@@ -208,10 +208,6 @@ pub enum CatalogError {
         /// The table, schema-qualified.
         deltas_table: String,
     },
-    /// With the group-basis dev knob on (`staging::group_basis`, #1100),
-    /// define refuses an aggregate the knob routes to the group basis when
-    /// its source or arguments need what that path doesn't have yet.
-    GroupBasisUnsupported { reason: String },
     /// A `GROUP BY` or `JOIN` target's source lacks the index its `self_check`
     /// walk pages by (#1167, `super::source_index`). Refused by define and by
     /// a whole-transform resume, unless the definition says `WITHOUT SOURCE
@@ -528,7 +524,6 @@ impl CatalogError {
             CatalogError::SourceKeyChanged { .. } => ErrorCode::Validation,
             CatalogError::AggregateDeltasShapeChanged { .. } => ErrorCode::Validation,
             CatalogError::AggregateDeltasTableMissing { .. } => ErrorCode::Validation,
-            CatalogError::GroupBasisUnsupported { .. } => ErrorCode::Validation,
             CatalogError::SourceIndexMissing { .. } => ErrorCode::Validation,
             CatalogError::LedgerTableMissing { .. } => ErrorCode::Validation,
             CatalogError::TargetTableMissing { .. } => ErrorCode::Validation,
@@ -684,11 +679,6 @@ impl fmt::Display for CatalogError {
             CatalogError::SourceIndexMissing { target, missing } => {
                 write!(f, "{}", super::source_index::refusal_text(target, missing))
             }
-            CatalogError::GroupBasisUnsupported { reason } => write!(
-                f,
-                "the group-basis dev knob (TRELLIS_DEV_GROUP_BASIS) can't take this aggregate: \
-                 {reason}"
-            ),
             CatalogError::LedgerTableMissing {
                 target,
                 ledger_table,
@@ -886,7 +876,6 @@ impl std::error::Error for CatalogError {
             CatalogError::SourceKeyChanged { .. } => None,
             CatalogError::AggregateDeltasShapeChanged { .. } => None,
             CatalogError::AggregateDeltasTableMissing { .. } => None,
-            CatalogError::GroupBasisUnsupported { .. } => None,
             CatalogError::SourceIndexMissing { .. } => None,
             CatalogError::LedgerTableMissing { .. } => None,
             CatalogError::TargetTableMissing { .. } => None,
@@ -3965,12 +3954,26 @@ async fn create_definition_inner(
         ))
         .await?;
     }
-    // #1100, #1096 decision 7: an aggregate on the group basis (behind its
-    // dev knob) keeps its partials in a hidden table in the catalog schema,
-    // named by this definition's id, created empty with its row. A JOIN's key
-    // space is never an aggregate's, so it never routes here.
-    if let Some(shape) = crate::staging::group_basis::route(&def, source_columns) {
-        crate::staging::group_basis::check_define(&txn, &shape, &qualified_source).await?;
+    // #1096 decision 1: an aggregate outside the admitted set is refused by
+    // family, whatever its arguments' types were when `validate` ran.
+    check_aggregate_admitted(&*txn, &def, &qualified_source).await?;
+    // #1100, #1096 decision 7: an aggregate on the group basis keeps its
+    // partials in a hidden table in the catalog schema, named by this
+    // definition's id, created empty with its row. A JOIN's key space is
+    // never an aggregate's, so it never routes here.
+    let shape = crate::staging::group_basis::route(&def, source_columns);
+    // Define's refusals and the routing agree: every aggregate define
+    // accepts without a relationship path is on the group basis, never
+    // silently on the ledger.
+    debug_assert!(
+        shape.is_some()
+            || !crate::staging::group_basis::enabled()
+            || !matches!(def.key_space, KeySpace::Aggregate { .. })
+            || !super::eval::relationship_references(&def).is_empty(),
+        "an admitted aggregate the group basis doesn't route: {}",
+        def.target
+    );
+    if let Some(shape) = shape {
         txn.batch_execute(&crate::staging::group_basis::hidden_table_ddl(
             pool.schema(),
             id,
@@ -5501,6 +5504,29 @@ impl JoinSides {
     }
 }
 
+/// Refuses a plain aggregate over `qualified_source` that calls an aggregate
+/// outside #1096 decision 1's admitted set, by family
+/// ([`super::validate::validate_aggregate_admitted`]), against the source's
+/// live columns. Define makes it in its transaction, and a resume's
+/// [`revalidate`] again, so a summed column re-typed since (to an
+/// unconstrained `numeric`, or a float) refuses the resume. Nothing is
+/// refused while a test has forced the group-basis knob off.
+async fn check_aggregate_admitted(
+    client: &impl GenericClient,
+    def: &TransformDef,
+    qualified_source: &str,
+) -> Result<(), CatalogError> {
+    // A test that forced the group-basis knob off keeps every aggregate on
+    // the ledger, which takes them all (`staging::group_basis`, "The knob").
+    if !matches!(def.key_space, KeySpace::Aggregate { .. })
+        || !crate::staging::group_basis::enabled()
+    {
+        return Ok(());
+    }
+    let columns = join_columns_of(client, qualified_source).await?;
+    Ok(super::validate::validate_aggregate_admitted(def, &columns)?)
+}
+
 /// Every column of `qualified` as [`super::validate::validate_join`] reads
 /// it. Like [`live_source_columns`], a column whose type the registry can't
 /// place is left out, so a reference to it is an unresolved column.
@@ -6160,11 +6186,10 @@ pub(crate) async fn revalidate(
             });
         }
     }
-    // #1188: the group basis's own refusals (a `SUM`/`AVG` over a numeric
-    // with no declared scale), which define makes once the table exists.
-    if let Some(shape) = crate::staging::group_basis::route(&definition.def, &source_columns) {
-        crate::staging::group_basis::check_define(txn, &shape, source).await?;
-    }
+    // #1188, #1096 decision 1: the aggregates define refuses by family (a
+    // `SUM`/`AVG` over a numeric that lost its declared scale, or over a
+    // column re-typed to a float), which define makes once the table exists.
+    check_aggregate_admitted(txn, &definition.def, source).await?;
     reject_row_security(
         txn,
         schema,

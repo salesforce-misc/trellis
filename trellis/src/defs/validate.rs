@@ -1765,6 +1765,110 @@ pub(crate) fn check_aggregate_admitted(
     }
 }
 
+/// Refuses a plain aggregate (`GROUP BY`, no relationship path) that calls
+/// an aggregate outside #1096 decision 1's admitted set, by family
+/// ([`check_aggregate_admitted`]): the group basis keeps every aggregate
+/// definition, and has nothing for the rest. `columns` are the source's live
+/// columns, whose declared modifier tells a `numeric(p,s)` argument from an
+/// unconstrained one; an expression's `numeric` result has no declared scale.
+///
+/// Any other key space, and an aggregate with a relationship path (which
+/// stays on the ledger until relationships are removed, #1115), passes.
+pub(crate) fn validate_aggregate_admitted(
+    def: &TransformDef,
+    columns: &HashMap<String, JoinColumnInfo>,
+) -> Result<(), ValidationError> {
+    let KeySpace::Aggregate { group_by } = &def.key_space else {
+        return Ok(());
+    };
+    if group_by
+        .iter()
+        .any(|key| matches!(key, GroupByKey::RelationshipPath { .. }))
+        || def.fields.iter().any(|f| reads_relationship(&f.expr))
+    {
+        return Ok(());
+    }
+    let value_types: HashMap<String, ValueType> = columns
+        .iter()
+        .map(|(name, info)| (name.clone(), info.value_type))
+        .collect();
+    // Each field with the calculated fields it reads by name substituted, as
+    // the group basis routes it: an argument that names a grouped calculated
+    // field (`(qty + 1) AS q, SUM(q)`) is typed as that field's expression,
+    // not as an unknown column. A definition substitution can't take is
+    // refused by `validate` already.
+    let Ok(substituted) = super::backfill::substituted_field_exprs(def) else {
+        return Ok(());
+    };
+    for field in &def.fields {
+        let expr = substituted.get(&field.name).unwrap_or(&field.expr);
+        check_aggregate_calls(expr, columns, &value_types)?;
+    }
+    Ok(())
+}
+
+fn reads_relationship(expr: &Expr) -> bool {
+    match expr {
+        Expr::RelationshipPath { .. } => true,
+        Expr::FunctionCall { args, .. } => args.iter().any(reads_relationship),
+        Expr::BinaryOp { lhs, rhs, .. } => reads_relationship(lhs) || reads_relationship(rhs),
+        _ => false,
+    }
+}
+
+/// [`validate_aggregate_admitted`]'s walk of one field's expression.
+fn check_aggregate_calls(
+    expr: &Expr,
+    columns: &HashMap<String, JoinColumnInfo>,
+    value_types: &HashMap<String, ValueType>,
+) -> Result<(), ValidationError> {
+    match expr {
+        Expr::BinaryOp { lhs, rhs, .. } => {
+            check_aggregate_calls(lhs, columns, value_types)?;
+            check_aggregate_calls(rhs, columns, value_types)
+        }
+        Expr::FunctionCall { name, args } => {
+            let upper = name.to_ascii_uppercase();
+            if !(is_deferred_aggregate_name(&upper)
+                || super::registry::AGGREGATE_FUNCTIONS.contains(&upper.as_str()))
+            {
+                for arg in args {
+                    check_aggregate_calls(arg, columns, value_types)?;
+                }
+                return Ok(());
+            }
+            check_aggregate_admitted(&upper, None)?;
+            let [arg] = args.as_slice() else {
+                return Ok(());
+            };
+            // `validate` has typed the definition already; an argument it
+            // can't type here is left to it.
+            let Ok(value_type) = infer_expr_type(arg, value_types, &HashMap::new()) else {
+                return Ok(());
+            };
+            let column = match arg {
+                Expr::Column(column) | Expr::SourceColumn { column, .. } => columns.get(column),
+                _ => None,
+            };
+            let (pg_type, typmod, trellis_target) = match column {
+                Some(info) => (info.pg_type.clone(), info.typmod, info.trellis_target),
+                None => (super::ddl::pg_type_name(value_type).into_owned(), -1, false),
+            };
+            check_aggregate_admitted(
+                &upper,
+                Some(&AggregateArg {
+                    column: &render_field_expr(arg),
+                    value_type,
+                    pg_type: &pg_type,
+                    typmod,
+                    trellis_target,
+                }),
+            )
+        }
+        _ => Ok(()),
+    }
+}
+
 fn written(column: &QualifiedColumn) -> String {
     match &column.schema {
         Some(schema) => format!("{schema}.{}.{}", column.table, column.column),
@@ -4699,8 +4803,7 @@ mod tests {
     /// Issue #120: `MIN`/`MAX(<uuid column>)` is refused *unconditionally* —
     /// checked live rather than assumed, Postgres has no `min(uuid)`/
     /// `max(uuid)` aggregate at all (the same "opclass but no aggregate"
-    /// shape #114/#116 found for `bytea`/`macaddr` — `trellis/tests/
-    /// defs_min_max_text_and_uuid.rs` pins this against a live server), so
+    /// shape #114/#116 found for `bytea`/`macaddr`), so
     /// `registry::aggregate_result_type("MIN"/"MAX", ValueType::Uuid)` is
     /// `None` and this is an ordinary `FunctionArgTypeMismatch`, independent
     /// of relationship shape — a plain `GROUP BY` field's own
@@ -6055,6 +6158,105 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(message.contains("#1120") && message.contains("no declared scale"));
+    }
+
+    /// #1096 decision 1 on a plain aggregate: every deferred family is
+    /// refused by name and issue, `SUM`/`AVG` over an unconstrained `numeric`
+    /// (a column, or any `numeric` expression) is refused with the "declare a
+    /// scale" remedy, and the admitted set, expression arguments and
+    /// composed fields included, passes.
+    #[test]
+    fn a_plain_aggregate_refuses_each_deferred_family_by_name() {
+        let (_, mut items) = tables();
+        items.insert(
+            "wait".into(),
+            jcol(ValueType::Other(PgType::Interval), "interval", 1186, -1),
+        );
+        items.insert(
+            "cost".into(),
+            jcol(ValueType::Numeric, "numeric(10,2)", 1700, 655366),
+        );
+        let check = |fields: &str| {
+            let def = parse_text(&format!(
+                "TRANSFORM t FROM items GROUP BY sku SELECT sku AS sku, {fields}"
+            ))
+            .unwrap_or_else(|e| panic!("{fields}: {e}"));
+            validate_aggregate_admitted(&def, &items)
+        };
+        for (call, family, issue) in [
+            ("MIN(qty)", "MIN/MAX", 1117),
+            ("MAX(note)", "MIN/MAX", 1117),
+            ("BOOL_AND(qty > 1)", "bool_and/bool_or/bit_and/bit_or", 1118),
+            ("BIT_OR(qty)", "bool_and/bool_or/bit_and/bit_or", 1118),
+            ("SUM(weight)", "float and interval SUM/AVG", 1119),
+            ("AVG(wait)", "float and interval SUM/AVG", 1119),
+            ("ARRAY_AGG(note)", "array_agg/string_agg/jsonb_agg", 1040),
+            (
+                "STRING_AGG(note, ',')",
+                "array_agg/string_agg/jsonb_agg",
+                1040,
+            ),
+            // Inside a composed field too.
+            ("COUNT(*) + MAX(qty)", "MIN/MAX", 1117),
+        ] {
+            match check(&format!("{call} AS v")) {
+                Err(ValidationError::DeferredAggregate {
+                    family: got_family,
+                    issue: got_issue,
+                    ..
+                }) => assert_eq!((got_family, got_issue), (family, issue), "{call}"),
+                other => panic!("{call}: expected DeferredAggregate, got {other:?}"),
+            }
+        }
+        for call in [
+            "SUM(price)",
+            "AVG(price)",
+            "SUM(cost + 1)",
+            "AVG(cost + qty)",
+        ] {
+            let err = check(&format!("{call} AS v")).unwrap_err();
+            assert!(
+                matches!(err, ValidationError::UnconstrainedNumericAggregate { .. }),
+                "{call}: {err:?}"
+            );
+            assert!(err.to_string().contains("numeric(p,s)"), "{call}: {err}");
+        }
+        for fields in [
+            "COUNT(*) AS n, COUNT(note) AS notes, COUNT(price) AS priced",
+            "SUM(qty) AS s, AVG(qty) AS a, SUM(cost) AS c, AVG(cost) AS ac",
+            "SUM(qty + order_id) AS s, COALESCE(SUM(cost), 0) + COUNT(*) AS c",
+        ] {
+            if let Err(err) = check(fields) {
+                panic!("{fields}: {err:?}");
+            }
+        }
+        // An argument that names a calculated field is typed as that field's
+        // expression: an integer one is admitted, a float one is refused by
+        // family. (This check doesn't look at `GROUP BY`; `validate` refuses
+        // a calculated field over an ungrouped column.)
+        let grouped = |fields: &str| {
+            let def = parse_text(&format!(
+                "TRANSFORM t FROM items GROUP BY sku, qty \
+                 SELECT sku AS sku, qty AS qty, {fields}"
+            ))
+            .unwrap_or_else(|e| panic!("{fields}: {e}"));
+            validate_aggregate_admitted(&def, &items)
+        };
+        assert!(
+            matches!(
+                grouped("(weight + weight) AS w2, SUM(w2) AS s"),
+                Err(ValidationError::DeferredAggregate { issue: 1119, .. })
+            ),
+            "a float calculated field's SUM"
+        );
+        for fields in [
+            "(qty + 1) AS q, SUM(q) AS s",
+            "(qty + qty) AS q, COUNT(*) AS n, AVG(q) AS a",
+        ] {
+            if let Err(err) = grouped(fields) {
+                panic!("{fields}: {err:?}");
+            }
+        }
     }
 
     #[test]

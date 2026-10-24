@@ -849,7 +849,7 @@ async fn the_min_max_fold_matches_a_server_side_aggregate() {
 
         for (aggregate, expected) in [("MIN", &server_min), ("MAX", &server_max)] {
             let def = parse(&format!(
-                "TRANSFORM t FROM s GROUP BY id SELECT id AS k, {aggregate}(col) AS out"
+                "TRANSFORM t FROM s GROUP BY id WITHOUT SOURCE INDEX SELECT id AS k, {aggregate}(col) AS out"
             ))
             .expect("parses");
             let columns = HashMap::from([
@@ -915,8 +915,10 @@ async fn the_sum_interval_fold_matches_a_server_side_sum() {
             .unwrap_or_else(|e| panic!("sum over {group:?}: {e}"))
             .get(0);
 
-        let def = parse("TRANSFORM t FROM s GROUP BY id SELECT id AS k, SUM(col) AS out")
-            .expect("parses");
+        let def = parse(
+            "TRANSFORM t FROM s GROUP BY id WITHOUT SOURCE INDEX SELECT id AS k, SUM(col) AS out",
+        )
+        .expect("parses");
         let columns = HashMap::from([
             ("id".to_string(), ValueType::Integer(IntWidth::Int8)),
             ("col".to_string(), ValueType::Other(PgType::Interval)),
@@ -1380,7 +1382,7 @@ async fn a_precision_modified_temporal_key_is_still_recognized() {
 fn the_group_by_key_gate_follows_the_same_split() {
     for column in ["d", "tm", "tmtz", "ts", "tstz"] {
         let def = parse(&format!(
-            "TRANSFORM t FROM s GROUP BY {column} SELECT {column} AS k, SUM(n) AS total"
+            "TRANSFORM t FROM s GROUP BY {column} WITHOUT SOURCE INDEX SELECT {column} AS k, SUM(n) AS total"
         ))
         .expect("parses");
         validate(&def, &source_columns(), &HashMap::new())
@@ -1390,7 +1392,7 @@ fn the_group_by_key_gate_follows_the_same_split() {
     {
         let column = "iv";
         let def = parse(&format!(
-            "TRANSFORM t FROM s GROUP BY {column} SELECT {column} AS k, SUM(n) AS total"
+            "TRANSFORM t FROM s GROUP BY {column} WITHOUT SOURCE INDEX SELECT {column} AS k, SUM(n) AS total"
         ))
         .expect("parses");
         let err = validate(&def, &source_columns(), &HashMap::new())
@@ -1548,260 +1550,6 @@ async fn interval_in_reads_intervalstyle_which_is_why_there_is_no_interval_liter
 // 7. The live delta path
 // ---------------------------------------------------------------------
 
-/// `SUM(interval)` and `MAX(date)` maintained end-to-end through the ring,
-/// checked against an independently-authored `SELECT ... GROUP BY` over the
-/// live source (ADR-0013 — not `defs::render_aggregate_select_sql`, which is
-/// the engine's own renderer).
-///
-/// Both fields are recompute-only, which is the point: `SUM(interval)` goes
-/// through a server-side `sum(<col>)`, so the value Trellis writes is Postgres's own
-/// `sum(interval)` over the group in one pass. That is what makes the
-/// infinity and overflow cases in
-/// `sum_interval_is_exact_on_finite_values_but_still_recompute_only`
-/// unreachable here: there is no accumulation order for them to depend on.
-///
-/// The insert/update/delete/grain-migration sequence is the same shape
-/// `apply_aggregate.rs`'s own oracle test uses; the update and delete are
-/// what force a group's value to fall as well as rise.
-#[tokio::test]
-async fn sum_interval_and_max_date_are_maintained_end_to_end_through_a_drain() {
-    use trellis::defs::{create_aggregate_target_table, create_definition};
-    use trellis::staging::{StagedWatermark, apply, seal};
-
-    const DEF_SQL: &str = "TRANSFORM shift_totals FROM shifts GROUP BY crew \
-         SELECT crew AS crew, SUM(worked) AS total_worked, MAX(on_day) AS last_day";
-
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
-
-    client
-        .batch_execute(
-            "create table shifts ( \
-               id integer primary key, crew integer, worked interval, on_day date)",
-        )
-        .await
-        .expect("create source table");
-
-    let columns = HashMap::from([
-        ("id".to_string(), ValueType::Integer(IntWidth::Int4)),
-        ("crew".to_string(), ValueType::Integer(IntWidth::Int4)),
-        ("worked".to_string(), ValueType::Other(PgType::Interval)),
-        ("on_day".to_string(), ValueType::Other(PgType::Date)),
-    ]);
-    let def = parse(DEF_SQL).expect("parse");
-    validate(&def, &columns, &HashMap::new()).expect("validate");
-    create_definition(&db.pool, DEF_SQL, &columns)
-        .await
-        .expect("create definition");
-    create_aggregate_target_table(&db.pool, &def, "public", &columns)
-        .await
-        .expect("create aggregate target table");
-
-    // The visible columns must be declared with their real Postgres types,
-    // not coerced into `numeric` — `SUM(interval)` is `interval` and
-    // `MAX(date)` is `date` (`registry::aggregate_result_type`).
-    for (column, expected) in [("total_worked", "interval"), ("last_day", "date")] {
-        let declared: String = client
-            .query_one(
-                "select format_type(atttypid, atttypmod) from pg_attribute \
-                 where attrelid = 'shift_totals'::regclass and attname = $1",
-                &[&column],
-            )
-            .await
-            .unwrap_or_else(|e| panic!("introspect shift_totals.{column}: {e}"))
-            .get(0);
-        assert_eq!(declared, expected, "shift_totals.{column}");
-    }
-
-    /// The independently-authored recompute: plain SQL, hand-written here,
-    /// with no reference to the engine's own renderer.
-    async fn expected(client: &Client) -> HashMap<String, (Option<String>, Option<String>)> {
-        client
-            .query(
-                "select crew::text, sum(worked)::text, max(on_day)::text \
-                 from shifts group by crew",
-                &[],
-            )
-            .await
-            .expect("hand-written recompute")
-            .into_iter()
-            .map(|row| (row.get::<_, String>(0), (row.get(1), row.get(2))))
-            .collect()
-    }
-
-    async fn actual(client: &Client) -> HashMap<String, (Option<String>, Option<String>)> {
-        client
-            .query(
-                "select crew::text, total_worked::text, last_day::text from shift_totals",
-                &[],
-            )
-            .await
-            .expect("read target")
-            .into_iter()
-            .map(|row| (row.get::<_, String>(0), (row.get(1), row.get(2))))
-            .collect()
-    }
-
-    async fn stage(
-        client: &Client,
-        segment: &str,
-        key: &str,
-        op: &str,
-        old_image: Option<&str>,
-        new_image: Option<&str>,
-    ) {
-        let src_table = format!("{DEFAULT_SCHEMA}.shifts");
-        client
-            .execute(
-                &format!(
-                    "insert into {segment} \
-                     (src_table, key, op, lsn, old_image, new_image, hop_gen) \
-                     values ($1, $2, $3, $4, $5::text::jsonb, $6::text::jsonb, 0)"
-                ),
-                &[
-                    &src_table,
-                    &key,
-                    &op,
-                    &testkit::wal_insert_lsn(client).await,
-                    &old_image,
-                    &new_image,
-                ],
-            )
-            .await
-            .unwrap_or_else(|e| panic!("stage {key}: {e}"));
-    }
-
-    async fn drain_sealed(client: &mut Client, pool: &trellis::Pool) {
-        let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
-        seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
-            .await
-            .expect("seal phase 2");
-        apply::drain_once(
-            pool,
-            outcome.sealed_seg_seq,
-            "temporal_worker",
-            1,
-            "trellis_defs_temporal_test",
-            &StagedWatermark::saturated(),
-        )
-        .await
-        .expect("drain_once")
-        .expect("drain_once must claim and drain something");
-    }
-
-    // Step 1 — seed two groups. Crew 1's members are deliberately `=` but
-    // spelled differently (`1 day` / `24 hours`), which is exactly the
-    // multiset that makes `MAX(interval)` ill-defined and leaves `SUM`
-    // perfectly well-defined.
-    client
-        .batch_execute(
-            "insert into shifts (id, crew, worked, on_day) values \
-               (1, 1, '1 day',    '2024-01-01'), \
-               (2, 1, '24 hours', '2024-01-05'), \
-               (3, 2, '2 hours',  '2024-02-01'), \
-               (4, 2, '1 mon',    '2023-12-31')",
-        )
-        .await
-        .expect("seed source rows");
-    // The staged images carry `interval_out`'s **canonical** spelling,
-    // because that is what a capture trigger renders — `'24 hours'` reaches
-    // the engine as `24:00:00`. Staging the input spelling instead would
-    // be testing a shape CDC cannot produce.
-    for (key, crew, worked, day) in [
-        ("1", "1", "1 day", "2024-01-01"),
-        ("2", "1", "24:00:00", "2024-01-05"),
-        ("3", "2", "02:00:00", "2024-02-01"),
-        ("4", "2", "1 mon", "2023-12-31"),
-    ] {
-        stage(
-            &client,
-            "seg_0",
-            key,
-            "insert",
-            None,
-            Some(&format!(
-                r#"{{"crew":"{crew}","worked":"{worked}","on_day":"{day}"}}"#
-            )),
-        )
-        .await;
-    }
-    drain_sealed(&mut client, &db.pool).await;
-    assert_eq!(
-        actual(&client).await,
-        expected(&client).await,
-        "the seed batch must already match a hand-written recompute"
-    );
-
-    // Step 2 — an insert, an in-place update, a grain migration (crew 2 ->
-    // 3) and a delete, all in one batch. The update and delete are what
-    // drive `SUM`'s *subtraction* leg, which is the half a recompute-only
-    // aggregate never exercises.
-    client
-        .batch_execute(
-            "insert into shifts (id, crew, worked, on_day) values \
-               (5, 1, '-1 day 1 hour', '2024-03-01'); \
-             update shifts set worked = '1 year 2 mons 3 days 04:05:06' where id = 2; \
-             update shifts set crew = 3 where id = 3; \
-             delete from shifts where id = 4",
-        )
-        .await
-        .expect("apply step 2's live end state");
-    stage(
-        &client,
-        "seg_1",
-        "5",
-        "insert",
-        None,
-        Some(r#"{"crew":"1","worked":"-1 days +01:00:00","on_day":"2024-03-01"}"#),
-    )
-    .await;
-    stage(
-        &client,
-        "seg_1",
-        "2",
-        "update",
-        Some(r#"{"crew":"1","worked":"24:00:00","on_day":"2024-01-05"}"#),
-        Some(r#"{"crew":"1","worked":"1 year 2 mons 3 days 04:05:06","on_day":"2024-01-05"}"#),
-    )
-    .await;
-    stage(
-        &client,
-        "seg_1",
-        "3",
-        "update",
-        Some(r#"{"crew":"2","worked":"02:00:00","on_day":"2024-02-01"}"#),
-        Some(r#"{"crew":"3","worked":"02:00:00","on_day":"2024-02-01"}"#),
-    )
-    .await;
-    stage(
-        &client,
-        "seg_1",
-        "4",
-        "delete",
-        Some(r#"{"crew":"2","worked":"1 mon","on_day":"2023-12-31"}"#),
-        None,
-    )
-    .await;
-    drain_sealed(&mut client, &db.pool).await;
-
-    let got = actual(&client).await;
-    assert_eq!(
-        got,
-        expected(&client).await,
-        "insert/update/grain-migration/delete must still match a hand-written recompute"
-    );
-
-    // And the sum is a real, unjustified interval rather than something
-    // that round-tripped through `numeric`: crew 1 holds
-    // `1 day + (1 year 2 mons 3 days 04:05:06) + (-1 day +01:00:00)`.
-    assert_eq!(
-        got["1"].0.as_deref(),
-        Some("1 year 2 mons 3 days 05:05:06"),
-        "crew 1's interval sum"
-    );
-}
-
 /// Issue #113's review finding, reproduced end-to-end and pinned as a
 /// regression: a `timestamp` `GROUP BY` group whose two source rows reach
 /// the engine through *different* row-decode paths must still fold into
@@ -1840,8 +1588,7 @@ async fn a_timestamp_group_key_seeded_by_backfill_and_by_live_read_is_one_group_
     use trellis::defs::{create_aggregate_target_table, create_definition};
     use trellis::staging::{StagedWatermark, apply, seal};
 
-    const DEF_SQL: &str =
-        "TRANSFORM totals FROM events GROUP BY grp SELECT grp AS grp, SUM(amount) AS total";
+    const DEF_SQL: &str = "TRANSFORM totals FROM events GROUP BY grp WITHOUT SOURCE INDEX SELECT grp AS grp, SUM(amount) AS total";
 
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -1850,7 +1597,7 @@ async fn a_timestamp_group_key_seeded_by_backfill_and_by_live_read_is_one_group_
     client
         .batch_execute(
             "create table events ( \
-               id integer primary key, grp timestamp, amount numeric)",
+               id integer primary key, grp timestamp, amount numeric(12,0))",
         )
         .await
         .expect("create source table");

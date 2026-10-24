@@ -73,7 +73,8 @@ and [stage 05](staging-and-claiming/05-apply-and-exactly-once-deltas.md).
 ### Registration
 
 Registering a transform (`Trellis::apply` with a `TRANSFORM` statement)
-validates the definition, creates the target table and its ledger tables,
+validates the definition, creates the target table and the tables Trellis
+keeps beside it,
 writes the catalog row as `waiting_to_backfill`, and returns. It reads no
 source rows and installs no triggers, so its latency doesn't depend on the
 table's size. The table and the catalog row commit in one transaction, so a
@@ -93,9 +94,9 @@ uninstalls the triggers of a table nothing reads any more.
 
 ### The Re-derive build
 
-A plain aggregate or plain 1-1 definition (no relationship in any field) is
-built by the **Re-derive build** (`staging::build`), whether its source is a
-captured table or another definition's target. It needs no marker and no
+A plain 1-1 definition (no relationship in any field) is built by the
+**Re-derive build** (`staging::build`), whether its source is a captured table
+or another definition's target. It needs no marker and no
 go-live catch-up, because the definition **applies from its first chunk**. A
 captured source needs no fence wait either; a source that is another
 definition's target takes one fence per build (see below):
@@ -114,13 +115,10 @@ definition's target takes one fence per build (see below):
    when it drains, and one it didn't see applies over the entry the chunk
    wrote. Commits between the join and the chunk's snapshot are therefore
    read and captured but counted once.
-3. **Writes.** A 1-1 chunk upserts and deletes the target rows itself. An
-   aggregate chunk never writes a group row; it appends the moves' per-group
-   increments to a delta table, and drain threads merge them into the groups,
-   one merge partition per thread.
-4. **Live.** The transaction that leaves the plan done, every chunk done and
-   the delta table empty moves the definition to `live`, and deletes the
-   build's finished plan job, chunks and sweep from the queue.
+3. **Writes.** A chunk upserts and deletes the target rows itself.
+4. **Live.** The transaction that leaves the plan done and every chunk done
+   moves the definition to `live`, and deletes the build's finished plan job,
+   chunks and sweep from the queue.
 
 **A source that is another definition's target.** Such a source is never
 captured: its writes reach Apply through the target-mutation seam, whose
@@ -130,15 +128,13 @@ snapshot, with its rows staged for no one, so the plan job first takes a
 fence, a transaction id assigned after the start commit, and enqueues no
 chunk until the oldest running transaction in the cluster began after it. The
 seam's check takes the writer's transaction id before it reads the list, so
-every writer that read it too early has an id below the fence.
+every writer that read it too early has an id below the fence. An aggregate
+over another definition's target, and a `JOIN` either of whose tables is one,
+take the same fence before their build
+([below](#an-aggregates-or-a-joins-build)).
 While it waits, the definition's `status().build_wait` reads
 `BuildWait::Fence { xid }`, naming the id to look for in `pg_stat_activity`.
-Only these builds wait, and only on transactions older than the fence. A
-source keyed by nullable `GROUP BY` columns has keys that no chunk's range
-reaches (a key with a `NULL` part, which a row comparison excludes), so an
-aggregate's plan job stages an image-less `Recompute` for each such key when
-its walk ends, for a drain page to re-derive; a 1-1 target leaves them out, as
-it can hold no row for one.
+Only these builds wait, and only on transactions older than the fence.
 
 A chunk that fails on its data splits until the key fails alone, and the key
 is quarantined as a drain eviction would quarantine it. Drain threads take
@@ -147,22 +143,39 @@ backlog is small and the next seal has a slot, so a build never starves the
 drain or holds off a seal. Each chunk's transaction is short, so the build
 holds no long snapshot.
 
-A paused or quarantined definition keeps its ledger, groups and owed deltas.
-Its resume starts a Re-derive build over the existing entries with no
-truncate, plus a **sweep** that re-derives each live entry no chunk did,
-which is a key deleted while the definition was frozen, and, for a 1-1
-target, each target row with no live entry, which is one added or re-keyed by
-hand. An aggregate whose source's key columns, by name and in key order, are
-no longer the ones recorded at define or at its last resume (the table dropped
-and created again with another key, such as a plain table converted to a
-partitioned one, its key constraint replaced, or a key column renamed) keeps
-none of its entries: the resume retires each, in batches, as a key with no
-row, its groups shed them through the deltas, and the build re-derives every
-row of the table now at the name, so no key stored under the old key is
-decoded against the new one. A 1-1 target, keyed by the source's key, refuses
-that resume instead. An `ALTER TRANSFORM`
+A paused or quarantined definition keeps its ledger. Its resume starts a
+Re-derive build over the existing entries with no truncate, plus a **sweep**
+that re-derives each live entry no chunk did, which is a key deleted while
+the definition was frozen, and each target row with no live entry, which is
+one added or re-keyed by hand. A resume whose source's key columns, by name
+and in key order, are no longer the ones recorded at define or at its last
+resume (the table dropped and created again with another key, or a key column
+renamed) is refused, since the target is keyed by the source's key. An
+`ALTER TRANSFORM`
 that adds columns, and a column resume, run a field build: background chunks
 that rewrite just those columns from one snapshot.
+
+### An aggregate's or a `JOIN`'s build
+
+An aggregate that reads no relationship path, and a `JOIN`, keep each group's
+partials (its row count and running sums) in hidden tables, not a per-row
+ledger, so their build is **one absolute write per structure**
+([ADR-0002](decisions/0002-async-data-flow.md#an-aggregates-build-is-one-absolute-write-per-structure)).
+The plan job, in one transaction, locks every group, takes one snapshot, runs
+the `GROUP BY` of the source rows and writes each group's partials and target
+row from it. The definition applies from the moment the build starts, and a
+page waits only on the groups the build holds. Over a partitioned source, or a
+partitioned table of a `JOIN`, the write is one transaction per leaf of the
+recorded tree, then one for the groups that route to no leaf, so no
+transaction holds more than one leaf's groups. A write that fails on the
+source's data (a `SUM` argument that overflows) fails whole and is retried,
+and its fifth failure pauses the definition, keeping the error on its build
+job; no key is quarantined, so a `RESUME` once the row is fixed builds it.
+
+A resume drops and recreates the hidden tables and writes every group again. A
+rebuild of a `live` definition recomputes every group in place, in the same
+transactions, so its readers see the old values until each commits, then the
+new ones, never an empty or partial target.
 
 ### Builds that still use a marker and a go-live catch-up
 
@@ -207,9 +220,12 @@ takes the table's `schema.table` name, or a bare name when exactly one captured
 table carries it; a bare name two captured tables share is refused, naming both.
 Either one is repaired in the transaction that makes the call:
 
-- **A reader the Re-derive build serves** (a plain aggregate or a plain 1-1
-  transform over the captured table, [the Re-derive
-  build](#the-re-derive-build)) is rebuilt. The transaction moves it
+- **An aggregate or a `JOIN`** reading the table is rebuilt in place
+  ([its build](#an-aggregates-or-a-joins-build)). The transaction moves it
+  `live -> backfilling` and enqueues one job, which recomputes every group.
+- **A reader the Re-derive build serves** (a plain 1-1 transform over the
+  captured table, [the Re-derive build](#the-re-derive-build)) is rebuilt.
+  The transaction moves it
   `live -> backfilling` and enqueues one plan job and one sweep job, two
   rows per definition, so the call returns quickly whatever the table's size.
   It keeps applying, the plan re-derives every row the table has, and the
@@ -321,6 +337,31 @@ Derived tables are eventually consistent. Two ways to reason about staleness:
   needed.
 * **Lag telemetry** — always-on metrics exposing how far derived data trails the
   source LSN.
+
+**The contract.** A value read before `await_converged` may be inconsistent.
+After it, values are exact: `await_converged` is how a reader gets exact
+values.
+
+What inconsistent looks like depends on the size of the group an aggregate
+reads:
+
+* **Groups of many rows** (thousands or more) read as slightly behind or ahead
+  by the changes still in flight. A count doesn't go negative and a group
+  doesn't disappear.
+* **Small or hot groups** (a handful of rows, fast concurrent writers) can
+  briefly show values no source state could produce: a negative `COUNT(x)`,
+  `COUNT(x)` above `COUNT(*)`, an `AVG` far off, or a group missing for a
+  moment. A `JOIN` target
+  ([ADR-0019](decisions/0019-join-transforms.md)) can show the same.
+
+An aggregate or `JOIN` target holds a group's row only while the group's row
+count is above 0, so a group whose count falls to 0 or below, even for a
+moment, has no row.
+
+This is by design. Pages apply in parallel and commit out of order, and the
+deltas commute, so the converged state is exact while a state between two
+out-of-order pages can describe no real data
+([ADR-0002](decisions/0002-async-data-flow.md#readers-see-a-group-only-while-its-row-count-is-above-0)).
 
 The predicate behind `await` — the one that must never falsely report
 "converged" — is [stage 07](staging-and-claiming/07-convergence-and-await.md).

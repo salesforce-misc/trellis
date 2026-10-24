@@ -188,9 +188,9 @@ pub use otel::OtelError;
 pub use pool::Pool;
 pub use staging::quarantine::HeldKeyRetry;
 pub use staging::{
-    CaptureFault, CorrectingNode, Divergence, DrainFailure, HeldKeys, HiddenTableSize, JoinStatus,
-    PartialsWarning, SelfCheckJob, SelfCheckJobState, SelfCheckMode, SelfCheckOutcome,
-    SelfCheckReport, UnindexedJoin,
+    CaptureFault, CorrectingNode, Divergence, DrainFailure, HeldKeys, HiddenTableSize,
+    JoinBuildStep, JoinSide, JoinSidePart, JoinStatus, PartialsWarning, SelfCheckJob,
+    SelfCheckJobState, SelfCheckMode, SelfCheckOutcome, SelfCheckReport, UnindexedJoin,
 };
 
 // --- Tier 2: the error types the public errors wrap -----------------------

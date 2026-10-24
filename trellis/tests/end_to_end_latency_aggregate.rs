@@ -29,6 +29,7 @@ use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::{ValueType, install_definition};
+use trellis::integer::IntWidth;
 use trellis::staging::apply;
 use trellis::staging::{has_pending, retire_drained_segments};
 
@@ -163,20 +164,22 @@ fn columns(pairs: &[(&str, ValueType)]) -> HashMap<String, ValueType> {
 
 fn sales_columns() -> HashMap<String, ValueType> {
     columns(&[
-        ("id", ValueType::Numeric),
+        ("id", ValueType::Integer(IntWidth::Int4)),
         ("sku", ValueType::Text),
-        ("amount", ValueType::Numeric),
+        ("amount", ValueType::Integer(IntWidth::Int4)),
     ])
 }
 
 fn sku_totals_columns() -> HashMap<String, ValueType> {
-    columns(&[("sku", ValueType::Text), ("total", ValueType::Numeric)])
+    columns(&[
+        ("sku", ValueType::Text),
+        ("total", ValueType::Integer(IntWidth::Int8)),
+    ])
 }
 
-const SKU_TOTALS: &str =
-    "TRANSFORM e2e_latency_agg_sku_totals FROM sales GROUP BY sku SELECT sum(amount) AS total";
+const SKU_TOTALS: &str = "TRANSFORM e2e_latency_agg_sku_totals FROM sales GROUP BY sku WITHOUT SOURCE INDEX SELECT sum(amount) AS total";
 const SKU_TOTALS_V2: &str = "TRANSFORM e2e_latency_agg_sku_totals_v2 FROM e2e_latency_agg_sku_totals \
-     GROUP BY sku SELECT sum(total) AS total2";
+     GROUP BY sku WITHOUT SOURCE INDEX SELECT sum(total) AS total2";
 
 /// A one-histogram-family text scrape of `rendered` for `metric{transform="target"}`
 /// — see `end_to_end_latency.rs`'s identical helper.
@@ -217,7 +220,7 @@ async fn end_to_end_latency_fires_at_the_terminal_transform_chained_off_an_aggre
     let mut client = connect_raw(db.dsn()).await;
 
     client
-        .batch_execute("create table sales (id integer primary key, sku text, amount numeric)")
+        .batch_execute("create table sales (id integer primary key, sku text, amount integer)")
         .await
         .expect("create the aggregate source table");
 

@@ -27,7 +27,7 @@ use trellis::integer::IntWidth;
 use trellis::staging::interleave::PausePoint;
 
 const SRC: &str = "public.src";
-const AGG: &str = "TRANSFORM agg FROM public.src GROUP BY g SELECT SUM(v) AS total, COUNT(*) AS n";
+const AGG: &str = "TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n";
 const ACTUAL: &str = "select g, total, n from public.agg order by g";
 const EXPECTED: &str = "select g, sum(v), count(*) from public.src group by g order by g";
 
@@ -215,7 +215,7 @@ async fn a_page_that_changes_nothing_writes_nothing() {
 #[tokio::test]
 async fn a_page_that_changes_only_hidden_partials_leaves_the_visible_row() {
     let mut d = start_with(
-        "TRANSFORM agg FROM public.src GROUP BY g SELECT SUM(v) AS total",
+        "TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total",
         "create table public.src (id integer primary key, g integer, v integer); \
          create index on public.src (g)",
         &[("id", int4()), ("g", int4()), ("v", int4())],
@@ -240,7 +240,7 @@ async fn a_page_that_changes_only_hidden_partials_leaves_the_visible_row() {
 async fn composed_fields_and_expression_arguments_equal_postgres() {
     let mut d = start_with(
         "TRANSFORM agg FROM public.src GROUP BY g \
-         SELECT SUM(a) + COUNT(b) AS mixed, SUM(a + b) AS ab, AVG(a) AS mean, \
+        WITHOUT SOURCE INDEX SELECT SUM(a) + COUNT(b) AS mixed, SUM(a + b) AS ab, AVG(a) AS mean, \
                 COALESCE(SUM(b), 0) AS sb, SUM(a) > COUNT(b) AS apart, COUNT(a + b) AS nab, \
                 COUNT(*) AS n",
         "create table public.src (id integer primary key, g integer, a integer, b integer); \
@@ -276,7 +276,7 @@ async fn composed_fields_and_expression_arguments_equal_postgres() {
 async fn numeric_sums_and_averages_keep_the_declared_scale() {
     let mut d = start_with(
         "TRANSFORM agg FROM public.src GROUP BY g \
-         SELECT SUM(m) AS total, AVG(m) AS mean, COUNT(m) AS nm, COUNT(*) AS n",
+        WITHOUT SOURCE INDEX SELECT SUM(m) AS total, AVG(m) AS mean, COUNT(m) AS nm, COUNT(*) AS n",
         "create table public.src (id integer primary key, g integer, m numeric(10, 2)); \
          create index on public.src (g)",
         &[("id", int4()), ("g", int4()), ("m", ValueType::Numeric)],
@@ -312,7 +312,7 @@ async fn group_columns_named_like_the_applys_working_columns() {
     let mut d = start_with(
         &format!(
             "TRANSFORM agg FROM public.src GROUP BY {group} \
-             SELECT SUM(v) AS total, COUNT(v) AS nv, n + COUNT(*) AS np"
+            WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(v) AS nv, n + COUNT(*) AS np"
         ),
         &format!(
             "create table public.src (id integer primary key, {}, v integer); \
@@ -354,7 +354,7 @@ async fn group_columns_named_like_the_applys_working_columns() {
 #[tokio::test]
 async fn every_pattern_of_null_group_columns_finds_its_group() {
     let mut d = start_with(
-        "TRANSFORM agg FROM public.src GROUP BY g, h SELECT SUM(v) AS total, COUNT(*) AS n",
+        "TRANSFORM agg FROM public.src GROUP BY g, h WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n",
         "create table public.src (id integer primary key, g integer, h integer, v integer); \
          create index on public.src (g, h)",
         &[("id", int4()), ("g", int4()), ("h", int4()), ("v", int4())],
@@ -1274,7 +1274,7 @@ async fn define_refuses_an_unconstrained_numeric_sum() {
     .collect();
     let err = trellis::dev::defs::install_definition(
         &db.pool,
-        "TRANSFORM agg FROM public.src GROUP BY g SELECT SUM(m) AS total",
+        "TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(m) AS total",
         &columns,
         "public",
     )

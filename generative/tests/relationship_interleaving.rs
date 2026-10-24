@@ -895,7 +895,7 @@ async fn truncating_a_relationship_to_side_table_leaves_a_stale_aggregate_enrich
 
     let snapshot = backend.snapshot().await.expect("snapshot after the run");
     let target = &snapshot[&program.defs[0].target];
-    let row = &target[&group_key(&[Some("0".to_string())])];
+    let row = &target[&group_key(&[Some("0.00".to_string())])];
     assert_eq!(
         row["cnt"],
         Some("2".to_string()),

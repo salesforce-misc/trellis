@@ -54,7 +54,9 @@ const ORDER_LINES: &str = "create table public.order_line_items ( \
         for values with (modulus 4, remainder 3);";
 
 fn aggregate(source: &str, group_by: &str) -> String {
-    format!("TRANSFORM totals FROM {source} GROUP BY {group_by} SELECT COUNT(*) AS n")
+    format!(
+        "TRANSFORM totals FROM {source} GROUP BY {group_by} WITHOUT SOURCE INDEX SELECT COUNT(*) AS n"
+    )
 }
 
 /// The catalog error `apply` refused with.
@@ -533,7 +535,7 @@ async fn a_join_side_is_held_to_the_rule_over_its_partial_key() {
             .map(|c| format!("{c} AS {}", c.split_once('.').map_or(c, |(_, b)| b)))
             .collect();
         format!(
-            "TRANSFORM j FROM {from} ON {on} GROUP BY {group_by} SELECT {}, COUNT(*) AS n",
+            "TRANSFORM j FROM {from} ON {on} GROUP BY {group_by} WITHOUT SOURCE INDEX SELECT {}, COUNT(*) AS n",
             fields.join(", ")
         )
     };

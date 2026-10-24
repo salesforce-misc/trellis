@@ -148,7 +148,7 @@ fn post_tags_columns() -> HashMap<String, ValueType> {
 }
 
 const AUTHOR_TAG_TOTALS: &str = "TRANSFORM author_tag_totals FROM post_tags GROUP BY tag, post.author \
-     SELECT count(*) AS post_count, sum(post.word_count) AS total_words";
+    WITHOUT SOURCE INDEX SELECT count(*) AS post_count, sum(post.word_count) AS total_words";
 
 /// The running schema for this file: `posts.author` is the relationship
 /// group-key column — `post_tags` itself never carries an `author` column at
@@ -626,7 +626,7 @@ async fn chaining_a_further_aggregate_onto_the_relationship_group_by_target_conv
     // `author_tag_totals` in this test (see the doc comment above).
 
     const TAG_TOTALS_2: &str = "TRANSFORM tag_totals2 FROM author_tag_totals GROUP BY tag \
-         SELECT sum(post_count) AS post_count, sum(total_words) AS total_words";
+        WITHOUT SOURCE INDEX SELECT sum(post_count) AS post_count, sum(total_words) AS total_words";
     let author_tag_totals_columns = columns(&[
         ("tag", ValueType::Text),
         ("author", ValueType::Text),
@@ -698,7 +698,7 @@ async fn a_to_many_relationship_path_as_a_group_by_key_is_rejected() {
     let err = install_definition(
         &db.pool,
         "TRANSFORM comment_author_totals FROM posts2 GROUP BY comments.author \
-         SELECT COUNT(*) AS post_count",
+        WITHOUT SOURCE INDEX SELECT COUNT(*) AS post_count",
         &columns(&[("id", ValueType::Numeric), ("tag", ValueType::Text)]),
         "public",
     )
@@ -729,7 +729,7 @@ async fn a_group_by_key_naming_an_unknown_relationship_is_rejected() {
 
     let err = install_definition(
         &db.pool,
-        "TRANSFORM x FROM post_tags GROUP BY tag, nope.author SELECT COUNT(*) AS post_count",
+        "TRANSFORM x FROM post_tags GROUP BY tag, nope.author WITHOUT SOURCE INDEX SELECT COUNT(*) AS post_count",
         &post_tags_columns(),
         "public",
     )
@@ -757,7 +757,7 @@ async fn a_group_by_key_naming_an_unknown_relationship_is_rejected() {
 /// it unmentioned entirely — DDL derives the `author` column from the
 /// `GROUP BY` key alone either way, so this field is legal but redundant).
 const AUTHOR_TAG_TOTALS_WITH_PASSTHROUGH: &str = "TRANSFORM author_tag_totals_pt FROM post_tags GROUP BY tag, post.author \
-     SELECT post.author AS author, count(*) AS post_count, sum(post.word_count) AS total_words";
+    WITHOUT SOURCE INDEX SELECT post.author AS author, count(*) AS post_count, sum(post.word_count) AS total_words";
 
 /// Regression pin (found in review): [`build_reverse_relationship_shape`]'s
 /// per-field `substitute_relationship_path` rewrite left

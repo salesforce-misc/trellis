@@ -910,6 +910,18 @@ pub(crate) async fn begin(
         // queue nothing, and, for a source that doesn't comply, look again on
         // every pass.
         plan.corrections.clear();
+        // The leaves' constraint texts too: a later pass that finds the
+        // tree unchanged carries them, and a group-basis rebuild on the
+        // resume routes its groups by them. A lock held by uncommitted DDL
+        // leaves the whole record to the next pass.
+        let Some(fetched) = fetch_constraints(client, &plan.fetch).await? else {
+            return Ok(Begin::Held { deep: true });
+        };
+        for node in &mut live.nodes {
+            if let Some(text) = fetched.get(&node.oid) {
+                node.constraint = text.clone();
+            }
+        }
         let record = Record {
             fingerprints,
             live,
