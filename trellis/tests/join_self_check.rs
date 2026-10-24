@@ -190,6 +190,33 @@ async fn a_converged_join_target_reports_no_divergence_at_every_page_size() {
     }
 }
 
+/// The tombstone pass collects `T`'s zero groups (the seed leaves some on
+/// both kinds), and the check reads a group `T` lacks as zeros: the target
+/// still reports nothing at every page size.
+#[tokio::test]
+async fn a_join_target_whose_zero_t_groups_were_collected_reports_no_divergence() {
+    let mut d = start(&[LEFT_PAIR, INNER]).await;
+    seed(&mut d).await;
+    let zero = |t: &str| format!("select count(*) > 0 from {t} where __zero");
+    for target in ["l", "i"] {
+        let (t, _) = hidden(&d, target, "t").await;
+        assert_eq!(d.rows(&zero(&t)).await, ["(t)"], "{target}: zero T groups");
+    }
+    d.retire().await;
+    d.collect_tombstones().await;
+    for target in ["l", "i"] {
+        let (t, _) = hidden(&d, target, "t").await;
+        assert_eq!(d.rows(&zero(&t)).await, ["(f)"], "{target}: collected");
+        for limit in [1, 2, 100] {
+            assert_eq!(
+                walk(&d, target, limit).await.0,
+                [],
+                "{target}, limit {limit}"
+            );
+        }
+    }
+}
+
 /// A sealed page nobody has drained yet is "not caught up", never a
 /// divergence.
 #[tokio::test]

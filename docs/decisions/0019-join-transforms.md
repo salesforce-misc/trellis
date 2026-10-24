@@ -405,7 +405,9 @@ query shows them.
   creates a multixact whenever two overlap.
 - Zero `P` and `M` cells are collected once the drained prefix passes them, as
   ADR-0002's zero groups are; on a hot key, uncollected zero cells made
-  fact-side pages 16x slower.
+  fact-side pages 16x slower. Zero `T` groups have no basis (`T` changes only
+  by the product's deltas) and are collected whenever no writer holds them,
+  so a `GROUP BY` over a churning column doesn't grow `T` without bound.
 - `J` rows are never collected while the transform runs. JR1's insert-then-lock
   pair of statements is exact only because no `J` row is ever deleted: a
   writer queued behind a delete would carry on holding no lock. So `J` keeps

@@ -64,9 +64,11 @@
 //!    `J.matches` crosses zero. The same statement adds `ΣΔM.n` to each
 //!    key's `J.matches`.
 //! 5. **`T`.** The changed `T` groups are created and locked in one sorted
-//!    statement, then #1100's writer adds the deltas to `T`'s hidden
-//!    partials and writes each visible row whose value changed (only while
-//!    its row count is above 0), through the target-mutation seam.
+//!    statement (a zero group the tombstone pass collected is created
+//!    afresh: `super::group_basis`'s "Zero groups"), then #1100's writer
+//!    adds the deltas to `T`'s hidden partials and writes each visible row
+//!    whose value changed (only while its row count is above 0), through
+//!    the target-mutation seam.
 //!
 //! The lock order is ADR-0019's: lock row, `J` sorted, `P` then `M` cells
 //! sorted, `T` groups sorted. A page applies its `JOIN` targets in target
@@ -1031,6 +1033,7 @@ async fn write_locked(
     if build {
         group_basis::enumerate_target_groups(txn, &plan.t).await?;
     }
+    pause!(txn, BeforeJoinTargetLock, &plan.target);
     txn.execute(&plan.t.lock_sql(), &[]).await?;
     pause!(txn, AfterJoinTargetLock, &plan.target);
     let (written, removed) = if build {
@@ -1281,6 +1284,7 @@ pub(crate) async fn build(
             txn.execute(&format!("select 1 from {} for share", plan.lock_ident), &[])
                 .await?;
             group_basis::enumerate_target_groups(txn, &plan.t).await?;
+            pause!(txn, BeforeJoinTargetLock, &plan.target);
             txn.execute(&plan.t.lock_sql(), &[]).await?;
             pause!(txn, AfterJoinTargetLock, &plan.target);
             group_basis::apply_join_build_groups(txn, &plan.t, &mut mutations).await?

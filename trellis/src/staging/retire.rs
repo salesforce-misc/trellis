@@ -22,8 +22,9 @@
 //! [`collect_tombstones`] is the ledgers' half of the same cleanup (#623
 //! D7): a tombstone is only needed while an older change to its key can
 //! still arrive, and the drained prefix says when none can. It collects the
-//! group basis's zero groups by the same prefix ([`collect_zero_groups`],
-//! ADR-0002 R4).
+//! group basis's zero groups by the same prefix, and a `JOIN`'s zero `T`
+//! groups, which have no basis, whatever the prefix
+//! ([`collect_zero_groups`], ADR-0002 R4).
 
 use tokio_postgres::Client;
 use tokio_postgres::types::Type;
@@ -252,7 +253,8 @@ pub(crate) fn may_leave_backlog(collected: u64) -> bool {
 /// ledger, each `__tombstone` entry whose `__applied_seg` is at or below the
 /// contiguous drained prefix `P` ([`DRAINED_PREFIX_SQL`]), and then the
 /// group-basis aggregates' zero groups and the `JOIN`s' zero `P` and `M`
-/// cells through `P` ([`collect_zero_groups`]).
+/// cells through `P`, and the `JOIN`s' zero `T` groups
+/// ([`collect_zero_groups`]).
 /// Returns how many of both went.
 ///
 /// **Why it's sound.** A tombstone exists so that an older change to its key,
@@ -372,11 +374,11 @@ pub async fn collect_tombstones(client: &mut Client) -> Result<u64, StagingError
 }
 
 /// Every table holding zero groups: each group-basis aggregate's hidden
-/// table (`super::group_basis::hidden_table_name`) and each `JOIN`'s `P`
-/// and `M` (`crate::defs::join::HiddenTable`), schema-qualified and quoted,
-/// with the quoted key columns of its zero-group index, or `NULL` while it
-/// has none valid. A `JOIN`'s `J` rows are never collected (ADR-0019), nor
-/// is its `T`, which has no zero-group index.
+/// table (`super::group_basis::hidden_table_name`) and each `JOIN`'s `P`,
+/// `M` and `T` (`crate::defs::join::HiddenTable`), schema-qualified and
+/// quoted, with the quoted key columns of its zero-group index, or `NULL`
+/// while it has none valid, and whether it has a basis column (`T` has
+/// none). A `JOIN`'s `J` rows are never collected (ADR-0019).
 fn hidden_tables_sql() -> String {
     use crate::defs::join::HiddenTable;
     format!(
@@ -386,9 +388,12 @@ fn hidden_tables_sql() -> String {
                  cross join unnest(i.indkey::int2[]) with ordinality as k(attnum, ord) \
                  join pg_catalog.pg_attribute a \
                    on a.attrelid = i.indrelid and a.attnum = k.attnum \
-                 where i.indrelid = c.oid and i.indisvalid and i.indpred is not null) \
+                 where i.indrelid = c.oid and i.indisvalid and i.indpred is not null), \
+                exists (select 1 from pg_catalog.pg_attribute a \
+                        where a.attrelid = c.oid and a.attname = '__basis' \
+                          and not a.attisdropped) \
          from transform_definitions d \
-         join pg_catalog.pg_class c on c.relname in ({agg}, {p}, {m}) \
+         join pg_catalog.pg_class c on c.relname in ({agg}, {p}, {m}, {t}) \
           and c.relnamespace = (select relnamespace from pg_catalog.pg_class \
                                 where oid = 'transform_definitions'::regclass) \
          join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
@@ -396,15 +401,18 @@ fn hidden_tables_sql() -> String {
         agg = super::group_basis::hidden_table_name_sql("d.id"),
         p = HiddenTable::FromPartials.name_sql("d.id"),
         m = HiddenTable::JoinedPartials.name_sql("d.id"),
+        t = HiddenTable::TargetPartials.name_sql("d.id"),
     )
 }
 
 /// Deletes the zero groups of every group-basis aggregate, and the zero
-/// cells of every `JOIN`'s `P` and `M` ([`hidden_tables_sql`]), that no
-/// change can still need (ADR-0002 R4): each hidden row whose partials are all
-/// zero (`__zero`) and that has no basis, or whose stamp is at or below the
-/// contiguous drained prefix `through`. Returns how many went. See "Zero
-/// groups" in `super::group_basis`'s module doc for why that is sound.
+/// cells and groups of every `JOIN`'s `P`, `M` and `T`
+/// ([`hidden_tables_sql`]), that no change can still need (ADR-0002 R4):
+/// each hidden row whose partials are all zero (`__zero`) and that has no
+/// basis, or whose stamp is at or below the contiguous drained prefix
+/// `through`. `T` has no basis, so each of its zero groups goes. Returns how
+/// many went. See "Zero groups" in `super::group_basis`'s module doc for why
+/// that is sound.
 ///
 /// Batched as [`collect_tombstones`]' ledgers are, and for the same
 /// reasons: each batch is a short transaction that takes the hidden table's
@@ -417,18 +425,18 @@ fn hidden_tables_sql() -> String {
 /// or recompute locks its groups before its snapshot (R1), so one that
 /// loses a group to the GC inserts it afresh and writes its own basis.
 async fn collect_zero_groups(client: &mut Client, through: i64) -> Result<u64, StagingError> {
-    let tables: Vec<(String, Option<String>)> = client
+    let tables: Vec<(String, Option<String>, bool)> = client
         .query(&hidden_tables_sql(), &[])
         .await?
         .into_iter()
-        .map(|row| (row.get(0), row.get(1)))
+        .map(|row| (row.get(0), row.get(1), row.get(2)))
         .collect();
     let mut collected = 0;
-    for (hidden, group_cols) in &tables {
+    for (hidden, group_cols, basis) in &tables {
         let Some(group_cols) = group_cols else {
             continue;
         };
-        let sql = super::group_basis::collect_zero_groups_sql(hidden, group_cols);
+        let sql = super::group_basis::collect_zero_groups_sql(hidden, group_cols, *basis);
         for _ in 0..TOMBSTONE_BATCHES_PER_PASS {
             let txn = client.transaction().await?;
             if let Err(err) = txn
@@ -442,7 +450,11 @@ async fn collect_zero_groups(client: &mut Client, through: i64) -> Result<u64, S
                 }
                 return Err(err.into());
             }
-            let deleted = txn.execute(&sql, &[&through, &TOMBSTONE_BATCH]).await?;
+            let deleted = if *basis {
+                txn.execute(&sql, &[&TOMBSTONE_BATCH, &through]).await?
+            } else {
+                txn.execute(&sql, &[&TOMBSTONE_BATCH]).await?
+            };
             txn.commit().await?;
             collected += deleted;
             if deleted < TOMBSTONE_BATCH as u64 {
@@ -464,22 +476,22 @@ pub async fn explain_collect_zero_groups(
     through: i64,
 ) -> Result<String, StagingError> {
     let tables = client.query(&hidden_tables_sql(), &[]).await?;
-    let group_cols: String = tables
-        .iter()
-        .find(|row| row.get::<_, String>(0) == hidden)
+    let row = tables.iter().find(|row| row.get::<_, String>(0) == hidden);
+    let group_cols: String = row
         .and_then(|row| row.get::<_, Option<String>>(1))
         .unwrap_or_default();
+    let basis = row.is_none_or(|row| row.get::<_, bool>(2));
+    let sql = format!(
+        "explain {}",
+        super::group_basis::collect_zero_groups_sql(hidden, &group_cols, basis)
+    );
     let txn = client.transaction().await?;
     txn.batch_execute(GC_PLAN_SETTINGS).await?;
-    let rows = txn
-        .query(
-            &format!(
-                "explain {}",
-                super::group_basis::collect_zero_groups_sql(hidden, &group_cols)
-            ),
-            &[&through, &TOMBSTONE_BATCH],
-        )
-        .await?;
+    let rows = if basis {
+        txn.query(&sql, &[&TOMBSTONE_BATCH, &through]).await?
+    } else {
+        txn.query(&sql, &[&TOMBSTONE_BATCH]).await?
+    };
     txn.rollback().await?;
     Ok(rows
         .iter()

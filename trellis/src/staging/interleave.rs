@@ -55,9 +55,9 @@
 //! A `JOIN` target (`super::join`, behind the same knob) fires, in order:
 //! `BeforeJoinLock` after the pair's lock row, `AfterJoinKeyInsert` after
 //! its `J` insert, `AfterJoinLock` after its sorted `J` lock,
-//! `AfterEntryLock` after its `P` and `M` cell locks, `AfterJoinTargetLock`
-//! after its `T` group lock, `AfterGroupUpsert` after its `T` write, and
-//! `BeforeCommit`.
+//! `AfterEntryLock` after its `P` and `M` cell locks, `BeforeJoinTargetLock`
+//! after its product, `AfterJoinTargetLock` after its `T` group lock,
+//! `AfterGroupUpsert` after its `T` write, and `BeforeCommit`.
 //!
 //! A build chunk (`super::build::run_chunk`, #625 F1) fires the ledger
 //! column's first three points for its target too: `AfterPlaceholders` and
@@ -212,6 +212,10 @@ pub enum PausePoint {
     /// side's, then the joined side's), before the next side or the product:
     /// a build's cross term (`super::join::build`, #1109).
     BetweenJoinSideWrites,
+    /// On a `JOIN` target, after the page's product of its `P` and `M`
+    /// changes (and a build's enumeration of `T`'s groups), before its lock
+    /// of the `T` groups.
+    BeforeJoinTargetLock,
     /// On a `JOIN` target, after the page applied its `P` and `M` changes and
     /// locked the `T` groups their product changes, before it writes them.
     AfterJoinTargetLock,

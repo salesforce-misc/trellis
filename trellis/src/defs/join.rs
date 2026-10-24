@@ -23,7 +23,10 @@
 //!   holding the joined side's row count under it;
 //! - `T` ([`HiddenTable::TargetPartials`]): the target's groups with their
 //!   joined partials: the row count, then a non-null count and a sum per
-//!   argument, the `FROM` side's arguments first;
+//!   argument, the `FROM` side's arguments first. It has no basis, so a
+//!   group whose partials are all zero (`__zero`, indexed as `P`'s) is
+//!   collected whatever the drained prefix (`crate::staging::group_basis`'s
+//!   "Zero groups");
 //! - the lock row ([`HiddenTable::TruncateLock`]): one row every writer of
 //!   the pair takes `FOR SHARE` before any `J` row (ADR-0019's lock order),
 //!   and a truncate of either side would take `FOR UPDATE`.
@@ -318,6 +321,23 @@ fn partial_columns(arguments: usize) -> Vec<String> {
     columns
 }
 
+/// The `__zero` column of a hidden partials table with `arguments`
+/// aggregate arguments: whether every partial is zero, as an aggregate's zero
+/// group (`crate::staging::group_basis`'s "Zero groups"). Stored and
+/// generated, so every writer keeps it current; the tombstone pass collects
+/// zero rows through a partial index `where __zero` on the table's identity.
+fn zero_column(arguments: usize) -> String {
+    let mut zero = vec!["__n = 0".to_string()];
+    for i in 1..=arguments {
+        zero.push(format!("__count_{i} = 0"));
+        zero.push(format!("__sum_{i} = 0"));
+    }
+    format!(
+        "__zero boolean not null generated always as ({}) stored",
+        zero.join(" and ")
+    )
+}
+
 /// `side`'s key columns in its hidden partials table, in the order of the
 /// table's cell identity: its join key columns, then its `GROUP BY` columns
 /// not already among them. The join key leads so the table's identity index
@@ -361,18 +381,7 @@ pub(crate) fn hidden_tables_ddl(
         body.extend(partial_columns(arguments));
         body.push("__basis pg_snapshot".to_string());
         body.push("__stamp bigint not null default 0".to_string());
-        // A zero cell: every partial zero, as an aggregate's zero group
-        // (`staging::group_basis`'s "Zero groups"), which the tombstone pass
-        // collects through the partial index below.
-        let mut zero = vec!["__n = 0".to_string()];
-        for i in 1..=arguments {
-            zero.push(format!("__count_{i} = 0"));
-            zero.push(format!("__sum_{i} = 0"));
-        }
-        body.push(format!(
-            "__zero boolean not null generated always as ({}) stored",
-            zero.join(" and ")
-        ));
+        body.push(zero_column(arguments));
         // The cell identity is the key columns in order, the join key first
         // (`side_key_columns`).
         let identity: Vec<String> = keys.iter().map(|c| quote_ident(c)).collect();
@@ -408,18 +417,24 @@ pub(crate) fn hidden_tables_ddl(
                 _ => typed(from, &key.column),
             })
             .collect();
-        body.extend(partial_columns(
-            side_arguments(def, Side::From).len() + side_arguments(def, Side::Joined).len(),
-        ));
+        let arguments =
+            side_arguments(def, Side::From).len() + side_arguments(def, Side::Joined).len();
+        body.extend(partial_columns(arguments));
+        body.push(zero_column(arguments));
         let groups: Vec<String> = join
             .group_by
             .iter()
             .map(|k| quote_ident(&k.column))
             .collect();
-        body.push(format!("unique nulls not distinct ({})", groups.join(", ")));
+        let groups = groups.join(", ");
+        body.push(format!("unique nulls not distinct ({groups})"));
+        let name = format!(
+            "{schema}.{}",
+            quote_ident(&HiddenTable::TargetPartials.name(id))
+        );
         sql.push_str(&format!(
-            "create table {schema}.{} ({});\n",
-            quote_ident(&HiddenTable::TargetPartials.name(id)),
+            "create table {name} ({});\n\
+             create index on {name} ({groups}) where __zero;\n",
             body.join(", ")
         ));
     }
@@ -653,14 +668,18 @@ mod tests {
             "{ddl}"
         );
         // `T`: the group columns, then the `FROM` side's one argument and the
-        // joined side's two.
+        // joined side's two, and its zero groups' column and partial index.
         assert!(
             ddl.contains(
                 "\"join_7_t\" (\"region\" text, \"sku\" text, __n bigint not null default 0, \
                  __count_1 bigint not null default 0, __sum_1 numeric not null default 0, \
                  __count_2 bigint not null default 0, __sum_2 numeric not null default 0, \
                  __count_3 bigint not null default 0, __sum_3 numeric not null default 0, \
-                 unique nulls not distinct (\"region\", \"sku\"))"
+                 __zero boolean not null generated always as (__n = 0 and __count_1 = 0 \
+                 and __sum_1 = 0 and __count_2 = 0 and __sum_2 = 0 and __count_3 = 0 \
+                 and __sum_3 = 0) stored, \
+                 unique nulls not distinct (\"region\", \"sku\"));\n\
+                 create index on \"trellis\".\"join_7_t\" (\"region\", \"sku\") where __zero;\n"
             ),
             "{ddl}"
         );

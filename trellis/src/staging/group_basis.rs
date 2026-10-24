@@ -110,6 +110,18 @@
 //! key's cells under `J` gets the same `T` delta with it or without it. Its
 //! `J` rows are never collected (ADR-0019).
 //!
+//! Its `T` groups are collected too, whatever the drained prefix: `T` has no
+//! basis, since it changes only by the product's deltas, which no basis
+//! filters, so a zero `T` group protects nothing, and adding a delta to it or
+//! to a fresh group gives the same row. Every writer of `T` (a page, a
+//! release, a partition correction, each build step) creates and locks the
+//! groups it writes in one sorted `insert … on conflict` before it adds to
+//! them, so a group the pass removed is inserted afresh and no delta lands on
+//! a group the writer hasn't locked. A build's enumeration of `T`'s groups
+//! reads without a lock, and its lock statement re-inserts a group collected
+//! since, at zero. Nothing reads `T` to compute a delta, and `self_check`
+//! counts a group `T` lacks as zeros.
+//!
 //! Zero groups left in place aren't free: #1043's JOIN model ran 16x slower
 //! with thousands of them on a few hot keys, and a definition whose groups
 //! churn (a `GROUP BY` over a session id, say) would grow its hidden table
@@ -509,16 +521,23 @@ pub(crate) fn hidden_table_ddl(schema: &str, id: i64, shape: &GroupShape) -> Str
 
 /// One zero-group GC batch's statement on the hidden table `hidden`
 /// (schema-qualified and quoted), whose zero-group index keys on
-/// `group_cols` (quoted, joined): deletes up to `$2` zero groups that have no
-/// basis or whose stamp is at or below `$1`, the contiguous drained prefix,
-/// claimed `for update skip locked` in key order. See "Zero groups" in the
-/// module doc; `super::retire::collect_tombstones` runs it.
-pub(crate) fn collect_zero_groups_sql(hidden: &str, group_cols: &str) -> String {
+/// `group_cols` (quoted, joined): deletes up to `$1` zero groups, claimed
+/// `for update skip locked` in key order. With `basis` (the table has a
+/// basis column), only those that have no basis or whose stamp is at or
+/// below `$2`, the contiguous drained prefix; without (a `JOIN`'s `T`),
+/// every zero group. See "Zero groups" in the module doc;
+/// `super::retire::collect_tombstones` runs it.
+pub(crate) fn collect_zero_groups_sql(hidden: &str, group_cols: &str, basis: bool) -> String {
+    let rule = if basis {
+        " and (__basis is null or __stamp <= $2)"
+    } else {
+        ""
+    };
     format!(
         "delete from {hidden} where ctid = any(array( \
              select ctid from {hidden} \
-             where __zero and (__basis is null or __stamp <= $1) \
-             order by {group_cols} limit $2 for update skip locked))"
+             where __zero{rule} \
+             order by {group_cols} limit $1 for update skip locked))"
     )
 }
 
