@@ -138,10 +138,7 @@ pub(crate) fn required(
             if crate::staging::group_basis::route(def, source_columns).is_none() {
                 return Vec::new();
             }
-            let columns: Vec<String> = group_by
-                .iter()
-                .map(|key| key.target_column_name().to_string())
-                .collect();
+            let columns: Vec<String> = group_by.to_vec();
             vec![SourceIndex {
                 table: source_table.to_string(),
                 columns,

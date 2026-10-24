@@ -281,7 +281,7 @@ use std::collections::BTreeSet;
 use tokio_postgres::Transaction;
 use tokio_postgres::types::ToSql;
 
-use crate::defs::ast::{GroupByKey, KeySpace};
+use crate::defs::ast::{Expr, KeySpace};
 use crate::defs::catalog::CatalogError;
 use crate::defs::ddl::{self, PrimaryKeyColumn};
 use crate::defs::oracle::render_qualified_expr_sql;
@@ -1144,12 +1144,12 @@ fn one_to_one_match(key_cols: &[PrimaryKeyColumn]) -> Match {
 /// the `=` one type, so it hashes.
 fn aggregate_match(
     target: &str,
-    group_by: &[GroupByKey],
+    group_by: &[String],
     key_cols: &[PrimaryKeyColumn],
 ) -> Result<Match, IntakeError> {
     let mut parts = Vec::with_capacity(group_by.len());
     for key in group_by {
-        let name = key.target_column_name();
+        let name = key.as_str();
         let col = key_cols.iter().find(|c| c.name == name).ok_or_else(|| {
             IntakeError::UnsweepableTarget {
                 target: target.to_string(),
@@ -1160,7 +1160,7 @@ fn aggregate_match(
             target_col: quote_ident(name),
             source_sql: format!(
                 "({})::{}",
-                render_qualified_expr_sql(&key.as_expr(), "s"),
+                render_qualified_expr_sql(&Expr::Column(key.clone()), "s"),
                 col.data_type
             ),
             nullable: col.nullable,

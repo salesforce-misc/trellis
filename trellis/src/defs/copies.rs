@@ -248,7 +248,7 @@ pub(crate) async fn typed_copies(
                 ),
             ];
             for key in group_by {
-                let column = key.target_column_name();
+                let column = key.as_str();
                 for (kind, table, table_name) in &tables {
                     copies.push(copy(*kind, table, table_name, column, source, column));
                 }

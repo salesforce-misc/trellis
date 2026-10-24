@@ -288,10 +288,10 @@ fn shape_of(
     };
     let mut group_cols = Vec::with_capacity(group_by.len());
     for key in group_by {
-        if !source_columns.contains_key(key.target_column_name()) {
+        if !source_columns.contains_key(key.as_str()) {
             return None;
         }
-        group_cols.push(key.target_column_name().to_string());
+        group_cols.push(key.clone());
     }
     let substituted = crate::defs::backfill::substituted_field_exprs(def).ok()?;
     let field_types = crate::defs::validate::infer_field_types(def, source_columns).ok()?;

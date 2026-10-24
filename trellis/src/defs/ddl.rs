@@ -69,9 +69,7 @@ use tokio_postgres::types::Type;
 use crate::error_code::{self, ErrorCode};
 use crate::pool::{Pool, quote_ident};
 
-use super::ast::{
-    Expr, FieldDef, GroupByKey, KeySpace, TransformDef, ValueType, group_by_contains,
-};
+use super::ast::{Expr, FieldDef, KeySpace, TransformDef, ValueType, group_by_contains};
 use super::validate::ValidationError;
 
 /// The Postgres column type for a calculated field or grouping column of a
@@ -1864,9 +1862,9 @@ pub(crate) async fn aggregate_target_table_ddl(
         "create table {} (",
         qualified_target_table(target_schema, def)
     );
-    let group_by_value_type = |key: &GroupByKey| {
+    let group_by_value_type = |key: &String| {
         source_columns
-            .get(key.target_column_name())
+            .get(key.as_str())
             .copied()
             .unwrap_or(ValueType::Numeric)
     };
@@ -1875,11 +1873,7 @@ pub(crate) async fn aggregate_target_table_ddl(
             sql.push_str(", ");
         }
         let pg_type = pg_type_name(group_by_value_type(key));
-        sql.push_str(&format!(
-            "{} {}",
-            quote_ident(key.target_column_name()),
-            pg_type
-        ));
+        sql.push_str(&format!("{} {}", quote_ident(key.as_str()), pg_type));
     }
     // Issue #48: fields aggregating the exact same argument (e.g. `SUM(amount)
     // AS total, AVG(amount) AS average`) share one hidden running-count
@@ -1929,10 +1923,7 @@ pub(crate) async fn aggregate_target_table_ddl(
         ", {} bigint not null default 0",
         quote_ident(MEMBERS_COLUMN)
     ));
-    let pk_columns: Vec<String> = group_by
-        .iter()
-        .map(|k| quote_ident(k.target_column_name()))
-        .collect();
+    let pk_columns: Vec<String> = group_by.iter().map(|k| quote_ident(k.as_str())).collect();
     sql.push_str(&format!(
         ", unique nulls not distinct ({})",
         pk_columns.join(", ")
@@ -1945,7 +1936,7 @@ pub(crate) async fn aggregate_target_table_ddl(
     let group_columns: Vec<super::ledger::LedgerColumn> = group_by
         .iter()
         .map(|key| super::ledger::LedgerColumn {
-            name: key.target_column_name().to_string(),
+            name: key.clone(),
             pg_type: pg_type_name(group_by_value_type(key)).into_owned(),
             collation: None,
         })

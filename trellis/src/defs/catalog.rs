@@ -92,7 +92,7 @@ use tokio_postgres::GenericClient;
 use tokio_postgres::types::Type;
 
 use super::ast::{
-    AlterClause, AlterTransform, Expr, FieldDef, GroupByKey, KeySpace, TransformDef, ValueType,
+    AlterClause, AlterTransform, Expr, FieldDef, KeySpace, TransformDef, ValueType,
     render_definition_text,
 };
 use super::backfill::BackfillError;
@@ -5250,18 +5250,14 @@ async fn assert_deterministic_definition_keys(
     let KeySpace::Aggregate { group_by } = &def.key_space else {
         return Ok(());
     };
-    for key in group_by {
-        match key {
-            GroupByKey::Column(column) => {
-                assert_deterministic_key_collation_in_txn(
-                    txn,
-                    KeyColumnRole::GroupBy,
-                    qualified_source,
-                    column,
-                )
-                .await?;
-            }
-        }
+    for column in group_by {
+        assert_deterministic_key_collation_in_txn(
+            txn,
+            KeyColumnRole::GroupBy,
+            qualified_source,
+            column,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -5420,10 +5416,7 @@ async fn reject_unkeyed_source(
                 table: qualified_source.to_string(),
             }),
             KeySpace::Aggregate { group_by } => {
-                let columns: Vec<String> = group_by
-                    .iter()
-                    .map(|key| key.target_column_name().to_string())
-                    .collect();
+                let columns: Vec<String> = group_by.to_vec();
                 tree.refusal(
                     super::partition_tree::server_version_num(client).await?,
                     &columns,
@@ -6521,10 +6514,10 @@ pub(crate) async fn reads_column(
 /// and dropping the column such a grouping key reads is exactly as
 /// destructive as dropping one a 1-1 field reads — the refusal must see it
 /// too. So this walks every downstream definition's [`KeySpace::Aggregate`]
-/// `group_by` keys (via [`GroupByKey::as_expr`]) in addition to every
-/// definition's `fields`, named by [`GroupByKey::target_column_name`] when a
-/// grouping key itself is the match — the same target-column-name convention
-/// [`super::validate`]'s own grouping-key/field-passthrough checks use.
+/// `group_by` keys in addition to every definition's `fields`, named by the
+/// key's column when a grouping key itself is the match — the same
+/// target-column-name convention [`super::validate`]'s own
+/// grouping-key/field-passthrough checks use.
 ///
 /// Used by [`super::lifecycle::drop_transform`] (naming precision only —
 /// every blocker this finds is already caught by that function's
@@ -6726,12 +6719,12 @@ async fn column_dependents_via(
         if !only_one_to_one && let KeySpace::Aggregate { group_by } = &def.key_space {
             for key in group_by {
                 if expr_references_column(
-                    &key.as_expr(),
+                    &Expr::Column(key.clone()),
                     &qualified_source,
                     &qualified_upstream,
                     upstream_column,
                 ) {
-                    deps.push((target.clone(), key.target_column_name().to_string()));
+                    deps.push((target.clone(), key.clone()));
                 }
             }
         }

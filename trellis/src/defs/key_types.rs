@@ -59,7 +59,7 @@ use std::fmt;
 use tokio_postgres::GenericClient;
 use tokio_postgres::types::Type;
 
-use super::ast::{GroupByKey, KeySpace, TransformDef};
+use super::ast::{KeySpace, TransformDef};
 
 /// How a definition uses one of its key columns.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,18 +110,14 @@ pub(crate) fn key_uses(
         );
         return uses;
     }
-    let group_by: &[GroupByKey] = match &def.key_space {
+    let group_by: &[String] = match &def.key_space {
         KeySpace::Aggregate { group_by } => group_by,
         _ => &[],
     };
     let mut uses = Vec::new();
     if source == table {
         uses.extend(table_key.iter().map(|c| (c.clone(), KeyUse::SourceKey)));
-        uses.extend(
-            group_by
-                .iter()
-                .map(|key| (key.target_column_name().to_string(), KeyUse::GroupBy)),
-        );
+        uses.extend(group_by.iter().map(|key| (key.clone(), KeyUse::GroupBy)));
     }
     uses
 }

@@ -494,7 +494,7 @@ fn concurrent_shapes(program: &Program, plan: &ConcurrentPlan) -> HashSet<Concur
     for def in &program.defs {
         if let KeySpace::Aggregate { group_by } = &def.key_space {
             for key in group_by {
-                let grouping = (def.source.as_str(), key.target_column_name());
+                let grouping = (def.source.as_str(), key.as_str());
                 if !groupings.contains(&grouping) {
                     groupings.push(grouping);
                 }

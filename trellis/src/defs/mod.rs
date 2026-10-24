@@ -100,8 +100,8 @@ pub use oracle::{
 // feature (ADR-0012; see `Cargo.toml`). Not part of `dev`.
 #[cfg(any(test, feature = "internals"))]
 pub use ast::{
-    Expr, FieldDef, GroupByKey, JoinKind, JoinOn, JoinSpec, KeySpace, Operator, Predicate,
-    QualifiedColumn, TransformDef,
+    Expr, FieldDef, JoinKind, JoinOn, JoinSpec, KeySpace, Operator, Predicate, QualifiedColumn,
+    TransformDef,
 };
 #[cfg(any(test, feature = "internals"))]
 pub use backfill::BackfillError;
@@ -208,7 +208,7 @@ mod tests {
         assert_eq!(
             def.key_space,
             KeySpace::Aggregate {
-                group_by: vec![GroupByKey::Column("order_id".to_string())]
+                group_by: vec!["order_id".to_string()]
             }
         );
         assert_eq!(
@@ -227,10 +227,7 @@ mod tests {
         assert_eq!(
             def.key_space,
             KeySpace::Aggregate {
-                group_by: vec![
-                    GroupByKey::Column("a".to_string()),
-                    GroupByKey::Column("b".to_string())
-                ]
+                group_by: vec!["a".to_string(), "b".to_string()]
             }
         );
     }
@@ -1059,10 +1056,7 @@ mod tests {
         assert_eq!(
             def.key_space,
             KeySpace::Aggregate {
-                group_by: vec![
-                    GroupByKey::Column("region".to_string()),
-                    GroupByKey::Column("kind".to_string()),
-                ],
+                group_by: vec!["region".to_string(), "kind".to_string(),],
             }
         );
         let err = parse(
@@ -1214,7 +1208,7 @@ mod statement_grammar_tests {
         assert_eq!(
             def.key_space,
             ast::KeySpace::Aggregate {
-                group_by: vec![ast::GroupByKey::Column("order_id".to_string())]
+                group_by: vec!["order_id".to_string()]
             }
         );
     }

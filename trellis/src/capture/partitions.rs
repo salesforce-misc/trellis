@@ -579,10 +579,7 @@ fn refusal_for(
             table: table.to_string(),
         }),
         KeySpace::Aggregate { group_by } => {
-            let columns: Vec<String> = group_by
-                .iter()
-                .map(|key| key.target_column_name().to_string())
-                .collect();
+            let columns: Vec<String> = group_by.to_vec();
             tree.refusal(server_version_num, &columns)
         }
     }

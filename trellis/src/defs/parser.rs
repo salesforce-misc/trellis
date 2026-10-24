@@ -32,9 +32,8 @@
 //! rejected. `<predicate>` accepts only the literal `TRUE`.
 
 use super::ast::{
-    AlterClause, AlterTransform, DefinitionRef, Expr, FieldDef, GroupByKey, JoinKind, JoinOn,
-    JoinSpec, KeySpace, Predicate, QualifiedColumn, Statement, StatementKind, TransformDef,
-    TransformRef,
+    AlterClause, AlterTransform, DefinitionRef, Expr, FieldDef, JoinKind, JoinOn, JoinSpec,
+    KeySpace, Predicate, QualifiedColumn, Statement, StatementKind, TransformDef, TransformRef,
 };
 use super::error::ParseError;
 use super::lexer::{Token, lex};
@@ -729,7 +728,7 @@ impl Parser {
     /// #830). A key is always a source column, never a field, so the
     /// qualifier changes nothing and isn't kept. Any other head is refused
     /// ([`ParseError::GroupByKeyNotFromSource`]).
-    fn parse_group_by_key(&mut self) -> Result<GroupByKey, ParseError> {
+    fn parse_group_by_key(&mut self) -> Result<String, ParseError> {
         let first = self.expect_ident()?;
         if self.peek_is_symbol('.') {
             self.advance();
@@ -741,9 +740,9 @@ impl Parser {
                     source,
                 });
             }
-            return Ok(GroupByKey::Column(column));
+            return Ok(column);
         }
-        Ok(GroupByKey::Column(first))
+        Ok(first)
     }
 
     /// Rejects a `JOIN`/`GROUP BY` key-space clause with a construct-specific

@@ -438,10 +438,8 @@ fn render_select(def: &TransformDef, pk_column: &str) -> String {
                     )
                 })
                 .collect();
-            let group_cols: Vec<String> = group_by
-                .iter()
-                .map(|k| quote_ident(k.target_column_name()))
-                .collect();
+            let group_cols: Vec<String> =
+                group_by.iter().map(|k| quote_ident(k.as_str())).collect();
             format!(
                 "select {} from {} group by {}",
                 select_list.join(", "),
@@ -498,7 +496,7 @@ pub async fn sql_oracle(
                 let group_values: Vec<Option<String>> = group_by
                     .iter()
                     .map(|key| {
-                        let column = key.target_column_name();
+                        let column = key.as_str();
                         let index = def
                             .fields
                             .iter()
@@ -517,10 +515,7 @@ pub async fn sql_oracle(
                 let key = group_key(&group_values);
                 let mut by_column = BTreeMap::new();
                 for (field, value) in def.fields.iter().zip(values) {
-                    if group_by
-                        .iter()
-                        .any(|k| k.target_column_name() == field.name)
-                    {
+                    if group_by.iter().any(|k| k.as_str() == field.name) {
                         continue;
                     }
                     by_column.insert(field.name.clone(), value);
@@ -573,9 +568,7 @@ pub async fn evaluator_oracle(
             for (key, fields) in recomputed {
                 let by_column = fields
                     .into_iter()
-                    .filter(|(column, _)| {
-                        !group_by.iter().any(|k| k.target_column_name() == column)
-                    })
+                    .filter(|(column, _)| !group_by.iter().any(|k| k.as_str() == column))
                     .map(|(column, value)| (column, value.map(|v| v.to_string())))
                     .collect();
                 rows.insert(key, by_column);
@@ -1161,7 +1154,7 @@ mod tests {
             target: "d0".into(),
             source: "t0".into(),
             key_space: KeySpace::Aggregate {
-                group_by: vec![trellis::dev::defs::ast::GroupByKey::Column("grain".into())],
+                group_by: vec!["grain".into()],
             },
             fields: vec![
                 trellis::dev::defs::ast::FieldDef {

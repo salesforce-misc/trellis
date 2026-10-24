@@ -120,7 +120,7 @@ pub(super) fn render_definition(def: &TransformDef) -> String {
             " GROUP BY {}",
             group_by
                 .iter()
-                .map(|k| k.target_column_name())
+                .map(|k| k.as_str())
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
@@ -147,10 +147,7 @@ pub(super) fn required_source_indexes(def: &TransformDef) -> Vec<(String, Vec<St
     match &def.key_space {
         KeySpace::OneToOne => Vec::new(),
         KeySpace::Aggregate { group_by } => {
-            let columns: Vec<String> = group_by
-                .iter()
-                .map(|key| key.target_column_name().to_string())
-                .collect();
+            let columns: Vec<String> = group_by.to_vec();
             if columns.len() == group_by.len() {
                 vec![(def.source.clone(), columns)]
             } else {

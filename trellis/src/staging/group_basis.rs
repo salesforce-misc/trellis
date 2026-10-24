@@ -335,8 +335,8 @@ fn shape_of(def: &TransformDef, source_columns: &HashMap<String, ValueType>) -> 
     let mut group_cols = Vec::with_capacity(group_by.len());
     let mut group_types = Vec::with_capacity(group_by.len());
     for key in group_by {
-        let value_type = source_columns.get(key.target_column_name())?;
-        group_cols.push(key.target_column_name().to_string());
+        let value_type = source_columns.get(key.as_str())?;
+        group_cols.push(key.clone());
         group_types.push(ddl::pg_type_name(*value_type).into_owned());
     }
     let substituted = crate::defs::backfill::substituted_field_exprs(def).ok()?;

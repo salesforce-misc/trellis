@@ -827,7 +827,7 @@ pub fn evaluate_aggregate(
     };
     assert!(!rows.is_empty(), "a group must have at least one row");
     // Keyed by each key's target column name.
-    let group_by: HashSet<&str> = group_by.iter().map(|k| k.target_column_name()).collect();
+    let group_by: HashSet<&str> = group_by.iter().map(|k| k.as_str()).collect();
 
     let fields_by_name: HashMap<&str, &FieldDef> =
         def.fields.iter().map(|f| (f.name.as_str(), f)).collect();
@@ -2405,7 +2405,6 @@ fn parse_boolean(field_name: &str, text: &str) -> Result<bool, EvalError> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::ast::GroupByKey;
     use super::*;
     use crate::defs::ast::{KeySpace, Predicate};
 
@@ -3053,10 +3052,7 @@ mod tests {
             target: "t".to_string(),
             source: "s".to_string(),
             key_space: KeySpace::Aggregate {
-                group_by: group_by
-                    .iter()
-                    .map(|s| GroupByKey::Column(s.to_string()))
-                    .collect(),
+                group_by: group_by.iter().map(|s| s.to_string()).collect(),
             },
             fields,
             predicate: Predicate::True,

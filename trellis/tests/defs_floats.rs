@@ -47,9 +47,7 @@ use tokio_postgres::error::SqlState;
 use tokio_postgres::{Client, NoTls};
 use trellis::FloatWidth;
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::defs::ast::{
-    Expr, FieldDef, GroupByKey, KeySpace, Operator, Predicate, TransformDef, ValueType,
-};
+use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use trellis::defs::eval::{RegexCache, Row, Value, evaluate, evaluate_aggregate};
 use trellis::defs::{
     CatalogError, ValidationError, chunk_queue, install_definition, parse, validate,
@@ -731,7 +729,7 @@ async fn the_evaluator_fold_agrees_with_postgres_on_float_aggregates() {
                 source: "s".to_string(),
                 explicit_source_schema: None,
                 key_space: KeySpace::Aggregate {
-                    group_by: vec![GroupByKey::Column("i".to_string())],
+                    group_by: vec!["i".to_string()],
                 },
                 fields: vec![FieldDef {
                     name: "out".to_string(),

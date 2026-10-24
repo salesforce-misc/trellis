@@ -77,7 +77,7 @@ use crate::error_code::{self, ErrorCode};
 use crate::pool::{Pool, quote_ident};
 use tokio_postgres::GenericClient;
 
-use super::ast::{Expr, GroupByKey, KeySpace, TransformDef, ValueType, group_by_contains};
+use super::ast::{Expr, KeySpace, TransformDef, ValueType, group_by_contains};
 use super::ddl::{
     self, PrimaryKeyColumn, avg_sum_column, qualified_target_table, source_primary_key,
 };
@@ -1495,7 +1495,7 @@ async fn backfill_aggregate(
     def: &TransformDef,
     target_schema: &str,
     source_table: &str,
-    group_by: &[GroupByKey],
+    group_by: &[String],
     source_columns: &HashMap<String, ValueType>,
     fence: Option<ClaimFence<'_>>,
 ) -> Result<(), BackfillError> {
@@ -1511,9 +1511,9 @@ async fn backfill_aggregate(
     let scan = SourceScan::new(source_table);
     let pk = source_primary_key(pool, source_table).await?;
 
-    let group_by_value_type = |key: &GroupByKey| -> ValueType {
+    let group_by_value_type = |key: &String| -> ValueType {
         source_columns
-            .get(key.target_column_name())
+            .get(key.as_str())
             .copied()
             .unwrap_or(ValueType::Numeric)
     };
@@ -1537,10 +1537,7 @@ async fn backfill_aggregate(
     let field_value_type =
         |name: &str| -> ValueType { field_types.get(name).copied().unwrap_or(ValueType::Numeric) };
 
-    let group_idents: Vec<String> = group_by
-        .iter()
-        .map(|k| quote_ident(k.target_column_name()))
-        .collect();
+    let group_idents: Vec<String> = group_by.iter().map(|k| quote_ident(k.as_str())).collect();
     let group_casts: Vec<std::borrow::Cow<'static, str>> = group_by
         .iter()
         .map(|k| ddl::pg_type_name(group_by_value_type(k)))
@@ -1553,8 +1550,8 @@ async fn backfill_aggregate(
     let mut ledger_cols = vec![quote_ident(super::ledger::KEY_COLUMN)];
     let mut ledger_exprs = vec![scan.key_sql(&pk)];
     for key in group_by {
-        ledger_cols.push(quote_ident(key.target_column_name()));
-        ledger_exprs.push(scan.render(&key.as_expr()));
+        ledger_cols.push(quote_ident(key.as_str()));
+        ledger_exprs.push(scan.render(&Expr::Column(key.clone())));
     }
     for contribution in &contributions {
         ledger_cols.push(quote_ident(&contribution.column));

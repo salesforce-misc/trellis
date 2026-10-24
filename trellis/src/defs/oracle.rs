@@ -21,7 +21,7 @@ use crate::pool::quote_ident;
 
 use super::ast::{Expr, Operator, TransformDef};
 #[cfg(any(test, feature = "test-util"))]
-use super::ast::{GroupByKey, KeySpace, ValueType};
+use super::ast::{KeySpace, ValueType};
 #[cfg(any(test, feature = "test-util"))]
 use super::eval::{EvalError, RegexCache, Row, Value, evaluate, evaluate_aggregate};
 use super::typed_literal;
@@ -202,7 +202,7 @@ pub async fn recompute_aggregate(
 
     let mut columns = referenced_source_columns(def);
     for key in group_by {
-        columns.insert(key.target_column_name().to_string());
+        columns.insert(key.clone());
     }
     let columns: Vec<String> = columns.into_iter().collect();
 
@@ -247,7 +247,7 @@ pub async fn recompute_aggregate(
 /// typical case for a real foreign/primary key); this doesn't attempt to
 /// match Postgres's "`NULL` groups with `NULL`" `GROUP BY` semantics.
 #[cfg(any(test, feature = "test-util"))]
-fn group_key(image: &Row, group_by: &[GroupByKey]) -> String {
+fn group_key(image: &Row, group_by: &[String]) -> String {
     // Length-prefix each component (`"{len}:{value}"`) rather than joining
     // on a bare separator: a Text grouping column's value can itself
     // contain any separator character (including a comma), which would
@@ -258,13 +258,7 @@ fn group_key(image: &Row, group_by: &[GroupByKey]) -> String {
     // number, not searched for as a delimiter.
     group_by
         .iter()
-        .map(|k| {
-            image
-                .get(k.target_column_name())
-                .cloned()
-                .flatten()
-                .unwrap_or_default()
-        })
+        .map(|k| image.get(k.as_str()).cloned().flatten().unwrap_or_default())
         .map(|v| format!("{}:{v}", v.len()))
         .collect::<String>()
 }
@@ -313,7 +307,7 @@ pub fn render_aggregate_select_sql(def: &TransformDef) -> String {
         .collect();
     let group_cols: Vec<String> = group_by
         .iter()
-        .map(|k| render_expr_sql(&k.as_expr()))
+        .map(|k| render_expr_sql(&Expr::Column(k.clone())))
         .collect();
 
     format!(

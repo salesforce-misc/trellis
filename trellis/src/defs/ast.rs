@@ -283,11 +283,13 @@ pub enum AlterClause {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeySpace {
     OneToOne,
-    /// `group_by` holds the keys named after `GROUP BY`, in the order they
-    /// were written — that order becomes the target table's composite
-    /// primary key column order.
+    /// `group_by` holds the source columns named after `GROUP BY`, in the
+    /// order they were written — that order becomes the target table's
+    /// composite primary key column order. A key's target column is named
+    /// after it (a key has no aliasing syntax), and a two-part
+    /// `<source>.<column>` key parses to its bare column.
     Aggregate {
-        group_by: Vec<GroupByKey>,
+        group_by: Vec<String>,
     },
     /// `FROM a [LEFT|INNER] JOIN b ON <equi-join> GROUP BY <keys>` (ADR-0019,
     /// epic #1091): an aggregate over the join of two tables.
@@ -340,40 +342,13 @@ pub struct JoinSpec {
     pub group_by: Vec<QualifiedColumn>,
 }
 
-/// One `GROUP BY` key: a source column. A two-part `<source>.<column>` key
-/// parses to the same plain column.
-///
-/// A key has no aliasing syntax (unlike a `SELECT <expr> AS <name>` field):
-/// its target column name is its own name, see [`Self::target_column_name`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GroupByKey {
-    Column(String),
-}
-
-impl GroupByKey {
-    /// The target table's column name this key becomes: the column's own name.
-    pub fn target_column_name(&self) -> &str {
-        match self {
-            GroupByKey::Column(name) => name,
-        }
-    }
-
-    /// This key, as the [`Expr::Column`] it's equivalent to, so a renderer of
-    /// an arbitrary expression can render a `GROUP BY` key too.
-    pub fn as_expr(&self) -> Expr {
-        match self {
-            GroupByKey::Column(name) => Expr::Column(name.clone()),
-        }
-    }
-}
-
 /// Whether `name` is one of `group_by`'s keys' target column names — the
 /// common "is this field a `GROUP BY` passthrough" check every layer that
 /// touches an [`super::ast::KeySpace::Aggregate`] definition's fields needs
 /// (DDL's column dedup, `staging::ledger`'s field shape, …), pulled out once here
 /// rather than re-implemented at each call site.
-pub fn group_by_contains(group_by: &[GroupByKey], name: &str) -> bool {
-    group_by.iter().any(|key| key.target_column_name() == name)
+pub fn group_by_contains(group_by: &[String], name: &str) -> bool {
+    group_by.iter().any(|key| key == name)
 }
 
 /// One `<expr> AS <name>` calculated-field entry.
@@ -609,11 +584,7 @@ pub(crate) fn render_definition_text(def: &TransformDef) -> String {
         KeySpace::OneToOne => {}
         KeySpace::Aggregate { group_by } => {
             out.push_str(" GROUP BY ");
-            let keys: Vec<String> = group_by
-                .iter()
-                .map(|key| key.target_column_name().to_string())
-                .collect();
-            out.push_str(&keys.join(", "));
+            out.push_str(&group_by.join(", "));
         }
         KeySpace::Join(join) => {
             let qualified = |column: &QualifiedColumn| match &column.schema {

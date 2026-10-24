@@ -127,11 +127,7 @@ fn own_columns(def: &TransformDef) -> BTreeSet<String> {
         .into_iter()
         .collect();
     if let KeySpace::Aggregate { group_by } = &def.key_space {
-        columns.extend(
-            group_by
-                .iter()
-                .map(|key| key.target_column_name().to_string()),
-        );
+        columns.extend(group_by.iter().cloned());
     }
     columns
 }

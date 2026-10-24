@@ -18,7 +18,7 @@ use std::fmt;
 use regex::Regex;
 
 use super::ast::{
-    Expr, FieldDef, GroupByKey, KeySpace, Predicate, QualifiedColumn, TransformDef, ValueType,
+    Expr, FieldDef, KeySpace, Predicate, QualifiedColumn, TransformDef, ValueType,
     render_field_expr,
 };
 use super::pg_type::PgType;
@@ -265,14 +265,12 @@ pub enum ValidationError {
         column: String,
         value_type: ValueType,
     },
-    /// Two of an [`super::ast::KeySpace::Aggregate`] definition's `GROUP BY`
-    /// keys map to the same target column name (issue #519) — e.g.
-    /// `GROUP BY buyer.name, seller.name`, a plain `name` alongside
-    /// `buyer.name`, or one key listed twice. A key's target column is named
-    /// after its bare column ([`GroupByKey::target_column_name`]), and the
-    /// grammar has no `GROUP BY ... AS` alias yet, so the target DDL would
-    /// declare that column twice. `first`/`second` are the clashing keys as
-    /// written (`rel.column` or `column`), in `GROUP BY` order.
+    /// Two `GROUP BY` keys map to the same target column name (issue #519):
+    /// one key listed twice, or a `JOIN`'s `a.name` and `b.name`. A key's
+    /// target column is named after its bare column, and the grammar has no
+    /// `GROUP BY ... AS` alias yet, so the target DDL would declare that
+    /// column twice. `first`/`second` are the clashing keys as written, in
+    /// `GROUP BY` order.
     GroupByKeysShareTargetColumn {
         first: String,
         second: String,
@@ -965,37 +963,32 @@ pub fn validate(
         KeySpace::Aggregate { group_by } => {
             // Checked ahead of the per-field checks below, so a bad
             // `GROUP BY` clause is never masked by a field error instead.
-            let mut keys_by_target_column: HashMap<&str, &GroupByKey> =
-                HashMap::with_capacity(group_by.len());
+            let mut seen: HashSet<&str> = HashSet::with_capacity(group_by.len());
             for key in group_by {
-                match key {
-                    GroupByKey::Column(column) => {
-                        let Some(value_type) = source_columns.get(column) else {
-                            return Err(ValidationError::UnresolvedGroupByColumn {
-                                column: column.clone(),
-                            });
-                        };
-                        reject_unsupported_group_by_key_type(column, *value_type)?;
-                    }
-                }
+                let Some(value_type) = source_columns.get(key) else {
+                    return Err(ValidationError::UnresolvedGroupByColumn {
+                        column: key.clone(),
+                    });
+                };
+                reject_unsupported_group_by_key_type(key, *value_type)?;
                 // Issue #519: each key becomes a target column named after
-                // its column, so a repeated key would reach the target DDL as
-                // a duplicate column. Checked after the key itself resolves,
+                // it, so a repeated key would reach the target DDL as a
+                // duplicate column. Checked after the key itself resolves,
                 // so an unknown column is reported as such rather than as a
                 // clash.
-                if let Some(earlier) = keys_by_target_column.insert(key.target_column_name(), key) {
+                if !seen.insert(key) {
                     return Err(ValidationError::GroupByKeysShareTargetColumn {
-                        first: group_by_key_as_written(earlier),
-                        second: group_by_key_as_written(key),
-                        column: key.target_column_name().to_string(),
+                        first: key.clone(),
+                        second: key.clone(),
+                        column: key.clone(),
                     });
                 }
                 // Issue #566: a key's column sits beside the target's hidden
                 // `__`-prefixed columns, so it may not use their prefix.
-                if key.target_column_name().starts_with(RESERVED_COLUMN_PREFIX) {
+                if key.starts_with(RESERVED_COLUMN_PREFIX) {
                     return Err(ValidationError::ReservedGroupByColumnName {
-                        key: group_by_key_as_written(key),
-                        column: key.target_column_name().to_string(),
+                        key: key.clone(),
+                        column: key.clone(),
                     });
                 }
             }
@@ -1007,9 +1000,7 @@ pub fn validate(
                 // name would compute a value with nowhere to go — enforce
                 // the passthrough shape here rather than let DDL silently
                 // drop it.
-                if let Some(key) = group_by
-                    .iter()
-                    .find(|k| k.target_column_name() == field.name)
+                if let Some(key) = group_by.iter().find(|k| k.as_str() == field.name)
                     && !expr_is_group_by_key_passthrough(&field.expr, key)
                 {
                     return Err(ValidationError::GroupingColumnFieldMustBePassthrough {
@@ -1989,11 +1980,6 @@ pub fn reject_primary_key_named_fields(
     }
 }
 
-/// A `GROUP BY` key spelled the way the definition wrote it.
-fn group_by_key_as_written(key: &GroupByKey) -> String {
-    key.target_column_name().to_string()
-}
-
 /// Walks a [`KeySpace::Aggregate`] field's expression, rejecting a bare
 /// (not wrapped in `SUM`/`MIN`/`MAX`/`AVG`) reference to a source column
 /// that isn't a grouping key. `in_aggregate_call` tracks whether the current
@@ -2004,15 +1990,13 @@ fn group_by_key_as_written(key: &GroupByKey) -> String {
 fn validate_aggregate_field_expr(
     expr: &Expr,
     field_name: &str,
-    group_by: &[GroupByKey],
+    group_by: &[String],
     source_columns: &HashMap<String, ValueType>,
     in_aggregate_call: bool,
 ) -> Result<(), ValidationError> {
     match expr {
         Expr::Column(name) => {
-            let is_group_key = group_by
-                .iter()
-                .any(|k| matches!(k, GroupByKey::Column(c) if c == name));
+            let is_group_key = group_by.contains(name);
             if source_columns.contains_key(name) && !is_group_key && !in_aggregate_call {
                 return Err(ValidationError::UngroupedColumnReference {
                     field: field_name.to_string(),
@@ -2024,9 +2008,7 @@ fn validate_aggregate_field_expr(
         // Issue #830: a qualified name is a source column even when a field
         // has its name, so the same rule applies without the field lookup.
         Expr::SourceColumn { column, .. } => {
-            let is_group_key = group_by
-                .iter()
-                .any(|k| matches!(k, GroupByKey::Column(c) if c == column));
+            let is_group_key = group_by.contains(column);
             if !is_group_key && !in_aggregate_call {
                 return Err(ValidationError::UngroupedColumnReference {
                     field: field_name.to_string(),
@@ -2068,16 +2050,14 @@ fn validate_aggregate_field_expr(
     }
 }
 
-/// Whether `expr` is exactly the passthrough shape [`GroupByKey`] `key`
-/// requires of a field named after its target column name (see
+/// Whether `expr` is exactly the passthrough shape `GROUP BY` key `key`
+/// requires of a field named after it (see
 /// [`ValidationError::GroupingColumnFieldMustBePassthrough`]): a bare
 /// [`Expr::Column`] of the same name — there is no other expression shape
 /// DDL generation gives a target column of its own for that name, so
 /// anything else is rejected rather than silently dropped.
-fn expr_is_group_by_key_passthrough(expr: &Expr, key: &GroupByKey) -> bool {
-    match key {
-        GroupByKey::Column(name) => matches!(expr, Expr::Column(n) if n == name),
-    }
+fn expr_is_group_by_key_passthrough(expr: &Expr, key: &str) -> bool {
+    matches!(expr, Expr::Column(n) if n == key)
 }
 
 pub(super) fn collect_columns(expr: &Expr, out: &mut Vec<String>) {
@@ -3708,16 +3688,10 @@ mod tests {
     }
 
     fn aggregate_def(group_by: &[&str], fields: Vec<FieldDef>) -> TransformDef {
-        aggregate_def_with_keys(
-            group_by
-                .iter()
-                .map(|s| GroupByKey::Column(s.to_string()))
-                .collect(),
-            fields,
-        )
+        aggregate_def_with_keys(group_by.iter().map(|s| s.to_string()).collect(), fields)
     }
 
-    fn aggregate_def_with_keys(group_by: Vec<GroupByKey>, fields: Vec<FieldDef>) -> TransformDef {
+    fn aggregate_def_with_keys(group_by: Vec<String>, fields: Vec<FieldDef>) -> TransformDef {
         TransformDef {
             target: "t".to_string(),
             source: "s".to_string(),
@@ -3997,10 +3971,7 @@ mod tests {
     #[test]
     fn a_group_by_key_listed_twice_is_rejected() {
         let d = aggregate_def_with_keys(
-            vec![
-                GroupByKey::Column("region".to_string()),
-                GroupByKey::Column("region".to_string()),
-            ],
+            vec!["region".to_string(), "region".to_string()],
             vec![count_star_field()],
         );
         let source_columns = numeric_columns(&["region"]);

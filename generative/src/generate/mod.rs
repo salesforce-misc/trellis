@@ -210,7 +210,7 @@ pub mod partition;
 use std::collections::HashMap;
 
 use trellis::dev::defs::ast::{
-    Expr, FieldDef, GroupByKey, KeySpace, Operator, Predicate, TransformDef, ValueType,
+    Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType,
 };
 
 use crate::model::{
@@ -1041,7 +1041,7 @@ pub fn build_program_multi_with_shapes(
                     );
                     (
                         KeySpace::Aggregate {
-                            group_by: vec![GroupByKey::Column(grain_col)],
+                            group_by: vec![grain_col],
                         },
                         fields,
                     )
@@ -1503,7 +1503,7 @@ pub fn partition_table(mut program: Program, table: usize, strategy: PartitionSt
     for def in program.defs.iter().filter(|d| d.source == name) {
         assert!(
             matches!(&def.key_space, KeySpace::Aggregate { group_by }
-                if group_by == &[GroupByKey::Column(grain.clone())]),
+                if group_by.as_slice() == std::slice::from_ref(&grain)),
             "partition_table: {} reads {name} other than grouped by {grain} — a generator bug",
             def.target
         );
@@ -2185,7 +2185,7 @@ pub fn build_bulk_insert_program(row_count: usize) -> Program {
         target: pool.next_table_name(),
         source: table.name.clone(),
         key_space: KeySpace::Aggregate {
-            group_by: vec![GroupByKey::Column(grain.clone())],
+            group_by: vec![grain.clone()],
         },
         fields: vec![
             FieldDef {
@@ -2304,7 +2304,7 @@ pub fn target_key_for(def: &TransformDef, table: &Table, op: &Op) -> Option<Stri
             Op::Insert { row, .. } => {
                 let mut parts = Vec::with_capacity(group_by.len());
                 for key in group_by {
-                    let column = key.target_column_name();
+                    let column = key.as_str();
                     let value = row.iter().find(|(name, _)| name == column)?.1.clone();
                     // A `NULL` grouping value is itself a value Postgres's
                     // `GROUP BY` treats as one group (nulls compare equal for
