@@ -18,7 +18,7 @@
 //! Each records a *holdup* for the page's segments ([`record`]), in a short
 //! transaction of its own after the page's transaction rolled back.
 //! `Trellis::status` reports it as `drain_failure` on every unfrozen
-//! definition whose source is a table on the page ([`for_definition`]), and
+//! definition whose source or joined table is on the page ([`for_definition`]), and
 //! `self_check` reports every open
 //! one ([`open`]). Recording charges and pauses nothing. A transient failure
 //! (a lock timeout, a serialization failure, a storm of them during
@@ -259,10 +259,12 @@ pub(crate) async fn open(
 }
 
 /// The oldest open holdup on a page holding `source_table`, a definition's
-/// source. The caller decides whether the definition is unfrozen.
+/// source, or `join_table`, the table a `JOIN` definition joins. The caller
+/// decides whether the definition is unfrozen.
 pub(crate) async fn for_definition(
     client: &impl GenericClient,
     source_table: &str,
+    join_table: Option<&str>,
 ) -> Result<Option<DrainFailure>, tokio_postgres::Error> {
     // `drain_holdups` holds a row per failing segment, so it's empty, or
     // nearly so, and read whole.
@@ -270,10 +272,10 @@ pub(crate) async fn for_definition(
         .query_opt(
             &format!(
                 "select {COLUMNS} from drain_holdups h \
-                 where $1 = any(h.tables) \
+                 where $1 = any(h.tables) or $2 = any(h.tables) \
                  order by h.since, h.seg_seq limit 1"
             ),
-            &[&source_table],
+            &[&source_table, &join_table],
         )
         .await?;
     Ok(row.as_ref().map(from_row))

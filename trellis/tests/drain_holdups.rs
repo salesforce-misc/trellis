@@ -55,6 +55,7 @@ async fn instance(cluster: &TestCluster, ddl: &[&str]) -> Instance {
              create table public.c (id int primary key, pid int, amount int); \
              insert into public.p select i, 'n' || i from generate_series(1, 3) i; \
              insert into public.c select i, 1 + i % 3, i from generate_series(1, 6) i; \
+             create index c_pid_idx on public.c (pid); \
              create table public.q (id int primary key, v int); \
              insert into public.q select i, i from generate_series(1, 6) i; \
              alter table public.p owner to holdup_trellis; \
@@ -466,6 +467,43 @@ async fn status_reports_a_holdup_on_each_unfrozen_reader_of_its_tables() {
         vec!["c_pid"],
         "a paused definition applies nothing, so it isn't held back"
     );
+    it.trellis.shutdown().await.expect("shutdown");
+}
+
+/// A `JOIN` definition reads its joined table too, so a page holding only
+/// that table is a holdup `status` reports on it (#1363).
+#[tokio::test]
+async fn status_reports_a_holdup_on_a_page_holding_only_a_joined_table() {
+    let cluster = TestCluster::start();
+    let mut it = instance(
+        &cluster,
+        &[
+            "TRANSFORM c_by_p FROM public.c JOIN public.p ON c.pid = p.id GROUP BY p.name \
+           SELECT sum(c.amount) AS total",
+        ],
+    )
+    .await;
+    let seg = seal(&mut it.raw).await;
+    let hold = |tables: &str| {
+        format!(
+            "delete from {SCHEMA}.drain_holdups; \
+             insert into {SCHEMA}.drain_holdups \
+               (seg_seq, buckets, tables, error, sqlstate, since, last_seen, attempts) \
+             values ({seg}, '{{0}}', '{tables}', 'it fails', null, now(), now(), 3)"
+        )
+    };
+    for (tables, reported) in [
+        ("{public.p}", true),
+        ("{public.c}", true),
+        ("{public.q}", false),
+    ] {
+        it.admin.batch_execute(&hold(tables)).await.expect("hold");
+        assert_eq!(
+            status(&it, "c_by_p").await.drain_failure.is_some(),
+            reported,
+            "{tables}"
+        );
+    }
     it.trellis.shutdown().await.expect("shutdown");
 }
 
