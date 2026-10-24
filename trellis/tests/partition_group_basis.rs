@@ -881,7 +881,8 @@ async fn leaf_operation_races_a_page(
 
 /// #1309: a leaf truncate's correction whose recompute gives up on a group a
 /// page holds (its `lock_timeout`) stays queued and runs again, so the
-/// truncated rows are not left counted. (The #1117 soak's model ran its
+/// truncated rows are not left counted: under `run_pending` and under a
+/// drain worker's claim alike. (The #1117 soak's model ran its
 /// correction once, on a session with a 100 ms `lock_timeout`, and moved on
 /// when it timed out.)
 #[tokio::test]
@@ -920,6 +921,32 @@ async fn a_leaf_correction_that_times_out_behind_a_page_runs_again() {
     let err = timed_out.expect_err("the recompute waits on the page");
     assert!(format!("{err:?}").contains("lock timeout"), "{err:?}");
     assert_eq!(fx.kinds().await, ["truncated"], "still queued");
+    // A drain worker's claim (`build::run_claimed`) meets the same timeout:
+    // the failure is recorded as transient and backs off, uncharged, with
+    // the correction still queued.
+    let claimed = chunk_queue::claim_chunks_of(
+        &**impatient.get().await.expect("pool"),
+        "worker",
+        1,
+        &[chunk_queue::KIND_CORRECTION],
+    )
+    .await
+    .expect("claim the correction");
+    assert_eq!(claimed.len(), 1, "the correction's chunk");
+    build::run_claimed(&impatient, &claimed[0], "worker", &REBUILD_OPTIONS).await;
+    assert_eq!(
+        fx.d.rows(
+            "select done, claimed_by, charged, last_error like '%lock timeout%' \
+             from backfill_chunks where kind = 'correction'"
+        )
+        .await,
+        ["(f,,0,t)"],
+        "backed off, uncharged"
+    );
+    assert_eq!(fx.kinds().await, ["truncated"], "still queued");
+    // Its backoff has passed.
+    fx.exec("update backfill_chunks set next_attempt_at = null")
+        .await;
     fx.d.release(&mut page, point).await;
     page.finish().await;
     assert_eq!(fx.run().await.completed, 1);
