@@ -1620,7 +1620,10 @@ impl GroupTargetPlan {
     /// A keyed cell is held by `J`, not by a row lock, so the zero-cell
     /// collection (`super::retire`), which takes no `J` lock, may delete one
     /// the first statement read: the update then finds no row, and the cell
-    /// is inserted instead. Its held partials were zero, as the collection
+    /// is inserted instead. The caller holds a snapshot from before the
+    /// first statement until the second is done, so that `ctid` still holds
+    /// the dead row, never another key's cell in a freed line pointer.
+    /// Its held partials were zero, as the collection
     /// deletes only zero cells, so its change is the same either way. The
     /// cells to insert are those the update didn't write, an anti-join of the
     /// cells against the update's rows (a cell with no hidden row has a
@@ -2554,12 +2557,37 @@ pub(super) async fn write_join_build_cells(
     analyze(txn, &[grouped]).await?;
     let [fill, write] = plan.join_build_sql(grouped, cells, deltas);
     txn.batch_execute(BULK_PLAN_SETTINGS).await?;
-    txn.batch_execute(&fill).await?;
+    // The write updates each held cell by the `ctid` the match read. A
+    // cell the zero-cell collection deletes in between leaves a dead row
+    // there, and once no snapshot needs that row a vacuum or a prune may
+    // free its line pointer for another key's cell, which the update would
+    // then overwrite. The cursor's snapshot, taken before the match and
+    // kept until the write is done, keeps every row the match saw from
+    // being removed, as one statement's snapshot did.
+    txn.batch_execute(&format!(
+        "declare {MATCH_HOLD} no scroll cursor for select; {fill}"
+    ))
+    .await?;
     analyze(txn, &[cells]).await?;
+    // Test-only pause point between the match and the write, holding no
+    // snapshot of its own, as production holds none but the cursor's
+    // between the two statements. See `super::interleave`.
+    #[cfg(any(test, feature = "test-util"))]
+    super::interleave::pause_between_transactions(
+        txn,
+        super::interleave::PausePoint::AfterJoinCellMatch,
+        &plan.target,
+    )
+    .await?;
     txn.query_one(&write, &[]).await?;
-    txn.batch_execute(BULK_PLAN_RESET).await?;
+    txn.batch_execute(&format!("close {MATCH_HOLD}; {BULK_PLAN_RESET}"))
+        .await?;
     Ok(())
 }
+
+/// The cursor [`write_join_build_cells`] holds open from before its match
+/// statement until its write is done, for its snapshot alone.
+const MATCH_HOLD: &str = "trellis_join_match_hold";
 
 /// Refreshes the planner's statistics of `tables` (session temp tables,
 /// quoted and qualified) after a bulk statement filled them. Postgres never

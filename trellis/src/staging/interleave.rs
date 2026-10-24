@@ -57,7 +57,9 @@
 //! its `J` insert, `AfterJoinLock` after its sorted `J` lock,
 //! `AfterEntryLock` after its `P` and `M` cell locks, `BeforeJoinTargetLock`
 //! after its product, `AfterJoinTargetLock` after its `T` group lock,
-//! `AfterGroupUpsert` after its `T` write, and `BeforeCommit`.
+//! `AfterGroupUpsert` after its `T` write, and `BeforeCommit`. A build's
+//! cell write of a side fires [`PausePoint::AfterJoinCellMatch`] between
+//! its match statement and its write.
 //!
 //! A build chunk (`super::build::run_chunk`, #625 F1) fires the ledger
 //! column's first three points for its target too: `AfterPlaceholders` and
@@ -212,6 +214,12 @@ pub enum PausePoint {
     /// side's, then the joined side's), before the next side or the product:
     /// a build's cross term (`super::join::build`, #1109).
     BetweenJoinSideWrites,
+    /// On a `JOIN` target, in a build's cell write of one side
+    /// (`super::group_basis::write_join_build_cells`), after the statement
+    /// that matches each cell to its hidden row's `ctid` and before the
+    /// write from that match. Waits as [`pause_between_transactions`] does,
+    /// holding no snapshot, as nothing does between the two statements.
+    AfterJoinCellMatch,
     /// On a `JOIN` target, after the page's product of its `P` and `M`
     /// changes (and a build's enumeration of `T`'s groups), before its lock
     /// of the `T` groups.

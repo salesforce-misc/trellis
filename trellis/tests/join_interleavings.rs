@@ -3514,6 +3514,92 @@ async fn a_build_writes_a_cell_the_collection_deletes_under_it() {
     lab.check("a cell collected under the build's write").await;
 }
 
+/// A build's write updates each held cell by the `ctid` its match statement
+/// read, in an earlier statement. Between the two the zero-cell collection
+/// may delete the cell, here in a transaction older than the build's. Were
+/// the build to hold no snapshot from before the match (it holds none of
+/// its own between statements), a vacuum would free the dead row's line
+/// pointer and a page's insert of a cell on a key the build doesn't hold
+/// would reuse it, and the write would overwrite that cell with the
+/// collected one's partials. The line pointer stays taken until the write
+/// is done, so the write inserts the collected cell, and the other keeps
+/// its own.
+#[tokio::test]
+async fn a_build_write_never_meets_a_collected_cells_reused_ctid() {
+    let mut lab = seeded(Key::Single, &[L], BUILD_SEED).await;
+    lab.build().await;
+    lab.assert_built("built").await;
+    lab.step("insert into public.a values (100, 5, 0, 1, 3)")
+        .await;
+    lab.step("delete from public.a where id = 100").await;
+    let p = lab.hidden(L, "p").await;
+    let zero = "__zero and __basis is null";
+    let collected = lab
+        .scalar(&format!("select ctid::text from {p} where {zero}"))
+        .await
+        .trim_matches('"')
+        .to_string();
+    request_rebuild(&lab, "a").await;
+    // The collection's transaction takes its id before the build's.
+    let collector = lab.d.user().await;
+    collector
+        .batch_execute("begin; select txid_current()")
+        .await
+        .expect("an older transaction id");
+    let point = PausePoint::AfterJoinCellMatch;
+    let mut building = lab.build_frozen("sweep", &[point]).await;
+    let build_pid = building.reached(point).await.backend_pid;
+    collector
+        .batch_execute(&format!(
+            "delete from {p} where ctid = any(array( \
+                 select ctid from {p} where {zero} for update skip locked)); \
+             commit"
+        ))
+        .await
+        .expect("collect the zero cell");
+    // The paused build polls its lock in short statements. Once one has
+    // started after the commit, only a snapshot the build holds across them
+    // keeps the dead row.
+    let committed = lab.scalar("select clock_timestamp()::text").await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while lab
+        .scalar(&format!(
+            "select count(*) from pg_stat_activity where pid = {build_pid} \
+             and query_start > '{committed}'::timestamptz"
+        ))
+        .await
+        == "0"
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the paused build ran no statement after the collection"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    lab.write(&format!("vacuum (index_cleanup on) {p}")).await;
+    // A page of cells on three new keys inserts each, then updates it, into
+    // the page's lowest free line pointers: one of them would be the
+    // collected cell's, had the vacuum freed it.
+    lab.step(
+        "insert into public.a values \
+         (177, 6, 0, 77, 1), (178, 6, 0, 78, 1), (179, 6, 0, 79, 1)",
+    )
+    .await;
+    assert_eq!(
+        lab.scalar(&format!(
+            "select count(*) from {p} where ctid = '{collected}'::tid"
+        ))
+        .await,
+        "0",
+        "the collected cell's line pointer {collected} is still taken"
+    );
+    lab.d.release(&mut building, point).await;
+    building.finish().await;
+    lab.assert_built("rebuilt around a collected cell").await;
+    lab.check("a cell collected between the build's match and its write")
+        .await;
+}
+
 /// Test 6 (R8): a cell whose only row moved out, undrained, before the build
 /// is a zero cell with a basis, so the later `-1` of the move is refused.
 #[tokio::test]

@@ -306,7 +306,10 @@ once from it, an update of a held cell or an insert of a new one, with that
 snapshot as its basis. `J` doesn't hold a zero cell against the
 zero-cell collection, which takes no `J` lock: a cell it deletes under the
 write is inserted instead, and its change is the same, since its held partials
-were zero. The enumeration is a `create table as` too, for the same reason as
+were zero. The write finds a held row by the row address the match read, so the
+transaction holds a snapshot from before the match until the write is done: a
+row the collection deletes stays dead at that address, and no other cell's row
+can take it. The enumeration is a `create table as` too, for the same reason as
 the snapshot statement. A cell first seen after the enumeration belongs to its
 pages. It then carries both sides' changes into `T` as the product, as a page
 does. `T`'s groups are locked after the product,
