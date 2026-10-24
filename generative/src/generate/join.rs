@@ -222,12 +222,21 @@ pub enum KeyShape {
     /// change one key from opposite sides without sharing a `P` or `M`
     /// cell, and only the `J` lock orders them.
     Wide,
+    /// Over [`RACING_KEYS`] keys and [`RACING_GROUPS`] groups, both tables
+    /// written alike, and run with short seals, paced writers and a long
+    /// commit stall ([`RACING_COMMIT_STALL_MS`]): many small pages overlap, and
+    /// the groups are so many that two pages seldom share a `P`, `M` or `T`
+    /// cell, so only the `J` lock (and the `T` group locks) order two pages
+    /// that change one key from opposite sides.
+    Racing,
 }
 
 pub const SPREAD_KEYS: u8 = 12;
 pub const HOT_OTHER_KEYS: u8 = 6;
 pub const FAN_OUT_KEYS: u8 = 3;
 pub const WIDE_KEYS: u8 = 64;
+pub const RACING_KEYS: u8 = 40;
+pub const RACING_GROUPS: u8 = 4;
 
 impl KeyShape {
     pub fn name(self) -> &'static str {
@@ -236,6 +245,15 @@ impl KeyShape {
             KeyShape::HotKey => "hot_key",
             KeyShape::FanOut => "fan_out",
             KeyShape::Wide => "wide",
+            KeyShape::Racing => "racing",
+        }
+    }
+
+    /// How many distinct group values the shape's rows draw from.
+    fn group_domain(self) -> u8 {
+        match self {
+            KeyShape::Racing => RACING_GROUPS,
+            _ => 4,
         }
     }
 
@@ -251,6 +269,7 @@ impl KeyShape {
             KeyShape::HotKey => 1 + raw % HOT_OTHER_KEYS,
             KeyShape::FanOut => raw % FAN_OUT_KEYS,
             KeyShape::Wide => raw % WIDE_KEYS,
+            KeyShape::Racing => raw % RACING_KEYS,
         })
     }
 }
@@ -279,7 +298,8 @@ pub struct JoinOpDraw {
     pub key: u8,
     /// `t`, modulo 2.
     pub t: u8,
-    /// The group column (`ga` or `gb`), modulo 4, or `NULL`.
+    /// The group column (`ga` or `gb`), modulo the shape's group domain, or
+    /// `NULL`.
     pub group: Option<u8>,
     /// The aggregate argument (`x` or `y`), or `NULL`.
     pub value: Option<i8>,
@@ -318,7 +338,7 @@ pub fn build_join_program(
         };
         let key = text(shape.key(draw.key).map(i64::from));
         let t = text(Some(i64::from(draw.t % 2)));
-        let group = text(draw.group.map(|g| i64::from(g % 4)));
+        let group = text(draw.group.map(|g| i64::from(g % shape.group_domain())));
         let value = text(draw.value.map(i64::from));
         let kind = if live[side].is_empty() {
             JoinOpKind::Insert
@@ -770,7 +790,7 @@ mod strategy {
             any::<usize>(),
             any::<u8>(),
             0u8..2,
-            prop_oneof![1 => Just(None), 9 => (0u8..4).prop_map(Some)],
+            prop_oneof![1 => Just(None), 9 => (0u8..RACING_GROUPS).prop_map(Some)],
             prop_oneof![1 => Just(None), 9 => (-20i8..60).prop_map(Some)],
             0u8..16,
         )
@@ -796,6 +816,9 @@ mod strategy {
     /// half the cases (`ConcurrentPlan::commit_stall`): long enough that two
     /// pages of one key's opposite sides overlap between their writes and
     /// their commits, where the `J` lock orders them.
+    /// The longest commit stall a `racing` case draws.
+    pub const RACING_COMMIT_STALL_MS: std::ops::RangeInclusive<u64> = 2000..=3500;
+
     pub const COMMIT_STALL_MS: std::ops::RangeInclusive<u64> = 5..=40;
 
     /// A JOIN-tier case: one to three definitions, each installed up front
@@ -814,32 +837,40 @@ mod strategy {
     /// page before its commit ([`COMMIT_STALL_MS`]).
     pub fn join_case_strategy() -> impl Strategy<Value = JoinCase> {
         prop_oneof![
-            Just(KeyShape::Spread),
-            Just(KeyShape::HotKey),
-            Just(KeyShape::FanOut),
-            Just(KeyShape::Wide)
+            1 => Just(KeyShape::Spread),
+            1 => Just(KeyShape::HotKey),
+            1 => Just(KeyShape::FanOut),
+            1 => Just(KeyShape::Wide),
+            4 => Just(KeyShape::Racing)
         ]
         .prop_flat_map(|shape| (Just(shape), any::<bool>()))
         .prop_flat_map(|(shape, truncating)| {
-            let joined_weight = if matches!(shape, KeyShape::FanOut | KeyShape::Wide) {
-                5
-            } else {
-                3
-            };
-            let burst_size = if shape == KeyShape::Wide {
+            let joined_weight =
+                if matches!(shape, KeyShape::FanOut | KeyShape::Wide | KeyShape::Racing) {
+                    5
+                } else {
+                    3
+                };
+            let racing = shape == KeyShape::Racing;
+            let ops = if racing { 500..=MAX_OPS } else { 120..=MAX_OPS };
+            let burst_size = if racing {
+                600usize..=900
+            } else if shape == KeyShape::Wide {
                 260usize..=600
             } else {
                 40usize..=600
             };
             (
                 proptest::collection::vec(spec(), 1..=3),
-                proptest::collection::vec(draw(joined_weight, truncating), 120..=MAX_OPS),
+                proptest::collection::vec(draw(joined_weight, truncating), ops),
                 burst_size,
                 2usize..=4,
                 2usize..=6,
                 20u64..=200,
                 builds(),
                 proptest::option::of(COMMIT_STALL_MS),
+                RACING_COMMIT_STALL_MS,
+                5_000u64..=10_000,
             )
                 .prop_map(
                     move |(
@@ -851,7 +882,20 @@ mod strategy {
                         seal_interval_ms,
                         builds,
                         commit_stall_ms,
+                        racing_stall_ms,
+                        racing_pace_micros,
                     )| {
+                        // A `racing` case builds nothing over rows: every
+                        // definition is live over the empty tables before
+                        // the first write, so every page is a page.
+                        let builds = if shape == KeyShape::Racing {
+                            JoinBuildDraws {
+                                settle_after_install: true,
+                                ..JoinBuildDraws::default()
+                            }
+                        } else {
+                            builds
+                        };
                         let mut case = join_case(
                             &specs,
                             shape,
@@ -864,6 +908,17 @@ mod strategy {
                         );
                         case.plan.commit_stall =
                             commit_stall_ms.map(std::time::Duration::from_millis);
+                        if shape == KeyShape::Racing {
+                            case.seal_interval_ms = 20 + case.seal_interval_ms % 21;
+                            case.workers = case.workers.max(3);
+                            case.plan.commit_stall =
+                                Some(std::time::Duration::from_millis(racing_stall_ms));
+                            case.plan.steady_load = Some(crate::model::SteadyLoad {
+                                pace: std::time::Duration::from_micros(racing_pace_micros),
+                                pace_from_start: true,
+                                stall: std::time::Duration::ZERO,
+                            });
+                        }
                         case
                     },
                 )

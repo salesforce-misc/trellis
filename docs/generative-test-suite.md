@@ -240,6 +240,16 @@ unblocks it.
   test -p generative --test join_convergence -- --ignored`. Its planted-bug
   sweep, `join_planted_bugs_are_caught`, gates the `JOIN` plants and the
   group-basis writer's plants that a `JOIN`'s `P` and `M` cells share (§6).
+  Half its cases are the `racing` shape (40 keys, 4 groups, one burst of 500 to
+  900 ops, definitions live before the first write, short seals, a commit stall
+  of up to 2 to 3.5 s): pages overlap between their writes and their commits and
+  seldom share a cell, so only the `J` and `T` locks order them, which is how
+  `join_no_j_lock` and `join_t_skip_lock` are caught (2 of 48 cases each). A
+  `racing` case takes about 15 s. `gb_early_zero_gc` is a known miss here: it
+  needs a zero group's rebuild stamp past the drained prefix when the GC pass
+  runs, and the GC runs every `housekeeping_interval` (5 s by default, which the
+  harness doesn't set). `gb_lsn_not_visibility` is not drawn here, as its writers
+  are single statements.
 - **Partitioned-source convergence** *(ADR-0017)*. The first table of a
   generated program is a partitioned source: `HASH` over one to four leaves,
   `LIST` with a leaf per grain value or fewer and a `DEFAULT`, or `RANGE` over

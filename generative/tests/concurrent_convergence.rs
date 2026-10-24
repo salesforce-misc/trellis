@@ -1651,10 +1651,11 @@ const NO_ABSOLUTE_WRITE_UNDER_LOAD: &[(&str, &str)] = &[
 /// to meet a zero group whose stamp is past the drained prefix (an absolute
 /// write's zero group with a change it saw still undrained) and then a page
 /// of that change to land on the fresh row; the plant changed the GC's
-/// choice in 0 to 4 of 48 cases per tier and the tiers caught none. The
+/// choice in 0 to 4 of 48 cases per tier and the tiers caught none. The GC pass runs every
+/// `housekeeping_interval` (5 s by default; the harness does not set it), so
+/// it rarely meets an undrained stamp. The
 /// deterministic pins (`group_basis_interleavings`'s `r4_…`,
-/// `join_interleavings`'s `family13_…`) gate it meanwhile; #1373 tracks
-/// the generator reach.
+/// `join_interleavings`'s `family13_…`) gate it.
 const EARLY_ZERO_GC_MISS: &str = "gb_early_zero_gc";
 
 /// The steady-load tier's known misses with the group basis on.

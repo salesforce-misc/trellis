@@ -27,6 +27,14 @@
 //!   shapes every page locks the same cells, which hides a missing `J`
 //!   lock).
 //!
+//! - `racing`: 40 keys and 4 groups, both tables written alike, with 500 to
+//!   900 ops in one burst, every definition live before the first write,
+//!   short seals, and a commit stall of up to 2 to 3.5 s (the stall is
+//!   skewed toward short, so that maximum makes pages that overlap for
+//!   seconds). Pages seldom share a cell, so only the `J` and `T` locks order
+//!   them: it is the shape that catches `join_no_j_lock` and
+//!   `join_t_skip_lock`. A case takes 15 s on average.
+//!
 //! The ops are issued as the concurrent tier issues them
 //! (`generative::run::run_convergence_concurrent`): bursts of 40 to 600 ops,
 //! each split over 2 to 4 lanes on their own connections, so writes to both
@@ -348,16 +356,16 @@ proptest! {
 /// gated (the `JOIN` plants and the group-basis writer's, which `P` and `M`
 /// share); the others break paths the tier never takes.
 ///
-/// Measured (#1114, 4 seeds x 12 cases, logbook `20261024T051124-a-sweep`):
-/// `join_drop_flip` caught in 33 of 48, `gb_fold_sides_per_key` 27,
-/// `join_other_side_before_j` 6. Known misses: `join_no_j_lock` and
-/// `join_t_skip_lock` fired in 27 to 31 of 48 cases and were caught in none,
-/// with or without the commit stall: their race needs two pages of one key's
-/// opposite sides (or one `T` group) to read each other's uncommitted state,
-/// which the tier's pages, each a burst's many keys, rarely line up; and
-/// `gb_early_zero_gc` fired in 1. The deterministic pins named in
-/// `trellis/src/plant.rs` gate them meanwhile; #1373 tracks the generator
-/// reach.
+/// Measured (4 seeds x 12 cases, logbook `20261024T*-b-sweep` for #1373):
+/// `join_no_j_lock` and `join_t_skip_lock` caught in 2 of 48 cases each, both
+/// only in `racing` cases: pages overlap between their writes and their
+/// commits for seconds (`RACING_COMMIT_STALL_MS`), over 40 keys and 4 groups, so
+/// pages seldom share a cell and only the `J` and `T` locks order them.
+/// `gb_early_zero_gc` fired in 0 of 48: it needs a rebuild whose basis stamp
+/// is past the drained prefix while the GC pass runs, and the GC pass runs
+/// every `housekeeping_interval` (5 s by default, which the harness doesn't
+/// set), so it is a known miss, pinned by `group_basis_interleavings`'s
+/// `r4_…` and `join_interleavings`'s `family13_…` (#1373).
 fn join_sweep_tier() -> SweepTier {
     use generative::plant_sweep::{PlantPath, not_on_path};
     let mut not_gated: Vec<(&'static str, &'static str)> = vec![(
@@ -378,7 +386,7 @@ fn join_sweep_tier() -> SweepTier {
     ));
     SweepTier {
         name: generative::baseline_quarantine::JOIN_TIER,
-        known_misses: &["join_no_j_lock", "join_t_skip_lock", "gb_early_zero_gc"],
+        known_misses: &["gb_early_zero_gc"],
         not_gated,
     }
 }
