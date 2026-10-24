@@ -102,6 +102,13 @@
 //! `__zero` change when a group empties or refills, so an update that keeps
 //! a group non-zero changes no indexed column and stays HOT.
 //!
+//! A `JOIN`'s `P` and `M` cells are groups of this kind, written by the
+//! same writer, and their zero cells are collected by the same rule and
+//! statement (`crate::defs::join`'s hidden tables). The pass takes no `J`
+//! lock: a zero cell adds nothing to the product, so a page that reads the
+//! key's cells under `J` gets the same `T` delta with it or without it. Its
+//! `J` rows are never collected (ADR-0019).
+//!
 //! Zero groups left in place aren't free: #1043's JOIN model ran 16x slower
 //! with thousands of them on a few hot keys, and a definition whose groups
 //! churn (a `GROUP BY` over a session id, say) would grow its hidden table

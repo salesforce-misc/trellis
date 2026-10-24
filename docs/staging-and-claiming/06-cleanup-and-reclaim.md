@@ -82,7 +82,10 @@ the reclaim TTL), whether or not the drain is busy. The pass:
    show, which its successor takes, [03](03-sealing-and-the-fence.md)), so a
    `self_check` page can skip a drained slot that holds none, then retires
    eligible drained batches;
-4. collects the tombstones no change can still need.
+4. collects the tombstones no change can still need, and the zero groups of
+   group-basis aggregates and the zero `P` and `M` cells of `JOIN`s that the
+   drained prefix has passed ([ADR-0002](../decisions/0002-async-data-flow.md)
+   R4, [ADR-0019](../decisions/0019-join-transforms.md)).
 
 So a crashed seal is recovered within its 10 s age gate plus about 5 s, and a dead
 claimant's buckets are freed within the reclaim TTL plus about 5 s. A full ring

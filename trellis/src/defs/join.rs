@@ -14,7 +14,10 @@
 //! - `P` ([`HiddenTable::FromPartials`]): the `FROM` side grouped by its
 //!   `GROUP BY` columns and its join key, with the row count and, per
 //!   aggregate argument on that side, a non-null count and a `numeric` sum,
-//!   and the cell's basis and stamp (ADR-0002's group basis);
+//!   and the cell's basis and stamp (ADR-0002's group basis). A cell whose
+//!   partials are all zero (`__zero`, a stored generated column, with a
+//!   partial index on the cell identity) is collected as an aggregate's zero
+//!   group is (`crate::staging::group_basis`'s "Zero groups");
 //! - `M` ([`HiddenTable::JoinedPartials`]): the same for the joined side;
 //! - `J` ([`HiddenTable::Matches`]): one row per join key, the key's lock,
 //!   holding the joined side's row count under it;
@@ -317,7 +320,7 @@ fn partial_columns(arguments: usize) -> Vec<String> {
 
 /// `side`'s key columns in its hidden partials table, in the order of the
 /// table's cell identity: its join key columns, then its `GROUP BY` columns
-/// not already among them. The join key leads so the table's one index
+/// not already among them. The join key leads so the table's identity index
 /// serves both a `self_check` page's range scan (#1198) and the other
 /// side's lookup of a key's cells.
 pub(crate) fn side_key_columns(def: &TransformDef, side: Side) -> Vec<String> {
@@ -353,20 +356,32 @@ pub(crate) fn hidden_tables_ddl(
         (HiddenTable::JoinedPartials, Side::Joined, joined),
     ] {
         let keys = side_key_columns(def, side);
+        let arguments = side_arguments(def, side).len();
         let mut body: Vec<String> = keys.iter().map(|c| typed(columns, c)).collect();
-        body.extend(partial_columns(side_arguments(def, side).len()));
+        body.extend(partial_columns(arguments));
         body.push("__basis pg_snapshot".to_string());
         body.push("__stamp bigint not null default 0".to_string());
+        // A zero cell: every partial zero, as an aggregate's zero group
+        // (`staging::group_basis`'s "Zero groups"), which the tombstone pass
+        // collects through the partial index below.
+        let mut zero = vec!["__n = 0".to_string()];
+        for i in 1..=arguments {
+            zero.push(format!("__count_{i} = 0"));
+            zero.push(format!("__sum_{i} = 0"));
+        }
+        body.push(format!(
+            "__zero boolean not null generated always as ({}) stored",
+            zero.join(" and ")
+        ));
         // The cell identity is the key columns in order, the join key first
         // (`side_key_columns`).
         let identity: Vec<String> = keys.iter().map(|c| quote_ident(c)).collect();
-        body.push(format!(
-            "unique nulls not distinct ({})",
-            identity.join(", ")
-        ));
+        let identity = identity.join(", ");
+        body.push(format!("unique nulls not distinct ({identity})"));
+        let name = format!("{schema}.{}", quote_ident(&table.name(id)));
         sql.push_str(&format!(
-            "create table {schema}.{} ({});\n",
-            quote_ident(&table.name(id)),
+            "create table {name} ({});\n\
+             create index on {name} ({identity}) where __zero;\n",
             body.join(", ")
         ));
     }
@@ -624,9 +639,17 @@ mod tests {
             "{ddl}"
         );
         assert!(ddl.contains("\"join_7_j\" (\"id\" integer, \"tenant\" integer, __matches bigint not null default 0, primary key (\"id\", \"tenant\"))"), "{ddl}");
-        // The join key leads each side's cell identity.
+        // The join key leads each side's cell identity. A zero cell is every
+        // partial zero, with a partial index on the cell identity for the
+        // zero-cell collection.
         assert!(
-            ddl.contains("__stamp bigint not null default 0, unique nulls not distinct (\"id\", \"tenant\", \"region\"))"),
+            ddl.contains(
+                "__stamp bigint not null default 0, __zero boolean not null generated always as \
+                 (__n = 0 and __count_1 = 0 and __sum_1 = 0) stored, \
+                 unique nulls not distinct (\"id\", \"tenant\", \"region\"));\n\
+                 create index on \"trellis\".\"join_7_p\" (\"id\", \"tenant\", \"region\") \
+                 where __zero;\n"
+            ),
             "{ddl}"
         );
         // `T`: the group columns, then the `FROM` side's one argument and the

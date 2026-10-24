@@ -61,7 +61,7 @@
 //!
 //! Cost: a page of `P` or `M` is keyed in the hidden table's cell identity
 //! (`spec::side_key_columns`): the join key, then the side's group columns not
-//! among them. The hidden table's one index has that order, so the hidden side
+//! among them. The hidden table's identity index has that order, so the hidden side
 //! is a range scan of it. The source side is a range scan of an index leading
 //! with the side's join columns (`a`'s for `P`, `b`'s for `M`), the group
 //! columns sorted within each join key, and the walk of the part reads its

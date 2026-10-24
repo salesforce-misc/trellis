@@ -251,7 +251,8 @@ pub(crate) fn may_leave_backlog(collected: u64) -> bool {
 /// Deletes the tombstones no change can still need (#623 D7): in every
 /// ledger, each `__tombstone` entry whose `__applied_seg` is at or below the
 /// contiguous drained prefix `P` ([`DRAINED_PREFIX_SQL`]), and then the
-/// group-basis aggregates' zero groups through `P` ([`collect_zero_groups`]).
+/// group-basis aggregates' zero groups and the `JOIN`s' zero `P` and `M`
+/// cells through `P` ([`collect_zero_groups`]).
 /// Returns how many of both went.
 ///
 /// **Why it's sound.** A tombstone exists so that an older change to its key,
@@ -370,10 +371,14 @@ pub async fn collect_tombstones(client: &mut Client) -> Result<u64, StagingError
     Ok(collected)
 }
 
-/// Every group-basis aggregate's hidden table, schema-qualified and quoted
-/// (`super::group_basis::hidden_table_name`), with the quoted key columns of
-/// its zero-group index, or `NULL` while it has none valid.
+/// Every table holding zero groups: each group-basis aggregate's hidden
+/// table (`super::group_basis::hidden_table_name`) and each `JOIN`'s `P`
+/// and `M` (`crate::defs::join::HiddenTable`), schema-qualified and quoted,
+/// with the quoted key columns of its zero-group index, or `NULL` while it
+/// has none valid. A `JOIN`'s `J` rows are never collected (ADR-0019), nor
+/// is its `T`, which has no zero-group index.
 fn hidden_tables_sql() -> String {
+    use crate::defs::join::HiddenTable;
     format!(
         "select format('%I.%I', n.nspname, c.relname), \
                 (select string_agg(format('%I', a.attname), ', ' order by k.ord) \
@@ -383,17 +388,20 @@ fn hidden_tables_sql() -> String {
                    on a.attrelid = i.indrelid and a.attnum = k.attnum \
                  where i.indrelid = c.oid and i.indisvalid and i.indpred is not null) \
          from transform_definitions d \
-         join pg_catalog.pg_class c on c.relname = {name} \
+         join pg_catalog.pg_class c on c.relname in ({agg}, {p}, {m}) \
           and c.relnamespace = (select relnamespace from pg_catalog.pg_class \
                                 where oid = 'transform_definitions'::regclass) \
          join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
-         order by d.id",
-        name = super::group_basis::hidden_table_name_sql("d.id"),
+         order by d.id, c.relname",
+        agg = super::group_basis::hidden_table_name_sql("d.id"),
+        p = HiddenTable::FromPartials.name_sql("d.id"),
+        m = HiddenTable::JoinedPartials.name_sql("d.id"),
     )
 }
 
-/// Deletes the zero groups of every group-basis aggregate that no change
-/// can still need (ADR-0002 R4): each hidden row whose partials are all
+/// Deletes the zero groups of every group-basis aggregate, and the zero
+/// cells of every `JOIN`'s `P` and `M` ([`hidden_tables_sql`]), that no
+/// change can still need (ADR-0002 R4): each hidden row whose partials are all
 /// zero (`__zero`) and that has no basis, or whose stamp is at or below the
 /// contiguous drained prefix `through`. Returns how many went. See "Zero
 /// groups" in `super::group_basis`'s module doc for why that is sound.

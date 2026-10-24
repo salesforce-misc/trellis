@@ -927,7 +927,7 @@ const GROUP_IS_KEY: &str = "TRANSFORM gk FROM public.a JOIN public.b ON a.k = b.
      GROUP BY a.k, b.gb SELECT a.k AS k, b.gb AS gb, COUNT(*) AS n, SUM(a.x) AS sx";
 
 /// A `P` or `M` page orders by the hidden cell identity, the join key first
-/// (#1198): the hidden side is a range scan of the hidden table's one index
+/// (#1198): the hidden side is a range scan of the hidden table's identity index
 /// and the source side a range scan of an index on the source's join columns.
 #[tokio::test]
 async fn a_p_or_m_page_is_a_range_scan_of_the_hidden_index_and_the_source_join_index() {
@@ -942,15 +942,16 @@ async fn a_p_or_m_page_is_a_range_scan_of_the_hidden_index_and_the_source_join_i
         ("m", "b", "b_join_idx", "gb"),
     ] {
         let (hidden, name) = hidden(&d, "l", part).await;
-        // The hidden table's one index, whatever define named it.
+        // The hidden table's identity index, whatever define named it (its
+        // other index is the partial zero-cell one).
         let hidden_index = d
             .rows(&format!(
                 "select c.relname from pg_index i join pg_class c on c.oid = i.indexrelid \
-                 where i.indrelid = '{hidden}'::regclass"
+                 where i.indrelid = '{hidden}'::regclass and i.indpred is null"
             ))
             .await;
         let [hidden_index] = hidden_index.as_slice() else {
-            panic!("{part}: one index on {hidden}: {hidden_index:?}");
+            panic!("{part}: one identity index on {hidden}: {hidden_index:?}");
         };
         let hidden_index = hidden_index.trim_matches(|c| c == '(' || c == ')');
         // Statistics, so the plan does not depend on whether autovacuum has
