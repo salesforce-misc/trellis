@@ -7,8 +7,7 @@
 //!
 //! The source is seeded and captured by an unrelated 1-1 definition, then
 //! the aggregate is defined over it, so its build starts over rows. Every
-//! test turns the group-basis dev knob on before its driver starts, and runs
-//! the plan job by hand through `support/drain_driver.rs`, frozen at its
+//! test runs the plan job by hand through `support/drain_driver.rs`, frozen at its
 //! pause points where the scenario needs it. None sleeps or polls for
 //! convergence (#297): the one wait is for a page to queue on a lock the
 //! frozen build holds, which the test has forced.
@@ -53,7 +52,6 @@ fn columns() -> Vec<(&'static str, ValueType)> {
 /// `public.src (id, g, v)` captured, with an unrelated 1-1 definition live
 /// over it, and `rows` (an `insert ... values` tail) drained into it.
 async fn seeded(rows: &str) -> Driver {
-    trellis::dev::staging::set_group_basis(true);
     let mut d = Driver::start(
         "create table public.src (id integer primary key, g integer, v integer); \
          create index on public.src (g)",
@@ -518,7 +516,6 @@ async fn the_build_holds_the_definition_row() {
 /// absolute partials, so a build writes the same values the pages do.
 #[tokio::test]
 async fn a_build_writes_averages_numeric_sums_and_composed_fields() {
-    trellis::dev::staging::set_group_basis(true);
     let mut d = Driver::start(
         "create table public.src (id integer primary key, g integer, v integer, \
          m numeric(12, 2)); create index on public.src (g)",
@@ -771,7 +768,6 @@ async fn a_drop_waits_for_a_build_in_flight() {
 /// `partition_group_basis.rs`.)
 #[tokio::test]
 async fn a_partitioned_source_with_rows_is_refused() {
-    trellis::dev::staging::set_group_basis(true);
     let d = Driver::start(
         "create table public.src (id integer, g integer, v integer, primary key (id, g)) \
              partition by range (g); \

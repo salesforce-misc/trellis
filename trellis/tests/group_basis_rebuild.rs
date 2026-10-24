@@ -5,8 +5,7 @@
 //! source's `GROUP BY` from one snapshot, and replaces each group's partials
 //! and visible row, while pages keep applying.
 //!
-//! Every test turns the group-basis dev knob on before its driver starts,
-//! requests the rebuild through `Trellis::request_backfill`, and runs the
+//! Every test requests the rebuild through `Trellis::request_backfill`, and runs the
 //! rebuild's job by hand through `support/drain_driver.rs`, frozen at its
 //! pause points where the scenario needs it. None sleeps or polls for
 //! convergence (#297): the one wait is for a page to queue on a lock the
@@ -47,7 +46,6 @@ fn int4() -> ValueType {
 /// `public.src (id, g, v)`, empty, with [`AGG`] live over it on the group
 /// basis, captured by triggers.
 async fn start() -> Driver {
-    trellis::dev::staging::set_group_basis(true);
     Driver::start(
         "create table public.src (id integer primary key, g integer, v integer); \
          create index on public.src (g)",
@@ -428,7 +426,6 @@ async fn a_rebuild_replaces_a_group_with_a_null_part() {
 /// replaced partials, so a rebuild writes the same values the pages do.
 #[tokio::test]
 async fn a_rebuild_writes_averages_numeric_sums_and_composed_fields() {
-    trellis::dev::staging::set_group_basis(true);
     let mut d = Driver::start(
         "create table public.src (id integer primary key, g integer, v integer, \
          m numeric(12, 2)); create index on public.src (g)",

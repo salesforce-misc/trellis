@@ -3,9 +3,9 @@
 //! staged under the old key are discarded by the resume, never decoded
 //! against the new one, and the rebuild reads the table now at the name.
 //!
-//! The per-row ledger aggregate and the 1-1 target; the group basis and a
-//! `JOIN` are in `group_basis_resume_after_source_key_change.rs`, since its
-//! knob is process-wide. Every pass, build and drain is stepped by hand.
+//! The aggregate and the 1-1 target; a `JOIN` is in
+//! `group_basis_resume_after_source_key_change.rs`. Every pass, build and
+//! drain is stepped by hand.
 //! Nothing polls for convergence (#297).
 
 #[path = "support/resume_passes.rs"]

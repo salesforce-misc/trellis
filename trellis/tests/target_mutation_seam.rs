@@ -1447,9 +1447,8 @@ async fn a_seam_fed_build_plans_no_chunk_until_the_writer_open_at_its_fence_ends
 
     // The plan job takes its fence, and plans nothing while the writer is
     // open. Its claim is given back, so nothing is claimable either.
-    let mut merges = build::MergeFailures::default();
     assert_eq!(
-        build::work_once(&pool, "worker", &BUILD_OPTIONS, &mut merges)
+        build::work_once(&pool, "worker", &BUILD_OPTIONS)
             .await
             .expect("the plan job's first step"),
         Step::Planned
@@ -1477,7 +1476,7 @@ async fn a_seam_fed_build_plans_no_chunk_until_the_writer_open_at_its_fence_ends
         "the status names the fence"
     );
     assert_eq!(
-        build::work_once(&pool, "worker", &BUILD_OPTIONS, &mut merges)
+        build::work_once(&pool, "worker", &BUILD_OPTIONS)
             .await
             .expect("a step while the fence is pending"),
         Step::Idle,
@@ -1748,68 +1747,6 @@ async fn a_rebuild_over_a_seam_fed_aggregate_keeps_its_null_keyed_groups() {
     );
 }
 
-/// #625 F6 with F-A5: a chunk of a build over a seam-fed aggregate source
-/// that fails on its data narrows to the key that fails, whatever
-/// `NULL`-keyed rows lie in its range. The source's `a` is even, so
-/// `(121, NULL)` lies strictly between two keys' first parts, in every range
-/// that holds `(122, 2)`, say, as its one key: a chunk that read it would
-/// fail on it, the narrowing (which counts no `NULL`-keyed row) would pin the
-/// failure on `(122, 2)`, and the chunk would go on failing. Here `(300, 0)`
-/// overflows `x + x`, and `(121, NULL)` does too. The chunk leaves the latter
-/// out, as the narrowing counts it out, so the failure is pinned on
-/// `(300, 0)`, and the staged page that re-derives `(121, NULL)` quarantines
-/// that key in turn. The build finishes without them and the target is the
-/// oracle over everything else.
-#[tokio::test]
-#[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
-async fn a_failing_chunk_over_a_seam_fed_source_is_narrowed_past_its_null_keyed_rows() {
-    let (mut d, u_columns) = nullable_keyed_upstream(
-        "insert into public.src select i, 2 * i, i % 3, i from generate_series(1, 300) i; \
-         update public.src set x = 2147483647 where id = 150; \
-         insert into public.src values (301, null, 1, 5), (302, 121, null, 2147483647), \
-                                       (303, 123, null, 7)",
-        "MAX",
-    )
-    .await;
-    build_over_u(
-        &mut d,
-        &u_columns,
-        "TRANSFORM w FROM public.u GROUP BY b WITHOUT SOURCE INDEX SELECT SUM(x + x) AS doubled, COUNT(*) AS n",
-        "w",
-    )
-    .await;
-    let quarantined: Vec<String> = text_rows(
-        &d.ctl,
-        "select key from poison p join transform_definitions t on t.id = p.transform_id \
-         where split_part(t.target_table, '.', 2) = 'w' order by key",
-    )
-    .await;
-    assert_eq!(
-        quarantined.len(),
-        2,
-        "the two overflowing keys, and no other: {quarantined:?}"
-    );
-    assert_eq!(
-        quarantined,
-        ["121\u{1f}\u{1}", "300\u{1f}0"],
-        "the NULL-parted key and the one the chunk narrowed to"
-    );
-    assert_eq!(
-        text_rows(
-            &d.ctl,
-            "select (b, doubled, n)::text from public.w order by b"
-        )
-        .await,
-        text_rows(
-            &d.ctl,
-            "select (b, sum(x + x::bigint), count(*))::text from public.u \
-             where x <> 2147483647 group by b order by b"
-        )
-        .await,
-        "w is the oracle over every key the build didn't quarantine"
-    );
-}
-
 /// #625 F6: only a seam-fed source's build is fenced. A captured source has
 /// no writer that can commit unseen by the build (its page reads the
 /// definition list after the seal fence), so its plan job takes no fence and
@@ -1852,14 +1789,9 @@ async fn a_captured_sources_build_takes_no_fence_and_waits_for_no_transaction() 
         .expect("start the build");
     assert_eq!(taken, vec![id]);
     assert_eq!(
-        build::work_once(
-            &pool,
-            "worker",
-            &BUILD_OPTIONS,
-            &mut build::MergeFailures::default()
-        )
-        .await
-        .expect("the plan job"),
+        build::work_once(&pool, "worker", &BUILD_OPTIONS)
+            .await
+            .expect("the plan job"),
         Step::Planned
     );
     assert_eq!(
@@ -1877,71 +1809,6 @@ async fn a_captured_sources_build_takes_no_fence_and_waits_for_no_transaction() 
         None
     );
     open.rollback().await.expect("end the old transaction");
-}
-
-/// #625 F6: a rebuild's sweep reads a nullable-keyed source (another
-/// aggregate's target) by every column of each key, a `NULL` part
-/// included. Its keys go in one statement per pattern of `NULL` parts, each
-/// matching its `NULL` columns by `is null` and the rest by `=`: a
-/// `NULL`-safe `or` per column in one statement for every key left the
-/// source's index condition without the key's columns, and read the source
-/// whole per batch.
-#[tokio::test]
-#[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
-async fn the_sweep_reads_a_nullable_keyed_source_by_its_whole_key() {
-    let (d, u_columns) = nullable_keyed_upstream(
-        "insert into public.src select i, i % 4, i, i from generate_series(1, 20000) i; \
-         insert into public.src values (20001, null, 5, 1), (20002, 3, null, 1), \
-                                       (20003, null, null, 1)",
-        "MAX",
-    )
-    .await;
-    install_definition(
-        d.pool(),
-        "TRANSFORM w FROM public.u GROUP BY b WITHOUT SOURCE INDEX SELECT SUM(x) AS total, COUNT(*) AS n",
-        &u_columns,
-        "public",
-    )
-    .await
-    .expect("register the downstream");
-    d.ctl
-        .batch_execute("analyze public.u")
-        .await
-        .expect("analyze the source");
-    let plan = d.build_plan("w").await;
-    // `\u{1f}` separates a key's parts, and `\u{1}` is a `NULL` part.
-    let keys = [
-        "1\u{1f}5",
-        "2\u{1f}6",
-        "\u{1}\u{1f}5",
-        "3\u{1f}\u{1}",
-        "\u{1}\u{1f}\u{1}",
-    ];
-    let mut client = d.db.pool.get().await.expect("pool");
-    let txn = client.transaction().await.expect("begin");
-    let plans = build::explain_rederive(&txn, &plan, Some("0\u{1f}0"), "3\u{1f}20000", &keys)
-        .await
-        .expect("explain the Re-derive statements");
-    txn.rollback().await.expect("roll back");
-    let sweeps: Vec<&String> = plans
-        .iter()
-        .filter(|(statement, _)| *statement == "sweep statement")
-        .map(|(_, explained)| explained)
-        .collect();
-    assert_eq!(
-        sweeps.len(),
-        4,
-        "one statement per pattern of NULL parts: {plans:#?}"
-    );
-    for explained in sweeps {
-        let reads_u_by_its_key = explained.lines().any(|line| {
-            line.contains("Index Cond") && line.contains("(a ") && line.contains("(b ")
-        });
-        assert!(
-            reads_u_by_its_key && !explained.contains("Seq Scan on u"),
-            "the sweep reads u by both key columns:\n{explained}"
-        );
-    }
 }
 
 /// #625 F6: a seam writer's check for readers comes after its transaction
@@ -1984,14 +1851,9 @@ async fn a_writer_that_checked_for_readers_before_a_seam_fed_build_holds_its_fen
         .expect("start the downstream's build");
     assert_eq!(taken, vec![id]);
     assert_eq!(
-        build::work_once(
-            &pool,
-            "worker",
-            &BUILD_OPTIONS,
-            &mut build::MergeFailures::default()
-        )
-        .await
-        .expect("the plan job's first step"),
+        build::work_once(&pool, "worker", &BUILD_OPTIONS)
+            .await
+            .expect("the plan job's first step"),
         Step::Planned
     );
     assert_eq!(

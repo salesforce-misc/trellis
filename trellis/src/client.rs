@@ -1975,8 +1975,6 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
     let mut wake = WakeListener::spawn(dsn.clone(), schema.clone(), wake_channel.clone());
 
     let mut drain_failures = DrainFailures::default();
-    // The group-delta merges that failed on this worker, backing off (#901).
-    let mut merge_failures = staging::build::MergeFailures::default();
     let mut backoff = IdleBackoff::new(poll_interval, idle_wake_cap);
 
     loop {
@@ -2015,7 +2013,6 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
                     chunk_heartbeat_interval,
                     reclaim_ttl,
                     &build_options,
-                    &mut merge_failures,
                 )
                 .await;
                 // Only here is the worker idle: no segment to look at (a
@@ -2104,7 +2101,6 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
                     chunk_heartbeat_interval,
                     reclaim_ttl,
                     &build_options,
-                    &mut merge_failures,
                 )
                 .await,
                 BuildStep::Progress
@@ -2143,7 +2139,6 @@ async fn build_step(
     chunk_heartbeat_interval: Duration,
     reclaim_ttl: Duration,
     build_options: &staging::build::WorkerOptions,
-    merge_failures: &mut staging::build::MergeFailures,
 ) -> BuildStep {
     // One probe when there is nothing to do (#273): the two steps below
     // would each look, on every idle wake. An error is not "nothing": run
@@ -2151,13 +2146,12 @@ async fn build_step(
     if let Ok(probe) = staging::build::work_probe(pool).await
         && !probe.may_exist
     {
-        merge_failures.clear();
         return BuildStep::Idle {
             next_due: probe.next_due,
         };
     }
     let old = drain_backfill_chunks(pool, claimed_by, chunk_heartbeat_interval, reclaim_ttl).await;
-    let rederive = rederive_build_step(pool, claimed_by, build_options, merge_failures).await;
+    let rederive = rederive_build_step(pool, claimed_by, build_options).await;
     if old || rederive {
         BuildStep::Progress
     } else {
@@ -2339,16 +2333,14 @@ async fn self_check_step(
 /// One step of the running Re-derive builds' work
 /// ([`staging::build::work_once`], #625 F2), after this worker's segments.
 /// Returns whether it did work. A failure of the step itself (not of a chunk,
-/// which `chunk_queue::fail_chunk` records and logs, nor of a merge, which
-/// `merge_failures` backs off and `staging::build` classifies) is logged at
+/// which `chunk_queue::fail_chunk` records and logs) is logged at
 /// warn and retried on the next pass.
 async fn rederive_build_step(
     pool: &Pool,
     claimed_by: &str,
     options: &staging::build::WorkerOptions,
-    merge_failures: &mut staging::build::MergeFailures,
 ) -> bool {
-    match staging::build::work_once(pool, claimed_by, options, merge_failures).await {
+    match staging::build::work_once(pool, claimed_by, options).await {
         Ok(step) => step.progressed(),
         Err(error) => {
             crate::instance_log::warn!(

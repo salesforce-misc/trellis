@@ -2,17 +2,12 @@
 //!
 //! A reader of a Trellis target can hold a key for a failure the upstream
 //! caused while it was being rebuilt: between a source rewrite and the
-//! upstream's rebuild, the upstream's copy of `bit(5)` holds 5- and 8-bit
-//! values together, and a chained `BIT_AND` raises "cannot AND bit strings
-//! of different sizes". Once the upstream's build completes, the staging
+//! upstream's rebuild, the upstream's copy of a column holds values of two
+//! widths together, and a reader's write raises. Once the upstream's build completes, the staging
 //! worker releases every key its direct readers hold, with the automatic
 //! retry's semantics. Every step is an explicit pass, build or drain;
 //! nothing polls for convergence (#297).
 //!
-//! On the group basis, which refuses `BIT_AND`: the chained `BIT_AND`
-//! scenario runs in `upstream_build_releases_ledger.rs` alone, with the
-//! basis off, in its own process, since the knob is process-wide; that file
-//! also runs the aggregate-upstream scenario with it off.
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
@@ -21,15 +16,13 @@ mod upstream_releases;
 
 use upstream_releases::*;
 
-const GROUP_BASIS: bool = true;
-
 /// The release is asked for in the build's own transaction and made by the
 /// pass after it: a worker that stops in between (here, a pass on a fresh
 /// session after the build completed with no pass of its own) still makes
 /// it.
 #[tokio::test]
 async fn a_release_the_build_asked_for_survives_a_worker_stop() {
-    let (mut d, trellis) = persistently_held(GROUP_BASIS).await;
+    let (mut d, trellis) = persistently_held().await;
     trellis
         .request_backfill("public.t")
         .await
@@ -67,7 +60,7 @@ async fn a_release_the_build_asked_for_survives_a_worker_stop() {
 /// not a fresh run of deaths.
 #[tokio::test]
 async fn a_persistent_failure_is_retried_once_per_upstream_backfill() {
-    let (mut d, trellis) = persistently_held(GROUP_BASIS).await;
+    let (mut d, trellis) = persistently_held().await;
     trellis
         .request_backfill("public.t")
         .await
@@ -86,7 +79,7 @@ async fn a_persistent_failure_is_retried_once_per_upstream_backfill() {
 /// The same for the build a `RESUME` of the upstream runs.
 #[tokio::test]
 async fn a_persistent_failure_is_retried_once_per_upstream_resume() {
-    let (mut d, trellis) = persistently_held(GROUP_BASIS).await;
+    let (mut d, trellis) = persistently_held().await;
     trellis.apply("PAUSE TRANSFORM up").await.expect("pause up");
     trellis
         .apply("RESUME TRANSFORM up")
@@ -107,7 +100,7 @@ async fn a_persistent_failure_is_retried_once_per_upstream_resume() {
 /// `RESUME` releases them.
 #[tokio::test]
 async fn a_paused_reader_keeps_its_keys_through_an_upstream_build() {
-    let (mut d, trellis) = persistently_held(GROUP_BASIS).await;
+    let (mut d, trellis) = persistently_held().await;
     trellis.apply("PAUSE TRANSFORM r").await.expect("pause r");
     trellis
         .request_backfill("public.t")
@@ -125,5 +118,5 @@ async fn a_paused_reader_keeps_its_keys_through_an_upstream_build() {
 
 #[tokio::test]
 async fn a_persistent_failure_is_retried_once_per_aggregate_upstream_resume() {
-    persistent_failure_retried_once_per_aggregate_upstream_resume(GROUP_BASIS).await;
+    persistent_failure_retried_once_per_aggregate_upstream_resume().await;
 }

@@ -7,7 +7,7 @@
 //! leaves. The `measure_` tests are `#[ignore]`d measurements that print
 //! `MEASURE` lines: run them one at a time under `logbook reserve`, the
 //! bench lock and a memory cap. Nothing waits for convergence (#297): the
-//! pass, the ring, the correction engine and the merger are driven by hand.
+//! pass, the ring and the correction engine are driven by hand.
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
@@ -26,7 +26,6 @@ use trellis::capture::reconcile::PassOutcome;
 use trellis::capture::sql::CaptureSpec;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::{ValueType, install_definition};
-use trellis::staging::build;
 use trellis::staging::partition_correction::{self, Options};
 
 const SOURCE: &str = "public.items";
@@ -48,8 +47,16 @@ struct Fx {
 
 impl Fx {
     async fn start(ddl: &str) -> Fx {
-        let d = Driver::start(ddl, &columns(), &[DEFINITION], &[SOURCE]).await;
-        Fx { d }
+        let (schema, seed) = drain_driver::split_seed(ddl);
+        let d = Driver::start(&schema, &columns(), &[DEFINITION], &[SOURCE]).await;
+        let mut fx = Fx { d };
+        // The first sight of the source records its tree; the rows follow.
+        fx.pass().await;
+        if !seed.trim_matches(';').trim().is_empty() {
+            fx.exec(&seed).await;
+            fx.d.settle().await;
+        }
+        fx
     }
 
     /// The capture half of one staging-worker pass.
@@ -148,8 +155,6 @@ async fn triggers_per_node(client: &Client) -> Vec<i64> {
 /// exact under writes named on the root and on a leaf.
 #[tokio::test]
 async fn a_hundred_and_one_leaf_source_installs_node_by_node_and_stays_exact() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
     const LEAVES: usize = 101;
     const { assert!(LEAVES + 1 > SINGLE_TRANSACTION_TABLES) };
     let mut fx = Fx::start(&range_tree(LEAVES, 2)).await;
@@ -190,8 +195,6 @@ async fn a_hundred_and_one_leaf_source_installs_node_by_node_and_stays_exact() {
 #[tokio::test]
 #[ignore = "a measurement: run with logbook reserve and a memory cap"]
 async fn measure_the_lock_table_limit_of_one_statement() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let client = connect(db.dsn()).await;
@@ -304,14 +307,12 @@ fn ms(d: Duration) -> f64 {
 }
 
 /// `--ignored`: the supported limit, measured on one 1,000-leaf source
-/// (ADR-0017's figures): define, build and backfill; the build statements'
-/// planning and locks; each pass's fingerprints and sweep; the correction
+/// (ADR-0017's figures): define, build and backfill; each pass's fingerprints
+/// and sweep; the correction
 /// of a dropped 1,000,000-row leaf; and a tree grown to 1,001 leaves.
 #[tokio::test]
 #[ignore = "a measurement: run with logbook reserve and a memory cap"]
 async fn measure_a_thousand_leaf_source() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
     let started = Instant::now();
     let mut fx = Fx::start(&thousand_leaves()).await;
     let phases: Vec<String> =
@@ -337,70 +338,6 @@ async fn measure_a_thousand_leaf_source() {
         )
         .await;
     eprintln!("MEASURE lock_table_slots={slots}");
-
-    // The build statements: planning (an `explain` of the chunk and the
-    // Re-derive statements, cold and then with the locks held) and the
-    // locks one chunk holds to commit.
-    let plan = fx.d.build_plan("agg").await;
-    let keys: Vec<String> =
-        fx.d.ctl
-            .query(
-                "select __from_key from public.agg__ledger order by g, __from_key limit 10",
-                &[],
-            )
-            .await
-            .expect("keys")
-            .iter()
-            .map(|r| r.get(0))
-            .collect();
-    let hi = keys.last().expect("a key").clone();
-    let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
-    for round in 0..3 {
-        let mut client = fx.d.pool().get().await.expect("pool");
-        let txn = client.transaction().await.expect("begin");
-        let mut times = Vec::new();
-        for _ in 0..2 {
-            let t = Instant::now();
-            let plans = build::explain_rederive(&txn, &plan, None, &hi, &key_refs)
-                .await
-                .expect("explain");
-            times.push(format!("{:.1}", ms(t.elapsed()) / plans.len() as f64));
-        }
-        let locks: i64 = txn
-            .query_one(
-                "select count(*) from pg_locks where pid = pg_backend_pid() \
-                 and locktype = 'relation'",
-                &[],
-            )
-            .await
-            .expect("locks")
-            .get(0);
-        txn.rollback().await.expect("roll back");
-        let txn = client.transaction().await.expect("begin");
-        let t = Instant::now();
-        let outcome = build::run_chunk(&txn, &plan, None, &hi)
-            .await
-            .expect("a chunk");
-        let chunk = t.elapsed();
-        let row = txn
-            .query_one(
-                "select count(*), count(*) filter (where fastpath) from pg_locks \
-                 where pid = pg_backend_pid() and locktype = 'relation'",
-                &[],
-            )
-            .await
-            .expect("locks");
-        let (chunk_locks, fastpath): (i64, i64) = (row.get(0), row.get(1));
-        txn.rollback().await.expect("roll back");
-        eprintln!(
-            "MEASURE build round={round} explain_ms_per_statement_cold,warm={} \
-             explain_relation_locks={locks} chunk_keys={} chunk_ms={:.1} \
-             chunk_relation_locks={chunk_locks} fastpath={fastpath}",
-            times.join(","),
-            outcome.keys,
-            ms(chunk),
-        );
-    }
 
     // Each pass: the first records the tree; then steady passes with nothing
     // changed, and a deep check after a simulated restart.
@@ -500,21 +437,19 @@ async fn measure_a_thousand_leaf_source() {
     let engine = t.elapsed();
     let middle = wal(&fx).await;
     let t = Instant::now();
-    let plan = fx.d.build_plan("agg").await;
-    fx.d.merge_all(&plan).await;
     fx.d.settle().await;
-    let merge = t.elapsed();
+    let settle = t.elapsed();
     let after = wal(&fx).await;
     eprintln!(
         "MEASURE correction leaf_rows=1000000 detect_pass_ms={:.1} deep_checks={} keys={} \
-         pages={} engine_s={:.2} engine_wal_mb={:.0} merge_s={:.2} merge_wal_mb={:.0}",
+         pages={} engine_s={:.2} engine_wal_mb={:.0} settle_s={:.2} settle_wal_mb={:.0}",
         ms(detect),
         outcome.partition_deep_checks.len(),
         corrected.keys,
         corrected.pages,
         engine.as_secs_f64(),
         (middle - before) as f64 / 1e6,
-        merge.as_secs_f64(),
+        settle.as_secs_f64(),
         (after - middle) as f64 / 1e6,
     );
     assert_eq!(fx.wrong_groups().await, Vec::<String>::new());
@@ -612,8 +547,6 @@ fn landed<T>(progress: Progress<T>) -> T {
 #[tokio::test]
 #[ignore = "a measurement: run with logbook reserve and a memory cap"]
 async fn measure_a_thousand_leaf_install_node_by_node_and_in_one_transaction() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect(db.dsn()).await;
@@ -696,8 +629,6 @@ async fn measure_a_thousand_leaf_install_node_by_node_and_in_one_transaction() {
 #[tokio::test]
 #[ignore = "a measurement: run with logbook reserve and a memory cap"]
 async fn measure_per_write_capture_cost_at_a_thousand_leaves() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
     const WRITES: i32 = 3000;
     let cluster = TestCluster::start();
     let mut cases = Vec::new();

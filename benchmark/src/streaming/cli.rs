@@ -107,8 +107,6 @@ const REACH_DEFAULT_DURATION: Duration = Duration::from_secs(10);
 ///   a mismatch;
 /// - `--progress-secs` (30; 0 turns it off): how often stderr gets an RSS
 ///   progress line;
-/// - `--min-max`: the definition also has `MIN(amt)` and `MAX(amt)`,
-///   recomputed fields (#625 F5);
 /// - `--one-to-one`: the definition is a 1-1 target, `SELECT grp AS grp,
 ///   amt + amt AS dbl`, instead of the aggregate (#625 F8a);
 /// - `--apply-latency` (with `--one-to-one`): once it is `live`, time every
@@ -148,7 +146,6 @@ fn build_under_load_config(args: &[String]) -> build_under_load::BuildUnderLoad 
         grace: secs(args, "--grace-secs").unwrap_or(Duration::from_secs(600)),
         oracle_poll_min: secs(args, "--oracle-poll-min-secs").unwrap_or(Duration::from_secs(5)),
         progress: (progress > 0.0).then(|| Duration::from_secs_f64(progress)),
-        min_max: args.iter().any(|a| a == "--min-max"),
         one_to_one: args.iter().any(|a| a == "--one-to-one"),
         apply_latency: args.iter().any(|a| a == "--apply-latency"),
     }
@@ -368,15 +365,6 @@ fn writer_runtime() -> tokio::runtime::Runtime {
 /// until it passes. Only a harness- or correctness-level failure is an error.
 pub fn run(name: &str, args: &[String]) -> Option<bool> {
     let runtime = || tokio::runtime::Runtime::new().expect("build tokio runtime");
-    // #1100: every aggregate runs on the group basis. `--ledger` forces the
-    // per-row ledger instead, for this whole run (the engine's dev knob, set
-    // once before any client starts): the same-session control for a
-    // group-basis measurement until #1105 deletes the ledger.
-    if args.iter().any(|a| a == "--ledger") {
-        trellis::dev::staging::set_group_basis(false);
-        eprintln!("group basis: off (--ledger: every aggregate on the per-row ledger)");
-    }
-
     match name {
         "hop-ladder" | "hop-latency" => {
             let depths = if name == "hop-latency" {
@@ -500,17 +488,7 @@ pub fn run(name: &str, args: &[String]) -> Option<bool> {
 
         "group-contention" => {
             let groups = usize_list(args, "--groups", CONTENTION_DEFAULT_GROUPS);
-            // `--aggregate max` measures a recomputed field (#698); the
-            // default `sum` is the incremental path.
-            let aggregate = match flag(args, "--aggregate").unwrap_or("sum") {
-                "sum" => "SUM",
-                // Define refuses `MAX` on the group basis (#1117).
-                "max" if trellis::dev::staging::group_basis_enabled() => {
-                    panic!("--aggregate max needs --ledger: define refuses MAX (#1117)")
-                }
-                "max" => "MAX",
-                other => panic!("--aggregate is sum or max, not {other}"),
-            };
+            let aggregate = "SUM";
             let threads = usize_list(
                 args,
                 "--threads",
@@ -547,10 +525,6 @@ pub fn run(name: &str, args: &[String]) -> Option<bool> {
         // #617's large aggregate build under write load (#620, #629).
         "build-under-load" => {
             let cfg = build_under_load_config(args);
-            assert!(
-                !cfg.min_max || !trellis::dev::staging::group_basis_enabled(),
-                "--min-max needs --ledger: define refuses MIN/MAX (#1117)"
-            );
             let tuning = throughput_tuning(args);
             let result = runtime().block_on(build_under_load::run(cfg, &tuning));
             println!("{}", result.to_json(name));
@@ -571,8 +545,6 @@ pub fn run(name: &str, args: &[String]) -> Option<bool> {
 
         // #1113 J8: #1091 J2's JOIN scenario, with its per-fact control.
         "join" => {
-            // A `JOIN` applies only behind the group-basis knob (#1108).
-            trellis::dev::staging::set_group_basis(true);
             let cfg = join_config(args);
             let tuning = join_tuning(args);
             let outcome = runtime().block_on(join::run(&cfg, &tuning));
@@ -1401,11 +1373,6 @@ mod tests {
         assert_eq!(d.grace, Duration::from_secs(600));
         assert_eq!(d.oracle_poll_min, Duration::from_secs(5));
         assert_eq!(d.progress, Some(Duration::from_secs(30)));
-        assert!(!d.min_max);
-        assert!(
-            build_under_load_config(&argv(&["build-under-load", "--min-max"])).min_max,
-            "--min-max adds MIN and MAX fields"
-        );
         assert!(!d.one_to_one);
         assert!(
             build_under_load_config(&argv(&["build-under-load", "--one-to-one"])).one_to_one,

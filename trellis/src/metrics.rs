@@ -144,10 +144,6 @@ const BUILD_CHUNK_MAX_METRIC: &str = "trellis_build_chunk_seconds_max";
 /// #625 F2: source keys a Re-derive build's chunks re-derived.
 const BUILD_ROWS_METRIC: &str = "trellis_build_rows_total";
 
-/// #625 F2: group-delta rows Re-derive build chunks appended, and that
-/// mergers folded into groups, labeled `step` (`appended`/`merged`).
-const BUILD_DELTA_ROWS_METRIC: &str = "trellis_build_delta_rows_total";
-
 /// #625 F2: Re-derive build chunks that gave up on their entry lock's short
 /// timeout and were released for a retry.
 const BUILD_CHUNK_LOCK_TIMEOUTS_METRIC: &str = "trellis_build_chunk_lock_timeouts_total";
@@ -229,46 +225,22 @@ pub enum BuildStatement {
     /// an entry before its insert.
     ChunkLock,
     /// A chunk's read-and-write statements: the insert of the entries of
-    /// keys with none, and the rewrite of the others' (each the snapshot,
-    /// the entries and the group-delta insert).
+    /// keys with none, and the rewrite of the others'.
     ChunkWrite,
     /// A chunk's commit, and marking it done.
     ChunkCommit,
-    /// A merger pass's catalog reads before its upsert: its definition and
-    /// target plan, a pooled connection, the begin and the definition row's
-    /// `for key share`.
-    MergeSetup,
-    /// The merger's claim, delete, sum and group upsert (one statement).
-    MergeUpsert,
-    /// The merger's rewrite of the recomputed fields of the groups it wrote
-    /// (#625 F5): a fold of the entries that entered each, or a recompute
-    /// from all of its entries.
-    MergeRecompute,
-    /// The merger's all-zero group delete and the seam.
-    MergeFinish,
-    /// The merger's commit.
-    MergeCommit,
-    /// A merger's periodic vacuum of the target's delta table, after its
-    /// commit (#625 F2b, `staging::build::VACUUM_EVERY`).
-    MergeVacuum,
     /// The plan job's boundary walk and chunk inserts.
     Plan,
 }
 
 impl BuildStatement {
     /// Every class, in label order.
-    pub const ALL: [BuildStatement; 12] = [
+    pub const ALL: [BuildStatement; 6] = [
         BuildStatement::ChunkSetup,
         BuildStatement::ChunkKeys,
         BuildStatement::ChunkLock,
         BuildStatement::ChunkWrite,
         BuildStatement::ChunkCommit,
-        BuildStatement::MergeSetup,
-        BuildStatement::MergeUpsert,
-        BuildStatement::MergeRecompute,
-        BuildStatement::MergeFinish,
-        BuildStatement::MergeCommit,
-        BuildStatement::MergeVacuum,
         BuildStatement::Plan,
     ];
 
@@ -280,12 +252,6 @@ impl BuildStatement {
             BuildStatement::ChunkLock => "chunk_lock",
             BuildStatement::ChunkWrite => "chunk_write",
             BuildStatement::ChunkCommit => "chunk_commit",
-            BuildStatement::MergeSetup => "merge_setup",
-            BuildStatement::MergeUpsert => "merge_upsert",
-            BuildStatement::MergeRecompute => "merge_recompute",
-            BuildStatement::MergeFinish => "merge_finish",
-            BuildStatement::MergeCommit => "merge_commit",
-            BuildStatement::MergeVacuum => "merge_vacuum",
             BuildStatement::Plan => "plan",
         }
     }
@@ -310,8 +276,8 @@ pub fn record_join_lock_wait(transform: &str, elapsed: Duration) {
 }
 
 /// Records one committed Re-derive build chunk (#625 F2): its transaction's
-/// duration, the keys it re-derived and the delta rows it appended.
-pub fn record_build_chunk(elapsed: Duration, keys: u64, delta_rows: u64) {
+/// duration and the keys it re-derived.
+pub fn record_build_chunk(elapsed: Duration, keys: u64) {
     ensure_installed();
     let instance = instance();
     metrics::histogram!(BUILD_CHUNK_METRIC, INSTANCE_LABEL => instance.clone())
@@ -324,16 +290,7 @@ pub fn record_build_chunk(elapsed: Duration, keys: u64, delta_rows: u64) {
         .max(nanos);
     metrics::gauge!(BUILD_CHUNK_MAX_METRIC, INSTANCE_LABEL => instance.clone())
         .set(max as f64 / 1e9);
-    metrics::counter!(BUILD_ROWS_METRIC, INSTANCE_LABEL => instance.clone()).increment(keys);
-    metrics::counter!(BUILD_DELTA_ROWS_METRIC, INSTANCE_LABEL => instance, "step" => "appended")
-        .increment(delta_rows);
-}
-
-/// Records group-delta rows a merger folded (#625 F2).
-pub fn record_build_merge(delta_rows: u64) {
-    ensure_installed();
-    metrics::counter!(BUILD_DELTA_ROWS_METRIC, INSTANCE_LABEL => instance(), "step" => "merged")
-        .increment(delta_rows);
+    metrics::counter!(BUILD_ROWS_METRIC, INSTANCE_LABEL => instance).increment(keys);
 }
 
 /// Counts a Re-derive build chunk that gave up on its entry lock (#625 F2).
@@ -448,11 +405,6 @@ fn describe_metrics() {
     metrics::describe_counter!(
         BUILD_ROWS_METRIC,
         "Count of source keys Re-derive build chunks re-derived."
-    );
-    metrics::describe_counter!(
-        BUILD_DELTA_ROWS_METRIC,
-        "Count of group-delta rows Re-derive build chunks appended and mergers folded, labeled \
-         by step (appended/merged)."
     );
     metrics::describe_counter!(
         BUILD_CHUNK_LOCK_TIMEOUTS_METRIC,
@@ -846,7 +798,7 @@ mod tests {
     /// them.
     #[test]
     fn build_chunk_seconds_render_with_their_own_buckets() {
-        record_build_chunk(Duration::from_millis(150), 10, 3);
+        record_build_chunk(Duration::from_millis(150), 10);
 
         let rendered = Metrics::new().render_prometheus();
         for le in ["0.125", "0.16", "0.2"] {
@@ -939,8 +891,7 @@ mod tests {
     fn record_everything() {
         record_build_statement(BuildStatement::Plan, Duration::from_millis(1));
         record_join_lock_wait("t", Duration::from_millis(1));
-        record_build_chunk(Duration::from_millis(1), 1, 1);
-        record_build_merge(1);
+        record_build_chunk(Duration::from_millis(1), 1);
         increment_build_chunk_lock_timeouts();
         increment_column_pause_lock_timeouts("pause");
         increment_seal_refused();
@@ -1007,12 +958,12 @@ mod tests {
             let (a, b) = (name("gauge_a/trellis"), name("gauge_b/trellis"));
             instance_log::run_scoped(&a, || {
                 set_staging_segments("active", 3);
-                record_build_chunk(Duration::from_secs(5), 1, 1);
-                record_build_chunk(Duration::from_secs(2), 1, 1);
+                record_build_chunk(Duration::from_secs(5), 1);
+                record_build_chunk(Duration::from_secs(2), 1);
             });
             instance_log::run_scoped(&b, || {
                 set_staging_segments("active", 9);
-                record_build_chunk(Duration::from_secs(1), 1, 1);
+                record_build_chunk(Duration::from_secs(1), 1);
             });
 
             let rendered = render();
@@ -1058,7 +1009,6 @@ mod tests {
                 BUILD_CHUNK_METRIC,
                 BUILD_CHUNK_MAX_METRIC,
                 BUILD_ROWS_METRIC,
-                BUILD_DELTA_ROWS_METRIC,
                 BUILD_CHUNK_LOCK_TIMEOUTS_METRIC,
                 COLUMN_PAUSE_LOCK_TIMEOUTS_METRIC,
                 SEAL_REFUSED_METRIC,
@@ -1157,7 +1107,7 @@ mod tests {
             for instance in [&running, &stopped] {
                 instance_log::run_scoped(instance, || {
                     set_staging_segments("active", 1);
-                    record_build_chunk(Duration::from_millis(7), 1, 1);
+                    record_build_chunk(Duration::from_millis(7), 1);
                 });
             }
             let first = render();

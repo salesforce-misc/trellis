@@ -87,9 +87,6 @@ pub async fn run(cfg: Config, tuning: &EngineTuning) {
     if cfg.join {
         return run_join(cfg, tuning).await;
     }
-    if cfg.aggregate {
-        trellis::dev::staging::set_group_basis(true);
-    }
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
@@ -358,7 +355,6 @@ async fn probe(raw: &RawClient, cfg: &Config) {
 async fn run_join(cfg: Config, tuning: &EngineTuning) {
     use trellis::IntWidth::{Int4, Int8};
     use trellis::dev::defs::ValueType::Integer;
-    trellis::dev::staging::set_group_basis(true);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;

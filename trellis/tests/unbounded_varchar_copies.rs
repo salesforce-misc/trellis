@@ -7,7 +7,7 @@
 //! re-typed the copy: a 1-1 key would upsert into the row of `'abcde'`, a
 //! passthrough would lose its spaces. The tests widen the source and write
 //! such a value with no pass in between, then drain, and check that no table
-//! Trellis creates without the group-basis knob holds a bounded `varchar`
+//! Trellis creates for a 1-1 target holds a bounded `varchar`
 //! (`join_schema_changes.rs` checks the `JOIN` and group-basis tables). The pipeline and the
 //! pass are stepped by hand (`support/drain_driver.rs`), and nothing polls for
 //! convergence (#297).

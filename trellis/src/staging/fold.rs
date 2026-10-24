@@ -189,9 +189,6 @@ pub struct FoldedChange {
     /// f(old)` per row and never folds per key (#1043 F2), so it needs every
     /// row, not the fold's endpoints. A union across rows:
     /// [`merge_folded_changes`] concatenates it.
-    ///
-    /// Filled only while the group-basis knob is on
-    /// ([`super::group_basis::enabled`]), for every key; empty otherwise.
     pub group_sides: Vec<String>,
 }
 
@@ -530,7 +527,7 @@ fn fold_sql(
     // position on before the next statement's trigger reads it. The truncate
     // floor depends on that, since it refuses every change at or below the
     // truncate's `lsn` (`a_truncate_then_an_insert_in_one_transaction_*` in
-    // `tests/ledger_interleavings.rs` pins it). `change_id` (the ring's
+    // `tests/one_to_one_ledger_interleavings.rs` pins it). `change_id` (the ring's
     // append order) only breaks a tie capture doesn't produce.
     //
     // Load-bearing subtlety: a recompute row's `lsn` is NULL, and Postgres's
@@ -588,16 +585,12 @@ fn fold_sql(
                                     or op = 'delete') \
                                and op <> 'recompute'))";
     // #1100: a group-basis aggregate's unfolded rows (`FoldedChange::group_sides`).
-    // The knob is read when the statement is rendered, so with it off the
-    // column is a constant and costs the fold nothing.
-    let group_sides = if super::group_basis::enabled() {
+    let group_sides = {
         "array_agg(json_build_object('t', row_txid::text, 'l', lsn::text, 'op', op, \
                                      'o', old_image::json, 'n', new_image::json, \
                                      'x', transition_images::json)::text \
                    order by lsn, change_id) \
              filter (where op in ('insert', 'update', 'delete', 'recompute'))"
-    } else {
-        "null::text[]"
     };
     format!(
         "with fenced as ({window_sql}), \

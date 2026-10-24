@@ -15,9 +15,7 @@
 //!
 //! Each shape: the relabel pauses it with the reason, and `RESUME` then
 //! gives zero oracle difference, no held key and `self_check` `Converged`.
-//! The ledger `GROUP BY` path, which needs the group-basis knob off, is
-//! `capture_enum_relabel_ledger.rs`. Every step is explicit; nothing polls
-//! (#297).
+//! Every step is explicit; nothing polls (#297).
 
 #[path = "support/relabel.rs"]
 mod relabel;
@@ -33,7 +31,6 @@ use trellis::defs::TransformStatus;
 /// rebuild.
 #[tokio::test]
 async fn a_passthrough_beside_an_aggregate_pauses_and_resumes_exactly() {
-    trellis::dev::staging::set_group_basis(true);
     let mut h = H::new(
         "create table public.s (id int primary key, tone public.tone, g int, n int); \
          create index on public.s (g); \
@@ -94,7 +91,6 @@ const ENUM_KEYED_ORACLE: &str = "select tone::text, n from public.k";
 /// a later `request_backfill` succeeds.
 #[tokio::test]
 async fn an_enum_keyed_one_to_one_with_nothing_pending_rebuilds_and_backfills_later() {
-    trellis::dev::staging::set_group_basis(true);
     let mut h = H::new(ENUM_KEYED, &["TRANSFORM kt FROM public.k SELECT n AS n"]).await;
     h.assert_exact("kt", ENUM_KEYED_TARGET, ENUM_KEYED_ORACLE)
         .await;
@@ -129,7 +125,6 @@ async fn an_enum_keyed_one_to_one_with_nothing_pending_rebuilds_and_backfills_la
 /// re-derives the old label's key and fails (the mutation check).
 #[tokio::test]
 async fn an_enum_keyed_one_to_one_with_changes_pending_resumes_exactly() {
-    trellis::dev::staging::set_group_basis(true);
     let mut h = H::new(ENUM_KEYED, &["TRANSFORM kt FROM public.k SELECT n AS n"]).await;
     h.write("update public.k set n = 10 where tone = 'brisk'; delete from public.k where tone = 'calm'; insert into public.k values ('calm', 3)")
         .await;
@@ -154,7 +149,6 @@ async fn an_enum_keyed_one_to_one_with_changes_pending_resumes_exactly() {
 /// definition re-derives the old label and holds the key.
 #[tokio::test]
 async fn an_enum_keyed_one_to_one_waits_for_a_pending_recompute_of_the_old_label() {
-    trellis::dev::staging::set_group_basis(true);
     let mut h = H::new(ENUM_KEYED, &["TRANSFORM kt FROM public.k SELECT n AS n"]).await;
     // Hold 'brisk' with a constraint its write breaks, then release it: the
     // release stages a `recompute` keyed 'brisk'.
@@ -187,7 +181,6 @@ async fn an_enum_keyed_one_to_one_waits_for_a_pending_recompute_of_the_old_label
 /// relabel and the resume made before it drains.
 #[tokio::test]
 async fn a_group_basis_group_by_the_enum_with_a_change_pending_resumes_exactly() {
-    trellis::dev::staging::set_group_basis(true);
     let mut h = H::new(
         "create table public.s (id int primary key, tone public.tone, n int); \
          create index on public.s (tone); \
@@ -217,7 +210,6 @@ async fn a_group_basis_group_by_the_enum_with_a_change_pending_resumes_exactly()
 /// A `JOIN` grouped by the enum, with a change staged across the relabel.
 #[tokio::test]
 async fn a_join_grouped_by_the_enum_with_a_change_pending_resumes_exactly() {
-    trellis::dev::staging::set_group_basis(true);
     let mut h = H::new(
         "create table public.items (id int primary key, tone public.tone); \
          create table public.notes (id int primary key, item_id int); \
@@ -253,7 +245,6 @@ async fn a_join_grouped_by_the_enum_with_a_change_pending_resumes_exactly() {
 /// new value is recorded, and a write of it applies.
 #[tokio::test]
 async fn a_new_value_pauses_nothing_and_is_recorded() {
-    trellis::dev::staging::set_group_basis(true);
     let mut h = H::new(
         "create table public.s (id int primary key, tone public.tone); \
          create index on public.s (tone); \
@@ -302,7 +293,6 @@ async fn a_new_value_pauses_nothing_and_is_recorded() {
 /// now does.
 #[tokio::test]
 async fn a_relabel_of_a_type_no_longer_read_pauses_nothing() {
-    trellis::dev::staging::set_group_basis(true);
     let mut h = H::new(
         "create type public.mood as enum ('brisk', 'calm'); \
          create table public.s (id int primary key, tone public.tone, n int); \
@@ -360,7 +350,6 @@ async fn a_relabel_of_a_type_no_longer_read_pauses_nothing() {
 /// staged changes and rebuilds from empty.
 #[tokio::test]
 async fn an_operator_pause_takes_the_relabel_record() {
-    trellis::dev::staging::set_group_basis(true);
     let mut h = H::new(ENUM_KEYED, &["TRANSFORM kt FROM public.k SELECT n AS n"]).await;
     h.trellis.apply("PAUSE TRANSFORM kt").await.expect("pause");
     h.write("update public.k set n = 10 where tone = 'brisk'")

@@ -241,7 +241,6 @@ async fn lab(key: Key, kinds: &[Kind]) -> Lab {
 }
 
 async fn lab_with_defaults(key: Key, kinds: &[Kind], defaults: &[(&str, &str)]) -> Lab {
-    trellis::dev::staging::set_group_basis(true);
     let definitions: Vec<String> = kinds.iter().map(|k| k.definition(key)).collect();
     let definitions: Vec<&str> = definitions.iter().map(String::as_str).collect();
     let d = Driver::start_with_database_defaults(
@@ -1478,7 +1477,6 @@ async fn rv2_pages_read_committed_whatever_the_default() {
 /// while its row count is above 0.
 #[tokio::test]
 async fn composed_fields_expression_arguments_and_numeric_scale() {
-    trellis::dev::staging::set_group_basis(true);
     let mut d = Driver::start(
         "create table public.o (id integer primary key, cid integer, qty integer, \
                                 amount numeric(10, 2)); \
@@ -2725,7 +2723,6 @@ async fn zero_t_group_collection_against_a_build() {
 /// ("Partitioned sides" below).
 #[tokio::test]
 async fn a_partitioned_side_with_no_rows_builds_whole() {
-    trellis::dev::staging::set_group_basis(true);
     let ddl = "create table public.a (id integer not null, ga integer, t integer, \
                    k integer not null, x integer, primary key (k, id)) partition by list (k); \
                create table public.a0 partition of public.a for values in (1, 2); \
@@ -2764,7 +2761,6 @@ async fn a_partitioned_side_with_no_rows_builds_whole() {
 /// have no `NULL` part: a 1-1 reader can't hold one, #1141.)
 #[tokio::test]
 async fn a_join_target_feeds_its_readers_through_the_seam() {
-    trellis::dev::staging::set_group_basis(true);
     let int8 = ValueType::Integer(IntWidth::Int8);
     let mut d = Driver::start(
         DDL,
@@ -2813,7 +2809,6 @@ async fn a_join_target_feeds_its_readers_through_the_seam() {
 /// key, with a fact whose key has a `NULL` part.
 #[tokio::test]
 async fn a_truncate_of_the_joined_side_refills_typed_unmatched_groups() {
-    trellis::dev::staging::set_group_basis(true);
     let mut d = Driver::start(
         "create table public.o (id integer primary key, cid text, rid integer, \
                                 region text, amount numeric(10, 2)); \
@@ -2959,7 +2954,6 @@ async fn seeded(key: Key, kinds: &[Kind], seed: &str) -> Lab {
 
 /// [`seeded`] over tables created by `ddl`.
 async fn seeded_in(ddl: &str, key: Key, kinds: &[Kind], seed: &str) -> Lab {
-    trellis::dev::staging::set_group_basis(true);
     let definitions: Vec<String> = kinds.iter().map(|k| k.definition(key)).collect();
     let definitions: Vec<&str> = definitions.iter().map(String::as_str).collect();
     let d = Driver::start_unbuilt(
@@ -4076,7 +4070,6 @@ async fn build_job_lifecycle() {
 /// definition stays `backfilling`, and the retry converges.
 #[tokio::test]
 async fn build_a_lock_timeout_is_retried() {
-    trellis::dev::staging::set_group_basis(true);
     let d = Driver::start_unbuilt(
         &[("lock_timeout", "300ms")],
         &format!("{DDL}; {BUILD_SEED}"),

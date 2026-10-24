@@ -367,13 +367,8 @@ fn join_sweep_tier() -> SweepTier {
          steady-load and mid-burst tiers gate it",
     )];
     not_gated.extend(not_on_path(
-        &[
-            PlantPath::Ledger,
-            PlantPath::OneToOne,
-            PlantPath::OneToOneOrLedger,
-            PlantPath::GroupBasis,
-        ],
-        "it breaks a 1-1, ledger or plain group-basis aggregate path, and the JOIN tier \
+        &[PlantPath::OneToOne, PlantPath::GroupBasis],
+        "it breaks a 1-1 or plain group-basis aggregate path, and the JOIN tier \
              draws only JOIN definitions",
     ));
     SweepTier {

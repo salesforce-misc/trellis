@@ -5,8 +5,7 @@
 //! joined table rebuilds the `JOIN` (#1109) rather than park a catch-up the
 //! orphan sweep, which has no arm for a `JOIN`, would fail for good.
 //!
-//! The group-basis dev knob is on before the driver starts (a `JOIN` applies
-//! only behind it); the pass is stepped by hand and nothing polls (#297).
+//! The pass is stepped by hand and nothing polls (#297).
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
@@ -23,7 +22,6 @@ const J: &str = "TRANSFORM j2 FROM public.ja LEFT JOIN public.jb ON ja.k = jb.k 
 
 #[tokio::test]
 async fn a_swapped_joined_table_does_not_panic_the_pass() {
-    trellis::dev::staging::set_group_basis(true);
     let mut d = Driver::start(
         "create table public.ja (id integer primary key, g text, k text); \
          create table public.jb (id integer primary key, k text, y integer); \

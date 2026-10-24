@@ -282,9 +282,8 @@ pub(crate) fn may_leave_backlog(collected: u64) -> bool {
 /// the two would apply to a fresh entry and bring the key back (#742). So
 /// every Re-derive stamps at least the newest segment its read's snapshot
 /// sees, and every change the snapshot saw is in that segment or an earlier
-/// one (`super::ledger::chunk_statement` explains why). A page's Re-derive
-/// reads that segment with its rows (`super::one_to_one_ledger::read_rows`,
-/// `super::ledger::apply_ledger_target`), a build chunk in its one
+/// one. A page's Re-derive reads that segment with its rows
+/// (`super::one_to_one_ledger::read_rows`), a build chunk in its one
 /// statement, and the direct Re-derives stamp the latest segment there is.
 ///
 /// **Against a build.** A ledger whose definition is under a build is

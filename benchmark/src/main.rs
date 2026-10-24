@@ -1,30 +1,16 @@
 //! Throughput/latency harness for the `trellis` crate.
 //!
-//! Issue #63's milestone 0: a deterministic, repeatable backfill benchmark
-//! (`posts` -> `posts_calc` -> `posts_totals`) that becomes the yardstick
-//! M2/M3/M4 are checked against. See `scenario` for the actual pipeline and
-//! measurements, `generate` for the deterministic data shape.
-//!
 //! ## Running
 //!
 //! This binary carries `required-features = ["engine-access"]` (ADR-0012; see
 //! `Cargo.toml`), so every invocation must pass `--features engine-access` —
-//! without it Cargo skips the target and `cargo run` fails outright:
+//! without it Cargo skips the target and `cargo run` fails outright.
 //!
-//! ```text
-//! cargo run -p benchmark --features engine-access --release -- high-cardinality
-//! cargo run -p benchmark --features engine-access --release -- low-cardinality
-//! cargo run -p benchmark --features engine-access --release -- both
-//! cargo run -p benchmark --features engine-access --release -- custom --n 200000 --g 500 --ceiling-secs 60
-//! ```
+//! ## Scenarios
 //!
-//! ## Streaming scenarios
-//!
-//! The scenarios above time the direct, ring-bypassing backfill build. The
-//! streaming ones (see [`streaming`], issue #270) instead drive the real
-//! product path through a live [`trellis::Client`] — trigger capture into the
-//! ring -> seal -> claim -> fold -> apply — and are epic #269's validation battery:
-//!
+//! The scenarios (see [`streaming`], issue #270) drive the real product path
+//! through a live [`trellis::Client`] — trigger capture into the ring ->
+//! seal -> claim -> fold -> apply — and are epic #269's validation battery:
 //! ```text
 //! # V-LAT: the T1 depth ladder, and one depth alone
 //! cargo run -p benchmark --features engine-access --release -- hop-ladder
@@ -38,12 +24,8 @@
 //! # issue #277: fold rate and lock-wait attribution by group count x drain workers
 //! cargo run -p benchmark --features engine-access --release -- group-contention --groups 10,100,400,4000,40000
 //! cargo run -p benchmark --features engine-access --release -- group-contention --groups 400 --threads 1,2,4,8,16
-//! cargo run -p benchmark --features engine-access --release -- group-contention --groups 10,400 --aggregate max --ledger
-//! # #1100: every aggregate runs on the group basis; `--ledger` forces the per-row ledger
-//! # (the dev knob) for a same-session control until #1105 deletes it
-//! cargo run -p benchmark --features engine-access --release -- group-contention --groups 10,400 --ledger
 //! # #1113: #1091 J2's JOIN scenario (D1/D2 x S1/S2, a-side and b-side pages, hot keys)
-//! # against its same-session per-fact control (B0); turns the group-basis knob on itself
+//! # against its same-session per-fact control (B0)
 //! cargo run -p benchmark --features engine-access --release -- join
 //! cargo run -p benchmark --features engine-access --release -- join --datasets d1 --facts 1000000 --hot-pages 0
 //! # the write-path tax and the capture ceiling (#622 C4; #565 E1/E2), and V-IDLE
@@ -127,58 +109,11 @@
 //!
 //! `--release` matters: this pushes 1M rows through a real Postgres
 //! instance and a real CDC pipeline, and the debug-build overhead is large
-//! enough to distort the numbers. Each scenario prints one line of JSON to
-//! stdout (see [`scenario::BenchResult::to_json`]) and the process exits
-//! non-zero if the aggregate-backfill phase exceeds its regression
-//! ceiling — wire this into CI as `cargo run -p benchmark --features
-//! engine-access --release -- high-cardinality`.
+//! enough to distort the numbers. Each scenario prints one line of JSON per
+//! measurement point to stdout.
 
-mod generate;
 mod scenario;
 mod streaming;
-
-use std::time::Duration;
-
-/// Post-M3 this shape's aggregate phase measures ~0.7-0.8s on this
-/// harness/box across repeated runs — the direct, single-pass-then-chunked
-/// build ([`trellis::dev::defs::backfill_definition`], issue #63) replaced the ring
-/// drain that took ~55-58s here (and ~1m50s on the issue's poc cluster). The
-/// M3-review fix (aggregate the source once into a staging table, then chunk
-/// the writes from that small table instead of re-scanning the source per
-/// chunk) took this from ~1.25s to ~0.75s. 10s keeps >10x headroom over this
-/// box's measurement for CI/dev-machine jitter and cold caches while still
-/// firing long before any regression back toward the old tens-of-seconds
-/// mechanism. Revisit once a CI-hardware baseline exists.
-const HIGH_CARDINALITY_CEILING: Duration = Duration::from_secs(10);
-
-/// Post-M3 this shape's aggregate phase measures ~35ms on this harness/box:
-/// with only 100 groups the direct build issues a single group-key chunk, so
-/// it's far faster than the 100k-group high-cardinality shape (which they no
-/// longer track — the direct build's cost scales with group count, so the two
-/// diverge sharply, as M3 intended). 5s keeps generous headroom while still
-/// catching a regression that would make small-group builds pathological.
-const LOW_CARDINALITY_CEILING: Duration = Duration::from_secs(5);
-
-struct Scenario {
-    name: &'static str,
-    n: i64,
-    g: i64,
-    ceiling: Duration,
-}
-
-const HIGH_CARDINALITY: Scenario = Scenario {
-    name: "high-cardinality",
-    n: 1_000_000,
-    g: 100_000,
-    ceiling: HIGH_CARDINALITY_CEILING,
-};
-
-const LOW_CARDINALITY: Scenario = Scenario {
-    name: "low-cardinality",
-    n: 1_000_000,
-    g: 100,
-    ceiling: LOW_CARDINALITY_CEILING,
-};
 
 fn main() {
     // Opt-in engine logs for debugging a probe: TRELLIS_BENCH_LOG=warn (or a
@@ -198,7 +133,7 @@ fn main() {
             .init();
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let name = args.first().map(String::as_str).unwrap_or("both");
+    let name = args.first().map(String::as_str).unwrap_or("");
 
     if let Some(ok) = streaming::cli::run(name, &args) {
         if !ok {
@@ -207,83 +142,9 @@ fn main() {
         return;
     }
 
-    let scenarios = match parse_args(&args, name) {
-        Ok(scenarios) => scenarios,
-        Err(message) => {
-            eprintln!("{message}");
-            std::process::exit(2);
-        }
-    };
-
-    // These scenarios time the per-row ledger's direct aggregate build
-    // (`backfill_definition`), which the group basis doesn't have: they run on
-    // the ledger until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
-    let runtime = tokio::runtime::Runtime::new().expect("build tokio runtime");
-    let mut any_over_ceiling = false;
-    let mut any_incorrect = false;
-
-    for scenario in scenarios {
-        let result = runtime.block_on(scenario::run(
-            scenario.name,
-            scenario.n,
-            scenario.g,
-            scenario.ceiling,
-        ));
-        println!("{}", result.to_json());
-        if !result.within_ceiling {
-            any_over_ceiling = true;
-            eprintln!(
-                "REGRESSION: {} aggregate backfill took {}ms, over its {}ms ceiling",
-                result.scenario, result.aggregate_backfill_ms, result.ceiling_ms
-            );
-        }
-        if !result.correctness_ok {
-            any_incorrect = true;
-            eprintln!(
-                "CORRECTNESS FAILURE: {}'s backfilled posts_totals did not match the oracle",
-                result.scenario
-            );
-        }
-    }
-
-    if any_over_ceiling || any_incorrect {
-        std::process::exit(1);
-    }
-}
-
-/// Parses argv into the list of scenarios to run. `custom` reads
-/// `--n`/`--g`/`--ceiling-secs` (all required); every other name is one of
-/// the two fixed scenarios above, or `both` for both of them in sequence.
-fn parse_args(args: &[String], name: &str) -> Result<Vec<Scenario>, String> {
-    match name {
-        "high-cardinality" => Ok(vec![HIGH_CARDINALITY]),
-        "low-cardinality" => Ok(vec![LOW_CARDINALITY]),
-        "both" => Ok(vec![HIGH_CARDINALITY, LOW_CARDINALITY]),
-        "custom" => {
-            let n = parse_flag(args, "--n")?;
-            let g = parse_flag(args, "--g")?;
-            let ceiling_secs = parse_flag(args, "--ceiling-secs")?;
-            Ok(vec![Scenario {
-                name: "custom",
-                n,
-                g,
-                ceiling: Duration::from_secs(ceiling_secs as u64),
-            }])
-        }
-        other => Err(format!(
-            "unknown scenario {other:?} — expected one of: high-cardinality, low-cardinality, \
-             both, custom, {}",
-            streaming::cli::SCENARIOS.join(", ")
-        )),
-    }
-}
-
-fn parse_flag(args: &[String], flag: &str) -> Result<i64, String> {
-    args.iter()
-        .position(|a| a == flag)
-        .and_then(|i| args.get(i + 1))
-        .ok_or_else(|| format!("custom scenario requires {flag} <value>"))?
-        .parse::<i64>()
-        .map_err(|e| format!("{flag} must be an integer: {e}"))
+    eprintln!(
+        "unknown scenario {name:?}: expected one of: {}",
+        streaming::cli::SCENARIOS.join(", ")
+    );
+    std::process::exit(2);
 }

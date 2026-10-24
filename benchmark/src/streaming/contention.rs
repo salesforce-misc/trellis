@@ -175,7 +175,7 @@ pub fn statement_class(query: &str, target: &str) -> StatementClass {
 
 /// A Re-derive build's statement classes (#625 F2), told apart by the
 /// `application_name` its transactions set (`trellis::dev::staging`'s
-/// `CHUNK_APPLICATION_NAME`/`MERGE_APPLICATION_NAME`): a chunk's entry lock
+/// `CHUNK_APPLICATION_NAME`): a chunk's entry lock
 /// shares its text with a drain page's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BuildClass {
@@ -187,23 +187,15 @@ pub enum BuildClass {
     /// rewrite of the others', and their delta inserts), its done mark and
     /// its commit.
     ChunkWrite,
-    /// A merger pass: the claim, sum and group upsert, the all-zero delete
-    /// and the seam.
-    MergeUpsert,
 }
 
 impl BuildClass {
-    pub const ALL: [BuildClass; 3] = [
-        BuildClass::ChunkLock,
-        BuildClass::ChunkWrite,
-        BuildClass::MergeUpsert,
-    ];
+    pub const ALL: [BuildClass; 2] = [BuildClass::ChunkLock, BuildClass::ChunkWrite];
 
     pub fn label(self) -> &'static str {
         match self {
             BuildClass::ChunkLock => "chunk_lock",
             BuildClass::ChunkWrite => "chunk_write",
-            BuildClass::MergeUpsert => "merge_upsert",
         }
     }
 
@@ -215,9 +207,6 @@ impl BuildClass {
 /// The build class of a backend running `query` under `application_name`,
 /// or `None` for anything that isn't a Re-derive build's.
 pub fn build_class(application_name: &str, query: &str) -> Option<BuildClass> {
-    if application_name == trellis::dev::staging::MERGE_APPLICATION_NAME {
-        return Some(BuildClass::MergeUpsert);
-    }
     if application_name != trellis::dev::staging::CHUNK_APPLICATION_NAME {
         return None;
     }
@@ -989,7 +978,6 @@ mod tests {
         let lock = "select 1 from \"public\".\"agg_totals__ledger\" where \"__from_key\" = \
                     any($1::text[]) order by \"__from_key\" for update";
         let chunk = trellis::dev::staging::CHUNK_APPLICATION_NAME;
-        let merge = trellis::dev::staging::MERGE_APPLICATION_NAME;
         assert_eq!(build_class(chunk, lock), Some(BuildClass::ChunkLock));
         assert_eq!(
             build_class(
@@ -997,10 +985,6 @@ mod tests {
                 "with snap as (select pg_current_snapshot() ...) select 1"
             ),
             Some(BuildClass::ChunkWrite)
-        );
-        assert_eq!(
-            build_class(merge, "with claimed as ..."),
-            Some(BuildClass::MergeUpsert)
         );
         assert_eq!(build_class("", lock), None, "a page's lock is a page's");
 

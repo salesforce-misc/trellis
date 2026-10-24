@@ -2,7 +2,7 @@
 //! `timetz`, `timestamp`, `timestamptz`, `interval`) against a real,
 //! ephemeral Postgres via `testkit::TestCluster` — including issue #248's
 //! fix, which reconciled `to_jsonb`'s row-body renderer with `::text` and
-//! re-admitted `timestamp` to every key/`MIN`/`MAX` role `date`/`time`/
+//! re-admitted `timestamp` to every key role `date`/`time`/
 //! `timetz` already held, and issue #246's fix, which pinned the walsender's
 //! output GUCs (including, now, `TimeZone`) the same way the pool's already
 //! were and let `timestamptz` join them too.
@@ -30,22 +30,7 @@
 //!    #246 closed that (independently of #248), and
 //!    `timestamptz_text_moves_with_the_session_timezone` below still shows
 //!    the underlying hazard `TimeZone` pinning now defends against.
-//! 3. **Comparison order.** `trellis::temporal::compare` must agree with
-//!    each family's own `<`/`=`/`>` over a grid that includes BC years,
-//!    `infinity`, sub-second fractions, `24:00:00`, and `timetz`'s
-//!    surprising GMT-then-zone tie-break.
-//! 4. **Aggregate result types.** `min`/`max` keep their argument's type
-//!    and `sum(interval)` is `interval`, checked against `pg_typeof`.
-//! 5. **`interval` arithmetic fidelity.** `trellis::temporal::Interval`'s
-//!    addition and `interval_out` rendering are compared byte-for-byte
-//!    against the server's own, including the 30-day-month comparison rule,
-//!    the no-justification addition rule, and the overflow error.
-//! 6. **Why `MIN`/`MAX(interval)` is refused.** Demonstrated from the
-//!    server: `max(v)` over the same three rows returns *different text*
-//!    for two different scan orders, so it is not a function of its input
-//!    and ADR-0013's byte-exact recompute cross-check could never settle
-//!    it.
-//! 7. **Issue #248's fix, both directly and end-to-end.**
+//! 3. **Issue #248's fix, both directly and end-to-end.**
 //!    `the_engine_s_own_row_renderer_agrees_with_text_for_every_temporal_family`
 //!    exercises the actual replacement renderer
 //!    (`staging::apply::row_as_text_jsonb_sql`) against `::text`, and
@@ -63,36 +48,20 @@
 //!
 //! Harness conventions follow `defs_floats.rs`.
 
-use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::ValueType;
-use trellis::defs::eval::{RegexCache, Row, Value, evaluate_aggregate};
 use trellis::defs::pg_type::PgType;
 use trellis::defs::{CatalogError, ValidationError, install_definition, parse, validate};
 use trellis::integer::IntWidth;
-use trellis::temporal::{self, Interval};
+use trellis::temporal;
 
 // ---------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------
-
-/// The source table the validator-level tests below install against: one
-/// column per temporal family, plus a `bigint` key and a `numeric` measure
-/// so a `GROUP BY` definition always has something to aggregate.
-const SOURCE_DDL: &str = "create table s ( \
-     id bigint primary key, \
-     d date, \
-     ts timestamp, \
-     tstz timestamptz, \
-     tm time, \
-     tmtz timetz, \
-     iv interval, \
-     n numeric \
-   )";
 
 fn source_columns() -> HashMap<String, ValueType> {
     HashMap::from([
@@ -507,538 +476,13 @@ async fn datestyle_moves_date_and_timestamp_but_not_time() {
 // 2. Comparison order
 // ---------------------------------------------------------------------
 
-/// `temporal::compare` must reproduce each family's own comparison
-/// operator, over the whole [`GRID`] — every ordered pair, in both
-/// directions.
-///
-/// The server's verdict is read as two booleans (`a < b`, `a = b`) rather
-/// than a single `cmp` function, so this compares against plain SQL
-/// operators rather than against a `*_cmp` support function the engine
-/// could have been written from.
-#[tokio::test]
-async fn temporal_compare_matches_each_family_s_own_operators() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
-
-    for (pg_type, sql_name, values) in GRID {
-        // Compare the *canonical renderings*, which is what the engine
-        // actually holds — not the input literals, which may be
-        // non-canonical (`'24 hours'`).
-        let mut canonical = Vec::new();
-        for value in *values {
-            canonical.push(render(&client, sql_name, value).await);
-        }
-
-        for a in &canonical {
-            for b in &canonical {
-                let row = client
-                    .query_one(
-                        &format!(
-                            "select ('{a}'::{sql_name} < '{b}'::{sql_name}), \
-                                    ('{a}'::{sql_name} = '{b}'::{sql_name})"
-                        ),
-                        &[],
-                    )
-                    .await
-                    .unwrap_or_else(|e| panic!("{sql_name}: {a} vs {b}: {e}"));
-                let (less, equal): (bool, bool) = (row.get(0), row.get(1));
-                let expected = if equal {
-                    Ordering::Equal
-                } else if less {
-                    Ordering::Less
-                } else {
-                    Ordering::Greater
-                };
-                let actual = temporal::compare(*pg_type, a, b).unwrap_or_else(|| {
-                    panic!("temporal::compare must handle canonical {sql_name} {a:?}/{b:?}")
-                });
-                assert_eq!(
-                    actual, expected,
-                    "{sql_name}: {a} vs {b} — Postgres says {expected:?}"
-                );
-            }
-        }
-    }
-}
-
 // ---------------------------------------------------------------------
 // 3. `interval` arithmetic and rendering fidelity
 // ---------------------------------------------------------------------
 
-/// `Interval::parse`/`render` must round-trip every canonical
-/// `interval_out` rendering the server produces, and `Interval::checked_add`
-/// must agree with `interval_pl` byte-for-byte.
-///
-/// This is the issue's "match Postgres `interval` canonicalization exactly"
-/// requirement, and it is checked the only way that means anything: by
-/// comparing against the server's own output for the same operands, not
-/// against a second copy of the same rules.
-#[tokio::test]
-async fn interval_arithmetic_and_rendering_match_the_server() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
-
-    // A spread that exercises every branch of `EncodeInterval`'s postgres
-    // style: pluralisation, the `is_before` `+` prefix, the omitted
-    // all-zero time field, fractional trimming, and the year/month split.
-    const OPERANDS: &[&str] = &[
-        "0",
-        "1 year",
-        "2 years",
-        "-13 mons",
-        "1 day",
-        "-1 day",
-        "24 hours",
-        "-1 day 1 hour",
-        "1 day -1 hour",
-        "1 mon -1 day 1 hour",
-        "0.5 secs",
-        "-0.000001 secs",
-        "100:00:00",
-        "1 year 2 mons 3 days 04:05:06",
-    ];
-
-    for literal in OPERANDS {
-        let server = render(&client, "interval", literal).await;
-        let parsed = Interval::parse(&server)
-            .unwrap_or_else(|| panic!("Interval::parse must accept interval_out's {server:?}"));
-        assert_eq!(
-            parsed.render(),
-            server,
-            "Interval::render must reproduce interval_out for {literal:?}"
-        );
-    }
-
-    for a in OPERANDS {
-        for b in OPERANDS {
-            let server: String = client
-                .query_one(
-                    &format!("select ('{a}'::interval + '{b}'::interval)::text"),
-                    &[],
-                )
-                .await
-                .unwrap_or_else(|e| panic!("{a} + {b}: {e}"))
-                .get(0);
-            let lhs = Interval::parse(&render(&client, "interval", a).await).expect("lhs parses");
-            let rhs = Interval::parse(&render(&client, "interval", b).await).expect("rhs parses");
-            let ours = lhs
-                .checked_add(rhs)
-                .unwrap_or_else(|e| panic!("{a} + {b} must not overflow: {e}"))
-                .render();
-            assert_eq!(ours, server, "{a} + {b}");
-        }
-    }
-}
-
-/// Postgres does not justify an interval sum, and this is what "1 day =
-/// 24h" does *and does not* mean: the two are `=` for **comparison**, but
-/// addition keeps the fields apart, so `'1 mon' + '30 days'` is `1 mon 30
-/// days` and not `2 mons` — even though those two are themselves `=`.
-///
-/// Getting this backwards is the fidelity risk the issue names, so it gets
-/// its own test rather than riding on the grid above.
-#[tokio::test]
-async fn interval_addition_does_not_justify() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
-
-    let row = client
-        .query_one(
-            "select ('1 mon'::interval + '30 days'::interval)::text, \
-                    (('1 mon'::interval + '30 days'::interval) = '2 mons'::interval)",
-            &[],
-        )
-        .await
-        .expect("the justification demonstration");
-    let (text, equals_two_months): (String, bool) = (row.get(0), row.get(1));
-    assert_eq!(text, "1 mon 30 days", "Postgres does not justify a sum");
-    assert!(
-        equals_two_months,
-        "...even though the unjustified result is = to the justified one"
-    );
-
-    let ours = Interval::parse("1 mon")
-        .unwrap()
-        .checked_add(Interval::parse("30 days").unwrap())
-        .unwrap();
-    assert_eq!(ours.render(), text);
-}
-
-/// `interval` addition overflows rather than wrapping, matching
-/// `select '2147483647 months'::interval + '1 month'::interval`.
-#[tokio::test]
-async fn interval_overflow_agrees_with_the_server() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
-
-    let server_failed = client
-        .query_one(
-            "select ('2147483647 months'::interval + '1 month'::interval)::text",
-            &[],
-        )
-        .await
-        .is_err();
-    let ours_failed = Interval {
-        months: i32::MAX,
-        days: 0,
-        micros: 0,
-    }
-    .checked_add(Interval {
-        months: 1,
-        days: 0,
-        micros: 0,
-    })
-    .is_err();
-    assert!(server_failed, "Postgres raises `interval out of range`");
-    assert_eq!(ours_failed, server_failed);
-}
-
 // ---------------------------------------------------------------------
 // 4. Aggregates
 // ---------------------------------------------------------------------
-
-/// `min`/`max` keep their argument's own type for every temporal family,
-/// and `sum(interval)` is `interval` — read off `pg_typeof`, not from the
-/// docs, exactly as #111/#112 did for their families.
-#[tokio::test]
-async fn temporal_aggregate_result_types_match_pg_typeof() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
-    client.batch_execute(SOURCE_DDL).await.expect("source ddl");
-    client
-        .execute(
-            "insert into s (id, d, ts, tstz, tm, tmtz, iv, n) values \
-             (1, '2024-01-01', '2024-01-01 00:00:00', '2024-01-01 00:00:00+00', \
-              '12:00:00', '12:00:00+00', '1 day', 1)",
-            &[],
-        )
-        .await
-        .expect("seed");
-
-    for (column, sql_name) in [
-        ("d", "date"),
-        ("tm", "time without time zone"),
-        ("tmtz", "time with time zone"),
-        ("ts", "timestamp without time zone"),
-        ("tstz", "timestamp with time zone"),
-    ] {
-        for aggregate in ["min", "max"] {
-            let pg =
-                postgres_type_of(&client, &format!("(select {aggregate}({column}) from s)")).await;
-            assert_eq!(pg, sql_name, "{aggregate}({column}) in Postgres");
-
-            let ours = trellis::defs::registry::aggregate_result_type(
-                &aggregate.to_uppercase(),
-                source_columns()[column],
-            )
-            .unwrap_or_else(|| panic!("{aggregate}({column}) must resolve"));
-            assert_eq!(
-                ours,
-                source_columns()[column],
-                "{aggregate}({column}) keeps its argument's type, like Postgres"
-            );
-        }
-    }
-
-    let pg = postgres_type_of(&client, "(select sum(iv) from s)").await;
-    assert_eq!(pg, "interval");
-    assert_eq!(
-        trellis::defs::registry::aggregate_result_type("SUM", ValueType::Other(PgType::Interval)),
-        Some(ValueType::Other(PgType::Interval))
-    );
-
-    // Postgres has no `sum`/`avg` over the other five, and no `avg` over
-    // `interval` either — so neither does the registry.
-    for column in ["d", "ts", "tstz", "tm", "tmtz"] {
-        assert_eq!(
-            trellis::defs::registry::aggregate_result_type("SUM", source_columns()[column]),
-            None,
-            "there is no sum({column}) in Postgres"
-        );
-    }
-    assert_eq!(
-        trellis::defs::registry::aggregate_result_type("AVG", ValueType::Other(PgType::Interval)),
-        None,
-        "there is no avg(interval) in Postgres"
-    );
-}
-
-/// **Why `MIN`/`MAX(interval)` is refused**, demonstrated from the server.
-///
-/// `max(v)` over the same three rows returns different *text* depending on
-/// the scan order, because `interval_larger` is a left fold
-/// (`cmp(arg1, arg2) < 0 ? arg1 : arg2`) and `'1 day'`/`'24 hours'` tie.
-/// Postgres's own answer is therefore not a function of its input multiset,
-/// which means ADR-0013's byte-exact recompute cross-check can never settle
-/// it — whatever Trellis computes, a recompute is free to disagree. So the
-/// aggregate is refused at define time rather than shipped with a
-/// known-flaky self-check.
-///
-/// The control is `date`, whose ties are byte-identical by construction and
-/// which is therefore admitted.
-#[tokio::test]
-async fn max_interval_is_not_a_function_of_its_input_which_is_why_it_is_refused() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
-
-    client
-        .batch_execute(
-            "create table iv_rows (id int primary key, v interval, d date); \
-             insert into iv_rows values \
-               (1, '1 day', '2024-01-01'), \
-               (2, '24 hours', '2024-01-01'), \
-               (3, '2 hours', '2023-06-01')",
-        )
-        .await
-        .expect("seed the tie");
-
-    let mut interval_answers = Vec::new();
-    let mut date_answers = Vec::new();
-    for direction in ["asc", "desc"] {
-        let row = client
-            .query_one(
-                &format!(
-                    "select max(v)::text, max(d)::text \
-                     from (select v, d from iv_rows order by id {direction}) s"
-                ),
-                &[],
-            )
-            .await
-            .expect("scan-order probe");
-        interval_answers.push(row.get::<_, String>(0));
-        date_answers.push(row.get::<_, String>(1));
-    }
-
-    assert_ne!(
-        interval_answers[0], interval_answers[1],
-        "Postgres's own max(interval) returned {interval_answers:?} for two scan orders — \
-         this is the fact the refusal rests on"
-    );
-    assert!(
-        !temporal::supports_min_max(PgType::Interval),
-        "so MIN/MAX(interval) must be refused"
-    );
-
-    assert_eq!(
-        date_answers[0], date_answers[1],
-        "the control: max(date) is scan-order independent"
-    );
-    assert!(temporal::supports_min_max(PgType::Date));
-}
-
-/// The evaluator's `MIN`/`MAX` fold over each admitted family must produce
-/// byte-identical text to a server-side `min()`/`max()` over the same rows
-/// (ADR-0013: independently-authored SQL, not `defs::oracle`).
-#[tokio::test]
-async fn the_min_max_fold_matches_a_server_side_aggregate() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
-
-    for (pg_type, sql_name, values) in GRID {
-        if !temporal::supports_min_max(*pg_type) {
-            continue;
-        }
-        let rows = values
-            .iter()
-            .map(|v| format!("('{v}'::{sql_name})"))
-            .collect::<Vec<_>>()
-            .join(",");
-        let row = client
-            .query_one(
-                &format!("select min(v)::text, max(v)::text from (values {rows}) t(v)"),
-                &[],
-            )
-            .await
-            .unwrap_or_else(|e| panic!("{sql_name} min/max: {e}"));
-        let (server_min, server_max): (String, String) = (row.get(0), row.get(1));
-
-        // The engine holds canonical renderings, so feed it those.
-        let mut canonical = Vec::new();
-        for value in *values {
-            canonical.push(render(&client, sql_name, value).await);
-        }
-
-        for (aggregate, expected) in [("MIN", &server_min), ("MAX", &server_max)] {
-            let def = parse(&format!(
-                "TRANSFORM t FROM s GROUP BY id WITHOUT SOURCE INDEX SELECT id AS k, {aggregate}(col) AS out"
-            ))
-            .expect("parses");
-            let columns = HashMap::from([
-                ("id".to_string(), ValueType::Integer(IntWidth::Int8)),
-                ("col".to_string(), ValueType::Other(*pg_type)),
-            ]);
-            validate(&def, &columns)
-                .unwrap_or_else(|e| panic!("{aggregate}({sql_name}) must validate: {e}"));
-
-            let group: Vec<Row> = canonical
-                .iter()
-                .map(|text| {
-                    Row::from([
-                        ("id".to_string(), Some("1".to_string())),
-                        ("col".to_string(), Some(text.clone())),
-                    ])
-                })
-                .collect();
-            let out = evaluate_aggregate(&def, &group, &columns, &mut RegexCache::default())
-                .unwrap_or_else(|e| panic!("{aggregate}({sql_name}) fold: {e}"))
-                .remove("out")
-                .expect("the aggregate field")
-                .expect("a non-empty group folds to a value");
-            assert_eq!(
-                out,
-                Value::Other(*pg_type, expected.clone()),
-                "{aggregate}({sql_name}) must match a server-side aggregate"
-            );
-        }
-    }
-}
-
-/// The `SUM(interval)` fold must likewise match a server-side `sum()`,
-/// including over a group whose members are `=` but spelled differently —
-/// the case that makes `MIN`/`MAX` unusable but leaves `SUM` perfectly
-/// well-defined, because a sum reads all three fields of every input rather
-/// than picking one input to return.
-#[tokio::test]
-async fn the_sum_interval_fold_matches_a_server_side_sum() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
-
-    const GROUPS: &[&[&str]] = &[
-        &["1 day", "24 hours", "2 hours"],
-        &["1 mon", "30 days", "-1 day"],
-        &["0.5 secs", "-0.000001 secs", "100:00:00"],
-        &["1 year 2 mons 3 days 04:05:06", "-1 day 1 hour"],
-    ];
-
-    for group in GROUPS {
-        let rows = group
-            .iter()
-            .map(|v| format!("('{v}'::interval)"))
-            .collect::<Vec<_>>()
-            .join(",");
-        let server: String = client
-            .query_one(
-                &format!("select sum(v)::text from (values {rows}) t(v)"),
-                &[],
-            )
-            .await
-            .unwrap_or_else(|e| panic!("sum over {group:?}: {e}"))
-            .get(0);
-
-        let def = parse(
-            "TRANSFORM t FROM s GROUP BY id WITHOUT SOURCE INDEX SELECT id AS k, SUM(col) AS out",
-        )
-        .expect("parses");
-        let columns = HashMap::from([
-            ("id".to_string(), ValueType::Integer(IntWidth::Int8)),
-            ("col".to_string(), ValueType::Other(PgType::Interval)),
-        ]);
-        validate(&def, &columns).expect("SUM(interval) must validate");
-
-        let mut rows_in = Vec::new();
-        for value in *group {
-            let canonical = render(&client, "interval", value).await;
-            rows_in.push(Row::from([
-                ("id".to_string(), Some("1".to_string())),
-                ("col".to_string(), Some(canonical)),
-            ]));
-        }
-        let out = evaluate_aggregate(&def, &rows_in, &columns, &mut RegexCache::default())
-            .expect("fold")
-            .remove("out")
-            .expect("the aggregate field")
-            .expect("a non-empty group folds to a value");
-        assert_eq!(
-            out,
-            Value::Other(PgType::Interval, server.clone()),
-            "SUM over {group:?}"
-        );
-    }
-}
-
-/// Interval addition really is exact, commutative and associative *on
-/// finite, in-range values* — unlike float addition, which fails all three.
-/// And `SUM(interval)` is still **recompute-only**, because that monoid is
-/// partial and a delta cannot represent the gaps.
-///
-/// Both halves are pinned here against the server, because the first half
-/// is what makes the second half surprising: this is not "interval is like
-/// float", it is "interval is exact but its arithmetic can *raise*, in
-/// ways that depend on accumulation order a delta does not control".
-#[tokio::test]
-async fn sum_interval_is_exact_on_finite_values_but_still_recompute_only() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
-
-    let row = client
-        .query_one(
-            "select (((('1 mon'::interval + '30 days') + '2 hours') - '30 days') \
-                     - '2 hours')::text, \
-                    (select sum(v)::text from (values ('1 day'::interval),('24 hours'), \
-                                                      ('2 hours')) t(v)), \
-                    (select sum(v)::text from (values ('2 hours'::interval),('24 hours'), \
-                                                      ('1 day')) t(v))",
-            &[],
-        )
-        .await
-        .expect("the invertibility demonstration");
-    let (round_tripped, forward, reversed): (String, String, String) =
-        (row.get(0), row.get(1), row.get(2));
-
-    assert_eq!(
-        round_tripped, "1 mon",
-        "adding then subtracting the same intervals returns exactly the original"
-    );
-    assert_eq!(
-        forward, reversed,
-        "sum(interval) is order-independent, unlike sum(float)"
-    );
-
-    // ...and yet `SUM(interval)` is still **recompute-only**, because the
-    // monoid is partial. Both gaps, from the same server:
-    //
-    //   select sum(v) from (values ('infinity'::interval),('-infinity')) t(v)
-    //     -> ERROR: interval out of range
-    //   select sum(v) from (select v from ovf order by id)       -> ERROR
-    //   select sum(v) from (select v from ovf order by id desc)  -> ok
-    //     (ovf = {'2147483647 days', '1 days', '-1 days'})
-    //
-    // A delta accumulates in arrival order and computes a deletion as
-    // `+ (-x)`, so it can raise on a group whose true sum is perfectly
-    // well-defined — and since the delta replays identically on retry,
-    // that is a drain that never progresses, not a quarantine. A
-    // recompute lets Postgres fold the group in one pass and raises
-    // exactly when a server-side `sum()` would.
-    let mixed = client
-        .query_one(
-            "select sum(v)::text from (values ('infinity'::interval),('-infinity')) t(v)",
-            &[],
-        )
-        .await;
-    assert!(
-        mixed.is_err(),
-        "infinity + -infinity must be an error, which is the case a delta cannot survive"
-    );
-
-    let verdict = trellis::defs::invertibility::classify(
-        "SUM",
-        trellis::defs::invertibility::AggregateArg::Column(ValueType::Other(PgType::Interval)),
-    )
-    .expect("SUM(interval) must classify");
-    assert!(
-        !verdict.is_invertible(),
-        "SUM(interval) belongs on the recompute path, alongside float SUM/AVG"
-    );
-}
 
 /// **The guard for the #113 review's finding.** Every type Trellis admits
 /// as a key must render *identically* under both of the engine's two
@@ -1160,15 +604,12 @@ async fn to_jsonb_and_text_agree_for_every_admitted_key_type() {
     // reconciliation can fix.
     assert!(temporal::is_render_consistent(PgType::Timestamp));
     assert!(temporal::is_text_stable(PgType::Timestamp));
-    assert!(temporal::supports_min_max(PgType::Timestamp));
 
     assert!(temporal::is_render_consistent(PgType::TimestampTz));
     assert!(temporal::is_text_stable(PgType::TimestampTz));
-    assert!(temporal::supports_min_max(PgType::TimestampTz));
 
     assert!(temporal::is_render_consistent(PgType::Interval));
     assert!(!temporal::is_text_stable(PgType::Interval));
-    assert!(!temporal::supports_min_max(PgType::Interval));
 }
 
 /// Issue #248's actual fix, exercised directly against a live server: the

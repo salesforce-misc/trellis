@@ -7,8 +7,7 @@
 //! images and those of the node's current rows, with a snapshot taken after
 //! the operation as each group's basis (#1043 F4). Never by a zero.
 //!
-//! Every test turns the group-basis dev knob on before its driver starts
-//! (the knob is process-wide), starts from an empty source, built before
+//! Every test starts from an empty source, built before
 //! its tree is recorded, and seeds it through capture. The pass, the
 //! drain and the engine are called by hand; nothing waits for convergence
 //! (#297). The oracle is a from-scratch `GROUP BY` over the source, and the
@@ -109,7 +108,6 @@ impl Fx {
     }
 
     async fn start_with(schema: &str, seed: &str, definitions: &[&str]) -> Fx {
-        trellis::dev::staging::set_group_basis(true);
         let d = Driver::start(
             schema,
             &[("id", int4()), ("g", int4()), ("v", int4())],
@@ -2162,7 +2160,6 @@ async fn a_leaf_detached_and_corrected_before_its_turn_is_read_through_the_root(
 /// longer as recorded). Each probe matches the source's own `NULL`s.
 #[tokio::test]
 async fn groups_with_a_null_part_read_through_the_root_are_exact() {
-    trellis::dev::staging::set_group_basis(true);
     let schema = format!(
         "create table public.items (id integer not null, g integer not null, h integer, \
          v integer not null, primary key (g, id)) partition by range (g); \
@@ -2427,7 +2424,6 @@ async fn a_leaf_read_matches_a_varchar_group_column_at_its_held_type() {
         "v integer not null,",
         "label varchar(10) not null, v integer not null,",
     ) + "create index on public.items (g, label);";
-    trellis::dev::staging::set_group_basis(true);
     let d = Driver::start(
         &schema,
         &[

@@ -199,141 +199,12 @@ pub enum EvalError {
     /// `Infinity` arriving as data, or arising from `'Infinity' + 1`, are
     /// ordinary values in Postgres and stay ordinary values here.
     FloatOutOfRange { field: String, source: FloatError },
-    /// A `SUM(interval)` fold overflowed one of an `interval`'s three
-    /// independent fields (issue #113), or was handed text that is not a
-    /// canonical `interval_out` rendering.
-    ///
-    /// [`EvalError::IntegerOutOfRange`]'s temporal twin and, like it, not
-    /// merely defense-in-depth for the overflow half: `select '2147483647
-    /// months'::interval + '1 month'::interval` raises `interval out of
-    /// range` on a real server, so a fold that silently wrapped would put
-    /// Trellis and a backfill of the same definition into permanent
-    /// disagreement. Per ADR-0003 it pauses the offending
-    /// `(transform, column)` pair rather than the whole transform.
-    IntervalOutOfRange { field: String },
-    /// A `BIT_AND`/`BIT_OR` fold was handed two bit strings of different
-    /// lengths within the same group (issue #118).
-    ///
-    /// Not defense-in-depth in the *evaluator*: a per-column `bit(n)`
-    /// argument can never trigger this (every row shares the column's one
-    /// fixed length), but an unconstrained `bit varying` argument genuinely
-    /// can, and Postgres itself refuses the combination rather than
-    /// padding/truncating — `select bit_and(v) from (values
-    /// ('1'::bit varying), ('01'::bit varying)) t(v)` raises `cannot AND
-    /// bit strings of different sizes` on a live server, so silently
-    /// picking a length here would compute a value no server-side
-    /// `bit_and`/`bit_or` would ever agree with. `op` names which of the
-    /// two folds hit it (`"AND"`/`"OR"`, matching Postgres's own error
-    /// wording), `len_a`/`len_b` the two disagreeing bit-string lengths in
-    /// encounter order.
-    ///
-    /// **This variant's own reachability is narrower than
-    /// `IntervalOutOfRange`'s, though, and worth stating precisely rather
-    /// than by analogy.** `bit_and`/`bit_or` are always
-    /// [`super::invertibility::Invertibility::RecomputeOnly`]
-    /// (`KeySpace::Aggregate` only), and no production path folds a group
-    /// through this Rust evaluator at all: the ledger Re-derive
-    /// (`staging::ledger`) pushes the rendered aggregate expression straight
-    /// to a live Postgres, which raises *its own* native "cannot AND/OR bit
-    /// strings of different sizes" error, surfacing as
-    /// [`crate::staging::apply::ApplyError::Db`], not this variant.
-    /// This variant is exercised only by this module's own unit
-    /// tests and by the test-only `defs::oracle::recompute_aggregate`
-    /// cross-check (`#[cfg(any(test, feature = "test-util"))]`), which does
-    /// call `evaluate_aggregate` over a whole multi-row group. It still
-    /// participates in the ordinary `field()`/`Display`/`code()` machinery
-    /// every `EvalError` variant does (so it degrades safely — `Internal`,
-    /// same as every other data-dependent variant here — on the unlikely
-    /// day some future caller does reach it with a real multi-row group),
-    /// but there is no live-pipeline scenario today where it fires.
-    ///
-    /// Also worth being precise about, since a v1 draft of this comment
-    /// overclaimed it: **this is not a case the ADR-0003 column-level pause
-    /// fuse would ever isolate**, even hypothetically. That fuse
-    /// (`staging::quarantine`'s "Column-level fuse" section) only ever
-    /// activates for `KeySpace::OneToOne` definitions — `bit_and`/`bit_or`
-    /// only ever appear in a `KeySpace::Aggregate` (`GROUP BY`) definition,
-    /// which the fuse explicitly excludes by design (see
-    /// `staging::quarantine`'s own doc comment on that scope cut, which
-    /// predates and is unrelated to this issue). A real occurrence — via
-    /// the `ApplyError::Db` path above, not this variant — is handled by
-    /// the ordinary row-level fuse instead, the same as any other
-    /// aggregate's data-dependent runtime failure in a `GROUP BY` context.
-    BitStringLengthMismatch {
-        field: String,
-        op: &'static str,
-        len_a: usize,
-        len_b: usize,
-    },
     /// A calculated field was re-entered while still being resolved on the
     /// current recursion path. The validator (#23) is supposed to reject
     /// cyclic definitions before they reach here, but `evaluate` is `pub`
     /// and gets exercised standalone in tests and by future callers (#25),
     /// so this is defense-in-depth against a stack overflow.
     Cycle(String),
-    /// A `MIN`/`MAX(enum)` fold ([`reduce_enum_aggregate`]) was handed a
-    /// group with more than one *distinct* value (issue #117).
-    ///
-    /// Not defense-in-depth, and worth stating precisely why, the same way
-    /// [`EvalError::BitStringLengthMismatch`]'s own doc comment does for its
-    /// structurally identical situation. An enum value's ordering is a
-    /// live, per-type, schema-defined fact (`pg_enum.enumsortorder`,
-    /// creation-position order, not alphabetical) — not a fixed, universal
-    /// property of the family the way `date`/`inet`/`bytea` ordering is, so
-    /// this pure, synchronous, DB-less evaluator has no way to answer "which
-    /// of these two distinct labels sorts first" correctly without a
-    /// connection it structurally never has here. A single-distinct-value
-    /// group (the overwhelmingly common shape this variant is *not* raised
-    /// for) needs no ordering at all — `MIN`/`MAX` of one repeated value is
-    /// that value — so this only ever fires on a genuine multi-value tie
-    /// this evaluator cannot break honestly. Guessing (e.g. falling back to
-    /// a lexicographic `Ord` on the label text) would be exactly the
-    /// "silent, wrong-order fold" issue #117 was written to rule out.
-    ///
-    /// **Reachability mirrors `BitStringLengthMismatch` almost exactly.**
-    /// `MIN`/`MAX` are always [`super::invertibility::Invertibility::RecomputeOnly`]
-    /// for every argument type (`super::invertibility::classify`'s own
-    /// unconditional `MIN`/`MAX` arm), so a `KeySpace::Aggregate` field's
-    /// own `MIN`/`MAX(enum)` never folds a multi-row group through this
-    /// evaluator in production at all — the ledger (`staging::ledger`)
-    /// always resolves its written value with a live server-side
-    /// `min()`/`max()` instead, which answers the real creation-order
-    /// question this evaluator cannot. In practice this variant is exercised only by this
-    /// module's own unit tests and by the test-only
-    /// `defs::oracle::recompute_aggregate` cross-check, the same as
-    /// `BitStringLengthMismatch` — see that variant's own doc comment for
-    /// why that is not a lesser guarantee, just a narrower one than
-    /// `IntegerOutOfRange`'s genuinely data-dependent reachability.
-    EnumOrderingUnavailable {
-        field: String,
-        function: &'static str,
-        pg_type: &'static str,
-    },
-    /// A `MIN`/`MAX(text)` fold ([`reduce_text_aggregate`]) was handed a
-    /// group with more than one *distinct* value (issue #120) —
-    /// [`EvalError::EnumOrderingUnavailable`]'s exact structural twin, for
-    /// the same reason: `text`'s ordering is a property of the *column's own
-    /// collation* (`pg_attribute.attcollation`), which this crate tracks
-    /// nowhere, rather than a fixed, universal property of the family the
-    /// way `date`/`inet` ordering is — so this pure, synchronous,
-    /// DB-less evaluator has no way to answer "which of these two distinct
-    /// strings sorts first" correctly without a connection it structurally
-    /// never has here. A single-distinct-value group (the overwhelmingly
-    /// common shape this variant is *not* raised for) needs no ordering at
-    /// all — `MIN`/`MAX` of one repeated value is that value — so this only
-    /// ever fires on a genuine multi-value tie this evaluator cannot break
-    /// honestly. Guessing (e.g. assuming Rust's own byte-order `Ord` on the
-    /// text, which happens to equal Postgres's `C`/`POSIX` collation but not
-    /// necessarily a real column's) would be exactly the "silent, wrong-order
-    /// fold" issue #117 was written to rule out for `enum`, one layer over.
-    ///
-    /// **Reachability mirrors `EnumOrderingUnavailable` exactly** — see that
-    /// variant's own doc comment; every word of its reachability argument
-    /// applies here with "text" in place of "enum".
-    TextOrderingUnavailable {
-        field: String,
-        function: &'static str,
-    },
 }
 
 impl EvalError {
@@ -371,11 +242,7 @@ impl EvalError {
             | EvalError::InvalidNumber { field, .. }
             | EvalError::InvalidBoolean { field, .. }
             | EvalError::IntegerOutOfRange { field, .. }
-            | EvalError::FloatOutOfRange { field, .. }
-            | EvalError::IntervalOutOfRange { field }
-            | EvalError::BitStringLengthMismatch { field, .. }
-            | EvalError::EnumOrderingUnavailable { field, .. }
-            | EvalError::TextOrderingUnavailable { field, .. } => field,
+            | EvalError::FloatOutOfRange { field, .. } => field,
             EvalError::Cycle(field) => field,
         }
     }
@@ -407,38 +274,9 @@ impl fmt::Display for EvalError {
             EvalError::FloatOutOfRange { field, source } => {
                 write!(f, "calculated field '{field}': {source}")
             }
-            EvalError::IntervalOutOfRange { field } => {
-                write!(f, "calculated field '{field}': interval out of range")
-            }
-            EvalError::BitStringLengthMismatch {
-                field,
-                op,
-                len_a,
-                len_b,
-            } => write!(
-                f,
-                "calculated field '{field}': cannot {op} bit strings of different sizes \
-                 ({len_a} and {len_b})"
-            ),
             EvalError::Cycle(field) => write!(
                 f,
                 "calculated field '{field}' is part of a cyclic reference"
-            ),
-            EvalError::EnumOrderingUnavailable {
-                field,
-                function,
-                pg_type,
-            } => write!(
-                f,
-                "calculated field '{field}': {function}({pg_type}) over more than one \
-                 distinct value cannot be resolved without a live connection to determine \
-                 the type's creation-order comparison"
-            ),
-            EvalError::TextOrderingUnavailable { field, function } => write!(
-                f,
-                "calculated field '{field}': {function}(text) over more than one distinct \
-                 value cannot be resolved without knowing the column's collation, which this \
-                 engine does not track"
             ),
         }
     }
@@ -452,11 +290,7 @@ impl std::error::Error for EvalError {
             EvalError::FloatOutOfRange { source, .. } => Some(source),
             EvalError::MissingColumn { .. }
             | EvalError::InvalidBoolean { .. }
-            | EvalError::IntervalOutOfRange { .. }
-            | EvalError::BitStringLengthMismatch { .. }
-            | EvalError::Cycle(_)
-            | EvalError::EnumOrderingUnavailable { .. }
-            | EvalError::TextOrderingUnavailable { .. } => None,
+            | EvalError::Cycle(_) => None,
         }
     }
 }
@@ -1109,17 +943,17 @@ fn aggregate_argument_scope<'a>(
 }
 
 #[cfg(any(test, feature = "test-util"))]
-/// Folds `SUM`/`MIN`/`MAX`/`AVG` over `arg_expr` evaluated against every row
-/// in the group, matching Postgres's NULL handling for these aggregates: a
-/// `NULL` row is skipped entirely (not treated as zero), and if every row's
-/// value is `NULL` the result is `NULL` too (Postgres's "aggregate of zero
-/// non-NULL values is NULL" rule — `sum('{}'::numeric[])`, for instance).
+/// Folds `SUM`/`AVG` over `arg_expr` evaluated against every row in the
+/// group, matching Postgres's NULL handling for these aggregates: a `NULL`
+/// row is skipped entirely (not treated as zero), and if every row's value is
+/// `NULL` the result is `NULL` too (Postgres's "aggregate of zero non-NULL
+/// values is NULL" rule: `sum('{}'::numeric[])`, for instance).
 ///
 /// `arg_expr` is evaluated per row via the ordinary single-row [`eval_expr`],
 /// one row at a time so each row gets its own fresh memoization scope.
 /// `fields_by_name` is threaded through so `arg_expr` can reference another
-/// (non-aggregate) calculated field on this same target — e.g.
-/// `GROUP BY id SELECT (id + 1) AS adj, SUM(adj) AS t` — the same way
+/// (non-aggregate) calculated field on this same target, e.g.
+/// `GROUP BY id SELECT (id + 1) AS adj, SUM(adj) AS t`, the same way
 /// Postgres itself resolves it; the validator doesn't restrict an aggregate
 /// argument to source-only columns, so the evaluator must not either.
 fn fold_aggregate(
@@ -1132,48 +966,7 @@ fn fold_aggregate(
     regex_cache: &mut RegexCache,
 ) -> Result<Option<Value>, EvalError> {
     let arg_expr = &args[0];
-    let extra_args = &args[1..];
     let fields_by_name = &aggregate_argument_scope(fields_by_name);
-
-    // Issue #115: `JSONB_AGG` folds *rows*, not non-NULL values — see
-    // `crate::jsonb`'s module doc for why `jsonb_agg`'s transition function
-    // is not `STRICT`. Handled as its own early return so the shared
-    // NULL-skipping loop below never sees it (`rows` here is a `GROUP BY`
-    // group, always non-empty — see `evaluate_aggregate`'s own assertion —
-    // so this never folds to `NULL`).
-    if matches!(name, "JSONB_AGG" | "ARRAY_AGG" | "STRING_AGG") {
-        let mut row_values: Vec<Option<Value>> = Vec::with_capacity(rows.len());
-        for row in rows {
-            let mut per_row_cache = HashMap::new();
-            let mut per_row_in_progress = HashSet::new();
-            let value = eval_expr(
-                arg_expr,
-                field_name,
-                row,
-                source_columns,
-                fields_by_name,
-                &mut per_row_cache,
-                &mut per_row_in_progress,
-                regex_cache,
-            )?;
-            row_values.push(value);
-        }
-        return Ok(match name {
-            "JSONB_AGG" => fold_jsonb_agg(row_values),
-            "ARRAY_AGG" => fold_array_agg(row_values),
-            _ => {
-                let Some(Expr::StringLiteral(separator)) = extra_args.first() else {
-                    // Defense-in-depth: the validator refuses a non-literal
-                    // separator (`StringAggSeparatorNotLiteral`).
-                    return Err(EvalError::MissingColumn {
-                        field: field_name.to_string(),
-                        column: "STRING_AGG separator".to_string(),
-                    });
-                };
-                fold_string_agg(row_values, separator)
-            }
-        });
-    }
 
     let mut values: Vec<Value> = Vec::new();
     for row in rows {
@@ -1189,206 +982,37 @@ fn fold_aggregate(
             &mut per_row_in_progress,
             regex_cache,
         )?;
-        // Issue #113 widened this filter past the numeric family: the
-        // aggregate registry, not a hardcoded predicate, decides which
-        // argument types an aggregate accepts, so `MIN(date_col)` and
-        // `SUM(interval_col)` reach the fold while `SUM(date_col)` — which
-        // Postgres has no aggregate for — still cannot.
+        // A `NULL` (`None`) or non-exact-numeric evaluation is skipped: `NULL` per Postgres's aggregate
+        // semantics above, and any other value here would mean a hand-built
+        // AST bypassed the validator's type check on the argument
+        // (defense-in-depth, as elsewhere in this module).
         if let Some(value) = value
-            && super::registry::aggregate_result_type(name, value.value_type()).is_some()
+            && matches!(value, Value::Integer(..) | Value::Numeric(_))
         {
             values.push(value);
         }
-        // A `NULL` (`None`) or non-numeric evaluation is skipped:
-        // `NULL` per Postgres's aggregate semantics above, and any other
-        // value here would mean a hand-built AST bypassed the validator's
-        // type check on these four functions' argument (defense-in-depth,
-        // as elsewhere in this module).
     }
 
     reduce_numeric_aggregate(name, values, field_name)
 }
 
-/// Folds `JSONB_AGG` over a group's **per-row** values (`None` for a `NULL`
-/// row), building the `jsonb` array `jsonb_agg` itself would — see this
-/// module's call site ([`fold_aggregate`])
-/// and `crate::jsonb`'s module doc for why a `NULL` row is folded in as a
-/// JSON `null` element rather than skipped, unlike every other aggregate in
-/// this crate.
-///
-/// Only a genuinely **empty** `row_values` (zero rows, not "every row
-/// `NULL`") folds to `None` (SQL `NULL`) — Postgres's own `jsonb_agg` over
-/// zero rows is `NULL`, but over one `NULL` row is the one-element array
-/// `[null]` (verified live), a *rows*-counted rule rather than every other
-/// aggregate's *non-NULL-values*-counted one.
-///
-/// Each element's text is inserted verbatim: a `Value::Other(PgType::Jsonb,
-/// _)` already carries `jsonb_out`'s own canonical text (decoded off a CDC
-/// row, or checked canonical by [`crate::jsonb::canonical_jsonb`] for a
-/// typed literal — see `super::typed_literal`), so no re-canonicalization is
-/// needed to assemble the enclosing array.
-///
-/// Element **order** here is simply `row_values`' own order — this
-/// evaluator never reorders a group's rows — but that is not a promise that
-/// a *server-side* recompute of the same group will agree on order between
-/// two separate calls (`crate::jsonb`'s module doc's "`jsonb_agg`'s residual
-/// ordering caveat"). `JSONB_AGG` is always
-/// [`super::invertibility::Invertibility::RecomputeOnly`], so this function
-/// exists for the oracle/self-check cross-validation path, not the
-/// production apply pipeline's own recompute (which asks Postgres directly —
-/// `staging::ledger`).
 #[cfg(any(test, feature = "test-util"))]
-fn fold_jsonb_agg(row_values: Vec<Option<Value>>) -> Option<Value> {
-    if row_values.is_empty() {
-        return None;
-    }
-    let mut text = String::from("[");
-    for (i, value) in row_values.iter().enumerate() {
-        if i > 0 {
-            text.push_str(", ");
-        }
-        match value {
-            Some(Value::Other(PgType::Jsonb, element)) => text.push_str(element),
-            // Defense-in-depth: the validator/registry gate `JSONB_AGG`'s
-            // argument to exactly `Other(PgType::Jsonb)` (an exact-match
-            // check, the same shape `BOOL_AND`'s fixed `Boolean` argument
-            // gets), so a hand-built AST is the only way to reach here with
-            // anything else — render it as `null` rather than panicking,
-            // the same "never trust a hand-built AST past the type it
-            // claims" posture the rest of this module takes.
-            Some(_) => text.push_str("null"),
-            None => text.push_str("null"),
-        }
-    }
-    text.push(']');
-    Some(Value::Other(PgType::Jsonb, text))
-}
-
-/// Folds `ARRAY_AGG` over a group's per-row `text` values into the `text[]`
-/// `array_agg` itself builds: a `NULL` row is a `NULL` element, and zero rows
-/// fold to SQL `NULL`. Elements render as Postgres's `array_out` does: bare
-/// unless empty, `NULL`-spelled, or holding a brace, comma, quote, backslash
-/// or whitespace, in which case double-quoted with `\` escapes. Element
-/// order is the group's own row order, which a server-side recompute does
-/// not promise to reproduce (`docs/type-support.md`, `array_agg` and `string_agg`).
-#[cfg(any(test, feature = "test-util"))]
-fn fold_array_agg(row_values: Vec<Option<Value>>) -> Option<Value> {
-    if row_values.is_empty() {
-        return None;
-    }
-    let elements: Vec<String> = row_values
-        .iter()
-        .map(|value| match value {
-            Some(Value::Text(text)) => array_element_text(text),
-            _ => "NULL".to_string(),
-        })
-        .collect();
-    Some(Value::Other(
-        PgType::TextArray,
-        format!("{{{}}}", elements.join(",")),
-    ))
-}
-
-#[cfg(any(test, feature = "test-util"))]
-fn array_element_text(text: &str) -> String {
-    let needs_quotes = text.is_empty()
-        || text.eq_ignore_ascii_case("null")
-        // `array_out` quotes on `array_isspace`'s ASCII set only, not
-        // Unicode whitespace (`char::is_whitespace` would quote U+00A0).
-        || text.chars().any(|c| {
-            matches!(
-                c,
-                '{' | '}' | ',' | '"' | '\\' | ' ' | '\t' | '\n' | '\r' | '\x0B' | '\x0C'
-            )
-        });
-    if !needs_quotes {
-        return text.to_string();
-    }
-    let mut out = String::with_capacity(text.len() + 2);
-    out.push('"');
-    for c in text.chars() {
-        if matches!(c, '"' | '\\') {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out.push('"');
-    out
-}
-
-/// Folds `STRING_AGG` over a group's per-row `text` values: `NULL` rows are
-/// skipped, the rest join with `separator`, and no non-`NULL` row folds to
-/// SQL `NULL`. Element order is the group's own row order (see
-/// [`fold_array_agg`]).
-#[cfg(any(test, feature = "test-util"))]
-fn fold_string_agg(row_values: Vec<Option<Value>>, separator: &str) -> Option<Value> {
-    let parts: Vec<&str> = row_values
-        .iter()
-        .filter_map(|value| match value {
-            Some(Value::Text(text)) => Some(text.as_str()),
-            _ => None,
-        })
-        .collect();
-    if parts.is_empty() {
-        return None;
-    }
-    Some(Value::Text(parts.join(separator)))
-}
-
-#[cfg(any(test, feature = "test-util"))]
-/// Reduces the collected non-`NULL` exact-numeric values of
-/// `SUM`/`MIN`/`MAX`/`AVG` to the aggregate's result, or `None` (SQL `NULL`)
-/// when `values` is empty — Postgres's "aggregate of zero non-NULL values is
-/// NULL" rule, over a GROUP BY group's rows ([`fold_aggregate`]).
-///
-/// # Integer arguments (issue #111)
+/// Reduces the collected non-`NULL` exact-numeric values of `SUM`/`AVG` to
+/// the aggregate's result, or `None` (SQL `NULL`) when `values` is empty:
+/// Postgres's "aggregate of zero non-NULL values is NULL" rule, over a
+/// GROUP BY group's rows ([`fold_aggregate`]).
 ///
 /// The result type follows [`super::registry::aggregate_result_type`], which
 /// follows Postgres:
 ///
-/// * `MIN`/`MAX` keep the argument's own type, so `max(int4_col)` stays
-///   `integer` rather than widening to `numeric`. No fold of a column's own
-///   values can leave that column's range, so neither can ever raise.
 /// * `SUM` over `smallint`/`integer` is Postgres's `int8` sum: it
 ///   accumulates in `bigint` and **raises `22003` on overflow**, exactly as
 ///   `sum(int4_col)` does server-side. It does *not* silently widen to
-///   arbitrary precision, which is what made Trellis and a backfill of the
-///   same definition disagree before this issue.
-/// * `SUM` over `bigint` is Postgres's `numeric` sum — unbounded, so it
-///   cannot raise — and `AVG` over any exact-integer width is likewise
-///   `numeric`. Both keep going through [`Numeric`], unchanged from before.
-///
-/// # Float arguments (issue #112)
-///
-/// Checked first, and they dominate: if *any* value in the group is a
-/// [`Value::Float`], the whole fold runs in binary floating point, because
-/// that is what Postgres's own aggregate would have done (a mixed group can
-/// only arise through `COALESCE`, whose result Postgres types as the float
-/// — `coalesce(1::real, 1::numeric)` is `real`). Per
-/// [`super::registry::aggregate_result_type`]:
-///
-/// * `SUM`/`MIN`/`MAX` keep the argument's width; `AVG` is always `double
-///   precision`, even over a `real` column.
-/// * `MIN`/`MAX` order by [`crate::float::compare`], so `max` over a group
-///   containing `NaN` is `NaN` and `min` over `{NaN, 1}` is `1` — matching
-///   `select max(v), min(v) from (values ('NaN'::float8),(1::float8)) t(v)`
-///   on a live server, which is `NaN` and `1`.
-/// * `SUM` can raise [`EvalError::FloatOutOfRange`] (Postgres's
-///   `float8pl` overflow check applies to the aggregate's running sum too),
-///   but never for a `NaN`/`Infinity` input — those propagate as values.
-///
-/// Note what this fold does *not* claim: that it agrees digit-for-digit
-/// with a server-side `sum()` over the same rows in a different order. It
-/// cannot — float addition isn't associative — which is precisely why
-/// `super::invertibility` routes float `SUM`/`AVG` to the recompute path
-/// rather than the delta path.
-///
-/// # Boolean arguments (issue #119)
-///
-/// `bool_and`/`bool_or` fold [`Value::Boolean`] rather than a numeric type
-/// at all, and are dispatched to [`reduce_boolean_aggregate`] even earlier
-/// than the temporal early-return above — see that function's own doc
-/// comment.
+///   arbitrary precision, which is what would make Trellis and a backfill of
+///   the same definition disagree.
+/// * `SUM` over `bigint` is Postgres's `numeric` sum, unbounded, so it
+///   cannot raise, and `AVG` over any exact-integer width is likewise
+///   `numeric`. Both go through [`Numeric`].
 fn reduce_numeric_aggregate(
     name: &str,
     values: Vec<Value>,
@@ -1398,190 +1022,39 @@ fn reduce_numeric_aggregate(
         return Ok(None);
     }
 
-    // Issue #113: a temporal group folds on its own terms and returns
-    // early, before any of the numeric machinery below. Unlike the
-    // float/integer arms there is no widest-wins or mixed-shape case to
-    // handle: `COALESCE` cannot mix a `date` with anything else (the
-    // validator's `common_numeric_type` unifies only inside the numeric
-    // family), so a temporal fold's values are all one family or the
-    // caller's filter let something through it shouldn't have.
-    if let Value::Other(pg_type, _) = &values[0]
-        && crate::temporal::is_temporal(*pg_type)
-    {
-        return reduce_temporal_aggregate(name, *pg_type, values, field_name);
-    }
-
-    // Issue #116: `inet`'s `MIN`/`MAX` fold on the same "own family, own
-    // terms" grounds as the temporal arm just above — `registry::
-    // aggregate_result_type` is the only place that admits `Other(PgType::
-    // Inet)` into an aggregate at all, and only for `MIN`/`MAX`, so
-    // `reduce_netaddr_aggregate` never needs a `SUM`/`AVG` arm.
-    if let Value::Other(PgType::Inet, _) = &values[0] {
-        return reduce_netaddr_aggregate(name, values);
-    }
-
-    // Issue #117: `min`/`max(enum)` fold on the same "own family, own
-    // terms" grounds as `inet`'s arm just above, with one genuine
-    // difference — see `reduce_enum_aggregate`'s own doc comment.
-    if let Value::Other(PgType::Enum(_), _) = &values[0] {
-        return reduce_enum_aggregate(name, values, field_name);
-    }
-
-    // Issue #119: `bool_and`/`bool_or` are the one aggregate pair whose
-    // group folds `Value::Boolean` rather than the numeric family — same
-    // early-return shape as the temporal arm above, and for the same
-    // reason: `Boolean` cannot mix with anything else through `COALESCE`
-    // either (`validate`'s `common_numeric_type` only unifies inside the
-    // numeric family), so a boolean fold's values are all one family by
-    // construction.
-    if let Value::Boolean(_) = &values[0] {
-        return reduce_boolean_aggregate(name, values);
-    }
-
-    // Issue #118: `bit_and`/`bit_or` fold `Value::Other(PgType::Bit |
-    // PgType::VarBit, _)` rather than the numeric family — the bit-string
-    // sibling of the `Boolean` early return just above. `is_temporal`
-    // (checked first, above) is false for both bit-string `PgType`s, so
-    // this never races that arm.
-    if matches!(&values[0], Value::Other(PgType::Bit | PgType::VarBit, _)) {
-        return reduce_bit_aggregate(name, values, field_name);
-    }
-
-    // Issue #120: `MIN`/`MAX(text)` folds on the same "own family, own
-    // terms" grounds as `enum`'s arm does (issue #117) — see
-    // `reduce_text_aggregate`'s own doc comment for the identical structural
-    // reason (`enum`'s ordering is schema-defined and live; `text`'s is
-    // collation-defined and per-column — neither is a fixed, universal
-    // property of the family this evaluator could reproduce with no
-    // connection).
-    if let Value::Text(_) = &values[0] {
-        return reduce_text_aggregate(name, values, field_name);
-    }
-
-    // Issue #112: a float anywhere in the group makes the whole fold a
-    // float fold, at the widest float width present — the same
-    // widest-wins reasoning as the integer fold below, and the same
-    // `COALESCE`-mixed-shapes hazard it exists for.
-    let float_width = values
-        .iter()
-        .fold(None, |acc: Option<FloatWidth>, v| match v {
-            Value::Float(width, _) => Some(match acc {
-                Some(seen) => seen.wider(*width),
-                None => *width,
-            }),
-            _ => acc,
-        });
-    if let Some(width) = float_width {
-        let floats: Vec<f64> = values.iter().cloned().filter_map(as_float).collect();
-        if floats.is_empty() {
-            return Ok(None);
-        }
-        // `reject` is the ordering that makes the *incoming* value lose, so
-        // a tie keeps the incoming one — which is what Postgres's
-        // `float8smaller`/`float8larger` do (`cmp(arg1, arg2) < 0 ? arg1 :
-        // arg2` keeps `arg2` when the two compare equal). It only shows on
-        // `-0` vs `0`, the one pair that is equal but renders two ways, and
-        // matching Postgres's left fold is free.
-        let reduce = |reject: std::cmp::Ordering| {
-            floats
-                .iter()
-                .copied()
-                .reduce(|a, b| if float::compare(b, a) == reject { a } else { b })
-                .expect("checked non-empty above")
-        };
-        return Ok(Some(match name {
-            "MIN" => Value::Float(width, reduce(std::cmp::Ordering::Greater)),
-            "MAX" => Value::Float(width, reduce(std::cmp::Ordering::Less)),
-            "SUM" => {
-                // Seeded from the first value, *not* from `0.0`: Postgres's
-                // `sum(float4)`/`sum(float8)` have a `NULL` initial
-                // condition, so the first row becomes the state rather than
-                // being added to a zero. The difference is visible on signed
-                // zero — `select sum(v) from (values ('-0'::float8)) t(v)` is
-                // `-0`, while `0.0 + -0.0` is `+0.0` in IEEE — and `-0` and
-                // `0` are two different `float8out` renderings of one value,
-                // so a zero seed would write text Postgres never would.
-                let mut floats = floats.into_iter();
-                let mut acc = floats.next().expect("checked non-empty above");
-                for n in floats {
-                    let (next, _) = float::checked_add(acc, width, n, width).map_err(|source| {
-                        EvalError::FloatOutOfRange {
-                            field: field_name.to_string(),
-                            source,
-                        }
-                    })?;
-                    acc = next;
-                }
-                Value::Float(width, acc)
-            }
-            // `avg(real)` is `double precision` in Postgres, not `real`.
-            //
-            // Folded from an explicit `0.0` rather than through
-            // `Iterator::sum`, which is *not* the same thing for floats:
-            // Rust seeds its `Sum` impl with `-0.0` (so a list of `-0.0`s
-            // sums to `-0.0`), while Postgres's `float8_accum`/`float4_accum`
-            // carry an `initcond` of `{0,0,0}` — a `+0.0` seed. `avg` over a
-            // group of `-0`s is therefore `0` on a real server and would be
-            // `-0` here, two different `float8out` renderings of one value.
-            // Note this is the opposite seed from `SUM` above, which has a
-            // `NULL` initcond; the two genuinely differ in Postgres.
-            "AVG" => {
-                let count = floats.len() as f64;
-                let sum: f64 = floats.iter().fold(0.0f64, |acc, n| acc + n);
-                Value::Float(FloatWidth::Float8, sum / count)
-            }
-            _ => unreachable!("reduce_numeric_aggregate is only called for SUM/MIN/MAX/AVG"),
-        }));
-    }
-
     // The integer fold applies only when **every** value is an exact
-    // integer, and its width is the *widest* present — not the first value's.
+    // integer, and its width is the *widest* present, not the first value's.
     // Both details are load-bearing, and both are reachable through
     // `COALESCE`, whose evaluation picks whichever argument is non-`NULL`
     // per row rather than coercing to the field's inferred type: a
     // `SUM(COALESCE(numeric_col, 0))` yields `Numeric` on some rows and the
-    // literal's `Integer` on others, and a `MAX(COALESCE(int8_col, 0))`
-    // mixes `Int8` column values with the literal's `Int4`. Keying off
-    // `values.first()` alone would silently drop every value of the other
-    // shape, or tag a `bigint`-sized result as `integer`.
+    // literal's `Integer` on others. Keying off `values.first()` alone would
+    // silently drop every value of the other shape, or tag a `bigint`-sized
+    // result as `integer`.
     let widest = values.iter().try_fold(IntWidth::Int2, |acc, v| match v {
         Value::Integer(width, _) => Some(acc.wider(*width)),
         _ => None,
     });
 
-    if let Some(width) = widest {
-        let ints = || {
-            values.iter().filter_map(|v| match v {
-                Value::Integer(_, n) => Some(*n),
-                _ => None,
-            })
-        };
-        match name {
-            "MIN" => {
-                let min = ints().min().expect("checked non-empty above");
-                return Ok(Some(Value::Integer(width, min)));
-            }
-            "MAX" => {
-                let max = ints().max().expect("checked non-empty above");
-                return Ok(Some(Value::Integer(width, max)));
-            }
-            // `sum(smallint)`/`sum(integer)` accumulate in `bigint`. The
-            // `bigint` case deliberately falls through to the `numeric`
-            // path below, matching `sum(bigint) -> numeric`.
-            "SUM" if width != IntWidth::Int8 => {
-                let mut acc: i64 = 0;
-                for n in ints() {
-                    let (next, _) = integer::checked_add(acc, IntWidth::Int8, n, IntWidth::Int8)
-                        .map_err(|source| EvalError::IntegerOutOfRange {
-                            field: field_name.to_string(),
-                            source,
-                        })?;
-                    acc = next;
-                }
-                return Ok(Some(Value::Integer(IntWidth::Int8, acc)));
-            }
-            _ => {}
+    if let Some(width) = widest
+        && name == "SUM"
+        // `sum(smallint)`/`sum(integer)` accumulate in `bigint`. The
+        // `bigint` case deliberately falls through to the `numeric` path
+        // below, matching `sum(bigint) -> numeric`.
+        && width != IntWidth::Int8
+    {
+        let mut acc: i64 = 0;
+        for v in &values {
+            let Value::Integer(_, n) = v else { continue };
+            let (next, _) = integer::checked_add(acc, IntWidth::Int8, *n, IntWidth::Int8).map_err(
+                |source| EvalError::IntegerOutOfRange {
+                    field: field_name.to_string(),
+                    source,
+                },
+            )?;
+            acc = next;
         }
+        return Ok(Some(Value::Integer(IntWidth::Int8, acc)));
     }
 
     let values: Vec<Numeric> = values.into_iter().filter_map(as_numeric).collect();
@@ -1594,26 +1067,6 @@ fn reduce_numeric_aggregate(
             .into_iter()
             .reduce(|a, b| a.add(&b))
             .expect("checked non-empty above"),
-        "MIN" => values
-            .into_iter()
-            .reduce(|a, b| {
-                if b.compare(&a) == std::cmp::Ordering::Less {
-                    b
-                } else {
-                    a
-                }
-            })
-            .expect("checked non-empty above"),
-        "MAX" => values
-            .into_iter()
-            .reduce(|a, b| {
-                if b.compare(&a) == std::cmp::Ordering::Greater {
-                    b
-                } else {
-                    a
-                }
-            })
-            .expect("checked non-empty above"),
         "AVG" => {
             let count = values.len();
             let sum = values
@@ -1624,441 +1077,9 @@ fn reduce_numeric_aggregate(
                 .expect("a usize always renders as a valid decimal literal");
             sum.div(&count_numeric)
         }
-        _ => unreachable!("reduce_numeric_aggregate is only called for SUM/MIN/MAX/AVG"),
+        _ => unreachable!("reduce_numeric_aggregate is only called for SUM/AVG"),
     };
     Ok(Some(Value::Numeric(result)))
-}
-
-#[cfg(any(test, feature = "test-util"))]
-/// Folds a group of one temporal family's values (issue #113) —
-/// [`reduce_numeric_aggregate`]'s early-return arm for
-/// [`ValueType::Other`](super::ast::ValueType::Other) temporal columns.
-///
-/// Only the two shapes `super::registry::aggregate_result_type` admits
-/// reach here, and they are folded very differently:
-///
-/// * **`MIN`/`MAX`** over `date`/`time`/`timetz`/`timestamp`/`timestamptz`
-///   return one of their inputs *verbatim*, so this never re-renders a
-///   value — it only orders them, through [`crate::temporal::compare`],
-///   which reproduces each family's own comparison operator (including
-///   `timetz`'s surprising GMT-then-zone two-level sort and `timestamptz`'s
-///   zone-normalising one). Keeping the input text untouched is what makes
-///   the result byte-identical to a server-side `min()`/`max()` without
-///   this module owning five output functions.
-///
-///   The tie rule matches Postgres's `date_smaller`-family left fold
-///   (`cmp(arg1, arg2) < 0 ? arg1 : arg2`, so a tie keeps `arg2`, the
-///   incoming value) — the same rule #112's float fold matches. For these
-///   five families it is unobservable, because a tie can only be between
-///   two byte-identical strings; it is matched anyway so the fold is right
-///   by construction rather than by luck. `interval`, whose ties are *not*
-///   byte-identical, never reaches here: it is refused at define time
-///   precisely because that makes Postgres's own answer scan-order
-///   dependent (see [`crate::temporal`]).
-///
-/// * **`SUM(interval)`** is the one temporal fold that computes a new
-///   value, via `interval_pl`'s exact fieldwise addition
-///   ([`crate::temporal::Interval::checked_add`]) and `interval_out`'s
-///   rendering ([`crate::temporal::Interval::render`]). It can raise
-///   [`EvalError::IntervalOutOfRange`], exactly as `select '2147483647
-///   months'::interval + '1 month'::interval` does on a live server.
-///
-///   Postgres's `sum(interval)` has a `NULL` initial condition, so this
-///   seeds from the first value rather than from a zero interval. Unlike
-///   the float case that distinction is invisible in the result (interval
-///   addition has a true identity element), but the empty-group answer is
-///   `NULL` either way and is already handled by the caller.
-fn reduce_temporal_aggregate(
-    name: &str,
-    pg_type: PgType,
-    values: Vec<Value>,
-    field_name: &str,
-) -> Result<Option<Value>, EvalError> {
-    // Defense-in-depth, as everywhere else in this module: a value of
-    // another family here would mean a hand-built AST bypassed the
-    // validator's argument check.
-    let texts: Vec<String> = values
-        .into_iter()
-        .filter_map(|value| match value {
-            Value::Other(found, text) if found == pg_type => Some(text),
-            _ => None,
-        })
-        .collect();
-    if texts.is_empty() {
-        return Ok(None);
-    }
-
-    match name {
-        "MIN" | "MAX" => {
-            let keep = if name == "MIN" {
-                std::cmp::Ordering::Less
-            } else {
-                std::cmp::Ordering::Greater
-            };
-            // Non-canonical text is dropped *before* the fold, not inside
-            // it. Handling it inside — "a `None` comparison keeps the
-            // accumulator" — reads correct but is not: `reduce` seeds the
-            // accumulator with the first element, so an unparseable *first*
-            // value never loses a comparison and silently wins the whole
-            // fold. Filtering first makes every comparison below a real
-            // one, which also lets the tie arm say exactly what it means.
-            let comparable: Vec<String> = texts
-                .into_iter()
-                .filter(|text| crate::temporal::order_key(pg_type, text).is_ok())
-                .collect();
-            if comparable.is_empty() {
-                return Ok(None);
-            }
-            let winner = comparable
-                .into_iter()
-                .reduce(|a, b| match crate::temporal::compare(pg_type, &b, &a) {
-                    // A tie keeps the incoming value, matching Postgres's
-                    // `date_smaller`-family left fold.
-                    Some(ordering) if ordering == keep => b,
-                    _ => a,
-                })
-                .expect("checked non-empty above");
-            Ok(Some(Value::Other(pg_type, winner)))
-        }
-        "SUM" => {
-            let mut acc = crate::temporal::Interval::default();
-            for text in &texts {
-                let Some(interval) = crate::temporal::Interval::parse(text) else {
-                    // Same defense-in-depth: text Postgres itself did not
-                    // produce means the engine's invariants are already
-                    // broken, and dropping the row silently would corrupt
-                    // the sum. Reporting it as an out-of-range fold pauses
-                    // the column (ADR-0003) rather than writing a wrong
-                    // total.
-                    return Err(EvalError::IntervalOutOfRange {
-                        field: field_name.to_string(),
-                    });
-                };
-                acc = acc
-                    .checked_add(interval)
-                    .map_err(|_| EvalError::IntervalOutOfRange {
-                        field: field_name.to_string(),
-                    })?;
-            }
-            Ok(Some(Value::Other(pg_type, acc.render())))
-        }
-        // `AVG` over a temporal type is not an aggregate Postgres has, so
-        // `registry::aggregate_result_type` never admits it and the
-        // validator rejects the definition before this point.
-        _ => Ok(None),
-    }
-}
-
-#[cfg(any(test, feature = "test-util"))]
-/// Folds a group of `Value::Other(PgType::Inet, _)`s for `MIN`/`MAX` (issue
-/// #116) — [`reduce_numeric_aggregate`]'s early-return arm for `inet`, the
-/// same shape [`reduce_temporal_aggregate`] is for the temporal families.
-/// `crate::netaddr::compare` reproduces `network_cmp`'s ordering exactly
-/// (see that module's doc comment for the live cross-checks), so this
-/// function's own fold is otherwise identical to the temporal one: seed from
-/// the first value, keep the incoming value on a tie (Postgres's
-/// `network_larger`-family left fold, `cmp(arg1, arg2) < 0 ? arg1 : arg2`
-/// mirrored the same way #112's float fold and #113's temporal fold both
-/// are), drop any value whose text fails to parse before folding rather than
-/// inside the fold (so an unparseable *first* value can't silently win by
-/// never losing a comparison).
-///
-/// Only `MIN`/`MAX` ever reach here — `registry::aggregate_result_type`
-/// never admits `Other(PgType::Inet)` into `SUM`/`AVG` (there is no such
-/// Postgres aggregate), so the `_ => Ok(None)` arm below is unreachable
-/// through the validator, kept only as the same defense-in-depth every
-/// sibling reducer in this module keeps.
-fn reduce_netaddr_aggregate(name: &str, values: Vec<Value>) -> Result<Option<Value>, EvalError> {
-    let texts: Vec<String> = values
-        .into_iter()
-        .filter_map(|value| match value {
-            Value::Other(PgType::Inet, text) => Some(text),
-            _ => None,
-        })
-        .collect();
-    if texts.is_empty() {
-        return Ok(None);
-    }
-
-    match name {
-        "MIN" | "MAX" => {
-            let keep = if name == "MIN" {
-                std::cmp::Ordering::Less
-            } else {
-                std::cmp::Ordering::Greater
-            };
-            let comparable: Vec<String> = texts
-                .into_iter()
-                .filter(|text| crate::netaddr::compare(text, text).is_some())
-                .collect();
-            if comparable.is_empty() {
-                return Ok(None);
-            }
-            let winner = comparable
-                .into_iter()
-                .reduce(|a, b| match crate::netaddr::compare(&b, &a) {
-                    Some(ordering) if ordering == keep => b,
-                    _ => a,
-                })
-                .expect("checked non-empty above");
-            Ok(Some(Value::Other(PgType::Inet, winner)))
-        }
-        _ => Ok(None),
-    }
-}
-
-#[cfg(any(test, feature = "test-util"))]
-/// Folds a group of `Value::Other(PgType::Enum(_), _)`s for `MIN`/`MAX`
-/// (issue #117) — [`reduce_numeric_aggregate`]'s early-return arm for enum
-/// types, the same shape [`reduce_netaddr_aggregate`]/[`reduce_temporal_aggregate`]
-/// are for their own families, with one genuine, structural difference from
-/// every sibling reducer in this module.
-///
-/// Every other family this module folds `MIN`/`MAX` over — `date`/`time`/
-/// `interval`, `inet`, the exact-numeric/float families — has an ordering
-/// that is a *fixed, universal* property of the family itself, reproducible
-/// in pure Rust with no connection (`crate::temporal`'s/`crate::netaddr`'s/
-/// `crate::float`'s own comparison functions). An enum's ordering is not:
-/// it is a *live, per-type, schema-defined* fact
-/// (`pg_enum.enumsortorder`, set by creation order and mutable afterward via
-/// `ALTER TYPE ... ADD VALUE`), so there is no `crate::pg_enum::compare` this
-/// function could call the way its siblings do. Rather than guess (a
-/// lexicographic fallback on the label text would be exactly the "silent,
-/// wrong-order fold" issue #117 exists to rule out — see
-/// `EvalError::EnumOrderingUnavailable`'s own doc comment), this function
-/// answers only the one case it *can* answer honestly without a connection:
-/// a group whose values are all textually identical needs no ordering at
-/// all (`MIN`/`MAX` of one repeated value is that value, regardless of what
-/// order the type's other, absent-from-this-group labels would sort in).
-/// Any group with more than one distinct value raises
-/// [`EvalError::EnumOrderingUnavailable`] — see that variant's own doc
-/// comment for exactly which production paths can and cannot reach that
-/// case (in short: never the real one, the ledger's `KeySpace::Aggregate`
-/// `MIN`/`MAX` handling, which always asks Postgres directly instead of
-/// calling this function over a multi-row group).
-fn reduce_enum_aggregate(
-    name: &str,
-    values: Vec<Value>,
-    field_name: &str,
-) -> Result<Option<Value>, EvalError> {
-    let mut texts = values.into_iter().filter_map(|value| match value {
-        Value::Other(pg_type @ PgType::Enum(_), text) => Some((pg_type, text)),
-        _ => None,
-    });
-    let Some((pg_type, first)) = texts.next() else {
-        return Ok(None);
-    };
-    match name {
-        "MIN" | "MAX" => {
-            for (_, text) in texts {
-                if text != first {
-                    return Err(EvalError::EnumOrderingUnavailable {
-                        field: field_name.to_string(),
-                        function: if name == "MIN" { "MIN" } else { "MAX" },
-                        pg_type: pg_type.enum_qualified_name().unwrap_or("enum"),
-                    });
-                }
-            }
-            Ok(Some(Value::Other(pg_type, first)))
-        }
-        _ => Ok(None),
-    }
-}
-
-#[cfg(any(test, feature = "test-util"))]
-/// (Issue #120) — [`reduce_numeric_aggregate`]'s early-return arm for
-/// [`ValueType::Text`](super::ast::ValueType::Text), the `text` twin of
-/// [`reduce_enum_aggregate`] just above, and for the identical structural
-/// reason (see that function's own doc comment for the fuller version of
-/// this argument).
-///
-/// Every other family this module folds `MIN`/`MAX` over has an ordering
-/// that is either a fixed, universal property of the family itself
-/// (`date`/`time`/`interval`, `inet`, the exact-numeric/float
-/// families — reproducible in pure Rust with no connection) or, for `enum`,
-/// at least resolvable from the *type* alone given a live connection
-/// (`pg_enum.enumsortorder`). Postgres `text` ordering is neither: it is a
-/// property of the *column's own collation* (`pg_attribute.attcollation`),
-/// which can differ column-to-column even within one database, and this
-/// crate tracks no collation metadata anywhere (`docs/type-support.md`'s
-/// `text`/`varchar` row: "requires deterministic collation" — a gap, not a
-/// solved problem, as of this issue). Assuming byte order (Rust's own `Ord`
-/// for `String`, which happens to equal Postgres's `C`/`POSIX` collation)
-/// would silently disagree with a database's actual collation the moment it
-/// isn't byte-order — the exact "silent, wrong-order fold" shape issue #117
-/// was written to rule out for `enum`, one layer over.
-///
-/// This is *not* the gap for the overwhelmingly common case, though: a
-/// `KeySpace::Aggregate` field's own `MIN`/`MAX(text)` is always
-/// [`super::invertibility::Invertibility::RecomputeOnly`], so
-/// the ledger (`staging::ledger`) never calls this function over a
-/// multi-row group at all — it always asks Postgres directly, under whatever the column's *real* collation is. This function answers
-/// only the one case it safely can with no connection: a group whose values
-/// are all textually identical needs no ordering at all (`MIN`/`MAX` of one
-/// repeated value is that value, regardless of what order the collation
-/// would give two *different* strings). Any group with more than one
-/// distinct value raises [`EvalError::TextOrderingUnavailable`] rather than
-/// guess — see that variant's own doc comment for exactly which production
-/// paths can and cannot reach that case (in short: never the real one, the
-/// same as [`EvalError::EnumOrderingUnavailable`]).
-fn reduce_text_aggregate(
-    name: &str,
-    values: Vec<Value>,
-    field_name: &str,
-) -> Result<Option<Value>, EvalError> {
-    let mut texts = values.into_iter().filter_map(|value| match value {
-        Value::Text(text) => Some(text),
-        _ => None,
-    });
-    let Some(first) = texts.next() else {
-        return Ok(None);
-    };
-    match name {
-        "MIN" | "MAX" => {
-            for text in texts {
-                if text != first {
-                    return Err(EvalError::TextOrderingUnavailable {
-                        field: field_name.to_string(),
-                        function: if name == "MIN" { "MIN" } else { "MAX" },
-                    });
-                }
-            }
-            Ok(Some(Value::Text(first)))
-        }
-        _ => Ok(None),
-    }
-}
-
-#[cfg(any(test, feature = "test-util"))]
-/// Folds a group of `Value::Boolean`s for `bool_and`/`bool_or` (issue #119)
-/// — [`reduce_numeric_aggregate`]'s early-return arm for
-/// [`ValueType::Boolean`](super::ast::ValueType::Boolean), the same shape
-/// [`reduce_temporal_aggregate`] is for the temporal families.
-///
-/// Matches Postgres's own `NULL` handling for these two: a `NULL` row is
-/// skipped (already true by the time `values` reaches here — the per-row
-/// `None` filter lives in [`fold_aggregate`],
-/// same as every other aggregate), and an all-`NULL` or empty group folds to
-/// `NULL` — the empty-`values` check at the top of
-/// [`reduce_numeric_aggregate`] already covers that, since this function is
-/// only ever reached with at least one value.
-///
-/// `bool_and` is Postgres's row-wise `AND`, `bool_or` its row-wise `OR` —
-/// both commutative, associative and total over `{true, false}`, so a plain
-/// `Iterator::all`/`any` reproduces the server's fold exactly regardless of
-/// row order; unlike `SUM`/`AVG`'s numeric arms there is no overflow,
-/// rounding or order-dependence to reproduce. `super::invertibility`'s
-/// `BOOL_AND`/`BOOL_OR` arm is `RecomputeOnly` even so — a delete cannot
-/// invert a fold whose only maintained state is its own current one-bit
-/// result — so a production group's value comes from the ledger's
-/// recompute (`staging::ledger`, `bool_and(<col>)` run server-side) and
-/// `defs::backfill`'s plain recompute, never a delta; this function serves
-/// the oracle.
-fn reduce_boolean_aggregate(name: &str, values: Vec<Value>) -> Result<Option<Value>, EvalError> {
-    // Defense-in-depth, as everywhere else in this module: a non-Boolean
-    // value here would mean a hand-built AST bypassed the validator's own
-    // argument check.
-    let bools: Vec<bool> = values
-        .into_iter()
-        .filter_map(|value| match value {
-            Value::Boolean(b) => Some(b),
-            _ => None,
-        })
-        .collect();
-    if bools.is_empty() {
-        return Ok(None);
-    }
-    let result = match name {
-        "BOOL_AND" => bools.into_iter().all(|b| b),
-        "BOOL_OR" => bools.into_iter().any(|b| b),
-        _ => unreachable!("reduce_boolean_aggregate is only called for BOOL_AND/BOOL_OR"),
-    };
-    Ok(Some(Value::Boolean(result)))
-}
-
-#[cfg(any(test, feature = "test-util"))]
-/// Folds a group of `Value::Other(PgType::Bit | PgType::VarBit, _)` bit
-/// strings for `bit_and`/`bit_or` (issue #118) — the bit-string sibling of
-/// [`reduce_boolean_aggregate`], reached the same early-return way.
-///
-/// Matches Postgres's own semantics: a per-*bit-position* `AND`/`OR` fold
-/// across the group, `NULL` skipped (already true by the time `values`
-/// reaches here) and an all-`NULL`/empty group folding to `NULL` (the
-/// empty-`values` check at the top of [`reduce_numeric_aggregate`] already
-/// covers that, since this function is only ever reached with at least one
-/// value). Unlike [`reduce_boolean_aggregate`], there is one operand-shape
-/// hazard to reproduce rather than paper over: Postgres itself refuses to
-/// combine two differently-sized bit strings (`select bit_and(v) from
-/// (values ('1'::bit varying), ('01'::bit varying)) t(v)` raises `cannot AND
-/// bit strings of different sizes` on a live server) rather than
-/// padding/truncating either one — see [`EvalError::BitStringLengthMismatch`],
-/// whose own doc comment is the authoritative account of exactly which
-/// callers can (and, today, cannot) actually reach that branch. A
-/// per-column `bit(n)` argument can never trigger this (every row shares
-/// the column's one fixed length), but an unconstrained `bit varying`
-/// argument genuinely can — in a multi-row caller; the one production
-/// caller of this function only ever hands it one row at a time.
-///
-/// [`super::invertibility::classify`]'s `BIT_AND`/`BIT_OR` arm is
-/// `RecomputeOnly` regardless — see that arm's own doc comment for the
-/// concrete two-deletions demonstration of why a running fold can't invert a
-/// delete — so this function's result, like [`reduce_boolean_aggregate`]'s,
-/// is only ever checked against a live server-side recompute, never
-/// incrementally maintained itself.
-///
-/// The result is always tagged [`PgType::VarBit`], never the argument's own
-/// [`PgType::Bit`] — mirroring `registry::aggregate_result_type`'s
-/// deliberate widening (see that function's own `BIT_AND`/`BIT_OR` doc
-/// comment for the DDL-typmod reason bare `bit` can't be a target column).
-/// `bit_out`/`varbit_out` render identically (bare `'0'`/`'1'` characters,
-/// no type-identifying wrapper), so retagging the family changes nothing
-/// about the text this function produces.
-fn reduce_bit_aggregate(
-    name: &str,
-    values: Vec<Value>,
-    field_name: &str,
-) -> Result<Option<Value>, EvalError> {
-    // Defense-in-depth, as everywhere else in this module: a value of
-    // another family here would mean a hand-built AST bypassed the
-    // validator's own argument check.
-    let bits: Vec<String> = values
-        .into_iter()
-        .filter_map(|value| match value {
-            Value::Other(PgType::Bit | PgType::VarBit, text) => Some(text),
-            _ => None,
-        })
-        .collect();
-    if bits.is_empty() {
-        return Ok(None);
-    }
-    let op = match name {
-        "BIT_AND" => "AND",
-        "BIT_OR" => "OR",
-        _ => unreachable!("reduce_bit_aggregate is only called for BIT_AND/BIT_OR"),
-    };
-
-    let mut bits = bits.into_iter();
-    let mut acc = bits.next().expect("checked non-empty above");
-    for next in bits {
-        if next.len() != acc.len() {
-            return Err(EvalError::BitStringLengthMismatch {
-                field: field_name.to_string(),
-                op,
-                len_a: acc.len(),
-                len_b: next.len(),
-            });
-        }
-        acc = acc
-            .bytes()
-            .zip(next.bytes())
-            .map(|(a, b)| {
-                let (a, b) = (a == b'1', b == b'1');
-                let bit = if op == "AND" { a && b } else { a || b };
-                if bit { '1' } else { '0' }
-            })
-            .collect();
-    }
-    Ok(Some(Value::Other(PgType::VarBit, acc)))
 }
 
 /// `+` and `>` both take exact-numeric-family operands — [`Value::Numeric`]
@@ -3209,43 +2230,6 @@ mod tests {
     }
 
     #[test]
-    fn bool_and_and_bool_or_fold_a_mixed_group() {
-        let d = aggregate_def(
-            &["id"],
-            vec![
-                FieldDef {
-                    name: "id".to_string(),
-                    expr: col("id"),
-                },
-                FieldDef {
-                    name: "all_true".to_string(),
-                    expr: call("BOOL_AND", vec![col("flag")]),
-                },
-                FieldDef {
-                    name: "any_true".to_string(),
-                    expr: call("BOOL_OR", vec![col("flag")]),
-                },
-            ],
-        );
-        // One `NULL` row mixed in — Postgres skips it, matching every other
-        // aggregate's "aggregate of non-NULL values" rule.
-        let rows = vec![
-            row(&[("id", Some("1")), ("flag", Some("true"))]),
-            row(&[("id", Some("1")), ("flag", None)]),
-            row(&[("id", Some("1")), ("flag", Some("false"))]),
-        ];
-        let result = evaluate_aggregate(
-            &d,
-            &rows,
-            &id_and_boolean_flag_types(),
-            &mut RegexCache::new(),
-        )
-        .unwrap();
-        assert_eq!(result["all_true"], Some(Value::Boolean(false)));
-        assert_eq!(result["any_true"], Some(Value::Boolean(true)));
-    }
-
-    #[test]
     fn bool_and_and_bool_or_over_an_all_null_group_are_null() {
         let d = aggregate_def(
             &["id"],
@@ -3279,83 +2263,14 @@ mod tests {
         assert_eq!(result["any_true"], None);
     }
 
-    // -------------------------------------------------------------
-    // Issue #117: reduce_enum_aggregate
-    // -------------------------------------------------------------
-
-    fn priority_enum() -> PgType {
-        PgType::Enum("enum:public.priority_enum")
-    }
-
-    /// A group whose values are all the same label needs no ordering
-    /// knowledge at all — `MIN`/`MAX` of one repeated value is that value,
-    /// regardless of what order the type's *other*, absent-from-this-group
-    /// labels would sort in. No live connection is needed or used.
-    #[test]
-    fn a_single_distinct_value_enum_group_folds_with_no_live_connection() {
-        let pg_type = priority_enum();
-        let values = vec![
-            Value::Other(pg_type, "medium".to_string()),
-            Value::Other(pg_type, "medium".to_string()),
-            Value::Other(pg_type, "medium".to_string()),
-        ];
-        for name in ["MIN", "MAX"] {
-            let out = reduce_enum_aggregate(name, values.clone(), "out").unwrap();
-            assert_eq!(out, Some(Value::Other(pg_type, "medium".to_string())));
-        }
-    }
-
-    /// An empty group (every row filtered out upstream) folds to `NULL`,
-    /// matching every other aggregate's "zero non-NULL values is NULL" rule
-    /// — checked directly since this function's own empty-check runs before
-    /// its distinct-value check.
-    #[test]
-    fn an_empty_enum_group_folds_to_null() {
-        assert_eq!(reduce_enum_aggregate("MIN", vec![], "out").unwrap(), None);
-    }
-
-    /// The core guard this issue exists for: a genuine multi-distinct-value
-    /// group cannot be resolved without knowing the type's live
-    /// creation-order comparison, which this pure, DB-less evaluator has no
-    /// way to ask for — so it refuses rather than fall back to any implicit
-    /// `Ord` on the label text (which would silently be alphabetical, not
-    /// creation-order, and wrong).
-    #[test]
-    fn a_multi_distinct_value_enum_group_refuses_rather_than_guess() {
-        let pg_type = priority_enum();
-        // Chosen so a lexicographic ("high" < "low" < "medium") and a
-        // creation-order ("low" < "medium" < "high", say) comparison would
-        // disagree — not that it matters, since this must refuse either way
-        // rather than silently pick one.
-        let values = vec![
-            Value::Other(pg_type, "medium".to_string()),
-            Value::Other(pg_type, "low".to_string()),
-            Value::Other(pg_type, "high".to_string()),
-        ];
-        for name in ["MIN", "MAX"] {
-            let err = reduce_enum_aggregate(name, values.clone(), "out").unwrap_err();
-            assert!(
-                matches!(
-                    err,
-                    EvalError::EnumOrderingUnavailable {
-                        ref field,
-                        function,
-                        pg_type: "public.priority_enum",
-                    } if field == "out" && function == name
-                ),
-                "got {err:?}"
-            );
-        }
-    }
-
     /// Issue #695: an aggregate's argument reads the source column when a
-    /// field of the same name is itself an aggregate, so `MIN(val)` after
-    /// `SUM(val) AS val` is the minimum of the rows, not of the sum.
+    /// field of the same name is itself an aggregate, so `AVG(val)` after
+    /// `SUM(val) AS val` is the average of the rows, not of the sum.
     #[test]
     fn an_aggregate_argument_reads_the_source_column_not_a_field_of_that_name() {
         let d = crate::defs::parse(
             "TRANSFORM t FROM s GROUP BY grp SELECT grp AS grp, SUM(val) AS val, \
-             COUNT(*) AS row_count, MIN(val) AS lo, MAX(val) AS hi, COUNT(val) AS seen",
+             COUNT(*) AS row_count, AVG(val) AS mean, COUNT(val) AS seen",
         )
         .expect("parse");
         let rows = vec![
@@ -3373,8 +2288,7 @@ mod tests {
         let text = |field: &str| result[field].as_ref().unwrap().to_string();
         assert_eq!(text("val"), "14");
         assert_eq!(text("row_count"), "3");
-        assert_eq!(text("lo"), "2");
-        assert_eq!(text("hi"), "7");
+        assert_eq!(text("mean"), "4.6666666666666667");
         assert_eq!(text("seen"), "3");
     }
 }

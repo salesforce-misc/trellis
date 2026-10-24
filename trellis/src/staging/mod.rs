@@ -114,8 +114,6 @@ pub use claim::{
 #[cfg(any(test, feature = "internals"))]
 pub use drift_memo::checks as drift_checks;
 pub use error::StagingError;
-#[cfg(any(test, feature = "internals"))]
-pub use ledger::explain_page as explain_ledger_page;
 pub use liveness::{
     DEFAULT_RECLAIM_TTL, HeartbeatDaemon, HeartbeatDaemonConfig, reclaim_stale, release_segments,
 };

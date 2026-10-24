@@ -177,11 +177,9 @@ use super::fold::{FoldedChange, earliest_origin};
 use super::group_basis::{self, Arg, GroupShape, GroupTargetPlan, Writer};
 use super::target_mutations::TargetMutations;
 
-/// Whether `def` is a `JOIN` that applies: always, unless a test forced the
-/// group-basis knob off (`super::group_basis::enabled`), when it stays
-/// `waiting_to_backfill`.
+/// Whether `def` is a `JOIN`, which always applies.
 pub(crate) fn applies(def: &TransformDef) -> bool {
-    matches!(def.key_space, KeySpace::Join(_)) && group_basis::enabled()
+    matches!(def.key_space, KeySpace::Join(_))
 }
 
 /// One side's part of a [`JoinTargetPlan`].

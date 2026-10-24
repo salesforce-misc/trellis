@@ -50,8 +50,6 @@
 //!   one before a baseline records it is step 3;
 //! - integer and float widths, the only changes that re-type a copy
 //!   (`capture_key_retype.rs`);
-//! - the ledger `GROUP BY` path, whose copies are family-typed like the
-//!   group-basis ones and which needs the group-basis knob off.
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
@@ -751,7 +749,6 @@ async fn copies_with_a_modifier(d: &Driver) -> Vec<String> {
 
 async fn run(place: Place, ty: &Ty, change: Change, row: &Row) -> Outcome {
     let scn = scenario(place, ty, row);
-    trellis::dev::staging::set_group_basis(true);
     let ddl = format!("{}{}", ty.prelude, scn.ddl);
     let mut d = Driver::start(&ddl, &scn.columns, &[scn.definition], scn.captured).await;
     assert_eq!(
@@ -966,7 +963,6 @@ async fn cell(place: Place, ty: &Ty, change: Change) {
 /// fails here until its cells are filled in.
 #[tokio::test]
 async fn a_type_a_place_refuses_is_refused() {
-    trellis::dev::staging::set_group_basis(true);
     let cluster = TestCluster::start();
     let mut accepted = Vec::new();
     for ty in TYPES {
@@ -1009,7 +1005,6 @@ async fn a_type_a_place_refuses_is_refused() {
 /// `search_path` (`public` here) is never the one it gets (ADR-0020).
 #[tokio::test]
 async fn a_join_key_keeps_its_collation_from_another_schema() {
-    trellis::dev::staging::set_group_basis(true);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let client = db.pool.get().await.expect("connection");
@@ -1068,7 +1063,6 @@ async fn a_join_key_keeps_its_collation_from_another_schema() {
 /// #1120; the same `SUM` over the source column is accepted.
 #[tokio::test]
 async fn a_chained_sum_over_a_targets_numeric_copy_is_refused_by_name() {
-    trellis::dev::staging::set_group_basis(true);
     let d = Driver::start(
         "create table public.t (id integer primary key, g integer, price numeric(10,2)); \
          create table public.o (id integer primary key, g integer); \
@@ -1155,7 +1149,6 @@ matrix! {
 /// change to the source column.
 #[tokio::test]
 async fn a_trellis_copy_pairs_with_a_source_column_of_any_modifier() {
-    trellis::dev::staging::set_group_basis(true);
     let mut refused = Vec::new();
     let mut tried = 0;
     // A re-type to another enum changes the type, not a modifier: the pair
@@ -1221,7 +1214,6 @@ async fn a_trellis_copy_pairs_with_a_source_column_of_any_modifier() {
 /// captured tables as rows reach both sides.
 #[tokio::test]
 async fn a_trellis_copy_joins_a_modified_source_column_end_to_end() {
-    trellis::dev::staging::set_group_basis(true);
     let mut cells = 0;
     for ty in TYPES
         .iter()
@@ -1316,7 +1308,6 @@ async fn a_trellis_copy_joins_a_modified_source_column_end_to_end() {
 /// (`integer` against `bigint`) or another collation is refused.
 #[tokio::test]
 async fn join_on_pairs_the_string_family_and_refuses_other_types_and_collations() {
-    trellis::dev::staging::set_group_basis(true);
     let cluster = TestCluster::start();
     let define = |left: &'static str, right: &'static str, collate: &'static str| {
         let cluster = &cluster;
@@ -1383,7 +1374,6 @@ async fn join_on_pairs_the_string_family_and_refuses_other_types_and_collations(
 /// equals the oracle.
 #[tokio::test]
 async fn paired_string_keys_of_different_bounds_never_truncate() {
-    trellis::dev::staging::set_group_basis(true);
     let mut d = Driver::start(
         "create table public.a (id integer primary key, k varchar(50), x integer); \
          create table public.b (id integer primary key, k varchar(10), y integer); \

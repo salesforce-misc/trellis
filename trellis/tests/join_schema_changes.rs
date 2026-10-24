@@ -4,8 +4,7 @@
 //! pass. No table a `JOIN` or a group-basis aggregate creates holds a bounded
 //! `varchar`.
 //!
-//! The group-basis dev knob is on before the driver starts (a `JOIN`
-//! applies only behind it); the pipeline and the pass are stepped by hand
+//! The pipeline and the pass are stepped by hand
 //! (`support/drain_driver.rs`), and nothing polls for convergence (#297).
 
 #[path = "support/drain_driver.rs"]
@@ -35,7 +34,6 @@ const ORACLE: &str = "select a.g, b.h, count(*)::bigint as n, sum(a.x)::bigint a
                       from public.a left join public.b on a.k = b.k group by a.g, b.h";
 
 async fn start() -> Driver {
-    trellis::dev::staging::set_group_basis(true);
     Driver::start(
         DDL,
         &[

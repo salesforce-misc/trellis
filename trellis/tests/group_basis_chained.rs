@@ -5,8 +5,7 @@
 //! target-mutation seam, and a target with a group-basis reader is on the
 //! seam's image feed (`staging::target_mutations`, "The image feed"). Each
 //! test here drives the pipeline by hand through `support/drain_driver.rs`
-//! with the group-basis dev knob on, and none sleeps or polls for
-//! convergence (#297). Every source starts empty and is written through
+//! and none sleeps or polls for convergence (#297). Every source starts empty and is written through
 //! capture once every definition is live, except where a test says it builds
 //! over rows.
 //!
@@ -60,7 +59,6 @@ async fn start(
     downstream_columns: &[(&str, ValueType)],
     aggregates: usize,
 ) -> Driver {
-    trellis::dev::staging::set_group_basis(true);
     let mut d = Driver::start(SRC_DDL, &src_columns(), &[upstream], &[SRC]).await;
     install(&d, downstream, downstream_columns).await;
     trellis::intake::markers::settle_registrations(d.pool()).await;
@@ -292,7 +290,6 @@ async fn a_rollup_follows_upstream_groups_emptied_and_refilled_in_one_page() {
 /// (#1101) counts it and the reader goes `live` with it.
 #[tokio::test]
 async fn a_reader_defined_while_an_upstream_writer_is_in_flight_does_not_miss_its_write() {
-    trellis::dev::staging::set_group_basis(true);
     let mut d = Driver::start(SRC_DDL, &src_columns(), &[ONE], &[SRC]).await;
     write(&d, "insert into public.src values (1, 1, 0, 5)").await;
     let batch = d.seal().await;
@@ -341,7 +338,6 @@ async fn a_reader_defined_while_an_upstream_writer_is_in_flight_does_not_miss_it
 /// build's plan waits on its fence, then one absolute write counts them.
 #[tokio::test]
 async fn a_reader_defined_over_a_seeded_upstream_builds_from_its_rows() {
-    trellis::dev::staging::set_group_basis(true);
     let mut d = Driver::start(SRC_DDL, &src_columns(), &[ONE], &[SRC]).await;
     step(
         &mut d,
@@ -602,7 +598,6 @@ async fn a_one_to_one_reader_holds_the_null_keyed_groups() {
 /// holds the `NULL` group as the `JOIN` target does (#1141).
 #[tokio::test]
 async fn a_one_to_one_reader_of_a_join_target_holds_the_null_group() {
-    trellis::dev::staging::set_group_basis(true);
     let mut d = Driver::start(
         "create table public.a (id integer primary key, ga integer, k integer, x integer); \
          create table public.b (id integer primary key, k integer, y integer); \
@@ -870,7 +865,6 @@ fn up_columns() -> Vec<(&'static str, ValueType)> {
 /// `NULL`) live over a captured `src` seeded with rows in `NULL`-part groups,
 /// and `roll` not yet defined over it.
 async fn seeded_upstream() -> Driver {
-    trellis::dev::staging::set_group_basis(true);
     let mut d = Driver::start(SRC_DDL, &src_columns(), &[UP_HG], &[SRC]).await;
     step(
         &mut d,

@@ -133,9 +133,9 @@ pub enum FailureClass {
 pub fn classify(err: &ApplyError) -> FailureClass {
     match innermost_apply_error(err) {
         ApplyError::VersionFenceMiss { .. } => FailureClass::VersionFenceMiss,
-        ApplyError::HopBoundExceeded { .. }
-        | ApplyError::AggregateOffLedger { .. }
-        | ApplyError::GroupBasisUnsupported { .. } => FailureClass::Halting,
+        ApplyError::HopBoundExceeded { .. } | ApplyError::GroupBasisUnsupported { .. } => {
+            FailureClass::Halting
+        }
         // A truncate the drain can't raise a floor for (#774) is no key's
         // fault: every page holding it reproduces it.
         ApplyError::TruncateWithoutLsn { .. } => FailureClass::Halting,
@@ -4367,10 +4367,6 @@ async fn complete_resume(
         &[&TransformStatus::WaitingToBackfill.as_str(), &id],
     )
     .await?;
-    // #1324: whether the source's key is still the one the definition's
-    // stored keys are keyed under, read before `record_definition` below
-    // records the key it has now.
-    let key_changed = source_key_changed(txn, id, source_table).await?;
     // #708, #767: the rebuild casts each source value through its live type,
     // and the capture pass compares the key columns against what it builds
     // from.
@@ -4396,7 +4392,7 @@ async fn complete_resume(
     // waited until every change staged before the change had drained
     // ([`relabel_changes_pending`]);
     // those still in their ring slot are discarded, since a group-basis or
-    // JOIN rebuild reads the old images in the ring. A ledger keyed by a
+    // JOIN rebuild reads the old images in the ring. A 1-1 ledger keyed by a
     // source key with an enum column holds the old label as `__from_key`,
     // which the rebuild's sweep would cast: such a target starts again from
     // empty.
@@ -4404,9 +4400,7 @@ async fn complete_resume(
         let mut tables = vec![source_table.to_string()];
         tables.extend(revalidated.join.as_ref().map(|sides| sides.joined.clone()));
         discard_drained_changes(txn, &tables, gate).await?;
-        if revalidated.join.is_none()
-            && super::group_basis::route(&definition.def, &revalidated.source_columns).is_none()
-        {
+        if matches!(definition.def.key_space, KeySpace::OneToOne) {
             empty_if_keyed_by_an_enum(txn, source_table, &definition.target_table).await?;
         }
     }
@@ -4448,18 +4442,6 @@ async fn complete_resume(
         &[&id],
     )
     .await?;
-
-    // #1324: a ledger keyed under a key the source no longer has (it was
-    // dropped and created again with another, or its key constraint was
-    // replaced) names no row of the table now at the name. Its entries are
-    // retired rather than kept for the rebuild, which would decode them
-    // against the new key. After the wait above, so no chunk of the old
-    // build is still writing them. A 1-1 target in that case was refused
-    // (`catalog::revalidate`), and the group basis and a `JOIN` recreate
-    // what they keep, below and above.
-    if key_changed {
-        super::build::retire_ledger(txn, definition).await?;
-    }
 
     // #1101: a group-basis aggregate's partials are fully derived, so the
     // resume drops and recreates them at the shape define would give them
@@ -4591,8 +4573,8 @@ async fn discard_drained_changes(
     Ok(())
 }
 
-/// Empties the ledger target `target` (qualified), its ledger and its
-/// group-delta table, when the row-identity key of `source_table` has a
+/// Empties the 1-1 target `target` (qualified) and its ledger when the
+/// row-identity key of `source_table` has a
 /// column of an enum type (#1241). Its ledger's `__from_key` is that key as
 /// text, and after a relabel an entry may name a label that no longer
 /// exists, which the rebuild's sweep would cast to the key's type. Emptied,
@@ -4626,7 +4608,6 @@ async fn empty_if_keyed_by_an_enum(
     for table in [
         target.to_string(),
         crate::defs::ledger::ledger_table_name(target),
-        crate::defs::ledger::deltas_table_name(target),
     ] {
         let arg = ddl::regclass_arg(&table);
         let exists: bool = txn
@@ -4688,33 +4669,6 @@ async fn reset_ordering_state(
     )
     .await?;
     Ok(())
-}
-
-/// Whether definition `id`'s `source` no longer has the key its stored keys
-/// are keyed under (#1324): the key columns, in key order, recorded at define
-/// or at its last resume (`transform_definitions.source_key`), against the
-/// source's now. `false` when none is recorded.
-async fn source_key_changed(
-    txn: &Transaction<'_>,
-    id: i64,
-    source: &str,
-) -> Result<bool, ApplyError> {
-    let recorded: Option<Vec<String>> = txn
-        .query_one(
-            "select source_key from transform_definitions where id = $1",
-            &[&id],
-        )
-        .await?
-        .get(0);
-    let Some(recorded) = recorded else {
-        return Ok(false);
-    };
-    let live: Vec<String> = ddl::identity_key_columns(txn, source)
-        .await?
-        .into_iter()
-        .map(|c| c.name)
-        .collect();
-    Ok(recorded != live)
 }
 
 /// How long the staging worker waits for the lock on a table whose copies
@@ -7233,12 +7187,14 @@ mod unit_tests {
         assert_eq!(classify(&err), FailureClass::Halting);
     }
 
-    /// Every key of an off-ledger aggregate target reproduces the failure,
-    /// so isolating it would quarantine the whole target a key at a time.
+    /// Every key of a group-basis target that can't apply reproduces the
+    /// failure, so isolating it would quarantine the whole target a key at
+    /// a time.
     #[test]
-    fn classify_maps_an_off_ledger_aggregate_to_halting() {
-        let err = ApplyError::AggregateOffLedger {
+    fn classify_maps_an_unsupported_group_basis_target_to_halting() {
+        let err = ApplyError::GroupBasisUnsupported {
             target: "t".to_string(),
+            what: "a test",
         };
         assert_eq!(classify(&err), FailureClass::Halting);
     }

@@ -1,10 +1,7 @@
 //! Deterministic interleavings of the drain on a group-basis aggregate
 //! (#1100 G2a, ADR-0002 "Aggregates: a basis per group, kept by deltas").
 //!
-//! Every test in this binary turns the group-basis dev knob on
-//! (`trellis::dev::staging::set_group_basis`) before its driver starts; the
-//! knob is process-wide, and no test here wants the ledger. Each test drives
-//! one interleaving by hand through `support/drain_driver.rs`, and none
+//! Each test drives one interleaving by hand through `support/drain_driver.rs`, and none
 //! sleeps or polls for convergence (#297). Every source starts empty and is
 //! seeded through capture.
 //!
@@ -44,7 +41,6 @@ async fn start_with(
     columns: &[(&str, ValueType)],
     app: &str,
 ) -> Driver {
-    trellis::dev::staging::set_group_basis(true);
     let d = Driver::start(
         &format!("{source_ddl}; {app}"),
         columns,
@@ -1307,7 +1303,6 @@ async fn the_evicting_changes_groups_are_held_and_released() {
 /// basis (#1096 decision 2).
 #[tokio::test]
 async fn define_refuses_an_unconstrained_numeric_sum() {
-    trellis::dev::staging::set_group_basis(true);
     let cluster = testkit::TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let client = drain_driver::connect(db.dsn()).await;

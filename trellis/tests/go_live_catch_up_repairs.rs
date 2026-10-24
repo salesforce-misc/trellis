@@ -15,31 +15,12 @@
 //!   build: same row count, no row with a fresh `xmin`. The coverage skip
 //!   took that for "unchanged" and kept the deleted row counted.
 //! - #485: a delete that drained while the definition was `backfilling`
-//!   leaves a 1-1 row, or an aggregate group with no rows left, that the
-//!   re-read can't reach.
+//!   leaves a 1-1 row that the re-read can't reach.
 //!
-//! Each test ends with the definition `live` after the discharge, and the
-//! target equal to the source.
-//!
-//! The aggregate's source is held out of the Re-derive build
-//! ([`markers::hold_out_of_the_rederive_build`]), so it takes the direct build
-//! and its go-live catch-up, which survive until #625 F10. That direct build
-//! loads the per-row ledger, which the group-basis default no longer creates,
-//! so the aggregate tests run only with the knob off. Every other
-//! aggregate is the Re-derive build's since #625 F5: it applies from its
-//! start and has no catch-up to repair anything (`tests/rederive_build.rs`,
-//! `tests/build_interleavings.rs`).
-//!
-//! The aggregate build is held with event triggers on advisory locks the
-//! test holds, at the two `ALTER TABLE`s around its ledger load (#623 D2),
-//! told apart by their text: the one dropping the ledger's key (before the source read) and the one
-//! adding it back (after the read, before the target write). The second has
-//! no xid when the trigger fires, so the build held there doesn't hold back
-//! the seal gate; the first runs in the load's transaction, and the tests
-//! seal nothing while it's held. The chunked 1-1 test drives
-//! `claim_chunks` / `run_claimed_chunk` / `finish_chunk` by hand, over a
-//! seam-fed source: over a captured one a plain 1-1 is the Re-derive
-//! build's since #625 F8a.
+//! The test ends with the definition `live` after the discharge, and the
+//! target equal to the source. It drives `claim_chunks` / `run_claimed_chunk`
+//! / `finish_chunk` by hand, over a seam-fed source: over a captured one a
+//! plain 1-1 is the Re-derive build's since #625 F8a.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -55,10 +36,6 @@ use trellis::staging::{has_pending, retire_drained_segments};
 
 const TEST_NAME: &str = "go_live_catch_up_repairs_test";
 const WAKE: &str = "go_live_catch_up_repairs_wake";
-/// Held by the test while the build waits before its read.
-const BEFORE_READ: i64 = 4681;
-/// Held by the test while the build waits between its read and its write.
-const AFTER_READ: i64 = 4682;
 
 async fn connect_raw(dsn: &str) -> Client {
     let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
@@ -100,47 +77,6 @@ async fn discharge_markers(pool: &trellis::Pool, client: &mut Client) {
     drain_to_quiescence(pool, client).await;
 }
 
-/// Parks the build's ledger-key drop on [`BEFORE_READ`] and its re-add on
-/// [`AFTER_READ`].
-async fn install_build_holds(client: &Client) {
-    client
-        .batch_execute(&format!(
-            "create function hold_direct_build() returns event_trigger \
-             language plpgsql as $$ \
-             declare held bigint := case \
-                 when current_query() ilike '%drop constraint%' then {BEFORE_READ} \
-                 when current_query() ilike '%add primary key%' then {AFTER_READ} end; \
-             begin \
-               if held is null then return; end if; \
-               perform pg_advisory_lock(held); \
-               perform pg_advisory_unlock(held); \
-             end $$; \
-             create event trigger hold_direct_build on ddl_command_start \
-               when tag in ('ALTER TABLE') execute function hold_direct_build()"
-        ))
-        .await
-        .expect("install the build-hold event trigger");
-}
-
-async fn wait_for_hold(client: &Client, lock: i64) {
-    for _ in 0..500 {
-        let held: bool = client
-            .query_one(
-                "select exists (select 1 from pg_locks \
-                 where locktype = 'advisory' and objid = $1 and not granted)",
-                &[&(lock as u32)],
-            )
-            .await
-            .expect("read pg_locks")
-            .get(0);
-        if held {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("the direct build never reached hold {lock}");
-}
-
 /// Commits `sql` and stages `change` (built from the write's LSN) in one
 /// transaction, as capture would stage it.
 async fn commit_and_stage(client: &mut Client, sql: &str, change: impl Fn(PgLsn) -> StagedChange) {
@@ -175,76 +111,6 @@ fn cdc_for(key: &str, op: CdcOp, lsn: PgLsn, old: Option<&str>, new: Option<&str
     }
 }
 
-/// Registers `sku_totals` over `public.sales` (`sku = 'a'` totalling `12`)
-/// and starts its build, returning once the build is parked before its read.
-/// The build task runs the build to completion and leaves the definition
-/// `catching_up`, with its go-live catch-up parked for [`discharge_markers`].
-async fn start_held_build(pool: &trellis::Pool, client: &Client) -> tokio::task::JoinHandle<()> {
-    client
-        .batch_execute(
-            "create table public.sales (id integer primary key, sku text, amount integer); \
-             insert into public.sales values (1, 'a', 5), (2, 'a', 7), (3, 'b', 2)",
-        )
-        .await
-        .expect("create + seed sales");
-    markers::hold_out_of_the_rederive_build(client, "public.sales")
-        .await
-        .expect("hold sales out of the Re-derive build");
-    install_build_holds(client).await;
-    for lock in [BEFORE_READ, AFTER_READ] {
-        client
-            .query_one("select pg_advisory_lock($1)", &[&lock])
-            .await
-            .expect("take a hold lock");
-    }
-    install_definition(
-        pool,
-        "TRANSFORM sku_totals FROM sales GROUP BY sku \
-        WITHOUT SOURCE INDEX SELECT sum(amount) AS total",
-        &HashMap::from([
-            ("id".to_string(), ValueType::Numeric),
-            ("sku".to_string(), ValueType::Text),
-            ("amount".to_string(), ValueType::Numeric),
-        ]),
-        "public",
-    )
-    .await
-    .expect("install the aggregate");
-    let pool = pool.clone();
-    let build = tokio::spawn(async move { markers::settle_builds(&pool).await });
-    wait_for_hold(client, BEFORE_READ).await;
-    assert_old_build(client).await;
-    build
-}
-
-/// The build parked at the hold is the old direct build's job, not a
-/// Re-derive build (#625 F5): the definition records no `build`, and its
-/// build is a `direct` chunk.
-async fn assert_old_build(client: &Client) {
-    let row = client
-        .query_one(
-            "select d.build is null, \
-                    (select count(*) from backfill_chunks c \
-                     where c.definition_id = d.id and c.kind = 'direct') \
-             from transform_definitions d where d.target_table = 'public.sku_totals'",
-            &[],
-        )
-        .await
-        .expect("read the definition's build");
-    assert!(
-        row.get::<_, bool>(0),
-        "an aggregate held out of the Re-derive build takes the old build"
-    );
-    assert_eq!(row.get::<_, i64>(1), 1, "its build is a direct-build job");
-}
-
-async fn release(client: &Client, lock: i64) {
-    client
-        .query_one("select pg_advisory_unlock($1)", &[&lock])
-        .await
-        .expect("release a hold");
-}
-
 async fn status_of(client: &Client, target: &str) -> String {
     client
         .query_one(
@@ -256,150 +122,10 @@ async fn status_of(client: &Client, target: &str) -> String {
         .get(0)
 }
 
-async fn totals(client: &Client) -> Vec<(String, String)> {
-    client
-        .query(
-            "select sku, coalesce(total::text, 'NULL') from sku_totals order by sku",
-            &[],
-        )
-        .await
-        .expect("read sku_totals")
-        .into_iter()
-        .map(|r| (r.get(0), r.get(1)))
-        .collect()
-}
-
-fn expected(rows: &[(&str, &str)]) -> Vec<(String, String)> {
-    rows.iter()
-        .map(|(a, b)| (a.to_string(), b.to_string()))
-        .collect()
-}
-
 const ROW_4: &str = r#"{"id":"4","sku":"SKU","amount":"1000"}"#;
 
 fn row_4(sku: &str) -> String {
     ROW_4.replace("SKU", sku)
-}
-
-/// #468's probe: the row is inserted after the build started and before its
-/// read, the build counts it, and it is deleted once the build has finished.
-/// Both CDC changes drain after that, in one batch, where they cancel out,
-/// so only the go-live catch-up's re-read of `a` can take the row back out.
-/// The source then has the row count and `xmin`s it had before the build,
-/// which the coverage skip took for "unchanged".
-#[tokio::test]
-#[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
-async fn a_row_inserted_during_the_build_and_deleted_after_it_is_not_left_counted() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
-    let build = start_held_build(&db.pool, &client).await;
-
-    let image = row_4("a");
-    commit_and_stage(
-        &mut client,
-        "insert into public.sales values (4, 'a', 1000)",
-        |lsn| cdc(CdcOp::Insert, lsn, None, Some(&image)),
-    )
-    .await;
-    release(&client, BEFORE_READ).await;
-    release(&client, AFTER_READ).await;
-    build.await.expect("build task");
-    assert_eq!(
-        totals(&client).await,
-        expected(&[("a", "1012"), ("b", "2")]),
-        "the build read the inserted row"
-    );
-    assert_eq!(status_of(&client, "public.sku_totals").await, "catching_up");
-
-    commit_and_stage(
-        &mut client,
-        "delete from public.sales where id = 4",
-        |lsn| cdc(CdcOp::Delete, lsn, Some(&image), None),
-    )
-    .await;
-    drain_to_quiescence(&db.pool, &mut client).await;
-    discharge_markers(&db.pool, &mut client).await;
-
-    assert_eq!(status_of(&client, "public.sku_totals").await, "live");
-    assert_eq!(totals(&client).await, expected(&[("a", "12"), ("b", "2")]));
-}
-
-/// As above, but the delete lands between the build's read and its write,
-/// and both changes drain while the definition is still `backfilling`, so
-/// apply skips them.
-#[tokio::test]
-#[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
-async fn a_row_inserted_and_deleted_during_the_build_is_not_left_counted() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
-    let build = start_held_build(&db.pool, &client).await;
-
-    let image = row_4("a");
-    commit_and_stage(
-        &mut client,
-        "insert into public.sales values (4, 'a', 1000)",
-        |lsn| cdc(CdcOp::Insert, lsn, None, Some(&image)),
-    )
-    .await;
-    release(&client, BEFORE_READ).await;
-    wait_for_hold(&client, AFTER_READ).await;
-    commit_and_stage(
-        &mut client,
-        "delete from public.sales where id = 4",
-        |lsn| cdc(CdcOp::Delete, lsn, Some(&image), None),
-    )
-    .await;
-    drain_to_quiescence(&db.pool, &mut client).await;
-    release(&client, AFTER_READ).await;
-    build.await.expect("build task");
-    assert_eq!(status_of(&client, "public.sku_totals").await, "catching_up");
-
-    discharge_markers(&db.pool, &mut client).await;
-    assert_eq!(status_of(&client, "public.sku_totals").await, "live");
-    assert_eq!(totals(&client).await, expected(&[("a", "12"), ("b", "2")]));
-}
-
-/// #485: as above, but the row was its group's only one. The go-live
-/// re-read has no key left in group `z` to re-derive it from, so only the
-/// orphan sweep at the flip removes it.
-#[tokio::test]
-#[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
-async fn a_group_emptied_during_the_build_is_gone_at_live() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
-    let build = start_held_build(&db.pool, &client).await;
-
-    let image = row_4("z");
-    commit_and_stage(
-        &mut client,
-        "insert into public.sales values (4, 'z', 1000)",
-        |lsn| cdc(CdcOp::Insert, lsn, None, Some(&image)),
-    )
-    .await;
-    release(&client, BEFORE_READ).await;
-    wait_for_hold(&client, AFTER_READ).await;
-    commit_and_stage(
-        &mut client,
-        "delete from public.sales where id = 4",
-        |lsn| cdc(CdcOp::Delete, lsn, Some(&image), None),
-    )
-    .await;
-    drain_to_quiescence(&db.pool, &mut client).await;
-    release(&client, AFTER_READ).await;
-    build.await.expect("build task");
-    assert_eq!(
-        totals(&client).await,
-        expected(&[("a", "12"), ("b", "2"), ("z", "1000")]),
-        "the build wrote the group it read"
-    );
-    assert_eq!(status_of(&client, "public.sku_totals").await, "catching_up");
-
-    discharge_markers(&db.pool, &mut client).await;
-    assert_eq!(status_of(&client, "public.sku_totals").await, "live");
-    assert_eq!(totals(&client).await, expected(&[("a", "12"), ("b", "2")]));
 }
 
 /// #485 on a plain (chunked) 1-1: a row the chunk read is deleted before the
@@ -481,73 +207,4 @@ async fn a_one_to_one_row_deleted_during_the_build_is_gone_at_live() {
         .map(|r| r.get(0))
         .collect();
     assert_eq!(ids, vec![1, 2, 3]);
-}
-
-/// The sweep also runs over a definition that is already applying, which can
-/// have deltas staged but not yet drained. Group `b`'s only row is deleted
-/// once the definition is `catching_up`, so that delete is applied rather
-/// than skipped, but it hasn't drained when the go-live sweep finds `b`
-/// empty and drops its row. A new row lands in `b` after the discharge, and
-/// both deltas drain against a group with no row. Each applies to its row's
-/// ledger entry, so `b` comes out as the source has it (50). Folded as deltas
-/// onto the group row instead, the delete subtracts a row the target no
-/// longer counts: `b` would be left at a count of 0 and a `NULL` total, with
-/// row 5 in the source.
-#[tokio::test]
-#[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
-async fn a_group_swept_with_its_delete_still_staged_is_rederived_when_refilled() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
-    let build = start_held_build(&db.pool, &client).await;
-    release(&client, BEFORE_READ).await;
-    release(&client, AFTER_READ).await;
-    build.await.expect("build task");
-    assert_eq!(status_of(&client, "public.sku_totals").await, "catching_up");
-
-    commit_and_stage(
-        &mut client,
-        "delete from public.sales where id = 3",
-        |lsn| {
-            cdc_for(
-                "3",
-                CdcOp::Delete,
-                lsn,
-                Some(r#"{"id":"3","sku":"b","amount":"2"}"#),
-                None,
-            )
-        },
-    )
-    .await;
-    markers::run_pending_backfills(
-        &mut client,
-        WAKE,
-        &StagedWatermark::saturated(),
-        Duration::ZERO,
-    )
-    .await
-    .expect("run_pending_backfills");
-    assert_eq!(status_of(&client, "public.sku_totals").await, "live");
-    assert_eq!(
-        totals(&client).await,
-        expected(&[("a", "12")]),
-        "the sweep dropped group b before its delete drained"
-    );
-
-    commit_and_stage(
-        &mut client,
-        "insert into public.sales values (5, 'b', 50)",
-        |lsn| {
-            cdc_for(
-                "5",
-                CdcOp::Insert,
-                lsn,
-                None,
-                Some(r#"{"id":"5","sku":"b","amount":"50"}"#),
-            )
-        },
-    )
-    .await;
-    drain_to_quiescence(&db.pool, &mut client).await;
-    assert_eq!(totals(&client).await, expected(&[("a", "12"), ("b", "50")]));
 }

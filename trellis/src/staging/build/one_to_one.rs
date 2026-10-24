@@ -487,7 +487,6 @@ pub async fn sweep_batch(
     Ok(SweepOutcome {
         scanned,
         rederived,
-        delta_rows: 0,
         next,
         finished,
     })

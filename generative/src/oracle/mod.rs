@@ -1232,12 +1232,10 @@ mod tests {
         let _ = field_value_type(&expr, &source_columns);
     }
 
-    /// Task B4's invertibility-split coverage claim only means something if
-    /// `field_value_type` (which drives per-cell comparison choice) actually
-    /// agrees that every one of the five aggregate functions — both the
-    /// `Invertible` ones (`SUM`/`COUNT`/`AVG`) and the `RecomputeOnly` ones
-    /// (`MIN`/`MAX`, see `trellis::dev::defs::invertibility`) — produces the
-    /// type Postgres itself would: `Numeric` for `SUM`/`AVG`/`MIN`/`MAX` over
+    /// `field_value_type` (which drives per-cell comparison choice) must
+    /// agree that every aggregate function a definition keeps (`SUM`,
+    /// `COUNT`, `AVG`) produces the type Postgres itself would: `Numeric` for
+    /// `SUM`/`AVG` over
     /// a `Numeric` column, and — since issue #120's registry alignment —
     /// `Integer(Int8)` (`bigint`) for `COUNT`, matching
     /// `pg_typeof(count(*))`/`pg_typeof(count(x))`, which selects
@@ -1255,7 +1253,7 @@ mod tests {
             field_value_type(&count_expr, &source_columns),
             ValueType::Integer(IntWidth::Int8)
         );
-        for name in ["SUM", "AVG", "MIN", "MAX"] {
+        for name in ["SUM", "AVG"] {
             let expr = Expr::FunctionCall {
                 name: name.to_string(),
                 args: vec![Expr::Column("c1".into())],

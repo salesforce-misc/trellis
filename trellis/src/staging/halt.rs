@@ -2,8 +2,8 @@
 //!
 //! A halting failure is structural, not one row's fault: a key the drain
 //! can't use (`NoPrimaryKey`, `UnsupportedPrimaryKeyType`), a propagation
-//! wave past the hop bound (`HopBoundExceeded`), an aggregate target off
-//! the ledger (`AggregateOffLedger`), a truncate with no ring `lsn`
+//! wave past the hop bound (`HopBoundExceeded`), an aggregate target the
+//! group basis can't apply (`GroupBasisUnsupported`), a truncate with no ring `lsn`
 //! (`TruncateWithoutLsn`), Postgres refusing the drain's role a read or
 //! write (`42501`, see below), or a spilled target-mutation accumulator
 //! staged in memory (`SpilledMutationsNotFlushed`, a programming error that
@@ -98,8 +98,7 @@ fn seed(err: &ApplyError) -> Option<Seed> {
         }
         ApplyError::HopBoundExceeded { tables, .. } => Some(Seed::Tables(tables.clone())),
         ApplyError::TruncateWithoutLsn { src_table } => Some(Seed::Tables(vec![src_table.clone()])),
-        ApplyError::AggregateOffLedger { target }
-        | ApplyError::GroupBasisUnsupported { target, .. } => Some(Seed::Target(target.clone())),
+        ApplyError::GroupBasisUnsupported { target, .. } => Some(Seed::Target(target.clone())),
         _ => None,
     }
 }
@@ -165,40 +164,6 @@ pub(crate) async fn halt_refused_discharge(
     let txn = client.transaction().await?;
     let halted = format!("the backfill discharge of {table} was refused");
     let paused = pause_closure(&txn, &schema, None, &halted, err).await?;
-    txn.commit().await?;
-    Ok(paused)
-}
-
-/// [`halt_closure`] for a Re-derive build's group-delta merge into `target`
-/// (issue #901, `staging::build`), which applies whole groups and so has no
-/// key to charge. A merge Postgres `refused` (`42501`) runs the same
-/// attribution as a drain's ([`refusals`]), on a connection of `pool`, the
-/// merge's own. Any other failure is the merge's charged failure that ran out
-/// of attempts, and pauses the definition writing `target` and everything
-/// downstream of it. Either pauses with kind `halt` and records the halting
-/// stop if it paused any, in one transaction, and returns the bare targets
-/// it paused: empty when every definition it reaches was already frozen, or
-/// the catalog pins a refusal on no table. `err` is the failure's text.
-pub(crate) async fn halt_failed_merge(
-    pool: &Pool,
-    target: &str,
-    refused: bool,
-    err: &str,
-) -> Result<Vec<String>, ApplyError> {
-    let (seed, halted) = if refused {
-        (
-            None,
-            format!("the re-derive build's merge into {target} was refused"),
-        )
-    } else {
-        (
-            Some(Seed::Target(target.to_string())),
-            format!("the re-derive build's merge into {target} kept failing"),
-        )
-    };
-    let mut client = pool.get().await?;
-    let txn = client.transaction().await?;
-    let paused = pause_closure(&txn, pool.schema(), seed, &halted, err).await?;
     txn.commit().await?;
     Ok(paused)
 }
