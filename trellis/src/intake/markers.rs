@@ -993,9 +993,9 @@ pub(super) async fn fetch_read(
 /// definition the refusal reaches with kind `halt` and the reason, and
 /// retries the marker at once without them. A frozen definition doesn't
 /// count as a reader of the table, so once every reader of a refused table
-/// is paused, the retry doesn't enumerate it, and the marker discharges; resuming a definition parks it a fresh one. A
-/// refusal the catalog pins on no table pauses nothing, and the marker backs
-/// off like any other failure.
+/// is paused, the retry doesn't enumerate it, and the marker discharges;
+/// resuming a definition parks it a fresh one. A refusal the catalog pins on
+/// no table pauses nothing, and the marker backs off like any other failure.
 ///
 /// This form returns the first such failure once the pass has run, for tests
 /// that expect one; [`run_pending_backfills_until`] returns them all without

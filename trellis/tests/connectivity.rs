@@ -75,7 +75,8 @@ async fn migrate_up_is_idempotent() {
         // qualified counterpart, now that all five key on one canonical
         // identity per logical source table instead of on whatever spelling
         // the ring row being diagnosed happened to carry — summing
-        // `key_deaths.deaths`, deduplicating the markers). Issues #241/#242 (ADR-0015) added V35 (`transform_definitions
+        // `key_deaths.deaths`, deduplicating the markers). Issues #241/#242
+        // (ADR-0015) added V35 (`transform_definitions
         // .definition_version` — the monotonic per-definition edit counter
         // `ALTER TRANSFORM` bumps; `source_table_versions.version` remains
         // the value the version fence itself reads). Issue #310 added V36

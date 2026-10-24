@@ -4,7 +4,8 @@
 //! (see that method's own doc comment for exactly why it can't stand in for
 //! this). This is the last unmet piece of issue #138's original scope (a
 //! SIGKILL during Phase 3, so the re-drain must redo the batch), deliberately
-//! deferred out of #138 rather than faked, and filed as its own issue for exactly this reason.
+//! deferred out of #138 rather than faked, and filed as its own issue for
+//! exactly this reason.
 //!
 //! Uses `generative::backend::SubprocessBackend` (issue #166) against a
 //! small 1-1 program ([`critical_pair_program`]) whose last two ops, updates

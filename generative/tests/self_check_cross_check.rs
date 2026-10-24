@@ -375,8 +375,9 @@ fn program_with_corruption_selectors() -> impl Strategy<Value = (Program, usize,
 /// never draws `DefShape::Aggregate` — so no case here needs a registry
 /// lookup the way the oracle's own general-purpose version does. A shape
 /// outside this closed set (a bare literal at field top level, which
-/// `trivial_one_to_one_program_with` never builds) is a generator-scope bug for this property and panics loudly
-/// rather than guessing (design doc §2 "refuse to guess").
+/// `trivial_one_to_one_program_with` never builds) is a generator-scope bug
+/// for this property and panics loudly rather than guessing (design doc §2
+/// "refuse to guess").
 fn corrupted_field_value_type(expr: &Expr, source: &Table) -> ValueType {
     match expr {
         Expr::Column(name) => source.column_type(name).unwrap_or_else(|| {
