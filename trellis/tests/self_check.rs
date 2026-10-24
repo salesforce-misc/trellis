@@ -91,8 +91,7 @@ const LOCKED_WAIT_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Seals the active segment and drains it through the engine's own apply
 /// path, repeating until nothing is pending — the hand-driven stand-in for a
-/// running `Client`'s drain workers that `defs_backfill_chunk_queue.rs`
-/// uses.
+/// running `Client`'s drain workers.
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
     // Capture triggers stage in the writer's own transaction, so there is
     // no staged watermark to hold apply back. A saturated one never does.
@@ -123,7 +122,7 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
 }
 
 /// Installs `table`'s capture triggers with one capture reconcile pass, the
-/// staging worker's, which also parks the table's join marker.
+/// staging worker's, which also records the table's capture gate.
 async fn capture(client: &mut Client, table: &str) {
     capture_tables(client, &[table]).await;
 }

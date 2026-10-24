@@ -971,7 +971,7 @@ pub async fn install_definition(
     let target_schema = effective_target_schema(&def, target_schema);
 
     // Issue #76, ADR-0011: resolved once, here, and threaded through every
-    // DDL/direct-build step below — see [`resolve_source_for_install`]'s own
+    // DDL step below — see [`resolve_source_for_install`]'s own
     // doc comment for why this function needs its own copy rather than
     // waiting for `create_definition_inner`'s later, authoritative one.
     let qualified_source = resolve_source_to_define(pool, &def).await?;
@@ -4119,7 +4119,7 @@ async fn join_columns_of(
 /// bare-target-suffix fallback ([`resolve_graph_identity`]) since that issue
 /// landed. That gap meant *this*, `install_definition`'s own "far more
 /// common" entry point (see its own doc comment), never actually got the
-/// fallback in practice: this function's DDL/direct-build steps run and can
+/// fallback in practice: this function's DDL steps run and can
 /// fail *before* `create_definition_inner` is ever reached (only the plain
 /// 1-1 path reaches it at all, and only after this qualification already
 /// succeeded), so a bare `FROM <name>` chained off another definition's
@@ -6236,7 +6236,7 @@ fn expr_references_column(
 }
 
 #[cfg(test)]
-mod go_live_tests {
+mod live_fixture_tests {
     use super::*;
 
     /// #1107: the fixtures that flip a definition `live` without a build

@@ -5,7 +5,7 @@
 //!
 //! Most tests step the pass by hand (`trellis::capture::reconcile::reconcile`
 //! for the capture half, `trellis::client::reconcile_pass` for the whole pass
-//! with its discharge) and hold a table's lock with a transaction left open,
+//! with its start of ready builds) and hold a table's lock with a transaction left open,
 //! with no convergence polling (#297). Two drive a running client end to
 //! end: A3 (a join and a drop wait out a writer that stays open, and no other
 //! writer queues behind them) and an `ON DELETE CASCADE` parent/child pair,
@@ -1207,10 +1207,9 @@ async fn an_alter_adding_a_field_on_a_new_source_column_waits_for_the_widen() {
     assert_eq!(paused, 0, "b2 unpaused once its capture covered it");
 }
 
-/// Claims, runs and finishes every pending backfill chunk, then runs every
-/// Re-derive build to its end (a plain 1-1 over a captured table is one
-/// since #625 F8a): the hand-driven stand-in for a drain worker's build half
-/// (as in `capture_schema_change.rs`).
+/// Claims, runs and finishes every pending backfill chunk, running every
+/// started build to its end: the hand-driven stand-in for a drain worker's
+/// build half (as in `capture_schema_change.rs`).
 async fn run_backfill_chunks(pool: &trellis::Pool) {
     trellis::staging::build::settle_builds(pool).await;
 }
@@ -1360,7 +1359,7 @@ async fn resuming_a_field_awaiting_its_widen_is_refused() {
     assert_eq!(wrong, 0, "the target equals the source");
     assert_eq!(
         paused, 0,
-        "the discharge unpaused b2 once capture covered it"
+        "the field build's start unpaused b2 once capture covered it"
     );
 }
 

@@ -55,10 +55,10 @@ impl BackfillError {
     /// [`BackfillError::Ddl`] and [`error_code::classify_pg_error`] for a raw
     /// Postgres error, so the mapping composes through nesting rather than
     /// re-deriving a category. [`BackfillError::Unsupported`] doesn't fit
-    /// any of the more specific categories — it's this build path declining
-    /// a definition shape it doesn't render, not a rejection of the
-    /// definition itself (the direct-build caller falls back to the ring
-    /// path instead of surfacing it) — so it reports [`ErrorCode::Internal`].
+    /// any of the more specific categories — it's a build declining a
+    /// definition shape it doesn't render, which define already refuses
+    /// (`ValidationError::FieldExpansionTooLarge`) — so it reports
+    /// [`ErrorCode::Internal`].
     pub fn code(&self) -> ErrorCode {
         match self {
             BackfillError::Db(err) => error_code::classify_pg_error(err),
@@ -309,8 +309,7 @@ fn charge_budget(budget: &mut usize, cost: usize) -> Result<(), BackfillError> {
             Ok(())
         }
         None => Err(BackfillError::Unsupported(
-            "a calculated-field alias expansion larger than the direct build's size budget"
-                .to_string(),
+            "a calculated-field alias expansion larger than a build's size budget".to_string(),
         )),
     }
 }
@@ -853,7 +852,7 @@ mod tests {
 
     /// `total = double_price + tax`, where `double_price` is itself a
     /// calculated field (`price + price`) — the alias-derived shape issue #83
-    /// asks the plain direct build to render. Substitution must inline
+    /// asks a 1-1 build to render. Substitution must inline
     /// `double_price` into `total`, leaving only real source columns.
     #[test]
     fn substitute_inlines_a_cross_field_alias_chain() {

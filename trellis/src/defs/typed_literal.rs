@@ -373,7 +373,7 @@ pub fn lookup_typed_literal(keyword: &str) -> Option<&'static TypedLiteralSpec> 
 /// Renders a typed literal back to Postgres SQL, for every renderer that
 /// turns an [`super::ast::Expr`] into text: the oracle
 /// ([`super::oracle::render_expr_sql`] and [`super::oracle::render_qualified_expr_sql`]),
-/// the direct-build backfill, and `staging::self_check`'s recompute leg.
+/// the 1-1 build, and `staging::self_check`'s recompute leg.
 /// Shared here so the five of them can't drift — ADR-0013's cross-check only
 /// catches a renderer that disagrees with the *evaluator*, not two renderers
 /// that agree with each other and are both wrong.

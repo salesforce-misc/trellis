@@ -29,7 +29,7 @@
 //! bounded at 60s per wait. The pipeline is the [`trellis::Client`] that
 //! `TrellisOptions { staging: true, drain_threads: 2 }` starts, but with a
 //! 200ms reconcile pass instead of the 5s default: most steps wait on a pass
-//! (a capture install, a discharge, a pause or resume landing), and at 5s
+//! (a capture install, a build's start, a pause or resume landing), and at 5s
 //! they made up most of the test's time. Some worker failures are only logged and
 //! retried, so the test also records every warning or error event logged
 //! anywhere in the process, and fails on any that reads as a privilege
@@ -368,8 +368,8 @@ async fn the_documented_privileges_run_the_whole_lifecycle() {
     for target in ["order_copy", "order_totals", "order_customers"] {
         wait_for(&trellis, target, TransformStatus::Live).await;
     }
-    // A definition the discharge flips `live` gets its rows from the ring
-    // after the flip, so `live` alone doesn't promise them: a token does.
+    // `live` alone doesn't promise that what is still in the ring has
+    // drained into the targets: a token does.
     converge(&trellis).await;
     assert_targets_match(&app, &admin, false).await;
     assert_no_privilege_refusal("define and build");

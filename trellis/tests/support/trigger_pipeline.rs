@@ -5,7 +5,7 @@
 //! [`Pipeline::attach`] runs the staging worker's reconcile pass by hand
 //! (`trellis::client::reconcile_pass`), which installs the real capture
 //! triggers on every table [`trellis::defs::tables_to_capture`] names and
-//! discharges their join markers. From then on the application's own writes
+//! starts their readers' builds. From then on the application's own writes
 //! stage their ring rows, and [`Pipeline::drain`] seals and drains the ring
 //! by hand until nothing is pending. So a source row reaches the ring spelled
 //! exactly the way capture spells it (the half of issue #267 a test that
@@ -29,10 +29,10 @@ const WAKE: &str = "hop_wake";
 /// How many seal/drain rounds [`Pipeline::drain`] allows before declaring
 /// the ring stuck. A chain needs one round per hop.
 const MAX_ROUNDS: usize = 16;
-/// How many reconcile passes [`Pipeline::attach`] allows for every join
-/// marker to discharge. Nothing holds a table's lock here, so one pass
-/// installs the capture and parks the markers, and the next discharges any
-/// go-live catch-up the first dispatched.
+/// How many reconcile passes [`Pipeline::attach`] allows for every build to
+/// start. Nothing holds a table's lock here, so one pass installs the
+/// capture and records its gate, and a later one starts the builds the gate
+/// held.
 const MAX_PASSES: usize = 5;
 
 /// Starts a fresh cluster and isolated database, and returns a raw client
@@ -107,9 +107,9 @@ pub struct Pipeline {
 
 impl Pipeline {
     /// Asserts [`trellis::defs::tables_to_capture`] is exactly
-    /// `expected_captured`, then runs reconcile passes until each of those
-    /// tables' capture is installed and every join marker has discharged,
-    /// and drains what that staged. Call it after every definition is
+    /// `expected_captured`, then runs reconcile passes until every build has
+    /// started (no definition is `waiting_to_backfill`), checks those tables'
+    /// capture is installed, and drains what that staged. Call it after every definition is
     /// installed and before the first write the test wants captured.
     pub async fn attach(
         cluster: TestCluster,

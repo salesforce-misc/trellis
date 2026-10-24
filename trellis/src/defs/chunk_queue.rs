@@ -599,8 +599,7 @@ pub async fn release_chunk(
 /// with the error (#616). A failure is charged when it is neither transient
 /// nor narrowed to a key: it says nothing about any one row, and retrying it
 /// without end would leave the definition `backfilling` forever with only a
-/// log line to show for it. A direct-build job counts its handed-back
-/// attempts against the same limit.
+/// log line to show for it.
 pub(crate) const MAX_CHARGED_ATTEMPTS: i32 = 5;
 
 /// The backoff after a chunk's first failure, doubled per further failure.
@@ -665,9 +664,8 @@ pub enum ChunkFailure {
     /// The caller's claim was already gone (reclaimed by the stale-claim
     /// sweep): the chunk is its new holder's, and nothing was recorded.
     NotHeld,
-    /// The chunk was held across its definition's resume ([`STALE`]), or its
-    /// definition was frozen while a direct-build job ran: it was deleted,
-    /// and the resume's rebuild owns the work.
+    /// The chunk was held across its definition's resume ([`STALE`]): it
+    /// was deleted, and the resume's rebuild owns the work.
     Discarded,
     /// The chunk is claimable again after a backoff. `charged` says whether
     /// the failure counted toward [`MAX_CHARGED_ATTEMPTS`].

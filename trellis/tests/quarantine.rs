@@ -785,8 +785,8 @@ async fn a_composite_primary_key_source_drains_cleanly_with_no_quarantine_or_hal
         )
         .await
         .expect("create source table with a composite primary key");
-    // Seeded before `create_definition` so its own initial backfill
-    // enumeration (`intake::markers::enumerate_and_append`) stages this
+    // Seeded before `create_definition` so the fixture's enumeration of the
+    // source (`intake::harness::enumerate_and_append`) stages this
     // row as a `Recompute` into the ring, exercising the same
     // `staging::apply` drain path (pre-lock/upsert, no-op-suppression, key
     // decoding) every other scenario in this file drives.

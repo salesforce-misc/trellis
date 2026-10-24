@@ -1,26 +1,25 @@
-//! Proves the manual backend now builds a definition's target through the
-//! direct, set-based backfill path (issue #63 M3) rather than the ring
-//! enumeration `create_definition` used to stage.
+//! Proves the manual backend builds a definition's target from rows its
+//! source already holds, through the Re-derive build (ADR-0002, "A build is
+//! Re-derive over chunks"), whose chunks read the source and write the
+//! target outside the ring.
 //!
 //! The backend seam always creates a source table empty and installs its
 //! definitions in the same `install` call, so a definition's backfill normally
-//! runs over an empty source. To exercise the direct build over *populated*
-//! data — the whole point of M3 — this drives `install` in two phases against
-//! one backend: first install the source table alone and seed rows into it,
-//! then install the definition, whose backfill must find and build those
-//! already-present rows directly. A final live update proves the ring still
-//! folds a post-build CDC delta onto the directly-built row (the build/CDC
-//! fence).
+//! runs over an empty source. To exercise the build over *populated* data,
+//! this drives `install` in two phases against one backend: first install the
+//! source table alone and seed rows into it, then install the definition,
+//! whose build must find and build those already-present rows. A final live
+//! update proves the ring still folds a post-build change onto the built row.
 //!
 //! **Why the target can only come from the build.** Phase 1's `install`
 //! starts the engine client, but no definition reads the source yet, so the
 //! staging worker doesn't capture it (it captures exactly what registered
 //! definitions read, issue #427): the seed inserts are never staged, and no
 //! CDC fold can stand in for the build. The table is captured only once
-//! phase 2's definition registers, and the discharge of its join marker
-//! dispatches the build. So the build is the *only* thing that can populate
-//! the target: no-op it and this test fails. The mid-test `quiesce` is kept
-//! so that stays true should an unread table ever be captured again.
+//! phase 2's definition registers, and the capture pass then starts its
+//! build. So the build is the *only* thing that can populate the target:
+//! no-op it and this test fails. The mid-test `quiesce` is kept so that
+//! stays true should an unread table ever be captured again.
 
 use std::time::{Duration, Instant};
 
@@ -106,8 +105,8 @@ async fn direct_backfill_builds_the_target_from_preexisting_source_rows() {
         .expect("quiesce to drain seed CDC before the definition exists");
 
     // Phase 2: install the definition against the now-populated source. With
-    // the seed markers already drained, its target can only be built by the
-    // direct backfill.
+    // the seed inserts already drained, its target can only be built by the
+    // backfill.
     let def_only = Program {
         tables: vec![],
         defs: vec![def],
@@ -142,8 +141,8 @@ async fn direct_backfill_builds_the_target_from_preexisting_source_rows() {
         "row 2's backfilled total must be 20.00 + 2.00"
     );
 
-    // A live update after the build must fold onto the directly-built row via
-    // the ring — the build/CDC fence the direct path relies on.
+    // A live update after the build must fold onto the built row via the
+    // ring.
     backend
         .apply(&Op::Update {
             table: source.name.clone(),
@@ -182,8 +181,8 @@ const RELEASE_MARGIN: Duration = Duration::from_secs(1);
 
 /// public-api-design review gap: [`ManualBackend::quiesce`] used to only
 /// await CDC-ring convergence — it had no awareness of a still-`Backfilling`
-/// direct-build definition's `defs::chunk_queue` work at all (ADR-0002's
-/// "A build is Re-derive over chunks, and applies from its first chunk" put that work entirely outside
+/// definition's build chunks at all (ADR-0002's "A build is Re-derive over
+/// chunks, and applies from its first chunk" puts that work entirely outside
 /// the ring). Every other test in this file only happened to pass because a
 /// large, unrelated convergence stall (issue #452's keepalive throttle, since
 /// fixed) gave a real running drain worker enough wall-clock time to finish a small backfill before `quiesce`

@@ -76,7 +76,7 @@ fn qualify_fixture_table(name: &str) -> String {
 /// `segment_pointer.ring_slot` rather than assuming `"seg_0"` the way
 /// `tests/quarantine.rs`'s fixtures can (those start from a completely
 /// fresh database with nothing yet sealed). This file's own fixtures run
-/// real backfill/catch-up activity first, which seals and advances the ring
+/// real build and drain activity first, which seals and advances the ring
 /// pointer before a test ever stages its own CDC rows, so the active slot
 /// cannot be assumed to still be `0`.
 async fn active_ring_table(client: &Client) -> String {
@@ -115,9 +115,9 @@ async fn insert_cdc_row(
 
 /// Runs any dispatched backfill chunks, then seals and drains repeatedly
 /// until nothing is pending anywhere in the ring — the same harness
-/// `defs_install_definition.rs` uses. A plain 1-1 definition's discharge
-/// dispatches chunks rather than a ring enumeration (ADR-0002, #418), so the
-/// chunks run first.
+/// `defs_install_definition.rs` uses. A definition's build reads its source
+/// itself rather than staging it into the ring (ADR-0002, #418), so the
+/// builds run first.
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
     drain_backfill_chunks(pool).await;
     // Issue #132: a throwaway, always-caught-up watermark — this helper
@@ -177,19 +177,20 @@ async fn drain_until_live(pool: &trellis::Pool, client: &mut Client, target: &st
     panic!("{target} did not reach live within 16 seal/drain rounds");
 }
 
-/// Claims and executes every pending direct-build backfill chunk until none
-/// remain — the harness stand-in for a running drain worker, matching
-/// `defs_install_definition.rs`'s `drain_backfill_chunks`.
+/// Starts every registered definition's build and runs it to completion —
+/// the harness stand-in for the staging worker and a running drain worker,
+/// matching `defs_install_definition.rs`'s `drain_backfill_chunks`.
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
-    // ADR-0002 (#418): registration only records a definition; the backfill
-    // discharge dispatches its chunks.
+    // ADR-0002 (#418): registration only records a definition; the staging
+    // worker starts its build.
     trellis::intake::harness::start_registered_builds(pool)
         .await
         .expect("dispatch registered definitions' builds");
     trellis::staging::build::settle_builds(pool).await;
 }
 
-/// One staging-worker reconcile pass (capture, markers, discharge), with no
+/// One staging-worker reconcile pass (capture, then the start of ready
+/// builds), with no
 /// time to wait for an unsettled fence.
 async fn reconcile_pass(pool: &trellis::Pool, raw: &mut Client) {
     trellis::client::reconcile_pass(raw, pool, DEFAULT_SCHEMA)
@@ -319,8 +320,7 @@ async fn evict_keys_for_real(
 /// #625 F8a: a plain 1-1 over a captured table is the Re-derive build's,
 /// which applies from the commit that starts it and reads its chunks under
 /// the key's ledger entry, so it takes no fence: a straggler open from
-/// before the source was captured doesn't hold it in `waiting_to_backfill`
-/// (contrast [`a_fresh_transform_waits_on_the_xmin_fence_then_reaches_live`]).
+/// before the source was captured doesn't hold it in `waiting_to_backfill`.
 /// It starts on the reconcile pass and builds to `live` while the straggler
 /// is still open, with every pre-existing source row.
 #[tokio::test]
@@ -385,9 +385,8 @@ async fn a_plain_one_to_one_is_not_held_by_the_xmin_fence() {
 
 /// Whole-transform quarantine resume (ADR-0003's coarser fuse tier):
 /// `quarantine::resume_transform` requires `quarantined`, drops the
-/// definition to `waiting_to_backfill`, and re-parks a catch-up marker that
-/// `run_pending_backfills` carries back through to `live`, with the target
-/// correctly re-populated. The quarantine itself is simulated here with a
+/// definition to `waiting_to_backfill`, and its Re-derive build carries it
+/// back through to `live`, with the target correctly re-populated. The quarantine itself is simulated here with a
 /// direct status write, deliberately isolating the *resume* half of the
 /// contract from the trip mechanism — see
 /// `quarantine_trips_for_real_on_five_poisoned_keys_then_resumes_to_live`
@@ -415,11 +414,8 @@ async fn quarantine_resume_drops_to_waiting_to_backfill_and_re_backfills_to_live
     )
     .await
     .expect("install_definition");
-    // The plain 1-1 fast path backgrounds its build as chunk work; drive it
-    // to completion (this also parks its own post-build catch-up marker —
-    // `complete_direct_backfill` — which the next `run_pending_backfills`
-    // call below discharges so it can't be mistaken for the marker
-    // `resume_transform` parks later).
+    // The plain 1-1 build runs in the background as chunk work; drive it
+    // to completion.
     drain_backfill_chunks(&db.pool).await;
     drain_backfill_chunks(&db.pool).await;
     assert_eq!(status_of(&raw, "t2").await, TransformStatus::Live);
@@ -450,8 +446,7 @@ async fn quarantine_resume_drops_to_waiting_to_backfill_and_re_backfills_to_live
         "resume must drop straight to waiting_to_backfill, never directly to backfilling/live"
     );
 
-    // No concurrent transaction pins the fence this time, so a single
-    // discharge pass both settles and processes the re-parked marker.
+    // Start the resumed definition's rebuild and run it to completion.
     drain_backfill_chunks(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut raw).await;
 
@@ -520,12 +515,8 @@ async fn quarantine_trips_for_real_on_five_poisoned_keys_then_resumes_to_live() 
     .expect("install_definition");
     drain_backfill_chunks(&db.pool).await;
     drain_backfill_chunks(&db.pool).await;
-    // The post-build catch-up marker only *stages* its recompute triggers
-    // into the still-active (unsealed) ring segment — draining it to
-    // quiescence here (rather than leaving those triggers pending) keeps
-    // the CDC rows this test stages next isolated in a fresh segment of
-    // their own, rather than folded together with 25 unrelated recompute
-    // triggers for this same source table.
+    // Drained to quiescence so the CDC rows this test stages next are
+    // isolated in a fresh segment of their own.
     drain_to_quiescence(&db.pool, &mut raw).await;
     assert_eq!(status_of(&raw, "t4").await, TransformStatus::Live);
 
@@ -546,7 +537,7 @@ async fn quarantine_trips_for_real_on_five_poisoned_keys_then_resumes_to_live() 
     // ever fires for [`trellis::defs::eval::EvalError`], so this charges
     // only the row-level fuse, letting the whole-transform fuse trip for
     // real. Staged into the *currently* active ring table, not a hardcoded
-    // `"seg_0"` — the backfill/catch-up activity above has already sealed
+    // `"seg_0"` — the build and drain activity above has already sealed
     // and advanced the ring pointer past its initial slot.
     let s4 = qualify_fixture_table("s4");
     evict_keys_for_real(
@@ -686,7 +677,7 @@ async fn a_resumed_transform_gets_a_fresh_fuse_budget_rather_than_re_tripping_at
         .expect("resume_transform");
     drain_backfill_chunks(&db.pool).await;
     drain_until_live(&db.pool, &mut raw, "t6").await;
-    // Flush whatever the re-backfill's own catch-up left staged, so the
+    // Flush whatever the re-backfill left staged, so the
     // eviction rounds below start from a segment holding only their own
     // bad-key rows.
     drain_one_round(&db.pool, &mut raw).await;
@@ -793,13 +784,11 @@ async fn resume_transform_reports_not_found_for_an_unregistered_target() {
     }
 }
 
-/// Regression coverage (this issue's items 2/3): with no unsettled marker at
-/// creation time, every background build reaches `live`: a plain 1-1
-/// definition's chunks through the discharge, and a plain `SUM`'s Re-derive
-/// build (#625 F3, every plain aggregate since F5) through its start, with
-/// three stored states and no `catching_up` between them.
+/// Every background build reaches `live`: a plain 1-1 definition's chunks
+/// and a plain `SUM`'s one absolute write, each through its start, with three
+/// stored states and no `catching_up` between them.
 #[tokio::test]
-async fn every_backfill_mechanism_still_reaches_live_with_no_unsettled_marker() {
+async fn every_build_reaches_live_through_three_stored_states() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;

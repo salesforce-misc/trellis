@@ -32,8 +32,8 @@
 //! keyed by a nullable unique index (an aggregate or `JOIN` target's `GROUP
 //! BY` columns) gives the target the same `unique nulls not distinct` key
 //! over its nullable columns (issue #1141) — every
-//! consumer of a 1-1 target's own key (this DDL, `defs::backfill`'s
-//! key-range-chunked direct build, `staging::apply`'s live CDC apply,
+//! consumer of a 1-1 target's own key (this DDL, the Re-derive build's
+//! key-range chunks, `staging::apply`'s live CDC apply,
 //! `staging::quarantine`'s recompute, `staging::self_check`'s divergence
 //! detector) renders and compares it through the shared, arity-generic
 //! key-contract text ([`pk_key_sql_expr`]/[`join_pk_key`]/[`split_pk_key`]),

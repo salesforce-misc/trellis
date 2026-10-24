@@ -284,8 +284,8 @@ async fn a_chained_target_is_never_captured() {
 
 /// A target's initial build writes it outside the seam, so a definition may
 /// only chain off it once it is live. A plain 1-1 target builds through the
-/// chunk queue its discharge dispatches, and with no drain worker running it
-/// stays `backfilling`.
+/// chunk queue its build's start enqueues, and with no drain worker running
+/// it stays `backfilling`.
 #[tokio::test]
 async fn defining_a_transform_off_a_target_that_is_still_backfilling_is_refused() {
     let (_cluster, db, raw) = setup().await;
@@ -306,7 +306,7 @@ async fn defining_a_transform_off_a_target_that_is_still_backfilling_is_refused(
     assert_eq!(h1.status.as_str(), "waiting_to_backfill");
     trellis::intake::harness::start_registered_builds(&db.pool)
         .await
-        .expect("dispatch h1's chunks");
+        .expect("start h1's build");
 
     let err = install_definition(
         &db.pool,
@@ -702,8 +702,8 @@ async fn resuming_a_column_across_several_chunks_propagates_every_changed_row() 
 
 /// `src -> t -> d`, `d` reading `t`'s target as its source, both `live`.
 /// With `seam_fed_src`, `src` reads as another definition's target
-/// (`feed_from_a_test_definition`), so `t` takes the old chunked build and
-/// its go-live catch-up rather than the Re-derive build (#625 F8a).
+/// (`feed_from_a_test_definition`); `t` takes the Re-derive build either
+/// way (#625 F8a).
 async fn chained_pair(db: &TestDatabase, raw: &mut Client, seam_fed_src: bool) {
     raw.batch_execute(
         "create table public.src (id integer primary key, v numeric); \
@@ -744,10 +744,10 @@ async fn chained_pair(db: &TestDatabase, raw: &mut Client, seam_fed_src: bool) {
 /// Issue #497: a definition whose source is another definition's target
 /// reports `catching_up` while that upstream is paused and while it
 /// rebuilds after the resume, applying throughout, and reports `live` again
-/// once the upstream is `live` and its own catch-up has run.
+/// once the upstream is `live`: the rebuild writes `t` through the seam, so
+/// `d` follows it with nothing parked for it.
 ///
-/// #625 F8a: the catch-up the rebuild parks for its readers is the old
-/// chunked build's, so `t` reads a seam-fed `src`; a Re-derive-built `t` is
+/// Here `t` reads a seam-fed `src`; over a captured `src` it is
 /// [`a_chained_reader_reports_catching_up_while_its_upstream_rederives`].
 #[tokio::test]
 async fn a_chained_reader_reports_catching_up_until_its_resumed_upstream_is_live() {
@@ -950,16 +950,14 @@ async fn seal_and_drain_once(pool: &trellis::Pool, client: &mut Client) {
 }
 
 /// Issue #507: seam rows for a target staged before its pause (an update and
-/// a delete) are still undrained when the rebuild's go-live catch-up re-reads
-/// the target for its readers, and drain after it. Their images predate the
-/// rebuild, so neither may put its value back: `double_totals`, an aggregate
-/// chained off the target, ends at the rebuilt target.
+/// a delete) are still undrained when the target's resume rebuild runs, and
+/// drain after it. Their images predate the rebuild, so neither may put its
+/// value back: `double_totals`, an aggregate chained off the target, ends at
+/// the rebuilt target.
 ///
-/// #625 F8a: a plain 1-1 over a captured table is the Re-derive build's,
-/// whose rebuild writes the target through the seam and parks no catch-up.
-/// The go-live catch-up this pins is the old chunked build's, which a plain
-/// 1-1 over a seam-fed source still takes, so `orders` is made to read as
-/// another definition's target (`feed_from_a_test_definition`).
+/// #625 F8a: the rebuild is the Re-derive build, which writes the target
+/// through the seam. `orders` is made to read as another definition's target
+/// (`feed_from_a_test_definition`).
 #[tokio::test]
 async fn stale_seam_rows_after_a_rebuilds_refresh_leave_an_aggregate_consumer_correct() {
     let (_cluster, db, mut raw) = setup().await;
@@ -1041,8 +1039,8 @@ async fn stale_seam_rows_after_a_rebuilds_refresh_leave_an_aggregate_consumer_co
         .await
         .expect("seal the seam rows, undrained");
 
-    // Paused, the source moves on; the rebuild writes the target outside the
-    // seam, and its catch-up re-reads it for the reader.
+    // Paused, the source moves on; the rebuild writes the target through
+    // the seam for the reader.
     let trellis = trellis::Trellis::connect(
         trellis::Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
         trellis::TrellisOptions::default(),
@@ -1072,7 +1070,7 @@ async fn stale_seam_rows_after_a_rebuilds_refresh_leave_an_aggregate_consumer_co
         "precondition: the rebuild read the paused changes"
     );
 
-    // The pre-pause seam rows drain now, after the catch-up.
+    // The pre-pause seam rows drain now, after the rebuild.
     drain_to_quiescence(&db.pool, &mut raw).await;
     harness::settle_builds(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut raw).await;
@@ -1735,8 +1733,8 @@ async fn a_captured_sources_build_takes_no_fence_and_waits_for_no_transaction() 
 /// The fence holds a build until every transaction with an id below it has
 /// ended, and a writer that checked before the build's start committed
 /// stages nothing for it. A writer whose first write comes after its check
-/// (the discharge's orphan sweep, which checks first and then reads before
-/// it deletes) would otherwise take its id after the fence, and the build
+/// (one that checks first and then reads before it deletes) would otherwise
+/// take its id after the fence, and the build
 /// would run past it. Here the writer has written nothing when it checks,
 /// and nothing reads `t` yet; `tot` is then registered and started, and its
 /// plan job must wait for the writer.

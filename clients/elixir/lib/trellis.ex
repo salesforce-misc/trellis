@@ -414,9 +414,9 @@ defmodule Trellis do
   def dump_definitions_sql!(trellis), do: bang(dump_definitions_sql(trellis))
 
   @doc """
-  Asks the staging worker to re-read `source_table` (a bare table name,
-  resolved like one in a statement) for every definition that reads it, and
-  returns once that re-read is queued.
+  Rebuilds every definition that reads `source_table` (a bare table name,
+  resolved like one in a statement), and returns once that rebuild is
+  queued.
 
   Each `:live` reader reports `:backfilling` (rebuilt by the call itself)
   until the re-read has re-derived every row the table still has and

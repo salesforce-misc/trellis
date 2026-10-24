@@ -45,7 +45,7 @@ async fn definer(dsn: &str) -> Trellis {
     .expect("connect a definer")
 }
 
-/// One whole staging-worker pass: capture, markers, discharge.
+/// One whole staging-worker pass: capture, then the start of ready builds.
 async fn full_pass(raw: &mut Client, pool: &trellis::Pool) {
     trellis::client::reconcile_pass(raw, pool, SCHEMA)
         .await
@@ -135,8 +135,8 @@ async fn run_backfill_chunks(pool: &trellis::Pool) {
     trellis::staging::build::settle_builds(pool).await;
 }
 
-/// Whether `status` is a rebuild's: a go-live catch-up, or a Re-derive
-/// build.
+/// Whether `status` is a rebuild's: the Re-derive build's own, or a reader's
+/// of a rebuilding upstream (reported `catching_up`).
 fn rebuilding(status: TransformStatus) -> bool {
     matches!(
         status,
@@ -1500,7 +1500,7 @@ async fn failure_detected_at(raw: &Client, target: &str) -> String {
 }
 
 /// Whether `target` isn't paused and has no pause record. A reader of a
-/// target being rebuilt is `catching_up` (#476).
+/// target being rebuilt reports `catching_up` (#497).
 async fn assert_unpaused(trellis: &Trellis, target: &str) {
     let reported = trellis.status(target).await.expect("status").expect(target);
     assert!(!reported.status.is_frozen(), "{target}: {reported:?}");

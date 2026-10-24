@@ -894,13 +894,13 @@ async fn combined_add_drop_alter_in_one_statement() {
 // Single-pass backfill and the version fence
 // ---------------------------------------------------------------------
 
-/// Claims, runs, and finishes every pending direct-build backfill chunk
-/// until none remain, flipping a freshly-defined 1-1 target to `live` with
-/// no running `Client`. This is the hand-driven stand-in for a drain worker
-/// that `defs_install_definition.rs` uses.
+/// Starts every registered definition's build and runs it to completion,
+/// flipping a freshly-defined 1-1 target to `live` with no running
+/// `Client`. This is the hand-driven stand-in for the staging worker and a
+/// drain worker that `defs_install_definition.rs` uses.
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
-    // ADR-0002 (#418): registration only records a definition; the backfill
-    // discharge dispatches its chunks.
+    // ADR-0002 (#418): registration only records a definition; the staging
+    // worker starts its build.
     trellis::intake::harness::start_registered_builds(pool)
         .await
         .expect("dispatch registered definitions' builds");
@@ -1531,7 +1531,7 @@ async fn dropping_a_paused_field_clears_its_quarantine_state() {
     // definition stopped reading at the DROP, so the staging worker may have
     // narrowed `b` out of the source's capture meanwhile: the field stays
     // paused (its own pause, nothing inherited) until the capture images `b`
-    // again and the edit's catch-up unpauses it (issue #622).
+    // again and the field build's start unpauses it (issue #622).
     trellis
         .apply("ALTER TRANSFORM order_calc ADD b AS b")
         .await
@@ -1564,12 +1564,10 @@ async fn dropping_a_paused_field_clears_its_quarantine_state() {
 /// build's plan job (its walk reads the source) but not the `ALTER`, which
 /// only registers the build and so returns with the source still locked.
 ///
-/// The ring is drained before the lock (issue #903). `order_next` reports
-/// `live` once its go-live catch-up has staged a re-derive of every
-/// `order_calc` row, before those pages drain. A page still in flight
-/// re-derives under `order_calc`'s version fence and would wait on the lock
-/// holding it; the pauses bump that fence, and would wait on the page in
-/// turn. Before the pauses bumped the fence, such a page wrote all three new
+/// The ring is drained before the lock (issue #903), so no page is in
+/// flight: a page re-derives under `order_calc`'s version fence and would
+/// wait on the lock holding it; the pauses bump that fence, and would wait
+/// on the page in turn. Before the pauses bumped the fence, such a page wrote all three new
 /// fields once the lock went, after both pauses had returned.
 #[tokio::test]
 async fn a_pause_landing_mid_field_build_survives_it() {
@@ -1596,7 +1594,7 @@ async fn a_pause_landing_mid_field_build_survives_it() {
     trellis
         .await_converged(token, Duration::from_secs(60))
         .await
-        .expect("drain the go-live catch-up's pages");
+        .expect("drain the ring");
 
     // Freeze the build: `order_calc` is `order_next`'s source.
     let mut locker = connect_raw(db.dsn()).await;

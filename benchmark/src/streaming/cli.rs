@@ -781,8 +781,8 @@ fn report_fold_in(results: &[fold_in::FoldInResult], scenario: &str) -> bool {
         if restaged_in_window(result.changes_applied, result.rows_issued) {
             eprintln!(
                 "HARNESS FAILURE: {} groups at {} rows/sec applied {} changes for {} committed \
-                 rows — source rows were staged again during the window (a catch-up \
-                 backfill?), so this rate was measured under extra load",
+                 rows — source rows were staged again during the window (a rebuild?), \
+                 so this rate was measured under extra load",
                 result.groups,
                 result.target_rows_per_sec,
                 result.changes_applied,
@@ -872,12 +872,11 @@ fn report_probes(probes: &[throughput::ThroughputProbe], scenario: &str) -> bool
         // The other direction (#423): the counter counts staged rows, so it
         // can only pass rows committed if something staged a source row a
         // second time inside the window, and then the probe measured more
-        // work than it offered. Setup waits out the one known source of that,
-        // the catch-up backfill a definition parks when it goes live.
+        // work than it offered.
         if restaged_in_window(probe.changes_applied, probe.rows_issued) {
             eprintln!(
                 "HARNESS FAILURE: {} at {} rows/sec applied {} changes for {} committed rows — \
-                 source rows were staged again during the window (a catch-up backfill?), so \
+                 source rows were staged again during the window (a rebuild?), so \
                  this rate was measured under extra load",
                 scenario, probe.target_rows_per_sec, probe.changes_applied, probe.rows_issued
             );
@@ -1181,8 +1180,8 @@ mod tests {
     }
 
     /// Issue #423: a counter ahead of the rows committed means something
-    /// re-staged source rows inside the window (the go-live catch-up measured
-    /// 297,601 for 200,000), so the probe fails even though it drained and
+    /// re-staged source rows inside the window (#423 measured 297,601 for
+    /// 200,000), so the probe fails even though it drained and
     /// its oracle agrees.
     #[test]
     fn a_counter_ahead_of_rows_committed_fails_the_probe() {

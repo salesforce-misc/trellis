@@ -729,8 +729,8 @@ fn dump_definitions_sql<'a>(env: Env<'a>, handle: ResourceArc<Handle>) -> NifRep
     )
 }
 
-/// Re-reads `source_table` for its applying readers: a rebuild, or a go-live
-/// catch-up for the staging worker.
+/// Rebuilds every applying definition that reads `source_table`
+/// (`live -> backfilling`).
 #[rustler::nif]
 fn request_backfill<'a>(
     env: Env<'a>,

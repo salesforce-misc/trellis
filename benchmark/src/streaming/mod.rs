@@ -2,10 +2,7 @@
 //! throwaway `performance-investigation` branch that issues #266/#268 were
 //! measured on).
 //!
-//! Unlike [`crate::scenario`], which times
-//! [`trellis::dev::defs::backfill_definition`] — the direct, ring-bypassing
-//! set-based build (ADR-0002) — everything here drives the real,
-//! product-facing streaming path: a live [`trellis::Client`] doing trigger
+//! Everything here drives the real, product-facing streaming path: a live [`trellis::Client`] doing trigger
 //! capture into the ring -> seal -> claim -> fold -> apply, fed by a
 //! controlled-rate load generator, measured through the Prometheus
 //! histograms that already exist

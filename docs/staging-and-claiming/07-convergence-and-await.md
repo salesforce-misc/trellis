@@ -52,7 +52,7 @@ propagation carries the *minimum* trigger origin to the dependent it stages; `0`
 means "unknown, conservatively old", and so does a `NULL` origin, which wins the
 LEAST-merge rather than losing it. A capture trigger stamps each row with the
 WAL insert position when it runs, below its commit's position; only rows with
-genuinely unknown origin (a backfill enumeration, a write
+genuinely unknown origin (a build's `NULL`-key recomputes, a write
 made outside a drain) stay `NULL` (issue #469).
 
 > **Invariant (await soundness):** every un-reflected effect of a commit at

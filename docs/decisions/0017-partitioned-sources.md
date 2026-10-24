@@ -268,9 +268,7 @@ held it across a pause and resume, from writing. A failing correction records
 its error on its row, which `status()` reports, and backs off. Charged
 failures pause its definition, whose resume rebuilds it from the source, and
 until that resume the row and the correction stay queued as the record of why.
-No other correction, definition or source waits on it. A definition that is
-not applying yet gets its row once it is, and the correction stays queued
-until then.
+No other correction, definition or source waits on it.
 
 A change staged before the DDL can still be in the ring when the correction
 runs. The correction starts by stamping the definition's `build_seg`, as a

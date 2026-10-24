@@ -26,7 +26,7 @@
 //! - the build's wall time and progress (sampled from `backfill_chunks` every
 //!   [`MONITOR_POLL`]: the Re-derive build's plan job, chunks and sweep, which
 //!   its flip to `live` deletes, so `chunks` is the most seen before it), and
-//!   define -> `live`, which includes any go-live catch-up re-read;
+//!   define -> `live`;
 //! - define -> converged and the tail from the writers stopping to
 //!   convergence;
 //! - the writers' commit latency during the build and overall, and whether
@@ -46,10 +46,10 @@
 //!   and per phase (`load`: COPY + index; `build`: client start, the
 //!   `--pre-define-secs` of writes, then define -> `live`; `converge`:
 //!   `live` -> converged or the grace deadline), plus `VmHWM` and the enclosing
-//!   cgroup's `memory.peak`. #617 found today's drain holds a bucket's whole
-//!   share of the go-live re-read's segment in memory (about 650 B per
-//!   staged row, killed at 13.8 GB for 20M rows); the `converge` peak is the
-//!   number #620's batch cap has to bound.
+//!   cgroup's `memory.peak`. #617 found a drain holding a bucket's whole
+//!   share of a segment in memory (about 650 B per staged row, killed at
+//!   13.8 GB for 20M rows); the `converge` peak is the number #620's batch
+//!   cap has to bound.
 //!
 //! - the Re-derive build's profile (#625 F2)
 //!   ([`build_profile`]): worker-seconds per build statement class, chunk
@@ -774,9 +774,6 @@ async fn monitor_build(
             }
             match status.as_str() {
                 "waiting_to_backfill" | "backfilling" => {}
-                "catching_up" => {
-                    p.built.get_or_insert(now);
-                }
                 "live" => {
                     // The flip deleted the build's rows (#966): a build that
                     // ran its chunks and flipped between two polls was

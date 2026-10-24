@@ -1324,7 +1324,7 @@ fn pool_as(it: &Instance, role: &str) -> trellis::Pool {
     trellis::Pool::new(&config).expect("pool")
 }
 
-/// The halt record `target` is paused with, after a refused discharge.
+/// The halt record `target` is paused with, after a refused read of its source.
 async fn halted(trellis: &trellis::Trellis, target: &str) -> trellis::CaptureFailure {
     let reported = status(trellis, target).await;
     assert_eq!(reported.status, TransformStatus::Paused, "{target}");

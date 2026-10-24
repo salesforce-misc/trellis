@@ -171,8 +171,8 @@ async fn oracle_snapshot(
         .collect()
 }
 
-/// The kinds of a Re-derive build's work rows (#625), which
-/// `chunk_queue::claim_chunks` (the old builds' kinds only) never claims.
+/// The kinds of a Re-derive build's work rows (#625), for
+/// `chunk_queue::claim_chunks_of`.
 const REDERIVE_BUILD_KINDS: [&str; 3] = [
     chunk_queue::KIND_PLAN,
     chunk_queue::KIND_REDERIVE,
@@ -708,28 +708,16 @@ async fn staging_and_application_threads_are_independent_knobs() {
 
 /// ADR-0002's "A build is Re-derive over chunks, and applies from its first chunk", proven
 /// end-to-end through the real `Client` runtime rather than by manually
-/// calling `defs::chunk_queue`'s primitives (see `defs_backfill_chunk_queue.rs`
-/// for that lower-level coverage): `install_definition` on a 1-1 transform
-/// returns immediately, its discharge
-/// enqueues the chunks, and it's the running client's own `application_threads`
+/// calling `staging::build`'s primitives: `install_definition` on a 1-1
+/// transform returns immediately, its build's start enqueues the plan job,
+/// and it's the running client's own `application_threads`
 /// drain workers — with no ring/CDC involved at all here (`staging_worker:
 /// false`) — that claim and finish its backfill chunk, completing its build
 /// and building the target correctly.
 ///
-/// The wait is for the chunk to be done and the definition applying, not for
-/// it to be `catching_up` (issue #552). The build leaves it `catching_up`, and
-/// with no staging worker nothing else moves it on, except the test's own
-/// stand-in for one: `discharge_registrations` discharges the go-live
-/// catch-up of any definition it finds `catching_up` before it returns, which
-/// takes it `live`. So a drain worker that finishes the chunk inside that call
-/// leaves it `live`, and a wait for `catching_up` never ends. Both are a
-/// finished build. The workers poll every 10ms, far below the 200ms default,
-/// so that interleaving happens on almost every run instead of only when load
-/// slows the discharge loop down, and the wait is shown to handle it.
-///
-/// #625 F8a: over a captured table a plain 1-1 is the Re-derive build's, so
-/// the discharge enqueues its plan job, the drain workers plan and run its
-/// chunks, and the build ends `live` with no catch-up.
+/// The workers poll every 10ms, far below the 200ms default. Over a captured
+/// table a plain 1-1 takes the Re-derive build: the start enqueues its plan
+/// job, the drain workers plan and run its chunks, and the build ends `live`.
 #[tokio::test]
 async fn a_plain_one_to_one_definition_backfills_via_running_drain_workers() {
     let cluster = TestCluster::start();
@@ -766,13 +754,12 @@ async fn a_plain_one_to_one_definition_backfills_via_running_drain_workers() {
         "install_definition must return before its build is even dispatched"
     );
     // No staging worker here (`staging_worker: false`): stand in for its
-    // discharge, which dispatches the chunked build (ADR-0002, #418). It
-    // retries a fence pinned by another transaction for only a few seconds
-    // and then returns without dispatching, so check that it did: a missing
-    // chunk would otherwise surface as the wait below timing out.
+    // capture pass, which starts the build (ADR-0002, #418). Check that it
+    // did: a missing plan job would otherwise surface as the wait below
+    // timing out.
     trellis::intake::harness::start_registered_builds(&db.pool)
         .await
-        .expect("dispatch the chunked build");
+        .expect("start the build");
     let chunks: i64 = raw
         .query_one(
             "select count(*) from backfill_chunks where definition_id = $1",
@@ -783,12 +770,11 @@ async fn a_plain_one_to_one_definition_backfills_via_running_drain_workers() {
         .get(0);
     assert!(
         chunks > 0,
-        "the discharge must have dispatched widgets_calc's build as backfill chunks"
+        "the start must have enqueued widgets_calc's build as backfill chunks"
     );
 
-    // Only the running drain workers run chunks here, so a finished chunk is
-    // one of them claiming and finishing it. See this test's doc comment for
-    // why `live` counts too.
+    // Only the running drain workers run chunks here, so a `live` definition
+    // is one of them claiming and finishing every chunk.
     poll_until(
         Duration::from_secs(20),
         Duration::from_millis(100),
@@ -796,18 +782,11 @@ async fn a_plain_one_to_one_definition_backfills_via_running_drain_workers() {
          drain worker",
         async || {
             raw.query_one(
-                "select d.status = any($2) \
+                "select d.status = $2 \
                         and not exists (select 1 from backfill_chunks bc \
                                         where bc.definition_id = d.id and not bc.done) \
                  from transform_definitions d where d.id = $1",
-                &[
-                    &def.id,
-                    &[
-                        TransformStatus::CatchingUp.as_str(),
-                        TransformStatus::Live.as_str(),
-                    ]
-                    .as_slice(),
-                ],
+                &[&def.id, &TransformStatus::Live.as_str()],
             )
             .await
             .expect("read widgets_calc's build progress")
@@ -853,8 +832,8 @@ async fn a_plain_one_to_one_definition_backfills_via_running_drain_workers() {
 /// once.
 ///
 /// #625 F8a: a plain 1-1 over a captured table is the Re-derive build's, so
-/// the dead claim is on its one `plan` job (the only row the discharge
-/// enqueues), and the build ends `live` (it has no go-live catch-up). Until
+/// the dead claim is on its one `plan` job (the only row its start
+/// enqueues), and the build ends `live`. Until
 /// the claim is freed nothing plans the chunks, so the build can't finish.
 #[tokio::test]
 async fn a_drain_only_client_reclaims_a_stale_chunk_claim_with_no_staging_worker_anywhere() {
@@ -880,7 +859,7 @@ async fn a_drain_only_client_reclaims_a_stale_chunk_claim_with_no_staging_worker
     .expect("install_definition records the definition and returns");
     assert_eq!(def.status, TransformStatus::WaitingToBackfill);
     // No staging worker here (`staging_worker: false`): stand in for its
-    // discharge, which starts the Re-derive build (#625 F8a).
+    // reconcile pass, which starts the Re-derive build (#625 F8a).
     trellis::intake::harness::start_registered_builds(&db.pool)
         .await
         .expect("start the re-derive build");
@@ -973,10 +952,6 @@ async fn a_drain_only_client_reclaims_a_stale_chunk_claim_with_no_staging_worker
 /// finish a reclaimed composite-key chunk on their own, with no test code
 /// driving them step by step — that's the wiring this test proves, kept as
 /// a small, bounded (not open-ended) integration check per #297.
-/// `defs_backfill_chunk_queue.rs`'s
-/// `a_composite_key_chunk_abandoned_by_its_claimant_is_reclaimed_and_completed_by_another_worker`
-/// proves the same reclaim-then-build behavior for the old chunked build
-/// against the bare `chunk_queue` functions directly (no client, no wait).
 ///
 /// #625 F8a: a plain 1-1 over a captured table is the Re-derive build's, so
 /// the reclaimed chunks are its `rederive` chunks, whose `lo`/`hi` carry the
@@ -1021,7 +996,7 @@ async fn a_running_client_backfills_a_reclaimed_composite_key_chunk() {
     .expect("install_definition records the definition and returns");
     assert_eq!(def.status, TransformStatus::WaitingToBackfill);
     // No staging worker here (`staging_worker: false`): stand in for its
-    // discharge, which starts the Re-derive build (#625 F8a).
+    // reconcile pass, which starts the Re-derive build (#625 F8a).
     trellis::intake::harness::start_registered_builds(&db.pool)
         .await
         .expect("start the re-derive build");
@@ -1117,10 +1092,9 @@ async fn a_running_client_backfills_a_reclaimed_composite_key_chunk() {
 /// makes work claimable must wake it. Here every wait a drain worker can
 /// make (`poll_interval`, `idle_wake_cap`) is an hour, far past this test's
 /// budget, so the build and the drain move only on notifications: a seal's,
-/// a discharge's, an apply's, and the database's own on the work channel
-/// (migration V86). A new definition is built through its plan job,
-/// re-derive chunks, sweep and merges to `live`, then a source insert and
-/// update drain into it. An edge nothing announces stalls the test until
+/// an apply's, and the database's own on the work channel
+/// (migration V86). A new aggregate is built by its plan job and goes
+/// `live`, then a source insert and update drain into it. An edge nothing announces stalls the test until
 /// its budget runs out.
 #[tokio::test]
 async fn drain_workers_waiting_an_hour_still_build_and_drain_on_notifications_alone() {

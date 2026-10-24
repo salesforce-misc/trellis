@@ -1874,7 +1874,7 @@ async fn wait_out_restore(
 /// the drainer registration task, not by the loop itself): runs an
 /// out-of-band heartbeat daemon for its ring-segment claims, then loops
 /// claiming and draining sealed batches *and* claiming and executing pending
-/// direct-build backfill chunks (ADR-0002) until
+/// build jobs and chunks (ADR-0002) until
 /// shutdown — both kinds of claimable work share this one loop/worker pool,
 /// per `docs/decisions/0008-public-api-design.md`'s decision 1 ("it's `application_threads`
 /// that finishes transform work, backfill included").

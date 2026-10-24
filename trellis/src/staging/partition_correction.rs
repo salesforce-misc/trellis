@@ -85,9 +85,7 @@
 //! `backfilling`. The drain workers claim the row like a build chunk
 //! ([`super::build::work_once`]), run up to [`CLAIM_PAGES`] pages, and give
 //! it back for the next claim, and [`super::build::try_complete`] moves it
-//! back to `live` once the row is done, as it does at the end of a build. A
-//! definition that is not applying yet gets its row once it is; the
-//! correction waits in the queue meanwhile.
+//! back to `live` once the row is done, as it does at the end of a build.
 //!
 //! A correction that fails is given up through the chunk queue's
 //! `fail_chunk`: its row records the error, which `Trellis::status` reports,
@@ -625,19 +623,14 @@ pub struct Scheduled {
 /// The staging worker pass's step for the queued corrections (see the module
 /// doc's "Scheduling"): for each correction and each definition that reads
 /// its source (an aggregate over it, or a `JOIN` reading it as either side)
-/// and applies (`live`, `catching_up`, or `backfilling` under a
-/// Re-derive build: `defs::model::APPLYING_SQL`) and has not re-derived it,
-/// enqueues the correction's row unless one is there, moving a `live`
-/// definition to `backfilling`. A `catching_up` one gets its row once it is
-/// `live`. Takes a correction off the queue once every one of them has
-/// re-derived it.
+/// and applies (`live`, or `backfilling` under a Re-derive build:
+/// `defs::model::APPLYING_SQL`) and has not re-derived it, enqueues the
+/// correction's row unless one is there, moving a `live` definition to
+/// `backfilling`. Takes a correction off the queue once every one of them
+/// has re-derived it.
 ///
 /// A definition that is frozen (paused, quarantined) or still waiting to
-/// build gets no row: its resume or its build reads the source afresh. One
-/// whose build is on the old path (`backfilling` without a Re-derive build)
-/// holds every correction of its source in the queue until it applies: its
-/// chunks may have read the node's rows before the operation, and nothing
-/// after them reads those keys again.
+/// build gets no row: its resume or its build reads the source afresh.
 pub async fn schedule(pool: &Pool) -> Result<Scheduled, CorrectionError> {
     let mut out = Scheduled::default();
     let tables: Vec<String> = {
@@ -660,9 +653,9 @@ pub async fn schedule(pool: &Pool) -> Result<Scheduled, CorrectionError> {
         if corrections.is_empty() {
             continue;
         }
-        let (readers, held) = all_readers(pool, &table).await?;
+        let readers = all_readers(pool, &table).await?;
         for correction in &corrections {
-            let mut drained = !held && !kept_by_frozen(pool, correction.id).await?;
+            let mut drained = !kept_by_frozen(pool, correction.id).await?;
             for &id in &readers {
                 if done(pool, correction.id, id).await? {
                     continue;
@@ -697,8 +690,8 @@ async fn done(
 }
 
 /// Enqueues correction `correction_id`'s row for `definition_id` unless the
-/// definition is not `live` or `backfilling` under a Re-derive build (one
-/// `catching_up` waits for its catch-up), or a current row of it is there (one held
+/// definition is not `live` or `backfilling` under a Re-derive build, or a
+/// current row of it is there (one held
 /// across a resume, [`chunk_queue::STALE`], is not current: its runner writes
 /// nothing). Moves a `live` definition to `backfilling` under a Re-derive
 /// build in the same transaction, under its row lock, which every enqueue,
@@ -788,15 +781,14 @@ async fn enqueue(
 }
 
 /// Takes `correction` off the queue if every definition reading its source
-/// that applies has corrected it, no old-path build holds it and no frozen
-/// definition keeps it ([`kept_by_frozen`]): [`schedule`]'s test. Returns
-/// whether it did.
+/// that applies has corrected it and no frozen definition keeps it
+/// ([`kept_by_frozen`]): [`schedule`]'s test. Returns whether it did.
 async fn complete_if_drained(
     pool: &Pool,
     correction: &PendingCorrection,
 ) -> Result<bool, CorrectionError> {
-    let (ids, held) = all_readers(pool, &correction.table).await?;
-    if held || kept_by_frozen(pool, correction.id).await? {
+    let ids = all_readers(pool, &correction.table).await?;
+    if kept_by_frozen(pool, correction.id).await? {
         return Ok(false);
     }
     for id in ids {
@@ -1031,37 +1023,28 @@ fn budget_spent(options: &Options, outcome: &Outcome) -> bool {
     options.max_pages.is_some_and(|max| outcome.pages >= max)
 }
 
-/// The ids of the aggregate definitions reading `source_table` that apply,
-/// a `JOIN` reading it as either side among them, and whether one is under
-/// an old-path build (`backfilling` without a Re-derive build), which holds
-/// the corrections in the queue.
+/// The ids of the definitions reading `source_table` that apply: the
+/// aggregates over it and the `JOIN`s reading it as either side.
 async fn readers(
     client: &impl GenericClient,
     source_table: &str,
-) -> Result<(Vec<i64>, bool), CorrectionError> {
-    // One statement, so both answers come from one snapshot: an old-path
-    // build that moves to `catching_up` between two reads would be in
-    // neither, and a correction completed then would never re-derive it.
-    let row = client
-        .query_one(
+) -> Result<Vec<i64>, CorrectionError> {
+    Ok(client
+        .query(
             &format!(
-                "select coalesce(array_agg(id order by id) filter (where {APPLYING_SQL}), \
-                                 '{{}}'::bigint[]), \
-                        coalesce(bool_or(status = $2 and build is distinct from 'rederive'), \
-                                 false) \
-                 from transform_definitions where source_table = $1 or join_table = $1"
+                "select id from transform_definitions \
+                 where (source_table = $1 or join_table = $1) and {APPLYING_SQL} order by id"
             ),
-            &[&source_table, &TransformStatus::Backfilling.as_str()],
+            &[&source_table],
         )
-        .await?;
-    Ok((row.get(0), row.get(1)))
+        .await?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect())
 }
 
-/// The ids of every definition reading `source_table` that applies (the
-/// aggregates over it and the `JOIN`s reading it as either side), and
-/// whether one of them is under an old-path build, which holds the
-/// corrections in the queue.
-async fn all_readers(pool: &Pool, source_table: &str) -> Result<(Vec<i64>, bool), CorrectionError> {
+/// [`readers`] on a pooled connection.
+async fn all_readers(pool: &Pool, source_table: &str) -> Result<Vec<i64>, CorrectionError> {
     let client = pool.get().await?;
     readers(&**client, source_table).await
 }

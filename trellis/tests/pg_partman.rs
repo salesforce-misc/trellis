@@ -212,7 +212,7 @@ impl Mode {
     }
 }
 
-/// One whole staging-worker pass: capture, markers, discharge.
+/// One whole staging-worker pass: capture, then the start of ready builds.
 async fn full_pass(raw: &mut Client, pool: &trellis::Pool) {
     trellis::client::reconcile_pass(raw, pool, SCHEMA)
         .await

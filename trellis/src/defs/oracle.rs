@@ -330,11 +330,8 @@ pub fn render_aggregate_select_sql(def: &TransformDef) -> String {
 /// or a self-referencing passthrough field's own source column never makes
 /// it into the recompute's `SELECT` list and `eval_expr` fails with
 /// `EvalError::MissingColumn` even though the same definition installs and
-/// backfills correctly (`trellis/tests/defs_backfill_direct.rs`'s `SELECT a
-/// AS a` goes through a different path — direct-build/backfill — that
-/// already has this carve-out via `ddl::passthrough_source_column`; this
-/// oracle-recompute path did not, until task B1's generative coverage of a
-/// real end-to-end passthrough-field run found the gap).
+/// backfills correctly (the build's `SELECT a AS a` already has this
+/// carve-out via `ddl::passthrough_source_column`).
 ///
 /// Unlike `eval.rs`'s and `validate.rs`'s versions of this same carve-out,
 /// this one doesn't also check that `name` actually names a real source
@@ -571,8 +568,7 @@ mod tests {
     /// in `field_names`), so a self-named field's source column was silently
     /// dropped from the recompute `SELECT` list and `evaluate` failed with
     /// `EvalError::MissingColumn` even though the definition installs and
-    /// backfills correctly via the direct-build path
-    /// (`trellis/tests/defs_backfill_direct.rs`'s `SELECT a AS a`), which
+    /// backfills correctly through its build (`SELECT a AS a`), which
     /// already special-cases this via `ddl::passthrough_source_column`.
     #[test]
     fn referenced_source_columns_includes_a_self_named_passthrough_columns_own_source() {

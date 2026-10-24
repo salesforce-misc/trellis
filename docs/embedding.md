@@ -1000,12 +1000,12 @@ call's [30-second deadline](#every-call-returns-within-30-seconds), whatever
 timeout is passed; call again to wait longer.
 
 A repair is visible to the poll too. `request_backfill` (and a capture
-re-install) rebuilds each plain aggregate and plain 1-1 reader of the table
-in its own transaction: they read `backfilling` when the call returns, and
-`live` again once the rebuild is done. So polling for `live` after a repair,
-then taking a token, covers the repair. A transform that reads one of those
-readers' targets reports `catching_up` until its upstream is `live`, and is
-rebuilt in its turn.
+re-install) rebuilds each reader of the table in its own transaction: they
+read `backfilling` when the call returns, and `live` again once the rebuild is
+done. So polling for `live` after a repair, then taking a token, covers the
+repair. A transform that reads one of those readers' targets reports
+`catching_up` until its upstream is `live`, and follows the rebuild through
+its upstream's writes to that target.
 
 `self_check` follows the same rule: it compares only a `live` transform. For
 any other its job ends with the outcome `not_live` (Rust's

@@ -63,10 +63,7 @@
 //! - a `TRUNCATE` of the case's second table while the hot table churns.
 //!
 //! The actions are named after the public API an operator calls, not the
-//! mechanism behind it, because the mechanism is what epic #556 rewrites:
-//! today each stages a catch-up re-read, and under ADR-0002 milestone F
-//! (#625) each becomes a Re-derive. The coverage report adds per-shape
-//! counts (`mid_burst_backfill`, `mid_burst_resume`,
+//! mechanism behind it. The coverage report adds per-shape counts (`mid_burst_backfill`, `mid_burst_resume`,
 //! `mid_burst_column_resume`, `mid_burst_install`) and per-action counts
 //! (`concurrent_actions`).
 //!
@@ -106,7 +103,7 @@
 //! after the first, at 25 to 65% of its ops, among the cooling keys' last
 //! writes. It runs under the steady-load tier's stall, with the lanes paced
 //! from each burst's start (`SteadyLoad::pace_from_start`), so the
-//! backfill's catch-up lands among writes still coming in. It is a sweep tier
+//! backfill's rebuild runs among writes still coming in. It is a sweep tier
 //! only, like the steady-load one, and it gates the plants a backfill under
 //! load reaches.
 //!

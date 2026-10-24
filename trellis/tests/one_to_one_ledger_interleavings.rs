@@ -487,8 +487,8 @@ async fn exp2_10_one_to_one() {
 
 // ------------------------------------------------------ superseded issues
 
-/// The CDC text-format image of `public.src`'s row `id`, as the go-live
-/// enumeration attaches it to a `Recompute` (#392).
+/// The CDC text-format image of `public.src`'s row `id`, as the old go-live
+/// enumeration attached it to a `Recompute` (#392).
 async fn src_image(d: &Driver, id: i32) -> String {
     d.ctl
         .query_one(
@@ -501,8 +501,8 @@ async fn src_image(d: &Driver, id: i32) -> String {
         .get(0)
 }
 
-/// #392: a go-live `Recompute` for key 1 (carrying key 1's image, as the
-/// enumeration stages it) drains after key 1 is deleted, and before the
+/// #392: a `Recompute` for key 1 carrying key 1's image (as the old go-live
+/// enumeration staged it) drains after key 1 is deleted, and before the
 /// delete's own batch. Group 1 must end without key 1.
 async fn issue_392(flavour: Flavour) {
     let mut d = start(flavour, &[(1, 1, 10), (2, 1, 5)]).await;

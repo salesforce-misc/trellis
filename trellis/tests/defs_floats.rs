@@ -106,11 +106,12 @@ async fn define_join_on(
         .map(|_| ())
 }
 
-/// Drives the durable backfill chunk queue to completion, standing in for a
-/// running drain worker (copied from `defs_exact_integers.rs`).
+/// Starts every registered definition's build and runs it to completion,
+/// standing in for the staging worker and a running drain worker (copied
+/// from `defs_exact_integers.rs`).
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
-    // ADR-0002 (#418): registration only records a definition; the backfill
-    // discharge dispatches its chunks.
+    // ADR-0002 (#418): registration only records a definition; the staging
+    // worker starts its build.
     trellis::intake::harness::start_registered_builds(pool)
         .await
         .expect("dispatch registered definitions' builds");

@@ -4923,8 +4923,7 @@ pub(super) async fn clear_target(
 ///    `staging::target_mutations` for why this seam, not CDC, is how a
 ///    chained hop hears about its upstream target. A definition created
 ///    between Phase 2 and this commit that starts reading a target is not
-///    missed: its own backfill (or catch-up marker) derives it from current
-///    target state.
+///    missed: its build derives it from current target state.
 /// 5. **The completion statement**: deletes this claim's `seg_claims` rows
 ///    and ORs their buckets into `segments.drained_mask`, flipping
 ///    `state` to `'drained'` once every bucket has drained — one statement,

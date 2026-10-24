@@ -47,8 +47,8 @@ async fn definer(dsn: &str) -> Trellis {
     .expect("connect a definer")
 }
 
-/// One whole staging-worker pass: capture, markers, discharge, and the
-/// release of the keys a re-type asked for.
+/// One whole staging-worker pass: capture, the release of the keys a
+/// re-type asked for, and the start of ready builds.
 async fn full_pass(raw: &mut Client, pool: &trellis::Pool) {
     trellis::client::reconcile_pass(raw, pool, SCHEMA)
         .await
@@ -360,7 +360,7 @@ async fn follows(alter: &str, tone_type: &str, recorded: &[&str]) {
     }
     assert_eq!(recorded_names(&raw).await, recorded);
 
-    // The release is the discharge half of a pass.
+    // The release follows the capture in a whole pass.
     full_pass(&mut raw, &db.pool).await;
     drain_to_quiescence(&db.pool, &mut raw).await;
     assert_converged(&raw).await;

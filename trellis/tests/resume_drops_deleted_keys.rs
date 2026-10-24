@@ -47,8 +47,8 @@ async fn define_only(dsn: &str) -> Trellis {
 }
 
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
-    // ADR-0002 (#418): registration only records a definition; the backfill
-    // discharge dispatches its chunks.
+    // ADR-0002 (#418): registration only records a definition; the staging
+    // worker's pass starts its build.
     trellis::intake::harness::start_registered_builds(pool)
         .await
         .expect("dispatch registered definitions' builds");
@@ -141,9 +141,7 @@ async fn resume_drops_an_aggregate_group_whose_rows_were_all_deleted_while_pause
     )
     .await
     .expect("install the aggregate");
-    // Registration only records the aggregate (#419): run its direct-build
-    // job, then discharge the catch-up marker going live parks, so the only
-    // marker the rebuild below sees is the resume's.
+    // Registration only records the aggregate (#419): run its build.
     drain_backfill_chunks(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
     assert_eq!(status(&client, "order_rollup").await, "live");
@@ -221,8 +219,6 @@ async fn resume_drops_a_one_to_one_row_whose_source_row_was_deleted_while_paused
     .await
     .expect("install the 1-1");
     drain_backfill_chunks(&db.pool).await;
-    // The chunked build's completion parks its own catch-up marker; discharge
-    // it now so the only marker the rebuild below sees is the resume's.
     drain_to_quiescence(&db.pool, &mut client).await;
     assert_eq!(status(&client, "order_doubles").await, "live");
 
@@ -296,9 +292,9 @@ async fn resume_drops_a_one_to_one_row_whose_source_row_was_deleted_while_paused
     operator.shutdown().await.expect("shut down");
 }
 
-/// Runs every settled marker, the chunks and the ring until nothing is left
-/// to do: a rebuild's own marker, plus the catch-ups a definition going
-/// `live` parks for its readers. A bounded loop, not a convergence wait.
+/// Runs the builds, their chunks and the ring until nothing is left to do: a
+/// rebuild, plus the rebuilds of the readers a build rewrote outside the
+/// seam. A bounded loop, not a convergence wait.
 async fn settle(pool: &trellis::Pool, client: &mut Client) {
     for _ in 0..8 {
         drain_backfill_chunks(pool).await;
@@ -312,7 +308,7 @@ async fn settle(pool: &trellis::Pool, client: &mut Client) {
             return;
         }
     }
-    panic!("markers and chunks did not settle within 8 rounds");
+    panic!("builds and chunks did not settle within 8 rounds");
 }
 
 /// Every row of `sql`, each column rendered as text (`None` for SQL `NULL`).
@@ -454,9 +450,9 @@ async fn resume_rebuilds_an_aggregate_through_whole_partial_and_reinserted_delet
 
 /// A composite, nullable `GROUP BY`: two groups go extinct, one of them the
 /// `(1, NULL)` group, while the `(0, NULL)` group survives with one row fewer.
-/// The anti-join handles a `NULL` grouping column in its own statement (see
-/// `intake::resume_orphans`' "Keeping the anti-join hashable"), so this covers
-/// both the `NULL` and the non-`NULL` pattern.
+/// The aggregate's rebuild (`staging::group_basis::rebuild`) must match a
+/// `NULL` grouping column as well as a non-`NULL` one, so this covers both
+/// patterns.
 #[tokio::test]
 async fn resume_drops_extinct_composite_and_null_groups() {
     let cluster = TestCluster::start();
@@ -506,10 +502,9 @@ async fn resume_drops_extinct_composite_and_null_groups() {
 /// Two hops: `rollup_echo` aggregates `order_rollup`'s target and stays
 /// `live` while `order_rollup` is paused. When the rebuild deletes
 /// `order_rollup`'s extinct group 0, `rollup_echo` must drop its group 0 too.
-/// Its catch-up enumerates `order_rollup`'s *current* keys, which no longer
-/// include 0, and the seam's `Recompute` for the deleted key finds nothing
-/// when it re-reads it. Only the prior image that `Recompute` carries says
-/// which group the row left.
+/// The seam's `Recompute` for the deleted key finds nothing when it re-reads
+/// it, and the build that completes the resume rebuilds `rollup_echo` from
+/// `order_rollup`'s current rows, which no longer include 0.
 #[tokio::test]
 async fn resume_drops_an_extinct_group_one_hop_down_a_chain() {
     let cluster = TestCluster::start();
@@ -558,10 +553,9 @@ async fn resume_drops_an_extinct_group_one_hop_down_a_chain() {
 }
 
 /// A sibling on the same source that stayed `live` through the pause is not
-/// rebuilt, so the discharge must not touch its target. With no intake
+/// rebuilt, so the resume must not touch its target. With no intake
 /// running, the sibling never saw the gap's deletes, so its stale rows are
-/// still there afterwards: the orphan sweep left them alone. (The
-/// rebuild's enumeration still re-derives the sibling's surviving keys.)
+/// still there afterwards: the resumed definition's sweep left them alone.
 #[tokio::test]
 async fn resume_leaves_a_live_sibling_on_the_same_source_alone() {
     let cluster = TestCluster::start();
@@ -619,7 +613,7 @@ async fn resume_leaves_a_live_sibling_on_the_same_source_alone() {
 }
 
 /// Mixed-case target names (the lexer keeps an identifier's case, and the
-/// target is created quoted). The orphan delete must find their keys, not
+/// target is created quoted). The sweep must find their keys, not
 /// case-fold the name and skip the target as if it were gone.
 #[tokio::test]
 async fn resume_drops_orphans_from_mixed_case_targets() {

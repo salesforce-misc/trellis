@@ -3722,7 +3722,8 @@ async fn drift(lab: &Lab) {
 
 /// Test 13: a `request_backfill` of the `FROM` table and of the joined table
 /// each rebuild the `JOIN` in place (a sweep job alone), repairing what
-/// drifted from the tables, and leave no catch-up marker failing.
+/// drifted from the tables, and the `JOIN` stays built once every build is
+/// settled.
 async fn rebuild_in_place(key: Key, kind: Kind) {
     for table in ["a", "b"] {
         let context = format!("{key:?} {} rebuild of {table}", kind.name);

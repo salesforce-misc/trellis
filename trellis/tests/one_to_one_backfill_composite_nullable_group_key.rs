@@ -13,9 +13,9 @@
 //! TRANSFORM stock_echo   FROM stock_totals                          SELECT total_qty AS echo_qty
 //! ```
 //!
-//! `defs::backfill::discover_pk_ranges` reads each boundary column as a bare
-//! `col::text` and binds it into a `Vec<String>` via `Row::get::<_, String>`,
-//! which panics on a genuine SQL `NULL` (that accessor isn't `Option`-aware).
+//! The range build's `discover_pk_ranges` read each boundary column as a bare
+//! `col::text` and bound it into a `Vec<String>` via `Row::get::<_, String>`,
+//! which panicked on a genuine SQL `NULL` (that accessor isn't `Option`-aware).
 //! The only thing that stood between a `NULL` component and that panic was
 //! whichever row won the outer `order by ... desc nulls last limit 1`
 //! tie-break — and a row whose *leading* key column is a decisive,
@@ -27,12 +27,10 @@
 //! (`'a'`) — that row alone then wins `discover_pk_ranges`' first boundary
 //! probe, and its `sku` component is `NULL`.
 //!
-//! Fixed by excluding any row with a `NULL` key component from
-//! `discover_pk_ranges`' candidate window outright (`<col> is not null`,
-//! for every key column) — a no-op for a genuine `PRIMARY KEY` (always
-//! `NOT NULL`), and, for the nullable fallback case, it keeps such a row out
-//! of both the paging window and the boundary itself. No range reaches the
-//! `NULL`-`sku` group, so the build's plan stages it into the ring instead
+//! The Re-derive build's plan boundaries are keys without a `NULL` part, and
+//! a chunk's range comparison leaves out any row a `NULL` part decides. No
+//! range reaches the `NULL`-`sku` group, so the build's plan stages it into
+//! the ring instead
 //! (`staging::build`'s `stage_null_keys`), and the drain writes its row:
 //! `stock_echo` is keyed `UNIQUE NULLS NOT DISTINCT` like `stock_totals`,
 //! so it holds that group (issue #1141).
@@ -135,10 +133,7 @@ async fn backfill_across_a_composite_nullable_group_key_writes_the_null_group_wi
     .await
     .expect("install the chained OneToOne");
 
-    // Only the builds: their go-live catch-ups (#476) re-stage the chained
-    // source into the ring by design, and this checks the build itself.
-    // (`settle_builds` does discharge `stock_totals`' catch-up on
-    // `inventory`, which re-reads `inventory` into the ring, #468/#485.)
+    // Only the builds, so the ring holds what the build itself staged.
     trellis::intake::harness::settle_builds(&db.pool).await;
 
     let ring_slot: i16 = client

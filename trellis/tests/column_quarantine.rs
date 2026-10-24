@@ -2173,9 +2173,8 @@ async fn resume_column_refuses_a_column_on_a_not_yet_live_definition() {
 /// The end-to-end version of the same bug, through the *real*
 /// `trip_column_fuse` -> `cascade_pause` path rather than a hand-seeded
 /// `column_status` row: `order_totals.total` (live) pauses and cascades onto
-/// `order_summaries.grand_total`, whose definition is genuinely stuck
-/// `Backfilling` behind its own never-drained `backfill_chunks` queue
-/// (`install_definition`, same determinism as the test above). Proves the
+/// `order_summaries.grand_total`, whose definition is not live (registered
+/// by `install_definition`, never started, and frozen by hand). Proves the
 /// cascade-queue's per-pair check (the second gate inside `resume_column`'s
 /// `while` loop, distinct from the initial-pair gate the test above
 /// exercises): resuming the upstream column must still succeed and commit,
@@ -2191,10 +2190,7 @@ async fn resume_column_leaves_a_cascaded_not_yet_live_dependent_paused_without_e
     seed_order_totals(&db, &client).await;
 
     // Real, valid source rows, drained so `order_totals` has actual target
-    // rows for `install_definition` (below) to enumerate chunk work over —
-    // an empty source table would enqueue zero chunks and `order_summaries`
-    // would complete its (trivial) backfill synchronously instead of
-    // sticking in `Backfilling` the way this test needs.
+    // rows for `order_summaries` (below) to read.
     client
         .batch_execute(
             "insert into orders (id, price, tax) values \
@@ -2246,10 +2242,10 @@ async fn resume_column_leaves_a_cascaded_not_yet_live_dependent_paused_without_e
 
     // `order_summaries`, reading straight from `order_totals` (mirrors
     // `seed_order_summaries`), but installed via `install_definition` so it
-    // enumerates real chunk work and is left `Backfilling` — nothing here
-    // ever drains that queue, the same determinism
+    // is left `waiting_to_backfill` — nothing here starts its build, the
+    // same determinism
     // `resume_column_refuses_a_column_on_a_not_yet_live_definition` (above)
-    // and `trellis/tests/defs_backfill_chunk_queue.rs` rely on.
+    // relies on.
     let order_totals_columns = numeric_columns(&["id", "total"]);
     let summary_def = install_definition(
         &db.pool,
@@ -2275,7 +2271,7 @@ async fn resume_column_leaves_a_cascaded_not_yet_live_dependent_paused_without_e
     // above, so as not to disturb them) — the real cascade path,
     // `defs::catalog::column_dependents`, must reach `order_summaries` here
     // exactly as it does in `a_dependent_transforms_column_cascades_to_paused_when_its_upstream_column_pauses`,
-    // regardless of `order_summaries` still being `Backfilling`.
+    // regardless of `order_summaries` not being live.
     let bad_ids: Vec<i64> = (101..=100 + DEFAULT_COLUMN_DEATH_THRESHOLD as i64).collect();
     stage_bad_orders(&mut client, &db.pool, &bad_ids).await;
 
@@ -2288,8 +2284,8 @@ async fn resume_column_leaves_a_cascaded_not_yet_live_dependent_paused_without_e
     let downstream_status = column_status_row(&client, "order_summaries", "grand_total")
         .await
         .expect(
-            "the cascade must reach order_summaries even though its definition is still \
-             backfilling",
+            "the cascade must reach order_summaries even though its definition is not \
+             live",
         );
     assert!(
         !downstream_status.0,
@@ -2592,7 +2588,7 @@ async fn pausing_a_column_that_does_not_exist_is_refused_before_anything_is_writ
 /// column in the transaction that registers its build, so the column
 /// applies from there: Apply writes it for every later change, and the
 /// build's chunks rewrite it under the keys' entry lock. The resume parks
-/// no marker, and a change applied after the build's chunk is right.
+/// nothing, and a change applied after the build's chunk is right.
 #[tokio::test]
 async fn a_row_changed_after_a_column_resume_needs_no_catch_up() {
     use trellis::staging::{has_pending, retire_drained_segments};
@@ -5232,9 +5228,8 @@ async fn a_drop_only_alter_waits_for_a_resume_holding_the_column_pause_lock() {
 /// Issue #922 rule 5, for the capture pass: a Re-derive build's start takes
 /// the column-pause lock. Behind a held lock it times out with nothing
 /// written, and the pass goes on rather than failing: the definition stays
-/// `waiting_to_backfill`, held back from the old build path's registration
-/// marker as a start held by its capture gate is, and the next pass starts
-/// it.
+/// `waiting_to_backfill`, held back as a start held by its capture gate is,
+/// and the next pass starts it.
 #[tokio::test]
 async fn a_build_start_behind_a_held_column_pause_lock_waits_for_the_next_pass() {
     let cluster = TestCluster::start();

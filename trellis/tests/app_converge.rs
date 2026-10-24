@@ -147,8 +147,8 @@ async fn await_converged_waits_for_a_sealed_write_until_it_is_applied() {
         .apply("TRANSFORM widget_prices FROM widgets SELECT price AS price")
         .await
         .expect("define over an empty source");
-    // Stand in for the staging worker's discharge (ADR-0002), which takes a
-    // definition over an empty source straight to `live`.
+    // Stand in for the staging worker's start of the build (ADR-0002): from
+    // its start the definition applies, so the change below reaches it.
     trellis::intake::harness::start_registered_builds(&db.pool)
         .await
         .expect("dispatch the build");

@@ -1,6 +1,5 @@
 //! Multi-hop transform chains fed by real CDC for their root source, rather
-//! than the direct/ring-bypassing backfill path (`backfill_definition`,
-//! ADR-0002) or a hand-staged CDC row.
+//! than a build alone (ADR-0002) or a hand-staged CDC row.
 //!
 //! A chain's intermediate hop (`h1` in `src -> h1 -> h2`) is two things at
 //! once: the *target* of the upstream definition and a *source* of the
@@ -52,7 +51,7 @@ fn rows(pairs: &[(&str, &str)]) -> HashMap<String, Option<String>> {
 }
 
 /// Installs each `TRANSFORM` in order against `columns`, taking each live
-/// (the discharge, then its chunks) before the next: that is what lets the
+/// (its build's start, then its chunks) before the next: that is what lets the
 /// next hop chain off it at all (`reject_non_live_upstream`, issue #315).
 async fn install_chain(
     db: &testkit::TestDatabase,

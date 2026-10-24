@@ -11,14 +11,12 @@ use trellis::defs::{
     install_definition, transforms_for_source,
 };
 
-/// Runs every queued `backfill_chunks` build to completion by hand, so a
-/// chunked 1-1 target goes `live` without a running drain worker — a
-/// definition can only chain off a live target (issue #315). #625 F8a: a
-/// plain 1-1 over a captured table is the Re-derive build's, which this runs
-/// to `live` once the chunks are done.
+/// Starts every registered definition's Re-derive build and runs it to
+/// completion by hand, so a 1-1 target goes `live` without a running drain
+/// worker — a definition can only chain off a live target (issue #315).
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
-    // ADR-0002 (#418): registration only records a definition; the backfill
-    // discharge dispatches its chunks.
+    // ADR-0002 (#418): registration only records a definition; the staging
+    // worker starts its build.
     trellis::intake::harness::start_registered_builds(pool)
         .await
         .expect("dispatch registered definitions' builds");

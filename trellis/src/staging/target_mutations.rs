@@ -279,7 +279,7 @@ impl TargetMutations {
             }
             // Mirrors `catalog::dependents_of`'s own status filter: a reader
             // apply doesn't maintain yet is excluded from applies anyway, and
-            // catches up from its own backfill or catch-up marker.
+            // its build reads the target after this commit.
             let readers = txn
                 .query_one(
                     &format!(

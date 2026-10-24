@@ -128,7 +128,7 @@ fn define_returns_before_backfill_completes() {
             .await
             .expect("create source table");
         // Enough rows that, even if something were watching the chunk
-        // queue, a direct build wouldn't be instantaneous — belt and
+        // queue, a build wouldn't be instantaneous — belt and
         // braces on top of the "nothing is watching at all" determinism
         // this test actually relies on (see the doc comment above).
         for start in (0..2000).step_by(200) {

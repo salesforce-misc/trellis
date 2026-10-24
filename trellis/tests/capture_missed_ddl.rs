@@ -6,7 +6,7 @@
 //! the study's worktree; the ids below are its rows) on a table of its own,
 //! calls the capture pass directly at each of the study's `PASS` markers,
 //! and then checks what the pass did to the table's two readers: nothing,
-//! a rebuild (both `catching_up` or `backfilling`, counted in
+//! a rebuild (`backfilling`, or `catching_up` reported downstream of one, counted in
 //! `capture_auto_rebuilds_total`), or a pause. Nothing polls for
 //! convergence (#297).
 
@@ -42,7 +42,7 @@ async fn definer(dsn: &str) -> Trellis {
     .expect("connect a definer")
 }
 
-/// One whole staging-worker pass: capture, markers, discharge.
+/// One whole staging-worker pass: capture, then the start of ready builds.
 async fn full_pass(raw: &mut Client, pool: &trellis::Pool) {
     trellis::client::reconcile_pass(raw, pool, SCHEMA)
         .await

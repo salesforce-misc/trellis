@@ -187,7 +187,7 @@ source state reaches Phase 3 last, its value overwrites the newer one, and nothi
 is left staged to correct it. That is the same **permanent staleness** the version
 fence exists for, caused by ordinary data changes instead of a definition change
 (issues #344, #392). It needs no crash or retry to happen. It only needs one
-worker to stall between Phase 2 and Phase 3, e.g. over a large catch-up batch.
+worker to stall between Phase 2 and Phase 3, e.g. over a large batch.
 
 So a 1-1 target is on its ledger (`staging::one_to_one_ledger`, #623 D6),
 whose entry for a key holds only the ordering state ([below](#the-ledger)); the

@@ -947,7 +947,7 @@ mod tests {
     }
 
     #[test]
-    fn a_joined_table_with_a_gated_marker_holds_the_reader_but_the_source_s_own_gate_does_not() {
+    fn a_joined_table_s_held_gate_holds_the_reader_but_the_source_s_own_gate_does_not() {
         let desired = strings(&["public.u", "public.t"]);
         let captured = set(&["public.u", "public.t"]);
         let gated: HashSet<String> = ["public.t".to_string()].into();

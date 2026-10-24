@@ -312,8 +312,9 @@ pause are arcs of one lifecycle:
   and an aggregate that reads only other columns stays `live`.
 * **`live`** — the steady state: a watermark token taken after a commit and
   awaited with `Trellis::await_converged` guarantees the target reflects that
-  commit. A ring enumeration's rows may still be draining when it flips, but
-  they gate every token, so the await covers them
+  commit. The rows a 1-1 build staged into the ring for keys with a `NULL`
+  part, which no chunk's range reaches, may still be draining when it flips,
+  but they gate every token, so the await covers them
   ([ADR-0002](decisions/0002-async-data-flow.md#what-live-promises)).
 * **`quarantined`** — the whole-transform fuse tripped
   ([ADR-0003](decisions/0003-quarantine-storage-and-api.md)). Resuming drops the

@@ -292,7 +292,7 @@ async fn hidden_tables(raw: &Client, id: i64) -> Vec<String> {
     .collect()
 }
 
-/// One whole staging-worker pass: capture, markers, discharge.
+/// One whole staging-worker pass: capture, then the start of ready builds.
 async fn pass(raw: &mut Client, pool: &trellis::Pool) {
     trellis::client::reconcile_pass(raw, pool, DEFAULT_SCHEMA)
         .await
@@ -439,8 +439,7 @@ async fn a_join_registers_both_tables_and_a_pass_starts_its_build() {
     );
 
     // A staging-worker pass captures both tables, each imaged with the
-    // columns the definition reads from it, and starts the JOIN's build,
-    // with no backfill marker parked for it.
+    // columns the definition reads from it, and starts the JOIN's build.
     // The first pass installs both captures, and the joined table's install
     // gate holds the JOIN back; the second finds it ready and starts it.
     pass(&mut raw, &db.pool).await;

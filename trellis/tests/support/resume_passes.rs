@@ -35,7 +35,7 @@ pub async fn definer(dsn: &str) -> Trellis {
     .expect("connect a definer")
 }
 
-/// One whole staging-worker pass: capture, markers, discharge.
+/// One whole staging-worker pass: capture, then the start of ready builds.
 pub async fn full_pass(raw: &mut Client, pool: &trellis::Pool) {
     trellis::client::reconcile_pass(raw, pool, SCHEMA)
         .await

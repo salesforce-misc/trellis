@@ -85,9 +85,9 @@ the *table definition* rather than the producer, which makes them free:
 All three ride the insert that is happening anyway: no extra statement, no round
 trip, and — decisively — **no extra lock**.
 
-`route` must reach **all four producers**, which do not share a code path: two
-append client-rendered `VALUES` tuples; capture triggers and backfill append
-server-side via `INSERT … SELECT`. A client-stamped route would be rendered
+`route` must reach **all four producers**, which do not share a code path:
+capture triggers append server-side via `INSERT … SELECT`, and the others
+append client-rendered `VALUES` tuples. A client-stamped route would be rendered
 twice in two languages, and the first divergence lands one key in two
 partitions. A generated column is the only shape with a single definition.
 
@@ -105,7 +105,7 @@ All four append into the active segment:
 | Capture triggers | the source change, in the writer's transaction | yes — `old_image` and/or `new_image`, and `transition_images` where a re-read's images aren't the statement's own ([01](01-capture-by-triggers.md#every-transition-row-counts-once)) |
 | Downstream propagation (a worker staging its dependents through the target-mutation seam) | a bare recompute trigger, or the change itself for a target on the seam's image feed | **no**, except on the image feed ([04](04-claiming-and-the-fold.md)) |
 | Definition re-derive (a formula changed) | a bare recompute trigger | **no** |
-| Backfill / snapshot enumeration | a bare recompute trigger, server-side | **no** |
+| A 1-1 build's keys with a `NULL` part, which no chunk reaches | a bare recompute trigger | **no** |
 
 That split matters. An **image-less row** is not a change — it asserts nothing
 about the row's state, only "recompute this key." The fold treats the two kinds

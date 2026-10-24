@@ -108,7 +108,7 @@ pub(crate) fn per_ring_table(sep: &str, f: impl Fn(i16, &str) -> String) -> Stri
 /// it writes with `pg_current_wal_insert_lsn()`, and every row a drain derives
 /// for a downstream transform inherits the earliest origin of the changes that
 /// produced it (unknown if any was). Rows of genuinely unknown origin stay
-/// `NULL`: a backfill enumeration's `Recompute`s (ADR-0002's "What `live`
+/// `NULL`: a 1-1 build's `NULL`-key `Recompute`s (ADR-0002's "What `live`
 /// promises" relies on them gating every token) and the propagation of a write
 /// made outside a drain. A missing origin can only make a wait longer, never
 /// let it return early.
@@ -134,7 +134,7 @@ pub async fn converged_through(
 /// `held_by` scopes condition 4 to one definition's held keys (#799,
 /// [`await_converged_for`]); `None` counts every definition's.
 fn converged_sql(token: &str, held_by: Option<i64>) -> String {
-    // `origin_lsn` is nullable — a row of unknown origin (a backfill
+    // `origin_lsn` is nullable — a row of unknown origin (a build's `NULL`-key
     // `Recompute`, say) reads NULL here, not `'0/0'`. Both are "unknown", and the doc pins
     // "unknown" to "conservatively old" — a NULL must gate exactly like the
     // explicit sentinel would. Two things go wrong if that's left implicit:

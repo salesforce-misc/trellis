@@ -2010,7 +2010,7 @@ pub fn build_program_multi_with_derived(
 /// By the time `defs[def_index]` installs, `program.ops[0..after_op]` have
 /// already run — including, if `after_op` is chosen past that definition's
 /// own source table's first seed insert, real pre-existing source rows for
-/// the engine's backfill discharge to build from (exactly the scenario `generative/tests/backfill.rs` exercises
+/// the engine's build to read (exactly the scenario `generative/tests/backfill.rs` exercises
 /// by hand against a bare [`crate::backend::ManualBackend`], now reachable
 /// from inside [`crate::run::run_convergence`]'s own op-stream loop). This
 /// function itself does not require that ordering — it only enforces the
@@ -3434,9 +3434,8 @@ mod strategy {
 
     /// How long after its burst's `request_backfill` a
     /// [`cooling_backfill_case`]'s cooling key takes its last write, in
-    /// thousandths of the burst's ops: within the time the catch-up takes
-    /// to be staged, so its `Recompute` seals into the same batch as many
-    /// keys' last writes.
+    /// thousandths of the burst's ops: close behind the request, so many
+    /// keys' last writes land while its rebuild runs.
     pub const COOLING_BACKFILL_LAG: std::ops::RangeInclusive<u16> = 0..=150;
 
     /// The range of [`SteadyLoad::stall`]s a [`cooling_backfill_case`]
@@ -3445,7 +3444,7 @@ mod strategy {
 
     /// Where in its burst a [`cooling_backfill_case`]'s `request_backfill`
     /// fires, in thousandths of the burst's ops: inside [`COOLING_LAST`]'s
-    /// span, so the catch-up stages while cooling keys still take their
+    /// span, so the rebuild runs while cooling keys still take their
     /// last writes, with some of the span left after it.
     pub const COOLING_BACKFILL_AT: std::ops::RangeInclusive<u16> = 250..=650;
 
@@ -3870,9 +3869,9 @@ mod strategy {
                         seal_interval_ms: seal,
                         // A cooling-backfill case starts no build mid-burst.
                         build_chunk_rows: extras.load.map(|load| load.chunk_rows),
-                        // A build, or a catch-up, starts at the reconcile
-                        // pass after the action that asked for it: at the
-                        // engine's 5s default, long after its burst.
+                        // A build starts at the reconcile pass after the
+                        // action that asked for it: at the engine's 5s
+                        // default, long after its burst.
                         reconcile_interval_ms: load.map(|_| seal),
                     }
                 },

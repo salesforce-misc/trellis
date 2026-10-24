@@ -234,8 +234,8 @@ impl Handle {
         rb_self.call(ruby, BlockingTrellis::start_dump_definitions_sql)
     }
 
-    /// Re-reads `source_table` for its applying readers: a rebuild, or a
-    /// go-live catch-up for the staging worker.
+    /// Rebuilds every applying definition that reads `source_table`
+    /// (`live -> backfilling`).
     fn request_backfill(ruby: &Ruby, rb_self: &Self, source_table: String) -> Result<(), Error> {
         rb_self.call(ruby, |trellis| {
             trellis.start_request_backfill(&source_table)

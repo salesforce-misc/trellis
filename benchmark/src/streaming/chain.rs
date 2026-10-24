@@ -3,9 +3,8 @@
 //! chain's own shape costs as little compute as possible — the latency ladder
 //! is measuring hop *count*, not per-hop transform complexity.
 //!
-//! Goes through [`install_definition`] — the real, product-facing front
-//! door — not the direct, ring-bypassing `backfill_definition`
-//! [`crate::scenario`] uses. That is the whole point of this harness.
+//! Goes through [`install_definition`], the real, product-facing front
+//! door. That is the whole point of this harness.
 //!
 //! Every table is created explicitly qualified into `public`: this crate's
 //! raw connections pin `search_path` to `trellis, public` (matching the
@@ -76,17 +75,16 @@ pub async fn create_chain_source_table(raw: &RawClient, prefix: &str) -> String 
 ///
 /// Must be called with a `Client` (staging worker, at least one application
 /// thread) already running against `pool`'s database: with no source rows
-/// yet, each hop's backfill enumerates zero chunks, but flipping
+/// yet, each hop's plan job enqueues zero chunks, but flipping
 /// `Backfilling` -> `Live` (ADR-0002's "A build is Re-derive over
-/// chunks, and applies from its first chunk") still needs a running drain worker to claim and finish that
-/// empty chunk queue — there is no synchronous fallback path.
+/// chunks, and applies from its first chunk") still needs a running drain
+/// worker to claim and finish that plan job.
 ///
 /// Waits for each hop to go live before registering the next one on top of
 /// it (#471): registration returns with a definition `waiting_to_backfill`
 /// (#418), and a transform can't be defined on another's target until that
-/// one's build has finished. Since #476 the staging worker discharges each
-/// hop's go-live catch-up on its next maintenance tick; registering the next
-/// hop still waits for a reconcile pass to park its marker.
+/// one's build has finished. Each hop's build starts at the staging worker's
+/// next reconcile pass, so registering the next hop waits for one.
 pub async fn install_chain_hops(pool: &Pool, source: &str, depth: usize) -> Chain {
     assert!(depth >= 1, "a chain needs at least one hop");
     let prefix = source

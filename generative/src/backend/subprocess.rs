@@ -53,7 +53,7 @@ use super::sql;
 use crate::model::{Op, Program, Table};
 
 /// How long [`SubprocessBackend::quiesce`] waits, in total, for definitions
-/// to settle, catch-up markers to discharge and the ring to converge before
+/// to settle, partition maintenance to be corrected and the ring to converge before
 /// giving up — same value and rationale as
 /// `ManualBackend::QUIESCE_TIMEOUT`.
 const QUIESCE_TIMEOUT: Duration = Duration::from_secs(30);

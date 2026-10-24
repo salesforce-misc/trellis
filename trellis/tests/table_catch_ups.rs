@@ -72,7 +72,7 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
     panic!("pipeline did not reach quiescence within 16 seal/drain rounds");
 }
 
-/// Builds every registered definition and discharges its go-live catch-up.
+/// Builds every registered definition and drains the ring.
 async fn bring_live(pool: &trellis::Pool, client: &mut Client) {
     harness::settle_builds(pool).await;
     drain_to_quiescence(pool, client).await;
@@ -91,7 +91,7 @@ async fn bring_live(pool: &trellis::Pool, client: &mut Client) {
 }
 
 /// One capture reconcile pass over `tables` (every other table's capture is
-/// uninstalled), which parks a join marker for each table it installs.
+/// uninstalled), which records a capture gate for each table it installs.
 async fn capture(client: &mut Client, tables: &[&str]) {
     let desired: Vec<String> = tables.iter().map(|t| t.to_string()).collect();
     let outcome = trellis::capture::reconcile::reconcile(
@@ -259,8 +259,8 @@ async fn active_seq(client: &Client) -> i64 {
 
 /// The Re-derive flavour (#625 F7): the call's own transaction moves the
 /// 1-1 definition `live -> backfilling` and enqueues a plan job and a sweep
-/// job, one row each, so it returns with the rebuild already visible. No
-/// marker catch-up is parked for it. The definition keeps applying while the
+/// job, one row each, so it returns with the rebuild already visible. The
+/// definition keeps applying while the
 /// rebuild runs, and ends `live` with the stale row swept.
 #[tokio::test]
 async fn a_requested_backfill_rebuilds_a_stale_one_to_one_row() {

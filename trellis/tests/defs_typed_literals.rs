@@ -145,13 +145,13 @@ async fn insert_cdc_row(client: &Client, key: &str, new_image: &str) {
         .expect("stage cdc row");
 }
 
-/// Drives the durable backfill chunk queue to completion, standing in for a
-/// running `application_threads` drain worker (copied from
-/// `defs_install_definition.rs`), then runs the Re-derive builds to `live`
-/// (#625 F8a: a plain 1-1 over a captured table is the Re-derive build's).
+/// Starts every registered definition's Re-derive build and runs it to
+/// `live`, standing in for the staging worker and a running
+/// `application_threads` drain worker (copied from
+/// `defs_install_definition.rs`).
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
-    // ADR-0002 (#418): registration only records a definition; the backfill
-    // discharge dispatches its chunks.
+    // ADR-0002 (#418): registration only records a definition; the staging
+    // worker starts its build.
     trellis::intake::harness::start_registered_builds(pool)
         .await
         .expect("dispatch registered definitions' builds");
@@ -379,12 +379,11 @@ async fn evaluator_and_sql_oracle_agree_on_every_literal() {
 // The full pipeline
 // ---------------------------------------------------------------------
 
-/// parse -> install -> **backfill/direct build** -> read. `install_definition`
-/// is the real front door, so this covers the SQL the build actually emits
-/// for a typed literal, plus the DDL that decides the target column's type.
-/// #625 F8a: a plain 1-1 over a captured table is the Re-derive build's,
-/// whose chunk renders each field through `defs::oracle` as the old range
-/// build did.
+/// parse -> install -> **build** -> read. `install_definition` is the real
+/// front door, so this covers the SQL the build actually emits for a typed
+/// literal, plus the DDL that decides the target column's type. #625 F8a: a
+/// plain 1-1 is the Re-derive build's, whose chunk renders each field
+/// through `defs::oracle`.
 #[tokio::test]
 async fn install_and_backfill_produce_real_typed_columns() {
     let cluster = TestCluster::start();

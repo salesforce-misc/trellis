@@ -41,13 +41,9 @@ pub const STOCK_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(300);
 /// the single-hop scenarios run at: they have no intermediate hops for the
 /// reconcile pass to start capturing, so the stock value is the honest one.
 ///
-/// It used to matter to them in one way: the reconcile pass discharged the
-/// catch-up backfill a definition parked when it went live, and that
-/// discharge re-stages every row the source holds by then (#423). Since #476
-/// a definition reports live only once that catch-up has been discharged,
-/// and the maintenance loop discharges a freshly parked marker on its next
-/// tick, so the probes' wait for `live` covers it and costs no reconcile
-/// interval.
+/// A definition's build starts at a reconcile pass (the client runs its
+/// first one at start-up), and the probes wait for `live` before they
+/// measure, so the interval never falls inside a measurement window.
 pub const STOCK_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// One scenario's engine configuration. [`Default`] is stock `main` in every
@@ -108,9 +104,9 @@ impl EngineTuning {
     /// captured, where each of their writes would have been staged twice
     /// (once by apply's in-transaction `Recompute`, again by capture). #315
     /// keeps every definition's target out of the captured set, so that
-    /// reason is gone (#471). And the reconcile pass is what parks a newly
-    /// registered hop's backfill marker, so an hour-long interval kept every
-    /// hop after the first `waiting_to_backfill` for an hour.
+    /// reason is gone (#471). And the reconcile pass is what starts a newly
+    /// registered hop's build, so an hour-long interval kept every hop after
+    /// the first `waiting_to_backfill` for an hour.
     pub fn multi_hop() -> Self {
         Self::default()
     }

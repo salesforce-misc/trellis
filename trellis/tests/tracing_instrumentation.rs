@@ -597,8 +597,8 @@ async fn a_below_threshold_charge_is_logged_as_a_warning_naming_the_key() {
 
 /// #625 F8a: the Re-derive build of a plain 1-1 over a captured table
 /// reports its start (`waiting_to_backfill` -> `backfilling`) and its
-/// finish (`backfilling` -> `live`), and nothing else: it parks no go-live
-/// catch-up, so it is never `catching_up`.
+/// finish (`backfilling` -> `live`), and nothing else: it is never
+/// `catching_up`.
 #[tokio::test]
 async fn rederive_build_status_transitions_emit_info_events() {
     assert_eq!(
@@ -614,7 +614,7 @@ async fn rederive_build_status_transitions_emit_info_events() {
 /// The body of the backfill transition test: seeds `s` and registers `transform` under a
 /// straggler that commits before the settled pass, then returns the `(from,
 /// to)` of every INFO "transform status transition" event the settled
-/// reconcile pass and `settle_registrations` emitted, in order.
+/// reconcile pass and `settle_builds` emitted, in order.
 async fn backfill_status_transitions(transform: &str) -> Vec<(String, String)> {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;

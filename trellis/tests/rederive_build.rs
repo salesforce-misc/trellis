@@ -110,8 +110,8 @@ impl Fixture {
         }
     }
 
-    /// One staging-worker reconcile pass: installs the source's capture,
-    /// starts every qualifying definition, and discharges the markers.
+    /// One staging-worker reconcile pass: installs the source's capture and
+    /// starts every ready definition.
     async fn pass(&mut self) {
         trellis::client::reconcile_pass(&mut self.raw, &self.db.pool, DEFAULT_SCHEMA)
             .await
@@ -576,8 +576,8 @@ async fn a_start_that_fails_transiently_is_retried_next_pass_and_not_paused() {
         .await
         .expect("make the pass's lock waits short");
 
-    // The holder's open transaction is one the discharge's fence wait waits
-    // out, so this pass gives it only a moment.
+    // The start's read of the ledger waits on the holder's lock, so this
+    // pass gives it only a moment.
     trellis::client::reconcile_pass(&mut f.raw, &f.db.pool, DEFAULT_SCHEMA)
         .await
         .expect("reconcile pass");
@@ -732,7 +732,7 @@ async fn the_start_waits_for_the_widens_capture_gate() {
 }
 
 /// A quarantined definition resumes the same way (#625 F3): through the
-/// start, with a sweep, and no marker.
+/// start, with a sweep.
 #[tokio::test]
 async fn a_quarantined_build_resumes_through_the_start() {
     let mut f = Fixture::new(60, &[ONE]).await;
@@ -821,7 +821,7 @@ async fn changes_drained_while_a_one_to_one_builds_are_applied() {
 
 /// A 1-1 definition paused part-way through its build, with keys deleted,
 /// updated and inserted while frozen, is rebuilt over the entries it kept
-/// (#625 F3, F8a): no marker, a sweep, and the sweep deletes the target
+/// (#625 F3, F8a): a sweep, and the sweep deletes the target
 /// rows of the keys deleted meanwhile, which no chunk reaches.
 #[tokio::test]
 async fn a_resumed_one_to_one_build_sweeps_the_keys_deleted_while_paused() {
@@ -1670,7 +1670,7 @@ async fn a_resume_refuses_when_the_target_table_is_gone() {
     assert_eq!(f.status("one").await.as_deref(), Some("paused"));
 }
 
-/// #1201: the orphan sweep of a rebuild walks more hand-added rows than one
+/// #1201: the sweep of a rebuild walks more hand-added rows than one
 /// batch holds, and never deletes a target row the source backs: a key whose
 /// source row committed after the plan read the source, with its captured
 /// change still in the ring when the sweep runs, is re-derived from the
@@ -1721,7 +1721,7 @@ async fn a_rebuild_sweeps_many_hand_added_rows_and_keeps_a_row_the_source_backs(
 }
 
 /// A plain 1-1 target's build (#625 F8a) is `waiting_to_backfill ->
-/// backfilling -> live`, with no `catching_up` and no marker: its chunks
+/// backfilling -> live`, with no `catching_up`: its chunks
 /// write the target rows.
 #[tokio::test]
 async fn a_one_to_one_build_goes_from_waiting_to_live_with_no_catch_up() {
@@ -1746,7 +1746,7 @@ async fn a_one_to_one_build_goes_from_waiting_to_live_with_no_catch_up() {
     assert_eq!(
         steps.iter().filter(|step| **step == Step::Chunk).count(),
         20,
-        "200 rows in chunks of 10, and no old build ran"
+        "200 rows in chunks of 10"
     );
     assert_eq!(
         f.count("select count(*) from backfill_chunks").await,
@@ -1760,4 +1760,98 @@ async fn a_one_to_one_build_goes_from_waiting_to_live_with_no_catch_up() {
         "every entry was re-derived by a chunk"
     );
     f.assert_one_oracle().await;
+}
+
+/// A worker whose claim the stale-claim sweep took (#434) writes nothing when
+/// it runs the chunk after all: the claim fence stops its first write, and
+/// the chunk stays undone for the next claimant.
+#[tokio::test]
+async fn a_worker_whose_claim_was_reclaimed_writes_nothing() {
+    let mut f = Fixture::new(60, &[ONE]).await;
+    f.pass().await;
+    assert_eq!(f.run_chunks_by_hand(1).await, 1, "the plan job");
+    let held = {
+        let client = f.db.pool.get().await.expect("pool");
+        chunk_queue::claim_chunks_of(&**client, "held", 1, &[chunk_queue::KIND_REDERIVE])
+            .await
+            .expect("claim a chunk")
+    };
+    assert_eq!(held.len(), 1);
+    {
+        let mut client = f.db.pool.get().await.expect("pool");
+        client
+            .execute(
+                "update backfill_chunks set claimed_at = now() - interval '1 hour' where id = $1",
+                &[&held[0].id],
+            )
+            .await
+            .expect("age the claim");
+        let reclaimed = chunk_queue::reclaim_stale_chunks(&mut **client, OPTIONS.reclaim_ttl)
+            .await
+            .expect("reclaim");
+        assert_eq!(reclaimed, 1, "the sweep takes the aged claim");
+    }
+    let before = f.count("select count(*) from public.one").await;
+    let entries_before = f
+        .count("select count(*) from public.one__ledger where __basis is not null")
+        .await;
+
+    build::run_claimed(&f.db.pool, &held[0], "held", &OPTIONS).await;
+
+    assert_eq!(
+        f.count("select count(*) from public.one").await,
+        before,
+        "the reclaimed worker wrote no target row"
+    );
+    assert_eq!(
+        f.count("select count(*) from public.one__ledger where __basis is not null")
+            .await,
+        entries_before,
+        "and no ledger entry"
+    );
+    assert_eq!(
+        f.count(&format!(
+            "select count(*) from backfill_chunks where id = {} and not done and claimed_by is null",
+            held[0].id
+        ))
+        .await,
+        1,
+        "the chunk is left for the next claimant"
+    );
+    f.run("one").await;
+    assert_eq!(f.status("one").await.as_deref(), Some("live"));
+    f.assert_one_oracle().await;
+}
+
+/// A pause gates new claims, not a chunk a worker already holds. The last
+/// chunks finishing after the pause must not flip the paused definition
+/// `live`: the completion reads only a `backfilling` one.
+#[tokio::test]
+async fn chunks_finishing_after_a_pause_leave_the_definition_paused() {
+    let mut f = Fixture::new(60, &[ONE]).await;
+    f.pass().await;
+    assert_eq!(f.run_chunks_by_hand(1).await, 1, "the plan job");
+    let held = {
+        let client = f.db.pool.get().await.expect("pool");
+        chunk_queue::claim_chunks_of(&**client, "held", 100, &[chunk_queue::KIND_REDERIVE])
+            .await
+            .expect("claim every chunk")
+    };
+    assert!(!held.is_empty(), "the plan job enqueued chunks");
+    let trellis = f.trellis().await;
+    trellis
+        .apply("PAUSE TRANSFORM one")
+        .await
+        .expect("pause the building transform");
+    for chunk in &held {
+        build::run_claimed(&f.db.pool, chunk, "held", &OPTIONS).await;
+    }
+    let id = f.definition_id().await;
+    assert!(
+        !build::try_complete(&f.db.pool, id)
+            .await
+            .expect("try complete"),
+        "a paused definition doesn't complete"
+    );
+    assert_eq!(f.status("one").await.as_deref(), Some("paused"));
 }

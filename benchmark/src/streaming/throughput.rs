@@ -265,14 +265,11 @@ pub async fn run_probe(
     //
     // * `trellis_changes_applied_total` counts staged rows (#409), which
     //   matches rows committed only while nothing stages a source row a second
-    //   time. A catch-up backfill does exactly that: its discharge stages every
-    //   row the source holds as a `Recompute`. The one that going live parks
-    //   has run before setup's wait for `live` returns (#476), and with it
-    //   gone the counter has measured exact. But if one ran mid-window, the
-    //   counter would reach `rows_issued` with rows still in flight and end
-    //   the grace period early. Issue #423 measured that before setup waited:
-    //   at 20k rows/sec in 10,000-row commits the counter read 500,001 against
-    //   400,000 committed rows.
+    //   time. If something did mid-window, the counter would reach
+    //   `rows_issued` with rows still in flight and end the grace period
+    //   early. Issue #423 measured that with a re-read that staged every
+    //   source row: at 20k rows/sec in 10,000-row commits the counter read
+    //   500,001 against 400,000 committed rows.
     // * a `count(*)` every poll is exact but, at the millions-of-rows end of
     //   the ramp, a repeated seq scan competes with the drain it is watching
     //   and changes the answer. Measured at 200k rows/sec: polling the count

@@ -285,8 +285,8 @@ async fn drain_matches_the_oracle_across_an_insert_update_and_delete() {
 
 /// A reviewer's high-severity follow-up to issue #76's grammar work, at the
 /// CDC-apply layer this time (`defs_install_definition.rs`'s
-/// `install_definition_fast_path_reads_the_explicitly_qualified_source_not_a_same_named_decoy`
-/// covers the direct-build/backfill layer): a definition created with an
+/// `rederive_build_reads_the_explicitly_qualified_source_not_a_same_named_decoy`
+/// covers the build layer): a definition created with an
 /// explicit `FROM custom.orders` must have its *live* source reads —
 /// [`read_live_rows_batch`], reached whenever a folded change carries no
 /// image, e.g. every `Recompute` marker `create_definition`'s own initial
@@ -380,8 +380,8 @@ async fn explicitly_qualified_source_reads_the_right_table_on_a_live_refetch() {
 /// above, and the one this round of issue #78's own fix-sweep exists for: a
 /// definition installed with an explicit non-default *target* schema (issue
 /// #76's `TRANSFORM custom.<target> FROM ...` grammar) backfills fine (its
-/// ring-enumeration and direct-build paths already read
-/// `Definition::target_table`/`resolve_source_for_install` correctly), but a
+/// build reads `Definition::target_table`/`resolve_source_for_install`
+/// correctly), but a
 /// subsequent *live* CDC write against its source used to fail outright:
 /// `apply_target` (`staging::apply`'s Phase 3 DML-emission function) bound
 /// `def.def.target` — always bare, even here — straight into
@@ -2668,7 +2668,7 @@ async fn drain_everything_left(pool: &trellis::Pool, client: &Client) {
 }
 
 /// The repro from issue #344: batch 1 is a bare recompute trigger (the shape
-/// a catch-up enumeration stages), a Re-derive. Its live read now happens in
+/// the `create_definition` fixture's enumeration stages), a Re-derive. Its live read now happens in
 /// Phase 3 under the entry lock, so it reads the row batch 2 wrote.
 #[tokio::test]
 async fn a_recompute_read_before_a_newer_batch_drains_does_not_overwrite_it() {

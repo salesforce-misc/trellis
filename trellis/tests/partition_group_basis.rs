@@ -1490,10 +1490,10 @@ async fn a_recorded_leaf_whose_capture_was_switched_off_pauses_the_reader() {
 }
 
 /// #1147: a new leaf, empty or loaded before its capture, is corrected in the
-/// pass that sees it, leaf alone. The reinstall of its capture parks no
-/// marker (whose discharge would enumerate every key of the source for each
-/// reader) and rebuilds no reader: the aggregate stays `live` through the
-/// pass, and the oracle holds after the correction.
+/// pass that sees it, leaf alone. The reinstall of its capture records no
+/// capture gate and rebuilds no reader (either would re-read every key of the
+/// source for each reader): the aggregate stays `live` through the pass, and
+/// the oracle holds after the correction.
 #[tokio::test]
 async fn a_new_leaf_costs_no_rebuild_and_no_source_wide_enumeration() {
     for loaded in [false, true] {

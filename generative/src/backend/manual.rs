@@ -214,9 +214,8 @@ pub enum ManualBackendError {
     /// target table still short of that. Distinct from
     /// [`StagingError::ConvergenceTimeout`] (surfaced as
     /// [`ManualBackendError::Staging`]): that one covers the ring's own CDC
-    /// convergence, this one covers a direct-build 1-1 definition's
-    /// `defs::chunk_queue`-driven backfill, which the ring has no visibility
-    /// into at all (ADR-0002).
+    /// convergence, this one covers a definition's build chunks, which the
+    /// ring has no visibility into at all (ADR-0002).
     DefinitionSettleTimeout {
         unsettled: Vec<String>,
         waited: Duration,
@@ -893,8 +892,8 @@ impl ManualBackend {
 
         // Issue #63 C1: `install_definition` is the same front door real
         // callers use. It creates the target table and records the
-        // definition `waiting_to_backfill`; the staging worker's backfill
-        // discharge builds it in the background (ADR-0002). Routing the fuzz
+        // definition `waiting_to_backfill`; the staging worker's capture
+        // pass starts its build in the background (ADR-0002). Routing the fuzz
         // harness through it, instead of hand-rolling the same
         // create-table/persist sequence, keeps this backend exercising the
         // exact path production traffic takes.
@@ -1160,7 +1159,7 @@ impl super::Backend for ManualBackend {
 
     async fn quiesce(&mut self) -> Result<(), ManualBackendError> {
         // Improvement-plan workstream C, task C1: opt-in per-call timing
-        // around the whole quiesce (since #432, the settle and catch-up
+        // around the whole quiesce (since #432, the settle and partition
         // waits as well as the watermark -> converge round trip), to test the
         // hypothesis that the convergence property's wall-clock variance came
         // from a ~10s pipeline stall. It did: issue #452's keepalive
@@ -1171,8 +1170,8 @@ impl super::Backend for ManualBackend {
         let timing_enabled = std::env::var_os("GENERATIVE_QUIESCE_TIMING").is_some();
         let start = timing_enabled.then(std::time::Instant::now);
 
-        // Issue #432: definition status, catch-up markers and the ring, in
-        // that order — see `sql::quiesce` for why the order matters.
+        // Issue #432: partition maintenance, definition status and the ring,
+        // in that order — see `sql::quiesce` for why the order matters.
         let result = sql::quiesce(&self.raw, &self.defs, QUIESCE_TIMEOUT).await;
 
         if let Some(start) = start {

@@ -38,20 +38,16 @@ use trellis::defs::{ValueType, install_definition};
 use trellis::staging::apply;
 use trellis::staging::{has_pending, retire_drained_segments};
 
-/// Claims and executes every pending direct-build backfill chunk until none
-/// remain — the test-harness stand-in for a running drain worker, since
-/// `install_definition` no longer runs a 1-1 definition's backfill in-call
-/// (ADR-0002): it
-/// returns as soon as the chunk work is enumerated and persisted,
-/// `Backfilling` until a drain worker actually claims and finishes each
-/// chunk. Both `order_view` (this file's 1-1 mirror) and `customer_totals`
-/// (an aggregate, whose direct build is a background job since #419) need
-/// this. Mirrors `defs_install_definition.rs`'s helper of the same name.
-/// #625 F8a: `order_view`, a plain 1-1 over a captured table, is the
-/// Re-derive build's, which this runs to `live` once the chunks are done.
+/// Starts every registered definition's Re-derive build and runs it to
+/// `live` — the test-harness stand-in for the staging worker and a running
+/// drain worker, since `install_definition` only records a definition
+/// `WaitingToBackfill` (ADR-0002). Both `order_view` (this file's 1-1
+/// mirror, built by chunks) and `customer_totals` (an aggregate, built by
+/// its plan job) need this. Mirrors `defs_install_definition.rs`'s helper of
+/// the same name.
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
-    // ADR-0002 (#418): registration only records a definition; the backfill
-    // discharge dispatches its chunks.
+    // ADR-0002 (#418): registration only records a definition; the staging
+    // worker starts its build.
     trellis::intake::harness::start_registered_builds(pool)
         .await
         .expect("dispatch registered definitions' builds");

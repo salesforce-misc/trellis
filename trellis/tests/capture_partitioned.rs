@@ -422,15 +422,15 @@ async fn a_tree_of_one_hundred_and_one_leaves_installs_root_first_then_node_by_n
         Installed::Partial { .. }
     ));
     // No gate until the install completes.
-    let markers: i64 = client
+    let gates: i64 = client
         .query_one(
             "select count(*) from capture_gates where table_name = 'public.r'",
             &[],
         )
         .await
-        .expect("markers")
+        .expect("gates")
         .get(0);
-    assert_eq!(markers, 0);
+    assert_eq!(gates, 0);
 
     // Released, the next call resumes with the missing nodes only.
     writer.batch_execute("rollback").await.expect("release");
@@ -440,15 +440,15 @@ async fn a_tree_of_one_hundred_and_one_leaves_installs_root_first_then_node_by_n
             .expect("resume")
     ));
     assert_every_node_carries_capture(&client, 102).await;
-    let markers: i64 = client
+    let gates: i64 = client
         .query_one(
             "select count(*) from capture_gates where table_name = 'public.r'",
             &[],
         )
         .await
-        .expect("markers")
+        .expect("gates")
         .get(0);
-    assert_eq!(markers, 1, "one gate, recorded by the last transaction");
+    assert_eq!(gates, 1, "one gate, recorded by the last transaction");
 
     // Uninstalling removes the triggers from every node.
     assert!(landed(

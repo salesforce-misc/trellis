@@ -85,9 +85,10 @@ pub struct OneToOnePlan {
 }
 
 /// Whether `definition` is a 1-1 target the Re-derive build serves (#625
-/// F8a): a 1-1 key space, and fields whose aliases substitute to self-contained SQL
-/// (a cyclic alias chain is the ring enumeration's). Its source may be
-/// captured or seam-fed ([`super::qualifies`], #625 F6).
+/// F8a): a 1-1 key space, and fields whose aliases substitute to
+/// self-contained SQL, which define checks
+/// (`ValidationError::FieldExpansionTooLarge`). Its source may be captured or
+/// seam-fed (#625 F6).
 pub(crate) fn buildable(definition: &Definition) -> bool {
     matches!(
         definition.def.key_space,

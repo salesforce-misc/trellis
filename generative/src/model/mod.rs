@@ -311,7 +311,7 @@ pub struct Program {
     /// any op runs" (today's only behavior, and [`crate::run::run_convergence`]'s
     /// default). A nonzero value `N` means "install this definition only once
     /// `ops[0..N]` have already been applied" — real rows can already exist
-    /// in `defs[i].source` by then, exercising the backfill discharge's build
+    /// in `defs[i].source` by then, exercising the build
     /// over pre-existing rows (the same path
     /// `generative/tests/backfill.rs` exercises by hand, now reachable from
     /// inside the harness's own op-stream loop). Must be index-aligned with
@@ -471,7 +471,7 @@ pub struct SteadyLoad {
     pub pace: std::time::Duration,
     /// Whether the pace holds from every burst's start, rather than only
     /// once an action starts a build. The cooling-backfill tier (#734) paces
-    /// its whole run, so a `request_backfill`'s catch-up lands among the
+    /// its whole run, so a `request_backfill`'s rebuild runs among the
     /// writes of the keys going quiet around it rather than after a burst
     /// written flat out in tens of milliseconds.
     pub pace_from_start: bool,
@@ -490,7 +490,7 @@ pub struct SteadyLoad {
 /// `actions` are operator actions the harness takes while the lanes run
 /// (issue #557 part 2), in order of [`TimedAction::after`]: each fires once
 /// that many of the burst's ops have been applied, by whichever lanes, so
-/// the re-read it stages overlaps the burst's CDC rather than landing at a
+/// the work it starts overlaps the burst's CDC rather than landing at a
 /// quiescent point.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Burst {
@@ -511,10 +511,8 @@ pub struct TimedAction {
 
 /// An operator action the concurrent tier takes mid-burst (issue #557 part
 /// 2). Each is named after the public API call an operator makes, not the
-/// engine mechanism behind it, because the mechanism is what epic #556
-/// rewrites: today each one stages a catch-up re-read, and under ADR-0002
-/// milestone F (#625) each becomes a Re-derive. None of them changes what the
-/// converged targets should hold, so the oracle is unchanged: the burst is
+/// engine mechanism behind it. None of them changes what the converged
+/// targets should hold, so the oracle is unchanged: the burst is
 /// checked once it settles, like any other.
 #[derive(Debug, Clone, PartialEq)]
 pub enum BurstAction {

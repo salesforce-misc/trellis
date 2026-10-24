@@ -148,8 +148,7 @@ async fn run_plan(d: &Driver) -> bool {
     true
 }
 
-/// Runs every build to the end and the go-live catch-ups they park, then
-/// drains.
+/// Runs every build to the end and drains, then does both again.
 async fn settle_all(d: &mut Driver) {
     trellis::intake::harness::settle_builds(d.pool()).await;
     d.settle().await;
@@ -165,8 +164,8 @@ const SEED: &str = "insert into public.fa values \
                         (5, null, 3, 500), (6, 40, 1, 600)";
 
 /// The tables a chain reads are each definition's source and `JOIN` table:
-/// both upstream targets are read tables (the set capture records, the
-/// discharge's enumeration and status read), while only the captured
+/// both upstream targets are read tables (the set capture records), while
+/// only the captured
 /// sources are captured, since a target is fed through the seam.
 #[tokio::test]
 async fn a_join_over_two_targets_reads_every_table_of_its_chain() {
