@@ -133,12 +133,6 @@ mod tests {
             "a partition key's type name for the partition key allowlist",
         ),
         (
-            "staging/partition_correction/to_many.rs",
-            1,
-            "a relationship's join column, compared with a partition key's \
-             type; relationships are removed by #1115",
-        ),
-        (
             "staging/schema_change.rs",
             2,
             "the recorded and live types a pause's reason names",
