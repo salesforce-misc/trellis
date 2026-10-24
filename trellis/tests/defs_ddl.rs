@@ -462,7 +462,7 @@ async fn other_typed_passthrough_columns_get_their_real_native_target_type() {
 /// source column's *concrete* Postgres type on the target (`integer` stays
 /// `integer`, `bigint` stays `bigint`, `smallint` stays `smallint`), instead
 /// of collapsing through `ValueType::Numeric` to `numeric` — so the target
-/// column stays eligible as a relationship join key. A non-passthrough field
+/// column stays eligible as a `JOIN` key. A non-passthrough field
 /// (arithmetic over the same columns) still widens to `numeric`, since its
 /// result genuinely can't be narrower.
 #[tokio::test]
@@ -1167,8 +1167,8 @@ async fn create_target_table_mirrors_a_composite_primary_key_in_full() {
 }
 
 /// Issue #107: a single-column primary key of an unsafe (non-text-stable)
-/// type must be rejected exactly like a relationship join key of the same
-/// type already is (`assert_join_key_type_supported`) — 1-1 apply/backfill
+/// type must be rejected exactly like a `JOIN` key of the same type
+/// already is — 1-1 apply/backfill
 /// compare the primary key via `::text` casts throughout, so e.g. a
 /// `numeric` PK's `::text` rendering could disagree with another `::text`
 /// rendering of the numerically equal value, missing or duplicating target

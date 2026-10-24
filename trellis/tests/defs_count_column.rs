@@ -74,8 +74,7 @@ async fn connect_raw(dsn: &str) -> Client {
 /// mechanism (`seal::fenced_window`'s predecessor-half `UNION ALL`, `docs/
 /// staging-and-claiming/04-claiming-and-the-fold.md`) only ever looks back
 /// *one* generation, so a stale-slot write survives exactly one round past
-/// sealing and then is silently never read by anything — matches
-/// `defs_aggregate_relationship.rs`'s own `active_seg_table` helper.
+/// sealing and then is silently never read by anything.
 async fn active_seg_table(client: &Client) -> String {
     let ring_slot: i16 = client
         .query_one("select ring_slot from segment_pointer", &[])

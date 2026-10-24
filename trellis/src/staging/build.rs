@@ -233,8 +233,8 @@
 //! upstream go through the seam as any writer's do, so a rebuild of an
 //! upstream parks no catch-up for its readers.
 //!
-//! **Plain 1-1 targets (F8a, [`one_to_one`]).** A 1-1 target on a captured
-//! source takes the same scheduled build:
+//! **Plain 1-1 targets (F8a, [`one_to_one`]).** A 1-1 target takes the same
+//! scheduled build:
 //! the start, the plan job, the sweep on a rebuild and the strict flip. Its
 //! chunk writes the target rows themselves, ordered against pages by the
 //! keys' entries on the 1-1 slim ledger (#623 D6), so it appends no group

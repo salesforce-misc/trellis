@@ -303,8 +303,8 @@ cost of maintaining it, which on a ledger far larger than `shared_buffers`
 is most of a build's WAL, as full-page images of the index's leaves.
 
 A target is built one of two ways. The Re-derive build (`staging::build`,
-#625) serves an aggregate target and a 1-1 target, on a captured source (not
-another definition's target): it
+#625) serves an aggregate target and a 1-1 target, on a captured source or
+another definition's target: it
 applies from its start and re-derives the source in chunks, each inserting
 the entries its keys don't have yet and locking the others as a page does,
 and stamping them as a Re-derive does (below).

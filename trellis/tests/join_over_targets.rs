@@ -165,6 +165,25 @@ const SEED: &str = "insert into public.fa values \
                         (1, 10, 1, 100), (2, 10, 1, 200), (3, 10, 2, 300), (4, 20, 1, 400), \
                         (5, null, 3, 500), (6, 40, 1, 600)";
 
+/// The tables a chain reads are each definition's source and `JOIN` table:
+/// both upstream targets are read tables (the set capture records, the
+/// discharge's enumeration and status read), while only the captured
+/// sources are captured, since a target is fed through the seam.
+#[tokio::test]
+async fn a_join_over_two_targets_reads_every_table_of_its_chain() {
+    let d = start().await;
+    let mut read = trellis::defs::all_source_tables(d.pool())
+        .await
+        .expect("read tables");
+    read.sort();
+    assert_eq!(read, ["public.a1", "public.b1", "public.db", "public.fa"]);
+    let mut captured = trellis::defs::tables_to_capture(d.pool())
+        .await
+        .expect("captured tables");
+    captured.sort();
+    assert_eq!(captured, ["public.db", "public.fa"]);
+}
+
 /// Writes to each upstream's source reach the `JOIN` through the seam's
 /// images: a row that moves `P` cell or `M` cell upstream leaves the old
 /// one, which only its old image names, and an upstream group that goes

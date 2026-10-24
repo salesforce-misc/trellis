@@ -1,8 +1,8 @@
 //! The Re-derive build of a 1-1 target (#625 F8a; ADR-0002 "A build is
 //! Re-derive over chunks, and applies from its first chunk").
 //!
-//! A plain 1-1 target (on a captured source) is built
-//! by the same scheduled build as a ledger aggregate (see the parent
+//! A plain 1-1 target, on a captured source or another definition's
+//! target, is built by the same scheduled build as a ledger aggregate (see the parent
 //! module): the staging worker's start moves it `waiting_to_backfill ->
 //! backfilling` with `build = 'rederive'`, it applies from that commit, a
 //! plan job enqueues `(lo, hi]` chunks of its source's primary key, a
@@ -86,8 +86,8 @@ pub struct OneToOnePlan {
 
 /// Whether `definition` is a 1-1 target the Re-derive build serves (#625
 /// F8a): a 1-1 key space, and fields whose aliases substitute to self-contained SQL
-/// (a cyclic alias chain is the ring enumeration's). The caller checks the
-/// source is captured, not seam-fed (#625 F6).
+/// (a cyclic alias chain is the ring enumeration's). Its source may be
+/// captured or seam-fed ([`super::qualifies`], #625 F6).
 pub(crate) fn buildable(definition: &Definition) -> bool {
     matches!(
         definition.def.key_space,

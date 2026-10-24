@@ -262,11 +262,11 @@ async fn read_totals(client: &Client) -> Vec<(i32, String, String, String)> {
         .collect()
 }
 
-/// An `ALTER TRANSFORM` clause is parsed without its source, so the catalog
-/// reads `<FROM table>.<column>` in it as the source column against the
-/// stored definition. Unqualified, it would be a relationship path, which an
-/// ALTER refuses. Re-adding the same field is a no-op, and a three-part name
-/// must name the schema the bare `FROM` resolved to.
+/// An `ALTER TRANSFORM` clause is parsed without its source, and the catalog
+/// checks a qualified name in it against the stored definition's source:
+/// `<FROM table>.<column>` is the source column, another table's name is
+/// refused. Re-adding the same field is a no-op, and a three-part name must
+/// name the schema the bare `FROM` resolved to.
 #[tokio::test]
 async fn an_alter_reads_a_qualified_name_as_the_source_column() {
     use trellis::defs::ast::Expr;
@@ -319,6 +319,20 @@ async fn an_alter_reads_a_qualified_name_as_the_source_column() {
         .await
         .expect("re-adding the same field is a no-op");
     assert!(again.added.is_empty(), "{:?}", again.added);
+
+    let err = alter_transform(
+        &db.pool,
+        &alter("ALTER TRANSFORM amb_calc ADD product.val + 1 AS wrong"),
+    )
+    .await
+    .expect_err("`product` is not the source");
+    assert!(
+        err.to_string().contains(
+            "calculated field 'wrong' reads 'product.val', but a qualified column must name \
+             this transform's FROM table ('amb_src'); a second table is read with a JOIN"
+        ),
+        "{err}"
+    );
 
     let err = alter_transform(
         &db.pool,
