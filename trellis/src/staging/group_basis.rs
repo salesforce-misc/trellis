@@ -3460,7 +3460,7 @@ mod tests {
         assert!(!write_plan.contains("SubPlan"), "{write_plan}");
         let anti = write_plan
             .lines()
-            .find(|line| line.contains("Hash Anti Join"))
+            .find(|line| line.contains("Hash") && line.contains("Anti Join"))
             .unwrap_or_else(|| panic!("no hash anti-join: {write_plan}"));
         let rows: f64 = anti
             .split("rows=")
