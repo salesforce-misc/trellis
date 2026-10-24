@@ -29,9 +29,11 @@ build, truncate, chain and read partitioned sources, and what readers see. It
 extends
 [ADR-0002](0002-async-data-flow.md)'s group-level basis, which every structure
 here is maintained by, and the grammar of
-[ADR-0004](0004-transform-definition-grammar.md). Three or more tables,
-`RIGHT`/`FULL` joins, non-equi joins, a join with no `GROUP BY`, and `WHERE` are
-out of scope.
+[ADR-0004](0004-transform-definition-grammar.md). Every JOIN transform here
+has a `GROUP BY`. A join with no `GROUP BY` keeps one row per row of `a`, the
+1-1 grain, and is a 1-1 JOIN transform
+([ADR-0021](0021-one-to-one-join-transforms.md)). Three or more tables,
+`RIGHT`/`FULL` joins, non-equi joins and `WHERE` are out of scope.
 
 ## Decisions
 
@@ -78,12 +80,12 @@ What's admitted is the shape the design below is proven exact for. Refused at
 define, by name: two sides sharing a bare table name; `RIGHT` (swap the sides
 and use `LEFT`), `FULL`, `CROSS`, a comma join and a second `JOIN`; an
 expression key, a non-equality condition, `OR`, a one-side predicate, an
-equality between two columns of one side, `USING` and `NATURAL`; and a join
-with no `GROUP BY`.
+equality between two columns of one side, `USING` and `NATURAL`.
 [Supported sources and targets](../transforms.md#supported-sources-and-targets)
-lists each refusal and its remedy. A join with no `GROUP BY` produces one row per
-matching pair, which is per-row state by definition, and a non-equi join (a
-validity-date range, say) doesn't decompose by key at all.
+lists each refusal and its remedy. A non-equi join (a validity-date range, say)
+doesn't decompose by key at all. A join with no `GROUP BY` isn't an aggregate:
+its output is one row per row of `a`, which
+[ADR-0021](0021-one-to-one-join-transforms.md) keeps.
 
 ### The admitted aggregates are the ones partials keep exact by deltas alone
 
@@ -369,11 +371,15 @@ the invariants `P = GROUP BY a`, `M = GROUP BY b`, `J.matches = Σ M.n` and
 `T = Σ_k P ⊗ M`. It detects and reports, and never repairs; the scope and
 semantics are in [ADR-0013](0013-self-check-production-recompute-audit.md).
 
-### Enrichment at the fact's own grain is out of scope
+### Enrichment at the fact's own grain is a 1-1 JOIN transform
 
-Copying a dimension attribute onto every fact row is not served: its output is
-per fact row, which is per-row state by definition, the state this design
-exists to avoid. Readers join the dimension at query time instead.
+Copying a dimension attribute onto every fact row is not an aggregate: its
+output is one row per fact row, which is per-row state by definition, the state
+this design exists to avoid. It is a 1-1 JOIN transform
+([ADR-0021](0021-one-to-one-join-transforms.md)), which keeps that state as
+every 1-1 target does, on [ADR-0002](0002-async-data-flow.md)'s 1-1 ledger, and
+orders its two sides with this ADR's `J` lock. The aggregates here always have
+a `GROUP BY` and keep no per-row state.
 
 ## Example
 
