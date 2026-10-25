@@ -69,7 +69,8 @@ Once the GitHub release is published, publish the packages from the tag:
 .github/scripts/publish-packages.sh <version>
 ```
 
-It clones the tag into a scratch directory, checks the versions and every
+It runs on Linux or macOS, from any checkout of the repository: only the
+script comes from the checkout. It clones the tag into a scratch directory, checks the versions and every
 asset against `SHA256SUMS`, then publishes, asking before each:
 
 - **crates.io**: the engine crate as `trellis-pg` (`trellis` is taken
