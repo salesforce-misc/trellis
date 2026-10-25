@@ -23,7 +23,9 @@ checks they agree:
 - `@version` in `clients/elixir/mix.exs`
 - `Trellis::VERSION` in `clients/ruby/lib/trellis/version.rb`
 
-Setting a new version is an ordinary pull request.
+Setting a new version is an ordinary pull request. A prerelease
+(`0.1.0-alpha`) is released the same way, as a GitHub prerelease; RubyGems
+writes its `-` as `.pre.`, so its gems are `0.1.0.pre.alpha`.
 
 ## Cutting a release
 

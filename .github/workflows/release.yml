@@ -44,6 +44,12 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # The toolchain the rust-toolchain action installs, overriding
+  # rust-toolchain.toml. These builds need none of the file's components
+  # (rustfmt, clippy), and rustup's automatic install of them, run by the
+  # first `cargo` in a job, intermittently fails on the hosted Linux runners
+  # ("detected conflict: 'bin/cargo-fmt'").
+  RUSTUP_TOOLCHAIN: "1.98.0"
 
 jobs:
   versions:
@@ -396,7 +402,8 @@ jobs:
           }
           check "crates.io trellis-pg" "https://crates.io/api/v1/crates/trellis-pg/$version"
           check "Hex trellis_pg" "https://hex.pm/api/packages/trellis_pg/releases/$version"
-          check "RubyGems trellis-pg" "https://rubygems.org/api/v2/rubygems/trellis-pg/versions/$version.json"
+          # RubyGems writes a prerelease's `-` as `.pre.`.
+          check "RubyGems trellis-pg" "https://rubygems.org/api/v2/rubygems/trellis-pg/versions/${version//-/.pre.}.json"
 
       - uses: actions/download-artifact@v4
         with:
@@ -432,7 +439,9 @@ jobs:
             gh release upload "$GITHUB_REF_NAME" assets/* --clobber
             gh release edit "$GITHUB_REF_NAME" --draft=false --verify-tag
           else
-            gh release create "$GITHUB_REF_NAME" assets/* --verify-tag \
+            prerelease=()
+            [[ "$version" != *-* ]] || prerelease=(--prerelease)
+            gh release create "$GITHUB_REF_NAME" assets/* --verify-tag "${prerelease[@]}" \
               --title "Trellis $version" \
               --notes "The \`trellis\` CLI, and the precompiled builds of the Elixir (\`trellis_pg\`) and Ruby (\`trellis-pg\`) bindings. See docs/releasing.md."
           fi

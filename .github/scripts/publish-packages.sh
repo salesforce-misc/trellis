@@ -79,6 +79,8 @@ done
 [ -n "$version" ] || usage
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || die "$version isn't a version (want e.g. 0.1.0)"
 tag="v$version"
+# RubyGems writes a prerelease's `-` as `.pre.`: 0.1.0-alpha is the gem 0.1.0.pre.alpha.
+gem_version="${version//-/.pre.}"
 wants() { [[ ",$only," == *",$1,"* ]]; }
 for part in ${only//,/ }; do
   case "$part" in crates|hex|gems) ;; *) die "--only takes crates, hex and gems, not $part" ;; esac
@@ -221,23 +223,23 @@ if wants hex; then
 fi
 
 if wants gems; then
-  step "RubyGems: trellis-pg $version"
-  mapfile -t platform_gems < <(find "$work/assets" -name "trellis-pg-$version-*.gem" | sort)
-  source_gem="$work/assets/trellis-pg-$version.gem"
+  step "RubyGems: trellis-pg $gem_version"
+  mapfile -t platform_gems < <(find "$work/assets" -name "trellis-pg-$gem_version-*.gem" | sort)
+  source_gem="$work/assets/trellis-pg-$gem_version.gem"
   [ "${#platform_gems[@]}" -eq 6 ] || die "the release has ${#platform_gems[@]} platform gems, not 6"
-  [ -f "$source_gem" ] || die "the release has no source gem trellis-pg-$version.gem"
+  [ -f "$source_gem" ] || die "the release has no source gem trellis-pg-$gem_version.gem"
   # The platforms of this version RubyGems already has (a re-run after a
   # partial push), "ruby" being the source gem's.
   status="$(curl -sS -o "$work/versions.json" -w '%{http_code}' -A "$ua" https://rubygems.org/api/v1/versions/trellis-pg.json)"
   case "$status" in
-    200) pushed="$(jq -r --arg v "$version" '.[] | select(.number == $v) | .platform' "$work/versions.json")" ;;
+    200) pushed="$(jq -r --arg v "$gem_version" '.[] | select(.number == $v) | .platform' "$work/versions.json")" ;;
     404) pushed="" ;;
     *) die "couldn't ask RubyGems which trellis-pg gems are published (HTTP $status)" ;;
   esac
   platform_of() {
     local name="${1##*/}"
     name="${name%.gem}"
-    name="${name#"trellis-pg-$version"}"
+    name="${name#"trellis-pg-$gem_version"}"
     echo "${name#-}" | sed 's/^$/ruby/'
   }
   todo=()
@@ -266,4 +268,4 @@ step "Done"
 [ "$dry_run" -eq 0 ] || echo "(dry run: nothing was published)"
 wants crates && echo "  https://crates.io/crates/trellis-pg/$version"
 wants hex && echo "  https://hex.pm/packages/trellis_pg/$version"
-wants gems && echo "  https://rubygems.org/gems/trellis-pg/versions/$version"
+wants gems && echo "  https://rubygems.org/gems/trellis-pg/versions/$gem_version"

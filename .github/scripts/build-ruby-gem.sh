@@ -83,7 +83,8 @@ BUNDLE_GEMFILE="$gem_dir/Gemfile" bundle exec rb-sys-dock \
   --platform "$platform" --directory "$gem_dir" --ruby-versions "$ruby_versions" \
   -- "$build"
 
-gem="$gem_dir/pkg/trellis-pg-$version-$platform.gem"
+# RubyGems writes a prerelease's `-` as `.pre.` (0.1.0-alpha is 0.1.0.pre.alpha).
+gem="$gem_dir/pkg/trellis-pg-${version//-/.pre.}-$platform.gem"
 if [ ! -f "$gem" ]; then
   echo "build-ruby-gem: no $gem; pkg/ holds:" >&2
   ls -l "$gem_dir/pkg" >&2

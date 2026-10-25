@@ -78,7 +78,14 @@ runs:
       shell: bash
 
     - name: rustup toolchain install ${{steps.parse.outputs.toolchain}}
-      run: rustup toolchain install ${{steps.parse.outputs.toolchain}}${{steps.flags.outputs.targets}}${{steps.flags.outputs.components}} --profile minimal${{steps.flags.outputs.downgrade}} --no-self-update
+      # Retried: a hosted runner's DNS sometimes can't resolve
+      # static.rust-lang.org for a few seconds.
+      run: |
+        for attempt in 1 2 3 4; do
+          rustup toolchain install ${{steps.parse.outputs.toolchain}}${{steps.flags.outputs.targets}}${{steps.flags.outputs.components}} --profile minimal${{steps.flags.outputs.downgrade}} --no-self-update && exit 0
+          [ "$attempt" -eq 4 ] || { echo "rustup toolchain install failed; retrying in $((attempt * 10))s" >&2; sleep $((attempt * 10)); }
+        done
+        exit 1
       shell: bash
 
     - run: rustup default ${{steps.parse.outputs.toolchain}}
