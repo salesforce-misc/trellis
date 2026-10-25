@@ -194,12 +194,14 @@ SELECT
 
 **Throughput falls as more distinct groups receive writes at once.** A page
 locks every group it touches until it commits, so drain workers whose pages
-share groups queue behind each other for those rows. On a tmpfs-backed
-benchmark (`benchmark group-contention`, CPU only), a single `SUM`/`COUNT(*)`
-aggregate applied about 320k source rows/sec over 10 groups, 230k over 400,
-220k over 4,000 and 90k over 40,000. If you're planning an aggregate with tens
-of thousands of groups written concurrently, benchmark it on your own storage
-first (`benchmark group-contention --groups <n>`).
+share groups queue behind each other for those rows. On a disk-backed
+benchmark (`benchmark group-contention`, 8 writer threads on a 16-core box), a
+single `SUM`/`COUNT(*)` aggregate applied about 233k to 308k source rows/sec
+over 10 to 400 groups, 190k to 200k over 4,000 and 75k to 90k over 40,000.
+Throughput rises with writer threads up to about 8 (about 70k rows/sec with
+one, 230k with eight) and stays flat beyond that. If you're planning an
+aggregate with tens of thousands of groups written concurrently, benchmark it
+on your own storage first (`benchmark group-contention --groups <n>`).
 
 Values read before `await_converged` may be inconsistent, and are exact after
 it; on small or hot groups that can include a combination no source state
