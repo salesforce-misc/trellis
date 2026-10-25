@@ -803,7 +803,6 @@ mod tests {
             outcome,
             held_keys: None,
             drain_failures: Vec::new(),
-            unindexed_joins: Vec::new(),
         }
     }
 

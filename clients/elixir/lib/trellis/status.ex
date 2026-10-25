@@ -38,14 +38,9 @@ defmodule Trellis.Status do
       page; fix the cause its error names. A paused or quarantined
       transform has none.
 
-  `unindexed_joins` is a warning, never a hold-up: a `Trellis.UnindexedJoin`
-  for each join column of the relationships it reads that has no usable
-  index, `[]` when every one is indexed. It leaves `status` alone, and an
-  index you create shows on the next call.
-
   `source_index_gaps` is a warning, never a hold-up: a
   `Trellis.SourceIndexGap` for each source index a `GROUP BY` or `JOIN`
-  target needs and lacks, `[]` when it needs none or they exist. Define and a
+  target needs and lacks (its `role` says which part of the definition), `[]` when it needs none or they exist. Define and a
   resume refuse a transform without them, so a gap is an index dropped
   since, or one the transform opted out of with `WITHOUT SOURCE INDEX`.
   Nothing is paused, but `Trellis.self_check/3` refuses to walk the target
@@ -80,7 +75,6 @@ defmodule Trellis.Status do
           capture_failure: Trellis.CaptureFailure.t() | nil,
           held_keys: Trellis.HeldKeys.t() | nil,
           drain_failure: Trellis.DrainFailure.t() | nil,
-          unindexed_joins: [Trellis.UnindexedJoin.t()],
           source_index_gaps: [Trellis.SourceIndexGap.t()],
           correcting: [Trellis.CorrectingNode.t()],
           paused_upstream_columns: [String.t()]
@@ -93,7 +87,6 @@ defmodule Trellis.Status do
     :capture_failure,
     :held_keys,
     :drain_failure,
-    :unindexed_joins,
     :source_index_gaps,
     :correcting,
     :paused_upstream_columns
@@ -108,7 +101,6 @@ defmodule Trellis.Status do
         capture_failure: capture_failure,
         held_keys: held_keys,
         drain_failure: drain_failure,
-        unindexed_joins: unindexed_joins,
         source_index_gaps: source_index_gaps,
         correcting: correcting,
         paused_upstream_columns: paused_upstream_columns
@@ -120,7 +112,6 @@ defmodule Trellis.Status do
       capture_failure: capture_failure && Trellis.CaptureFailure.from_native(capture_failure),
       held_keys: held_keys && Trellis.HeldKeys.from_native(held_keys),
       drain_failure: drain_failure && Trellis.DrainFailure.from_native(drain_failure),
-      unindexed_joins: Enum.map(unindexed_joins, &Trellis.UnindexedJoin.from_native/1),
       source_index_gaps: Enum.map(source_index_gaps, &Trellis.SourceIndexGap.from_native/1),
       correcting: Enum.map(correcting, &Trellis.CorrectingNode.from_native/1),
       paused_upstream_columns: paused_upstream_columns
@@ -156,53 +147,32 @@ defmodule Trellis.CorrectingNode do
   end
 end
 
-defmodule Trellis.UnindexedJoin do
-  @moduledoc """
-  A join column of a relationship a transform reads that has no usable index,
-  as `Trellis.status/2` reports it: the
-  relationship's name (`relationship`), the qualified table that holds the
-  column (`table`), the `column`, and what to do about it (`fix`), the index
-  to create as a sentence. Trellis doesn't create indexes on your tables.
-  """
-
-  @type t :: %__MODULE__{
-          relationship: String.t(),
-          table: String.t(),
-          column: String.t(),
-          fix: String.t()
-        }
-
-  @enforce_keys [:relationship, :table, :column, :fix]
-  defstruct @enforce_keys
-
-  @doc false
-  def from_native(%{relationship: relationship, table: table, column: column, fix: fix}) do
-    %__MODULE__{relationship: relationship, table: table, column: column, fix: fix}
-  end
-end
-
 defmodule Trellis.SourceIndexGap do
   @moduledoc """
   A source index a `GROUP BY` or `JOIN` target needs and lacks, as
   `Trellis.status/2` reports it: the qualified `table`, the `columns` the
-  index should lead with, whether the transform opted out with `WITHOUT
-  SOURCE INDEX` (`opted_out`), and a `create index` statement to run (`fix`).
+  index should lead with, the part of the definition that needs it (`role`:
+  `:group_by` for the `GROUP BY` columns, `:join_from` or `:join_joined` for
+  a `JOIN`'s `ON` columns on its from or joined side), whether the transform
+  opted out with `WITHOUT SOURCE INDEX` (`opted_out`), and a `create index`
+  statement to run (`fix`).
   Trellis doesn't create indexes on your tables.
   """
 
   @type t :: %__MODULE__{
           table: String.t(),
           columns: [String.t()],
+          role: :group_by | :join_from | :join_joined,
           opted_out: boolean(),
           fix: String.t()
         }
 
-  @enforce_keys [:table, :columns, :opted_out, :fix]
+  @enforce_keys [:table, :columns, :role, :opted_out, :fix]
   defstruct @enforce_keys
 
   @doc false
-  def from_native(%{table: table, columns: columns, opted_out: opted_out, fix: fix}) do
-    %__MODULE__{table: table, columns: columns, opted_out: opted_out, fix: fix}
+  def from_native(%{table: table, columns: columns, role: role, opted_out: opted_out, fix: fix}) do
+    %__MODULE__{table: table, columns: columns, role: role, opted_out: opted_out, fix: fix}
   end
 end
 

@@ -131,6 +131,7 @@ defmodule Trellis.Native do
   def self_check_states, do: :erlang.nif_error(:nif_not_loaded)
   def divergence_kinds, do: :erlang.nif_error(:nif_not_loaded)
   def capture_failure_kinds, do: :erlang.nif_error(:nif_not_loaded)
+  def index_roles, do: :erlang.nif_error(:nif_not_loaded)
   def log_levels, do: :erlang.nif_error(:nif_not_loaded)
   def render_prometheus, do: :erlang.nif_error(:nif_not_loaded)
   def install_log_bridge(_level), do: :erlang.nif_error(:nif_not_loaded)

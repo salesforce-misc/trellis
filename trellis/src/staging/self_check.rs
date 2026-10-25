@@ -167,7 +167,6 @@ use super::holdup::{self, DrainFailure};
 use super::quarantine::{self, HeldKeys};
 use super::self_check_keyset::Keyset;
 use super::self_check_ring::Ring;
-use super::unindexed_joins::UnindexedJoin;
 
 /// One page's worth of bound for a [`check_page`] call — see the module doc
 /// comment's "Bounded, keyset-scoped, mandatory" section. `after` is a
@@ -305,15 +304,6 @@ pub struct SelfCheckPage {
     /// the targets of the tables it holds changes to, and with them the
     /// convergence this audit waits on. Empty when there is none.
     pub drain_failures: Vec<DrainFailure>,
-    /// The join columns of the relationships the audited definition reads
-    /// that have no usable index, whatever the outcome (#973): each read of
-    /// one scans its table. A warning only: it never changes `outcome`. The
-    /// fix for each is an index on its table and column, which Trellis
-    /// doesn't create. Read live when the audit ends, so an index created
-    /// since shows. Empty when there is none, which is always since no
-    /// definition reads a relationship (#1115); #1347 decides the field's
-    /// fate.
-    pub unindexed_joins: Vec<UnindexedJoin>,
 }
 
 /// What `self_check` found — see the module doc comment's "Quiescence"
@@ -545,9 +535,6 @@ pub async fn check_page(
     let found = findings(pool, &def).await?;
     page.held_keys = found.held_keys;
     page.drain_failures = found.drain_failures;
-    page.unindexed_joins =
-        super::unindexed_joins::for_definition(&**pool.get().await?, &def.source_table, &def.def)
-            .await?;
     Ok(page)
 }
 
@@ -755,7 +742,6 @@ pub(crate) async fn audit(
             ),
             held_keys: None,
             drain_failures: Vec::new(),
-            unindexed_joins: Vec::new(),
         });
     }
 
@@ -775,7 +761,6 @@ pub(crate) async fn audit(
             outcome: SelfCheckOutcome::NotLive(def.status),
             held_keys: None,
             drain_failures: Vec::new(),
-            unindexed_joins: Vec::new(),
         });
     }
 
@@ -807,7 +792,6 @@ pub(crate) async fn audit(
                     outcome: SelfCheckOutcome::NotCaughtUp,
                     held_keys: None,
                     drain_failures: Vec::new(),
-                    unindexed_joins: Vec::new(),
                 });
             }
             AwaitOutcome::CaughtUp(pass) => pass,
@@ -825,7 +809,6 @@ pub(crate) async fn audit(
             outcome: SelfCheckOutcome::Converged,
             held_keys: None,
             drain_failures: Vec::new(),
-            unindexed_joins: Vec::new(),
         });
     }
 
@@ -843,7 +826,6 @@ pub(crate) async fn audit(
             outcome: SelfCheckOutcome::Diverged(divergences),
             held_keys: None,
             drain_failures: Vec::new(),
-            unindexed_joins: Vec::new(),
         });
     }
 
@@ -863,7 +845,6 @@ pub(crate) async fn audit(
                     outcome: SelfCheckOutcome::NotCaughtUp,
                     held_keys: None,
                     drain_failures: Vec::new(),
-                    unindexed_joins: Vec::new(),
                 });
             }
             AwaitOutcome::CaughtUp(pass) => pass,
@@ -887,7 +868,6 @@ pub(crate) async fn audit(
         outcome,
         held_keys: None,
         drain_failures: Vec::new(),
-        unindexed_joins: Vec::new(),
     })
 }
 

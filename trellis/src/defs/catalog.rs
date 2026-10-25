@@ -4714,18 +4714,6 @@ pub(crate) async fn check_owned_tables(
     check_ledger_table(txn, definition).await
 }
 
-/// The relationships `def` reads through: none, since no definition reads
-/// a relationship (#1115). Kept, with [`super::model::RelationshipDefinition`], only so
-/// `staging::unindexed_joins` compiles unchanged until #1347 decides its
-/// fate; it goes with that module.
-pub(crate) async fn relationships_read_by(
-    _client: &impl GenericClient,
-    _def: &TransformDef,
-    _qualified_source: &str,
-) -> Result<Vec<super::model::RelationshipDefinition>, CatalogError> {
-    Ok(Vec::new())
-}
-
 /// Persists `source_columns` as definition `id`'s source column types, the
 /// ones its builds and applies cast through. A resume records the live ones
 /// ([`revalidate`]), so a source column widened since define is cast to its

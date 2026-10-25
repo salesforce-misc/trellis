@@ -41,6 +41,46 @@ use super::ddl::regclass_arg;
 use super::join::{self, Side};
 use crate::pool::quote_ident;
 
+/// The part of a definition that needs a source index. In a self-join both
+/// sides sit on the same table with the same columns, and the role is what
+/// tells their two requirements apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexRole {
+    /// A group-basis aggregate's `GROUP BY` columns.
+    GroupBy,
+    /// A `JOIN`'s `ON` columns on its from side.
+    JoinFrom,
+    /// A `JOIN`'s `ON` columns on its joined side.
+    JoinJoined,
+}
+
+impl IndexRole {
+    /// Every role, for a client to intern its words.
+    pub const ALL: [IndexRole; 3] = [
+        IndexRole::GroupBy,
+        IndexRole::JoinFrom,
+        IndexRole::JoinJoined,
+    ];
+
+    /// The role as one word, the form every client carries it in.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IndexRole::GroupBy => "group_by",
+            IndexRole::JoinFrom => "join_from",
+            IndexRole::JoinJoined => "join_joined",
+        }
+    }
+
+    /// The role in words, for a message.
+    pub fn describe(self) -> &'static str {
+        match self {
+            IndexRole::GroupBy => "the GROUP BY columns",
+            IndexRole::JoinFrom => "the JOIN's ON columns (from side)",
+            IndexRole::JoinJoined => "the JOIN's ON columns (joined side)",
+        }
+    }
+}
+
 /// An index a definition needs on one of its source tables.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceIndex {
@@ -48,6 +88,8 @@ pub struct SourceIndex {
     pub table: String,
     /// The columns the index leads with, in order.
     pub columns: Vec<String>,
+    /// The part of the definition that needs it.
+    pub role: IndexRole,
 }
 
 impl SourceIndex {
@@ -78,6 +120,8 @@ pub struct SourceIndexGap {
     pub table: String,
     /// The columns the index should lead with.
     pub columns: Vec<String>,
+    /// The part of the definition that needs the index.
+    pub role: IndexRole,
     /// Whether the definition was defined `WITHOUT SOURCE INDEX`: it runs
     /// without the index and its `self_check` walks at the per-page scan
     /// cost, rather than refusing.
@@ -97,6 +141,7 @@ impl From<&SourceIndexGap> for SourceIndex {
         SourceIndex {
             table: gap.table.clone(),
             columns: gap.columns.clone(),
+            role: gap.role,
         }
     }
 }
@@ -116,6 +161,7 @@ pub(crate) async fn gaps(
             .map(|index| SourceIndexGap {
                 table: index.table,
                 columns: index.columns,
+                role: index.role,
                 opted_out: def.without_source_index,
             })
             .collect(),
@@ -142,21 +188,26 @@ pub(crate) fn required(
             vec![SourceIndex {
                 table: source_table.to_string(),
                 columns,
+                role: IndexRole::GroupBy,
             }]
         }
-        KeySpace::Join(_) => [(Side::From, Some(source_table)), (Side::Joined, join_table)]
-            .into_iter()
-            .filter_map(|(side, table)| {
-                let columns = join::join_key(def, side);
-                if columns.is_empty() {
-                    return None;
-                }
-                Some(SourceIndex {
-                    table: table?.to_string(),
-                    columns,
-                })
+        KeySpace::Join(_) => [
+            (Side::From, IndexRole::JoinFrom, Some(source_table)),
+            (Side::Joined, IndexRole::JoinJoined, join_table),
+        ]
+        .into_iter()
+        .filter_map(|(side, role, table)| {
+            let columns = join::join_key(def, side);
+            if columns.is_empty() {
+                return None;
+            }
+            Some(SourceIndex {
+                table: table?.to_string(),
+                columns,
+                role,
             })
-            .collect(),
+        })
+        .collect(),
     }
 }
 
@@ -205,39 +256,33 @@ pub(crate) async fn has_index(
     table: &str,
     columns: &[String],
 ) -> Result<bool, tokio_postgres::Error> {
-    is_met(
-        client,
-        &SourceIndex {
-            table: table.to_string(),
-            columns: columns.to_vec(),
-        },
-    )
-    .await
+    is_met(client, table, columns).await
 }
 
-/// Whether `table` has an index meeting `need`. A table or a column that no
+/// Whether `table` has an index leading with `columns`. A table or a column that no
 /// longer exists is reported elsewhere (the definition's capture failure or
 /// resume refusal) and counts as met: there is no index to create.
 async fn is_met(
     client: &impl GenericClient,
-    need: &SourceIndex,
+    table: &str,
+    columns: &[String],
 ) -> Result<bool, tokio_postgres::Error> {
-    let regclass = regclass_arg(&need.table);
-    let columns = client
+    let regclass = regclass_arg(table);
+    let found = client
         .query(
             "select a.attname, a.attnum, a.attcollation::oid \
              from pg_catalog.pg_attribute a \
              where a.attrelid = pg_catalog.to_regclass($1) and a.attname = any($2) \
                and a.attnum > 0 and not a.attisdropped",
-            &[&regclass, &need.columns],
+            &[&regclass, &columns],
         )
         .await?;
     let mut by_name: HashMap<String, (i16, u32)> = HashMap::new();
-    for row in &columns {
+    for row in &found {
         by_name.insert(row.get(0), (row.get(1), row.get(2)));
     }
-    let mut want = Vec::with_capacity(need.columns.len());
-    for column in &need.columns {
+    let mut want = Vec::with_capacity(columns.len());
+    for column in columns {
         match by_name.get(column) {
             Some(found) => want.push(*found),
             None => return Ok(true),
@@ -295,7 +340,7 @@ pub(crate) async fn unmet(
 ) -> Result<Vec<SourceIndex>, tokio_postgres::Error> {
     let mut out = Vec::new();
     for need in needs {
-        if !is_met(client, &need).await? {
+        if !is_met(client, &need.table, &need.columns).await? {
             out.push(need);
         }
     }
@@ -325,9 +370,10 @@ pub fn refusal_text(target: &str, indexes: &[SourceIndex]) -> String {
     for index in indexes {
         let _ = write!(
             text,
-            " {} has none leading with ({}) in that order; create one with `{}`;",
+            " {} has none leading with ({}) in that order, for {}; create one with `{}`;",
             index.table,
             index.columns.join(", "),
+            index.role.describe(),
             index.create_index()
         );
     }
@@ -406,11 +452,91 @@ mod tests {
         assert!(!meets(&ordered(&[1], &[nulls_first]), &[(1, 0)]));
     }
 
+    fn needs(text: &str, columns: &[(&str, ValueType)], join: Option<&str>) -> Vec<SourceIndex> {
+        use crate::defs::parser::parse;
+        let columns = columns
+            .iter()
+            .map(|(name, ty)| (name.to_string(), *ty))
+            .collect();
+        required(&parse(text).expect("parses"), &columns, "public.t", join)
+    }
+
+    #[test]
+    fn an_aggregate_needs_its_index_in_the_group_by_role() {
+        let found = needs(
+            "TRANSFORM x FROM t GROUP BY g SELECT SUM(v) AS s",
+            &[("g", ValueType::Text), ("v", ValueType::Numeric)],
+            None,
+        );
+        assert_eq!(
+            found,
+            [SourceIndex {
+                table: "public.t".to_string(),
+                columns: vec!["g".to_string()],
+                role: IndexRole::GroupBy,
+            }]
+        );
+    }
+
+    #[test]
+    fn each_join_side_needs_its_index_in_its_own_role() {
+        let found = needs(
+            "TRANSFORM x FROM t JOIN u ON t.a = u.b GROUP BY t.g SELECT COUNT(*) AS n",
+            &[],
+            Some("public.u"),
+        );
+        let roles: Vec<_> = found
+            .iter()
+            .map(|i| (i.table.as_str(), i.columns.clone(), i.role))
+            .collect();
+        assert_eq!(
+            roles,
+            [
+                ("public.t", vec!["a".to_string()], IndexRole::JoinFrom),
+                ("public.u", vec!["b".to_string()], IndexRole::JoinJoined),
+            ]
+        );
+    }
+
+    #[test]
+    fn two_sides_on_one_table_are_two_indexes_told_apart_by_role() {
+        // The grammar refuses a self-join (two tables sharing a bare name),
+        // so no definition reaches this today; `required` keeps both sides
+        // anyway, so a grammar that allowed one would report both gaps.
+        let found = needs(
+            "TRANSFORM x FROM t JOIN u ON t.a = u.b GROUP BY t.g SELECT COUNT(*) AS n",
+            &[],
+            Some("public.t"),
+        );
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(found.iter().all(|i| i.table == "public.t"));
+        assert_eq!(found[0].role, IndexRole::JoinFrom);
+        assert_eq!(found[1].role, IndexRole::JoinJoined);
+        assert_ne!(found[0], found[1]);
+    }
+
+    #[test]
+    fn the_refusal_names_the_role() {
+        let text = refusal_text(
+            "public.x",
+            &[SourceIndex {
+                table: "public.regions".to_string(),
+                columns: vec!["id".to_string()],
+                role: IndexRole::JoinJoined,
+            }],
+        );
+        assert!(
+            text.contains("for the JOIN's ON columns (joined side)"),
+            "{text}"
+        );
+    }
+
     #[test]
     fn create_index_quotes_the_table_and_columns() {
         let need = SourceIndex {
             table: "public.Order Lines".to_string(),
             columns: vec!["customer id".to_string(), "kind".to_string()],
+            role: IndexRole::GroupBy,
         };
         assert_eq!(
             need.create_index(),

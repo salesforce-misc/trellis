@@ -10,7 +10,7 @@ use std::time::Duration;
 use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::{Config, SelfCheckMode, TransformStatus, Trellis, TrellisOptions};
+use trellis::{Config, IndexRole, SelfCheckMode, TransformStatus, Trellis, TrellisOptions};
 
 const AGG: &str = "TRANSFORM agg FROM public.src GROUP BY g SELECT SUM(v) AS total";
 const AGG_OPT_OUT: &str =
@@ -164,6 +164,7 @@ async fn the_opt_out_defines_and_status_reports_it() {
     assert_eq!(status.source_index_gaps.len(), 1, "{status:?}");
     let gap = &status.source_index_gaps[0];
     assert!(gap.opted_out);
+    assert_eq!(gap.role, IndexRole::GroupBy);
     assert_eq!(
         (gap.table.as_str(), gap.columns.clone()),
         ("public.src", vec!["g".to_string()])
@@ -217,6 +218,7 @@ async fn a_dropped_index_warns_refuses_self_check_and_pauses_nothing() {
     assert_ne!(status.status, TransformStatus::Paused);
     assert_eq!(status.source_index_gaps.len(), 1);
     assert!(!status.source_index_gaps[0].opted_out);
+    assert_eq!(status.source_index_gaps[0].role, IndexRole::GroupBy);
 
     let err = trellis
         .self_check("agg", SelfCheckMode::Standard, Duration::ZERO)
@@ -258,6 +260,10 @@ async fn a_join_checks_each_side_separately() {
     // orders.id is its primary key; items.order_id has no index.
     let message = refusal(&trellis, JOIN).await;
     assert!(message.contains("public.items"), "{message}");
+    assert!(
+        message.contains("for the JOIN's ON columns (joined side)"),
+        "{message}"
+    );
     assert!(!message.contains("public.orders has none"), "{message}");
     assert!(
         message.contains(r#"create index on "public"."items" ("order_id")"#),
@@ -276,6 +282,7 @@ async fn a_join_checks_each_side_separately() {
     let gaps = status_of(&trellis, "j").await.source_index_gaps;
     assert_eq!(gaps.len(), 1, "{gaps:?}");
     assert_eq!(gaps[0].table, "public.items");
+    assert_eq!(gaps[0].role, IndexRole::JoinJoined);
 }
 
 #[tokio::test]

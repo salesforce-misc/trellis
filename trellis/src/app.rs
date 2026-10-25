@@ -124,7 +124,6 @@ use crate::staging::partition_correction::CorrectingNode;
 use crate::staging::quarantine::{self, HeldKeyRetry, HeldKeys};
 use crate::staging::self_check::{SelfCheckError, SelfCheckMode};
 use crate::staging::self_check_job::{self, SelfCheckJob};
-use crate::staging::unindexed_joins::{self, UnindexedJoin};
 use crate::staging::{DEFAULT_RECLAIM_TTL, StagingError, converge, worker_registry};
 
 /// Options a client sets when it [`connect`](Trellis::connect)s.
@@ -840,7 +839,6 @@ impl Trellis {
             let mut paused_upstream_columns = Vec::new();
             let mut holdup = (None, None);
             let mut drain_failure = None;
-            let mut unindexed = Vec::new();
             let mut source_index_gaps = Vec::new();
             let mut join = None;
             let mut correcting = Vec::new();
@@ -877,14 +875,11 @@ impl Trellis {
                         )
                         .await?;
                 }
-                // #973: a stored definition always parses.
+                // A stored definition always parses.
                 if let Ok(def) = crate::defs::grammar::load(
                     row.get("definition_text"),
                     row.get("grammar_version"),
                 ) {
-                    unindexed =
-                        unindexed_joins::for_definition(&*txn, row.get("source_table"), &def)
-                            .await?;
                     // Only an aggregate's requirement reads the recorded
                     // source columns (whether the group basis takes it).
                     let source_columns =
@@ -929,7 +924,6 @@ impl Trellis {
                     row.get("held_retry_at"),
                 ),
                 drain_failure,
-                unindexed_joins: unindexed,
                 source_index_gaps,
                 join,
                 correcting,
@@ -2042,17 +2036,6 @@ pub struct DefinitionStatus {
     /// first, and cleared when the page commits. Separate from
     /// `capture_failure`: it pauses nothing.
     pub drain_failure: Option<DrainFailure>,
-    /// The join columns of the relationships the definition reads that have
-    /// no usable index (#973): `from_col` on the from-side table, and a
-    /// to-many relationship's `to_col` on the to-side table. Each read of
-    /// one scans its table, growing with the table instead of with the
-    /// batch. A warning only: the definition's status is unaffected. Each
-    /// entry names the relationship, table and column, and [`UnindexedJoin::fix`]
-    /// says what to do: create an index on the column, which Trellis doesn't
-    /// do. Read live on each call, so an index created since shows. Empty
-    /// when there is none, which is always since no definition reads a
-    /// relationship (#1115); #1347 decides the field's fate.
-    pub unindexed_joins: Vec<UnindexedJoin>,
     /// The source indexes a `GROUP BY` or `JOIN` target needs and lacks now
     /// (#1167): one entry per table and columns. Define and a resume refuse
     /// a definition without them, so an entry here is an index dropped or

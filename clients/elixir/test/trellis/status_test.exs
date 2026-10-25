@@ -23,7 +23,6 @@ defmodule Trellis.StatusTest do
         capture_failure: nil,
         held_keys: nil,
         drain_failure: nil,
-        unindexed_joins: [],
         source_index_gaps: [],
         correcting: [],
         paused_upstream_columns: []
@@ -64,7 +63,6 @@ defmodule Trellis.StatusTest do
         },
         held_keys: %{count: 2, oldest_poisoned_at_micros: 1_727_222_400_654_323},
         drain_failure: nil,
-        unindexed_joins: [],
         source_index_gaps: [],
         correcting: [],
         paused_upstream_columns: []
@@ -112,7 +110,6 @@ defmodule Trellis.StatusTest do
           last_seen_micros: 1_727_222_400_654_322,
           attempts: 5
         },
-        unindexed_joins: [],
         source_index_gaps: [],
         correcting: [],
         paused_upstream_columns: []
@@ -129,38 +126,6 @@ defmodule Trellis.StatusTest do
            }
   end
 
-  test "an unindexed join becomes a struct" do
-    status =
-      Trellis.Status.from_native(%{
-        status: :live,
-        backfill_failure: nil,
-        capture_wait: nil,
-        capture_failure: nil,
-        held_keys: nil,
-        drain_failure: nil,
-        unindexed_joins: [
-          %{
-            relationship: "orders",
-            table: "public.orders",
-            column: "customer_id",
-            fix: "create an index on public.orders (customer_id)"
-          }
-        ],
-        source_index_gaps: [],
-        correcting: [],
-        paused_upstream_columns: []
-      })
-
-    assert status.unindexed_joins == [
-             %Trellis.UnindexedJoin{
-               relationship: "orders",
-               table: "public.orders",
-               column: "customer_id",
-               fix: "create an index on public.orders (customer_id)"
-             }
-           ]
-  end
-
   test "a source index gap becomes a struct" do
     status =
       Trellis.Status.from_native(%{
@@ -170,11 +135,11 @@ defmodule Trellis.StatusTest do
         capture_failure: nil,
         held_keys: nil,
         drain_failure: nil,
-        unindexed_joins: [],
         source_index_gaps: [
           %{
             table: "public.orders",
             columns: ["customer_id"],
+            role: :join_joined,
             opted_out: false,
             fix: ~s|create index on "public"."orders" ("customer_id")|
           }
@@ -187,6 +152,7 @@ defmodule Trellis.StatusTest do
              %Trellis.SourceIndexGap{
                table: "public.orders",
                columns: ["customer_id"],
+               role: :join_joined,
                opted_out: false,
                fix: ~s|create index on "public"."orders" ("customer_id")|
              }
@@ -202,7 +168,6 @@ defmodule Trellis.StatusTest do
         capture_failure: nil,
         held_keys: nil,
         drain_failure: nil,
-        unindexed_joins: [],
         source_index_gaps: [],
         correcting: [
           %{node: "public.items_p1", since_micros: 1_727_222_400_654_321, keys_remaining: 5},

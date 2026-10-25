@@ -225,49 +225,6 @@ impl TransformStatus {
     }
 }
 
-/// A relationship as `staging::unindexed_joins` reads it. No definition
-/// reads a relationship since #1115, so nothing constructs one; the type
-/// stays, with [`RelationshipDef`] and [`RelationshipCardinality`], only so
-/// that module compiles unchanged until #1347 decides its fate.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RelationshipDefinition {
-    pub from_schema: String,
-    pub to_schema: String,
-    pub def: RelationshipDef,
-    pub cardinality: RelationshipCardinality,
-}
-
-impl RelationshipDefinition {
-    /// The from-table's fully-qualified `"schema.table"` identity.
-    pub fn qualified_from_table(&self) -> String {
-        format!("{}.{}", self.from_schema, self.def.from_table)
-    }
-
-    /// The to-table's fully-qualified `"schema.table"` identity.
-    pub fn qualified_to_table(&self) -> String {
-        format!("{}.{}", self.to_schema, self.def.to_table)
-    }
-}
-
-/// A relationship's name and join columns; see [`RelationshipDefinition`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RelationshipDef {
-    pub name: String,
-    pub from_table: String,
-    pub from_col: String,
-    pub to_table: String,
-    pub to_col: String,
-}
-
-/// Whether a relationship's to-side has at most one row per from-row; see
-/// [`RelationshipDefinition`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[expect(dead_code, reason = "staging::unindexed_joins' input until #1347")]
-pub(crate) enum RelationshipCardinality {
-    ToOne,
-    ToMany,
-}
-
 /// Which role [`super::catalog::resolve_node`] is being asked to establish for
 /// a table: a **source** table is one Trellis captures changes from, and
 /// beyond installing its capture triggers (ADR-0002) issues no DDL against

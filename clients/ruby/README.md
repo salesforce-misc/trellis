@@ -72,16 +72,13 @@ Nothing in the binding uses it.
   holds (`held_keys`). `status` also reports a page the drain keeps failing
   on with nothing charged or paused (`drain_failure`, a
   `Trellis::DrainFailure`), and a finished `self_check` job's report lists
-  every one open (`drain_failures`). `status` lists the join columns of the
-  relationships a definition reads that have no usable index
-  (`unindexed_joins`, each a `Trellis::UnindexedJoin` with `relationship`,
-  `table`, `column` and the `fix` sentence), a warning that never changes its
-  status. `status` names the paused upstream columns
+  every one open (`drain_failures`). `status` names the paused upstream columns
   (`paused_upstream_columns`, each `"target.column"`) that make a `live`
   definition report `catching_up`. `status` lists the source indexes a
   `GROUP BY` or `JOIN` target
   needs and lacks (`source_index_gaps`, each a `Trellis::SourceIndexGap` with
-  `table`, `columns`, `opted_out` and a `create index` statement as `fix`);
+  `table`, `columns`, `role` (`:group_by`, `:join_from` or `:join_joined`: the part of
+  the definition that needs it), `opted_out` and a `create index` statement as `fix`);
   `self_check` refuses such a target unless it was defined `WITHOUT SOURCE
   INDEX`. `status` lists the partitions of a partitioned source a definition
   is being corrected for while it reads `:backfilling` for them

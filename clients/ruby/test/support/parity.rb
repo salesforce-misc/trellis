@@ -20,7 +20,8 @@ module Parity
     "self_check_mode" => -> { Trellis::Native.self_check_modes },
     "self_check_state" => -> { Trellis::Native.self_check_states },
     "divergence_kind" => -> { Trellis::Native.divergence_kinds },
-    "capture_failure_kind" => -> { Trellis::Native.capture_failure_kinds }
+    "capture_failure_kind" => -> { Trellis::Native.capture_failure_kinds },
+    "index_role" => -> { Trellis::Native.index_roles }
   }.freeze
 
   # The fixture's operations, each as a call on this binding. `args` are the

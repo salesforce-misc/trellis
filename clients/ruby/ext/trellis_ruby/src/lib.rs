@@ -65,9 +65,9 @@ use trellis_embed::{
     PlainCaptureWait, PlainConfig, PlainCorrectingNode, PlainDefinitionStatus,
     PlainDefinitionSummary, PlainDivergence, PlainDrainFailure, PlainError, PlainHeldKeys,
     PlainPoisonEntry, PlainQuarantineEntry, PlainSamplePage, PlainSelfCheckJob,
-    PlainSelfCheckReport, PlainSourceIndexGap, PlainUnindexedJoin, SELF_CHECK_MODES,
-    SELF_CHECK_OUTCOMES, SELF_CHECK_STATES, capture_failure_kind_names, decode_cursor,
-    decode_watermark, encode_watermark, quarantine_state_names, require_transform_statement,
+    PlainSelfCheckReport, PlainSourceIndexGap, SELF_CHECK_MODES, SELF_CHECK_OUTCOMES,
+    SELF_CHECK_STATES, capture_failure_kind_names, decode_cursor, decode_watermark,
+    encode_watermark, index_role_names, quarantine_state_names, require_transform_statement,
     self_check_mode, system_time_from_epoch_micros, transform_status_names,
 };
 
@@ -823,6 +823,7 @@ fn symbol_words() -> impl Iterator<Item = &'static str> {
         .chain(SELF_CHECK_MODES)
         .chain(DIVERGENCE_KINDS)
         .chain(capture_failure_kind_names())
+        .chain(index_role_names())
 }
 
 /// A hash from symbol keys to `fields`' values: the shape every record
@@ -893,7 +894,6 @@ fn status_hash(ruby: &Ruby, status: PlainDefinitionStatus) -> Result<RHash, Erro
         .drain_failure
         .map(|failure| drain_failure_hash(ruby, failure))
         .transpose()?;
-    let unindexed_joins = array(ruby, status.unindexed_joins, unindexed_join_hash)?;
     let source_index_gaps = array(ruby, status.source_index_gaps, source_index_gap_hash)?;
     let correcting = array(ruby, status.correcting, correcting_hash)?;
     let paused_upstream_columns = ruby.ary_from_iter(status.paused_upstream_columns);
@@ -906,7 +906,6 @@ fn status_hash(ruby: &Ruby, status: PlainDefinitionStatus) -> Result<RHash, Erro
             ("capture_failure", ruby.into_value(capture_failure)),
             ("held_keys", ruby.into_value(held_keys)),
             ("drain_failure", ruby.into_value(drain_failure)),
-            ("unindexed_joins", unindexed_joins.as_value()),
             ("source_index_gaps", source_index_gaps.as_value()),
             ("correcting", correcting.as_value()),
             (
@@ -929,20 +928,6 @@ fn correcting_hash(ruby: &Ruby, node: PlainCorrectingNode) -> Result<RHash, Erro
     )
 }
 
-/// A join column of a relationship a definition reads that has no usable
-/// index.
-fn unindexed_join_hash(ruby: &Ruby, join: PlainUnindexedJoin) -> Result<RHash, Error> {
-    record(
-        ruby,
-        [
-            ("relationship", ruby.into_value(join.relationship)),
-            ("table", ruby.into_value(join.table)),
-            ("column", ruby.into_value(join.column)),
-            ("fix", ruby.into_value(join.fix)),
-        ],
-    )
-}
-
 /// A source index a `GROUP BY` or `JOIN` target needs and lacks.
 fn source_index_gap_hash(ruby: &Ruby, gap: PlainSourceIndexGap) -> Result<RHash, Error> {
     record(
@@ -950,6 +935,7 @@ fn source_index_gap_hash(ruby: &Ruby, gap: PlainSourceIndexGap) -> Result<RHash,
         [
             ("table", ruby.into_value(gap.table)),
             ("columns", ruby.into_value(gap.columns)),
+            ("role", word_symbol(ruby, gap.role).as_value()),
             ("opted_out", ruby.into_value(gap.opted_out)),
             ("fix", ruby.into_value(gap.fix)),
         ],
@@ -1220,6 +1206,11 @@ fn capture_failure_kinds(ruby: &Ruby) -> RArray {
     word_symbols(ruby, capture_failure_kind_names())
 }
 
+/// Every role symbol a source index gap can carry.
+fn index_roles(ruby: &Ruby) -> RArray {
+    word_symbols(ruby, index_role_names())
+}
+
 /// Every statement kind `trellis`'s grammar has, for the test asserting
 /// `apply`'s round trip covers each one.
 fn statement_kinds() -> Vec<&'static str> {
@@ -1248,6 +1239,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     native.define_module_function("self_check_states", function!(self_check_states, 0))?;
     native.define_module_function("divergence_kinds", function!(divergence_kinds, 0))?;
     native.define_module_function("capture_failure_kinds", function!(capture_failure_kinds, 0))?;
+    native.define_module_function("index_roles", function!(index_roles, 0))?;
     native.define_module_function("statement_kinds", function!(statement_kinds, 0))?;
 
     let handle = native.define_class("Handle", ruby.class_object())?;

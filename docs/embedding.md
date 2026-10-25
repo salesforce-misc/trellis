@@ -467,31 +467,6 @@ end
 The CLI's `trellis status` prints each one on an indented line under the
 definition it holds back.
 
-### Unindexed join columns
-
-`status(target)` reports, as `unindexed_joins`, each join column of a
-relationship the definition reads that has no usable index: a relationship's
-`from_col`, and a to-many relationship's `to_col`. An entry names the
-relationship, the table (`schema.table`) and the column; the fix is an index on
-that table and column, which Trellis doesn't create on your tables.
-The list is empty for a definition whose join columns are all indexed, and it
-never changes the definition's status, so a health check that wants it reads
-the field:
-
-```rust
-for summary in trellis.definitions().await? {
-    if let Some(status) = trellis.status(&summary.target_table).await? {
-        for join in &status.unindexed_joins {
-            // `join.fix()`: "create an index on public.orders (customer_id)"
-        }
-    }
-}
-```
-
-In `trellis-embed`, `PlainDefinitionStatus` carries it as `unindexed_joins`,
-each entry with `relationship`, `table`, `column` and the `fix` sentence. The
-CLI's `trellis status` prints each entry as a warning line under its definition.
-
 ### Source indexes
 
 A `GROUP BY` aggregate on the group basis and a `JOIN` need an index on their
@@ -503,7 +478,10 @@ that leads with them is enough. Define and `RESUME` refuse without it, with the
 `create index` to run in the message, unless the definition says `WITHOUT SOURCE
 INDEX` after its `GROUP BY` or `JOIN` clause. `status(target)` reports an index
 dropped since, or one an opted-out definition lacks, as `source_index_gaps`
-(`table`, `columns`, `opted_out` and `fix`, the statement to run); in
+(`table`, `columns`, `role`, `opted_out` and `fix`, the statement to run); `role`
+says which part of the definition needs the index: the `GROUP BY` columns
+(`group_by`), or a `JOIN`'s `ON` columns on its from side (`join_from`) or its
+joined side (`join_joined`). In
 `trellis-embed` that is `PlainDefinitionStatus::source_index_gaps`. The warning
 pauses nothing, but `self_check` refuses a definition that did not opt out. See
 [Supported sources and targets](transforms.md#supported-sources-and-targets).

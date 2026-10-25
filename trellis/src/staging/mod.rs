@@ -88,7 +88,6 @@ mod self_check_ring;
 pub mod session;
 pub mod state;
 pub(crate) mod target_mutations;
-pub(crate) mod unindexed_joins;
 pub mod worker_registry;
 
 // This module is tier 3 (`pub(crate)`, ADR-0012), so these flattened
@@ -139,7 +138,6 @@ pub use self_check::{Divergence, SelfCheckMode, SelfCheckOutcome};
 pub use self_check_job::{SelfCheckJob, SelfCheckJobState, SelfCheckReport};
 pub use session::ProducerSession;
 pub use state::segment_state_counts;
-pub use unindexed_joins::UnindexedJoin;
 pub use worker_registry::{deregister_worker, reclaim_stale_workers, register_worker};
 
 // Reached from `crate::dev` (ADR-0012's sanctioned exception) by

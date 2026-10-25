@@ -65,16 +65,13 @@ The surface mirrors the Rust crate's `BlockingTrellis` (issues #146, #147,
   fixed; `status/2` reports how many it holds (`held_keys`). `status/2`
   also reports a page the drain keeps failing on with nothing charged or
   paused (`drain_failure`, a `Trellis.DrainFailure`), and a finished `self_check/3`
-  job's report lists every one open (`drain_failures`). `status/2` lists the join
-  columns of the relationships a transform reads that have no usable index
-  (`unindexed_joins`, each a `Trellis.UnindexedJoin` with `relationship`,
-  `table`, `column` and the `fix` sentence), a warning that never changes its
-  status. `status/2` names the paused upstream columns
+  job's report lists every one open (`drain_failures`). `status/2` names the paused upstream columns
   (`paused_upstream_columns`, each `"target.column"`) that make a `:live`
   transform report `:catching_up`. `status/2` lists the source indexes a
   `GROUP BY` or `JOIN` target
   needs and lacks (`source_index_gaps`, each a `Trellis.SourceIndexGap` with
-  `table`, `columns`, `opted_out` and a `create index` statement as `fix`);
+  `table`, `columns`, `role` (`:group_by`, `:join_from` or `:join_joined`: the part
+  of the definition that needs it), `opted_out` and a `create index` statement as `fix`);
   `self_check/3` refuses such a target unless it was defined `WITHOUT SOURCE
   INDEX`. `status/2` lists the partitions of a partitioned source a transform
   is being corrected for while it reads `:backfilling` for them

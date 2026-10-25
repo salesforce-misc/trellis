@@ -70,9 +70,9 @@ use trellis_embed::{
     PlainCaptureFailure, PlainCaptureWait, PlainConfig, PlainCorrectingNode, PlainDefinitionStatus,
     PlainDefinitionSummary, PlainDivergence, PlainDrainFailure, PlainError, PlainHeldKeys,
     PlainPoisonEntry, PlainQuarantineEntry, PlainSamplePage, PlainSelfCheckJob,
-    PlainSelfCheckReport, PlainSourceIndexGap, PlainUnindexedJoin, SELF_CHECK_MODES,
-    SELF_CHECK_OUTCOMES, SELF_CHECK_STATES, capture_failure_kind_names, decode_cursor,
-    decode_watermark, encode_watermark, quarantine_state_names, require_transform_statement,
+    PlainSelfCheckReport, PlainSourceIndexGap, SELF_CHECK_MODES, SELF_CHECK_OUTCOMES,
+    SELF_CHECK_STATES, capture_failure_kind_names, decode_cursor, decode_watermark,
+    encode_watermark, index_role_names, quarantine_state_names, require_transform_statement,
     self_check_mode, system_time_from_epoch_micros, transform_status_names,
 };
 
@@ -222,7 +222,6 @@ struct StatusTerm {
     capture_failure: Option<CaptureFailureTerm>,
     held_keys: Option<HeldKeysTerm>,
     drain_failure: Option<DrainFailureTerm>,
-    unindexed_joins: Vec<UnindexedJoinTerm>,
     source_index_gaps: Vec<SourceIndexGapTerm>,
     correcting: Vec<CorrectingNodeTerm>,
     paused_upstream_columns: Vec<String>,
@@ -247,45 +246,26 @@ impl From<PlainCorrectingNode> for CorrectingNodeTerm {
     }
 }
 
-/// A join column of a relationship a definition reads that has no usable
-/// index, as `status/2` and `self_check/3` report it.
-#[derive(NifMap)]
-struct UnindexedJoinTerm {
-    relationship: String,
-    table: String,
-    column: String,
-    fix: String,
-}
-
-impl From<PlainUnindexedJoin> for UnindexedJoinTerm {
-    fn from(join: PlainUnindexedJoin) -> Self {
-        UnindexedJoinTerm {
-            relationship: join.relationship,
-            table: join.table,
-            column: join.column,
-            fix: join.fix,
-        }
-    }
-}
-
 /// A source index a `GROUP BY` or `JOIN` target needs and lacks, as
 /// `status/2` reports it.
 #[derive(NifMap)]
 struct SourceIndexGapTerm {
     table: String,
     columns: Vec<String>,
+    role: Atom,
     opted_out: bool,
     fix: String,
 }
 
-impl From<PlainSourceIndexGap> for SourceIndexGapTerm {
-    fn from(gap: PlainSourceIndexGap) -> Self {
-        SourceIndexGapTerm {
+impl SourceIndexGapTerm {
+    fn new(env: Env, gap: PlainSourceIndexGap) -> NifReply<Self> {
+        Ok(SourceIndexGapTerm {
             table: gap.table,
             columns: gap.columns,
+            role: word_atom(env, gap.role)?,
             opted_out: gap.opted_out,
             fix: gap.fix,
-        }
+        })
     }
 }
 
@@ -425,6 +405,7 @@ fn atom_words() -> impl Iterator<Item = &'static str> {
         .chain(DIVERGENCE_KINDS)
         .chain(capture_failure_kind_names())
         .chain(LOG_LEVELS)
+        .chain(index_role_names())
 }
 
 /// A registered definition, as `definitions/1` lists it.
@@ -989,16 +970,11 @@ fn status<'a>(
                     .transpose()?,
                 held_keys: status.held_keys.map(HeldKeysTerm::from),
                 drain_failure: status.drain_failure.map(DrainFailureTerm::from),
-                unindexed_joins: status
-                    .unindexed_joins
-                    .into_iter()
-                    .map(UnindexedJoinTerm::from)
-                    .collect(),
                 source_index_gaps: status
                     .source_index_gaps
                     .into_iter()
-                    .map(SourceIndexGapTerm::from)
-                    .collect(),
+                    .map(|gap| SourceIndexGapTerm::new(env, gap))
+                    .collect::<NifReply<_>>()?,
                 correcting: status
                     .correcting
                     .into_iter()
@@ -1081,6 +1057,12 @@ fn divergence_kinds(env: Env) -> NifReply<Vec<Atom>> {
 #[rustler::nif(schedule = "DirtyIo")]
 fn capture_failure_kinds(env: Env) -> NifReply<Vec<Atom>> {
     word_atoms(env, capture_failure_kind_names())
+}
+
+/// Every role atom a source index gap can carry.
+#[rustler::nif(schedule = "DirtyIo")]
+fn index_roles(env: Env) -> NifReply<Vec<Atom>> {
+    word_atoms(env, index_role_names().to_vec())
 }
 
 /// Every level atom `take_log_records/1` can return.

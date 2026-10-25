@@ -54,6 +54,8 @@ defmodule Trellis.ConversionsTest do
              {:ok, [:cell, :missing_row, :extra_row, :missing_column, :extra_column, :capture]}
 
     assert Trellis.Native.capture_failure_kinds() == {:ok, [:capture, :halt, :disruption]}
+
+    assert Trellis.Native.index_roles() == {:ok, [:group_by, :join_from, :join_joined]}
   end
 
   test "a self-check report's divergences become structs" do

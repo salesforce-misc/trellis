@@ -452,8 +452,11 @@ The holdup is separate from `capture_failure`: it pauses and charges nothing
 
 `source_index_gaps` on `DefinitionStatus` lists the source indexes a `GROUP BY` or `JOIN`
 transform needs and lacks (#1167): one entry per table and leading columns, with
+a `role` (`GROUP BY` columns, a `JOIN`'s `ON` columns on its from side, or on its
+joined side: `IndexRole`, the word `group_by`, `join_from` or `join_joined` in the
+bindings) that names the part of the definition that needs the index, with
 `opted_out` and a `create index` statement as the fix (`SourceIndexGap::fix`), which
-Trellis doesn't run. Define and a `RESUME` refuse a transform without them, so an
+Trellis doesn't run. Define and a `RESUME` refuse a transform without them, naming the same role, so an
 entry is an index dropped or made invalid since, or one a transform defined `WITHOUT
 SOURCE INDEX` runs without. It is a warning: nothing is paused and the target is
 correct, but `self_check` refuses to walk a transform whose entry is not opted out
@@ -462,18 +465,6 @@ other target and when the indexes exist, is read from the catalog on each call, 
 is one field for every target kind. The CLI's `trellis status` prints one warning line per
 entry. Which indexes a target needs is in
 [Supported sources and targets](transforms.md#supported-sources-and-targets).
-
-`unindexed_joins` on `DefinitionStatus` lists the join columns of the relationships
-the transform reads that have no usable index (#973): a relationship's `from_col`,
-and a to-many relationship's `to_col` (a to-one's `to_col` is unique, so it is never
-listed). Each entry names the relationship, the table, the column and the fix, an
-index on that table and column, which Trellis doesn't create on your tables.
-It is a warning: the transform
-reads the column either way, each read scanning the table until the index exists,
-and its status is unaffected. The list is read from the catalog on each call, so an
-index you create shows on the next one, with no restart. A join column that no
-longer exists isn't listed. The CLI's `trellis status` prints one warning line per
-entry under the transform.
 
 `join` on `DefinitionStatus` is set for a `JOIN` transform and `None` for any
 other. It reports three things, none of which changes the transform's status:

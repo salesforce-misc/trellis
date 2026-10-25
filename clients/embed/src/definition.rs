@@ -10,7 +10,7 @@
 
 use trellis::{
     BackfillFailure, CaptureFailure, CaptureFailureKind, CaptureWait, CorrectingNode,
-    DefinitionStatus, DefinitionSummary, DrainFailure, SourceIndexGap, UnindexedJoin,
+    DefinitionStatus, DefinitionSummary, DrainFailure, SourceIndexGap,
 };
 
 use crate::{PlainHeldKeys, epoch_micros, transform_status};
@@ -68,9 +68,6 @@ pub struct PlainDefinitionStatus {
     /// Set while the drain keeps failing on a page holding changes to a table
     /// the definition reads; see [`DefinitionStatus::drain_failure`].
     pub drain_failure: Option<PlainDrainFailure>,
-    /// The join columns of the relationships the definition reads that have
-    /// no usable index; see [`DefinitionStatus::unindexed_joins`].
-    pub unindexed_joins: Vec<PlainUnindexedJoin>,
     /// The source indexes a `GROUP BY` or `JOIN` target needs and lacks; see
     /// [`DefinitionStatus::source_index_gaps`].
     pub source_index_gaps: Vec<PlainSourceIndexGap>,
@@ -106,20 +103,6 @@ impl From<&CorrectingNode> for PlainCorrectingNode {
     }
 }
 
-/// An [`UnindexedJoin`] flattened to plain data: a join column of a
-/// relationship a definition reads that has no usable index.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlainUnindexedJoin {
-    /// The relationship's name.
-    pub relationship: String,
-    /// The qualified table that holds the column.
-    pub table: String,
-    /// The column.
-    pub column: String,
-    /// What to do about it: the index to create, as a sentence.
-    pub fix: String,
-}
-
 /// A [`SourceIndexGap`] flattened to plain data: a source index a target
 /// needs and lacks.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,10 +111,20 @@ pub struct PlainSourceIndexGap {
     pub table: String,
     /// The columns the index should lead with.
     pub columns: Vec<String>,
+    /// The part of the definition that needs the index, as
+    /// [`trellis::IndexRole::as_str`]: `group_by`, `join_from` or
+    /// `join_joined`.
+    pub role: &'static str,
     /// Whether the definition opted out (`WITHOUT SOURCE INDEX`).
     pub opted_out: bool,
     /// What to do about it: a `create index` statement.
     pub fix: String,
+}
+
+/// Every [`PlainSourceIndexGap::role`] word, for a binding to intern up
+/// front.
+pub fn index_role_names() -> [&'static str; 3] {
+    trellis::IndexRole::ALL.map(trellis::IndexRole::as_str)
 }
 
 /// A [`CaptureWait`] flattened to plain data.
@@ -216,11 +209,6 @@ impl From<&DefinitionStatus> for PlainDefinitionStatus {
                 .map(PlainCaptureFailure::from),
             held_keys: status.held_keys.as_ref().map(PlainHeldKeys::from),
             drain_failure: status.drain_failure.as_ref().map(PlainDrainFailure::from),
-            unindexed_joins: status
-                .unindexed_joins
-                .iter()
-                .map(PlainUnindexedJoin::from)
-                .collect(),
             source_index_gaps: status
                 .source_index_gaps
                 .iter()
@@ -241,19 +229,9 @@ impl From<&SourceIndexGap> for PlainSourceIndexGap {
         PlainSourceIndexGap {
             table: gap.table.clone(),
             columns: gap.columns.clone(),
+            role: gap.role.as_str(),
             opted_out: gap.opted_out,
             fix: gap.fix(),
-        }
-    }
-}
-
-impl From<&UnindexedJoin> for PlainUnindexedJoin {
-    fn from(join: &UnindexedJoin) -> Self {
-        PlainUnindexedJoin {
-            relationship: join.relationship.clone(),
-            table: join.table.clone(),
-            column: join.column.clone(),
-            fix: join.fix(),
         }
     }
 }
@@ -420,7 +398,6 @@ mod tests {
             held_keys: None,
             drain_failure: None,
             source_index_gaps: Vec::new(),
-            unindexed_joins: Vec::new(),
             paused_upstream_columns: Vec::new(),
             correcting: Vec::new(),
             build_wait: None,
@@ -436,7 +413,6 @@ mod tests {
                 held_keys: None,
                 drain_failure: None,
                 source_index_gaps: Vec::new(),
-                unindexed_joins: Vec::new(),
                 paused_upstream_columns: Vec::new(),
                 correcting: Vec::new(),
             }
@@ -459,7 +435,6 @@ mod tests {
             }),
             drain_failure: None,
             source_index_gaps: Vec::new(),
-            unindexed_joins: Vec::new(),
             paused_upstream_columns: Vec::new(),
             correcting: Vec::new(),
             build_wait: None,
@@ -485,7 +460,6 @@ mod tests {
             held_keys: None,
             drain_failure: None,
             source_index_gaps: Vec::new(),
-            unindexed_joins: Vec::new(),
             correcting: Vec::new(),
             paused_upstream_columns: vec!["t.total".to_string()],
             build_wait: None,
@@ -496,35 +470,25 @@ mod tests {
     }
 
     #[test]
-    fn an_unindexed_join_crosses_with_its_fix() {
-        let status = DefinitionStatus {
-            join: None,
-            status: TransformStatus::Live,
-            backfill_failure: None,
-            capture_wait: None,
-            capture_failure: None,
-            held_keys: None,
-            drain_failure: None,
-            source_index_gaps: Vec::new(),
-            unindexed_joins: vec![UnindexedJoin {
-                relationship: "orders".to_string(),
-                table: "public.orders".to_string(),
-                column: "customer_id".to_string(),
-            }],
-            correcting: Vec::new(),
-            paused_upstream_columns: Vec::new(),
-            build_wait: None,
+    fn a_source_index_gap_crosses_with_its_role_and_fix() {
+        let gap = SourceIndexGap {
+            table: "public.regions".to_string(),
+            columns: vec!["id".to_string()],
+            role: trellis::IndexRole::JoinJoined,
+            opted_out: false,
         };
-
         assert_eq!(
-            PlainDefinitionStatus::from(&status).unindexed_joins,
-            vec![PlainUnindexedJoin {
-                relationship: "orders".to_string(),
-                table: "public.orders".to_string(),
-                column: "customer_id".to_string(),
-                fix: "create an index on public.orders (customer_id)".to_string(),
-            }]
+            PlainSourceIndexGap::from(&gap),
+            PlainSourceIndexGap {
+                table: "public.regions".to_string(),
+                columns: vec!["id".to_string()],
+                role: "join_joined",
+                opted_out: false,
+                fix: "create index on \"public\".\"regions\" (\"id\")".to_string(),
+            }
         );
+        assert_eq!(trellis::IndexRole::GroupBy.as_str(), "group_by");
+        assert_eq!(trellis::IndexRole::JoinFrom.as_str(), "join_from");
     }
 
     #[test]
@@ -538,7 +502,6 @@ mod tests {
             held_keys: None,
             drain_failure: None,
             source_index_gaps: Vec::new(),
-            unindexed_joins: Vec::new(),
             paused_upstream_columns: Vec::new(),
             correcting: vec![
                 CorrectingNode {
@@ -595,7 +558,6 @@ mod tests {
                 attempts: 5,
             }),
             source_index_gaps: Vec::new(),
-            unindexed_joins: Vec::new(),
             paused_upstream_columns: Vec::new(),
             correcting: Vec::new(),
             build_wait: None,
@@ -631,7 +593,6 @@ mod tests {
             held_keys: None,
             drain_failure: None,
             source_index_gaps: Vec::new(),
-            unindexed_joins: Vec::new(),
             paused_upstream_columns: Vec::new(),
             correcting: Vec::new(),
             build_wait: None,
@@ -652,7 +613,6 @@ mod tests {
                 held_keys: None,
                 drain_failure: None,
                 source_index_gaps: Vec::new(),
-                unindexed_joins: Vec::new(),
                 paused_upstream_columns: Vec::new(),
                 correcting: Vec::new(),
             }
@@ -684,7 +644,6 @@ mod tests {
             held_keys: None,
             drain_failure: None,
             source_index_gaps: Vec::new(),
-            unindexed_joins: Vec::new(),
             paused_upstream_columns: Vec::new(),
             correcting: Vec::new(),
             build_wait: None,

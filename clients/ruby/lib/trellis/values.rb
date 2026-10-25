@@ -70,11 +70,6 @@ module Trellis
   #   paused or quarantined definition has none.
   # Every process sees them, whichever one runs the staging worker.
   #
-  # unindexed_joins is a warning, never a hold-up: the UnindexedJoins for the
-  # join columns of the relationships it reads that have no usable index
-  # ([] when every one is indexed). It leaves status alone, and an index you
-  # create shows on the next call.
-  #
   # source_index_gaps is a warning, never a hold-up: the SourceIndexGaps for
   # the source indexes a GROUP BY or JOIN target needs and lacks ([] when it
   # needs none or they exist). Define and a resume refuse a definition
@@ -98,7 +93,7 @@ module Trellis
   # paused or rebuilt: resuming the column writes through to the reader and
   # it reads :live again.
   Status = Data.define(:status, :backfill_failure, :capture_wait, :capture_failure,
-                       :held_keys, :drain_failure, :unindexed_joins, :source_index_gaps,
+                       :held_keys, :drain_failure, :source_index_gaps,
                        :correcting, :paused_upstream_columns) do
     def self.from_native(hash)
       failure = hash[:backfill_failure]
@@ -112,7 +107,6 @@ module Trellis
           capture_failure: capture_failure && CaptureFailure.from_native(capture_failure),
           held_keys: held_keys && HeldKeys.from_native(held_keys),
           drain_failure: drain_failure && DrainFailure.from_native(drain_failure),
-          unindexed_joins: hash.fetch(:unindexed_joins).map { |j| UnindexedJoin.new(**j) },
           source_index_gaps: hash.fetch(:source_index_gaps).map { |g| SourceIndexGap.new(**g) },
           correcting: hash.fetch(:correcting).map { |c| CorrectingNode.from_native(c) },
           paused_upstream_columns: hash.fetch(:paused_upstream_columns))
@@ -132,20 +126,14 @@ module Trellis
     end
   end
 
-  # A join column of a relationship a definition reads that has no usable
-  # index, as Trellis.status reports it: the
-  # relationship's name (relationship), the qualified table that holds the
-  # column (table), the column (column), and what to do about it (fix), the
-  # index to create as a sentence. Trellis doesn't create indexes on your
-  # tables.
-  UnindexedJoin = Data.define(:relationship, :table, :column, :fix)
-
   # A source index a GROUP BY or JOIN target needs and lacks, as
   # Trellis.status reports it: the qualified table (table), the columns the
-  # index should lead with (columns), whether the definition opted out with
+  # index should lead with (columns), the part of the definition that needs it
+  # (role: :group_by for the GROUP BY columns, :join_from or :join_joined for a
+  # JOIN's ON columns on its from or joined side), whether the definition opted out with
   # WITHOUT SOURCE INDEX (opted_out), and a create index statement to run
   # (fix). Trellis doesn't create indexes on your tables.
-  SourceIndexGap = Data.define(:table, :columns, :opted_out, :fix)
+  SourceIndexGap = Data.define(:table, :columns, :role, :opted_out, :fix)
 
   # A drain page that keeps failing with nothing charged or paused, as
   # Trellis.status and Trellis.self_check report it: the segment whose page

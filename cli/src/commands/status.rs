@@ -19,8 +19,7 @@
 //! halted on it, if it did (`halt`, issue #663), and on another the page the
 //! drain keeps failing on with nothing charged or paused, if one holds it
 //! back (`drain_failure` from [`Trellis::status`], issue #817), and one per
-//! join column of a relationship it reads that has no usable index
-//! (`unindexed_joins`, issue #973), and one per node of its partitioned
+//! source index it lacks (`source_index_gaps`, issue #1167), and one per node of its partitioned
 //! source it is being corrected for (`correcting`, ADR-0017). Finer-grained per-`(transform,
 //! column)` pause state (docs/decisions/0008-public-api-design.md's
 //! decision 5 and
@@ -43,7 +42,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 use trellis::{
     Config, CorrectingNode, DefinitionSummary, DrainFailure, JoinBuildStep, JoinSide, JoinSidePart,
-    JoinStatus, SourceIndexGap, Trellis, TrellisOptions, UnindexedJoin,
+    JoinStatus, SourceIndexGap, Trellis, TrellisOptions,
 };
 
 use super::release::shell_quote;
@@ -123,8 +122,8 @@ even though the engine tracks it.";
 /// then [`STATUS_NOTE`].
 async fn report(trellis: &Trellis) -> Result<String, String> {
     let definitions = trellis.definitions().await.map_err(|err| err.to_string())?;
-    // `definitions()` doesn't carry a drain failure, the unindexed join
-    // columns or the nodes under correction, so each definition's own status
+    // `definitions()` doesn't carry a drain failure, the source index gaps
+    // or the nodes under correction, so each definition's own status
     // is read for them, by the qualified target name `definitions()` lists.
     let mut listed = Vec::with_capacity(definitions.len());
     for def in definitions {
@@ -134,7 +133,6 @@ async fn report(trellis: &Trellis) -> Result<String, String> {
             .map_err(|err| err.to_string())?;
         let warnings = status.map_or_else(StatusWarnings::default, |status| StatusWarnings {
             drain_failure: status.drain_failure,
-            unindexed_joins: status.unindexed_joins,
             correcting: status.correcting,
             source_index_gaps: status.source_index_gaps,
             join: status.join,
@@ -188,7 +186,6 @@ fn format_poisoned(poisoned: &[trellis::PoisonEntry]) -> String {
 #[derive(Debug, Default)]
 struct StatusWarnings {
     drain_failure: Option<DrainFailure>,
-    unindexed_joins: Vec<UnindexedJoin>,
     correcting: Vec<CorrectingNode>,
     source_index_gaps: Vec<SourceIndexGap>,
     join: Option<JoinStatus>,
@@ -249,12 +246,6 @@ fn format_definitions(definitions: &[(DefinitionSummary, StatusWarnings)]) -> St
             for node in &warnings.correcting {
                 line.push_str(&format_correcting(node));
             }
-            // #973: a warning only. The definition reads the column
-            // regardless; each read of it scans the table until the index
-            // exists. See docs/recommendations.md.
-            for join in &warnings.unindexed_joins {
-                line.push_str(&format_unindexed_join(join));
-            }
             // #1167: a source index the target's `self_check` pages by.
             for gap in &warnings.source_index_gaps {
                 line.push_str(&format_source_index_gap(gap));
@@ -289,28 +280,19 @@ fn format_correcting(node: &CorrectingNode) -> String {
     )
 }
 
-fn format_unindexed_join(join: &UnindexedJoin) -> String {
-    format!(
-        "    warning: relationship {} joins on {}.{}, which has no usable index; {}\n",
-        join.relationship,
-        join.table,
-        join.column,
-        join.fix()
-    )
-}
-
 fn format_source_index_gap(gap: &SourceIndexGap) -> String {
     let columns = gap.columns.join(", ");
+    let role = gap.role.describe();
     if gap.opted_out {
         format!(
-            "    warning: runs without a source index on {} ({columns}), as defined WITHOUT \
-             SOURCE INDEX; self_check scans the source once per page; {}\n",
+            "    warning: runs without a source index on {} ({columns}) for {role}, as defined \
+             WITHOUT SOURCE INDEX; self_check scans the source once per page; {}\n",
             gap.table,
             gap.fix()
         )
     } else {
         format!(
-            "    warning: source index on {} ({columns}) is missing; self_check refuses \
+            "    warning: source index on {} ({columns}) for {role} is missing; self_check refuses \
              until it exists; {}\n",
             gap.table,
             gap.fix()
@@ -621,33 +603,6 @@ mod tests {
     }
 
     #[test]
-    fn an_unindexed_join_is_shown_under_its_definition_with_its_fix() {
-        let def = DefinitionSummary {
-            target_table: "public.order_totals".to_string(),
-            status: trellis::TransformStatus::Live,
-            created_at: UNIX_EPOCH,
-            backfill_failure: None,
-            halt: None,
-        };
-        let warnings = StatusWarnings {
-            unindexed_joins: vec![UnindexedJoin {
-                relationship: "items".to_string(),
-                table: "public.order_items".to_string(),
-                column: "order_id".to_string(),
-            }],
-            ..StatusWarnings::default()
-        };
-        assert_eq!(
-            format_definitions(&[(def, warnings)]),
-            "  target=public.order_totals \
-             status=live created_at=1970-01-01 00:00:00 UTC\n    \
-             warning: relationship items joins on public.order_items.order_id, \
-             which has no usable index; \
-             create an index on public.order_items (order_id)\n"
-        );
-    }
-
-    #[test]
     fn a_missing_source_index_is_shown_with_its_fix_and_whether_it_opted_out() {
         let def = || DefinitionSummary {
             target_table: "public.order_totals".to_string(),
@@ -660,6 +615,7 @@ mod tests {
             source_index_gaps: vec![SourceIndexGap {
                 table: "public.orders".to_string(),
                 columns: vec!["customer_id".to_string()],
+                role: trellis::IndexRole::JoinJoined,
                 opted_out,
             }],
             ..StatusWarnings::default()
@@ -668,7 +624,8 @@ mod tests {
         assert_eq!(
             format_definitions(&[(def(), gap(false))]),
             format!(
-                "{head}    warning: source index on public.orders (customer_id) is missing; \
+                "{head}    warning: source index on public.orders (customer_id) for the JOIN's ON columns \
+                 (joined side) is missing; \
                  self_check refuses until it exists; \
                  create index on \"public\".\"orders\" (\"customer_id\")\n"
             )
@@ -676,10 +633,27 @@ mod tests {
         assert_eq!(
             format_definitions(&[(def(), gap(true))]),
             format!(
-                "{head}    warning: runs without a source index on public.orders (customer_id), \
-                 as defined WITHOUT SOURCE INDEX; self_check scans the source once per page; \
+                "{head}    warning: runs without a source index on public.orders (customer_id) for the \
+                 JOIN's ON columns (joined side), as defined WITHOUT SOURCE INDEX; self_check scans the source once per page; \
                  create index on \"public\".\"orders\" (\"customer_id\")\n"
             )
+        );
+    }
+
+    #[test]
+    fn a_missing_source_index_names_its_role() {
+        let gap = |role| {
+            format_source_index_gap(&SourceIndexGap {
+                table: "public.t".to_string(),
+                columns: vec!["a".to_string()],
+                role,
+                opted_out: false,
+            })
+        };
+        assert!(gap(trellis::IndexRole::GroupBy).contains(" for the GROUP BY columns is missing"));
+        assert!(
+            gap(trellis::IndexRole::JoinFrom)
+                .contains(" for the JOIN's ON columns (from side) is missing")
         );
     }
 
