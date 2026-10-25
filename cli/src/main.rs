@@ -37,6 +37,7 @@ Options:
                              PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE, if
                              omitted.
   -h, --help                 Print this help and exit.
+  -V, --version              Print the version and exit.
 
 Run `trellis <COMMAND> --help` for command-specific help.
 ";
@@ -56,6 +57,10 @@ fn run(mut args: Vec<String>) -> ExitCode {
     }
     if wants_help(&args[..1]) {
         print!("{USAGE}");
+        return ExitCode::SUCCESS;
+    }
+    if args[0] == "-V" || args[0] == "--version" {
+        println!("trellis {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
     }
 
@@ -274,6 +279,12 @@ mod tests {
     fn top_level_help_is_success() {
         assert_eq!(run(vec!["--help".to_string()]), ExitCode::SUCCESS);
         assert_eq!(run(vec!["-h".to_string()]), ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn top_level_version_is_success() {
+        assert_eq!(run(vec!["--version".to_string()]), ExitCode::SUCCESS);
+        assert_eq!(run(vec!["-V".to_string()]), ExitCode::SUCCESS);
     }
 
     #[test]

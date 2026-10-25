@@ -2,7 +2,6 @@
 name = "trellis"
 version = "0.1.0"
 edition.workspace = true
-rust-version.workspace = true
 # Published to crates.io as `trellis-pg` (`trellis` is taken there), with its
 # library still named `trellis`; .github/scripts/publish-packages.sh renames
 # it in the published copy only (docs/releasing.md).

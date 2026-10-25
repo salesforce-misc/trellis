@@ -111,7 +111,7 @@ jobs:
         run: |
           set -euo pipefail
           tar -C "$RUNNER_TEMP" -xzf "$RUNNER_TEMP"/cli/*.tar.gz
-          "$RUNNER_TEMP"/trellis-v*-"${{ matrix.target }}"/trellis --help
+          "$RUNNER_TEMP"/trellis-v*-"${{ matrix.target }}"/trellis --version
 
       - uses: actions/upload-artifact@v4
         with:
