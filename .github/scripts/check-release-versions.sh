@@ -8,6 +8,7 @@
 # usage: check-release-versions.sh <version> [<repo-root>]
 #
 # Prints each file it reads, and exits 1 naming every file that differs.
+# Portable to macOS's bash 3.2 (publish-packages.sh runs it there).
 set -euo pipefail
 
 usage="usage: check-release-versions.sh <version> [<repo-root>]"
@@ -15,24 +16,29 @@ want="${1:?$usage}"
 want="${want#v}"
 root="${2:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 
-crate_version() { awk -F'"' '/^version = / { print $2; exit }' "$root/$1"; }
-
-declare -A found=(
-  [trellis/Cargo.toml]="$(crate_version trellis/Cargo.toml)"
-  [cli/Cargo.toml]="$(crate_version cli/Cargo.toml)"
-  [clients/embed/Cargo.toml]="$(crate_version clients/embed/Cargo.toml)"
-  [clients/elixir/native/trellis_nif/Cargo.toml]="$(crate_version clients/elixir/native/trellis_nif/Cargo.toml)"
-  [clients/ruby/ext/trellis_ruby/Cargo.toml]="$(crate_version clients/ruby/ext/trellis_ruby/Cargo.toml)"
-  [clients/elixir/mix.exs]="$(awk -F'"' '/^  @version / { print $2; exit }' "$root/clients/elixir/mix.exs")"
-  [clients/ruby/lib/trellis/version.rb]="$(awk -F'"' '/VERSION = / { print $2; exit }' "$root/clients/ruby/lib/trellis/version.rb")"
-)
+# version_of <file>: the version that file declares.
+version_of() {
+  case "$1" in
+    *Cargo.toml) awk -F'"' '/^version = / { print $2; exit }' "$root/$1" ;;
+    *mix.exs) awk -F'"' '/^  @version / { print $2; exit }' "$root/$1" ;;
+    *version.rb) awk -F'"' '/VERSION = / { print $2; exit }' "$root/$1" ;;
+  esac
+}
 
 bad=0
-for file in $(printf '%s\n' "${!found[@]}" | sort); do
-  if [ "${found[$file]}" = "$want" ]; then
-    printf '  ok   %-48s %s\n' "$file" "${found[$file]}"
+for file in \
+  cli/Cargo.toml \
+  clients/elixir/mix.exs \
+  clients/elixir/native/trellis_nif/Cargo.toml \
+  clients/embed/Cargo.toml \
+  clients/ruby/ext/trellis_ruby/Cargo.toml \
+  clients/ruby/lib/trellis/version.rb \
+  trellis/Cargo.toml; do
+  found="$(version_of "$file")"
+  if [ "$found" = "$want" ]; then
+    printf '  ok   %-48s %s\n' "$file" "$found"
   else
-    printf '  BAD  %-48s %s (want %s)\n' "$file" "${found[$file]:-<none>}" "$want"
+    printf '  BAD  %-48s %s (want %s)\n' "$file" "${found:-<none>}" "$want"
     bad=1
   fi
 done

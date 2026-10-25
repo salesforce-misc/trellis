@@ -22,9 +22,10 @@
 #   --only     a comma-separated subset of crates, hex and gems
 #   --keep     keep the scratch directory (it's kept anyway on failure)
 #
-# Needs git, curl, jq, sha256sum, a Rust toolchain (rustup installs the
-# pinned one), Erlang/Elixir (clients/elixir/.tool-versions; asdf or mise
-# pick it up from the clone) and Ruby's `gem`. And credentials, unless
+# Runs on Linux and macOS (its stock bash 3.2 and BSD tools too). Needs git,
+# curl, jq, perl, a Rust toolchain through rustup (it installs the version
+# rust-toolchain.toml pins), Erlang/Elixir (clients/elixir/.tool-versions;
+# asdf or mise pick it up from the clone) and Ruby's `gem`. And credentials, unless
 # --dry-run:
 #
 #   crates.io  `cargo login` (or CARGO_REGISTRY_TOKEN), a token with
@@ -108,7 +109,7 @@ crate_published() { published "crates.io trellis-pg" "https://crates.io/api/v1/c
 hex_published() { published "Hex trellis_pg" "https://hex.pm/api/packages/trellis_pg/releases/$version"; }
 
 step "Checking tools and credentials"
-need=(git curl jq sha256sum)
+need=(git curl jq perl)
 wants crates && need+=(cargo)
 wants hex && need+=(cargo mix)
 wants gems && need+=(gem)
@@ -153,7 +154,9 @@ jq -r '.assets[] | "\(.name)\t\(.browser_download_url)"' <<<"$release" |
     curl -sSLf -A "$ua" -o "$work/assets/$name" "$url"
   done
 [ -f "$work/assets/SHA256SUMS" ] || die "the $tag release has no SHA256SUMS"
-(cd "$work/assets" && sha256sum --quiet -c SHA256SUMS) || die "an asset doesn't match the release's SHA256SUMS"
+# macOS has shasum rather than sha256sum.
+if command -v sha256sum >/dev/null; then sha256=(sha256sum); else sha256=(shasum -a 256); fi
+(cd "$work/assets" && "${sha256[@]}" -c SHA256SUMS >/dev/null) || die "an asset doesn't match the release's SHA256SUMS"
 echo "every asset matches SHA256SUMS"
 
 step "Cloning $tag"
@@ -170,10 +173,11 @@ if wants crates; then
     echo "already on crates.io; skipping"
   else
     grep -q '^\[lib\]' "$src/trellis/Cargo.toml" && die "trellis/Cargo.toml has a [lib] table now; update the rename below"
-    sed -i 's|^name = "trellis"$|name = "trellis-pg"|' "$src/trellis/Cargo.toml"
-    sed -i '0,/^\[dependencies\]$/s||[lib]\nname = "trellis"\n\n[dependencies]|' "$src/trellis/Cargo.toml"
+    # perl rather than `sed -i`, whose syntax differs between GNU and BSD.
+    perl -0pi -e 's/^name = "trellis"$/name = "trellis-pg"/m; s/^\[dependencies\]$/[lib]\nname = "trellis"\n\n[dependencies]/m' \
+      "$src/trellis/Cargo.toml"
     find "$src" -name Cargo.toml -not -path '*/target/*' -print0 |
-      xargs -0 sed -i 's|^trellis = { path = |trellis = { package = "trellis-pg", path = |'
+      xargs -0 perl -pi -e 's/^trellis = \{ path = /trellis = { package = "trellis-pg", path = /'
     if grep -rn --include=Cargo.toml '^trellis = ' "$src" | grep -v 'package = "trellis-pg"'; then
       die "a dependency on trellis above wasn't renamed"
     fi
@@ -224,7 +228,8 @@ fi
 
 if wants gems; then
   step "RubyGems: trellis-pg $gem_version"
-  mapfile -t platform_gems < <(find "$work/assets" -name "trellis-pg-$gem_version-*.gem" | sort)
+  platform_gems=()
+  while IFS= read -r gem; do platform_gems+=("$gem"); done < <(find "$work/assets" -name "trellis-pg-$gem_version-*.gem" | sort)
   source_gem="$work/assets/trellis-pg-$gem_version.gem"
   [ "${#platform_gems[@]}" -eq 6 ] || die "the release has ${#platform_gems[@]} platform gems, not 6"
   [ -f "$source_gem" ] || die "the release has no source gem trellis-pg-$gem_version.gem"
