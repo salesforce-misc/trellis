@@ -222,12 +222,12 @@ pub enum KeyShape {
     /// change one key from opposite sides without sharing a `P` or `M`
     /// cell, and only the `J` lock orders them.
     Wide,
-    /// Over [`RACING_KEYS`] keys and [`RACING_GROUPS`] groups, both tables
-    /// written alike, and run with short seals, paced writers and a long
-    /// commit stall ([`RACING_COMMIT_STALL_MS`]): many small pages overlap, and
-    /// the groups are so many that two pages seldom share a `P`, `M` or `T`
-    /// cell, so only the `J` lock (and the `T` group locks) order two pages
-    /// that change one key from opposite sides.
+    /// Over [`RACING_KEYS`] keys, both tables written alike, and run with
+    /// short seals, paced writers and a long commit stall
+    /// (`RACING_COMMIT_STALL_MS`): pages hold a few rows each and many stay
+    /// open at once, so two pages that change one key from opposite sides
+    /// (or one `T` group) often share no `P` or `M` cell, and only the `J`
+    /// and `T` locks order them.
     Racing,
 }
 
@@ -236,7 +236,6 @@ pub const HOT_OTHER_KEYS: u8 = 6;
 pub const FAN_OUT_KEYS: u8 = 3;
 pub const WIDE_KEYS: u8 = 64;
 pub const RACING_KEYS: u8 = 40;
-pub const RACING_GROUPS: u8 = 4;
 
 impl KeyShape {
     pub fn name(self) -> &'static str {
@@ -246,14 +245,6 @@ impl KeyShape {
             KeyShape::FanOut => "fan_out",
             KeyShape::Wide => "wide",
             KeyShape::Racing => "racing",
-        }
-    }
-
-    /// How many distinct group values the shape's rows draw from.
-    fn group_domain(self) -> u8 {
-        match self {
-            KeyShape::Racing => RACING_GROUPS,
-            _ => 4,
         }
     }
 
@@ -298,8 +289,7 @@ pub struct JoinOpDraw {
     pub key: u8,
     /// `t`, modulo 2.
     pub t: u8,
-    /// The group column (`ga` or `gb`), modulo the shape's group domain, or
-    /// `NULL`.
+    /// The group column (`ga` or `gb`), modulo 4, or `NULL`.
     pub group: Option<u8>,
     /// The aggregate argument (`x` or `y`), or `NULL`.
     pub value: Option<i8>,
@@ -338,7 +328,7 @@ pub fn build_join_program(
         };
         let key = text(shape.key(draw.key).map(i64::from));
         let t = text(Some(i64::from(draw.t % 2)));
-        let group = text(draw.group.map(|g| i64::from(g % shape.group_domain())));
+        let group = text(draw.group.map(|g| i64::from(g % 4)));
         let value = text(draw.value.map(i64::from));
         let kind = if live[side].is_empty() {
             JoinOpKind::Insert
@@ -790,7 +780,7 @@ mod strategy {
             any::<usize>(),
             any::<u8>(),
             0u8..2,
-            prop_oneof![1 => Just(None), 9 => (0u8..RACING_GROUPS).prop_map(Some)],
+            prop_oneof![1 => Just(None), 9 => (0u8..4).prop_map(Some)],
             prop_oneof![1 => Just(None), 9 => (-20i8..60).prop_map(Some)],
             0u8..16,
         )
@@ -816,10 +806,12 @@ mod strategy {
     /// half the cases (`ConcurrentPlan::commit_stall`): long enough that two
     /// pages of one key's opposite sides overlap between their writes and
     /// their commits, where the `J` lock orders them.
-    /// The longest commit stall a `racing` case draws.
-    pub const RACING_COMMIT_STALL_MS: std::ops::RangeInclusive<u64> = 2000..=3500;
-
     pub const COMMIT_STALL_MS: std::ops::RangeInclusive<u64> = 5..=40;
+
+    /// The longest commit stall a `racing` case draws, in milliseconds. The
+    /// stall is skewed toward zero, so a maximum of seconds is what keeps
+    /// many pages open at once.
+    pub const RACING_COMMIT_STALL_MS: std::ops::RangeInclusive<u64> = 2000..=3500;
 
     /// A JOIN-tier case: one to three definitions, each installed up front
     /// or part way through the stream, with pauses, resumes and re-reads
@@ -835,6 +827,12 @@ mod strategy {
     /// ops from one lane (`super::concurrent_plan`), so the other half keeps
     /// several lanes writing each table. About half the cases stall each
     /// page before its commit ([`COMMIT_STALL_MS`]).
+    ///
+    /// Half the cases are [`KeyShape::Racing`]: 500 to [`MAX_OPS`] ops in
+    /// bursts of 600 to 900, paced from the first op, every definition live
+    /// over the empty tables before the first write (no builds or operator
+    /// actions), at least 3 workers sealing every 20 to 40 ms, and every
+    /// page stalled before its commit ([`RACING_COMMIT_STALL_MS`]).
     pub fn join_case_strategy() -> impl Strategy<Value = JoinCase> {
         prop_oneof![
             1 => Just(KeyShape::Spread),
@@ -887,7 +885,8 @@ mod strategy {
                     )| {
                         // A `racing` case builds nothing over rows: every
                         // definition is live over the empty tables before
-                        // the first write, so every page is a page.
+                        // the first write, so every write reaches a target
+                        // through a page.
                         let builds = if shape == KeyShape::Racing {
                             JoinBuildDraws {
                                 settle_after_install: true,
@@ -1041,6 +1040,7 @@ mod tests {
             KeyShape::HotKey,
             KeyShape::FanOut,
             KeyShape::Wide,
+            KeyShape::Racing,
         ] {
             assert_eq!(shape.key(255), None);
             assert!((0..250u8).all(|raw| shape.key(raw).is_some()));
@@ -1050,6 +1050,10 @@ mod tests {
             .filter_map(|raw| KeyShape::Wide.key(raw))
             .collect();
         assert_eq!(wide.len(), usize::from(WIDE_KEYS));
+        let racing: std::collections::BTreeSet<u8> = (0..250u8)
+            .filter_map(|raw| KeyShape::Racing.key(raw))
+            .collect();
+        assert_eq!(racing.len(), usize::from(RACING_KEYS));
     }
 
     fn inserts(n: usize) -> Vec<JoinOpDraw> {
