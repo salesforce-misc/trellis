@@ -192,8 +192,13 @@ jobs:
         run: mix compile --warnings-as-errors
 
       - name: Build the package
+        # Hex won't build without the checksum file the package lists. The
+        # real one needs this release's NIFs to be downloadable, so this
+        # check builds with an empty one; publish-packages.sh writes it.
         working-directory: clients/elixir
-        run: mix hex.build
+        run: |
+          echo '%{}' > checksum-Elixir.Trellis.Native.exs
+          mix hex.build
 
   platform-gem:
     name: Gem ${{ matrix.platform }}

@@ -16,8 +16,8 @@
 # usage: publish-packages.sh <version> [--dry-run] [--yes] [--only crates,hex,gems] [--keep]
 #
 #   --dry-run  build and check everything, publish nothing: `cargo publish
-#              --dry-run`, `mix hex.publish --dry-run`, and the list of gems
-#              it would push
+#              --dry-run`, `mix hex.build` (Hex's own dry run needs a login),
+#              and the list of gems it would push. Needs no credentials.
 #   --yes      don't ask before each publish
 #   --only     a comma-separated subset of crates, hex and gems
 #   --keep     keep the scratch directory (it's kept anyway on failure)
@@ -209,7 +209,7 @@ if wants hex; then
       targets="$(grep -c '"sha256:' checksum-Elixir.Trellis.Native.exs)"
       [ "$targets" -eq 5 ] || { echo "checksum-Elixir.Trellis.Native.exs lists $targets NIFs, not 5" >&2; exit 1; }
       if [ "$dry_run" -eq 1 ]; then
-        mix hex.publish --dry-run --yes
+        mix hex.build
       elif [ "$yes" -eq 1 ]; then
         mix hex.publish --yes
       else
