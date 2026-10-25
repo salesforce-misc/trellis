@@ -37,8 +37,7 @@ defmodule Trellis.Native do
         otp_app: :trellis_pg,
         crate: "trellis_nif",
         version: version,
-        base_url:
-          "https://github.com/salesforce-misc/trellis/releases/download/v#{version}",
+        base_url: "https://github.com/salesforce-misc/trellis/releases/download/v#{version}",
         # The release workflow's matrix. Every build is for NIF version
         # 2.15, which loads on OTP 22 and up.
         targets: ~w(

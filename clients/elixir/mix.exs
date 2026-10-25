@@ -26,8 +26,7 @@ defmodule Trellis.MixProject do
       docs: [
         main: "readme",
         extras: ["README.md"],
-        source_url_pattern:
-          "#{@source_url}/blob/v#{@version}/clients/elixir/%{path}#L%{line}"
+        source_url_pattern: "#{@source_url}/blob/v#{@version}/clients/elixir/%{path}#L%{line}"
       ]
     ]
   end
