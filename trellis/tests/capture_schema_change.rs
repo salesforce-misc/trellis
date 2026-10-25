@@ -308,7 +308,7 @@ async fn b_readers_converged(raw: &Client) {
 /// and after the rename, including one transaction that writes, renames and
 /// writes again. The marker is in the ring. The drain pauses the one reader
 /// of the column with the reason on `Trellis::status`, while the definitions
-/// that don't read it (one of them on the ledger path) keep converging over
+/// that don't read it (one of them an aggregate) keep converging over
 /// the partial images. The next pass narrows capture to the columns still
 /// read, and the markers stop. Once the column is back, resuming the reader
 /// widens capture again and rebuilds it.

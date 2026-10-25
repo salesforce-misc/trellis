@@ -1,8 +1,9 @@
 //! End-to-end tests for issue #115's `jsonb` support: the passthrough gap
 //! check, the join/primary/`GROUP BY` key refusal, the typed-literal
 //! ("computed 1-1 target") role (covered by `defs_typed_literals.rs`'s
-//! shared `CASES` table, which this issue added a `JSONB` row to), and the
-//! `jsonb_agg` aggregate.
+//! shared `CASES` table, which this issue added a `JSONB` row to). The
+//! `jsonb_agg` aggregate is refused at define
+//! (`ValidationError::DeferredAggregate`).
 //!
 //! # Why these run against a live server
 //!
@@ -31,7 +32,7 @@
 //!    element rather than being skipped, unlike every other aggregate here.
 //!
 //! Per ADR-0013 every comparison is against independently-authored SQL —
-//! plain `pg_cast`, plain `pg_proc`, plain `jsonb_agg`, plain `=` — never
+//! plain `pg_cast`, plain `pg_proc`, plain `=` — never
 //! against `defs::oracle::recompute`, which would be the engine's own
 //! renderer grading itself. Harness conventions follow
 //! `defs_bit.rs`/`defs_boolean.rs`.
@@ -42,8 +43,6 @@ use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::ValueType;
-use trellis::defs::eval::{RegexCache, Row, Value, evaluate_aggregate};
-use trellis::defs::invertibility::{AggregateArg, Invertibility, classify};
 use trellis::defs::pg_type::PgType;
 use trellis::defs::{
     CatalogError, ValidationError, install_definition, parse, registry, source_primary_key,
@@ -288,268 +287,6 @@ async fn jsonb_min_max_is_not_wired_up() {
             registry::aggregate_result_type(name, ValueType::Other(PgType::Jsonb)),
             None,
             "{name}(jsonb) is out of this issue's scope — see crate::jsonb's module doc"
-        );
-    }
-}
-
-// ---------------------------------------------------------------------
-// 4. `jsonb_agg`'s STABLE marking: root-caused live
-// ---------------------------------------------------------------------
-
-/// The load-bearing investigation result: `array_agg`/`string_agg` are
-/// `IMMUTABLE` despite being just as order-sensitive as `jsonb_agg`, which
-/// alone is `STABLE` — so order-sensitivity is not the reason.
-#[tokio::test]
-async fn jsonb_agg_is_stable_while_array_agg_and_string_agg_are_immutable() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
-
-    let rows = client
-        .query(
-            "select proname, provolatile from pg_proc \
-             where proname in ('array_agg', 'string_agg', 'jsonb_agg') \
-               and pronamespace = 'pg_catalog'::regnamespace",
-            &[],
-        )
-        .await
-        .expect("pg_proc probe");
-    assert!(!rows.is_empty());
-    for row in rows {
-        let name: String = row.get(0);
-        let volatility = row.get::<_, i8>(1) as u8 as char;
-        if name == "jsonb_agg" {
-            assert_eq!(volatility, 's', "jsonb_agg must be STABLE");
-        } else {
-            assert_eq!(volatility, 'i', "{name} must be IMMUTABLE, not STABLE");
-        }
-    }
-}
-
-/// The real reason `jsonb_agg` is `STABLE`: it is polymorphic, and for a
-/// `timestamptz` argument its row-to-`jsonb` conversion reads the session
-/// `TimeZone` GUC. Restricting `JSONB_AGG`'s argument to `jsonb` itself
-/// (this crate's own scope decision) sidesteps this — demonstrated by the
-/// second half of this test, which shows a `jsonb` argument is unaffected.
-#[tokio::test]
-async fn jsonb_agg_over_timestamptz_is_guc_dependent_but_over_jsonb_is_not() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
-
-    client
-        .batch_execute(
-            "create table tstz (v timestamptz); \
-             insert into tstz values ('2024-01-01 12:00:00+00'); \
-             create table j (v jsonb); \
-             insert into j values ('\"2024-01-01T12:00:00+00:00\"')",
-        )
-        .await
-        .expect("seed");
-
-    client.batch_execute("set timezone = 'UTC'").await.unwrap();
-    let utc_tstz: String = client
-        .query_one("select jsonb_agg(v)::text from tstz", &[])
-        .await
-        .unwrap()
-        .get(0);
-    let utc_j: String = client
-        .query_one("select jsonb_agg(v)::text from j", &[])
-        .await
-        .unwrap()
-        .get(0);
-
-    client
-        .batch_execute("set timezone = 'America/New_York'")
-        .await
-        .unwrap();
-    let ny_tstz: String = client
-        .query_one("select jsonb_agg(v)::text from tstz", &[])
-        .await
-        .unwrap()
-        .get(0);
-    let ny_j: String = client
-        .query_one("select jsonb_agg(v)::text from j", &[])
-        .await
-        .unwrap()
-        .get(0);
-
-    assert_ne!(
-        utc_tstz, ny_tstz,
-        "jsonb_agg(timestamptz) must be TimeZone-dependent — the hazard being excluded"
-    );
-    assert_eq!(
-        utc_j, ny_j,
-        "jsonb_agg(jsonb) must be unaffected by TimeZone — the exclusion actually works"
-    );
-}
-
-/// `jsonb_agg`'s transition function is not `STRICT`: a `NULL` row becomes
-/// a JSON `null` element, unlike every other aggregate `AGGREGATE_FUNCTION_SPECS`
-/// admits (all of which skip a `NULL` row entirely). Only a genuinely
-/// *empty* row set folds to SQL `NULL`.
-#[tokio::test]
-async fn jsonb_agg_includes_null_rows_unlike_every_other_aggregate() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
-
-    client
-        .batch_execute(
-            r#"create table t (g int, v jsonb);
-               insert into t values (1, '"a"'), (1, NULL), (1, '"b"'), (2, NULL)"#,
-        )
-        .await
-        .expect("seed");
-
-    let group1: String = client
-        .query_one("select jsonb_agg(v)::text from t where g = 1", &[])
-        .await
-        .unwrap()
-        .get(0);
-    assert_eq!(group1, r#"["a", null, "b"]"#);
-
-    let all_null_group: String = client
-        .query_one("select jsonb_agg(v)::text from t where g = 2", &[])
-        .await
-        .unwrap()
-        .get(0);
-    assert_eq!(all_null_group, "[null]");
-
-    let empty_group: Option<String> = client
-        .query_one("select jsonb_agg(v)::text from t where g = 99", &[])
-        .await
-        .unwrap()
-        .get(0);
-    assert_eq!(empty_group, None, "a genuinely empty group is SQL NULL");
-
-    // The Rust evaluator must reproduce this exactly (`fold_jsonb_agg`).
-    let def = parse(
-        "TRANSFORM out FROM t GROUP BY g WITHOUT SOURCE INDEX SELECT g AS g, JSONB_AGG(v) AS items",
-    )
-    .expect("parses");
-    let columns = HashMap::from([
-        ("g".to_string(), ValueType::Integer(IntWidth::Int4)),
-        ("v".to_string(), ValueType::Other(PgType::Jsonb)),
-    ]);
-    validate(&def, &columns).expect("validate");
-
-    let rows: Vec<Row> = vec![
-        Row::from([
-            ("g".to_string(), Some("1".to_string())),
-            ("v".to_string(), Some("\"a\"".to_string())),
-        ]),
-        Row::from([
-            ("g".to_string(), Some("1".to_string())),
-            ("v".to_string(), None),
-        ]),
-        Row::from([
-            ("g".to_string(), Some("1".to_string())),
-            ("v".to_string(), Some("\"b\"".to_string())),
-        ]),
-    ];
-    let result = evaluate_aggregate(&def, &rows, &columns, &mut RegexCache::default())
-        .expect("evaluate_aggregate");
-    assert_eq!(result["items"], Some(Value::Other(PgType::Jsonb, group1)));
-}
-
-/// `JSONB_AGG`'s result type is `jsonb`, matching a live `pg_typeof`.
-#[tokio::test]
-async fn jsonb_agg_result_type_matches_pg_typeof() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
-
-    let pg_type: String = client
-        .query_one(
-            "select pg_typeof(jsonb_agg(v))::text from (values ('1'::jsonb)) t(v)",
-            &[],
-        )
-        .await
-        .unwrap()
-        .get(0);
-    assert_eq!(pg_type, "jsonb");
-
-    assert_eq!(
-        registry::aggregate_result_type("JSONB_AGG", ValueType::Other(PgType::Jsonb)),
-        Some(ValueType::Other(PgType::Jsonb))
-    );
-}
-
-/// `JSONB_AGG` is classified `RecomputeOnly` — a live-facing regression
-/// guard alongside `defs::invertibility`'s own pure-code unit tests.
-#[test]
-fn jsonb_agg_is_classified_recompute_only() {
-    let verdict = classify(
-        "JSONB_AGG",
-        AggregateArg::Column(ValueType::Other(PgType::Jsonb)),
-    )
-    .expect("JSONB_AGG must classify");
-    assert_eq!(verdict.invertibility, Invertibility::RecomputeOnly);
-}
-
-/// The Rust evaluator's fold matches a server-side `jsonb_agg` byte-for-byte
-/// over a handful of small groups — the same "cross-checked against an
-/// independently-authored SQL aggregate" shape
-/// `bit_and_or_fold_matches_a_server_side_aggregate` (#118) pins for its own
-/// family. Element order is not independently varied here (both sides read
-/// the same in-memory row order), which is deliberate — see `crate::jsonb`'s
-/// module doc for why cross-recompute order agreement is a documented
-/// caveat, not a guarantee, and out of scope to force via grammar in this
-/// issue.
-#[tokio::test]
-async fn jsonb_agg_fold_matches_a_server_side_aggregate() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
-
-    let groups: &[&[Option<&str>]] = &[
-        &[Some("1"), Some("2"), Some("3")],
-        &[Some(r#"{"a": 1}"#), Some(r#"[1, 2]"#)],
-        &[Some("\"x\""), None, Some("\"y\"")],
-        &[None, None],
-        &[Some("true"), Some("false"), Some("null")],
-    ];
-
-    for group in groups {
-        let values_sql = group
-            .iter()
-            .map(|v| match v {
-                Some(j) => format!("('{j}'::jsonb)"),
-                None => "(null::jsonb)".to_string(),
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-        let server: String = client
-            .query_one(
-                &format!("select (jsonb_agg(v))::text from (values {values_sql}) t(v)"),
-                &[],
-            )
-            .await
-            .unwrap_or_else(|e| panic!("server jsonb_agg over {group:?}: {e}"))
-            .get(0);
-
-        let def = parse("TRANSFORM t FROM s GROUP BY id WITHOUT SOURCE INDEX SELECT id AS k, JSONB_AGG(j) AS items")
-            .expect("parses");
-        let columns = source_columns();
-        validate(&def, &columns).expect("validate");
-
-        let rows: Vec<Row> = group
-            .iter()
-            .map(|v| {
-                Row::from([
-                    ("id".to_string(), Some("1".to_string())),
-                    ("j".to_string(), v.map(|s| s.to_string())),
-                ])
-            })
-            .collect();
-        let result = evaluate_aggregate(&def, &rows, &columns, &mut RegexCache::default())
-            .unwrap_or_else(|e| panic!("jsonb_agg fold over {group:?}: {e}"));
-
-        assert_eq!(
-            result["items"],
-            Some(Value::Other(PgType::Jsonb, server.clone())),
-            "JSONB_AGG over {group:?}: evaluator disagreed with server ({server})"
         );
     }
 }

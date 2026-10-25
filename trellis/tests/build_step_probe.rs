@@ -148,8 +148,6 @@ async fn the_probe_never_hides_a_build_step() {
     )
     .await
     .expect("reconcile pass");
-
-    let mut merges = build::MergeFailures::default();
     let mut worked = 0;
     for _ in 0..500 {
         f.drain().await;
@@ -158,7 +156,7 @@ async fn the_probe_never_hides_a_build_step() {
             may || !f.old_probes_find_work().await,
             "the probe said no while a former probe finds work"
         );
-        let step = build::work_once(&f.db.pool, "worker", &OPTIONS, &mut merges)
+        let step = build::work_once(&f.db.pool, "worker", &OPTIONS)
             .await
             .expect("step");
         if step.progressed() {

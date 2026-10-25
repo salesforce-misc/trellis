@@ -2,8 +2,8 @@
 //!
 //! A halting failure is structural, not one row's fault: a key the drain
 //! can't use (`NoPrimaryKey`, `UnsupportedPrimaryKeyType`), a propagation
-//! wave past the hop bound (`HopBoundExceeded`), an aggregate target off
-//! the ledger (`AggregateOffLedger`), a truncate with no ring `lsn`
+//! wave past the hop bound (`HopBoundExceeded`), an aggregate target the
+//! group basis can't apply (`GroupBasisUnsupported`), a truncate with no ring `lsn`
 //! (`TruncateWithoutLsn`), Postgres refusing the drain's role a read or
 //! write (`42501`, see below), or a spilled target-mutation accumulator
 //! staged in memory (`SpilledMutationsNotFlushed`, a programming error that
@@ -17,8 +17,8 @@
 //!   `JOIN` table (`capture::columns::readers_of`). For a hop
 //!   bound, the halting tables are those the wave ran away through, so their
 //!   readers are the cycle's definitions. For a truncate with no `lsn`, it
-//!   is the truncated table. For an aggregate off the ledger, it's the
-//!   definition that writes that target;
+//!   is the truncated table. For an aggregate the group basis can't apply,
+//!   it's the definition that writes that target;
 //! - and everything downstream of them, so no hop target goes quietly stale.
 //!
 //! Each is paused like a capture failure (`capture_failures`, with `kind`
@@ -52,11 +52,9 @@
 //! surfaces the error, charging no key either way, as a drain holdup
 //! ([`super::holdup`]).
 //!
-//! A Re-derive build's group-delta merge (issue #901) halts the same way
-//! ([`halt_failed_merge`]): a refused one through the same attribution, and
-//! one that keeps failing otherwise (its charged attempts ran out) from the
-//! definition writing its target, as for an aggregate off the ledger. A
-//! merge applies whole groups, so neither has a key to charge.
+//! A Re-derive build's start that fails in a way no retry gets past halts
+//! from the definition writing its target ([`halt_failed_start`]), as for
+//! an aggregate the group basis can't apply.
 //!
 //! A backfill marker's discharge that Postgres refuses the same way (a
 //! build's planning, or a go-live catch-up's re-read, issue #813) halts
@@ -98,8 +96,7 @@ fn seed(err: &ApplyError) -> Option<Seed> {
         }
         ApplyError::HopBoundExceeded { tables, .. } => Some(Seed::Tables(tables.clone())),
         ApplyError::TruncateWithoutLsn { src_table } => Some(Seed::Tables(vec![src_table.clone()])),
-        ApplyError::AggregateOffLedger { target }
-        | ApplyError::GroupBasisUnsupported { target, .. } => Some(Seed::Target(target.clone())),
+        ApplyError::GroupBasisUnsupported { target, .. } => Some(Seed::Target(target.clone())),
         _ => None,
     }
 }
@@ -165,40 +162,6 @@ pub(crate) async fn halt_refused_discharge(
     let txn = client.transaction().await?;
     let halted = format!("the backfill discharge of {table} was refused");
     let paused = pause_closure(&txn, &schema, None, &halted, err).await?;
-    txn.commit().await?;
-    Ok(paused)
-}
-
-/// [`halt_closure`] for a Re-derive build's group-delta merge into `target`
-/// (issue #901, `staging::build`), which applies whole groups and so has no
-/// key to charge. A merge Postgres `refused` (`42501`) runs the same
-/// attribution as a drain's ([`refusals`]), on a connection of `pool`, the
-/// merge's own. Any other failure is the merge's charged failure that ran out
-/// of attempts, and pauses the definition writing `target` and everything
-/// downstream of it. Either pauses with kind `halt` and records the halting
-/// stop if it paused any, in one transaction, and returns the bare targets
-/// it paused: empty when every definition it reaches was already frozen, or
-/// the catalog pins a refusal on no table. `err` is the failure's text.
-pub(crate) async fn halt_failed_merge(
-    pool: &Pool,
-    target: &str,
-    refused: bool,
-    err: &str,
-) -> Result<Vec<String>, ApplyError> {
-    let (seed, halted) = if refused {
-        (
-            None,
-            format!("the re-derive build's merge into {target} was refused"),
-        )
-    } else {
-        (
-            Some(Seed::Target(target.to_string())),
-            format!("the re-derive build's merge into {target} kept failing"),
-        )
-    };
-    let mut client = pool.get().await?;
-    let txn = client.transaction().await?;
-    let paused = pause_closure(&txn, pool.schema(), seed, &halted, err).await?;
     txn.commit().await?;
     Ok(paused)
 }
@@ -678,8 +641,8 @@ mod tests {
         assert!(found[2].2.contains("docs/transforms.md"), "{}", found[2].2);
     }
 
-    /// An aggregate off the ledger names its target bare: the seed is the
-    /// definition writing it, and what is downstream of it.
+    /// An aggregate the group basis can't apply names its target bare: the
+    /// seed is the definition writing it, and what is downstream of it.
     #[test]
     fn a_target_seed_reaches_its_writer_and_its_downstream() {
         let catalog = catalog(&[

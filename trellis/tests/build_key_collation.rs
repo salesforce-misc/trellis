@@ -30,11 +30,6 @@ const ONE: &str = "TRANSFORM one FROM public.src SELECT g AS g, v + v AS dbl";
 const ONE_ACTUAL: &str = "select (id, g, dbl)::text from public.one order by id collate \"C\"";
 const ONE_EXPECTED: &str = "select (id, g, v + v)::text from public.src order by id collate \"C\"";
 
-const AGG: &str = "TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n";
-const AGG_ACTUAL: &str = "select (g, total, n)::text from public.agg order by g";
-const AGG_EXPECTED: &str =
-    "select (g, sum(v), count(*))::text from public.src group by g order by g";
-
 /// Ten rows per chunk.
 const OPTIONS: WorkerOptions = WorkerOptions {
     chunk_rows: 10,
@@ -166,14 +161,9 @@ impl Fixture {
     async fn finish(&mut self) {
         for _ in 0..MAX_STEPS {
             self.drain().await;
-            let step = build::work_once(
-                &self.db.pool,
-                "worker",
-                &OPTIONS,
-                &mut build::MergeFailures::default(),
-            )
-            .await
-            .expect("build step");
+            let step = build::work_once(&self.db.pool, "worker", &OPTIONS)
+                .await
+                .expect("build step");
             if !step.progressed() {
                 return;
             }
@@ -252,20 +242,6 @@ async fn a_one_to_one_build_survives_its_key_being_recollated() {
         f.rows(ONE_ACTUAL).await,
         f.rows(ONE_EXPECTED).await,
         "the 1-1 target equals its source"
-    );
-}
-
-/// An aggregate Re-derive build whose remaining chunks run after the key is
-/// re-collated still counts every source row once.
-#[tokio::test]
-#[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
-async fn an_aggregate_build_survives_its_key_being_recollated() {
-    let mut f = Fixture::new(AGG).await;
-    f.build_across_a_recollation("agg").await;
-    assert_eq!(
-        f.rows(AGG_ACTUAL).await,
-        f.rows(AGG_EXPECTED).await,
-        "the target equals a from-scratch GROUP BY over the source"
     );
 }
 
@@ -359,80 +335,4 @@ async fn a_chunk_over_a_c_collated_key_reads_by_index() {
     assert_eq!(seq_scans(&explained), Vec::<&str>::new(), "{explained}");
     assert!(explained.contains("src_pkey"), "{explained}");
     assert!(explained.contains("one_pkey"), "{explained}");
-}
-
-/// A build whose recorded collation is dropped mid-build (the key
-/// re-collated to `"C"`, then `drop collation`) can't read its remaining
-/// ranges in the order it planned them. Its chunks fail, are charged, and
-/// pause the definition: it doesn't loop, and doesn't read in another order.
-/// A resume plans a fresh build under the key's collation now, which
-/// finishes. An aggregate, because a 1-1 target's key keeps the source key's
-/// collation, which the `drop collation` then refuses to drop.
-#[tokio::test]
-#[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
-async fn a_build_whose_recorded_collation_is_dropped_pauses_and_resumes() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let raw = connect(db.dsn()).await;
-    raw.batch_execute(
-        "create collation public.keyed (provider = icu, locale = 'en-US'); \
-         create table public.src (id text collate public.keyed primary key, g integer, \
-                                  v bigint); \
-         insert into public.src \
-         select case when i % 2 = 0 then 'K' else 'k' end || lpad(i::text, 4, '0'), \
-                i % 7, i \
-         from generate_series(1, 200) i",
-    )
-    .await
-    .expect("seed the source");
-    let columns = [
-        ("id".to_string(), ValueType::Text),
-        ("g".to_string(), ValueType::Numeric),
-        ("v".to_string(), ValueType::Numeric),
-    ]
-    .into_iter()
-    .collect();
-    trellis::defs::install_definition(&db.pool, AGG, &columns, "public")
-        .await
-        .expect("register the definition");
-    let mut f = Fixture {
-        db,
-        raw,
-        _cluster: cluster,
-    };
-    f.pass().await;
-    assert!(f.run_one_chunk().await, "the plan job");
-    assert!(f.run_one_chunk().await, "the first chunk");
-    f.recollate_key("C").await;
-    f.raw
-        .batch_execute("drop collation public.keyed")
-        .await
-        .expect("drop the recorded collation");
-
-    for _ in 0..MAX_STEPS {
-        if f.status("agg").await != "backfilling" {
-            break;
-        }
-        f.raw
-            .batch_execute("update backfill_chunks set next_attempt_at = now()")
-            .await
-            .expect("skip the backoff");
-        assert!(f.run_one_chunk().await, "a chunk to run while backfilling");
-    }
-    assert_eq!(f.status("agg").await, "paused");
-    let errors = f
-        .rows("select last_error from backfill_chunks where last_error is not null")
-        .await;
-    assert!(
-        errors.iter().any(|e| e.contains("keyed")),
-        "the failure names the dropped collation: {errors:?}"
-    );
-
-    trellis::staging::quarantine::resume_transform(&f.db.pool, "agg")
-        .await
-        .expect("resume");
-    f.pass().await;
-    f.finish().await;
-    assert_eq!(f.status("agg").await, "live");
-    assert_eq!(f.rows(AGG_ACTUAL).await, f.rows(AGG_EXPECTED).await);
 }

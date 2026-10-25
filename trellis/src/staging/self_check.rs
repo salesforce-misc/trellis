@@ -23,7 +23,7 @@
 //! [`crate::defs::oracle::render_expr_sql`] or any of its siblings in
 //! `defs::oracle` — those are used by the *production write path*
 //! (`defs::backfill`'s direct-build backfill, and
-//! `staging::ledger`'s incremental aggregate apply), not just by
+//! `staging::group_basis`'s aggregate apply), not just by
 //! tests. Auditing backfilled rows with a renderer the backfill path itself
 //! uses would check the write path against itself: a rendering bug would
 //! agree with itself, and the audit would pass on a wrong answer. This
@@ -94,15 +94,14 @@
 //! # Scope: 1-1 targets, group-basis aggregates and JOIN targets
 //!
 //! A 1-1 target is compared row by row against its source. An aggregate on
-//! the group basis ([`super::group_basis`], behind its dev knob) is
+//! the group basis ([`super::group_basis`]) is
 //! compared a page of groups at a time by [`super::self_check_groups`]: each
 //! group's hidden partials against a `GROUP BY` of the source, and its
-//! visible row against the partials. A `JOIN` target (behind the same knob,
-//! [`super::join`]) is compared by [`super::self_check_joins`]: its visible
+//! visible row against the partials. A `JOIN` target
+//! ([`super::join`]) is compared by [`super::self_check_joins`]: its visible
 //! rows and `T`'s partials against the definition's `JOIN … GROUP BY`, and
 //! `P`, `M` and `J` against their tables. Both detect and never repair
-//! (ADR-0013). Any other aggregate (a ledger one, with the group-basis knob
-//! forced off) is refused ([`SelfCheckError::UnsupportedKeySpace`]).
+//! (ADR-0013).
 //!
 //! # How a page finds its keys
 //!
@@ -392,8 +391,7 @@ pub enum SelfCheckError {
     /// No transform is registered under this target table name.
     TargetNotFound(String),
     /// The target is neither 1-1, an aggregate on the group basis nor a
-    /// `JOIN` that applies: with the group-basis knob forced off, any
-    /// aggregate or `JOIN` — see the module doc comment's "Scope" section.
+    /// `JOIN` that applies — see the module doc comment's "Scope" section.
     UnsupportedKeySpace {
         target: String,
     },
@@ -456,7 +454,7 @@ impl fmt::Display for SelfCheckError {
             SelfCheckError::UnsupportedKeySpace { target } => write!(
                 f,
                 "self_check audits a 1-1 target, an aggregate or a JOIN; \"{target}\" is an \
-                 aggregate on the per-row ledger, which it can't audit"
+                 aggregate the group basis doesn't take, which it can't audit"
             ),
             SelfCheckError::UnsupportedExpr { target, detail } => {
                 write!(f, "self_check can't audit \"{target}\": {detail}")
@@ -658,14 +656,12 @@ pub(crate) async fn comparable_definition(
 }
 
 /// The group-basis shape of `def`, if it is an aggregate on the group basis
-/// (#1104): audited by [`super::self_check_groups`]. Whatever the knob says
-/// at this moment, as it decides the definition's routing.
+/// (#1104): audited by [`super::self_check_groups`].
 fn group_shape(def: &Definition) -> Option<super::group_basis::GroupShape> {
     super::group_basis::route(&def.def, &def.source_columns)
 }
 
-/// Whether `def` is a `JOIN` that applies (behind the group-basis knob,
-/// [`super::join::applies`]): audited by [`super::self_check_joins`].
+/// Whether `def` is a `JOIN` that applies ([`super::join::applies`]): audited by [`super::self_check_joins`].
 fn joined(def: &Definition) -> bool {
     super::join::applies(&def.def)
 }

@@ -65,7 +65,6 @@ async fn records(h: &H) -> Vec<String> {
 /// each exactly, and later writes apply under the new type.
 #[tokio::test]
 async fn a_re_type_to_another_enum_pauses_each_reader_once_and_resumes_exactly() {
-    trellis::dev::staging::set_group_basis(true);
     let mut h = H::new(
         SOURCE,
         &[
@@ -182,7 +181,6 @@ async fn a_re_type_to_another_enum_pauses_each_reader_once_and_resumes_exactly()
 /// no change of value identity, so this check pauses nothing for it.
 #[tokio::test]
 async fn a_re_type_to_text_is_no_value_identity_change() {
-    trellis::dev::staging::set_group_basis(true);
     let mut h = H::new(
         SOURCE,
         &["TRANSFORM t1 FROM public.s SELECT tone AS tone, n AS n"],
@@ -204,7 +202,6 @@ async fn a_re_type_to_text_is_no_value_identity_change() {
 /// goes on to rebuild it.
 #[tokio::test]
 async fn a_draining_resume_keeps_the_target_until_the_changes_drain() {
-    trellis::dev::staging::set_group_basis(true);
     let mut h = H::new(
         SOURCE,
         &["TRANSFORM per_tone FROM public.s GROUP BY tone \
@@ -254,7 +251,6 @@ async fn a_draining_resume_keeps_the_target_until_the_changes_drain() {
 /// both back exact.
 #[tokio::test]
 async fn a_definition_chained_off_a_re_typed_key_resumes_with_its_upstream() {
-    trellis::dev::staging::set_group_basis(true);
     let mut h = H::new(
         SOURCE,
         &["TRANSFORM per_tone FROM public.s GROUP BY tone \

@@ -75,14 +75,8 @@ pub struct SweepTier {
 /// Which apply path a plant breaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlantPath {
-    /// The per-row aggregate ledger, which takes an aggregate only with the
-    /// group-basis knob off (`TRELLIS_DEV_GROUP_BASIS=0`) while it exists
-    /// (#1105 deletes it).
-    Ledger,
     /// A 1-1 target.
     OneToOne,
-    /// A 1-1 target, or an aggregate on the ledger.
-    OneToOneOrLedger,
     /// A group-basis aggregate's page or build.
     GroupBasis,
     /// A group-basis aggregate, or a `JOIN`'s `P` and `M` cells: the
@@ -96,15 +90,11 @@ pub enum PlantPath {
 /// The path `plant` breaks.
 pub fn plant_path(plant: Plant) -> PlantPath {
     match plant {
-        Plant::DropRacingGroupDelta
-        | Plant::SkipLedgerLock
-        | Plant::LsnOnlySkip
-        | Plant::MergeWithoutDelete => PlantPath::Ledger,
-        Plant::StaleOneToOneWrite => PlantPath::OneToOne,
-        // The tombstone GC (#623 D7) collects 1-1 ledgers too since D6, and
-        // a plain 1-1 target takes the Re-derive build's chunks since #625
-        // F8a.
-        Plant::EarlyTombstoneGc | Plant::ChunkWithoutEntryLock => PlantPath::OneToOneOrLedger,
+        // The tombstone GC (#623 D7) collects a 1-1 target's ledger, and a
+        // plain 1-1 target takes the Re-derive build's chunks (#625 F8a).
+        Plant::StaleOneToOneWrite | Plant::EarlyTombstoneGc | Plant::ChunkWithoutEntryLock => {
+            PlantPath::OneToOne
+        }
         Plant::GbSkipGroupLock | Plant::GbBuildSnapshotBeforeLocks => PlantPath::GroupBasis,
         Plant::GbLsnNotVisibility | Plant::GbFoldSidesPerKey | Plant::GbEarlyZeroGc => {
             PlantPath::GroupBasisWriter
@@ -118,9 +108,7 @@ pub fn plant_path(plant: Plant) -> PlantPath {
 
 /// Whether `plant` can make a target with `key_space` diverge: each plant
 /// breaks one apply path, so a divergence in a target it never writes is an
-/// unplanted failure, not a catch. The baseline reaches everything. With the
-/// group-basis knob on (the default) the ledger takes no aggregate, so a
-/// ledger plant reaches only what a 1-1 plant does.
+/// unplanted failure, not a catch. The baseline reaches everything.
 pub fn plant_reaches(plant: &str, key_space: &KeySpace) -> bool {
     let Some(plant) = Plant::from_name(plant) else {
         return true;
@@ -128,9 +116,7 @@ pub fn plant_reaches(plant: &str, key_space: &KeySpace) -> bool {
     let aggregate = matches!(key_space, KeySpace::Aggregate { .. });
     let join = matches!(key_space, KeySpace::Join(_));
     match plant_path(plant) {
-        PlantPath::Ledger => aggregate,
         PlantPath::OneToOne => !aggregate && !join,
-        PlantPath::OneToOneOrLedger => !join,
         PlantPath::GroupBasis => aggregate,
         PlantPath::GroupBasisWriter => aggregate || join,
         PlantPath::Join => join,
@@ -629,10 +615,10 @@ mod tests {
                     assert!(!plant_reaches(name, &group_by), "{name}");
                     assert!(!plant_reaches(name, &one_to_one), "{name}");
                 }
-                PlantPath::OneToOne | PlantPath::OneToOneOrLedger => {
+                PlantPath::OneToOne => {
                     assert!(plant_reaches(name, &one_to_one), "{name}");
+                    assert!(!plant_reaches(name, &group_by), "{name}");
                 }
-                PlantPath::Ledger => assert!(plant_reaches(name, &group_by), "{name}"),
             }
         }
     }

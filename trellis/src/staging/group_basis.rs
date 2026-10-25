@@ -1,21 +1,12 @@
 //! Aggregate targets on the group basis (#1100 G2a, ADR-0002 "Aggregates: a
 //! basis per group, kept by deltas").
 //!
-//! # The knob
+//! # Which definitions take it
 //!
 //! The group basis keeps every aggregate definition: define refuses an
 //! aggregate outside #1096 decision 1's admitted set by family
 //! (`defs::validate::validate_aggregate_admitted`), so [`route`] takes every
-//! aggregate define accepts. The per-row ledger (`super::ledger`) keeps
-//! none, and is deleted with #1105.
-//!
-//! Until then a dev/test knob can force every aggregate back onto the
-//! ledger, with the ledger's whole surface (define refuses nothing by family
-//! then): [`enabled`] is on unless [`KNOB_ENV`] is `0`, `false` or `off`,
-//! or [`set_enabled`] (`trellis::dev::set_group_basis`) turned it off. It is
-//! process-wide and read whenever a definition is routed, so it must not
-//! change while a definition exists: a test binary or a benchmark probe sets
-//! it once, before its client starts. A definition [`route`] takes:
+//! aggregate define accepts. A definition [`route`] takes:
 //!
 //! - is built, fresh or on a resume, by the plan job's one absolute write of
 //!   every group ([`rebuild`]), over a partitioned source one transaction per
@@ -71,7 +62,7 @@
 //! instance's catalog schema, named by definition id ([`hidden_table_name`],
 //! `agg_<id>`, beside a `JOIN`'s `join_<id>_*` tables): the row count
 //! `__n`, and per distinct aggregate argument `i` (1-based, in
-//! `defs::ledger::contributions`' order) its non-null count `__count_<i>` and,
+//! [`distinct_arguments`]' order) its non-null count `__count_<i>` and,
 //! when a `SUM` or `AVG` reads it, its sum `__sum_<i>` as `numeric`. A group
 //! row is visible in the target only while `__n > 0`; a zero group stays in
 //! the hidden table until the GC collects it (below).
@@ -200,7 +191,6 @@
 //! before the page's change.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::SystemTime;
 
 use tokio_postgres::Transaction;
@@ -208,7 +198,6 @@ use tokio_postgres::types::PgLsn;
 
 use crate::defs::ast::{Expr, KeySpace, TransformDef, ValueType, group_by_contains};
 use crate::defs::ddl::{self, PrimaryKeyColumn};
-use crate::defs::ledger as schema;
 use crate::defs::oracle::{render_expr_sql, render_qualified_expr_sql};
 use crate::integer::IntWidth;
 use crate::pool::{quote_ident, quote_literal};
@@ -216,34 +205,6 @@ use crate::pool::{quote_ident, quote_literal};
 use super::apply::ApplyError;
 use super::fold::{FoldedChange, earliest_origin};
 use super::target_mutations::TargetMutations;
-
-/// The environment variable that turns the knob off (`0`, `false` or
-/// `off`) when nothing has set it: see the module doc.
-pub const KNOB_ENV: &str = "TRELLIS_DEV_GROUP_BASIS";
-
-/// 0: not read yet; 1: off; 2: on.
-static KNOB: AtomicU8 = AtomicU8::new(0);
-
-/// Whether the group-basis knob is on (see the module doc).
-pub fn enabled() -> bool {
-    match KNOB.load(Ordering::Relaxed) {
-        1 => false,
-        2 => true,
-        _ => {
-            let on = !std::env::var(KNOB_ENV)
-                .is_ok_and(|v| matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "off"));
-            KNOB.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-            on
-        }
-    }
-}
-
-/// Turns the group-basis knob on or off for this process. Only before any
-/// client starts: see the module doc.
-#[cfg_attr(not(any(test, feature = "test-util")), allow(dead_code))]
-pub fn set_enabled(on: bool) {
-    KNOB.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-}
 
 /// Planted bug `gb_fold_sides_per_key` (`crate::plant`): a key's ring rows
 /// (`FoldedChange::group_sides`) folded into one, as the per-key fold folds
@@ -347,21 +308,11 @@ pub(super) fn placeholder(k: usize) -> String {
 }
 
 /// Whether the group basis takes `def` (see the module doc), and its shape
-/// if so. `None` whenever the knob is off. The one routing decision between
-/// the ledger and the group basis: `super::ledger::route` declines what this
-/// takes.
+/// if so.
 pub(crate) fn route(
     def: &TransformDef,
     source_columns: &HashMap<String, ValueType>,
 ) -> Option<GroupShape> {
-    if !enabled() {
-        return None;
-    }
-    shape_of(def, source_columns)
-}
-
-/// [`route`]'s shape of `def`, whatever the knob says.
-fn shape_of(def: &TransformDef, source_columns: &HashMap<String, ValueType>) -> Option<GroupShape> {
     let KeySpace::Aggregate { group_by } = &def.key_space else {
         return None;
     };
@@ -374,15 +325,15 @@ fn shape_of(def: &TransformDef, source_columns: &HashMap<String, ValueType>) -> 
     }
     let substituted = crate::defs::backfill::substituted_field_exprs(def).ok()?;
     let field_types = crate::defs::validate::infer_field_types(def, source_columns).ok()?;
-    let contributions = schema::contributions(&def.fields, group_by, &substituted);
+    let distinct = distinct_arguments(&def.fields, group_by, &substituted);
     let mut shape = GroupShape {
         group_cols,
         group_types,
-        args: contributions
+        args: distinct
             .iter()
-            .map(|c| Arg {
-                sql: render_qualified_expr_sql(&c.arg, "s"),
-                expr: c.arg.clone(),
+            .map(|arg| Arg {
+                sql: render_qualified_expr_sql(arg, "s"),
+                expr: arg.clone(),
                 summed: false,
             })
             .collect(),
@@ -390,7 +341,7 @@ fn shape_of(def: &TransformDef, source_columns: &HashMap<String, ValueType>) -> 
         fields: Vec::new(),
         numeric_args: Vec::new(),
     };
-    let arg_of = |arg: &Expr| contributions.iter().position(|c| c.arg == *arg);
+    let arg_of = |arg: &Expr| distinct.iter().position(|d| d == arg);
     for field in &def.fields {
         if group_by_contains(group_by, &field.name) {
             continue;
@@ -470,6 +421,46 @@ pub(super) fn rewrite(
         }),
         other => Some(other.clone()),
     }
+}
+
+/// The distinct arguments of the aggregate calls in the non-`GROUP BY`
+/// fields, in field declaration order, then left to right within a field:
+/// one per distinct argument, so `SUM(x)` and `AVG(x)` share one. `COUNT(*)`
+/// has none. `substituted` is every field's cross-field-alias-resolved
+/// expression ([`crate::defs::backfill::substituted_field_exprs`]), so an
+/// aliased aggregate (`t2 = t` where `t = SUM(x)`) resolves to its source's
+/// argument.
+fn distinct_arguments(
+    fields: &[crate::defs::ast::FieldDef],
+    group_by: &[String],
+    substituted: &HashMap<String, Expr>,
+) -> Vec<Expr> {
+    fn walk(expr: &Expr, out: &mut Vec<Expr>) {
+        match expr {
+            Expr::FunctionCall { name, args } if args.len() == 1 && is_aggregate(name) => {
+                if !out.contains(&args[0]) {
+                    out.push(args[0].clone());
+                }
+            }
+            Expr::FunctionCall { args, .. } => args.iter().for_each(|a| walk(a, out)),
+            Expr::BinaryOp { lhs, rhs, .. } => {
+                walk(lhs, out);
+                walk(rhs, out);
+            }
+            Expr::Column(_)
+            | Expr::SourceColumn { .. }
+            | Expr::NumberLiteral(_)
+            | Expr::StringLiteral(_)
+            | Expr::TypedLiteral { .. } => {}
+        }
+    }
+    let mut out = Vec::new();
+    for field in fields {
+        if !group_by_contains(group_by, &field.name) {
+            walk(&substituted[&field.name], &mut out);
+        }
+    }
+    out
 }
 
 /// Whether `name` is an aggregate function, admitted or not.
@@ -827,10 +818,9 @@ impl GroupTargetPlan {
             self.recompute_keys.push(change.key.clone());
         }
         if change.group_sides.is_empty() {
-            return Err(self.unsupported(
-                "a page folded while the group-basis knob was off; the knob must not change \
-                 while a definition exists",
-            ));
+            return Err(
+                self.unsupported("a page folded without the unfolded ring rows its change needs")
+            );
         }
         // Planted bug (#1114): fold the key's ring rows into one side. See
         // `crate::plant`.
@@ -3319,7 +3309,7 @@ mod tests {
 
     fn shape(text: &str) -> Option<GroupShape> {
         let def = crate::defs::parse(text).expect("parses");
-        shape_of(&def, &columns())
+        route(&def, &columns())
     }
 
     #[test]
@@ -3337,7 +3327,7 @@ mod tests {
     }
 
     #[test]
-    fn leaves_every_other_aggregate_on_the_ledger() {
+    fn takes_no_refused_aggregate_and_no_one_to_one() {
         for text in [
             "TRANSFORM t FROM s GROUP BY g SELECT MIN(a) AS n",
             "TRANSFORM t FROM s GROUP BY g SELECT MAX(a) + COUNT(*) AS n",
@@ -3359,7 +3349,7 @@ mod tests {
         let text = "TRANSFORM t FROM s GROUP BY g SELECT SUM(a) AS s";
         let name = |cols: &HashMap<String, ValueType>| {
             let def = crate::defs::parse(text).expect("parses");
-            let shape = shape_of(&def, cols).expect("admitted");
+            let shape = route(&def, cols).expect("admitted");
             GroupTargetPlan::new(
                 "trellis",
                 7,
@@ -3378,7 +3368,7 @@ mod tests {
         assert_ne!(name(&int4), name(&int8));
         assert!(name(&int4).starts_with("pg_temp.\"trellis_group_sides_7_"));
         let def = crate::defs::parse(text).expect("parses");
-        let shape = shape_of(&def, &int4).expect("admitted");
+        let shape = route(&def, &int4).expect("admitted");
         let longest = GroupTargetPlan::new(
             "trellis",
             i64::MIN,
@@ -3402,7 +3392,7 @@ mod tests {
         let text = "TRANSFORM t FROM s GROUP BY g SELECT SUM(a) AS s";
         let name = |id: i64, cols: &HashMap<String, ValueType>| {
             let def = crate::defs::parse(text).expect("parses");
-            let shape = shape_of(&def, cols).expect("admitted");
+            let shape = route(&def, cols).expect("admitted");
             GroupTargetPlan::new(
                 "trellis",
                 id,
@@ -3438,7 +3428,7 @@ mod tests {
         let schema = crate::config::DEFAULT_SCHEMA;
         let def =
             crate::defs::parse("TRANSFORM t FROM s GROUP BY g SELECT SUM(a) AS s").expect("parses");
-        let shape = shape_of(&def, cols).expect("admitted");
+        let shape = route(&def, cols).expect("admitted");
         let mut plan = GroupTargetPlan::new(
             schema,
             7,
@@ -3513,7 +3503,7 @@ mod tests {
     ) {
         let def =
             crate::defs::parse("TRANSFORM t FROM s GROUP BY g SELECT SUM(a) AS s").expect("parses");
-        let shape = shape_of(&def, cols).expect("admitted");
+        let shape = route(&def, cols).expect("admitted");
         let plan = GroupTargetPlan::new(
             crate::config::DEFAULT_SCHEMA,
             7,
@@ -3596,7 +3586,7 @@ mod tests {
         });
         let def =
             crate::defs::parse("TRANSFORM t FROM s GROUP BY g SELECT SUM(a) AS s").expect("parses");
-        let shape = shape_of(&def, &columns()).expect("admitted");
+        let shape = route(&def, &columns()).expect("admitted");
         let hidden = hidden_table_ident("trellis", 7);
         let deltas = "pg_temp.\"trellis_test_deltas\"".to_string();
         let plan = GroupTargetPlan::for_join(

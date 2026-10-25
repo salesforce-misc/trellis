@@ -391,6 +391,10 @@ async fn start_backfilling(
 ///
 /// Returns the status the dispatch left the definition in, or `None` when it
 /// was no longer `waiting_to_backfill`, as for [`dispatch_one_to_one`].
+///
+/// No discharge dispatches one: every aggregate is built by its plan job. It
+/// stays, with the rest of the old build path, for #625 to delete.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn dispatch_direct_build(
     txn: &tokio_postgres::Transaction<'_>,
     definition_id: i64,
@@ -2541,8 +2545,8 @@ mod tests {
         super::super::ddl::join_pk_key(parts)
     }
 
-    /// The tables [`seed_waiting_aggregate`]'s definition builds into: its
-    /// target, ledger and group deltas.
+    /// The table [`seed_waiting_aggregate`]'s definition builds into: its
+    /// target.
     async fn create_rollup_target(pool: &Pool) {
         let text = "TRANSFORM rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT g AS g, sum(a) AS total";
         let columns: std::collections::HashMap<String, super::super::ast::ValueType> =
@@ -2603,67 +2607,6 @@ mod tests {
             .expect("dispatch");
         txn.commit().await.expect("commit");
         assert_eq!(status, Some(TransformStatus::Backfilling));
-    }
-
-    /// Issue #419: a direct-build job whose worker dies is reclaimed and
-    /// rerun by another worker, and finishing it moves the definition to
-    /// `catching_up` with its go-live catch-up parked.
-    #[tokio::test]
-    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
-    async fn a_direct_build_job_held_by_a_dead_worker_is_rerun_by_another() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (pool, mut raw) = connect(&db).await;
-        let id = seed_waiting_aggregate(&pool, &raw, true).await;
-        dispatch_job(&pool, id, 0).await;
-
-        let dead = claim_chunks(&raw, "dead-worker", 10).await.expect("claim");
-        assert_eq!(dead.len(), 1);
-        assert_eq!(dead[0].work, ChunkWork::DirectBuild);
-        let reclaimed = reclaim_stale_chunks(&mut raw, Duration::ZERO)
-            .await
-            .expect("reclaim");
-        assert_eq!(reclaimed, 1);
-
-        let job = claim_chunks(&raw, WORKER, 10).await.expect("claim again");
-        assert_eq!(job.len(), 1);
-        run_claimed_chunk(
-            &pool,
-            &job[0],
-            WORKER,
-            Duration::from_secs(5),
-            Duration::from_secs(60),
-        )
-        .await
-        .expect("run the job");
-        finish_chunk(&pool, &job[0], WORKER)
-            .await
-            .expect("finish the job");
-        // A finish from the dead worker's claim is a no-op.
-        finish_chunk(&pool, &dead[0], "dead-worker")
-            .await
-            .expect("finish a lost claim");
-
-        assert_eq!(status_of(&raw, id).await, "catching_up");
-        assert_eq!(chunk_count(&raw, id).await, 0);
-        assert!(marker_generation(&raw, "public.orders").await.is_some());
-        let rows: Vec<(String, String)> = raw
-            .query(
-                "select g::text, total::text from public.rollup order by g",
-                &[],
-            )
-            .await
-            .expect("read the target")
-            .into_iter()
-            .map(|row| (row.get(0), row.get(1)))
-            .collect();
-        assert_eq!(
-            rows,
-            [
-                ("1".to_string(), "30".to_string()),
-                ("2".to_string(), "5".to_string())
-            ]
-        );
     }
 
     /// Issue #419: a direct build that fails hands its build back to the
@@ -2739,60 +2682,6 @@ mod tests {
         assert_eq!(status_of(&raw, id).await, "paused");
         assert_eq!(chunk_count(&raw, id).await, 0);
         assert_eq!(marker_generation(&raw, "public.orders").await, None);
-    }
-
-    /// #616: a direct build can't be narrowed to a key, so the
-    /// [`MAX_CHARGED_ATTEMPTS`]th failure in a row pauses its definition
-    /// rather than handing it back again. The job stays as the record of the
-    /// failure, and no marker is parked: the resume parks one and rebuilds.
-    #[tokio::test]
-    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
-    async fn a_direct_build_that_keeps_failing_pauses_its_definition() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (pool, raw) = connect(&db).await;
-        // No target table, so the build's write fails.
-        let id = seed_waiting_aggregate(&pool, &raw, false).await;
-        dispatch_job(&pool, id, MAX_CHARGED_ATTEMPTS - 1).await;
-
-        let job = claim_chunks(&raw, WORKER, 10).await.expect("claim");
-        let error = run_claimed_chunk(
-            &pool,
-            &job[0],
-            WORKER,
-            Duration::from_secs(5),
-            Duration::from_secs(60),
-        )
-        .await
-        .expect_err("the build has no target to write");
-        let given_up = fail_chunk(&pool, &job[0], WORKER, &error)
-            .await
-            .expect("fail the job");
-
-        assert_eq!(given_up, ChunkFailure::Paused);
-        assert_eq!(status_of(&raw, id).await, "paused");
-        assert_eq!(marker_generation(&raw, "public.orders").await, None);
-        let record = raw
-            .query_one(
-                "select attempts, last_error, claimed_by from backfill_chunks \
-                 where definition_id = $1",
-                &[&id],
-            )
-            .await
-            .expect("the job stays as the record");
-        assert_eq!(record.get::<_, i32>(0), MAX_CHARGED_ATTEMPTS);
-        assert_eq!(record.get::<_, Option<String>>(1), Some(error.to_string()));
-        assert_eq!(record.get::<_, Option<String>>(2), None);
-
-        // A definition's tables exist, and a resume refuses without its
-        // group-delta table (#967): create the ones the build lacked.
-        create_rollup_target(&pool).await;
-        resume_transform(&pool, "rollup").await.expect("resume");
-        assert_eq!(
-            chunk_count(&raw, id).await,
-            0,
-            "the resume clears the record"
-        );
     }
 
     /// Issue #434: a chunk held across a pause and a completed resume must
@@ -2872,44 +2761,6 @@ mod tests {
             0,
             "the held chunk is discarded"
         );
-    }
-
-    /// Issue #434, for a direct-build job: a job held across a pause and a
-    /// resume writes nothing when it runs, and is discarded.
-    #[tokio::test]
-    #[ignore = "pins the per-row ledger, which the default path no longer takes: run with TRELLIS_DEV_GROUP_BASIS=0 and --ignored; #1105 deletes it"]
-    async fn a_direct_build_job_held_across_a_resume_writes_nothing() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (pool, raw) = connect(&db).await;
-        let id = seed_waiting_aggregate(&pool, &raw, true).await;
-        dispatch_job(&pool, id, 0).await;
-        let held = claim_chunks(&raw, WORKER, 10).await.expect("claim");
-        assert_eq!(held.len(), 1);
-        pause_transform(&pool, "rollup").await.expect("pause");
-        resume_transform(&pool, "rollup").await.expect("resume");
-
-        run_claimed_chunk(
-            &pool,
-            &held[0],
-            WORKER,
-            Duration::from_secs(5),
-            Duration::from_secs(60),
-        )
-        .await
-        .expect("a superseded job is not a failure");
-        let rows: i64 = raw
-            .query_one("select count(*) from public.rollup", &[])
-            .await
-            .expect("count target rows")
-            .get(0);
-        assert_eq!(rows, 0, "the held job wrote nothing");
-
-        finish_chunk(&pool, &held[0], WORKER)
-            .await
-            .expect("finish the held job");
-        assert_eq!(chunk_count(&raw, id).await, 0, "the held job is discarded");
-        assert_eq!(status_of(&raw, id).await, "waiting_to_backfill");
     }
 
     /// The fence also covers a claim reclaimed from a worker that is still

@@ -160,7 +160,6 @@ async fn bring_live(raw: &mut Client, pool: &trellis::Pool) {
 /// panicked the pass (#1177).
 #[tokio::test]
 async fn a_gone_joined_table_pauses_its_readers() {
-    trellis::dev::staging::set_group_basis(true);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
@@ -213,7 +212,6 @@ async fn record_counts(raw: &Client, table: &str) -> (i64, i64, i64) {
 /// records; a table another definition still reads keeps them.
 #[tokio::test]
 async fn dropping_the_last_reader_of_a_joined_table_forgets_its_records() {
-    trellis::dev::staging::set_group_basis(true);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;

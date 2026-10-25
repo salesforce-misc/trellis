@@ -60,7 +60,7 @@ use trellis::defs::ast::ValueType;
 use trellis::defs::pg_type::PgType;
 use trellis::defs::{
     CatalogError, ValidationError, create_aggregate_target_table, create_definition,
-    install_definition, parse, registry, source_primary_key, validate,
+    install_definition, parse, source_primary_key, validate,
 };
 use trellis::integer::IntWidth;
 use trellis::staging::{apply, seal};
@@ -400,64 +400,3 @@ async fn an_enum_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two()
 // ---------------------------------------------------------------------
 // 3. MIN/MAX: creation-order, not alphabetical
 // ---------------------------------------------------------------------
-
-/// `min(enum)`/`max(enum)` are real Postgres aggregates that keep their
-/// argument's own concrete enum type (`pg_typeof`, not assumed), and their
-/// comparison is the type's *creation-order* one — demonstrated by choosing
-/// label spellings where the two orders disagree outright, so a passing
-/// assertion here could not be explained by an accidental alphabetical
-/// fallback anywhere in the stack.
-#[tokio::test]
-async fn enum_min_max_keeps_its_type_and_honors_creation_order_not_alphabetical() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
-
-    // Creation order: bravo (1) < alpha (2) — the *opposite* of alphabetical
-    // (alpha < bravo). A naive lexicographic MIN/MAX would get this backwards.
-    client
-        .batch_execute("create type public.flip_enum as enum ('bravo', 'alpha')")
-        .await
-        .expect("create enum type");
-
-    let row = client
-        .query_one(
-            "select pg_typeof(min(v))::text, pg_typeof(max(v))::text \
-             from (values ('bravo'::flip_enum), ('alpha'::flip_enum)) t(v)",
-            &[],
-        )
-        .await
-        .expect("pg_typeof probe");
-    let (min_ty, max_ty): (String, String) = (row.get(0), row.get(1));
-    assert_eq!(min_ty, "flip_enum");
-    assert_eq!(max_ty, "flip_enum");
-
-    let row = client
-        .query_one(
-            "select min(v)::text, max(v)::text \
-             from (values ('bravo'::flip_enum), ('alpha'::flip_enum)) t(v)",
-            &[],
-        )
-        .await
-        .expect("min/max probe");
-    let (min_v, max_v): (String, String) = (row.get(0), row.get(1));
-    assert_eq!(min_v, "bravo", "creation order, not alphabetical, must win");
-    assert_eq!(max_v, "alpha", "creation order, not alphabetical, must win");
-
-    let pg_type = registry::aggregate_result_type(
-        "MIN",
-        ValueType::Other(PgType::Enum("enum:public.flip_enum")),
-    );
-    assert_eq!(
-        pg_type,
-        Some(ValueType::Other(PgType::Enum("enum:public.flip_enum"))),
-        "MIN(enum) must resolve to Other(Enum), mirroring its argument's own type"
-    );
-    assert_eq!(
-        registry::aggregate_result_type(
-            "MAX",
-            ValueType::Other(PgType::Enum("enum:public.flip_enum"))
-        ),
-        pg_type
-    );
-}

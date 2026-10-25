@@ -5,8 +5,7 @@
 //! source's `GROUP BY` from one snapshot, and replaces each group's partials
 //! and visible row, while pages keep applying.
 //!
-//! Every test turns the group-basis dev knob on before its driver starts,
-//! requests the rebuild through `Trellis::request_backfill`, and runs the
+//! Every test requests the rebuild through `Trellis::request_backfill`, and runs the
 //! rebuild's job by hand through `support/drain_driver.rs`, frozen at its
 //! pause points where the scenario needs it. None sleeps or polls for
 //! convergence (#297): the one wait is for a page to queue on a lock the
@@ -47,7 +46,6 @@ fn int4() -> ValueType {
 /// `public.src (id, g, v)`, empty, with [`AGG`] live over it on the group
 /// basis, captured by triggers.
 async fn start() -> Driver {
-    trellis::dev::staging::set_group_basis(true);
     Driver::start(
         "create table public.src (id integer primary key, g integer, v integer); \
          create index on public.src (g)",
@@ -428,7 +426,6 @@ async fn a_rebuild_replaces_a_group_with_a_null_part() {
 /// replaced partials, so a rebuild writes the same values the pages do.
 #[tokio::test]
 async fn a_rebuild_writes_averages_numeric_sums_and_composed_fields() {
-    trellis::dev::staging::set_group_basis(true);
     let mut d = Driver::start(
         "create table public.src (id integer primary key, g integer, v integer, \
          m numeric(12, 2)); create index on public.src (g)",
@@ -480,9 +477,9 @@ async fn pause(d: &Driver) {
 }
 
 /// A whole-transform `RESUME` of a group-basis aggregate is accepted (#1222):
-/// it keeps no ledger and no group-delta table, so the owned-table checks
-/// that a ledger aggregate's resume runs have nothing to find missing. Its
-/// hidden partials table is recreated (`group_basis_resume.rs`).
+/// it keeps no ledger, so the owned-table check a 1-1 resume runs has
+/// nothing to find missing. Its hidden partials table is recreated
+/// (`group_basis_resume.rs`).
 #[tokio::test]
 async fn resume_of_a_paused_group_basis_aggregate_is_accepted() {
     let d = start().await;

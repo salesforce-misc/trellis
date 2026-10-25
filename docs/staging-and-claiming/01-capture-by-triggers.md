@@ -74,8 +74,8 @@ segment with one `INSERT … SELECT`:
   included.
 - **Truncate** stages one image-less `truncate` row keyed by the sentinel
   `\x1ftrellis-truncate-sentinel`. The seal records it
-  (`segments.has_truncate`), and the drain empties the table's ledgers and
-  targets and raises their truncate floor.
+  (`segments.has_truncate`), and the drain empties the table's 1-1 ledgers,
+  hidden tables and targets and raises their truncate floor.
 
 ### A partitioned source's truncate
 
@@ -289,8 +289,7 @@ the columns it keys by there (its source key, its `GROUP BY` keys, and a
 `JOIN`'s `ON` columns) and the
 columns Trellis created from them with a type that comes from the source
 (`defs::copies`: a 1-1 target's key, passthrough and calculated columns, an
-aggregate's `GROUP BY` columns in its target, ledger and group-delta table,
-its field columns and its ledger's contribution columns, a `JOIN`'s
+aggregate's `GROUP BY` columns in its target and its field columns, a `JOIN`'s
 `GROUP BY` and `ON` columns in its target and hidden tables and its field
 columns). A column typed by an expression is compared
 with the type define's inference gives the expression over the live
@@ -312,8 +311,8 @@ it regenerates anything, it pauses the definition, with its
    or when a pass last accepted a change to the column without a pause; or
 4. a column Trellis created can't hold every value of the type define would
    give it now: `integer` to `bigint` under a 1-1 target's key, a `GROUP BY`
-   key, a calculated field (`qty + 1`) or a `SUM` or `MIN` (whose ledger
-   contribution is typed as the argument), `integer` or `bigint` to
+   key, a calculated field (`qty + 1`) or a `SUM` (whose target column is typed
+   as the argument's sum), `integer` or `bigint` to
    `numeric` under the same, `real` to `double precision` under a
    passthrough. The column's next value that doesn't fit would fail its
    write.
@@ -332,7 +331,7 @@ stored as it is, with no pass in between. Only an integer or float width
 outgrows a copy.
 
 Changes that need neither pause nothing: widening a key no copy holds (an
-aggregate's source key, which its ledger keys by text), a `GROUP BY` key's
+aggregate's source key), a `GROUP BY` key's
 `varchar` widening or move to `text` (its copy is `text`), a string column's
 bound or move between `text` and `varchar` (its copies are unbounded), a `numeric`
 precision change or wider scale, or a wider timestamp precision, on a
@@ -496,9 +495,8 @@ is answered as any other re-type is
    column it is, since nulling a key in place would merge every group onto
    one. The status reads `backfilling` until the rebuild has written them
    back: the old keys can't be expressed in the new type at all;
-4. rebuilds from the source. A target whose ledger is keyed by a source key
-   with an enum column (a 1-1, or a ledger aggregate, over a table keyed by
-   an enum) is emptied with its ledger first and rebuilt as define builds
+4. rebuilds from the source. A 1-1 target whose ledger is keyed by a source key
+   with an enum column (a 1-1 over a table keyed by an enum) is emptied with its ledger first and rebuilt as define builds
    it, so no stored label is cast; its readers see it empty until then.
    Every other shape rebuilds in place;
 5. records the labels again.
@@ -638,9 +636,7 @@ them:
   rewrite has touched since (the rewrite clears the default the column's row
   keeps for older rows, as `VACUUM FULL` does); one on a column with a
   compression method, a storage mode or a non-default collation set (the
-  `ALTER` resets each); a pure widening no copy outgrows; and a column read
-  by `MIN` or `MAX` re-collated, since a field column's collation isn't part
-  of what the pass compares. Between two passes
+  `ALTER` resets each); and a pure widening no copy outgrows. Between two passes
   ([known correctness gaps](../known-correctness-gaps.md#capture-disrupted-and-restored-between-two-passes)):
   a table attached to a hierarchy, or given an inheritance child, and
   detached or the child dropped; a capture function replaced and restored by
@@ -660,7 +656,7 @@ rewrites a row its own statement wrote, the nested statement's capture runs
 first, so the outer statement's ring row has the higher `lsn`. The outer
 row's `new_image` is the live row, the final one, so a `GROUP BY` or 1-1
 target keeps the final values (`tests/capture_join.rs`,
-`tests/ledger_interleavings.rs`). Its `old_image` is the statement's OLD row;
+`tests/one_to_one_ledger_interleavings.rs`). Its `old_image` is the statement's OLD row;
 the fold keeps the earliest old image anyway. A nested write that re-keys a
 row is covered by the [known correctness gaps](../known-correctness-gaps.md).
 
@@ -743,7 +739,7 @@ that comes to apply to the ring's owner hides rows from it, and a hidden row
 reads as gone: the capture stages a delete for a row that still exists.
 Setting `row_security` in the capture functions would turn the policy into a
 failed application write instead. A target that reads the table directly
-doesn't show the wrong delete: a 1-1 or ledger apply re-reads a delete's row
+doesn't show the wrong delete: a 1-1 apply re-reads a delete's row
 live as the drain's role, which is either exempt from the policy and reads
 the row, or refused, which halts the definition, and the group basis sums
 the statement's own transition rows.

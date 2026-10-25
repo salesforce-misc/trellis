@@ -34,7 +34,6 @@ fn int4() -> ValueType {
 }
 
 async fn start_with(definition: &str, source_ddl: &str, columns: &[(&str, ValueType)]) -> Driver {
-    trellis::dev::staging::set_group_basis(true);
     Driver::start(source_ddl, columns, &[definition], &[SRC]).await
 }
 

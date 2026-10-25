@@ -163,8 +163,8 @@ pub enum ValidationError {
     },
     /// The target's name ends with `suffix`, one of
     /// [`super::ledger::RESERVED_TARGET_SUFFIXES`], which name the tables
-    /// Trellis keeps beside a target (its ledger, #623 D2, and its group
-    /// deltas, #625 F1): this target would be one of another target's.
+    /// Trellis keeps beside a target (a 1-1 target's ledger, #623 D2): this
+    /// target would be one of another target's.
     ReservedTargetSuffix {
         target: String,
         suffix: &'static str,
@@ -1110,8 +1110,7 @@ fn validate_target_names(def: &TransformDef) -> Result<(), ValidationError> {
         });
     }
 
-    // #623 D2, #625 F1: a target has a ledger named `<target>__ledger` beside
-    // it, and a ledger-routed aggregate also `<target>__deltas`.
+    // #623 D2: a 1-1 target has a ledger named `<target>__ledger` beside it.
     if let Some(suffix) = super::ledger::RESERVED_TARGET_SUFFIXES
         .into_iter()
         .find(|suffix| def.target.ends_with(suffix))
@@ -1178,8 +1177,8 @@ enum JoinSide {
     Right,
 }
 
-/// The aggregate families a `JOIN` (and, once #1105 lands, a plain
-/// aggregate) refuses, by name: `(functions, family, follow-up issue)`.
+/// The aggregate families a `JOIN` and a plain aggregate refuse, by name:
+/// `(functions, family, follow-up issue)`.
 const DEFERRED_AGGREGATES: &[(&[&str], &str, u32)] = &[
     (&["MIN", "MAX"], "MIN/MAX", 1117),
     (
@@ -1221,8 +1220,8 @@ pub(crate) struct AggregateArg<'a> {
 /// `numeric(p,s)`, or else a named refusal. `arg` is `None` for `COUNT(*)`
 /// and for a call whose argument isn't a resolved column.
 ///
-/// Shared so every key-space refuses the same way. A `JOIN` uses it today;
-/// the plain aggregate adopts it when #1105 removes the ledger.
+/// Shared so every key-space refuses the same way: a `JOIN` and a plain
+/// aggregate both use it.
 pub(crate) fn check_aggregate_admitted(
     function: &str,
     arg: Option<&AggregateArg<'_>>,
@@ -2236,10 +2235,10 @@ pub(crate) fn reject_unsupported_group_by_key_type(
         // `boolean` is *not* on that allowlist (the join/primary-key role
         // really does raw-text `{col}::text = $1` matching in places).
         //
-        // What saves the `GROUP BY` role is that the ledger
-        // (`staging::ledger`) never matches a group by its text: an entry's
-        // group is cast from the image's text into the ledger's own typed
-        // column, through `boolin` — a permissive *input* function that
+        // What saves the `GROUP BY` role is that the group basis
+        // (`staging::group_basis`) never matches a group by its text: a
+        // change's group is parsed from the image's text into the source's
+        // typed column (`jsonb_populate_record`), through `boolin` — a permissive *input* function that
         // accepts both `'t'`/`'f'` and `'true'`/`'false'` — and groups are
         // then matched natively, in SQL. Two renderings of one value always
         // resolve to the same group. `trellis/tests/defs_boolean.rs`'s
@@ -2318,8 +2317,8 @@ pub(crate) fn reject_unsupported_group_by_key_type(
         // `crate::netaddr`'s module doc for the live grid), the identical
         // "one value, two renderers" shape that keeps `inet` off the
         // join/primary-key allowlist. That divergence does not reach the
-        // `GROUP BY` role, because the ledger (`staging::ledger`) never
-        // compares a group key's text — it casts it to the column's native
+        // `GROUP BY` role, because the group basis (`staging::group_basis`)
+        // never compares a group key's text — it casts it to the column's native
         // type, and `inet_in` is permissive enough to parse both spellings
         // back to the identical stored value (`'192.168.1.5'::inet =
         // '192.168.1.5/32'::inet` is `true`, verified live).
@@ -2440,7 +2439,7 @@ pub(crate) fn supported_group_by_key_types() -> String {
 ///   rendering isn't a `1.0`/`1.00` bijection; `boolean`: #119, a second
 ///   `pg_cast`-registered `::text` renderer disagrees with `boolout`). Both
 ///   are safe for this role for reasons specific to it — `boolean`'s
-///   because the ledger (`staging::ledger`) never does the raw-text
+///   because the group basis (`staging::group_basis`) never does the raw-text
 ///   comparison that trips it up elsewhere (issue #119).
 /// * `inet` is admitted here for the identical reason `boolean` is (its own
 ///   `network_show`-vs-`inet_out` split, closed the same way), but stays off
@@ -2707,6 +2706,12 @@ fn infer_expr(
             // just above.
             let aggregate_spec = super::registry::lookup_aggregate_function(name);
             let is_aggregate = aggregate_spec.is_some();
+            // An aggregate outside #1096 decision 1's admitted set is refused
+            // by family, before its argument is typed: the grammar parses
+            // these names only to refuse them.
+            if is_deferred_aggregate_name(name) {
+                check_aggregate_admitted(&name.to_ascii_uppercase(), None)?;
+            }
             let spec = super::registry::lookup_function(name).or(aggregate_spec);
             // An aggregate's argument reads source columns, not aggregate
             // fields (see `aggregate_field_names`).
@@ -3733,108 +3738,6 @@ mod tests {
         assert_eq!(validate(&d, &source_columns), Ok(()));
     }
 
-    /// A plain `KeySpace::Aggregate` field's own `MIN`/`MAX(<enum column>)`
-    /// validates. This is the shape that is always
-    /// [`super::invertibility::Invertibility::RecomputeOnly`] and therefore
-    /// always resolved by a live server-side `min()`/`max()` push-down.
-    #[test]
-    fn min_max_enum_over_a_plain_group_by_column_is_accepted() {
-        let d = aggregate_def(
-            &["tag"],
-            vec![
-                FieldDef {
-                    name: "tag".to_string(),
-                    expr: col("tag"),
-                },
-                FieldDef {
-                    name: "worst".to_string(),
-                    expr: Expr::FunctionCall {
-                        name: "MAX".to_string(),
-                        args: vec![col("priority")],
-                    },
-                },
-            ],
-        );
-        let source_columns = HashMap::from([
-            ("tag".to_string(), ValueType::Numeric),
-            (
-                "priority".to_string(),
-                ValueType::Other(PgType::Enum("enum:public.priority_enum")),
-            ),
-        ]);
-        assert_eq!(validate(&d, &source_columns), Ok(()));
-    }
-
-    /// A plain `KeySpace::Aggregate` field's own `MIN`/`MAX(<text column>)`
-    /// validates: always
-    /// [`super::invertibility::Invertibility::RecomputeOnly`], always
-    /// resolved by a live server-side `min()`/`max()` push-down.
-    #[test]
-    fn min_max_text_over_a_plain_group_by_column_is_accepted() {
-        let d = aggregate_def(
-            &["tag"],
-            vec![
-                FieldDef {
-                    name: "tag".to_string(),
-                    expr: col("tag"),
-                },
-                FieldDef {
-                    name: "worst".to_string(),
-                    expr: Expr::FunctionCall {
-                        name: "MAX".to_string(),
-                        args: vec![col("label")],
-                    },
-                },
-            ],
-        );
-        let source_columns = HashMap::from([
-            ("tag".to_string(), ValueType::Numeric),
-            ("label".to_string(), ValueType::Text),
-        ]);
-        assert_eq!(validate(&d, &source_columns), Ok(()));
-    }
-
-    /// Issue #120: `MIN`/`MAX(<uuid column>)` is refused *unconditionally* —
-    /// checked live rather than assumed, Postgres has no `min(uuid)`/
-    /// `max(uuid)` aggregate at all (the same "opclass but no aggregate"
-    /// shape #114/#116 found for `bytea`/`macaddr`), so
-    /// `registry::aggregate_result_type("MIN"/"MAX", ValueType::Uuid)` is
-    /// `None` and this is an ordinary `FunctionArgTypeMismatch`.
-    #[test]
-    fn min_max_uuid_is_refused_unconditionally() {
-        let d = aggregate_def(
-            &["tag"],
-            vec![
-                FieldDef {
-                    name: "tag".to_string(),
-                    expr: col("tag"),
-                },
-                FieldDef {
-                    name: "worst".to_string(),
-                    expr: Expr::FunctionCall {
-                        name: "MAX".to_string(),
-                        args: vec![col("token")],
-                    },
-                },
-            ],
-        );
-        let source_columns = HashMap::from([
-            ("tag".to_string(), ValueType::Numeric),
-            ("token".to_string(), ValueType::Uuid),
-        ]);
-        let err = validate(&d, &source_columns).unwrap_err();
-        assert_eq!(
-            err,
-            ValidationError::FunctionArgTypeMismatch {
-                field: "worst".to_string(),
-                function: "MAX".to_string(),
-                arg_index: 0,
-                expected: ValueType::Numeric,
-                found: ValueType::Uuid,
-            }
-        );
-    }
-
     /// Issue #120: `COUNT(<column>)` in a `GROUP BY` definition — counting
     /// non-null occurrences of a specific column, unlike `COUNT(*)` — parses
     /// and validates, typed `bigint` (`Integer(Int8)`), matching Postgres's
@@ -4092,21 +3995,6 @@ mod tests {
             }
         );
         assert!(err.to_string().contains("__ledger"), "{err}");
-        // #625 F1: `t__deltas` is `t`'s group-delta table.
-        let err = validate(
-            &parsed("TRANSFORM t__deltas FROM s GROUP BY g SELECT COUNT(*) AS n"),
-            &columns,
-        )
-        .unwrap_err();
-        assert_eq!(
-            err,
-            ValidationError::ReservedTargetSuffix {
-                target: "t__deltas".to_string(),
-                suffix: "__deltas",
-            }
-        );
-        assert!(err.to_string().contains("__deltas"), "{err}");
-
         let longest = "t".repeat(crate::defs::ledger::MAX_TARGET_NAME_LEN);
         assert_eq!(
             validate(
@@ -4279,7 +4167,7 @@ mod tests {
     fn collation_refusing_reads_in_an_aggregate_argument_name_the_source_column() {
         let d = parsed(
             "TRANSFORM t FROM s GROUP BY g SELECT g AS g, SUM(n) AS title, \
-             MAX(strpos(title, 'x')) AS m",
+             SUM(strpos(title, 'x')) AS m",
         );
         assert_eq!(
             collation_refusing_function_reads(&d),
@@ -4294,7 +4182,7 @@ mod tests {
     fn an_aggregate_argument_reads_the_source_column_not_a_field_of_that_name() {
         let d = parsed(
             "TRANSFORM t FROM s GROUP BY grp SELECT grp AS grp, SUM(val) AS val, \
-             COUNT(*) AS row_count, MIN(val) AS lo, MAX(val) AS hi",
+             COUNT(*) AS row_count, SUM(val) AS lo, SUM(val) AS hi",
         );
         let int4 = ValueType::Integer(crate::integer::IntWidth::Int4);
         let source_columns = HashMap::from([
@@ -4303,7 +4191,11 @@ mod tests {
         ]);
         assert_eq!(validate(&d, &source_columns), Ok(()));
         let types = infer_field_types(&d, &source_columns).unwrap();
-        assert_eq!(types["lo"], int4, "MIN of the int4 source column");
+        assert_eq!(
+            types["lo"],
+            ValueType::Integer(crate::integer::IntWidth::Int8),
+            "SUM of the int4 source column"
+        );
         assert_eq!(
             types["val"],
             ValueType::Integer(crate::integer::IntWidth::Int8),
@@ -4317,7 +4209,7 @@ mod tests {
     fn an_aggregate_of_another_aggregate_field_is_rejected() {
         let d = parsed(
             "TRANSFORM t FROM s GROUP BY grp SELECT grp AS grp, SUM(val) AS total, \
-             MAX(total) AS biggest",
+             SUM(total) AS biggest",
         );
         let source_columns = numeric_columns(&["grp", "val"]);
         assert_eq!(
@@ -4330,7 +4222,7 @@ mod tests {
         // Through a field that reads one: `double` is an aggregate too.
         let d = parsed(
             "TRANSFORM t FROM s GROUP BY grp SELECT grp AS grp, SUM(val) AS total, \
-             total + total AS double, MAX(double) AS biggest",
+             total + total AS double, SUM(double) AS biggest",
         );
         assert!(matches!(
             validate(&d, &source_columns),
@@ -4455,7 +4347,7 @@ mod tests {
     fn an_aggregate_field_inside_another_aggregate_is_not_ambiguous() {
         let d = parsed(
             "TRANSFORM t FROM s GROUP BY grp SELECT grp AS grp, SUM(val) AS val, \
-             MIN(val) AS lo, MAX(val) AS hi",
+             SUM(val) AS lo, SUM(val) AS hi",
         );
         assert_eq!(validate(&d, &numeric_columns(&["grp", "val"])), Ok(()));
     }
@@ -4481,15 +4373,19 @@ mod tests {
         ]);
         for text in [
             "TRANSFORM t FROM s GROUP BY grp SELECT grp AS grp, grp AS val, \
-             MIN(s.val) AS lo",
+             SUM(s.val) AS lo",
             "TRANSFORM t FROM app.s GROUP BY grp SELECT grp AS grp, grp AS val, \
-             MIN(app.s.val) AS lo",
+             SUM(app.s.val) AS lo",
         ] {
             let d = parsed(text);
             assert_eq!(validate(&d, &source_columns), Ok(()), "{text}");
             let types = infer_field_types(&d, &source_columns).unwrap();
             assert_eq!(types["val"], ValueType::Text, "{text}");
-            assert_eq!(types["lo"], int4, "MIN of the int4 source column: {text}");
+            assert_eq!(
+                types["lo"],
+                ValueType::Integer(crate::integer::IntWidth::Int8),
+                "SUM of the int4 source column: {text}"
+            );
         }
     }
 

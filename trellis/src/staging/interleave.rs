@@ -3,7 +3,7 @@
 //! "test-util"))`**, like [`crate::plant`] and the pre-commit pause in
 //! [`super::apply`].
 //!
-//! The interleaving tests (`tests/ledger_interleavings.rs`) freeze one drain
+//! The interleaving tests (`tests/one_to_one_ledger_interleavings.rs`) freeze one drain
 //! worker between two steps of its page transaction, do something else (commit
 //! a source write, drain another batch on another worker), then let it go. No
 //! test sleeps or polls for convergence (#297).
@@ -35,23 +35,20 @@
 //! # Where the points sit
 //!
 //! The names are the ledger design's steps (ADR-0002, "Apply" and
-//! "Re-derive"). Every aggregate target is on the ledger since #623 D5
-//! (`super::ledger`) and a 1-1 target since D6 (`super::one_to_one_ledger`):
+//! "Re-derive"). A 1-1 target is on its ledger (`super::one_to_one_ledger`):
 //!
-//! | Point | 1-1 target | Aggregate target |
-//! |---|---|---|
-//! | [`PausePoint::AfterPlaceholders`] | after the placeholder insert, before the entry lock | after the placeholder insert, before the entry lock (each time it is taken) |
-//! | [`PausePoint::AfterEntryLock`] | after the sorted entry lock | after the sorted entry lock |
-//! | [`PausePoint::AfterRederiveRead`] | directly after the one read-and-snapshot statement, when the page re-derives any key | directly after the one read-and-snapshot statement, when the page re-derives any key |
-//! | [`PausePoint::AfterGroupUpsert`] | never reached | after the entries-and-groups statement |
-//! | [`PausePoint::BeforeCommit`] | after the page's last write | after the page's last write |
+//! | Point | 1-1 target |
+//! |---|---|
+//! | [`PausePoint::AfterPlaceholders`] | after the placeholder insert, before the entry lock |
+//! | [`PausePoint::AfterEntryLock`] | after the sorted entry lock |
+//! | [`PausePoint::AfterRederiveRead`] | directly after the one read-and-snapshot statement, when the page re-derives any key |
+//! | [`PausePoint::BeforeCommit`] | after the page's last write |
 //!
-//! An aggregate on the group basis (`super::group_basis`, behind its dev
-//! knob, #1100) fires `AfterEntryLock` after its sorted group lock, before
-//! the statement that reads the groups' bases, `AfterGroupUpsert` after
-//! that statement, and `BeforeCommit`.
+//! An aggregate (`super::group_basis`, #1100) fires `AfterEntryLock` after
+//! its sorted group lock, before the statement that reads the groups' bases,
+//! `AfterGroupUpsert` after that statement, and `BeforeCommit`.
 //!
-//! A `JOIN` target (`super::join`, behind the same knob) fires, in order:
+//! A `JOIN` target (`super::join`) fires, in order:
 //! `BeforeJoinLock` after the pair's lock row, `AfterJoinKeyInsert` after
 //! its `J` insert, `AfterJoinLock` after its sorted `J` lock,
 //! `AfterEntryLock` after its `P` and `M` cell locks, `BeforeJoinTargetLock`
@@ -60,21 +57,13 @@
 //! cell write of a side fires [`PausePoint::AfterJoinCellMatch`] between
 //! its match statement and its write.
 //!
-//! A build chunk (`super::build::run_chunk`, #625 F1) fires the ledger
-//! column's first three points for its target too: `AfterPlaceholders` and
-//! `AfterEntryLock` around the entry lock of the keys that had an entry
-//! (after its insert of the others', #723), and `AfterRederiveRead`
-//! directly after its last read-and-write statement (the entries written
-//! and the deltas appended, uncommitted). Three points are a chunk's alone:
-//! [`PausePoint::BeforeChunkTransaction`], after a claimed chunk is planned
-//! and before its transaction begins (any Re-derive chunk
-//! `super::build::run_rederive` runs, a field build's included),
-//! [`PausePoint::BeforeChunkInsert`], after its read of the keys and before
-//! its insert, and [`PausePoint::AfterChunkSnapshot`], inside the insert,
-//! after its snapshot ([`pause_in_statement`]). The merger
-//! (`super::build::merge_deltas`) fires `AfterGroupUpsert` after its one
-//! statement, holding its claimed delta rows and its groups. A test runs
-//! either inside [`with_scope`] as it would a drain.
+//! A 1-1 build chunk (`super::build::one_to_one::run_chunk`, #625 F8a) fires
+//! `AfterPlaceholders` and `AfterEntryLock` around its entry lock, and
+//! `AfterRederiveRead` directly after its read-and-write statement
+//! (uncommitted). [`PausePoint::BeforeChunkTransaction`] is a chunk's alone:
+//! after a claimed chunk is planned and before its transaction begins (any
+//! Re-derive chunk `super::build::run_rederive` runs, a field build's
+//! included). A test runs either inside [`with_scope`] as it would a drain.
 //!
 //! A key release (`super::quarantine::release_key`) fires
 //! [`PausePoint::BeforeReleaseCommit`] for the key's table after its last
@@ -166,11 +155,10 @@
 //! never what any step does, so a correct engine converges under it.
 //!
 //! It applies wherever the table above puts those two points, on purpose: a
-//! 1-1 page, a ledger page, another aggregate target's page (at its group
-//! pre-lock) and a build chunk alike. A busy worker is slow at whatever page
-//! it is running, and a chunk racing a 1-1 page, or a ledger page racing an
-//! old-path page of the same burst, needs that page held as much as one on
-//! its own path does.
+//! 1-1 page, an aggregate target's page (at its group lock) and a build
+//! chunk alike. A busy worker is slow at whatever page it is running, and a
+//! chunk racing a 1-1 page needs that page held as much as one on its own
+//! path does.
 //!
 //! A group-basis build or rebuild stalls the same way between its
 //! enumeration and its lock statement ([`PausePoint::AfterRebuildEnumerate`],
@@ -202,10 +190,10 @@ use tokio_postgres::GenericClient;
 /// See the module doc for where each sits today.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PausePoint {
-    /// After a ledger target's placeholder insert, before its entry lock
+    /// After a 1-1 target's placeholder insert, before its entry lock
     /// (#623 D7): where a tombstone the insert found can be collected.
     AfterPlaceholders,
-    /// After the page has locked the entries (off the ledger, the group
+    /// After the page has locked the entries (on an aggregate, the group
     /// rows; on a `JOIN`, its `P` and `M` cells) it will write.
     AfterEntryLock,
     /// On a `JOIN` target (`super::join`), at the start of a build's write
@@ -238,7 +226,7 @@ pub enum PausePoint {
     /// On a `JOIN` target, after the page applied its `P` and `M` changes and
     /// locked the `T` groups their product changes, before it writes them.
     AfterJoinTargetLock,
-    /// After a Re-derive's live read of the source (off the ledger, a
+    /// After a Re-derive's live read of the source (on a 1-1 ledger, a
     /// forced group recompute).
     AfterRederiveRead,
     /// After a claimed build chunk is planned, before its transaction
@@ -246,12 +234,6 @@ pub enum PausePoint {
     /// definition, its fields and the range's keys, and holds no lock and
     /// no transaction id, so the ring seals and drains around it.
     BeforeChunkTransaction,
-    /// After a build chunk's read of its keys, before its insert of the
-    /// entries of those that have none (#723).
-    BeforeChunkInsert,
-    /// Inside a build chunk's insert of its new keys' entries, after the
-    /// statement's snapshot and before its first insert (#723).
-    AfterChunkSnapshot,
     /// After the page's group increments (aggregate targets only).
     AfterGroupUpsert,
     /// After every write the page makes, just before it commits.
@@ -564,40 +546,6 @@ pub(crate) async fn pause_between_transactions<C: GenericClient>(
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-}
-
-/// The in-statement hook, for a point inside one statement
-/// ([`PausePoint::AfterChunkSnapshot`]): unless the running task's
-/// [`PauseScope`] armed `point` for `target`, `None`. When it is armed, it
-/// lifts `client`'s `lock_timeout` for the rest of the transaction, reports
-/// [`Reached`] and returns the lock key, which the caller's statement then
-/// waits on (`pg_advisory_xact_lock_shared`). The caller sets the timeout it
-/// wants back after the statement.
-///
-/// [`Reached`] is sent before the statement starts, so a test that needs the
-/// statement's snapshot taken waits until the backend is queued on the lock
-/// (`pg_blocking_pids`).
-pub(crate) async fn pause_in_statement<C: GenericClient>(
-    client: &C,
-    point: PausePoint,
-    target: &str,
-) -> Result<Option<i64>, tokio_postgres::Error> {
-    let Some(arming) = SCOPE
-        .try_with(|scope| scope.take(point, target))
-        .ok()
-        .flatten()
-    else {
-        return Ok(None);
-    };
-    let backend_pid: i32 = client
-        .query_one("select pg_backend_pid()", &[])
-        .await?
-        .get(0);
-    client
-        .execute("select set_config('lock_timeout', '0', true)", &[])
-        .await?;
-    let _ = arming.reached.send(Reached { point, backend_pid });
-    Ok(Some(arming.lock_key))
 }
 
 #[cfg(test)]

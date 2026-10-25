@@ -7,8 +7,7 @@
 //! `numeric` makes. Trellis's copy of it becomes an unconstrained `numeric`,
 //! which a group-basis `SUM`/`AVG` or a `JOIN`'s define refuses over a column
 //! of a table Trellis creates (#1096 decision 2, ADR-0020, #1120). The
-//! readers are group-basis aggregates (the group-basis dev knob is on for
-//! this binary). Every step is a bounded, explicit pass or drain; nothing
+//! readers are group-basis aggregates. Every step is a bounded, explicit pass or drain; nothing
 //! polls for convergence (#297). The one wait, in the lock-order test, is for
 //! a backend to block on a lock.
 
@@ -164,7 +163,6 @@ async fn bring_live(raw: &mut Client, pool: &trellis::Pool, targets: &[&str]) {
 /// - `cnt`: `COUNT(p)` per `g` (valid over any type);
 /// - `c`: a 1-1 passthrough of `p` (valid; #828's copies are its business).
 async fn setup(dsn: &str, raw: &mut Client, pool: &trellis::Pool) -> Trellis {
-    trellis::dev::staging::set_group_basis(true);
     raw.batch_execute(
         "create table public.src (id int primary key, g int, price int); \
         ",
@@ -403,7 +401,6 @@ async fn a_chained_resume_retype_pauses_the_reader_define_would_refuse() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
-    trellis::dev::staging::set_group_basis(true);
     raw.batch_execute("create table public.src (id int primary key, g int, price int)")
         .await
         .expect("tables");
@@ -465,7 +462,6 @@ async fn a_source_retype_to_unscaled_numeric_pauses_its_sum_readers() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
-    trellis::dev::staging::set_group_basis(true);
     raw.batch_execute(
         "create table public.src (id int primary key, g int, price numeric(10,2)); \
          create table public.o (id int primary key, g int)",
@@ -504,6 +500,78 @@ async fn a_source_retype_to_unscaled_numeric_pauses_its_sum_readers() {
             "{reader} reads a source: not the chained refusal: {error}"
         );
     }
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// #703's narrowed R1 after an unscaled re-type: the paused reader's
+/// `RESUME` refuses with define's refusal while the column has no scale.
+#[tokio::test]
+async fn a_resume_refuses_a_sum_over_a_column_re_typed_to_unscaled_numeric() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute("create table public.src (id int primary key, g int, price numeric(10,2))")
+        .await
+        .expect("table");
+    let trellis = definer(db.dsn()).await;
+    trellis
+        .apply(
+            "TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX \
+             SELECT SUM(price) AS total",
+        )
+        .await
+        .expect("define agg");
+    bring_live(&mut raw, &db.pool, &["agg"]).await;
+
+    raw.batch_execute("alter table public.src alter column price type numeric")
+        .await
+        .expect("widen the source");
+    full_pass(&mut raw, &db.pool).await;
+    assert_eq!(status(&raw, "agg").await, TransformStatus::Paused);
+
+    match trellis.apply("RESUME TRANSFORM agg").await {
+        Err(err) => assert!(err.to_string().contains("no declared scale"), "{err}"),
+        Ok(applied) => panic!("the resume should be refused: {applied:?}"),
+    }
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// #703's narrowed R1 for a change between two declared scales: a `SUM`
+/// over `numeric(10,2)` re-typed to `numeric(12,4)` pauses nothing, and the
+/// capture pass rebuilds the aggregate on its own, whose total is still the
+/// source's sum.
+#[tokio::test]
+async fn a_scale_change_between_two_declared_scales_rebuilds_the_sum_reader() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.src (id int primary key, g int, price numeric(10,2)); \
+         insert into public.src values (1, 1, 1.25), (2, 1, 2.50)",
+    )
+    .await
+    .expect("table");
+    let trellis = definer(db.dsn()).await;
+    trellis
+        .apply(
+            "TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX \
+             SELECT SUM(price) AS total",
+        )
+        .await
+        .expect("define agg");
+    bring_live(&mut raw, &db.pool, &["agg"]).await;
+
+    raw.batch_execute("alter table public.src alter column price type numeric(12,4)")
+        .await
+        .expect("re-scale the source");
+    bring_live(&mut raw, &db.pool, &["agg"]).await;
+    assert_eq!(status(&raw, "agg").await, TransformStatus::Live);
+    let total: String = raw
+        .query_one("select total::text from public.agg where g = 1", &[])
+        .await
+        .expect("read the total")
+        .get(0);
+    assert_eq!(total, "3.75");
     trellis.shutdown().await.expect("shutdown");
 }
 
@@ -546,7 +614,6 @@ async fn a_source_retype_to_a_float_pauses_its_sum_reader_and_the_resume_refuses
 /// so the alter is accepted and the `JOIN` is untouched.
 #[tokio::test]
 async fn an_alter_that_keeps_a_join_key_pair_valid_is_accepted() {
-    trellis::dev::staging::set_group_basis(true);
     let int4 = ValueType::Integer(IntWidth::Int4);
     let d = Driver::start(
         "create table public.src (id int primary key, g int, name varchar(10)); \

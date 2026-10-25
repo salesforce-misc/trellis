@@ -3,9 +3,9 @@
 //! staged under the old key are discarded by the resume, never decoded
 //! against the new one, and the rebuild reads the table now at the name.
 //!
-//! The per-row ledger aggregate and the 1-1 target; the group basis and a
-//! `JOIN` are in `group_basis_resume_after_source_key_change.rs`, since its
-//! knob is process-wide. Every pass, build and drain is stepped by hand.
+//! The aggregate and the 1-1 target; a `JOIN` is in
+//! `group_basis_resume_after_source_key_change.rs`. Every pass, build and
+//! drain is stepped by hand.
 //! Nothing polls for convergence (#297).
 
 #[path = "support/resume_passes.rs"]
@@ -187,11 +187,12 @@ async fn an_aggregate_resumes_onto_its_source_converted_to_a_partitioned_table()
     assert_eq!(rows(&raw, SUMS_ACTUAL).await, rows(&raw, SUMS_ORACLE).await);
 }
 
-/// A ledger holding more live entries than one retire statement takes
-/// (`build::retire_ledger`'s batches of 10,000): every batch is retired, so
-/// no old group survives into the rebuilt target.
+/// An aggregate whose target holds 500 groups over 25,001 source rows when
+/// its source is dropped and created again with two groups: the resume's
+/// rebuild removes every group the new table lacks, so no old group survives
+/// into the rebuilt target.
 #[tokio::test]
-async fn an_aggregate_resumes_onto_a_wider_key_over_a_ledger_of_several_retire_batches() {
+async fn an_aggregate_of_many_groups_resumes_onto_a_wider_key() {
     let cluster = TestCluster::start();
     let (db, mut raw, trellis) = setup(
         &cluster,

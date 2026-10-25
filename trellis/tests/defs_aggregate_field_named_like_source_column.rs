@@ -11,7 +11,8 @@ use std::time::Duration;
 use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::defs::{ValueType, chunk_queue, install_definition};
+use trellis::defs::validate::ValidationError;
+use trellis::defs::{CatalogError, ValueType, chunk_queue, install_definition};
 use trellis::intake::markers;
 use trellis::integer::IntWidth;
 use trellis::staging::{has_pending, retire_drained_segments};
@@ -182,15 +183,101 @@ async fn an_aggregate_of_another_aggregate_field_is_refused_at_define() {
     let err = install_definition(
         &db.pool,
         "TRANSFORM nested FROM public.agg_src GROUP BY grp \
-        WITHOUT SOURCE INDEX SELECT grp AS grp, SUM(val) AS total, MAX(total) AS biggest",
+        WITHOUT SOURCE INDEX SELECT grp AS grp, SUM(val) AS total, SUM(total) AS biggest",
         &source_columns(),
         "public",
     )
     .await
-    .expect_err("MAX(total) would nest SUM inside MAX");
+    .expect_err("SUM(total) would nest SUM inside SUM");
     let message = err.to_string();
     assert!(
         message.contains("biggest") && message.contains("total"),
         "the refusal names the field and what it aggregates: {message}"
     );
+}
+
+/// #1096 decision 1: a plain aggregate outside the admitted set is refused at
+/// define by family, with nothing left behind: no target, no hidden table, no
+/// definition row. The float and unconstrained-`numeric` refusals read the
+/// live column, so they come from define's transaction, not the text.
+#[tokio::test]
+async fn a_plain_aggregate_outside_the_admitted_set_is_refused_at_define_by_family() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+    client
+        .batch_execute(
+            "create table public.agg_src (id integer primary key, grp text, val integer, \
+             f double precision, n numeric, ok boolean)",
+        )
+        .await
+        .expect("create agg_src");
+    let mut columns = source_columns();
+    columns.insert(
+        "f".to_string(),
+        ValueType::Float(trellis::float::FloatWidth::Float8),
+    );
+    columns.insert("n".to_string(), ValueType::Numeric);
+    columns.insert("ok".to_string(), ValueType::Boolean);
+
+    for (field, want) in [
+        ("MIN(val)", Some(1117)),
+        ("MAX(grp)", Some(1117)),
+        ("BOOL_AND(ok)", Some(1118)),
+        ("ARRAY_AGG(val)", Some(1040)),
+        ("SUM(f)", Some(1119)),
+        ("AVG(f)", Some(1119)),
+        ("SUM(n)", None),
+        ("SUM(val) + MAX(val)", Some(1117)),
+    ] {
+        let err = install_definition(
+            &db.pool,
+            &format!(
+                "TRANSFORM refused FROM public.agg_src GROUP BY grp \
+                 WITHOUT SOURCE INDEX SELECT grp AS grp, {field} AS x"
+            ),
+            &columns,
+            "public",
+        )
+        .await
+        .expect_err(field);
+        match want {
+            Some(issue) => assert!(
+                matches!(
+                    &err,
+                    CatalogError::Validate(ValidationError::DeferredAggregate { issue: i, .. })
+                        if *i == issue
+                ),
+                "{field}: {err:?}"
+            ),
+            None => assert!(
+                matches!(
+                    &err,
+                    CatalogError::Validate(ValidationError::UnconstrainedNumericAggregate { .. })
+                ),
+                "{field}: {err:?}"
+            ),
+        }
+        let left: (bool, i64, i64) = {
+            let row = client
+                .query_one(
+                    &format!(
+                        "select to_regclass('public.refused') is not null, \
+                         (select count(*) from {DEFAULT_SCHEMA}.transform_definitions), \
+                         (select count(*) from pg_catalog.pg_class c \
+                          join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
+                          where n.nspname = '{DEFAULT_SCHEMA}' and c.relname like 'agg\\_%')"
+                    ),
+                    &[],
+                )
+                .await
+                .expect("look for leftovers");
+            (row.get(0), row.get(1), row.get(2))
+        };
+        assert_eq!(
+            left,
+            (false, 0, 0),
+            "{field}: a refusal leaves nothing behind"
+        );
+    }
 }

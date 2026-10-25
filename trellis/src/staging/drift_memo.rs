@@ -15,9 +15,8 @@
 //!
 //! 1. the definition, its source and target (the *context*); and
 //! 2. the catalog state of every relation the comparison reads
-//!    ([`crate::defs::copies::inputs`]): the source, the target and, for an
-//!    aggregate, its ledger and group-delta table, and, for a `JOIN`, its
-//!    joined table and its hidden tables.
+//!    ([`crate::defs::copies::inputs`]): the source, the target and, for a
+//!    `JOIN`, its joined table and its hidden tables.
 //!
 //! The *stamp* of a definition is its context and the [`fingerprint`] of each
 //! of those relations. A fingerprint covers the relation's oid (a dropped and
@@ -132,7 +131,6 @@ impl Fingerprints {
 fn inputs_of(schema: &str, reader: &CaptureReader) -> Vec<String> {
     copies::inputs(
         schema,
-        &reader.def,
         &reader.source,
         &reader.target,
         reader.join.as_deref().map(|joined| (reader.id, joined)),

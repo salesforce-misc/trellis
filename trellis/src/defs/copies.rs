@@ -6,9 +6,9 @@
 //! - a 1-1 target's key columns, typed as the source key's
 //!   ([`super::ddl::target_table_ddl`]), and its bare passthrough fields,
 //!   typed as the source column they copy (#45);
-//! - an aggregate target's `GROUP BY` columns, and the same columns of its
-//!   ledger and its group-delta table, typed as the key's value family
-//!   ([`super::ddl::pg_type_name`]: `integer`, `bigint`, `text`, `numeric`);
+//! - an aggregate target's `GROUP BY` columns, typed as the key's value
+//!   family ([`super::ddl::pg_type_name`]: `integer`, `bigint`, `text`,
+//!   `numeric`);
 //! - a `JOIN` target's `GROUP BY` columns, and the same columns of its
 //!   hidden `T` table, typed as the column of the side each comes from, and
 //!   each side's hidden partials table's `GROUP BY` and join-key columns and
@@ -20,9 +20,7 @@
 //! source's column types:
 //!
 //! - a 1-1 target's calculated field (`qty + 1`);
-//! - an aggregate or `JOIN` target's field column (`SUM(qty)`, `MIN(qty)`);
-//! - an aggregate ledger's contribution column, typed as the aggregate's
-//!   argument ([`super::ledger::contribution_pg_type`]).
+//! - an aggregate or `JOIN` target's field column (`SUM(qty)`, `COUNT(*)`).
 //!
 //! A copy has its source column's type with no type modifier, and the
 //! column's collation (ADR-0020, [`super::copy_type`]): a `numeric(10,2)` is
@@ -53,7 +51,7 @@
 //! runs it for a definition only when a table it reads has changed since a
 //! comparison found every column current (`staging::drift_memo`, [`inputs`]).
 //!
-//! The ledger's `__from_key` is always `text`, and an aggregate's or a
+//! The 1-1 ledger's `__from_key` is always `text`, and an aggregate's or a
 //! `JOIN`'s hidden partials (`numeric` sums, `bigint` counts) have fixed
 //! types, so none of them is checked.
 
@@ -74,16 +72,10 @@ pub(crate) enum CopyKind {
     Passthrough,
     /// An aggregate target's `GROUP BY` column.
     GroupBy,
-    /// The same column of the aggregate's ledger.
-    LedgerGroup,
-    /// The same column of the aggregate's group-delta table.
-    DeltasGroup,
     /// A 1-1 target's calculated field, typed by its expression.
     Field,
     /// An aggregate target's field column, typed by its expression.
     AggregateField,
-    /// An aggregate ledger's contribution column, typed as its argument.
-    Contribution,
     /// A `JOIN` target's `GROUP BY` column, typed as its side's column.
     JoinGroupBy,
     /// A `JOIN`'s hidden-table column (`P`, `M`, `J` or `T`), typed as the
@@ -100,28 +92,20 @@ impl CopyKind {
         self == CopyKind::JoinHidden
     }
 
-    /// Whether the copy is a key of its table's rows: a target's, a
-    /// ledger's or a group-delta table's `GROUP BY` column, or a 1-1
-    /// target's key. Such a column can't be
+    /// Whether the copy is a key of its table's rows: a target's `GROUP BY`
+    /// column, or a 1-1 target's key. Such a column can't be
     /// nulled in place ([`retype_statements`]).
     fn is_key(self) -> bool {
         matches!(
             self,
-            CopyKind::TargetKey
-                | CopyKind::GroupBy
-                | CopyKind::LedgerGroup
-                | CopyKind::DeltasGroup
-                | CopyKind::JoinGroupBy
+            CopyKind::TargetKey | CopyKind::GroupBy | CopyKind::JoinGroupBy
         )
     }
 
     /// Whether the copy is typed as its source column's value family
     /// ([`super::ddl::pg_type_name`]) rather than as the column itself.
     fn by_family(self) -> bool {
-        matches!(
-            self,
-            CopyKind::GroupBy | CopyKind::LedgerGroup | CopyKind::DeltasGroup
-        )
+        self == CopyKind::GroupBy
     }
 }
 
@@ -174,7 +158,6 @@ pub(crate) async fn typed_copies(
     source: &str,
     target: &str,
 ) -> Result<Vec<TypedCopy>, tokio_postgres::Error> {
-    let (target_schema, target_bare) = target.split_once('.').unwrap_or(("", target));
     let quoted_target = super::ddl::qualified_target_table_ident(target);
     let mut copies = Vec::new();
     let copy =
@@ -232,26 +215,16 @@ pub(crate) async fn typed_copies(
             }
         }
         KeySpace::Aggregate { group_by } => {
-            let ledger_bare = super::ledger::ledger_table_name(target_bare);
-            let deltas_bare = super::ledger::deltas_table_name(target_bare);
-            let tables = [
-                (CopyKind::GroupBy, quoted_target.clone(), target.to_string()),
-                (
-                    CopyKind::LedgerGroup,
-                    super::ledger::qualified_ledger_table(target_schema, target_bare),
-                    format!("{target_schema}.{ledger_bare}"),
-                ),
-                (
-                    CopyKind::DeltasGroup,
-                    super::ledger::qualified_deltas_table(target_schema, target_bare),
-                    format!("{target_schema}.{deltas_bare}"),
-                ),
-            ];
             for key in group_by {
                 let column = key.as_str();
-                for (kind, table, table_name) in &tables {
-                    copies.push(copy(*kind, table, table_name, column, source, column));
-                }
+                copies.push(copy(
+                    CopyKind::GroupBy,
+                    &quoted_target,
+                    target,
+                    column,
+                    source,
+                    column,
+                ));
             }
         }
     }
@@ -387,16 +360,15 @@ async fn join_copies(
 
 /// Every relation [`typed_copies`] and [`inspect`] read for `def`, which
 /// reads `source` (qualified) into `target` (qualified), as SQL resolves
-/// them (`to_regclass` text): the source, the target and, for an aggregate,
-/// its ledger and group-delta table. For a `JOIN`, `join` is its definition id and its joined table
-/// (qualified), which adds that table and the hidden tables.
+/// them (`to_regclass` text): the source and the target. For a `JOIN`, `join`
+/// is its definition id and its joined table (qualified), which adds that
+/// table and the hidden tables.
 /// A superset of the tables the copies are in and read from: the capture
 /// pass fingerprints these to skip the comparison while none changed
 /// (`staging::drift_memo`, #858). A table `typed_copies` starts reading
 /// belongs here.
 pub(crate) fn inputs(
     schema: &str,
-    def: &TransformDef,
     source: &str,
     target: &str,
     join: Option<(i64, &str)>,
@@ -413,25 +385,13 @@ pub(crate) fn inputs(
                 .map(|table| format!("{}.{}", quote_ident(schema), quote_ident(&table.name(id)))),
         );
     }
-    if matches!(def.key_space, KeySpace::Aggregate { .. }) {
-        let (target_schema, target_bare) = target.split_once('.').unwrap_or(("", target));
-        names.push(super::ledger::qualified_ledger_table(
-            target_schema,
-            target_bare,
-        ));
-        names.push(super::ledger::qualified_deltas_table(
-            target_schema,
-            target_bare,
-        ));
-    }
     names.sort();
     names.dedup();
     names
 }
 
-/// The columns of `def`'s target and ledger typed by an expression
-/// ([`CopyKind::Field`], [`CopyKind::AggregateField`],
-/// [`CopyKind::Contribution`]), each with the type define's inference gives
+/// The columns of `def`'s target typed by an expression
+/// ([`CopyKind::Field`], [`CopyKind::AggregateField`]), each with the type define's inference gives
 /// it from the live schema: the same inference, over the same source column
 /// types, that define created it with
 /// ([`super::ddl::target_table_ddl`], [`super::ddl::aggregate_target_table_ddl`]).
@@ -456,7 +416,6 @@ async fn inferred_copies(
     let Ok(substituted) = super::backfill::substituted_field_exprs(def) else {
         return Ok(Vec::new());
     };
-    let (target_schema, target_bare) = target.split_once('.').unwrap_or(("", target));
     let quoted_target = super::ddl::qualified_target_table_ident(target);
     let reads = |expr: &Expr| {
         let mut out = Vec::new();
@@ -522,26 +481,6 @@ async fn inferred_copies(
                     &field.name,
                     reads(expr),
                     field_type(&field.name),
-                );
-            }
-            let ledger = super::ledger::qualified_ledger_table(target_schema, target_bare);
-            let ledger_name = format!(
-                "{target_schema}.{}",
-                super::ledger::ledger_table_name(target_bare)
-            );
-            for contribution in super::ledger::contributions(&def.fields, group_by, &substituted) {
-                let Ok(value_type) =
-                    super::validate::infer_expr_type(&contribution.arg, &source_columns)
-                else {
-                    continue;
-                };
-                push(
-                    CopyKind::Contribution,
-                    &ledger,
-                    &ledger_name,
-                    &contribution.column,
-                    reads(&contribution.arg),
-                    super::ledger::contribution_pg_type(value_type),
                 );
             }
         }
@@ -837,10 +776,8 @@ pub(crate) async fn describe(
 /// `alter table … alter column … type … using …`, which takes `ACCESS
 /// EXCLUSIVE` on the table and rewrites it when the change isn't
 /// binary-compatible (`integer` to `bigint`; a `numeric` precision widening
-/// at the same scale only changes the catalog). A group-delta table's partition column is
-/// generated from its `GROUP BY` columns, so it is generated again
-/// ([`super::ledger::deltas_retype_sql`]). Each comes with the labels of the
-/// copies it re-types, for messages. Empty when nothing drifted.
+/// at the same scale only changes the catalog). Each comes with the labels of
+/// the copies it re-types, for messages. Empty when nothing drifted.
 ///
 /// A copy re-typed from one enum to another casts no stored value
 /// ([`CopyState::discards_values`], #1327): it is re-typed `using null`,
@@ -892,20 +829,7 @@ pub(crate) fn retype_statements(states: &[CopyState]) -> Vec<(String, Vec<String
                     discarded_keys.join(" or ")
                 )
             };
-            let sql = if drifted[0].copy.kind == CopyKind::DeltasGroup {
-                let group_columns: Vec<super::ledger::LedgerColumn> = states
-                    .iter()
-                    .filter(|s| s.copy.table == table)
-                    .map(|s| super::ledger::LedgerColumn {
-                        name: s.copy.column.clone(),
-                        pg_type: s.live_type.sql.clone(),
-                        collation: None,
-                    })
-                    .collect();
-                super::ledger::deltas_retype_sql(table, &group_columns, &alter)
-            } else {
-                format!("alter table {table} {alter}")
-            };
+            let sql = format!("alter table {table} {alter}");
             let sql = format!("{delete}{sql}");
             (sql, drifted.iter().map(|s| s.copy.label()).collect())
         })
@@ -983,46 +907,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_delta_table_generates_its_partition_again() {
-        let states = [
-            state(
-                CopyKind::DeltasGroup,
-                "\"public\".\"t__deltas\"",
-                "g",
-                "integer",
-                "bigint",
-            ),
-            state(
-                CopyKind::DeltasGroup,
-                "\"public\".\"t__deltas\"",
-                "h",
-                "bigint",
-                "bigint",
-            ),
-        ];
-        let statements = retype_statements(&states);
-        assert_eq!(statements.len(), 1);
-        let sql = &statements[0].0;
-        assert!(
-            sql.starts_with("alter table \"public\".\"t__deltas\" drop column \"__part\";"),
-            "{sql}"
-        );
-        assert!(
-            sql.contains("alter column \"g\" type bigint using \"g\"::bigint;"),
-            "{sql}"
-        );
-        assert!(
-            sql.contains("hash_record_extended(row(\"g\", \"h\"), 0)"),
-            "{sql}"
-        );
-        assert!(sql.ends_with("(\"__part\", \"__seq\")"), "{sql}");
-    }
-
-    /// #1327: a copy re-typed from one enum to another casts no stored
-    /// label. A passthrough is re-typed `using null`; a key's rows with a
-    /// value are deleted first, in the same batch, and a `NULL` group keeps
-    /// its row. A non-enum copy beside them is still cast.
     #[test]
     fn a_re_type_between_enums_discards_the_values_and_a_key_s_rows() {
         let as_enum = |mut s: CopyState, from: (&str, u32), to: (&str, u32)| {
@@ -1113,17 +997,10 @@ mod tests {
                 "bigint",
             ),
             state(
-                CopyKind::Contribution,
-                "\"public\".\"t__ledger\"",
-                "__arg0",
+                CopyKind::Field,
+                "\"public\".\"u\"",
+                "label",
                 "integer",
-                "bigint",
-            ),
-            state(
-                CopyKind::Contribution,
-                "\"public\".\"t__ledger\"",
-                "__arg1",
-                "bigint",
                 "bigint",
             ),
         ];
@@ -1137,10 +1014,10 @@ mod tests {
                     vec!["public.t.least".to_string()],
                 ),
                 (
-                    "alter table \"public\".\"t__ledger\" alter column \"__arg0\" type bigint \
-                     using \"__arg0\"::bigint"
+                    "alter table \"public\".\"u\" alter column \"label\" type bigint \
+                     using \"label\"::bigint"
                         .to_string(),
-                    vec!["public.t__ledger.__arg0".to_string()],
+                    vec!["public.u.label".to_string()],
                 ),
             ]
         );

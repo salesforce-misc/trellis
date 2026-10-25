@@ -146,10 +146,11 @@ shape:
 
 * `GROUP BY <col1>[, <col2>...]` produces a `KeySpace::Aggregate` whose
   calculated fields may reference a grouping column directly or wrap any other
-  column in exactly one of `SUM`, `MIN`, `MAX`, `AVG` (`MIN`/`MAX` accept any type Postgres itself has a
-  `min`/`max` aggregate for — `text`/`varchar` yes, `uuid` no, despite having a
-  full btree opclass; see `docs/type-support.md`), resolved against a
-  separate aggregate-function registry. `COUNT(*)` and
+  column in `SUM` or `AVG` (over an integer or `numeric(p,s)`; see
+  `docs/type-support.md`), resolved against a separate aggregate-function
+  registry. The grammar also parses `MIN`, `MAX`, `bool_*`, `bit_*`,
+  `array_agg`, `string_agg` and `jsonb_agg`, only so define can refuse them by
+  family ([ADR-0002](0002-async-data-flow.md)). `COUNT(*)` and
   `COUNT(<expr>)` (counts non-null occurrences of `<expr>`, a
   different Postgres semantic from `COUNT(*)`) are both supported.
 * `FROM <a> <join> <b> ON <cond>`, with a required `GROUP BY`, makes a JOIN

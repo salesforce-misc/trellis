@@ -9,7 +9,7 @@ concurrent definition changes.
 **The guarantee:** *a non-idempotent effect — an aggregate delta — is applied
 exactly once. Never twice, never zero times.* It rests on one transaction and
 one per-key record: a batch's writes commit with its drained mark, and a group
-moves by exactly what its keys' ledger entries move, in the same statement.
+moves by exactly the changes its basis hasn't counted, in the same statement.
 
 ## The three phases
 
@@ -40,7 +40,7 @@ sequenceDiagram
     W->>DB: BEGIN
     W->>DB: 1. version fence (FOR SHARE on each computed source)
     W->>DB: 2. derived writes, gone-key deletes, truncate handling<br/>(1-1: sorted entry lock + I2 test)
-    W->>DB: 3. aggregate ledgers (sorted entry lock, I2 test, group increments)
+    W->>DB: 3. aggregate groups (sorted group lock, basis test, partial increments)
     W->>DB: 4. downstream staging — into the ACTIVE batch
     W->>DB: 5. last page: mark this claim's buckets drained<br/>earlier page: check the claim, advance the cursor
     W->>DB: 6. pg_notify (the instance's wake channel)
@@ -64,7 +64,7 @@ move under you, which the version fence and the immutable batch exist to handle.
 ## The exactly-once argument
 
 Three properties give it. The first two are structural; the third is the
-ledger entry, which every write to a group moves in the same statement.
+group's basis, which every write to a group moves in the same statement.
 
 ### 1. The claimed batch is immutable
 
@@ -144,22 +144,23 @@ ON CONFLICT (seg_seq, bucket) DO UPDATE SET ...;
 - A key never splits inside a segment (pages are key ranges), so the fold's rules
   below hold per page unchanged.
 
-### 3. A group moves by its entries' moves
+### 3. A group moves by the changes its basis hasn't counted
 
-Within one batch, N changes to a key fold to one record carrying the *latest*
-post-image. A page writes that record into the key's ledger entry and, in the
-same statement, adds the entry's move (from the state it held to the state it
-now holds) to the group's increments
-([below](#aggregate-groups-the-ledger)). The entry is the key's last-applied
-state, so what a page subtracts is **exactly what the entry's last write
-added**, whichever batch that came from.
+A group-basis aggregate keeps no per-key record. Each group has a **basis**
+(the snapshot of the last absolute write to it: a build's, a rebuild's or a
+recompute's) and a **stamp**. A page takes the ring's rows for each key
+unfolded, each with its old and new image, and for every change adds the
+difference between the contribution of its new image and of its old one to
+the group's partials. It adds a change only if its transaction is not visible
+in the group's basis, so the write that took the basis (which read the source
+in its own snapshot) and the page never both count it, and only above the
+target's truncate floor. A page holds a group's lock from its lock statement
+to its commit, so the basis it tests is one no other page is about to change.
 
-The moves telescope: a group row, plus any of its increments a Re-derive build
-has queued and not yet merged ([below](#aggregate-groups-the-ledger)), is always
-the sum of its live members' entries. With no build running, the group row alone
-is.
-A change the entry's I2 test refuses moves nothing, so a batch draining after a
-newer one for the same key adds nothing twice.
+So a group's partials are the contributions of the source rows its basis saw
+plus the changes that came after, each counted once, whichever batch or page
+it came from ([below](#aggregate-groups-the-group-basis)). A batch draining
+after a newer one for the same key adds nothing twice.
 
 ## Absolute writes do not commute: the 1-1 ledger
 
@@ -170,14 +171,15 @@ table:
 
 | Write kind | Commutes? | Idempotent? | What makes an out-of-order drain safe |
 |---|---|---|---|
-| Aggregate group increments (`+new − old`, per entry) | yes | **no** | exactly-once (the three properties above), and the entry's I2 test |
-| Aggregate entry writes, from an image or a Re-derive read | **no** | yes | the ledger's entry lock and I2 test, below |
+| Aggregate group increments (`+new − old`, per change) | yes | **no** | exactly-once (the three properties above), and the group's basis test |
+| Aggregate absolute writes (a build's or a recompute's `GROUP BY`) | **no** | yes | the group lock and the basis, below |
 | 1-1 field writes and deletes, from an image or a Re-derive read | **no** | yes | the 1-1 ledger's entry lock and I2 test, below |
 | Truncate | no | yes | the drain barrier (full serialization) |
 
-I2 is one test, shared by both ledgers: an Apply changes its entry only if its
+I2 is one test on a 1-1 ledger: an Apply changes its entry only if its
 source transaction is not visible in the entry's `__basis`, its `lsn` is above
-`__applied_lsn`, and its `lsn` is above the target's truncate floor.
+`__applied_lsn`, and its `lsn` is above the target's truncate floor. An
+aggregate's group applies the same test against the group's basis.
 
 A 1-1 write is an absolute value: "set this key's row to `f(row)`". Two such writes
 for one key in two batches don't commute. If the batch computed from the older
@@ -257,11 +259,11 @@ rows from one snapshot, leaving the entries as they are.
 
 ### The ledger
 
-ADR-0002 gives every target a per-key ledger. Apply maintains it for every
-aggregate target (`staging::ledger`, next section) and every 1-1 target
-(`staging::one_to_one_ledger`, [above](#absolute-writes-do-not-commute-the-1-1-ledger)).
+ADR-0002 gives every 1-1 target a per-key ledger. Apply maintains it
+(`staging::one_to_one_ledger`,
+[above](#absolute-writes-do-not-commute-the-1-1-ledger)).
 
-Every target has one, `<target>__ledger` in the target's schema, created in the
+Every 1-1 target has one, `<target>__ledger` in the target's schema, created in the
 registration transaction and dropped with the target (`defs::ledger`). It holds
 one entry per source key (`__from_key`, in the ring's `key` encoding) with the
 ordering state apply will judge a change against:
@@ -277,169 +279,69 @@ ordering state apply will judge a change against:
   visible in it is already counted.
 - `__tombstone`: whether the key's last applied change deleted it.
 
-An aggregate target's entries also hold:
-
-- the row's `GROUP BY` values, typed as the target's;
-- `__member`;
-- one column per distinct aggregate argument (`__arg0`, …), holding the
-  argument's value, with the argument's collation when it is text;
-
-Every group row is then a pure function of its live members' entries: `SUM(x)`
-is `sum(__argN)` over them, its hidden count `count(__argN)`, `COUNT(*)` the
-entry count, and so on. The group row carries that count as `__trellis_members`.
 A 1-1 target's ledger holds only the key and the ordering state, because the
-target row holds the values.
+target row holds the values. It is keyed by `__from_key` and indexes its
+tombstones by `__applied_seg` (the tombstone GC's index, below).
 
-Every ledger is keyed by `__from_key` and indexes its tombstones by
-`__applied_seg` (the tombstone GC's index, below). An aggregate ledger also
-has a `GROUP BY` index over its live members (`where __member and not
-__tombstone`) unless the Re-derive build takes its target and none of the
-target's fields is recomputed (#723). Only three readers find a group's
-entries through that index: a recomputed field's rewrite, the one-pass
-build's group writes, and the orphan sweep. The last two run only for
-targets the Re-derive build doesn't take. Every other statement reads the
-ledger by key, so a ledger without the index saves every entry write the
-cost of maintaining it, which on a ledger far larger than `shared_buffers`
-is most of a build's WAL, as full-page images of the index's leaves.
+A 1-1 target is built one of two ways. The Re-derive build (`staging::build`,
+#625) serves a 1-1 target on a captured source or on another definition's
+target: it applies from its start and re-derives the source in chunks, each
+inserting the entries its keys don't have yet and locking the others as a page
+does, and stamping them as a Re-derive does (below). Every other 1-1 target
+keeps the one-pass build.
 
-A target is built one of two ways. The Re-derive build (`staging::build`,
-#625) serves an aggregate target and a 1-1 target, on a captured source or
-another definition's target: it
-applies from its start and re-derives the source in chunks, each inserting
-the entries its keys don't have yet and locking the others as a page does,
-and stamping them as a Re-derive does (below).
-Every other target keeps the one-pass build. For an aggregate it empties the
-ledger, reads the source into it in one statement whose snapshot becomes
-every entry's basis, and then writes the group rows as a `GROUP BY` over it.
+### Aggregate groups: the group basis
 
-### Aggregate groups: the ledger
-
-Every aggregate target is on the ledger (`staging::ledger`). Its fields are
-of two kinds (#623 D3, D4):
-
-- **Maintained** by increments: `SUM(x)` and `AVG(x)` over an exact numeric
-  argument, `COUNT(*)` and `COUNT(x)`. `AVG(x)` keeps a hidden running sum and
-  count and writes `sum / count::numeric`, which is Postgres's own `avg()`
-  over an exact numeric argument.
-- **Recomputed** from the group's live entries after the upsert: every other
-  field (`MIN`/`MAX`, `BOOL_AND`/`BOOL_OR`, a float `SUM`/`AVG`, a composed
-  field such as `SUM(a) + COUNT(b)`).
-
+An aggregate (`staging::group_basis`, ADR-0002 "Aggregates: a basis per
+group") keeps each group's partials (its row count `__n`, and per distinct
+argument its non-null count and, for a `SUM` or `AVG`, its sum) in a hidden
+table in the catalog schema, `agg_<id>`, beside the group's basis and stamp.
+The visible target holds only the declared columns, computed from the
+partials whenever the visible row is written. The grammar admits `COUNT(*)`,
+`COUNT(x)`, and `SUM`/`AVG` over `smallint`, `integer`, `bigint` and
+`numeric(p,s)`, because only those can be kept exact from each change alone.
 An argument may be an expression (`SUM(v + 1)`), evaluated per change over
-the image as the source's row type. Each page applies its records for an aggregate target in one transaction, in
-five steps:
+the image as the source's row type.
 
-1. **Lock (I1, I5).** Insert an entry for every key the page has no entry
-   for, then lock every other entry `for update`, sorted by key, in one
-   statement. As on a 1-1 target, a new key's Apply is written into the entry
-   its insert creates, since with no entry I2 is only the truncate floor
-   (#775); step 3 leaves that entry alone and counts it as a move into its
-   group from no entry. A Re-derive's new key and an Apply at or below the
-   floor get a non-member placeholder that step 3 writes. A key whose tombstone the GC collects between the two
-   statements fails the page transiently and it is retried (#712).
-2. **Re-derive read.** A record staged as a `recompute`, or folded with one, is a
-   Re-derive. So is a record with no change to apply, and every record of a
-   page whose oldest batch is at or below the target's `build_seg`, as on a
-   1-1 target (#733). One
-   statement reads those keys' current source rows *and*
-   `pg_current_snapshot()`, after the lock. A key with no row becomes a
-   tombstone.
-3. **Entries, then groups, in one statement.** It first updates each entry:
-   - A Re-derive writes the entry from its read. It sets `__basis` to the
-     read's snapshot and leaves `__applied_lsn` alone (#623 Q1). Every change
-     the read saw is visible in that snapshot. Every change it missed is still
-     pending with its own ring row, and its trigger `lsn` may be below any
-     position the read could record.
-   - An Apply writes the entry from the record's new image, or makes a tombstone
-     for a delete. It sets `__applied_lsn` to the change's `lsn`, and only if
-     the I2 test passes (as on a 1-1 target, [above](#absolute-writes-do-not-commute-the-1-1-ledger)).
-   - An Apply at or below the truncate floor that step 1 gave a placeholder
-     deletes it instead (#774), as on a 1-1 target: nothing else would write
-     it, and the tombstone GC collects only tombstones.
+A page, per aggregate target:
 
-   The statement then sums each updated entry's move from its old state to its
-   new one into per-group increments: the member count, and per argument its
-   sum and its non-null count. It upserts them in group order, incrementing every
-   column (I3). A `SUM` goes `NULL` when its non-null count and its sum both
-   reach 0.
-4. **Recomputed fields.** Each group the upsert wrote has its recomputed
-   fields rewritten from its live member entries. The upsert holds every
-   written group's row lock, so this statement sees every entry change any
-   other page made to those groups (a build chunk takes no group lock, and
-   the merger recomputes every group it writes).
-5. **Empty groups go.** Groups whose every accumulator (`__trellis_members`,
-   each count, each sum) reached 0 are deleted. With one writer of groups that
-   is the same as the member count reaching 0. A Re-derive build adds a second
-   writer (below), and then a group can reach 0 members while a sum is
-   still owed to it.
+1. **Stage.** One statement splits each ring row into sides (its old image
+   negated, and its new image), evaluates the group and each argument on
+   each, and sums them per group, transaction and statement into a session
+   temporary table. It reads no basis, so this work, most of a page's,
+   happens before any group is locked.
+2. **Lock (I1, I5).** One statement inserts every group the staged sides name,
+   sorted, and locks the ones that exist.
+3. **Apply.** One later statement, so under `READ COMMITTED` its snapshot
+   sees every committed basis, keeps a staged sum only when its transaction
+   isn't visible in the group's basis and its `lsn` is above the target's
+   truncate floor, adds what is kept to the hidden row, and writes the
+   visible row when a visible value changed: an upsert while `__n > 0`, a
+   delete when it falls to 0.
 
-A page takes its locks in one order: entries (an insert for new keys, then
-one sorted `for update` of the rest), then groups, in one sorted upsert. A Re-derive of an unchanged key moves nothing, so a go-live re-read
-after the build writes no group rows.
+Each changed visible row reaches the seam with its prior image, computed from
+the partials before the page's change. A `Recompute` (a release of a key, or
+a marker's re-read) names groups instead of carrying images: the page
+rewrites each of them from a `GROUP BY` of the source in the statement's
+snapshot, which becomes the group's basis.
 
-Each written or deleted group reaches the seam with its prior image. PG 17 has
-no `OLD` in `RETURNING`, so the image is rebuilt from the upsert's result minus
-the increments. A group the upsert created has no prior image.
+**Builds.** A build or rebuild is one absolute write per structure: it locks
+the groups of the enumeration (the target's, the source's, and those the
+ring's old images name) in key order, then one statement runs the source's
+`GROUP BY` from its snapshot and replaces each group's partials, basis, stamp
+and visible row. Pages keep applying, against the new bases once it commits.
+It is the plan job's whole build
+([data flow](../data-flow.md#an-aggregates-or-a-joins-build)).
 
-A fold record carries the identity of the change that won its post-image
-(`last_change`: its `lsn` and `row_txid`, see
-[04](04-claiming-and-the-fold.md)). That change is the one an Apply judges.
+**Zero groups.** A group whose partials are all zero has no visible row, but
+its hidden row can still matter: a change its basis saw but a page hasn't
+drained yet must still be refused. The maintenance loop's GC collects a zero
+group only once the contiguous drained prefix reaches its stamp
+(`staging::retire::collect_tombstones`), without waiting on a page.
 
-**Build chunks and the merger (#625).** A Re-derive build re-derives the
-source a primary-key range at a time. An aggregate target's chunk first
-inserts the entries of the keys that have none, in one statement that reads
-their rows with `pg_current_snapshot()` and the active segment, writes each
-entry once from that read (`__basis` the snapshot, a deleted key a tombstone
-stamped with the segment), and appends their groups' increments. A key whose
-entry is there by the time its insert runs is left alone. The insert's
-snapshot is taken before its uniqueness check, which is sound because no
-Apply can have written a key since that snapshot without leaving its entry
-for the check to find: the only thing that removes an entry an Apply wrote,
-the tombstone GC, skips a ledger while its definition is under a build
-(below). A page deletes only a placeholder it wrote no change to, which
-holds no applied change, and a source truncate commits before the chunk's
-first read, which holds the source's lock, so it empties no change the
-snapshot doesn't see. The chunk
-then takes the same entry lock as a page on the keys that already had an
-entry, and one more statement reads their rows afresh, rewrites their
-entries and appends their increments. Both steps run under a 1 s
-`lock_timeout`, so a chunk gives way to a page. On a fresh build every key
-is new, and the insert is the whole chunk. Every chunk stamps `__applied_seg`
-with the segment its read saw, so the tombstone GC can collect a chunk's
-tombstones. The increments go to `<target>__deltas`, where each row's
-generated `__part` is its group's merge partition: `hash_record_extended`
-of the group, so equal groups (`1.5` and `1.50`, or every `NULL` group)
-share one. It never writes a group row. A
-merger claims one partition's delta rows oldest first through an index on
-`(__part, __seq)` (`for update skip locked`), deletes them, and upserts their
-sums per group with the page's upsert, in group order, then rewrites the
-recomputed fields of the groups it wrote (#625 F5). Only one merger works
-on a partition at a time: it takes a transaction-scoped advisory lock on the
-partition without waiting, trying the partitions with rows in turn, and
-skips the target only when another merger holds each of them (#625 F2b,
-#717). Mergers of different partitions write different groups, so they run
-side by side without queueing on each other's group rows. The delta table is a queue, so its statistics are unreliable: the merge
-statement runs with nested loops and sequential scans off, and a merger
-vacuums the table every 100,000 rows it merges. The delta rows are discarded
-only with the ledger: by a truncate, a drop, or the one-pass build.
-
-**A failing merge (#901).** A merge applies whole groups, so its failure
-names no key to charge, and the merger classifies it by target. A transient
-failure, at any statement or at `COMMIT`, is retried at once a few times as a
-page's is, then the worker backs the target off, uncharged. A refused write
-(`42501`) halts what it reaches, as a page's does. Any other failure, such as
-an application's check, foreign key or deferred constraint that a merged
-group breaks, backs the target off and is charged, and the fifth charge on a
-worker halts the definition and everything downstream of its target with
-kind `halt`, naming the target and the error. The backoff and the charges
-are each drain worker's own. A target backing off is skipped, and the worker
-goes on to the next target's merge and to the build's chunks, so one failing
-target never holds up another build.
-
-**Truncate.** A source `TRUNCATE` empties the ledger and the group deltas,
-deletes every group row, and raises the target's truncate floor
-(`ledger_truncate_floor`) to the truncate's `lsn` (#623 Q6). A 1-1 target
-does the same to its ledger, and the page clears its rows. `TRUNCATE` takes
+**Truncate.** A source `TRUNCATE` empties a 1-1 target's ledger, or an
+aggregate's hidden table, clears the target's rows, and raises the target's
+truncate floor (`ledger_truncate_floor`) to the truncate's `lsn` (#623 Q6). `TRUNCATE` takes
 `ACCESS EXCLUSIVE`, so every earlier writer's trigger ran below that `lsn` and
 every later writer's above it; a write later in the truncating transaction
 itself is above it too, since the truncate's own ring row moves the WAL insert
@@ -450,25 +352,19 @@ later one (no segment above an undrained truncate's is claimable,
 and the fold voids its own batch's rows from before it. Segments are fenced
 in order (the seal gate seals none past an unfenced predecessor), so no
 segment past a truncate's is claimable before the truncate's `has_truncate`
-is decided. A group-basis aggregate (`staging::group_basis`, behind its dev
-knob) empties its hidden table of partials, bases and zero groups the same
-way, and raises the same floor.
+is decided.
 
 **Release and the orphan sweep.** Releasing a quarantined key
 (`staging::release_key`) stages one `Recompute` of it and discards the parked
 rows. A replayed row would carry the releaser's `row_txid`, not the source
-transaction's. On a group-basis aggregate the release also recomputes, in
+transaction's. On an aggregate the release also recomputes, in
 its own transaction, every group the held row's `agg_groups` names (the
 groups of every parked change's images) and the key's current row's, locked
 in one sorted statement and rewritten from a `GROUP BY` of the source with
 that statement's snapshot as each group's basis; a page with a `Recompute`
-recomputes the groups it names the same way, under the page's group locks. A catch-up discharge's orphan sweep finds live entries the
-source no longer backs and Re-derives them in its own transaction (each comes
-back a tombstone and leaves its group), stamping them with the newest segment.
-It locks every such entry, and then every group they are in, before its first
-Re-derive. A key's new source row could put it in a group it hasn't locked, so
-it re-derives only the keys its own read still finds no row for: a key
-re-inserted since keeps its entry, and the insert's Apply moves it.
+recomputes the groups it names the same way, under the page's group locks. A
+1-1 target's catch-up discharge runs an orphan sweep that deletes the rows
+the source no longer backs.
 
 **Tombstone GC (I4).** Maintenance deletes each tombstone whose
 `__applied_seg` is at or below the **contiguous drained prefix**, the highest
@@ -494,11 +390,11 @@ length.
 
 Only a tombstone carries `__applied_seg` (#775). A write that leaves an entry
 a tombstone raises it to `greatest(old, its segment)`; one that leaves the
-entry live leaves it alone. Both ledgers index their tombstones by it
+entry live leaves it alone. The ledger indexes its tombstones by it
 (`(__applied_seg) where __tombstone`), so a GC batch seeks the collectable
 ones under a pinned index-scan plan (#738), however many tombstones wait
 above the drained prefix, and an Apply or Re-derive that leaves an entry live
-in its group changes no indexed column and can be HOT. A live entry's stale
+changes no indexed column and can be HOT. A live entry's stale
 stamp never has to protect anything: a delete's Apply applies only a change
 its entry's `basis` doesn't see, so every change the `basis` does see
 completed before the delete and is in the delete's batch or an earlier one,
@@ -508,38 +404,32 @@ its own read's segment (`defs::ledger::tombstone_seg_sql`).
 ## The delta model
 
 For a source key, maintaining a measure `f` over group `g` in one Phase-3
-transaction, where the key's ledger entry holds the group `g(entry)` and the
-contribution `f(entry)` it last applied:
+transaction, with the change's old image `o` and new image `n` from the ring
+row:
 
 | Op | Effect |
 |---|---|
-| INSERT | `g(new) += f(new)` |
-| DELETE | `g(entry) -= f(entry)`; the entry becomes a tombstone |
-| UPDATE, grain unchanged | `g += f(new) − f(entry)` — one group, net delta |
-| UPDATE, grain changed | **grain migration**: `g(entry) -= f(entry)` *and* `g(new) += f(new)` — two groups |
+| INSERT | `g(n) += f(n)` |
+| DELETE | `g(o) -= f(o)` |
+| UPDATE, grain unchanged | `g += f(n) − f(o)` — one group, net delta |
+| UPDATE, grain changed | **grain migration**: `g(o) -= f(o)` *and* `g(n) += f(n)` — two groups |
 
-The entry is then rewritten to the new side. So the drain needs one image per
-folded record, its **new side** (none for a delete), and no old image: the old
-side is the entry.
+Each change carries both images, and a group's basis, not a per-key record,
+decides whether the page adds it. A page never folds a key's rows into one:
+the first old and last new image are wrong when a group's basis falls between
+two of a key's changes, so each row is its own side.
 
-An Apply takes the new side from the **staged post-image at the claimed
-position**, which keeps it scan-free. A Re-derive reads the source live
-instead, which may see a *later* state than the batch accounts for. That is
-safe because the entry records what it added: the read's snapshot becomes the
-entry's `__basis`, so a later change the read already saw is refused by I2,
-and the next write subtracts what the read wrote.
-
-Composite measures fold their hidden partials, never themselves: `avg` maintains
-`__{m}_sum` and `__{m}_count` and recomputes the visible ratio from them.
+Composite measures fold their hidden partials, never themselves: `avg` keeps
+a running sum and count and writes the ratio when it writes the visible row.
 
 **Not every measure is delta-able**; the gate is explicit: only exact,
 invertible folds are maintained by increments. `count(*)`, `count(col)`, and
-`sum`/`avg` over an exact numeric argument are in. Every other field is
-recomputed from the group's live entries (#623 D4): `min`/`max`, which are not
-invertible (removing the current maximum tells you nothing about the next
-one), `bool_and`/`bool_or`, a float `sum`/`avg`, whose increments would drift
-because IEEE-754 addition is non-associative (and `Inf − Inf = NaN`), and a
-composed field.
+`sum`/`avg` over `smallint`, `integer`, `bigint` and `numeric(p,s)` are in.
+Everything else is refused at define, named by its family
+([transforms](../transforms.md#supported-sources-and-targets)): `min`/`max` are
+not invertible (removing the current maximum tells you nothing about the next
+one), and a float `sum`/`avg` would drift because IEEE-754 addition is
+non-associative (and `Inf − Inf = NaN`).
 
 **The north star for the exact types is byte-identical convergence to a
 from-scratch `GROUP BY` oracle after every op and every drain interleaving** — far
@@ -599,7 +489,7 @@ one consistent order: its 1-1 targets, then its aggregate targets, each in
 target order, and per target **its entries, then its rows, each in one sorted
 statement**. The entry lock is ordered by key
 ([the 1-1 ledger](#absolute-writes-do-not-commute-the-1-1-ledger),
-[the aggregate ledger](#aggregate-groups-the-ledger)); a 1-1 target's rows are
+[the group basis](#aggregate-groups-the-group-basis)); a 1-1 target's rows are
 then pre-locked in key order, and an aggregate's group upsert writes its
 groups in group order.
 
@@ -625,7 +515,7 @@ retried with backoff from outside any transaction.
 - **The bound is on the session.** Every connection Trellis opens, pooled or
   dedicated, caps its `lock_timeout` at `locks::LOCK_TIMEOUT` when it
   connects (a shorter setting it was given is kept). That bounds the explicit
-  lock statements (the ledger's entry locks above, `FOR SHARE` on the version fence,
+  lock statements (the 1-1 ledger's entry locks above, `FOR SHARE` on the version fence,
   advisory stripe locks, DDL) and the implicit waits nobody writes down: an
   `INSERT ... ON CONFLICT` waiting on another transaction's uncommitted key
   (#617's wait), an `UPDATE` of a row another transaction holds. A setting
@@ -681,8 +571,8 @@ autovacuum waits the vacuum out (#622 plan Q1).
 
 Step 4 stages the keys whose derived values depend on what just changed: every
 key a step above physically wrote in a target another definition reads. An
-aggregate needs no old image for this: its ledger entry names the group a key
-was in.
+aggregate needs no old image for this: the change's own images name the groups
+a key was in.
 Two termination mechanisms:
 
 - **Filtered staging.** Dependents are staged only for tables that actually have a
@@ -725,7 +615,7 @@ key, or a schema error into a silently parked one. The classification:
 |---|---|---|
 | **Transient** | serialization/deadlock (`40001`/`40P01`), lock-not-available, statement timeout, dropped connection | retry with backoff; **charge nothing to any key** — a transient failure is not attributable. A lock timeout retries for up to three `lock_timeout`s with the claim held rather than five attempts ([I7](#no-lock-wait-holds-a-snapshot-open-adr-0002-i7)) |
 | **Version fence miss** | a definition changed mid-drain | reload the schema and retry; back off on *consecutive* misses only |
-| **Halting schema diagnosis** | a source key the drain can't use (`NoPrimaryKey`, `UnsupportedPrimaryKeyType`); a tripped hop bound (`HopBoundExceeded`, a cross-table value cycle or a run-away wave); an aggregate target off the ledger (`AggregateOffLedger`); Postgres refusing the drain's role a read or write (`42501`: row-level security, which every Trellis session turns into an error with `row_security = off`, or a missing privilege) | **pause the closure it reaches, loudly**; never quarantine. Quarantining would blame one key for a failure every key reproduces, and turn a loud, actionable error into a key that blocks reads forever |
+| **Halting schema diagnosis** | a source key the drain can't use (`NoPrimaryKey`, `UnsupportedPrimaryKeyType`); a tripped hop bound (`HopBoundExceeded`, a cross-table value cycle or a run-away wave); an aggregate the group basis can't apply (`GroupBasisUnsupported`); Postgres refusing the drain's role a read or write (`42501`: row-level security, which every Trellis session turns into an error with `row_security = off`, or a missing privilege) | **pause the closure it reaches, loudly**; never quarantine. Quarantining would blame one key for a failure every key reproduces, and turn a loud, actionable error into a key that blocks reads forever |
 | **Claim lost** | a page's claim check or completion finds a held bucket's claim gone | surface; never isolate. The page rolled back, and whoever holds the buckets now resumes from the last committed cursor |
 | **Everything else** | a genuinely poisonous change | isolate and charge — see [06](06-cleanup-and-reclaim.md) |
 
@@ -738,7 +628,8 @@ the page without it:
   a `JOIN`'s joined table);
 - for a hop bound outside a cycle, the readers of the table the wave ran away
   through — not the definition that wrote it; inside a cycle, every member;
-- for an aggregate off the ledger, the definition that writes that target;
+- for an aggregate the group basis can't apply, the definition that writes that
+  target;
 - for a refused read or write (#766), found from the catalog as the drain's
   own role, since Postgres's message names no key and only a bare table: the
   readers of each table they read that the role can't (`SELECT`, or policies
@@ -797,7 +688,7 @@ for any failed discharge, with the error on `backfill_failure`.
 7. **A non-commutative write commits only if its basis is still current**, checked
    under a lock that serializes every Phase 3 for that key. A new write path must
    either commute (deltas), check its basis, or be serialized some other way
-   (the `prev_lsn` guard, the truncate barrier). A ledger entry records its
+   (the `prev_lsn` guard, the truncate barrier). A ledger entry or a group records its
    basis, and every change to it is checked against it, so a group's
    increments stay exactly-once. See the
    classification table under

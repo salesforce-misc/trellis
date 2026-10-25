@@ -7,8 +7,7 @@
 //! images and those of the node's current rows, with a snapshot taken after
 //! the operation as each group's basis (#1043 F4). Never by a zero.
 //!
-//! Every test turns the group-basis dev knob on before its driver starts
-//! (the knob is process-wide), starts from an empty source, built before
+//! Every test starts from an empty source, built before
 //! its tree is recorded, and seeds it through capture. The pass, the
 //! drain and the engine are called by hand; nothing waits for convergence
 //! (#297). The oracle is a from-scratch `GROUP BY` over the source, and the
@@ -109,7 +108,6 @@ impl Fx {
     }
 
     async fn start_with(schema: &str, seed: &str, definitions: &[&str]) -> Fx {
-        trellis::dev::staging::set_group_basis(true);
         let d = Driver::start(
             schema,
             &[("id", int4()), ("g", int4()), ("v", int4())],
@@ -2162,7 +2160,6 @@ async fn a_leaf_detached_and_corrected_before_its_turn_is_read_through_the_root(
 /// longer as recorded). Each probe matches the source's own `NULL`s.
 #[tokio::test]
 async fn groups_with_a_null_part_read_through_the_root_are_exact() {
-    trellis::dev::staging::set_group_basis(true);
     let schema = format!(
         "create table public.items (id integer not null, g integer not null, h integer, \
          v integer not null, primary key (g, id)) partition by range (g); \
@@ -2427,7 +2424,6 @@ async fn a_leaf_read_matches_a_varchar_group_column_at_its_held_type() {
         "v integer not null,",
         "label varchar(10) not null, v integer not null,",
     ) + "create index on public.items (g, label);";
-    trellis::dev::staging::set_group_basis(true);
     let d = Driver::start(
         &schema,
         &[
@@ -2464,4 +2460,58 @@ async fn a_leaf_read_matches_a_varchar_group_column_at_its_held_type() {
     fx.run().await;
     fx.d.settle().await;
     fx.assert_right("attached").await;
+}
+
+/// `Trellis::status` reports a definition under correction as `backfilling`,
+/// with a `correcting` entry for the node: its schema-qualified name and when
+/// the pass queued the correction, with no count before it commits. Once it
+/// commits the definition is `live` with nothing listed.
+#[tokio::test]
+async fn status_lists_the_node_under_correction_until_it_commits() {
+    let mut fx = Fx::start(&tree("range"), SEED).await;
+    let handle = Trellis::connect(
+        Config::from_dsn(fx.d.db.dsn().to_string()).expect("valid dsn"),
+        TrellisOptions::default(),
+    )
+    .await
+    .expect("connect");
+    let status = handle.status("agg").await.expect("status").expect("agg");
+    assert_eq!(
+        (status.status, status.correcting),
+        (trellis::TransformStatus::Live, Vec::new())
+    );
+
+    fx.exec("drop table public.items_p1").await;
+    fx.pass().await;
+    assert_eq!(fx.kinds().await, ["gone_node"]);
+    // The staging worker's step that enqueues the correction's row.
+    partition_correction::schedule(fx.d.pool())
+        .await
+        .expect("schedule");
+    let queued_at: std::time::SystemTime =
+        fx.d.ctl
+            .query_one("select queued_at from partition_corrections", &[])
+            .await
+            .expect("the correction")
+            .get(0);
+    let status = handle.status("agg").await.expect("status").expect("agg");
+    assert_eq!(status.status, trellis::TransformStatus::Backfilling);
+    assert_eq!(
+        status.correcting,
+        vec![trellis::CorrectingNode {
+            node: "public.items_p1".to_string(),
+            since: queued_at,
+            keys_remaining: None,
+        }],
+        "listed from the pass that queued it"
+    );
+
+    fx.run().await;
+    fx.d.settle().await;
+    let status = handle.status("agg").await.expect("status").expect("agg");
+    assert_eq!(
+        (status.status, status.correcting),
+        (trellis::TransformStatus::Live, Vec::new())
+    );
+    fx.assert_right("dropped").await;
 }

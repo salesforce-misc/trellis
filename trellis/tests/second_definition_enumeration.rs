@@ -102,7 +102,6 @@ async fn status(client: &Client, target: &str) -> String {
 /// registered over it and its marker parked as the staging worker parks it.
 /// Returns the `Recompute` rows the second marker's discharge staged.
 async fn second_definition(first: &str, second: &str) -> i64 {
-    trellis::dev::staging::set_group_basis(true);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;

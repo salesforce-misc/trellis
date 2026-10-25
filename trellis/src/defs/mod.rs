@@ -38,7 +38,6 @@ pub mod error;
 pub mod eval;
 pub mod grammar;
 pub mod hierarchy;
-pub mod invertibility;
 pub(crate) mod join;
 pub(crate) mod join_key_types;
 pub(crate) mod key_types;
@@ -117,7 +116,6 @@ pub use ddl::{PrimaryKeyColumn, neighbor_table_name};
 #[cfg(any(test, feature = "internals"))]
 pub use eval::{EvalError, RegexCache, Row, Value, evaluate, evaluate_aggregate};
 #[cfg(any(test, feature = "internals"))]
-pub use invertibility::{AggregateArg, CountArg, Invertibility, PartialField, Verdict, classify};
 #[cfg(any(test, feature = "internals"))]
 pub use model::{EdgeKind, NodeKind, SchemaEdge, SchemaNode};
 #[cfg(any(test, feature = "internals"))]

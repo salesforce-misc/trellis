@@ -1,6 +1,6 @@
 //! The correction of an aggregate on the group basis over a partitioned
 //! source (#1103, ADR-0002 "Aggregates: a basis per group, kept by deltas";
-//! the parent module's "On the group basis"), and of a `JOIN` whose side is
+//! the parent module's "What a correction does"), and of a `JOIN` whose side is
 //! the partitioned source (#1111, ADR-0019), over that side's partial cells
 //! ([`Cells`]): below, a `JOIN`'s cells read as groups, its `P` or `M` as
 //! the hidden table, and the side's table as the source.
@@ -22,7 +22,7 @@
 //!   attached or truncated node, or a `DEFAULT` whose siblings changed):
 //!   rows written into it directly before its capture existed are counted
 //!   only here. A gone node without a usable text has its table read the
-//!   same way while it still exists, as the ledger's node phase does: the
+//!   same way while it still exists: the
 //!   region it left is covered by the complement sweep, a `DEFAULT`'s
 //!   correction or the node that took it (#1129), with no full routing form.
 //!
@@ -45,9 +45,7 @@
 //! still pending is waited for, so the basis sees its
 //! transaction, and its page refuses it. No `build_seg` stamp and no fence
 //! are needed. The definition reports `backfilling` from the pass that
-//! schedules the correction until the transaction commits, as under the
-//! ledger's engine, with no group deltas for the build's completion to wait
-//! on.
+//! schedules the correction until the transaction commits.
 
 use tokio_postgres::IsolationLevel;
 

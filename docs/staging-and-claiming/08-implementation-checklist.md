@@ -17,7 +17,7 @@ A condensed checklist. Each item links to the document that argues for it.
 | Merging happens at read time, under four fixed rules | ordered `array_agg` arg-extremes |
 | Pending work is measured by asking storage, never a boundary aggregate | index + hand-written `ANALYZE` on statistics-free tables |
 | Quarantined work still blocks the read-your-writes predicate | the three-table poison track |
-| A non-commutative write commits only if its basis is current (I2), under a per-key lock | the `<target>__ledger` table, `pg_current_snapshot()` as the basis |
+| A non-commutative write commits only if its basis is current (I2), under a per-key lock | the `<target>__ledger` table (1-1) or the group's basis (aggregate), `pg_current_snapshot()` as the basis |
 
 ## Foundations to lock down first
 
@@ -34,9 +34,10 @@ A condensed checklist. Each item links to the document that argues for it.
 - [ ] **Enumerate which measures are invertible.** Everything else goes on a
       recompute path. Never approximate an inverse.
       → [05](05-apply-and-exactly-once-deltas.md)
-- [ ] **Every target keeps a per-key ledger** (last-applied position, basis
-      snapshot, tombstone) and every non-commutative write checks it under the
-      key's entry lock; a group row is a function of its live entries.
+- [ ] **Every 1-1 target keeps a per-key ledger** (last-applied position,
+      basis snapshot, tombstone) and every non-commutative write checks it
+      under the key's entry lock; an aggregate group keeps a basis and a
+      stamp, and a page adds a change only if its basis hasn't counted it.
       → [05](05-apply-and-exactly-once-deltas.md#the-ledger)
 - [ ] **No item may stay undrainable** — one would stop the whole instance. A
       schema error pauses the definitions it reaches and drains without them;
@@ -100,15 +101,14 @@ These fail only if you write them deliberately; ordinary end-to-end tests pass a
 - [ ] **I2 visibility.** A Re-derive whose snapshot saw a change refuses the
       older capture of that change and still applies a change it did not see;
       a Re-derive's tombstone outlives the changes its read saw.
-      (`ledger_interleavings.rs`:
-      `a_rederive_absorbed_update_leaves_an_older_capture_skippable_only_by_visibility`,
+      (`one_to_one_ledger_interleavings.rs`:
       `a_rederives_tombstone_outlives_the_changes_its_read_saw_*`)
 - [ ] **Ledger GC holds back for out-of-order drains**: a tombstone is collected
       only at or below the contiguous drained prefix.
-      (`ledger_interleavings.rs`: `an_out_of_order_drain_holds_gc_back_*`)
+      (`one_to_one_ledger_interleavings.rs`: `an_out_of_order_drain_holds_gc_back_*`)
 - [ ] **A Re-derive build interleaved with live Apply pages** converges to a
-      from-scratch oracle after the last chunk, drain and merge.
-      (`build_interleavings.rs`, `rederive_build.rs`)
+      from-scratch oracle after the last chunk and drain.
+      (`rederive_build.rs`, `one_to_one_build_interleavings.rs`)
 - [ ] **A schema change never fails the application's write**: a renamed or
       dropped captured column writes a `schema_changed` marker, the drain
       pauses the definitions that read it, and the others keep applying.

@@ -6,11 +6,9 @@
 //! by hand. The last tests here run the loop, check, repair, check: writes
 //! capture missed repaired by `request_backfill`, hand edits of `J`/`T` by
 //! `PAUSE`/`RESUME`. One test here checks the `J` lock-wait
-//! histogram a page records (#1112 J7b), since it needs the same knob-on
-//! driver.
+//! histogram a page records (#1112 J7b).
 //!
-//! Every test turns the group-basis dev knob on before its driver starts (a
-//! `JOIN` applies only behind it), drives the pipeline by hand through
+//! Every test drives the pipeline by hand through
 //! `support/drain_driver.rs` and never polls for convergence (#297).
 
 #[path = "support/drain_driver.rs"]
@@ -53,7 +51,6 @@ fn int4() -> ValueType {
 }
 
 async fn start(definitions: &[&str]) -> Driver {
-    trellis::dev::staging::set_group_basis(true);
     Driver::start_with_database_defaults(
         &[],
         DDL,
@@ -546,7 +543,6 @@ async fn a_group_on_one_side_only_is_reported_alike_at_every_page_size() {
 /// transform's label, one observation per page that applies it.
 #[tokio::test]
 async fn each_join_page_records_its_j_lock_wait() {
-    trellis::dev::staging::set_group_basis(true);
     let mut d = Driver::start_with_database_defaults(
         &[],
         "create table public.a (id integer primary key, ga integer, k integer); \
@@ -878,7 +874,6 @@ async fn a_pending_change_a_cells_basis_saw_is_not_subtracted() {
 /// source's new one, so the walk still reads every cell once (#1178).
 #[tokio::test]
 async fn a_group_column_re_collated_mid_walk_skips_and_repeats_no_cell() {
-    trellis::dev::staging::set_group_basis(true);
     let mut d = Driver::start_with_database_defaults(
         &[],
         "create table public.a (id integer primary key, ga text collate \"C\", k integer); \

@@ -76,9 +76,8 @@ enum Comparison {
     /// engine-side fold and a server-side `sum()` over the same rows in a
     /// different order really do produce different doubles
     /// (`1e16::float8+1+1+1+1` is `1e+16`, `1+1+1+1+1e16` is
-    /// `1.0000000000000004e+16`). That is not a bug to report — it is the
-    /// reason `defs::invertibility` routes float `SUM`/`AVG` to the
-    /// recompute path.
+    /// `1.0000000000000004e+16`). That is not a bug to report — it is why
+    /// a float `SUM`/`AVG` is refused at define.
     ///
     /// `NaN`/`±Infinity` are compared by Postgres's own float equality
     /// ([`trellis::float::equal`]: `NaN = NaN` is true), not IEEE's, so a
@@ -1145,9 +1144,8 @@ mod tests {
     /// Task B4: `render_select` now renders a real `GROUP BY` instead of
     /// panicking (the old pin here, `render_select_panics_on_an_aggregate_key_space`,
     /// asserted the pre-B4 refuse-to-guess behavior; this is its
-    /// replacement now that the real thing works). Mirrors the
-    /// `order_summary` shape `trellis/tests/apply_aggregate.rs` uses as its
-    /// own model aggregate definition.
+    /// replacement now that the real thing works), over an `order_summary`
+    /// model aggregate definition.
     #[test]
     fn render_select_renders_a_group_by_aggregate() {
         let def = TransformDef {
@@ -1232,12 +1230,10 @@ mod tests {
         let _ = field_value_type(&expr, &source_columns);
     }
 
-    /// Task B4's invertibility-split coverage claim only means something if
-    /// `field_value_type` (which drives per-cell comparison choice) actually
-    /// agrees that every one of the five aggregate functions — both the
-    /// `Invertible` ones (`SUM`/`COUNT`/`AVG`) and the `RecomputeOnly` ones
-    /// (`MIN`/`MAX`, see `trellis::dev::defs::invertibility`) — produces the
-    /// type Postgres itself would: `Numeric` for `SUM`/`AVG`/`MIN`/`MAX` over
+    /// `field_value_type` (which drives per-cell comparison choice) must
+    /// agree that every aggregate function a definition keeps (`SUM`,
+    /// `COUNT`, `AVG`) produces the type Postgres itself would: `Numeric` for
+    /// `SUM`/`AVG` over
     /// a `Numeric` column, and — since issue #120's registry alignment —
     /// `Integer(Int8)` (`bigint`) for `COUNT`, matching
     /// `pg_typeof(count(*))`/`pg_typeof(count(x))`, which selects
@@ -1255,7 +1251,7 @@ mod tests {
             field_value_type(&count_expr, &source_columns),
             ValueType::Integer(IntWidth::Int8)
         );
-        for name in ["SUM", "AVG", "MIN", "MAX"] {
+        for name in ["SUM", "AVG"] {
             let expr = Expr::FunctionCall {
                 name: name.to_string(),
                 args: vec![Expr::Column("c1".into())],

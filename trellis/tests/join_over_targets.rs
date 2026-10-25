@@ -9,8 +9,8 @@
 //! pattern) and the joined side a group-basis aggregate target (a rollup),
 //! each over a captured table.
 //!
-//! Each test drives the pipeline by hand through `support/drain_driver.rs`
-//! with the group-basis dev knob on, and none sleeps or polls for
+//! Each test drives the pipeline by hand through `support/drain_driver.rs`,
+//! and none sleeps or polls for
 //! convergence (#297). After each step the `JOIN` target equals its query
 //! written over the captured tables, so the upstreams are checked through
 //! it.
@@ -71,7 +71,6 @@ fn columns() -> Vec<(&'static str, ValueType)> {
 /// The upstreams live over the empty captured tables, the `JOIN` not yet
 /// defined.
 async fn upstreams() -> Driver {
-    trellis::dev::staging::set_group_basis(true);
     Driver::start(DDL, &columns(), &[A1, B1], &["public.fa", "public.db"]).await
 }
 

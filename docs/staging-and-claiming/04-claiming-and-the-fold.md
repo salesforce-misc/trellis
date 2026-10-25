@@ -147,7 +147,7 @@ Four rules are load-bearing:
 | Field | Rule | Why |
 |---|---|---|
 | `new_image` | **last** — post-image of the highest-`lsn` change (`change_id` breaks ties); a latest `delete` wins with a NULL post-image even when it carries no image | an Apply writes the key's latest image, and a deleted key has none |
-| `old_image` | **first** — pre-image of the lowest-`lsn` change | the key's state before the window; no ledger target reads it ([below](#who-reads-the-old-image)) |
+| `old_image` | **first** — pre-image of the lowest-`lsn` change | the key's state before the window; no 1-1 target reads it ([below](#who-reads-the-old-image)) |
 | `src_changed` | **OR** | any source contribution makes the record a source change, so downstream propagation fires; dropping the OR reintroduces a mutual-derivation livelock |
 | `origin_lsn` | **LEAST**, unknown (`NULL`) wins | the oldest-origin marker read-your-writes soundness depends on ([07](07-convergence-and-await.md)); an unknown origin gates every token, so it must survive the merge |
 
@@ -157,10 +157,10 @@ change.
 
 The `new_image` arg-extreme also carries the winning change's identity,
 `last_change`: its own `lsn` and its `row_txid`, the source transaction's id
-under trigger capture. A target on the ledger applies that change
+under trigger capture. A 1-1 target on its ledger applies that change
 only if its transaction is not visible in the entry's basis and its `lsn` is
 newer than the entry's
-([05](05-apply-and-exactly-once-deltas.md#aggregate-groups-the-ledger)). A
+([05](05-apply-and-exactly-once-deltas.md#the-ledger)). A
 record with only `recompute` rows has no `last_change`. Across segments,
 `last_change` comes from whichever side supplied `new_image`.
 
@@ -172,8 +172,7 @@ UPDATE of the same key needs an intra-commit order. `lsn` stays primary;
 
 ### Who reads the old image
 
-No ledger target does. An aggregate's entry holds the group and contribution
-its key last applied, and a 1-1 target overwrites its row, so an Apply needs
+No 1-1 target does. A 1-1 target overwrites its row, so an Apply needs
 only the new image and `last_change`
 ([05](05-apply-and-exactly-once-deltas.md#the-ledger)). Besides the fold's
 own image-bearing test (below), only quarantine reads it: it parks it in
@@ -218,7 +217,7 @@ the key's state. Its `old_image`, when set, is a prior-image hint (the row as
 readers last saw it), which the fold returns as the record's prior image. A
 key whose
 rows are all image-less folds to both images NULL and no `last_change`, which
-is correct: a ledger target re-derives it from live source.
+is correct: a 1-1 target re-derives it from live source.
 
 One image-less row does speak to the post-image: an `op = 'delete'` is the
 key's final state within the window, whatever precedes it (ADR-0002). The post-image arg-extreme therefore ranks every `delete` alongside the
@@ -243,7 +242,7 @@ a change.** A `recompute` never wins an image, so when it folds with the same
 key's CDC change the record carries that change's images and looks like a plain
 change. The recompute was staged to re-derive the key from live state, and
 applying the change's image instead would skip that (issue #392). The fold
-carries `has_recompute = bool_or(op = 'recompute')`, and a ledger target
+carries `has_recompute = bool_or(op = 'recompute')`, and a 1-1 target
 re-derives such a key rather than applying its last change.
 
 A group-basis aggregate (ADR-0002, "Aggregates: a basis per group, kept by
@@ -252,13 +251,12 @@ since it sums each row's `f(new) − f(old)` per (group, transaction) and never
 folds per key. So the fold also returns each key's
 `insert`/`update`/`delete`/`recompute` rows unfolded (`group_sides`:
 transaction, `lsn`, `op`, both images and the transition images), and the
-segment merge concatenates them. Only while a test forces the group basis off
-(`staging::group_basis`'s knob) is the column a constant `NULL`.
+segment merge concatenates them. 
 
 A key born and died in the batch (an insert then a delete) folds to both images
 NULL, the same as a bare trigger. That needs nothing kept on the side: the
-key's ledger entry, if a read counted it, names its group, and the delete
-removes it ([05](05-apply-and-exactly-once-deltas.md), issue #486).
+key's ring rows carry both images, so a group that counted the insert (in its
+basis) also sees the delete, and the sides cancel ([05](05-apply-and-exactly-once-deltas.md), issue #486).
 
 One field is deliberately **not** filtered: `op`, because the only load-bearing op
 is the `truncate` sentinel, and that sentinel is itself image-less. Filtering `op`

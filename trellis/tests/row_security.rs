@@ -1694,8 +1694,8 @@ async fn source_and_targets(admin: &Client) -> [Vec<String>; 4] {
 }
 
 /// Capture's conditional live re-read (#623 D8a) runs as the ring's owner
-/// under the writing session's `row_security`. Defines a 1-1 copy and a
-/// ledger aggregate of `c`, forces a policy hiding every row of `c` from the
+/// under the writing session's `row_security`. Defines a 1-1 copy and an
+/// aggregate of `c`, forces a policy hiding every row of `c` from the
 /// ring's owner, then writes as the superuser (exempt, `row_security` on)
 /// through two application triggers whose nested writes send the outer
 /// statement's capture down the re-read: updating row 1 updates row 3, and
@@ -1771,8 +1771,8 @@ async fn deletes_staged_for_rows_the_policy_hides(cluster: &TestCluster) -> Inst
 }
 
 /// A delete capture staged for a row a policy hid from its re-read (above)
-/// shows in no target when the drain's role is exempt: a 1-1 apply and a
-/// ledger aggregate apply re-read a delete's row live as the drain's role,
+/// shows in no target when the drain's role is exempt: a 1-1 apply and an
+/// aggregate apply re-read a delete's row live as the drain's role,
 /// find it, and both targets match the source. The next capture pass then
 /// pauses both readers for the row-level security.
 #[tokio::test]

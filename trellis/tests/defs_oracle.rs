@@ -348,17 +348,17 @@ fn order_totals_aggregate_def() -> TransformDef {
                 },
             },
             FieldDef {
-                name: "min_amount".to_string(),
+                name: "count_amount".to_string(),
                 expr: Expr::FunctionCall {
-                    name: "MIN".to_string(),
+                    name: "COUNT".to_string(),
                     args: vec![Expr::Column("amount".to_string())],
                 },
             },
             FieldDef {
-                name: "max_amount".to_string(),
+                name: "count_rows".to_string(),
                 expr: Expr::FunctionCall {
-                    name: "MAX".to_string(),
-                    args: vec![Expr::Column("amount".to_string())],
+                    name: "COUNT".to_string(),
+                    args: Vec::new(),
                 },
             },
         ],
@@ -372,7 +372,7 @@ fn order_totals_aggregate_def() -> TransformDef {
 /// The evaluator-driven [`recompute_aggregate`] must equal grouping the
 /// source rows and running [`evaluate_aggregate`] directly over each group
 /// — the same self-consistency property [`oracle_recompute_equals_per_row_evaluation_over_the_source`]
-/// checks for the 1-1 case, exercised here for `SUM`/`AVG`/`MIN`/`MAX`.
+/// checks for the 1-1 case, exercised here for `SUM`/`AVG`/`COUNT`.
 #[tokio::test]
 async fn oracle_recompute_aggregate_equals_per_group_evaluation() {
     let cluster = TestCluster::start();
@@ -482,7 +482,7 @@ async fn aggregate_recompute_matches_postgres_group_by_exactly() {
     let base_sql = render_aggregate_select_sql(&def);
     let sql = format!(
         "select order_id::text, total_amount::text, avg_amount::text, \
-         min_amount::text, max_amount::text from ({base_sql}) t"
+         count_amount::text, count_rows::text from ({base_sql}) t"
     );
     let postgres_rows = client
         .query(sql.as_str(), &[])
@@ -494,8 +494,8 @@ async fn aggregate_recompute_matches_postgres_group_by_exactly() {
         let order_id: String = row.get(0);
         let total_amount: Option<String> = row.get(1);
         let avg_amount: Option<String> = row.get(2);
-        let min_amount: Option<String> = row.get(3);
-        let max_amount: Option<String> = row.get(4);
+        let count_amount: Option<String> = row.get(3);
+        let count_rows: Option<String> = row.get(4);
 
         // See the matching comment in
         // `oracle_recompute_aggregate_equals_per_group_evaluation` — the
@@ -513,14 +513,14 @@ async fn aggregate_recompute_matches_postgres_group_by_exactly() {
             "avg_amount mismatch for order_id {order_id}"
         );
         assert_eq!(
-            min_amount,
-            expected["min_amount"].as_ref().map(|v| v.to_string()),
-            "min_amount mismatch for order_id {order_id}"
+            count_amount,
+            expected["count_amount"].as_ref().map(|v| v.to_string()),
+            "count_amount mismatch for order_id {order_id}"
         );
         assert_eq!(
-            max_amount,
-            expected["max_amount"].as_ref().map(|v| v.to_string()),
-            "max_amount mismatch for order_id {order_id}"
+            count_rows,
+            expected["count_rows"].as_ref().map(|v| v.to_string()),
+            "count_rows mismatch for order_id {order_id}"
         );
     }
 }

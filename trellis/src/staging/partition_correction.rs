@@ -10,43 +10,13 @@
 //!
 //! # What a correction does
 //!
-//! A correction **re-derives a key set** through the ledger's normal paths
-//! ([`super::build::rederive_keys`], the rebuild sweep's primitive): each key
-//! takes its entry lock, the source row is read live through the root, and
-//! the entry is rewritten (or tombstoned when the row is gone), so its group
-//! moves by a delta, which the merger folds like any other. The code here
-//! never deletes a target row, a ledger entry or a delta: deleting a group
-//! row would leave its entries live, and deleting entries would drop the
-//! tombstones that refuse a ring change staged before the DDL, which would
-//! then resurrect the row.
-//!
-//! The key set of a node is two walks, each in bounded pages (one page, one
-//! transaction), with the progress committed in the page's own transaction:
-//!
-//! 1. **The ledger phase.** The keys of the live ledger entries whose group
-//!    routes to the node ([`Route`]), found through the ledger's `GROUP BY`
-//!    index (a partitioned source's aggregate always has it) in
-//!    `(group, key)` order, so a restart resumes after the last page.
-//! 2. **The node phase**, for a node in the tree: the keys of its current
-//!    rows, read from the node in primary-key order, as a build reads the
-//!    source. It finds the rows a new, attached or re-attached leaf holds
-//!    that no entry knows, including rows written into it directly before
-//!    its capture existed. A gone node needs it only without a usable text
-//!    (a detached table is then read the same way): every row of a gone node
-//!    routed by its text has its live entry found by the ledger phase.
-//!
-//! # On the group basis
-//!
-//! An aggregate kept on the group basis (`super::group_basis`, behind its
-//! dev knob) has no ledger: its correction (the `group` module, #1103)
-//! recomputes, in one transaction, the groups that route to the node (the
-//! target's, those of the ring's undrained images, and the node's current
-//! rows'), with the recompute's snapshot as each group's basis. It routes
-//! as below, and is scheduled, reported and failed as below, but stamps no
-//! `build_seg` and has no fence, ledger or node phase. A capture install
-//! that only adds new nodes to the tree rebuilds no such aggregate
-//! (`crate::intake::markers::park_table_catch_ups`): the nodes' corrections
-//! cover them, as they do a ledger aggregate.
+//! A correction **recomputes the groups that route to the node** (the
+//! `group` module, #1103): the target's, those of the ring's undrained
+//! images, and the node's current rows', in one transaction, with the
+//! recompute's snapshot as each group's basis. It never zeroes a group. A
+//! capture install that only adds new nodes to the tree rebuilds no
+//! aggregate (`crate::intake::markers::park_table_catch_ups`): the nodes'
+//! corrections cover them.
 //!
 //! A `JOIN` reading the source as either side (`super::join`, #1111) is
 //! corrected the same way, over that side's partial cells (`P` or `M`)
@@ -88,18 +58,14 @@
 //!
 //! # Ordering against the ring
 //!
-//! A change staged before the DDL and applied after the correction must not
-//! resurrect a row the correction retracted. A correction therefore starts
-//! by stamping the definition's `build_seg` (the segment active when it
-//! starts), as a rebuild does (`super::build::stamp_rebuild_seg`, #733): a
-//! page with a batch at or below it re-derives its keys rather than applying
-//! their changes. Then it waits for the transactions open at the stamp to end
-//! (the `fence` phase, as a seam-fed build's plan job does), so no page that
-//! read the old `build_seg` can still apply a stale change to a key with no
-//! entry yet. A `gone_node` whose `pg_inherits` row is still there
-//! (a detach pending) waits for `DETACH ... FINALIZE`, which waits out the
-//! writers with older snapshots, before it starts: only then is the ring
-//! complete for the node.
+//! A change staged before the operation and applied after the correction
+//! must not resurrect a member the correction removed. The recompute's
+//! snapshot is each group's basis, so a page that later carries such a
+//! change finds it visible in the basis and skips it (the `group` module's
+//! doc). A `gone_node` whose `pg_inherits` row is still there (a detach
+//! pending) waits for `DETACH ... FINALIZE`, which waits out the writers
+//! with older snapshots, before it starts: only then is the ring complete
+//! for the node.
 //!
 //! # Scheduling
 //!
@@ -118,15 +84,11 @@
 //! so from the pass that detects the operation the definition reports
 //! `backfilling`. The drain workers claim the row like a build chunk
 //! ([`super::build::work_once`]), run up to [`CLAIM_PAGES`] pages, and give
-//! it back for the next claim; the merger folds the correction's group
-//! deltas while the definition is `backfilling`, and
-//! [`super::build::try_complete`] moves it back to `live` once the row is
-//! done and its deltas are folded, as it does at the end of a build. A
-//! definition already under a Re-derive build stays `backfilling` until both
-//! are done. A `catching_up` definition gets its row once its catch-up has
-//! moved it `live`: the merger folds only a `backfilling` definition's
-//! deltas, and the catch-up's discharge owns its status until then. It holds
-//! the correction in the queue meanwhile.
+//! it back for the next claim, and [`super::build::try_complete`] moves it
+//! back to `live` once the row is done, as it does at the end of a build. A
+//! `catching_up` definition gets its row once its catch-up has moved it
+//! `live`: the catch-up's discharge owns its status until then. It holds the
+//! correction in the queue meanwhile.
 //!
 //! A correction that fails is given up through the chunk queue's
 //! `fail_chunk`: its row records the error, which `Trellis::status` reports,
@@ -142,31 +104,24 @@
 use std::fmt;
 use std::time::{Duration, SystemTime};
 
-use tokio_postgres::{GenericClient, IsolationLevel};
+use tokio_postgres::GenericClient;
 
 use crate::capture::partitions::{self, Key, PendingCorrection, Recorded};
+use crate::defs::catalog;
 use crate::defs::chunk_queue::{self, ChunkQueueError, ClaimFence, ClaimedChunk};
 use crate::defs::model::{APPLYING_SQL, Definition, TransformStatus};
-use crate::defs::{backfill, catalog, ddl};
 use crate::error_code::ErrorCode;
 use crate::pool::{Pool, quote_ident};
 
 use super::apply::ApplyError;
-use super::build::{self, BuildPlan, CHUNK_APPLICATION_NAME};
-use super::ledger::LedgerTargetPlan;
+use super::build::{self, CHUNK_APPLICATION_NAME};
 
 mod group;
 pub(crate) use group::lock_recorded_node;
 
-/// Keys per page by default, the size of a build chunk
-/// ([`build::DEFAULT_CHUNK_ROWS`]): one page is one transaction and one entry
-/// lock set, so it bounds the locks and the WAL a transaction holds.
-pub const DEFAULT_PAGE_KEYS: usize = 10_000;
-
 /// Pages a drain worker runs per claim of a correction before it gives the
-/// row back: about a second of work at [`DEFAULT_PAGE_KEYS`], so the
-/// worker's segments, merges and other chunks get their turn, and the ring's
-/// backlog is checked again before the next claim.
+/// row back, so the worker's segments and other chunks get their turn, and
+/// the ring's backlog is checked again before the next claim.
 pub const CLAIM_PAGES: usize = 10;
 
 /// How long a correction waits before it looks again at a detach that is
@@ -184,8 +139,8 @@ pub enum CorrectionError {
     Staging(super::StagingError),
     /// The node's group cannot be presented to its constraint text.
     Unroutable(String),
-    /// The Re-derive build does not serve the definition's shape, so its keys
-    /// cannot be re-derived.
+    /// Neither the group basis nor a `JOIN` serves the definition's shape,
+    /// so its groups cannot be recomputed.
     Unserved {
         target: String,
     },
@@ -232,8 +187,8 @@ impl fmt::Display for CorrectionError {
             CorrectionError::Unroutable(why) => write!(f, "partition correction: {why}"),
             CorrectionError::Unserved { target } => write!(
                 f,
-                "partition correction: the Re-derive build does not serve {target}'s shape, \
-                 so its keys cannot be re-derived"
+                "partition correction: the group basis does not serve {target}'s shape, \
+                 so its groups cannot be recomputed"
             ),
         }
     }
@@ -295,25 +250,14 @@ impl From<catalog::CatalogError> for CorrectionError {
     }
 }
 
-/// How a correction runs: a drain worker's claim ([`CLAIM_PAGES`] pages of
-/// [`DEFAULT_PAGE_KEYS`]), or a test's [`run_pending`].
-#[derive(Debug, Clone, Copy)]
+/// How a correction runs: a drain worker's claim ([`CLAIM_PAGES`] pages), or
+/// a test's [`run_pending`].
+#[derive(Debug, Clone, Copy, Default)]
 pub struct Options {
-    /// Keys per page.
-    pub page_keys: usize,
     /// Stops after this many pages in all, leaving the progress committed so
     /// far for the next claim: a worker's turn, or a test's deterministic
     /// stand-in for a crash or a restart in the middle of a correction.
     pub max_pages: Option<usize>,
-}
-
-impl Default for Options {
-    fn default() -> Self {
-        Self {
-            page_keys: DEFAULT_PAGE_KEYS,
-            max_pages: None,
-        }
-    }
 }
 
 /// What a run of corrections did.
@@ -508,15 +452,6 @@ pub(crate) fn remainder_scope(
     }
 }
 
-/// The ledger's group columns as a constraint text sees them.
-fn route_columns(
-    plan: &LedgerTargetPlan,
-    recorded: Option<&Recorded>,
-    alias: &str,
-) -> Vec<RouteColumn> {
-    route_columns_named(&plan.plain_group_cols(), recorded, alias)
-}
-
 /// [`route_columns`] for the group columns `names`. A column is presented
 /// under the first recorded key on it: its type, and its type's own
 /// collation ([`Key::collation`]), which every level's text compares under
@@ -545,8 +480,6 @@ fn route_columns_named(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Fence,
-    Ledger,
-    Node,
     Done,
 }
 
@@ -554,8 +487,6 @@ impl Phase {
     fn as_str(self) -> &'static str {
         match self {
             Phase::Fence => "fence",
-            Phase::Ledger => "ledger",
-            Phase::Node => "node",
             Phase::Done => "done",
         }
     }
@@ -563,8 +494,6 @@ impl Phase {
     fn parse(text: &str) -> Phase {
         match text {
             "fence" => Phase::Fence,
-            "ledger" => Phase::Ledger,
-            "node" => Phase::Node,
             _ => Phase::Done,
         }
     }
@@ -575,17 +504,18 @@ impl Phase {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Progress {
     phase: &'static str,
-    /// The last key of the phase's walk.
+    /// The column's cursor; a correction commits in one transaction, so it
+    /// is always `None`.
     pub cursor: Option<String>,
-    /// Keys re-derived so far.
+    /// Groups (or cells) recomputed, written when the correction commits.
     pub keys_done: i64,
-    /// The keys the correction expects to re-derive, an estimate for the
-    /// node phase. `None` before the ledger phase counted them.
+    /// The groups (or cells) the correction recomputes. `None` until it
+    /// commits.
     pub keys_total: Option<i64>,
 }
 
 impl Progress {
-    /// The phase: `fence`, `ledger`, `node` or `done`.
+    /// The phase: `fence` or `done`.
     pub fn phase(&self) -> &str {
         self.phase
     }
@@ -989,7 +919,12 @@ pub(crate) async fn run_chunk(
         )
         .await?
     } else if definition.source_table == correction.table {
-        correct(pool, &definition, &correction, options, outcome, &fence).await?
+        // A shape this engine cannot re-derive. The failure is the row's to
+        // report, rather than a correction that completes uncorrected.
+        return Err(CorrectionError::Unserved {
+            target: definition.target_table.clone(),
+        }
+        .into());
     } else if mark_done(pool, &fence, &correction, &definition).await? {
         // It no longer reads the source: nothing of it to correct.
         Step::Done
@@ -1143,112 +1078,6 @@ enum Step {
     /// The row's fence no longer holds: its claim was reclaimed, or it was
     /// held across a resume. Nothing was written.
     Superseded,
-}
-
-/// Runs correction `correction` for `definition` page by page, resuming from
-/// its progress, each write under `fence`.
-async fn correct(
-    pool: &Pool,
-    definition: &Definition,
-    correction: &PendingCorrection,
-    options: &Options,
-    outcome: &mut Outcome,
-    fence: &ClaimFence<'_>,
-) -> Result<Step, CorrectionError> {
-    let Some(plan) = BuildPlan::for_definition(pool, definition).await? else {
-        // A shape the Re-derive build does not serve: this engine cannot
-        // re-derive its keys. The failure is the row's to report, rather than a correction that
-        // completes uncorrected.
-        return Err(CorrectionError::Unserved {
-            target: definition.target_table.clone(),
-        });
-    };
-    let ledger = plan.ledger();
-    if covered_by_parent(pool, correction).await?
-        || complement_unevaluable(pool, correction).await?
-    {
-        return Ok(if mark_done(pool, fence, correction, definition).await? {
-            Step::Done
-        } else {
-            Step::Superseded
-        });
-    }
-    let recorded = {
-        let client = pool.get().await?;
-        partitions::recorded(&**client, &correction.table).await?
-    };
-    match ancestry(pool, correction, recorded.as_ref()).await? {
-        Ancestry::Intact => {}
-        Ancestry::Moved => return Ok(Step::Waiting),
-        Ancestry::Gone => {
-            return Ok(if mark_done(pool, fence, correction, definition).await? {
-                Step::Done
-            } else {
-                Step::Superseded
-            });
-        }
-    }
-    let route = route_of(correction, recorded.as_ref());
-    let columns = route_columns(ledger, recorded.as_ref(), "l");
-    let group_types = group_types(pool, ledger).await?;
-
-    loop {
-        if budget_spent(options, outcome) {
-            return Ok(Step::Stopped);
-        }
-        let current = {
-            let client = pool.get().await?;
-            progress(&**client, correction.id, definition.id).await?
-        };
-        let Some(current) = current else {
-            match start(pool, definition, correction, fence).await? {
-                Started::Recorded => continue,
-                Started::Pending => return Ok(Step::Waiting),
-                Started::Superseded => return Ok(Step::Superseded),
-            }
-        };
-        let page = match Phase::parse(current.phase) {
-            Phase::Done => return Ok(Step::Done),
-            Phase::Fence => {
-                if !settle_fence(pool, definition, correction).await? {
-                    return Ok(Step::Waiting);
-                }
-                continue;
-            }
-            Phase::Ledger => {
-                ledger_page(
-                    pool,
-                    ledger,
-                    &route,
-                    &columns,
-                    &group_types,
-                    &current,
-                    correction,
-                    definition,
-                    options.page_keys,
-                    fence,
-                )
-                .await?
-            }
-            Phase::Node => {
-                node_page(
-                    pool,
-                    ledger,
-                    &current,
-                    correction,
-                    definition,
-                    options.page_keys,
-                    fence,
-                )
-                .await?
-            }
-        };
-        let Some(keys) = page else {
-            return Ok(Step::Superseded);
-        };
-        outcome.pages += 1;
-        outcome.keys += keys;
-    }
 }
 
 /// Whether `correction` is a complement that names a `HASH` node no longer
@@ -1442,354 +1271,9 @@ async fn mark_done(
     Ok(true)
 }
 
-/// What [`start`] did.
-enum Started {
-    /// The progress row is recorded.
-    Recorded,
-    /// The node's detach is still pending.
-    Pending,
-    /// The row's fence no longer holds.
-    Superseded,
-}
-
-/// Starts `correction` for `definition`: waits for a pending detach to
-/// finish, then stamps the definition's `build_seg` and records the progress
-/// row, in one transaction under `fence`.
-async fn start(
-    pool: &Pool,
-    definition: &Definition,
-    correction: &PendingCorrection,
-    fence: &ClaimFence<'_>,
-) -> Result<Started, CorrectionError> {
-    let mut client = pool.get().await?;
-    if detach_pending(&**client, correction).await? {
-        return Ok(Started::Pending);
-    }
-    let txn = client.transaction().await?;
-    fence.arm(&*txn).await?;
-    // The definition's row first, as a rebuild's start takes it, then the
-    // claim's (`ClaimFence`: resume's order).
-    txn.execute(
-        "select 1 from transform_definitions where id = $1 for update",
-        &[&definition.id],
-    )
-    .await?;
-    if !fence.hold(&*txn).await? {
-        txn.rollback().await?;
-        return Ok(Started::Superseded);
-    }
-    txn.execute(
-        "insert into partition_correction_progress (correction_id, definition_id, phase) \
-         values ($1, $2, 'fence') on conflict do nothing",
-        &[&correction.id, &definition.id],
-    )
-    .await?;
-    // Last: the share lock that keeps the active segment from sealing is held
-    // only for the commit.
-    build::stamp_rebuild_seg(&*txn, &[definition.id]).await?;
-    txn.commit().await?;
-    Ok(Started::Recorded)
-}
-
 /// `oid` as the `i64` a text-free bind takes.
 fn u32_param(oid: u32) -> i64 {
     i64::from(oid)
-}
-
-/// Takes the fence if the progress has none (a transaction id assigned after
-/// the stamp committed) and moves to the ledger phase once the oldest running
-/// transaction began after it. Returns whether it moved.
-async fn settle_fence(
-    pool: &Pool,
-    definition: &Definition,
-    correction: &PendingCorrection,
-) -> Result<bool, CorrectionError> {
-    let client = pool.get().await?;
-    client
-        .execute(
-            "update partition_correction_progress \
-             set fence_xid = coalesce(fence_xid, pg_current_xact_id()) \
-             where correction_id = $1 and definition_id = $2 and phase = 'fence'",
-            &[&correction.id, &definition.id],
-        )
-        .await?;
-    let moved = client
-        .execute(
-            "update partition_correction_progress set phase = 'ledger' \
-             where correction_id = $1 and definition_id = $2 and phase = 'fence' \
-               and pg_snapshot_xmin(pg_current_snapshot()) > fence_xid",
-            &[&correction.id, &definition.id],
-        )
-        .await?;
-    Ok(moved > 0)
-}
-
-/// The ledger's group columns' types, in `plain_group_cols` order, as the
-/// cursor's binds cast to them.
-async fn group_types(
-    pool: &Pool,
-    ledger: &LedgerTargetPlan,
-) -> Result<Vec<String>, CorrectionError> {
-    let client = pool.get().await?;
-    let names: Vec<String> = ledger
-        .plain_group_cols()
-        .into_iter()
-        .map(str::to_string)
-        .collect();
-    let rows = client
-        .query(
-            &format!(
-                "select a.attname::text, {} \
-                 from pg_catalog.pg_attribute a \
-                 where a.attrelid = $1::text::regclass and a.attname::text = any($2) \
-                   and not a.attisdropped",
-                crate::defs::copy_type::type_sql("a.atttypid")
-            ),
-            &[&ledger.ledger_ident(), &names],
-        )
-        .await?;
-    names
-        .iter()
-        .map(|name| {
-            rows.iter()
-                .find(|r| r.get::<_, String>(0) == *name)
-                .map(|r| r.get::<_, String>(1))
-                .ok_or_else(|| {
-                    CorrectionError::Unroutable(format!(
-                        "the ledger has no group column {name} for {}",
-                        ledger.ledger_ident()
-                    ))
-                })
-        })
-        .collect()
-}
-
-/// The ledger-phase cursor: the last entry's group values (text, `None` for
-/// `NULL`) and key.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct LedgerCursor {
-    groups: Vec<Option<String>>,
-    key: String,
-}
-
-/// The predicate selecting entries strictly after `cursor` in
-/// `(group columns, key)` order, `NULL` groups last, binding the cursor's
-/// values from `$first`, and the seeks on the first group column that the
-/// walk reads in turn: a range condition the `GROUP BY` index starts its scan
-/// at (`>=` the cursor's value, then `is null`, which sorts last). A single
-/// `(>= or is null)` would not be an index condition, so every page would
-/// scan the index from its beginning and the walk would read a quadratic
-/// number of entries.
-fn after_cursor(
-    alias: &str,
-    groups: &[&str],
-    types: &[String],
-    cursor: &LedgerCursor,
-    first_param: usize,
-) -> (String, Vec<String>, Vec<String>) {
-    let key = quote_ident(crate::defs::ledger::KEY_COLUMN);
-    let mut params: Vec<String> = Vec::new();
-    let mut bind = |value: &str, ty: &str| -> String {
-        params.push(value.to_string());
-        format!("${}::text::{ty}", first_param + params.len() - 1)
-    };
-    let mut equal: Vec<String> = Vec::new();
-    let mut any: Vec<String> = Vec::new();
-    for (i, name) in groups.iter().enumerate() {
-        let column = format!("{alias}.{}", quote_ident(name));
-        match &cursor.groups[i] {
-            Some(value) => {
-                let bound = bind(value, &types[i]);
-                let greater = format!("({column} > {bound} or {column} is null)");
-                any.push(and_all(&equal, &greater));
-                equal.push(format!("{column} = {bound}"));
-            }
-            None => {
-                equal.push(format!("{column} is null"));
-            }
-        }
-    }
-    let bound_key = bind(&cursor.key, "text");
-    any.push(and_all(&equal, &format!("{alias}.{key} > {bound_key}")));
-    let predicate = format!("({})", any.join(" or "));
-    let seeks = match groups.first() {
-        Some(first) => {
-            let column = format!("{alias}.{}", quote_ident(first));
-            match &cursor.groups[0] {
-                // The first group's bind is the first parameter.
-                Some(_) => vec![
-                    format!("{column} >= ${first_param}::text::{}", types[0]),
-                    format!("{column} is null"),
-                ],
-                None => vec![format!("{column} is null")],
-            }
-        }
-        None => vec!["true".to_string()],
-    };
-    (predicate, params, seeks)
-}
-
-fn and_all(parts: &[String], last: &str) -> String {
-    if parts.is_empty() {
-        return last.to_string();
-    }
-    format!("({} and {last})", parts.join(" and "))
-}
-
-/// Reads one page of the ledger phase's keys and re-derives them, then
-/// commits the progress with them, under `fence`. Returns the keys
-/// re-derived, or `None`, with nothing written, when the fence no longer
-/// holds.
-#[allow(clippy::too_many_arguments)]
-async fn ledger_page(
-    pool: &Pool,
-    ledger: &LedgerTargetPlan,
-    route: &Route,
-    columns: &[RouteColumn],
-    types: &[String],
-    current: &Progress,
-    correction: &PendingCorrection,
-    definition: &Definition,
-    page_keys: usize,
-    fence: &ClaimFence<'_>,
-) -> Result<Option<i64>, CorrectionError> {
-    let groups = ledger.plain_group_cols();
-    let key = quote_ident(crate::defs::ledger::KEY_COLUMN);
-    let live = format!(
-        "l.{} and not l.{}",
-        quote_ident(crate::defs::ledger::MEMBER_COLUMN),
-        quote_ident(crate::defs::ledger::TOMBSTONE_COLUMN)
-    );
-    let predicate = route_predicate(route, columns);
-    let cursor: Option<LedgerCursor> = current
-        .cursor
-        .as_deref()
-        .map(serde_json::from_str)
-        .transpose()
-        .map_err(|e| CorrectionError::Unroutable(format!("an unreadable cursor: {e}")))?;
-    let (after, bound, seeks) = match &cursor {
-        Some(cursor) => after_cursor("l", &groups, types, cursor, 2),
-        None => ("true".to_string(), Vec::new(), vec!["true".to_string()]),
-    };
-    let group_list: Vec<String> = groups
-        .iter()
-        .map(|g| format!("l.{}", quote_ident(g)))
-        .collect();
-    let group_text: Vec<String> = group_list.iter().map(|g| format!("{g}::text")).collect();
-    let order = if group_list.is_empty() {
-        format!("l.{key}")
-    } else {
-        format!("{}, l.{key}", group_list.join(", "))
-    };
-    let limit = i64::try_from(page_keys.max(1)).unwrap_or(i64::MAX);
-    let selects: Vec<String> = seeks
-        .iter()
-        .map(|seek| {
-            format!(
-                "select l.{key}{}{} from {ledger} l \
-                 where {live} and {predicate} and {after} and {seek} \
-                 order by {order} limit $1",
-                if group_text.is_empty() { "" } else { ", " },
-                group_text.join(", "),
-                ledger = ledger.ledger_ident(),
-            )
-        })
-        .collect();
-    let count = format!(
-        "select count(*) from {ledger} l where {live} and {predicate}",
-        ledger = ledger.ledger_ident(),
-    );
-
-    // Read the page under the pinned settings, in a transaction of its own:
-    // the settings change what the constraint text means, and the
-    // re-derive below must run under the session's own.
-    let mut client = pool.get().await?;
-    let (rows, total) = {
-        let txn = client
-            .build_transaction()
-            .isolation_level(IsolationLevel::ReadCommitted)
-            .start()
-            .await?;
-        txn.batch_execute(&partitions::pinned_settings()).await?;
-        txn.batch_execute(WALK_PLAN_SETTINGS).await?;
-        // Each seek's entries follow the previous one's in the walk's order,
-        // so the page is the first `limit` of them read in turn.
-        let mut rows = Vec::new();
-        for select in &selects {
-            let want = limit - i64::try_from(rows.len()).unwrap_or(i64::MAX);
-            if want <= 0 {
-                break;
-            }
-            let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&want];
-            for value in &bound {
-                params.push(value);
-            }
-            rows.extend(txn.query(select, &params).await?);
-        }
-        let total: Option<i64> = if current.keys_total.is_none() {
-            Some(txn.query_one(&count, &[]).await?.get(0))
-        } else {
-            None
-        };
-        txn.commit().await?;
-        (rows, total)
-    };
-    let found: Vec<String> = rows.iter().map(|r| r.get(0)).collect();
-    let last = rows.last().map(|r| LedgerCursor {
-        groups: (0..groups.len()).map(|i| r.get(i + 1)).collect(),
-        key: r.get(0),
-    });
-    let finished = rows.len() < page_keys.max(1);
-
-    let txn = client
-        .build_transaction()
-        .isolation_level(IsolationLevel::ReadCommitted)
-        .start()
-        .await?;
-    txn.batch_execute(&format!(
-        "set local application_name = '{CHUNK_APPLICATION_NAME}'"
-    ))
-    .await?;
-    if !fence.hold(&*txn).await? {
-        txn.rollback().await?;
-        return Ok(None);
-    }
-    let keys = unpoisoned(&txn, ledger, &found).await?;
-    let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
-    if !refs.is_empty() {
-        build::rederive_keys(&txn, ledger, &refs).await?;
-    }
-    let next_cursor = match (&last, finished) {
-        (Some(last), false) => Some(serde_json::to_string(last).expect("a cursor serializes")),
-        _ => None,
-    };
-    let (phase, total_estimate) = if !finished {
-        (Phase::Ledger, 0)
-    } else if reads_node(correction, route) {
-        (Phase::Node, node_estimate(&txn, correction).await?)
-    } else {
-        (Phase::Done, 0)
-    };
-    // The node phase's keys join the total once the ledger phase is done.
-    txn.execute(
-        "update partition_correction_progress set phase = $3, cursor = $4, \
-             keys_done = keys_done + $5::bigint, \
-             keys_total = coalesce(keys_total, 0) + coalesce($6::bigint, 0) + $7::bigint \
-         where correction_id = $1 and definition_id = $2",
-        &[
-            &correction.id,
-            &definition.id,
-            &phase.as_str(),
-            &next_cursor,
-            &i64::try_from(found.len()).unwrap_or(i64::MAX),
-            &total,
-            &total_estimate,
-        ],
-    )
-    .await?;
-    pause_before_commit(&txn, definition).await?;
-    txn.commit().await?;
-    Ok(Some(i64::try_from(keys.len()).unwrap_or(i64::MAX)))
 }
 
 /// The test hook before a page commits ([`super::interleave`]'s
@@ -1810,213 +1294,17 @@ async fn pause_before_commit(
     Ok(())
 }
 
-/// Whether the correction walks the node's rows after the ledger: a node in
-/// the tree (new, attached, or a `DEFAULT` whose siblings changed), whose
-/// rows may have no entry yet, and a gone node without a usable text, which
-/// routes no entry. A gone node routed by its text needs no node phase: every
-/// row it held satisfied that text while it was in the tree, so the ledger
-/// phase found every live entry of its rows, and reading a detached table's
-/// rows would only rewrite those tombstones again. A complement has no node.
+/// Whether the correction reads the node's own rows for its groups: a node
+/// in the tree (new, attached, or a `DEFAULT` whose siblings changed), whose
+/// rows may be in groups the target doesn't have yet, and a gone node
+/// without a usable text, which routes no group. A gone node routed by its
+/// text needs no read of its table: every group of its rows routes to it by
+/// that text. A complement has no node.
 fn reads_node(correction: &PendingCorrection, route: &Route) -> bool {
     if correction.kind == partitions::Kind::Complement.as_str() {
         return false;
     }
     correction.kind != partitions::Kind::GoneNode.as_str() || *route == Route::Unusable
-}
-
-/// The ledger walk's planner settings: an ordered scan of the `GROUP BY`
-/// index from the seek, sorted by key only within a group, which stops after
-/// a page of entries. On a ledger whose statistics lag (a fresh build's), the
-/// planner otherwise picks a bitmap scan of every entry past the seek and a
-/// sort of them all for each page, which made the walk of a 1M-entry leaf
-/// read 800,000 entries a page at its start: quadratic in the node.
-const WALK_PLAN_SETTINGS: &str = "set local enable_seqscan = off; \
-     set local enable_bitmapscan = off; set local enable_sort = off";
-
-/// The keys of `found` that are not quarantined for the definition, as a
-/// build leaves them out (`poison`).
-async fn unpoisoned(
-    txn: &tokio_postgres::Transaction<'_>,
-    ledger: &LedgerTargetPlan,
-    found: &[String],
-) -> Result<Vec<String>, CorrectionError> {
-    if found.is_empty() {
-        return Ok(Vec::new());
-    }
-    Ok(txn
-        .query(
-            "select k from unnest($1::text[]) as u(k) \
-             where not exists (select 1 from poison p \
-                               join transform_definitions d on d.id = p.transform_id \
-                               where p.src_table = $2 and p.key = u.k and d.target_table = $3) \
-             order by k",
-            &[&found, &ledger.source_table(), &ledger.target],
-        )
-        .await?
-        .into_iter()
-        .map(|row| row.get(0))
-        .collect())
-}
-
-/// The rows the node phase expects, by the planner's estimate (`reltuples`,
-/// zero for a table nothing has analyzed or a node that is gone).
-async fn node_estimate(
-    txn: &tokio_postgres::Transaction<'_>,
-    correction: &PendingCorrection,
-) -> Result<i64, CorrectionError> {
-    let estimate: Option<f32> = txn
-        .query_opt(
-            "select c.reltuples from pg_catalog.pg_class c where c.oid = $1::bigint::oid",
-            &[&u32_param(correction.node_oid)],
-        )
-        .await?
-        .map(|row| row.get(0));
-    #[allow(clippy::cast_possible_truncation)]
-    Ok(estimate.map_or(0, |e| e.max(0.0) as i64))
-}
-
-/// Reads one page of the node phase's keys from the node itself and
-/// re-derives them, committing the progress with them, under `fence`.
-/// Returns the keys re-derived, or `None`, with nothing written, when the
-/// fence no longer holds.
-async fn node_page(
-    pool: &Pool,
-    ledger: &LedgerTargetPlan,
-    current: &Progress,
-    correction: &PendingCorrection,
-    definition: &Definition,
-    page_keys: usize,
-    fence: &ClaimFence<'_>,
-) -> Result<Option<i64>, CorrectionError> {
-    let mut client = pool.get().await?;
-    let txn = client
-        .build_transaction()
-        .isolation_level(IsolationLevel::ReadCommitted)
-        .start()
-        .await?;
-    txn.batch_execute(&format!(
-        "set local application_name = '{CHUNK_APPLICATION_NAME}'"
-    ))
-    .await?;
-    if !fence.hold(&*txn).await? {
-        txn.rollback().await?;
-        return Ok(None);
-    }
-    // The node by oid, so a rename doesn't lose it; none once it is dropped.
-    // Qualified whatever the search path is.
-    let node: Option<String> = txn
-        .query_opt(
-            "select pg_catalog.format('%I.%I', n.nspname, c.relname) \
-             from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
-             where c.oid = $1::bigint::oid and c.relkind in ('r', 'p')",
-            &[&u32_param(correction.node_oid)],
-        )
-        .await?
-        .map(|row| row.get(0));
-    let Some(node) = node else {
-        finish(&txn, correction, definition, 0, None, true).await?;
-        txn.commit().await?;
-        return Ok(Some(0));
-    };
-    // A gone node read here has no usable text (`reads_node`): its table,
-    // once detached, is read the same way, and each key re-derived reads the
-    // source, finding no row for it.
-    let pk = ledger.source_pk();
-    let idents: Vec<String> = pk.iter().map(|c| quote_ident(&c.name)).collect();
-    let cursor_parts: Option<Vec<String>> = match current.cursor.as_deref() {
-        Some(cursor) => Some(
-            ddl::split_pk_key(pk, ledger.source_table(), cursor)
-                .map_err(|e| CorrectionError::Unroutable(format!("an unreadable cursor: {e}")))?
-                .into_iter()
-                .map(|part| part.map(|c| c.into_owned()).unwrap_or_default())
-                .collect(),
-        ),
-        None => None,
-    };
-    let after = if cursor_parts.is_some() {
-        backfill::pk_row_cmp(&idents, pk, ">", 0)
-    } else {
-        "true".to_string()
-    };
-    let order: Vec<String> = pk
-        .iter()
-        .zip(&idents)
-        .map(|(c, ident)| c.ordered(ident))
-        .collect();
-    let limit = i64::try_from(page_keys.max(1)).unwrap_or(i64::MAX);
-    let limit_param = cursor_parts.as_ref().map_or(0, Vec::len) + 1;
-    let sql = format!(
-        "select {k} from {node} s where {after} and {not_null} order by {order} limit ${limit_param}",
-        k = ddl::pk_key_sql_expr(pk, Some("s")),
-        not_null = backfill::key_not_null(&idents),
-        order = order.join(", "),
-    );
-    let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = Vec::new();
-    if let Some(parts) = &cursor_parts {
-        for part in parts {
-            params.push(part);
-        }
-    }
-    params.push(&limit);
-    let found: Vec<String> = txn
-        .query(&sql, &params)
-        .await?
-        .into_iter()
-        .map(|row| row.get(0))
-        .collect();
-    let finished = found.len() < page_keys.max(1);
-    let keys = unpoisoned(&txn, ledger, &found).await?;
-    let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
-    if !refs.is_empty() {
-        build::rederive_keys(&txn, ledger, &refs).await?;
-    }
-    let next = if finished {
-        None
-    } else {
-        found.last().cloned()
-    };
-    finish(
-        &txn,
-        correction,
-        definition,
-        i64::try_from(found.len()).unwrap_or(i64::MAX),
-        next.as_deref(),
-        finished,
-    )
-    .await?;
-    pause_before_commit(&txn, definition).await?;
-    txn.commit().await?;
-    Ok(Some(i64::try_from(keys.len()).unwrap_or(i64::MAX)))
-}
-
-/// Commits a node-phase page's progress: `done` keys more, the cursor, and
-/// the phase `done` when the walk is.
-async fn finish(
-    txn: &tokio_postgres::Transaction<'_>,
-    correction: &PendingCorrection,
-    definition: &Definition,
-    done: i64,
-    cursor: Option<&str>,
-    finished: bool,
-) -> Result<(), CorrectionError> {
-    txn.execute(
-        "update partition_correction_progress set phase = $3, cursor = $4, \
-             keys_done = keys_done + $5::bigint \
-         where correction_id = $1 and definition_id = $2",
-        &[
-            &correction.id,
-            &definition.id,
-            &if finished {
-                Phase::Done.as_str()
-            } else {
-                Phase::Node.as_str()
-            },
-            &cursor,
-            &done,
-        ],
-    )
-    .await?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -2225,44 +1513,6 @@ mod tests {
         );
         correction.node_oid = 9;
         assert_eq!(route_of(&correction, Some(&recorded)), Route::Unusable);
-    }
-
-    #[test]
-    fn the_cursor_predicate_orders_groups_then_key_with_nulls_last() {
-        let cursor = LedgerCursor {
-            groups: vec![Some("5".to_string()), None],
-            key: "k9".to_string(),
-        };
-        let (sql, params, seeks) = after_cursor(
-            "l",
-            &["a", "b"],
-            &["integer".to_string(), "text".to_string()],
-            &cursor,
-            2,
-        );
-        assert_eq!(params, vec!["5".to_string(), "k9".to_string()]);
-        assert_eq!(
-            sql,
-            "((l.\"a\" > $2::text::integer or l.\"a\" is null) \
-             or (l.\"a\" = $2::text::integer and l.\"b\" is null and l.\"__from_key\" > $3::text::text))"
-        );
-        assert_eq!(
-            seeks,
-            ["l.\"a\" >= $2::text::integer", "l.\"a\" is null"],
-            "a seek the index can start at, then the NULLs, which sort last"
-        );
-        let null_first = LedgerCursor {
-            groups: vec![None, Some("x".to_string())],
-            key: "k1".to_string(),
-        };
-        let (_, _, seeks) = after_cursor(
-            "l",
-            &["a", "b"],
-            &["integer".to_string(), "text".to_string()],
-            &null_first,
-            2,
-        );
-        assert_eq!(seeks, ["l.\"a\" is null"]);
     }
 
     /// Each node's route over a probe row, under [`route_columns_named`],

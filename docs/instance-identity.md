@@ -184,7 +184,7 @@ One thing remains the operator's responsibility, not the engine's:
   deliberately outside the instance schema (see `DEFAULT_TARGET_SCHEMA`), and
   two instances may share a target schema (`public` by default). A define
   never takes over a relation it didn't create, so a target whose name, or
-  whose `<target>__ledger` or `<target>__deltas`, is already taken in the
+  whose `<target>__ledger`, is already taken in the
   target schema, by the other instance's target or anything else, is refused
   ([transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)).
   Whichever instance defines a name second is the one refused. Give the

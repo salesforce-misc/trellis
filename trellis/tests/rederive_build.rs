@@ -1,6 +1,7 @@
 //! The scheduled Re-derive build (#625 F2/F3, epic #556; ADR-0002 "A build
-//! is Re-derive over chunks, and applies from its first chunk"): the only
-//! build of a plain invertible aggregate since F3.
+//! is Re-derive over chunks, and applies from its first chunk"): the build of
+//! a plain 1-1 target. (An aggregate is built by the group basis's one
+//! absolute write, `group_basis_build.rs`.)
 //!
 //! Every test steps the engine by hand: the staging worker's reconcile pass
 //! (`trellis::client::reconcile_pass`), a drain worker's build step
@@ -15,8 +16,8 @@ use testkit::{TestCluster, TestDatabase};
 use tokio_postgres::{Client, NoTls};
 use trellis::config::{Config, DEFAULT_SCHEMA};
 use trellis::defs::ValueType;
-use trellis::defs::chunk_queue::{self, ChunkWork};
-use trellis::staging::build::{self, BuildPlan, Step, WorkerOptions};
+use trellis::defs::chunk_queue;
+use trellis::staging::build::{self, Step, WorkerOptions};
 use trellis::staging::{StagedWatermark, apply, has_pending, retire_drained_segments};
 use trellis::{Trellis, TrellisOptions};
 
@@ -125,14 +126,9 @@ impl Fixture {
 
     /// One drain worker's build step.
     async fn step(&self, options: &WorkerOptions) -> Step {
-        build::work_once(
-            &self.db.pool,
-            "worker",
-            options,
-            &mut build::MergeFailures::default(),
-        )
-        .await
-        .expect("build step")
+        build::work_once(&self.db.pool, "worker", options)
+            .await
+            .expect("build step")
     }
 
     /// Claims and runs up to `max` plan jobs and chunks by hand, with no
@@ -255,29 +251,6 @@ impl Fixture {
             .get(0)
     }
 
-    /// Merges every one of `plan`'s delta rows by hand, a committed pass per
-    /// merge partition (#717), until a pass merges nothing.
-    async fn merge_all(&self, plan: &BuildPlan) {
-        loop {
-            let mut client = self.db.pool.get().await.expect("pool");
-            let txn = client.transaction().await.expect("begin");
-            let outcome = build::merge_deltas(&txn, plan, 10_000)
-                .await
-                .expect("merge");
-            txn.commit().await.expect("commit the merge");
-            assert!(!outcome.skipped, "no other merger runs: {outcome:?}");
-            if outcome.claimed == 0 {
-                return;
-            }
-        }
-    }
-
-    /// The merge partitions `agg`'s delta rows are in (#717).
-    async fn partitions(&self) -> i64 {
-        self.count("select count(distinct __part) from public.agg__deltas")
-            .await
-    }
-
     async fn assert_one_oracle(&self) {
         assert_eq!(
             self.rows(ONE_ACTUAL).await,
@@ -305,75 +278,11 @@ impl Fixture {
     }
 }
 
-/// The build's lifecycle is `waiting_to_backfill -> backfilling -> live`,
-/// with no `catching_up` and no marker, and the target ends equal to the
-/// oracle.
-#[tokio::test]
-async fn a_rederive_build_goes_from_waiting_to_live_with_no_catch_up() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
-    let mut f = Fixture::new(200, &[AGG]).await;
-    assert_eq!(
-        f.status("agg").await.as_deref(),
-        Some("waiting_to_backfill")
-    );
-
-    f.pass().await;
-    assert_eq!(f.status("agg").await.as_deref(), Some("backfilling"));
-    assert_eq!(f.build("agg").await.as_deref(), Some("rederive"));
-    assert_eq!(
-        f.count("select count(*) from backfill_chunks where kind = 'plan'")
-            .await,
-        1,
-        "the start enqueued the plan job"
-    );
-    assert_eq!(
-        f.count("select count(*) from backfill_chunks where kind = 'sweep'")
-            .await,
-        0,
-        "a fresh build's ledger is empty at its start, so it gets no sweep"
-    );
-    assert_eq!(
-        f.count("select count(*) from pending_backfill").await,
-        0,
-        "no marker is parked for a re-derive build (the install's join marker discharged)"
-    );
-
-    let (steps, seen) = f.run("agg").await;
-    assert_eq!(steps.first(), Some(&Step::Planned));
-    assert!(steps.contains(&Step::Chunk) && steps.contains(&Step::Merged));
-    assert_eq!(
-        seen,
-        BTreeSet::from(["backfilling".to_string(), "live".to_string()]),
-        "the build never passes through catching_up"
-    );
-    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
-    assert_eq!(
-        f.build("agg").await,
-        None,
-        "a finished build clears `build`"
-    );
-    assert_eq!(
-        steps.iter().filter(|step| **step == Step::Chunk).count(),
-        20,
-        "200 rows in chunks of 10"
-    );
-    assert_eq!(
-        f.count("select count(*) from backfill_chunks").await,
-        0,
-        "the flip deleted the build's rows (#966)"
-    );
-    assert_eq!(f.count("select count(*) from public.agg__deltas").await, 0);
-    f.assert_agg_oracle().await;
-}
-
 /// A started definition applies at once (B1): a write drained before any
 /// chunk runs reaches the target, and every kind of write made while the
 /// build runs ends up counted exactly once.
 #[tokio::test]
 async fn changes_drained_while_backfilling_are_applied() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(200, &[AGG]).await;
     f.pass().await;
 
@@ -422,376 +331,10 @@ async fn changes_drained_while_backfilling_are_applied() {
     f.assert_agg_oracle().await;
 }
 
-/// `SUM`, `MAX` (a recomputed field that folds), `AVG` and `COUNT(*)` by `g`.
-const AGG_WIDE: &str = "TRANSFORM agg FROM public.src GROUP BY g \
-    WITHOUT SOURCE INDEX SELECT SUM(v) AS total, MAX(v) AS biggest, AVG(v) AS mean, COUNT(*) AS n";
-
-/// The read-your-writes contract over a build (#728; ADR-0002, "What `live`
-/// promises"): a workload runs while the target builds, and the moment the
-/// definition reports `live`, with no step past the flip, a watermark token
-/// taken after a later write is already met and the target equals a
-/// from-scratch `GROUP BY`.
-///
-/// The workload covers what the facade-level oracle tests in
-/// `defs_exact_integers.rs` and `defs_floats.rs` raced against the build
-/// before #728: group moves, the `NULL` group (entered by Apply before any
-/// chunk and by chunks after), a group emptied mid-build across chunked and
-/// unchunked keys, a group created and emptied within the build, and groups
-/// losing their `MAX`. Each round's write is read by the next chunks before
-/// it drains, and by later chunks after it drains.
-///
-/// Group 50 loses its `MAX` through the merger alone: Apply counts keys 7
-/// (v 10000) and 8 into it before the plan, and the first chunk then reads
-/// key 7 lowered to 1 before that change drains, so only its delta row says
-/// a value left the group. The merge must recompute the group rather than
-/// fold, and no later page writes it to cover for a fold.
-#[tokio::test]
-async fn a_target_reporting_live_meets_a_token_and_the_oracle_after_a_build_under_writes() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
-    let mut f = Fixture::new(200, &[AGG_WIDE]).await;
-    f.pass().await;
-    assert_eq!(f.status("agg").await.as_deref(), Some("backfilling"));
-
-    // Before any chunk, by Apply alone: two keys into the `NULL` group, a
-    // new group 99, and keys 7 and 8 into group 50 with 7 its `MAX`.
-    f.raw
-        .batch_execute(
-            "update public.src set g = null where id in (2, 150); \
-             insert into public.src values (5000, 99, 5); \
-             update public.src set g = 50, v = 10000 where id = 7; \
-             update public.src set g = 50 where id = 8",
-        )
-        .await
-        .expect("write before the plan");
-    f.drain().await;
-    assert_eq!(f.step(&OPTIONS).await, Step::Planned);
-
-    // Group 50's `MAX` leaves through the first chunk (keys 1 to 10), which
-    // reads the change before it drains.
-    f.raw
-        .batch_execute("update public.src set v = 1 where id = 7")
-        .await
-        .expect("lower group 50's MAX");
-    assert_eq!(f.step(&OPTIONS).await, Step::Chunk);
-    assert_eq!(
-        f.count("select count(*) from public.agg__deltas where g = 50")
-            .await,
-        1,
-        "the chunk's delta row for group 50"
-    );
-    f.drain().await;
-
-    let mut steps = Vec::new();
-    for round in 0..6 {
-        let base = round * 30;
-        // The moves and the `+ 1`s reach a key in every chunk, so the next
-        // chunk to run reads one of each before it drains. None touches
-        // group 50.
-        let mut sql = format!(
-            "update public.src set g = null where id = {null}; \
-             update public.src set g = (g + 1) % 6 where id % 10 = {round} and g <> 50; \
-             update public.src set v = v + 1 where id % 10 = {plus} and g is distinct from 50; \
-             update public.src set v = v + 1000 where id = {raised}; \
-             delete from public.src where id = {deleted};",
-            null = base + 3,
-            plus = round + 5,
-            raised = base + 20,
-            deleted = base + 26,
-        );
-        sql.push_str(match round {
-            // Group 6 emptied, over keys chunked and not; nothing moves
-            // into it again (`% 6`).
-            2 => "delete from public.src where g = 6;",
-            // Out of the `NULL` group again.
-            3 => "update public.src set g = 4 where id = 2;",
-            // The group created before the plan, emptied.
-            4 => "delete from public.src where g = 99;",
-            // Group 1 loses its `MAX`.
-            5 => {
-                "delete from public.src where id = \
-                 (select id from public.src where g = 1 order by v desc, id limit 1);"
-            }
-            _ => "",
-        });
-        f.raw.batch_execute(&sql).await.expect("write");
-        // Chunks (and merges) read the write before it drains, then more
-        // after.
-        for _ in 0..2 {
-            steps.push(f.step(&OPTIONS).await);
-        }
-        f.drain().await;
-        steps.push(f.step(&OPTIONS).await);
-    }
-
-    // Step only until the flip, and not one step past it.
-    let mut live = false;
-    for _ in 0..MAX_STEPS {
-        f.drain().await;
-        let step = f.step(&OPTIONS).await;
-        steps.push(step);
-        if f.status("agg").await.as_deref() == Some("live") {
-            live = true;
-            break;
-        }
-        assert!(
-            step.progressed(),
-            "the build stalled before live: {steps:?}"
-        );
-    }
-    assert!(
-        live,
-        "the build did not reach live within {MAX_STEPS} steps"
-    );
-    assert!(
-        steps.contains(&Step::Chunk) && steps.contains(&Step::Merged),
-        "the build went through chunks and the merger: {steps:?}"
-    );
-
-    // Once `live`, a write's token covers it (ADR-0002): drained, a token
-    // taken after it is already met, with no wait.
-    f.raw
-        .batch_execute(
-            "update public.src set g = null where id = 199; \
-             delete from public.src where id = 33",
-        )
-        .await
-        .expect("write after live");
-    f.drain().await;
-    let trellis = f.trellis().await;
-    let token = trellis.watermark_token().await.expect("watermark_token");
-    trellis
-        .await_converged(token, Duration::ZERO)
-        .await
-        .expect("a drained ring meets the token at once");
-    trellis.shutdown().await.expect("shutdown");
-
-    assert_eq!(
-        f.count("select count(*) from public.agg__deltas").await,
-        0,
-        "live leaves no delta behind"
-    );
-    let differences = f
-        .count(
-            "with expected as ( \
-                 select g, sum(v) as total, max(v) as biggest, avg(v) as mean, count(*) as n \
-                 from public.src group by g \
-             ), \
-             actual as (select g, total, biggest, mean, n from public.agg) \
-             select (select count(*) from (table expected except table actual) missing) \
-                  + (select count(*) from (table actual except table expected) extra)",
-        )
-        .await;
-    assert_eq!(differences, 0, "the live target equals the oracle");
-    // The cases the workload is for are really in the outcome.
-    assert_eq!(
-        f.count("select count(*) from public.agg where g is null")
-            .await,
-        1,
-        "the NULL group is there"
-    );
-    assert_eq!(
-        f.count("select count(*) from public.agg where g in (6, 99)")
-            .await,
-        0,
-        "the emptied groups are gone"
-    );
-    assert_eq!(
-        f.count("select biggest::bigint from public.agg where g = 50")
-            .await,
-        8,
-        "group 50's MAX is key 8's, after key 7 left it"
-    );
-}
-
-/// The flip waits for the last merge (B7): with every chunk done but deltas
-/// still pending, the definition stays `backfilling`, and the merge that
-/// empties the delta table moves it to `live`.
-#[tokio::test]
-async fn the_flip_happens_only_after_the_last_merge() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
-    let mut f = Fixture::new(60, &[AGG]).await;
-    f.pass().await;
-    let pool = &f.db.pool;
-
-    // Run the plan and every chunk by hand, with no merge between them.
-    f.run_chunks_by_hand(usize::MAX).await;
-    assert_eq!(
-        f.count("select count(*) from backfill_chunks where not done")
-            .await,
-        0,
-        "every chunk is done"
-    );
-    let pending = f.count("select count(*) from public.agg__deltas").await;
-    assert!(pending > 0, "the chunks left deltas for the merger");
-    assert_eq!(f.status("agg").await.as_deref(), Some("backfilling"));
-    let id = f.definition_id().await;
-    assert!(
-        !build::try_complete(pool, id).await.expect("try_complete"),
-        "not live while deltas are pending"
-    );
-    assert_eq!(
-        f.rows(AGG_ACTUAL).await,
-        Vec::<String>::new(),
-        "no group yet"
-    );
-
-    assert!(f.partitions().await > 1, "the deltas span partitions");
-    // A step merges one partition (#717): every merge but the last leaves
-    // deltas in another partition, so the definition stays `backfilling`.
-    while f.partitions().await > 1 {
-        assert_eq!(f.step(&OPTIONS).await, Step::Merged);
-        assert_eq!(f.status("agg").await.as_deref(), Some("backfilling"));
-    }
-    assert_eq!(f.step(&OPTIONS).await, Step::Merged);
-    assert_eq!(f.count("select count(*) from public.agg__deltas").await, 0);
-    assert_eq!(
-        f.status("agg").await.as_deref(),
-        Some("live"),
-        "the merge that emptied the delta table flipped it"
-    );
-    f.assert_agg_oracle().await;
-}
-
-/// The strict flip still waits for every merge in flight (#625 F2b, B7,
-/// #717): a merge that has claimed and deleted delta rows but not committed
-/// leaves the table non-empty to everyone else, so neither `try_complete`
-/// nor a worker's step flips the build until the last of them commits. Two
-/// merges are left in flight, on the last two partitions with rows: the
-/// worker skips the merge (others hold every partition with rows), finds
-/// nothing else to do and reports idle without waiting on them, and the
-/// flip comes only once both committed.
-#[tokio::test]
-async fn the_flip_waits_for_every_merge_in_flight() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
-    let mut f = Fixture::new(60, &[AGG]).await;
-    f.pass().await;
-    let pool = &f.db.pool;
-    f.run_chunks_by_hand(usize::MAX).await;
-    let id = f.definition_id().await;
-    let plan = BuildPlan::load(pool, "agg")
-        .await
-        .expect("load the plan")
-        .expect("a buildable target");
-    while f.partitions().await > 2 {
-        let mut client = pool.get().await.expect("pool");
-        let txn = client.transaction().await.expect("begin");
-        build::merge_deltas(&txn, &plan, i64::MAX)
-            .await
-            .expect("merge a partition");
-        txn.commit().await.expect("commit the merge");
-    }
-    assert_eq!(f.partitions().await, 2);
-
-    let mut client_a = pool.get().await.expect("pool");
-    let merge_a = client_a.transaction().await.expect("begin merge A");
-    let a = build::merge_deltas(&merge_a, &plan, i64::MAX)
-        .await
-        .expect("merge A");
-    let mut client_b = pool.get().await.expect("pool");
-    let merge_b = client_b.transaction().await.expect("begin merge B");
-    let b = build::merge_deltas(&merge_b, &plan, i64::MAX)
-        .await
-        .expect("merge B");
-    assert!(a.claimed > 0 && b.claimed > 0, "{a:?} {b:?}");
-    assert_ne!(
-        a.partition, b.partition,
-        "B takes the partition A doesn't hold"
-    );
-
-    assert!(
-        !build::try_complete(pool, id).await.expect("try_complete"),
-        "not live while both merges are uncommitted"
-    );
-    assert_eq!(
-        f.step(&OPTIONS).await,
-        Step::Idle,
-        "a worker skips the busy partitions, and has nothing else to do"
-    );
-    merge_a.commit().await.expect("commit merge A");
-    assert!(
-        !build::try_complete(pool, id).await.expect("try_complete"),
-        "not live while B is uncommitted"
-    );
-    assert_eq!(f.status("agg").await.as_deref(), Some("backfilling"));
-
-    merge_b.commit().await.expect("commit merge B");
-    assert!(
-        build::try_complete(pool, id).await.expect("try_complete"),
-        "the flip once both merges committed"
-    );
-    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
-    f.assert_agg_oracle().await;
-}
-
-/// A worker that finds every partition with rows being merged takes a chunk
-/// instead of waiting for a merge or reporting idle (#625 F2b, #717): one
-/// merger per partition, and the rest of the workers build.
-#[tokio::test]
-async fn a_worker_takes_a_chunk_while_others_merge() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
-    let mut f = Fixture::new(60, &[AGG]).await;
-    f.pass().await;
-    let pool = &f.db.pool;
-    // The plan job and two chunks, so every group has two delta rows, and
-    // chunks are left.
-    assert_eq!(f.run_chunks_by_hand(3).await, 3);
-    let plan = BuildPlan::load(pool, "agg")
-        .await
-        .expect("load the plan")
-        .expect("a buildable target");
-    // A merge in flight on every partition, of one row each: its group's
-    // other row is left for a second merger of the partition, which would
-    // wait on this merge's group row if it took it.
-    let partitions = usize::try_from(f.partitions().await).expect("a count");
-    let mut clients = Vec::new();
-    for _ in 0..=partitions {
-        clients.push(pool.get().await.expect("pool"));
-    }
-    let mut merges = Vec::new();
-    for client in &mut clients {
-        merges.push(client.transaction().await.expect("begin a merge"));
-    }
-    for (i, merge) in merges.iter().enumerate() {
-        let outcome = build::merge_deltas(merge, &plan, 1).await.expect("merge");
-        if i < partitions {
-            assert_eq!(
-                (outcome.claimed, outcome.skipped),
-                (1, false),
-                "{outcome:?}"
-            );
-        } else {
-            assert!(
-                outcome.skipped,
-                "every partition is being merged: {outcome:?}"
-            );
-        }
-    }
-
-    let step = tokio::time::timeout(Duration::from_secs(30), f.step(&OPTIONS))
-        .await
-        .expect("the step doesn't wait on the merges in flight");
-    assert_eq!(step, Step::Chunk);
-    for merge in merges {
-        merge.commit().await.expect("commit a merge");
-    }
-    drop(clients);
-
-    let (steps, _) = f.run("agg").await;
-    assert!(steps.contains(&Step::Merged), "{steps:?}");
-    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
-    f.assert_agg_oracle().await;
-}
-
 /// A source with no rows plans no chunk, and the plan job itself moves the
 /// definition to `live`.
 #[tokio::test]
 async fn a_zero_row_source_goes_live_from_the_plan_job() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(0, &[AGG]).await;
     f.pass().await;
     assert_eq!(f.status("agg").await.as_deref(), Some("backfilling"));
@@ -805,70 +348,12 @@ async fn a_zero_row_source_goes_live_from_the_plan_job() {
     assert_eq!(f.step(&OPTIONS).await, Step::Idle);
 }
 
-/// A chunk whose worker dies mid-write (its transaction rolls back after the
-/// entries and deltas were written) is reclaimed and run again, and the
-/// build still equals the oracle.
-#[tokio::test]
-async fn a_chunk_killed_mid_write_is_reclaimed_and_rerun() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
-    let mut f = Fixture::new(100, &[AGG]).await;
-    f.pass().await;
-    assert_eq!(f.step(&OPTIONS).await, Step::Planned);
-    let pool = &f.db.pool;
-
-    let chunk = {
-        let client = pool.get().await.expect("pool");
-        chunk_queue::claim_chunks_of(&**client, "doomed", 1, &[chunk_queue::KIND_REDERIVE])
-            .await
-            .expect("claim")
-            .into_iter()
-            .next()
-            .expect("a chunk to claim")
-    };
-    let ChunkWork::Rederive { lo, hi } = &chunk.work else {
-        panic!("claimed {:?}", chunk.work);
-    };
-    let plan = BuildPlan::load(pool, "agg")
-        .await
-        .expect("load")
-        .expect("a re-derive shape");
-    {
-        let mut client = pool.get().await.expect("pool");
-        let txn = client.transaction().await.expect("begin");
-        let outcome = build::run_chunk(&txn, &plan, lo.as_deref(), hi)
-            .await
-            .expect("the chunk writes");
-        assert!(outcome.keys > 0 && outcome.delta_rows > 0);
-        // The worker dies here: its transaction never commits.
-        txn.rollback().await.expect("roll back");
-    }
-    assert_eq!(f.count("select count(*) from public.agg__deltas").await, 0);
-
-    let reclaimed = chunk_queue::reclaim_stale_chunks(&mut f.raw, Duration::ZERO)
-        .await
-        .expect("reclaim");
-    assert_eq!(reclaimed, 1, "the dead worker's claim is freed");
-    f.run("agg").await;
-    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
-    // The flip deleted the build's rows (#966), so the chunk's range is
-    // known to have run by the target alone: the oracle below covers it.
-    assert_eq!(
-        f.count("select count(*) from backfill_chunks").await,
-        0,
-        "another worker ran the reclaimed chunk, and the flip deleted it"
-    );
-    f.assert_agg_oracle().await;
-}
-
 /// A chunk whose entry lock a drain page holds gives up after its short lock
 /// timeout and is retried later without a charge (B6); the build then
 /// finishes.
 #[tokio::test]
 async fn a_chunk_behind_a_held_entry_gives_up_and_is_retried_uncharged() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
-    let mut f = Fixture::new(40, &[AGG]).await;
+    let mut f = Fixture::new(40, &[ONE]).await;
     f.pass().await;
     // An entry for key 5, which the first chunk (ids 1..=10) covers.
     f.raw
@@ -880,7 +365,7 @@ async fn a_chunk_behind_a_held_entry_gives_up_and_is_retried_uncharged() {
 
     let holder = connect(f.db.dsn()).await;
     holder
-        .batch_execute("begin; select 1 from public.agg__ledger where __from_key = '5' for update")
+        .batch_execute("begin; select 1 from public.one__ledger where __from_key = '5' for update")
         .await
         .expect("hold key 5's entry");
     assert_eq!(f.step(&OPTIONS).await, Step::Chunk);
@@ -908,18 +393,16 @@ async fn a_chunk_behind_a_held_entry_gives_up_and_is_retried_uncharged() {
         .batch_execute("update backfill_chunks set next_attempt_at = now()")
         .await
         .expect("make the retry due");
-    f.run("agg").await;
-    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
-    f.assert_agg_oracle().await;
+    f.run("one").await;
+    assert_eq!(f.status("one").await.as_deref(), Some("live"));
+    f.assert_one_oracle().await;
 }
 
 /// A chunk is claimed only while the ring's sealed, undrained backlog is
 /// under twice the drain batch cap (B6); the plan job runs regardless.
 #[tokio::test]
 async fn chunks_wait_while_the_ring_has_a_backlog() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
-    let mut f = Fixture::new(40, &[AGG]).await;
+    let mut f = Fixture::new(40, &[ONE]).await;
     f.pass().await;
     f.drain().await;
     let tight = WorkerOptions {
@@ -946,18 +429,16 @@ async fn chunks_wait_while_the_ring_has_a_backlog() {
         Step::Chunk,
         "the drained ring lets it go"
     );
-    f.run("agg").await;
-    f.assert_agg_oracle().await;
+    f.run("one").await;
+    f.assert_one_oracle().await;
 }
 
-/// A source `TRUNCATE` while the build runs: its deltas and entries go with
-/// the ledger, and the rest of the build and Apply rebuild the target from
+/// A source `TRUNCATE` while the build runs: its entries go with the
+/// ledger, and the rest of the build and Apply rebuild the target from
 /// the rows inserted after it.
 #[tokio::test]
 async fn a_truncate_during_the_build_is_absorbed() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
-    let mut f = Fixture::new(100, &[AGG]).await;
+    let mut f = Fixture::new(100, &[ONE]).await;
     f.pass().await;
     for _ in 0..4 {
         f.drain().await;
@@ -977,9 +458,9 @@ async fn a_truncate_during_the_build_is_absorbed() {
         .await
         .expect("truncate and refill");
     f.drain().await;
-    f.run("agg").await;
-    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
-    f.assert_agg_oracle().await;
+    f.run("one").await;
+    assert_eq!(f.status("one").await.as_deref(), Some("live"));
+    f.assert_one_oracle().await;
 }
 
 /// A drop during the build: pause, then drop. The chunk rows, the delta
@@ -987,9 +468,7 @@ async fn a_truncate_during_the_build_is_absorbed() {
 /// do.
 #[tokio::test]
 async fn a_drop_during_the_build_takes_its_work_with_it() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
-    let mut f = Fixture::new(100, &[AGG]).await;
+    let mut f = Fixture::new(100, &[ONE]).await;
     f.pass().await;
     for _ in 0..3 {
         f.drain().await;
@@ -997,7 +476,7 @@ async fn a_drop_during_the_build_takes_its_work_with_it() {
     }
     let trellis = f.trellis().await;
     trellis
-        .apply("PAUSE TRANSFORM agg")
+        .apply("PAUSE TRANSFORM one")
         .await
         .expect("pause the building transform");
     assert_eq!(
@@ -1006,12 +485,12 @@ async fn a_drop_during_the_build_takes_its_work_with_it() {
         "a paused build gets no merge and no chunk"
     );
     trellis
-        .apply("DROP TRANSFORM agg")
+        .apply("DROP TRANSFORM one")
         .await
         .expect("drop the paused transform");
-    assert_eq!(f.status("agg").await, None);
+    assert_eq!(f.status("one").await, None);
     assert_eq!(f.count("select count(*) from backfill_chunks").await, 0);
-    for table in ["agg", "agg__ledger", "agg__deltas"] {
+    for table in ["one", "one__ledger"] {
         let exists: bool = f
             .raw
             .query_one(
@@ -1031,110 +510,6 @@ async fn a_drop_during_the_build_takes_its_work_with_it() {
     assert_eq!(f.step(&OPTIONS).await, Step::Idle);
 }
 
-/// Two definitions on one source: the one a Re-derive build serves takes
-/// it, the other (held out of the Re-derive build,
-/// `markers::hold_target_out_of_the_rederive_build`) the old direct build
-/// with its go-live catch-up, and both end equal to their oracles.
-#[tokio::test]
-async fn two_definitions_on_one_source_take_one_build_path_each() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
-    const MAXES: &str = "TRANSFORM agg_max FROM public.src GROUP BY g \
-        WITHOUT SOURCE INDEX SELECT MAX(v) AS top";
-    let mut f = Fixture::new(150, &[AGG]).await;
-    trellis::intake::markers::hold_target_out_of_the_rederive_build(
-        &f.raw,
-        "public.src",
-        "public.agg_max",
-    )
-    .await
-    .expect("hold agg_max out of the Re-derive build");
-    let columns = [
-        (
-            "id".to_string(),
-            ValueType::Integer(trellis::integer::IntWidth::Int8),
-        ),
-        (
-            "g".to_string(),
-            ValueType::Integer(trellis::integer::IntWidth::Int4),
-        ),
-        (
-            "v".to_string(),
-            ValueType::Integer(trellis::integer::IntWidth::Int8),
-        ),
-    ]
-    .into_iter()
-    .collect();
-    trellis::defs::install_definition(&f.db.pool, MAXES, &columns, "public")
-        .await
-        .expect("register the held-out definition");
-    f.pass().await;
-    assert_eq!(f.build("agg").await.as_deref(), Some("rederive"));
-    assert_eq!(f.build("agg_max").await, None);
-    assert_eq!(
-        f.status("agg_max").await.as_deref(),
-        Some("backfilling"),
-        "the discharge dispatched the old build's job"
-    );
-    let direct = f
-        .count(
-            "select count(*) from backfill_chunks c join transform_definitions d \
-             on d.id = c.definition_id \
-             where d.target_table = 'public.agg_max' and c.kind = 'direct'",
-        )
-        .await;
-    assert_eq!(direct, 1);
-
-    // The old build's job, as a drain worker runs it.
-    let pool = f.db.pool.clone();
-    let claimed = {
-        let client = pool.get().await.expect("pool");
-        chunk_queue::claim_chunks(&**client, "old", 1)
-            .await
-            .expect("claim the direct build")
-    };
-    let job = claimed.into_iter().next().expect("the direct build job");
-    assert_eq!(job.work, ChunkWork::DirectBuild);
-    chunk_queue::run_claimed_chunk(
-        &pool,
-        &job,
-        "old",
-        Duration::from_secs(1),
-        Duration::from_secs(30),
-    )
-    .await
-    .expect("run the direct build");
-    chunk_queue::finish_chunk(&pool, &job, "old")
-        .await
-        .expect("finish the direct build");
-    assert_eq!(f.status("agg_max").await.as_deref(), Some("catching_up"));
-
-    // Interleave the re-derive build with the old build's catch-up.
-    f.raw
-        .batch_execute("update public.src set v = v * 3 where id % 10 = 0")
-        .await
-        .expect("write");
-    for _ in 0..5 {
-        f.drain().await;
-        f.step(&OPTIONS).await;
-    }
-    for _ in 0..3 {
-        f.pass().await;
-        f.drain().await;
-    }
-    f.run("agg").await;
-    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
-    assert_eq!(f.status("agg_max").await.as_deref(), Some("live"));
-    f.assert_agg_oracle().await;
-    assert_eq!(
-        f.rows("select (g, top)::text from public.agg_max order by g")
-            .await,
-        f.rows("select (g, max(v))::text from public.src group by g order by g")
-            .await,
-        "the old build's target equals its oracle"
-    );
-}
-
 /// #986: a build's start that fails for good (here, the definition's ledger
 /// table was dropped, so the start's read of it errors) pauses that
 /// definition with the error as its `capture_failure`, instead of failing
@@ -1143,8 +518,6 @@ async fn two_definitions_on_one_source_take_one_build_path_each() {
 /// Resuming the paused definition refuses and names the repair.
 #[tokio::test]
 async fn a_start_that_fails_pauses_its_definition_and_the_pass_starts_the_others() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(150, &[ONE, AGG]).await;
     f.raw
         .batch_execute("drop table public.one__ledger")
@@ -1192,66 +565,12 @@ async fn a_start_that_fails_pauses_its_definition_and_the_pass_starts_the_others
     assert_eq!(f.status("one").await.as_deref(), Some("paused"));
 }
 
-/// #986: the rest of the pass runs after a start fails, not only the other
-/// starts: the registration marker of a definition the Re-derive build
-/// doesn't take (held out of it,
-/// `markers::hold_target_out_of_the_rederive_build`) is parked and
-/// discharged, so that definition's build is dispatched in the same pass.
-#[tokio::test]
-async fn a_start_that_fails_doesn_t_stop_the_pass_discharging_other_markers() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
-    const MAXES: &str = "TRANSFORM agg_max FROM public.src GROUP BY g \
-        WITHOUT SOURCE INDEX SELECT MAX(v) AS top";
-    let mut f = Fixture::new(150, &[ONE]).await;
-    trellis::intake::markers::hold_target_out_of_the_rederive_build(
-        &f.raw,
-        "public.src",
-        "public.agg_max",
-    )
-    .await
-    .expect("hold agg_max out of the Re-derive build");
-    let columns = [
-        (
-            "id".to_string(),
-            ValueType::Integer(trellis::integer::IntWidth::Int8),
-        ),
-        (
-            "g".to_string(),
-            ValueType::Integer(trellis::integer::IntWidth::Int4),
-        ),
-        (
-            "v".to_string(),
-            ValueType::Integer(trellis::integer::IntWidth::Int8),
-        ),
-    ]
-    .into_iter()
-    .collect();
-    trellis::defs::install_definition(&f.db.pool, MAXES, &columns, "public")
-        .await
-        .expect("register the held-out definition");
-    f.raw
-        .batch_execute("drop table public.one__ledger")
-        .await
-        .expect("drop the ledger of the first definition");
-
-    f.pass().await;
-    assert_eq!(f.status("one").await.as_deref(), Some("paused"));
-    assert_eq!(
-        f.status("agg_max").await.as_deref(),
-        Some("backfilling"),
-        "the discharge dispatched the old build's job"
-    );
-}
-
 /// #986: a start that fails transiently (here its read of the ledger waits
 /// out `lock_timeout` behind another session's lock, `55P03`) is retried on
 /// the next pass, not paused, and the pass still starts the other
 /// definitions' builds.
 #[tokio::test]
 async fn a_start_that_fails_transiently_is_retried_next_pass_and_not_paused() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(150, &[ONE, AGG]).await;
     let holder = connect(f.db.dsn()).await;
     holder
@@ -1306,8 +625,6 @@ async fn a_start_that_fails_transiently_is_retried_next_pass_and_not_paused() {
 /// repair.
 #[tokio::test]
 async fn a_live_definition_whose_ledger_is_dropped_is_quarantined_alone() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(50, &[ONE, AGG]).await;
     f.pass().await;
     f.run("one").await;
@@ -1360,72 +677,12 @@ async fn a_live_definition_whose_ledger_is_dropped_is_quarantined_alone() {
     );
 }
 
-/// A worker that dies after a chunk's or a merge's commit, before its own
-/// flip check, leaves a finished build `backfilling`; the next worker step
-/// that finds nothing to claim makes the flip (`work_once`'s idle check).
-#[tokio::test]
-async fn a_flip_missed_by_a_dead_worker_is_made_by_the_next_idle_step() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
-    let mut f = Fixture::new(30, &[AGG]).await;
-    f.pass().await;
-    assert_eq!(f.step(&OPTIONS).await, Step::Planned);
-    let pool = &f.db.pool;
-    let plan = BuildPlan::load(pool, "agg")
-        .await
-        .expect("load")
-        .expect("a re-derive shape");
-
-    // Every chunk and the merge, each committed by a worker that dies before
-    // it checks for the flip.
-    loop {
-        let claimed = {
-            let client = pool.get().await.expect("pool");
-            chunk_queue::claim_chunks_of(&**client, "dying", 1, &[chunk_queue::KIND_REDERIVE])
-                .await
-                .expect("claim")
-        };
-        let Some(chunk) = claimed.into_iter().next() else {
-            break;
-        };
-        let ChunkWork::Rederive { lo, hi } = &chunk.work else {
-            panic!("claimed {:?}", chunk.work);
-        };
-        let mut client = pool.get().await.expect("pool");
-        let txn = client.transaction().await.expect("begin");
-        build::run_chunk(&txn, &plan, lo.as_deref(), hi)
-            .await
-            .expect("the chunk writes");
-        txn.execute(
-            "update backfill_chunks set done = true, claimed_by = null where id = $1",
-            &[&chunk.id],
-        )
-        .await
-        .expect("mark the chunk done");
-        txn.commit().await.expect("commit the chunk");
-    }
-    f.merge_all(&plan).await;
-    assert_eq!(f.count("select count(*) from public.agg__deltas").await, 0);
-    assert_eq!(
-        f.status("agg").await.as_deref(),
-        Some("backfilling"),
-        "nobody checked for the flip"
-    );
-
-    assert_eq!(f.step(&OPTIONS).await, Step::Completed);
-    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
-    assert_eq!(f.build("agg").await, None);
-    f.assert_agg_oracle().await;
-}
-
 /// The start waits out its source's capture gate (#625 Q2(a)): while a
 /// change the old, narrower capture function staged is still pending, a
 /// definition that needs the widened column stays `waiting_to_backfill`,
 /// and the pass after that change drains starts it.
 #[tokio::test]
 async fn the_start_waits_for_the_widens_capture_gate() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
     const COUNTS: &str =
         "TRANSFORM cnt FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT COUNT(*) AS n";
     let mut f = Fixture::new(50, &[COUNTS]).await;
@@ -1486,119 +743,19 @@ async fn the_start_waits_for_the_widens_capture_gate() {
     f.assert_agg_oracle().await;
 }
 
-/// A definition paused part-way through its Re-derive build, with keys
-/// deleted, updated and inserted while it was frozen, is rebuilt by a
-/// Re-derive build over the entries it kept (#625 F3): the resume parks no
-/// marker and keeps the group deltas still owed (B4), the next pass starts
-/// a rebuild with a sweep, the sweep waits for every chunk, and it retires
-/// the entries of the keys deleted meanwhile, which no chunk reaches.
-#[tokio::test]
-async fn a_resumed_build_rebuilds_over_its_entries_and_sweeps_the_deleted_keys() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
-    let mut f = Fixture::new(100, &[AGG]).await;
-    f.pass().await;
-    // The plan job and three chunks (ids 1..=30), and no merge.
-    assert_eq!(f.run_chunks_by_hand(4).await, 4);
-    let owed = f.count("select count(*) from public.agg__deltas").await;
-    assert!(owed > 0, "the chunks left deltas to merge");
-    let trellis = f.trellis().await;
-    trellis
-        .apply("PAUSE TRANSFORM agg")
-        .await
-        .expect("pause the building transform");
-    // Ids 1..=15 have live entries, which no chunk of the rebuild reaches;
-    // 95 has none yet.
-    f.raw
-        .batch_execute(
-            "delete from public.src where id <= 15 or id = 95; \
-             update public.src set v = v + 1000, g = g + 1 where id in (20, 50); \
-             insert into public.src values (200, 3, 7)",
-        )
-        .await
-        .expect("write while paused");
-    f.drain().await;
-
-    trellis.apply("RESUME TRANSFORM agg").await.expect("resume");
-    assert_eq!(
-        f.status("agg").await.as_deref(),
-        Some("waiting_to_backfill")
-    );
-    assert_eq!(f.build("agg").await, None, "a resume clears `build`");
-    assert_eq!(
-        f.count("select count(*) from pending_backfill").await,
-        0,
-        "a resume of a re-derive shape parks no marker"
-    );
-    assert_eq!(
-        f.count("select count(*) from public.agg__deltas").await,
-        owed,
-        "a resume keeps the deltas still owed to the groups (B4)"
-    );
-
-    f.pass().await;
-    assert_eq!(f.status("agg").await.as_deref(), Some("backfilling"));
-    assert_eq!(f.build("agg").await.as_deref(), Some("rederive"));
-    assert_eq!(
-        f.count(
-            "select count(*) from backfill_chunks \
-             where kind = 'sweep' and not done and start_xid is not null"
-        )
-        .await,
-        1,
-        "a rebuild over a non-empty ledger enqueues one sweep"
-    );
-    let early = {
-        let client = f.db.pool.get().await.expect("pool");
-        chunk_queue::claim_chunks_of(&**client, "early", 1, &[chunk_queue::KIND_SWEEP])
-            .await
-            .expect("claim")
-    };
-    assert!(
-        early.is_empty(),
-        "the sweep isn't claimed before its plan job and chunks are done"
-    );
-
-    let (_, seen) = f.run("agg").await;
-    assert_eq!(
-        seen,
-        BTreeSet::from(["backfilling".to_string(), "live".to_string()])
-    );
-    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
-    assert_eq!(
-        f.count("select count(*) from backfill_chunks where not done")
-            .await,
-        0,
-        "the sweep ran to its end"
-    );
-    assert_eq!(
-        f.count(
-            "select count(*) from public.agg__ledger \
-             where __member and not __tombstone and __from_key::bigint <= 15"
-        )
-        .await,
-        0,
-        "the sweep retired the deleted keys' entries"
-    );
-    assert_eq!(f.count("select count(*) from public.agg__deltas").await, 0);
-    f.assert_agg_oracle().await;
-}
-
 /// A quarantined definition resumes the same way (#625 F3): through the
 /// start, with a sweep, and no marker.
 #[tokio::test]
 async fn a_quarantined_build_resumes_through_the_start() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
-    let mut f = Fixture::new(60, &[AGG]).await;
+    let mut f = Fixture::new(60, &[ONE]).await;
     f.pass().await;
-    f.run("agg").await;
-    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
+    f.run("one").await;
+    assert_eq!(f.status("one").await.as_deref(), Some("live"));
     // The fuse's own write, as `quarantine_if_crossed` makes it.
     f.raw
         .batch_execute(
             "update transform_definitions set status = 'quarantined' \
-             where target_table = 'public.agg'",
+             where target_table = 'public.one'",
         )
         .await
         .expect("quarantine");
@@ -1610,279 +767,20 @@ async fn a_quarantined_build_resumes_through_the_start() {
 
     f.trellis()
         .await
-        .apply("RESUME TRANSFORM agg")
+        .apply("RESUME TRANSFORM one")
         .await
         .expect("resume");
     assert_eq!(f.count("select count(*) from pending_backfill").await, 0);
     f.pass().await;
-    assert_eq!(f.build("agg").await.as_deref(), Some("rederive"));
+    assert_eq!(f.build("one").await.as_deref(), Some("rederive"));
     assert_eq!(
         f.count("select count(*) from backfill_chunks where kind = 'sweep'")
             .await,
         1
     );
-    f.run("agg").await;
-    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
-    f.assert_agg_oracle().await;
-}
-
-/// The sweep's batch (#625 F3), by hand: it reads a bounded window of
-/// entries per call, re-derives the live ones whose basis is older than its
-/// start, tombstones the keys whose rows are gone, and a second pass over
-/// entries it already re-derived finds nothing to do.
-#[tokio::test]
-async fn a_sweep_batch_rederives_stale_live_entries_in_bounded_windows() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
-    let mut f = Fixture::new(50, &[AGG]).await;
-    f.pass().await;
-    f.run("agg").await;
-    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
-    let pool = f.db.pool.clone();
-    let plan = BuildPlan::load(&pool, "agg")
-        .await
-        .expect("load")
-        .expect("a re-derive shape");
-
-    // Captured and left in the ring: the sweep reads the source as it is.
-    f.raw
-        .batch_execute("delete from public.src where id % 5 = 0")
-        .await
-        .expect("delete");
-    let start_xid: String = f
-        .raw
-        .query_one("select pg_current_xact_id()::text", &[])
-        .await
-        .expect("a start xid")
-        .get(0);
-
-    let sweep = |start_xid: String| {
-        let pool = pool.clone();
-        let plan = plan.clone();
-        async move {
-            let mut outcomes = Vec::new();
-            let mut cursor: Option<String> = None;
-            loop {
-                let mut client = pool.get().await.expect("pool");
-                let txn = client
-                    .build_transaction()
-                    .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
-                    .start()
-                    .await
-                    .expect("begin");
-                let outcome = build::sweep_batch(&txn, &plan, &start_xid, cursor.as_deref(), 7)
-                    .await
-                    .expect("sweep batch");
-                txn.commit().await.expect("commit");
-                cursor = outcome.next.clone();
-                let finished = outcome.finished;
-                outcomes.push(outcome);
-                if finished {
-                    return outcomes;
-                }
-            }
-        }
-    };
-    let first = sweep(start_xid.clone()).await;
-    assert!(first.iter().all(|o| o.scanned <= 7), "bounded windows");
-    assert_eq!(first.iter().map(|o| o.scanned).sum::<i64>(), 50);
-    assert_eq!(
-        first.iter().map(|o| o.rederived).sum::<usize>(),
-        50,
-        "every live entry predates the start"
-    );
-    assert_eq!(
-        f.count("select count(*) from public.agg__ledger where __tombstone")
-            .await,
-        10,
-        "the deleted keys are tombstones"
-    );
-
-    let second = sweep(start_xid).await;
-    assert_eq!(
-        second.iter().map(|o| o.rederived).sum::<usize>(),
-        0,
-        "a re-derived entry's basis is past the start, and a tombstone isn't live"
-    );
-
-    f.merge_all(&plan).await;
-    // The deletes' captured changes are visible in the sweep's bases, so
-    // they drain to nothing.
-    f.drain().await;
-    f.assert_agg_oracle().await;
-}
-
-/// The sweep picks an entry Apply alone wrote (#625 F3, review): a key
-/// inserted after the build is counted by its insert's change, with no
-/// `basis`, and no chunk of a rebuild reaches it once its row is deleted
-/// while the definition is frozen. The sweep's `basis is null` arm retires
-/// it.
-#[tokio::test]
-async fn a_rebuild_sweeps_a_deleted_key_only_apply_had_counted() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
-    let mut f = Fixture::new(30, &[AGG]).await;
-    f.pass().await;
-    f.run("agg").await;
-    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
-    // Nothing has sealed since the start, so the start's segment is still
-    // active, and a page re-derives its batch's keys (#733). A write sealed
-    // into that batch moves the inserts below to the next, which Apply
-    // applies. It changes `v`: an update that changes nothing imaged stages
-    // nothing (#623 D8a's skip-no-op).
-    f.raw
-        .batch_execute("update public.src set v = v + 1 where id = 1")
-        .await
-        .expect("a write in the start's segment");
-    f.drain().await;
-    f.raw
-        .batch_execute("insert into public.src values (100, 3, 1000), (101, 4, 2000)")
-        .await
-        .expect("insert after the build");
-    f.drain().await;
-    assert_eq!(
-        f.count(
-            "select count(*) from public.agg__ledger \
-             where __from_key in ('100', '101') and __basis is null \
-               and __member and not __tombstone"
-        )
-        .await,
-        2,
-        "Apply alone counted the new keys"
-    );
-
-    let trellis = f.trellis().await;
-    trellis.apply("PAUSE TRANSFORM agg").await.expect("pause");
-    f.raw
-        .batch_execute("delete from public.src where id = 100")
-        .await
-        .expect("delete while paused");
-    f.drain().await;
-    trellis.apply("RESUME TRANSFORM agg").await.expect("resume");
-    f.pass().await;
-    assert_eq!(f.build("agg").await.as_deref(), Some("rederive"));
-    f.run("agg").await;
-    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
-    f.assert_agg_oracle().await;
-}
-
-/// The sweep reads the source by a composite key's typed parts (#625 F3,
-/// review): text parts holding the key encoding's separator, its NULL
-/// sentinel, a backslash and a quote, beside a `timestamptz` part. A live
-/// key the sweep re-derives is found and kept; a key deleted while frozen
-/// is retired.
-#[tokio::test]
-async fn a_rebuild_sweeps_a_composite_typed_key() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
-    let mut f = Fixture::new(0, &[]).await;
-    f.raw
-        .batch_execute(
-            "create table public.csrc (a text, t timestamptz, g integer, v bigint, \
-                 primary key (a, t)); \
-             insert into public.csrc \
-             select k, timestamptz '2024-01-01 00:00:00+00' + i * interval '1 hour 0.5 seconds', \
-                    i % 3, i \
-             from generate_series(1, 40) i, \
-                  lateral (select (array['x', 'y' || chr(31) || 'z', 'q' || chr(1), \
-                                         'b\\s', 'o''q', ''])[1 + i % 6] || i as k) s",
-        )
-        .await
-        .expect("seed the composite source");
-    let columns = [
-        ("a".to_string(), ValueType::Text),
-        (
-            "g".to_string(),
-            ValueType::Integer(trellis::integer::IntWidth::Int4),
-        ),
-        (
-            "v".to_string(),
-            ValueType::Integer(trellis::integer::IntWidth::Int8),
-        ),
-    ]
-    .into_iter()
-    .collect();
-    trellis::defs::install_definition(
-        &f.db.pool,
-        "TRANSFORM cagg FROM public.csrc GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n",
-        &columns,
-        "public",
-    )
-    .await
-    .expect("register");
-    let actual = "select (g, total, n)::text from public.cagg order by g";
-    let expected = "select (g, sum(v), count(*))::text from public.csrc group by g order by g";
-    f.pass().await;
-    f.run("cagg").await;
-    assert_eq!(f.status("cagg").await.as_deref(), Some("live"));
-    assert_eq!(f.rows(actual).await, f.rows(expected).await);
-
-    let trellis = f.trellis().await;
-    trellis.apply("PAUSE TRANSFORM cagg").await.expect("pause");
-    f.raw
-        .batch_execute("delete from public.csrc where v % 4 = 0")
-        .await
-        .expect("delete while paused");
-    f.drain().await;
-    trellis
-        .apply("RESUME TRANSFORM cagg")
-        .await
-        .expect("resume");
-    f.pass().await;
-    assert_eq!(f.build("cagg").await.as_deref(), Some("rederive"));
-    f.run("cagg").await;
-    assert_eq!(f.status("cagg").await.as_deref(), Some("live"));
-    assert_eq!(
-        f.count("select count(*) from public.cagg__ledger where __member and not __tombstone")
-            .await,
-        30,
-        "every live row's entry is live, and only those"
-    );
-    assert_eq!(f.rows(actual).await, f.rows(expected).await);
-
-    // The rebuild's chunks re-derived every live key, so its sweep picked
-    // only the deleted ones. A sweep from a later start picks the live ones
-    // too, and must find each one's row by its typed parts.
-    let pool = f.db.pool.clone();
-    let plan = BuildPlan::load(&pool, "cagg")
-        .await
-        .expect("load")
-        .expect("a re-derive shape");
-    let start_xid: String = f
-        .raw
-        .query_one("select pg_current_xact_id()::text", &[])
-        .await
-        .expect("a start xid")
-        .get(0);
-    let mut cursor: Option<String> = None;
-    let mut rederived = 0;
-    loop {
-        let mut client = pool.get().await.expect("pool");
-        let txn = client
-            .build_transaction()
-            .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
-            .start()
-            .await
-            .expect("begin");
-        let outcome = build::sweep_batch(&txn, &plan, &start_xid, cursor.as_deref(), 7)
-            .await
-            .expect("sweep batch");
-        txn.commit().await.expect("commit");
-        rederived += outcome.rederived;
-        cursor = outcome.next.clone();
-        if outcome.finished {
-            break;
-        }
-    }
-    assert_eq!(rederived, 30, "every live entry predates the later start");
-    assert_eq!(
-        f.count("select count(*) from public.cagg__ledger where __member and not __tombstone")
-            .await,
-        30,
-        "the sweep found every live key's row"
-    );
-    f.merge_all(&plan).await;
-    assert_eq!(f.rows(actual).await, f.rows(expected).await);
+    f.run("one").await;
+    assert_eq!(f.status("one").await.as_deref(), Some("live"));
+    f.assert_one_oracle().await;
 }
 
 /// The backfill discharge never dispatches a definition the Re-derive build
@@ -1891,8 +789,6 @@ async fn a_rebuild_sweeps_a_composite_typed_key() {
 /// `waiting_to_backfill` for the staging worker's start.
 #[tokio::test]
 async fn the_discharge_leaves_a_rederive_shape_to_the_start() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(20, &[AGG]).await;
     f.raw
         .batch_execute("insert into pending_backfill (table_name) values ('public.src')")
@@ -1936,66 +832,11 @@ async fn the_discharge_leaves_a_rederive_shape_to_the_start() {
 
 // ------------------------------------------------------- 1-1 targets (F8a)
 
-/// A plain 1-1 target's build (#625 F8a) is `waiting_to_backfill ->
-/// backfilling -> live`, with no `catching_up`, no marker, and no group
-/// deltas: its chunks write the target rows, so no step merges, and it has
-/// no delta table.
-#[tokio::test]
-async fn a_one_to_one_build_goes_from_waiting_to_live_with_no_catch_up() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
-    let mut f = Fixture::new(200, &[ONE]).await;
-    assert_eq!(
-        f.status("one").await.as_deref(),
-        Some("waiting_to_backfill")
-    );
-    f.pass().await;
-    assert_eq!(f.status("one").await.as_deref(), Some("backfilling"));
-    assert_eq!(f.build("one").await.as_deref(), Some("rederive"));
-    assert_eq!(f.count("select count(*) from pending_backfill").await, 0);
-
-    let (steps, seen) = f.run("one").await;
-    assert_eq!(steps.first(), Some(&Step::Planned));
-    assert!(steps.contains(&Step::Chunk));
-    assert!(!steps.contains(&Step::Merged), "a 1-1 build never merges");
-    assert_eq!(
-        seen,
-        BTreeSet::from(["backfilling".to_string(), "live".to_string()]),
-        "the build never passes through catching_up"
-    );
-    assert_eq!(f.build("one").await, None);
-    assert_eq!(
-        steps.iter().filter(|step| **step == Step::Chunk).count(),
-        20,
-        "200 rows in chunks of 10, and no old build ran"
-    );
-    assert_eq!(
-        f.count("select count(*) from backfill_chunks").await,
-        0,
-        "the flip deleted the build's rows (#966)"
-    );
-    assert_eq!(
-        f.count("select count(*) from pg_class where relname = 'one__deltas'")
-            .await,
-        0,
-        "a 1-1 target has no delta table"
-    );
-    assert_eq!(
-        f.count("select count(*) from public.one__ledger where __basis is null")
-            .await,
-        0,
-        "every entry was re-derived by a chunk"
-    );
-    f.assert_one_oracle().await;
-}
-
 /// A started 1-1 definition applies at once (B1), and every kind of write
 /// made while its build runs, on keys whose chunks have and haven't run,
 /// ends up in the target exactly as the source has it.
 #[tokio::test]
 async fn changes_drained_while_a_one_to_one_builds_are_applied() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(200, &[ONE]).await;
     f.pass().await;
     f.raw
@@ -2044,8 +885,6 @@ async fn changes_drained_while_a_one_to_one_builds_are_applied() {
 /// rows of the keys deleted meanwhile, which no chunk reaches.
 #[tokio::test]
 async fn a_resumed_one_to_one_build_sweeps_the_keys_deleted_while_paused() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(100, &[ONE]).await;
     f.pass().await;
     // The plan job and three chunks (ids 1..=30).
@@ -2114,8 +953,6 @@ async fn a_resumed_one_to_one_build_sweeps_the_keys_deleted_while_paused() {
 /// test above isn't passing for a reason other than the sweep.)
 #[tokio::test]
 async fn without_its_sweep_a_one_to_one_rebuild_keeps_a_deleted_key() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(30, &[ONE]).await;
     f.pass().await;
     f.run("one").await;
@@ -2147,8 +984,6 @@ async fn without_its_sweep_a_one_to_one_rebuild_keeps_a_deleted_key() {
 /// `live` without its row, and its entry is never taken.
 #[tokio::test]
 async fn a_one_to_one_build_leaves_a_quarantined_key_out() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(50, &[ONE]).await;
     f.raw
         .batch_execute(
@@ -2181,8 +1016,6 @@ async fn a_one_to_one_build_leaves_a_quarantined_key_out() {
 /// and nothing is written to the target.
 #[tokio::test]
 async fn a_one_to_one_whose_source_lost_its_key_fails_through_its_plan_job() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
     // `chunk_queue::MAX_CHARGED_ATTEMPTS`, which is crate-private.
     const MAX_CHARGED_ATTEMPTS: u32 = 5;
     let mut f = Fixture::new(50, &[ONE]).await;
@@ -2277,8 +1110,6 @@ const AGG2: &str = "TRANSFORM agg2 FROM public.src GROUP BY g WITHOUT SOURCE IND
 /// tier's stall).
 #[tokio::test]
 async fn a_batch_older_than_the_start_drained_after_it_does_not_revive_a_deleted_key() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(20, &[AGG]).await;
     f.pass().await;
     f.run("agg").await;
@@ -2350,8 +1181,6 @@ const ONE2: &str = "TRANSFORM one2 FROM public.src SELECT g AS g, v + v AS dbl";
 /// back for good.
 #[tokio::test]
 async fn a_batch_older_than_a_one_to_one_start_drained_after_it_does_not_revive_a_deleted_key() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(20, &[ONE]).await;
     f.pass().await;
     f.run("one").await;
@@ -2457,8 +1286,6 @@ async fn rederive_tombstone_outlives_a_batch_its_read_saw(
 
 #[tokio::test]
 async fn a_one_to_one_rederive_tombstone_outlives_a_batch_its_read_saw() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
     let f = rederive_tombstone_outlives_a_batch_its_read_saw(ONE, "one").await;
     assert_eq!(
         f.rows(ONE_ACTUAL).await,
@@ -2470,8 +1297,6 @@ async fn a_one_to_one_rederive_tombstone_outlives_a_batch_its_read_saw() {
 
 #[tokio::test]
 async fn an_aggregate_rederive_tombstone_outlives_a_batch_its_read_saw() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
     let f = rederive_tombstone_outlives_a_batch_its_read_saw(AGG, "agg").await;
     assert_eq!(
         f.rows(AGG_ACTUAL).await,
@@ -2530,46 +1355,13 @@ async fn rebuilds_leave_no_rows(definition: &str, target: &str) {
 }
 
 #[tokio::test]
-async fn an_aggregate_s_done_build_rows_do_not_pile_up_over_rebuilds() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
-    rebuilds_leave_no_rows(AGG, "agg").await;
+async fn an_one_to_one_s_done_build_rows_do_not_pile_up_over_rebuilds() {
+    rebuilds_leave_no_rows(ONE, "one").await;
 }
 
 #[tokio::test]
 async fn a_one_to_one_s_done_build_rows_do_not_pile_up_over_rebuilds() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
     rebuilds_leave_no_rows(ONE, "one").await;
-}
-
-/// Done rows stay while their build runs (#966): only the flip deletes
-/// them, so a build in progress is judged by all its rows. With the plan
-/// job and every chunk done but deltas owed, `try_complete` leaves the rows
-/// and the definition as they are, and the merge that flips the definition
-/// takes the rows with it.
-#[tokio::test]
-async fn done_rows_stay_until_the_flip() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
-    let mut f = Fixture::new(60, &[AGG]).await;
-    f.pass().await;
-    f.run_chunks_by_hand(usize::MAX).await;
-    let rows = build_rows(&f).await;
-    assert_eq!(rows, 7, "the plan job and six chunks");
-    assert_eq!(
-        f.count("select count(*) from backfill_chunks where done")
-            .await,
-        rows
-    );
-    let id = f.definition_id().await;
-    assert!(!build::try_complete(&f.db.pool, id).await.expect("try"));
-    assert_eq!(build_rows(&f).await, rows, "an unfinished build keeps them");
-
-    while f.step(&OPTIONS).await.progressed() {}
-    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
-    assert_eq!(build_rows(&f).await, 0, "the flip took them");
-    f.assert_agg_oracle().await;
 }
 
 /// A build a resume superseded leaves done rows behind (the plan job and
@@ -2577,19 +1369,17 @@ async fn done_rows_stay_until_the_flip() {
 /// (#966). Completion still waits for every row of the resumed build.
 #[tokio::test]
 async fn a_resumed_build_s_flip_takes_the_superseded_builds_done_rows() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
-    let mut f = Fixture::new(100, &[AGG]).await;
+    let mut f = Fixture::new(100, &[ONE]).await;
     f.pass().await;
     assert_eq!(f.run_chunks_by_hand(4).await, 4);
     let trellis = f.trellis().await;
     trellis
-        .apply("PAUSE TRANSFORM agg")
+        .apply("PAUSE TRANSFORM one")
         .await
         .expect("pause the building transform");
-    trellis.apply("RESUME TRANSFORM agg").await.expect("resume");
+    trellis.apply("RESUME TRANSFORM one").await.expect("resume");
     f.pass().await;
-    assert_eq!(f.status("agg").await.as_deref(), Some("backfilling"));
+    assert_eq!(f.status("one").await.as_deref(), Some("backfilling"));
     assert_eq!(
         f.count("select count(*) from backfill_chunks where done")
             .await,
@@ -2598,59 +1388,12 @@ async fn a_resumed_build_s_flip_takes_the_superseded_builds_done_rows() {
     );
     let id = f.definition_id().await;
     assert!(!build::try_complete(&f.db.pool, id).await.expect("try"));
-    assert_eq!(f.status("agg").await.as_deref(), Some("backfilling"));
+    assert_eq!(f.status("one").await.as_deref(), Some("backfilling"));
 
-    f.run("agg").await;
-    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
-    assert_eq!(build_rows(&f).await, 0);
-    f.assert_agg_oracle().await;
-}
-
-/// `target`'s done `backfill_chunks` rows, and all of them.
-async fn rows_of(f: &Fixture, target: &str) -> (i64, i64) {
-    let row = f
-        .raw
-        .query_one(
-            "select count(*) filter (where bc.done), count(*) from backfill_chunks bc \
-             join transform_definitions d on d.id = bc.definition_id \
-             where split_part(d.target_table, '.', 2) = $1",
-            &[&target],
-        )
-        .await
-        .expect("count a definition's rows");
-    (row.get(0), row.get(1))
-}
-
-/// The flip deletes only its own definition's rows (#966). Two definitions
-/// on one source build together: the 1-1 one has no deltas to merge, so it
-/// flips as its last chunk commits, while the aggregate's done rows (its
-/// plan job, and whatever chunks ran first) wait on their merge. Those stay
-/// until the aggregate's own flip.
-#[tokio::test]
-async fn a_flip_leaves_another_definition_s_done_rows() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
-    let mut f = Fixture::new(60, &[ONE, AGG]).await;
-    f.pass().await;
-    f.run_chunks_by_hand(usize::MAX).await;
+    f.run("one").await;
     assert_eq!(f.status("one").await.as_deref(), Some("live"));
-    assert_eq!(f.status("agg").await.as_deref(), Some("backfilling"));
-    assert_eq!(
-        rows_of(&f, "one").await,
-        (0, 0),
-        "the 1-1 flip took its rows"
-    );
-    assert_eq!(
-        rows_of(&f, "agg").await,
-        (7, 7),
-        "the aggregate's plan job and six chunks, all done, wait on its merge"
-    );
-
-    f.run("agg").await;
-    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
     assert_eq!(build_rows(&f).await, 0);
     f.assert_one_oracle().await;
-    f.assert_agg_oracle().await;
 }
 
 /// The flip leaves an undone row behind (#966): a chunk a worker held
@@ -2659,9 +1402,7 @@ async fn a_flip_leaves_another_definition_s_done_rows() {
 /// when it runs it after the flip; giving it up discards the row.
 #[tokio::test]
 async fn a_chunk_held_across_a_resume_outlives_the_flip_and_is_discarded() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
-    let mut f = Fixture::new(60, &[AGG]).await;
+    let mut f = Fixture::new(60, &[ONE]).await;
     f.pass().await;
     assert_eq!(f.run_chunks_by_hand(1).await, 1, "the plan job");
     let held = {
@@ -2673,13 +1414,13 @@ async fn a_chunk_held_across_a_resume_outlives_the_flip_and_is_discarded() {
     assert_eq!(held.len(), 1);
     let trellis = f.trellis().await;
     trellis
-        .apply("PAUSE TRANSFORM agg")
+        .apply("PAUSE TRANSFORM one")
         .await
         .expect("pause the building transform");
-    trellis.apply("RESUME TRANSFORM agg").await.expect("resume");
+    trellis.apply("RESUME TRANSFORM one").await.expect("resume");
     f.pass().await;
-    f.run("agg").await;
-    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
+    f.run("one").await;
+    assert_eq!(f.status("one").await.as_deref(), Some("live"));
     assert_eq!(
         f.count("select count(*) from backfill_chunks where not done and claimed_by = 'held'")
             .await,
@@ -2690,8 +1431,8 @@ async fn a_chunk_held_across_a_resume_outlives_the_flip_and_is_discarded() {
 
     build::run_claimed(&f.db.pool, &held[0], "held", &OPTIONS).await;
     assert_eq!(build_rows(&f).await, 0, "giving it up discards it");
-    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
-    f.assert_agg_oracle().await;
+    assert_eq!(f.status("one").await.as_deref(), Some("live"));
+    f.assert_one_oracle().await;
 }
 
 /// The advisory lock the frozen plan job waits on.
@@ -2739,7 +1480,7 @@ async fn paused_with_a_claimed_plan_job(f: &mut Fixture) -> (chunk_queue::Claime
     assert_eq!(plan.len(), 1, "the plan job");
     let trellis = f.trellis().await;
     trellis
-        .apply("PAUSE TRANSFORM agg")
+        .apply("PAUSE TRANSFORM one")
         .await
         .expect("pause the building transform");
     (plan.into_iter().next().expect("one plan job"), trellis)
@@ -2763,7 +1504,7 @@ async fn action_against_a_frozen_plan_batch(
         .await
         .expect("take the pause lock");
     let scope = PauseScope::new();
-    let reached = scope.arm(PausePoint::AfterPlanHold, "public.agg", PLAN_PAUSE_LOCK);
+    let reached = scope.arm(PausePoint::AfterPlanHold, "public.one", PLAN_PAUSE_LOCK);
     let pool = f.db.pool.clone();
     let batch = tokio::spawn(with_scope(scope, async move {
         build::run_claimed(&pool, &plan, "held", &OPTIONS).await;
@@ -2790,29 +1531,25 @@ async fn action_against_a_frozen_plan_batch(
 /// `backfill_chunks`). The resumed build then runs to live.
 #[tokio::test]
 async fn a_resume_arriving_mid_plan_batch_does_not_deadlock_with_it() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
-    let mut f = Fixture::new(60, &[AGG]).await;
-    action_against_a_frozen_plan_batch(&mut f, "RESUME TRANSFORM agg")
+    let mut f = Fixture::new(60, &[ONE]).await;
+    action_against_a_frozen_plan_batch(&mut f, "RESUME TRANSFORM one")
         .await
         .expect("the resume is not a deadlock victim");
     f.pass().await;
-    f.run("agg").await;
-    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
-    f.assert_agg_oracle().await;
+    f.run("one").await;
+    assert_eq!(f.status("one").await.as_deref(), Some("live"));
+    f.assert_one_oracle().await;
 }
 
 /// The same for `DROP TRANSFORM`, whose cascade delete of the chunks waits on
 /// the plan row the batch holds.
 #[tokio::test]
 async fn a_drop_arriving_mid_plan_batch_does_not_deadlock_with_it() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
-    let mut f = Fixture::new(60, &[AGG]).await;
-    action_against_a_frozen_plan_batch(&mut f, "DROP TRANSFORM agg")
+    let mut f = Fixture::new(60, &[ONE]).await;
+    action_against_a_frozen_plan_batch(&mut f, "DROP TRANSFORM one")
         .await
         .expect("the drop is not a deadlock victim");
-    assert_eq!(f.status("agg").await, None, "the definition is gone");
+    assert_eq!(f.status("one").await, None, "the definition is gone");
     assert_eq!(
         f.count("select count(*) from backfill_chunks").await,
         0,
@@ -2898,10 +1635,8 @@ async fn plan_batch_behind(f: &mut Fixture, action: &'static str) -> (i64, Resul
 /// stale: it stops as superseded and writes nothing.
 #[tokio::test]
 async fn a_plan_batch_behind_a_resume_stops_as_superseded() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
-    let mut f = Fixture::new(60, &[AGG]).await;
-    let (plan_id, resumed) = plan_batch_behind(&mut f, "RESUME TRANSFORM agg").await;
+    let mut f = Fixture::new(60, &[ONE]).await;
+    let (plan_id, resumed) = plan_batch_behind(&mut f, "RESUME TRANSFORM one").await;
     resumed.expect("the resume is not a deadlock victim");
 
     assert_eq!(
@@ -2919,9 +1654,9 @@ async fn a_plan_batch_behind_a_resume_stops_as_superseded() {
         "and it planned no chunk"
     );
     f.pass().await;
-    f.run("agg").await;
-    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
-    f.assert_agg_oracle().await;
+    f.run("one").await;
+    assert_eq!(f.status("one").await.as_deref(), Some("live"));
+    f.assert_one_oracle().await;
 }
 
 /// The same behind a drop: once the drop commits, the batch's definition-row
@@ -2929,12 +1664,10 @@ async fn a_plan_batch_behind_a_resume_stops_as_superseded() {
 /// quietly having written nothing.
 #[tokio::test]
 async fn a_plan_batch_behind_a_drop_writes_nothing() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
-    let mut f = Fixture::new(60, &[AGG]).await;
-    let (_, dropped) = plan_batch_behind(&mut f, "DROP TRANSFORM agg").await;
+    let mut f = Fixture::new(60, &[ONE]).await;
+    let (_, dropped) = plan_batch_behind(&mut f, "DROP TRANSFORM one").await;
     dropped.expect("the drop is not a deadlock victim");
-    assert_eq!(f.status("agg").await, None, "the definition is gone");
+    assert_eq!(f.status("one").await, None, "the definition is gone");
     assert_eq!(
         f.count("select count(*) from backfill_chunks").await,
         0,
@@ -2947,8 +1680,6 @@ async fn a_plan_batch_behind_a_drop_writes_nothing() {
 /// re-derives from the source.
 #[tokio::test]
 async fn a_rebuild_deletes_target_rows_added_or_rekeyed_by_hand() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(150, &[ONE]).await;
     f.pass().await;
     f.run("one").await;
@@ -2979,8 +1710,6 @@ async fn a_rebuild_deletes_target_rows_added_or_rekeyed_by_hand() {
 /// leaving a build that fails.
 #[tokio::test]
 async fn a_resume_refuses_when_the_target_table_is_gone() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(150, &[ONE]).await;
     f.pass().await;
     f.run("one").await;
@@ -3009,8 +1738,6 @@ async fn a_resume_refuses_when_the_target_table_is_gone() {
 /// source, not deleted as unbacked.
 #[tokio::test]
 async fn a_rebuild_sweeps_many_hand_added_rows_and_keeps_a_row_the_source_backs() {
-    // The per-row ledger, which this file pins, until #1105 deletes it.
-    trellis::dev::staging::set_group_basis(false);
     let mut f = Fixture::new(150, &[ONE]).await;
     f.pass().await;
     f.run("one").await;
@@ -3051,5 +1778,48 @@ async fn a_rebuild_sweeps_many_hand_added_rows_and_keeps_a_row_the_source_backs(
     );
     f.run("one").await;
     assert_eq!(f.status("one").await.as_deref(), Some("live"));
+    f.assert_one_oracle().await;
+}
+
+/// A plain 1-1 target's build (#625 F8a) is `waiting_to_backfill ->
+/// backfilling -> live`, with no `catching_up` and no marker: its chunks
+/// write the target rows.
+#[tokio::test]
+async fn a_one_to_one_build_goes_from_waiting_to_live_with_no_catch_up() {
+    let mut f = Fixture::new(200, &[ONE]).await;
+    assert_eq!(
+        f.status("one").await.as_deref(),
+        Some("waiting_to_backfill")
+    );
+    f.pass().await;
+    assert_eq!(f.status("one").await.as_deref(), Some("backfilling"));
+    assert_eq!(f.build("one").await.as_deref(), Some("rederive"));
+    assert_eq!(f.count("select count(*) from pending_backfill").await, 0);
+
+    let (steps, seen) = f.run("one").await;
+    assert_eq!(steps.first(), Some(&Step::Planned));
+    assert!(steps.contains(&Step::Chunk));
+    assert_eq!(
+        seen,
+        BTreeSet::from(["backfilling".to_string(), "live".to_string()]),
+        "the build never passes through catching_up"
+    );
+    assert_eq!(f.build("one").await, None);
+    assert_eq!(
+        steps.iter().filter(|step| **step == Step::Chunk).count(),
+        20,
+        "200 rows in chunks of 10, and no old build ran"
+    );
+    assert_eq!(
+        f.count("select count(*) from backfill_chunks").await,
+        0,
+        "the flip deleted the build's rows (#966)"
+    );
+    assert_eq!(
+        f.count("select count(*) from public.one__ledger where __basis is null")
+            .await,
+        0,
+        "every entry was re-derived by a chunk"
+    );
     f.assert_one_oracle().await;
 }

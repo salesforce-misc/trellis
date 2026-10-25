@@ -34,8 +34,7 @@
 //!   (S1's and S2's), as J2's B0 maintained both targets. Nothing reads `a`
 //!   there, so it isn't captured.
 //!
-//! Every aggregate runs on the group basis (the dev knob, which `join` turns
-//! on). The data gets in one of two ways (`--load`, [`build::LoadMode`]):
+//! Every aggregate runs on the group basis. The data gets in one of two ways (`--load`, [`build::LoadMode`]):
 //!
 //! - `direct` (the default): the tables are seeded server-side before any
 //!   definition exists, and each target is then *built* over the rows, timed
@@ -1007,10 +1006,6 @@ const JOIN_MAX_CONNECTIONS: &str = "max_connections=300";
 
 /// Runs the scenario; prints one JSON line per measurement and a summary.
 pub async fn run(cfg: &JoinBench, tuning: &EngineTuning) -> JoinOutcome {
-    assert!(
-        trellis::dev::staging::group_basis_enabled(),
-        "join runs behind the group-basis knob; the CLI turns it on"
-    );
     let cluster = TestCluster::start_with_settings(&[JOIN_MAX_CONNECTIONS]);
     let d1_keys = (cfg.facts / Dataset::D1.facts_per_key()).max(10);
     let b_rows = cfg.b_page.unwrap_or_else(|| (d1_keys as usize / 50).max(1));

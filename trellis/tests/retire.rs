@@ -530,7 +530,7 @@ async fn collect_tombstones_skips_a_ledger_without_its_tombstone_index() {
 /// build's start does. A build's chunk inserts the entry of a key with no
 /// entry from a snapshot taken before the insert, which a tombstone
 /// collected in between would make wrong
-/// (`staging::ledger::chunk_insert_statement`). Once the build is over, the
+/// (`staging::one_to_one_ledger::lock_entries`). Once the build is over, the
 /// GC collects as usual.
 #[tokio::test]
 async fn collect_tombstones_skips_a_ledger_under_a_build() {

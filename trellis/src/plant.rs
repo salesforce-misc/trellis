@@ -68,48 +68,23 @@ pub const PLANT_ENV: &str = "TRELLIS_TEST_PLANT";
 /// One planted ordering bug. Each breaks one invariant, at one engine site.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Plant {
-    /// Aggregate apply (a ledger target's group upsert in `staging::ledger`,
-    /// since #623 D3): each apply
-    /// transaction takes a non-waiting advisory lock per group before it
-    /// writes the group, and drops its delta for any group another open
-    /// apply transaction already holds. Only two workers applying one group
-    /// at once can trip it. Found by #557 part 1's review.
-    DropRacingGroupDelta,
     /// Issues #344/#392 (#623 D6): a 1-1 target applies every change without
     /// ADR-0002's I2 (`staging::one_to_one_ledger::update_entries`): not
     /// skipped when a Re-derive already read it, nor when a newer change
     /// already applied. A page that drains after a newer one for the same key
     /// then leaves the older value behind.
     StaleOneToOneWrite,
-    /// ADR-0002 I1 (#623 D3): a ledger target's page takes no entry lock
-    /// before its Re-derive read (`staging::ledger`), so the read can run
-    /// while another page is between its own read and its write for the
-    /// same key, and one of the two writes the entry from a stale read.
-    SkipLedgerLock,
-    /// ADR-0002 I2 (#623 D3): a ledger target skips a change only by `lsn`
-    /// (at or below the entry's `applied_lsn`), without the visibility test
-    /// against the entry's Re-derive `basis` (`staging::ledger`). A change a
-    /// Re-derive already read is then applied a second time.
-    LsnOnlySkip,
     /// ADR-0002 I4 (#623 D7): tombstone GC (`staging::retire::collect_tombstones`)
     /// collects through the highest drained segment instead of the
     /// contiguous drained prefix, so a tombstone goes while an older change
     /// to its key is still in an undrained segment, which then applies to
     /// the fresh entry and brings the deleted row back.
     EarlyTombstoneGc,
-    /// #625 F3 (ADR-0002 I1 for the build): a Re-derive build's chunk, or
-    /// its sweep, reads and rewrites its keys' entries without first taking
-    /// their entry locks (`staging::build`), so it reads an entry a page is
-    /// between reading and writing, and its group deltas move the key from
-    /// a state the page already moved it out of.
+    /// #625 F3 (ADR-0002 I1 for the build): a 1-1 Re-derive build's chunk,
+    /// or its sweep, reads and rewrites its keys' entries without first
+    /// taking their entry locks (`staging::build::one_to_one`), so it reads
+    /// an entry a page is between reading and writing.
     ChunkWithoutEntryLock,
-    /// #625 F3 (B3): the build's merger (`staging::build::merge_deltas`)
-    /// applies the group-delta rows it claims without deleting them, so the
-    /// next merge applies them again. It fires on a target's first merge in
-    /// the process that claims a row only: kept every time, the rows would
-    /// be merged forever and the build never end, which a test sees as a
-    /// hang, not a catch.
-    MergeWithoutDelete,
     /// ADR-0002 R1 on the group basis (#1100): a page on a group-basis
     /// aggregate takes no lock on the groups it already has hidden rows for
     /// (`staging::group_basis::lock_groups` only inserts the missing ones),
@@ -125,8 +100,7 @@ pub enum Plant {
     /// basis snapshot's `xmax`), not by the basis's visibility test
     /// (`staging::group_basis`'s apply statement). A change whose
     /// transaction was in flight when the basis was taken, which the basis
-    /// didn't see, is refused, and its group loses it. The group basis's
-    /// counterpart of `lsn_only_skip`.
+    /// didn't see, is refused, and its group loses it.
     ///
     /// Pinned by `group_basis_interleavings`'s
     /// `r2_a_change_in_flight_at_the_basis_applies`.
@@ -203,13 +177,9 @@ pub enum Plant {
 impl Plant {
     /// Every plant, in the order the concurrent tier's sweep runs them.
     pub const ALL: &'static [Plant] = &[
-        Plant::DropRacingGroupDelta,
         Plant::StaleOneToOneWrite,
-        Plant::SkipLedgerLock,
-        Plant::LsnOnlySkip,
         Plant::EarlyTombstoneGc,
         Plant::ChunkWithoutEntryLock,
-        Plant::MergeWithoutDelete,
         Plant::GbSkipGroupLock,
         Plant::GbLsnNotVisibility,
         Plant::GbFoldSidesPerKey,
@@ -224,13 +194,9 @@ impl Plant {
     /// The name [`PLANT_ENV`] takes.
     pub fn name(self) -> &'static str {
         match self {
-            Plant::DropRacingGroupDelta => "drop_racing_group_delta",
             Plant::StaleOneToOneWrite => "stale_one_to_one_write",
-            Plant::SkipLedgerLock => "skip_ledger_lock",
-            Plant::LsnOnlySkip => "lsn_only_skip",
             Plant::EarlyTombstoneGc => "early_tombstone_gc",
             Plant::ChunkWithoutEntryLock => "chunk_without_entry_lock",
-            Plant::MergeWithoutDelete => "merge_without_delete",
             Plant::GbSkipGroupLock => "gb_skip_group_lock",
             Plant::GbLsnNotVisibility => "gb_lsn_not_visibility",
             Plant::GbFoldSidesPerKey => "gb_fold_sides_per_key",
@@ -332,7 +298,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "names no plant")]
     fn an_unknown_name_panics_instead_of_running_unplanted() {
-        parse(Some("drop_racing_group_delt"));
+        parse(Some("stale_one_to_one_writ"));
     }
 
     /// The default suite never sets [`PLANT_ENV`], so no hook is live in
@@ -341,6 +307,6 @@ mod tests {
     #[test]
     fn the_default_suite_runs_with_no_plant_armed() {
         assert_eq!(armed(), None, "{PLANT_ENV} is set in the test environment");
-        assert!(!fires(Plant::DropRacingGroupDelta, true));
+        assert!(!fires(Plant::StaleOneToOneWrite, true));
     }
 }

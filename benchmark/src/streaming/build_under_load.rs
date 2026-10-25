@@ -10,8 +10,7 @@
 //! single-row load at `--write-rate` statements/sec in total (70% `amt`
 //! updates, 15% group moves, 10% inserts above the loaded ids, 5% deletes)
 //! `--pre-define-secs` **before** `GROUP BY grp SELECT SUM(amt) AS total,
-//! COUNT(*) AS n` is defined (with `--min-max`, also `MIN(amt) AS lo,
-//! MAX(amt) AS hi`: recomputed fields, #625 F5), and keep it up through the build and for
+//! COUNT(*) AS n` is defined, and keep it up through the build and for
 //! `--duration-secs` after the definition reads `live`. Once they stop, the
 //! target must equal a from-scratch `GROUP BY` over the source (the SQL
 //! oracle) within `--grace-secs`. That comparison is a full scan, so it only
@@ -153,9 +152,6 @@ pub struct BuildUnderLoad {
     pub oracle_poll_min: Duration,
     /// How often the run prints its RSS progress line (`None`: never).
     pub progress: Option<Duration>,
-    /// `--min-max`: the definition also has `MIN(amt)` and `MAX(amt)`,
-    /// recomputed fields (#625 F5), and the oracle compares them too.
-    pub min_max: bool,
     /// `--one-to-one`: the definition is the 1-1 `SELECT grp AS grp, amt +
     /// amt AS dbl` instead of the aggregate (#625 F8a), and the oracle
     /// compares it row by row.
@@ -174,14 +170,9 @@ impl BuildUnderLoad {
                 "TRANSFORM {TARGET} FROM public.{SOURCE} SELECT grp AS grp, amt + amt AS dbl"
             );
         }
-        let extremes = if self.min_max {
-            ", MIN(amt) AS lo, MAX(amt) AS hi"
-        } else {
-            ""
-        };
         format!(
             "TRANSFORM {TARGET} FROM public.{SOURCE} GROUP BY grp \
-             SELECT grp AS grp, SUM(amt) AS total, COUNT(*) AS n{extremes}"
+             SELECT grp AS grp, SUM(amt) AS total, COUNT(*) AS n"
         )
     }
 
@@ -190,13 +181,8 @@ impl BuildUnderLoad {
         if self.one_to_one {
             return format!("select id, grp, amt + amt as dbl from public.{SOURCE}");
         }
-        let extremes = if self.min_max {
-            ", min(amt) as lo, max(amt) as hi"
-        } else {
-            ""
-        };
         format!(
-            "select grp, sum(amt) as total, count(*) as n{extremes} \
+            "select grp, sum(amt) as total, count(*) as n \
              from public.{SOURCE} group by grp"
         )
     }
@@ -213,12 +199,6 @@ impl BuildUnderLoad {
             "t.id is null or o.id is null \
              or t.grp::numeric is distinct from o.grp::numeric \
              or t.dbl::numeric is distinct from o.dbl::numeric"
-        } else if self.min_max {
-            "t.grp is null or o.grp is null \
-             or t.total::numeric is distinct from o.total::numeric \
-             or t.n::bigint is distinct from o.n \
-             or t.lo::numeric is distinct from o.lo::numeric \
-             or t.hi::numeric is distinct from o.hi::numeric"
         } else {
             "t.grp is null or o.grp is null \
              or t.total::numeric is distinct from o.total::numeric \
@@ -451,7 +431,7 @@ impl BuildUnderLoadResult {
             .join(",");
         let w = &self.writes;
         format!(
-            "{{\"scenario\":\"{}\",\"rows\":{},\"groups\":{},\"min_max\":{},\"one_to_one\":{},\"writers\":{},\"write_rate\":{},\
+            "{{\"scenario\":\"{}\",\"rows\":{},\"groups\":{},\"one_to_one\":{},\"writers\":{},\"write_rate\":{},\
              \"application_threads\":{},\"build_chunk_rows\":{},\
              \"load_secs\":{:.3},\"load_rows_per_sec\":{:.0},\
              \"index_secs\":{:.3},\"build_secs\":{:.3},\"chunks\":{},\"first_claim_secs\":{},\
@@ -471,7 +451,6 @@ impl BuildUnderLoadResult {
             scenario,
             self.cfg.rows,
             self.cfg.groups,
-            self.cfg.min_max,
             self.cfg.one_to_one,
             self.cfg.writers,
             self.cfg.write_rate,
@@ -871,19 +850,12 @@ async fn dump_mismatches(raw: &RawClient, cfg: &BuildUnderLoad, terminal: &str) 
             &format!(
                 "with o as ({oracle}) \
                  select coalesce(t.grp::text, o.grp::text), t.total::text, o.total::text, \
-                        t.n::text, o.n::text, {extremes} \
+                        t.n::text, o.n::text \
                  from o full outer join public.{terminal} t on t.grp::numeric = o.grp::numeric \
                  where {differs} \
                  order by 1 limit 20",
                 oracle = cfg.oracle(),
                 differs = cfg.differs(),
-                // `--min-max` runs' extremes, so a group that differs only in
-                // its `MIN`/`MAX` shows how.
-                extremes = if cfg.min_max {
-                    "format('lo=%s hi=%s', t.lo, t.hi), format('lo=%s hi=%s', o.lo, o.hi)"
-                } else {
-                    "'', ''"
-                },
             ),
             &[],
         )
@@ -891,14 +863,12 @@ async fn dump_mismatches(raw: &RawClient, cfg: &BuildUnderLoad, terminal: &str) 
         .expect("list mismatched groups");
     for r in rows {
         eprintln!(
-            "build-under-load: MISMATCH grp={} target total={:?} n={:?} {} oracle total={:?} n={:?} {}",
+            "build-under-load: MISMATCH grp={} target total={:?} n={:?} oracle total={:?} n={:?}",
             r.get::<_, String>(0),
             r.get::<_, Option<String>>(1),
             r.get::<_, Option<String>>(3),
-            r.get::<_, String>(5),
             r.get::<_, Option<String>>(2),
             r.get::<_, Option<String>>(4),
-            r.get::<_, String>(6),
         );
     }
 }
@@ -1014,7 +984,6 @@ pub async fn run(cfg: BuildUnderLoad, tuning: &EngineTuning) -> BuildUnderLoadRe
     let peaks_stop = Arc::new(AtomicBool::new(false));
     let peaks_task = tokio::spawn(build_profile::sample_peaks(
         connect_raw(db.dsn()).await,
-        TARGET.to_string(),
         peaks_stop.clone(),
     ));
     let server_start = server_cost::start(&cluster);

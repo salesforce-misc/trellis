@@ -196,10 +196,7 @@ A 1-1 definition whose alias chain is cyclic doesn't yet take the Re-derive buil
 3. **Build.** The discharge takes the capture snapshot and builds by shape:
    a ring enumeration (an image-less `Recompute` per source row that drain
    workers fold like any batch), plain 1-1 chunks, or one direct set-based
-   `INSERT … SELECT` job. Apply skips a definition that isn't `live`. An
-   aggregate's direct job rebuilds the ledger, then deletes, through the
-   target-mutation seam, every group the rebuilt ledger has no live entry
-   for, before it writes the groups it has.
+   `INSERT … SELECT` job. Apply skips a definition that isn't `live`.
 4. **Go live.** A ring enumeration flips its definition to `live` in the
    discharge transaction. A chunked or direct build moves to `catching_up`
    (applying, not yet `live`) and parks a go-live catch-up on every table the

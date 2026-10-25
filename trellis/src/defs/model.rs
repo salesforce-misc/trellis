@@ -86,13 +86,13 @@ pub fn applying_sql(alias: &str) -> String {
 /// A ring-built definition goes straight to `live`, or to `catching_up` when
 /// its source is another definition's target.
 ///
-/// A plain aggregate (a target the ledger maintains, on a captured source)
+/// A plain aggregate (a target the group basis maintains, on a captured source)
 /// has no discharge, catch-up or `catching_up` (#625 F3, F5,
 /// `crate::staging::build`): the staging worker moves it to
 /// [`TransformStatus::Backfilling`] with its Re-derive build's plan job, it
 /// applies from that commit ([`APPLYING_SQL`]), and the transaction that
-/// finishes its build (the plan, every chunk and every group-delta merge)
-/// moves it to [`TransformStatus::Live`]. Its resume rebuilds it the same way.
+/// finishes its build (the plan job's one absolute write) moves it to
+/// [`TransformStatus::Live`]. Its resume rebuilds it the same way.
 ///
 /// Apply maintains a definition that is [`TransformStatus::is_applying`]:
 /// `live` or `catching_up`. Only `live` tells an operator the target is in

@@ -189,7 +189,7 @@ computed before the release misses its fence and computes again, and one that re
 the key as held but the fence after the release parks nothing, since a page parks
 only while the key's `poison` row is there. The
 parked changes are not replayed: a replayed row would carry the releaser's `row_txid`,
-not its source commit's, so a replay could regress a ledger entry a later
+not its source commit's, so a replay could regress a 1-1 ledger entry a later
 Re-derive already moved past. The `Recompute` is a Re-derive of the key from its
 current row on every target that reads it
 ([05](05-apply-and-exactly-once-deltas.md#the-ledger)): idempotent for a transform
@@ -210,7 +210,7 @@ replayed with its images, and the new transform holds no key.
 **What must never be quarantined.** The halting errors are deterministic yet
 caused by the *declared schema*, not the data — a source key the drain can't use
 (`NoPrimaryKey`, `UnsupportedPrimaryKeyType`), a tripped hop bound (a real value
-cycle), an aggregate target off the ledger (`AggregateOffLedger`), and Postgres
+cycle), an aggregate the group basis can't apply (`GroupBasisUnsupported`), and Postgres
 refusing the drain's role a read or write (`42501`, row-level security or a
 missing privilege, #766). Every key
 reproduces them, so quarantining would blame one key for nobody's fault and turn

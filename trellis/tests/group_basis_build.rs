@@ -7,8 +7,7 @@
 //!
 //! The source is seeded and captured by an unrelated 1-1 definition, then
 //! the aggregate is defined over it, so its build starts over rows. Every
-//! test turns the group-basis dev knob on before its driver starts, and runs
-//! the plan job by hand through `support/drain_driver.rs`, frozen at its
+//! test runs the plan job by hand through `support/drain_driver.rs`, frozen at its
 //! pause points where the scenario needs it. None sleeps or polls for
 //! convergence (#297): the one wait is for a page to queue on a lock the
 //! frozen build holds, which the test has forced.
@@ -53,7 +52,6 @@ fn columns() -> Vec<(&'static str, ValueType)> {
 /// `public.src (id, g, v)` captured, with an unrelated 1-1 definition live
 /// over it, and `rows` (an `insert ... values` tail) drained into it.
 async fn seeded(rows: &str) -> Driver {
-    trellis::dev::staging::set_group_basis(true);
     let mut d = Driver::start(
         "create table public.src (id integer primary key, g integer, v integer); \
          create index on public.src (g)",
@@ -518,7 +516,6 @@ async fn the_build_holds_the_definition_row() {
 /// absolute partials, so a build writes the same values the pages do.
 #[tokio::test]
 async fn a_build_writes_averages_numeric_sums_and_composed_fields() {
-    trellis::dev::staging::set_group_basis(true);
     let mut d = Driver::start(
         "create table public.src (id integer primary key, g integer, v integer, \
          m numeric(12, 2)); create index on public.src (g)",
@@ -771,7 +768,6 @@ async fn a_drop_waits_for_a_build_in_flight() {
 /// `partition_group_basis.rs`.)
 #[tokio::test]
 async fn a_partitioned_source_with_rows_is_refused() {
-    trellis::dev::staging::set_group_basis(true);
     let d = Driver::start(
         "create table public.src (id integer, g integer, v integer, primary key (id, g)) \
              partition by range (g); \
@@ -884,5 +880,73 @@ async fn a_build_that_keeps_failing_on_its_data_pauses_its_definition() {
         d.rows(ACTUAL).await,
         Vec::<String>::new(),
         "no group was written"
+    );
+}
+
+/// Issue #77 / ADR-0011's same-named decoy, on the group basis: an aggregate
+/// that names `custom.order_items` and a `custom` target reads and writes
+/// those, never the `public` tables of the same names on the engine's pinned
+/// `search_path`. Its build, a page, an image-less recompute (which reads
+/// the source live) and a group's extinction all agree with a `GROUP BY` of
+/// `custom.order_items`; the decoy's sums are far off any of them.
+#[tokio::test]
+async fn a_qualified_source_and_target_are_read_and_written_not_a_same_named_decoy() {
+    const DECOY: &str = "TRANSFORM custom.order_summary FROM custom.order_items GROUP BY g \
+        WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n";
+    const ACTUAL: &str = "select g, total, n from custom.order_summary order by g";
+    const EXPECTED: &str =
+        "select g, sum(v), count(*) from custom.order_items group by g order by g";
+    let mut d = Driver::start(
+        "create table public.order_items (id integer primary key, g integer, v integer); \
+         insert into public.order_items values (1, 1, 1000), (2, 1, 1000), (3, 2, 1000), \
+           (4, 2, 1000); \
+         create table public.order_summary (g integer, total bigint, n bigint); \
+         create schema custom; \
+         create table custom.order_items (id integer primary key, g integer, v integer); \
+         insert into custom.order_items values (1, 1, 5), (2, 2, 7)",
+        &columns(),
+        &[DECOY],
+        &["custom.order_items"],
+    )
+    .await;
+    async fn check(d: &Driver, why: &str) {
+        assert_eq!(d.rows(ACTUAL).await, d.rows(EXPECTED).await, "{why}");
+    }
+    check(&d, "the build").await;
+    assert_eq!(d.rows(ACTUAL).await, ["(1,5,1)", "(2,7,1)"]);
+
+    // Group 1's partials and row made wrong by hand, then an image-less
+    // recompute of one of its keys, which rewrites the group from a read of
+    // the source.
+    step(&mut d, "insert into custom.order_items values (3, 1, 3)").await;
+    check(&d, "a page").await;
+    let id = d
+        .rows("select id from transform_definitions where target_table = 'custom.order_summary'")
+        .await[0]
+        .trim_matches(|c| c == '(' || c == ')')
+        .to_string();
+    write(
+        &d,
+        &format!(
+            "update {DEFAULT_SCHEMA}.agg_{id} set __n = 9, __count_1 = 9, __sum_1 = 99 \
+             where g = 1; \
+             update custom.order_summary set total = 99, n = 9 where g = 1"
+        ),
+    )
+    .await;
+    assert_eq!(d.rows(ACTUAL).await, ["(1,99,9)", "(2,7,1)"], "made wrong");
+    d.stage_recomputes("custom.order_items", &["3"]).await;
+    d.settle().await;
+    check(&d, "an image-less recompute reads the qualified source").await;
+    assert_eq!(d.rows(ACTUAL).await, ["(1,8,2)", "(2,7,1)"]);
+
+    // A group's extinction deletes the qualified target's row.
+    step(&mut d, "delete from custom.order_items where g = 2").await;
+    d.settle().await;
+    check(&d, "a group's extinction").await;
+    assert_eq!(
+        d.rows("select count(*) from public.order_summary").await,
+        ["(0)"],
+        "the same-named public table is never written"
     );
 }

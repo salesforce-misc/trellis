@@ -23,7 +23,8 @@ ordered floor to ceiling:
    included.
 4. **Computed 1-1 target** — a scalar calculated field produces this type.
    Needs an immutable evaluator arm and, for a constant, a typed literal.
-5. **Aggregate target** — an aggregate calculated field folds to this type.
+5. **Aggregate target** — an aggregate calculated field has this type: `COUNT`,
+   and `SUM` or `AVG` over an integer or `numeric(p,s)` column.
 
 A `WHERE` predicate other than `TRUE` is not supported
 ([transforms](transforms.md#supported-sources-and-targets)), so no type has a
@@ -196,7 +197,7 @@ and what that misses in
 own overflow behaviour (`trellis/src/integer.rs`). `int4 + int4` is `integer`
 and raises `22003` past range; `int4 + numeric` promotes to unbounded
 `numeric`. `sum(int2|int4)` is `bigint`, `sum(int8)` is `numeric`, `avg(<int>)`
-is `numeric`, and `min`/`max` keep their argument's width. `oid` is an
+is `numeric`. `oid` is an
 unsigned 32-bit integer with no arithmetic; its `oid_out` is canonical
 decimal, so it is text-stable and a full key. Cross-checked against a live
 server in `trellis/tests/defs_exact_integers.rs`.
@@ -253,8 +254,8 @@ role, `GROUP BY` and primary key included (`temporal::is_text_stable`).
   `TIMESTAMPTZ` (no canonical-form checker) or `INTERVAL` (`interval_in` reads
   `IntervalStyle`). The text must be in Postgres's canonical output spelling.
 
-`crate::temporal` owns the comparison order, the `interval` value model and
-`interval_out`'s rendering. Checked in `trellis/tests/defs_temporal.rs`.
+`crate::temporal` classifies each family's text stability. Checked in
+`trellis/tests/defs_temporal.rs`.
 
 ## `bytea`
 

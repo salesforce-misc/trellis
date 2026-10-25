@@ -8,8 +8,7 @@
 //! partials, not from the rows the target holds, so a group-basis reader is
 //! rebuilt and any other reader is caught up.
 //!
-//! Every test turns the group-basis dev knob on before its driver starts and
-//! drives the pipeline by hand through `support/drain_driver.rs`, frozen at
+//! Every test drives the pipeline by hand through `support/drain_driver.rs`, frozen at
 //! pause points where the scenario needs it. None sleeps or polls for
 //! convergence (#297).
 
@@ -73,7 +72,6 @@ fn src_columns() -> Vec<(&'static str, ValueType)> {
 /// `public.src (id, g, v)` captured, seeded with `rows` (an `insert ...
 /// values` tail), with [`AGG`] live over it on the group basis.
 async fn start(rows: &str) -> Driver {
-    trellis::dev::staging::set_group_basis(true);
     let mut d = Driver::start(SRC_DDL, &src_columns(), &[AGG], &[SRC]).await;
     step(&mut d, &format!("insert into public.src values {rows}")).await;
     assert_oracle(&mut d).await;

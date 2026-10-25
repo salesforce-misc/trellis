@@ -24,10 +24,12 @@
 //!   which Postgres reports as a `Lock` wait on `transactionid` (waiting for
 //!   the holder's transaction to end) or `tuple` (queued behind another
 //!   waiter for the same row). Those two are [`WaitClass::RowLock`]; and a
-//!   row-lock wait whose statement is the aggregate apply's ordered pre-lock
-//!   (`... for update of t`, `staging::apply_aggregate`) is additionally
-//!   counted as [`ContentionSummary::prelock_wait_mean`] — the one wait that
-//!   is unambiguously "another drain worker holds my target groups".
+//!   row-lock wait whose statement is an ordered target-row pre-lock
+//!   (`... for update of t`, `staging::apply`) is additionally counted as
+//!   [`ContentionSummary::prelock_wait_mean`], as is a group-basis
+//!   aggregate's group lock on its hidden partials table
+//!   (`staging::group_basis`'s `lock_groups`, a sorted `insert ... on
+//!   conflict ... where false`).
 //!
 //! Sampling is cheap (one catalog query per interval, on a connection that is
 //! never a generator's or the engine's) and stands in for lock-wait
@@ -81,12 +83,14 @@ use crate::streaming::disk_tier::{LatencyHistogram, json_ms};
 /// the sampler's own query is noise next to the load.
 pub const SAMPLE_INTERVAL: Duration = Duration::from_millis(50);
 
-/// The aggregate apply's ordered pre-lock (`staging::apply_aggregate`'s
-/// `apply_aggregate_target`) ends in this. So does a 1-1 transform's
-/// composite-key pre-lock (`staging::apply`), which `fold_in`'s
-/// aggregate-only pipeline never installs; a scenario that mixes the two
-/// would have to tell them apart.
+/// A 1-1 transform's composite-key pre-lock (`staging::apply`) ends in
+/// this.
 const PRELOCK_MARKER: &str = "for update of t";
+
+/// A group-basis aggregate's (or a `JOIN`'s) group lock
+/// (`staging::group_basis`'s `lock_sql`) ends in this: it locks every group
+/// the page writes, sorted, without writing, before the page reads a basis.
+const GROUP_LOCK_MARKER: &str = "do update set __n = excluded.__n where false";
 
 /// The claim's statement (`staging::claim`'s `CLAIM_SQL`) takes the batch's
 /// buckets with this.
@@ -105,7 +109,8 @@ const LEDGER_MARKER: &str = "__ledger";
 pub enum StatementClass {
     /// The claim (`insert into seg_claims ...`).
     Claim,
-    /// The aggregate's ordered target-row pre-lock ([`PRELOCK_MARKER`]).
+    /// An ordered pre-lock: a 1-1 target's rows ([`PRELOCK_MARKER`]) or a
+    /// group-basis page's groups ([`GROUP_LOCK_MARKER`]).
     PreLock,
     /// Any statement naming a `%__ledger` table.
     LedgerLock,
@@ -159,7 +164,7 @@ pub fn statement_class(query: &str, target: &str) -> StatementClass {
     let target = target.to_ascii_lowercase();
     if q.contains(LEDGER_MARKER) {
         StatementClass::LedgerLock
-    } else if q.contains(PRELOCK_MARKER) {
+    } else if q.contains(PRELOCK_MARKER) || q.contains(GROUP_LOCK_MARKER) {
         StatementClass::PreLock
     } else if q.contains(CLAIM_MARKER) || q.contains(CLAIM_LOCK_MARKER) {
         StatementClass::Claim
@@ -175,7 +180,7 @@ pub fn statement_class(query: &str, target: &str) -> StatementClass {
 
 /// A Re-derive build's statement classes (#625 F2), told apart by the
 /// `application_name` its transactions set (`trellis::dev::staging`'s
-/// `CHUNK_APPLICATION_NAME`/`MERGE_APPLICATION_NAME`): a chunk's entry lock
+/// `CHUNK_APPLICATION_NAME`): a chunk's entry lock
 /// shares its text with a drain page's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BuildClass {
@@ -183,27 +188,18 @@ pub enum BuildClass {
     /// an entry (and a sweep batch's placeholder insert).
     ChunkLock,
     /// The rest of a chunk's transaction: its claim fence, its key read, its
-    /// read-and-write statements (the insert of the new keys' entries, the
-    /// rewrite of the others', and their delta inserts), its done mark and
-    /// its commit.
+    /// read-and-write statements (the insert of the new keys' entries and
+    /// the rewrite of the others'), its done mark and its commit.
     ChunkWrite,
-    /// A merger pass: the claim, sum and group upsert, the all-zero delete
-    /// and the seam.
-    MergeUpsert,
 }
 
 impl BuildClass {
-    pub const ALL: [BuildClass; 3] = [
-        BuildClass::ChunkLock,
-        BuildClass::ChunkWrite,
-        BuildClass::MergeUpsert,
-    ];
+    pub const ALL: [BuildClass; 2] = [BuildClass::ChunkLock, BuildClass::ChunkWrite];
 
     pub fn label(self) -> &'static str {
         match self {
             BuildClass::ChunkLock => "chunk_lock",
             BuildClass::ChunkWrite => "chunk_write",
-            BuildClass::MergeUpsert => "merge_upsert",
         }
     }
 
@@ -215,9 +211,6 @@ impl BuildClass {
 /// The build class of a backend running `query` under `application_name`,
 /// or `None` for anything that isn't a Re-derive build's.
 pub fn build_class(application_name: &str, query: &str) -> Option<BuildClass> {
-    if application_name == trellis::dev::staging::MERGE_APPLICATION_NAME {
-        return Some(BuildClass::MergeUpsert);
-    }
     if application_name != trellis::dev::staging::CHUNK_APPLICATION_NAME {
         return None;
     }
@@ -383,8 +376,8 @@ pub struct ContentionSummary {
     /// Engine backends not idle — the denominator the shares below use.
     pub engine_busy_mean: f64,
     pub engine_row_lock_mean: f64,
-    /// The subset of `engine_row_lock_mean` blocked in the aggregate apply's
-    /// ordered target-row pre-lock.
+    /// The subset of `engine_row_lock_mean` blocked in an ordered
+    /// target-row pre-lock ([`PRELOCK_MARKER`]).
     pub prelock_wait_mean: f64,
     pub engine_other_lock_mean: f64,
     pub engine_lwlock_mean: f64,
@@ -989,7 +982,6 @@ mod tests {
         let lock = "select 1 from \"public\".\"agg_totals__ledger\" where \"__from_key\" = \
                     any($1::text[]) order by \"__from_key\" for update";
         let chunk = trellis::dev::staging::CHUNK_APPLICATION_NAME;
-        let merge = trellis::dev::staging::MERGE_APPLICATION_NAME;
         assert_eq!(build_class(chunk, lock), Some(BuildClass::ChunkLock));
         assert_eq!(
             build_class(
@@ -997,10 +989,6 @@ mod tests {
                 "with snap as (select pg_current_snapshot() ...) select 1"
             ),
             Some(BuildClass::ChunkWrite)
-        );
-        assert_eq!(
-            build_class(merge, "with claimed as ..."),
-            Some(BuildClass::MergeUpsert)
         );
         assert_eq!(build_class("", lock), None, "a page's lock is a page's");
 
@@ -1092,6 +1080,15 @@ mod tests {
     fn statements_classify_by_their_text() {
         let class = |q| statement_class(q, "agg_totals");
         assert_eq!(class(PRELOCK), StatementClass::PreLock);
+        assert_eq!(
+            class(
+                "insert into trellis.agg_7 (\"g\") select distinct \"g\" from ( \
+                 select \"g\" from pg_temp.s ) as g order by \"g\" \
+                 on conflict (\"g\") do update set __n = excluded.__n where false"
+            ),
+            StatementClass::PreLock,
+            "a group-basis page's group lock"
+        );
         assert_eq!(
             class(
                 "with taken as ( select bucket from seg_claims where seg_seq = $1 ), \

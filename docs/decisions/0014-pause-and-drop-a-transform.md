@@ -37,7 +37,7 @@ operator's `PAUSE`, or by the engine when it cannot maintain the definition:
 - **Repeated build failure.** A build chunk kept failing in a way no retry or narrowing
   gets past (a missing table or column, say). The error stays on `backfill_failure`.
 - **A halting drain failure.** A failure every key reproduces (a source with no usable
-  primary key, a propagation wave past the hop bound, an aggregate target off its ledger)
+  primary key, a propagation wave past the hop bound, an aggregate the group basis can't apply)
   pauses every definition it reaches and everything downstream of them, so the rest of the
   page commits instead of retrying forever. Recorded on `capture_failure`.
 
@@ -130,10 +130,9 @@ together in one transaction and read on one snapshot:
   with no live entry (one added or re-keyed by hand). Any other definition parks a marker,
   and its one-pass build ends in a go-live catch-up that enumerates the
   source's current keys as image-less Recomputes, plus the orphan sweep
-  (`intake::resume_orphans`) above. An aggregate's one-pass build rebuilds
-  its ledger, and before it applies again it deletes every group the rebuilt
-  ledger has no live entry for: a group whose rows left after the sweep's
-  snapshot but before the build's read. `RESUME` first bumps the source's
+  (`intake::resume_orphans`) above. An aggregate or a `JOIN` is rebuilt by one
+  absolute write that replaces every group, and removes the groups the source no
+  longer has. `RESUME` first bumps the source's
   version fence and discards the definition's unclaimed backfill chunks.
 
 Deletions are visible the moment that transaction commits. Rows whose values changed
@@ -147,12 +146,8 @@ live columns, the source key's type and collations, a `JOIN`'s `ON` columns (sti
 the allowlist, with matching types and collations), row-level security and subscriptions, and, for a 1-1 definition, a
 source key that is still the one its target is keyed by. While define would refuse
 it, the resume refuses with define's error, names the column and what to change, and
-changes nothing: the definition stays paused. Every definition also needs its ledger
-table to exist (only a hand edit drops it), and an aggregate gets one more check,
-that its group-delta table is the one define would create now: it exists (likewise),
-and its running-sum and recompute columns are define's (a `SUM` or `AVG`
-argument that moved between an exact type and floating point changes them). The
-resume refuses each of these too, names `DROP TRANSFORM`, and changes nothing; a column resume
+changes nothing: the definition stays paused. A 1-1 definition also needs its ledger
+table to exist (only a hand edit drops it). The resume refuses that too, names `DROP TRANSFORM`, and changes nothing; a column resume
 doesn't make these checks, since it builds nothing. A field resume runs define's validation on
 its definition, and leaves a dependent its cascade reaches paused while that
 dependent's check fails. The dependent's check runs on the definition read under the
@@ -168,13 +163,11 @@ compares later changes against. The pass records a key column's new type itself 
 accepts a change to it without a pause. And the resume brings every column Trellis
 created for the definition with a type that comes from the source to the type define
 would give it now. Some are copies of one source column: a 1-1 target's key and
-passthrough columns, an aggregate's `GROUP BY` columns in its target, ledger and
-group-delta table, and a `JOIN`'s `GROUP BY` and `ON` columns in its target and hidden
+passthrough columns, an aggregate's `GROUP BY` columns in its target, and a `JOIN`'s `GROUP BY` and `ON` columns in its target and hidden
 tables. Others are typed by an expression, and
 take the type define's inference gives it over the live schema: a 1-1 target's
 calculated fields, an aggregate's or a `JOIN`'s field columns (`SUM(qty)` is `bigint` over an
-`integer` `qty` and `numeric` over a `bigint` one), and its ledger's contribution
-columns, typed as the aggregate's argument. The staging worker's capture pass pauses a
+`integer` `qty` and `numeric` over a `bigint` one). The staging worker's capture pass pauses a
 definition when the source widens past one of these columns, and the resume re-types
 every one whose type differs from define's, whichever change made it differ. Re-typing
 one is an `ALTER … TYPE` under `ACCESS EXCLUSIVE`, which waits for every reader of the

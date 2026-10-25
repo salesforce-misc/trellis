@@ -5,8 +5,8 @@
 //! A restore is faked deterministically: the stored oid of
 //! `partition_sources` is changed under the same `system_identifier` (a dump
 //! restored into the same cluster), or the identifier is changed and every
-//! recorded node oid moved (a restore into another cluster). Each pass, the
-//! correction engine and the merger are called by hand (#297).
+//! recorded node oid moved (a restore into another cluster). Each pass and
+//! the correction engine are called by hand (#297).
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;

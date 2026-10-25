@@ -207,7 +207,7 @@ same after `pg_dump`), and Trellis does the same:
   Trellis's tables. The engine classifies each table in its schema as
   definition, seed or runtime state, and a test fails on a table nobody
   classified.
-* **Runtime state is never dumped.** The ledger, ring, build chunks,
+* **Runtime state is never dumped.** The 1-1 ledgers, ring, build chunks,
   quarantine, claims and statuses describe source and target rows a
   schema-only dump doesn't carry. Definitions load as `waiting_to_backfill`,
   the state a `define` commits, whatever state they were in when dumped.

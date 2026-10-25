@@ -1,10 +1,9 @@
-//! Apply ∪ mark-drained (issue #11, stage 05) — the 1-1/scalar subset only.
-//! See docs/staging-and-claiming/05-apply-and-exactly-once-deltas.md.
+//! Apply ∪ mark-drained (issue #11, stage 05). See
+//! docs/staging-and-claiming/05-apply-and-exactly-once-deltas.md.
 //!
-//! **Scope**: only [`crate::defs::ast::KeySpace::OneToOne`] definitions.
-//! The aggregate delta model (groups, invertibility, min/max recompute,
-//! composite partials, grain migration) is out of scope — it's blocked on
-//! aggregate transform-defs, which don't exist yet.
+//! A 1-1 definition's records are applied here; an aggregate's and a
+//! `JOIN`'s are handed to [`super::group_basis`] and [`super::join`] in
+//! Phase 3.
 //!
 //! The design's three phases map onto three functions:
 //!
@@ -126,7 +125,7 @@ pub enum ApplyError {
     /// [`super::liveness::release`]'s doc comment on why a fence miss is
     /// not parked behind the reclaim TTL.
     VersionFenceMiss { src_table: String },
-    /// The entry lock of a ledger target (`super::ledger::lock_entries`)
+    /// The entry lock of a 1-1 target (`super::one_to_one_ledger::lock_entries`)
     /// found a key with no entry: the tombstone GC
     /// (`super::retire::collect_tombstones`, #623 D7) collected it between
     /// the placeholder insert and the sorted `for update` (#712). Transient,
@@ -140,22 +139,16 @@ pub enum ApplyError {
     /// needs to know a wave ran away, and which target tables it ran away
     /// through, rather than have the tail of it quietly disappear.
     HopBoundExceeded { hop_gen: i32, tables: Vec<String> },
-    /// An aggregate target `ledger::route` doesn't take (#623 D5). Every
-    /// valid aggregate is on the ledger, so this is a definition the drain
-    /// can't apply at all, not a bad row: every key of the target would
-    /// reproduce it, so it halts rather than charging each key a death.
-    AggregateOffLedger { target: String },
     /// A group-basis aggregate target (`super::group_basis`, #1100) met
-    /// what its dev knob doesn't support yet: a ring row missing the images
-    /// its change needs, a page folded with the knob off, a fresh build or
+    /// what it doesn't support yet: an aggregate it doesn't route, a ring
+    /// row missing the images its change needs, a fresh build or
     /// resume over a partitioned source that has rows before its tree is
     /// recorded, or a build or rebuild over one whose tree is not recorded or
     /// has a leaf with no usable constraint text (#1101); or, on a `JOIN`
     /// (`super::join`, #1108), a field build, or a partitioned side whose tree
     /// is not recorded or has a leaf with no usable constraint text (#1286).
-    /// Like
-    /// [`ApplyError::AggregateOffLedger`], every page of the target would
-    /// reproduce it, so it halts the target.
+    /// Every page of the target would reproduce it, so it halts the target
+    /// rather than charging each key a death.
     GroupBasisUnsupported { target: String, what: &'static str },
     /// A folded record names a source table Postgres no longer has
     /// (`42P01` from a live query against it) — issue #16's "one sanctioned
@@ -309,7 +302,6 @@ impl ApplyError {
             | ApplyError::VersionFenceMiss { .. }
             | ApplyError::LedgerEntryCollected { .. }
             | ApplyError::HopBoundExceeded { .. }
-            | ApplyError::AggregateOffLedger { .. }
             | ApplyError::GroupBasisUnsupported { .. }
             | ApplyError::TruncateWithoutLsn { .. }
             | ApplyError::SpilledMutationsNotFlushed => ErrorCode::Internal,
@@ -377,9 +369,6 @@ impl fmt::Display for ApplyError {
                 "a ledger entry of '{target}' was collected while its lock was being taken; \
                  retry the transaction"
             ),
-            ApplyError::AggregateOffLedger { target } => {
-                write!(f, "aggregate target '{target}' is not on the ledger")
-            }
             ApplyError::GroupBasisUnsupported { target, what } => write!(
                 f,
                 "group-basis aggregate target '{target}' can't apply {what}"
@@ -483,7 +472,6 @@ impl std::error::Error for ApplyError {
             | ApplyError::VersionFenceMiss { .. }
             | ApplyError::LedgerEntryCollected { .. }
             | ApplyError::HopBoundExceeded { .. }
-            | ApplyError::AggregateOffLedger { .. }
             | ApplyError::GroupBasisUnsupported { .. }
             | ApplyError::SourceTableDropped { .. }
             | ApplyError::ColumnNotPaused { .. }
@@ -1253,8 +1241,6 @@ struct AggregateClearPlan {
 /// Where an aggregate target keeps its ordering state ([`AggregateClearPlan`]).
 #[derive(Debug, Clone)]
 enum AggregateState {
-    /// #623 D3: the per-row ledger.
-    Ledger,
     /// #1102: the group basis's hidden table (`super::group_basis`), quoted
     /// and qualified.
     GroupBasis { hidden: String },
@@ -2773,15 +2759,11 @@ mod tests {
 pub struct ApplyPlan {
     versions: BTreeMap<String, Option<i64>>,
     targets: BTreeMap<String, TargetPlan>,
-    /// The aggregate targets, all on the ledger (`super::ledger`, #623 D3 to
-    /// D5), each with this page's records for it, keyed by the definition's
-    /// bare target name. Ordered, so every page writes them in one order.
-    ledger_targets: BTreeMap<String, super::ledger::LedgerTargetPlan>,
     /// The aggregate targets on the group basis (`super::group_basis`,
-    /// behind its dev knob, #1100), each with this page's ring rows for it,
+    /// #1100), each with this page's ring rows for it,
     /// keyed by the definition's bare target name, in target order.
     group_targets: BTreeMap<String, super::group_basis::GroupTargetPlan>,
-    /// The `JOIN` targets (`super::join`, behind the group-basis knob,
+    /// The `JOIN` targets (`super::join`,
     /// #1108), each with this page's ring rows of either table, keyed by the
     /// definition's bare target name, in target order.
     join_targets: BTreeMap<String, super::join::JoinTargetPlan>,
@@ -3151,9 +3133,6 @@ pub(super) async fn compute_page(
 
     let mut versions: BTreeMap<String, Option<i64>> = BTreeMap::new();
     let mut targets: BTreeMap<String, TargetPlan> = BTreeMap::new();
-    // #623 D3: aggregate targets on the ledger, in target order, so every
-    // page takes their locks in one order.
-    let mut ledger_targets: BTreeMap<String, super::ledger::LedgerTargetPlan> = BTreeMap::new();
     // #1100: aggregate targets on the group basis, in target order too.
     let mut group_targets: BTreeMap<String, super::group_basis::GroupTargetPlan> = BTreeMap::new();
     // #1108: `JOIN` targets, in target order too.
@@ -3282,48 +3261,31 @@ pub(super) async fn compute_page(
         // changes need is decoded in one [`decode_images`] call (issue
         // #327), not one round trip each.
         //
-        // #623 D3: a definition on the ledger reads its images and its
-        // Re-derives in Phase 3 (`super::ledger`), so a source read only by
-        // such definitions decodes and re-reads nothing here.
-        let mut ledger_shapes: Vec<Option<super::ledger::LedgerShape>> =
-            Vec::with_capacity(defs.len());
-        // #1100: a definition the group basis takes (behind its dev knob)
-        // reads its changes' ring rows in Phase 3 (`super::group_basis`), so
-        // it decodes and re-reads nothing here either.
+        // #1100: a definition on the group basis reads its changes' ring
+        // rows in Phase 3 (`super::group_basis`), so it decodes and re-reads
+        // nothing here.
         let mut group_shapes: Vec<Option<super::group_basis::GroupShape>> =
             Vec::with_capacity(defs.len());
         // #1108: so does a `JOIN` (`super::join`).
         let mut joins: Vec<bool> = Vec::with_capacity(defs.len());
         for def in &defs {
-            let join = matches!(def.def.key_space, KeySpace::Join(_));
-            joins.push(join);
-            ledger_shapes.push(if join {
-                None
-            } else {
-                super::ledger::route_definition(def)
-            });
+            joins.push(matches!(def.def.key_space, KeySpace::Join(_)));
             group_shapes.push(super::group_basis::route(&def.def, &def.source_columns));
         }
-        let ledger_only = ledger_shapes
+        let phase3_only = group_shapes
             .iter()
-            .zip(&group_shapes)
             .zip(&joins)
-            .all(|((ledger, group), join)| ledger.is_some() || group.is_some() || *join);
+            .all(|(group, join)| group.is_some() || *join);
         // #623 D6: so does a 1-1 definition's Re-derive, so a source read
         // only by those re-reads nothing here either.
-        let rederives_in_phase3 = defs
-            .iter()
-            .zip(ledger_shapes.iter().zip(&group_shapes))
-            .all(|(def, (shape, group))| {
-                shape.is_some()
-                    || group.is_some()
-                    || matches!(def.def.key_space, KeySpace::Join(_) | KeySpace::OneToOne)
-            });
+        let rederives_in_phase3 = defs.iter().zip(&group_shapes).all(|(def, group)| {
+            group.is_some() || matches!(def.def.key_space, KeySpace::Join(_) | KeySpace::OneToOne)
+        });
         let mut batch = ImageBatch::default();
         let mut slots: Vec<Option<usize>> = Vec::with_capacity(changes.len());
         let mut live_refetch_indices: Vec<usize> = Vec::new();
         for (i, change) in changes.iter().enumerate() {
-            if ledger_only {
+            if phase3_only {
                 slots.push(None);
                 continue;
             }
@@ -3349,7 +3311,7 @@ pub(super) async fn compute_page(
             }
         }
 
-        for ((def, ledger_shape), group_shape) in defs.iter().zip(ledger_shapes).zip(group_shapes) {
+        for (def, group_shape) in defs.iter().zip(group_shapes) {
             // #799: this definition's share, without the changes whose key
             // is poisoned for it (parked above).
             let (changes, rows) = definition_share(def.id, &changes, &rows, &exclusions);
@@ -3416,40 +3378,11 @@ pub(super) async fn compute_page(
                 }
                 continue;
             }
-            // #623 D3: a plain aggregate on the ledger takes the records as
-            // they are; Phase 3 evaluates them (`super::ledger`).
-            if let Some(shape) = ledger_shape {
-                let target_plan = match ledger_targets.entry(def.def.target.clone()) {
-                    std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
-                    std::collections::btree_map::Entry::Vacant(entry) => {
-                        let identity = {
-                            let client = pool.get().await?;
-                            ddl::identity_key_columns(&**client, &def.target_table).await?
-                        };
-                        entry.insert(super::ledger::LedgerTargetPlan::new(
-                            &def.target_table,
-                            qualified_source,
-                            pk.clone(),
-                            identity,
-                            shape,
-                        ))
-                    }
-                };
-                for change in changes.iter() {
-                    target_plan.push(change);
-                    buffer_transform_apply_metrics(
-                        &def.def.target,
-                        change,
-                        &mut end_to_end_origins,
-                        &mut transform_observations,
-                    );
-                }
-                continue;
-            }
-            // #623 D5: `ledger::route` takes every valid aggregate.
+            // Every aggregate define accepts is on the group basis.
             if matches!(def.def.key_space, KeySpace::Aggregate { .. }) {
-                return Err(ApplyError::AggregateOffLedger {
+                return Err(ApplyError::GroupBasisUnsupported {
                     target: def.def.target.clone(),
+                    what: "an aggregate the group basis doesn't take",
                 });
             }
             let field_names: Vec<String> = def.def.fields.iter().map(|f| f.name.clone()).collect();
@@ -3652,7 +3585,7 @@ pub(super) async fn compute_page(
                             .into());
                         }
                         // #1102: a group-basis target empties its hidden
-                        // table, as a ledger target empties its ledger.
+                        // table.
                         let state =
                             if super::group_basis::route(&def.def, &def.source_columns).is_some() {
                                 AggregateState::GroupBasis {
@@ -3661,8 +3594,6 @@ pub(super) async fn compute_page(
                                         def.id,
                                     ),
                                 }
-                            } else if super::ledger::route_definition(def).is_some() {
-                                AggregateState::Ledger
                             } else {
                                 AggregateState::Neither
                             };
@@ -3721,7 +3652,6 @@ pub(super) async fn compute_page(
     let mut downstream_readers = HashMap::new();
     let mut all_targets: std::collections::HashSet<&String> = targets.keys().collect();
     all_targets.extend(clears.keys());
-    all_targets.extend(ledger_targets.keys());
     all_targets.extend(group_targets.keys());
     all_targets.extend(join_targets.keys());
     all_targets.extend(aggregate_clears.keys());
@@ -3786,7 +3716,6 @@ pub(super) async fn compute_page(
     Ok(ApplyPlan {
         versions,
         targets,
-        ledger_targets,
         group_targets,
         join_targets,
         clears,
@@ -5171,7 +5100,6 @@ async fn hold_version_fences(
     fields(
         segments = steps.len(),
         targets = plan.targets.len(),
-        ledger_targets = plan.ledger_targets.len(),
         keys_written = tracing::field::Empty,
         keys_deleted = tracing::field::Empty,
     )
@@ -5229,14 +5157,10 @@ pub(crate) async fn apply_page(
     // target's `GROUP BY` key (issue #315: each cleared group reaches the
     // seam, where it used to go unpropagated).
     for clear in plan.aggregate_clears.values() {
-        // #623 D3: a ledger target's truncate empties its ledger and raises
-        // its truncate floor (the D split's Q6), then clears its groups.
-        // #1102: a group-basis target empties its hidden table the same way.
+        // #1102: a group-basis target's truncate empties its hidden table and
+        // raises its truncate floor (the D split's Q6), then clears its
+        // groups.
         match &clear.state {
-            AggregateState::Ledger => {
-                super::ledger::truncate_ledger(txn, &clear.qualified_target, clear.truncate_lsn)
-                    .await?;
-            }
             AggregateState::GroupBasis { hidden } => {
                 super::group_basis::truncate_groups(
                     txn,
@@ -5279,25 +5203,7 @@ pub(crate) async fn apply_page(
         keys_deleted += deleted;
     }
 
-    // 3b. Aggregate targets, all on the ledger (#623 D3 to D5), in target
-    // order. A tombstone's `applied_seg` is the page's latest segment: a key
-    // never splits across a page's segments by more than that, and a later
-    // stamp only delays tombstone GC (the D split's Q7).
-    for ledger_plan in plan.ledger_targets.values() {
-        let (written, deleted) = super::ledger::apply_ledger_target(
-            txn,
-            ledger_plan,
-            page_first_seg,
-            page_seg,
-            &mut mutations,
-        )
-        .await?;
-        keys_written += written;
-        keys_deleted += deleted;
-    }
-
-    // 3b'. Aggregate targets on the group basis (#1100, behind its dev
-    // knob), in target order.
+    // 3b. Aggregate targets on the group basis (#1100), in target order.
     for group_plan in plan.group_targets.values() {
         let (written, deleted) =
             super::group_basis::apply_group_target(txn, group_plan, &mut mutations).await?;
@@ -5305,7 +5211,7 @@ pub(crate) async fn apply_page(
         keys_deleted += deleted;
     }
 
-    // 3b''. `JOIN` targets (#1108, behind the same knob), in target order.
+    // 3c. `JOIN` targets (#1108), in target order.
     for join_plan in plan.join_targets.values() {
         let (written, deleted) =
             super::join::apply_join_target(txn, join_plan, &mut mutations).await?;
@@ -5394,7 +5300,6 @@ pub(crate) async fn apply_page(
         .targets
         .values()
         .map(|t| &t.qualified_target)
-        .chain(plan.ledger_targets.values().map(|t| &t.target))
         .chain(plan.group_targets.values().map(|t| &t.target))
         .chain(plan.join_targets.values().map(|t| &t.target))
     {
