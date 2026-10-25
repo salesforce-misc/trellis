@@ -9,7 +9,7 @@ require_relative "lib/trellis/version"
 # This spec is the source gem. The Rakefile's RbSys::ExtensionTask derives
 # each platform gem from it, dropping the Rust sources, extconf.rb and the
 # rb_sys dependency in favor of prebuilt extensions
-# (.github/workflows/ruby-release.yml).
+# (.github/workflows/release.yml).
 #
 # The source gem's extension crate has to build with no Cargo workspace
 # around it: .github/scripts/ruby-prepare-source-gem.sh rewrites its

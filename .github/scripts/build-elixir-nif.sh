@@ -3,7 +3,7 @@
 # release mode for one target and packs it the way rustler_precompiled
 # downloads it: `lib<crate>-v<version>-nif-<nif version>-<target>.so.tar.gz`,
 # holding the one library under that name without the `.tar.gz`. Used by
-# .github/workflows/elixir-release.yml, once per target; runs the same way
+# .github/workflows/release.yml, once per target; runs the same way
 # locally.
 #
 # usage: build-elixir-nif.sh <target> <out-dir>

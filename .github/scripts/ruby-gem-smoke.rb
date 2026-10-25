@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
 # Checks an installed trellis-pg gem loads its extension and calls into it.
-# Run by .github/workflows/ruby-release.yml against every gem it builds,
+# Run by .github/workflows/release.yml against every gem it builds,
 # installed on its own (not from a checkout).
 #
 # usage: ruby ruby-gem-smoke.rb [<dsn>]

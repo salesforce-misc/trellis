@@ -14,9 +14,10 @@ defmodule Trellis.Native do
   # run on dirty IO schedulers; the NIF crate's module docs list the rest.
   #
   # A host gets the NIF precompiled: rustler_precompiled downloads the build
-  # for its target from the `elixir-v<version>` GitHub release, which
-  # .github/workflows/elixir-release.yml builds, and checks it against
-  # checksum-Elixir.Trellis.Native.exs, which ships in the Hex package.
+  # for its target from the `v<version>` GitHub release, which
+  # .github/workflows/release.yml builds, and checks it against
+  # checksum-Elixir.Trellis.Native.exs, which ships in the Hex package
+  # (docs/releasing.md).
   # `TRELLIS_PG_BUILD=1` builds it from source instead (it needs Rust and
   # the host's own `{:rustler, ...}` dep), for a target not listed below.
   # Inside this repository (dev and test; a dependency always compiles in
@@ -37,7 +38,7 @@ defmodule Trellis.Native do
         crate: "trellis_nif",
         version: version,
         base_url:
-          "https://github.com/salesforce-misc/trellis/releases/download/elixir-v#{version}",
+          "https://github.com/salesforce-misc/trellis/releases/download/v#{version}",
         # The release workflow's matrix. Every build is for NIF version
         # 2.15, which loads on OTP 22 and up.
         targets: ~w(

@@ -541,17 +541,13 @@ Elixir suite runs too, so the two bindings can't drift apart unnoticed (see
 
 ## Releasing
 
-`.github/workflows/ruby-release.yml` builds and publishes the gems. Pushing
-a `ruby-v<version>` tag, where `<version>` is `Trellis::VERSION`
-(`lib/trellis/version.rb`), builds the six platform gems and the source gem,
-installs and loads each one (every Linux gem on each Ruby it supports), and
-pushes them all to RubyGems, platform gems first. Running the workflow by
-hand does everything but the push, leaving the gems as workflow artifacts.
-
-It publishes as a RubyGems [trusted publisher](https://guides.rubygems.org/trusted-publishing/),
-so there's no API key to keep: on rubygems.org, `trellis-pg` (or, before its
-first release, a pending trusted publisher for it) names this repository and
-the workflow file `ruby-release.yml`.
+`trellis-pg` is released with the rest of Trellis, from one `v<version>` tag
+([docs/releasing.md](../../docs/releasing.md)); `Trellis::VERSION`
+(`lib/trellis/version.rb`) is the release's. `.github/workflows/release.yml`
+builds the six platform gems and the source gem, installs and loads each one
+(every Linux gem on each Ruby it supports), and attaches them to the tag's
+GitHub release. They are then pushed to RubyGems by hand, byte for byte, with
+`.github/scripts/publish-packages.sh`, platform gems first.
 
 A platform gem builds in rb-sys's cross-compiling container for its
 platform, through `rb-sys-dock`, and takes one build of the extension per

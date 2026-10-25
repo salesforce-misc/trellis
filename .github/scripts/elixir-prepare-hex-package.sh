@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Readies the Elixir binding (clients/elixir, or <package-dir>) for
-# `mix hex.publish`. Run by .github/workflows/elixir-release.yml; it edits the
-# tree in place, so don't commit the result.
+# `mix hex.publish`. Run by .github/workflows/release.yml (to check the
+# package builds) and .github/scripts/publish-packages.sh (to publish it); it
+# edits the tree in place, so don't commit the result.
 #
 # usage: elixir-prepare-hex-package.sh <git-url> <rev> [<package-dir>]
 #

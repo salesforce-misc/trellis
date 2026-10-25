@@ -1,0 +1,433 @@
+name: Release
+
+# Builds a Trellis release and attaches it to the tag's GitHub release
+# (docs/releasing.md). Nothing else triggers it: merging a change does
+# nothing. It publishes no package: crates.io, Hex and RubyGems are published
+# by hand afterwards, from the released tag and these assets, with
+# .github/scripts/publish-packages.sh.
+#
+# - Pushing a `v<version>` tag, where <version> is the version of every
+#   crate, mix.exs and Trellis::VERSION (check-release-versions.sh), builds:
+#   - the `trellis` CLI for each target below,
+#   - the Elixir binding's precompiled NIF for every target Trellis.Native
+#     lists (rustler_precompiled downloads them from this release),
+#   - the Ruby binding's platform gems, each installed and loaded, and its
+#     source gem,
+#   and checks the Hex package builds. Then it attaches all of them, with a
+#   SHA256SUMS file, to the tag's GitHub release and publishes that release.
+#   A draft release for the tag (the one the release notes were written into)
+#   is filled in and published; with none, it creates one.
+# - Running it by hand (workflow_dispatch) builds and checks the same things
+#   and keeps them as workflow artifacts. It touches no GitHub release, even
+#   when run from a `v*` tag: only the `release` job does, and it runs only
+#   on a tag push to salesforce-misc/trellis (the repository Trellis.Native
+#   downloads from).
+#
+# The org's Actions policy allows only a curated set of third-party actions
+# (see .github/actions/rust-toolchain/action.yml), so this uses GitHub's own
+# actions and repository scripts: build-elixir-nif.sh rather than
+# philss/rustler-precompiled-action, rb-sys-dock directly rather than
+# oxidize-rb/actions/cross-gem (which runs it too), and setup-ruby.sh rather
+# than ruby/setup-ruby.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  versions:
+    name: Versions
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check every version equals the tag's
+        # By hand, there's no tag: every version must still agree, with the
+        # engine crate's.
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            version="$GITHUB_REF_NAME"
+          else
+            version="$(awk -F'"' '/^version = / { print $2; exit }' trellis/Cargo.toml)"
+          fi
+          .github/scripts/check-release-versions.sh "$version"
+
+  cli:
+    name: CLI ${{ matrix.target }}
+    needs: versions
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Every Linux target cross-builds on one x86_64 runner with
+          # cargo-zigbuild (see build-cli.sh); both macOS targets on an Apple
+          # silicon runner. The gnu binaries are the ones to run: the musl
+          # ones are static, for Alpine and scratch images, and musl's
+          # allocator is slower.
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-24.04 }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04 }
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-24.04 }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04 }
+          - { target: aarch64-apple-darwin, os: macos-15 }
+          - { target: x86_64-apple-darwin, os: macos-15 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: "1.98.0"
+          targets: ${{ matrix.target }}
+
+      - name: Install cargo-zigbuild
+        # From PyPI, which ships both it and Zig as wheels, pinned. In a venv
+        # put first on PATH, so its `python3 -m ziglang` is how
+        # cargo-zigbuild finds Zig.
+        if: runner.os == 'Linux'
+        run: |
+          python3 -m venv "$RUNNER_TEMP/zigbuild"
+          "$RUNNER_TEMP/zigbuild/bin/pip" install --quiet cargo-zigbuild==0.23.4 ziglang==0.15.2
+          echo "$RUNNER_TEMP/zigbuild/bin" >> "$GITHUB_PATH"
+
+      - name: Build the CLI
+        run: .github/scripts/build-cli.sh "${{ matrix.target }}" "$RUNNER_TEMP/cli"
+
+      - name: Run it
+        # The x86_64 builds run here (Rosetta runs the Intel macOS one); the
+        # aarch64 Linux ones would need an emulator.
+        if: ${{ !startsWith(matrix.target, 'aarch64-unknown-linux') }}
+        run: |
+          set -euo pipefail
+          tar -C "$RUNNER_TEMP" -xzf "$RUNNER_TEMP"/cli/*.tar.gz
+          "$RUNNER_TEMP"/trellis-v*-"${{ matrix.target }}"/trellis --help
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.target }}
+          path: ${{ runner.temp }}/cli/*.tar.gz
+          if-no-files-found: error
+
+  nif:
+    name: NIF ${{ matrix.target }}
+    needs: versions
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Trellis.Native's `targets`. Built the same way as the CLI.
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-24.04 }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04 }
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-24.04 }
+          - { target: aarch64-apple-darwin, os: macos-15 }
+          - { target: x86_64-apple-darwin, os: macos-15 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: "1.98.0"
+          targets: ${{ matrix.target }}
+
+      - name: Install cargo-zigbuild
+        if: runner.os == 'Linux'
+        run: |
+          python3 -m venv "$RUNNER_TEMP/zigbuild"
+          "$RUNNER_TEMP/zigbuild/bin/pip" install --quiet cargo-zigbuild==0.23.4 ziglang==0.15.2
+          echo "$RUNNER_TEMP/zigbuild/bin" >> "$GITHUB_PATH"
+
+      - name: Build the NIF
+        run: .github/scripts/build-elixir-nif.sh "${{ matrix.target }}" "$RUNNER_TEMP/nif"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nif-${{ matrix.target }}
+          path: ${{ runner.temp }}/nif/*.tar.gz
+          if-no-files-found: error
+
+  hex-package:
+    # Checks the Hex package builds the way publish-packages.sh builds it,
+    # from the crate it ships: the source build a host on an unlisted target
+    # gets. The package itself (with its checksum file, which needs this
+    # release's NIFs) is built and published by hand.
+    name: Hex package
+    needs: versions
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: "1.98.0"
+
+      - name: Install Erlang/OTP and Elixir
+        run: .github/scripts/setup-beam.sh clients/elixir/.tool-versions "$RUNNER_TEMP/beam"
+
+      - name: Make the NIF crate stand alone, and copy in the license
+        run: .github/scripts/elixir-prepare-hex-package.sh "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "$GITHUB_SHA"
+
+      - name: Fetch Mix dependencies
+        working-directory: clients/elixir
+        run: |
+          mix local.hex --force
+          mix local.rebar --force
+          mix deps.get
+
+      - name: Build from source, as TRELLIS_PG_BUILD=1 would
+        working-directory: clients/elixir
+        run: mix compile --warnings-as-errors
+
+      - name: Build the package
+        working-directory: clients/elixir
+        run: mix hex.build
+
+  platform-gem:
+    name: Gem ${{ matrix.platform }}
+    needs: versions
+    # Every platform cross-compiles on an x86_64 runner, in rb-sys's
+    # container for it (.github/scripts/build-ruby-gem.sh).
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - x86_64-linux
+          - x86_64-linux-musl
+          - aarch64-linux
+          - aarch64-linux-musl
+          - x86_64-darwin
+          - arm64-darwin
+    env:
+      # Only rb_sys (for rb-sys-dock) and rake-compiler are needed here; the
+      # test group's pg needs libpq to build.
+      BUNDLE_WITHOUT: test
+      BUNDLE_FROZEN: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Ruby
+        # The token only authenticates the digest lookup.
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: .github/scripts/setup-ruby.sh clients/ruby/.tool-versions
+
+      - name: Install rb-sys-dock
+        working-directory: clients/ruby
+        run: bundle install
+
+      - name: Build the gem
+        run: .github/scripts/build-ruby-gem.sh "${{ matrix.platform }}" "$RUNNER_TEMP/gems"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gem-${{ matrix.platform }}
+          path: ${{ runner.temp }}/gems/*.gem
+          if-no-files-found: error
+
+  check-linux-gem:
+    # Installs each Linux gem into the official Ruby image of every Ruby it
+    # has an extension for (Debian for gnu, Alpine for musl), on a runner of
+    # its architecture, and loads it.
+    name: Check ${{ matrix.platform }} on Ruby ${{ matrix.ruby }}
+    needs: platform-gem
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        ruby: ["3.3", "3.4", "4.0"]
+        platform: [x86_64-linux, x86_64-linux-musl, aarch64-linux, aarch64-linux-musl]
+        include:
+          - { platform: x86_64-linux, runner: ubuntu-24.04, variant: slim }
+          - { platform: x86_64-linux-musl, runner: ubuntu-24.04, variant: alpine }
+          - { platform: aarch64-linux, runner: ubuntu-24.04-arm, variant: slim }
+          - { platform: aarch64-linux-musl, runner: ubuntu-24.04-arm, variant: alpine }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: gem-${{ matrix.platform }}
+          path: gems
+
+      - name: Install and load the gem
+        run: |
+          docker run --rm -v "$PWD/gems:/gems:ro" -v "$PWD/.github/scripts:/scripts:ro" \
+            "ruby:${{ matrix.ruby }}-${{ matrix.variant }}" \
+            sh -c 'gem install --local --no-document /gems/*.gem && ruby /scripts/ruby-gem-smoke.rb'
+
+  check-darwin-gem:
+    # Homebrew's Ruby, one minor version: macOS runners have no container to
+    # choose one with.
+    name: Check ${{ matrix.platform }}
+    needs: platform-gem
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: arm64-darwin, runner: macos-14 }
+          - { platform: x86_64-darwin, runner: macos-15-intel }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: gem-${{ matrix.platform }}
+          path: gems
+
+      - name: Install and load the gem
+        run: |
+          brew install ruby
+          ruby="$(brew --prefix ruby)/bin"
+          "$ruby/gem" install --local --no-document --install-dir "$RUNNER_TEMP/gem-home" gems/*.gem
+          GEM_HOME="$RUNNER_TEMP/gem-home" GEM_PATH="$RUNNER_TEMP/gem-home" \
+            "$ruby/ruby" .github/scripts/ruby-gem-smoke.rb
+
+  source-gem:
+    # The fallback for any platform without a platform gem: it builds the
+    # extension on install, with the host's own Rust toolchain.
+    name: Source gem
+    needs: versions
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: "1.98.0"
+
+      - name: Install Ruby
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: .github/scripts/setup-ruby.sh clients/ruby/.tool-versions
+
+      - name: Install libclang
+        # rb-sys generates its bindings with bindgen, which loads libclang;
+        # see ci.yml's `ruby` job.
+        run: |
+          set -euo pipefail
+          if compgen -G "/usr/lib/llvm-*/lib/libclang.so*" >/dev/null ||
+             compgen -G "/usr/lib/x86_64-linux-gnu/libclang-[0-9]*.so*" >/dev/null; then
+            echo "libclang found"
+          else
+            sudo apt-get update
+            sudo apt-get install -y libclang-dev
+          fi
+
+      - name: Make the extension crate stand alone, and copy in the license
+        run: .github/scripts/ruby-prepare-source-gem.sh "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "$GITHUB_SHA"
+
+      - name: Build the gem
+        working-directory: clients/ruby
+        run: |
+          set -euo pipefail
+          gem build trellis-pg.gemspec
+          # A source gem that can't build outside this repository is no
+          # fallback: check it has what ruby-prepare-source-gem.sh added.
+          files="$(tar -xOf trellis-pg-*.gem metadata.gz | gunzip)"
+          for f in ext/trellis_ruby/Cargo.lock LICENSE.txt; do
+            grep -qx -- "- $f" <<<"$files" || { echo "the source gem lacks $f" >&2; exit 1; }
+          done
+          mkdir -p "$RUNNER_TEMP/gems"
+          mv trellis-pg-*.gem "$RUNNER_TEMP/gems/"
+
+      - name: Install and load the gem
+        # From outside the checkout, as a host would: Cargo fetches `trellis`
+        # at this commit, and the repository's rust-toolchain.toml doesn't
+        # apply. rb_sys comes from RubyGems.
+        working-directory: ${{ runner.temp }}
+        run: |
+          gem install --no-document --install-dir gem-home gems/trellis-pg-*.gem
+          GEM_HOME=gem-home GEM_PATH=gem-home \
+            ruby "$GITHUB_WORKSPACE/.github/scripts/ruby-gem-smoke.rb"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gem-source
+          path: ${{ runner.temp }}/gems/*.gem
+          if-no-files-found: error
+
+  release:
+    # Attaches everything to the tag's GitHub release and publishes it. A tag
+    # push only: `github.ref_type` alone would also match a manual run
+    # started from a tag.
+    needs: [cli, nif, hex-package, check-linux-gem, check-darwin-gem, source-gem]
+    if: github.event_name == 'push' && github.ref_type == 'tag' && github.repository == 'salesforce-misc/trellis'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Refuse to replace the assets of a version already published
+        # A package publish-packages.sh has already published was built
+        # from (Hex: checksums of) the assets the release serves now.
+        # Rebuilt ones differ byte for byte, so replacing them ("Re-run all
+        # jobs") would break every install of that version.
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          check() {
+            local status
+            status="$(curl -sS -o /dev/null -w '%{http_code}' -A 'trellis-release (github.com/salesforce-misc/trellis)' "$2")"
+            case "$status" in
+              404) ;;
+              200) echo "$1 $version is already published; leaving this release's assets alone" >&2; exit 1 ;;
+              *) echo "couldn't ask whether $1 $version is published (HTTP $status from $2)" >&2; exit 1 ;;
+            esac
+          }
+          check "crates.io trellis-pg" "https://crates.io/api/v1/crates/trellis-pg/$version"
+          check "Hex trellis_pg" "https://hex.pm/api/packages/trellis_pg/releases/$version"
+          check "RubyGems trellis-pg" "https://rubygems.org/api/v2/rubygems/trellis-pg/versions/$version.json"
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: "{cli,nif,gem}-*"
+          merge-multiple: true
+          path: assets
+
+      - name: Check every asset is here
+        # 6 CLI targets, Trellis.Native's 5 NIF targets, and 6 platform gems
+        # and the source gem: the build matrices above.
+        run: |
+          set -euo pipefail
+          ls -l assets
+          expect() {
+            local n
+            n="$(find assets -name "$2" | wc -l)"
+            [ "$n" -eq "$1" ] || { echo "expected $1 assets named $2, found $n" >&2; exit 1; }
+          }
+          expect 6 'trellis-v*.tar.gz'
+          expect 5 'libtrellis_nif-*.tar.gz'
+          expect 7 'trellis-pg-*.gem'
+          (cd assets && sha256sum -- * > SHA256SUMS)
+          cat assets/SHA256SUMS
+
+      - name: Attach them to the GitHub release, and publish it
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" assets/* --clobber
+            gh release edit "$GITHUB_REF_NAME" --draft=false --verify-tag
+          else
+            gh release create "$GITHUB_REF_NAME" assets/* --verify-tag \
+              --title "Trellis $version" \
+              --notes "The \`trellis\` CLI, and the precompiled builds of the Elixir (\`trellis_pg\`) and Ruby (\`trellis-pg\`) bindings. See docs/releasing.md."
+          fi

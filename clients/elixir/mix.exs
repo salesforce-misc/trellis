@@ -2,8 +2,8 @@ defmodule Trellis.MixProject do
   use Mix.Project
 
   # Kept equal to the NIF crate's version (native/trellis_nif/Cargo.toml).
-  # The precompiled NIFs are downloaded from the `elixir-v<version>` GitHub
-  # release; see Trellis.Native and .github/workflows/elixir-release.yml.
+  # The precompiled NIFs are downloaded from the `v<version>` GitHub
+  # release; see Trellis.Native and docs/releasing.md.
   @version "0.1.0"
   @source_url "https://github.com/salesforce-misc/trellis"
 
@@ -27,7 +27,7 @@ defmodule Trellis.MixProject do
         main: "readme",
         extras: ["README.md"],
         source_url_pattern:
-          "#{@source_url}/blob/elixir-v#{@version}/clients/elixir/%{path}#L%{line}"
+          "#{@source_url}/blob/v#{@version}/clients/elixir/%{path}#L%{line}"
       ]
     ]
   end
@@ -63,9 +63,9 @@ defmodule Trellis.MixProject do
       licenses: ["Apache-2.0"],
       links: %{"GitHub" => @source_url},
       # The NIF's source ships too, for building it on a target the release
-      # doesn't cover. The release workflow makes its Cargo.toml stand alone
-      # outside this repository's workspace, and writes LICENSE.txt and the
-      # checksum file, before it publishes
+      # doesn't cover. .github/scripts/publish-packages.sh makes its
+      # Cargo.toml stand alone outside this repository's workspace, and
+      # writes LICENSE.txt and the checksum file, before it publishes
       # (.github/scripts/elixir-prepare-hex-package.sh).
       files: [
         "lib",

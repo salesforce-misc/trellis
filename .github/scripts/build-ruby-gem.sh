@@ -2,7 +2,7 @@
 # Builds one trellis-pg platform gem (clients/ruby) with rb-sys-dock: in
 # rb-sys's cross-compiling container for <platform>, one extension per Ruby
 # minor version in RUBY_VERSIONS, packed into a single gem that loads the one
-# matching the running Ruby. Used by .github/workflows/ruby-release.yml, once
+# matching the running Ruby. Used by .github/workflows/release.yml, once
 # per platform; runs the same way locally.
 #
 # usage: build-ruby-gem.sh <platform> <out-dir>

@@ -355,25 +355,14 @@ the Ruby suite runs too, so the two bindings can't drift apart unnoticed
 
 ## Releasing
 
-`.github/workflows/elixir-release.yml` releases the package; nothing else
-triggers it.
-
-1. Set the new version in `mix.exs` (`@version`) and in
-   `native/trellis_nif/Cargo.toml`, and merge that.
-2. Push the tag `elixir-v<version>` on that commit, e.g.
-   `git tag elixir-v0.1.0 && git push upstream elixir-v0.1.0`.
-
-The workflow builds the NIF for each target above, attaches them to the tag's
-GitHub release (where `lib/trellis/native.ex` downloads them from), writes
-`checksum-Elixir.Trellis.Native.exs` from what that release serves, and
-publishes the package and its docs to Hex. Publishing needs the repository
-secret `HEX_API_KEY`, a Hex key allowed to publish `trellis_pg`. If the Hex
-step fails, re-run the failed jobs: the release step replaces the NIFs.
-
-Running the workflow by hand (Actions, "Elixir release", Run workflow) is a
-dry run. It builds every NIF, keeps them as workflow artifacts, builds the
-package's NIF from source the way a host would, and runs `mix hex.build`,
-without releasing or publishing anything.
+`trellis_pg` is released with the rest of Trellis, from one `v<version>` tag
+([docs/releasing.md](../../docs/releasing.md)). `@version` in `mix.exs` and
+the NIF crate's version (`native/trellis_nif/Cargo.toml`) are the release's.
+`.github/workflows/release.yml` builds the NIF for each target above and
+attaches them to the tag's GitHub release, where `lib/trellis/native.ex`
+downloads them from. The package is then published to Hex by hand with
+`.github/scripts/publish-packages.sh`, which writes
+`checksum-Elixir.Trellis.Native.exs` from the NIFs that release serves.
 
 `.github/scripts/build-elixir-nif.sh <target> <out-dir>` builds one NIF the
 way the workflow does. Linux targets need `cargo-zigbuild` and Zig

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Readies the Ruby binding (clients/ruby, or <gem-dir>) for building the
-# trellis-pg source gem. Run by .github/workflows/ruby-release.yml; it edits
+# trellis-pg source gem. Run by .github/workflows/release.yml; it edits
 # the tree in place, so don't commit the result.
 #
 # usage: ruby-prepare-source-gem.sh <git-url> <rev> [<gem-dir>]
