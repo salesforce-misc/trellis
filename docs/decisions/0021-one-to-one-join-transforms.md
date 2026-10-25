@@ -72,11 +72,23 @@ placeholder, an older page waiting on a newer page's uncommitted insert of the
 same entry overwrote it. Without the position check, an out-of-order page put
 an older state over a newer one.
 
-[OPEN: an entry's `basis` snapshot and the Re-derive producers (a build chunk,
-a rebuild, `request_backfill`, a quarantine release, catch-up), and which
-`J` locks a Re-derive of each side takes before its live read. Measured in
-#1375 Y1. Recommendation: the ledger's full I2 on both `R` and `M`, with each
-side's Re-derive taking `J` before its read.]
+Both `R` and `M` take ADR-0002's full I2: an Apply runs only if its txid is
+not in the entry's basis, its position is past the entry's applied position,
+and it is above its side's truncate floor. Each check alone was wrong in
+some interleaving (#1375). A Re-derive of either side is what every producer
+stages (a build chunk, a rebuild, `request_backfill`, a quarantine release,
+catch-up, and a page whose segment predates the build):
+
+- Before its `J` lock, the page reads the row's live join key, unlocked, and
+  adds it to its key set alongside the key the entry holds.
+- After its entry lock, one statement reads the live row and
+  `pg_current_snapshot()`, which becomes the entry's basis. A snapshot taken a
+  statement later was wrong in 22 families.
+- If that read finds a key outside the locked set (the row moved between the
+  two reads), the page rolls back and retries. Not retrying was wrong in
+  910 of 1,716 schedules for each side. Taking the late key's `J` after the
+  read was exact but deadlocked, because it breaks lock sorting.
+- It reads `M` only after its `J` lock.
 
 ### Neither side reads the other's source, only its copy under `J`
 
@@ -97,9 +109,18 @@ and writes. In a model on PG 16.8, 17.10 and 18.2, 8,064 deterministic
 interleavings per version and 240 randomized soak runs were exact. Each
 necessary rule was shown necessary by an ablation that removes it (#1371).
 
-[OPEN: a page carrying changes of both tables takes one `J` lock statement
-over the union of both sides' key sets. `TRUNCATE` of either side follows
-ADR-0019's barrier. Measured in #1375 Y2.]
+A page carrying changes and Re-derives of both tables takes one `J` lock
+statement over the union of both sides' key sets. Its lock order is the
+truncate lock row, `J`, then `R` entries, then `M` entries, then target rows,
+each sorted. A truncate page holds the lock row `FOR UPDATE`, deletes its
+side's hidden table and raises its floor. ADR-0019's barrier orders it
+against other pages; without the barrier, four of eight truncate families
+were wrong. With both rules, 60 families × 2 join kinds (102,312 schedules per
+version on PG 16.8, 17.10 and 18.2) and 48 soak runs, with builds starting
+mid-run, were exact (#1375).
+
+`TRUNCATE b` changes every target row, so it starts a target rebuild rather
+than recomputing in the page.
 
 ### A `b` change's fan-out is linear in the `a` rows on its key
 
@@ -108,16 +129,39 @@ A `b` change rewrites every target row on its key while holding `J[k]`: about
 seam's images. An `a` change on that key waits for the whole fan-out. Fan-out
 in chunks that each take `J[k]` again was exact.
 
-[OPEN: v1 is either one transaction with a `status()` warning on `a` rows per
-key, or chunked fan-out with a durable pending-recompute marker per key.
-Measured in #1375 Y4 and Y5.]
+In v1, fan-out runs in one transaction. It is about 3–4 s per million rows
+with the seam, and that key's `a` writers wait for all of it. Three limits
+keep it bounded:
+
+- A `status()` warning names keys with more than 100k `a` rows.
+- A hard cap halts the transform rather than fan out past a configured row
+  count.
+- No transform may read a 1-1 JOIN target. The seam holds every changed key's
+  prior image in memory until commit: about 300 MB per million rows with any
+  reader, and more on the image feed.
+
+Chunked fan-out with a durable per-key pending marker lifts these limits
+later. In the model (#1375 Y5) it was exact under worker kills and a second
+`b` change mid-way, and it bounded an `a` writer's wait to one chunk: 0.13 s
+against 3.8 s. It took about 5x as long overall.
 
 ### A build fills `M`, then `R` and the target
 
-[OPEN: chunked by `a` key under live pages, each chunk's entries taking its
-read's snapshot as their basis, as a 1-1 Re-derive build does. Measured in
-#1375 Y3. In the model, a one-transaction build of 10M `a` rows took 24.7 s
-against 9.7 s for a plain 1-1 transform.]
+A build re-derives every `b` row into `M` in one transaction, about the size
+of `b`. It then fills `R` and the target in chunks of `a`'s primary-key
+range. Each chunk:
+
+1. Locks `J` for the live keys in its range plus the keys `R` holds there.
+2. Inserts the missing entries in one statement that reads `a` live, with
+   `pg_current_snapshot()` as their basis.
+3. Locks and re-derives the remaining entries.
+4. Retries if any read finds a key outside its locked set. Without the retry,
+   378 of 1,716 schedules were wrong.
+
+Pages whose segment predates the build re-derive. A one-transaction build is
+not an option: at 100M `a` rows it took 834 s, and a concurrent page waited
+807 s behind it. In 10k-row chunks on 4 workers the build took 446 s, and no
+page waited longer than 0.74 s (#1375 Y3).
 
 ## Consequences
 

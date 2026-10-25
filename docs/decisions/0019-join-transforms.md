@@ -441,5 +441,5 @@ query shows them.
   scaled `numeric`, with arguments over one side. Each other aggregate, an
   argument mixing the sides, and the out-of-scope
   join shapes are refused until designed.
-- A transform that copies a dimension attribute onto every fact row has no
-  form inside Trellis.
+- A transform that copies a dimension attribute onto every fact row is a
+  1-1 JOIN transform (ADR-0021), not a JOIN aggregate.
