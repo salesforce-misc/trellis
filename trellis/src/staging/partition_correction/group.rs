@@ -462,19 +462,38 @@ pub(crate) struct LockedNode {
 /// `txn` and checks the tree against the record (see [`node_to_read`]).
 /// `None` when the node is gone.
 ///
-/// The root is locked first (itself only, not its leaves): a user's
-/// `TRUNCATE` or DDL of the partitioned table locks the root, then its
-/// leaves, and a later statement of this transaction names the root's row
-/// type, so locking the leaf first would deadlock with it and Postgres would
-/// fail the user's statement.
+/// The node's recorded ancestors are locked first, root down, each itself
+/// only (an ancestor that is gone is skipped): a user's `TRUNCATE` or DDL of
+/// a partitioned table locks it, then the tables under it, and a later
+/// statement of this transaction names the root's row type, or reads
+/// through the root, which locks the ancestors. Locking the node first would
+/// deadlock with the user's statement, and Postgres would fail it.
 pub(crate) async fn lock_recorded_node(
     txn: &tokio_postgres::Transaction<'_>,
     node_oid: u32,
     recorded: &partitions::Recorded,
 ) -> Result<Option<LockedNode>, tokio_postgres::Error> {
-    let mut names = Vec::new();
-    for (oid, only) in [(recorded.nodes[0].oid, "only "), (node_oid, "")] {
-        let name: Option<String> = txn
+    let mut ancestors = vec![recorded.nodes[0].oid];
+    let mut at = node_oid;
+    while let Some(parent) = recorded
+        .nodes
+        .iter()
+        .find(|n| n.oid == at)
+        .and_then(|n| n.parent)
+    {
+        if ancestors.contains(&parent) {
+            break;
+        }
+        ancestors.insert(1, parent);
+        at = parent;
+    }
+    let mut name = None;
+    for (oid, only) in ancestors
+        .iter()
+        .map(|oid| (*oid, "only "))
+        .chain([(node_oid, "")])
+    {
+        name = txn
             .query_opt(
                 "select pg_catalog.format('%I.%I', n.nspname, c.relname) \
                  from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
@@ -482,15 +501,15 @@ pub(crate) async fn lock_recorded_node(
                 &[&i64::from(oid)],
             )
             .await?
-            .map(|row| row.get(0));
-        let Some(name) = name else {
-            return Ok(None);
-        };
-        txn.batch_execute(&format!("lock table {only}{name} in access share mode"))
-            .await?;
-        names.push(name);
+            .map(|row| row.get::<_, String>(0));
+        if let Some(name) = &name {
+            txn.batch_execute(&format!("lock table {only}{name} in access share mode"))
+                .await?;
+        }
     }
-    let name = names.pop().expect("the node's name");
+    let Some(name) = name else {
+        return Ok(None);
+    };
     let mut oids = Vec::new();
     let mut parents = Vec::new();
     let mut xmins = Vec::new();
@@ -552,70 +571,112 @@ mod tests {
         client
     }
 
-    /// A user's `TRUNCATE` (or any DDL) of a partitioned table locks the
-    /// root, then its leaves. A node lock that took the leaf first would
+    /// A user's `TRUNCATE` (or any DDL) of a partitioned table locks it,
+    /// then the tables under it. A node lock that took the leaf first would
     /// hold it while a later statement of the same transaction (the
-    /// enumeration's `jsonb_populate_record(null::root, ..)`) waited for the
-    /// root: a deadlock Postgres resolves by failing the user's statement.
-    /// The root is locked before the leaf, so the lock waits behind the
-    /// `TRUNCATE` holding nothing, and the `TRUNCATE` still gets the leaf.
+    /// enumeration's `jsonb_populate_record(null::root, ..)`, or a read
+    /// through the root) waited for the user's table: a deadlock Postgres
+    /// resolves by failing the user's statement. The node's ancestors are
+    /// locked first, root down, so the lock waits behind the user's
+    /// statement holding nothing under it, and the statement still gets the
+    /// leaf: at once, which a `NOWAIT` checks, whichever ancestor the user
+    /// holds.
     #[tokio::test]
-    async fn locking_a_node_takes_the_root_first() {
+    async fn locking_a_node_takes_its_ancestors_first() {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_empty_database().await;
         let admin = connect(db.dsn()).await;
         admin
             .batch_execute(
-                "create table public.r (id int, c int, primary key (id, c)) partition by list (c); \
-                 create table public.r_p0 partition of public.r for values in (0);",
+                "create table public.r (id int, c int, d int, primary key (id, c, d)) \
+                     partition by list (c); \
+                 create table public.r_m partition of public.r for values in (0) \
+                     partition by list (d); \
+                 create table public.r_l partition of public.r_m for values in (0);",
             )
             .await
-            .expect("a partitioned table");
-        let oid = |name: &'static str| {
-            let admin = &admin;
-            async move {
-                let oid: u32 = admin
-                    .query_one(&format!("select '{name}'::regclass::oid"), &[])
-                    .await
-                    .expect("oid")
-                    .get(0);
-                oid
-            }
-        };
-        let (root, leaf) = (oid("public.r").await, oid("public.r_p0").await);
+            .expect("a two-level partitioned table");
+        let mut oids = Vec::new();
+        for name in ["public.r", "public.r_m", "public.r_l"] {
+            let oid: u32 = admin
+                .query_one(&format!("select '{name}'::regclass::oid"), &[])
+                .await
+                .expect("oid")
+                .get(0);
+            oids.push(oid);
+        }
+        let (root, mid, leaf) = (oids[0], oids[1], oids[2]);
         let recorded = Recorded {
-            nodes: vec![node(root, None), node(leaf, Some(root))],
+            nodes: vec![
+                node(root, None),
+                node(mid, Some(root)),
+                node(leaf, Some(mid)),
+            ],
             keys: Vec::new(),
         };
 
-        // The user's transaction holds the root, as `TRUNCATE r` does first.
-        let mut user = connect(db.dsn()).await;
-        let user_txn = user.transaction().await.expect("begin");
-        user_txn
-            .batch_execute("lock table only public.r in access exclusive mode")
-            .await
-            .expect("the root");
-
-        let mut worker = connect(db.dsn()).await;
-        let locked = tokio::spawn(async move {
-            let txn = worker.transaction().await.expect("begin");
-            lock_recorded_node(&txn, leaf, &recorded)
+        for held in ["public.r", "public.r_m"] {
+            // The user's transaction holds `held`, as `TRUNCATE held` does
+            // first.
+            let mut user = connect(db.dsn()).await;
+            let user_txn = user.transaction().await.expect("begin");
+            user_txn
+                .batch_execute(&format!("lock table only {held} in access exclusive mode"))
                 .await
-                .expect("lock the node")
-                .expect("the node exists");
-            // Hold the locks until told to commit.
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            txn.commit().await.expect("commit");
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                .expect("the user's table");
 
-        // The user's transaction goes on to the leaf. It must not wait for
-        // the worker, which (root first) is still queued behind the root.
-        user_txn
-            .batch_execute("set local lock_timeout = '2s'; lock table only public.r_p0 in access exclusive mode")
-            .await
-            .expect("the leaf is free: the worker holds nothing while it waits for the root");
-        user_txn.commit().await.expect("commit");
-        locked.await.expect("the worker");
+            let mut worker = connect(db.dsn()).await;
+            let pid: i32 = worker
+                .query_one("select pg_catalog.pg_backend_pid()", &[])
+                .await
+                .expect("pid")
+                .get(0);
+            let (locked_tx, mut locked_rx) = tokio::sync::oneshot::channel();
+            let (commit_tx, commit_rx) = tokio::sync::oneshot::channel::<()>();
+            let recorded = recorded.clone();
+            let task = tokio::spawn(async move {
+                let txn = worker.transaction().await.expect("begin");
+                lock_recorded_node(&txn, leaf, &recorded)
+                    .await
+                    .expect("lock the node")
+                    .expect("the node exists");
+                let _ = locked_tx.send(());
+                let _ = commit_rx.await;
+                txn.commit().await.expect("commit");
+            });
+
+            // Until the worker waits on a lock, or (locking the leaf first)
+            // has its locks.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                let waiting: bool = admin
+                    .query_one(
+                        "select coalesce((select wait_event_type = 'Lock' \
+                             from pg_catalog.pg_stat_activity where pid = $1), false)",
+                        &[&pid],
+                    )
+                    .await
+                    .expect("the worker's wait")
+                    .get(0);
+                if waiting || locked_rx.try_recv().is_ok() {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the worker neither waited nor locked"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+
+            user_txn
+                .batch_execute("lock table only public.r_l in access exclusive mode nowait")
+                .await
+                .unwrap_or_else(|err| {
+                    panic!("holding {held}, the leaf is free: the worker holds nothing under it ({err})")
+                });
+            user_txn.commit().await.expect("commit");
+            let _ = commit_tx.send(());
+            task.await.expect("the worker");
+        }
     }
 }
