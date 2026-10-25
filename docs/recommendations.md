@@ -60,8 +60,8 @@ not seconds.
   few minutes; `wal_compression` offsets the extra full-page images.
 * `pg_wal` holds about `max_wal_size` plus one checkpoint's worth of WAL (the
   #723 runs peaked at 4,192 and 4,576 MiB at a 4,096 MiB setting). It grows
-  without bound while WAL archiving fails or a replication slot lags, so alert
-  on both.
+  without bound while WAL archiving fails or another consumer's replication
+  slot lags (Trellis has none), so alert on both.
 
 A longer interval makes crash recovery replay more WAL, a trade worth making
 for a database that builds large targets.
