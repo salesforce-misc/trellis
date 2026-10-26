@@ -111,8 +111,7 @@ async fn never_false_converged_until_active_and_sealed_all_clear() {
 
 /// Issue #622 C5: trigger capture writes a change's ring rows in the
 /// writer's own transaction, so there is no intake progress to wait for. An
-/// empty ring converges with no `replication_progress` row at all (it used to
-/// fail closed on the missing row, condition 1).
+/// empty ring converges with no intake progress recorded anywhere.
 #[tokio::test]
 async fn an_empty_ring_converges_with_no_progress_row() {
     let cluster = TestCluster::start();
