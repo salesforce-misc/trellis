@@ -19,6 +19,7 @@ function of the unit list, and `run` fails if the binaries cargo built for a
 shard differ from the shard's units.
 
   test-shards.py check              partition invariants + ci.yml shard matrix
+                                    + no stale entry in test-shards.txt
   test-shards.py plan               the table: units per shard and its weight
   test-shards.py run SHARD          build, verify, then run one shard (CI)
   test-shards.py weights LOG...     a fresh test-shards.txt from `cargo test`
@@ -153,7 +154,12 @@ def cmd_check():
     for i, s in enumerate(shards, 1):
         if not s["units"]:
             die(f"shard {i} has no units; lower TEST_SHARDS")
-    annotate(missing, stale)
+    if stale:
+        die(
+            f"{WEIGHTS} names {len(stale)} unit(s) that no longer exist; delete their lines: "
+            + ", ".join(stale)
+        )
+    annotate(missing, [])
     print(f"ok: {len(all_units)} units in {n} disjoint shards covering all of them")
 
 

@@ -41,7 +41,8 @@
 #   The rename is made in the clone only, on the package and on every
 #   workspace dependency on it, so that `cargo publish` resolves; the tracked
 #   manifests keep `trellis` so `cargo test -p trellis` and friends stay as
-#   they are.
+#   they are. The clone gets the repository's LICENSE.txt beside the crate's
+#   manifest too, so the package ships its licence.
 # - Hex: the package as release.yml's `hex-package` job checks it
 #   (elixir-prepare-hex-package.sh, a source build of the NIF), plus
 #   checksum-Elixir.Trellis.Native.exs, written from the NIFs the GitHub
@@ -178,6 +179,9 @@ if wants crates; then
       "$src/trellis/Cargo.toml"
     find "$src" -name Cargo.toml -not -path '*/target/*' -print0 |
       xargs -0 perl -pi -e 's/^trellis = \{ path = /trellis = { package = "trellis-pg", path = /'
+    # A crate packages only files below its own directory, so the licence
+    # goes in beside its manifest.
+    cp "$src/LICENSE.txt" "$src/trellis/LICENSE.txt"
     if grep -rn --include=Cargo.toml '^trellis = ' "$src" | grep -v 'package = "trellis-pg"'; then
       die "a dependency on trellis above wasn't renamed"
     fi
@@ -190,6 +194,7 @@ if wants crates; then
     fi
     # The Hex step builds from this tree too, and expects it as tagged.
     git -C "$src" checkout --quiet -- .
+    rm -f "$src/trellis/LICENSE.txt"
   fi
 fi
 

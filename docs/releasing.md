@@ -55,7 +55,10 @@ The tag starts `release.yml`. It checks the versions, then builds:
 - the NIF for every target `Trellis.Native` lists;
 - the six platform gems and the source gem, installing and loading each;
 
-and checks the Hex package builds from source. It then attaches everything,
+and checks the Hex package builds from source. Each CLI build also checks
+its binary carries none of the engine's test-only code
+(`.github/scripts/check-release-binary.sh`, which CI runs on every change
+too). It then attaches everything,
 with a `SHA256SUMS` file, to the draft and publishes it. With no draft for
 the tag, it creates the release itself, with short notes.
 

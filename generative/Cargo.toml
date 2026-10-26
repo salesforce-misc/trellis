@@ -2,6 +2,7 @@
 name = "generative"
 version = "0.1.0"
 edition.workspace = true
+publish = false
 
 [dependencies]
 # Plain and featureless, deliberately. `trellis/test-util` (issue #166) is

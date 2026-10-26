@@ -8,7 +8,12 @@ edition.workspace = true
 description = "Streaming SQL transforms (aggregates, JOINs, copies) maintained inside your own Postgres"
 license = "Apache-2.0"
 repository = "https://github.com/salesforce-misc/trellis"
-readme = "../README.md"
+readme = "README.md"
+# The integration tests need the unpublished `testkit` crate, so they stay out
+# of the package. The package's LICENSE.txt is copied in by
+# .github/scripts/publish-packages.sh (cargo packages only files below the
+# crate's directory).
+exclude = ["tests/"]
 keywords = ["postgres", "postgresql", "streaming", "materialized-view", "incremental"]
 categories = ["database"]
 
@@ -116,11 +121,10 @@ otlp = [
 # `generative` (a test-infrastructure-only crate — see its own Cargo.toml),
 # therefore routes it through its own off-by-default `subprocess-backend`
 # feature, activated only by its self dev-dependency. Any future enabler
-# must do the same; check with
-# `cargo build --workspace && strings target/debug/trellis | grep TRELLIS_TEST_PAUSE`
-# (must print nothing). The same check applies to `dev`'s own contents:
-# `strings target/debug/trellis | grep render_aggregate_select_sql`
-# must print nothing too.
+# must do the same. `.github/scripts/check-release-binary.sh` checks that the
+# CLI binary holds none of the pause hook's, the plant hook's or `dev`'s strings
+# (`TRELLIS_TEST_PAUSE`, `TRELLIS_TEST_PLANT`, `render_aggregate_select_sql`);
+# CI runs it, and so does the release build.
 test-util = []
 # ADR-0012, and *not* its sanctioned exception. `defs`/`staging`/`intake` are
 # tier 3 — `pub(crate)`, named by no external crate. But this crate's own

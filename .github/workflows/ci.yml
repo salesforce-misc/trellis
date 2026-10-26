@@ -63,6 +63,13 @@ jobs:
         # matrix below matches TEST_SHARDS; see .github/scripts/test-shards.py.
         run: python3 .github/scripts/test-shards.py check
 
+      - name: Check the CLI binary carries no test-only code
+        # A dev build of the CLI, whose dependencies the cache above holds
+        # (a release build would recompile everything). It holds the same
+        # strings a release build does, and more of them: release.yml checks
+        # every shipped binary through build-cli.sh.
+        run: .github/scripts/check-release-binary.sh --profile dev
+
       - name: Clippy
         # `--all-features` alone makes code whose only caller is feature-gated
         # look live, so dead code and unused imports in narrower builds slip

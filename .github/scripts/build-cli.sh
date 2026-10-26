@@ -51,6 +51,9 @@ if [[ "$target" == *-unknown-linux-musl ]] && file "$built" | grep -q 'dynamical
   exit 1
 fi
 
+# And that none of that surface reached the binary itself.
+"$repo_root/.github/scripts/check-release-binary.sh" "$built"
+
 name="trellis-v$version-$target"
 mkdir -p "$out_dir"
 out_dir="$(cd "$out_dir" && pwd)"

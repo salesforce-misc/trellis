@@ -2,6 +2,14 @@
 name = "trellis-cli"
 version = "0.1.0-alpha"
 edition.workspace = true
+description = "The trellis command-line tool: define streaming SQL transforms, run the pipeline and check status"
+license = "Apache-2.0"
+repository = "https://github.com/salesforce-misc/trellis"
+readme = "../README.md"
+keywords = ["postgres", "postgresql", "streaming", "materialized-view", "cli"]
+categories = ["command-line-utilities", "database"]
+# Ships as a release binary (docs/releasing.md), not through crates.io.
+publish = false
 
 [[bin]]
 name = "trellis"
