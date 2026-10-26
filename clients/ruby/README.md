@@ -108,6 +108,8 @@ require "trellis/pg"
 
 # A deploy's migration step: the defaults run nothing in the background.
 Trellis.connect(url: "host=localhost dbname=app")
+# TLS options go in the URL (docs/embedding.md, "TLS to Postgres"):
+#   url: "postgres://db.example.com/app?sslmode=verify-full&sslrootcert=/etc/ssl/ca.pem"
 Trellis.migrate
 Trellis.shutdown
 

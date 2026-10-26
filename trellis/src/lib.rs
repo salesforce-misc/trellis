@@ -94,6 +94,7 @@ pub mod numeric;
 #[cfg(feature = "otlp")]
 pub mod otel;
 pub mod pool;
+pub(crate) mod tls;
 
 // Tier 3 (the engine) — see ADR-0012. Crate-private: no external crate names
 // `trellis::defs::*`, `trellis::staging::*`, or `trellis::intake::*`. The

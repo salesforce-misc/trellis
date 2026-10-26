@@ -119,6 +119,8 @@ The surface mirrors the Rust crate's `BlockingTrellis` (issues #146, #147,
 ```elixir
 # A deploy's migration step: the defaults run nothing in the background.
 {:ok, migrator} = Trellis.connect(url: "postgres://localhost/app")
+# TLS options go in the URL (docs/embedding.md, "TLS to Postgres"):
+#   url: "postgres://db.example.com/app?sslmode=verify-full&sslrootcert=/etc/ssl/ca.pem"
 :ok = Trellis.migrate(migrator)
 :ok = Trellis.shutdown(migrator)
 

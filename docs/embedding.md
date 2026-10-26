@@ -221,6 +221,59 @@ let worker = Trellis::connect(
 .await?;
 ```
 
+## TLS to Postgres
+
+Every connection Trellis opens to Postgres (both pools, the `LISTEN`
+connections, the staging worker's and the drain threads' own) uses TLS as
+the connection string asks. The options go in the string you pass as
+`--database-url` or `Config::from_dsn`, in either form: `key=value` pairs or
+a `postgres://` URL with the options as query parameters (percent-encode
+reserved characters in a path).
+
+| Option | Meaning |
+| --- | --- |
+| `sslmode=disable` | Plaintext only. |
+| `sslmode=prefer` (the default) | Use TLS if the server offers it, without checking its certificate; plaintext only when the server answers that it has no TLS. |
+| `sslmode=require` | TLS or fail, without checking the server's certificate. |
+| `sslmode=verify-ca` | TLS, and the server's certificate must chain to `sslrootcert`. The name is not checked. |
+| `sslmode=verify-full` | `verify-ca`, and the certificate must name the host you connect to. |
+| `sslrootcert=<file>` | PEM file of the CA certificate(s) to trust. Required for `verify-ca` and `verify-full`. |
+| `sslcert=<file>`, `sslkey=<file>` | PEM client certificate and its unencrypted private key, for a server that authenticates by certificate. Given together. |
+
+```text
+postgres://app@db.example.com/app?sslmode=verify-full&sslrootcert=/etc/trellis/ca.pem
+host=db.example.com dbname=app sslmode=verify-full sslrootcert=/etc/trellis/ca.pem sslcert=/etc/trellis/client.crt sslkey=/etc/trellis/client.key
+```
+
+The rules:
+
+* **Trust comes from `sslrootcert` only.** Trellis does not read the
+  operating system's certificate store or ship public roots, so a server with a
+  publicly signed certificate still needs `sslrootcert` pointing at the CA's
+  PEM file for `verify-ca` and `verify-full`.
+* **`prefer` is the default, and it does not authenticate the server.** A
+  connection string with no `sslmode` encrypts when it can and is open to
+  anyone who can sit between you and Postgres. For a network you do not
+  control, use `verify-full`. `prefer` falls back to plaintext only when the
+  server answers the TLS request with "no"; a TLS handshake that fails is an
+  error, where libpq would retry in plaintext.
+* **A unix-socket host is never encrypted.** `require`, `verify-ca` and
+  `verify-full` with a socket host are a configuration error; `disable` and
+  `prefer` connect in plaintext over the socket.
+* **`allow` and the other libpq `ssl*` options are not supported** (for
+  example `sslpassword`, `sslcrl`, `sslnegotiation`) and are configuration
+  errors, as is an encrypted private key. The `PGSSL*` environment variables
+  are not read; the options come from the connection string.
+* **Files are read when the connection machinery is built**: when a `Pool` is
+  created, and for each dedicated connection when it is opened. A rotated
+  client certificate or CA file takes effect for a new `Pool` (a restart, for
+  the CLI); a rotated server certificate is accepted on the next connect.
+* The Ruby and Elixir clients pass the string through, so the same options
+  work there.
+
+The `ssl` column of `pg_stat_ssl` shows, per backend, whether a connection is
+encrypted: `select ssl, count(*) from pg_stat_ssl group by ssl`.
+
 ## Forking (issue #600)
 
 Preforking servers (Puma, Unicorn, Passenger, Resque) fork after boot. The

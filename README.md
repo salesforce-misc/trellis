@@ -24,6 +24,8 @@ The trade-off is worth it when a fact is read far more often than its inputs
 change, or when read latency matters more than write throughput. It is the same
 bargain a database index makes — pay a little on write to make reads fast.
 
+Connections to Postgres use TLS when the database URL asks for it (`sslmode`, `sslrootcert`, `sslcert`, `sslkey`) and try it first when it does not; see [TLS to Postgres](docs/embedding.md#tls-to-postgres).
+
 ## Structure
 
 This repo is home to a few key components:

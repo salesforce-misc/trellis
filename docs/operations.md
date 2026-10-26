@@ -221,6 +221,25 @@ which targets it compares is in
   after the pause, stays paused with the refusal and isn't tried again:
   resume it by hand once that's fixed, or drop it and define it again.
 
+## Encrypted connections
+
+Trellis connects to Postgres with TLS when the connection string says so,
+and tries TLS first when it says nothing (`sslmode=prefer`). The options, the
+rules for a unix-socket host and the file handling are in
+[Embedding Trellis](embedding.md#tls-to-postgres). What an operator needs to
+know:
+
+* **Check, don't assume.** `prefer` keeps working against a server that has
+  no TLS, in plaintext. Set `sslmode=require` (or `verify-full`) where
+  plaintext would be a fault, and confirm with `pg_stat_ssl` that Trellis's
+  sessions report `ssl = true`.
+* **A server that only accepts TLS** (`hostssl` entries in `pg_hba.conf`)
+  refuses `sslmode=disable` with a "no pg_hba.conf entry ... no encryption"
+  error.
+* **Rotating certificates.** A new server certificate needs nothing from
+  Trellis. A new client certificate or CA file needs a restart of the
+  process, or a new `Pool`, because the files are read once.
+
 ## Partitioned sources
 
 [Transforms — Partitioned sources](transforms.md#partitioned-sources) says what a

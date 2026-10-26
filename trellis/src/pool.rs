@@ -31,7 +31,6 @@ use deadpool_postgres::{
     Hook, HookError, Manager, ManagerConfig, Pool as DeadpoolPool, RecyclingMethod, Runtime,
 };
 use std::time::Duration;
-use tokio_postgres::NoTls;
 
 /// A pooled connection, handed out by [`Pool::get`].
 ///
@@ -204,9 +203,10 @@ impl Drop for Unreset {
 
 /// Trellis's connection pool.
 ///
-/// Connections are unencrypted (`NoTls`) for now; TLS is out of scope for
-/// this issue and can be layered on by swapping the `NoTls` connector below
-/// for a real one once a TLS approach is chosen.
+/// Connections use TLS as the DSN's `sslmode` says (default `prefer`); see
+/// [`crate::tls`] and the TLS section of `docs/embedding.md`. The connector
+/// is built once, in [`Pool::new`], so a rotated client certificate or CA
+/// file takes a new `Pool`.
 ///
 /// `Clone` is cheap: `deadpool_postgres::Pool` is itself `Arc`-backed, so a
 /// clone shares the same underlying pool of physical connections rather than
@@ -221,6 +221,9 @@ pub struct Pool {
     /// open one more the same way. `tokio_postgres::Config`'s `Debug`
     /// redacts the password (issue #591).
     pg_config: tokio_postgres::Config,
+    /// The TLS connector the pool's connections use, kept for the same
+    /// reason as `pg_config`.
+    tls: crate::tls::Tls,
     /// A copy of the [`Config::schema`] this pool was built from — see
     /// [`Pool::schema`].
     schema: String,
@@ -254,13 +257,14 @@ impl Pool {
     /// [`crate::config::DEFAULT_POOL_WAIT_TIMEOUT`] for the sizing/timeout
     /// reasoning.
     pub fn new(config: &Config) -> Result<Self, Error> {
-        let mut pg_config = crate::config::parse_dsn(config.dsn())?;
+        let (mut pg_config, tls_spec) = crate::config::parse_dsn_tls(config.dsn())?;
+        let tls = tls_spec.connector()?;
         with_client_keepalives(&mut pg_config, DeadPeerDetection::KeepalivesOnly);
 
         let manager_config = ManagerConfig {
             recycling_method: RecyclingMethod::Fast,
         };
-        let manager = Manager::from_config(pg_config.clone(), NoTls, manager_config);
+        let manager = Manager::from_config(pg_config.clone(), tls.clone(), manager_config);
 
         let schema = config.schema().to_string();
         let target_schema = config.target_schema().to_string();
@@ -289,6 +293,7 @@ impl Pool {
         Ok(Self {
             inner,
             pg_config,
+            tls,
             schema: config.schema().to_string(),
             target_schema: config.target_schema().to_string(),
             instance: crate::instance_log::name_of(config),
@@ -341,7 +346,7 @@ impl Pool {
     /// future dropped mid-page) the table goes with the session, and no later
     /// borrower of a pooled connection can inherit it.
     pub(crate) async fn connect_unpooled(&self) -> Result<tokio_postgres::Client, Error> {
-        let (mut client, connection) = self.pg_config.connect(NoTls).await?;
+        let (mut client, connection) = self.pg_config.connect(self.tls.clone()).await?;
         // The driver may run on a thread of the host's runtime, so it names
         // its own instance.
         tokio::spawn(crate::instance_log::scoped(
@@ -870,19 +875,23 @@ pub(crate) fn with_client_keepalives(
 /// A DSN that doesn't parse is an [`Error::Config`] from
 /// [`crate::config::parse_dsn`], never a `tokio_postgres::Error`, whose
 /// `Debug` can quote part of the password (issue #608).
+///
+/// The TLS options in `dsn` apply as they do to the pool; the connector is
+/// rebuilt on each call, so a replaced certificate file is picked up.
 pub(crate) async fn connect_dedicated(
     dsn: &str,
-) -> Result<
-    (
-        tokio_postgres::Client,
-        tokio_postgres::Connection<tokio_postgres::Socket, tokio_postgres::tls::NoTlsStream>,
-    ),
-    Error,
-> {
-    let mut config = crate::config::parse_dsn(dsn)?;
+) -> Result<(tokio_postgres::Client, DedicatedConnection), Error> {
+    let (mut config, tls) = crate::config::parse_dsn_tls(dsn)?;
+    let tls = tls.connector()?;
     with_client_keepalives(&mut config, DeadPeerDetection::KeepalivesAndUserTimeout);
-    Ok(config.connect(NoTls).await?)
+    Ok(config.connect(tls).await?)
 }
+
+/// The connection half of [`connect_dedicated`]: the future to spawn or poll.
+pub(crate) type DedicatedConnection = tokio_postgres::Connection<
+    tokio_postgres::Socket,
+    <crate::tls::Tls as tokio_postgres::tls::MakeTlsConnect<tokio_postgres::Socket>>::Stream,
+>;
 
 /// The session setup a dedicated connection runs straight after
 /// [`connect_dedicated`], mirroring what [`session_bootstrap`] does for a
@@ -933,6 +942,7 @@ pub(crate) fn quote_literal(value: &str) -> String {
 mod tests {
     use super::*;
     use std::str::FromStr;
+    use tokio_postgres::NoTls;
 
     #[test]
     fn quote_ident_escapes_embedded_quotes() {
@@ -1056,6 +1066,33 @@ mod tests {
                 .expect_err("the DSN doesn't parse");
             crate::config::malformed_dsn_fixtures::assert_no_password_fragment(dsn, &err);
         }
+    }
+
+    /// `connect_unpooled` opens its session with the pool's TLS settings
+    /// (the pooled and dedicated sessions are covered in
+    /// `tests/tls_connect.rs`, which cannot reach this crate-private call).
+    #[tokio::test]
+    async fn an_unpooled_connection_is_encrypted_as_the_dsn_asks() {
+        let cluster = testkit::TestCluster::start_with_tls();
+        let db = cluster.create_isolated_database().await;
+        let ca = cluster.tls_dir().join("ca.crt");
+        let dsn = format!(
+            "host=127.0.0.1 port={} user=postgres dbname={} sslmode=verify-full sslrootcert='{}'",
+            cluster.port(),
+            db.name(),
+            ca.display()
+        );
+        let pool = Pool::new(&Config::from_dsn(dsn).expect("config")).expect("pool");
+        let client = pool.connect_unpooled().await.expect("unpooled connection");
+        let encrypted: bool = client
+            .query_one(
+                "select ssl from pg_stat_ssl where pid = pg_backend_pid()",
+                &[],
+            )
+            .await
+            .expect("pg_stat_ssl")
+            .get(0);
+        assert!(encrypted);
     }
 
     /// Issue #672: `money` renders the same on every kind of session Trellis

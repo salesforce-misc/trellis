@@ -154,6 +154,7 @@ fn build(tmp: &Path, name: &str, dir: &Path) {
         false,
         DataDirSource::Initdb,
         Vec::new(),
+        false,
     );
     cluster.create_database(TEMPLATE_DB);
     migrate(&cluster.database_dsn(TEMPLATE_DB));

@@ -68,6 +68,7 @@ use std::time::{Duration, Instant};
 use trellis::{Config, Pool, migrate};
 
 mod template;
+mod tls;
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -315,7 +316,7 @@ impl TestCluster {
     /// first, as [`TestCluster::start`] does for the temp dir.
     pub fn start_in(parent: &Path) -> Self {
         reap_orphans_in(parent);
-        Self::start_listening_in(parent, false, DataDirSource::Initdb, Vec::new())
+        Self::start_listening_in(parent, false, DataDirSource::Initdb, Vec::new(), false)
     }
 
     /// [`TestCluster::start`], but with a data directory of its own from
@@ -331,6 +332,7 @@ impl TestCluster {
             false,
             DataDirSource::Initdb,
             Vec::new(),
+            false,
         )
     }
 
@@ -346,6 +348,7 @@ impl TestCluster {
             tcp,
             DataDirSource::Template,
             Vec::new(),
+            false,
         )
     }
 
@@ -361,14 +364,46 @@ impl TestCluster {
             false,
             DataDirSource::Template,
             settings.iter().map(|s| s.to_string()).collect(),
+            false,
         )
+    }
+
+    /// [`TestCluster::start_with_tcp`], with TLS on. The server listens on
+    /// loopback TCP only over TLS (its `pg_hba.conf` has `hostssl` entries
+    /// and no `host` one), and the database `certdb` also demands a client
+    /// certificate. The unix socket stays plaintext: Postgres cannot carry
+    /// TLS over it. The throwaway certificates are in
+    /// [`TestCluster::tls_dir`]. Needs `openssl` on `PATH`.
+    pub fn start_with_tls() -> Self {
+        reap_orphans_once();
+        Self::start_listening_in(
+            &std::env::temp_dir(),
+            true,
+            DataDirSource::Template,
+            Vec::new(),
+            true,
+        )
+    }
+
+    /// The directory of a [`TestCluster::start_with_tls`] cluster's
+    /// certificates: `ca.crt`, `other-ca.crt` (a CA that signed nothing),
+    /// `server.crt`, and the `client.crt`/`client.key` pair (common name
+    /// `postgres`). Removed with the cluster.
+    pub fn tls_dir(&self) -> PathBuf {
+        let dir = self.root.join("tls");
+        assert!(
+            dir.is_dir(),
+            "tls_dir needs a cluster started with TestCluster::start_with_tls"
+        );
+        dir
     }
 
     fn start_listening_in(
         parent: &Path,
         tcp: bool,
         source: DataDirSource,
-        settings: Vec<String>,
+        mut settings: Vec<String>,
+        tls: bool,
     ) -> Self {
         // The template is built (or found) before taking a permit: building
         // it starts a cluster of its own, and a thread holding a permit while
@@ -409,6 +444,12 @@ impl TestCluster {
         // `initdb`, so the window in which another process could take it is
         // milliseconds rather than seconds.
         let port: u16 = if tcp { free_loopback_port() } else { 5432 };
+
+        if tls {
+            let tls_dir = root.join("tls");
+            tls::write_material(&tls_dir);
+            settings.extend(tls::settings(&tls_dir));
+        }
 
         let log_path = root.join("postgres.log");
         let server = spawn_server(&data_dir, &socket_dir, port, tcp, &log_path, &settings);

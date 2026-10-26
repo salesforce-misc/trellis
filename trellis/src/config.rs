@@ -330,7 +330,7 @@ pub(crate) struct RedactedDsn<'a>(pub(crate) &'a str);
 
 impl fmt::Debug for RedactedDsn<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.0.parse::<tokio_postgres::Config>() {
+        match parse_dsn(self.0) {
             Ok(parsed) if parsed.get_password().is_none() => fmt::Debug::fmt(self.0, f),
             _ => f.write_str("<redacted>"),
         }
@@ -350,7 +350,16 @@ impl fmt::Debug for RedactedDsn<'_> {
 /// the form the DSN looked like and what usually breaks it, without quoting
 /// any of it.
 pub(crate) fn parse_dsn(dsn: &str) -> Result<tokio_postgres::Config, Error> {
-    dsn.parse().map_err(|_| {
+    parse_dsn_tls(dsn).map(|(config, _)| config)
+}
+
+/// [`parse_dsn`], plus the TLS options the DSN carried
+/// ([`crate::tls::split_dsn`]); the pool builds its connector from them.
+pub(crate) fn parse_dsn_tls(
+    dsn: &str,
+) -> Result<(tokio_postgres::Config, crate::tls::TlsSpec), Error> {
+    let (rest, tls) = crate::tls::split_dsn(dsn)?;
+    let mut config: tokio_postgres::Config = rest.parse().map_err(|_| {
         let hint = if dsn.starts_with("postgres://") || dsn.starts_with("postgresql://") {
             "a postgres:// URL; percent-encode reserved characters (such as @ : / ? # & and \
              spaces) in the user, password and query values"
@@ -362,7 +371,9 @@ pub(crate) fn parse_dsn(dsn: &str) -> Result<tokio_postgres::Config, Error> {
             "the database connection string does not parse as {hint} (the parser's detail is \
              withheld because it can quote part of a password)"
         ))
-    })
+    })?;
+    tls.apply(&mut config)?;
+    Ok((config, tls))
 }
 
 impl fmt::Display for Config {
