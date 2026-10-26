@@ -120,7 +120,6 @@ create table segments (
     seg_seq bigint primary key,
     ring_slot smallint not null,
     state text not null,
-    bucket_mask bigint not null default 0,
     created_at timestamptz not null default now(),
     sealed_at timestamptz,
     fence_snapshot pg_snapshot,

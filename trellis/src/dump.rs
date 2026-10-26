@@ -102,7 +102,6 @@ pub const CLASSIFICATION: &[(&str, Class)] = &[
     ("drain_cursor", Class::Runtime),
     ("drain_holdups", Class::Runtime),
     ("drainers", Class::Runtime),
-    ("engine_bootstrap", Class::Runtime),
     ("key_deaths", Class::Runtime),
     ("ledger_truncate_floor", Class::Runtime),
     ("partition_correction_progress", Class::Runtime),

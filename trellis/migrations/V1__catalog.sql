@@ -121,9 +121,3 @@ create table worker_registry (
     registered_at timestamptz not null default now(),
     last_seen timestamptz not null default now()
 );
-
--- Proves the runner applies an ordered SQL file end to end.
-create table engine_bootstrap (
-    id integer primary key generated always as identity,
-    bootstrapped_at timestamptz not null default now()
-);
