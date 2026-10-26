@@ -70,18 +70,6 @@ impl Fixture {
     /// `id`), and `definitions` registered over it (`waiting_to_backfill`).
     /// Nothing is captured yet.
     async fn new(rows: i64, definitions: &[&str]) -> Self {
-        let cluster = TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let raw = connect(db.dsn()).await;
-        raw.batch_execute(&format!(
-            "create table public.src (id bigint primary key, g integer, v bigint); \
-             insert into public.src select i, i % 7, i from generate_series(1, {rows}) i"
-        ))
-        .await
-        .expect("seed the source");
-        // The source's own types: a resume re-types every column Trellis
-        // created whose type differs from the one define gives it from
-        // the live schema.
         let columns = [
             (
                 "id".to_string(),
@@ -95,9 +83,33 @@ impl Fixture {
                 "v".to_string(),
                 ValueType::Integer(trellis::integer::IntWidth::Int8),
             ),
-        ]
-        .into_iter()
-        .collect();
+        ];
+        Self::custom(
+            &format!(
+                "create table public.src (id bigint primary key, g integer, v bigint); \
+                 insert into public.src select i, i % 7, i from generate_series(1, {rows}) i"
+            ),
+            columns,
+            definitions,
+        )
+        .await
+    }
+
+    /// A source `setup` creates (named `public.src`, whose columns are
+    /// `columns`), and `definitions` registered over it.
+    async fn custom(
+        setup: &str,
+        columns: impl IntoIterator<Item = (String, ValueType)>,
+        definitions: &[&str],
+    ) -> Self {
+        let cluster = TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let raw = connect(db.dsn()).await;
+        raw.batch_execute(setup).await.expect("seed the source");
+        // The source's own types: a resume re-types every column Trellis
+        // created whose type differs from the one define gives it from
+        // the live schema.
+        let columns = columns.into_iter().collect();
         for definition in definitions {
             trellis::defs::install_definition(&db.pool, definition, &columns, "public")
                 .await
@@ -1854,4 +1866,698 @@ async fn chunks_finishing_after_a_pause_leave_the_definition_paused() {
         "a paused definition doesn't complete"
     );
     assert_eq!(f.status("one").await.as_deref(), Some("paused"));
+}
+
+// ----------------------------------------------------- the chunk queue's driver
+//
+// The Re-derive build's plan, rederive and sweep jobs run through the chunk
+// queue (`defs::chunk_queue`): the claim, its fence, the failure ladder and the
+// reclaim. Each test claims by hand and runs with `build::run_claimed`, and
+// moves a backoff or a claim's age with SQL instead of waiting for it (#297).
+
+/// Claims the lowest claimable chunk of `kind` as `who`.
+async fn claim(f: &Fixture, who: &str, kind: &str) -> chunk_queue::ClaimedChunk {
+    let client = f.db.pool.get().await.expect("pool");
+    let mut claimed = chunk_queue::claim_chunks_of(&**client, who, 1, &[kind])
+        .await
+        .expect("claim");
+    assert_eq!(claimed.len(), 1, "a claimable {kind} chunk for {who}");
+    claimed.remove(0)
+}
+
+/// Ages every claim past any reclaim TTL, as a stalled worker's is.
+async fn age_claims(f: &Fixture) {
+    f.raw
+        .execute(
+            "update backfill_chunks set claimed_at = now() - interval '1 hour' \
+             where claimed_by is not null",
+            &[],
+        )
+        .await
+        .expect("age the claims");
+}
+
+/// Ends every failed chunk's backoff, so it can be claimed again at once.
+async fn end_backoffs(f: &Fixture) {
+    f.raw
+        .execute("update backfill_chunks set next_attempt_at = null", &[])
+        .await
+        .expect("end the backoffs");
+}
+
+async fn pause_and_resume(f: &Fixture) {
+    let trellis = f.trellis().await;
+    trellis
+        .apply("PAUSE TRANSFORM one")
+        .await
+        .expect("pause the building transform");
+    trellis.apply("RESUME TRANSFORM one").await.expect("resume");
+}
+
+/// A build with its plan job run, a chunk (`stale`) held by `held` across a
+/// pause and a resume, and the resumed build's chunk (`current`) held by
+/// `current`.
+async fn held_across_a_resume() -> (
+    Fixture,
+    chunk_queue::ClaimedChunk,
+    chunk_queue::ClaimedChunk,
+) {
+    let mut f = Fixture::new(60, &[ONE]).await;
+    f.pass().await;
+    assert_eq!(f.run_chunks_by_hand(1).await, 1, "the plan job");
+    let stale = claim(&f, "held", chunk_queue::KIND_REDERIVE).await;
+    pause_and_resume(&f).await;
+    f.pass().await;
+    assert_eq!(f.run_chunks_by_hand(1).await, 1, "the resumed plan job");
+    let current = claim(&f, "current", chunk_queue::KIND_REDERIVE).await;
+    (f, stale, current)
+}
+
+async fn chunk_exists(f: &Fixture, id: i64) -> bool {
+    f.count(&format!(
+        "select count(*) from backfill_chunks where id = {id}"
+    ))
+    .await
+        == 1
+}
+
+async fn chunk_is_free(f: &Fixture, id: i64) -> bool {
+    f.count(&format!(
+        "select count(*) from backfill_chunks \
+         where id = {id} and not done and claimed_by is null and claimed_at is null"
+    ))
+    .await
+        == 1
+}
+
+/// The stale-claim sweep deletes a chunk held across a resume, as running it
+/// again would redo what the resumed build covers, and frees a current one
+/// for the next claimant. The build then finishes without the discarded one.
+#[tokio::test]
+async fn the_reclaim_sweep_discards_a_chunk_held_across_a_resume_and_frees_a_current_one() {
+    let (mut f, stale, current) = held_across_a_resume().await;
+    age_claims(&f).await;
+    {
+        let mut client = f.db.pool.get().await.expect("pool");
+        let swept = chunk_queue::reclaim_stale_chunks(&mut **client, OPTIONS.reclaim_ttl)
+            .await
+            .expect("reclaim");
+        assert_eq!(swept, 2, "both aged claims");
+    }
+    assert!(!chunk_exists(&f, stale.id).await, "the stale chunk is gone");
+    assert!(
+        chunk_is_free(&f, current.id).await,
+        "the current chunk is claimable again"
+    );
+    f.run("one").await;
+    assert_eq!(f.status("one").await.as_deref(), Some("live"));
+    assert_eq!(build_rows(&f).await, 0);
+    f.assert_one_oracle().await;
+}
+
+/// `release_chunk` does the same for one claim: it deletes a chunk held across
+/// a resume, frees a current one, and leaves a claim another worker holds.
+#[tokio::test]
+async fn releasing_a_chunk_held_across_a_resume_discards_it_and_frees_a_current_one() {
+    let (mut f, stale, current) = held_across_a_resume().await;
+    {
+        let mut client = f.db.pool.get().await.expect("pool");
+        assert_eq!(
+            chunk_queue::release_chunk(&mut **client, current.id, "someone else")
+                .await
+                .expect("release"),
+            0,
+            "a claim another worker holds is left alone"
+        );
+        assert_eq!(
+            chunk_queue::release_chunk(&mut **client, stale.id, "held")
+                .await
+                .expect("release"),
+            1
+        );
+        assert_eq!(
+            chunk_queue::release_chunk(&mut **client, current.id, "current")
+                .await
+                .expect("release"),
+            1
+        );
+    }
+    assert!(!chunk_exists(&f, stale.id).await, "the stale chunk is gone");
+    assert!(chunk_is_free(&f, current.id).await);
+    f.run("one").await;
+    assert_eq!(f.status("one").await.as_deref(), Some("live"));
+    assert_eq!(build_rows(&f).await, 0);
+    f.assert_one_oracle().await;
+}
+
+/// The advisory lock the frozen chunk waits on.
+const CHUNK_PAUSE_LOCK: i64 = 0x7a1b;
+
+/// Runs the claimed Re-derive chunk as `who` and freezes it after its write,
+/// inside its fenced transaction (`PausePoint::AfterRederiveRead`). Returns the
+/// connection that holds the pause lock and the chunk's task; releasing the
+/// lock lets it finish.
+async fn freeze_chunk(
+    f: &Fixture,
+    chunk: chunk_queue::ClaimedChunk,
+    who: &'static str,
+    options: WorkerOptions,
+) -> (Client, tokio::task::JoinHandle<()>) {
+    use trellis::staging::interleave::{PausePoint, PauseScope, with_scope};
+
+    let gate = connect(f.db.dsn()).await;
+    gate.execute("select pg_advisory_lock($1)", &[&CHUNK_PAUSE_LOCK])
+        .await
+        .expect("take the pause lock");
+    let scope = PauseScope::new();
+    let reached = scope.arm(
+        PausePoint::AfterRederiveRead,
+        "public.one",
+        CHUNK_PAUSE_LOCK,
+    );
+    let pool = f.db.pool.clone();
+    let task = tokio::spawn(with_scope(scope, async move {
+        build::run_claimed(&pool, &chunk, who, &options).await;
+    }));
+    reached.await.expect("the chunk reached its pause");
+    (gate, task)
+}
+
+async fn release_chunk_freeze(gate: Client, task: tokio::task::JoinHandle<()>) {
+    gate.execute("select pg_advisory_unlock($1)", &[&CHUNK_PAUSE_LOCK])
+        .await
+        .expect("release the pause lock");
+    task.await.expect("the chunk task");
+}
+
+/// A chunk mid-write holds its claim row `for key share`, so the sweep passes
+/// it over however old its claim looks, and the chunk finishes whole.
+#[tokio::test]
+async fn the_reclaim_sweep_skips_a_chunk_that_is_mid_write() {
+    let mut f = Fixture::new(60, &[ONE]).await;
+    f.pass().await;
+    assert_eq!(f.run_chunks_by_hand(1).await, 1, "the plan job");
+    let chunk = claim(&f, "held", chunk_queue::KIND_REDERIVE).await;
+    let id = chunk.id;
+    let (gate, task) = freeze_chunk(&f, chunk, "held", OPTIONS).await;
+    age_claims(&f).await;
+    {
+        let mut client = f.db.pool.get().await.expect("pool");
+        assert_eq!(
+            chunk_queue::reclaim_stale_chunks(&mut **client, OPTIONS.reclaim_ttl)
+                .await
+                .expect("reclaim"),
+            0,
+            "the sweep skips the fenced chunk"
+        );
+    }
+    assert_eq!(
+        f.count(&format!(
+            "select count(*) from backfill_chunks where id = {id} and claimed_by = 'held'"
+        ))
+        .await,
+        1
+    );
+    release_chunk_freeze(gate, task).await;
+    assert_eq!(
+        f.count(&format!(
+            "select count(*) from backfill_chunks where id = {id} and done"
+        ))
+        .await,
+        1,
+        "the chunk committed"
+    );
+    f.run("one").await;
+    f.assert_one_oracle().await;
+}
+
+/// A chunk whose write takes longer than the reclaim TTL keeps its claim fresh
+/// (`ChunkHeartbeat`): the claim's age, forced past the TTL while the chunk is
+/// mid-write, is refreshed by the heartbeat. The wait is for one heartbeat
+/// tick, bounded; nothing else here waits on the clock.
+#[tokio::test]
+async fn a_slow_chunk_write_keeps_its_claim_fresh() {
+    let mut f = Fixture::new(60, &[ONE]).await;
+    f.pass().await;
+    assert_eq!(f.run_chunks_by_hand(1).await, 1, "the plan job");
+    let chunk = claim(&f, "held", chunk_queue::KIND_REDERIVE).await;
+    let id = chunk.id;
+    let options = WorkerOptions {
+        heartbeat_interval: Duration::from_millis(20),
+        ..OPTIONS
+    };
+    let (gate, task) = freeze_chunk(&f, chunk, "held", options).await;
+    age_claims(&f).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let fresh = f
+            .count(&format!(
+                "select count(*) from backfill_chunks \
+                 where id = {id} and claimed_at > now() - interval '30 seconds'"
+            ))
+            .await;
+        if fresh == 1 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the heartbeat never refreshed the claim"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    release_chunk_freeze(gate, task).await;
+    f.run("one").await;
+    f.assert_one_oracle().await;
+}
+
+/// A worker claims only the chunk it runs: after one step the other chunks are
+/// still unclaimed for the rest of the fleet.
+#[tokio::test]
+async fn a_worker_claims_only_the_chunk_it_runs() {
+    let mut f = Fixture::new(60, &[ONE]).await;
+    f.pass().await;
+    assert_eq!(f.step(&OPTIONS).await, Step::Planned);
+    let queued = f
+        .count("select count(*) from backfill_chunks where kind = 'rederive'")
+        .await;
+    assert!(queued > 2, "the plan job enqueued several chunks: {queued}");
+    assert_eq!(f.step(&OPTIONS).await, Step::Chunk);
+    assert_eq!(
+        f.count("select count(*) from backfill_chunks where claimed_by is not null")
+            .await,
+        0,
+        "the step left no chunk claimed"
+    );
+    assert_eq!(
+        f.count("select count(*) from backfill_chunks where kind = 'rederive' and done")
+            .await,
+        1,
+        "and ran exactly one"
+    );
+    f.run("one").await;
+    f.assert_one_oracle().await;
+}
+
+/// A resume deletes the chunks of the build it supersedes that are neither
+/// done nor held; the done ones stay until the new build's flip takes them.
+#[tokio::test]
+async fn a_resume_deletes_the_undone_unclaimed_chunks() {
+    let mut f = Fixture::new(100, &[ONE]).await;
+    f.pass().await;
+    assert_eq!(f.run_chunks_by_hand(3).await, 3, "the plan job, two chunks");
+    let held = claim(&f, "held", chunk_queue::KIND_REDERIVE).await;
+    assert!(
+        f.count("select count(*) from backfill_chunks where not done and claimed_by is null")
+            .await
+            > 3,
+        "several chunks wait"
+    );
+    pause_and_resume(&f).await;
+    assert_eq!(
+        f.count("select count(*) from backfill_chunks where not done and claimed_by is null")
+            .await,
+        0,
+        "no undone, unclaimed chunk survives the resume"
+    );
+    assert_eq!(
+        f.count("select count(*) from backfill_chunks where done")
+            .await,
+        3
+    );
+    assert!(chunk_exists(&f, held.id).await, "the held one stays");
+    f.pass().await;
+    f.run("one").await;
+    assert_eq!(f.status("one").await.as_deref(), Some("live"));
+    f.assert_one_oracle().await;
+}
+
+/// `x + x` over a source whose row `(7, 3)` overflows: a data failure the
+/// chunk narrows to that row's key.
+const OVERFLOWING: &str = "TRANSFORM one FROM public.src SELECT x + x AS dbl";
+
+/// A composite-key source of 300 rows `(i / 10, i % 10)` where `(7, 3)` holds
+/// `x = 2147483647`, with `OVERFLOWING` registered over it.
+async fn composite_overflow_fixture() -> Fixture {
+    let int4 = ValueType::Integer(trellis::integer::IntWidth::Int4);
+    Fixture::custom(
+        "create table public.src (a integer, b integer, x integer, primary key (a, b)); \
+         insert into public.src select i / 10, i % 10, i from generate_series(1, 300) i; \
+         update public.src set x = 2147483647 where a = 7 and b = 3",
+        [
+            ("a".to_string(), int4),
+            ("b".to_string(), int4),
+            ("x".to_string(), int4),
+        ],
+        &[OVERFLOWING],
+    )
+    .await
+}
+
+/// Runs claimed chunks by hand until the build has quarantined a key or has
+/// nothing left to claim. Returns how many ran.
+async fn run_until_quarantined(f: &Fixture) -> usize {
+    for ran in 0..MAX_STEPS {
+        if f.count("select count(*) from poison").await > 0 {
+            return ran;
+        }
+        if f.run_chunks_by_hand(1).await == 0 {
+            return ran;
+        }
+    }
+    panic!("no key was quarantined within {MAX_STEPS} chunks");
+}
+
+/// A `rederive` chunk's data failure over a composite primary key splits until
+/// it fails on one key, which is quarantined under the ring's key text for a
+/// composite key (its parts joined by the unit separator), and the build
+/// finishes without it.
+#[tokio::test]
+async fn a_composite_key_data_failure_narrows_to_its_key() {
+    let mut f = composite_overflow_fixture().await;
+    f.pass().await;
+    run_until_quarantined(&f).await;
+    assert!(
+        f.count("select count(*) from backfill_chunks where kind = 'rederive'")
+            .await
+            > 30,
+        "the failing chunk split on the way"
+    );
+    f.run_chunks_by_hand(MAX_STEPS).await;
+    assert_eq!(f.status("one").await.as_deref(), Some("live"));
+    assert_eq!(
+        f.rows("select replace(key, chr(31), '|') from poison")
+            .await,
+        ["7|3"]
+    );
+    assert_eq!(
+        f.count("select count(*) from public.one").await,
+        299,
+        "the target lacks only the quarantined key"
+    );
+    assert_eq!(
+        f.count("select count(*) from public.one where a = 7 and b = 3")
+            .await,
+        0
+    );
+    assert_eq!(
+        f.count("select count(*) from public.one where dbl = 2 * (a * 10 + b)")
+            .await,
+        299
+    );
+}
+
+/// The key a build quarantines keeps the SQLSTATE of the failure that
+/// narrowed to it (#824): an overflow is `22003`.
+#[tokio::test]
+async fn a_build_quarantined_key_keeps_its_sqlstate() {
+    let mut f = composite_overflow_fixture().await;
+    f.pass().await;
+    f.run_chunks_by_hand(MAX_STEPS).await;
+    assert_eq!(
+        f.rows("select coalesce(sqlstate, 'none') from poison")
+            .await,
+        ["22003"],
+        "the key keeps the SQLSTATE of the overflow"
+    );
+}
+
+/// A key the build quarantined and an operator released while the build is
+/// still `backfilling` reaches the target, though the chunk that quarantined
+/// it has long since committed without it.
+#[tokio::test]
+async fn a_key_quarantined_by_the_build_and_released_mid_build_reaches_the_target() {
+    let mut f = Fixture::custom(
+        "create table public.src (id bigint primary key, g integer, v bigint); \
+         insert into public.src select i, i % 7, i from generate_series(1, 300) i; \
+         update public.src set v = 9223372036854775807 where id = 150",
+        [
+            (
+                "id".to_string(),
+                ValueType::Integer(trellis::integer::IntWidth::Int8),
+            ),
+            (
+                "g".to_string(),
+                ValueType::Integer(trellis::integer::IntWidth::Int4),
+            ),
+            (
+                "v".to_string(),
+                ValueType::Integer(trellis::integer::IntWidth::Int8),
+            ),
+        ],
+        &[ONE],
+    )
+    .await;
+    f.pass().await;
+    run_until_quarantined(&f).await;
+    assert_eq!(f.rows("select key from poison").await, ["150"]);
+    assert_eq!(f.status("one").await.as_deref(), Some("backfilling"));
+    assert!(
+        f.count("select count(*) from backfill_chunks where not done")
+            .await
+            >= 1,
+        "the chunk that quarantined the key has yet to run again"
+    );
+
+    f.raw
+        .execute("update public.src set v = 150 where id = 150", &[])
+        .await
+        .expect("fix the row");
+    // One round of the drain parks the fix behind the held key.
+    trellis::staging::seal_if_active_nonempty(&mut f.raw, WAKE)
+        .await
+        .expect("seal");
+    while let Some(seg) = apply::next_claimable_segment(&f.raw)
+        .await
+        .expect("next claimable segment")
+    {
+        apply::drain_once(&f.db.pool, seg, "drainer", 1, WAKE)
+            .await
+            .expect("drain_once");
+    }
+    f.trellis()
+        .await
+        .release_key("one", "public.src", "150")
+        .await
+        .expect("release the key");
+    f.drain().await;
+    assert_eq!(f.status("one").await.as_deref(), Some("backfilling"));
+    assert_eq!(
+        f.rows("select dbl::text from public.one where id = 150")
+            .await,
+        ["300"],
+        "the released key reached the target before the build finished"
+    );
+    f.run("one").await;
+    assert_eq!(f.status("one").await.as_deref(), Some("live"));
+    f.assert_one_oracle().await;
+}
+
+/// Runs the lowest claimable chunk of `kind` to its failure until the build
+/// pauses its definition, clearing the backoff between attempts. Asserts that
+/// every failure before the last is charged and retried, and that the
+/// last one pauses the definition and leaves the chunk, with its error, as the
+/// record. Returns the chunk's id.
+async fn fail_until_paused(f: &Fixture, kind: &str) -> i64 {
+    let mut id = None;
+    for attempt in 1..=5 {
+        end_backoffs(f).await;
+        let chunk = claim(f, "worker", kind).await;
+        assert_eq!(*id.get_or_insert(chunk.id), chunk.id, "the same chunk");
+        build::run_claimed(&f.db.pool, &chunk, "worker", &OPTIONS).await;
+        let row = f
+            .raw
+            .query_one(
+                "select attempts, charged, claimed_by is null, last_error \
+                 from backfill_chunks where id = $1",
+                &[&chunk.id],
+            )
+            .await
+            .expect("the chunk stays");
+        assert_eq!(row.get::<_, i32>(0), attempt, "attempts");
+        assert_eq!(row.get::<_, i32>(1), attempt, "every failure is charged");
+        assert!(row.get::<_, bool>(2), "the claim is given up");
+        assert!(row.get::<_, Option<String>>(3).is_some(), "the error");
+        let want = if attempt < 5 { "backfilling" } else { "paused" };
+        assert_eq!(f.status("one").await.as_deref(), Some(want), "{attempt}");
+    }
+    id.expect("a chunk")
+}
+
+/// A `rederive` chunk that fails in a way no key explains is charged each
+/// time, and the fifth charge pauses its definition with the error on the
+/// chunk's row. A resume replaces the chunk and the build runs to `live`.
+#[tokio::test]
+async fn an_unnarrowable_rederive_failure_pauses_and_a_resume_rebuilds() {
+    let mut f = Fixture::new(60, &[ONE]).await;
+    f.pass().await;
+    assert_eq!(f.run_chunks_by_hand(1).await, 1, "the plan job");
+    f.raw
+        .batch_execute(
+            "create function public.refuse() returns trigger language plpgsql as \
+             $$ begin raise exception 'refused by the test'; end $$; \
+             create trigger refuse before insert on public.one \
+             for each row execute function public.refuse()",
+        )
+        .await
+        .expect("make the target refuse its rows");
+    let id = fail_until_paused(&f, chunk_queue::KIND_REDERIVE).await;
+    let failure = f
+        .trellis()
+        .await
+        .status("one")
+        .await
+        .expect("status")
+        .expect("the definition")
+        .backfill_failure
+        .expect("the failure is on the status");
+    assert!(
+        failure.last_error.contains("refused by the test"),
+        "{failure:?}"
+    );
+    assert_eq!(failure.attempts, 5);
+    assert!(chunk_exists(&f, id).await, "the chunk stays as the record");
+
+    f.raw
+        .batch_execute("drop trigger refuse on public.one")
+        .await
+        .expect("fix the cause");
+    pause_and_resume_only(&f).await;
+    f.pass().await;
+    f.run("one").await;
+    assert_eq!(f.status("one").await.as_deref(), Some("live"));
+    assert_eq!(
+        f.trellis()
+            .await
+            .status("one")
+            .await
+            .unwrap()
+            .unwrap()
+            .backfill_failure,
+        None
+    );
+    assert!(!chunk_exists(&f, id).await);
+    f.assert_one_oracle().await;
+}
+
+/// Resumes a transform the build paused.
+async fn pause_and_resume_only(f: &Fixture) {
+    f.trellis()
+        .await
+        .apply("RESUME TRANSFORM one")
+        .await
+        .expect("resume");
+}
+
+/// Gives `Fixture`'s database a login role without superuser, with every
+/// privilege but `select` on the source, and runs the fixture's workers as it:
+/// what a revoked source looks like to the build.
+async fn run_workers_without_the_source_privilege(f: &mut Fixture) {
+    f.raw
+        .batch_execute(&format!(
+            "create role builder login; \
+             grant usage, create on schema {DEFAULT_SCHEMA} to builder; \
+             grant all on all tables in schema {DEFAULT_SCHEMA} to builder; \
+             grant all on all sequences in schema {DEFAULT_SCHEMA} to builder; \
+             grant execute on all functions in schema {DEFAULT_SCHEMA} to builder; \
+             grant all on all tables in schema public to builder; \
+             revoke select on public.src from builder"
+        ))
+        .await
+        .expect("create the unprivileged role");
+    let dsn = f.db.dsn().replace("user=postgres", "user=builder");
+    let config = Config::from_dsn(dsn).expect("valid dsn");
+    f.db.pool = trellis::Pool::new(&config).expect("pool");
+}
+
+/// A `42501` on a `rederive` chunk's read is not narrowed to a key: it is
+/// charged like any failure no row explains, up to the fifth, which pauses the
+/// definition with the permission error on the chunk's row.
+#[tokio::test]
+async fn a_refused_rederive_chunk_is_charged_and_pauses_the_definition() {
+    let mut f = Fixture::new(60, &[ONE]).await;
+    f.pass().await;
+    assert_eq!(f.run_chunks_by_hand(1).await, 1, "the plan job");
+    run_workers_without_the_source_privilege(&mut f).await;
+    let id = fail_until_paused(&f, chunk_queue::KIND_REDERIVE).await;
+    assert_eq!(
+        f.count(&format!(
+            "select count(*) from backfill_chunks \
+             where id = {id} and last_error like '%permission denied%'"
+        ))
+        .await,
+        1
+    );
+    assert_eq!(
+        f.count("select count(*) from poison").await,
+        0,
+        "no key was quarantined"
+    );
+    assert_eq!(
+        f.count("select count(*) from backfill_chunks where kind = 'rederive'")
+            .await,
+        f.count("select count(*) from backfill_chunks where kind = 'rederive' and not done")
+            .await,
+        "and the chunk was never split"
+    );
+}
+
+/// The same for the plan job's read of the source.
+#[tokio::test]
+async fn a_refused_plan_read_is_charged_and_pauses_the_definition() {
+    let mut f = Fixture::new(60, &[ONE]).await;
+    f.pass().await;
+    run_workers_without_the_source_privilege(&mut f).await;
+    let id = fail_until_paused(&f, chunk_queue::KIND_PLAN).await;
+    assert_eq!(
+        f.count(&format!(
+            "select count(*) from backfill_chunks \
+             where id = {id} and last_error like '%permission denied%'"
+        ))
+        .await,
+        1
+    );
+}
+
+/// A column paused while its target is rebuilt keeps the value it had: the
+/// `rederive` chunks of the rebuild write every other column from the source
+/// and leave the paused one out.
+#[tokio::test]
+async fn a_rerun_rederive_chunk_leaves_a_paused_column_alone() {
+    let mut f = Fixture::new(60, &[ONE]).await;
+    f.pass().await;
+    f.run("one").await;
+    assert_eq!(f.status("one").await.as_deref(), Some("live"));
+    f.assert_one_oracle().await;
+
+    f.raw
+        .execute(
+            "insert into column_status (transform_table, column_name, last_error, local_fuse) \
+             values ('one', 'dbl', 'paused by the test', true)",
+            &[],
+        )
+        .await
+        .expect("pause one.dbl");
+    f.raw
+        .execute("update public.src set g = g + 100, v = v + 1000", &[])
+        .await
+        .expect("change every source row");
+    pause_and_resume(&f).await;
+    f.pass().await;
+    f.run("one").await;
+    assert_eq!(f.status("one").await.as_deref(), Some("live"));
+    assert_eq!(
+        f.count(
+            "select count(*) from public.one o join public.src s using (id) \
+             where o.g = s.g"
+        )
+        .await,
+        60,
+        "the rebuild wrote the other column"
+    );
+    assert_eq!(
+        f.count("select count(*) from public.one where dbl = 2 * id")
+            .await,
+        60,
+        "and left the paused one with the value it had"
+    );
 }

@@ -1215,3 +1215,123 @@ pub(crate) async fn discard_if_superseded(
     txn.commit().await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::defs::ast::ValueType;
+    use crate::integer::IntWidth;
+
+    /// A fenced transaction left idle past the reclaim TTL loses its lock
+    /// (`idle_in_transaction_session_timeout`, set by [`ClaimFence::hold`]):
+    /// the stale-claim sweep skips the chunk while the session holds it, and
+    /// reclaims it once the server has ended the session. The test waits for
+    /// that with a lock request the dying session's lock blocks, not a poll.
+    #[tokio::test]
+    async fn a_fenced_transaction_left_idle_loses_its_lock_and_the_chunk_is_reclaimed() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let config = crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
+        let pool = Pool::new(&config).expect("build a same-crate pool");
+        let connect = || async {
+            let (client, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+                .await
+                .expect("connect");
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            client
+                .batch_execute(&format!(
+                    "set search_path to {}, public",
+                    crate::config::DEFAULT_SCHEMA
+                ))
+                .await
+                .expect("set search_path");
+            client
+        };
+        let mut raw = connect().await;
+        raw.batch_execute(
+            "create table public.nums (id bigint primary key, x integer); \
+             insert into public.nums select i, i from generate_series(1, 30) i",
+        )
+        .await
+        .expect("seed the source");
+        let columns = HashMap::from([
+            ("id".to_string(), ValueType::Integer(IntWidth::Int8)),
+            ("x".to_string(), ValueType::Integer(IntWidth::Int4)),
+        ]);
+        crate::defs::install_definition(
+            &pool,
+            "TRANSFORM doubles FROM nums SELECT x + x AS doubled",
+            &columns,
+            "public",
+        )
+        .await
+        .expect("install_definition");
+        crate::client::reconcile_pass(&mut raw, &pool, crate::config::DEFAULT_SCHEMA)
+            .await
+            .expect("start the build");
+        let claimed = {
+            let client = pool.get().await.expect("pool");
+            claim_chunks_of(&**client, "holder", 1, &[KIND_PLAN])
+                .await
+                .expect("claim the plan job")
+        };
+        let id = claimed[0].id;
+        raw.execute(
+            "update backfill_chunks set claimed_at = now() - interval '1 hour' where id = $1",
+            &[&id],
+        )
+        .await
+        .expect("age the claim");
+
+        // The fence idles for 300 ms inside its transaction.
+        let mut holder = connect().await;
+        let txn = holder.transaction().await.expect("begin");
+        let fence = ClaimFence::new(id, "holder", Duration::from_millis(300));
+        assert!(fence.hold(&txn).await.expect("hold"), "the claim holds");
+
+        let mut sweeper = pool.get().await.expect("pool");
+        assert_eq!(
+            reclaim_stale_chunks(&mut **sweeper, Duration::from_secs(30))
+                .await
+                .expect("reclaim"),
+            0,
+            "the sweep skips a chunk whose fenced transaction is open"
+        );
+
+        // Blocks until the server ends the idle session and its lock goes.
+        raw.batch_execute("set statement_timeout = '30s'")
+            .await
+            .expect("bound the wait");
+        raw.execute(
+            "select 1 from backfill_chunks where id = $1 for update",
+            &[&id],
+        )
+        .await
+        .expect("the idle session released the chunk's lock");
+
+        assert_eq!(
+            reclaim_stale_chunks(&mut **sweeper, Duration::from_secs(30))
+                .await
+                .expect("reclaim"),
+            1,
+            "and the sweep now reclaims it"
+        );
+        assert!(
+            raw.query_one(
+                "select claimed_by is null from backfill_chunks where id = $1",
+                &[&id]
+            )
+            .await
+            .expect("read the chunk")
+            .get::<_, bool>(0)
+        );
+        assert!(
+            txn.query("select 1", &[]).await.is_err(),
+            "the idle session was ended"
+        );
+    }
+}
