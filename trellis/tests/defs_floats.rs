@@ -636,73 +636,122 @@ async fn float_text_rendering_is_byte_identical_to_postgres_through_the_evaluato
 /// #1418: a float against a *bare* number literal compares as Postgres does,
 /// in `double precision`: the literal is cast to `float8` and a `real`
 /// operand widens to it, so `0.1::real > 0.1` is true (the widened real is
-/// 0.10000000149...). Every verdict below is read from the server and the
-/// evaluator must agree; narrowing the literal to `f32` flips the `r` rows.
+/// 0.10000000149...). Every verdict below is read from the server, over rows
+/// that include `NULL`, `NaN`, `-0`, a subnormal and a `real` that rounded,
+/// and the evaluator must agree; narrowing the literal to `f32` flips the
+/// `r` rows. A literal is refused at define exactly where the server raises
+/// `22003` for it.
 #[tokio::test]
 async fn a_float_against_a_bare_literal_compares_in_double_precision_like_postgres() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let client = connect_raw(db.dsn()).await;
 
-    let r_text: String = client
-        .query_one("select 0.1::real::text", &[])
-        .await
-        .expect("real text")
-        .get(0);
-    let d_text: String = client
-        .query_one("select 0.1::float8::text", &[])
-        .await
-        .expect("double text")
-        .get(0);
     let columns = HashMap::from([
         ("r".to_string(), ValueType::Float(FloatWidth::Float4)),
         ("d".to_string(), ValueType::Float(FloatWidth::Float8)),
     ]);
-    let row: Row = HashMap::from([
-        ("r".to_string(), Some(r_text)),
-        ("d".to_string(), Some(d_text)),
-    ]);
-
-    let exprs = [
+    let f64_max = format!("{:.0}", f64::MAX);
+    let subnormal = |digits: &str| format!("0.{}{digits}", "0".repeat(323));
+    let mut exprs: Vec<String> = [
         "r > 0.1",
         "0.1 > r",
         "d > 0.1",
         "0.1 > d",
+        "r > (0.1)",
         "r > 0.1000000014",
         "r > 0.1000000015",
         "0.1000000015 > r",
         "r > 0",
         "0 > r",
+        "r > 0.0000",
         "r > 1",
+        "r > 16777216",
+        "16777216.5 > r",
         "d > 0.09999999999999999",
         "d > 0.10000000000000001",
+        "d > 0.3",
+        "0.30000000000000004 > d",
         "d > 3000000000",
         "3000000000 > d",
         "r > 9223372036854775808",
         "COALESCE(r, 0) > 0.1",
         "COALESCE(d, 0.1) > 0.1",
+        "r + 1 > 1.1",
         "r > r",
         "r > d",
         "d > r",
-    ];
-    for expr in exprs {
+    ]
+    .iter()
+    .map(|e| e.to_string())
+    .collect();
+    exprs.push(format!("{f64_max} > d"));
+    exprs.push(format!("d > {}", subnormal("5")));
+    exprs.push(format!("r > {}", subnormal("3")));
+
+    for (r, d) in [
+        ("0.1", "0.1"),
+        ("16777217", "0.30000000000000004"),
+        ("'NaN'", "'Infinity'"),
+        ("'-0'", "'4.9406564584124654e-324'"),
+        ("null", "null"),
+    ] {
+        let source = format!("select {r}::real as r, {d}::float8 as d");
+        let texts = client
+            .query_one(&format!("select r::text, d::text from ({source}) t"), &[])
+            .await
+            .expect("row text");
+        let row: Row = HashMap::from([
+            ("r".to_string(), texts.get(0)),
+            ("d".to_string(), texts.get(1)),
+        ]);
+        for expr in &exprs {
+            let def = parse(&format!("TRANSFORM t FROM s SELECT {expr} AS out")).expect("parse");
+            assert_eq!(validate(&def, &columns), Ok(()), "{expr}");
+            let oracle: Option<bool> = client
+                .query_one(&format!("select {expr} from ({source}) t"), &[])
+                .await
+                .unwrap_or_else(|e| panic!("{expr}: {e}"))
+                .get(0);
+            let values = evaluate(&def, &row, &columns, &mut RegexCache::new())
+                .unwrap_or_else(|e| panic!("{expr}: {e}"));
+            assert_eq!(
+                values["out"],
+                oracle.map(Value::Boolean),
+                "{expr} over r = {r}, d = {d}: Postgres says {oracle:?}"
+            );
+        }
+    }
+
+    // Range: refused at define exactly where the server raises 22003 when
+    // it casts the literal to `double precision` (past the finite ceiling,
+    // or a nonzero value that rounds to zero; a subnormal is in range).
+    for literal in [
+        f64_max.clone(),
+        format!("{f64_max}.5"),
+        format!("17976931348623158{}", "0".repeat(292)),
+        "9".repeat(309),
+        subnormal("24703282292062328"),
+        subnormal("24703282292062327"),
+        subnormal("5"),
+        format!("0.{}1", "0".repeat(400)),
+    ] {
+        let expr = format!("d > {literal}");
         let def = parse(&format!("TRANSFORM t FROM s SELECT {expr} AS out")).expect("parse");
-        assert_eq!(validate(&def, &columns), Ok(()), "{expr}");
-        let oracle: bool = client
+        let refused = matches!(
+            validate(&def, &columns),
+            Err(ValidationError::FloatComparisonLiteralOutOfRange { .. })
+        );
+        let server = client
             .query_one(
-                &format!("select {expr} from (select 0.1::real as r, 0.1::float8 as d) t"),
+                &format!("select {expr} from (select 1::float8 as d) t"),
                 &[],
             )
-            .await
-            .unwrap_or_else(|e| panic!("{expr}: {e}"))
-            .get(0);
-        let values = evaluate(&def, &row, &columns, &mut RegexCache::new())
-            .unwrap_or_else(|e| panic!("{expr}: {e}"));
-        assert_eq!(
-            values["out"],
-            Some(Value::Boolean(oracle)),
-            "{expr}: Postgres says {oracle}"
-        );
+            .await;
+        if let Err(e) = &server {
+            assert_eq!(e.code(), Some(&SqlState::NUMERIC_VALUE_OUT_OF_RANGE), "{e}");
+        }
+        assert_eq!(refused, server.is_err(), "{}...", &literal[..40]);
     }
 
     // The headline pair, stated outright.
