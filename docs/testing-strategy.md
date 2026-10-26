@@ -19,8 +19,8 @@ lower one already guarantees.
 | 2. Linters & format | every build | `clippy`/`rustfmt` | fully | every edit / CI |
 | 3. Unit tests | scripted | assertion | fully | every PR / CI |
 | 4. Integration tests | scripted, real Postgres | assertion | fully | every PR / CI |
-| 5. Generative tests | random valid program, seeded | independent oracle at quiescence | at program level (shrinking) | TBD |
-| 6. Chaos tests | wall-clock random workload + faults | invariants over recorded history | **no** | TBD |
+| 5. Generative tests | random valid program, seeded | independent oracle at quiescence | at program level (shrinking) | nightly (`nightly.yml`, the one deep property), and on demand with `-- --ignored` |
+| 6. Chaos tests | wall-clock random workload + faults | invariants over recorded history | **no** | on demand, before a release; never a per-commit gate |
 
 The tier 5↔6 line is the one that most needs stating, so it gets its own section (§6).
 
@@ -65,7 +65,7 @@ or allowlisted actions). Style and lint only; no claim about behavior.
 
 - The AST and parser — accept/reject, precedence, error messages.
 - The `numeric` exact-decimal type — arithmetic, scale, comparison-by-value.
-- The AST→`SELECT` printer (#36) as pure string production.
+- The AST→`SELECT` printer as pure string production.
 - Dependency-order resolution, batch/fold bookkeeping, outcome classification —
   anything expressible as *value in, expected value out*.
 
@@ -106,8 +106,7 @@ cluster with the `shared_preload_libraries` the worker needs.
 **The combinatorial correctness claim: byte-identical convergence to an independent
 oracle over random valid programs, with failures shrunk to a minimal reproducing
 program.** This is the `generative` crate; full architecture lives in
-`docs/generative-test-suite.md`, build plan in the tracking epic
-(salesforce-misc/trellis#2). In brief:
+`docs/generative-test-suite.md`, In brief:
 
 - **Trigger:** a randomly generated *valid* program — schema, transform definitions,
   and a sequence of source mutations — driven through the real engine against a
@@ -215,7 +214,7 @@ Alongside the generative harness, the chaos tier needs:
 
 ## Benchmarks: building a `JOIN` over seeded tables
 
-The streaming benchmark (`benchmark/`, run through `.claude/scripts/bench`) is
+The streaming benchmark (`benchmark/`, run with `cargo run -p benchmark --features engine-access --release -- join ...`) is
 not a test tier, but `bench join` has a mode that measures a `JOIN` *build*: by
 default (`--load direct`) it seeds the fact and dimension tables server-side
 with parallel `INSERT ... SELECT` before any definition exists, so nothing

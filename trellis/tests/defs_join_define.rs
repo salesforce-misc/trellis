@@ -167,7 +167,10 @@ async fn define_validates_a_join_against_both_tables_then_refuses_it() {
     assert!(
         matches!(
             err,
-            CatalogError::Validate(ValidationError::DeferredAggregate { issue: 1117, .. })
+            CatalogError::Validate(ValidationError::DeferredAggregate {
+                family: "MIN/MAX",
+                ..
+            })
         ),
         "{err:?}"
     );

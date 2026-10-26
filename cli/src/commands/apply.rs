@@ -4,7 +4,7 @@
 //! One command for every definition-changing operation, because the engine
 //! facade has one method for them: [`trellis::Trellis::apply`] takes the
 //! statement text and the *parse* decides whether it defines, alters,
-//! pauses, resumes, or drops a transform (issue #227, ADR-0012). All this
+//! pauses, resumes, or drops a transform (ADR-0012). All this
 //! module decides is how to phrase the confirmation it prints.
 
 use trellis::{Applied, Config, Trellis, TrellisOptions};
@@ -35,8 +35,6 @@ PAUSE and DROP are idempotent. RESUME rebuilds by a fresh backfill rather than
 catching up. DROP removes the target table's data too, and is refused (naming
 the blockers) while another definition still chains off the subject; pause a
 definition before dropping it.
-
-`define` is accepted as a deprecated alias for `apply`.
 
 Applies pending migrations first, so this works against a freshly created
 database with no separate migrate step.

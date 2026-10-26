@@ -28,7 +28,7 @@ where they're stuck, and what work is pending or blocked. The counterpart to
   worker running to build and maintain targets, and is the staging worker
   running to capture changes and move a new transform out of
   `waiting_to_backfill`. A healthy fleet needs both. See
-  [docs/embedding.md](embedding.md#the-silent-stall-hazard-issue-144) for the
+  [docs/embedding.md](embedding.md#the-silent-stall-hazard) for the
   embedded-deployment misconfiguration this exists to catch.
 
 **Non-goals**

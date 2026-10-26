@@ -3,11 +3,9 @@
 Embedded Trellis for Ruby apps: a [Magnus](https://github.com/matsadler/magnus)
 native extension over the `trellis` crate's `BlockingTrellis`, so a Rails app
 can define and run streaming transforms without deploying a separate service.
-The design is [ADR-0010](../../docs/decisions/0010-embeddable-clients.md); the
-work is epic #140.
+The design is [ADR-0010](../../docs/decisions/0010-embeddable-clients.md).
 
-The surface mirrors the Rust crate's `BlockingTrellis` (issues #151 and
-#152), and the Elixir binding's (`clients/elixir`) wherever Ruby and Elixir
+The surface mirrors the Rust crate's `BlockingTrellis`, and the Elixir binding's (`clients/elixir`) wherever Ruby and Elixir
 don't call for a difference. Every method is on `Trellis::Instance`, one
 catalog schema's handle, and a process holds as many as it has schemas. The
 `Trellis` module is the shortcut for the common case: it holds the process's
@@ -200,7 +198,7 @@ default one included.
   connecting on another thread, or not yet fully shut down) may have
   inherited a lock one of that handle's threads held, which nothing in the
   child can release, so its `connect` raises `Trellis::ForkedHandleError`
-  too, rather than risk hanging on it (issue #600). Forks whose children
+  too, rather than risk hanging on it. Forks whose children
   never connect, and `system`/`spawn`, are unaffected. [Forking
   servers](#forking-servers) has the hooks for Puma (with `preload_app!`
   and `fork_worker`), Unicorn and Passenger.
@@ -293,7 +291,7 @@ With neither set, the Railtie does nothing. Two exceptions:
 
 ### Forking servers
 
-A handle doesn't survive `fork` (issue #600). A server that loads the app
+A handle doesn't survive `fork`. A server that loads the app
 before it forks has to shut the boot handle down in the parent and connect
 one in each child. Puma preloads by default whenever it runs more than one
 worker:

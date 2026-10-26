@@ -5422,7 +5422,7 @@ async fn pause_before_commit_for_tests() {
     crate::instance_log::warn!(
         trigger_path,
         "TRELLIS_TEST_PAUSE_TRIGGER fired: pausing Phase 3 indefinitely before commit \
-         (test-only hook, issue #166)"
+         (test-only hook)"
     );
     if let Ok(marker_path) = std::env::var("TRELLIS_TEST_PAUSE_MARKER")
         && let Err(err) = std::fs::write(&marker_path, b"paused")

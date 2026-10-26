@@ -1,7 +1,7 @@
 //! `trellis status [--database-url <URL>]` — a one-shot, read-only snapshot
 //! of what's registered against the configured database.
 //!
-//! Unlike `define`/`run`, this command never calls `.migrate()`. Those two
+//! Unlike `apply`/`run`, this command never calls `.migrate()`. Those two
 //! are already mutating operations (they create/register things), so folding
 //! a schema migration into their connect path doesn't add a new kind of
 //! surprise. `status` is meant to be safe to run at any time, including
@@ -10,25 +10,18 @@
 //! does not exist" error is left to surface as-is rather than papering over
 //! it by migrating on this command's behalf.
 //!
-//! What this prints today: every registered transform definition
+//! What this prints: every registered transform definition
 //! ([`Trellis::definitions`]) — id, tables, `created_at`, and its whole-
-//! keyspace lifecycle status (issue #55's `TransformStatus`:
-//! `waiting_to_backfill`/`backfilling`/`live`/`quarantined`), plus, on a
+//! keyspace lifecycle status (`TransformStatus`), plus, on a
 //! line of its own, the failure of its source's backfill if that keeps
-//! failing (`backfill_failure`, issue #461), on another why the drain
-//! halted on it, if it did (`halt`, issue #663), and on another the page the
+//! failing (`backfill_failure`), on another why the drain
+//! halted on it, if it did (`halt`), and on another the page the
 //! drain keeps failing on with nothing charged or paused, if one holds it
-//! back (`drain_failure` from [`Trellis::status`], issue #817), and one per
-//! source index it lacks (`source_index_gaps`, issue #1167), and one per node of its partitioned
-//! source it is being corrected for (`correcting`, ADR-0017). Finer-grained per-`(transform,
-//! column)` pause state (docs/decisions/0008-public-api-design.md's
-//! decision 5 and
-//! docs/decisions/0003-quarantine-storage-and-api.md) is implemented on the
-//! engine (`Trellis::quarantined`/`quarantine_status`/`sample_quarantined`)
-//! but not yet surfaced by this command — still a real gap, just a smaller
-//! one than "no status at all."
+//! back (`drain_failure` from [`Trellis::status`]), and one per
+//! source index it lacks (`source_index_gaps`), and one per node of its partitioned
+//! source it is being corrected for (`correcting`, ADR-0017).
 //!
-//! [`Trellis::poisoned_since`] *is* surfaced here, called with `UNIX_EPOCH`
+//! [`Trellis::poisoned_since`] is surfaced here, called with `UNIX_EPOCH`
 //! as the watermark. Despite its name suggesting a point-in-time delta, the
 //! underlying `poison` table (see the quarantine migration under `trellis/migrations`
 //! and `trellis::staging::quarantine`) is a live marker of which
@@ -52,9 +45,9 @@ use super::release::shell_quote;
 pub const USAGE: &str = "\
 Usage: trellis status [--database-url <URL>]
 
-Prints every registered TRANSFORM definition, and a note on
-what lifecycle/quarantine status isn't tracked yet (issue #55). Read-only:
-unlike `define`/`run`, this does not apply pending migrations, so it fails
+Prints every registered TRANSFORM definition with its lifecycle status and
+any warnings, then the source rows held in quarantine. Read-only:
+unlike `apply`/`run`, this does not apply pending migrations, so it fails
 plainly against a database with no Trellis schema yet.
 
 Options:
@@ -89,8 +82,7 @@ pub fn parse(args: &[String]) -> Result<Args, String> {
 }
 
 /// Connects (without migrating — see the module doc comment for why),
-/// prints the definition listing plus the "status not
-/// implemented yet" note, then disconnects.
+/// prints the definition listing and the quarantined rows, then disconnects.
 ///
 /// `shutdown` is called even if the listing failed, per [`Trellis::shutdown`]'s
 /// "correct lifecycle call" contract — but the earlier error (the one an
@@ -110,16 +102,8 @@ pub async fn run(_args: Args, database_url: Option<String>) -> Result<String, St
     Ok(message)
 }
 
-/// The note appended to every `status` listing, explaining the remaining gap
-/// now that whole-transform lifecycle status (issue #55) is shown per
-/// definition below. See the module doc comment for the full reasoning.
-const STATUS_NOTE: &str = "\
-Note: the status shown per definition above is whole-transform (issue #55). \
-Finer-grained per-column pause state is not yet surfaced by this command, \
-even though the engine tracks it.";
-
 /// Builds the full human-readable status report: definitions, poisoned keys,
-/// then [`STATUS_NOTE`].
+/// then the quarantined source rows.
 async fn report(trellis: &Trellis) -> Result<String, String> {
     let definitions = trellis.definitions().await.map_err(|err| err.to_string())?;
     // `definitions()` doesn't carry a drain failure, the source index gaps
@@ -150,8 +134,6 @@ async fn report(trellis: &Trellis) -> Result<String, String> {
     out.push_str(&format_definitions(&listed));
     out.push('\n');
     out.push_str(&format_poisoned(&poisoned));
-    out.push('\n');
-    out.push_str(STATUS_NOTE);
 
     Ok(out)
 }
@@ -753,11 +735,6 @@ mod tests {
             formatted.contains(r"orders\nDETAIL: role lacks SELECT\nHINT: grant it"),
             "got {formatted:?}"
         );
-    }
-
-    #[test]
-    fn note_mentions_issue_55() {
-        assert!(STATUS_NOTE.contains("#55"));
     }
 
     #[test]

@@ -211,7 +211,7 @@ Either one is repaired in the transaction that makes the call:
   own it doesn't wait for a build.
 - **A staging worker must be running**, and drain threads for any build
   ([embedding — Who runs what](embedding.md#who-runs-what),
-  [the silent-stall hazard](embedding.md#the-silent-stall-hazard-issue-144)).
+  [the silent-stall hazard](embedding.md#the-silent-stall-hazard)).
 - **Only the staging worker needs to own the source tables**, because it
   installs their capture triggers. A process that only registers or drops
   transforms needs catalog access and the right to create target tables; the

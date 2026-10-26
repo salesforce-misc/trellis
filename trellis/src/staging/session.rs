@@ -75,17 +75,8 @@ pub(crate) fn fnv1a_64(text: &str) -> u64 {
 /// singleton. It needs no cryptographic properties: schema names are
 /// operator-chosen configuration, not adversarial input, and the only
 /// consequence of a collision is two distinct instances in the same database
-/// conservatively refusing to run concurrently — the pre-#234 behavior for
-/// *every* pair, and a loud, typed error rather than a correctness bug.
-///
-/// **Upgrade note:** this changes the key a default-schema
-/// (`config::DEFAULT_SCHEMA`) instance acquires, so a fleet running a mix of
-/// pre- and post-#234 binaries against the same database would not see each
-/// other's singleton for the duration of the rollout. That window is a
-/// deliberate accepted cost: preserving the old constant as a special case
-/// for the default schema would leave the documented multi-instance topology
-/// broken for exactly the configuration it is most likely to be used in (a
-/// default-schema instance alongside a named one).
+/// conservatively refusing to run concurrently, which is a loud, typed error
+/// rather than a correctness bug.
 pub fn producer_singleton_lock_key(schema: &str) -> i64 {
     let hash = fnv1a_64(schema);
     // `as i64` is a plain bit reinterpretation, not a lossy narrowing:

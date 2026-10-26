@@ -1183,8 +1183,8 @@ impl Parser {
             Token::Ident(s) if s.eq_ignore_ascii_case("true") => Ok(Predicate::True),
             other => Err(ParseError::UnsupportedPredicate {
                 detail: format!(
-                    "only a literal TRUE is accepted (general predicates are deferred; \
-                        see issue #804); found {}",
+                    "only a literal TRUE is accepted (general predicates are not supported; \
+                        see docs/transforms.md); found {}",
                     other.describe()
                 ),
             }),

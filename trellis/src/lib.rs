@@ -9,8 +9,8 @@
 //! primitives together themselves; [`client::Client`] is the runtime it
 //! starts, still public for embedders that want to drive it directly.
 //! [`blocking::BlockingTrellis`] wraps the same facade for callers that
-//! can't assume a `tokio` runtime on their own thread (issue #87's future
-//! FFI embedding). Those three are tier 1 in
+//! can't assume a `tokio` runtime on their own thread (the FFI
+//! bindings). Those three are tier 1 in
 //! `docs/decisions/0012-curate-public-api-demote-engine-modules.md` — the
 //! only front doors.
 //!
@@ -29,13 +29,13 @@
 //!   `docs/decisions/0008-public-api-design.md`, decision 3.
 //! - [`statement_kind`] names which form a statement is ([`StatementKind`])
 //!   without applying it, using `apply`'s own parser — the check a binding
-//!   makes before handing a statement to `apply` (issue #580).
+//!   makes before handing a statement to `apply`.
 //! - [`metrics`] is a facade over the `metrics`/`metrics-exporter-prometheus`
-//!   in-process registry (issue #51, epic #49) and its Prometheus text
-//!   exposition (issue #53, [`app::Trellis::metrics`]) — see
+//!   in-process registry and its Prometheus text
+//!   exposition ([`app::Trellis::metrics`]) — see
 //!   `docs/observability.md` and
 //!   `docs/decisions/0009-observability-decisions.md`.
-//! - Logs/traces (issue #56, epic #49) flow through the plain `tracing`
+//! - Logs/traces flow through the plain `tracing`
 //!   facade — spans modeling the propagation path (source commit → hop →
 //!   hop → apply, ADR-0009 decision 3) and events at operationally
 //!   meaningful points, in `capture` and `staging` directly, not a
@@ -58,19 +58,26 @@
 //! `test-util` feature) is the one curated, uncommitted door onto them, for
 //! the generative suite's independent cross-check leg.
 //!
-//! **Current subset**: 1-1 scalar transforms only end to end (issue #11's
-//! 1-1 slice). Aggregate/invertible-delta maintenance is not yet wired up —
-//! the apply frame that will carry it (fence, lock order, atomic apply ∪
-//! mark-drained) is already in place in `staging`.
+//! Trellis maintains target tables incrementally from source tables. A
+//! definition is one of three shapes: a 1-1 transform (one target row per
+//! source row), an aggregate (`GROUP BY` with invertible functions), or a
+//! `JOIN` transform; `docs/transforms.md` is the grammar reference and lists
+//! the supported sources and targets. Triggers on each source table stage
+//! every change into a durable ring in its writer's transaction; application
+//! workers claim sealed segments, fold them, and apply them to the targets
+//! exactly once. A definition that can no longer be maintained correctly is
+//! stopped with a reason rather than left to drift, and rows a transform
+//! cannot produce are quarantined; `docs/operations.md` describes both and
+//! how to repair them. `docs/data-flow.md` and `docs/staging-and-claiming/`
+//! describe the pipeline, and `docs/known-correctness-gaps.md` lists the
+//! ways a target can go stale or wrong without Trellis repairing it.
 //!
 //! The ring has a fixed `staging::RING_SIZE` of 4 slots; a `drained`
-//! segment's slot is freed for reuse by retirement (stage 06,
-//! `docs/staging-and-claiming/06-cleanup-and-reclaim.md`,
-//! `staging::retire_drained_segments`), run both as
-//! `staging::seal_if_active_nonempty`'s one-retry-on-`RingFull` step and in
-//! the maintenance loop's housekeeping
-//! ([`client::ClientOptions::housekeeping_interval`]).
-//! Quarantine, stage 06's other half, is not yet implemented.
+//! segment's slot is freed for reuse by retirement
+//! (`docs/staging-and-claiming/06-cleanup-and-reclaim.md`), run in the
+//! maintenance loop's housekeeping
+//! ([`client::ClientOptions::housekeeping_interval`]) and as the
+//! one-retry-on-`RingFull` step of sealing.
 
 // Tier 1 (the facade) and tier 2 (composable primitives) — see ADR-0012.
 pub mod app;
@@ -217,22 +224,6 @@ pub use tokio_postgres::types::PgLsn;
 
 // --- Tier 2: statement classification -------------------------------------
 // Pure on the text, so an embedder can refuse the wrong statement form before
-// handing it to `apply` (issue #580). It is `apply`'s own parser, not a copy
+// handing it to `apply`. It is `apply`'s own parser, not a copy
 // of its dispatch rule.
 pub use defs::{StatementKind, statement_kind};
-
-/// Placeholder entry point exercising the async plumbing the engine will
-/// build on. Returns the crate version so callers have something to check.
-pub async fn version() -> &'static str {
-    env!("CARGO_PKG_VERSION")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn version_is_reported() {
-        assert_eq!(version().await, env!("CARGO_PKG_VERSION"));
-    }
-}

@@ -1,7 +1,7 @@
 //! `trellis run [--staging|--no-staging] [--drain-threads N]` — runs the live
 //! CDC/apply pipeline until interrupted.
 //!
-//! Unlike `define`, this command can't just call `.migrate()` right after
+//! Unlike `apply`, this command can't just call `.migrate()` right after
 //! connecting: [`trellis::Trellis::connect`] with `staging: true` starts the
 //! staging worker *during* connect, and the worker reads the catalog for the
 //! tables to capture before this module gets a chance to run anything. On a
@@ -10,9 +10,9 @@
 //! short-lived, no-options connection first, migrates on it, and shuts it
 //! down — that guarantees the catalog tables exist by the time the real
 //! `staging`/`drain_threads` connect runs, so a fresh database doesn't need a
-//! separate `migrate` step any more than `define` does.
+//! separate `migrate` step any more than `apply` does.
 //!
-//! No definitions need to be registered yet (issue #427): the staging worker
+//! No definitions need to be registered yet: the staging worker
 //! captures nothing until `trellis apply` registers something, then picks
 //! it up on its next reconcile pass without a restart.
 //!

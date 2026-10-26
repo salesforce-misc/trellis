@@ -1551,7 +1551,7 @@ async fn a_new_leaf_costs_no_rebuild_and_no_source_wide_enumeration() {
 /// dropped; each correction is timed with the WAL it wrote, and the target is
 /// checked against the oracle after each. Prints `MEASURE` lines.
 #[tokio::test]
-#[ignore = "a measurement: run with logbook reserve and a memory cap"]
+#[ignore = "a measurement: run it alone, with a memory cap"]
 async fn measure_the_correction_of_a_large_leaf() {
     let rows: i64 = std::env::var("TRELLIS_MEASURE_LEAF_ROWS")
         .ok()

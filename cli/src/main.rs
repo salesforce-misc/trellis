@@ -10,7 +10,7 @@
 //!
 //! Each subcommand lives in its own `commands::<name>` module; this file is
 //! just the top-level usage/help and the match that dispatches to one.
-//! Today that's `apply`, `run`, `status` and `release`.
+//! The commands are `apply`, `run`, `status` and `release`.
 
 mod commands;
 mod connection;
@@ -22,7 +22,7 @@ Usage: trellis <COMMAND> [OPTIONS]
 
 Commands:
   apply <GRAMMAR>     Run one Trellis statement: TRANSFORM, PAUSE, RESUME,
-                       DROP or ALTER. (`define` is a deprecated alias.)
+                       DROP or ALTER.
   run                 Run the live CDC/apply pipeline until interrupted.
   status              Print registered definitions and exit.
   release <TRANSFORM> <SOURCE_TABLE> <KEY>
@@ -88,10 +88,7 @@ fn run(mut args: Vec<String>) -> ExitCode {
 
     let command = args.remove(0);
     match command.as_str() {
-        // `define` predates the unified entrypoint (issue #227), when the
-        // CLI had one command per typed facade method. Kept as an alias so an
-        // operator's existing scripts and runbooks don't break over a rename.
-        "apply" | "define" => run_apply(args, database_url),
+        "apply" => run_apply(args, database_url),
         "run" => run_run(args, database_url),
         "status" => run_status(args, database_url),
         "release" => run_release(args, database_url),
@@ -307,18 +304,6 @@ mod tests {
     #[test]
     fn apply_missing_grammar_is_a_failure() {
         assert_eq!(run(vec!["apply".to_string()]), ExitCode::FAILURE);
-    }
-
-    /// `define` is a deprecated alias for `apply` (issue #227) — it must keep
-    /// reaching the same command rather than falling through to
-    /// "unknown command".
-    #[test]
-    fn define_is_still_accepted_as_an_alias() {
-        assert_eq!(
-            run(vec!["define".to_string(), "--help".to_string()]),
-            ExitCode::SUCCESS
-        );
-        assert_eq!(run(vec!["define".to_string()]), ExitCode::FAILURE);
     }
 
     #[test]

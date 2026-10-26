@@ -165,16 +165,15 @@ impl fmt::Display for ParseError {
             ParseError::TooManyQualifiedNameParts { reference } => write!(
                 f,
                 "'{reference}' is not a valid table reference: only a bare <table> or a \
-                 qualified <schema>.<table> is supported (issue #76), not a third '.'-separated \
+                 qualified <schema>.<table> is supported, not a third '.'-separated \
                  part"
             ),
             ParseError::UnsupportedCast { found } => write!(
                 f,
                 "CAST is only supported over a single-quoted literal — \
                  CAST('<literal>' AS <type>), equivalently <type> '<literal>' — found {found}. \
-                 General casts between expression types are not implemented: each type family's \
-                 coercions are decided by its own issue (#113 temporal, #114 bytea, #115 jsonb), \
-                 since most interesting pairs are not immutable (ADR-0004)"
+                 General casts between expression types are not supported: most interesting \
+                 pairs are not immutable (ADR-0004; docs/type-support.md)"
             ),
             ParseError::UnsupportedLiteralType { name } => write!(
                 f,

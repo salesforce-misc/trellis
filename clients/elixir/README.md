@@ -3,8 +3,7 @@
 Embedded Trellis for Elixir apps: a [Rustler](https://github.com/rusterlium/rustler)
 NIF over the `trellis` crate's `BlockingTrellis`, so a Phoenix app can define
 and run streaming transforms without deploying a separate service. The design
-is [ADR-0010](https://github.com/salesforce-misc/trellis/blob/main/docs/decisions/0010-embeddable-clients.md); the work is
-epic #140.
+is [ADR-0010](https://github.com/salesforce-misc/trellis/blob/main/docs/decisions/0010-embeddable-clients.md).
 
 ## Installation
 
@@ -48,8 +47,7 @@ path pulls in an OpenTelemetry or gRPC stack. The engine's log lines reach
 
 ## Usage
 
-The surface mirrors the Rust crate's `BlockingTrellis` (issues #146, #147,
-#587 and #152). Every function has a bang variant.
+The surface mirrors the Rust crate's `BlockingTrellis`. Every function has a bang variant.
 
 - `connect/1`, `migrate/1`, `config/1`, `shutdown/1`: the handle's lifecycle.
 - `apply/2`: any statement of Trellis's grammar (`TRANSFORM`,

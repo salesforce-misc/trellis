@@ -5,8 +5,8 @@
 //! [`SINGLE_TRANSACTION_TABLES`], defines, installs capture node by node,
 //! backfills, and stays exact under writes named on the root and on its
 //! leaves. The `measure_` tests are `#[ignore]`d measurements that print
-//! `MEASURE` lines: run them one at a time under `logbook reserve`, the
-//! bench lock and a memory cap. Nothing waits for convergence (#297): the
+//! `MEASURE` lines: run them one at a time, alone on the machine and under
+//! a memory cap. Nothing waits for convergence: the
 //! pass, the ring and the correction engine are driven by hand.
 
 #[path = "support/drain_driver.rs"]
@@ -193,7 +193,7 @@ async fn a_hundred_and_one_leaf_source_installs_node_by_node_and_stays_exact() {
 /// runs the default lock table out. Leaves are added 250 at a time, each
 /// batch in its own transaction.
 #[tokio::test]
-#[ignore = "a measurement: run with logbook reserve and a memory cap"]
+#[ignore = "a measurement: run it alone, with a memory cap"]
 async fn measure_the_lock_table_limit_of_one_statement() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -311,7 +311,7 @@ fn ms(d: Duration) -> f64 {
 /// and sweep; the correction
 /// of a dropped 1,000,000-row leaf; and a tree grown to 1,001 leaves.
 #[tokio::test]
-#[ignore = "a measurement: run with logbook reserve and a memory cap"]
+#[ignore = "a measurement: run it alone, with a memory cap"]
 async fn measure_a_thousand_leaf_source() {
     let started = Instant::now();
     let mut fx = Fx::start(&thousand_leaves()).await;
@@ -545,7 +545,7 @@ fn landed<T>(progress: Progress<T>) -> T {
 /// one transaction, alternating, three rounds each. Prints the install's
 /// time and the writer's worst commit and how many commits took over 50 ms.
 #[tokio::test]
-#[ignore = "a measurement: run with logbook reserve and a memory cap"]
+#[ignore = "a measurement: run it alone, with a memory cap"]
 async fn measure_a_thousand_leaf_install_node_by_node_and_in_one_transaction() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -627,7 +627,7 @@ async fn measure_a_thousand_leaf_install_node_by_node_and_in_one_transaction() {
 /// on the leaf that holds the row. 3,000 of each per round, prepared and
 /// autocommit, three rounds, the cases interleaved within a round.
 #[tokio::test]
-#[ignore = "a measurement: run with logbook reserve and a memory cap"]
+#[ignore = "a measurement: run it alone, with a memory cap"]
 async fn measure_per_write_capture_cost_at_a_thousand_leaves() {
     const WRITES: i32 = 3000;
     let cluster = TestCluster::start();

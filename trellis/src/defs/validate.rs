@@ -148,7 +148,6 @@ pub enum ValidationError {
     DeferredAggregate {
         function: String,
         family: &'static str,
-        issue: u32,
     },
     /// `SUM`/`AVG` over an unconstrained `numeric` column, whose display
     /// scale a running sum can't track (#1096 decision 2).
@@ -699,30 +698,27 @@ impl fmt::Display for ValidationError {
             ValidationError::JoinFieldShape { field, detail } => {
                 write!(f, "field '{field}' of a JOIN definition: {detail}")
             }
-            ValidationError::DeferredAggregate {
-                function,
-                family,
-                issue,
-            } => write!(
+            ValidationError::DeferredAggregate { function, family } => write!(
                 f,
-                "{function} is not supported yet: {family} is deferred past 0.1.0 (tracked in \
-                 #{issue}); the supported aggregates are COUNT(*), COUNT(col), and SUM/AVG over \
-                 smallint, integer, bigint or numeric(p,s)"
+                "{function} is not supported: {family} is not an aggregate Trellis maintains; \
+                 the supported aggregates are COUNT(*), COUNT(col), and SUM/AVG over \
+                 smallint, integer, bigint or numeric(p,s) (see \"Supported sources and \
+                 targets\" in docs/transforms.md)"
             ),
             ValidationError::UnconstrainedNumericAggregate { function, column } => write!(
                 f,
                 "{function}({column}) is over a numeric with no declared scale, which is not \
-                 supported yet (tracked in #1120): Postgres shows a sum with as many decimal \
+                 supported: Postgres shows a sum with as many decimal \
                  places as the most precise value in the group, which a running sum can't \
-                 track. Sum a numeric(p,s) column directly (ALTER TABLE ... ALTER COLUMN ... \
+                 track (see \"Supported sources and targets\" in docs/transforms.md). Sum a numeric(p,s) column directly (ALTER TABLE ... ALTER COLUMN ... \
                  TYPE numeric(p,s)); an expression over numeric has no declared scale"
             ),
             ValidationError::ChainedNumericAggregate { function, column } => write!(
                 f,
                 "{function}({column}) is over a numeric column of a table Trellis creates, \
                  which has no declared scale: Trellis creates its columns with no type \
-                 modifier, so a chained SUM/AVG over one is not supported yet (tracked in \
-                 #1120). Sum the source's numeric(p,s) column in the transform that reads \
+                 modifier, so a chained SUM/AVG over one is not supported (see \"Supported \
+                 sources and targets\" in docs/transforms.md). Sum the source's numeric(p,s) column in the transform that reads \
                  the source"
             ),
             ValidationError::UnsupportedAggregateArgument {
@@ -1223,18 +1219,16 @@ enum JoinSide {
 }
 
 /// The aggregate families a `JOIN` and a plain aggregate refuse, by name:
-/// `(functions, family, follow-up issue)`.
-const DEFERRED_AGGREGATES: &[(&[&str], &str, u32)] = &[
-    (&["MIN", "MAX"], "MIN/MAX", 1117),
+/// `(functions, family)`.
+const DEFERRED_AGGREGATES: &[(&[&str], &str)] = &[
+    (&["MIN", "MAX"], "MIN/MAX"),
     (
         &["BOOL_AND", "BOOL_OR", "BIT_AND", "BIT_OR"],
         "bool_and/bool_or/bit_and/bit_or",
-        1118,
     ),
     (
         &["ARRAY_AGG", "STRING_AGG", "JSONB_AGG"],
         "array_agg/string_agg/jsonb_agg",
-        1040,
     ),
 ];
 
@@ -1243,7 +1237,7 @@ const DEFERRED_AGGREGATES: &[(&[&str], &str, u32)] = &[
 pub(crate) fn is_deferred_aggregate_name(name: &str) -> bool {
     DEFERRED_AGGREGATES
         .iter()
-        .any(|(names, _, _)| names.contains(&name.to_ascii_uppercase().as_str()))
+        .any(|(names, _)| names.contains(&name.to_ascii_uppercase().as_str()))
 }
 
 /// The one column argument of an aggregate call, as
@@ -1272,15 +1266,11 @@ pub(crate) fn check_aggregate_admitted(
     arg: Option<&AggregateArg<'_>>,
 ) -> Result<(), ValidationError> {
     let function = function.to_ascii_uppercase();
-    if let Some((_, family, issue)) = DEFERRED_AGGREGATES
+    if let Some((_, family)) = DEFERRED_AGGREGATES
         .iter()
-        .find(|(names, _, _)| names.contains(&function.as_str()))
+        .find(|(names, _)| names.contains(&function.as_str()))
     {
-        return Err(ValidationError::DeferredAggregate {
-            function,
-            family,
-            issue: *issue,
-        });
+        return Err(ValidationError::DeferredAggregate { function, family });
     }
     match function.as_str() {
         "COUNT" => Ok(()),
@@ -1303,7 +1293,6 @@ pub(crate) fn check_aggregate_admitted(
                     Err(ValidationError::DeferredAggregate {
                         function,
                         family: "float and interval SUM/AVG",
-                        issue: 1119,
                     })
                 }
                 _ => Err(ValidationError::UnsupportedAggregateArgument {
@@ -4896,55 +4885,35 @@ mod tests {
 
     #[test]
     fn join_refuses_each_deferred_aggregate_family_by_name() {
-        for (call, family, issue) in [
-            ("MIN(items.qty)", "MIN/MAX", 1117),
-            ("MAX(orders.total)", "MIN/MAX", 1117),
-            (
-                "BOOL_AND(items.qty)",
-                "bool_and/bool_or/bit_and/bit_or",
-                1118,
-            ),
-            (
-                "BOOL_OR(items.qty)",
-                "bool_and/bool_or/bit_and/bit_or",
-                1118,
-            ),
-            (
-                "BIT_AND(items.qty)",
-                "bool_and/bool_or/bit_and/bit_or",
-                1118,
-            ),
-            ("BIT_OR(items.qty)", "bool_and/bool_or/bit_and/bit_or", 1118),
-            ("SUM(items.weight)", "float and interval SUM/AVG", 1119),
-            ("AVG(items.weight)", "float and interval SUM/AVG", 1119),
-            (
-                "ARRAY_AGG(items.sku)",
-                "array_agg/string_agg/jsonb_agg",
-                1040,
-            ),
+        for (call, family) in [
+            ("MIN(items.qty)", "MIN/MAX"),
+            ("MAX(orders.total)", "MIN/MAX"),
+            ("BOOL_AND(items.qty)", "bool_and/bool_or/bit_and/bit_or"),
+            ("BOOL_OR(items.qty)", "bool_and/bool_or/bit_and/bit_or"),
+            ("BIT_AND(items.qty)", "bool_and/bool_or/bit_and/bit_or"),
+            ("BIT_OR(items.qty)", "bool_and/bool_or/bit_and/bit_or"),
+            ("SUM(items.weight)", "float and interval SUM/AVG"),
+            ("AVG(items.weight)", "float and interval SUM/AVG"),
+            ("ARRAY_AGG(items.sku)", "array_agg/string_agg/jsonb_agg"),
             (
                 "STRING_AGG(items.sku, ',')",
                 "array_agg/string_agg/jsonb_agg",
-                1040,
             ),
-            (
-                "JSONB_AGG(items.sku)",
-                "array_agg/string_agg/jsonb_agg",
-                1040,
-            ),
+            ("JSONB_AGG(items.sku)", "array_agg/string_agg/jsonb_agg"),
         ] {
             let err = check(&format!("orders.region AS region, {call} AS v")).unwrap_err();
             match &err {
                 ValidationError::DeferredAggregate {
-                    family: got_family,
-                    issue: got_issue,
-                    ..
+                    family: got_family, ..
                 } => {
-                    assert_eq!((*got_family, *got_issue), (family, issue), "{call}");
+                    assert_eq!(*got_family, family, "{call}");
                 }
                 other => panic!("{call}: expected DeferredAggregate, got {other:?}"),
             }
-            assert!(err.to_string().contains(&format!("#{issue}")), "{call}");
+            assert!(
+                err.to_string().contains("docs/transforms.md") && !err.to_string().contains('#'),
+                "{call}: {err}"
+            );
         }
     }
 
@@ -4974,7 +4943,10 @@ mod tests {
         let message = check_aggregate_admitted("SUM", Some(&arg(true)))
             .unwrap_err()
             .to_string();
-        assert!(message.contains("#1120") && message.contains("no declared scale"));
+        assert!(
+            message.contains("docs/transforms.md") && message.contains("no declared scale"),
+            "{message}"
+        );
     }
 
     /// #1096 decision 1 on a plain aggregate: every deferred family is
@@ -5000,28 +4972,22 @@ mod tests {
             .unwrap_or_else(|e| panic!("{fields}: {e}"));
             validate_aggregate_admitted(&def, &items)
         };
-        for (call, family, issue) in [
-            ("MIN(qty)", "MIN/MAX", 1117),
-            ("MAX(note)", "MIN/MAX", 1117),
-            ("BOOL_AND(qty > 1)", "bool_and/bool_or/bit_and/bit_or", 1118),
-            ("BIT_OR(qty)", "bool_and/bool_or/bit_and/bit_or", 1118),
-            ("SUM(weight)", "float and interval SUM/AVG", 1119),
-            ("AVG(wait)", "float and interval SUM/AVG", 1119),
-            ("ARRAY_AGG(note)", "array_agg/string_agg/jsonb_agg", 1040),
-            (
-                "STRING_AGG(note, ',')",
-                "array_agg/string_agg/jsonb_agg",
-                1040,
-            ),
+        for (call, family) in [
+            ("MIN(qty)", "MIN/MAX"),
+            ("MAX(note)", "MIN/MAX"),
+            ("BOOL_AND(qty > 1)", "bool_and/bool_or/bit_and/bit_or"),
+            ("BIT_OR(qty)", "bool_and/bool_or/bit_and/bit_or"),
+            ("SUM(weight)", "float and interval SUM/AVG"),
+            ("AVG(wait)", "float and interval SUM/AVG"),
+            ("ARRAY_AGG(note)", "array_agg/string_agg/jsonb_agg"),
+            ("STRING_AGG(note, ',')", "array_agg/string_agg/jsonb_agg"),
             // Inside a composed field too.
-            ("COUNT(*) + MAX(qty)", "MIN/MAX", 1117),
+            ("COUNT(*) + MAX(qty)", "MIN/MAX"),
         ] {
             match check(&format!("{call} AS v")) {
                 Err(ValidationError::DeferredAggregate {
-                    family: got_family,
-                    issue: got_issue,
-                    ..
-                }) => assert_eq!((got_family, got_issue), (family, issue), "{call}"),
+                    family: got_family, ..
+                }) => assert_eq!(got_family, family, "{call}"),
                 other => panic!("{call}: expected DeferredAggregate, got {other:?}"),
             }
         }
@@ -5062,7 +5028,10 @@ mod tests {
         assert!(
             matches!(
                 grouped("(weight + weight) AS w2, SUM(w2) AS s"),
-                Err(ValidationError::DeferredAggregate { issue: 1119, .. })
+                Err(ValidationError::DeferredAggregate {
+                    family: "float and interval SUM/AVG",
+                    ..
+                })
             ),
             "a float calculated field's SUM"
         );
@@ -5359,7 +5328,10 @@ mod tests {
         // A deferred aggregate is refused inside a composition too.
         assert!(matches!(
             refused("COALESCE(MIN(items.qty), 0) AS v"),
-            Err(ValidationError::DeferredAggregate { issue: 1117, .. })
+            Err(ValidationError::DeferredAggregate {
+                family: "MIN/MAX",
+                ..
+            })
         ));
         assert!(matches!(
             refused("SUM(items.sku) + 1 AS v"),

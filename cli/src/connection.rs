@@ -19,7 +19,7 @@ const SHORT_FLAG: &str = "-d";
 /// Deliberately position-independent — it finds the flag wherever it sits in
 /// `args` — rather than only recognizing it before or only after the
 /// subcommand name. That gives an operator the same result whether they
-/// write `trellis --database-url <URL> define <GRAMMAR>` or
+/// write `trellis --database-url <URL> apply <GRAMMAR>` or
 /// `trellis apply --database-url <URL> <GRAMMAR>`, without this crate
 /// needing a general per-subcommand flag-parsing framework: callers just run
 /// this once, on the full argv, before splitting off the subcommand name.
@@ -62,7 +62,7 @@ mod tests {
 
     #[test]
     fn absent_flag_returns_none() {
-        let mut args = vec!["define".to_string(), "TRANSFORM x FROM y".to_string()];
+        let mut args = vec!["apply".to_string(), "TRANSFORM x FROM y".to_string()];
         let original = args.clone();
         assert_eq!(extract_database_url(&mut args).unwrap(), None);
         assert_eq!(args, original);
@@ -73,25 +73,25 @@ mod tests {
         let mut args = vec![
             "--database-url".to_string(),
             "postgresql://x/y".to_string(),
-            "define".to_string(),
+            "apply".to_string(),
             "TRANSFORM x FROM y".to_string(),
         ];
         let url = extract_database_url(&mut args).unwrap();
         assert_eq!(url.as_deref(), Some("postgresql://x/y"));
-        assert_eq!(args, vec!["define", "TRANSFORM x FROM y"]);
+        assert_eq!(args, vec!["apply", "TRANSFORM x FROM y"]);
     }
 
     #[test]
     fn short_flag_after_subcommand_is_extracted() {
         let mut args = vec![
-            "define".to_string(),
+            "apply".to_string(),
             "-d".to_string(),
             "postgresql://x/y".to_string(),
             "TRANSFORM x FROM y".to_string(),
         ];
         let url = extract_database_url(&mut args).unwrap();
         assert_eq!(url.as_deref(), Some("postgresql://x/y"));
-        assert_eq!(args, vec!["define", "TRANSFORM x FROM y"]);
+        assert_eq!(args, vec!["apply", "TRANSFORM x FROM y"]);
     }
 
     #[test]
@@ -130,7 +130,7 @@ mod tests {
 
     #[test]
     fn flag_with_no_value_is_an_error() {
-        let mut args = vec!["define".to_string(), "--database-url".to_string()];
+        let mut args = vec!["apply".to_string(), "--database-url".to_string()];
         assert!(extract_database_url(&mut args).is_err());
     }
 
@@ -139,7 +139,7 @@ mod tests {
         let mut args = vec![
             "--database-url".to_string(),
             "postgresql://x/y".to_string(),
-            "define".to_string(),
+            "apply".to_string(),
             "-d".to_string(),
             "postgresql://a/b".to_string(),
             "TRANSFORM x FROM y".to_string(),

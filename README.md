@@ -1,5 +1,7 @@
 # Trellis
 
+> **0.1.0-alpha, pre-release:** the API and stored definitions may change.
+
 A declarative API for creating data transformations in PostgreSQL.
 Correctness and performance are the key design goals.
 All state managed in Postgres for simplified architecture and efficient, provably correct transforms.
@@ -25,6 +27,40 @@ change, or when read latency matters more than write throughput. It is the same
 bargain a database index makes — pay a little on write to make reads fast.
 
 Connections to Postgres use TLS when the database URL asks for it (`sslmode`, `sslrootcert`, `sslcert`, `sslkey`) and try it first when it does not; see [TLS to Postgres](docs/embedding.md#tls-to-postgres).
+
+## Install
+
+Pick the form that matches how you run it:
+
+* **The `trellis` command-line tool** for defining transforms and running the pipeline from a shell: download `trellis-v<version>-<target>.tar.gz` for your platform from the [GitHub release](https://github.com/salesforce-misc/trellis/releases) and unpack it, or build it with `cargo install --path cli` from a checkout.
+* **Rust**: the engine crate is published as `trellis-pg` (its library is `trellis`), so `trellis-pg = "<version>"` in `Cargo.toml` and `use trellis::...` in code.
+* **Elixir**: the Hex package `trellis_pg`; see [clients/elixir](clients/elixir/README.md).
+* **Ruby**: the gem `trellis-pg`; see [clients/ruby](clients/ruby/README.md).
+
+[docs/embedding.md](docs/embedding.md) is the guide to running Trellis inside an application, and [docs/releasing.md](docs/releasing.md) lists what each release ships.
+
+## A first transform
+
+Trellis runs against a PostgreSQL database and a role that can create objects in it (see [docs/recommendations.md](docs/recommendations.md) for roles and permissions). Given a source table and, for an aggregate, an index on its `GROUP BY` columns:
+
+```sql
+CREATE TABLE orders (id bigint PRIMARY KEY, customer_id bigint NOT NULL, amount numeric(12,2) NOT NULL);
+CREATE INDEX ON orders (customer_id);
+```
+
+define a transform and run the pipeline:
+
+```sh
+export TRELLIS_DATABASE_URL=postgres://user@localhost/shop
+
+trellis apply "TRANSFORM customer_totals FROM orders GROUP BY customer_id
+  SELECT customer_id AS customer_id, COUNT(*) AS order_count, SUM(amount) AS total"
+
+trellis run      # until interrupted: captures changes and keeps the target current
+trellis status   # in another shell: each definition's status, warnings and quarantined rows
+```
+
+`customer_totals` is now an ordinary table. It holds one row per customer, backfilled from the rows already in `orders`, and stays exactly equal to `SELECT customer_id, COUNT(*), SUM(amount) FROM orders GROUP BY customer_id` as `orders` changes. [docs/transforms.md](docs/transforms.md) is the reference for the grammar (1-1, aggregate and `JOIN` transforms) and for which sources and targets are supported, and [docs/known-correctness-gaps.md](docs/known-correctness-gaps.md) lists the ways a target can go stale or wrong without Trellis repairing it.
 
 ## Structure
 

@@ -17,7 +17,7 @@ Use GitHub Issues page to submit issues, enhancement requests and discuss ideas.
 
 ### Bug Reports and Fixes
 -  If you find a bug, please search for it in the [Issues](https://github.com/salesforce-misc/trellis/issues), and if it isn't already tracked,
-   [create a new issue](https://github.com/salesforce-misc/trellis/issues/new). Fill out the "Bug Report" section of the issue template. Even if an Issue is closed, feel free to comment and add details, it will still
+   [create a new issue](https://github.com/salesforce-misc/trellis/issues/new). Describe what you ran, what you expected and what happened, with the Trellis and PostgreSQL versions. Even if an Issue is closed, feel free to comment and add details, it will still
    be reviewed.
 -  Issues that have already been identified as a bug (note: able to reproduce) will be labelled `bug`.
 -  If you'd like to submit a fix for a bug, [send a Pull Request](#creating-a-pull-request) and mention the Issue number.

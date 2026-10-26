@@ -197,14 +197,14 @@ async fn a_plain_aggregate_outside_the_admitted_set_is_refused_at_define_by_fami
     columns.insert("ok".to_string(), ValueType::Boolean);
 
     for (field, want) in [
-        ("MIN(val)", Some(1117)),
-        ("MAX(grp)", Some(1117)),
-        ("BOOL_AND(ok)", Some(1118)),
-        ("ARRAY_AGG(val)", Some(1040)),
-        ("SUM(f)", Some(1119)),
-        ("AVG(f)", Some(1119)),
+        ("MIN(val)", Some("MIN/MAX")),
+        ("MAX(grp)", Some("MIN/MAX")),
+        ("BOOL_AND(ok)", Some("bool_and/bool_or/bit_and/bit_or")),
+        ("ARRAY_AGG(val)", Some("array_agg/string_agg/jsonb_agg")),
+        ("SUM(f)", Some("float and interval SUM/AVG")),
+        ("AVG(f)", Some("float and interval SUM/AVG")),
         ("SUM(n)", None),
-        ("SUM(val) + MAX(val)", Some(1117)),
+        ("SUM(val) + MAX(val)", Some("MIN/MAX")),
     ] {
         let err = install_definition(
             &db.pool,
@@ -218,11 +218,11 @@ async fn a_plain_aggregate_outside_the_admitted_set_is_refused_at_define_by_fami
         .await
         .expect_err(field);
         match want {
-            Some(issue) => assert!(
+            Some(family) => assert!(
                 matches!(
                     &err,
-                    CatalogError::Validate(ValidationError::DeferredAggregate { issue: i, .. })
-                        if *i == issue
+                    CatalogError::Validate(ValidationError::DeferredAggregate { family: f, .. })
+                        if *f == family
                 ),
                 "{field}: {err:?}"
             ),

@@ -247,7 +247,7 @@ pub fn armed() -> Option<Plant> {
             crate::instance_log::warn!(
                 plant = plant.name(),
                 "{PLANT_ENV} armed a planted ordering bug: this engine is deliberately wrong \
-                 (test-only, issue #557)"
+                 (test-only)"
             );
         }
         plant

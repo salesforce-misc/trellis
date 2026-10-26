@@ -572,7 +572,7 @@ fn thousand_leaves(kind: &str) -> String {
 }
 
 #[tokio::test]
-#[ignore = "a measurement: run with logbook reserve and a memory cap"]
+#[ignore = "a measurement: run it alone, with a memory cap"]
 async fn measure_the_sweep_at_a_thousand_hash_leaves() {
     let mut fx = measure("hash_two_missing", &thousand_leaves("hash")).await;
     measure_full_routing_form(&fx, "hash").await;
@@ -596,14 +596,14 @@ async fn measure_the_sweep_at_a_thousand_hash_leaves() {
 }
 
 #[tokio::test]
-#[ignore = "a measurement: run with logbook reserve and a memory cap"]
+#[ignore = "a measurement: run it alone, with a memory cap"]
 async fn measure_the_sweep_at_a_thousand_range_leaves() {
     let fx = measure("range", &thousand_leaves("range")).await;
     measure_full_routing_form(&fx, "range").await;
 }
 
 #[tokio::test]
-#[ignore = "a measurement: run with logbook reserve and a memory cap"]
+#[ignore = "a measurement: run it alone, with a memory cap"]
 async fn measure_the_sweep_at_a_thousand_list_leaves() {
     let fx = measure("list", &thousand_leaves("list")).await;
     measure_full_routing_form(&fx, "list").await;

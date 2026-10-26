@@ -51,7 +51,7 @@ Four rules sit behind that table, and they hold for each instance separately:
   Trellis's own tables as it starts, so a `staging: true` connect to a
   schema `migrate` hasn't created yet fails with a `not_found` error.
 * **Nothing errors when a rule is broken.** The transforms just never go
-  `live` ([the silent-stall hazard](#the-silent-stall-hazard-issue-144), and
+  `live` ([the silent-stall hazard](#the-silent-stall-hazard), and
   the health checks that catch it).
 
 In a Phoenix app, each process's handle is `{Trellis, options}` in its
@@ -283,7 +283,7 @@ The rules:
 The `ssl` column of `pg_stat_ssl` shows, per backend, whether a connection is
 encrypted: `select ssl, count(*) from pg_stat_ssl group by ssl`.
 
-## Forking (issue #600)
+## Forking
 
 Preforking servers (Puma, Unicorn, Passenger, Resque) fork after boot. The
 engine is not safe to fork while it runs: `fork()` copies memory but only
@@ -313,7 +313,7 @@ covers Unicorn, Passenger and Puma's `fork_worker`, which needs
 `before_worker_fork`/`after_worker_fork` too). The BEAM never forks,
 so the Elixir binding has nothing to enforce.
 
-## The silent-stall hazard (issue #144)
+## The silent-stall hazard
 
 This shape has one sharp edge: **if the dedicated worker process is never
 deployed, or gets scaled to zero, nothing errors.** Every `apply()` call
