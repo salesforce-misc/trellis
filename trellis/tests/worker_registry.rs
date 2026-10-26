@@ -274,7 +274,10 @@ async fn staleness_is_read_time_and_needs_no_reclaim_pass() {
     let db = cluster.create_isolated_database().await;
     let client = connect_raw(db.dsn()).await;
 
-    let ttl = Duration::from_millis(300);
+    // Far longer than any pause between the register and the first check
+    // (a loaded box can stall a test past a sub-second TTL), and the
+    // backdate below is far older than it: no assertion reads the clock.
+    let ttl = Duration::from_secs(3600);
 
     worker_registry::register_worker(&client, "dead-worker")
         .await
@@ -291,7 +294,7 @@ async fn staleness_is_read_time_and_needs_no_reclaim_pass() {
     // `trellis/tests/liveness.rs`'s own convention for `seg_claims.claimed_at`.
     client
         .execute(
-            "update worker_registry set last_seen = now() - interval '10 seconds' \
+            "update worker_registry set last_seen = now() - interval '2 hours' \
              where worker_id = 'dead-worker'",
             &[],
         )
@@ -323,7 +326,9 @@ async fn reclaim_stale_workers_deletes_only_the_stale_row() {
     let db = cluster.create_isolated_database().await;
     let client = connect_raw(db.dsn()).await;
 
-    let ttl = Duration::from_millis(300);
+    // Far longer than the pause between registering "live-worker" and the
+    // sweep, and the backdate is older still: no assertion reads the clock.
+    let ttl = Duration::from_secs(3600);
     worker_registry::register_worker(&client, "dead-worker")
         .await
         .expect("register dead-worker");
@@ -333,7 +338,7 @@ async fn reclaim_stale_workers_deletes_only_the_stale_row() {
 
     client
         .execute(
-            "update worker_registry set last_seen = now() - interval '10 seconds' \
+            "update worker_registry set last_seen = now() - interval '2 hours' \
              where worker_id = 'dead-worker'",
             &[],
         )
