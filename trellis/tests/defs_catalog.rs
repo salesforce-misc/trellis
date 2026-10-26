@@ -914,8 +914,7 @@ async fn a_target_table_colliding_on_bare_suffix_under_a_different_schema_is_rej
 }
 
 /// Reviewer follow-up to issue #73's own follow-up
-/// (`transform_definitions_target_suffix_idx`,
-/// `V23__transform_definitions_target_suffix_idx.sql`): the TOCTOU race the
+/// (`transform_definitions_target_suffix_idx`): the TOCTOU race the
 /// index exists to close, reproduced for real rather than merely asserted by
 /// inspection. `create_definition_inner`'s pre-check
 /// (`a_target_table_colliding_on_bare_suffix_under_a_different_schema_is_rejected`

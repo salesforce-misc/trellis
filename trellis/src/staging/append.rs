@@ -48,7 +48,7 @@ impl CdcOp {
 
 /// The sentinel key every [`StagedChange::Truncate`] row carries — a
 /// truncate is whole-keyspace, not keyed to any one row, but the ring's schema
-/// requires a `key` on every row (`V3__staging_ring.sql`'s `not null`), and the
+/// requires a `key` on every row (the ring tables' `not null`), and the
 /// fold groups by `(src_table, key)`. Prefixed with U+001F (INFORMATION
 /// SEPARATOR ONE) — not a NUL byte: Postgres `text` cannot store an embedded
 /// NUL at all (it's a null-terminated C string internally; the wire protocol
@@ -316,7 +316,7 @@ pub async fn active_ring_slot(client: &impl GenericClient) -> Result<i16, Stagin
         )
         .await?
         .get(0);
-    // `V53__ring_slot_mirror.sql` initialises the sequence with
+    // The staging-ring migration initialises the sequence with
     // `is_called = true`, so `pg_sequence_last_value` is never NULL; a NULL
     // here means that invariant broke, not "slot 0".
     ring_slot.ok_or(StagingError::InvalidRingSlot(-1))
@@ -325,7 +325,7 @@ pub async fn active_ring_slot(client: &impl GenericClient) -> Result<i16, Stagin
 /// Appends `changes` into the active ring segment as a single blind
 /// multi-row `INSERT` — no `ON CONFLICT`, no merge, one row per change.
 /// `row_txid`, `appended_at`, and `route` come from the tables' own
-/// defaults/generated expression (see `V3__staging_ring.sql`), so every
+/// defaults/generated expression (see the staging-ring migration), so every
 /// producer computes them identically.
 ///
 /// Takes an already-open `Transaction` so the pointer read and the insert

@@ -69,7 +69,7 @@
 //! still applies uniformly regardless of whether a colliding target arrived
 //! via explicit qualification or bare resolution. This is now double-enforced,
 //! not merely application-level: `transform_definitions_target_suffix_idx`
-//! (`V23__transform_definitions_target_suffix_idx.sql`) is a real Postgres
+//! is a real Postgres
 //! expression unique index on `split_part(target_table, '.', 2)`, the same
 //! DB-level backstop `target_table`'s own `unique` constraint already is for
 //! exact-qualified-name collisions — it closes the race two concurrent
@@ -218,7 +218,7 @@ pub enum CatalogError {
     /// `Config::target_schema` changing between deploys and a `TRANSFORM
     /// ... TARGET foo` being redeclared under it. Issue #73 made
     /// `transform_definitions.target_table` store the qualified spelling, so
-    /// `target_table text not null unique` (`V2__transform_catalog.sql`)
+    /// `target_table text not null unique` (the catalog migration)
     /// only enforces uniqueness of *that* spelling now, not the bare suffix
     /// it used to store outright — checked and rejected here, in
     /// `create_definition_inner`, rather than at any individual read site,
@@ -239,7 +239,7 @@ pub enum CatalogError {
     /// transaction's snapshot, so two concurrent `create_definition` calls
     /// resolving different-schema targets for the same bare suffix could
     /// each pass it and both commit. `transform_definitions_target_suffix_idx`
-    /// (`V23__transform_definitions_target_suffix_idx.sql`) is the real
+    /// is the real
     /// DB-level guard that closes that race; `create_definition_inner`
     /// catches the rare insert-time unique-violation against it and
     /// translates it into this same variant (with `existing: None` — see the
@@ -263,7 +263,7 @@ pub enum CatalogError {
     /// still visible in this transaction's own snapshot, so its qualified
     /// spelling can be reported) and a genuine insert-time race against
     /// `transform_definitions_target_suffix_idx`
-    /// (`V23__transform_definitions_target_suffix_idx.sql`, `existing: None`
+    /// (`existing: None`
     /// — a concurrent transaction's insert that the pre-check's snapshot
     /// couldn't see committed first, so by the time this transaction's own
     /// insert fails on the index, it has no further query available inside
@@ -3109,7 +3109,7 @@ async fn create_definition_inner(
     // `qualified_target` shares a bare table-name suffix with a *different*
     // qualified spelling some other still-persisted definition already
     // uses. Before #73, `target_table` stored the bare name and its own
-    // `unique` constraint (`V2__transform_catalog.sql`) enforced this for
+    // `unique` constraint enforced this for
     // free; now that the column stores the qualified spelling, that
     // constraint only guarantees the qualified string is unique, and
     // nothing else stopped `public.foo` and `custom.foo` from coexisting
@@ -3250,7 +3250,7 @@ async fn create_definition_inner(
     let status_text = status.as_str();
 
     // Reviewer follow-up to issue #73: `transform_definitions_target_suffix_idx`
-    // (`V23__transform_definitions_target_suffix_idx.sql`) is the DB-level
+    // is the DB-level
     // backstop for the exact same invariant the pre-check above enforces
     // optimistically — it's what actually closes the race between two
     // concurrent `create_definition` calls each resolving a different-schema
@@ -3453,7 +3453,7 @@ fn is_relation_name_taken(err: &tokio_postgres::Error) -> bool {
 
 /// Whether `err` is a unique-violation against
 /// `transform_definitions_target_suffix_idx`
-/// (`V23__transform_definitions_target_suffix_idx.sql`) specifically — the
+/// specifically — the
 /// signal [`create_definition_inner`]'s final insert uses to tell "a
 /// concurrent transaction won the bare-target-suffix race the pre-check
 /// above couldn't see" apart from any other constraint violation the same

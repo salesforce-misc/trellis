@@ -1,7 +1,7 @@
 //! The edges that make build work claimable announce themselves (issue #273):
 //! an idle drain worker backs off its wake, so each change that turns the
 //! build probe from "nothing" into "something" must `NOTIFY` the work channel
-//! (migration V86's triggers) or, for a retry coming due, be scheduled by the
+//! (the work-wake triggers) or, for a retry coming due, be scheduled by the
 //! worker from the probe's `next_due`.
 //!
 //! Every test acts and then reads what the listening session was told. A

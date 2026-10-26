@@ -1974,9 +1974,7 @@ async fn evict_for(
 /// never tripped, two row-level death counters for one physical row, a fold
 /// exclusion that missed a key poisoned under the other spelling, and a
 /// per-spelling (so non-serializing) `take_fuse_gate` lock row. Every write and
-/// every read now goes through this one resolution, and
-/// `V33__quarantine_canonical_src_table.sql` folded the pre-existing bare rows
-/// into their qualified counterpart. An unresolvable spelling is the
+/// every read now goes through this one resolution. An unresolvable spelling is the
 /// deliberate exception: it keeps its raw key, which is self-consistent
 /// (nothing else can resolve it either) and exactly the pre-#283 behaviour.
 pub(super) async fn qualified_src_table(
@@ -2077,7 +2075,7 @@ impl CanonicalSrcTables {
 ///
 /// Deliberately no `RETURNING` and no maintained count: the threshold
 /// decision stays a `count(*)` over the definition's `poison` rows.
-/// `V30__transform_fuse_gate.sql` has the full rationale.
+/// The `transform_fuse_gate` table's migration has the full rationale.
 async fn take_fuse_gate(txn: &Transaction<'_>, transform_id: i64) -> Result<(), ApplyError> {
     txn.execute(
         "insert into transform_fuse_gate (transform_id, checks, last_checked_at) \
@@ -2987,7 +2985,7 @@ pub const CASCADE_COMPLETION_LOCK_TIMEOUT: std::time::Duration = std::time::Dura
 /// Whether `transform` and `column` actually exist is checked by the caller
 /// ([`crate::Trellis::apply`]), which has the catalog reads and the
 /// [`crate::TrellisError`] variants for it — `column_status` has no foreign
-/// key onto either (see `V22__column_status_drops_target_table_fkey.sql`), so
+/// key onto either (`column_status` is keyed by transform name), so
 /// this function would otherwise happily park a row naming nothing.
 #[tracing::instrument(
     name = "quarantine.pause_column",
@@ -5146,7 +5144,7 @@ struct RetypedColumn {
 /// (`staging::schema_change::pause_readers_of_retyped`), and names this
 /// resume in its `capture_failure`. Also deletes the records of a
 /// definition that's gone. Takes no lock on any definition's row (see
-/// `V76__retype_causes.sql`).
+/// the `retype_causes` table's migration).
 async fn record_retype_causes(
     txn: &Transaction<'_>,
     id: i64,
@@ -6373,10 +6371,9 @@ pub(crate) fn held_keys_from(
 ///
 /// **Known residual, deliberately not widened here:** [`canonical_and_raw`]
 /// derives the canonical name *from* the given one, so it never adds the bare
-/// suffix when handed an already-qualified spelling. A legacy bare quarantine
-/// row for a table `V33__quarantine_canonical_src_table.sql` could not fold
-/// (its bare suffix ambiguous across two schemas, or unresolvable at migration
-/// time) therefore still survives a purge keyed on the qualified ring spelling —
+/// suffix when handed an already-qualified spelling. A bare quarantine
+/// row for a table whose bare suffix is ambiguous across two schemas, or
+/// unresolvable, therefore still survives a purge keyed on the qualified ring spelling —
 /// exactly the pre-#283 behavior, since that delete was single-spelling too.
 /// Stripping to the bare suffix here would fix that only by reintroducing the
 /// ambiguity #74/ADR-0011 exists to prevent: a purge of `archive.orders` would

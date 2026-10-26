@@ -1793,7 +1793,7 @@ async fn self_check_returns_a_queued_job_and_the_result_is_readable_once_a_worke
 
 /// An idle `self_check` worker waits out its poll floor (here 30 s, with the
 /// cap above it), so a job queued meanwhile is run by the wake the database
-/// sends when the row is inserted (migration V90, #1075), not by the clock.
+/// sends when the row is inserted (#1075), not by the clock.
 /// The only wait is for the worker's `LISTEN` to be in place, which the test
 /// reads from the server, and then for the job it queued.
 #[tokio::test]

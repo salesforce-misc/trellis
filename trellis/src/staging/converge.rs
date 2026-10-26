@@ -31,7 +31,7 @@
 //! see, not the slot, so a straddler or a phase-gap writer
 //! (docs/staging-and-claiming/03-sealing-and-the-fence.md) can each land in
 //! the slot outside it and produce a false `converged`. Nothing in
-//! `segments` (see `V3__staging_ring.sql`) even carries those two columns
+//! `segments` even carries those two columns
 //! today — they are vestigial in the doc, not a real surface to restore a
 //! reader for. Condition 3 below asks the slot directly instead.
 

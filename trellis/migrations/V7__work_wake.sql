@@ -1,19 +1,17 @@
--- The edges that make build work claimable, announced by the database (#273).
---
--- An idle drain worker backs off its wake (`ClientOptions::idle_wake_cap`),
--- so every change that can make the build probe (`staging::build::work_probe`)
--- go from "nothing" to "something" must wake it. Seals, discharges and applies
--- already send a NOTIFY; the build work's edges are rows changing, from many
--- code paths (a plan job, a retry, a release, a reclaim sweep, a definition
--- moving to `backfilling`), so triggers announce them by construction: a new
--- path that makes a chunk claimable cannot forget to.
+-- Work-wake edges: the database announces every change that can make work
+-- claimable, so an idle worker, which backs its wake off, is woken by
+-- construction rather than by every code path remembering to send a NOTIFY.
+-- Seals, discharges and applies send their own NOTIFY; the build work's edges
+-- are rows changing, from many code paths (a plan job, a retry, a release, a
+-- reclaim sweep, a definition moving to a dispatchable status), and a queued
+-- self-check job is one more.
 --
 -- The channel is `<catalog schema>_work`, cut to Postgres's 63-byte limit by
--- whole characters (a longer schema name shares a channel with its cut
--- twin, which only costs the twin a spurious wake). It is baked into the
--- functions as a literal because a trigger runs under its writer's
--- `search_path`, and `work_wake_channel()` hands it to the workers that
--- `LISTEN` on it, so SQL is the one place the name is computed.
+-- whole characters (a longer schema name shares a channel with its cut twin,
+-- which only costs the twin a spurious wake). It is baked into the functions
+-- as a literal because a trigger runs under its writer's `search_path`, and
+-- `work_wake_channel()` hands it to the workers that `LISTEN` on it, so SQL
+-- is the one place the name is computed.
 do $migration$
 declare
     base text := current_schema();
@@ -66,16 +64,41 @@ create trigger announce_chunk_update
         or old.fields is distinct from new.fields))
     execute function announce_chunk_work();
 
--- A definition entering (or changing within) the states a build runs in.
+-- A definition entering (or changing within) a status the chunk claim hands
+-- work in (`TransformStatus::dispatchable()`): a resume or an unfreeze makes
+-- its existing chunks claimable without touching a chunk row.
 create trigger announce_definition_insert
     after insert on transform_definitions
     for each row
-    when (new.status in ('backfilling', 'catching_up'))
+    when (new.status in ('waiting_to_backfill', 'backfilling', 'catching_up', 'live'))
     execute function announce_definition_work();
 
 create trigger announce_definition_update
     after update on transform_definitions
     for each row
-    when (new.status in ('backfilling', 'catching_up')
+    when (new.status in ('waiting_to_backfill', 'backfilling', 'catching_up', 'live')
           and (old.status is distinct from new.status or old.build is distinct from new.build))
     execute function announce_definition_work();
+
+-- A queued `self_check` job announces itself: the one edge that makes a job
+-- claimable at once is a row entering `queued`. A job a dead worker left
+-- `running` becomes claimable by the clock, not by a write, and is found
+-- within the idle backoff cap past its reclaim TTL. It sends on the work
+-- channel above, with the name baked in as a literal for the same reason.
+do $migration$
+begin
+    execute format($f$
+        create function announce_self_check_work() returns trigger language plpgsql as $body$
+        begin
+            perform pg_notify(%L, '');
+            return null;
+        end
+        $body$$f$, work_wake_channel());
+end
+$migration$;
+
+create trigger announce_self_check_insert
+    after insert on self_check_jobs
+    for each row
+    when (new.state = 'queued')
+    execute function announce_self_check_work();

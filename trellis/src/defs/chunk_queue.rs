@@ -3,7 +3,7 @@
 //! `docs/decisions/0008-public-api-design.md`'s decision 1).
 //!
 //! A Re-derive build (`staging::build`) is a plan job, chunks and a sweep job,
-//! each a row of the `backfill_chunks` table (`V20__backfill_chunks.sql`).
+//! each a row of the `backfill_chunks` table.
 //! [`claim_chunks_of`]/[`reclaim_stale_chunks`]/[`fail_chunk`] mirror
 //! `staging::claim`/`staging::liveness`'s claim/reclaim-stale/release-on-error
 //! idiom for sealed ring segments, collapsed onto one table (a chunk, unlike a
@@ -213,7 +213,7 @@ pub enum ChunkWork {
 }
 
 impl ChunkWork {
-    /// The `backfill_chunks.kind` word of this work (V64).
+    /// The `backfill_chunks.kind` word of this work.
     #[cfg(any(test, feature = "internals"))]
     pub fn kind(&self) -> &'static str {
         match self {

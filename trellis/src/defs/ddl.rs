@@ -13,7 +13,7 @@
 //! "calculated columns live on a neighbor table" rule: writing them onto the
 //! captured source row would feed our own writes back into capture). No extra
 //! prefix/suffix is added to `def.target` because `transform_definitions.target_table`
-//! is already `unique` (see `V2__transform_catalog.sql`), so collisions
+//! is already `unique` (see the catalog migration), so collisions
 //! across definitions are already ruled out at the catalog layer; deriving
 //! a *different* name from it would just be a second name to keep in sync
 //! for no benefit. That catalog constraint is global across every target

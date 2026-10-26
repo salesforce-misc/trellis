@@ -2153,8 +2153,8 @@ impl CaptureFailureKind {
         }
     }
 
-    /// The kind `capture_failures.kind` stores. Its check constraint (V70,
-    /// V104) admits only these.
+    /// The kind `capture_failures.kind` stores. Its check constraint admits
+    /// only these.
     fn from_persisted(kind: &str) -> Self {
         match kind {
             "halt" => CaptureFailureKind::Halt,

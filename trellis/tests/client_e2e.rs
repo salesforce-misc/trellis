@@ -1092,8 +1092,8 @@ async fn a_running_client_backfills_a_reclaimed_composite_key_chunk() {
 /// makes work claimable must wake it. Here every wait a drain worker can
 /// make (`poll_interval`, `idle_wake_cap`) is an hour, far past this test's
 /// budget, so the build and the drain move only on notifications: a seal's,
-/// an apply's, and the database's own on the work channel
-/// (migration V86). A new aggregate is built by its plan job and goes
+/// an apply's, and the database's own on the work channel.
+/// A new aggregate is built by its plan job and goes
 /// `live`, then a source insert and update drain into it. An edge nothing announces stalls the test until
 /// its budget runs out.
 #[tokio::test]

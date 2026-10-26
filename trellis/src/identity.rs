@@ -9,7 +9,7 @@
 //! 1. **Fresh (or mid-migration on our own behalf).** The schema doesn't
 //!    exist yet, exists but is empty, or exists with Trellis's own
 //!    migration ledger (`refinery_schema_history`) but no marker yet — the
-//!    last of these is a crash between the runner creating V9's table and
+//!    last of these is a crash between the runner creating the marker table and
 //!    [`seed_marker`] committing, and must be exactly as attachable as a
 //!    fresh schema, or a crashed first-ever migrate would permanently lock
 //!    itself out. Ours to take/resume.
@@ -101,14 +101,14 @@ impl std::fmt::Display for Identity {
 /// 1. The catalog schema may not be `public`.
 /// 2. It may not be this instance's own target schema.
 /// 3. The target schema may not hold another instance's catalog (a
-///    `trellis_instance` table, V9).
+///    `trellis_instance` table).
 /// 4. The catalog schema may not be another instance's target schema (its
-///    marker's `target_schema`, V83).
+///    marker's `target_schema`).
 ///
 /// Rules 1 and 2 read only the [`Config`]; 3 and 4 scan the database's
 /// markers, so the caller holds the [`AttachLock`] while it runs. A marker
-/// this role cannot read is not seen by rule 4, and a marker written before
-/// V83 has no target schema; both are blind spots, not refusals.
+/// this role cannot read is not seen by rule 4, and a marker with no target
+/// schema is not either; both are blind spots, not refusals.
 pub(crate) async fn prepare_attach(
     client: &mut tokio_postgres::Client,
     config: &Config,
@@ -149,8 +149,8 @@ pub(crate) async fn prepare_attach(
         None => {
             // No marker yet doesn't necessarily mean "foreign": it's also
             // the state of a schema that's ours but mid-migration (crashed
-            // between the runner creating V9's table and `seed_marker`
-            // committing — or, before V9 even ran, between an earlier
+            // between the runner creating the marker table and `seed_marker`
+            // committing — or, before that migration ran, between an earlier
             // migration committing and the crash). `refinery_schema_history`
             // is refinery's own ledger table, created by the very first
             // migration it applies, so its presence is a reliable signal
@@ -270,8 +270,8 @@ async fn refuse_conflicting_instances(
 struct OtherInstance {
     /// The schema holding its `trellis_instance` table: its catalog schema.
     catalog_schema: String,
-    /// The target schema its marker records. `None` if the marker predates
-    /// V83, is not written yet, or this role cannot read it.
+    /// The target schema its marker records. `None` if the marker has none,
+    /// is not written yet, or this role cannot read it.
     target_schema: Option<String>,
 }
 

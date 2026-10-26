@@ -17,6 +17,14 @@
 //! whether attaching to it is safe at all — see that module for what
 //! "safe" means.
 //!
+//! # Numbering and editing
+//!
+//! Versions are contiguous from 1 (a test checks the ledger against the files).
+//! A migration that has shipped is never edited; a schema change is a new file
+//! at the next version. Before the first release the files were compacted into
+//! topic migrations, so a catalog schema created earlier is recreated rather
+//! than migrated.
+//!
 //! # Rebuilding a catalog table
 //!
 //! A migration must never rebuild `partition_sources`, `capture_baselines` or

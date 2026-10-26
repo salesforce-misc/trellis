@@ -47,7 +47,7 @@ unvalidated name.
 A shared name doesn't prove two attaches are the same instance — the schema
 could have been recreated, restored under the wrong name, or never been
 Trellis's. So each instance writes a single-row identity marker,
-`trellis_instance` (migration V9), recording its schema name and an
+`trellis_instance`, recording its schema name and an
 `instance_format_version` (`trellis::identity::INSTANCE_FORMAT_VERSION`).
 
 Before the migration runner touches the schema, `trellis::identity::prepare_attach`
@@ -92,7 +92,7 @@ Each refusal is an `Error::IncompatibleInstance` naming the schema and, for 3
 and 4, the other instance's catalog schema. The first two read only the
 `Config`. The others scan the database for `trellis_instance` tables outside
 the instance's own schema. Rule 4 needs the other instance's target schema, so
-the marker records it (`trellis_instance.target_schema`, migration V83) and
+the marker records it (`trellis_instance.target_schema`) and
 `seed_marker` rewrites it on every attach. The target schema is configuration
 that can change between deploys, so a changed value updates the marker; it
 never refuses. The scan skips the instance's own marker, so a second client of
@@ -100,7 +100,7 @@ the same instance, whose marker matches, attaches as it always has. Whichever
 of two conflicting instances attaches second is the one refused.
 
 The scan sees a marker only if the role attaching can read it, and an
-instance's marker only once that instance has attached at V83 or later. A role
+instance's marker only once that instance has attached and recorded its target schema. A role
 without `USAGE` on another instance's schema still sees rule 3 (the table
 exists), but not rule 4. Rule 3 and rule 4 compare the catalog schema with
 `Config::target_schema` only. A schema-qualified target (`TRANSFORM other_schema.t`)

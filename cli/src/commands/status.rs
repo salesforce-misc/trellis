@@ -30,7 +30,7 @@
 //!
 //! [`Trellis::poisoned_since`] *is* surfaced here, called with `UNIX_EPOCH`
 //! as the watermark. Despite its name suggesting a point-in-time delta, the
-//! underlying `poison` table (see `trellis/migrations/V71__poison_per_transform.sql`
+//! underlying `poison` table (see the quarantine migration under `trellis/migrations`
 //! and `trellis::staging::quarantine`) is a live marker of which
 //! `(src_table, key)` pairs are *currently* held for which definition, not an append-only
 //! log — rows are deleted on release, not just inserted on poison. So

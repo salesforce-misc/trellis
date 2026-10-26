@@ -7,7 +7,7 @@
 //! Transaction-id family: the modern `pg_snapshot`/`xid8` family throughout
 //! (`pg_current_xact_id()`, `pg_current_snapshot()`,
 //! `pg_visible_in_snapshot`), matching `row_txid`'s and `fence_snapshot`'s
-//! column types (see `V3__staging_ring.sql`) — not the legacy `txid_*`
+//! column types (see the staging-ring migration) — not the legacy `txid_*`
 //! family the design doc's SQL literally shows. tokio-postgres has no
 //! `FromSql`/`ToSql` for `xid8`/`pg_snapshot`, so every value crosses the
 //! wire as text (`::text` out, `::text::xid8`/`::text::pg_snapshot` back
@@ -572,7 +572,7 @@ pub async fn seal_if_active_nonempty(
 /// Best-effort, single-column `ANALYZE (origin_lsn)` on a slot that just
 /// stopped growing (docs/staging-and-claiming/07-convergence-and-await.md,
 /// "Making the honest question cheap"): ring tables carry
-/// `autovacuum_enabled = off` (`V3__staging_ring.sql`), which also disables
+/// `autovacuum_enabled = off` (set by the staging-ring migration), which also disables
 /// autoANALYZE, so condition 3 of the convergence predicate
 /// (`trellis::staging::converge::converged_through`) would otherwise pick a
 /// sequential scan at every table size, forever, with no threshold it ever

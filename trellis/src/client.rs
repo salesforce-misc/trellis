@@ -2161,7 +2161,7 @@ impl IdleBackoff {
 /// `poll_interval`, doubling up to `idle_wake_cap`, and starting over on
 /// work and whenever the wake listener changes state. A queued job ends the
 /// wait by itself: a `self_check` call inserts the row and the database
-/// announces it on the work channel (migration V90). Only a job a dead
+/// announces it on the work channel. Only a job a dead
 /// worker left `running` is found by the clock, within the cap past its
 /// reclaim TTL. Its listener hears the work channel alone: a seal or an
 /// apply never makes a job claimable, and under steady writes they would
@@ -2502,7 +2502,7 @@ struct WakeListener {
 
 impl WakeListener {
     /// Hears the engine's `channel` (seals, applies) and the
-    /// database's work channel (migration V86).
+    /// database's work channel.
     fn spawn(dsn: String, schema: String, channel: String) -> Self {
         Self::spawn_on(dsn, schema, Some(channel))
     }
@@ -2618,7 +2618,7 @@ async fn open_wake_session(
     });
 
     // The database announces build work on a channel of its own
-    // (`work_wake_channel()`, migration V86), beside the one the engine
+    // (`work_wake_channel()`), beside the one the engine
     // notifies.
     let listening = async {
         client

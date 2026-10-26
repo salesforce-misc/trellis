@@ -12,9 +12,7 @@ use tokio_postgres::Client;
 
 use super::error::StagingError;
 
-/// One `segments.state` value. All four are valid `segments.state` CHECK
-/// values as of `V6__origin_lsn_index_and_state_check.sql` (widened from
-/// `V3__staging_ring.sql`'s original `active`/`sealed`-only constraint).
+/// One `segments.state` value. All four are valid `segments.state` CHECK values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SegmentState {
     Active,

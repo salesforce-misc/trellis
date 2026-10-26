@@ -1576,7 +1576,7 @@ async fn backends_waiting_on_a_lock(client: &Client) -> i64 {
 /// both counts came back `threshold - 1`, neither tripped, and the transform
 /// stayed live past its fuse point — indefinitely, unless some later,
 /// unrelated eviction happened to re-run the check. `take_fuse_gate`'s
-/// per-`src_table` row lock (`V30__transform_fuse_gate.sql`) is the fix: B
+/// per-`src_table` row lock (`transform_fuse_gate`) is the fix: B
 /// cannot begin counting until A's transaction has ended, so it counts all
 /// five and trips.
 ///

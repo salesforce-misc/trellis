@@ -71,7 +71,7 @@
 //!
 //! A correction runs for each definition that reads the source (an aggregate
 //! over it, or a `JOIN` reading it as either side) as a `backfill_chunks` row
-//! of kind `correction` (V92), one per correction and definition, which the
+//! of kind `correction`, one per correction and definition, which the
 //! staging worker's pass enqueues ([`schedule`]) right after the capture pass
 //! that queued the correction. The row gives it what a
 //! build chunk has: one runner at a time (the claim), a heartbeat, the

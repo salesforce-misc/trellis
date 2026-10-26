@@ -6,6 +6,21 @@
 use testkit::TestCluster;
 use trellis::{Config, Error, Pool, migrate};
 
+/// The number of migration files embedded in the crate. The ledger holds
+/// exactly versions `1..=N`: migrations are numbered contiguously.
+fn migration_count() -> i32 {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/migrations");
+    let count = std::fs::read_dir(dir)
+        .expect("read the migrations directory")
+        .filter(|entry| {
+            let name = entry.as_ref().expect("directory entry").file_name();
+            let name = name.to_string_lossy();
+            name.starts_with('V') && name.ends_with(".sql")
+        })
+        .count();
+    i32::try_from(count).expect("migration count fits an i32")
+}
+
 /// Builds a [`Config`] for `schema` against `dsn` directly, bypassing
 /// `TRELLIS_SCHEMA`/env resolution entirely — these tests need several
 /// distinct schemas against the very same database in one process, which
@@ -261,8 +276,8 @@ async fn crash_between_migrations_and_marker_seed_recovers_cleanly() {
     migrate(&pool, &config).await.expect("initial attach");
 
     // Simulate a process death between the runner creating
-    // `trellis_instance` (V9) and `seed_marker` committing: the ledger and
-    // every other Trellis table (V1-V7) are intact, but the marker row
+    // `trellis_instance` and `seed_marker` committing: the ledger and
+    // every other Trellis table are intact, but the marker row
     // itself never made it in. This must NOT read as "foreign" (it has our
     // ledger) and must NOT error on the empty-table lookup (`read_marker`
     // uses `query_opt`, not `query_one`).
@@ -307,81 +322,10 @@ async fn crash_between_migrations_and_marker_seed_recovers_cleanly() {
         .iter()
         .map(|row| row.get(0))
         .collect();
-    // Issue #73 added V22; its reviewer follow-up added V23. Issue #74
-    // added V24. Issue #54 (epic #49) added V25 (`metric_rollup`); later
-    // removed (metric history/aggregation is left to an operator's own
-    // Prometheus stack — see docs/observability.md's "Retention" section),
-    // so V25 is not reissued to anything else.
-    // Issue #1115 removed V16, V17, V26, V27, V28, V34, V38, V46, V49, V51,
-    // V79 and V93 with the feature they served; none is reissued.
-    // Issue #160 added V29
-    // (`transform_definitions.fuse_rearmed_at`, the whole-transform fuse's
-    // re-arm point). Issue #159 added V30 (`transform_fuse_gate`, that same
-    // fuse's per-source-table serialization point). Issue #144 added V31
-    // (`worker_registry`, one row per live drain worker). Issue #191
-    // removed V8 (`pause_leases`, the fleet-wide claiming-pause lease that
-    // ADR-0013's `Trellis::self_check` never ended up needing), so V8 is
-    // not reissued to anything else either. Issue #142 (ADR-0014) added V32
-    // (`paused` joins `transform_definitions.status`'s check constraint —
-    // the operator-driven half of the pause state whose other half is the
-    // poison fuse's `quarantined`). Issue #283 added V33 (folds pre-existing
-    // bare-spelled quarantine rows into their qualified counterpart, now that
-    // every counter/marker table keys on one canonical identity per logical
-    // source table). Issues #241/#242 (ADR-0015) added V35
-    // (`transform_definitions.definition_version`, the monotonic
-    // per-definition edit counter `ALTER TRANSFORM` bumps). Issue #310 added
-    // V36 (`slot_loss_pauses`, which transforms a lost slot paused).
-    // Issue #315 added V37 (a `recompute` ring row may carry a prior-image
-    // hint in `old_image`). Issues #311/#367 added V39
-    // (`pending_backfill.generation`, so a discharge deletes only the marker
-    // generation it read).
-    // Issue #321 added V40 (`aggregate_extinct_horizon`, the per-target
-    // extinct horizon for aggregate recompute basis checks). Issue #379 added
-    // V41, later removed by issue #435. Issue #418 added
-    // V42 (`backfill_chunks.fuse_rearmed_at`, which tells a chunk planned
-    // before a resume apart from one planned for the rebuild). Issue #407
-    // added V43 (`pending_backfill`'s retry state). Issue #419 added V44
-    // (`backfill_chunks`' unbounded direct-build job rows). Issue #431
-    // added V45 (`pending_backfill.fence_xid`, null until the discharge
-    // fences the marker). Issue #476 added V47
-    // (the `catching_up` transform status). Issues #468/#485 added V48
-    // (drops V18's `backfill_coverage`). Issue #420 added V50 (drops
-    // `pending_backfill.added_at`, which nothing read). Issue #595 added V53
-    // (`ring_slot_mirror`); V52 is left free for an experiment branch. Issue
-    // #620 added V54 (`segments.row_count` and `drain_cursor`, bounded
-    // drain paging). Issue #622 added V55 (`pending_backfill
-    // .capture_gate_lsn`) and V56 (`column_status.awaiting_capture`). Issue
-    // #623 D3 added V57 (`ledger_truncate_floor`), #622 C6 V58
-    // (`capture_failures`, the `schema_changed` ring op), and #622 C8 V59
-    // (drops `replication_progress` and `slot_loss_pauses`). Issue #687
-    // added V60 (`capture_failures.error` and `capture_holdups`). #625 F4
-    // added V63 (`backfill_chunks`' failure record, #616), and F2 V64 (the
-    // Re-derive build's chunk kinds and `build` column); V61 and V62 are
-    // left free for the other lane's #623 work. #623 D5 added V65 (drops
-    // V40's `aggregate_extinct_horizon`), #625 F8b V67
-    // (`backfill_chunks.fields`, a field build's scope), #733 V68
-    // (`transform_definitions.build_seg`, the segment a Re-derive build
-    // started in). V66 is unused. #769 added V69
-    // (`backfill_chunks.key_collations`), #663 V70
-    // (`capture_failures.kind`), #799 V71 (whole-key poison per
-    // transform), #760 V72 (`definition_key_types`), #824 V74
-    // (`poison.sqlstate`, `retype_releases`), #817 V75 (`drain_holdups`),
-    // #828 V76 (`retype_causes`, `capture_failures.caused_by`), #912 V77
-    // (`column_status.cascade_pending`), #803 V78 (one `poison_held` row
-    // per held key), #938 V80 (`transform_definitions.build_marker_generation`), #625 F6
-    // V81 (`backfill_chunks.fence_xid`, a seam-fed build's fence), #894
-    // V82 (`resume_requests.timeout_cancels`), and #877 V83
-    // (`trellis_instance.target_schema`), #1023 V84 (`self_check_jobs`), #864 V85 (`grammar_version`), #273 V86 (the work-wake triggers), #1047 V87 (they also announce a definition entering `waiting_to_backfill` or `live`), #1061 V88 (`partition_sources`, `partition_corrections`), #861 V89 (`retry_attempts` on `poison` and `key_deaths`), #1075 V90 (a queued `self_check` job announces itself), #1062 V91 (`partition_correction_progress`, `partition_corrections.node_default` and `parent_oid`), #1062 V92 (`backfill_chunks.correction_id`, the `correction` chunk kind), #1064 V94 (the `truncated` correction kind), #1066 V95 (the `complement` correction kind), #1067 V96 (`partition_sources.system_identifier`), #1099 V97 (the ring's `transition_images`), #1107 V98 (`transform_definitions.join_table` and `join_columns`), #703 V99 (`capture_baselines`), #1102 V100 (`poison_held.agg_groups`), #1151 V101 (`partition_corrections_once` becomes a non-unique lookup index), #1067 V102 (`partition_sources.catalog_oid`), #707 V103 (`capture_triggers`), #1181 V104 (the `disruption` failure kind), #1200 V105 (`capture_triggers.node_oid`), #1205 V106 (`capture_failures.restored`), #1219 V107 (`segments.late_rows`), #1242 V108 (`definition_types`), #1241 V109 (`definition_enum_values`, `capture_failures.relabel_lsn`), #1306 V110 (`upstream_releases`), and #625 V112 (drops `pending_backfill` and `build_marker_generation`, adds `capture_gates`, and removes the old build's chunk kinds).
-    // V73 is unused.
     assert_eq!(
         applied,
-        vec![
-            1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 18, 19, 20, 21, 22, 23, 24, 29, 30, 31,
-            32, 33, 35, 36, 37, 39, 40, 42, 43, 44, 45, 47, 48, 50, 53, 54, 55, 56, 57, 58, 59, 60,
-            63, 64, 65, 67, 68, 69, 70, 71, 72, 74, 75, 76, 77, 78, 80, 81, 82, 83, 84, 85, 86, 87,
-            88, 89, 90, 91, 92, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107,
-            108, 109, 110, 112,
-        ]
+        (1..=migration_count()).collect::<Vec<i32>>(),
+        "recovery re-applies no migration and applies none twice"
     );
 }
 

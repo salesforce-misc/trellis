@@ -28,8 +28,7 @@
 //! 2. **It does not delete shared state.** A drop removes the target's data —
 //!    always, there is no keep-the-rows option — and otherwise only what the
 //!    *target* owns: its `transform_definitions` row (whose `on delete
-//!    cascade` takes `backfill_chunks` with it,
-//!    `V20__backfill_chunks.sql`), the edges leading *into* its schema node,
+//!    cascade` takes `backfill_chunks` with it), the edges leading *into* its schema node,
 //!    and its per-column quarantine bookkeeping (`column_status`,
 //!    `column_deaths`, `column_failures`, `column_pause_cascades`). Its
 //!    whole-key quarantine (`poison`, `poison_held`, `key_deaths` and its
@@ -595,9 +594,8 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
     // per-column quarantine bookkeeping goes with the data it describes —
     // its forensic value is about rows that are about to stop existing (or
     // stop being maintained). These four tables are bare-transform-keyed
-    // (`V22__column_status_drops_target_table_fkey.sql` explains why they
-    // are not FK'd, and therefore why this has to be an explicit delete
-    // rather than a cascade).
+    // (they are not FK'd, so this has to be an explicit delete rather than a
+    // cascade).
     //
     // The whole-key quarantine (`poison`, `poison_held`, `key_deaths`,
     // `transform_fuse_gate`) is keyed by the definition's id since #799, and
@@ -618,7 +616,7 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
     .await?;
 
     // `backfill_chunks` rides this out on its `on delete cascade`
-    // (`V20__backfill_chunks.sql`) — per-definition work, keyed to the
+    // — per-definition work, keyed to the
     // definition, removed with it. A chunk another worker holds right now is
     // deleted here too, but that is safe by construction: `finish_chunk`
     // locks its `transform_definitions` row and raises

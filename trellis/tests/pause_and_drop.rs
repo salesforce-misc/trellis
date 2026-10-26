@@ -373,7 +373,7 @@ async fn resume_rebuilds_by_backfill_and_a_paused_definition_never_pins_the_ring
     // of the ring fails it outright. The retention bookkeeping is then
     // asserted directly: a segment sits in `sealed`/`draining` until every
     // bucket of it has been applied-and-marked-drained
-    // (`segments.drained_mask`, `V10__drained_mask.sql`), and `seg_claims`
+    // (`segments.drained_mask`), and `seg_claims`
     // holds a row for every bucket a worker still owns. If a paused
     // definition's share were held open for its eventual resume — the thing
     // ADR-0014's "Resume reconciles with source, not by catch-up" section rules
