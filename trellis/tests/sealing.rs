@@ -993,20 +993,40 @@ async fn a_raced_seal_backs_off_instead_of_double_sealing() {
         seal::seal_phase1(&mut client_b),
     );
 
+    // The loser backs off with `Raced` when it plans from the same pointer the
+    // winner did. When the winner's whole flip commits between the loser's
+    // statements (READ COMMITTED takes a fresh snapshot per statement) it
+    // sees the winner's new segment instead and backs off with `RingFull` (the
+    // slot is taken) or `SealGateBlocked` (the new segment's predecessor has
+    // no published fence yet). These are the back-off outcomes `seal_phase1`
+    // documents; the invariant is one win and one seal.
     let outcomes = [result_a, result_b];
     let wins = outcomes.iter().filter(|r| r.is_ok()).count();
-    let races = outcomes
+    let backoffs = outcomes
         .iter()
-        .filter(|r| matches!(r, Err(StagingError::Raced)))
+        .filter(|r| {
+            matches!(
+                r,
+                Err(StagingError::Raced
+                    | StagingError::RingFull { .. }
+                    | StagingError::SealGateBlocked)
+            )
+        })
         .count();
     assert_eq!(
         wins, 1,
         "exactly one racer should win the seal: {outcomes:?}"
     );
     assert_eq!(
-        races, 1,
-        "exactly one racer should back off with Raced: {outcomes:?}"
+        backoffs, 1,
+        "exactly one racer should back off: {outcomes:?}"
     );
+    let sealed: i64 = client_a
+        .query_one("select count(*) from segments where state = 'sealed'", &[])
+        .await
+        .expect("count sealed segments")
+        .get(0);
+    assert_eq!(sealed, 1, "exactly one segment sealed: {outcomes:?}");
 }
 
 #[tokio::test]
