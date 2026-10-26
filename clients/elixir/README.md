@@ -13,7 +13,7 @@ The Hex package is `trellis_pg` (Hex's `trellis` is taken); the modules are
 
 ```elixir
 def deps do
-  [{:trellis_pg, "~> 0.1.0"}]
+  [{:trellis_pg, "0.1.0-alpha"}]
 end
 ```
 

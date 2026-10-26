@@ -4,7 +4,7 @@ defmodule Trellis.MixProject do
   # Kept equal to the NIF crate's version (native/trellis_nif/Cargo.toml).
   # The precompiled NIFs are downloaded from the `v<version>` GitHub
   # release; see Trellis.Native and docs/releasing.md.
-  @version "0.1.0"
+  @version "0.1.0-alpha"
   @source_url "https://github.com/salesforce-misc/trellis"
 
   def project do
