@@ -5,9 +5,29 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+// Every certificate carries explicit extensions. Without any, `openssl x509
+// -req` writes an X.509 version 1 certificate on OpenSSL 3.0 (rustls rejects
+// those), while newer releases add extensions on their own; naming them makes
+// the output the same on every version.
+
+/// A CA: may sign, and nothing else.
+const CA_EXTENSIONS: [&str; 2] = [
+    "basicConstraints=critical,CA:TRUE",
+    "keyUsage=critical,keyCertSign,cRLSign",
+];
+
 /// The server's host names: `localhost` and loopback, so `verify-full`
 /// passes against either spelling.
-const SERVER_EXTENSIONS: &str = "subjectAltName=DNS:localhost,IP:127.0.0.1\n";
+const SERVER_EXTENSIONS: [&str; 3] = [
+    "basicConstraints=critical,CA:FALSE",
+    "extendedKeyUsage=serverAuth",
+    "subjectAltName=DNS:localhost,IP:127.0.0.1",
+];
+
+const CLIENT_EXTENSIONS: [&str; 2] = [
+    "basicConstraints=critical,CA:FALSE",
+    "extendedKeyUsage=clientAuth",
+];
 
 fn openssl(dir: &Path, args: &[&str]) {
     let output = Command::new("openssl")
@@ -23,29 +43,35 @@ fn openssl(dir: &Path, args: &[&str]) {
 }
 
 fn self_signed_ca(dir: &Path, name: &str) {
-    openssl(
-        dir,
-        &[
-            "req",
-            "-x509",
-            "-newkey",
-            "ec",
-            "-pkeyopt",
-            "ec_paramgen_curve:prime256v1",
-            "-nodes",
-            "-keyout",
-            &format!("{name}.key"),
-            "-out",
-            &format!("{name}.crt"),
-            "-subj",
-            &format!("/CN=trellis-test-{name}"),
-            "-days",
-            "2",
-        ],
+    let (key, cert, subject) = (
+        format!("{name}.key"),
+        format!("{name}.crt"),
+        format!("/CN=trellis-test-{name}"),
     );
+    let mut args = vec![
+        "req",
+        "-x509",
+        "-newkey",
+        "ec",
+        "-pkeyopt",
+        "ec_paramgen_curve:prime256v1",
+        "-nodes",
+        "-keyout",
+        &key,
+        "-out",
+        &cert,
+        "-subj",
+        &subject,
+        "-days",
+        "2",
+    ];
+    for extension in CA_EXTENSIONS {
+        args.extend(["-addext", extension]);
+    }
+    openssl(dir, &args);
 }
 
-fn signed_by_ca(dir: &Path, name: &str, common_name: &str, extensions: Option<&str>) {
+fn signed_by_ca(dir: &Path, name: &str, common_name: &str, extensions: &[&str]) {
     openssl(
         dir,
         &[
@@ -81,10 +107,8 @@ fn signed_by_ca(dir: &Path, name: &str, common_name: &str, extensions: Option<&s
     ]
     .map(String::from)
     .to_vec();
-    if let Some(extensions) = extensions {
-        fs::write(dir.join(&ext_file), extensions).expect("write extensions");
-        args.extend(["-extfile".to_string(), ext_file]);
-    }
+    fs::write(dir.join(&ext_file), extensions.join("\n") + "\n").expect("write extensions");
+    args.extend(["-extfile".to_string(), ext_file]);
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     openssl(dir, &args);
 }
@@ -98,8 +122,8 @@ pub fn write_material(dir: &Path) {
     fs::create_dir_all(dir).expect("create tls dir");
     self_signed_ca(dir, "ca");
     self_signed_ca(dir, "other-ca");
-    signed_by_ca(dir, "server", "localhost", Some(SERVER_EXTENSIONS));
-    signed_by_ca(dir, "client", "postgres", None);
+    signed_by_ca(dir, "server", "localhost", &SERVER_EXTENSIONS);
+    signed_by_ca(dir, "client", "postgres", &CLIENT_EXTENSIONS);
     // Postgres refuses a key file that others can read.
     #[cfg(unix)]
     {
