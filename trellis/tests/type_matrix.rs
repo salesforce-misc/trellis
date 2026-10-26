@@ -1055,7 +1055,7 @@ async fn a_chained_sum_over_a_targets_numeric_copy_is_refused_by_name() {
             .expect_err("a chained SUM/AVG over a target's numeric")
             .to_string();
         assert!(
-            error.contains("#1120") && error.contains("a table Trellis creates"),
+            error.contains("docs/transforms.md") && error.contains("a table Trellis creates"),
             "{chained}: {error}"
         );
     }

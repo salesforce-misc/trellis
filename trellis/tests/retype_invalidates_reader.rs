@@ -570,7 +570,10 @@ async fn a_source_retype_to_a_float_pauses_its_sum_reader_and_the_resume_refuses
     assert_eq!(reported.status, TransformStatus::Paused, "{reported:?}");
 
     match trellis.apply("RESUME TRANSFORM agg").await {
-        Err(err) => assert!(err.to_string().contains("#1119"), "{err}"),
+        Err(err) => assert!(
+            err.to_string().contains("float and interval SUM/AVG"),
+            "{err}"
+        ),
         Ok(applied) => panic!("the resume should be refused: {applied:?}"),
     }
     trellis.shutdown().await.expect("shutdown");
