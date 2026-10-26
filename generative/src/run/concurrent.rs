@@ -234,6 +234,17 @@ pub async fn run_convergence_concurrent<B: ConcurrentBackend>(
 
         quiesce_snapshot_and_check(backend, pool, program, last_op, &installed, timing_enabled)
             .await?;
+        let targets: Vec<String> = installed.iter().map(|d| d.target.clone()).collect();
+        let failures = backend
+            .strict_audit(&targets)
+            .await
+            .map_err(|e| RunError::Quiesce(format!("strict audit: {e:?}")))?;
+        if !failures.is_empty() {
+            return Err(RunError::Audit {
+                burst: index,
+                failures,
+            });
+        }
     }
 
     let drain = backend

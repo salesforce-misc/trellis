@@ -48,7 +48,9 @@
 //! of up to 5 to 40 ms between its last write and its commit
 //! (`ConcurrentPlan::commit_stall`), so two pages of one key's opposite
 //! sides overlap there, where only the `J` lock orders them. Every burst is checked
-//! once it settles, and at the end every definition must still be `live`
+//! once it settles (against the oracle, then by a `Strict` `self_check` of
+//! every definition, which audits the hidden `P`/`M`/`J`/`T` tables the
+//! oracle cannot see, #1388), and at the end every definition must still be `live`
 //! (a `JOIN` that halted would otherwise only show as a stale target).
 //!
 //! Like every property in this crate it is `#[ignore]`d: run it with
@@ -85,7 +87,7 @@
 //! The fast tests below (not ignored) run one hand-built case end to end,
 //! and check that the oracle tells a corrupted target from a good one.
 
-use generative::backend::{Backend, ManualBackend};
+use generative::backend::{Backend, ConcurrentBackend, ManualBackend};
 use generative::generate::join::{
     BuildCoverage, JoinActionDraw, JoinActionKind, JoinBuildDraws, JoinCase, JoinDefSpec,
     JoinField, JoinGroups, JoinKey, JoinOpDraw, JoinOpKind, KeyShape, build_coverage, join_case,
@@ -296,6 +298,7 @@ fn run_case(case: &JoinCase) -> Result<(), String> {
             )
             .await
             .expect("connect the backend");
+            backend.set_strict_audit(true);
             let pool =
                 Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
             let shape = format!(
@@ -327,6 +330,13 @@ fn run_case(case: &JoinCase) -> Result<(), String> {
                             .map(|(target, report)| format!("target {target}:\n{report}"))
                             .collect::<Vec<_>>()
                             .join("\n")
+                    ));
+                }
+                Err(RunError::Audit { burst, failures }) => {
+                    return Err(format!(
+                        "Strict self_check found a divergence the oracle did not, after burst \
+                         {burst} ({shape}):\n{}",
+                        failures.join("\n")
                     ));
                 }
                 Err(other) => return Err(format!("run error ({shape}): {other:?}")),
@@ -592,6 +602,53 @@ fn the_join_oracle_catches_a_corrupted_target() {
                 ["j0"],
                 "{diverged:?}"
             );
+        })
+    });
+}
+
+/// #1388: the `Strict` audit tells a damaged hidden table from a good one,
+/// where the oracle (which reads the visible target) cannot: after a
+/// converged run, `T`'s row counts are changed by hand. The target is as it
+/// was, so the oracle still agrees, and the audit reports `T`.
+#[test]
+fn the_strict_audit_catches_a_corrupted_hidden_table() {
+    let case = hand_built_case(false);
+    HARNESS.with(|h| {
+        h.runtime.block_on(async {
+            let db = h.cluster.create_isolated_database().await;
+            let mut backend = ManualBackend::connect_with_options(db.dsn(), 2, None)
+                .await
+                .expect("connect the backend");
+            backend.set_strict_audit(true);
+            let pool =
+                Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
+            run_convergence_concurrent(&mut backend, &pool, &case.program, &case.plan)
+                .await
+                .expect("the hand-built case converges and audits clean");
+            let targets: Vec<String> = case.program.defs.iter().map(|d| d.target.clone()).collect();
+            let clean = backend.strict_audit(&targets).await.expect("audit");
+            assert!(clean.is_empty(), "{clean:?}");
+            let touched = backend
+                .execute_raw(
+                    "do $$ declare r record; begin \
+                     for r in select schemaname, tablename from pg_tables \
+                              where tablename ~ '^join_[0-9]+_t$' loop \
+                       execute format('update %I.%I set __n = __n + 1', r.schemaname, r.tablename); \
+                     end loop; end $$",
+                )
+                .await
+                .expect("corrupt T");
+            let _ = touched;
+            let snapshot = backend.snapshot().await.expect("snapshot");
+            assert!(
+                check_program(&pool, &case.program, &snapshot)
+                    .await
+                    .expect("check")
+                    .is_empty(),
+                "the oracle reads the visible target, which is untouched"
+            );
+            let failures = backend.strict_audit(&targets).await.expect("audit");
+            assert!(!failures.is_empty(), "the audit missed a damaged T");
         })
     });
 }

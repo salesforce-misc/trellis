@@ -449,6 +449,9 @@ pub struct ManualBackend {
     /// takes operator actions through, connected on first use. It runs no
     /// background work of its own.
     operator: Option<trellis::Trellis>,
+    /// Whether [`super::ConcurrentBackend::strict_audit`] runs; see
+    /// [`ManualBackend::set_strict_audit`].
+    strict_audit: bool,
 }
 
 impl ManualBackend {
@@ -578,6 +581,7 @@ impl ManualBackend {
             build_chunk_rows: None,
             reconcile_interval: None,
             reclaim_ttl: None,
+            strict_audit: false,
             target_schema,
             source_tables: SourceTables::Own,
             config,
@@ -593,6 +597,14 @@ impl ManualBackend {
     /// way a build over a large table does at the default size (#720).
     pub fn set_build_chunk_rows(&mut self, rows: i64) {
         self.build_chunk_rows = Some(rows);
+    }
+
+    /// Turns on the `Strict` `self_check` of every installed target at each
+    /// quiescence point of a concurrent run
+    /// ([`super::ConcurrentBackend::strict_audit`]). Off by default: only
+    /// the `JOIN` tier asks for it.
+    pub fn set_strict_audit(&mut self, on: bool) {
+        self.strict_audit = on;
     }
 
     /// Sets how often the engine client's reconcile pass runs
@@ -1425,6 +1437,63 @@ impl super::ConcurrentBackend for ManualBackend {
         let schema = quote_ident(self.config.schema());
         self.raw.batch_execute(&drain_audit_ddl(&schema)).await?;
         Ok(())
+    }
+
+    async fn strict_audit(
+        &mut self,
+        targets: &[String],
+    ) -> Result<Vec<String>, ManualBackendError> {
+        if !self.strict_audit {
+            return Ok(Vec::new());
+        }
+        let facade =
+            trellis::Trellis::connect(self.config.clone(), trellis::TrellisOptions::default())
+                .await?;
+        let worker = trellis::dev::staging::SelfCheckWorkerOptions::new(Duration::from_secs(30));
+        let mut failures = Vec::new();
+        for target in targets {
+            let job = facade
+                .self_check(target, trellis::SelfCheckMode::Strict, QUIESCE_TIMEOUT)
+                .await?;
+            // The engine's own worker may run the job too: a claim is
+            // exclusive, so whichever page this loop doesn't get is the
+            // worker's, and the poll below waits for the job to end.
+            let deadline = std::time::Instant::now() + QUIESCE_TIMEOUT + Duration::from_secs(60);
+            let finished = loop {
+                trellis::dev::staging::work_self_check_once(&self.pool, "generative", &worker)
+                    .await
+                    .map_err(trellis::TrellisError::SelfCheck)?;
+                let Some(polled) = facade.self_check_job(job.id).await? else {
+                    break None;
+                };
+                if polled.report.is_some() || polled.error.is_some() {
+                    break Some(polled);
+                }
+                if std::time::Instant::now() > deadline {
+                    break Some(polled);
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            };
+            match finished {
+                None => failures.push(format!("{target}: the self_check job vanished")),
+                Some(job) => match job.report {
+                    Some(report) => match &report.outcome {
+                        trellis::SelfCheckOutcome::Converged => {}
+                        // Not a verdict on correctness: a definition an
+                        // operator action left paused is checked by the
+                        // run's end-of-run `live` check.
+                        trellis::SelfCheckOutcome::NotLive(_) => {}
+                        _ => failures.push(format!("{target}: {report:#?}")),
+                    },
+                    None => failures.push(format!(
+                        "{target}: the job ended {:?} with no report: {:?}",
+                        job.state, job.error
+                    )),
+                },
+            }
+        }
+        facade.shutdown().await?;
+        Ok(failures)
     }
 
     async fn begin_burst(&mut self, burst: usize) -> Result<(), ManualBackendError> {

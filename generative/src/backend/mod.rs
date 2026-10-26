@@ -137,6 +137,18 @@ pub trait ConcurrentBackend: Backend {
         program: &Program,
         action: &BurstAction,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// A `self_check` in `Strict` mode of each of `targets`, which the run
+    /// calls at every quiescence point once the oracle has agreed, for a
+    /// backend that opted in. One line per target that is not clean, with
+    /// the report. The default audits nothing.
+    fn strict_audit(
+        &mut self,
+        targets: &[String],
+    ) -> impl Future<Output = Result<Vec<String>, Self::Error>> + Send {
+        let _ = targets;
+        async { Ok(Vec::new()) }
+    }
 }
 
 /// The fewest rows a sealed batch needs for the engine to split it into

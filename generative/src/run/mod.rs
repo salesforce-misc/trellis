@@ -228,6 +228,13 @@ pub enum RunError {
         action: BurstAction,
         error: String,
     },
+    /// Issue #1388: the oracle agreed with every target after burst
+    /// `burst`, but a `Strict` `self_check` of a target found a divergence
+    /// (a hidden `P`/`M`/`J`/`T` table off) or could not finish.
+    Audit {
+        burst: usize,
+        failures: Vec<String>,
+    },
 }
 
 /// Installs `program`, then applies each op and checks convergence after it.
