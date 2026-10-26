@@ -708,18 +708,19 @@ impl fmt::Display for ValidationError {
             ValidationError::UnconstrainedNumericAggregate { function, column } => write!(
                 f,
                 "{function}({column}) is over a numeric with no declared scale, which is not \
-                 supported: Postgres shows a sum with as many decimal \
-                 places as the most precise value in the group, which a running sum can't \
-                 track (see \"Supported sources and targets\" in docs/transforms.md). Sum a numeric(p,s) column directly (ALTER TABLE ... ALTER COLUMN ... \
-                 TYPE numeric(p,s)); an expression over numeric has no declared scale"
+                 supported: Postgres shows a sum with as many decimal places as the most \
+                 precise value in the group, which a running sum can't track (see \"Supported \
+                 sources and targets\" in docs/transforms.md). Sum a numeric(p,s) column \
+                 directly (ALTER TABLE ... ALTER COLUMN ... TYPE numeric(p,s)); an expression \
+                 over numeric has no declared scale"
             ),
             ValidationError::ChainedNumericAggregate { function, column } => write!(
                 f,
                 "{function}({column}) is over a numeric column of a table Trellis creates, \
                  which has no declared scale: Trellis creates its columns with no type \
                  modifier, so a chained SUM/AVG over one is not supported (see \"Supported \
-                 sources and targets\" in docs/transforms.md). Sum the source's numeric(p,s) column in the transform that reads \
-                 the source"
+                 sources and targets\" in docs/transforms.md). Sum the source's numeric(p,s) \
+                 column in the transform that reads the source"
             ),
             ValidationError::UnsupportedAggregateArgument {
                 function,

@@ -53,7 +53,7 @@ plus `catching_up`, `quarantined` and `paused`): a host defines a transform, the
 until `live`. Progress requires a staging worker and at
 least one drain thread running *somewhere* in the fleet; a connection that only ever
 defines sees its definition sit in `waiting_to_backfill` indefinitely
-([embedding](../embedding.md#the-silent-stall-hazard-issue-144)).
+([embedding](../embedding.md#the-silent-stall-hazard)).
 
 `BlockingTrellis` is an additive wrapper in the `trellis`
 crate, not a separate shim. `Trellis` stays async-native; `BlockingTrellis` owns a

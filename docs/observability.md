@@ -240,7 +240,7 @@ pause are arcs of one lifecycle:
   with it here. It stays until the staging worker's reconcile pass finds its
   source (and a `JOIN`'s joined table) captured with the columns it reads, and
   no change staged before the capture install or widen is still pending
-  ([stage 01](staging-and-claiming/01-capture-by-triggers.md#widening-and-the-capture-gate)),
+  ([stage 01](staging-and-claiming/01-capture-by-triggers.md#which-definitions-may-start-a-build)),
   then starts its build
   ([data-flow — Capturing a table's existing rows](data-flow.md#capturing-a-tables-existing-rows)).
 * **`backfilling`** —* **`backfilling`** — the staging worker has started the transform's build,

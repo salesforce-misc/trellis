@@ -20,7 +20,7 @@
 //! - [`config`] resolves a [`Config`] from CLI args + environment.
 //! - [`pool`] manages a `deadpool-postgres` connection pool and exposes the
 //!   per-connection session bootstrap seam.
-//! - [`migrate`] applies Trellis's embedded SQL migrations.
+//! - [`mod@migrate`] applies Trellis's embedded SQL migrations.
 //! - [`identity`] decides, before migrations run, whether the configured
 //!   schema is safe to attach to — see `docs/instance-identity.md`.
 //! - [`error_code`] is a small, stable [`error_code::ErrorCode`] taxonomy

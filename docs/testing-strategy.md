@@ -106,7 +106,7 @@ cluster with the `shared_preload_libraries` the worker needs.
 **The combinatorial correctness claim: byte-identical convergence to an independent
 oracle over random valid programs, with failures shrunk to a minimal reproducing
 program.** This is the `generative` crate; full architecture lives in
-`docs/generative-test-suite.md`, In brief:
+`docs/generative-test-suite.md`. In brief:
 
 - **Trigger:** a randomly generated *valid* program — schema, transform definitions,
   and a sequence of source mutations — driven through the real engine against a
@@ -215,7 +215,7 @@ Alongside the generative harness, the chaos tier needs:
 ## Benchmarks: building a `JOIN` over seeded tables
 
 The streaming benchmark (`benchmark/`, run with `cargo run -p benchmark --features engine-access --release -- join ...`) is
-not a test tier, but `bench join` has a mode that measures a `JOIN` *build*: by
+not a test tier, but its `join` scenario has a mode that measures a `JOIN` *build*: by
 default (`--load direct`) it seeds the fact and dimension tables server-side
 with parallel `INSERT ... SELECT` before any definition exists, so nothing
 enters the capture ring and a 100M-row dataset loads in minutes. It then

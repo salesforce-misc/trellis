@@ -41,7 +41,7 @@ Pick the form that matches how you run it:
 
 ## A first transform
 
-Trellis runs against a PostgreSQL database and a role that can create objects in it (see [docs/recommendations.md](docs/recommendations.md) for roles and permissions). Given a source table and, for an aggregate, an index on its `GROUP BY` columns:
+Trellis runs against a PostgreSQL database and a role that can create objects in it (see [Roles and permissions](docs/recommendations.md#roles-and-permissions)). Given a source table and, for an aggregate, an index on its `GROUP BY` columns:
 
 ```sql
 CREATE TABLE orders (id bigint PRIMARY KEY, customer_id bigint NOT NULL, amount numeric(12,2) NOT NULL);

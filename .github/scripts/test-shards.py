@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Splits the workspace test suite across the CI `test` shards (issue #1226).
+"""Splits the workspace test suite across the CI `test` shards.
 
 A *unit* is what one `cargo test` selector names:
 
