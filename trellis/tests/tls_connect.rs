@@ -218,3 +218,54 @@ async fn a_mode_that_needs_encryption_is_a_config_error_on_a_unix_socket_host() 
     );
     assert!(!pool_is_encrypted(plain).await.unwrap());
 }
+
+/// `prefer` falls back to plaintext only when the server answers that it
+/// has no TLS. A server that offers TLS but whose handshake fails (here: it
+/// speaks only protocol versions rustls refuses) is an error, never a
+/// silent plaintext session. The server's `hostssl`-only `pg_hba.conf`
+/// would refuse a plaintext session too, so the error must be the
+/// handshake's, not that refusal.
+#[tokio::test]
+async fn a_failed_handshake_is_an_error_under_prefer_not_a_plaintext_retry() {
+    let cluster = TestCluster::start_with_tls_settings(&[
+        "ssl_min_protocol_version=TLSv1",
+        "ssl_max_protocol_version=TLSv1.1",
+    ]);
+    let db = cluster.create_isolated_database().await;
+    for options in ["", "sslmode=prefer", "sslmode=require"] {
+        let dsn = dsn(&cluster, db.name(), "127.0.0.1", options);
+        let err = pool_is_encrypted(dsn.clone())
+            .await
+            .expect_err("the handshake fails");
+        let text = format!("{err} {err:?}");
+        assert!(!text.contains(PASSWORD), "{text}");
+        assert!(
+            !text.contains("pg_hba.conf"),
+            "fell back to plaintext: {text}"
+        );
+        assert!(text.contains("TLS handshake"), "{options:?}: {text}");
+    }
+}
+
+/// A DSN that names only `hostaddr` has no host name for the handshake.
+/// The modes that check no name still encrypt.
+#[tokio::test]
+async fn a_hostaddr_without_a_host_encrypts_in_the_unverified_modes() {
+    let cluster = TestCluster::start_with_tls();
+    let db = cluster.create_isolated_database().await;
+    for options in ["", "sslmode=prefer", "sslmode=require"] {
+        let dsn = format!(
+            "hostaddr=127.0.0.1 port={} user=postgres dbname={} {options}",
+            cluster.port(),
+            db.name()
+        );
+        assert!(
+            pool_is_encrypted(dsn.clone()).await.expect("pooled"),
+            "{options:?}"
+        );
+        let session = ProducerSession::connect(&dsn, DEFAULT_SCHEMA)
+            .await
+            .expect("dedicated session");
+        assert!(is_encrypted(session.client()).await, "{options:?}");
+    }
+}

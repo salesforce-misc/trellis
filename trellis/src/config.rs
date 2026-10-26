@@ -358,8 +358,7 @@ pub(crate) fn parse_dsn(dsn: &str) -> Result<tokio_postgres::Config, Error> {
 pub(crate) fn parse_dsn_tls(
     dsn: &str,
 ) -> Result<(tokio_postgres::Config, crate::tls::TlsSpec), Error> {
-    let (rest, tls) = crate::tls::split_dsn(dsn)?;
-    let mut config: tokio_postgres::Config = rest.parse().map_err(|_| {
+    let unparsable = || {
         let hint = if dsn.starts_with("postgres://") || dsn.starts_with("postgresql://") {
             "a postgres:// URL; percent-encode reserved characters (such as @ : / ? # & and \
              spaces) in the user, password and query values"
@@ -371,7 +370,12 @@ pub(crate) fn parse_dsn_tls(
             "the database connection string does not parse as {hint} (the parser's detail is \
              withheld because it can quote part of a password)"
         ))
-    })?;
+    };
+    // A DSN the TLS pre-pass cannot scan is refused here rather than handed
+    // to `tokio_postgres`: its parser stops silently at some malformed input
+    // and would then connect with a `sslmode` the pre-pass never saw.
+    let (rest, tls) = crate::tls::split_dsn(dsn)?.ok_or_else(unparsable)?;
+    let mut config: tokio_postgres::Config = rest.parse().map_err(|_| unparsable())?;
     tls.apply(&mut config)?;
     Ok((config, tls))
 }

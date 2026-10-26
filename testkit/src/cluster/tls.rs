@@ -94,7 +94,7 @@ fn signed_by_ca(dir: &Path, name: &str, common_name: &str, extensions: Option<&s
 /// `postgres`, the test user), `other-ca.crt` (a CA that signed nothing), and
 /// `pg_hba.conf`. The hba file accepts a TLS session on loopback, and on
 /// the database `certdb` only a client certificate. Plain TCP is refused.
-pub(super) fn write_material(dir: &Path) {
+pub fn write_material(dir: &Path) {
     fs::create_dir_all(dir).expect("create tls dir");
     self_signed_ca(dir, "ca");
     self_signed_ca(dir, "other-ca");

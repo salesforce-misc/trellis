@@ -250,13 +250,18 @@ The rules:
 * **Trust comes from `sslrootcert` only.** Trellis does not read the
   operating system's certificate store or ship public roots, so a server with a
   publicly signed certificate still needs `sslrootcert` pointing at the CA's
-  PEM file for `verify-ca` and `verify-full`.
+  PEM file for `verify-ca` and `verify-full`. Only those two modes read it:
+  `sslmode=require` with an `sslrootcert` still does not check the
+  certificate, where libpq would treat the pair as `verify-ca`.
 * **`prefer` is the default, and it does not authenticate the server.** A
   connection string with no `sslmode` encrypts when it can and is open to
   anyone who can sit between you and Postgres. For a network you do not
   control, use `verify-full`. `prefer` falls back to plaintext only when the
   server answers the TLS request with "no"; a TLS handshake that fails is an
   error, where libpq would retry in plaintext.
+* **`verify-full` checks the name in `host`.** A connection string that
+  gives only `hostaddr` uses the address as that name, so the certificate
+  must list the IP address.
 * **A unix-socket host is never encrypted.** `require`, `verify-ca` and
   `verify-full` with a socket host are a configuration error; `disable` and
   `prefer` connect in plaintext over the socket.

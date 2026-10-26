@@ -68,7 +68,7 @@ use std::time::{Duration, Instant};
 use trellis::{Config, Pool, migrate};
 
 mod template;
-mod tls;
+pub mod tls;
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -375,12 +375,18 @@ impl TestCluster {
     /// TLS over it. The throwaway certificates are in
     /// [`TestCluster::tls_dir`]. Needs `openssl` on `PATH`.
     pub fn start_with_tls() -> Self {
+        Self::start_with_tls_settings(&[])
+    }
+
+    /// [`TestCluster::start_with_tls`], plus `settings` as
+    /// [`TestCluster::start_with_settings`] passes them.
+    pub fn start_with_tls_settings(settings: &[&str]) -> Self {
         reap_orphans_once();
         Self::start_listening_in(
             &std::env::temp_dir(),
             true,
             DataDirSource::Template,
-            Vec::new(),
+            settings.iter().map(|s| s.to_string()).collect(),
             true,
         )
     }

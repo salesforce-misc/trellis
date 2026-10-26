@@ -14,14 +14,14 @@ use crate::error::Error;
 use rustls::client::WebPkiServerVerifier;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::WebPkiSupportedAlgorithms;
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::pki_types::pem::{self, PemObject};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::{
     CertificateError, ClientConfig, DigitallySignedStruct, Error as TlsError, RootCertStore,
     SignatureScheme,
 };
 use std::fmt;
 use std::fs::File;
-use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -178,6 +178,15 @@ impl TlsSpec {
                  for the socket",
             ));
         }
+        // `tokio_postgres` takes the handshake's server name from `host`
+        // and refuses TLS without one, so a DSN naming only `hostaddr`
+        // would fail against every server that offers TLS. The address
+        // stands in for the name, as if it had been given as `host`.
+        if config.get_hosts().is_empty() {
+            for addr in config.get_hostaddrs().to_vec() {
+                config.host(addr.to_string());
+            }
+        }
         config.ssl_mode(self.mode.for_tokio());
         Ok(())
     }
@@ -185,7 +194,34 @@ impl TlsSpec {
     /// Builds the rustls connector, reading the certificate and key files.
     pub(crate) fn connector(&self) -> Result<Tls, Error> {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let verifier: Arc<dyn ServerCertVerifier> = match (self.mode, &self.root_cert) {
+        let verifier = self.verifier(&provider)?;
+        let builder = ClientConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .map_err(|e| Error::Config(format!("TLS setup failed: {e}")))?
+            .dangerous()
+            .with_custom_certificate_verifier(verifier);
+        let config = match (&self.client_cert, &self.client_key) {
+            (Some(cert), Some(key)) if self.mode != SslMode::Disable => {
+                let chain = read_certs(cert, "sslcert")?;
+                let key = read_key(key)?;
+                builder.with_client_auth_cert(chain, key).map_err(|e| {
+                    Error::Config(format!("sslcert and sslkey do not form a usable pair: {e}"))
+                })?
+            }
+            _ => builder.with_no_client_auth(),
+        };
+        Ok(Tls {
+            inner: MakeRustlsConnect::new(config),
+            verifies: self.mode.verifies(),
+        })
+    }
+
+    /// The server-certificate check for the mode, reading `sslrootcert`.
+    fn verifier(
+        &self,
+        provider: &Arc<rustls::crypto::CryptoProvider>,
+    ) -> Result<Arc<dyn ServerCertVerifier>, Error> {
+        Ok(match (self.mode, &self.root_cert) {
             (SslMode::VerifyFull | SslMode::VerifyCa, Some(root)) => {
                 let mut roots = RootCertStore::empty();
                 let certs = read_certs(root, "sslrootcert")?;
@@ -210,25 +246,6 @@ impl TlsSpec {
             _ => Arc::new(AcceptAnyCert {
                 algorithms: provider.signature_verification_algorithms,
             }),
-        };
-        let builder = ClientConfig::builder_with_provider(provider.clone())
-            .with_safe_default_protocol_versions()
-            .map_err(|e| Error::Config(format!("TLS setup failed: {e}")))?
-            .dangerous()
-            .with_custom_certificate_verifier(verifier);
-        let config = match (&self.client_cert, &self.client_key) {
-            (Some(cert), Some(key)) if self.mode != SslMode::Disable => {
-                let chain = read_certs(cert, "sslcert")?;
-                let key = read_key(key)?;
-                builder.with_client_auth_cert(chain, key).map_err(|e| {
-                    Error::Config(format!("sslcert and sslkey do not form a usable pair: {e}"))
-                })?
-            }
-            _ => builder.with_no_client_auth(),
-        };
-        Ok(Tls {
-            inner: MakeRustlsConnect::new(config),
-            verifies: self.mode.verifies(),
         })
     }
 }
@@ -273,8 +290,8 @@ where
 /// The server name given to a connector when no name will be checked.
 const UNCHECKED_NAME: &str = "localhost";
 
-fn open(path: &Path, option: &str) -> Result<BufReader<File>, Error> {
-    File::open(path).map(BufReader::new).map_err(|e| {
+fn open(path: &Path, option: &str) -> Result<File, Error> {
+    File::open(path).map_err(|e| {
         Error::Config(format!(
             "{option} {} could not be read: {}",
             path.display(),
@@ -283,16 +300,27 @@ fn open(path: &Path, option: &str) -> Result<BufReader<File>, Error> {
     })
 }
 
-fn read_certs(path: &Path, option: &str) -> Result<Vec<CertificateDer<'static>>, Error> {
-    let certs = rustls_pemfile::certs(&mut open(path, option)?)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| {
-            Error::Config(format!(
-                "{option} {} is not valid PEM: {}",
+/// A PEM error, by kind only: the decoder's own messages can quote a line
+/// of the file, which for `sslkey` is key material.
+fn pem_err(option: &str, path: &Path, e: &pem::Error) -> Error {
+    let what = match e {
+        pem::Error::Io(e) => {
+            return Error::Config(format!(
+                "{option} {} could not be read: {}",
                 path.display(),
                 e.kind()
-            ))
-        })?;
+            ));
+        }
+        pem::Error::NoItemsFound => "holds no PEM item of the expected kind",
+        _ => "is not valid PEM",
+    };
+    Error::Config(format!("{option} {} {what}", path.display()))
+}
+
+fn read_certs(path: &Path, option: &str) -> Result<Vec<CertificateDer<'static>>, Error> {
+    let certs = CertificateDer::pem_reader_iter(open(path, option)?)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| pem_err(option, path, &e))?;
     if certs.is_empty() {
         return Err(Error::Config(format!(
             "{option} {} holds no PEM certificate",
@@ -302,21 +330,14 @@ fn read_certs(path: &Path, option: &str) -> Result<Vec<CertificateDer<'static>>,
     Ok(certs)
 }
 
-fn read_key(path: &Path) -> Result<rustls::pki_types::PrivateKeyDer<'static>, Error> {
-    rustls_pemfile::private_key(&mut open(path, "sslkey")?)
-        .map_err(|e| {
-            Error::Config(format!(
-                "sslkey {} is not valid PEM: {}",
-                path.display(),
-                e.kind()
-            ))
-        })?
-        .ok_or_else(|| {
-            Error::Config(format!(
-                "sslkey {} holds no PEM private key (an encrypted key is not supported)",
-                path.display()
-            ))
-        })
+fn read_key(path: &Path) -> Result<PrivateKeyDer<'static>, Error> {
+    PrivateKeyDer::from_pem_reader(open(path, "sslkey")?).map_err(|e| match e {
+        pem::Error::NoItemsFound => Error::Config(format!(
+            "sslkey {} holds no PEM private key (an encrypted key is not supported)",
+            path.display()
+        )),
+        e => pem_err("sslkey", path, &e),
+    })
 }
 
 /// `require` and `prefer`: encrypts, and trusts whatever certificate the
@@ -419,18 +440,18 @@ impl ServerCertVerifier for IgnoreServerName {
 /// Splits the TLS options out of `dsn`: returns the DSN without them, for
 /// `tokio_postgres`'s parser, and the options.
 ///
-/// A DSN this cannot scan comes back unchanged with the default options, so
-/// `tokio_postgres` rejects it and the caller reports the fixed parse error.
-pub(crate) fn split_dsn(dsn: &str) -> Result<(String, TlsSpec), Error> {
+/// `None` for a DSN this cannot scan; the caller reports the fixed parse
+/// error for it.
+pub(crate) fn split_dsn(dsn: &str) -> Result<Option<(String, TlsSpec)>, Error> {
     let scanned = if dsn.starts_with("postgres://") || dsn.starts_with("postgresql://") {
         split_url(dsn)
     } else {
         split_key_value(dsn)
     };
     let Some((rest, params)) = scanned else {
-        return Ok((dsn.to_string(), TlsSpec::default()));
+        return Ok(None);
     };
-    Ok((rest, TlsSpec::from_params(&params)?))
+    Ok(Some((rest, TlsSpec::from_params(&params)?)))
 }
 
 fn is_tls_key(key: &str) -> bool {
@@ -440,7 +461,9 @@ fn is_tls_key(key: &str) -> bool {
 
 /// `key = value` pairs, mirroring `tokio_postgres`'s grammar: whitespace
 /// around `=`, a value either single-quoted or ending at whitespace, and a
-/// backslash escaping the next character in both.
+/// backslash escaping the next character in both. An empty key (a `=`
+/// where a key should start) is unscannable: `tokio_postgres` stops parsing
+/// there and ignores the rest, `sslmode` included.
 fn split_key_value(dsn: &str) -> Option<(String, Vec<(String, String)>)> {
     let mut rest = String::new();
     let mut params = Vec::new();
@@ -454,6 +477,9 @@ fn split_key_value(dsn: &str) -> Option<(String, Vec<(String, String)>)> {
         let mut key = String::new();
         while let Some((_, c)) = chars.next_if(|(_, c)| !c.is_whitespace() && *c != '=') {
             key.push(c);
+        }
+        if key.is_empty() {
+            return None;
         }
         while chars.next_if(|(_, c)| c.is_whitespace()).is_some() {}
         chars.next_if(|(_, c)| *c == '=')?;
@@ -541,7 +567,7 @@ mod tests {
     use super::*;
 
     fn spec(dsn: &str) -> Result<(String, TlsSpec), Error> {
-        split_dsn(dsn)
+        split_dsn(dsn).map(|scanned| scanned.expect("the DSN scans"))
     }
 
     #[test]
@@ -648,18 +674,26 @@ mod tests {
     }
 
     #[test]
-    fn an_unscannable_dsn_passes_through_for_the_fixed_parse_error() {
-        for dsn in ["host=db user", "host='db", "postgres://db/app?sslmode"] {
-            let (rest, spec) = split_dsn(dsn).unwrap();
-            assert_eq!(rest, dsn);
-            assert_eq!(spec.mode, SslMode::Prefer);
+    fn an_unscannable_dsn_is_the_fixed_parse_error() {
+        // The last: `tokio_postgres` stops at the `=` where a key should
+        // start and would connect with `sslmode=require` overridden by the
+        // default, had the DSN reached it.
+        for dsn in [
+            "host=db user",
+            "host='db",
+            "postgres://db/app?sslmode",
+            "host=db sslmode=require =x y",
+        ] {
+            assert!(split_dsn(dsn).unwrap().is_none(), "{dsn}");
+            let err = crate::config::parse_dsn(dsn).unwrap_err().to_string();
+            assert!(err.contains("does not parse"), "{dsn}: {err}");
         }
     }
 
     #[test]
     fn a_demanding_mode_on_a_unix_socket_host_is_a_config_error() {
         for mode in ["require", "verify-ca", "verify-full"] {
-            let (rest, spec) = split_dsn(&format!(
+            let (rest, spec) = spec(&format!(
                 "host=/var/run/postgresql sslmode={mode} sslrootcert=/ca.pem"
             ))
             .unwrap();
@@ -669,12 +703,11 @@ mod tests {
             assert!(err.to_string().contains("unix-socket"), "{err}");
         }
         for mode in ["disable", "prefer"] {
-            let (rest, spec) =
-                split_dsn(&format!("host=/var/run/postgresql sslmode={mode}")).unwrap();
+            let (rest, spec) = spec(&format!("host=/var/run/postgresql sslmode={mode}")).unwrap();
             let mut config: tokio_postgres::Config = rest.parse().unwrap();
             spec.apply(&mut config).unwrap();
         }
-        let (rest, spec) = split_dsn("host=db sslmode=require").unwrap();
+        let (rest, spec) = spec("host=db sslmode=require").unwrap();
         let mut config: tokio_postgres::Config = rest.parse().unwrap();
         spec.apply(&mut config).unwrap();
         assert_eq!(
@@ -691,7 +724,7 @@ mod tests {
         std::fs::write(&junk, "SECRET-KEY-MATERIAL not pem").unwrap();
         let missing = dir.join("missing.pem");
         for (option, path) in [("sslrootcert", &junk), ("sslrootcert", &missing)] {
-            let (_, spec) = split_dsn(&format!(
+            let (_, spec) = spec(&format!(
                 "host=db sslmode=verify-full {option}='{}'",
                 path.display()
             ))
@@ -700,21 +733,407 @@ mod tests {
             assert!(err.contains(&path.display().to_string()), "{err}");
             assert!(!err.contains("SECRET"), "{err}");
         }
-        let (_, spec) = split_dsn(&format!(
+        let (_, spec) = spec(&format!(
             "host=db sslmode=require sslcert='{0}' sslkey='{0}'",
             junk.display()
         ))
         .unwrap();
         let err = spec.connector().unwrap_err().to_string();
         assert!(!err.contains("SECRET"), "{err}");
+        // A PEM block whose body does not decode: the decoder's message
+        // would quote the offending bytes.
+        let broken = dir.join("broken.key");
+        std::fs::write(
+            &broken,
+            "-----BEGIN PRIVATE KEY-----\nSECRET!*#\n-----END PRIVATE KEY-----\n",
+        )
+        .unwrap();
+        let err = read_key(&broken).unwrap_err().to_string();
+        assert!(err.contains("is not valid PEM"), "{err}");
+        assert!(!err.contains("SECRET") && !err.contains('!'), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The verifiers themselves, against throwaway certificates: `verify-ca`
+    /// forgives only a certificate that names another host; an expired or
+    /// not-yet-valid certificate, or one from another CA, fails in both
+    /// verifying modes. The unverified modes check handshake signatures
+    /// with the same algorithms as the verifying ones.
+    #[test]
+    fn the_verifiers_forgive_only_a_name_mismatch_and_only_in_verify_ca() {
+        let dir = std::env::temp_dir().join(format!("trellis-tls-verify-{}", std::process::id()));
+        testkit::cluster::tls::write_material(&dir);
+        let server = read_certs(&dir.join("server.crt"), "test")
+            .unwrap()
+            .remove(0);
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let verifier = |mode: &str, root: &str| {
+            spec(&format!(
+                "host=db sslmode={mode} sslrootcert='{}'",
+                dir.join(root).display()
+            ))
+            .unwrap()
+            .1
+            .verifier(&provider)
+            .unwrap()
+        };
+        let named = ServerName::try_from("localhost").unwrap();
+        let other = ServerName::try_from("other.example").unwrap();
+        let now = UnixTime::now();
+        let day = std::time::Duration::from_secs(86_400);
+        let later =
+            UnixTime::since_unix_epoch(std::time::Duration::from_secs(now.as_secs()) + 30 * day);
+        let earlier =
+            UnixTime::since_unix_epoch(std::time::Duration::from_secs(now.as_secs()) - 30 * day);
+        let check = |v: &Arc<dyn ServerCertVerifier>, name: &ServerName<'_>, at: UnixTime| {
+            v.verify_server_cert(&server, &[], name, &[], at)
+                .map(|_| ())
+        };
+        let full = verifier("verify-full", "ca.crt");
+        let ca = verifier("verify-ca", "ca.crt");
+        check(&full, &named, now).expect("verify-full, right name");
+        check(&ca, &named, now).expect("verify-ca, right name");
+        check(&ca, &other, now).expect("verify-ca ignores the name");
+        let err = check(&full, &other, now).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                TlsError::InvalidCertificate(CertificateError::NotValidForNameContext { .. })
+            ),
+            "{err:?}"
+        );
+        for v in [&full, &ca] {
+            for name in [&named, &other] {
+                let err = check(v, name, later).unwrap_err();
+                assert!(
+                    matches!(
+                        err,
+                        TlsError::InvalidCertificate(CertificateError::ExpiredContext { .. })
+                    ),
+                    "{err:?}"
+                );
+                let err = check(v, name, earlier).unwrap_err();
+                assert!(
+                    matches!(
+                        err,
+                        TlsError::InvalidCertificate(CertificateError::NotValidYetContext { .. })
+                    ),
+                    "{err:?}"
+                );
+            }
+        }
+        for mode in ["verify-full", "verify-ca"] {
+            let v = verifier(mode, "other-ca.crt");
+            for name in [&named, &other] {
+                let err = check(&v, name, now).unwrap_err();
+                assert!(
+                    matches!(
+                        err,
+                        TlsError::InvalidCertificate(CertificateError::UnknownIssuer)
+                    ),
+                    "{mode}: {err:?}"
+                );
+            }
+        }
+        let unverified = spec("host=db sslmode=require")
+            .unwrap()
+            .1
+            .verifier(&provider)
+            .unwrap();
+        assert_eq!(
+            unverified.supported_verify_schemes(),
+            full.supported_verify_schemes()
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The PEM shapes `openssl` writes: a CA bundle with CRLF line ends
+    /// whose second certificate is the one that matters, and private keys
+    /// in PKCS#8, PKCS#1 (RSA) and SEC1 (EC). An empty file and an encrypted
+    /// key are refused by path.
+    #[test]
+    fn pem_files_in_the_usual_shapes_are_read() {
+        let dir = std::env::temp_dir().join(format!("trellis-tls-pem-{}", std::process::id()));
+        testkit::cluster::tls::write_material(&dir);
+        let openssl = |args: &[&str]| {
+            let status = std::process::Command::new("openssl")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .expect("openssl")
+                .status;
+            assert!(status.success(), "openssl {args:?}");
+        };
+        let text = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap();
+        let bundle = format!("{}{}", text("other-ca.crt"), text("ca.crt")).replace('\n', "\r\n");
+        std::fs::write(dir.join("bundle.crt"), bundle).unwrap();
+        let roots = read_certs(&dir.join("bundle.crt"), "sslrootcert").unwrap();
+        assert_eq!(roots.len(), 2);
+        let server = read_certs(&dir.join("server.crt"), "test")
+            .unwrap()
+            .remove(0);
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let (_, full) = spec(&format!(
+            "host=db sslmode=verify-full sslrootcert='{}'",
+            dir.join("bundle.crt").display()
+        ))
+        .unwrap();
+        full.verifier(&provider)
+            .unwrap()
+            .verify_server_cert(
+                &server,
+                &[],
+                &ServerName::try_from("localhost").unwrap(),
+                &[],
+                UnixTime::now(),
+            )
+            .expect("the bundle's second CA signed the server certificate");
+
+        openssl(&["genrsa", "-traditional", "-out", "rsa.key", "2048"]);
+        openssl(&[
+            "ecparam",
+            "-name",
+            "prime256v1",
+            "-genkey",
+            "-noout",
+            "-out",
+            "ec.key",
+        ]);
+        openssl(&[
+            "genpkey",
+            "-algorithm",
+            "EC",
+            "-pkeyopt",
+            "ec_paramgen_curve:P-256",
+            "-aes256",
+            "-pass",
+            "pass:x",
+            "-out",
+            "encrypted.key",
+        ]);
+        assert!(text("rsa.key").contains("BEGIN RSA PRIVATE KEY"));
+        assert!(text("ec.key").contains("BEGIN EC PRIVATE KEY"));
+        assert!(text("client.key").contains("BEGIN PRIVATE KEY"));
+        assert!(matches!(
+            read_key(&dir.join("rsa.key")).unwrap(),
+            PrivateKeyDer::Pkcs1(_)
+        ));
+        assert!(matches!(
+            read_key(&dir.join("ec.key")).unwrap(),
+            PrivateKeyDer::Sec1(_)
+        ));
+        assert!(matches!(
+            read_key(&dir.join("client.key")).unwrap(),
+            PrivateKeyDer::Pkcs8(_)
+        ));
+        let err = read_key(&dir.join("encrypted.key"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("encrypted key is not supported"), "{err}");
+
+        std::fs::write(dir.join("empty.pem"), "").unwrap();
+        let err = read_certs(&dir.join("empty.pem"), "sslrootcert")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("empty.pem holds no PEM certificate"), "{err}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn a_mode_that_never_verifies_builds_without_any_file() {
         for mode in ["disable", "prefer", "require"] {
-            let (_, spec) = split_dsn(&format!("host=db sslmode={mode}")).unwrap();
+            let (_, spec) = spec(&format!("host=db sslmode={mode}")).unwrap();
             spec.connector().expect("connector");
+        }
+    }
+}
+
+/// The pre-pass against `tokio_postgres`'s own parser, on generated DSNs
+/// that hold only options both understand (`sslmode` limited to `disable`,
+/// `prefer` and `require`): wherever `tokio_postgres` accepts a DSN, the
+/// pre-pass must lift out the same `sslmode` and leave a rest that parses to
+/// the same everything else. Deterministic: a fixed-seed xorshift.
+#[cfg(test)]
+mod differential {
+    use super::*;
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn pick<'a>(&mut self, xs: &[&'a str]) -> &'a str {
+            xs[(self.next() % xs.len() as u64) as usize]
+        }
+    }
+
+    /// Whether both parsers accepted `dsn` (and agreed: a disagreement
+    /// panics). `may_refuse`: the pre-pass may refuse a DSN that
+    /// `tokio_postgres` accepts, which it does for an empty key, where
+    /// `tokio_postgres` silently stops parsing.
+    fn agree(dsn: &str, may_refuse: bool) -> bool {
+        let theirs = dsn.parse::<tokio_postgres::Config>();
+        let ours = split_dsn(dsn).ok().flatten().and_then(|(rest, spec)| {
+            let config = rest.parse::<tokio_postgres::Config>().ok()?;
+            Some((config, spec))
+        });
+        match (theirs, ours) {
+            (Ok(theirs), Some((mut ours, spec))) => {
+                assert_eq!(spec.mode.for_tokio(), theirs.get_ssl_mode(), "{dsn:?}");
+                ours.ssl_mode(theirs.get_ssl_mode());
+                assert_eq!(format!("{theirs:?}"), format!("{ours:?}"), "{dsn:?}");
+                assert_eq!(theirs.get_password(), ours.get_password(), "{dsn:?}");
+                true
+            }
+            (Ok(_), None) => {
+                assert!(
+                    may_refuse,
+                    "tokio_postgres accepts, the pre-pass refuses: {dsn:?}"
+                );
+                false
+            }
+            // The pre-pass is more lenient only about empty `&` segments in
+            // a URL query, which it skips.
+            (Err(_), _) => false,
+        }
+    }
+
+    #[test]
+    fn token_soup_key_value() {
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let tokens = [
+            "sslmode",
+            "host",
+            "password",
+            "user",
+            "=",
+            " ",
+            "  ",
+            "'",
+            "\\",
+            "require",
+            "disable",
+            "prefer",
+            "x",
+            "a b",
+            "\t",
+            "sslmode=require",
+            "\\'",
+        ];
+        let agreed = (0..100_000)
+            .filter(|_| {
+                let n = 1 + rng.next() % 9;
+                let dsn: String = (0..n).map(|_| rng.pick(&tokens)).collect();
+                agree(&dsn, true)
+            })
+            .count();
+        assert!(agreed > 1_000, "{agreed}");
+    }
+
+    #[test]
+    fn token_soup_url() {
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        let tokens = [
+            "u",
+            ":",
+            "p",
+            "@",
+            "db",
+            "/",
+            "app",
+            "?",
+            "&",
+            "=",
+            "sslmode",
+            "require",
+            "disable",
+            "%20",
+            "%3D",
+            "%26",
+            "%zz",
+            "%",
+            "application_name",
+            "ssl%6dode",
+            "[::1]",
+            ",",
+            "5433",
+            "%40",
+            "%3F",
+            "host=%2Ftmp",
+        ];
+        let agreed = (0..100_000)
+            .filter(|_| {
+                let n = 1 + rng.next() % 12;
+                let dsn: String = std::iter::once("postgres://")
+                    .chain((0..n).map(|_| rng.pick(&tokens)))
+                    .collect();
+                agree(&dsn, false)
+            })
+            .count();
+        assert!(agreed > 10_000, "{agreed}");
+    }
+
+    /// Well-formed `key=value` DSNs whose values hold quotes, backslashes,
+    /// whitespace and option-like text, each quoted or escaped as the
+    /// grammar allows.
+    #[test]
+    fn well_formed_key_value() {
+        let mut rng = Rng(0xdead_beef_cafe_f00d);
+        let keys = [
+            "host",
+            "password",
+            "user",
+            "dbname",
+            "application_name",
+            "sslmode",
+        ];
+        let pieces = [
+            "a",
+            " ",
+            "'",
+            "\\",
+            "=",
+            "sslmode=disable",
+            "%",
+            "@",
+            "?",
+            "\t",
+        ];
+        for _ in 0..100_000 {
+            let mut dsn = String::new();
+            for _ in 0..(1 + rng.next() % 5) {
+                let key = rng.pick(&keys);
+                dsn.push_str(rng.pick(&["", " ", "  "]));
+                dsn.push_str(key);
+                dsn.push_str(rng.pick(&["", " "]));
+                dsn.push('=');
+                dsn.push_str(rng.pick(&["", " "]));
+                let raw: String = if key == "sslmode" {
+                    rng.pick(&["disable", "prefer", "require"]).to_string()
+                } else {
+                    (0..rng.next() % 6).map(|_| rng.pick(&pieces)).collect()
+                };
+                let quoted = raw.is_empty() || rng.next().is_multiple_of(2);
+                if quoted {
+                    dsn.push('\'');
+                }
+                for c in raw.chars() {
+                    if c == '\\' || c == '\'' || (!quoted && c.is_whitespace()) {
+                        dsn.push('\\');
+                    }
+                    dsn.push(c);
+                }
+                if quoted {
+                    dsn.push('\'');
+                }
+                dsn.push(' ');
+            }
+            assert!(agree(&dsn, false), "{dsn:?}");
         }
     }
 }

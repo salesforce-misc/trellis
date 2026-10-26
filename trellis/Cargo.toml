@@ -68,7 +68,6 @@ tokio-postgres = "0.7.13"
 # release's cross builds (zig cc) compile for every target without a system
 # OpenSSL.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-rustls-pemfile = "2"
 tokio-postgres-rustls = "0.13"
 # Issue #874: the OS user `tokio-postgres` connects as when a DSN names no
 # user, whose name is then the database's (`instance_log::name_of`). Already
