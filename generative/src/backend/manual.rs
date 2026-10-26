@@ -452,6 +452,10 @@ pub struct ManualBackend {
     /// Whether [`super::ConcurrentBackend::strict_audit`] runs; see
     /// [`ManualBackend::set_strict_audit`].
     strict_audit: bool,
+    /// How many targets [`super::ConcurrentBackend::strict_audit`] found
+    /// clean, so a test can tell an audit that ran from one that skipped
+    /// every target.
+    strict_audits_converged: usize,
 }
 
 impl ManualBackend {
@@ -582,6 +586,7 @@ impl ManualBackend {
             reconcile_interval: None,
             reclaim_ttl: None,
             strict_audit: false,
+            strict_audits_converged: 0,
             target_schema,
             source_tables: SourceTables::Own,
             config,
@@ -605,6 +610,13 @@ impl ManualBackend {
     /// the `JOIN` tier asks for it.
     pub fn set_strict_audit(&mut self, on: bool) {
         self.strict_audit = on;
+    }
+
+    /// How many targets the `Strict` audit has found clean so far
+    /// ([`ManualBackend::set_strict_audit`]); a target it skipped as not
+    /// `live` doesn't count.
+    pub fn strict_audits_converged(&self) -> usize {
+        self.strict_audits_converged
     }
 
     /// Sets how often the engine client's reconcile pass runs
@@ -1478,7 +1490,9 @@ impl super::ConcurrentBackend for ManualBackend {
                 None => failures.push(format!("{target}: the self_check job vanished")),
                 Some(job) => match job.report {
                     Some(report) => match &report.outcome {
-                        trellis::SelfCheckOutcome::Converged => {}
+                        trellis::SelfCheckOutcome::Converged => {
+                            self.strict_audits_converged += 1;
+                        }
                         // Not a verdict on correctness: a definition an
                         // operator action left paused is checked by the
                         // run's end-of-run `live` check.

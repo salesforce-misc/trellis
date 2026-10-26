@@ -625,10 +625,14 @@ fn the_strict_audit_catches_a_corrupted_hidden_table() {
             run_convergence_concurrent(&mut backend, &pool, &case.program, &case.plan)
                 .await
                 .expect("the hand-built case converges and audits clean");
+            assert!(
+                backend.strict_audits_converged() > 0,
+                "the run audited no target at any burst"
+            );
             let targets: Vec<String> = case.program.defs.iter().map(|d| d.target.clone()).collect();
             let clean = backend.strict_audit(&targets).await.expect("audit");
             assert!(clean.is_empty(), "{clean:?}");
-            let touched = backend
+            backend
                 .execute_raw(
                     "do $$ declare r record; begin \
                      for r in select schemaname, tablename from pg_tables \
@@ -638,7 +642,6 @@ fn the_strict_audit_catches_a_corrupted_hidden_table() {
                 )
                 .await
                 .expect("corrupt T");
-            let _ = touched;
             let snapshot = backend.snapshot().await.expect("snapshot");
             assert!(
                 check_program(&pool, &case.program, &snapshot)
@@ -648,7 +651,12 @@ fn the_strict_audit_catches_a_corrupted_hidden_table() {
                 "the oracle reads the visible target, which is untouched"
             );
             let failures = backend.strict_audit(&targets).await.expect("audit");
-            assert!(!failures.is_empty(), "the audit missed a damaged T");
+            for target in &targets {
+                assert!(
+                    failures.iter().any(|f| f.starts_with(&format!("{target}: "))),
+                    "the audit missed {target}'s damaged T: {failures:?}"
+                );
+            }
         })
     });
 }
