@@ -14,18 +14,25 @@ A Trellis release is one version for everything it ships, cut from one tag,
 
 ## The version
 
-Every version below is the release's, and `.github/scripts/check-release-versions.sh <version>`
-checks they agree:
+Every version below is the release's:
 
 - `trellis/Cargo.toml`, `cli/Cargo.toml`, `clients/embed/Cargo.toml`,
   `clients/elixir/native/trellis_nif/Cargo.toml` and
-  `clients/ruby/ext/trellis_ruby/Cargo.toml`
+  `clients/ruby/ext/trellis_ruby/Cargo.toml`, and their entries in
+  `Cargo.lock`
 - `@version` in `clients/elixir/mix.exs`
-- `Trellis::VERSION` in `clients/ruby/lib/trellis/version.rb`
+- `Trellis::VERSION` in `clients/ruby/lib/trellis/version.rb`, and its entry
+  in `clients/ruby/Gemfile.lock`
 
-Setting a new version is an ordinary pull request. A prerelease
-(`0.1.0-alpha`) is released the same way, as a GitHub prerelease; RubyGems
-writes its `-` as `.pre.`, so its gems are `0.1.0.pre.alpha`.
+The release builds run with `--locked` and a frozen bundle, so a lockfile
+left behind fails them. `.github/scripts/bump-version.sh <version>` sets all
+of them and checks the result with `.github/scripts/check-release-versions.sh`;
+it updates no dependency. Commit what it changes as an ordinary pull request,
+and tag the merged commit on `main`.
+
+A prerelease (`0.1.0-alpha`) is released the same way, as a GitHub
+prerelease. RubyGems writes its `-` as `.pre.`, so its gems are
+`0.1.0.pre.alpha`.
 
 ## Cutting a release
 
