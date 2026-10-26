@@ -1227,8 +1227,10 @@ mod tests {
     /// A fenced transaction left idle past the reclaim TTL loses its lock
     /// (`idle_in_transaction_session_timeout`, set by [`ClaimFence::hold`]):
     /// the stale-claim sweep skips the chunk while the session holds it, and
-    /// reclaims it once the server has ended the session. The test waits for
-    /// that with a lock request the dying session's lock blocks, not a poll.
+    /// reclaims it once the server has ended the session. The session is kept
+    /// busy on an advisory lock until the first sweep has looked, so the
+    /// timeout cannot fire early under load, and the test waits for the
+    /// session's end with a lock request its lock blocks, not a poll.
     #[tokio::test]
     async fn a_fenced_transaction_left_idle_loses_its_lock_and_the_chunk_is_reclaimed() {
         let cluster = testkit::TestCluster::start();
@@ -1287,31 +1289,46 @@ mod tests {
         .await
         .expect("age the claim");
 
-        // The fence idles for 300 ms inside its transaction.
+        // The fenced session waits on an advisory lock `gate` holds, so it is
+        // busy, not idle, until the sweep has looked: the 300 ms timeout
+        // starts only when the gate lets it finish that statement.
+        const BUSY_LOCK: i64 = 0x1380;
+        let gate = connect().await;
+        gate.execute("select pg_advisory_lock($1)", &[&BUSY_LOCK])
+            .await
+            .expect("take the gate lock");
         let mut holder = connect().await;
         let txn = holder.transaction().await.expect("begin");
         let fence = ClaimFence::new(id, "holder", Duration::from_millis(300));
         assert!(fence.hold(&txn).await.expect("hold"), "the claim holds");
 
         let mut sweeper = pool.get().await.expect("pool");
-        assert_eq!(
-            reclaim_stale_chunks(&mut **sweeper, Duration::from_secs(30))
+        let busy = txn.execute("select pg_advisory_lock($1)", &[&BUSY_LOCK]);
+        let sweep_then_idle = async {
+            assert_eq!(
+                reclaim_stale_chunks(&mut **sweeper, Duration::from_secs(30))
+                    .await
+                    .expect("reclaim"),
+                0,
+                "the sweep skips a chunk whose fenced transaction is open"
+            );
+            gate.execute("select pg_advisory_unlock($1)", &[&BUSY_LOCK])
                 .await
-                .expect("reclaim"),
-            0,
-            "the sweep skips a chunk whose fenced transaction is open"
-        );
-
-        // Blocks until the server ends the idle session and its lock goes.
-        raw.batch_execute("set statement_timeout = '30s'")
+                .expect("release the gate lock");
+            // Blocks until the server ends the now idle session and its lock
+            // goes.
+            raw.batch_execute("set statement_timeout = '30s'")
+                .await
+                .expect("bound the wait");
+            raw.execute(
+                "select 1 from backfill_chunks where id = $1 for update",
+                &[&id],
+            )
             .await
-            .expect("bound the wait");
-        raw.execute(
-            "select 1 from backfill_chunks where id = $1 for update",
-            &[&id],
-        )
-        .await
-        .expect("the idle session released the chunk's lock");
+            .expect("the idle session released the chunk's lock");
+        };
+        let (busy, ()) = tokio::join!(busy, sweep_then_idle);
+        busy.expect("the fenced session got the gate lock");
 
         assert_eq!(
             reclaim_stale_chunks(&mut **sweeper, Duration::from_secs(30))
