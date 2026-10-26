@@ -150,6 +150,12 @@ pub enum ApplyError {
     /// Every page of the target would reproduce it, so it halts the target
     /// rather than charging each key a death.
     GroupBasisUnsupported { target: String, what: &'static str },
+    /// A `JOIN`'s `T` write (`super::group_basis`, ADR-0019's strict form)
+    /// staged `groups` groups that have no hidden row: the writer didn't lock
+    /// them (`GroupTargetPlan::lock_sql` inserts the missing rows and locks
+    /// the rest), so applying would have dropped their deltas. A gap in the
+    /// lock set, never a state of the data. The transaction rolls back.
+    GroupLockGap { target: String, groups: i64 },
     /// A folded record names a source table Postgres no longer has
     /// (`42P01` from a live query against it) — issue #16's "one sanctioned
     /// exception to immutability": no retry or per-key quarantine can
@@ -292,6 +298,7 @@ impl ApplyError {
             | ApplyError::LedgerEntryCollected { .. }
             | ApplyError::HopBoundExceeded { .. }
             | ApplyError::GroupBasisUnsupported { .. }
+            | ApplyError::GroupLockGap { .. }
             | ApplyError::TruncateWithoutLsn { .. } => ErrorCode::Internal,
             ApplyError::SourceTableDropped { .. } => ErrorCode::NotFound,
             ApplyError::ColumnNotPaused { .. } => ErrorCode::NotFound,
@@ -360,6 +367,11 @@ impl fmt::Display for ApplyError {
             ApplyError::GroupBasisUnsupported { target, what } => write!(
                 f,
                 "group-basis aggregate target '{target}' can't apply {what}"
+            ),
+            ApplyError::GroupLockGap { target, groups } => write!(
+                f,
+                "a write of '{target}''s group table staged {groups} group(s) that no lock \
+                 covered (no hidden row to apply their change to)"
             ),
             ApplyError::HopBoundExceeded { hop_gen, tables } => write!(
                 f,
@@ -456,6 +468,7 @@ impl std::error::Error for ApplyError {
             | ApplyError::LedgerEntryCollected { .. }
             | ApplyError::HopBoundExceeded { .. }
             | ApplyError::GroupBasisUnsupported { .. }
+            | ApplyError::GroupLockGap { .. }
             | ApplyError::SourceTableDropped { .. }
             | ApplyError::ColumnNotPaused { .. }
             | ApplyError::DefinitionNotLive { .. }
