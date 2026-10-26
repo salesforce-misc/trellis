@@ -25,12 +25,19 @@ LIST = os.path.join(ROOT, ".github", "public-api.txt")
 
 def rustdoc_json():
     env = dict(os.environ, RUSTC_BOOTSTRAP="1")
-    subprocess.run(
+    build = subprocess.run(
         ["cargo", "rustdoc", "-p", "trellis", "--",
          "-Z", "unstable-options", "--output-format", "json"],
-        cwd=ROOT, env=env, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        cwd=ROOT, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
     )
-    target = os.environ.get("CARGO_TARGET_DIR", os.path.join(ROOT, "target"))
+    if build.returncode != 0:
+        sys.stderr.write(build.stderr)
+        sys.exit("check-public-api: building the rustdoc JSON failed")
+    metadata = subprocess.run(
+        ["cargo", "metadata", "--format-version", "1", "--no-deps"],
+        cwd=ROOT, check=True, capture_output=True, text=True,
+    )
+    target = json.loads(metadata.stdout)["target_directory"]
     with open(os.path.join(target, "doc", "trellis.json")) as f:
         return json.load(f)
 
@@ -112,6 +119,7 @@ def main():
         print(f"+ {line}")
     for line in removed:
         print(f"- {line}")
+    sys.stdout.flush()
     print(
         "\nThe trellis crate's public API changed. If that is intended, run\n"
         "  .github/scripts/check-public-api.py --update\n"

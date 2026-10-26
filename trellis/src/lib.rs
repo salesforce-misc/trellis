@@ -15,13 +15,15 @@
 //! only front doors.
 //!
 //! Every public name is re-exported at the crate root; the modules that
-//! define them are private. Tier 2 is the small set of composable primitives
+//! define them are private (`otel`, behind the `otlp` feature, is the one
+//! public module). Tier 2 is the small set of composable primitives
 //! an embedder may reach for directly instead of going through the facade:
 //!
 //! - [`Config`] resolves from CLI args + environment (`Config::resolve`) or
 //!   from a DSN.
 //! - [`Pool`] manages a `deadpool-postgres` connection pool, which
-//!   [`Trellis::pool`] hands back for an embedder's own queries.
+//!   [`Trellis::pool`] hands back for an embedder's own queries; each
+//!   [`Pool::get`] checks out a [`PooledClient`].
 //! - [`migrate()`] applies Trellis's embedded SQL migrations, after checking
 //!   that the configured schema is safe to attach to — see
 //!   `docs/instance-identity.md`.
@@ -229,7 +231,7 @@ pub use metrics::Metrics;
 pub use migrate::migrate;
 #[cfg(feature = "otlp")]
 pub use otel::OtelError;
-pub use pool::Pool;
+pub use pool::{Pool, PooledClient, TransactionBuilder};
 pub use staging::quarantine::HeldKeyRetry;
 pub use staging::{
     CaptureFault, CorrectingNode, Divergence, DrainFailure, HeldKeys, HiddenTableSize,

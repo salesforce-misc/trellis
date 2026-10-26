@@ -84,7 +84,7 @@ pub fn applying_sql(alias: &str) -> String {
 /// chunk, or the plan job's one absolute write for an aggregate or a `JOIN`)
 /// moves it to [`TransformStatus::Live`]. Its resume rebuilds it the same way.
 ///
-/// Apply maintains a definition that is [`TransformStatus::is_applying`]:
+/// Apply maintains a definition that is applying:
 /// `live` or `catching_up`. Only `live` tells an operator the target is in
 /// its steady state (ADR-0002, "What `live` promises").
 ///
@@ -123,7 +123,7 @@ pub enum TransformStatus {
 }
 
 impl TransformStatus {
-    /// Every variant, once — the list [`Self::dispatchable`] derives the
+    /// Every variant, once — the list the engine derives the
     /// chunk queue's positive allowlist from, so that gate can never drift
     /// out of step with this enum the way a hand-written `status <> 'paused'`
     /// denylist did (issue #231).
@@ -184,7 +184,7 @@ impl TransformStatus {
     /// that is not frozen" is the real rule, and stating it positively means a
     /// status added later has to be *chosen* into dispatch instead of falling
     /// into it (issue #231).
-    pub fn dispatchable() -> Vec<&'static str> {
+    pub(crate) fn dispatchable() -> Vec<&'static str> {
         TransformStatus::ALL
             .iter()
             .filter(|status| !status.is_frozen())

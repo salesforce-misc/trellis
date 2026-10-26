@@ -13,7 +13,7 @@
 //!    gets a session `statement_timeout` of the budget remaining at checkout,
 //!    and every transaction opened through the pooled client sets a
 //!    `SET LOCAL statement_timeout` for the budget remaining when it begins
-//!    (see [`crate::pool::Client::transaction`]). Postgres starts a fresh
+//!    (see [`crate::PooledClient::transaction`]). Postgres starts a fresh
 //!    timer per statement and the timer covers lock waits, so a statement
 //!    stuck on a lock is abandoned by the server and its transaction rolls
 //!    back. No `cancel_query`: a cancel request can land on the connection's
@@ -24,7 +24,7 @@
 //!    [`BACKSTOP_GRACE`] after the deadline, for a connection that stopped
 //!    answering altogether. The abandoned statement is still bounded on the
 //!    server by (1), and the connection it was on stays out of the pool until
-//!    the server has finished with it (see [`crate::pool::Client`]'s `Drop`).
+//!    the server has finished with it (see [`crate::PooledClient`]'s `Drop`).
 //!
 //! A call that runs out of budget rolls back and returns
 //! [`TrellisError::CallTimeout`] ([`crate::ErrorCode::Timeout`]).
@@ -164,7 +164,7 @@ pub(crate) struct BudgetExpired {
 /// The server stops the work at the deadline. Past it by [`BACKSTOP_GRACE`]
 /// the step's future is dropped, for a connection that stopped answering, and
 /// the connection stays out of the pool until the server has finished with
-/// what it left (see [`crate::pool::Client`]'s `Drop`).
+/// what it left (see [`crate::PooledClient`]'s `Drop`).
 ///
 /// A step already inside a deadline keeps it, like [`bounded`].
 pub(crate) async fn within<T>(

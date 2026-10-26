@@ -226,10 +226,10 @@ let worker = Trellis::connect(
 The `trellis` library's public surface is its crate root. `Trellis` (async) and
 `BlockingTrellis` (for threads without a Tokio runtime) are the front doors,
 built from a `Config` and `TrellisOptions`; `Client` starts the in-process
-workers directly. `migrate`, `Pool`, `Metrics`, `statement_kind` and, behind the
-`otlp` feature, `otel` are the building blocks beneath them, and `Error`,
-`ErrorCode` and the error and status types the facade returns are exported
-alongside. The engine's modules are private. `.github/public-api.txt` lists
+workers directly. `migrate`, `Pool` (whose `get` hands out a `PooledClient`),
+`Metrics`, `statement_kind` and, behind the `otlp` feature, `otel` are the
+building blocks beneath them, and `Error`, `ErrorCode` and the error and status
+types the facade returns are exported alongside. The engine's modules are private. `.github/public-api.txt` lists
 every public item.
 
 ## TLS to Postgres

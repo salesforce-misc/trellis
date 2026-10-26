@@ -174,7 +174,7 @@ pub enum ApplyError {
     ColumnNotPaused { transform: String, column: String },
     /// `super::quarantine::resume_column` was asked to resume a column
     /// whose owning definition is not currently applying
-    /// ([`crate::defs::model::TransformStatus::is_applying`]: `live` or
+    /// (`live` or
     /// `catching_up`) — most concretely, a definition still `Backfilling`
     /// behind an in-flight `backfill_chunks` queue nothing is draining. `resume_column`
     /// takes one snapshot of the *source* table and only clears

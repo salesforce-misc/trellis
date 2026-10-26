@@ -38,21 +38,21 @@ use std::time::Duration;
 /// does, and behaves the same, with one difference for a checkout made inside
 /// a public call (issue #599, `crate::deadline`): it was handed out with a
 /// session `statement_timeout` of the call's remaining budget, and
-/// [`Client::transaction`]/[`Client::build_transaction`] set the budget then
+/// [`PooledClient::transaction`]/[`PooledClient::build_transaction`] set the budget then
 /// remaining for each transaction. When it drops, the setting is reset
 /// *before* the connection goes back to the pool, on a task of its own, so a
 /// later borrower (a background worker) never inherits a call's timeout. That
 /// reset queues behind whatever the connection is still doing, so a statement
 /// an abandoned call left running keeps its connection out of the pool until
 /// the server has finished with it.
-pub struct Client {
+pub struct PooledClient {
     inner: Option<deadpool_postgres::Client>,
     /// `Some` when this checkout ran under a call's deadline: how long to
     /// wait for the connection to settle before giving up on it.
     settle: Option<Duration>,
 }
 
-impl Client {
+impl PooledClient {
     fn plain(inner: deadpool_postgres::Client) -> Self {
         Self {
             inner: Some(inner),
@@ -76,7 +76,7 @@ impl Client {
 
     /// `deadpool_postgres::ClientWrapper::build_transaction`; its
     /// [`TransactionBuilder::start`] bounds the transaction like
-    /// [`Client::transaction`].
+    /// [`PooledClient::transaction`].
     pub fn build_transaction(&mut self) -> TransactionBuilder<'_> {
         TransactionBuilder {
             inner: self.wrapper_mut().build_transaction(),
@@ -96,28 +96,32 @@ async fn bound_transaction(
     Ok(())
 }
 
-/// [`Client::build_transaction`]'s builder: `deadpool_postgres`'s, whose
+/// [`PooledClient::build_transaction`]'s builder: `deadpool_postgres`'s, whose
 /// `start` also bounds the transaction by the running call's budget.
 pub struct TransactionBuilder<'a> {
     inner: deadpool_postgres::TransactionBuilder<'a>,
 }
 
 impl<'a> TransactionBuilder<'a> {
+    /// The transaction's isolation level.
     pub fn isolation_level(mut self, isolation_level: tokio_postgres::IsolationLevel) -> Self {
         self.inner = self.inner.isolation_level(isolation_level);
         self
     }
 
+    /// Whether the transaction is read-only.
     pub fn read_only(mut self, read_only: bool) -> Self {
         self.inner = self.inner.read_only(read_only);
         self
     }
 
+    /// Whether the transaction is deferrable.
     pub fn deferrable(mut self, deferrable: bool) -> Self {
         self.inner = self.inner.deferrable(deferrable);
         self
     }
 
+    /// Begins the transaction.
     pub async fn start(self) -> Result<deadpool_postgres::Transaction<'a>, tokio_postgres::Error> {
         let txn = self.inner.start().await?;
         bound_transaction(&txn).await?;
@@ -125,13 +129,13 @@ impl<'a> TransactionBuilder<'a> {
     }
 }
 
-impl std::fmt::Debug for Client {
+impl std::fmt::Debug for PooledClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Client").finish_non_exhaustive()
+        f.debug_struct("PooledClient").finish_non_exhaustive()
     }
 }
 
-impl std::ops::Deref for Client {
+impl std::ops::Deref for PooledClient {
     type Target = deadpool_postgres::ClientWrapper;
 
     fn deref(&self) -> &Self::Target {
@@ -139,13 +143,13 @@ impl std::ops::Deref for Client {
     }
 }
 
-impl std::ops::DerefMut for Client {
+impl std::ops::DerefMut for PooledClient {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.wrapper_mut()
     }
 }
 
-impl Drop for Client {
+impl Drop for PooledClient {
     fn drop(&mut self) {
         let Some(settle) = self.settle else {
             return;
@@ -312,9 +316,9 @@ impl Pool {
     /// longer than the call has left, and hands the connection out with its
     /// `statement_timeout` set to that, so the server abandons a statement
     /// the call can no longer wait for.
-    pub async fn get(&self) -> Result<Client, Error> {
+    pub async fn get(&self) -> Result<PooledClient, Error> {
         let Some(deadline) = crate::deadline::current() else {
-            return Ok(Client::plain(self.inner.get().await?));
+            return Ok(PooledClient::plain(self.inner.get().await?));
         };
         let remaining = deadline.remaining();
         if remaining.is_zero() {
@@ -327,7 +331,7 @@ impl Pool {
             create: Some(remaining),
             recycle: Some(remaining),
         };
-        let mut client = Client::plain(self.inner.timeout_get(&timeouts).await?);
+        let mut client = PooledClient::plain(self.inner.timeout_get(&timeouts).await?);
         client.settle = Some(deadline.settle_time());
         client
             .simple_query(&deadline.set_statement_timeout_sql(false))

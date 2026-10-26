@@ -240,8 +240,8 @@ async fn a_definition_entering_a_build_state_announces_itself() {
             status.as_str()
         ))
         .await;
-        let dispatchable =
-            trellis::defs::TransformStatus::dispatchable().contains(&status.as_str());
+        // The work-wake trigger's gate is the chunk queue's: not frozen.
+        let dispatchable = !status.is_frozen();
         assert_eq!(
             f.listener.heard().await,
             usize::from(dispatchable),

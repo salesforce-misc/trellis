@@ -454,7 +454,7 @@ fn value_type_for_builtin_oid(type_oid: u32) -> ValueType {
 /// `docs/type-support.md`'s enum section.
 ///
 /// Generic over [`GenericClient`] (issue #241's `ALTER TRANSFORM` type-change
-/// refusal) rather than pinned to a pooled [`crate::pool::Client`): that
+/// refusal) rather than pinned to a pooled [`crate::PooledClient`): that
 /// refusal's authoritative recheck runs under `alter_transform`'s own
 /// row-locking transaction, and taking a *second* pooled connection while
 /// already mid-transaction is the "classic pool-exhaustion deadlock"

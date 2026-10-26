@@ -188,7 +188,6 @@ async fn the_probe_follows_the_claims_definition_status_gate() {
     trellis::client::reconcile_pass(&mut f.raw, &f.db.pool, DEFAULT_SCHEMA)
         .await
         .expect("reconcile pass");
-    let dispatchable = trellis::defs::TransformStatus::dispatchable();
     for status in trellis::defs::TransformStatus::ALL {
         f.raw
             .batch_execute(&format!(
@@ -197,7 +196,8 @@ async fn the_probe_follows_the_claims_definition_status_gate() {
             ))
             .await
             .expect("set status");
-        let claimable = dispatchable.contains(&status.as_str());
+        // The claim's gate: a frozen definition is handed no new work.
+        let claimable = !status.is_frozen();
         let probe = build::work_probe(&f.db.pool).await.expect("probe");
         assert_eq!(probe.may_exist, claimable, "probe at {}", status.as_str());
         let claimed = chunk_queue::claim_chunks_of(&f.raw, "w", 100, &["plan"])

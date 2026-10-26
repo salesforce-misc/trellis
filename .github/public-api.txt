@@ -108,6 +108,8 @@ function ParseError::code
 function PendingCall::wait
 function Pool::get
 function Pool::new
+function PooledClient::build_transaction
+function PooledClient::transaction
 function QuarantineState::as_str
 function QuarantineTarget::parse
 function QuarantineTarget::transform
@@ -119,8 +121,11 @@ function SourceIndexGap::fix
 function StagingError::code
 function StatementKind::as_str
 function StatementKind::keywords
+function TransactionBuilder::deferrable
+function TransactionBuilder::isolation_level
+function TransactionBuilder::read_only
+function TransactionBuilder::start
 function TransformStatus::as_str
-function TransformStatus::dispatchable
 function TransformStatus::from_persisted
 function TransformStatus::is_frozen
 function Trellis::apply
@@ -171,10 +176,12 @@ struct PendingCall
 struct PoisonEntry
 struct PoisonSample
 struct Pool
+struct PooledClient
 struct QuarantineEntry
 struct SelfCheckJob
 struct SelfCheckReport
 struct Shutdown
 struct SourceIndexGap
+struct TransactionBuilder
 struct Trellis
 struct TrellisOptions
