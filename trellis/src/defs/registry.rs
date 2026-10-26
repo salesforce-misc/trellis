@@ -177,8 +177,25 @@ pub fn operator_result_type(op: Operator, lhs: ValueType, rhs: ValueType) -> Opt
             (ValueType::Integer(a), ValueType::Integer(b)) => ValueType::Integer(a.wider(b)),
             _ => ValueType::Numeric,
         },
+        // A float against an exact numeric is refused: Postgres resolves it
+        // by casting the exact side to `double precision`, so the comparison
+        // inherits float rounding (`0.1::numeric + 0.2 = 0.3::float8` is
+        // false). `float > float` and `exact > exact` are admitted.
+        Operator::GreaterThan if is_mixed_float_exact(lhs, rhs) => return None,
         Operator::GreaterThan => ValueType::Boolean,
     })
+}
+
+/// Whether one operand is a float and the other an exact numeric (an integer
+/// of any width, or `numeric`): the pair `>` refuses at define time.
+pub fn is_mixed_float_exact(lhs: ValueType, rhs: ValueType) -> bool {
+    matches!(
+        (lhs, rhs),
+        (ValueType::Float(_), r) if r.is_exact_numeric_family()
+    ) || matches!(
+        (lhs, rhs),
+        (l, ValueType::Float(_)) if l.is_exact_numeric_family()
+    )
 }
 
 /// One function the grammar accepts, and the arity/types the parser and
@@ -500,8 +517,24 @@ mod tests {
                 Some(ValueType::Float(Float8)),
                 "{other} + real"
             );
+        }
+        // `>` admits float > float and exact > exact, and refuses the mix.
+        assert_eq!(
+            operator_result_type(Operator::GreaterThan, f4, f8),
+            Some(ValueType::Boolean)
+        );
+        for exact in [
+            ValueType::Numeric,
+            ValueType::Integer(IntWidth::Int2),
+            ValueType::Integer(IntWidth::Int4),
+            ValueType::Integer(IntWidth::Int8),
+        ] {
+            for f in [f4, f8] {
+                assert_eq!(operator_result_type(Operator::GreaterThan, f, exact), None);
+                assert_eq!(operator_result_type(Operator::GreaterThan, exact, f), None);
+            }
             assert_eq!(
-                operator_result_type(Operator::GreaterThan, f4, other),
+                operator_result_type(Operator::GreaterThan, exact, ValueType::Numeric),
                 Some(ValueType::Boolean)
             );
         }

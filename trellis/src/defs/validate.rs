@@ -186,6 +186,16 @@ pub enum ValidationError {
         expected: ValueType,
         found: ValueType,
     },
+    /// `>` was given a float on one side and an exact numeric (an integer of
+    /// any width, or `numeric`) on the other. Postgres casts the exact side
+    /// to `double precision`, so the comparison inherits float rounding;
+    /// Trellis refuses the pair rather than admit a comparison that doesn't
+    /// compose (issue #1418).
+    MixedFloatExactComparison {
+        field: String,
+        lhs: ValueType,
+        rhs: ValueType,
+    },
     /// A function call's argument had the wrong [`ValueType`] for its
     /// position (issue #64) — e.g. `octet_length(1)`. Distinct from
     /// [`ValidationError::TypeMismatch`] so the message can name the
@@ -739,6 +749,13 @@ impl fmt::Display for ValidationError {
             } => write!(
                 f,
                 "calculated field '{field}' expects a {expected} value here, found {found}"
+            ),
+            ValidationError::MixedFloatExactComparison { field, lhs, rhs } => write!(
+                f,
+                "calculated field '{field}' compares a {lhs} value with a {rhs} value using \
+                 '>'; a float and an exact numeric (an integer or numeric) cannot be \
+                 compared, because Postgres would round the exact side to a float. Compare \
+                 values of one family: rewrite so both sides are floats or both are exact"
             ),
             ValidationError::FunctionArgTypeMismatch {
                 field,
@@ -2659,6 +2676,15 @@ fn infer_expr(
             if let Some(result) = super::registry::operator_result_type(*op, lhs_t, rhs_t) {
                 return Ok(result);
             }
+            if matches!(op, super::ast::Operator::GreaterThan)
+                && super::registry::is_mixed_float_exact(lhs_t, rhs_t)
+            {
+                return Err(ValidationError::MixedFloatExactComparison {
+                    field: field_name.to_string(),
+                    lhs: lhs_t,
+                    rhs: rhs_t,
+                });
+            }
             // Blame the operand that actually isn't admissible. At least one
             // of them isn't (or resolution above would have succeeded), and
             // the left one is reported first so the error reads in source
@@ -3637,6 +3663,89 @@ mod tests {
                 found: ValueType::Text,
             }
         );
+    }
+
+    fn gt(lhs: Expr, rhs: Expr) -> Expr {
+        Expr::BinaryOp {
+            op: Operator::GreaterThan,
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        }
+    }
+
+    #[test]
+    fn greater_than_refuses_a_float_against_an_exact_numeric_in_both_orders() {
+        let source_columns = HashMap::from([
+            ("f".to_string(), ValueType::Float(FloatWidth::Float4)),
+            ("d".to_string(), ValueType::Float(FloatWidth::Float8)),
+            ("n".to_string(), ValueType::Numeric),
+            ("i".to_string(), ValueType::Integer(IntWidth::Int4)),
+        ]);
+        for (float, exact) in [("f", "n"), ("f", "i"), ("d", "n"), ("d", "i")] {
+            for (l, r) in [(float, exact), (exact, float)] {
+                let d = def(vec![FieldDef {
+                    name: "out".to_string(),
+                    expr: gt(col(l), col(r)),
+                }]);
+                assert_eq!(
+                    validate(&d, &source_columns),
+                    Err(ValidationError::MixedFloatExactComparison {
+                        field: "out".to_string(),
+                        lhs: source_columns[l],
+                        rhs: source_columns[r],
+                    }),
+                    "{l} > {r}"
+                );
+            }
+        }
+        // float > float and exact > exact stay admitted.
+        for (l, r) in [("f", "d"), ("d", "f"), ("n", "i"), ("i", "n")] {
+            let d = def(vec![FieldDef {
+                name: "out".to_string(),
+                expr: gt(col(l), col(r)),
+            }]);
+            assert_eq!(validate(&d, &source_columns), Ok(()), "{l} > {r}");
+        }
+    }
+
+    #[test]
+    fn greater_than_refuses_the_mix_through_a_calculated_float_field() {
+        // `s` is a float (`real + integer` is `double precision`), so `s > n`
+        // is a float against an exact numeric even though no source column
+        // on either side of the `>` is a float... on its own.
+        let source_columns = HashMap::from([
+            ("f".to_string(), ValueType::Float(FloatWidth::Float4)),
+            ("n".to_string(), ValueType::Numeric),
+        ]);
+        for flip in [false, true] {
+            let (l, r) = if flip { ("n", "s") } else { ("s", "n") };
+            let d = def(vec![
+                FieldDef {
+                    name: "s".to_string(),
+                    expr: Expr::BinaryOp {
+                        op: Operator::Add,
+                        lhs: Box::new(col("f")),
+                        rhs: Box::new(Expr::NumberLiteral("1".to_string())),
+                    },
+                },
+                FieldDef {
+                    name: "out".to_string(),
+                    expr: gt(col(l), col(r)),
+                },
+            ]);
+            let err = validate(&d, &source_columns).unwrap_err();
+            assert!(
+                matches!(err, ValidationError::MixedFloatExactComparison { ref field, .. } if field == "out"),
+                "{err:?}"
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.contains("'out'")
+                    && msg.contains("double precision")
+                    && msg.contains("numeric"),
+                "{msg}"
+            );
+        }
     }
 
     #[test]

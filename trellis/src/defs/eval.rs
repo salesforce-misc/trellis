@@ -1155,6 +1155,8 @@ fn apply_operator(
             (Value::Float(_, a), Value::Float(_, b)) => Some(Value::Boolean(
                 float::compare(a, b) == std::cmp::Ordering::Greater,
             )),
+            // A float against an exact numeric is refused at define (#1418),
+            // so these two arms are reached only by a hand-built AST.
             (Value::Float(_, a), rhs) => as_float(rhs)
                 .map(|b| Value::Boolean(float::compare(a, b) == std::cmp::Ordering::Greater)),
             (lhs, Value::Float(_, b)) => as_float(lhs)

@@ -222,7 +222,10 @@ Postgres, not IEEE 754, is the oracle: `NaN = NaN` is true, `NaN` sorts above
 is `real`, a float mixed with anything else is `double precision`, a finite
 overflow raises `22003`, `sum(real)` is `real`, `avg(real)` is
 `double precision`. `COALESCE` resolves a `real`/`numeric` pair to `real`,
-unlike the operators, and is modelled separately. Floats are refused as every
+unlike the operators, and is modelled separately. `+` admits a float mixed
+with an exact numeric, but `>` refuses that pair at define
+([Supported sources and targets](transforms.md#supported-sources-and-targets)):
+Postgres would cast the exact side to `double precision`. Floats are refused as every
 key role: `-0` and `0` are equal but render as `'-0'` and `'0'`, which would
 split one group into two target rows. `SUM` and `AVG` over a float are refused
 at define ([#1119](https://github.com/salesforce-misc/trellis/issues/1119)):
