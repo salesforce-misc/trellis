@@ -223,9 +223,13 @@ is `real`, a float mixed with anything else is `double precision`, a finite
 overflow raises `22003`, `sum(real)` is `real`, `avg(real)` is
 `double precision`. `COALESCE` resolves a `real`/`numeric` pair to `real`,
 unlike the operators, and is modelled separately. `+` admits a float mixed
-with an exact numeric, but `>` refuses that pair at define
-([Supported sources and targets](transforms.md#supported-sources-and-targets)):
-Postgres would cast the exact side to `double precision`. Floats are refused as every
+with an exact numeric. `>` admits a float against a bare number literal
+(`f > 0.5`, `f > 1`) and refuses a float against any other exact numeric
+([Supported sources and targets](transforms.md#supported-sources-and-targets)).
+As in Postgres, the literal is cast to `double precision` and a `real` operand
+is widened to `double precision`, so the comparison runs in `double precision`:
+with `r = 0.1::real`, `r > 0.1` is true (the widened `r` is 0.10000000149...),
+`r = 0.1` is false and `r > 0.1::real` is false. Floats are refused as every
 key role: `-0` and `0` are equal but render as `'-0'` and `'0'`, which would
 split one group into two target rows. `SUM` and `AVG` over a float are refused
 at define ([#1119](https://github.com/salesforce-misc/trellis/issues/1119)):

@@ -180,7 +180,9 @@ pub fn operator_result_type(op: Operator, lhs: ValueType, rhs: ValueType) -> Opt
         // A float against an exact numeric is refused: Postgres resolves it
         // by casting the exact side to `double precision`, so the comparison
         // inherits float rounding (`0.1::numeric + 0.2 = 0.3::float8` is
-        // false). `float > float` and `exact > exact` are admitted.
+        // false). `float > float` and `exact > exact` are admitted, and so
+        // is a float against a *bare number literal*, but that exemption
+        // needs the operand's syntax, which only `validate::infer_expr` sees.
         Operator::GreaterThan if is_mixed_float_exact(lhs, rhs) => return None,
         Operator::GreaterThan => ValueType::Boolean,
     })

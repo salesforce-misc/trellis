@@ -320,6 +320,24 @@ pub fn parse(text: &str, width: FloatWidth) -> Result<f64, FloatError> {
     Ok(value)
 }
 
+/// A bare number literal (`0.5`, `3000000000`: digits with an optional
+/// fraction, no sign or exponent) as the `double precision` constant
+/// Postgres casts it to when it meets a float operand: correctly rounded,
+/// and an error where `float8in` errors (overflow past the finite range, or
+/// a nonzero value that underflows to zero; subnormals are accepted).
+pub fn literal_to_f64(text: &str) -> Result<f64, FloatError> {
+    let width = FloatWidth::Float8;
+    let value: f64 = text.parse().map_err(|_| FloatError::Invalid {
+        width,
+        text: text.to_string(),
+    })?;
+    let nonzero_digits = text.bytes().any(|b| (b'1'..=b'9').contains(&b));
+    if !value.is_finite() || (value == 0.0 && nonzero_digits) {
+        return Err(FloatError::OutOfRange { width });
+    }
+    Ok(value)
+}
+
 /// Renders a float exactly as Postgres's `float4out`/`float8out` do under
 /// `extra_float_digits >= 1` — the shortest decimal that round-trips,
 /// formatted with Postgres's own fixed-vs-scientific rule.

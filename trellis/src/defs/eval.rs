@@ -1109,9 +1109,10 @@ fn reduce_numeric_aggregate(
 /// So `Float + anything` is the binary-float path, `Float + Float` is that
 /// path at the wider of the two widths, and only an all-exact pair reaches
 /// the integer/`numeric` arms below. `>` admits only `Float > Float` among
-/// the floats: a float against an exact numeric is refused at define
-/// (#1418), so that pair falls to the `None` fallback like any other
-/// inadmissible one.
+/// the floats, plus a float against a *bare number literal*, which Postgres
+/// casts to `double precision` (a `real` operand widens to it): any other
+/// float against an exact numeric is refused at define (#1418), so the
+/// evaluator can't tell a literal from a column here and doesn't need to.
 ///
 /// `>` on floats routes through [`crate::float::compare`], **not** `f64`'s
 /// `PartialOrd` — Postgres's float order is total (`NaN` above everything,
@@ -1158,6 +1159,14 @@ fn apply_operator(
             (Value::Float(_, a), Value::Float(_, b)) => Some(Value::Boolean(
                 float::compare(a, b) == std::cmp::Ordering::Greater,
             )),
+            // A float against a bare number literal (the only mixed pair
+            // the validator admits, #1418): Postgres casts the literal to
+            // `double precision` and widens a `real` operand to it, so the
+            // comparison runs in `f64`. Never narrow the literal to `f32`.
+            (Value::Float(_, a), rhs) => as_float(rhs)
+                .map(|b| Value::Boolean(float::compare(a, b) == std::cmp::Ordering::Greater)),
+            (lhs, Value::Float(_, b)) => as_float(lhs)
+                .map(|a| Value::Boolean(float::compare(a, b) == std::cmp::Ordering::Greater)),
             (Value::Integer(_, a), Value::Integer(_, b)) => Some(Value::Boolean(a > b)),
             (lhs, rhs) => match (as_numeric(lhs), as_numeric(rhs)) {
                 (Some(a), Some(b)) => {

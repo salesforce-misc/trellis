@@ -633,6 +633,87 @@ async fn float_text_rendering_is_byte_identical_to_postgres_through_the_evaluato
 // 5. Values, against an independently-written SQL query
 // ---------------------------------------------------------------------
 
+/// #1418: a float against a *bare* number literal compares as Postgres does,
+/// in `double precision`: the literal is cast to `float8` and a `real`
+/// operand widens to it, so `0.1::real > 0.1` is true (the widened real is
+/// 0.10000000149...). Every verdict below is read from the server and the
+/// evaluator must agree; narrowing the literal to `f32` flips the `r` rows.
+#[tokio::test]
+async fn a_float_against_a_bare_literal_compares_in_double_precision_like_postgres() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    let r_text: String = client
+        .query_one("select 0.1::real::text", &[])
+        .await
+        .expect("real text")
+        .get(0);
+    let d_text: String = client
+        .query_one("select 0.1::float8::text", &[])
+        .await
+        .expect("double text")
+        .get(0);
+    let columns = HashMap::from([
+        ("r".to_string(), ValueType::Float(FloatWidth::Float4)),
+        ("d".to_string(), ValueType::Float(FloatWidth::Float8)),
+    ]);
+    let row: Row = HashMap::from([
+        ("r".to_string(), Some(r_text)),
+        ("d".to_string(), Some(d_text)),
+    ]);
+
+    let exprs = [
+        "r > 0.1",
+        "0.1 > r",
+        "d > 0.1",
+        "0.1 > d",
+        "r > 0.1000000014",
+        "r > 0.1000000015",
+        "0.1000000015 > r",
+        "r > 0",
+        "0 > r",
+        "r > 1",
+        "d > 0.09999999999999999",
+        "d > 0.10000000000000001",
+        "d > 3000000000",
+        "3000000000 > d",
+        "r > 9223372036854775808",
+        "COALESCE(r, 0) > 0.1",
+        "COALESCE(d, 0.1) > 0.1",
+        "r > r",
+        "r > d",
+        "d > r",
+    ];
+    for expr in exprs {
+        let def = parse(&format!("TRANSFORM t FROM s SELECT {expr} AS out")).expect("parse");
+        assert_eq!(validate(&def, &columns), Ok(()), "{expr}");
+        let oracle: bool = client
+            .query_one(
+                &format!("select {expr} from (select 0.1::real as r, 0.1::float8 as d) t"),
+                &[],
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{expr}: {e}"))
+            .get(0);
+        let values = evaluate(&def, &row, &columns, &mut RegexCache::new())
+            .unwrap_or_else(|e| panic!("{expr}: {e}"));
+        assert_eq!(
+            values["out"],
+            Some(Value::Boolean(oracle)),
+            "{expr}: Postgres says {oracle}"
+        );
+    }
+
+    // The headline pair, stated outright.
+    let headline = client
+        .query_one("select 0.1::real > 0.1, 0.1::real > 0.1::real", &[])
+        .await
+        .expect("headline");
+    assert!(headline.get::<_, bool>(0));
+    assert!(!headline.get::<_, bool>(1));
+}
+
 // ---------------------------------------------------------------------
 // 6. Key roles: deliberately refused, and why
 // ---------------------------------------------------------------------

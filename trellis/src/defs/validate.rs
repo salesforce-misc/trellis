@@ -196,6 +196,10 @@ pub enum ValidationError {
         lhs: ValueType,
         rhs: ValueType,
     },
+    /// A bare number literal compared with a float lies outside
+    /// `double precision`'s range (overflow, or a nonzero value that
+    /// underflows to zero). Postgres raises `22003` for it at plan time.
+    FloatComparisonLiteralOutOfRange { field: String, text: String },
     /// A function call's argument had the wrong [`ValueType`] for its
     /// position (issue #64) — e.g. `octet_length(1)`. Distinct from
     /// [`ValidationError::TypeMismatch`] so the message can name the
@@ -750,13 +754,18 @@ impl fmt::Display for ValidationError {
                 f,
                 "calculated field '{field}' expects a {expected} value here, found {found}"
             ),
+            ValidationError::FloatComparisonLiteralOutOfRange { field, text } => write!(
+                f,
+                "calculated field '{field}' compares a float with the literal {text}, which is \
+                 out of range for double precision"
+            ),
             ValidationError::MixedFloatExactComparison { field, lhs, rhs } => write!(
                 f,
                 "calculated field '{field}' compares a {lhs} value with a {rhs} value using \
                  '>'; a float and an exact numeric (an integer or numeric) cannot be \
                  compared, because Postgres would round the exact side to a float. Compare \
                  values of one family: rewrite so both sides are floats or both are exact \
-                 (against a float, type a literal: DOUBLE PRECISION '0.5')"
+                 (only a bare number literal such as 0.5 is admitted against a float)"
             ),
             ValidationError::FunctionArgTypeMismatch {
                 field,
@@ -2680,6 +2689,34 @@ fn infer_expr(
             if matches!(op, super::ast::Operator::GreaterThan)
                 && super::registry::is_mixed_float_exact(lhs_t, rhs_t)
             {
+                // A *bare* number literal against a float is Postgres's
+                // `float_col > 0.5`: the untyped literal is cast to
+                // `double precision` (a `real` operand widens to it) and
+                // the comparison runs as `float8`. Only the literal's own
+                // syntax is exempt: the same value in a column, a calculated
+                // field, an expression or a typed `NUMERIC '0.5'` literal
+                // still hits the refusal below.
+                let literal = match (&**lhs, &**rhs) {
+                    (Expr::NumberLiteral(text), _) if matches!(rhs_t, ValueType::Float(_)) => {
+                        Some(text)
+                    }
+                    (_, Expr::NumberLiteral(text)) if matches!(lhs_t, ValueType::Float(_)) => {
+                        Some(text)
+                    }
+                    _ => None,
+                };
+                if let Some(text) = literal {
+                    // Postgres raises `22003` at plan time for a literal
+                    // outside `double precision`'s range; refuse it at
+                    // define instead of failing every row.
+                    crate::float::literal_to_f64(text).map_err(|_| {
+                        ValidationError::FloatComparisonLiteralOutOfRange {
+                            field: field_name.to_string(),
+                            text: text.clone(),
+                        }
+                    })?;
+                    return Ok(ValueType::Boolean);
+                }
                 return Err(ValidationError::MixedFloatExactComparison {
                     field: field_name.to_string(),
                     lhs: lhs_t,
@@ -3750,11 +3787,14 @@ mod tests {
     }
 
     #[test]
-    fn greater_than_types_a_bare_number_literal_as_exact() {
-        // #1418: a bare literal is exact (`1` is integer, `0.5` numeric, as
-        // Postgres's lexer types them), so it is refused against a float; a
-        // typed float literal is the remedy. `COALESCE(real, numeric)` is
-        // `real`, so it is a float operand too.
+    fn greater_than_admits_a_bare_number_literal_against_a_float() {
+        // #1418: Postgres casts an untyped literal to `double precision`
+        // when it meets a float (`explain verbose select r > 0.5` shows
+        // `r > '0.5'::double precision`), so a *bare* literal is admitted in
+        // either order and stays compared as a float. The same value in a
+        // column, a calculated field or an expression is still refused, and
+        // so is anything exact-typed (the grammar has no `NUMERIC '..'` /
+        // `INTEGER '..'` literal, so those fail to parse).
         let source_columns = HashMap::from([
             ("f".to_string(), ValueType::Float(FloatWidth::Float4)),
             ("d".to_string(), ValueType::Float(FloatWidth::Float8)),
@@ -3764,19 +3804,14 @@ mod tests {
         ]);
         for expr in [
             "f > 0.5",
+            "f > 1",
+            "0.5 > f",
             "1 > d",
             "d > 9223372036854775808",
-            "COALESCE(f, n) > n",
-            "(f + i) > b",
-        ] {
-            let d = parsed(&format!("TRANSFORM t FROM s SELECT {expr} AS out"));
-            let err = validate(&d, &source_columns).unwrap_err();
-            assert!(
-                matches!(err, ValidationError::MixedFloatExactComparison { ref field, .. } if field == "out"),
-                "{expr}: {err:?}"
-            );
-        }
-        for expr in [
+            "d > 3000000000",
+            "COALESCE(f, 0) > 0.5",
+            "COALESCE(f, n) > 1",
+            "f > f",
             "f > REAL '0.5'",
             "DOUBLE PRECISION '1' > d",
             "f > d",
@@ -3788,6 +3823,55 @@ mod tests {
             let d = parsed(&format!("TRANSFORM t FROM s SELECT {expr} AS out"));
             assert_eq!(validate(&d, &source_columns), Ok(()), "{expr}");
         }
+        for expr in [
+            "COALESCE(f, n) > n",
+            "(f + i) > b",
+            "f > (1 + 1)",
+            "f > (i + 1)",
+            "(1 + 1) > d",
+            "f > n",
+            "i > d",
+            "(f + 1) > n",
+        ] {
+            let d = parsed(&format!("TRANSFORM t FROM s SELECT {expr} AS out"));
+            let err = validate(&d, &source_columns).unwrap_err();
+            assert!(
+                matches!(err, ValidationError::MixedFloatExactComparison { ref field, .. } if field == "out"),
+                "{expr}: {err:?}"
+            );
+        }
+        for expr in ["f > NUMERIC '0.5'", "f > INTEGER '1'"] {
+            assert!(
+                crate::defs::parser::parse(&format!("TRANSFORM t FROM s SELECT {expr} AS out"))
+                    .is_err(),
+                "{expr}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bare_literal_outside_double_precision_is_refused_at_define() {
+        // Postgres raises 22003 for these at plan time (`select
+        // 1<309 digits>::float8`, and a nonzero value that underflows).
+        let source_columns =
+            HashMap::from([("f".to_string(), ValueType::Float(FloatWidth::Float4))]);
+        let big = "9".repeat(310);
+        let tiny = format!("0.{}1", "0".repeat(400));
+        let subnormal = format!("0.{}5", "0".repeat(323)); // 5e-324, finite
+        for text in [&big, &tiny] {
+            let d = parsed(&format!("TRANSFORM t FROM s SELECT f > {text} AS out"));
+            assert_eq!(
+                validate(&d, &source_columns),
+                Err(ValidationError::FloatComparisonLiteralOutOfRange {
+                    field: "out".to_string(),
+                    text: text.clone(),
+                })
+            );
+        }
+        let d = parsed(&format!("TRANSFORM t FROM s SELECT f > {subnormal} AS out"));
+        assert_eq!(validate(&d, &source_columns), Ok(()));
+        let d = parsed("TRANSFORM t FROM s SELECT f > 0.0000 AS out");
+        assert_eq!(validate(&d, &source_columns), Ok(()));
     }
 
     #[test]
@@ -4800,7 +4884,7 @@ mod tests {
     #[test]
     fn join_greater_than_refuses_a_float_against_an_exact_aggregate() {
         // #1418: a JOIN's fields are typed by the same rule as a 1-1's. A
-        // float aggregate is refused there, so a typed literal is the float.
+        // float aggregate is refused there, even against a typed float literal.
         let err = check("orders.region AS region, SUM(items.qty) > DOUBLE PRECISION '1' AS x")
             .unwrap_err();
         assert!(
