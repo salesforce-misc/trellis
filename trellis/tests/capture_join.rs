@@ -741,9 +741,26 @@ async fn a3_join_and_drop_wait_out_an_open_writer_without_stalling_other_writers
         None,
         "the join waits out the open writer"
     );
+    // The wait is recorded when a capture pass ends, which is one DDL budget
+    // (1 s) plus a reconcile interval after the join is defined, and a loaded
+    // box can stretch that past the hold window. The holder is still open, so
+    // the report is certain to appear: wait for it rather than for a window.
+    eventually(
+        Duration::from_secs(30),
+        "the join's wait is reported",
+        || async {
+            trellis
+                .status("tu")
+                .await
+                .expect("status")
+                .expect("tu")
+                .capture_wait
+                .is_some()
+        },
+    )
+    .await;
     let waiting = trellis.status("tu").await.expect("status").expect("tu");
     assert_eq!(waiting.status, TransformStatus::WaitingToBackfill);
-    assert!(waiting.capture_wait.is_some(), "{waiting:?}");
     holder
         .batch_execute("commit")
         .await
