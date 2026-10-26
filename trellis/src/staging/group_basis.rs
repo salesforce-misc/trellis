@@ -3825,6 +3825,105 @@ mod tests {
         txn.rollback().await.expect("rollback");
     }
 
+    /// [`a_join_t_write_of_a_group_with_no_hidden_row_is_an_error`] over a
+    /// composite text-keyed group and a `COUNT(*)`, `COUNT(h)`, `AVG(b)`
+    /// shape (a counted-only argument next to a summed one), with one staged
+    /// group locked and one not: the page's statement returns a written
+    /// group's row and the sentinel together, so their columns must agree,
+    /// and the page still fails, counting only the unlocked group (#1362).
+    #[tokio::test]
+    async fn a_join_t_write_with_one_unlocked_group_fails_for_any_shape() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (mut client, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let def = crate::defs::parse(
+            "TRANSFORM t FROM s GROUP BY g, h SELECT COUNT(*) AS n, COUNT(h) AS c, AVG(b) AS v",
+        )
+        .expect("parses");
+        let shape = route(&def, &columns()).expect("admitted");
+        assert!(
+            shape.args.iter().any(|arg| arg.summed) && shape.args.iter().any(|arg| !arg.summed),
+            "a counted-only and a summed argument"
+        );
+        let hidden = hidden_table_ident("trellis", 8);
+        client
+            .batch_execute(&format!(
+                "create schema if not exists trellis; {}; \
+                 create table public.t (g integer, h text, n bigint, c bigint, v numeric, \
+                                        primary key (g, h))",
+                hidden_table_ddl("trellis", 8, &shape)
+            ))
+            .await
+            .expect("tables");
+        let identity = ddl::identity_key_columns(&client, "public.t")
+            .await
+            .expect("identity");
+        let plan = GroupTargetPlan::for_join(
+            "public.t",
+            hidden,
+            "trellis_test_t_staged_shape",
+            None,
+            identity,
+            shape,
+            Writer::JoinTarget,
+            None,
+            String::new(),
+        );
+        // One row per group: `__n` 1, and per argument a count of 1 and a
+        // sum of 4 where summed.
+        let mut partials = vec!["__n".to_string()];
+        let mut ones = vec!["1".to_string()];
+        for (i, arg) in plan.shape.args.iter().enumerate() {
+            partials.push(format!("__c{}", i + 1));
+            ones.push("1".to_string());
+            if arg.summed {
+                partials.push(format!("__s{}", i + 1));
+                ones.push("4".to_string());
+            }
+        }
+        let stage = |g: i32, h: &str| {
+            format!(
+                "insert into {} (g, h, __txid, __lsn, {}) values \
+                     ({g}, '{h}', pg_current_xact_id(), '0/10', {})",
+                plan.staged,
+                partials.join(", "),
+                ones.join(", ")
+            )
+        };
+        let txn = client.transaction().await.expect("begin");
+        txn.batch_execute(&plan.staged_ddl()).await.expect("staged");
+        txn.batch_execute(&stage(1, "x")).await.expect("stage");
+        txn.batch_execute(&plan.lock_sql()).await.expect("lock");
+        // Staged after the lock: no hidden row.
+        txn.batch_execute(&stage(2, "y")).await.expect("stage");
+        let err = apply_locked_groups(&txn, &plan, &mut TargetMutations::assuming_read())
+            .await
+            .expect_err("a page with an unlocked group");
+        assert!(
+            matches!(&err, ApplyError::GroupLockGap { target, groups: 1 } if target == "public.t"),
+            "{err:?}"
+        );
+        txn.rollback().await.expect("rollback");
+
+        // Both locked: the page applies, and writes both groups.
+        let txn = client.transaction().await.expect("begin");
+        txn.batch_execute(&plan.staged_ddl()).await.expect("staged");
+        txn.batch_execute(&stage(1, "x")).await.expect("stage");
+        txn.batch_execute(&stage(2, "y")).await.expect("stage");
+        txn.batch_execute(&plan.lock_sql()).await.expect("lock");
+        let (applied, written, deleted) =
+            apply_locked_groups(&txn, &plan, &mut TargetMutations::assuming_read())
+                .await
+                .expect("a locked page applies");
+        assert_eq!((applied.len(), written, deleted), (2, 2, 0));
+        txn.rollback().await.expect("rollback");
+    }
+
     #[test]
     fn shares_partials_between_calls_on_one_argument() {
         let shape = shape(
