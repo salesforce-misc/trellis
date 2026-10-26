@@ -719,6 +719,7 @@ fn mark_checked(instance: &str, table: &str) {
 
 /// Forgets which sources this process has deep-checked for the instance in
 /// `database` and `schema`, as a process restart would.
+#[cfg(any(test, feature = "internals"))]
 pub fn forget_checked(database: &str, schema: &str) {
     let instance = super::reconcile::instance_key(database, schema);
     CHECKED

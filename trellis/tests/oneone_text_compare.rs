@@ -14,9 +14,10 @@ use std::time::Duration;
 use drain_driver::Driver;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::{PgType, ValueType};
+use trellis::float::FloatWidth;
 use trellis::integer::IntWidth;
 use trellis::staging::self_check::CheckPageExt;
-use trellis::{Config, FloatWidth, SelfCheckMode, Trellis, TrellisOptions};
+use trellis::{Config, SelfCheckMode, Trellis, TrellisOptions};
 
 const COLLATION: &str = "create collation public.case_insensitive \
      (provider = icu, locale = 'und-u-ks-level2', deterministic = false);";

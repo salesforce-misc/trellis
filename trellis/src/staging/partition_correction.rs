@@ -107,7 +107,6 @@ use crate::capture::partitions::{self, Key, PendingCorrection, Recorded};
 use crate::defs::catalog;
 use crate::defs::chunk_queue::{self, ChunkQueueError, ClaimFence, ClaimedChunk};
 use crate::defs::model::{APPLYING_SQL, Definition, TransformStatus};
-use crate::error_code::ErrorCode;
 use crate::pool::{Pool, quote_ident};
 
 use super::apply::ApplyError;
@@ -141,32 +140,6 @@ pub enum CorrectionError {
     Unserved {
         target: String,
     },
-}
-
-impl CorrectionError {
-    /// This error's [`ErrorCode`] category.
-    pub fn code(&self) -> ErrorCode {
-        match self {
-            CorrectionError::Db(err) => crate::error_code::classify_pg_error(err),
-            CorrectionError::Pool(err) => err.code(),
-            CorrectionError::Apply(err) => err.code(),
-            CorrectionError::Catalog(err) => err.code(),
-            CorrectionError::Staging(err) => err.code(),
-            CorrectionError::Capture(err) => {
-                let mut link: Option<&(dyn std::error::Error + 'static)> = Some(err);
-                while let Some(err) = link {
-                    if let Some(pg) = err.downcast_ref::<tokio_postgres::Error>() {
-                        return crate::error_code::classify_pg_error(pg);
-                    }
-                    link = err.source();
-                }
-                ErrorCode::Internal
-            }
-            CorrectionError::Unroutable(_) | CorrectionError::Unserved { .. } => {
-                ErrorCode::Internal
-            }
-        }
-    }
 }
 
 impl fmt::Display for CorrectionError {

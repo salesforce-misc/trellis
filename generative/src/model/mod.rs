@@ -7,7 +7,7 @@
 //! this crate generates is byte-for-byte the same shape the parser produces
 //! from concrete syntax.
 
-use trellis::IntWidth;
+use trellis::dev::defs::IntWidth;
 use trellis::dev::defs::ast::{TransformDef, ValueType};
 
 /// One column on a [`Table`].

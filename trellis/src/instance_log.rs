@@ -191,19 +191,10 @@ macro_rules! debug_event {
         ::tracing::debug!(trellis_instance = %$crate::instance_log::Current, $($arg)*)
     };
 }
-#[allow(unused_macros)]
-macro_rules! trace_event {
-    ($($arg:tt)*) => {
-        ::tracing::trace!(trellis_instance = %$crate::instance_log::Current, $($arg)*)
-    };
-}
 
-#[allow(unused_imports)]
 pub(crate) use debug_event as debug;
 pub(crate) use error_event as error;
 pub(crate) use info_event as info;
-#[allow(unused_imports)]
-pub(crate) use trace_event as trace;
 // Aliased: a macro named `warn` is ambiguous with the built-in attribute.
 pub(crate) use warn_event as warn;
 

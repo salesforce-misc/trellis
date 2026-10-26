@@ -67,7 +67,7 @@ pub const MAX_HOP_GEN: i32 = 32;
 /// Why a drain attempt (fold, compute, or apply ∪ mark-drained) failed. A
 /// module-local enum, plain `Display` + `std::error::Error`, composing with
 /// the crate's other error types via `From` — matching
-/// [`StagingError`]/[`CatalogError`]/[`DdlError`]/[`EvalError`]'s own
+/// [`StagingError`]/[`CatalogError`]/[`DdlError`]/`EvalError`'s own
 /// convention.
 #[derive(Debug)]
 pub enum ApplyError {
@@ -81,7 +81,7 @@ pub enum ApplyError {
     Eval(EvalError),
     /// A definition's calculated fields failed to type-infer against its own
     /// persisted `source_columns` — meaning a definition that already passed
-    /// [`crate::defs::validate::validate`] at creation time no longer
+    /// `crate::defs::validate::validate` at creation time no longer
     /// type-checks against the map it was created with, which should not be
     /// reachable; kept as a typed error rather than a panic per this
     /// module's own convention of not trusting invariants it cannot enforce
@@ -90,7 +90,7 @@ pub enum ApplyError {
     /// Substituting a `GROUP BY` definition's cross-field-alias references
     /// (`defs::backfill::substituted_field_exprs`) failed — a cyclic alias
     /// chain or a pathologically large expansion. Both are rejected by
-    /// [`crate::defs::validate::validate`] (a real cycle) or bounded at
+    /// `crate::defs::validate::validate` (a real cycle) or bounded at
     /// definition-creation time (the direct backfill's node budget) before a
     /// definition can ever reach live apply, so this should not be reachable
     /// for a definition that already passed backfill at creation time — kept
@@ -115,14 +115,14 @@ pub enum ApplyError {
     /// last key once it held their claims: the same page committed before,
     /// and only the reply to its `COMMIT` was lost (#856). Its transaction
     /// rolls back, so nothing applies twice, and the drain carries on from
-    /// the next page ([`drain_batch`]). The group basis needs this: a page
+    /// the next page (`drain_batch`). The group basis needs this: a page
     /// adds its deltas to the groups' partials, with nothing per key that
     /// would make a second application move nothing.
     PageAlreadyCommitted,
     /// Phase 3's version fence found `source_table_versions.version` had
     /// moved since Phase 2 loaded it: a definition change landed on
     /// `src_table` mid-drain. Routine and immediately retryable — see
-    /// [`super::liveness::release`]'s doc comment on why a fence miss is
+    /// `super::liveness::release`'s doc comment on why a fence miss is
     /// not parked behind the reclaim TTL.
     VersionFenceMiss { src_table: String },
     /// The entry lock of a 1-1 target (`super::one_to_one_ledger::lock_entries`)
@@ -135,7 +135,7 @@ pub enum ApplyError {
     /// while holding the other keys' locks, out of I5's one order.
     LedgerEntryCollected { target: String },
     /// Downstream propagation would have staged a `Recompute` row past
-    /// [`MAX_HOP_GEN`]. Named rather than silently truncated: an operator
+    /// `MAX_HOP_GEN`. Named rather than silently truncated: an operator
     /// needs to know a wave ran away, and which target tables it ran away
     /// through, rather than have the tail of it quietly disappear.
     HopBoundExceeded { hop_gen: i32, tables: Vec<String> },
@@ -160,10 +160,10 @@ pub enum ApplyError {
     /// (`42P01` from a live query against it) — issue #16's "one sanctioned
     /// exception to immutability": no retry or per-key quarantine can
     /// resolve this, since the table itself is gone, not any one row.
-    /// [`drain_once`] routes this to [`quarantine::purge_dropped_table`]
+    /// `drain_once` routes this to `quarantine::purge_dropped_table`
     /// rather than the ordinary isolate/evict path.
     SourceTableDropped { source_table: String },
-    /// [`super::quarantine::resume_column`] (or, indirectly,
+    /// `super::quarantine::resume_column` (or, indirectly,
     /// a `RESUME TRANSFORM <target>.<column>` statement,
     /// [`crate::app::Trellis::apply`]) was asked to resume a
     /// `(transform, column)` pair with no currently-paused `column_status`
@@ -172,7 +172,7 @@ pub enum ApplyError {
     /// all," so an address naming a real transform but the wrong field name
     /// gets a specific error rather than silently doing nothing.
     ColumnNotPaused { transform: String, column: String },
-    /// [`super::quarantine::resume_column`] was asked to resume a column
+    /// `super::quarantine::resume_column` was asked to resume a column
     /// whose owning definition is not currently applying
     /// ([`crate::defs::model::TransformStatus::is_applying`]: `live` or
     /// `catching_up`) — most concretely, a definition still `Backfilling`
@@ -189,7 +189,7 @@ pub enum ApplyError {
     /// resume until the definition's build has finished closes the window
     /// instead of racing it.
     DefinitionNotLive { transform: String },
-    /// [`super::quarantine::resume_column`] was asked to resume an `ALTER
+    /// `super::quarantine::resume_column` was asked to resume an `ALTER
     /// TRANSFORM` field that is paused until its source's capture images the
     /// column it reads (`column_status.awaiting_capture`, #687). Unpausing it
     /// before then would let a row the narrower capture function staged,
@@ -198,13 +198,13 @@ pub enum ApplyError {
     /// (`staging::build`'s "Field builds"); the definition's `capture_wait`
     /// or `capture_failure` status says what holds that up.
     ColumnAwaitingCapture { transform: String, column: String },
-    /// A failure from [`crate::intake`]'s helpers (rebuilding the readers
+    /// A failure from `crate::intake`'s helpers (rebuilding the readers
     /// of a table, or qualifying a table name).
     Intake(crate::intake::IntakeError),
-    /// [`super::quarantine::resume_transform`] was asked to resume a target
+    /// `super::quarantine::resume_transform` was asked to resume a target
     /// with no corresponding `transform_definitions` row at all.
     TransformNotFound { transform: String },
-    /// [`super::quarantine::resume_transform`] was asked to resume a target
+    /// `super::quarantine::resume_transform` was asked to resume a target
     /// whose current status is neither of ADR-0014's two frozen states —
     /// [`crate::defs::model::TransformStatus::Quarantined`] (the poison fuse
     /// tripped it) nor [`crate::defs::model::TransformStatus::Paused`] (an
@@ -213,7 +213,7 @@ pub enum ApplyError {
     /// [`ApplyError::ColumnNotPaused`]'s same discipline for the
     /// column-level tier.
     TransformNotPaused { transform: String },
-    /// [`super::quarantine::release_key`] was asked to release a key the
+    /// `super::quarantine::release_key` was asked to release a key the
     /// transform doesn't hold: no `poison` or `poison_held` row of the
     /// transform names that source table and key, in either spelling of the
     /// table. Releasing a key that isn't held is caller error, not a silent
@@ -225,9 +225,9 @@ pub enum ApplyError {
         src_table: String,
         key: String,
     },
-    /// [`super::quarantine::release_key`]'s first lock, the bump of the key's
+    /// `super::quarantine::release_key`'s first lock, the bump of the key's
     /// table's version fence, waited out the session's `lock_timeout`
-    /// ([`crate::locks::LOCK_TIMEOUT`], 30 s, unless the session set a
+    /// (`crate::locks::LOCK_TIMEOUT`, 30 s, unless the session set a
     /// shorter one) (#842). The release waits for every drain page holding
     /// that fence, the pages in flight on the table, so a page that parked a
     /// change for the key has committed before the release reads the key's
@@ -245,13 +245,13 @@ pub enum ApplyError {
     },
     /// A column pause, resume, fuse trip or cascade pair, or a build's
     /// release of capture-widen pauses, waited for the column-pause lock
-    /// ([`crate::locks::lock_column_pauses`]) past its transaction's
+    /// (`crate::locks::lock_column_pauses`) past its transaction's
     /// `lock_timeout` (#922). Its transaction rolled back with nothing
     /// written: retry the call. A fuse trip and the capture pass's
     /// callers retry on their next pass.
     ColumnPauseLockTimeout(crate::locks::ColumnPauseLockTimeout),
-    /// [`super::quarantine::resume_transform`] or
-    /// [`super::quarantine::resume_column`] re-ran define-time validation
+    /// `super::quarantine::resume_transform` or
+    /// `super::quarantine::resume_column` re-ran define-time validation
     /// against the live schema and it failed (#708, #760): define would
     /// refuse the definition as the schema stands now, so a rebuild would
     /// build from what it no longer matches. `reason` is define's own error,

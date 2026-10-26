@@ -20,9 +20,11 @@ application does, it does through these — and every definition-changing operat
 enters through a single grammar-driven entrypoint on them (see below).
 
 **Tier 2 — composable primitives.** An embedder may reach these directly: `Config`,
-`Pool`, `migrate`, `Identity`, `metrics`, `Error`/`ErrorCode`, `Numeric`, and `otel`
+`Pool`, `migrate`, `Metrics`, `Error`/`ErrorCode`, `statement_kind`, and `otel`
 (behind the `otlp` feature). They are public and stable, re-exported at the crate
-root, and documented as deliberate building blocks rather than incidental leaks.
+root, and documented as deliberate building blocks rather than incidental leaks. The
+modules that define them are private: the crate root is the whole surface, and
+`.github/public-api.txt` lists it, checked in CI.
 
 **Tier 3 — the engine.** `capture`, `defs`, `staging`, `intake` and `locks` are
 `pub(crate)`. No external crate names `trellis::defs::*`, `trellis::staging::*`,
@@ -34,8 +36,10 @@ API.
 ### The engine is `pub(crate)`
 
 `capture`, `defs`, `staging`, `intake` and `locks` — and every module beneath them — are
-crate-private. (The `internals` cargo feature opens them for the crate's own integration
-tests; it is not API.)
+crate-private, as are the tier-1 and tier-2 modules that define the root's re-exports.
+(The `internals` cargo feature opens all of them for the crate's own integration
+tests; it is not API. The sibling crates reach the few items they need through
+`dev`, behind `test-util`.)
 The curated re-exports at the crate root are the boundary, not a suggestion layered
 over reachable internals.
 

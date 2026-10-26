@@ -204,7 +204,7 @@ impl Drop for Unreset {
 /// Trellis's connection pool.
 ///
 /// Connections use TLS as the DSN's `sslmode` says (default `prefer`); see
-/// [`crate::tls`] and the TLS section of `docs/embedding.md`. The connector
+/// `crate::tls` and the TLS section of `docs/embedding.md`. The connector
 /// is built once, in [`Pool::new`], so a rotated client certificate or CA
 /// file takes a new `Pool`.
 ///
@@ -253,8 +253,8 @@ impl Pool {
     /// (`crate::staging::quarantine::trip_transform_fuse_if_crossed`'s
     /// `catalog::transforms_for_source` call) could exhaust a small box's
     /// pool and then [`Pool::get`] would wait forever — no error, no log,
-    /// just every drain thread stuck. See [`crate::config::DEFAULT_POOL_MAX_SIZE`]/
-    /// [`crate::config::DEFAULT_POOL_WAIT_TIMEOUT`] for the sizing/timeout
+    /// just every drain thread stuck. See `crate::config::DEFAULT_POOL_MAX_SIZE`/
+    /// `crate::config::DEFAULT_POOL_WAIT_TIMEOUT` for the sizing/timeout
     /// reasoning.
     pub fn new(config: &Config) -> Result<Self, Error> {
         let (mut pg_config, tls_spec) = crate::config::parse_dsn_tls(config.dsn())?;

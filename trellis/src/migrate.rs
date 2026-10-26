@@ -46,11 +46,11 @@ use crate::identity;
 use crate::pool::Pool;
 
 /// Ensures `config.schema()` exists and is safe to attach to (see
-/// [`crate::identity`]), then applies any migrations not yet recorded as
+/// `crate::identity`), then applies any migrations not yet recorded as
 /// applied. A no-op if everything is already up to date.
 ///
 /// Attaches to one database run one at a time (see
-/// [`identity::AttachLock`]), and a catalog schema that belongs to another
+/// `identity::AttachLock`), and a catalog schema that belongs to another
 /// instance sharing the database is refused (issue #877).
 ///
 /// Deliberately public — a tier-2 composable primitive under ADR-0012, not a

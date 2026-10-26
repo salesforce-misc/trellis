@@ -93,8 +93,8 @@ use bytes::Bytes;
 use futures_util::SinkExt;
 use testkit::TestCluster;
 use tokio_postgres::Client as RawClient;
-use trellis::config::DEFAULT_SCHEMA;
 use trellis::dev::capture::CaptureSpec;
+use trellis::dev::config::DEFAULT_SCHEMA;
 
 use crate::scenario::connect_raw;
 use crate::streaming::chain::install_chain_hops;

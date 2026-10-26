@@ -83,24 +83,24 @@ pub struct ClientOptions {
     pub application_threads: usize,
     /// The `LISTEN/NOTIFY` channel shared by seals,
     /// apply's downstream propagation, and every idle app-worker task's
-    /// `LISTEN`. `None` (the default) uses [`default_wake_channel`] of the
+    /// `LISTEN`. `None` (the default) uses `default_wake_channel` of the
     /// client's catalog schema, so each instance in a database wakes only
     /// its own workers; `Some` overrides it. Read the channel a client uses
     /// with [`Self::wake_channel_for`].
     pub wake_channel: Option<String>,
     /// How long a claim may sit unrefreshed before it's taken back: ring
-    /// segment claims by [`staging::reclaim_stale`] (the maintenance loop,
+    /// segment claims by `staging::reclaim_stale` (the maintenance loop,
     /// only when `staging_worker` is set), and backfill-chunk claims by
-    /// [`chunk_queue::reclaim_stale_chunks`] (one sweep per client with
+    /// `chunk_queue::reclaim_stale_chunks` (one sweep per client with
     /// `application_threads > 0`, regardless of `staging_worker`, run every
-    /// third of this TTL, or of [`staging::DEFAULT_RECLAIM_TTL`] if that is
+    /// third of this TTL, or of `staging::DEFAULT_RECLAIM_TTL` if that is
     /// shorter, for as long as one of its app-worker tasks runs).
     ///
     /// The same task refreshes the client's worker-registry row, which
     /// [`crate::app::Trellis::has_live_drain_workers`] reads against
-    /// [`staging::DEFAULT_RECLAIM_TTL`] whatever this is set to.
+    /// `staging::DEFAULT_RECLAIM_TTL` whatever this is set to.
     ///
-    /// Must be at least twice [`HeartbeatDaemonConfig::interval`] (see
+    /// Must be at least twice `HeartbeatDaemonConfig::interval` (see
     /// [`Self::heartbeat`]), or [`Client::start`] rejects the options with
     /// [`ClientError::HeartbeatNotUnderReclaimTtl`]: a live worker only
     /// refreshes its claims once per heartbeat interval, so a TTL at or
@@ -128,7 +128,7 @@ pub struct ClientOptions {
     pub housekeeping_interval: Duration,
     /// How often the maintenance loop re-derives the desired source-table
     /// set from the catalog (issue #14) and re-runs the capture reconcile
-    /// ([`capture::reconcile`]) and the start of the builds it readies
+    /// (`capture::reconcile`) and the start of the builds it readies
     /// against it — so a transform registered while the client runs gets
     /// captured and backfilled without a restart, and a table whose last
     /// reader was dropped loses its capture triggers (issue #427). Coarser
@@ -136,7 +136,7 @@ pub struct ClientOptions {
     /// a catalog query and (when a table is newly read) a `CREATE TRIGGER`,
     /// neither of which needs sub-second freshness.
     pub reconcile_interval: Duration,
-    /// The window [`staging::count_live_drainers`] uses to size a claim's
+    /// The window `staging::count_live_drainers` uses to size a claim's
     /// share of a batch's buckets: a drain thread counts while its `drainers`
     /// row was refreshed within it. A client refreshes the rows of its running
     /// drain threads once per third of this window (and once at start), in
@@ -182,7 +182,7 @@ pub struct ClientOptions {
     /// (a backlog built while seal was refused).
     /// Several small sealed segments coalesce into one drain only while their
     /// ring rows sum to at most this. Defaults to
-    /// [`staging::DEFAULT_DRAIN_BATCH_CAP`] (100,000); peak drain memory is
+    /// `staging::DEFAULT_DRAIN_BATCH_CAP` (100,000); peak drain memory is
     /// about `application_threads` × this × bytes per change. Zero is treated
     /// as one.
     ///
@@ -195,7 +195,7 @@ pub struct ClientOptions {
     pub drain_batch_cap: usize,
     /// Source rows per Re-derive build chunk (#625 Q4), read by the drain
     /// worker that runs a build's plan job. Defaults to
-    /// [`staging::build::DEFAULT_CHUNK_ROWS`]. Zero is treated as one.
+    /// `staging::build::DEFAULT_CHUNK_ROWS`. Zero is treated as one.
     pub build_chunk_rows: i64,
     /// Caps the worker threads of the `tokio` runtime this client's
     /// background thread builds. `None` (the default) leaves `tokio`'s own
@@ -235,7 +235,7 @@ impl Default for ClientOptions {
 
 impl ClientOptions {
     /// The wake channel a client of catalog schema `schema` uses: the
-    /// explicit [`Self::wake_channel`], else [`default_wake_channel`].
+    /// explicit [`Self::wake_channel`], else `default_wake_channel`.
     pub fn wake_channel_for(&self, schema: &str) -> String {
         self.wake_channel
             .clone()
@@ -517,7 +517,7 @@ impl Client {
     /// until setup fails.
     ///
     /// The instance schema is resolved from the process environment
-    /// (`TRELLIS_SCHEMA`, defaulting to [`crate::config::DEFAULT_SCHEMA`]) via
+    /// (`TRELLIS_SCHEMA`, defaulting to `crate::config::DEFAULT_SCHEMA`) via
     /// [`Config::from_dsn`]. A caller that already holds a [`Config`] — or
     /// that needs two clients in one process to run in two different schemas
     /// — must use [`Client::start_with_config`] instead; see its doc comment.
@@ -539,7 +539,7 @@ impl Client {
     /// * [`crate::Trellis`] is constructed from an explicit `Config` and
     ///   handed its own `config.dsn()` to `Client::start` — so a `Trellis`
     ///   built with `Config::with_schema(dsn, "some_schema")` silently ran
-    ///   its background client in `TRELLIS_SCHEMA`/[`crate::config::DEFAULT_SCHEMA`]
+    ///   its background client in `TRELLIS_SCHEMA`/`crate::config::DEFAULT_SCHEMA`
     ///   instead, against a different instance's staging ring entirely. The
     ///   schema was accepted, validated, and then dropped on the floor.
     /// * Two Trellis instances could not coexist *in one process* at all,

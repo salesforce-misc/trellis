@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio_postgres::Client as RawClient;
-use trellis::metrics::BuildStatement;
+use trellis::dev::metrics::BuildStatement;
 
 use crate::streaming::disk_tier::json_ms;
 

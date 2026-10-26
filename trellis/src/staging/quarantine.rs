@@ -6280,7 +6280,7 @@ pub async fn retry_held_keys(
 
 /// The keys one definition holds in quarantine (#759): its `poison` rows,
 /// each a source key whose changes the definition's apply leaves out until
-/// a release ([`release_key`]), a resume or a drop. `None` where a
+/// a release (`release_key`), a resume or a drop. `None` where a
 /// definition holds none. `status` reports it per definition, and
 /// `self_check` with every report, so a definition that reads `live` can't
 /// hide a held key. The keys themselves are paged by `sample_quarantined`.

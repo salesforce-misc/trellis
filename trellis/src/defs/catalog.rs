@@ -127,13 +127,13 @@ pub enum CatalogError {
     /// than `"numeric"`/`"text"`/`"boolean"`/`"uuid"` for some column —
     /// meaning the row was written by something other than
     /// `create_definition_inner`, the only writer, which only ever encodes
-    /// [`ValueType`]'s variants.
+    /// `ValueType`'s variants.
     UnknownValueType { column: String, text: String },
     /// An intake step failed: resolving a qualified table name, rebuilding
     /// the readers of a table, or checking that a source is change-keyed.
     Backfill(crate::intake::IntakeError),
     /// `def.source` doesn't resolve to any schema on this connection's
-    /// search path (see [`resolve_source_schema_in_txn`]) — the table was
+    /// search path (see `resolve_source_schema_in_txn`) — the table was
     /// dropped, renamed, or never existed under that bare name. Also a table
     /// dropped between resolving it and a later check that reads it.
     SourceTableNotFound(String),
@@ -155,7 +155,7 @@ pub enum CatalogError {
     },
     /// A 1-1 definition's source was given another row-identity key after
     /// define (issues #687, #708): its target is keyed by the old one, so a
-    /// resume can't rebuild into it. [`revalidate`] refuses it; the repair
+    /// resume can't rebuild into it. `revalidate` refuses it; the repair
     /// is to restore the key, or to drop the definition and define it again.
     SourceKeyChanged {
         source_table: String,
@@ -176,7 +176,7 @@ pub enum CatalogError {
     /// A definition's ledger table doesn't exist, though define creates one
     /// for every 1-1 definition (#986). Only Trellis writes its
     /// tables, so an operator dropped it; the build's `start` reads it and
-    /// fails, and the apply writes into it. [`check_ledger_table`] refuses it,
+    /// fails, and the apply writes into it. `check_ledger_table` refuses it,
     /// and Trellis doesn't re-create the table: the repair is to drop the
     /// definition and define it again.
     LedgerTableMissing {
@@ -187,7 +187,7 @@ pub enum CatalogError {
     /// A definition's target table doesn't exist, though define creates it.
     /// Only Trellis writes its targets, so an operator dropped it; the
     /// rebuild a resume starts writes into it and would fail. A whole-transform
-    /// resume refuses it ([`check_target_table`]), and Trellis doesn't
+    /// resume refuses it (`check_target_table`), and Trellis doesn't
     /// re-create the table: the repair is to drop the definition and define
     /// it again.
     TargetTableMissing { target: String },
@@ -198,7 +198,7 @@ pub enum CatalogError {
     /// live there, so the other instance's uninstall (`drop
     /// schema ... cascade`) would drop them, and a dump of one instance's
     /// schema would carry the other's data. Refused by define, and by a
-    /// resume ([`revalidate`]) of a definition whose target schema has since
+    /// resume (`revalidate`) of a definition whose target schema has since
     /// become one. The repair is a target in an ordinary schema: `TRANSFORM
     /// <schema>.<target>` with such a schema, after a `DROP TRANSFORM` for a
     /// definition a resume refused.
@@ -291,7 +291,7 @@ pub enum CatalogError {
         table: String,
     },
     /// Issue #376: the definition's source would be captured by triggers,
-    /// but they can't key that table's changes (see [`change_keyed`]): it
+    /// but they can't key that table's changes (see `change_keyed`): it
     /// has no primary key, or isn't a plain table (a partitioned table, say).
     /// The case that motivated this is another Trellis instance's aggregate
     /// target: this instance's own targets are exempt, since their writes
@@ -299,36 +299,36 @@ pub enum CatalogError {
     /// capture.
     SourceNotChangeKeyed { source_table: String },
     /// ADR-0017: a partitioned root can't be read as the definition asks
-    /// ([`super::partition_tree::PartitionRefusal`]; every message names the
+    /// (`super::partition_tree::PartitionRefusal`; every message names the
     /// column or the limit).
     PartitionedSource(super::partition_tree::PartitionRefusal),
     /// Issue #745: row-level security on a table the definition reads
     /// (its source, or a `JOIN`'s joined table) applies to a role Trellis
     /// reads the table as, so its policies would filter Trellis's reads
-    /// (see [`super::row_security`]). Or (issue #765) row-level security on
+    /// (see `super::row_security`). Or (issue #765) row-level security on
     /// its newly created target applies to the session's role, which would
-    /// filter Trellis's writes ([`super::row_security::RowSecurity::target`]).
+    /// filter Trellis's writes (`super::row_security::RowSecurity::target`).
     /// Not supported.
     RowSecurityApplies(super::row_security::RowSecurity),
     /// Issue #751: a logical-replication subscription replicates into a
     /// table the definition reads. The subscription's apply worker fires only row-level
     /// triggers, so Trellis's capture never sees its changes (see
-    /// [`super::subscription`]). Not supported.
+    /// `super::subscription`). Not supported.
     Subscribed(super::subscription::Subscribed),
-    /// [`install_definition`]'s target-table DDL failed.
+    /// `install_definition`'s target-table DDL failed.
     Ddl(DdlError),
     /// A build step failed with something other than
-    /// [`BackfillError::Unsupported`]: an `ALTER TRANSFORM`'s added-column
+    /// `BackfillError::Unsupported`: an `ALTER TRANSFORM`'s added-column
     /// build.
     DirectBackfill(BackfillError),
-    /// [`super::lifecycle::pause_transform`] was asked to pause a target with
+    /// `super::lifecycle::pause_transform` was asked to pause a target with
     /// no corresponding `transform_definitions` row at all (issue #142). Its
     /// sibling verb, `drop`, deliberately treats the same situation as an
     /// idempotent success instead — see
-    /// [`super::lifecycle::drop_transform`]'s doc comment for why the two
+    /// `super::lifecycle::drop_transform`'s doc comment for why the two
     /// differ.
     TransformNotFound { transform: String },
-    /// [`super::lifecycle::drop_transform`] was asked to drop a definition
+    /// `super::lifecycle::drop_transform` was asked to drop a definition
     /// that is not frozen (issue #142, ADR-0014). There is no direct
     /// live-to-gone edge in the lifecycle: quiescing through a pause is a
     /// precondition, so the removal never has to reason about a claim-time
@@ -353,14 +353,14 @@ pub enum CatalogError {
         dependents: Vec<String>,
         /// issue #242: for every blocker whose exact reference resolved to
         /// one specific column of the subject (column-granularity
-        /// dependency edges — [`column_dependents`]), a human-readable
+        /// dependency edges — `column_dependents`), a human-readable
         /// `"<dependent>.<field> reads <subject>.<column>"` detail line.
         /// This is strictly additive precision over `dependents` alone, not
         /// a replacement. Empty whenever no blocker's reference could be
         /// resolved this precisely.
         column_detail: Vec<String>,
     },
-    /// [`alter_transform`] was asked to edit a target that doesn't apply
+    /// `alter_transform` was asked to edit a target that doesn't apply
     /// (`staging::build::takes_field_build`, #625 F8b): one still
     /// `waiting_to_backfill`, `backfilling` behind an old-path build, or
     /// frozen (`paused`/`quarantined`). Retry once it applies.
@@ -375,7 +375,7 @@ pub enum CatalogError {
         transform: String,
         status: TransformStatus,
     },
-    /// [`alter_transform`] was asked to `ALTER <field> AS <expr>` a field
+    /// `alter_transform` was asked to `ALTER <field> AS <expr>` a field
     /// that isn't one of the target's declared calculated fields — unlike
     /// `DROP`ping an absent field (idempotent success) or `ADD`ing one that
     /// already exists (idempotent iff the formula matches), there is no
@@ -386,7 +386,7 @@ pub enum CatalogError {
         field: String,
         declared: Vec<String>,
     },
-    /// [`alter_transform`] was asked to `ADD <expr> AS <field>` a field name
+    /// `alter_transform` was asked to `ADD <expr> AS <field>` a field name
     /// that already exists with a *different* formula than `<expr>` —
     /// distinct from the idempotent case (same formula, a no-op success):
     /// `ADD` only ever introduces a field, so re-adding an existing name
@@ -394,14 +394,14 @@ pub enum CatalogError {
     /// silently reinterpreted as one.
     AlterFieldAlreadyExists { transform: String, field: String },
     /// `ALTER TRANSFORM` was asked to edit a target/expression shape outside
-    /// this release's scope — see [`alter_transform`]'s own doc comment for
+    /// this release's scope — see `alter_transform`'s own doc comment for
     /// exactly what's covered. Not a rejection of the definition's *shape* in
     /// the way [`CatalogError::Validate`] is (the edit would very likely be
     /// accepted by `define`); it's this operation's own, narrower coverage
     /// declining, with a message that says so.
     UnsupportedAlter(String),
     /// A define, `ALTER TRANSFORM` or `DROP TRANSFORM` waited for the
-    /// column-pause lock ([`crate::locks::lock_column_pauses`]) past its
+    /// column-pause lock (`crate::locks::lock_column_pauses`) past its
     /// transaction's `lock_timeout` (#922). Nothing changed: retry the call.
     ColumnPauseLockTimeout(crate::locks::ColumnPauseLockTimeout),
 }

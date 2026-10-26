@@ -49,40 +49,6 @@ use crate::pool::quote_ident;
 /// add one alongside the first version bump.
 pub const INSTANCE_FORMAT_VERSION: i32 = 1;
 
-/// A resolved instance identity, for reporting (see [`Config`]'s
-/// [`std::fmt::Display`] impl for the short form; this is the structured
-/// version).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Identity {
-    /// The schema this instance operates in.
-    pub schema: String,
-    /// The instance-identity marker format this build writes/expects. See
-    /// [`INSTANCE_FORMAT_VERSION`].
-    pub format_version: i32,
-}
-
-impl Identity {
-    /// The identity this build of Trellis would attach to `config` as.
-    /// Doesn't touch the database — see [`prepare_attach`] for the
-    /// database-backed check.
-    pub fn resolved(config: &Config) -> Self {
-        Self {
-            schema: config.schema().to_string(),
-            format_version: INSTANCE_FORMAT_VERSION,
-        }
-    }
-}
-
-impl std::fmt::Display for Identity {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "schema {:?}, instance format version {}",
-            self.schema, self.format_version
-        )
-    }
-}
-
 /// Ensures `config.schema()` exists and is safe to attach to, refusing it
 /// otherwise (see the module docs for the three cases).
 ///
@@ -496,14 +462,6 @@ async fn read_marker(
 mod tests {
     use super::*;
 
-    #[test]
-    fn identity_resolved_matches_config_schema() {
-        let config = Config::from_dsn("postgresql://example/db").expect("valid default schema");
-        let identity = Identity::resolved(&config);
-        assert_eq!(identity.schema, config.schema());
-        assert_eq!(identity.format_version, INSTANCE_FORMAT_VERSION);
-    }
-
     fn config_with_target(schema: &str, target: &str) -> Config {
         Config::with_schema("postgresql://example/db", schema)
             .and_then(|config| config.with_target_schema(target))
@@ -610,17 +568,5 @@ mod tests {
             format!("{}s", crate::locks::LOCK_TIMEOUT.as_secs())
         );
         lock.release().await;
-    }
-
-    #[test]
-    fn identity_display_is_human_readable() {
-        let identity = Identity {
-            schema: "trellis".to_string(),
-            format_version: 1,
-        };
-        assert_eq!(
-            identity.to_string(),
-            "schema \"trellis\", instance format version 1"
-        );
     }
 }

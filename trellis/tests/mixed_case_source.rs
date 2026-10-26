@@ -143,9 +143,9 @@ async fn recomputed_fields_over_mixed_case_columns_follow_cdc() {
     // expression with no declared scale, which the group basis doesn't take.
     let int = |w| ValueType::Integer(w);
     let columns: HashMap<String, ValueType> = [
-        ("id", int(trellis::IntWidth::Int8)),
-        ("OrderId", int(trellis::IntWidth::Int8)),
-        ("Qty", int(trellis::IntWidth::Int4)),
+        ("id", int(trellis::integer::IntWidth::Int8)),
+        ("OrderId", int(trellis::integer::IntWidth::Int8)),
+        ("Qty", int(trellis::integer::IntWidth::Int4)),
     ]
     .into_iter()
     .map(|(n, t)| (n.to_string(), t))

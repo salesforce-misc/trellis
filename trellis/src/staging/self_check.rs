@@ -203,8 +203,8 @@ pub enum SelfCheckMode {
     /// schema change, and every group of a `JOIN`'s target part while either
     /// table has any such change. The trade-off: a change stuck in the ring
     /// is subtracted rather than reported here. It shows up as a
-    /// [`SelfCheckPage::drain_failures`] entry or a held key
-    /// ([`SelfCheckPage::held_keys`]) instead.
+    /// `SelfCheckPage::drain_failures` entry or a held key
+    /// (`SelfCheckPage::held_keys`) instead.
     ///
     /// **A 1-1 target** compares each row of a page against what the target
     /// has applied of it, in the same statement that reads the target
@@ -220,16 +220,16 @@ pub enum SelfCheckMode {
     ///
     /// For those fallbacks, a known and accepted limitation: **the re-check's
     /// guarantee is identity stability, not value non-transience.**
-    /// [`await_then_compare`] takes its watermark token and runs
-    /// [`converge::await_converged`] on one connection borrowed from the
-    /// pool, then [`compare_once`] runs its statement on a separate
+    /// `await_then_compare` takes its watermark token and runs
+    /// `converge::await_converged` on one connection borrowed from the
+    /// pool, then `compare_once` runs its statement on a separate
     /// `pool.get()` call, which may hand back a *different* connection. A
     /// commit landing in that gap is visible to the source read but not yet
     /// applied to the target. Two independent passes can each catch this
     /// same lag race on the same hot `(key, column)`, with a different
     /// transient value each time, and because divergences are matched by
     /// identity (key/column) across passes rather than by exact value (see
-    /// [`DivergenceIdentity`]), such a case is reported as a stable, real
+    /// `DivergenceIdentity`), such a case is reported as a stable, real
     /// divergence even though it is still just lag.
     ///
     /// Matching by exact value instead would trade this narrow
@@ -256,7 +256,13 @@ pub enum SelfCheckMode {
 ///
 /// The job ([`super::self_check_job`]) reads the comparison's own fields; the
 /// rest is what `check_page`, the page on its own, adds for the tests of it.
-#[cfg_attr(not(any(test, feature = "internals")), allow(dead_code))]
+#[cfg_attr(
+    not(any(test, feature = "internals")),
+    allow(
+        dead_code,
+        reason = "`target`, `held_keys` and `drain_failures` are read by tests through `internals`"
+    )
+)]
 #[derive(Debug, Clone)]
 pub struct SelfCheckPage {
     /// The audited target's bare table name (as passed to [`check_page`]).
@@ -364,7 +370,7 @@ pub enum Divergence {
     /// function, a capture function is missing or has the wrong owner, the
     /// role the functions run as lost a privilege, the table joined a
     /// partition or inheritance hierarchy (#622 C9, see
-    /// [`super::capture_audit`]), its row-level security applies to the
+    /// `super::capture_audit`), its row-level security applies to the
     /// Trellis role (#745), which would filter its reads, this audit's too
     /// (or the target's does, which would filter its writes, #765),
     /// or a logical-replication subscription replicates into it (#751). Its
@@ -373,7 +379,7 @@ pub enum Divergence {
     Capture(CaptureFault),
 }
 
-/// Why a [`check_page`] call failed outright (as opposed to reporting a
+/// Why a `check_page` call failed outright (as opposed to reporting a
 /// [`SelfCheckOutcome::Diverged`], which is a successful audit that found a
 /// problem, not a failure of the audit itself).
 #[derive(Debug)]
@@ -385,7 +391,7 @@ pub enum SelfCheckError {
     UnsupportedKeySpace {
         target: String,
     },
-    /// [`SelfCheckScope::limit`] wasn't a positive row count. Refused rather
+    /// `SelfCheckScope::limit` wasn't a positive row count. Refused rather
     /// than run: a zero/negative limit compares nothing at all, and would
     /// otherwise report a cheerful `Converged` over an empty page — an audit
     /// that silently checks nothing is worse than one that declines.
@@ -401,7 +407,7 @@ pub enum SelfCheckError {
         detail: String,
     },
     /// A page of a `self_check` job ran past its budget
-    /// ([`super::self_check_job::page_budget`]) and the server stopped it.
+    /// (`super::self_check_job::page_budget`) and the server stopped it.
     /// The job fails with this; a new `self_check` starts over.
     PageTimedOut {
         budget: Duration,

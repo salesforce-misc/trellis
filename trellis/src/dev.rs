@@ -34,6 +34,30 @@
 //! they see `defs`/`staging`/`intake` through the `internals` feature
 //! instead. See `Cargo.toml`.
 
+/// The default instance schema name, for harnesses that build a `Config` or
+/// name Trellis's own tables without resolving one.
+pub mod config {
+    pub use crate::config::DEFAULT_SCHEMA;
+}
+
+/// The engine's Postgres-faithful `float4`/`float8` equality and text
+/// rendering, which `generative`'s oracle compares values with.
+pub mod float {
+    pub use crate::float::{equal, render};
+}
+
+/// The latency histogram boundaries and build-statement classes, for
+/// `benchmark`'s scrape of the engine's metrics.
+pub mod metrics {
+    pub use crate::metrics::{BuildStatement, LATENCY_BUCKETS, increment_changes_applied};
+}
+
+/// The exact decimal `numeric` type, which `generative`'s oracle does
+/// Postgres-faithful arithmetic and comparison in.
+pub mod numeric {
+    pub use crate::numeric::Numeric;
+}
+
 /// The engine items `generative` and `benchmark` reach for under `defs`.
 pub mod defs {
     /// The parsed definition AST. The fuzz generator emits definition *text*
@@ -52,6 +76,9 @@ pub mod defs {
     /// it from the engine's table rather than a second, drifting copy, for
     /// the same reason `registry` is reachable here.
     pub use crate::defs::typed_literal;
+
+    pub use crate::float::FloatWidth;
+    pub use crate::integer::IntWidth;
 
     pub use crate::defs::{
         CatalogError, DdlError, PgType, TransformStatus, ValueType, create_aggregate_target_table,

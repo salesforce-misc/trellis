@@ -1247,7 +1247,7 @@ fn hot_key_case_3_11() -> (
     generative::model::Program,
     generative::model::ConcurrentPlan,
 ) {
-    use trellis::IntWidth;
+    use trellis::dev::defs::IntWidth;
     use trellis::dev::defs::ast::ValueType::{Boolean, Integer, Numeric, Text, Uuid};
     let tables = vec![
         pin_table(

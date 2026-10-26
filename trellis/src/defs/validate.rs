@@ -47,20 +47,20 @@ impl fmt::Display for KeyColumnRole {
     }
 }
 
-/// Why a [`TransformDef`] was rejected by the validator.
+/// Why a `TransformDef` was rejected by the validator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationError {
     /// Two calculated fields on the same target share a name.
     DuplicateFieldName { name: String },
-    /// A field's name starts with [`RESERVED_COLUMN_PREFIX`], which is kept
+    /// A field's name starts with `RESERVED_COLUMN_PREFIX`, which is kept
     /// for the hidden columns Trellis adds to a target
-    /// ([`super::ddl::MEMBERS_COLUMN`], an `AVG`'s `__{field}_sum`, a
+    /// (`super::ddl::MEMBERS_COLUMN`, an `AVG`'s `__{field}_sum`, a
     /// `SUM`'s `__{field}_count`). Without the reservation such a name could
     /// equal one of them, and install failed with a raw Postgres
     /// duplicate-column error (issue #566).
     ReservedFieldName { field: String },
     /// A `GROUP BY` key's target column name starts with
-    /// [`RESERVED_COLUMN_PREFIX`] (see [`ValidationError::ReservedFieldName`]).
+    /// `RESERVED_COLUMN_PREFIX` (see [`ValidationError::ReservedFieldName`]).
     /// `key` is the key as written, `column` the target column it would
     /// become.
     ReservedGroupByColumnName { key: String, column: String },
@@ -68,7 +68,7 @@ pub enum ValidationError {
     /// (issue #566), whether it passes that column through (`id AS id`) or
     /// computes something else under its name. The target already carries
     /// every key column as its own key, so the field would declare the column
-    /// a second time. Raised by [`reject_primary_key_named_fields`], which the
+    /// a second time. Raised by `reject_primary_key_named_fields`, which the
     /// catalog runs once it knows the source's key.
     FieldNamedAfterPrimaryKey { field: String },
     /// A field's expression references a name that is neither a known
@@ -83,21 +83,21 @@ pub enum ValidationError {
     /// Adding a table-to-table dependency edge from a definition's source to
     /// its target would create a cycle in the two-level dependency graph
     /// (issue #22 follow-up: cycle detection generalized from column-only,
-    /// within one [`TransformDef`], to the whole graph of tables connected
-    /// by [`super::model::SchemaEdge`]s — currently just `Source` edges, but
+    /// within one `TransformDef`, to the whole graph of tables connected
+    /// by `super::model::SchemaEdge`s — currently just `Source` edges, but
     /// checked generically over whatever edge kinds exist). Distinct
     /// from [`ValidationError::Cycle`], which names calculated *columns*
     /// within a single definition, since this names *tables* across
     /// definitions and is only ever detected once the persisted graph is
-    /// consulted — see [`super::catalog`].
+    /// consulted — see `super::catalog`.
     TableCycle { cycle: Vec<String> },
     /// The target table is the same as the source table. Calculated columns
     /// must live on a separate neighbor table — writing them back onto the
     /// source would feed our own writes back into capture (see
     /// `docs/data-flow.md`).
     TargetEqualsSource { table: String },
-    /// [`validate`] was handed a `JOIN` definition. A `JOIN` is checked
-    /// against both tables' columns, by [`validate_join`]; this entry point
+    /// `validate` was handed a `JOIN` definition. A `JOIN` is checked
+    /// against both tables' columns, by `validate_join`; this entry point
     /// has only the `FROM` table's.
     JoinNeedsBothTables,
     /// The joined table is the `FROM` table. A self-join needs aliases, which
@@ -130,7 +130,7 @@ pub enum ValidationError {
         rhs_type: String,
     },
     /// A join column has a type that isn't text-stable (the join-key rule,
-    /// [`super::join_key_types::TEXT_STABLE_JOIN_KEY_TYPES`]).
+    /// `super::join_key_types::TEXT_STABLE_JOIN_KEY_TYPES`).
     JoinUnsupportedKeyType { reference: String, pg_type: String },
     /// A join column has a nondeterministic collation, whose `=` Trellis
     /// can't reproduce.
@@ -165,19 +165,19 @@ pub enum ValidationError {
         pg_type: String,
     },
     /// The target's name ends with `suffix`, one of
-    /// [`super::ledger::RESERVED_TARGET_SUFFIXES`], which name the tables
+    /// `super::ledger::RESERVED_TARGET_SUFFIXES`, which name the tables
     /// Trellis keeps beside a target (a 1-1 target's ledger, #623 D2): this
     /// target would be one of another target's.
     ReservedTargetSuffix {
         target: String,
         suffix: &'static str,
     },
-    /// The target's name is longer than [`super::ledger::MAX_TARGET_NAME_LEN`]
+    /// The target's name is longer than `super::ledger::MAX_TARGET_NAME_LEN`
     /// bytes, so its ledger's name (the target's plus
-    /// [`super::ledger::LEDGER_SUFFIX`]) would pass Postgres's 63-byte
+    /// `super::ledger::LEDGER_SUFFIX`) would pass Postgres's 63-byte
     /// identifier limit and be silently truncated.
     TargetNameTooLong { target: String, max: usize },
-    /// An operator was applied to an operand of the wrong [`ValueType`] —
+    /// An operator was applied to an operand of the wrong `ValueType` —
     /// e.g. `+` given a `Text` operand (issue #63: `+` stays Numeric-only,
     /// no implicit string concatenation).
     TypeMismatch {
@@ -199,7 +199,7 @@ pub enum ValidationError {
     /// `double precision`'s range (overflow, or a nonzero value that
     /// underflows to zero). Postgres raises `22003` for it at plan time.
     FloatComparisonLiteralOutOfRange { field: String, text: String },
-    /// A function call's argument had the wrong [`ValueType`] for its
+    /// A function call's argument had the wrong `ValueType` for its
     /// position (issue #64) — e.g. `octet_length(1)`. Distinct from
     /// [`ValidationError::TypeMismatch`] so the message can name the
     /// function and argument position; arity itself is a parser-time
@@ -226,7 +226,7 @@ pub enum ValidationError {
     },
     /// A typed literal's text (issue #109) isn't in its family's **canonical**
     /// Postgres output spelling — `DATE '2024-1-5'`, `DATE 'today'`,
-    /// `BYTEA '\xAB'`. See [`super::typed_literal`]'s module doc comment for
+    /// `BYTEA '\xAB'`. See `super::typed_literal`'s module doc comment for
     /// why the bar is canonical form rather than "Postgres would parse it":
     /// in short, immutability (`date_in` is `STABLE` precisely because of
     /// `'today'`) and text round-trip identity between the Rust evaluator
@@ -237,21 +237,21 @@ pub enum ValidationError {
         text: String,
         detail: String,
     },
-    /// A hand-built [`super::ast::Expr::TypedLiteral`] names a [`ValueType`]
-    /// outside [`super::typed_literal::TYPED_LITERALS`]'s allowlist. The
+    /// A hand-built `super::ast::Expr::TypedLiteral` names a `ValueType`
+    /// outside `super::typed_literal::TYPED_LITERALS`'s allowlist. The
     /// parser can't produce one — it only builds the node from that same
     /// table — so this is the validator's defense-in-depth against an AST
     /// assembled directly, in the same spirit as
-    /// [`super::eval::EvalError::Cycle`].
+    /// `super::eval::EvalError::Cycle`.
     UnsupportedLiteralType {
         field: String,
         value_type: ValueType,
     },
-    /// An [`super::ast::KeySpace::Aggregate`] definition's `GROUP BY` names a
+    /// An `super::ast::KeySpace::Aggregate` definition's `GROUP BY` names a
     /// column that isn't a real source column.
     UnresolvedGroupByColumn { column: String },
-    /// An [`super::ast::KeySpace::Aggregate`] definition's `GROUP BY` names a
-    /// column typed [`ValueType::Other`] (issue #108 review) — a Postgres
+    /// An `super::ast::KeySpace::Aggregate` definition's `GROUP BY` names a
+    /// column typed `ValueType::Other` (issue #108 review) — a Postgres
     /// family the OID registry recognizes but that `docs/type-support.md`
     /// still lists as passthrough-only, with no key role.
     ///
@@ -293,7 +293,7 @@ pub enum ValidationError {
         second: String,
         column: String,
     },
-    /// An [`super::ast::KeySpace::Aggregate`] definition's field references a
+    /// An `super::ast::KeySpace::Aggregate` definition's field references a
     /// source column that is neither a grouping key nor wrapped in exactly
     /// one of `SUM`/`MIN`/`MAX`/`AVG` — every row in a group must be folded
     /// down to one value before it can appear in the target, and a bare
@@ -322,7 +322,7 @@ pub enum ValidationError {
         reference: String,
         source: String,
     },
-    /// An [`super::ast::KeySpace::Aggregate`] definition has a calculated
+    /// An `super::ast::KeySpace::Aggregate` definition has a calculated
     /// field whose name matches one of its grouping columns, but whose
     /// expression isn't a bare passthrough of that same column (e.g.
     /// `GROUP BY order_id SELECT SUM(order_id) AS order_id`). DDL generation
@@ -333,7 +333,7 @@ pub enum ValidationError {
     /// keeps that assumption enforced at validation, not a silent DDL-time
     /// skip.
     GroupingColumnFieldMustBePassthrough { field: String },
-    /// A [`KeySpace::OneToOne`] definition has a calculated field whose alias
+    /// A `KeySpace::OneToOne` definition has a calculated field whose alias
     /// matches the name of a real source column, but whose expression isn't a
     /// bare passthrough of that same column. Without this guard, a *different*
     /// field referencing that name would resolve it via `fields_by_name`
@@ -364,7 +364,7 @@ pub enum ValidationError {
     /// (issue #76, ADR-0011) named a schema that does not
     /// actually contain a table by that name, as introspected live against
     /// `information_schema.tables`
-    /// ([`super::catalog::confirm_qualified_source`]). Distinct
+    /// (`super::catalog::confirm_qualified_source`). Distinct
     /// from [`super::catalog::CatalogError::SourceTableNotFound`]: that
     /// variant means "no schema on `search_path` has this bare name",
     /// whereas this one means "the exact schema the definition named is
@@ -375,12 +375,12 @@ pub enum ValidationError {
     /// [`ValidationError::QualifiedSourceTableNotFound`]: an explicitly-qualified
     /// `TRANSFORM <schema>.<target>` reference (issue #76) named a schema
     /// that doesn't actually contain a table by that name. For the common
-    /// [`super::catalog::install_definition`] path this schema is checked
+    /// `super::catalog::install_definition` path this schema is checked
     /// *after* the physical `CREATE TABLE` DDL already ran under the same
     /// explicit schema, so a miss here would mean that DDL itself failed
     /// silently rather than a genuine spelling error; for the ring-path entry
-    /// points ([`super::catalog::create_definition`]/
-    /// [`super::catalog::create_definition_without_backfill`]), which assume
+    /// points (`super::catalog::create_definition`/
+    /// `super::catalog::create_definition_without_backfill`), which assume
     /// their caller already created the physical target table, this is the
     /// only check that a bogus explicit schema ever gets.
     QualifiedTargetTableNotFound { schema: String, table: String },

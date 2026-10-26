@@ -24,11 +24,11 @@ pub enum ParseError {
     UnsupportedKeySpace { construct: String, detail: String },
     /// An operator other than `+`.
     UnsupportedOperator { operator: String },
-    /// A function call other than one in [`super::registry::FUNCTIONS`].
+    /// A function call other than one in `super::registry::FUNCTIONS`.
     UnsupportedFunction { name: String },
     /// A registered function called with the wrong number of arguments
     /// (issue #64) — a structural check the parser can make directly from
-    /// [`super::registry::FunctionSpec::arg_types`]'s length, without
+    /// `super::registry::FunctionSpec::arg_types`'s length, without
     /// needing argument type information (that's the validator's job).
     FunctionArityMismatch {
         name: String,
@@ -55,12 +55,12 @@ pub enum ParseError {
     GroupByKeyNotFromSource { reference: String, source: String },
     /// A `CAST(<expr> AS <type>)` whose operand is not a single-quoted
     /// string literal (issue #109) — i.e. a request for a **general** cast
-    /// rather than a typed literal. See [`super::typed_literal`] for why the
+    /// rather than a typed literal. See `super::typed_literal` for why the
     /// coercion lattice a general cast implies is each type family's own
     /// epic child, not this grammar's.
     UnsupportedCast { found: String },
     /// A `CAST(<literal> AS <type>)` or `<type> '<literal>'` naming a type
-    /// that isn't in [`super::typed_literal::TYPED_LITERALS`]'s allowlist.
+    /// that isn't in `super::typed_literal::TYPED_LITERALS`'s allowlist.
     UnsupportedLiteralType { name: String },
     /// Postgres's `<expr>::<type>` cast sugar, which this grammar doesn't
     /// accept (issue #109) — rejected by name so the message can point at

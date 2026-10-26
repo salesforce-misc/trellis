@@ -96,7 +96,7 @@ const SOURCE_COLUMNS_DDL: &str = "id bigint not null, grp integer not null, amt 
 /// The source table's own types ([`SOURCE_COLUMNS_DDL`]), as `Trellis::apply`
 /// would read them off the catalog.
 fn source_columns() -> HashMap<String, trellis::dev::defs::ValueType> {
-    use trellis::IntWidth::{Int4, Int8};
+    use trellis::dev::defs::IntWidth::{Int4, Int8};
     use trellis::dev::defs::ValueType::Integer;
     HashMap::from([
         ("id".to_string(), Integer(Int8)),
@@ -1191,7 +1191,7 @@ mod tests {
     /// refuses an edit over it once the live type disagrees (#1022).
     #[test]
     fn declared_source_types_match_the_tables() {
-        use trellis::IntWidth::{Int4, Int8};
+        use trellis::dev::defs::IntWidth::{Int4, Int8};
         use trellis::dev::defs::ValueType::Integer;
         let from_ddl: HashMap<String, _> = SOURCE_COLUMNS_DDL
             .split(',')

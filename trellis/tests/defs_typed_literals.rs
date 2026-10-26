@@ -651,7 +651,7 @@ async fn a_hostile_database_level_output_guc_does_not_change_what_the_engine_rea
     );
     assert_eq!(
         rendered_float,
-        trellis::float::render(0.1 + 0.2, trellis::FloatWidth::Float8),
+        trellis::float::render(0.1 + 0.2, trellis::float::FloatWidth::Float8),
         "and `float::render` must agree with it"
     );
     drop(pooled);

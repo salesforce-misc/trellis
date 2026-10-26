@@ -118,7 +118,7 @@ pub fn parse_statement(input: &str) -> Result<Statement, ParseError> {
 }
 
 /// Which form the statement `input` is, decided by parsing all of it with
-/// [`parse_statement`] — so the answer is always the form
+/// `parse_statement` — so the answer is always the form
 /// [`crate::Trellis::apply`] would carry out, and a statement `apply` would
 /// refuse as malformed is the same [`ParseError`] here, whatever keyword it
 /// leads with (`TRANSFORM oops` is an error, not a

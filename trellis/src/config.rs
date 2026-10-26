@@ -93,7 +93,7 @@ pub const DEFAULT_POOL_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Resolved connection configuration.
 ///
 /// Every field but `dsn` is private and every constructor validates the
-/// schema names via [`validate_schema_name`], so there is no way to hold a
+/// schema names via `validate_schema_name`, so there is no way to hold a
 /// `Config` whose schema hasn't been checked — see [`Config::with_schema`]
 /// and [`Config::with_target_schema`].
 ///
@@ -148,11 +148,11 @@ impl Config {
 
     /// Builds a [`Config`] from an explicit DSN, bypassing environment
     /// resolution entirely (the schema and target schema are still resolved
-    /// from `TRELLIS_SCHEMA`/[`DEFAULT_SCHEMA`] and
-    /// `TRELLIS_TARGET_SCHEMA`/[`DEFAULT_TARGET_SCHEMA`], and validated —
+    /// from `TRELLIS_SCHEMA`/`DEFAULT_SCHEMA` and
+    /// `TRELLIS_TARGET_SCHEMA`/`DEFAULT_TARGET_SCHEMA`, and validated —
     /// likewise the pool sizing/timeout, from `TRELLIS_POOL_MAX_SIZE`/
-    /// [`DEFAULT_POOL_MAX_SIZE`] and `TRELLIS_POOL_WAIT_TIMEOUT_SECS`/
-    /// [`DEFAULT_POOL_WAIT_TIMEOUT`]). Useful for tests.
+    /// `DEFAULT_POOL_MAX_SIZE` and `TRELLIS_POOL_WAIT_TIMEOUT_SECS`/
+    /// `DEFAULT_POOL_WAIT_TIMEOUT`). Useful for tests.
     pub fn from_dsn(dsn: impl Into<String>) -> Result<Self, Error> {
         let schema = std::env::var("TRELLIS_SCHEMA").unwrap_or_else(|_| DEFAULT_SCHEMA.to_string());
         let target_schema = target_schema_from_env();
@@ -165,8 +165,8 @@ impl Config {
     }
 
     /// Builds a [`Config`] from an explicit DSN and schema, validating the
-    /// schema via [`validate_schema_name`] and defaulting the target schema
-    /// to [`DEFAULT_TARGET_SCHEMA`] (override via [`Config::with_target_schema`]).
+    /// schema via `validate_schema_name` and defaulting the target schema
+    /// to `DEFAULT_TARGET_SCHEMA` (override via [`Config::with_target_schema`]).
     /// This is the one place a `Config` is actually constructed —
     /// [`Config::resolve`] and [`Config::from_dsn`] both resolve a schema
     /// and hand it to this — so there is no path to a `Config` carrying an
@@ -184,7 +184,7 @@ impl Config {
     }
 
     /// Returns `self` with its target schema overridden to `target_schema`,
-    /// validated via [`validate_schema_name`] just like [`Config::with_schema`]
+    /// validated via `validate_schema_name` just like [`Config::with_schema`]
     /// validates the instance schema.
     pub fn with_target_schema(mut self, target_schema: impl Into<String>) -> Result<Self, Error> {
         let target_schema = target_schema.into();
@@ -194,7 +194,7 @@ impl Config {
     }
 
     /// Returns `self` with its connection pool's `max_size` overridden (issue
-    /// #182) — see [`DEFAULT_POOL_MAX_SIZE`]. Rejects `0`: a pool that can
+    /// #182) — see `DEFAULT_POOL_MAX_SIZE`. Rejects `0`: a pool that can
     /// never open a single connection isn't a smaller pool, it's a broken
     /// one, and letting it through here would only surface as a confusing
     /// wait-timeout on every single [`crate::Pool::get`] call instead of a
@@ -210,7 +210,7 @@ impl Config {
     }
 
     /// Returns `self` with its connection pool's wait timeout overridden
-    /// (issue #182) — see [`DEFAULT_POOL_WAIT_TIMEOUT`]. Unlike
+    /// (issue #182) — see `DEFAULT_POOL_WAIT_TIMEOUT`. Unlike
     /// [`Config::with_pool_max_size`], every [`Duration`] (including
     /// [`Duration::ZERO`], which just makes [`crate::Pool::get`] fail
     /// immediately when no connection is already free — a legitimate, if
@@ -226,25 +226,25 @@ impl Config {
     }
 
     /// The Postgres schema this instance is configured to operate in. See
-    /// [`DEFAULT_SCHEMA`] and `docs/instance-identity.md`.
+    /// `DEFAULT_SCHEMA` and `docs/instance-identity.md`.
     pub fn schema(&self) -> &str {
         &self.schema
     }
 
     /// The Postgres schema transform target tables are created under. See
-    /// [`DEFAULT_TARGET_SCHEMA`].
+    /// `DEFAULT_TARGET_SCHEMA`.
     pub fn target_schema(&self) -> &str {
         &self.target_schema
     }
 
     /// The cap [`crate::Pool`] places on physical connections. See
-    /// [`DEFAULT_POOL_MAX_SIZE`].
+    /// `DEFAULT_POOL_MAX_SIZE`.
     pub fn pool_max_size(&self) -> usize {
         self.pool_max_size
     }
 
     /// How long [`crate::Pool::get`] waits for a free connection before
-    /// failing. See [`DEFAULT_POOL_WAIT_TIMEOUT`].
+    /// failing. See `DEFAULT_POOL_WAIT_TIMEOUT`.
     pub fn pool_wait_timeout(&self) -> Duration {
         self.pool_wait_timeout
     }

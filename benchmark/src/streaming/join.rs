@@ -103,7 +103,7 @@ use rand::{Rng, SeedableRng};
 use testkit::{TestCluster, TestDatabase};
 use tokio_postgres::Client as RawClient;
 use tokio_postgres::types::ToSql;
-use trellis::config::DEFAULT_SCHEMA;
+use trellis::dev::config::DEFAULT_SCHEMA;
 use trellis::dev::defs::ast::ValueType;
 
 use crate::scenario::connect_raw;
@@ -540,8 +540,8 @@ impl VariantDb {
             None
         };
         let client = trellis::Client::start(db.dsn(), tuning.client_options()).expect("client");
-        let int4 = ValueType::Integer(trellis::IntWidth::Int4);
-        let int8 = ValueType::Integer(trellis::IntWidth::Int8);
+        let int4 = ValueType::Integer(trellis::dev::defs::IntWidth::Int4);
+        let int8 = ValueType::Integer(trellis::dev::defs::IntWidth::Int8);
         let mut columns: std::collections::HashMap<String, ValueType> = [
             ("id", int8),
             ("day", int4),

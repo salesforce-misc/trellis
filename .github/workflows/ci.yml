@@ -83,6 +83,15 @@ jobs:
           cargo clippy -p benchmark --features engine-access -- -D warnings
           cargo clippy -p generative --features subprocess-backend -- -D warnings
 
+      - name: Rustdoc
+        # The crate docs link only to public items and every link resolves.
+        run: RUSTDOCFLAGS='-D warnings' cargo doc -p trellis --no-deps
+
+      - name: Check the public API
+        # The crate's public items are exactly .github/public-api.txt, so an
+        # addition is a visible diff in review; see the script's docstring.
+        run: .github/scripts/check-public-api.py
+
       - name: Build every test's dependencies for the cache
         # Only on a cache miss, so the saved entry holds the dependencies of
         # all the shards, not of whichever shard happened to save it.

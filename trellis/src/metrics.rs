@@ -186,12 +186,6 @@ pub enum CaptureRebuildCause {
 }
 
 impl CaptureRebuildCause {
-    /// Every cause, in label order.
-    pub const ALL: [CaptureRebuildCause; 2] = [
-        CaptureRebuildCause::ValueRewrite,
-        CaptureRebuildCause::ColumnChanged,
-    ];
-
     /// The `cause` label.
     pub fn label(self) -> &'static str {
         match self {
@@ -235,6 +229,7 @@ pub enum BuildStatement {
 
 impl BuildStatement {
     /// Every class, in label order.
+    #[cfg(any(test, feature = "test-util"))]
     pub const ALL: [BuildStatement; 6] = [
         BuildStatement::ChunkSetup,
         BuildStatement::ChunkKeys,
@@ -706,7 +701,7 @@ pub struct Metrics {
 }
 
 impl Metrics {
-    /// Ensures the registry is installed (see [`ensure_installed`]) and
+    /// Ensures the registry is installed (see `ensure_installed`) and
     /// returns a handle onto it. Cheap and side-effect-free beyond that
     /// first-call installation — safe to call as often as wanted.
     pub fn new() -> Self {

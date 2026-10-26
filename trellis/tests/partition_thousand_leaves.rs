@@ -36,7 +36,7 @@ fn columns() -> Vec<(&'static str, ValueType)> {
         ("id", ValueType::Numeric),
         // As define types it from the source (`integer`), so the routing
         // and sweep searches' casts are no-ops an index serves.
-        ("g", ValueType::Integer(trellis::IntWidth::Int4)),
+        ("g", ValueType::Integer(trellis::integer::IntWidth::Int4)),
         ("v", ValueType::Numeric),
     ]
 }

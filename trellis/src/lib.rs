@@ -1,38 +1,40 @@
 //! Trellis engine: a declarative API for creating incrementally maintained
 //! data transformations in PostgreSQL.
 //!
-//! [`app::Trellis`] is the embedder's entry point — one facade covering the
+//! [`Trellis`] is the embedder's entry point — one facade covering the
 //! whole lifecycle: apply migrations, register transform definitions, list
 //! them, request backfills, and run the live pipeline
 //! (capture, ring maintenance, and N application workers). It composes
 //! everything below into one interface so callers never stitch the
-//! primitives together themselves; [`client::Client`] is the runtime it
+//! primitives together themselves; [`Client`] is the runtime it
 //! starts, still public for embedders that want to drive it directly.
-//! [`blocking::BlockingTrellis`] wraps the same facade for callers that
+//! [`BlockingTrellis`] wraps the same facade for callers that
 //! can't assume a `tokio` runtime on their own thread (the FFI
 //! bindings). Those three are tier 1 in
 //! `docs/decisions/0012-curate-public-api-demote-engine-modules.md` — the
 //! only front doors.
 //!
-//! Tier 2 is the small set of composable primitives an embedder may reach
-//! for directly instead of going through the facade:
+//! Every public name is re-exported at the crate root; the modules that
+//! define them are private. Tier 2 is the small set of composable primitives
+//! an embedder may reach for directly instead of going through the facade:
 //!
-//! - [`config`] resolves a [`Config`] from CLI args + environment.
-//! - [`pool`] manages a `deadpool-postgres` connection pool and exposes the
-//!   per-connection session bootstrap seam.
-//! - [`mod@migrate`] applies Trellis's embedded SQL migrations.
-//! - [`identity`] decides, before migrations run, whether the configured
-//!   schema is safe to attach to — see `docs/instance-identity.md`.
-//! - [`error_code`] is a small, stable [`error_code::ErrorCode`] taxonomy
-//!   every error type in this crate can report via a `code()` method,
-//!   independent of its own (freely growing) internal variants — see
+//! - [`Config`] resolves from CLI args + environment (`Config::resolve`) or
+//!   from a DSN.
+//! - [`Pool`] manages a `deadpool-postgres` connection pool, which
+//!   [`Trellis::pool`] hands back for an embedder's own queries.
+//! - [`migrate()`] applies Trellis's embedded SQL migrations, after checking
+//!   that the configured schema is safe to attach to — see
+//!   `docs/instance-identity.md`.
+//! - [`ErrorCode`] is a small, stable taxonomy every error type in this
+//!   crate can report via a `code()` method, independent of its own (freely
+//!   growing) internal variants — see
 //!   `docs/decisions/0008-public-api-design.md`, decision 3.
 //! - [`statement_kind`] names which form a statement is ([`StatementKind`])
 //!   without applying it, using `apply`'s own parser — the check a binding
 //!   makes before handing a statement to `apply`.
-//! - [`metrics`] is a facade over the `metrics`/`metrics-exporter-prometheus`
+//! - [`Metrics`] is a facade over the `metrics`/`metrics-exporter-prometheus`
 //!   in-process registry and its Prometheus text
-//!   exposition ([`app::Trellis::metrics`]) — see
+//!   exposition ([`Trellis::metrics`]) — see
 //!   `docs/observability.md` and
 //!   `docs/decisions/0009-observability-decisions.md`.
 //! - Logs/traces flow through the plain `tracing`
@@ -76,30 +78,69 @@
 //! segment's slot is freed for reuse by retirement
 //! (`docs/staging-and-claiming/06-cleanup-and-reclaim.md`), run in the
 //! maintenance loop's housekeeping
-//! ([`client::ClientOptions::housekeeping_interval`]) and as the
+//! ([`ClientOptions::housekeeping_interval`]) and as the
 //! one-retry-on-`RingFull` step of sealing.
 
 // Tier 1 (the facade) and tier 2 (composable primitives) — see ADR-0012.
+#[cfg(not(feature = "internals"))]
+mod app;
+#[cfg(feature = "internals")]
 pub mod app;
+#[cfg(not(feature = "internals"))]
+mod blocking;
+#[cfg(feature = "internals")]
 pub mod blocking;
+#[cfg(not(feature = "internals"))]
+mod client;
+#[cfg(feature = "internals")]
 pub mod client;
+#[cfg(not(feature = "internals"))]
+mod config;
+#[cfg(feature = "internals")]
 pub mod config;
 pub(crate) mod deadline;
 #[cfg(not(feature = "internals"))]
 pub(crate) mod dump;
 #[cfg(feature = "internals")]
 pub mod dump;
+#[cfg(not(feature = "internals"))]
+mod error;
+#[cfg(feature = "internals")]
 pub mod error;
+#[cfg(not(feature = "internals"))]
+mod error_code;
+#[cfg(feature = "internals")]
 pub mod error_code;
+#[cfg(not(feature = "internals"))]
+mod float;
+#[cfg(feature = "internals")]
 pub mod float;
+#[cfg(not(feature = "internals"))]
+mod identity;
+#[cfg(feature = "internals")]
 pub mod identity;
 pub(crate) mod instance_log;
+#[cfg(not(feature = "internals"))]
+mod integer;
+#[cfg(feature = "internals")]
 pub mod integer;
+#[cfg(not(feature = "internals"))]
+mod metrics;
+#[cfg(feature = "internals")]
 pub mod metrics;
+#[cfg(not(feature = "internals"))]
+mod migrate;
+#[cfg(feature = "internals")]
 pub mod migrate;
+#[cfg(not(feature = "internals"))]
+mod numeric;
+#[cfg(feature = "internals")]
 pub mod numeric;
 #[cfg(feature = "otlp")]
 pub mod otel;
+#[cfg(not(feature = "internals"))]
+mod pool;
+#[cfg(feature = "internals")]
 pub mod pool;
 pub(crate) mod tls;
 
@@ -182,15 +223,10 @@ pub use client::{Client, ClientError, ClientOptions};
 
 // --- Tier 2: composable primitives ----------------------------------------
 pub use config::Config;
-pub use deadline::DEFAULT_CALL_BUDGET;
 pub use error::Error;
 pub use error_code::ErrorCode;
-pub use float::FloatWidth;
-pub use identity::Identity;
-pub use integer::IntWidth;
 pub use metrics::Metrics;
 pub use migrate::migrate;
-pub use numeric::Numeric;
 #[cfg(feature = "otlp")]
 pub use otel::OtelError;
 pub use pool::Pool;

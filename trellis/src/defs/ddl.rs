@@ -230,7 +230,7 @@ pub enum DdlError {
         actual_arity: usize,
     },
     /// The source table's (single-column) primary key resolved to a Postgres
-    /// type outside [`super::join_key_types::is_text_stable_join_key_type`]'s
+    /// type outside `super::join_key_types::is_text_stable_join_key_type`'s
     /// allowlist (issue #107). Every 1-1 apply/backfill path
     /// (`staging::apply`, `staging::backfill`) compares this primary key via
     /// `::text` casts, exactly like a `JOIN` key — so a
@@ -247,20 +247,20 @@ pub enum DdlError {
         pg_type: String,
     },
     /// `def`'s calculated fields failed type inference — meaning `def`
-    /// reached DDL generation without having passed [`super::validate::validate`]
+    /// reached DDL generation without having passed `super::validate::validate`
     /// against this same `source_columns`, since a validated definition's
     /// fields always type-check.
     InvalidDefinition(ValidationError),
-    /// Substituting an [`super::ast::KeySpace::Aggregate`] definition's
+    /// Substituting an `super::ast::KeySpace::Aggregate` definition's
     /// cross-field-alias references (see
-    /// [`super::backfill::substituted_field_exprs`]) failed — a cyclic alias
+    /// `super::backfill::substituted_field_exprs`) failed — a cyclic alias
     /// chain or a pathologically large expansion. A real cycle is already
-    /// rejected by [`super::validate::validate`] before DDL generation runs,
+    /// rejected by `super::validate::validate` before DDL generation runs,
     /// so this should not be reachable for a definition that reaches this
     /// point; kept as a typed error rather than a panic, matching this
     /// module's treatment of every other "should not happen" case above.
-    /// Boxed because [`super::backfill::BackfillError`] itself has a
-    /// [`super::backfill::BackfillError::Ddl`] variant holding a [`DdlError`]
+    /// Boxed because `super::backfill::BackfillError` itself has a
+    /// `super::backfill::BackfillError::Ddl` variant holding a [`DdlError`]
     /// — an unboxed cycle here would make both types infinite-sized.
     AliasSubstitution(Box<super::backfill::BackfillError>),
     /// An aggregate definition the group basis doesn't route reached target
@@ -277,7 +277,7 @@ impl DdlError {
     /// This error's stable, coarse [`ErrorCode`] category (`docs/decisions/0008-public-api-design.md`,
     /// decision 3). Delegates to the wrapped error's own `code()` where one
     /// nests here ([`DdlError::InvalidDefinition`], [`DdlError::AliasSubstitution`],
-    /// [`DdlError::Pool`]) or to [`error_code::classify_pg_error`] for a raw
+    /// [`DdlError::Pool`]) or to `error_code::classify_pg_error` for a raw
     /// Postgres error, so the mapping composes rather than re-deriving a
     /// category for an error type that already has one.
     pub fn code(&self) -> ErrorCode {

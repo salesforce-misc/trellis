@@ -165,6 +165,7 @@ impl CaptureSpec {
     }
 
     /// Whether the table is a partitioned root.
+    #[cfg(any(test, feature = "internals"))]
     pub fn is_partitioned(&self) -> bool {
         self.partitioned
     }
@@ -207,6 +208,7 @@ impl CaptureEvent {
     ];
 
     /// The events whose functions write ring rows.
+    #[cfg(any(test, feature = "internals"))]
     pub const CAPTURED: [CaptureEvent; 4] = [
         CaptureEvent::Insert,
         CaptureEvent::Update,

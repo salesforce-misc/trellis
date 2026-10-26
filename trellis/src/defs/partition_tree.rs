@@ -128,20 +128,20 @@ impl PartitionTree {
     }
 
     /// The deepest node's depth: 1 for a root of plain leaves.
-    #[allow(dead_code)] // read by capture install and the reconcile pass (ADR-0017 P2/P3)
+    #[cfg(any(test, feature = "internals"))]
     pub fn depth(&self) -> u32 {
         self.nodes.iter().map(|n| n.depth).max().unwrap_or(0)
     }
 
     /// Whether a `DEFAULT` partition sits anywhere in the tree.
-    #[allow(dead_code)] // read by capture install and the reconcile pass (ADR-0017 P2/P3)
+    #[cfg(any(test, feature = "internals"))]
     pub fn has_default(&self) -> bool {
         self.nodes.iter().any(|n| n.is_default)
     }
 
     /// Every partition-key column name at every level, each once, in the
     /// order first met top-down.
-    #[allow(dead_code)] // read by capture install and the reconcile pass (ADR-0017 P2/P3)
+    #[cfg(any(test, feature = "internals"))]
     pub fn key_columns(&self) -> Vec<&str> {
         let mut out: Vec<&str> = Vec::new();
         for level in &self.levels {

@@ -44,11 +44,11 @@ use std::collections::HashMap;
 use testkit::TestCluster;
 use tokio_postgres::error::SqlState;
 use tokio_postgres::{Client, NoTls};
-use trellis::FloatWidth;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use trellis::defs::eval::{RegexCache, Row, Value, evaluate};
 use trellis::defs::{CatalogError, ValidationError, install_definition, parse, validate};
+use trellis::float::FloatWidth;
 use trellis::integer::IntWidth;
 
 // ---------------------------------------------------------------------

@@ -110,7 +110,7 @@ use crate::defs::row_security::{self, RowSecurity};
 use crate::defs::subscription::{self, Subscribed};
 use crate::staging::append::RING_SIZE;
 
-/// One way a table's capture is broken, found by [`audit`]. Each names the
+/// One way a table's capture is broken, found by `audit`. Each names the
 /// captured table as its unquoted `schema.table` identity, except
 /// [`CaptureFault::MissingPrivilege`], which is about the instance, not one
 /// table.
@@ -160,7 +160,7 @@ pub enum CaptureFault {
         object: String,
     },
     /// The table is in a partition or inheritance hierarchy (issue #707,
-    /// [`crate::defs::hierarchy`]): it became a partition or an inheritance
+    /// `crate::defs::hierarchy`): it became a partition or an inheritance
     /// parent or child after its definition was accepted, or was dropped and
     /// recreated as a partitioned table or as one of those. Its statement
     /// triggers miss some writes to it, or capture another table's rows as
@@ -169,17 +169,17 @@ pub enum CaptureFault {
     Hierarchy(Hierarchy),
     /// The table's row-level security policies apply to the ring's owner, or
     /// to the role `self_check` runs as (issue #745,
-    /// [`crate::defs::row_security`]). Capture still sees
+    /// `crate::defs::row_security`). Capture still sees
     /// every change, but each read of the table, `self_check`'s recompute
     /// included, sees only the rows the policies allow. Checked on every
     /// table the definition reads, including one the target-mutation seam
     /// feeds. Also (issue #765) reported for the definition's own target
-    /// ([`RowSecurity::target`]) when the policies apply to the caller's
+    /// (`RowSecurity::target`) when the policies apply to the caller's
     /// role, standing in for the workers' that write it: their updates and
     /// deletes skip the rows the policies hide, and their inserts fail.
     RowSecurity(RowSecurity),
     /// A logical-replication subscription replicates into the table (issue
-    /// #751, [`crate::defs::subscription`]). Its apply worker fires only
+    /// #751, `crate::defs::subscription`). Its apply worker fires only
     /// row-level triggers, so the capture triggers, installed and enabled as
     /// they are, never see the changes it applies. Checked on every table the
     /// definition reads, including one the target-mutation seam feeds, which

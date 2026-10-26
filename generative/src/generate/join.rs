@@ -52,7 +52,7 @@
 //! The tables are unpartitioned and no definition reads another's target;
 //! partitioned sides and chained readers are separate draw dimensions.
 
-use trellis::IntWidth;
+use trellis::dev::defs::IntWidth;
 use trellis::dev::defs::ast::{TransformDef, ValueType};
 
 use crate::model::{

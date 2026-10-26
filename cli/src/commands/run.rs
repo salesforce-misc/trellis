@@ -38,7 +38,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use trellis::metrics::Metrics;
+use trellis::Metrics;
 use trellis::{Config, Trellis, TrellisOptions};
 
 /// Help text for `trellis run -h`/`--help`, and prefixed to any
@@ -562,7 +562,7 @@ mod tests {
     /// the Prometheus content type whose body contains that observation.
     #[tokio::test]
     async fn serves_the_rendered_registry_as_a_200_with_the_prometheus_content_type() {
-        trellis::metrics::increment_changes_applied("run_cli_test_target", 1);
+        trellis::dev::metrics::increment_changes_applied("run_cli_test_target", 1);
 
         let listener = TcpListener::bind("127.0.0.1:0")
             .await

@@ -706,6 +706,7 @@ pub enum Progress<T> {
 
 impl<T> Progress<T> {
     /// The result, if the operation landed.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn done(self) -> Option<T> {
         match self {
             Progress::Done(value) => Some(value),
@@ -750,6 +751,7 @@ pub async fn reconcile(
 /// module doc describes. Lands `false`, having done nothing, when `spec` is
 /// already installed and current: a repeat install takes no lock and records
 /// no gate.
+#[cfg(any(test, feature = "test-util"))]
 pub async fn install(
     client: &mut Client,
     schema: &str,
@@ -859,6 +861,7 @@ fn trigger_names(schema: &str) -> Vec<String> {
 /// table's `SHARE ROW EXCLUSIVE` lock, and records the table's capture gate
 /// (see "Widening and the capture gate"), retried as the module doc
 /// describes.
+#[cfg(any(test, feature = "internals"))]
 pub async fn widen(
     client: &mut Client,
     schema: &str,
@@ -1495,6 +1498,7 @@ impl Blocker {
 
 /// Who, other than this session, holds or is queued for a lock on `table`
 /// that conflicts with `conflicts` (lock modes as `pg_locks` spells them).
+#[cfg(any(test, feature = "internals"))]
 pub async fn blockers(
     client: &impl GenericClient,
     table: &str,

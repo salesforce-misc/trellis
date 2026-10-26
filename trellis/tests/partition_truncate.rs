@@ -54,9 +54,9 @@ impl Fx {
         let d = Driver::start(
             &schema,
             &[
-                ("id", ValueType::Integer(trellis::IntWidth::Int4)),
-                ("g", ValueType::Integer(trellis::IntWidth::Int4)),
-                ("v", ValueType::Integer(trellis::IntWidth::Int4)),
+                ("id", ValueType::Integer(trellis::integer::IntWidth::Int4)),
+                ("g", ValueType::Integer(trellis::integer::IntWidth::Int4)),
+                ("v", ValueType::Integer(trellis::integer::IntWidth::Int4)),
             ],
             &[DEFINITION],
             &[SOURCE],

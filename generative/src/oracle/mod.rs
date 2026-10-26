@@ -39,13 +39,13 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
-use trellis::IntWidth;
 use trellis::Pool;
+use trellis::dev::defs::IntWidth;
 use trellis::dev::defs::ast::{Expr, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use trellis::dev::defs::oracle::{OracleError, recompute, recompute_aggregate};
 use trellis::dev::defs::registry;
 use trellis::dev::defs::typed_literal;
-use trellis::numeric::Numeric;
+use trellis::dev::numeric::Numeric;
 
 use crate::model::{Program, group_key};
 
@@ -155,7 +155,7 @@ impl Comparison {
 fn floats_close(a: f64, b: f64) -> bool {
     const RELATIVE: f64 = 1e-9;
     const ABSOLUTE: f64 = 1e-12;
-    if trellis::float::equal(a, b) {
+    if trellis::dev::float::equal(a, b) {
         return true;
     }
     // A special value that isn't equal to the other side (e.g. `NaN` vs `1`,

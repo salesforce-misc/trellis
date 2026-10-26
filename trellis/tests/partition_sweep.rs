@@ -461,7 +461,7 @@ async fn measure(kind: &str, ddl: &str) -> Fx {
     let started = Instant::now();
     // The group column typed as define gives it from the source (`integer`),
     // so the search's cast to the key's type is a no-op an index serves.
-    let mut fx = Fx::start(ddl, ValueType::Integer(trellis::IntWidth::Int4)).await;
+    let mut fx = Fx::start(ddl, ValueType::Integer(trellis::integer::IntWidth::Int4)).await;
     let groups: i64 =
         fx.d.ctl
             .query_one("select count(*) from public.agg", &[])

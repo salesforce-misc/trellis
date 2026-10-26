@@ -63,7 +63,7 @@ pub struct JoinStatus {
     /// left out.
     pub hidden_tables: Vec<HiddenTableSize>,
     /// Set when `P`'s estimated rows reach
-    /// [`PARTIALS_WARNING_PERCENT`] percent of the fact table's.
+    /// `PARTIALS_WARNING_PERCENT` percent of the fact table's.
     pub partials_warning: Option<PartialsWarning>,
     /// The step the definition's build runs now, or runs next if no worker
     /// holds its job; `None` when no build is under way or the definition

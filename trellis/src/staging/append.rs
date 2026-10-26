@@ -174,7 +174,7 @@ pub enum StagedChange {
     /// `lsn` is required, as the trigger always stamps one: the truncate's
     /// drain raises its targets' truncate floor to it (ADR-0002 I2), and a
     /// truncate with none would raise no floor (#774).
-    #[allow(dead_code)]
+    #[cfg(any(test, feature = "internals"))]
     Truncate {
         src_table: String,
         lsn: PgLsn,
@@ -240,6 +240,7 @@ impl<'a> From<&'a StagedChange> for ChangeRow<'a> {
                 src_changed: *src_changed,
                 hop_gen: *hop_gen,
             },
+            #[cfg(any(test, feature = "internals"))]
             StagedChange::Truncate {
                 src_table,
                 lsn,

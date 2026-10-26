@@ -95,10 +95,16 @@ impl Fixture {
         let columns = [
             (
                 "id".to_string(),
-                ValueType::Integer(trellis::IntWidth::Int4),
+                ValueType::Integer(trellis::integer::IntWidth::Int4),
             ),
-            ("g".to_string(), ValueType::Integer(trellis::IntWidth::Int4)),
-            ("v".to_string(), ValueType::Integer(trellis::IntWidth::Int8)),
+            (
+                "g".to_string(),
+                ValueType::Integer(trellis::integer::IntWidth::Int4),
+            ),
+            (
+                "v".to_string(),
+                ValueType::Integer(trellis::integer::IntWidth::Int8),
+            ),
         ]
         .into_iter()
         .collect();

@@ -173,6 +173,7 @@ impl Numeric {
         digits
     }
 
+    #[cfg(any(test, feature = "test-util"))]
     fn is_zero(&self) -> bool {
         self.digits.iter().all(|&d| d == 0)
     }
@@ -181,6 +182,7 @@ impl Numeric {
     /// power-of-ten position of the leading digit. Zero has no well-defined
     /// exponent; by convention (matching Postgres's `ndigits == 0` case)
     /// it's treated as `0`.
+    #[cfg(any(test, feature = "test-util"))]
     fn decimal_exponent(&self) -> i64 {
         if self.is_zero() {
             0
@@ -193,6 +195,7 @@ impl Numeric {
     /// the index of the group containing the leading digit, `floor(exponent
     /// / 4)`. Needed only to reproduce [`select_div_scale`]'s result-scale
     /// rule for `/`, which is defined in terms of these groups.
+    #[cfg(any(test, feature = "test-util"))]
     fn nbase_weight(&self) -> i64 {
         floor_div4(self.decimal_exponent())
     }
@@ -200,6 +203,7 @@ impl Numeric {
     /// The integer value (`0..=9999`) of this value's leading base-10000
     /// digit group — e.g. `1000` for `100000000000`, `3` for `3`. Zero by
     /// convention for a zero value.
+    #[cfg(any(test, feature = "test-util"))]
     fn leading_nbase_digit(&self) -> u32 {
         if self.is_zero() {
             return 0;
@@ -227,6 +231,7 @@ impl Numeric {
     ///
     /// If `other` is zero. Callers (aggregate `AVG`) only ever divide by a
     /// non-zero group row count.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn div(&self, other: &Numeric) -> Numeric {
         assert!(!other.is_zero(), "division by zero");
 
@@ -262,6 +267,7 @@ impl Numeric {
 /// fractional digits `/` keeps, at least [`NUMERIC_MIN_SIG_DIGITS`]
 /// significant digits' worth relative to the quotient's magnitude, and never
 /// fewer than either operand's own scale.
+#[cfg(any(test, feature = "test-util"))]
 fn select_div_scale(v1: &Numeric, v2: &Numeric) -> u32 {
     const NUMERIC_MIN_SIG_DIGITS: i64 = 16;
     const DEC_DIGITS: i64 = 4;
@@ -285,12 +291,14 @@ fn select_div_scale(v1: &Numeric, v2: &Numeric) -> u32 {
     rscale as u32
 }
 
+#[cfg(any(test, feature = "test-util"))]
 fn floor_div4(a: i64) -> i64 {
     if a >= 0 { a / 4 } else { (a - 3) / 4 }
 }
 
 /// Appends `k` zero digits to the end of a most-significant-first digit
 /// vector — i.e. multiplies the represented integer by `10^k`.
+#[cfg(any(test, feature = "test-util"))]
 fn append_zeros(digits: &[u8], k: usize) -> Vec<u8> {
     let mut v = digits.to_vec();
     v.extend(std::iter::repeat_n(0, k));
@@ -298,6 +306,7 @@ fn append_zeros(digits: &[u8], k: usize) -> Vec<u8> {
 }
 
 /// Multiplies a big-endian decimal digit vector by a single digit `0..=9`.
+#[cfg(any(test, feature = "test-util"))]
 fn mul_small(digits: &[u8], m: u8) -> Vec<u8> {
     if m == 0 {
         return vec![0];
@@ -321,6 +330,7 @@ fn mul_small(digits: &[u8], m: u8) -> Vec<u8> {
 /// Compares two big-endian decimal digit vectors as unsigned integers,
 /// ignoring any leading-zero padding (unlike [`compare_magnitudes`], which
 /// requires equal length).
+#[cfg(any(test, feature = "test-util"))]
 fn cmp_biguint(a: &[u8], b: &[u8]) -> Ordering {
     let mut a = a.to_vec();
     let mut b = b.to_vec();
@@ -335,6 +345,7 @@ fn cmp_biguint(a: &[u8], b: &[u8]) -> Ordering {
 
 /// Subtracts `b` from `a` (unsigned big-endian decimal digit vectors of
 /// possibly differing length), assuming `a >= b`.
+#[cfg(any(test, feature = "test-util"))]
 fn sub_biguint(a: &[u8], b: &[u8]) -> Vec<u8> {
     let mut a = a.to_vec();
     strip_leading_zeros(&mut a);
@@ -348,6 +359,7 @@ fn sub_biguint(a: &[u8], b: &[u8]) -> Vec<u8> {
 
 /// Adds one to a big-endian decimal digit vector in place, growing it by one
 /// digit on overflow (e.g. `999` -> `1000`).
+#[cfg(any(test, feature = "test-util"))]
 fn increment(digits: &mut Vec<u8>) {
     for d in digits.iter_mut().rev() {
         if *d == 9 {
@@ -365,6 +377,7 @@ fn increment(digits: &mut Vec<u8>) {
 /// `(quotient, remainder)` with `quotient.len() == dividend.len()` (leading
 /// zeros included, un-normalized — callers strip them) and `remainder ==
 /// dividend % divisor` exactly.
+#[cfg(any(test, feature = "test-util"))]
 fn div_digits(dividend: &[u8], divisor: &[u8]) -> (Vec<u8>, Vec<u8>) {
     let mut divisor_trimmed = divisor.to_vec();
     strip_leading_zeros(&mut divisor_trimmed);

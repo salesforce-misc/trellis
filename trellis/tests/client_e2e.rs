@@ -1144,10 +1144,16 @@ async fn drain_workers_waiting_an_hour_still_build_and_drain_on_notifications_al
     let columns = [
         (
             "id".to_string(),
-            ValueType::Integer(trellis::IntWidth::Int4),
+            ValueType::Integer(trellis::integer::IntWidth::Int4),
         ),
-        ("g".to_string(), ValueType::Integer(trellis::IntWidth::Int4)),
-        ("v".to_string(), ValueType::Integer(trellis::IntWidth::Int8)),
+        (
+            "g".to_string(),
+            ValueType::Integer(trellis::integer::IntWidth::Int4),
+        ),
+        (
+            "v".to_string(),
+            ValueType::Integer(trellis::integer::IntWidth::Int8),
+        ),
     ]
     .into_iter()
     .collect();

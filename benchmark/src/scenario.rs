@@ -1,7 +1,7 @@
 //! The benchmark's shared raw-connection helper.
 
 use tokio_postgres::{Client as RawClient, NoTls};
-use trellis::config::DEFAULT_SCHEMA;
+use trellis::dev::config::DEFAULT_SCHEMA;
 
 /// Connects directly to `dsn` (bypassing `trellis::Pool`), matching the
 /// convention `trellis`'s own integration tests use: the scenarios' reference

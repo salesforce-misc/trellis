@@ -200,7 +200,7 @@ pub struct SelfCheckReport {
     /// on either side of the comparison.
     pub rows_compared: i64,
     /// Whether the job stopped before the end of the target's keys: it found
-    /// [`MAX_DIVERGENCES`] divergences, or a page found the target no longer
+    /// `MAX_DIVERGENCES` divergences, or a page found the target no longer
     /// live or not caught up (or its capture broken) after earlier pages had
     /// compared rows. `rows_compared` says how far it got.
     pub truncated: bool,

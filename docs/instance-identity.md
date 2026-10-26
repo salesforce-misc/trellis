@@ -123,9 +123,6 @@ conflicting instances starting together would each scan before the other wrote
 its marker and both pass, and two clients of one instance starting together
 would both run the migration runner on the same new schema.
 
-`trellis::identity::Identity::resolved` reports the identity (schema + format
-version) this build would attach as, without touching the database.
-
 ## What "coexisting instances" actually requires
 
 The named schema is necessary but not sufficient. Anything an instance treats

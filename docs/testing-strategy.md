@@ -231,7 +231,7 @@ be compared.
 
 ## How CI runs the tiers
 
-The `ci` workflow runs `lint` (format, clippy, the shard-plan check) beside four `test`
+The `ci` workflow runs `lint` (format, clippy, the rustdoc build with warnings denied, the public-API list check, the shard-plan check) beside four `test`
 shard jobs, and a final job named `ci` that passes only when `lint` and every shard
 passed; `ci` is the one required status check. Each shard builds and runs its own test
 binaries, one at a time, with `cargo test --workspace --features benchmark/engine-access

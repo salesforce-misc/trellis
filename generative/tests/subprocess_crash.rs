@@ -162,7 +162,7 @@ async fn a_sigkill_mid_phase_3_drain_still_converges_on_redrive() {
         .query(
             &format!(
                 "select distinct claimed_by from {}.seg_claims",
-                trellis::config::DEFAULT_SCHEMA
+                trellis::dev::config::DEFAULT_SCHEMA
             ),
             &[],
         )
@@ -211,7 +211,7 @@ async fn a_sigkill_mid_phase_3_drain_still_converges_on_redrive() {
             &format!(
                 "update {}.seg_claims set claimed_at = now() - interval '1 hour' \
                  where claimed_by = any($1)",
-                trellis::config::DEFAULT_SCHEMA
+                trellis::dev::config::DEFAULT_SCHEMA
             ),
             &[&killed_claimants],
         )
@@ -264,7 +264,7 @@ async fn restart_waits_for_the_killed_engines_singleton_to_free() {
         .await
         .expect("install program (spawns the primary engine subprocess)");
 
-    let key = producer_singleton_lock_key(trellis::config::DEFAULT_SCHEMA);
+    let key = producer_singleton_lock_key(trellis::dev::config::DEFAULT_SCHEMA);
     let (stand_in, connection) = tokio_postgres::connect(db.dsn(), NoTls)
         .await
         .expect("connect the stand-in session");

@@ -127,7 +127,7 @@ pub async fn run(cfg: Config, tuning: &EngineTuning) {
                 }
             ),
             {
-                use trellis::IntWidth::{Int4, Int8};
+                use trellis::dev::defs::IntWidth::{Int4, Int8};
                 use trellis::dev::defs::ValueType::Integer;
                 HashMap::from([
                     ("id".to_string(), Integer(Int8)),
@@ -353,7 +353,7 @@ async fn probe(raw: &RawClient, cfg: &Config) {
 
 /// `--kind join`: the `P` and `M` walks of a JOIN target (the module doc).
 async fn run_join(cfg: Config, tuning: &EngineTuning) {
-    use trellis::IntWidth::{Int4, Int8};
+    use trellis::dev::defs::IntWidth::{Int4, Int8};
     use trellis::dev::defs::ValueType::Integer;
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;

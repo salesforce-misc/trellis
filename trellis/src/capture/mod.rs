@@ -51,10 +51,6 @@
 //! every transition row counts once (#1099; [`sql`]'s "Every transition row
 //! counts once").
 
-// A few items (the parity helpers, the spec accessors) only the tests reach,
-// and a build without `internals` would flag them as dead.
-#![cfg_attr(not(feature = "internals"), allow(dead_code))]
-
 pub(crate) mod baseline;
 pub mod columns;
 pub mod complement;

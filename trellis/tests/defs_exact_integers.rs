@@ -38,11 +38,11 @@ use std::time::Duration;
 use testkit::TestCluster;
 use tokio_postgres::error::SqlState;
 use tokio_postgres::{Client, NoTls};
-use trellis::IntWidth;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use trellis::defs::eval::{RegexCache, Row, Value, evaluate};
 use trellis::defs::{CatalogError, ValidationError, install_definition, parse, validate};
+use trellis::integer::IntWidth;
 use trellis::{Config, Trellis, TrellisOptions};
 
 // ---------------------------------------------------------------------

@@ -76,11 +76,11 @@ pub fn applying_sql(alias: &str) -> String {
 /// A transform's lifecycle status (issue #55), persisted as
 /// `transform_definitions.status`: `docs/transforms.md`'s "Status" section
 /// documents the full state machine this mirrors. Registration
-/// ([`super::catalog::install_definition`]) persists
+/// (`super::catalog::install_definition`) persists
 /// [`TransformStatus::WaitingToBackfill`]. The staging worker's capture pass
 /// moves it on, to [`TransformStatus::Backfilling`] with its Re-derive build's
 /// plan job (`crate::staging::build`); it applies from that commit
-/// ([`APPLYING_SQL`]), and the transaction that finishes its build (the last
+/// (`APPLYING_SQL`), and the transaction that finishes its build (the last
 /// chunk, or the plan job's one absolute write for an aggregate or a `JOIN`)
 /// moves it to [`TransformStatus::Live`]. Its resume rebuilds it the same way.
 ///
@@ -93,13 +93,13 @@ pub fn applying_sql(alias: &str) -> String {
 /// the first, an operator [`PAUSE`](crate::Trellis::apply) sets the
 /// second, and nothing else distinguishes them — neither is applying, which
 /// is the one gate the claim-time fold has ever honored (the status
-/// predicate in [`super::catalog::dependents_of`]).
+/// predicate in `super::catalog::dependents_of`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransformStatus {
     WaitingToBackfill,
     Backfilling,
     /// Reported, never stored: a `live` definition reading an upstream that
-    /// isn't `live` (issue #497, [`super::catalog::reported_statuses`]), or a
+    /// isn't `live` (issue #497, `super::catalog::reported_statuses`), or a
     /// paused column of one (#1208). Apply maintains it exactly as a `live`
     /// one, but its target doesn't reflect its source yet, so `live` holds
     /// along a chain.
@@ -110,7 +110,7 @@ pub enum TransformStatus {
     /// freeze [`TransformStatus::Quarantined`] is, reached by the other of
     /// the two triggers the ADR names. The target holds its current,
     /// now-stale value until
-    /// [`crate::staging::quarantine::resume_transform`] rebuilds it by a
+    /// `crate::staging::quarantine::resume_transform` rebuilds it by a
     /// fresh backfill; meanwhile its share of the change stream is drained
     /// for its siblings and is not recoverable by replay, so a paused
     /// definition never pins the staging ring.
@@ -147,7 +147,7 @@ impl TransformStatus {
     /// `quarantined`) for itself.
     ///
     /// A frozen definition is not being maintained: the claim-time fold does
-    /// not write to its target, and [`super::chunk_queue::claim_chunks`] does
+    /// not write to its target, and `super::chunk_queue::claim_chunks` does
     /// not hand out its backfill chunks. Both follow from this one method, so
     /// a future third frozen state closes both gates by being named here and
     /// nowhere else.
@@ -159,13 +159,13 @@ impl TransformStatus {
     /// what it reads into its target, and the target-mutation seam stages
     /// its source's writes for it. `live` and `catching_up`; a definition
     /// whose build hasn't finished, or that is frozen, is skipped.
-    pub fn is_applying(self) -> bool {
+    pub(crate) fn is_applying(self) -> bool {
         matches!(self, TransformStatus::Live | TransformStatus::CatchingUp)
     }
 
     /// The persisted words of every [`Self::is_applying`] status, for a SQL
     /// predicate (`status = any($n)`) that has to agree with it.
-    pub fn applying() -> Vec<&'static str> {
+    pub(crate) fn applying() -> Vec<&'static str> {
         TransformStatus::ALL
             .iter()
             .filter(|status| status.is_applying())
