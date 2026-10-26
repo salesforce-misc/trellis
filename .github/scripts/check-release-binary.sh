@@ -37,19 +37,25 @@ if [ -z "$binary" ]; then
     dev) cargo_profile=(); dir=debug ;;
     *) echo "check-release-binary: --profile is release or dev" >&2; exit 64 ;;
   esac
-  (cd "$repo_root" && cargo build -p trellis-cli --locked "${cargo_profile[@]}" ${cargo_args[@]+"${cargo_args[@]}"})
+  (cd "$repo_root" && cargo build -p trellis-cli --locked ${cargo_profile[@]+"${cargo_profile[@]}"} ${cargo_args[@]+"${cargo_args[@]}"})
   target_dir="$(cd "$repo_root" && cargo metadata --format-version 1 --no-deps | jq -r .target_directory)"
   binary="$target_dir/$dir/trellis"
 fi
-[ -f "$binary" ] || { echo "check-release-binary: no binary at $binary" >&2; exit 1; }
+# An empty or unreadable file would pass vacuously.
+[ -f "$binary" ] && [ -s "$binary" ] && [ -r "$binary" ] ||
+  { echo "check-release-binary: no readable, non-empty binary at $binary" >&2; exit 1; }
 
-# grep -a reads the binary as text, so this needs no `strings`.
+# grep -a reads the binary as text, so this needs no `strings`. Its status is
+# 0 for a match, 1 for none, and anything else is an error, not a pass.
 leaked=0
 for s in "${forbidden[@]}"; do
-  if grep -aq -- "$s" "$binary"; then
-    echo "check-release-binary: $binary contains \`$s\`" >&2
-    leaked=1
-  fi
+  status=0
+  grep -aq -- "$s" "$binary" || status=$?
+  case "$status" in
+    0) echo "check-release-binary: $binary contains \`$s\`" >&2; leaked=1 ;;
+    1) ;;
+    *) echo "check-release-binary: grep failed (status $status) reading $binary" >&2; exit 1 ;;
+  esac
 done
 if [ "$leaked" -ne 0 ]; then
   echo "check-release-binary: the test-only surface is compiled in; see the \`test-util\` feature in trellis/Cargo.toml" >&2

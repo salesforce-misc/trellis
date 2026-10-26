@@ -7,7 +7,8 @@ The engine behind [Trellis](https://github.com/salesforce-misc/trellis): streami
 database. A target is an ordinary table that stays exactly equal to the query over its source as
 the source changes.
 
-The crate is published as `trellis-pg`; its library is named `trellis`:
+The crate is published as `trellis-pg`; its library is named `trellis`. Name an alpha version
+exactly (for example `"0.1.0-alpha"`), since Cargo never picks a prerelease on its own:
 
 ```toml
 [dependencies]
