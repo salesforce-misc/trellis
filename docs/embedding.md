@@ -234,10 +234,10 @@ reserved characters in a path).
 | --- | --- |
 | `sslmode=disable` | Plaintext only. |
 | `sslmode=prefer` (the default) | Use TLS if the server offers it, without checking its certificate; plaintext only when the server answers that it has no TLS. |
-| `sslmode=require` | TLS or fail, without checking the server's certificate. |
+| `sslmode=require` | TLS or fail, without checking the server's certificate. With `sslrootcert`, it is `verify-ca`, as in libpq. |
 | `sslmode=verify-ca` | TLS, and the server's certificate must chain to `sslrootcert`. The name is not checked. |
 | `sslmode=verify-full` | `verify-ca`, and the certificate must name the host you connect to. |
-| `sslrootcert=<file>` | PEM file of the CA certificate(s) to trust. Required for `verify-ca` and `verify-full`. |
+| `sslrootcert=<file>` | PEM file of the CA certificate(s) to trust. Required for `verify-ca` and `verify-full`; turns `require` into `verify-ca`. |
 | `sslcert=<file>`, `sslkey=<file>` | PEM client certificate and its unencrypted private key, for a server that authenticates by certificate. Given together. |
 
 ```text
@@ -250,9 +250,8 @@ The rules:
 * **Trust comes from `sslrootcert` only.** Trellis does not read the
   operating system's certificate store or ship public roots, so a server with a
   publicly signed certificate still needs `sslrootcert` pointing at the CA's
-  PEM file for `verify-ca` and `verify-full`. Only those two modes read it:
-  `sslmode=require` with an `sslrootcert` still does not check the
-  certificate, where libpq would treat the pair as `verify-ca`.
+  PEM file for `verify-ca` and `verify-full`. `require` reads it too and
+  then checks the chain as `verify-ca` does; `prefer` never reads it.
 * **`prefer` is the default, and it does not authenticate the server.** A
   connection string with no `sslmode` encrypts when it can and is open to
   anyone who can sit between you and Postgres. For a network you do not
@@ -267,8 +266,13 @@ The rules:
   `prefer` connect in plaintext over the socket.
 * **`allow` and the other libpq `ssl*` options are not supported** (for
   example `sslpassword`, `sslcrl`, `sslnegotiation`) and are configuration
-  errors, as is an encrypted private key. The `PGSSL*` environment variables
-  are not read; the options come from the connection string.
+  errors, as is an encrypted private key.
+* **`PGSSLMODE`, `PGSSLROOTCERT`, `PGSSLCERT` and `PGSSLKEY`** set the
+  matching options when Trellis builds the connection string from the `PG*`
+  environment variables (no `--database-url` and no `TRELLIS_DATABASE_URL`).
+  They are checked like the same options in a connection string. A
+  connection string given explicitly is used as written: these variables do
+  not add to it.
 * **Files are read when the connection machinery is built**: when a `Pool` is
   created, and for each dedicated connection when it is opened. A rotated
   client certificate or CA file takes effect for a new `Pool` (a restart, for

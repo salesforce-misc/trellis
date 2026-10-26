@@ -8,7 +8,8 @@
 //!    flag).
 //! 2. The `TRELLIS_DATABASE_URL` environment variable, used verbatim.
 //! 3. The standard libpq `PGHOST`/`PGPORT`/`PGUSER`/`PGPASSWORD`/
-//!    `PGDATABASE` environment variables, assembled into a DSN.
+//!    `PGDATABASE` environment variables, plus the TLS ones (`PGSSLMODE`,
+//!    `PGSSLROOTCERT`, `PGSSLCERT`, `PGSSLKEY`), assembled into a DSN.
 //!
 //! The Postgres schema Trellis manages its own objects under is likewise
 //! resolved from `TRELLIS_SCHEMA`, defaulting to [`DEFAULT_SCHEMA`]. The
@@ -249,17 +250,45 @@ impl Config {
     }
 
     fn dsn_from_env() -> String {
-        if let Ok(dsn) = std::env::var("TRELLIS_DATABASE_URL") {
-            return dsn;
-        }
-
-        let host = std::env::var("PGHOST").unwrap_or_else(|_| "localhost".to_string());
-        let port = std::env::var("PGPORT").unwrap_or_else(|_| "5432".to_string());
-        let user = std::env::var("PGUSER").unwrap_or_else(|_| "postgres".to_string());
-        let dbname = std::env::var("PGDATABASE").unwrap_or_else(|_| user.clone());
-        let password = std::env::var("PGPASSWORD").ok();
-        keyword_value_dsn(&host, &port, &user, password.as_deref(), &dbname)
+        dsn_from_vars(|name| std::env::var(name).ok())
     }
+}
+
+/// The `PGSSL*` environment variables and the connection options they set.
+const PG_TLS_VARS: [(&str, &str); 4] = [
+    ("PGSSLMODE", "sslmode"),
+    ("PGSSLROOTCERT", "sslrootcert"),
+    ("PGSSLCERT", "sslcert"),
+    ("PGSSLKEY", "sslkey"),
+];
+
+/// [`Config::dsn_from_env`], reading variables through `var` so tests need
+/// not touch the process environment: `TRELLIS_DATABASE_URL` verbatim, else
+/// a DSN from the `PG*` variables, `PGSSL*` included. Their values are
+/// checked where every DSN's are, when it is parsed.
+fn dsn_from_vars(var: impl Fn(&str) -> Option<String>) -> String {
+    if let Some(dsn) = var("TRELLIS_DATABASE_URL") {
+        return dsn;
+    }
+
+    let host = var("PGHOST").unwrap_or_else(|| "localhost".to_string());
+    let port = var("PGPORT").unwrap_or_else(|| "5432".to_string());
+    let user = var("PGUSER").unwrap_or_else(|| "postgres".to_string());
+    let dbname = var("PGDATABASE").unwrap_or_else(|| user.clone());
+    let password = var("PGPASSWORD");
+    let mut dsn = keyword_value_dsn(&host, &port, &user, password.as_deref(), &dbname);
+    for (name, option) in PG_TLS_VARS {
+        if let Some(value) = var(name) {
+            dsn.push_str(&format!(" {option}={}", quote_kv(&value)));
+        }
+    }
+    dsn
+}
+
+/// `value` single-quoted for a key=value DSN, with `\` and `'`
+/// backslash-escaped, so it reaches the connection exactly as given.
+fn quote_kv(value: &str) -> String {
+    format!("'{}'", value.replace('\\', r"\\").replace('\'', r"\'"))
 }
 
 /// Assembles a keyword/value DSN from the `PG*` environment values.
@@ -276,9 +305,7 @@ fn keyword_value_dsn(
     password: Option<&str>,
     dbname: &str,
 ) -> String {
-    fn quoted(value: &str) -> String {
-        format!("'{}'", value.replace('\\', r"\\").replace('\'', r"\'"))
-    }
+    let quoted = quote_kv;
     let mut dsn = format!(
         "host={} port={} user={} dbname={}",
         quoted(host),
@@ -585,6 +612,67 @@ mod tests {
         assert_eq!(
             parsed.get_hosts(),
             [tokio_postgres::config::Host::Tcp("db.example.com".into())]
+        );
+    }
+
+    /// The `PGSSL*` variables reach the DSN assembled from the `PG*` ones,
+    /// quoted like the rest, and are checked like the same options written
+    /// in a DSN. Read through a map, so no test touches the process
+    /// environment.
+    #[test]
+    fn env_dsn_carries_the_pgssl_variables() {
+        let vars = |pairs: &[(&str, &str)]| {
+            let map: std::collections::HashMap<String, String> = pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            dsn_from_vars(move |name| map.get(name).cloned())
+        };
+        let dsn = vars(&[
+            ("PGHOST", "db.example.com"),
+            ("PGPASSWORD", "pw-secret"),
+            ("PGSSLMODE", "verify-full"),
+            ("PGSSLROOTCERT", "/etc/my certs/ca's.pem"),
+            ("PGSSLCERT", "/etc/c.pem"),
+            ("PGSSLKEY", "/etc/k.pem"),
+        ]);
+        let (config, tls) = parse_dsn_tls(&dsn).expect("parses");
+        assert_eq!(config.get_password(), Some(&b"pw-secret"[..]));
+        let tls = format!("{tls:?}");
+        for expected in [
+            "VerifyFull",
+            "/etc/my certs/ca's.pem",
+            "/etc/c.pem",
+            "/etc/k.pem",
+        ] {
+            assert!(tls.contains(expected), "{expected}: {tls}");
+        }
+
+        // Without them the default is `prefer`, as for any DSN.
+        let (config, _) = parse_dsn_tls(&vars(&[("PGHOST", "db")])).unwrap();
+        assert_eq!(
+            config.get_ssl_mode(),
+            tokio_postgres::config::SslMode::Prefer
+        );
+
+        // A bad value is the same error as in a DSN, without the password.
+        for (pairs, expected) in [
+            (&[("PGSSLMODE", "allow")][..], "sslmode must be one of"),
+            (&[("PGSSLMODE", "verify-ca")][..], "need sslrootcert"),
+            (&[("PGSSLCERT", "/c.pem")][..], "given together"),
+        ] {
+            let mut pairs = pairs.to_vec();
+            pairs.push(("PGPASSWORD", "pw-secret"));
+            let err = parse_dsn_tls(&vars(&pairs)).unwrap_err().to_string();
+            assert!(err.contains(expected), "{err}");
+            assert!(!err.contains("pw-secret"), "{err}");
+        }
+
+        // `TRELLIS_DATABASE_URL` is used verbatim; the `PG*` variables,
+        // `PGSSL*` included, do not apply to it.
+        assert_eq!(
+            vars(&[("TRELLIS_DATABASE_URL", "host=a"), ("PGSSLMODE", "disable")]),
+            "host=a"
         );
     }
 

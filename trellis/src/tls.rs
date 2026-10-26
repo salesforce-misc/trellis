@@ -37,7 +37,8 @@ pub(crate) enum SslMode {
     /// Use TLS when the server offers it, without checking its certificate;
     /// plaintext only when the server answers that it has no TLS. The default.
     Prefer,
-    /// Require TLS, without checking the server's certificate.
+    /// Require TLS, without checking the server's certificate unless
+    /// `sslrootcert` is given, which makes it [`SslMode::VerifyCa`].
     Require,
     /// Require TLS and a server certificate that chains to `sslrootcert`.
     VerifyCa,
@@ -147,6 +148,11 @@ impl TlsSpec {
             (None, None) => {}
             _ => return Err(config_err("sslcert and sslkey must be given together")),
         }
+        // libpq's rule: `require` with a root certificate verifies the
+        // chain, as `verify-ca` does.
+        if spec.mode == SslMode::Require && spec.root_cert.is_some() {
+            spec.mode = SslMode::VerifyCa;
+        }
         if spec.mode.verifies() && spec.root_cert.is_none() {
             return Err(config_err(
                 "sslmode=verify-ca and verify-full need sslrootcert, a PEM file of the CA \
@@ -212,7 +218,7 @@ impl TlsSpec {
         };
         Ok(Tls {
             inner: MakeRustlsConnect::new(config),
-            verifies: self.mode.verifies(),
+            checks_name: self.mode == SslMode::VerifyFull,
         })
     }
 
@@ -255,12 +261,12 @@ impl TlsSpec {
 /// `tokio_postgres` asks for a connector for every host, with an empty name
 /// for a unix socket, and `MakeRustlsConnect` refuses a name that is not a
 /// valid DNS name or IP address. A name nothing checks (a socket path, or any
-/// host in a mode that does not verify) is swapped for a placeholder instead,
-/// so such a DSN connects as it would with libpq.
+/// host in a mode other than `verify-full`) is swapped for a placeholder
+/// instead, so such a DSN connects as it would with libpq.
 #[derive(Clone)]
 pub(crate) struct Tls {
     inner: MakeRustlsConnect,
-    verifies: bool,
+    checks_name: bool,
 }
 
 impl fmt::Debug for Tls {
@@ -279,7 +285,7 @@ where
 
     fn make_tls_connect(&mut self, hostname: &str) -> Result<Self::TlsConnect, Self::Error> {
         match MakeTlsConnect::<S>::make_tls_connect(&mut self.inner, hostname) {
-            Err(_) if !self.verifies => {
+            Err(_) if !self.checks_name => {
                 MakeTlsConnect::<S>::make_tls_connect(&mut self.inner, UNCHECKED_NAME)
             }
             other => other,
@@ -633,6 +639,20 @@ mod tests {
             let (_, s) = spec(&format!("host=db sslmode={text}")).unwrap();
             assert_eq!(s.mode, mode);
         }
+    }
+
+    #[test]
+    fn require_with_a_root_cert_is_verify_ca_as_in_libpq() {
+        let (_, s) = spec("host=db sslmode=require sslrootcert=/ca.pem").unwrap();
+        assert_eq!(s.mode, SslMode::VerifyCa);
+        let (_, s) = spec("postgres://db/app?sslrootcert=%2Fca.pem&sslmode=require").unwrap();
+        assert_eq!(s.mode, SslMode::VerifyCa);
+        let (_, s) = spec("host=db sslmode=require").unwrap();
+        assert_eq!(s.mode, SslMode::Require);
+        // Only `require`: `prefer` with a root certificate still does not
+        // verify, as in libpq.
+        let (_, s) = spec("host=db sslrootcert=/ca.pem").unwrap();
+        assert_eq!(s.mode, SslMode::Prefer);
     }
 
     #[test]

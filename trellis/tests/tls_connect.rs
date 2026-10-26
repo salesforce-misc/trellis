@@ -269,3 +269,46 @@ async fn a_hostaddr_without_a_host_encrypts_in_the_unverified_modes() {
         assert!(is_encrypted(session.client()).await, "{options:?}");
     }
 }
+
+/// libpq's rule: `sslmode=require` with an `sslrootcert` verifies the chain
+/// as `verify-ca` does (the name is not checked); without one it checks
+/// nothing, so it connects although no certificate is trusted at all.
+#[tokio::test]
+async fn require_with_a_root_cert_verifies_the_chain_and_without_one_checks_nothing() {
+    let cluster = TestCluster::start_with_tls();
+    let db = cluster.create_isolated_database().await;
+    // `hostaddr` reaches the server; `host` is a name the certificate lacks.
+    let require = |root: &str| {
+        let root = match root {
+            "" => String::new(),
+            file => format!("sslrootcert={}", path(&cluster, file)),
+        };
+        dsn(
+            &cluster,
+            db.name(),
+            "wrong.example",
+            &format!("hostaddr=127.0.0.1 sslmode=require {root}"),
+        )
+    };
+    assert!(
+        pool_is_encrypted(require("ca.crt"))
+            .await
+            .expect("right CA")
+    );
+    let session = ProducerSession::connect(&require("ca.crt"), DEFAULT_SCHEMA)
+        .await
+        .expect("dedicated session, right CA");
+    assert!(is_encrypted(session.client()).await);
+
+    let err = pool_is_encrypted(require("other-ca.crt"))
+        .await
+        .expect_err("another CA");
+    assert_refused_because(&err, "UnknownIssuer");
+    let err = ProducerSession::connect(&require("other-ca.crt"), DEFAULT_SCHEMA)
+        .await
+        .map(|_| ())
+        .expect_err("another CA");
+    assert!(format!("{err:?}").contains("UnknownIssuer"), "{err:?}");
+
+    assert!(pool_is_encrypted(require("")).await.expect("no root cert"));
+}

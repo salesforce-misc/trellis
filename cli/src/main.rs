@@ -34,7 +34,8 @@ Options:
                              `trellis --database-url <URL> apply ...` and
                              `trellis apply --database-url <URL> ...`
                              work). Falls back to TRELLIS_DATABASE_URL, then
-                             PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE, if
+                             PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE (and
+                             PGSSLMODE/PGSSLROOTCERT/PGSSLCERT/PGSSLKEY), if
                              omitted. TLS options go in the URL: sslmode
                              (disable, prefer [default], require, verify-ca,
                              verify-full), sslrootcert, sslcert, sslkey; e.g.

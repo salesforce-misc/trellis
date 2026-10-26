@@ -233,6 +233,10 @@ know:
   no TLS, in plaintext. Set `sslmode=require` (or `verify-full`) where
   plaintext would be a fault, and confirm with `pg_stat_ssl` that Trellis's
   sessions report `ssl = true`.
+* **Environment-only setups.** When the connection comes from `PGHOST`
+  and friends, `PGSSLMODE`, `PGSSLROOTCERT`, `PGSSLCERT` and `PGSSLKEY` set
+  the TLS options; with `--database-url` or `TRELLIS_DATABASE_URL`, put them
+  in the URL.
 * **A server that only accepts TLS** (`hostssl` entries in `pg_hba.conf`)
   refuses `sslmode=disable` with a "no pg_hba.conf entry ... no encryption"
   error.
