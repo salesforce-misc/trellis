@@ -755,7 +755,8 @@ impl fmt::Display for ValidationError {
                 "calculated field '{field}' compares a {lhs} value with a {rhs} value using \
                  '>'; a float and an exact numeric (an integer or numeric) cannot be \
                  compared, because Postgres would round the exact side to a float. Compare \
-                 values of one family: rewrite so both sides are floats or both are exact"
+                 values of one family: rewrite so both sides are floats or both are exact \
+                 (against a float, type a literal: DOUBLE PRECISION '0.5')"
             ),
             ValidationError::FunctionArgTypeMismatch {
                 field,
@@ -3749,6 +3750,47 @@ mod tests {
     }
 
     #[test]
+    fn greater_than_types_a_bare_number_literal_as_exact() {
+        // #1418: a bare literal is exact (`1` is integer, `0.5` numeric, as
+        // Postgres's lexer types them), so it is refused against a float; a
+        // typed float literal is the remedy. `COALESCE(real, numeric)` is
+        // `real`, so it is a float operand too.
+        let source_columns = HashMap::from([
+            ("f".to_string(), ValueType::Float(FloatWidth::Float4)),
+            ("d".to_string(), ValueType::Float(FloatWidth::Float8)),
+            ("n".to_string(), ValueType::Numeric),
+            ("i".to_string(), ValueType::Integer(IntWidth::Int2)),
+            ("b".to_string(), ValueType::Integer(IntWidth::Int8)),
+        ]);
+        for expr in [
+            "f > 0.5",
+            "1 > d",
+            "d > 9223372036854775808",
+            "COALESCE(f, n) > n",
+            "(f + i) > b",
+        ] {
+            let d = parsed(&format!("TRANSFORM t FROM s SELECT {expr} AS out"));
+            let err = validate(&d, &source_columns).unwrap_err();
+            assert!(
+                matches!(err, ValidationError::MixedFloatExactComparison { ref field, .. } if field == "out"),
+                "{expr}: {err:?}"
+            );
+        }
+        for expr in [
+            "f > REAL '0.5'",
+            "DOUBLE PRECISION '1' > d",
+            "f > d",
+            "i > 0.5",
+            "b > i",
+            "n > 1",
+            "(i + b) > n",
+        ] {
+            let d = parsed(&format!("TRANSFORM t FROM s SELECT {expr} AS out"));
+            assert_eq!(validate(&d, &source_columns), Ok(()), "{expr}");
+        }
+    }
+
+    #[test]
     fn function_call_composed_with_greater_than_type_checks_as_boolean() {
         let d = def(vec![FieldDef {
             name: "has_foo".to_string(),
@@ -4753,6 +4795,19 @@ mod tests {
              items.qty = orders.id GROUP BY orders.region SELECT COUNT(*) AS n",
         )
         .unwrap();
+    }
+
+    #[test]
+    fn join_greater_than_refuses_a_float_against_an_exact_aggregate() {
+        // #1418: a JOIN's fields are typed by the same rule as a 1-1's. A
+        // float aggregate is refused there, so a typed literal is the float.
+        let err = check("orders.region AS region, SUM(items.qty) > DOUBLE PRECISION '1' AS x")
+            .unwrap_err();
+        assert!(
+            matches!(err, ValidationError::MixedFloatExactComparison { ref field, .. } if field == "x"),
+            "{err:?}"
+        );
+        check("orders.region AS region, SUM(items.qty) > AVG(orders.total) AS x").unwrap();
     }
 
     #[test]

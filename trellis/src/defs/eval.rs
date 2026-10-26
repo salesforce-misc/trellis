@@ -1103,12 +1103,15 @@ fn reduce_numeric_aggregate(
 /// make Trellis and a server-side backfill of the same expression disagree
 /// about whether it errors at all.
 ///
-/// A [`Value::Float`] operand takes priority over both, on either side,
-/// because Postgres has no operator that mixes a float with an exact type:
-/// it casts both operands to `double precision` and runs `float8pl`. So
-/// `Float op anything` is the binary-float path, `Float op Float` is that
+/// For `+`, a [`Value::Float`] operand takes priority over both, on either
+/// side, because Postgres has no operator that mixes a float with an exact
+/// type: it casts both operands to `double precision` and runs `float8pl`.
+/// So `Float + anything` is the binary-float path, `Float + Float` is that
 /// path at the wider of the two widths, and only an all-exact pair reaches
-/// the integer/`numeric` arms below.
+/// the integer/`numeric` arms below. `>` admits only `Float > Float` among
+/// the floats: a float against an exact numeric is refused at define
+/// (#1418), so that pair falls to the `None` fallback like any other
+/// inadmissible one.
 ///
 /// `>` on floats routes through [`crate::float::compare`], **not** `f64`'s
 /// `PartialOrd` — Postgres's float order is total (`NaN` above everything,
@@ -1155,12 +1158,6 @@ fn apply_operator(
             (Value::Float(_, a), Value::Float(_, b)) => Some(Value::Boolean(
                 float::compare(a, b) == std::cmp::Ordering::Greater,
             )),
-            // A float against an exact numeric is refused at define (#1418),
-            // so these two arms are reached only by a hand-built AST.
-            (Value::Float(_, a), rhs) => as_float(rhs)
-                .map(|b| Value::Boolean(float::compare(a, b) == std::cmp::Ordering::Greater)),
-            (lhs, Value::Float(_, b)) => as_float(lhs)
-                .map(|a| Value::Boolean(float::compare(a, b) == std::cmp::Ordering::Greater)),
             (Value::Integer(_, a), Value::Integer(_, b)) => Some(Value::Boolean(a > b)),
             (lhs, rhs) => match (as_numeric(lhs), as_numeric(rhs)) {
                 (Some(a), Some(b)) => {
