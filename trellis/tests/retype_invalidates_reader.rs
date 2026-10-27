@@ -628,6 +628,50 @@ async fn a_coalesce_constant_out_of_range_after_a_retype_to_real_pauses_and_the_
     trellis.shutdown().await.expect("shutdown");
 }
 
+/// An exact constant past `double precision` beside a `numeric` column is
+/// computed as `numeric`, so it defines. Re-typing the column to `double
+/// precision` makes Postgres cast the constant to it, which raises for every
+/// row: the capture pass pauses the transform, and the resume refuses as
+/// define would.
+#[tokio::test]
+async fn a_constant_beside_a_column_retyped_to_a_float_pauses_and_the_resume_refuses() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.src (id int primary key, n numeric); \
+         insert into public.src values (1, 1.5)",
+    )
+    .await
+    .expect("table");
+    let trellis = definer(db.dsn()).await;
+    let beyond_double = "9".repeat(310);
+    trellis
+        .apply(&format!(
+            "TRANSFORM one FROM public.src SELECT n + {beyond_double} AS v"
+        ))
+        .await
+        .expect("define one");
+    bring_live(&mut raw, &db.pool, &["one"]).await;
+
+    raw.batch_execute("alter table public.src alter column n type double precision")
+        .await
+        .expect("retype n");
+    full_pass(&mut raw, &db.pool).await;
+    let reported = trellis.status("one").await.expect("status").expect("one");
+    assert_eq!(reported.status, TransformStatus::Paused, "{reported:?}");
+
+    match trellis.apply("RESUME TRANSFORM one").await {
+        Err(err) => assert!(
+            err.to_string()
+                .contains("out of range for double precision"),
+            "{err}"
+        ),
+        Ok(applied) => panic!("the resume should be refused: {applied:?}"),
+    }
+    trellis.shutdown().await.expect("shutdown");
+}
+
 /// Rules 1 and 4: an alter that changes a column's type within the string
 /// family leaves a `JOIN` key pair `t.k = o.k` valid (Trellis's copy of a
 /// `varchar(n)` column is unbounded, and `varchar` and `text` pair),
