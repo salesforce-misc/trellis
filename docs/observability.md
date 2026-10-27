@@ -21,9 +21,9 @@ where they're stuck, and what work is pending or blocked. The counterpart to
   `paused`, which a halting failure also uses, and `catching_up`, which is
   reported while an upstream isn't `live`), so an
   operator can tell a new transform is still populating rather than live — the
-  right-sized answer to the silent-stall problem (#14).
+  right-sized answer to the silent-stall problem.
 * **Fleet-level worker liveness** — `Trellis::has_live_drain_workers`
-  (issue #144) and `Trellis::has_live_staging_worker` (issue #428) answer the
+ and `Trellis::has_live_staging_worker` answer the
   coarser, fleet-wide questions a per-transform status can't: is *any* drain
   worker running to build and maintain targets, and is the staging worker
   running to capture changes and move a new transform out of
@@ -63,9 +63,20 @@ follow:
   apply, keyed by the **terminal transform** (not source→sink pair) to keep
   cardinality low.
 
+The two histograms are:
+
+* `trellis_transform_latency_seconds{transform}` — per-transform latency, one
+  observation per folded change.
+* `trellis_end_to_end_latency_seconds{transform}` — end-to-end latency, recorded
+  only for a terminal transform (one whose target nothing else reads), summed
+  across every source feeding it, and never for an intermediate hop.
+
+Both use one exponential bucket set from 10 ms to 60 s.
+
 Supporting counters/gauges keep the histograms interpretable. Every series
 below, and the histograms above, also carries the `trellis_instance` label
-([below](#several-instances-in-one-process)):
+([below](#several-instances-in-one-process)). Each name below takes the
+`trellis_` prefix in the exposition:
 
 * `changes_applied_total{transform}` — staged changes each transform folded
   and applied. One change is one row in the staging ring: a source row change
@@ -107,6 +118,30 @@ below, and the histograms above, also carries the `trellis_instance` label
   cleanly and left quarantine. The difference is the retries that were poisoned again, or
   have not drained yet. The first counts a pass's releases; the second counts on the page that
   clears the key, in whichever process drains it.
+* `seal_refused_total` — seals refused because the staging ring had no free slot,
+  after the retirement the seal answers that with. A steady rate means capture
+  outruns the drain and every slot is in use; see
+  [recommendations](recommendations.md) for the ring's disk growth.
+* `build_statement_seconds{class}` — worker time a Re-derive build spends in each
+  class of statement: `chunk_setup` (the chunk's catalog reads, pooled
+  connection, begin and claim fence), `chunk_keys` (the read of the keys in its
+  range), `chunk_lock` (the sorted entry lock), `chunk_write` (the inserts and
+  rewrites) and `chunk_commit` (the commit and marking the chunk done), and
+  `plan` (the plan job's boundary walk and chunk inserts). The `_sum` of a
+  class is worker-seconds; divide by `build_rows_total` for the cost per row
+  built.
+* `build_chunk_seconds` — the duration of each committed Re-derive build chunk's
+  transaction, from its begin to its commit, the span its entry locks and
+  snapshot are held. Its buckets are finer than the latency histograms': about
+  25% apart from 1 ms to 125 s. `build_chunk_seconds_max` is a gauge of the
+  longest such chunk the instance has committed.
+* `build_rows_total` — source keys that Re-derive build chunks have re-derived.
+* `build_chunk_lock_timeouts_total` — build chunks that gave up on their entry
+  lock's short timeout and were released for a retry. A nonzero rate means a
+  page or writer holds the keys a build wants.
+* `join_lock_wait_seconds{transform}` — the time a `JOIN` page spends locking its
+  `J` rows (the lock wait plus the read). A rising tail shows contention on hot
+  join keys.
 * `staging_segments{state}` — a cheap system-level gauge counting segments by
   state (ties to [the staging ring](staging-and-claiming/02-the-staging-ring.md)),
   chosen over a per-transform depth gauge for lower cost. The staging worker
@@ -217,7 +252,7 @@ start that forwards events (not spans) to `Logger`. A host can opt out, but
 composing its own subscriber means building its own NIF around the crate:
 the global subscriber belongs to the copy of `tracing` linked into the NIF
 library, so one installed from another library never sees the engine's
-events (`clients/elixir/README.md`, issue #149).
+events (`clients/elixir/README.md`).
 
 ## Transform status lifecycle
 
@@ -430,7 +465,7 @@ none), and each `sample_quarantined` row carries its `retry_attempts` and `next_
 transform ([ADR-0003](decisions/0003-quarantine-storage-and-api.md#releasing-held-keys)).
 
 `drain_failure` on `DefinitionStatus` is set while the drain keeps failing on a page
-holding changes to a table the transform reads, and the failure is charged to no key and pauses nothing (#817): a
+holding changes to a table the transform reads, and the failure is charged to no key and pauses nothing: a
 refused read or write the catalog can't pin on a table
 ([A halting failure](#a-halting-failure)), records that fail only together, a record
 that fails only in two separate combinations of transforms
@@ -451,7 +486,7 @@ The holdup is separate from `capture_failure`: it pauses and charges nothing
 ([ADR-0003](decisions/0003-quarantine-storage-and-api.md#retry-policy)).
 
 `source_index_gaps` on `DefinitionStatus` lists the source indexes a `GROUP BY` or `JOIN`
-transform needs and lacks (#1167): one entry per table and leading columns, with
+transform needs and lacks: one entry per table and leading columns, with
 a `role` (`GROUP BY` columns, a `JOIN`'s `ON` columns on its from side, or on its
 joined side: `IndexRole`, the word `group_by`, `join_from` or `join_joined` in the
 bindings) that names the part of the definition that needs the index, with
@@ -555,9 +590,9 @@ a source key the drain can't use (the table lost its primary key, or the key
 changed to a type Trellis can't key by), a propagation wave past the hop bound,
 an aggregate the group basis can't apply, or Postgres refusing the drain's role a read
 or write (row-level security, which Trellis's `row_security = off` turns into an
-error, or a missing privilege, #766). Retrying the page would fail it forever,
+error, or a missing privilege). Retrying the page would fail it forever,
 and quarantining a key would blame one for nobody's fault. Instead the drain
-**halts** the definitions the failure reaches (#663) and drains the page
+**halts** the definitions the failure reaches and drains the page
 without them:
 
 * **What it pauses.** For a key error, every definition that reads the table.
@@ -589,12 +624,11 @@ without them:
   [row-level security](transforms.md#supported-sources-and-targets))
   surfaces the error and records the page as a drain holdup, which `status`
   reports as `drain_failure` on the definitions reading its tables. The drain
-  worker re-claims the page at its poll interval under a collapsed warning
-  (#660).
+  worker re-claims the page at its poll interval under a collapsed warning.
 * **A failing build start.** A Re-derive build's start that fails in a way
   that would repeat on every pass (its ledger table was dropped, say) halts the
   definition writing that target, and everything downstream of the target, the
-  same way (#986), with `kind` `halt`, the target as the table and the error.
+  same way, with `kind` `halt`, the target as the table and the error.
   It never stops the staging worker's pass: the other definitions' builds
   start. A start that fails transiently, or
   by losing its connection, is retried on the next pass instead.
@@ -621,6 +655,3 @@ Pinned in `trellis/Cargo.toml`; rationale in
 ## Related
 
 * [data-flow](data-flow.md) — the flow these metrics measure.
-* [#14](https://github.com/salesforce-misc/trellis/issues/14) — the motivating stall.
-</content>
-</invoke>

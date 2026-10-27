@@ -1,8 +1,9 @@
-# Implementation checklist
+# Invariants and the tests that pin them
 
 ← [Convergence and await](07-convergence-and-await.md) · [Overview](README.md)
 
-A condensed checklist. Each item links to the document that argues for it.
+A condensed summary of what the design guarantees and the tests that pin each
+guarantee. Each item links to the document that argues for it.
 
 ## What is essential vs. what is Postgres-specific
 
@@ -19,97 +20,74 @@ A condensed checklist. Each item links to the document that argues for it.
 | Quarantined work still blocks the read-your-writes predicate | the three-table poison track |
 | A non-commutative write commits only if its basis is current (I2), under a per-key lock | the `<target>__ledger` table (1-1) or the group's basis (aggregate), `pg_current_snapshot()` as the basis |
 
-## Foundations to lock down first
+## Foundations
 
-- [ ] **The staging tables and the source tables share a transaction** — capture
+- **The staging tables and the source tables share a transaction** — capture
       triggers stage each change in the writer's own transaction, so a change is
       staged exactly when it commits. Same Postgres database. Non-negotiable.
       → [01](01-capture-by-triggers.md)
-- [ ] **The staging tables and the *target* tables share a transaction** — same
+- **The staging tables and the *target* tables share a transaction** — same
       database — what makes exactly-once for non-idempotent effects possible.
       → [05](05-apply-and-exactly-once-deltas.md)
-- [ ] **The fence is a store-assigned per-row writer identity (`txid_current()`)
+- **The fence is a store-assigned per-row writer identity (`txid_current()`)
       plus an inspectable transaction snapshot.**
       → [03](03-sealing-and-the-fence.md)
-- [ ] **Enumerate which measures are invertible.** Everything else goes on a
+- **Enumerate which measures are invertible.** Everything else goes on a
       recompute path. Never approximate an inverse.
       → [05](05-apply-and-exactly-once-deltas.md)
-- [ ] **Every 1-1 target keeps a per-key ledger** (last-applied position,
+- **Every 1-1 target keeps a per-key ledger** (last-applied position,
       basis snapshot, tombstone) and every non-commutative write checks it
       under the key's entry lock; an aggregate group keeps a basis and a
       stamp, and a page adds a change only if its basis hasn't counted it.
       → [05](05-apply-and-exactly-once-deltas.md#the-ledger)
-- [ ] **No item may stay undrainable** — one would stop the whole instance. A
+- **No item may stay undrainable** — one would stop the whole instance. A
       schema error pauses the definitions it reaches and drains without them;
       write the halting-stop metric at the same time, so "halted" and "slow"
       stay distinguishable.
       → [05](05-apply-and-exactly-once-deltas.md#failure-classification),
       [06](06-cleanup-and-reclaim.md)
 
-## Build order
+## Tests that pin the guarantees
 
-1. **Staging table + blind append + the capture triggers.** Prove a change is
-   staged exactly when its write commits, under kill -9 and rollback, before
-   moving on. → [01](01-capture-by-triggers.md), [02](02-the-staging-ring.md)
-2. **Seal with a single bucket, and the fence.** One worker, no parallelism. Get
-   the straddler and phase-gap tests green here — much harder to debug once
-   buckets exist. → [03](03-sealing-and-the-fence.md)
-3. **The fold.** Four rules plus the image-bearing discriminator. Test it against
-   a from-scratch oracle. → [04](04-claiming-and-the-fold.md)
-4. **Apply ∪ mark in one transaction**, still single-bucket. → [05](05-apply-and-exactly-once-deltas.md)
-5. **The convergence predicate**, before parallelism — you need it to write every
-   subsequent test. → [07](07-convergence-and-await.md)
-6. **Retirement and reclaim** — now the system can run indefinitely. → [06](06-cleanup-and-reclaim.md)
-7. **Buckets and multi-worker claims.** → [04](04-claiming-and-the-fold.md)
-8. **Heartbeat, reclaim TTL, release-on-error.** → [04](04-claiming-and-the-fold.md)
-9. **The ledger and the Re-derive build.** Entries, the I2 test and tombstone
-   GC, then a build that re-derives the source in chunks and applies from its
-   first chunk. → [05](05-apply-and-exactly-once-deltas.md#the-ledger)
-10. **Quarantine.** Last, because it is the only part that can hide work if it is
-   wrong. → [06](06-cleanup-and-reclaim.md)
+These fail only if written deliberately; ordinary end-to-end tests pass against every one of these bugs.
 
-## Tests that are not optional
-
-These fail only if you write them deliberately; ordinary end-to-end tests pass against every one of these bugs.
-
-- [ ] **The straddler.** Hold a writer's transaction open across a seal; assert its
+- **The straddler.** Hold a writer's transaction open across a seal; assert its
       row is applied exactly once.
-- [ ] **The phase-gap writer.** Resolve the pointer in the window between the
+- **The phase-gap writer.** Resolve the pointer in the window between the
       flip's commit and the snapshot capture; assert exactly once.
-- [ ] **The high-xid writer.** A writer that is the highest live transaction id
+- **The high-xid writer.** A writer that is the highest live transaction id
       when the snapshot is captured — the `xmax` case in
       [03](03-sealing-and-the-fence.md).
-- [ ] **Buckets partition the batch exactly once** — assert the union of
+- **Buckets partition the batch exactly once** — assert the union of
       per-bucket folds equals the whole-batch fold, as a set identity.
-- [ ] **Claim lost mid-drain.** Reclaim a worker's claim while it computes; assert
+- **Claim lost mid-drain.** Reclaim a worker's claim while it computes; assert
       its apply rolls back entirely.
-- [ ] **A key born inside a batch** (insert-then-update) folds to a NULL old side,
+- **A key born inside a batch** (insert-then-update) folds to a NULL old side,
       and an image-less trigger row never wins either arg-extreme.
-- [ ] **Delta vs. oracle, byte-identical**, after every op and under randomized
+- **Delta vs. oracle, byte-identical**, after every op and under randomized
       drain interleavings.
-- [ ] **Retire-then-seal on the same slot.** Assert a re-seeded slot is never
+- **Retire-then-seal on the same slot.** Assert a re-seeded slot is never
       truncated by a stale reclaimer.
-- [ ] **Quarantine release preserves the origin position**, so the predicate never
+- **Quarantine release preserves the origin position**, so the predicate never
       reports converged across a parked key.
-- [ ] **Crash in the seal's phase gap** wedges, and the age-gated recovery unwedges
+- **Crash in the seal's phase gap** wedges, and the age-gated recovery unwedges
       it without stomping a healthy in-flight seal.
-- [ ] **Two batches for one key, applied in reverse order.** Compute an older
+- **Two batches for one key, applied in reverse order.** Compute an older
       batch, drain a newer one for the same key, then apply the older one; assert
       a 1-1 target ends on the newer value. Cover a live recompute read, an older
       image, a stale write after a delete, and a stale delete after a re-insert.
-
-- [ ] **I2 visibility.** A Re-derive whose snapshot saw a change refuses the
+- **I2 visibility.** A Re-derive whose snapshot saw a change refuses the
       older capture of that change and still applies a change it did not see;
       a Re-derive's tombstone outlives the changes its read saw.
       (`one_to_one_ledger_interleavings.rs`:
       `a_rederives_tombstone_outlives_the_changes_its_read_saw_*`)
-- [ ] **Ledger GC holds back for out-of-order drains**: a tombstone is collected
+- **Ledger GC holds back for out-of-order drains**: a tombstone is collected
       only at or below the contiguous drained prefix.
       (`one_to_one_ledger_interleavings.rs`: `an_out_of_order_drain_holds_gc_back_*`)
-- [ ] **A Re-derive build interleaved with live Apply pages** converges to a
+- **A Re-derive build interleaved with live Apply pages** converges to a
       from-scratch oracle after the last chunk and drain.
       (`rederive_build.rs`, `one_to_one_build_interleavings.rs`)
-- [ ] **A schema change never fails the application's write**: a renamed or
+- **A schema change never fails the application's write**: a renamed or
       dropped captured column writes a `schema_changed` marker, the drain
       pauses the definitions that read it, and the others keep applying.
       (`capture_schema_change.rs`)

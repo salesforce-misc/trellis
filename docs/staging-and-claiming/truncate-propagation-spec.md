@@ -79,7 +79,7 @@ and not exists (
 The anti-join reads a materialized set of just the truncate rows, not `fenced`
 itself. A `not exists` straight over `fenced` can plan as a nested loop that
 rescans the whole window once per row, which makes the fold quadratic in batch
-size (#492).
+size.
 
 **Recompute rows (NULL `lsn`) are never filtered** — the comparison against a
 NULL lsn is NULL, not true, so they survive regardless of truncate position.

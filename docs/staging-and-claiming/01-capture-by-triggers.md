@@ -320,7 +320,7 @@ it regenerates anything, it pauses the definition, with its
 The reason names each column, its old and new type, and each copy, and says
 what to do. Nothing clears it but a deliberate `RESUME`, or a drop.
 
-A modifier never makes the fourth check pause (ADR-0020, #1207, #1288): every
+A modifier never makes the fourth check pause: every
 column Trellis creates from a source column has the source column's type with
 no modifier, and its collation. It holds whatever the source column holds
 after any change of a modifier (a string bound, a `numeric` precision or
@@ -368,14 +368,14 @@ whose resume is refused stays paused with the refusal and no cause.
 
 The pause doesn't stop a drain that reads a source key whose type is off the
 key allowlist: `staging::apply::compute` introspects every staged table's key
-before it asks which definitions apply, and halts on that type (#663). The
+before it asks which definitions apply, and halts on that type. The
 halt and the capture pass's pause both record a `capture_failure`, and the
 first one stands.
 
 ## A column changed or rewritten without a trigger
 
 Two more kinds of DDL change what a read column holds while its name stays
-the same, and fire no DML trigger (#703):
+the same, and fire no DML trigger:
 
 - **A column dropped and re-added** (`DROP COLUMN plan; ADD COLUMN plan
   text`): every row holds the new column's default, under a new `attnum`.

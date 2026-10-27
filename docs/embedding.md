@@ -244,6 +244,27 @@ the target schema, then `public`, so an unqualified `create table` through it
 lands in the instance schema, next to Trellis's own tables. Schema-qualify the
 objects an embedder creates, or use a separate pool.
 
+## Configuration from the environment
+
+`Config::resolve` (what the CLI and the language clients call) reads the
+connection from an explicit connection string, then from the environment, with
+no config file. A value is read once, when the `Config` is built.
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `TRELLIS_DATABASE_URL` | The connection string, used as written. Read only when no connection string is passed explicitly. | unset: fall back to the `PG*` variables |
+| `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE` | Assemble a connection string when neither an explicit one nor `TRELLIS_DATABASE_URL` is set. Values reach the connection exactly as given, whatever characters they hold. | `localhost`, `5432`, `postgres`, no password, and the user name as the database |
+| `PGSSLMODE`, `PGSSLROOTCERT`, `PGSSLCERT`, `PGSSLKEY` | TLS options for the connection string assembled from the `PG*` variables only; a connection string given explicitly is used as written ([TLS to Postgres](#tls-to-postgres)). | unset |
+| `TRELLIS_SCHEMA` | The schema holding the instance's catalog, ring and bookkeeping tables ([instance identity](instance-identity.md)). | `trellis` |
+| `TRELLIS_TARGET_SCHEMA` | The schema transform target tables are created in. It is independent of `TRELLIS_SCHEMA`, so a target never collides with a catalog object. | `public` |
+| `TRELLIS_POOL_MAX_SIZE` | The most physical connections the pool opens, as a positive integer. The producer, maintenance loop, heartbeat daemon, wake listener and a paged drain's `TEMP`-table session are dedicated connections outside the pool. | `20` |
+| `TRELLIS_POOL_WAIT_TIMEOUT_SECS` | Whole seconds a call waits for a free pooled connection before failing with a typed pool error rather than waiting forever. | `30` |
+
+A value that does not parse (`TRELLIS_POOL_MAX_SIZE=many`), or a schema name
+that is empty, holds a NUL byte or is over 63 bytes, is a configuration error at startup; it is not
+ignored. With no connection string at all, startup fails and names the
+variables it looked for.
+
 ## TLS to Postgres
 
 Every connection Trellis opens to Postgres (both pools, the `LISTEN`
@@ -454,8 +475,8 @@ The worker checks say the fleet is running; they can't say a definition has
 stopped. A halting failure (a source key the drain can't use, a propagation
 wave past the hop bound, an aggregate the group basis can't apply, or Postgres refusing the
 drain's role a read or write) pauses the definitions it reaches, and every
-other definition keeps converging (#663,
-[observability — A halting failure](observability.md#a-halting-failure)). A
+other definition keeps converging
+([observability — A halting failure](observability.md#a-halting-failure)). A
 halted definition reports `paused`, the same word as an operator pause, so
 check `DefinitionSummary::halt` rather than the status: it is set only on a
 halted definition, and carries the table the failure named, the error and when
@@ -497,8 +518,8 @@ refused read or write the catalog can't pin on a table (a column grant, a
 function's `EXECUTE`, one of Trellis's own tables), records that fail only
 together, or a failure that keeps reproducing until the page's retries run out.
 Every drain pass retries the page, and the targets of the tables on it stop
-short of it, so every watermark token taken since waits on it (#817,
-[observability — Transform status lifecycle](observability.md#transform-status-lifecycle)).
+short of it, so every watermark token taken since waits on it
+([observability — Transform status lifecycle](observability.md#transform-status-lifecycle)).
 The drain records each as a *drain holdup*, which `status(target)` reports as
 `drain_failure` on every definition that isn't paused or quarantined and reads
 a table on the page: the segment, the

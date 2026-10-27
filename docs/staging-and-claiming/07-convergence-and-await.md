@@ -1,6 +1,6 @@
 # Cross-cutting — Convergence, and the read-your-writes predicate
 
-← [Cleanup and reclaim](06-cleanup-and-reclaim.md) · next → [Implementation checklist](08-implementation-checklist.md)
+← [Cleanup and reclaim](06-cleanup-and-reclaim.md) · next → [Invariants and the tests that pin them](08-invariants-and-pins.md)
 
 **What this owns:** answering "has my write been reflected yet?" without lying.
 
@@ -23,7 +23,7 @@ Taken *after* the write commits, the token bounds that write's position from abo
 It is the WAL *insert* position, not `pg_current_wal_lsn()`'s *write* position: a
 writer with `synchronous_commit = off` gets its commit back before its WAL is written,
 so the write position can still sit below the `origin_lsn` its trigger stamped, and
-the wait would return before the change is applied (issue #697).
+the wait would return before the change is applied.
 The engine's workers do the work; the caller only waits — no client-driven drain loop.
 Capture triggers write a change's ring rows in the writer's own transaction
 ([01](01-capture-by-triggers.md)), so every commit at or below the token is already
@@ -53,7 +53,7 @@ means "unknown, conservatively old", and so does a `NULL` origin, which wins the
 LEAST-merge rather than losing it. A capture trigger stamps each row with the
 WAL insert position when it runs, below its commit's position; only rows with
 genuinely unknown origin (a build's `NULL`-key recomputes, a write
-made outside a drain) stay `NULL` (issue #469).
+made outside a drain) stay `NULL`.
 
 > **Invariant (await soundness):** every un-reflected effect of a commit at
 > position L is represented by ≥1 pending change with `origin_lsn <= L`. Any staging

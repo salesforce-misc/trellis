@@ -13,9 +13,6 @@ sequence of source mutations — drives each through the real engine against a r
 Postgres (`testkit`), compares the settled derived state against an **independent
 recompute oracle**, and shrinks any failure to a minimal reproducing program.
 
-The build plan lives in the tracking epic (salesforce-misc/trellis, label `Epic`:
-*Generative correctness test suite*); this is the design behind it.
-
 ---
 
 ## 1. Architecture
@@ -23,8 +20,8 @@ The build plan lives in the tracking epic (salesforce-misc/trellis, label `Epic`
 The suite is the `generative` crate — a workspace member, so `cargo test -p
 generative` (and CI's `clippy --all-targets --all-features`) compile it and a
 signature change can't rot it silently. It depends on `trellis` and `testkit`
-(the latter became a normal dependency, not just a dev-dependency, once
-`SubprocessBackend` needed `CrashGuard` from the library itself).
+(the latter a normal dependency, not just a dev-dependency, since
+`SubprocessBackend` needs `CrashGuard` from the library itself).
 
 Three of its features stay off by default and are switched on only by the
 crate's own self dev-dependency, so none can reach a production
@@ -64,9 +61,9 @@ tests/      property declarations, hand-built pins, meta-tests.
 
 The seam is a structural guarantee: the oracle *cannot* cheat by calling
 maintenance code if that code is only reachable through `backend/`, and a second
-backend drops in without touching generators or oracle. Two exist today:
+backend drops in without touching generators or oracle. Two exist:
 `ManualBackend` (an in-process `trellis::Client`) and `SubprocessBackend`
-(issue #166 — a real OS child process `CrashGuard` can genuinely `SIGKILL`, for
+(a real OS child process `CrashGuard` can genuinely `SIGKILL`, for
 crash tests that an in-process drop-and-replace cannot honestly stand in for).
 They share all DDL/DML/read-back rendering via `backend/sql.rs`; the only thing
 that actually differs between them is how the engine is started and stopped.
@@ -91,8 +88,7 @@ it.
 
 `defs` reuses `trellis::defs::ast::TransformDef` directly — 1-1 definitions
 (including numeric `+`), `GROUP BY` aggregates, and two-table `JOIN … GROUP BY`
-definitions (the JOIN tier). The model is shaped so non-DML actions slot in
-later.
+definitions (the JOIN tier). Non-DML actions (§7) slot in beside the DML ops.
 
 ### The backend seam
 
@@ -104,7 +100,7 @@ One module drives the engine, and its job is narrow:
   (`docs/data-flow.md#capture-by-triggers`);
 - `quiesce()` — block until the engine catches up, defined exactly as a *client's*
   read-your-own-writes check: watermark the LSN after the last commit, `await`
-  until derived state converges past it (stage 07, #12). Not a `sleep`. Over a
+  until derived state converges past it. Not a `sleep`. Over a
   partitioned source it first waits for the reconcile pass to record the tree
   and for each correction it queued to finish, since partition maintenance
   reaches a target only through a correction.
@@ -177,41 +173,75 @@ Two rules protect the suite from lying to itself:
   as a column and via a derivation; every operator appears over every supported
   argument type. Coverage that silently drops out is otherwise invisible.
 
-## 4. The properties (lit up as engine stages land)
+## 4. The properties
 
-Ordering matches the dependency chain; each property names the stage that
-unblocks it.
+Each property is a test under `generative/tests/`. The properties are
+`#[ignore]`d deep-lane tests named `property_*` (§9); the hand-built pins
+beside them run on every `cargo test`.
 
-- **Convergence, per op** *(idempotent 1-1 pipeline: fold #10, apply #11)*. After
-  each op: `quiesce`, assert materialized state equals the oracle. Per-op checking
-  localizes shrinking to the *first* diverging op. Cost is a full round trip per
-  op, so case counts stay low.
+- **Convergence, per op** (`tests/convergence.rs`). After each op: `quiesce`,
+  assert materialized state equals the oracle. Per-op checking localizes
+  shrinking to the *first* diverging op. Cost is a full round trip per op, so
+  case counts stay low.
 - **Operation errors are checked, not swallowed.** A rejected op (update of a
   never-inserted row) is applied to the oracle too, and state must still match — an
   op that errors changed nothing.
-- **Idempotency** *(exactly-once apply #11)*. Run once normally, then again
-  applying every op twice; both converge identically. Catches at-least-once
-  delivery treated as exactly-once.
-- **Order-insensitivity over commuting ops.** Reordering ops on *distinct*
-  `(table, pk)` targets must converge identically.
-- **Read-your-own-writes** *(await #12)*. Trellis ships `await(LSN, timeout)` as
-  its freshness promise, so it earns its own property: take a token after op *k*,
-  await it, assert the visible derived state includes every effect of ops 1..k.
-- **Non-idempotent delta convergence** *(aggregate slice)*. The hardest guarantee —
-  byte-identical convergence to a from-scratch `GROUP BY` oracle under aggregate
+- **Repeated application** (`tests/repeated_apply.rs`). The same statement run
+  twice is real, distinct source traffic (the engine's apply is exactly-once by
+  construction, so a redelivered change can't be simulated through raw DML);
+  both runs converge to the oracle. The exactly-once claim itself is pinned by
+  deterministic interleaving tests under `trellis/tests/`.
+- **Order-insensitivity over commuting ops** (`tests/order_insensitivity.rs`).
+  Reordering ops on *distinct* `(table, pk)` targets must converge identically.
+- **Read-your-own-writes** (`tests/read_your_own_writes.rs`). Trellis ships
+  `await(LSN, timeout)` as its freshness promise: every convergence check takes a
+  token after the op, awaits it, and asserts the visible derived state includes
+  every effect of ops 1..k. A negative control shows a read without the await can
+  see stale state, so `quiesce` is doing real work.
+- **Bulk operations** (`tests/bulk_operations.rs`). `TRUNCATE` and bulk inserts
+  with a shrinkable row count.
+- **Mid-stream definition install** (`tests/mid_stream_definition_install.rs`).
+  A definition installed after some ops have run builds its target from the rows
+  the source already holds and then follows the stream.
+- **Backfill** (`tests/backfill.rs`). A definition installed over a populated
+  source builds exactly those rows; no change data capture stands in for the
+  build.
+- **Engine lifecycle** (`tests/client_lifecycle.rs`). A client torn down and
+  replaced mid-stream, and an extra worker-only client started alongside the
+  first, both converge.
+- **Crash during Phase 3** (`tests/subprocess_crash.rs`). A real `SIGKILL` of the
+  engine process inside a drain batch's open transaction; the re-drain redoes the
+  batch and the target converges.
+- **Database administration and backup/restore** (`tests/db_admin.rs`,
+  `tests/backup_restore.rs`; §7).
+- **Untracked-table noise and checkpoints** (`tests/noise.rs`). Writes and DDL on
+  tables Trellis doesn't track, and `CHECKPOINT`s, interleaved with the program
+  never change the converged state.
+- **Out-of-band tampering** (`tests/self_check_cross_check.rs`). Direct writes to
+  derived tables are found by `self_check`, whose SQL renderer is independently
+  authored from the oracle's; the suite asserts the two agree on every generated
+  definition.
+- **Two instances** (`tests/two_instance_noise.rs`). Two Trellis instances in one
+  database (or in two), each converging against its own oracle, including one
+  instance reading the other's target.
+- **Concurrent convergence** (`tests/concurrent_convergence.rs`). The same
+  programs and oracle against the real worker pool and multi-worker claiming, in
+  tiers: small programs; hot keys and groups taking bursts from several
+  connections; mid-burst re-reads, pauses, resumes and installs while change
+  capture for the same keys is in flight; cooling keys whose last write lands
+  mid-burst; and sweep-only steady-load and cooling-backfill tiers that stall
+  pages and build chunks at their entry-lock step (the stall is process-wide, so
+  they run only in the planted-bug sweep, §6).
+- **Non-idempotent delta convergence** (the aggregate slice of the above).
+  Byte-identical convergence to a from-scratch `GROUP BY` oracle under aggregate
   delta maintenance. Grain domains stay *tiny* (`0`, `1`, `2`, plus occasional
   `NULL` — see `generative::generate::strategy::grain_value`'s doc comment) so many
-  rows share a group and deletes really kill groups. A legal SQL `NULL` grouping
-  value used to hit a real engine defect (a NULL-keyed group's write was silently
-  and permanently dropped with a not-null-constraint quarantine and no
-  operator-driven recovery), which the generator worked around by never drawing
-  one; issue #128 fixed the root cause (the target no longer rejects a NULL-keyed
-  group's write at all) and `grain_value` has drawn `NULL` unconditionally since.
-  This suite doesn't currently generate a *chained* definition (one `TRANSFORM`
-  reading another's target), so it never exercised issue #110's sibling
-  downstream-propagation gap either way; #110's own front-door coverage lives in
+  rows share a group and deletes really kill groups. A `NULL` grouping value is
+  drawn unconditionally. The suite doesn't generate a *chained* definition (one
+  `TRANSFORM` reading another's target) except in the two-instance property;
+  front-door coverage of chains lives in
   `trellis/tests/defs_aggregate_chained_single_column_group_key.rs`.
-- **Join convergence** *(`JOIN` apply, #1108; the JOIN tier, #1113)*. Two
+- **Join convergence** (`tests/join_convergence.rs`). Two
   tables, one to three `LEFT` or `INNER` join aggregates over them (joined on one
   column or on two, grouped by the joined table's column, by a column of each
   table, or by the `FROM` table's alone, with `COUNT`/`SUM`/`AVG` on either side,
@@ -284,11 +314,8 @@ unblocks it.
   (created or attached) and removes it: that is the short-lived-leaf gap in
   [known correctness gaps](known-correctness-gaps.md#a-short-lived-leaf-beside-a-default-partition).
   The `partition_ops` line counts each kind drawn. The hot-key tier has no
-  partitioned variant yet
+  partitioned variant
   ([#1331](https://github.com/salesforce-misc/trellis/issues/1331)).
-- **A second, structural oracle** *(needs an engine consistency auditor, if one
-  exists)*. Run the engine's internal consistency check at end of run, require zero
-  findings, prove the wiring with a negative test.
 
 ### Two runtimes, one oracle
 
@@ -296,13 +323,12 @@ The same programs run in two modes against the same oracle:
 
 - **Manual:** harness-driven, one worker, lockstep apply → quiesce → compare.
   Deterministic; source of clean shrinks and reproducible seeds.
-- **Concurrent:** the real worker pool and multi-worker claiming (#14), quiescence
+- **Concurrent:** the real worker pool and multi-worker claiming, quiescence
   as the client `await` check. Exercises wakeup, parallel claiming, and await
   semantics.
 
 Identical shape means a divergence in only one mode localizes immediately to
-concurrency. We do **not** run a property in concurrent mode for a path known to
-be un-safe yet.
+concurrency.
 
 ## 5. Comparison semantics: exactness is a per-type decision
 
@@ -414,9 +440,9 @@ Every candidate action falls in one of three buckets by its effect on the oracle
 - **Bucket 3 — source data/shape changes:** source DDL, `TRUNCATE`, restore. The
   source effect is easy; the real work is modeling the engine's *policy* when a
   definition's dependencies change under it — Trellis's quarantine and pause
-  policy (stage 06, #16). The oracle models only the settled cases.
+  policy. The oracle models only the settled cases.
 
-Sequencing, cheapest-first (each its own future story under the epic):
+The actions, cheapest-first (every one below is built):
 
 1. **Untracked-object noise** (bucket 1) — nearly free; converged state must be
    unchanged by DML/DDL on tables Trellis doesn't track.
@@ -425,18 +451,18 @@ Sequencing, cheapest-first (each its own future story under the epic):
    idempotent re-application get tested.
 4. **Transaction shapes** (bucket 3) — a transaction held open across a batch
    boundary (via `OpenTransaction`).
-5. **Database administration** (bucket 1) — restart PG, checkpoint. Built
-   (issue #236): `model::DbAdminAction`, driven by
-   `run::run_convergence_with_db_admin`, swept by
-   `tests/db_admin.rs`. A restart or checkpoint fires with the anchor op's
-   change still in flight and the engine must reconnect by itself. Backup/restore is built for a cold file-level copy
-   (`model::RestorePlan`, driven by `run::run_convergence_with_restore`,
-   swept by `tests/backup_restore.rs`): back up right after op *k* with its
-   change in flight, run to the end, restore into a fresh cluster, replay
-   *k+1..n*, converge with no pause (§8 has the decision behind that). Not
-   built yet: the `pg_basebackup` variant (held for #558).
+5. **Database administration** (bucket 1) — restart PG, checkpoint:
+   `model::DbAdminAction`, driven by `run::run_convergence_with_db_admin`,
+   swept by `tests/db_admin.rs`. A restart or checkpoint fires with the anchor
+   op's change still in flight and the engine must reconnect by itself.
+   Backup/restore is a cold file-level copy (`model::RestorePlan`, driven by
+   `run::run_convergence_with_restore`, swept by `tests/backup_restore.rs`):
+   back up right after op *k* with its change in flight, run to the end,
+   restore into a fresh cluster, replay *k+1..n*, converge with no pause (§8
+   has the decision behind that). The `pg_basebackup` variant is not
+   generated ([#1422](https://github.com/salesforce-misc/trellis/issues/1422)).
 6. **Out-of-band tampering** (bucket 1, detection) — direct writes to derived
-   tables; promotes the auditor's negative wiring test to a swept property.
+   tables, found by `self_check` (`tests/self_check_cross_check.rs`).
 
 Two structural notes for when faults enter the stream:
 
@@ -458,21 +484,21 @@ Two structural notes for when faults enter the stream:
 | 3. Generative + fault actions | random program incl. faults, seeded | same oracle at quiescence | at program level (shrinking) | minutes–hours |
 | 4. Black-box chaos | wall-clock random | invariants over recorded history | no | nightly / pre-release |
 
-- **Layer 1 already exists** — `trellis/tests/*` and the `testkit` crash/straddler
+- **Layer 1** is `trellis/tests/*` and the `testkit` crash/straddler
   pins. Every race bug found by layers 2–4 terminates as a layer-1 pin here.
-- **Layer 2 is what this epic stands up first.**
+- **Layer 2** is the healthy-path properties of §4.
 - **Layer 3** is reachable only because a fault action is an oracle identity (§7)
   and because the generative and scripted harnesses **share one action vocabulary**:
   a scripted scenario is a generated program with its draws pinned.
-- **A restore needs no restore-specific handling** (decided on #236,
-  2026-09-24). Trellis keeps its catalog, staging ring, capture triggers and
+- **A restore needs no restore-specific handling.** Trellis keeps its catalog, staging ring, capture triggers and
   targets in the database it reads, so a restore rolls them all back to one
   point and what comes back is consistent with itself. Layer 3's
-  backup/restore action checks that assumption: today the cold-copy case
-  (restore, replay, converge, no pause); the `pg_basebackup` case waits on
-  #558. One thing a server stop does carry over is a claim a worker took just
+  backup/restore action checks that assumption: the cold-copy case
+  (restore, replay, converge, no pause) is generated; the `pg_basebackup`
+  case is not ([#1422](https://github.com/salesforce-misc/trellis/issues/1422)). One thing a
+  server stop does carry over is a claim a worker took just
   before it: the claim's worker can't run the job or give it back, so only
-  the stale-claim sweep frees it, a reclaim TTL later (#752). The restore and
+  the stale-claim sweep frees it, a reclaim TTL later. The restore and
   restart runs give the engine a 10 s TTL so that recovery fits well inside
   the 30 s quiesce.
 
@@ -483,7 +509,7 @@ Two structural notes for when faults enter the stream:
   property its own count by cost; give shrinking a generous iteration cap.
 - Persist failing seeds locally, replayed first on the next run, but never check
   them in: a seed only names the same program while the strategy keeps its shape,
-  so a checked-in seed goes stale on the next generator change (#505). A failure
+  so a checked-in seed goes stale on the next generator change. A failure
   worth keeping becomes a hand-built pin. (The baseline quarantine list in §6
   does name cases by seed, but only to exclude known, filed failures from a
   sweep's baseline. The sweep fails on an entry whose issue is closed and

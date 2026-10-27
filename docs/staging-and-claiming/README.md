@@ -77,7 +77,7 @@ Each numbered step has its own document:
 | ⑤ | Applying, and non-idempotent deltas | [05-apply-and-exactly-once-deltas.md](05-apply-and-exactly-once-deltas.md) | A delta is applied exactly once — never twice, never zero times. |
 | ⑥ | Cleanup, reclaim, and quarantine | [06-cleanup-and-reclaim.md](06-cleanup-and-reclaim.md) | Storage is bounded, and no cleanup step can retire un-applied work. |
 | — | Proving it (read-your-writes) | [07-convergence-and-await.md](07-convergence-and-await.md) | A caller can block until its own write is reflected, and the predicate never lies. |
-| — | Implementation checklist | [08-implementation-checklist.md](08-implementation-checklist.md) | What is essential to correctness, what is a Postgres-specific choice, what to test. |
+| — | Invariants and the tests that pin them | [08-invariants-and-pins.md](08-invariants-and-pins.md) | What is essential to correctness, what is a Postgres-specific choice, what tests pin it. |
 
 A source `TRUNCATE` cuts across sealing, the fold, and apply; its
 whole-keyspace-clear semantics and drain-ordering barrier are written up in
@@ -104,7 +104,7 @@ high-volume ones be append-only and vacuum-free.
 | `seg_claims` | one row per in-flight bucket | the claim; its primary key *is* the exclusion |
 | `drainers` | one row per live drain thread, refreshed once per third of the drainer window | share denominator for fair fan-out |
 | `poison` / `poison_held` / `key_deaths` | per quarantined key and transform | keeps a killer change from wedging the system |
-| `transform_fuse_gate` | one row per transform with a poisoned key | serializes concurrent evictions' fuse checks (issue #159) |
+| `transform_fuse_gate` | one row per transform with a poisoned key | serializes concurrent evictions' fuse checks |
 
 ## Reading order
 
